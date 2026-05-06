@@ -1497,42 +1497,134 @@ pub fn run_lifecycle(
     Ok(())
 }
 
-/// Pre-scans a WASM binary's export section to check whether it exports a
-/// function named `run`. This is used to decide whether to apply the
-/// short-lived tool timeout *before* instantiating the component.
+/// Pre-scans a WASM binary's exports for a real `run` implementation. This
+/// is used to decide whether to apply the short-lived tool timeout *before*
+/// instantiating the component, and whether to take the run-loop branch
+/// (which moves the store into a background task and routes interceptor
+/// events via auto-subscribe instead of direct invocation).
 ///
-/// On any parse error, returns `true` (no timeout) - the safe direction.
+/// See [`wasm_exports_contain`] for the stub-detection semantics.
+///
+/// On any parse error, returns `true` (no timeout) — the safe direction.
 /// A truly corrupt binary will fail the subsequent Component::from_binary anyway.
 fn wasm_exports_contain_run(wasm_bytes: &[u8]) -> bool {
     wasm_exports_contain("run", wasm_bytes)
 }
 
-/// Pre-scans a WASM binary's export section to check whether it exports a
-/// function with the given name.
+/// WIT-mandatory `func()` exports the wasm32-wasip2 toolchain auto-stubs
+/// when the source crate doesn't implement them. Synthesized stubs share a
+/// single backing function and alias to the same export index, so a name
+/// in this trio whose index matches another trio member's index is a stub.
+const STUB_PRONE_EXPORTS: [&str; 3] = ["run", "astrid-install", "astrid-upgrade"];
+
+/// Pre-scans a WASM binary's exports for a real implementation of `name`.
+///
+/// "Real" means: the export exists AND is not a synthesized stub. The
+/// `wasm32-wasip2` toolchain auto-generates a single shared nop function
+/// for every mandatory WIT `func()` export the source crate doesn't
+/// implement — `run`, `astrid-install`, `astrid-upgrade` — and points all
+/// of them at the same function index. A real `#[astrid::run]` (or
+/// `#[astrid::install]` / `#[astrid::upgrade]`) produces a function index
+/// distinct from the shared stub, so aliasing within
+/// [`STUB_PRONE_EXPORTS`] is the structural signal of a stub.
+///
+/// For names outside that trio, falls back to plain name-presence (no
+/// stub baseline to compare against).
+///
+/// Why this matters: pre-migration (Extism) the SDK only emitted these
+/// exports when the user opted in, so name-presence was sufficient.
+/// Post-migration to the Component Model the WIT world makes them
+/// mandatory and the toolchain fills in the gaps with stubs — without
+/// stub detection, every capsule looks like a run-loop daemon and the
+/// kernel zeros out the store/instance, breaking direct interceptor
+/// dispatch for every interceptor-only capsule.
 ///
 /// On any parse error, returns `true` (safe default: assume export exists).
 fn wasm_exports_contain(name: &str, wasm_bytes: &[u8]) -> bool {
+    // Per-section state — function indices are per-index-space, so a
+    // multi-module binary (e.g. WASI adapter alongside the user module)
+    // is checked module-by-module. Cross-module comparison would be
+    // meaningless.
+    let trio_position = |export_name: &str| -> Option<usize> {
+        STUB_PRONE_EXPORTS.iter().position(|n| *n == export_name)
+    };
+
+    let resolve = |trio: &[Option<u32>; STUB_PRONE_EXPORTS.len()]| -> Option<bool> {
+        let pos = trio_position(name)?;
+        let target = trio[pos]?;
+        let aliased = trio
+            .iter()
+            .enumerate()
+            .any(|(i, idx)| i != pos && *idx == Some(target));
+        Some(!aliased)
+    };
+
     for payload in wasmparser::Parser::new(0).parse_all(wasm_bytes) {
         match payload {
             Ok(wasmparser::Payload::ExportSection(reader)) => {
-                // Only one export section per module; return immediately.
-                return reader.into_iter().any(|export| match export {
-                    Ok(e) => e.name == name && e.kind == wasmparser::ExternalKind::Func,
-                    Err(e) => {
-                        tracing::warn!("failed to parse WASM export entry: {e}");
-                        true // safe default: skip timeout
-                    },
-                });
+                let mut trio: [Option<u32>; STUB_PRONE_EXPORTS.len()] =
+                    [None; STUB_PRONE_EXPORTS.len()];
+                let mut name_present = false;
+                for export in reader {
+                    let e = match export {
+                        Ok(e) => e,
+                        Err(e) => {
+                            tracing::warn!("failed to parse WASM export entry: {e}");
+                            return true; // safe default: skip timeout
+                        },
+                    };
+                    if e.kind != wasmparser::ExternalKind::Func {
+                        continue;
+                    }
+                    if e.name == name {
+                        name_present = true;
+                    }
+                    if let Some(pos) = trio_position(e.name) {
+                        trio[pos] = Some(e.index);
+                    }
+                }
+                if let Some(real) = resolve(&trio) {
+                    return real;
+                }
+                if name_present {
+                    // Name found but outside the stub-prone trio — no
+                    // stub baseline to compare, take at face value.
+                    return true;
+                }
             },
             // Component Model binaries have a ComponentExportSection.
             Ok(wasmparser::Payload::ComponentExportSection(reader)) => {
-                return reader.into_iter().any(|export| match export {
-                    Ok(e) => e.name.0 == name,
-                    Err(e) => {
-                        tracing::warn!("failed to parse component export entry: {e}");
-                        true
-                    },
-                });
+                let mut trio: [Option<u32>; STUB_PRONE_EXPORTS.len()] =
+                    [None; STUB_PRONE_EXPORTS.len()];
+                let mut name_present = false;
+                for export in reader {
+                    let e = match export {
+                        Ok(e) => e,
+                        Err(e) => {
+                            tracing::warn!("failed to parse component export entry: {e}");
+                            return true;
+                        },
+                    };
+                    // Component-model exports span multiple index spaces
+                    // (func, type, module, instance, ...). Trio comparison
+                    // is only meaningful within the function space, so
+                    // ignore non-function exports.
+                    if e.kind != wasmparser::ComponentExternalKind::Func {
+                        continue;
+                    }
+                    if e.name.0 == name {
+                        name_present = true;
+                    }
+                    if let Some(pos) = trio_position(e.name.0) {
+                        trio[pos] = Some(e.index);
+                    }
+                }
+                if let Some(real) = resolve(&trio) {
+                    return real;
+                }
+                if name_present {
+                    return true;
+                }
             },
             Err(e) => {
                 tracing::warn!("failed to pre-scan WASM binary: {e}");
@@ -1930,6 +2022,146 @@ mod tests {
             wasm_exports_contain_run(garbage),
             "corrupt binary should default to true (safe: no timeout)"
         );
+    }
+
+    /// Build a WASM module where exports may alias to shared function
+    /// indices, simulating the wasm32-wasip2 toolchain's nop-stub synthesis
+    /// for unimplemented mandatory WIT exports. `exports` is `(name, idx)`
+    /// pairs — multiple entries with the same `idx` model an aliased stub.
+    fn build_wasm_module_with_aliases(exports: &[(&str, u32)]) -> Vec<u8> {
+        use wasm_encoder::{
+            CodeSection, ExportKind, ExportSection, Function, FunctionSection, Module, TypeSection,
+        };
+
+        let mut module = Module::new();
+
+        let mut types = TypeSection::new();
+        types.ty().function(vec![], vec![]);
+        module.section(&types);
+
+        let max_idx = exports.iter().map(|(_, i)| *i).max().unwrap_or(0);
+        let func_count = (max_idx + 1) as usize;
+
+        let mut functions = FunctionSection::new();
+        for _ in 0..func_count {
+            functions.function(0);
+        }
+        module.section(&functions);
+
+        let mut export_section = ExportSection::new();
+        for (name, idx) in exports {
+            export_section.export(name, ExportKind::Func, *idx);
+        }
+        module.section(&export_section);
+
+        let mut code = CodeSection::new();
+        for _ in 0..func_count {
+            let mut f = Function::new(vec![]);
+            f.instruction(&wasm_encoder::Instruction::End);
+            code.function(&f);
+        }
+        module.section(&code);
+
+        module.finish()
+    }
+
+    /// `run` aliased to `astrid-install` and `astrid-upgrade` is the
+    /// wasip2-stub signature — must not be classified as a live run loop.
+    #[test]
+    fn prescan_rejects_run_aliased_with_install_and_upgrade() {
+        let wasm = build_wasm_module_with_aliases(&[
+            ("astrid-hook-trigger", 0),
+            ("run", 1),
+            ("astrid-install", 1),
+            ("astrid-upgrade", 1),
+        ]);
+        assert!(
+            !wasm_exports_contain_run(&wasm),
+            "stub run aliased to install/upgrade must be treated as no run loop"
+        );
+    }
+
+    /// A real `#[astrid::run]` produces a function distinct from the
+    /// install/upgrade stubs — must be classified as a live run loop.
+    #[test]
+    fn prescan_accepts_run_distinct_from_install_stubs() {
+        let wasm = build_wasm_module_with_aliases(&[
+            ("astrid-hook-trigger", 0),
+            ("run", 1),
+            ("astrid-install", 2),
+            ("astrid-upgrade", 2),
+        ]);
+        assert!(
+            wasm_exports_contain_run(&wasm),
+            "run distinct from aliased install/upgrade stubs is a real run loop"
+        );
+    }
+
+    /// All three trio members real (distinct) — every one is a real export.
+    #[test]
+    fn prescan_accepts_all_three_distinct_implementations() {
+        let wasm = build_wasm_module_with_aliases(&[
+            ("astrid-hook-trigger", 0),
+            ("run", 1),
+            ("astrid-install", 2),
+            ("astrid-upgrade", 3),
+        ]);
+        assert!(wasm_exports_contain_run(&wasm));
+        assert!(wasm_exports_contain("astrid-install", &wasm));
+        assert!(wasm_exports_contain("astrid-upgrade", &wasm));
+    }
+
+    /// Real install with stubbed run+upgrade: install is real, run/upgrade
+    /// are stubs because they alias to each other (but not to install).
+    #[test]
+    fn prescan_distinguishes_real_install_from_run_upgrade_stubs() {
+        let wasm = build_wasm_module_with_aliases(&[
+            ("astrid-hook-trigger", 0),
+            ("run", 1),
+            ("astrid-upgrade", 1),
+            ("astrid-install", 2),
+        ]);
+        assert!(
+            !wasm_exports_contain_run(&wasm),
+            "run aliased to upgrade is a stub even when install is real"
+        );
+        assert!(
+            wasm_exports_contain("astrid-install", &wasm),
+            "install with a unique index is real"
+        );
+        assert!(
+            !wasm_exports_contain("astrid-upgrade", &wasm),
+            "upgrade aliased to run is a stub"
+        );
+    }
+
+    /// Lifecycle pre-scan: stubbed install/upgrade must short-circuit out
+    /// of `run_lifecycle` — same call site, same stub-detection contract.
+    #[test]
+    fn prescan_rejects_stubbed_lifecycle_exports() {
+        let wasm = build_wasm_module_with_aliases(&[
+            ("astrid-hook-trigger", 0),
+            ("run", 1),
+            ("astrid-install", 1),
+            ("astrid-upgrade", 1),
+        ]);
+        assert!(!wasm_exports_contain("astrid-install", &wasm));
+        assert!(!wasm_exports_contain("astrid-upgrade", &wasm));
+    }
+
+    /// Names outside the stub-prone trio fall back to plain name-presence —
+    /// no stub baseline applies.
+    #[test]
+    fn prescan_non_trio_name_uses_plain_presence() {
+        let wasm = build_wasm_module_with_aliases(&[
+            ("astrid-hook-trigger", 0),
+            ("astrid-cron-trigger", 0),
+        ]);
+        assert!(
+            wasm_exports_contain("astrid-hook-trigger", &wasm),
+            "non-trio names take face value even if shared"
+        );
+        assert!(wasm_exports_contain("astrid-cron-trigger", &wasm));
     }
 
     #[test]
