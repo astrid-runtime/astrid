@@ -77,11 +77,15 @@ impl sys::Host for HostState {
                             if !matches!(capsule.state(), crate::capsule::CapsuleState::Ready) {
                                 continue;
                             }
-                            for interceptor in &capsule.manifest().interceptors {
+                            // RFC cargo-like-manifest: read effective interceptors
+                            // — [subscribe].handler entries merged with legacy
+                            // [[interceptor]] blocks — so new-format capsules can
+                            // service trigger_hook dispatch without legacy fallback.
+                            for interceptor in capsule.manifest().effective_interceptors() {
                                 if crate::topic::topic_matches(&request.hook, &interceptor.event) {
                                     matches.push((
                                         std::sync::Arc::clone(&capsule),
-                                        interceptor.action.clone(),
+                                        interceptor.action,
                                     ));
                                 }
                             }

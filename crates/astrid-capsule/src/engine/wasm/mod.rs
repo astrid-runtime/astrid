@@ -676,8 +676,12 @@ impl ExecutionEngine for WasmEngine {
                     subscriptions: std::collections::HashMap::new(),
                     next_subscription_id,
                     config: wasm_config,
-                    ipc_publish_patterns: manifest.capabilities.ipc_publish.clone(),
-                    ipc_subscribe_patterns: manifest.capabilities.ipc_subscribe.clone(),
+                    // RFC cargo-like-manifest: prefer [publish] / [subscribe] keys
+                    // over the legacy [capabilities].ipc_publish / .ipc_subscribe arrays
+                    // when the capsule declares them. The helper falls back to the
+                    // legacy arrays if the new tables are empty.
+                    ipc_publish_patterns: manifest.effective_ipc_publish_patterns(),
+                    ipc_subscribe_patterns: manifest.effective_ipc_subscribe_patterns(),
                     // Only provide the CLI socket listener if the capsule declares net_bind.
                     // This prevents unauthorized capsules from even seeing the listener.
                     cli_socket_listener: if manifest.capabilities.net_bind.is_empty() {
@@ -809,22 +813,25 @@ impl ExecutionEngine for WasmEngine {
                 // Note: subscriptions are created before the WASM guest starts, so
                 // events published between subscribe and the guest's first recv/poll
                 // call are buffered in the broadcast channel (same as normal IPC).
-                if has_run && !manifest.interceptors.is_empty() {
+                // RFC cargo-like-manifest: read interceptor bindings from
+                // [subscribe].handler (new) merged with [[interceptor]] (legacy).
+                let effective_interceptors = manifest.effective_interceptors();
+                if has_run && !effective_interceptors.is_empty() {
                     // Cap auto-subscribed interceptors to leave headroom for
                     // guest-initiated subscriptions (shared 128-slot pool).
                     const MAX_AUTO_SUBSCRIBE: usize = 64;
-                    if manifest.interceptors.len() > MAX_AUTO_SUBSCRIBE {
+                    if effective_interceptors.len() > MAX_AUTO_SUBSCRIBE {
                         return Err(CapsuleError::UnsupportedEntryPoint(format!(
                             "Capsule '{}' declares {} interceptors, exceeding the \
                          auto-subscribe limit ({MAX_AUTO_SUBSCRIBE})",
                             manifest.package.name,
-                            manifest.interceptors.len()
+                            effective_interceptors.len()
                         )));
                     }
 
                     // Validate interceptor event patterns have well-formed segments
                     // (no empty segments, leading/trailing dots, or empty strings).
-                    for interceptor in &manifest.interceptors {
+                    for interceptor in &effective_interceptors {
                         if !crate::topic::has_valid_segments(&interceptor.event) {
                             return Err(CapsuleError::UnsupportedEntryPoint(format!(
                                 "Interceptor event '{}' has invalid segment structure \
@@ -839,10 +846,12 @@ impl ExecutionEngine for WasmEngine {
                     })?;
                     let state = s.data_mut();
                     // Interceptors are auto-subscribed without check_subscribe_acl.
-                    // Their event patterns are declared in [[interceptor]] blocks in
-                    // Capsule.toml (operator-controlled, same trust level as ipc_subscribe).
+                    // Their event patterns are declared in [subscribe].handler (new
+                    // format) or [[interceptor]] blocks (legacy) in Capsule.toml —
+                    // both operator-controlled, same trust level as ipc_subscribe.
                     // Only guest-initiated ipc::subscribe() calls are ACL-checked.
-                    for interceptor in &manifest.interceptors {
+                    let count = effective_interceptors.len();
+                    for interceptor in effective_interceptors {
                         let receiver = state.event_bus.subscribe_topic(&interceptor.event);
                         let handle_id = state.next_subscription_id;
                         state.next_subscription_id = state.next_subscription_id.wrapping_add(1);
@@ -851,13 +860,13 @@ impl ExecutionEngine for WasmEngine {
                             .interceptor_handles
                             .push(host_state::InterceptorHandle {
                                 handle_id,
-                                action: interceptor.action.clone(),
-                                topic: interceptor.event.clone(),
+                                action: interceptor.action,
+                                topic: interceptor.event,
                             });
                     }
                     tracing::debug!(
                         capsule = %manifest.package.name,
-                        count = manifest.interceptors.len(),
+                        count,
                         "Auto-subscribed interceptors for run-loop capsule"
                     );
                 }
