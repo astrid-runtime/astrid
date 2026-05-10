@@ -13,10 +13,15 @@ pub struct IpcMessage {
     /// Standardized payload structure.
     pub payload: IpcPayload,
     /// Optional cryptographic signature for stateless verification across a distributed swarm.
+    #[serde(default)]
     pub signature: Option<Vec<u8>>,
     /// Identifier of the sender plugin or agent.
     pub source_id: Uuid,
-    /// Timestamp when the message was dispatched.
+    /// Timestamp when the message was dispatched. Defaults to now on
+    /// deserialization so capsules forwarding bus messages over the wire
+    /// (e.g. the CLI proxy) don't need to fabricate a timestamp the SDK
+    /// doesn't expose to them.
+    #[serde(default = "Utc::now")]
     pub timestamp: DateTime<Utc>,
     /// Monotonic sequence number assigned by the event bus at publish time.
     /// Used by the dispatcher to guarantee in-order delivery per capsule.
@@ -395,6 +400,29 @@ mod tests {
         let json = r#"{"type":"future_variant","some_data":42}"#;
         let payload: IpcPayload = serde_json::from_str(json).unwrap();
         assert_eq!(payload, IpcPayload::Unknown);
+    }
+
+    #[test]
+    fn ipc_message_parses_cli_proxy_wire_format() {
+        // The CLI proxy capsule (capsules/astrid-capsule-cli) forwards bus
+        // messages to socket clients using only the fields exposed by the
+        // SDK's `ipc::Message`: {topic, payload, source_id}. The SDK does
+        // not surface the original timestamp or signature, so the wire
+        // format omits them. Without serde defaults on those fields the
+        // headless client's `from_slice::<IpcMessage>` silently fails on
+        // every frame and the response never reaches the user.
+        let wire = r#"{"topic":"agent.v1.response","payload":{"type":"agent_response","text":"hi","is_final":true,"session_id":"00000000-0000-0000-0000-000000000000"},"source_id":"00000000-0000-0000-0000-000000000000"}"#;
+        let msg: IpcMessage = serde_json::from_str(wire).expect("cli proxy frame must parse");
+        assert_eq!(msg.topic, "agent.v1.response");
+        assert!(msg.signature.is_none());
+        assert_eq!(msg.seq, 0);
+        match msg.payload {
+            IpcPayload::AgentResponse { text, is_final, .. } => {
+                assert_eq!(text, "hi");
+                assert!(is_final);
+            },
+            other => panic!("unexpected payload variant: {other:?}"),
+        }
     }
 
     #[test]
