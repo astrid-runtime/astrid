@@ -552,34 +552,50 @@ async fn run_modify(args: ModifyArgs) -> Result<ExitCode> {
         return Ok(ExitCode::from(1));
     }
     let mut client = AdminClient::connect().await?;
-    let body = client.request(AdminRequestKind::AgentList).await?;
+    let body = client
+        .request(AdminRequestKind::AgentModify {
+            principal: principal.clone(),
+            add_groups: args.add_group.clone(),
+            remove_groups: args.remove_group.clone(),
+        })
+        .await?;
     let body = into_result(body)?;
-    let agents = match body {
-        AdminResponseBody::AgentList(list) => list,
+
+    let value = match body {
+        AdminResponseBody::Success(v) => v,
         other => anyhow::bail!("unexpected response from kernel: {other:?}"),
     };
-    let Some(_agent) = agents.iter().find(|a| a.principal == principal) else {
-        eprintln!(
-            "{}",
-            Theme::error(&format!("agent '{principal}' not found"))
-        );
-        return Ok(ExitCode::from(1));
-    };
 
-    // Layer 6 does NOT yet expose a partial-group-update IPC topic for
-    // agents. We translate add/remove into capability grants/revokes
-    // for the duration of the gap: an agent's "groups" derive from
-    // grants when the kernel resolves caps, but until #657's followup
-    // wires `admin.agent.modify`, the safest path is to surface this
-    // limitation explicitly rather than silently no-op.
-    eprintln!(
-        "astrid: agent group membership changes need an `admin.agent.modify` IPC topic that has not shipped yet."
-    );
-    eprintln!(
-        "  As a workaround, edit `~/.astrid/etc/profiles/{principal}.toml` directly and reboot the daemon."
-    );
-    eprintln!("  Tracking issue #657 — CLI redesign followup.");
-    Ok(ExitCode::from(2))
+    let groups: Vec<String> = value
+        .get("groups")
+        .and_then(|g| g.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    let changed = value
+        .get("changed")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    if changed {
+        println!(
+            "{}",
+            Theme::success(&format!(
+                "Updated agent '{principal}' groups: [{}]",
+                groups.join(", ")
+            ))
+        );
+    } else {
+        println!(
+            "{}",
+            Theme::info(&format!(
+                "agent '{principal}' already in the requested groups (no change)"
+            ))
+        );
+    }
+    Ok(ExitCode::SUCCESS)
 }
 
 fn run_link(_args: LinkArgs) -> ExitCode {

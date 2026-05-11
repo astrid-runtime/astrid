@@ -202,6 +202,25 @@ pub enum AdminRequestKind {
     },
     /// List every agent principal with a profile on disk.
     AgentList,
+    /// Partial-update an existing agent's group memberships. Built-in
+    /// group names (`admin`, `agent`, `restricted`) and custom groups
+    /// loaded from `groups.toml` are both accepted as identifiers;
+    /// validation that the named groups exist happens at the new
+    /// profile's `validate` step. Mutations are idempotent — adding an
+    /// already-present group or removing an absent one is a no-op.
+    AgentModify {
+        /// Principal to modify.
+        principal: PrincipalId,
+        /// Groups to add (idempotent).
+        #[serde(default)]
+        add_groups: Vec<String>,
+        /// Groups to remove (idempotent — missing entries are no-ops).
+        /// Removing the last group leaves the agent in zero groups,
+        /// which the `agent` built-in does NOT auto-restore; operators
+        /// who want a baseline should add `agent` explicitly.
+        #[serde(default)]
+        remove_groups: Vec<String>,
+    },
     /// Replace the target principal's [`Quotas`] block. Values are
     /// validated before the atomic profile write.
     QuotaSet {

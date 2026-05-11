@@ -27,6 +27,8 @@ mod handlers;
 #[cfg(test)]
 mod state_tests;
 #[cfg(test)]
+mod state_tests_agent_modify;
+#[cfg(test)]
 mod tests;
 
 use std::sync::Arc;
@@ -117,6 +119,7 @@ pub fn resolve_admin_scope(req: &AdminRequestKind, caller: &PrincipalId) -> Auth
         | AdminRequestKind::AgentDelete { .. }
         | AdminRequestKind::AgentEnable { .. }
         | AdminRequestKind::AgentDisable { .. }
+        | AdminRequestKind::AgentModify { .. }
         | AdminRequestKind::GroupCreate { .. }
         | AdminRequestKind::GroupDelete { .. }
         | AdminRequestKind::GroupModify { .. }
@@ -145,6 +148,7 @@ pub fn required_capability_for_admin_request(
         (AdminRequestKind::AgentDelete { .. }, _) => "agent:delete",
         (AdminRequestKind::AgentEnable { .. }, _) => "agent:enable",
         (AdminRequestKind::AgentDisable { .. }, _) => "agent:disable",
+        (AdminRequestKind::AgentModify { .. }, _) => "agent:modify",
         (AdminRequestKind::AgentList, AuthorityScope::Self_) => "self:agent:list",
         (AdminRequestKind::AgentList, AuthorityScope::Global) => "agent:list",
         (AdminRequestKind::QuotaSet { .. }, AuthorityScope::Self_) => "self:quota:set",
@@ -169,6 +173,7 @@ pub fn admin_request_method(req: &AdminRequestKind) -> &'static str {
         AdminRequestKind::AgentDelete { .. } => "admin.agent.delete",
         AdminRequestKind::AgentEnable { .. } => "admin.agent.enable",
         AdminRequestKind::AgentDisable { .. } => "admin.agent.disable",
+        AdminRequestKind::AgentModify { .. } => "admin.agent.modify",
         AdminRequestKind::AgentList => "admin.agent.list",
         AdminRequestKind::QuotaSet { .. } => "admin.quota.set",
         AdminRequestKind::QuotaGet { .. } => "admin.quota.get",
@@ -189,6 +194,7 @@ pub fn admin_target_principal(req: &AdminRequestKind) -> Option<&PrincipalId> {
         AdminRequestKind::AgentDelete { principal }
         | AdminRequestKind::AgentEnable { principal }
         | AdminRequestKind::AgentDisable { principal }
+        | AdminRequestKind::AgentModify { principal, .. }
         | AdminRequestKind::QuotaSet { principal, .. }
         | AdminRequestKind::QuotaGet { principal }
         | AdminRequestKind::CapsGrant { principal, .. }

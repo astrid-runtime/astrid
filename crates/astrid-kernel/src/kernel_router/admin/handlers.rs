@@ -60,6 +60,11 @@ pub(super) async fn dispatch(
             agent_set_enabled(kernel, principal, false).await
         },
         AdminRequestKind::AgentList => agent_list(kernel),
+        AdminRequestKind::AgentModify {
+            principal,
+            add_groups,
+            remove_groups,
+        } => agent_modify(kernel, principal, add_groups, remove_groups).await,
         AdminRequestKind::QuotaSet { principal, quotas } => {
             quota_set(kernel, principal, quotas).await
         },
@@ -308,6 +313,88 @@ async fn agent_set_enabled(
     success_json(serde_json::json!({
         "principal": principal.as_str(),
         "enabled": enabled,
+        "changed": true,
+    }))
+}
+
+async fn agent_modify(
+    kernel: &Arc<crate::Kernel>,
+    principal: PrincipalId,
+    add_groups: Vec<String>,
+    remove_groups: Vec<String>,
+) -> AdminResponseBody {
+    if add_groups.is_empty() && remove_groups.is_empty() {
+        return err_bad_input(
+            "agent.modify: at least one of `add_groups` or `remove_groups` must be non-empty"
+                .to_string(),
+        );
+    }
+
+    let _guard = kernel.admin_write_lock.lock().await;
+    let path = principal_profile_path(kernel, &principal);
+    if let Err(msg) = require_principal_exists(&principal, &path) {
+        return err_bad_input(msg);
+    }
+    let mut profile = match PrincipalProfile::load_from_path(&path) {
+        Ok(p) => p,
+        Err(e) => return err_profile(&principal, &e),
+    };
+
+    // Apply removes first so a (remove, add) of the same group is an
+    // idempotent rename rather than a duplicate. Both ops are per-group
+    // idempotent: adding present groups and removing absent ones are
+    // no-ops.
+    let before = profile.groups.clone();
+    profile.groups.retain(|g| !remove_groups.contains(g));
+    for g in &add_groups {
+        if !profile.groups.iter().any(|existing| existing == g) {
+            profile.groups.push(g.clone());
+        }
+    }
+
+    // Set-based comparison: group membership is a set semantically, so
+    // a no-op modify (adding present, removing absent, or add+remove
+    // of the same group) should report `changed = false` regardless
+    // of the underlying Vec's order. `retain` + `push` happens to
+    // preserve the order of pre-existing groups today, but the
+    // correctness of `changed` shouldn't depend on that implementation
+    // detail.
+    let before_set: std::collections::HashSet<&String> = before.iter().collect();
+    let after_set: std::collections::HashSet<&String> = profile.groups.iter().collect();
+    if before_set == after_set {
+        kernel.profile_cache.invalidate(&principal);
+        return success_json(serde_json::json!({
+            "principal": principal.as_str(),
+            "groups": profile.groups,
+            "changed": false,
+        }));
+    }
+
+    // Validate before saving: re-runs the profile invariants (group
+    // names match groups.toml, grants/revokes still well-formed, etc.).
+    // Without this an operator could `agent modify --add-group typo`
+    // and the Layer 5 cap lookup would silently miss the typo'd group
+    // at every authz check.
+    if let Err(e) = profile.validate() {
+        return err_bad_input(format!("profile rejected: {e}"));
+    }
+
+    if let Err(e) = profile.save_to_path(&path) {
+        return err_profile(&principal, &e);
+    }
+    kernel.profile_cache.invalidate(&principal);
+
+    info!(
+        %principal,
+        added = ?add_groups,
+        removed = ?remove_groups,
+        groups = ?profile.groups,
+        "Layer 6 agent.modify"
+    );
+
+    success_json(serde_json::json!({
+        "principal": principal.as_str(),
+        "groups": profile.groups,
         "changed": true,
     }))
 }
