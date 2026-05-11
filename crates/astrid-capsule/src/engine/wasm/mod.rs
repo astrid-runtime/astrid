@@ -1756,6 +1756,7 @@ mod tests {
             default: None,
             enum_values: vec![],
             placeholder: None,
+            scope: crate::manifest::EnvScope::default(),
         };
         let field = crate::engine::build_onboarding_field("owner", &def);
         assert_eq!(field.key, "owner");
@@ -1777,6 +1778,7 @@ mod tests {
             default: None,
             enum_values: vec!["a".into()], // enum_values ignored for secrets
             placeholder: None,
+            scope: crate::manifest::EnvScope::default(),
         };
         let field = crate::engine::build_onboarding_field("apiKey", &def);
         assert_eq!(
@@ -1794,6 +1796,7 @@ mod tests {
             default: Some(serde_json::json!("testnet")),
             enum_values: vec!["testnet".into(), "mainnet".into()],
             placeholder: None,
+            scope: crate::manifest::EnvScope::default(),
         };
         let field = crate::engine::build_onboarding_field("network", &def);
         assert_eq!(
@@ -1812,6 +1815,7 @@ mod tests {
             default: None,
             enum_values: vec![],
             placeholder: None,
+            scope: crate::manifest::EnvScope::default(),
         };
         let field = crate::engine::build_onboarding_field("someKey", &def);
         assert_eq!(field.prompt, "Please enter value for someKey");
@@ -1826,6 +1830,7 @@ mod tests {
             default: None,
             enum_values: vec!["only".into()],
             placeholder: None,
+            scope: crate::manifest::EnvScope::default(),
         };
         let field = crate::engine::build_onboarding_field("single", &def);
         assert_eq!(
@@ -1849,6 +1854,7 @@ mod tests {
             default: None,
             enum_values: vec![],
             placeholder: None,
+            scope: crate::manifest::EnvScope::default(),
         };
         let field = crate::engine::build_onboarding_field("relays", &def);
         assert_eq!(
@@ -1867,6 +1873,7 @@ mod tests {
             default: None,
             enum_values: vec![],
             placeholder: None,
+            scope: crate::manifest::EnvScope::default(),
         };
         let field = crate::engine::build_onboarding_field("empty", &def);
         assert_eq!(
