@@ -292,46 +292,98 @@ async fn run_revoke(args: RevokeArgs) -> Result<ExitCode> {
 }
 
 async fn run_check(args: CheckArgs) -> Result<ExitCode> {
-    // The kernel does not expose a `caps:check` IPC topic: capability
-    // resolution requires the full GroupConfig + profile, both of
-    // which live behind the admin write lock. We approximate by
-    // fetching the agent summary and reporting whether the requested
-    // capability appears in `grants`, `revokes`, or a group name. This
-    // is a CLI convenience — the authoritative check is at the host
-    // function boundary, not here.
+    // Mirrors the Layer 5 enforcement preamble's resolution order:
+    // explicit revokes (highest precedence) → direct grants → group-
+    // inherited patterns. Pattern matching uses
+    // `astrid_core::capability_grammar::capability_matches` — the
+    // same function the kernel runs — so the CLI answer matches what
+    // the kernel would decide at request time (modulo races against
+    // an admin write between the two admin RPCs we issue below).
+    use astrid_core::capability_grammar::capability_matches;
+
     let principal = PrincipalId::new(&args.name).context("invalid agent name")?;
-    let summary = fetch_summary(&principal).await?;
-    if summary.revokes.iter().any(|c| c == &args.capability) {
+    let mut client = AdminClient::connect().await?;
+
+    let summary_body = client.request(AdminRequestKind::AgentList).await?;
+    let summary_body = into_result(summary_body)?;
+    let agents = match summary_body {
+        AdminResponseBody::AgentList(list) => list,
+        other => anyhow::bail!("unexpected response from kernel: {other:?}"),
+    };
+    let Some(agent) = agents.iter().find(|a| a.principal == principal) else {
+        eprintln!(
+            "{}",
+            Theme::error(&format!("agent '{principal}' not found"))
+        );
+        return Ok(ExitCode::from(1));
+    };
+
+    // Revoke wins over everything.
+    if let Some(pattern) = agent
+        .revokes
+        .iter()
+        .find(|p| capability_matches(p, &args.capability))
+    {
         println!(
-            "{}: {} is revoked from '{}'",
+            "{}: {} {} '{}' (revoke pattern: {pattern})",
             "denied".red().bold(),
             args.capability,
+            "is revoked from".dimmed(),
             args.name
         );
         return Ok(ExitCode::from(1));
     }
-    if summary.grants.iter().any(|c| c == &args.capability) {
+
+    // Direct grant beats group inheritance — easier diagnostic.
+    if let Some(pattern) = agent
+        .grants
+        .iter()
+        .find(|p| capability_matches(p, &args.capability))
+    {
         println!(
-            "{}: '{}' has direct grant for {}",
+            "{}: '{}' {} (grant pattern: {pattern})",
             "allowed".green().bold(),
             args.name,
-            args.capability
+            "holds a direct grant".dimmed()
         );
         return Ok(ExitCode::SUCCESS);
     }
-    if !summary.groups.is_empty() {
-        println!(
-            "{}: '{}' belongs to groups {} — group capabilities not enumerated by Layer 6",
-            "indeterminate".yellow().bold(),
-            args.name,
-            summary.groups.join(",")
-        );
-        return Ok(ExitCode::from(2));
+
+    // Group inheritance: fetch the full group catalogue and resolve.
+    if !agent.groups.is_empty() {
+        let groups_body = client.request(AdminRequestKind::GroupList).await?;
+        let groups_body = into_result(groups_body)?;
+        let groups = match groups_body {
+            AdminResponseBody::GroupList(list) => list,
+            other => anyhow::bail!("unexpected response from kernel: {other:?}"),
+        };
+
+        for group_name in &agent.groups {
+            let Some(group) = groups.iter().find(|g| &g.name == group_name) else {
+                continue;
+            };
+            if let Some(pattern) = group
+                .capabilities
+                .iter()
+                .find(|p| capability_matches(p, &args.capability))
+            {
+                println!(
+                    "{}: '{}' {} '{}' (pattern: {pattern})",
+                    "allowed".green().bold(),
+                    args.name,
+                    "inherits from group".dimmed(),
+                    group_name
+                );
+                return Ok(ExitCode::SUCCESS);
+            }
+        }
     }
+
     println!(
-        "{}: '{}' has no direct grant for {}",
+        "{}: '{}' {} {}",
         "denied".red().bold(),
         args.name,
+        "has no grant matching".dimmed(),
         args.capability
     );
     Ok(ExitCode::from(1))
