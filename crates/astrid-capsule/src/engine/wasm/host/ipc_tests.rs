@@ -440,3 +440,48 @@ fn subscribe_acl_malformed_pattern_silently_denies() {
         "malformed ACL pattern must not allow subscriptions"
     );
 }
+
+#[test]
+fn publish_inner_quota_bucket_is_keyed_by_passed_principal() {
+    // Regression: `publish_inner` used `state.effective_principal()` for the
+    // quota bucket key, which for an uplink relaying via `ipc_publish_as`
+    // resolves to the uplink's own principal — every relayed principal ends
+    // up sharing one bucket, so one tenant can starve another's budget.
+    // The fix uses the validated `principal_str` parameter as the key.
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("rt");
+    let mut state = crate::engine::wasm::test_fixtures::minimal_host_state(rt.handle().clone());
+    state.has_uplink_capability = true;
+    state.ipc_publish_patterns = vec!["uplink.*".into()];
+
+    // Tight cap so two saturating sends to the SAME bucket would trip the
+    // limiter on the second. Set on a custom invocation profile so the
+    // host reads it via `effective_profile()`.
+    let mut profile = astrid_core::profile::PrincipalProfile::default();
+    profile.quotas.max_ipc_throughput_bytes = 200;
+    state.invocation_profile = Some(std::sync::Arc::new(profile));
+
+    // Valid JSON; the body is irrelevant — only the byte length is.
+    let payload = format!("\"{}\"", "x".repeat(148)); // adds 2 for quotes → 150 bytes
+    let topic = "uplink.relay".to_string();
+
+    // First message charged to alice — fits her 200-byte bucket (uses 150).
+    super::publish_inner(&mut state, topic.clone(), payload.clone(), "alice".into())
+        .expect("alice first send fits her bucket");
+
+    // Second message charged to bob — would fail if they shared a bucket
+    // (150 + 150 = 300 > 200) but succeeds with separate buckets.
+    super::publish_inner(&mut state, topic.clone(), payload.clone(), "bob".into())
+        .expect("bob has his own bucket");
+
+    // Third message back to alice's bucket — must now fail because alice
+    // is at 150/200 and 150 more would bust the cap.
+    let err = super::publish_inner(&mut state, topic, payload, "alice".into())
+        .expect_err("alice's bucket should be saturated now");
+    assert!(
+        err.contains("Rate limit exceeded"),
+        "expected rate-limit error, got: {err}"
+    );
+}

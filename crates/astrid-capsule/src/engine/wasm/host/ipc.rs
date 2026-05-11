@@ -142,78 +142,6 @@ const MAX_RECV_TIMEOUT_MS: u64 = 60_000;
 
 impl ipc::Host for HostState {
     fn ipc_publish(&mut self, topic: String, payload: String) -> Result<(), String> {
-        // Prevent IPC topic abuse
-        if topic.len() > 256 {
-            return Err("Topic exceeds maximum allowed length (256 bytes)".to_string());
-        }
-
-        let payload_len = payload.len();
-
-        // Check rate limit and quotas using the length *before* allocating the memory.
-        // Buckets are keyed by (capsule, principal) and bounded by the invoking
-        // principal's `max_ipc_throughput_bytes`, so two principals sharing the
-        // same capsule instance cannot starve each other's budget.
-        let principal = self.effective_principal();
-        let throughput_cap =
-            usize::try_from(self.effective_profile().quotas.max_ipc_throughput_bytes)
-                .unwrap_or(usize::MAX);
-        self.ipc_limiter
-            .check_quota(self.capsule_uuid, &principal, payload_len, throughput_cap)
-            .map_err(|e| e.to_string())?;
-
-        // Reject malformed topic structure before any matching or routing.
-        if !crate::topic::has_valid_segments(&topic) {
-            return Err(
-                "Topic contains empty segments (consecutive dots, leading/trailing dots, or is empty)"
-                    .to_string(),
-            );
-        }
-
-        if topic.split('.').count() > 8 {
-            return Err("Topic exceeds maximum allowed segments (8)".to_string());
-        }
-
-        // Enforce IPC topic publishing restrictions from Capsule.toml.
-        // Fail-closed: capsules without ipc_publish declarations cannot publish.
-        // Protected topics (kernel.*) require explicit declaration even if
-        // a capsule has other patterns — defense-in-depth against privilege escalation.
-        if self.ipc_publish_patterns.is_empty() {
-            return Err(format!(
-                "Capsule '{}' has no ipc_publish declarations — publishing is denied. \
-                 Add ipc_publish patterns to Capsule.toml [capabilities]",
-                self.capsule_id
-            ));
-        }
-
-        if !self
-            .ipc_publish_patterns
-            .iter()
-            .any(|pattern| crate::topic::topic_matches(&topic, pattern))
-        {
-            return Err(format!(
-                "Capsule '{}' is not allowed to publish to topic '{topic}' — \
-                 declared ipc_publish patterns: {:?}",
-                self.capsule_id, self.ipc_publish_patterns
-            ));
-        }
-
-        let payload_bytes = payload.as_bytes();
-
-        if payload_bytes.len() > util::MAX_GUEST_PAYLOAD_LEN as usize {
-            return Err(format!(
-                "IPC payload exceeds maximum allowed length ({} bytes)",
-                util::MAX_GUEST_PAYLOAD_LEN
-            ));
-        }
-
-        // Deserialize the guest payload into an IpcPayload, falling back to
-        // Custom for unrecognised or missing type tags.  See IpcPayload::from_json_value
-        // for the rationale behind the pre-check.
-        let ipc_payload = match serde_json::from_slice::<serde_json::Value>(payload_bytes) {
-            Ok(data) => IpcPayload::from_json_value(data),
-            Err(_) => return Err("IPC payload is not valid JSON".to_string()),
-        };
-
         // Propagate the principal to the outgoing message. Capsules never
         // touch the principal — it's invisible. Two cases:
         // 1. Invocation context exists (triggered by IPC) → copy from caller
@@ -224,18 +152,34 @@ impl ipc::Host for HostState {
             .as_ref()
             .and_then(|c| c.principal.clone())
             .unwrap_or_else(|| self.principal.to_string());
-        let message =
-            IpcMessage::new(topic, ipc_payload, self.capsule_uuid).with_principal(principal_str);
+        publish_inner(self, topic, payload, principal_str)
+    }
 
-        let event = AstridEvent::Ipc {
-            metadata: EventMetadata::new("wasm_guest").with_session_id(self.capsule_uuid),
-            message,
-        };
-
-        // Publish to the event bus
-        self.event_bus.publish(event);
-
-        Ok(())
+    fn ipc_publish_as(
+        &mut self,
+        topic: String,
+        payload: String,
+        principal: String,
+    ) -> Result<(), String> {
+        // Gate on uplink capability: only uplinks (CLI proxy, Telegram
+        // bridge, etc.) may stamp messages with a principal other than
+        // their own. The trust model is "trust the uplink" — see issue
+        // #658 for cryptographic per-connection auth.
+        if !self.has_uplink_capability {
+            return Err(format!(
+                "Capsule '{}' is not an uplink — `ipc-publish-as` requires \
+                 `uplink = true` in `Capsule.toml [capabilities]`",
+                self.capsule_id
+            ));
+        }
+        // Validate the claimed principal parses cleanly. The kernel-side
+        // dispatcher only re-parses the principal field for capability
+        // checks; an invalid value would silently fall back to default
+        // and confuse audit logs. Reject up front instead.
+        if astrid_core::principal::PrincipalId::new(&principal).is_err() {
+            return Err(format!("invalid principal: {principal:?}"));
+        }
+        publish_inner(self, topic, payload, principal)
     }
 
     fn ipc_subscribe(&mut self, topic_pattern: String) -> Result<u64, String> {
@@ -394,6 +338,111 @@ impl ipc::Host for HostState {
             })
             .collect())
     }
+}
+
+/// Shared publish path used by [`ipc::Host::ipc_publish`] and
+/// [`ipc::Host::ipc_publish_as`]. The only difference between the two
+/// entry points is how `principal_str` is resolved — quota check,
+/// topic validation, ACL, and event-bus publication are identical.
+fn publish_inner(
+    state: &mut HostState,
+    topic: String,
+    payload: String,
+    principal_str: String,
+) -> Result<(), String> {
+    // Prevent IPC topic abuse
+    if topic.len() > 256 {
+        return Err("Topic exceeds maximum allowed length (256 bytes)".to_string());
+    }
+
+    let payload_len = payload.len();
+
+    // Check rate limit and quotas using the length *before* allocating
+    // the memory. Buckets are keyed by (capsule, principal) and bounded
+    // by the invoking principal's `max_ipc_throughput_bytes`, so two
+    // principals sharing the same capsule instance cannot starve each
+    // other's budget.
+    //
+    // For `ipc_publish_as`, the bucket key is the **claimed** principal
+    // (the validated `principal_str`), not the uplink's own principal —
+    // otherwise every principal relaying through one uplink would share
+    // a single bucket and could starve each other. Falls back to
+    // `effective_principal()` if `principal_str` is somehow unparseable
+    // (defence-in-depth — `ipc_publish_as` already validates the input,
+    // and the `ipc_publish` path constructs it from a valid `PrincipalId`).
+    let principal = astrid_core::principal::PrincipalId::new(&principal_str)
+        .unwrap_or_else(|_| state.effective_principal());
+    let throughput_cap = usize::try_from(state.effective_profile().quotas.max_ipc_throughput_bytes)
+        .unwrap_or(usize::MAX);
+    state
+        .ipc_limiter
+        .check_quota(state.capsule_uuid, &principal, payload_len, throughput_cap)
+        .map_err(|e| e.to_string())?;
+
+    if !crate::topic::has_valid_segments(&topic) {
+        return Err(
+            "Topic contains empty segments (consecutive dots, leading/trailing dots, or is empty)"
+                .to_string(),
+        );
+    }
+
+    if topic.split('.').count() > 8 {
+        return Err("Topic exceeds maximum allowed segments (8)".to_string());
+    }
+
+    // Enforce IPC topic publishing restrictions from Capsule.toml.
+    // Fail-closed: capsules without ipc_publish declarations cannot
+    // publish. Protected topics (kernel.*) require explicit declaration
+    // even if a capsule has other patterns — defense-in-depth against
+    // privilege escalation.
+    if state.ipc_publish_patterns.is_empty() {
+        return Err(format!(
+            "Capsule '{}' has no ipc_publish declarations — publishing is denied. \
+             Add ipc_publish patterns to Capsule.toml [capabilities]",
+            state.capsule_id
+        ));
+    }
+
+    if !state
+        .ipc_publish_patterns
+        .iter()
+        .any(|pattern| crate::topic::topic_matches(&topic, pattern))
+    {
+        return Err(format!(
+            "Capsule '{}' is not allowed to publish to topic '{topic}' — \
+             declared ipc_publish patterns: {:?}",
+            state.capsule_id, state.ipc_publish_patterns
+        ));
+    }
+
+    let payload_bytes = payload.as_bytes();
+
+    if payload_bytes.len() > util::MAX_GUEST_PAYLOAD_LEN as usize {
+        return Err(format!(
+            "IPC payload exceeds maximum allowed length ({} bytes)",
+            util::MAX_GUEST_PAYLOAD_LEN
+        ));
+    }
+
+    // Deserialize the guest payload into an IpcPayload, falling back to
+    // Custom for unrecognised or missing type tags. See
+    // `IpcPayload::from_json_value` for the rationale behind the
+    // pre-check.
+    let ipc_payload = match serde_json::from_slice::<serde_json::Value>(payload_bytes) {
+        Ok(data) => IpcPayload::from_json_value(data),
+        Err(_) => return Err("IPC payload is not valid JSON".to_string()),
+    };
+
+    let message =
+        IpcMessage::new(topic, ipc_payload, state.capsule_uuid).with_principal(principal_str);
+
+    let event = AstridEvent::Ipc {
+        metadata: EventMetadata::new("wasm_guest").with_session_id(state.capsule_uuid),
+        message,
+    };
+
+    state.event_bus.publish(event);
+    Ok(())
 }
 
 #[cfg(test)]

@@ -697,7 +697,12 @@ impl ExecutionEngine for WasmEngine {
                     hook_manager: None, // Will be injected by Gateway
                     capsule_registry: ctx.capsule_registry.clone(),
                     runtime_handle: tokio::runtime::Handle::current(),
-                    has_uplink_capability: !manifest.uplinks.is_empty(),
+                    // `has_uplink_capability` reflects the `[capabilities].uplink`
+                    // bit (binds a socket / accepts external clients), NOT the
+                    // `[[uplink]]` declarations (which list target platforms a
+                    // capsule provides). Gates `ipc-publish-as` so only uplinks
+                    // can stamp messages on behalf of external principals.
+                    has_uplink_capability: manifest.capabilities.uplink,
                     inbound_tx: tx,
                     registered_uplinks: Vec::new(),
                     lifecycle_phase: None,
