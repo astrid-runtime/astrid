@@ -69,6 +69,7 @@ fn all_admin_variants() -> Vec<AdminRequestKind> {
         AdminRequestKind::CapsGrant {
             principal: pid("a"),
             capabilities: vec!["self:capsule:install".into()],
+            unsafe_admin: false,
         },
         AdminRequestKind::CapsRevoke {
             principal: pid("a"),
@@ -188,6 +189,7 @@ fn admin_target_principal_some_for_cross_tenant_variants() {
         admin_target_principal(&AdminRequestKind::CapsGrant {
             principal: pid("a"),
             capabilities: vec!["self:capsule:install".into()],
+            unsafe_admin: false,
         })
         .is_some()
     );

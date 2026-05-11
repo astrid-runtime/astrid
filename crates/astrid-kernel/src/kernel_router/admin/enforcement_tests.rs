@@ -113,6 +113,7 @@ async fn disabled_principal_denied_on_admin_topic() {
         AdminRequestKind::CapsGrant {
             principal: pid("target_user"),
             capabilities: vec!["self:capsule:install".into()],
+            unsafe_admin: false,
         }
         .into(),
     )
@@ -157,6 +158,7 @@ async fn enabled_principal_proceeds_through_admin_topic() {
         AdminRequestKind::CapsGrant {
             principal: pid("target_user"),
             capabilities: vec!["self:capsule:install".into()],
+            unsafe_admin: false,
         }
         .into(),
     )
@@ -190,6 +192,7 @@ async fn admin_request_audit_includes_params_payload() {
         AdminRequestKind::CapsGrant {
             principal: pid("target_user"),
             capabilities: vec!["self:capsule:install".into(), "self:capsule:list".into()],
+            unsafe_admin: false,
         }
         .into(),
     )

@@ -101,6 +101,7 @@ fn all_admin_variants() -> Vec<AdminRequestKind> {
         AdminRequestKind::CapsGrant {
             principal: pid("target"),
             capabilities: vec!["self:capsule:install".into()],
+            unsafe_admin: false,
         },
         AdminRequestKind::CapsRevoke {
             principal: pid("target"),
@@ -248,6 +249,7 @@ fn admin_target_principal_matches_wire_shape() {
         admin_target_principal(&AdminRequestKind::CapsGrant {
             principal: pid("alice"),
             capabilities: vec!["self:capsule:install".into()],
+            unsafe_admin: false,
         })
         .is_some()
     );
@@ -276,6 +278,7 @@ fn admin_kernel_request_roundtrips_through_json_with_request_id() {
         AdminRequestKind::CapsGrant {
             principal: pid("alice"),
             capabilities: vec!["self:capsule:install".into()],
+            unsafe_admin: false,
         },
     );
     let v = serde_json::to_value(&req).unwrap();
@@ -288,9 +291,11 @@ fn admin_kernel_request_roundtrips_through_json_with_request_id() {
         AdminRequestKind::CapsGrant {
             principal,
             capabilities,
+            unsafe_admin,
         } => {
             assert_eq!(principal, pid("alice"));
             assert_eq!(capabilities, vec!["self:capsule:install".to_string()]);
+            assert!(!unsafe_admin);
         },
         other => panic!("unexpected variant: {other:?}"),
     }

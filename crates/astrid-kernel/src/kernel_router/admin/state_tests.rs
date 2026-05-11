@@ -277,6 +277,7 @@ async fn caps_grant_on_nonexistent_principal_is_rejected() {
         AdminRequestKind::CapsGrant {
             principal: pid("typo_principal"),
             capabilities: vec!["capsule:install".into()],
+            unsafe_admin: false,
         },
     )
     .await;
@@ -694,6 +695,7 @@ async fn caps_grant_appends_and_invalidates_cache() {
         AdminRequestKind::CapsGrant {
             principal: pid("grace"),
             capabilities: vec!["capsule:install".into()],
+            unsafe_admin: false,
         },
     )
     .await;
@@ -734,6 +736,7 @@ async fn caps_grant_does_not_clear_matching_revoke() {
         AdminRequestKind::CapsGrant {
             principal: pid("henry"),
             capabilities: vec!["self:capsule:install".into()],
+            unsafe_admin: false,
         },
     )
     .await;
@@ -797,6 +800,7 @@ async fn caps_grant_is_idempotent_no_disk_growth_on_repeat() {
             AdminRequestKind::CapsGrant {
                 principal: pid("indy"),
                 capabilities: vec!["capsule:install".into(), "capsule:remove".into()],
+                unsafe_admin: false,
             },
         )
         .await;
@@ -860,10 +864,75 @@ async fn caps_grant_rejects_invalid_capability_grammar() {
         AdminRequestKind::CapsGrant {
             principal: pid("julia"),
             capabilities: vec!["system:shut down".into()], // space → invalid
+            unsafe_admin: false,
         },
     )
     .await;
     assert_error_contains(&res, "rejected");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn caps_grant_universal_requires_unsafe_admin_acknowledgement() {
+    // F-E: `caps grant <agent> "*"` must be acknowledged via
+    // `unsafe_admin = true`. Mirrors the group-level rail
+    // (`group create --caps "*"`) so an individual grant can't
+    // silently promote a principal to universal admin.
+    let (_dir, kernel) = fixture().await;
+    handlers::dispatch(
+        &kernel,
+        AdminRequestKind::AgentCreate {
+            name: "luke".into(),
+            groups: Vec::new(),
+            grants: Vec::new(),
+        },
+    )
+    .await;
+
+    // 1. Without `unsafe_admin` — rejected with a clear error.
+    let rejected = handlers::dispatch(
+        &kernel,
+        AdminRequestKind::CapsGrant {
+            principal: pid("luke"),
+            capabilities: vec!["*".into()],
+            unsafe_admin: false,
+        },
+    )
+    .await;
+    assert_error_contains(&rejected, "universal admin");
+    assert_error_contains(&rejected, "unsafe_admin");
+
+    // Profile must not have been mutated by the rejected request.
+    let path = PrincipalProfile::path_for(&kernel.astrid_home, &pid("luke"));
+    let profile = PrincipalProfile::load_from_path(&path).unwrap();
+    assert!(profile.grants.is_empty(), "rejected grant must not persist");
+
+    // 2. Multi-segment wildcards stay unaffected — only the literal
+    //    bare `*` is gated.
+    let scoped = handlers::dispatch(
+        &kernel,
+        AdminRequestKind::CapsGrant {
+            principal: pid("luke"),
+            capabilities: vec!["network:egress:*".into()],
+            unsafe_admin: false,
+        },
+    )
+    .await;
+    assert_success(&scoped);
+
+    // 3. With `unsafe_admin = true` — accepted.
+    let accepted = handlers::dispatch(
+        &kernel,
+        AdminRequestKind::CapsGrant {
+            principal: pid("luke"),
+            capabilities: vec!["*".into()],
+            unsafe_admin: true,
+        },
+    )
+    .await;
+    assert_success(&accepted);
+    let profile = PrincipalProfile::load_from_path(&path).unwrap();
+    assert!(profile.grants.contains(&"*".to_string()));
+    assert!(profile.grants.contains(&"network:egress:*".to_string()));
 }
 
 // ── Concurrency: write lock serializes mutations ────────────────────
@@ -892,6 +961,7 @@ async fn concurrent_caps_grants_serialized_by_admin_write_lock() {
             AdminRequestKind::CapsGrant {
                 principal: pid("kate"),
                 capabilities: vec!["capsule:install".into()],
+                unsafe_admin: false,
             },
         )
         .await
@@ -902,6 +972,7 @@ async fn concurrent_caps_grants_serialized_by_admin_write_lock() {
             AdminRequestKind::CapsGrant {
                 principal: pid("kate"),
                 capabilities: vec!["capsule:remove".into()],
+                unsafe_admin: false,
             },
         )
         .await

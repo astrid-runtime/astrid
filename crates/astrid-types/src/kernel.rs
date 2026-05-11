@@ -260,6 +260,13 @@ pub enum AdminRequestKind {
         principal: PrincipalId,
         /// Capability patterns to add.
         capabilities: Vec<String>,
+        /// Required when `capabilities` contains the universal `*`
+        /// pattern. Mirrors the `unsafe_admin` rail on
+        /// [`Self::GroupCreate`] / [`Self::GroupModify`] so an
+        /// individual grant cannot escalate a principal to universal
+        /// admin without an explicit acknowledgement.
+        #[serde(default)]
+        unsafe_admin: bool,
     },
     /// Append capability patterns to the principal's `revokes` vec. Safe
     /// to call on caps the principal does not currently hold
