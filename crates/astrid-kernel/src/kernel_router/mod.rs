@@ -273,6 +273,16 @@ async fn handle_request(
             let uptime = kernel.boot_time.elapsed().as_secs();
             let reg = kernel.capsules.read().await;
             let loaded: Vec<String> = reg.list().iter().map(ToString::to_string).collect();
+            let by_principal = kernel
+                .connections_by_principal()
+                .into_iter()
+                .map(
+                    |(p, c)| astrid_events::kernel_api::PrincipalConnectionCount {
+                        principal: p.to_string(),
+                        count: u32::try_from(c).unwrap_or(u32::MAX),
+                    },
+                )
+                .collect();
             let status = astrid_events::kernel_api::DaemonStatus {
                 pid: std::process::id(),
                 uptime_secs: uptime,
@@ -280,6 +290,7 @@ async fn handle_request(
                 ephemeral: false, // The kernel doesn't know; daemon sets this via response override if needed
                 connected_clients: u32::try_from(kernel.total_connection_count())
                     .unwrap_or(u32::MAX),
+                connections_by_principal: by_principal,
                 loaded_capsules: loaded,
             };
             KernelResponse::Status(status)
