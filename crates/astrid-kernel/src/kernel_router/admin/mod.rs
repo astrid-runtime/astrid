@@ -114,7 +114,19 @@ pub fn resolve_admin_scope(req: &AdminRequestKind, caller: &PrincipalId) -> Auth
                 AuthorityScope::Global
             }
         },
-        AdminRequestKind::AgentList => AuthorityScope::Self_,
+        // `GroupList` is read-only over system config and carries no
+        // target principal; every agent legitimately needs to read it
+        // to enumerate their own group-inherited capabilities (e.g.
+        // `caps check <self>` follows AgentList with GroupList to
+        // resolve `(group: agent)` → `self:agent:list`). Self-scoping
+        // makes the request match against `self:group:list`, which
+        // the `self:*` grant on the `agent` builtin already satisfies
+        // — without handing out the admin-tier `group:list` capability.
+        // The mutating group operations (`group create / delete /
+        // modify`) keep their own dedicated caps (`group:create`,
+        // `group:delete`, `group:modify`) and remain
+        // `AuthorityScope::Global` below, so this widening is read-only.
+        AdminRequestKind::AgentList | AdminRequestKind::GroupList => AuthorityScope::Self_,
         AdminRequestKind::AgentCreate { .. }
         | AdminRequestKind::AgentDelete { .. }
         | AdminRequestKind::AgentEnable { .. }
@@ -123,7 +135,6 @@ pub fn resolve_admin_scope(req: &AdminRequestKind, caller: &PrincipalId) -> Auth
         | AdminRequestKind::GroupCreate { .. }
         | AdminRequestKind::GroupDelete { .. }
         | AdminRequestKind::GroupModify { .. }
-        | AdminRequestKind::GroupList
         | AdminRequestKind::CapsGrant { .. }
         | AdminRequestKind::CapsRevoke { .. } => AuthorityScope::Global,
     }
@@ -158,7 +169,8 @@ pub fn required_capability_for_admin_request(
         (AdminRequestKind::GroupCreate { .. }, _) => "group:create",
         (AdminRequestKind::GroupDelete { .. }, _) => "group:delete",
         (AdminRequestKind::GroupModify { .. }, _) => "group:modify",
-        (AdminRequestKind::GroupList, _) => "group:list",
+        (AdminRequestKind::GroupList, AuthorityScope::Self_) => "self:group:list",
+        (AdminRequestKind::GroupList, AuthorityScope::Global) => "group:list",
         (AdminRequestKind::CapsGrant { .. }, _) => "caps:grant",
         (AdminRequestKind::CapsRevoke { .. }, _) => "caps:revoke",
     }
