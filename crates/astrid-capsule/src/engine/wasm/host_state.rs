@@ -493,6 +493,108 @@ impl HostState {
             None => astrid_core::profile::PrincipalProfile::default_ref(),
         }
     }
+
+    /// Install per-invocation context from an inbound IPC message picked
+    /// up via [`ipc::Host::ipc_recv`](crate::engine::wasm::host::ipc) /
+    /// [`ipc::Host::ipc_poll`].
+    ///
+    /// Mirrors the principal-isolation setup done in
+    /// [`WasmEngine::invoke_interceptor`](super::WasmEngine::invoke_interceptor)
+    /// for the dispatcher path, but driven by `recv`/`poll` so that
+    /// `run + ipc::recv` capsules (prompt-builder, registry,
+    /// context-engine) also stamp publishes with the publisher's
+    /// principal and route reads/writes to the invoking principal's
+    /// namespaces. Without this hook these capsules silently fall back
+    /// to the owner principal (`default` for the standard distro),
+    /// breaking chat for any non-default agent: the publish goes out
+    /// stamped `default`, downstream interceptors load the wrong KV
+    /// namespace, the turn-state phase doesn't match, and the chain
+    /// stalls.
+    ///
+    /// Sets up the subset relevant to publish stamping and per-principal
+    /// KV / log routing:
+    /// - [`caller_context`](Self::caller_context) — drives both
+    ///   [`effective_principal`](Self::effective_principal) and the
+    ///   `principal_str` chosen by `publish_inner`.
+    /// - [`invocation_kv`](Self::invocation_kv) — per-principal KV
+    ///   namespace; falls back to load-time `kv` on failure.
+    /// - [`invocation_capsule_log`](Self::invocation_capsule_log) —
+    ///   per-principal log file; falls back to load-time `capsule_log`
+    ///   when the principal has no home directory yet.
+    ///
+    /// Skipped vs the interceptor path (each is independently
+    /// recoverable; documenting the gaps so the omissions are
+    /// auditable):
+    /// - `invocation_home` / `invocation_tmp` / `invocation_secret_store` —
+    ///   none of the current run+recv capsules touch home/tmp paths
+    ///   or secrets from the recv loop. Add when one starts to.
+    /// - `invocation_profile` / `store_limits` — quotas remain the
+    ///   capsule owner's. Acceptable for the immediate fix because
+    ///   the run+recv capsules are shared singletons whose per-call
+    ///   work is bounded by the message size limits already in the
+    ///   bus. Move to a real lookup when per-principal quota
+    ///   enforcement is needed.
+    pub(crate) fn install_recv_invocation_context(&mut self, msg: &astrid_events::ipc::IpcMessage) {
+        // Fast path: if the new message's principal matches whatever
+        // we already have installed, keep the existing
+        // `invocation_kv` / `invocation_capsule_log` rather than
+        // re-opening the namespace and log file. The chat-stack run
+        // loop calls this on every recv tick — re-init each time
+        // burns I/O and allocations for no behavioural change.
+        let new_principal = msg.principal.clone();
+        let existing_principal = self
+            .caller_context
+            .as_ref()
+            .and_then(|c| c.principal.clone());
+        if new_principal == existing_principal {
+            // Refresh the caller context so e.g. topic name / payload
+            // tracking stays current, but skip the expensive resets.
+            self.caller_context = Some(msg.clone());
+            return;
+        }
+
+        self.caller_context = Some(msg.clone());
+
+        let invocation_principal: Option<astrid_core::PrincipalId> = msg
+            .principal
+            .as_deref()
+            .and_then(|p| astrid_core::PrincipalId::new(p).ok())
+            .filter(|p| *p != self.principal);
+
+        let Some(p) = invocation_principal else {
+            self.invocation_kv = None;
+            self.invocation_capsule_log = None;
+            return;
+        };
+
+        let ns = format!("{}:capsule:{}", p, self.capsule_id);
+        self.invocation_kv = match self.kv.with_namespace(&ns) {
+            Ok(kv) => Some(kv),
+            Err(e) => {
+                tracing::warn!(
+                    principal = %p,
+                    error = %e,
+                    "Failed to create invocation KV scope on ipc::recv path"
+                );
+                None
+            },
+        };
+
+        self.invocation_capsule_log = super::open_capsule_log(&p, self.capsule_id.as_str(), false);
+    }
+
+    /// Tear down per-invocation context installed by
+    /// [`install_recv_invocation_context`](Self::install_recv_invocation_context).
+    ///
+    /// Called on empty `ipc_poll` / `ipc_recv` returns so a previous
+    /// publisher's context doesn't leak into subsequent guest host
+    /// calls (KV reads, publishes) that happen before the next recv
+    /// pulls fresh state.
+    pub(crate) fn clear_recv_invocation_context(&mut self) {
+        self.caller_context = None;
+        self.invocation_kv = None;
+        self.invocation_capsule_log = None;
+    }
 }
 
 impl std::fmt::Debug for HostState {
