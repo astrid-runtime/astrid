@@ -303,6 +303,18 @@ impl AstridHome {
         self.root.join("log")
     }
 
+    /// Secrets directory (`secrets/`).
+    ///
+    /// File-per-secret store keyed by
+    /// `secrets/<scope>/<capsule>/<key>`. `<scope>` is either an
+    /// agent principal name (per-agent override) or `__host__` (the
+    /// shared / operator-wide value the kernel's secret-resolve path
+    /// falls back to). Files are written `0600`, parent dirs `0700`.
+    #[must_use]
+    pub fn secrets_dir(&self) -> PathBuf {
+        self.root.join("secrets")
+    }
+
     /// Keys directory (`keys/`).
     #[must_use]
     pub fn keys_dir(&self) -> PathBuf {

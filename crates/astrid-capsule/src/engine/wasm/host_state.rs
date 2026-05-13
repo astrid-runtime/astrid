@@ -160,7 +160,26 @@ pub struct HostState {
     /// Counter for issuing subscription handle IDs.
     pub next_subscription_id: u64,
     /// Plugin configuration from the manifest.
+    ///
+    /// Holds only **non-secret** env values (the `[env]` declarations
+    /// in `Capsule.toml` whose `type` is not `"secret"` — base URLs,
+    /// model names, log levels, etc.). Secret-typed keys are
+    /// resolved live in [`crate::engine::wasm::host::sys`] through
+    /// `resolve_secret` (file-per-secret store, see
+    /// [`astrid_storage::FileSecretStore`]) instead of being preloaded
+    /// here, so plaintext secret material never sits in
+    /// `wasm_config`'s hot memory.
     pub config: HashMap<String, serde_json::Value>,
+    /// Manifest-declared secret-typed env keys. Populated at load
+    /// time from `manifest.env` entries with `type = "secret"`. Used
+    /// by [`crate::engine::wasm::host::sys::Host::get_config`] to
+    /// route reads through the file-per-secret store instead of
+    /// `config`. The scope (per-agent vs host-wide) is an
+    /// operator-side decision at `astrid secret set` time, not a
+    /// manifest declaration, so the kernel always tries per-agent
+    /// first and falls through to host-wide regardless of where the
+    /// operator stored the value.
+    pub secret_env: std::collections::HashSet<String>,
     /// IPC topic patterns this capsule is allowed to publish to.
     /// Empty means DENY ALL (fail-closed).
     pub ipc_publish_patterns: Vec<String>,

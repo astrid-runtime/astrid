@@ -16,6 +16,21 @@ struct TriggerRequest {
 
 impl sys::Host for HostState {
     fn get_config(&mut self, key: String) -> Result<String, String> {
+        // Manifest-declared secrets route through the OS keychain
+        // (`astrid_storage::KeychainSecretStore`) at invocation time,
+        // never through `self.config`. This keeps plaintext secret
+        // material off disk and out of long-lived host memory.
+        //
+        // Lookup precedence: per-invocation principal first, then
+        // host-wide fall-through. Scope is operator-decided at
+        // `astrid secret set --scope` time (not a manifest
+        // declaration), so the kernel-side read path always tries
+        // both slots — whichever slot the operator populated is
+        // what gets used.
+        if self.secret_env.contains(&key) {
+            return Ok(resolve_secret(self, &key));
+        }
+
         let value = self.config.get(&key).cloned();
 
         // Return the raw string value, not JSON-encoded.
@@ -289,6 +304,83 @@ impl sys::Host for HostState {
 
         Ok(CapabilityCheckResponse { allowed })
     }
+}
+
+/// Resolve a secret-typed env value through the file-per-secret store.
+///
+/// Precedence (fixed — operator-controlled where the value lives,
+/// kernel just follows the lookup chain):
+/// 1. **Per-agent** — file at
+///    `~/.astrid/secrets/<effective_principal>/<capsule>/<key>`,
+///    backed by [`astrid_storage::FileSecretStore`]. Tried first so an
+///    agent's explicit override always wins over the host-wide value.
+/// 2. **Host-wide** — file at
+///    `~/.astrid/secrets/__host__/<capsule>/<key>`. Consulted on
+///    per-agent miss so an operator who set `--scope shared` makes the
+///    value visible to every agent that hasn't set their own override.
+///
+/// The capsule manifest does NOT declare scope — it only marks the
+/// key as `type = "secret"`. The operator decides per-agent vs
+/// host-wide at `astrid secret set --scope` time. This prevents a
+/// third-party capsule from declaring its own credentials shared
+/// (privilege escalation: bot tokens, OAuth bindings, etc.).
+///
+/// Returns `String::new()` on miss so the guest-side `env::var`
+/// reader sees the same empty-string-on-absent semantic that the
+/// `config` path produces. I/O errors from the file store are
+/// logged (`security_event = true`) and treated as miss — the
+/// capsule continues with no value rather than panicking the
+/// invocation, matching how an unset env-var would normally fail
+/// downstream within the capsule's own logic.
+fn resolve_secret(state: &HostState, key: &str) -> String {
+    use astrid_storage::{FileSecretStore, SecretStore};
+
+    let capsule = state.capsule_id.as_str();
+    let principal = state.effective_principal();
+
+    // The CLI write path lays secrets at
+    // `~/.astrid/secrets/<scope>/<capsule>/<key>`. The kernel resolves
+    // the same `AstridHome` to find the file root, then probes per-
+    // agent first and falls through to the shared `__host__` slot —
+    // mirroring the keychain precedence the pivot replaced.
+    let Ok(home) = astrid_core::dirs::AstridHome::resolve() else {
+        tracing::warn!(
+            security_event = true,
+            %principal,
+            capsule,
+            key,
+            "AstridHome::resolve failed during secret lookup"
+        );
+        return String::new();
+    };
+    let secrets_dir = home.secrets_dir();
+
+    let try_get = |scope: &str| -> Option<String> {
+        let store = FileSecretStore::new(secrets_dir.join(scope).join(capsule));
+        match store.get(key) {
+            Ok(value) => value,
+            Err(e) => {
+                tracing::warn!(
+                    security_event = true,
+                    %principal,
+                    capsule,
+                    key,
+                    scope,
+                    error = %e,
+                    "file secret-store read failed for secret-typed env key"
+                );
+                None
+            },
+        }
+    };
+
+    if let Some(v) = try_get(principal.as_str()) {
+        return v;
+    }
+    if let Some(v) = try_get("__host__") {
+        return v;
+    }
+    String::new()
 }
 
 // ---------------------------------------------------------------------------

@@ -676,6 +676,21 @@ impl ExecutionEngine for WasmEngine {
                     subscriptions: std::collections::HashMap::new(),
                     next_subscription_id,
                     config: wasm_config,
+                    // Secret-typed env keys from the manifest.
+                    // `get_config` routes these through the keychain
+                    // (per-invocation principal-scoped, with host-
+                    // wide fall-through) instead of reading from
+                    // `config`. Non-secret entries stay in `config`
+                    // and behave as before. Scope is an operator-
+                    // side concept at `astrid secret set` time, not
+                    // a manifest declaration — the lookup precedence
+                    // is fixed (per-agent first, host-wide on miss).
+                    secret_env: manifest
+                        .env
+                        .iter()
+                        .filter(|(_, d)| d.env_type.eq_ignore_ascii_case("secret"))
+                        .map(|(k, _)| k.clone())
+                        .collect(),
                     // RFC cargo-like-manifest: prefer [publish] / [subscribe] keys
                     // over the legacy [capabilities].ipc_publish / .ipc_subscribe arrays
                     // when the capsule declares them. The helper falls back to the
@@ -1413,6 +1428,7 @@ pub fn run_lifecycle(
         subscriptions: std::collections::HashMap::new(),
         next_subscription_id: 1,
         config: cfg.config,
+        secret_env: std::collections::HashSet::new(),
         ipc_publish_patterns: Vec::new(),
         ipc_subscribe_patterns: Vec::new(),
         security: None,
