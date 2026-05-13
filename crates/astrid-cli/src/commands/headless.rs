@@ -7,6 +7,28 @@ use anyhow::{Context, Result};
 use super::daemon;
 use crate::{formatter, socket_client, tui};
 
+/// Resolve the `--session` flag value into a [`uuid::Uuid`].
+///
+/// Auto-detects: a string that parses as a UUID is returned as-is
+/// (so an operator can copy a printed session id back into the
+/// next `-p` invocation and resume the exact same session). Anything
+/// else is treated as a stable session name and hashed via UUID v5
+/// (`NAMESPACE_URL`) so the same name always maps to the same
+/// session across invocations. Matches the `cargo` / `gh` /
+/// `claude` convention of accepting either form for the same flag.
+/// Returns the resolved [`Uuid`] and whether the input parsed as a UUID
+/// directly (`true`) or was hashed from a name (`false`). Callers
+/// that need to differentiate the two cases — e.g. `--print-session`
+/// — would otherwise re-run `Uuid::parse_str` on the same input to
+/// recover that bit.
+fn resolve_session_arg(s: &str) -> (uuid::Uuid, bool) {
+    if let Ok(uuid) = uuid::Uuid::parse_str(s) {
+        return (uuid, true);
+    }
+    let ns = uuid::Uuid::NAMESPACE_URL;
+    (uuid::Uuid::new_v5(&ns, s.as_bytes()), false)
+}
+
 /// Snapshot TUI mode: render the TUI to stdout as text frames.
 ///
 /// Uses the same daemon connection as headless mode, but renders through
@@ -22,9 +44,8 @@ pub(crate) async fn run_snapshot_tui(
 
     daemon::ensure_daemon("snapshot-tui").await?;
 
-    let session_id = if let Some(ref name) = session_name {
-        let ns = uuid::Uuid::NAMESPACE_URL;
-        SessionId::from_uuid(uuid::Uuid::new_v5(&ns, name.as_bytes()))
+    let session_id = if let Some(s) = session_name.as_deref() {
+        SessionId::from_uuid(resolve_session_arg(s).0)
     } else {
         SessionId::from_uuid(uuid::Uuid::new_v4())
     };
@@ -67,14 +88,21 @@ pub(crate) async fn run_headless(
 
     daemon::ensure_daemon("headless").await?;
 
-    // Use a named session (deterministic UUID v5 from name) or fresh UUID v4.
-    let session_id = if let Some(ref name) = session_name {
-        // Derive a stable UUID from the session name so the same name always
-        // maps to the same session ID across invocations.
-        let ns = uuid::Uuid::NAMESPACE_URL;
-        let id = uuid::Uuid::new_v5(&ns, name.as_bytes());
+    // `--session` accepts either a raw UUID (re-used as-is for resuming
+    // the exact session `--print-session` reported on a prior turn) or
+    // any other string (used as a stable name and hashed into a
+    // deterministic UUID v5 so the same name always maps to the same
+    // session). UUID-first means an operator can copy a printed
+    // session id straight into the next invocation without it being
+    // re-hashed; `cargo`/`gh`/`claude` use the same convention.
+    let session_id = if let Some(s) = session_name.as_deref() {
+        let (id, was_uuid) = resolve_session_arg(s);
         if print_session {
-            eprintln!("[headless] Session: {name} ({id})");
+            if was_uuid {
+                eprintln!("[headless] Session: {id}");
+            } else {
+                eprintln!("[headless] Session: {s} ({id})");
+            }
         }
         SessionId::from_uuid(id)
     } else {
