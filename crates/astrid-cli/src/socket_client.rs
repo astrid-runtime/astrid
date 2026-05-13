@@ -174,6 +174,51 @@ impl SocketClient {
     /// # Errors
     /// Returns an error if the connection drops or the deadline
     /// elapses without a matching frame.
+    /// Extract the inner kernel response from a raw frame previously
+    /// returned by [`read_until_topic`](Self::read_until_topic).
+    ///
+    /// The kernel's IPC payload arrives in one of two on-wire shapes
+    /// depending on which router branch produced it:
+    ///
+    /// * Bare typed payload — `{ "type": "...", ... }` (already a
+    ///   `KernelResponse`-shaped object that `serde_json::from_value`
+    ///   can deserialize directly).
+    /// * `RawJson`-wrapped payload — `{ "type": "raw_json", "value":
+    ///   { "type": "...", ... } }` (the older router branch wraps the
+    ///   typed body in `IpcPayload::RawJson`).
+    ///
+    /// Both shapes have to be tolerated by every consumer of the bare
+    /// verbs (`astrid status`, `astrid ps`, `astrid who`, `astrid
+    /// doctor`). Returns `None` when the frame has no `payload` field
+    /// or the deserialization fails — callers fall back to an empty
+    /// display rather than crashing the surface.
+    #[must_use]
+    pub fn extract_kernel_response(
+        raw: &serde_json::Value,
+    ) -> Option<astrid_types::kernel::KernelResponse> {
+        let payload = raw.get("payload")?.clone();
+        let value = if payload
+            .as_object()
+            .is_some_and(|m| m.contains_key("type") && m.contains_key("value"))
+        {
+            payload.get("value").cloned().unwrap_or(payload)
+        } else {
+            payload
+        };
+        serde_json::from_value::<astrid_types::kernel::KernelResponse>(value).ok()
+    }
+
+    /// Read raw frames from the socket until one carries `want_topic`
+    /// or the deadline expires. Frames that don't deserialize as JSON
+    /// or carry a different topic are silently skipped, which lets
+    /// the bare verbs (`astrid status`, `astrid ps`, `astrid who`,
+    /// `astrid doctor`) tolerate broadcast frames like
+    /// `astrid.v1.capsules_loaded` whose payload tag doesn't
+    /// round-trip through `IpcPayload::RawJson`.
+    ///
+    /// # Errors
+    /// Returns an error if the deadline elapses, the connection
+    /// closes, or a read fails.
     pub async fn read_until_topic(
         &mut self,
         want_topic: &str,

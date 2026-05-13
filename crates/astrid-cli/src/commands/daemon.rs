@@ -202,20 +202,8 @@ pub(crate) async fn handle_status() -> Result<()> {
                         std::time::Duration::from_secs(10),
                     )
                     .await?;
-                let payload = raw
-                    .get("payload")
-                    .cloned()
-                    .unwrap_or(serde_json::Value::Null);
-                let response_value = if payload
-                    .as_object()
-                    .is_some_and(|m| m.contains_key("type") && m.contains_key("value"))
-                {
-                    payload.get("value").cloned().unwrap_or(payload)
-                } else {
-                    payload
-                };
-                if let Ok(astrid_types::kernel::KernelResponse::Status(status)) =
-                    serde_json::from_value::<astrid_types::kernel::KernelResponse>(response_value)
+                if let Some(astrid_types::kernel::KernelResponse::Status(status)) =
+                    crate::socket_client::SocketClient::extract_kernel_response(&raw)
                 {
                     let uptime_display = format_uptime(status.uptime_secs);
                     println!(
