@@ -44,6 +44,33 @@ pub(crate) fn validate_config() -> Result<()> {
     }
 }
 
+/// Open the global runtime config file (`~/.astrid/etc/config.toml`)
+/// in `$EDITOR` (falling back to `$VISUAL`, then `vi`). Creates the
+/// file if missing so the editor opens on a real path.
+pub(crate) fn edit_config() -> Result<()> {
+    let home = astrid_core::dirs::AstridHome::resolve()
+        .map_err(|e| anyhow::anyhow!("Failed to resolve Astrid home: {e}"))?;
+    let path = home.config_path();
+    if !path.exists() {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(&path, "# Astrid runtime configuration\n")?;
+    }
+    let editor = std::env::var("EDITOR")
+        .ok()
+        .or_else(|| std::env::var("VISUAL").ok())
+        .unwrap_or_else(|| "vi".to_string());
+    let status = std::process::Command::new(&editor)
+        .arg(&path)
+        .status()
+        .map_err(|e| anyhow::anyhow!("Failed to launch '{editor}': {e}"))?;
+    if !status.success() {
+        anyhow::bail!("editor '{editor}' exited with non-zero status");
+    }
+    Ok(())
+}
+
 /// Show all config file paths that are checked.
 #[expect(clippy::unnecessary_wraps)]
 pub(crate) fn show_paths() -> Result<()> {

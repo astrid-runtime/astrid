@@ -439,7 +439,7 @@ fn clone_and_build(
     let output_dir = tmp_dir.path().join("dist");
     std::fs::create_dir_all(&output_dir)?;
 
-    let build_bin = crate::find_companion_binary("astrid-build")?;
+    let build_bin = crate::bootstrap::find_companion_binary("astrid-build")?;
     let build_status = std::process::Command::new(build_bin)
         .arg(clone_dir.to_str().context("Invalid clone dir path")?)
         .arg("--output")
@@ -496,7 +496,7 @@ pub(crate) fn transpile_and_install(
     let output_dir = tmp_dir.path();
 
     // Delegate to astrid-build for OpenClaw compilation
-    let build_bin = crate::find_companion_binary("astrid-build")?;
+    let build_bin = crate::bootstrap::find_companion_binary("astrid-build")?;
     let status = std::process::Command::new(build_bin)
         .arg(source_path)
         .arg("--output")
@@ -550,7 +550,7 @@ pub(crate) fn install_from_local(
         let tmp_dir = tempfile::tempdir().context("failed to create temp dir for building")?;
         let output_dir = tmp_dir.path().join("dist");
 
-        let build_bin = crate::find_companion_binary("astrid-build")?;
+        let build_bin = crate::bootstrap::find_companion_binary("astrid-build")?;
         let status = std::process::Command::new(build_bin)
             .arg(source)
             .arg("--output")

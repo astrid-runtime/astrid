@@ -64,6 +64,7 @@ base64 = "0.22"
 blake3 = "1.5"
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4.5", features = ["derive", "env"] }
+clap_complete = "4.5"
 colored = "2.1"
 crossterm = "0.28"
 dashmap = "6.1.0"
@@ -77,6 +78,7 @@ globset = "0.4"
 hex = "0.4"
 ignore = "0.4"
 indicatif = "0.17"
+insta = { version = "1.40", features = ["yaml", "json"] }
 jsonrpsee = { version = "0.24", features = ["server", "client", "macros"] }
 keyring = { version = "3", features = ["async-secret-service", "crypto-rust"] }
 landlock = "0.4"

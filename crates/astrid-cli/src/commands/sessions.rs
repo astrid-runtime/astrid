@@ -5,17 +5,10 @@ use astrid_core::dirs::AstridHome;
 use colored::Colorize;
 use std::fs;
 
-use crate::{SessionCommands, theme::Theme};
+use crate::theme::Theme;
 
-pub(crate) fn handle_session_commands(command: SessionCommands) -> Result<()> {
-    match command {
-        SessionCommands::List => list_sessions(),
-        SessionCommands::Delete { id } => delete_session(&id),
-        SessionCommands::Info { id } => session_info(&id),
-    }
-}
-
-fn list_sessions() -> Result<()> {
+/// List all session directories under `run/`.
+pub(crate) fn list_sessions() -> Result<()> {
     let home = AstridHome::resolve().context("Failed to resolve Astrid home directory")?;
     let sessions_dir = home.run_dir();
 
@@ -56,7 +49,8 @@ fn list_sessions() -> Result<()> {
     Ok(())
 }
 
-fn delete_session(id: &str) -> Result<()> {
+/// Delete a session by UUID.
+pub(crate) fn delete_session(id: &str) -> Result<()> {
     // Validate as UUID to prevent path traversal (e.g. "../../config")
     uuid::Uuid::parse_str(id)
         .map_err(|_| anyhow::anyhow!("Invalid session ID (must be a UUID): {id}"))?;
@@ -72,7 +66,8 @@ fn delete_session(id: &str) -> Result<()> {
     Ok(())
 }
 
-fn session_info(id: &str) -> Result<()> {
+/// Show information about a session by UUID.
+pub(crate) fn session_info(id: &str) -> Result<()> {
     uuid::Uuid::parse_str(id)
         .map_err(|_| anyhow::anyhow!("Invalid session ID (must be a UUID): {id}"))?;
     let home = AstridHome::resolve().context("Failed to resolve Astrid home directory")?;

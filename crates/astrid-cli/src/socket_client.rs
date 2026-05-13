@@ -99,31 +99,154 @@ impl SocketClient {
         })
     }
 
-    /// Read the next event from the Kernel.
-    ///
     /// Read the next IPC message from the daemon.
     ///
-    /// The CLI proxy capsule sends individual `IpcMessage` objects over the
-    /// socket as length-prefixed JSON.
+    /// The CLI proxy capsule sends individual `IpcMessage` objects over
+    /// the socket as length-prefixed JSON. Frames whose payload does
+    /// not deserialize into [`IpcMessage`] (notably the kernel's
+    /// `astrid.v1.capsules_loaded` broadcast, whose `IpcPayload::RawJson`
+    /// inner value is emitted without the `type` discriminator) are
+    /// logged at `debug` and skipped — the caller reads the next valid
+    /// frame instead. Without this tolerance, every interactive client
+    /// would die on the first broadcast.
     ///
     /// # Errors
-    /// Returns an error if the message cannot be read or parsed.
+    /// Returns an error if the connection is in an unrecoverable state
+    /// (over-large frame, IO failure mid-read).
     pub async fn read_message(&mut self) -> Result<Option<IpcMessage>> {
+        loop {
+            let mut len_buf = [0u8; 4];
+            if self.read_half.read_exact(&mut len_buf).await.is_err() {
+                return Ok(None); // Connection closed
+            }
+            let len = u32::from_be_bytes(len_buf) as usize;
+
+            if len > 50 * 1024 * 1024 {
+                anyhow::bail!("Message too large from kernel: {len} bytes");
+            }
+
+            let mut payload = vec![0u8; len];
+            self.read_half.read_exact(&mut payload).await?;
+
+            if let Ok(message) = serde_json::from_slice::<IpcMessage>(&payload) {
+                return Ok(Some(message));
+            }
+            let preview = String::from_utf8_lossy(&payload[..payload.len().min(120)]);
+            tracing::debug!(
+                preview = %preview,
+                "skipping unparseable frame from daemon"
+            );
+        }
+    }
+
+    /// Read the next length-prefixed frame as raw bytes, without
+    /// attempting to deserialize. Used by [`crate::admin_client`] when
+    /// it needs to tolerate broadcast messages that don't deserialize
+    /// cleanly into [`IpcMessage`] (e.g. the kernel's
+    /// `astrid.v1.capsules_loaded` payload, which serializes without a
+    /// `type` discriminator on the inner JSON).
+    ///
+    /// # Errors
+    /// Returns an error if the frame cannot be read.
+    pub async fn read_raw_frame(&mut self) -> Result<Option<Vec<u8>>> {
         let mut len_buf = [0u8; 4];
         if self.read_half.read_exact(&mut len_buf).await.is_err() {
-            return Ok(None); // Connection closed
+            return Ok(None);
         }
         let len = u32::from_be_bytes(len_buf) as usize;
-
         if len > 50 * 1024 * 1024 {
             anyhow::bail!("Message too large from kernel: {len} bytes");
         }
-
         let mut payload = vec![0u8; len];
         self.read_half.read_exact(&mut payload).await?;
+        Ok(Some(payload))
+    }
 
-        let message = serde_json::from_slice::<IpcMessage>(&payload)?;
-        Ok(Some(message))
+    /// Read frames until one arrives on `want_topic`, skipping
+    /// broadcasts (e.g. `astrid.v1.capsules_loaded`) whose payload
+    /// fails strict [`IpcMessage`] deserialization.
+    ///
+    /// Returns the parsed JSON value of the first matching frame so
+    /// the caller can pull whatever shape it expects out of `payload`
+    /// — useful for kernel responses (`KernelResponse`) whose inner
+    /// JSON does not round-trip through the `IpcPayload` tag.
+    ///
+    /// # Errors
+    /// Returns an error if the connection drops or the deadline
+    /// elapses without a matching frame.
+    /// Extract the inner kernel response from a raw frame previously
+    /// returned by [`read_until_topic`](Self::read_until_topic).
+    ///
+    /// The kernel's IPC payload arrives in one of two on-wire shapes
+    /// depending on which router branch produced it:
+    ///
+    /// * Bare typed payload — `{ "type": "...", ... }` (already a
+    ///   `KernelResponse`-shaped object that `serde_json::from_value`
+    ///   can deserialize directly).
+    /// * `RawJson`-wrapped payload — `{ "type": "raw_json", "value":
+    ///   { "type": "...", ... } }` (the older router branch wraps the
+    ///   typed body in `IpcPayload::RawJson`).
+    ///
+    /// Both shapes have to be tolerated by every consumer of the bare
+    /// verbs (`astrid status`, `astrid ps`, `astrid who`, `astrid
+    /// doctor`). Returns `None` when the frame has no `payload` field
+    /// or the deserialization fails — callers fall back to an empty
+    /// display rather than crashing the surface.
+    #[must_use]
+    pub fn extract_kernel_response(
+        raw: &serde_json::Value,
+    ) -> Option<astrid_types::kernel::KernelResponse> {
+        let payload = raw.get("payload")?.clone();
+        let value = if payload
+            .as_object()
+            .is_some_and(|m| m.contains_key("type") && m.contains_key("value"))
+        {
+            payload.get("value").cloned().unwrap_or(payload)
+        } else {
+            payload
+        };
+        serde_json::from_value::<astrid_types::kernel::KernelResponse>(value).ok()
+    }
+
+    /// Read raw frames from the socket until one carries `want_topic`
+    /// or the deadline expires. Frames that don't deserialize as JSON
+    /// or carry a different topic are silently skipped, which lets
+    /// the bare verbs (`astrid status`, `astrid ps`, `astrid who`,
+    /// `astrid doctor`) tolerate broadcast frames like
+    /// `astrid.v1.capsules_loaded` whose payload tag doesn't
+    /// round-trip through `IpcPayload::RawJson`.
+    ///
+    /// # Errors
+    /// Returns an error if the deadline elapses, the connection
+    /// closes, or a read fails.
+    pub async fn read_until_topic(
+        &mut self,
+        want_topic: &str,
+        timeout: std::time::Duration,
+    ) -> Result<serde_json::Value> {
+        let deadline = tokio::time::Instant::now()
+            .checked_add(timeout)
+            .unwrap_or_else(tokio::time::Instant::now);
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                anyhow::bail!("timed out waiting for {want_topic}");
+            }
+            let read = tokio::time::timeout(remaining, self.read_raw_frame()).await;
+            let frame = match read {
+                Ok(Ok(Some(bytes))) => bytes,
+                Ok(Ok(None)) => anyhow::bail!("connection closed before {want_topic}"),
+                Ok(Err(e)) => return Err(e),
+                Err(_) => anyhow::bail!("timed out waiting for {want_topic}"),
+            };
+            let raw: serde_json::Value = match serde_json::from_slice(&frame) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            if raw.get("topic").and_then(|t| t.as_str()) == Some(want_topic) {
+                return Ok(raw);
+            }
+        }
     }
 
     /// Send a user input message to the Kernel.
