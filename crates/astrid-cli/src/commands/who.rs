@@ -1,12 +1,18 @@
-//! `astrid who` — list connected clients with platform attribution.
+//! `astrid who` — list connected clients with per-agent attribution.
 //!
-//! Per-platform attribution requires the platform-identity link IPC
-//! (deferred — needs `admin.agent.link` exposing the binding map).
-//! Until that ships, this surface walks the daemon's client roster
-//! from `KernelRequest::GetStatus` (which exposes `connected_clients`
-//! as a count) and renders a placeholder table. This is intentionally
-//! shallow — operators get a `not-yet-implemented` row with a tracking
-//! reference rather than fabricated columns.
+//! The daemon's `KernelRequest::GetStatus` exposes both a total
+//! `connected_clients` count and a `connections_by_principal`
+//! breakdown sourced from `Kernel::active_connections` (incremented
+//! on socket handshake, decremented on disconnect, keyed by the
+//! claimed principal). One row is emitted per `(principal,
+//! connection)` pair so the operator sees a real per-agent picture
+//! instead of a fabricated `default`-only roster.
+//!
+//! Platform attribution (CLI vs Discord vs Telegram) still needs the
+//! `admin.agent.link` IPC tracked in #657. Until that lands, the
+//! `PLATFORM` column reads `cli` for every row — the only uplink
+//! shipping today — and the info-line footer points at the tracking
+//! issue so operators know it's a placeholder.
 
 use std::process::ExitCode;
 
@@ -69,18 +75,40 @@ pub(crate) async fn run(args: WhoArgs) -> Result<ExitCode> {
             std::time::Duration::from_secs(10),
         )
         .await?;
-    let count = match crate::socket_client::SocketClient::extract_kernel_response(&raw) {
-        Some(astrid_types::kernel::KernelResponse::Status(s)) => s.connected_clients,
-        _ => 0,
+    // Reuse the shared envelope extractor so this command tracks any
+    // future change to the IPC response wrapper without re-implementing
+    // the `{type, value}` unwrap inline (matches `ps` / `daemon` usage).
+    let status = match crate::socket_client::SocketClient::extract_kernel_response(&raw) {
+        Some(astrid_types::kernel::KernelResponse::Status(s)) => Some(s),
+        _ => None,
     };
 
-    let principal = astrid_core::PrincipalId::default();
-    let connections: Vec<Connection> = (0..count)
-        .map(|_| Connection {
-            agent: principal.to_string(),
-            platform: "cli".into(),
-        })
-        .collect();
+    let connections: Vec<Connection> = match status {
+        Some(s) if !s.connections_by_principal.is_empty() => s
+            .connections_by_principal
+            .iter()
+            .flat_map(|pc| {
+                (0..pc.count).map(move |_| Connection {
+                    agent: pc.principal.clone(),
+                    platform: "cli".into(),
+                })
+            })
+            .collect(),
+        // Daemon doesn't expose per-principal yet (older build) — fall
+        // back to the bare count attributed to `default`. Matches the
+        // pre-#22 behaviour so a CLI/daemon version skew degrades
+        // gracefully instead of returning an empty roster.
+        Some(s) => {
+            let principal = astrid_core::PrincipalId::default();
+            (0..s.connected_clients)
+                .map(|_| Connection {
+                    agent: principal.to_string(),
+                    platform: "cli".into(),
+                })
+                .collect()
+        },
+        None => Vec::new(),
+    };
 
     if !format.is_pretty() {
         emit_structured(&connections, format)?;

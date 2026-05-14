@@ -224,8 +224,6 @@ impl net::Host for HostState {
         let cancel_token = self.cancel_token.clone();
         let session_token = self.session_token.clone();
         let host_semaphore = self.host_semaphore.clone();
-        let capsule_uuid = self.capsule_uuid;
-        let event_bus = self.event_bus.clone();
 
         // Accept + authenticate loop. Authentication failures (wrong UID, bad
         // token) retry accept immediately so a malicious client cannot gate
@@ -314,17 +312,18 @@ impl net::Host for HostState {
             std::sync::Arc::new(tokio::sync::Mutex::new(stream)),
         );
 
-        // Notify the kernel that a new client connection was accepted so the
-        // idle monitor can track active connections.
-        let connected_msg = astrid_events::ipc::IpcMessage::new(
-            "client.v1.connected",
-            astrid_events::ipc::IpcPayload::Connect,
-            capsule_uuid,
-        );
-        let _ = event_bus.publish(astrid_events::AstridEvent::Ipc {
-            metadata: astrid_events::EventMetadata::new("net_accept"),
-            message: connected_msg,
-        });
+        // The `client.v1.connected` event is intentionally NOT published
+        // here. At accept time the host has no idea which principal the
+        // socket will eventually claim, so an unstamped publish lands
+        // under `default` and breaks `astrid who` attribution (#22). The
+        // cli (uplink) capsule republishes the event with the correct
+        // claimed principal once the first principal-stamped ingress
+        // message arrives on the stream — at that point the principal
+        // is known and the kernel's `active_connections` counter is
+        // attributed correctly. A stream that connects but never sends
+        // a principal-claim message therefore does not appear in the
+        // per-principal roster, which matches the operator-facing
+        // semantics of `who` (idle/zombie sockets shouldn't count).
 
         Ok(handle_id)
     }
@@ -427,15 +426,10 @@ impl net::Host for HostState {
             std::sync::Arc::new(tokio::sync::Mutex::new(stream)),
         );
 
-        let connected_msg = astrid_events::ipc::IpcMessage::new(
-            "client.v1.connected",
-            astrid_events::ipc::IpcPayload::Connect,
-            self.capsule_uuid,
-        );
-        let _ = self.event_bus.publish(astrid_events::AstridEvent::Ipc {
-            metadata: astrid_events::EventMetadata::new("net_poll_accept"),
-            message: connected_msg,
-        });
+        // See the matching comment in `net_accept` — `client.v1.connected`
+        // is published by the cli capsule on the first principal-stamped
+        // ingress message, not here, so the per-principal counter is
+        // attributed correctly (#22).
 
         Ok(Some(handle_id))
     }
@@ -550,20 +544,15 @@ impl net::Host for HostState {
 
     fn net_close_stream(&mut self, stream_handle: u64) -> Result<(), String> {
         // Idempotent: silently ignore if the handle was already removed.
-        if self.active_streams.remove(&stream_handle).is_some() {
-            let msg = astrid_events::ipc::IpcMessage::new(
-                "client.v1.disconnect",
-                astrid_events::ipc::IpcPayload::Disconnect {
-                    reason: Some("stream_closed".to_string()),
-                },
-                self.capsule_uuid,
-            );
-            let _ = self.event_bus.publish(astrid_events::AstridEvent::Ipc {
-                metadata: astrid_events::EventMetadata::new("net_close_stream"),
-                message: msg,
-            });
-        }
-
+        //
+        // The `client.v1.disconnect` event used to be published here, but
+        // an unstamped publish lands under `default` regardless of which
+        // principal owned the connection, which double-counts on the
+        // kernel side (`connection_closed(default)` decrements default's
+        // counter even when the stream was attributed to alice). The cli
+        // capsule now publishes the disconnect stamped with the stream's
+        // bound principal before calling `close()` — see issue #22.
+        let _ = self.active_streams.remove(&stream_handle);
         Ok(())
     }
 }

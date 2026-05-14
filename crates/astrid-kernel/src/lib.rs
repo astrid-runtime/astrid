@@ -674,6 +674,32 @@ impl Kernel {
             .sum()
     }
 
+    /// Snapshot of `(principal, count)` for every principal with a
+    /// non-zero active connection. The `astrid who` admin surface
+    /// reads this to attribute connections to specific agents
+    /// instead of fabricating a `default`-only row from the bare
+    /// total.
+    ///
+    /// Not a hot-path call site — taken at status-RPC time. Iterating
+    /// the `DashMap` snapshots the shard guards individually, so the
+    /// total may not be perfectly consistent with a concurrent
+    /// connect/disconnect, but each entry is internally consistent
+    /// and the operator-facing accuracy bound (a flickering one-off
+    /// count) is acceptable.
+    pub fn connections_by_principal(&self) -> Vec<(PrincipalId, usize)> {
+        self.active_connections
+            .iter()
+            .filter_map(|e| {
+                let count = e.value().load(Ordering::Relaxed);
+                if count == 0 {
+                    None
+                } else {
+                    Some((e.key().clone(), count))
+                }
+            })
+            .collect()
+    }
+
     /// Gracefully shut down the kernel.
     ///
     /// 1. Publish `KernelShutdown` event on the bus.

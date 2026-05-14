@@ -85,8 +85,25 @@ pub struct DaemonStatus {
     pub ephemeral: bool,
     /// Number of currently connected clients.
     pub connected_clients: u32,
+    /// Per-principal breakdown of `connected_clients`. Each entry is
+    /// `(principal, count)`; the sum equals `connected_clients`. Empty
+    /// on daemons that don't yet expose per-principal connection
+    /// attribution (older builds, or when no clients are connected).
+    /// Used by `astrid who` to show who is actually on the daemon
+    /// rather than the bare count.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub connections_by_principal: Vec<PrincipalConnectionCount>,
     /// Names of loaded capsules.
     pub loaded_capsules: Vec<String>,
+}
+
+/// Per-principal connection count entry on [`DaemonStatus`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PrincipalConnectionCount {
+    /// The principal (agent) holding the connections.
+    pub principal: String,
+    /// Number of active connections owned by this principal.
+    pub count: u32,
 }
 
 /// Metadata entry for a loaded capsule.
