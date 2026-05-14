@@ -53,7 +53,9 @@ pub mod db;
 pub use error::{StorageError, StorageResult};
 pub use identity::{IdentityError, IdentityStore, KvIdentityStore};
 pub use kv::{KvEntry, KvStore, MemoryKvStore, ScopedKvStore};
-pub use secret::{KvSecretStore, SecretStore, SecretStoreError, build_secret_store};
+pub use secret::{
+    FileSecretStore, KvSecretStore, SecretStore, SecretStoreError, build_secret_store,
+};
 
 #[cfg(feature = "keychain")]
 pub use secret::{FallbackSecretStore, KeychainSecretStore};

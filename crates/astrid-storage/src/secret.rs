@@ -11,6 +11,7 @@
 //! first and degrades to KV storage when the keychain is unavailable.
 
 use std::fmt;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::kv::ScopedKvStore;
@@ -188,6 +189,174 @@ impl SecretStore for KvSecretStore {
         self.runtime_handle
             .block_on(self.kv.delete(&prefixed))
             .map_err(|e| SecretStoreError::Internal(format!("KV delete failed: {e}")))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// File-backed implementation (default for the CLI tool model)
+// ---------------------------------------------------------------------------
+
+/// File-per-secret store rooted at a directory, one file per key.
+///
+/// Layout (one absolute path per secret):
+/// ```text
+/// <root>/<key>            file: 0o600, contents: the raw secret value
+/// ```
+///
+/// `<root>` is supplied by the caller — typically
+/// `~/.astrid/secrets/<scope>/<capsule>/`, where `<scope>` is either
+/// an agent principal name or `__host__`. The caller is responsible
+/// for tucking the path together; this store is naive about
+/// `(principal, capsule)` semantics so it stays composable with the
+/// existing keychain/KV constructors.
+///
+/// Design rationale (pivoted from keychain default):
+/// - **No prompts** — the OS doesn't gate access on code signature.
+///   Survives every `cargo build` / `cargo install` / `brew install`
+///   identity change without operator interaction.
+/// - **Matches CLI tool norm** — `gh`, `aws`, `kubectl`, `npm`,
+///   `docker` (default credential helper) all store credentials in
+///   `~/.config` / `~/.aws` / etc. with `0o600`. The OS user account
+///   is the trust boundary.
+/// - **One file per secret** — eliminates the corrupt-all-on-partial-
+///   -write failure mode of a single JSON blob, and avoids JSON
+///   serialization for what's already an opaque string value.
+/// - **Permissions enforced on write** — `0o600` on the file,
+///   `0o700` on the parent (set when creating). Existing files
+///   created with looser perms get re-stamped on next `set`.
+pub struct FileSecretStore {
+    /// The directory all keys for this `(scope, capsule)` live in.
+    root: PathBuf,
+}
+
+impl fmt::Debug for FileSecretStore {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("FileSecretStore")
+            .field("root", &self.root)
+            .finish()
+    }
+}
+
+impl FileSecretStore {
+    /// Create a new file-backed store rooted at `root`. The directory
+    /// is created lazily on `set`; reads against a missing root
+    /// return `None` / `false` as if no entries existed.
+    #[must_use]
+    pub fn new(root: impl Into<PathBuf>) -> Self {
+        Self { root: root.into() }
+    }
+
+    /// Resolve a key to its on-disk path. Rejects keys that contain
+    /// path separators, null bytes, or otherwise escape the root —
+    /// defense in depth against caller bugs since `validate_key`
+    /// already excludes `:`, but doesn't filter `/`, `\\`, or `\0`.
+    fn key_path(&self, key: &str) -> Result<PathBuf, SecretStoreError> {
+        if key.contains('/') || key.contains(std::path::MAIN_SEPARATOR) || key.contains('\0') {
+            return Err(SecretStoreError::Invalid(
+                "secret key must not contain path separators or null bytes".into(),
+            ));
+        }
+        Ok(self.root.join(key))
+    }
+
+    /// Ensure `root` exists with `0700` permissions on Unix. No-op
+    /// on platforms without Unix permissions.
+    fn ensure_root(&self) -> Result<(), SecretStoreError> {
+        std::fs::create_dir_all(&self.root)
+            .map_err(|e| SecretStoreError::Internal(format!("create secrets dir: {e}")))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let perms = std::fs::Permissions::from_mode(0o700);
+            // Best-effort; if the dir already had perms we tolerate it.
+            let _ = std::fs::set_permissions(&self.root, perms);
+        }
+        Ok(())
+    }
+}
+
+impl SecretStore for FileSecretStore {
+    fn set(&self, key: &str, value: &str) -> Result<(), SecretStoreError> {
+        validate_key(key)?;
+        validate_value(value)?;
+        self.ensure_root()?;
+        let path = self.key_path(key)?;
+
+        // Atomic write: write to a sibling tempfile then rename. Avoids
+        // a half-written secret on crash/power-loss between open and
+        // close. The tempfile inherits 0600 via OpenOptions on Unix.
+        let tmp = self.root.join(format!(".{key}.tmp"));
+        {
+            use std::io::Write;
+            let mut opts = std::fs::OpenOptions::new();
+            opts.write(true).create(true).truncate(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                opts.mode(0o600);
+            }
+            let mut f = opts
+                .open(&tmp)
+                .map_err(|e| SecretStoreError::Internal(format!("open secret tempfile: {e}")))?;
+            f.write_all(value.as_bytes())
+                .map_err(|e| SecretStoreError::Internal(format!("write secret: {e}")))?;
+            f.sync_all()
+                .map_err(|e| SecretStoreError::Internal(format!("sync secret: {e}")))?;
+        }
+        // Final perm stamp on the tempfile in case the platform
+        // ignored OpenOptionsExt::mode (rare, but cheap to enforce).
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let perms = std::fs::Permissions::from_mode(0o600);
+            let _ = std::fs::set_permissions(&tmp, perms);
+        }
+        std::fs::rename(&tmp, &path)
+            .map_err(|e| SecretStoreError::Internal(format!("rename secret: {e}")))?;
+        Ok(())
+    }
+
+    fn exists(&self, key: &str) -> Result<bool, SecretStoreError> {
+        validate_key(key)?;
+        let path = self.key_path(key)?;
+        Ok(path.exists())
+    }
+
+    fn get(&self, key: &str) -> Result<Option<String>, SecretStoreError> {
+        // Size-cap the read so a stray oversized file (corrupted,
+        // attacker-planted, or operator-typo) can't OOM the daemon
+        // when a capsule asks for the secret. 64 KiB is well above
+        // any plausible secret (API keys, OAuth tokens, signing
+        // material) but small enough to be a useful guard.
+        const MAX_SECRET_BYTES: u64 = 64 * 1024;
+        validate_key(key)?;
+        let path = self.key_path(key)?;
+        let meta = match std::fs::metadata(&path) {
+            Ok(m) => m,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(SecretStoreError::Internal(format!("stat secret: {e}"))),
+        };
+        if meta.len() > MAX_SECRET_BYTES {
+            return Err(SecretStoreError::Internal(format!(
+                "secret file exceeds {MAX_SECRET_BYTES}-byte cap ({} bytes)",
+                meta.len()
+            )));
+        }
+        match std::fs::read_to_string(&path) {
+            Ok(s) => Ok(Some(s)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(SecretStoreError::Internal(format!("read secret: {e}"))),
+        }
+    }
+
+    fn delete(&self, key: &str) -> Result<bool, SecretStoreError> {
+        validate_key(key)?;
+        let path = self.key_path(key)?;
+        match std::fs::remove_file(&path) {
+            Ok(()) => Ok(true),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(e) => Err(SecretStoreError::Internal(format!("delete secret: {e}"))),
+        }
     }
 }
 
@@ -470,7 +639,10 @@ pub fn build_secret_store(
 mod tests {
     use std::sync::Arc;
 
-    use super::{KvSecretStore, ScopedKvStore, SecretStore, SecretStoreError, build_secret_store};
+    use super::{
+        FileSecretStore, KvSecretStore, ScopedKvStore, SecretStore, SecretStoreError,
+        build_secret_store,
+    };
     use crate::MemoryKvStore;
 
     /// Build a `KvSecretStore` backed by an in-memory KV. Returns a dedicated
@@ -674,5 +846,43 @@ mod tests {
             store.delete("ns:key"),
             Err(SecretStoreError::Invalid(_))
         ));
+    }
+
+    // ── FileSecretStore defence-in-depth tests ─────────────────────
+
+    #[test]
+    fn file_key_with_null_byte_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FileSecretStore::new(dir.path());
+        // validate_key catches the null byte at the API boundary
+        // (returns Invalid); even if it didn't, key_path would.
+        assert!(matches!(
+            store.set("bad\0key", "x"),
+            Err(SecretStoreError::Invalid(_))
+        ));
+    }
+
+    #[test]
+    fn file_get_rejects_oversized_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FileSecretStore::new(dir.path());
+        store.ensure_root().unwrap();
+        // Plant a 128 KiB file under the store — twice the cap.
+        let big = vec![b'x'; 128 * 1024];
+        std::fs::write(dir.path().join("OVERSIZED"), &big).unwrap();
+        let err = store.get("OVERSIZED").unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("exceeds") && msg.contains("65536"),
+            "expected size-cap rejection, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn file_get_within_cap_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FileSecretStore::new(dir.path());
+        store.set("OK", "value").unwrap();
+        assert_eq!(store.get("OK").unwrap().as_deref(), Some("value"));
     }
 }

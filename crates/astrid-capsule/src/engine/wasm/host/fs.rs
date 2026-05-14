@@ -655,6 +655,7 @@ mod tests {
             subscriptions: HashMap::new(),
             next_subscription_id: 1,
             config: HashMap::new(),
+            secret_env: std::collections::HashSet::new(),
             ipc_publish_patterns: Vec::new(),
             ipc_subscribe_patterns: Vec::new(),
             security: Some(gate),

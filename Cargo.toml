@@ -80,7 +80,19 @@ ignore = "0.4"
 indicatif = "0.17"
 insta = { version = "1.40", features = ["yaml", "json"] }
 jsonrpsee = { version = "0.24", features = ["server", "client", "macros"] }
-keyring = { version = "3", features = ["async-secret-service", "crypto-rust"] }
+# Enable platform-native backends for every supported OS. Without
+# these features the keyring crate falls back to a process-local
+# `MockCredential` that "succeeds" without persisting — values vanish
+# on process exit and `astrid secret set` silently loses every secret
+# it claims to have stored. `apple-native` and `windows-native` are
+# additive (the crate picks the right one at compile time); the
+# Linux backend stays on the async secret-service binding we had.
+keyring = { version = "3", features = [
+    "apple-native",
+    "windows-native",
+    "async-secret-service",
+    "crypto-rust",
+] }
 landlock = "0.4"
 nix = { version = "0.29", features = ["process", "signal", "user", "fs", "resource"] }
 notify = "7"
