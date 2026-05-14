@@ -368,6 +368,62 @@ impl SecretStore for FileSecretStore {
 mod keychain_impl {
     use super::{SecretStore, SecretStoreError, validate_key, validate_value};
 
+    /// Write a keychain entry via `security add-generic-password -A` so
+    /// the entry's ACL grants access to any application on the local
+    /// machine. Without `-A` the OS prompts the operator each time the
+    /// reading binary's code signature changes — which is every
+    /// `cargo build` in a dev workflow.
+    ///
+    /// Deletes any existing entry with the same `(service, account)` first
+    /// because `security add-generic-password` errors on `errSecDuplicateItem`
+    /// rather than overwriting. The delete is best-effort — a missing
+    /// entry returns non-zero, which we ignore.
+    ///
+    /// Worth flagging: `-A` makes the entry readable by **any** app on
+    /// the machine, not just Astrid. That's acceptable for local
+    /// single-operator dev/use because the keychain is already
+    /// per-OS-user. A production hardening step would code-sign the
+    /// astrid binary with a stable identity and revert to the
+    /// `kSecAttrAccessControl`-restricted ACL; tracked separately.
+    #[cfg(target_os = "macos")]
+    pub(super) fn macos_set_with_any_app_access(
+        service: &str,
+        account: &str,
+        password: &str,
+    ) -> Result<(), SecretStoreError> {
+        use std::process::Command;
+        // Best-effort delete; ignore exit status because "entry not
+        // found" is the common path on first write.
+        let _ = Command::new("security")
+            .args(["delete-generic-password", "-a", account, "-s", service])
+            .output();
+
+        let out = Command::new("security")
+            .args([
+                "add-generic-password",
+                "-a",
+                account,
+                "-s",
+                service,
+                "-w",
+                password,
+                "-A",
+                "-U",
+            ])
+            .output()
+            .map_err(|e| {
+                SecretStoreError::NoAccess(format!("security CLI invocation failed: {e}"))
+            })?;
+        if !out.status.success() {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            return Err(SecretStoreError::Internal(format!(
+                "security add-generic-password failed: {}",
+                stderr.trim()
+            )));
+        }
+        Ok(())
+    }
+
     /// OS keychain-backed secret store using the `keyring` crate.
     ///
     /// Each secret is stored as a keyring entry with:
@@ -440,8 +496,22 @@ mod keychain_impl {
         fn set(&self, key: &str, value: &str) -> Result<(), SecretStoreError> {
             validate_key(key)?;
             validate_value(value)?;
-            let entry = self.entry(key)?;
-            entry.set_password(value).map_err(map_keyring_error)
+            // On macOS the default ACL on a fresh keychain entry only
+            // grants access to the binary that created it — and the
+            // signature of a dev `cargo build` changes on every rebuild,
+            // so every restart of the daemon would re-prompt the
+            // operator to unlock the entry. Bypass the prompt by using
+            // the `security` CLI with `-A` (any-app access) on macOS.
+            // The non-macOS keyring path keeps its native semantics.
+            #[cfg(target_os = "macos")]
+            {
+                macos_set_with_any_app_access(&self.service, key, value)
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                let entry = self.entry(key)?;
+                entry.set_password(value).map_err(map_keyring_error)
+            }
         }
 
         fn exists(&self, key: &str) -> Result<bool, SecretStoreError> {

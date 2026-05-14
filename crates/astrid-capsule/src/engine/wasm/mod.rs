@@ -258,7 +258,7 @@ fn build_wasi_ctx() -> wasmtime_wasi::WasiCtx {
 /// panic; the host-side fs functions treat `None` as "no VFS available"
 /// and return an error to the guest.
 #[derive(Default)]
-struct PrincipalVfsBundle {
+pub(crate) struct PrincipalVfsBundle {
     home: Option<PrincipalMount>,
     tmp: Option<PrincipalMount>,
 }
@@ -311,7 +311,9 @@ pub(crate) fn mount_dir(root: &std::path::Path) -> Option<PrincipalMount> {
 /// is auto-created under an already-existing principal root.
 ///
 /// Callers must be holding a tokio runtime handle (`tokio::runtime::Handle::current()`).
-fn build_principal_vfs_bundle(principal: &astrid_core::PrincipalId) -> PrincipalVfsBundle {
+pub(crate) fn build_principal_vfs_bundle(
+    principal: &astrid_core::PrincipalId,
+) -> PrincipalVfsBundle {
     let Ok(astrid_home) = astrid_core::dirs::AstridHome::resolve() else {
         return PrincipalVfsBundle::default();
     };
@@ -331,7 +333,7 @@ fn build_principal_vfs_bundle(principal: &astrid_core::PrincipalId) -> Principal
 /// Mirrors the registration gate from [`build_principal_vfs_bundle`]: an
 /// invocation for an unregistered principal yields `None` instead of
 /// auto-creating the attacker's home tree.
-fn open_capsule_log(
+pub(crate) fn open_capsule_log(
     principal: &astrid_core::PrincipalId,
     capsule_name: &str,
     prune: bool,

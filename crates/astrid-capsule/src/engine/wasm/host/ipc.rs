@@ -113,6 +113,47 @@ fn drain_to_wit_envelope(drain: &DrainResult) -> WitIpcEnvelope {
     }
 }
 
+/// Truncate a drained message batch in place so every retained message
+/// shares the same publisher principal as the first.
+///
+/// The per-invocation context installed by
+/// [`HostState::install_recv_invocation_context`](super::super::host_state::HostState::install_recv_invocation_context)
+/// is keyed off a single principal, so a batch that interleaves
+/// publishers would silently process trailing messages under the first
+/// message's principal — wrong KV namespace, wrong publish stamping,
+/// and (worst) a confidentiality breach across tenants on a fan-in
+/// topic. Truncate at the first cross-principal boundary; the dropped
+/// tail messages are lost from this subscriber's view of the bus (the
+/// batch has already been pulled out of the receiver by the
+/// `drain_receiver` call upstream).
+///
+/// Trade-off: this prefers throughput loss (operator observable via
+/// the warn) over silent cross-principal mis-stamping. A follow-up
+/// ABI change to one-message-at-a-time `ipc::recv` removes the need
+/// for this guard entirely.
+fn truncate_to_homogeneous_principal(messages: &mut Vec<IpcMessage>, handle_id: u64) {
+    let Some(first) = messages.first() else {
+        return;
+    };
+    let first_principal = first.principal.clone();
+    let first_match = messages
+        .iter()
+        .position(|m| m.principal != first_principal)
+        .unwrap_or(messages.len());
+    if first_match < messages.len() {
+        let dropped = messages.len() - first_match;
+        tracing::warn!(
+            handle_id,
+            kept = first_match,
+            dropped,
+            first_principal = first_principal.as_deref().unwrap_or("<none>"),
+            security_event = true,
+            "ipc::recv: mixed-principal batch truncated to first publisher's messages so per-recv context is honoured; tail messages dropped (file a follow-up for one-msg-at-a-time recv ABI if this fires under steady-state load)"
+        );
+        messages.truncate(first_match);
+    }
+}
+
 /// Remove a subscription by handle ID, rejecting runtime-owned interceptor handles.
 ///
 /// Returns `Err` if the handle is protected (auto-subscribed interceptor) or
@@ -259,7 +300,19 @@ impl ipc::Host for HostState {
             .get_mut(&handle_id)
             .ok_or_else(|| "Subscription handle not found".to_string())?;
 
-        let drain = drain_receiver(receiver, util::MAX_GUEST_PAYLOAD_LEN as usize);
+        let mut drain = drain_receiver(receiver, util::MAX_GUEST_PAYLOAD_LEN as usize);
+        truncate_to_homogeneous_principal(&mut drain.messages, handle_id);
+
+        // Install or clear per-message principal context so subsequent
+        // publishes / KV reads in the same run-loop iteration stamp /
+        // scope to the publisher's principal rather than the capsule
+        // owner's. Empty drain clears so a previous publisher's
+        // context doesn't leak into the next guest operation.
+        match drain.messages.first() {
+            Some(first) => self.install_recv_invocation_context(first),
+            None => self.clear_recv_invocation_context(),
+        }
+
         Ok(drain_to_wit_envelope(&drain))
     }
 
@@ -316,6 +369,18 @@ impl ipc::Host for HostState {
         // poisoned from concurrent cleanup, which would surface a misleading error.
         if !cancel_token.is_cancelled() {
             self.subscriptions.insert(handle_id, receiver);
+        }
+
+        truncate_to_homogeneous_principal(&mut drain.messages, handle_id);
+
+        // Install or clear per-message principal context so subsequent
+        // publishes / KV reads in the same run-loop iteration stamp /
+        // scope to the publisher's principal rather than the capsule
+        // owner's. Empty drain (timeout, cancellation, no messages)
+        // clears so the previous wake-up's principal doesn't leak.
+        match drain.messages.first() {
+            Some(first) => self.install_recv_invocation_context(first),
+            None => self.clear_recv_invocation_context(),
         }
 
         Ok(drain_to_wit_envelope(&drain))
