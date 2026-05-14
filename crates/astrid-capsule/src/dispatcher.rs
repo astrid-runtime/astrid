@@ -442,11 +442,15 @@ async fn find_matching_interceptors(
             if !matches!(capsule.state(), crate::capsule::CapsuleState::Ready) {
                 continue;
             }
-            for interceptor in &capsule.manifest().interceptors {
+            // RFC cargo-like-manifest: read effective interceptors
+            // — [subscribe].handler entries merged with legacy
+            // [[interceptor]] blocks. Legacy entries keep their declared
+            // priority; new-form entries get the default (100).
+            for interceptor in capsule.manifest().effective_interceptors() {
                 if crate::topic::topic_matches(topic, &interceptor.event) {
                     matches.push((
                         Arc::clone(&capsule),
-                        interceptor.action.clone(),
+                        interceptor.action,
                         interceptor.priority,
                     ));
                 }
@@ -537,6 +541,9 @@ mod tests {
                     priority,
                 }],
                 topics: Vec::new(),
+                publishes: ::std::collections::HashMap::new(),
+                subscribes: ::std::collections::HashMap::new(),
+                tools: ::std::vec::Vec::new(),
             };
             let capsule = Self {
                 id: CapsuleId::from_static(name),

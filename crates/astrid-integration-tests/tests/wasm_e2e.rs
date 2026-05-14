@@ -79,6 +79,9 @@ async fn setup_test_capsule(
         uplinks: vec![],
         interceptors: vec![],
         topics: vec![],
+        publishes: ::std::collections::HashMap::new(),
+        subscribes: ::std::collections::HashMap::new(),
+        tools: ::std::vec::Vec::new(),
     };
 
     let loader = CapsuleLoader::new(test_secure_mcp_client());
@@ -180,6 +183,9 @@ async fn setup_test_capsule_with_home(
         uplinks: vec![],
         interceptors: vec![],
         topics: vec![],
+        publishes: ::std::collections::HashMap::new(),
+        subscribes: ::std::collections::HashMap::new(),
+        tools: ::std::vec::Vec::new(),
     };
 
     let loader = CapsuleLoader::new(test_secure_mcp_client());
