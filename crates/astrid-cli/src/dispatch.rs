@@ -180,50 +180,15 @@ async fn dispatch_subcommand(
 async fn dispatch_capsule(command: crate::cli::CapsuleCommands) -> Result<ExitCode> {
     use crate::cli::CapsuleCommands;
     match command {
-        CapsuleCommands::Install {
-            source,
-            workspace,
-            agent,
-            group,
-        } => {
-            if group.is_some() {
-                return Ok(commands::stub::deferred(
-                    "capsule install -g <group>",
-                    &[tracker_657()],
-                ));
-            }
-            let _ = agent;
+        CapsuleCommands::Install { source, workspace } => {
             commands::capsule::install::install_capsule(&source, workspace).await?;
             Ok(ExitCode::SUCCESS)
         },
-        CapsuleCommands::Update {
-            target,
-            workspace,
-            agent,
-            group,
-        } => {
-            if group.is_some() {
-                return Ok(commands::stub::deferred(
-                    "capsule update -g <group>",
-                    &[tracker_657()],
-                ));
-            }
-            let _ = agent;
+        CapsuleCommands::Update { target, workspace } => {
             commands::capsule::install::update_capsule(target.as_deref(), workspace).await?;
             Ok(ExitCode::SUCCESS)
         },
-        CapsuleCommands::List {
-            verbose,
-            agent,
-            group,
-        } => {
-            if group.is_some() {
-                return Ok(commands::stub::deferred(
-                    "capsule list -g <group>",
-                    &[tracker_657()],
-                ));
-            }
-            let _ = agent;
+        CapsuleCommands::List { verbose } => {
             commands::capsule::list::list_capsules(verbose)?;
             Ok(ExitCode::SUCCESS)
         },
@@ -232,16 +197,7 @@ async fn dispatch_capsule(command: crate::cli::CapsuleCommands) -> Result<ExitCo
             workspace,
             force,
             purge,
-            agent,
-            group,
         } => {
-            if group.is_some() {
-                return Ok(commands::stub::deferred(
-                    "capsule remove -g <group>",
-                    &[tracker_657()],
-                ));
-            }
-            let _ = agent;
             commands::capsule::remove::remove_capsule(&name, workspace, force, purge)?;
             Ok(ExitCode::SUCCESS)
         },
