@@ -45,6 +45,7 @@ pub(crate) const fn topic_suffix(req: &AdminRequestKind) -> &'static str {
         AdminRequestKind::AgentDelete { .. } => "agent.delete",
         AdminRequestKind::AgentEnable { .. } => "agent.enable",
         AdminRequestKind::AgentDisable { .. } => "agent.disable",
+        AdminRequestKind::AgentModify { .. } => "agent.modify",
         AdminRequestKind::AgentList => "agent.list",
         AdminRequestKind::QuotaSet { .. } => "quota.set",
         AdminRequestKind::QuotaGet { .. } => "quota.get",

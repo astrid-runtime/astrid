@@ -203,6 +203,10 @@ async fn agent_create_rolls_back_when_home_provisioning_fails() {
     );
 }
 
+// `admin.agent.modify` tests live in the sibling
+// `state_tests_agent_modify.rs` module — split off so this file stays
+// under the per-file CI line cap.
+
 // ── agent.delete ─────────────────────────────────────────────────────
 
 #[tokio::test(flavor = "multi_thread")]
