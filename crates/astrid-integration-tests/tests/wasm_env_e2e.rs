@@ -36,6 +36,7 @@ async fn test_wasm_capsule_e2e_env_config_injection() {
             description: None,
             enum_values: vec![],
             placeholder: None,
+            scope: astrid_capsule::manifest::EnvScope::default(),
         },
     );
     env.insert(
@@ -47,6 +48,7 @@ async fn test_wasm_capsule_e2e_env_config_injection() {
             description: None,
             enum_values: vec![],
             placeholder: None,
+            scope: astrid_capsule::manifest::EnvScope::default(),
         },
     );
 

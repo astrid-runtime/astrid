@@ -480,7 +480,17 @@ pub struct CapabilitiesDef {
 /// This prevents developers from shipping hardcoded API keys in their manifests.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EnvDef {
-    /// The type of the environment variable (e.g. "secret", "string").
+    /// The type of the environment variable. Accepted values: `"text"`,
+    /// `"secret"`, `"select"`, `"array"`.
+    ///
+    /// `"secret"` is the load-bearing case: the operator-facing surface
+    /// elicits with a masked prompt at install time and stores the value
+    /// through [`astrid_storage::SecretStore`] (keychain-backed where
+    /// available, encrypted KV otherwise) instead of the plaintext
+    /// `<principal_home>/.config/env/<capsule>.env.json` path that
+    /// non-secret keys use. `"text"`, `"select"`, and `"array"` all land
+    /// in the env JSON; `"select"` elicits with `enum_values` choices,
+    /// `"array"` accepts a comma-separated list.
     #[serde(rename = "type")]
     pub env_type: String,
     /// The specific prompt or question to ask the user when eliciting this value.
@@ -495,6 +505,61 @@ pub struct EnvDef {
     /// Placeholder hint text shown in an empty input field (e.g. `"sk-..."`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub placeholder: Option<String>,
+    /// Sharing model for this env variable across principals on the
+    /// same host. Defaults to [`EnvScope::Agent`] (fail-closed: every
+    /// principal has their own isolated value, miss = no value).
+    /// [`EnvScope::Shared`] opts the key into a host-wide fall-through
+    /// — used for credentials the operator runs as a single account
+    /// for the whole host (LLM provider keys, OAuth client IDs). For
+    /// `env_type = "secret"`, the scope determines which
+    /// [`astrid_storage::SecretStore`] namespace the value lives in.
+    ///
+    /// **Operator-only contract:** this field is deliberately skipped at
+    /// deserialize time. A capsule manifest cannot set its own scope —
+    /// otherwise a malicious capsule could mark its credentials
+    /// `Shared` and pull host-wide values into its sandbox. The kernel
+    /// resolves scope from operator action (`astrid secret set --scope
+    /// shared ...`) at runtime, not from manifest declaration.
+    #[serde(
+        default,
+        skip_serializing_if = "EnvScope::is_default",
+        skip_deserializing
+    )]
+    pub scope: EnvScope,
+}
+
+/// Sharing model for an env / secret value across principals.
+///
+/// Lookup precedence is always per-agent first; [`EnvScope::Shared`]
+/// only changes the *fall-through* behaviour on miss. An agent that
+/// has set their own override of a `shared` key wins over the host-
+/// wide value at read time, so per-agent isolation is preserved even
+/// when the manifest declares sharing as the default.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum EnvScope {
+    /// Strictly per-invoking-principal. Miss = no value, no fall-
+    /// through. The fail-closed default — appropriate for anything an
+    /// end-user must not be able to act-as another user with
+    /// (per-agent API keys, OAuth tokens, Telegram bot tokens).
+    #[default]
+    Agent,
+    /// Per-agent first, then a host-wide fall-through on miss. The
+    /// host-wide value is set by the operator once (`astrid secret
+    /// set --scope shared ...`) and shared by every agent that hasn't
+    /// set their own override. Appropriate for credentials the
+    /// operator runs as a single account for the whole host (LLM
+    /// provider keys, OAuth client IDs).
+    Shared,
+}
+
+impl EnvScope {
+    /// Returns `true` for the default scope so serializers can omit
+    /// it (matches the rest of the manifest fields' conventions).
+    #[must_use]
+    pub fn is_default(&self) -> bool {
+        matches!(self, Self::Agent)
+    }
 }
 
 /// A context file provided by the capsule.
