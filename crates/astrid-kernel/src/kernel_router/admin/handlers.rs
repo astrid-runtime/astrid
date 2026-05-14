@@ -81,7 +81,16 @@ pub(super) async fn dispatch(
         AdminRequestKind::CapsGrant {
             principal,
             capabilities,
-        } => mutate_caps(kernel, &principal, capabilities, CapsMutation::Grant).await,
+            unsafe_admin,
+        } => {
+            mutate_caps(
+                kernel,
+                &principal,
+                capabilities,
+                CapsMutation::Grant { unsafe_admin },
+            )
+            .await
+        },
         AdminRequestKind::CapsRevoke {
             principal,
             capabilities,
@@ -484,7 +493,13 @@ fn commit_group_config(kernel: &Arc<crate::Kernel>, next: GroupConfig) -> AdminR
 // ── Per-principal grants / revokes ─────────────────────────────────────
 
 enum CapsMutation {
-    Grant,
+    /// Add capabilities to `profile.grants`. `unsafe_admin` is required
+    /// when the patterns include the universal `*` pattern — mirrors the
+    /// group-level rail so an individual grant cannot silently escalate
+    /// a principal to universal admin.
+    Grant {
+        unsafe_admin: bool,
+    },
     Revoke,
 }
 
@@ -501,6 +516,23 @@ async fn mutate_caps(
         if let Err(e) = validate_capability(cap) {
             return err_bad_input(format!("capability {cap:?} rejected: {e}"));
         }
+    }
+
+    // `caps.grant <agent> "*"` must be acknowledged via `unsafe_admin =
+    // true`. Mirrors `group_create`'s rail (see groups/mod.rs:UNIVERSAL_
+    // WITHOUT_UNSAFE_ADMIN_ERROR) — without this, an individual grant
+    // bypasses the group-level safety check and silently promotes a
+    // principal to universal admin. The check is scoped to a literal
+    // bare `*` cap; multi-segment wildcards (`network:egress:*`) are
+    // inherently scoped and not affected.
+    if let CapsMutation::Grant { unsafe_admin } = &which
+        && !*unsafe_admin
+        && capabilities.iter().any(|c| c == "*")
+    {
+        return err_bad_input(format!(
+            "caps.grant rejected: granting `*` to {principal} confers universal admin; \
+             pass `unsafe_admin = true` (CLI: `--unsafe-admin`) to confirm this elevation"
+        ));
     }
 
     // Refuse to revoke from `default` — it is the bootstrap admin
@@ -535,7 +567,7 @@ async fn mutate_caps(
     // `profile.toml` and slow `CapabilityCheck::has` on the linear
     // grant/revoke scan.
     let target = match which {
-        CapsMutation::Grant => &mut profile.grants,
+        CapsMutation::Grant { .. } => &mut profile.grants,
         CapsMutation::Revoke => &mut profile.revokes,
     };
     for cap in &capabilities {

@@ -57,6 +57,12 @@ pub(crate) struct GrantArgs {
     /// modify IPC is followup work).
     #[arg(short, long, hide = true)]
     pub group: bool,
+    /// Required when `capability` is the universal `*` pattern.
+    /// Granting `*` to an individual agent confers admin-level
+    /// authority; the kernel refuses without this acknowledgement.
+    /// Mirrors the same flag on `group create --caps "*"`.
+    #[arg(long)]
+    pub unsafe_admin: bool,
 }
 
 #[derive(Args, Debug, Clone)]
@@ -177,6 +183,23 @@ fn print_caps_pretty(agent: &AgentSummary) {
     }
 }
 
+/// Client-side mirror of the kernel's universal-grant rail.
+///
+/// The bare `"*"` pattern grants admin-equivalent reach to a single
+/// agent — a one-step bypass of the group-creation safety rail
+/// (`group create --caps "*"` already requires `--unsafe-admin`).
+/// Mirroring the check at the CLI saves a round-trip and surfaces the
+/// reason inline. Multi-segment wildcards (`network:egress:*`,
+/// `self:capsule:*`) are scoped and unaffected.
+fn validate_grant_pattern(pattern: &str, unsafe_admin: bool) -> Result<(), &'static str> {
+    if pattern == "*" && !unsafe_admin {
+        return Err(
+            "refusing to grant universal `*` without --unsafe-admin: this confers admin-equivalent reach on a single agent. Re-run with --unsafe-admin if intentional.",
+        );
+    }
+    Ok(())
+}
+
 async fn run_grant(args: GrantArgs) -> Result<ExitCode> {
     if args.group {
         eprintln!(
@@ -187,12 +210,22 @@ async fn run_grant(args: GrantArgs) -> Result<ExitCode> {
         );
         return Ok(ExitCode::from(2));
     }
+    // Client-side mirror of the kernel's universal-grant rail. The
+    // kernel is authoritative — the same check fires there even if a
+    // client speaks the wire format directly — but rejecting the
+    // request locally saves an IPC round-trip and lets the operator
+    // see the explanatory error without scrolling daemon logs.
+    if let Err(msg) = validate_grant_pattern(&args.capability, args.unsafe_admin) {
+        eprintln!("{}", Theme::error(msg));
+        return Ok(ExitCode::from(2));
+    }
     let principal = PrincipalId::new(&args.name).context("invalid agent name")?;
     let mut client = AdminClient::connect().await?;
     let body = client
         .request(AdminRequestKind::CapsGrant {
             principal,
             capabilities: vec![args.capability.clone()],
+            unsafe_admin: args.unsafe_admin,
         })
         .await?;
     let _ = into_result(body)?;
@@ -281,6 +314,26 @@ async fn run_check(args: CheckArgs) -> Result<ExitCode> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn validate_grant_pattern_rejects_bare_star_without_unsafe_admin() {
+        let err = validate_grant_pattern("*", false).expect_err("bare `*` must be rejected");
+        assert!(err.contains("--unsafe-admin"), "msg={err}");
+    }
+
+    #[test]
+    fn validate_grant_pattern_accepts_bare_star_with_unsafe_admin() {
+        validate_grant_pattern("*", true).expect("bare `*` with --unsafe-admin must pass");
+    }
+
+    #[test]
+    fn validate_grant_pattern_accepts_scoped_wildcards() {
+        // Multi-segment wildcards are inherently scoped — the rail only
+        // triggers on the universal pattern.
+        validate_grant_pattern("network:egress:*", false).expect("scoped wildcard");
+        validate_grant_pattern("self:capsule:*", false).expect("scoped wildcard");
+        validate_grant_pattern("agent:disable", false).expect("concrete cap");
+    }
 
     #[test]
     fn record_round_trips_to_json() {
