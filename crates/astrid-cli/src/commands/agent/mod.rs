@@ -260,73 +260,196 @@ fn create_uses_deferred_flags(args: &CreateArgs) -> bool {
         || args.period.is_some()
 }
 
-async fn run_create(args: CreateArgs) -> Result<ExitCode> {
+async fn run_create(mut args: CreateArgs) -> Result<ExitCode> {
     if create_uses_deferred_flags(&args) {
         return Ok(stub::deferred(
             "agent create with delegation/budget flags",
             &[ISSUE_DELEGATION],
         ));
     }
-    if args.egress.is_some()
-        || args.process_allow.is_some()
-        || args.memory.is_some()
-        || args.timeout.is_some()
-        || args.storage.is_some()
-        || args.processes.is_some()
-        || args.link.is_some()
-        || !args.bare && args.distro != "astralis"
-        || args.bare
-    {
-        // Many of the per-resource flags require kernel-side admin IPC
-        // that did NOT ship with Layer 6 (#672 covered agent/group/
-        // quota/caps; egress, process-allow, memory/timeout/storage/
-        // processes per-create, distro pinning per-create, and identity
-        // linking are tracked separately). We accept the flags so the
-        // help surface documents them, but reject the create until
-        // those handlers exist.
-        eprintln!(
-            "astrid: per-resource provisioning flags (--egress, --process-allow, --memory, --timeout, --storage, --processes, --distro, --bare, --link) require kernel-side IPC that has not yet shipped."
-        );
-        eprintln!("  Tracking issue #657 (CLI redesign) coordinates the rollout — for now use:");
-        eprintln!("    astrid agent create {}", args.name);
-        eprintln!(
-            "    astrid quota set --agent {} --memory <SIZE> --timeout <DURATION> ...",
-            args.name
-        );
-        eprintln!(
-            "    astrid caps grant {} <capability>  # for egress / process / network",
-            args.name
-        );
-        return Ok(ExitCode::from(2));
+    if let Some(exit) = check_unshipped_provisioning_flags(&args) {
+        return Ok(exit);
     }
 
-    // Validate name client-side so a bad name fails before the IPC.
-    let _principal: PrincipalId = PrincipalId::new(&args.name).context("invalid agent name")?;
+    // Parse and validate everything client-side BEFORE any IPC. A
+    // malformed quota spec or capability label should fail the whole
+    // command, not leave a half-provisioned agent on disk that the
+    // operator has to clean up.
+    let principal = PrincipalId::new(&args.name).context("invalid agent name")?;
+    let quota_updates = parse_quota_flags(&args)?;
+    let caps_to_grant = build_caps_to_grant(&args)?;
 
-    let groups: Vec<String> = if args.groups.is_empty() {
-        // Empty defaults to the kernel's `agent` group (Layer 6 default).
-        // Pass empty so the kernel applies the default rather than the
-        // CLI duplicating the policy.
-        Vec::new()
-    } else {
-        args.groups
-    };
-
-    let kind = AdminRequestKind::AgentCreate {
-        name: args.name.clone(),
-        groups,
-        grants: Vec::new(),
-    };
+    // Empty defaults to the kernel's `agent` group (Layer 6 default).
+    // Pass empty so the kernel applies the default rather than the CLI
+    // duplicating the policy.
+    let groups = std::mem::take(&mut args.groups);
 
     let mut client = AdminClient::connect().await?;
-    let body = client.request(kind).await?;
+    // Hand `caps_to_grant` directly to `AgentCreate.grants` so the
+    // capability grants land in the same admin call as the profile
+    // write — atomic from the operator's perspective. The kernel
+    // handler validates the full set against the capability grammar
+    // before writing the profile, so a malformed pattern can't leave
+    // a half-provisioned agent on disk.
+    let body = client
+        .request(AdminRequestKind::AgentCreate {
+            name: args.name.clone(),
+            groups,
+            grants: caps_to_grant,
+        })
+        .await?;
     let _ = into_result(body)?;
-
     println!(
         "{}",
         Theme::success(&format!("Created agent '{}'", args.name))
     );
+
+    if !quota_updates.is_empty() {
+        apply_initial_quotas(&mut client, &principal, &quota_updates)
+            .await
+            .with_context(|| {
+                format!(
+                    "agent '{}' created, but failed to apply quotas — re-run `astrid quota set -a {} ...` to retry",
+                    args.name, args.name
+                )
+            })?;
+    }
+
     Ok(ExitCode::SUCCESS)
+}
+
+/// Reject `--bare`, non-default `--distro`, and `--link` up front —
+/// each still needs kernel-side IPC that has not shipped. Returns the
+/// exit code for the failure, or `None` if all three are absent.
+fn check_unshipped_provisioning_flags(args: &CreateArgs) -> Option<ExitCode> {
+    if args.bare {
+        eprintln!(
+            "astrid: --bare needs a distro management IPC that has not shipped. Track in #657."
+        );
+        return Some(ExitCode::from(2));
+    }
+    if args.distro != "astralis" {
+        eprintln!(
+            "astrid: per-agent --distro pinning needs distro management IPC that has not \
+             shipped. Track in #657."
+        );
+        return Some(ExitCode::from(2));
+    }
+    if args.link.is_some() {
+        eprintln!(
+            "astrid: --link needs an admin.agent.link IPC that has not shipped. Track in #657."
+        );
+        return Some(ExitCode::from(2));
+    }
+    None
+}
+
+/// Parse the four quota-flag specs into a delta list. Returns an
+/// `Err` for malformed byte / duration strings; that fails the entire
+/// `agent create` before any IPC commits to disk.
+fn parse_quota_flags(args: &CreateArgs) -> Result<Vec<QuotaField>> {
+    let mut updates: Vec<QuotaField> = Vec::new();
+    if let Some(s) = args.memory.as_deref() {
+        let bytes = crate::commands::quota::parse_bytes(s).context("invalid --memory")?;
+        updates.push(QuotaField::Memory(bytes));
+    }
+    if let Some(s) = args.timeout.as_deref() {
+        let secs = crate::commands::quota::parse_duration(s)
+            .context("invalid --timeout")?
+            .as_secs()
+            .max(1);
+        updates.push(QuotaField::Timeout(secs));
+    }
+    if let Some(s) = args.storage.as_deref() {
+        let bytes = crate::commands::quota::parse_bytes(s).context("invalid --storage")?;
+        updates.push(QuotaField::Storage(bytes));
+    }
+    if let Some(n) = args.processes {
+        updates.push(QuotaField::Processes(n));
+    }
+    Ok(updates)
+}
+
+/// Translate `--egress` / `--process-allow` allow-lists into Layer 6
+/// capability patterns and validate each against the capability
+/// grammar (no dots in segments, etc.). Catching invalid labels here
+/// — before any IPC — prevents the kernel from accepting the agent
+/// profile and then rejecting the follow-up grant, which would leave a
+/// half-provisioned agent on disk.
+fn build_caps_to_grant(args: &CreateArgs) -> Result<Vec<String>> {
+    let mut caps: Vec<String> = Vec::new();
+    if let Some(domains) = args.egress.as_deref() {
+        for entry in domains.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+            let cap = format!("network:egress:{entry}");
+            astrid_core::capability_grammar::validate_capability(&cap)
+                .map_err(|e| anyhow::anyhow!("invalid --egress entry {entry:?}: {e}"))?;
+            caps.push(cap);
+        }
+    }
+    if let Some(cmds) = args.process_allow.as_deref() {
+        for entry in cmds.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+            let cap = format!("process:spawn:{entry}");
+            astrid_core::capability_grammar::validate_capability(&cap)
+                .map_err(|e| anyhow::anyhow!("invalid --process-allow entry {entry:?}: {e}"))?;
+            caps.push(cap);
+        }
+    }
+    Ok(caps)
+}
+
+/// Apply the parsed quota deltas: `QuotaGet` to pull the new agent's
+/// defaults, replay each requested field, single `QuotaSet`. A failure
+/// here leaves the agent in place with default quotas — operator can
+/// re-run `astrid quota set -a <name> ...` to retry.
+async fn apply_initial_quotas(
+    client: &mut AdminClient,
+    principal: &PrincipalId,
+    updates: &[QuotaField],
+) -> Result<()> {
+    let body = client
+        .request(AdminRequestKind::QuotaGet {
+            principal: principal.clone(),
+        })
+        .await?;
+    let body = into_result(body)?;
+    let mut quotas = match body {
+        AdminResponseBody::Quotas(q) => q,
+        other => anyhow::bail!("unexpected response from kernel: {other:?}"),
+    };
+    for field in updates {
+        match field {
+            QuotaField::Memory(b) => quotas.max_memory_bytes = *b,
+            QuotaField::Timeout(s) => quotas.max_timeout_secs = *s,
+            QuotaField::Storage(b) => quotas.max_storage_bytes = *b,
+            QuotaField::Processes(n) => quotas.max_background_processes = *n,
+        }
+    }
+    let body = client
+        .request(AdminRequestKind::QuotaSet {
+            principal: principal.clone(),
+            quotas,
+        })
+        .await?;
+    let _ = into_result(body)?;
+    println!(
+        "  {}",
+        Theme::info(&format!(
+            "Quotas set ({} field{})",
+            updates.len(),
+            if updates.len() == 1 { "" } else { "s" }
+        ))
+    );
+    Ok(())
+}
+
+/// Discriminator for which quota field a CLI flag is updating, kept
+/// out of `Quotas` so we can replay the deltas after fetching the
+/// principal's current values from the kernel.
+enum QuotaField {
+    Memory(u64),
+    Timeout(u64),
+    Storage(u64),
+    Processes(u32),
 }
 
 async fn run_list(args: ListArgs) -> Result<ExitCode> {
