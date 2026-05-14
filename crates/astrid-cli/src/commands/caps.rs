@@ -51,7 +51,11 @@ pub(crate) struct ShowArgs {
 pub(crate) struct GrantArgs {
     /// Agent name.
     pub name: String,
-    /// Capability pattern (e.g. `network:egress:api.openai.com`).
+    /// Capability pattern. Colon-delimited segments of
+    /// `[a-zA-Z0-9_-]+` or bare `*` (no dots — capability identifiers
+    /// are role labels, not resource URIs). Examples:
+    /// `self:capsule:install`, `network:egress:openai`,
+    /// `system:shutdown`, `*` (with --unsafe-admin).
     pub capability: String,
     /// Grant to a group instead of an individual (deferred — group
     /// modify IPC is followup work).
@@ -69,7 +73,8 @@ pub(crate) struct GrantArgs {
 pub(crate) struct RevokeArgs {
     /// Agent name.
     pub name: String,
-    /// Capability pattern to revoke.
+    /// Capability pattern to revoke. Same grammar as `caps grant` —
+    /// colon-delimited `[a-zA-Z0-9_-]+` segments or bare `*`.
     pub capability: String,
     /// Revoke from a group (deferred).
     #[arg(short, long, hide = true)]
@@ -80,7 +85,8 @@ pub(crate) struct RevokeArgs {
 pub(crate) struct CheckArgs {
     /// Agent name.
     pub name: String,
-    /// Capability pattern to check.
+    /// Capability pattern to check. Same grammar as `caps grant` —
+    /// colon-delimited `[a-zA-Z0-9_-]+` segments or bare `*`.
     pub capability: String,
 }
 
@@ -149,32 +155,52 @@ async fn run_show(args: ShowArgs) -> Result<ExitCode> {
 }
 
 fn print_caps_pretty(agent: &AgentSummary) {
+    // Pad raw strings *before* applying ANSI escape codes — the
+    // `{:<N}` formatter counts every byte (including escape codes)
+    // toward width, so colouring a value inside the format spec
+    // visually shrinks its column by the ANSI overhead and misaligns
+    // every subsequent column.
     println!(
-        "  {:<60}  {:<24}  STATUS",
-        "CAPABILITY".bold(),
-        "SOURCE".bold()
+        "  {}  {}  STATUS",
+        format!("{:<60}", "CAPABILITY").bold(),
+        format!("{:<24}", "SOURCE").bold()
     );
     for g in &agent.groups {
         println!(
-            "  {:<60}  {:<24}  {}",
+            "  {:<60}  {}  {}",
             format!("(group: {g})"),
-            "group".dimmed(),
+            format!("{:<24}", "group").dimmed(),
             "inherited".green()
         );
     }
+    // Layer 5 precedence is revoke > grant. A grant `cap` is shadowed
+    // if ANY revoke pattern matches it under the same segment-glob
+    // rules the kernel uses for enforcement
+    // (`capability_matches(revoke, cap)`). Exact string equality would
+    // miss pattern revokes (e.g. `sys:*` shadowing `sys:status`),
+    // misleading an operator into thinking a cap is live when it
+    // isn't.
     for cap in &agent.grants {
+        let status = if agent
+            .revokes
+            .iter()
+            .any(|r| astrid_core::capability_grammar::capability_matches(r, cap))
+        {
+            "shadowed by revoke".dimmed().to_string()
+        } else {
+            "active".green().to_string()
+        };
         println!(
-            "  {:<60}  {:<24}  {}",
+            "  {:<60}  {}  {status}",
             cap,
-            "individual grant".dimmed(),
-            "active".green()
+            format!("{:<24}", "individual grant").dimmed(),
         );
     }
     for cap in &agent.revokes {
         println!(
-            "  {:<60}  {:<24}  {}",
+            "  {:<60}  {}  {}",
             cap,
-            "individual revoke".dimmed(),
+            format!("{:<24}", "individual revoke").dimmed(),
             "revoked".yellow()
         );
     }

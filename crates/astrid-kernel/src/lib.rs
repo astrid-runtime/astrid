@@ -1051,7 +1051,11 @@ fn load_or_generate_runtime_key(keys_dir: &Path) -> std::io::Result<KeyPair> {
 ///
 /// Takes the minimum of both signals to handle ungraceful disconnects.
 ///
-/// Configurable via `ASTRID_IDLE_TIMEOUT_SECS` (default 300 = 5 minutes).
+/// Idle shutdown is on by default in `--ephemeral` mode (30s after the
+/// last client disconnects) and **off by default** in persistent mode
+/// (`astrid start`). Both modes respect `ASTRID_IDLE_TIMEOUT_SECS` —
+/// setting it in persistent mode opts the operator into auto-shutdown,
+/// setting it in ephemeral mode overrides the 30s default.
 /// Number of permanent internal event bus subscribers that are not client
 /// connections: `KernelRouter` (`kernel.request.*`), `AdminRouter`
 /// (`kernel.admin.*`), `ConnectionTracker` (`client.*`), and
@@ -1066,9 +1070,6 @@ const IDLE_NON_EPHEMERAL_GRACE: std::time::Duration = std::time::Duration::from_
 const IDLE_EPHEMERAL_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
 /// How often the idle monitor polls when running in persistent mode.
 const IDLE_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(15);
-/// Default idle timeout for non-ephemeral daemons (5 minutes).
-const IDLE_DEFAULT_TIMEOUT: std::time::Duration = std::time::Duration::from_mins(5);
-
 fn spawn_idle_monitor(kernel: Arc<Kernel>) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         // Initial grace period — wait for capsules to boot and first client
@@ -1081,12 +1082,35 @@ fn spawn_idle_monitor(kernel: Arc<Kernel>) -> tokio::task::JoinHandle<()> {
             // Give the CLI time to reconnect after brief disconnects (e.g.
             // during tool execution when the TUI might momentarily drop
             // the socket). Zero timeout caused premature shutdowns.
-            std::time::Duration::from_secs(30)
-        } else {
+            //
+            // Operators may still override via `ASTRID_IDLE_TIMEOUT_SECS`
+            // when they want a longer ephemeral window (e.g. headless
+            // batch runs that pause between prompts).
             std::env::var("ASTRID_IDLE_TIMEOUT_SECS")
                 .ok()
                 .and_then(|v| v.parse().ok())
-                .map_or(IDLE_DEFAULT_TIMEOUT, std::time::Duration::from_secs)
+                .map_or(
+                    std::time::Duration::from_secs(30),
+                    std::time::Duration::from_secs,
+                )
+        } else {
+            // Persistent (`astrid start`) mode: idle shutdown is opt-in.
+            // The operator explicitly chose persistent — honour that.
+            // Setting `ASTRID_IDLE_TIMEOUT_SECS` switches the monitor on
+            // for housekeeping flows that genuinely want auto-shutdown.
+            // Without it, the monitor task exits immediately and the
+            // daemon stays up until SIGTERM.
+            let Some(secs) = std::env::var("ASTRID_IDLE_TIMEOUT_SECS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+            else {
+                tracing::debug!(
+                    "Non-ephemeral daemon: idle shutdown disabled \
+                     (set ASTRID_IDLE_TIMEOUT_SECS to enable)."
+                );
+                return;
+            };
+            std::time::Duration::from_secs(secs)
         };
         let check_interval = if ephemeral {
             IDLE_EPHEMERAL_CHECK_INTERVAL
