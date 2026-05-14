@@ -39,10 +39,13 @@ pub(crate) struct Cli {
     #[arg(short = 'y', long = "yes", alias = "yolo", alias = "autonomous")]
     pub auto_approve: bool,
 
-    /// Resume or create a named session for multi-turn headless conversations.
-    /// Use the same ID across multiple -p calls to maintain context.
-    /// If omitted, a fresh session is created each time.
-    #[arg(long = "session")]
+    /// Resume an existing session by UUID, or create/resume a named
+    /// session by string. UUIDs (the form `--print-session` reports)
+    /// are used as-is so an operator can copy the printed id straight
+    /// into the next `-p` call; any other string is hashed into a
+    /// stable UUID v5 so the same name always maps to the same
+    /// session. Omit the flag for a fresh random session per call.
+    #[arg(long = "session", value_name = "ID_OR_NAME")]
     pub session_name: Option<String>,
 
     /// Print the session ID to stderr after the response, for use in scripts.
