@@ -166,6 +166,28 @@ async fn agent_create(
         return err_internal(format!("profile save failed: {e}"));
     }
 
+    // Provision the per-principal home tree so per-invocation KV, log,
+    // tmp, secrets, audit, and capability tokens have a place to land.
+    // Capsule WASM stays shared (loaded once from the system/default
+    // location); only the principal-scoped data namespaces live here.
+    //
+    // Fail-closed: if the home tree cannot be created, downstream
+    // per-invocation lookups silently fall back to the `default`
+    // principal's namespace — a confidentiality break across tenants.
+    // Roll back identity + profile so the agent isn't left in a state
+    // where future invocations would leak into someone else's data.
+    if let Err(e) = kernel.astrid_home.principal_home(&principal).ensure() {
+        let _ = kernel
+            .identity_store
+            .unlink(AGENT_IDENTITY_PLATFORM, principal.as_str())
+            .await;
+        let _ = kernel.identity_store.delete_user(user.id).await;
+        let _ = std::fs::remove_file(&profile_path);
+        return err_internal(format!(
+            "principal home tree provisioning failed (rolled back): {e}"
+        ));
+    }
+
     info!(%principal, user_id = %user.id, "Layer 6 agent.create");
     success_json(serde_json::json!({
         "principal": principal.as_str(),

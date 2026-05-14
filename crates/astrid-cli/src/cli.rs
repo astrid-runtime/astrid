@@ -234,20 +234,20 @@ pub(crate) enum Commands {
 
 #[derive(Subcommand)]
 pub(crate) enum CapsuleCommands {
-    /// Install a capsule from a local path or registry
+    /// Install a capsule from a local path or registry.
+    ///
+    /// Capsules are deployed once and shared across every principal —
+    /// per-invocation isolation comes from the kernel's caller-context
+    /// scoping (KV namespace, home, secrets, log, quotas), not from
+    /// duplicating the WASM. There is intentionally no per-agent
+    /// install: an agent says "I use capsule X" and the kernel routes
+    /// their invocations into the already-loaded instance.
     Install {
         /// Capsule source (local path or package name)
         source: String,
         /// Install to workspace instead of user-level
         #[arg(long)]
         workspace: bool,
-        /// Install for a specific agent (defaults to active context).
-        #[arg(short, long)]
-        agent: Option<String>,
-        /// Install for every agent in this group (deferred — needs
-        /// per-principal install IPC).
-        #[arg(short, long, hide = true)]
-        group: Option<String>,
     },
     /// Update an installed capsule (or all capsules) from its original source
     Update {
@@ -256,24 +256,12 @@ pub(crate) enum CapsuleCommands {
         /// Update workspace capsules instead of user-level
         #[arg(long)]
         workspace: bool,
-        /// Update for a specific agent (defaults to active context).
-        #[arg(short, long)]
-        agent: Option<String>,
-        /// Update for every agent in this group (deferred).
-        #[arg(short, long, hide = true)]
-        group: Option<String>,
     },
     /// List all installed capsules with capability metadata
     List {
         /// Show full provides/requires details
         #[arg(short, long)]
         verbose: bool,
-        /// List for a specific agent (defaults to active context).
-        #[arg(short, long)]
-        agent: Option<String>,
-        /// List for every agent in this group (deferred).
-        #[arg(short, long, hide = true)]
-        group: Option<String>,
     },
     /// Remove an installed capsule
     Remove {
@@ -288,12 +276,6 @@ pub(crate) enum CapsuleCommands {
         /// Also delete saved configuration (API keys, env vars)
         #[arg(long)]
         purge: bool,
-        /// Remove for a specific agent (defaults to active context).
-        #[arg(short, long)]
-        agent: Option<String>,
-        /// Remove for every agent in this group (deferred).
-        #[arg(short, long, hide = true)]
-        group: Option<String>,
     },
     /// Show the capsule imports/exports dependency tree
     Tree,

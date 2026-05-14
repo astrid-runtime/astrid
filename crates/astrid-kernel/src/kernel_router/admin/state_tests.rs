@@ -81,6 +81,18 @@ async fn agent_create_writes_profile_and_links_identity() {
     // Identity link created.
     let user = kernel.identity_store.resolve("cli", "alice").await.unwrap();
     assert!(user.is_some());
+
+    // Per-principal home tree provisioned. Capsule WASM stays shared
+    // (loaded once from default's home), but every per-invocation
+    // namespace — KV, log, audit, tmp, tokens, env — needs a place to
+    // land before the first interceptor scoped to this principal fires.
+    let ph = kernel.astrid_home.principal_home(&pid("alice"));
+    assert!(ph.kv_dir().is_dir(), "kv_dir not provisioned");
+    assert!(ph.log_dir().is_dir(), "log_dir not provisioned");
+    assert!(ph.audit_dir().is_dir(), "audit_dir not provisioned");
+    assert!(ph.tmp_dir().is_dir(), "tmp_dir not provisioned");
+    assert!(ph.tokens_dir().is_dir(), "tokens_dir not provisioned");
+    assert!(ph.env_dir().is_dir(), "env_dir not provisioned");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -138,6 +150,57 @@ async fn agent_create_rejects_default_bootstrap_name() {
     )
     .await;
     assert_error_contains(&res, "reserved");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn agent_create_rolls_back_when_home_provisioning_fails() {
+    // Confidentiality boundary: if the per-principal home tree cannot be
+    // created, downstream per-invocation lookups fall back to the
+    // default principal's namespace — a cross-tenant leak. The handler
+    // must roll back the identity + profile rather than leave the agent
+    // in a half-provisioned state.
+    let (_dir, kernel) = fixture().await;
+
+    // Force `principal_home(&blocked).ensure()` to fail by placing a
+    // regular file where the principal home directory would live. The
+    // `create_dir_all` call inside `ensure()` returns NotADirectory.
+    std::fs::create_dir_all(kernel.astrid_home.home_dir()).expect("home_dir");
+    let blocked_path = kernel.astrid_home.home_dir().join("blocked");
+    std::fs::write(&blocked_path, b"sentinel").expect("write blocker file");
+
+    let res = handlers::dispatch(
+        &kernel,
+        AdminRequestKind::AgentCreate {
+            name: "blocked".into(),
+            groups: Vec::new(),
+            grants: Vec::new(),
+        },
+    )
+    .await;
+    assert_error_contains(&res, "home tree provisioning failed");
+
+    // Rollback assertions: identity link gone, user record gone,
+    // profile file gone. The blocker file we placed stays.
+    let resolved = kernel
+        .identity_store
+        .resolve("cli", "blocked")
+        .await
+        .unwrap();
+    assert!(
+        resolved.is_none(),
+        "identity link must be unlinked on rollback"
+    );
+
+    let profile_path = PrincipalProfile::path_for(&kernel.astrid_home, &pid("blocked"));
+    assert!(
+        !profile_path.exists(),
+        "profile file must be removed on rollback"
+    );
+
+    assert!(
+        blocked_path.is_file(),
+        "rollback must not touch the unrelated sentinel"
+    );
 }
 
 // ── agent.delete ─────────────────────────────────────────────────────
