@@ -120,7 +120,15 @@ impl AdminClient {
         let req = AdminKernelRequest::with_request_id(request_id.clone(), kind);
         let payload =
             serde_json::to_value(&req).context("Failed to serialize AdminKernelRequest")?;
-        let msg = IpcMessage::new(topic, IpcPayload::RawJson(payload), Uuid::nil());
+        // Stamp the outbound message with the operator's active agent
+        // (`astrid agent switch` or `--agent`), so the kernel's
+        // `resolve_caller` reads it for Layer 5/6 capability checks
+        // instead of falling back to `default`. Trust-the-uplink today;
+        // cryptographic per-connection auth lives in #658.
+        let caller =
+            crate::context::active_agent().context("Failed to resolve active agent context")?;
+        let msg = IpcMessage::new(topic, IpcPayload::RawJson(payload), Uuid::nil())
+            .with_principal(caller.to_string());
         self.inner.send_message(msg).await?;
 
         let deadline = tokio::time::Instant::now()

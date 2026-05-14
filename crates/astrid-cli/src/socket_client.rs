@@ -251,8 +251,16 @@ impl SocketClient {
 
     /// Send a user input message to the Kernel.
     ///
+    /// Stamps the outbound `IpcMessage` with the operator's active
+    /// agent (set by `astrid agent switch`, queried via
+    /// [`crate::context::active_agent`]), so the kernel's
+    /// `resolve_caller` sees the right principal for session, KV,
+    /// home, secret, and quota scoping. Trust-the-uplink model
+    /// today; cryptographic per-connection auth lives in #658.
+    ///
     /// # Errors
-    /// Returns an error if the message cannot be sent.
+    /// Returns an error if the active agent context cannot be
+    /// resolved or the message cannot be sent.
     pub async fn send_input(&mut self, text: String) -> Result<()> {
         let payload = IpcPayload::UserInput {
             text,
@@ -260,7 +268,10 @@ impl SocketClient {
             context: None,
         };
 
-        let msg = IpcMessage::new("user.v1.prompt", payload, self.session_id.0);
+        let caller =
+            crate::context::active_agent().context("Failed to resolve active agent context")?;
+        let msg = IpcMessage::new("user.v1.prompt", payload, self.session_id.0)
+            .with_principal(caller.to_string());
 
         self.send_message(msg).await
     }

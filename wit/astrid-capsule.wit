@@ -411,6 +411,23 @@ interface ipc {
     /// is automatically propagated from the caller context.
     ipc-publish: func(topic: string, payload: string) -> result<_, string>;
 
+    /// Publish a message on behalf of a specific principal.
+    ///
+    /// Like `ipc-publish` but stamps the outgoing envelope with the
+    /// supplied principal instead of the capsule's own — used by
+    /// uplinks (CLI proxy, Telegram bridge, etc.) to relay messages
+    /// from external clients while preserving the calling identity
+    /// for downstream capability checks. Gated on `uplink = true` in
+    /// the manifest's `[capabilities]` block. The trust model is
+    /// "trust the uplink": the kernel does not verify that the uplink
+    /// actually authenticated the claimed principal. Real cross-
+    /// principal auth lives in issue #658.
+    ipc-publish-as: func(
+        topic: string,
+        payload: string,
+        principal: string,
+    ) -> result<_, string>;
+
     /// Subscribe to a topic pattern and receive a handle.
     ///
     /// Supports exact matches and trailing-suffix wildcards (`foo.bar.*`).
