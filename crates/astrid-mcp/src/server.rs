@@ -530,13 +530,24 @@ impl ServerManager {
             sandbox_config = sandbox_config.with_extra_read(bin_dir);
         }
 
-        // Get sandbox prefix (bwrap/sandbox-exec args)
+        // Get sandbox prefix (bwrap/sandbox-exec args).
+        //
+        // Under the default `SandboxPolicy::Required` policy this errors
+        // out when the OS sandbox is unavailable — the error carries the
+        // operator-facing remediation hint (sysctl command on Ubuntu
+        // 24.04+, package-install on other distros, or explicit policy
+        // override). We surface that message verbatim instead of wrapping
+        // it in a misleading "path validation failed" label.
+        //
+        // Under `Preferred` the call returns `Ok(None)` after emitting its
+        // own `warn`; under `Off` it returns `Ok(None)` silently. Either
+        // way we don't double-log here.
         let sandbox_prefix =
             sandbox_config
                 .sandbox_prefix()
                 .map_err(|e| McpError::ServerStartFailed {
                     name: name.to_string(),
-                    reason: format!("sandbox path validation failed: {e}"),
+                    reason: e.to_string(),
                 })?;
 
         // Build the command
@@ -549,11 +560,9 @@ impl ServerManager {
             cmd.args(&config.args);
             cmd
         } else {
-            warn!(
-                server = name,
-                "Sandboxing not available on this platform; \
-                 untrusted MCP server will run without OS-level isolation"
-            );
+            // Reached only when the operator explicitly opted into
+            // `Preferred` or `Off`. The `Preferred` path already logged
+            // a warn; `Off` is intentionally silent.
             let mut cmd = tokio::process::Command::new(&resolved_command);
             cmd.args(&config.args);
             cmd

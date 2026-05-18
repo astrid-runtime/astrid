@@ -51,4 +51,4 @@ pub mod sandbox;
 #[allow(dead_code)]
 pub(crate) mod worktree;
 
-pub use sandbox::{ProcessSandboxConfig, SandboxCommand, SandboxPrefix};
+pub use sandbox::{ProcessSandboxConfig, SandboxCommand, SandboxPolicy, SandboxPrefix};
