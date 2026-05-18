@@ -12,7 +12,8 @@ use crate::commands::{
     capsule::config::ConfigArgs as CapsuleConfigArgs, capsule::show::ShowArgs as CapsuleShowArgs,
     completions::CompletionsArgs, doctor::DoctorArgs, gc::GcArgs, group::GroupCommand,
     logs::LogsArgs, ps::PsArgs, quota::QuotaCommand, run::RunArgs, secret::SecretCommand,
-    top::TopArgs, trust::TrustCommand, version::VersionArgs, voucher::VoucherCommand, who::WhoArgs,
+    setup::SetupArgs, top::TopArgs, trust::TrustCommand, version::VersionArgs,
+    voucher::VoucherCommand, who::WhoArgs,
 };
 
 /// Astrid - Secure Agent Runtime
@@ -220,6 +221,10 @@ pub(crate) enum Commands {
 
     /// Run a system health check.
     Doctor(DoctorArgs),
+
+    /// One-time host configuration (`AppArmor` profile for unprivileged
+    /// user namespaces on Ubuntu 23.10+, etc.).
+    Setup(SetupArgs),
 
     /// Print version information.
     Version(VersionArgs),

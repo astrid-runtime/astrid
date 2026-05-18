@@ -220,6 +220,112 @@ pub struct SandboxPrefix {
 ///     cmd.arg("npx").args(["@anthropics/mcp-server-filesystem", "/tmp"]);
 /// }
 /// ```
+/// Distro-aware hint string returned alongside the "sandbox unavailable"
+/// error or warning on Linux. Names the most common cause
+/// (`apparmor_restrict_unprivileged_userns=1` on Ubuntu 24.04+) and the
+/// remediation. Returned by value so the caller can format it into a
+/// larger message.
+#[cfg(target_os = "linux")]
+fn linux_unavailable_hint() -> &'static str {
+    "On Ubuntu 24.04+, this is most often caused by \
+     `kernel.apparmor_restrict_unprivileged_userns=1`. \
+     Fix with: `sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0` \
+     (or persist via /etc/sysctl.d/). On other distros, ensure the \
+     `bubblewrap` package is installed."
+}
+
+/// Hint string for platforms without a supported OS-level sandbox
+/// implementation (everything except Linux + macOS today).
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn unsupported_os_hint() -> &'static str {
+    "Astrid currently supports OS-level sandboxing on Linux (bwrap) and \
+     macOS (Seatbelt). On other platforms there is no sandbox layer \
+     available — native subprocess capsules cannot be safely contained."
+}
+
+/// Operator-side policy controlling what happens when OS-level
+/// sandboxing is unavailable (e.g. `bwrap` missing or
+/// `kernel.apparmor_restrict_unprivileged_userns=1` on Ubuntu 24.04+).
+///
+/// Two-state on purpose. The default is [`SandboxPolicy::Required`] —
+/// refuse to launch unsandboxed subprocesses, matching the security
+/// guarantee the README documents. The only escape hatch is
+/// [`SandboxPolicy::Off`], which silently launches without a sandbox.
+///
+/// There is **no** "warn and fall through" middle state. That was the
+/// pre-#655 behaviour and it is exactly the bug: a soft fallback hides
+/// the fact that the security model isn't applying. Either the sandbox
+/// works (`Required`) or the operator explicitly opted out (`Off`). On
+/// a clean target system the kernel sandbox should always be available;
+/// if it isn't, that's a deployment problem to surface, not paper over.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SandboxPolicy {
+    /// Refuse to launch if the OS-level sandbox cannot be applied.
+    /// [`ProcessSandboxConfig::sandbox_prefix`] returns an error with
+    /// an actionable hint (typically the `sysctl` command on Ubuntu
+    /// 24.04+). This is the default — fail loudly rather than silently
+    /// weaken isolation. Production deployments should always run with
+    /// this policy on a properly configured system.
+    #[default]
+    Required,
+    /// Always launch without an OS-level sandbox, no warning. The
+    /// operator has explicitly accepted that subprocess capsules will
+    /// run with the host user's full reach. Use only for trusted dev
+    /// environments, CI runners where the kernel can't be configured
+    /// for unprivileged namespaces, or other situations where the
+    /// trade-off is documented elsewhere.
+    Off,
+}
+
+impl SandboxPolicy {
+    /// Parse a policy name from a configuration string.
+    ///
+    /// Accepted values (case-insensitive): `"required"`, `"off"`.
+    /// Returns the parsed policy on success, `None` on unknown input so
+    /// callers can log the bad value and fall back to the default.
+    #[must_use]
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "required" => Some(Self::Required),
+            "off" => Some(Self::Off),
+            _ => None,
+        }
+    }
+
+    /// Resolve the effective policy from the `ASTRID_SANDBOX_POLICY`
+    /// environment variable, falling back to [`Self::default`] when
+    /// unset or unparseable.
+    ///
+    /// A malformed value logs a `warn` so operators see the typo and
+    /// understand they got the default (Required) instead of what they
+    /// asked for.
+    #[must_use]
+    pub fn from_env() -> Self {
+        match std::env::var("ASTRID_SANDBOX_POLICY") {
+            Ok(s) => {
+                if let Some(p) = Self::parse(&s) {
+                    p
+                } else {
+                    tracing::warn!(
+                        value = %s,
+                        "ASTRID_SANDBOX_POLICY value is not one of \
+                         required / off — falling back to `required`"
+                    );
+                    Self::default()
+                }
+            },
+            Err(_) => Self::default(),
+        }
+    }
+}
+
+/// Data-oriented sandbox configuration that produces a wrapper program +
+/// args prefix rather than wrapping a `std::process::Command` directly.
+///
+/// Useful when the consumer needs a different `Command` type (e.g.
+/// `tokio::process::Command`) but still wants OS-level sandbox wrapping.
+/// See [`Self::sandbox_prefix`] for the produced prefix and
+/// [`SandboxPolicy`] for what happens when the OS sandbox is unavailable.
 #[derive(Debug, Clone)]
 pub struct ProcessSandboxConfig {
     /// Root directory the sandboxed process can write to.
@@ -232,10 +338,18 @@ pub struct ProcessSandboxConfig {
     allow_network: bool,
     /// Paths to overlay with empty tmpfs (Linux) or exclude (macOS), blocking access.
     hidden_paths: Vec<PathBuf>,
+    /// What to do when OS-level sandboxing is unavailable (see [`SandboxPolicy`]).
+    policy: SandboxPolicy,
 }
 
 impl ProcessSandboxConfig {
     /// Create a new sandbox config with the given writable root.
+    ///
+    /// The default sandbox policy is read from the `ASTRID_SANDBOX_POLICY`
+    /// environment variable (`required` / `off`). When unset
+    /// or unparseable, the policy defaults to [`SandboxPolicy::Required`]:
+    /// callers will get an error from [`Self::sandbox_prefix`] rather than a
+    /// silent unsandboxed launch when the OS-level sandbox can't be applied.
     #[must_use]
     pub fn new(writable_root: impl Into<PathBuf>) -> Self {
         Self {
@@ -244,7 +358,16 @@ impl ProcessSandboxConfig {
             extra_write_paths: Vec::new(),
             allow_network: true,
             hidden_paths: Vec::new(),
+            policy: SandboxPolicy::from_env(),
         }
+    }
+
+    /// Override the policy for handling unavailable OS-level sandboxing.
+    /// See [`SandboxPolicy`] for the semantics of each variant.
+    #[must_use]
+    pub fn with_policy(mut self, policy: SandboxPolicy) -> Self {
+        self.policy = policy;
+        self
     }
 
     /// Set whether network access is allowed.
@@ -280,14 +403,27 @@ impl ProcessSandboxConfig {
 
     /// Build the sandbox wrapper prefix for this configuration.
     ///
-    /// Returns `Some(prefix)` on supported platforms (Linux, macOS), `None` on
-    /// unsupported platforms (e.g., Windows).
+    /// Behaviour depends on the active [`SandboxPolicy`]:
+    /// - [`SandboxPolicy::Required`] (default): returns `Ok(Some(prefix))`
+    ///   when the OS-level sandbox is available, or `Err` with an
+    ///   actionable hint when it is not. Callers should propagate the
+    ///   error and refuse to launch the subprocess — this is what
+    ///   preserves the README's "subprocess capsules are always
+    ///   contained" guarantee.
+    /// - [`SandboxPolicy::Off`]: returns `Ok(None)` unconditionally,
+    ///   without any warning. Use only for trusted dev environments.
     ///
     /// # Errors
     ///
-    /// Returns an error if any configured path is not valid UTF-8, not absolute,
-    /// or contains characters that would break sandbox profile syntax
-    /// (double-quote, backslash, or null byte).
+    /// Returns an error if:
+    /// - Any configured path is not valid UTF-8, not absolute, or
+    ///   contains characters that would break sandbox profile syntax
+    ///   (double-quote, backslash, or null byte).
+    /// - The active policy is [`SandboxPolicy::Required`] and the
+    ///   OS-level sandbox is unavailable. The error message names the
+    ///   most likely cause (`kernel.apparmor_restrict_unprivileged_userns=1`
+    ///   on Ubuntu 24.04+) and the remediation (`sysctl` command or
+    ///   explicit policy override).
     pub fn sandbox_prefix(&self) -> io::Result<Option<SandboxPrefix>> {
         // Validate all configured paths up front, regardless of platform.
         // This ensures the doc contract ("returns Err for non-UTF-8 or
@@ -295,27 +431,56 @@ impl ProcessSandboxConfig {
         // interpolation makes it exploitable.
         self.validate_all_paths()?;
 
+        // `Off` short-circuits before any probe so the no-warn contract
+        // is honoured: the operator has explicitly opted out of
+        // subprocess containment and shouldn't see diagnostic noise.
+        if self.policy == SandboxPolicy::Off {
+            return Ok(None);
+        }
+
         #[cfg(target_os = "linux")]
         {
             if bwrap::bwrap_available() {
-                Ok(Some(self.build_bwrap_prefix()))
-            } else {
-                Ok(None)
+                return Ok(Some(self.build_bwrap_prefix()));
             }
+            self.handle_unavailable_sandbox(linux_unavailable_hint())
         }
 
         #[cfg(target_os = "macos")]
         {
+            // Seatbelt is shipped with macOS and effectively always
+            // available; a failure here is genuinely exceptional (e.g.
+            // path validation tripping a sub-builder), so it surfaces
+            // through `build_seatbelt_prefix` regardless of policy.
             self.build_seatbelt_prefix().map(Some)
         }
 
         #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         {
-            tracing::warn!(
-                "Host-level sandboxing is not supported on this OS. \
-                 MCP server will run unsandboxed."
-            );
-            Ok(None)
+            self.handle_unavailable_sandbox(unsupported_os_hint())
+        }
+    }
+
+    /// Apply the configured `SandboxPolicy` when the OS-level sandbox is
+    /// unavailable. Returns `Err` for `Required`, and never called for
+    /// `Off` (handled upstream in [`Self::sandbox_prefix`]).
+    #[cfg(any(
+        target_os = "linux",
+        not(any(target_os = "linux", target_os = "macos"))
+    ))]
+    fn handle_unavailable_sandbox(&self, hint: &str) -> io::Result<Option<SandboxPrefix>> {
+        match self.policy {
+            SandboxPolicy::Required => Err(io::Error::other(format!(
+                "OS-level sandbox unavailable and policy is `required` — \
+                 refusing to launch native subprocess capsule without \
+                 containment. {hint} To run without the sandbox anyway \
+                 (trusted dev environments, CI runners where the kernel \
+                 can't be configured), set `ASTRID_SANDBOX_POLICY=off`. \
+                 The `required` default exists to keep the security \
+                 guarantee documented in the README — see issue #655."
+            ))),
+            // Unreachable: `Off` short-circuits in `sandbox_prefix`.
+            SandboxPolicy::Off => Ok(None),
         }
     }
 
@@ -542,6 +707,81 @@ mod tests {
         assert!(config.extra_write_paths.is_empty());
         assert!(config.hidden_paths.is_empty());
     }
+
+    // --- SandboxPolicy tests ---
+
+    #[test]
+    fn policy_parse_accepts_known_values() {
+        assert_eq!(
+            SandboxPolicy::parse("required"),
+            Some(SandboxPolicy::Required)
+        );
+        assert_eq!(
+            SandboxPolicy::parse("Required"),
+            Some(SandboxPolicy::Required)
+        );
+        assert_eq!(SandboxPolicy::parse("OFF"), Some(SandboxPolicy::Off));
+        assert_eq!(SandboxPolicy::parse("  off  "), Some(SandboxPolicy::Off));
+    }
+
+    #[test]
+    fn policy_parse_rejects_unknown_values() {
+        assert_eq!(SandboxPolicy::parse(""), None);
+        // The pre-#655 "warn and fall through" middle state was removed
+        // intentionally — `preferred` is no longer a valid policy.
+        assert_eq!(SandboxPolicy::parse("preferred"), None);
+        assert_eq!(SandboxPolicy::parse("relaxed"), None);
+        assert_eq!(SandboxPolicy::parse("required-ish"), None);
+    }
+
+    #[test]
+    fn policy_default_is_required() {
+        assert_eq!(SandboxPolicy::default(), SandboxPolicy::Required);
+    }
+
+    #[test]
+    #[allow(unsafe_code)] // env mutation is unsafe in 2024 edition; see SAFETY note below
+    fn config_default_policy_is_required_when_env_unset() {
+        // The bug from #655: a fresh `ProcessSandboxConfig::new(...)`
+        // silently bypassing the sandbox. The constructor reads
+        // `ASTRID_SANDBOX_POLICY` from the env, falling back to
+        // `Required`. Confirm it lands on `Required` when the env var
+        // is unset.
+        //
+        // SAFETY: `std::env::remove_var` is unsafe in 2024 edition
+        // because env mutation isn't thread-safe; this test is racy if
+        // another test concurrently sets the same var. None do — the
+        // policy-test set is the only consumer.
+        unsafe {
+            std::env::remove_var("ASTRID_SANDBOX_POLICY");
+        }
+        let config = ProcessSandboxConfig::new("/project");
+        assert_eq!(
+            config.policy,
+            SandboxPolicy::Required,
+            "fresh config with unset env must default to Required — \
+             silent unsandboxed launches are the bug from #655"
+        );
+    }
+
+    #[test]
+    fn with_policy_overrides_default() {
+        let config = ProcessSandboxConfig::new("/project").with_policy(SandboxPolicy::Off);
+        assert_eq!(config.policy, SandboxPolicy::Off);
+    }
+
+    #[test]
+    fn sandbox_prefix_with_off_policy_returns_none_silently() {
+        // `Off` short-circuits and returns None regardless of platform
+        // sandbox availability.
+        let config = ProcessSandboxConfig::new("/project").with_policy(SandboxPolicy::Off);
+        let result = config.sandbox_prefix();
+        assert!(matches!(result, Ok(None)));
+    }
+
+    // The Required-vs-Preferred behaviour around real bwrap availability
+    // is platform-specific and probe-cached, so it's covered by the
+    // bwrap-targeted tests below rather than reproduced here.
 
     // --- Cross-platform sandbox_prefix() rejection tests ---
 

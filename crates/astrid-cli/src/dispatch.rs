@@ -168,6 +168,7 @@ async fn dispatch_subcommand(
         Some(Commands::Top(args)) => commands::top::run(args).await,
         Some(Commands::Who(args)) => commands::who::run(args).await,
         Some(Commands::Doctor(args)) => commands::doctor::run(args).await,
+        Some(Commands::Setup(args)) => commands::setup::run(&args),
         Some(Commands::Version(args)) => commands::version::run(&args),
         Some(Commands::Completions(args)) => commands::completions::run(&args),
         Some(Commands::Update | Commands::SelfUpdate) => {

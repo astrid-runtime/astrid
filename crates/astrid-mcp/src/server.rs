@@ -148,6 +148,14 @@ pub struct ServerManager {
     /// When set, MCP capsule server stderr is redirected to
     /// `{capsule_log_dir}/{capsule-name}.log`. When `None`, stderr is inherited.
     capsule_log_dir: Option<PathBuf>,
+    /// Override for the sandbox availability policy.
+    ///
+    /// When `None`, [`ProcessSandboxConfig`] reads `ASTRID_SANDBOX_POLICY`
+    /// from the environment (defaulting to [`SandboxPolicy::Required`]).
+    /// Tests that exercise non-sandbox code paths set this to
+    /// [`SandboxPolicy::Off`] so they don't depend on host `bwrap` /
+    /// `AppArmor` state.
+    sandbox_policy_override: Option<astrid_workspace::SandboxPolicy>,
 }
 
 impl ServerManager {
@@ -161,7 +169,19 @@ impl ServerManager {
             shutdown_timeout,
             workspace_root: None,
             capsule_log_dir: None,
+            sandbox_policy_override: None,
         }
+    }
+
+    /// Override the sandbox-availability policy for every command this
+    /// manager builds. Intended for tests that need deterministic
+    /// behaviour regardless of host `bwrap` / `AppArmor` state — production
+    /// code paths should let [`ProcessSandboxConfig::new`] resolve the
+    /// policy from `ASTRID_SANDBOX_POLICY`.
+    #[must_use]
+    pub fn with_sandbox_policy(mut self, policy: astrid_workspace::SandboxPolicy) -> Self {
+        self.sandbox_policy_override = Some(policy);
+        self
     }
 
     /// Set the workspace root directory for sandbox writable access.
@@ -468,6 +488,9 @@ impl ServerManager {
         let mut sandbox_config = ProcessSandboxConfig::new(&writable_root)
             .with_network(config.allow_network)
             .with_hidden(astrid_home);
+        if let Some(policy) = self.sandbox_policy_override {
+            sandbox_config = sandbox_config.with_policy(policy);
+        }
 
         // Add config-specified extra paths. Validated for:
         // 1. Absolute (avoid ambiguity about which directory they resolve relative to)
@@ -530,13 +553,23 @@ impl ServerManager {
             sandbox_config = sandbox_config.with_extra_read(bin_dir);
         }
 
-        // Get sandbox prefix (bwrap/sandbox-exec args)
+        // Get sandbox prefix (bwrap/sandbox-exec args).
+        //
+        // Under the default `SandboxPolicy::Required` policy this errors
+        // out when the OS sandbox is unavailable — the error carries the
+        // operator-facing remediation hint (sysctl command on Ubuntu
+        // 24.04+, package-install on other distros, or explicit policy
+        // override). We surface that message verbatim instead of wrapping
+        // it in a misleading "path validation failed" label.
+        //
+        // Under `Off` the call returns `Ok(None)` silently. Either
+        // way we don't double-log here.
         let sandbox_prefix =
             sandbox_config
                 .sandbox_prefix()
                 .map_err(|e| McpError::ServerStartFailed {
                     name: name.to_string(),
-                    reason: format!("sandbox path validation failed: {e}"),
+                    reason: e.to_string(),
                 })?;
 
         // Build the command
@@ -549,11 +582,8 @@ impl ServerManager {
             cmd.args(&config.args);
             cmd
         } else {
-            warn!(
-                server = name,
-                "Sandboxing not available on this platform; \
-                 untrusted MCP server will run without OS-level isolation"
-            );
+            // Reached only when the operator explicitly opted into
+            // `Off`, which is intentionally silent.
             let mut cmd = tokio::process::Command::new(&resolved_command);
             cmd.args(&config.args);
             cmd
@@ -1178,6 +1208,18 @@ mod tests {
 
     #[test]
     fn test_build_sandboxed_command_adds_sandbox_prefix() {
+        // Probe-gated: on Linux this needs a working bwrap to exercise the
+        // wrapper. CI runners often have bwrap installed but the kernel
+        // sysctl blocks user namespaces — sandbox_prefix() returns Err under
+        // the default Required policy. Skipping there preserves the test's
+        // intent (verify the wrapper is invoked when sandboxing is possible)
+        // without making CI dependent on host-kernel configuration.
+        #[cfg(target_os = "linux")]
+        if !linux_sandbox_actually_available() {
+            eprintln!("skipping: bwrap probe failed — sandbox not exercised on this host");
+            return;
+        }
+
         let configs = ServersConfig::default();
         let manager = ServerManager::new(configs)
             .with_workspace_root(std::env::temp_dir().join("astrid-test-workspace"));
@@ -1190,14 +1232,8 @@ mod tests {
 
         let program = cmd.as_std().get_program().to_string_lossy().to_string();
 
-        // On supported platforms with a working sandbox, the program is the
-        // wrapper. If the sandbox is unavailable at runtime (e.g. bwrap
-        // blocked by AppArmor in CI), the program is the resolved binary.
         #[cfg(target_os = "linux")]
-        assert!(
-            program == "bwrap" || std::path::Path::new(&program).is_absolute(),
-            "expected 'bwrap' or resolved absolute path, got: {program}"
-        );
+        assert_eq!(program, "bwrap", "expected bwrap wrapper, got: {program}");
         #[cfg(target_os = "macos")]
         assert_eq!(program, "sandbox-exec");
         #[cfg(not(any(target_os = "linux", target_os = "macos")))]
@@ -1207,12 +1243,30 @@ mod tests {
         );
     }
 
+    /// Linux-only: does the host kernel actually grant unprivileged user
+    /// namespaces to `bwrap`? Mirrors `astrid_workspace::bwrap_available`
+    /// but inlined here so the test doesn't depend on internal symbols.
+    #[cfg(target_os = "linux")]
+    fn linux_sandbox_actually_available() -> bool {
+        std::process::Command::new("bwrap")
+            .args(["--unshare-user", "--ro-bind", "/", "/", "--", "/bin/true"])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success())
+    }
+
     #[test]
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     fn test_build_sandboxed_command_resolves_absolute_binary_path() {
+        // Off so the test exercises binary resolution deterministically
+        // regardless of host bwrap / `AppArmor` state. Resolution happens
+        // before the sandbox-policy decision either way.
         let configs = ServersConfig::default();
         let manager = ServerManager::new(configs)
-            .with_workspace_root(std::env::temp_dir().join("astrid-test-workspace"));
+            .with_workspace_root(std::env::temp_dir().join("astrid-test-workspace"))
+            .with_sandbox_policy(astrid_workspace::SandboxPolicy::Off);
 
         let config = ServerConfig::stdio("test", "echo");
 
@@ -1272,9 +1326,11 @@ mod tests {
 
     #[test]
     fn test_sandboxed_command_clears_env() {
+        // Off so env scrubbing is tested independently of host sandbox state.
         let configs = ServersConfig::default();
         let manager = ServerManager::new(configs)
-            .with_workspace_root(std::env::temp_dir().join("astrid-test-workspace"));
+            .with_workspace_root(std::env::temp_dir().join("astrid-test-workspace"))
+            .with_sandbox_policy(astrid_workspace::SandboxPolicy::Off);
 
         let config = ServerConfig::stdio("test", "echo").with_env("SAFE_VAR", "value");
 
@@ -1324,7 +1380,8 @@ mod tests {
     fn test_sandboxed_command_blocks_dangerous_env() {
         let configs = ServersConfig::default();
         let manager = ServerManager::new(configs)
-            .with_workspace_root(std::env::temp_dir().join("astrid-test-workspace"));
+            .with_workspace_root(std::env::temp_dir().join("astrid-test-workspace"))
+            .with_sandbox_policy(astrid_workspace::SandboxPolicy::Off);
 
         let config = ServerConfig::stdio("test", "echo")
             .with_env("LD_PRELOAD", "/evil.so")
@@ -1356,11 +1413,16 @@ mod tests {
 
     #[test]
     fn test_writable_root_priority_cwd_first() {
+        // Off so the writable-root precedence logic is tested independently
+        // of host sandbox state. The cwd-as-current-dir behaviour we assert
+        // here is what the unsandboxed branch sets regardless of policy.
         let cwd_dir = std::env::temp_dir().join("astrid-test-cwd");
         let ws_dir = std::env::temp_dir().join("astrid-test-ws");
 
         let configs = ServersConfig::default();
-        let manager = ServerManager::new(configs).with_workspace_root(ws_dir.clone());
+        let manager = ServerManager::new(configs)
+            .with_workspace_root(ws_dir.clone())
+            .with_sandbox_policy(astrid_workspace::SandboxPolicy::Off);
 
         let mut config = ServerConfig::stdio("test", "echo");
         config.cwd = Some(cwd_dir.clone());
@@ -1369,57 +1431,39 @@ mod tests {
             .build_sandboxed_command("test", "echo", &config)
             .expect("should build command");
 
-        // When sandbox is available, the writable root appears in sandbox
-        // args. When unavailable (e.g. bwrap blocked in CI), the cwd is
-        // still set as current_dir on the command.
-        let args: Vec<String> = cmd
-            .as_std()
-            .get_args()
-            .map(|a| a.to_string_lossy().to_string())
-            .collect();
-        let args_joined = args.join(" ");
         let current_dir = cmd.as_std().get_current_dir();
-
-        let cwd_str = cwd_dir.to_string_lossy().to_string();
-        assert!(
-            args_joined.contains(&cwd_str) || current_dir == Some(cwd_dir.as_path()),
-            "writable root should be {cwd_str} (config.cwd wins), got args: {args_joined}, \
-             current_dir: {current_dir:?}"
+        assert_eq!(
+            current_dir,
+            Some(cwd_dir.as_path()),
+            "config.cwd should win over workspace_root as the command's current_dir"
         );
     }
 
     #[test]
     fn test_writable_root_priority_workspace_second() {
+        // Off so workspace_root fallback is tested deterministically.
         let ws_dir = std::env::temp_dir().join("astrid-test-ws2");
 
         let configs = ServersConfig::default();
-        let manager = ServerManager::new(configs).with_workspace_root(ws_dir.clone());
+        let manager = ServerManager::new(configs)
+            .with_workspace_root(ws_dir.clone())
+            .with_sandbox_policy(astrid_workspace::SandboxPolicy::Off);
 
         let config = ServerConfig::stdio("test", "echo");
-        // No cwd set, should fall back to workspace_root
+        // No cwd set, should fall back to workspace_root for sandbox config.
 
         let cmd = manager
             .build_sandboxed_command("test", "echo", &config)
             .expect("should build command");
 
-        // When sandbox is available, the writable root appears in sandbox
-        // args. When unavailable, verify the command still builds
-        // successfully (workspace_root was used for sandbox config even if
-        // sandbox is skipped).
-        let args: Vec<String> = cmd
-            .as_std()
-            .get_args()
-            .map(|a| a.to_string_lossy().to_string())
-            .collect();
-        let args_joined = args.join(" ");
-
-        let ws_str = ws_dir.to_string_lossy().to_string();
+        // Under Off the sandbox prefix is suppressed, so the assertion is
+        // that the command builds successfully — the only way it can fail
+        // here without a sandbox involved is if the writable_root resolution
+        // chain breaks (e.g. workspace_root not picked up when cwd is None).
         let program = cmd.as_std().get_program().to_string_lossy().to_string();
-        // Either ws_dir is in sandbox args, or sandbox was skipped and
-        // we just have the resolved binary.
         assert!(
-            args_joined.contains(&ws_str) || std::path::Path::new(&program).is_absolute(),
-            "writable root should be {ws_str} (workspace_root fallback), got args: {args_joined}"
+            std::path::Path::new(&program).is_absolute(),
+            "resolved binary should be absolute, got: {program}"
         );
     }
 
