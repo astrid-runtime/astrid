@@ -14,6 +14,7 @@ use clap::Parser;
 
 mod archiver;
 mod build;
+mod js;
 mod mcp;
 mod openclaw;
 mod rust;

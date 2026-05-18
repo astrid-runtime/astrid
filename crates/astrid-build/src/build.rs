@@ -43,9 +43,10 @@ pub(crate) fn run_build(
         "mcp" => crate::mcp::convert(&target_dir, "mcp.json", output)?,
         "extension" => crate::mcp::convert(&target_dir, "gemini-extension.json", output)?,
         "openclaw" => crate::openclaw::build(&target_dir, output)?,
-        "js" | "ts" | "node" => {
+        "js" | "ts" => crate::js::build(&target_dir, output)?,
+        "node" => {
             bail!(
-                "Native JS/TS capsule SDK is not yet implemented. \
+                "Project type 'node' is ambiguous. For native Astrid JS/TS capsules use --type js or --type ts. \
                  For OpenClaw plugins, use --type openclaw or ensure openclaw.plugin.json exists."
             );
         },
@@ -79,7 +80,16 @@ fn detect_project_type(dir: &Path) -> Result<String> {
     }
 
     if dir.join("package.json").exists() {
-        return Ok("js".to_string());
+        // Disambiguate: native Astrid JS/TS capsules also carry a Capsule.toml.
+        // Without one, it's almost certainly an OpenClaw plugin or unrelated
+        // project — fall through and let the next checks (or a manual --type)
+        // decide.
+        if dir.join("Capsule.toml").exists() {
+            if dir.join("tsconfig.json").exists() {
+                return Ok("ts".to_string());
+            }
+            return Ok("js".to_string());
+        }
     }
 
     if dir.join("mcp.json").exists() {
@@ -106,7 +116,7 @@ mod tests {
     use std::fs;
     use std::path::{Path, PathBuf};
 
-    /// Create a minimal Tier 2 OpenClaw plugin (Node.js — no QuickJS kernel needed).
+    /// Create a minimal Tier 2 `OpenClaw` plugin (`Node.js` — no `QuickJS` kernel needed).
     fn create_tier2_plugin(dir: &Path) {
         let manifest = r#"{
             "id": "lifecycle-test",

@@ -22,6 +22,7 @@ astrid-openclaw = { workspace = true }
 cargo_metadata = "0.23.1"
 clap = { workspace = true }
 flate2 = { workspace = true }
+serde = { workspace = true }
 serde_json = { workspace = true }
 tar = { workspace = true }
 tempfile = { workspace = true }
