@@ -545,8 +545,11 @@ pub(crate) fn install_from_local(
         return unpack_and_install(source_path, workspace, home, original_source);
     }
 
-    // Auto-build Rust capsules if we point at a source directory with a Cargo.toml
-    if source_path.is_dir() && source_path.join("Cargo.toml").exists() {
+    // Auto-build capsule sources. astrid-build handles language detection
+    // (Rust via Cargo.toml, JS/TS via package.json + Capsule.toml, OpenClaw
+    // via openclaw.plugin.json) — we just need to spot any of those
+    // markers and delegate.
+    if source_path.is_dir() && is_buildable_source(source_path) {
         let tmp_dir = tempfile::tempdir().context("failed to create temp dir for building")?;
         let output_dir = tmp_dir.path().join("dist");
 
@@ -555,8 +558,6 @@ pub(crate) fn install_from_local(
             .arg(source)
             .arg("--output")
             .arg(output_dir.to_str().context("Invalid output dir path")?)
-            .arg("--type")
-            .arg("rust")
             .status()
             .context("Failed to run astrid-build")?;
         if !status.success() {
@@ -573,10 +574,32 @@ pub(crate) fn install_from_local(
                 return unpack_and_install(&entry.path(), workspace, home, original_source);
             }
         }
-        bail!("Failed to auto-build capsule from Cargo project.");
+        bail!(
+            "astrid-build did not produce a .capsule archive in {}",
+            output_dir.display()
+        );
     }
 
     install_from_local_path_inner(source_path, workspace, home, original_source)
+}
+
+/// Returns true if `dir` looks like a capsule source tree astrid-build can
+/// compile. Mirrors astrid-build's `detect_project_type` without pulling in
+/// the full crate dependency just for the marker check.
+fn is_buildable_source(dir: &Path) -> bool {
+    if dir.join("Cargo.toml").exists() {
+        return true;
+    }
+    if dir.join("openclaw.plugin.json").exists() {
+        return true;
+    }
+    // Native Astrid JS/TS capsules require both Capsule.toml and package.json
+    // (the Capsule.toml requirement disambiguates from random Node projects
+    // that happen to sit in the working directory).
+    if dir.join("Capsule.toml").exists() && dir.join("package.json").exists() {
+        return true;
+    }
+    false
 }
 
 fn unpack_and_install(
