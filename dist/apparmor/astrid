@@ -1,0 +1,60 @@
+# AppArmor profile for Astrid OS — allows unprivileged user namespace
+# creation so the bundled bubblewrap sandbox can build its mount /
+# pid / network namespace for native subprocess capsules (MCP servers,
+# OpenClaw Tier 2 plugins).
+#
+# Why this profile exists
+# -----------------------
+# Ubuntu 23.10+ and other recent distros ship the kernel sysctl
+# `kernel.apparmor_restrict_unprivileged_userns=1` enabled by default.
+# Under that policy, AppArmor denies `unshare(CLONE_NEWUSER)` from any
+# process that is not covered by a profile granting the `userns,`
+# permission. Without this profile, Astrid's bwrap subprocess fails
+# during user-namespace creation and the daemon refuses to launch
+# native subprocess capsules under the default `SandboxPolicy::Required`
+# (see issue #655).
+#
+# What this profile does and does not do
+# --------------------------------------
+# This is a *narrow* exception, not a sandbox. The `flags=(unconfined)`
+# directive means Astrid keeps its normal Linux DAC permissions for
+# everything; the profile only carves out the one extra capability the
+# binary needs (creating user namespaces) without weakening host-wide
+# AppArmor policy. The actual sandboxing — filesystem view, network
+# restrictions, process-exec policy — is applied INSIDE the user
+# namespace by bwrap, not by this profile.
+#
+# Children spawned by Astrid inherit this profile by default, which is
+# what we want: when Astrid execs bwrap, bwrap also has the `userns,`
+# permission and can complete its sandbox setup.
+#
+# Install
+# -------
+# Distro packagers should ship this file at /etc/apparmor.d/astrid.
+# Manual install:
+#   sudo install -m 644 dist/apparmor/astrid /etc/apparmor.d/astrid
+#   sudo apparmor_parser -r /etc/apparmor.d/astrid
+# Verify:
+#   sudo aa-status | grep astrid
+#
+# Path coverage
+# -------------
+# The path glob below covers the two locations Astrid binaries normally
+# live in on a Linux host:
+#   /usr/bin/astrid          (distro packages: deb / rpm / pacman / etc.)
+#   /usr/local/bin/astrid    (manual `cargo install --root /usr/local`,
+#                             `make install`, distro-side overrides)
+#
+# Users who installed via `cargo install astrid` into ~/.cargo/bin will
+# need to either (a) move the binary to /usr/local/bin, or (b) copy
+# this profile and rewrite the path to match their install location.
+# `astrid setup` generates a path-correct profile for the current
+# binary if that's easier.
+
+abi <abi/4.0>,
+
+include <tunables/global>
+
+profile astrid /usr/{,local/}bin/astrid flags=(unconfined) {
+  userns,
+}

@@ -2,7 +2,10 @@
 /target
 **/target
 Cargo.lock
-dist/
+# Ignore build artifacts under dist/, but keep tracked source assets
+# (AppArmor profile, distro/packager files) re-included below.
+dist/*
+!dist/apparmor/
 
 # IDE
 .idea/
@@ -43,3 +46,4 @@ packages/*/dist/
 !.gemini/config.yaml
 !.gemini/styleguide.md
 .mcp.json
+.docker-target/
