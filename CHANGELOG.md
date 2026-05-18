@@ -9,6 +9,10 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
 
 ## [Unreleased]
 
+### Changed
+
+- **`wit/astrid-capsule.wit` is now sourced from the canonical `unicity-astrid/wit` repo.** The host ABI lived as an unsynced copy in three places (`core/wit/`, `sdk-rust/astrid-sys/wit/`, `sdk-js/packages/astrid-sdk/wit/`); PR `unicity-astrid/wit#3` made `unicity-astrid/wit` the canonical home (new `host/astrid-capsule.wit` path) so the kernel + every SDK consume the same file. This commit adds the submodule at `contracts/`, adds `scripts/sync-host-wit.sh` that copies the canonical into `core/wit/` (the in-tree copy can't be removed because `astrid-capsule` publishes to crates.io and `cargo package` only bundles files inside the crate directory — but the submodule is authoritative), and a new CI job (`wit-sync`) runs `scripts/sync-host-wit.sh --check` on every push so drift fails CI. The current in-tree content is byte-identical to the canonical so the sync is a no-op today; the next change to the host ABI lands in `unicity-astrid/wit` first and bumps the submodule pointer here.
+
 ### Added
 
 - **`astrid -p ... --session <ID_OR_NAME>` accepts either a UUID or a name.** A string that parses as a UUID is used as-is for resume; anything else is treated as a stable session name and hashed via UUID v5 (`NAMESPACE_URL`). Operators can copy the UUID printed by `--print-session` straight into `--session <that UUID>` for the next turn and round-trip works, matching the `cargo` / `gh` / `claude` convention on the same flag. Help text uses value name `ID_OR_NAME`.

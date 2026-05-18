@@ -68,6 +68,17 @@ jobs:
       - name: Run cargo fmt
         run: cargo fmt --all -- --check
 
+  wit-sync:
+    name: Host WIT in sync with canonical
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Check host WIT mirror
+        run: scripts/sync-host-wit.sh --check
+
   clippy:
     name: Clippy
     runs-on: ubuntu-latest
