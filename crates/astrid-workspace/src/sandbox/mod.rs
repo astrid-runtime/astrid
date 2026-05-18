@@ -346,7 +346,7 @@ impl ProcessSandboxConfig {
     /// Create a new sandbox config with the given writable root.
     ///
     /// The default sandbox policy is read from the `ASTRID_SANDBOX_POLICY`
-    /// environment variable (`required` / `preferred` / `off`). When unset
+    /// environment variable (`required` / `off`). When unset
     /// or unparseable, the policy defaults to [`SandboxPolicy::Required`]:
     /// callers will get an error from [`Self::sandbox_prefix`] rather than a
     /// silent unsandboxed launch when the OS-level sandbox can't be applied.
@@ -410,10 +410,6 @@ impl ProcessSandboxConfig {
     ///   error and refuse to launch the subprocess — this is what
     ///   preserves the README's "subprocess capsules are always
     ///   contained" guarantee.
-    /// - [`SandboxPolicy::Preferred`]: returns `Ok(Some(prefix))` when
-    ///   available, `Ok(None)` with a `warn`-level log when not. Callers
-    ///   that opt in to this policy are explicitly accepting an
-    ///   unsandboxed launch on degraded environments.
     /// - [`SandboxPolicy::Off`]: returns `Ok(None)` unconditionally,
     ///   without any warning. Use only for trusted dev environments.
     ///
@@ -466,9 +462,8 @@ impl ProcessSandboxConfig {
     }
 
     /// Apply the configured `SandboxPolicy` when the OS-level sandbox is
-    /// unavailable. Returns `Err` for `Required`, `Ok(None)` (with a
-    /// `warn`) for `Preferred`, and never called for `Off` (handled
-    /// upstream in [`Self::sandbox_prefix`]).
+    /// unavailable. Returns `Err` for `Required`, and never called for
+    /// `Off` (handled upstream in [`Self::sandbox_prefix`]).
     #[cfg(any(
         target_os = "linux",
         not(any(target_os = "linux", target_os = "macos"))

@@ -72,7 +72,7 @@ pub(crate) fn run(args: &SetupArgs) -> Result<ExitCode> {
 
     println!();
     println!("{}", "Applying via sudo...".bold());
-    apply_install(&cmds)
+    apply_install()
 }
 
 // ── Diagnosis ──────────────────────────────────────────────────────
@@ -208,29 +208,47 @@ fn is_astrid_profile_loaded() -> bool {
 
 // ── Install commands ───────────────────────────────────────────────
 
+/// Operator-facing copy-paste install recipe. Uses `mktemp` so a hostile
+/// local user can't pre-seed a symlink at the temp path and trick the
+/// later `sudo install` into reading from (or the redirect into writing
+/// over) an attacker-chosen file — the failure mode that motivates the
+/// `tempfile` crate in [`apply_install`].
 fn install_commands() -> Vec<String> {
-    let tmp_path = "/tmp/astrid-apparmor-profile";
     vec![
-        format!("# 1. Write the profile to a temp location:"),
-        format!("astrid setup --print-apparmor > {tmp_path}"),
+        format!("# 1. Stage the profile in a fresh per-invocation temp file (mktemp avoids"),
+        format!("#    the classic /tmp symlink-pre-seed race):"),
+        format!("TMPFILE=$(mktemp -t astrid-apparmor.XXXXXX)"),
+        format!("astrid setup --print-apparmor > \"$TMPFILE\""),
         format!("# 2. Install it system-wide and load it (sudo required):"),
-        format!("sudo install -m 644 {tmp_path} /etc/apparmor.d/astrid"),
+        format!("sudo install -m 644 \"$TMPFILE\" /etc/apparmor.d/astrid"),
         format!("sudo apparmor_parser -r /etc/apparmor.d/astrid"),
+        format!("rm -f \"$TMPFILE\""),
         format!("# 3. Verify:"),
         format!("sudo aa-status | grep astrid"),
     ]
 }
 
-fn apply_install(_cmds: &[String]) -> Result<ExitCode> {
-    // Auto-apply runs the three privileged steps via sudo, prompting
-    // once for the password. We re-spawn the relevant commands rather
-    // than re-execing astrid itself, so the operator can see exactly
-    // what's being run.
-    let tmp_path = "/tmp/astrid-apparmor-profile";
-    std::fs::write(tmp_path, APPARMOR_PROFILE_TEMPLATE)?;
+fn apply_install() -> Result<ExitCode> {
+    // Auto-apply runs the privileged steps via sudo, prompting once for
+    // the password. The profile is staged through `tempfile::NamedTempFile`
+    // so the source path is created with `O_EXCL` in a randomised
+    // location — a local attacker can't pre-create a symlink at a
+    // predictable path and trick the later `sudo install` into copying
+    // (or the write into clobbering) an attacker-chosen file.
+    use std::io::Write;
+
+    let mut tmp = tempfile::Builder::new()
+        .prefix("astrid-apparmor-")
+        .suffix(".profile")
+        .tempfile()?;
+    tmp.write_all(APPARMOR_PROFILE_TEMPLATE.as_bytes())?;
+    tmp.flush()?;
+    let tmp_path = tmp.path().to_owned();
 
     let install = Command::new("sudo")
-        .args(["install", "-m", "644", tmp_path, "/etc/apparmor.d/astrid"])
+        .args(["install", "-m", "644"])
+        .arg(&tmp_path)
+        .arg("/etc/apparmor.d/astrid")
         .status()?;
     if !install.success() {
         eprintln!("{}", "sudo install failed".red());
@@ -244,6 +262,9 @@ fn apply_install(_cmds: &[String]) -> Result<ExitCode> {
         eprintln!("{}", "apparmor_parser failed".red());
         return Ok(ExitCode::FAILURE);
     }
+
+    // tmp drops here, removing the staged file.
+    drop(tmp);
 
     println!("{}", "Profile installed and loaded.".green());
     println!("Re-run `astrid setup` to verify the bwrap probe now passes.");
@@ -281,5 +302,24 @@ mod tests {
         let cmds = install_commands();
         assert!(cmds.iter().any(|c| c.contains("aa-status")));
         assert!(cmds.iter().any(|c| c.contains("apparmor_parser -r")));
+    }
+
+    #[test]
+    fn install_commands_use_mktemp_not_predictable_tmp_path() {
+        // Symlink-attack hardening: a hardcoded /tmp path lets a local
+        // attacker pre-seed a symlink and trick `sudo install` into
+        // reading from (or the redirect into clobbering) a sensitive
+        // file. Pin the mktemp pattern so a future edit can't quietly
+        // re-introduce the predictable path.
+        let cmds = install_commands();
+        let joined = cmds.join("\n");
+        assert!(
+            joined.contains("mktemp"),
+            "install_commands must stage via mktemp, not a hardcoded /tmp path: {joined}"
+        );
+        assert!(
+            !joined.contains("/tmp/astrid-apparmor-profile"),
+            "install_commands must not reference the legacy predictable temp path: {joined}"
+        );
     }
 }
