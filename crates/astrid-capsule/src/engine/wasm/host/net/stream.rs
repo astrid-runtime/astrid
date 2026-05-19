@@ -14,6 +14,16 @@ use crate::engine::wasm::host_state::{HostState, NetStream};
 /// guest in a host call indefinitely.
 pub(super) const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// Host-side cap on a single byte-stream read/peek buffer.
+///
+/// Matches the framed `net-read` payload cap so a malicious or buggy
+/// guest passing `u32::MAX` can't trigger a multi-GB allocation on the
+/// host. 10 MB is well above any realistic single-call read for the
+/// protocols this surface targets (TLS records ≤ 16 KB, WebSocket
+/// frames typically ≤ 64 KB, MQTT control packets ≤ 256 MB but
+/// streamed in chunks).
+pub(super) const MAX_BYTES_PER_CALL: usize = 10 * 1024 * 1024;
+
 /// Returns true for IO errors that represent a normal peer disconnect.
 /// These should NOT trap the WASM guest — the run loop handles dead streams.
 pub(super) fn is_peer_disconnect(e: &std::io::Error) -> bool {
@@ -105,6 +115,7 @@ where
     S: tokio::io::AsyncRead + Unpin,
 {
     use tokio::io::AsyncReadExt;
+    let max_bytes = max_bytes.min(MAX_BYTES_PER_CALL);
     let mut buf = vec![0u8; max_bytes];
     // Default (no timeout) blocks indefinitely — matches std::io::Read
     // semantics. Caller cancellation comes from the outer

@@ -9,8 +9,31 @@ mod stream;
 
 use handshake::{validate_handshake, verify_peer_credentials};
 use stream::{
-    CONNECT_TIMEOUT, read_bytes_inner, read_frame, with_tcp_slot, write_bytes_inner, write_frame,
+    CONNECT_TIMEOUT, MAX_BYTES_PER_CALL, read_bytes_inner, read_frame, with_tcp_slot,
+    write_bytes_inner, write_frame,
 };
+
+/// DNS hostname guards before reaching the resolver.
+///
+/// `lookup_host` will reject empty or null-byte input, but failing
+/// early at the host-fn boundary keeps malformed guest input out of
+/// the resolver / audit log / tracing spans entirely. 255 chars is
+/// the RFC 1035 max-name-length.
+fn validate_host(host: &str) -> Result<(), String> {
+    if host.is_empty() {
+        return Err("host must be non-empty".to_string());
+    }
+    if host.len() > 255 {
+        return Err(format!(
+            "host too long ({} bytes, max 255 per RFC 1035)",
+            host.len()
+        ));
+    }
+    if host.bytes().any(|b| b == 0) {
+        return Err("host contains null byte".to_string());
+    }
+    Ok(())
+}
 
 /// Maximum concurrent socket connections per capsule.
 /// Prevents resource exhaustion from malicious or runaway clients.
@@ -349,6 +372,9 @@ impl net::Host for HostState {
     }
 
     fn net_connect_tcp(&mut self, host: String, port: u16) -> Result<u64, String> {
+        // Reject malformed host strings at the boundary — keeps unsafe
+        // input out of the resolver, the audit log, and tracing spans.
+        validate_host(&host)?;
         // 1. Capability check — literal host:port against the manifest's
         //    net_connect allowlist. DNS / SSRF run after this gate.
         if let Some(ref gate) = self.security {
@@ -528,7 +554,9 @@ impl net::Host for HostState {
         let rt = self.runtime_handle.clone();
         let sem = self.host_semaphore.clone();
         let tok = self.cancel_token.clone();
-        let max = max_bytes as usize;
+        // Same OOM cap as read_bytes — guest can pass u32::MAX which
+        // would be a 4 GB host-side allocation.
+        let max = (max_bytes as usize).min(MAX_BYTES_PER_CALL);
         match stream {
             NetStream::Tcp(slot) => {
                 let timeout = slot.read_timeout;
@@ -725,5 +753,36 @@ mod tests {
         // dropping into an "only write supported" branch.
         let _ = sock.shutdown(Shutdown::Read);
         let _ = sock.shutdown(Shutdown::Both);
+    }
+
+    #[test]
+    fn validate_host_accepts_normal_names() {
+        assert!(validate_host("example.com").is_ok());
+        assert!(validate_host("fulcrum.unicity.network").is_ok());
+        assert!(validate_host("127.0.0.1").is_ok());
+        assert!(validate_host("::1").is_ok());
+    }
+
+    #[test]
+    fn validate_host_rejects_empty() {
+        assert!(validate_host("").is_err());
+    }
+
+    #[test]
+    fn validate_host_rejects_null_bytes() {
+        assert!(validate_host("evil\0.com").is_err());
+    }
+
+    #[test]
+    fn validate_host_rejects_overlength() {
+        let long = "a".repeat(256);
+        let err = validate_host(&long).unwrap_err();
+        assert!(err.contains("too long"));
+    }
+
+    #[test]
+    fn validate_host_accepts_max_length() {
+        let max = "a".repeat(255);
+        assert!(validate_host(&max).is_ok());
     }
 }
