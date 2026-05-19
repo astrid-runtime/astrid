@@ -4,8 +4,16 @@ use astrid_core::session_token::{
 
 use crate::engine::wasm::bindings::astrid::capsule::net;
 use crate::engine::wasm::bindings::astrid::capsule::types::NetReadStatus;
+use crate::engine::wasm::host::http::is_safe_ip;
 use crate::engine::wasm::host::util;
-use crate::engine::wasm::host_state::HostState;
+use crate::engine::wasm::host_state::{HostState, NetStream};
+
+/// Bounded timeout on a `net-connect-tcp` outbound handshake.
+///
+/// DNS resolve + TCP `connect` together must complete within this window,
+/// otherwise the host fn returns an error rather than holding the WASM
+/// guest in a host call indefinitely.
+const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Maximum concurrent socket connections per capsule.
 /// Prevents resource exhaustion from malicious or runaway clients.
@@ -21,6 +29,64 @@ fn is_peer_disconnect(e: &std::io::Error) -> bool {
             | std::io::ErrorKind::ConnectionAborted
             | std::io::ErrorKind::UnexpectedEof
     )
+}
+
+/// Read one length-prefixed frame from `stream`. Shared by UnixStream and
+/// TcpStream paths — both implement [`tokio::io::AsyncRead`].
+async fn read_frame<S>(stream: &mut S) -> Result<NetReadStatus, String>
+where
+    S: tokio::io::AsyncRead + Unpin,
+{
+    use tokio::io::AsyncReadExt;
+
+    let mut len_buf = [0u8; 4];
+    match tokio::time::timeout(
+        std::time::Duration::from_millis(50),
+        stream.read_exact(&mut len_buf),
+    )
+    .await
+    {
+        Err(_) => return Ok(NetReadStatus::Pending),
+        Ok(Err(e)) if is_peer_disconnect(&e) => return Ok(NetReadStatus::Closed),
+        Ok(Err(e)) => return Err(format!("socket read error: {e}")),
+        Ok(Ok(_)) => {},
+    }
+
+    let len = u32::from_be_bytes(len_buf) as usize;
+    if len > 10 * 1024 * 1024 {
+        return Err("Payload too large (max 10MB)".to_string());
+    }
+
+    let mut payload = vec![0u8; len];
+    let timeout_ms = 5000 + (len as u64 / 1024);
+    match tokio::time::timeout(
+        std::time::Duration::from_millis(timeout_ms),
+        stream.read_exact(&mut payload),
+    )
+    .await
+    {
+        Err(_) => return Err("Payload read timed out".to_string()),
+        Ok(Err(e)) if is_peer_disconnect(&e) => return Ok(NetReadStatus::Closed),
+        Ok(Err(e)) => return Err(format!("socket payload read error: {e}")),
+        Ok(Ok(_)) => {},
+    }
+
+    Ok(NetReadStatus::Data(payload))
+}
+
+/// Write one length-prefixed frame to `stream`. Shared across UnixStream
+/// and TcpStream — both implement [`tokio::io::AsyncWrite`].
+async fn write_frame<S>(stream: &mut S, data: &[u8]) -> std::io::Result<()>
+where
+    S: tokio::io::AsyncWrite + Unpin,
+{
+    use tokio::io::AsyncWriteExt;
+    let len = u32::try_from(data.len())
+        .map_err(|_| std::io::Error::other("write payload too large for length prefix"))?;
+    stream.write_all(&len.to_be_bytes()).await?;
+    stream.write_all(data).await?;
+    stream.flush().await?;
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -309,7 +375,7 @@ impl net::Host for HostState {
         );
         self.active_streams.insert(
             handle_id,
-            std::sync::Arc::new(tokio::sync::Mutex::new(stream)),
+            NetStream::Unix(std::sync::Arc::new(tokio::sync::Mutex::new(stream))),
         );
 
         // The `client.v1.connected` event is intentionally NOT published
@@ -423,7 +489,7 @@ impl net::Host for HostState {
         );
         self.active_streams.insert(
             handle_id,
-            std::sync::Arc::new(tokio::sync::Mutex::new(stream)),
+            NetStream::Unix(std::sync::Arc::new(tokio::sync::Mutex::new(stream))),
         );
 
         // See the matching comment in `net_accept` — `client.v1.connected`
@@ -435,11 +501,11 @@ impl net::Host for HostState {
     }
 
     fn net_read(&mut self, stream_handle: u64) -> Result<NetReadStatus, String> {
-        let stream_arc = self
+        let stream = self
             .active_streams
             .get(&stream_handle)
-            .ok_or_else(|| "Stream handle not found".to_string())?
-            .clone();
+            .cloned()
+            .ok_or_else(|| "Stream handle not found".to_string())?;
 
         let rt_handle = self.runtime_handle.clone();
         let cancel_token = self.cancel_token.clone();
@@ -449,49 +515,18 @@ impl net::Host for HostState {
         // may leave a partial frame on the socket. This is acceptable because the
         // capsule is unloading - the socket will be closed by Drop on
         // active_streams and the client will see a hard EOF / connection reset.
-        use tokio::io::AsyncReadExt;
-
         let status =
             util::bounded_block_on_cancellable(&rt_handle, &host_semaphore, &cancel_token, async {
-                let mut stream = stream_arc.lock().await;
-                let mut len_buf = [0u8; 4];
-
-                match tokio::time::timeout(
-                    std::time::Duration::from_millis(50),
-                    stream.read_exact(&mut len_buf),
-                )
-                .await
-                {
-                    Err(_) => return Ok(NetReadStatus::Pending),
-                    Ok(Err(e)) if is_peer_disconnect(&e) => {
-                        return Ok(NetReadStatus::Closed);
+                match stream {
+                    NetStream::Unix(arc) => {
+                        let mut s = arc.lock().await;
+                        read_frame(&mut *s).await
                     },
-                    Ok(Err(e)) => return Err(format!("socket read error: {e}")),
-                    Ok(Ok(_)) => {},
-                }
-
-                let len = u32::from_be_bytes(len_buf) as usize;
-                if len > 10 * 1024 * 1024 {
-                    return Err("Payload too large (max 10MB)".to_string());
-                }
-
-                let mut payload = vec![0u8; len];
-                let timeout_ms = 5000 + (len as u64 / 1024);
-                match tokio::time::timeout(
-                    std::time::Duration::from_millis(timeout_ms),
-                    stream.read_exact(&mut payload),
-                )
-                .await
-                {
-                    Err(_) => return Err("Payload read timed out".to_string()),
-                    Ok(Err(e)) if is_peer_disconnect(&e) => {
-                        return Ok(NetReadStatus::Closed);
+                    NetStream::Tcp(arc) => {
+                        let mut s = arc.lock().await;
+                        read_frame(&mut *s).await
                     },
-                    Ok(Err(e)) => return Err(format!("socket payload read error: {e}")),
-                    Ok(Ok(_)) => {},
                 }
-
-                Ok(NetReadStatus::Data(payload))
             });
 
         // Cancellation (capsule unloading) -> Pending so the guest loop exits cleanly.
@@ -502,32 +537,32 @@ impl net::Host for HostState {
     }
 
     fn net_write(&mut self, stream_handle: u64, data: Vec<u8>) -> Result<(), String> {
-        let stream_arc = self
+        let stream = self
             .active_streams
             .get(&stream_handle)
-            .ok_or_else(|| "Stream handle not found".to_string())?
-            .clone();
+            .cloned()
+            .ok_or_else(|| "Stream handle not found".to_string())?;
 
         let rt_handle = self.runtime_handle.clone();
         let host_semaphore = self.host_semaphore.clone();
         let cancel_token = self.cancel_token.clone();
 
-        use tokio::io::AsyncWriteExt;
         // Cancel safety: write_all is not cancel-safe, so cancellation mid-write
         // may leave a partial frame on the socket. This is acceptable because the
         // capsule is unloading - the socket will be closed by Drop on
         // active_streams and the client will see a hard EOF / connection reset.
         let result =
             util::bounded_block_on_cancellable(&rt_handle, &host_semaphore, &cancel_token, async {
-                let mut stream = stream_arc.lock().await;
-                // In the CLI architecture, we expect length-prefixed writes back to the client
-                let len = u32::try_from(data.len()).map_err(|_| {
-                    std::io::Error::other("write payload too large for length prefix")
-                })?;
-                stream.write_all(&len.to_be_bytes()).await?;
-                stream.write_all(&data).await?;
-                stream.flush().await?;
-                Ok::<(), std::io::Error>(())
+                match stream {
+                    NetStream::Unix(arc) => {
+                        let mut s = arc.lock().await;
+                        write_frame(&mut *s, &data).await
+                    },
+                    NetStream::Tcp(arc) => {
+                        let mut s = arc.lock().await;
+                        write_frame(&mut *s, &data).await
+                    },
+                }
             });
         match result {
             Some(Ok(())) => {},
@@ -540,6 +575,101 @@ impl net::Host for HostState {
         }
 
         Ok(())
+    }
+
+    fn net_connect_tcp(&mut self, host: String, port: u16) -> Result<u64, String> {
+        // 1. Capability check — literal host:port against the manifest's
+        //    net_connect allowlist. DNS / SSRF run after this gate.
+        if let Some(ref gate) = self.security {
+            let capsule_id = self.capsule_id.as_str().to_owned();
+            let host_for_check = host.clone();
+            let gate = gate.clone();
+            let rt = self.runtime_handle.clone();
+            let semaphore = self.host_semaphore.clone();
+            util::bounded_block_on(&rt, &semaphore, async move {
+                gate.check_net_connect(&capsule_id, &host_for_check, port)
+                    .await
+            })
+            .map_err(|e| format!("security denied net_connect: {e}"))?;
+        }
+
+        // 2. Pre-insert active-stream cap check.
+        let stream_count = self.active_streams.len();
+        if stream_count >= MAX_ACTIVE_STREAMS {
+            tracing::warn!(
+                max = MAX_ACTIVE_STREAMS,
+                current = stream_count,
+                "net_connect_tcp: connection cap reached, rejecting"
+            );
+            return Err(format!(
+                "connection cap reached ({stream_count}/{MAX_ACTIVE_STREAMS})"
+            ));
+        }
+
+        let rt_handle = self.runtime_handle.clone();
+        let host_semaphore = self.host_semaphore.clone();
+        let cancel_token = self.cancel_token.clone();
+
+        // 3. DNS resolve + SSRF airlock + TCP connect, all under a bounded
+        //    timeout so a stalled handshake doesn't pin the WASM guest.
+        let connect_result =
+            util::bounded_block_on_cancellable(&rt_handle, &host_semaphore, &cancel_token, async {
+                tokio::time::timeout(CONNECT_TIMEOUT, async {
+                    let addrs: Vec<std::net::SocketAddr> =
+                        tokio::net::lookup_host((host.as_str(), port))
+                            .await
+                            .map_err(|e| format!("dns: {e}"))?
+                            .collect();
+                    if addrs.is_empty() {
+                        return Err("dns: no addresses returned".to_string());
+                    }
+                    for addr in &addrs {
+                        if !is_safe_ip(addr.ip()) {
+                            return Err(format!(
+                                "net.connect-tcp denied: resolved IP {} is in a \
+                                 private/loopback/link-local range (SSRF protection)",
+                                addr.ip()
+                            ));
+                        }
+                    }
+                    tokio::net::TcpStream::connect(&addrs[..])
+                        .await
+                        .map_err(|e| format!("connect: {e}"))
+                })
+                .await
+                .map_err(|_| format!("connect timeout after {}s", CONNECT_TIMEOUT.as_secs()))
+                .and_then(|inner| inner)
+            });
+
+        let stream = match connect_result {
+            Some(Ok(s)) => s,
+            Some(Err(e)) => return Err(e),
+            None => return Err("capsule unloading".to_string()),
+        };
+
+        // 4. Defense in depth: re-check the cap before insertion.
+        if self.active_streams.len() >= MAX_ACTIVE_STREAMS {
+            drop(stream);
+            return Err(format!(
+                "connection cap reached ({}/{MAX_ACTIVE_STREAMS})",
+                self.active_streams.len()
+            ));
+        }
+
+        let handle_id = self.next_stream_id;
+        self.next_stream_id = self
+            .next_stream_id
+            .checked_add(1)
+            .ok_or_else(|| "stream handle ID space exhausted".to_string())?;
+        debug_assert!(
+            !self.active_streams.contains_key(&handle_id),
+            "stream handle ID collision"
+        );
+        self.active_streams.insert(
+            handle_id,
+            NetStream::Tcp(std::sync::Arc::new(tokio::sync::Mutex::new(stream))),
+        );
+        Ok(handle_id)
     }
 
     fn net_close_stream(&mut self, stream_handle: u64) -> Result<(), String> {

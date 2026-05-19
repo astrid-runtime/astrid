@@ -65,7 +65,7 @@ static SSRF_BYPASS: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
     false
 });
 
-fn is_safe_ip(mut ip: std::net::IpAddr) -> bool {
+pub(super) fn is_safe_ip(mut ip: std::net::IpAddr) -> bool {
     if *SSRF_BYPASS {
         return true;
     }

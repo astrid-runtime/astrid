@@ -206,6 +206,20 @@ interface types {
         payload: string,
         /// UUID of the capsule that sent this message.
         source-id: string,
+        /// Principal attributed to the publisher of this message.
+        ///
+        /// For messages published via `ipc-publish`, this is the publishing
+        /// capsule's invocation principal (whoever the host attributed the
+        /// call to). For messages published via `ipc-publish-as`, this is
+        /// the principal the uplink claimed on behalf of an external caller.
+        ///
+        /// `none` for system / kernel-originated events that have no
+        /// attributable principal, and for legacy messages that predate
+        /// this field. Subscribers processing multi-message recv batches
+        /// should read this per-message rather than relying on the
+        /// invocation context (which only reflects the first message's
+        /// publisher).
+        principal: option<string>,
     }
 
     /// Pre-registered interceptor handle mapping.
@@ -555,6 +569,29 @@ interface net {
     /// Idempotent: closing an already-closed handle is a no-op.
     /// Publishes a `client.v1.disconnect` IPC event.
     net-close-stream: func(stream-handle: u64) -> result<_, string>;
+
+    /// Open an outbound TCP connection to `host:port`.
+    ///
+    /// Returns a stream handle compatible with the existing
+    /// `net-read` / `net-write` / `net-close-stream` functions
+    /// — the same handle type returned by `net-accept`.
+    ///
+    /// Security gates (all checked before any TCP syscall):
+    /// - The capsule's `net_connect` capability allowlist must
+    ///   contain a pattern matching `host:port`. Patterns are
+    ///   `"host:port"` exact matches or `"host:*"` (any port for
+    ///   the named host). Missing or empty allowlist denies all
+    ///   outbound TCP (fail-closed).
+    /// - DNS resolution runs after the capability check. The
+    ///   resolved IP is rejected if it falls into a private,
+    ///   loopback, link-local, multicast, or unspecified range,
+    ///   matching the airlock that gates `http-request` /
+    ///   `http-stream-start`.
+    /// - The capsule's per-instance active-stream cap (default
+    ///   8, shared with `net-accept`) is enforced.
+    /// - Connect attempts time out (default 10s) rather than
+    ///   holding the WASM guest in a host fn indefinitely.
+    net-connect-tcp: func(host: string, port: u16) -> result<u64, string>;
 }
 
 /// HTTP client operations with SSRF protection.

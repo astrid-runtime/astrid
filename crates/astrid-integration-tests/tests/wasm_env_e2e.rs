@@ -85,6 +85,7 @@ async fn test_wasm_capsule_e2e_env_config_injection() {
         capabilities: CapabilitiesDef {
             net: vec![],
             net_bind: vec![],
+            net_connect: vec![],
             kv: vec!["*".into()],
             fs_read: vec![],
             fs_write: vec![],

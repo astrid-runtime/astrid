@@ -9,6 +9,17 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
 
 ## [Unreleased]
 
+### Added
+
+- **Outbound TCP for capsules — `net.connect-tcp` host fn + `net_connect` capability.** Capsules can now open persistent TCP connections via the new `astrid:capsule/net.net-connect-tcp(host, port) -> stream-handle` host fn, gated by a per-capsule `net_connect = ["host:port", "host:*"]` allowlist in `Capsule.toml`. The returned handle flows through the existing `net-read` / `net-write` / `net-close-stream` plumbing, and the kernel reuses the same `is_safe_ip` airlock that gates `http-request` to reject loopback / private / link-local / multicast IPs after DNS resolution. Connect timeout bounded to 10s; per-capsule active-stream cap (`MAX_ACTIVE_STREAMS = 8`) shared with inbound `net-accept`. Unblocks WebSocket clients, MQTT, Discord/Telegram gateways, postgres/redis, and the immediate motivator: a Unicity-network capsule wrapping Sphere SDK (Fulcrum + Nostr WebSocket transports). Tracking issue: #745. RFC: [rfcs#27](https://github.com/unicity-astrid/rfcs/pull/27). WIT contract: [wit#5](https://github.com/unicity-astrid/wit/pull/5).
+- **`NetStream` enum (Unix + Tcp)** in `engine::wasm::host_state` — replaces the bare `Arc<Mutex<UnixStream>>` value type in `active_streams`. The `net_read` / `net_write` dispatchers match on the variant; the inner framing (`read_frame` / `write_frame` generic helpers) is shared via `tokio::io::AsyncRead + AsyncWrite` trait bounds. Single-variant capsules see no behavior change.
+- **`CapsuleSecurityGate::check_net_connect(capsule_id, host, port)`** — new trait method, default-deny. `ManifestSecurityGate` implements it by matching the requested `host:port` against the manifest's `net_connect` allowlist (case-insensitive host, exact-or-`*` port).
+
+### Changed
+
+- **`crates/astrid-capsule/src/manifest.rs` split into a `manifest/` submodule.** The 1000-line single file became `manifest/mod.rs` + `manifest/capabilities.rs` + `manifest/topics.rs`. `CapabilitiesDef`, `PublishDef`, `SubscribeDef` (with their custom deserializers and TOML parsing tests) live in dedicated submodules; the top-level `manifest::*` public API is preserved via `pub use` re-exports — no consumer-side change required.
+- **`wit/astrid-capsule.wit` resynced from canonical `unicity-astrid/wit`** to pick up the new `net-connect-tcp` fn and the `ipc-message.principal` field (canonical PR #4 from May; was missing from the in-tree copy). Internal `IpcMessage → WitIpcMessage` conversion now forwards `principal`.
+
 ## [0.6.0] - 2026-05-19
 
 ### Breaking
