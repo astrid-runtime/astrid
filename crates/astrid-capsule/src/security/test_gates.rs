@@ -49,6 +49,15 @@ impl CapsuleSecurityGate for AllowAllGate {
         Ok(())
     }
 
+    async fn check_net_connect(
+        &self,
+        _capsule_id: &str,
+        _host: &str,
+        _port: u16,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+
     async fn check_uplink_register(
         &self,
         _capsule_id: &str,
@@ -115,6 +124,17 @@ impl CapsuleSecurityGate for DenyAllGate {
     async fn check_net_bind(&self, capsule_id: &str) -> Result<(), String> {
         Err(format!(
             "capsule '{capsule_id}' denied: net_bind (DenyAllGate)"
+        ))
+    }
+
+    async fn check_net_connect(
+        &self,
+        capsule_id: &str,
+        host: &str,
+        port: u16,
+    ) -> Result<(), String> {
+        Err(format!(
+            "capsule '{capsule_id}' denied: net_connect {host}:{port} (DenyAllGate)"
         ))
     }
 

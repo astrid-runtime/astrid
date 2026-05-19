@@ -206,6 +206,20 @@ interface types {
         payload: string,
         /// UUID of the capsule that sent this message.
         source-id: string,
+        /// Principal attributed to the publisher of this message.
+        ///
+        /// For messages published via `ipc-publish`, this is the publishing
+        /// capsule's invocation principal (whoever the host attributed the
+        /// call to). For messages published via `ipc-publish-as`, this is
+        /// the principal the uplink claimed on behalf of an external caller.
+        ///
+        /// `none` for system / kernel-originated events that have no
+        /// attributable principal, and for legacy messages that predate
+        /// this field. Subscribers processing multi-message recv batches
+        /// should read this per-message rather than relying on the
+        /// invocation context (which only reflects the first message's
+        /// publisher).
+        principal: option<string>,
     }
 
     /// Pre-registered interceptor handle mapping.
@@ -337,6 +351,20 @@ interface types {
     record approval-response {
         /// Whether the action was approved.
         approved: bool,
+    }
+
+    /// Direction argument for `net-shutdown` — mirrors `std::net::Shutdown`.
+    enum shutdown-how {
+        /// Half-close the read side. Subsequent reads return EOF; writes
+        /// continue.
+        read,
+        /// Half-close the write side. The peer sees EOF on its read side;
+        /// reads continue.
+        write,
+        /// Close both directions. Equivalent to `net-close-stream` except
+        /// the handle entry is retained so getters (`peer-addr`, etc.)
+        /// still work until the explicit close call.
+        both,
     }
 }
 
@@ -517,7 +545,7 @@ interface kv {
 ///
 /// Max 8 concurrent streams per capsule.
 interface net {
-    use types.{net-read-status};
+    use types.{net-read-status, shutdown-how};
 
     /// Bind and activate the pre-provisioned Unix socket listener.
     ///
@@ -555,6 +583,122 @@ interface net {
     /// Idempotent: closing an already-closed handle is a no-op.
     /// Publishes a `client.v1.disconnect` IPC event.
     net-close-stream: func(stream-handle: u64) -> result<_, string>;
+
+    /// Open an outbound TCP connection to `host:port`.
+    ///
+    /// Returns a stream handle compatible with the existing
+    /// `net-read` / `net-write` / `net-close-stream` functions
+    /// — the same handle type returned by `net-accept`.
+    ///
+    /// Security gates (all checked before any TCP syscall):
+    /// - The capsule's `net_connect` capability allowlist must
+    ///   contain a pattern matching `host:port`. Patterns are
+    ///   `"host:port"` exact matches or `"host:*"` (any port for
+    ///   the named host). Missing or empty allowlist denies all
+    ///   outbound TCP (fail-closed).
+    /// - DNS resolution runs after the capability check. The
+    ///   resolved IP is rejected if it falls into a private,
+    ///   loopback, link-local, multicast, or unspecified range,
+    ///   matching the airlock that gates `http-request` /
+    ///   `http-stream-start`.
+    /// - The capsule's per-instance active-stream cap (default
+    ///   8, shared with `net-accept`) is enforced.
+    /// - Connect attempts time out (default 10s) rather than
+    ///   holding the WASM guest in a host fn indefinitely.
+    net-connect-tcp: func(host: string, port: u16) -> result<u64, string>;
+
+    /// Read up to `max-bytes` from `stream` without length-prefix framing.
+    ///
+    /// Mirrors `std::net::TcpStream::read` (and `<TcpStream as Read>::read`).
+    /// Returns the bytes that were available — may be shorter than
+    /// `max-bytes`. Empty list means no data is ready under the current
+    /// read timeout (default: non-blocking, ~50 ms internal poll).
+    ///
+    /// Use this for byte-stream protocols (WebSocket, MQTT, postgres,
+    /// HTTP/1.1, TLS, …). The existing `net-read` keeps the length-prefix
+    /// framing required by the uplink-proxy use case.
+    net-read-bytes: func(stream-handle: u64, max-bytes: u32) -> result<list<u8>, string>;
+
+    /// Write `data` to `stream` without length-prefix framing.
+    ///
+    /// Mirrors `<TcpStream as Write>::write`. Returns the number of
+    /// bytes actually written — may be less than `data.len()` when the
+    /// kernel-side socket buffer is full. Callers loop until `data` is
+    /// drained (the SDK `write_all` wrapper handles this).
+    net-write-bytes: func(stream-handle: u64, data: list<u8>) -> result<u32, string>;
+
+    /// Read up to `max-bytes` from `stream` without consuming them.
+    ///
+    /// Mirrors `std::net::TcpStream::peek`. Subsequent `net-read-bytes`
+    /// returns the same bytes again. Useful for protocol detection on
+    /// the first frame of a connection.
+    net-peek: func(stream-handle: u64, max-bytes: u32) -> result<list<u8>, string>;
+
+    /// Shut down the read side, write side, or both halves of `stream`.
+    ///
+    /// Mirrors `std::net::TcpStream::shutdown`. After `shutdown-how::write`
+    /// the peer sees EOF on its read side; further sends on the local
+    /// side return an error. `shutdown-how::both` closes both directions
+    /// but leaves the handle entry intact so accessors (e.g.
+    /// `peer-addr`) still work until `net-close-stream` is called.
+    net-shutdown: func(stream-handle: u64, how: shutdown-how) -> result<_, string>;
+
+    /// Return the remote peer address as `"ip:port"`.
+    ///
+    /// Mirrors `std::net::TcpStream::peer_addr`. Returns an error for
+    /// Unix-domain stream handles.
+    net-peer-addr: func(stream-handle: u64) -> result<string, string>;
+
+    /// Return the local socket address as `"ip:port"`.
+    ///
+    /// Mirrors `std::net::TcpStream::local_addr`. Returns an error for
+    /// Unix-domain stream handles.
+    net-local-addr: func(stream-handle: u64) -> result<string, string>;
+
+    /// Enable or disable the `TCP_NODELAY` option (Nagle's algorithm off
+    /// when `true`).
+    ///
+    /// Mirrors `std::net::TcpStream::set_nodelay`. Returns an error for
+    /// Unix-domain stream handles.
+    net-set-nodelay: func(stream-handle: u64, nodelay: bool) -> result<_, string>;
+
+    /// Return the current `TCP_NODELAY` setting.
+    ///
+    /// Mirrors `std::net::TcpStream::nodelay`.
+    net-nodelay: func(stream-handle: u64) -> result<bool, string>;
+
+    /// Set the read timeout. `none` clears the timeout (reads still
+    /// honour the host's internal cancellation token; this controls
+    /// only the user-visible blocking duration of each `net-read-bytes`
+    /// call).
+    ///
+    /// Mirrors `std::net::TcpStream::set_read_timeout`. Subsequent
+    /// `net-read-bytes` and `net-peek` calls honour the new value.
+    net-set-read-timeout: func(stream-handle: u64, timeout-ms: option<u64>) -> result<_, string>;
+
+    /// Return the current read timeout in milliseconds, or `none` if
+    /// unset.
+    net-read-timeout: func(stream-handle: u64) -> result<option<u64>, string>;
+
+    /// Set the write timeout. `none` clears it.
+    ///
+    /// Mirrors `std::net::TcpStream::set_write_timeout`.
+    net-set-write-timeout: func(stream-handle: u64, timeout-ms: option<u64>) -> result<_, string>;
+
+    /// Return the current write timeout in milliseconds, or `none` if
+    /// unset.
+    net-write-timeout: func(stream-handle: u64) -> result<option<u64>, string>;
+
+    /// Set the IP `TTL` field on outgoing packets.
+    ///
+    /// Mirrors `std::net::TcpStream::set_ttl`. Returns an error for
+    /// Unix-domain stream handles.
+    net-set-ttl: func(stream-handle: u64, ttl: u32) -> result<_, string>;
+
+    /// Return the current IP TTL.
+    ///
+    /// Mirrors `std::net::TcpStream::ttl`.
+    net-ttl: func(stream-handle: u64) -> result<u32, string>;
 }
 
 /// HTTP client operations with SSRF protection.

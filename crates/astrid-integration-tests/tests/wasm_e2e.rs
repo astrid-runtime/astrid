@@ -61,6 +61,7 @@ async fn setup_test_capsule(
         capabilities: CapabilitiesDef {
             net: net_caps,
             net_bind: vec![],
+            net_connect: vec![],
             kv: vec!["*".into()],
             fs_read: fs_read_caps,
             fs_write: fs_write_caps,
@@ -165,6 +166,7 @@ async fn setup_test_capsule_with_home(
         capabilities: CapabilitiesDef {
             net: vec![],
             net_bind: vec![],
+            net_connect: vec![],
             kv: vec!["*".into()],
             fs_read: fs_read_caps,
             fs_write: fs_write_caps,

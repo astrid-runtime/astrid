@@ -15,6 +15,45 @@ use astrid_core::uplink::{InboundMessage, MAX_UPLINKS_PER_CAPSULE, UplinkDescrip
 use astrid_storage::ScopedKvStore;
 use astrid_storage::secret::SecretStore;
 
+/// An active network stream owned by a capsule.
+///
+/// Holds either an inbound Unix-socket connection (accepted from the
+/// capsule's pre-provisioned listener) or an outbound TCP connection
+/// (opened via `net.connect-tcp`). The read/write/close host fns
+/// dispatch on the variant; both variants implement
+/// [`tokio::io::AsyncRead`] / [`tokio::io::AsyncWrite`], so the inner
+/// framing logic is shared.
+#[derive(Debug, Clone)]
+pub enum NetStream {
+    /// Inbound Unix-domain socket accepted from the kernel's listener.
+    Unix(Arc<tokio::sync::Mutex<tokio::net::UnixStream>>),
+    /// Outbound TCP connection opened via `net.connect-tcp`.
+    Tcp(TcpStreamSlot),
+}
+
+/// Per-stream state for an outbound TCP connection.
+///
+/// Holds the raw [`tokio::net::TcpStream`] (behind an `Arc<Mutex<…>>` so
+/// host fns that all take `&mut HostState` can each lock it cooperatively)
+/// plus the std-style configurable socket options that the WIT surface
+/// exposes — read/write timeouts. `TCP_NODELAY` and `TTL` are not cached
+/// here; they live on the underlying socket and are read back via
+/// `TcpStream::nodelay()` / `ttl()` on demand.
+#[derive(Debug, Clone)]
+pub struct TcpStreamSlot {
+    /// The connected TCP socket. Shared via `Arc<Mutex<…>>` so the
+    /// existing `net-read` / `net-write` dispatchers can clone the
+    /// outer `NetStream` and then lock the inner stream.
+    pub stream: Arc<tokio::sync::Mutex<tokio::net::TcpStream>>,
+    /// Read timeout applied to each `net-read-bytes` / `net-peek` call.
+    /// `None` → use the host default (~50 ms poll for `Pending` parity
+    /// with `net-read`).
+    pub read_timeout: Option<std::time::Duration>,
+    /// Write timeout applied to each `net-write-bytes` call.
+    /// `None` → no extra timeout beyond the host cancellation token.
+    pub write_timeout: Option<std::time::Duration>,
+}
+
 /// The lifecycle phase a capsule is currently executing in.
 ///
 /// Set on [`HostState`] during `#[install]` or `#[upgrade]` dispatch.
@@ -214,9 +253,8 @@ pub struct HostState {
     pub registered_uplinks: Vec<UplinkDescriptor>,
     /// Optional natively bound unix listener.
     pub cli_socket_listener: Option<Arc<tokio::sync::Mutex<tokio::net::UnixListener>>>,
-    /// Active, mapped UnixStreams from the socket listener.
-    pub active_streams:
-        std::collections::HashMap<u64, Arc<tokio::sync::Mutex<tokio::net::UnixStream>>>,
+    /// Active network streams owned by this capsule (Unix accept + outbound TCP).
+    pub active_streams: std::collections::HashMap<u64, NetStream>,
     /// Monotonic counter for stream handle IDs (avoids reuse after removal).
     /// Starts at 1 so that handle ID 0 is never issued — 0 is reserved as a
     /// sentinel / "no handle" value in the WASM ABI.

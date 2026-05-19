@@ -120,6 +120,25 @@ pub trait CapsuleSecurityGate: Send + Sync {
         ))
     }
 
+    /// Check whether the capsule is allowed to open an outbound TCP connection.
+    ///
+    /// Default implementation denies. Override to permit capsules that
+    /// declare `net_connect` capabilities matching `host:port`.
+    ///
+    /// The check is on the literal `host:port` the capsule passed to
+    /// `net.connect-tcp`; DNS resolution and the SSRF airlock run
+    /// kernel-side *after* this gate returns `Ok`.
+    async fn check_net_connect(
+        &self,
+        capsule_id: &str,
+        _host: &str,
+        _port: u16,
+    ) -> Result<(), String> {
+        Err(format!(
+            "capsule '{capsule_id}' denied: net_connect not permitted (default)"
+        ))
+    }
+
     /// Check whether the capsule is allowed to register a uplink.
     ///
     /// Default implementation permits all registrations. Override to enforce

@@ -265,6 +265,30 @@ impl CapsuleSecurityGate for ManifestSecurityGate {
         }
     }
 
+    async fn check_net_connect(
+        &self,
+        capsule_id: &str,
+        host: &str,
+        port: u16,
+    ) -> Result<(), String> {
+        // Each allowlist entry is "host:port" or "host:*". Match against the
+        // literal host the capsule named; DNS resolution and SSRF check run
+        // after this gate.
+        let allowed = self
+            .manifest
+            .capabilities
+            .net_connect
+            .iter()
+            .any(|entry| net_connect_pattern_matches(entry, host, port));
+        if allowed {
+            Ok(())
+        } else {
+            Err(format!(
+                "capsule '{capsule_id}' denied: \"{host}:{port}\" not in net_connect allowlist"
+            ))
+        }
+    }
+
     async fn check_identity(
         &self,
         capsule_id: &str,
@@ -280,6 +304,29 @@ impl CapsuleSecurityGate for ManifestSecurityGate {
                 self.manifest.capabilities.identity
             ))
         }
+    }
+}
+
+/// Match a `net_connect` allowlist entry against a literal `host:port`.
+///
+/// Patterns:
+///   - `"host:port"` — exact match.
+///   - `"host:*"` — any port for the named host.
+///
+/// Hostnames are compared case-insensitively (DNS names are case-insensitive
+/// per RFC 1035). The pattern host segment is taken literally — DNS-style
+/// wildcards (`*.example.com`) are intentionally NOT supported in this version
+/// (see RFC: rfcs#27 Unresolved questions).
+fn net_connect_pattern_matches(pattern: &str, host: &str, port: u16) -> bool {
+    let Some((pat_host, pat_port)) = pattern.rsplit_once(':') else {
+        return false;
+    };
+    if !pat_host.eq_ignore_ascii_case(host) {
+        return false;
+    }
+    match pat_port {
+        "*" => true,
+        p => p.parse::<u16>().is_ok_and(|n| n == port),
     }
 }
 
@@ -317,6 +364,7 @@ mod tests {
             capabilities: CapabilitiesDef {
                 net: net.into_iter().map(String::from).collect(),
                 net_bind: vec![],
+                net_connect: vec![],
                 kv: vec![],
                 fs_read: fs_read.into_iter().map(String::from).collect(),
                 fs_write: fs_write.into_iter().map(String::from).collect(),
@@ -786,5 +834,103 @@ mod tests {
                 .await
                 .is_ok()
         );
+    }
+
+    #[test]
+    fn net_connect_exact_match() {
+        assert!(net_connect_pattern_matches(
+            "example.com:443",
+            "example.com",
+            443
+        ));
+    }
+
+    #[test]
+    fn net_connect_port_mismatch_is_denied() {
+        assert!(!net_connect_pattern_matches(
+            "example.com:443",
+            "example.com",
+            80
+        ));
+    }
+
+    #[test]
+    fn net_connect_host_mismatch_is_denied() {
+        assert!(!net_connect_pattern_matches(
+            "example.com:443",
+            "evil.com",
+            443
+        ));
+    }
+
+    #[test]
+    fn net_connect_port_wildcard_matches_any_port() {
+        assert!(net_connect_pattern_matches(
+            "example.com:*",
+            "example.com",
+            1
+        ));
+        assert!(net_connect_pattern_matches(
+            "example.com:*",
+            "example.com",
+            65535
+        ));
+    }
+
+    #[test]
+    fn net_connect_host_is_case_insensitive() {
+        assert!(net_connect_pattern_matches(
+            "Example.COM:443",
+            "example.com",
+            443
+        ));
+    }
+
+    #[test]
+    fn net_connect_missing_colon_is_denied() {
+        assert!(!net_connect_pattern_matches(
+            "example.com",
+            "example.com",
+            80
+        ));
+    }
+
+    #[test]
+    fn net_connect_invalid_port_is_denied() {
+        assert!(!net_connect_pattern_matches(
+            "example.com:abc",
+            "example.com",
+            80
+        ));
+    }
+
+    #[tokio::test]
+    async fn check_net_connect_default_denies_with_empty_allowlist() {
+        let mut manifest = make_manifest(vec![], vec![], vec![]);
+        manifest.capabilities.net_connect = vec![];
+        let gate = ManifestSecurityGate::new(manifest, workspace_root(), None);
+        let err = gate
+            .check_net_connect("c", "example.com", 443)
+            .await
+            .unwrap_err();
+        assert!(err.contains("not in net_connect allowlist"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn check_net_connect_matches_allowlist_entry() {
+        let mut manifest = make_manifest(vec![], vec![], vec![]);
+        manifest.capabilities.net_connect = vec!["example.com:443".to_string()];
+        let gate = ManifestSecurityGate::new(manifest, workspace_root(), None);
+        assert!(
+            gate.check_net_connect("c", "example.com", 443)
+                .await
+                .is_ok()
+        );
+        assert!(
+            gate.check_net_connect("c", "example.com", 80)
+                .await
+                .is_err()
+        );
+        assert!(gate.check_net_connect("c", "evil.com", 443).await.is_err());
     }
 }

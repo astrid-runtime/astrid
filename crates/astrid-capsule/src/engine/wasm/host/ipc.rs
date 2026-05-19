@@ -101,6 +101,7 @@ fn to_wit_ipc_message(msg: &IpcMessage) -> WitIpcMessage {
         topic: msg.topic.clone(),
         payload,
         source_id: msg.source_id.to_string(),
+        principal: msg.principal.clone(),
     }
 }
 

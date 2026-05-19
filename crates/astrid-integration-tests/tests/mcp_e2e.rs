@@ -36,6 +36,7 @@ async fn test_mcp_host_engine_capability_validation() {
         capabilities: CapabilitiesDef {
             net: vec![],
             net_bind: vec![],
+            net_connect: vec![],
             kv: vec![],
             fs_read: vec![],
             fs_write: vec![],
