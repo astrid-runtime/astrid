@@ -28,7 +28,30 @@ pub enum NetStream {
     /// Inbound Unix-domain socket accepted from the kernel's listener.
     Unix(Arc<tokio::sync::Mutex<tokio::net::UnixStream>>),
     /// Outbound TCP connection opened via `net.connect-tcp`.
-    Tcp(Arc<tokio::sync::Mutex<tokio::net::TcpStream>>),
+    Tcp(TcpStreamSlot),
+}
+
+/// Per-stream state for an outbound TCP connection.
+///
+/// Holds the raw [`tokio::net::TcpStream`] (behind an `Arc<Mutex<…>>` so
+/// host fns that all take `&mut HostState` can each lock it cooperatively)
+/// plus the std-style configurable socket options that the WIT surface
+/// exposes — read/write timeouts. `TCP_NODELAY` and `TTL` are not cached
+/// here; they live on the underlying socket and are read back via
+/// `TcpStream::nodelay()` / `ttl()` on demand.
+#[derive(Debug, Clone)]
+pub struct TcpStreamSlot {
+    /// The connected TCP socket. Shared via `Arc<Mutex<…>>` so the
+    /// existing `net-read` / `net-write` dispatchers can clone the
+    /// outer `NetStream` and then lock the inner stream.
+    pub stream: Arc<tokio::sync::Mutex<tokio::net::TcpStream>>,
+    /// Read timeout applied to each `net-read-bytes` / `net-peek` call.
+    /// `None` → use the host default (~50 ms poll for `Pending` parity
+    /// with `net-read`).
+    pub read_timeout: Option<std::time::Duration>,
+    /// Write timeout applied to each `net-write-bytes` call.
+    /// `None` → no extra timeout beyond the host cancellation token.
+    pub write_timeout: Option<std::time::Duration>,
 }
 
 /// The lifecycle phase a capsule is currently executing in.

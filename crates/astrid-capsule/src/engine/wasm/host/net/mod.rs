@@ -1,249 +1,20 @@
-use astrid_core::session_token::{
-    HandshakeRequest, HandshakeResponse, PROTOCOL_VERSION, SessionToken,
-};
-
 use crate::engine::wasm::bindings::astrid::capsule::net;
-use crate::engine::wasm::bindings::astrid::capsule::types::NetReadStatus;
+use crate::engine::wasm::bindings::astrid::capsule::types::{NetReadStatus, ShutdownHow};
 use crate::engine::wasm::host::http::is_safe_ip;
 use crate::engine::wasm::host::util;
-use crate::engine::wasm::host_state::{HostState, NetStream};
+use crate::engine::wasm::host_state::{HostState, NetStream, TcpStreamSlot};
 
-/// Bounded timeout on a `net-connect-tcp` outbound handshake.
-///
-/// DNS resolve + TCP `connect` together must complete within this window,
-/// otherwise the host fn returns an error rather than holding the WASM
-/// guest in a host call indefinitely.
-const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+mod handshake;
+mod stream;
+
+use handshake::{validate_handshake, verify_peer_credentials};
+use stream::{
+    CONNECT_TIMEOUT, read_bytes_inner, read_frame, with_tcp_slot, write_bytes_inner, write_frame,
+};
 
 /// Maximum concurrent socket connections per capsule.
 /// Prevents resource exhaustion from malicious or runaway clients.
 const MAX_ACTIVE_STREAMS: usize = 8;
-
-/// Returns true for IO errors that represent a normal peer disconnect.
-/// These should NOT trap the WASM guest — the run loop handles dead streams.
-fn is_peer_disconnect(e: &std::io::Error) -> bool {
-    matches!(
-        e.kind(),
-        std::io::ErrorKind::BrokenPipe
-            | std::io::ErrorKind::ConnectionReset
-            | std::io::ErrorKind::ConnectionAborted
-            | std::io::ErrorKind::UnexpectedEof
-    )
-}
-
-/// Read one length-prefixed frame from `stream`. Shared by UnixStream and
-/// TcpStream paths — both implement [`tokio::io::AsyncRead`].
-async fn read_frame<S>(stream: &mut S) -> Result<NetReadStatus, String>
-where
-    S: tokio::io::AsyncRead + Unpin,
-{
-    use tokio::io::AsyncReadExt;
-
-    let mut len_buf = [0u8; 4];
-    match tokio::time::timeout(
-        std::time::Duration::from_millis(50),
-        stream.read_exact(&mut len_buf),
-    )
-    .await
-    {
-        Err(_) => return Ok(NetReadStatus::Pending),
-        Ok(Err(e)) if is_peer_disconnect(&e) => return Ok(NetReadStatus::Closed),
-        Ok(Err(e)) => return Err(format!("socket read error: {e}")),
-        Ok(Ok(_)) => {},
-    }
-
-    let len = u32::from_be_bytes(len_buf) as usize;
-    if len > 10 * 1024 * 1024 {
-        return Err("Payload too large (max 10MB)".to_string());
-    }
-
-    let mut payload = vec![0u8; len];
-    let timeout_ms = 5000 + (len as u64 / 1024);
-    match tokio::time::timeout(
-        std::time::Duration::from_millis(timeout_ms),
-        stream.read_exact(&mut payload),
-    )
-    .await
-    {
-        Err(_) => return Err("Payload read timed out".to_string()),
-        Ok(Err(e)) if is_peer_disconnect(&e) => return Ok(NetReadStatus::Closed),
-        Ok(Err(e)) => return Err(format!("socket payload read error: {e}")),
-        Ok(Ok(_)) => {},
-    }
-
-    Ok(NetReadStatus::Data(payload))
-}
-
-/// Write one length-prefixed frame to `stream`. Shared across UnixStream
-/// and TcpStream — both implement [`tokio::io::AsyncWrite`].
-async fn write_frame<S>(stream: &mut S, data: &[u8]) -> std::io::Result<()>
-where
-    S: tokio::io::AsyncWrite + Unpin,
-{
-    use tokio::io::AsyncWriteExt;
-    let len = u32::try_from(data.len())
-        .map_err(|_| std::io::Error::other("write payload too large for length prefix"))?;
-    stream.write_all(&len.to_be_bytes()).await?;
-    stream.write_all(data).await?;
-    stream.flush().await?;
-    Ok(())
-}
-
-// ---------------------------------------------------------------------------
-// Handshake helpers
-// ---------------------------------------------------------------------------
-
-/// Timeout for individual handshake read/write operations (server-side).
-const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
-
-/// Maximum allowed size of a handshake request payload (bytes).
-const MAX_HANDSHAKE_SIZE: usize = 4096;
-
-/// Validate the client handshake: read the `HandshakeRequest`, verify the token
-/// and protocol version, then send back a `HandshakeResponse`.
-///
-/// Returns `Ok(())` on success or `Err(reason)` with a human-readable rejection
-/// reason.
-async fn validate_handshake(
-    stream: &mut tokio::net::UnixStream,
-    expected_token: &SessionToken,
-) -> Result<(), String> {
-    use tokio::io::AsyncReadExt;
-
-    // 1. Read the handshake request (length-prefixed JSON, same wire format).
-    let mut len_buf = [0u8; 4];
-    tokio::time::timeout(HANDSHAKE_TIMEOUT, stream.read_exact(&mut len_buf))
-        .await
-        .map_err(|_| "handshake timed out (5s)".to_string())?
-        .map_err(|e| format!("handshake read error: {e}"))?;
-
-    let len = u32::from_be_bytes(len_buf) as usize;
-    if len > MAX_HANDSHAKE_SIZE {
-        return Err(format!("handshake too large: {len} bytes"));
-    }
-
-    let mut payload = vec![0u8; len];
-    tokio::time::timeout(HANDSHAKE_TIMEOUT, stream.read_exact(&mut payload))
-        .await
-        .map_err(|_| "handshake payload timed out".to_string())?
-        .map_err(|e| format!("handshake payload read error: {e}"))?;
-
-    let request: HandshakeRequest =
-        serde_json::from_slice(&payload).map_err(|e| format!("invalid handshake JSON: {e}"))?;
-
-    // 2. Validate protocol version FIRST - this check reveals no information
-    // about token validity. Checking version before token prevents an oracle
-    // where a "protocol mismatch" response confirms the token was correct.
-    if request.protocol_version != PROTOCOL_VERSION {
-        let reason = format!(
-            "Protocol version mismatch (client={}, server={}). \
-             Restart the daemon with `astrid daemon restart`.",
-            request.protocol_version, PROTOCOL_VERSION,
-        );
-        if let Err(e) =
-            send_handshake_response_timed(stream, &HandshakeResponse::error(&reason)).await
-        {
-            tracing::warn!(error = %e, "Failed to send handshake error response for protocol mismatch");
-        }
-        return Err(reason);
-    }
-
-    // 3. Validate token (constant-time comparison).
-    // Send a uniform error response on both malformed-hex and wrong-token
-    // paths to prevent an oracle that distinguishes the two failure modes.
-    let client_token = match SessionToken::from_hex(&request.token) {
-        Ok(t) => t,
-        Err(_) => {
-            if let Err(e) = send_handshake_response_timed(
-                stream,
-                &HandshakeResponse::error("authentication failed"),
-            )
-            .await
-            {
-                tracing::warn!(error = %e, "Failed to send handshake error response");
-            }
-            return Err("invalid session token".to_string());
-        },
-    };
-
-    if !expected_token.ct_eq(&client_token) {
-        if let Err(e) = send_handshake_response_timed(
-            stream,
-            &HandshakeResponse::error("authentication failed"),
-        )
-        .await
-        {
-            tracing::warn!(error = %e, "Failed to send handshake error response");
-        }
-        return Err("invalid session token".to_string());
-    }
-
-    // 4. All checks passed - send success response.
-    send_handshake_response_timed(stream, &HandshakeResponse::ok())
-        .await
-        .map_err(|e| format!("failed to send handshake response: {e}"))?;
-
-    // Truncate client_version to prevent log injection from oversized values.
-    // Use chars().take() to avoid panicking on multi-byte UTF-8 boundaries.
-    let safe_version: String = request.client_version.chars().take(64).collect();
-    tracing::info!(
-        client_version = %safe_version,
-        "Socket handshake succeeded"
-    );
-    Ok(())
-}
-
-/// Send a length-prefixed JSON handshake response with a 5s write timeout.
-///
-/// Wraps [`send_handshake_response`] with a timeout to prevent a stalled
-/// client from holding the accept loop hostage during the response write.
-async fn send_handshake_response_timed(
-    stream: &mut tokio::net::UnixStream,
-    response: &HandshakeResponse,
-) -> Result<(), std::io::Error> {
-    tokio::time::timeout(HANDSHAKE_TIMEOUT, send_handshake_response(stream, response))
-        .await
-        .map_err(|_| std::io::Error::other("handshake response write timed out (5s)"))?
-}
-
-/// Send a length-prefixed JSON handshake response.
-async fn send_handshake_response(
-    stream: &mut tokio::net::UnixStream,
-    response: &HandshakeResponse,
-) -> Result<(), std::io::Error> {
-    use tokio::io::AsyncWriteExt;
-
-    let bytes = serde_json::to_vec(response)
-        .map_err(|e| std::io::Error::other(format!("serialize handshake response: {e}")))?;
-    let len = u32::try_from(bytes.len())
-        .map_err(|_| std::io::Error::other("handshake response too large"))?;
-
-    stream.write_all(&len.to_be_bytes()).await?;
-    stream.write_all(&bytes).await?;
-    stream.flush().await?;
-    Ok(())
-}
-
-/// Verify that the connecting process runs as the same UID as the daemon.
-/// Returns `Err(reason)` if the UID does not match or credentials cannot
-/// be retrieved.
-#[cfg(unix)]
-fn verify_peer_credentials(stream: &tokio::net::UnixStream) -> Result<(), String> {
-    match stream.peer_cred() {
-        Ok(cred) => {
-            let peer_uid = cred.uid();
-            let my_uid = nix::unistd::geteuid().as_raw();
-            if peer_uid != my_uid {
-                Err(format!(
-                    "peer UID {peer_uid} does not match daemon UID {my_uid}"
-                ))
-            } else {
-                Ok(())
-            }
-        },
-        Err(e) => Err(format!("failed to check peer credentials: {e}")),
-    }
-}
 
 impl net::Host for HostState {
     /// Gate `net_bind` capability once at bind time (session-scoped).
@@ -522,8 +293,8 @@ impl net::Host for HostState {
                         let mut s = arc.lock().await;
                         read_frame(&mut *s).await
                     },
-                    NetStream::Tcp(arc) => {
-                        let mut s = arc.lock().await;
+                    NetStream::Tcp(slot) => {
+                        let mut s = slot.stream.lock().await;
                         read_frame(&mut *s).await
                     },
                 }
@@ -558,8 +329,8 @@ impl net::Host for HostState {
                         let mut s = arc.lock().await;
                         write_frame(&mut *s, &data).await
                     },
-                    NetStream::Tcp(arc) => {
-                        let mut s = arc.lock().await;
+                    NetStream::Tcp(slot) => {
+                        let mut s = slot.stream.lock().await;
                         write_frame(&mut *s, &data).await
                     },
                 }
@@ -667,7 +438,11 @@ impl net::Host for HostState {
         );
         self.active_streams.insert(
             handle_id,
-            NetStream::Tcp(std::sync::Arc::new(tokio::sync::Mutex::new(stream))),
+            NetStream::Tcp(TcpStreamSlot {
+                stream: std::sync::Arc::new(tokio::sync::Mutex::new(stream)),
+                read_timeout: None,
+                write_timeout: None,
+            }),
         );
         Ok(handle_id)
     }
@@ -684,6 +459,250 @@ impl net::Host for HostState {
         // bound principal before calling `close()` — see issue #22.
         let _ = self.active_streams.remove(&stream_handle);
         Ok(())
+    }
+
+    fn net_read_bytes(&mut self, stream_handle: u64, max_bytes: u32) -> Result<Vec<u8>, String> {
+        let stream = self
+            .active_streams
+            .get(&stream_handle)
+            .cloned()
+            .ok_or_else(|| "Stream handle not found".to_string())?;
+        let rt = self.runtime_handle.clone();
+        let sem = self.host_semaphore.clone();
+        let tok = self.cancel_token.clone();
+        let max = max_bytes as usize;
+        let result = util::bounded_block_on_cancellable(&rt, &sem, &tok, async {
+            match stream {
+                NetStream::Unix(arc) => {
+                    let mut s = arc.lock().await;
+                    read_bytes_inner(&mut *s, max, None).await
+                },
+                NetStream::Tcp(slot) => {
+                    let timeout = slot.read_timeout;
+                    let mut s = slot.stream.lock().await;
+                    read_bytes_inner(&mut *s, max, timeout).await
+                },
+            }
+        });
+        result.unwrap_or_else(|| Ok(Vec::new()))
+    }
+
+    fn net_write_bytes(&mut self, stream_handle: u64, data: Vec<u8>) -> Result<u32, String> {
+        let stream = self
+            .active_streams
+            .get(&stream_handle)
+            .cloned()
+            .ok_or_else(|| "Stream handle not found".to_string())?;
+        let rt = self.runtime_handle.clone();
+        let sem = self.host_semaphore.clone();
+        let tok = self.cancel_token.clone();
+        let result = util::bounded_block_on_cancellable(&rt, &sem, &tok, async {
+            match stream {
+                NetStream::Unix(arc) => {
+                    let mut s = arc.lock().await;
+                    write_bytes_inner(&mut *s, &data, None).await
+                },
+                NetStream::Tcp(slot) => {
+                    let timeout = slot.write_timeout;
+                    let mut s = slot.stream.lock().await;
+                    write_bytes_inner(&mut *s, &data, timeout).await
+                },
+            }
+        });
+        match result {
+            Some(r) => r,
+            None => Err("capsule unloading".to_string()),
+        }
+    }
+
+    fn net_peek(&mut self, stream_handle: u64, max_bytes: u32) -> Result<Vec<u8>, String> {
+        // tokio's TcpStream has `peek` natively; UnixStream does not. The
+        // Unix case is rare for outbound work — return an error rather
+        // than emulate via a buffered wrapper that other host fns would
+        // also have to learn about.
+        let stream = self
+            .active_streams
+            .get(&stream_handle)
+            .cloned()
+            .ok_or_else(|| "Stream handle not found".to_string())?;
+        let rt = self.runtime_handle.clone();
+        let sem = self.host_semaphore.clone();
+        let tok = self.cancel_token.clone();
+        let max = max_bytes as usize;
+        match stream {
+            NetStream::Tcp(slot) => {
+                let timeout = slot.read_timeout;
+                let result = util::bounded_block_on_cancellable(&rt, &sem, &tok, async move {
+                    let s = slot.stream.lock().await;
+                    let mut buf = vec![0u8; max];
+                    let fut = s.peek(&mut buf);
+                    let n = match timeout {
+                        Some(d) => match tokio::time::timeout(d, fut).await {
+                            Ok(Ok(n)) => n,
+                            Ok(Err(e)) => return Err(format!("peek error: {e}")),
+                            Err(_) => return Err("peek would block".to_string()),
+                        },
+                        None => fut.await.map_err(|e| format!("peek error: {e}"))?,
+                    };
+                    buf.truncate(n);
+                    Ok(buf)
+                });
+                result.unwrap_or_else(|| Ok(Vec::new()))
+            },
+            NetStream::Unix(_) => Err("peek not supported on Unix streams".to_string()),
+        }
+    }
+
+    fn net_shutdown(&mut self, stream_handle: u64, how: ShutdownHow) -> Result<(), String> {
+        let stream = self
+            .active_streams
+            .get(&stream_handle)
+            .cloned()
+            .ok_or_else(|| "Stream handle not found".to_string())?;
+        let rt = self.runtime_handle.clone();
+        let sem = self.host_semaphore.clone();
+        let tok = self.cancel_token.clone();
+        let std_how = match how {
+            ShutdownHow::Read => std::net::Shutdown::Read,
+            ShutdownHow::Write => std::net::Shutdown::Write,
+            ShutdownHow::Both => std::net::Shutdown::Both,
+        };
+        let result = util::bounded_block_on_cancellable(&rt, &sem, &tok, async move {
+            match stream {
+                NetStream::Tcp(slot) => {
+                    use tokio::io::AsyncWriteExt;
+                    let mut s = slot.stream.lock().await;
+                    match how {
+                        // Tokio TcpStream only exposes shutdown for the write
+                        // side via the AsyncWrite trait. For Read / Both we
+                        // need the inner std-level shutdown via std_into.
+                        ShutdownHow::Write => s
+                            .shutdown()
+                            .await
+                            .map_err(|e| format!("shutdown(write): {e}")),
+                        _ => {
+                            let std = s.as_ref();
+                            // No-op for unsupported direction on the read
+                            // side of tokio's TcpStream — std::Shutdown::Read
+                            // / Both delegate to the underlying socket via
+                            // socket2 in a future iteration. For now we
+                            // accept the documented limitation: only
+                            // `shutdown-how::write` is fully supported.
+                            let _ = std;
+                            let _ = std_how;
+                            Err(format!(
+                                "shutdown({:?}): only `write` half-close is supported in this version",
+                                how
+                            ))
+                        },
+                    }
+                },
+                NetStream::Unix(_) => Err("shutdown not supported on Unix streams".to_string()),
+            }
+        });
+        match result {
+            Some(r) => r,
+            None => Err("capsule unloading".to_string()),
+        }
+    }
+
+    fn net_peer_addr(&mut self, stream_handle: u64) -> Result<String, String> {
+        with_tcp_slot(self, stream_handle, |slot| {
+            slot.peer_addr()
+                .map(|a| a.to_string())
+                .map_err(|e| format!("peer_addr: {e}"))
+        })
+    }
+
+    fn net_local_addr(&mut self, stream_handle: u64) -> Result<String, String> {
+        with_tcp_slot(self, stream_handle, |slot| {
+            slot.local_addr()
+                .map(|a| a.to_string())
+                .map_err(|e| format!("local_addr: {e}"))
+        })
+    }
+
+    fn net_set_nodelay(&mut self, stream_handle: u64, nodelay: bool) -> Result<(), String> {
+        with_tcp_slot(self, stream_handle, |slot| {
+            slot.set_nodelay(nodelay)
+                .map_err(|e| format!("set_nodelay: {e}"))
+        })
+    }
+
+    fn net_nodelay(&mut self, stream_handle: u64) -> Result<bool, String> {
+        with_tcp_slot(self, stream_handle, |slot| {
+            slot.nodelay().map_err(|e| format!("nodelay: {e}"))
+        })
+    }
+
+    fn net_set_read_timeout(
+        &mut self,
+        stream_handle: u64,
+        timeout_ms: Option<u64>,
+    ) -> Result<(), String> {
+        match self.active_streams.get_mut(&stream_handle) {
+            Some(NetStream::Tcp(slot)) => {
+                slot.read_timeout = timeout_ms.map(std::time::Duration::from_millis);
+                Ok(())
+            },
+            Some(NetStream::Unix(_)) => {
+                Err("set_read_timeout not supported on Unix streams".to_string())
+            },
+            None => Err("Stream handle not found".to_string()),
+        }
+    }
+
+    fn net_read_timeout(&mut self, stream_handle: u64) -> Result<Option<u64>, String> {
+        match self.active_streams.get(&stream_handle) {
+            Some(NetStream::Tcp(slot)) => Ok(slot
+                .read_timeout
+                .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))),
+            Some(NetStream::Unix(_)) => {
+                Err("read_timeout not supported on Unix streams".to_string())
+            },
+            None => Err("Stream handle not found".to_string()),
+        }
+    }
+
+    fn net_set_write_timeout(
+        &mut self,
+        stream_handle: u64,
+        timeout_ms: Option<u64>,
+    ) -> Result<(), String> {
+        match self.active_streams.get_mut(&stream_handle) {
+            Some(NetStream::Tcp(slot)) => {
+                slot.write_timeout = timeout_ms.map(std::time::Duration::from_millis);
+                Ok(())
+            },
+            Some(NetStream::Unix(_)) => {
+                Err("set_write_timeout not supported on Unix streams".to_string())
+            },
+            None => Err("Stream handle not found".to_string()),
+        }
+    }
+
+    fn net_write_timeout(&mut self, stream_handle: u64) -> Result<Option<u64>, String> {
+        match self.active_streams.get(&stream_handle) {
+            Some(NetStream::Tcp(slot)) => Ok(slot
+                .write_timeout
+                .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))),
+            Some(NetStream::Unix(_)) => {
+                Err("write_timeout not supported on Unix streams".to_string())
+            },
+            None => Err("Stream handle not found".to_string()),
+        }
+    }
+
+    fn net_set_ttl(&mut self, stream_handle: u64, ttl: u32) -> Result<(), String> {
+        with_tcp_slot(self, stream_handle, |slot| {
+            slot.set_ttl(ttl).map_err(|e| format!("set_ttl: {e}"))
+        })
+    }
+
+    fn net_ttl(&mut self, stream_handle: u64) -> Result<u32, String> {
+        with_tcp_slot(self, stream_handle, |slot| {
+            slot.ttl().map_err(|e| format!("ttl: {e}"))
+        })
     }
 }
 
