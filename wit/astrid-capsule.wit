@@ -232,16 +232,6 @@ interface types {
         topic: string,
     }
 
-    /// Status of a network read operation.
-    variant net-read-status {
-        /// Data frame received.
-        data(list<u8>),
-        /// Stream closed by peer.
-        closed,
-        /// No data available (non-blocking).
-        pending,
-    }
-
     /// Request to check a capsule's capability.
     record capability-check-request {
         /// UUID of the capsule to check.
@@ -545,7 +535,7 @@ interface kv {
 ///
 /// Max 8 concurrent streams per capsule.
 interface net {
-    use types.{net-read-status, shutdown-how};
+    use types.{shutdown-how};
 
     /// Bind and activate the pre-provisioned Unix socket listener.
     ///
@@ -567,17 +557,6 @@ interface net {
     /// or none if no pending connections or the capsule is unloading.
     net-poll-accept: func(listener-handle: u64) -> result<option<u64>, string>;
 
-    /// Read the next length-prefixed frame from a stream.
-    ///
-    /// Returns Data with payload, Closed if peer disconnected, or
-    /// Pending if no data available. Max frame size: 10 MB.
-    net-read: func(stream-handle: u64) -> result<net-read-status, string>;
-
-    /// Write a length-prefixed frame to a stream.
-    ///
-    /// Non-fatal on failure (dead stream is cleaned up on next read).
-    net-write: func(stream-handle: u64, data: list<u8>) -> result<_, string>;
-
     /// Close a stream handle, releasing host-side resources.
     ///
     /// Idempotent: closing an already-closed handle is a no-op.
@@ -587,8 +566,8 @@ interface net {
     /// Open an outbound TCP connection to `host:port`.
     ///
     /// Returns a stream handle compatible with the existing
-    /// `net-read` / `net-write` / `net-close-stream` functions
-    /// — the same handle type returned by `net-accept`.
+    /// `net-read-bytes` / `net-write-bytes` / `net-close-stream`
+    /// functions — the same handle type returned by `net-accept`.
     ///
     /// Security gates (all checked before any TCP syscall):
     /// - The capsule's `net_connect` capability allowlist must
@@ -615,8 +594,13 @@ interface net {
     /// read timeout (default: non-blocking, ~50 ms internal poll).
     ///
     /// Use this for byte-stream protocols (WebSocket, MQTT, postgres,
-    /// HTTP/1.1, TLS, …). The existing `net-read` keeps the length-prefix
-    /// framing required by the uplink-proxy use case.
+    /// HTTP/1.1, TLS, …).
+    ///
+    /// Length-prefixed envelope framing (previously offered as a
+    /// dedicated `net-read` host fn) is now a user-space concern:
+    /// capsules that need it build a tiny state machine on top of
+    /// this byte-stream surface. The Astrid CLI uplink proxy does
+    /// exactly that.
     net-read-bytes: func(stream-handle: u64, max-bytes: u32) -> result<list<u8>, string>;
 
     /// Write `data` to `stream` without length-prefix framing.

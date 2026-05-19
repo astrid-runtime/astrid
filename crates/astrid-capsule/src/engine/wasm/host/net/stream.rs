@@ -1,9 +1,12 @@
-//! Shared stream helpers: byte-stream framing for the framed (legacy)
-//! `net-read` / `net-write` path, raw byte-stream helpers for the std-style
-//! `net-read-bytes` / `net-write-bytes` path, and the `with_tcp_slot` wrapper
-//! used by every TCP-only getter/setter (peer-addr, nodelay, ttl, …).
+//! Shared stream helpers: byte-stream read/write/peek over a
+//! [`tokio::io::AsyncRead`] / [`AsyncWrite`], plus the `with_tcp_slot`
+//! wrapper used by every TCP-only getter/setter (peer-addr, nodelay,
+//! ttl, …).
+//!
+//! Length-prefixed envelope framing is no longer in this module — it
+//! moved to user-space (capsule code) when the framed `net-read` /
+//! `net-write` host fns were removed.
 
-use crate::engine::wasm::bindings::astrid::capsule::types::NetReadStatus;
 use crate::engine::wasm::host::util;
 use crate::engine::wasm::host_state::{HostState, NetStream};
 
@@ -16,10 +19,9 @@ pub(super) const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::fro
 
 /// Host-side cap on a single byte-stream read/peek buffer.
 ///
-/// Matches the framed `net-read` payload cap so a malicious or buggy
-/// guest passing `u32::MAX` can't trigger a multi-GB allocation on the
-/// host. 10 MB is well above any realistic single-call read for the
-/// protocols this surface targets (TLS records ≤ 16 KB, WebSocket
+/// Prevents a guest passing `u32::MAX` from triggering a multi-GB host
+/// allocation. 10 MB is well above any realistic single-call read for
+/// the protocols this surface targets (TLS records ≤ 16 KB, WebSocket
 /// frames typically ≤ 64 KB, MQTT control packets ≤ 256 MB but
 /// streamed in chunks).
 pub(super) const MAX_BYTES_PER_CALL: usize = 10 * 1024 * 1024;
@@ -34,64 +36,6 @@ pub(super) fn is_peer_disconnect(e: &std::io::Error) -> bool {
             | std::io::ErrorKind::ConnectionAborted
             | std::io::ErrorKind::UnexpectedEof
     )
-}
-
-/// Read one length-prefixed frame from `stream`. Shared by UnixStream and
-/// TcpStream paths — both implement [`tokio::io::AsyncRead`].
-pub(super) async fn read_frame<S>(stream: &mut S) -> Result<NetReadStatus, String>
-where
-    S: tokio::io::AsyncRead + Unpin,
-{
-    use tokio::io::AsyncReadExt;
-
-    let mut len_buf = [0u8; 4];
-    match tokio::time::timeout(
-        std::time::Duration::from_millis(50),
-        stream.read_exact(&mut len_buf),
-    )
-    .await
-    {
-        Err(_) => return Ok(NetReadStatus::Pending),
-        Ok(Err(e)) if is_peer_disconnect(&e) => return Ok(NetReadStatus::Closed),
-        Ok(Err(e)) => return Err(format!("socket read error: {e}")),
-        Ok(Ok(_)) => {},
-    }
-
-    let len = u32::from_be_bytes(len_buf) as usize;
-    if len > 10 * 1024 * 1024 {
-        return Err("Payload too large (max 10MB)".to_string());
-    }
-
-    let mut payload = vec![0u8; len];
-    let timeout_ms = 5000 + (len as u64 / 1024);
-    match tokio::time::timeout(
-        std::time::Duration::from_millis(timeout_ms),
-        stream.read_exact(&mut payload),
-    )
-    .await
-    {
-        Err(_) => return Err("Payload read timed out".to_string()),
-        Ok(Err(e)) if is_peer_disconnect(&e) => return Ok(NetReadStatus::Closed),
-        Ok(Err(e)) => return Err(format!("socket payload read error: {e}")),
-        Ok(Ok(_)) => {},
-    }
-
-    Ok(NetReadStatus::Data(payload))
-}
-
-/// Write one length-prefixed frame to `stream`. Shared across UnixStream
-/// and TcpStream — both implement [`tokio::io::AsyncWrite`].
-pub(super) async fn write_frame<S>(stream: &mut S, data: &[u8]) -> std::io::Result<()>
-where
-    S: tokio::io::AsyncWrite + Unpin,
-{
-    use tokio::io::AsyncWriteExt;
-    let len = u32::try_from(data.len())
-        .map_err(|_| std::io::Error::other("write payload too large for length prefix"))?;
-    stream.write_all(&len.to_be_bytes()).await?;
-    stream.write_all(data).await?;
-    stream.flush().await?;
-    Ok(())
 }
 
 /// Read up to `max_bytes` from `stream` without length-prefix framing.

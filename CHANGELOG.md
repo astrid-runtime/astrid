@@ -9,6 +9,11 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
 
 ## [Unreleased]
 
+### Removed
+
+- **`net-read` / `net-write` host fns** (length-prefixed envelope framing) and the `net-read-status` WIT enum. Length-prefix framing is application-layer — `std::net::TcpStream` doesn't ship it, the OS doesn't ship it — so it shouldn't live in the host ABI. Capsules that need framing build a small state machine on top of `net-read-bytes` / `net-write-bytes`; the Astrid CLI proxy does exactly that ([`unicity-astrid/capsule-cli` `src/framing.rs`](https://github.com/unicity-astrid/capsule-cli/blob/main/src/framing.rs)). **Breaking**: any capsule still importing `net-read` or `net-write` will fail to instantiate after this lands; rebuild against [`unicity-astrid/sdk-rust` chore/drop-framed-net](https://github.com/unicity-astrid/sdk-rust) (the framed convenience APIs `astrid_sdk::net::{recv, try_recv, send}` are removed there too).
+
+
 ### Added
 
 - **Outbound TCP for capsules — `net.connect-tcp` host fn + `net_connect` capability.** Capsules can now open persistent TCP connections via the new `astrid:capsule/net.net-connect-tcp(host, port) -> stream-handle` host fn, gated by a per-capsule `net_connect = ["host:port", "host:*"]` allowlist in `Capsule.toml`. The returned handle flows through the existing `net-read` / `net-write` / `net-close-stream` plumbing, and the kernel reuses the same `is_safe_ip` airlock that gates `http-request` to reject loopback / private / link-local / multicast IPs after DNS resolution. Connect timeout bounded to 10s; per-capsule active-stream cap (`MAX_ACTIVE_STREAMS = 8`) shared with inbound `net-accept`. Unblocks WebSocket clients, MQTT, Discord/Telegram gateways, postgres/redis, and the immediate motivator: a Unicity-network capsule wrapping Sphere SDK (Fulcrum + Nostr WebSocket transports). Tracking issue: #745. RFC: [rfcs#27](https://github.com/unicity-astrid/rfcs/pull/27). WIT contract: [wit#5](https://github.com/unicity-astrid/wit/pull/5).

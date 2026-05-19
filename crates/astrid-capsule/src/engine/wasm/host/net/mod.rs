@@ -1,5 +1,5 @@
 use crate::engine::wasm::bindings::astrid::capsule::net;
-use crate::engine::wasm::bindings::astrid::capsule::types::{NetReadStatus, ShutdownHow};
+use crate::engine::wasm::bindings::astrid::capsule::types::ShutdownHow;
 use crate::engine::wasm::host::http::is_safe_ip;
 use crate::engine::wasm::host::util;
 use crate::engine::wasm::host_state::{HostState, NetStream, TcpStreamSlot};
@@ -9,8 +9,7 @@ mod stream;
 
 use handshake::{validate_handshake, verify_peer_credentials};
 use stream::{
-    CONNECT_TIMEOUT, MAX_BYTES_PER_CALL, read_bytes_inner, read_frame, with_tcp_slot,
-    write_bytes_inner, write_frame,
+    CONNECT_TIMEOUT, MAX_BYTES_PER_CALL, read_bytes_inner, with_tcp_slot, write_bytes_inner,
 };
 
 /// DNS hostname guards before reaching the resolver.
@@ -292,83 +291,6 @@ impl net::Host for HostState {
         // attributed correctly (#22).
 
         Ok(Some(handle_id))
-    }
-
-    fn net_read(&mut self, stream_handle: u64) -> Result<NetReadStatus, String> {
-        let stream = self
-            .active_streams
-            .get(&stream_handle)
-            .cloned()
-            .ok_or_else(|| "Stream handle not found".to_string())?;
-
-        let rt_handle = self.runtime_handle.clone();
-        let cancel_token = self.cancel_token.clone();
-        let host_semaphore = self.host_semaphore.clone();
-
-        // Cancel safety: read_exact is not cancel-safe, so cancellation mid-read
-        // may leave a partial frame on the socket. This is acceptable because the
-        // capsule is unloading - the socket will be closed by Drop on
-        // active_streams and the client will see a hard EOF / connection reset.
-        let status =
-            util::bounded_block_on_cancellable(&rt_handle, &host_semaphore, &cancel_token, async {
-                match stream {
-                    NetStream::Unix(arc) => {
-                        let mut s = arc.lock().await;
-                        read_frame(&mut *s).await
-                    },
-                    NetStream::Tcp(slot) => {
-                        let mut s = slot.stream.lock().await;
-                        read_frame(&mut *s).await
-                    },
-                }
-            });
-
-        // Cancellation (capsule unloading) -> Pending so the guest loop exits cleanly.
-        match status {
-            Some(r) => r,
-            None => Ok(NetReadStatus::Pending),
-        }
-    }
-
-    fn net_write(&mut self, stream_handle: u64, data: Vec<u8>) -> Result<(), String> {
-        let stream = self
-            .active_streams
-            .get(&stream_handle)
-            .cloned()
-            .ok_or_else(|| "Stream handle not found".to_string())?;
-
-        let rt_handle = self.runtime_handle.clone();
-        let host_semaphore = self.host_semaphore.clone();
-        let cancel_token = self.cancel_token.clone();
-
-        // Cancel safety: write_all is not cancel-safe, so cancellation mid-write
-        // may leave a partial frame on the socket. This is acceptable because the
-        // capsule is unloading - the socket will be closed by Drop on
-        // active_streams and the client will see a hard EOF / connection reset.
-        let result =
-            util::bounded_block_on_cancellable(&rt_handle, &host_semaphore, &cancel_token, async {
-                match stream {
-                    NetStream::Unix(arc) => {
-                        let mut s = arc.lock().await;
-                        write_frame(&mut *s, &data).await
-                    },
-                    NetStream::Tcp(slot) => {
-                        let mut s = slot.stream.lock().await;
-                        write_frame(&mut *s, &data).await
-                    },
-                }
-            });
-        match result {
-            Some(Ok(())) => {},
-            Some(Err(e)) => {
-                // Write failed — client likely disconnected. Log and continue;
-                // the dead stream will be cleaned up on the next read.
-                tracing::debug!(error = %e, "net write failed, client likely disconnected");
-            },
-            None => return Err("capsule unloading".to_string()),
-        }
-
-        Ok(())
     }
 
     fn net_connect_tcp(&mut self, host: String, port: u16) -> Result<u64, String> {
