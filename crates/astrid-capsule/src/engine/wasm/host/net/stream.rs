@@ -85,9 +85,17 @@ where
 }
 
 /// Read up to `max_bytes` from `stream` without length-prefix framing.
-/// Empty result means EOF (peer disconnected); timeout returns the
-/// `would block` error so callers can distinguish "no data yet" from
-/// "stream closed" — matching `std::io::ErrorKind::WouldBlock`.
+///
+/// Contract:
+/// - `Ok(empty Vec)` = **EOF** (peer disconnected). Unambiguous — matches
+///   `std::io::Read::read` returning `Ok(0)`.
+/// - `Ok(non-empty Vec)` = data read.
+/// - `Err("read would block")` = the caller-supplied `timeout` expired with
+///   no data. Maps to `std::io::ErrorKind::WouldBlock` SDK-side. Only
+///   returned when the caller has set a read timeout — `timeout = None`
+///   blocks indefinitely (until data, EOF, or capsule unload via the
+///   outer cancellation token).
+/// - `Err(other)` = transient IO error.
 pub(super) async fn read_bytes_inner<S>(
     stream: &mut S,
     max_bytes: usize,
@@ -98,8 +106,14 @@ where
 {
     use tokio::io::AsyncReadExt;
     let mut buf = vec![0u8; max_bytes];
-    let effective = timeout.unwrap_or(std::time::Duration::from_millis(50));
-    match tokio::time::timeout(effective, stream.read(&mut buf)).await {
+    // Default (no timeout) blocks indefinitely — matches std::io::Read
+    // semantics. Caller cancellation comes from the outer
+    // bounded_block_on_cancellable, not from a tight internal poll.
+    let result = match timeout {
+        Some(d) => tokio::time::timeout(d, stream.read(&mut buf)).await,
+        None => Ok(stream.read(&mut buf).await),
+    };
+    match result {
         Ok(Ok(0)) => Ok(Vec::new()),
         Ok(Ok(n)) => {
             buf.truncate(n);
@@ -107,7 +121,6 @@ where
         },
         Ok(Err(e)) if is_peer_disconnect(&e) => Ok(Vec::new()),
         Ok(Err(e)) => Err(format!("read error: {e}")),
-        Err(_) if timeout.is_none() => Ok(Vec::new()),
         Err(_) => Err("read would block".to_string()),
     }
 }
