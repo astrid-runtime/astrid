@@ -2,7 +2,7 @@ use crate::engine::wasm::bindings::astrid::capsule::net;
 use crate::engine::wasm::bindings::astrid::capsule::types::ShutdownHow;
 use crate::engine::wasm::host::http::is_safe_ip;
 use crate::engine::wasm::host::util;
-use crate::engine::wasm::host_state::{HostState, NetStream, TcpStreamSlot};
+use crate::engine::wasm::host_state::{HostState, NetStream, TcpStreamSlot, UnixStreamSlot};
 
 mod handshake;
 mod stream;
@@ -168,7 +168,11 @@ impl net::Host for HostState {
         );
         self.active_streams.insert(
             handle_id,
-            NetStream::Unix(std::sync::Arc::new(tokio::sync::Mutex::new(stream))),
+            NetStream::Unix(UnixStreamSlot {
+                stream: std::sync::Arc::new(tokio::sync::Mutex::new(stream)),
+                read_timeout: None,
+                write_timeout: None,
+            }),
         );
 
         // The `client.v1.connected` event is intentionally NOT published
@@ -282,7 +286,11 @@ impl net::Host for HostState {
         );
         self.active_streams.insert(
             handle_id,
-            NetStream::Unix(std::sync::Arc::new(tokio::sync::Mutex::new(stream))),
+            NetStream::Unix(UnixStreamSlot {
+                stream: std::sync::Arc::new(tokio::sync::Mutex::new(stream)),
+                read_timeout: None,
+                write_timeout: None,
+            }),
         );
 
         // See the matching comment in `net_accept` — `client.v1.connected`
@@ -421,9 +429,10 @@ impl net::Host for HostState {
         let max = max_bytes as usize;
         let result = util::bounded_block_on_cancellable(&rt, &sem, &tok, async {
             match stream {
-                NetStream::Unix(arc) => {
-                    let mut s = arc.lock().await;
-                    read_bytes_inner(&mut *s, max, None).await
+                NetStream::Unix(slot) => {
+                    let timeout = slot.read_timeout;
+                    let mut s = slot.stream.lock().await;
+                    read_bytes_inner(&mut *s, max, timeout).await
                 },
                 NetStream::Tcp(slot) => {
                     let timeout = slot.read_timeout;
@@ -446,9 +455,10 @@ impl net::Host for HostState {
         let tok = self.cancel_token.clone();
         let result = util::bounded_block_on_cancellable(&rt, &sem, &tok, async {
             match stream {
-                NetStream::Unix(arc) => {
-                    let mut s = arc.lock().await;
-                    write_bytes_inner(&mut *s, &data, None).await
+                NetStream::Unix(slot) => {
+                    let timeout = slot.write_timeout;
+                    let mut s = slot.stream.lock().await;
+                    write_bytes_inner(&mut *s, &data, timeout).await
                 },
                 NetStream::Tcp(slot) => {
                     let timeout = slot.write_timeout;
@@ -577,12 +587,9 @@ impl net::Host for HostState {
         timeout_ms: Option<u64>,
     ) -> Result<(), String> {
         match self.active_streams.get_mut(&stream_handle) {
-            Some(NetStream::Tcp(slot)) => {
-                slot.read_timeout = timeout_ms.map(std::time::Duration::from_millis);
+            Some(s) => {
+                *s.read_timeout_mut() = timeout_ms.map(std::time::Duration::from_millis);
                 Ok(())
-            },
-            Some(NetStream::Unix(_)) => {
-                Err("set_read_timeout not supported on Unix streams".to_string())
             },
             None => Err("Stream handle not found".to_string()),
         }
@@ -590,12 +597,9 @@ impl net::Host for HostState {
 
     fn net_read_timeout(&mut self, stream_handle: u64) -> Result<Option<u64>, String> {
         match self.active_streams.get(&stream_handle) {
-            Some(NetStream::Tcp(slot)) => Ok(slot
-                .read_timeout
+            Some(s) => Ok(s
+                .read_timeout()
                 .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))),
-            Some(NetStream::Unix(_)) => {
-                Err("read_timeout not supported on Unix streams".to_string())
-            },
             None => Err("Stream handle not found".to_string()),
         }
     }
@@ -606,12 +610,9 @@ impl net::Host for HostState {
         timeout_ms: Option<u64>,
     ) -> Result<(), String> {
         match self.active_streams.get_mut(&stream_handle) {
-            Some(NetStream::Tcp(slot)) => {
-                slot.write_timeout = timeout_ms.map(std::time::Duration::from_millis);
+            Some(s) => {
+                *s.write_timeout_mut() = timeout_ms.map(std::time::Duration::from_millis);
                 Ok(())
-            },
-            Some(NetStream::Unix(_)) => {
-                Err("set_write_timeout not supported on Unix streams".to_string())
             },
             None => Err("Stream handle not found".to_string()),
         }
@@ -619,12 +620,9 @@ impl net::Host for HostState {
 
     fn net_write_timeout(&mut self, stream_handle: u64) -> Result<Option<u64>, String> {
         match self.active_streams.get(&stream_handle) {
-            Some(NetStream::Tcp(slot)) => Ok(slot
-                .write_timeout
+            Some(s) => Ok(s
+                .write_timeout()
                 .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))),
-            Some(NetStream::Unix(_)) => {
-                Err("write_timeout not supported on Unix streams".to_string())
-            },
             None => Err("Stream handle not found".to_string()),
         }
     }

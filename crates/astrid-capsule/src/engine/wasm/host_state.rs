@@ -26,9 +26,56 @@ use astrid_storage::secret::SecretStore;
 #[derive(Debug, Clone)]
 pub enum NetStream {
     /// Inbound Unix-domain socket accepted from the kernel's listener.
-    Unix(Arc<tokio::sync::Mutex<tokio::net::UnixStream>>),
+    Unix(UnixStreamSlot),
     /// Outbound TCP connection opened via `net.connect-tcp`.
     Tcp(TcpStreamSlot),
+}
+
+impl NetStream {
+    /// Mutable access to the read timeout, regardless of variant.
+    pub fn read_timeout_mut(&mut self) -> &mut Option<std::time::Duration> {
+        match self {
+            Self::Unix(slot) => &mut slot.read_timeout,
+            Self::Tcp(slot) => &mut slot.read_timeout,
+        }
+    }
+
+    /// Mutable access to the write timeout, regardless of variant.
+    pub fn write_timeout_mut(&mut self) -> &mut Option<std::time::Duration> {
+        match self {
+            Self::Unix(slot) => &mut slot.write_timeout,
+            Self::Tcp(slot) => &mut slot.write_timeout,
+        }
+    }
+
+    /// Current read timeout, regardless of variant.
+    pub fn read_timeout(&self) -> Option<std::time::Duration> {
+        match self {
+            Self::Unix(slot) => slot.read_timeout,
+            Self::Tcp(slot) => slot.read_timeout,
+        }
+    }
+
+    /// Current write timeout, regardless of variant.
+    pub fn write_timeout(&self) -> Option<std::time::Duration> {
+        match self {
+            Self::Unix(slot) => slot.write_timeout,
+            Self::Tcp(slot) => slot.write_timeout,
+        }
+    }
+}
+
+/// Per-stream state for an inbound Unix-domain accept stream.
+///
+/// Mirrors [`TcpStreamSlot`] but holds [`tokio::net::UnixStream`]. The
+/// read/write timeout fields back `net-set-read-timeout` /
+/// `net-set-write-timeout` so user-space framing layers (e.g. the CLI
+/// proxy) can poll without blocking the loop on the first stream.
+#[derive(Debug, Clone)]
+pub struct UnixStreamSlot {
+    pub stream: Arc<tokio::sync::Mutex<tokio::net::UnixStream>>,
+    pub read_timeout: Option<std::time::Duration>,
+    pub write_timeout: Option<std::time::Duration>,
 }
 
 /// Per-stream state for an outbound TCP connection.
@@ -41,16 +88,8 @@ pub enum NetStream {
 /// `TcpStream::nodelay()` / `ttl()` on demand.
 #[derive(Debug, Clone)]
 pub struct TcpStreamSlot {
-    /// The connected TCP socket. Shared via `Arc<Mutex<…>>` so the
-    /// existing `net-read` / `net-write` dispatchers can clone the
-    /// outer `NetStream` and then lock the inner stream.
     pub stream: Arc<tokio::sync::Mutex<tokio::net::TcpStream>>,
-    /// Read timeout applied to each `net-read-bytes` / `net-peek` call.
-    /// `None` → use the host default (~50 ms poll for `Pending` parity
-    /// with `net-read`).
     pub read_timeout: Option<std::time::Duration>,
-    /// Write timeout applied to each `net-write-bytes` call.
-    /// `None` → no extra timeout beyond the host cancellation token.
     pub write_timeout: Option<std::time::Duration>,
 }
 
