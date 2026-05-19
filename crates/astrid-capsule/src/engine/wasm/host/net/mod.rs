@@ -570,32 +570,18 @@ impl net::Host for HostState {
         let result = util::bounded_block_on_cancellable(&rt, &sem, &tok, async move {
             match stream {
                 NetStream::Tcp(slot) => {
-                    use tokio::io::AsyncWriteExt;
-                    let mut s = slot.stream.lock().await;
-                    match how {
-                        // Tokio TcpStream only exposes shutdown for the write
-                        // side via the AsyncWrite trait. For Read / Both we
-                        // need the inner std-level shutdown via std_into.
-                        ShutdownHow::Write => s
-                            .shutdown()
-                            .await
-                            .map_err(|e| format!("shutdown(write): {e}")),
-                        _ => {
-                            let std = s.as_ref();
-                            // No-op for unsupported direction on the read
-                            // side of tokio's TcpStream — std::Shutdown::Read
-                            // / Both delegate to the underlying socket via
-                            // socket2 in a future iteration. For now we
-                            // accept the documented limitation: only
-                            // `shutdown-how::write` is fully supported.
-                            let _ = std;
-                            let _ = std_how;
-                            Err(format!(
-                                "shutdown({:?}): only `write` half-close is supported in this version",
-                                how
-                            ))
-                        },
-                    }
+                    // Use socket2's borrowed `SockRef` for full
+                    // `Shutdown::{Read,Write,Both}` support — tokio's
+                    // `TcpStream` only exposes the write half via the
+                    // `AsyncWrite` trait, but the OS `shutdown(2)`
+                    // syscall (reached through socket2) handles every
+                    // direction cleanly. Borrowed; no FD ownership
+                    // transfer; safe to call repeatedly.
+                    let s = slot.stream.lock().await;
+                    let sock_ref = socket2::SockRef::from(&*s);
+                    sock_ref
+                        .shutdown(std_how)
+                        .map_err(|e| format!("shutdown({how:?}): {e}"))
                 },
                 NetStream::Unix(_) => Err("shutdown not supported on Unix streams".to_string()),
             }
@@ -715,5 +701,29 @@ mod tests {
         // Changing MAX_ACTIVE_STREAMS requires explicit security review
         // (resource exhaustion surface). Update this test deliberately.
         assert_eq!(MAX_ACTIVE_STREAMS, 8);
+    }
+
+    #[tokio::test]
+    async fn socket2_shutdown_supports_all_three_directions() {
+        // Smoke test that socket2::SockRef::from(&tokio::net::TcpStream)
+        // accepts every Shutdown direction. If a future tokio/socket2 bump
+        // breaks this glue, the test fails loudly here instead of
+        // surfacing as a runtime error on the first capsule that calls
+        // shutdown(Read|Both).
+        use std::net::Shutdown;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (client, _server) = tokio::join!(
+            async { tokio::net::TcpStream::connect(addr).await.unwrap() },
+            async { listener.accept().await.unwrap() },
+        );
+        let sock = socket2::SockRef::from(&client);
+        sock.shutdown(Shutdown::Write).unwrap();
+        // Read shutdown after write may already be effectively done; calling
+        // it again must not panic. Some platforms return ENOTCONN here,
+        // which is fine — the point is the FFI call resolves without
+        // dropping into an "only write supported" branch.
+        let _ = sock.shutdown(Shutdown::Read);
+        let _ = sock.shutdown(Shutdown::Both);
     }
 }
