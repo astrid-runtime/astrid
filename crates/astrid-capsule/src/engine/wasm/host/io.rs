@@ -138,3 +138,197 @@ impl astrid_poll::HostPollable for HostState {
         wasi_poll::HostPollable::drop(&mut self.resource_table, rep)
     }
 }
+
+// ────────────────────────────────────────────────────────────────────────
+// astrid:io/error — downcastable error resource
+// ────────────────────────────────────────────────────────────────────────
+
+mod astrid_error_impl {
+    use super::*;
+    use crate::engine::wasm::bindings::astrid::io::error::{self as astrid_error, Error};
+    use wasmtime_wasi::p2::IoError;
+
+    impl astrid_error::Host for HostState {}
+
+    impl astrid_error::HostError for HostState {
+        fn to_debug_string(&mut self, self_: Resource<Error>) -> String {
+            // Re-tag the resource handle so wasi-io's `to-debug-string`
+            // impl on `IoError` operates on the same underlying error.
+            let rep = self_.rep();
+            self.resource_table
+                .get::<IoError>(&Resource::new_borrow(rep))
+                .map(|e| format!("{e:?}"))
+                .unwrap_or_else(|_| "error resource not found".to_string())
+        }
+
+        fn drop(&mut self, rep: Resource<Error>) -> WResult<()> {
+            let _ = self
+                .resource_table
+                .delete::<IoError>(Resource::new_own(rep.rep()));
+            Ok(())
+        }
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────────
+// astrid:io/streams — input-stream / output-stream
+//
+// STUB SHELL — trait shape matches the new WIT but each method body
+// returns `last-operation-failed` with a placeholder error. Full impls
+// porting back the underlying byte-movement machinery come in a
+// follow-up commit alongside the resource accessors on tcp-stream /
+// http-stream / process-handle.
+// ────────────────────────────────────────────────────────────────────────
+
+mod astrid_streams_impl {
+    use super::*;
+    use crate::engine::wasm::bindings::astrid::io::streams::{
+        self as astrid_streams, Error, HostInputStream, HostOutputStream, InputStream,
+        OutputStream, StreamError,
+    };
+    use wasmtime::component::Resource;
+
+    /// Build a `closed` stream-error.
+    fn closed() -> StreamError {
+        StreamError::Closed
+    }
+
+    impl astrid_streams::Host for HostState {}
+
+    impl HostInputStream for HostState {
+        fn read(
+            &mut self,
+            _self_: Resource<InputStream>,
+            _len: u64,
+        ) -> Result<Vec<u8>, StreamError> {
+            // TODO(streams): port the read-path port-back lands.
+            // For now every operation returns `closed` so capsules that
+            // happen to obtain an input-stream from a stubbed resource
+            // method get a clean error rather than a panic.
+            Err(closed())
+        }
+
+        fn blocking_read(
+            &mut self,
+            _self_: Resource<InputStream>,
+            _len: u64,
+        ) -> Result<Vec<u8>, StreamError> {
+            Err(closed())
+        }
+
+        fn skip(&mut self, _self_: Resource<InputStream>, _len: u64) -> Result<u64, StreamError> {
+            Err(closed())
+        }
+
+        fn blocking_skip(
+            &mut self,
+            _self_: Resource<InputStream>,
+            _len: u64,
+        ) -> Result<u64, StreamError> {
+            Err(closed())
+        }
+
+        fn subscribe(
+            &mut self,
+            _self_: Resource<InputStream>,
+        ) -> Resource<crate::engine::wasm::bindings::astrid::io::poll::Pollable> {
+            // TODO: return a pollable that fires on stream readiness.
+            // Placeholder allocates a never-ready pollable via the
+            // resource table; capsules using stub streams should not
+            // depend on this firing.
+            unimplemented!("input-stream.subscribe: pollable wiring pending")
+        }
+
+        fn drop(&mut self, rep: Resource<InputStream>) -> WResult<()> {
+            let _ = self
+                .resource_table
+                .delete::<wasmtime_wasi::p2::DynInputStream>(Resource::new_own(rep.rep()));
+            Ok(())
+        }
+    }
+
+    impl HostOutputStream for HostState {
+        fn check_write(&mut self, _self_: Resource<OutputStream>) -> Result<u64, StreamError> {
+            Err(closed())
+        }
+
+        fn write(
+            &mut self,
+            _self_: Resource<OutputStream>,
+            _contents: Vec<u8>,
+        ) -> Result<(), StreamError> {
+            Err(closed())
+        }
+
+        fn blocking_write_and_flush(
+            &mut self,
+            _self_: Resource<OutputStream>,
+            _contents: Vec<u8>,
+        ) -> Result<(), StreamError> {
+            Err(closed())
+        }
+
+        fn flush(&mut self, _self_: Resource<OutputStream>) -> Result<(), StreamError> {
+            Err(closed())
+        }
+
+        fn blocking_flush(&mut self, _self_: Resource<OutputStream>) -> Result<(), StreamError> {
+            Err(closed())
+        }
+
+        fn subscribe(
+            &mut self,
+            _self_: Resource<OutputStream>,
+        ) -> Resource<crate::engine::wasm::bindings::astrid::io::poll::Pollable> {
+            unimplemented!("output-stream.subscribe: pollable wiring pending")
+        }
+
+        fn write_zeroes(
+            &mut self,
+            _self_: Resource<OutputStream>,
+            _len: u64,
+        ) -> Result<(), StreamError> {
+            Err(closed())
+        }
+
+        fn blocking_write_zeroes_and_flush(
+            &mut self,
+            _self_: Resource<OutputStream>,
+            _len: u64,
+        ) -> Result<(), StreamError> {
+            Err(closed())
+        }
+
+        fn splice(
+            &mut self,
+            _self_: Resource<OutputStream>,
+            _src: Resource<InputStream>,
+            _len: u64,
+        ) -> Result<u64, StreamError> {
+            Err(closed())
+        }
+
+        fn blocking_splice(
+            &mut self,
+            _self_: Resource<OutputStream>,
+            _src: Resource<InputStream>,
+            _len: u64,
+        ) -> Result<u64, StreamError> {
+            Err(closed())
+        }
+
+        fn drop(&mut self, rep: Resource<OutputStream>) -> WResult<()> {
+            let _ = self
+                .resource_table
+                .delete::<wasmtime_wasi::p2::DynOutputStream>(Resource::new_own(rep.rep()));
+            Ok(())
+        }
+    }
+
+    // The bindgen-generated module re-exports `Error` (the resource
+    // tag) from `astrid:io/error` into `astrid:io/streams` via the
+    // `use error.{error};` clause. The handle here is the same one
+    // produced by `astrid_error_impl` above; no separate impl needed.
+    #[allow(dead_code)]
+    fn _ensure_error_type_in_scope(_: Resource<Error>) {}
+}

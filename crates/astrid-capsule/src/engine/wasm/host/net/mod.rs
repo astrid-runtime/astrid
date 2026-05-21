@@ -9,6 +9,7 @@
 use wasmtime::component::Resource;
 use wasmtime_wasi::p2::DynPollable;
 
+use crate::engine::wasm::bindings::astrid::io::streams::{InputStream, OutputStream};
 use crate::engine::wasm::bindings::astrid::net::host::{
     self as net, ErrorCode, HostTcpListener, HostTcpStream, HostUdpSocket, HostUnixListener,
     NetReadStatus, ShutdownHow, TcpListener, TcpStream, UdpDatagram, UdpSocket, UnixListener,
@@ -197,6 +198,12 @@ impl HostTcpStream for HostState {
     }
     fn subscribe_readable(&mut self, _self_: Resource<TcpStream>) -> Resource<DynPollable> {
         todo!("TcpStream.subscribe_readable pending")
+    }
+    fn read_stream(&mut self, _self_: Resource<TcpStream>) -> Resource<InputStream> {
+        todo!("TcpStream.read_stream: input-stream wiring pending")
+    }
+    fn write_stream(&mut self, _self_: Resource<TcpStream>) -> Resource<OutputStream> {
+        todo!("TcpStream.write_stream: output-stream wiring pending")
     }
     fn drop(&mut self, _rep: Resource<TcpStream>) -> wasmtime::Result<()> {
         Ok(())

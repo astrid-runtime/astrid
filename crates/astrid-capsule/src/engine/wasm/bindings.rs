@@ -44,7 +44,9 @@ wasmtime::component::bindgen!({
         /// readiness operation goes through Astrid host code so it is
         /// audited, principal-scoped, cancellable, and quota-bounded.
         world kernel {
+            import astrid:io/error@1.0.0;
             import astrid:io/poll@1.0.0;
+            import astrid:io/streams@1.0.0;
             import astrid:fs/host@1.0.0;
             import astrid:ipc/host@1.0.0;
             import astrid:kv/host@1.0.0;
@@ -73,6 +75,14 @@ wasmtime::component::bindgen!({
         // `lookup_keys` walk in wasmtime-internal-wit-bindgen. Forgetting
         // the dot or substituting a slash makes the key "unused" and the
         // build fails before bindings codegen completes.
+        //
+        // The wasmtime-wasi-io types are reused for *storage only* — they
+        // are Future/Box<dyn ...> wrappers, not syscalls. Our Host trait
+        // impls live in `engine/wasm/host/io.rs` and add audit + cancel +
+        // per-principal accounting around every operation.
         "astrid:io/poll@1.0.0.pollable": wasmtime_wasi::p2::DynPollable,
+        "astrid:io/error@1.0.0.error": wasmtime_wasi::p2::IoError,
+        "astrid:io/streams@1.0.0.input-stream": wasmtime_wasi::p2::DynInputStream,
+        "astrid:io/streams@1.0.0.output-stream": wasmtime_wasi::p2::DynOutputStream,
     },
 });

@@ -14,6 +14,7 @@ use crate::engine::wasm::bindings::astrid::http::host::{
     self as http, ErrorCode, HostHttpStream, HttpMethod, HttpRequestData, HttpResponseData,
     HttpStream, KeyValuePair,
 };
+use crate::engine::wasm::bindings::astrid::io::streams::InputStream;
 use crate::engine::wasm::host::util;
 use crate::engine::wasm::host_state::HostState;
 use wasmtime_wasi::p2::DynPollable;
@@ -402,6 +403,10 @@ impl HostHttpStream for HostState {
         // bytes ready. For now hand out an always-ready pollable so guests
         // that compose pollables don't block forever.
         todo!("http_stream.subscribe_readable: pollable scaffolding pending")
+    }
+
+    fn body_stream(&mut self, _self_: Resource<HttpStream>) -> Resource<InputStream> {
+        todo!("http_stream.body_stream: input-stream wiring pending")
     }
 
     fn drop(&mut self, rep: Resource<HttpStream>) -> wasmtime::Result<()> {
