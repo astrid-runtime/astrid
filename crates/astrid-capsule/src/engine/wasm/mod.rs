@@ -781,14 +781,16 @@ impl ExecutionEngine for WasmEngine {
 
                 let mut linker: Linker<HostState> = Linker::new(&wt_engine);
 
-                // Wire WASI imports (clocks, random, stderr).
-                wasmtime_wasi::p2::add_to_linker_sync(&mut linker).map_err(|e| {
-                    CapsuleError::UnsupportedEntryPoint(format!(
-                        "Failed to add WASI to linker: {e}"
-                    ))
-                })?;
-
-                // Wire all 12 Astrid host interfaces from the new per-domain WIT.
+                // No `wasi:*` interfaces are registered: the host ABI is
+                // fully Astrid-owned. Capsules import `astrid:fs`,
+                // `astrid:ipc`, …, and `astrid:io/poll` for readiness
+                // multiplexing — never wasi:io. Exposing the wasi stack
+                // here would create unaudited side channels around the
+                // capability and audit layers (filesystem outside the
+                // VFS, sockets outside the SSRF airlock, clocks/random
+                // outside sys, etc.).
+                //
+                // Wire all Astrid host interfaces from the per-domain WIT.
                 // The synthetic `Kernel` world imports every host package, so
                 // a single `add_to_linker` call registers them all.
                 bindings::Kernel::add_to_linker::<
@@ -1493,11 +1495,9 @@ pub fn run_lifecycle(
     let _epoch_guard = spawn_epoch_ticker(&wt_engine);
 
     let mut linker: Linker<HostState> = Linker::new(&wt_engine);
-    wasmtime_wasi::p2::add_to_linker_sync(&mut linker).map_err(|e| {
-        CapsuleError::UnsupportedEntryPoint(format!(
-            "Failed to add WASI to linker for lifecycle: {e}"
-        ))
-    })?;
+    // No wasi:* registrations — same rationale as the main load path:
+    // every host call must route through Astrid's audit + capability
+    // layers, no carve-outs.
     bindings::Kernel::add_to_linker::<HostState, wasmtime::component::HasSelf<HostState>>(
         &mut linker,
         |state| state,

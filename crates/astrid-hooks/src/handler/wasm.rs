@@ -4,8 +4,9 @@
 //! serialized [`HookAbiContext`] as `list<u8>` and interpreting the returned
 //! bytes as a [`HookAbiResult`].
 //!
-//! Host functions are provided via `Capsule::add_to_linker` (wasmtime bindgen)
-//! and `wasmtime_wasi::p2::add_to_linker_sync`.
+//! Host functions are provided via `Kernel::add_to_linker` (wasmtime
+//! bindgen) — no wasi:* interfaces are exposed; the host ABI is fully
+//! Astrid-owned for audit and capability uniformity.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -171,11 +172,9 @@ impl WasmHandler {
             u64::try_from(self.config.max_execution_time.as_millis() / 100).unwrap_or(u64::MAX);
         store.set_epoch_deadline(deadline_ticks.max(1));
 
-        // Build linker with WASI + Astrid host interfaces
+        // Build linker with Astrid host interfaces only — no wasi:*
+        // exposure, matching the main capsule load path.
         let mut linker: Linker<HostState> = Linker::new(&self.engine);
-
-        wasmtime_wasi::p2::add_to_linker_sync(&mut linker)
-            .map_err(|e| HandlerError::WasmFailed(format!("failed to add WASI to linker: {e}")))?;
 
         bindings::Kernel::add_to_linker::<HostState, wasmtime::component::HasSelf<HostState>>(
             &mut linker,

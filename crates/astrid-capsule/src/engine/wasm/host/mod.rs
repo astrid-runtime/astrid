@@ -15,6 +15,12 @@ pub(crate) mod fs;
 pub mod http;
 /// Identity operations (resolve, link, create user).
 pub(crate) mod identity;
+/// Astrid-owned readiness multiplexing (`astrid:io/poll@1.0.0`).
+///
+/// Replaces the wasi:io/poll dependency. Every readiness operation is
+/// audited, principal-scoped, races against the capsule cancellation
+/// token, and is bounded by the per-principal quota profile.
+pub(crate) mod io;
 /// Inter-Process Communication bus.
 pub(crate) mod ipc;
 /// Key-Value persistent storage primitives.
@@ -47,40 +53,7 @@ impl crate::engine::wasm::bindings::astrid::guest::lifecycle::Host
 {
 }
 
-// `wasi:io/poll` is referenced transitively by every host package that
-// returns a `pollable` (ipc, net, http, process). The wasmtime-wasi
-// crate implements `Host` and `HostPollable` for `ResourceTable`; we
-// forward through `HostState.resource_table` so the kernel's
-// `Kernel::add_to_linker` (which type-bounds its host getter to a
-// single `HasSelf<HostState>`) type-checks without splitting the
-// linker into a per-interface getter dance.
-//
-// These are thin shims: every call delegates to the underlying
-// `ResourceTable` impl.
-mod wasi_poll_forward {
-    use crate::engine::wasm::host_state::HostState;
-    use wasmtime::Result;
-    use wasmtime::component::Resource;
-    use wasmtime_wasi::p2::DynPollable;
-    use wasmtime_wasi::p2::bindings::sync::io::poll;
-
-    impl poll::Host for HostState {
-        fn poll(&mut self, pollables: Vec<Resource<DynPollable>>) -> Result<Vec<u32>> {
-            poll::Host::poll(&mut self.resource_table, pollables)
-        }
-    }
-
-    impl poll::HostPollable for HostState {
-        fn ready(&mut self, pollable: Resource<DynPollable>) -> Result<bool> {
-            poll::HostPollable::ready(&mut self.resource_table, pollable)
-        }
-
-        fn block(&mut self, pollable: Resource<DynPollable>) -> Result<()> {
-            poll::HostPollable::block(&mut self.resource_table, pollable)
-        }
-
-        fn drop(&mut self, pollable: Resource<DynPollable>) -> Result<()> {
-            poll::HostPollable::drop(&mut self.resource_table, pollable)
-        }
-    }
-}
+// `astrid:io/poll` is implemented in `host/io.rs` — kernel-owned with
+// audit + cancel-token + per-principal accounting. The wasi:io/poll
+// forwarder used during the initial scaffolding pass has been removed:
+// no wasi:* interface is exposed to capsules.
