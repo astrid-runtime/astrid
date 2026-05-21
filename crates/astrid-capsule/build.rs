@@ -6,13 +6,14 @@
 //!
 //! 2. Stage the WIT submodule into a layout `wasmtime::component::bindgen!`
 //!    can resolve. The canonical WIT lives at `core/wit/` (a submodule of
-//!    `unicity-astrid/wit`) with per-domain packages under `host/` and
-//!    vendored dependencies under `deps/`. wasmtime's bindgen expects a
-//!    single root WIT directory with one package per `deps/<name>/` subdir,
-//!    so we copy each `host/<pkg>@<ver>.wit` into
-//!    `wit-staging/deps/astrid-<pkg>/<pkg>@<ver>.wit`, and `wit/deps/wasi-io/`
-//!    into `wit-staging/deps/wasi-io/`. The synthetic kernel world is
-//!    supplied via the `inline:` option in `bindings.rs`.
+//!    `unicity-astrid/wit`) with per-domain packages under `host/`. wasmtime's
+//!    bindgen expects a single root WIT directory with one package per
+//!    `deps/<name>/` subdir, so we copy each `host/<pkg>@<ver>.wit` into
+//!    `wit-staging/deps/astrid-<pkg>/<pkg>@<ver>.wit`. The synthetic kernel
+//!    world is supplied via the `inline:` option in `bindings.rs`.
+//!
+//! No external WIT packages are vendored — the host ABI is fully
+//! Astrid-owned (`astrid:*` only, no `wasi:*` dependency).
 
 use std::fs;
 use std::path::Path;
@@ -44,19 +45,6 @@ fn stage_wit() {
     fs::write(staging.join("kernel.wit"), "package kernel:placeholder;\n")
         .expect("write kernel.wit");
 
-    let wasi_io_src = wit_root.join("deps").join("wasi-io");
-    let wasi_io_dst = deps.join("wasi-io");
-    fs::create_dir_all(&wasi_io_dst).expect("mkdir deps/wasi-io");
-    for entry in fs::read_dir(&wasi_io_src).expect("read wit/deps/wasi-io") {
-        let entry = entry.unwrap();
-        let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) == Some("wit") {
-            let dst = wasi_io_dst.join(path.file_name().unwrap());
-            fs::copy(&path, &dst).expect("copy wasi-io wit");
-            println!("cargo:rerun-if-changed={}", path.display());
-        }
-    }
-
     let host_src = wit_root.join("host");
     for entry in fs::read_dir(&host_src).expect("read wit/host") {
         let entry = entry.unwrap();
@@ -77,7 +65,6 @@ fn stage_wit() {
     }
 
     rerun_if_dir_changed(&wit_root.join("host"));
-    rerun_if_dir_changed(&wit_root.join("deps"));
     println!("cargo:rerun-if-changed=build.rs");
 }
 
