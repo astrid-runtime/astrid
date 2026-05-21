@@ -177,25 +177,35 @@ impl WasmHandler {
         wasmtime_wasi::p2::add_to_linker_sync(&mut linker)
             .map_err(|e| HandlerError::WasmFailed(format!("failed to add WASI to linker: {e}")))?;
 
-        bindings::Capsule::add_to_linker::<HostState, wasmtime::component::HasSelf<HostState>>(
+        bindings::Kernel::add_to_linker::<HostState, wasmtime::component::HasSelf<HostState>>(
             &mut linker,
             |state| state,
         )
         .map_err(|e| {
-            HandlerError::WasmFailed(format!("failed to add Capsule host to linker: {e}"))
+            HandlerError::WasmFailed(format!("failed to add Astrid host to linker: {e}"))
         })?;
 
-        // Instantiate the component
-        let instance =
-            bindings::Capsule::instantiate(&mut store, &component, &linker).map_err(|e| {
-                HandlerError::WasmFailed(format!("failed to instantiate WASM component: {e}"))
-            })?;
+        // Instantiate the component without world enforcement (the per-
+        // domain WIT split removed the bundled `Capsule` world; exports
+        // are looked up by name).
+        let instance = linker.instantiate(&mut store, &component).map_err(|e| {
+            HandlerError::WasmFailed(format!("failed to instantiate WASM component: {e}"))
+        })?;
 
-        // Call the typed Component Model export. The function name is the
-        // action, the serialized context is the payload.
+        // Call `astrid-hook-trigger` via typed func lookup.
         let capsule_result = tokio::task::block_in_place(|| {
-            instance
-                .call_astrid_hook_trigger(&mut store, function, &input_bytes)
+            let func = instance
+                .get_typed_func::<(String, Vec<u8>), (bindings::astrid::guest::lifecycle::CapsuleResult,)>(
+                    &mut store,
+                    "astrid-hook-trigger",
+                )
+                .map_err(|e| {
+                    HandlerError::WasmFailed(format!(
+                        "capsule does not export `astrid-hook-trigger`: {e}"
+                    ))
+                })?;
+            func.call(&mut store, (function.clone(), input_bytes.clone()))
+                .map(|(cr,)| cr)
                 .map_err(|e| {
                     HandlerError::WasmFailed(format!("astrid-hook-trigger call failed: {e}"))
                 })
@@ -346,6 +356,7 @@ impl WasmHandler {
             // do not receive the identity store. Identity resolution requires
             // a kernel-managed security gate which hooks don't have.
             identity_store: None,
+            #[allow(clippy::zero_sized_map_values)] // ManagedProcess is a stub pending the process resource port-back
             background_processes: HashMap::new(),
             next_process_id: 1,
             process_tracker: Arc::new(

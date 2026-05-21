@@ -3,8 +3,9 @@
 //! These functions are called by WASM guests during `#[install]` or `#[upgrade]`
 //! hooks to interactively collect user input (secrets, text, selections, arrays).
 
-use crate::engine::wasm::bindings::astrid::capsule::elicit;
-use crate::engine::wasm::bindings::astrid::capsule::types::ElicitRequest;
+use crate::engine::wasm::bindings::astrid::elicit::host::{
+    self as elicit, ElicitRequest, ElicitResponse, ElicitType, ErrorCode,
+};
 use crate::engine::wasm::host::util;
 use crate::engine::wasm::host_state::HostState;
 use astrid_events::AstridEvent;
@@ -14,22 +15,21 @@ use uuid::Uuid;
 /// Maximum timeout for interactive elicitation (120 seconds).
 const MAX_ELICIT_TIMEOUT_MS: u64 = 120_000;
 
-/// Map the SDK's string-typed request into the `OnboardingField` schema
+/// Map the typed [`ElicitRequest`] into the `OnboardingField` schema
 /// used by the IPC layer and TUI.
-fn map_to_onboarding_field(req: &ElicitRequest) -> Result<OnboardingField, String> {
-    let field_type = match req.elicit_type.as_str() {
-        "text" => OnboardingFieldType::Text,
-        "secret" => OnboardingFieldType::Secret,
-        "select" => {
+fn map_to_onboarding_field(req: &ElicitRequest) -> Result<OnboardingField, ErrorCode> {
+    let field_type = match req.kind {
+        ElicitType::Text => OnboardingFieldType::Text,
+        ElicitType::Secret => OnboardingFieldType::Secret,
+        ElicitType::Select => {
             let options = req
                 .options
                 .as_ref()
                 .filter(|o| !o.is_empty())
-                .ok_or_else(|| "select elicit request requires non-empty options".to_string())?;
+                .ok_or(ErrorCode::InvalidInput)?;
             OnboardingFieldType::Enum(options.clone())
         },
-        "array" => OnboardingFieldType::Array,
-        other => return Err(format!("unknown elicit type: {other}")),
+        ElicitType::Array => OnboardingFieldType::Array,
     };
 
     Ok(OnboardingField {
@@ -51,25 +51,22 @@ fn map_to_onboarding_field(req: &ElicitRequest) -> Result<OnboardingField, Strin
 }
 
 impl elicit::Host for HostState {
-    /// Host function: `elicit(request) -> response_json`
+    /// Host function: `elicit(request) -> ElicitResponse`
     ///
     /// Blocks the WASM thread until the frontend (TUI or CLI) collects user input
     /// and publishes an `ElicitResponse` on the response topic.
     ///
-    /// Only callable during a lifecycle phase (install/upgrade). Returns an error
-    /// if called during normal runtime.
-    fn elicit(&mut self, request: ElicitRequest) -> Result<String, String> {
+    /// Only callable during a lifecycle phase (install/upgrade). Returns
+    /// `not-in-lifecycle` if called during normal runtime.
+    fn elicit(&mut self, request: ElicitRequest) -> Result<ElicitResponse, ErrorCode> {
+        // Gate: elicit is only allowed during lifecycle hooks
+        if self.lifecycle_phase.is_none() {
+            return Err(ErrorCode::NotInLifecycle);
+        }
+
         let field = map_to_onboarding_field(&request)?;
         let request_id = Uuid::new_v4();
         let response_topic = format!("astrid.v1.elicit.response.{request_id}");
-
-        // Gate: elicit is only allowed during lifecycle hooks
-        if self.lifecycle_phase.is_none() {
-            return Err(
-                "elicit is only available during #[install] or #[upgrade] lifecycle hooks"
-                    .to_string(),
-            );
-        }
 
         // Subscribe to the response topic BEFORE publishing the request
         // to prevent a race where the response arrives before we're listening.
@@ -101,7 +98,7 @@ impl elicit::Host for HostState {
         tracing::debug!(
             capsule = %capsule_id,
             key = %request.key,
-            kind = %request.elicit_type,
+            ?request.kind,
             %request_id,
             "Published elicit request, waiting for response"
         );
@@ -130,82 +127,70 @@ impl elicit::Host for HostState {
         )
         .flatten();
 
-        // Extract the response
-        let response_json = match event {
+        // Extract the response, mapping the inner IPC reply into the typed
+        // `ElicitResponse` variant required by the WIT contract.
+        let response = match event {
             Some(event) => {
-                if let AstridEvent::Ipc { message, .. } = &*event {
-                    match &message.payload {
-                        IpcPayload::ElicitResponse { value, values, .. } => {
-                            // Detect cancellation: both value and values are None
-                            if value.is_none() && values.is_none() {
-                                return Err("user cancelled elicit request".to_string());
-                            }
+                let AstridEvent::Ipc { message, .. } = &*event else {
+                    return Err(ErrorCode::Unknown(
+                        "unexpected event type in elicit response".to_string(),
+                    ));
+                };
+                match &message.payload {
+                    IpcPayload::ElicitResponse { value, values, .. } => {
+                        // Detect cancellation: both value and values are None.
+                        if value.is_none() && values.is_none() {
+                            return Err(ErrorCode::Cancelled);
+                        }
 
-                            // Build response JSON matching what the SDK expects
-                            match request.elicit_type.as_str() {
-                                "secret" => {
-                                    // Persist the secret via the SecretStore abstraction.
-                                    // This uses the OS keychain when available, falling
-                                    // back to KV storage in headless/CI environments.
-                                    let secret_val = value.clone().unwrap_or_default();
-                                    if secret_val.is_empty() {
-                                        return Err(
-                                            "received empty secret value from elicit response"
-                                                .to_string(),
-                                        );
-                                    }
-                                    secret_store
-                                        .set(&request.key, &secret_val)
-                                        .map_err(|e| format!("failed to persist secret: {e}"))?;
-
-                                    // Secret: SDK expects {"ok": true}
-                                    serde_json::to_string(&serde_json::json!({"ok": true}))
-                                        .map_err(|e| format!("failed to serialize response: {e}"))?
-                                },
-                                "array" => {
-                                    // Array: SDK expects {"values": [...]}
-                                    let vals = values.clone().unwrap_or_default();
-                                    serde_json::to_string(&serde_json::json!({"values": vals}))
-                                        .map_err(|e| format!("failed to serialize response: {e}"))?
-                                },
-                                _ => {
-                                    // Text/Select: SDK expects {"value": "..."}
-                                    let val = value.clone().unwrap_or_default();
-                                    serde_json::to_string(&serde_json::json!({"value": val}))
-                                        .map_err(|e| format!("failed to serialize response: {e}"))?
-                                },
-                            }
-                        },
-                        _ => {
-                            return Err(
-                                "unexpected IPC payload type in elicit response".to_string()
-                            );
-                        },
-                    }
-                } else {
-                    return Err("unexpected event type in elicit response".to_string());
+                        match request.kind {
+                            ElicitType::Secret => {
+                                // Persist the secret via the SecretStore
+                                // abstraction. OS keychain when available,
+                                // file fallback otherwise. The value is NOT
+                                // returned to the guest — the WIT contract
+                                // is `secret-stored`, signaling the secret
+                                // exists in the host store.
+                                let secret_val = value.clone().unwrap_or_default();
+                                if secret_val.is_empty() {
+                                    return Err(ErrorCode::InvalidInput);
+                                }
+                                secret_store
+                                    .set(&request.key, &secret_val)
+                                    .map_err(|_| ErrorCode::StoreUnavailable)?;
+                                ElicitResponse::SecretStored
+                            },
+                            ElicitType::Array => {
+                                ElicitResponse::Values(values.clone().unwrap_or_default())
+                            },
+                            ElicitType::Text | ElicitType::Select => {
+                                ElicitResponse::Value(value.clone().unwrap_or_default())
+                            },
+                        }
+                    },
+                    _ => {
+                        return Err(ErrorCode::Unknown(
+                            "unexpected IPC payload type in elicit response".to_string(),
+                        ));
+                    },
                 }
             },
             None => {
-                // Timeout expired, capsule unloading (cancellation), or channel closed.
-                return Err(
-                    "elicit request timed out, was cancelled, or response channel closed"
-                        .to_string(),
-                );
+                // Timeout / cancellation / closed channel.
+                return Err(ErrorCode::Timeout);
             },
         };
 
-        Ok(response_json)
+        Ok(response)
     }
 
     /// Host function: `has_secret(key) -> bool`
     ///
     /// Checks whether a secret key has been stored for this capsule.
-    /// Uses the [`SecretStore`] abstraction (OS keychain with KV fallback).
-    fn has_secret(&mut self, key: String) -> Result<bool, String> {
+    fn has_secret(&mut self, key: String) -> Result<bool, ErrorCode> {
         self.effective_secret_store()
             .exists(&key)
-            .map_err(|e| format!("failed to check for secret: {e}"))
+            .map_err(|_| ErrorCode::StoreUnavailable)
     }
 }
 
@@ -214,14 +199,14 @@ mod tests {
     use super::*;
 
     fn make_elicit_request(
-        kind: &str,
+        kind: ElicitType,
         key: &str,
         description: &str,
         options: Option<Vec<String>>,
         default: Option<String>,
     ) -> ElicitRequest {
         ElicitRequest {
-            elicit_type: kind.to_string(),
+            kind,
             key: key.to_string(),
             description: description.to_string(),
             options,
@@ -232,7 +217,7 @@ mod tests {
     #[test]
     fn map_text_request() {
         let req = make_elicit_request(
-            "text",
+            ElicitType::Text,
             "api_url",
             "Enter API URL",
             None,
@@ -247,7 +232,13 @@ mod tests {
 
     #[test]
     fn map_secret_request() {
-        let req = make_elicit_request("secret", "api_key", "Enter your API key", None, None);
+        let req = make_elicit_request(
+            ElicitType::Secret,
+            "api_key",
+            "Enter your API key",
+            None,
+            None,
+        );
         let field = map_to_onboarding_field(&req).unwrap();
         assert_eq!(field.field_type, OnboardingFieldType::Secret);
     }
@@ -255,7 +246,7 @@ mod tests {
     #[test]
     fn map_select_request() {
         let req = make_elicit_request(
-            "select",
+            ElicitType::Select,
             "network",
             "Choose network",
             Some(vec!["mainnet".into(), "testnet".into()]),
@@ -270,35 +261,32 @@ mod tests {
 
     #[test]
     fn map_select_request_empty_options_fails() {
-        let req = make_elicit_request("select", "network", "", Some(vec![]), None);
-        let err = map_to_onboarding_field(&req).unwrap_err();
-        assert!(err.contains("non-empty options"));
+        let req = make_elicit_request(ElicitType::Select, "network", "", Some(vec![]), None);
+        assert!(matches!(
+            map_to_onboarding_field(&req),
+            Err(ErrorCode::InvalidInput)
+        ));
     }
 
     #[test]
     fn map_select_request_no_options_fails() {
-        let req = make_elicit_request("select", "network", "", None, None);
-        let err = map_to_onboarding_field(&req).unwrap_err();
-        assert!(err.contains("non-empty options"));
+        let req = make_elicit_request(ElicitType::Select, "network", "", None, None);
+        assert!(matches!(
+            map_to_onboarding_field(&req),
+            Err(ErrorCode::InvalidInput)
+        ));
     }
 
     #[test]
     fn map_array_request() {
-        let req = make_elicit_request("array", "relays", "Enter relay URLs", None, None);
+        let req = make_elicit_request(ElicitType::Array, "relays", "Enter relay URLs", None, None);
         let field = map_to_onboarding_field(&req).unwrap();
         assert_eq!(field.field_type, OnboardingFieldType::Array);
     }
 
     #[test]
-    fn map_unknown_type_fails() {
-        let req = make_elicit_request("checkbox", "foo", "", None, None);
-        let err = map_to_onboarding_field(&req).unwrap_err();
-        assert!(err.contains("unknown elicit type"));
-    }
-
-    #[test]
     fn map_text_uses_key_as_prompt_when_no_description() {
-        let req = make_elicit_request("text", "my_setting", "", None, None);
+        let req = make_elicit_request(ElicitType::Text, "my_setting", "", None, None);
         let field = map_to_onboarding_field(&req).unwrap();
         assert_eq!(field.prompt, "my_setting");
         assert!(field.description.is_none());
@@ -316,7 +304,7 @@ mod tests {
 mod secret_chain_tests {
     use std::sync::Arc;
 
-    use crate::engine::wasm::bindings::astrid::capsule::elicit::Host as ElicitHost;
+    use crate::engine::wasm::bindings::astrid::elicit::host::Host as ElicitHost;
     use crate::engine::wasm::host_state::HostState;
     use crate::engine::wasm::test_fixtures::{mem_secret_store, minimal_host_state};
     use astrid_storage::secret::SecretStore;

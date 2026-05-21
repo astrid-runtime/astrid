@@ -154,8 +154,10 @@ pub struct WasmEngine {
     /// run loop task and invoke_interceptor can both access it (though never
     /// concurrently for run-loop capsules — those use IPC auto-subscribe).
     store: Option<Arc<Mutex<Store<HostState>>>>,
-    /// The instantiated guest component with typed export accessors.
-    instance: Option<bindings::Capsule>,
+    /// The instantiated guest component. Per-export typed accessors are
+    /// looked up at call time via `instance.get_typed_func` since the
+    /// per-domain WIT split removed the bundled `Capsule` world.
+    instance: Option<wasmtime::component::Instance>,
     inbound_rx: Option<tokio::sync::mpsc::Receiver<astrid_core::InboundMessage>>,
     run_handle: Option<tokio::task::JoinHandle<()>>,
     /// Receiver for the readiness signal from the run loop.
@@ -786,18 +788,22 @@ impl ExecutionEngine for WasmEngine {
                     ))
                 })?;
 
-                // Wire all 11 Astrid host interfaces from the WIT world.
-                bindings::Capsule::add_to_linker::<
+                // Wire all 12 Astrid host interfaces from the new per-domain WIT.
+                // The synthetic `Kernel` world imports every host package, so
+                // a single `add_to_linker` call registers them all.
+                bindings::Kernel::add_to_linker::<
                     HostState,
                     wasmtime::component::HasSelf<HostState>,
                 >(&mut linker, |state| state)
                 .map_err(|e| {
                     CapsuleError::UnsupportedEntryPoint(format!(
-                        "Failed to add Capsule host to linker: {e}"
+                        "Failed to add Astrid host to linker: {e}"
                     ))
                 })?;
 
-                // Compile and instantiate the WASM component.
+                // Compile and instantiate the WASM component. The new ABI no
+                // longer ships a bundled world, so we instantiate directly via
+                // the linker and look up exports by name at invocation time.
                 let wasm_component =
                     Component::from_binary(&wt_engine, &wasm_bytes).map_err(|e| {
                         CapsuleError::UnsupportedEntryPoint(format!(
@@ -805,7 +811,8 @@ impl ExecutionEngine for WasmEngine {
                         ))
                     })?;
 
-                let instance = bindings::Capsule::instantiate(&mut store, &wasm_component, &linker)
+                let instance = linker
+                    .instantiate(&mut store, &wasm_component)
                     .map_err(|e| {
                         CapsuleError::UnsupportedEntryPoint(format!(
                             "Failed to instantiate WASM component: {e}"
@@ -987,7 +994,10 @@ impl ExecutionEngine for WasmEngine {
                             return;
                         },
                     };
-                    if let Err(e) = run_instance.call_run(&mut *s) {
+                    let call_result = run_instance
+                        .get_typed_func::<(), ()>(&mut *s, "run")
+                        .and_then(|f| f.call(&mut *s, ()));
+                    if let Err(e) = call_result {
                         tracing::error!(capsule = %capsule_name, error = %e, "WASM background loop failed");
                     }
                 });
@@ -1271,14 +1281,27 @@ impl ExecutionEngine for WasmEngine {
             }
         }
 
-        // Call the typed Component Model export. The action name and payload
-        // are passed as separate typed parameters (no JSON envelope needed).
+        // Call the typed Component Model export by name. With the per-export
+        // guest world split, `astrid-hook-trigger` only exists on capsules
+        // that actually implement it — the typed-func lookup returns
+        // `UnsupportedEntryPoint` for capsules that don't.
+        type HookTriggerResult = bindings::astrid::guest::lifecycle::CapsuleResult;
         let result = tokio::task::block_in_place(|| {
             let mut s = store
                 .lock()
                 .map_err(|e| CapsuleError::WasmError(format!("store lock poisoned: {e}")))?;
-            instance
-                .call_astrid_hook_trigger(&mut *s, action, payload)
+            let func = instance
+                .get_typed_func::<(String, Vec<u8>), (HookTriggerResult,)>(
+                    &mut *s,
+                    "astrid-hook-trigger",
+                )
+                .map_err(|e| {
+                    CapsuleError::UnsupportedEntryPoint(format!(
+                        "capsule does not export `astrid-hook-trigger`: {e}"
+                    ))
+                })?;
+            func.call(&mut *s, (action.to_string(), payload.to_vec()))
+                .map(|(cr,)| cr)
                 .map_err(|e| CapsuleError::WasmError(format!("astrid_hook_trigger failed: {e:?}")))
         });
 
@@ -1475,13 +1498,13 @@ pub fn run_lifecycle(
             "Failed to add WASI to linker for lifecycle: {e}"
         ))
     })?;
-    bindings::Capsule::add_to_linker::<HostState, wasmtime::component::HasSelf<HostState>>(
+    bindings::Kernel::add_to_linker::<HostState, wasmtime::component::HasSelf<HostState>>(
         &mut linker,
         |state| state,
     )
     .map_err(|e| {
         CapsuleError::UnsupportedEntryPoint(format!(
-            "Failed to add Capsule host to linker for lifecycle: {e}"
+            "Failed to add Astrid host to linker for lifecycle: {e}"
         ))
     })?;
 
@@ -1491,8 +1514,9 @@ pub fn run_lifecycle(
         ))
     })?;
 
-    let instance =
-        bindings::Capsule::instantiate(&mut store, &wasm_component, &linker).map_err(|e| {
+    let instance = linker
+        .instantiate(&mut store, &wasm_component)
+        .map_err(|e| {
             CapsuleError::UnsupportedEntryPoint(format!(
                 "Failed to instantiate WASM component for lifecycle: {e}"
             ))
@@ -1505,18 +1529,22 @@ pub fn run_lifecycle(
         "Running lifecycle hook"
     );
 
-    // Call the lifecycle export.
-    // Note: Component Model lifecycle exports take no arguments (unlike Extism
-    // which passed previous_version as a string). The previous_version can be
-    // made available via config or a dedicated host function if needed.
-    match phase {
-        LifecyclePhase::Install => instance.call_astrid_install(&mut store).map_err(|e| {
-            CapsuleError::ExecutionFailed(format!("lifecycle hook {export_name} failed: {e}"))
-        })?,
-        LifecyclePhase::Upgrade => instance.call_astrid_upgrade(&mut store).map_err(|e| {
-            CapsuleError::ExecutionFailed(format!("lifecycle hook {export_name} failed: {e}"))
-        })?,
-    }
+    // Call the lifecycle export by name. With per-export guest worlds the
+    // export is only present in the wasm binary if the capsule actually
+    // implements it; missing exports surface as a clear "not implemented"
+    // error rather than a toolchain stub trap.
+    let export_fn = export_name; // "astrid-install" or "astrid-upgrade"
+    let func = instance
+        .get_typed_func::<(), ()>(&mut store, export_fn)
+        .map_err(|_| {
+            CapsuleError::UnsupportedEntryPoint(format!(
+                "capsule does not export lifecycle hook `{export_fn}`"
+            ))
+        })?;
+    func.call(&mut store, ()).map_err(|e| {
+        CapsuleError::ExecutionFailed(format!("lifecycle hook {export_fn} failed: {e}"))
+    })?;
+    let _ = phase; // export_fn already encodes the phase
 
     // Epoch ticker guard drops automatically (RAII).
 

@@ -1,50 +1,49 @@
-use crate::engine::wasm::bindings::astrid::capsule::sys;
-use crate::engine::wasm::bindings::astrid::capsule::types::{
-    CallerContext, CapabilityCheckRequest, CapabilityCheckResponse, LogLevel,
+//! `astrid:sys@1.0.0` host implementation.
+//!
+//! `trigger_hook` was removed from the kernel ABI when the
+//! `astrid:capsule@0.1.0` world was split into per-domain packages —
+//! capsule-to-capsule fan-out lives on the IPC bus
+//! (`astrid-bus:hook@1.0.0`), not as a sys host call. Capsules that
+//! need to dispatch hooks now publish `hook.trigger.v1` and aggregate
+//! responses via subscriptions.
+
+use crate::engine::wasm::bindings::astrid::sys::host::{
+    self as sys, CallerContext, CapabilityCheckRequest, CapabilityCheckResponse, ErrorCode,
+    LogLevel,
 };
 use crate::engine::wasm::host::util;
 use crate::engine::wasm::host_state::HostState;
 
-/// Trigger request sent by WASM capsules via `hooks::trigger`.
-#[derive(serde::Deserialize)]
-struct TriggerRequest {
-    /// The hook/interceptor topic to fan out (e.g. `before_tool_call`).
-    hook: String,
-    /// Opaque JSON payload forwarded to each matching interceptor.
-    payload: serde_json::Value,
-}
+/// Cap on a single `random-bytes` request, per the WIT contract.
+const RANDOM_BYTES_CAP: u64 = 4096;
+
+/// Cap on a single `sleep-ns` request (60 seconds in nanoseconds).
+const SLEEP_NS_CAP: u64 = 60_000_000_000;
 
 impl sys::Host for HostState {
-    fn get_config(&mut self, key: String) -> Result<String, String> {
-        // Manifest-declared secrets route through the OS keychain
-        // (`astrid_storage::KeychainSecretStore`) at invocation time,
-        // never through `self.config`. This keeps plaintext secret
-        // material off disk and out of long-lived host memory.
+    fn get_config(&mut self, key: String) -> Result<Option<String>, ErrorCode> {
+        // Manifest-declared secrets route through the file-per-secret
+        // store at invocation time, never through `self.config`. This
+        // keeps plaintext secret material off disk and out of long-lived
+        // host memory.
         //
-        // Lookup precedence: per-invocation principal first, then
-        // host-wide fall-through. Scope is operator-decided at
-        // `astrid secret set --scope` time (not a manifest
-        // declaration), so the kernel-side read path always tries
-        // both slots — whichever slot the operator populated is
-        // what gets used.
+        // Lookup precedence: per-invocation principal first, then host-
+        // wide fall-through. Scope is operator-decided at
+        // `astrid secret set --scope` time (not a manifest declaration),
+        // so the kernel-side read path always tries both slots.
         if self.secret_env.contains(&key) {
-            return Ok(resolve_secret(self, &key));
+            let value = resolve_secret(self, &key);
+            return Ok(if value.is_empty() { None } else { Some(value) });
         }
 
-        let value = self.config.get(&key).cloned();
-
-        // Return the raw string value, not JSON-encoded.
-        // serde_json::to_string wraps strings in quotes ("\"value\""),
-        // causing double-encoding when the SDK's env::var reads it.
-        let result = match value {
-            Some(serde_json::Value::String(s)) => s,
-            Some(v) => serde_json::to_string(&v).unwrap_or_default(),
-            None => String::new(),
-        };
-        Ok(result)
+        match self.config.get(&key) {
+            None => Ok(None),
+            Some(serde_json::Value::String(s)) => Ok(Some(s.clone())),
+            Some(v) => Ok(Some(serde_json::to_string(v).unwrap_or_default())),
+        }
     }
 
-    fn get_caller(&mut self) -> Result<CallerContext, String> {
+    fn get_caller(&mut self) -> Result<CallerContext, ErrorCode> {
         if let Some(ref msg) = self.caller_context {
             Ok(CallerContext {
                 principal: msg.principal.clone(),
@@ -60,138 +59,8 @@ impl sys::Host for HostState {
         }
     }
 
-    fn trigger_hook(&mut self, request_json: String) -> Result<String, String> {
-        let caller_id = self.capsule_id.clone();
-        let registry = self.capsule_registry.clone();
-        let rt_handle = self.runtime_handle.clone();
-        let host_semaphore = self.host_semaphore.clone();
-
-        let result_str = if let Some(registry) = registry {
-            // Deserialize the trigger request from the WASM guest.
-            let request: TriggerRequest = serde_json::from_str(&request_json)
-                .map_err(|e| format!("invalid trigger request: {e}"))?;
-
-            let payload_bytes = serde_json::to_vec(&request.payload).unwrap_or_default();
-
-            // Fan out: find all capsules with interceptors matching the hook topic,
-            // invoke each (skipping the caller to prevent infinite recursion),
-            // and collect their responses.
-            //
-            // Step 1: Collect matching capsules under the registry read lock.
-            let matches: Vec<(std::sync::Arc<dyn crate::capsule::Capsule>, String)> =
-                util::bounded_block_on(&rt_handle, &host_semaphore, async {
-                    let registry = registry.read().await;
-                    let mut matches = Vec::new();
-
-                    for capsule_id in registry.list() {
-                        // Skip the calling capsule to prevent recursion.
-                        if *capsule_id == caller_id {
-                            continue;
-                        }
-                        if let Some(capsule) = registry.get(capsule_id) {
-                            if !matches!(capsule.state(), crate::capsule::CapsuleState::Ready) {
-                                continue;
-                            }
-                            // RFC cargo-like-manifest: read effective interceptors
-                            // — [subscribe].handler entries merged with legacy
-                            // [[interceptor]] blocks — so new-format capsules can
-                            // service trigger_hook dispatch without legacy fallback.
-                            for interceptor in capsule.manifest().effective_interceptors() {
-                                if crate::topic::topic_matches(&request.hook, &interceptor.event) {
-                                    matches.push((
-                                        std::sync::Arc::clone(&capsule),
-                                        interceptor.action,
-                                    ));
-                                }
-                            }
-                        }
-                    }
-                    matches
-                });
-
-            // Step 2: Dispatch each interceptor via spawned tasks and collect
-            // results.
-            let responses: Vec<serde_json::Value> =
-                util::bounded_block_on(&rt_handle, &host_semaphore, async {
-                    let mut join_set = tokio::task::JoinSet::new();
-
-                    for (capsule, action) in matches {
-                        let payload = payload_bytes.clone();
-                        let hook = request.hook.clone();
-                        join_set.spawn(async move {
-                            match capsule.invoke_interceptor(&action, &payload, None) {
-                                Ok(crate::capsule::InterceptResult::Continue(bytes))
-                                    if bytes.is_empty() =>
-                                {
-                                    None
-                                },
-                                Ok(
-                                    crate::capsule::InterceptResult::Continue(bytes)
-                                    | crate::capsule::InterceptResult::Final(bytes),
-                                ) => match serde_json::from_slice::<serde_json::Value>(&bytes) {
-                                    Ok(val) => Some(val),
-                                    Err(_) => {
-                                        tracing::warn!(
-                                            capsule_id = %capsule.id(),
-                                            action = %action,
-                                            "interceptor returned non-JSON response, skipping"
-                                        );
-                                        None
-                                    },
-                                },
-                                Ok(crate::capsule::InterceptResult::Deny { reason }) => {
-                                    tracing::warn!(
-                                        capsule_id = %capsule.id(),
-                                        action = %action,
-                                        hook = %hook,
-                                        reason = %reason,
-                                        "interceptor denied during hook trigger"
-                                    );
-                                    None
-                                },
-                                Err(e) => {
-                                    tracing::warn!(
-                                        capsule_id = %capsule.id(),
-                                        action = %action,
-                                        hook = %hook,
-                                        error = %e,
-                                        "interceptor invocation failed during hook trigger"
-                                    );
-                                    None
-                                },
-                            }
-                        });
-                    }
-
-                    let mut responses = Vec::new();
-                    while let Some(result) = join_set.join_next().await {
-                        if let Ok(Some(val)) = result {
-                            responses.push(val);
-                        }
-                    }
-                    responses
-                });
-
-            match serde_json::to_string(&responses) {
-                Ok(s) => s,
-                Err(e) => {
-                    tracing::warn!(error = %e, "failed to serialize hook responses");
-                    "[]".to_string()
-                },
-            }
-        } else {
-            // No registry available — return empty array (no subscribers).
-            "[]".to_string()
-        };
-
-        Ok(result_str)
-    }
-
     fn log(&mut self, level: LogLevel, message: String) {
         let capsule_id = self.capsule_id.as_str().to_owned();
-        // Routes to the invoking principal's log when `invoke_interceptor`
-        // installed one (cross-principal invocation), otherwise to the
-        // capsule owner's load-time log, otherwise to the tracing subscriber.
         let log_file = self.effective_capsule_log().cloned();
 
         let level_str = match level {
@@ -205,9 +74,6 @@ impl sys::Host for HostState {
             .duration_since(std::time::UNIX_EPOCH)
             .map_or_else(|_| "0".to_string(), |d| format!("{:.3}", d.as_secs_f64()));
 
-        // Try the per-capsule log file first. If it's not available, or the
-        // mutex is poisoned (panic in a prior log writer), emit a warning and
-        // fall back to the tracing subscriber so the message still lands.
         let wrote_to_file = if let Some(log_file) = log_file {
             use std::io::Write;
             match log_file.lock() {
@@ -242,10 +108,7 @@ impl sys::Host for HostState {
     fn signal_ready(&mut self) {
         if let Some(tx) = &self.ready_tx {
             let _ = tx.send(true);
-            tracing::debug!(
-                capsule = %self.capsule_id,
-                "Capsule signaled ready"
-            );
+            tracing::debug!(capsule = %self.capsule_id, "Capsule signaled ready");
         }
     }
 
@@ -255,52 +118,76 @@ impl sys::Host for HostState {
             .map_or(0u64, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
     }
 
+    fn clock_monotonic_ns(&mut self) -> u64 {
+        // Use std::time::Instant via a process-anchor stored in HostState
+        // (initialised at first call so the absolute value monotonically
+        // increases from then on; differences are what matters).
+        use std::sync::OnceLock;
+        use std::time::Instant;
+        static ANCHOR: OnceLock<Instant> = OnceLock::new();
+        let anchor = *ANCHOR.get_or_init(Instant::now);
+        u64::try_from(anchor.elapsed().as_nanos()).unwrap_or(u64::MAX)
+    }
+
+    fn sleep_ns(&mut self, duration_ns: u64) -> Result<(), ErrorCode> {
+        if duration_ns > SLEEP_NS_CAP {
+            return Err(ErrorCode::TooLarge);
+        }
+        let cancel = self.cancel_token.clone();
+        let rt = self.runtime_handle.clone();
+        let sem = self.host_semaphore.clone();
+        let duration = std::time::Duration::from_nanos(duration_ns);
+        let cancelled = util::bounded_block_on(&rt, &sem, async move {
+            tokio::select! {
+                () = tokio::time::sleep(duration) => false,
+                () = cancel.cancelled() => true,
+            }
+        });
+        if cancelled {
+            Err(ErrorCode::Cancelled)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn random_bytes(&mut self, length: u64) -> Result<Vec<u8>, ErrorCode> {
+        if length > RANDOM_BYTES_CAP {
+            return Err(ErrorCode::TooLarge);
+        }
+        let len = usize::try_from(length).map_err(|_| ErrorCode::TooLarge)?;
+        use rand::RngCore;
+        let mut buf = vec![0u8; len];
+        rand::thread_rng().fill_bytes(&mut buf);
+        Ok(buf)
+    }
+
     fn check_capsule_capability(
         &mut self,
         request: CapabilityCheckRequest,
-    ) -> Result<CapabilityCheckResponse, String> {
+    ) -> Result<CapabilityCheckResponse, ErrorCode> {
         let registry = self.capsule_registry.clone();
         let rt_handle = self.runtime_handle.clone();
         let host_semaphore = self.host_semaphore.clone();
 
-        let allowed = if let Some(registry) = registry {
-            if let Ok(source_uuid) = uuid::Uuid::parse_str(&request.source_uuid) {
-                util::bounded_block_on(&rt_handle, &host_semaphore, async {
-                    let reg = registry.read().await;
-                    let Some(capsule_id) = reg.find_by_uuid(&source_uuid) else {
-                        tracing::debug!(
-                            uuid = %source_uuid,
-                            capability = %request.capability,
-                            "UUID not found in registry, denying capability"
-                        );
-                        return false;
-                    };
-                    let Some(capsule) = reg.get(capsule_id) else {
-                        return false;
-                    };
-                    match request.capability.as_str() {
-                        "allow_prompt_injection" => {
-                            capsule.manifest().capabilities.allow_prompt_injection
-                        },
-                        other => {
-                            tracing::warn!(
-                                capability = %other,
-                                "Unknown capability requested, denying"
-                            );
-                            false
-                        },
-                    }
-                })
-            } else {
-                tracing::debug!(
-                    uuid = %request.source_uuid,
-                    "Malformed UUID in capability check, denying"
-                );
-                false
-            }
-        } else {
-            false
+        let registry = registry.ok_or(ErrorCode::RegistryUnavailable)?;
+        let Ok(source_uuid) = uuid::Uuid::parse_str(&request.source_uuid) else {
+            // Fail-closed per the WIT contract.
+            return Ok(CapabilityCheckResponse { allowed: false });
         };
+
+        let allowed = util::bounded_block_on(&rt_handle, &host_semaphore, async {
+            let reg = registry.read().await;
+            let Some(capsule_id) = reg.find_by_uuid(&source_uuid) else {
+                return false;
+            };
+            let Some(capsule) = reg.get(capsule_id) else {
+                return false;
+            };
+            match request.capability.as_str() {
+                "allow_prompt_injection" => capsule.manifest().capabilities.allow_prompt_injection,
+                _ => false,
+            }
+        });
 
         Ok(CapabilityCheckResponse { allowed })
     }
@@ -308,41 +195,17 @@ impl sys::Host for HostState {
 
 /// Resolve a secret-typed env value through the file-per-secret store.
 ///
-/// Precedence (fixed — operator-controlled where the value lives,
-/// kernel just follows the lookup chain):
-/// 1. **Per-agent** — file at
-///    `~/.astrid/secrets/<effective_principal>/<capsule>/<key>`,
-///    backed by [`astrid_storage::FileSecretStore`]. Tried first so an
-///    agent's explicit override always wins over the host-wide value.
-/// 2. **Host-wide** — file at
-///    `~/.astrid/secrets/__host__/<capsule>/<key>`. Consulted on
-///    per-agent miss so an operator who set `--scope shared` makes the
-///    value visible to every agent that hasn't set their own override.
+/// Precedence (operator-controlled at `astrid secret set --scope` time;
+/// the kernel just follows the chain):
 ///
-/// The capsule manifest does NOT declare scope — it only marks the
-/// key as `type = "secret"`. The operator decides per-agent vs
-/// host-wide at `astrid secret set --scope` time. This prevents a
-/// third-party capsule from declaring its own credentials shared
-/// (privilege escalation: bot tokens, OAuth bindings, etc.).
-///
-/// Returns `String::new()` on miss so the guest-side `env::var`
-/// reader sees the same empty-string-on-absent semantic that the
-/// `config` path produces. I/O errors from the file store are
-/// logged (`security_event = true`) and treated as miss — the
-/// capsule continues with no value rather than panicking the
-/// invocation, matching how an unset env-var would normally fail
-/// downstream within the capsule's own logic.
+/// 1. **Per-agent** — `~/.astrid/secrets/<effective_principal>/<capsule>/<key>`.
+/// 2. **Host-wide** — `~/.astrid/secrets/__host__/<capsule>/<key>`.
 fn resolve_secret(state: &HostState, key: &str) -> String {
     use astrid_storage::{FileSecretStore, SecretStore};
 
     let capsule = state.capsule_id.as_str();
     let principal = state.effective_principal();
 
-    // The CLI write path lays secrets at
-    // `~/.astrid/secrets/<scope>/<capsule>/<key>`. The kernel resolves
-    // the same `AstridHome` to find the file root, then probes per-
-    // agent first and falls through to the shared `__host__` slot —
-    // mirroring the keychain precedence the pivot replaced.
     let Ok(home) = astrid_core::dirs::AstridHome::resolve() else {
         tracing::warn!(
             security_event = true,
@@ -383,22 +246,14 @@ fn resolve_secret(state: &HostState, key: &str) -> String {
     String::new()
 }
 
-// ---------------------------------------------------------------------------
-// Chain tests: drive `sys::Host::log` synchronously on a HostState with
-// manually-installed invocation fields, assert physical log file lives under
-// the invoking principal's dir. Mirrors the pattern established in
-// `host/fs.rs` for per-invocation VFS re-scoping (#549).
-// ---------------------------------------------------------------------------
 #[cfg(test)]
 mod log_chain_tests {
     use std::sync::Arc;
 
     use super::*;
-    use crate::engine::wasm::bindings::astrid::capsule::sys::Host as SysHost;
+    use crate::engine::wasm::bindings::astrid::sys::host::Host as SysHost;
     use crate::engine::wasm::test_fixtures::{minimal_host_state, open_log};
 
-    /// Drive `log()` on a minimal HostState — no security gate, no VFS
-    /// mounts, only the fields `log()` consults.
     fn make_host_state() -> crate::engine::wasm::host_state::HostState {
         minimal_host_state(tokio::runtime::Handle::current())
     }
@@ -420,10 +275,7 @@ mod log_chain_tests {
         let alice_contents = std::fs::read_to_string(&alice_log_path).unwrap();
         let owner_contents = std::fs::read_to_string(&owner_log_path).unwrap();
         assert!(alice_contents.contains("hello from alice"));
-        assert!(
-            !owner_contents.contains("hello from alice"),
-            "owner log must not receive cross-principal write"
-        );
+        assert!(!owner_contents.contains("hello from alice"));
     }
 
     #[tokio::test]
@@ -444,8 +296,6 @@ mod log_chain_tests {
 
     #[tokio::test]
     async fn log_isolates_writes_across_sequential_invocations() {
-        // Same HostState, invocation log swapped between calls — each call's
-        // writes land in the file installed for that call.
         let tmp = tempfile::tempdir().unwrap();
         let alice_path = tmp.path().join("alice.log");
         let bob_path = tmp.path().join("bob.log");
@@ -468,15 +318,10 @@ mod log_chain_tests {
 
     #[tokio::test]
     async fn log_survives_poisoned_mutex_without_dropping_message() {
-        // If a prior writer panicked holding the log mutex, subsequent writes
-        // must not silently vanish — they fall back to the tracing subscriber
-        // after a warning. Asserted by exercising the non-panicking fallback
-        // path: a poisoned lock must not cause `log()` itself to panic.
         let tmp = tempfile::tempdir().unwrap();
         let log_path = tmp.path().join("poisoned.log");
         let log_file = open_log(&log_path);
 
-        // Poison the mutex by panicking inside a `lock()`.
         let poisoner = Arc::clone(&log_file);
         let _ = std::thread::spawn(move || {
             let _guard = poisoner.lock().unwrap();
@@ -488,7 +333,6 @@ mod log_chain_tests {
         let mut state = make_host_state();
         state.capsule_log = Some(log_file);
 
-        // Must not panic; must not silently drop (it warns and tracing-fallbacks).
         state.log(LogLevel::Error, "post-poison line".into());
     }
 }

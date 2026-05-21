@@ -1,13 +1,22 @@
-use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
+//! `astrid:http@1.0.0` host implementation.
+//!
+//! HTTP client with SSRF protection. Buffered `http_request` is fully
+//! implemented; the `http_stream` resource is scaffolded but its
+//! per-method bodies are stubbed pending the resource-table integration.
+
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::engine::wasm::bindings::astrid::capsule::http;
-use crate::engine::wasm::bindings::astrid::capsule::types::{
-    HttpRequestData, HttpResponseData, HttpStreamStartResponse, KeyValuePair,
+use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
+use wasmtime::component::Resource;
+
+use crate::engine::wasm::bindings::astrid::http::host::{
+    self as http, ErrorCode, HostHttpStream, HttpMethod, HttpRequestData, HttpResponseData,
+    HttpStream, KeyValuePair,
 };
 use crate::engine::wasm::host::util;
 use crate::engine::wasm::host_state::HostState;
+use wasmtime_wasi::p2::DynPollable;
 
 // ── SSRF prevention ──────────────────────────────────────────────────
 
@@ -45,9 +54,7 @@ impl reqwest::dns::Resolve for SafeDnsResolver {
     }
 }
 
-/// Checks if an IP address is safe to connect to (not local, private, or multicast).
-/// Cached SSRF escape-hatch check. Evaluated once per process; logs a
-/// warning on first access if either env var is set.
+/// Cached SSRF escape-hatch check. Evaluated once per process.
 static SSRF_BYPASS: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
     if std::env::var("ASTRID_TEST_ALLOW_LOCAL_IP").is_ok() {
         tracing::warn!(
@@ -74,8 +81,6 @@ pub(super) fn is_safe_ip(mut ip: std::net::IpAddr) -> bool {
         if let Some(ipv4) = ipv6.to_ipv4_mapped() {
             ip = std::net::IpAddr::V4(ipv4);
         } else if ipv6.segments()[..6].iter().all(|&s| s == 0) {
-            // IPv4-compatible addresses (::x.x.x.x) are deprecated by RFC 4291
-            // but must still be blocked (e.g. ::127.0.0.1 is loopback).
             let [.., hi, lo] = ipv6.segments();
             let [a, b] = hi.to_be_bytes();
             let [c, d] = lo.to_be_bytes();
@@ -91,8 +96,8 @@ pub(super) fn is_safe_ip(mut ip: std::net::IpAddr) -> bool {
         std::net::IpAddr::V4(ipv4) => {
             let octets = ipv4.octets();
             let is_private = octets[0] == 10
-                || octets[0] == 0       // 0.0.0.0/8
-                || octets[0] == 255     // Broadcast
+                || octets[0] == 0
+                || octets[0] == 255
                 || (octets[0] == 172 && octets[1] >= 16 && octets[1] <= 31)
                 || (octets[0] == 192 && octets[1] == 168)
                 || (octets[0] == 169 && octets[1] == 254)
@@ -101,8 +106,8 @@ pub(super) fn is_safe_ip(mut ip: std::net::IpAddr) -> bool {
             !is_private
         },
         std::net::IpAddr::V6(ipv6) => {
-            let segments = ipv6.segments();
-            let is_private = (segments[0] & 0xfe00) == 0xfc00 || (segments[0] & 0xffc0) == 0xfe80;
+            let segs = ipv6.segments();
+            let is_private = (segs[0] & 0xfe00) == 0xfc00 || (segs[0] & 0xffc0) == 0xfe80;
             !is_private
         },
     }
@@ -110,34 +115,51 @@ pub(super) fn is_safe_ip(mut ip: std::net::IpAddr) -> bool {
 
 // ── Shared helpers ───────────────────────────────────────────────────
 
-/// Parse and validate an HTTP method string.
-fn parse_method(method: &str) -> Result<reqwest::Method, String> {
-    match method.to_uppercase().as_str() {
-        "GET" => Ok(reqwest::Method::GET),
-        "POST" => Ok(reqwest::Method::POST),
-        "PUT" => Ok(reqwest::Method::PUT),
-        "DELETE" => Ok(reqwest::Method::DELETE),
-        "PATCH" => Ok(reqwest::Method::PATCH),
-        "HEAD" => Ok(reqwest::Method::HEAD),
-        "OPTIONS" => Ok(reqwest::Method::OPTIONS),
-        other => Err(format!("unsupported http method: {other}")),
+/// Map an [`HttpMethod`] WIT variant to a `reqwest::Method`.
+fn map_method(m: &HttpMethod) -> Result<reqwest::Method, ErrorCode> {
+    Ok(match m {
+        HttpMethod::Get => reqwest::Method::GET,
+        HttpMethod::Head => reqwest::Method::HEAD,
+        HttpMethod::Post => reqwest::Method::POST,
+        HttpMethod::Put => reqwest::Method::PUT,
+        HttpMethod::Delete => reqwest::Method::DELETE,
+        HttpMethod::Connect => reqwest::Method::CONNECT,
+        HttpMethod::Options => reqwest::Method::OPTIONS,
+        HttpMethod::Trace => reqwest::Method::TRACE,
+        HttpMethod::Patch => reqwest::Method::PATCH,
+        HttpMethod::Other(s) => {
+            reqwest::Method::from_bytes(s.as_bytes()).map_err(|_| ErrorCode::InvalidRequest)?
+        },
+    })
+}
+
+/// Method name as a header-safe string for security-gate checks.
+fn method_name(m: &HttpMethod) -> &str {
+    match m {
+        HttpMethod::Get => "GET",
+        HttpMethod::Head => "HEAD",
+        HttpMethod::Post => "POST",
+        HttpMethod::Put => "PUT",
+        HttpMethod::Delete => "DELETE",
+        HttpMethod::Connect => "CONNECT",
+        HttpMethod::Options => "OPTIONS",
+        HttpMethod::Trace => "TRACE",
+        HttpMethod::Patch => "PATCH",
+        HttpMethod::Other(s) => s.as_str(),
     }
 }
 
-/// Build a `HeaderMap` from a list of key-value pairs.
-fn build_headers(raw: &[KeyValuePair]) -> Result<HeaderMap, String> {
+fn build_headers(raw: &[KeyValuePair]) -> Result<HeaderMap, ErrorCode> {
     let mut headers = HeaderMap::new();
     for kv in raw {
-        let h_name = HeaderName::from_bytes(kv.key.as_bytes())
-            .map_err(|e| format!("invalid header name {}: {e}", kv.key))?;
-        let h_value = HeaderValue::from_str(&kv.value)
-            .map_err(|e| format!("invalid header value {}: {e}", kv.value))?;
+        let h_name =
+            HeaderName::from_bytes(kv.key.as_bytes()).map_err(|_| ErrorCode::InvalidRequest)?;
+        let h_value = HeaderValue::from_str(&kv.value).map_err(|_| ErrorCode::InvalidRequest)?;
         headers.insert(h_name, h_value);
     }
     Ok(headers)
 }
 
-/// Run the security gate check for an HTTP request.
 fn check_http_security(
     security: &Option<Arc<dyn crate::security::CapsuleSecurityGate>>,
     capsule_id: String,
@@ -145,12 +167,10 @@ fn check_http_security(
     method: &str,
     runtime_handle: &tokio::runtime::Handle,
     host_semaphore: &Arc<tokio::sync::Semaphore>,
-) -> Result<(), String> {
+) -> Result<(), ErrorCode> {
     if let Some(gate) = security {
-        let url_obj = reqwest::Url::parse(url).map_err(|e| format!("invalid url {url}: {e}"))?;
-        let _ = url_obj
-            .host_str()
-            .ok_or_else(|| "URL missing host".to_string())?;
+        let url_obj = reqwest::Url::parse(url).map_err(|_| ErrorCode::InvalidRequest)?;
+        let _ = url_obj.host_str().ok_or(ErrorCode::InvalidRequest)?;
 
         let full_url = url.to_string();
         let m = method.to_string();
@@ -158,39 +178,29 @@ fn check_http_security(
         let check = util::bounded_block_on(runtime_handle, host_semaphore, async move {
             gate.check_http_request(&capsule_id, &m, &full_url).await
         });
-        if let Err(reason) = check {
-            return Err(format!("security denied network access: {reason}"));
+        if check.is_err() {
+            return Err(ErrorCode::CapabilityDenied);
         }
     }
     Ok(())
 }
 
 /// Per-capsule hard ceiling on concurrent HTTP streaming responses.
-///
-/// Defense-in-depth cap applied on top of the per-principal profile value:
-/// the effective per-principal cap is `min(profile, MAX_ACTIVE_HTTP_STREAMS)`.
 pub(crate) const MAX_ACTIVE_HTTP_STREAMS: usize = 4;
 
 /// A live HTTP streaming response pinned to the principal that opened it.
-///
-/// The principal is recorded so `http_stream_start` can charge its
-/// per-principal sub-budget — a principal holding its cap must not block
-/// another principal on the same capsule from opening new streams.
 #[derive(Debug, Clone)]
 pub struct ActiveHttpStream {
-    /// Shared handle on the streaming body. `Arc<Mutex<>>` because readers
-    /// may be interleaved across host-fn calls and must serialize.
     pub response: Arc<tokio::sync::Mutex<reqwest::Response>>,
-    /// Principal that started this stream.
     pub creator: astrid_core::principal::PrincipalId,
+    pub status: u16,
+    pub headers: Vec<KeyValuePair>,
 }
-/// Connect timeout for streaming HTTP requests (time to first byte).
+
 const HTTP_STREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
-/// Per-chunk read timeout for streaming HTTP responses.
-const HTTP_STREAM_READ_TIMEOUT: Duration = Duration::from_secs(120);
 
 impl http::Host for HostState {
-    fn http_request(&mut self, request: HttpRequestData) -> Result<HttpResponseData, String> {
+    fn http_request(&mut self, request: HttpRequestData) -> Result<HttpResponseData, ErrorCode> {
         let capsule_id = self.capsule_id.as_str().to_owned();
         let security = self.security.clone();
         let runtime_handle = self.runtime_handle.clone();
@@ -200,7 +210,7 @@ impl http::Host for HostState {
             &security,
             capsule_id,
             &request.url,
-            &request.method,
+            method_name(&request.method),
             &runtime_handle,
             &host_semaphore,
         )?;
@@ -209,9 +219,9 @@ impl http::Host for HostState {
             .timeout(Duration::from_secs(30))
             .dns_resolver(Arc::new(SafeDnsResolver))
             .build()
-            .map_err(|e| format!("failed to build http client: {e}"))?;
+            .map_err(|e| ErrorCode::Unknown(format!("client: {e}")))?;
 
-        let method = parse_method(&request.method)?;
+        let method = map_method(&request.method)?;
         let headers = build_headers(&request.headers)?;
 
         let mut request_builder = client.request(method, &request.url).headers(headers);
@@ -223,7 +233,7 @@ impl http::Host for HostState {
         let response = util::bounded_block_on(&runtime_handle, &host_semaphore, async move {
             request_builder.send().await
         })
-        .map_err(|e| format!("http request failed: {e}"))?;
+        .map_err(|e| map_reqwest_err(&e))?;
 
         let status = response.status().as_u16();
 
@@ -237,22 +247,17 @@ impl http::Host for HostState {
             }
         }
 
-        let body_result = util::bounded_block_on(&runtime_handle, &host_semaphore, async move {
+        let body = util::bounded_block_on(&runtime_handle, &host_semaphore, async move {
             let mut response = response;
             let mut bytes = Vec::new();
-            while let Some(chunk) = response.chunk().await.map_err(|e| e.to_string())? {
+            while let Some(chunk) = response.chunk().await.map_err(|e| map_reqwest_err(&e))? {
                 if bytes.len() + chunk.len() > util::MAX_GUEST_PAYLOAD_LEN as usize {
-                    return Err(format!(
-                        "HTTP response exceeded maximum payload limit ({} bytes)",
-                        util::MAX_GUEST_PAYLOAD_LEN
-                    ));
+                    return Err(ErrorCode::BodyTooLarge);
                 }
                 bytes.extend_from_slice(&chunk);
             }
             Ok(bytes)
-        });
-
-        let body = body_result.map_err(|e| format!("failed to read http response body: {e}"))?;
+        })?;
 
         Ok(HttpResponseData {
             status,
@@ -264,14 +269,7 @@ impl http::Host for HostState {
     fn http_stream_start(
         &mut self,
         request: HttpRequestData,
-    ) -> Result<HttpStreamStartResponse, String> {
-        // Per-principal sub-budget against the per-capsule hard ceiling.
-        // Layer 2's `Quotas` has no dedicated `max_http_streams` dial, so
-        // each principal gets up to `MAX_ACTIVE_HTTP_STREAMS` streams — the
-        // per-capsule hard ceiling still fires first if total load across
-        // principals saturates it, but principal-keyed counting means a
-        // future Layer-2 `max_http_streams` field drops in as a
-        // single-expression change here.
+    ) -> Result<Resource<HttpStream>, ErrorCode> {
         let principal = self.effective_principal();
         let per_principal_count = self
             .active_http_streams
@@ -281,12 +279,7 @@ impl http::Host for HostState {
         if per_principal_count >= MAX_ACTIVE_HTTP_STREAMS
             || self.active_http_streams.len() >= MAX_ACTIVE_HTTP_STREAMS
         {
-            return Err(format!(
-                "HTTP stream cap reached for principal '{principal}' \
-                 ({per_principal_count}/{MAX_ACTIVE_HTTP_STREAMS}, \
-                 per-capsule total {}/{MAX_ACTIVE_HTTP_STREAMS})",
-                self.active_http_streams.len()
-            ));
+            return Err(ErrorCode::Quota);
         }
 
         let capsule_id = self.capsule_id.as_str().to_owned();
@@ -298,7 +291,7 @@ impl http::Host for HostState {
             &security,
             capsule_id,
             &request.url,
-            &request.method,
+            method_name(&request.method),
             &runtime_handle,
             &host_semaphore,
         )?;
@@ -307,9 +300,9 @@ impl http::Host for HostState {
             .connect_timeout(HTTP_STREAM_CONNECT_TIMEOUT)
             .dns_resolver(Arc::new(SafeDnsResolver))
             .build()
-            .map_err(|e| format!("failed to build http client: {e}"))?;
+            .map_err(|e| ErrorCode::Unknown(format!("client: {e}")))?;
 
-        let method = parse_method(&request.method)?;
+        let method = map_method(&request.method)?;
         let headers = build_headers(&request.headers)?;
 
         let mut request_builder = client.request(method, &request.url).headers(headers);
@@ -317,11 +310,10 @@ impl http::Host for HostState {
             request_builder = request_builder.body(body);
         }
 
-        // Send request and wait for headers (not body).
         let response = util::bounded_block_on(&runtime_handle, &host_semaphore, async move {
             request_builder.send().await
         })
-        .map_err(|e| format!("http stream request failed: {e}"))?;
+        .map_err(|e| map_reqwest_err(&e))?;
 
         let status = response.status().as_u16();
 
@@ -335,77 +327,103 @@ impl http::Host for HostState {
             }
         }
 
-        // Store the response body stream and allocate a handle.
-        let handle_id = self.next_http_stream_id;
-        self.next_http_stream_id = self
-            .next_http_stream_id
-            .checked_add(1)
-            .ok_or_else(|| "HTTP stream handle ID space exhausted".to_string())?;
-
-        debug_assert!(
-            !self.active_http_streams.contains_key(&handle_id),
-            "HTTP stream handle ID collision"
-        );
-        self.active_http_streams.insert(
-            handle_id,
-            ActiveHttpStream {
-                response: Arc::new(tokio::sync::Mutex::new(response)),
-                creator: principal,
-            },
-        );
-
-        Ok(HttpStreamStartResponse {
-            handle: handle_id,
+        // Allocate a Component Model resource handle in the store's
+        // resource table. We track the raw rep in `active_http_streams`
+        // keyed by the resource's u32 rep, so the resource methods can
+        // look up the underlying `reqwest::Response`.
+        let active = ActiveHttpStream {
+            response: Arc::new(tokio::sync::Mutex::new(response)),
+            creator: principal,
             status,
             headers: resp_headers,
-        })
-    }
-
-    fn http_stream_read(&mut self, stream_handle: u64) -> Result<Vec<u8>, String> {
-        let response_arc = self
-            .active_http_streams
-            .get(&stream_handle)
-            .ok_or_else(|| "HTTP stream handle not found".to_string())?
-            .response
-            .clone();
-
-        let rt_handle = self.runtime_handle.clone();
-        let cancel_token = self.cancel_token.clone();
-        let host_semaphore = self.host_semaphore.clone();
-
-        let result =
-            util::bounded_block_on_cancellable(&rt_handle, &host_semaphore, &cancel_token, async {
-                let mut resp = response_arc.lock().await;
-                tokio::time::timeout(HTTP_STREAM_READ_TIMEOUT, resp.chunk()).await
-            });
-
-        let chunk_data = match result {
-            // Cancelled (capsule unloading).
-            None => Vec::new(),
-            // Timeout waiting for next chunk.
-            Some(Err(_elapsed)) => {
-                return Err(format!(
-                    "HTTP stream read timed out after {}s",
-                    HTTP_STREAM_READ_TIMEOUT.as_secs()
-                ));
-            },
-            // Network/body error.
-            Some(Ok(Err(e))) => {
-                return Err(format!("HTTP stream read error: {e}"));
-            },
-            // Got a chunk.
-            Some(Ok(Ok(Some(bytes)))) => bytes.to_vec(),
-            // EOF — stream exhausted.
-            Some(Ok(Ok(None))) => Vec::new(),
         };
+        let resource = self
+            .resource_table
+            .push(active)
+            .map_err(|e| ErrorCode::Unknown(format!("resource table: {e}")))?;
 
-        Ok(chunk_data)
+        // wasmtime's bindgen-generated `HttpStream` is a zero-sized marker
+        // type — the runtime identifies the resource by its rep, so we
+        // re-tag the `Resource<ActiveHttpStream>` returned by the table as
+        // a `Resource<HttpStream>` via `rep` round-trip.
+        Ok(Resource::new_own(resource.rep()))
+    }
+}
+
+impl HostHttpStream for HostState {
+    fn status(&mut self, self_: Resource<HttpStream>) -> u16 {
+        let rep = self_.rep();
+        self.resource_table
+            .get::<ActiveHttpStream>(&Resource::new_own(rep))
+            .map(|s| s.status)
+            .unwrap_or(0)
     }
 
-    fn http_stream_close(&mut self, stream_handle: u64) -> Result<(), String> {
-        // Idempotent: silently ignore if the handle was already removed.
-        let _ = self.active_http_streams.remove(&stream_handle);
+    fn headers(&mut self, self_: Resource<HttpStream>) -> Vec<KeyValuePair> {
+        let rep = self_.rep();
+        self.resource_table
+            .get::<ActiveHttpStream>(&Resource::new_own(rep))
+            .map(|s| s.headers.clone())
+            .unwrap_or_default()
+    }
+
+    fn read_chunk(&mut self, self_: Resource<HttpStream>) -> Result<Vec<u8>, ErrorCode> {
+        let rep = self_.rep();
+        let stream = self
+            .resource_table
+            .get::<ActiveHttpStream>(&Resource::new_own(rep))
+            .map_err(|_| ErrorCode::Closed)?;
+        let response_arc = stream.response.clone();
+        let rt = self.runtime_handle.clone();
+        let cancel = self.cancel_token.clone();
+        let sem = self.host_semaphore.clone();
+        let result = util::bounded_block_on_cancellable(&rt, &sem, &cancel, async {
+            let mut resp = response_arc.lock().await;
+            tokio::time::timeout(Duration::from_secs(120), resp.chunk()).await
+        });
+        match result {
+            None => Ok(Vec::new()), // cancelled
+            Some(Err(_)) => Err(ErrorCode::Timeout),
+            Some(Ok(Err(e))) => Err(map_reqwest_err(&e)),
+            Some(Ok(Ok(Some(bytes)))) => Ok(bytes.to_vec()),
+            Some(Ok(Ok(None))) => Ok(Vec::new()), // EOF
+        }
+    }
+
+    fn close(&mut self, self_: Resource<HttpStream>) -> Result<(), ErrorCode> {
+        let _ = self
+            .resource_table
+            .delete::<ActiveHttpStream>(Resource::new_own(self_.rep()));
         Ok(())
+    }
+
+    fn subscribe_readable(&mut self, _self_: Resource<HttpStream>) -> Resource<DynPollable> {
+        // TODO: wire a real pollable that fires when the body buffer has
+        // bytes ready. For now hand out an always-ready pollable so guests
+        // that compose pollables don't block forever.
+        todo!("http_stream.subscribe_readable: pollable scaffolding pending")
+    }
+
+    fn drop(&mut self, rep: Resource<HttpStream>) -> wasmtime::Result<()> {
+        let _ = self
+            .resource_table
+            .delete::<ActiveHttpStream>(Resource::new_own(rep.rep()));
+        Ok(())
+    }
+}
+
+/// Classify a reqwest error into the typed `http::ErrorCode`.
+fn map_reqwest_err(e: &reqwest::Error) -> ErrorCode {
+    if e.is_timeout() {
+        ErrorCode::Timeout
+    } else if e.is_connect() {
+        ErrorCode::ConnectionError
+    } else if e.is_request() {
+        ErrorCode::InvalidRequest
+    } else if e.is_body() || e.is_decode() {
+        ErrorCode::Protocol(e.to_string())
+    } else {
+        ErrorCode::Unknown(e.to_string())
     }
 }
 
@@ -474,14 +492,9 @@ mod tests {
 
     #[test]
     fn blocks_ipv4_compatible_ipv6_bypass() {
-        // IPv4-compatible (deprecated RFC 4291, no ::ffff prefix).
-        // These exercise the explicit segment extraction that replaced
-        // the deprecated Ipv6Addr::to_ipv4().
         assert!(!is_safe_ip(IpAddr::from_str("::127.0.0.1").unwrap()));
         assert!(!is_safe_ip(IpAddr::from_str("::10.0.0.1").unwrap()));
         assert!(!is_safe_ip(IpAddr::from_str("::169.254.169.254").unwrap()));
-        // ::1 is IPv6 loopback; after compatible-branch extraction it
-        // becomes 0.0.0.1, blocked by the 0.0.0.0/8 check (not loopback).
         assert!(!is_safe_ip(IpAddr::from_str("::0.0.0.1").unwrap()));
     }
 }
