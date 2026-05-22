@@ -9,6 +9,10 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
 
 ## [Unreleased]
 
+### Added
+
+- **`astrid:fs/host.fs-mkdir-all`** — unstubbed. Idempotent recursive directory creation via the existing VFS `mkdir` call (every VFS impl already routes through `std::fs::create_dir_all` under the hood). Capability gating, audit envelope (`astrid:fs/host.fs-mkdir-all`), and error mapping match `fs-mkdir`. Unblocks capsule code that wants the `std::fs::create_dir_all`-style idempotent variant instead of the strict `fs-mkdir`. (Closes one item of #753.)
+
 ### Fixed
 
 - **Per-domain WIT review fixups (PR #752).** A multi-agent review surfaced fixes addressed in-branch before merge:

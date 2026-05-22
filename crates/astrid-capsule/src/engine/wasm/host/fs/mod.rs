@@ -202,10 +202,31 @@ impl fs::Host for HostState {
         result
     }
 
-    fn fs_mkdir_all(&mut self, _path: String) -> Result<(), ErrorCode> {
-        Err(ErrorCode::Unknown(
-            "fs-mkdir-all: recursive create port pending".to_string(),
-        ))
+    fn fs_mkdir_all(&mut self, path: String) -> Result<(), ErrorCode> {
+        // Same VFS call as `fs_mkdir` — every VFS impl already routes
+        // through the host's `std::fs::create_dir_all`, so the
+        // recursive semantics are already there. The WIT contract
+        // distinguishes the two only by whether the call is idempotent
+        // (`fs-mkdir-all`) or strict (`fs-mkdir`): see
+        // `wit/host/fs@1.0.0.wit`. Tightening `fs-mkdir` to non-
+        // recursive is a separate behaviour change; this commit only
+        // unstubs the idempotent variant the capsule contract
+        // promises.
+        let resolved = resolve_path(self, &path).map_err(map_resolve_err)?;
+        gate_write(self, &resolved.physical)?;
+        let vfs_path = resolve_vfs(self, &resolved).map_err(map_resolve_err)?;
+        let result = util::bounded_block_on(&self.runtime_handle, &self.host_semaphore, async {
+            vfs_path
+                .vfs
+                .mkdir(
+                    &vfs_path.handle,
+                    vfs_path.relative.to_string_lossy().as_ref(),
+                )
+                .await
+        })
+        .map_err(map_vfs_err);
+        audit_fs(self, "astrid:fs/host.fs-mkdir-all", &path, &result);
+        result
     }
 
     fn fs_readdir(&mut self, path: String) -> Result<Vec<String>, ErrorCode> {
