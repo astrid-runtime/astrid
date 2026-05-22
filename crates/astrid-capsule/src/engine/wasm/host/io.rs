@@ -25,10 +25,13 @@ use crate::engine::wasm::host_state::HostState;
 
 /// Hard cap on the number of pollables in a single `poll` call.
 ///
-/// Defense-in-depth on top of the per-principal profile quota — the
-/// profile dial may raise this for trusted capsules but never beyond
-/// the hard ceiling here.
-const MAX_POLL_LIST: usize = 64;
+/// Matches the WIT contract (`astrid:io/poll@1.0.0`). The cap is sized
+/// so a capsule at its full IPC subscription quota (128) plus its TCP /
+/// UDP / HTTP / process stream pollables can wait on them all in one
+/// call. Defense-in-depth on top of the per-principal profile quota —
+/// the profile dial may lower the effective cap for less-trusted
+/// capsules but never raise it above this hard ceiling.
+const MAX_POLL_LIST: usize = 256;
 
 /// Map a wasmtime error from the underlying wasmtime-wasi-io machinery
 /// into our typed `astrid:io/poll` error.
