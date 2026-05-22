@@ -329,6 +329,23 @@ pub struct HostState {
     /// registers/unregisters PIDs; the listener calls `cancel_all()` when a
     /// `tool.v1.request.cancel` event arrives.
     pub process_tracker: Arc<ProcessTracker>,
+    /// Live count of `NetStream` entries currently in the resource table.
+    /// Maintained alongside `ResourceTable` insertions / drops so the
+    /// `MAX_ACTIVE_STREAMS` gate is O(1) instead of iterating every
+    /// resource (the table may hold hundreds of pollables / errors /
+    /// http handles unrelated to net). Single-threaded: wasmtime
+    /// stores are owned by exactly one OS thread.
+    pub net_stream_count: usize,
+    /// Live count of `SubscriptionEntry` entries. Same rationale as
+    /// `net_stream_count`.
+    pub subscription_count: usize,
+    /// Live count of `ManagedProcess` entries — overall.
+    pub process_count_total: usize,
+    /// Per-creator-principal count of `ManagedProcess` entries. The
+    /// process-spawn gate needs to enforce per-principal sub-budgets
+    /// without iterating the whole resource table.
+    pub process_count_by_principal:
+        std::collections::HashMap<astrid_core::principal::PrincipalId, usize>,
 }
 
 impl wasmtime_wasi::WasiView for HostState {

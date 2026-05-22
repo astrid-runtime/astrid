@@ -187,15 +187,6 @@ fn audit_ipc<T, E: std::fmt::Debug>(
     }
 }
 
-/// Count live `SubscriptionEntry` records in the resource table.
-fn count_subscriptions(table: &mut wasmtime::component::ResourceTable) -> usize {
-    let empty: std::collections::BTreeMap<u32, ()> = std::collections::BTreeMap::new();
-    table
-        .iter_entries(empty)
-        .filter(|(entry, _)| entry.as_ref().is_ok_and(|e| e.is::<SubscriptionEntry>()))
-        .count()
-}
-
 /// Check whether `topic_pattern` is allowed by the capsule's
 /// `ipc_subscribe` ACL.
 fn check_subscribe_acl(state: &HostState, topic_pattern: &str) -> Result<(), ErrorCode> {
@@ -339,7 +330,7 @@ impl ipc::Host for HostState {
 
         check_subscribe_acl(self, &topic_pattern)?;
 
-        if count_subscriptions(&mut self.resource_table) >= MAX_SUBSCRIPTIONS {
+        if self.subscription_count >= MAX_SUBSCRIPTIONS {
             return Err(ErrorCode::Quota);
         }
 
@@ -352,6 +343,7 @@ impl ipc::Host for HostState {
             .resource_table
             .push(entry)
             .map_err(|e| ErrorCode::Unknown(format!("resource table: {e}")))?;
+        self.subscription_count += 1;
         let result: Result<Resource<Subscription>, ErrorCode> = Ok(Resource::new_own(res.rep()));
         audit_ipc(
             self,
@@ -503,9 +495,13 @@ impl HostSubscription for HostState {
     }
 
     fn drop(&mut self, rep: Resource<Subscription>) -> wasmtime::Result<()> {
-        let _ = self
+        if self
             .resource_table
-            .delete::<SubscriptionEntry>(Resource::new_own(rep.rep()));
+            .delete::<SubscriptionEntry>(Resource::new_own(rep.rep()))
+            .is_ok()
+        {
+            self.subscription_count = self.subscription_count.saturating_sub(1);
+        }
         Ok(())
     }
 }

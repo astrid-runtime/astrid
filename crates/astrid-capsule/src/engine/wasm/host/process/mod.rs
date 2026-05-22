@@ -73,28 +73,6 @@ fn audit_process<T, E: std::fmt::Debug>(
     }
 }
 
-/// Count live `ManagedProcess` entries in the resource table, filtered
-/// by `creator` principal for per-principal sub-budgets.
-fn count_processes(
-    table: &mut wasmtime::component::ResourceTable,
-    creator: &astrid_core::principal::PrincipalId,
-) -> (usize, usize) {
-    let empty: std::collections::BTreeMap<u32, ()> = std::collections::BTreeMap::new();
-    let mut total = 0usize;
-    let mut by_principal = 0usize;
-    for (entry, _) in table.iter_entries(empty) {
-        if let Ok(e) = entry
-            && let Some(mp) = e.downcast_ref::<ManagedProcess>()
-        {
-            total += 1;
-            if &mp.creator == creator {
-                by_principal += 1;
-            }
-        }
-    }
-    (total, by_principal)
-}
-
 /// Extract the call_id from the caller's IPC context if it carried a
 /// `ToolExecuteRequest` payload.
 fn extract_call_id(state: &HostState) -> Option<String> {
@@ -208,8 +186,12 @@ impl process::Host for HostState {
         let profile_cap = usize::try_from(self.effective_profile().quotas.max_background_processes)
             .unwrap_or(MAX_BACKGROUND_PROCESSES);
         let effective_cap = profile_cap.min(MAX_BACKGROUND_PROCESSES);
-        let (total, by_principal) = count_processes(&mut self.resource_table, &principal);
-        if by_principal >= effective_cap || total >= MAX_BACKGROUND_PROCESSES {
+        let by_principal = self
+            .process_count_by_principal
+            .get(&principal)
+            .copied()
+            .unwrap_or(0);
+        if by_principal >= effective_cap || self.process_count_total >= MAX_BACKGROUND_PROCESSES {
             return Err(ErrorCode::Quota);
         }
 
@@ -278,6 +260,11 @@ impl process::Host for HostState {
             .resource_table
             .push(managed)
             .map_err(|e| ErrorCode::Unknown(format!("resource table: {e}")))?;
+        self.process_count_total += 1;
+        *self
+            .process_count_by_principal
+            .entry(principal)
+            .or_insert(0) += 1;
         let result: Result<Resource<ProcessHandle>, ErrorCode> = Ok(Resource::new_own(res.rep()));
         audit_process(
             self,

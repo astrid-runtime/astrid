@@ -49,8 +49,10 @@ mod unix_listener;
 use stream::CONNECT_TIMEOUT;
 
 /// Maximum concurrent socket connections per capsule. Defense-in-depth
-/// cap on top of the per-principal profile quota. Counted by walking the
-/// resource table — see [`count_net_streams`].
+/// cap on top of the per-principal profile quota. Tracked via
+/// [`HostState::net_stream_count`], bumped on every successful
+/// `accept` / `connect-tcp` push and decremented in the resource
+/// drop path.
 pub(super) const MAX_ACTIVE_STREAMS: usize = 8;
 
 /// Stamp marking a resource slot in the table as a `UnixListener` handle.
@@ -67,15 +69,6 @@ pub(super) struct TcpListenerSlot;
 /// Stamp marking a resource slot as a `UdpSocket`. Same reason as above.
 #[allow(dead_code)]
 pub(super) struct UdpSocketSlot;
-
-/// Count the number of live `NetStream` entries in the resource table.
-pub(super) fn count_net_streams(table: &mut wasmtime::component::ResourceTable) -> usize {
-    let empty: std::collections::BTreeMap<u32, ()> = std::collections::BTreeMap::new();
-    table
-        .iter_entries(empty)
-        .filter(|(entry, _)| entry.as_ref().is_ok_and(|e| e.is::<NetStream>()))
-        .count()
-}
 
 /// DNS hostname guards before reaching the resolver.
 pub(super) fn validate_host(host: &str) -> Result<(), ErrorCode> {
@@ -248,7 +241,7 @@ impl net::Host for HostState {
             }
         }
 
-        if count_net_streams(&mut self.resource_table) >= MAX_ACTIVE_STREAMS {
+        if self.net_stream_count >= MAX_ACTIVE_STREAMS {
             return Err(ErrorCode::Quota);
         }
 
@@ -287,7 +280,7 @@ impl net::Host for HostState {
             None => return Err(ErrorCode::Closed),
         };
 
-        if count_net_streams(&mut self.resource_table) >= MAX_ACTIVE_STREAMS {
+        if self.net_stream_count >= MAX_ACTIVE_STREAMS {
             drop(stream);
             return Err(ErrorCode::Quota);
         }
@@ -301,6 +294,7 @@ impl net::Host for HostState {
             .resource_table
             .push(net_stream)
             .map_err(|e| ErrorCode::Unknown(format!("resource table: {e}")))?;
+        self.net_stream_count += 1;
         let result: Result<Resource<TcpStream>, ErrorCode> = Ok(Resource::new_own(res.rep()));
         audit_net(self, "astrid:net/host.connect-tcp", 0, &result);
         result

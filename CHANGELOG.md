@@ -22,6 +22,10 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
   - `unix_listener::accept` retries credential-rejected connections with a 100ms back-off to avoid a CPU-pinned spin against a hostile peer.
   - `http-stream` per-chunk timeout extracted to `HTTP_STREAM_READ_TIMEOUT` named constant.
   - Build script now invalidates the WIT staging dir on `.gitmodules` changes so CI runners that lazily `git submodule update` don't compile against a stale tree.
+- **Per-domain WIT review fixups round 2 (Gemini, PR #752).**
+  - `MAX_ACTIVE_STREAMS` / `MAX_SUBSCRIPTIONS` / `MAX_BACKGROUND_PROCESSES` quota gates now read O(1) counter fields on `HostState` (`net_stream_count`, `subscription_count`, `process_count_total`, `process_count_by_principal`) instead of walking the entire `ResourceTable`. Each successful resource insert bumps the counter; the matching `drop` impl decrements. Per-principal sub-budgets for `spawn-background` use a `HashMap<PrincipalId, usize>` keyed on the creator. Single-threaded: wasmtime stores are owned by exactly one OS thread.
+  - CI workflows (`ci.yml`) now check out the `wit/` submodule recursively so `astrid-capsule`'s build script can stage the per-domain WIT packages. Previously every job that touched the build (`check`, `clippy`, `test`, `msrv`) panicked with `read wit/host: No such file or directory`.
+  - Note: `kv_cas` atomicity gap (`get` → `set` not atomic across capsules) remains a known TODO. The fix requires plumbing a `compare_and_swap` primitive through `KvStore` / `ScopedKvStore` in `astrid-storage`, which is out of scope for the WIT split PR. Tracking issue to follow.
 
 ### Added
 

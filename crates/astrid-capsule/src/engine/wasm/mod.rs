@@ -753,6 +753,10 @@ impl ExecutionEngine for WasmEngine {
                     allowance_store: ctx.allowance_store.clone(),
                     identity_store: ctx.identity_store.clone(),
                     process_tracker: process_tracker.clone(),
+                    net_stream_count: 0,
+                    subscription_count: 0,
+                    process_count_total: 0,
+                    process_count_by_principal: std::collections::HashMap::new(),
                 };
 
                 // Pre-scan WASM exports to detect run() before instantiation.
@@ -1486,6 +1490,10 @@ pub fn run_lifecycle(
         allowance_store: None,
         identity_store: None,
         process_tracker: Arc::new(host::process::ProcessTracker::new()),
+        net_stream_count: 0,
+        subscription_count: 0,
+        process_count_total: 0,
+        process_count_by_principal: std::collections::HashMap::new(),
     };
 
     // Build wasmtime engine and store for lifecycle execution.
@@ -1738,8 +1746,10 @@ mod tests {
 
     #[test]
     fn check_principal_enabled_rejects_disabled_profile() {
-        let mut profile = astrid_core::profile::PrincipalProfile::default();
-        profile.enabled = false;
+        let profile = astrid_core::profile::PrincipalProfile {
+            enabled: false,
+            ..Default::default()
+        };
         let err = check_principal_enabled(&profile, &pid("bob"), "test-capsule", "do-thing")
             .expect_err("disabled profile must be denied");
         let msg = err.to_string();
@@ -1754,9 +1764,11 @@ mod tests {
         // The Layer 5 preamble denies disabled admins on management
         // requests; Layer 3 must do the same on capsule invocations,
         // regardless of group membership. enabled=false beats admin.
-        let mut profile = astrid_core::profile::PrincipalProfile::default();
-        profile.groups = vec!["admin".to_string()];
-        profile.enabled = false;
+        let profile = astrid_core::profile::PrincipalProfile {
+            groups: vec!["admin".to_string()],
+            enabled: false,
+            ..Default::default()
+        };
         assert!(check_principal_enabled(&profile, &pid("admin_user"), "x", "y").is_err());
     }
 
@@ -2024,7 +2036,7 @@ mod tests {
         // Export section
         let mut exports = ExportSection::new();
         for (i, name) in export_names.iter().enumerate() {
-            exports.export(*name, ExportKind::Func, i as u32);
+            exports.export(name, ExportKind::Func, i as u32);
         }
         module.section(&exports);
 

@@ -388,9 +388,13 @@ impl HostTcpStream for HostState {
     }
 
     fn drop(&mut self, rep: Resource<TcpStream>) -> wasmtime::Result<()> {
-        let _ = self
+        if self
             .resource_table
-            .delete::<NetStream>(Resource::new_own(rep.rep()));
+            .delete::<NetStream>(Resource::new_own(rep.rep()))
+            .is_ok()
+        {
+            self.net_stream_count = self.net_stream_count.saturating_sub(1);
+        }
         Ok(())
     }
 }
@@ -446,7 +450,7 @@ mod tests {
 
     #[test]
     fn write_frame_err_other_maps_to_unknown() {
-        let e = io::Error::new(io::ErrorKind::Other, "weird");
+        let e = io::Error::other("weird");
         assert!(matches!(map_write_frame_err(&e), ErrorCode::Unknown(_)));
     }
 

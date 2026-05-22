@@ -13,10 +13,7 @@ use wasmtime_wasi::p2::DynPollable;
 use super::handshake::validate_handshake;
 #[cfg(unix)]
 use super::handshake::verify_peer_credentials;
-use super::{
-    HostState, MAX_ACTIVE_STREAMS, NetStream, UnixListenerSlot, audit_net, count_net_streams,
-    map_io_err,
-};
+use super::{HostState, MAX_ACTIVE_STREAMS, NetStream, UnixListenerSlot, audit_net, map_io_err};
 use crate::engine::wasm::bindings::astrid::net::host::{
     ErrorCode, HostUnixListener, TcpStream, UnixListener,
 };
@@ -24,7 +21,7 @@ use crate::engine::wasm::host::util;
 
 impl HostUnixListener for HostState {
     fn accept(&mut self, _self_: Resource<UnixListener>) -> Result<Resource<TcpStream>, ErrorCode> {
-        if count_net_streams(&mut self.resource_table) >= MAX_ACTIVE_STREAMS {
+        if self.net_stream_count >= MAX_ACTIVE_STREAMS {
             return Err(ErrorCode::Quota);
         }
 
@@ -99,7 +96,7 @@ impl HostUnixListener for HostState {
             }
         };
 
-        if count_net_streams(&mut self.resource_table) >= MAX_ACTIVE_STREAMS {
+        if self.net_stream_count >= MAX_ACTIVE_STREAMS {
             drop(stream);
             return Err(ErrorCode::Quota);
         }
@@ -109,6 +106,7 @@ impl HostUnixListener for HostState {
             .resource_table
             .push(net_stream)
             .map_err(|e| ErrorCode::Unknown(format!("resource table: {e}")))?;
+        self.net_stream_count += 1;
         let result: Result<Resource<TcpStream>, ErrorCode> = Ok(Resource::new_own(res.rep()));
         audit_net(self, "astrid:net/host.unix-listener.accept", 0, &result);
         result
@@ -125,7 +123,7 @@ impl HostUnixListener for HostState {
         let session_token = self.session_token.clone();
         let host_semaphore = self.host_semaphore.clone();
 
-        if count_net_streams(&mut self.resource_table) >= MAX_ACTIVE_STREAMS {
+        if self.net_stream_count >= MAX_ACTIVE_STREAMS {
             return Ok(None);
         }
 
@@ -177,7 +175,7 @@ impl HostUnixListener for HostState {
             }
         }
 
-        if count_net_streams(&mut self.resource_table) >= MAX_ACTIVE_STREAMS {
+        if self.net_stream_count >= MAX_ACTIVE_STREAMS {
             drop(stream);
             return Ok(None);
         }
@@ -187,6 +185,7 @@ impl HostUnixListener for HostState {
             .resource_table
             .push(net_stream)
             .map_err(|e| ErrorCode::Unknown(format!("resource table: {e}")))?;
+        self.net_stream_count += 1;
         Ok(Some(Resource::new_own(res.rep())))
     }
 

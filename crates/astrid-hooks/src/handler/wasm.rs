@@ -350,6 +350,10 @@ impl WasmHandler {
             process_tracker: Arc::new(
                 astrid_capsule::engine::wasm::host::process::ProcessTracker::new(),
             ),
+            net_stream_count: 0,
+            subscription_count: 0,
+            process_count_total: 0,
+            process_count_by_principal: HashMap::new(),
         })
     }
 }

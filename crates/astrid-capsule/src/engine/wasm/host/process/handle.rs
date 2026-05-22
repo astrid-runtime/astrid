@@ -249,6 +249,13 @@ impl HostProcessHandle for HostState {
             if let Some(child) = managed.child.as_ref() {
                 self.process_tracker.unregister(child.id());
             }
+            self.process_count_total = self.process_count_total.saturating_sub(1);
+            if let Some(count) = self.process_count_by_principal.get_mut(&managed.creator) {
+                *count = count.saturating_sub(1);
+                if *count == 0 {
+                    self.process_count_by_principal.remove(&managed.creator);
+                }
+            }
             // Dropping `managed` here kills and reaps any still-live
             // child via `Drop for ManagedProcess`.
             drop(managed);
