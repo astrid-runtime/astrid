@@ -85,4 +85,23 @@ wasmtime::component::bindgen!({
         "astrid:io/streams@1.0.0.input-stream": wasmtime_wasi::p2::DynInputStream,
         "astrid:io/streams@1.0.0.output-stream": wasmtime_wasi::p2::DynOutputStream,
     },
+    // Lower the `stream-error` variant to wasmtime-wasi-io's runtime
+    // `StreamError` enum (Closed / LastOperationFailed(wasmtime::Error)
+    // / Trap(wasmtime::Error)) instead of the bindgen-generated enum.
+    // This matches what wasi-sync does for its own streams interface
+    // and lets the Astrid Host impl delegate to wasi-sync without a
+    // structural shuffle on every call. The kernel's audit + cancel
+    // envelope wraps the runtime errors transparently.
+    //
+    // `imports: { default: trappable }` is what makes bindgen actually
+    // rewrite the trait signatures to return the trappable type
+    // directly (rather than just generating a `convert_stream_error`
+    // hook). Without it, host impls still return the bindgen-emitted
+    // enum and a separate convert pass runs on each return.
+    trappable_error_type: {
+        "astrid:io/streams.stream-error" => wasmtime_wasi::p2::StreamError,
+    },
+    imports: {
+        "astrid:io/streams": trappable,
+    },
 });
