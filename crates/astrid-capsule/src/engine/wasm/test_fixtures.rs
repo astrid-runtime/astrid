@@ -110,8 +110,6 @@ pub(crate) fn minimal_host_state(rt: tokio::runtime::Handle) -> HostState {
         inbound_tx: None,
         registered_uplinks: Vec::new(),
         cli_socket_listener: None,
-        active_streams: HashMap::new(),
-        next_stream_id: 1,
         active_http_streams: HashMap::new(),
         next_http_stream_id: 1,
         lifecycle_phase: None,

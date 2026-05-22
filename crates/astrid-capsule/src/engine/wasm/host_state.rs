@@ -253,12 +253,6 @@ pub struct HostState {
     pub registered_uplinks: Vec<UplinkDescriptor>,
     /// Optional natively bound unix listener.
     pub cli_socket_listener: Option<Arc<tokio::sync::Mutex<tokio::net::UnixListener>>>,
-    /// Active network streams owned by this capsule (Unix accept + outbound TCP).
-    pub active_streams: std::collections::HashMap<u64, NetStream>,
-    /// Monotonic counter for stream handle IDs (avoids reuse after removal).
-    /// Starts at 1 so that handle ID 0 is never issued — 0 is reserved as a
-    /// sentinel / "no handle" value in the WASM ABI.
-    pub next_stream_id: u64,
     /// Active lifecycle phase, if any. `None` during normal runtime.
     /// Set to `Some(Install)` or `Some(Upgrade)` during lifecycle dispatch.
     /// Gates the `astrid_elicit` host function.

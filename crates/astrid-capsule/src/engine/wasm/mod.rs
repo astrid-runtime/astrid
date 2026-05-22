@@ -708,8 +708,6 @@ impl ExecutionEngine for WasmEngine {
                     } else {
                         ctx.cli_socket_listener.clone()
                     },
-                    active_streams: std::collections::HashMap::new(),
-                    next_stream_id: 1,
                     active_http_streams: std::collections::HashMap::new(),
                     next_http_stream_id: 1,
                     security: Some(security_gate),
@@ -1466,8 +1464,6 @@ pub fn run_lifecycle(
         inbound_tx: None,
         registered_uplinks: Vec::new(),
         cli_socket_listener: None,
-        active_streams: std::collections::HashMap::new(),
-        next_stream_id: 1,
         active_http_streams: std::collections::HashMap::new(),
         next_http_stream_id: 1,
         lifecycle_phase: Some(phase),
