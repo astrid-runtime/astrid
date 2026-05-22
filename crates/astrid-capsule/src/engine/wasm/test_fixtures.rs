@@ -119,8 +119,6 @@ pub(crate) fn minimal_host_state(rt: tokio::runtime::Handle) -> HostState {
         interceptor_handles: Vec::new(),
         allowance_store: None,
         identity_store: None,
-        background_processes: HashMap::new(),
-        next_process_id: 1,
         process_tracker: Arc::new(ProcessTracker::new()),
     }
 }

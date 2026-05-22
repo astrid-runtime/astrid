@@ -303,15 +303,6 @@ pub struct HostState {
     /// Monotonic counter for HTTP stream handle IDs.
     /// Starts at 1 (0 reserved as sentinel).
     pub next_http_stream_id: u64,
-    /// Active background processes managed for this capsule.
-    ///
-    /// Keyed by opaque handle IDs (not OS PIDs). Processes are cleaned up
-    /// via `Drop for ManagedProcess` when removed or when the capsule unloads.
-    pub background_processes: HashMap<u64, crate::engine::wasm::host::process::ManagedProcess>,
-    /// Monotonic counter for background process handle IDs.
-    ///
-    /// Starts at 1 so handle 0 is never issued (reserved as sentinel).
-    pub next_process_id: u64,
     /// Tracks active child process PIDs for cancellation.
     ///
     /// Shared with the cancel listener background task. The spawn host function

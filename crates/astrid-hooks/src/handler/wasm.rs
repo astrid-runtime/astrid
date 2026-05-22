@@ -352,8 +352,6 @@ impl WasmHandler {
             // a kernel-managed security gate which hooks don't have.
             identity_store: None,
             #[allow(clippy::zero_sized_map_values)] // ManagedProcess is a stub pending the process resource port-back
-            background_processes: HashMap::new(),
-            next_process_id: 1,
             process_tracker: Arc::new(
                 astrid_capsule::engine::wasm::host::process::ProcessTracker::new(),
             ),
