@@ -355,7 +355,7 @@ impl HostHttpStream for HostState {
     fn status(&mut self, self_: Resource<HttpStream>) -> u16 {
         let rep = self_.rep();
         self.resource_table
-            .get::<ActiveHttpStream>(&Resource::new_own(rep))
+            .get::<ActiveHttpStream>(&Resource::new_borrow(rep))
             .map(|s| s.status)
             .unwrap_or(0)
     }
@@ -363,7 +363,7 @@ impl HostHttpStream for HostState {
     fn headers(&mut self, self_: Resource<HttpStream>) -> Vec<KeyValuePair> {
         let rep = self_.rep();
         self.resource_table
-            .get::<ActiveHttpStream>(&Resource::new_own(rep))
+            .get::<ActiveHttpStream>(&Resource::new_borrow(rep))
             .map(|s| s.headers.clone())
             .unwrap_or_default()
     }
@@ -372,23 +372,49 @@ impl HostHttpStream for HostState {
         let rep = self_.rep();
         let stream = self
             .resource_table
-            .get::<ActiveHttpStream>(&Resource::new_own(rep))
+            .get::<ActiveHttpStream>(&Resource::new_borrow(rep))
             .map_err(|_| ErrorCode::Closed)?;
         let response_arc = stream.response.clone();
         let rt = self.runtime_handle.clone();
         let cancel = self.cancel_token.clone();
         let sem = self.host_semaphore.clone();
+        let started = std::time::Instant::now();
         let result = util::bounded_block_on_cancellable(&rt, &sem, &cancel, async {
             let mut resp = response_arc.lock().await;
             tokio::time::timeout(Duration::from_secs(120), resp.chunk()).await
         });
-        match result {
+        let bytes_result: Result<Vec<u8>, ErrorCode> = match result {
             None => Ok(Vec::new()), // cancelled
             Some(Err(_)) => Err(ErrorCode::Timeout),
             Some(Ok(Err(e))) => Err(map_reqwest_err(&e)),
             Some(Ok(Ok(Some(bytes)))) => Ok(bytes.to_vec()),
             Some(Ok(Ok(None))) => Ok(Vec::new()), // EOF
+        };
+        let bytes = bytes_result.as_ref().map(|v| v.len() as u64).unwrap_or(0);
+        let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        let capsule_id = self.capsule_id.as_str();
+        let principal = self.effective_principal();
+        match &bytes_result {
+            Ok(_) => tracing::debug!(
+                target: "astrid.audit.http",
+                %capsule_id,
+                %principal,
+                fn = "astrid:http/host.http-stream.read-chunk",
+                bytes,
+                elapsed_ms,
+                "audit",
+            ),
+            Err(e) => tracing::debug!(
+                target: "astrid.audit.http",
+                %capsule_id,
+                %principal,
+                fn = "astrid:http/host.http-stream.read-chunk",
+                error = ?e,
+                elapsed_ms,
+                "audit",
+            ),
         }
+        bytes_result
     }
 
     fn close(&mut self, self_: Resource<HttpStream>) -> Result<(), ErrorCode> {
