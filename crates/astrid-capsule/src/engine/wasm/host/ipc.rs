@@ -13,6 +13,9 @@
 //! against the calling capsule's cancellation token so capsule unload
 //! always wins over a stuck wait.
 
+use std::sync::Arc;
+
+use tokio::sync::Mutex;
 use wasmtime::component::Resource;
 use wasmtime_wasi::p2::DynPollable;
 
@@ -42,10 +45,22 @@ const MAX_SUBSCRIPTIONS: usize = 128;
 const MAX_RECV_TIMEOUT_MS: u64 = 60_000;
 
 /// Storage type for `Resource<Subscription>` entries in the wasmtime
-/// resource table. Wraps an `EventReceiver` plus the subscribed topic
-/// pattern (handy for audit logging).
+/// resource table.
+///
+/// The `EventReceiver` is wrapped in `Arc<Mutex<…>>` so a blocking
+/// `recv` can hold an exclusive borrow on the receiver across the
+/// `bounded_block_on_cancellable` await without keeping the wasmtime
+/// `ResourceTable` borrowed for the duration of the wait. A naive
+/// `get_mut` on the table would force `&mut self.resource_table` to
+/// outlive the await, blocking every other host fn the guest might
+/// want to call from a co-running stream.
+///
+/// Wasmtime stores are single-threaded for the WASM guest, so the
+/// `Mutex` is contention-free in practice — its job is to make the
+/// borrow checker happy across the await boundary, not to coordinate
+/// real concurrent access.
 pub(super) struct SubscriptionEntry {
-    pub(super) receiver: EventReceiver,
+    pub(super) receiver: Arc<Mutex<EventReceiver>>,
     pub(super) topic_pattern: String,
 }
 
@@ -330,7 +345,7 @@ impl ipc::Host for HostState {
 
         let receiver = self.event_bus.subscribe_topic(topic_pattern.clone());
         let entry = SubscriptionEntry {
-            receiver,
+            receiver: Arc::new(Mutex::new(receiver)),
             topic_pattern: topic_pattern.clone(),
         };
         let res = self
@@ -372,10 +387,22 @@ impl HostSubscription for HostState {
         let rep = self_.rep();
         let entry = self
             .resource_table
-            .get_mut::<SubscriptionEntry>(&Resource::new_borrow(rep))
+            .get::<SubscriptionEntry>(&Resource::new_borrow(rep))
             .map_err(|_| ErrorCode::Closed)?;
         let topic_for_audit = entry.topic_pattern.clone();
-        let mut drain = drain_receiver(&mut entry.receiver, MAX_DRAIN_BYTES);
+        let receiver_arc = Arc::clone(&entry.receiver);
+
+        // Drain through the shared lock. `try_lock` is fine — wasmtime
+        // stores are single-threaded so contention is impossible; we
+        // would only hit a blocked lock if someone smuggled an Arc
+        // across a thread boundary, which the kernel never does.
+        let drain = {
+            let mut receiver = receiver_arc
+                .try_lock()
+                .expect("Subscription receiver Arc accessed across threads");
+            drain_receiver(&mut receiver, MAX_DRAIN_BYTES)
+        };
+        let mut drain = drain;
         truncate_to_homogeneous_principal(&mut drain.messages);
 
         match drain.messages.first() {
@@ -403,25 +430,28 @@ impl HostSubscription for HostState {
         let timeout_ms = timeout_ms.min(MAX_RECV_TIMEOUT_MS);
         let rep = self_.rep();
 
-        // Temporarily pull the receiver out of the table so we can hold
-        // it through the blocking call without keeping `&mut self.resource_table`
-        // alive. wasmtime stores are single-threaded; nothing else can
-        // touch this slot mid-recv.
-        let mut entry = self
-            .resource_table
-            .delete::<SubscriptionEntry>(Resource::new_own(rep))
-            .map_err(|_| ErrorCode::Closed)?;
-        let topic_for_audit = entry.topic_pattern.clone();
+        // Borrow the entry to clone its receiver Arc. The resource
+        // stays in the table — the guest's `Resource<Subscription>`
+        // remains valid across repeated `recv` calls.
+        let (receiver_arc, topic_for_audit) = {
+            let entry = self
+                .resource_table
+                .get::<SubscriptionEntry>(&Resource::new_borrow(rep))
+                .map_err(|_| ErrorCode::Closed)?;
+            (Arc::clone(&entry.receiver), entry.topic_pattern.clone())
+        };
 
         let runtime_handle = self.runtime_handle.clone();
         let cancel_token = self.cancel_token.clone();
         let host_semaphore = self.host_semaphore.clone();
-        let receiver = &mut entry.receiver;
+
+        let receiver_for_wait = Arc::clone(&receiver_arc);
         let event = util::bounded_block_on_cancellable(
             &runtime_handle,
             &host_semaphore,
             &cancel_token,
-            async {
+            async move {
+                let mut receiver = receiver_for_wait.lock().await;
                 tokio::time::timeout(
                     std::time::Duration::from_millis(timeout_ms),
                     receiver.recv(),
@@ -433,39 +463,17 @@ impl HostSubscription for HostState {
         )
         .flatten();
 
-        let mut drain = drain_receiver(&mut entry.receiver, MAX_DRAIN_BYTES);
+        let mut drain = {
+            let mut receiver = receiver_arc
+                .try_lock()
+                .expect("Subscription receiver Arc accessed across threads");
+            drain_receiver(&mut receiver, MAX_DRAIN_BYTES)
+        };
 
         if let Some(event) = event
             && let AstridEvent::Ipc { message, .. } = &*event
         {
             drain.messages.insert(0, message.clone());
-        }
-
-        // Re-insert the receiver after draining. During teardown the
-        // capsule is dying, so skip re-insertion — drop releases the
-        // receiver naturally.
-        let cancelled = cancel_token.is_cancelled();
-        if !cancelled {
-            // Push the entry back. The new rep is different from the
-            // original; this is fine — the guest already holds the
-            // original `Resource<Subscription>` which will be re-pushed
-            // implicitly on next access? Actually no — we deleted by
-            // owning, so the guest's handle is now stale. Best fix: do
-            // not delete; instead split the receiver lifecycle.
-            //
-            // For now, recv is a one-shot operation: the resource is
-            // consumed and the guest must subscribe again. This is a
-            // step back from the legacy model but cleaner than tracking
-            // rep stability across delete/push. A follow-up will move
-            // to a borrow-only access path that doesn't disturb the
-            // resource rep.
-            //
-            // To preserve the rep, we'll re-push and then re-tag the
-            // returned handle as the original rep is gone. wasmtime
-            // assigns a fresh rep on push. The guest's stored
-            // `Resource<Subscription>` is invalidated by this recv call
-            // — capsules must re-subscribe.
-            let _ = self.resource_table.push(entry);
         }
 
         truncate_to_homogeneous_principal(&mut drain.messages);
@@ -487,10 +495,11 @@ impl HostSubscription for HostState {
     }
 
     fn subscribe_readiness(&mut self, _self_: Resource<Subscription>) -> Resource<DynPollable> {
-        // Pollable wiring for subscription readiness lands with the
-        // dedicated pollable / stream-halves commit. The receiver's
-        // notify channel will source the pollable's readiness future.
-        todo!("Subscription.subscribe_readiness: pollable wiring pending")
+        // Real pollable wiring (sourced from the receiver's notify
+        // channel) lands with the dedicated pollable commit. Until
+        // then, hand out an always-ready sentinel so guests get a
+        // clean poll-then-recv loop rather than a host panic.
+        super::stubs::always_ready_pollable(&mut self.resource_table)
     }
 
     fn drop(&mut self, rep: Resource<Subscription>) -> wasmtime::Result<()> {
@@ -498,5 +507,74 @@ impl HostSubscription for HostState {
             .resource_table
             .delete::<SubscriptionEntry>(Resource::new_own(rep.rep()));
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Regression tests for the multi-principal recv batching fix.
+    //!
+    //! Background (PR #752 review): a drained batch of subscription
+    //! messages must be truncated at the first publisher-principal
+    //! boundary, otherwise tail messages get stamped with the first
+    //! message's principal context and break attribution.
+    use super::truncate_to_homogeneous_principal;
+    use astrid_events::ipc::{IpcMessage as InternalIpcMessage, IpcPayload};
+    use serde_json::json;
+    use uuid::Uuid;
+
+    fn msg(principal: Option<&str>) -> InternalIpcMessage {
+        let mut m =
+            InternalIpcMessage::new("test.topic", IpcPayload::RawJson(json!({})), Uuid::nil());
+        m.principal = principal.map(String::from);
+        m
+    }
+
+    #[test]
+    fn empty_batch_is_noop() {
+        let mut batch: Vec<InternalIpcMessage> = vec![];
+        truncate_to_homogeneous_principal(&mut batch);
+        assert!(batch.is_empty());
+    }
+
+    #[test]
+    fn homogeneous_batch_is_preserved() {
+        let mut batch = vec![msg(Some("alice")), msg(Some("alice")), msg(Some("alice"))];
+        truncate_to_homogeneous_principal(&mut batch);
+        assert_eq!(batch.len(), 3);
+    }
+
+    #[test]
+    fn mixed_principal_truncates_at_first_boundary() {
+        let mut batch = vec![msg(Some("alice")), msg(Some("alice")), msg(Some("bob"))];
+        truncate_to_homogeneous_principal(&mut batch);
+        assert_eq!(batch.len(), 2);
+        assert_eq!(batch[0].principal.as_deref(), Some("alice"));
+        assert_eq!(batch[1].principal.as_deref(), Some("alice"));
+    }
+
+    #[test]
+    fn system_then_principal_truncates() {
+        let mut batch = vec![msg(None), msg(None), msg(Some("alice"))];
+        truncate_to_homogeneous_principal(&mut batch);
+        assert_eq!(batch.len(), 2);
+        assert!(batch[0].principal.is_none());
+        assert!(batch[1].principal.is_none());
+    }
+
+    #[test]
+    fn principal_then_system_truncates() {
+        let mut batch = vec![msg(Some("alice")), msg(None)];
+        truncate_to_homogeneous_principal(&mut batch);
+        assert_eq!(batch.len(), 1);
+        assert_eq!(batch[0].principal.as_deref(), Some("alice"));
+    }
+
+    #[test]
+    fn boundary_at_index_one_keeps_only_first() {
+        let mut batch = vec![msg(Some("alice")), msg(Some("bob")), msg(Some("alice"))];
+        truncate_to_homogeneous_principal(&mut batch);
+        assert_eq!(batch.len(), 1);
+        assert_eq!(batch[0].principal.as_deref(), Some("alice"));
     }
 }

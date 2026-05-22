@@ -69,7 +69,7 @@ impl HostUdpSocket for HostState {
     }
 
     fn subscribe_readable(&mut self, _self_: Resource<UdpSocket>) -> Resource<DynPollable> {
-        todo!("UdpSocket.subscribe_readable pending")
+        super::super::stubs::always_ready_pollable(&mut self.resource_table)
     }
 
     fn drop(&mut self, rep: Resource<UdpSocket>) -> wasmtime::Result<()> {

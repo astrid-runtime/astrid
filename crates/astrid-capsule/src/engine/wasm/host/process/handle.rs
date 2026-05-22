@@ -165,21 +165,29 @@ impl HostProcessHandle for HostState {
             &sem,
             &tok,
             async move {
-                let deadline = timeout_ms
-                    .map(|ms| tokio::time::Instant::now() + std::time::Duration::from_millis(ms));
-                loop {
-                    match child.try_wait() {
-                        Ok(Some(status)) => return Ok(status.code()),
-                        Ok(None) => {
-                            if let Some(d) = deadline
-                                && tokio::time::Instant::now() >= d
-                            {
-                                return Err(ErrorCode::WaitTimeout);
-                            }
-                            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                        },
-                        Err(e) => return Err(ErrorCode::Unknown(format!("try_wait: {e}"))),
-                    }
+                // Off-thread blocking wait avoids the 50ms try_wait
+                // busy-loop. If the caller specified a timeout we race
+                // it against the JoinHandle; on timeout we drop the
+                // receiver. The blocking thread is allowed to finish
+                // on its own (the kernel does not kill the child here
+                // — callers must invoke `kill` explicitly).
+                let wait_fut = tokio::task::spawn_blocking(move || child.wait());
+                match timeout_ms {
+                    Some(ms) => {
+                        match tokio::time::timeout(std::time::Duration::from_millis(ms), wait_fut)
+                            .await
+                        {
+                            Ok(Ok(Ok(status))) => Ok(status.code()),
+                            Ok(Ok(Err(e))) => Err(ErrorCode::Unknown(format!("wait: {e}"))),
+                            Ok(Err(e)) => Err(ErrorCode::Unknown(format!("join: {e}"))),
+                            Err(_) => Err(ErrorCode::WaitTimeout),
+                        }
+                    },
+                    None => match wait_fut.await {
+                        Ok(Ok(status)) => Ok(status.code()),
+                        Ok(Err(e)) => Err(ErrorCode::Unknown(format!("wait: {e}"))),
+                        Err(e) => Err(ErrorCode::Unknown(format!("join: {e}"))),
+                    },
                 }
             },
         );
@@ -216,17 +224,35 @@ impl HostProcessHandle for HostState {
     }
 
     fn subscribe_exit(&mut self, _self_: Resource<ProcessHandle>) -> Resource<DynPollable> {
-        todo!("ProcessHandle.subscribe-exit: pollable wiring pending")
+        // Real wiring (sourced from try_wait readiness on the child)
+        // lands with the pollable commit. Always-ready sentinel until
+        // then — guests poll, then `wait` blocks on the actual exit.
+        super::super::stubs::always_ready_pollable(&mut self.resource_table)
     }
 
     fn subscribe_logs(&mut self, _self_: Resource<ProcessHandle>) -> Resource<DynPollable> {
-        todo!("ProcessHandle.subscribe-logs: pollable wiring pending")
+        // Same pattern — guests poll, then `read-logs` drains whatever
+        // the reader thread has buffered (or returns empty if nothing
+        // is available yet, which is honest non-blocking semantics).
+        super::super::stubs::always_ready_pollable(&mut self.resource_table)
     }
 
     fn drop(&mut self, rep: Resource<ProcessHandle>) -> wasmtime::Result<()> {
-        let _ = self
+        // Pull the entry out of the table first so the cancellation
+        // tracker can be updated *before* `ManagedProcess::Drop` kills
+        // the child — otherwise a `tool.v1.request.cancel` event
+        // landing simultaneously would chase a freshly-reused PID.
+        if let Ok(managed) = self
             .resource_table
-            .delete::<ManagedProcess>(Resource::new_own(rep.rep()));
+            .delete::<ManagedProcess>(Resource::new_own(rep.rep()))
+        {
+            if let Some(child) = managed.child.as_ref() {
+                self.process_tracker.unregister(child.id());
+            }
+            // Dropping `managed` here kills and reaps any still-live
+            // child via `Drop for ManagedProcess`.
+            drop(managed);
+        }
         Ok(())
     }
 }

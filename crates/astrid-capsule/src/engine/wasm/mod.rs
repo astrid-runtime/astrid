@@ -232,6 +232,24 @@ impl WasmEngine {
 /// See #639 for the resource telemetry tracking issue.
 const WASM_MAX_MEMORY_BYTES: usize = 64 * 1024 * 1024;
 
+/// Register every Astrid host interface on `linker`. Single source of
+/// truth shared between the main capsule-load path and the lifecycle-
+/// hook (`run_lifecycle`) path so a future change that adds version
+/// negotiation can't drift between the two — what a capsule sees at
+/// install time MUST match what it sees at runtime.
+///
+/// Does NOT register any `wasi:*` interface. The Astrid host ABI is
+/// fully self-contained; exposing wasi would create unaudited paths
+/// to the host filesystem / sockets / clocks / entropy.
+pub fn configure_kernel_linker(
+    linker: &mut wasmtime::component::Linker<HostState>,
+) -> wasmtime::Result<()> {
+    bindings::Kernel::add_to_linker::<HostState, wasmtime::component::HasSelf<HostState>>(
+        linker,
+        |state| state,
+    )
+}
+
 fn build_wasmtime_engine() -> CapsuleResult<wasmtime::Engine> {
     let mut config = wasmtime::Config::new();
     config.wasm_component_model(true).epoch_interruption(true);
@@ -783,14 +801,14 @@ impl ExecutionEngine for WasmEngine {
                 // VFS, sockets outside the SSRF airlock, clocks/random
                 // outside sys, etc.).
                 //
-                // Wire all Astrid host interfaces from the per-domain WIT.
-                // The synthetic `Kernel` world imports every host package, so
-                // a single `add_to_linker` call registers them all.
-                bindings::Kernel::add_to_linker::<
-                    HostState,
-                    wasmtime::component::HasSelf<HostState>,
-                >(&mut linker, |state| state)
-                .map_err(|e| {
+                // Wire all Astrid host interfaces from the per-domain
+                // WIT. Both this load path AND the lifecycle path
+                // (`run_lifecycle`, below) go through the same helper
+                // so the linker config stays in lockstep — a future
+                // change that adds a second version registration here
+                // but forgets it in lifecycle would silently install
+                // capsules with mismatched ABIs across the two paths.
+                configure_kernel_linker(&mut linker).map_err(|e| {
                     CapsuleError::UnsupportedEntryPoint(format!(
                         "Failed to add Astrid host to linker: {e}"
                     ))
@@ -1481,14 +1499,7 @@ pub fn run_lifecycle(
     let _epoch_guard = spawn_epoch_ticker(&wt_engine);
 
     let mut linker: Linker<HostState> = Linker::new(&wt_engine);
-    // No wasi:* registrations — same rationale as the main load path:
-    // every host call must route through Astrid's audit + capability
-    // layers, no carve-outs.
-    bindings::Kernel::add_to_linker::<HostState, wasmtime::component::HasSelf<HostState>>(
-        &mut linker,
-        |state| state,
-    )
-    .map_err(|e| {
+    configure_kernel_linker(&mut linker).map_err(|e| {
         CapsuleError::UnsupportedEntryPoint(format!(
             "Failed to add Astrid host to linker for lifecycle: {e}"
         ))
@@ -1518,19 +1529,19 @@ pub fn run_lifecycle(
     // Call the lifecycle export by name. With per-export guest worlds the
     // export is only present in the wasm binary if the capsule actually
     // implements it; missing exports surface as a clear "not implemented"
-    // error rather than a toolchain stub trap.
-    let export_fn = export_name; // "astrid-install" or "astrid-upgrade"
+    // error rather than a toolchain stub trap. `export_name` is
+    // "astrid-install" or "astrid-upgrade" depending on `phase`.
     let func = instance
-        .get_typed_func::<(), ()>(&mut store, export_fn)
+        .get_typed_func::<(), ()>(&mut store, export_name)
         .map_err(|_| {
             CapsuleError::UnsupportedEntryPoint(format!(
-                "capsule does not export lifecycle hook `{export_fn}`"
+                "capsule does not export lifecycle hook `{export_name}`"
             ))
         })?;
     func.call(&mut store, ()).map_err(|e| {
-        CapsuleError::ExecutionFailed(format!("lifecycle hook {export_fn} failed: {e}"))
+        CapsuleError::ExecutionFailed(format!("lifecycle hook {export_name} failed: {e}"))
     })?;
-    let _ = phase; // export_fn already encodes the phase
+    let _ = phase; // already consumed via export_name selection above
 
     // Epoch ticker guard drops automatically (RAII).
 
@@ -1561,6 +1572,20 @@ fn wasm_exports_contain_run(wasm_bytes: &[u8]) -> bool {
 /// when the source crate doesn't implement them. Synthesized stubs share a
 /// single backing function and alias to the same export index, so a name
 /// in this trio whose index matches another trio member's index is a stub.
+// IMPORTANT: keep this list in sync with the SDK's stub-emission list.
+// Today the SDK fills in three mandatory exports — `run`,
+// `astrid-install`, `astrid-upgrade` — with a single shared no-op
+// function when the source crate does not provide them. Stub
+// detection matches all three to that shared function index.
+//
+// `astrid-hook-trigger` is currently NOT stubbed (the SDK omits it
+// entirely when no `#[astrid::hook]` attributes are present, and we
+// detect its absence by export-name). If a future SDK release adds
+// `astrid-hook-trigger` to its mandatory stub set, this trio MUST be
+// extended to include it — otherwise every capsule will appear to
+// expose a real hook handler and the kernel will dispatch trigger
+// events into a no-op trap. See `wasm_exports_contain` callers in
+// the interceptor / hook-bridge paths for the affected branches.
 const STUB_PRONE_EXPORTS: [&str; 3] = ["run", "astrid-install", "astrid-upgrade"];
 
 /// Pre-scans a WASM binary's exports for a real implementation of `name`.

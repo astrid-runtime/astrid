@@ -2,8 +2,10 @@
 //!
 //! Each submodule implements the corresponding `Host` trait from the
 //! WIT-generated bindings on `HostState`. The trait implementations
-//! are automatically wired to the wasmtime linker via
-//! `Capsule::add_to_linker()`.
+//! are wired to the wasmtime linker via the shared
+//! `engine::wasm::configure_kernel_linker` helper, which calls
+//! `bindings::Kernel::add_to_linker` (the synthetic kernel world that
+//! imports every host package).
 
 /// Capsule-level approval requests.
 pub(crate) mod approval;
@@ -28,6 +30,11 @@ pub(crate) mod kv;
 pub(crate) mod net;
 /// Process spawning and sandboxing.
 pub mod process;
+/// Sentinel `Pollable` / `InputStream` / `OutputStream` impls used as
+/// no-panic placeholders by resource methods whose full implementation
+/// is still pending (stream-half adapter + per-resource pollable
+/// wiring planned in dedicated follow-up commits).
+pub(crate) mod stubs;
 /// System configuration primitives.
 pub mod sys;
 /// Uplink communications with host capabilities.

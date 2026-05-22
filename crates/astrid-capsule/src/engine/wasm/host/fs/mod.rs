@@ -274,17 +274,24 @@ impl fs::Host for HostState {
         let resolved = resolve_path(self, &path).map_err(map_resolve_err)?;
         gate_read(self, &resolved.physical)?;
         let vfs_path = resolve_vfs(self, &resolved).map_err(map_resolve_err)?;
+        // Sentinel string used to encode the "too large at stat time"
+        // case as a `PermissionDenied` payload so we can re-raise it
+        // as `TooLarge` outside the async block. Keep the marker on a
+        // local constant so the `map_err` matcher can compare against
+        // a single source of truth instead of an inline literal.
+        const TOO_LARGE_TAG: &str = "astrid-read-file:too-large";
         let result = util::bounded_block_on(&self.runtime_handle, &self.host_semaphore, async {
             let metadata = vfs_path
                 .vfs
-                .stat(&vfs_path.handle, vfs_path.relative.to_string_lossy().as_ref())
+                .stat(
+                    &vfs_path.handle,
+                    vfs_path.relative.to_string_lossy().as_ref(),
+                )
                 .await?;
             if metadata.size > util::MAX_GUEST_PAYLOAD_LEN {
-                return Err(astrid_vfs::VfsError::PermissionDenied(format!(
-                    "file too large ({} bytes > {} bytes)",
-                    metadata.size,
-                    util::MAX_GUEST_PAYLOAD_LEN
-                )));
+                return Err(astrid_vfs::VfsError::PermissionDenied(
+                    TOO_LARGE_TAG.to_string(),
+                ));
             }
             let handle = vfs_path
                 .vfs
@@ -300,11 +307,24 @@ impl fs::Host for HostState {
             data
         })
         .map_err(|e| {
-            if matches!(&e, astrid_vfs::VfsError::PermissionDenied(msg) if msg.contains("too large"))
-            {
+            if matches!(&e, astrid_vfs::VfsError::PermissionDenied(msg) if msg == TOO_LARGE_TAG) {
                 ErrorCode::TooLarge
             } else {
                 map_vfs_err(e)
+            }
+        });
+        // Post-read enforcement closes a TOCTOU window: the stat check
+        // above sees the size at `t0`, but the file can grow between
+        // stat and the open/read syscalls. The VFS read path has its
+        // own ceiling (currently 50 MiB) which is higher than ours, so
+        // a file that grew past 10 MiB but stayed below the VFS cap
+        // would otherwise be returned in full. Cap the final buffer
+        // here so the kernel's intended limit is the effective limit.
+        let result = result.and_then(|data| {
+            if data.len() as u64 > util::MAX_GUEST_PAYLOAD_LEN {
+                Err(ErrorCode::TooLarge)
+            } else {
+                Ok(data)
             }
         });
         audit_fs(self, "astrid:fs/host.read-file", &path, &result);

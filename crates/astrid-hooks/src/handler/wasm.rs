@@ -176,11 +176,7 @@ impl WasmHandler {
         // exposure, matching the main capsule load path.
         let mut linker: Linker<HostState> = Linker::new(&self.engine);
 
-        bindings::Kernel::add_to_linker::<HostState, wasmtime::component::HasSelf<HostState>>(
-            &mut linker,
-            |state| state,
-        )
-        .map_err(|e| {
+        astrid_capsule::engine::wasm::configure_kernel_linker(&mut linker).map_err(|e| {
             HandlerError::WasmFailed(format!("failed to add Astrid host to linker: {e}"))
         })?;
 
@@ -351,7 +347,6 @@ impl WasmHandler {
             // do not receive the identity store. Identity resolution requires
             // a kernel-managed security gate which hooks don't have.
             identity_store: None,
-            #[allow(clippy::zero_sized_map_values)] // ManagedProcess is a stub pending the process resource port-back
             process_tracker: Arc::new(
                 astrid_capsule::engine::wasm::host::process::ProcessTracker::new(),
             ),

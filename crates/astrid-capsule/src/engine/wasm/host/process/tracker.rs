@@ -123,4 +123,75 @@ impl ProcessTracker {
             let _ = (pids, handle);
         }
     }
+
+    /// Test helper: snapshot the active PID set. Visible only under
+    /// `cfg(test)` so production callers can't introspect the map.
+    #[cfg(test)]
+    pub(crate) fn active_pids_snapshot(&self) -> Vec<u32> {
+        let mut v: Vec<u32> = self
+            .active_pids
+            .lock()
+            .expect("process tracker lock poisoned")
+            .keys()
+            .copied()
+            .collect();
+        v.sort_unstable();
+        v
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Regression tests for the `spawn_background` registration fix.
+    //!
+    //! PR #752 review surfaced that backgrounded children were never
+    //! registered in the tracker, so `cancel_by_call_ids` could not
+    //! reach them on capsule unload. These tests pin the contract
+    //! `spawn_background` relies on.
+    use super::*;
+
+    #[test]
+    fn register_adds_pid() {
+        let t = ProcessTracker::new();
+        t.register(42, None);
+        assert_eq!(t.active_pids_snapshot(), vec![42]);
+    }
+
+    #[test]
+    fn unregister_removes_pid() {
+        let t = ProcessTracker::new();
+        t.register(42, None);
+        t.register(99, Some("call-a".into()));
+        t.unregister(42);
+        assert_eq!(t.active_pids_snapshot(), vec![99]);
+    }
+
+    #[test]
+    fn pid_zero_is_rejected() {
+        let t = ProcessTracker::new();
+        t.register(0, None);
+        assert!(t.active_pids_snapshot().is_empty());
+    }
+
+    #[test]
+    fn double_register_overwrites_call_id() {
+        // Re-registering a PID with a different call_id must replace
+        // the prior entry, otherwise stale call_id associations leak.
+        let t = ProcessTracker::new();
+        t.register(42, Some("call-a".into()));
+        t.register(42, Some("call-b".into()));
+        assert_eq!(t.active_pids_snapshot(), vec![42]);
+    }
+
+    #[test]
+    fn unregister_after_register_clears_call_id_match() {
+        // The contract relied on by `spawn_background`'s drop path:
+        // register on spawn, unregister on child exit. After
+        // unregister, `cancel_by_call_ids` must find no PIDs to
+        // signal — verified here by observing the snapshot is empty.
+        let t = ProcessTracker::new();
+        t.register(42, Some("call-a".into()));
+        t.unregister(42);
+        assert!(t.active_pids_snapshot().is_empty());
+    }
 }

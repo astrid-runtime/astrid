@@ -21,6 +21,7 @@ astrid-vfs = { workspace = true }
 astrid-workspace = { workspace = true }
 async-trait = { workspace = true }
 blake3 = { workspace = true }
+bytes = "1"
 notify = "7"
 rand = { workspace = true }
 reqwest = { workspace = true }

@@ -66,6 +66,19 @@ fn stage_wit() {
 
     rerun_if_dir_changed(&wit_root.join("host"));
     println!("cargo:rerun-if-changed=build.rs");
+    // CI environments may run `git submodule update` lazily; the
+    // .gitmodules pointer changing without the working tree yet
+    // checked out should still invalidate the staging dir.
+    println!(
+        "cargo:rerun-if-changed={}",
+        crate_root
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join(".gitmodules")
+            .display()
+    );
 }
 
 fn rerun_if_dir_changed(dir: &Path) {

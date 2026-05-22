@@ -31,7 +31,7 @@ impl HostTcpListener for HostState {
     }
 
     fn subscribe_readiness(&mut self, _self_: Resource<TcpListener>) -> Resource<DynPollable> {
-        todo!("TcpListener.subscribe_readiness pending")
+        super::super::stubs::always_ready_pollable(&mut self.resource_table)
     }
 
     fn drop(&mut self, rep: Resource<TcpListener>) -> wasmtime::Result<()> {

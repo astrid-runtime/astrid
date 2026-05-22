@@ -9,6 +9,20 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Per-domain WIT review fixups (PR #752).** A multi-agent review surfaced fixes addressed in-branch before merge:
+  - `ipc::recv` mixed-principal batches are now truncated at the first publisher boundary so tail messages can't be silently mis-stamped with the head's principal context; new `truncate_to_homogeneous_principal` unit tests cover the boundary cases.
+  - `TcpStream::write` surfaces peer-disconnect IO kinds as `ErrorCode::ConnectionReset` instead of swallowing them as `Ok(())`; pure-function tests pin the `BrokenPipe / ConnectionReset / ConnectionAborted / UnexpectedEof → ConnectionReset` mapping and use `tokio::io::duplex` to reproduce the live close.
+  - `TcpStream::read` cancellation now returns `NetReadStatus::Closed` (not `Pending`) so a cancelled run-loop terminates instead of busy-looping.
+  - `spawn_background` registers the spawned PID in the `ProcessTracker`, and the `ProcessHandle` drop path unregisters; previously a `tool.v1.request.cancel` could never reach backgrounded children.
+  - `Subscription` recv keeps the resource handle valid across calls — the `EventReceiver` lives behind an `Arc<Mutex<...>>` so the wasmtime resource is no longer deleted-and-re-pushed each blocking wait.
+  - `read_file` re-checks the post-read payload size for `TooLarge` rather than relying on a pre-stat TOCTOU.
+  - `ProcessHandle::wait` uses `tokio::task::spawn_blocking(child.wait)` racing a `tokio::time::timeout` instead of the 50ms `try_wait` busy-poll.
+  - `unix_listener::accept` retries credential-rejected connections with a 100ms back-off to avoid a CPU-pinned spin against a hostile peer.
+  - `http-stream` per-chunk timeout extracted to `HTTP_STREAM_READ_TIMEOUT` named constant.
+  - Build script now invalidates the WIT staging dir on `.gitmodules` changes so CI runners that lazily `git submodule update` don't compile against a stale tree.
+
 ### Added
 
 - **Outbound TCP for capsules — `net.connect-tcp` host fn + `net_connect` capability.** Capsules can now open persistent TCP connections via the new `astrid:capsule/net.net-connect-tcp(host, port) -> stream-handle` host fn, gated by a per-capsule `net_connect = ["host:port", "host:*"]` allowlist in `Capsule.toml`. The returned handle flows through the existing `net-read` / `net-write` / `net-close-stream` plumbing, and the kernel reuses the same `is_safe_ip` airlock that gates `http-request` to reject loopback / private / link-local / multicast IPs after DNS resolution. Connect timeout bounded to 10s; per-capsule active-stream cap (`MAX_ACTIVE_STREAMS = 8`) shared with inbound `net-accept`. Unblocks WebSocket clients, MQTT, Discord/Telegram gateways, postgres/redis, and the immediate motivator: a Unicity-network capsule wrapping Sphere SDK (Fulcrum + Nostr WebSocket transports). Tracking issue: #745. RFC: [rfcs#27](https://github.com/unicity-astrid/rfcs/pull/27). WIT contract: [wit#5](https://github.com/unicity-astrid/wit/pull/5).

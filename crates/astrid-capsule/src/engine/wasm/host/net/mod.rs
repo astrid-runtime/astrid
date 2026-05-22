@@ -320,6 +320,16 @@ impl net::Host for HostState {
             let gate = gate.clone();
             let rt = self.runtime_handle.clone();
             let semaphore = self.host_semaphore.clone();
+            // Port 0 here is "no specific port": the gate is being
+            // asked "may this capsule resolve this hostname?" rather
+            // than "may it connect to host:port?". Manifest entries
+            // that pin a port (`api.example.com:443`) must therefore
+            // have a permissive sibling (`api.example.com:*`) to
+            // permit resolution — strict per-port gating today
+            // requires splitting the manifest into resolve-only and
+            // connect-only entries. A dedicated `check_net_resolve`
+            // gate method is tracked as a future refinement so this
+            // overload of port 0 can be removed.
             let check = util::bounded_block_on(&rt, &semaphore, async move {
                 gate.check_net_connect(&capsule_id, &host_for_check, 0)
                     .await

@@ -213,10 +213,21 @@ mod astrid_streams_impl {
     /// the guest.
     type StreamResult<T> = Result<T, RtStreamError>;
 
-    /// Reject the call up front if the capsule is unloading. Streams
-    /// don't have a typed `cancelled` variant on the wire — the
-    /// `closed` semantic ("no more bytes will be produced / accepted")
-    /// is what the capsule should observe.
+    /// Reject the call up front if the capsule is unloading.
+    ///
+    /// Both blocking and non-blocking stream methods run through this
+    /// guard, even though `read` / `write` / `check-write` / `flush`
+    /// / `skip` / `write-zeroes` are documented as non-blocking in
+    /// the WIT. The deviation is deliberate: a cancelled capsule
+    /// should observe its streams as closed (one consistent failure
+    /// mode), not continue to read/write for one more poll before
+    /// noticing on the next call. Capsules already handle `closed`
+    /// as the canonical end-of-stream signal, so unloading surfaces
+    /// through the same code path.
+    ///
+    /// Streams don't have a typed `cancelled` variant on the wire —
+    /// `Closed` carries the "no more bytes will be produced /
+    /// accepted" semantic that matches.
     fn cancel_guard(state: &HostState) -> Result<(), RtStreamError> {
         if state.cancel_token.is_cancelled() {
             Err(RtStreamError::Closed)

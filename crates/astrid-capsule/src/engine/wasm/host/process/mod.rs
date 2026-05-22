@@ -232,6 +232,16 @@ impl process::Host for HostState {
             return Err(ErrorCode::CapabilityDenied);
         }
 
+        // Re-check the cancellation token AFTER the (potentially
+        // semaphore-bounded) capability check has run. The window
+        // between gate clearance and `spawn()` is small but
+        // non-zero — surfacing Cancelled here avoids fork+exec
+        // immediately followed by tracker-less orphaning if the
+        // capsule is being torn down right now.
+        if self.cancel_token.is_cancelled() {
+            return Err(ErrorCode::Cancelled);
+        }
+
         let mut sandboxed_cmd =
             prepare_sandboxed_command(&request.cmd, &request.args, &workspace_root)
                 .map_err(|_| ErrorCode::InvalidInput)?;
@@ -254,6 +264,15 @@ impl process::Host for HostState {
 
         let pid = managed.child.as_ref().map(|c| c.id()).unwrap_or(0);
         attach_pipes(&mut managed, pid);
+
+        // Register with the cancellation tracker so a
+        // `tool.v1.request.cancel` event reaches the background
+        // child. spawn-background does not currently propagate a
+        // call_id (no caller_context payload to extract from in the
+        // common case), so the entry is registered with None — which
+        // makes it eligible for the "conservative fallback" branch of
+        // `cancel_by_call_ids` (cancelled by any matching event).
+        self.process_tracker.register(pid, None);
 
         let res = self
             .resource_table

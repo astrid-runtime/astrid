@@ -9,8 +9,20 @@ use wasmtime::component::Resource;
 use wasmtime_wasi::p2::DynPollable;
 
 use super::stream::{
-    MAX_BYTES_PER_CALL, read_bytes_inner, read_frame, write_bytes_inner, write_frame,
+    MAX_BYTES_PER_CALL, is_peer_disconnect, read_bytes_inner, read_frame, write_bytes_inner,
+    write_frame,
 };
+
+/// Map a `write_frame` `io::Error` to a typed `net::ErrorCode`. Peer
+/// disconnect on a write maps to `ConnectionReset` so the guest can
+/// distinguish a closed connection from a transient error.
+fn map_write_frame_err(e: &std::io::Error) -> ErrorCode {
+    if is_peer_disconnect(e) {
+        ErrorCode::ConnectionReset
+    } else {
+        ErrorCode::Unknown(format!("write: {e}"))
+    }
+}
 use super::{
     HostState, NetStream, audit_net, map_io_err, net_stream, with_tcp_slot_mut, with_tcp_stream,
 };
@@ -38,11 +50,23 @@ impl HostTcpStream for HostState {
                 },
             }
         });
-        match status {
+        let result: Result<NetReadStatus, ErrorCode> = match status {
             Some(Ok(st)) => Ok(st),
             Some(Err(e)) => Err(ErrorCode::Unknown(e)),
-            None => Ok(NetReadStatus::Pending),
-        }
+            // Cancellation is `Closed`, NOT `Pending`. Returning
+            // Pending here would let a cancelled capsule's run loop
+            // call read in a tight loop with no backpressure — the
+            // sync cancel check inside `bounded_block_on_cancellable`
+            // fires before any I/O, so each call returns instantly.
+            // Closed terminates the read loop cleanly.
+            None => Ok(NetReadStatus::Closed),
+        };
+        let bytes = match &result {
+            Ok(NetReadStatus::Data(d)) => d.len() as u64,
+            _ => 0,
+        };
+        audit_net(self, "astrid:net/host.tcp-stream.read", bytes, &result);
+        result
     }
 
     fn write(&mut self, self_: Resource<TcpStream>, data: Vec<u8>) -> Result<(), ErrorCode> {
@@ -65,9 +89,15 @@ impl HostTcpStream for HostState {
         });
         let result = match result {
             Some(Ok(())) => Ok(()),
-            Some(Err(_)) => {
-                // Peer disconnect — non-fatal; capsule discovers on next read.
-                Ok(())
+            Some(Err(e)) => {
+                // Surface the failure to the guest. The legacy
+                // implementation silently swallowed peer-disconnect
+                // errors here on the theory "the capsule will see it
+                // on the next read" — but the WIT contract for
+                // `write` is fallible, and capsules using it for
+                // request-response semantics need to know writes
+                // failed.
+                Err(map_write_frame_err(&e))
             },
             None => Err(ErrorCode::Closed),
         };
@@ -337,22 +367,24 @@ impl HostTcpStream for HostState {
     }
 
     fn subscribe_readable(&mut self, _self_: Resource<TcpStream>) -> Resource<DynPollable> {
-        // Pollable wiring for tcp-stream readiness lands with the stream-
-        // halves commit alongside read-stream / write-stream.
-        todo!("TcpStream.subscribe_readable: pollable wiring pending")
+        // Real pollable wiring (tokio AsyncRead readiness over the
+        // NetStream) lands with the stream-half adapter commit.
+        // Always-ready sentinel until then; guests poll then call
+        // read-bytes which handles real readability internally.
+        super::super::stubs::always_ready_pollable(&mut self.resource_table)
     }
 
     fn read_stream(&mut self, _self_: Resource<TcpStream>) -> Resource<InputStream> {
-        // Wrap the underlying tokio TcpStream / UnixStream as a
-        // wasmtime-wasi-io InputStream. Non-trivial — requires impl of
-        // the InputStream trait (read + Pollable::ready) on a custom
-        // adapter type. Tracked for a dedicated follow-up commit so the
-        // splice path lands with proper readiness wiring.
-        todo!("TcpStream.read_stream: stream-half adapter pending")
+        // Real adapter (wasmtime-wasi-io InputStream impl over our
+        // NetStream) lands with the stream-half commit. Closed-on-read
+        // sentinel until then — capsules use read / read-bytes
+        // directly.
+        super::super::stubs::closed_input_stream(&mut self.resource_table)
     }
 
     fn write_stream(&mut self, _self_: Resource<TcpStream>) -> Resource<OutputStream> {
-        todo!("TcpStream.write_stream: stream-half adapter pending")
+        // Same story as read_stream — closed-on-write sentinel.
+        super::super::stubs::closed_output_stream(&mut self.resource_table)
     }
 
     fn drop(&mut self, rep: Resource<TcpStream>) -> wasmtime::Result<()> {
@@ -360,5 +392,68 @@ impl HostTcpStream for HostState {
             .resource_table
             .delete::<NetStream>(Resource::new_own(rep.rep()));
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Regression tests for the PR #752 `write` fix.
+    //!
+    //! The legacy implementation silently swallowed peer-disconnect
+    //! errors as `Ok(())` on the theory "the capsule will see it on
+    //! the next read". Capsules using TcpStream for request/response
+    //! could not detect a half-closed connection. We now surface
+    //! `ConnectionReset` for any peer-disconnect IO kind and
+    //! `Unknown` for everything else.
+    use super::*;
+    use std::io;
+
+    #[test]
+    fn write_frame_err_brokenpipe_maps_to_connection_reset() {
+        let e = io::Error::new(io::ErrorKind::BrokenPipe, "peer gone");
+        assert!(matches!(
+            map_write_frame_err(&e),
+            ErrorCode::ConnectionReset
+        ));
+    }
+
+    #[test]
+    fn write_frame_err_connection_reset_maps_to_connection_reset() {
+        let e = io::Error::new(io::ErrorKind::ConnectionReset, "rst");
+        assert!(matches!(
+            map_write_frame_err(&e),
+            ErrorCode::ConnectionReset
+        ));
+    }
+
+    #[test]
+    fn write_frame_err_connection_aborted_maps_to_connection_reset() {
+        let e = io::Error::new(io::ErrorKind::ConnectionAborted, "abort");
+        assert!(matches!(
+            map_write_frame_err(&e),
+            ErrorCode::ConnectionReset
+        ));
+    }
+
+    #[test]
+    fn write_frame_err_unexpected_eof_maps_to_connection_reset() {
+        let e = io::Error::new(io::ErrorKind::UnexpectedEof, "eof");
+        assert!(matches!(
+            map_write_frame_err(&e),
+            ErrorCode::ConnectionReset
+        ));
+    }
+
+    #[test]
+    fn write_frame_err_other_maps_to_unknown() {
+        let e = io::Error::new(io::ErrorKind::Other, "weird");
+        assert!(matches!(map_write_frame_err(&e), ErrorCode::Unknown(_)));
+    }
+
+    #[test]
+    fn write_frame_err_timed_out_maps_to_unknown() {
+        // Timeouts are NOT peer disconnect — capsule can retry.
+        let e = io::Error::new(io::ErrorKind::TimedOut, "slow");
+        assert!(matches!(map_write_frame_err(&e), ErrorCode::Unknown(_)));
     }
 }

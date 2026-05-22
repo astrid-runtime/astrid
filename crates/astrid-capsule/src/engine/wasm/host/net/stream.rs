@@ -128,3 +128,74 @@ where
     };
     Ok(u32::try_from(n).unwrap_or(u32::MAX))
 }
+
+#[cfg(test)]
+mod tests {
+    //! Regression tests for the PR #752 net-stream fixes:
+    //!
+    //! - `is_peer_disconnect` must cover every error kind the kernel
+    //!   treats as a graceful close, otherwise `write` surfaces
+    //!   `Unknown(...)` to the guest instead of `ConnectionReset`.
+    //! - `write_frame` propagates `BrokenPipe` (the fix replaces a
+    //!   silent `Ok(())` swallow in `tcp_stream::write`).
+    //! - `read_frame` returns `Closed` on a half-closed peer.
+    use super::*;
+    use std::io;
+
+    #[test]
+    fn peer_disconnect_recognises_all_close_kinds() {
+        for kind in [
+            io::ErrorKind::BrokenPipe,
+            io::ErrorKind::ConnectionReset,
+            io::ErrorKind::ConnectionAborted,
+            io::ErrorKind::UnexpectedEof,
+        ] {
+            let e = io::Error::new(kind, "test");
+            assert!(is_peer_disconnect(&e), "{kind:?} should be peer-disconnect");
+        }
+    }
+
+    #[test]
+    fn peer_disconnect_rejects_unrelated_kinds() {
+        for kind in [
+            io::ErrorKind::TimedOut,
+            io::ErrorKind::PermissionDenied,
+            io::ErrorKind::InvalidInput,
+            io::ErrorKind::Other,
+        ] {
+            let e = io::Error::new(kind, "test");
+            assert!(
+                !is_peer_disconnect(&e),
+                "{kind:?} must NOT be classified as peer-disconnect"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn write_frame_returns_brokenpipe_when_peer_closes() {
+        // tokio::io::duplex pair: closing the read half causes the
+        // write half's next write to fail with BrokenPipe. This is
+        // the exact failure mode `tcp_stream::write` now surfaces as
+        // `ConnectionReset` instead of silently swallowing.
+        let (mut tx, rx) = tokio::io::duplex(64);
+        drop(rx);
+        let err = write_frame(&mut tx, &[1u8; 16])
+            .await
+            .expect_err("write to closed peer must error");
+        assert!(
+            is_peer_disconnect(&err),
+            "expected peer-disconnect kind, got {:?}",
+            err.kind()
+        );
+    }
+
+    #[tokio::test]
+    async fn read_frame_returns_closed_on_half_close() {
+        // Peer drops without sending — read_exact gets UnexpectedEof
+        // and `read_frame` converts it to `NetReadStatus::Closed`.
+        let (tx, mut rx) = tokio::io::duplex(64);
+        drop(tx);
+        let status = read_frame(&mut rx).await.expect("classified, not error");
+        assert!(matches!(status, NetReadStatus::Closed));
+    }
+}

@@ -57,6 +57,19 @@ impl HostUnixListener for HostState {
                     "rejected unix accept: peer creds"
                 );
                 drop(stream);
+                // Backoff to keep a flood of UID-mismatched clients
+                // from spinning the accept loop at syscall speed.
+                // The handshake path has a 5s timeout that already
+                // throttles slow-but-valid-creds clients; this branch
+                // doesn't enter the handshake at all.
+                let _ = util::bounded_block_on_cancellable(
+                    &rt_handle,
+                    &host_semaphore,
+                    &cancel_token,
+                    async {
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                    },
+                );
                 continue;
             }
 
@@ -178,9 +191,11 @@ impl HostUnixListener for HostState {
     }
 
     fn subscribe_readiness(&mut self, _self_: Resource<UnixListener>) -> Resource<DynPollable> {
-        // Readiness wiring for inbound unix accept lands with the stream-
-        // halves commit (same pollable infra).
-        todo!("UnixListener.subscribe_readiness: pollable wiring pending")
+        // Real wiring (tokio UnixListener::poll_accept-backed) lands
+        // with the dedicated pollable commit. Always-ready sentinel
+        // until then — guests poll, call accept, get a connection or
+        // wait inside accept's own blocking path.
+        super::super::stubs::always_ready_pollable(&mut self.resource_table)
     }
 
     fn drop(&mut self, rep: Resource<UnixListener>) -> wasmtime::Result<()> {

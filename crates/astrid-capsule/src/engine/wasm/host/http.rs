@@ -200,6 +200,11 @@ pub struct ActiveHttpStream {
 
 const HTTP_STREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Per-chunk read timeout for streaming HTTP responses. Kept as a
+/// named constant so per-principal timeout tuning has a single edit
+/// point.
+const HTTP_STREAM_READ_TIMEOUT: Duration = Duration::from_secs(120);
+
 impl http::Host for HostState {
     fn http_request(&mut self, request: HttpRequestData) -> Result<HttpResponseData, ErrorCode> {
         let capsule_id = self.capsule_id.as_str().to_owned();
@@ -381,7 +386,7 @@ impl HostHttpStream for HostState {
         let started = std::time::Instant::now();
         let result = util::bounded_block_on_cancellable(&rt, &sem, &cancel, async {
             let mut resp = response_arc.lock().await;
-            tokio::time::timeout(Duration::from_secs(120), resp.chunk()).await
+            tokio::time::timeout(HTTP_STREAM_READ_TIMEOUT, resp.chunk()).await
         });
         let bytes_result: Result<Vec<u8>, ErrorCode> = match result {
             None => Ok(Vec::new()), // cancelled
@@ -425,14 +430,18 @@ impl HostHttpStream for HostState {
     }
 
     fn subscribe_readable(&mut self, _self_: Resource<HttpStream>) -> Resource<DynPollable> {
-        // TODO: wire a real pollable that fires when the body buffer has
-        // bytes ready. For now hand out an always-ready pollable so guests
-        // that compose pollables don't block forever.
-        todo!("http_stream.subscribe_readable: pollable scaffolding pending")
+        // Real pollable wiring (sourced from the reqwest response's
+        // chunk readiness) lands with the dedicated stream-adapter
+        // commit. Always-ready sentinel until then; guests poll, then
+        // read-chunk returns the next chunk or EOF.
+        super::stubs::always_ready_pollable(&mut self.resource_table)
     }
 
     fn body_stream(&mut self, _self_: Resource<HttpStream>) -> Resource<InputStream> {
-        todo!("http_stream.body_stream: input-stream wiring pending")
+        // The real adapter wraps reqwest::Response as a wasmtime-wasi-io
+        // InputStream; until that lands, capsules get a closed-on-read
+        // sentinel and must use `read-chunk` directly.
+        super::stubs::closed_input_stream(&mut self.resource_table)
     }
 
     fn drop(&mut self, rep: Resource<HttpStream>) -> wasmtime::Result<()> {
