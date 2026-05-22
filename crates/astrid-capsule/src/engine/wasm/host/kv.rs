@@ -111,21 +111,17 @@ impl kv::Host for HostState {
         expected: Option<Vec<u8>>,
         new: Vec<u8>,
     ) -> Result<bool, ErrorCode> {
-        // ScopedKvStore doesn't yet expose an atomic CAS primitive — emulate
-        // by get-then-set under the runtime's single-threaded executor. This
-        // is NOT race-free across capsules; the WIT contract requires real
-        // atomicity, so this is a placeholder until storage exposes a CAS.
-        // TODO(astrid-storage): plumb through a true atomic CAS.
+        // Atomic compare-and-swap is delegated to the storage layer.
+        // `MemoryKvStore` serializes the read+conditional-write under a
+        // single write lock; `SurrealKvStore` issues one MVCC
+        // transaction and treats commit conflicts as `Ok(false)` so a
+        // concurrent capsule's commit invalidates this caller's
+        // `expected` rather than overwriting the new value.
         let kv = self.effective_kv().clone();
         util::bounded_block_on(&self.runtime_handle, &self.host_semaphore, async {
-            let current = kv.get(&key).await.map_err(|e| store_err("kv_cas/get", e))?;
-            if current.as_deref() != expected.as_deref() {
-                return Ok(false);
-            }
-            kv.set(&key, new)
+            kv.compare_and_swap(&key, expected.as_deref(), new)
                 .await
-                .map_err(|e| store_err("kv_cas/set", e))?;
-            Ok(true)
+                .map_err(|e| store_err("kv_cas", e))
         })
     }
 }
