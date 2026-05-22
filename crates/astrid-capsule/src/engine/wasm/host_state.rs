@@ -194,10 +194,6 @@ pub struct HostState {
     pub event_bus: astrid_events::EventBus,
     /// Rate limiter for IPC message publishing.
     pub ipc_limiter: astrid_events::ipc::IpcRateLimiter,
-    /// Active event bus subscriptions for IPC events.
-    pub subscriptions: HashMap<u64, astrid_events::EventReceiver>,
-    /// Counter for issuing subscription handle IDs.
-    pub next_subscription_id: u64,
     /// Plugin configuration from the manifest.
     ///
     /// Holds only **non-secret** env values (the `[env]` declarations

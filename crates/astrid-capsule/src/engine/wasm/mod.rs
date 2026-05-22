@@ -615,7 +615,6 @@ impl ExecutionEngine for WasmEngine {
                     Box::new(upper_vfs),
                 ));
 
-                let next_subscription_id = 1;
                 // Only resolve home:// in the gate if we actually mounted the VFS.
                 // Otherwise the gate would approve paths the VFS can't serve.
                 let gate_home_root = home_mount.as_ref().map(|m| m.root.clone());
@@ -677,8 +676,6 @@ impl ExecutionEngine for WasmEngine {
                     kv,
                     event_bus,
                     ipc_limiter: astrid_events::ipc::IpcRateLimiter::new(),
-                    subscriptions: std::collections::HashMap::new(),
-                    next_subscription_id,
                     config: wasm_config,
                     // Secret-typed env keys from the manifest.
                     // `get_config` routes these through the keychain
@@ -874,21 +871,20 @@ impl ExecutionEngine for WasmEngine {
                         CapsuleError::UnsupportedEntryPoint(format!("Store lock poisoned: {e}"))
                     })?;
                     let state = s.data_mut();
-                    // Interceptors are auto-subscribed without check_subscribe_acl.
-                    // Their event patterns are declared in [subscribe].handler (new
-                    // format) or [[interceptor]] blocks (legacy) in Capsule.toml —
-                    // both operator-controlled, same trust level as ipc_subscribe.
-                    // Only guest-initiated ipc::subscribe() calls are ACL-checked.
+                    // Interceptor bindings are metadata under the new
+                    // ABI. The kernel dispatches matching IPC messages to
+                    // `astrid-hook-trigger` directly (no capsule-side
+                    // receiver poll), so we record the action / topic
+                    // mapping but do not allocate an EventReceiver per
+                    // interceptor. `handle-id` is informational only —
+                    // capsules cannot convert it back to a
+                    // `Resource<Subscription>`.
                     let count = effective_interceptors.len();
-                    for interceptor in effective_interceptors {
-                        let receiver = state.event_bus.subscribe_topic(&interceptor.event);
-                        let handle_id = state.next_subscription_id;
-                        state.next_subscription_id = state.next_subscription_id.wrapping_add(1);
-                        state.subscriptions.insert(handle_id, receiver);
+                    for (idx, interceptor) in effective_interceptors.into_iter().enumerate() {
                         state
                             .interceptor_handles
                             .push(host_state::InterceptorHandle {
-                                handle_id,
+                                handle_id: idx as u64,
                                 action: interceptor.action,
                                 topic: interceptor.event,
                             });
@@ -1450,8 +1446,6 @@ pub fn run_lifecycle(
         kv: cfg.kv,
         event_bus: cfg.event_bus,
         ipc_limiter: astrid_events::ipc::IpcRateLimiter::new(),
-        subscriptions: std::collections::HashMap::new(),
-        next_subscription_id: 1,
         config: cfg.config,
         secret_env: std::collections::HashSet::new(),
         ipc_publish_patterns: Vec::new(),
