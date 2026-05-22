@@ -553,7 +553,6 @@ impl HostState {
     ///   work is bounded by the message size limits already in the
     ///   bus. Move to a real lookup when per-principal quota
     ///   enforcement is needed.
-    #[allow(dead_code)] // re-enabled by ipc Subscription resource port-back
     pub(crate) fn install_recv_invocation_context(&mut self, msg: &astrid_events::ipc::IpcMessage) {
         // Fast path: if the new message's principal matches whatever
         // we already have installed, keep the existing
@@ -610,7 +609,6 @@ impl HostState {
     /// publisher's context doesn't leak into subsequent guest host
     /// calls (KV reads, publishes) that happen before the next recv
     /// pulls fresh state.
-    #[allow(dead_code)] // re-enabled by ipc Subscription resource port-back
     pub(crate) fn clear_recv_invocation_context(&mut self) {
         self.caller_context = None;
         self.invocation_kv = None;
