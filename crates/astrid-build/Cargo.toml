@@ -27,6 +27,7 @@ tar = { workspace = true }
 tempfile = { workspace = true }
 toml_edit = "0.25.3"
 tracing = { workspace = true }
+wit-component = { workspace = true }
 wit-parser = { workspace = true }
 
 [dev-dependencies]

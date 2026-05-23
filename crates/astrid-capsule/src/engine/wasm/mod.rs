@@ -238,9 +238,13 @@ const WASM_MAX_MEMORY_BYTES: usize = 64 * 1024 * 1024;
 /// negotiation can't drift between the two — what a capsule sees at
 /// install time MUST match what it sees at runtime.
 ///
-/// Does NOT register any `wasi:*` interface. The Astrid host ABI is
-/// fully self-contained; exposing wasi would create unaudited paths
-/// to the host filesystem / sockets / clocks / entropy.
+/// **Zero `wasi:*` registration.** The Astrid-canonical guest target is
+/// `wasm32-unknown-unknown` — capsules produce wasm with zero `wasi:*`
+/// imports, every host call going through audited `astrid:*` interfaces.
+/// A capsule that somehow ships with a `wasi:*` import (e.g. built
+/// against `wasm32-wasip2` without `astrid-sdk`'s toolchain integration)
+/// fails to instantiate at load time with a clear "interface not found"
+/// error — that is the intended posture, not a bug to paper over.
 pub fn configure_kernel_linker(
     linker: &mut wasmtime::component::Linker<HostState>,
 ) -> wasmtime::Result<()> {

@@ -1,7 +1,15 @@
 //! Kernel management API request and response types.
+//!
+//! These types describe the CLI ↔ daemon RPC surface (admin requests,
+//! status queries, capsule lifecycle ops). They live in `astrid-core`
+//! because they reference `PrincipalId` and `Quotas` from this crate.
+//!
+//! Capsule-facing IPC types live in `astrid-types` (which intentionally
+//! has no dependency on `astrid-core` — it must compile on
+//! `wasm32-unknown-unknown` without dragging in the kernel).
 
-use astrid_core::PrincipalId;
-use astrid_core::profile::Quotas;
+use crate::PrincipalId;
+use crate::profile::Quotas;
 use serde::{Deserialize, Serialize};
 
 /// The well-known system session UUID string used by the background daemon.

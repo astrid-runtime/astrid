@@ -62,7 +62,14 @@ arc-swap = "1.7"
 async-trait = "0.1"
 base64 = "0.22"
 blake3 = "1.5"
-chrono = { version = "0.4", features = ["serde"] }
+# `default-features = false` strips chrono's `clock` feature, which on
+# `wasm32-unknown-unknown` would pull in `wasm-bindgen` + `js-sys` and
+# inject `__wbindgen_placeholder__` imports that `wit-component`
+# rejects when wrapping a core wasm into a Component Model component.
+# Records that need a clock value receive it from `astrid_sdk::time`
+# (audited host fn); `DateTime<Utc>` is only used as a serializable
+# field shape, never constructed via `Utc::now()` in capsule code.
+chrono = { version = "0.4", default-features = false, features = ["serde"] }
 clap = { version = "4.5", features = ["derive", "env"] }
 clap_complete = "4.5"
 colored = "2.1"
@@ -127,6 +134,7 @@ uuid = { version = "1.0", features = ["v4", "v5", "serde"] }
 walkdir = "2.5"
 wasm-encoder = "0.227"
 wasmparser = "0.227"
+wit-component = "0.227"
 wit-parser = "0.227"
 wasmtime = { version = "43", features = ["component-model", "cranelift"] }
 wasmtime-wasi = "43"

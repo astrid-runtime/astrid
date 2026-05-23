@@ -9,9 +9,19 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
 
 ## [Unreleased]
 
+### Breaking
+
+- **`KernelRequest` / `KernelResponse` / `CommandInfo` / `CapsuleMetadataEntry` / `DaemonStatus` / `SYSTEM_SESSION_UUID` moved from `astrid_types::kernel` to `astrid_core::kernel_api`.** Re-exports under `astrid_events::kernel_api` are preserved for migration ergonomics. The reason: `astrid-types` is the WASM-compatible shared-types crate intended to compile on `wasm32-unknown-unknown` for capsule SDK consumption — it cannot depend on `astrid-core` (which references `PrincipalId`, `Quotas`, and the rest of the kernel-only type universe). The kernel-management RPC surface (CLI ↔ daemon) doesn't belong in a WASM-compatible crate to begin with. CLI commands, `socket_client`, `admin_client`, the TUI, and the integration tests have all been updated to import from `astrid_core::kernel_api`.
+
 ### Added
 
 - **`astrid:fs/host.fs-mkdir-all`** — unstubbed. Idempotent recursive directory creation via the existing VFS `mkdir` call (every VFS impl already routes through `std::fs::create_dir_all` under the hood). Capability gating, audit envelope (`astrid:fs/host.fs-mkdir-all`), and error mapping match `fs-mkdir`. Unblocks capsule code that wants the `std::fs::create_dir_all`-style idempotent variant instead of the strict `fs-mkdir`. (Closes one item of #753.)
+- **`astrid-build` is target-agnostic now.** Drops the hardcoded `--target wasm32-wasip2` flag on `cargo build`; instead lets the capsule's own `.cargo/config.toml` select the target. After compilation, probes `target/wasm32-unknown-unknown/release/` first, `target/wasm32-wasip2/release/` second (and the workspace root) for the produced `.wasm`. When the produced artifact is a core wasm module (no Component Model layer = 1 in the magic bytes) — which is what `wasm32-unknown-unknown` produces — `wit_component::ComponentEncoder::default().validate(true).module(&core).encode()` wraps it into a Component Model component. Required because the Astrid-canonical guest target is `wasm32-unknown-unknown` (zero `wasi:*` imports), and `cargo` does not produce a component directly for that target.
+- **`chrono = { default-features = false, features = ["serde"] }`** workspace-wide. The `clock` feature is what pulls `wasm-bindgen` + `js-sys` on `wasm32-unknown-unknown`, which then inject `__wbindgen_placeholder__` imports that `wit-component`'s encoder refuses to round-trip. Records that need a clock value receive it from `astrid_sdk::time` (audited host fn); `DateTime<Utc>` is only used as a serializable field shape, never constructed via `Utc::now()` in capsule code.
+
+### Changed
+
+- **Kernel exposes zero `wasi:*`.** `configure_kernel_linker` no longer registers `wasmtime_wasi::p2::add_to_linker_sync`. The Astrid-canonical guest target (`wasm32-unknown-unknown`) produces wasm with zero `wasi:*` imports; a capsule that somehow ships with a `wasi:*` import fails to instantiate at load time with a clear "interface not found" error — the intended posture, not a bug. Capsules that historically targeted `wasm32-wasip2` and relied on auto-injected `wasi:*` imports will fail to load until they migrate to `wasm32-unknown-unknown` via the upcoming SDK + capsule sweep (a separate PR cluster, blocked on this one landing first).
 
 ### Fixed
 

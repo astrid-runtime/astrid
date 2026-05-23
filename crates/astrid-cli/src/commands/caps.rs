@@ -16,7 +16,7 @@ use std::process::ExitCode;
 
 use anyhow::{Context, Result};
 use astrid_core::PrincipalId;
-use astrid_types::kernel::{AdminRequestKind, AdminResponseBody, AgentSummary};
+use astrid_core::kernel_api::{AdminRequestKind, AdminResponseBody, AgentSummary};
 use clap::{Args, Subcommand};
 use colored::Colorize;
 use serde::Serialize;

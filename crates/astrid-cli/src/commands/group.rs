@@ -5,7 +5,7 @@
 use std::process::ExitCode;
 
 use anyhow::Result;
-use astrid_types::kernel::{AdminRequestKind, AdminResponseBody, GroupSummary};
+use astrid_core::kernel_api::{AdminRequestKind, AdminResponseBody, GroupSummary};
 use clap::{Args, Subcommand};
 use colored::Colorize;
 use serde::Serialize;

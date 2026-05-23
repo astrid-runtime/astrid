@@ -22,6 +22,7 @@ pub mod elicitation;
 pub mod env_policy;
 pub mod groups;
 pub mod identity;
+pub mod kernel_api;
 pub mod principal;
 pub mod profile;
 pub mod retry;

@@ -20,10 +20,10 @@ pub mod ipc;
 pub mod rate_limiter;
 mod subscriber;
 
-// Re-export shared types from astrid-types for backward compatibility.
-pub use astrid_types::kernel;
-/// Backward-compatible alias.
-pub use astrid_types::kernel as kernel_api;
+// Re-export shared types for backward compatibility. `kernel_api` lives in
+// `astrid-core` (it references `PrincipalId`/`Quotas`); `llm` is in
+// `astrid-types` (the WASM-compatible side, zero `astrid-core` dep).
+pub use astrid_core::kernel_api;
 pub use astrid_types::llm;
 
 pub use bus::{EventBus, EventReceiver};

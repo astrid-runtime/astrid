@@ -15,10 +15,10 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
 use astrid_core::SessionId;
-use astrid_types::ipc::{IpcMessage, IpcPayload};
-use astrid_types::kernel::{
+use astrid_core::kernel_api::{
     AdminKernelRequest, AdminKernelResponse, AdminRequestKind, AdminResponseBody,
 };
+use astrid_types::ipc::{IpcMessage, IpcPayload};
 use serde_json::Value;
 use uuid::Uuid;
 

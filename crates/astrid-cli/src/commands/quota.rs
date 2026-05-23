@@ -10,8 +10,8 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use astrid_core::PrincipalId;
+use astrid_core::kernel_api::{AdminRequestKind, AdminResponseBody};
 use astrid_core::profile::{BACKGROUND_PROCESSES_UPPER_BOUND, Quotas, TIMEOUT_SECS_UPPER_BOUND};
-use astrid_types::kernel::{AdminRequestKind, AdminResponseBody};
 use clap::{Args, Subcommand};
 use colored::Colorize;
 use serde::Serialize;

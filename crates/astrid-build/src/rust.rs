@@ -26,6 +26,7 @@ pub(crate) fn build(dir: &Path, output: Option<&str>) -> Result<()> {
     compile_wasm(dir)?;
 
     let wasm_path = locate_wasm_binary(dir, &meta, &wasm_name)?;
+    let wasm_path = ensure_component(&wasm_path)?;
 
     let toml_content =
         build_manifest_content(dir, &wasm_path, &crate_name, &package_version, &wasm_name)?;
@@ -96,53 +97,94 @@ fn resolve_package_metadata(
     Ok((meta, crate_name, package_version, wasm_name))
 }
 
-/// Compile the capsule to `wasm32-wasip2` in release mode.
+/// Compile the capsule in release mode using whatever target the
+/// capsule's own `.cargo/config.toml` selects.
+///
+/// The Astrid-canonical target is `wasm32-unknown-unknown` — zero
+/// `wasi:*` imports, every host call audited through the
+/// `astrid:*` SDK surface. Capsules may also target `wasm32-wasip2`
+/// during the migration window (the kernel still satisfies wasi:*
+/// for backwards compatibility), so this build step does NOT pass
+/// `--target`; it lets the capsule decide.
 fn compile_wasm(dir: &Path) -> Result<()> {
-    info!("   Compiling target wasm32-wasip2...");
+    info!("   Compiling capsule (release)...");
     let status = std::process::Command::new("cargo")
         .current_dir(dir)
-        .args(["build", "--target", "wasm32-wasip2", "--release"])
+        .args(["build", "--release"])
         .status()
         .context("Failed to spawn cargo build")?;
 
     if !status.success() {
         bail!(
-            "Cargo build failed. Ensure you have the target installed: `rustup target add wasm32-wasip2`"
+            "Cargo build failed. Set `[build] target = \"wasm32-unknown-unknown\"` (Astrid-canonical) or `wasm32-wasip2` in `.cargo/config.toml` and install the matching `rustup target` component."
         );
     }
     Ok(())
 }
 
-/// Locate the compiled WASM binary in the target directory (local or workspace).
+/// Wrap a core wasm module into a Component Model component if it isn't
+/// one already. `wasm32-unknown-unknown` (Astrid-canonical) produces a
+/// core module with `wit-bindgen`'s component-type custom section
+/// embedded; `wit_component::ComponentEncoder` consumes that section and
+/// emits a real component. `wasm32-wasip2` builds skip this — cargo
+/// already produces a component there.
+fn ensure_component(wasm_path: &Path) -> Result<PathBuf> {
+    let bytes =
+        std::fs::read(wasm_path).context("Failed to read compiled WASM for component check")?;
+    // Component magic: \0asm version=0x0d layer=0x01. Core magic:
+    // \0asm version=0x01. The 4-byte version field at offset 4
+    // distinguishes them.
+    let is_component = bytes.len() >= 8 && &bytes[..4] == b"\0asm" && bytes[6] == 0x01;
+    if is_component {
+        return Ok(wasm_path.to_path_buf());
+    }
+    info!("   Wrapping core wasm into Component Model component...");
+    let component = wit_component::ComponentEncoder::default()
+        .validate(true)
+        .module(&bytes)
+        .context("ComponentEncoder rejected the core wasm — wit-bindgen `generate!` may be missing or producing the wrong section")?
+        .encode()
+        .context("ComponentEncoder failed to emit a component")?;
+    let out = wasm_path.with_extension("component.wasm");
+    std::fs::write(&out, component)
+        .with_context(|| format!("Failed to write wrapped component to {}", out.display()))?;
+    Ok(out)
+}
+
+/// Locate the compiled WASM binary in the target directory. We don't
+/// know which target was used (the capsule's `.cargo/config.toml`
+/// decides), so probe the known guest targets in canonical-first order
+/// and accept the first one that exists. The capsule build wrapping
+/// step below treats `wasm32-unknown-unknown` outputs as core wasm
+/// modules that need to be wrapped into a component; `wasm32-wasip2`
+/// outputs are already components.
 fn locate_wasm_binary(
     dir: &Path,
     meta: &cargo_metadata::Metadata,
     wasm_name: &str,
 ) -> Result<PathBuf> {
-    let mut wasm_path = dir
-        .join("target")
-        .join("wasm32-wasip2")
-        .join("release")
-        .join(format!("{wasm_name}.wasm"));
-
-    if !wasm_path.exists() {
-        wasm_path = meta
-            .workspace_root
-            .clone()
-            .into_std_path_buf()
-            .join("target")
-            .join("wasm32-wasip2")
-            .join("release")
-            .join(format!("{wasm_name}.wasm"));
+    const TARGETS: &[&str] = &["wasm32-unknown-unknown", "wasm32-wasip2"];
+    let local_target = dir.join("target");
+    let workspace_target = meta
+        .workspace_root
+        .clone()
+        .into_std_path_buf()
+        .join("target");
+    for target in TARGETS {
+        for root in &[&local_target, &workspace_target] {
+            let candidate = root
+                .join(target)
+                .join("release")
+                .join(format!("{wasm_name}.wasm"));
+            if candidate.exists() {
+                return Ok(candidate);
+            }
+        }
     }
-
-    if !wasm_path.exists() {
-        bail!(
-            "Could not locate compiled WASM binary at {}",
-            wasm_path.display()
-        );
-    }
-    Ok(wasm_path)
+    bail!(
+        "Could not locate compiled WASM binary under `target/{{wasm32-unknown-unknown,wasm32-wasip2}}/release/{wasm_name}.wasm` in {} or workspace root",
+        dir.display()
+    );
 }
 
 /// Merge the developer's `Capsule.toml` with any extracted description.
