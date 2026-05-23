@@ -53,7 +53,7 @@ astrid-prelude = { path = "crates/astrid-prelude", version = "0.6.0" }
 astrid-storage = { path = "crates/astrid-storage", version = "0.6.0" }
 astrid-telemetry = { path = "crates/astrid-telemetry", version = "0.6.0" }
 astrid-test = { path = "crates/astrid-test" }
-astrid-types = { path = "crates/astrid-types", version = "0.6.0" }
+astrid-types = { path = "crates/astrid-types", version = "0.6.0", features = ["clock"] }
 astrid-vfs = { path = "crates/astrid-vfs", version = "0.6.0" }
 astrid-workspace = { path = "crates/astrid-workspace", version = "0.6.0" }
 anyhow = "1.0"
@@ -130,7 +130,12 @@ toml = "0.8"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 url = "2"
-uuid = { version = "1.0", features = ["v4", "v5", "serde"] }
+# `default-features = false` strips the `js` auto-feature that uuid
+# enables on `wasm32-unknown-unknown`, which would pull `wasm-bindgen`.
+# The `v4` feature uses `getrandom` under the hood — on host this is
+# the OS RNG, on capsule (wasm32-unknown-unknown) it's routed through
+# `astrid:sys.random-bytes` via the SDK's custom getrandom backend.
+uuid = { version = "1.0", default-features = false, features = ["v4", "v5", "serde", "rng-getrandom"] }
 walkdir = "2.5"
 wasm-encoder = "0.227"
 wasmparser = "0.227"

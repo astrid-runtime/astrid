@@ -20,8 +20,13 @@ pub struct IpcMessage {
     /// Timestamp when the message was dispatched. Defaults to now on
     /// deserialization so capsules forwarding bus messages over the wire
     /// (e.g. the CLI proxy) don't need to fabricate a timestamp the SDK
-    /// doesn't expose to them.
-    #[serde(default = "Utc::now")]
+    /// doesn't expose to them. Only filled in by the `clock` feature
+    /// path (kernel-side); when the feature is off (capsule SDK
+    /// consumption on `wasm32-unknown-unknown`), missing timestamps
+    /// fall back to the Unix epoch — capsules read timestamps from
+    /// kernel-published messages, they never construct fresh ones.
+    #[cfg_attr(feature = "clock", serde(default = "Utc::now"))]
+    #[cfg_attr(not(feature = "clock"), serde(default = "default_unix_epoch"))]
     pub timestamp: DateTime<Utc>,
     /// Monotonic sequence number assigned by the event bus at publish time.
     /// Used by the dispatcher to guarantee in-order delivery per capsule.
@@ -36,8 +41,25 @@ pub struct IpcMessage {
     pub principal: Option<String>,
 }
 
+/// `DateTime<Utc>` at the Unix epoch — used as the serde default for
+/// `timestamp` fields when the `clock` feature is off and a message
+/// arrives without one. Capsule-side code never inspects this value;
+/// kernel-side code always sets a real timestamp before publish.
+#[cfg(not(feature = "clock"))]
+fn default_unix_epoch() -> DateTime<Utc> {
+    DateTime::<Utc>::from_timestamp(0, 0).unwrap_or_else(|| {
+        // chrono guarantees epoch is representable; this branch is
+        // unreachable. Use `MIN_UTC` as the safe fallback.
+        DateTime::<Utc>::MIN_UTC
+    })
+}
+
 impl IpcMessage {
-    /// Create a new IPC message.
+    /// Create a new IPC message stamped with the current wall-clock
+    /// time. Only available when the `clock` feature is enabled
+    /// (kernel-side); capsule code constructs `IpcMessage` from
+    /// payloads it receives, never from scratch.
+    #[cfg(feature = "clock")]
     #[must_use]
     pub fn new(topic: impl Into<String>, payload: IpcPayload, source_id: Uuid) -> Self {
         Self {

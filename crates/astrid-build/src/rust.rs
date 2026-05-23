@@ -145,10 +145,18 @@ fn ensure_component(wasm_path: &Path) -> Result<PathBuf> {
         .context("ComponentEncoder rejected the core wasm — wit-bindgen `generate!` may be missing or producing the wrong section")?
         .encode()
         .context("ComponentEncoder failed to emit a component")?;
-    let out = wasm_path.with_extension("component.wasm");
-    std::fs::write(&out, component)
-        .with_context(|| format!("Failed to write wrapped component to {}", out.display()))?;
-    Ok(out)
+    // Overwrite the original artifact path so the capsule's
+    // `Capsule.toml [[component]] file = "<crate>.wasm"` directive
+    // continues to resolve. Using a `.component.wasm` sibling instead
+    // would force every capsule manifest to track which target produced
+    // the artifact — that's friction the toolchain should hide.
+    std::fs::write(wasm_path, component).with_context(|| {
+        format!(
+            "Failed to write wrapped component to {}",
+            wasm_path.display()
+        )
+    })?;
+    Ok(wasm_path.to_path_buf())
 }
 
 /// Locate the compiled WASM binary in the target directory. We don't
