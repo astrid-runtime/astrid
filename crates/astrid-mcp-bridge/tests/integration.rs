@@ -1,12 +1,15 @@
-//! End-to-end test: spawn `astrid mcp bridge` as a subprocess, drive
-//! it with an in-test rmcp client over its stdio, verify
-//! `initialize` returns the right server info and `tools/list` is empty.
+//! End-to-end tests: spawn `astrid mcp bridge` as a subprocess and
+//! drive it with an in-test rmcp client over its stdio.
+//!
+//! All tests below are `#[ignore]` because the bridge now connects to
+//! the live daemon at startup (Task 6+) — there is no useful offline
+//! mode left to assert against. Run with:
+//!
+//!   cargo test -p astrid-mcp-bridge --test integration -- --ignored
 //!
 //! The `astrid` binary lives in `astrid-cli`, not this crate, so we
 //! locate it via the workspace target directory derived from
-//! `CARGO_MANIFEST_DIR` and the executable's own path. We try (in
-//! order) the current build profile's directory, then `debug`, then
-//! `release` — whichever has a recent `astrid` binary.
+//! `CARGO_MANIFEST_DIR`.
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -15,20 +18,14 @@ use rmcp::ServiceExt;
 use tokio::process::Command;
 
 /// Locate the `astrid` binary in the workspace target directory.
-///
-/// `CARGO_MANIFEST_DIR` points at this crate; walk up to the workspace
-/// root (containing `Cargo.toml` + `target/`) and probe `target/debug`
-/// and `target/release`.
 fn find_astrid_binary() -> PathBuf {
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    // crates/astrid-mcp-bridge -> walk up to workspace root.
     let workspace_root = manifest
         .ancestors()
         .find(|p| p.join("Cargo.toml").is_file() && p.join("target").is_dir())
         .expect("workspace root with target/ not found");
     let target = workspace_root.join("target");
 
-    // Prefer debug (test default), fall back to release.
     let exe = if cfg!(windows) { "astrid.exe" } else { "astrid" };
     for profile in ["debug", "release"] {
         let candidate = target.join(profile).join(exe);
@@ -36,7 +33,6 @@ fn find_astrid_binary() -> PathBuf {
             return candidate;
         }
     }
-
     panic!(
         "could not locate `astrid` binary under {}/{{debug,release}}. \
          Run `cargo build -p astrid` first.",
@@ -45,7 +41,8 @@ fn find_astrid_binary() -> PathBuf {
 }
 
 #[tokio::test]
-async fn initialize_returns_server_info_and_empty_tools_list() -> anyhow::Result<()> {
+#[ignore = "requires running astrid daemon"]
+async fn initialize_returns_server_info() -> anyhow::Result<()> {
     let bin = find_astrid_binary();
     assert!(
         Path::new(&bin).is_file(),
@@ -57,7 +54,7 @@ async fn initialize_returns_server_info_and_empty_tools_list() -> anyhow::Result
     cmd.args(["mcp", "bridge"])
         .stdout(Stdio::piped())
         .stdin(Stdio::piped())
-        .stderr(Stdio::null());
+        .stderr(Stdio::inherit());
 
     let transport = rmcp::transport::child_process::TokioChildProcess::new(cmd)?;
     let service = ().serve(transport).await?;
@@ -67,13 +64,6 @@ async fn initialize_returns_server_info_and_empty_tools_list() -> anyhow::Result
         .expect("peer_info available after initialize");
     assert_eq!(server_info.server_info.name, "astrid-mcp-bridge");
 
-    let tools = service.list_tools(Option::default()).await?;
-    assert!(
-        tools.tools.is_empty(),
-        "expected empty catalog, got {:?}",
-        tools.tools
-    );
-
     let _ = service.cancel().await?;
     Ok(())
 }
@@ -82,5 +72,32 @@ async fn initialize_returns_server_info_and_empty_tools_list() -> anyhow::Result
 #[ignore = "requires running astrid daemon"]
 async fn bridge_connects_to_daemon() -> anyhow::Result<()> {
     let _conn = astrid_mcp_bridge::daemon::DaemonConnection::connect("default").await?;
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires running astrid daemon with capsule-system + capsule-shell installed"]
+async fn live_tools_list_includes_shell() -> anyhow::Result<()> {
+    let bin = find_astrid_binary();
+
+    let mut cmd = Command::new(&bin);
+    cmd.args(["mcp", "bridge"])
+        .stdout(Stdio::piped())
+        .stdin(Stdio::piped())
+        .stderr(Stdio::inherit());
+
+    let transport = rmcp::transport::child_process::TokioChildProcess::new(cmd)?;
+    let service = ().serve(transport).await?;
+
+    let tools = service.list_tools(Option::default()).await?;
+    let names: Vec<&str> = tools.tools.iter().map(|t| t.name.as_ref()).collect();
+    eprintln!("catalog: {names:?}");
+
+    assert!(
+        names.iter().any(|n| n.starts_with("shell.")),
+        "expected at least one shell.* tool; got: {names:?}"
+    );
+
+    let _ = service.cancel().await?;
     Ok(())
 }

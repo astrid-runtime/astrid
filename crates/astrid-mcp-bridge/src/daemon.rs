@@ -3,9 +3,13 @@
 //! attribution, plus a helper that builds messages stamped with the
 //! connection's principal.
 
+use std::time::Duration;
+
 use astrid_core::SessionId;
 use astrid_ipc_client::SocketClient;
 use astrid_types::ipc::{IpcMessage, IpcPayload};
+use astrid_types::llm::ToolCallResult;
+use tokio::time::timeout;
 use uuid::Uuid;
 
 use crate::error::BridgeError;
@@ -77,5 +81,55 @@ impl DaemonConnection {
     #[must_use]
     pub fn principal(&self) -> &str {
         &self.principal
+    }
+
+    /// Send a `ToolExecuteRequest` for `tool_name` with `args`, then
+    /// block until the matching `ToolExecuteResult` arrives.
+    ///
+    /// Filters out messages we self-echo: `capsule-cli` re-broadcasts
+    /// our own forwarded `ToolExecuteRequest` back at us (Task 1
+    /// limitation: cannot subscribe to mid-segment wildcards like
+    /// `tool.v1.execute.*.result`), so we discriminate by payload
+    /// variant and `call_id` match rather than by topic.
+    ///
+    /// # Errors
+    /// - [`BridgeError::DaemonDisconnected`] if the peer closes mid-call.
+    /// - [`BridgeError::ToolTimeout`] if `deadline` elapses without a
+    ///   matching response.
+    pub async fn call_tool_round_trip(
+        &mut self,
+        tool_name: &str,
+        args: serde_json::Value,
+        deadline: Duration,
+    ) -> Result<ToolCallResult, BridgeError> {
+        let call_id = Uuid::new_v4().to_string();
+        let topic = format!("tool.v1.execute.{tool_name}");
+        let req = self.build_message(
+            &topic,
+            IpcPayload::ToolExecuteRequest {
+                call_id: call_id.clone(),
+                tool_name: tool_name.to_owned(),
+                arguments: args,
+            },
+        );
+        self.send(&req).await?;
+
+        timeout(deadline, async {
+            loop {
+                let msg = self.recv().await?.ok_or(BridgeError::DaemonDisconnected)?;
+                if let IpcPayload::ToolExecuteResult {
+                    call_id: got,
+                    result,
+                } = msg.payload
+                {
+                    if got == call_id {
+                        return Ok::<ToolCallResult, BridgeError>(result);
+                    }
+                }
+                // Ignore self-echoed requests and unrelated traffic.
+            }
+        })
+        .await
+        .map_err(|_| BridgeError::ToolTimeout(deadline))?
     }
 }

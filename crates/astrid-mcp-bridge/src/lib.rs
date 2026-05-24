@@ -3,6 +3,7 @@
 
 #![allow(clippy::missing_errors_doc)]
 
+pub mod catalog;
 pub mod daemon;
 pub mod error;
 pub mod mcp;
@@ -27,17 +28,14 @@ impl Default for BridgeConfig {
     }
 }
 
-/// Run the bridge: accept MCP traffic on stdio, translate to/from
-/// the Astrid daemon. Returns when stdin closes or a fatal error
-/// occurs.
+/// Run the bridge: connect to the daemon, build the tool catalog by
+/// introspecting installed capsules, then accept MCP traffic on stdio.
+/// Returns when stdin closes or a fatal error occurs.
 pub async fn run_stdio(config: BridgeConfig) -> Result<(), BridgeError> {
     use rmcp::{ServiceExt, transport::stdio};
 
-    // `config` is used by later tasks (tool dispatch). For Task 4 the
-    // server is stateless beyond the handler struct.
-    let _ = config;
-
-    let server = mcp::AstridMcpServer::new();
+    let daemon = daemon::DaemonConnection::connect(&config.principal).await?;
+    let server = mcp::AstridMcpServer::new(daemon).await?;
     let service = server
         .serve(stdio())
         .await
