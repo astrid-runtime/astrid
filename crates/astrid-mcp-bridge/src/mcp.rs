@@ -106,12 +106,14 @@ impl ServerHandler for AstridMcpServer {
         request: CallToolRequestParams,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
+        crate::debug::log(format_args!("call_tool: enter, name={}", request.name));
         // 1. Validate the tool exists in our cached catalog. The
         //    catalog exposes tools as `<short_capsule>.<tool_name>`
         //    (built in catalog::build_catalog), so the MCP-facing
         //    name always carries that prefix.
         let mcp_name = request.name.as_ref();
         if !self.catalog.iter().any(|t| t.name == mcp_name) {
+            crate::debug::log(format_args!("call_tool: unknown tool {mcp_name}"));
             return Err(McpError::internal_error(
                 format!("unknown tool: {mcp_name}"),
                 None,
@@ -143,16 +145,36 @@ impl ServerHandler for AstridMcpServer {
         //    side of refusing dangerous operations when the UI loop
         //    can't confirm intent.
         let peer = ctx.peer.clone();
+        crate::debug::log(format_args!(
+            "call_tool: dispatching internal={internal_name}"
+        ));
         let result = {
             let mut daemon = self.daemon.lock().await;
             daemon
                 .call_tool_round_trip(internal_name, args, TOOL_CALL_TIMEOUT, |req| {
                     let peer = peer.clone();
-                    async move { elicit_approval(&peer, req).await }
+                    async move {
+                        crate::debug::log(format_args!(
+                            "approval_callback: invoked, action={}, resource={}",
+                            req.action, req.resource
+                        ));
+                        let decision = elicit_approval(&peer, req).await;
+                        crate::debug::log(format_args!(
+                            "approval_callback: decision={decision:?}"
+                        ));
+                        decision
+                    }
                 })
                 .await
         }
-        .map_err(|e| McpError::internal_error(format!("{e}"), None))?;
+        .map_err(|e| {
+            crate::debug::log(format_args!("call_tool: round-trip error: {e}"));
+            McpError::internal_error(format!("{e}"), None)
+        })?;
+        crate::debug::log(format_args!(
+            "call_tool: success, is_error={}",
+            result.is_error
+        ));
 
         // 5. Map the Astrid ToolCallResult to MCP CallToolResult.
         //    The capsule already discriminated success vs error via
@@ -209,9 +231,21 @@ async fn elicit_approval(
         requested_schema: schema,
     };
 
-    match peer
+    crate::debug::log(format_args!(
+        "elicit_approval: issuing elicitation, timeout={APPROVAL_TIMEOUT:?}"
+    ));
+    let res = peer
         .create_elicitation_with_timeout(params, Some(APPROVAL_TIMEOUT))
-        .await
+        .await;
+    crate::debug::log(format_args!(
+        "elicit_approval: elicitation returned: {}",
+        match &res {
+            Ok(r) => format!("Ok action={:?}", r.action),
+            Err(e) => format!("Err {e}"),
+        }
+    ));
+
+    match res
     {
         Ok(result) => match result.action {
             ElicitationAction::Accept => {

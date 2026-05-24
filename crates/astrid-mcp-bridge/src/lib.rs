@@ -5,6 +5,7 @@
 
 pub mod catalog;
 pub mod daemon;
+pub mod debug;
 pub mod error;
 pub mod mcp;
 
@@ -34,8 +35,11 @@ impl Default for BridgeConfig {
 pub async fn run_stdio(config: BridgeConfig) -> Result<(), BridgeError> {
     use rmcp::{ServiceExt, transport::stdio};
 
+    debug::log(format_args!("run_stdio: starting, principal={}", config.principal));
     let daemon = daemon::DaemonConnection::connect(&config.principal).await?;
+    debug::log(format_args!("run_stdio: daemon connected"));
     let server = mcp::AstridMcpServer::new(daemon).await?;
+    debug::log(format_args!("run_stdio: catalog built, serving over stdio"));
     let service = server
         .serve(stdio())
         .await
