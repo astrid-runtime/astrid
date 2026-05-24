@@ -15,6 +15,7 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
 use rmcp::ServiceExt;
+use rmcp::model::{CallToolRequestParams, RawContent};
 use tokio::process::Command;
 
 /// Locate the `astrid` binary in the workspace target directory.
@@ -96,6 +97,58 @@ async fn live_tools_list_includes_shell() -> anyhow::Result<()> {
     assert!(
         names.iter().any(|n| n.starts_with("shell.")),
         "expected at least one shell.* tool; got: {names:?}"
+    );
+
+    let _ = service.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires running astrid daemon with capsule-shell installed"]
+async fn live_call_shell_tool() -> anyhow::Result<()> {
+    let bin = find_astrid_binary();
+
+    let mut cmd = Command::new(&bin);
+    cmd.args(["mcp", "bridge"])
+        .stdout(Stdio::piped())
+        .stdin(Stdio::piped())
+        .stderr(Stdio::inherit());
+
+    let transport = rmcp::transport::child_process::TokioChildProcess::new(cmd)?;
+    let service = ().serve(transport).await?;
+
+    // Build argument map: { "command": "echo hello-astrid" }
+    let mut arguments = serde_json::Map::new();
+    arguments.insert(
+        "command".into(),
+        serde_json::Value::String("echo hello-astrid".into()),
+    );
+
+    let result = service
+        .call_tool(CallToolRequestParams {
+            meta: None,
+            name: "shell.run_shell_command".into(),
+            arguments: Some(arguments),
+            task: None,
+        })
+        .await?;
+
+    // Content is Vec<Content> where Content is Annotated<RawContent>;
+    // pattern-match the RawContent::Text variant via Deref.
+    let combined: String = result
+        .content
+        .iter()
+        .filter_map(|c| match &c.raw {
+            RawContent::Text(t) => Some(t.text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("");
+
+    assert!(
+        combined.contains("hello-astrid"),
+        "expected hello-astrid in output; got: {combined:?}; is_error={:?}",
+        result.is_error,
     );
 
     let _ = service.cancel().await?;

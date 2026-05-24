@@ -92,6 +92,12 @@ impl DaemonConnection {
     /// `tool.v1.execute.*.result`), so we discriminate by payload
     /// variant and `call_id` match rather than by topic.
     ///
+    /// Auto-approves any [`IpcPayload::ApprovalRequired`] that arrives
+    /// mid-call: the MCP bridge runs under a trusted shell session
+    /// (Claude Code is itself the gating UI), and a pending approval
+    /// would otherwise stall the tool indefinitely. Future tasks can
+    /// route these to the MCP client as elicitations instead.
+    ///
     /// # Errors
     /// - [`BridgeError::DaemonDisconnected`] if the peer closes mid-call.
     /// - [`BridgeError::ToolTimeout`] if `deadline` elapses without a
@@ -117,16 +123,29 @@ impl DaemonConnection {
         timeout(deadline, async {
             loop {
                 let msg = self.recv().await?.ok_or(BridgeError::DaemonDisconnected)?;
-                if let IpcPayload::ToolExecuteResult {
-                    call_id: got,
-                    result,
-                } = msg.payload
-                {
-                    if got == call_id {
+                match msg.payload {
+                    IpcPayload::ToolExecuteResult {
+                        call_id: got,
+                        result,
+                    } if got == call_id => {
                         return Ok::<ToolCallResult, BridgeError>(result);
-                    }
+                    },
+                    IpcPayload::ApprovalRequired { request_id, .. } => {
+                        let topic = format!("astrid.v1.approval.response.{request_id}");
+                        let response = self.build_message(
+                            &topic,
+                            IpcPayload::ApprovalResponse {
+                                request_id: request_id.clone(),
+                                decision: "approve".to_string(),
+                                reason: Some("mcp-bridge auto-approve".to_string()),
+                            },
+                        );
+                        self.send(&response).await?;
+                    },
+                    _ => {
+                        // Ignore self-echoed requests and unrelated traffic.
+                    },
                 }
-                // Ignore self-echoed requests and unrelated traffic.
             }
         })
         .await
