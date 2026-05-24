@@ -9,7 +9,7 @@ use colored::Colorize;
 
 use crate::formatter::{OutputFormat, OutputFormatter, create_formatter};
 use crate::repl::ReadlineEvent;
-use crate::socket_client::SocketClient;
+use astrid_ipc_client::socket_client::SocketClient;
 use crate::theme::Theme;
 
 /// Reason sent (and displayed) when the JSON REPL auto-denies an approval request.
@@ -85,7 +85,8 @@ async fn run_json_chat(
             continue;
         }
 
-        client.send_input(input.to_string()).await?;
+        let caller = crate::context::active_agent()?.to_string();
+        client.send_input(input.to_string(), caller).await?;
 
         if !drain_agent_response(client, session_id, &mut *formatter).await? {
             return Ok(());

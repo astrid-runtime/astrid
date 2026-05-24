@@ -143,6 +143,7 @@ async fn dispatch_subcommand(
             commands::self_update::ensure_path_setup()?;
             Ok(ExitCode::SUCCESS)
         },
+        Some(Commands::Mcp { command }) => commands::mcp::run(command).await,
         Some(Commands::Capsule { command }) => dispatch_capsule(command).await,
         Some(Commands::Distro { command }) => dispatch_distro(command).await,
         Some(Commands::Wit { command }) => dispatch_wit(&command),

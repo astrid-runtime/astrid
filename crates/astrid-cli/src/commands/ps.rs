@@ -13,7 +13,7 @@ use colored::Colorize;
 use serde::Serialize;
 use uuid::Uuid;
 
-use crate::socket_client::SocketClient;
+use astrid_ipc_client::socket_client::SocketClient;
 use crate::theme::Theme;
 use crate::value_formatter::{ValueFormat, emit_structured};
 
@@ -38,7 +38,7 @@ pub(crate) struct CapsuleRow {
 /// Entry point for `astrid ps`.
 pub(crate) async fn run(args: PsArgs) -> Result<ExitCode> {
     let format = ValueFormat::parse(&args.format);
-    let socket_path = crate::socket_client::proxy_socket_path();
+    let socket_path = astrid_ipc_client::socket_client::proxy_socket_path();
     if !socket_path.exists() {
         if format.is_pretty() {
             println!("{}", Theme::info("No Astrid daemon is running."));
@@ -66,7 +66,7 @@ pub(crate) async fn run(args: PsArgs) -> Result<ExitCode> {
             std::time::Duration::from_secs(10),
         )
         .await?;
-    let entries = match crate::socket_client::SocketClient::extract_kernel_response(&raw) {
+    let entries = match astrid_ipc_client::socket_client::SocketClient::extract_kernel_response(&raw) {
         Some(astrid_types::kernel::KernelResponse::CapsuleMetadata(list)) => list,
         _ => Vec::new(),
     };

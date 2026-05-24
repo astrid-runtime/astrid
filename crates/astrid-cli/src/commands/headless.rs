@@ -5,7 +5,8 @@ use std::io::IsTerminal;
 use anyhow::{Context, Result};
 
 use super::daemon;
-use crate::{formatter, socket_client, tui};
+use crate::{formatter, tui};
+use astrid_ipc_client::socket_client;
 
 /// Resolve the `--session` flag value into a [`uuid::Uuid`].
 ///
@@ -130,7 +131,8 @@ pub(crate) async fn run_headless(
     };
 
     // Send the prompt and collect the streaming response
-    client.send_input(full_prompt).await?;
+    let caller = crate::context::active_agent()?.to_string();
+    client.send_input(full_prompt, caller).await?;
     let (response_text, tool_calls) =
         collect_response(&mut client, &session_id, format, auto_approve).await?;
 

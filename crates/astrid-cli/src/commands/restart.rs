@@ -12,7 +12,7 @@ use anyhow::Result;
 use tokio::time::sleep;
 
 use crate::commands::daemon;
-use crate::socket_client;
+use astrid_ipc_client::socket_client;
 use crate::theme::Theme;
 
 /// Entry point for `astrid restart`.

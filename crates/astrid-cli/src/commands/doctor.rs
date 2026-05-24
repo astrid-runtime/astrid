@@ -13,7 +13,7 @@ use clap::Args;
 use colored::Colorize;
 use uuid::Uuid;
 
-use crate::socket_client::SocketClient;
+use astrid_ipc_client::socket_client::SocketClient;
 use crate::theme::Theme;
 
 #[derive(Args, Debug, Clone)]

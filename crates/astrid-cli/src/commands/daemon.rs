@@ -3,7 +3,8 @@
 use anyhow::{Context, Result};
 
 use crate::bootstrap::find_companion_binary;
-use crate::{socket_client, theme};
+use crate::theme;
+use astrid_ipc_client::socket_client;
 
 /// Build a hint string pointing the user to the daemon log directory.
 fn log_hint() -> String {
@@ -203,7 +204,7 @@ pub(crate) async fn handle_status() -> Result<()> {
                     )
                     .await?;
                 if let Some(astrid_types::kernel::KernelResponse::Status(status)) =
-                    crate::socket_client::SocketClient::extract_kernel_response(&raw)
+                    astrid_ipc_client::socket_client::SocketClient::extract_kernel_response(&raw)
                 {
                     let uptime_display = format_uptime(status.uptime_secs);
                     println!(

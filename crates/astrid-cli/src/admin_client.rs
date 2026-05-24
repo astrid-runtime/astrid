@@ -22,7 +22,7 @@ use astrid_types::kernel::{
 use serde_json::Value;
 use uuid::Uuid;
 
-use crate::socket_client::SocketClient;
+use astrid_ipc_client::socket_client::SocketClient;
 
 /// Topic prefix for admin requests sent by the CLI.
 const ADMIN_INPUT_PREFIX: &str = "astrid.v1.admin.";

@@ -26,7 +26,7 @@ use crossterm::{
 };
 use ratatui::{Terminal, backend::CrosstermBackend};
 
-use crate::socket_client::SocketClient;
+use astrid_ipc_client::socket_client::SocketClient;
 use state::{App, MessageRole, PendingAction, UiState};
 
 /// Type alias for our terminal.
@@ -568,11 +568,23 @@ async fn handle_pending_actions(
                     };
 
                     // Send to daemon.
-                    if let Err(e) = client.send_input(content).await {
-                        app.push_notice(&format!("Failed to send input: {e}"));
-                        app.state = UiState::Error {
-                            message: format!("Send failed: {e}"),
-                        };
+                    match crate::context::active_agent() {
+                        Ok(caller) => {
+                            if let Err(e) =
+                                client.send_input(content, caller.to_string()).await
+                            {
+                                app.push_notice(&format!("Failed to send input: {e}"));
+                                app.state = UiState::Error {
+                                    message: format!("Send failed: {e}"),
+                                };
+                            }
+                        },
+                        Err(e) => {
+                            app.push_notice(&format!("Failed to resolve active agent: {e}"));
+                            app.state = UiState::Error {
+                                message: format!("Active agent resolution failed: {e}"),
+                            };
+                        },
                     }
                 }
             },

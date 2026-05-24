@@ -29,6 +29,8 @@ astrid-config = { workspace = true }
 astrid-core = { workspace = true }
 blake3 = { workspace = true }
 astrid-events = { workspace = true }
+astrid-ipc-client = { workspace = true }
+astrid-mcp-bridge = { workspace = true }
 astrid-types = { workspace = true }
 astrid-daemon = { workspace = true }
 astrid-storage = { workspace = true, features = ["keychain"] }
