@@ -77,3 +77,10 @@ async fn initialize_returns_server_info_and_empty_tools_list() -> anyhow::Result
     let _ = service.cancel().await?;
     Ok(())
 }
+
+#[tokio::test]
+#[ignore = "requires running astrid daemon"]
+async fn bridge_connects_to_daemon() -> anyhow::Result<()> {
+    let _conn = astrid_mcp_bridge::daemon::DaemonConnection::connect("default").await?;
+    Ok(())
+}

@@ -3,6 +3,7 @@
 
 #![allow(clippy::missing_errors_doc)]
 
+pub mod daemon;
 pub mod error;
 pub mod mcp;
 
