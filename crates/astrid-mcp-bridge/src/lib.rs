@@ -4,6 +4,8 @@
 #![allow(clippy::missing_errors_doc)]
 
 pub mod error;
+pub mod mcp;
+
 pub use error::BridgeError;
 
 /// Configuration for a single bridge run.
@@ -28,6 +30,20 @@ impl Default for BridgeConfig {
 /// the Astrid daemon. Returns when stdin closes or a fatal error
 /// occurs.
 pub async fn run_stdio(config: BridgeConfig) -> Result<(), BridgeError> {
+    use rmcp::{ServiceExt, transport::stdio};
+
+    // `config` is used by later tasks (tool dispatch). For Task 4 the
+    // server is stateless beyond the handler struct.
     let _ = config;
-    Err(BridgeError::NotYetImplemented("run_stdio"))
+
+    let server = mcp::AstridMcpServer::new();
+    let service = server
+        .serve(stdio())
+        .await
+        .map_err(|e| BridgeError::Mcp(anyhow::anyhow!("serve: {e}")))?;
+    service
+        .waiting()
+        .await
+        .map_err(|e| BridgeError::Mcp(anyhow::anyhow!("waiting: {e}")))?;
+    Ok(())
 }
