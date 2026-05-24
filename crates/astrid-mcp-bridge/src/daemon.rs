@@ -14,6 +14,44 @@ use uuid::Uuid;
 
 use crate::error::BridgeError;
 
+/// A capability-approval request surfaced mid-tool-call by the kernel.
+///
+/// Mirrors [`IpcPayload::ApprovalRequired`](astrid_types::ipc::IpcPayload::ApprovalRequired)
+/// minus the wire-level `request_id` (the daemon connection handles
+/// correlation internally). Passed to the `on_approval` callback of
+/// [`DaemonConnection::call_tool_round_trip`].
+#[derive(Debug, Clone)]
+pub struct ApprovalRequest {
+    /// Action being requested (e.g. "git push").
+    pub action: String,
+    /// Resource target (e.g. the full command string).
+    pub resource: String,
+    /// Justification supplied by the originating interceptor/capsule.
+    pub reason: String,
+}
+
+/// The user-facing decision on an [`ApprovalRequest`].
+///
+/// Serializes to the `decision` string on
+/// [`IpcPayload::ApprovalResponse`](astrid_types::ipc::IpcPayload::ApprovalResponse)
+/// — either `"approve"` or `"deny"`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApprovalDecision {
+    Approve,
+    Deny,
+}
+
+impl ApprovalDecision {
+    /// Wire-protocol string for the IPC `decision` field.
+    #[must_use]
+    pub fn as_wire(self) -> &'static str {
+        match self {
+            Self::Approve => "approve",
+            Self::Deny => "deny",
+        }
+    }
+}
+
 /// A connected, handshake-complete daemon session.
 ///
 /// The bridge uses one of these per stdio run. All outbound messages
@@ -92,22 +130,30 @@ impl DaemonConnection {
     /// `tool.v1.execute.*.result`), so we discriminate by payload
     /// variant and `call_id` match rather than by topic.
     ///
-    /// Auto-approves any [`IpcPayload::ApprovalRequired`] that arrives
-    /// mid-call: the MCP bridge runs under a trusted shell session
-    /// (Claude Code is itself the gating UI), and a pending approval
-    /// would otherwise stall the tool indefinitely. Future tasks can
-    /// route these to the MCP client as elicitations instead.
+    /// Any [`IpcPayload::ApprovalRequired`] that arrives mid-call is
+    /// surfaced to the caller via the `on_approval` callback. The
+    /// caller's returned [`ApprovalDecision`] is translated into an
+    /// `ApprovalResponse` (`"approve"` or `"deny"`) on the bus, then
+    /// the loop resumes waiting for the tool result. A deny does NOT
+    /// short-circuit the round-trip — the capsule decides whether
+    /// denial means "fail the tool call" or "fall back to a safer
+    /// path"; either way we still wait for its `ToolExecuteResult`.
     ///
     /// # Errors
     /// - [`BridgeError::DaemonDisconnected`] if the peer closes mid-call.
     /// - [`BridgeError::ToolTimeout`] if `deadline` elapses without a
     ///   matching response.
-    pub async fn call_tool_round_trip(
+    pub async fn call_tool_round_trip<F, Fut>(
         &mut self,
         tool_name: &str,
         args: serde_json::Value,
         deadline: Duration,
-    ) -> Result<ToolCallResult, BridgeError> {
+        on_approval: F,
+    ) -> Result<ToolCallResult, BridgeError>
+    where
+        F: Fn(ApprovalRequest) -> Fut + Send + Sync,
+        Fut: std::future::Future<Output = ApprovalDecision> + Send,
+    {
         let call_id = Uuid::new_v4().to_string();
         let topic = format!("tool.v1.execute.{tool_name}");
         let req = self.build_message(
@@ -130,14 +176,25 @@ impl DaemonConnection {
                     } if got == call_id => {
                         return Ok::<ToolCallResult, BridgeError>(result);
                     },
-                    IpcPayload::ApprovalRequired { request_id, .. } => {
+                    IpcPayload::ApprovalRequired {
+                        request_id,
+                        action,
+                        resource,
+                        reason,
+                    } => {
+                        let req = ApprovalRequest {
+                            action,
+                            resource,
+                            reason,
+                        };
+                        let decision = on_approval(req).await;
                         let topic = format!("astrid.v1.approval.response.{request_id}");
                         let response = self.build_message(
                             &topic,
                             IpcPayload::ApprovalResponse {
                                 request_id: request_id.clone(),
-                                decision: "approve".to_string(),
-                                reason: Some("mcp-bridge auto-approve".to_string()),
+                                decision: decision.as_wire().to_string(),
+                                reason: Some("mcp-bridge: forwarded via elicitation".to_string()),
                             },
                         );
                         self.send(&response).await?;

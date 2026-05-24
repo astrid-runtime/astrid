@@ -21,20 +21,26 @@ use std::time::Duration;
 use rmcp::{
     ErrorData as McpError, RoleServer, ServerHandler,
     model::{
-        CallToolRequestParams, CallToolResult, Content, Implementation, ListToolsResult,
+        CallToolRequestParams, CallToolResult, Content, CreateElicitationRequestParams,
+        ElicitationAction, ElicitationSchema, Implementation, ListToolsResult,
         PaginatedRequestParams, ServerCapabilities, ServerInfo, Tool,
     },
     service::RequestContext,
 };
 use tokio::sync::Mutex;
 
-use crate::daemon::DaemonConnection;
+use crate::daemon::{ApprovalDecision, ApprovalRequest, DaemonConnection};
 use crate::error::BridgeError;
 
 /// Per-call timeout for forwarded tool execution. Mirrors the default
 /// Claude Code expects; capsule-side operations longer than this will
 /// surface as timeout errors back to the MCP client.
 const TOOL_CALL_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// How long to wait for the MCP client (Claude Code) to respond to an
+/// elicitation prompt before treating it as a denial. Generous because
+/// the human at the keyboard may take a moment to read the request.
+const APPROVAL_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// MCP server exposed by `astrid mcp bridge`.
 ///
@@ -98,7 +104,7 @@ impl ServerHandler for AstridMcpServer {
     async fn call_tool(
         &self,
         request: CallToolRequestParams,
-        _ctx: RequestContext<RoleServer>,
+        ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
         // 1. Validate the tool exists in our cached catalog. The
         //    catalog exposes tools as `<short_capsule>.<tool_name>`
@@ -128,10 +134,22 @@ impl ServerHandler for AstridMcpServer {
         // 4. Round-trip through the daemon. Hold the lock only for
         //    the duration of the send + recv loop — other tool calls
         //    on the same connection serialize behind us.
+        //
+        //    Any approval requests raised mid-call route to Claude
+        //    Code via an MCP elicitation: we surface action/resource/
+        //    reason in a form-style prompt with a single boolean
+        //    `approved` field. Decline, Cancel, timeout, or any
+        //    protocol error all map to Deny — the bridge errs on the
+        //    side of refusing dangerous operations when the UI loop
+        //    can't confirm intent.
+        let peer = ctx.peer.clone();
         let result = {
             let mut daemon = self.daemon.lock().await;
             daemon
-                .call_tool_round_trip(internal_name, args, TOOL_CALL_TIMEOUT)
+                .call_tool_round_trip(internal_name, args, TOOL_CALL_TIMEOUT, |req| {
+                    let peer = peer.clone();
+                    async move { elicit_approval(&peer, req).await }
+                })
                 .await
         }
         .map_err(|e| McpError::internal_error(format!("{e}"), None))?;
@@ -149,5 +167,75 @@ impl ServerHandler for AstridMcpServer {
 
     fn get_tool(&self, name: &str) -> Option<Tool> {
         self.catalog.iter().find(|t| t.name == name).cloned()
+    }
+}
+
+/// Surface an [`ApprovalRequest`] to the MCP client as an elicitation.
+///
+/// We use a form-style elicitation with a single required boolean
+/// (`approved`) so the client can render a simple yes/no prompt. The
+/// human-readable details live in the `message` field — schemas can
+/// only carry primitive properties (string/number/boolean/enum-string),
+/// not arbitrary structured payloads.
+///
+/// Returns [`ApprovalDecision::Approve`] only when the client returns
+/// `action: Accept` AND `content.approved == true`. Decline, Cancel,
+/// timeout, transport errors, malformed responses, schema build
+/// failures, and missing `approved` field all map to Deny.
+async fn elicit_approval(
+    peer: &rmcp::Peer<RoleServer>,
+    req: ApprovalRequest,
+) -> ApprovalDecision {
+    let Ok(schema) = ElicitationSchema::builder()
+        .required_bool("approved")
+        .build()
+    else {
+        tracing::error!("failed to build elicitation schema; denying by default");
+        return ApprovalDecision::Deny;
+    };
+
+    let message = format!(
+        "Astrid is requesting approval:\n\n\
+         Action:   {}\n\
+         Resource: {}\n\
+         Reason:   {}\n\n\
+         Allow this operation?",
+        req.action, req.resource, req.reason,
+    );
+
+    let params = CreateElicitationRequestParams::FormElicitationParams {
+        meta: None,
+        message,
+        requested_schema: schema,
+    };
+
+    match peer
+        .create_elicitation_with_timeout(params, Some(APPROVAL_TIMEOUT))
+        .await
+    {
+        Ok(result) => match result.action {
+            ElicitationAction::Accept => {
+                let approved = result
+                    .content
+                    .as_ref()
+                    .and_then(|c| c.get("approved"))
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false);
+                if approved {
+                    ApprovalDecision::Approve
+                } else {
+                    ApprovalDecision::Deny
+                }
+            },
+            ElicitationAction::Decline | ElicitationAction::Cancel => ApprovalDecision::Deny,
+        },
+        Err(err) => {
+            tracing::warn!(
+                error = %err,
+                action = %req.action,
+                "elicitation failed; denying approval by default"
+            );
+            ApprovalDecision::Deny
+        },
     }
 }

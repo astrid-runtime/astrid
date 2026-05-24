@@ -105,7 +105,16 @@ async fn live_tools_list_includes_shell() -> anyhow::Result<()> {
 
 #[tokio::test]
 #[ignore = "requires running astrid daemon with capsule-shell installed"]
-async fn live_call_shell_tool() -> anyhow::Result<()> {
+async fn live_call_shell_tool_denies_on_unhandled_elicitation() -> anyhow::Result<()> {
+    // After Task 8, the bridge no longer auto-approves. Approval
+    // requests from the kernel are forwarded to the MCP client as
+    // elicitations. The test client below (`()`) does NOT implement
+    // an elicitation handler, so rmcp will reply with an error /
+    // capability-not-supported — which the bridge maps to Deny.
+    //
+    // We expect the tool call to surface as `is_error == true`. The
+    // capsule may either fail outright or return a refusal payload;
+    // either way it's NOT the success path of Task 7.
     let bin = find_astrid_binary();
 
     let mut cmd = Command::new(&bin);
@@ -133,8 +142,6 @@ async fn live_call_shell_tool() -> anyhow::Result<()> {
         })
         .await?;
 
-    // Content is Vec<Content> where Content is Annotated<RawContent>;
-    // pattern-match the RawContent::Text variant via Deref.
     let combined: String = result
         .content
         .iter()
@@ -145,9 +152,11 @@ async fn live_call_shell_tool() -> anyhow::Result<()> {
         .collect::<Vec<_>>()
         .join("");
 
-    assert!(
-        combined.contains("hello-astrid"),
-        "expected hello-astrid in output; got: {combined:?}; is_error={:?}",
+    assert_eq!(
+        result.is_error,
+        Some(true),
+        "expected denial-induced error after Task 8 (no auto-approve); \
+         got is_error={:?}, content={combined:?}",
         result.is_error,
     );
 

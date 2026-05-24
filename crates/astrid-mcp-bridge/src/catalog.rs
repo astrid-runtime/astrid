@@ -44,7 +44,12 @@ const TOOL_RESULT_SUFFIX: &str = ".result";
 /// `call_tool_round_trip` calls (timeout, daemon disconnect, etc.).
 pub async fn build_catalog(daemon: &mut DaemonConnection) -> Result<Vec<Tool>, BridgeError> {
     let list = daemon
-        .call_tool_round_trip("list_capsules", serde_json::json!({}), CATALOG_TIMEOUT)
+        .call_tool_round_trip(
+            "list_capsules",
+            serde_json::json!({}),
+            CATALOG_TIMEOUT,
+            deny_during_catalog,
+        )
         .await?;
     let capsule_names = parse_capsule_names(&list.content);
 
@@ -55,11 +60,32 @@ pub async fn build_catalog(daemon: &mut DaemonConnection) -> Result<Vec<Tool>, B
                 "inspect_capsule",
                 serde_json::json!({ "name": &name }),
                 CATALOG_TIMEOUT,
+                deny_during_catalog,
             )
             .await?;
         tools.extend(parse_tools_from_inspect(&name, &inspect.content));
     }
     Ok(tools)
+}
+
+/// Approval policy for catalog-time introspection calls.
+///
+/// Catalog construction happens at bridge startup, *before* the MCP
+/// stdio handshake — there is no `Peer` yet to issue an elicitation
+/// against, and the introspection tools (`list_capsules`,
+/// `inspect_capsule` on capsule-system) are intentionally low-privilege
+/// and should never trip the approval interceptor. If one ever does,
+/// we deny rather than block forever or auto-approve into capabilities
+/// the user never consented to.
+async fn deny_during_catalog(
+    req: crate::daemon::ApprovalRequest,
+) -> crate::daemon::ApprovalDecision {
+    tracing::warn!(
+        action = %req.action,
+        resource = %req.resource,
+        "approval required during catalog build; denying (no MCP client to elicit from yet)"
+    );
+    crate::daemon::ApprovalDecision::Deny
 }
 
 /// Extract capsule names from the JSON array returned by
