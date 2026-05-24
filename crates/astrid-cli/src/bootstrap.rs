@@ -11,7 +11,7 @@ use anyhow::{Context, Result};
 use crate::cli::Cli;
 use crate::commands;
 use crate::formatter::OutputFormat;
-use crate::socket_client;
+use astrid_ipc_client::socket_client;
 use crate::theme;
 
 /// Ensure `~/.astrid/` exists and run first-boot init if needed.

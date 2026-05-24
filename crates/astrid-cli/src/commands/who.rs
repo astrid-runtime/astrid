@@ -23,7 +23,7 @@ use serde::Serialize;
 use uuid::Uuid;
 
 use crate::commands::daemon;
-use crate::socket_client::SocketClient;
+use astrid_ipc_client::socket_client::SocketClient;
 use crate::theme::Theme;
 use crate::value_formatter::{ValueFormat, emit_structured};
 
@@ -47,7 +47,7 @@ pub(crate) struct Connection {
 /// Entry point for `astrid who`.
 pub(crate) async fn run(args: WhoArgs) -> Result<ExitCode> {
     let format = ValueFormat::parse(&args.format);
-    let socket_path = crate::socket_client::proxy_socket_path();
+    let socket_path = astrid_ipc_client::socket_client::proxy_socket_path();
     if !socket_path.exists() {
         if format.is_pretty() {
             println!("{}", Theme::info("No Astrid daemon is running."));
@@ -78,7 +78,7 @@ pub(crate) async fn run(args: WhoArgs) -> Result<ExitCode> {
     // Reuse the shared envelope extractor so this command tracks any
     // future change to the IPC response wrapper without re-implementing
     // the `{type, value}` unwrap inline (matches `ps` / `daemon` usage).
-    let status = match crate::socket_client::SocketClient::extract_kernel_response(&raw) {
+    let status = match astrid_ipc_client::socket_client::SocketClient::extract_kernel_response(&raw) {
         Some(astrid_types::kernel::KernelResponse::Status(s)) => Some(s),
         _ => None,
     };

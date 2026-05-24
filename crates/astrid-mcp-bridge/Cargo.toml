@@ -1,0 +1,30 @@
+[package]
+name = "astrid-mcp-bridge"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "MCP server bridge that lets external MCP clients (Claude Code) drive Astrid capsule tools."
+
+[dependencies]
+anyhow = { workspace = true }
+astrid-core = { workspace = true }
+astrid-ipc-client = { workspace = true }
+astrid-types = { workspace = true }
+rmcp = { workspace = true }
+schemars = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+toml = { workspace = true }
+tokio = { workspace = true, features = ["net", "io-util", "sync", "macros", "rt-multi-thread"] }
+tracing = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[lints]
+workspace = true

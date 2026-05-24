@@ -11,7 +11,8 @@ use crate::commands::{
     agent::AgentCommand, audit::AuditArgs, budget::BudgetCommand, caps::CapsCommand,
     capsule::config::ConfigArgs as CapsuleConfigArgs, capsule::show::ShowArgs as CapsuleShowArgs,
     completions::CompletionsArgs, doctor::DoctorArgs, gc::GcArgs, group::GroupCommand,
-    logs::LogsArgs, ps::PsArgs, quota::QuotaCommand, run::RunArgs, secret::SecretCommand,
+    logs::LogsArgs, mcp::McpCommand, ps::PsArgs, quota::QuotaCommand, run::RunArgs,
+    secret::SecretCommand,
     setup::SetupArgs, top::TopArgs, trust::TrustCommand, version::VersionArgs,
     voucher::VoucherCommand, who::WhoArgs,
 };
@@ -177,6 +178,12 @@ pub(crate) enum Commands {
         /// Distro to install (name, @org/repo, or path to Distro.toml)
         #[arg(long, default_value = "astralis")]
         distro: String,
+    },
+
+    /// Bridge Astrid tools to external MCP clients (Claude Code, etc.)
+    Mcp {
+        #[command(subcommand)]
+        command: McpCommand,
     },
 
     /// View resolved configuration, edit it in `$EDITOR`, or print paths.

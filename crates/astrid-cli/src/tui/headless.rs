@@ -31,7 +31,7 @@ use ratatui::style::{Color, Modifier};
 
 use super::render;
 use super::state::{App, MessageRole, UiState};
-use crate::socket_client::SocketClient;
+use astrid_ipc_client::socket_client::SocketClient;
 
 /// Convert a ratatui `Color` to an ANSI SGR foreground code.
 fn fg_ansi(color: Color) -> Option<String> {
@@ -209,7 +209,10 @@ pub(crate) async fn run(cfg: HeadlessConfig<'_>) -> anyhow::Result<()> {
         start_time: Instant::now(),
         dots: 0,
     };
-    cfg.client.send_input(cfg.prompt.to_string()).await?;
+    let caller = crate::context::active_agent()?.to_string();
+    cfg.client
+        .send_input(cfg.prompt.to_string(), caller)
+        .await?;
     snapshot(&mut terminal, &mut app, "input_sent");
 
     let timeout = Duration::from_secs(120);

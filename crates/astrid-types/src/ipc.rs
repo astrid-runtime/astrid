@@ -71,6 +71,23 @@ fn default_session_id() -> String {
     "default".into()
 }
 
+/// Describes one tool an external client (e.g. an MCP bridge) can
+/// invoke through the daemon.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ToolDescriptor {
+    /// Namespaced tool name exposed externally, e.g.
+    /// `shell.run_shell_command`. The part after the dot is the
+    /// internal tool_name used on the IPC bus.
+    pub name: String,
+    /// Human-readable description.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// JSON Schema for the tool's input arguments.
+    pub input_schema: Value,
+    /// Which capsule hosts this tool (e.g. `astrid-capsule-shell`).
+    pub capsule: String,
+}
+
 /// Standardized cross-boundary payload schemas.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -174,6 +191,20 @@ pub enum IpcPayload {
         /// The call IDs of the tool invocations to cancel.
         call_ids: Vec<String>,
     },
+    /// External client requests the tool catalog.
+    ToolListRequest {
+        /// Correlation ID; echoed in the response.
+        request_id: String,
+    },
+
+    /// Response carrying the catalog of tools available to the
+    /// requesting principal.
+    ToolListResponse {
+        /// Matches the originating ToolListRequest's request_id.
+        request_id: String,
+        /// Tools available.
+        tools: Vec<ToolDescriptor>,
+    },
     /// A capsule is requesting the user to select from a list of options.
     SelectionRequired {
         /// Opaque ID so the capsule can correlate the response.
@@ -241,6 +272,8 @@ impl IpcPayload {
                 | "tool_execute_request"
                 | "tool_execute_result"
                 | "tool_cancel_request"
+                | "tool_list_request"
+                | "tool_list_response"
                 | "selection_required"
                 | "elicit_request"
                 | "elicit_response"
@@ -448,7 +481,7 @@ mod tests {
     /// match arm *and* the representatives list below, this test fails.
     #[test]
     fn is_known_tag_covers_all_variants() {
-        const EXPECTED_VARIANT_COUNT: usize = 17;
+        const EXPECTED_VARIANT_COUNT: usize = 19;
 
         let representatives: Vec<IpcPayload> = vec![
             IpcPayload::RawJson(serde_json::json!({"key": "val"})),
@@ -515,6 +548,13 @@ mod tests {
                     content: String::new(),
                     is_error: false,
                 },
+            },
+            IpcPayload::ToolListRequest {
+                request_id: String::new(),
+            },
+            IpcPayload::ToolListResponse {
+                request_id: String::new(),
+                tools: vec![],
             },
             IpcPayload::SelectionRequired {
                 request_id: String::new(),
@@ -744,5 +784,37 @@ mod tests {
         });
         let payload = IpcPayload::from_json_value(data);
         assert!(matches!(payload, IpcPayload::UserInput { .. }));
+    }
+
+    #[test]
+    fn tool_list_request_round_trips() {
+        let p = IpcPayload::ToolListRequest { request_id: "req-1".into() };
+        let json = serde_json::to_string(&p).unwrap();
+        assert!(json.contains("\"type\":\"tool_list_request\""));
+        assert!(json.contains("\"request_id\":\"req-1\""));
+        let back: IpcPayload = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, p);
+    }
+
+    #[test]
+    fn tool_list_response_round_trips() {
+        let p = IpcPayload::ToolListResponse {
+            request_id: "req-1".into(),
+            tools: vec![ToolDescriptor {
+                name: "shell.run_shell_command".into(),
+                description: Some("Run a shell command".into()),
+                input_schema: serde_json::json!({"type": "object"}),
+                capsule: "astrid-capsule-shell".into(),
+            }],
+        };
+        let json = serde_json::to_string(&p).unwrap();
+        let back: IpcPayload = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, p);
+    }
+
+    #[test]
+    fn new_variants_are_known_tags() {
+        assert!(IpcPayload::is_known_tag("tool_list_request"));
+        assert!(IpcPayload::is_known_tag("tool_list_response"));
     }
 }

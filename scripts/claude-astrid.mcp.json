@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "astrid": {
+      "command": "astrid",
+      "args": ["mcp", "bridge"]
+    }
+  }
+}

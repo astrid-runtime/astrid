@@ -37,8 +37,6 @@ mod context;
 mod dispatch;
 mod formatter;
 mod repl;
-/// The socket client for interacting with the Kernel.
-pub mod socket_client;
 mod theme;
 mod tui;
 mod value_formatter;

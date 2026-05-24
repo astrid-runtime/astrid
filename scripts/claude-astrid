@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+#
+# claude-astrid: run `claude` with native tools disabled and the
+# Astrid MCP bridge as the only tool provider.
+#
+# LIMITATIONS in v1: WebSearch, Glob, and Grep have no Astrid
+# equivalent capsule yet, so they're disabled with no replacement.
+# If Claude needs them, work around by spawning a shell command
+# (shell.run_shell_command) until shim capsules ship.
+#
+set -euo pipefail
+
+# Ensure daemon is up
+if ! astrid status >/dev/null 2>&1; then
+  echo "Starting Astrid daemon..." >&2
+  astrid start
+  for _ in {1..30}; do
+    [[ -e "$HOME/.astrid/run/system.ready" ]] && break
+    sleep 0.2
+  done
+fi
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+exec claude \
+  --mcp-config "$SCRIPT_DIR/claude-astrid.mcp.json" \
+  --disallowed-tools "Read,Write,Edit,Bash,WebFetch,WebSearch,Glob,Grep,NotebookEdit" \
+  "$@"
