@@ -1,0 +1,289 @@
+/// Foundation I/O primitives — Astrid-owned readiness multiplexing,
+/// downcastable error resource, and byte streams.
+///
+/// The shape mirrors `wasi:io@0.2.0` (error / poll / streams) because the
+/// Component Model conventions for these primitives are mature and well-
+/// understood. What differs is ownership: Astrid implements all three
+/// interfaces itself rather than re-exporting `wasi:io`, so every
+/// operation is gated, principal-scoped, audited, cancellable, and
+/// quota-bounded by the kernel's capability layer. No wasi:* carve-outs.
+///
+/// Why Astrid-owned and not wasi:io:
+///
+/// - `pollable.block()` and `poll.poll(...)` race against the calling
+///   capsule's cancellation token. On capsule unload, blocking calls
+///   return `cancelled` immediately rather than stranding host tasks on
+///   futures that may never complete.
+/// - Every read/write/skip/splice on a stream is audited (per-principal,
+///   with bytes transferred and elapsed time).
+/// - Pollable and stream resource handles are bounded by the per-principal
+///   quota profile; exceeding it returns `quota` from the host fn that
+///   would have allocated them.
+/// - Pollables created in capsule A's store cannot be passed to capsule
+///   B (wasmtime resource-table boundary).
+///
+/// Forward-looking: when Astrid ships as a hermit-rs unikernel, the
+/// kernel-side impls dispatch to unikernel wait/io primitives rather
+/// than wasmtime-wasi-backed futures. The WIT contract is stable across
+/// host implementations.
+///
+/// Frozen per the ABI evolution discipline (RFC: host_abi). Shape changes
+/// ship as a new file at a new version path; never edit this file.
+
+package astrid:io@1.0.0;
+
+/// A downcastable error resource carried by `stream-error::last-operation-failed`.
+///
+/// Mirrors `wasi:io/error`. Other host interfaces (`astrid:net`,
+/// `astrid:http`, `astrid:process`, …) may provide downcast functions
+/// that take `borrow<error>` and return a typed error-code from their
+/// own domain — e.g. converting a stream's last-operation-failed into
+/// a `net.error-code::connection-reset`.
+interface error {
+    /// An opaque error value tagged with a host-side identifier.
+    resource error {
+        /// Human-readable diagnostic.
+        ///
+        /// WARNING: do not parse this string. Its content is best-effort
+        /// and changes across platforms / kernel revisions. For typed
+        /// classification use a domain-specific downcast function on a
+        /// `borrow<error>`.
+        to-debug-string: func() -> string;
+    }
+}
+
+/// Readiness multiplexing.
+///
+/// Pollables are returned by `subscribe-*` methods on other Astrid host
+/// resources and let capsules wait on heterogeneous readiness signals
+/// via a single `poll` call.
+interface poll {
+    /// Typed error returned from fallible poll operations.
+    variant error-code {
+        /// `poll` was called with an empty list. Polling on nothing
+        /// is undefined; the host rejects rather than blocking forever.
+        invalid-input,
+        /// Pollable handle was dropped (or never valid in this store).
+        closed,
+        /// Caller exceeded the hard per-call cap (256 pollables) on
+        /// `poll`. The cap is sized so a capsule at its full IPC
+        /// subscription quota (128) plus its TCP / UDP / HTTP / process
+        /// stream pollables can wait on them all in one call.
+        /// Subdivide the wait set or use resource-specific blocking.
+        too-large,
+        /// Block was cancelled because the capsule is unloading.
+        cancelled,
+        /// Unspecific host error; detail is best-effort.
+        unknown(string),
+    }
+
+    /// An opaque handle to a future readiness signal.
+    resource pollable {
+        /// Non-blocking readiness check.
+        ///
+        /// Returns `true` if a subsequent `block` would return
+        /// immediately, `false` otherwise. Side-effect free; not
+        /// audit-recorded per call (high-volume).
+        ready: func() -> bool;
+
+        /// Block the calling guest task until the pollable is ready.
+        ///
+        /// Returns when the underlying signal fires OR when the
+        /// capsule's cancellation token is triggered. Returns
+        /// `cancelled` in the latter case; capsules should treat
+        /// that as graceful shutdown.
+        ///
+        /// Audit: recorded with the calling principal and wait
+        /// duration in milliseconds.
+        block: func() -> result<_, error-code>;
+    }
+
+    /// Wait until at least one of the given pollables is ready.
+    ///
+    /// Returns the indices (into the input list) of every pollable
+    /// that was ready when at least one became so. The returned list
+    /// is sorted ascending and contains at least one entry on success.
+    ///
+    /// Per-call cap: 256 pollables. Larger lists return `too-large`.
+    /// The cap is sized so a capsule at full IPC subscription quota
+    /// (128) plus its TCP / UDP / HTTP / process pollables can wait
+    /// on them all in a single call. Per-principal quota profiles
+    /// may lower the effective cap further but never raise it above
+    /// 256.
+    ///
+    /// Returns `cancelled` if the capsule unloads mid-poll.
+    ///
+    /// Audit: every `poll` call recorded (per-principal, with handle
+    /// count and wait duration).
+    poll: func(pollables: list<borrow<pollable>>) -> result<list<u32>, error-code>;
+}
+
+/// Byte streams.
+///
+/// `input-stream` is the read end of a byte source; `output-stream` is
+/// the write end of a byte sink. Both are non-blocking by default;
+/// blocking variants are provided for ergonomic use. `splice` moves
+/// bytes from an input to an output in the host without crossing the
+/// WASM boundary per byte — the primary throughput primitive for
+/// proxying / forwarding capsules (e.g. capsule-hosted TCP servers).
+///
+/// Streams are not constructed directly by capsules. They are obtained
+/// from `subscribe-*` / `*-stream` methods on other host resources:
+///
+/// - `astrid:net/host.tcp-stream.{read-stream, write-stream}` — TCP byte halves
+/// - `astrid:http/host.http-stream.body-stream`               — HTTP response body
+/// - `astrid:process/host.process-handle.{stdin, stdout, stderr}` — child stdio
+///
+/// Each per-call read / write / splice is audited (per-principal, with
+/// bytes transferred). Blocking variants race against the calling
+/// capsule's cancellation token. Per-capsule stream-handle quotas are
+/// bounded by the principal's profile.
+interface streams {
+    use error.{error};
+    use poll.{pollable};
+
+    /// Error variant for stream operations.
+    ///
+    /// Matches the `wasi:io/streams.stream-error` shape so capsule SDKs
+    /// can reason uniformly about stream failures. After a stream
+    /// returns `last-operation-failed`, the stream is closed; all
+    /// subsequent calls return `closed`.
+    variant stream-error {
+        /// The last read / write / splice / flush failed before
+        /// completion. The `error` payload is downcastable to a
+        /// domain-specific error-code via interfaces that source the
+        /// stream (e.g. `astrid:net` for TCP streams, `astrid:http`
+        /// for HTTP body streams).
+        last-operation-failed(error),
+        /// Stream end: no more bytes will be produced (input) or
+        /// accepted (output). Returned by every operation on a closed
+        /// stream.
+        closed,
+    }
+
+    /// Read end of a byte stream.
+    ///
+    /// `read` is non-blocking; returns up to `len` bytes (possibly zero)
+    /// if any are promptly available. To wait, take the `subscribe`
+    /// pollable and `block` on it, or use `blocking-read`.
+    resource input-stream {
+        /// Non-blocking read up to `len` bytes. Empty list = no data
+        /// available right now (not EOF). Use `subscribe` to wait.
+        /// EOF or peer close surfaces as `closed` on the next call.
+        ///
+        /// The host may return fewer than `len` bytes — `len` is the
+        /// caller's *upper bound*, and the host applies its own
+        /// internal buffer ceiling (currently 1 MiB) to bound a single
+        /// call's transfer. Callers loop on `read` to drain larger
+        /// volumes; truncation is not a stream error. Per `wasi:io`
+        /// semantics, a trap only occurs when `len` exceeds what
+        /// wasm32 can address (~4 GiB).
+        ///
+        /// Audit: recorded (per-principal, with bytes read).
+        read: func(len: u64) -> result<list<u8>, stream-error>;
+
+        /// Block until at least one byte is available, then read up to
+        /// `len`. Identical to `read` except for the wait. Races
+        /// against the cancellation token; `last-operation-failed`
+        /// surfaces if the capsule is unloading.
+        blocking-read: func(len: u64) -> result<list<u8>, stream-error>;
+
+        /// Skip up to `len` bytes without buffering them in the guest.
+        /// Equivalent to `read` followed by discarding, but skips the
+        /// data copy. Returns the number of bytes actually skipped.
+        skip: func(len: u64) -> result<u64, stream-error>;
+
+        /// Blocking variant of `skip`.
+        blocking-skip: func(len: u64) -> result<u64, stream-error>;
+
+        /// Pollable that fires when bytes are available to read OR the
+        /// stream has closed. Once ready, `read` is guaranteed to
+        /// return at least one byte OR a `closed` error.
+        ///
+        /// The pollable is a child resource: dropping the input-stream
+        /// before all derived pollables traps.
+        subscribe: func() -> pollable;
+    }
+
+    /// Write end of a byte stream.
+    ///
+    /// `write` is non-blocking; `check-write` reports how many bytes
+    /// may be written before the next `write` would block. `splice` is
+    /// the primary throughput primitive — bytes move host-side without
+    /// crossing the WASM boundary per byte.
+    resource output-stream {
+        /// How many bytes may be written in the next `write` call.
+        /// Returns 0 if the stream is not currently writable;
+        /// `subscribe` will fire when that changes.
+        ///
+        /// Calling `write` with more bytes than `check-write` permits
+        /// traps. This mirrors `wasi:io/streams` exactly.
+        check-write: func() -> result<u64, stream-error>;
+
+        /// Write bytes. `contents.len()` must be <= the last
+        /// `check-write` permit. Returns `closed` if the stream closed
+        /// since the permit was issued.
+        ///
+        /// Audit: recorded (per-principal, with bytes written).
+        write: func(contents: list<u8>) -> result<_, stream-error>;
+
+        /// Convenience: write `contents` and flush, blocking until all
+        /// bytes are accepted and the flush completes. Internally
+        /// drives `check-write` / `subscribe` / `write` / `flush` in a
+        /// loop, so callers don't need an outer loop of their own.
+        /// No fixed cap on payload size — the host segments large
+        /// transfers internally and yields between chunks to keep
+        /// other capsules responsive. (The `wasi:io` documentation
+        /// mentions 4096 in pseudocode but does not actually cap.)
+        ///
+        /// Audit: recorded (per-principal, with total bytes written).
+        blocking-write-and-flush: func(contents: list<u8>) -> result<_, stream-error>;
+
+        /// Request flush of all bytes passed to `write` prior to this
+        /// call. Non-blocking. While the flush is in progress,
+        /// `check-write` returns 0; `subscribe` fires when it
+        /// completes.
+        flush: func() -> result<_, stream-error>;
+
+        /// Block until flush completes and the stream is ready to
+        /// accept more writes. Races against cancellation.
+        blocking-flush: func() -> result<_, stream-error>;
+
+        /// Pollable that fires when the stream is ready to accept
+        /// writes (i.e. `check-write` will return > 0) OR the stream
+        /// closed. The pollable is a child resource: dropping the
+        /// output-stream before all derived pollables traps.
+        subscribe: func() -> pollable;
+
+        /// Write `len` zero bytes. Same preconditions as `write`:
+        /// `len` must be <= last `check-write` permit. Useful for
+        /// sparse-file extension and protocol padding.
+        write-zeroes: func(len: u64) -> result<_, stream-error>;
+
+        /// Convenience: write `len` zeroes and flush, blocking until
+        /// complete. No fixed cap on `len` — no guest-side buffer is
+        /// involved, so the host can stream arbitrary zero-fill sizes
+        /// efficiently. The host yields between chunks to keep other
+        /// capsules responsive.
+        blocking-write-zeroes-and-flush: func(len: u64) -> result<_, stream-error>;
+
+        /// Move up to `len` bytes from `src` to this stream in the
+        /// host. The kernel handles the read-then-write loop without
+        /// crossing the WASM boundary per byte — the primary
+        /// throughput primitive for proxy / forwarder capsules.
+        ///
+        /// Behaviour is equivalent to:
+        ///   1. `check-write` on this stream
+        ///   2. `read` on `src` with the smaller of the permit and `len`
+        ///   3. `write` on this stream with the bytes read
+        /// Any error in those steps ends the splice and is reported.
+        ///
+        /// Audit: recorded (per-principal, with bytes spliced).
+        splice: func(src: borrow<input-stream>, len: u64) -> result<u64, stream-error>;
+
+        /// Blocking variant of `splice`. Blocks until `src` has data
+        /// AND this stream is writable, then splices. Races against
+        /// cancellation.
+        blocking-splice: func(src: borrow<input-stream>, len: u64) -> result<u64, stream-error>;
+    }
+}

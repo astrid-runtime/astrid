@@ -1,0 +1,73 @@
+/// Human-in-the-loop approval for sensitive actions.
+///
+/// Checks the AllowanceStore first (instant path for pre-approved
+/// patterns), then publishes an ApprovalRequired IPC event and blocks
+/// until the frontend user responds or the request times out (60s).
+///
+/// Note: a capsule-to-capsule `astrid-bus:approval@1.0.0` package
+/// exists in `interfaces/` for approval-event schemas on the IPC bus.
+/// This host interface and that bus contract are distinct concerns;
+/// the namespace split keeps them from colliding.
+///
+/// Frozen per the ABI evolution discipline (RFC: host_abi). Shape changes
+/// ship as a new file at a new version path; never edit this file.
+
+package astrid:approval@1.0.0;
+
+interface host {
+    /// Typed error returned from approval operations.
+    variant error-code {
+        /// Action or resource string failed sanitization (control
+        /// chars, exceeded max length, NUL bytes).
+        invalid-input,
+        /// User did not respond within 60s.
+        timeout,
+        /// AllowanceStore is temporarily unavailable.
+        store-unavailable,
+        /// Unspecific host error; detail is best-effort.
+        unknown(string),
+    }
+
+    /// Approval request from a capsule to the host.
+    ///
+    /// The capsule declares the action and resource. The kernel
+    /// classifies risk and manages approval policy — the capsule sees
+    /// only approved/denied.
+    record approval-request {
+        /// The action being requested (e.g. "git push"). Sanitized:
+        /// control chars stripped, max 256 chars.
+        action: string,
+        /// Full resource description (e.g. "git push origin main").
+        /// Sanitized: max 1024 chars.
+        target-resource: string,
+    }
+
+    /// Decision returned by the user (or by the AllowanceStore for a
+    /// pre-approved pattern).
+    enum approval-decision {
+        /// Denied — capsule must not proceed.
+        denied,
+        /// Approved once.
+        approved,
+        /// Approved for the current session.
+        approved-session,
+        /// Approved permanently (stored in the AllowanceStore).
+        approved-always,
+        /// Auto-approved via an existing allowance pattern.
+        allowance,
+    }
+
+    /// Approval response from the host. Carries the specific decision
+    /// (not just approved/denied) so capsule UI can communicate WHY
+    /// (e.g. "stored as always-approve") for transparency.
+    record approval-response {
+        /// The specific decision class.
+        decision: approval-decision,
+    }
+
+    /// Request human approval for a sensitive action.
+    ///
+    /// Audit: every approval call recorded — request, response, and
+    /// resolution path (AllowanceStore hit vs user prompt).
+    request-approval: func(request: approval-request) -> result<approval-response, error-code>;
+}

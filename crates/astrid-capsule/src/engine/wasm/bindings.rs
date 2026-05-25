@@ -61,7 +61,7 @@ wasmtime::component::bindgen!({
             import astrid:guest/lifecycle@1.0.0;
         }
     ",
-    path: "../../crates/astrid-capsule/wit-staging",
+    path: "wit-staging",
     // The `pollable` resource is stored in the wasmtime resource table
     // as a `DynPollable` (Future-based) — that is the same internal
     // representation wasmtime-wasi already uses, so we re-use the

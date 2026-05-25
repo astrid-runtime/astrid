@@ -1,0 +1,78 @@
+/// Interactive user input collection during lifecycle hooks.
+///
+/// Only callable during `astrid-install` or `astrid-upgrade` lifecycle
+/// phases. Blocks the WASM thread until the frontend (TUI/CLI) collects
+/// user input and publishes a response, or the request times out (120s).
+///
+/// Note: a capsule-to-capsule `astrid-bus:elicit@1.0.0` package exists
+/// in `interfaces/` for elicit-event schemas on the IPC bus. This host
+/// interface and that bus contract are distinct concerns; the namespace
+/// split keeps them from colliding.
+///
+/// Frozen per the ABI evolution discipline (RFC: host_abi). Shape changes
+/// ship as a new file at a new version path; never edit this file.
+
+package astrid:elicit@1.0.0;
+
+interface host {
+    /// Typed error returned from elicit operations.
+    variant error-code {
+        /// Called outside an install/upgrade lifecycle phase.
+        not-in-lifecycle,
+        /// User did not respond within 120s.
+        timeout,
+        /// User cancelled (closed prompt, sent CTRL-C, etc.).
+        cancelled,
+        /// Input failed validation (e.g. select value not in options).
+        invalid-input,
+        /// SecretStore (keychain + KV fallback) is unavailable.
+        store-unavailable,
+        /// Unspecific host error; detail is best-effort.
+        unknown(string),
+    }
+
+    /// Type of input being elicited.
+    enum elicit-type {
+        /// Plain text input.
+        text,
+        /// Secret (stored in SecretStore, never returned in plaintext).
+        secret,
+        /// Single selection from `options`.
+        %select,
+        /// Multiple selections from `options` (returned as JSON array).
+        array,
+    }
+
+    /// Request for user input during capsule lifecycle.
+    record elicit-request {
+        /// Input type.
+        kind: elicit-type,
+        /// Key for storing the collected value.
+        key: string,
+        /// Human-readable prompt description.
+        description: string,
+        /// Options for select-type inputs.
+        options: option<list<string>>,
+        /// Default value.
+        default-value: option<string>,
+    }
+
+    /// Response from an elicit call.
+    variant elicit-response {
+        /// Single text/select value.
+        value(string),
+        /// Multiple values (from `array` type).
+        values(list<string>),
+        /// Secret stored in SecretStore; value not returned.
+        secret-stored,
+    }
+
+    /// Prompt the user for input.
+    /// Audit: every elicit call recorded.
+    elicit: func(request: elicit-request) -> result<elicit-response, error-code>;
+
+    /// Check whether a secret key has been stored for this capsule.
+    /// Uses the SecretStore abstraction (OS keychain with KV fallback).
+    /// Audit: not recorded (read-only).
+    has-secret: func(key: string) -> result<bool, error-code>;
+}

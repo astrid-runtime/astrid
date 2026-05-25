@@ -1,0 +1,89 @@
+/// Guest export contract — lifecycle and interceptor entry points the
+/// kernel calls into a capsule.
+///
+/// Each entry point lives in its own world so capsules `include` only the
+/// ones they actually implement. The CM toolchain auto-stubs every export
+/// declared in a world the component targets; co-mingling optional exports
+/// in a single world forces stubs for unused ones and pushes the kernel
+/// into parsing the wasm binary to detect them. Per-export worlds put the
+/// declaration where the implementation is, and the kernel sees exports
+/// only when they are real.
+///
+/// Typical capsule worlds:
+///
+/// ```wit
+/// // Interceptor-only capsule (e.g. router):
+/// world my-capsule {
+///     include astrid:guest/interceptor@1.0.0;
+///     import astrid:ipc/host@1.0.0;
+/// }
+///
+/// // Run-loop capsule with install hook (e.g. cli uplink):
+/// world my-capsule {
+///     include astrid:guest/interceptor@1.0.0;
+///     include astrid:guest/background@1.0.0;
+///     include astrid:guest/installable@1.0.0;
+///     import astrid:ipc/host@1.0.0;
+///     import astrid:uplink/host@1.0.0;
+/// }
+/// ```
+///
+/// The package is named `astrid:guest` to mirror the per-domain `host`
+/// packages: `host` interfaces are kernel-side (imported by capsules),
+/// `guest` exports are capsule-side (called by the kernel). Note the
+/// distinct `astrid:hook@1.0.0` in `interfaces/hook.wit` — that one is a
+/// capsule-to-capsule IPC contract for lifecycle fan-out, not a guest
+/// export contract.
+///
+/// Frozen per the ABI evolution discipline (RFC: host_abi). Shape changes
+/// ship as a new file at a new version path; never edit this file.
+
+package astrid:guest@1.0.0;
+
+interface lifecycle {
+    /// Result returned by a capsule after hook execution.
+    record capsule-result {
+        /// Action directive (e.g. "continue", "abort", "modify").
+        action: string,
+        /// Optional payload as a JSON string.
+        data: option<string>,
+    }
+}
+
+/// Interceptor entry point.
+///
+/// Almost every capsule includes this. The kernel calls `astrid-hook-trigger`
+/// with an action name (interceptor handler to invoke) and an event payload
+/// as raw bytes. The guest returns a `capsule-result` directing the kernel
+/// how to proceed.
+world interceptor {
+    use lifecycle.{capsule-result};
+
+    export astrid-hook-trigger: func(action: string, payload: list<u8>) -> capsule-result;
+}
+
+/// Background run loop.
+///
+/// Capsules that export `run` are started as background tasks. The function
+/// should block indefinitely (event loop pattern), processing IPC messages
+/// via subscriptions set up before calling `signal-ready`. The kernel
+/// manages the lifecycle.
+world background {
+    export run: func();
+}
+
+/// First-time installation lifecycle hook.
+///
+/// Called once when a capsule is installed. May use `elicit` to collect
+/// secrets and configuration from the user interactively.
+world installable {
+    export astrid-install: func();
+}
+
+/// Upgrade lifecycle hook.
+///
+/// Called when a capsule is upgraded from a previous version. May use
+/// `elicit` to collect new configuration.
+world upgradable {
+    export astrid-upgrade: func();
+}

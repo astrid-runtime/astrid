@@ -1,0 +1,105 @@
+/// Multi-platform identity resolution and linking.
+///
+/// Maps external platform identities (Discord user, GitHub user, etc.)
+/// to internal Astrid user IDs. All operations are security-gated per
+/// operation type and audit-logged.
+///
+/// Frozen per the ABI evolution discipline (RFC: host_abi). Shape changes
+/// ship as a new file at a new version path; never edit this file.
+
+package astrid:identity@1.0.0;
+
+interface host {
+    /// Typed error returned from identity operations.
+    variant error-code {
+        /// Capsule lacks the `identity` capability.
+        capability-denied,
+        /// Platform / user-id / display-name / method failed
+        /// validation (NUL bytes, control chars, max length).
+        invalid-input,
+        /// User ID does not exist.
+        user-not-found,
+        /// No link exists for the given platform user (resolve / unlink).
+        link-not-found,
+        /// Link already exists (link operation collision).
+        already-linked,
+        /// Identity store is temporarily unavailable.
+        store-unavailable,
+        /// Unspecific host error; detail is best-effort.
+        unknown(string),
+    }
+
+    /// Request to resolve a platform identity to an Astrid user.
+    record identity-resolve-request {
+        /// External platform (e.g. "discord", "github").
+        platform: string,
+        /// User ID on the external platform.
+        platform-user-id: string,
+    }
+
+    /// Successful resolution; carries the user info. Returns
+    /// `link-not-found` error instead of a flag-based "found: bool".
+    record identity-resolve-response {
+        /// The Astrid user ID.
+        user-id: string,
+        /// The user's display name, if available.
+        display-name: option<string>,
+    }
+
+    /// Request to link a platform identity to an Astrid user.
+    record identity-link-request {
+        platform: string,
+        platform-user-id: string,
+        astrid-user-id: string,
+        /// Authentication method (e.g. "passkey", "token").
+        method: string,
+    }
+
+    /// Request to unlink a platform identity.
+    record identity-unlink-request {
+        platform: string,
+        platform-user-id: string,
+    }
+
+    /// Request to create a new Astrid user.
+    record identity-create-user-request {
+        /// Optional display name for the new user.
+        display-name: option<string>,
+    }
+
+    /// Response from `identity-create-user`.
+    record identity-create-user-response {
+        /// The newly created Astrid user ID.
+        user-id: string,
+    }
+
+    /// One platform link in a user's link list.
+    record platform-link {
+        platform: string,
+        platform-user-id: string,
+        /// When the link was created (ISO 8601).
+        linked-at: string,
+        /// Authentication method used at link time.
+        method: string,
+    }
+
+    /// Resolve a platform identity to an Astrid user. Returns
+    /// `link-not-found` if the platform user is not linked to anyone.
+    identity-resolve: func(request: identity-resolve-request) -> result<identity-resolve-response, error-code>;
+
+    /// Link a platform identity to an Astrid user. Returns
+    /// `already-linked` if a link for this (platform, platform-user-id)
+    /// already exists.
+    identity-link: func(request: identity-link-request) -> result<_, error-code>;
+
+    /// Unlink a platform identity. Returns `link-not-found` if no link
+    /// exists.
+    identity-unlink: func(request: identity-unlink-request) -> result<_, error-code>;
+
+    /// Create a new Astrid user.
+    identity-create-user: func(request: identity-create-user-request) -> result<identity-create-user-response, error-code>;
+
+    /// List all platform links for an Astrid user. Returns the
+    /// (possibly empty) link list directly — no JSON blob.
+    identity-list-links: func(astrid-user-id: string) -> result<list<platform-link>, error-code>;
+}

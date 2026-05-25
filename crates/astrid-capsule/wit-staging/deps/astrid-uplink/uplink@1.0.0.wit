@@ -1,0 +1,59 @@
+/// Uplink communications — inbound message ingestion from external platforms.
+///
+/// Capsules register uplinks (named endpoints) for platforms they bridge
+/// (e.g. Discord, Slack) and then forward inbound user messages to the
+/// kernel's processing pipeline.
+///
+/// Frozen per the ABI evolution discipline (RFC: host_abi). Shape changes
+/// ship as a new file at a new version path; never edit this file.
+
+package astrid:uplink@1.0.0;
+
+interface host {
+    /// Typed error returned from uplink operations.
+    variant error-code {
+        /// Capsule lacks the `uplink` capability.
+        capability-denied,
+        /// Name / platform / profile failed validation (NUL bytes,
+        /// control chars, max length).
+        invalid-input,
+        /// Profile not in the recognized set (`chat`, `interactive`,
+        /// `notify`, `bridge`).
+        invalid-profile,
+        /// Uplink ID not registered or already unregistered.
+        unknown-uplink,
+        /// No active session for the target principal — message was
+        /// intentionally dropped.
+        no-session,
+        /// Server-side resource quota exhausted.
+        quota,
+        /// Unspecific host error; detail is best-effort.
+        unknown(string),
+    }
+
+    /// Profile for a registered uplink. Determines how the kernel
+    /// routes inbound messages.
+    enum uplink-profile {
+        /// Conversational chat (Telegram, Discord DM, Slack DM).
+        chat,
+        /// Long-lived interactive session (CLI TTY).
+        interactive,
+        /// One-way notification sink.
+        notify,
+        /// Bidirectional bridge to another runtime.
+        bridge,
+    }
+
+    /// Register an uplink endpoint.
+    ///
+    /// Returns the assigned uplink UUID.
+    /// Audit: recorded.
+    uplink-register: func(name: string, platform: string, profile: uplink-profile) -> result<string, error-code>;
+
+    /// Send an inbound message through a registered uplink.
+    ///
+    /// Returns `true` if sent, `false` if intentionally dropped
+    /// (no `no-session` error — the drop is normal flow).
+    /// Audit: recorded.
+    uplink-send: func(uplink-id: string, platform-user-id: string, content: string) -> result<bool, error-code>;
+}
