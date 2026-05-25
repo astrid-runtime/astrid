@@ -11,7 +11,7 @@ description = "Library for converting OpenClaw tool plugins into Astrid WASM plu
 
 [dependencies]
 blake3 = { workspace = true }
-chrono = { workspace = true }
+chrono = { workspace = true, features = ["clock"] }
 directories = { workspace = true }
 oxc = { workspace = true }
 oxc_allocator = { workspace = true }

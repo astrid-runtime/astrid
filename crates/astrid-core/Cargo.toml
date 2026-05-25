@@ -11,7 +11,7 @@ description = "Core types and traits for Astrid secure agent runtime"
 [dependencies]
 async-trait = { workspace = true }
 base64 = { workspace = true }
-chrono = { workspace = true }
+chrono = { workspace = true, features = ["clock"] }
 rand = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

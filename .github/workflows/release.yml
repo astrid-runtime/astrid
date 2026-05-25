@@ -34,6 +34,13 @@ jobs:
             archive: tar.gz
     steps:
       - uses: actions/checkout@v4
+        with:
+          # astrid-capsule's build.rs stages WIT files from the
+          # `wit/` submodule (unicity-astrid/wit) before bindgen
+          # consumes them. Without recursive submodule checkout the
+          # release build fails with `read wit/host: No such file or
+          # directory`. Matches the ci.yml fix landed in #752.
+          submodules: recursive
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
