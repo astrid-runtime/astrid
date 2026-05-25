@@ -52,7 +52,7 @@ pub(crate) async fn run(args: PsArgs) -> Result<ExitCode> {
         eprintln!("{}", Theme::error("Failed to connect to daemon"));
         return Ok(ExitCode::from(1));
     };
-    let req = astrid_types::kernel::KernelRequest::GetCapsuleMetadata;
+    let req = astrid_core::kernel_api::KernelRequest::GetCapsuleMetadata;
     let val = serde_json::to_value(req)?;
     let msg = astrid_types::ipc::IpcMessage::new(
         "astrid.v1.request.metadata",
@@ -67,7 +67,7 @@ pub(crate) async fn run(args: PsArgs) -> Result<ExitCode> {
         )
         .await?;
     let entries = match crate::socket_client::SocketClient::extract_kernel_response(&raw) {
-        Some(astrid_types::kernel::KernelResponse::CapsuleMetadata(list)) => list,
+        Some(astrid_core::kernel_api::KernelResponse::CapsuleMetadata(list)) => list,
         _ => Vec::new(),
     };
     let mut rows: Vec<CapsuleRow> = entries

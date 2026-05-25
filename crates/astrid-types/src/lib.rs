@@ -3,10 +3,15 @@
 //! This crate provides the canonical definitions for:
 //! - IPC payload schemas (cross-boundary messaging between WASM guests and host)
 //! - LLM message, tool, and streaming types
-//! - Kernel management API request/response types
 //!
-//! It has minimal dependencies (serde, uuid) and is WASM-compatible, making it
-//! suitable for use in both the kernel runtime and user-space capsule SDKs.
+//! It has zero dependency on `astrid-core` and minimal dependencies overall
+//! (serde, uuid, chrono with serde-only features), so it compiles on
+//! `wasm32-unknown-unknown` for capsule SDK consumption without dragging
+//! in the kernel.
+//!
+//! Kernel-management RPC types (CLI ↔ daemon: `KernelRequest`,
+//! `KernelResponse`, etc.) live in `astrid_core::kernel_api`. They depend
+//! on `PrincipalId` and `Quotas` and therefore cannot live here.
 
 #![deny(unsafe_code)]
 #![deny(missing_docs)]
@@ -16,14 +21,9 @@
 #![cfg_attr(test, allow(clippy::unwrap_used))]
 
 pub mod ipc;
-pub mod kernel;
 pub mod llm;
 
 pub use ipc::{IpcMessage, IpcPayload, OnboardingField, OnboardingFieldType, SelectionOption};
-pub use kernel::{
-    CapsuleMetadataEntry, CommandInfo, DaemonStatus, KernelRequest, KernelResponse,
-    SYSTEM_SESSION_UUID,
-};
 pub use llm::{
     ContentPart, LlmResponse, LlmToolDefinition, Message, MessageContent, MessageRole, StopReason,
     StreamEvent, ToolCall, ToolCallResult, Usage,

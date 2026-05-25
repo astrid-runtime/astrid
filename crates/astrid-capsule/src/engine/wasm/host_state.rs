@@ -67,14 +67,25 @@ pub enum LifecyclePhase {
     Upgrade,
 }
 
-/// A pre-registered interceptor subscription for run-loop capsules.
+/// Metadata for an interceptor binding declared in `Capsule.toml`.
 ///
-/// Created during `WasmEngine::load()` when a capsule declares both
-/// `run()` and `[[interceptor]]`. Maps a subscription handle ID (stored
-/// in `HostState.subscriptions`) to the interceptor action name and topic.
+/// Under the new per-domain WIT, interceptors are NOT capsule-side
+/// `Resource<Subscription>` handles — the kernel matches incoming IPC
+/// messages against interceptor patterns and dispatches them directly
+/// to `astrid-hook-trigger`. This struct exists purely to:
+///
+/// 1. Let the guest enumerate what it's subscribed to via
+///    `astrid:ipc/host.get-interceptor-bindings` (debugging /
+///    tooling), and
+/// 2. Anchor the registry-side routing table used by the run-loop
+///    dispatcher.
+///
+/// `handle_id` is informational only — the guest cannot turn it
+/// back into a `Resource<Subscription>` and the kernel does not key
+/// any storage on it.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct InterceptorHandle {
-    /// The subscription handle ID (key in `HostState.subscriptions`).
+    /// Enumeration index; informational only under the new ABI.
     pub handle_id: u64,
     /// The interceptor action name from the manifest.
     pub action: String,
@@ -194,10 +205,6 @@ pub struct HostState {
     pub event_bus: astrid_events::EventBus,
     /// Rate limiter for IPC message publishing.
     pub ipc_limiter: astrid_events::ipc::IpcRateLimiter,
-    /// Active event bus subscriptions for IPC events.
-    pub subscriptions: HashMap<u64, astrid_events::EventReceiver>,
-    /// Counter for issuing subscription handle IDs.
-    pub next_subscription_id: u64,
     /// Plugin configuration from the manifest.
     ///
     /// Holds only **non-secret** env values (the `[env]` declarations
@@ -253,12 +260,6 @@ pub struct HostState {
     pub registered_uplinks: Vec<UplinkDescriptor>,
     /// Optional natively bound unix listener.
     pub cli_socket_listener: Option<Arc<tokio::sync::Mutex<tokio::net::UnixListener>>>,
-    /// Active network streams owned by this capsule (Unix accept + outbound TCP).
-    pub active_streams: std::collections::HashMap<u64, NetStream>,
-    /// Monotonic counter for stream handle IDs (avoids reuse after removal).
-    /// Starts at 1 so that handle ID 0 is never issued — 0 is reserved as a
-    /// sentinel / "no handle" value in the WASM ABI.
-    pub next_stream_id: u64,
     /// Active lifecycle phase, if any. `None` during normal runtime.
     /// Set to `Some(Install)` or `Some(Upgrade)` during lifecycle dispatch.
     /// Gates the `astrid_elicit` host function.
@@ -279,17 +280,26 @@ pub struct HostState {
     pub host_semaphore: Arc<Semaphore>,
     /// Cooperative cancellation token for long-running host function calls.
     ///
-    /// Triggered during capsule unload to unblock `ipc_recv`, `elicit`, and
-    /// `net_accept`/`net_read`/`net_write` host functions that may be waiting on I/O.
+    /// Triggered during capsule unload to unblock every blocking host
+    /// fn that races it: `Subscription.recv`, `elicit`, the various
+    /// listener `accept` paths, `connect-tcp`, `read`/`read-bytes`/
+    /// `write-bytes` on `tcp-stream`, `read-chunk` on `http-stream`,
+    /// `pollable.block`, `poll.poll`, `sleep-ns`, and the `wait` /
+    /// `spawn` paths on `process`. Streams (`astrid:io/streams`)
+    /// short-circuit with `Closed` when this fires; pollables
+    /// short-circuit with `Cancelled`.
     pub cancel_token: CancellationToken,
     /// Session token for authenticating CLI socket connections. Only set for
     /// the CLI proxy capsule (which has `net_bind` capability).
     pub session_token: Option<std::sync::Arc<astrid_core::session_token::SessionToken>>,
-    /// Pre-registered interceptor subscription handles for run-loop capsules.
-    ///
-    /// Populated during `WasmEngine::load()` when a capsule declares both
-    /// `run()` and `[[interceptor]]`. Each entry maps a subscription handle
-    /// (in `self.subscriptions`) to the interceptor action name.
+    /// Interceptor binding metadata, populated during `WasmEngine::load()`
+    /// from `[[interceptor]]` entries in `Capsule.toml`. The kernel
+    /// matches incoming IPC messages against these patterns and calls
+    /// `astrid-hook-trigger` directly — these handles are not
+    /// `Resource<Subscription>` references and the guest cannot
+    /// consume from them. See [`InterceptorHandle`] for the metadata
+    /// shape and `astrid:ipc/host.get-interceptor-bindings` for the
+    /// guest-facing accessor.
     pub interceptor_handles: Vec<InterceptorHandle>,
     /// Shared allowance store for capsule-level approval requests.
     ///
@@ -313,21 +323,29 @@ pub struct HostState {
     /// Monotonic counter for HTTP stream handle IDs.
     /// Starts at 1 (0 reserved as sentinel).
     pub next_http_stream_id: u64,
-    /// Active background processes managed for this capsule.
-    ///
-    /// Keyed by opaque handle IDs (not OS PIDs). Processes are cleaned up
-    /// via `Drop for ManagedProcess` when removed or when the capsule unloads.
-    pub background_processes: HashMap<u64, crate::engine::wasm::host::process::ManagedProcess>,
-    /// Monotonic counter for background process handle IDs.
-    ///
-    /// Starts at 1 so handle 0 is never issued (reserved as sentinel).
-    pub next_process_id: u64,
     /// Tracks active child process PIDs for cancellation.
     ///
     /// Shared with the cancel listener background task. The spawn host function
     /// registers/unregisters PIDs; the listener calls `cancel_all()` when a
     /// `tool.v1.request.cancel` event arrives.
     pub process_tracker: Arc<ProcessTracker>,
+    /// Live count of `NetStream` entries currently in the resource table.
+    /// Maintained alongside `ResourceTable` insertions / drops so the
+    /// `MAX_ACTIVE_STREAMS` gate is O(1) instead of iterating every
+    /// resource (the table may hold hundreds of pollables / errors /
+    /// http handles unrelated to net). Single-threaded: wasmtime
+    /// stores are owned by exactly one OS thread.
+    pub net_stream_count: usize,
+    /// Live count of `SubscriptionEntry` entries. Same rationale as
+    /// `net_stream_count`.
+    pub subscription_count: usize,
+    /// Live count of `ManagedProcess` entries — overall.
+    pub process_count_total: usize,
+    /// Per-creator-principal count of `ManagedProcess` entries. The
+    /// process-spawn gate needs to enforce per-principal sub-budgets
+    /// without iterating the whole resource table.
+    pub process_count_by_principal:
+        std::collections::HashMap<astrid_core::principal::PrincipalId, usize>,
 }
 
 impl wasmtime_wasi::WasiView for HostState {

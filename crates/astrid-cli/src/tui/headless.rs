@@ -192,7 +192,7 @@ pub(crate) async fn run(cfg: HeadlessConfig<'_>) -> anyhow::Result<()> {
     let mut terminal = Terminal::new(backend)?;
 
     // Sync dynamic commands on startup.
-    let req = astrid_types::kernel::KernelRequest::GetCommands;
+    let req = astrid_core::kernel_api::KernelRequest::GetCommands;
     if let Ok(val) = serde_json::to_value(req) {
         let msg = astrid_types::ipc::IpcMessage::new(
             "astrid.v1.request.get_commands",

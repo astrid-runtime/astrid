@@ -1,31 +1,17 @@
-//! Shared stream helpers: byte-stream framing for the framed (legacy)
-//! `net-read` / `net-write` path, raw byte-stream helpers for the std-style
-//! `net-read-bytes` / `net-write-bytes` path, and the `with_tcp_slot` wrapper
-//! used by every TCP-only getter/setter (peer-addr, nodelay, ttl, …).
+//! Shared stream helpers — byte-stream framing for the length-prefixed
+//! `read` / `write` path and raw byte-stream helpers for the std-style
+//! `read-bytes` / `write-bytes` path. Updated for the resource-table
+//! storage model in `mod.rs`.
 
-use crate::engine::wasm::bindings::astrid::capsule::types::NetReadStatus;
-use crate::engine::wasm::host::util;
-use crate::engine::wasm::host_state::{HostState, NetStream};
+use crate::engine::wasm::bindings::astrid::net::host::NetReadStatus;
 
-/// Bounded timeout on a `net-connect-tcp` outbound handshake.
-///
-/// DNS resolve + TCP `connect` together must complete within this window,
-/// otherwise the host fn returns an error rather than holding the WASM
-/// guest in a host call indefinitely.
+/// Bounded timeout on a `connect-tcp` outbound handshake.
 pub(super) const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Host-side cap on a single byte-stream read/peek buffer.
-///
-/// Matches the framed `net-read` payload cap so a malicious or buggy
-/// guest passing `u32::MAX` can't trigger a multi-GB allocation on the
-/// host. 10 MB is well above any realistic single-call read for the
-/// protocols this surface targets (TLS records ≤ 16 KB, WebSocket
-/// frames typically ≤ 64 KB, MQTT control packets ≤ 256 MB but
-/// streamed in chunks).
 pub(super) const MAX_BYTES_PER_CALL: usize = 10 * 1024 * 1024;
 
 /// Returns true for IO errors that represent a normal peer disconnect.
-/// These should NOT trap the WASM guest — the run loop handles dead streams.
 pub(super) fn is_peer_disconnect(e: &std::io::Error) -> bool {
     matches!(
         e.kind(),
@@ -36,8 +22,7 @@ pub(super) fn is_peer_disconnect(e: &std::io::Error) -> bool {
     )
 }
 
-/// Read one length-prefixed frame from `stream`. Shared by UnixStream and
-/// TcpStream paths — both implement [`tokio::io::AsyncRead`].
+/// Read one length-prefixed frame from `stream`.
 pub(super) async fn read_frame<S>(stream: &mut S) -> Result<NetReadStatus, String>
 where
     S: tokio::io::AsyncRead + Unpin,
@@ -58,7 +43,7 @@ where
     }
 
     let len = u32::from_be_bytes(len_buf) as usize;
-    if len > 10 * 1024 * 1024 {
+    if len > MAX_BYTES_PER_CALL {
         return Err("Payload too large (max 10MB)".to_string());
     }
 
@@ -79,8 +64,7 @@ where
     Ok(NetReadStatus::Data(payload))
 }
 
-/// Write one length-prefixed frame to `stream`. Shared across UnixStream
-/// and TcpStream — both implement [`tokio::io::AsyncWrite`].
+/// Write one length-prefixed frame to `stream`.
 pub(super) async fn write_frame<S>(stream: &mut S, data: &[u8]) -> std::io::Result<()>
 where
     S: tokio::io::AsyncWrite + Unpin,
@@ -95,17 +79,6 @@ where
 }
 
 /// Read up to `max_bytes` from `stream` without length-prefix framing.
-///
-/// Contract:
-/// - `Ok(empty Vec)` = **EOF** (peer disconnected). Unambiguous — matches
-///   `std::io::Read::read` returning `Ok(0)`.
-/// - `Ok(non-empty Vec)` = data read.
-/// - `Err("read would block")` = the caller-supplied `timeout` expired with
-///   no data. Maps to `std::io::ErrorKind::WouldBlock` SDK-side. Only
-///   returned when the caller has set a read timeout — `timeout = None`
-///   blocks indefinitely (until data, EOF, or capsule unload via the
-///   outer cancellation token).
-/// - `Err(other)` = transient IO error.
 pub(super) async fn read_bytes_inner<S>(
     stream: &mut S,
     max_bytes: usize,
@@ -117,9 +90,6 @@ where
     use tokio::io::AsyncReadExt;
     let max_bytes = max_bytes.min(MAX_BYTES_PER_CALL);
     let mut buf = vec![0u8; max_bytes];
-    // Default (no timeout) blocks indefinitely — matches std::io::Read
-    // semantics. Caller cancellation comes from the outer
-    // bounded_block_on_cancellable, not from a tight internal poll.
     let result = match timeout {
         Some(d) => tokio::time::timeout(d, stream.read(&mut buf)).await,
         None => Ok(stream.read(&mut buf).await),
@@ -137,8 +107,6 @@ where
 }
 
 /// Write `data` to `stream` without framing. Returns bytes-written.
-/// Honours an optional `timeout`; the host-default behaviour (no
-/// timeout) blocks until the write completes or the peer disconnects.
 pub(super) async fn write_bytes_inner<S>(
     stream: &mut S,
     data: &[u8],
@@ -161,32 +129,73 @@ where
     Ok(u32::try_from(n).unwrap_or(u32::MAX))
 }
 
-/// Run `op` against the inner [`tokio::net::TcpStream`] of an outbound
-/// TCP stream handle. Returns an error if the handle is missing or holds
-/// a Unix-domain stream (most std-style getters/setters are TCP-only).
-pub(super) fn with_tcp_slot<T, F>(state: &mut HostState, handle: u64, op: F) -> Result<T, String>
-where
-    F: FnOnce(&tokio::net::TcpStream) -> Result<T, String>,
-{
-    let stream = state
-        .active_streams
-        .get(&handle)
-        .cloned()
-        .ok_or_else(|| "Stream handle not found".to_string())?;
-    match stream {
-        NetStream::Tcp(slot) => {
-            let rt = state.runtime_handle.clone();
-            let sem = state.host_semaphore.clone();
-            let tok = state.cancel_token.clone();
-            let result = util::bounded_block_on_cancellable(&rt, &sem, &tok, async move {
-                let s = slot.stream.lock().await;
-                op(&s)
-            });
-            match result {
-                Some(r) => r,
-                None => Err("capsule unloading".to_string()),
-            }
-        },
-        NetStream::Unix(_) => Err("operation not supported on Unix streams".to_string()),
+#[cfg(test)]
+mod tests {
+    //! Regression tests for the PR #752 net-stream fixes:
+    //!
+    //! - `is_peer_disconnect` must cover every error kind the kernel
+    //!   treats as a graceful close, otherwise `write` surfaces
+    //!   `Unknown(...)` to the guest instead of `ConnectionReset`.
+    //! - `write_frame` propagates `BrokenPipe` (the fix replaces a
+    //!   silent `Ok(())` swallow in `tcp_stream::write`).
+    //! - `read_frame` returns `Closed` on a half-closed peer.
+    use super::*;
+    use std::io;
+
+    #[test]
+    fn peer_disconnect_recognises_all_close_kinds() {
+        for kind in [
+            io::ErrorKind::BrokenPipe,
+            io::ErrorKind::ConnectionReset,
+            io::ErrorKind::ConnectionAborted,
+            io::ErrorKind::UnexpectedEof,
+        ] {
+            let e = io::Error::new(kind, "test");
+            assert!(is_peer_disconnect(&e), "{kind:?} should be peer-disconnect");
+        }
+    }
+
+    #[test]
+    fn peer_disconnect_rejects_unrelated_kinds() {
+        for kind in [
+            io::ErrorKind::TimedOut,
+            io::ErrorKind::PermissionDenied,
+            io::ErrorKind::InvalidInput,
+            io::ErrorKind::Other,
+        ] {
+            let e = io::Error::new(kind, "test");
+            assert!(
+                !is_peer_disconnect(&e),
+                "{kind:?} must NOT be classified as peer-disconnect"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn write_frame_returns_brokenpipe_when_peer_closes() {
+        // tokio::io::duplex pair: closing the read half causes the
+        // write half's next write to fail with BrokenPipe. This is
+        // the exact failure mode `tcp_stream::write` now surfaces as
+        // `ConnectionReset` instead of silently swallowing.
+        let (mut tx, rx) = tokio::io::duplex(64);
+        drop(rx);
+        let err = write_frame(&mut tx, &[1u8; 16])
+            .await
+            .expect_err("write to closed peer must error");
+        assert!(
+            is_peer_disconnect(&err),
+            "expected peer-disconnect kind, got {:?}",
+            err.kind()
+        );
+    }
+
+    #[tokio::test]
+    async fn read_frame_returns_closed_on_half_close() {
+        // Peer drops without sending — read_exact gets UnexpectedEof
+        // and `read_frame` converts it to `NetReadStatus::Closed`.
+        let (tx, mut rx) = tokio::io::duplex(64);
+        drop(tx);
+        let status = read_frame(&mut rx).await.expect("classified, not error");
+        assert!(matches!(status, NetReadStatus::Closed));
     }
 }

@@ -18,10 +18,10 @@
 #![allow(clippy::arithmetic_side_effects)]
 
 use astrid_capabilities::{CapabilityCheck, PermissionError};
+use astrid_core::kernel_api::KernelRequest;
 use astrid_core::principal::PrincipalId;
 use astrid_core::{GroupConfig, PrincipalProfile};
 use astrid_kernel::kernel_router::{kernel_request_method, required_capability, resolve_scope};
-use astrid_types::kernel::KernelRequest;
 
 fn admin_principal() -> PrincipalId {
     PrincipalId::new("admin_user").unwrap()

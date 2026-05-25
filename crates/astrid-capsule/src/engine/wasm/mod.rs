@@ -154,8 +154,10 @@ pub struct WasmEngine {
     /// run loop task and invoke_interceptor can both access it (though never
     /// concurrently for run-loop capsules — those use IPC auto-subscribe).
     store: Option<Arc<Mutex<Store<HostState>>>>,
-    /// The instantiated guest component with typed export accessors.
-    instance: Option<bindings::Capsule>,
+    /// The instantiated guest component. Per-export typed accessors are
+    /// looked up at call time via `instance.get_typed_func` since the
+    /// per-domain WIT split removed the bundled `Capsule` world.
+    instance: Option<wasmtime::component::Instance>,
     inbound_rx: Option<tokio::sync::mpsc::Receiver<astrid_core::InboundMessage>>,
     run_handle: Option<tokio::task::JoinHandle<()>>,
     /// Receiver for the readiness signal from the run loop.
@@ -229,6 +231,28 @@ impl WasmEngine {
 /// per-capsule shares would be more appropriate than N * 64MB headroom.
 /// See #639 for the resource telemetry tracking issue.
 const WASM_MAX_MEMORY_BYTES: usize = 64 * 1024 * 1024;
+
+/// Register every Astrid host interface on `linker`. Single source of
+/// truth shared between the main capsule-load path and the lifecycle-
+/// hook (`run_lifecycle`) path so a future change that adds version
+/// negotiation can't drift between the two — what a capsule sees at
+/// install time MUST match what it sees at runtime.
+///
+/// **Zero `wasi:*` registration.** The Astrid-canonical guest target is
+/// `wasm32-unknown-unknown` — capsules produce wasm with zero `wasi:*`
+/// imports, every host call going through audited `astrid:*` interfaces.
+/// A capsule that somehow ships with a `wasi:*` import (e.g. built
+/// against `wasm32-wasip2` without `astrid-sdk`'s toolchain integration)
+/// fails to instantiate at load time with a clear "interface not found"
+/// error — that is the intended posture, not a bug to paper over.
+pub fn configure_kernel_linker(
+    linker: &mut wasmtime::component::Linker<HostState>,
+) -> wasmtime::Result<()> {
+    bindings::Kernel::add_to_linker::<HostState, wasmtime::component::HasSelf<HostState>>(
+        linker,
+        |state| state,
+    )
+}
 
 fn build_wasmtime_engine() -> CapsuleResult<wasmtime::Engine> {
     let mut config = wasmtime::Config::new();
@@ -613,7 +637,6 @@ impl ExecutionEngine for WasmEngine {
                     Box::new(upper_vfs),
                 ));
 
-                let next_subscription_id = 1;
                 // Only resolve home:// in the gate if we actually mounted the VFS.
                 // Otherwise the gate would approve paths the VFS can't serve.
                 let gate_home_root = home_mount.as_ref().map(|m| m.root.clone());
@@ -675,8 +698,6 @@ impl ExecutionEngine for WasmEngine {
                     kv,
                     event_bus,
                     ipc_limiter: astrid_events::ipc::IpcRateLimiter::new(),
-                    subscriptions: std::collections::HashMap::new(),
-                    next_subscription_id,
                     config: wasm_config,
                     // Secret-typed env keys from the manifest.
                     // `get_config` routes these through the keychain
@@ -706,8 +727,6 @@ impl ExecutionEngine for WasmEngine {
                     } else {
                         ctx.cli_socket_listener.clone()
                     },
-                    active_streams: std::collections::HashMap::new(),
-                    next_stream_id: 1,
                     active_http_streams: std::collections::HashMap::new(),
                     next_http_stream_id: 1,
                     security: Some(security_gate),
@@ -737,9 +756,11 @@ impl ExecutionEngine for WasmEngine {
                     interceptor_handles: Vec::new(),
                     allowance_store: ctx.allowance_store.clone(),
                     identity_store: ctx.identity_store.clone(),
-                    background_processes: std::collections::HashMap::new(),
-                    next_process_id: 1,
                     process_tracker: process_tracker.clone(),
+                    net_stream_count: 0,
+                    subscription_count: 0,
+                    process_count_total: 0,
+                    process_count_by_principal: std::collections::HashMap::new(),
                 };
 
                 // Pre-scan WASM exports to detect run() before instantiation.
@@ -779,25 +800,31 @@ impl ExecutionEngine for WasmEngine {
 
                 let mut linker: Linker<HostState> = Linker::new(&wt_engine);
 
-                // Wire WASI imports (clocks, random, stderr).
-                wasmtime_wasi::p2::add_to_linker_sync(&mut linker).map_err(|e| {
+                // No `wasi:*` interfaces are registered: the host ABI is
+                // fully Astrid-owned. Capsules import `astrid:fs`,
+                // `astrid:ipc`, …, and `astrid:io/poll` for readiness
+                // multiplexing — never wasi:io. Exposing the wasi stack
+                // here would create unaudited side channels around the
+                // capability and audit layers (filesystem outside the
+                // VFS, sockets outside the SSRF airlock, clocks/random
+                // outside sys, etc.).
+                //
+                // Wire all Astrid host interfaces from the per-domain
+                // WIT. Both this load path AND the lifecycle path
+                // (`run_lifecycle`, below) go through the same helper
+                // so the linker config stays in lockstep — a future
+                // change that adds a second version registration here
+                // but forgets it in lifecycle would silently install
+                // capsules with mismatched ABIs across the two paths.
+                configure_kernel_linker(&mut linker).map_err(|e| {
                     CapsuleError::UnsupportedEntryPoint(format!(
-                        "Failed to add WASI to linker: {e}"
+                        "Failed to add Astrid host to linker: {e}"
                     ))
                 })?;
 
-                // Wire all 11 Astrid host interfaces from the WIT world.
-                bindings::Capsule::add_to_linker::<
-                    HostState,
-                    wasmtime::component::HasSelf<HostState>,
-                >(&mut linker, |state| state)
-                .map_err(|e| {
-                    CapsuleError::UnsupportedEntryPoint(format!(
-                        "Failed to add Capsule host to linker: {e}"
-                    ))
-                })?;
-
-                // Compile and instantiate the WASM component.
+                // Compile and instantiate the WASM component. The new ABI no
+                // longer ships a bundled world, so we instantiate directly via
+                // the linker and look up exports by name at invocation time.
                 let wasm_component =
                     Component::from_binary(&wt_engine, &wasm_bytes).map_err(|e| {
                         CapsuleError::UnsupportedEntryPoint(format!(
@@ -805,7 +832,8 @@ impl ExecutionEngine for WasmEngine {
                         ))
                     })?;
 
-                let instance = bindings::Capsule::instantiate(&mut store, &wasm_component, &linker)
+                let instance = linker
+                    .instantiate(&mut store, &wasm_component)
                     .map_err(|e| {
                         CapsuleError::UnsupportedEntryPoint(format!(
                             "Failed to instantiate WASM component: {e}"
@@ -867,21 +895,20 @@ impl ExecutionEngine for WasmEngine {
                         CapsuleError::UnsupportedEntryPoint(format!("Store lock poisoned: {e}"))
                     })?;
                     let state = s.data_mut();
-                    // Interceptors are auto-subscribed without check_subscribe_acl.
-                    // Their event patterns are declared in [subscribe].handler (new
-                    // format) or [[interceptor]] blocks (legacy) in Capsule.toml —
-                    // both operator-controlled, same trust level as ipc_subscribe.
-                    // Only guest-initiated ipc::subscribe() calls are ACL-checked.
+                    // Interceptor bindings are metadata under the new
+                    // ABI. The kernel dispatches matching IPC messages to
+                    // `astrid-hook-trigger` directly (no capsule-side
+                    // receiver poll), so we record the action / topic
+                    // mapping but do not allocate an EventReceiver per
+                    // interceptor. `handle-id` is informational only —
+                    // capsules cannot convert it back to a
+                    // `Resource<Subscription>`.
                     let count = effective_interceptors.len();
-                    for interceptor in effective_interceptors {
-                        let receiver = state.event_bus.subscribe_topic(&interceptor.event);
-                        let handle_id = state.next_subscription_id;
-                        state.next_subscription_id = state.next_subscription_id.wrapping_add(1);
-                        state.subscriptions.insert(handle_id, receiver);
+                    for (idx, interceptor) in effective_interceptors.into_iter().enumerate() {
                         state
                             .interceptor_handles
                             .push(host_state::InterceptorHandle {
-                                handle_id,
+                                handle_id: idx as u64,
                                 action: interceptor.action,
                                 topic: interceptor.event,
                             });
@@ -987,7 +1014,10 @@ impl ExecutionEngine for WasmEngine {
                             return;
                         },
                     };
-                    if let Err(e) = run_instance.call_run(&mut *s) {
+                    let call_result = run_instance
+                        .get_typed_func::<(), ()>(&mut *s, "run")
+                        .and_then(|f| f.call(&mut *s, ()));
+                    if let Err(e) = call_result {
                         tracing::error!(capsule = %capsule_name, error = %e, "WASM background loop failed");
                     }
                 });
@@ -1271,14 +1301,27 @@ impl ExecutionEngine for WasmEngine {
             }
         }
 
-        // Call the typed Component Model export. The action name and payload
-        // are passed as separate typed parameters (no JSON envelope needed).
+        // Call the typed Component Model export by name. With the per-export
+        // guest world split, `astrid-hook-trigger` only exists on capsules
+        // that actually implement it — the typed-func lookup returns
+        // `UnsupportedEntryPoint` for capsules that don't.
+        type HookTriggerResult = bindings::astrid::guest::lifecycle::CapsuleResult;
         let result = tokio::task::block_in_place(|| {
             let mut s = store
                 .lock()
                 .map_err(|e| CapsuleError::WasmError(format!("store lock poisoned: {e}")))?;
-            instance
-                .call_astrid_hook_trigger(&mut *s, action, payload)
+            let func = instance
+                .get_typed_func::<(String, Vec<u8>), (HookTriggerResult,)>(
+                    &mut *s,
+                    "astrid-hook-trigger",
+                )
+                .map_err(|e| {
+                    CapsuleError::UnsupportedEntryPoint(format!(
+                        "capsule does not export `astrid-hook-trigger`: {e}"
+                    ))
+                })?;
+            func.call(&mut *s, (action.to_string(), payload.to_vec()))
+                .map(|(cr,)| cr)
                 .map_err(|e| CapsuleError::WasmError(format!("astrid_hook_trigger failed: {e:?}")))
         });
 
@@ -1427,8 +1470,6 @@ pub fn run_lifecycle(
         kv: cfg.kv,
         event_bus: cfg.event_bus,
         ipc_limiter: astrid_events::ipc::IpcRateLimiter::new(),
-        subscriptions: std::collections::HashMap::new(),
-        next_subscription_id: 1,
         config: cfg.config,
         secret_env: std::collections::HashSet::new(),
         ipc_publish_patterns: Vec::new(),
@@ -1441,8 +1482,6 @@ pub fn run_lifecycle(
         inbound_tx: None,
         registered_uplinks: Vec::new(),
         cli_socket_listener: None,
-        active_streams: std::collections::HashMap::new(),
-        next_stream_id: 1,
         active_http_streams: std::collections::HashMap::new(),
         next_http_stream_id: 1,
         lifecycle_phase: Some(phase),
@@ -1454,9 +1493,11 @@ pub fn run_lifecycle(
         interceptor_handles: Vec::new(),
         allowance_store: None,
         identity_store: None,
-        background_processes: std::collections::HashMap::new(),
-        next_process_id: 1,
         process_tracker: Arc::new(host::process::ProcessTracker::new()),
+        net_stream_count: 0,
+        subscription_count: 0,
+        process_count_total: 0,
+        process_count_by_principal: std::collections::HashMap::new(),
     };
 
     // Build wasmtime engine and store for lifecycle execution.
@@ -1470,18 +1511,9 @@ pub fn run_lifecycle(
     let _epoch_guard = spawn_epoch_ticker(&wt_engine);
 
     let mut linker: Linker<HostState> = Linker::new(&wt_engine);
-    wasmtime_wasi::p2::add_to_linker_sync(&mut linker).map_err(|e| {
+    configure_kernel_linker(&mut linker).map_err(|e| {
         CapsuleError::UnsupportedEntryPoint(format!(
-            "Failed to add WASI to linker for lifecycle: {e}"
-        ))
-    })?;
-    bindings::Capsule::add_to_linker::<HostState, wasmtime::component::HasSelf<HostState>>(
-        &mut linker,
-        |state| state,
-    )
-    .map_err(|e| {
-        CapsuleError::UnsupportedEntryPoint(format!(
-            "Failed to add Capsule host to linker for lifecycle: {e}"
+            "Failed to add Astrid host to linker for lifecycle: {e}"
         ))
     })?;
 
@@ -1491,8 +1523,9 @@ pub fn run_lifecycle(
         ))
     })?;
 
-    let instance =
-        bindings::Capsule::instantiate(&mut store, &wasm_component, &linker).map_err(|e| {
+    let instance = linker
+        .instantiate(&mut store, &wasm_component)
+        .map_err(|e| {
             CapsuleError::UnsupportedEntryPoint(format!(
                 "Failed to instantiate WASM component for lifecycle: {e}"
             ))
@@ -1505,18 +1538,22 @@ pub fn run_lifecycle(
         "Running lifecycle hook"
     );
 
-    // Call the lifecycle export.
-    // Note: Component Model lifecycle exports take no arguments (unlike Extism
-    // which passed previous_version as a string). The previous_version can be
-    // made available via config or a dedicated host function if needed.
-    match phase {
-        LifecyclePhase::Install => instance.call_astrid_install(&mut store).map_err(|e| {
-            CapsuleError::ExecutionFailed(format!("lifecycle hook {export_name} failed: {e}"))
-        })?,
-        LifecyclePhase::Upgrade => instance.call_astrid_upgrade(&mut store).map_err(|e| {
-            CapsuleError::ExecutionFailed(format!("lifecycle hook {export_name} failed: {e}"))
-        })?,
-    }
+    // Call the lifecycle export by name. With per-export guest worlds the
+    // export is only present in the wasm binary if the capsule actually
+    // implements it; missing exports surface as a clear "not implemented"
+    // error rather than a toolchain stub trap. `export_name` is
+    // "astrid-install" or "astrid-upgrade" depending on `phase`.
+    let func = instance
+        .get_typed_func::<(), ()>(&mut store, export_name)
+        .map_err(|_| {
+            CapsuleError::UnsupportedEntryPoint(format!(
+                "capsule does not export lifecycle hook `{export_name}`"
+            ))
+        })?;
+    func.call(&mut store, ()).map_err(|e| {
+        CapsuleError::ExecutionFailed(format!("lifecycle hook {export_name} failed: {e}"))
+    })?;
+    let _ = phase; // already consumed via export_name selection above
 
     // Epoch ticker guard drops automatically (RAII).
 
@@ -1547,6 +1584,20 @@ fn wasm_exports_contain_run(wasm_bytes: &[u8]) -> bool {
 /// when the source crate doesn't implement them. Synthesized stubs share a
 /// single backing function and alias to the same export index, so a name
 /// in this trio whose index matches another trio member's index is a stub.
+// IMPORTANT: keep this list in sync with the SDK's stub-emission list.
+// Today the SDK fills in three mandatory exports — `run`,
+// `astrid-install`, `astrid-upgrade` — with a single shared no-op
+// function when the source crate does not provide them. Stub
+// detection matches all three to that shared function index.
+//
+// `astrid-hook-trigger` is currently NOT stubbed (the SDK omits it
+// entirely when no `#[astrid::hook]` attributes are present, and we
+// detect its absence by export-name). If a future SDK release adds
+// `astrid-hook-trigger` to its mandatory stub set, this trio MUST be
+// extended to include it — otherwise every capsule will appear to
+// expose a real hook handler and the kernel will dispatch trigger
+// events into a no-op trap. See `wasm_exports_contain` callers in
+// the interceptor / hook-bridge paths for the affected branches.
 const STUB_PRONE_EXPORTS: [&str; 3] = ["run", "astrid-install", "astrid-upgrade"];
 
 /// Pre-scans a WASM binary's exports for a real implementation of `name`.
@@ -1699,8 +1750,10 @@ mod tests {
 
     #[test]
     fn check_principal_enabled_rejects_disabled_profile() {
-        let mut profile = astrid_core::profile::PrincipalProfile::default();
-        profile.enabled = false;
+        let profile = astrid_core::profile::PrincipalProfile {
+            enabled: false,
+            ..Default::default()
+        };
         let err = check_principal_enabled(&profile, &pid("bob"), "test-capsule", "do-thing")
             .expect_err("disabled profile must be denied");
         let msg = err.to_string();
@@ -1715,9 +1768,11 @@ mod tests {
         // The Layer 5 preamble denies disabled admins on management
         // requests; Layer 3 must do the same on capsule invocations,
         // regardless of group membership. enabled=false beats admin.
-        let mut profile = astrid_core::profile::PrincipalProfile::default();
-        profile.groups = vec!["admin".to_string()];
-        profile.enabled = false;
+        let profile = astrid_core::profile::PrincipalProfile {
+            groups: vec!["admin".to_string()],
+            enabled: false,
+            ..Default::default()
+        };
         assert!(check_principal_enabled(&profile, &pid("admin_user"), "x", "y").is_err());
     }
 
@@ -1985,7 +2040,7 @@ mod tests {
         // Export section
         let mut exports = ExportSection::new();
         for (i, name) in export_names.iter().enumerate() {
-            exports.export(*name, ExportKind::Func, i as u32);
+            exports.export(name, ExportKind::Func, i as u32);
         }
         module.section(&exports);
 

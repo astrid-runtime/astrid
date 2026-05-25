@@ -5,8 +5,9 @@
 //! [`AllowanceStore`] first (instant path), then publishes an
 //! [`ApprovalRequired`] IPC event and blocks until the frontend responds.
 
-use crate::engine::wasm::bindings::astrid::capsule::approval;
-use crate::engine::wasm::bindings::astrid::capsule::types::{ApprovalRequest, ApprovalResponse};
+use crate::engine::wasm::bindings::astrid::approval::host::{
+    self as approval, ApprovalDecision, ApprovalRequest, ApprovalResponse, ErrorCode,
+};
 use crate::engine::wasm::host::util;
 use crate::engine::wasm::host_state::HostState;
 use astrid_approval::action::SensitiveAction;
@@ -175,15 +176,30 @@ fn create_allowance_from_decision(
     }
 }
 
+/// Map the JSON-string decision in `IpcPayload::ApprovalResponse` to the
+/// typed [`ApprovalDecision`] returned to the WASM guest.
+fn decision_from_str(decision: &str) -> ApprovalDecision {
+    match decision {
+        "approve" => ApprovalDecision::Approved,
+        "approve_session" => ApprovalDecision::ApprovedSession,
+        "approve_always" => ApprovalDecision::ApprovedAlways,
+        // Anything else — including explicit denies, unknown strings, or
+        // empty — is treated as a deny.
+        _ => ApprovalDecision::Denied,
+    }
+}
+
 impl approval::Host for HostState {
     /// Host function: `request_approval(request) -> ApprovalResponse`
     ///
     /// Blocks the WASM thread until the frontend user approves or denies, or
-    /// the request times out. If an allowance already exists, returns immediately.
+    /// the request times out. If an allowance already exists, returns immediately
+    /// with `ApprovalDecision::Allowance` so the capsule UI can communicate
+    /// WHY consent was granted.
     fn request_approval(
         &mut self,
         mut request: ApprovalRequest,
-    ) -> Result<ApprovalResponse, String> {
+    ) -> Result<ApprovalResponse, ErrorCode> {
         let allowance_store = self.allowance_store.clone();
         let event_bus = self.event_bus.clone();
         let runtime_handle = self.runtime_handle.clone();
@@ -198,9 +214,7 @@ impl approval::Host for HostState {
         // Validate and sanitize all guest-supplied strings at the entry point.
         let action_char_count = request.action.chars().count();
         if action_char_count > MAX_ACTION_LEN {
-            return Err(format!(
-                "approval request action exceeds maximum length ({action_char_count} > {MAX_ACTION_LEN})",
-            ));
+            return Err(ErrorCode::InvalidInput);
         }
         request.action = sanitize_action_for_pattern(&request.action, &capsule_id);
         sanitize_guest_field(
@@ -223,7 +237,9 @@ impl approval::Host for HostState {
                 "Approval auto-granted via existing allowance"
             );
 
-            return Ok(ApprovalResponse { approved: true });
+            return Ok(ApprovalResponse {
+                decision: ApprovalDecision::Allowance,
+            });
         }
 
         // Slow path: publish ApprovalRequired and wait for response.
@@ -281,9 +297,12 @@ impl approval::Host for HostState {
                         IpcPayload::ApprovalResponse {
                             decision, reason, ..
                         } => {
+                            let typed = decision_from_str(decision);
                             let approved = matches!(
-                                decision.as_str(),
-                                "approve" | "approve_session" | "approve_always"
+                                typed,
+                                ApprovalDecision::Approved
+                                    | ApprovalDecision::ApprovedSession
+                                    | ApprovalDecision::ApprovedAlways
                             );
 
                             // Create allowance for session/always decisions.
@@ -306,12 +325,16 @@ impl approval::Host for HostState {
                                 "Approval response received"
                             );
 
-                            Ok(ApprovalResponse { approved })
+                            Ok(ApprovalResponse { decision: typed })
                         },
-                        _ => Err("unexpected IPC payload type in approval response".to_string()),
+                        _ => Err(ErrorCode::Unknown(
+                            "unexpected IPC payload type in approval response".to_string(),
+                        )),
                     }
                 } else {
-                    Err("unexpected event type in approval response".to_string())
+                    Err(ErrorCode::Unknown(
+                        "unexpected event type in approval response".to_string(),
+                    ))
                 }
             },
             None => {
@@ -320,8 +343,8 @@ impl approval::Host for HostState {
                     action = %request.action,
                     "Approval request timed out or was cancelled"
                 );
-                // Timeout/cancellation = deny
-                Ok(ApprovalResponse { approved: false })
+                // Per WIT: timeout returns the typed `timeout` ErrorCode arm.
+                Err(ErrorCode::Timeout)
             },
         }
     }

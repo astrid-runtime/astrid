@@ -98,7 +98,7 @@ pub(crate) async fn run(
     let (mut terminal, keyboard_enhanced) = init_terminal()?;
 
     // Sync dynamic commands on startup.
-    let req = astrid_types::kernel::KernelRequest::GetCommands;
+    let req = astrid_core::kernel_api::KernelRequest::GetCommands;
     if let Ok(val) = serde_json::to_value(req) {
         let msg = astrid_types::ipc::IpcMessage::new(
             "astrid.v1.request.get_commands",
@@ -351,8 +351,8 @@ pub(crate) fn handle_daemon_event(app: &mut App, message: &IpcMessage) {
                 app.state = UiState::AwaitingApproval;
             }
         } else if let astrid_types::ipc::IpcPayload::RawJson(val) = &message.payload
-            && let Ok(astrid_types::kernel::KernelResponse::Commands(cmds)) =
-                serde_json::from_value::<astrid_types::kernel::KernelResponse>(val.clone())
+            && let Ok(astrid_core::kernel_api::KernelResponse::Commands(cmds)) =
+                serde_json::from_value::<astrid_core::kernel_api::KernelResponse>(val.clone())
         {
             // Reset the dynamic slash command palette to the hardcoded base commands
             app.slash_commands = vec![
@@ -596,7 +596,7 @@ async fn handle_pending_actions(
                 let _ = client.send_message(msg).await;
             },
             PendingAction::RefreshCommands => {
-                let req = astrid_types::kernel::KernelRequest::GetCommands;
+                let req = astrid_core::kernel_api::KernelRequest::GetCommands;
                 if let Ok(val) = serde_json::to_value(req) {
                     let msg = astrid_types::ipc::IpcMessage::new(
                         "astrid.v1.request.get_commands",
@@ -622,7 +622,7 @@ async fn handle_pending_actions(
                             app.push_notice(msg);
                             app.status_message = Some((msg.to_string(), Instant::now()));
 
-                            let req = astrid_types::kernel::KernelRequest::ReloadCapsules;
+                            let req = astrid_core::kernel_api::KernelRequest::ReloadCapsules;
                             if let Ok(val) = serde_json::to_value(req) {
                                 let ipc_msg = astrid_types::ipc::IpcMessage::new(
                                     "astrid.v1.request.reload_capsules",
@@ -715,7 +715,7 @@ async fn handle_slash_command(
                         app.push_notice(success_msg);
                         app.status_message = Some((success_msg.to_string(), Instant::now()));
 
-                        let req = astrid_types::kernel::KernelRequest::ReloadCapsules;
+                        let req = astrid_core::kernel_api::KernelRequest::ReloadCapsules;
                         if let Ok(val) = serde_json::to_value(req) {
                             let msg = astrid_types::ipc::IpcMessage::new(
                                 "astrid.v1.request.reload_capsules",
@@ -727,7 +727,7 @@ async fn handle_slash_command(
 
                         // Refresh the slash command palette so newly installed
                         // capsule commands appear without restarting the CLI.
-                        let req = astrid_types::kernel::KernelRequest::GetCommands;
+                        let req = astrid_core::kernel_api::KernelRequest::GetCommands;
                         if let Ok(val) = serde_json::to_value(req) {
                             let msg = astrid_types::ipc::IpcMessage::new(
                                 "astrid.v1.request.get_commands",
@@ -746,7 +746,7 @@ async fn handle_slash_command(
         "/refresh" => {
             app.push_message(MessageRole::User, cmd.to_string());
             app.push_notice("Sending refresh signal to daemon...");
-            let req = astrid_types::kernel::KernelRequest::ReloadCapsules;
+            let req = astrid_core::kernel_api::KernelRequest::ReloadCapsules;
             if let Ok(val) = serde_json::to_value(req) {
                 let msg = astrid_types::ipc::IpcMessage::new(
                     "astrid.v1.request.reload_capsules",
@@ -757,7 +757,7 @@ async fn handle_slash_command(
             }
 
             // Refresh the slash command palette after reload.
-            let req = astrid_types::kernel::KernelRequest::GetCommands;
+            let req = astrid_core::kernel_api::KernelRequest::GetCommands;
             if let Ok(val) = serde_json::to_value(req) {
                 let msg = astrid_types::ipc::IpcMessage::new(
                     "astrid.v1.request.get_commands",
@@ -781,7 +781,7 @@ async fn handle_slash_command(
                  Capsule commands (from installed capsules) also appear in the palette."
                     .to_string(),
             );
-            let req = astrid_types::kernel::KernelRequest::GetCommands;
+            let req = astrid_core::kernel_api::KernelRequest::GetCommands;
             if let Ok(val) = serde_json::to_value(req) {
                 let msg = astrid_types::ipc::IpcMessage::new(
                     "astrid.v1.request.get_commands",

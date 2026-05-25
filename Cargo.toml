@@ -53,7 +53,7 @@ astrid-prelude = { path = "crates/astrid-prelude", version = "0.6.0" }
 astrid-storage = { path = "crates/astrid-storage", version = "0.6.0" }
 astrid-telemetry = { path = "crates/astrid-telemetry", version = "0.6.0" }
 astrid-test = { path = "crates/astrid-test" }
-astrid-types = { path = "crates/astrid-types", version = "0.6.0" }
+astrid-types = { path = "crates/astrid-types", version = "0.6.0", features = ["clock"] }
 astrid-vfs = { path = "crates/astrid-vfs", version = "0.6.0" }
 astrid-workspace = { path = "crates/astrid-workspace", version = "0.6.0" }
 anyhow = "1.0"
@@ -62,7 +62,14 @@ arc-swap = "1.7"
 async-trait = "0.1"
 base64 = "0.22"
 blake3 = "1.5"
-chrono = { version = "0.4", features = ["serde"] }
+# `default-features = false` strips chrono's `clock` feature, which on
+# `wasm32-unknown-unknown` would pull in `wasm-bindgen` + `js-sys` and
+# inject `__wbindgen_placeholder__` imports that `wit-component`
+# rejects when wrapping a core wasm into a Component Model component.
+# Records that need a clock value receive it from `astrid_sdk::time`
+# (audited host fn); `DateTime<Utc>` is only used as a serializable
+# field shape, never constructed via `Utc::now()` in capsule code.
+chrono = { version = "0.4", default-features = false, features = ["serde"] }
 clap = { version = "4.5", features = ["derive", "env"] }
 clap_complete = "4.5"
 colored = "2.1"
@@ -123,13 +130,19 @@ toml = "0.8"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 url = "2"
-uuid = { version = "1.0", features = ["v4", "v5", "serde"] }
+# `default-features = false` strips the `js` auto-feature that uuid
+# enables on `wasm32-unknown-unknown`, which would pull `wasm-bindgen`.
+# The `v4` feature uses `getrandom` under the hood — on host this is
+# the OS RNG, on capsule (wasm32-unknown-unknown) it's routed through
+# `astrid:sys.random-bytes` via the SDK's custom getrandom backend.
+uuid = { version = "1.0", default-features = false, features = ["v4", "v5", "serde", "rng-getrandom"] }
 walkdir = "2.5"
 wasm-encoder = "0.227"
 wasmparser = "0.227"
+wit-component = "0.227"
 wit-parser = "0.227"
-wasmtime = { version = "43", features = ["component-model", "cranelift"] }
-wasmtime-wasi = "43"
+wasmtime = { version = "45", features = ["component-model", "cranelift"] }
+wasmtime-wasi = "45"
 unicode-width = "0.2"
 which = "7"
 wizer = "10"

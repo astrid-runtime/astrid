@@ -4,8 +4,9 @@
 //! serialized [`HookAbiContext`] as `list<u8>` and interpreting the returned
 //! bytes as a [`HookAbiResult`].
 //!
-//! Host functions are provided via `Capsule::add_to_linker` (wasmtime bindgen)
-//! and `wasmtime_wasi::p2::add_to_linker_sync`.
+//! Host functions are provided via `Kernel::add_to_linker` (wasmtime
+//! bindgen) — no wasi:* interfaces are exposed; the host ABI is fully
+//! Astrid-owned for audit and capability uniformity.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -171,31 +172,35 @@ impl WasmHandler {
             u64::try_from(self.config.max_execution_time.as_millis() / 100).unwrap_or(u64::MAX);
         store.set_epoch_deadline(deadline_ticks.max(1));
 
-        // Build linker with WASI + Astrid host interfaces
+        // Build linker with Astrid host interfaces only — no wasi:*
+        // exposure, matching the main capsule load path.
         let mut linker: Linker<HostState> = Linker::new(&self.engine);
 
-        wasmtime_wasi::p2::add_to_linker_sync(&mut linker)
-            .map_err(|e| HandlerError::WasmFailed(format!("failed to add WASI to linker: {e}")))?;
-
-        bindings::Capsule::add_to_linker::<HostState, wasmtime::component::HasSelf<HostState>>(
-            &mut linker,
-            |state| state,
-        )
-        .map_err(|e| {
-            HandlerError::WasmFailed(format!("failed to add Capsule host to linker: {e}"))
+        astrid_capsule::engine::wasm::configure_kernel_linker(&mut linker).map_err(|e| {
+            HandlerError::WasmFailed(format!("failed to add Astrid host to linker: {e}"))
         })?;
 
-        // Instantiate the component
-        let instance =
-            bindings::Capsule::instantiate(&mut store, &component, &linker).map_err(|e| {
-                HandlerError::WasmFailed(format!("failed to instantiate WASM component: {e}"))
-            })?;
+        // Instantiate the component without world enforcement (the per-
+        // domain WIT split removed the bundled `Capsule` world; exports
+        // are looked up by name).
+        let instance = linker.instantiate(&mut store, &component).map_err(|e| {
+            HandlerError::WasmFailed(format!("failed to instantiate WASM component: {e}"))
+        })?;
 
-        // Call the typed Component Model export. The function name is the
-        // action, the serialized context is the payload.
+        // Call `astrid-hook-trigger` via typed func lookup.
         let capsule_result = tokio::task::block_in_place(|| {
-            instance
-                .call_astrid_hook_trigger(&mut store, function, &input_bytes)
+            let func = instance
+                .get_typed_func::<(String, Vec<u8>), (bindings::astrid::guest::lifecycle::CapsuleResult,)>(
+                    &mut store,
+                    "astrid-hook-trigger",
+                )
+                .map_err(|e| {
+                    HandlerError::WasmFailed(format!(
+                        "capsule does not export `astrid-hook-trigger`: {e}"
+                    ))
+                })?;
+            func.call(&mut store, (function.clone(), input_bytes.clone()))
+                .map(|(cr,)| cr)
                 .map_err(|e| {
                     HandlerError::WasmFailed(format!("astrid-hook-trigger call failed: {e}"))
                 })
@@ -316,8 +321,6 @@ impl WasmHandler {
             kv,
             event_bus: astrid_events::EventBus::with_capacity(128),
             ipc_limiter: astrid_events::ipc::IpcRateLimiter::new(),
-            subscriptions: HashMap::new(),
-            next_subscription_id: 1,
             config: HashMap::new(),
             secret_env: std::collections::HashSet::new(),
             ipc_publish_patterns: vec!["hook.v1.result.*".into()],
@@ -330,8 +333,6 @@ impl WasmHandler {
             inbound_tx: None,
             registered_uplinks: Vec::new(),
             cli_socket_listener: None,
-            active_streams: HashMap::new(),
-            next_stream_id: 1,
             active_http_streams: HashMap::new(),
             next_http_stream_id: 1,
             lifecycle_phase: None,
@@ -346,11 +347,13 @@ impl WasmHandler {
             // do not receive the identity store. Identity resolution requires
             // a kernel-managed security gate which hooks don't have.
             identity_store: None,
-            background_processes: HashMap::new(),
-            next_process_id: 1,
             process_tracker: Arc::new(
                 astrid_capsule::engine::wasm::host::process::ProcessTracker::new(),
             ),
+            net_stream_count: 0,
+            subscription_count: 0,
+            process_count_total: 0,
+            process_count_by_principal: HashMap::new(),
         })
     }
 }

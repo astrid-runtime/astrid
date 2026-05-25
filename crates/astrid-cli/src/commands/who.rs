@@ -61,7 +61,7 @@ pub(crate) async fn run(args: WhoArgs) -> Result<ExitCode> {
         eprintln!("{}", Theme::error("Failed to connect to daemon"));
         return Ok(ExitCode::from(1));
     };
-    let req = astrid_types::kernel::KernelRequest::GetStatus;
+    let req = astrid_core::kernel_api::KernelRequest::GetStatus;
     let val = serde_json::to_value(req)?;
     let msg = astrid_types::ipc::IpcMessage::new(
         "astrid.v1.request.status",
@@ -79,7 +79,7 @@ pub(crate) async fn run(args: WhoArgs) -> Result<ExitCode> {
     // future change to the IPC response wrapper without re-implementing
     // the `{type, value}` unwrap inline (matches `ps` / `daemon` usage).
     let status = match crate::socket_client::SocketClient::extract_kernel_response(&raw) {
-        Some(astrid_types::kernel::KernelResponse::Status(s)) => Some(s),
+        Some(astrid_core::kernel_api::KernelResponse::Status(s)) => Some(s),
         _ => None,
     };
 

@@ -195,7 +195,7 @@ impl SocketClient {
     #[must_use]
     pub fn extract_kernel_response(
         raw: &serde_json::Value,
-    ) -> Option<astrid_types::kernel::KernelResponse> {
+    ) -> Option<astrid_core::kernel_api::KernelResponse> {
         let payload = raw.get("payload")?.clone();
         let value = if payload
             .as_object()
@@ -205,7 +205,7 @@ impl SocketClient {
         } else {
             payload
         };
-        serde_json::from_value::<astrid_types::kernel::KernelResponse>(value).ok()
+        serde_json::from_value::<astrid_core::kernel_api::KernelResponse>(value).ok()
     }
 
     /// Read raw frames from the socket until one carries `want_topic`

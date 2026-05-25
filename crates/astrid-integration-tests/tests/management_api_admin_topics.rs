@@ -23,6 +23,10 @@
 #![allow(clippy::arithmetic_side_effects)]
 
 use astrid_capabilities::{CapabilityCheck, PermissionError};
+use astrid_core::kernel_api::{
+    AdminKernelRequest, AdminKernelResponse, AdminRequestKind, AdminResponseBody, AgentSummary,
+    GroupSummary,
+};
 use astrid_core::principal::PrincipalId;
 use astrid_core::profile::Quotas;
 use astrid_core::{GroupConfig, PrincipalProfile};
@@ -30,10 +34,6 @@ use astrid_kernel::kernel_router::AuthorityScope;
 use astrid_kernel::kernel_router::admin::{
     admin_request_method, admin_target_principal, required_capability_for_admin_request,
     resolve_admin_scope,
-};
-use astrid_types::kernel::{
-    AdminKernelRequest, AdminKernelResponse, AdminRequestKind, AdminResponseBody, AgentSummary,
-    GroupSummary,
 };
 
 // ── Fixtures ──────────────────────────────────────────────────────────

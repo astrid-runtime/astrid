@@ -1,0 +1,3 @@
+[submodule "wit"]
+	path = wit
+	url = https://github.com/unicity-astrid/wit.git
