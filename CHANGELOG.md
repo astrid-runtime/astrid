@@ -9,6 +9,8 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-05-25
+
 ### Breaking
 
 - **`KernelRequest` / `KernelResponse` / `CommandInfo` / `CapsuleMetadataEntry` / `DaemonStatus` / `SYSTEM_SESSION_UUID` moved from `astrid_types::kernel` to `astrid_core::kernel_api`.** Re-exports under `astrid_events::kernel_api` are preserved for migration ergonomics. The reason: `astrid-types` is the WASM-compatible shared-types crate intended to compile on `wasm32-unknown-unknown` for capsule SDK consumption — it cannot depend on `astrid-core` (which references `PrincipalId`, `Quotas`, and the rest of the kernel-only type universe). The kernel-management RPC surface (CLI ↔ daemon) doesn't belong in a WASM-compatible crate to begin with. CLI commands, `socket_client`, `admin_client`, the TUI, and the integration tests have all been updated to import from `astrid_core::kernel_api`.
