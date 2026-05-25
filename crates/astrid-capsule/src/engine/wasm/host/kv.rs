@@ -110,18 +110,26 @@ impl kv::Host for HostState {
         key: String,
         expected: Option<Vec<u8>>,
         new: Vec<u8>,
-    ) -> Result<bool, ErrorCode> {
+    ) -> Result<(), ErrorCode> {
         // Atomic compare-and-swap is delegated to the storage layer.
         // `MemoryKvStore` serializes the read+conditional-write under a
         // single write lock; `SurrealKvStore` issues one MVCC
         // transaction and treats commit conflicts as `Ok(false)` so a
         // concurrent capsule's commit invalidates this caller's
         // `expected` rather than overwriting the new value.
+        //
+        // The storage layer reports mismatch via `Ok(false)`; the WIT
+        // contract surfaces mismatch via `Err(ErrorCode::CasMismatch)`.
+        // Translate at the boundary so capsule code can pattern-match
+        // `Err(CasMismatch)` for the routine lost-race retry and use
+        // `?` for everything else.
         let kv = self.effective_kv().clone();
         util::bounded_block_on(&self.runtime_handle, &self.host_semaphore, async {
-            kv.compare_and_swap(&key, expected.as_deref(), new)
-                .await
-                .map_err(|e| store_err("kv_cas", e))
+            match kv.compare_and_swap(&key, expected.as_deref(), new).await {
+                Ok(true) => Ok(()),
+                Ok(false) => Err(ErrorCode::CasMismatch),
+                Err(e) => Err(store_err("kv_cas", e)),
+            }
         })
     }
 }
