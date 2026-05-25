@@ -20,7 +20,7 @@ use colored::Colorize;
 /// The packaged `AppArmor` profile, bundled into the binary at build
 /// time so `astrid setup` can write a path-correct copy to /tmp for
 /// the operator to install.
-const APPARMOR_PROFILE_TEMPLATE: &str = include_str!("../../../../dist/apparmor/astrid");
+const APPARMOR_PROFILE_TEMPLATE: &str = include_str!("../../apparmor/astrid");
 
 #[derive(Args, Debug, Clone)]
 pub(crate) struct SetupArgs {
