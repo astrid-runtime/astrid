@@ -188,14 +188,36 @@ impl fs::Host for HostState {
         let resolved = resolve_path(self, &path).map_err(map_resolve_err)?;
         gate_write(self, &resolved.physical)?;
         let vfs_path = resolve_vfs(self, &resolved).map_err(map_resolve_err)?;
+
+        // Strict-create semantics per `astrid:fs@1.0.0` (fs-mkdir
+        // distinguished from fs-mkdir-all by failing when an
+        // intermediate parent is missing). The underlying VFS
+        // `mkdir()` is `create_dir_all`-based for every impl
+        // (host/overlay/worktree), so without this guard fs-mkdir
+        // would silently create missing parents and fail-open against
+        // the contract (Gemini #752 finding). Pre-check the parent
+        // exists; the only TOCTOU window is between this check and
+        // the mkdir call, which leaves the operation no less strict
+        // than POSIX `mkdir(2)` against a concurrent mutator.
+        let relative = vfs_path.relative.to_string_lossy().to_string();
+        if let Some(parent) = vfs_path.relative.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            let parent_rel = parent.to_string_lossy().to_string();
+            let parent_exists =
+                util::bounded_block_on(&self.runtime_handle, &self.host_semaphore, async {
+                    vfs_path.vfs.exists(&vfs_path.handle, &parent_rel).await
+                })
+                .unwrap_or(false);
+            if !parent_exists {
+                let result: Result<(), ErrorCode> = Err(ErrorCode::NotFound);
+                audit_fs(self, "astrid:fs/host.fs-mkdir", &path, &result);
+                return result;
+            }
+        }
+
         let result = util::bounded_block_on(&self.runtime_handle, &self.host_semaphore, async {
-            vfs_path
-                .vfs
-                .mkdir(
-                    &vfs_path.handle,
-                    vfs_path.relative.to_string_lossy().as_ref(),
-                )
-                .await
+            vfs_path.vfs.mkdir(&vfs_path.handle, &relative).await
         })
         .map_err(map_vfs_err);
         audit_fs(self, "astrid:fs/host.fs-mkdir", &path, &result);

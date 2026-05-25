@@ -25,6 +25,7 @@ use std::collections::VecDeque;
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 
+use tokio::process::Command as TokioCommand;
 use tracing::warn;
 use wasmtime::component::Resource;
 
@@ -229,8 +230,17 @@ impl process::Host for HostState {
                 .map_err(|_| ErrorCode::InvalidInput)?;
         configure_piped(&mut sandboxed_cmd);
 
+        // Convert the prepared std::Command into a tokio::Command so the
+        // spawned Child supports async wait(&mut self) without ownership
+        // transfer (Gemini #752 finding — the previous std::Child path
+        // stranded the handle inside spawn_blocking on timeout).
+        // `kill_on_drop(true)` ensures the tokio runtime reaps the
+        // zombie if `ManagedProcess` is dropped before the child exits.
+        let mut tokio_cmd = TokioCommand::from(sandboxed_cmd);
+        tokio_cmd.kill_on_drop(true);
+
         let command_str = format!("{} {}", request.cmd, request.args.join(" "));
-        let child = sandboxed_cmd
+        let child = tokio_cmd
             .spawn()
             .map_err(|e| ErrorCode::Unknown(format!("spawn-background failed: {e}")))?;
 
@@ -244,8 +254,12 @@ impl process::Host for HostState {
             creator: principal.clone(),
         };
 
-        let pid = managed.child.as_ref().map(|c| c.id()).unwrap_or(0);
-        attach_pipes(&mut managed, pid);
+        let pid = managed
+            .child
+            .as_ref()
+            .and_then(tokio::process::Child::id)
+            .unwrap_or(0);
+        attach_pipes(&mut managed, &handle);
 
         // Register with the cancellation tracker so a
         // `tool.v1.request.cancel` event reaches the background

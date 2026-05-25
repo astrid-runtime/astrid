@@ -7,13 +7,22 @@ use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 
 use astrid_workspace::SandboxCommand;
+use tokio::io::AsyncReadExt;
 
 /// Maximum bytes buffered per stream (stdout or stderr).
 pub(super) const MAX_BUFFER_BYTES: usize = 1024 * 1024;
 
 /// A background process managed by the host on behalf of a WASM capsule.
+///
+/// `child` is a [`tokio::process::Child`] rather than the synchronous
+/// stdlib variant because `wait()` takes `&mut self` rather than
+/// consuming the child by value — so `ProcessHandle.wait` with a
+/// timeout can race `child.wait()` against `tokio::time::timeout`
+/// without losing ownership when the timeout fires. The std variant
+/// requires moving the child into a `spawn_blocking` task, which
+/// strands the handle if the wait times out (Gemini #752 finding).
 pub struct ManagedProcess {
-    pub(super) child: Option<std::process::Child>,
+    pub(super) child: Option<tokio::process::Child>,
     pub(super) stdout_buf: Arc<Mutex<VecDeque<u8>>>,
     pub(super) stderr_buf: Arc<Mutex<VecDeque<u8>>>,
     /// The full command string (cmd + args), kept for diagnostic /
@@ -25,16 +34,28 @@ pub struct ManagedProcess {
     pub(super) creator: astrid_core::principal::PrincipalId,
 }
 
-/// Kill and reap a child process, including its process group on Unix.
-pub(super) fn kill_and_reap(child: &mut std::process::Child) -> Option<i32> {
+/// Synchronously kill a child process group on Unix and start the kill
+/// on the child itself. Returns the exit code if reaping was possible
+/// in the brief window before this call returns.
+///
+/// `tokio::process::Child::kill()` is async, but `Drop` and the kill
+/// host-fn need a sync path. `start_kill` sends SIGKILL and returns
+/// immediately; the kernel's `kill_on_drop(true)` flag on the spawning
+/// Command ensures the tokio runtime reaps the zombie when the Child
+/// is dropped.
+pub(super) fn kill_and_reap(child: &mut tokio::process::Child) -> Option<i32> {
     #[cfg(unix)]
     {
-        let raw_pid = child.id();
-        let pid = nix::unistd::Pid::from_raw(i32::try_from(raw_pid).unwrap_or(i32::MAX));
-        let _ = nix::sys::signal::killpg(pid, nix::sys::signal::Signal::SIGKILL);
+        if let Some(raw_pid) = child.id() {
+            let pid = nix::unistd::Pid::from_raw(i32::try_from(raw_pid).unwrap_or(i32::MAX));
+            let _ = nix::sys::signal::killpg(pid, nix::sys::signal::Signal::SIGKILL);
+        }
     }
-    let _ = child.kill();
-    child.wait().ok().and_then(|s| s.code())
+    let _ = child.start_kill();
+    // Best-effort sync drain of the exit status. `try_wait` is
+    // non-blocking; if the SIGKILL hasn't been observed by the OS yet
+    // this returns Ok(None) and we surface `None` for the exit code.
+    child.try_wait().ok().flatten().and_then(|s| s.code())
 }
 
 impl Drop for ManagedProcess {
@@ -52,34 +73,33 @@ pub(super) fn drain_buffer(buf: &Mutex<VecDeque<u8>>) -> String {
     String::from_utf8_lossy(&bytes).into_owned()
 }
 
-/// Spawn a reader thread that drains a pipe into a bounded ring buffer.
-pub(super) fn spawn_reader_thread(
-    id: u32,
-    label: &str,
-    mut pipe: impl std::io::Read + Send + 'static,
+/// Spawn a tokio task that drains an async pipe into a bounded ring
+/// buffer. The task exits on EOF or read error; both are normal
+/// terminal conditions when the child closes its stdio.
+pub(super) fn spawn_reader_task<R>(
+    runtime: &tokio::runtime::Handle,
+    mut pipe: R,
     buffer: Arc<Mutex<VecDeque<u8>>>,
-) {
-    let name = format!("bg-{id}-{label}");
-    std::thread::Builder::new()
-        .name(name)
-        .spawn(move || {
-            let mut chunk = [0u8; 4096];
-            loop {
-                match pipe.read(&mut chunk) {
-                    Ok(0) => break,
-                    Ok(n) => {
-                        let mut locked = buffer.lock().unwrap_or_else(|e| e.into_inner());
-                        locked.extend(&chunk[..n]);
-                        let excess = locked.len().saturating_sub(MAX_BUFFER_BYTES);
-                        if excess > 0 {
-                            locked.drain(..excess);
-                        }
-                    },
-                    Err(_) => break,
-                }
+) where
+    R: AsyncReadExt + Unpin + Send + 'static,
+{
+    runtime.spawn(async move {
+        let mut chunk = vec![0u8; 4096];
+        loop {
+            match pipe.read(&mut chunk).await {
+                Ok(0) => break,
+                Ok(n) => {
+                    let mut locked = buffer.lock().unwrap_or_else(|e| e.into_inner());
+                    locked.extend(&chunk[..n]);
+                    let excess = locked.len().saturating_sub(MAX_BUFFER_BYTES);
+                    if excess > 0 {
+                        locked.drain(..excess);
+                    }
+                },
+                Err(_) => break,
             }
-        })
-        .ok();
+        }
+    });
 }
 
 /// Prepare a sandboxed command. Shared between spawn and spawn-background.
@@ -99,30 +119,21 @@ pub(super) fn prepare_sandboxed_command(
         .map_err(|e| format!("failed to wrap command in sandbox: {e}"))
 }
 
-/// Wire a freshly-spawned child's stdout / stderr into reader threads
-/// that drain into the supplied buffers.
-pub(super) fn attach_pipes(managed: &mut ManagedProcess, process_id: u32) {
+/// Wire a freshly-spawned child's stdout / stderr into tokio reader
+/// tasks that drain into the supplied buffers.
+pub(super) fn attach_pipes(managed: &mut ManagedProcess, runtime: &tokio::runtime::Handle) {
     if let Some(child) = managed.child.as_mut() {
         if let Some(stdout) = child.stdout.take() {
-            spawn_reader_thread(
-                process_id,
-                "stdout",
-                stdout,
-                Arc::clone(&managed.stdout_buf),
-            );
+            spawn_reader_task(runtime, stdout, Arc::clone(&managed.stdout_buf));
         }
         if let Some(stderr) = child.stderr.take() {
-            spawn_reader_thread(
-                process_id,
-                "stderr",
-                stderr,
-                Arc::clone(&managed.stderr_buf),
-            );
+            spawn_reader_task(runtime, stderr, Arc::clone(&managed.stderr_buf));
         }
     }
 }
 
-/// Helper for building a piped-stdio command. Used by spawn-background.
+/// Configure stdio + process-group on a std command. Caller converts
+/// to a `tokio::process::Command` afterwards.
 pub(super) fn configure_piped(sandboxed_cmd: &mut Command) {
     #[cfg(unix)]
     {

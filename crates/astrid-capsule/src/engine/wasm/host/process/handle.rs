@@ -32,6 +32,9 @@ impl HostProcessHandle for HostState {
             .get_mut::<ManagedProcess>(&Resource::new_borrow(self_.rep()))
             .map_err(|_| ErrorCode::Closed)?;
 
+        // `tokio::process::Child::try_wait` is non-blocking and
+        // returns the exit status if the child has exited. Same
+        // semantics as std::process::Child::try_wait.
         let (running, exit_code) = if let Some(child) = proc.child.as_mut() {
             match child.try_wait() {
                 Ok(Some(status)) => {
@@ -93,10 +96,15 @@ impl HostProcessHandle for HostState {
                 .resource_table
                 .get::<ManagedProcess>(&Resource::new_borrow(self_.rep()))
                 .map_err(|_| ErrorCode::Closed)?;
-            let pid = match proc.child.as_ref() {
-                Some(c) => c.id(),
-                None => return Err(ErrorCode::Closed),
-            };
+            // `tokio::process::Child::id()` returns `Option<u32>` —
+            // `None` once the child has been polled and reaped, which
+            // we treat as Closed here. The std variant returned `u32`
+            // unconditionally.
+            let pid = proc
+                .child
+                .as_ref()
+                .and_then(tokio::process::Child::id)
+                .ok_or(ErrorCode::Closed)?;
             let nix_sig = match sig {
                 ProcessSignal::Term => nix::sys::signal::Signal::SIGTERM,
                 ProcessSignal::Hup => nix::sys::signal::Signal::SIGHUP,
@@ -151,11 +159,18 @@ impl HostProcessHandle for HostState {
         let rt = self.runtime_handle.clone();
         let sem = self.host_semaphore.clone();
         let tok = self.cancel_token.clone();
+        // Borrow the child from the resource table directly — no
+        // `take()`. `tokio::process::Child::wait` is `&mut self`, so
+        // we race it against the timeout without ever transferring
+        // ownership. On timeout / cancel the child stays in the slot
+        // and `kill` / `read-logs` / Drop continue to work; the
+        // previous std::Child + spawn_blocking pattern stranded the
+        // handle inside the blocking task (Gemini #752 finding).
         let proc = self
             .resource_table
             .get_mut::<ManagedProcess>(&Resource::new_borrow(self_.rep()))
             .map_err(|_| ErrorCode::Closed)?;
-        let mut child = match proc.child.take() {
+        let child = match proc.child.as_mut() {
             Some(c) => c,
             None => return Err(ErrorCode::Closed),
         };
@@ -165,32 +180,32 @@ impl HostProcessHandle for HostState {
             &sem,
             &tok,
             async move {
-                // Off-thread blocking wait avoids the 50ms try_wait
-                // busy-loop. If the caller specified a timeout we race
-                // it against the JoinHandle; on timeout we drop the
-                // receiver. The blocking thread is allowed to finish
-                // on its own (the kernel does not kill the child here
-                // — callers must invoke `kill` explicitly).
-                let wait_fut = tokio::task::spawn_blocking(move || child.wait());
                 match timeout_ms {
-                    Some(ms) => {
-                        match tokio::time::timeout(std::time::Duration::from_millis(ms), wait_fut)
-                            .await
-                        {
-                            Ok(Ok(Ok(status))) => Ok(status.code()),
-                            Ok(Ok(Err(e))) => Err(ErrorCode::Unknown(format!("wait: {e}"))),
-                            Ok(Err(e)) => Err(ErrorCode::Unknown(format!("join: {e}"))),
-                            Err(_) => Err(ErrorCode::WaitTimeout),
-                        }
-                    },
-                    None => match wait_fut.await {
+                    Some(ms) => match tokio::time::timeout(
+                        std::time::Duration::from_millis(ms),
+                        child.wait(),
+                    )
+                    .await
+                    {
                         Ok(Ok(status)) => Ok(status.code()),
                         Ok(Err(e)) => Err(ErrorCode::Unknown(format!("wait: {e}"))),
-                        Err(e) => Err(ErrorCode::Unknown(format!("join: {e}"))),
+                        Err(_) => Err(ErrorCode::WaitTimeout),
+                    },
+                    None => match child.wait().await {
+                        Ok(status) => Ok(status.code()),
+                        Err(e) => Err(ErrorCode::Unknown(format!("wait: {e}"))),
                     },
                 }
             },
         );
+
+        // On a successful wait, the child has been reaped — clear the
+        // slot so a subsequent `wait` doesn't observe a stale Child
+        // that the OS no longer knows about.
+        let succeeded = matches!(result, Some(Ok(_)));
+        if succeeded {
+            proc.child.take();
+        }
 
         match result {
             Some(Ok(code)) => Ok(ExitInfo {
@@ -217,10 +232,10 @@ impl HostProcessHandle for HostState {
             .resource_table
             .get::<ManagedProcess>(&Resource::new_borrow(self_.rep()))
             .map_err(|_| ErrorCode::Closed)?;
-        match proc.child.as_ref() {
-            Some(c) => Ok(c.id()),
-            None => Err(ErrorCode::Closed),
-        }
+        proc.child
+            .as_ref()
+            .and_then(tokio::process::Child::id)
+            .ok_or(ErrorCode::Closed)
     }
 
     fn subscribe_exit(&mut self, _self_: Resource<ProcessHandle>) -> Resource<DynPollable> {
@@ -246,8 +261,8 @@ impl HostProcessHandle for HostState {
             .resource_table
             .delete::<ManagedProcess>(Resource::new_own(rep.rep()))
         {
-            if let Some(child) = managed.child.as_ref() {
-                self.process_tracker.unregister(child.id());
+            if let Some(pid) = managed.child.as_ref().and_then(tokio::process::Child::id) {
+                self.process_tracker.unregister(pid);
             }
             self.process_count_total = self.process_count_total.saturating_sub(1);
             if let Some(count) = self.process_count_by_principal.get_mut(&managed.creator) {
