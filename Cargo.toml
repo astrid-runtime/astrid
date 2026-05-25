@@ -141,8 +141,8 @@ wasm-encoder = "0.227"
 wasmparser = "0.227"
 wit-component = "0.227"
 wit-parser = "0.227"
-wasmtime = { version = "43", features = ["component-model", "cranelift"] }
-wasmtime-wasi = "43"
+wasmtime = { version = "45", features = ["component-model", "cranelift"] }
+wasmtime-wasi = "45"
 unicode-width = "0.2"
 which = "7"
 wizer = "10"
