@@ -1,1 +1,5 @@
-wit-staging/
+# wit-staging/ is committed: build.rs regenerates it from the
+# unicity-astrid/wit submodule on workspace builds, but the committed
+# copy ships with the published crate so `cargo install astrid` works
+# without the submodule on the consumer's machine. CI verifies the
+# committed copy matches what build.rs would regenerate.

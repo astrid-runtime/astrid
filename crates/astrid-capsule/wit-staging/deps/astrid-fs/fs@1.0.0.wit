@@ -1,0 +1,285 @@
+/// Filesystem operations within the capsule's workspace boundary.
+///
+/// All paths are resolved relative to a VFS scheme (`workspace://`,
+/// `home://`, `tmp://`). The kernel re-resolves and re-validates every
+/// path on every call — `fs-canonicalize` is for display and equality
+/// only, NOT a one-time security check that subsequent calls can rely
+/// on. Symlink traversal is canonicalized to prevent bypass; results
+/// returned from `fs-canonicalize` and `fs-read-link` are always
+/// VFS-scheme paths (e.g. `workspace://foo`), never host real-paths.
+///
+/// Error strings (the `unknown(string)` arm of `error-code`) never
+/// contain host real-paths, IP addresses, UUIDs, or capability names —
+/// no host-side information leaks through error messages.
+///
+/// Frozen per the ABI evolution discipline (RFC: host_abi). Shape changes
+/// ship as a new file at a new version path; never edit this file.
+
+package astrid:fs@1.0.0;
+
+interface host {
+    // -----------------------------------------------------------------
+    // Error type
+    // -----------------------------------------------------------------
+
+    /// Typed error returned from every fallible fs operation. Specific
+    /// variants for the common cases; `unknown(string)` carries the raw
+    /// host detail for everything else. Capsules pattern-match on the
+    /// specific arms and log/propagate the unknown arm.
+    variant error-code {
+        /// File or directory not found.
+        not-found,
+        /// Host filesystem denied permission (distinct from
+        /// `capability-denied` which is Astrid's gate).
+        access,
+        /// Capsule lacks the required capability for this operation
+        /// (e.g. `fs_write` to a `home://` path).
+        capability-denied,
+        /// Path resolved outside the VFS scope — sandbox violation.
+        /// Audit-logged at high severity.
+        boundary-escape,
+        /// Path string failed validation (NUL byte, control chars, not
+        /// UTF-8 NFC, exceeded max length, malformed VFS scheme).
+        invalid-path,
+        /// Operation would block on a non-blocking handle.
+        would-block,
+        /// Target is a directory where a file was expected.
+        is-directory,
+        /// Target is a regular file where a directory was expected.
+        not-directory,
+        /// Directory is not empty (for non-recursive removes).
+        not-empty,
+        /// Payload exceeded the per-call cap (`read-file` / `write-file`
+        /// hard 10 MB; `read-at` / `write-at` hard 1 MB) or cumulative
+        /// per-capsule write quota.
+        too-large,
+        /// Server-side resource quota exhausted (open handles, total
+        /// file count under a VFS scheme).
+        quota,
+        /// Cross-VFS-scheme rename / link attempted (e.g. workspace://
+        /// to home://). Refused to preserve atomic-rename contracts.
+        cross-vfs,
+        /// File or directory already exists where exclusive creation
+        /// was requested.
+        already-exists,
+        /// File handle has been closed (Drop'd) and is no longer valid.
+        closed,
+        /// Unspecific I/O error from the host. Detail is best-effort and
+        /// not part of the contract — capsules log it but do not branch
+        /// on its content.
+        unknown(string),
+    }
+
+    // -----------------------------------------------------------------
+    // Value types
+    // -----------------------------------------------------------------
+
+    /// File kind. Matches `wasi:filesystem/types.descriptor-type`.
+    enum file-type {
+        /// Type could not be determined (rare; non-POSIX hosts).
+        type-unknown,
+        /// Regular file.
+        regular,
+        /// Directory.
+        directory,
+        /// Symbolic link (only seen via `fs-stat-symlink`; following
+        /// stat resolves the link's target type).
+        symlink,
+        /// Block device.
+        block-device,
+        /// Character device.
+        character-device,
+        /// Named pipe (FIFO).
+        fifo,
+        /// Unix-domain socket.
+        socket,
+    }
+
+    /// Timestamp matching `wasi:clocks/wall-clock.datetime`. Signed
+    /// seconds allow pre-1970 timestamps (archive restores, etc.).
+    record datetime {
+        seconds: s64,
+        nanoseconds: u32,
+    }
+
+    /// File metadata returned by `fs-stat`, `fs-stat-symlink`, and
+    /// `file-handle.stat`.
+    record file-stat {
+        /// File size in bytes.
+        size: u64,
+        /// Kind of file (regular / directory / symlink / device / etc.).
+        kind: file-type,
+        /// POSIX mode bits (file type + permissions). Zero on platforms
+        /// without a mode concept; best-effort cross-platform.
+        mode: u32,
+        /// Last modification time, if available.
+        modified: option<datetime>,
+        /// Creation (birth) time, if available.
+        created: option<datetime>,
+        /// Last access time, if available.
+        accessed: option<datetime>,
+    }
+
+    /// Open mode for `fs-open`. Matches the common subset of
+    /// `std::fs::OpenOptions`.
+    enum open-mode {
+        /// Open existing file for reading only. Fails if absent.
+        read,
+        /// Open or create for writing; truncates existing content.
+        write,
+        /// Open or create for writing; appends to existing content.
+        append,
+        /// Open existing file for both reading and writing. Fails if
+        /// absent.
+        read-write,
+    }
+
+    // -----------------------------------------------------------------
+    // File handle resource
+    // -----------------------------------------------------------------
+
+    /// An open file handle. Returned from `fs-open`. The host releases
+    /// the underlying file descriptor automatically when the resource
+    /// is dropped (the guest's component-model runtime invokes the
+    /// destructor) — capsules don't need to close handles explicitly.
+    ///
+    /// Per-capsule cap: 16 open file handles.
+    resource file-handle {
+        /// Read up to `max-bytes` from the file at byte `offset`.
+        /// Mirrors POSIX `pread(2)`. Returns the bytes read; an empty
+        /// list signals EOF at the requested offset. Per-call payload
+        /// capped at 1 MB.
+        read-at: func(offset: u64, max-bytes: u32) -> result<list<u8>, error-code>;
+
+        /// Write `data` to the file at byte `offset`. Mirrors POSIX
+        /// `pwrite(2)`. Returns the number of bytes actually written.
+        /// Per-call payload capped at 1 MB; cumulative writes counted
+        /// against the per-capsule write quota.
+        write-at: func(offset: u64, data: list<u8>) -> result<u32, error-code>;
+
+        /// Flush buffered data to disk (`fdatasync(2)` — data only, not
+        /// metadata). Mirrors `std::fs::File::sync_data`.
+        sync-data: func() -> result<_, error-code>;
+
+        /// Flush both data and metadata to disk (`fsync(2)`). Mirrors
+        /// `std::fs::File::sync_all`. Required for durability-sensitive
+        /// workloads (databases, WALs); slower than `sync-data`.
+        sync-all: func() -> result<_, error-code>;
+
+        /// Get file metadata on the open handle (`fstat(2)`). Race-free
+        /// counterpart to `fs-stat(path)`; safe to call after `fs-open`
+        /// without re-resolving the path.
+        stat: func() -> result<file-stat, error-code>;
+
+        /// Truncate or extend the file to `size` bytes (`ftruncate(2)`).
+        /// Mirrors `std::fs::File::set_len`. Extending past end fills
+        /// with zeros.
+        set-len: func(size: u64) -> result<_, error-code>;
+    }
+
+    // -----------------------------------------------------------------
+    // Path-based operations
+    // -----------------------------------------------------------------
+
+    /// Open a file and return a handle. Mirrors `std::fs::OpenOptions`.
+    /// Required capability depends on `mode` (read modes need
+    /// `fs_read`; write/append/read-write need `fs_write`).
+    fs-open: func(path: string, mode: open-mode) -> result<file-handle, error-code>;
+
+    /// Check whether a path exists. Returns true / false / error
+    /// (rather than collapsing access-denied into "doesn't exist").
+    fs-exists: func(path: string) -> result<bool, error-code>;
+
+    /// Create a directory. Mirrors `std::fs::create_dir` /
+    /// `mkdir(2)`. Strict — fails with `already-exists` if the path
+    /// exists, and fails with `not-found` if the parent directory
+    /// does not exist. Use this for lock-dir patterns and exclusive
+    /// scratch dirs where the race "another writer got here first"
+    /// matters. For the "ensure this exists" pattern use
+    /// `fs-mkdir-all`.
+    fs-mkdir: func(path: string) -> result<_, error-code>;
+
+    /// Create a directory and all missing parents. Mirrors
+    /// `std::fs::create_dir_all`. Idempotent — succeeds if the
+    /// directory already exists. For the strict "must not exist"
+    /// variant use `fs-mkdir`.
+    fs-mkdir-all: func(path: string) -> result<_, error-code>;
+
+    /// List entries in a directory. Returns entry names (not full
+    /// paths). Per-call cap: 4096 entries; larger directories must use
+    /// `fs-readdir-page` (not in 1.0; tracked for 1.x).
+    fs-readdir: func(path: string) -> result<list<string>, error-code>;
+
+    /// Get file metadata. Follows symlinks (`stat(2)`).
+    fs-stat: func(path: string) -> result<file-stat, error-code>;
+
+    /// Get file metadata without following symlinks (`lstat(2)`).
+    /// Mirrors `std::fs::symlink_metadata`. Use when you specifically
+    /// want to inspect a symlink rather than its target.
+    fs-stat-symlink: func(path: string) -> result<file-stat, error-code>;
+
+    /// Remove a regular file. Mirrors `std::fs::remove_file`. Returns
+    /// `is-directory` if the path names a directory.
+    fs-unlink: func(path: string) -> result<_, error-code>;
+
+    /// Read a whole file as bytes. Convenience wrapper around
+    /// `fs-open` + `file-handle.read-at`. Files larger than 10 MB are
+    /// rejected with `too-large`; use `fs-open` + handle reads for
+    /// streaming over large files.
+    read-file: func(path: string) -> result<list<u8>, error-code>;
+
+    /// Write content to a file (truncate-or-create). Mirrors
+    /// `std::fs::write`. Capped at 10 MB per call; cumulative against
+    /// the per-capsule write quota.
+    write-file: func(path: string, content: list<u8>) -> result<_, error-code>;
+
+    /// Append content to a file, creating it if absent. Avoids the
+    /// read-modify-write hazard of `read-file` + `write-file` for
+    /// log-style writes. 10 MB per call; cumulative against the
+    /// per-capsule write quota.
+    fs-append: func(path: string, content: list<u8>) -> result<_, error-code>;
+
+    /// Copy a file from `src` to `dst`. Mirrors `std::fs::copy`.
+    /// Overwrites `dst`. Directory copies are not supported; `src`
+    /// must name a regular file.
+    fs-copy: func(src: string, dst: string) -> result<_, error-code>;
+
+    /// Rename (move) within the same VFS scheme. Mirrors
+    /// `std::fs::rename`. Cross-scheme renames return `cross-vfs`.
+    fs-rename: func(src: string, dst: string) -> result<_, error-code>;
+
+    /// Remove a directory and all its contents recursively. Refuses
+    /// to traverse symlinks to prevent sandbox escapes. Returns the
+    /// count of removed entries (files + subdirectories).
+    fs-remove-dir-all: func(path: string) -> result<u64, error-code>;
+
+    /// Resolve a path to its canonical form, following symlinks.
+    /// Returns a VFS-scheme path (`workspace://`, `home://`, `tmp://`),
+    /// NEVER a host real-path. Resolutions escaping the input's VFS
+    /// scope return `boundary-escape`.
+    ///
+    /// Note: `fs-canonicalize` is for display and path-equality only.
+    /// The result is NOT a security check that subsequent calls can
+    /// trust — the kernel re-resolves every path on every call, so
+    /// `fs-canonicalize` then `fs-open` is NOT TOCTOU-safe.
+    fs-canonicalize: func(path: string) -> result<string, error-code>;
+
+    /// Read the target of a symbolic link without following it.
+    /// Mirrors `std::fs::read_link`. Returns a VFS-scheme path; links
+    /// pointing outside the input's scope return `boundary-escape`.
+    fs-read-link: func(path: string) -> result<string, error-code>;
+
+    /// Create a hard link from `link-path` to `src`. Mirrors
+    /// `std::fs::hard_link`. Both paths must resolve to the same VFS
+    /// scheme; cross-scheme links return `cross-vfs`. Cannot link
+    /// directories. The kernel enforces that both endpoints stay
+    /// inside the VFS scope at link time.
+    ///
+    /// (Symlink creation — `fs-symlink` — is deliberately omitted: it
+    /// allows capsules to encode boundary-escape paths into the
+    /// workspace, and the read-only `fs-read-link` / `fs-stat-symlink`
+    /// pair is sufficient for handling existing symlinks. Revisit if
+    /// a concrete use case emerges with a security model.)
+    /// Security-gated: requires file-write capability on both paths.
+    fs-hard-link: func(src: string, link-path: string) -> result<_, error-code>;
+}

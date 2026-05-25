@@ -35,6 +35,40 @@ fn stage_wit() {
         .join("wit");
 
     let staging = crate_root.join("wit-staging");
+    let host_src = wit_root.join("host");
+
+    // Published-crate path: the `unicity-astrid/wit` submodule isn't
+    // available on a consumer's machine (`cargo install astrid` pulls
+    // the .crate tarball, not the workspace). The committed
+    // `wit-staging/` ships with the crate; `bindings.rs` reads from
+    // it directly. Skip the stage step — there's nothing to copy
+    // from, and the existing committed contents are what bindgen
+    // consumes.
+    //
+    // Workspace path: the submodule IS available; clean and re-stage
+    // so the committed copy stays in lockstep with the submodule.
+    // CI fails the workspace build if `git status` is dirty after
+    // build.rs runs, catching drift.
+    //
+    // Empty-directory path: a developer who cloned without
+    // `git submodule update --init` has `wit/host/` as an empty dir
+    // (the submodule pointer exists but isn't checked out).
+    // `host_src.exists()` returns true, but there's nothing to copy.
+    // Without the .wit-file check below we'd wipe the committed
+    // wit-staging and leave the working tree dirty with deletions.
+    // Check for actual .wit files before deciding to re-stage.
+    let has_wit_files = fs::read_dir(&host_src)
+        .map(|entries| {
+            entries
+                .filter_map(Result::ok)
+                .any(|e| e.path().extension().is_some_and(|ext| ext == "wit"))
+        })
+        .unwrap_or(false);
+    if !has_wit_files {
+        println!("cargo:rerun-if-changed=wit-staging");
+        return;
+    }
+
     let deps = staging.join("deps");
 
     if staging.exists() {
@@ -45,7 +79,6 @@ fn stage_wit() {
     fs::write(staging.join("kernel.wit"), "package kernel:placeholder;\n")
         .expect("write kernel.wit");
 
-    let host_src = wit_root.join("host");
     for entry in fs::read_dir(&host_src).expect("read wit/host") {
         let entry = entry.unwrap();
         let path = entry.path();

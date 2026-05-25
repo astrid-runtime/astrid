@@ -1,0 +1,211 @@
+/// Host-side process spawning with OS-level sandboxing.
+///
+/// Commands are wrapped in platform-specific sandbox tools
+/// (`sandbox-exec` on macOS, `bwrap` on Linux) scoped to the workspace
+/// directory. All processes are tracked for cancellation.
+/// Security-gated: requires `host_process` capability.
+///
+/// **Desktop-kernel only.** This package depends on a POSIX-style
+/// fork/exec model. Unikernel targets (hermit-rs, etc.) do not implement
+/// it — capsules importing `astrid:process` will fail to load on those
+/// kernels. Capsule-to-capsule patterns over the IPC bus replace most
+/// child-process workflows on the unikernel target; remaining
+/// workloads stay desktop-only by design.
+///
+/// Child stdio is byte-oriented (`write-stdin` / `read-logs`) rather
+/// than stream-based. The bus already handles high-throughput
+/// capsule-to-capsule traffic; stream halves on `process-handle` would
+/// pull weight only for niche "splice TCP into child into TCP" media-
+/// gateway scenarios that haven't materialised yet. Add as
+/// `process-handle@1.1.0` if/when concrete need arises.
+///
+/// Frozen per the ABI evolution discipline (RFC: host_abi). Shape changes
+/// ship as a new file at a new version path; never edit this file.
+
+package astrid:process@1.0.0;
+
+interface host {
+    use astrid:io/poll@1.0.0.{pollable};
+
+    /// Typed error returned from process operations.
+    variant error-code {
+        /// Capsule lacks the `host_process` capability.
+        capability-denied,
+        /// Command / args / cwd / env failed validation (NUL bytes,
+        /// control chars, max length).
+        invalid-input,
+        /// `cwd` resolved outside the workspace.
+        boundary-escape,
+        /// Per-capsule background-process cap exhausted (max 8).
+        quota,
+        /// Stdin payload exceeded the per-call 1 MB cap or the
+        /// cumulative-per-process write quota.
+        too-large,
+        /// Handle has been closed (process exited and reaped).
+        closed,
+        /// Spawn cancelled (capsule unloading).
+        cancelled,
+        /// Wait timed out before the process exited.
+        wait-timeout,
+        /// Unspecific host error; detail is best-effort.
+        unknown(string),
+    }
+
+    /// Signal a background process can receive (Unix semantics; the
+    /// kernel maps to the closest equivalent on Windows).
+    ///
+    /// `kill` (SIGKILL) is a separate method because it is non-
+    /// graceful and drains stdout/stderr buffers into the kill result.
+    enum process-signal {
+        /// SIGTERM — graceful shutdown request.
+        term,
+        /// SIGHUP — reload configuration.
+        hup,
+        /// SIGUSR1 — user-defined.
+        usr1,
+        /// SIGUSR2 — user-defined.
+        usr2,
+        /// SIGINT — interrupt (Ctrl-C equivalent).
+        int,
+    }
+
+    /// Environment variable to pass to a spawned process.
+    record env-var {
+        key: string,
+        value: string,
+    }
+
+    /// Request to spawn a host process.
+    record spawn-request {
+        /// Command to execute.
+        cmd: string,
+        /// Command arguments.
+        args: list<string>,
+        /// Optional stdin bytes piped to the spawned process. For
+        /// long-lived stdin streaming use `process-handle.write-stdin`.
+        /// Capped at 4 MiB per spawn (cumulative).
+        stdin: option<list<u8>>,
+        /// Environment variables. Replaces the host's default sandbox
+        /// environment except for a small kernel-passthrough allowlist.
+        env: list<env-var>,
+        /// Working directory relative to the workspace. Must resolve
+        /// inside the sandbox; absolute paths and `..` escapes are
+        /// rejected with `boundary-escape`.
+        cwd: option<string>,
+    }
+
+    /// Exit information for a process that has terminated.
+    record exit-info {
+        /// Normal exit code if exited normally; `none` if killed by
+        /// signal or platform didn't surface one.
+        exit-code: option<s32>,
+        /// Signal that killed the process (Unix), if any. Distinguishes
+        /// SIGKILL (oom-killer, parent kill) from SIGTERM (graceful
+        /// shutdown) from normal exit.
+        signal: option<s32>,
+    }
+
+    /// Result of a synchronous process execution.
+    record process-result {
+        /// Captured standard output.
+        stdout: string,
+        /// Captured standard error.
+        stderr: string,
+        /// How the process terminated.
+        exit: exit-info,
+    }
+
+    /// Logs and status from a background process.
+    record read-logs-result {
+        /// Buffered stdout since last read.
+        stdout: string,
+        /// Buffered stderr since last read.
+        stderr: string,
+        /// Whether the process is still running.
+        running: bool,
+        /// Exit info if the process has terminated.
+        exit: option<exit-info>,
+    }
+
+    /// Result of killing a background process.
+    record kill-result {
+        /// Whether the process was successfully killed.
+        killed: bool,
+        /// Exit info if available.
+        exit: option<exit-info>,
+        /// Final buffered stdout.
+        stdout: string,
+        /// Final buffered stderr.
+        stderr: string,
+    }
+
+    /// A running or recently-terminated background process. Drop is
+    /// automatic — capsules don't need to explicitly close; the
+    /// host reaps the process on resource drop.
+    ///
+    /// Per-capsule cap: 8 concurrent background processes.
+    resource process-handle {
+        /// Read buffered logs since the last call. Drains the buffers
+        /// (subsequent reads return only new data). Buffers are 1 MiB
+        /// ring per stream.
+        read-logs: func() -> result<read-logs-result, error-code>;
+
+        /// Write to the process's stdin. Useful for REPL-style
+        /// children (`python -i`, `psql`, MCP stdio subprocesses).
+        /// Returns bytes actually written; capped at 1 MB per call.
+        write-stdin: func(data: list<u8>) -> result<u32, error-code>;
+
+        /// Close the stdin pipe (child observes EOF on read).
+        close-stdin: func() -> result<_, error-code>;
+
+        /// Send a signal. Fire-and-forget; for graceful shutdown use
+        /// `term`. Use `kill` (SIGKILL) for non-graceful with log
+        /// drainage.
+        signal: func(sig: process-signal) -> result<_, error-code>;
+
+        /// Send SIGKILL and drain stdout/stderr buffers. Returns the
+        /// final state including exit-info if available.
+        kill: func() -> result<kill-result, error-code>;
+
+        /// Wait for the process to exit. `timeout-ms: none` waits
+        /// indefinitely; bounded values drive request-response
+        /// patterns that mustn't hang on a runaway child.
+        /// Returns exit-info on exit, `wait-timeout` error if the
+        /// timeout elapsed first.
+        wait: func(timeout-ms: option<u64>) -> result<exit-info, error-code>;
+
+        /// Wait for the process to exit AND drain remaining stdout /
+        /// stderr buffers atomically. Mirrors
+        /// `std::process::Child::wait_with_output`. Closes the
+        /// read-logs race for short-lived children that may have
+        /// terminal output not yet drained when `wait` observes exit.
+        wait-with-output: func(timeout-ms: option<u64>) -> result<process-result, error-code>;
+
+        /// The OS-level PID of the process. Useful for capsules that
+        /// correlate kernel-level events (cgroup IDs, /proc paths)
+        /// with child processes that log their own PID. Returns
+        /// `closed` if the process has already been reaped.
+        os-pid: func() -> result<u32, error-code>;
+
+        /// Pollable that fires when the process has exited. Compose
+        /// with other pollables to multiplex "wait on child OR
+        /// receive IPC event."
+        subscribe-exit: func() -> pollable;
+
+        /// Pollable that fires when stdout / stderr has buffered
+        /// data ready to be drained via `read-logs`.
+        subscribe-logs: func() -> pollable;
+    }
+
+    /// Spawn a synchronous (blocking) process. Blocks the WASM
+    /// task until the process exits or is cancelled. Cancelled
+    /// processes return `cancelled` error.
+    /// Audit: recorded (cmd + args + cwd, not env or stdin bytes).
+    spawn: func(request: spawn-request) -> result<process-result, error-code>;
+
+    /// Spawn a background (non-blocking) process. Returns a handle
+    /// for subsequent log/wait/signal/kill calls.
+    /// stdout/stderr are buffered (1 MiB per stream, ring buffer).
+    /// Audit: recorded.
+    spawn-background: func(request: spawn-request) -> result<process-handle, error-code>;
+}

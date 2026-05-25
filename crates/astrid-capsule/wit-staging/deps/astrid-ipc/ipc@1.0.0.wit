@@ -1,0 +1,163 @@
+/// Inter-Process Communication (IPC) event bus.
+///
+/// Capsules communicate via a publish/subscribe event bus. Topics are
+/// dot-delimited strings ([a-z0-9._-]+ per segment, max 8 segments,
+/// max 256 bytes). Publishing and subscribing are independently
+/// ACL-gated via `ipc_publish` and `ipc_subscribe` patterns in
+/// `Capsule.toml [capabilities]`.
+///
+/// Provenance is tracked via `ipc-message.source-id` (the publishing
+/// capsule's session UUID) and `ipc-message.principal` (variant
+/// carrying both the principal AND the trust marker — verified vs
+/// claimed). Downstream consumers MUST check the principal-attribution
+/// variant for sensitive actions: claimed principals are uplink-
+/// asserted and not kernel-verified.
+///
+/// Frozen per the ABI evolution discipline (RFC: host_abi). Shape changes
+/// ship as a new file at a new version path; never edit this file.
+
+package astrid:ipc@1.0.0;
+
+interface host {
+    use astrid:io/poll@1.0.0.{pollable};
+
+    /// Typed error returned from every fallible ipc operation.
+    variant error-code {
+        /// Capsule lacks `ipc_publish` / `ipc_subscribe` matching the
+        /// topic, or lacks `uplink` for `publish-as`.
+        capability-denied,
+        /// Topic / payload / principal failed validation.
+        invalid-input,
+        /// Subscription handle has been dropped.
+        closed,
+        /// Publish was rate-limited (per-capsule limit).
+        rate-limited,
+        /// Bus queue overflow (buffer full beyond drop threshold).
+        backpressure,
+        /// Max subscriptions per capsule (128) reached.
+        quota,
+        /// Recv timed out before a message arrived.
+        timeout,
+        /// Unspecific host error; detail is best-effort.
+        unknown(string),
+    }
+
+    /// Provenance + trust attribution for an IPC message's principal.
+    ///
+    /// Capsules MUST check this variant on sensitive actions. A
+    /// `claimed` principal is uplink-asserted (via `publish-as`) and
+    /// the kernel has NOT verified the asserting uplink actually
+    /// authenticated the named principal. Treat `claimed` as caller-
+    /// input, not authenticated context.
+    variant principal-attribution {
+        /// Principal kernel-verified from the publishing capsule's
+        /// invocation context. Trusted: capability checks may use
+        /// this directly.
+        verified(string),
+        /// Principal claimed by an uplink capsule via `publish-as`.
+        /// Uplink-asserted, NOT kernel-verified. Downstream capability
+        /// checks on sensitive actions MUST require `verified` or
+        /// perform additional authentication.
+        claimed(string),
+        /// System / kernel-originated event with no attributable
+        /// principal (e.g. lifecycle events from the kernel itself).
+        system,
+    }
+
+    /// IPC message envelope returned by `subscription.poll` /
+    /// `subscription.recv`.
+    record ipc-envelope {
+        /// List of messages received since last poll/recv.
+        messages: list<ipc-message>,
+        /// Number of messages dropped due to buffer overflow.
+        dropped: u64,
+        /// Cumulative lag (messages missed due to slow consumption).
+        lagged: u64,
+    }
+
+    /// A single IPC message.
+    record ipc-message {
+        /// Topic the message was published on.
+        topic: string,
+        /// Message payload as JSON.
+        payload: string,
+        /// UUID of the capsule that sent this message.
+        source-id: string,
+        /// Principal attribution — see `principal-attribution`.
+        /// Subscribers processing multi-message recv batches MUST
+        /// read this per-message rather than rely on invocation
+        /// context (which only reflects the first message's
+        /// publisher).
+        principal: principal-attribution,
+    }
+
+    /// Pre-registered interceptor handle mapping.
+    record interceptor-binding {
+        /// Subscription handle ID.
+        handle-id: u64,
+        /// Interceptor action name.
+        action: string,
+        /// IPC topic pattern this binding is subscribed to.
+        topic: string,
+    }
+
+    /// An active subscription to an IPC topic pattern. Drop is
+    /// automatic — capsules don't call unsubscribe explicitly.
+    /// Per-capsule cap: 128 subscriptions.
+    resource subscription {
+        /// Non-blocking poll for messages. Returns whatever's queued
+        /// since the last poll/recv.
+        poll: func() -> result<ipc-envelope, error-code>;
+
+        /// Block until a message arrives, or `timeout-ms` elapses.
+        /// Max timeout: 60_000 ms (capped by host). Returns the
+        /// envelope on message arrival or `timeout` error on
+        /// timeout.
+        recv: func(timeout-ms: u64) -> result<ipc-envelope, error-code>;
+
+        /// Pollable that fires when messages are queued. Compose with
+        /// other pollables (net, future http-stream, etc.) via
+        /// `astrid:io/poll.poll` for multiplexed I/O in bridge and
+        /// fan-out capsules.
+        subscribe-readiness: func() -> pollable;
+    }
+
+    /// Publish a UTF-8 JSON payload to a topic. Principal is
+    /// automatically attributed from the caller's invocation context
+    /// as `verified`.
+    ///
+    /// Re-entrancy: publish does NOT synchronously invoke subscribers.
+    /// Subscribers receive the message on their next `recv`/`poll`.
+    /// Publishing from within an interceptor handler is allowed but
+    /// counts against the per-invocation publish-depth budget (host
+    /// default: 8) to prevent unbounded reentry.
+    ///
+    /// Fan-out: a single publish dispatches to at most 256 matching
+    /// subscribers; further matches return `backpressure` (the kernel
+    /// preserves the first 256 deliveries and counts the rest as
+    /// dropped in subscribers' lag/drop counters).
+    ///
+    /// Audit: recorded.
+    publish: func(topic: string, payload: string) -> result<_, error-code>;
+
+    /// Publish on behalf of a specific principal (uplink-claimed,
+    /// NOT kernel-verified — see `principal-attribution::claimed`).
+    /// Reserved for uplinks (`uplink = true` in
+    /// `[capabilities]`); other callers get `capability-denied`.
+    /// Subscribers see the principal as `claimed(...)`, not
+    /// `verified(...)`.
+    /// Audit: recorded with BOTH the uplink's true principal AND
+    /// the claimed principal.
+    publish-as: func(topic: string, payload: string, principal: string) -> result<_, error-code>;
+
+    /// Subscribe to a topic pattern. Supports exact matches and
+    /// trailing-suffix wildcards (`foo.bar.*`). Mid-segment wildcards
+    /// are rejected.
+    subscribe: func(topic-pattern: string) -> result<subscription, error-code>;
+
+    /// Get pre-registered interceptor handles for run-loop capsules.
+    /// Returns ONLY the calling capsule's own interceptors — does
+    /// NOT enumerate other capsules' bindings (capability-inference
+    /// scope discipline).
+    get-interceptor-bindings: func() -> result<list<interceptor-binding>, error-code>;
+}

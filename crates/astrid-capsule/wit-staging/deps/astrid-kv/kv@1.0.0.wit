@@ -1,0 +1,93 @@
+/// Key-Value persistent storage.
+///
+/// Keys are scoped per-principal and per-capsule. Each capsule sees only
+/// its own namespace (`wasm:{capsule_id}`), and per-invocation principal
+/// scoping ensures different users' data is isolated even when the same
+/// capsule serves multiple principals.
+///
+/// Keys are UTF-8 NFC, no NUL or control characters, max 256 bytes.
+/// Values are arbitrary bytes (max 1 MiB per value). Server-side
+/// cumulative quota per (principal, capsule) namespace is bounded;
+/// `quota` is returned when the quota is exhausted.
+///
+/// Frozen per the ABI evolution discipline (RFC: host_abi). Shape changes
+/// ship as a new file at a new version path; never edit this file.
+
+package astrid:kv@1.0.0;
+
+interface host {
+    /// Typed error returned from every fallible kv operation.
+    variant error-code {
+        /// Key string failed validation (NUL byte, control chars, not
+        /// UTF-8 NFC, exceeded max length).
+        invalid-key,
+        /// Value exceeded the 1 MiB per-value cap.
+        too-large,
+        /// Per-(principal, capsule) cumulative quota exhausted.
+        quota,
+        /// `kv-cas` saw a value other than `expected` (or saw a value
+        /// at all when `expected` was `none`). Caller's lost-race
+        /// retry path: re-read the key, recompute, retry the CAS.
+        cas-mismatch,
+        /// Unspecific host error; detail is best-effort.
+        unknown(string),
+    }
+
+    /// A page of keys returned by `kv-list-keys-page`.
+    record key-page {
+        /// Keys matching the prefix in this page.
+        keys: list<string>,
+        /// Cursor to pass to the next `kv-list-keys-page` call. `none`
+        /// when this is the last page.
+        next-cursor: option<string>,
+    }
+
+    /// Read a value by key.
+    ///
+    /// Returns the stored bytes, or `none` if the key does not exist.
+    /// Audit: not recorded per-call (high-volume read; sampled at
+    /// kernel level).
+    kv-get: func(key: string) -> result<option<list<u8>>, error-code>;
+
+    /// Write a value by key. Atomic per-key replacement.
+    /// Audit: recorded.
+    kv-set: func(key: string, value: list<u8>) -> result<_, error-code>;
+
+    /// Delete a key. Idempotent — deleting a missing key is a no-op.
+    /// Audit: recorded.
+    kv-delete: func(key: string) -> result<_, error-code>;
+
+    /// List all keys matching a prefix. Convenience for small stores
+    /// where the caller is sure the result fits.
+    ///
+    /// Capped server-side at 1024 keys per call — larger result sets
+    /// return `too-large` directing the caller to `kv-list-keys-page`.
+    kv-list-keys: func(prefix: string) -> result<list<string>, error-code>;
+
+    /// Paginated key listing for unbounded stores.
+    ///
+    /// Pass `none` for `cursor` on the first call and the cursor
+    /// returned in `next-cursor` on subsequent calls. `limit` is
+    /// capped at 1024 per page; 0 means "use the server default."
+    kv-list-keys-page: func(prefix: string, cursor: option<string>, limit: u32) -> result<key-page, error-code>;
+
+    /// Delete all keys matching a prefix.
+    ///
+    /// Returns the count of deleted keys.
+    /// Audit: recorded.
+    kv-clear-prefix: func(prefix: string) -> result<u64, error-code>;
+
+    /// Atomically compare-and-swap a key.
+    ///
+    /// Returns `Ok(())` if the key's current value equals `expected`
+    /// and the swap was applied. Returns `Err(cas-mismatch)` if
+    /// `expected` did not match (the routine lost-race retry path).
+    /// `expected` of `none` means "swap only if the key does not
+    /// currently exist" (create-if-absent).
+    ///
+    /// Required for any concurrent coordination on shared state — the
+    /// kernel runs capsule invocations across the multi-threaded tokio
+    /// worker pool, so RMW patterns on shared keys race without this.
+    /// Audit: recorded.
+    kv-cas: func(key: string, expected: option<list<u8>>, new: list<u8>) -> result<_, error-code>;
+}
