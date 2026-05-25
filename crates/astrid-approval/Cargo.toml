@@ -15,7 +15,7 @@ astrid-core = { workspace = true }
 astrid-crypto = { workspace = true }
 astrid-storage = { workspace = true }
 async-trait = { workspace = true }
-chrono = { workspace = true }
+chrono = { workspace = true, features = ["clock"] }
 globset = { workspace = true }
 serde = { workspace = true }
 thiserror = { workspace = true }

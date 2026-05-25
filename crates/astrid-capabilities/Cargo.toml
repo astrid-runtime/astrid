@@ -12,7 +12,7 @@ description = "Capability token system for Astrid secure agent runtime"
 astrid-core = { workspace = true }
 astrid-crypto = { workspace = true }
 astrid-storage = { workspace = true, features = ["kv"] }
-chrono = { workspace = true }
+chrono = { workspace = true, features = ["clock"] }
 globset = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

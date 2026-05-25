@@ -12,7 +12,7 @@ description = "Event bus for Astrid secure agent runtime"
 astrid-types = { workspace = true }
 astrid-core = { workspace = true }
 async-trait = { workspace = true }
-chrono = { workspace = true }
+chrono = { workspace = true, features = ["clock"] }
 dashmap = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

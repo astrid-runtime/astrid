@@ -16,7 +16,7 @@ astrid-events = { workspace = true }
 astrid-storage = { workspace = true }
 astrid-vfs = { workspace = true }
 blake3 = { workspace = true }
-chrono = { workspace = true }
+chrono = { workspace = true, features = ["clock"] }
 globset = { workspace = true }
 regex = { workspace = true }
 serde = { workspace = true }
