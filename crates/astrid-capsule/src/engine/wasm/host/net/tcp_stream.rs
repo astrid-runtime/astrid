@@ -192,10 +192,10 @@ impl HostTcpStream for HostState {
         let sem = self.host_semaphore.clone();
         let tok = self.cancel_token.clone();
         let max = (max_bytes as usize).min(MAX_BYTES_PER_CALL);
-        match stream {
+        let result: Result<Vec<u8>, ErrorCode> = match stream {
             NetStream::Tcp(slot) => {
                 let timeout = slot.read_timeout;
-                let result = util::bounded_block_on_cancellable(&rt, &sem, &tok, async move {
+                let opt = util::bounded_block_on_cancellable(&rt, &sem, &tok, async move {
                     let s = slot.stream.lock().await;
                     let mut buf = vec![0u8; max];
                     let fut = s.peek(&mut buf);
@@ -214,10 +214,13 @@ impl HostTcpStream for HostState {
                 // data peeked yet, peer still connected," which is
                 // indistinguishable from a clean cancel. Surface Closed
                 // on cancellation so capsules can distinguish.
-                result.unwrap_or(Err(ErrorCode::Closed))
+                opt.unwrap_or(Err(ErrorCode::Closed))
             },
             NetStream::Unix(_) => Err(ErrorCode::NotTcp),
-        }
+        };
+        let bytes = result.as_ref().map(|v| v.len() as u64).unwrap_or(0);
+        audit_net(self, "astrid:net/host.tcp-stream.peek", bytes, &result);
+        result
     }
 
     fn shutdown(&mut self, self_: Resource<TcpStream>, how: ShutdownHow) -> Result<(), ErrorCode> {
