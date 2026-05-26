@@ -58,13 +58,25 @@ pub(crate) struct RedeemArgs {
     pub token: String,
     /// Hex-encoded ed25519 public key. Accepts bare 64 hex chars or
     /// the self-describing `ed25519:<hex>` form. The new principal's
-    /// `AuthConfig.public_keys` is seeded with this entry.
-    #[arg(long)]
-    pub public_key: String,
+    /// `AuthConfig.public_keys` is seeded with this entry. Mutually
+    /// exclusive with `--keypair`.
+    #[arg(long, conflicts_with = "keypair")]
+    pub public_key: Option<String>,
+    /// Name of a local keypair created via `astrid keypair generate`.
+    /// The CLI reads the public key from disk and stamps the
+    /// `bound_principal` field on the keypair's meta.toml after a
+    /// successful redeem. Mutually exclusive with `--public-key`.
+    #[arg(long, conflicts_with = "public_key")]
+    pub keypair: Option<String>,
     /// Optional human-friendly name for the new principal. Slugified
     /// server-side; collisions fall back to a random suffix.
     #[arg(long)]
     pub display_name: Option<String>,
+    /// After a successful redeem, update `~/.astrid/run/cli-context.toml`
+    /// so subsequent `astrid` commands run as the new principal
+    /// without an explicit `astrid agent switch`.
+    #[arg(long)]
+    pub switch: bool,
 }
 
 #[derive(Args, Debug, Clone)]
@@ -125,6 +137,23 @@ async fn run_issue(args: IssueArgs) -> Result<ExitCode> {
 }
 
 async fn run_redeem(args: RedeemArgs) -> Result<ExitCode> {
+    // Resolve the public key source: either an explicit `--public-key`
+    // hex string or a local `--keypair` reference. Exactly one is
+    // required (clap enforces mutual exclusion; this enforces presence).
+    let (public_key_hex, keypair_name) = match (args.public_key, args.keypair) {
+        (Some(hex), None) => (hex, None),
+        (None, Some(name)) => {
+            let hex = crate::commands::keypair::load_public_key_hex(&name)
+                .with_context(|| format!("load public key for --keypair {name:?}"))?;
+            (hex, Some(name))
+        },
+        (None, None) => anyhow::bail!(
+            "redeem requires either --public-key <hex> or --keypair <name>. \
+             Generate one with `astrid keypair generate`."
+        ),
+        (Some(_), Some(_)) => unreachable!("clap conflicts_with prevents this"),
+    };
+
     // Redemption is intentionally unauthenticated kernel-side — the
     // token IS the auth. A fresh-machine redeemer typically has no
     // `cli-context.toml` yet, so don't require an active-agent context
@@ -136,7 +165,7 @@ async fn run_redeem(args: RedeemArgs) -> Result<ExitCode> {
     let resp = client
         .request(AdminRequestKind::InviteRedeem {
             token: args.token,
-            public_key: args.public_key,
+            public_key: public_key_hex,
             display_name: args.display_name,
         })
         .await
@@ -151,6 +180,28 @@ async fn run_redeem(args: RedeemArgs) -> Result<ExitCode> {
                 redeemed.group,
                 redeemed.public_key_fingerprint,
             );
+            // Best-effort: bind the keypair's meta.toml to the new
+            // principal so `astrid keypair list` shows the link.
+            // Failure here doesn't fail the redeem itself.
+            if let Some(name) = &keypair_name
+                && let Err(e) = crate::commands::keypair::record_binding(name, &redeemed.principal)
+            {
+                tracing::warn!(name = %name, error = %e, "could not record keypair binding");
+            }
+            if args.switch {
+                crate::context::set_active_agent(&redeemed.principal)
+                    .context("update cli-context.toml after redeem")?;
+                println!(
+                    "{} active agent set to {}",
+                    Theme::success("→"),
+                    redeemed.principal.to_string().bold()
+                );
+            } else {
+                println!(
+                    "  next step: astrid agent switch {} (or re-run redeem with --switch)",
+                    redeemed.principal
+                );
+            }
             Ok(ExitCode::SUCCESS)
         },
         other => anyhow::bail!("unexpected response shape: {other:?}"),
