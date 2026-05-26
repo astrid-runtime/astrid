@@ -15,8 +15,26 @@ use axum::extract::State;
 use serde::Serialize;
 use serde_json::Value;
 
-use crate::error::{GatewayError, GatewayResult};
+use crate::error::GatewayError;
 use crate::state::GatewayState;
+
+impl DistributionInfo {
+    /// Single-tenant stub. Used when no `Distro.toml` is configured —
+    /// the dashboard sees enough metadata to render *something* but
+    /// `invites_enabled = false` so no registration UI surfaces.
+    #[must_use]
+    pub fn single_tenant() -> Self {
+        Self {
+            id: "single-tenant".to_string(),
+            name: "Astrid".to_string(),
+            pretty_name: None,
+            description: None,
+            homepage: None,
+            invites_enabled: false,
+            branding: None,
+        }
+    }
+}
 
 /// Distribution discovery response.
 #[derive(Debug, Clone, Serialize)]
@@ -40,22 +58,13 @@ pub struct DistributionInfo {
     pub branding: Option<Value>,
 }
 
-pub async fn get_distribution(
-    State(state): State<Arc<GatewayState>>,
-) -> GatewayResult<Json<DistributionInfo>> {
-    let info = match &state.distro_toml {
-        None => DistributionInfo {
-            id: "single-tenant".to_string(),
-            name: "Astrid".to_string(),
-            pretty_name: None,
-            description: None,
-            homepage: None,
-            invites_enabled: false,
-            branding: None,
-        },
-        Some(text) => parse_distribution(text)?,
-    };
-    Ok(Json(info))
+pub async fn get_distribution(State(state): State<Arc<GatewayState>>) -> Json<DistributionInfo> {
+    // Distribution metadata is parsed once at startup (see
+    // `GatewayState::new`). Cloning the pre-parsed struct is orders
+    // of magnitude cheaper than reparsing TOML on every request,
+    // which would be a trivial CPU-exhaustion DoS vector against
+    // this unauthenticated route.
+    Json((*state.distribution).clone())
 }
 
 /// `GET /api/distribution/onboarding` — distro-level cross-capsule
@@ -63,13 +72,8 @@ pub async fn get_distribution(
 /// data via `astrid init`; the dashboard mirrors it here so a
 /// freshly-redeemed principal can immediately fill in their copy
 /// without a CLI roundtrip.
-pub async fn get_onboarding(
-    State(state): State<Arc<GatewayState>>,
-) -> GatewayResult<Json<OnboardingFields>> {
-    let Some(text) = &state.distro_toml else {
-        return Ok(Json(OnboardingFields::default()));
-    };
-    Ok(Json(parse_onboarding(text)?))
+pub async fn get_onboarding(State(state): State<Arc<GatewayState>>) -> Json<OnboardingFields> {
+    Json((*state.onboarding).clone())
 }
 
 /// Subset of `[variables]` surfaced to the dashboard.
@@ -93,7 +97,11 @@ pub struct OnboardingField {
 
 // ── parsing helpers ────────────────────────────────────────────────
 
-fn parse_distribution(text: &str) -> GatewayResult<DistributionInfo> {
+/// Parse the `[distro]` / `[invites]` / `[branding]` sections out of
+/// a `Distro.toml` string. Called once at startup by
+/// `GatewayState::new`; the result is cached and reflected verbatim
+/// from `/api/distribution`.
+pub fn parse_distribution(text: &str) -> Result<DistributionInfo, GatewayError> {
     let parsed: toml::Value = toml::from_str(text)
         .map_err(|e| GatewayError::Internal(anyhow::anyhow!("distro manifest parse: {e}")))?;
     let distro_tbl = parsed
@@ -148,7 +156,11 @@ fn parse_distribution(text: &str) -> GatewayResult<DistributionInfo> {
     })
 }
 
-fn parse_onboarding(text: &str) -> GatewayResult<OnboardingFields> {
+/// Parse the `[variables]` section out of a `Distro.toml` string
+/// into the dashboard-facing onboarding fields. Called once at
+/// startup; the result is cached and reflected from
+/// `/api/distribution/onboarding`.
+pub fn parse_onboarding(text: &str) -> Result<OnboardingFields, GatewayError> {
     let parsed: toml::Value = toml::from_str(text)
         .map_err(|e| GatewayError::Internal(anyhow::anyhow!("distro manifest parse: {e}")))?;
     let Some(vars) = parsed.get("variables").and_then(toml::Value::as_table) else {

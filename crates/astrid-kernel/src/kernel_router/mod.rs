@@ -13,6 +13,9 @@ use astrid_events::kernel_api::{KernelRequest, KernelResponse};
 use serde::Serialize;
 use tracing::{debug, info, warn};
 
+#[cfg(test)]
+mod capability_catalog_tests;
+
 /// Spawns background tasks for the kernel management API and connection tracking.
 ///
 /// Two listeners:

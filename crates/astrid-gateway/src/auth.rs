@@ -65,7 +65,12 @@ pub fn mint_bearer(signer: &SigningKey, principal: &PrincipalId, lifetime_secs: 
 /// success, or `Err` with a generic shape so callers can't tell
 /// which check failed (avoids leaking validity oracle).
 pub fn verify_bearer(state: &GatewayState, raw: &str) -> Result<CallerContext, GatewayError> {
-    let parts: Vec<&str> = raw.split('.').collect();
+    // `splitn(4, '.')` caps allocation at four slices regardless of
+    // input length. Without the cap, an attacker sending an
+    // Authorization header packed with dots would coerce `split('.')`
+    // into materialising millions of empty slices — a cheap path to
+    // memory / CPU exhaustion against an unauthenticated route.
+    let parts: Vec<&str> = raw.splitn(4, '.').collect();
     if parts.len() != 3 {
         return Err(GatewayError::Unauthorized);
     }
@@ -158,7 +163,8 @@ mod tests {
         Arc::new(GatewayState {
             config: cfg,
             signing: SigningMaterial::fresh(),
-            distro_toml: None,
+            distribution: Arc::new(crate::routes::distribution::DistributionInfo::single_tenant()),
+            onboarding: Arc::new(crate::routes::distribution::OnboardingFields::default()),
             redeem_limiter: tokio::sync::Mutex::default(),
         })
     }
@@ -211,5 +217,15 @@ mod tests {
         let state = test_state();
         assert!(verify_bearer(&state, "garbage").is_err());
         assert!(verify_bearer(&state, "a.b.c").is_err());
+    }
+
+    #[test]
+    fn dot_flood_does_not_allocate_unboundedly() {
+        // 10k dots → 10k+1 slices under split, but splitn(4) caps the
+        // alloc at 4 slices. We only assert behaviour (rejection +
+        // bounded work); the real DoS proof is in the splitn contract.
+        let state = test_state();
+        let dot_bomb = ".".repeat(10_000);
+        assert!(verify_bearer(&state, &dot_bomb).is_err());
     }
 }

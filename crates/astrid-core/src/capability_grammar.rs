@@ -155,6 +155,72 @@ pub fn capability_matches(pattern: &str, cap: &str) -> bool {
     }
 }
 
+/// Canonical catalog of every static capability identifier the kernel
+/// recognises.
+///
+/// Mirrors the static match tables in
+/// `astrid-kernel::kernel_router::{required_capability,
+/// admin::required_capability_for_admin_request}` so external
+/// consumers (the HTTP gateway's `/api/sys/capabilities`, docs
+/// tooling, dashboards) don't have to redeclare the list. Adding a
+/// capability requires updating this constant and the corresponding
+/// kernel match; `KNOWN_CAPABILITIES_MIRROR_COUNT` pins the
+/// expected size so a kernel addition without a catalog bump fails
+/// at compile time of the kernel tests.
+///
+/// Entries are sorted by family then by `self:`-prefix to keep the
+/// list scan-friendly. Order is part of the public API — UIs sort
+/// by it for stable display.
+pub const KNOWN_CAPABILITIES: &[&str] = &[
+    // Kernel-request gates (capsule install / list / system control).
+    "system:shutdown",
+    "system:status",
+    "self:capsule:reload",
+    "capsule:reload",
+    "self:capsule:install",
+    "capsule:install",
+    "self:capsule:list",
+    "capsule:list",
+    "self:approval:respond",
+    // Admin-request gates: agent lifecycle.
+    "agent:create",
+    "agent:delete",
+    "agent:enable",
+    "agent:disable",
+    "agent:modify",
+    "agent:list",
+    "self:agent:list",
+    // Quotas.
+    "quota:set",
+    "self:quota:set",
+    "quota:get",
+    "self:quota:get",
+    // Group lifecycle.
+    "group:create",
+    "group:delete",
+    "group:modify",
+    "group:list",
+    "self:group:list",
+    // Capability mutation.
+    "caps:grant",
+    "caps:revoke",
+    // Invite lifecycle (#756).
+    "invite:issue",
+    "invite:redeem",
+    "invite:list",
+    "invite:revoke",
+];
+
+/// Compile-time pin on the size of [`KNOWN_CAPABILITIES`]. Bumped in
+/// the same commit that adds a new capability so a kernel addition
+/// without updating the catalog fails the consuming crate's tests.
+pub const KNOWN_CAPABILITIES_COUNT: usize = 31;
+
+const _: () = assert!(
+    KNOWN_CAPABILITIES.len() == KNOWN_CAPABILITIES_COUNT,
+    "KNOWN_CAPABILITIES_COUNT is stale; bump it when adding a capability"
+);
+
 #[cfg(test)]
 mod tests {
     use super::*;

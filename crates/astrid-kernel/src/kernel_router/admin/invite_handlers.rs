@@ -374,10 +374,21 @@ fn allocate_principal(
     Err("failed to allocate a unique principal id after 16 attempts".into())
 }
 
+/// Maximum length of a slugified principal id. Bounded so an attacker
+/// supplying a multi-megabyte `display_name` cannot force the kernel
+/// to (a) iterate the full string and (b) produce a profile path
+/// longer than the filesystem's `NAME_MAX` (typically 255 on Unix,
+/// 143 on legacy eCryptfs). 64 is well under every supported limit
+/// and matches the ergonomic ceiling for human-friendly names.
+const MAX_PRINCIPAL_SLUG_LEN: usize = 64;
+
 fn slugify_principal(input: &str) -> String {
-    let mut out = String::with_capacity(input.len());
+    let mut out = String::with_capacity(input.len().min(MAX_PRINCIPAL_SLUG_LEN));
     let mut last_was_dash = false;
-    for ch in input.chars() {
+    // `.take(MAX_PRINCIPAL_SLUG_LEN)` short-circuits the iterator so
+    // the oversize-input case is O(MAX) not O(input.len()), preventing
+    // the CPU-exhaustion shape of "redeem with a giant display_name".
+    for ch in input.chars().take(MAX_PRINCIPAL_SLUG_LEN) {
         if ch.is_ascii_alphanumeric() {
             out.push(ch.to_ascii_lowercase());
             last_was_dash = false;
@@ -450,6 +461,18 @@ mod tests {
         assert_eq!(slugify_principal("alice@example.com"), "alice-example-com");
         assert_eq!(slugify_principal("--Alice--"), "alice");
         assert_eq!(slugify_principal(""), "");
+    }
+
+    #[test]
+    fn slugify_principal_caps_oversize_input() {
+        let monster = "a".repeat(10_000);
+        let out = slugify_principal(&monster);
+        assert!(
+            out.len() <= MAX_PRINCIPAL_SLUG_LEN,
+            "expected len <= {MAX_PRINCIPAL_SLUG_LEN}, got {}",
+            out.len()
+        );
+        assert_eq!(out, "a".repeat(MAX_PRINCIPAL_SLUG_LEN));
     }
 
     #[test]

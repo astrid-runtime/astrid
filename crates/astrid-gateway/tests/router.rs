@@ -23,6 +23,9 @@ use astrid_gateway::{
     GatewayConfig, GatewayState,
     auth::{CallerContext, mint_bearer, verify_bearer},
     routes,
+    routes::distribution::{
+        DistributionInfo, OnboardingFields, parse_distribution, parse_onboarding,
+    },
     state::SigningMaterial,
 };
 use axum::body::{Body, to_bytes};
@@ -49,10 +52,21 @@ role = "uplink"
 "#;
 
 fn fresh_state_with_distro(distro: Option<&str>) -> Arc<GatewayState> {
+    let (distribution, onboarding) = match distro {
+        Some(text) => (
+            parse_distribution(text).expect("test distro parses"),
+            parse_onboarding(text).expect("test onboarding parses"),
+        ),
+        None => (
+            DistributionInfo::single_tenant(),
+            OnboardingFields::default(),
+        ),
+    };
     Arc::new(GatewayState {
         config: GatewayConfig::default(),
         signing: SigningMaterial::fresh(),
-        distro_toml: distro.map(str::to_string),
+        distribution: Arc::new(distribution),
+        onboarding: Arc::new(onboarding),
         redeem_limiter: tokio::sync::Mutex::default(),
     })
 }

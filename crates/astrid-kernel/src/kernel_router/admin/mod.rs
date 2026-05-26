@@ -221,30 +221,69 @@ pub fn admin_request_method(req: &AdminRequestKind) -> &'static str {
 /// Serialise an [`AdminRequestKind`] for audit storage with sensitive
 /// fields redacted. Keeps the wire-name shape so audit consumers can
 /// still discriminate variants — only the secret-bearing fields are
-/// dropped.
+/// dropped or hashed.
 ///
-/// Today the only redaction is `InviteRedeem.public_key`: storing the
-/// raw ed25519 key in the audit log doubles the system of record for
-/// authorization, which Layer 5/6 treat as `AuthConfig.public_keys`
-/// alone. The audit row keeps the SHA-256 fingerprint of the key so an
-/// auditor can still bind the redemption to a registered key after
-/// the fact.
+/// Redactions:
+///
+/// * `InviteRedeem.public_key` → `public_key_fingerprint` (SHA-256 of
+///   the supplied key). Storing the raw ed25519 key in the audit log
+///   would double the system of record for authorization, which Layer
+///   5/6 treat as `AuthConfig.public_keys` alone.
+/// * `InviteRedeem.token` → `token_fingerprint` (`hex(sha256(token))`).
+///   The raw invite token is a secret that grants the right to mint a
+///   principal; persisting it in the audit log would let anyone with
+///   read access replay it on a multi-use invite. The fingerprint
+///   matches the on-disk hash in `invites.toml`, so an auditor can
+///   still correlate a redeem to the issued invite.
+/// * `InviteRevoke.token` → `token_fingerprint`. Same hazard as
+///   `InviteRedeem.token`: the caller can pass either the raw token or
+///   the already-fingerprinted form. Hash unconditionally when the
+///   input doesn't already look like a fingerprint (64 hex chars).
 fn sanitize_admin_audit_params(req: &AdminRequestKind) -> Option<serde_json::Value> {
     let mut val = serde_json::to_value(req).ok()?;
-    if let AdminRequestKind::InviteRedeem { public_key, .. } = req
-        && let Some(obj) = val
-            .as_object_mut()
-            .and_then(|m| m.get_mut("params"))
-            .and_then(|p| p.as_object_mut())
-    {
-        let fp = invite_handlers::fingerprint_public_key(public_key);
-        obj.remove("public_key");
-        obj.insert(
-            "public_key_fingerprint".to_string(),
-            serde_json::Value::String(fp),
-        );
+    let params = val
+        .as_object_mut()
+        .and_then(|m| m.get_mut("params"))
+        .and_then(|p| p.as_object_mut())?;
+    match req {
+        AdminRequestKind::InviteRedeem {
+            public_key, token, ..
+        } => {
+            let fp = invite_handlers::fingerprint_public_key(public_key);
+            params.remove("public_key");
+            params.insert(
+                "public_key_fingerprint".to_string(),
+                serde_json::Value::String(fp),
+            );
+            params.remove("token");
+            params.insert(
+                "token_fingerprint".to_string(),
+                serde_json::Value::String(crate::invite::hash_token(token)),
+            );
+        },
+        AdminRequestKind::InviteRevoke { token } => {
+            params.remove("token");
+            params.insert(
+                "token_fingerprint".to_string(),
+                serde_json::Value::String(fingerprint_revoke_input(token)),
+            );
+        },
+        _ => {},
     }
     Some(val)
+}
+
+/// Fingerprint helper for `InviteRevoke.token`, which can be supplied
+/// either as the raw token *or* as an already-fingerprinted 64-hex
+/// identifier (from `astrid invite list`). The audit row stores the
+/// fingerprint form unconditionally so an auditor can correlate
+/// against `invites.toml` without seeing the secret.
+fn fingerprint_revoke_input(token: &str) -> String {
+    if token.len() == 64 && token.chars().all(|c| c.is_ascii_hexdigit()) {
+        token.to_ascii_lowercase()
+    } else {
+        crate::invite::hash_token(token)
+    }
 }
 
 /// Borrow the target principal for audit purposes — `Some` only when the

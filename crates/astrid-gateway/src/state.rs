@@ -16,6 +16,7 @@ use rand::RngCore;
 use tokio::sync::Mutex;
 
 use crate::config::GatewayConfig;
+use crate::routes::distribution::{DistributionInfo, OnboardingFields};
 
 /// Signing material for session bearer tokens.
 ///
@@ -83,10 +84,15 @@ pub struct GatewayState {
     pub config: GatewayConfig,
     /// Per-boot signing material.
     pub signing: SigningMaterial,
-    /// Raw `Distro.toml` text, cached at boot. The gateway reflects
-    /// this through `/api/distribution` and `/api/distribution/onboarding`.
-    /// `None` for single-tenant deployments with no manifest.
-    pub distro_toml: Option<String>,
+    /// Pre-parsed distribution discovery payload. Computed once at
+    /// boot from `Distro.toml` so the public `/api/distribution`
+    /// route doesn't reparse TOML on every request — that would be a
+    /// trivial CPU-exhaustion `DoS` vector against an unauthenticated
+    /// endpoint. `Arc` so route handlers can clone cheaply.
+    pub distribution: Arc<DistributionInfo>,
+    /// Pre-parsed onboarding fields drawn from `[variables]`. Same
+    /// rationale as [`Self::distribution`].
+    pub onboarding: Arc<OnboardingFields>,
     /// Redeem rate-limiter. Wrapped in async `Mutex` because the
     /// limiter is a write-mostly workload and handlers are async.
     pub redeem_limiter: Mutex<RedeemRateLimiter>,
@@ -97,19 +103,33 @@ impl GatewayState {
     ///
     /// # Errors
     /// Returns an error if `distro_path` points at a file that can't
-    /// be read.
+    /// be read or whose contents fail to parse.
     pub fn new(config: GatewayConfig) -> anyhow::Result<Arc<Self>> {
-        let distro_toml =
-            match &config.distro_path {
-                Some(p) => Some(std::fs::read_to_string(p).with_context(|| {
+        let (distribution, onboarding) = match &config.distro_path {
+            Some(p) => {
+                let text = std::fs::read_to_string(p).with_context(|| {
                     format!("failed to read distro manifest at {}", p.display())
-                })?),
-                None => None,
-            };
+                })?;
+                let dist =
+                    crate::routes::distribution::parse_distribution(&text).with_context(|| {
+                        format!("failed to parse distro manifest at {}", p.display())
+                    })?;
+                let onb =
+                    crate::routes::distribution::parse_onboarding(&text).with_context(|| {
+                        format!("failed to parse onboarding fields at {}", p.display())
+                    })?;
+                (dist, onb)
+            },
+            None => (
+                DistributionInfo::single_tenant(),
+                OnboardingFields::default(),
+            ),
+        };
         Ok(Arc::new(Self {
             config,
             signing: SigningMaterial::fresh(),
-            distro_toml,
+            distribution: Arc::new(distribution),
+            onboarding: Arc::new(onboarding),
             redeem_limiter: Mutex::new(RedeemRateLimiter::default()),
         }))
     }

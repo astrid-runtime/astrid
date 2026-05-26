@@ -49,52 +49,16 @@ pub async fn list_principals(
 #[derive(Debug, Clone, Serialize)]
 pub struct CapabilityCatalog {
     /// Every capability identifier the kernel currently recognises.
-    /// Mirrors `kernel_router::required_capability` and
-    /// `kernel_router::admin::required_capability_for_admin_request`
-    /// — the static map that gates every management op.
-    pub capabilities: Vec<&'static str>,
+    /// Sourced from `astrid_core::capability_grammar::KNOWN_CAPABILITIES`
+    /// — the single canonical declaration shared with the kernel's
+    /// `required_capability` tables. Avoids duplication / drift.
+    pub capabilities: &'static [&'static str],
 }
 
 pub async fn list_capabilities(
     _req: Request<axum::body::Body>,
 ) -> GatewayResult<Json<CapabilityCatalog>> {
-    // Hard-coded mirror of the kernel-side static maps. Keep in
-    // sync; the test below pins both to the same length so a kernel
-    // addition without a gateway update fails CI.
-    let capabilities = vec![
-        // Kernel-request gates.
-        "system:shutdown",
-        "system:status",
-        "self:capsule:reload",
-        "capsule:reload",
-        "self:capsule:install",
-        "capsule:install",
-        "self:capsule:list",
-        "capsule:list",
-        "self:approval:respond",
-        // Admin-request gates.
-        "agent:create",
-        "agent:delete",
-        "agent:enable",
-        "agent:disable",
-        "agent:modify",
-        "agent:list",
-        "self:agent:list",
-        "quota:set",
-        "self:quota:set",
-        "quota:get",
-        "self:quota:get",
-        "group:create",
-        "group:delete",
-        "group:modify",
-        "group:list",
-        "self:group:list",
-        "caps:grant",
-        "caps:revoke",
-        "invite:issue",
-        "invite:redeem",
-        "invite:list",
-        "invite:revoke",
-    ];
-    Ok(Json(CapabilityCatalog { capabilities }))
+    Ok(Json(CapabilityCatalog {
+        capabilities: astrid_core::capability_grammar::KNOWN_CAPABILITIES,
+    }))
 }
