@@ -34,7 +34,7 @@ edition = "2024"
 authors = ["Joshua J. Bouw <dev@joshuajbouw.com>", "Unicity Labs <info@unicity-labs.com>"]
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/unicity-astrid/astrid"
-rust-version = "1.94"
+rust-version = "1.95"
 
 [workspace.dependencies]
 astrid-approval = { path = "crates/astrid-approval", version = "0.7.0" }

@@ -195,7 +195,7 @@ impl BudgetTracker {
             };
         }
 
-        let spent = self.session_spent.read().map(|s| *s).unwrap_or(0.0);
+        let spent = self.session_spent.read().map_or(0.0, |s| *s);
         let remaining = self.config.session_max_usd - spent;
 
         // Check session budget
@@ -301,14 +301,14 @@ impl BudgetTracker {
     /// Get the remaining session budget.
     #[must_use]
     pub fn remaining(&self) -> f64 {
-        let spent = self.session_spent.read().map(|s| *s).unwrap_or(0.0);
+        let spent = self.session_spent.read().map_or(0.0, |s| *s);
         (self.config.session_max_usd - spent).max(0.0)
     }
 
     /// Get the total amount spent this session.
     #[must_use]
     pub fn spent(&self) -> f64 {
-        self.session_spent.read().map(|s| *s).unwrap_or(0.0)
+        self.session_spent.read().map_or(0.0, |s| *s)
     }
 
     /// Get the budget configuration.
@@ -510,7 +510,7 @@ impl WorkspaceBudgetTracker {
             return BudgetResult::Allowed;
         };
 
-        let spent = self.total_spent.read().map(|s| *s).unwrap_or(0.0);
+        let spent = self.total_spent.read().map_or(0.0, |s| *s);
         let remaining = max - spent;
 
         if estimated_cost > remaining {
@@ -537,7 +537,7 @@ impl WorkspaceBudgetTracker {
     /// Get the total amount spent in this workspace.
     #[must_use]
     pub fn spent(&self) -> f64 {
-        self.total_spent.read().map(|s| *s).unwrap_or(0.0)
+        self.total_spent.read().map_or(0.0, |s| *s)
     }
 
     /// Get the remaining workspace budget, or `None` if unlimited.

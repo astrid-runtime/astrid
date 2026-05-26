@@ -9,6 +9,10 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
 
 ## [Unreleased]
 
+### Breaking
+
+- **MSRV bumped to 1.95.0.** `surrealdb 3.0.0-beta.3`'s `kv-mem` feature pulled in `surrealmx v0.21.0` → `ferntree v0.7.0`, which uses `std::hint::cold_path` stabilised in Rust 1.95. Upstream declared no `rust-version`, so cargo's resolver silently picks 0.7 even though the workspace MSRV says 1.94. Bumping our MSRV is the smallest fix that keeps CI deterministic without committing `Cargo.lock` (which is intentionally gitignored). Affects `cargo install astrid` consumers — installers on 1.94 will see a clear "requires rustc 1.95" error rather than the cryptic `cold_path` failure.
+
 ### Added
 
 - **HTTP admin gateway (`astrid-gateway`).** New crate that fronts the kernel's existing `astrid.v1.admin.*` IPC surface over HTTP for browser dashboards. Reads `~/.astrid/run/system.token`, handshakes with the daemon over the same Unix socket the CLI uses, and stamps `IpcMessage.principal` from an ed25519-signed bearer it verifies against its boot-time public key — never from the request body. Routes: `GET /api/distribution`, `GET /api/distribution/onboarding`, `POST /api/auth/redeem`, `GET /api/auth/me`, `GET /api/sys/principals`, `POST/GET/DELETE /api/sys/invites`, `GET /api/sys/capabilities`. localhost-bound by default; TLS expected upstream. Spawned by `astrid-daemon` when `etc/gateway-http.toml` has `enabled = true`; missing/disabled = no-op so single-tenant deployments are unaffected. (#756)

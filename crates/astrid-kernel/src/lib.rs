@@ -1213,7 +1213,7 @@ struct RestartTracker {
 impl RestartTracker {
     const MAX_ATTEMPTS: u32 = 5;
     const INITIAL_BACKOFF: std::time::Duration = std::time::Duration::from_secs(2);
-    const MAX_BACKOFF: std::time::Duration = std::time::Duration::from_secs(120);
+    const MAX_BACKOFF: std::time::Duration = std::time::Duration::from_mins(2);
 
     fn new() -> Self {
         Self {

@@ -116,7 +116,7 @@ impl Vfs for HostVfs {
             let mut entries = Vec::new();
             for entry_res in iter {
                 let entry = entry_res.map_err(VfsError::Io)?;
-                let is_dir = entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false);
+                let is_dir = entry.file_type().is_ok_and(|ft| ft.is_dir());
                 entries.push(VfsDirEntry {
                     name: entry.file_name().to_string_lossy().to_string(),
                     is_dir,

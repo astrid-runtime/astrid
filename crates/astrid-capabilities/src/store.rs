@@ -608,8 +608,7 @@ impl CapabilityStore {
     pub fn is_used(&self, token_id: &TokenId) -> bool {
         self.used_tokens
             .read()
-            .map(|used| used.contains(token_id))
-            .unwrap_or(false)
+            .is_ok_and(|used| used.contains(token_id))
     }
 
     /// Validate and optionally consume a token.
@@ -727,13 +726,11 @@ impl Default for CapabilityStore {
 
 impl std::fmt::Debug for CapabilityStore {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let (session_principals, session_count) = self
-            .session_tokens
-            .read()
-            .map(|t| (t.len(), t.values().map(HashMap::len).sum::<usize>()))
-            .unwrap_or((0, 0));
-        let revoked_count = self.revoked.read().map(|r| r.len()).unwrap_or(0);
-        let used_count = self.used_tokens.read().map(|u| u.len()).unwrap_or(0);
+        let (session_principals, session_count) = self.session_tokens.read().map_or((0, 0), |t| {
+            (t.len(), t.values().map(HashMap::len).sum::<usize>())
+        });
+        let revoked_count = self.revoked.read().map_or(0, |r| r.len());
+        let used_count = self.used_tokens.read().map_or(0, |u| u.len());
         let has_persistence = self.persistent_store.is_some();
 
         f.debug_struct("CapabilityStore")

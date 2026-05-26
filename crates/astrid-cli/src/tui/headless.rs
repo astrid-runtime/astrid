@@ -108,7 +108,7 @@ fn build_sgr(codes: &mut Vec<String>, fg: Color, bg: Color, mods: Modifier) {
 
 /// Render a snapshot with full ANSI color and print it to stdout.
 fn snapshot(terminal: &mut Terminal<TestBackend>, app: &mut App, event: &str) {
-    app.terminal_height = terminal.size().map(|s| s.height).unwrap_or(40);
+    app.terminal_height = terminal.size().map_or(40, |s| s.height);
     let _ = terminal.draw(|frame| render::render_frame(frame, app));
 
     let backend = terminal.backend();
@@ -212,7 +212,7 @@ pub(crate) async fn run(cfg: HeadlessConfig<'_>) -> anyhow::Result<()> {
     crate::socket_client::send_input_as_active_agent(cfg.client, cfg.prompt.to_string()).await?;
     snapshot(&mut terminal, &mut app, "input_sent");
 
-    let timeout = Duration::from_secs(120);
+    let timeout = Duration::from_mins(2);
     let start = Instant::now();
 
     loop {

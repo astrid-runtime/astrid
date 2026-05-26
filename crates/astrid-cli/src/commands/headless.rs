@@ -175,7 +175,7 @@ async fn collect_response(
 ) -> Result<(String, Vec<serde_json::Value>)> {
     let mut response_text = String::new();
     let mut tool_calls: Vec<serde_json::Value> = Vec::new();
-    let timeout_duration = std::time::Duration::from_secs(120);
+    let timeout_duration = std::time::Duration::from_mins(2);
 
     loop {
         let message = match tokio::time::timeout(timeout_duration, client.read_message()).await {

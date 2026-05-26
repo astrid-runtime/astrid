@@ -235,7 +235,7 @@ impl AuditLog {
         // Verify each chain independently.
         for chain_entries in chains.values_mut() {
             // Sort by timestamp within each chain.
-            chain_entries.sort_by(|a, b| a.timestamp.0.cmp(&b.timestamp.0));
+            chain_entries.sort_by_key(|a| a.timestamp.0);
 
             // Verify genesis (first entry has zero previous hash).
             if !chain_entries[0].previous_hash.is_zero() {
@@ -309,7 +309,7 @@ impl AuditLog {
         let mut entries_verified: usize = 0;
 
         let mut sorted = entries;
-        sorted.sort_by(|a, b| a.timestamp.0.cmp(&b.timestamp.0));
+        sorted.sort_by_key(|a| a.timestamp.0);
 
         if !sorted[0].previous_hash.is_zero() {
             issues.push(ChainIssue::InvalidGenesis {

@@ -36,7 +36,7 @@ pub(crate) fn list_sessions() -> Result<()> {
         return Ok(());
     }
 
-    sessions.sort_by(|a, b| b.1.cmp(&a.1));
+    sessions.sort_by_key(|s| std::cmp::Reverse(s.1));
 
     println!("{}", "Active Sessions:".bold());
     for (id, modified) in sessions {

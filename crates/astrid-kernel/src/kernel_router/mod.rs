@@ -356,7 +356,7 @@ impl ManagementRateLimiter {
     /// Returns `true` if allowed, `false` if rate-limited.
     fn check(&mut self, method: &'static str, max_per_minute: u32) -> bool {
         let now = Instant::now();
-        let window = std::time::Duration::from_secs(60);
+        let window = std::time::Duration::from_mins(1);
         let timestamps = self.buckets.entry(method).or_default();
 
         // Evict timestamps older than the 60-second sliding window.

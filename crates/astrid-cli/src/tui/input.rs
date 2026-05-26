@@ -751,22 +751,18 @@ fn handle_approval_input(app: &mut App, key: KeyEvent) {
             app.deny_tool(&id);
         },
         // Navigate between approvals
-        KeyCode::Tab | KeyCode::Down => {
-            if !app.pending_approvals.is_empty() {
-                #[expect(clippy::arithmetic_side_effects)] // modulo by non-empty len is safe
-                {
-                    app.selected_approval =
-                        app.selected_approval.saturating_add(1) % app.pending_approvals.len();
-                }
+        KeyCode::Tab | KeyCode::Down if !app.pending_approvals.is_empty() => {
+            #[expect(clippy::arithmetic_side_effects)] // modulo by non-empty len is safe
+            {
+                app.selected_approval =
+                    app.selected_approval.saturating_add(1) % app.pending_approvals.len();
             }
         },
-        KeyCode::BackTab | KeyCode::Up => {
-            if !app.pending_approvals.is_empty() {
-                app.selected_approval = app
-                    .selected_approval
-                    .checked_sub(1)
-                    .unwrap_or(app.pending_approvals.len().saturating_sub(1));
-            }
+        KeyCode::BackTab | KeyCode::Up if !app.pending_approvals.is_empty() => {
+            app.selected_approval = app
+                .selected_approval
+                .checked_sub(1)
+                .unwrap_or(app.pending_approvals.len().saturating_sub(1));
         },
         // Quit
         KeyCode::Char('c') if key.modifiers == KeyModifiers::CONTROL => {
@@ -815,10 +811,8 @@ fn handle_copy_input(app: &mut App, key: KeyEvent) {
             app.copy_cursor = app.copy_cursor.saturating_sub(1);
         },
         // Navigate down
-        (KeyCode::Down, _) => {
-            if app.copy_cursor.saturating_add(1) < app.nexus_stream.len() {
-                app.copy_cursor = app.copy_cursor.saturating_add(1);
-            }
+        (KeyCode::Down, _) if app.copy_cursor.saturating_add(1) < app.nexus_stream.len() => {
+            app.copy_cursor = app.copy_cursor.saturating_add(1);
         },
         // Jump up by 5
         (KeyCode::PageUp, _) => {

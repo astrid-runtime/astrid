@@ -202,8 +202,7 @@ fn is_astrid_profile_loaded() -> bool {
     Command::new("aa-status")
         .arg("--profiled")
         .output()
-        .map(|o| String::from_utf8_lossy(&o.stdout).contains("astrid"))
-        .unwrap_or(false)
+        .is_ok_and(|o| String::from_utf8_lossy(&o.stdout).contains("astrid"))
 }
 
 // ── Install commands ───────────────────────────────────────────────

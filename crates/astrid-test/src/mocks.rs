@@ -71,8 +71,7 @@ impl MockEventBus {
     pub fn has_event(&self, event_type: &str) -> bool {
         self.events
             .lock()
-            .map(|g| g.iter().any(|e| e.event_type == event_type))
-            .unwrap_or(false)
+            .is_ok_and(|g| g.iter().any(|e| e.event_type == event_type))
     }
 }
 

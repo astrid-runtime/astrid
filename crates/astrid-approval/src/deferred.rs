@@ -378,7 +378,7 @@ impl DeferredResolutionStore {
         };
         let mut pending: Vec<_> = store.values().cloned().collect();
         // Sort by priority descending (Critical > High > Normal > Low)
-        pending.sort_by(|a, b| b.priority.cmp(&a.priority));
+        pending.sort_by_key(|p| std::cmp::Reverse(p.priority));
         pending
     }
 
@@ -478,7 +478,7 @@ impl DeferredResolutionStore {
     /// Get the number of pending resolutions.
     #[must_use]
     pub fn count(&self) -> usize {
-        self.resolutions.read().map(|s| s.len()).unwrap_or(0)
+        self.resolutions.read().map_or(0, |s| s.len())
     }
 }
 
