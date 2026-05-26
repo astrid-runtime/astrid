@@ -53,12 +53,7 @@ jobs:
             ${{ runner.os }}-cargo-
 
       - name: Run cargo check
-        # --locked honours Cargo.lock so transitive dep-version drift
-        # (e.g. a patch release on an indirect dep that bumps its own
-        # rustc-version requirement) doesn't break CI between commits.
-        # Developers running `cargo check` locally use the lockfile by
-        # default; CI does not unless --locked is passed.
-        run: cargo check --locked --workspace --all-features
+        run: cargo check --workspace --all-features
 
   fmt:
     name: Format
@@ -109,7 +104,7 @@ jobs:
             ${{ runner.os }}-cargo-
 
       - name: Run clippy
-        run: cargo clippy --locked --workspace --all-features -- -D warnings
+        run: cargo clippy --workspace --all-features -- -D warnings
 
   test:
     name: Test
@@ -157,7 +152,7 @@ jobs:
       - name: Run tests
         env:
           ASTRID_AUTO_BUILD_KERNEL: "1"
-        run: cargo test --locked --workspace
+        run: cargo test --workspace
 
   msrv:
     name: MSRV
@@ -190,7 +185,7 @@ jobs:
             ${{ runner.os }}-msrv-
 
       - name: Check MSRV compiles
-        run: cargo check --locked --workspace
+        run: cargo check --workspace
 
   audit:
     name: Security Audit
