@@ -143,7 +143,7 @@ mod tests {
     fn rate_limiter_blocks_within_window() {
         let mut limiter = RedeemRateLimiter::default();
         let ip: IpAddr = "127.0.0.1".parse().unwrap();
-        let interval = Duration::from_secs(60);
+        let interval = Duration::from_mins(1);
 
         assert!(limiter.check(ip, interval).is_none());
         let wait = limiter.check(ip, interval).expect("second probe blocks");
