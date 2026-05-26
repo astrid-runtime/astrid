@@ -568,7 +568,9 @@ async fn handle_pending_actions(
                     };
 
                     // Send to daemon.
-                    if let Err(e) = client.send_input(content).await {
+                    if let Err(e) =
+                        crate::socket_client::send_input_as_active_agent(client, content).await
+                    {
                         app.push_notice(&format!("Failed to send input: {e}"));
                         app.state = UiState::Error {
                             message: format!("Send failed: {e}"),

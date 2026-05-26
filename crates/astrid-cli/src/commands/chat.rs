@@ -85,7 +85,7 @@ async fn run_json_chat(
             continue;
         }
 
-        client.send_input(input.to_string()).await?;
+        crate::socket_client::send_input_as_active_agent(client, input.to_string()).await?;
 
         if !drain_agent_response(client, session_id, &mut *formatter).await? {
             return Ok(());

@@ -21,7 +21,7 @@ use clap::{Args, Subcommand};
 use colored::Colorize;
 use serde::Serialize;
 
-use crate::admin_client::{AdminClient, into_result};
+use crate::admin_client::into_result;
 use crate::context;
 use crate::theme::Theme;
 use crate::value_formatter::{ValueFormat, emit_structured};
@@ -126,7 +126,7 @@ impl From<AgentSummary> for CapsRecord {
 }
 
 async fn fetch_summary(target: &PrincipalId) -> Result<AgentSummary> {
-    let mut client = AdminClient::connect().await?;
+    let mut client = crate::admin_client::connect_as_active_agent().await?;
     let body = client.request(AdminRequestKind::AgentList).await?;
     let body = into_result(body)?;
     let agents = match body {
@@ -246,7 +246,7 @@ async fn run_grant(args: GrantArgs) -> Result<ExitCode> {
         return Ok(ExitCode::from(2));
     }
     let principal = PrincipalId::new(&args.name).context("invalid agent name")?;
-    let mut client = AdminClient::connect().await?;
+    let mut client = crate::admin_client::connect_as_active_agent().await?;
     let body = client
         .request(AdminRequestKind::CapsGrant {
             principal,
@@ -273,7 +273,7 @@ async fn run_revoke(args: RevokeArgs) -> Result<ExitCode> {
         return Ok(ExitCode::from(2));
     }
     let principal = PrincipalId::new(&args.name).context("invalid agent name")?;
-    let mut client = AdminClient::connect().await?;
+    let mut client = crate::admin_client::connect_as_active_agent().await?;
     let body = client
         .request(AdminRequestKind::CapsRevoke {
             principal,
@@ -302,7 +302,7 @@ async fn run_check(args: CheckArgs) -> Result<ExitCode> {
     use astrid_core::capability_grammar::capability_matches;
 
     let principal = PrincipalId::new(&args.name).context("invalid agent name")?;
-    let mut client = AdminClient::connect().await?;
+    let mut client = crate::admin_client::connect_as_active_agent().await?;
 
     let summary_body = client.request(AdminRequestKind::AgentList).await?;
     let summary_body = into_result(summary_body)?;

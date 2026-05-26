@@ -22,12 +22,18 @@ astrid-events = { workspace = true }
 astrid-mcp = { workspace = true }
 astrid-storage = { workspace = true, features = ["kv"] }
 astrid-vfs = { workspace = true }
+base64 = { workspace = true }
 dashmap = { workspace = true }
+hex = { workspace = true }
+rand = { workspace = true }
 semver = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+sha2 = { workspace = true }
+subtle = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["full", "signal"] }
+toml = { workspace = true }
 tracing = { workspace = true }
 uuid = { workspace = true }
 

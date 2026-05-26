@@ -13,6 +13,7 @@ members = [
     "crates/astrid-crypto",
     "crates/astrid-events",
     "crates/astrid-types",
+    "crates/astrid-gateway",
     "crates/astrid-hooks",
     "crates/astrid-integration-tests",
     "crates/astrid-kernel",
@@ -22,6 +23,7 @@ members = [
     "crates/astrid-storage",
     "crates/astrid-telemetry",
     "crates/astrid-test",
+    "crates/astrid-uplink",
     "crates/astrid-vfs",
     "crates/astrid-workspace",
 ]
@@ -54,12 +56,15 @@ astrid-storage = { path = "crates/astrid-storage", version = "0.7.0" }
 astrid-telemetry = { path = "crates/astrid-telemetry", version = "0.7.0" }
 astrid-test = { path = "crates/astrid-test" }
 astrid-types = { path = "crates/astrid-types", version = "0.7.0", features = ["clock"] }
+astrid-uplink = { path = "crates/astrid-uplink", version = "0.7.0" }
+astrid-gateway = { path = "crates/astrid-gateway", version = "0.7.0" }
 astrid-vfs = { path = "crates/astrid-vfs", version = "0.7.0" }
 astrid-workspace = { path = "crates/astrid-workspace", version = "0.7.0" }
 anyhow = "1.0"
 arboard = "3"
 arc-swap = "1.7"
 async-trait = "0.1"
+axum = { version = "0.7", default-features = false, features = ["http1", "json", "tokio", "tracing", "matched-path"] }
 base64 = "0.22"
 blake3 = "1.5"
 # `default-features = false` strips chrono's `clock` feature, which on
@@ -127,6 +132,8 @@ thiserror = "2.0"
 tokio = { version = "1.49", features = ["sync", "macros", "time", "rt", "rt-multi-thread", "net", "io-util", "signal"] }
 tokio-util = "0.7"
 toml = "0.8"
+tower = { version = "0.5", features = ["util"] }
+tower-http = { version = "0.6", features = ["cors", "trace", "limit", "set-header"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 url = "2"

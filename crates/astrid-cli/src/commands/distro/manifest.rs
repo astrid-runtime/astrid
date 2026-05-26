@@ -26,6 +26,65 @@ pub(crate) struct DistroManifest {
     /// Capsule entries in the distro.
     #[serde(default, rename = "capsule")]
     pub(crate) capsules: Vec<DistroCapsule>,
+    /// Invite policy — when `Some`, the deployment ships with the
+    /// `astrid-gateway` HTTP surface configured to accept new
+    /// principals via invite redemption. `None` (the default) keeps
+    /// the distro single-tenant: no public registration UI.
+    ///
+    /// The kernel never reads this directly — `astrid init` /
+    /// `astrid distro apply` surfaces it to the operator and the
+    /// gateway reads it through `/api/distribution`.
+    #[serde(default)]
+    pub(crate) invites: Option<InviteConfig>,
+    /// Optional visual branding for the dashboard. The kernel and
+    /// admin API ignore this entirely; only the gateway returns it
+    /// through `/api/distribution`.
+    #[serde(default)]
+    pub(crate) branding: Option<BrandingConfig>,
+}
+
+/// Invite policy from `[invites]`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub(crate) struct InviteConfig {
+    /// Group(s) allowed to issue invite tokens. An empty `issuers`
+    /// list disables registration (single-tenant deployment). All
+    /// names must be defined groups (built-in or custom).
+    #[serde(default)]
+    pub(crate) issuers: Vec<String>,
+    /// Default group new redeemers join. Required when `issuers` is
+    /// non-empty.
+    #[serde(default)]
+    pub(crate) default_group: Option<String>,
+    /// Default token lifetime (e.g. `"24h"`, `"7d"`, `"30s"`).
+    /// `None` falls back to the gateway's compiled-in default
+    /// (24 hours).
+    #[serde(default)]
+    pub(crate) default_expires: Option<String>,
+    /// Total-principal cap for the deployment. `"unlimited"` (the
+    /// default) skips the check; integer strings cap the count.
+    #[serde(default)]
+    pub(crate) max_principals: Option<String>,
+}
+
+/// Visual branding from `[branding]`. Operator-controlled hints for
+/// the dashboard.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub(crate) struct BrandingConfig {
+    /// Icon — either a data URL (`data:image/svg+xml,...`) or a path
+    /// relative to the distro root. Capped at 64 `KiB` on parse to
+    /// keep malformed `Distro.toml` from ballooning memory.
+    #[serde(default)]
+    pub(crate) icon: Option<String>,
+    /// Primary brand colour as a CSS hex string (`#RRGGBB`). The
+    /// parser validates the shape; the dashboard interprets it.
+    #[serde(default)]
+    pub(crate) primary_color: Option<String>,
+    /// Optional accent colour. Same shape constraints as
+    /// [`Self::primary_color`].
+    #[serde(default)]
+    pub(crate) accent_color: Option<String>,
 }
 
 /// Distro identity and metadata (os-release style).

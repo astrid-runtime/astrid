@@ -10,7 +10,7 @@ use clap::{Args, Subcommand};
 use colored::Colorize;
 use serde::Serialize;
 
-use crate::admin_client::{AdminClient, into_result};
+use crate::admin_client::into_result;
 use crate::theme::Theme;
 use crate::value_formatter::{ValueFormat, emit_structured};
 
@@ -97,7 +97,7 @@ pub(crate) async fn run(cmd: GroupCommand) -> Result<ExitCode> {
 }
 
 async fn fetch_groups() -> Result<Vec<GroupSummary>> {
-    let mut client = AdminClient::connect().await?;
+    let mut client = crate::admin_client::connect_as_active_agent().await?;
     let body = client.request(AdminRequestKind::GroupList).await?;
     let body = into_result(body)?;
     match body {
@@ -111,7 +111,7 @@ async fn run_create(args: CreateArgs) -> Result<ExitCode> {
         eprintln!("astrid: --caps is required (use comma-separated values)");
         return Ok(ExitCode::from(1));
     }
-    let mut client = AdminClient::connect().await?;
+    let mut client = crate::admin_client::connect_as_active_agent().await?;
     let body = client
         .request(AdminRequestKind::GroupCreate {
             name: args.name.clone(),
@@ -160,7 +160,7 @@ async fn run_list(args: ListArgs) -> Result<ExitCode> {
 }
 
 async fn run_delete(args: DeleteArgs) -> Result<ExitCode> {
-    let mut client = AdminClient::connect().await?;
+    let mut client = crate::admin_client::connect_as_active_agent().await?;
     let body = client
         .request(AdminRequestKind::GroupDelete {
             name: args.name.clone(),
@@ -186,7 +186,7 @@ async fn run_modify(args: ModifyArgs) -> Result<ExitCode> {
 
     // Layer 6 group.modify replaces the capability list wholesale —
     // get-modify-set round-trip preserves caps not explicitly removed.
-    let mut client = AdminClient::connect().await?;
+    let mut client = crate::admin_client::connect_as_active_agent().await?;
     let body = client.request(AdminRequestKind::GroupList).await?;
     let body = into_result(body)?;
     let groups = match body {

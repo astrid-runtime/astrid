@@ -130,7 +130,7 @@ pub(crate) async fn run_headless(
     };
 
     // Send the prompt and collect the streaming response
-    client.send_input(full_prompt).await?;
+    crate::socket_client::send_input_as_active_agent(&mut client, full_prompt).await?;
     let (response_text, tool_calls) =
         collect_response(&mut client, &session_id, format, auto_approve).await?;
 

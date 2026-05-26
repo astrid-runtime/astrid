@@ -121,6 +121,87 @@ pub(crate) fn validate_manifest(manifest: &DistroManifest) -> anyhow::Result<()>
         }
     }
 
+    // Invite policy — additive, so the rule is "if any field is set,
+    // the shape must be coherent". The kernel still cap-gates issuance
+    // at runtime; this is fail-fast for typos.
+    if let Some(invites) = &manifest.invites {
+        if !invites.issuers.is_empty() && invites.default_group.is_none() {
+            anyhow::bail!(
+                "invites.issuers is non-empty but invites.default-group is unset — \
+                 either configure both or remove the [invites] section"
+            );
+        }
+        if let Some(exp) = &invites.default_expires {
+            parse_invite_duration(exp).map_err(|e| anyhow::anyhow!(e))?;
+        }
+        if let Some(cap) = &invites.max_principals
+            && cap != "unlimited"
+            && cap.parse::<u32>().is_err()
+        {
+            anyhow::bail!(
+                "invites.max-principals must be \"unlimited\" or a non-negative integer (got {cap:?})",
+            );
+        }
+    }
+
+    // Branding — only structural rails. The dashboard interprets the
+    // values; the parser just refuses obvious garbage.
+    if let Some(branding) = &manifest.branding {
+        if let Some(icon) = &branding.icon
+            && icon.len() > 64 * 1024
+        {
+            anyhow::bail!(
+                "branding.icon is {} bytes — distros must not embed assets larger than 64 KiB",
+                icon.len()
+            );
+        }
+        if let Some(color) = &branding.primary_color {
+            validate_hex_color(color)
+                .map_err(|e| anyhow::anyhow!("branding.primary-color: {e}"))?;
+        }
+        if let Some(color) = &branding.accent_color {
+            validate_hex_color(color).map_err(|e| anyhow::anyhow!("branding.accent-color: {e}"))?;
+        }
+    }
+
+    Ok(())
+}
+
+/// Parse the operator-friendly duration form (`24h`, `7d`, `30m`, `30s`)
+/// into seconds. The kernel caps at 30 days regardless.
+pub(crate) fn parse_invite_duration(input: &str) -> Result<u64, String> {
+    let trimmed = input.trim();
+    let (num_str, multiplier_secs) = if let Some(s) = trimmed.strip_suffix('s') {
+        (s, 1_u64)
+    } else if let Some(s) = trimmed.strip_suffix('m') {
+        (s, 60)
+    } else if let Some(s) = trimmed.strip_suffix('h') {
+        (s, 3_600)
+    } else if let Some(s) = trimmed.strip_suffix('d') {
+        (s, 86_400)
+    } else {
+        return Err(format!(
+            "invalid duration {input:?} — must end with s/m/h/d (e.g. 24h, 7d, 30m, 30s)"
+        ));
+    };
+    let n: u64 = num_str
+        .parse()
+        .map_err(|e| format!("invalid duration number in {input:?}: {e}"))?;
+    n.checked_mul(multiplier_secs)
+        .ok_or_else(|| format!("duration {input:?} overflows u64 seconds"))
+}
+
+/// Validate `#RRGGBB` or `#RGB` style hex colours.
+fn validate_hex_color(input: &str) -> Result<(), String> {
+    let Some(rest) = input.strip_prefix('#') else {
+        return Err(format!("expected leading '#'; got {input:?}"));
+    };
+    if !matches!(rest.len(), 3 | 6) {
+        return Err(format!("{input:?} must be 3 or 6 hex digits after '#'"));
+    }
+    if !rest.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(format!("{input:?} contains non-hex characters"));
+    }
     Ok(())
 }
 
@@ -159,5 +240,89 @@ mod tests {
     fn extract_refs_handles_whitespace() {
         assert_eq!(extract_variable_refs("{{  spaced  }}"), vec!["spaced"]);
         assert_eq!(extract_variable_refs("{{no_space}}"), vec!["no_space"]);
+    }
+
+    #[test]
+    fn parse_invite_duration_accepts_units() {
+        assert_eq!(parse_invite_duration("30s"), Ok(30));
+        assert_eq!(parse_invite_duration("5m"), Ok(300));
+        assert_eq!(parse_invite_duration("24h"), Ok(86_400));
+        assert_eq!(parse_invite_duration("7d"), Ok(604_800));
+        assert_eq!(parse_invite_duration(" 12h "), Ok(43_200));
+    }
+
+    #[test]
+    fn parse_invite_duration_rejects_garbage() {
+        assert!(parse_invite_duration("").is_err());
+        assert!(parse_invite_duration("24").is_err());
+        assert!(parse_invite_duration("ten h").is_err());
+        assert!(parse_invite_duration("forever").is_err());
+    }
+
+    #[test]
+    fn hex_color_accepts_standard_forms() {
+        assert!(validate_hex_color("#abc").is_ok());
+        assert!(validate_hex_color("#ABCDEF").is_ok());
+        assert!(validate_hex_color("#123456").is_ok());
+    }
+
+    #[test]
+    fn hex_color_rejects_garbage() {
+        assert!(validate_hex_color("abc").is_err());
+        assert!(validate_hex_color("#abcd").is_err());
+        assert!(validate_hex_color("#xyz").is_err());
+        assert!(validate_hex_color("rgb(1,2,3)").is_err());
+    }
+
+    #[test]
+    fn invites_block_validates_coherence() {
+        let toml_src = r##"
+schema-version = 1
+
+[distro]
+id = "tenancy-demo"
+name = "Tenancy"
+version = "0.1.0"
+
+[[capsule]]
+name = "astrid-capsule-cli"
+source = "@unicity-astrid/capsule-cli"
+version = "0.7.0"
+role = "uplink"
+
+[invites]
+issuers = ["admin"]
+"##;
+        let manifest: DistroManifest =
+            toml::from_str(toml_src).expect("manifest should parse syntactically");
+        let err = validate_manifest(&manifest).expect_err("missing default-group must reject");
+        assert!(
+            err.to_string().contains("default-group is unset"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn branding_accepts_well_formed_colors() {
+        let toml_src = r##"
+schema-version = 1
+
+[distro]
+id = "branded"
+name = "Branded"
+version = "0.1.0"
+
+[[capsule]]
+name = "astrid-capsule-cli"
+source = "@unicity-astrid/capsule-cli"
+version = "0.7.0"
+role = "uplink"
+
+[branding]
+primary-color = "#ff8800"
+accent-color = "#abc"
+"##;
+        let manifest: DistroManifest = toml::from_str(toml_src).unwrap();
+        validate_manifest(&manifest).expect("branding accepts hex colours");
     }
 }

@@ -209,7 +209,7 @@ pub(crate) async fn run(cfg: HeadlessConfig<'_>) -> anyhow::Result<()> {
         start_time: Instant::now(),
         dots: 0,
     };
-    cfg.client.send_input(cfg.prompt.to_string()).await?;
+    crate::socket_client::send_input_as_active_agent(cfg.client, cfg.prompt.to_string()).await?;
     snapshot(&mut terminal, &mut app, "input_sent");
 
     let timeout = Duration::from_secs(120);

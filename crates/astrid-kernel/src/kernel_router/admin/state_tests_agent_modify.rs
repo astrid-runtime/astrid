@@ -34,7 +34,10 @@ fn assert_success(res: &AdminResponseBody) {
         AdminResponseBody::Success(_)
         | AdminResponseBody::Quotas(_)
         | AdminResponseBody::AgentList(_)
-        | AdminResponseBody::GroupList(_) => {},
+        | AdminResponseBody::GroupList(_)
+        | AdminResponseBody::Invite(_)
+        | AdminResponseBody::InviteRedeemed(_)
+        | AdminResponseBody::InviteList(_) => {},
         AdminResponseBody::Error(msg) => panic!("expected success, got Error: {msg}"),
     }
 }

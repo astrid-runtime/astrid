@@ -100,6 +100,24 @@ pub(super) async fn dispatch(
             principal,
             capabilities,
         } => mutate_caps(kernel, &principal, capabilities, CapsMutation::Revoke).await,
+        AdminRequestKind::InviteIssue {
+            group,
+            expires_secs,
+            max_uses,
+            metadata,
+        } => {
+            super::invite_handlers::invite_issue(kernel, group, expires_secs, max_uses, metadata)
+                .await
+        },
+        AdminRequestKind::InviteRedeem {
+            token,
+            public_key,
+            display_name,
+        } => super::invite_handlers::invite_redeem(kernel, token, public_key, display_name).await,
+        AdminRequestKind::InviteList => super::invite_handlers::invite_list(kernel).await,
+        AdminRequestKind::InviteRevoke { token } => {
+            super::invite_handlers::invite_revoke(kernel, token).await
+        },
     }
 }
 

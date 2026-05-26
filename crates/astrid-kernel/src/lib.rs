@@ -11,6 +11,8 @@
 //! is to instantiate `astrid_events::EventBus`, load `.capsule` files into
 //! the Extism sandbox, and route IPC bytes between them.
 
+/// Persistent invite-token store (issue #756).
+pub mod invite;
 /// The Management API router listening to the `EventBus`.
 pub mod kernel_router;
 /// The Unix Domain Socket manager.

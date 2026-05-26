@@ -24,6 +24,7 @@
 #[cfg(test)]
 mod enforcement_tests;
 mod handlers;
+mod invite_handlers;
 #[cfg(test)]
 mod state_tests;
 #[cfg(test)]
@@ -136,7 +137,11 @@ pub fn resolve_admin_scope(req: &AdminRequestKind, caller: &PrincipalId) -> Auth
         | AdminRequestKind::GroupDelete { .. }
         | AdminRequestKind::GroupModify { .. }
         | AdminRequestKind::CapsGrant { .. }
-        | AdminRequestKind::CapsRevoke { .. } => AuthorityScope::Global,
+        | AdminRequestKind::CapsRevoke { .. }
+        | AdminRequestKind::InviteIssue { .. }
+        | AdminRequestKind::InviteRedeem { .. }
+        | AdminRequestKind::InviteList
+        | AdminRequestKind::InviteRevoke { .. } => AuthorityScope::Global,
     }
 }
 
@@ -173,6 +178,17 @@ pub fn required_capability_for_admin_request(
         (AdminRequestKind::GroupList, AuthorityScope::Global) => "group:list",
         (AdminRequestKind::CapsGrant { .. }, _) => "caps:grant",
         (AdminRequestKind::CapsRevoke { .. }, _) => "caps:revoke",
+        (AdminRequestKind::InviteIssue { .. }, _) => "invite:issue",
+        // `InviteRedeem` is special-cased in `handle_admin_request`
+        // below — the dispatcher bypasses the capability preamble
+        // because the caller principal does not exist yet (the token
+        // IS the auth). The string returned here is unused for that
+        // variant but kept for completeness so audit records still
+        // carry a stable name. We pick `invite:redeem` rather than
+        // leaving it blank so the audit log reads cleanly.
+        (AdminRequestKind::InviteRedeem { .. }, _) => "invite:redeem",
+        (AdminRequestKind::InviteList, _) => "invite:list",
+        (AdminRequestKind::InviteRevoke { .. }, _) => "invite:revoke",
     }
 }
 
@@ -195,7 +211,40 @@ pub fn admin_request_method(req: &AdminRequestKind) -> &'static str {
         AdminRequestKind::GroupList => "admin.group.list",
         AdminRequestKind::CapsGrant { .. } => "admin.caps.grant",
         AdminRequestKind::CapsRevoke { .. } => "admin.caps.revoke",
+        AdminRequestKind::InviteIssue { .. } => "admin.invite.issue",
+        AdminRequestKind::InviteRedeem { .. } => "admin.invite.redeem",
+        AdminRequestKind::InviteList => "admin.invite.list",
+        AdminRequestKind::InviteRevoke { .. } => "admin.invite.revoke",
     }
+}
+
+/// Serialise an [`AdminRequestKind`] for audit storage with sensitive
+/// fields redacted. Keeps the wire-name shape so audit consumers can
+/// still discriminate variants — only the secret-bearing fields are
+/// dropped.
+///
+/// Today the only redaction is `InviteRedeem.public_key`: storing the
+/// raw ed25519 key in the audit log doubles the system of record for
+/// authorization, which Layer 5/6 treat as `AuthConfig.public_keys`
+/// alone. The audit row keeps the SHA-256 fingerprint of the key so an
+/// auditor can still bind the redemption to a registered key after
+/// the fact.
+fn sanitize_admin_audit_params(req: &AdminRequestKind) -> Option<serde_json::Value> {
+    let mut val = serde_json::to_value(req).ok()?;
+    if let AdminRequestKind::InviteRedeem { public_key, .. } = req
+        && let Some(obj) = val
+            .as_object_mut()
+            .and_then(|m| m.get_mut("params"))
+            .and_then(|p| p.as_object_mut())
+    {
+        let fp = invite_handlers::fingerprint_public_key(public_key);
+        obj.remove("public_key");
+        obj.insert(
+            "public_key_fingerprint".to_string(),
+            serde_json::Value::String(fp),
+        );
+    }
+    Some(val)
 }
 
 /// Borrow the target principal for audit purposes — `Some` only when the
@@ -216,7 +265,11 @@ pub fn admin_target_principal(req: &AdminRequestKind) -> Option<&PrincipalId> {
         | AdminRequestKind::GroupCreate { .. }
         | AdminRequestKind::GroupDelete { .. }
         | AdminRequestKind::GroupModify { .. }
-        | AdminRequestKind::GroupList => None,
+        | AdminRequestKind::GroupList
+        | AdminRequestKind::InviteIssue { .. }
+        | AdminRequestKind::InviteRedeem { .. }
+        | AdminRequestKind::InviteList
+        | AdminRequestKind::InviteRevoke { .. } => None,
     }
 }
 
@@ -234,8 +287,42 @@ async fn handle_admin_request(
     let target = admin_target_principal(&req.kind).cloned();
     // Capture the params field for the audit entry — clients submitting
     // malformed JSON never reach this point, so serialization is
-    // infallible for shapes we accept.
-    let audit_params = serde_json::to_value(&req.kind).ok();
+    // infallible for shapes we accept. We strip the `public_key` field
+    // out of `InviteRedeem` payloads before storing because the audit
+    // shouldn't permanently embed an ed25519 key that a verifier might
+    // later mistake for a system-of-record entry — the canonical copy
+    // lives on `AuthConfig.public_keys`.
+    let audit_params = sanitize_admin_audit_params(&req.kind);
+
+    // `InviteRedeem` is the one variant that bypasses the capability
+    // preamble: the redeemer's principal does not exist yet at the
+    // moment the request arrives — the token IS the auth. The handler
+    // verifies the token internally and either mints a principal or
+    // rejects the request. Every redeem still produces an audit row
+    // (allow OR deny) below.
+    if matches!(req.kind, AdminRequestKind::InviteRedeem { .. }) {
+        record_admin_audit(
+            kernel,
+            AdminAuditEntry {
+                caller: &caller,
+                method,
+                required_cap,
+                target_principal: None,
+                params: audit_params.clone(),
+                authorization: AuthorizationProof::System {
+                    reason: "invite-redeem: token is the auth".to_string(),
+                },
+                outcome: AuditOutcome::success(),
+            },
+        );
+        let body = handlers::dispatch(kernel, req.kind).await;
+        publish_response(
+            kernel,
+            response_topic,
+            AdminKernelResponse::for_request(request_id, body),
+        );
+        return;
+    }
 
     match authorize_request(kernel, &caller, required_cap) {
         Ok(()) => {
