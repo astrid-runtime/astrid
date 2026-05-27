@@ -14,17 +14,20 @@ use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::{Request, StatusCode};
 use serde::{Deserialize, Serialize};
+use utoipa::ToSchema;
 
-use crate::error::{GatewayError, GatewayResult};
+use crate::error::{ErrorBody, GatewayError, GatewayResult};
 use crate::routes::principals::{caller_from, daemon_internal, read_json_body, unexpected};
 use crate::state::GatewayState;
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct GroupListResponse {
+    /// `GroupSummary` shape: `{ name, capabilities, description?, unsafe_admin, built_in }`.
+    #[schema(value_type = Vec<serde_json::Value>)]
     pub groups: Vec<GroupSummary>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, ToSchema)]
 pub struct CreateGroupRequest {
     pub name: String,
     pub capabilities: Vec<String>,
@@ -35,7 +38,7 @@ pub struct CreateGroupRequest {
     pub unsafe_admin: bool,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, ToSchema)]
 pub struct ModifyGroupRequest {
     /// Replace the capability list. `None` keeps the existing list.
     #[serde(default)]
@@ -50,6 +53,16 @@ pub struct ModifyGroupRequest {
     pub unsafe_admin: Option<bool>,
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/sys/groups",
+    tag = "groups",
+    responses(
+        (status = 200, body = GroupListResponse, description = "All capability groups."),
+        (status = 401, body = ErrorBody),
+        (status = 403, body = ErrorBody, description = "Caller lacks `group:list`."),
+    )
+)]
 pub async fn list_groups(
     State(_state): State<Arc<GatewayState>>,
     req: Request<axum::body::Body>,
@@ -69,6 +82,17 @@ pub async fn list_groups(
     }
 }
 
+#[utoipa::path(
+    post,
+    path = "/api/sys/groups",
+    tag = "groups",
+    request_body = CreateGroupRequest,
+    responses(
+        (status = 200, description = "Group created.", content_type = "application/json"),
+        (status = 401, body = ErrorBody),
+        (status = 403, body = ErrorBody, description = "Caller lacks `group:create`, or wildcard cap without `unsafe_admin: true`."),
+    )
+)]
 pub async fn create_group(
     State(_state): State<Arc<GatewayState>>,
     req: Request<axum::body::Body>,
@@ -94,6 +118,18 @@ pub async fn create_group(
     }
 }
 
+#[utoipa::path(
+    patch,
+    path = "/api/sys/groups/{name}",
+    tag = "groups",
+    params(("name" = String, Path, description = "Group name")),
+    request_body = ModifyGroupRequest,
+    responses(
+        (status = 200, description = "Group updated.", content_type = "application/json"),
+        (status = 401, body = ErrorBody),
+        (status = 403, body = ErrorBody, description = "Caller lacks `group:modify`, or the group is built-in."),
+    )
+)]
 pub async fn modify_group(
     State(_state): State<Arc<GatewayState>>,
     Path(name): Path<String>,
@@ -120,6 +156,17 @@ pub async fn modify_group(
     }
 }
 
+#[utoipa::path(
+    delete,
+    path = "/api/sys/groups/{name}",
+    tag = "groups",
+    params(("name" = String, Path, description = "Group name")),
+    responses(
+        (status = 204, description = "Group deleted."),
+        (status = 401, body = ErrorBody),
+        (status = 403, body = ErrorBody, description = "Caller lacks `group:delete`, or the group is built-in."),
+    )
+)]
 pub async fn delete_group(
     State(_state): State<Arc<GatewayState>>,
     Path(name): Path<String>,

@@ -7,8 +7,35 @@
 use axum::Json;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
+use serde::Serialize;
 use serde_json::json;
 use thiserror::Error;
+use utoipa::ToSchema;
+
+/// Documentation-only shape of every error body the gateway returns.
+///
+/// The `IntoResponse` impl on [`GatewayError`] still builds bodies via
+/// `serde_json::json!(...)` (it has been wire-stable since the
+/// gateway shipped); this struct lists the **same fields** so `OpenAPI`
+/// clients can target one error type instead of inventing variants
+/// per status code. Fields beyond `error` are present only on the
+/// error kinds that need them: `reason` on forbidden / bad-request /
+/// kernel errors, `retry_after_secs` on rate-limited responses.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ErrorBody {
+    /// Machine-readable error tag. One of: `unauthorized`,
+    /// `forbidden`, `bad_request`, `not_found`, `rate_limited`,
+    /// `kernel`, `internal`.
+    #[schema(example = "forbidden")]
+    pub error: String,
+    /// Human-readable reason. Present on `forbidden`, `bad_request`,
+    /// `kernel`. Absent on `unauthorized`, `not_found`, `internal`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// Suggested back-off in seconds. Present only on `rate_limited`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retry_after_secs: Option<u64>,
+}
 
 /// Typed gateway error. Each variant carries the operator-facing
 /// message; internal context is logged at warn/error instead of

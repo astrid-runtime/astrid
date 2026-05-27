@@ -27,6 +27,16 @@ use crate::state::GatewayState;
 /// `GET /healthz` — 200 if the daemon socket file is reachable,
 /// 503 otherwise. Pure liveness probe; no IPC round-trip so it
 /// stays fast under load.
+#[utoipa::path(
+    get,
+    path = "/healthz",
+    tag = "ops",
+    security(()),
+    responses(
+        (status = 200, description = "Daemon socket reachable. Body is the literal text `ok\\n`.", content_type = "text/plain"),
+        (status = 503, description = "Daemon socket unreachable.", content_type = "text/plain"),
+    )
+)]
 pub async fn get_healthz(State(_state): State<Arc<GatewayState>>) -> Response {
     let healthy = match AstridHome::resolve() {
         Ok(home) => home.socket_path().exists(),
@@ -48,6 +58,15 @@ pub async fn get_healthz(State(_state): State<Arc<GatewayState>>) -> Response {
 }
 
 /// `GET /metrics` — Prometheus text-exposition format.
+#[utoipa::path(
+    get,
+    path = "/metrics",
+    tag = "ops",
+    security(()),
+    responses(
+        (status = 200, description = "Prometheus text-exposition format (version 0.0.4). Counters: `astrid_gateway_requests_total{method,route}`, `astrid_gateway_auth_failures_total`, `astrid_gateway_redeem_attempts_total`, `astrid_gateway_redeem_rate_limited_total`.", content_type = "text/plain"),
+    )
+)]
 pub async fn get_metrics(State(state): State<Arc<GatewayState>>) -> Response {
     let body = state.metrics.render().await;
     Response::builder()

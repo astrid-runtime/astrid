@@ -45,6 +45,7 @@ pub mod auth;
 pub mod config;
 pub mod error;
 pub mod metrics;
+pub mod openapi;
 pub mod routes;
 pub mod state;
 

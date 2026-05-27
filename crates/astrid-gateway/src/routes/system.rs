@@ -13,10 +13,20 @@ use axum::Json;
 use axum::extract::State;
 use axum::http::{Request, StatusCode};
 
-use crate::error::{GatewayError, GatewayResult};
+use crate::error::{ErrorBody, GatewayError, GatewayResult};
 use crate::routes::principals::caller_from;
 use crate::state::GatewayState;
 
+#[utoipa::path(
+    get,
+    path = "/api/sys/status",
+    tag = "system",
+    responses(
+        (status = 200, description = "`DaemonStatus` JSON shape: `{ pid, started_at, uptime_secs, active_connections, ephemeral, capsules: { loaded, failed }, session_id }`.", content_type = "application/json"),
+        (status = 401, body = ErrorBody),
+        (status = 403, body = ErrorBody, description = "Caller lacks `system:status`."),
+    )
+)]
 pub async fn get_status(
     State(_state): State<Arc<GatewayState>>,
     req: Request<axum::body::Body>,
@@ -38,6 +48,16 @@ pub async fn get_status(
     }
 }
 
+#[utoipa::path(
+    post,
+    path = "/api/sys/capsules/reload",
+    tag = "system",
+    responses(
+        (status = 204, description = "Capsules reloaded."),
+        (status = 401, body = ErrorBody),
+        (status = 403, body = ErrorBody, description = "Caller lacks `capsule:reload`."),
+    )
+)]
 pub async fn reload_capsules(
     State(_state): State<Arc<GatewayState>>,
     req: Request<axum::body::Body>,

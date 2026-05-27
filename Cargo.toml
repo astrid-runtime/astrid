@@ -149,6 +149,7 @@ url = "2"
 # The `v4` feature uses `getrandom` under the hood — on host this is
 # the OS RNG, on capsule (wasm32-unknown-unknown) it's routed through
 # `astrid:sys.random-bytes` via the SDK's custom getrandom backend.
+utoipa = { version = "5", features = ["axum_extras"] }
 uuid = { version = "1.0", default-features = false, features = ["v4", "v5", "serde", "rng-getrandom"] }
 walkdir = "2.5"
 wasm-encoder = "0.227"

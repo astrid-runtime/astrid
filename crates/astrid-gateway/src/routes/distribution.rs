@@ -14,6 +14,7 @@ use axum::Json;
 use axum::extract::State;
 use serde::Serialize;
 use serde_json::Value;
+use utoipa::ToSchema;
 
 use crate::error::GatewayError;
 use crate::state::GatewayState;
@@ -37,7 +38,7 @@ impl DistributionInfo {
 }
 
 /// Distribution discovery response.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct DistributionInfo {
     /// `distro.id` from the manifest. `"single-tenant"` when no
     /// distro is configured.
@@ -55,9 +56,19 @@ pub struct DistributionInfo {
     /// registration flow.
     pub invites_enabled: bool,
     /// `[branding]` section, surfaced verbatim. `null` when absent.
+    #[schema(value_type = Option<serde_json::Value>)]
     pub branding: Option<Value>,
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/distribution",
+    tag = "discovery",
+    security(()),
+    responses(
+        (status = 200, body = DistributionInfo, description = "Distribution metadata cached at gateway startup.")
+    )
+)]
 pub async fn get_distribution(State(state): State<Arc<GatewayState>>) -> Json<DistributionInfo> {
     // Distribution metadata is parsed once at startup (see
     // `GatewayState::new`). Cloning the pre-parsed struct is orders
@@ -72,18 +83,27 @@ pub async fn get_distribution(State(state): State<Arc<GatewayState>>) -> Json<Di
 /// data via `astrid init`; the dashboard mirrors it here so a
 /// freshly-redeemed principal can immediately fill in their copy
 /// without a CLI roundtrip.
+#[utoipa::path(
+    get,
+    path = "/api/distribution/onboarding",
+    tag = "discovery",
+    security(()),
+    responses(
+        (status = 200, body = OnboardingFields, description = "Distro `[variables]` rendered into dashboard onboarding hints.")
+    )
+)]
 pub async fn get_onboarding(State(state): State<Arc<GatewayState>>) -> Json<OnboardingFields> {
     Json((*state.onboarding).clone())
 }
 
 /// Subset of `[variables]` surfaced to the dashboard.
-#[derive(Debug, Clone, Default, Serialize)]
+#[derive(Debug, Clone, Default, Serialize, ToSchema)]
 pub struct OnboardingFields {
     /// One entry per `[variables.<name>]` block.
     pub fields: Vec<OnboardingField>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct OnboardingField {
     /// Variable name (matches `[variables.<name>]`).
     pub key: String,

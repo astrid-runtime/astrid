@@ -48,15 +48,16 @@ use axum::extract::{Path, State};
 use axum::http::{Request, StatusCode};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use utoipa::ToSchema;
 
-use crate::error::{GatewayError, GatewayResult};
+use crate::error::{ErrorBody, GatewayError, GatewayResult};
 use crate::routes::principals::caller_from;
 use crate::state::GatewayState;
 
 /// Subset of `Capsule.toml [env.<field>]` surfaced to the dashboard.
 /// Drops the operator-only `scope` field (kernel enforces that via
 /// `skip_deserializing`); everything else is verbatim.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct EnvFieldSchema {
     /// `"text"`, `"secret"`, `"select"`, or `"array"`.
     #[serde(rename = "type")]
@@ -66,6 +67,7 @@ pub struct EnvFieldSchema {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub request: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(value_type = Option<serde_json::Value>)]
     pub default: Option<serde_json::Value>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub enum_values: Vec<String>,
@@ -73,13 +75,13 @@ pub struct EnvFieldSchema {
     pub placeholder: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct EnvSchemaResponse {
     pub capsule_id: String,
     pub fields: HashMap<String, EnvFieldSchema>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, ToSchema)]
 pub struct EnvWriteRequest {
     /// The value to set. For `array`-typed fields this is one
     /// element appended to the existing array; the existing list
@@ -88,6 +90,17 @@ pub struct EnvWriteRequest {
 }
 
 /// `GET /api/capsules/{id}/env` — env schema from `Capsule.toml`.
+#[utoipa::path(
+    get,
+    path = "/api/capsules/{id}/env",
+    tag = "env",
+    params(("id" = String, Path, description = "Capsule id")),
+    responses(
+        (status = 200, body = EnvSchemaResponse, description = "Env schema declared in `Capsule.toml`."),
+        (status = 401, body = ErrorBody),
+        (status = 404, body = ErrorBody, description = "Unknown capsule id."),
+    )
+)]
 pub async fn get_env_schema(
     State(_state): State<Arc<GatewayState>>,
     Path(capsule_id): Path<String>,
@@ -103,6 +116,22 @@ pub async fn get_env_schema(
 
 /// `POST /api/capsules/{id}/env/{field}` — write the value for the
 /// authenticated principal.
+#[utoipa::path(
+    post,
+    path = "/api/capsules/{id}/env/{field}",
+    tag = "env",
+    params(
+        ("id" = String, Path, description = "Capsule id"),
+        ("field" = String, Path, description = "Env field name from the capsule's schema"),
+    ),
+    request_body = EnvWriteRequest,
+    responses(
+        (status = 204, description = "Value persisted to the caller's scope."),
+        (status = 400, body = ErrorBody, description = "Malformed value or empty body."),
+        (status = 401, body = ErrorBody),
+        (status = 404, body = ErrorBody, description = "Unknown capsule id, or field not declared in the schema."),
+    )
+)]
 pub async fn write_env(
     State(_state): State<Arc<GatewayState>>,
     Path((capsule_id, field)): Path<(String, String)>,

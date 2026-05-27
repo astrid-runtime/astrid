@@ -16,12 +16,13 @@ use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::{Request, StatusCode};
 use serde::Deserialize;
+use utoipa::ToSchema;
 
-use crate::error::{GatewayError, GatewayResult};
+use crate::error::{ErrorBody, GatewayError, GatewayResult};
 use crate::routes::principals::{caller_from, daemon_internal, read_json_body, unexpected};
 use crate::state::GatewayState;
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, ToSchema)]
 pub struct GrantRequest {
     /// Colon-delimited capability patterns to append.
     pub capabilities: Vec<String>,
@@ -32,7 +33,7 @@ pub struct GrantRequest {
     pub unsafe_admin: bool,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, ToSchema)]
 pub struct RevokeRequest {
     /// Capability patterns to add to the principal's `revokes` vec.
     /// Safe to call on caps the principal does not currently hold
@@ -40,6 +41,18 @@ pub struct RevokeRequest {
     pub capabilities: Vec<String>,
 }
 
+#[utoipa::path(
+    post,
+    path = "/api/sys/principals/{id}/caps",
+    tag = "caps",
+    params(("id" = String, Path, description = "Target principal id")),
+    request_body = GrantRequest,
+    responses(
+        (status = 200, description = "Grants appended.", content_type = "application/json"),
+        (status = 401, body = ErrorBody),
+        (status = 403, body = ErrorBody, description = "Caller lacks `caps:grant`, or `*` pattern without `unsafe_admin: true`."),
+    )
+)]
 pub async fn grant_caps(
     State(_state): State<Arc<GatewayState>>,
     Path(id): Path<String>,
@@ -67,6 +80,18 @@ pub async fn grant_caps(
     }
 }
 
+#[utoipa::path(
+    delete,
+    path = "/api/sys/principals/{id}/caps",
+    tag = "caps",
+    params(("id" = String, Path, description = "Target principal id")),
+    request_body = RevokeRequest,
+    responses(
+        (status = 204, description = "Revokes appended."),
+        (status = 401, body = ErrorBody),
+        (status = 403, body = ErrorBody, description = "Caller lacks `caps:revoke`."),
+    )
+)]
 pub async fn revoke_caps(
     State(_state): State<Arc<GatewayState>>,
     Path(id): Path<String>,

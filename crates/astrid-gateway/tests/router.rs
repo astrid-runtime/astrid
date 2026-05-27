@@ -218,3 +218,110 @@ async fn caller_context_is_attached_to_extensions_for_authed_routes() {
     let caller = verify_bearer(&state, &bearer).expect("verify");
     let _: CallerContext = caller; // type-asserts the public shape
 }
+
+#[tokio::test]
+async fn openapi_route_serves_valid_spec_unauthenticated() {
+    // The spec is the contract clients read before they have a
+    // bearer — codegen tools, dashboards, Swagger UI all need it
+    // without auth. Verify it returns 200 with a parseable
+    // OpenAPI 3.x document and that the canary routes are listed.
+    let state = fresh_state_with_distro(None);
+    let router = routes::build(state);
+
+    let req = Request::builder()
+        .uri("/api/openapi.json")
+        .body(Body::empty())
+        .unwrap();
+    let resp = router.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+    let doc: serde_json::Value = serde_json::from_slice(&bytes).expect("openapi must be JSON");
+
+    assert!(
+        doc.get("openapi").and_then(|v| v.as_str()).is_some(),
+        "spec must declare an OpenAPI version"
+    );
+    let paths = doc
+        .get("paths")
+        .and_then(|v| v.as_object())
+        .expect("spec must declare paths");
+    for canary in [
+        "/api/auth/redeem",
+        "/api/auth/me",
+        "/api/sys/principals",
+        "/api/sys/capabilities",
+        "/api/capsules",
+        "/api/events",
+        "/healthz",
+        "/metrics",
+    ] {
+        assert!(paths.contains_key(canary), "missing path: {canary}");
+    }
+
+    // Bearer auth scheme must be declared.
+    let schemes = doc
+        .get("components")
+        .and_then(|v| v.get("securitySchemes"))
+        .and_then(|v| v.as_object())
+        .expect("spec must declare security schemes");
+    assert!(schemes.contains_key("bearerAuth"));
+}
+
+#[test]
+fn openapi_lists_every_router_route() {
+    // Drift-check: the route registered in `routes::build` and the
+    // path annotated with `#[utoipa::path(...)]` must agree. If
+    // someone wires a new route into the router but forgets the
+    // utoipa annotation (or forgets to add it under `paths(...)` in
+    // the `ApiDoc` macro), this test catches it before review.
+    use astrid_gateway::openapi::ApiDoc;
+    use utoipa::OpenApi;
+
+    // Every concrete `/api` route the router exposes. Update this
+    // list when you add a route; the spec must contain a matching
+    // entry under each.
+    const ROUTER_PATHS: &[&str] = &[
+        // Public
+        "/api/distribution",
+        "/api/distribution/onboarding",
+        "/api/auth/redeem",
+        "/api/auth/pair-device/redeem",
+        "/api/openapi.json",
+        "/healthz",
+        "/metrics",
+        // Authed
+        "/api/auth/me",
+        "/api/auth/refresh",
+        "/api/auth/pair-device",
+        "/api/sys/principals",
+        "/api/sys/principals/{id}",
+        "/api/sys/principals/{id}/enable",
+        "/api/sys/principals/{id}/disable",
+        "/api/sys/principals/{id}/caps",
+        "/api/sys/principals/{id}/quotas",
+        "/api/sys/groups",
+        "/api/sys/groups/{name}",
+        "/api/sys/invites",
+        "/api/sys/invites/{fingerprint}",
+        "/api/sys/capabilities",
+        "/api/capsules",
+        "/api/capsules/{id}",
+        "/api/capsules/{id}/topics",
+        "/api/capsules/{id}/env",
+        "/api/capsules/{id}/env/{field}",
+        "/api/events",
+        "/api/sys/status",
+        "/api/sys/capsules/reload",
+    ];
+
+    let doc = ApiDoc::openapi();
+    let spec_paths: std::collections::HashSet<&str> =
+        doc.paths.paths.keys().map(String::as_str).collect();
+
+    for p in ROUTER_PATHS {
+        assert!(
+            spec_paths.contains(p),
+            "router path {p} is not in the OpenAPI spec — annotate the handler with #[utoipa::path(...)] and list it under paths(...) in ApiDoc"
+        );
+    }
+}

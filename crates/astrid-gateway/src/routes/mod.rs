@@ -43,7 +43,12 @@ pub fn build(state: Arc<GatewayState>) -> Router {
         // balancers and Prometheus scrapers don't need a bearer.
         // Restrict by network policy (reverse proxy / firewall).
         .route("/healthz", get(observability::get_healthz))
-        .route("/metrics", get(observability::get_metrics));
+        .route("/metrics", get(observability::get_metrics))
+        // OpenAPI: unauthenticated by design — the spec is the
+        // contract the API publishes about itself, and clients
+        // (dashboards, codegen tools) read it before they have
+        // a bearer.
+        .route("/api/openapi.json", get(crate::openapi::get_openapi));
 
     // Authenticated routes — bearer required, principal attached to
     // request extensions.

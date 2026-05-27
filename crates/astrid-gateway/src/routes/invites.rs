@@ -13,12 +13,13 @@ use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::{Request, StatusCode};
 use serde::{Deserialize, Serialize};
+use utoipa::ToSchema;
 
 use crate::auth::CallerContext;
-use crate::error::{GatewayError, GatewayResult};
+use crate::error::{ErrorBody, GatewayError, GatewayResult};
 use crate::state::GatewayState;
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, ToSchema)]
 pub struct IssueRequest {
     pub group: String,
     #[serde(default)]
@@ -28,11 +29,24 @@ pub struct IssueRequest {
     pub metadata: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct IssueResponse {
+    /// `InviteIssued` shape: `{ token, group, remaining_uses, expires_at_epoch?, fingerprint, metadata? }`.
+    #[schema(value_type = serde_json::Value)]
     pub invite: InviteIssued,
 }
 
+#[utoipa::path(
+    post,
+    path = "/api/sys/invites",
+    tag = "invites",
+    request_body = IssueRequest,
+    responses(
+        (status = 200, body = IssueResponse, description = "Invite minted; opaque token returned once — store it securely."),
+        (status = 401, body = ErrorBody),
+        (status = 403, body = ErrorBody, description = "Caller lacks `invite:issue`."),
+    )
+)]
 pub async fn issue_invite(
     State(_state): State<Arc<GatewayState>>,
     req: Request<axum::body::Body>,
@@ -72,11 +86,23 @@ pub async fn issue_invite(
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct ListResponse {
+    /// `InviteSummary` shape: `{ fingerprint, group, remaining_uses, expires_at_epoch?, metadata? }`.
+    #[schema(value_type = Vec<serde_json::Value>)]
     pub invites: Vec<InviteSummary>,
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/sys/invites",
+    tag = "invites",
+    responses(
+        (status = 200, body = ListResponse, description = "Outstanding invites — fingerprints only, not raw tokens."),
+        (status = 401, body = ErrorBody),
+        (status = 403, body = ErrorBody, description = "Caller lacks `invite:list`."),
+    )
+)]
 pub async fn list_invites(
     State(_state): State<Arc<GatewayState>>,
     req: Request<axum::body::Body>,
@@ -102,6 +128,18 @@ pub async fn list_invites(
     }
 }
 
+#[utoipa::path(
+    delete,
+    path = "/api/sys/invites/{fingerprint}",
+    tag = "invites",
+    params(("fingerprint" = String, Path, description = "SHA-256 fingerprint from a prior `IssueResponse` / list entry")),
+    responses(
+        (status = 204, description = "Invite revoked."),
+        (status = 401, body = ErrorBody),
+        (status = 403, body = ErrorBody, description = "Caller lacks `invite:revoke`."),
+        (status = 404, body = ErrorBody, description = "No invite matches the fingerprint."),
+    )
+)]
 pub async fn revoke_invite(
     State(_state): State<Arc<GatewayState>>,
     Path(fingerprint): Path<String>,

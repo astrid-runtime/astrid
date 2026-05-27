@@ -16,16 +16,32 @@ use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::Request;
 use serde::Deserialize;
+use utoipa::ToSchema;
 
-use crate::error::{GatewayError, GatewayResult};
+use crate::error::{ErrorBody, GatewayError, GatewayResult};
 use crate::routes::principals::{caller_from, daemon_internal, read_json_body, unexpected};
 use crate::state::GatewayState;
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, ToSchema)]
 pub struct QuotaRequest {
+    /// Resource ceilings (`Quotas` from `astrid_core::profile`). All
+    /// fields optional — omitted ones keep their current value.
+    #[schema(value_type = serde_json::Value)]
     pub quotas: Quotas,
 }
 
+#[utoipa::path(
+    get,
+    path = "/api/sys/principals/{id}/quotas",
+    tag = "quotas",
+    params(("id" = String, Path, description = "Target principal id")),
+    responses(
+        (status = 200, description = "`Quotas` JSON shape.", content_type = "application/json"),
+        (status = 401, body = ErrorBody),
+        (status = 403, body = ErrorBody, description = "Caller lacks `quota:get` / `self:quota:get`."),
+        (status = 404, body = ErrorBody),
+    )
+)]
 pub async fn get_quotas(
     State(_state): State<Arc<GatewayState>>,
     Path(id): Path<String>,
@@ -51,6 +67,19 @@ pub async fn get_quotas(
     }
 }
 
+#[utoipa::path(
+    put,
+    path = "/api/sys/principals/{id}/quotas",
+    tag = "quotas",
+    params(("id" = String, Path, description = "Target principal id")),
+    request_body = QuotaRequest,
+    responses(
+        (status = 200, description = "Quotas updated.", content_type = "application/json"),
+        (status = 401, body = ErrorBody),
+        (status = 403, body = ErrorBody, description = "Caller lacks `quota:set` / `self:quota:set`."),
+        (status = 404, body = ErrorBody),
+    )
+)]
 pub async fn set_quotas(
     State(_state): State<Arc<GatewayState>>,
     Path(id): Path<String>,

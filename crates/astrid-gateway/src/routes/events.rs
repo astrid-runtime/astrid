@@ -41,6 +41,16 @@ const AUDIT_FIREHOSE_CAP: &str = "audit:read_all";
 /// `GET /api/events` — opens a long-lived Server-Sent Events
 /// stream. The connection stays open until the client disconnects
 /// or the daemon shuts down.
+#[utoipa::path(
+    get,
+    path = "/api/events",
+    tag = "audit",
+    responses(
+        (status = 200, description = "Server-Sent Events stream of audit entries. Each event is one of: `event: ready` (initial handshake) or `event: audit` (audit entry, JSON payload). Holders of `audit:read_all` see the firehose; others see only entries whose `principal` matches their own. 15s `event: keep-alive` heartbeat.", content_type = "text/event-stream"),
+        (status = 401, description = "Missing / invalid bearer."),
+        (status = 500, description = "Gateway not wired to a live event bus."),
+    )
+)]
 pub async fn get_events(
     State(state): State<Arc<GatewayState>>,
     req: Request<axum::body::Body>,

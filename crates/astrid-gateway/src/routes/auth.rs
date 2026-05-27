@@ -18,19 +18,22 @@ use axum::Json;
 use axum::extract::{ConnectInfo, State};
 use axum::http::Request;
 use serde::{Deserialize, Serialize};
+use utoipa::ToSchema;
 
 use crate::auth::{CallerContext, mint_bearer};
-use crate::error::{GatewayError, GatewayResult};
+use crate::error::{ErrorBody, GatewayError, GatewayResult};
 use crate::state::GatewayState;
 
 /// Inbound body for `POST /api/auth/redeem`.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, ToSchema)]
 pub struct RedeemRequest {
     /// The opaque token from an `astrid invite issue` (or
     /// dashboard-issued) invite.
+    #[schema(example = "AAAA...")]
     pub token: String,
     /// Hex-encoded ed25519 public key. Bare 64 hex chars or the
     /// `ed25519:<hex>` form.
+    #[schema(example = "ed25519:a1b2c3...")]
     pub public_key: String,
     /// Optional human-friendly name for the new principal.
     #[serde(default)]
@@ -38,9 +41,10 @@ pub struct RedeemRequest {
 }
 
 /// Outbound response for `POST /api/auth/redeem`.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct RedeemResponse {
     /// Freshly minted principal id.
+    #[schema(value_type = String, example = "agent-alice")]
     pub principal: PrincipalId,
     /// Group the new principal joined.
     pub group: String,
@@ -54,9 +58,10 @@ pub struct RedeemResponse {
 }
 
 /// Outbound response for `GET /api/auth/me`.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct MeResponse {
     /// The authenticated principal.
+    #[schema(value_type = String, example = "agent-alice")]
     pub principal: PrincipalId,
     /// Bearer expiry — clients can use this to schedule a refresh.
     pub expires_at_epoch: u64,
@@ -64,6 +69,19 @@ pub struct MeResponse {
 
 /// Handler: redeem an invite token, mint a principal, return a
 /// session bearer.
+#[utoipa::path(
+    post,
+    path = "/api/auth/redeem",
+    tag = "auth",
+    security(()),
+    request_body = RedeemRequest,
+    responses(
+        (status = 200, body = RedeemResponse, description = "New principal minted; session bearer attached."),
+        (status = 400, body = ErrorBody, description = "Malformed token / public key."),
+        (status = 429, body = ErrorBody, description = "Per-IP rate limit hit; respect `retry_after_secs`."),
+        (status = 500, body = ErrorBody, description = "Kernel rejected the redeem or upstream is unreachable."),
+    )
+)]
 pub async fn post_redeem(
     State(state): State<Arc<GatewayState>>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
@@ -128,6 +146,15 @@ pub async fn post_redeem(
 }
 
 /// Handler: reflect the verified caller back to the dashboard.
+#[utoipa::path(
+    get,
+    path = "/api/auth/me",
+    tag = "auth",
+    responses(
+        (status = 200, body = MeResponse, description = "Current session info — principal + expiry."),
+        (status = 401, body = ErrorBody, description = "Missing / invalid bearer."),
+    )
+)]
 pub async fn get_me(req: Request<axum::body::Body>) -> GatewayResult<Json<MeResponse>> {
     let caller: &CallerContext = req
         .extensions()
@@ -140,10 +167,11 @@ pub async fn get_me(req: Request<axum::body::Body>) -> GatewayResult<Json<MeResp
 }
 
 /// Outbound response for `POST /api/auth/refresh`.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct RefreshResponse {
     /// Same principal as the inbound bearer — refresh never
     /// switches identities.
+    #[schema(value_type = String, example = "agent-alice")]
     pub principal: PrincipalId,
     /// Freshly signed bearer.
     pub session_token: String,
@@ -152,7 +180,7 @@ pub struct RefreshResponse {
 }
 
 /// Inbound body for `POST /api/auth/pair-device`.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, ToSchema)]
 pub struct PairDeviceIssueRequest {
     /// Token lifetime in seconds. `None` defaults kernel-side
     /// (typically 5 minutes). Capped at 1 hour kernel-side.
@@ -166,20 +194,22 @@ pub struct PairDeviceIssueRequest {
 
 /// Inbound body for `POST /api/auth/pair-device/redeem`. Unauthenticated
 /// route — the pair-token is the auth.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, ToSchema)]
 pub struct PairDeviceRedeemRequest {
     /// Opaque pair-token from a prior issue.
     pub token: String,
     /// Hex-encoded ed25519 public key. Bare 64 hex or
     /// `ed25519:<hex>`.
+    #[schema(example = "ed25519:a1b2c3...")]
     pub public_key: String,
 }
 
 /// Outbound response for `POST /api/auth/pair-device/redeem` — the
 /// new device's session bearer for the bound principal.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct PairDeviceRedeemResponse {
     /// The principal the new device is now bound to.
+    #[schema(value_type = String, example = "agent-alice")]
     pub principal: PrincipalId,
     /// SHA-256 fingerprint of the registered key.
     pub public_key_fingerprint: String,
@@ -193,6 +223,17 @@ pub struct PairDeviceRedeemResponse {
 /// authenticated caller's principal. Returns the opaque token,
 /// which the caller hands to the new device out-of-band (QR code,
 /// NFC, etc.).
+#[utoipa::path(
+    post,
+    path = "/api/auth/pair-device",
+    tag = "auth",
+    request_body = PairDeviceIssueRequest,
+    responses(
+        (status = 200, description = "Pair-token (single-use, time-limited). Schema mirrors `astrid_core::kernel_api::PairTokenIssued`: `{ token, principal, expires_at_epoch, label? }`.", content_type = "application/json"),
+        (status = 401, body = ErrorBody, description = "Missing / invalid bearer."),
+        (status = 500, body = ErrorBody, description = "Kernel rejected the issue or upstream is unreachable."),
+    )
+)]
 pub async fn post_pair_device_issue(
     State(_state): State<Arc<GatewayState>>,
     req: Request<axum::body::Body>,
@@ -226,6 +267,18 @@ pub async fn post_pair_device_issue(
 /// pair-token is the auth. The kernel registers the supplied key
 /// on the bound principal and the gateway mints a session bearer
 /// so the new device is immediately usable.
+#[utoipa::path(
+    post,
+    path = "/api/auth/pair-device/redeem",
+    tag = "auth",
+    security(()),
+    request_body = PairDeviceRedeemRequest,
+    responses(
+        (status = 200, body = PairDeviceRedeemResponse, description = "Device's key registered; session bearer attached."),
+        (status = 400, body = ErrorBody, description = "Malformed token / public key."),
+        (status = 500, body = ErrorBody, description = "Kernel rejected the redeem or upstream is unreachable."),
+    )
+)]
 pub async fn post_pair_device_redeem(
     State(state): State<Arc<GatewayState>>,
     Json(body): Json<PairDeviceRedeemRequest>,
@@ -281,6 +334,15 @@ pub async fn post_pair_device_redeem(
 /// implies (an attacker without a valid bearer can't reach this
 /// route at all). Per-principal refresh tracking (one outstanding
 /// refresh per principal) is a future hardening if abuse appears.
+#[utoipa::path(
+    post,
+    path = "/api/auth/refresh",
+    tag = "auth",
+    responses(
+        (status = 200, body = RefreshResponse, description = "Re-minted bearer with a fresh expiry."),
+        (status = 401, body = ErrorBody, description = "Missing / invalid bearer."),
+    )
+)]
 pub async fn post_refresh(
     State(state): State<Arc<GatewayState>>,
     req: Request<axum::body::Body>,
