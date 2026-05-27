@@ -87,10 +87,20 @@ pub async fn run(
     info!(addr = %bound, "astrid-gateway listening");
 
     let router = routes::build(state);
-    axum::serve(listener, router)
-        .with_graceful_shutdown(shutdown)
-        .await
-        .context("gateway HTTP server failed")
+    // `into_make_service_with_connect_info::<SocketAddr>()` is what
+    // populates the `ConnectInfo<SocketAddr>` request extension that
+    // `routes::auth::post_redeem` extracts for per-IP rate limiting.
+    // Without it, every redeem fails with a 500 "Missing request
+    // extension". The plain `axum::serve(listener, router)` shape
+    // works for every other route but quietly breaks the redeem
+    // path — caught at runtime by exercising the live daemon.
+    axum::serve(
+        listener,
+        router.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown)
+    .await
+    .context("gateway HTTP server failed")
 }
 
 use std::future::Future;
