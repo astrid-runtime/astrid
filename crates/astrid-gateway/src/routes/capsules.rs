@@ -1,19 +1,32 @@
-//! `/api/capsules` — read-only capsule introspection.
+//! `/api/capsules` — capsule introspection + install.
 //!
 //! The dashboard's "available capsules" view: list, detail,
-//! declared topics. **Install / uninstall are NOT exposed** here —
-//! `KernelRequest::InstallCapsule` is a stub in the kernel today
-//! (returns "Installation logic not yet implemented", see
-//! `kernel_router/mod.rs`) and the actual CLI install path does
-//! file-system ops directly. Wiring a real HTTP install needs the
-//! kernel-side handler to land first; the gateway is purely a
-//! translator. Tracked as a follow-up under #756.
+//! declared topics, install (forward-compatible).
 //!
-//! Routes shipping here:
+//! ## Permission surface
 //!
-//! * `GET /api/capsules` — list of capsule ids
-//! * `GET /api/capsules/{id}` — manifest excerpt (env defs, etc.)
-//! * `GET /api/capsules/{id}/topics` — declared `TopicDef` entries
+//! `POST /api/capsules` exists today, gated by the existing
+//! `capsule:install` capability that's already in
+//! `astrid_core::capability_grammar::KNOWN_CAPABILITIES` and the
+//! kernel's `required_capability` table. Enterprise admins can
+//! grant the cap to a group right now (e.g. a
+//! `capsule-installers` group with
+//! `caps: ["capsule:install"]`); the kernel's cap-gate enforces
+//! it before the handler runs.
+//!
+//! The handler that actually unpacks a `.capsule` archive and
+//! writes it to disk is a stub in the kernel today (`kernel_router/
+//! mod.rs:186-193` returns "Installation logic not yet
+//! implemented"). The route forwards that error verbatim — the
+//! cap-gate still works, the route is reachable, and when the
+//! kernel handler lands no gateway change is needed.
+//!
+//! Routes:
+//!
+//! * `GET  /api/capsules` — list of capsule ids
+//! * `POST /api/capsules` — install (cap-gated, kernel handler currently stubbed)
+//! * `GET  /api/capsules/{id}` — manifest excerpt (env defs, etc.)
+//! * `GET  /api/capsules/{id}/topics` — declared `TopicDef` entries
 
 use std::sync::Arc;
 
@@ -22,7 +35,7 @@ use astrid_uplink::KernelClient;
 use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::Request;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::error::{GatewayError, GatewayResult};
 use crate::routes::principals::caller_from;
@@ -52,6 +65,16 @@ pub struct CapsuleTopicsResponse {
     pub topics: Vec<CapsuleTopic>,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct InstallRequest {
+    /// Source path or package locator (e.g. `@unicity-astrid/capsule-telegram`).
+    pub source: String,
+    /// `true` to install into the workspace-local capsules slot
+    /// instead of the system-wide one.
+    #[serde(default)]
+    pub workspace: bool,
+}
+
 pub async fn list_capsules(
     State(_state): State<Arc<GatewayState>>,
     req: Request<axum::body::Body>,
@@ -77,6 +100,56 @@ pub async fn list_capsules(
         KernelResponse::Error(msg) => Err(GatewayError::Forbidden { reason: msg }),
         other => Err(internal(format!(
             "unexpected response shape for ListCapsules: {other:?}"
+        ))),
+    }
+}
+
+/// `POST /api/capsules` — install a capsule. Cap-gated by
+/// `capsule:install` (or `self:capsule:install` for self-scope) at
+/// the kernel boundary. The kernel handler is currently stubbed
+/// (`Installation logic not yet implemented`) — when it lands, this
+/// route works without modification.
+pub async fn install_capsule(
+    State(_state): State<Arc<GatewayState>>,
+    req: Request<axum::body::Body>,
+) -> GatewayResult<Json<serde_json::Value>> {
+    let caller = caller_from(&req)?.clone();
+    let body: InstallRequest = crate::routes::principals::read_json_body(req).await?;
+    let mut client = KernelClient::connect(caller.principal)
+        .await
+        .map_err(daemon_internal)?;
+    let resp = client
+        .request(KernelRequest::InstallCapsule {
+            source: body.source,
+            workspace: body.workspace,
+        })
+        .await
+        .map_err(daemon_internal)?;
+    match resp {
+        KernelResponse::Success(v) => Ok(Json(v)),
+        // `ApprovalRequired` is the kernel's way of saying "this
+        // capsule wants caps the operator needs to OK out-of-band."
+        // Pass it through with structured fields so the dashboard
+        // can render the approval prompt rather than treating it
+        // as a generic error.
+        KernelResponse::ApprovalRequired {
+            request_id,
+            description,
+            capabilities,
+        } => Ok(Json(serde_json::json!({
+            "status": "approval_required",
+            "request_id": request_id,
+            "description": description,
+            "capabilities": capabilities,
+        }))),
+        // The kernel returns `Error` either for cap-denied (kernel
+        // gate refused) or "Installation logic not yet implemented"
+        // (handler stub). Surface both as 403 Forbidden for the
+        // cap-denied shape; the stub message will read clearly to
+        // operators inspecting the response.
+        KernelResponse::Error(msg) => Err(GatewayError::Forbidden { reason: msg }),
+        other => Err(internal(format!(
+            "unexpected response shape for InstallCapsule: {other:?}"
         ))),
     }
 }

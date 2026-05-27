@@ -81,6 +81,7 @@ pub fn build(state: Arc<GatewayState>) -> Router {
         .route("/api/sys/capabilities", get(principals::list_capabilities))
         // ── Capsules ──
         .route("/api/capsules", get(capsules::list_capsules))
+        .route("/api/capsules", post(capsules::install_capsule))
         .route("/api/capsules/{id}", get(capsules::get_capsule))
         .route(
             "/api/capsules/{id}/topics",
