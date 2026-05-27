@@ -310,6 +310,7 @@ fn openapi_lists_every_router_route() {
         "/api/capsules/{id}/env",
         "/api/capsules/{id}/env/{field}",
         "/api/events",
+        "/api/agent/prompt",
         "/api/sys/status",
         "/api/sys/capsules/reload",
     ];

@@ -102,6 +102,8 @@ use crate::state::GatewayState;
         routes::capsules::list_capsule_topics,
         routes::env::get_env_schema,
         routes::env::write_env,
+        // Agent invocation
+        routes::agent::post_prompt,
         // Audit
         routes::events::get_events,
         // System
@@ -147,6 +149,9 @@ use crate::state::GatewayState;
             routes::capsules::CapsuleTopic,
             routes::capsules::CapsuleTopicsResponse,
             routes::capsules::InstallRequest,
+            // Agent
+            routes::agent::PromptRequest,
+            routes::agent::PromptReady,
             // Env
             routes::env::EnvFieldSchema,
             routes::env::EnvSchemaResponse,
@@ -172,6 +177,7 @@ use crate::state::GatewayState;
         (name = "invites", description = "One-shot onboarding tokens"),
         (name = "capsules", description = "Capsule install + introspection"),
         (name = "env", description = "Per-principal capsule configuration"),
+        (name = "agent", description = "Agent invocation (SSE response stream)"),
         (name = "audit", description = "Audit-event stream (SSE)"),
         (name = "system", description = "Daemon status + lifecycle"),
         (name = "discovery", description = "Pre-auth onboarding hints"),

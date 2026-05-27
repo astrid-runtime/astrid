@@ -12,6 +12,7 @@ use axum::routing::{delete, get, patch, post, put};
 
 use crate::state::GatewayState;
 
+pub mod agent;
 pub mod auth;
 pub mod caps;
 pub mod capsules;
@@ -63,39 +64,39 @@ pub fn build(state: Arc<GatewayState>) -> Router {
         // ── Principals (agents) ──
         .route("/api/sys/principals", get(principals::list_principals))
         .route("/api/sys/principals", post(principals::create_principal))
-        .route("/api/sys/principals/{id}", get(principals::get_principal))
+        .route("/api/sys/principals/:id", get(principals::get_principal))
         .route(
-            "/api/sys/principals/{id}",
+            "/api/sys/principals/:id",
             patch(principals::modify_principal),
         )
         .route(
-            "/api/sys/principals/{id}",
+            "/api/sys/principals/:id",
             delete(principals::delete_principal),
         )
         .route(
-            "/api/sys/principals/{id}/enable",
+            "/api/sys/principals/:id/enable",
             post(principals::enable_principal),
         )
         .route(
-            "/api/sys/principals/{id}/disable",
+            "/api/sys/principals/:id/disable",
             post(principals::disable_principal),
         )
         // ── Caps ──
-        .route("/api/sys/principals/{id}/caps", post(caps::grant_caps))
-        .route("/api/sys/principals/{id}/caps", delete(caps::revoke_caps))
+        .route("/api/sys/principals/:id/caps", post(caps::grant_caps))
+        .route("/api/sys/principals/:id/caps", delete(caps::revoke_caps))
         // ── Quotas ──
-        .route("/api/sys/principals/{id}/quotas", get(quotas::get_quotas))
-        .route("/api/sys/principals/{id}/quotas", put(quotas::set_quotas))
+        .route("/api/sys/principals/:id/quotas", get(quotas::get_quotas))
+        .route("/api/sys/principals/:id/quotas", put(quotas::set_quotas))
         // ── Groups ──
         .route("/api/sys/groups", get(groups::list_groups))
         .route("/api/sys/groups", post(groups::create_group))
-        .route("/api/sys/groups/{name}", patch(groups::modify_group))
-        .route("/api/sys/groups/{name}", delete(groups::delete_group))
+        .route("/api/sys/groups/:name", patch(groups::modify_group))
+        .route("/api/sys/groups/:name", delete(groups::delete_group))
         // ── Invites ──
         .route("/api/sys/invites", post(invites::issue_invite))
         .route("/api/sys/invites", get(invites::list_invites))
         .route(
-            "/api/sys/invites/{fingerprint}",
+            "/api/sys/invites/:fingerprint",
             delete(invites::revoke_invite),
         )
         // ── Capabilities catalog ──
@@ -103,15 +104,17 @@ pub fn build(state: Arc<GatewayState>) -> Router {
         // ── Capsules ──
         .route("/api/capsules", get(capsules::list_capsules))
         .route("/api/capsules", post(capsules::install_capsule))
-        .route("/api/capsules/{id}", get(capsules::get_capsule))
+        .route("/api/capsules/:id", get(capsules::get_capsule))
         .route(
-            "/api/capsules/{id}/topics",
+            "/api/capsules/:id/topics",
             get(capsules::list_capsule_topics),
         )
-        .route("/api/capsules/{id}/env", get(env::get_env_schema))
-        .route("/api/capsules/{id}/env/{field}", post(env::write_env))
+        .route("/api/capsules/:id/env", get(env::get_env_schema))
+        .route("/api/capsules/:id/env/:field", post(env::write_env))
         // ── Audit stream ──
         .route("/api/events", get(events::get_events))
+        // ── Agent invocation (SSE) ──
+        .route("/api/agent/prompt", post(agent::post_prompt))
         // ── System ──
         .route("/api/sys/status", get(system::get_status))
         .route(
@@ -127,7 +130,7 @@ pub fn build(state: Arc<GatewayState>) -> Router {
         .merge(authed)
         // Count every request after it routes — axum's `MatchedPath`
         // extractor gives the registered template (e.g.
-        // `/api/sys/principals/{id}`) so the metric stays bounded
+        // `/api/sys/principals/:id`) so the metric stays bounded
         // even under high-cardinality path params.
         .layer(axum::middleware::from_fn_with_state(
             Arc::clone(&state),
