@@ -156,6 +156,12 @@ pub struct GatewayState {
     pub config: GatewayConfig,
     /// Per-boot signing material.
     pub signing: SigningMaterial,
+    /// Live event bus handle for the audit SSE stream. `Some` when
+    /// the gateway is spawned by `astrid-daemon` co-located with the
+    /// kernel; `None` for the standalone-builder constructor used by
+    /// route-level unit tests (those tests never exercise SSE so
+    /// the `Option` is safe).
+    pub event_bus: Option<Arc<astrid_events::EventBus>>,
     /// Pre-parsed distribution discovery payload. Computed once at
     /// boot from `Distro.toml` so the public `/api/distribution`
     /// route doesn't reparse TOML on every request — that would be a
@@ -178,7 +184,10 @@ impl GatewayState {
     /// # Errors
     /// Returns an error if `distro_path` points at a file that can't
     /// be read or whose contents fail to parse.
-    pub fn new(config: GatewayConfig) -> anyhow::Result<Arc<Self>> {
+    pub fn new(
+        config: GatewayConfig,
+        event_bus: Option<Arc<astrid_events::EventBus>>,
+    ) -> anyhow::Result<Arc<Self>> {
         let (distribution, onboarding) = match &config.distro_path {
             Some(p) => {
                 let text = std::fs::read_to_string(p).with_context(|| {
@@ -208,6 +217,7 @@ impl GatewayState {
             onboarding: Arc::new(onboarding),
             redeem_limiter: Mutex::new(RedeemRateLimiter::default()),
             metrics: Metrics::default(),
+            event_bus,
         }))
     }
 }

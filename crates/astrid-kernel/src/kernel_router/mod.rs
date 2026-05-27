@@ -554,9 +554,22 @@ pub(crate) struct AdminAuditEntry<'a> {
     pub outcome: AuditOutcome,
 }
 
-/// Append an `AdminRequest` audit entry for the given outcome. Failures
-/// to persist are logged but do not abort the request — the audit log
-/// degrades to "continue + alert" by design.
+/// IPC topic the kernel publishes structured audit-entry events to
+/// for live subscribers (the HTTP gateway's SSE stream).
+///
+/// The persistent audit log under `~/.astrid/audit.db` remains the
+/// system of record — this topic is a fire-and-forget broadcast for
+/// dashboards / monitoring tools that want a live feed. Subscribers
+/// scope their view at the consumer end: operators with
+/// `audit:read_all` see the firehose, agents see only entries
+/// whose `principal` field matches their own.
+pub const AUDIT_TOPIC: &str = "astrid.v1.audit.entry";
+
+/// Append an `AdminRequest` audit entry for the given outcome.
+/// Persists to the on-disk log AND publishes a live event on
+/// [`AUDIT_TOPIC`]. Failures to persist are logged but do not abort
+/// the request — the audit log degrades to "continue + alert" by
+/// design. A bus-publish failure is similarly best-effort.
 fn record_admin_audit(kernel: &crate::Kernel, entry: AdminAuditEntry<'_>) {
     let AdminAuditEntry {
         caller,
@@ -570,15 +583,15 @@ fn record_admin_audit(kernel: &crate::Kernel, entry: AdminAuditEntry<'_>) {
     let action = AuditAction::AdminRequest {
         method: method.to_string(),
         required_capability: required_cap.to_string(),
-        target_principal,
-        params,
+        target_principal: target_principal.clone(),
+        params: params.clone(),
     };
     if let Err(e) = kernel.audit_log.append_with_principal(
         kernel.session_id.clone(),
         caller.clone(),
         action,
-        authorization,
-        outcome,
+        authorization.clone(),
+        outcome.clone(),
     ) {
         warn!(
             security_event = true,
@@ -588,6 +601,31 @@ fn record_admin_audit(kernel: &crate::Kernel, entry: AdminAuditEntry<'_>) {
             "Failed to persist admin-request audit entry — continuing"
         );
     }
+
+    // Live broadcast. Subscribers filter at the consumer end (the
+    // `principal` field is what the gateway's SSE handler uses).
+    // The payload is intentionally a flat JSON shape so SSE
+    // consumers don't have to reify the kernel-side enum types.
+    let event = serde_json::json!({
+        "ts_epoch": std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs()),
+        "method": method,
+        "required_capability": required_cap,
+        "principal": caller.to_string(),
+        "target_principal": target_principal.as_ref().map(ToString::to_string),
+        "params": params,
+        "outcome": match &outcome {
+            AuditOutcome::Success { .. } => "success",
+            AuditOutcome::Failure { .. } => "failure",
+        },
+    });
+    let msg = IpcMessage::new(AUDIT_TOPIC, IpcPayload::RawJson(event), uuid::Uuid::nil())
+        .with_principal(caller.to_string());
+    let _ = kernel.event_bus.publish(astrid_events::AstridEvent::Ipc {
+        metadata: astrid_events::EventMetadata::new("kernel_router::audit"),
+        message: msg,
+    });
 }
 
 #[cfg(test)]

@@ -499,6 +499,15 @@ pub const CAPABILITY_CATALOG: &[CapabilityInfo] = {
             scope: Global,
             danger: Normal,
         },
+        // ── Audit ──
+        CapabilityInfo {
+            id: "audit:read_all",
+            label: "View full audit firehose",
+            description: "Subscribe to every audit entry across every principal via /api/events. Without this cap, the SSE stream is filtered to the caller's own entries only.",
+            category: System,
+            scope: Global,
+            danger: Elevated,
+        },
         // ── Approval ──
         CapabilityInfo {
             id: "self:approval:respond",
@@ -552,7 +561,7 @@ pub fn known_capabilities_list() -> &'static [&'static str] {
 /// in the same commit that adds a new capability so a kernel
 /// addition without updating the catalog fails the consuming
 /// crate's tests.
-pub const KNOWN_CAPABILITIES_COUNT: usize = 33;
+pub const KNOWN_CAPABILITIES_COUNT: usize = 34;
 
 const _: () = assert!(
     CAPABILITY_CATALOG.len() == KNOWN_CAPABILITIES_COUNT,

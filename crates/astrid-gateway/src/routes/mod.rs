@@ -17,6 +17,7 @@ pub mod caps;
 pub mod capsules;
 pub mod distribution;
 pub mod env;
+pub mod events;
 pub mod groups;
 pub mod invites;
 pub mod observability;
@@ -104,6 +105,8 @@ pub fn build(state: Arc<GatewayState>) -> Router {
         )
         .route("/api/capsules/{id}/env", get(env::get_env_schema))
         .route("/api/capsules/{id}/env/{field}", post(env::write_env))
+        // ── Audit stream ──
+        .route("/api/events", get(events::get_events))
         // ── System ──
         .route("/api/sys/status", get(system::get_status))
         .route(

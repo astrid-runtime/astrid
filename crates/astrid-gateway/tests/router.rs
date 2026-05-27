@@ -69,6 +69,7 @@ fn fresh_state_with_distro(distro: Option<&str>) -> Arc<GatewayState> {
         onboarding: Arc::new(onboarding),
         redeem_limiter: tokio::sync::Mutex::default(),
         metrics: astrid_gateway::metrics::Metrics::default(),
+        event_bus: None,
     })
 }
 

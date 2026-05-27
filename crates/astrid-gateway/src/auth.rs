@@ -167,6 +167,7 @@ mod tests {
             onboarding: Arc::new(crate::routes::distribution::OnboardingFields::default()),
             redeem_limiter: tokio::sync::Mutex::default(),
             metrics: crate::metrics::Metrics::default(),
+            event_bus: None,
         })
     }
 

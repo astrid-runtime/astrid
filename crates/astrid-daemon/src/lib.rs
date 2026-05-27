@@ -140,7 +140,7 @@ pub async fn run() -> Result<()> {
     // reads `etc/gateway-http.toml`; missing file or `enabled = false`
     // → no-op so single-tenant deployments keep their old shape.
     let gateway_shutdown = match load_gateway_config().await {
-        Ok(Some(cfg)) if cfg.enabled => Some(spawn_gateway(cfg, kernel.clone())?),
+        Ok(Some(cfg)) if cfg.enabled => Some(spawn_gateway(cfg, &kernel)?),
         Ok(Some(_)) => {
             tracing::debug!("astrid-gateway config present but disabled — skipping");
             None
@@ -210,9 +210,13 @@ async fn load_gateway_config() -> Result<Option<astrid_gateway::GatewayConfig>> 
 
 fn spawn_gateway(
     cfg: astrid_gateway::GatewayConfig,
-    _kernel: std::sync::Arc<astrid_kernel::Kernel>,
+    kernel: &std::sync::Arc<astrid_kernel::Kernel>,
 ) -> Result<std::sync::Arc<tokio::sync::Notify>> {
-    let state = astrid_gateway::GatewayState::new(cfg).context("build gateway state")?;
+    // Plumb the kernel's event bus into the gateway so the SSE
+    // audit stream can subscribe directly — same in-process bus,
+    // no extra socket round-trip.
+    let bus = std::sync::Arc::clone(&kernel.event_bus);
+    let state = astrid_gateway::GatewayState::new(cfg, Some(bus)).context("build gateway state")?;
     let notify = std::sync::Arc::new(tokio::sync::Notify::new());
     let notify_for_task = std::sync::Arc::clone(&notify);
     tokio::spawn(async move {
