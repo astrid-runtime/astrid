@@ -34,6 +34,10 @@ pub fn build(state: Arc<GatewayState>) -> Router {
             get(distribution::get_onboarding),
         )
         .route("/api/auth/redeem", post(auth::post_redeem))
+        .route(
+            "/api/auth/pair-device/redeem",
+            post(auth::post_pair_device_redeem),
+        )
         // Ops probes: intentionally unauthenticated so load
         // balancers and Prometheus scrapers don't need a bearer.
         // Restrict by network policy (reverse proxy / firewall).
@@ -46,6 +50,10 @@ pub fn build(state: Arc<GatewayState>) -> Router {
         // ── Session ──
         .route("/api/auth/me", get(auth::get_me))
         .route("/api/auth/refresh", post(auth::post_refresh))
+        .route(
+            "/api/auth/pair-device",
+            post(auth::post_pair_device_issue),
+        )
         // ── Principals (agents) ──
         .route("/api/sys/principals", get(principals::list_principals))
         .route("/api/sys/principals", post(principals::create_principal))

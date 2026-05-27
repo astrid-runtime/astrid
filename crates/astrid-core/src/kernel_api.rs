@@ -372,6 +372,36 @@ pub enum AdminRequestKind {
         /// The opaque token to invalidate.
         token: String,
     },
+    /// Issue a pair-device token. Gated by `self:auth:pair` (the
+    /// caller can only mint pair-tokens for their own principal —
+    /// the kernel ignores any target field on the wire and ties the
+    /// token to the caller). Used to add a new device's ed25519
+    /// public key to an existing principal's `AuthConfig.public_keys`
+    /// without minting a separate principal.
+    PairDeviceIssue {
+        /// Seconds until the token expires. Capped server-side to
+        /// 1 hour — pair-tokens are intended for immediate use on a
+        /// neighbouring device, not for long-lived sharing.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expires_secs: Option<u64>,
+        /// Free-form short label (e.g. "alice's phone") persisted
+        /// alongside the new public key on
+        /// `AuthConfig.public_keys` once the token is redeemed.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        label: Option<String>,
+    },
+    /// Redeem a pair-device token. Like `InviteRedeem`, the kernel
+    /// dispatcher special-cases this to bypass the capability
+    /// preamble — the token IS the auth. The handler verifies the
+    /// token, appends the supplied public key to the issuing
+    /// principal's `AuthConfig.public_keys`, and decrements / deletes
+    /// the token record.
+    PairDeviceRedeem {
+        /// The opaque token from a prior `PairDeviceIssue`.
+        token: String,
+        /// Hex-encoded ed25519 public key (32 bytes / 64 hex chars).
+        public_key: String,
+    },
 }
 
 /// Admin management API response wrapper carrying the echoed
@@ -430,6 +460,10 @@ pub enum AdminResponseBody {
     InviteRedeemed(InviteRedeemed),
     /// Response for [`AdminRequestKind::InviteList`].
     InviteList(Vec<InviteSummary>),
+    /// Response for [`AdminRequestKind::PairDeviceIssue`].
+    PairToken(PairTokenIssued),
+    /// Response for [`AdminRequestKind::PairDeviceRedeem`].
+    PairTokenRedeemed(PairTokenRedeemed),
     /// The request failed.
     Error(String),
 }
@@ -481,6 +515,33 @@ pub struct InviteRedeemed {
     pub group: String,
     /// SHA-256 fingerprint (hex) of the registered ed25519 public key.
     /// Lets the redeemer verify that the kernel registered the key it
+    /// sent rather than substituting one of its own.
+    pub public_key_fingerprint: String,
+}
+
+/// Response payload for [`AdminRequestKind::PairDeviceIssue`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PairTokenIssued {
+    /// Opaque token. The issuing device hands this to the new
+    /// device out-of-band (QR code, NFC, manual copy).
+    pub token: String,
+    /// Principal the new device's key will attach to (always the
+    /// caller, never request-body derived).
+    pub principal: PrincipalId,
+    /// Wall-clock Unix-epoch timestamp at which the token expires.
+    pub expires_at_epoch: u64,
+    /// Operator-supplied label (echoed; not yet bound).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+}
+
+/// Response payload for [`AdminRequestKind::PairDeviceRedeem`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PairTokenRedeemed {
+    /// The principal the new device is now bound to.
+    pub principal: PrincipalId,
+    /// SHA-256 fingerprint (hex) of the registered ed25519 key.
+    /// Lets the redeemer verify the kernel registered the key it
     /// sent rather than substituting one of its own.
     pub public_key_fingerprint: String,
 }

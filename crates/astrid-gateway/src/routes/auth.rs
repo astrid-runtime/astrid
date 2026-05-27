@@ -10,7 +10,9 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use astrid_core::PrincipalId;
-use astrid_core::kernel_api::{AdminRequestKind, AdminResponseBody};
+use astrid_core::kernel_api::{
+    AdminRequestKind, AdminResponseBody, PairTokenIssued, PairTokenRedeemed,
+};
 use astrid_uplink::AdminClient;
 use axum::Json;
 use axum::extract::{ConnectInfo, State};
@@ -147,6 +149,126 @@ pub struct RefreshResponse {
     pub session_token: String,
     /// Wall-clock epoch the new bearer expires.
     pub session_expires_at_epoch: u64,
+}
+
+/// Inbound body for `POST /api/auth/pair-device`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct PairDeviceIssueRequest {
+    /// Token lifetime in seconds. `None` defaults kernel-side
+    /// (typically 5 minutes). Capped at 1 hour kernel-side.
+    #[serde(default)]
+    pub expires_secs: Option<u64>,
+    /// Optional human-friendly label persisted alongside the new
+    /// key entry on `AuthConfig.public_keys` once redeemed.
+    #[serde(default)]
+    pub label: Option<String>,
+}
+
+/// Inbound body for `POST /api/auth/pair-device/redeem`. Unauthenticated
+/// route — the pair-token is the auth.
+#[derive(Debug, Clone, Deserialize)]
+pub struct PairDeviceRedeemRequest {
+    /// Opaque pair-token from a prior issue.
+    pub token: String,
+    /// Hex-encoded ed25519 public key. Bare 64 hex or
+    /// `ed25519:<hex>`.
+    pub public_key: String,
+}
+
+/// Outbound response for `POST /api/auth/pair-device/redeem` — the
+/// new device's session bearer for the bound principal.
+#[derive(Debug, Clone, Serialize)]
+pub struct PairDeviceRedeemResponse {
+    /// The principal the new device is now bound to.
+    pub principal: PrincipalId,
+    /// SHA-256 fingerprint of the registered key.
+    pub public_key_fingerprint: String,
+    /// Signed bearer token for subsequent requests.
+    pub session_token: String,
+    /// Wall-clock epoch the bearer expires.
+    pub session_expires_at_epoch: u64,
+}
+
+/// `POST /api/auth/pair-device` — issue a pair-token tied to the
+/// authenticated caller's principal. Returns the opaque token,
+/// which the caller hands to the new device out-of-band (QR code,
+/// NFC, etc.).
+pub async fn post_pair_device_issue(
+    State(_state): State<Arc<GatewayState>>,
+    req: Request<axum::body::Body>,
+) -> GatewayResult<Json<PairTokenIssued>> {
+    let caller: CallerContext = req
+        .extensions()
+        .get::<CallerContext>()
+        .cloned()
+        .ok_or(GatewayError::Unauthorized)?;
+    let body: PairDeviceIssueRequest = crate::routes::principals::read_json_body(req).await?;
+    let mut client = astrid_uplink::AdminClient::connect(caller.principal)
+        .await
+        .map_err(|e| GatewayError::Internal(anyhow::anyhow!("daemon connect: {e}")))?;
+    let resp = client
+        .request(AdminRequestKind::PairDeviceIssue {
+            expires_secs: body.expires_secs,
+            label: body.label,
+        })
+        .await
+        .map_err(|e| GatewayError::Internal(anyhow::anyhow!("daemon request: {e}")))?;
+    match resp {
+        AdminResponseBody::PairToken(issued) => Ok(Json(issued)),
+        AdminResponseBody::Error(msg) => Err(GatewayError::Forbidden { reason: msg }),
+        other => Err(GatewayError::Internal(anyhow::anyhow!(
+            "unexpected response shape: {other:?}"
+        ))),
+    }
+}
+
+/// `POST /api/auth/pair-device/redeem` — unauthenticated. The
+/// pair-token is the auth. The kernel registers the supplied key
+/// on the bound principal and the gateway mints a session bearer
+/// so the new device is immediately usable.
+pub async fn post_pair_device_redeem(
+    State(state): State<Arc<GatewayState>>,
+    Json(body): Json<PairDeviceRedeemRequest>,
+) -> GatewayResult<Json<PairDeviceRedeemResponse>> {
+    // Same trust posture as invite-redeem: connect as the bootstrap
+    // default principal (the gateway has system.token access), let
+    // the kernel's special-cased dispatcher verify the token.
+    let mut client = astrid_uplink::AdminClient::connect(PrincipalId::default())
+        .await
+        .map_err(|e| GatewayError::Internal(anyhow::anyhow!("daemon connect: {e}")))?;
+    let resp = client
+        .request(AdminRequestKind::PairDeviceRedeem {
+            token: body.token,
+            public_key: body.public_key,
+        })
+        .await
+        .map_err(|e| GatewayError::Internal(anyhow::anyhow!("daemon request: {e}")))?;
+    let redeemed: PairTokenRedeemed = match resp {
+        AdminResponseBody::PairTokenRedeemed(r) => r,
+        AdminResponseBody::Error(msg) => return Err(GatewayError::Kernel(msg)),
+        other => {
+            return Err(GatewayError::Internal(anyhow::anyhow!(
+                "unexpected response shape: {other:?}"
+            )));
+        },
+    };
+
+    let session_token = mint_bearer(
+        &state.signing.signer,
+        &redeemed.principal,
+        state.config.session_lifetime_secs,
+    );
+    let session_expires_at_epoch = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+        .saturating_add(state.config.session_lifetime_secs);
+
+    Ok(Json(PairDeviceRedeemResponse {
+        principal: redeemed.principal,
+        public_key_fingerprint: redeemed.public_key_fingerprint,
+        session_token,
+        session_expires_at_epoch,
+    }))
 }
 
 /// Handler: `POST /api/auth/refresh`. Issues a new bearer for the

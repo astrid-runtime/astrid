@@ -25,10 +25,13 @@
 mod enforcement_tests;
 mod handlers;
 mod invite_handlers;
+mod pair_device_handlers;
 #[cfg(test)]
 mod state_tests;
 #[cfg(test)]
 mod state_tests_agent_modify;
+#[cfg(test)]
+mod state_tests_caps;
 #[cfg(test)]
 mod tests;
 
@@ -127,7 +130,9 @@ pub fn resolve_admin_scope(req: &AdminRequestKind, caller: &PrincipalId) -> Auth
         // modify`) keep their own dedicated caps (`group:create`,
         // `group:delete`, `group:modify`) and remain
         // `AuthorityScope::Global` below, so this widening is read-only.
-        AdminRequestKind::AgentList | AdminRequestKind::GroupList => AuthorityScope::Self_,
+        AdminRequestKind::AgentList
+        | AdminRequestKind::GroupList
+        | AdminRequestKind::PairDeviceIssue { .. } => AuthorityScope::Self_,
         AdminRequestKind::AgentCreate { .. }
         | AdminRequestKind::AgentDelete { .. }
         | AdminRequestKind::AgentEnable { .. }
@@ -141,7 +146,12 @@ pub fn resolve_admin_scope(req: &AdminRequestKind, caller: &PrincipalId) -> Auth
         | AdminRequestKind::InviteIssue { .. }
         | AdminRequestKind::InviteRedeem { .. }
         | AdminRequestKind::InviteList
-        | AdminRequestKind::InviteRevoke { .. } => AuthorityScope::Global,
+        | AdminRequestKind::InviteRevoke { .. }
+        | AdminRequestKind::PairDeviceRedeem { .. } => AuthorityScope::Global,
+        // Note: PairDeviceIssue is intrinsically self-scoped — the
+        // kernel binds the token to the caller's own principal
+        // regardless of any wire-level hint. Folded into the Self_
+        // arm above with AgentList / GroupList.
     }
 }
 
@@ -189,6 +199,12 @@ pub fn required_capability_for_admin_request(
         (AdminRequestKind::InviteRedeem { .. }, _) => "invite:redeem",
         (AdminRequestKind::InviteList, _) => "invite:list",
         (AdminRequestKind::InviteRevoke { .. }, _) => "invite:revoke",
+        // PairDeviceIssue is self-scoped (kernel binds to caller).
+        (AdminRequestKind::PairDeviceIssue { .. }, _) => "self:auth:pair",
+        // PairDeviceRedeem mirrors InviteRedeem: dispatcher
+        // bypasses the cap-gate because the token IS the auth.
+        // String kept here for audit-log readability.
+        (AdminRequestKind::PairDeviceRedeem { .. }, _) => "auth:pair:redeem",
     }
 }
 
@@ -215,6 +231,8 @@ pub fn admin_request_method(req: &AdminRequestKind) -> &'static str {
         AdminRequestKind::InviteRedeem { .. } => "admin.invite.redeem",
         AdminRequestKind::InviteList => "admin.invite.list",
         AdminRequestKind::InviteRevoke { .. } => "admin.invite.revoke",
+        AdminRequestKind::PairDeviceIssue { .. } => "admin.auth.pair.issue",
+        AdminRequestKind::PairDeviceRedeem { .. } => "admin.auth.pair.redeem",
     }
 }
 
@@ -268,6 +286,19 @@ fn sanitize_admin_audit_params(req: &AdminRequestKind) -> Option<serde_json::Val
                 serde_json::Value::String(fingerprint_revoke_input(token)),
             );
         },
+        AdminRequestKind::PairDeviceRedeem { token, public_key } => {
+            let fp = invite_handlers::fingerprint_public_key(public_key);
+            params.remove("public_key");
+            params.insert(
+                "public_key_fingerprint".to_string(),
+                serde_json::Value::String(fp),
+            );
+            params.remove("token");
+            params.insert(
+                "token_fingerprint".to_string(),
+                serde_json::Value::String(crate::pair_token::hash_token(token)),
+            );
+        },
         _ => {},
     }
     Some(val)
@@ -308,7 +339,9 @@ pub fn admin_target_principal(req: &AdminRequestKind) -> Option<&PrincipalId> {
         | AdminRequestKind::InviteIssue { .. }
         | AdminRequestKind::InviteRedeem { .. }
         | AdminRequestKind::InviteList
-        | AdminRequestKind::InviteRevoke { .. } => None,
+        | AdminRequestKind::InviteRevoke { .. }
+        | AdminRequestKind::PairDeviceIssue { .. }
+        | AdminRequestKind::PairDeviceRedeem { .. } => None,
     }
 }
 
@@ -339,7 +372,10 @@ async fn handle_admin_request(
     // verifies the token internally and either mints a principal or
     // rejects the request. Every redeem still produces an audit row
     // (allow OR deny) below.
-    if matches!(req.kind, AdminRequestKind::InviteRedeem { .. }) {
+    if matches!(
+        req.kind,
+        AdminRequestKind::InviteRedeem { .. } | AdminRequestKind::PairDeviceRedeem { .. }
+    ) {
         record_admin_audit(
             kernel,
             AdminAuditEntry {
@@ -349,12 +385,12 @@ async fn handle_admin_request(
                 target_principal: None,
                 params: audit_params.clone(),
                 authorization: AuthorizationProof::System {
-                    reason: "invite-redeem: token is the auth".to_string(),
+                    reason: "redeem (invite or pair-device): token is the auth".to_string(),
                 },
                 outcome: AuditOutcome::success(),
             },
         );
-        let body = handlers::dispatch(kernel, req.kind).await;
+        let body = handlers::dispatch(kernel, &caller, req.kind).await;
         publish_response(
             kernel,
             response_topic,
@@ -415,7 +451,7 @@ async fn handle_admin_request(
         },
     }
 
-    let body = handlers::dispatch(kernel, req.kind).await;
+    let body = handlers::dispatch(kernel, &caller, req.kind).await;
     publish_response(
         kernel,
         response_topic,

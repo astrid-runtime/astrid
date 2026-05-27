@@ -15,6 +15,8 @@
 pub mod invite;
 /// The Management API router listening to the `EventBus`.
 pub mod kernel_router;
+/// Persistent pair-device token store (issue #756).
+pub mod pair_token;
 /// The Unix Domain Socket manager.
 pub mod socket;
 
