@@ -17,7 +17,7 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
 
 - **HTTP admin gateway (`astrid-gateway`).** New crate that fronts the kernel's existing `astrid.v1.admin.*` + `astrid.v1.request.*` IPC surfaces over HTTP for browser dashboards. Reads `~/.astrid/run/system.token`, handshakes with the daemon over the same Unix socket the CLI uses, and stamps `IpcMessage.principal` from an ed25519-signed bearer it verifies against its boot-time public key — never from the request body. Full route surface, sufficient for a dashboard to provision principals, set quotas, manage groups + caps + invites, and configure capsule env:
   - **Discovery (unauthenticated):** `GET /api/distribution`, `GET /api/distribution/onboarding`
-  - **Auth:** `POST /api/auth/redeem`, `GET /api/auth/me`
+  - **Auth:** `POST /api/auth/redeem`, `GET /api/auth/me`, `POST /api/auth/refresh` (extends an existing session without forcing a re-redeem)
   - **Principals (agent CRUD):** `GET/POST /api/sys/principals`, `GET/PATCH/DELETE /api/sys/principals/{id}`, `POST .../enable`, `POST .../disable`
   - **Caps:** `POST /api/sys/principals/{id}/caps` (grant), `DELETE /api/sys/principals/{id}/caps` (revoke)
   - **Quotas:** `GET/PUT /api/sys/principals/{id}/quotas`

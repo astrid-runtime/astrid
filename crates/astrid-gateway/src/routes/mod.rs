@@ -45,6 +45,7 @@ pub fn build(state: Arc<GatewayState>) -> Router {
     let authed = Router::new()
         // ── Session ──
         .route("/api/auth/me", get(auth::get_me))
+        .route("/api/auth/refresh", post(auth::post_refresh))
         // ── Principals (agents) ──
         .route("/api/sys/principals", get(principals::list_principals))
         .route("/api/sys/principals", post(principals::create_principal))

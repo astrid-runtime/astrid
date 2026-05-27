@@ -136,3 +136,49 @@ pub async fn get_me(req: Request<axum::body::Body>) -> GatewayResult<Json<MeResp
         expires_at_epoch: caller.expires_at_epoch,
     }))
 }
+
+/// Outbound response for `POST /api/auth/refresh`.
+#[derive(Debug, Clone, Serialize)]
+pub struct RefreshResponse {
+    /// Same principal as the inbound bearer — refresh never
+    /// switches identities.
+    pub principal: PrincipalId,
+    /// Freshly signed bearer.
+    pub session_token: String,
+    /// Wall-clock epoch the new bearer expires.
+    pub session_expires_at_epoch: u64,
+}
+
+/// Handler: `POST /api/auth/refresh`. Issues a new bearer for the
+/// same principal, extending the session without forcing the user
+/// back through invite redeem. Behind the auth middleware, so the
+/// inbound bearer is already verified — we just re-mint with a
+/// fresh expiry.
+///
+/// No additional rate limiting beyond what the bearer check already
+/// implies (an attacker without a valid bearer can't reach this
+/// route at all). Per-principal refresh tracking (one outstanding
+/// refresh per principal) is a future hardening if abuse appears.
+pub async fn post_refresh(
+    State(state): State<Arc<GatewayState>>,
+    req: Request<axum::body::Body>,
+) -> GatewayResult<Json<RefreshResponse>> {
+    let caller: &CallerContext = req
+        .extensions()
+        .get::<CallerContext>()
+        .ok_or(GatewayError::Unauthorized)?;
+    let session_token = mint_bearer(
+        &state.signing.signer,
+        &caller.principal,
+        state.config.session_lifetime_secs,
+    );
+    let session_expires_at_epoch = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+        .saturating_add(state.config.session_lifetime_secs);
+    Ok(Json(RefreshResponse {
+        principal: caller.principal.clone(),
+        session_token,
+        session_expires_at_epoch,
+    }))
+}

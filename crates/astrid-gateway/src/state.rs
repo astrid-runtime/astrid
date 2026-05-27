@@ -21,11 +21,15 @@ use crate::routes::distribution::{DistributionInfo, OnboardingFields};
 
 /// Signing material for session bearer tokens.
 ///
-/// A fresh keypair is generated on every daemon boot. This means
-/// outstanding session tokens become invalid across restarts —
-/// acceptable for v1, and keeps the gateway from needing
-/// persistent-key management. Long-running deployments that want
-/// session continuity can switch to a persisted key in a follow-up.
+/// Persisted at `$ASTRID_HOME/keys/gateway.ed25519` so outstanding
+/// session tokens survive daemon restarts. Same file-system posture
+/// as the kernel's `runtime.ed25519` runtime key: 0600 perms, atomic
+/// write-then-rename, raw 32-byte secret. The file is generated on
+/// first gateway boot and reused on every subsequent boot.
+///
+/// Rotation: delete the file → restart the daemon → fresh keypair is
+/// generated, all existing bearers invalidated. (No in-place rotation
+/// route; that needs a multi-key verifier and is deferred.)
 pub struct SigningMaterial {
     /// Signs new bearer tokens.
     pub signer: SigningKey,
@@ -35,7 +39,8 @@ pub struct SigningMaterial {
 }
 
 impl SigningMaterial {
-    /// Generate a fresh signing keypair from the OS CSPRNG.
+    /// Generate a fresh signing keypair from the OS CSPRNG. Used by
+    /// tests and by the load path when the on-disk key is missing.
     #[must_use]
     pub fn fresh() -> Self {
         let mut secret = [0u8; 32];
@@ -43,6 +48,72 @@ impl SigningMaterial {
         let signer = SigningKey::from_bytes(&secret);
         let verifier = signer.verifying_key();
         Self { signer, verifier }
+    }
+
+    /// Load the persisted gateway signing key, generating it on
+    /// first boot. Matches the kernel's `runtime.ed25519` load
+    /// pattern: 0600 perms, atomic write-then-rename. Same path
+    /// layout convention (`keys/` under `$ASTRID_HOME`).
+    ///
+    /// # Errors
+    /// Returns an error if the keys directory can't be created,
+    /// the on-disk key is corrupt (wrong length), or the file
+    /// write fails.
+    pub fn load_or_generate() -> anyhow::Result<Self> {
+        use anyhow::Context as _;
+        let home = astrid_core::dirs::AstridHome::resolve()
+            .context("resolve $ASTRID_HOME for gateway signing key")?;
+        let keys_dir = home.keys_dir();
+        let key_path = keys_dir.join("gateway.ed25519");
+
+        if key_path.exists() {
+            let bytes = std::fs::read(&key_path)
+                .with_context(|| format!("read gateway key at {}", key_path.display()))?;
+            if bytes.len() != 32 {
+                anyhow::bail!(
+                    "gateway key at {} has wrong length ({} bytes, expected 32) — remove the file to regenerate",
+                    key_path.display(),
+                    bytes.len()
+                );
+            }
+            let mut arr = [0u8; 32];
+            arr.copy_from_slice(&bytes);
+            let signer = SigningKey::from_bytes(&arr);
+            let verifier = signer.verifying_key();
+            return Ok(Self { signer, verifier });
+        }
+
+        // Generate fresh and persist atomically (write-then-rename
+        // with 0600 perms, matching the kernel's runtime key flow).
+        std::fs::create_dir_all(&keys_dir)
+            .with_context(|| format!("create keys dir {}", keys_dir.display()))?;
+        let fresh = Self::fresh();
+
+        let tmp = key_path.with_extension(format!("{}.tmp", std::process::id()));
+        #[cfg(unix)]
+        {
+            use std::io::Write as _;
+            use std::os::unix::fs::OpenOptionsExt as _;
+            let mut f = std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(&tmp)
+                .with_context(|| format!("create {}", tmp.display()))?;
+            f.write_all(fresh.signer.as_bytes())
+                .with_context(|| format!("write {}", tmp.display()))?;
+            f.sync_all()
+                .with_context(|| format!("fsync {}", tmp.display()))?;
+        }
+        #[cfg(not(unix))]
+        {
+            std::fs::write(&tmp, fresh.signer.as_bytes())
+                .with_context(|| format!("write {}", tmp.display()))?;
+        }
+        std::fs::rename(&tmp, &key_path)
+            .with_context(|| format!("rename {} → {}", tmp.display(), key_path.display()))?;
+        Ok(fresh)
     }
 }
 
@@ -128,9 +199,11 @@ impl GatewayState {
                 OnboardingFields::default(),
             ),
         };
+        let signing =
+            SigningMaterial::load_or_generate().context("load or generate gateway signing key")?;
         Ok(Arc::new(Self {
             config,
-            signing: SigningMaterial::fresh(),
+            signing,
             distribution: Arc::new(distribution),
             onboarding: Arc::new(onboarding),
             redeem_limiter: Mutex::new(RedeemRateLimiter::default()),
