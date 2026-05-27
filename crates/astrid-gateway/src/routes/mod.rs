@@ -19,20 +19,26 @@ pub mod distribution;
 pub mod env;
 pub mod groups;
 pub mod invites;
+pub mod observability;
 pub mod principals;
 pub mod quotas;
 pub mod system;
 
 /// Build the gateway's HTTP router.
 pub fn build(state: Arc<GatewayState>) -> Router {
-    // Unauthenticated routes — discovery + redeem.
+    // Unauthenticated routes — discovery + redeem + ops probes.
     let public = Router::new()
         .route("/api/distribution", get(distribution::get_distribution))
         .route(
             "/api/distribution/onboarding",
             get(distribution::get_onboarding),
         )
-        .route("/api/auth/redeem", post(auth::post_redeem));
+        .route("/api/auth/redeem", post(auth::post_redeem))
+        // Ops probes: intentionally unauthenticated so load
+        // balancers and Prometheus scrapers don't need a bearer.
+        // Restrict by network policy (reverse proxy / firewall).
+        .route("/healthz", get(observability::get_healthz))
+        .route("/metrics", get(observability::get_metrics));
 
     // Authenticated routes — bearer required, principal attached to
     // request extensions.
@@ -100,5 +106,67 @@ pub fn build(state: Arc<GatewayState>) -> Router {
             crate::auth::require_session,
         ));
 
-    public.merge(authed).with_state(state)
+    public
+        .merge(authed)
+        // Count every request after it routes — axum's `MatchedPath`
+        // extractor gives the registered template (e.g.
+        // `/api/sys/principals/{id}`) so the metric stays bounded
+        // even under high-cardinality path params.
+        .layer(axum::middleware::from_fn_with_state(
+            Arc::clone(&state),
+            metrics_middleware,
+        ))
+        .with_state(state)
+}
+
+/// Per-request counter bump. Uses axum's `MatchedPath` so the
+/// cardinality stays bounded (one bucket per route template, not
+/// one per concrete URL). Failed-route requests (404 before match)
+/// fall under the catch-all `<unmatched>` bucket.
+async fn metrics_middleware(
+    axum::extract::State(state): axum::extract::State<Arc<GatewayState>>,
+    matched: Option<axum::extract::MatchedPath>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    use std::sync::OnceLock;
+    // Static interner: every route template is a literal string,
+    // but the matched-path extractor returns `&str` borrowed from
+    // the per-request router state. We need `&'static str` for the
+    // counter map. The set of templates is fixed at compile time
+    // (we register them) so a one-time lazy interner is bounded.
+    static INTERN: OnceLock<std::sync::Mutex<std::collections::HashSet<&'static str>>> =
+        OnceLock::new();
+    let templates = INTERN.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+
+    let method = request.method().clone();
+    let template: &'static str = matched.as_ref().map_or("<unmatched>", |m| {
+        let s = m.as_str();
+        let mut guard = templates.lock().expect("interner lock");
+        if let Some(existing) = guard.get(s) {
+            existing
+        } else {
+            let leaked: &'static str = Box::leak(s.to_string().into_boxed_str());
+            guard.insert(leaked);
+            leaked
+        }
+    });
+
+    // Build the bucket key once and intern it too — same logic as
+    // the template intern above.
+    let key: &'static str = {
+        let composed = format!("{method} {template}");
+        let mut guard = templates.lock().expect("interner lock");
+        if let Some(existing) = guard.get(composed.as_str()) {
+            existing
+        } else {
+            let leaked: &'static str = Box::leak(composed.into_boxed_str());
+            guard.insert(leaked);
+            leaked
+        }
+    };
+
+    state.metrics.observe_request(key).await;
+
+    next.run(request).await
 }

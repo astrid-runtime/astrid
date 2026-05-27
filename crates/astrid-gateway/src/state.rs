@@ -16,6 +16,7 @@ use rand::RngCore;
 use tokio::sync::Mutex;
 
 use crate::config::GatewayConfig;
+use crate::metrics::Metrics;
 use crate::routes::distribution::{DistributionInfo, OnboardingFields};
 
 /// Signing material for session bearer tokens.
@@ -96,6 +97,8 @@ pub struct GatewayState {
     /// Redeem rate-limiter. Wrapped in async `Mutex` because the
     /// limiter is a write-mostly workload and handlers are async.
     pub redeem_limiter: Mutex<RedeemRateLimiter>,
+    /// Prometheus counter set rendered at `/metrics`.
+    pub metrics: Metrics,
 }
 
 impl GatewayState {
@@ -131,6 +134,7 @@ impl GatewayState {
             distribution: Arc::new(distribution),
             onboarding: Arc::new(onboarding),
             redeem_limiter: Mutex::new(RedeemRateLimiter::default()),
+            metrics: Metrics::default(),
         }))
     }
 }
