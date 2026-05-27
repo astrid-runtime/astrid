@@ -1,5 +1,9 @@
 /// Admin management API dispatcher (issue #672, Layer 6).
 pub mod admin;
+/// `KernelRequest::InstallCapsule` handler — delegates to the
+/// `astrid-capsule-install` library so the daemon and the CLI reach
+/// disk through the same code path.
+mod install;
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
@@ -185,11 +189,7 @@ async fn handle_request(
     let res = match req {
         KernelRequest::InstallCapsule { source, workspace } => {
             info!(source = %source, workspace, "Kernel received install request");
-            // Here the kernel would verify identity, parse the capsule, and potentially
-            // return ApprovalRequired if it needs dangerous capabilities!
-            KernelResponse::Error(
-                "Installation logic not yet implemented in kernel router".to_string(),
-            )
+            install::handle_install_capsule(kernel, &source, workspace).await
         },
         KernelRequest::ApproveCapability {
             request_id,
