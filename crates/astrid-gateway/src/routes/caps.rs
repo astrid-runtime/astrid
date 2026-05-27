@@ -11,7 +11,6 @@ use std::sync::Arc;
 
 use astrid_core::PrincipalId;
 use astrid_core::kernel_api::{AdminRequestKind, AdminResponseBody};
-use astrid_uplink::AdminClient;
 use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::{Request, StatusCode};
@@ -54,7 +53,7 @@ pub struct RevokeRequest {
     )
 )]
 pub async fn grant_caps(
-    State(_state): State<Arc<GatewayState>>,
+    State(state): State<Arc<GatewayState>>,
     Path(id): Path<String>,
     req: Request<axum::body::Body>,
 ) -> GatewayResult<Json<serde_json::Value>> {
@@ -62,9 +61,7 @@ pub async fn grant_caps(
         .map_err(|e| GatewayError::BadRequest(format!("invalid principal id: {e}")))?;
     let caller = caller_from(&req)?.clone();
     let body: GrantRequest = read_json_body(req).await?;
-    let mut client = AdminClient::connect(caller.principal)
-        .await
-        .map_err(daemon_internal)?;
+    let client = state.admin_client(caller.principal)?;
     let resp = client
         .request(AdminRequestKind::CapsGrant {
             principal,
@@ -93,7 +90,7 @@ pub async fn grant_caps(
     )
 )]
 pub async fn revoke_caps(
-    State(_state): State<Arc<GatewayState>>,
+    State(state): State<Arc<GatewayState>>,
     Path(id): Path<String>,
     req: Request<axum::body::Body>,
 ) -> GatewayResult<StatusCode> {
@@ -101,9 +98,7 @@ pub async fn revoke_caps(
         .map_err(|e| GatewayError::BadRequest(format!("invalid principal id: {e}")))?;
     let caller = caller_from(&req)?.clone();
     let body: RevokeRequest = read_json_body(req).await?;
-    let mut client = AdminClient::connect(caller.principal)
-        .await
-        .map_err(daemon_internal)?;
+    let client = state.admin_client(caller.principal)?;
     let resp = client
         .request(AdminRequestKind::CapsRevoke {
             principal,

@@ -42,6 +42,7 @@
 #![allow(clippy::module_name_repetitions)]
 
 pub mod auth;
+pub mod bus_admin;
 pub mod config;
 pub mod error;
 pub mod metrics;

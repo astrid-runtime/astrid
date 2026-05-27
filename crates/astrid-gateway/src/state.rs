@@ -220,6 +220,28 @@ impl GatewayState {
             event_bus,
         }))
     }
+
+    /// Build a bus-direct admin client bound to `caller`. Routes
+    /// hosted in this same process talk to the kernel over the
+    /// shared event bus rather than the Unix socket — bypasses the
+    /// `astrid-capsule-cli` proxy entirely and removes the 19 RPS
+    /// admin-throughput ceiling the socket path imposes.
+    ///
+    /// # Errors
+    /// Returns an internal error if the state was built without a
+    /// live event bus (the standalone tests-only constructor). In
+    /// production the daemon always wires it up.
+    pub fn admin_client(
+        &self,
+        caller: astrid_core::PrincipalId,
+    ) -> Result<crate::bus_admin::BusAdminClient, crate::error::GatewayError> {
+        let bus = self.event_bus.clone().ok_or_else(|| {
+            crate::error::GatewayError::Internal(anyhow::anyhow!(
+                "gateway is not wired to a live event bus; admin operations unavailable"
+            ))
+        })?;
+        Ok(crate::bus_admin::BusAdminClient::new(bus, caller))
+    }
 }
 
 #[cfg(test)]

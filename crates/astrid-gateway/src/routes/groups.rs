@@ -9,7 +9,6 @@
 use std::sync::Arc;
 
 use astrid_core::kernel_api::{AdminRequestKind, AdminResponseBody, GroupSummary};
-use astrid_uplink::AdminClient;
 use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::{Request, StatusCode};
@@ -64,13 +63,11 @@ pub struct ModifyGroupRequest {
     )
 )]
 pub async fn list_groups(
-    State(_state): State<Arc<GatewayState>>,
+    State(state): State<Arc<GatewayState>>,
     req: Request<axum::body::Body>,
 ) -> GatewayResult<Json<GroupListResponse>> {
     let caller = caller_from(&req)?.clone();
-    let mut client = AdminClient::connect(caller.principal)
-        .await
-        .map_err(daemon_internal)?;
+    let client = state.admin_client(caller.principal)?;
     let resp = client
         .request(AdminRequestKind::GroupList)
         .await
@@ -94,14 +91,12 @@ pub async fn list_groups(
     )
 )]
 pub async fn create_group(
-    State(_state): State<Arc<GatewayState>>,
+    State(state): State<Arc<GatewayState>>,
     req: Request<axum::body::Body>,
 ) -> GatewayResult<Json<serde_json::Value>> {
     let caller = caller_from(&req)?.clone();
     let body: CreateGroupRequest = read_json_body(req).await?;
-    let mut client = AdminClient::connect(caller.principal)
-        .await
-        .map_err(daemon_internal)?;
+    let client = state.admin_client(caller.principal)?;
     let resp = client
         .request(AdminRequestKind::GroupCreate {
             name: body.name,
@@ -131,15 +126,13 @@ pub async fn create_group(
     )
 )]
 pub async fn modify_group(
-    State(_state): State<Arc<GatewayState>>,
+    State(state): State<Arc<GatewayState>>,
     Path(name): Path<String>,
     req: Request<axum::body::Body>,
 ) -> GatewayResult<Json<serde_json::Value>> {
     let caller = caller_from(&req)?.clone();
     let body: ModifyGroupRequest = read_json_body(req).await?;
-    let mut client = AdminClient::connect(caller.principal)
-        .await
-        .map_err(daemon_internal)?;
+    let client = state.admin_client(caller.principal)?;
     let resp = client
         .request(AdminRequestKind::GroupModify {
             name,
@@ -168,14 +161,12 @@ pub async fn modify_group(
     )
 )]
 pub async fn delete_group(
-    State(_state): State<Arc<GatewayState>>,
+    State(state): State<Arc<GatewayState>>,
     Path(name): Path<String>,
     req: Request<axum::body::Body>,
 ) -> GatewayResult<StatusCode> {
     let caller = caller_from(&req)?.clone();
-    let mut client = AdminClient::connect(caller.principal)
-        .await
-        .map_err(daemon_internal)?;
+    let client = state.admin_client(caller.principal)?;
     let resp = client
         .request(AdminRequestKind::GroupDelete { name })
         .await

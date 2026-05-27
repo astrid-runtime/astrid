@@ -11,7 +11,6 @@ use std::sync::Arc;
 use astrid_core::PrincipalId;
 use astrid_core::kernel_api::{AdminRequestKind, AdminResponseBody};
 use astrid_core::profile::Quotas;
-use astrid_uplink::AdminClient;
 use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::Request;
@@ -43,16 +42,14 @@ pub struct QuotaRequest {
     )
 )]
 pub async fn get_quotas(
-    State(_state): State<Arc<GatewayState>>,
+    State(state): State<Arc<GatewayState>>,
     Path(id): Path<String>,
     req: Request<axum::body::Body>,
 ) -> GatewayResult<Json<Quotas>> {
     let principal = PrincipalId::new(&id)
         .map_err(|e| GatewayError::BadRequest(format!("invalid principal id: {e}")))?;
     let caller = caller_from(&req)?.clone();
-    let mut client = AdminClient::connect(caller.principal)
-        .await
-        .map_err(daemon_internal)?;
+    let client = state.admin_client(caller.principal)?;
     let resp = client
         .request(AdminRequestKind::QuotaGet { principal })
         .await
@@ -81,7 +78,7 @@ pub async fn get_quotas(
     )
 )]
 pub async fn set_quotas(
-    State(_state): State<Arc<GatewayState>>,
+    State(state): State<Arc<GatewayState>>,
     Path(id): Path<String>,
     req: Request<axum::body::Body>,
 ) -> GatewayResult<Json<serde_json::Value>> {
@@ -89,9 +86,7 @@ pub async fn set_quotas(
         .map_err(|e| GatewayError::BadRequest(format!("invalid principal id: {e}")))?;
     let caller = caller_from(&req)?.clone();
     let body: QuotaRequest = read_json_body(req).await?;
-    let mut client = AdminClient::connect(caller.principal)
-        .await
-        .map_err(daemon_internal)?;
+    let client = state.admin_client(caller.principal)?;
     let resp = client
         .request(AdminRequestKind::QuotaSet {
             principal,

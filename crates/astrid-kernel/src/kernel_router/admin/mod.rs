@@ -78,8 +78,23 @@ pub(crate) fn spawn_admin_router(kernel: Arc<crate::Kernel>) -> tokio::task::Joi
 
             match serde_json::from_value::<AdminKernelRequest>(val.clone()) {
                 Ok(req) => {
+                    // Spawn a fresh task per request so reads
+                    // (AgentList, GroupList, QuotaGet, …) run in
+                    // parallel. Writes still serialize through
+                    // `kernel.admin_write_lock` inside the handler.
+                    // Without this, a single in-flight admin
+                    // request blocked every other admin request —
+                    // the dispatcher was the bottleneck pinning
+                    // gateway admin throughput at ~120 RPS even on
+                    // pure-read endpoints. (For an HTTP front that
+                    // hosts thousands of agents the serial loop is
+                    // unworkable.)
+                    let kernel = Arc::clone(&kernel);
+                    let topic = message.topic.clone();
                     let caller = resolve_caller(message);
-                    handle_admin_request(&kernel, message.topic.clone(), caller, req).await;
+                    tokio::spawn(async move {
+                        handle_admin_request(&kernel, topic, caller, req).await;
+                    });
                 },
                 Err(e) => {
                     warn!(

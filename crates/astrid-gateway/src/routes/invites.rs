@@ -8,7 +8,6 @@
 use std::sync::Arc;
 
 use astrid_core::kernel_api::{AdminRequestKind, AdminResponseBody, InviteIssued, InviteSummary};
-use astrid_uplink::AdminClient;
 use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::{Request, StatusCode};
@@ -48,7 +47,7 @@ pub struct IssueResponse {
     )
 )]
 pub async fn issue_invite(
-    State(_state): State<Arc<GatewayState>>,
+    State(state): State<Arc<GatewayState>>,
     req: Request<axum::body::Body>,
 ) -> GatewayResult<Json<IssueResponse>> {
     // axum's `Json<T>` and `State<...>` can't co-exist with a manual
@@ -65,9 +64,7 @@ pub async fn issue_invite(
         .map_err(|e| GatewayError::BadRequest(format!("body read: {e}")))?;
     let body: IssueRequest = serde_json::from_slice(&bytes)?;
 
-    let mut client = AdminClient::connect(caller.principal)
-        .await
-        .map_err(|e| GatewayError::Internal(anyhow::anyhow!("daemon connect: {e}")))?;
+    let client = state.admin_client(caller.principal)?;
     let resp = client
         .request(AdminRequestKind::InviteIssue {
             group: body.group,
@@ -104,7 +101,7 @@ pub struct ListResponse {
     )
 )]
 pub async fn list_invites(
-    State(_state): State<Arc<GatewayState>>,
+    State(state): State<Arc<GatewayState>>,
     req: Request<axum::body::Body>,
 ) -> GatewayResult<Json<ListResponse>> {
     let caller = req
@@ -112,9 +109,7 @@ pub async fn list_invites(
         .get::<CallerContext>()
         .cloned()
         .ok_or(GatewayError::Unauthorized)?;
-    let mut client = AdminClient::connect(caller.principal)
-        .await
-        .map_err(|e| GatewayError::Internal(anyhow::anyhow!("daemon connect: {e}")))?;
+    let client = state.admin_client(caller.principal)?;
     let resp = client
         .request(AdminRequestKind::InviteList)
         .await
@@ -141,7 +136,7 @@ pub async fn list_invites(
     )
 )]
 pub async fn revoke_invite(
-    State(_state): State<Arc<GatewayState>>,
+    State(state): State<Arc<GatewayState>>,
     Path(fingerprint): Path<String>,
     req: Request<axum::body::Body>,
 ) -> GatewayResult<StatusCode> {
@@ -150,9 +145,7 @@ pub async fn revoke_invite(
         .get::<CallerContext>()
         .cloned()
         .ok_or(GatewayError::Unauthorized)?;
-    let mut client = AdminClient::connect(caller.principal)
-        .await
-        .map_err(|e| GatewayError::Internal(anyhow::anyhow!("daemon connect: {e}")))?;
+    let client = state.admin_client(caller.principal)?;
     let resp = client
         .request(AdminRequestKind::InviteRevoke { token: fingerprint })
         .await

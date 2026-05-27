@@ -13,7 +13,6 @@ use astrid_core::PrincipalId;
 use astrid_core::kernel_api::{
     AdminRequestKind, AdminResponseBody, PairTokenIssued, PairTokenRedeemed,
 };
-use astrid_uplink::AdminClient;
 use axum::Json;
 use axum::extract::{ConnectInfo, State};
 use axum::http::Request;
@@ -105,9 +104,7 @@ pub async fn post_redeem(
     // the cap-gate for this variant. Stamp the IPC message with the
     // `default` principal so the kernel's `resolve_caller` has *a*
     // value to log; the handler ignores it.
-    let mut client = AdminClient::connect(PrincipalId::default())
-        .await
-        .map_err(|e| GatewayError::Internal(anyhow::anyhow!("daemon connect: {e}")))?;
+    let client = state.admin_client(PrincipalId::default())?;
     let resp = client
         .request(AdminRequestKind::InviteRedeem {
             token: body.token,
@@ -235,7 +232,7 @@ pub struct PairDeviceRedeemResponse {
     )
 )]
 pub async fn post_pair_device_issue(
-    State(_state): State<Arc<GatewayState>>,
+    State(state): State<Arc<GatewayState>>,
     req: Request<axum::body::Body>,
 ) -> GatewayResult<Json<PairTokenIssued>> {
     let caller: CallerContext = req
@@ -244,9 +241,7 @@ pub async fn post_pair_device_issue(
         .cloned()
         .ok_or(GatewayError::Unauthorized)?;
     let body: PairDeviceIssueRequest = crate::routes::principals::read_json_body(req).await?;
-    let mut client = astrid_uplink::AdminClient::connect(caller.principal)
-        .await
-        .map_err(|e| GatewayError::Internal(anyhow::anyhow!("daemon connect: {e}")))?;
+    let client = state.admin_client(caller.principal)?;
     let resp = client
         .request(AdminRequestKind::PairDeviceIssue {
             expires_secs: body.expires_secs,
@@ -286,9 +281,7 @@ pub async fn post_pair_device_redeem(
     // Same trust posture as invite-redeem: connect as the bootstrap
     // default principal (the gateway has system.token access), let
     // the kernel's special-cased dispatcher verify the token.
-    let mut client = astrid_uplink::AdminClient::connect(PrincipalId::default())
-        .await
-        .map_err(|e| GatewayError::Internal(anyhow::anyhow!("daemon connect: {e}")))?;
+    let client = state.admin_client(PrincipalId::default())?;
     let resp = client
         .request(AdminRequestKind::PairDeviceRedeem {
             token: body.token,
