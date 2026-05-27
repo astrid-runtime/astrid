@@ -6,6 +6,7 @@ members = [
     "crates/astrid-capabilities",
     "crates/astrid-build",
     "crates/astrid-capsule",
+    "crates/astrid-capsule-install",
     "crates/astrid-cli",
     "crates/astrid-config",
     "crates/astrid-daemon",
@@ -42,6 +43,7 @@ astrid-audit = { path = "crates/astrid-audit", version = "0.7.0" }
 astrid-capabilities = { path = "crates/astrid-capabilities", version = "0.7.0" }
 astrid-build = { path = "crates/astrid-build", version = "0.7.0" }
 astrid-capsule = { path = "crates/astrid-capsule", version = "0.7.0" }
+astrid-capsule-install = { path = "crates/astrid-capsule-install", version = "0.7.0" }
 astrid-config = { path = "crates/astrid-config", version = "0.7.0" }
 astrid-daemon = { path = "crates/astrid-daemon", version = "0.7.0" }
 astrid-core = { path = "crates/astrid-core", version = "0.7.0" }

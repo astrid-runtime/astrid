@@ -311,7 +311,7 @@ mod tests {
         )
         .unwrap();
 
-        super::super::install::install_from_local_path(capsule_dir.path(), false, &home)
+        super::super::install::install_from_local_path(capsule_dir.path(), false, &home, None)
             .expect("install should succeed");
 
         let target =

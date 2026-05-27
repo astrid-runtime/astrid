@@ -1,0 +1,39 @@
+[package]
+name = "astrid-capsule-install"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Capsule install machinery — file layout, lifecycle hooks, content-addressing, topic baking. Shared by the CLI and the kernel-side admin install handler so both reach disk through the same code path."
+
+[lib]
+name = "astrid_capsule_install"
+path = "src/lib.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+astrid-build = { workspace = true }
+astrid-capsule = { workspace = true }
+astrid-core = { workspace = true }
+astrid-events = { workspace = true }
+astrid-storage = { workspace = true }
+astrid-types = { workspace = true }
+blake3 = { workspace = true }
+chrono = { workspace = true }
+flate2 = { workspace = true }
+semver = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tar = { workspace = true }
+tempfile = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[lints]
+workspace = true

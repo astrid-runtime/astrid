@@ -25,6 +25,7 @@ astrid-build = { workspace = true }
 anyhow = { workspace = true }
 arboard = { workspace = true }
 astrid-capsule = { workspace = true }
+astrid-capsule-install = { workspace = true }
 astrid-config = { workspace = true }
 astrid-core = { workspace = true }
 blake3 = { workspace = true }
