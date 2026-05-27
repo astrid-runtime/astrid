@@ -23,7 +23,7 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
   - **Quotas:** `GET/PUT /api/sys/principals/{id}/quotas`
   - **Groups:** `GET/POST /api/sys/groups`, `PATCH/DELETE /api/sys/groups/{name}`
   - **Invites:** `POST/GET /api/sys/invites`, `DELETE /api/sys/invites/{fingerprint}`
-  - **Capabilities catalog:** `GET /api/sys/capabilities` (drift-checked against the kernel-side tables at test time)
+  - **Capabilities catalog:** `GET /api/sys/capabilities` (drift-checked against the kernel-side tables at test time) returns structured entries — each with `id`, `label`, `description`, `category` (agent / caps / quota / group / invite / capsule / system / approval), `scope` (`self` / `global`), and `danger` (`safe` / `normal` / `elevated` / `extreme`) — so dashboards can render Discord-style permissions panels with confirmation prompts on dangerous toggles, without hardcoding per-capability metadata client-side. Source of truth is `astrid_core::capability_grammar::CAPABILITY_CATALOG`; the kernel's drift tests pin every static cap-string against the catalog at test time.
   - **Capsules:** `GET /api/capsules`, `POST /api/capsules` (cap-gated by `capsule:install`; kernel handler is a stub today but the route is forward-compatible), `GET /api/capsules/{id}`, `GET /api/capsules/{id}/topics`
   - **Capsule env (per-principal config):** `GET /api/capsules/{id}/env` (schema from `Capsule.toml`), `POST /api/capsules/{id}/env/{field}` (writes to `FileSecretStore` for `secret`-typed fields, env JSON under the principal's home for `text`/`select`/`array`)
   - **System:** `GET /api/sys/status`, `POST /api/sys/capsules/reload`

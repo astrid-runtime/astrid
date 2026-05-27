@@ -1,16 +1,16 @@
-//! Drift checks for `astrid_core::capability_grammar::KNOWN_CAPABILITIES`.
+//! Drift checks for `astrid_core::capability_grammar::CAPABILITY_CATALOG`.
 //!
-//! The shared catalog is what the HTTP gateway returns from
+//! The structured catalog is what the HTTP gateway returns from
 //! `/api/sys/capabilities`. If a new capability lands in
 //! `required_capability` or `required_capability_for_admin_request`
-//! without being added to the catalog, the gateway silently omits it
-//! from discovery — breaking dashboards that build cap-grant UI from
-//! the list. These tests enumerate every string returned by both
-//! match tables (across both [`AuthorityScope`] variants) and assert
-//! each appears in `KNOWN_CAPABILITIES`.
+//! without being added to the catalog, the gateway silently omits
+//! it from discovery — breaking dashboards that build cap-grant UI
+//! from the list. These tests enumerate every string returned by
+//! both match tables (across both [`AuthorityScope`] variants) and
+//! assert each appears in the catalog.
 
 use astrid_core::PrincipalId;
-use astrid_core::capability_grammar::KNOWN_CAPABILITIES;
+use astrid_core::capability_grammar::known_capabilities;
 use astrid_core::kernel_api::{AdminRequestKind, KernelRequest};
 use astrid_core::profile::Quotas;
 
@@ -49,9 +49,9 @@ fn known_capabilities_covers_every_kernel_request_cap() {
         for scope in scopes {
             let cap = required_capability(&req, scope);
             assert!(
-                KNOWN_CAPABILITIES.contains(&cap),
+                known_capabilities().any(|c| c == cap),
                 "kernel returns capability {cap:?} not in \
-                 astrid_core::capability_grammar::KNOWN_CAPABILITIES — \
+                 astrid_core::capability_grammar::CAPABILITY_CATALOG — \
                  update the catalog when adding a capability"
             );
         }
@@ -132,9 +132,9 @@ fn known_capabilities_covers_every_admin_request_cap() {
         for scope in scopes {
             let cap = required_capability_for_admin_request(req, scope);
             assert!(
-                KNOWN_CAPABILITIES.contains(&cap),
+                known_capabilities().any(|c| c == cap),
                 "admin op returns capability {cap:?} not in \
-                 astrid_core::capability_grammar::KNOWN_CAPABILITIES — \
+                 astrid_core::capability_grammar::CAPABILITY_CATALOG — \
                  update the catalog when adding a capability"
             );
         }

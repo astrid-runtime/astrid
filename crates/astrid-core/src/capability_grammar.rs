@@ -155,69 +155,390 @@ pub fn capability_matches(pattern: &str, cap: &str) -> bool {
     }
 }
 
-/// Canonical catalog of every static capability identifier the kernel
-/// recognises.
-///
-/// Mirrors the static match tables in
-/// `astrid-kernel::kernel_router::{required_capability,
-/// admin::required_capability_for_admin_request}` so external
-/// consumers (the HTTP gateway's `/api/sys/capabilities`, docs
-/// tooling, dashboards) don't have to redeclare the list. Adding a
-/// capability requires updating this constant and the corresponding
-/// kernel match; `KNOWN_CAPABILITIES_MIRROR_COUNT` pins the
-/// expected size so a kernel addition without a catalog bump fails
-/// at compile time of the kernel tests.
-///
-/// Entries are sorted by family then by `self:`-prefix to keep the
-/// list scan-friendly. Order is part of the public API — UIs sort
-/// by it for stable display.
-pub const KNOWN_CAPABILITIES: &[&str] = &[
-    // Kernel-request gates (capsule install / list / system control).
-    "system:shutdown",
-    "system:status",
-    "self:capsule:reload",
-    "capsule:reload",
-    "self:capsule:install",
-    "capsule:install",
-    "self:capsule:list",
-    "capsule:list",
-    "self:approval:respond",
-    // Admin-request gates: agent lifecycle.
-    "agent:create",
-    "agent:delete",
-    "agent:enable",
-    "agent:disable",
-    "agent:modify",
-    "agent:list",
-    "self:agent:list",
-    // Quotas.
-    "quota:set",
-    "self:quota:set",
-    "quota:get",
-    "self:quota:get",
-    // Group lifecycle.
-    "group:create",
-    "group:delete",
-    "group:modify",
-    "group:list",
-    "self:group:list",
-    // Capability mutation.
-    "caps:grant",
-    "caps:revoke",
-    // Invite lifecycle (#756).
-    "invite:issue",
-    "invite:redeem",
-    "invite:list",
-    "invite:revoke",
-];
+/// Coarse category for dashboard grouping. Dashboards bucket
+/// capabilities by category to render permissions panels
+/// Discord-style (one collapsible section per family).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CapabilityCategory {
+    /// Agent (principal) lifecycle: create, delete, enable, modify, list.
+    Agent,
+    /// Direct capability grants and revokes on a principal.
+    Caps,
+    /// Per-principal resource quotas (RAM / CPU / IPC).
+    Quota,
+    /// Capability-group definitions and memberships.
+    Group,
+    /// Invite-token lifecycle for onboarding new principals.
+    Invite,
+    /// Capsule install / list / reload / inspect.
+    Capsule,
+    /// Daemon-wide system operations (status, shutdown).
+    System,
+    /// Approval responses for capability requests held in escrow.
+    Approval,
+}
 
-/// Compile-time pin on the size of [`KNOWN_CAPABILITIES`]. Bumped in
-/// the same commit that adds a new capability so a kernel addition
-/// without updating the catalog fails the consuming crate's tests.
+/// Self vs global scope. `Self_` capabilities only let a principal
+/// act on their own state; `Global` lets the holder act on every
+/// principal. The kernel's static tables determine which form
+/// applies to which operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CapabilityScope {
+    /// Operation targets the caller's own principal only.
+    #[serde(rename = "self")]
+    Self_,
+    /// Operation can target any principal / system-wide state.
+    Global,
+}
+
+/// Risk tier for dashboard rendering. Dashboards use this to decide
+/// whether to require a confirmation prompt, paint the toggle red,
+/// or hide the capability behind an "advanced" disclosure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CapabilityDanger {
+    /// Read-only or limited to the caller's own state. No
+    /// cross-principal effects.
+    Safe,
+    /// Routine mutation visible to others (e.g. `agent:create`).
+    Normal,
+    /// Permission management — grants / revokes / group edits.
+    /// Compounds: holding it lets the principal grant more caps to
+    /// themselves or others. Confirmation prompt recommended.
+    Elevated,
+    /// System-wide impact (`system:shutdown`, `capsule:install`).
+    /// Confirmation + audit emphasis strongly recommended.
+    Extreme,
+}
+
+/// Structured catalog entry describing one capability.
+///
+/// Single source of truth shared by the kernel's drift tests and
+/// the HTTP gateway's `/api/sys/capabilities` route. Dashboards
+/// consume this directly to render permissions panels without
+/// hardcoding any per-capability metadata client-side.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct CapabilityInfo {
+    /// The capability identifier as it appears in policy. Stable
+    /// wire format — never change without a policy-version bump.
+    pub id: &'static str,
+    /// Short human-readable label for the dashboard toggle.
+    pub label: &'static str,
+    /// One-sentence operator-facing description. Suitable for a
+    /// tooltip or inline hint.
+    pub description: &'static str,
+    /// Family bucket for UI grouping.
+    pub category: CapabilityCategory,
+    /// Self vs global authority scope.
+    pub scope: CapabilityScope,
+    /// Risk tier for confirmation prompts.
+    pub danger: CapabilityDanger,
+}
+
+/// Structured catalog of every static capability the kernel
+/// recognises. **Single source of truth** for grantable
+/// capabilities. Mirrors the static match tables in
+/// `astrid-kernel::kernel_router::{required_capability,
+/// admin::required_capability_for_admin_request}`.
+///
+/// Order is part of the public API — dashboards render in this
+/// order for a stable display. Within each category the
+/// `Global` variant precedes its `self:`-prefixed sibling so the
+/// operator-facing form is the visual default.
+pub const CAPABILITY_CATALOG: &[CapabilityInfo] = {
+    use CapabilityCategory::{Agent, Approval, Caps, Capsule, Group, Invite, Quota, System};
+    use CapabilityDanger::{Elevated, Extreme, Normal, Safe};
+    use CapabilityScope::{Global, Self_};
+    &[
+        // ── System ──
+        CapabilityInfo {
+            id: "system:shutdown",
+            label: "Shut down daemon",
+            description: "Gracefully stop the Astrid daemon. The CLI and dashboard disconnect; pending work is allowed to finish under the configured shutdown grace period.",
+            category: System,
+            scope: Global,
+            danger: Extreme,
+        },
+        CapabilityInfo {
+            id: "system:status",
+            label: "Read daemon status",
+            description: "View daemon PID, uptime, connected-client count, and loaded-capsule list.",
+            category: System,
+            scope: Global,
+            danger: Safe,
+        },
+        // ── Capsules ──
+        CapabilityInfo {
+            id: "capsule:install",
+            label: "Install capsules",
+            description: "Install a new capsule into the system-wide capsule directory. Affects every principal on the host.",
+            category: Capsule,
+            scope: Global,
+            danger: Extreme,
+        },
+        CapabilityInfo {
+            id: "self:capsule:install",
+            label: "Install capsules (own workspace)",
+            description: "Install a capsule into the caller's own workspace. Future kernel work; see also: capsule:install.",
+            category: Capsule,
+            scope: Self_,
+            danger: Elevated,
+        },
+        CapabilityInfo {
+            id: "capsule:reload",
+            label: "Reload all capsules",
+            description: "Trigger a re-discovery of installed capsules system-wide. Causes a brief pause as capsules unload and reload.",
+            category: Capsule,
+            scope: Global,
+            danger: Normal,
+        },
+        CapabilityInfo {
+            id: "self:capsule:reload",
+            label: "Reload capsules (self)",
+            description: "Self-scoped variant of capsule:reload.",
+            category: Capsule,
+            scope: Self_,
+            danger: Normal,
+        },
+        CapabilityInfo {
+            id: "capsule:list",
+            label: "List all capsules",
+            description: "Enumerate every capsule installed on the host, including manifest metadata.",
+            category: Capsule,
+            scope: Global,
+            danger: Safe,
+        },
+        CapabilityInfo {
+            id: "self:capsule:list",
+            label: "List capsules (self)",
+            description: "Self-scoped variant of capsule:list. Always granted to the agent built-in.",
+            category: Capsule,
+            scope: Self_,
+            danger: Safe,
+        },
+        // ── Agents (principals) ──
+        CapabilityInfo {
+            id: "agent:create",
+            label: "Create agents",
+            description: "Provision a new agent principal. Doesn't grant any caps by itself — combine with caps:grant or move the new agent into a group.",
+            category: Agent,
+            scope: Global,
+            danger: Normal,
+        },
+        CapabilityInfo {
+            id: "agent:delete",
+            label: "Delete agents",
+            description: "Remove an agent principal. Cannot delete the bootstrap `default` principal. The principal's home directory is NOT scrubbed (ops concern).",
+            category: Agent,
+            scope: Global,
+            danger: Elevated,
+        },
+        CapabilityInfo {
+            id: "agent:enable",
+            label: "Enable agents",
+            description: "Re-enable a previously disabled agent. New invocations resume.",
+            category: Agent,
+            scope: Global,
+            danger: Normal,
+        },
+        CapabilityInfo {
+            id: "agent:disable",
+            label: "Disable agents",
+            description: "Suspend an agent without deleting it. In-flight invocations finish under the old value; new ones are refused.",
+            category: Agent,
+            scope: Global,
+            danger: Elevated,
+        },
+        CapabilityInfo {
+            id: "agent:modify",
+            label: "Modify agent groups",
+            description: "Add or remove group memberships on an agent. Changes which capabilities the agent inherits.",
+            category: Agent,
+            scope: Global,
+            danger: Elevated,
+        },
+        CapabilityInfo {
+            id: "agent:list",
+            label: "List all agents",
+            description: "Enumerate every agent principal on this host with their groups, grants, and revokes.",
+            category: Agent,
+            scope: Global,
+            danger: Safe,
+        },
+        CapabilityInfo {
+            id: "self:agent:list",
+            label: "View own agent row",
+            description: "Read this principal's own AgentSummary. Always granted to the agent built-in so members can introspect their own permissions.",
+            category: Agent,
+            scope: Self_,
+            danger: Safe,
+        },
+        // ── Quotas ──
+        CapabilityInfo {
+            id: "quota:set",
+            label: "Set agent quotas",
+            description: "Set resource ceilings (RAM, CPU time, IPC throughput) on any agent.",
+            category: Quota,
+            scope: Global,
+            danger: Normal,
+        },
+        CapabilityInfo {
+            id: "self:quota:set",
+            label: "Set own quotas",
+            description: "Self-scoped quota:set — typically only used to relax quotas the operator already permits.",
+            category: Quota,
+            scope: Self_,
+            danger: Normal,
+        },
+        CapabilityInfo {
+            id: "quota:get",
+            label: "Read agent quotas",
+            description: "View the resource ceilings configured on any agent.",
+            category: Quota,
+            scope: Global,
+            danger: Safe,
+        },
+        CapabilityInfo {
+            id: "self:quota:get",
+            label: "Read own quotas",
+            description: "Read the caller's own resource ceilings. Always granted to the agent built-in.",
+            category: Quota,
+            scope: Self_,
+            danger: Safe,
+        },
+        // ── Groups ──
+        CapabilityInfo {
+            id: "group:create",
+            label: "Create capability groups",
+            description: "Define a new custom capability group. Members inherit the group's capabilities.",
+            category: Group,
+            scope: Global,
+            danger: Elevated,
+        },
+        CapabilityInfo {
+            id: "group:delete",
+            label: "Delete capability groups",
+            description: "Remove a custom capability group. Built-in groups (admin, agent, restricted) cannot be deleted.",
+            category: Group,
+            scope: Global,
+            danger: Elevated,
+        },
+        CapabilityInfo {
+            id: "group:modify",
+            label: "Modify capability groups",
+            description: "Edit the capabilities, description, or `unsafe_admin` flag on a custom group. Changes propagate to every member on the next authz check.",
+            category: Group,
+            scope: Global,
+            danger: Elevated,
+        },
+        CapabilityInfo {
+            id: "group:list",
+            label: "List all groups",
+            description: "Enumerate every group (built-in + custom) with its capability set.",
+            category: Group,
+            scope: Global,
+            danger: Safe,
+        },
+        CapabilityInfo {
+            id: "self:group:list",
+            label: "List groups (self-membership)",
+            description: "Self-scoped group:list — for resolving the caller's own inherited capabilities. Always granted to the agent built-in.",
+            category: Group,
+            scope: Self_,
+            danger: Safe,
+        },
+        // ── Caps (direct grant/revoke) ──
+        CapabilityInfo {
+            id: "caps:grant",
+            label: "Grant capabilities",
+            description: "Append capability patterns to a principal's grants. With `unsafe_admin`, can mint wildcard (`*`) grants. Effectively a meta-permission — anyone with this can elevate themselves.",
+            category: Caps,
+            scope: Global,
+            danger: Extreme,
+        },
+        CapabilityInfo {
+            id: "caps:revoke",
+            label: "Revoke capabilities",
+            description: "Append capability patterns to a principal's revokes (highest-precedence deny). Cannot revoke from the bootstrap `default` principal.",
+            category: Caps,
+            scope: Global,
+            danger: Elevated,
+        },
+        // ── Invites ──
+        CapabilityInfo {
+            id: "invite:issue",
+            label: "Issue invite tokens",
+            description: "Mint invite tokens that let new principals self-enroll into a designated group. The token IS the auth — anyone holding it can redeem.",
+            category: Invite,
+            scope: Global,
+            danger: Elevated,
+        },
+        CapabilityInfo {
+            id: "invite:redeem",
+            label: "Redeem invite tokens (no-op grant)",
+            description: "Capability name preserved for completeness — the kernel bypasses the cap check on redemption because the token itself is the auth. Granting this to anyone is a no-op.",
+            category: Invite,
+            scope: Global,
+            danger: Normal,
+        },
+        CapabilityInfo {
+            id: "invite:list",
+            label: "List outstanding invites",
+            description: "Enumerate outstanding invite tokens by fingerprint (never the raw token).",
+            category: Invite,
+            scope: Global,
+            danger: Safe,
+        },
+        CapabilityInfo {
+            id: "invite:revoke",
+            label: "Revoke invites",
+            description: "Invalidate an outstanding invite token before it's redeemed.",
+            category: Invite,
+            scope: Global,
+            danger: Normal,
+        },
+        // ── Approval ──
+        CapabilityInfo {
+            id: "self:approval:respond",
+            label: "Approve own capability requests",
+            description: "Respond to capability-approval prompts addressed to this principal. Always granted to the agent built-in (an agent can only approve its own requests, never another's).",
+            category: Approval,
+            scope: Self_,
+            danger: Safe,
+        },
+    ]
+};
+
+/// Borrow the catalog as a flat slice of ids — the historical shape
+/// used by kernel drift tests. Now a thin view over
+/// [`CAPABILITY_CATALOG`]; the structured catalog is the canonical
+/// declaration.
+///
+/// Kept as a function rather than a `const` because the constant
+/// version would require an extra hand-mirrored array; the function
+/// makes the kernel-test drift check call
+/// `known_capabilities().any(|c| c == cap)` which is unambiguous.
+pub fn known_capabilities() -> impl Iterator<Item = &'static str> {
+    CAPABILITY_CATALOG.iter().map(|c| c.id)
+}
+
+/// Backwards-compatible flat-list view. Materialises once on
+/// first access and re-uses the cached slice on subsequent calls.
+pub fn known_capabilities_list() -> &'static [&'static str] {
+    static CACHED: std::sync::OnceLock<Vec<&'static str>> = std::sync::OnceLock::new();
+    CACHED.get_or_init(|| known_capabilities().collect())
+}
+
+/// Compile-time pin on the size of [`CAPABILITY_CATALOG`]. Bumped
+/// in the same commit that adds a new capability so a kernel
+/// addition without updating the catalog fails the consuming
+/// crate's tests.
 pub const KNOWN_CAPABILITIES_COUNT: usize = 31;
 
 const _: () = assert!(
-    KNOWN_CAPABILITIES.len() == KNOWN_CAPABILITIES_COUNT,
+    CAPABILITY_CATALOG.len() == KNOWN_CAPABILITIES_COUNT,
     "KNOWN_CAPABILITIES_COUNT is stale; bump it when adding a capability"
 );
 

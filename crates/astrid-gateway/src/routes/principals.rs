@@ -233,20 +233,52 @@ pub async fn modify_principal(
 
 // ── /api/sys/capabilities ────────────────────────────────────────
 
+/// Structured response for `GET /api/sys/capabilities`. Sourced
+/// from `astrid_core::capability_grammar::CAPABILITY_CATALOG` — the
+/// single canonical declaration. Dashboards bucket by `category`,
+/// render `label` on the toggle, surface `description` as the
+/// tooltip, dim or hide `self`-scoped entries depending on UX, and
+/// require confirmation prompts on `extreme` / `elevated` danger.
+///
+/// Response shape (verbatim from the catalog):
+///
+/// ```json
+/// {
+///   "capabilities": [
+///     {
+///       "id": "agent:create",
+///       "label": "Create agents",
+///       "description": "Provision a new agent principal. …",
+///       "category": "agent",
+///       "scope": "global",
+///       "danger": "normal"
+///     },
+///     …
+///   ],
+///   "categories": ["agent", "caps", "quota", "group", "invite", "capsule", "system", "approval"]
+/// }
+/// ```
+///
+/// `categories` is the stable ordering dashboards should use for
+/// section rendering (matches the catalog's natural grouping).
 #[derive(Debug, Clone, Serialize)]
-pub struct CapabilityCatalog {
-    /// Every capability identifier the kernel currently recognises.
-    /// Sourced from `astrid_core::capability_grammar::KNOWN_CAPABILITIES`
-    /// — the single canonical declaration shared with the kernel's
-    /// `required_capability` tables. Avoids duplication / drift.
-    pub capabilities: &'static [&'static str],
+pub struct CapabilityCatalogResponse {
+    pub capabilities: &'static [astrid_core::capability_grammar::CapabilityInfo],
+    pub categories: &'static [&'static str],
 }
+
+/// Canonical category render order. Mirrors the catalog's natural
+/// grouping; dashboards consume this for stable section ordering.
+const CATEGORY_RENDER_ORDER: &[&str] = &[
+    "agent", "caps", "quota", "group", "invite", "capsule", "system", "approval",
+];
 
 pub async fn list_capabilities(
     _req: Request<axum::body::Body>,
-) -> GatewayResult<Json<CapabilityCatalog>> {
-    Ok(Json(CapabilityCatalog {
-        capabilities: astrid_core::capability_grammar::KNOWN_CAPABILITIES,
+) -> GatewayResult<Json<CapabilityCatalogResponse>> {
+    Ok(Json(CapabilityCatalogResponse {
+        capabilities: astrid_core::capability_grammar::CAPABILITY_CATALOG,
+        categories: CATEGORY_RENDER_ORDER,
     }))
 }
 
