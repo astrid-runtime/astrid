@@ -65,12 +65,22 @@ astrid-workspace = { path = "crates/astrid-workspace", version = "0.7.0" }
 anyhow = "1.0"
 arboard = "3"
 arc-swap = "1.7"
+# Streaming + HTTP-server deps (async-stream, axum, tokio-stream,
+# tower, tower-http, utoipa) all back the new `astrid-gateway` crate
+# and have no in-workspace substitute. They are scoped to
+# `astrid-gateway` (and `astrid-integration-tests` for the gateway
+# smoke test); none of the kernel/capsule crates depend on them. See
+# crates/astrid-gateway/Cargo.toml for the per-dep rationale.
 async-stream = "0.3"
 async-trait = "0.1"
+# Pinned to axum 0.7 because 0.8 changed the path-param syntax
+# (`:id` → `{id}`) and we rely on the matching tower stack
+# (`tower-http` 0.6, `utoipa-axum` 0.5). `default-features = false`
+# strips the multipart / `original-uri` / `ws` extractors we don't use.
 axum = { version = "0.7", default-features = false, features = ["http1", "json", "tokio", "tracing", "matched-path"] }
-# axum's SSE module — extracted into its own dep entry because the
-# `tokio-stream` feature it needs to consume tokio::sync::broadcast
-# receivers as Streams isn't on by default.
+# Bridges `tokio::sync::broadcast::Receiver` → `futures::Stream` so
+# axum's `Sse` responder can consume the kernel event bus directly.
+# The `sync` feature is the only thing that does it; not on by default.
 tokio-stream = { version = "0.1", features = ["sync"] }
 base64 = "0.22"
 blake3 = "1.5"
@@ -139,6 +149,10 @@ thiserror = "2.0"
 tokio = { version = "1.49", features = ["sync", "macros", "time", "rt", "rt-multi-thread", "net", "io-util", "signal"] }
 tokio-util = "0.7"
 toml = "0.8"
+# Middleware substrate axum is built on (`Service` trait composition,
+# request-id, trace, CORS, body-size limit, response-header injection).
+# Dropping `tower-http` means re-implementing each middleware by hand;
+# nothing else in the workspace provides it.
 tower = { version = "0.5", features = ["util"] }
 tower-http = { version = "0.6", features = ["cors", "trace", "limit", "set-header"] }
 tracing = "0.1"
@@ -149,6 +163,10 @@ url = "2"
 # The `v4` feature uses `getrandom` under the hood — on host this is
 # the OS RNG, on capsule (wasm32-unknown-unknown) it's routed through
 # `astrid:sys.random-bytes` via the SDK's custom getrandom backend.
+# OpenAPI 3.x spec emission for `/api/openapi.json` + the drift test
+# that pins every router path against the spec. Workspace has no
+# other OpenAPI generator. `axum_extras` plugs into axum's extractor
+# system so `#[utoipa::path]` annotations on handlers carry through.
 utoipa = { version = "5", features = ["axum_extras"] }
 uuid = { version = "1.0", default-features = false, features = ["v4", "v5", "serde", "rng-getrandom"] }
 walkdir = "2.5"
