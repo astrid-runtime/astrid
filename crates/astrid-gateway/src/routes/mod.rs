@@ -147,12 +147,61 @@ pub fn build(state: Arc<GatewayState>) -> Router {
     // validate`) so the `parse::<HeaderValue>` here is infallible by
     // construction. We still `unwrap_or_else` defensively rather than
     // `expect` so a future grammar drift doesn't crash a live gateway.
-    if state.config.cors_allow_origins.is_empty() {
-        combined.with_state(state)
+    let with_cors = if state.config.cors_allow_origins.is_empty() {
+        combined
     } else {
         let cors = build_cors_layer(&state.config.cors_allow_origins);
-        combined.layer(cors).with_state(state)
-    }
+        combined.layer(cors)
+    };
+
+    // Security-headers stack applies to every response, including
+    // CORS preflights and error paths. The gateway returns JSON,
+    // SSE, plain text, and Prometheus — never HTML — so a strict
+    // CSP and `X-Frame-Options: DENY` are safe blanket defaults.
+    // A future misconfigured handler that accidentally renders HTML
+    // would be neutered rather than ship a clickjacking / XSS
+    // surface.
+    apply_security_headers(with_cors).with_state(state)
+}
+
+/// Apply the four static security headers every gateway response
+/// carries. `if_not_present` means a handler that intentionally
+/// sets one of these wins; this layer only fills in the defaults.
+fn apply_security_headers<S: Clone + Send + Sync + 'static>(router: Router<S>) -> Router<S> {
+    use axum::http::{HeaderName, HeaderValue};
+    use tower_http::set_header::SetResponseHeaderLayer;
+    router
+        // X-Content-Type-Options: nosniff — stops browsers from
+        // MIME-sniffing a JSON response into HTML when the
+        // content-type is missing or wrong.
+        .layer(SetResponseHeaderLayer::if_not_present(
+            HeaderName::from_static("x-content-type-options"),
+            HeaderValue::from_static("nosniff"),
+        ))
+        // X-Frame-Options: DENY — API responses must not be
+        // embeddable. Clickjacking defence-in-depth for any HTML
+        // that might accidentally land in the surface area later.
+        .layer(SetResponseHeaderLayer::if_not_present(
+            HeaderName::from_static("x-frame-options"),
+            HeaderValue::from_static("DENY"),
+        ))
+        // Referrer-Policy: no-referrer — URL paths can carry
+        // principal ids (`/api/sys/principals/:id`); we don't want
+        // those leaking to third-party origins via the `Referer`
+        // header when an admin clicks an external link from a
+        // dashboard view.
+        .layer(SetResponseHeaderLayer::if_not_present(
+            HeaderName::from_static("referrer-policy"),
+            HeaderValue::from_static("no-referrer"),
+        ))
+        // Content-Security-Policy: gateway never returns HTML, so
+        // deny every sub-resource by default. Kicks in as defence-
+        // in-depth if a future bug accidentally surfaces HTML or an
+        // error page from a misbehaving middleware.
+        .layer(SetResponseHeaderLayer::if_not_present(
+            HeaderName::from_static("content-security-policy"),
+            HeaderValue::from_static("default-src 'none'; frame-ancestors 'none'"),
+        ))
 }
 
 /// Build a `CorsLayer` from the operator-configured allowlist.

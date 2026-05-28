@@ -9,6 +9,10 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
 
 ## [Unreleased]
 
+### Security
+
+- **Security-response-headers stack applied to every gateway response.** The gateway returns JSON, SSE, plain text, and Prometheus — never HTML — but every response now carries `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`, `Referrer-Policy: no-referrer`, and `Content-Security-Policy: default-src 'none'; frame-ancestors 'none'`. The headers are `if_not_present` so a handler that intentionally sets one wins; defaults fill in everywhere else. Defends against MIME-confusion (nosniff), clickjacking against any HTML that lands in the surface later (DENY + CSP frame-ancestors), and `Referer` leakage of principal-id-bearing URLs to third-party origins (no-referrer). Two new e2e tests pin headers on success and 401 paths. Closes #771.
+
 ### Fixed
 
 - **`cors_allow_origins` is actually wired into the router now.** The gateway shipped in v0.7.0 with a `cors_allow_origins: Vec<String>` field that the router never consumed — `tower-http::CorsLayer` was on the dep list, but no layer was applied. An operator setting the allowlist saw nothing happen at runtime; browsers fell back to same-origin (which was the correct *secure* default but not the configured one). `routes::build` now applies a `CorsLayer` when the allowlist is non-empty: `Access-Control-Allow-Origin` (per-request match), `…-Allow-Methods` (GET/POST/PUT/PATCH/DELETE/OPTIONS), `…-Allow-Headers` (authorization/content-type/accept), `Vary: Origin`, and a 1-hour preflight cache. Empty allowlist stays no-CORS (browsers refuse cross-origin) so single-tenant deployments don't grow a `Vary` header. New `GatewayConfig::validate` rejects malformed origins (scheme other than http/https, trailing slash, path/query/fragment, unparseable strings) at daemon boot so misconfig fails fast instead of silently no-op-ing. Five new end-to-end tests in `crates/astrid-gateway/tests/cors.rs` cover preflight accept/reject, actual-request ACAO, empty-allowlist secure default, and per-origin echo for multi-origin allowlists. Closes #771.

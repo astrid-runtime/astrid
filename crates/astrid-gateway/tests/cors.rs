@@ -209,6 +209,100 @@ async fn empty_allowlist_means_no_cors_headers_anywhere() {
 }
 
 #[tokio::test]
+async fn security_headers_appear_on_every_response() {
+    // The security-headers stack (nosniff, DENY, no-referrer, CSP)
+    // is independent of CORS — it applies even when no allowlist
+    // is configured. Pinning this so a future refactor of the
+    // CORS conditional doesn't accidentally drop the header layer
+    // off the "no CORS" branch.
+    for origins in [vec![], vec!["https://app.example"]] {
+        let state = state_with_origins(origins.clone());
+        let router = routes::build(state);
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/api/distribution")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .expect("router responds");
+
+        let headers = response.headers();
+        assert_eq!(
+            headers
+                .get("x-content-type-options")
+                .map(axum::http::HeaderValue::as_bytes),
+            Some(&b"nosniff"[..]),
+            "X-Content-Type-Options missing (origins={origins:?})"
+        );
+        assert_eq!(
+            headers
+                .get("x-frame-options")
+                .map(axum::http::HeaderValue::as_bytes),
+            Some(&b"DENY"[..]),
+            "X-Frame-Options missing (origins={origins:?})"
+        );
+        assert_eq!(
+            headers
+                .get("referrer-policy")
+                .map(axum::http::HeaderValue::as_bytes),
+            Some(&b"no-referrer"[..]),
+            "Referrer-Policy missing (origins={origins:?})"
+        );
+        let csp = headers
+            .get("content-security-policy")
+            .expect("CSP must be set")
+            .to_str()
+            .unwrap();
+        assert!(
+            csp.contains("default-src 'none'") && csp.contains("frame-ancestors 'none'"),
+            "CSP must deny default-src + frame-ancestors (origins={origins:?}): {csp}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn security_headers_apply_to_error_responses_too() {
+    // Defence in depth: a 401 from missing-bearer still gets
+    // the headers. A future XSS-via-error-page bug would still be
+    // mitigated by the CSP.
+    let state = state_with_origins(vec![]);
+    let router = routes::build(state);
+
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/api/auth/me")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .expect("router responds");
+
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        response
+            .headers()
+            .get("x-content-type-options")
+            .map(axum::http::HeaderValue::as_bytes),
+        Some(&b"nosniff"[..]),
+        "401 must still carry nosniff"
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get("x-frame-options")
+            .map(axum::http::HeaderValue::as_bytes),
+        Some(&b"DENY"[..]),
+        "401 must still carry X-Frame-Options"
+    );
+}
+
+#[tokio::test]
 async fn multiple_allowlisted_origins_each_get_their_own_acao() {
     // Allowlist with two entries: each origin must see itself echoed,
     // not the other. Pins that tower-http's `AllowOrigin::list`
