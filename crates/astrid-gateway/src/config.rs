@@ -86,11 +86,13 @@ pub struct GatewayConfig {
 #[serde(rename_all = "kebab-case")]
 pub struct TlsConfig {
     /// Filesystem path to the PEM-encoded server certificate chain.
-    /// Must be readable by the daemon process. Reload via SIGHUP.
+    /// Must be readable by the daemon process. Live cert rotation is
+    /// not yet wired (the daemon only handles SIGINT / SIGTERM);
+    /// today, restart the daemon to pick up new bytes.
     pub cert_path: PathBuf,
     /// Filesystem path to the PEM-encoded private key (PKCS#8 or
     /// RSA). Must be 0600 perms on Unix; the gateway logs a warning
-    /// on boot if the key is world-readable.
+    /// on boot if the key is group- or world-readable.
     pub key_path: PathBuf,
 }
 
@@ -129,32 +131,33 @@ impl GatewayConfig {
     /// validations (CORS origin grammar, etc.).
     pub fn validate(&self) -> anyhow::Result<()> {
         if let Some(tls) = &self.tls {
-            if !tls.cert_path.exists() {
+            // `is_file()` catches both "doesn't exist" and "points
+            // at a directory". `exists()` alone would pass for a
+            // directory and fail later inside rustls with a less
+            // clear error.
+            if !tls.cert_path.is_file() {
                 anyhow::bail!(
-                    "tls.cert-path {} does not exist — refusing to boot the gateway",
+                    "tls.cert-path {} is not a regular file — refusing to boot the gateway",
                     tls.cert_path.display()
                 );
             }
-            if !tls.key_path.exists() {
+            if !tls.key_path.is_file() {
                 anyhow::bail!(
-                    "tls.key-path {} does not exist — refusing to boot the gateway",
+                    "tls.key-path {} is not a regular file — refusing to boot the gateway",
                     tls.key_path.display()
                 );
             }
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt as _;
-                if let Ok(meta) = std::fs::metadata(&tls.key_path) {
-                    let mode = meta.permissions().mode() & 0o777;
-                    if mode & 0o077 != 0 {
-                        tracing::warn!(
-                            path = %tls.key_path.display(),
-                            mode = format!("{mode:o}"),
-                            "TLS private key is group- or world-readable; chmod 0600 recommended"
-                        );
-                    }
-                }
+            // Defensive: catch the copy-paste typo where cert+key
+            // point at the same file. The rustls PEM parser will
+            // happily try to load a private key out of the cert chain
+            // and produce a cryptic error; surface the problem here.
+            if tls.cert_path == tls.key_path {
+                anyhow::bail!(
+                    "tls.cert-path and tls.key-path resolve to the same file ({}); separate them",
+                    tls.cert_path.display()
+                );
             }
+            crate::tls::warn_if_key_is_too_open(&tls.key_path);
         }
         Ok(())
     }
@@ -226,6 +229,47 @@ mod tests {
         assert!(
             format!("{err:#}").contains("key-path"),
             "error mentions key-path: {err:#}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_directory_as_cert_path() {
+        // `exists()` on a directory returns true; `is_file()` is what
+        // catches the copy-paste-a-dir typo. Use the parent of a
+        // tempfile so we have a real directory at hand.
+        let tmpdir = tempfile::tempdir().expect("tempdir");
+        let key = tempfile::NamedTempFile::new().expect("key tempfile");
+        let cfg = GatewayConfig {
+            tls: Some(TlsConfig {
+                cert_path: tmpdir.path().to_path_buf(),
+                key_path: key.path().to_path_buf(),
+            }),
+            ..GatewayConfig::default()
+        };
+        let err = cfg.validate().expect_err("directory must reject");
+        assert!(
+            format!("{err:#}").contains("not a regular file"),
+            "error mentions regular file: {err:#}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_same_file_for_cert_and_key() {
+        // Common copy-paste typo: cert and key both point at the same
+        // path. Surface it here rather than letting rustls' PEM
+        // parser produce a cryptic "no private key found".
+        let same = tempfile::NamedTempFile::new().expect("tempfile");
+        let cfg = GatewayConfig {
+            tls: Some(TlsConfig {
+                cert_path: same.path().to_path_buf(),
+                key_path: same.path().to_path_buf(),
+            }),
+            ..GatewayConfig::default()
+        };
+        let err = cfg.validate().expect_err("same-file must reject");
+        assert!(
+            format!("{err:#}").contains("same file"),
+            "error mentions same file: {err:#}"
         );
     }
 

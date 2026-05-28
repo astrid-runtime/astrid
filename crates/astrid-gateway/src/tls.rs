@@ -26,7 +26,6 @@
 
 use std::net::SocketAddr;
 use std::path::Path;
-use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use axum::Router;
@@ -150,11 +149,8 @@ pub fn warn_if_key_is_too_open(key_path: &Path) {
 pub fn warn_if_key_is_too_open(_key_path: &Path) {}
 
 /// Re-export so the daemon doesn't have to depend on axum-server
-/// directly.
+/// directly. `RustlsConfig` is already cheaply cloneable (its
+/// internal `rustls::ServerConfig` lives behind an `Arc`), so no
+/// extra `Arc<RustlsConfig>` wrapping is needed — clone it directly
+/// if you need shared ownership for a future cert-reload story.
 pub use axum_server::tls_rustls::RustlsConfig as ReexportedRustlsConfig;
-
-// `Arc` is intentionally available in the public surface here — the
-// daemon may want to hold a shared handle to the rustls config for
-// future SIGHUP-driven reload. Kept as a sibling export so the
-// import shape stays stable.
-pub type SharedRustlsConfig = Arc<RustlsConfig>;

@@ -85,12 +85,12 @@ pub async fn run(
         )
     })?;
 
-    if let Some(tls_cfg) = state.config.tls.clone() {
+    if let Some(tls_cfg) = state.config.tls.as_ref() {
         // TLS path: bind via axum-server, layer rustls in front of
         // the same router. The plain-HTTP TcpListener::bind dance
         // doesn't apply here — axum-server opens its own listener.
         info!(addr = %addr, scheme = "https", "astrid-gateway listening (TLS)");
-        let rustls = tls::load_rustls_config(&tls_cfg).await?;
+        let rustls = tls::load_rustls_config(tls_cfg).await?;
         let router = tls::apply_hsts(routes::build(state));
         return tls::serve_https(addr, router, rustls, shutdown).await;
     }
