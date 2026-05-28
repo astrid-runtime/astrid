@@ -9,6 +9,10 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
 
 ## [Unreleased]
 
+### Added
+
+- **Native TLS termination in the gateway via rustls.** New optional `[tls]` block in `etc/gateway-http.toml` (`cert-path`, `key-path`) flips the gateway from plain HTTP to rustls-terminated HTTPS — useful for single-box installs, Tailscale-fronted deployments, and anyone running without a reverse-proxy ops layer. Without the block, the daemon behaves exactly as v0.7.0 (plain HTTP, TLS-upstream expected). Backed by `axum-server 0.7` + `aws-lc-rs` (no openssl). New `GatewayConfig::validate()` runs at daemon boot: missing cert/key paths produce a clear "refusing to boot" error so misconfig fails fast instead of returning malformed TLS handshakes at runtime. Group/world-readable key files generate a `WARN` log at boot suggesting `chmod 0600`. `rustls::crypto::CryptoProvider::install_default()` is called idempotently in `tls::load_rustls_config` so rustls 0.23's multi-provider deferral doesn't panic the first handshake. Three new integration tests in `crates/astrid-integration-tests/tests/gateway_tls.rs` mint a self-signed cert at test time with `rcgen` and prove the round-trip end-to-end. ACME / Let's Encrypt automation, mTLS client-cert auth, and HTTP/2 / h2 ALPN remain out of scope for v0.7 and tracked as follow-ups on the closed issue. Closes #773.
+
 ### Breaking
 
 - **MSRV bumped to 1.95.0.** `surrealdb 3.0.0-beta.3`'s `kv-mem` feature pulled in `surrealmx v0.21.0` → `ferntree v0.7.0`, which uses `std::hint::cold_path` stabilised in Rust 1.95. Upstream declared no `rust-version`, so cargo's resolver silently picks 0.7 even though the workspace MSRV says 1.94. Bumping our MSRV is the smallest fix that keeps CI deterministic without committing `Cargo.lock` (which is intentionally gitignored). Affects `cargo install astrid` consumers — installers on 1.94 will see a clear "requires rustc 1.95" error rather than the cryptic `cold_path` failure.

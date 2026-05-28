@@ -49,6 +49,7 @@ pub mod metrics;
 pub mod openapi;
 pub mod routes;
 pub mod state;
+pub mod tls;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -63,14 +64,16 @@ pub use state::GatewayState;
 /// Run the gateway HTTP server until `shutdown` resolves.
 ///
 /// Binds the configured listen address, attaches every defined route,
-/// and serves over plain HTTP. TLS termination is expected upstream
-/// (Caddy / nginx / Cloudflare) — the gateway never speaks TLS itself.
-/// This keeps the crate dependency-light and lets operators choose
-/// their own cert lifecycle.
+/// and serves over plain HTTP — unless `state.config.tls` is `Some`,
+/// in which case rustls termination is layered in front of the same
+/// router (see [`tls::serve_https`]). The default posture remains
+/// "TLS upstream"; native TLS is an opt-in feature for single-box
+/// installs that don't want to run a reverse proxy.
 ///
 /// # Errors
-/// Returns an error if the listener cannot bind, the daemon socket
-/// handshake fails, or the HTTP server crashes.
+/// Returns an error if the listener cannot bind, the rustls config
+/// can't be loaded (TLS path), the daemon socket handshake fails, or
+/// the HTTP server crashes.
 pub async fn run(
     state: Arc<GatewayState>,
     shutdown: impl Future<Output = ()> + Send + 'static,
@@ -81,11 +84,23 @@ pub async fn run(
             state.config.listen
         )
     })?;
+
+    if let Some(tls_cfg) = state.config.tls.clone() {
+        // TLS path: bind via axum-server, layer rustls in front of
+        // the same router. The plain-HTTP TcpListener::bind dance
+        // doesn't apply here — axum-server opens its own listener.
+        info!(addr = %addr, scheme = "https", "astrid-gateway listening (TLS)");
+        let rustls = tls::load_rustls_config(&tls_cfg).await?;
+        let router = routes::build(state);
+        return tls::serve_https(addr, router, rustls, shutdown).await;
+    }
+
+    // Plain HTTP path — unchanged behaviour from v0.7.0.
     let listener = TcpListener::bind(addr)
         .await
         .with_context(|| format!("failed to bind gateway listener on {addr}"))?;
     let bound = listener.local_addr().unwrap_or(addr);
-    info!(addr = %bound, "astrid-gateway listening");
+    info!(addr = %bound, scheme = "http", "astrid-gateway listening");
 
     let router = routes::build(state);
     // `into_make_service_with_connect_info::<SocketAddr>()` is what

@@ -68,6 +68,30 @@ pub struct GatewayConfig {
     ///
     /// Example: `["127.0.0.1", "10.0.0.1"]`.
     pub trust_forwarded_from: Vec<std::net::IpAddr>,
+    /// TLS termination directly in the gateway. `None` (the default)
+    /// keeps the plain-HTTP posture and delegates TLS to an upstream
+    /// proxy. `Some(...)` switches to native rustls termination —
+    /// useful for single-box installs, Tailscale-fronted deployments,
+    /// or anyone deploying without a reverse-proxy ops layer.
+    ///
+    /// Default `None` so an upgrade from v0.7.0 keeps its existing
+    /// shape (`enabled = true` + no TLS = same plain-HTTP behaviour
+    /// the daemon already had).
+    pub tls: Option<TlsConfig>,
+}
+
+/// Native TLS configuration for the gateway. Backed by rustls
+/// (no openssl dependency anywhere in the workspace).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct TlsConfig {
+    /// Filesystem path to the PEM-encoded server certificate chain.
+    /// Must be readable by the daemon process. Reload via SIGHUP.
+    pub cert_path: PathBuf,
+    /// Filesystem path to the PEM-encoded private key (PKCS#8 or
+    /// RSA). Must be 0600 perms on Unix; the gateway logs a warning
+    /// on boot if the key is world-readable.
+    pub key_path: PathBuf,
 }
 
 impl Default for GatewayConfig {
@@ -80,6 +104,7 @@ impl Default for GatewayConfig {
             redeem_rate_limit_secs: DEFAULT_REDEEM_RATE_LIMIT_SECS,
             cors_allow_origins: Vec::new(),
             trust_forwarded_from: Vec::new(),
+            tls: None,
         }
     }
 }
@@ -95,6 +120,43 @@ impl GatewayConfig {
     #[must_use]
     pub const fn redeem_rate_limit(&self) -> Duration {
         Duration::from_secs(self.redeem_rate_limit_secs)
+    }
+
+    /// Post-deserialisation validation. Surfaces TLS misconfig early:
+    /// a missing cert/key path is a guaranteed boot failure, so
+    /// catching it here (with a clear message) beats discovering it
+    /// inside rustls' lower-level errors. Sibling PRs add further
+    /// validations (CORS origin grammar, etc.).
+    pub fn validate(&self) -> anyhow::Result<()> {
+        if let Some(tls) = &self.tls {
+            if !tls.cert_path.exists() {
+                anyhow::bail!(
+                    "tls.cert-path {} does not exist — refusing to boot the gateway",
+                    tls.cert_path.display()
+                );
+            }
+            if !tls.key_path.exists() {
+                anyhow::bail!(
+                    "tls.key-path {} does not exist — refusing to boot the gateway",
+                    tls.key_path.display()
+                );
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                if let Ok(meta) = std::fs::metadata(&tls.key_path) {
+                    let mode = meta.permissions().mode() & 0o777;
+                    if mode & 0o077 != 0 {
+                        tracing::warn!(
+                            path = %tls.key_path.display(),
+                            mode = format!("{mode:o}"),
+                            "TLS private key is group- or world-readable; chmod 0600 recommended"
+                        );
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -119,10 +181,73 @@ mod tests {
             redeem_rate_limit_secs: 0,
             cors_allow_origins: vec!["https://example.invalid".into()],
             trust_forwarded_from: vec!["10.0.0.1".parse().unwrap()],
+            tls: Some(TlsConfig {
+                cert_path: PathBuf::from("/etc/astrid/tls/cert.pem"),
+                key_path: PathBuf::from("/etc/astrid/tls/key.pem"),
+            }),
         };
         let text = toml::to_string_pretty(&cfg).unwrap();
         let back: GatewayConfig = toml::from_str(&text).unwrap();
         assert_eq!(back.listen, cfg.listen);
         assert_eq!(back.cors_allow_origins, cfg.cors_allow_origins);
+        assert_eq!(
+            back.tls.as_ref().map(|t| t.cert_path.clone()),
+            cfg.tls.as_ref().map(|t| t.cert_path.clone())
+        );
+    }
+
+    #[test]
+    fn validate_rejects_missing_cert_path() {
+        let cfg = GatewayConfig {
+            tls: Some(TlsConfig {
+                cert_path: PathBuf::from("/dev/null/does/not/exist.pem"),
+                key_path: PathBuf::from("/dev/null/does/not/exist.key"),
+            }),
+            ..GatewayConfig::default()
+        };
+        let err = cfg.validate().expect_err("missing cert must reject");
+        assert!(
+            format!("{err:#}").contains("cert-path"),
+            "error mentions cert-path: {err:#}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_missing_key_path() {
+        let tmp = tempfile::NamedTempFile::new().expect("tempfile");
+        let cfg = GatewayConfig {
+            tls: Some(TlsConfig {
+                cert_path: tmp.path().to_path_buf(),
+                key_path: PathBuf::from("/dev/null/does/not/exist.key"),
+            }),
+            ..GatewayConfig::default()
+        };
+        let err = cfg.validate().expect_err("missing key must reject");
+        assert!(
+            format!("{err:#}").contains("key-path"),
+            "error mentions key-path: {err:#}"
+        );
+    }
+
+    #[test]
+    fn validate_passes_for_existing_cert_and_key() {
+        let cert = tempfile::NamedTempFile::new().expect("cert tempfile");
+        let key = tempfile::NamedTempFile::new().expect("key tempfile");
+        let cfg = GatewayConfig {
+            tls: Some(TlsConfig {
+                cert_path: cert.path().to_path_buf(),
+                key_path: key.path().to_path_buf(),
+            }),
+            ..GatewayConfig::default()
+        };
+        cfg.validate()
+            .expect("existing cert+key files should pass validation");
+    }
+
+    #[test]
+    fn validate_no_tls_block_is_a_noop() {
+        let cfg = GatewayConfig::default();
+        assert!(cfg.tls.is_none());
+        cfg.validate().expect("no-tls config must pass");
     }
 }
