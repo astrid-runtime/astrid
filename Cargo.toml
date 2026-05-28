@@ -77,7 +77,7 @@ async-trait = "0.1"
 # (`:id` → `{id}`) and we rely on the matching tower stack
 # (`tower-http` 0.6, `utoipa-axum` 0.5). `default-features = false`
 # strips the multipart / `original-uri` / `ws` extractors we don't use.
-axum = { version = "0.7", default-features = false, features = ["http1", "json", "tokio", "tracing", "matched-path"] }
+axum = { version = "0.7", default-features = false, features = ["http1", "json", "query", "tokio", "tracing", "matched-path"] }
 # Bridges `tokio::sync::broadcast::Receiver` → `futures::Stream` so
 # axum's `Sse` responder can consume the kernel event bus directly.
 # The `sync` feature is the only thing that does it; not on by default.

@@ -42,6 +42,8 @@ fn state_with_origins(origins: Vec<&str>) -> Arc<GatewayState> {
         metrics: astrid_gateway::metrics::Metrics::default(),
         event_bus: None,
         revoked_at: std::sync::Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
+        audit_log: None,
+        session_id: None,
     })
 }
 

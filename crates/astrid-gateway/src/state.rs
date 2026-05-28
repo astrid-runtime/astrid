@@ -188,6 +188,18 @@ pub struct GatewayState {
     /// by orders of magnitude, and the critical sections are
     /// non-`await`-blocking.
     pub revoked_at: Arc<RwLock<HashMap<PrincipalId, u64>>>,
+    /// Live audit-log handle backing `GET /api/sys/audit`. `Some`
+    /// when the gateway is spawned by `astrid-daemon` (which holds
+    /// the kernel's `Arc<AuditLog>`); `None` for the standalone-
+    /// builder constructor used by route-level unit tests, in which
+    /// case the audit-history route returns 502 honestly rather
+    /// than hanging.
+    pub audit_log: Option<Arc<astrid_audit::AuditLog>>,
+    /// Kernel session id, paired with [`Self::audit_log`] because the
+    /// audit log indexes entries by session. Single-session daemons
+    /// today; if a future kernel ever runs multiple sessions
+    /// concurrently this becomes the slice the gateway is scoped to.
+    pub session_id: Option<astrid_core::SessionId>,
 }
 
 impl GatewayState {
@@ -200,6 +212,8 @@ impl GatewayState {
     pub fn new(
         config: GatewayConfig,
         event_bus: Option<Arc<astrid_events::EventBus>>,
+        audit_log: Option<Arc<astrid_audit::AuditLog>>,
+        session_id: Option<astrid_core::SessionId>,
     ) -> anyhow::Result<Arc<Self>> {
         let (distribution, onboarding) = match &config.distro_path {
             Some(p) => {
@@ -235,6 +249,8 @@ impl GatewayState {
             metrics: Metrics::default(),
             event_bus,
             revoked_at,
+            audit_log,
+            session_id,
         }))
     }
 

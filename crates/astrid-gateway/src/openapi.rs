@@ -106,6 +106,7 @@ use crate::state::GatewayState;
         routes::agent::post_prompt,
         // Audit
         routes::events::get_events,
+        routes::audit::get_audit,
         // System
         routes::system::get_status,
         routes::system::reload_capsules,
@@ -160,6 +161,9 @@ use crate::state::GatewayState;
             routes::distribution::DistributionInfo,
             routes::distribution::OnboardingFields,
             routes::distribution::OnboardingField,
+            // Audit history
+            routes::audit::AuditEntryView,
+            routes::audit::AuditQueryResponse,
             // Errors
             crate::error::ErrorBody,
         )

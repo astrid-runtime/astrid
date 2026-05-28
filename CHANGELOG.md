@@ -9,6 +9,10 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
 
 ## [Unreleased]
 
+### Added
+
+- **`GET /api/sys/audit` — historical-query endpoint over the persistent audit log.** Companion to the live `GET /api/events` SSE feed: SSE only delivers events from the moment the connection opens, so a dashboard rendering "the last 24 h of admin activity" had no way to backfill. Now it does. Paginated with `?since`/`?until` (epoch seconds), `?method=AgentDelete`, `?principal=alice`, `?limit` (default 100, cap 1000), `?cursor` (opaque). Same trust shape as the SSE handler — `audit:read_all` holders see the firehose; everyone else is silently scoped to their own principal regardless of what they pass in `?principal`. Reads via `tokio::task::spawn_blocking` so the underlying `SurrealKV` query doesn't stall the runtime worker. The new endpoint is plumbed through `astrid-daemon::spawn_gateway` alongside `event_bus` so the gateway gets an `Arc<AuditLog>` + `SessionId` at boot; standalone-builder `GatewayState::new` returns 502 honestly when those handles are absent. OpenAPI annotation + drift test pin the new route. Closes #779.
+
 ### Security
 
 - **Security-response-headers stack applied to every gateway response.** The gateway returns JSON, SSE, plain text, and Prometheus — never HTML — but every response now carries `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`, `Referrer-Policy: no-referrer`, and `Content-Security-Policy: default-src 'none'; frame-ancestors 'none'`. The headers are `if_not_present` so a handler that intentionally sets one wins; defaults fill in everywhere else. Defends against MIME-confusion (nosniff), clickjacking against any HTML that lands in the surface later (DENY + CSP frame-ancestors), and `Referer` leakage of principal-id-bearing URLs to third-party origins (no-referrer). Two new e2e tests pin headers on success and 401 paths. Closes #771.
