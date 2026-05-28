@@ -109,6 +109,25 @@ pub async fn serve_https(
         .context("gateway HTTPS server failed")
 }
 
+/// Layer `Strict-Transport-Security` onto a router. **Only call this
+/// from the TLS dispatch path** — HSTS over plain HTTP is forbidden
+/// by RFC 6797 (browsers ignore the header on http:// origins, but
+/// shipping it would still be a footgun if someone reverse-proxies
+/// this output back to plain HTTP).
+///
+/// Two-year max-age + `includeSubDomains` follows the HSTS preload
+/// list's minimum requirements without committing to the preload
+/// list (an operator can submit on their own). `if_not_present` so
+/// a handler that intentionally sets a different policy wins.
+pub fn apply_hsts<S: Clone + Send + Sync + 'static>(router: axum::Router<S>) -> axum::Router<S> {
+    use axum::http::{HeaderName, HeaderValue};
+    use tower_http::set_header::SetResponseHeaderLayer;
+    router.layer(SetResponseHeaderLayer::if_not_present(
+        HeaderName::from_static("strict-transport-security"),
+        HeaderValue::from_static("max-age=63072000; includeSubDomains"),
+    ))
+}
+
 /// Convenience: warn if the key file looks world-readable. Called
 /// at `config.validate()` time so the warning surfaces at daemon
 /// boot, not on the first request.

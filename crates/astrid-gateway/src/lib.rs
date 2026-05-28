@@ -91,11 +91,23 @@ pub async fn run(
         // doesn't apply here — axum-server opens its own listener.
         info!(addr = %addr, scheme = "https", "astrid-gateway listening (TLS)");
         let rustls = tls::load_rustls_config(&tls_cfg).await?;
-        let router = routes::build(state);
+        let router = tls::apply_hsts(routes::build(state));
         return tls::serve_https(addr, router, rustls, shutdown).await;
     }
 
-    // Plain HTTP path — unchanged behaviour from v0.7.0.
+    // Plain HTTP path — unchanged behaviour from v0.7.0. Warn loudly
+    // when the operator binds beyond loopback without enabling TLS,
+    // since that's almost always a misconfig: either the gateway is
+    // about to serve unencrypted traffic on the LAN/public, or
+    // there's a reverse proxy upstream that the operator should
+    // confirm is actually fronting plain TCP correctly.
+    if !addr.ip().is_loopback() {
+        tracing::warn!(
+            addr = %addr,
+            "gateway is binding a non-loopback address without TLS; ensure a TLS-terminating reverse proxy fronts this listener, or enable [tls] in gateway-http.toml"
+        );
+    }
+
     let listener = TcpListener::bind(addr)
         .await
         .with_context(|| format!("failed to bind gateway listener on {addr}"))?;

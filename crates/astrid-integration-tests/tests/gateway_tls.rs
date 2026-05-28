@@ -130,6 +130,18 @@ async fn gateway_terminates_tls_for_openapi_endpoint() {
         "openapi: {}",
         response.status()
     );
+    // HSTS must be set on the TLS path (RFC 6797 only meaningful
+    // over a real https:// origin, so we wire it conditionally).
+    let hsts = response
+        .headers()
+        .get("strict-transport-security")
+        .expect("HSTS must be set on TLS responses")
+        .to_str()
+        .unwrap();
+    assert!(
+        hsts.contains("max-age=") && hsts.contains("includeSubDomains"),
+        "HSTS must carry max-age + includeSubDomains: {hsts}"
+    );
 }
 
 #[tokio::test]
@@ -209,5 +221,16 @@ async fn plain_http_path_still_works_when_no_tls_block() {
         response.status().is_success(),
         "openapi: {}",
         response.status()
+    );
+    // HSTS over plain HTTP is forbidden by RFC 6797 — browsers
+    // ignore it on http:// origins, but emitting it would still be
+    // a footgun if someone reverse-proxies this output back to
+    // plain HTTP downstream. Pin the absence.
+    assert!(
+        response
+            .headers()
+            .get("strict-transport-security")
+            .is_none(),
+        "HSTS must NOT be set on plain HTTP responses (RFC 6797)"
     );
 }
