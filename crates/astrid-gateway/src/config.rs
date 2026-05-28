@@ -130,6 +130,14 @@ fn validate_cors_origin(raw: &str) -> anyhow::Result<()> {
     if parsed.host_str().is_none() {
         anyhow::bail!("CORS origin {raw:?} has no host component");
     }
+    // Browsers strip userinfo before sending `Origin:`, so a config
+    // entry with embedded credentials can never match a real
+    // preflight. Reject so operators don't silently misconfigure.
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        anyhow::bail!(
+            "CORS origin {raw:?} carries userinfo (user:password); browsers strip it before sending `Origin:` so this can never match"
+        );
+    }
     if parsed.path() != "" && parsed.path() != "/" {
         anyhow::bail!(
             "CORS origin {raw:?} carries a path ({:?}); origins are scheme+host+port only",
@@ -146,6 +154,17 @@ fn validate_cors_origin(raw: &str) -> anyhow::Result<()> {
     if raw.ends_with('/') {
         anyhow::bail!(
             "CORS origin {raw:?} has a trailing slash; remove it (browsers send `Origin:` without one)"
+        );
+    }
+    // Reject a raw IDN — browsers transmit the Punycode (ASCII)
+    // form in `Origin:`, so the bytes wouldn't match anyway. The
+    // `Url` parser already normalizes the host to its ASCII form on
+    // parse; if the *raw* string contained a non-ASCII character,
+    // the parsed `origin()` ASCII-serialization won't equal `raw`.
+    let parsed_ascii = parsed.origin().ascii_serialization();
+    if parsed_ascii != raw {
+        anyhow::bail!(
+            "CORS origin {raw:?} must be ASCII-only (Punycode); browsers send the Punycoded form in `Origin:`. Use {parsed_ascii:?} instead."
         );
     }
     Ok(())
@@ -218,6 +237,41 @@ mod tests {
         let cfg = cfg_with_cors(vec!["not-a-url"]);
         cfg.validate()
             .expect_err("unparseable origin must be rejected");
+    }
+
+    #[test]
+    fn validate_rejects_origin_with_userinfo() {
+        let cfg = cfg_with_cors(vec!["https://user:pass@app.example"]);
+        let err = cfg.validate().expect_err("userinfo must be rejected");
+        assert!(
+            format!("{err:#}").contains("userinfo"),
+            "error mentions userinfo: {err:#}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_raw_idn() {
+        // Non-ASCII / raw IDN — browsers send the Punycoded form
+        // in `Origin:` so a raw IDN can never match.
+        let cfg = cfg_with_cors(vec!["https://äpp.example"]);
+        let err = cfg.validate().expect_err("raw IDN must be rejected");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("Punycode") || msg.contains("ASCII"),
+            "error suggests Punycode form: {msg}"
+        );
+        // And the error should suggest the ASCII (Punycode) form.
+        assert!(
+            msg.contains("xn--"),
+            "error should propose the Punycode form: {msg}"
+        );
+    }
+
+    #[test]
+    fn validate_accepts_punycode_form() {
+        let cfg = cfg_with_cors(vec!["https://xn--pp-eka.example"]);
+        cfg.validate()
+            .expect("the Punycode form of an IDN must validate");
     }
 
     #[test]
