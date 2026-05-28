@@ -7,10 +7,11 @@
 
 use std::collections::HashMap;
 use std::net::IpAddr;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
 use anyhow::Context;
+use astrid_core::PrincipalId;
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use rand::RngCore;
 use tokio::sync::Mutex;
@@ -176,6 +177,17 @@ pub struct GatewayState {
     pub redeem_limiter: Mutex<RedeemRateLimiter>,
     /// Prometheus counter set rendered at `/metrics`.
     pub metrics: Metrics,
+    /// Bearer revocation map: `principal → epoch when the principal
+    /// was deleted`. Populated by a background task that watches the
+    /// kernel's audit-event stream for successful `AgentDelete` ops,
+    /// persisted to `$ASTRID_HOME/etc/gateway-revocations.json`. The
+    /// auth middleware rejects any bearer whose `iat` is at or before
+    /// the recorded epoch — see [`crate::auth::verify_bearer`].
+    /// `std::sync::RwLock` because the read path (every authenticated
+    /// request) outweighs the write path (admin-only delete events)
+    /// by orders of magnitude, and the critical sections are
+    /// non-`await`-blocking.
+    pub revoked_at: Arc<RwLock<HashMap<PrincipalId, u64>>>,
 }
 
 impl GatewayState {
@@ -183,7 +195,8 @@ impl GatewayState {
     ///
     /// # Errors
     /// Returns an error if `distro_path` points at a file that can't
-    /// be read or whose contents fail to parse.
+    /// be read or whose contents fail to parse, or if the persisted
+    /// revocation file is present but corrupt.
     pub fn new(
         config: GatewayConfig,
         event_bus: Option<Arc<astrid_events::EventBus>>,
@@ -210,6 +223,9 @@ impl GatewayState {
         };
         let signing =
             SigningMaterial::load_or_generate().context("load or generate gateway signing key")?;
+        let revoked_at = Arc::new(RwLock::new(
+            crate::revocations::load_from_disk().context("load gateway revocations")?,
+        ));
         Ok(Arc::new(Self {
             config,
             signing,
@@ -218,6 +234,7 @@ impl GatewayState {
             redeem_limiter: Mutex::new(RedeemRateLimiter::default()),
             metrics: Metrics::default(),
             event_bus,
+            revoked_at,
         }))
     }
 

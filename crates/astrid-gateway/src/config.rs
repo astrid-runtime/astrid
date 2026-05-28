@@ -124,12 +124,22 @@ impl GatewayConfig {
         Duration::from_secs(self.redeem_rate_limit_secs)
     }
 
-    /// Post-deserialisation validation. Surfaces TLS misconfig early:
-    /// a missing cert/key path is a guaranteed boot failure, so
-    /// catching it here (with a clear message) beats discovering it
-    /// inside rustls' lower-level errors. Sibling PRs add further
-    /// validations (CORS origin grammar, etc.).
+    /// Post-deserialisation validation. Catches misconfigurations
+    /// that would otherwise silently no-op at runtime or fail with a
+    /// cryptic error deep inside rustls / `tower-http`:
+    ///
+    /// * **CORS origins** are checked against the `scheme://host[:port]`
+    ///   shape so an operator who typoed a trailing slash, fragment,
+    ///   IDN, etc., fails boot with a clear message rather than
+    ///   silently never matching a browser preflight.
+    /// * **TLS** cert/key paths must exist as regular files and not
+    ///   collide with each other — both common misconfigurations
+    ///   that the rustls PEM parser would surface as bewildering
+    ///   downstream errors.
     pub fn validate(&self) -> anyhow::Result<()> {
+        for raw in &self.cors_allow_origins {
+            validate_cors_origin(raw)?;
+        }
         if let Some(tls) = &self.tls {
             // `is_file()` catches both "doesn't exist" and "points
             // at a directory". `exists()` alone would pass for a
@@ -163,6 +173,65 @@ impl GatewayConfig {
     }
 }
 
+/// Validate a single CORS origin string. Origins MUST be of the form
+/// `scheme://host[:port]` with no path, query, or fragment — that's
+/// what the browser sends in `Origin:` and what the response's
+/// `Access-Control-Allow-Origin:` is byte-matched against. A
+/// `https://app.example/` (trailing slash) would silently fail to
+/// match a real preflight; rejecting it here is what makes that
+/// surfacable.
+fn validate_cors_origin(raw: &str) -> anyhow::Result<()> {
+    let parsed = url::Url::parse(raw)
+        .map_err(|e| anyhow::anyhow!("CORS origin {raw:?} doesn't parse as a URL: {e}"))?;
+    match parsed.scheme() {
+        "http" | "https" => {},
+        other => anyhow::bail!(
+            "CORS origin {raw:?} uses scheme {other:?}; only http/https are valid for browser origins"
+        ),
+    }
+    if parsed.host_str().is_none() {
+        anyhow::bail!("CORS origin {raw:?} has no host component");
+    }
+    // Browsers strip userinfo before sending `Origin:`, so a config
+    // entry with embedded credentials can never match a real
+    // preflight. Reject so operators don't silently misconfigure.
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        anyhow::bail!(
+            "CORS origin {raw:?} carries userinfo (user:password); browsers strip it before sending `Origin:` so this can never match"
+        );
+    }
+    if parsed.path() != "" && parsed.path() != "/" {
+        anyhow::bail!(
+            "CORS origin {raw:?} carries a path ({:?}); origins are scheme+host+port only",
+            parsed.path()
+        );
+    }
+    if parsed.query().is_some() || parsed.fragment().is_some() {
+        anyhow::bail!(
+            "CORS origin {raw:?} carries a query/fragment; origins are scheme+host+port only"
+        );
+    }
+    // Disallow trailing-slash forms — browsers send `https://app.example`
+    // (no slash) in `Origin:` and the response header is byte-matched.
+    if raw.ends_with('/') {
+        anyhow::bail!(
+            "CORS origin {raw:?} has a trailing slash; remove it (browsers send `Origin:` without one)"
+        );
+    }
+    // Reject a raw IDN — browsers transmit the Punycode (ASCII)
+    // form in `Origin:`, so the bytes wouldn't match anyway. The
+    // `Url` parser already normalizes the host to its ASCII form on
+    // parse; if the *raw* string contained a non-ASCII character,
+    // the parsed `origin()` ASCII-serialization won't equal `raw`.
+    let parsed_ascii = parsed.origin().ascii_serialization();
+    if parsed_ascii != raw {
+        anyhow::bail!(
+            "CORS origin {raw:?} must be ASCII-only (Punycode); browsers send the Punycoded form in `Origin:`. Use {parsed_ascii:?} instead."
+        );
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -172,6 +241,99 @@ mod tests {
         let cfg = GatewayConfig::default();
         assert!(!cfg.enabled);
         assert_eq!(cfg.listen, "127.0.0.1:7777");
+    }
+
+    fn cfg_with_cors(origins: Vec<&str>) -> GatewayConfig {
+        GatewayConfig {
+            cors_allow_origins: origins.into_iter().map(String::from).collect(),
+            ..GatewayConfig::default()
+        }
+    }
+
+    #[test]
+    fn validate_accepts_well_formed_origins() {
+        let cfg = cfg_with_cors(vec![
+            "https://app.example",
+            "http://localhost:5173",
+            "https://staging.example.com",
+        ]);
+        cfg.validate().expect("well-formed origins must pass");
+    }
+
+    #[test]
+    fn validate_rejects_origin_with_path() {
+        let cfg = cfg_with_cors(vec!["https://app.example/dashboard"]);
+        let err = cfg
+            .validate()
+            .expect_err("origin with path must be rejected");
+        assert!(
+            format!("{err:#}").contains("path"),
+            "error mentions path: {err:#}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_origin_with_trailing_slash() {
+        let cfg = cfg_with_cors(vec!["https://app.example/"]);
+        let err = cfg.validate().expect_err("trailing slash must be rejected");
+        assert!(
+            format!("{err:#}").contains("trailing slash"),
+            "error mentions trailing slash: {err:#}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_non_http_scheme() {
+        let cfg = cfg_with_cors(vec!["ftp://files.example"]);
+        let err = cfg
+            .validate()
+            .expect_err("non-http scheme must be rejected");
+        assert!(
+            format!("{err:#}").contains("scheme") || format!("{err:#}").contains("ftp"),
+            "error mentions scheme: {err:#}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_garbage() {
+        let cfg = cfg_with_cors(vec!["not-a-url"]);
+        cfg.validate()
+            .expect_err("unparseable origin must be rejected");
+    }
+
+    #[test]
+    fn validate_rejects_origin_with_userinfo() {
+        let cfg = cfg_with_cors(vec!["https://user:pass@app.example"]);
+        let err = cfg.validate().expect_err("userinfo must be rejected");
+        assert!(
+            format!("{err:#}").contains("userinfo"),
+            "error mentions userinfo: {err:#}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_raw_idn() {
+        // Non-ASCII / raw IDN — browsers send the Punycoded form
+        // in `Origin:` so a raw IDN can never match.
+        let cfg = cfg_with_cors(vec!["https://äpp.example"]);
+        let err = cfg.validate().expect_err("raw IDN must be rejected");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("Punycode") || msg.contains("ASCII"),
+            "error suggests Punycode form: {msg}"
+        );
+        // And the error should suggest the ASCII (Punycode) form.
+        assert!(
+            msg.contains("xn--"),
+            "error should propose the Punycode form: {msg}"
+        );
+    }
+
+    #[test]
+    fn validate_accepts_punycode_form() {
+        let cfg = cfg_with_cors(vec!["https://xn--pp-eka.example"]);
+        cfg.validate()
+            .expect("the Punycode form of an IDN must validate");
     }
 
     #[test]
