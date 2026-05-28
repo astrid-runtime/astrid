@@ -6,6 +6,7 @@ members = [
     "crates/astrid-capabilities",
     "crates/astrid-build",
     "crates/astrid-capsule",
+    "crates/astrid-capsule-install",
     "crates/astrid-cli",
     "crates/astrid-config",
     "crates/astrid-daemon",
@@ -13,6 +14,7 @@ members = [
     "crates/astrid-crypto",
     "crates/astrid-events",
     "crates/astrid-types",
+    "crates/astrid-gateway",
     "crates/astrid-hooks",
     "crates/astrid-integration-tests",
     "crates/astrid-kernel",
@@ -22,6 +24,7 @@ members = [
     "crates/astrid-storage",
     "crates/astrid-telemetry",
     "crates/astrid-test",
+    "crates/astrid-uplink",
     "crates/astrid-vfs",
     "crates/astrid-workspace",
 ]
@@ -32,7 +35,7 @@ edition = "2024"
 authors = ["Joshua J. Bouw <dev@joshuajbouw.com>", "Unicity Labs <info@unicity-labs.com>"]
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/unicity-astrid/astrid"
-rust-version = "1.94"
+rust-version = "1.95"
 
 [workspace.dependencies]
 astrid-approval = { path = "crates/astrid-approval", version = "0.7.0" }
@@ -40,6 +43,7 @@ astrid-audit = { path = "crates/astrid-audit", version = "0.7.0" }
 astrid-capabilities = { path = "crates/astrid-capabilities", version = "0.7.0" }
 astrid-build = { path = "crates/astrid-build", version = "0.7.0" }
 astrid-capsule = { path = "crates/astrid-capsule", version = "0.7.0" }
+astrid-capsule-install = { path = "crates/astrid-capsule-install", version = "0.7.0" }
 astrid-config = { path = "crates/astrid-config", version = "0.7.0" }
 astrid-daemon = { path = "crates/astrid-daemon", version = "0.7.0" }
 astrid-core = { path = "crates/astrid-core", version = "0.7.0" }
@@ -54,12 +58,30 @@ astrid-storage = { path = "crates/astrid-storage", version = "0.7.0" }
 astrid-telemetry = { path = "crates/astrid-telemetry", version = "0.7.0" }
 astrid-test = { path = "crates/astrid-test" }
 astrid-types = { path = "crates/astrid-types", version = "0.7.0", features = ["clock"] }
+astrid-uplink = { path = "crates/astrid-uplink", version = "0.7.0" }
+astrid-gateway = { path = "crates/astrid-gateway", version = "0.7.0" }
 astrid-vfs = { path = "crates/astrid-vfs", version = "0.7.0" }
 astrid-workspace = { path = "crates/astrid-workspace", version = "0.7.0" }
 anyhow = "1.0"
 arboard = "3"
 arc-swap = "1.7"
+# Streaming + HTTP-server deps (async-stream, axum, tokio-stream,
+# tower, tower-http, utoipa) all back the new `astrid-gateway` crate
+# and have no in-workspace substitute. They are scoped to
+# `astrid-gateway` (and `astrid-integration-tests` for the gateway
+# smoke test); none of the kernel/capsule crates depend on them. See
+# crates/astrid-gateway/Cargo.toml for the per-dep rationale.
+async-stream = "0.3"
 async-trait = "0.1"
+# Pinned to axum 0.7 because 0.8 changed the path-param syntax
+# (`:id` → `{id}`) and we rely on the matching tower stack
+# (`tower-http` 0.6, `utoipa-axum` 0.5). `default-features = false`
+# strips the multipart / `original-uri` / `ws` extractors we don't use.
+axum = { version = "0.7", default-features = false, features = ["http1", "json", "tokio", "tracing", "matched-path"] }
+# Bridges `tokio::sync::broadcast::Receiver` → `futures::Stream` so
+# axum's `Sse` responder can consume the kernel event bus directly.
+# The `sync` feature is the only thing that does it; not on by default.
+tokio-stream = { version = "0.1", features = ["sync"] }
 base64 = "0.22"
 blake3 = "1.5"
 # `default-features = false` strips chrono's `clock` feature, which on
@@ -127,6 +149,12 @@ thiserror = "2.0"
 tokio = { version = "1.49", features = ["sync", "macros", "time", "rt", "rt-multi-thread", "net", "io-util", "signal"] }
 tokio-util = "0.7"
 toml = "0.8"
+# Middleware substrate axum is built on (`Service` trait composition,
+# request-id, trace, CORS, body-size limit, response-header injection).
+# Dropping `tower-http` means re-implementing each middleware by hand;
+# nothing else in the workspace provides it.
+tower = { version = "0.5", features = ["util"] }
+tower-http = { version = "0.6", features = ["cors", "trace", "limit", "set-header"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 url = "2"
@@ -135,6 +163,11 @@ url = "2"
 # The `v4` feature uses `getrandom` under the hood — on host this is
 # the OS RNG, on capsule (wasm32-unknown-unknown) it's routed through
 # `astrid:sys.random-bytes` via the SDK's custom getrandom backend.
+# OpenAPI 3.x spec emission for `/api/openapi.json` + the drift test
+# that pins every router path against the spec. Workspace has no
+# other OpenAPI generator. `axum_extras` plugs into axum's extractor
+# system so `#[utoipa::path]` annotations on handlers carry through.
+utoipa = { version = "5", features = ["axum_extras"] }
 uuid = { version = "1.0", default-features = false, features = ["v4", "v5", "serde", "rng-getrandom"] }
 walkdir = "2.5"
 wasm-encoder = "0.227"

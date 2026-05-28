@@ -24,10 +24,14 @@
 #[cfg(test)]
 mod enforcement_tests;
 mod handlers;
+mod invite_handlers;
+mod pair_device_handlers;
 #[cfg(test)]
 mod state_tests;
 #[cfg(test)]
 mod state_tests_agent_modify;
+#[cfg(test)]
+mod state_tests_caps;
 #[cfg(test)]
 mod tests;
 
@@ -74,8 +78,23 @@ pub(crate) fn spawn_admin_router(kernel: Arc<crate::Kernel>) -> tokio::task::Joi
 
             match serde_json::from_value::<AdminKernelRequest>(val.clone()) {
                 Ok(req) => {
+                    // Spawn a fresh task per request so reads
+                    // (AgentList, GroupList, QuotaGet, …) run in
+                    // parallel. Writes still serialize through
+                    // `kernel.admin_write_lock` inside the handler.
+                    // Without this, a single in-flight admin
+                    // request blocked every other admin request —
+                    // the dispatcher was the bottleneck pinning
+                    // gateway admin throughput at ~120 RPS even on
+                    // pure-read endpoints. (For an HTTP front that
+                    // hosts thousands of agents the serial loop is
+                    // unworkable.)
+                    let kernel = Arc::clone(&kernel);
+                    let topic = message.topic.clone();
                     let caller = resolve_caller(message);
-                    handle_admin_request(&kernel, message.topic.clone(), caller, req).await;
+                    tokio::spawn(async move {
+                        handle_admin_request(&kernel, topic, caller, req).await;
+                    });
                 },
                 Err(e) => {
                     warn!(
@@ -126,7 +145,9 @@ pub fn resolve_admin_scope(req: &AdminRequestKind, caller: &PrincipalId) -> Auth
         // modify`) keep their own dedicated caps (`group:create`,
         // `group:delete`, `group:modify`) and remain
         // `AuthorityScope::Global` below, so this widening is read-only.
-        AdminRequestKind::AgentList | AdminRequestKind::GroupList => AuthorityScope::Self_,
+        AdminRequestKind::AgentList
+        | AdminRequestKind::GroupList
+        | AdminRequestKind::PairDeviceIssue { .. } => AuthorityScope::Self_,
         AdminRequestKind::AgentCreate { .. }
         | AdminRequestKind::AgentDelete { .. }
         | AdminRequestKind::AgentEnable { .. }
@@ -136,7 +157,16 @@ pub fn resolve_admin_scope(req: &AdminRequestKind, caller: &PrincipalId) -> Auth
         | AdminRequestKind::GroupDelete { .. }
         | AdminRequestKind::GroupModify { .. }
         | AdminRequestKind::CapsGrant { .. }
-        | AdminRequestKind::CapsRevoke { .. } => AuthorityScope::Global,
+        | AdminRequestKind::CapsRevoke { .. }
+        | AdminRequestKind::InviteIssue { .. }
+        | AdminRequestKind::InviteRedeem { .. }
+        | AdminRequestKind::InviteList
+        | AdminRequestKind::InviteRevoke { .. }
+        | AdminRequestKind::PairDeviceRedeem { .. } => AuthorityScope::Global,
+        // Note: PairDeviceIssue is intrinsically self-scoped — the
+        // kernel binds the token to the caller's own principal
+        // regardless of any wire-level hint. Folded into the Self_
+        // arm above with AgentList / GroupList.
     }
 }
 
@@ -173,6 +203,23 @@ pub fn required_capability_for_admin_request(
         (AdminRequestKind::GroupList, AuthorityScope::Global) => "group:list",
         (AdminRequestKind::CapsGrant { .. }, _) => "caps:grant",
         (AdminRequestKind::CapsRevoke { .. }, _) => "caps:revoke",
+        (AdminRequestKind::InviteIssue { .. }, _) => "invite:issue",
+        // `InviteRedeem` is special-cased in `handle_admin_request`
+        // below — the dispatcher bypasses the capability preamble
+        // because the caller principal does not exist yet (the token
+        // IS the auth). The string returned here is unused for that
+        // variant but kept for completeness so audit records still
+        // carry a stable name. We pick `invite:redeem` rather than
+        // leaving it blank so the audit log reads cleanly.
+        (AdminRequestKind::InviteRedeem { .. }, _) => "invite:redeem",
+        (AdminRequestKind::InviteList, _) => "invite:list",
+        (AdminRequestKind::InviteRevoke { .. }, _) => "invite:revoke",
+        // PairDeviceIssue is self-scoped (kernel binds to caller).
+        (AdminRequestKind::PairDeviceIssue { .. }, _) => "self:auth:pair",
+        // PairDeviceRedeem mirrors InviteRedeem: dispatcher
+        // bypasses the cap-gate because the token IS the auth.
+        // String kept here for audit-log readability.
+        (AdminRequestKind::PairDeviceRedeem { .. }, _) => "auth:pair:redeem",
     }
 }
 
@@ -195,6 +242,93 @@ pub fn admin_request_method(req: &AdminRequestKind) -> &'static str {
         AdminRequestKind::GroupList => "admin.group.list",
         AdminRequestKind::CapsGrant { .. } => "admin.caps.grant",
         AdminRequestKind::CapsRevoke { .. } => "admin.caps.revoke",
+        AdminRequestKind::InviteIssue { .. } => "admin.invite.issue",
+        AdminRequestKind::InviteRedeem { .. } => "admin.invite.redeem",
+        AdminRequestKind::InviteList => "admin.invite.list",
+        AdminRequestKind::InviteRevoke { .. } => "admin.invite.revoke",
+        AdminRequestKind::PairDeviceIssue { .. } => "admin.auth.pair.issue",
+        AdminRequestKind::PairDeviceRedeem { .. } => "admin.auth.pair.redeem",
+    }
+}
+
+/// Serialise an [`AdminRequestKind`] for audit storage with sensitive
+/// fields redacted. Keeps the wire-name shape so audit consumers can
+/// still discriminate variants — only the secret-bearing fields are
+/// dropped or hashed.
+///
+/// Redactions:
+///
+/// * `InviteRedeem.public_key` → `public_key_fingerprint` (SHA-256 of
+///   the supplied key). Storing the raw ed25519 key in the audit log
+///   would double the system of record for authorization, which Layer
+///   5/6 treat as `AuthConfig.public_keys` alone.
+/// * `InviteRedeem.token` → `token_fingerprint` (`hex(sha256(token))`).
+///   The raw invite token is a secret that grants the right to mint a
+///   principal; persisting it in the audit log would let anyone with
+///   read access replay it on a multi-use invite. The fingerprint
+///   matches the on-disk hash in `invites.toml`, so an auditor can
+///   still correlate a redeem to the issued invite.
+/// * `InviteRevoke.token` → `token_fingerprint`. Same hazard as
+///   `InviteRedeem.token`: the caller can pass either the raw token or
+///   the already-fingerprinted form. Hash unconditionally when the
+///   input doesn't already look like a fingerprint (64 hex chars).
+fn sanitize_admin_audit_params(req: &AdminRequestKind) -> Option<serde_json::Value> {
+    let mut val = serde_json::to_value(req).ok()?;
+    let params = val
+        .as_object_mut()
+        .and_then(|m| m.get_mut("params"))
+        .and_then(|p| p.as_object_mut())?;
+    match req {
+        AdminRequestKind::InviteRedeem {
+            public_key, token, ..
+        } => {
+            let fp = invite_handlers::fingerprint_public_key(public_key);
+            params.remove("public_key");
+            params.insert(
+                "public_key_fingerprint".to_string(),
+                serde_json::Value::String(fp),
+            );
+            params.remove("token");
+            params.insert(
+                "token_fingerprint".to_string(),
+                serde_json::Value::String(crate::invite::hash_token(token)),
+            );
+        },
+        AdminRequestKind::InviteRevoke { token } => {
+            params.remove("token");
+            params.insert(
+                "token_fingerprint".to_string(),
+                serde_json::Value::String(fingerprint_revoke_input(token)),
+            );
+        },
+        AdminRequestKind::PairDeviceRedeem { token, public_key } => {
+            let fp = invite_handlers::fingerprint_public_key(public_key);
+            params.remove("public_key");
+            params.insert(
+                "public_key_fingerprint".to_string(),
+                serde_json::Value::String(fp),
+            );
+            params.remove("token");
+            params.insert(
+                "token_fingerprint".to_string(),
+                serde_json::Value::String(crate::pair_token::hash_token(token)),
+            );
+        },
+        _ => {},
+    }
+    Some(val)
+}
+
+/// Fingerprint helper for `InviteRevoke.token`, which can be supplied
+/// either as the raw token *or* as an already-fingerprinted 64-hex
+/// identifier (from `astrid invite list`). The audit row stores the
+/// fingerprint form unconditionally so an auditor can correlate
+/// against `invites.toml` without seeing the secret.
+fn fingerprint_revoke_input(token: &str) -> String {
+    if token.len() == 64 && token.chars().all(|c| c.is_ascii_hexdigit()) {
+        token.to_ascii_lowercase()
+    } else {
+        crate::invite::hash_token(token)
     }
 }
 
@@ -216,7 +350,13 @@ pub fn admin_target_principal(req: &AdminRequestKind) -> Option<&PrincipalId> {
         | AdminRequestKind::GroupCreate { .. }
         | AdminRequestKind::GroupDelete { .. }
         | AdminRequestKind::GroupModify { .. }
-        | AdminRequestKind::GroupList => None,
+        | AdminRequestKind::GroupList
+        | AdminRequestKind::InviteIssue { .. }
+        | AdminRequestKind::InviteRedeem { .. }
+        | AdminRequestKind::InviteList
+        | AdminRequestKind::InviteRevoke { .. }
+        | AdminRequestKind::PairDeviceIssue { .. }
+        | AdminRequestKind::PairDeviceRedeem { .. } => None,
     }
 }
 
@@ -234,8 +374,45 @@ async fn handle_admin_request(
     let target = admin_target_principal(&req.kind).cloned();
     // Capture the params field for the audit entry — clients submitting
     // malformed JSON never reach this point, so serialization is
-    // infallible for shapes we accept.
-    let audit_params = serde_json::to_value(&req.kind).ok();
+    // infallible for shapes we accept. We strip the `public_key` field
+    // out of `InviteRedeem` payloads before storing because the audit
+    // shouldn't permanently embed an ed25519 key that a verifier might
+    // later mistake for a system-of-record entry — the canonical copy
+    // lives on `AuthConfig.public_keys`.
+    let audit_params = sanitize_admin_audit_params(&req.kind);
+
+    // `InviteRedeem` is the one variant that bypasses the capability
+    // preamble: the redeemer's principal does not exist yet at the
+    // moment the request arrives — the token IS the auth. The handler
+    // verifies the token internally and either mints a principal or
+    // rejects the request. Every redeem still produces an audit row
+    // (allow OR deny) below.
+    if matches!(
+        req.kind,
+        AdminRequestKind::InviteRedeem { .. } | AdminRequestKind::PairDeviceRedeem { .. }
+    ) {
+        record_admin_audit(
+            kernel,
+            AdminAuditEntry {
+                caller: &caller,
+                method,
+                required_cap,
+                target_principal: None,
+                params: audit_params.clone(),
+                authorization: AuthorizationProof::System {
+                    reason: "redeem (invite or pair-device): token is the auth".to_string(),
+                },
+                outcome: AuditOutcome::success(),
+            },
+        );
+        let body = handlers::dispatch(kernel, &caller, req.kind).await;
+        publish_response(
+            kernel,
+            response_topic,
+            AdminKernelResponse::for_request(request_id, body),
+        );
+        return;
+    }
 
     match authorize_request(kernel, &caller, required_cap) {
         Ok(()) => {
@@ -289,7 +466,7 @@ async fn handle_admin_request(
         },
     }
 
-    let body = handlers::dispatch(kernel, req.kind).await;
+    let body = handlers::dispatch(kernel, &caller, req.kind).await;
     publish_response(
         kernel,
         response_topic,

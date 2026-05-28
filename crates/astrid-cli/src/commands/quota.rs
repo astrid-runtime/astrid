@@ -16,7 +16,7 @@ use clap::{Args, Subcommand};
 use colored::Colorize;
 use serde::Serialize;
 
-use crate::admin_client::{AdminClient, into_result};
+use crate::admin_client::into_result;
 use crate::context;
 use crate::value_formatter::{ValueFormat, emit_structured};
 
@@ -106,7 +106,7 @@ fn record(principal: &PrincipalId, q: &Quotas) -> QuotaRecord {
 }
 
 async fn fetch_quotas(target: &PrincipalId) -> Result<Quotas> {
-    let mut client = AdminClient::connect().await?;
+    let mut client = crate::admin_client::connect_as_active_agent().await?;
     let body = client
         .request(AdminRequestKind::QuotaGet {
             principal: target.clone(),
@@ -183,7 +183,7 @@ async fn run_set(args: SetArgs) -> Result<ExitCode> {
         return Ok(ExitCode::from(1));
     }
     let target = context::resolve_agent(args.agent.as_deref())?;
-    let mut client = AdminClient::connect().await?;
+    let mut client = crate::admin_client::connect_as_active_agent().await?;
     let body = client
         .request(AdminRequestKind::QuotaGet {
             principal: target.clone(),

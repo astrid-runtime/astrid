@@ -130,7 +130,7 @@ pub(crate) async fn run_headless(
     };
 
     // Send the prompt and collect the streaming response
-    client.send_input(full_prompt).await?;
+    crate::socket_client::send_input_as_active_agent(&mut client, full_prompt).await?;
     let (response_text, tool_calls) =
         collect_response(&mut client, &session_id, format, auto_approve).await?;
 
@@ -175,7 +175,7 @@ async fn collect_response(
 ) -> Result<(String, Vec<serde_json::Value>)> {
     let mut response_text = String::new();
     let mut tool_calls: Vec<serde_json::Value> = Vec::new();
-    let timeout_duration = std::time::Duration::from_secs(120);
+    let timeout_duration = std::time::Duration::from_mins(2);
 
     loop {
         let message = match tokio::time::timeout(timeout_duration, client.read_message()).await {

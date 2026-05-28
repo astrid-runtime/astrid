@@ -3,6 +3,8 @@
 pub(crate) mod config;
 pub(crate) mod deps;
 pub(crate) mod install;
+pub(crate) mod install_prompts;
+pub(crate) mod install_update;
 pub(crate) mod list;
 pub(crate) mod meta;
 pub(crate) mod remove;

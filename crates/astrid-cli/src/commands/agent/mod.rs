@@ -284,7 +284,7 @@ async fn run_create(mut args: CreateArgs) -> Result<ExitCode> {
     // duplicating the policy.
     let groups = std::mem::take(&mut args.groups);
 
-    let mut client = AdminClient::connect().await?;
+    let mut client = crate::admin_client::connect_as_active_agent().await?;
     // Hand `caps_to_grant` directly to `AgentCreate.grants` so the
     // capability grants land in the same admin call as the profile
     // write — atomic from the operator's perspective. The kernel
@@ -467,7 +467,7 @@ async fn run_list(args: ListArgs) -> Result<ExitCode> {
     }
     let format = ValueFormat::parse(&args.format);
 
-    let mut client = AdminClient::connect().await?;
+    let mut client = crate::admin_client::connect_as_active_agent().await?;
     let body = client.request(AdminRequestKind::AgentList).await?;
     let body = into_result(body)?;
 
@@ -532,7 +532,7 @@ async fn run_switch(args: SwitchArgs) -> Result<ExitCode> {
     // Verify the agent exists. An admin client connection is required,
     // but if the daemon is offline we still allow setting context — the
     // operator may be configuring before starting the daemon.
-    if let Ok(mut client) = AdminClient::connect().await
+    if let Ok(mut client) = crate::admin_client::connect_as_active_agent().await
         && let Ok(body) = client.request(AdminRequestKind::AgentList).await
         && let AdminResponseBody::AgentList(list) = body
         && !list.iter().any(|a| a.principal == principal)
@@ -556,7 +556,7 @@ async fn run_switch(args: SwitchArgs) -> Result<ExitCode> {
 async fn run_show(args: ShowArgs) -> Result<ExitCode> {
     let target = context::resolve_agent(args.name.as_deref())?;
     let format = ValueFormat::parse(&args.format);
-    let mut client = AdminClient::connect().await?;
+    let mut client = crate::admin_client::connect_as_active_agent().await?;
     let body = client.request(AdminRequestKind::AgentList).await?;
     let body = into_result(body)?;
     let agents = match body {
@@ -620,7 +620,7 @@ async fn run_delete(args: DeleteArgs) -> Result<ExitCode> {
             return Ok(ExitCode::from(1));
         }
     }
-    let mut client = AdminClient::connect().await?;
+    let mut client = crate::admin_client::connect_as_active_agent().await?;
     let body = client
         .request(AdminRequestKind::AgentDelete { principal })
         .await?;
@@ -634,7 +634,7 @@ async fn run_delete(args: DeleteArgs) -> Result<ExitCode> {
 
 async fn run_enable(args: EnableArgs) -> Result<ExitCode> {
     let principal = PrincipalId::new(&args.name).context("invalid agent name")?;
-    let mut client = AdminClient::connect().await?;
+    let mut client = crate::admin_client::connect_as_active_agent().await?;
     let body = client
         .request(AdminRequestKind::AgentEnable { principal })
         .await?;
@@ -648,7 +648,7 @@ async fn run_enable(args: EnableArgs) -> Result<ExitCode> {
 
 async fn run_disable(args: DisableArgs) -> Result<ExitCode> {
     let principal = PrincipalId::new(&args.name).context("invalid agent name")?;
-    let mut client = AdminClient::connect().await?;
+    let mut client = crate::admin_client::connect_as_active_agent().await?;
     let body = client
         .request(AdminRequestKind::AgentDisable { principal })
         .await?;
@@ -674,7 +674,7 @@ async fn run_modify(args: ModifyArgs) -> Result<ExitCode> {
         eprintln!("astrid: nothing to do (specify --add-group or --remove-group)");
         return Ok(ExitCode::from(1));
     }
-    let mut client = AdminClient::connect().await?;
+    let mut client = crate::admin_client::connect_as_active_agent().await?;
     let body = client
         .request(AdminRequestKind::AgentModify {
             principal: principal.clone(),

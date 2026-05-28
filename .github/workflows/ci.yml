@@ -33,7 +33,7 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: "1.94"
+          toolchain: "1.95"
           targets: wasm32-wasip1
 
       - name: Setup Node.js
@@ -66,7 +66,7 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: "1.94"
+          toolchain: "1.95"
           components: rustfmt
 
       - name: Run cargo fmt
@@ -83,7 +83,7 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: "1.94"
+          toolchain: "1.95"
           components: clippy
           targets: wasm32-wasip1
 
@@ -120,7 +120,7 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: "1.94"
+          toolchain: "1.95"
           targets: wasm32-unknown-unknown,wasm32-wasip1
 
       - name: Setup Node.js
@@ -165,7 +165,7 @@ jobs:
       - name: Install MSRV toolchain
         uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: "1.94"
+          toolchain: "1.95"
           targets: wasm32-wasip1
 
       - name: Setup Node.js

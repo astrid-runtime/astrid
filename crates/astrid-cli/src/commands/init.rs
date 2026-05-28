@@ -97,7 +97,7 @@ pub(crate) async fn run_init(distro_source: &str) -> anyhow::Result<()> {
 
     eprintln!();
     eprintln!("{}", Theme::success("Installation complete."));
-    eprintln!("  Run {} to start.", Theme::prompt("astrid"),);
+    eprintln!("  Run {} to start.", Theme::prompt("astrid"));
 
     Ok(())
 }

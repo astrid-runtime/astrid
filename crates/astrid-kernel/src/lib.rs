@@ -11,8 +11,12 @@
 //! is to instantiate `astrid_events::EventBus`, load `.capsule` files into
 //! the Extism sandbox, and route IPC bytes between them.
 
+/// Persistent invite-token store (issue #756).
+pub mod invite;
 /// The Management API router listening to the `EventBus`.
 pub mod kernel_router;
+/// Persistent pair-device token store (issue #756).
+pub mod pair_token;
 /// The Unix Domain Socket manager.
 pub mod socket;
 
@@ -1211,7 +1215,7 @@ struct RestartTracker {
 impl RestartTracker {
     const MAX_ATTEMPTS: u32 = 5;
     const INITIAL_BACKOFF: std::time::Duration = std::time::Duration::from_secs(2);
-    const MAX_BACKOFF: std::time::Duration = std::time::Duration::from_secs(120);
+    const MAX_BACKOFF: std::time::Duration = std::time::Duration::from_mins(2);
 
     fn new() -> Self {
         Self {

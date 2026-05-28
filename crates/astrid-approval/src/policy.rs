@@ -173,9 +173,7 @@ impl SecurityPolicy {
             }
         }
 
-        PolicyResult::RequiresApproval(RiskAssessment::new(
-            format!("command execution: {command}",),
-        ))
+        PolicyResult::RequiresApproval(RiskAssessment::new(format!("command execution: {command}")))
     }
 
     /// Check an MCP tool call.
@@ -230,7 +228,7 @@ impl SecurityPolicy {
             };
         }
 
-        PolicyResult::RequiresApproval(RiskAssessment::new(format!("{operation}: {path}",)))
+        PolicyResult::RequiresApproval(RiskAssessment::new(format!("{operation}: {path}")))
     }
 
     /// Check a file delete action.

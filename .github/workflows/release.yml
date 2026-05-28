@@ -45,7 +45,7 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: "1.94"
+          toolchain: "1.95"
           targets: ${{ matrix.target }}
 
       - name: Install cross-compilation tools (Linux ARM)
@@ -157,7 +157,7 @@ jobs:
 
             ## Install
 
-            **From source (requires Rust 1.94+):**
+            **From source (requires Rust 1.95+):**
             ```
             cargo install astrid
             ```

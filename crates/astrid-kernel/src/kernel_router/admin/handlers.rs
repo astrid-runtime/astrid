@@ -42,8 +42,17 @@ const AGENT_IDENTITY_PLATFORM: &str = "cli";
 
 /// Dispatch an already-authorized [`AdminRequestKind`] to the matching
 /// handler.
+///
+/// `caller` is the verified principal from the IPC handshake. Most
+/// handlers ignore it (the target principal comes from the request
+/// body for variants like [`AdminRequestKind::CapsGrant`]), but
+/// handlers that intrinsically bind a result to the caller
+/// (notably [`AdminRequestKind::PairDeviceIssue`], which mints a
+/// token tied to the caller's own principal regardless of any
+/// wire-level hint) need it.
 pub(super) async fn dispatch(
     kernel: &Arc<crate::Kernel>,
+    caller: &PrincipalId,
     req: AdminRequestKind,
 ) -> AdminResponseBody {
     match req {
@@ -100,6 +109,34 @@ pub(super) async fn dispatch(
             principal,
             capabilities,
         } => mutate_caps(kernel, &principal, capabilities, CapsMutation::Revoke).await,
+        AdminRequestKind::InviteIssue {
+            group,
+            expires_secs,
+            max_uses,
+            metadata,
+        } => {
+            super::invite_handlers::invite_issue(kernel, group, expires_secs, max_uses, metadata)
+                .await
+        },
+        AdminRequestKind::InviteRedeem {
+            token,
+            public_key,
+            display_name,
+        } => super::invite_handlers::invite_redeem(kernel, token, public_key, display_name).await,
+        AdminRequestKind::InviteList => super::invite_handlers::invite_list(kernel).await,
+        AdminRequestKind::InviteRevoke { token } => {
+            super::invite_handlers::invite_revoke(kernel, token).await
+        },
+        AdminRequestKind::PairDeviceIssue {
+            expires_secs,
+            label,
+        } => {
+            super::pair_device_handlers::pair_device_issue(kernel, caller, expires_secs, label)
+                .await
+        },
+        AdminRequestKind::PairDeviceRedeem { token, public_key } => {
+            super::pair_device_handlers::pair_device_redeem(kernel, token, public_key).await
+        },
     }
 }
 

@@ -1,0 +1,79 @@
+[package]
+name = "astrid-gateway"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "HTTP gateway for the Astrid admin API — translates HTTP requests into the daemon's IPC management surface."
+
+# Dependency footprint is intentionally HTTP-server-shaped (axum + the
+# tower + tokio-stream + utoipa ecosystem). Why each is non-negotiable:
+#
+# - `axum`               — the HTTP framework itself; routing, extractors,
+#                          SSE responder. There is no in-workspace HTTP
+#                          server to reuse.
+# - `tower` / `tower-http` — middleware substrate axum is built on
+#                          (`Service` trait, CORS, trace, request-id);
+#                          dropping them means re-implementing middleware
+#                          composition by hand.
+# - `async-stream` / `tokio-stream` — Server-Sent Events plumbing for
+#                          `/api/events` and `/api/agent/prompt`. The
+#                          kernel's event bus exposes a `broadcast::Receiver`;
+#                          these crates adapt it into a `futures::Stream`
+#                          that axum's `Sse` responder consumes. Removing
+#                          either forces a custom `Stream` impl per route.
+# - `utoipa`             — OpenAPI 3.x emission for `/api/openapi.json` and
+#                          the drift test that pins every router path against
+#                          the spec. Workspace has no other OpenAPI generator.
+# - `uuid`               — UUID v4 for response-topic correlation on the
+#                          bus-direct admin path AND temp-file disambiguation
+#                          for sibling-task install/env writes (Gemini r2 race
+#                          fix). Workspace already pulls it for other crates.
+# - `tokio-util`         — `Bytes`/`BytesMut` helpers used by the body parser.
+# - `chrono [clock]`     — wall-clock timestamps in audit envelopes and
+#                          bearer expiry. Capsules see this dep without `clock`;
+#                          the gateway is a kernel-side consumer so opting in
+#                          is correct.
+#
+# Everything else (`anyhow`, `serde*`, `tokio`, `rand`, `sha2`, …) is already
+# load-bearing across the workspace; pulling them here introduces no new
+# vertices.
+
+[dependencies]
+anyhow = { workspace = true }
+async-stream = { workspace = true }
+astrid-audit = { workspace = true }
+astrid-core = { workspace = true }
+astrid-events = { workspace = true }
+astrid-storage = { workspace = true }
+astrid-types = { workspace = true }
+astrid-uplink = { workspace = true }
+axum = { workspace = true }
+base64 = { workspace = true }
+chrono = { workspace = true, features = ["clock"] }
+ed25519-dalek = { workspace = true }
+futures = { workspace = true }
+hex = { workspace = true }
+rand = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+subtle = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["full"] }
+tokio-stream = { workspace = true }
+tokio-util = { workspace = true }
+toml = { workspace = true }
+tower = { workspace = true }
+tower-http = { workspace = true }
+tracing = { workspace = true }
+utoipa = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[lints]
+workspace = true

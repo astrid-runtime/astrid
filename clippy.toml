@@ -2,7 +2,7 @@
 # See: https://doc.rust-lang.org/clippy/lint_configuration.html
 
 # MSRV for lint suggestions
-msrv = "1.94"
+msrv = "1.95"
 
 # Complexity thresholds
 cognitive-complexity-threshold = 25

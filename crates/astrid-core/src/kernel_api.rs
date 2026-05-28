@@ -321,6 +321,87 @@ pub enum AdminRequestKind {
         /// Capability patterns to revoke.
         capabilities: Vec<String>,
     },
+    /// Issue a new invite token. Capability-gated by `invite:issue`.
+    /// The kernel persists the token under `etc/invites.toml` with
+    /// expiry + remaining use count, and the caller publishes the
+    /// returned redeem URL out-of-band.
+    InviteIssue {
+        /// Group new redeemers join. Must already exist (built-in or
+        /// custom) — validated against the live `GroupConfig`.
+        group: String,
+        /// Seconds until the token expires. `None` = no expiry (the
+        /// max-uses counter is the only stop). Capped server-side to
+        /// 30 days to bound forever-tokens.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expires_secs: Option<u64>,
+        /// Maximum number of successful redemptions before the token is
+        /// invalidated. Zero is rejected (issuing a dead token serves
+        /// no purpose).
+        max_uses: u32,
+        /// Free-form short label (e.g. "alice's tablet") attached to
+        /// the persisted record. Surfaced by `InviteList`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        metadata: Option<String>,
+    },
+    /// Redeem an invite token. The token IS the auth: the kernel-side
+    /// dispatcher special-cases this variant to skip the capability
+    /// preamble (the caller principal does not yet exist), and the
+    /// handler verifies the token, mints a fresh principal via the
+    /// existing `AgentCreate` machinery, registers the supplied
+    /// ed25519 public key on the new principal's profile, and decrements
+    /// the token's use counter (deleting the record on the last use).
+    InviteRedeem {
+        /// Opaque token bytes (URL-safe base64) returned from a prior
+        /// `InviteIssue`.
+        token: String,
+        /// Hex-encoded ed25519 public key (32 bytes / 64 hex chars).
+        /// Registered on the new principal's `AuthConfig.public_keys`.
+        public_key: String,
+        /// Optional human-friendly name attached to the minted principal.
+        /// When `Some(s)`, the kernel generates the underlying
+        /// `PrincipalId` from `s` (slugified, collision-checked); when
+        /// `None`, a random `agent-<8-hex>` id is allocated.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        display_name: Option<String>,
+    },
+    /// List outstanding invite tokens. Gated by `invite:list`.
+    InviteList,
+    /// Revoke an outstanding invite token without consuming it.
+    /// Gated by `invite:revoke`.
+    InviteRevoke {
+        /// The opaque token to invalidate.
+        token: String,
+    },
+    /// Issue a pair-device token. Gated by `self:auth:pair` (the
+    /// caller can only mint pair-tokens for their own principal —
+    /// the kernel ignores any target field on the wire and ties the
+    /// token to the caller). Used to add a new device's ed25519
+    /// public key to an existing principal's `AuthConfig.public_keys`
+    /// without minting a separate principal.
+    PairDeviceIssue {
+        /// Seconds until the token expires. Capped server-side to
+        /// 1 hour — pair-tokens are intended for immediate use on a
+        /// neighbouring device, not for long-lived sharing.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expires_secs: Option<u64>,
+        /// Free-form short label (e.g. "alice's phone") persisted
+        /// alongside the new public key on
+        /// `AuthConfig.public_keys` once the token is redeemed.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        label: Option<String>,
+    },
+    /// Redeem a pair-device token. Like `InviteRedeem`, the kernel
+    /// dispatcher special-cases this to bypass the capability
+    /// preamble — the token IS the auth. The handler verifies the
+    /// token, appends the supplied public key to the issuing
+    /// principal's `AuthConfig.public_keys`, and decrements / deletes
+    /// the token record.
+    PairDeviceRedeem {
+        /// The opaque token from a prior `PairDeviceIssue`.
+        token: String,
+        /// Hex-encoded ed25519 public key (32 bytes / 64 hex chars).
+        public_key: String,
+    },
 }
 
 /// Admin management API response wrapper carrying the echoed
@@ -366,6 +447,23 @@ pub enum AdminResponseBody {
     GroupList(Vec<GroupSummary>),
     /// Response for [`AdminRequestKind::QuotaGet`].
     Quotas(Quotas),
+    /// Response for [`AdminRequestKind::InviteIssue`] — the freshly
+    /// minted token plus its persisted metadata. The redemption URL is
+    /// derived client-side from the deployment's public gateway base
+    /// URL; the kernel never knows where the gateway is reachable.
+    Invite(InviteIssued),
+    /// Response for [`AdminRequestKind::InviteRedeem`] — the new
+    /// principal id (so the redeemer can locally pin the binding) and
+    /// the assigned group. The redeemer also gets back the issuing
+    /// public-key fingerprint so out-of-band verification of the
+    /// minted principal becomes possible.
+    InviteRedeemed(InviteRedeemed),
+    /// Response for [`AdminRequestKind::InviteList`].
+    InviteList(Vec<InviteSummary>),
+    /// Response for [`AdminRequestKind::PairDeviceIssue`].
+    PairToken(PairTokenIssued),
+    /// Response for [`AdminRequestKind::PairDeviceRedeem`].
+    PairTokenRedeemed(PairTokenRedeemed),
     /// The request failed.
     Error(String),
 }
@@ -384,6 +482,90 @@ pub struct AgentSummary {
     pub grants: Vec<String>,
     /// Explicit revokes (highest-precedence deny).
     pub revokes: Vec<String>,
+}
+
+/// Response payload for [`AdminRequestKind::InviteIssue`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InviteIssued {
+    /// Opaque token (URL-safe base64). The caller delivers this to the
+    /// redeemer out-of-band — e.g. printed by the CLI, surfaced by the
+    /// gateway as a redeem URL fragment, or pasted into a chat.
+    pub token: String,
+    /// Group the redeemer will join on success.
+    pub group: String,
+    /// Number of remaining redemptions before the token is invalidated.
+    pub remaining_uses: u32,
+    /// Wall-clock Unix-epoch timestamp at which the token expires.
+    /// `None` when the issuer requested no expiry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at_epoch: Option<u64>,
+    /// Operator-supplied label (`metadata` from the issue request).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<String>,
+}
+
+/// Response payload for [`AdminRequestKind::InviteRedeem`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InviteRedeemed {
+    /// The freshly minted principal id. The redeemer pins this locally
+    /// alongside its keypair so subsequent gateway sessions can verify
+    /// the binding.
+    pub principal: PrincipalId,
+    /// Group the new principal is now a member of.
+    pub group: String,
+    /// SHA-256 fingerprint (hex) of the registered ed25519 public key.
+    /// Lets the redeemer verify that the kernel registered the key it
+    /// sent rather than substituting one of its own.
+    pub public_key_fingerprint: String,
+}
+
+/// Response payload for [`AdminRequestKind::PairDeviceIssue`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PairTokenIssued {
+    /// Opaque token. The issuing device hands this to the new
+    /// device out-of-band (QR code, NFC, manual copy).
+    pub token: String,
+    /// Principal the new device's key will attach to (always the
+    /// caller, never request-body derived).
+    pub principal: PrincipalId,
+    /// Wall-clock Unix-epoch timestamp at which the token expires.
+    pub expires_at_epoch: u64,
+    /// Operator-supplied label (echoed; not yet bound).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+}
+
+/// Response payload for [`AdminRequestKind::PairDeviceRedeem`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PairTokenRedeemed {
+    /// The principal the new device is now bound to.
+    pub principal: PrincipalId,
+    /// SHA-256 fingerprint (hex) of the registered ed25519 key.
+    /// Lets the redeemer verify the kernel registered the key it
+    /// sent rather than substituting one of its own.
+    pub public_key_fingerprint: String,
+}
+
+/// Summary of an outstanding invite returned by
+/// [`AdminRequestKind::InviteList`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InviteSummary {
+    /// SHA-256 fingerprint (hex) of the token — the kernel does not
+    /// leak the raw token through list responses. Issuers retain the
+    /// raw value from the original [`InviteIssued`] response.
+    pub token_fingerprint: String,
+    /// Group the redeemer will join.
+    pub group: String,
+    /// Remaining redemptions.
+    pub remaining_uses: u32,
+    /// Wall-clock Unix-epoch timestamp at which the token expires.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at_epoch: Option<u64>,
+    /// Wall-clock Unix-epoch timestamp at which the token was issued.
+    pub issued_at_epoch: u64,
+    /// Operator-supplied label.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<String>,
 }
 
 /// Summary of a group returned by [`AdminKernelRequest::GroupList`].

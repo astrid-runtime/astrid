@@ -47,11 +47,10 @@ pub struct IpcMessage {
 /// kernel-side code always sets a real timestamp before publish.
 #[cfg(not(feature = "clock"))]
 fn default_unix_epoch() -> DateTime<Utc> {
-    DateTime::<Utc>::from_timestamp(0, 0).unwrap_or_else(|| {
-        // chrono guarantees epoch is representable; this branch is
-        // unreachable. Use `MIN_UTC` as the safe fallback.
-        DateTime::<Utc>::MIN_UTC
-    })
+    // chrono guarantees epoch is representable; the `unwrap_or`
+    // branch is unreachable. `MIN_UTC` is the safe fallback if that
+    // contract ever changes.
+    DateTime::<Utc>::from_timestamp(0, 0).unwrap_or(DateTime::<Utc>::MIN_UTC)
 }
 
 impl IpcMessage {
@@ -469,6 +468,7 @@ mod tests {
     /// `is_known_tag`. If a new variant is added without updating the
     /// match arm *and* the representatives list below, this test fails.
     #[test]
+    #[allow(clippy::too_many_lines, reason = "exhaustive variant table")]
     fn is_known_tag_covers_all_variants() {
         const EXPECTED_VARIANT_COUNT: usize = 17;
 

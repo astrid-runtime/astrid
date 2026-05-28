@@ -11,9 +11,9 @@ use crate::commands::{
     agent::AgentCommand, audit::AuditArgs, budget::BudgetCommand, caps::CapsCommand,
     capsule::config::ConfigArgs as CapsuleConfigArgs, capsule::show::ShowArgs as CapsuleShowArgs,
     completions::CompletionsArgs, doctor::DoctorArgs, gc::GcArgs, group::GroupCommand,
-    logs::LogsArgs, ps::PsArgs, quota::QuotaCommand, run::RunArgs, secret::SecretCommand,
-    setup::SetupArgs, top::TopArgs, trust::TrustCommand, version::VersionArgs,
-    voucher::VoucherCommand, who::WhoArgs,
+    invite::InviteCommand, keypair::KeypairCommand, logs::LogsArgs, ps::PsArgs,
+    quota::QuotaCommand, run::RunArgs, secret::SecretCommand, setup::SetupArgs, top::TopArgs,
+    trust::TrustCommand, version::VersionArgs, voucher::VoucherCommand, who::WhoArgs,
 };
 
 /// Astrid - Secure Agent Runtime
@@ -109,6 +109,19 @@ pub(crate) enum Commands {
     Quota {
         #[command(subcommand)]
         command: QuotaCommand,
+    },
+
+    /// Mint invite tokens so new principals can self-enroll through the
+    /// HTTP gateway (or via `astrid invite redeem`).
+    Invite {
+        #[command(subcommand)]
+        command: InviteCommand,
+    },
+
+    /// Manage local ed25519 keypairs used for invite redemption.
+    Keypair {
+        #[command(subcommand)]
+        command: KeypairCommand,
     },
 
     /// Store and inspect capsule env configuration (API keys, base URLs).

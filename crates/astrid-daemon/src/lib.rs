@@ -136,6 +136,22 @@ pub async fn run() -> Result<()> {
         "Kernel booted successfully"
     );
 
+    // Optionally spawn the HTTP gateway (issue #756). The gateway
+    // reads `etc/gateway-http.toml`; missing file or `enabled = false`
+    // → no-op so single-tenant deployments keep their old shape.
+    let gateway_shutdown = match load_gateway_config().await {
+        Ok(Some(cfg)) if cfg.enabled => Some(spawn_gateway(cfg, &kernel)?),
+        Ok(Some(_)) => {
+            tracing::debug!("astrid-gateway config present but disabled — skipping");
+            None
+        },
+        Ok(None) => None,
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to load gateway config; gateway not started");
+            None
+        },
+    };
+
     // Wait for a termination signal or API shutdown request.
     let mut shutdown_rx = kernel.shutdown_tx.subscribe();
 
@@ -167,7 +183,49 @@ pub async fn run() -> Result<()> {
         }
     }
 
+    if let Some(notify) = gateway_shutdown {
+        notify.notify_waiters();
+    }
+
     kernel.shutdown(Some("signal".to_string())).await;
 
     Ok(())
+}
+
+/// Load `etc/gateway-http.toml`. Returns `Ok(None)` when the file
+/// doesn't exist (single-tenant default).
+async fn load_gateway_config() -> Result<Option<astrid_gateway::GatewayConfig>> {
+    let home = astrid_core::dirs::AstridHome::resolve()
+        .map_err(|e| anyhow::anyhow!("resolve AstridHome: {e}"))?;
+    let path = home.etc_dir().join("gateway-http.toml");
+    let text = match tokio::fs::read_to_string(&path).await {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(anyhow::anyhow!("read {}: {e}", path.display())),
+    };
+    let cfg: astrid_gateway::GatewayConfig =
+        toml::from_str(&text).context("parse gateway-http.toml")?;
+    Ok(Some(cfg))
+}
+
+fn spawn_gateway(
+    cfg: astrid_gateway::GatewayConfig,
+    kernel: &std::sync::Arc<astrid_kernel::Kernel>,
+) -> Result<std::sync::Arc<tokio::sync::Notify>> {
+    // Plumb the kernel's event bus into the gateway so the SSE
+    // audit stream can subscribe directly — same in-process bus,
+    // no extra socket round-trip.
+    let bus = std::sync::Arc::clone(&kernel.event_bus);
+    let state = astrid_gateway::GatewayState::new(cfg, Some(bus)).context("build gateway state")?;
+    let notify = std::sync::Arc::new(tokio::sync::Notify::new());
+    let notify_for_task = std::sync::Arc::clone(&notify);
+    tokio::spawn(async move {
+        let shutdown = async move {
+            notify_for_task.notified().await;
+        };
+        if let Err(e) = astrid_gateway::run(state, shutdown).await {
+            tracing::error!(error = %e, "astrid-gateway exited with error");
+        }
+    });
+    Ok(notify)
 }

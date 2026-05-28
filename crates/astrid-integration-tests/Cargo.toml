@@ -17,8 +17,12 @@ astrid-capsule = { workspace = true }
 astrid-core = { workspace = true }
 astrid-crypto = { workspace = true }
 astrid-events = { workspace = true }
+astrid-gateway = { workspace = true }
 astrid-hooks = { workspace = true }
 astrid-kernel = { workspace = true }
+astrid-uplink = { workspace = true }
+axum = { workspace = true }
+tower = { workspace = true }
 astrid-mcp = { workspace = true, features = ["test-support"] }
 astrid-storage = { workspace = true }
 astrid-test = { workspace = true }

@@ -34,7 +34,12 @@ fn assert_success(res: &AdminResponseBody) {
         AdminResponseBody::Success(_)
         | AdminResponseBody::Quotas(_)
         | AdminResponseBody::AgentList(_)
-        | AdminResponseBody::GroupList(_) => {},
+        | AdminResponseBody::GroupList(_)
+        | AdminResponseBody::Invite(_)
+        | AdminResponseBody::InviteRedeemed(_)
+        | AdminResponseBody::InviteList(_)
+        | AdminResponseBody::PairToken(_)
+        | AdminResponseBody::PairTokenRedeemed(_) => {},
         AdminResponseBody::Error(msg) => panic!("expected success, got Error: {msg}"),
     }
 }
@@ -58,6 +63,7 @@ async fn agent_modify_adds_and_removes_groups_idempotently() {
     let (_dir, kernel) = fixture().await;
     handlers::dispatch(
         &kernel,
+        &astrid_core::PrincipalId::default(),
         AdminRequestKind::AgentCreate {
             name: "mia".into(),
             groups: vec![BUILTIN_AGENT.into()],
@@ -69,6 +75,7 @@ async fn agent_modify_adds_and_removes_groups_idempotently() {
     // Add `restricted`, no change to existing `agent`.
     let res = handlers::dispatch(
         &kernel,
+        &astrid_core::PrincipalId::default(),
         AdminRequestKind::AgentModify {
             principal: pid("mia"),
             add_groups: vec![BUILTIN_RESTRICTED.into()],
@@ -88,6 +95,7 @@ async fn agent_modify_adds_and_removes_groups_idempotently() {
     // succeeds so scripts can be re-run safely.
     let res = handlers::dispatch(
         &kernel,
+        &astrid_core::PrincipalId::default(),
         AdminRequestKind::AgentModify {
             principal: pid("mia"),
             add_groups: vec![BUILTIN_RESTRICTED.into()],
@@ -100,6 +108,7 @@ async fn agent_modify_adds_and_removes_groups_idempotently() {
     // Remove `agent`. Now mia is only in `restricted`.
     let res = handlers::dispatch(
         &kernel,
+        &astrid_core::PrincipalId::default(),
         AdminRequestKind::AgentModify {
             principal: pid("mia"),
             add_groups: Vec::new(),
@@ -117,6 +126,7 @@ async fn agent_modify_rejects_empty_changes() {
     let (_dir, kernel) = fixture().await;
     handlers::dispatch(
         &kernel,
+        &astrid_core::PrincipalId::default(),
         AdminRequestKind::AgentCreate {
             name: "nina".into(),
             groups: Vec::new(),
@@ -126,6 +136,7 @@ async fn agent_modify_rejects_empty_changes() {
     .await;
     let res = handlers::dispatch(
         &kernel,
+        &astrid_core::PrincipalId::default(),
         AdminRequestKind::AgentModify {
             principal: pid("nina"),
             add_groups: Vec::new(),
@@ -141,6 +152,7 @@ async fn agent_modify_rejects_unknown_principal() {
     let (_dir, kernel) = fixture().await;
     let res = handlers::dispatch(
         &kernel,
+        &astrid_core::PrincipalId::default(),
         AdminRequestKind::AgentModify {
             principal: pid("ghost"),
             add_groups: vec![BUILTIN_RESTRICTED.into()],

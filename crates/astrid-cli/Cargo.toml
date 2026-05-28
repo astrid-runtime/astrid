@@ -25,6 +25,7 @@ astrid-build = { workspace = true }
 anyhow = { workspace = true }
 arboard = { workspace = true }
 astrid-capsule = { workspace = true }
+astrid-capsule-install = { workspace = true }
 astrid-config = { workspace = true }
 astrid-core = { workspace = true }
 blake3 = { workspace = true }
@@ -33,6 +34,13 @@ astrid-types = { workspace = true }
 astrid-daemon = { workspace = true }
 astrid-storage = { workspace = true, features = ["keychain"] }
 astrid-telemetry = { workspace = true, features = ["config"] }
+astrid-uplink = { workspace = true }
+base64 = { workspace = true }
+ed25519-dalek = { workspace = true }
+hex = { workspace = true }
+rand = { workspace = true }
+sha2 = { workspace = true }
+zeroize = { workspace = true }
 chrono = { workspace = true, features = ["clock"] }
 clap = { workspace = true }
 clap_complete = { workspace = true }
