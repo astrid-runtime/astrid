@@ -205,6 +205,7 @@ async fn load_gateway_config() -> Result<Option<astrid_gateway::GatewayConfig>> 
     };
     let cfg: astrid_gateway::GatewayConfig =
         toml::from_str(&text).context("parse gateway-http.toml")?;
+    cfg.validate().context("validate gateway-http.toml")?;
     Ok(Some(cfg))
 }
 

@@ -126,8 +126,7 @@ pub fn build(state: Arc<GatewayState>) -> Router {
             crate::auth::require_session,
         ));
 
-    public
-        .merge(authed)
+    let combined = public.merge(authed)
         // Count every request after it routes — axum's `MatchedPath`
         // extractor gives the registered template (e.g.
         // `/api/sys/principals/:id`) so the metric stays bounded
@@ -135,8 +134,70 @@ pub fn build(state: Arc<GatewayState>) -> Router {
         .layer(axum::middleware::from_fn_with_state(
             Arc::clone(&state),
             metrics_middleware,
-        ))
-        .with_state(state)
+        ));
+
+    // Apply CORS only when the operator opted in via
+    // `cors_allow_origins`. Empty allowlist = no CORS headers in any
+    // response = browsers refuse cross-origin requests = same-origin
+    // only. That's the secure default; adding the layer when nothing's
+    // configured would mint unnecessary `Vary: Origin` and break
+    // shared-cache assumptions further downstream.
+    //
+    // Origins were validated at config-load time (`GatewayConfig::
+    // validate`) so the `parse::<HeaderValue>` here is infallible by
+    // construction. We still `unwrap_or_else` defensively rather than
+    // `expect` so a future grammar drift doesn't crash a live gateway.
+    if state.config.cors_allow_origins.is_empty() {
+        combined.with_state(state)
+    } else {
+        let cors = build_cors_layer(&state.config.cors_allow_origins);
+        combined.layer(cors).with_state(state)
+    }
+}
+
+/// Build a `CorsLayer` from the operator-configured allowlist.
+/// Allowlist entries are validated at config-load time, so any entry
+/// that fails to parse as a header value here is treated as a config
+/// drift and skipped with a warning — the layer still applies for
+/// every entry that did parse.
+#[allow(clippy::duration_suboptimal_units)] // 60 * 60 reads better than 3600
+fn build_cors_layer(origins: &[String]) -> tower_http::cors::CorsLayer {
+    use axum::http::{HeaderName, HeaderValue, Method};
+    let parsed: Vec<HeaderValue> = origins
+        .iter()
+        .filter_map(|s| match s.parse::<HeaderValue>() {
+            Ok(v) => Some(v),
+            Err(e) => {
+                tracing::warn!(origin = %s, error = %e, "skipping unparseable CORS origin");
+                None
+            },
+        })
+        .collect();
+    tower_http::cors::CorsLayer::new()
+        .allow_origin(tower_http::cors::AllowOrigin::list(parsed))
+        .allow_methods([
+            Method::GET,
+            Method::POST,
+            Method::PUT,
+            Method::PATCH,
+            Method::DELETE,
+            Method::OPTIONS,
+        ])
+        .allow_headers([
+            HeaderName::from_static("authorization"),
+            HeaderName::from_static("content-type"),
+            HeaderName::from_static("accept"),
+        ])
+        // `Vary: Origin` is what stops a shared cache (CDN, browser
+        // disk cache) from serving an ACAO response keyed for one
+        // origin to a request from another. tower-http defaults to
+        // setting Vary on every CORS-eligible response, but we name
+        // it here so the wiring is self-documenting.
+        .vary([HeaderName::from_static("origin")])
+        // Browsers may cache the preflight outcome for this long; one
+        // hour is a sensible tradeoff between policy-rollout latency
+        // and dashboard responsiveness.
+        .max_age(std::time::Duration::from_secs(60 * 60))
 }
 
 /// Per-request counter bump. Uses axum's `MatchedPath` so the

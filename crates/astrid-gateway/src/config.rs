@@ -96,6 +96,59 @@ impl GatewayConfig {
     pub const fn redeem_rate_limit(&self) -> Duration {
         Duration::from_secs(self.redeem_rate_limit_secs)
     }
+
+    /// Post-deserialisation validation. Catches misconfigurations that
+    /// would otherwise silently no-op at runtime — most importantly,
+    /// CORS entries that don't parse as a `scheme://host[:port]`
+    /// origin. The gateway used to read the field and never wire it
+    /// into the router; the router now does the wiring, so refusing
+    /// to boot on bad origins is what makes the config honest.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        for raw in &self.cors_allow_origins {
+            validate_cors_origin(raw)?;
+        }
+        Ok(())
+    }
+}
+
+/// Validate a single CORS origin string. Origins MUST be of the form
+/// `scheme://host[:port]` with no path, query, or fragment — that's
+/// what the browser sends in `Origin:` and what the response's
+/// `Access-Control-Allow-Origin:` is byte-matched against. A
+/// `https://app.example/` (trailing slash) would silently fail to
+/// match a real preflight; rejecting it here is what makes that
+/// surfacable.
+fn validate_cors_origin(raw: &str) -> anyhow::Result<()> {
+    let parsed = url::Url::parse(raw)
+        .map_err(|e| anyhow::anyhow!("CORS origin {raw:?} doesn't parse as a URL: {e}"))?;
+    match parsed.scheme() {
+        "http" | "https" => {},
+        other => anyhow::bail!(
+            "CORS origin {raw:?} uses scheme {other:?}; only http/https are valid for browser origins"
+        ),
+    }
+    if parsed.host_str().is_none() {
+        anyhow::bail!("CORS origin {raw:?} has no host component");
+    }
+    if parsed.path() != "" && parsed.path() != "/" {
+        anyhow::bail!(
+            "CORS origin {raw:?} carries a path ({:?}); origins are scheme+host+port only",
+            parsed.path()
+        );
+    }
+    if parsed.query().is_some() || parsed.fragment().is_some() {
+        anyhow::bail!(
+            "CORS origin {raw:?} carries a query/fragment; origins are scheme+host+port only"
+        );
+    }
+    // Disallow trailing-slash forms — browsers send `https://app.example`
+    // (no slash) in `Origin:` and the response header is byte-matched.
+    if raw.ends_with('/') {
+        anyhow::bail!(
+            "CORS origin {raw:?} has a trailing slash; remove it (browsers send `Origin:` without one)"
+        );
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -107,6 +160,64 @@ mod tests {
         let cfg = GatewayConfig::default();
         assert!(!cfg.enabled);
         assert_eq!(cfg.listen, "127.0.0.1:7777");
+    }
+
+    fn cfg_with_cors(origins: Vec<&str>) -> GatewayConfig {
+        GatewayConfig {
+            cors_allow_origins: origins.into_iter().map(String::from).collect(),
+            ..GatewayConfig::default()
+        }
+    }
+
+    #[test]
+    fn validate_accepts_well_formed_origins() {
+        let cfg = cfg_with_cors(vec![
+            "https://app.example",
+            "http://localhost:5173",
+            "https://staging.example.com",
+        ]);
+        cfg.validate().expect("well-formed origins must pass");
+    }
+
+    #[test]
+    fn validate_rejects_origin_with_path() {
+        let cfg = cfg_with_cors(vec!["https://app.example/dashboard"]);
+        let err = cfg
+            .validate()
+            .expect_err("origin with path must be rejected");
+        assert!(
+            format!("{err:#}").contains("path"),
+            "error mentions path: {err:#}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_origin_with_trailing_slash() {
+        let cfg = cfg_with_cors(vec!["https://app.example/"]);
+        let err = cfg.validate().expect_err("trailing slash must be rejected");
+        assert!(
+            format!("{err:#}").contains("trailing slash"),
+            "error mentions trailing slash: {err:#}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_non_http_scheme() {
+        let cfg = cfg_with_cors(vec!["ftp://files.example"]);
+        let err = cfg
+            .validate()
+            .expect_err("non-http scheme must be rejected");
+        assert!(
+            format!("{err:#}").contains("scheme") || format!("{err:#}").contains("ftp"),
+            "error mentions scheme: {err:#}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_garbage() {
+        let cfg = cfg_with_cors(vec!["not-a-url"]);
+        cfg.validate()
+            .expect_err("unparseable origin must be rejected");
     }
 
     #[test]

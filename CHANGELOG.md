@@ -9,6 +9,10 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
 
 ## [Unreleased]
 
+### Fixed
+
+- **`cors_allow_origins` is actually wired into the router now.** The gateway shipped in v0.7.0 with a `cors_allow_origins: Vec<String>` field that the router never consumed — `tower-http::CorsLayer` was on the dep list, but no layer was applied. An operator setting the allowlist saw nothing happen at runtime; browsers fell back to same-origin (which was the correct *secure* default but not the configured one). `routes::build` now applies a `CorsLayer` when the allowlist is non-empty: `Access-Control-Allow-Origin` (per-request match), `…-Allow-Methods` (GET/POST/PUT/PATCH/DELETE/OPTIONS), `…-Allow-Headers` (authorization/content-type/accept), `Vary: Origin`, and a 1-hour preflight cache. Empty allowlist stays no-CORS (browsers refuse cross-origin) so single-tenant deployments don't grow a `Vary` header. New `GatewayConfig::validate` rejects malformed origins (scheme other than http/https, trailing slash, path/query/fragment, unparseable strings) at daemon boot so misconfig fails fast instead of silently no-op-ing. Five new end-to-end tests in `crates/astrid-gateway/tests/cors.rs` cover preflight accept/reject, actual-request ACAO, empty-allowlist secure default, and per-origin echo for multi-origin allowlists. Closes #771.
+
 ### Breaking
 
 - **MSRV bumped to 1.95.0.** `surrealdb 3.0.0-beta.3`'s `kv-mem` feature pulled in `surrealmx v0.21.0` → `ferntree v0.7.0`, which uses `std::hint::cold_path` stabilised in Rust 1.95. Upstream declared no `rust-version`, so cargo's resolver silently picks 0.7 even though the workspace MSRV says 1.94. Bumping our MSRV is the smallest fix that keeps CI deterministic without committing `Cargo.lock` (which is intentionally gitignored). Affects `cargo install astrid` consumers — installers on 1.94 will see a clear "requires rustc 1.95" error rather than the cryptic `cold_path` failure.
