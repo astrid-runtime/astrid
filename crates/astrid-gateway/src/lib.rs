@@ -47,6 +47,7 @@ pub mod config;
 pub mod error;
 pub mod metrics;
 pub mod openapi;
+pub mod revocations;
 pub mod routes;
 pub mod state;
 
@@ -86,6 +87,17 @@ pub async fn run(
         .with_context(|| format!("failed to bind gateway listener on {addr}"))?;
     let bound = listener.local_addr().unwrap_or(addr);
     info!(addr = %bound, "astrid-gateway listening");
+
+    // Spawn the revocation watcher as soon as we know we have a live
+    // bus. Detached: the task exits when the bus drops at daemon
+    // shutdown, so no explicit join is needed.
+    if let Some(bus) = state.event_bus.clone() {
+        revocations::spawn_watcher(bus, Arc::clone(&state.revoked_at));
+    } else {
+        tracing::warn!(
+            "gateway running without a kernel event bus — bearer revocations on principal delete will NOT take effect for this process"
+        );
+    }
 
     let router = routes::build(state);
     // `into_make_service_with_connect_info::<SocketAddr>()` is what

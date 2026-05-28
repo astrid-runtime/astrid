@@ -32,7 +32,7 @@ use crate::error::{GatewayError, GatewayResult};
 use crate::routes::principals::caller_from;
 use crate::state::GatewayState;
 
-const AUDIT_TOPIC: &str = "astrid.v1.audit.entry";
+pub const AUDIT_TOPIC: &str = "astrid.v1.audit.entry";
 /// Capability that lifts the per-principal filter and lets the
 /// caller see every audit entry. Operators (admin group `*`) hold
 /// it; regular agents do not.

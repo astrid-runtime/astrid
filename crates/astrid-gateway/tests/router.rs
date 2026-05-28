@@ -70,6 +70,7 @@ fn fresh_state_with_distro(distro: Option<&str>) -> Arc<GatewayState> {
         redeem_limiter: tokio::sync::Mutex::default(),
         metrics: astrid_gateway::metrics::Metrics::default(),
         event_bus: None,
+        revoked_at: std::sync::Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
     })
 }
 
