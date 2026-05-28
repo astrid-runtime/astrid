@@ -62,7 +62,11 @@ pub fn content_address_wasm(
     if !store_path.exists() {
         // Atomic temp-and-rename so a concurrent installer racing on
         // identical bytes never observes a half-written file.
-        let tmp = bin_dir.join(format!("{hash}.tmp.{}", std::process::id()));
+        // A UUID-suffixed temp name is essential — `process::id()`
+        // alone would collide between sibling tokio tasks in the
+        // same daemon (gateway processes admin requests in parallel
+        // after the bus-direct refactor).
+        let tmp = bin_dir.join(format!("{hash}.tmp.{}", uuid::Uuid::new_v4().simple()));
         std::fs::write(&tmp, &bytes)
             .with_context(|| format!("failed to write temp file: {}", tmp.display()))?;
         match std::fs::rename(&tmp, &store_path) {

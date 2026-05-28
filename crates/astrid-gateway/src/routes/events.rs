@@ -70,12 +70,16 @@ pub async fn get_events(
     // Resolve whether the caller gets the firehose or the
     // per-principal filtered view. The caller's capability set is
     // expressed in their bearer — we don't have it directly, so
-    // ask the kernel via AdminClient::request(AgentList) and look
-    // for the caller's row. AgentList is cap-gated by self:agent:list
-    // for agents and by `*` for admins, so the call always
-    // succeeds for any valid bearer. The kernel filters by scope
-    // server-side.
-    let firehose = caller_holds(&caller.principal, AUDIT_FIREHOSE_CAP).await;
+    // ask the kernel via AgentList and look for the caller's row.
+    // AgentList is cap-gated by self:agent:list for agents and by
+    // `*` for admins, so the call always succeeds for any valid
+    // bearer. The kernel filters by scope server-side.
+    //
+    // Use the bus-direct admin client (not the socket-based one) —
+    // SSE handshakes happen once per dashboard tab open, and the
+    // socket-dial latency would otherwise dominate first-byte
+    // time for the audit stream.
+    let firehose = caller_holds(&state, &caller.principal, AUDIT_FIREHOSE_CAP).await;
 
     let mut receiver = bus.subscribe_topic(AUDIT_TOPIC);
     let caller_principal = caller.principal;
@@ -124,13 +128,12 @@ pub async fn get_events(
 }
 
 /// Best-effort capability check via the kernel's `AgentList`. Returns
-/// `false` on any failure (parse error, daemon unreachable) so the
+/// `false` on any failure (parse error, bus unavailable) so the
 /// caller falls back to the safer per-principal filter rather than
 /// accidentally widening to the firehose.
-async fn caller_holds(principal: &PrincipalId, capability: &str) -> bool {
+async fn caller_holds(state: &GatewayState, principal: &PrincipalId, capability: &str) -> bool {
     use astrid_core::kernel_api::{AdminRequestKind, AdminResponseBody};
-    use astrid_uplink::AdminClient;
-    let Ok(mut client) = AdminClient::connect(principal.clone()).await else {
+    let Ok(client) = state.admin_client(principal.clone()) else {
         return false;
     };
     let Ok(resp) = client.request(AdminRequestKind::AgentList).await else {

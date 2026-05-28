@@ -8,6 +8,39 @@ repository.workspace = true
 rust-version.workspace = true
 description = "HTTP gateway for the Astrid admin API — translates HTTP requests into the daemon's IPC management surface."
 
+# Dependency footprint is intentionally HTTP-server-shaped (axum + the
+# tower + tokio-stream + utoipa ecosystem). Why each is non-negotiable:
+#
+# - `axum`               — the HTTP framework itself; routing, extractors,
+#                          SSE responder. There is no in-workspace HTTP
+#                          server to reuse.
+# - `tower` / `tower-http` — middleware substrate axum is built on
+#                          (`Service` trait, CORS, trace, request-id);
+#                          dropping them means re-implementing middleware
+#                          composition by hand.
+# - `async-stream` / `tokio-stream` — Server-Sent Events plumbing for
+#                          `/api/events` and `/api/agent/prompt`. The
+#                          kernel's event bus exposes a `broadcast::Receiver`;
+#                          these crates adapt it into a `futures::Stream`
+#                          that axum's `Sse` responder consumes. Removing
+#                          either forces a custom `Stream` impl per route.
+# - `utoipa`             — OpenAPI 3.x emission for `/api/openapi.json` and
+#                          the drift test that pins every router path against
+#                          the spec. Workspace has no other OpenAPI generator.
+# - `uuid`               — UUID v4 for response-topic correlation on the
+#                          bus-direct admin path AND temp-file disambiguation
+#                          for sibling-task install/env writes (Gemini r2 race
+#                          fix). Workspace already pulls it for other crates.
+# - `tokio-util`         — `Bytes`/`BytesMut` helpers used by the body parser.
+# - `chrono [clock]`     — wall-clock timestamps in audit envelopes and
+#                          bearer expiry. Capsules see this dep without `clock`;
+#                          the gateway is a kernel-side consumer so opting in
+#                          is correct.
+#
+# Everything else (`anyhow`, `serde*`, `tokio`, `rand`, `sha2`, …) is already
+# load-bearing across the workspace; pulling them here introduces no new
+# vertices.
+
 [dependencies]
 anyhow = { workspace = true }
 async-stream = { workspace = true }

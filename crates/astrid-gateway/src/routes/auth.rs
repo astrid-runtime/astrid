@@ -84,15 +84,23 @@ pub struct MeResponse {
 pub async fn post_redeem(
     State(state): State<Arc<GatewayState>>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: axum::http::HeaderMap,
     Json(body): Json<RedeemRequest>,
 ) -> GatewayResult<Json<RedeemResponse>> {
     // Rate-limit per source IP. Defends the redeem path against
     // brute-force token enumeration — even at 1 attempt per second,
     // a 192-bit token space is unreachable.
+    //
+    // Behind a reverse proxy `peer.ip()` is the proxy's address, so
+    // one abusive client would trip the limit for *every* user.
+    // When the immediate peer is on `trust_forwarded_from`, trust
+    // `X-Forwarded-For` (first hop) / `X-Real-IP`. Otherwise stick
+    // with the connection address.
+    let client_ip = resolve_client_ip(&state, peer.ip(), &headers);
     let interval = state.config.redeem_rate_limit();
     if !interval.is_zero() {
         let mut limiter = state.redeem_limiter.lock().await;
-        if let Some(wait) = limiter.check(peer.ip(), interval) {
+        if let Some(wait) = limiter.check(client_ip, interval) {
             return Err(GatewayError::RateLimited {
                 retry_after_secs: wait.as_secs().max(1),
             });
@@ -358,4 +366,40 @@ pub async fn post_refresh(
         session_token,
         session_expires_at_epoch,
     }))
+}
+
+/// Resolve the real client IP for rate-limiting purposes.
+///
+/// Returns the `X-Forwarded-For` (left-most hop) or `X-Real-IP`
+/// value **only** when the immediate peer is on
+/// `config.trust_forwarded_from`. Otherwise falls back to the
+/// connection's peer address.
+///
+/// The trust gate is critical: without it, any client could send
+/// `X-Forwarded-For: 1.2.3.4` and dodge the per-IP rate limit by
+/// rotating the claimed address. Trusting forwarded headers only
+/// from a configured proxy fence keeps the limiter honest.
+fn resolve_client_ip(
+    state: &GatewayState,
+    peer: std::net::IpAddr,
+    headers: &axum::http::HeaderMap,
+) -> std::net::IpAddr {
+    if !state.config.trust_forwarded_from.contains(&peer) {
+        return peer;
+    }
+    // X-Forwarded-For is comma-separated `client, proxy1, proxy2`.
+    // The left-most entry is the original client per RFC 7239 / de
+    // facto convention. Reject obviously malformed values.
+    if let Some(xff) = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok())
+        && let Some(first) = xff.split(',').next()
+        && let Ok(ip) = first.trim().parse::<std::net::IpAddr>()
+    {
+        return ip;
+    }
+    if let Some(xri) = headers.get("x-real-ip").and_then(|v| v.to_str().ok())
+        && let Ok(ip) = xri.trim().parse::<std::net::IpAddr>()
+    {
+        return ip;
+    }
+    peer
 }

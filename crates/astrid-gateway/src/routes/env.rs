@@ -152,29 +152,58 @@ pub async fn write_env(
 
     let value_fp = fingerprint(&body.value);
 
-    match def.env_type.as_str() {
-        "secret" => {
-            let root = home
-                .secrets_dir()
-                .join(caller.principal.as_str())
-                .join(&capsule_id);
-            let store = FileSecretStore::new(root);
-            store
-                .set(&field, &body.value)
-                .map_err(|e| GatewayError::Internal(anyhow::anyhow!("secret write: {e}")))?;
-        },
-        "text" | "select" => {
-            write_env_string(&home, &caller.principal, &capsule_id, &field, &body.value)?;
-        },
-        "array" => {
-            append_env_array(&home, &caller.principal, &capsule_id, &field, &body.value)?;
-        },
-        other => {
-            return Err(GatewayError::BadRequest(format!(
-                "unsupported env type {other:?} for field {field:?}"
-            )));
-        },
-    }
+    // The disk writes below (`FileSecretStore::set`, `write_env_string`,
+    // `append_env_array`) are synchronous `std::fs` calls that fsync
+    // through a temp-and-rename. Running them on the tokio worker
+    // thread blocks the runtime — at the gateway's measured 5,400
+    // RPS read throughput, a single slow fsync would stall every
+    // other in-flight HTTP request. `spawn_blocking` parks the
+    // syscall on the blocking-IO threadpool instead.
+    let env_type = def.env_type.clone();
+    let principal_str = caller.principal.clone();
+    let capsule_id_for_blocking = capsule_id.clone();
+    let field_for_blocking = field.clone();
+    let value = body.value.clone();
+    tokio::task::spawn_blocking(move || -> GatewayResult<()> {
+        match env_type.as_str() {
+            "secret" => {
+                let root = home
+                    .secrets_dir()
+                    .join(principal_str.as_str())
+                    .join(&capsule_id_for_blocking);
+                let store = FileSecretStore::new(root);
+                store
+                    .set(&field_for_blocking, &value)
+                    .map_err(|e| GatewayError::Internal(anyhow::anyhow!("secret write: {e}")))?;
+            },
+            "text" | "select" => {
+                write_env_string(
+                    &home,
+                    &principal_str,
+                    &capsule_id_for_blocking,
+                    &field_for_blocking,
+                    &value,
+                )?;
+            },
+            "array" => {
+                append_env_array(
+                    &home,
+                    &principal_str,
+                    &capsule_id_for_blocking,
+                    &field_for_blocking,
+                    &value,
+                )?;
+            },
+            other => {
+                return Err(GatewayError::BadRequest(format!(
+                    "unsupported env type {other:?} for field {field_for_blocking:?}"
+                )));
+            },
+        }
+        Ok(())
+    })
+    .await
+    .map_err(|e| GatewayError::Internal(anyhow::anyhow!("env-write task panicked: {e}")))??;
 
     tracing::info!(
         principal = %caller.principal,
@@ -203,9 +232,17 @@ fn load_env_schema(capsule_id: &str) -> GatewayResult<HashMap<String, EnvFieldSc
     }
     let home = AstridHome::resolve()
         .map_err(|e| GatewayError::Internal(anyhow::anyhow!("resolve ASTRID_HOME: {e}")))?;
+    // Installed capsules live under the principal's home, not
+    // `$ASTRID_HOME/capsules/` (that path doesn't exist on disk).
+    // Before this, every env schema lookup 404'd for any
+    // user-installed capsule. Capsules today are globally installed
+    // under the default principal — see
+    // `astrid_capsule_install::resolve_target_dir` for the
+    // canonical path resolver. We mirror its non-workspace branch.
+    let principal = astrid_core::PrincipalId::default();
     let manifest_path = home
-        .root()
-        .join("capsules")
+        .principal_home(&principal)
+        .capsules_dir()
         .join(capsule_id)
         .join("Capsule.toml");
     let text = match std::fs::read_to_string(&manifest_path) {
@@ -371,7 +408,10 @@ fn write_json_atomic(
 ) -> GatewayResult<()> {
     let body = serde_json::to_vec_pretty(map)
         .map_err(|e| GatewayError::Internal(anyhow::anyhow!("serialise env JSON: {e}")))?;
-    let tmp = path.with_extension(format!("{}.tmp", std::process::id()));
+    // UUID, not process::id() — two concurrent env-writes from the
+    // same principal would otherwise race on the same temp name in
+    // the multi-threaded gateway runtime and clobber each other.
+    let tmp = path.with_extension(format!("{}.tmp", uuid::Uuid::new_v4().simple()));
     std::fs::write(&tmp, &body)
         .map_err(|e| GatewayError::Internal(anyhow::anyhow!("write env JSON: {e}")))?;
     #[cfg(unix)]

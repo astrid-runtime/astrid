@@ -55,6 +55,19 @@ pub struct GatewayConfig {
     /// origin only. Each entry is a literal origin (`https://foo`),
     /// matched verbatim.
     pub cors_allow_origins: Vec<String>,
+    /// Reverse-proxy IPs the gateway trusts to forward client IPs
+    /// in `X-Forwarded-For` / `X-Real-IP` headers. Used by the
+    /// redeem rate limiter to attribute attempts to the real client
+    /// rather than the proxy. Empty = no forwarded-header trust
+    /// (peer IP is used directly).
+    ///
+    /// **Operators MUST set this when the gateway is behind a
+    /// reverse proxy** — otherwise the rate limiter sees every
+    /// request as coming from the proxy's IP, and one abusive
+    /// client locks out every legitimate user globally.
+    ///
+    /// Example: `["127.0.0.1", "10.0.0.1"]`.
+    pub trust_forwarded_from: Vec<std::net::IpAddr>,
 }
 
 impl Default for GatewayConfig {
@@ -66,6 +79,7 @@ impl Default for GatewayConfig {
             session_lifetime_secs: DEFAULT_SESSION_LIFETIME_SECS,
             redeem_rate_limit_secs: DEFAULT_REDEEM_RATE_LIMIT_SECS,
             cors_allow_origins: Vec::new(),
+            trust_forwarded_from: Vec::new(),
         }
     }
 }
@@ -104,6 +118,7 @@ mod tests {
             session_lifetime_secs: 3600,
             redeem_rate_limit_secs: 0,
             cors_allow_origins: vec!["https://example.invalid".into()],
+            trust_forwarded_from: vec!["10.0.0.1".parse().unwrap()],
         };
         let text = toml::to_string_pretty(&cfg).unwrap();
         let back: GatewayConfig = toml::from_str(&text).unwrap();

@@ -100,7 +100,10 @@ fn content_address_wit_recursive(
         // Atomic temp-and-rename — concurrent writers on identical
         // bytes converge harmlessly.
         if !dest.exists() {
-            let tmp = wit_store.join(format!("{hash}.tmp.{}", std::process::id()));
+            // UUID, not process::id() — sibling tokio tasks in the
+            // same daemon share a pid and would race on the same
+            // temp name.
+            let tmp = wit_store.join(format!("{hash}.tmp.{}", uuid::Uuid::new_v4().simple()));
             std::fs::write(&tmp, &content)
                 .with_context(|| format!("failed to write temp file: {}", tmp.display()))?;
             match std::fs::rename(&tmp, &dest) {

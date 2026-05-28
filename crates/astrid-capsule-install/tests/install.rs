@@ -118,6 +118,62 @@ fn copy_capsule_dir_excludes_wasm_and_wit() {
 
 #[test]
 #[cfg_attr(windows, ignore = "symlinks require elevated privileges on Windows")]
+fn copy_capsule_dir_refuses_file_symlink_pointing_outside_root() {
+    // Sandbox-escape vector: a malicious capsule tree ships a file
+    // symlink pointing at a host secret. The installer must refuse
+    // rather than copying the bytes into the per-capsule directory
+    // (which the capsule's WASM sandbox could then read via the
+    // `home://` VFS or a Tier-2 local-command script).
+    let outside = tempfile::tempdir().unwrap();
+    let host_secret = outside.path().join("host-secret");
+    std::fs::write(&host_secret, b"super secret host data").unwrap();
+
+    let src = tempfile::tempdir().unwrap();
+    std::fs::write(src.path().join("legit.txt"), "ok").unwrap();
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&host_secret, src.path().join("evil")).unwrap();
+
+    let dst = tempfile::tempdir().unwrap();
+    let err = copy_capsule_dir(src.path(), dst.path())
+        .expect_err("must refuse a symlink resolving outside the source root");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("outside the capsule source root"),
+        "expected sandbox-escape error, got: {msg}"
+    );
+    assert!(
+        !dst.path().join("evil").exists(),
+        "host secret must not be copied into the capsule dir"
+    );
+}
+
+#[test]
+#[cfg_attr(windows, ignore = "symlinks require elevated privileges on Windows")]
+fn copy_capsule_dir_refuses_directory_symlink() {
+    // Directory symlinks open two problems: (a) infinite recursion
+    // when the link points to an ancestor, and (b) ballooning copies
+    // of legitimately-shared trees (e.g. a symlink to a sibling's
+    // node_modules). npm only produces FILE symlinks under
+    // `node_modules/.bin/`, so refusing directory symlinks loses no
+    // real use case and shuts both threats down.
+    let src = tempfile::tempdir().unwrap();
+    let real_dir = src.path().join("real-dir");
+    std::fs::create_dir_all(&real_dir).unwrap();
+    std::fs::write(real_dir.join("inner.txt"), "x").unwrap();
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&real_dir, src.path().join("link-to-dir")).unwrap();
+
+    let dst = tempfile::tempdir().unwrap();
+    let err = copy_capsule_dir(src.path(), dst.path()).expect_err("must refuse directory symlinks");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("directory symlink"),
+        "expected directory-symlink error, got: {msg}"
+    );
+}
+
+#[test]
+#[cfg_attr(windows, ignore = "symlinks require elevated privileges on Windows")]
 fn install_dereferences_node_modules_bin_symlinks() {
     let capsule_dir = tempfile::tempdir().unwrap();
     let base = capsule_dir.path();
