@@ -38,6 +38,14 @@ fn revocations_path() -> anyhow::Result<PathBuf> {
     Ok(home.etc_dir().join("gateway-revocations.json"))
 }
 
+/// Hard cap on the on-disk revocation file. Each entry is ~50 bytes
+/// of JSON; `10 MiB` lets us hold ~200k revocations which is well
+/// past any realistic operator's lifetime. Acts as a `DoS` / `OOM`
+/// guard against a malicious or corrupted file — without the cap, a
+/// gigabyte-sized file would block the daemon's boot path inside
+/// `read_to_string` while it allocates.
+const MAX_REVOCATIONS_FILE_BYTES: u64 = 10 * 1024 * 1024;
+
 /// Load the persisted revocation map. Returns an empty map if the
 /// file doesn't exist yet (single-tenant default, fresh install).
 ///
@@ -47,6 +55,19 @@ fn revocations_path() -> anyhow::Result<PathBuf> {
 /// either restores from backup or deletes the file to start fresh.
 pub fn load_from_disk() -> anyhow::Result<HashMap<PrincipalId, u64>> {
     let path = revocations_path()?;
+    let metadata = match std::fs::metadata(&path) {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(HashMap::new()),
+        Err(e) => return Err(anyhow::anyhow!("stat {}: {e}", path.display())),
+    };
+    if metadata.len() > MAX_REVOCATIONS_FILE_BYTES {
+        anyhow::bail!(
+            "revocation file {} is {} bytes; refusing to load (cap is {} bytes — investigate disk pressure or a corrupted file)",
+            path.display(),
+            metadata.len(),
+            MAX_REVOCATIONS_FILE_BYTES
+        );
+    }
     let text = match std::fs::read_to_string(&path) {
         Ok(s) => s,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(HashMap::new()),
@@ -66,9 +87,15 @@ pub fn load_from_disk() -> anyhow::Result<HashMap<PrincipalId, u64>> {
     Ok(out)
 }
 
-/// Persist the revocation map atomically. Writes to `<path>.tmp.<uuid>`
-/// then renames into place, so a crash mid-write cannot leave a
-/// truncated file.
+/// Persist the revocation map atomically. Writes to `<path>.tmp.<uuid>`,
+/// fsyncs, then renames into place — matches the durability pattern
+/// in `state::SigningMaterial::load_or_generate`. A crash between
+/// `write` and `rename` leaves the temp file behind (cleaned up by
+/// the next operator-initiated daemon restart) but never produces
+/// a half-written `gateway-revocations.json`.
+///
+/// Blocking I/O: callers from async contexts should wrap this in
+/// `tokio::task::spawn_blocking` — the watcher in this module does.
 #[allow(clippy::implicit_hasher)] // map shape is internal to this module; no generic hasher
 pub fn persist(map: &HashMap<PrincipalId, u64>) -> anyhow::Result<()> {
     let path = revocations_path()?;
@@ -79,7 +106,21 @@ pub fn persist(map: &HashMap<PrincipalId, u64>) -> anyhow::Result<()> {
     let raw: HashMap<String, u64> = map.iter().map(|(k, v)| (k.to_string(), *v)).collect();
     let text = serde_json::to_string_pretty(&raw).context("serialise revocation map")?;
     let tmp = path.with_extension(format!("tmp.{}", uuid::Uuid::new_v4().simple()));
-    std::fs::write(&tmp, &text).with_context(|| format!("write {}", tmp.display()))?;
+    {
+        use std::io::Write as _;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&tmp)
+            .with_context(|| format!("create {}", tmp.display()))?;
+        f.write_all(text.as_bytes())
+            .with_context(|| format!("write {}", tmp.display()))?;
+        // fsync so a power loss between write+rename can't produce a
+        // 0-byte revocation file on next boot.
+        f.sync_all()
+            .with_context(|| format!("fsync {}", tmp.display()))?;
+    }
     std::fs::rename(&tmp, &path)
         .with_context(|| format!("rename {} → {}", tmp.display(), path.display()))?;
     Ok(())
@@ -163,22 +204,37 @@ pub fn spawn_watcher(
                 guard.clone()
             };
 
-            if let Err(e) = persist(&snapshot) {
-                // Persistence failures degrade to in-memory only — the
-                // revocation still applies for this daemon's lifetime.
-                // Logging is the operator's signal that the file write
-                // path needs attention.
-                tracing::error!(
-                    error = %e,
-                    principal = %principal,
-                    "failed to persist gateway revocation — keeping in-memory; investigate disk health"
-                );
-            } else {
-                tracing::info!(
-                    principal = %principal,
-                    revoked_at_epoch = ts_epoch,
-                    "bearer revocation recorded"
-                );
+            // `persist` does sync I/O (fsync + rename); offload it to
+            // the blocking-IO threadpool so a slow disk doesn't stall
+            // the tokio worker that owns this watcher task.
+            let principal_for_log = principal.clone();
+            let persist_result = tokio::task::spawn_blocking(move || persist(&snapshot)).await;
+            match persist_result {
+                Ok(Ok(())) => {
+                    tracing::info!(
+                        principal = %principal_for_log,
+                        revoked_at_epoch = ts_epoch,
+                        "bearer revocation recorded"
+                    );
+                },
+                Ok(Err(e)) => {
+                    // Persistence failures degrade to in-memory only — the
+                    // revocation still applies for this daemon's lifetime.
+                    // Logging is the operator's signal that the file write
+                    // path needs attention.
+                    tracing::error!(
+                        error = %e,
+                        principal = %principal_for_log,
+                        "failed to persist gateway revocation — keeping in-memory; investigate disk health"
+                    );
+                },
+                Err(join_err) => {
+                    tracing::error!(
+                        error = %join_err,
+                        principal = %principal_for_log,
+                        "revocation persistence task panicked"
+                    );
+                },
             }
         }
     });
