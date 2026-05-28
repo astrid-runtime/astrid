@@ -9,6 +9,10 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
 
 ## [Unreleased]
 
+### Added
+
+- **Gateway deployment runbook.** New `docs/gateway-deployment.md` covers the full operator surface: quickstart, behind a reverse proxy (nginx + Caddy snippets, `trust-forwarded-from` discipline), native TLS via the `[tls]` block, monitoring (every counter / histogram explained, sample alert PromQL), authentication flow + bearer lifecycle, CORS allowlist grammar, key rotation, backup + restore, and a troubleshooting section for the common failure modes (401 cascade, rate-limiter lockout, CORS preflight mismatch, audit-history 502). Cross-linked from `core/README.md` under a new "Operator documentation" section. Closes #777.
+
 ### Security
 
 - **Security-response-headers stack applied to every gateway response.** The gateway returns JSON, SSE, plain text, and Prometheus — never HTML — but every response now carries `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`, `Referrer-Policy: no-referrer`, and `Content-Security-Policy: default-src 'none'; frame-ancestors 'none'`. The headers are `if_not_present` so a handler that intentionally sets one wins; defaults fill in everywhere else. Defends against MIME-confusion (nosniff), clickjacking against any HTML that lands in the surface later (DENY + CSP frame-ancestors), and `Referer` leakage of principal-id-bearing URLs to third-party origins (no-referrer). Two new e2e tests pin headers on success and 401 paths. Closes #771.
