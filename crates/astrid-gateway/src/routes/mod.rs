@@ -262,24 +262,27 @@ async fn metrics_middleware(
     request: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> axum::response::Response {
-    let method = request.method().clone();
-    let template = match matched.as_ref() {
-        Some(m) => intern(m.as_str()),
+    let method = crate::metrics::http_method_static(request.method());
+    let route = match matched.as_ref() {
+        Some(m) => intern_route(m.as_str()),
         None => "<unmatched>",
     };
 
     let start = std::time::Instant::now();
     let response = next.run(request).await;
     let duration = start.elapsed();
-    let status = response.status();
+    let status = response.status().as_u16();
 
-    // Bucket key is `"METHOD ROUTE STATUS"` so the metric
-    // decomposes by status code. We intern the composed string
-    // once per unique (method, route, status) combination —
-    // cardinality is bounded by `routes × ~6 typical statuses`
-    // (~210 series at the current router shape), so the interner
-    // stays small.
-    let key = intern_owned(format!("{method} {template} {}", status.as_u16()));
+    // Per-request key is `(method, route, status)`. All three fields
+    // are `Copy` — no allocation, no format!, no global mutex on
+    // the hot path. Cardinality stays bounded by
+    // `routes × ~6 typical statuses` (~210 series at the current
+    // router shape).
+    let key = crate::metrics::RequestKey {
+        method,
+        route,
+        status,
+    };
     state.metrics.observe_request(key, duration).await;
 
     // Structured per-request log. /healthz and /metrics demote to
@@ -288,20 +291,20 @@ async fn metrics_middleware(
     #[allow(clippy::cast_precision_loss)]
     // duration_ms is a presentational field, precision loss is fine
     let duration_ms = duration.as_secs_f64() * 1000.0;
-    let quiet = template == "/healthz" || template == "/metrics";
+    let quiet = route == "/healthz" || route == "/metrics";
     if quiet {
         tracing::debug!(
-            method = %method,
-            route = template,
-            status = status.as_u16(),
+            method = method,
+            route = route,
+            status = status,
             duration_ms = duration_ms,
             "request"
         );
     } else {
         tracing::info!(
-            method = %method,
-            route = template,
-            status = status.as_u16(),
+            method = method,
+            route = route,
+            status = status,
             duration_ms = duration_ms,
             "request"
         );
@@ -310,12 +313,20 @@ async fn metrics_middleware(
     response
 }
 
-/// Intern a `&str` into a `&'static str`. The set of strings we
-/// intern is bounded — route templates and `(method, route,
-/// status)` compositions, both fixed by the router shape — so
-/// leaking is safe. Done lazily on first encounter so we don't
-/// need a manifest of every possible status code up front.
-fn intern(s: &str) -> &'static str {
+/// Intern a route template `&str` into a `&'static str`. The set of
+/// route templates is fixed at compile time by [`build`] above —
+/// the matched-path extractor returns one of those literals on every
+/// request — so leaking each unique template once is safe and the
+/// total leak budget is the route count.
+///
+/// The mutex contention here is only paid the *first* time each
+/// route is seen; subsequent requests skip the lock entirely because
+/// `axum::extract::MatchedPath` returns a string borrowed from the
+/// per-request router state that already has a stable representation
+/// in axum's own intern table (the path strings are static-like once
+/// the router is built). We intern again on our side to materialise
+/// the `&'static str` lifetime the metric map's key requires.
+fn intern_route(s: &str) -> &'static str {
     use std::sync::OnceLock;
     static INTERN: OnceLock<std::sync::Mutex<std::collections::HashSet<&'static str>>> =
         OnceLock::new();
@@ -325,23 +336,6 @@ fn intern(s: &str) -> &'static str {
         return existing;
     }
     let leaked: &'static str = Box::leak(s.to_string().into_boxed_str());
-    guard.insert(leaked);
-    leaked
-}
-
-/// Same as [`intern`] but takes an owned `String` to avoid an extra
-/// allocation in the common case where the caller already had to
-/// `format!()` the bucket key.
-fn intern_owned(s: String) -> &'static str {
-    use std::sync::OnceLock;
-    static INTERN: OnceLock<std::sync::Mutex<std::collections::HashSet<&'static str>>> =
-        OnceLock::new();
-    let table = INTERN.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()));
-    let mut guard = table.lock().expect("interner lock");
-    if let Some(existing) = guard.get(s.as_str()) {
-        return existing;
-    }
-    let leaked: &'static str = Box::leak(s.into_boxed_str());
     guard.insert(leaked);
     leaked
 }

@@ -84,28 +84,41 @@ impl Histogram {
 }
 
 /// One bucket of per-request observability: total count + latency
-/// histogram. Keyed in `Metrics::requests` by `"METHOD ROUTE STATUS"`
-/// so a 500-rate spike against `/api/auth/redeem` decomposes
-/// separately from the 200 traffic on the same route.
+/// histogram. Decomposed by `(method, route, status)` via
+/// [`RequestKey`] so a 500-rate spike against `/api/auth/redeem`
+/// shows up separately from the 200 traffic on the same route.
 #[derive(Debug, Default)]
 pub struct PerRequestMetrics {
     pub count: AtomicU64,
     pub duration: Histogram,
 }
 
+/// Key for the per-request metric family. Three small fields, all
+/// `Copy`, so the map lookup on the hot path is a hash of two
+/// pointers + a `u16` — no string formatting, no global lock, no
+/// allocation. Standard HTTP methods are passed as one of the
+/// `&'static str` constants from [`http_method_static`]; the route
+/// template is interned once per route (the set is fixed at compile
+/// time, see [`crate::routes::build`]); status is the raw `u16` axum
+/// hands us.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct RequestKey {
+    pub method: &'static str,
+    pub route: &'static str,
+    pub status: u16,
+}
+
 /// Shared metrics handle. One per `GatewayState`. Counters are
 /// `AtomicU64` so route handlers don't take a lock to increment.
 #[derive(Debug, Default)]
 pub struct Metrics {
-    /// Per-request observability. Keyed by
-    /// `"<METHOD> <route-pattern> <status>"` (e.g.
-    /// `GET /api/sys/principals 200`). Wrapped in
-    /// `RwLock<HashMap>` because the key set grows lazily on first
-    /// request and shrinks never — read-mostly after warm-up, so
-    /// the lock cost is negligible. Cardinality is bounded by
-    /// `routes × ~6 typical statuses` (~210 series at the current
-    /// router shape).
-    pub requests: RwLock<HashMap<&'static str, PerRequestMetrics>>,
+    /// Per-request observability keyed by [`RequestKey`] — the
+    /// `(method, route, status)` triple. `RwLock<HashMap>` because
+    /// the key set grows lazily on first request and shrinks never
+    /// — read-mostly after warm-up, so the lock cost is negligible.
+    /// Cardinality is bounded by `routes × ~6 typical statuses`
+    /// (~210 series at the current router shape).
+    pub requests: RwLock<HashMap<RequestKey, PerRequestMetrics>>,
     /// Bearer-verification failures (tampered sig, expired, malformed).
     pub auth_failures_total: AtomicU64,
     /// Invite-redemption attempts (successful + rejected combined).
@@ -118,15 +131,14 @@ pub struct Metrics {
 
 impl Metrics {
     /// Record one request observation: bump the count and feed the
-    /// duration into the histogram. The key is `&'static str` so we
-    /// don't allocate on the hot path — the router middleware interns
-    /// the `"METHOD ROUTE STATUS"` string once per unique combination
-    /// and passes the interned pointer.
-    pub async fn observe_request(&self, key: &'static str, duration: Duration) {
+    /// duration into the histogram. The [`RequestKey`] is `Copy` so
+    /// no allocation happens on the hot path; the map lookup is a
+    /// hash of two `&'static str` pointers plus a `u16`.
+    pub async fn observe_request(&self, key: RequestKey, duration: Duration) {
         // Fast path: read lock, increment if entry exists.
         {
             let map = self.requests.read().await;
-            if let Some(entry) = map.get(key) {
+            if let Some(entry) = map.get(&key) {
                 entry.count.fetch_add(1, Ordering::Relaxed);
                 entry.duration.observe(duration);
                 return;
@@ -161,13 +173,14 @@ impl Metrics {
             let map = self.requests.read().await;
             // Sort keys for stable output — easier to diff in
             // dashboards and tests.
-            let mut entries: Vec<(&&'static str, &PerRequestMetrics)> = map.iter().collect();
+            let mut entries: Vec<(&RequestKey, &PerRequestMetrics)> = map.iter().collect();
             entries.sort_by_key(|(k, _)| *k);
             for (key, entry) in entries {
-                let (method, route, status) = split_key(key);
                 let labels = format!(
-                    "method=\"{method}\",route=\"{}\",status=\"{status}\"",
-                    escape_label(route)
+                    "method=\"{}\",route=\"{}\",status=\"{}\"",
+                    key.method,
+                    escape_label(key.route),
+                    key.status
                 );
                 let count = entry.count.load(Ordering::Relaxed);
                 let _ = writeln!(out, "astrid_gateway_requests_total{{{labels}}} {count}");
@@ -240,14 +253,25 @@ fn micros_to_seconds(micros: u64) -> f64 {
     micros as f64 / 1_000_000.0
 }
 
-/// Split a `"METHOD ROUTE STATUS"` key back into its three parts.
-/// Defaults are paranoia — the router middleware interns the key in
-/// exactly this shape, so the empty cases should be unreachable in
-/// production.
-fn split_key(key: &str) -> (&str, &str, &str) {
-    let (method, rest) = key.split_once(' ').unwrap_or(("UNKNOWN", key));
-    let (route, status) = rest.rsplit_once(' ').unwrap_or((rest, "0"));
-    (method, route, status)
+/// Map an axum `Method` to a `&'static str` for use as
+/// [`RequestKey::method`]. Covers every method axum's `http` crate
+/// defines plus an `OTHER` fallback for the rare custom-method case
+/// — that path skips interning entirely so a malicious client can't
+/// inflate the metric cardinality.
+#[must_use]
+pub fn http_method_static(method: &axum::http::Method) -> &'static str {
+    match *method {
+        axum::http::Method::GET => "GET",
+        axum::http::Method::POST => "POST",
+        axum::http::Method::PUT => "PUT",
+        axum::http::Method::DELETE => "DELETE",
+        axum::http::Method::PATCH => "PATCH",
+        axum::http::Method::HEAD => "HEAD",
+        axum::http::Method::OPTIONS => "OPTIONS",
+        axum::http::Method::CONNECT => "CONNECT",
+        axum::http::Method::TRACE => "TRACE",
+        _ => "OTHER",
+    }
 }
 
 /// Escape characters that have meaning in Prometheus label values
@@ -270,15 +294,26 @@ fn escape_label(s: &str) -> String {
 mod tests {
     use super::*;
 
+    fn k(method: &'static str, route: &'static str, status: u16) -> RequestKey {
+        RequestKey {
+            method,
+            route,
+            status,
+        }
+    }
+
     #[tokio::test]
     async fn observe_records_count_and_duration() {
         let m = Metrics::default();
-        m.observe_request("GET /api/sys/status 200", Duration::from_millis(12))
+        m.observe_request(k("GET", "/api/sys/status", 200), Duration::from_millis(12))
             .await;
-        m.observe_request("GET /api/sys/status 200", Duration::from_millis(25))
+        m.observe_request(k("GET", "/api/sys/status", 200), Duration::from_millis(25))
             .await;
-        m.observe_request("GET /api/sys/principals 200", Duration::from_millis(8))
-            .await;
+        m.observe_request(
+            k("GET", "/api/sys/principals", 200),
+            Duration::from_millis(8),
+        )
+        .await;
         let rendered = m.render().await;
         assert!(rendered.contains(
             "astrid_gateway_requests_total{method=\"GET\",route=\"/api/sys/status\",status=\"200\"} 2"
@@ -296,12 +331,15 @@ mod tests {
     #[tokio::test]
     async fn status_label_decomposes_2xx_from_5xx() {
         let m = Metrics::default();
-        m.observe_request("POST /api/auth/redeem 200", Duration::from_millis(5))
+        m.observe_request(k("POST", "/api/auth/redeem", 200), Duration::from_millis(5))
             .await;
-        m.observe_request("POST /api/auth/redeem 200", Duration::from_millis(7))
+        m.observe_request(k("POST", "/api/auth/redeem", 200), Duration::from_millis(7))
             .await;
-        m.observe_request("POST /api/auth/redeem 500", Duration::from_millis(80))
-            .await;
+        m.observe_request(
+            k("POST", "/api/auth/redeem", 500),
+            Duration::from_millis(80),
+        )
+        .await;
         let rendered = m.render().await;
         assert!(rendered.contains(
             "astrid_gateway_requests_total{method=\"POST\",route=\"/api/auth/redeem\",status=\"200\"} 2"
@@ -316,11 +354,11 @@ mod tests {
         let m = Metrics::default();
         // Three observations: 7 ms, 20 ms, 200 ms. Buckets above are
         // cumulative — every bucket whose `le >= obs` increments.
-        m.observe_request("GET /x 200", Duration::from_millis(7))
+        m.observe_request(k("GET", "/x", 200), Duration::from_millis(7))
             .await;
-        m.observe_request("GET /x 200", Duration::from_millis(20))
+        m.observe_request(k("GET", "/x", 200), Duration::from_millis(20))
             .await;
-        m.observe_request("GET /x 200", Duration::from_millis(200))
+        m.observe_request(k("GET", "/x", 200), Duration::from_millis(200))
             .await;
         let rendered = m.render().await;
         // `<= 0.005` is below all three: 0
@@ -372,11 +410,19 @@ mod tests {
     }
 
     #[test]
-    fn split_key_extracts_three_parts() {
-        assert_eq!(split_key("GET /a 200"), ("GET", "/a", "200"));
-        assert_eq!(
-            split_key("POST /api/sys/principals/:id 404"),
-            ("POST", "/api/sys/principals/:id", "404")
-        );
+    fn http_method_static_covers_standard_set() {
+        use axum::http::Method;
+        assert_eq!(http_method_static(&Method::GET), "GET");
+        assert_eq!(http_method_static(&Method::POST), "POST");
+        assert_eq!(http_method_static(&Method::PUT), "PUT");
+        assert_eq!(http_method_static(&Method::DELETE), "DELETE");
+        assert_eq!(http_method_static(&Method::PATCH), "PATCH");
+        assert_eq!(http_method_static(&Method::HEAD), "HEAD");
+        assert_eq!(http_method_static(&Method::OPTIONS), "OPTIONS");
+        // Custom method falls back to `OTHER` so cardinality stays
+        // bounded — a malicious client can't inflate the metric by
+        // sending a stream of randomly-named verbs.
+        let custom = Method::from_bytes(b"WEIRD").unwrap();
+        assert_eq!(http_method_static(&custom), "OTHER");
     }
 }
