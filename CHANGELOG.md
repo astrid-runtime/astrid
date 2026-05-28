@@ -9,6 +9,10 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
 
 ## [Unreleased]
 
+### Added
+
+- **Latency histograms + per-request structured logs for the gateway.** The `/metrics` exposition now ships an `astrid_gateway_request_duration_seconds` Prometheus histogram per `(method, route, status)` with the standard HTTP buckets (5 ms → 10 s + `+Inf`), and `astrid_gateway_requests_total` carries a new `status` label so a 4xx/5xx spike decomposes separately from the 2xx traffic on the same route. Every request also emits one structured `tracing` event with `method`, `route` (matched template, never the raw URL — keeps cardinality bounded), `status`, and `duration_ms`; `/healthz` and `/metrics` demote to DEBUG so the high-frequency liveness probes don't drown the INFO stream. Hand-rolled histogram (matching the existing no-`prometheus`-crate posture) — `Histogram` stores cumulative bucket counts as `AtomicU64`s and the running sum as microseconds in a `u64` so we never need an `AtomicF64`. New `metrics::tests::histogram_buckets_are_cumulative` and a `tests/router.rs` integration test pin the wiring end-to-end (real request → `/metrics` exposition). Closes #778.
+
 ### Security
 
 - **Security-response-headers stack applied to every gateway response.** The gateway returns JSON, SSE, plain text, and Prometheus — never HTML — but every response now carries `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`, `Referrer-Policy: no-referrer`, and `Content-Security-Policy: default-src 'none'; frame-ancestors 'none'`. The headers are `if_not_present` so a handler that intentionally sets one wins; defaults fill in everywhere else. Defends against MIME-confusion (nosniff), clickjacking against any HTML that lands in the surface later (DENY + CSP frame-ancestors), and `Referer` leakage of principal-id-bearing URLs to third-party origins (no-referrer). Two new e2e tests pin headers on success and 401 paths. Closes #771.

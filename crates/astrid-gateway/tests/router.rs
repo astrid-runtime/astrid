@@ -327,3 +327,63 @@ fn openapi_lists_every_router_route() {
         );
     }
 }
+
+#[tokio::test]
+async fn metrics_endpoint_decomposes_request_by_status_and_records_latency() {
+    // Make a real request through the middleware, then hit /metrics
+    // and confirm the exposition reflects the (method, route, status)
+    // we just observed AND emits the histogram lines (count + +Inf
+    // bucket) for the same labels. Pins the wiring between the
+    // middleware and the `Metrics` type.
+    let state = fresh_state_with_distro(Some(SAMPLE_DISTRO));
+    let router = routes::build(Arc::clone(&state));
+
+    // Drive one /api/distribution → expected 200.
+    let resp = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/distribution")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // Scrape /metrics and verify shape.
+    let metrics_resp = router
+        .oneshot(
+            Request::builder()
+                .uri("/metrics")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(metrics_resp.status(), StatusCode::OK);
+    let body = to_bytes(metrics_resp.into_body(), 64 * 1024).await.unwrap();
+    let text = std::str::from_utf8(&body).expect("metrics must be UTF-8");
+
+    // Counter — at least one observation for the request we made.
+    assert!(
+        text.contains(
+            "astrid_gateway_requests_total{method=\"GET\",route=\"/api/distribution\",status=\"200\"}"
+        ),
+        "missing counter for GET /api/distribution 200; body was:\n{text}"
+    );
+    // Histogram — `_count` line for the same labels.
+    assert!(
+        text.contains(
+            "astrid_gateway_request_duration_seconds_count{method=\"GET\",route=\"/api/distribution\",status=\"200\"}"
+        ),
+        "missing histogram _count for GET /api/distribution 200; body was:\n{text}"
+    );
+    // Histogram — `+Inf` bucket present.
+    assert!(
+        text.contains(
+            "astrid_gateway_request_duration_seconds_bucket{method=\"GET\",route=\"/api/distribution\",status=\"200\",le=\"+Inf\"}"
+        ),
+        "missing +Inf bucket; body was:\n{text}"
+    );
+}
