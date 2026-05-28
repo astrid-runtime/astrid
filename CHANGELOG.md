@@ -9,8 +9,13 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
 
 ## [Unreleased]
 
+### Security
+
+- **Bearer revocation on principal delete.** Session bearers shipped in v0.7.0 as 8-hour ed25519-signed tokens with no revocation mechanism — an admin who deleted a compromised principal still had to wait out the bearer lifetime (or rotate the gateway signing key, which logs out every other user too). The gateway now subscribes to the kernel's audit-event firehose (`astrid.v1.audit.entry`); when an `AgentDelete` admin op records a `success` outcome, the target principal is added to a per-gateway `revoked_at` map (persisted atomically to `$ASTRID_HOME/etc/gateway-revocations.json`) and every bearer with an `iat` at-or-before the recorded epoch is rejected by `verify_bearer`. Survives daemon restart. Resilient to clock skew between the kernel and the gateway because the timestamp baked into the revocation entry comes from the kernel's own audit envelope, not gateway-local wall clock. Closes #772.
+
 ### Breaking
 
+- **Bearer wire format bumped to v2 (4 segments, was 3).** The token now carries an `iat` (issued-at epoch) claim alongside `principal` and `exp`. Required by the new revocation machinery: without `iat` the only revocation semantics available would be "blanket reject forever," which surprises an operator who later re-creates a principal with the same id. Dashboard sessions issued by the v0.7.0 gateway no longer verify after upgrade — clients must re-redeem. CLI `astrid invite redeem`, the existing pair-device flow, and every browser session that goes through `/api/auth/redeem` mint the new shape automatically; only pre-existing in-flight bearers are affected. Format spec: `b64url(principal) "." b64url(iat) "." b64url(exp) "." hex(sig)`, with sig over `principal:iat:exp`. Closes #772.
 - **MSRV bumped to 1.95.0.** `surrealdb 3.0.0-beta.3`'s `kv-mem` feature pulled in `surrealmx v0.21.0` → `ferntree v0.7.0`, which uses `std::hint::cold_path` stabilised in Rust 1.95. Upstream declared no `rust-version`, so cargo's resolver silently picks 0.7 even though the workspace MSRV says 1.94. Bumping our MSRV is the smallest fix that keeps CI deterministic without committing `Cargo.lock` (which is intentionally gitignored). Affects `cargo install astrid` consumers — installers on 1.94 will see a clear "requires rustc 1.95" error rather than the cryptic `cold_path` failure.
 
 ### Added
