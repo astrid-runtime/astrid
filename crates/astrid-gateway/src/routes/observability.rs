@@ -64,11 +64,11 @@ pub async fn get_healthz(State(_state): State<Arc<GatewayState>>) -> Response {
     tag = "ops",
     security(()),
     responses(
-        (status = 200, description = "Prometheus text-exposition format (version 0.0.4). Counters: `astrid_gateway_requests_total{method,route}`, `astrid_gateway_auth_failures_total`, `astrid_gateway_redeem_attempts_total`, `astrid_gateway_redeem_rate_limited_total`.", content_type = "text/plain"),
+        (status = 200, description = "Prometheus text-exposition format (version 0.0.4). Series: `astrid_gateway_requests_total{method,route,status}`, `astrid_gateway_request_duration_seconds{method,route,status}` (histogram), `astrid_gateway_auth_failures_total`, `astrid_gateway_redeem_attempts_total`, `astrid_gateway_redeem_rate_limited_total`.", content_type = "text/plain"),
     )
 )]
 pub async fn get_metrics(State(state): State<Arc<GatewayState>>) -> Response {
-    let body = state.metrics.render().await;
+    let body = state.metrics_handle.render();
     Response::builder()
         .status(StatusCode::OK)
         // Prometheus' content type — the version suffix is part of
