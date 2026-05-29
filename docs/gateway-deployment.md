@@ -278,9 +278,9 @@ What to back up:
   any custom group definitions.
 - `$ASTRID_HOME/keys/` — gateway signing key, kernel runtime key.
   Treat as secret material; `chmod 0700` the directory.
-- Per-principal state under `$ASTRID_HOME/{principal}/` — capsule
+- Per-principal state under `$ASTRID_HOME/home/{principal}/` — capsule
   env, secret stores, KV — and per-principal audit chains under
-  `$ASTRID_HOME/{principal}/.local/audit/`. The audit log isn't a
+  `$ASTRID_HOME/home/{principal}/.local/audit/`. The audit log isn't a
   monolithic `audit.db` file any more; each principal owns its own
   cryptographically-linked chain, so back up the whole principal
   home directory tree to retain auditable history. Operators
