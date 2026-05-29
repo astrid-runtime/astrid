@@ -155,9 +155,15 @@ impl sys::Host for HostState {
             return Err(ErrorCode::TooLarge);
         }
         let len = usize::try_from(length).map_err(|_| ErrorCode::TooLarge)?;
+        // Pull straight from the OS CSPRNG so the bytes match the WIT
+        // contract's "OS-level CSPRNG" guarantee. `try_fill_bytes` (not
+        // `fill_bytes`) so a practically-impossible entropy-source failure
+        // fails secure as an error rather than panicking inside a host call.
         use rand::RngCore;
         let mut buf = vec![0u8; len];
-        rand::thread_rng().fill_bytes(&mut buf);
+        rand::rngs::OsRng
+            .try_fill_bytes(&mut buf)
+            .map_err(|e| ErrorCode::Unknown(format!("entropy source unavailable: {e}")))?;
         Ok(buf)
     }
 
