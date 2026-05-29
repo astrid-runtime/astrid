@@ -78,6 +78,11 @@ async-trait = "0.1"
 # (`tower-http` 0.6, `utoipa-axum` 0.5). `default-features = false`
 # strips the multipart / `original-uri` / `ws` extractors we don't use.
 axum = { version = "0.7", default-features = false, features = ["http1", "json", "tokio", "tracing", "matched-path"] }
+# Wraps the axum router with native TLS via rustls. Used by the
+# gateway's optional `[tls]` block; without it the gateway speaks
+# plain HTTP and TLS is delegated to an upstream proxy. `tls-rustls`
+# is the only TLS backend we ship — no openssl in the workspace.
+axum-server = { version = "0.7", features = ["tls-rustls"] }
 # Bridges `tokio::sync::broadcast::Receiver` → `futures::Stream` so
 # axum's `Sse` responder can consume the kernel event bus directly.
 # The `sync` feature is the only thing that does it; not on by default.
@@ -129,6 +134,18 @@ oxc = { version = "0.112", features = ["transformer", "semantic", "codegen"] }
 oxc_allocator = "0.112"
 rand = "0.8"
 ratatui = { version = "0.29", features = ["unstable-rendered-line-info"] }
+# Self-signed certificate generation for gateway TLS integration
+# tests. Test-only (dev-dependency in the gateway integration crate);
+# we don't ship cert-mint logic in production code.
+rcgen = "0.13"
+# Direct dep on rustls (also pulled in transitively via axum-server)
+# so the gateway can call `CryptoProvider::install_default()` at boot.
+# rustls 0.23 requires that explicit pick when more than one provider
+# feature is in the dep tree (which is our situation:
+# `reqwest`/`teloxide` pull `rustls/ring` indirectly, axum-server
+# pulls `aws-lc-rs`). aws-lc-rs is the FIPS-friendlier option and is
+# what we run with in production.
+rustls = { version = "0.23", features = ["aws-lc-rs"] }
 regex = "1.10"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
 rmcp = { version = "0.15", features = ["client", "transport-child-process", "transport-io", "elicitation"] }
