@@ -28,7 +28,7 @@ mod connection_tracker_tests;
 /// 1. `astrid.v1.request.*` - handles management commands (list capsules, reload, etc.)
 /// 2. `client.v1.*` - tracks the active connection count per principal.
 ///
-/// Uplink capsules (e.g. the CLI proxy) publish `client.v1.connected` /
+/// Uplink capsules (e.g. the CLI proxy) publish `client.v1.connect` /
 /// `client.v1.disconnect` carrying the authenticated principal as a socket is
 /// accepted / closed; the tracker adjusts `active_connections` accordingly.
 /// Because the SDK exposes no typed-payload publish (only JSON), the tracker
@@ -104,7 +104,7 @@ enum ConnectionSignal {
 /// Classifies a `client.v1.*` message as a connection open/close.
 ///
 /// Recognises **both** the typed [`IpcPayload::Connect`]/[`IpcPayload::Disconnect`]
-/// that native producers emit, **and** the `client.v1.connected` /
+/// that native producers emit, **and** the `client.v1.connect` /
 /// `client.v1.disconnect` topics carrying any payload. Uplink capsules can only
 /// reach the bus through the JSON-only SDK publish surface (no typed-payload
 /// publish exists), so the topic is the only signal they can produce — without
@@ -126,7 +126,7 @@ fn connection_signal(topic: &str, payload: &IpcPayload) -> Option<ConnectionSign
             Some(ConnectionSignal::Closed { reason })
         },
         _ if topic == "client.v1.disconnect" => Some(ConnectionSignal::Closed { reason: None }),
-        _ if topic == "client.v1.connected" => Some(ConnectionSignal::Opened),
+        _ if topic == "client.v1.connect" => Some(ConnectionSignal::Opened),
         _ => None,
     }
 }
