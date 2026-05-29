@@ -213,11 +213,22 @@ fn spawn_gateway(
     cfg: astrid_gateway::GatewayConfig,
     kernel: &std::sync::Arc<astrid_kernel::Kernel>,
 ) -> Result<std::sync::Arc<tokio::sync::Notify>> {
-    // Plumb the kernel's event bus into the gateway so the SSE
-    // audit stream can subscribe directly — same in-process bus,
-    // no extra socket round-trip.
+    // Plumb three kernel handles into the gateway:
+    //
+    //   * the event bus, so the SSE audit stream and the bus-direct
+    //     admin client can subscribe / publish locally without going
+    //     back over the Unix socket;
+    //   * the persistent audit log, so the new
+    //     `GET /api/sys/audit` historical-query route has somewhere
+    //     to read from;
+    //   * the session id (paired with the audit log because the
+    //     log indexes entries by session).
     let bus = std::sync::Arc::clone(&kernel.event_bus);
-    let state = astrid_gateway::GatewayState::new(cfg, Some(bus)).context("build gateway state")?;
+    let audit_log = std::sync::Arc::clone(&kernel.audit_log);
+    let session_id = kernel.session_id.clone();
+    let state =
+        astrid_gateway::GatewayState::new(cfg, Some(bus), Some(audit_log), Some(session_id))
+            .context("build gateway state")?;
     let notify = std::sync::Arc::new(tokio::sync::Notify::new());
     let notify_for_task = std::sync::Arc::clone(&notify);
     tokio::spawn(async move {

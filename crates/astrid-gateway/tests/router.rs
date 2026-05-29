@@ -71,6 +71,8 @@ fn fresh_state_with_distro(distro: Option<&str>) -> Arc<GatewayState> {
         metrics_handle: astrid_gateway::metrics::install_recorder().expect("recorder"),
         event_bus: None,
         revoked_at: std::sync::Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
+        audit_log: None,
+        session_id: None,
     })
 }
 
@@ -311,6 +313,7 @@ fn openapi_lists_every_router_route() {
         "/api/capsules/{id}/env",
         "/api/capsules/{id}/env/{field}",
         "/api/events",
+        "/api/sys/audit",
         "/api/agent/prompt",
         "/api/sys/status",
         "/api/sys/capsules/reload",

@@ -120,6 +120,8 @@ async fn kernel_and_gateway_boot_against_shared_home() {
     let state = GatewayState::new(
         GatewayConfig::default(),
         Some(Arc::clone(&kernel.event_bus)),
+        Some(Arc::clone(&kernel.audit_log)),
+        Some(kernel.session_id.clone()),
     )
     .expect("gateway state");
     let key_path = home.root().join("keys").join("gateway.ed25519");
