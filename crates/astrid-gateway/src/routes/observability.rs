@@ -68,9 +68,14 @@ pub async fn get_healthz(State(_state): State<Arc<GatewayState>>) -> Response {
     )
 )]
 pub async fn get_metrics(State(state): State<Arc<GatewayState>>) -> Response {
-    // Refresh the pull-based `process_*` gauges so the scrape reflects
-    // the instant it was taken (the collector has no background thread).
-    crate::metrics::collect_process_metrics();
+    // Refresh the pull-based `process_*` gauges so the scrape reflects the
+    // instant it was taken (the collector has no background thread).
+    // `collect()` does synchronous `/proc` (Linux) / `libproc` (macOS)
+    // reads, so run it on the blocking pool to keep the async workers
+    // responsive under scrape spam against this unauthenticated endpoint.
+    // Fail-soft: if the blocking task can't be joined, render with the
+    // prior sample rather than panicking a public request.
+    let _ = tokio::task::spawn_blocking(crate::metrics::collect_process_metrics).await;
     let body = state.metrics_handle.render();
     Response::builder()
         .status(StatusCode::OK)

@@ -20,11 +20,26 @@ fn main() {
     let rustc_version = run(Command::new(rustc).arg("--version"));
     println!("cargo:rustc-env=ASTRID_RUSTC_VERSION={rustc_version}");
 
-    // Re-run when HEAD moves so the embedded SHA tracks the checkout.
-    // Best-effort: if we can't find `.git/HEAD` (worktree gitfile,
-    // tarball build) the SHA simply refreshes on the next clean build.
+    // Re-run when the resolved commit changes. `.git/HEAD` is usually a
+    // symbolic ref (`ref: refs/heads/<branch>`) whose *content* doesn't
+    // change on a new commit — only the pointed-to ref file does — so we
+    // track that file too, plus `packed-refs` as a fallback for a ref with
+    // no loose file (e.g. a fresh clone). Best-effort: a tarball or worktree
+    // build with no reachable `.git` simply refreshes on the next clean build.
     if let Some(head) = locate_git_head() {
         println!("cargo:rerun-if-changed={}", head.display());
+        if let (Some(git_dir), Ok(contents)) = (head.parent(), std::fs::read_to_string(&head))
+            && let Some(ref_path) = contents.strip_prefix("ref:")
+        {
+            println!(
+                "cargo:rerun-if-changed={}",
+                git_dir.join(ref_path.trim()).display()
+            );
+            println!(
+                "cargo:rerun-if-changed={}",
+                git_dir.join("packed-refs").display()
+            );
+        }
     }
     println!("cargo:rerun-if-changed=build.rs");
 }
