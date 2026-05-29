@@ -39,7 +39,7 @@ fn state_with_origins(origins: Vec<&str>) -> Arc<GatewayState> {
         distribution: Arc::new(DistributionInfo::single_tenant()),
         onboarding: Arc::new(OnboardingFields::default()),
         redeem_limiter: tokio::sync::Mutex::default(),
-        metrics: astrid_gateway::metrics::Metrics::default(),
+        metrics_handle: astrid_gateway::metrics::install_recorder().expect("recorder"),
         event_bus: None,
         revoked_at: std::sync::Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
     })

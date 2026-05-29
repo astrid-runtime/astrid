@@ -215,7 +215,7 @@ mod tests {
             distribution: Arc::new(crate::routes::distribution::DistributionInfo::single_tenant()),
             onboarding: Arc::new(crate::routes::distribution::OnboardingFields::default()),
             redeem_limiter: tokio::sync::Mutex::default(),
-            metrics: crate::metrics::Metrics::default(),
+            metrics_handle: crate::metrics::install_recorder().expect("recorder"),
             event_bus: None,
             revoked_at: std::sync::Arc::new(std::sync::RwLock::new(
                 std::collections::HashMap::new(),

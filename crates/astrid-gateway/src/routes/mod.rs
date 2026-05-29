@@ -257,7 +257,7 @@ fn build_cors_layer(origins: &[String]) -> tower_http::cors::CorsLayer {
 /// Failed-route requests (404 before match) fall under the
 /// catch-all `<unmatched>` bucket.
 async fn metrics_middleware(
-    axum::extract::State(state): axum::extract::State<Arc<GatewayState>>,
+    _state: axum::extract::State<Arc<GatewayState>>,
     matched: Option<axum::extract::MatchedPath>,
     request: axum::extract::Request,
     next: axum::middleware::Next,
@@ -273,17 +273,12 @@ async fn metrics_middleware(
     let duration = start.elapsed();
     let status = response.status().as_u16();
 
-    // Per-request key is `(method, route, status)`. All three fields
-    // are `Copy` — no allocation, no format!, no global mutex on
-    // the hot path. Cardinality stays bounded by
-    // `routes × ~6 typical statuses` (~210 series at the current
-    // router shape).
-    let key = crate::metrics::RequestKey {
-        method,
-        route,
-        status,
-    };
-    state.metrics.observe_request(key, duration).await;
+    // Record into the process-wide `metrics::Recorder`. The labels
+    // are `&'static str` (route templates interned once on first
+    // sight; method + status mapped to static strs at the call
+    // site) so the recorder doesn't allocate on the hot path.
+    // Cardinality stays bounded by `routes × ~6 typical statuses`.
+    crate::metrics::observe_request(method, route, status, duration);
 
     // Structured per-request log. /healthz and /metrics demote to
     // DEBUG so the high-frequency liveness probes don't drown the
