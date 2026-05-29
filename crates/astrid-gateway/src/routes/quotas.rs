@@ -21,11 +21,31 @@ use crate::error::{ErrorBody, GatewayError, GatewayResult};
 use crate::routes::principals::{caller_from, daemon_internal, read_json_body, unexpected};
 use crate::state::GatewayState;
 
+/// `OpenAPI` schema mirror of [`astrid_core::profile::Quotas`]. Never
+/// constructed; resolves the `value_type` on [`QuotaRequest::quotas`]
+/// to a typed schema. Every field carries a server-side default, so
+/// any may be omitted on a `set` request; the same shape is what a
+/// `get` returns (all fields always present). Field types track
+/// `Quotas` exactly.
+#[derive(ToSchema)]
+pub struct QuotasView {
+    /// Maximum resident memory in bytes (> 0).
+    pub max_memory_bytes: u64,
+    /// Maximum wall-clock time for a single invocation, in seconds.
+    pub max_timeout_secs: u64,
+    /// Maximum IPC throughput in bytes/sec (> 0).
+    pub max_ipc_throughput_bytes: u64,
+    /// Maximum concurrent background processes.
+    pub max_background_processes: u32,
+    /// Maximum persistent storage in bytes (> 0).
+    pub max_storage_bytes: u64,
+}
+
 #[derive(Debug, Clone, Deserialize, ToSchema)]
 pub struct QuotaRequest {
     /// Resource ceilings (`Quotas` from `astrid_core::profile`). All
-    /// fields optional — omitted ones keep their current value.
-    #[schema(value_type = serde_json::Value)]
+    /// fields optional — omitted ones fall back to server defaults.
+    #[schema(value_type = QuotasView)]
     pub quotas: Quotas,
 }
 

@@ -28,10 +28,27 @@ pub struct IssueRequest {
     pub metadata: Option<String>,
 }
 
+/// `OpenAPI` schema mirror of [`astrid_core::kernel_api::InviteIssued`].
+/// Never constructed; resolves the `value_type` on
+/// [`IssueResponse::invite`] to a typed schema. Keep it
+/// field-for-field with the serialized shape of `InviteIssued`.
+#[derive(ToSchema)]
+pub struct InviteIssuedView {
+    /// Opaque token (URL-safe base64). Returned once — store securely.
+    pub token: String,
+    /// Group the redeemer will join on success.
+    pub group: String,
+    /// Remaining redemptions before the token is invalidated.
+    pub remaining_uses: u32,
+    /// Unix-epoch expiry. Absent when issued with no expiry.
+    pub expires_at_epoch: Option<u64>,
+    /// Operator-supplied label.
+    pub metadata: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct IssueResponse {
-    /// `InviteIssued` shape: `{ token, group, remaining_uses, expires_at_epoch?, fingerprint, metadata? }`.
-    #[schema(value_type = serde_json::Value)]
+    #[schema(value_type = InviteIssuedView)]
     pub invite: InviteIssued,
 }
 
@@ -83,10 +100,32 @@ pub async fn issue_invite(
     }
 }
 
+/// `OpenAPI` schema mirror of [`astrid_core::kernel_api::InviteSummary`].
+/// Never constructed; resolves the `value_type` on
+/// [`ListResponse::invites`] to a typed schema. Keep it
+/// field-for-field with the serialized shape of `InviteSummary` —
+/// note the field is `token_fingerprint` (not `fingerprint`), and
+/// `issued_at_epoch` is always present.
+#[derive(ToSchema)]
+pub struct InviteSummaryView {
+    /// SHA-256 fingerprint (hex) of the token. Raw tokens are never
+    /// leaked through list responses.
+    pub token_fingerprint: String,
+    /// Group the redeemer will join.
+    pub group: String,
+    /// Remaining redemptions.
+    pub remaining_uses: u32,
+    /// Unix-epoch expiry. Absent when issued with no expiry.
+    pub expires_at_epoch: Option<u64>,
+    /// Unix-epoch timestamp at which the token was issued.
+    pub issued_at_epoch: u64,
+    /// Operator-supplied label.
+    pub metadata: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct ListResponse {
-    /// `InviteSummary` shape: `{ fingerprint, group, remaining_uses, expires_at_epoch?, metadata? }`.
-    #[schema(value_type = Vec<serde_json::Value>)]
+    #[schema(value_type = Vec<InviteSummaryView>)]
     pub invites: Vec<InviteSummary>,
 }
 

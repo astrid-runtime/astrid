@@ -19,10 +19,28 @@ use crate::error::{ErrorBody, GatewayError, GatewayResult};
 use crate::routes::principals::{caller_from, daemon_internal, read_json_body, unexpected};
 use crate::state::GatewayState;
 
+/// `OpenAPI` schema mirror of [`astrid_core::kernel_api::GroupSummary`].
+/// Never constructed; resolves the `value_type` on
+/// [`GroupListResponse::groups`] to a typed schema. Keep it
+/// field-for-field with the serialized shape of `GroupSummary`.
+#[derive(ToSchema)]
+pub struct GroupSummaryView {
+    /// Group name.
+    pub name: String,
+    /// Capability patterns conferred by this group.
+    pub capabilities: Vec<String>,
+    /// Human-readable description.
+    pub description: Option<String>,
+    /// Whether the group opted in to granting the universal `*`.
+    pub unsafe_admin: bool,
+    /// `true` for built-in groups (`admin`, `agent`, `restricted`);
+    /// clients should treat built-ins as read-only.
+    pub builtin: bool,
+}
+
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct GroupListResponse {
-    /// `GroupSummary` shape: `{ name, capabilities, description?, unsafe_admin, built_in }`.
-    #[schema(value_type = Vec<serde_json::Value>)]
+    #[schema(value_type = Vec<GroupSummaryView>)]
     pub groups: Vec<GroupSummary>,
 }
 
