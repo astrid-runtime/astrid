@@ -68,6 +68,32 @@ pub struct GatewayConfig {
     ///
     /// Example: `["127.0.0.1", "10.0.0.1"]`.
     pub trust_forwarded_from: Vec<std::net::IpAddr>,
+    /// TLS termination directly in the gateway. `None` (the default)
+    /// keeps the plain-HTTP posture and delegates TLS to an upstream
+    /// proxy. `Some(...)` switches to native rustls termination —
+    /// useful for single-box installs, Tailscale-fronted deployments,
+    /// or anyone deploying without a reverse-proxy ops layer.
+    ///
+    /// Default `None` so an upgrade from v0.7.0 keeps its existing
+    /// shape (`enabled = true` + no TLS = same plain-HTTP behaviour
+    /// the daemon already had).
+    pub tls: Option<TlsConfig>,
+}
+
+/// Native TLS configuration for the gateway. Backed by rustls
+/// (no openssl dependency anywhere in the workspace).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub struct TlsConfig {
+    /// Filesystem path to the PEM-encoded server certificate chain.
+    /// Must be readable by the daemon process. Live cert rotation is
+    /// not yet wired (the daemon only handles SIGINT / SIGTERM);
+    /// today, restart the daemon to pick up new bytes.
+    pub cert_path: PathBuf,
+    /// Filesystem path to the PEM-encoded private key (PKCS#8 or
+    /// RSA). Must be 0600 perms on Unix; the gateway logs a warning
+    /// on boot if the key is group- or world-readable.
+    pub key_path: PathBuf,
 }
 
 impl Default for GatewayConfig {
@@ -80,6 +106,7 @@ impl Default for GatewayConfig {
             redeem_rate_limit_secs: DEFAULT_REDEEM_RATE_LIMIT_SECS,
             cors_allow_origins: Vec::new(),
             trust_forwarded_from: Vec::new(),
+            tls: None,
         }
     }
 }
@@ -97,15 +124,50 @@ impl GatewayConfig {
         Duration::from_secs(self.redeem_rate_limit_secs)
     }
 
-    /// Post-deserialisation validation. Catches misconfigurations that
-    /// would otherwise silently no-op at runtime — most importantly,
-    /// CORS entries that don't parse as a `scheme://host[:port]`
-    /// origin. The gateway used to read the field and never wire it
-    /// into the router; the router now does the wiring, so refusing
-    /// to boot on bad origins is what makes the config honest.
+    /// Post-deserialisation validation. Catches misconfigurations
+    /// that would otherwise silently no-op at runtime or fail with a
+    /// cryptic error deep inside rustls / `tower-http`:
+    ///
+    /// * **CORS origins** are checked against the `scheme://host[:port]`
+    ///   shape so an operator who typoed a trailing slash, fragment,
+    ///   IDN, etc., fails boot with a clear message rather than
+    ///   silently never matching a browser preflight.
+    /// * **TLS** cert/key paths must exist as regular files and not
+    ///   collide with each other — both common misconfigurations
+    ///   that the rustls PEM parser would surface as bewildering
+    ///   downstream errors.
     pub fn validate(&self) -> anyhow::Result<()> {
         for raw in &self.cors_allow_origins {
             validate_cors_origin(raw)?;
+        }
+        if let Some(tls) = &self.tls {
+            // `is_file()` catches both "doesn't exist" and "points
+            // at a directory". `exists()` alone would pass for a
+            // directory and fail later inside rustls with a less
+            // clear error.
+            if !tls.cert_path.is_file() {
+                anyhow::bail!(
+                    "tls.cert-path {} is not a regular file — refusing to boot the gateway",
+                    tls.cert_path.display()
+                );
+            }
+            if !tls.key_path.is_file() {
+                anyhow::bail!(
+                    "tls.key-path {} is not a regular file — refusing to boot the gateway",
+                    tls.key_path.display()
+                );
+            }
+            // Defensive: catch the copy-paste typo where cert+key
+            // point at the same file. The rustls PEM parser will
+            // happily try to load a private key out of the cert chain
+            // and produce a cryptic error; surface the problem here.
+            if tls.cert_path == tls.key_path {
+                anyhow::bail!(
+                    "tls.cert-path and tls.key-path resolve to the same file ({}); separate them",
+                    tls.cert_path.display()
+                );
+            }
+            crate::tls::warn_if_key_is_too_open(&tls.key_path);
         }
         Ok(())
     }
@@ -284,10 +346,114 @@ mod tests {
             redeem_rate_limit_secs: 0,
             cors_allow_origins: vec!["https://example.invalid".into()],
             trust_forwarded_from: vec!["10.0.0.1".parse().unwrap()],
+            tls: Some(TlsConfig {
+                cert_path: PathBuf::from("/etc/astrid/tls/cert.pem"),
+                key_path: PathBuf::from("/etc/astrid/tls/key.pem"),
+            }),
         };
         let text = toml::to_string_pretty(&cfg).unwrap();
         let back: GatewayConfig = toml::from_str(&text).unwrap();
         assert_eq!(back.listen, cfg.listen);
         assert_eq!(back.cors_allow_origins, cfg.cors_allow_origins);
+        assert_eq!(
+            back.tls.as_ref().map(|t| t.cert_path.clone()),
+            cfg.tls.as_ref().map(|t| t.cert_path.clone())
+        );
+    }
+
+    #[test]
+    fn validate_rejects_missing_cert_path() {
+        let cfg = GatewayConfig {
+            tls: Some(TlsConfig {
+                cert_path: PathBuf::from("/dev/null/does/not/exist.pem"),
+                key_path: PathBuf::from("/dev/null/does/not/exist.key"),
+            }),
+            ..GatewayConfig::default()
+        };
+        let err = cfg.validate().expect_err("missing cert must reject");
+        assert!(
+            format!("{err:#}").contains("cert-path"),
+            "error mentions cert-path: {err:#}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_missing_key_path() {
+        let tmp = tempfile::NamedTempFile::new().expect("tempfile");
+        let cfg = GatewayConfig {
+            tls: Some(TlsConfig {
+                cert_path: tmp.path().to_path_buf(),
+                key_path: PathBuf::from("/dev/null/does/not/exist.key"),
+            }),
+            ..GatewayConfig::default()
+        };
+        let err = cfg.validate().expect_err("missing key must reject");
+        assert!(
+            format!("{err:#}").contains("key-path"),
+            "error mentions key-path: {err:#}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_directory_as_cert_path() {
+        // `exists()` on a directory returns true; `is_file()` is what
+        // catches the copy-paste-a-dir typo. Use the parent of a
+        // tempfile so we have a real directory at hand.
+        let tmpdir = tempfile::tempdir().expect("tempdir");
+        let key = tempfile::NamedTempFile::new().expect("key tempfile");
+        let cfg = GatewayConfig {
+            tls: Some(TlsConfig {
+                cert_path: tmpdir.path().to_path_buf(),
+                key_path: key.path().to_path_buf(),
+            }),
+            ..GatewayConfig::default()
+        };
+        let err = cfg.validate().expect_err("directory must reject");
+        assert!(
+            format!("{err:#}").contains("not a regular file"),
+            "error mentions regular file: {err:#}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_same_file_for_cert_and_key() {
+        // Common copy-paste typo: cert and key both point at the same
+        // path. Surface it here rather than letting rustls' PEM
+        // parser produce a cryptic "no private key found".
+        let same = tempfile::NamedTempFile::new().expect("tempfile");
+        let cfg = GatewayConfig {
+            tls: Some(TlsConfig {
+                cert_path: same.path().to_path_buf(),
+                key_path: same.path().to_path_buf(),
+            }),
+            ..GatewayConfig::default()
+        };
+        let err = cfg.validate().expect_err("same-file must reject");
+        assert!(
+            format!("{err:#}").contains("same file"),
+            "error mentions same file: {err:#}"
+        );
+    }
+
+    #[test]
+    fn validate_passes_for_existing_cert_and_key() {
+        let cert = tempfile::NamedTempFile::new().expect("cert tempfile");
+        let key = tempfile::NamedTempFile::new().expect("key tempfile");
+        let cfg = GatewayConfig {
+            tls: Some(TlsConfig {
+                cert_path: cert.path().to_path_buf(),
+                key_path: key.path().to_path_buf(),
+            }),
+            ..GatewayConfig::default()
+        };
+        cfg.validate()
+            .expect("existing cert+key files should pass validation");
+    }
+
+    #[test]
+    fn validate_no_tls_block_is_a_noop() {
+        let cfg = GatewayConfig::default();
+        assert!(cfg.tls.is_none());
+        cfg.validate().expect("no-tls config must pass");
     }
 }
