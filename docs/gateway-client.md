@@ -29,7 +29,7 @@ annotations at compile time and served unauthenticated. Point any
 OpenAPI 3.x toolchain at a running daemon:
 
 ```sh
-curl http://127.0.0.1:7777/api/openapi.json > openapi.json
+curl http://127.0.0.1:2787/api/openapi.json > openapi.json
 ```
 
 | Language | Recommended generator | Notes |

@@ -17,14 +17,14 @@ The smallest possible gateway:
 ```toml
 # $ASTRID_HOME/etc/gateway-http.toml
 enabled = true
-listen = "127.0.0.1:7777"
+listen = "127.0.0.1:2787"
 ```
 
 Restart the daemon. The gateway is now serving plain HTTP on
 loopback. Hit `/healthz` to confirm:
 
 ```sh
-curl http://127.0.0.1:7777/healthz   # → ok
+curl http://127.0.0.1:2787/healthz   # → ok
 ```
 
 For single-box installs that don't need an HTTP front at all,
@@ -50,7 +50,7 @@ server {
     ssl_certificate_key /etc/letsencrypt/live/astrid.example.com/privkey.pem;
 
     location / {
-        proxy_pass http://127.0.0.1:7777;
+        proxy_pass http://127.0.0.1:2787;
         proxy_http_version 1.1;
 
         # SSE needs the response to stream as it arrives.
@@ -69,7 +69,7 @@ server {
 
 ```caddy
 astrid.example.com {
-    reverse_proxy 127.0.0.1:7777 {
+    reverse_proxy 127.0.0.1:2787 {
         flush_interval -1            # SSE
         header_up X-Real-IP {remote}
     }
@@ -314,7 +314,7 @@ line saying so.
 The bearer either isn't being sent or doesn't verify.
 
 ```sh
-curl -v -H "Authorization: Bearer $TOKEN" http://127.0.0.1:7777/api/auth/me
+curl -v -H "Authorization: Bearer $TOKEN" http://127.0.0.1:2787/api/auth/me
 ```
 
 If the daemon log shows `Authorization` header missing, the proxy

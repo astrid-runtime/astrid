@@ -22,13 +22,31 @@ use crate::auth::CallerContext;
 use crate::error::{ErrorBody, GatewayError, GatewayResult};
 use crate::state::GatewayState;
 
+/// `OpenAPI` schema mirror of [`astrid_core::kernel_api::AgentSummary`].
+///
+/// `AgentSummary` lives in `astrid-core`, which deliberately doesn't
+/// depend on utoipa (see `openapi.rs`). This struct is never
+/// constructed — it exists only so the `value_type` on
+/// [`PrincipalListResponse::principals`] resolves to a typed schema
+/// instead of an opaque JSON value. Keep it field-for-field with the
+/// serialized shape of `AgentSummary`.
+#[derive(ToSchema)]
+pub struct AgentSummaryView {
+    /// Principal identifier (e.g. `"agent-alice"`).
+    pub principal: String,
+    /// Whether the principal is currently enabled (master switch).
+    pub enabled: bool,
+    /// Group memberships as written to `profile.toml`.
+    pub groups: Vec<String>,
+    /// Direct capability grants beyond group inheritance.
+    pub grants: Vec<String>,
+    /// Explicit revokes (highest-precedence deny).
+    pub revokes: Vec<String>,
+}
+
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct PrincipalListResponse {
-    /// Per the kernel's `AgentSummary` shape:
-    /// `{ principal: string, enabled: bool, groups: string[], grants: string[], revokes: string[] }`.
-    /// Listed as a JSON value array here because `AgentSummary` lives
-    /// in `astrid-core` and we don't pull utoipa across that boundary.
-    #[schema(value_type = Vec<serde_json::Value>)]
+    #[schema(value_type = Vec<AgentSummaryView>)]
     pub principals: Vec<AgentSummary>,
 }
 
@@ -333,12 +351,36 @@ pub async fn modify_principal(
 ///
 /// `categories` is the stable ordering dashboards should use for
 /// section rendering (matches the catalog's natural grouping).
+/// `OpenAPI` schema mirror of
+/// [`astrid_core::capability_grammar::CapabilityInfo`]. Never
+/// constructed; resolves the `value_type` on
+/// [`CapabilityCatalogResponse::capabilities`] to a typed schema.
+/// The `category`/`scope`/`danger` enums serialize as lowercase
+/// (`snake_case`) strings — modelled as `String` here rather than
+/// re-deriving the kernel enums across the no-utoipa boundary.
+#[derive(ToSchema)]
+pub struct CapabilityInfoView {
+    /// Capability identifier as it appears in policy (e.g.
+    /// `"system:shutdown"`). Stable wire format.
+    pub id: String,
+    /// Short human-readable label for the dashboard toggle.
+    pub label: String,
+    /// One-sentence operator-facing description (tooltip / hint).
+    pub description: String,
+    /// Family bucket for UI grouping: one of `agent`, `approval`,
+    /// `caps`, `capsule`, `group`, `invite`, `quota`, `system`.
+    pub category: String,
+    /// Authority scope: `global` or the self-scoped variant.
+    pub scope: String,
+    /// Risk tier for confirmation prompts: one of `safe`, `normal`,
+    /// `elevated`, `extreme`.
+    pub danger: String,
+}
+
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct CapabilityCatalogResponse {
-    /// Per-capability metadata. Each entry is the `CapabilityInfo`
-    /// shape: `{ id, label, description, category, scope, danger }`
-    /// — see `astrid_core::capability_grammar` for the source.
-    #[schema(value_type = Vec<serde_json::Value>)]
+    /// Per-capability metadata — see `astrid_core::capability_grammar`.
+    #[schema(value_type = Vec<CapabilityInfoView>)]
     pub capabilities: &'static [astrid_core::capability_grammar::CapabilityInfo],
     /// Stable render order. Dashboards group toggles into these
     /// sections in the listed sequence.

@@ -128,22 +128,28 @@ use crate::state::GatewayState;
             routes::auth::PairDeviceRedeemResponse,
             // Principals
             routes::principals::PrincipalListResponse,
+            routes::principals::AgentSummaryView,
             routes::principals::CreatePrincipalRequest,
             routes::principals::ModifyPrincipalRequest,
             routes::principals::CapabilityCatalogResponse,
+            routes::principals::CapabilityInfoView,
             // Caps
             routes::caps::GrantRequest,
             routes::caps::RevokeRequest,
             // Quotas
             routes::quotas::QuotaRequest,
+            routes::quotas::QuotasView,
             // Groups
             routes::groups::GroupListResponse,
+            routes::groups::GroupSummaryView,
             routes::groups::CreateGroupRequest,
             routes::groups::ModifyGroupRequest,
             // Invites
             routes::invites::IssueRequest,
             routes::invites::IssueResponse,
+            routes::invites::InviteIssuedView,
             routes::invites::ListResponse,
+            routes::invites::InviteSummaryView,
             // Capsules
             routes::capsules::CapsuleListResponse,
             routes::capsules::CapsuleDetail,

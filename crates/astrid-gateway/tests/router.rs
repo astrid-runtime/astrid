@@ -271,6 +271,67 @@ async fn openapi_route_serves_valid_spec_unauthenticated() {
 }
 
 #[test]
+fn openapi_types_kernel_payloads_instead_of_opaque_json() {
+    // Regression guard for #783: response payloads sourced from
+    // `astrid-core` types must surface as typed schema mirrors, not
+    // opaque `serde_json::Value` (which renders as `any`/`object`
+    // and gives generated clients no field-level types). If someone
+    // reverts a `value_type` back to `serde_json::Value`, the
+    // mirror schema disappears from components and this fails.
+    use astrid_gateway::openapi::ApiDoc;
+    use utoipa::OpenApi;
+
+    let doc: serde_json::Value = serde_json::to_value(ApiDoc::openapi()).expect("spec serializes");
+    let schemas = doc
+        .get("components")
+        .and_then(|v| v.get("schemas"))
+        .and_then(|v| v.as_object())
+        .expect("spec must declare component schemas");
+
+    for mirror in [
+        "AgentSummaryView",
+        "CapabilityInfoView",
+        "QuotasView",
+        "GroupSummaryView",
+        "InviteIssuedView",
+        "InviteSummaryView",
+    ] {
+        assert!(
+            schemas.contains_key(mirror),
+            "typed schema mirror {mirror} is missing — a kernel payload regressed to opaque JSON"
+        );
+    }
+
+    // The list response must reference the mirror by `$ref`, proving
+    // the `value_type` wiring took effect (not an inline `object`).
+    let principals_items = schemas
+        .get("PrincipalListResponse")
+        .and_then(|v| v.get("properties"))
+        .and_then(|v| v.get("principals"))
+        .and_then(|v| v.get("items"))
+        .and_then(|v| v.get("$ref"))
+        .and_then(|v| v.as_str())
+        .expect("PrincipalListResponse.principals must be a typed array");
+    assert!(
+        principals_items.ends_with("AgentSummaryView"),
+        "principals array must $ref AgentSummaryView, got {principals_items}"
+    );
+
+    // `token_fingerprint` is the canonical field name (the old doc
+    // comment drifted to `fingerprint`); pin it so it can't drift back.
+    let invite_props = schemas
+        .get("InviteSummaryView")
+        .and_then(|v| v.get("properties"))
+        .and_then(|v| v.as_object())
+        .expect("InviteSummaryView must have properties");
+    assert!(
+        invite_props.contains_key("token_fingerprint")
+            && invite_props.contains_key("issued_at_epoch"),
+        "InviteSummaryView must mirror the real InviteSummary fields"
+    );
+}
+
+#[test]
 fn openapi_lists_every_router_route() {
     // Drift-check: the route registered in `routes::build` and the
     // path annotated with `#[utoipa::path(...)]` must agree. If

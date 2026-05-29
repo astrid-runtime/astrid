@@ -14,7 +14,11 @@ use serde::{Deserialize, Serialize};
 /// Default listen address — localhost only. Anything beyond
 /// host-local needs an explicit decision (reverse proxy, host
 /// firewall) because the gateway speaks plain HTTP.
-const DEFAULT_LISTEN: &str = "127.0.0.1:7777";
+///
+/// Port `2787` is the phone-keypad mnemonic for `ASTR` (A=2, S=7,
+/// T=8, R=7). Chosen over the old `7777`, which collides in practice
+/// with Terraria and assorted dev tooling.
+const DEFAULT_LISTEN: &str = "127.0.0.1:2787";
 
 /// Default session token lifetime. Long enough to outlast a typical
 /// dashboard session, short enough that revocation only requires
@@ -37,7 +41,7 @@ pub struct GatewayConfig {
     /// HTTP front, and gating on an explicit flag avoids surprising
     /// existing installs.
     pub enabled: bool,
-    /// Bind address (e.g. `"127.0.0.1:7777"`). Plain TCP; terminate
+    /// Bind address (e.g. `"127.0.0.1:2787"`). Plain TCP; terminate
     /// TLS upstream.
     pub listen: String,
     /// Path to the deployment's `Distro.toml`. The gateway loads it
@@ -240,7 +244,7 @@ mod tests {
     fn default_is_disabled() {
         let cfg = GatewayConfig::default();
         assert!(!cfg.enabled);
-        assert_eq!(cfg.listen, "127.0.0.1:7777");
+        assert_eq!(cfg.listen, "127.0.0.1:2787");
     }
 
     fn cfg_with_cors(origins: Vec<&str>) -> GatewayConfig {
