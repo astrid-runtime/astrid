@@ -64,10 +64,13 @@ pub async fn get_healthz(State(_state): State<Arc<GatewayState>>) -> Response {
     tag = "ops",
     security(()),
     responses(
-        (status = 200, description = "Prometheus text-exposition format (version 0.0.4). Series: `astrid_gateway_requests_total{method,route,status}`, `astrid_gateway_request_duration_seconds{method,route,status}` (histogram), `astrid_gateway_auth_failures_total`, `astrid_gateway_redeem_attempts_total`, `astrid_gateway_redeem_rate_limited_total`.", content_type = "text/plain"),
+        (status = 200, description = "Prometheus text-exposition format (version 0.0.4). Series: `astrid_gateway_requests_total{method,route,status}`, `astrid_gateway_request_duration_seconds{method,route,status}` (histogram), `astrid_gateway_auth_failures_total`, `astrid_gateway_redeem_attempts_total`, `astrid_gateway_redeem_rate_limited_total`, `astrid_build_info{version,git_sha,rustc}`, and the standard `process_*` family (`process_cpu_seconds_total`, `process_resident_memory_bytes`, `process_threads`, `process_open_fds`, `process_start_time_seconds`).", content_type = "text/plain"),
     )
 )]
 pub async fn get_metrics(State(state): State<Arc<GatewayState>>) -> Response {
+    // Refresh the pull-based `process_*` gauges so the scrape reflects
+    // the instant it was taken (the collector has no background thread).
+    crate::metrics::collect_process_metrics();
     let body = state.metrics_handle.render();
     Response::builder()
         .status(StatusCode::OK)

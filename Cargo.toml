@@ -138,6 +138,11 @@ nix = { version = "0.29", features = ["process", "signal", "user", "fs", "resour
 # at the HTTP surface.
 metrics = "0.24"
 metrics-exporter-prometheus = { version = "0.17", default-features = false }
+# Pull-based process collector (`process_cpu_seconds_total`, resident
+# memory, threads, fds, start time) feeding the same recorder. Supports
+# Linux/macOS/Windows/FreeBSD; `collect()` is called per scrape, no
+# background thread.
+metrics-process = "2.4"
 notify = "7"
 oxc = { version = "0.112", features = ["transformer", "semantic", "codegen"] }
 oxc_allocator = "0.112"
