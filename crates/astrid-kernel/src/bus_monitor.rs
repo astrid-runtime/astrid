@@ -86,6 +86,26 @@ fn summarize_window(counts: &HashMap<String, u64>, elapsed_secs: f64) -> WindowS
     }
 }
 
+/// Resolves the tally key for an event without allocating: IPC events key off
+/// the message topic, lifecycle events off their `&'static str` `event_type()`.
+fn event_topic(event: &AstridEvent) -> &str {
+    match event {
+        AstridEvent::Ipc { message, .. } => message.topic.as_str(),
+        other => other.event_type(),
+    }
+}
+
+/// Adds `n` to `topic`'s tally. The borrowed `get_mut` lookup keeps the storm
+/// hot path allocation-free for already-seen topics — a `String` is only minted
+/// the first time a topic appears in the window.
+fn bump(counts: &mut HashMap<String, u64>, topic: &str, n: u64) {
+    if let Some(count) = counts.get_mut(topic) {
+        *count = count.saturating_add(n);
+    } else {
+        counts.insert(topic.to_string(), n);
+    }
+}
+
 /// Spawns the passive bus-activity monitor. See the module docs for rationale.
 ///
 /// The subscription is taken **synchronously** (before the task is spawned) so
@@ -110,29 +130,21 @@ pub(crate) fn spawn_bus_activity_monitor(event_bus: &EventBus) -> tokio::task::J
         loop {
             tokio::select! {
                 event = receiver.recv() => {
-                    match event {
-                        Some(event) => {
-                            let topic = match &*event {
-                                AstridEvent::Ipc { message, .. } => message.topic.clone(),
-                                other => other.event_type().to_string(),
-                            };
-                            counts
-                                .entry(topic)
-                                .and_modify(|c| *c = c.saturating_add(1))
-                                .or_insert(1);
-                        },
-                        // `recv` only yields `None` when the bus closes, which
-                        // happens at shutdown. Nothing left to monitor.
-                        None => break,
+                    // `recv` only yields `None` when the bus closes (shutdown).
+                    let Some(first) = event else { break };
+                    bump(&mut counts, event_topic(&first), 1);
+                    // Drain everything else already buffered without re-entering
+                    // select! per event — under a storm this batches the work
+                    // (one wakeup, many events) and keeps the monitor from
+                    // falling behind the publishers.
+                    while let Some(ev) = receiver.try_recv() {
+                        bump(&mut counts, event_topic(&ev), 1);
                     }
                     // Fold any events dropped to broadcast lag into the tally
                     // so an overflow spike still surfaces in the rate.
                     let lagged = receiver.drain_lagged();
                     if lagged > 0 {
-                        counts
-                            .entry(LAGGED_LABEL.to_string())
-                            .and_modify(|c| *c = c.saturating_add(lagged))
-                            .or_insert(lagged);
+                        bump(&mut counts, LAGGED_LABEL, lagged);
                     }
                 },
                 _ = tick.tick() => {
