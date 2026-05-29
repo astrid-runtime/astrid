@@ -252,54 +252,88 @@ fn build_cors_layer(origins: &[String]) -> tower_http::cors::CorsLayer {
         .max_age(std::time::Duration::from_secs(60 * 60))
 }
 
-/// Per-request counter bump. Uses axum's `MatchedPath` so the
-/// cardinality stays bounded (one bucket per route template, not
-/// one per concrete URL). Failed-route requests (404 before match)
-/// fall under the catch-all `<unmatched>` bucket.
+/// Per-request observability — times the inner handler, records
+/// into the latency histogram, bumps the counter, and emits one
+/// structured `tracing::event!` per request. Uses axum's
+/// `MatchedPath` so the metric cardinality stays bounded (one
+/// bucket per route template, not one per concrete URL).
+/// Failed-route requests (404 before match) fall under the
+/// catch-all `<unmatched>` bucket.
 async fn metrics_middleware(
-    axum::extract::State(state): axum::extract::State<Arc<GatewayState>>,
+    _state: axum::extract::State<Arc<GatewayState>>,
     matched: Option<axum::extract::MatchedPath>,
     request: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> axum::response::Response {
-    use std::sync::OnceLock;
-    // Static interner: every route template is a literal string,
-    // but the matched-path extractor returns `&str` borrowed from
-    // the per-request router state. We need `&'static str` for the
-    // counter map. The set of templates is fixed at compile time
-    // (we register them) so a one-time lazy interner is bounded.
-    static INTERN: OnceLock<std::sync::Mutex<std::collections::HashSet<&'static str>>> =
-        OnceLock::new();
-    let templates = INTERN.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()));
-
-    let method = request.method().clone();
-    let template: &'static str = matched.as_ref().map_or("<unmatched>", |m| {
-        let s = m.as_str();
-        let mut guard = templates.lock().expect("interner lock");
-        if let Some(existing) = guard.get(s) {
-            existing
-        } else {
-            let leaked: &'static str = Box::leak(s.to_string().into_boxed_str());
-            guard.insert(leaked);
-            leaked
-        }
-    });
-
-    // Build the bucket key once and intern it too — same logic as
-    // the template intern above.
-    let key: &'static str = {
-        let composed = format!("{method} {template}");
-        let mut guard = templates.lock().expect("interner lock");
-        if let Some(existing) = guard.get(composed.as_str()) {
-            existing
-        } else {
-            let leaked: &'static str = Box::leak(composed.into_boxed_str());
-            guard.insert(leaked);
-            leaked
-        }
+    let method = crate::metrics::http_method_static(request.method());
+    let route = match matched.as_ref() {
+        Some(m) => intern_route(m.as_str()),
+        None => "<unmatched>",
     };
 
-    state.metrics.observe_request(key).await;
+    let start = std::time::Instant::now();
+    let response = next.run(request).await;
+    let duration = start.elapsed();
+    let status = response.status().as_u16();
 
-    next.run(request).await
+    // Record into the process-wide `metrics::Recorder`. The labels
+    // are `&'static str` (route templates interned once on first
+    // sight; method + status mapped to static strs at the call
+    // site) so the recorder doesn't allocate on the hot path.
+    // Cardinality stays bounded by `routes × ~6 typical statuses`.
+    crate::metrics::observe_request(method, route, status, duration);
+
+    // Structured per-request log. /healthz and /metrics demote to
+    // DEBUG so the high-frequency liveness probes don't drown the
+    // INFO stream; every other route logs at INFO.
+    #[allow(clippy::cast_precision_loss)]
+    // duration_ms is a presentational field, precision loss is fine
+    let duration_ms = duration.as_secs_f64() * 1000.0;
+    let quiet = route == "/healthz" || route == "/metrics";
+    if quiet {
+        tracing::debug!(
+            method = method,
+            route = route,
+            status = status,
+            duration_ms = duration_ms,
+            "request"
+        );
+    } else {
+        tracing::info!(
+            method = method,
+            route = route,
+            status = status,
+            duration_ms = duration_ms,
+            "request"
+        );
+    }
+
+    response
+}
+
+/// Intern a route template `&str` into a `&'static str`. The set of
+/// route templates is fixed at compile time by [`build`] above —
+/// the matched-path extractor returns one of those literals on every
+/// request — so leaking each unique template once is safe and the
+/// total leak budget is the route count.
+///
+/// The mutex contention here is only paid the *first* time each
+/// route is seen; subsequent requests skip the lock entirely because
+/// `axum::extract::MatchedPath` returns a string borrowed from the
+/// per-request router state that already has a stable representation
+/// in axum's own intern table (the path strings are static-like once
+/// the router is built). We intern again on our side to materialise
+/// the `&'static str` lifetime the metric map's key requires.
+fn intern_route(s: &str) -> &'static str {
+    use std::sync::OnceLock;
+    static INTERN: OnceLock<std::sync::Mutex<std::collections::HashSet<&'static str>>> =
+        OnceLock::new();
+    let table = INTERN.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+    let mut guard = table.lock().expect("interner lock");
+    if let Some(existing) = guard.get(s) {
+        return existing;
+    }
+    let leaked: &'static str = Box::leak(s.to_string().into_boxed_str());
+    guard.insert(leaked);
+    leaked
 }

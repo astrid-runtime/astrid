@@ -129,6 +129,15 @@ keyring = { version = "3", features = [
 ] }
 landlock = "0.4"
 nix = { version = "0.29", features = ["process", "signal", "user", "fs", "resource"] }
+# Metric recording facade + Prometheus exporter. The facade decouples
+# recording (`counter!()`, `histogram!()` macros) from export format,
+# so we can swap to OTLP later without touching the call sites. Lives
+# in the workspace because the eventual plan is for the kernel +
+# capsules to record into the same recorder the gateway exports —
+# Prometheus integration is intended to go deep into Astrid, not stay
+# at the HTTP surface.
+metrics = "0.24"
+metrics-exporter-prometheus = { version = "0.17", default-features = false }
 notify = "7"
 oxc = { version = "0.112", features = ["transformer", "semantic", "codegen"] }
 oxc_allocator = "0.112"

@@ -1,190 +1,343 @@
-//! Hand-rolled Prometheus counters.
+//! Metric recording for the gateway.
 //!
-//! Lives in the gateway crate (not the daemon or kernel) because
-//! the gateway is the natural ops-monitoring boundary — every HTTP
-//! request flows through it, and the metrics we want
-//! (requests-per-route, auth failures, redeem attempts) are
-//! gateway-scoped.
+//! Uses the `metrics` facade + `metrics-exporter-prometheus` instead
+//! of a hand-rolled counter/histogram pair. The facade decouples
+//! recording from export format, so kernel-side or capsule-side code
+//! that wants to participate in observability later can do so via
+//! the same `counter!()` / `histogram!()` macros without each
+//! subsystem reinventing a metrics layer.
 //!
-//! A full `metrics` / `prometheus` crate dep would be overkill for
-//! the four counters we emit. The Prometheus text-exposition
-//! format is well-specified (one line per series, type + help
-//! optional), so hand-emitting it from atomic counters reads
-//! clearly and adds no compile-time surface to the workspace.
+//! ## Layout
 //!
-//! Counters are namespaced under `astrid_gateway_*` so a single
-//! Prometheus instance can scrape multiple Astrid daemons without
-//! collision.
+//! * [`install_recorder`] installs a process-wide `PrometheusRecorder`
+//!   (idempotent — re-invocation returns the existing handle) and
+//!   pre-registers every series the gateway is expected to emit so
+//!   even uninstrumented counters show up at `0` in the scrape body.
+//! * Handler / middleware sites record via the facade
+//!   macros: `counter!("astrid_gateway_requests_total", "method" => …,
+//!   "route" => …, "status" => …).increment(1)` etc.
+//! * `/metrics` renders the recorder handle.
+//!
+//! ## Metric inventory
+//!
+//! | Name | Type | Labels | What it tracks |
+//! |---|---|---|---|
+//! | `astrid_gateway_requests_total` | counter | method, route, status | Per-request count |
+//! | `astrid_gateway_request_duration_seconds` | histogram | method, route, status | Per-request latency |
+//! | `astrid_gateway_auth_failures_total` | counter | — | Bearer verification failures |
+//! | `astrid_gateway_redeem_attempts_total` | counter | — | Invite redemptions attempted |
+//! | `astrid_gateway_redeem_rate_limited_total` | counter | — | Redeem rejections by the rate limiter |
+//!
+//! Cardinality on the labelled series is bounded by
+//! `routes × ~6 typical statuses` (~210 series at the current router
+//! shape). The histogram inherits the same labels.
 
-use std::collections::HashMap;
-use std::fmt::Write;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
+use std::time::Duration;
 
-use tokio::sync::RwLock;
+use metrics::{Unit, describe_counter, describe_histogram};
+use metrics_exporter_prometheus::{Matcher, PrometheusBuilder, PrometheusHandle};
 
-/// Shared metrics handle. One per `GatewayState`. Counters are
-/// `AtomicU64` so route handlers don't take a lock to increment.
-#[derive(Debug, Default)]
-pub struct Metrics {
-    /// Per-route request counts. Keyed by `<METHOD> <route-pattern>`
-    /// (e.g. `GET /api/sys/principals`). Wrapped in `RwLock<HashMap>`
-    /// because the key set grows lazily on first request and shrinks
-    /// never — read-mostly after warm-up, so the lock cost is
-    /// negligible.
-    pub requests_total: RwLock<HashMap<&'static str, AtomicU64>>,
-    /// Bearer-verification failures (tampered sig, expired, malformed).
-    pub auth_failures_total: AtomicU64,
-    /// Invite-redemption attempts (successful + rejected combined).
-    /// Subtract rate-limited from this to estimate token-brute-force
-    /// pressure if it ever shows up in dashboards.
-    pub redeem_attempts_total: AtomicU64,
-    /// Invite redemptions rejected for rate-limiting.
-    pub redeem_rate_limited_total: AtomicU64,
+/// Prometheus default histogram buckets for HTTP request duration in
+/// seconds: 5 ms → 10 s. Spans the range from "p50 of a hot admin
+/// call" (< 5 ms) to "definitely something has wedged" (> 10 s).
+/// Identical to what `prometheus_client::default_buckets` ships, so
+/// dashboards built against the convention "just work".
+const DURATION_BUCKETS_SECONDS: &[f64] = &[
+    0.005, 0.010, 0.025, 0.050, 0.100, 0.250, 0.500, 1.000, 2.500, 5.000, 10.000,
+];
+
+/// Metric name for the per-request count. Kept as a `const` so the
+/// middleware call site and the inventory above stay in lock-step.
+pub const METRIC_REQUESTS_TOTAL: &str = "astrid_gateway_requests_total";
+
+/// Metric name for the per-request latency histogram.
+pub const METRIC_REQUEST_DURATION_SECONDS: &str = "astrid_gateway_request_duration_seconds";
+
+/// Bearer-verification failure counter.
+pub const METRIC_AUTH_FAILURES_TOTAL: &str = "astrid_gateway_auth_failures_total";
+
+/// Invite-redemption attempt counter.
+pub const METRIC_REDEEM_ATTEMPTS_TOTAL: &str = "astrid_gateway_redeem_attempts_total";
+
+/// Invite-redemption rate-limited counter.
+pub const METRIC_REDEEM_RATE_LIMITED_TOTAL: &str = "astrid_gateway_redeem_rate_limited_total";
+
+/// Install the process-wide Prometheus recorder. Idempotent: every
+/// call after the first returns the same handle (the `metrics` crate
+/// allows only one recorder per process, so we serialise the install
+/// behind a [`Mutex`] and memoise the handle inside it).
+///
+/// The Mutex (rather than `OnceLock::get_or_try_init`, which is
+/// nightly) is what makes the function safe under concurrent
+/// callers: two test binaries that both call `install_recorder` at
+/// boot would race the underlying `metrics::set_global_recorder`,
+/// the loser would `Err`, and we'd have no way to recover the
+/// already-installed handle. Serialising the check + install + store
+/// inside one critical section avoids that.
+///
+/// # Errors
+/// Returns an error if `PrometheusBuilder::install_recorder` fails
+/// on first call. Subsequent calls cannot fail.
+pub fn install_recorder() -> anyhow::Result<PrometheusHandle> {
+    static HANDLE: Mutex<Option<PrometheusHandle>> = Mutex::new(None);
+    let mut guard = HANDLE
+        .lock()
+        .map_err(|e| anyhow::anyhow!("recorder lock poisoned: {e}"))?;
+    if let Some(existing) = guard.as_ref() {
+        return Ok(existing.clone());
+    }
+    let handle = PrometheusBuilder::new()
+        // Set the per-route latency histogram's buckets explicitly.
+        // The `Suffix` matcher applies to every series whose name
+        // matches the metric base — same buckets for every
+        // (method, route, status) combo.
+        .set_buckets_for_metric(
+            Matcher::Suffix(METRIC_REQUEST_DURATION_SECONDS.to_string()),
+            DURATION_BUCKETS_SECONDS,
+        )
+        .map_err(|e| anyhow::anyhow!("configure histogram buckets: {e}"))?
+        .install_recorder()
+        .map_err(|e| anyhow::anyhow!("install Prometheus recorder: {e}"))?;
+
+    // Describe every metric the gateway emits so `/metrics` carries
+    // `# HELP` + `# TYPE` lines even before the series sees its
+    // first observation. Touch each counter once at zero so it
+    // appears in the scrape body — `metrics-exporter-prometheus`
+    // only renders series after they've been recorded against.
+    describe_counter!(
+        METRIC_REQUESTS_TOTAL,
+        Unit::Count,
+        "Total HTTP requests by method+route+status."
+    );
+    describe_histogram!(
+        METRIC_REQUEST_DURATION_SECONDS,
+        Unit::Seconds,
+        "Per-request handler latency by method+route+status."
+    );
+    describe_counter!(
+        METRIC_AUTH_FAILURES_TOTAL,
+        Unit::Count,
+        "Failed bearer verifications."
+    );
+    describe_counter!(
+        METRIC_REDEEM_ATTEMPTS_TOTAL,
+        Unit::Count,
+        "Invite-redemption attempts."
+    );
+    describe_counter!(
+        METRIC_REDEEM_RATE_LIMITED_TOTAL,
+        Unit::Count,
+        "Redeem requests rejected by the rate limiter."
+    );
+    // Force registration of the unlabelled counters so they render
+    // at zero even before instrumentation lands. The labelled
+    // request counter and histogram materialise lazily on first
+    // observation — that's fine because the router middleware hits
+    // them every request.
+    metrics::counter!(METRIC_AUTH_FAILURES_TOTAL).absolute(0);
+    metrics::counter!(METRIC_REDEEM_ATTEMPTS_TOTAL).absolute(0);
+    metrics::counter!(METRIC_REDEEM_RATE_LIMITED_TOTAL).absolute(0);
+
+    *guard = Some(handle.clone());
+    Ok(handle)
 }
 
-impl Metrics {
-    /// Bump the per-route counter for `(method, route_pattern)`.
-    /// The key is `&'static str` so we don't allocate on the hot
-    /// path — pass route-template strings directly from the route
-    /// handler.
-    pub async fn observe_request(&self, key: &'static str) {
-        // Fast path: read lock, increment if entry exists.
-        {
-            let map = self.requests_total.read().await;
-            if let Some(counter) = map.get(key) {
-                counter.fetch_add(1, Ordering::Relaxed);
-                return;
-            }
-        }
-        // Slow path: write lock, double-check, insert.
-        let mut map = self.requests_total.write().await;
-        let counter = map.entry(key).or_insert_with(|| AtomicU64::new(0));
-        counter.fetch_add(1, Ordering::Relaxed);
-    }
-
-    /// Render the current snapshot as Prometheus text-exposition
-    /// format. One pass over each counter family; no allocation per
-    /// counter beyond the output `String`.
-    pub async fn render(&self) -> String {
-        let mut out = String::with_capacity(1024);
-
-        // Per-route counter family.
-        out.push_str("# HELP astrid_gateway_requests_total Total HTTP requests by method+route.\n");
-        out.push_str("# TYPE astrid_gateway_requests_total counter\n");
-        {
-            let map = self.requests_total.read().await;
-            // Sort keys for stable output — easier to diff in
-            // dashboards and tests.
-            let mut entries: Vec<(&&'static str, &AtomicU64)> = map.iter().collect();
-            entries.sort_by_key(|(k, _)| *k);
-            for (key, counter) in entries {
-                let v = counter.load(Ordering::Relaxed);
-                // Split on the first space to get method + route.
-                let (method, route) = key.split_once(' ').unwrap_or(("UNKNOWN", *key));
-                let _ = writeln!(
-                    out,
-                    "astrid_gateway_requests_total{{method=\"{method}\",route=\"{}\"}} {v}",
-                    escape_label(route),
-                );
-            }
-        }
-
-        // Auth failures.
-        out.push_str("\n# HELP astrid_gateway_auth_failures_total Failed bearer verifications.\n");
-        out.push_str("# TYPE astrid_gateway_auth_failures_total counter\n");
-        let _ = writeln!(
-            out,
-            "astrid_gateway_auth_failures_total {}",
-            self.auth_failures_total.load(Ordering::Relaxed)
-        );
-
-        // Redeem attempts.
-        out.push_str("\n# HELP astrid_gateway_redeem_attempts_total Invite-redemption attempts.\n");
-        out.push_str("# TYPE astrid_gateway_redeem_attempts_total counter\n");
-        let _ = writeln!(
-            out,
-            "astrid_gateway_redeem_attempts_total {}",
-            self.redeem_attempts_total.load(Ordering::Relaxed)
-        );
-
-        // Redeem rate-limit rejections.
-        out.push_str(
-            "\n# HELP astrid_gateway_redeem_rate_limited_total Redeem requests rejected by the rate limiter.\n",
-        );
-        out.push_str("# TYPE astrid_gateway_redeem_rate_limited_total counter\n");
-        let _ = writeln!(
-            out,
-            "astrid_gateway_redeem_rate_limited_total {}",
-            self.redeem_rate_limited_total.load(Ordering::Relaxed)
-        );
-
-        out
+/// Map an axum `Method` to a `&'static str` for use as a metric
+/// label. Custom methods (`Method::from_bytes(b"WEIRD")`) collapse to
+/// `"OTHER"` so a malicious client can't inflate metric cardinality
+/// by spraying random verbs.
+#[must_use]
+pub fn http_method_static(method: &axum::http::Method) -> &'static str {
+    match *method {
+        axum::http::Method::GET => "GET",
+        axum::http::Method::POST => "POST",
+        axum::http::Method::PUT => "PUT",
+        axum::http::Method::DELETE => "DELETE",
+        axum::http::Method::PATCH => "PATCH",
+        axum::http::Method::HEAD => "HEAD",
+        axum::http::Method::OPTIONS => "OPTIONS",
+        axum::http::Method::CONNECT => "CONNECT",
+        axum::http::Method::TRACE => "TRACE",
+        _ => "OTHER",
     }
 }
 
-/// Escape characters that have meaning in Prometheus label values
-/// (`\`, `"`, `\n`). Route patterns won't normally need this but
-/// route registration helpers might let weirder strings through.
-fn escape_label(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for c in s.chars() {
-        match c {
-            '\\' => out.push_str("\\\\"),
-            '"' => out.push_str("\\\""),
-            '\n' => out.push_str("\\n"),
-            other => out.push(other),
-        }
+/// Convenience for the router middleware: record one observation
+/// (count + duration) on the per-request metrics in a single call,
+/// keyed by `(method, route, status)`.
+pub fn observe_request(method: &'static str, route: &'static str, status: u16, duration: Duration) {
+    let status_str = status_to_static(status);
+    metrics::counter!(
+        METRIC_REQUESTS_TOTAL,
+        "method" => method,
+        "route" => route,
+        "status" => status_str,
+    )
+    .increment(1);
+    metrics::histogram!(
+        METRIC_REQUEST_DURATION_SECONDS,
+        "method" => method,
+        "route" => route,
+        "status" => status_str,
+    )
+    .record(duration.as_secs_f64());
+}
+
+/// Map common HTTP status codes to `&'static str` to dodge the
+/// `String` allocation the `metrics` macros would otherwise force
+/// on the hot path. Anything outside the standard range falls back
+/// to `"other"` so cardinality stays bounded under a hostile client.
+fn status_to_static(status: u16) -> &'static str {
+    match status {
+        100 => "100",
+        101 => "101",
+        102 => "102",
+        103 => "103",
+        200 => "200",
+        201 => "201",
+        202 => "202",
+        203 => "203",
+        204 => "204",
+        205 => "205",
+        206 => "206",
+        207 => "207",
+        208 => "208",
+        226 => "226",
+        300 => "300",
+        301 => "301",
+        302 => "302",
+        303 => "303",
+        304 => "304",
+        305 => "305",
+        307 => "307",
+        308 => "308",
+        400 => "400",
+        401 => "401",
+        402 => "402",
+        403 => "403",
+        404 => "404",
+        405 => "405",
+        406 => "406",
+        407 => "407",
+        408 => "408",
+        409 => "409",
+        410 => "410",
+        411 => "411",
+        412 => "412",
+        413 => "413",
+        414 => "414",
+        415 => "415",
+        416 => "416",
+        417 => "417",
+        418 => "418",
+        421 => "421",
+        422 => "422",
+        423 => "423",
+        424 => "424",
+        425 => "425",
+        426 => "426",
+        428 => "428",
+        429 => "429",
+        431 => "431",
+        451 => "451",
+        500 => "500",
+        501 => "501",
+        502 => "502",
+        503 => "503",
+        504 => "504",
+        505 => "505",
+        506 => "506",
+        507 => "507",
+        508 => "508",
+        510 => "510",
+        511 => "511",
+        _ => "other",
     }
-    out
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[tokio::test]
-    async fn observe_increments_counter() {
-        let m = Metrics::default();
-        m.observe_request("GET /api/sys/status").await;
-        m.observe_request("GET /api/sys/status").await;
-        m.observe_request("GET /api/sys/principals").await;
-        let rendered = m.render().await;
-        assert!(
-            rendered.contains(
-                "astrid_gateway_requests_total{method=\"GET\",route=\"/api/sys/status\"} 2"
-            )
-        );
-        assert!(rendered.contains(
-            "astrid_gateway_requests_total{method=\"GET\",route=\"/api/sys/principals\"} 1"
-        ));
-    }
+    // The metrics crate's global recorder is process-wide. Every
+    // test in this module shares the same recorder via
+    // `install_recorder`'s OnceLock, so observations accumulate
+    // across tests. That's fine — assertions use `.contains()` and
+    // the test names are not the metric labels.
 
-    #[tokio::test]
-    async fn renders_help_and_type_for_every_family() {
-        let m = Metrics::default();
-        let rendered = m.render().await;
-        for family in [
-            "astrid_gateway_requests_total",
-            "astrid_gateway_auth_failures_total",
-            "astrid_gateway_redeem_attempts_total",
-            "astrid_gateway_redeem_rate_limited_total",
-        ] {
-            assert!(
-                rendered.contains(&format!("# HELP {family}")),
-                "missing HELP for {family} in:\n{rendered}"
-            );
-            assert!(
-                rendered.contains(&format!("# TYPE {family} counter")),
-                "missing TYPE for {family} in:\n{rendered}"
-            );
-        }
+    #[test]
+    fn install_recorder_is_idempotent() {
+        let h1 = install_recorder().expect("install");
+        let h2 = install_recorder().expect("second install");
+        // Calling `render()` shouldn't panic on either handle.
+        let _ = h1.render();
+        let _ = h2.render();
     }
 
     #[test]
-    fn label_escape_handles_quote_and_backslash() {
-        assert_eq!(escape_label("plain"), "plain");
-        assert_eq!(escape_label(r#"with"quote"#), r#"with\"quote"#);
-        assert_eq!(escape_label(r"with\backslash"), r"with\\backslash");
-        assert_eq!(escape_label("with\nnewline"), "with\\nnewline");
+    fn http_method_static_covers_standard_set() {
+        use axum::http::Method;
+        assert_eq!(http_method_static(&Method::GET), "GET");
+        assert_eq!(http_method_static(&Method::POST), "POST");
+        assert_eq!(http_method_static(&Method::PUT), "PUT");
+        assert_eq!(http_method_static(&Method::DELETE), "DELETE");
+        assert_eq!(http_method_static(&Method::PATCH), "PATCH");
+        assert_eq!(http_method_static(&Method::HEAD), "HEAD");
+        assert_eq!(http_method_static(&Method::OPTIONS), "OPTIONS");
+        let custom = Method::from_bytes(b"WEIRD").unwrap();
+        assert_eq!(http_method_static(&custom), "OTHER");
+    }
+
+    #[test]
+    fn status_to_static_covers_common_codes_and_falls_back() {
+        assert_eq!(status_to_static(200), "200");
+        assert_eq!(status_to_static(404), "404");
+        assert_eq!(status_to_static(500), "500");
+        // Anything outside the standard range goes to `other` so a
+        // hostile client can't blow up metric cardinality by
+        // returning arbitrary status codes via a future handler.
+        assert_eq!(status_to_static(999), "other");
+    }
+
+    #[tokio::test]
+    async fn observe_request_renders_counter_and_histogram() {
+        let handle = install_recorder().expect("install");
+        observe_request("GET", "/api/test-observe", 200, Duration::from_millis(15));
+        observe_request("GET", "/api/test-observe", 200, Duration::from_millis(42));
+        let rendered = handle.render();
+        assert!(
+            rendered.contains("astrid_gateway_requests_total")
+                && rendered.contains("route=\"/api/test-observe\"")
+                && rendered.contains("status=\"200\""),
+            "missing requests_total for the labelled series; body:\n{rendered}"
+        );
+        // The Prometheus exporter renders histograms as a
+        // `_bucket` family + `_sum` + `_count`. We just check that
+        // the histogram name appears with our route.
+        assert!(
+            rendered.contains("astrid_gateway_request_duration_seconds")
+                && rendered.contains("route=\"/api/test-observe\""),
+            "missing request_duration histogram; body:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn unlabelled_counters_register_at_zero() {
+        let handle = install_recorder().expect("install");
+        let rendered = handle.render();
+        // Each unlabelled counter was touched at `absolute(0)` in
+        // `install_recorder`, so it must appear in the scrape body
+        // even before any instrumentation lands.
+        for name in [
+            METRIC_AUTH_FAILURES_TOTAL,
+            METRIC_REDEEM_ATTEMPTS_TOTAL,
+            METRIC_REDEEM_RATE_LIMITED_TOTAL,
+        ] {
+            assert!(
+                rendered.contains(name),
+                "{name} missing from scrape body — describe + touch broken;\n{rendered}"
+            );
+        }
     }
 }

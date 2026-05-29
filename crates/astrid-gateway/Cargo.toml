@@ -57,6 +57,8 @@ chrono = { workspace = true, features = ["clock"] }
 ed25519-dalek = { workspace = true }
 futures = { workspace = true }
 hex = { workspace = true }
+metrics = { workspace = true }
+metrics-exporter-prometheus = { workspace = true }
 rand = { workspace = true }
 rustls = { workspace = true }
 serde = { workspace = true }
