@@ -113,7 +113,7 @@ fn bump(counts: &mut HashMap<String, u64>, topic: &str, n: u64) {
 /// [`INTERNAL_SUBSCRIBER_COUNT`](crate::INTERNAL_SUBSCRIBER_COUNT) by the time
 /// `Kernel::new`'s debug-assert runs — mirroring `EventDispatcher::new`.
 pub(crate) fn spawn_bus_activity_monitor(event_bus: &EventBus) -> tokio::task::JoinHandle<()> {
-    let mut receiver = event_bus.subscribe();
+    let mut receiver = event_bus.subscribe_as("bus_monitor");
 
     tokio::spawn(async move {
         let mut counts: HashMap<String, u64> = HashMap::new();
@@ -148,6 +148,11 @@ pub(crate) fn spawn_bus_activity_monitor(event_bus: &EventBus) -> tokio::task::J
                     }
                 },
                 _ = tick.tick() => {
+                    metrics::counter!(
+                        crate::METRIC_BACKGROUND_TICKS_TOTAL,
+                        "loop" => "bus_monitor",
+                    )
+                    .increment(1);
                     let elapsed = window_start.elapsed().as_secs_f64();
                     let summary = summarize_window(&counts, elapsed);
                     if summary.is_storm {

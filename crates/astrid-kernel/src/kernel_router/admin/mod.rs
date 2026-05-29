@@ -59,7 +59,9 @@ const ADMIN_RESPONSE_PREFIX: &str = "astrid.v1.admin.response.";
 /// but listens on `astrid.v1.admin.*` and parses
 /// [`AdminKernelRequest`] payloads.
 pub(crate) fn spawn_admin_router(kernel: Arc<crate::Kernel>) -> tokio::task::JoinHandle<()> {
-    let mut receiver = kernel.event_bus.subscribe_topic("astrid.v1.admin.*");
+    let mut receiver = kernel
+        .event_bus
+        .subscribe_topic_as("astrid.v1.admin.*", "admin_router");
 
     tokio::spawn(async move {
         while let Some(event) = receiver.recv().await {

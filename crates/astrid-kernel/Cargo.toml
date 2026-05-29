@@ -26,6 +26,10 @@ astrid-vfs = { workspace = true }
 base64 = { workspace = true }
 dashmap = { workspace = true }
 hex = { workspace = true }
+# Metric recording facade. Connection-count, background-loop-tick, and
+# event-bus-saturation counters record into the daemon-wide recorder the
+# gateway exports; no exporter dependency here.
+metrics = { workspace = true }
 rand = { workspace = true }
 semver = { workspace = true }
 serde = { workspace = true }

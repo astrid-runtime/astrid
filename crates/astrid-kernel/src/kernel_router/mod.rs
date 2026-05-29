@@ -41,7 +41,9 @@ pub(crate) fn spawn_kernel_router(kernel: Arc<crate::Kernel>) -> tokio::task::Jo
     // Spawn the Layer 6 admin dispatcher as a sibling task (issue #672).
     drop(admin::spawn_admin_router(Arc::clone(&kernel)));
 
-    let mut receiver = kernel.event_bus.subscribe_topic("astrid.v1.request.*");
+    let mut receiver = kernel
+        .event_bus
+        .subscribe_topic_as("astrid.v1.request.*", "kernel_router");
 
     tokio::spawn(async move {
         let mut rate_limiter = ManagementRateLimiter::new();
@@ -136,7 +138,9 @@ fn connection_signal(topic: &str, payload: &IpcPayload) -> Option<ConnectionSign
 /// Listens on `client.v1.*` topics and adjusts the per-principal connection
 /// count via [`connection_signal`] (typed payload or topic).
 fn spawn_connection_tracker(kernel: Arc<crate::Kernel>) -> tokio::task::JoinHandle<()> {
-    let mut receiver = kernel.event_bus.subscribe_topic("client.v1.*");
+    let mut receiver = kernel
+        .event_bus
+        .subscribe_topic_as("client.v1.*", "connection_tracker");
 
     tokio::spawn(async move {
         while let Some(event) = receiver.recv().await {

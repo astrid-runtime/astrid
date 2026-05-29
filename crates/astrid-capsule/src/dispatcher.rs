@@ -80,7 +80,7 @@ impl EventDispatcher {
     /// accurate before `run()` is spawned on a background task.
     #[must_use]
     pub fn new(registry: Arc<RwLock<CapsuleRegistry>>, event_bus: Arc<EventBus>) -> Self {
-        let receiver = event_bus.subscribe();
+        let receiver = event_bus.subscribe_as("capsule_dispatcher");
         Self {
             registry,
             event_bus,

@@ -11,6 +11,23 @@ use crate::subscriber::SubscriberRegistry;
 /// Default channel capacity for the event bus.
 pub(crate) const DEFAULT_CHANNEL_CAPACITY: usize = 1024;
 
+/// Counter: events published to the bus, labelled by the bounded
+/// `event_kind` (`AstridEvent::event_type`, a closed `&'static str` set).
+pub(crate) const METRIC_BUS_EVENTS_PUBLISHED_TOTAL: &str = "astrid_bus_events_published_total";
+
+/// Counter: events a receiver dropped by falling behind the sender,
+/// labelled by `subscriber`. A non-zero `rate()` on any subscriber is the
+/// signature of bus backpressure / a feedback storm — the failure mode
+/// that pegs CPU by waking every broadcast subscriber. Subscriber labels
+/// are a fixed, code-assigned set (see [`EventBus::subscribe_as`]);
+/// untagged subscriptions collapse to `"untagged"`.
+pub(crate) const METRIC_BUS_RECEIVER_LAGGED_TOTAL: &str = "astrid_bus_receiver_lagged_total";
+
+/// Subscriber label applied to receivers created without an explicit tag.
+/// Keeps the `subscriber` label cardinality bounded even for dynamic
+/// (capsule-supplied) topic subscriptions.
+const SUBSCRIBER_UNTAGGED: &str = "untagged";
+
 /// Event bus for broadcasting events to all subscribers.
 ///
 /// The event bus uses a broadcast channel to deliver events to all
@@ -68,6 +85,13 @@ impl EventBus {
         }
         let event = Arc::new(event);
 
+        // Publish throughput by bounded event kind. `rate()` shows bus
+        // load; paired with the per-subscriber lag counter it localises a
+        // feedback storm. `event_type()` is a closed `&'static str` set,
+        // so cardinality is fixed (IPC traffic collapses to `"ipc"`).
+        metrics::counter!(METRIC_BUS_EVENTS_PUBLISHED_TOTAL, "event_kind" => event.event_type())
+            .increment(1);
+
         trace!(event_type = %event.event_type(), "Publishing event");
 
         // Broadcast to async subscribers first so they don't wait for synchronous subscribers
@@ -92,10 +116,23 @@ impl EventBus {
 
     /// Subscribe to events.
     ///
-    /// Returns a receiver that will receive all published events.
+    /// Returns a receiver that will receive all published events. The
+    /// receiver's lag is attributed to the `"untagged"` subscriber in
+    /// [`METRIC_BUS_RECEIVER_LAGGED_TOTAL`]; use [`subscribe_as`] to give a
+    /// long-lived consumer a stable label.
+    ///
+    /// [`subscribe_as`]: Self::subscribe_as
     #[must_use]
     pub fn subscribe(&self) -> EventReceiver {
-        EventReceiver::new(self.sender.subscribe(), None)
+        self.subscribe_as(SUBSCRIBER_UNTAGGED)
+    }
+
+    /// Subscribe to all events, attributing this receiver's lag to a
+    /// stable `subscriber` label. Pass a fixed `&'static str` (never
+    /// caller/remote text) so the lag-counter cardinality stays bounded.
+    #[must_use]
+    pub fn subscribe_as(&self, subscriber: &'static str) -> EventReceiver {
+        EventReceiver::new(self.sender.subscribe(), None, subscriber)
     }
 
     /// Subscribe to IPC events matching a specific topic pattern.
@@ -104,9 +141,31 @@ impl EventBus {
     /// or end with a trailing `*` (e.g. `astrid.v1.request.*`) which matches
     /// one or more remaining dot-separated segments up to a maximum depth of 20.
     /// Middle wildcards (e.g. `astrid.*.event`) match exactly one segment.
+    ///
+    /// Lag is attributed to `"untagged"`; use [`subscribe_topic_as`] for a
+    /// long-lived consumer.
+    ///
+    /// [`subscribe_topic_as`]: Self::subscribe_topic_as
     #[must_use]
     pub fn subscribe_topic(&self, topic_pattern: impl Into<String>) -> EventReceiver {
-        EventReceiver::new(self.sender.subscribe(), Some(topic_pattern.into()))
+        self.subscribe_topic_as(topic_pattern, SUBSCRIBER_UNTAGGED)
+    }
+
+    /// Topic subscription that attributes this receiver's lag to a stable
+    /// `subscriber` label. Pass a fixed `&'static str` (never the topic
+    /// pattern itself, which can be capsule-supplied) so the lag-counter
+    /// cardinality stays bounded.
+    #[must_use]
+    pub fn subscribe_topic_as(
+        &self,
+        topic_pattern: impl Into<String>,
+        subscriber: &'static str,
+    ) -> EventReceiver {
+        EventReceiver::new(
+            self.sender.subscribe(),
+            Some(topic_pattern.into()),
+            subscriber,
+        )
     }
 
     /// Get the synchronous subscriber registry (test-only).
@@ -159,18 +218,25 @@ pub struct EventReceiver {
     /// Cumulative count of messages lost due to broadcast channel lag.
     /// Incremented each time the receiver falls behind the sender.
     lagged_count: u64,
+    /// Stable label for this receiver in [`METRIC_BUS_RECEIVER_LAGGED_TOTAL`].
+    /// A fixed `&'static str` (code-assigned, never caller text) so the
+    /// lag counter's cardinality is bounded.
+    subscriber: &'static str,
 }
 
 impl EventReceiver {
-    /// Create a new receiver with an optional topic filter.
+    /// Create a new receiver with an optional topic filter and a stable
+    /// subscriber label for lag attribution.
     pub(crate) fn new(
         receiver: broadcast::Receiver<Arc<AstridEvent>>,
         topic_pattern: Option<String>,
+        subscriber: &'static str,
     ) -> Self {
         Self {
             receiver,
             topic_pattern,
             lagged_count: 0,
+            subscriber,
         }
     }
 
@@ -262,6 +328,11 @@ impl EventReceiver {
                 Err(broadcast::error::RecvError::Lagged(count)) => {
                     warn!(skipped = count, "Event receiver lagged, events dropped");
                     self.lagged_count = self.lagged_count.saturating_add(count);
+                    metrics::counter!(
+                        METRIC_BUS_RECEIVER_LAGGED_TOTAL,
+                        "subscriber" => self.subscriber,
+                    )
+                    .increment(count);
                     // Continue receiving
                 },
                 Err(broadcast::error::RecvError::Closed) => return None,
@@ -284,6 +355,11 @@ impl EventReceiver {
                 Err(broadcast::error::TryRecvError::Lagged(count)) => {
                     warn!(skipped = count, "Event receiver lagged, events dropped");
                     self.lagged_count = self.lagged_count.saturating_add(count);
+                    metrics::counter!(
+                        METRIC_BUS_RECEIVER_LAGGED_TOTAL,
+                        "subscriber" => self.subscriber,
+                    )
+                    .increment(count);
                     // Continue receiving
                 },
                 Err(
@@ -851,5 +927,49 @@ mod tests {
 
         // No more messages.
         assert!(receiver.try_recv().is_none());
+    }
+
+    #[test]
+    fn lag_and_publish_metrics_record_with_labels() {
+        use metrics_util::debugging::DebuggingRecorder;
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+
+        // A small-capacity bus with 5 un-drained publishes forces the
+        // receiver to lag; the first `try_recv` then reports it and records
+        // the per-subscriber counter. Scoped to a thread-local recorder so
+        // this never touches a global recorder another test may install.
+        metrics::with_local_recorder(&recorder, || {
+            let bus = EventBus::with_capacity(2);
+            let mut rx = bus.subscribe_as("test_subscriber");
+            for _ in 0..5 {
+                bus.publish(AstridEvent::RuntimeStarted {
+                    metadata: EventMetadata::new("test"),
+                    version: "0.1.0".to_string(),
+                });
+            }
+            // First call records the lag; the rest drain the survivors.
+            while rx.try_recv().is_some() {}
+        });
+
+        let mut published = false;
+        let mut lag_labelled = false;
+        for (composite, _unit, _desc, _value) in snapshotter.snapshot().into_vec() {
+            let (_kind, key) = composite.into_parts();
+            let name = key.name();
+            if name == METRIC_BUS_EVENTS_PUBLISHED_TOTAL {
+                published = true;
+            } else if name == METRIC_BUS_RECEIVER_LAGGED_TOTAL {
+                lag_labelled = key
+                    .labels()
+                    .any(|l| l.key() == "subscriber" && l.value() == "test_subscriber");
+            }
+        }
+        assert!(published, "publish counter not recorded");
+        assert!(
+            lag_labelled,
+            "lag counter missing or not labelled with the subscriber tag"
+        );
     }
 }
