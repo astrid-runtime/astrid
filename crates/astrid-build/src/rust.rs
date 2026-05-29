@@ -10,6 +10,27 @@ use tracing::{info, warn};
 /// Gives `push_dir` a main package to anchor on so deps can still be loaded.
 const STUB_WIT_PACKAGE: &str = "package astrid:capsule-stub@1.0.0;\n\ninterface stub {}\n";
 
+/// The only capsule target that needs the getrandom cfg injected. Other
+/// targets get a real platform backend from their runtime: `wasm32-wasip2`
+/// from WASI, and native build-script / proc-macro units from the host OS.
+const GETRANDOM_TARGET: &str = "wasm32-unknown-unknown";
+
+/// The `getrandom` custom-backend cfg every `wasm32-unknown-unknown` capsule
+/// needs so that `uuid` v4 / `HashMap` seeding link against `astrid-sys`'s
+/// host-routed RNG (`astrid:sys/host.random-bytes`) instead of failing with
+/// getrandom's "wasm32-unknown-unknown is not supported by default"
+/// `compile_error!`. Injecting it here means `astrid build` succeeds even
+/// when a capsule's `.cargo/config.toml` is missing the flag — capsules still
+/// keep it in config for plain `cargo build` / `cargo test`, which don't run
+/// through this builder.
+const GETRANDOM_CUSTOM_CFG: &str = "--cfg=getrandom_backend=\"custom\"";
+
+/// Cargo's argument separator for `CARGO_ENCODED_RUSTFLAGS` (ASCII unit
+/// separator), used so individual flags may themselves contain spaces. A
+/// `&str` (not `char`) so it can be passed straight to `join` / `split`
+/// without allocating.
+const RUSTFLAGS_SEP: &str = "\u{1f}";
+
 /// Build a Rust capsule from a crate directory.
 ///
 /// 1. `cargo build --target wasm32-wasip2 --release`
@@ -106,13 +127,45 @@ fn resolve_package_metadata(
 /// during the migration window (the kernel still satisfies wasi:*
 /// for backwards compatibility), so this build step does NOT pass
 /// `--target`; it lets the capsule decide.
+///
+/// When the capsule targets `wasm32-unknown-unknown` it additionally
+/// injects the getrandom custom-backend cfg (see
+/// [`encoded_rustflags_with_getrandom`]) so `astrid build` succeeds even
+/// when a capsule's `.cargo/config.toml` is missing
+/// `--cfg=getrandom_backend="custom"`. This is a safety net for the
+/// canonical build tool, not a replacement: capsules still carry the flag
+/// in config so a plain `cargo build` / `cargo test` (which never runs
+/// through here) keeps linking `uuid` v4 / `HashMap`.
 fn compile_wasm(dir: &Path) -> Result<()> {
     info!("   Compiling capsule (release)...");
-    let status = std::process::Command::new("cargo")
-        .current_dir(dir)
-        .args(["build", "--release"])
-        .status()
-        .context("Failed to spawn cargo build")?;
+
+    let (config_target, config_flags) = cargo_config_target_and_rustflags(dir);
+    // `CARGO_BUILD_TARGET` (if the caller set it) overrides the config-file
+    // target, mirroring Cargo's own precedence.
+    let env_target = std::env::var("CARGO_BUILD_TARGET").ok();
+    let target = env_target.as_deref().or(config_target.as_deref());
+
+    let mut cmd = std::process::Command::new("cargo");
+    cmd.current_dir(dir).args(["build", "--release"]);
+
+    if let Some(encoded) = encoded_rustflags_with_getrandom(
+        target,
+        &config_flags,
+        std::env::var("CARGO_ENCODED_RUSTFLAGS").ok().as_deref(),
+        std::env::var("RUSTFLAGS").ok().as_deref(),
+    ) {
+        // Capsule targets `wasm32-unknown-unknown`, so guarantee the getrandom
+        // custom-backend cfg is present. Because host != wasm this is a
+        // cross-compile, so the flag reaches only the wasm artifacts — host
+        // build scripts / proc-macros are untouched. We set
+        // `CARGO_ENCODED_RUSTFLAGS` (and drop `RUSTFLAGS`, whose value we have
+        // already folded in) so the two sources can't both apply and so flags
+        // containing spaces survive.
+        cmd.env("CARGO_ENCODED_RUSTFLAGS", encoded);
+        cmd.env_remove("RUSTFLAGS");
+    }
+
+    let status = cmd.status().context("Failed to spawn cargo build")?;
 
     if !status.success() {
         bail!(
@@ -120,6 +173,113 @@ fn compile_wasm(dir: &Path) -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// Read the build target and any author-declared `rustflags` from a capsule's
+/// local `.cargo/config.toml` (or the legacy `.cargo/config`).
+///
+/// Returns `(target, rustflags)`. `target` is the `[build] target` string if
+/// set. `rustflags` is the effective list Cargo would apply to the wasm
+/// target: `[target."wasm32-unknown-unknown"].rustflags` if present, otherwise
+/// `[build].rustflags`, otherwise empty. Cargo honours only one of those two
+/// sources (target-scoped wins), so we mirror that precedence rather than
+/// concatenating them. A `[build] target` written as an array (multi-target
+/// build) is intentionally ignored — we only auto-inject for a single, plain
+/// `wasm32-unknown-unknown` target.
+fn cargo_config_target_and_rustflags(dir: &Path) -> (Option<String>, Vec<String>) {
+    let Some(doc) = [".cargo/config.toml", ".cargo/config"]
+        .iter()
+        .map(|name| dir.join(name))
+        .find_map(|p| fs::read_to_string(p).ok())
+        .and_then(|s| s.parse::<toml_edit::DocumentMut>().ok())
+    else {
+        return (None, Vec::new());
+    };
+
+    let target = doc
+        .get("build")
+        .and_then(|b| b.get("target"))
+        .and_then(toml_edit::Item::as_str)
+        .map(str::to_owned);
+
+    // Cargo accepts `rustflags` as either an array of strings or a single
+    // space-separated string; handle both so a string-form value isn't
+    // silently dropped (which would let our env injection clobber it).
+    let read_flags = |item: Option<&toml_edit::Item>| -> Option<Vec<String>> {
+        item.and_then(|it| {
+            if let Some(arr) = it.as_array() {
+                Some(
+                    arr.iter()
+                        .filter_map(|v| v.as_str().map(str::to_owned))
+                        .collect(),
+                )
+            } else {
+                it.as_str()
+                    .map(|s| s.split_whitespace().map(str::to_owned).collect())
+            }
+        })
+    };
+
+    let target_scoped = doc
+        .get("target")
+        .and_then(|t| t.get(GETRANDOM_TARGET))
+        .and_then(|t| t.get("rustflags"));
+    let build_scoped = doc.get("build").and_then(|b| b.get("rustflags"));
+
+    let rustflags = read_flags(target_scoped)
+        .or_else(|| read_flags(build_scoped))
+        .unwrap_or_default();
+
+    (target, rustflags)
+}
+
+/// Compute the `CARGO_ENCODED_RUSTFLAGS` value for a capsule build, injecting
+/// the getrandom custom-backend cfg when — and only when — the capsule targets
+/// `wasm32-unknown-unknown`. Returns `None` (leave the environment untouched)
+/// for any other target.
+///
+/// Flags are concatenated in order — inherited environment flags
+/// (`CARGO_ENCODED_RUSTFLAGS` takes precedence over `RUSTFLAGS`), then the
+/// capsule's own config `rustflags`, then the getrandom cfg. We deliberately
+/// *merge* rather than let the env override config (which is Cargo's real
+/// precedence): a build tool silently dropping a flag the author or developer
+/// set would be a nasty surprise. The only flags it can't see are ones set in
+/// a *parent* config (above the capsule dir); capsules keep their `rustflags`
+/// in their own `.cargo/config.toml`, so that's a non-issue in practice.
+///
+/// Only the getrandom cfg is de-duplicated. Inherited and config flags are
+/// kept verbatim: de-duping individual tokens would corrupt multi-token flags
+/// like `-C opt-level=3` followed by `-C debuginfo=2` (the second `-C` would
+/// be dropped, yielding invalid `rustc` input). Duplicate whole flags are
+/// harmless to `rustc`.
+fn encoded_rustflags_with_getrandom(
+    target: Option<&str>,
+    config_flags: &[String],
+    inherited_encoded: Option<&str>,
+    inherited_plain: Option<&str>,
+) -> Option<String> {
+    if target != Some(GETRANDOM_TARGET) {
+        return None;
+    }
+
+    let mut flags: Vec<String> = if let Some(enc) = inherited_encoded {
+        enc.split(RUSTFLAGS_SEP)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+            .collect()
+    } else if let Some(plain) = inherited_plain {
+        plain.split_whitespace().map(str::to_owned).collect()
+    } else {
+        Vec::new()
+    };
+
+    flags.extend(config_flags.iter().cloned());
+
+    if !flags.iter().any(|f| f == GETRANDOM_CUSTOM_CFG) {
+        flags.push(GETRANDOM_CUSTOM_CFG.to_owned());
+    }
+
+    Some(flags.join(RUSTFLAGS_SEP))
 }
 
 /// Wrap a core wasm module into a Component Model component if it isn't
@@ -401,4 +561,167 @@ fn create_default_manifest(
     doc.insert("component", toml_edit::Item::ArrayOfTables(comp_arr));
 
     doc
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn decode(encoded: &str) -> Vec<String> {
+        encoded.split(RUSTFLAGS_SEP).map(str::to_owned).collect()
+    }
+
+    #[test]
+    fn no_injection_for_non_wasm_target() {
+        assert_eq!(
+            encoded_rustflags_with_getrandom(Some("wasm32-wasip2"), &[], None, None),
+            None
+        );
+        assert_eq!(
+            encoded_rustflags_with_getrandom(None, &[], None, None),
+            None
+        );
+    }
+
+    #[test]
+    fn injects_cfg_when_capsule_declares_nothing() {
+        let encoded =
+            encoded_rustflags_with_getrandom(Some(GETRANDOM_TARGET), &[], None, None).unwrap();
+        assert_eq!(decode(&encoded), vec![GETRANDOM_CUSTOM_CFG.to_owned()]);
+    }
+
+    #[test]
+    fn does_not_duplicate_an_already_present_cfg() {
+        // The current per-capsule `.cargo/config.toml` case: the flag is
+        // already there, so injection must be a no-op (no double flag).
+        let config = vec![GETRANDOM_CUSTOM_CFG.to_owned()];
+        let encoded =
+            encoded_rustflags_with_getrandom(Some(GETRANDOM_TARGET), &config, None, None).unwrap();
+        assert_eq!(decode(&encoded), vec![GETRANDOM_CUSTOM_CFG.to_owned()]);
+    }
+
+    #[test]
+    fn preserves_other_config_rustflags() {
+        let config = vec!["-C".to_owned(), "target-feature=+simd128".to_owned()];
+        let encoded =
+            encoded_rustflags_with_getrandom(Some(GETRANDOM_TARGET), &config, None, None).unwrap();
+        assert_eq!(
+            decode(&encoded),
+            vec![
+                "-C".to_owned(),
+                "target-feature=+simd128".to_owned(),
+                GETRANDOM_CUSTOM_CFG.to_owned(),
+            ]
+        );
+    }
+
+    #[test]
+    fn preserves_repeated_flag_tokens() {
+        // Regression: de-duping individual tokens must NOT drop a repeated
+        // `-C`, which would fuse two separate flags into invalid rustc input
+        // (`-C opt-level=3` + `-C debuginfo=2` -> `-C opt-level=3 debuginfo=2`).
+        let config = vec![
+            "-C".to_owned(),
+            "opt-level=3".to_owned(),
+            "-C".to_owned(),
+            "debuginfo=2".to_owned(),
+        ];
+        let encoded =
+            encoded_rustflags_with_getrandom(Some(GETRANDOM_TARGET), &config, None, None).unwrap();
+        assert_eq!(
+            decode(&encoded),
+            vec![
+                "-C".to_owned(),
+                "opt-level=3".to_owned(),
+                "-C".to_owned(),
+                "debuginfo=2".to_owned(),
+                GETRANDOM_CUSTOM_CFG.to_owned(),
+            ]
+        );
+    }
+
+    #[test]
+    fn merges_inherited_plain_rustflags() {
+        let encoded = encoded_rustflags_with_getrandom(
+            Some(GETRANDOM_TARGET),
+            &[],
+            None,
+            Some("--cfg=foo -Cdebuginfo=2"),
+        )
+        .unwrap();
+        assert_eq!(
+            decode(&encoded),
+            vec![
+                "--cfg=foo".to_owned(),
+                "-Cdebuginfo=2".to_owned(),
+                GETRANDOM_CUSTOM_CFG.to_owned(),
+            ]
+        );
+    }
+
+    #[test]
+    fn encoded_env_takes_precedence_over_plain() {
+        // When both are set Cargo reads the encoded form; we must too.
+        let encoded = encoded_rustflags_with_getrandom(
+            Some(GETRANDOM_TARGET),
+            &[],
+            Some("--cfg=from_encoded"),
+            Some("--cfg=from_plain"),
+        )
+        .unwrap();
+        assert_eq!(
+            decode(&encoded),
+            vec![
+                "--cfg=from_encoded".to_owned(),
+                GETRANDOM_CUSTOM_CFG.to_owned(),
+            ]
+        );
+    }
+
+    #[test]
+    fn reads_target_and_rustflags_from_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let cargo_dir = dir.path().join(".cargo");
+        fs::create_dir_all(&cargo_dir).unwrap();
+        fs::write(
+            cargo_dir.join("config.toml"),
+            "[build]\n\
+             target = \"wasm32-unknown-unknown\"\n\n\
+             [target.wasm32-unknown-unknown]\n\
+             rustflags = [\"--cfg=getrandom_backend=\\\"custom\\\"\"]\n",
+        )
+        .unwrap();
+
+        let (target, flags) = cargo_config_target_and_rustflags(dir.path());
+        assert_eq!(target.as_deref(), Some(GETRANDOM_TARGET));
+        assert_eq!(flags, vec![GETRANDOM_CUSTOM_CFG.to_owned()]);
+    }
+
+    #[test]
+    fn reads_string_form_rustflags_from_config() {
+        // Cargo allows `rustflags` as a single space-separated string, not
+        // just an array — parse both forms.
+        let dir = tempfile::tempdir().unwrap();
+        let cargo_dir = dir.path().join(".cargo");
+        fs::create_dir_all(&cargo_dir).unwrap();
+        fs::write(
+            cargo_dir.join("config.toml"),
+            "[build]\n\
+             target = \"wasm32-unknown-unknown\"\n\
+             rustflags = \"-C opt-level=3\"\n",
+        )
+        .unwrap();
+
+        let (target, flags) = cargo_config_target_and_rustflags(dir.path());
+        assert_eq!(target.as_deref(), Some(GETRANDOM_TARGET));
+        assert_eq!(flags, vec!["-C".to_owned(), "opt-level=3".to_owned()]);
+    }
+
+    #[test]
+    fn missing_config_yields_no_target_or_flags() {
+        let dir = tempfile::tempdir().unwrap();
+        let (target, flags) = cargo_config_target_and_rustflags(dir.path());
+        assert_eq!(target, None);
+        assert!(flags.is_empty());
+    }
 }
