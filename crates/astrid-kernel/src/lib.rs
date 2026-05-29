@@ -11,6 +11,8 @@
 //! is to instantiate `astrid_events::EventBus`, load `.capsule` files into
 //! the Extism sandbox, and route IPC bytes between them.
 
+/// Passive event-bus storm diagnostics (publish-rate monitor).
+mod bus_monitor;
 /// Persistent invite-token store (issue #756).
 pub mod invite;
 /// The Management API router listening to the `EventBus`.
@@ -313,6 +315,10 @@ impl Kernel {
         drop(spawn_idle_monitor(Arc::clone(&kernel)));
         drop(spawn_react_watchdog(Arc::clone(&kernel.event_bus)));
         drop(spawn_capsule_health_monitor(Arc::clone(&kernel)));
+        // Passive storm diagnostics — subscribes synchronously inside the
+        // call (before the debug-assert below) so it counts toward
+        // `INTERNAL_SUBSCRIBER_COUNT`.
+        drop(bus_monitor::spawn_bus_activity_monitor(&kernel.event_bus));
 
         // Spawn the event dispatcher — routes EventBus events to capsule interceptors.
         // Wire the identity store so auto-provisioning is gated.
@@ -1088,9 +1094,10 @@ fn load_or_generate_runtime_key(keys_dir: &Path) -> std::io::Result<KeyPair> {
 /// setting it in ephemeral mode overrides the 30s default.
 /// Number of permanent internal event bus subscribers that are not client
 /// connections: `KernelRouter` (`kernel.request.*`), `AdminRouter`
-/// (`kernel.admin.*`), `ConnectionTracker` (`client.*`), and
-/// `EventDispatcher` (all events).
-const INTERNAL_SUBSCRIBER_COUNT: usize = 4;
+/// (`kernel.admin.*`), `ConnectionTracker` (`client.*`),
+/// `EventDispatcher` (all events), and the bus activity monitor (all events,
+/// storm diagnostics — see [`bus_monitor::spawn_bus_activity_monitor`]).
+const INTERNAL_SUBSCRIBER_COUNT: usize = 5;
 
 /// Initial grace period before idle checking begins.
 const IDLE_INITIAL_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
