@@ -93,7 +93,12 @@ pub(crate) fn spawn_kernel_router(kernel: Arc<crate::Kernel>) -> tokio::task::Jo
 #[derive(Debug, PartialEq, Eq)]
 enum ConnectionSignal {
     Opened,
-    Closed,
+    /// Carries the disconnect reason when present — the typed
+    /// `IpcPayload::Disconnect { reason }`, or a `"reason"` string in a JSON
+    /// payload — so the tracker can preserve it in the diagnostic log.
+    Closed {
+        reason: Option<String>,
+    },
 }
 
 /// Classifies a `client.v1.*` message as a connection open/close.
@@ -105,13 +110,24 @@ enum ConnectionSignal {
 /// publish exists), so the topic is the only signal they can produce — without
 /// the topic arm, the per-principal connection counter is never populated and
 /// the idle monitor / `astrid who` see zero connections regardless of reality.
+///
+/// Typed payloads take precedence over the topic, so a mismatched topic can
+/// never suppress a real connection event.
 fn connection_signal(topic: &str, payload: &IpcPayload) -> Option<ConnectionSignal> {
-    if matches!(payload, IpcPayload::Disconnect { .. }) || topic == "client.v1.disconnect" {
-        Some(ConnectionSignal::Closed)
-    } else if matches!(payload, IpcPayload::Connect) || topic == "client.v1.connected" {
-        Some(ConnectionSignal::Opened)
-    } else {
-        None
+    match payload {
+        IpcPayload::Disconnect { reason } => Some(ConnectionSignal::Closed {
+            reason: reason.clone(),
+        }),
+        IpcPayload::Connect => Some(ConnectionSignal::Opened),
+        // Uplink capsules can only publish JSON; the topic is the signal, and
+        // the reason (if any) rides along under the `"reason"` key.
+        IpcPayload::RawJson(val) if topic == "client.v1.disconnect" => {
+            let reason = val.get("reason").and_then(|r| r.as_str().map(String::from));
+            Some(ConnectionSignal::Closed { reason })
+        },
+        _ if topic == "client.v1.disconnect" => Some(ConnectionSignal::Closed { reason: None }),
+        _ if topic == "client.v1.connected" => Some(ConnectionSignal::Opened),
+        _ => None,
     }
 }
 
@@ -138,9 +154,9 @@ fn spawn_connection_tracker(kernel: Arc<crate::Kernel>) -> tokio::task::JoinHand
                 .and_then(|p| astrid_core::principal::PrincipalId::new(p).ok())
                 .unwrap_or_default();
             match connection_signal(&message.topic, &message.payload) {
-                Some(ConnectionSignal::Closed) => {
+                Some(ConnectionSignal::Closed { reason }) => {
                     kernel.connection_closed(&principal);
-                    debug!(%principal, topic = %message.topic, "Client disconnected");
+                    debug!(%principal, topic = %message.topic, ?reason, "Client disconnected");
                 },
                 Some(ConnectionSignal::Opened) => {
                     kernel.connection_opened(&principal);
