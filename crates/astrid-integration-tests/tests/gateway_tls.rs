@@ -62,6 +62,8 @@ fn tls_state(bind_addr: SocketAddr, cert_path: PathBuf, key_path: PathBuf) -> Ar
         metrics: astrid_gateway::metrics::Metrics::default(),
         event_bus: None,
         revoked_at: std::sync::Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
+        audit_log: None,
+        session_id: None,
     })
 }
 
@@ -192,6 +194,8 @@ async fn plain_http_path_still_works_when_no_tls_block() {
         metrics: astrid_gateway::metrics::Metrics::default(),
         event_bus: None,
         revoked_at: std::sync::Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
+        audit_log: None,
+        session_id: None,
     });
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
