@@ -14,6 +14,11 @@ astrid-core = { workspace = true }
 async-trait = { workspace = true }
 chrono = { workspace = true, features = ["clock"] }
 dashmap = { workspace = true }
+# Metric recording facade. The bus emits publish-throughput and
+# per-subscriber lag counters into whatever process-wide recorder the
+# daemon installs (the gateway's Prometheus recorder today); no exporter
+# dependency here — recording is decoupled from export.
+metrics = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
@@ -23,6 +28,9 @@ uuid = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
+# Thread-local debugging recorder for asserting metric emission in unit
+# tests without installing a global recorder (`with_local_recorder`).
+metrics-util = "0.20"
 
 [lints]
 workspace = true

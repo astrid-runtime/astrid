@@ -624,6 +624,8 @@ impl Kernel {
             .entry(principal.clone())
             .or_insert_with(|| AtomicUsize::new(0))
             .fetch_add(1, Ordering::Relaxed);
+        metrics::counter!(METRIC_CONNECTIONS_OPENED_TOTAL).increment(1);
+        metrics::gauge!(METRIC_ACTIVE_CONNECTIONS).increment(1.0);
     }
 
     /// Record that a client connection for `principal` has been closed.
@@ -658,6 +660,13 @@ impl Kernel {
                 Some(n.saturating_sub(1))
             }
         });
+
+        // Only count a real close: `Err` means the counter was already 0
+        // (no connection to drop), so the gauge must not go negative.
+        if result.is_ok() {
+            metrics::counter!(METRIC_CONNECTIONS_CLOSED_TOTAL).increment(1);
+            metrics::gauge!(METRIC_ACTIVE_CONNECTIONS).decrement(1.0);
+        }
 
         if result == Ok(1) {
             self.allowance_store.clear_session_allowances(principal);
@@ -1111,6 +1120,21 @@ fn load_or_generate_runtime_key(keys_dir: &Path) -> std::io::Result<KeyPair> {
 /// storm diagnostics — see [`bus_monitor::spawn_bus_activity_monitor`]).
 const INTERNAL_SUBSCRIBER_COUNT: usize = 5;
 
+/// Gauge: current active client connections (sum across principals).
+/// Mirrors [`Kernel::total_connection_count`]; lets a dashboard graph
+/// "who is connected" without polling.
+const METRIC_ACTIVE_CONNECTIONS: &str = "astrid_daemon_active_connections";
+/// Counter: client connections opened (cumulative).
+const METRIC_CONNECTIONS_OPENED_TOTAL: &str = "astrid_daemon_connections_opened_total";
+/// Counter: client connections closed (cumulative). `opened - closed`
+/// cross-checks the gauge.
+const METRIC_CONNECTIONS_CLOSED_TOTAL: &str = "astrid_daemon_connections_closed_total";
+/// Counter: background monitor-loop iterations, labelled by `loop`. A
+/// flat `rate()` is a parked loop; a runaway `rate()` is a spin loop —
+/// the direct signal for the idle-CPU class of incident. Shared with
+/// [`bus_monitor`], hence `pub(crate)`.
+pub(crate) const METRIC_BACKGROUND_TICKS_TOTAL: &str = "astrid_daemon_background_ticks_total";
+
 /// Initial grace period before idle checking begins.
 const IDLE_INITIAL_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
 /// Additional grace for non-ephemeral daemons to let capsules fully initialize.
@@ -1175,6 +1199,7 @@ fn spawn_idle_monitor(kernel: Arc<Kernel>) -> tokio::task::JoinHandle<()> {
 
         loop {
             tokio::time::sleep(check_interval).await;
+            metrics::counter!(METRIC_BACKGROUND_TICKS_TOTAL, "loop" => "idle").increment(1);
 
             let connections = kernel.total_connection_count();
 
@@ -1328,6 +1353,8 @@ fn spawn_capsule_health_monitor(kernel: Arc<Kernel>) -> tokio::task::JoinHandle<
 
         loop {
             interval.tick().await;
+            metrics::counter!(METRIC_BACKGROUND_TICKS_TOTAL, "loop" => "capsule_health")
+                .increment(1);
 
             // Collect ready capsules under a brief read lock, then drop
             // the lock before calling check_health() or publishing events.
@@ -1430,6 +1457,8 @@ fn spawn_react_watchdog(event_bus: Arc<EventBus>) -> tokio::task::JoinHandle<()>
 
         loop {
             interval.tick().await;
+            metrics::counter!(METRIC_BACKGROUND_TICKS_TOTAL, "loop" => "react_watchdog")
+                .increment(1);
 
             let msg = astrid_events::ipc::IpcMessage::new(
                 "astrid.v1.watchdog.tick",

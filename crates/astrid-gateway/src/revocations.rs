@@ -146,7 +146,8 @@ pub fn spawn_watcher(
     revoked_at: Arc<RwLock<HashMap<PrincipalId, u64>>>,
 ) {
     tokio::spawn(async move {
-        let mut receiver = bus.subscribe_topic(crate::routes::events::AUDIT_TOPIC);
+        let mut receiver =
+            bus.subscribe_topic_as(crate::routes::events::AUDIT_TOPIC, "revocation_watcher");
         while let Some(event) = receiver.recv().await {
             let astrid_events::AstridEvent::Ipc { message, .. } = &*event else {
                 continue;
@@ -333,7 +334,8 @@ mod tests {
         revoked_at: Arc<RwLock<HashMap<PrincipalId, u64>>>,
     ) {
         tokio::spawn(async move {
-            let mut receiver = bus.subscribe_topic(crate::routes::events::AUDIT_TOPIC);
+            let mut receiver =
+                bus.subscribe_topic_as(crate::routes::events::AUDIT_TOPIC, "revocation_watcher");
             while let Some(event) = receiver.recv().await {
                 let astrid_events::AstridEvent::Ipc { message, .. } = &*event else {
                     continue;
