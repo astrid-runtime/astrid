@@ -406,6 +406,7 @@ Release binaries for macOS (x86_64, aarch64) and Linux (x86_64, aarch64) are bui
 ## Operator documentation
 
 - [Gateway deployment runbook](docs/gateway-deployment.md) — setting up the HTTP admin gateway behind a reverse proxy or with native TLS, monitoring, key rotation, troubleshooting.
+- [Generating a gateway API client](docs/gateway-client.md) — building a browser/native client against the HTTP admin API from the OpenAPI spec, and why it doesn't belong in the capsule SDKs.
 - [Unified config schema](docs/config.md) — `astrid.toml` reference.
 - [SDK ergonomics notes](docs/sdk-ergonomics.md) — capsule-author guidance.
 
