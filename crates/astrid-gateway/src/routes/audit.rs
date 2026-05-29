@@ -129,7 +129,8 @@ pub async fn get_audit(
     Query(query): Query<AuditQuery>,
     req: Request<axum::body::Body>,
 ) -> GatewayResult<Json<AuditQueryResponse>> {
-    let caller = caller_from(&req)?.clone();
+    let caller = caller_from(&req)?;
+    let caller_principal = caller.principal.clone();
 
     let (audit_log, session_id) = match (state.audit_log.as_ref(), state.session_id.as_ref()) {
         (Some(log), Some(sid)) => (log.clone(), sid.clone()),
@@ -153,7 +154,7 @@ pub async fn get_audit(
     // Cap-gate: admin / `audit:read_all` callers get the firehose;
     // everyone else is silently scoped to their own principal,
     // matching the SSE handler's posture.
-    let firehose = super::events::caller_holds(&state, &caller.principal, AUDIT_FIREHOSE_CAP).await;
+    let firehose = super::events::caller_holds(&state, &caller_principal, AUDIT_FIREHOSE_CAP).await;
 
     // Pull the full session slice from the audit log. The audit log
     // doesn't expose an "after cursor" query primitive today, so we
@@ -169,11 +170,16 @@ pub async fn get_audit(
             .map_err(|e| GatewayError::Internal(anyhow::anyhow!("audit read task panicked: {e}")))?
             .map_err(|e| GatewayError::Internal(anyhow::anyhow!("audit read failed: {e}")))?;
 
-    // Newest first. The storage backend returns entries in
-    // insertion order; reverse so the dashboard's "page 1" is
-    // "most recent".
+    // Newest first. The storage backend already returns entries in
+    // insertion order (oldest first), so a plain `reverse()` is both
+    // cheaper (O(N) vs O(N log N) sort, zero allocation) AND
+    // preserves true insertion order for entries that share a
+    // second-granular timestamp — a stable sort with `Reverse` would
+    // keep equal-ts entries oldest-first inside the slice, which
+    // breaks the cursor's expectation that "page 1" lists every
+    // entry strictly newer than page 2.
     let mut entries: Vec<AuditEntry> = all;
-    entries.sort_by_key(|e| std::cmp::Reverse(e.timestamp.0.timestamp()));
+    entries.reverse();
 
     // Effective principal filter: admins can use the `principal=`
     // query param; non-admins are pinned to their own principal
@@ -186,36 +192,48 @@ pub async fn get_audit(
             None => None,
         }
     } else {
-        Some(caller.principal.clone())
+        Some(caller_principal)
     };
 
-    let cursor_ts: Option<u64> =
-        match query.cursor.as_deref() {
-            Some(c) => Some(c.parse::<u64>().map_err(|_| {
-                GatewayError::BadRequest("cursor must be an integer timestamp".into())
-            })?),
-            None => None,
-        };
+    // Cursor is `"<ts_epoch>_<offset>"` — `offset` is the number of
+    // entries with the same `ts_epoch` we've already returned from
+    // previous pages. Encoding both means same-second batches
+    // (timer ticks, scripted ops) can't silently lose or duplicate
+    // entries across the page boundary. The plain `"<ts_epoch>"`
+    // shape is still accepted for compatibility with v1 cursors.
+    let cursor = parse_cursor(query.cursor.as_deref())?;
+    let (page, next_cursor) =
+        paginate_page(entries, &query, principal_filter.as_ref(), cursor, limit);
 
+    Ok(Json(AuditQueryResponse {
+        entries: page,
+        next_cursor,
+    }))
+}
+
+/// Walk the entries (newest first) and assemble one page worth of
+/// rendered views, honouring every filter + the cursor offset.
+/// Returns the page plus the next-page cursor (or `None` if the
+/// result is the last page). Pulled out of [`get_audit`] so the
+/// handler stays inside the function-length budget and the cursor
+/// arithmetic lives in one place.
+fn paginate_page(
+    entries: Vec<AuditEntry>,
+    query: &AuditQuery,
+    principal_filter: Option<&PrincipalId>,
+    cursor: (Option<u64>, usize),
+    limit: usize,
+) -> (Vec<AuditEntryView>, Option<String>) {
+    let (cursor_ts, cursor_offset) = cursor;
     let mut page: Vec<AuditEntryView> = Vec::with_capacity(limit);
+    let mut equal_ts_skipped: usize = 0;
+    let mut equal_ts_count_in_page: usize = 0;
     let mut last_ts: Option<u64> = None;
     for entry in entries {
-        // Skip non-`AdminRequest` entries — those belong to a
-        // different feed (MCP tool calls, capsule events).
         let Some(view) = render_entry(&entry) else {
             continue;
         };
 
-        // Cursor: entries with ts >= cursor_ts have already been
-        // delivered, so skip them. Equal-ts collisions are handled
-        // by dropping at the boundary; in practice ts is seconds-
-        // granular and the kernel sees fewer than one admin op per
-        // second.
-        if let Some(c) = cursor_ts
-            && view.ts_epoch >= c
-        {
-            continue;
-        }
         if let Some(s) = query.since
             && view.ts_epoch < s
         {
@@ -231,12 +249,29 @@ pub async fn get_audit(
         {
             continue;
         }
-        if let Some(p) = principal_filter.as_ref()
+        if let Some(p) = principal_filter
             && view.principal.as_deref() != Some(p.as_str())
         {
             continue;
         }
 
+        // Cursor positioning: drop everything strictly newer than
+        // the cursor's `ts`, then skip the first `cursor_offset`
+        // entries that share `ts` (those were on the prior page).
+        if let Some(c_ts) = cursor_ts {
+            if view.ts_epoch > c_ts {
+                continue;
+            }
+            if view.ts_epoch == c_ts && equal_ts_skipped < cursor_offset {
+                equal_ts_skipped = equal_ts_skipped.saturating_add(1);
+                continue;
+            }
+        }
+
+        equal_ts_count_in_page = match last_ts {
+            Some(t) if t == view.ts_epoch => equal_ts_count_in_page.saturating_add(1),
+            _ => 1,
+        };
         last_ts = Some(view.ts_epoch);
         page.push(view);
         if page.len() >= limit {
@@ -245,15 +280,43 @@ pub async fn get_audit(
     }
 
     let next_cursor = if page.len() == limit {
-        last_ts.map(|t| t.to_string())
+        last_ts.map(|t| {
+            let offset = if cursor_ts == Some(t) {
+                cursor_offset.saturating_add(equal_ts_count_in_page)
+            } else {
+                equal_ts_count_in_page
+            };
+            format!("{t}_{offset}")
+        })
     } else {
         None
     };
 
-    Ok(Json(AuditQueryResponse {
-        entries: page,
-        next_cursor,
-    }))
+    (page, next_cursor)
+}
+
+/// Parse an opaque cursor into `(ts_epoch, equal_ts_offset)`.
+/// Supports both the v2 shape (`"<ts>_<offset>"`) and the legacy
+/// v1 plain-`"<ts>"` shape so dashboards holding a v1 cursor across
+/// the upgrade don't fail their next paginated fetch.
+fn parse_cursor(cursor: Option<&str>) -> GatewayResult<(Option<u64>, usize)> {
+    let Some(raw) = cursor else {
+        return Ok((None, 0));
+    };
+    if let Some((ts_str, off_str)) = raw.split_once('_') {
+        let ts = ts_str
+            .parse::<u64>()
+            .map_err(|_| GatewayError::BadRequest("cursor timestamp must be an integer".into()))?;
+        let off = off_str.parse::<usize>().map_err(|_| {
+            GatewayError::BadRequest("cursor offset must be a non-negative integer".into())
+        })?;
+        Ok((Some(ts), off))
+    } else {
+        let ts = raw.parse::<u64>().map_err(|_| {
+            GatewayError::BadRequest("cursor must be \"<ts>\" or \"<ts>_<offset>\"".into())
+        })?;
+        Ok((Some(ts), 0))
+    }
 }
 
 /// Map an `AuditEntry` into the flat JSON shape we ship over the
@@ -351,5 +414,32 @@ mod tests {
         assert_eq!(view.principal.as_deref(), Some("admin"));
         assert_eq!(view.target_principal.as_deref(), Some("alice"));
         assert_eq!(view.outcome, "success");
+    }
+
+    #[test]
+    fn parse_cursor_handles_v1_and_v2_shapes() {
+        // v1 (legacy): bare integer, no underscore — offset
+        // defaults to 0. We accept this shape so v0.7.0 cursors
+        // already in flight don't fail the next paginated fetch.
+        let (ts, off) = parse_cursor(Some("1700000000")).expect("bare ts parses");
+        assert_eq!(ts, Some(1_700_000_000));
+        assert_eq!(off, 0);
+
+        // v2: `<ts>_<offset>` — same-second batches resume cleanly
+        // without losing or duplicating entries across the page
+        // boundary.
+        let (ts, off) = parse_cursor(Some("1700000000_3")).expect("v2 cursor parses");
+        assert_eq!(ts, Some(1_700_000_000));
+        assert_eq!(off, 3);
+
+        // None: no cursor → no positioning, start from newest.
+        let (ts, off) = parse_cursor(None).expect("None passes");
+        assert_eq!(ts, None);
+        assert_eq!(off, 0);
+
+        // Garbage rejected with `BadRequest`.
+        assert!(parse_cursor(Some("not-a-number")).is_err());
+        assert!(parse_cursor(Some("123_not-a-number")).is_err());
+        assert!(parse_cursor(Some("not-a-number_4")).is_err());
     }
 }
