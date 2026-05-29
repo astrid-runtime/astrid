@@ -85,8 +85,10 @@ for everyone. You **must** tell the gateway which proxies to trust:
 
 ```toml
 trust-forwarded-from = ["127.0.0.1"]   # only loopback
-# or, in a cloud LB scenario:
-trust-forwarded-from = ["10.0.0.0/8"]  # CIDR not yet supported — list individual IPs
+# or, in a cloud LB scenario — list individual proxy IPs, CIDR
+# blocks aren't parsed yet (`std::net::IpAddr` deserialisation
+# only accepts bare addresses):
+trust-forwarded-from = ["10.0.0.1", "10.0.0.2"]
 ```
 
 The gateway only honours `X-Forwarded-For` / `X-Real-IP` when the
@@ -209,8 +211,8 @@ user
 
 ### Revocation
 
-`POST /api/sys/principals/{id}` with DELETE method publishes an
-`AgentDelete` audit event. The gateway subscribes to that feed and
+`DELETE /api/sys/principals/{id}` publishes an `AgentDelete`
+audit event. The gateway subscribes to that feed and
 records the deletion time in
 `$ASTRID_HOME/etc/gateway-revocations.json`. Every bearer with
 `iat <= revoked_at` is rejected on the next request. Backs up
@@ -276,19 +278,24 @@ What to back up:
   any custom group definitions.
 - `$ASTRID_HOME/keys/` — gateway signing key, kernel runtime key.
   Treat as secret material; `chmod 0700` the directory.
-- `$ASTRID_HOME/audit.db/` — persistent audit log. Operators
-  legally required to retain audit history must back this up;
-  others can let it rotate per their own policy.
-- Per-principal state under `$ASTRID_HOME/<principal>/` —
-  per-principal capsule env, secret stores, KV.
+- Per-principal state under `$ASTRID_HOME/{principal}/` — capsule
+  env, secret stores, KV — and per-principal audit chains under
+  `$ASTRID_HOME/{principal}/.local/audit/`. The audit log isn't a
+  monolithic `audit.db` file any more; each principal owns its own
+  cryptographically-linked chain, so back up the whole principal
+  home directory tree to retain auditable history. Operators
+  legally required to retain that history must back these up;
+  others can let them rotate per their own policy.
 
 Restore order:
 
 1. Stop the daemon.
-2. Restore `etc/`, `keys/`, and the principal homes.
-3. Restore `audit.db/` only if you need history; the daemon will
-   create a fresh empty log otherwise.
-4. Start the daemon.
+2. Restore `etc/`, `keys/`, and the per-principal home directory
+   trees (which carry the audit chains inside `.local/audit/`).
+3. Start the daemon. Audit chains are verified on boot — if any
+   chain doesn't match, `verify_all` logs an `error!` line but
+   the daemon still comes up (fail-open for availability, loud
+   alert for integrity).
 
 The gateway loads its config + signing key at boot; nothing to
 re-run.
