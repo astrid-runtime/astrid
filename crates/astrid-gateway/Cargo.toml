@@ -59,6 +59,7 @@ futures = { workspace = true }
 hex = { workspace = true }
 metrics = { workspace = true }
 metrics-exporter-prometheus = { workspace = true }
+metrics-process = { workspace = true }
 rand = { workspace = true }
 rustls = { workspace = true }
 serde = { workspace = true }

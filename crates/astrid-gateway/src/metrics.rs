@@ -27,15 +27,29 @@
 //! | `astrid_gateway_auth_failures_total` | counter | — | Bearer verification failures |
 //! | `astrid_gateway_redeem_attempts_total` | counter | — | Invite redemptions attempted |
 //! | `astrid_gateway_redeem_rate_limited_total` | counter | — | Redeem rejections by the rate limiter |
+//! | `astrid_build_info` | gauge | version, `git_sha`, rustc | Build provenance (always 1) |
+//! | `process_cpu_seconds_total` | counter | — | Total process CPU time |
+//! | `process_resident_memory_bytes` | gauge | — | Resident set size |
+//! | `process_threads` | gauge | — | OS thread count |
+//! | `process_open_fds` | gauge | — | Open file descriptors |
+//! | `process_start_time_seconds` | gauge | — | Process start (unix epoch) |
 //!
 //! Cardinality on the labelled series is bounded by
 //! `routes × ~6 typical statuses` (~210 series at the current router
-//! shape). The histogram inherits the same labels.
+//! shape). The histogram inherits the same labels. The `process_*`
+//! family and `astrid_build_info` are unlabelled (or carry only
+//! build-constant labels), so they add a fixed handful of series.
+//!
+//! The `process_*` series deliberately use the Prometheus-ecosystem
+//! standard names (no `astrid_` prefix) so off-the-shelf dashboards
+//! work unmodified. `astrid_build_info` exposes build constants
+//! (version/sha/rustc) on the unauthenticated endpoint deliberately —
+//! they carry no principal, path, or secret. See `docs/metrics.md`.
 
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
-use metrics::{Unit, describe_counter, describe_histogram};
+use metrics::{Unit, describe_counter, describe_gauge, describe_histogram};
 use metrics_exporter_prometheus::{Matcher, PrometheusBuilder, PrometheusHandle};
 
 /// Prometheus default histogram buckets for HTTP request duration in
@@ -62,6 +76,21 @@ pub const METRIC_REDEEM_ATTEMPTS_TOTAL: &str = "astrid_gateway_redeem_attempts_t
 
 /// Invite-redemption rate-limited counter.
 pub const METRIC_REDEEM_RATE_LIMITED_TOTAL: &str = "astrid_gateway_redeem_rate_limited_total";
+
+/// Build-provenance gauge. Always `1`; the *value* carries nothing —
+/// the point is the label set (`version`, `git_sha`, `rustc`), which
+/// dashboards join against to slice every other series by build. Set
+/// once at recorder install (gauges retain their last value, so it
+/// renders on every subsequent scrape).
+pub const METRIC_BUILD_INFO: &str = "astrid_build_info";
+
+/// Process-level collector emitting the Prometheus-ecosystem-standard
+/// `process_*` series. `metrics-process` is pull-based: its
+/// [`metrics_process::Collector::collect`] must run on each scrape (no
+/// background thread). Stored in a `OnceLock` so the `/metrics` handler
+/// can reach it via [`collect_process_metrics`] without threading it
+/// through `GatewayState`. Populated inside [`install_recorder`].
+static PROCESS_COLLECTOR: OnceLock<metrics_process::Collector> = OnceLock::new();
 
 /// Install the process-wide Prometheus recorder. Idempotent: every
 /// call after the first returns the same handle (the `metrics` crate
@@ -139,8 +168,46 @@ pub fn install_recorder() -> anyhow::Result<PrometheusHandle> {
     metrics::counter!(METRIC_REDEEM_ATTEMPTS_TOTAL).absolute(0);
     metrics::counter!(METRIC_REDEEM_RATE_LIMITED_TOTAL).absolute(0);
 
+    // Standard process collector. `describe()` registers HELP/TYPE; the
+    // gauges themselves materialise on the first `collect()`, which the
+    // `/metrics` handler drives per scrape via `collect_process_metrics`.
+    // Stash it in the `OnceLock` so the handler can reach it. We run
+    // entirely inside the install mutex, so the `set` cannot race.
+    let process_collector = metrics_process::Collector::default();
+    process_collector.describe();
+    let _ = PROCESS_COLLECTOR.set(process_collector);
+
+    // Build-provenance gauge. Set once here; a gauge retains its last
+    // value, so it renders on every subsequent scrape. Labels are
+    // compile-time build constants (`build.rs` fills the SHA + rustc,
+    // each falling back to `"unknown"`), so this never fails and never
+    // leaks principal/path/secret material onto the public endpoint.
+    describe_gauge!(
+        METRIC_BUILD_INFO,
+        Unit::Count,
+        "Build provenance (always 1). Join other series on this to slice by version/sha."
+    );
+    metrics::gauge!(
+        METRIC_BUILD_INFO,
+        "version" => env!("CARGO_PKG_VERSION"),
+        "git_sha" => env!("ASTRID_GIT_SHA"),
+        "rustc" => env!("ASTRID_RUSTC_VERSION"),
+    )
+    .set(1.0);
+
     *guard = Some(handle.clone());
     Ok(handle)
+}
+
+/// Refresh the process-level gauges (`process_cpu_seconds_total`,
+/// `process_resident_memory_bytes`, `process_threads`, …) so the next
+/// render reflects the moment the scrape was taken. The `/metrics`
+/// handler calls this immediately before rendering. No-op until
+/// [`install_recorder`] has run.
+pub fn collect_process_metrics() {
+    if let Some(collector) = PROCESS_COLLECTOR.get() {
+        collector.collect();
+    }
 }
 
 /// Map an axum `Method` to a `&'static str` for use as a metric
@@ -337,6 +404,50 @@ mod tests {
             assert!(
                 rendered.contains(name),
                 "{name} missing from scrape body — describe + touch broken;\n{rendered}"
+            );
+        }
+    }
+
+    #[test]
+    fn build_info_renders_with_constant_labels() {
+        let handle = install_recorder().expect("install");
+        let rendered = handle.render();
+        // Set once at install; must always be present, pinned at 1, and
+        // carry the version label sourced from CARGO_PKG_VERSION.
+        assert!(
+            rendered.contains(METRIC_BUILD_INFO),
+            "{METRIC_BUILD_INFO} missing from scrape body;\n{rendered}"
+        );
+        assert!(
+            rendered.contains(&format!("version=\"{}\"", env!("CARGO_PKG_VERSION"))),
+            "build_info missing version label;\n{rendered}"
+        );
+        // git_sha / rustc come from build.rs and fall back to "unknown",
+        // so the label keys are always emitted regardless of build env.
+        assert!(
+            rendered.contains("git_sha=\"") && rendered.contains("rustc=\""),
+            "build_info missing git_sha/rustc labels;\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn process_metrics_render_after_collect() {
+        let handle = install_recorder().expect("install");
+        // Pull-based: the gauges only materialise once `collect()` runs.
+        collect_process_metrics();
+        let rendered = handle.render();
+        // Assert only on the families `metrics-process` documents for
+        // every supported platform (Linux/macOS/Windows/FreeBSD), so the
+        // test is portable across dev (macOS) and CI (Linux). CPU and
+        // start-time are the signals this slice exists to expose.
+        for name in [
+            "process_cpu_seconds_total",
+            "process_resident_memory_bytes",
+            "process_start_time_seconds",
+        ] {
+            assert!(
+                rendered.contains(name),
+                "{name} missing after collect — process collector not wired;\n{rendered}"
             );
         }
     }
