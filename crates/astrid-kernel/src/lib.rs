@@ -260,7 +260,7 @@ impl Kernel {
         // The socket is bound here, but not yet listened on. The token is
         // generated before any capsule can accept connections, preventing
         // a race where a client connects before the token file exists.
-        let (listener, singleton_lock) = socket::bind_session_socket()?;
+        let (listener, singleton_lock) = socket::bind_session_socket(&home)?;
         let (session_token, token_path) = socket::generate_session_token()?;
 
         let allowance_store = Arc::new(astrid_approval::AllowanceStore::new());

@@ -24,28 +24,23 @@ const MAX_SOCKET_PATH_LEN: usize = 104;
 #[cfg(not(any(target_os = "macos", target_os = "freebsd", target_os = "openbsd")))]
 const MAX_SOCKET_PATH_LEN: usize = 108;
 
-/// Binds a local Unix Domain Socket for the OS.
-/// Returns the bound listener so it can be passed into the WASM execution context.
+/// Binds a local Unix Domain Socket for the OS and acquires the singleton lock.
+/// Returns the bound listener (for the WASM execution context) plus the lock
+/// file, which the caller MUST keep alive for the process lifetime.
+///
+/// Takes the already-resolved [`AstridHome`](astrid_core::dirs::AstridHome) so
+/// the path is resolved exactly once, by the caller. There is intentionally no
+/// `/tmp` fallback: the caller resolves `ASTRID_HOME` strictly and a daemon
+/// that can't resolve it refuses to boot, rather than binding a divergent
+/// `/tmp` path and running side by side with another instance (split-brain).
 ///
 /// # Errors
 /// Returns an error if the socket cannot be bound, the path exceeds the
-/// platform's `sun_path` limit, or another kernel instance is already
-/// listening on the socket.
-pub(crate) fn bind_session_socket() -> Result<(UnixListener, std::fs::File), std::io::Error> {
-    use astrid_core::dirs::AstridHome;
-
-    // Resolve the socket path STRICTLY — no `/tmp` fallback. A daemon whose
-    // ASTRID_HOME cannot be resolved must refuse to boot rather than bind a
-    // divergent `/tmp` path: two daemons that resolve to different paths would
-    // both bind successfully and run side by side (split-brain). Fail closed.
-    // (`generate_session_token` already refuses the fallback for the same
-    // reason.)
-    let home = AstridHome::resolve().map_err(|e| {
-        std::io::Error::other(format!(
-            "Cannot bind kernel socket: failed to resolve ASTRID_HOME \
-             (refusing the /tmp fallback to avoid split-brain daemons): {e}"
-        ))
-    })?;
+/// platform's `sun_path` limit, the singleton lock is already held by another
+/// kernel instance, or another kernel is already listening on the socket.
+pub(crate) fn bind_session_socket(
+    home: &astrid_core::dirs::AstridHome,
+) -> Result<(UnixListener, std::fs::File), std::io::Error> {
     let path = home.socket_path();
 
     // Create the run directory first — both the lockfile and the socket live
