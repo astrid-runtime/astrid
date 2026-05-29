@@ -19,16 +19,21 @@ use tracing::{debug, info, warn};
 
 #[cfg(test)]
 mod capability_catalog_tests;
+#[cfg(test)]
+mod connection_tracker_tests;
 
 /// Spawns background tasks for the kernel management API and connection tracking.
 ///
 /// Two listeners:
 /// 1. `astrid.v1.request.*` - handles management commands (list capsules, reload, etc.)
-/// 2. `client.v1.disconnect` - decrements the active connection counter on graceful disconnect.
+/// 2. `client.v1.*` - tracks the active connection count per principal.
 ///
-/// Connection *increment* happens when the WASM proxy capsule accepts a socket
-/// connection (it publishes a `client.v1.connected` event). For ungraceful disconnects,
-/// the idle monitor uses `EventBus::subscriber_count()` as a secondary signal.
+/// Uplink capsules (e.g. the CLI proxy) publish `client.v1.connected` /
+/// `client.v1.disconnect` carrying the authenticated principal as a socket is
+/// accepted / closed; the tracker adjusts `active_connections` accordingly.
+/// Because the SDK exposes no typed-payload publish (only JSON), the tracker
+/// keys off the **topic** as well as the typed `IpcPayload::Connect` /
+/// `Disconnect` that native producers emit — see [`connection_signal`].
 #[must_use]
 pub(crate) fn spawn_kernel_router(kernel: Arc<crate::Kernel>) -> tokio::task::JoinHandle<()> {
     // Spawn the connection tracker as a sibling task.
@@ -84,11 +89,36 @@ pub(crate) fn spawn_kernel_router(kernel: Arc<crate::Kernel>) -> tokio::task::Jo
     })
 }
 
+/// Whether a `client.v1.*` message opens or closes a connection.
+#[derive(Debug, PartialEq, Eq)]
+enum ConnectionSignal {
+    Opened,
+    Closed,
+}
+
+/// Classifies a `client.v1.*` message as a connection open/close.
+///
+/// Recognises **both** the typed [`IpcPayload::Connect`]/[`IpcPayload::Disconnect`]
+/// that native producers emit, **and** the `client.v1.connected` /
+/// `client.v1.disconnect` topics carrying any payload. Uplink capsules can only
+/// reach the bus through the JSON-only SDK publish surface (no typed-payload
+/// publish exists), so the topic is the only signal they can produce — without
+/// the topic arm, the per-principal connection counter is never populated and
+/// the idle monitor / `astrid who` see zero connections regardless of reality.
+fn connection_signal(topic: &str, payload: &IpcPayload) -> Option<ConnectionSignal> {
+    if matches!(payload, IpcPayload::Disconnect { .. }) || topic == "client.v1.disconnect" {
+        Some(ConnectionSignal::Closed)
+    } else if matches!(payload, IpcPayload::Connect) || topic == "client.v1.connected" {
+        Some(ConnectionSignal::Opened)
+    } else {
+        None
+    }
+}
+
 /// Tracks client connection lifecycle events.
 ///
-/// Listens on `client.v1.*` topics:
-/// - `client.v1.connected` - a new socket connection was accepted.
-/// - `client.v1.disconnect` - a client sent a graceful disconnect.
+/// Listens on `client.v1.*` topics and adjusts the per-principal connection
+/// count via [`connection_signal`] (typed payload or topic).
 fn spawn_connection_tracker(kernel: Arc<crate::Kernel>) -> tokio::task::JoinHandle<()> {
     let mut receiver = kernel.event_bus.subscribe_topic("client.v1.*");
 
@@ -107,16 +137,16 @@ fn spawn_connection_tracker(kernel: Arc<crate::Kernel>) -> tokio::task::JoinHand
                 .as_deref()
                 .and_then(|p| astrid_core::principal::PrincipalId::new(p).ok())
                 .unwrap_or_default();
-            match &message.payload {
-                IpcPayload::Disconnect { reason } => {
+            match connection_signal(&message.topic, &message.payload) {
+                Some(ConnectionSignal::Closed) => {
                     kernel.connection_closed(&principal);
-                    debug!(%principal, reason = ?reason, "Client disconnected");
+                    debug!(%principal, topic = %message.topic, "Client disconnected");
                 },
-                IpcPayload::Connect => {
+                Some(ConnectionSignal::Opened) => {
                     kernel.connection_opened(&principal);
-                    debug!(%principal, "New client connection accepted");
+                    debug!(%principal, topic = %message.topic, "New client connection accepted");
                 },
-                _ => {},
+                None => {},
             }
         }
     })
