@@ -16,8 +16,9 @@ use ed25519_dalek::{SigningKey, VerifyingKey};
 use rand::RngCore;
 use tokio::sync::Mutex;
 
+use metrics_exporter_prometheus::PrometheusHandle;
+
 use crate::config::GatewayConfig;
-use crate::metrics::Metrics;
 use crate::routes::distribution::{DistributionInfo, OnboardingFields};
 
 /// Signing material for session bearer tokens.
@@ -175,8 +176,13 @@ pub struct GatewayState {
     /// Redeem rate-limiter. Wrapped in async `Mutex` because the
     /// limiter is a write-mostly workload and handlers are async.
     pub redeem_limiter: Mutex<RedeemRateLimiter>,
-    /// Prometheus counter set rendered at `/metrics`.
-    pub metrics: Metrics,
+    /// Handle into the process-wide Prometheus recorder. The
+    /// gateway's `/metrics` route renders this; kernel-side or
+    /// capsule-side code that calls `metrics::counter!()` flows
+    /// into the same recorder so a single scrape covers the whole
+    /// daemon. Installed once at gateway boot via
+    /// [`crate::metrics::install_recorder`].
+    pub metrics_handle: PrometheusHandle,
     /// Bearer revocation map: `principal → epoch when the principal
     /// was deleted`. Populated by a background task that watches the
     /// kernel's audit-event stream for successful `AgentDelete` ops,
@@ -226,13 +232,15 @@ impl GatewayState {
         let revoked_at = Arc::new(RwLock::new(
             crate::revocations::load_from_disk().context("load gateway revocations")?,
         ));
+        let metrics_handle =
+            crate::metrics::install_recorder().context("install Prometheus recorder")?;
         Ok(Arc::new(Self {
             config,
             signing,
             distribution: Arc::new(distribution),
             onboarding: Arc::new(onboarding),
             redeem_limiter: Mutex::new(RedeemRateLimiter::default()),
-            metrics: Metrics::default(),
+            metrics_handle,
             event_bus,
             revoked_at,
         }))
