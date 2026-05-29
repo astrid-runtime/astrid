@@ -81,6 +81,16 @@ pub struct Kernel {
     pub home_root: Option<PathBuf>,
     /// The natively bound Unix Socket for the CLI proxy.
     pub cli_socket_listener: Option<Arc<tokio::sync::Mutex<tokio::net::UnixListener>>>,
+    /// Exclusive advisory lock enforcing a single kernel instance, held for
+    /// the daemon's lifetime (see [`socket::bind_session_socket`]). `None` for
+    /// test kernels that don't bind a real socket. Never read — the point is
+    /// that its `Drop` (or process exit) releases the lock so a restart isn't
+    /// wedged.
+    #[expect(
+        dead_code,
+        reason = "held for the process lifetime; Drop releases the singleton flock"
+    )]
+    singleton_lock: Option<std::fs::File>,
     /// Shared KV store backing all capsule-scoped stores and kernel state.
     pub kv: Arc<astrid_storage::SurrealKvStore>,
     /// Chain-linked cryptographic audit log with persistent storage.
@@ -250,7 +260,7 @@ impl Kernel {
         // The socket is bound here, but not yet listened on. The token is
         // generated before any capsule can accept connections, preventing
         // a race where a client connects before the token file exists.
-        let listener = socket::bind_session_socket()?;
+        let (listener, singleton_lock) = socket::bind_session_socket()?;
         let (session_token, token_path) = socket::generate_session_token()?;
 
         let allowance_store = Arc::new(astrid_approval::AllowanceStore::new());
@@ -295,6 +305,7 @@ impl Kernel {
             workspace_root,
             home_root,
             cli_socket_listener: Some(Arc::new(tokio::sync::Mutex::new(listener))),
+            singleton_lock: Some(singleton_lock),
             kv,
             audit_log,
             active_connections: DashMap::new(),
@@ -958,6 +969,7 @@ pub(crate) async fn test_kernel_with_home(home: astrid_core::dirs::AstridHome) -
         workspace_root: home.root().to_path_buf(),
         home_root: Some(principal_home.root().to_path_buf()),
         cli_socket_listener: None,
+        singleton_lock: None,
         kv,
         audit_log,
         active_connections: DashMap::new(),

@@ -31,15 +31,27 @@ const MAX_SOCKET_PATH_LEN: usize = 108;
 /// Returns an error if the socket cannot be bound, the path exceeds the
 /// platform's `sun_path` limit, or another kernel instance is already
 /// listening on the socket.
-pub(crate) fn bind_session_socket() -> Result<UnixListener, std::io::Error> {
-    let path = kernel_socket_path();
+pub(crate) fn bind_session_socket() -> Result<(UnixListener, std::fs::File), std::io::Error> {
+    use astrid_core::dirs::AstridHome;
 
-    prepare_socket_path(&path)?;
+    // Resolve the socket path STRICTLY — no `/tmp` fallback. A daemon whose
+    // ASTRID_HOME cannot be resolved must refuse to boot rather than bind a
+    // divergent `/tmp` path: two daemons that resolve to different paths would
+    // both bind successfully and run side by side (split-brain). Fail closed.
+    // (`generate_session_token` already refuses the fallback for the same
+    // reason.)
+    let home = AstridHome::resolve().map_err(|e| {
+        std::io::Error::other(format!(
+            "Cannot bind kernel socket: failed to resolve ASTRID_HOME \
+             (refusing the /tmp fallback to avoid split-brain daemons): {e}"
+        ))
+    })?;
+    let path = home.socket_path();
 
-    // Also clean stale readiness file as defense-in-depth for daemon
-    // crashes that bypassed graceful shutdown.
-    remove_readiness_file();
-
+    // Create the run directory first — both the lockfile and the socket live
+    // in it. Enforce 0o700: AstridHome::ensure() does this at boot, but if the
+    // directory was just created here it would inherit the process umask
+    // (commonly 0o755, making the socket listable by other users).
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| {
             std::io::Error::other(format!(
@@ -48,10 +60,6 @@ pub(crate) fn bind_session_socket() -> Result<UnixListener, std::io::Error> {
             ))
         })?;
 
-        // Enforce 0o700 on the sessions directory. AstridHome::ensure() does
-        // this at boot, but if the directory was just created by create_dir_all
-        // it inherits the process umask (commonly 0o755, making the socket
-        // listable by other users).
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -59,7 +67,59 @@ pub(crate) fn bind_session_socket() -> Result<UnixListener, std::io::Error> {
         }
     }
 
-    UnixListener::bind(&path)
+    // Singleton guard: hold an exclusive advisory lock on a lockfile next to
+    // the socket for the daemon's lifetime. This closes the connect-probe ->
+    // bind TOCTOU window in `prepare_socket_path` deterministically — a second
+    // daemon fails to acquire the lock and exits before touching the socket.
+    // The OS releases the lock when the process dies, so a crashed daemon
+    // never wedges a restart. The caller MUST keep the returned file alive for
+    // the process lifetime (dropping it releases the lock).
+    let lock = acquire_singleton_lock(&path.with_file_name("system.lock"))?;
+
+    prepare_socket_path(&path)?;
+
+    // Also clean stale readiness file as defense-in-depth for daemon
+    // crashes that bypassed graceful shutdown.
+    remove_readiness_file();
+
+    let listener = UnixListener::bind(&path)?;
+    Ok((listener, lock))
+}
+
+/// Acquire an exclusive, non-blocking advisory lock on `lock_path`, returning
+/// the open file handle. The lock is held for as long as the returned `File`
+/// is alive — the caller stores it for the daemon's lifetime, and the OS
+/// releases it on process exit (so a crash can't wedge a restart). The
+/// lockfile itself is intentionally left in place between runs.
+fn acquire_singleton_lock(lock_path: &std::path::Path) -> Result<std::fs::File, std::io::Error> {
+    use std::fs::OpenOptions;
+
+    let mut opts = OpenOptions::new();
+    opts.read(true).write(true).create(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let file = opts.open(lock_path).map_err(|e| {
+        std::io::Error::other(format!(
+            "Failed to open singleton lockfile {}: {e}",
+            lock_path.display()
+        ))
+    })?;
+
+    file.try_lock().map_err(|e| match e {
+        std::fs::TryLockError::WouldBlock => std::io::Error::other(format!(
+            "Another kernel instance is already running (singleton lock held): {}",
+            lock_path.display()
+        )),
+        std::fs::TryLockError::Error(err) => std::io::Error::other(format!(
+            "Failed to acquire singleton lock {}: {err}",
+            lock_path.display()
+        )),
+    })?;
+
+    Ok(file)
 }
 
 /// Generate a random session token and write it to the token file.
@@ -281,5 +341,37 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let sock = dir.path().join("does_not_exist.sock");
         prepare_socket_path(&sock).unwrap();
+    }
+
+    #[test]
+    fn singleton_lock_is_exclusive() {
+        let dir = tempfile::tempdir().unwrap();
+        let lock = dir.path().join("system.lock");
+
+        // First acquisition holds the lock for the duration of `_first`.
+        let _first = acquire_singleton_lock(&lock).expect("first acquisition succeeds");
+
+        // A second acquisition while the first is held must fail — this is the
+        // "another kernel is already running" guard.
+        let err = acquire_singleton_lock(&lock).unwrap_err();
+        assert!(
+            err.to_string().contains("already running"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn singleton_lock_is_released_on_drop() {
+        let dir = tempfile::tempdir().unwrap();
+        let lock = dir.path().join("system.lock");
+
+        // Acquire and drop — mirrors a daemon exiting and releasing the lock.
+        {
+            let _first = acquire_singleton_lock(&lock).expect("first acquisition succeeds");
+        }
+
+        // A fresh daemon can now acquire the same lock (no wedged restart).
+        let _second =
+            acquire_singleton_lock(&lock).expect("lock should be re-acquirable after release");
     }
 }
