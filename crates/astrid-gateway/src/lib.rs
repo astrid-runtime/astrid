@@ -50,6 +50,7 @@ pub mod openapi;
 pub mod revocations;
 pub mod routes;
 pub mod state;
+pub mod tls;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -64,14 +65,16 @@ pub use state::GatewayState;
 /// Run the gateway HTTP server until `shutdown` resolves.
 ///
 /// Binds the configured listen address, attaches every defined route,
-/// and serves over plain HTTP. TLS termination is expected upstream
-/// (Caddy / nginx / Cloudflare) — the gateway never speaks TLS itself.
-/// This keeps the crate dependency-light and lets operators choose
-/// their own cert lifecycle.
+/// and serves over plain HTTP — unless `state.config.tls` is `Some`,
+/// in which case rustls termination is layered in front of the same
+/// router (see [`tls::serve_https`]). The default posture remains
+/// "TLS upstream"; native TLS is an opt-in feature for single-box
+/// installs that don't want to run a reverse proxy.
 ///
 /// # Errors
-/// Returns an error if the listener cannot bind, the daemon socket
-/// handshake fails, or the HTTP server crashes.
+/// Returns an error if the listener cannot bind, the rustls config
+/// can't be loaded (TLS path), the daemon socket handshake fails, or
+/// the HTTP server crashes.
 pub async fn run(
     state: Arc<GatewayState>,
     shutdown: impl Future<Output = ()> + Send + 'static,
@@ -82,11 +85,35 @@ pub async fn run(
             state.config.listen
         )
     })?;
+
+    if let Some(tls_cfg) = state.config.tls.as_ref() {
+        // TLS path: bind via axum-server, layer rustls in front of
+        // the same router. The plain-HTTP TcpListener::bind dance
+        // doesn't apply here — axum-server opens its own listener.
+        info!(addr = %addr, scheme = "https", "astrid-gateway listening (TLS)");
+        let rustls = tls::load_rustls_config(tls_cfg).await?;
+        let router = tls::apply_hsts(routes::build(state));
+        return tls::serve_https(addr, router, rustls, shutdown).await;
+    }
+
+    // Plain HTTP path — unchanged behaviour from v0.7.0. Warn loudly
+    // when the operator binds beyond loopback without enabling TLS,
+    // since that's almost always a misconfig: either the gateway is
+    // about to serve unencrypted traffic on the LAN/public, or
+    // there's a reverse proxy upstream that the operator should
+    // confirm is actually fronting plain TCP correctly.
+    if !addr.ip().is_loopback() {
+        tracing::warn!(
+            addr = %addr,
+            "gateway is binding a non-loopback address without TLS; ensure a TLS-terminating reverse proxy fronts this listener, or enable [tls] in gateway-http.toml"
+        );
+    }
+
     let listener = TcpListener::bind(addr)
         .await
         .with_context(|| format!("failed to bind gateway listener on {addr}"))?;
     let bound = listener.local_addr().unwrap_or(addr);
-    info!(addr = %bound, "astrid-gateway listening");
+    info!(addr = %bound, scheme = "http", "astrid-gateway listening");
 
     // Spawn the revocation watcher as soon as we know we have a live
     // bus. Detached: the task exits when the bus drops at daemon
