@@ -1,6 +1,6 @@
 //! Unit tests for [`super::connection_signal`] — the classifier that lets the
 //! connection tracker recognise both typed `IpcPayload::Connect`/`Disconnect`
-//! (native producers) and the `client.v1.connected`/`client.v1.disconnect`
+//! (native producers) and the `client.v1.connect`/`client.v1.disconnect`
 //! topics (uplink capsules, which can only publish JSON via the SDK).
 
 use astrid_events::ipc::IpcPayload;
@@ -10,7 +10,7 @@ use super::{ConnectionSignal, connection_signal};
 #[test]
 fn typed_connect_payload_opens() {
     assert_eq!(
-        connection_signal("client.v1.connected", &IpcPayload::Connect),
+        connection_signal("client.v1.connect", &IpcPayload::Connect),
         Some(ConnectionSignal::Opened)
     );
 }
@@ -43,7 +43,7 @@ fn connected_topic_with_json_payload_opens() {
     // variant is never present — the topic is the sole signal.
     let payload = IpcPayload::RawJson(serde_json::json!({ "principal": "alice" }));
     assert_eq!(
-        connection_signal("client.v1.connected", &payload),
+        connection_signal("client.v1.connect", &payload),
         Some(ConnectionSignal::Opened)
     );
 }
