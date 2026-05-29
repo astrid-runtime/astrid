@@ -13,6 +13,7 @@ use axum::routing::{delete, get, patch, post, put};
 use crate::state::GatewayState;
 
 pub mod agent;
+pub mod audit;
 pub mod auth;
 pub mod caps;
 pub mod capsules;
@@ -113,6 +114,8 @@ pub fn build(state: Arc<GatewayState>) -> Router {
         .route("/api/capsules/:id/env/:field", post(env::write_env))
         // ── Audit stream ──
         .route("/api/events", get(events::get_events))
+        // ── Audit history (paginated) ──
+        .route("/api/sys/audit", get(audit::get_audit))
         // ── Agent invocation (SSE) ──
         .route("/api/agent/prompt", post(agent::post_prompt))
         // ── System ──

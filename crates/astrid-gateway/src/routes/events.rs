@@ -35,8 +35,9 @@ use crate::state::GatewayState;
 pub const AUDIT_TOPIC: &str = "astrid.v1.audit.entry";
 /// Capability that lifts the per-principal filter and lets the
 /// caller see every audit entry. Operators (admin group `*`) hold
-/// it; regular agents do not.
-const AUDIT_FIREHOSE_CAP: &str = "audit:read_all";
+/// it; regular agents do not. Shared with the
+/// `GET /api/sys/audit` route in [`super::audit`].
+pub(super) const AUDIT_FIREHOSE_CAP: &str = "audit:read_all";
 
 /// `GET /api/events` — opens a long-lived Server-Sent Events
 /// stream. The connection stays open until the client disconnects
@@ -131,7 +132,11 @@ pub async fn get_events(
 /// `false` on any failure (parse error, bus unavailable) so the
 /// caller falls back to the safer per-principal filter rather than
 /// accidentally widening to the firehose.
-async fn caller_holds(state: &GatewayState, principal: &PrincipalId, capability: &str) -> bool {
+pub(super) async fn caller_holds(
+    state: &GatewayState,
+    principal: &PrincipalId,
+    capability: &str,
+) -> bool {
     use astrid_core::kernel_api::{AdminRequestKind, AdminResponseBody};
     let Ok(client) = state.admin_client(principal.clone()) else {
         return false;

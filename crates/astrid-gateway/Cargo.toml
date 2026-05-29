@@ -78,6 +78,7 @@ utoipa = { workspace = true }
 uuid = { workspace = true }
 
 [dev-dependencies]
+astrid-crypto = { workspace = true }
 tempfile = { workspace = true }
 
 [lints]

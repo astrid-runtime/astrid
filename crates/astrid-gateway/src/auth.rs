@@ -220,6 +220,8 @@ mod tests {
             revoked_at: std::sync::Arc::new(std::sync::RwLock::new(
                 std::collections::HashMap::new(),
             )),
+            audit_log: None,
+            session_id: None,
         })
     }
 
