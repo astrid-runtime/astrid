@@ -39,6 +39,8 @@ uuid = { workspace = true }
 
 [dev-dependencies]
 astrid-openclaw = { workspace = true }
+rcgen = { workspace = true }
+reqwest = { workspace = true }
 which = { workspace = true }
 
 [lints]
