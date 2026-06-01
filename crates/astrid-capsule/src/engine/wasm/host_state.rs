@@ -201,6 +201,26 @@ pub struct HostState {
     /// throughput, background processes, HTTP streams) read this through
     /// [`effective_profile`](Self::effective_profile). Cleared on exit.
     pub invocation_profile: Option<Arc<astrid_core::profile::PrincipalProfile>>,
+    /// Per-invocation env overlay for the invoking principal.
+    ///
+    /// Loaded from
+    /// `$ASTRID_HOME/home/{principal}/.config/env/{capsule_id}.env.json`
+    /// when the dispatcher establishes a per-invocation context whose
+    /// principal differs from the capsule's load-time principal.
+    /// `get_config` checks this overlay before falling back to
+    /// [`config`](Self::config) (the manifest defaults loaded at
+    /// capsule boot).
+    ///
+    /// Without this overlay, the gateway's
+    /// `POST /api/capsules/{id}/env/{field}` route — which writes to
+    /// the per-principal path above — was effectively write-only for
+    /// every principal other than `default`: the capsule's
+    /// `env::var(...)` reads still returned the manifest's
+    /// load-time default. Most visibly, an operator setting
+    /// `base_url = http://localhost:1234` on the openai-compat
+    /// capsule for a gateway-minted bearer would see their LLM
+    /// request still hit `api.openai.com` (the manifest default).
+    pub invocation_env_overlay: Option<HashMap<String, String>>,
     /// System Event Bus for IPC publish/subscribe.
     pub event_bus: astrid_events::EventBus,
     /// Rate limiter for IPC message publishing.
@@ -620,6 +640,7 @@ impl HostState {
         let Some(p) = invocation_principal else {
             self.invocation_kv = None;
             self.invocation_capsule_log = None;
+            self.invocation_env_overlay = None;
             return;
         };
 
@@ -637,6 +658,8 @@ impl HostState {
         };
 
         self.invocation_capsule_log = super::open_capsule_log(&p, self.capsule_id.as_str(), false);
+        self.invocation_env_overlay =
+            super::load_invocation_env_overlay(&p, self.capsule_id.as_str());
     }
 
     /// Tear down per-invocation context installed by
@@ -650,6 +673,7 @@ impl HostState {
         self.caller_context = None;
         self.invocation_kv = None;
         self.invocation_capsule_log = None;
+        self.invocation_env_overlay = None;
     }
 }
 

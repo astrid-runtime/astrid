@@ -36,6 +36,21 @@ impl sys::Host for HostState {
             return Ok(if value.is_empty() { None } else { Some(value) });
         }
 
+        // Per-invocation env overlay: operator-written values for the
+        // invoking principal, sourced from
+        // `<home>/.config/env/<capsule>.env.json`. Installed by
+        // `WasmEngine::invoke_interceptor` (and the recv-context
+        // installer) when the invoking principal differs from the
+        // capsule's load-time principal. Wins over `self.config`
+        // (manifest defaults) so the gateway's
+        // `POST /api/capsules/{id}/env/{field}` route is no longer
+        // write-only for non-default principals.
+        if let Some(overlay) = self.invocation_env_overlay.as_ref()
+            && let Some(value) = overlay.get(&key)
+        {
+            return Ok(Some(value.clone()));
+        }
+
         match self.config.get(&key) {
             None => Ok(None),
             Some(serde_json::Value::String(s)) => Ok(Some(s.clone())),
@@ -340,5 +355,77 @@ mod log_chain_tests {
         state.capsule_log = Some(log_file);
 
         state.log(LogLevel::Error, "post-poison line".into());
+    }
+}
+
+#[cfg(test)]
+mod get_config_tests {
+    use std::collections::HashMap;
+
+    use super::*;
+    use crate::engine::wasm::bindings::astrid::sys::host::Host as SysHost;
+    use crate::engine::wasm::test_fixtures::minimal_host_state;
+
+    fn make_host_state() -> crate::engine::wasm::host_state::HostState {
+        minimal_host_state(tokio::runtime::Handle::current())
+    }
+
+    /// Regression for the v0.7 smoke-test gap: the gateway's
+    /// `POST /api/capsules/{id}/env/{field}` route writes overrides
+    /// to `<home>/.config/env/<capsule>.env.json`, but the kernel's
+    /// `get_config` host-fn used to only consult the manifest
+    /// defaults loaded into `self.config` at capsule boot — so the
+    /// route was effectively write-only for any principal other
+    /// than the load-time owner. The smoking gun was openai-compat:
+    /// `base_url` overridden to `http://localhost:1234` (LM Studio)
+    /// for a gateway-minted bearer still hit `api.openai.com` (the
+    /// manifest default). With the per-invocation overlay wired in,
+    /// the override now wins.
+    #[tokio::test]
+    async fn overlay_value_wins_over_manifest_default() {
+        let mut state = make_host_state();
+        state.config.insert(
+            "base_url".into(),
+            serde_json::Value::String("https://api.openai.com".into()),
+        );
+
+        let mut overlay = HashMap::new();
+        overlay.insert("base_url".into(), "http://localhost:1234".into());
+        state.invocation_env_overlay = Some(overlay);
+
+        let value = state.get_config("base_url".into()).expect("host call");
+        assert_eq!(value.as_deref(), Some("http://localhost:1234"));
+    }
+
+    #[tokio::test]
+    async fn manifest_default_used_when_overlay_missing_key() {
+        let mut state = make_host_state();
+        state.config.insert(
+            "base_url".into(),
+            serde_json::Value::String("https://api.openai.com".into()),
+        );
+
+        // Overlay installed but missing `base_url` — must fall
+        // through to manifest defaults rather than returning None.
+        let mut overlay = HashMap::new();
+        overlay.insert("model".into(), "qwen3.5".into());
+        state.invocation_env_overlay = Some(overlay);
+
+        let value = state.get_config("base_url".into()).expect("host call");
+        assert_eq!(value.as_deref(), Some("https://api.openai.com"));
+    }
+
+    #[tokio::test]
+    async fn no_overlay_falls_back_to_manifest_default() {
+        let mut state = make_host_state();
+        state
+            .config
+            .insert("model".into(), serde_json::Value::String("gpt-5.4".into()));
+
+        // No overlay installed at all — single-tenant capsule load.
+        assert!(state.invocation_env_overlay.is_none());
+
+        let value = state.get_config("model".into()).expect("host call");
+        assert_eq!(value.as_deref(), Some("gpt-5.4"));
     }
 }

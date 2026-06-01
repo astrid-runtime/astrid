@@ -366,6 +366,51 @@ pub(crate) fn open_capsule_log(
     open_capsule_log_at(&astrid_home.principal_home(principal), capsule_name, prune)
 }
 
+/// Read the per-principal env overlay for a capsule.
+///
+/// Returns `Some(map)` only when the JSON file at
+/// `$ASTRID_HOME/home/{principal}/.config/env/{capsule_id}.env.json`
+/// exists and parses as a flat `HashMap<String, String>` (matching the
+/// shape the gateway's
+/// [`crate::routes::env::write_env`](../../gateway/src/routes/env.rs)
+/// writes through `text` / `select` / `array` fields and the kernel's
+/// own boot-time loader expects). Anything else — file missing,
+/// permission denied, malformed JSON, oversized file — returns `None`
+/// and lets [`HostState::get_config`] fall back to the manifest
+/// defaults in `self.config`.
+///
+/// Called from `WasmEngine::invoke_interceptor` (on dispatch) and from
+/// `HostState::install_recv_invocation_context` (on each fresh inbound
+/// principal in a run-loop subscription). Reading on every dispatch
+/// adds one `stat` + `read_to_string` per call — cheap relative to the
+/// surrounding wasmtime invocation, and the alternative (caching with
+/// invalidation on the gateway env-write path) would couple the host
+/// to a routing surface that's optional at boot. If profiling later
+/// shows this matters, swap in an LRU keyed by `(principal, capsule)`.
+///
+/// Defensive size cap: env files larger than 1 MiB are skipped. The
+/// gateway env-write path doesn't impose its own ceiling today;
+/// guarding against a runaway file keeps a misconfigured operator
+/// from blocking every interceptor dispatch on a slow read.
+pub(crate) fn load_invocation_env_overlay(
+    principal: &astrid_core::PrincipalId,
+    capsule_id: &str,
+) -> Option<std::collections::HashMap<String, String>> {
+    const MAX_ENV_FILE_BYTES: u64 = 1 << 20;
+    let astrid_home = astrid_core::dirs::AstridHome::resolve().ok()?;
+    let env_path = astrid_home
+        .principal_home(principal)
+        .env_dir()
+        .join(format!("{capsule_id}.env.json"));
+
+    let meta = std::fs::metadata(&env_path).ok()?;
+    if !meta.is_file() || meta.len() > MAX_ENV_FILE_BYTES {
+        return None;
+    }
+    let contents = std::fs::read_to_string(&env_path).ok()?;
+    serde_json::from_str::<std::collections::HashMap<String, String>>(&contents).ok()
+}
+
 /// Test-friendly core of [`open_capsule_log`]: open a log file under a
 /// fully-resolved [`PrincipalHome`], without touching any environment.
 fn open_capsule_log_at(
@@ -693,6 +738,7 @@ impl ExecutionEngine for WasmEngine {
                     invocation_secret_store: None,
                     invocation_capsule_log: None,
                     invocation_profile: None,
+                    invocation_env_overlay: None,
                     overlay_vfs: Some(overlay_vfs),
                     upper_dir: Some(Arc::new(upper_temp)),
                     kv,
@@ -1280,6 +1326,20 @@ impl ExecutionEngine for WasmEngine {
                     state.invocation_capsule_log =
                         open_capsule_log(p, state.capsule_id.as_str(), false);
 
+                    // Per-invocation env overlay: reads
+                    // `<home>/.config/env/<capsule>.env.json` so
+                    // `env::var(...)` calls inside this interceptor
+                    // see the invoking principal's operator-written
+                    // overrides instead of the load-time manifest
+                    // defaults. None on missing/malformed file — the
+                    // host falls back to `self.config` (the manifest
+                    // values loaded at capsule boot under the
+                    // load-time principal). See `host_state`'s
+                    // `invocation_env_overlay` doc + `host::sys::get_config`
+                    // for the read path.
+                    state.invocation_env_overlay =
+                        load_invocation_env_overlay(p, state.capsule_id.as_str());
+
                     // Per-invocation secret store: built against the
                     // invocation KV scope so both KV and keychain backends
                     // are principal-isolated. `build_secret_store`'s
@@ -1348,6 +1408,7 @@ impl ExecutionEngine for WasmEngine {
             state.invocation_secret_store = None;
             state.invocation_capsule_log = None;
             state.invocation_profile = None;
+            state.invocation_env_overlay = None;
         }
 
         // Map the typed CapsuleResult to InterceptResult.
@@ -1465,6 +1526,7 @@ pub fn run_lifecycle(
         invocation_secret_store: None,
         invocation_capsule_log: None,
         invocation_profile: None,
+        invocation_env_overlay: None,
         overlay_vfs: None,
         upper_dir: None,
         kv: cfg.kv,
