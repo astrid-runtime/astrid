@@ -1180,116 +1180,114 @@ impl ExecutionEngine for WasmEngine {
             }
         }
 
-        // Set per-invocation caller context, profile, KV, VFS, and
-        // epoch deadline under a single store lock. Recovers from
-        // poisoned mutex to prevent stale principal context from persisting.
-        {
+        // SET + CALL + CLEAR under a single store lock so a parallel
+        // chain dispatch can't observe another principal's
+        // `caller_context` between SET and CALL — the cross-principal
+        // race that #813 collapsed the orchestration cliff onto. The
+        // `ClearOnDrop` guard guarantees CLEAR runs even on early
+        // return from the typed-func lookup or a panic-unwind through
+        // the guest call, preserving the invariant that
+        // `caller_context = None` after every invoke.
+        //
+        // SAFETY: store.lock() held synchronously across the entire
+        // SET/CALL/CLEAR; no `.await` inside this block. Any future
+        // host-fn that takes the outer `Arc<Mutex<Store<HostState>>>`
+        // must not re-lock — current host fns receive `&mut
+        // Store<HostState>` directly from wasmtime and never touch
+        // the Arc, so re-entrancy is impossible today.
+        type HookTriggerResult = bindings::astrid::guest::lifecycle::CapsuleResult;
+
+        /// RAII guard: clears per-invocation context fields on drop so
+        /// CLEAR runs through every exit path (normal return, early
+        /// `?`, panic-unwind). `armed = false` after an explicit
+        /// `disarm()` avoids a double-clear if the caller already
+        /// cleared inline.
+        struct ClearOnDrop<'a> {
+            store: &'a mut wasmtime::Store<HostState>,
+            armed: bool,
+        }
+        impl<'a> ClearOnDrop<'a> {
+            fn new(store: &'a mut wasmtime::Store<HostState>) -> Self {
+                Self { store, armed: true }
+            }
+        }
+        impl Drop for ClearOnDrop<'_> {
+            fn drop(&mut self) {
+                if !self.armed {
+                    return;
+                }
+                let state = self.store.data_mut();
+                state.caller_context = None;
+                state.invocation_kv = None;
+                state.invocation_home = None;
+                state.invocation_tmp = None;
+                state.invocation_secret_store = None;
+                state.invocation_capsule_log = None;
+                state.invocation_profile = None;
+            }
+        }
+
+        let result = tokio::task::block_in_place(|| {
             let mut s = match store.lock() {
                 Ok(guard) => guard,
                 Err(poisoned) => {
                     tracing::error!(
-                        "Store lock poisoned during set; recovering to prevent \
+                        "Store lock poisoned during invoke; recovering to prevent \
                          principal context leak"
                     );
                     poisoned.into_inner()
                 },
             };
-            // Always apply a profile — when the cache didn't produce one
-            // (tests, no-cache builds), fall back to the process-global
-            // default. Doing this unconditionally keeps limits / deadline
-            // consistent across invocations regardless of cache presence
-            // and prevents a prior invocation's cap from leaking forward
-            // through any future refactor that drops an invocation's
-            // profile mid-flow.
+
+            // ── Phase 1: SET ──────────────────────────────────────
             let applied_profile: Arc<astrid_core::profile::PrincipalProfile> =
                 invocation_profile.clone().unwrap_or_else(|| {
                     Arc::new(astrid_core::profile::PrincipalProfile::default_ref().clone())
                 });
 
-            // Per-invocation epoch deadline for non-daemon capsules. The
-            // store's epoch deadline is configured on the `Store`, not
-            // inside `HostState`, so this call goes through the mutable
-            // store guard above rather than `state`.
             if !is_daemon {
                 let deadline = applied_profile.quotas.max_timeout_secs.saturating_mul(1000)
                     / EPOCH_TICK_INTERVAL.as_millis() as u64;
                 s.set_epoch_deadline(deadline);
             }
 
-            let state = s.data_mut();
-            state.caller_context = caller.cloned();
-            // Apply per-principal memory cap by rebuilding `StoreLimits`.
-            // The store's `limiter` callback reads this field on each
-            // `memory.grow`, so mutating in place takes effect for the
-            // upcoming call.
-            state.store_limits = wasmtime::StoreLimitsBuilder::new()
-                .memory_size(
-                    usize::try_from(applied_profile.quotas.max_memory_bytes).unwrap_or(usize::MAX),
-                )
-                .build();
-            state.invocation_profile = invocation_profile.clone();
+            {
+                let state = s.data_mut();
+                state.caller_context = caller.cloned();
+                state.store_limits = wasmtime::StoreLimitsBuilder::new()
+                    .memory_size(
+                        usize::try_from(applied_profile.quotas.max_memory_bytes)
+                            .unwrap_or(usize::MAX),
+                    )
+                    .build();
+                state.invocation_profile = invocation_profile.clone();
 
-            // Derive the invocation principal once; reused for KV + VFS scoping.
-            let invocation_principal: Option<astrid_core::PrincipalId> = caller
-                .and_then(|msg| msg.principal.as_deref())
-                .and_then(|p| astrid_core::PrincipalId::new(p).ok())
-                .filter(|p| *p != state.principal);
+                let invocation_principal: Option<astrid_core::PrincipalId> = caller
+                    .and_then(|msg| msg.principal.as_deref())
+                    .and_then(|p| astrid_core::PrincipalId::new(p).ok())
+                    .filter(|p| *p != state.principal);
 
-            // Dynamic KV scoping: if the invocation principal differs
-            // from the capsule's default, create a scoped KV store.
-            state.invocation_kv = invocation_principal.as_ref().and_then(|p| {
-                let ns = format!("{}:capsule:{}", p, state.capsule_id);
-                match state.kv.with_namespace(&ns) {
-                    Ok(kv) => Some(kv),
-                    Err(e) => {
-                        tracing::warn!(
-                            principal = %p,
-                            error = %e,
-                            "Failed to create invocation KV scope"
-                        );
-                        None
-                    },
-                }
-            });
+                state.invocation_kv = invocation_principal.as_ref().and_then(|p| {
+                    let ns = format!("{}:capsule:{}", p, state.capsule_id);
+                    match state.kv.with_namespace(&ns) {
+                        Ok(kv) => Some(kv),
+                        Err(e) => {
+                            tracing::warn!(
+                                principal = %p,
+                                error = %e,
+                                "Failed to create invocation KV scope"
+                            );
+                            None
+                        },
+                    }
+                });
 
-            // Dynamic home/tmp VFS scoping. Mirrors the KV pattern above:
-            // build a per-principal bundle if the invocation principal differs
-            // from the capsule's load-time principal, install the VFS + root
-            // handle + physical path on HostState, and clear them after the
-            // call returns. The bundle is intentionally built inline (no
-            // shared registry) because `HostVfs::new` + `DirHandle::new` +
-            // `register_dir` are lightweight; caching can be retrofitted later
-            // behind the same accessors if profiling shows it matters.
-            if let Some(ref p) = invocation_principal {
-                // VFS/log/secret builders below do blocking I/O (VFS
-                // `register_dir` via `block_on`, log `create_dir_all` + `open`,
-                // keychain probe inside `build_secret_store`). `invoke_interceptor`
-                // is called from async tasks (see `trigger_hook` fan-out), so
-                // wrap the blocking work in `block_in_place` to avoid stalling
-                // the tokio worker. Pruning is NOT performed here — that's
-                // load-time only (O(N) scan).
-                tokio::task::block_in_place(|| {
+                if let Some(ref p) = invocation_principal {
                     let bundle = build_principal_vfs_bundle(p);
                     state.invocation_home = bundle.home;
                     state.invocation_tmp = bundle.tmp;
-
-                    // Per-invocation capsule log: opens (or silently falls
-                    // back to None for unregistered principals) under the
-                    // invoking principal's home. Host `astrid_log` routes
-                    // through `effective_capsule_log()`.
                     state.invocation_capsule_log =
                         open_capsule_log(p, state.capsule_id.as_str(), false);
-
-                    // Per-invocation secret store: built against the
-                    // invocation KV scope so both KV and keychain backends
-                    // are principal-isolated. `build_secret_store`'s
-                    // capsule_id is the keychain service name; combining it
-                    // with the principal keeps keychain entries scoped even
-                    // when the same capsule serves multiple principals.
-                    // If the invocation KV scope couldn't be built we leave
-                    // this as `None`, which causes `effective_secret_store`
-                    // to fall back to the load-time store — same
-                    // degrade-safely behavior as the KV scoping above.
                     state.invocation_secret_store = state.invocation_kv.as_ref().map(|kv| {
                         astrid_storage::build_secret_store(
                             &format!("{}:{}", state.capsule_id, p),
@@ -1297,22 +1295,18 @@ impl ExecutionEngine for WasmEngine {
                             state.runtime_handle.clone(),
                         )
                     });
-                });
+                }
             }
-        }
 
-        // Call the typed Component Model export by name. With the per-export
-        // guest world split, `astrid-hook-trigger` only exists on capsules
-        // that actually implement it — the typed-func lookup returns
-        // `UnsupportedEntryPoint` for capsules that don't.
-        type HookTriggerResult = bindings::astrid::guest::lifecycle::CapsuleResult;
-        let result = tokio::task::block_in_place(|| {
-            let mut s = store
-                .lock()
-                .map_err(|e| CapsuleError::WasmError(format!("store lock poisoned: {e}")))?;
+            // Arm the RAII clear. From this point every exit (normal,
+            // `?` from typed-func lookup, panic-unwind through
+            // `func.call`) runs Phase 3.
+            let mut guard = ClearOnDrop::new(&mut s);
+
+            // ── Phase 2: CALL ─────────────────────────────────────
             let func = instance
                 .get_typed_func::<(String, Vec<u8>), (HookTriggerResult,)>(
-                    &mut *s,
+                    &mut *guard.store,
                     "astrid-hook-trigger",
                 )
                 .map_err(|e| {
@@ -1320,37 +1314,18 @@ impl ExecutionEngine for WasmEngine {
                         "capsule does not export `astrid-hook-trigger`: {e}"
                     ))
                 })?;
-            func.call(&mut *s, (action.to_string(), payload.to_vec()))
+            let call_result = func
+                .call(&mut *guard.store, (action.to_string(), payload.to_vec()))
                 .map(|(cr,)| cr)
-                .map_err(|e| CapsuleError::WasmError(format!("astrid_hook_trigger failed: {e:?}")))
+                .map_err(|e| CapsuleError::WasmError(format!("astrid_hook_trigger failed: {e:?}")));
+
+            // Phase 3 runs via `Drop for ClearOnDrop` as `guard`,
+            // `s`, and the closure all unwind. Leave `armed = true`
+            // so it executes whether `call_result` is Ok or Err.
+            let _ = &mut guard.armed;
+            call_result
         });
 
-        // Clear invocation context after call returns (success or error).
-        // Prevents stale principal/KV from leaking to any subsequent
-        // call path (tool execution, run-loop subscriptions).
-        // Recovers from poisoned mutex — principal isolation is critical.
-        {
-            let mut s = match store.lock() {
-                Ok(guard) => guard,
-                Err(poisoned) => {
-                    tracing::error!(
-                        "Store lock poisoned during post-invocation clear; \
-                         recovering to prevent principal context leak"
-                    );
-                    poisoned.into_inner()
-                },
-            };
-            let state = s.data_mut();
-            state.caller_context = None;
-            state.invocation_kv = None;
-            state.invocation_home = None;
-            state.invocation_tmp = None;
-            state.invocation_secret_store = None;
-            state.invocation_capsule_log = None;
-            state.invocation_profile = None;
-        }
-
-        // Map the typed CapsuleResult to InterceptResult.
         result.map(|cr| {
             crate::capsule::InterceptResult::from_capsule_result(&cr.action, cr.data.as_deref())
         })

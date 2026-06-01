@@ -22,6 +22,7 @@ astrid-workspace = { workspace = true }
 async-trait = { workspace = true }
 blake3 = { workspace = true }
 bytes = "1"
+metrics = { workspace = true }
 notify = "7"
 rand = { workspace = true }
 reqwest = { workspace = true }

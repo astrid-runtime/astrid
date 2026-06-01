@@ -283,6 +283,36 @@ fn dispatch_to_capsule_queues(
                 topic = %topic_clone,
                 "Dispatching interceptor (chain)"
             );
+            // Bound concurrent invokes of THIS capsule. The permit is
+            // re-acquired per chain step because each step is a separate
+            // `invoke_interceptor` call and Wasmtime Store contention is
+            // per-call; chains across distinct capsules don't share a
+            // permit pool. `acquire_owned()` only fails when the
+            // semaphore is closed (capsule unloaded); treat as benign
+            // and tear down the chain.
+            let wait_start = std::time::Instant::now();
+            let _permit = match capsule
+                .interceptor_semaphore()
+                .clone()
+                .acquire_owned()
+                .await
+            {
+                Ok(p) => p,
+                Err(_) => {
+                    debug!(
+                        capsule_id = %capsule.id(),
+                        "interceptor permit acquire failed (semaphore closed); \
+                         capsule likely unloading"
+                    );
+                    return;
+                },
+            };
+            metrics::histogram!(
+                "astrid_capsule_interceptor_permit_wait_seconds_total",
+                "capsule" => capsule.id().to_string(),
+            )
+            .record(wait_start.elapsed().as_secs_f64());
+
             let caller = ipc_clone.as_deref();
             match capsule.invoke_interceptor(action, &current_payload, caller) {
                 Ok(crate::capsule::InterceptResult::Continue(modified_payload)) => {
@@ -363,6 +393,33 @@ fn dispatch_single(
                     topic = %work.topic,
                     "Dispatching interceptor (ordered)"
                 );
+                // Bound concurrent invokes of THIS capsule. `continue`
+                // (not `return`) on a closed semaphore so a transient
+                // closure during hot-reload doesn't tear down the
+                // consumer loop for the replacement capsule.
+                let wait_start = std::time::Instant::now();
+                let _permit = match capsule
+                    .interceptor_semaphore()
+                    .clone()
+                    .acquire_owned()
+                    .await
+                {
+                    Ok(p) => p,
+                    Err(_) => {
+                        debug!(
+                            capsule_id = %capsule.id(),
+                            "interceptor permit acquire failed (semaphore closed); \
+                             capsule likely unloading"
+                        );
+                        continue;
+                    },
+                };
+                metrics::histogram!(
+                    "astrid_capsule_interceptor_permit_wait_seconds_total",
+                    "capsule" => capsule.id().to_string(),
+                )
+                .record(wait_start.elapsed().as_secs_f64());
+
                 let caller = work.ipc_message.as_deref();
                 match capsule.invoke_interceptor(&work.action, &work.payload, caller) {
                     Ok(crate::capsule::InterceptResult::Continue(_)) => {
@@ -466,477 +523,5 @@ async fn find_matching_interceptors(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    // ── Dispatch integration tests ──────────────────────────────────
-
-    use async_trait::async_trait;
-    use std::sync::Mutex;
-    use std::sync::atomic::{AtomicBool, Ordering};
-    use std::time::Duration;
-
-    use crate::capsule::{Capsule, CapsuleId, CapsuleState, InterceptResult};
-    use crate::context::CapsuleContext;
-    use crate::error::CapsuleResult;
-    use crate::manifest::{CapabilitiesDef, CapsuleManifest, InterceptorDef, PackageDef};
-    use astrid_events::ipc::IpcPayload;
-
-    /// A minimal mock capsule for dispatch tests.
-    struct MockCapsule {
-        id: CapsuleId,
-        manifest: CapsuleManifest,
-        invoked: Arc<AtomicBool>,
-        /// Optional shared log for recording invocation order across capsules.
-        invocation_log: Option<Arc<Mutex<Vec<String>>>>,
-        /// Override the default `Continue` result for testing chain semantics.
-        result_override: Option<InterceptResult>,
-    }
-
-    impl MockCapsule {
-        fn new(name: &str, interceptor_event: &str) -> (Self, Arc<AtomicBool>) {
-            Self::with_priority(name, interceptor_event, 100, None)
-        }
-
-        fn with_priority(
-            name: &str,
-            interceptor_event: &str,
-            priority: u32,
-            invocation_log: Option<Arc<Mutex<Vec<String>>>>,
-        ) -> (Self, Arc<AtomicBool>) {
-            let invoked = Arc::new(AtomicBool::new(false));
-            let manifest = CapsuleManifest {
-                package: PackageDef {
-                    name: name.to_string(),
-                    version: "0.0.1".to_string(),
-                    description: None,
-                    authors: Vec::new(),
-                    repository: None,
-                    homepage: None,
-                    documentation: None,
-                    license: None,
-                    license_file: None,
-                    readme: None,
-                    keywords: Vec::new(),
-                    categories: Vec::new(),
-                    astrid_version: None,
-                    publish: None,
-                    include: None,
-                    exclude: None,
-                    metadata: None,
-                },
-                components: Vec::new(),
-                imports: std::collections::HashMap::new(),
-                exports: std::collections::HashMap::new(),
-                capabilities: CapabilitiesDef::default(),
-                env: std::collections::HashMap::new(),
-                context_files: Vec::new(),
-                commands: Vec::new(),
-                mcp_servers: Vec::new(),
-                skills: Vec::new(),
-                uplinks: Vec::new(),
-                interceptors: vec![InterceptorDef {
-                    event: interceptor_event.to_string(),
-                    action: "test_action".to_string(),
-                    priority,
-                }],
-                topics: Vec::new(),
-                publishes: ::std::collections::HashMap::new(),
-                subscribes: ::std::collections::HashMap::new(),
-                tools: ::std::vec::Vec::new(),
-            };
-            let capsule = Self {
-                id: CapsuleId::from_static(name),
-                manifest,
-                invoked: Arc::clone(&invoked),
-                invocation_log,
-                result_override: None,
-            };
-            (capsule, invoked)
-        }
-    }
-
-    #[async_trait]
-    impl Capsule for MockCapsule {
-        fn id(&self) -> &CapsuleId {
-            &self.id
-        }
-        fn manifest(&self) -> &CapsuleManifest {
-            &self.manifest
-        }
-        fn state(&self) -> CapsuleState {
-            CapsuleState::Ready
-        }
-        async fn load(&mut self, _ctx: &CapsuleContext) -> CapsuleResult<()> {
-            Ok(())
-        }
-        async fn unload(&mut self) -> CapsuleResult<()> {
-            Ok(())
-        }
-        fn invoke_interceptor(
-            &self,
-            _action: &str,
-            _payload: &[u8],
-            _caller: Option<&astrid_events::ipc::IpcMessage>,
-        ) -> CapsuleResult<InterceptResult> {
-            self.invoked.store(true, Ordering::SeqCst);
-            if let Some(ref log) = self.invocation_log {
-                log.lock().unwrap().push(self.id.to_string());
-            }
-            if let Some(ref result) = self.result_override {
-                return Ok(result.clone());
-            }
-            Ok(InterceptResult::Continue(Vec::new()))
-        }
-    }
-
-    /// Helper: publish an IPC event on the bus.
-    fn publish_ipc(bus: &EventBus, topic: &str) {
-        let msg = astrid_events::ipc::IpcMessage::new(
-            topic,
-            IpcPayload::Custom {
-                data: serde_json::json!({}),
-            },
-            uuid::Uuid::nil(),
-        );
-        bus.publish(AstridEvent::Ipc {
-            metadata: astrid_events::EventMetadata::new("test"),
-            message: msg,
-        });
-    }
-
-    #[tokio::test]
-    async fn dispatch_routes_to_matching_interceptor() {
-        let (capsule, invoked) = MockCapsule::new("test-capsule", "test.topic");
-
-        let mut registry = CapsuleRegistry::new();
-        registry.register(Box::new(capsule)).unwrap();
-        let registry = Arc::new(RwLock::new(registry));
-
-        let bus = Arc::new(EventBus::with_capacity(64));
-        let dispatcher = EventDispatcher::new(Arc::clone(&registry), Arc::clone(&bus));
-        let handle = tokio::spawn(dispatcher.run());
-
-        // Yield to let the dispatcher subscribe before publishing.
-        tokio::task::yield_now().await;
-
-        publish_ipc(&bus, "test.topic");
-
-        // Give the dispatcher time to process.
-        tokio::time::sleep(Duration::from_millis(200)).await;
-
-        assert!(
-            invoked.load(Ordering::SeqCst),
-            "interceptor should have been invoked for matching topic"
-        );
-
-        handle.abort();
-    }
-
-    #[tokio::test]
-    async fn dispatch_skips_non_matching_topic() {
-        let (capsule, invoked) = MockCapsule::new("test-capsule-skip", "specific.topic");
-
-        let mut registry = CapsuleRegistry::new();
-        registry.register(Box::new(capsule)).unwrap();
-        let registry = Arc::new(RwLock::new(registry));
-
-        let bus = Arc::new(EventBus::with_capacity(64));
-        let dispatcher = EventDispatcher::new(Arc::clone(&registry), Arc::clone(&bus));
-        let handle = tokio::spawn(dispatcher.run());
-
-        tokio::task::yield_now().await;
-
-        publish_ipc(&bus, "other.topic");
-
-        tokio::time::sleep(Duration::from_millis(200)).await;
-
-        assert!(
-            !invoked.load(Ordering::SeqCst),
-            "interceptor should NOT have been invoked for non-matching topic"
-        );
-
-        handle.abort();
-    }
-
-    #[tokio::test]
-    async fn dispatch_concurrent_does_not_block() {
-        // Both capsules match different topics. With concurrent dispatch,
-        // the second event is processed immediately without waiting for
-        // the first interceptor to complete.
-        let (cap_a, invoked_a) = MockCapsule::new("capsule-a", "topic.a");
-        let (cap_b, invoked_b) = MockCapsule::new("capsule-b", "topic.b");
-
-        let mut registry = CapsuleRegistry::new();
-        registry.register(Box::new(cap_a)).unwrap();
-        registry.register(Box::new(cap_b)).unwrap();
-        let registry = Arc::new(RwLock::new(registry));
-
-        let bus = Arc::new(EventBus::with_capacity(64));
-        let dispatcher = EventDispatcher::new(Arc::clone(&registry), Arc::clone(&bus));
-        let handle = tokio::spawn(dispatcher.run());
-
-        tokio::task::yield_now().await;
-
-        publish_ipc(&bus, "topic.a");
-        publish_ipc(&bus, "topic.b");
-
-        tokio::time::sleep(Duration::from_millis(200)).await;
-
-        assert!(
-            invoked_a.load(Ordering::SeqCst),
-            "capsule-a interceptor should have been invoked"
-        );
-        assert!(
-            invoked_b.load(Ordering::SeqCst),
-            "capsule-b interceptor should have been invoked"
-        );
-
-        handle.abort();
-    }
-
-    #[tokio::test]
-    async fn dispatch_routes_lifecycle_events() {
-        // Lifecycle events are dispatched by event_type() as the topic.
-        let (capsule, invoked) =
-            MockCapsule::new("lifecycle-capsule", "astrid.v1.lifecycle.tool_call_started");
-
-        let mut registry = CapsuleRegistry::new();
-        registry.register(Box::new(capsule)).unwrap();
-        let registry = Arc::new(RwLock::new(registry));
-
-        let bus = Arc::new(EventBus::with_capacity(64));
-        let dispatcher = EventDispatcher::new(Arc::clone(&registry), Arc::clone(&bus));
-        let handle = tokio::spawn(dispatcher.run());
-
-        tokio::task::yield_now().await;
-
-        // Publish a lifecycle event
-        bus.publish(AstridEvent::ToolCallStarted {
-            metadata: astrid_events::EventMetadata::new("test"),
-            call_id: uuid::Uuid::nil(),
-            tool_name: "search".into(),
-            server_name: None,
-        });
-
-        tokio::time::sleep(Duration::from_millis(200)).await;
-
-        assert!(
-            invoked.load(Ordering::SeqCst),
-            "EventDispatcher should dispatch lifecycle events by event_type()"
-        );
-
-        handle.abort();
-    }
-
-    #[tokio::test]
-    async fn dispatch_publishes_lag_event_on_overflow() {
-        // Use a tiny bus capacity so publishing more events than capacity triggers lag.
-        let bus = Arc::new(EventBus::with_capacity(2));
-
-        // A capsule that listens for lag events.
-        let (lag_capsule, _lag_invoked) =
-            MockCapsule::new("lag-listener", "astrid.v1.event_bus.lagged");
-
-        let mut registry = CapsuleRegistry::new();
-        registry.register(Box::new(lag_capsule)).unwrap();
-        let registry = Arc::new(RwLock::new(registry));
-
-        let dispatcher = EventDispatcher::new(Arc::clone(&registry), Arc::clone(&bus));
-        let handle = tokio::spawn(dispatcher.run());
-
-        tokio::task::yield_now().await;
-
-        // Flood the bus to trigger lag (the dispatcher's receiver has capacity 2,
-        // so publishing many events quickly should cause overflow).
-        for i in 0..20 {
-            publish_ipc(&bus, &format!("flood.event.{i}"));
-        }
-
-        tokio::time::sleep(Duration::from_millis(500)).await;
-
-        // If lag was detected, the dispatcher should have published
-        // astrid.v1.event_bus.lagged which routes to our lag-listener capsule.
-        // Note: this test may not trigger lag on fast machines where the
-        // dispatcher drains fast enough. That's acceptable - the test
-        // validates the wiring, not the race condition.
-        // We just verify no panics occurred and the dispatcher is still running.
-        assert!(!handle.is_finished(), "dispatcher should still be running");
-        handle.abort();
-    }
-
-    #[test]
-    fn mock_capsule_check_health_returns_ready() {
-        let (capsule, _) = MockCapsule::new("health-test", "test.topic");
-        assert_eq!(capsule.check_health(), CapsuleState::Ready);
-    }
-
-    #[tokio::test]
-    async fn dispatch_respects_interceptor_priority_order() {
-        // Three capsules intercept the same topic with different priorities.
-        // Priority 10 (guard) should fire before 50 (transform) before 100 (handler).
-        let order = Arc::new(Mutex::new(Vec::<String>::new()));
-
-        let (guard, _) =
-            MockCapsule::with_priority("guard", "shared.topic", 10, Some(Arc::clone(&order)));
-        let (handler, _) =
-            MockCapsule::with_priority("handler", "shared.topic", 100, Some(Arc::clone(&order)));
-        let (transform, _) =
-            MockCapsule::with_priority("transform", "shared.topic", 50, Some(Arc::clone(&order)));
-
-        let mut registry = CapsuleRegistry::new();
-        // Register in non-priority order to prove sorting works.
-        registry.register(Box::new(handler)).unwrap();
-        registry.register(Box::new(guard)).unwrap();
-        registry.register(Box::new(transform)).unwrap();
-        let registry = Arc::new(RwLock::new(registry));
-
-        let bus = Arc::new(EventBus::with_capacity(64));
-        let dispatcher = EventDispatcher::new(Arc::clone(&registry), Arc::clone(&bus));
-        let handle = tokio::spawn(dispatcher.run());
-
-        tokio::task::yield_now().await;
-
-        publish_ipc(&bus, "shared.topic");
-
-        tokio::time::sleep(Duration::from_millis(300)).await;
-
-        let recorded = order.lock().unwrap().clone();
-        assert_eq!(
-            recorded,
-            vec!["guard", "transform", "handler"],
-            "interceptors must fire in priority order (lower first)"
-        );
-
-        handle.abort();
-    }
-
-    #[tokio::test]
-    async fn find_matching_interceptors_sorts_by_priority() {
-        // Unit test for find_matching_interceptors directly.
-        let (low, _) = MockCapsule::with_priority("low-pri", "test.event", 10, None);
-        let (high, _) = MockCapsule::with_priority("high-pri", "test.event", 200, None);
-        let (mid, _) = MockCapsule::with_priority("mid-pri", "test.event", 50, None);
-
-        let mut registry = CapsuleRegistry::new();
-        registry.register(Box::new(high)).unwrap();
-        registry.register(Box::new(low)).unwrap();
-        registry.register(Box::new(mid)).unwrap();
-        let registry = Arc::new(RwLock::new(registry));
-
-        let matches = find_matching_interceptors(&registry, "test.event").await;
-        let names: Vec<&str> = matches.iter().map(|(c, _)| c.id().as_str()).collect();
-        assert_eq!(
-            names,
-            vec!["low-pri", "mid-pri", "high-pri"],
-            "find_matching_interceptors must return results sorted by priority"
-        );
-    }
-
-    #[tokio::test]
-    async fn deny_interceptor_short_circuits_chain() {
-        // Guard at priority 10 denies, handler at priority 100 should never fire.
-        let order = Arc::new(Mutex::new(Vec::<String>::new()));
-
-        let (mut guard, _) =
-            MockCapsule::with_priority("guard", "shared.topic", 10, Some(Arc::clone(&order)));
-        guard.result_override = Some(InterceptResult::Deny {
-            reason: "blocked by guard".into(),
-        });
-
-        let (handler, invoked_handler) =
-            MockCapsule::with_priority("handler", "shared.topic", 100, Some(Arc::clone(&order)));
-
-        let mut registry = CapsuleRegistry::new();
-        registry.register(Box::new(handler)).unwrap();
-        registry.register(Box::new(guard)).unwrap();
-        let registry = Arc::new(RwLock::new(registry));
-
-        let bus = Arc::new(EventBus::with_capacity(64));
-        let dispatcher = EventDispatcher::new(Arc::clone(&registry), Arc::clone(&bus));
-        let handle = tokio::spawn(dispatcher.run());
-
-        tokio::task::yield_now().await;
-
-        publish_ipc(&bus, "shared.topic");
-
-        tokio::time::sleep(Duration::from_millis(300)).await;
-
-        let recorded = order.lock().unwrap().clone();
-        assert_eq!(
-            recorded,
-            vec!["guard"],
-            "only the guard should have fired — handler should be short-circuited"
-        );
-        assert!(
-            !invoked_handler.load(Ordering::SeqCst),
-            "handler must NOT be invoked after Deny"
-        );
-
-        handle.abort();
-    }
-
-    #[tokio::test]
-    async fn final_interceptor_short_circuits_chain() {
-        // Cache at priority 30 returns Final, core at priority 100 should never fire.
-        let order = Arc::new(Mutex::new(Vec::<String>::new()));
-
-        let (mut cache, _) =
-            MockCapsule::with_priority("cache", "shared.topic", 30, Some(Arc::clone(&order)));
-        cache.result_override = Some(InterceptResult::Final(b"cached response".to_vec()));
-
-        let (core, invoked_core) =
-            MockCapsule::with_priority("core", "shared.topic", 100, Some(Arc::clone(&order)));
-
-        let mut registry = CapsuleRegistry::new();
-        registry.register(Box::new(core)).unwrap();
-        registry.register(Box::new(cache)).unwrap();
-        let registry = Arc::new(RwLock::new(registry));
-
-        let bus = Arc::new(EventBus::with_capacity(64));
-        let dispatcher = EventDispatcher::new(Arc::clone(&registry), Arc::clone(&bus));
-        let handle = tokio::spawn(dispatcher.run());
-
-        tokio::task::yield_now().await;
-
-        publish_ipc(&bus, "shared.topic");
-
-        tokio::time::sleep(Duration::from_millis(300)).await;
-
-        let recorded = order.lock().unwrap().clone();
-        assert_eq!(
-            recorded,
-            vec!["cache"],
-            "only the cache should have fired — core should be short-circuited"
-        );
-        assert!(
-            !invoked_core.load(Ordering::SeqCst),
-            "core must NOT be invoked after Final"
-        );
-
-        handle.abort();
-    }
-
-    #[test]
-    fn intercept_result_from_guest_bytes() {
-        // Empty = Continue
-        let r = InterceptResult::from_guest_bytes(vec![]);
-        assert!(matches!(r, InterceptResult::Continue(ref b) if b.is_empty()));
-
-        // 0x00 + payload = Continue
-        let r = InterceptResult::from_guest_bytes(vec![0x00, 1, 2, 3]);
-        assert!(matches!(r, InterceptResult::Continue(ref b) if b == &[1, 2, 3]));
-
-        // 0x01 + payload = Final
-        let r = InterceptResult::from_guest_bytes(vec![0x01, 4, 5]);
-        assert!(matches!(r, InterceptResult::Final(ref b) if b == &[4, 5]));
-
-        // 0x02 + reason = Deny
-        let r = InterceptResult::from_guest_bytes(vec![0x02, b'n', b'o']);
-        assert!(matches!(r, InterceptResult::Deny { ref reason } if reason == "no"));
-
-        // Unknown discriminant = Continue with full bytes
-        let r = InterceptResult::from_guest_bytes(vec![0xFF, 1]);
-        assert!(matches!(r, InterceptResult::Continue(ref b) if b == &[0xFF, 1]));
-    }
-}
+#[path = "dispatcher_tests.rs"]
+mod tests;

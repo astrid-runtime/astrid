@@ -340,7 +340,7 @@ impl EventReceiver {
                     }
                 },
                 Err(broadcast::error::RecvError::Lagged(count)) => {
-                    warn!(skipped = count, "Event receiver lagged, events dropped");
+                    tracing::error!(target: "astrid.bus", security_event = true, skipped = count, subscriber = self.subscriber, "Event receiver lagged, events dropped");
                     self.lagged_count = self.lagged_count.saturating_add(count);
                     metrics::counter!(
                         METRIC_BUS_RECEIVER_LAGGED_TOTAL,
