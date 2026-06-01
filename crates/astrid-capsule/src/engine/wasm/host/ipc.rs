@@ -600,9 +600,16 @@ impl HostSubscription for HostState {
             rep,
         );
 
-        match drain.messages.first() {
-            Some(first) => self.install_recv_invocation_context(first),
-            None => self.clear_recv_invocation_context(),
+        // Empty drains keep the prior caller context. A run-loop
+        // capsule (prompt-builder, registry) frequently dispatches
+        // its own follow-up publishes between recvs — e.g. fetching
+        // session messages after a hook fan-out timed out. Clearing
+        // here would force those follow-up publishes to fall back
+        // to the capsule's load-time principal, which silently
+        // flipped the orchestration chain to `default` mid-flow
+        // under any non-default caller.
+        if let Some(first) = drain.messages.first() {
+            self.install_recv_invocation_context(first);
         }
 
         let count = drain.messages.len() as u64;
@@ -711,9 +718,10 @@ impl HostSubscription for HostState {
             rep,
         );
 
-        match drain.messages.first() {
-            Some(first) => self.install_recv_invocation_context(first),
-            None => self.clear_recv_invocation_context(),
+        // Empty drains keep the prior caller context (see the
+        // matching note above `poll`'s drain).
+        if let Some(first) = drain.messages.first() {
+            self.install_recv_invocation_context(first);
         }
 
         let count = drain.messages.len() as u64;

@@ -140,6 +140,18 @@ pub struct HostState {
     pub capsule_log: Option<Arc<std::sync::Mutex<std::fs::File>>>,
     /// Context of the current caller (set per-invocation by the dispatcher).
     pub caller_context: Option<astrid_events::ipc::IpcMessage>,
+    /// `true` while a kernel-dispatched interceptor is executing.
+    ///
+    /// Set by `WasmEngine::invoke_interceptor` around the typed-func
+    /// call and read by `install_recv_invocation_context` to detect
+    /// that `caller_context` is owned by the *outer* interceptor
+    /// invocation, not by recv. Without this flag a nested
+    /// `ipc::recv` that drained a message from a different publisher
+    /// would rewrite the interceptor's caller — making subsequent
+    /// `publish_json` calls stamp the wrong principal. The outer
+    /// invocation's principal owns every outbound publish for the
+    /// duration of the interceptor.
+    pub interceptor_active: bool,
     /// The unique session UUID for this plugin's execution state.
     pub capsule_uuid: uuid::Uuid,
     /// Workspace root directory (file operations are confined here).
@@ -201,6 +213,26 @@ pub struct HostState {
     /// throughput, background processes, HTTP streams) read this through
     /// [`effective_profile`](Self::effective_profile). Cleared on exit.
     pub invocation_profile: Option<Arc<astrid_core::profile::PrincipalProfile>>,
+    /// Per-invocation env overlay for the invoking principal.
+    ///
+    /// Loaded from
+    /// `$ASTRID_HOME/home/{principal}/.config/env/{capsule_id}.env.json`
+    /// when the dispatcher establishes a per-invocation context whose
+    /// principal differs from the capsule's load-time principal.
+    /// `get_config` checks this overlay before falling back to
+    /// [`config`](Self::config) (the manifest defaults loaded at
+    /// capsule boot).
+    ///
+    /// Without this overlay, the gateway's
+    /// `POST /api/capsules/{id}/env/{field}` route — which writes to
+    /// the per-principal path above — was effectively write-only for
+    /// every principal other than `default`: the capsule's
+    /// `env::var(...)` reads still returned the manifest's
+    /// load-time default. Most visibly, an operator setting
+    /// `base_url = http://localhost:1234` on the openai-compat
+    /// capsule for a gateway-minted bearer would see their LLM
+    /// request still hit `api.openai.com` (the manifest default).
+    pub invocation_env_overlay: Option<HashMap<String, String>>,
     /// System Event Bus for IPC publish/subscribe.
     pub event_bus: astrid_events::EventBus,
     /// Rate limiter for IPC message publishing.
@@ -597,6 +629,17 @@ impl HostState {
         // re-opening the namespace and log file. The chat-stack run
         // loop calls this on every recv tick — re-init each time
         // burns I/O and allocations for no behavioural change.
+        // An interceptor's caller is owned by the dispatch path
+        // (`WasmEngine::invoke_interceptor`), not by recv. Nested
+        // `ipc::recv` calls inside an interceptor must NOT overwrite
+        // it — otherwise a recv'd message from a different publisher
+        // (or the empty-batch clear path below) would silently flip
+        // every subsequent `publish_json` away from the principal the
+        // interceptor was dispatched under.
+        if self.interceptor_active {
+            return;
+        }
+
         let new_principal = msg.principal.clone();
         let existing_principal = self
             .caller_context
@@ -620,6 +663,7 @@ impl HostState {
         let Some(p) = invocation_principal else {
             self.invocation_kv = None;
             self.invocation_capsule_log = None;
+            self.invocation_env_overlay = None;
             return;
         };
 
@@ -637,19 +681,8 @@ impl HostState {
         };
 
         self.invocation_capsule_log = super::open_capsule_log(&p, self.capsule_id.as_str(), false);
-    }
-
-    /// Tear down per-invocation context installed by
-    /// [`install_recv_invocation_context`](Self::install_recv_invocation_context).
-    ///
-    /// Called on empty `ipc_poll` / `ipc_recv` returns so a previous
-    /// publisher's context doesn't leak into subsequent guest host
-    /// calls (KV reads, publishes) that happen before the next recv
-    /// pulls fresh state.
-    pub(crate) fn clear_recv_invocation_context(&mut self) {
-        self.caller_context = None;
-        self.invocation_kv = None;
-        self.invocation_capsule_log = None;
+        self.invocation_env_overlay =
+            super::load_invocation_env_overlay(&p, self.capsule_id.as_str());
     }
 }
 
