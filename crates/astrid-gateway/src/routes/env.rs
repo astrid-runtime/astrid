@@ -257,7 +257,22 @@ fn load_env_schema(capsule_id: &str) -> GatewayResult<HashMap<String, EnvFieldSc
             )));
         },
     };
-    let parsed: toml::Value = toml::from_str(&text)
+    parse_env_schema_from_toml(&text)
+}
+
+/// Parse the `[env]` subtable out of a Capsule.toml text. Extracted
+/// from [`load_env_schema`] so unit tests can exercise the parser
+/// directly without a filesystem round-trip.
+///
+/// The TOML key for the field type is `type` (canonical: see
+/// `astrid-capsule`'s `EnvDef` which serializes
+/// `env_type` as `type`). Reading the wrong key here historically
+/// caused every field to fall back to the `"text"` default — including
+/// `type = "secret"` fields, which then bypassed
+/// [`astrid_storage::FileSecretStore`] and landed in plaintext env
+/// JSON via [`write_env`]'s `"text"` arm.
+fn parse_env_schema_from_toml(text: &str) -> GatewayResult<HashMap<String, EnvFieldSchema>> {
+    let parsed: toml::Value = toml::from_str(text)
         .map_err(|e| GatewayError::Internal(anyhow::anyhow!("parse Capsule.toml: {e}")))?;
     let env_tbl = parsed
         .get("env")
@@ -273,7 +288,7 @@ fn load_env_schema(capsule_id: &str) -> GatewayResult<HashMap<String, EnvFieldSc
         // whole load on one weird field).
         let Some(tbl) = val.as_table() else { continue };
         let env_type = tbl
-            .get("env_type")
+            .get("type")
             .and_then(toml::Value::as_str)
             .unwrap_or("text")
             .to_string();
@@ -455,5 +470,58 @@ mod tests {
         assert_eq!(a, b);
         assert_ne!(a, c);
         assert_eq!(a.len(), 64);
+    }
+
+    #[test]
+    fn parse_env_schema_reads_type_key() {
+        // Regression: the loader used to read `env_type`, but Capsule.toml
+        // [env] subtables use `type` (canonical, matches astrid-capsule's
+        // EnvDef serde rename). Reading the wrong key silently downgraded
+        // every `type = "secret"` field to the `"text"` default, routing
+        // secrets through plaintext JSON instead of the FileSecretStore.
+        let toml = r#"
+[env]
+api_key = { type = "secret", request = "Enter API key" }
+"#;
+        let fields = parse_env_schema_from_toml(toml).expect("parse");
+        let api_key = fields.get("api_key").expect("api_key present");
+        assert_eq!(
+            api_key.env_type, "secret",
+            "api_key declared as type=\"secret\" must surface as env_type=\"secret\" \
+             so write_env routes it to FileSecretStore, not plaintext env JSON"
+        );
+    }
+
+    #[test]
+    fn parse_env_schema_falls_back_to_text_when_type_absent() {
+        let toml = r#"
+[env]
+debug = { description = "no explicit type" }
+"#;
+        let fields = parse_env_schema_from_toml(toml).expect("parse");
+        assert_eq!(fields.get("debug").expect("debug present").env_type, "text");
+    }
+
+    #[test]
+    fn parse_env_schema_matches_openai_compat_shape() {
+        // Pinned against the openai-compat capsule's actual manifest as
+        // of the time this regression was discovered. If the shape
+        // changes upstream (e.g. capsule authors normalize to
+        // text/secret/select/array per EnvDef's documented enum), this
+        // test will surface it and we can update intentionally.
+        let toml = r#"
+[env]
+api_key = { type = "secret", request = "Enter your API key", placeholder = "sk-..." }
+base_url = { type = "string", request = "Enter the API base URL", default = "https://api.openai.com" }
+model = { type = "string", default = "gpt-5.4" }
+"#;
+        let fields = parse_env_schema_from_toml(toml).expect("parse");
+        assert_eq!(fields.get("api_key").unwrap().env_type, "secret");
+        assert_eq!(fields.get("base_url").unwrap().env_type, "string");
+        assert_eq!(fields.get("model").unwrap().env_type, "string");
+        assert_eq!(
+            fields.get("api_key").unwrap().placeholder.as_deref(),
+            Some("sk-...")
+        );
     }
 }
