@@ -355,6 +355,9 @@ impl EventReceiver {
                     tokio::task::yield_now().await;
                     #[cfg(target_os = "wasi")]
                     std::hint::spin_loop();
+                    // Just yielded — reset so the next non-matching event can't
+                    // trigger an immediate back-to-back yield.
+                    skipped = 0;
                 },
                 Err(broadcast::error::RecvError::Closed) => return None,
             }
