@@ -11,6 +11,16 @@ use crate::subscriber::SubscriberRegistry;
 /// Default channel capacity for the event bus.
 pub(crate) const DEFAULT_CHANNEL_CAPACITY: usize = 1024;
 
+/// How many consecutive non-matching events a topic-filtered subscriber may
+/// drain before yielding to the scheduler. A subscriber filtering a backlog
+/// under a broadcast storm would otherwise hold its worker for this many
+/// synchronous iterations (`broadcast::recv` returns buffered items without
+/// awaiting). Kept small to bound that monopolization, but not 1 — yielding on
+/// every event would slow the drain enough to risk self-induced lag. Normal
+/// operation rarely reaches it: `recv().await` parks between events when the
+/// channel isn't backlogged.
+const YIELD_AFTER_SKIPPED: usize = 32;
+
 /// Counter: events published to the bus, labelled by the bounded
 /// `event_kind` (`AstridEvent::event_type`, a closed `&'static str` set).
 pub(crate) const METRIC_BUS_EVENTS_PUBLISHED_TOTAL: &str = "astrid_bus_events_published_total";
@@ -317,8 +327,12 @@ impl EventReceiver {
                     if self.matches(&event) {
                         return Some(event);
                     }
+                    // Filtered-out event. Yield every `YIELD_AFTER_SKIPPED`
+                    // non-matching events so a subscriber draining a backlog
+                    // under a broadcast storm can't hold the worker for an
+                    // unbounded synchronous run.
                     skipped = skipped.wrapping_add(1);
-                    if skipped.is_multiple_of(100) {
+                    if skipped.is_multiple_of(YIELD_AFTER_SKIPPED) {
                         #[cfg(not(target_os = "wasi"))]
                         tokio::task::yield_now().await;
                         #[cfg(target_os = "wasi")]
@@ -333,7 +347,17 @@ impl EventReceiver {
                         "subscriber" => self.subscriber,
                     )
                     .increment(count);
-                    // Continue receiving
+                    // A lag means the broadcast buffer overran this receiver —
+                    // i.e. a storm is in progress. Yield before catching up so
+                    // the catch-up doesn't monopolize the worker at the worst
+                    // possible moment.
+                    #[cfg(not(target_os = "wasi"))]
+                    tokio::task::yield_now().await;
+                    #[cfg(target_os = "wasi")]
+                    std::hint::spin_loop();
+                    // Just yielded — reset so the next non-matching event can't
+                    // trigger an immediate back-to-back yield.
+                    skipped = 0;
                 },
                 Err(broadcast::error::RecvError::Closed) => return None,
             }
