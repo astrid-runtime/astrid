@@ -724,6 +724,7 @@ impl ExecutionEngine for WasmEngine {
                     principal: ctx.principal.clone(),
                     capsule_uuid,
                     caller_context: None,
+                    interceptor_active: false,
                     invocation_kv: None,
                     capsule_log,
                     capsule_id: crate::capsule::CapsuleId::new(&manifest.package.name)
@@ -1264,6 +1265,12 @@ impl ExecutionEngine for WasmEngine {
 
             let state = s.data_mut();
             state.caller_context = caller.cloned();
+            // Mark the interceptor as active so any nested `ipc::recv`
+            // inside the handler (e.g. prompt-builder waiting on plugin
+            // hook responses) cannot wipe or rewrite `caller_context`
+            // from its empty / cross-publisher batches. See the field
+            // doc on `interceptor_active` for the full rationale.
+            state.interceptor_active = true;
             // Apply per-principal memory cap by rebuilding `StoreLimits`.
             // The store's `limiter` callback reads this field on each
             // `memory.grow`, so mutating in place takes effect for the
@@ -1402,6 +1409,7 @@ impl ExecutionEngine for WasmEngine {
             };
             let state = s.data_mut();
             state.caller_context = None;
+            state.interceptor_active = false;
             state.invocation_kv = None;
             state.invocation_home = None;
             state.invocation_tmp = None;
@@ -1513,6 +1521,7 @@ pub fn run_lifecycle(
         principal: astrid_core::PrincipalId::default(),
         capsule_uuid: uuid::Uuid::new_v4(),
         caller_context: None,
+        interceptor_active: false,
         invocation_kv: None,
         capsule_log: None,
         capsule_id: cfg.capsule_id.clone(),

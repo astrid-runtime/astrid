@@ -302,3 +302,58 @@ fn effective_principal_prefers_caller_over_owner() {
     }
     assert_eq!(state.effective_principal(), owner);
 }
+
+/// Regression for the prompt-pipeline stall investigated under
+/// the v0.7 smoke test: nested `ipc::recv` inside an interceptor
+/// (e.g. prompt-builder waiting on plugin hook responses) used to
+/// reinstall the outer caller from whatever the recv drained,
+/// silently flipping the orchestration chain
+/// (react → prompt-builder → router → provider) to the inner
+/// publisher's principal mid-flow. The fix marks the invocation as
+/// `interceptor_active` and short-circuits
+/// `install_recv_invocation_context` — the interceptor's caller is
+/// owned by the dispatcher, not by recv. The companion empty-recv
+/// clear path is removed at the call site (see `host/ipc.rs::poll`
+/// and `recv`): empty drains keep the prior caller context so
+/// follow-up publishes between recvs stamp the correct principal.
+#[test]
+fn install_recv_invocation_context_preserves_outer_caller_inside_interceptor() {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap();
+    let mut state = minimal_host_state(rt.handle().clone());
+    let alice = astrid_core::PrincipalId::new("alice").expect("valid alice");
+    let bob = astrid_core::PrincipalId::new("bob").expect("valid bob");
+
+    // Interceptor was dispatched under alice; mid-execution it polls
+    // a subscription and gets back a message published by bob. The
+    // outer caller (alice) owns outbound stamping for this
+    // invocation — bob's message must not overwrite it.
+    let outer = astrid_events::ipc::IpcMessage::new(
+        "user.v1.prompt",
+        astrid_events::ipc::IpcPayload::RawJson(serde_json::json!({})),
+        uuid::Uuid::new_v4(),
+    )
+    .with_principal(alice.to_string());
+    state.caller_context = Some(outer);
+    state.interceptor_active = true;
+
+    let inner = astrid_events::ipc::IpcMessage::new(
+        "some.v1.event",
+        astrid_events::ipc::IpcPayload::RawJson(serde_json::json!({})),
+        uuid::Uuid::new_v4(),
+    )
+    .with_principal(bob.to_string());
+
+    state.install_recv_invocation_context(&inner);
+
+    assert_eq!(
+        state
+            .caller_context
+            .as_ref()
+            .and_then(|c| c.principal.clone())
+            .as_deref(),
+        Some("alice"),
+        "Nested recv inside interceptor must not rewrite the outer caller"
+    );
+}

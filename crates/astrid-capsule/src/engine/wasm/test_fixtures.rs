@@ -78,6 +78,7 @@ pub(crate) fn minimal_host_state(rt: tokio::runtime::Handle) -> HostState {
         principal: astrid_core::PrincipalId::default(),
         capsule_uuid: uuid::Uuid::new_v4(),
         caller_context: None,
+        interceptor_active: false,
         invocation_kv: None,
         capsule_log: None,
         capsule_id: CapsuleId::from_static("test"),
