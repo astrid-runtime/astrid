@@ -48,8 +48,16 @@ jobs:
         with:
           node-version: "22"
 
-      - name: Cache Rust build
-        uses: Swatinem/rust-cache@v2
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
 
       - name: Run cargo check
         run: cargo check --workspace --all-features
@@ -91,8 +99,16 @@ jobs:
         with:
           node-version: "22"
 
-      - name: Cache Rust build
-        uses: Swatinem/rust-cache@v2
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
 
       - name: Run clippy
         run: cargo clippy --workspace --all-features -- -D warnings
@@ -119,8 +135,16 @@ jobs:
         with:
           node-version: "22"
 
-      - name: Cache Rust build
-        uses: Swatinem/rust-cache@v2
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
 
       - name: Cache QuickJS kernel
         uses: actions/cache@v4
@@ -156,8 +180,16 @@ jobs:
         with:
           node-version: "22"
 
-      - name: Cache Rust build
-        uses: Swatinem/rust-cache@v2
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-msrv-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-msrv-
 
       - name: Check MSRV compiles
         run: cargo check --workspace
