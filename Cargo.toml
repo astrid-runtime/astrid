@@ -11,6 +11,7 @@ members = [
     "crates/astrid-config",
     "crates/astrid-daemon",
     "crates/astrid-core",
+    "crates/astrid-emit",
     "crates/astrid-crypto",
     "crates/astrid-events",
     "crates/astrid-types",
@@ -47,6 +48,7 @@ astrid-config = { path = "crates/astrid-config", version = "0.7.0" }
 astrid-daemon = { path = "crates/astrid-daemon", version = "0.7.0" }
 astrid-core = { path = "crates/astrid-core", version = "0.7.0" }
 astrid-crypto = { path = "crates/astrid-crypto", version = "0.7.0" }
+astrid-emit = { path = "crates/astrid-emit", version = "0.7.0" }
 astrid-events = { path = "crates/astrid-events", version = "0.7.0" }
 astrid-hooks = { path = "crates/astrid-hooks", version = "0.7.0" }
 astrid-kernel = { path = "crates/astrid-kernel", version = "0.7.0" }

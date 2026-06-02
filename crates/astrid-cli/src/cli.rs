@@ -67,6 +67,14 @@ pub(crate) struct Cli {
     #[arg(long = "tui-height", default_value = "40")]
     pub tui_height: u16,
 
+    /// Print the absolute path to the co-installed `astrid-emit`
+    /// companion binary and exit. Used by hook-bridge installers (sage)
+    /// to wire `settings.local.json` commands at the right path without
+    /// guessing the install layout. Handled before banner/config so it
+    /// works on a half-configured host.
+    #[arg(long = "emit-path")]
+    pub emit_path: bool,
+
     #[command(subcommand)]
     pub command: Option<Commands>,
 }
