@@ -103,5 +103,18 @@ wasmtime::component::bindgen!({
     },
     imports: {
         "astrid:io/streams": trappable,
+        // `subscription.recv` is the only host import on the orchestration
+        // hot path that *blocks* — every chained capsule (react ->
+        // prompt-builder -> registry -> openai-compat) waits here for the
+        // next stage's response. Making just this one function `async`
+        // lets the host impl `.await` the broadcast receiver instead of
+        // pinning a tokio worker via `block_in_place`/`block_on`, which is
+        // the actual fix for the worker-pool exhaustion in issue #816.
+        // Selector is function-level (per wasmtime-wasi-45's own bindgen):
+        // `<iface>.[method]<resource>.<func>`, no version, dot-separated.
+        // Every other import stays synchronous — non-blocking host fns
+        // (publish/subscribe/kv/sys/...) gain nothing from async and the
+        // larger migration (net/http/elicit) is a tracked follow-up.
+        "astrid:ipc/host.[method]subscription.recv": async,
     },
 });

@@ -389,7 +389,7 @@ impl HostSubscription for HostState {
         result
     }
 
-    fn recv(
+    async fn recv(
         &mut self,
         self_: Resource<Subscription>,
         timeout_ms: u64,
@@ -405,23 +405,22 @@ impl HostSubscription for HostState {
             (Arc::clone(&entry.receiver), entry.topic_pattern.clone())
         };
 
-        // Block for at least one event up to `timeout_ms`, then drain
-        // additional events without further blocking.
-        let runtime_handle = self.runtime_handle.clone();
+        // Wait for at least one event up to `timeout_ms`, then drain
+        // additional events without further blocking. This is an `async`
+        // host fn (see the bindgen async selector), so we `.await` the
+        // wait directly via `bounded_await_cancellable` — the tokio worker
+        // is freed while the receiver is idle rather than pinned via
+        // `block_in_place` (issue #816).
         let cancel_token = self.cancel_token.clone();
         let host_semaphore = self.host_semaphore.clone();
         let receiver_for_wait = Arc::clone(&receiver_arc);
-        let first = util::bounded_block_on_cancellable(
-            &runtime_handle,
-            &host_semaphore,
-            &cancel_token,
-            async move {
-                let mut receiver = receiver_for_wait.lock().await;
-                receiver
-                    .recv(Some(std::time::Duration::from_millis(timeout_ms)))
-                    .await
-            },
-        )
+        let first = util::bounded_await_cancellable(&host_semaphore, &cancel_token, async move {
+            let mut receiver = receiver_for_wait.lock().await;
+            receiver
+                .recv(Some(std::time::Duration::from_millis(timeout_ms)))
+                .await
+        })
+        .await
         .flatten();
 
         let mut messages: Vec<InternalIpcMessage> = Vec::new();

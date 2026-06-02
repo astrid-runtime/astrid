@@ -318,18 +318,17 @@ pub(crate) struct PrincipalVfsBundle {
 /// `/tmp/...` canonicalize to `/private/tmp/...`, and a non-canonical mount
 /// root would cause `Path::starts_with` comparisons in the gate to fail.
 ///
-/// Callers must be holding a tokio runtime handle
-/// (`tokio::runtime::Handle::current()`).
-pub(crate) fn mount_dir(root: &std::path::Path) -> Option<PrincipalMount> {
+/// Async: `register_dir` is awaited directly so no tokio worker is pinned
+/// via `block_in_place`/`block_on` (issue #816). Must be called from an
+/// async context (load path and per-invocation SET phase both are).
+pub(crate) async fn mount_dir(root: &std::path::Path) -> Option<PrincipalMount> {
     if !root.exists() {
         return None;
     }
     let canonical = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
     let vfs = astrid_vfs::HostVfs::new();
     let handle = astrid_capabilities::DirHandle::new();
-    match tokio::runtime::Handle::current()
-        .block_on(async { vfs.register_dir(handle.clone(), canonical.clone()).await })
-    {
+    match vfs.register_dir(handle.clone(), canonical.clone()).await {
         Ok(()) => Some(PrincipalMount {
             root: canonical,
             vfs: Arc::new(vfs) as Arc<dyn astrid_vfs::Vfs>,
@@ -354,14 +353,15 @@ pub(crate) fn mount_dir(root: &std::path::Path) -> Option<PrincipalMount> {
 /// `home://` access. The tmp directory (`~/.astrid/home/{principal}/.local/tmp/`)
 /// is auto-created under an already-existing principal root.
 ///
-/// Callers must be holding a tokio runtime handle (`tokio::runtime::Handle::current()`).
-pub(crate) fn build_principal_vfs_bundle(
+/// Async: awaits the underlying `mount_dir` calls rather than pinning a
+/// worker (issue #816).
+pub(crate) async fn build_principal_vfs_bundle(
     principal: &astrid_core::PrincipalId,
 ) -> PrincipalVfsBundle {
     let Ok(astrid_home) = astrid_core::dirs::AstridHome::resolve() else {
         return PrincipalVfsBundle::default();
     };
-    build_principal_vfs_bundle_at(&astrid_home.principal_home(principal))
+    build_principal_vfs_bundle_at(&astrid_home.principal_home(principal)).await
 }
 
 /// Open (creating the log dir if needed) the daily-rotated log file for
@@ -462,18 +462,22 @@ fn open_capsule_log_at(
 ///
 /// Tests construct a [`PrincipalHome`] pointing at a tempdir; production
 /// code resolves the principal home through [`astrid_core::dirs::AstridHome`].
-fn build_principal_vfs_bundle_at(ph: &astrid_core::dirs::PrincipalHome) -> PrincipalVfsBundle {
-    let home = mount_dir(ph.root());
+async fn build_principal_vfs_bundle_at(
+    ph: &astrid_core::dirs::PrincipalHome,
+) -> PrincipalVfsBundle {
+    let home = mount_dir(ph.root()).await;
     // Tmp is only mounted when home is — they live under the same principal
     // root and follow its lifetime. Tmp subdirs may be auto-created.
-    let tmp = home.as_ref().and_then(|_| {
+    let tmp = if home.is_some() {
         let t = ph.tmp_dir();
         if t.exists() || std::fs::create_dir_all(&t).is_ok() {
-            mount_dir(&t)
+            mount_dir(&t).await
         } else {
             None
         }
-    });
+    } else {
+        None
+    };
     PrincipalVfsBundle { home, tmp }
 }
 
@@ -697,7 +701,7 @@ impl ExecutionEngine for WasmEngine {
                     );
                     None
                 },
-                Some(g_root) => mount_dir(g_root),
+                Some(g_root) => mount_dir(g_root).await,
                 None => None,
             };
 
@@ -716,16 +720,17 @@ impl ExecutionEngine for WasmEngine {
             ));
 
             // Set up /tmp mount backed by the principal's .local/tmp/ directory.
-            let tmp_mount: Option<PrincipalMount> = astrid_core::dirs::AstridHome::resolve()
-                .ok()
-                .and_then(|astrid_home| {
+            let tmp_mount: Option<PrincipalMount> = match astrid_core::dirs::AstridHome::resolve() {
+                Ok(astrid_home) => {
                     let dir = astrid_home.principal_home(&ctx.principal).tmp_dir();
                     if dir.exists() || std::fs::create_dir_all(&dir).is_ok() {
-                        mount_dir(&dir)
+                        mount_dir(&dir).await
                     } else {
                         None
                     }
-                });
+                },
+                Err(_) => None,
+            };
 
             // Open per-capsule daily log file at .local/log/{capsule}/{date}.log.
             // Prunes logs older than 7 days on each capsule load — load is
@@ -1379,7 +1384,7 @@ impl ExecutionEngine for WasmEngine {
                 });
 
                 if let Some(ref p) = invocation_principal {
-                    let bundle = build_principal_vfs_bundle(p);
+                    let bundle = build_principal_vfs_bundle(p).await;
                     state.invocation_home = bundle.home;
                     state.invocation_tmp = bundle.tmp;
                     state.invocation_capsule_log =
@@ -1548,10 +1553,13 @@ pub async fn run_lifecycle(
 
     // Mount home VFS if a home root was provided. Canonicalize first so the
     // stored mount root matches paths the security gate checks against.
-    let home_mount: Option<PrincipalMount> = cfg.home_root.as_ref().and_then(|h_root| {
-        let canonical = h_root.canonicalize().unwrap_or_else(|_| h_root.clone());
-        mount_dir(&canonical)
-    });
+    let home_mount: Option<PrincipalMount> = match cfg.home_root.as_ref() {
+        Some(h_root) => {
+            let canonical = h_root.canonicalize().unwrap_or_else(|_| h_root.clone());
+            mount_dir(&canonical).await
+        },
+        None => None,
+    };
 
     let host_state = HostState {
         wasi_ctx: build_wasi_ctx(),
@@ -2462,17 +2470,11 @@ mod tests {
     // build_principal_vfs_bundle_at: per-invocation VFS scoping (#549)
     // ---------------------------------------------------------------------
 
-    /// Build a bundle from a sync context with a live runtime handle.
-    ///
-    /// `build_principal_vfs_bundle_at` uses `Handle::current().block_on`
-    /// internally to call the async `register_dir` — the same pattern used in
-    /// the load-time path and in `invoke_interceptor`. That call panics if
-    /// invoked from an async task polled on the same runtime, so tests wrap
-    /// it in `spawn_blocking` to bridge sync/async like production does.
+    /// Build a bundle, awaiting the now-async `build_principal_vfs_bundle_at`
+    /// directly. `register_dir` is awaited internally (issue #816), so the
+    /// old `spawn_blocking` sync/async bridge is no longer needed.
     async fn build_bundle_async_safe(ph: astrid_core::dirs::PrincipalHome) -> PrincipalVfsBundle {
-        tokio::task::spawn_blocking(move || build_principal_vfs_bundle_at(&ph))
-            .await
-            .expect("spawn_blocking join")
+        build_principal_vfs_bundle_at(&ph).await
     }
 
     #[tokio::test(flavor = "multi_thread")]
