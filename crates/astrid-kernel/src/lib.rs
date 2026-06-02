@@ -498,7 +498,9 @@ impl Kernel {
             registry.get(id)
         };
         if let Some(capsule) = capsule
-            && let Err(e) = capsule.invoke_interceptor("handle_lifecycle_restart", &[], None)
+            && let Err(e) = capsule
+                .invoke_interceptor("handle_lifecycle_restart", &[], None)
+                .await
         {
             tracing::debug!(
                 capsule_id = %id,

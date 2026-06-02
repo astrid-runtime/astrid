@@ -398,7 +398,10 @@ fn dispatch_to_capsule_queues(
             let _chain_guard = chain_mutex.lock().await;
 
             let caller = ipc_clone.as_deref();
-            match capsule.invoke_interceptor(action, &current_payload, caller) {
+            match capsule
+                .invoke_interceptor(action, &current_payload, caller)
+                .await
+            {
                 Ok(crate::capsule::InterceptResult::Continue(modified_payload)) => {
                     debug!(
                         capsule_id = %capsule.id(),
@@ -539,7 +542,10 @@ async fn run_consumer(
                 );
 
                 let caller = work.ipc_message.as_deref();
-                match capsule.invoke_interceptor(&work.action, &work.payload, caller) {
+                match capsule
+                    .invoke_interceptor(&work.action, &work.payload, caller)
+                    .await
+                {
                     Ok(crate::capsule::InterceptResult::Continue(_)) => {
                         debug!(
                             capsule_id = %capsule.id(),

@@ -213,7 +213,7 @@ pub trait Capsule: Send + Sync {
     /// - `Continue` — pass (possibly modified) payload to the next interceptor
     /// - `Final` — short-circuit the chain with a response
     /// - `Deny` — short-circuit the chain, audit-logged
-    fn invoke_interceptor(
+    async fn invoke_interceptor(
         &self,
         _action: &str,
         _payload: &[u8],
@@ -343,14 +343,14 @@ impl Capsule for CompositeCapsule {
         None
     }
 
-    fn invoke_interceptor(
+    async fn invoke_interceptor(
         &self,
         action: &str,
         payload: &[u8],
         caller: Option<&astrid_events::ipc::IpcMessage>,
     ) -> CapsuleResult<InterceptResult> {
         for engine in &self.engines {
-            match engine.invoke_interceptor(action, payload, caller) {
+            match engine.invoke_interceptor(action, payload, caller).await {
                 Ok(result) => return Ok(result),
                 // Engine doesn't support interceptors — try the next one.
                 Err(CapsuleError::NotSupported(_)) => continue,

@@ -62,7 +62,7 @@ async fn test_lifecycle_skips_when_no_install_export() {
     let wasm_bytes = std::fs::read(&path).unwrap();
     let (cfg, _kv) = make_lifecycle_config(wasm_bytes);
 
-    let result = tokio::task::block_in_place(|| run_lifecycle(cfg, LifecyclePhase::Install, None));
+    let result = run_lifecycle(cfg, LifecyclePhase::Install, None).await;
     assert!(
         result.is_ok(),
         "expected Ok when export is missing, got: {result:?}"
@@ -78,8 +78,7 @@ async fn test_lifecycle_skips_when_no_upgrade_export() {
     let wasm_bytes = std::fs::read(&path).unwrap();
     let (cfg, _kv) = make_lifecycle_config(wasm_bytes);
 
-    let result =
-        tokio::task::block_in_place(|| run_lifecycle(cfg, LifecyclePhase::Upgrade, Some("0.1.0")));
+    let result = run_lifecycle(cfg, LifecyclePhase::Upgrade, Some("0.1.0")).await;
     assert!(
         result.is_ok(),
         "expected Ok when export is missing, got: {result:?}"
@@ -91,7 +90,7 @@ async fn test_lifecycle_skips_when_no_upgrade_export() {
 async fn test_lifecycle_rejects_invalid_wasm() {
     let (cfg, _kv) = make_lifecycle_config(b"not a wasm binary".to_vec());
 
-    let result = tokio::task::block_in_place(|| run_lifecycle(cfg, LifecyclePhase::Install, None));
+    let result = run_lifecycle(cfg, LifecyclePhase::Install, None).await;
     assert!(result.is_err(), "expected error for invalid WASM bytes");
 }
 
@@ -154,7 +153,7 @@ async fn test_lifecycle_install_with_elicit() {
         }
     });
 
-    let result = tokio::task::block_in_place(|| run_lifecycle(cfg, LifecyclePhase::Install, None));
+    let result = run_lifecycle(cfg, LifecyclePhase::Install, None).await;
 
     responder.abort();
 
@@ -188,8 +187,7 @@ async fn test_lifecycle_upgrade_records_kv() {
     let wasm_bytes = std::fs::read(&path).unwrap();
     let (cfg, kv) = make_lifecycle_config(wasm_bytes);
 
-    let result =
-        tokio::task::block_in_place(|| run_lifecycle(cfg, LifecyclePhase::Upgrade, Some("0.1.0")));
+    let result = run_lifecycle(cfg, LifecyclePhase::Upgrade, Some("0.1.0")).await;
 
     assert!(result.is_ok(), "lifecycle upgrade failed: {result:?}");
 

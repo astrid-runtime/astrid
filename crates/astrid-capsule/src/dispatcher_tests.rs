@@ -119,7 +119,7 @@ impl Capsule for MockCapsule {
     async fn unload(&mut self) -> CapsuleResult<()> {
         Ok(())
     }
-    fn invoke_interceptor(
+    async fn invoke_interceptor(
         &self,
         _action: &str,
         _payload: &[u8],

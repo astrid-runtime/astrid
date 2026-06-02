@@ -219,7 +219,7 @@ impl ExecutionEngine for McpHostEngine {
         }
     }
 
-    fn invoke_interceptor(
+    async fn invoke_interceptor(
         &self,
         action: &str,
         payload: &[u8],
@@ -243,13 +243,9 @@ impl ExecutionEngine for McpHostEngine {
         // no capability check needed for the kernel invoking its own hooks.
         let client = self.mcp_client.inner().clone();
 
-        let result = tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(async {
-                client
-                    .call_tool(&server_id, "astrid_hook_intercept", tool_args)
-                    .await
-            })
-        });
+        let result = client
+            .call_tool(&server_id, "astrid_hook_intercept", tool_args)
+            .await;
 
         match result {
             Ok(tool_result) => {
