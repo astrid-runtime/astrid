@@ -103,6 +103,11 @@ use crate::security::CapsuleSecurityGate;
 /// at `root`. They must always be installed and cleared as a unit, so callers
 /// cannot accidentally pair an invocation-scoped VFS with a load-time handle
 /// (which would break capability confinement).
+///
+/// `Clone` so the Store pool can hand the same principal mount to each of a
+/// capsule's N pooled instances — all fields (`PathBuf`, `Arc<dyn Vfs>`,
+/// `DirHandle`) share or copy cheaply (issue #816).
+#[derive(Clone)]
 pub struct PrincipalMount {
     /// Canonical physical directory this mount is rooted at.
     pub root: PathBuf,
@@ -236,7 +241,13 @@ pub struct HostState {
     /// System Event Bus for IPC publish/subscribe.
     pub event_bus: astrid_events::EventBus,
     /// Rate limiter for IPC message publishing.
-    pub ipc_limiter: astrid_events::ipc::IpcRateLimiter,
+    ///
+    /// `Arc` so a capsule's pool of `Store`s shares one limiter — otherwise
+    /// each pooled `Store` would get its own budget and the per-capsule
+    /// throughput cap would be `pool_size`× too loose (issue #816). The
+    /// limiter is internally concurrent (`DashMap`), so shared `&self` access
+    /// is contention-free.
+    pub ipc_limiter: Arc<astrid_events::ipc::IpcRateLimiter>,
     /// Plugin configuration from the manifest.
     ///
     /// Holds only **non-secret** env values (the `[env]` declarations

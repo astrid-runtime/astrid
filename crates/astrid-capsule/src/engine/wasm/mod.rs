@@ -15,6 +15,7 @@ use crate::manifest::CapsuleManifest;
 pub mod bindings;
 pub mod host;
 pub mod host_state;
+mod pool;
 #[cfg(test)]
 mod test_fixtures;
 
@@ -141,6 +142,15 @@ const WASM_CAPSULE_TIMEOUT_SECS: u64 = 5 * 60;
 /// granularity is `EPOCH_TICK_INTERVAL * epoch_deadline`.
 const EPOCH_TICK_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
 
+/// Number of `(Store, Instance)` pairs a pooled (non-run-loop) capsule
+/// instantiates, so that many principals' interceptors run concurrently
+/// instead of serialising through one Store (`astrid#816`). Each instance
+/// costs one WASM linear memory (capped at [`WASM_MAX_MEMORY_BYTES`] virtual;
+/// committed RSS is only what the guest touches), so this trades a bounded
+/// memory footprint for genuine per-capsule parallelism. Capsules carved out
+/// via `host_process` (live cross-invocation resource handles) use size 1.
+const INSTANCE_POOL_SIZE: usize = 16;
+
 /// Executes WASM Components via the wasmtime Component Model.
 ///
 /// This engine sandboxes execution in wasmtime and wires the
@@ -152,16 +162,17 @@ pub struct WasmEngine {
     /// The wasmtime engine shared between the store and epoch incrementer.
     wasmtime_engine: Option<wasmtime::Engine>,
     /// The wasmtime store holding HostState. Wrapped in `Arc<AsyncMutex<>>`
-    /// so the run loop task and `invoke_interceptor` can both access it
-    /// (though never concurrently for run-loop capsules — those use IPC
-    /// auto-subscribe). Async mutex so a parallel interceptor invocation
-    /// `.await`s on the lock instead of pinning a tokio worker via
-    /// `block_in_place` (issue #816).
-    store: Option<Arc<AsyncMutex<Store<HostState>>>>,
-    /// The instantiated guest component. Per-export typed accessors are
-    /// looked up at call time via `instance.get_typed_func` since the
-    /// per-domain WIT split removed the bundled `Capsule` world.
-    instance: Option<wasmtime::component::Instance>,
+    /// Pool of `(Store, Instance)` pairs for a non-run-loop capsule.
+    ///
+    /// `invoke_interceptor` leases a free instance per call, so N principals'
+    /// interceptors run concurrently instead of serialising through one Store
+    /// (the throughput floor behind `astrid#813`; see `astrid#816` and
+    /// [`pool`]). `None` for run-loop capsules — they keep one dedicated
+    /// Store owned by `run_handle` and never go through this pool. Pool size
+    /// is [`INSTANCE_POOL_SIZE`], or `1` for capsules carved out via the
+    /// `host_process` capability (they hold live resources across
+    /// invocations and must stay single-Store).
+    pool: Option<pool::CapsuleInstancePool>,
     inbound_rx: Option<tokio::sync::mpsc::Receiver<astrid_core::InboundMessage>>,
     run_handle: Option<tokio::task::JoinHandle<()>>,
     /// Receiver for the readiness signal from the run loop.
@@ -210,8 +221,7 @@ impl WasmEngine {
             manifest,
             _capsule_dir: capsule_dir,
             wasmtime_engine: None,
-            store: None,
-            instance: None,
+            pool: None,
             inbound_rx: None,
             run_handle: None,
             ready_rx: None,
@@ -621,7 +631,7 @@ impl ExecutionEngine for WasmEngine {
         // `register_dir` calls. Component-model async lets us `.await`
         // those directly here, so the load path no longer pins a worker
         // for the duration of the engine build.
-        let (store_arc, instance, rx, has_run, ready_rx, wt_engine) = async {
+        let (pool_opt, store_arc, run_instance, rx, has_run, ready_rx, wt_engine) = async {
             let wasm_bytes = std::fs::read(&wasm_path).map_err(|e| {
                 CapsuleError::UnsupportedEntryPoint(format!("Failed to read WASM: {e}"))
             })?;
@@ -744,7 +754,51 @@ impl ExecutionEngine for WasmEngine {
                 tokio::runtime::Handle::current(),
             );
 
-            let host_state = HostState {
+            // Manifest-derived data + shared services, built once and cloned
+            // into each pooled Store's HostState by `make_state` below.
+            let capsule_id_val = crate::capsule::CapsuleId::new(&manifest.package.name)
+                .map_err(|e| CapsuleError::UnsupportedEntryPoint(e.to_string()))?;
+            // Secret-typed env keys from the manifest. `get_config` routes
+            // these through the keychain (per-invocation principal-scoped,
+            // host-wide fall-through) instead of `config`.
+            let secret_env_set: std::collections::HashSet<String> = manifest
+                .env
+                .iter()
+                .filter(|(_, d)| d.env_type.eq_ignore_ascii_case("secret"))
+                .map(|(k, _)| k.clone())
+                .collect();
+            // RFC cargo-like-manifest: prefer [publish]/[subscribe] keys over
+            // the legacy [capabilities] arrays (helper falls back if empty).
+            let ipc_publish_v = manifest.effective_ipc_publish_patterns();
+            let ipc_subscribe_v = manifest.effective_ipc_subscribe_patterns();
+            // Only capsules declaring net_bind (the CLI proxy) get the socket
+            // listener / session token.
+            let cli_listener = if manifest.capabilities.net_bind.is_empty() {
+                None
+            } else {
+                ctx.cli_socket_listener.clone()
+            };
+            let session_tok = if manifest.capabilities.net_bind.is_empty() {
+                None
+            } else {
+                ctx.session_token.clone()
+            };
+            // `[capabilities].uplink` bit (binds a socket), gating ipc-publish-as.
+            let has_uplink = manifest.capabilities.uplink;
+            // One IPC rate limiter shared by every pooled instance, so the
+            // per-capsule throughput budget is not multiplied by pool size.
+            let ipc_limiter = Arc::new(astrid_events::ipc::IpcRateLimiter::new());
+            // The CoW overlay upper-dir tempdir is shared by all instances.
+            let upper_dir_arc = Arc::new(upper_temp);
+
+            // Per-instance `HostState` factory. Shared services clone (Arc or
+            // cheap value clones); per-Store fields (`wasi_ctx`,
+            // `resource_table`, the http-stream map, the resource-table-mirror
+            // counters) are fresh per Store. The pool-safety audit confirmed
+            // no pooled capsule relies on in-WASM-memory state surviving
+            // across invocations, so distinct Stores per principal-invocation
+            // are sound (issue #816).
+            let make_state = || HostState {
                 wasi_ctx: build_wasi_ctx(),
                 resource_table: wasmtime::component::ResourceTable::new(),
                 store_limits: wasmtime::StoreLimitsBuilder::new()
@@ -755,80 +809,46 @@ impl ExecutionEngine for WasmEngine {
                 caller_context: None,
                 interceptor_active: false,
                 invocation_kv: None,
-                capsule_log,
-                capsule_id: crate::capsule::CapsuleId::new(&manifest.package.name)
-                    .map_err(|e| CapsuleError::UnsupportedEntryPoint(e.to_string()))?,
-                workspace_root,
+                capsule_log: capsule_log.clone(),
+                capsule_id: capsule_id_val.clone(),
+                workspace_root: workspace_root.clone(),
                 vfs: Arc::clone(&overlay_vfs) as Arc<dyn astrid_vfs::Vfs>,
-                vfs_root_handle: root_handle,
-                home: home_mount,
-                tmp: tmp_mount,
+                vfs_root_handle: root_handle.clone(),
+                home: home_mount.clone(),
+                tmp: tmp_mount.clone(),
                 invocation_home: None,
                 invocation_tmp: None,
                 invocation_secret_store: None,
                 invocation_capsule_log: None,
                 invocation_profile: None,
                 invocation_env_overlay: None,
-                overlay_vfs: Some(overlay_vfs),
-                upper_dir: Some(Arc::new(upper_temp)),
-                kv,
-                event_bus,
-                ipc_limiter: astrid_events::ipc::IpcRateLimiter::new(),
-                config: wasm_config,
-                // Secret-typed env keys from the manifest.
-                // `get_config` routes these through the keychain
-                // (per-invocation principal-scoped, with host-
-                // wide fall-through) instead of reading from
-                // `config`. Non-secret entries stay in `config`
-                // and behave as before. Scope is an operator-
-                // side concept at `astrid secret set` time, not
-                // a manifest declaration — the lookup precedence
-                // is fixed (per-agent first, host-wide on miss).
-                secret_env: manifest
-                    .env
-                    .iter()
-                    .filter(|(_, d)| d.env_type.eq_ignore_ascii_case("secret"))
-                    .map(|(k, _)| k.clone())
-                    .collect(),
-                // RFC cargo-like-manifest: prefer [publish] / [subscribe] keys
-                // over the legacy [capabilities].ipc_publish / .ipc_subscribe arrays
-                // when the capsule declares them. The helper falls back to the
-                // legacy arrays if the new tables are empty.
-                ipc_publish_patterns: manifest.effective_ipc_publish_patterns(),
-                ipc_subscribe_patterns: manifest.effective_ipc_subscribe_patterns(),
-                // Only provide the CLI socket listener if the capsule declares net_bind.
-                // This prevents unauthorized capsules from even seeing the listener.
-                cli_socket_listener: if manifest.capabilities.net_bind.is_empty() {
-                    None
-                } else {
-                    ctx.cli_socket_listener.clone()
-                },
+                overlay_vfs: Some(Arc::clone(&overlay_vfs)),
+                upper_dir: Some(Arc::clone(&upper_dir_arc)),
+                kv: kv.clone(),
+                event_bus: event_bus.clone(),
+                ipc_limiter: Arc::clone(&ipc_limiter),
+                config: wasm_config.clone(),
+                secret_env: secret_env_set.clone(),
+                ipc_publish_patterns: ipc_publish_v.clone(),
+                ipc_subscribe_patterns: ipc_subscribe_v.clone(),
+                cli_socket_listener: cli_listener.clone(),
                 active_http_streams: std::collections::HashMap::new(),
                 next_http_stream_id: 1,
-                security: Some(security_gate),
+                security: Some(
+                    Arc::clone(&security_gate) as Arc<dyn crate::security::CapsuleSecurityGate>
+                ),
                 hook_manager: None, // Will be injected by Gateway
                 capsule_registry: ctx.capsule_registry.clone(),
                 runtime_handle: tokio::runtime::Handle::current(),
-                // `has_uplink_capability` reflects the `[capabilities].uplink`
-                // bit (binds a socket / accepts external clients), NOT the
-                // `[[uplink]]` declarations (which list target platforms a
-                // capsule provides). Gates `ipc-publish-as` so only uplinks
-                // can stamp messages on behalf of external principals.
-                has_uplink_capability: manifest.capabilities.uplink,
-                inbound_tx: tx,
+                has_uplink_capability: has_uplink,
+                inbound_tx: tx.clone(),
                 registered_uplinks: Vec::new(),
                 lifecycle_phase: None,
-                secret_store,
+                secret_store: secret_store.clone(),
                 ready_tx: None,
-                host_semaphore,
-                cancel_token: cancel_token_for_state,
-                // Only provide the session token to capsules with net_bind
-                // (the CLI proxy). Other capsules have no use for it.
-                session_token: if manifest.capabilities.net_bind.is_empty() {
-                    None
-                } else {
-                    ctx.session_token.clone()
-                },
+                host_semaphore: host_semaphore.clone(),
+                cancel_token: cancel_token_for_state.clone(),
+                session_token: session_tok.clone(),
                 interceptor_handles: Vec::new(),
                 allowance_store: ctx.allowance_store.clone(),
                 identity_store: ctx.identity_store.clone(),
@@ -839,86 +859,97 @@ impl ExecutionEngine for WasmEngine {
                 process_count_by_principal: std::collections::HashMap::new(),
             };
 
-            // Pre-scan WASM exports to detect run() before instantiation.
-            // Component Model instantiation requires all exports to be present,
-            // but we need to know about run() ahead of time for timeout config.
-            //
-            // On parse failure, default to true (no timeout) - the safe
-            // direction. A truly corrupt binary will fail Component::from_binary
+            // Pre-scan run() before instantiation — it picks the epoch policy
+            // and decides whether this capsule is pooled (interceptor) or
+            // run-loop. On parse failure default to true (no timeout) — the
+            // safe direction; a corrupt binary fails Component::from_binary
             // moments later anyway.
             let has_run_export = wasm_exports_contain_run(&wasm_bytes);
-
-            // Build wasmtime engine, store, linker, and instantiate the component.
-            let wt_engine = build_wasmtime_engine()?;
-            let mut store = Store::new(&wt_engine, host_state);
-
-            // Memory limit: 64 MB per capsule (matches old Extism setting).
-            store.limiter(|state| &mut state.store_limits);
-
-            // Epoch-based timeout for non-daemon capsules.
-            // Long-lived capsules (uplinks, run-loop daemons) must not
-            // have a wall-clock timeout. Other capsules get a safety
-            // timeout — generous enough for interceptors that do streaming HTTP
-            // (e.g. LLM providers) while still catching runaways.
+            // Non-daemon, non-run-loop capsules get a wall-clock epoch deadline
+            // (≈ WASM_CAPSULE_TIMEOUT_SECS); long-lived capsules (uplinks,
+            // run-loop daemons) run unbounded (u64::MAX) so the epoch ticker
+            // never traps them.
             let is_daemon = !manifest.uplinks.is_empty() || manifest.capabilities.uplink;
-            if !is_daemon && !has_run_export {
-                // Each epoch tick is EPOCH_TICK_INTERVAL (100ms). Set the
-                // deadline so total timeout ≈ WASM_CAPSULE_TIMEOUT_SECS.
-                let deadline =
-                    WASM_CAPSULE_TIMEOUT_SECS * 1000 / EPOCH_TICK_INTERVAL.as_millis() as u64;
-                store.set_epoch_deadline(deadline);
+            let epoch_deadline = if !is_daemon && !has_run_export {
+                WASM_CAPSULE_TIMEOUT_SECS * 1000 / EPOCH_TICK_INTERVAL.as_millis() as u64
             } else {
-                // Long-lived capsules: set deadline to u64::MAX so the epoch
-                // ticker doesn't trap them. Without this, the default deadline
-                // of 0 would cause an immediate trap on the first tick.
-                store.set_epoch_deadline(u64::MAX);
-            }
+                u64::MAX
+            };
 
-            let mut linker: Linker<HostState> = Linker::new(&wt_engine);
-
-            // No `wasi:*` interfaces are registered: the host ABI is
-            // fully Astrid-owned. Capsules import `astrid:fs`,
-            // `astrid:ipc`, …, and `astrid:io/poll` for readiness
-            // multiplexing — never wasi:io. Exposing the wasi stack
-            // here would create unaudited side channels around the
-            // capability and audit layers (filesystem outside the
-            // VFS, sockets outside the SSRF airlock, clocks/random
-            // outside sys, etc.).
+            // Build the engine, linker, and compiled component ONCE; the pool
+            // mints N instances from the same `InstancePre` without re-running
+            // the linker per Store.
             //
-            // Wire all Astrid host interfaces from the per-domain
-            // WIT. Both this load path AND the lifecycle path
-            // (`run_lifecycle`, below) go through the same helper
-            // so the linker config stays in lockstep — a future
-            // change that adds a second version registration here
-            // but forgets it in lifecycle would silently install
-            // capsules with mismatched ABIs across the two paths.
+            // No `wasi:*` interfaces are registered: the host ABI is fully
+            // Astrid-owned. Both this load path AND `run_lifecycle` go through
+            // the same `configure_kernel_linker` helper so the linker config
+            // stays in lockstep across the two paths.
+            let wt_engine = build_wasmtime_engine()?;
+            let mut linker: Linker<HostState> = Linker::new(&wt_engine);
             configure_kernel_linker(&mut linker).map_err(|e| {
                 CapsuleError::UnsupportedEntryPoint(format!(
                     "Failed to add Astrid host to linker: {e}"
                 ))
             })?;
-
-            // Compile and instantiate the WASM component. The new ABI no
-            // longer ships a bundled world, so we instantiate directly via
-            // the linker and look up exports by name at invocation time.
             let wasm_component = Component::from_binary(&wt_engine, &wasm_bytes).map_err(|e| {
                 CapsuleError::UnsupportedEntryPoint(format!(
                     "Failed to compile WASM component: {e}"
                 ))
             })?;
+            let instance_pre = linker.instantiate_pre(&wasm_component).map_err(|e| {
+                CapsuleError::UnsupportedEntryPoint(format!(
+                    "Failed to pre-instantiate WASM component: {e}"
+                ))
+            })?;
 
-            let instance = linker
-                .instantiate_async(&mut store, &wasm_component)
-                .await
-                .map_err(|e| {
-                    CapsuleError::UnsupportedEntryPoint(format!(
-                        "Failed to instantiate WASM component: {e}"
-                    ))
-                })?;
+            // Pool size: run-loop builds one dedicated Store (owned by the run
+            // loop, not pooled); `host_process` capsules are carved out to one
+            // Store (they hold live resource handles across invocations and
+            // must stay single-Store); everyone else gets INSTANCE_POOL_SIZE
+            // for concurrent interceptor invocation (issue #816).
+            let pool_size = if has_run_export || !manifest.capabilities.host_process.is_empty() {
+                1
+            } else {
+                INSTANCE_POOL_SIZE
+            };
+            let mut pooled: Vec<pool::PooledInstance> = Vec::with_capacity(pool_size);
+            for _ in 0..pool_size {
+                let mut store = Store::new(&wt_engine, make_state());
+                // Memory limit (64 MB/capsule) + epoch-based timeout.
+                store.limiter(|state| &mut state.store_limits);
+                store.set_epoch_deadline(epoch_deadline);
+                let instance = instance_pre
+                    .instantiate_async(&mut store)
+                    .await
+                    .map_err(|e| {
+                        CapsuleError::UnsupportedEntryPoint(format!(
+                            "Failed to instantiate WASM component: {e}"
+                        ))
+                    })?;
+                pooled.push(pool::PooledInstance { store, instance });
+            }
+            tracing::debug!(
+                capsule = %manifest.package.name,
+                pool_size,
+                has_run = has_run_export,
+                host_process = !manifest.capabilities.host_process.is_empty(),
+                "Instantiated capsule instance pool"
+            );
 
             let has_run = has_run_export;
-
-            let store_arc = Arc::new(AsyncMutex::new(store));
+            // Run-loop capsules pull one instance out as a dedicated,
+            // mutex-guarded Store owned by the run loop; pooled capsules keep
+            // the whole set for `invoke_interceptor` to lease from.
+            let mut pool_opt: Option<pool::CapsuleInstancePool> = None;
+            let mut store_arc: Option<Arc<AsyncMutex<Store<HostState>>>> = None;
+            let mut run_instance: Option<wasmtime::component::Instance> = None;
+            if has_run {
+                let pi = pooled.pop().expect("pool_size >= 1 for run-loop");
+                store_arc = Some(Arc::new(AsyncMutex::new(pi.store)));
+                run_instance = Some(pi.instance);
+            } else {
+                pool_opt = Some(pool::CapsuleInstancePool::new(pooled));
+            }
 
             // Only allocate the watch channel for run-loop capsules.
             let ready_rx = if has_run {
@@ -927,7 +958,7 @@ impl ExecutionEngine for WasmEngine {
                 // legacy poisoned-lock conversion is gone. The borrow is
                 // held synchronously across the small mutation below;
                 // no `.await` occurs while it is alive.
-                let mut s = store_arc.lock().await;
+                let mut s = store_arc.as_ref().expect("run-loop has store").lock().await;
                 s.data_mut().ready_tx = Some(ready_tx);
                 Some(ready_rx)
             } else {
@@ -969,7 +1000,7 @@ impl ExecutionEngine for WasmEngine {
                     }
                 }
 
-                let mut s = store_arc.lock().await;
+                let mut s = store_arc.as_ref().expect("run-loop has store").lock().await;
                 let state = s.data_mut();
                 // Interceptor bindings are metadata under the new
                 // ABI. The kernel dispatches matching IPC messages to
@@ -996,7 +1027,15 @@ impl ExecutionEngine for WasmEngine {
                 );
             }
 
-            Ok::<_, CapsuleError>((store_arc, instance, rx, has_run, ready_rx, wt_engine))
+            Ok::<_, CapsuleError>((
+                pool_opt,
+                store_arc,
+                run_instance,
+                rx,
+                has_run,
+                ready_rx,
+                wt_engine,
+            ))
         }
         .await?;
 
@@ -1076,8 +1115,8 @@ impl ExecutionEngine for WasmEngine {
             // because run-loop capsules receive events via auto-subscribed IPC
             // channels instead — no external invoke_interceptor calls.
             let capsule_name = self.manifest.package.name.clone();
-            let run_store = Arc::clone(&store_arc);
-            let run_instance = instance;
+            let run_store = Arc::clone(store_arc.as_ref().expect("run-loop has store"));
+            let run_inst = run_instance.expect("run-loop has instance");
             // With async wasmtime, `call_async` schedules guest execution
             // on a fiber that yields back to the executor on every host
             // import boundary. The spawned task no longer needs to be a
@@ -1085,7 +1124,7 @@ impl ExecutionEngine for WasmEngine {
             self.run_handle = Some(tokio::task::spawn(async move {
                 tracing::info!(capsule = %capsule_name, "Starting background WASM run loop");
                 let mut s = run_store.lock().await;
-                let typed = match run_instance.get_typed_func::<(), ()>(&mut *s, "run") {
+                let typed = match run_inst.get_typed_func::<(), ()>(&mut *s, "run") {
                     Ok(f) => f,
                     Err(e) => {
                         tracing::error!(
@@ -1104,11 +1143,11 @@ impl ExecutionEngine for WasmEngine {
                     );
                 }
             }));
-            // store_arc is also held by run loop — self.store/instance stay None
-            // for run-loop capsules to prevent deadlock in invoke_interceptor.
+            // The run loop owns the Store via `run_store`; `self.pool` stays
+            // None so `invoke_interceptor` reports NotSupported for run-loop
+            // capsules (they receive events through auto-subscribed IPC).
         } else {
-            self.store = Some(store_arc);
-            self.instance = Some(instance);
+            self.pool = pool_opt;
         }
         self.inbound_rx = rx;
         self.profile_cache = ctx.profile_cache.clone();
@@ -1133,8 +1172,10 @@ impl ExecutionEngine for WasmEngine {
         }
         // Stop the epoch ticker thread (RAII guard joins on drop).
         drop(self.epoch_ticker.take());
-        self.store = None; // Drop releases WASM memory
-        self.instance = None;
+        // Drop the pool — releases every pooled Store's WASM memory. (Run-loop
+        // capsules have `pool == None`; their Store is owned by the aborted
+        // run_handle and dropped with it.)
+        self.pool = None;
         self.wasmtime_engine = None;
         self.ready_rx = None; // Prevent stale channel observation post-unload
         Ok(())
@@ -1166,15 +1207,11 @@ impl ExecutionEngine for WasmEngine {
         payload: &[u8],
         caller: Option<&astrid_events::ipc::IpcMessage>,
     ) -> CapsuleResult<crate::capsule::InterceptResult> {
-        let store = self.store.as_ref().ok_or_else(|| {
+        let pool = self.pool.as_ref().ok_or_else(|| {
             CapsuleError::NotSupported(
                 "plugin handles interceptors internally via IPC auto-subscribe".into(),
             )
         })?;
-        let instance = self
-            .instance
-            .as_ref()
-            .ok_or_else(|| CapsuleError::NotSupported("WASM component not instantiated".into()))?;
 
         // Layer 3 (#666): resolve the invoking principal's quota profile
         // BEFORE touching the store — a failed load denies the invocation
@@ -1266,70 +1303,34 @@ impl ExecutionEngine for WasmEngine {
         // single-lock window remains for panic safety and as
         // defence-in-depth.
         //
-        // SET + CALL + CLEAR under a single store lock so a parallel
-        // chain dispatch can't observe another principal's
-        // `caller_context` between SET and CALL — the cross-principal
-        // race that #813 collapsed the orchestration cliff onto. The
-        // `ClearOnDrop` guard guarantees CLEAR runs even on early
-        // return from the typed-func lookup or a panic-unwind through
-        // the guest call, preserving the invariant that
-        // `caller_context = None` after every invoke.
+        // SET + CALL run on one leased pooled instance, so a parallel
+        // invocation on a *different* pooled Store can never observe this
+        // invocation's `caller_context` between SET and CALL — the
+        // cross-principal race that #813 collapsed the orchestration cliff
+        // onto. CLEAR (resetting every `invocation_*` field) and return-to-
+        // pool are handled by `PoolCheckout::drop` (see [`pool`]), which runs
+        // on every exit path — normal return, `?`, panic-unwind, and
+        // future-drop on caller cancellation — preserving the invariant that
+        // the next lease of this instance observes `caller_context = None`.
         //
-        // SAFETY: store.lock() held synchronously across the entire
-        // SET/CALL/CLEAR; no `.await` inside this block. Any future
-        // host-fn that takes the outer `Arc<Mutex<Store<HostState>>>`
-        // must not re-lock — current host fns receive `&mut
-        // Store<HostState>` directly from wasmtime and never touch
-        // the Arc, so re-entrancy is impossible today.
+        // SAFETY: each pooled Store is leased exclusively for the duration of
+        // this call (the pool semaphore guarantees no two invocations share a
+        // Store), so the SET/CALL state is private to this invocation.
         type HookTriggerResult = bindings::astrid::guest::lifecycle::CapsuleResult;
 
-        /// RAII guard: clears per-invocation context fields on drop so
-        /// CLEAR runs through every exit path (normal return, early
-        /// `?`, panic-unwind). `armed = false` after an explicit
-        /// `disarm()` avoids a double-clear if the caller already
-        /// cleared inline.
-        struct ClearOnDrop<'a> {
-            store: &'a mut wasmtime::Store<HostState>,
-            armed: bool,
-        }
-        impl<'a> ClearOnDrop<'a> {
-            fn new(store: &'a mut wasmtime::Store<HostState>) -> Self {
-                Self { store, armed: true }
-            }
-        }
-        impl Drop for ClearOnDrop<'_> {
-            fn drop(&mut self) {
-                if !self.armed {
-                    return;
-                }
-                let state = self.store.data_mut();
-                state.caller_context = None;
-                state.interceptor_active = false;
-                state.invocation_kv = None;
-                state.invocation_home = None;
-                state.invocation_tmp = None;
-                state.invocation_secret_store = None;
-                state.invocation_capsule_log = None;
-                state.invocation_profile = None;
-                state.invocation_env_overlay = None;
-            }
-        }
-
-        // Acquire the store under the async mutex. A waiter here
-        // `.await`s instead of pinning a tokio worker (issue #816). The
-        // mutex still serialises one guest call at a time per capsule,
-        // but the executor is free to schedule other capsules while
-        // this one waits.
-        //
-        // The lock guard is dropped on every exit path (normal return,
-        // `?`, panic-unwind, future-drop on caller cancellation). The
-        // `ClearOnDrop` inside this scope runs first because it owns
-        // the inner store borrow — it clears `caller_context`,
-        // `interceptor_active`, and all `invocation_*` fields before
-        // the lock is released, preserving the invariant that the
-        // next interceptor sees a clean HostState.
-        let mut s = store.lock().await;
+        // Lease a free pooled instance. A waiter here `.await`s for a permit
+        // instead of pinning a tokio worker, and — unlike the old single Store
+        // — up to the pool size of invocations run concurrently on independent
+        // Stores (issue #816). `instance` (a `Copy` handle) is taken before
+        // borrowing the store mutably for the SET/CALL block; `PoolCheckout`
+        // clears the invocation state and returns the instance on drop.
+        let mut checkout = pool
+            .checkout()
+            .await
+            .ok_or_else(|| CapsuleError::NotSupported("capsule is unloading".into()))?;
+        let typed_instance = checkout.instance();
         let result: CapsuleResult<HookTriggerResult> = {
+            let s = checkout.store_mut();
             // ── Phase 1: SET ──────────────────────────────────────
             let applied_profile: Arc<astrid_core::profile::PrincipalProfile> =
                 invocation_profile.clone().unwrap_or_else(|| {
@@ -1424,50 +1425,35 @@ impl ExecutionEngine for WasmEngine {
                 }
             }
 
-            // Arm the RAII clear. From this point every exit (normal,
-            // `?` from typed-func lookup, panic-unwind through
-            // `call_async`, OR future-drop on caller cancellation)
-            // runs Phase 3 via `Drop for ClearOnDrop`.
-            let mut guard = ClearOnDrop::new(&mut s);
-
             // ── Phase 2: CALL ─────────────────────────────────────
             //
             // Cancellation safety: the `call_async` future below may be
-            // dropped by the dispatcher (e.g. tokio task abort). Drop
-            // semantics guarantee `ClearOnDrop` runs synchronously
-            // *before* the wasm fiber is torn down, so the next
-            // invocation observes `caller_context = None` and every
-            // `invocation_*` field cleared. The store mutex is also
-            // released, so a parallel waiter is unblocked promptly.
-            let typed_lookup = instance.get_typed_func::<(String, Vec<u8>), (HookTriggerResult,)>(
-                &mut *guard.store,
-                "astrid-hook-trigger",
-            );
+            // dropped by the dispatcher (e.g. tokio task abort). Dropping it
+            // drops `checkout`, whose `Drop` synchronously runs Phase 3 CLEAR
+            // *before* the wasm fiber is torn down and returns the instance to
+            // the pool, so the next lease observes `caller_context = None` and
+            // every `invocation_*` field cleared.
+            let typed_lookup = typed_instance
+                .get_typed_func::<(String, Vec<u8>), (HookTriggerResult,)>(
+                    &mut *s,
+                    "astrid-hook-trigger",
+                );
             match typed_lookup {
-                Ok(func) => {
-                    let call_result = func
-                        .call_async(&mut *guard.store, (action.to_string(), payload.to_vec()))
-                        .await
-                        .map(|(cr,)| cr)
-                        .map_err(|e| {
-                            CapsuleError::WasmError(format!("astrid_hook_trigger failed: {e:?}"))
-                        });
-
-                    // Phase 3 runs via `Drop for ClearOnDrop`. Leave
-                    // `armed = true` so it executes whether
-                    // `call_result` is Ok or Err.
-                    let _ = &mut guard.armed;
-                    call_result
-                },
+                Ok(func) => func
+                    .call_async(&mut *s, (action.to_string(), payload.to_vec()))
+                    .await
+                    .map(|(cr,)| cr)
+                    .map_err(|e| {
+                        CapsuleError::WasmError(format!("astrid_hook_trigger failed: {e:?}"))
+                    }),
                 Err(e) => Err(CapsuleError::UnsupportedEntryPoint(format!(
                     "capsule does not export `astrid-hook-trigger`: {e}"
                 ))),
             }
         };
-        // Release the store mutex before mapping the result so a
-        // parallel invocation observes the cleared HostState as soon
-        // as possible (ClearOnDrop has already run by this point).
-        drop(s);
+        // Drop the lease: Phase 3 CLEAR runs and the instance returns to the
+        // pool, so a parallel invocation can lease it with clean state.
+        drop(checkout);
 
         result.map(|cr| {
             crate::capsule::InterceptResult::from_capsule_result(&cr.action, cr.data.as_deref())
@@ -1589,7 +1575,7 @@ pub async fn run_lifecycle(
         upper_dir: None,
         kv: cfg.kv,
         event_bus: cfg.event_bus,
-        ipc_limiter: astrid_events::ipc::IpcRateLimiter::new(),
+        ipc_limiter: Arc::new(astrid_events::ipc::IpcRateLimiter::new()),
         config: cfg.config,
         secret_env: std::collections::HashSet::new(),
         ipc_publish_patterns: Vec::new(),
@@ -1893,11 +1879,11 @@ mod tests {
     /// "poisoned_lock_*" tests no longer apply.
     ///
     /// The replacement invariant is **cancellation safety**: if the
-    /// `invoke_interceptor` future is dropped mid-call, the
-    /// `ClearOnDrop` guard MUST clear `caller_context`,
+    /// `invoke_interceptor` future is dropped mid-call, the leased
+    /// instance's `PoolCheckout::drop` MUST clear `caller_context`,
     /// `interceptor_active`, and every `invocation_*` field before the
-    /// store lock is released, so the next invocation observes a
-    /// clean HostState. The next test exercises the Drop path
+    /// instance returns to the pool, so the next lease observes a
+    /// clean HostState. The next test exercises the Drop clear path
     /// directly (without instantiating wasmtime, which would require
     /// a fixture WASM binary).
     #[tokio::test]
@@ -1905,14 +1891,14 @@ mod tests {
         use crate::engine::wasm::host_state::HostState;
         use crate::engine::wasm::test_fixtures::minimal_host_state;
 
-        // ClearOnDrop is defined inside `invoke_interceptor`; we
-        // re-create the same logic here as a free function to keep
+        // The clear lives in `PoolCheckout::drop` (engine/wasm/pool.rs);
+        // we re-create the same logic here as a free function to keep
         // the test scoped to the contract (each invocation_* field
         // is cleared, interceptor_active flipped back to false) rather
         // than the inner type. This is the cancellation-safety guard
         // for async wasmtime: when the call_async future is dropped
         // mid-invocation, the Drop impl MUST run this clear path
-        // synchronously before the store mutex is released.
+        // synchronously before the leased instance returns to the pool.
         fn clear(state: &mut HostState) {
             state.caller_context = None;
             state.interceptor_active = false;

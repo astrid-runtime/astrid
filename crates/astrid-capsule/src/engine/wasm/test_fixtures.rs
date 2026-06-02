@@ -97,7 +97,7 @@ pub(crate) fn minimal_host_state(rt: tokio::runtime::Handle) -> HostState {
         upper_dir: None,
         kv,
         event_bus: astrid_events::EventBus::with_capacity(128),
-        ipc_limiter: astrid_events::ipc::IpcRateLimiter::new(),
+        ipc_limiter: Arc::new(astrid_events::ipc::IpcRateLimiter::new()),
         config: HashMap::new(),
         secret_env: std::collections::HashSet::new(),
         ipc_publish_patterns: Vec::new(),
