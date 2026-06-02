@@ -79,6 +79,26 @@ where
     })
 }
 
+/// Async-native sibling of [`bounded_block_on`] for host fns that are
+/// themselves `async` (see the bindgen `imports` async selectors). Bounds
+/// concurrency on the host semaphore and `.await`s directly, so the calling
+/// tokio worker is freed while the future is pending instead of being
+/// pinned via `block_in_place`/`block_on` (issue #816).
+///
+/// Use this for blocking I/O that has no cancellation token (e.g. the
+/// non-streaming `http_request` send + body read). For I/O that must abort
+/// promptly on capsule unload, use [`bounded_await_cancellable`].
+pub(crate) async fn bounded_await<F, T>(semaphore: &Semaphore, fut: F) -> T
+where
+    F: Future<Output = T>,
+{
+    let _permit = semaphore
+        .acquire()
+        .await
+        .expect("host semaphore closed: capsule HostState was dropped");
+    fut.await
+}
+
 /// Async-native sibling of [`bounded_block_on_cancellable`] for host fns
 /// that are themselves `async` (see the bindgen `imports` async selector).
 ///
