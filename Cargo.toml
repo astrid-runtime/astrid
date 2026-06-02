@@ -167,7 +167,7 @@ rcgen = "0.13"
 rustls = { version = "0.23", features = ["aws-lc-rs"] }
 regex = "1.10"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
-rmcp = { version = "0.15", features = ["client", "transport-child-process", "transport-io", "elicitation"] }
+rmcp = { version = "1.7.0", features = ["server", "client", "transport-io", "transport-child-process", "elicitation", "macros", "schemars"] }
 rustyline = { version = "15", features = ["derive"] }
 semver = "1"
 serde = { version = "1.0", features = ["derive"] }

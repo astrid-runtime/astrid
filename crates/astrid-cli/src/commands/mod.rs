@@ -18,6 +18,7 @@ pub(crate) mod init;
 pub(crate) mod invite;
 pub(crate) mod keypair;
 pub(crate) mod logs;
+pub(crate) mod mcp;
 pub(crate) mod ps;
 pub(crate) mod quota;
 pub(crate) mod restart;

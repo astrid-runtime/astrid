@@ -71,6 +71,24 @@ pub(crate) fn init_logging(cli: &Cli) {
         lc
     };
 
+    // `mcp serve` owns stdout for the MCP JSON-RPC stream. A stray log
+    // frame on stdout corrupts the protocol irrecoverably, so force
+    // diagnostics off stdout regardless of operator config — to the log
+    // file when a home is resolvable, else stderr.
+    let mut log_config = log_config;
+    if matches!(
+        cli.command,
+        Some(crate::cli::Commands::Mcp {
+            command: crate::cli::McpCommands::Serve { .. }
+        })
+    ) && matches!(log_config.target, astrid_telemetry::LogTarget::Stdout)
+    {
+        log_config.target = match astrid_core::dirs::AstridHome::resolve() {
+            Ok(home) => astrid_telemetry::LogTarget::File(home.log_dir()),
+            Err(_) => astrid_telemetry::LogTarget::Stderr,
+        };
+    }
+
     if let Err(e) = astrid_telemetry::setup_logging(&log_config) {
         eprintln!("Failed to initialize logging: {e}");
     }
