@@ -18,6 +18,7 @@ mod bus;
 mod event;
 pub mod ipc;
 pub mod rate_limiter;
+mod route;
 mod subscriber;
 
 // Re-export shared types for backward compatibility. `kernel_api` lives in
@@ -31,3 +32,9 @@ pub use event::{AstridEvent, EventMetadata};
 pub use ipc::IpcMessage;
 pub use ipc::IpcPayload;
 pub use ipc::IpcRateLimiter;
+pub use route::{
+    DRR_QUANTUM_MIN_BYTES, MAX_SUBSCRIPTION_BUDGET_BYTES, METRIC_ROUTE_ACTIVE_PRINCIPALS,
+    METRIC_ROUTE_BUDGET_BYTES_IN_USE, METRIC_ROUTE_BYTE_EVICTIONS_TOTAL,
+    METRIC_ROUTE_QUANTUM_STARVED_TOTAL, PrincipalKey, RouteKey, RoutedEventReceiver, TopicMatcher,
+    ipc_size_of, principal_class_label,
+};

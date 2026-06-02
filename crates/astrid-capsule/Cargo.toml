@@ -24,6 +24,7 @@ blake3 = { workspace = true }
 bytes = "1"
 metrics = { workspace = true }
 notify = "7"
+parking_lot = { workspace = true }
 rand = { workspace = true }
 reqwest = { workspace = true }
 semver = { workspace = true }

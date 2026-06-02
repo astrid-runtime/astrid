@@ -34,6 +34,7 @@ use tokio::sync::{RwLock, mpsc};
 use tracing::{debug, warn};
 
 use crate::capsule::{Capsule, CapsuleId};
+use crate::principal_class::PrincipalClass;
 use crate::registry::CapsuleRegistry;
 use astrid_events::{AstridEvent, EventBus, EventReceiver};
 
@@ -43,6 +44,14 @@ use astrid_events::{AstridEvent, EventBus, EventReceiver};
 /// they arrive), new events are dropped with a warning rather than blocking
 /// the dispatcher. 256 is generous for typical usage.
 const CAPSULE_EVENT_QUEUE_CAPACITY: usize = 256;
+
+/// Shared map of per-(capsule, principal-class) chain mutexes. One
+/// `Arc<tokio::sync::Mutex<()>>` per `(CapsuleId, PrincipalClass)` so
+/// chain dispatches for the same key serialize FIFO while distinct
+/// keys run concurrently. Held across the chain task's lifetime in
+/// `dispatch_to_capsule_queues`.
+type ChainLocks =
+    Arc<parking_lot::RwLock<HashMap<(CapsuleId, PrincipalClass), Arc<tokio::sync::Mutex<()>>>>>;
 
 /// Work item sent to a per-capsule ordered queue.
 struct InterceptorWork {
@@ -54,6 +63,13 @@ struct InterceptorWork {
     /// `invoke_interceptor` so the kernel can set per-invocation
     /// principal context on `HostState`.
     ipc_message: Option<Arc<astrid_events::ipc::IpcMessage>>,
+    /// Bounded principal class derived from `ipc_message.principal`,
+    /// used as the per-capsule queue key so distinct principal classes
+    /// on the same capsule do not head-of-line block each other (#813).
+    /// Carried through to the consumer for diagnostic logging and
+    /// future per-class telemetry.
+    #[allow(dead_code)]
+    principal_class: PrincipalClass,
 }
 
 /// Routes events from the `EventBus` to capsule interceptors.
@@ -71,6 +87,13 @@ pub struct EventDispatcher {
     /// home directories created. When `None`, provisioning is ungated
     /// (pre-production behavior).
     identity_store: Option<Arc<dyn astrid_storage::IdentityStore>>,
+    /// Per-(capsule, principal-class) chain serialization mutexes.
+    /// Chains for the same `(CapsuleId, PrincipalClass)` are mutually
+    /// exclusive (FIFO via `tokio::sync::Mutex`) but distinct
+    /// principal classes on the same capsule run concurrently. Closes
+    /// the cross-principal SET/CALL race at the dispatcher layer in
+    /// addition to the bus-side routing demux (#813).
+    chain_locks: ChainLocks,
 }
 
 impl EventDispatcher {
@@ -86,6 +109,7 @@ impl EventDispatcher {
             event_bus,
             receiver,
             identity_store: None,
+            chain_locks: Arc::new(parking_lot::RwLock::new(HashMap::new())),
         }
     }
 
@@ -109,7 +133,15 @@ impl EventDispatcher {
         let mut last_lag_notification = std::time::Instant::now()
             .checked_sub(std::time::Duration::from_secs(10))
             .unwrap_or_else(std::time::Instant::now);
-        let mut capsule_queues: HashMap<CapsuleId, mpsc::Sender<InterceptorWork>> = HashMap::new();
+        // Per-(capsule, principal-class) ordered queue for the
+        // single-match fast path. Widening the key lets two distinct
+        // principal classes targeting the same capsule run in
+        // parallel without HOL blocking. Chain dispatches use the
+        // sibling `chain_locks` map for the same guarantee.
+        let mut capsule_queues: HashMap<
+            (CapsuleId, PrincipalClass),
+            mpsc::Sender<InterceptorWork>,
+        > = HashMap::new();
         let mut known_principals: HashSet<String> = HashSet::new();
         // The "default" principal is always provisioned by the kernel boot sequence.
         known_principals.insert("default".to_string());
@@ -223,6 +255,7 @@ impl EventDispatcher {
             let matches = find_matching_interceptors(&self.registry, &topic).await;
             dispatch_to_capsule_queues(
                 &mut capsule_queues,
+                &self.chain_locks,
                 matches,
                 topic,
                 payload_bytes,
@@ -246,7 +279,8 @@ impl EventDispatcher {
 /// per-capsule mpsc queues (preserving IPC `seq` ordering). The chain semantics
 /// apply across capsules for the same event.
 fn dispatch_to_capsule_queues(
-    queues: &mut HashMap<CapsuleId, mpsc::Sender<InterceptorWork>>,
+    queues: &mut HashMap<(CapsuleId, PrincipalClass), mpsc::Sender<InterceptorWork>>,
+    chain_locks: &ChainLocks,
     matches: Vec<(Arc<dyn Capsule>, String)>,
     topic: Arc<String>,
     payload_bytes: Arc<Vec<u8>>,
@@ -262,10 +296,21 @@ fn dispatch_to_capsule_queues(
         .map(|(c, a)| (Arc::clone(&c), a))
         .collect();
 
+    let principal_class =
+        PrincipalClass::from_str_opt(ipc_message.as_deref().and_then(|m| m.principal.as_deref()));
+
     // For single-interceptor events (common case), skip chain overhead.
     if matches_owned.len() == 1 {
         let (capsule, action) = matches_owned.into_iter().next().unwrap();
-        dispatch_single(queues, capsule, action, topic, payload_bytes, ipc_message);
+        dispatch_single(
+            queues,
+            capsule,
+            action,
+            topic,
+            payload_bytes,
+            ipc_message,
+            principal_class,
+        );
         return;
     }
 
@@ -273,6 +318,7 @@ fn dispatch_to_capsule_queues(
     // Spawned as a task so the dispatcher loop doesn't block.
     let topic_clone = Arc::clone(&topic);
     let ipc_clone = ipc_message.clone();
+    let chain_locks_clone = Arc::clone(chain_locks);
     tokio::task::spawn(async move {
         let mut current_payload = (*payload_bytes).clone();
 
@@ -283,6 +329,33 @@ fn dispatch_to_capsule_queues(
                 topic = %topic_clone,
                 "Dispatching interceptor (chain)"
             );
+
+            // Per-(capsule, principal-class) chain serialization. Two
+            // events with the same principal class targeting this
+            // capsule execute one-at-a-time (FIFO via tokio::Mutex)
+            // so the SET/CALL/CLEAR window in wasm/mod.rs can never
+            // race a sibling chain. Distinct principal classes on
+            // this capsule run concurrently — the orchestration
+            // cliff fix is per-class, not per-capsule (#813).
+            let chain_key = (capsule.id().clone(), principal_class);
+            let chain_mutex = {
+                // Read-fast / write-on-miss: the common case is a hit
+                // on an existing lock.
+                let read = chain_locks_clone.read();
+                if let Some(m) = read.get(&chain_key) {
+                    Arc::clone(m)
+                } else {
+                    drop(read);
+                    let mut write = chain_locks_clone.write();
+                    Arc::clone(
+                        write
+                            .entry(chain_key.clone())
+                            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))),
+                    )
+                }
+            };
+            let _chain_guard = chain_mutex.lock().await;
+
             // Bound concurrent invokes of THIS capsule. The permit is
             // re-acquired per chain step because each step is a separate
             // `invoke_interceptor` call and Wasmtime Store contention is
@@ -372,17 +445,21 @@ fn dispatch_to_capsule_queues(
     });
 }
 
-/// Fast path for single-interceptor dispatch — uses per-capsule queue
-/// for ordered delivery without chain overhead.
+/// Fast path for single-interceptor dispatch — uses per-(capsule,
+/// principal-class) queue for ordered delivery without chain overhead.
+/// Keying on the class means alice's events don't head-of-line block
+/// bob's on the same capsule (#813).
 fn dispatch_single(
-    queues: &mut HashMap<CapsuleId, mpsc::Sender<InterceptorWork>>,
+    queues: &mut HashMap<(CapsuleId, PrincipalClass), mpsc::Sender<InterceptorWork>>,
     capsule: Arc<dyn Capsule>,
     action: String,
     topic: Arc<String>,
     payload_bytes: Arc<Vec<u8>>,
     ipc_message: Option<Arc<astrid_events::ipc::IpcMessage>>,
+    principal_class: PrincipalClass,
 ) {
-    let sender = queues.entry(capsule.id().clone()).or_insert_with(|| {
+    let key = (capsule.id().clone(), principal_class);
+    let sender = queues.entry(key).or_insert_with(|| {
         let (tx, mut rx) = mpsc::channel::<InterceptorWork>(CAPSULE_EVENT_QUEUE_CAPACITY);
         let capsule = Arc::clone(&capsule);
         tokio::task::spawn(async move {
@@ -473,6 +550,7 @@ fn dispatch_single(
         payload: Arc::clone(&payload_bytes),
         topic: Arc::clone(&topic),
         ipc_message: ipc_message.clone(),
+        principal_class,
     };
     if let Err(e) = sender.try_send(work) {
         warn!(

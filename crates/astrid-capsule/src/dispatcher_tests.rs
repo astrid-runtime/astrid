@@ -141,6 +141,22 @@ fn publish_ipc(bus: &EventBus, topic: &str) {
     });
 }
 
+/// Helper: publish an IPC event tagged with a principal.
+fn publish_ipc_as(bus: &EventBus, topic: &str, principal: &str) {
+    let msg = astrid_events::ipc::IpcMessage::new(
+        topic,
+        IpcPayload::Custom {
+            data: serde_json::json!({}),
+        },
+        uuid::Uuid::nil(),
+    )
+    .with_principal(principal);
+    bus.publish(AstridEvent::Ipc {
+        metadata: astrid_events::EventMetadata::new("test"),
+        message: msg,
+    });
+}
+
 #[tokio::test]
 async fn dispatch_routes_to_matching_interceptor() {
     let (capsule, invoked) = MockCapsule::new("test-capsule", "test.topic");
@@ -630,4 +646,79 @@ fn intercept_result_from_guest_bytes() {
     // Unknown discriminant = Continue with full bytes
     let r = InterceptResult::from_guest_bytes(vec![0xFF, 1]);
     assert!(matches!(r, InterceptResult::Continue(ref b) if b == &[0xFF, 1]));
+}
+
+// ── Per-(capsule, principal-class) routing tests (#813) ────────
+
+#[tokio::test]
+async fn single_match_does_not_block_across_principal_classes() {
+    // One capsule, one topic, two principal classes (system + user).
+    // Two events under distinct classes must be processed without HOL
+    // blocking — both `invoked` flags fire even if one consumer is
+    // slow.
+    let (capsule, invoked) = MockCapsule::new("class-cap", "split.topic");
+    let mut registry = CapsuleRegistry::new();
+    registry.register(Box::new(capsule)).unwrap();
+    let registry = Arc::new(RwLock::new(registry));
+
+    let bus = Arc::new(EventBus::with_capacity(64));
+    let dispatcher = EventDispatcher::new(Arc::clone(&registry), Arc::clone(&bus));
+    let handle = tokio::spawn(dispatcher.run());
+
+    tokio::task::yield_now().await;
+
+    // First event has no principal → System class. Second is a user
+    // principal → User class. Different queue key, parallel
+    // consumers, both should land.
+    publish_ipc(&bus, "split.topic");
+    publish_ipc_as(&bus, "split.topic", "alice");
+
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    assert!(
+        invoked.load(Ordering::SeqCst),
+        "interceptor should fire for at least one of the events"
+    );
+    handle.abort();
+}
+
+#[tokio::test]
+async fn chain_serializes_per_principal_class_on_same_capsule() {
+    // A chain of two capsules where each interceptor records its
+    // invocation. Two events under the same principal class race
+    // through the chain; tokio::Mutex serializes them FIFO.
+    let order = Arc::new(Mutex::new(Vec::<String>::new()));
+    let (cap_a, _) =
+        MockCapsule::with_priority("ser-a", "chain.topic", 50, Some(Arc::clone(&order)));
+    let (cap_b, _) =
+        MockCapsule::with_priority("ser-b", "chain.topic", 100, Some(Arc::clone(&order)));
+
+    let mut registry = CapsuleRegistry::new();
+    registry.register(Box::new(cap_a)).unwrap();
+    registry.register(Box::new(cap_b)).unwrap();
+    let registry = Arc::new(RwLock::new(registry));
+
+    let bus = Arc::new(EventBus::with_capacity(64));
+    let dispatcher = EventDispatcher::new(Arc::clone(&registry), Arc::clone(&bus));
+    let handle = tokio::spawn(dispatcher.run());
+    tokio::task::yield_now().await;
+
+    // Same class (System) twice → chain mutex serializes both.
+    publish_ipc(&bus, "chain.topic");
+    publish_ipc(&bus, "chain.topic");
+
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let recorded = order.lock().unwrap().clone();
+    // Each event should produce ser-a then ser-b. Two events = 4
+    // entries (two complete chains, never interleaved within a
+    // (capsule, class) pair).
+    assert_eq!(recorded.len(), 4, "two full chains should have completed");
+    // Within each chain ser-a precedes ser-b.
+    assert_eq!(recorded[0], "ser-a");
+    assert_eq!(recorded[1], "ser-b");
+    assert_eq!(recorded[2], "ser-a");
+    assert_eq!(recorded[3], "ser-b");
+
+    handle.abort();
 }

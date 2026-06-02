@@ -1227,6 +1227,12 @@ impl ExecutionEngine for WasmEngine {
             }
         }
 
+        // Cross-principal SET/CALL race is now also closed at the bus
+        // layer via per-(capsule, topic, principal) routing in
+        // EventBus (see crates/astrid-events/src/route/). The
+        // single-lock window remains for panic safety and as
+        // defence-in-depth.
+        //
         // SET + CALL + CLEAR under a single store lock so a parallel
         // chain dispatch can't observe another principal's
         // `caller_context` between SET and CALL — the cross-principal

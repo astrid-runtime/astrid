@@ -144,6 +144,13 @@ metrics-exporter-prometheus = { version = "0.17", default-features = false }
 # background thread.
 metrics-process = "2.4"
 notify = "7"
+# `parking_lot::RwLock`/`Mutex` are used in the event-bus per-(capsule,
+# topic, principal) routing demux so the synchronous `EventBus::publish`
+# path can take a read-lock without forcing an async boundary into every
+# publish call site (including the reentrant `SubscriberRegistry::notify`
+# path). No poisoning + fewer kernel calls than `std::sync` under
+# contention.
+parking_lot = "0.12"
 oxc = { version = "0.112", features = ["transformer", "semantic", "codegen"] }
 oxc_allocator = "0.112"
 rand = "0.8"

@@ -15,6 +15,7 @@ pub mod engine;
 pub mod error;
 pub mod loader;
 pub mod manifest;
+pub mod principal_class;
 pub mod profile_cache;
 pub mod registry;
 pub mod schema_catalog;

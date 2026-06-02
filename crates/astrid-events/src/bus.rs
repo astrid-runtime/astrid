@@ -1,11 +1,16 @@
 //! Event bus for broadcasting events to subscribers.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::broadcast;
 use tracing::{debug, trace, warn};
 
 use crate::event::AstridEvent;
+use crate::route::{
+    MAX_SUBSCRIPTION_BUDGET_BYTES, PrincipalKey, RouteEntry, RouteKey, RoutedEventReceiver,
+    SubscriptionRepAllocator, TopicMatcher,
+};
 use crate::subscriber::SubscriberRegistry;
 
 /// Default channel capacity for the event bus.
@@ -58,6 +63,16 @@ pub struct EventBus {
     capacity: usize,
     /// Monotonic sequence counter for IPC message ordering.
     ipc_seq: Arc<AtomicU64>,
+    /// Per-(capsule, topic, principal) routing table for guest
+    /// subscriptions. Demand-allocated entries; an idle principal has
+    /// zero entries even when the bus has 5000 active subscribers (#813).
+    /// `parking_lot::RwLock` keeps `publish` synchronous so the
+    /// reentrant `SubscriberRegistry::notify` path does not need to be
+    /// rewritten as async.
+    routes: Arc<parking_lot::RwLock<HashMap<RouteKey, Arc<parking_lot::Mutex<RouteEntry>>>>>,
+    /// Allocator for new `RouteKey.subscription_rep` ids; monotonic and
+    /// shared across all `EventBus` clones.
+    next_subscription_rep: Arc<SubscriptionRepAllocator>,
 }
 
 impl EventBus {
@@ -76,6 +91,8 @@ impl EventBus {
             registry: Arc::new(SubscriberRegistry::new()),
             capacity,
             ipc_seq: Arc::new(AtomicU64::new(1)),
+            routes: Arc::new(parking_lot::RwLock::new(HashMap::new())),
+            next_subscription_rep: Arc::new(SubscriptionRepAllocator::default()),
         }
     }
 
@@ -121,7 +138,71 @@ impl EventBus {
         // Notify synchronous subscribers
         self.registry.notify(&event, self);
 
+        // Fan out to routed subscriptions AFTER broadcast::send so a
+        // slow routed enqueue can never delay untargeted consumers
+        // (kernel_router, admin_router, bus_monitor — all still on
+        // broadcast). Routed receivers attached to the bus get full
+        // per-(capsule, topic, principal) delivery via the demux here.
+        self.dispatch_to_routes(&event);
+
         count
+    }
+
+    /// Iterate the routes table, fan out matching events into each
+    /// route's per-principal queue. The read-lock is released as soon
+    /// as the matching set is cloned out so a slow per-route push can
+    /// never block a sibling publish or a `subscribe_topic_routed`
+    /// write-lock acquisition.
+    fn dispatch_to_routes(&self, event: &Arc<AstridEvent>) {
+        // Snapshot matching route Arcs under the read lock, then
+        // release the lock before doing any per-route enqueue work.
+        // Without this, a publisher loop would hold the read lock
+        // across every route's lock-and-push, blocking
+        // `subscribe_topic_routed` callers (which need the write lock).
+        let matched: Vec<(RouteKey, Arc<parking_lot::Mutex<RouteEntry>>)> = {
+            let routes = self.routes.read();
+            if routes.is_empty() {
+                return;
+            }
+            routes
+                .iter()
+                .filter_map(|(k, e)| {
+                    let entry = e.lock();
+                    if entry.matcher.matches(event) {
+                        // Hold a shared label snapshot before drop so we
+                        // can release the per-entry lock between the
+                        // matcher check and the actual push (push needs
+                        // its own write lock).
+                        drop(entry);
+                        Some((k.clone(), Arc::clone(e)))
+                    } else {
+                        None
+                    }
+                })
+                .collect()
+        };
+        if matched.is_empty() {
+            return;
+        }
+
+        let principal: PrincipalKey = match &**event {
+            AstridEvent::Ipc { message, .. } => message.principal.clone(),
+            _ => None,
+        };
+
+        for (_key, entry_arc) in matched {
+            let mut entry = entry_arc.lock();
+            entry.push_with_eviction(
+                Arc::clone(event),
+                principal.clone(),
+                MAX_SUBSCRIPTION_BUDGET_BYTES,
+            );
+            // Capture the notify Arc before drop so we can wake the
+            // receiver without holding the entry lock across the wake.
+            let notify = Arc::clone(&entry.notify);
+            drop(entry);
+            notify.notify_one();
+        }
     }
 
     /// Subscribe to events.
@@ -178,6 +259,58 @@ impl EventBus {
         )
     }
 
+    /// Subscribe with publish-side per-(capsule, topic, principal)
+    /// routing.
+    ///
+    /// Allocates a [`RouteEntry`] in the bus's `routes` table and
+    /// returns a [`RoutedEventReceiver`] that drains its own queues
+    /// with deficit-round-robin fairness across principals. Two
+    /// receivers of the same `(capsule_uuid, topic_pattern)` get
+    /// distinct routes — each receives its own copy of every matching
+    /// event, unlike the broadcast channel which shares one queue.
+    ///
+    /// Dropping the receiver removes its route from the bus.
+    #[must_use]
+    pub fn subscribe_topic_routed(
+        &self,
+        capsule_uuid: uuid::Uuid,
+        topic_pattern: impl Into<String>,
+        capsule_id_label: impl Into<String>,
+        subscriber: &'static str,
+    ) -> RoutedEventReceiver {
+        let topic_pattern = topic_pattern.into();
+        let capsule_label = capsule_id_label.into();
+        let route_key = RouteKey {
+            capsule_uuid,
+            topic_pattern: topic_pattern.clone(),
+            subscription_rep: self.next_subscription_rep.next(),
+        };
+        let matcher = TopicMatcher::new(topic_pattern);
+        let entry = Arc::new(parking_lot::Mutex::new(RouteEntry::new(
+            matcher,
+            capsule_label,
+        )));
+        let notify = Arc::clone(&entry.lock().notify);
+        {
+            let mut routes = self.routes.write();
+            routes.insert(route_key.clone(), Arc::clone(&entry));
+        }
+        RoutedEventReceiver {
+            route_key,
+            route_entry: entry,
+            notify,
+            routes: Arc::clone(&self.routes),
+            lagged_count: 0,
+            subscriber,
+        }
+    }
+
+    /// Number of active routed subscriptions (diagnostic).
+    #[must_use]
+    pub fn routed_subscription_count(&self) -> usize {
+        self.routes.read().len()
+    }
+
     /// Get the synchronous subscriber registry (test-only).
     #[cfg(test)]
     #[must_use]
@@ -209,12 +342,16 @@ impl Default for EventBus {
 impl Clone for EventBus {
     fn clone(&self) -> Self {
         // Create a new bus that shares the same sender,
-        // subscriber registry, and sequence counter.
+        // subscriber registry, sequence counter, and routes table so
+        // a routed subscription created via one handle is visible to
+        // every publisher holding any clone of the bus.
         Self {
             sender: self.sender.clone(),
             registry: Arc::clone(&self.registry),
             capacity: self.capacity,
             ipc_seq: Arc::clone(&self.ipc_seq),
+            routes: Arc::clone(&self.routes),
+            next_subscription_rep: Arc::clone(&self.next_subscription_rep),
         }
     }
 }
@@ -395,605 +532,5 @@ impl EventReceiver {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::event::EventMetadata;
-
-    #[tokio::test]
-    async fn test_event_bus_creation() {
-        let bus = EventBus::new();
-        assert_eq!(bus.capacity(), DEFAULT_CHANNEL_CAPACITY);
-        assert_eq!(bus.subscriber_count(), 0);
-    }
-
-    #[tokio::test]
-    async fn test_event_bus_with_capacity() {
-        let bus = EventBus::with_capacity(100);
-        assert_eq!(bus.capacity(), 100);
-    }
-
-    #[tokio::test]
-    async fn test_publish_and_receive() {
-        let bus = EventBus::new();
-        let mut receiver = bus.subscribe();
-
-        let event = AstridEvent::RuntimeStarted {
-            metadata: EventMetadata::new("test"),
-            version: "0.1.0".to_string(),
-        };
-
-        let count = bus.publish(event);
-        assert_eq!(count, 1);
-
-        let msg = receiver.recv().await.unwrap();
-        assert_eq!(msg.event_type(), "astrid.v1.lifecycle.runtime_started");
-    }
-
-    #[tokio::test]
-    async fn test_multiple_subscribers() {
-        let bus = EventBus::new();
-        let mut receiver1 = bus.subscribe();
-        let mut receiver2 = bus.subscribe();
-
-        let event = AstridEvent::RuntimeStarted {
-            metadata: EventMetadata::new("test"),
-            version: "0.1.0".to_string(),
-        };
-
-        let count = bus.publish(event);
-        assert_eq!(count, 2);
-
-        let obj1 = receiver1.recv().await.unwrap();
-        let obj2 = receiver2.recv().await.unwrap();
-
-        assert_eq!(obj1.event_type(), "astrid.v1.lifecycle.runtime_started");
-        assert_eq!(obj2.event_type(), "astrid.v1.lifecycle.runtime_started");
-    }
-
-    #[tokio::test]
-    async fn test_no_subscribers() {
-        let bus = EventBus::new();
-
-        let event = AstridEvent::RuntimeStarted {
-            metadata: EventMetadata::new("test"),
-            version: "0.1.0".to_string(),
-        };
-
-        let count = bus.publish(event);
-        assert_eq!(count, 0);
-    }
-
-    #[tokio::test]
-    async fn test_try_recv_empty() {
-        let bus = EventBus::new();
-        let mut receiver = bus.subscribe();
-
-        let result = receiver.try_recv();
-        assert!(result.is_none());
-    }
-
-    #[tokio::test]
-    async fn test_try_recv_with_event() {
-        let bus = EventBus::new();
-        let mut receiver = bus.subscribe();
-
-        let event = AstridEvent::RuntimeStarted {
-            metadata: EventMetadata::new("test"),
-            version: "0.1.0".to_string(),
-        };
-
-        bus.publish(event);
-
-        let result = receiver.try_recv();
-        assert!(result.is_some());
-    }
-
-    #[tokio::test]
-    async fn test_subscriber_count() {
-        let bus = EventBus::new();
-        assert_eq!(bus.subscriber_count(), 0);
-
-        let receiver1 = bus.subscribe();
-        assert_eq!(bus.subscriber_count(), 1);
-
-        let _receiver2 = bus.subscribe();
-        assert_eq!(bus.subscriber_count(), 2);
-
-        drop(receiver1);
-        // Note: subscriber count may not immediately reflect dropped receivers
-    }
-
-    #[tokio::test]
-    async fn test_cloned_bus_synchronous_subscriber() {
-        use crate::subscriber::FilterSubscriber;
-        use std::sync::atomic::{AtomicUsize, Ordering};
-
-        let bus = EventBus::new();
-        let cloned_bus = bus.clone();
-
-        let counter = Arc::new(AtomicUsize::new(0));
-        let counter_clone = Arc::clone(&counter);
-
-        let subscriber = FilterSubscriber::new("test_sync", move |_| {
-            counter_clone.fetch_add(1, Ordering::SeqCst);
-        });
-
-        // Register on the cloned bus
-        cloned_bus.registry().register(Arc::new(subscriber));
-
-        // Publish on the original bus
-        let event = AstridEvent::RuntimeStarted {
-            metadata: EventMetadata::new("test"),
-            version: "0.1.0".to_string(),
-        };
-        bus.publish(event);
-
-        // The subscriber registered on the cloned bus should have received it
-        assert_eq!(counter.load(Ordering::SeqCst), 1);
-    }
-
-    #[tokio::test]
-    async fn test_event_bus_drop_cleans_up_registry() {
-        use crate::subscriber::FilterSubscriber;
-        use std::sync::atomic::{AtomicUsize, Ordering};
-
-        struct DropNotify(Arc<AtomicUsize>);
-        impl Drop for DropNotify {
-            fn drop(&mut self) {
-                self.0.fetch_add(1, Ordering::SeqCst);
-            }
-        }
-
-        let drop_count = Arc::new(AtomicUsize::new(0));
-        let drop_count_clone = Arc::clone(&drop_count);
-
-        let notifier = DropNotify(drop_count_clone);
-        let bus = EventBus::new();
-
-        let subscriber = FilterSubscriber::new("test_drop", move |_| {
-            let _ = &notifier; // Capture notifier so it drops when the subscriber drops
-        });
-
-        bus.registry().register(Arc::new(subscriber));
-
-        // The subscriber shouldn't drop until the bus drops
-        assert_eq!(drop_count.load(Ordering::SeqCst), 0);
-
-        drop(bus);
-
-        // Dropping the bus should drop the registry, dropping the subscriber, triggering DropNotify
-        assert_eq!(drop_count.load(Ordering::SeqCst), 1);
-    }
-
-    #[tokio::test]
-    async fn test_reentrancy_unregister_from_on_event() {
-        use crate::subscriber::{EventSubscriber, SubscriberId};
-        use std::sync::Mutex;
-
-        struct UnregisteringSubscriber {
-            my_id: Mutex<Option<SubscriberId>>,
-        }
-
-        impl EventSubscriber for UnregisteringSubscriber {
-            fn on_event(&self, _event: &AstridEvent, bus: &EventBus) {
-                let id = self.my_id.lock().unwrap().expect("id not set");
-                // This shouldn't deadlock against notify's read lock
-                bus.registry().unregister(id);
-            }
-        }
-
-        let bus = EventBus::new();
-
-        let subscriber = Arc::new(UnregisteringSubscriber {
-            my_id: Mutex::new(None),
-        });
-
-        let id = bus
-            .registry()
-            .register(Arc::clone(&subscriber) as Arc<dyn EventSubscriber>);
-        *subscriber.my_id.lock().unwrap() = Some(id);
-
-        let event = AstridEvent::RuntimeStarted {
-            metadata: EventMetadata::new("test"),
-            version: "0.1.0".to_string(),
-        };
-
-        // This will trigger on_event, which calls unregister.
-        bus.publish(event);
-
-        assert_eq!(bus.registry().len(), 0);
-    }
-
-    #[tokio::test]
-    async fn test_drop_deadlock_publish_from_drop() {
-        use crate::subscriber::EventSubscriber;
-
-        struct DroppingSubscriber {
-            bus: EventBus,
-        }
-
-        impl EventSubscriber for DroppingSubscriber {
-            fn on_event(&self, _event: &AstridEvent, _bus: &EventBus) {}
-        }
-
-        impl Drop for DroppingSubscriber {
-            fn drop(&mut self) {
-                let event = AstridEvent::RuntimeStarted {
-                    metadata: EventMetadata::new("test"),
-                    version: "0.1.0".to_string(),
-                };
-                // If unregister holds the write lock while dropping us, this will deadlock
-                // when notify tries to get the read lock.
-                self.bus.publish(event);
-            }
-        }
-
-        let bus = EventBus::new();
-
-        let id = bus
-            .registry()
-            .register(Arc::new(DroppingSubscriber { bus: bus.clone() }));
-
-        // This shouldn't deadlock
-        bus.registry().unregister(id);
-    }
-
-    #[tokio::test]
-    async fn test_topic_subscription_exact() {
-        let bus = EventBus::new();
-        let mut all_receiver = bus.subscribe();
-        let mut specific_receiver = bus.subscribe_topic("astrid.cli.input");
-
-        let msg = crate::ipc::IpcMessage::new(
-            "astrid.cli.input",
-            crate::ipc::IpcPayload::UserInput {
-                text: "hello".into(),
-                session_id: "default".into(),
-                context: None,
-            },
-            uuid::Uuid::new_v4(),
-        );
-
-        let event = AstridEvent::Ipc {
-            metadata: EventMetadata::new("test"),
-            message: msg,
-        };
-
-        bus.publish(event);
-
-        assert!(all_receiver.try_recv().is_some());
-        assert!(specific_receiver.try_recv().is_some());
-
-        // Publish to a different topic
-        let msg2 = crate::ipc::IpcMessage::new(
-            "astrid.telegram.input",
-            crate::ipc::IpcPayload::UserInput {
-                text: "hello".into(),
-                session_id: "default".into(),
-                context: None,
-            },
-            uuid::Uuid::new_v4(),
-        );
-
-        let event2 = AstridEvent::Ipc {
-            metadata: EventMetadata::new("test"),
-            message: msg2,
-        };
-
-        bus.publish(event2);
-
-        assert!(all_receiver.try_recv().is_some());
-        // Specific receiver should ignore this
-        assert!(specific_receiver.try_recv().is_none());
-    }
-
-    #[tokio::test]
-    async fn test_topic_subscription_wildcard() {
-        let bus = EventBus::new();
-        // Trailing `*` matches 1+ segments; "astrid.*" is a namespace subscription
-        // that matches any topic starting with "astrid." regardless of depth.
-        let mut wildcard_receiver = bus.subscribe_topic("astrid.*");
-
-        let msg1 = crate::ipc::IpcMessage::new(
-            "astrid.cli.input",
-            crate::ipc::IpcPayload::UserInput {
-                text: "hello".into(),
-                session_id: "default".into(),
-                context: None,
-            },
-            uuid::Uuid::new_v4(),
-        );
-        let event1 = AstridEvent::Ipc {
-            metadata: EventMetadata::new("test"),
-            message: msg1,
-        };
-
-        let msg2 = crate::ipc::IpcMessage::new(
-            "system.log",
-            crate::ipc::IpcPayload::UserInput {
-                text: "hello".into(),
-                session_id: "default".into(),
-                context: None,
-            },
-            uuid::Uuid::new_v4(),
-        );
-        let event2 = AstridEvent::Ipc {
-            metadata: EventMetadata::new("test"),
-            message: msg2,
-        };
-
-        bus.publish(event1);
-        bus.publish(event2);
-
-        // Should receive the matching one, but not the non-matching one
-        let received = wildcard_receiver.try_recv().unwrap();
-        if let AstridEvent::Ipc { message, .. } = &*received {
-            assert_eq!(message.topic, "astrid.cli.input");
-        } else {
-            panic!("Expected IPC event");
-        }
-
-        assert!(wildcard_receiver.try_recv().is_none());
-    }
-
-    #[tokio::test]
-    async fn test_topic_subscription_ignores_non_ipc() {
-        let bus = EventBus::new();
-        let mut specific_receiver = bus.subscribe_topic("astrid.cli.input");
-
-        // Publish a non-IPC event
-        let event = AstridEvent::RuntimeStarted {
-            metadata: EventMetadata::new("test"),
-            version: "0.1.0".into(),
-        };
-
-        bus.publish(event);
-
-        // Specific receiver should strictly ignore non-IPC events
-        assert!(specific_receiver.try_recv().is_none());
-    }
-
-    /// Helper to create an IPC event with a given topic.
-    fn ipc_event(topic: &str) -> AstridEvent {
-        AstridEvent::Ipc {
-            metadata: EventMetadata::new("test"),
-            message: crate::ipc::IpcMessage::new(
-                topic,
-                crate::ipc::IpcPayload::UserInput {
-                    text: "x".into(),
-                    session_id: "default".into(),
-                    context: None,
-                },
-                uuid::Uuid::new_v4(),
-            ),
-        }
-    }
-
-    #[tokio::test]
-    async fn test_wildcard_matches_multiple_depths() {
-        let bus = EventBus::new();
-        let mut receiver = bus.subscribe_topic("astrid.v1.request.*");
-
-        // 4 segments: should match (1 segment after prefix)
-        bus.publish(ipc_event("astrid.v1.request.list_capsules"));
-        assert!(receiver.try_recv().is_some());
-
-        // 5 segments: should also match (trailing * = 1+ segments)
-        bus.publish(ipc_event("astrid.v1.request.foo.bar"));
-        assert!(receiver.try_recv().is_some());
-
-        // 3 segments (fewer than prefix + 1): should NOT match
-        bus.publish(ipc_event("astrid.v1.request"));
-        assert!(receiver.try_recv().is_none());
-
-        // Different prefix: should NOT match
-        bus.publish(ipc_event("system.v1.request.foo"));
-        assert!(receiver.try_recv().is_none());
-    }
-
-    #[tokio::test]
-    async fn test_wildcard_rejects_deep_topics() {
-        let bus = EventBus::new();
-        let mut receiver = bus.subscribe_topic("a.*");
-
-        // 21 segments: exceeds MAX_TOPIC_DEPTH of 20
-        let deep = (0..21)
-            .map(|i| format!("s{i}"))
-            .collect::<Vec<_>>()
-            .join(".");
-        let topic = format!("a.{deep}");
-        bus.publish(ipc_event(&topic));
-        assert!(receiver.try_recv().is_none());
-    }
-
-    #[tokio::test]
-    async fn test_middle_wildcard_matches_one_segment() {
-        let bus = EventBus::new();
-        let mut receiver = bus.subscribe_topic("astrid.*.input");
-
-        // Exact match with one middle segment
-        bus.publish(ipc_event("astrid.cli.input"));
-        assert!(receiver.try_recv().is_some());
-
-        // Different middle segment also matches
-        bus.publish(ipc_event("astrid.telegram.input"));
-        assert!(receiver.try_recv().is_some());
-
-        // Wrong last segment: should NOT match
-        bus.publish(ipc_event("astrid.cli.output"));
-        assert!(receiver.try_recv().is_none());
-
-        // Extra segment: should NOT match (segment count mismatch)
-        bus.publish(ipc_event("astrid.cli.sub.input"));
-        assert!(receiver.try_recv().is_none());
-    }
-
-    #[tokio::test]
-    async fn test_drain_lagged_initially_zero() {
-        let bus = EventBus::new();
-        let mut receiver = bus.subscribe();
-        assert_eq!(receiver.drain_lagged(), 0);
-    }
-
-    #[tokio::test]
-    async fn test_drain_lagged_resets_after_read() {
-        // Use a tiny channel so we can force lag easily.
-        let bus = EventBus::with_capacity(2);
-        let mut receiver = bus.subscribe();
-
-        // Publish 5 events into a capacity-2 channel — the receiver will lag.
-        for i in 0..5 {
-            let event = AstridEvent::RuntimeStarted {
-                metadata: EventMetadata::new("test"),
-                version: format!("{i}"),
-            };
-            bus.publish(event);
-        }
-
-        // try_recv will encounter the Lagged error and accumulate it.
-        let _ = receiver.try_recv();
-
-        let lagged = receiver.drain_lagged();
-        assert!(lagged > 0, "expected lag count > 0, got {lagged}");
-
-        // Second drain should be zero — it was reset.
-        assert_eq!(receiver.drain_lagged(), 0);
-    }
-
-    #[tokio::test]
-    async fn test_drain_lagged_accumulates_across_calls() {
-        let bus = EventBus::with_capacity(2);
-        let mut receiver = bus.subscribe();
-
-        // First burst: overflow the channel.
-        for _ in 0..4 {
-            bus.publish(AstridEvent::RuntimeStarted {
-                metadata: EventMetadata::new("test"),
-                version: "v1".into(),
-            });
-        }
-        // Drain available messages to trigger the Lagged error.
-        while receiver.try_recv().is_some() {}
-
-        let lag1 = receiver.drain_lagged();
-
-        // Second burst: overflow again.
-        for _ in 0..4 {
-            bus.publish(AstridEvent::RuntimeStarted {
-                metadata: EventMetadata::new("test"),
-                version: "v2".into(),
-            });
-        }
-        while receiver.try_recv().is_some() {}
-
-        let lag2 = receiver.drain_lagged();
-
-        // Both bursts should have caused lag independently.
-        assert!(lag1 > 0, "first burst should lag");
-        assert!(lag2 > 0, "second burst should lag");
-    }
-
-    #[tokio::test]
-    async fn test_recv_blocking_with_timeout() {
-        let bus = EventBus::new();
-        let mut receiver = bus.subscribe();
-
-        // With no messages, recv should return None after timeout.
-        let result =
-            tokio::time::timeout(std::time::Duration::from_millis(50), receiver.recv()).await;
-
-        // Timeout should fire — no messages published.
-        assert!(result.is_err(), "expected timeout, got a message");
-    }
-
-    #[tokio::test]
-    async fn test_recv_blocking_wakes_on_message() {
-        let bus = EventBus::new();
-        let mut receiver = bus.subscribe();
-
-        // Spawn a task that publishes after a short delay.
-        let bus_clone = bus.clone();
-        tokio::spawn(async move {
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-            bus_clone.publish(AstridEvent::RuntimeStarted {
-                metadata: EventMetadata::new("test"),
-                version: "wake".into(),
-            });
-        });
-
-        // recv should wake when the message arrives, well before 5s.
-        let result = tokio::time::timeout(std::time::Duration::from_secs(5), receiver.recv()).await;
-
-        assert!(result.is_ok(), "recv should have woken up");
-        let event = result.unwrap().unwrap();
-        assert_eq!(event.event_type(), "astrid.v1.lifecycle.runtime_started");
-    }
-
-    #[tokio::test]
-    async fn test_try_recv_drains_burst() {
-        let bus = EventBus::new();
-        let mut receiver = bus.subscribe();
-
-        // Publish 10 messages in a burst.
-        for i in 0..10 {
-            bus.publish(AstridEvent::RuntimeStarted {
-                metadata: EventMetadata::new("test"),
-                version: format!("{i}"),
-            });
-        }
-
-        // Drain all with try_recv.
-        let mut count = 0;
-        while receiver.try_recv().is_some() {
-            count += 1;
-        }
-        assert_eq!(count, 10);
-
-        // No more messages.
-        assert!(receiver.try_recv().is_none());
-    }
-
-    #[test]
-    fn lag_and_publish_metrics_record_with_labels() {
-        use metrics_util::debugging::DebuggingRecorder;
-
-        let recorder = DebuggingRecorder::new();
-        let snapshotter = recorder.snapshotter();
-
-        // A small-capacity bus with 5 un-drained publishes forces the
-        // receiver to lag; the first `try_recv` then reports it and records
-        // the per-subscriber counter. Scoped to a thread-local recorder so
-        // this never touches a global recorder another test may install.
-        metrics::with_local_recorder(&recorder, || {
-            let bus = EventBus::with_capacity(2);
-            let mut rx = bus.subscribe_as("test_subscriber");
-            for _ in 0..5 {
-                bus.publish(AstridEvent::RuntimeStarted {
-                    metadata: EventMetadata::new("test"),
-                    version: "0.1.0".to_string(),
-                });
-            }
-            // First call records the lag; the rest drain the survivors.
-            while rx.try_recv().is_some() {}
-        });
-
-        let mut published = false;
-        let mut lag_labelled = false;
-        for (composite, _unit, _desc, _value) in snapshotter.snapshot().into_vec() {
-            let (_kind, key) = composite.into_parts();
-            let name = key.name();
-            if name == METRIC_BUS_EVENTS_PUBLISHED_TOTAL {
-                published = true;
-            } else if name == METRIC_BUS_RECEIVER_LAGGED_TOTAL {
-                lag_labelled = key
-                    .labels()
-                    .any(|l| l.key() == "subscriber" && l.value() == "test_subscriber");
-            }
-        }
-        assert!(published, "publish counter not recorded");
-        assert!(
-            lag_labelled,
-            "lag counter missing or not labelled with the subscriber tag"
-        );
-    }
-}
+#[path = "bus_tests.rs"]
+mod tests;
