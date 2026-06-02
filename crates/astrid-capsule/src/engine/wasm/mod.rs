@@ -1213,6 +1213,20 @@ impl ExecutionEngine for WasmEngine {
             )
         })?;
 
+        // Invoking principal, derived once: used both for the quota profile
+        // below and the per-invocation diagnostic span at the end. Lock-free
+        // — `owner_principal` is the immutable load-time `state.principal`.
+        let invoking_principal = caller
+            .and_then(|msg| msg.principal.as_deref())
+            .and_then(|p| astrid_core::PrincipalId::new(p).ok())
+            .or_else(|| self.owner_principal.clone())
+            .unwrap_or_default();
+
+        // Per-invocation timing for the live "sample" view (#816
+        // observability). Started before profile resolution + pool checkout so
+        // the span captures the full kernel-side cost a caller waits on.
+        let invoke_start = std::time::Instant::now();
+
         // Layer 3 (#666): resolve the invoking principal's quota profile
         // BEFORE touching the store — a failed load denies the invocation
         // without mutating state. Fail-closed: no fallback to the owner's
@@ -1227,35 +1241,26 @@ impl ExecutionEngine for WasmEngine {
         // a principal can drive, not just the admin IPC. In-flight
         // invocations finish under the old value (we only check at
         // entry); new invocations are refused.
-        let invocation_profile: Option<Arc<astrid_core::profile::PrincipalProfile>> = match self
-            .profile_cache
-            .as_ref()
-        {
-            Some(cache) => {
-                // Derive the invoking principal without locking the store —
-                // `owner_principal` captures the immutable `state.principal`
-                // at `load()` time, so the fallback path is allocation- and
-                // lock-free on the hot path.
-                let invoking = caller
-                    .and_then(|msg| msg.principal.as_deref())
-                    .and_then(|p| astrid_core::PrincipalId::new(p).ok())
-                    .or_else(|| self.owner_principal.clone())
-                    .unwrap_or_default();
-                let profile = cache.resolve(&invoking).map_err(|e| {
-                    tracing::error!(principal = %invoking, error = %e,
+        let invocation_profile: Option<Arc<astrid_core::profile::PrincipalProfile>> =
+            match self.profile_cache.as_ref() {
+                Some(cache) => {
+                    let profile = cache.resolve(&invoking_principal).map_err(|e| {
+                        tracing::error!(principal = %invoking_principal, error = %e,
                             "profile load failed; denying invocation (issue #666)");
-                    CapsuleError::WasmError(format!("principal '{invoking}' profile invalid: {e}"))
-                })?;
-                check_principal_enabled(
-                    &profile,
-                    &invoking,
-                    self.manifest.package.name.as_str(),
-                    action,
-                )?;
-                Some(profile)
-            },
-            None => None,
-        };
+                        CapsuleError::WasmError(format!(
+                            "principal '{invoking_principal}' profile invalid: {e}"
+                        ))
+                    })?;
+                    check_principal_enabled(
+                        &profile,
+                        &invoking_principal,
+                        self.manifest.package.name.as_str(),
+                        action,
+                    )?;
+                    Some(profile)
+                },
+                None => None,
+            };
         // Is the capsule a daemon (uplink / long-lived)? Daemons keep their
         // load-time `u64::MAX` epoch deadline; only non-daemon capsules
         // accept a per-invocation timeout from the profile.
@@ -1324,10 +1329,15 @@ impl ExecutionEngine for WasmEngine {
         // Stores (issue #816). `instance` (a `Copy` handle) is taken before
         // borrowing the store mutably for the SET/CALL block; `PoolCheckout`
         // clears the invocation state and returns the instance on drop.
+        let checkout_start = std::time::Instant::now();
         let mut checkout = pool
             .checkout()
             .await
             .ok_or_else(|| CapsuleError::NotSupported("capsule is unloading".into()))?;
+        // Time spent waiting for a free pooled instance — a rising
+        // `pool_wait_ms` is the signal the pool is saturated (all instances
+        // busy), distinct from a slow guest call.
+        let pool_wait_ms = checkout_start.elapsed().as_millis() as u64;
         let typed_instance = checkout.instance();
         let result: CapsuleResult<HookTriggerResult> = {
             let s = checkout.store_mut();
@@ -1454,6 +1464,33 @@ impl ExecutionEngine for WasmEngine {
         // Drop the lease: Phase 3 CLEAR runs and the instance returns to the
         // pool, so a parallel invocation can lease it with clean state.
         drop(checkout);
+
+        // ── Per-invocation diagnostic span (observability brick #1, #816) ──
+        // The debug log carries the *principal* (greppable per handler — this
+        // is exactly what distinguishes a cross-principal KV scope mismatch
+        // from a same-principal visibility race) plus the timing breakdown:
+        // `pool_wait_ms` (pool saturation) vs `invoke_ms` (full kernel-side
+        // cost). Off by default at debug; enable via
+        // `directives = ["astrid.sample=debug"]`. The metric stays
+        // low-cardinality — `capsule` + `action` only, never `principal`,
+        // which would explode label cardinality across thousands of agents.
+        let invoke_ms = invoke_start.elapsed().as_millis() as u64;
+        metrics::histogram!(
+            "astrid_capsule_invocation_duration_seconds",
+            "capsule" => self.manifest.package.name.clone(),
+            "action" => action.to_string(),
+        )
+        .record(invoke_start.elapsed().as_secs_f64());
+        tracing::debug!(
+            target: "astrid.sample",
+            capsule = %self.manifest.package.name,
+            action,
+            principal = %invoking_principal,
+            pool_wait_ms,
+            invoke_ms,
+            ok = result.is_ok(),
+            "interceptor invocation"
+        );
 
         result.map(|cr| {
             crate::capsule::InterceptResult::from_capsule_result(&cr.action, cr.data.as_deref())
