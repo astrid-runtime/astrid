@@ -82,7 +82,17 @@ pub async fn get_events(
     // time for the audit stream.
     let firehose = caller_holds(&state, &caller.principal, AUDIT_FIREHOSE_CAP).await;
 
-    let mut receiver = bus.subscribe_topic(AUDIT_TOPIC);
+    // Routed subscription so the audit firehose gets the same
+    // per-(topic, principal) DRR fairness the rest of the gateway
+    // SSE streams now use (#813 Layer 4). The principal-firehose
+    // filter at the post-receive layer is unchanged — it's a
+    // capability gate, not a routing concern.
+    let mut receiver = bus.subscribe_topic_routed(
+        state.gateway_route_uuid,
+        AUDIT_TOPIC,
+        "gateway",
+        "gateway::audit_sse",
+    );
     let caller_principal = caller.principal;
 
     let stream = async_stream::stream! {
@@ -97,7 +107,7 @@ pub async fn get_events(
                 }).to_string())
         );
 
-        while let Some(event) = receiver.recv().await {
+        while let Some(event) = receiver.recv(None).await {
             let AstridEvent::Ipc { message, .. } = &*event else {
                 continue;
             };

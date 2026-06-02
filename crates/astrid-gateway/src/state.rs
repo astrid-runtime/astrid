@@ -15,6 +15,7 @@ use astrid_core::PrincipalId;
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use rand::RngCore;
 use tokio::sync::Mutex;
+use uuid::Uuid;
 
 use metrics_exporter_prometheus::PrometheusHandle;
 
@@ -206,6 +207,18 @@ pub struct GatewayState {
     /// today; if a future kernel ever runs multiple sessions
     /// concurrently this becomes the slice the gateway is scoped to.
     pub session_id: Option<astrid_core::SessionId>,
+    /// Stable per-gateway-instance UUID supplied as the `capsule_uuid`
+    /// argument to [`astrid_events::EventBus::subscribe_topic_routed`]
+    /// for every gateway SSE subscription. Each subscribe call still
+    /// receives a unique `RouteKey` via the bus's internal
+    /// `subscription_rep` allocator, so a fixed UUID here is fine —
+    /// it pairs the metric labels (`capsule="gateway"`) across every
+    /// route this gateway opens. Re-generated on each boot
+    /// (`Uuid::new_v4`); harmless because no persisted state is keyed
+    /// on it. Layer 4 of the #813 fix swaps the gateway's broadcast
+    /// receivers for the routed surface so the per-(topic, principal)
+    /// DRR fairness machinery applies to the SSE streams.
+    pub gateway_route_uuid: Uuid,
 }
 
 impl GatewayState {
@@ -259,6 +272,7 @@ impl GatewayState {
             revoked_at,
             audit_log,
             session_id,
+            gateway_route_uuid: Uuid::new_v4(),
         }))
     }
 

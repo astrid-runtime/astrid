@@ -1,7 +1,8 @@
-//! Bounded principal-class label for telemetry and per-class chain
-//! serialization. Extracted as a shared typed enum so the
-//! `EventDispatcher`'s `chain_locks` map and the IPC host-fn audit
-//! labels agree on label cardinality (3 buckets × capsule_count).
+//! Bounded principal-class label for telemetry and IPC host-fn audit
+//! labels. Used only for emitting bounded-cardinality metrics labels
+//! (3 buckets) — dispatcher routing (mpsc queues and `chain_locks`) is
+//! now keyed on the unbounded `PrincipalKey` so distinct user
+//! principals do not collide on a single class-keyed queue.
 
 /// Three-way classification of an IPC message's originating principal.
 /// The mapping mirrors `astrid_events::principal_class_label` so labels

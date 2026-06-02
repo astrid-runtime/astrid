@@ -222,6 +222,7 @@ mod tests {
             )),
             audit_log: None,
             session_id: None,
+            gateway_route_uuid: uuid::Uuid::new_v4(),
         })
     }
 

@@ -749,3 +749,49 @@ async fn routed_5000_principals_demand_allocate() {
     assert_eq!(drained.len(), 5000);
     assert_eq!(sub.active_principals(), 0);
 }
+
+#[tokio::test]
+async fn routed_receiver_drain_under_n1000_fanin_via_try_drain() {
+    // Pins that 1000 distinct principals routed into one receiver land
+    // in the entry's per-principal buckets without back-pressure
+    // collapse. Drains through `try_drain` (the diagnostic path the
+    // gateway can poll under saturation alarms); the SSE-shaped `recv`
+    // path is exercised by `routed_recv_wakes_on_publish` above.
+    let bus = EventBus::new();
+    let mut sub =
+        bus.subscribe_topic_routed(uuid::Uuid::new_v4(), "t.*", "capsule-fanin", "test_sub");
+    for i in 0..1000 {
+        bus.publish(ipc_evt("t.x", Some(&format!("p{i}"))));
+    }
+    assert_eq!(sub.active_principals(), 1000);
+    let drained = sub.try_drain(super::MAX_SUBSCRIPTION_BUDGET_BYTES);
+    let mut seen = std::collections::HashSet::new();
+    for ev in &drained {
+        if let AstridEvent::Ipc { message, .. } = &**ev
+            && let Some(p) = &message.principal
+        {
+            seen.insert(p.clone());
+        }
+    }
+    assert_eq!(seen.len(), 1000, "every distinct principal should drain");
+}
+
+#[tokio::test]
+async fn routed_receiver_isolation_between_subscriptions() {
+    // Two routed subscriptions for the same topic each get their own
+    // RouteEntry. Draining one doesn't drain the other — they're
+    // independent fan-out targets.
+    let bus = EventBus::new();
+    let mut a = bus.subscribe_topic_routed(uuid::Uuid::new_v4(), "t.*", "capsule-a", "test_sub");
+    let mut b = bus.subscribe_topic_routed(uuid::Uuid::new_v4(), "t.*", "capsule-b", "test_sub");
+
+    for _ in 0..10 {
+        bus.publish(ipc_evt("t.x", Some("alice")));
+    }
+
+    let drained_a = a.try_drain(super::MAX_SUBSCRIPTION_BUDGET_BYTES);
+    assert_eq!(drained_a.len(), 10, "a should see all 10");
+    // b's queue is untouched by a's drain.
+    let drained_b = b.try_drain(super::MAX_SUBSCRIPTION_BUDGET_BYTES);
+    assert_eq!(drained_b.len(), 10, "b independently sees all 10");
+}

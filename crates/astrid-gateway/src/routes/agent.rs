@@ -28,10 +28,12 @@
 //!
 //! ## Filtering
 //!
-//! Subscribers see **every** event on each topic, so we filter at
-//! the consumer end by `session_id` to avoid cross-session bleed
-//! when multiple dashboards are connected. The kernel's per-principal
-//! routing is enforced separately by the cap gate on `user.v1.prompt`.
+//! Each SSE subscription opens a routed receiver via
+//! [`astrid_events::EventBus::subscribe_topic_routed`]; per-(topic,
+//! principal) DRR fairness and publish-side byte-budget eviction are
+//! enforced by the bus's routing demux. The `session_id` post-receive
+//! filter handles cross-session de-multiplexing within a principal's
+//! stream — session is a payload concern, not a routing concern.
 //!
 //! ## Termination
 //!
@@ -148,11 +150,22 @@ pub async fn post_prompt(
 
     // Subscribe FIRST, then publish. Reverse order would race a fast
     // model response — the first delta could land before subscribe
-    // returns and we'd miss it.
-    let mut response_rx = bus.subscribe_topic("agent.v1.response");
-    let mut delta_rx = bus.subscribe_topic("agent.v1.stream.delta");
-    let mut session_rx = bus.subscribe_topic("agent.v1.session_changed");
-    let mut elicit_rx = bus.subscribe_topic("astrid.v1.elicit");
+    // returns and we'd miss it. Routed subscription so each SSE
+    // stream gets its own per-(topic, principal) DRR queue inside
+    // the bus, replacing the broadcast-channel back-pressure that
+    // collapsed the 100-principal fan-in (#813 Layer 4).
+    let subscribe = |topic: &'static str| {
+        bus.subscribe_topic_routed(
+            state.gateway_route_uuid,
+            topic,
+            "gateway",
+            "gateway::agent_sse",
+        )
+    };
+    let mut response_rx = subscribe("agent.v1.response");
+    let mut delta_rx = subscribe("agent.v1.stream.delta");
+    let mut session_rx = subscribe("agent.v1.session_changed");
+    let mut elicit_rx = subscribe("astrid.v1.elicit");
 
     let payload = TypesIpcPayload::UserInput {
         text: body.text,
@@ -198,7 +211,7 @@ pub async fn post_prompt(
                 // buffered.
                 biased;
                 () = tokio::time::sleep(remaining) => break,
-                event = response_rx.recv() => {
+                event = response_rx.recv(None) => {
                     let Some(event) = event else { break };
                     if let Some(ev) = forward_event(&event, &session_id_for_stream, "response") {
                         yield Ok(ev);
@@ -207,19 +220,19 @@ pub async fn post_prompt(
                     // stream once we've forwarded it.
                     break;
                 }
-                event = delta_rx.recv() => {
+                event = delta_rx.recv(None) => {
                     let Some(event) = event else { break };
                     if let Some(ev) = forward_event(&event, &session_id_for_stream, "delta") {
                         yield Ok(ev);
                     }
                 }
-                event = session_rx.recv() => {
+                event = session_rx.recv(None) => {
                     let Some(event) = event else { break };
                     if let Some(ev) = forward_event(&event, &session_id_for_stream, "session_changed") {
                         yield Ok(ev);
                     }
                 }
-                event = elicit_rx.recv() => {
+                event = elicit_rx.recv(None) => {
                     let Some(event) = event else { break };
                     // Elicit events don't carry session_id in the
                     // same shape — forward unconditionally and let

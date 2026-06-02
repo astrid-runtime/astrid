@@ -1,7 +1,8 @@
 //! Tests for [`crate::dispatcher`]. Kept in a sibling file (referenced
 //! via `#[path]`) so `dispatcher.rs` stays under the per-file CI line
 //! cap while the test surface continues to grow with new dispatch
-//! semantics (priority order, chain short-circuit, semaphore cap, …).
+//! semantics (priority order, chain short-circuit, per-principal
+//! isolation, …).
 
 use super::*;
 
@@ -9,7 +10,7 @@ use super::*;
 
 use async_trait::async_trait;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use crate::capsule::{Capsule, CapsuleId, CapsuleState, InterceptResult};
@@ -27,6 +28,13 @@ struct MockCapsule {
     invocation_log: Option<Arc<Mutex<Vec<String>>>>,
     /// Override the default `Continue` result for testing chain semantics.
     result_override: Option<InterceptResult>,
+    /// Optional principal-tagged invocation counter. When set, every
+    /// `invoke_interceptor` call appends the caller's `principal`
+    /// field (or `<none>` for system events). Tests use this to
+    /// assert per-principal isolation under fan-in.
+    principal_log: Option<Arc<Mutex<Vec<String>>>>,
+    /// Optional shared counter incremented on every invoke.
+    invoke_counter: Option<Arc<AtomicUsize>>,
 }
 
 impl MockCapsule {
@@ -87,6 +95,8 @@ impl MockCapsule {
             invoked: Arc::clone(&invoked),
             invocation_log,
             result_override: None,
+            principal_log: None,
+            invoke_counter: None,
         };
         (capsule, invoked)
     }
@@ -113,11 +123,20 @@ impl Capsule for MockCapsule {
         &self,
         _action: &str,
         _payload: &[u8],
-        _caller: Option<&astrid_events::ipc::IpcMessage>,
+        caller: Option<&astrid_events::ipc::IpcMessage>,
     ) -> CapsuleResult<InterceptResult> {
         self.invoked.store(true, Ordering::SeqCst);
         if let Some(ref log) = self.invocation_log {
             log.lock().unwrap().push(self.id.to_string());
+        }
+        if let Some(ref log) = self.principal_log {
+            let p = caller
+                .and_then(|m| m.principal.clone())
+                .unwrap_or_else(|| "<none>".to_string());
+            log.lock().unwrap().push(p);
+        }
+        if let Some(ref c) = self.invoke_counter {
+            c.fetch_add(1, Ordering::SeqCst);
         }
         if let Some(ref result) = self.result_override {
             return Ok(result.clone());
@@ -469,162 +488,6 @@ async fn final_interceptor_short_circuits_chain() {
     handle.abort();
 }
 
-/// Mock capsule that records concurrent invocations and holds its own
-/// per-capsule `Arc<Semaphore>` matching the production cap. Used by
-/// the semaphore-cap test below to assert no more than
-/// `MAX_CONCURRENT_INTERCEPTORS` invokes of the same capsule run at
-/// once even under fan-in pressure.
-struct SemaphoreMockCapsule {
-    id: CapsuleId,
-    manifest: CapsuleManifest,
-    semaphore: Arc<tokio::sync::Semaphore>,
-    in_flight: Arc<std::sync::atomic::AtomicUsize>,
-    peak: Arc<std::sync::atomic::AtomicUsize>,
-    invoke_count: Arc<std::sync::atomic::AtomicUsize>,
-}
-#[async_trait]
-impl Capsule for SemaphoreMockCapsule {
-    fn id(&self) -> &CapsuleId {
-        &self.id
-    }
-    fn manifest(&self) -> &CapsuleManifest {
-        &self.manifest
-    }
-    fn state(&self) -> CapsuleState {
-        CapsuleState::Ready
-    }
-    async fn load(&mut self, _ctx: &CapsuleContext) -> CapsuleResult<()> {
-        Ok(())
-    }
-    async fn unload(&mut self) -> CapsuleResult<()> {
-        Ok(())
-    }
-    fn interceptor_semaphore(&self) -> &Arc<tokio::sync::Semaphore> {
-        &self.semaphore
-    }
-    fn invoke_interceptor(
-        &self,
-        _action: &str,
-        _payload: &[u8],
-        _caller: Option<&astrid_events::ipc::IpcMessage>,
-    ) -> CapsuleResult<InterceptResult> {
-        let n = self
-            .in_flight
-            .fetch_add(1, Ordering::SeqCst)
-            .saturating_add(1);
-        // Track the high-water mark of concurrent invokes.
-        self.peak.fetch_max(n, Ordering::SeqCst);
-        // Hold the permit long enough that parallel chain spawns
-        // pile up against the semaphore cap. 30ms × 4 (cap) plenty
-        // for the dispatcher to surface contention.
-        std::thread::sleep(Duration::from_millis(30));
-        self.in_flight.fetch_sub(1, Ordering::SeqCst);
-        self.invoke_count.fetch_add(1, Ordering::SeqCst);
-        Ok(InterceptResult::Continue(Vec::new()))
-    }
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-async fn semaphore_caps_concurrent_chain_invokes_per_capsule() {
-    // Two capsules in the same chain (so dispatch goes through the
-    // chain path, not the single-capsule mpsc consumer). The target
-    // capsule has a cap of 4 — flood with 10 parallel events and
-    // assert the peak concurrency never exceeds 4 for it.
-    const CAP: usize = 4;
-    const FANIN: usize = 10;
-
-    let make_manifest = |name: &str| CapsuleManifest {
-        package: PackageDef {
-            name: name.to_string(),
-            version: "0.0.1".to_string(),
-            description: None,
-            authors: Vec::new(),
-            repository: None,
-            homepage: None,
-            documentation: None,
-            license: None,
-            license_file: None,
-            readme: None,
-            keywords: Vec::new(),
-            categories: Vec::new(),
-            astrid_version: None,
-            publish: None,
-            include: None,
-            exclude: None,
-            metadata: None,
-        },
-        components: Vec::new(),
-        imports: std::collections::HashMap::new(),
-        exports: std::collections::HashMap::new(),
-        capabilities: CapabilitiesDef::default(),
-        env: std::collections::HashMap::new(),
-        context_files: Vec::new(),
-        commands: Vec::new(),
-        mcp_servers: Vec::new(),
-        skills: Vec::new(),
-        uplinks: Vec::new(),
-        interceptors: vec![InterceptorDef {
-            event: "chain.topic".to_string(),
-            action: "chain_action".to_string(),
-            priority: 100,
-        }],
-        topics: Vec::new(),
-        publishes: ::std::collections::HashMap::new(),
-        subscribes: ::std::collections::HashMap::new(),
-        tools: ::std::vec::Vec::new(),
-    };
-
-    let peak = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let in_flight = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let invoke_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let target = SemaphoreMockCapsule {
-        id: CapsuleId::from_static("sem-target"),
-        manifest: make_manifest("sem-target"),
-        semaphore: Arc::new(tokio::sync::Semaphore::new(CAP)),
-        in_flight: Arc::clone(&in_flight),
-        peak: Arc::clone(&peak),
-        invoke_count: Arc::clone(&invoke_count),
-    };
-    // A second mock in the chain forces the multi-interceptor path
-    // (single-match goes through the per-capsule mpsc which already
-    // serializes). MockCapsule reuses the default global fallback
-    // semaphore — fine, we only assert on the target.
-    let (chain_neighbour, _) = MockCapsule::with_priority("sem-neighbour", "chain.topic", 50, None);
-
-    let mut registry = CapsuleRegistry::new();
-    registry.register(Box::new(chain_neighbour)).unwrap();
-    registry.register(Box::new(target)).unwrap();
-    let registry = Arc::new(RwLock::new(registry));
-
-    let bus = Arc::new(EventBus::with_capacity(128));
-    let dispatcher = EventDispatcher::new(Arc::clone(&registry), Arc::clone(&bus));
-    let handle = tokio::spawn(dispatcher.run());
-
-    tokio::task::yield_now().await;
-
-    for _ in 0..FANIN {
-        publish_ipc(&bus, "chain.topic");
-    }
-
-    // Allow time for all 10 chains to drain through the 4-permit cap.
-    // 10 events × 30ms hold / 4 concurrency ≈ 75ms minimum; allow
-    // generous headroom for the multi-threaded executor.
-    tokio::time::sleep(Duration::from_millis(600)).await;
-
-    let observed_peak = peak.load(Ordering::SeqCst);
-    let total = invoke_count.load(Ordering::SeqCst);
-    assert!(
-        observed_peak <= CAP,
-        "peak concurrent invokes on capped capsule was {observed_peak}, expected <= {CAP}"
-    );
-    assert_eq!(
-        total, FANIN,
-        "all {FANIN} chains should have invoked the capped capsule (got {total})"
-    );
-
-    handle.abort();
-}
-
 #[test]
 fn intercept_result_from_guest_bytes() {
     // Empty = Continue
@@ -648,15 +511,18 @@ fn intercept_result_from_guest_bytes() {
     assert!(matches!(r, InterceptResult::Continue(ref b) if b == &[0xFF, 1]));
 }
 
-// ── Per-(capsule, principal-class) routing tests (#813) ────────
+// ── Per-(capsule, principal) routing tests (#813 Layer 3) ───────
 
 #[tokio::test]
-async fn single_match_does_not_block_across_principal_classes() {
-    // One capsule, one topic, two principal classes (system + user).
-    // Two events under distinct classes must be processed without HOL
-    // blocking — both `invoked` flags fire even if one consumer is
-    // slow.
-    let (capsule, invoked) = MockCapsule::new("class-cap", "split.topic");
+async fn single_match_does_not_block_across_principal_keys() {
+    // One capsule, one topic, two user-class principals (alice + bob).
+    // Two events under distinct principals (same class) must be
+    // processed without HOL blocking — both invocations land within a
+    // short window even if one consumer is slow.
+    let principal_log = Arc::new(Mutex::new(Vec::<String>::new()));
+    let (mut capsule, _invoked) = MockCapsule::new("class-cap", "split.topic");
+    capsule.principal_log = Some(Arc::clone(&principal_log));
+
     let mut registry = CapsuleRegistry::new();
     registry.register(Box::new(capsule)).unwrap();
     let registry = Arc::new(RwLock::new(registry));
@@ -667,26 +533,33 @@ async fn single_match_does_not_block_across_principal_classes() {
 
     tokio::task::yield_now().await;
 
-    // First event has no principal → System class. Second is a user
-    // principal → User class. Different queue key, parallel
-    // consumers, both should land.
-    publish_ipc(&bus, "split.topic");
+    // Two distinct user principals — same class but distinct
+    // PrincipalKey. With per-class keying these would collide on a
+    // single queue; with per-principal keying each runs on its own
+    // consumer task.
     publish_ipc_as(&bus, "split.topic", "alice");
+    publish_ipc_as(&bus, "split.topic", "bob");
 
     tokio::time::sleep(Duration::from_millis(300)).await;
 
+    let recorded = principal_log.lock().unwrap().clone();
     assert!(
-        invoked.load(Ordering::SeqCst),
-        "interceptor should fire for at least one of the events"
+        recorded.contains(&"alice".to_string()),
+        "alice's event should have been invoked: {recorded:?}"
+    );
+    assert!(
+        recorded.contains(&"bob".to_string()),
+        "bob's event should have been invoked: {recorded:?}"
     );
     handle.abort();
 }
 
 #[tokio::test]
-async fn chain_serializes_per_principal_class_on_same_capsule() {
+async fn chain_serializes_per_principal_key_on_same_capsule() {
     // A chain of two capsules where each interceptor records its
-    // invocation. Two events under the same principal class race
-    // through the chain; tokio::Mutex serializes them FIFO.
+    // invocation. Two events under the SAME principal serialize FIFO
+    // through the chain mutex; two events under DISTINCT principals
+    // are concurrent.
     let order = Arc::new(Mutex::new(Vec::<String>::new()));
     let (cap_a, _) =
         MockCapsule::with_priority("ser-a", "chain.topic", 50, Some(Arc::clone(&order)));
@@ -703,22 +576,182 @@ async fn chain_serializes_per_principal_class_on_same_capsule() {
     let handle = tokio::spawn(dispatcher.run());
     tokio::task::yield_now().await;
 
-    // Same class (System) twice → chain mutex serializes both.
-    publish_ipc(&bus, "chain.topic");
-    publish_ipc(&bus, "chain.topic");
+    // Same principal (alice) twice → chain mutex serializes both.
+    publish_ipc_as(&bus, "chain.topic", "alice");
+    publish_ipc_as(&bus, "chain.topic", "alice");
 
     tokio::time::sleep(Duration::from_millis(500)).await;
 
     let recorded = order.lock().unwrap().clone();
-    // Each event should produce ser-a then ser-b. Two events = 4
-    // entries (two complete chains, never interleaved within a
-    // (capsule, class) pair).
+    // Each event produces ser-a then ser-b. Two events = 4 entries
+    // (two complete chains, never interleaved within a (capsule,
+    // principal) pair).
     assert_eq!(recorded.len(), 4, "two full chains should have completed");
     // Within each chain ser-a precedes ser-b.
     assert_eq!(recorded[0], "ser-a");
     assert_eq!(recorded[1], "ser-b");
     assert_eq!(recorded[2], "ser-a");
     assert_eq!(recorded[3], "ser-b");
+
+    handle.abort();
+}
+
+#[tokio::test]
+async fn dispatch_isolates_per_principal_under_n1000_fanin() {
+    // Publish 1000 events under 1000 distinct principals against a
+    // single interceptor. Per-principal queue partitioning means each
+    // event gets its own queue (queue capacity 64 — well above the
+    // single event each queue receives) and no event is dropped.
+    let counter = Arc::new(AtomicUsize::new(0));
+    let principals = Arc::new(Mutex::new(Vec::<String>::new()));
+    let (mut capsule, _) = MockCapsule::new("fanin-cap", "fanin.topic");
+    capsule.invoke_counter = Some(Arc::clone(&counter));
+    capsule.principal_log = Some(Arc::clone(&principals));
+
+    let mut registry = CapsuleRegistry::new();
+    registry.register(Box::new(capsule)).unwrap();
+    let registry = Arc::new(RwLock::new(registry));
+
+    // Bus with generous capacity so the broadcast subscriber doesn't
+    // lag and synthesize a Lagged signal we don't care about here.
+    let bus = Arc::new(EventBus::with_capacity(4096));
+    let dispatcher = EventDispatcher::new(Arc::clone(&registry), Arc::clone(&bus));
+    let handle = tokio::spawn(dispatcher.run());
+
+    tokio::task::yield_now().await;
+
+    const N: usize = 1000;
+    for i in 0..N {
+        publish_ipc_as(&bus, "fanin.topic", &format!("user-{i}"));
+    }
+
+    // Wait long enough for all 1000 per-principal consumers to drain
+    // their single-element queues.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while counter.load(Ordering::SeqCst) < N && std::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    let observed = counter.load(Ordering::SeqCst);
+    assert_eq!(
+        observed, N,
+        "all {N} per-principal events should have invoked the interceptor (got {observed})"
+    );
+    let recorded_principals = principals.lock().unwrap().clone();
+    let unique = recorded_principals
+        .iter()
+        .collect::<std::collections::HashSet<_>>()
+        .len();
+    assert_eq!(
+        unique, N,
+        "every recorded invocation should carry a distinct principal (got {unique})"
+    );
+
+    handle.abort();
+}
+
+#[tokio::test]
+async fn dispatch_does_not_drop_under_burst_to_single_principal() {
+    // Publish many events for one principal — they all queue against a
+    // single consumer task (capacity 64). The dispatcher waits on the
+    // bus subscribe-recv between publishes (in the bus broadcast path
+    // every published event materially fans out through the receiver
+    // before the next is taken), so even bursts within the 64-deep
+    // queue are drained one-at-a-time without drops.
+    let counter = Arc::new(AtomicUsize::new(0));
+    let (mut capsule, _) = MockCapsule::new("burst-cap", "burst.topic");
+    capsule.invoke_counter = Some(Arc::clone(&counter));
+
+    let mut registry = CapsuleRegistry::new();
+    registry.register(Box::new(capsule)).unwrap();
+    let registry = Arc::new(RwLock::new(registry));
+
+    let bus = Arc::new(EventBus::with_capacity(256));
+    let dispatcher = EventDispatcher::new(Arc::clone(&registry), Arc::clone(&bus));
+    let handle = tokio::spawn(dispatcher.run());
+    tokio::task::yield_now().await;
+
+    const N: usize = 50;
+    for _ in 0..N {
+        publish_ipc_as(&bus, "burst.topic", "burst-user");
+    }
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    while counter.load(Ordering::SeqCst) < N && std::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let observed = counter.load(Ordering::SeqCst);
+    assert_eq!(
+        observed, N,
+        "single-principal burst of {N} should all be delivered (got {observed})"
+    );
+    handle.abort();
+}
+
+#[tokio::test]
+async fn dispatcher_idle_evicts_per_principal_consumers_after_grace() {
+    // Publish for alice — spawns a consumer. After the (collapsed)
+    // grace passes, the consumer self-evicts. A second publish must
+    // still be delivered: the dispatcher's `get_or_spawn_consumer`
+    // re-spawns through the same queue map entry.
+    //
+    // The `set_idle_consumer_grace_for_test` hook collapses the 60s
+    // production grace to a short interval so this test runs in real
+    // time without needing tokio's `test-util` feature.
+    super::set_idle_consumer_grace_for_test(100);
+    // Restore on test exit so sibling tests aren't affected by the
+    // override. Tests share a process; the next sibling sees the
+    // production default.
+    struct ResetGrace;
+    impl Drop for ResetGrace {
+        fn drop(&mut self) {
+            super::set_idle_consumer_grace_for_test(super::DEFAULT_IDLE_CONSUMER_GRACE_MS);
+        }
+    }
+    let _reset = ResetGrace;
+
+    let counter = Arc::new(AtomicUsize::new(0));
+    let (mut capsule, _) = MockCapsule::new("evict-cap", "evict.topic");
+    capsule.invoke_counter = Some(Arc::clone(&counter));
+
+    let mut registry = CapsuleRegistry::new();
+    registry.register(Box::new(capsule)).unwrap();
+    let registry = Arc::new(RwLock::new(registry));
+
+    let bus = Arc::new(EventBus::with_capacity(64));
+    let dispatcher = EventDispatcher::new(Arc::clone(&registry), Arc::clone(&bus));
+    let handle = tokio::spawn(dispatcher.run());
+
+    // Let dispatcher subscribe.
+    tokio::task::yield_now().await;
+
+    publish_ipc_as(&bus, "evict.topic", "alice");
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    while counter.load(Ordering::SeqCst) < 1 && std::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        counter.load(Ordering::SeqCst),
+        1,
+        "first alice event should land"
+    );
+
+    // Sleep past the (collapsed) grace so the consumer idle-evicts.
+    tokio::time::sleep(Duration::from_millis(400)).await;
+
+    // Publish again — must re-spawn the consumer through
+    // `or_insert_with` and deliver the second event.
+    publish_ipc_as(&bus, "evict.topic", "alice");
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    while counter.load(Ordering::SeqCst) < 2 && std::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        counter.load(Ordering::SeqCst),
+        2,
+        "second alice event must re-spawn the consumer and land"
+    );
 
     handle.abort();
 }

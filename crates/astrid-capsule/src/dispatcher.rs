@@ -29,29 +29,80 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::time::Duration;
 
 use tokio::sync::{RwLock, mpsc};
 use tracing::{debug, warn};
 
 use crate::capsule::{Capsule, CapsuleId};
-use crate::principal_class::PrincipalClass;
 use crate::registry::CapsuleRegistry;
+use astrid_events::PrincipalKey;
 use astrid_events::{AstridEvent, EventBus, EventReceiver};
 
-/// Capacity of each per-capsule event dispatch queue.
+/// Capacity of each per-(capsule, principal) event dispatch queue.
 ///
-/// If a capsule's queue fills up (i.e. it is processing events slower than
-/// they arrive), new events are dropped with a warning rather than blocking
-/// the dispatcher. 256 is generous for typical usage.
-const CAPSULE_EVENT_QUEUE_CAPACITY: usize = 256;
+/// Per-principal partitioning means the working set per queue is much
+/// smaller than the legacy per-class queue. A queue full event is dropped
+/// with a warning rather than blocking the dispatcher; 64 is generous for
+/// per-principal traffic and tightens the worst-case envelope footprint
+/// (10k principals × 16 capsules × 64 slots stays under the half-gig
+/// ceiling called out in the design's risk register).
+const CAPSULE_EVENT_QUEUE_CAPACITY: usize = 64;
 
-/// Shared map of per-(capsule, principal-class) chain mutexes. One
-/// `Arc<tokio::sync::Mutex<()>>` per `(CapsuleId, PrincipalClass)` so
+/// Maximum number of per-(capsule, principal) dispatcher queues to
+/// hold simultaneously **per capsule**. Beyond this cap, new principals
+/// for that capsule fall back to a single shared `PrincipalKey::None`
+/// queue (with an audit-logged degrade) so the queue map can never grow
+/// unboundedly even under a pathological N-principal storm.
+const MAX_DISPATCHER_QUEUES_PER_CAPSULE: usize = 10_000;
+
+/// Default idle grace before a per-(capsule, principal) consumer task exits.
+///
+/// Each consumer awaits `recv()` under this timeout; on timeout the task
+/// cleans up its sender from the queue map and exits. The next event for
+/// that principal re-spawns the consumer through `or_insert_with`. This
+/// mirrors the demand-allocation invariant on the bus's `RouteEntry`
+/// fanout and bounds steady-state dispatcher memory at the working set.
+const DEFAULT_IDLE_CONSUMER_GRACE_MS: u64 = 60_000;
+
+/// Live override of [`DEFAULT_IDLE_CONSUMER_GRACE_MS`] in milliseconds.
+/// Tests collapse the grace to a sub-second value to exercise the
+/// idle-eviction path without sleeping in real time. Production uses the
+/// 60-second default; the override is `cfg(test)`-only mutated through
+/// [`set_idle_consumer_grace_for_test`].
+static IDLE_CONSUMER_GRACE_MS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(DEFAULT_IDLE_CONSUMER_GRACE_MS);
+
+/// Current idle-eviction grace, honouring any test override.
+fn idle_consumer_grace() -> Duration {
+    Duration::from_millis(IDLE_CONSUMER_GRACE_MS.load(std::sync::atomic::Ordering::Relaxed))
+}
+
+/// Test hook: collapse the idle-eviction grace to a short interval so
+/// the eviction path can be exercised in unit tests without sleeping
+/// for a full minute. Public-in-crate; not exposed to consumers.
+#[cfg(test)]
+pub(crate) fn set_idle_consumer_grace_for_test(ms: u64) {
+    IDLE_CONSUMER_GRACE_MS.store(ms, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Shared map of per-(capsule, principal) chain mutexes. One
+/// `Arc<tokio::sync::Mutex<()>>` per `(CapsuleId, PrincipalKey)` so
 /// chain dispatches for the same key serialize FIFO while distinct
-/// keys run concurrently. Held across the chain task's lifetime in
+/// keys (including distinct principals within the same class) run
+/// concurrently. Held across the chain task's lifetime in
 /// `dispatch_to_capsule_queues`.
 type ChainLocks =
-    Arc<parking_lot::RwLock<HashMap<(CapsuleId, PrincipalClass), Arc<tokio::sync::Mutex<()>>>>>;
+    Arc<parking_lot::RwLock<HashMap<(CapsuleId, PrincipalKey), Arc<tokio::sync::Mutex<()>>>>>;
+
+/// Shared map of per-(capsule, principal) dispatcher mpsc senders.
+/// Wrapped in `parking_lot::Mutex` so the consumer task can remove its
+/// own entry under the same lock that admits new principals — this
+/// closes the race where an idle-evicting consumer exits between the
+/// dispatcher's `entry().or_insert_with(...)` and the subsequent
+/// `try_send`.
+type CapsuleQueues =
+    Arc<parking_lot::Mutex<HashMap<(CapsuleId, PrincipalKey), mpsc::Sender<InterceptorWork>>>>;
 
 /// Work item sent to a per-capsule ordered queue.
 struct InterceptorWork {
@@ -63,13 +114,6 @@ struct InterceptorWork {
     /// `invoke_interceptor` so the kernel can set per-invocation
     /// principal context on `HostState`.
     ipc_message: Option<Arc<astrid_events::ipc::IpcMessage>>,
-    /// Bounded principal class derived from `ipc_message.principal`,
-    /// used as the per-capsule queue key so distinct principal classes
-    /// on the same capsule do not head-of-line block each other (#813).
-    /// Carried through to the consumer for diagnostic logging and
-    /// future per-class telemetry.
-    #[allow(dead_code)]
-    principal_class: PrincipalClass,
 }
 
 /// Routes events from the `EventBus` to capsule interceptors.
@@ -87,12 +131,12 @@ pub struct EventDispatcher {
     /// home directories created. When `None`, provisioning is ungated
     /// (pre-production behavior).
     identity_store: Option<Arc<dyn astrid_storage::IdentityStore>>,
-    /// Per-(capsule, principal-class) chain serialization mutexes.
-    /// Chains for the same `(CapsuleId, PrincipalClass)` are mutually
+    /// Per-(capsule, principal) chain serialization mutexes.
+    /// Chains for the same `(CapsuleId, PrincipalKey)` are mutually
     /// exclusive (FIFO via `tokio::sync::Mutex`) but distinct
-    /// principal classes on the same capsule run concurrently. Closes
-    /// the cross-principal SET/CALL race at the dispatcher layer in
-    /// addition to the bus-side routing demux (#813).
+    /// principals — even within the same class — run concurrently.
+    /// Closes the cross-principal SET/CALL race at the dispatcher
+    /// layer in addition to the bus-side routing demux (#813).
     chain_locks: ChainLocks,
 }
 
@@ -133,15 +177,11 @@ impl EventDispatcher {
         let mut last_lag_notification = std::time::Instant::now()
             .checked_sub(std::time::Duration::from_secs(10))
             .unwrap_or_else(std::time::Instant::now);
-        // Per-(capsule, principal-class) ordered queue for the
-        // single-match fast path. Widening the key lets two distinct
-        // principal classes targeting the same capsule run in
-        // parallel without HOL blocking. Chain dispatches use the
-        // sibling `chain_locks` map for the same guarantee.
-        let mut capsule_queues: HashMap<
-            (CapsuleId, PrincipalClass),
-            mpsc::Sender<InterceptorWork>,
-        > = HashMap::new();
+        // Per-(capsule, principal) ordered queue. Per-principal keying
+        // means the dispatcher's worst case at N distinct principals
+        // is N independent FIFO consumers, not a single class-keyed
+        // queue collapsing the load (#813 Layer 3).
+        let capsule_queues: CapsuleQueues = Arc::new(parking_lot::Mutex::new(HashMap::new()));
         let mut known_principals: HashSet<String> = HashSet::new();
         // The "default" principal is always provisioned by the kernel boot sequence.
         known_principals.insert("default".to_string());
@@ -254,7 +294,7 @@ impl EventDispatcher {
 
             let matches = find_matching_interceptors(&self.registry, &topic).await;
             dispatch_to_capsule_queues(
-                &mut capsule_queues,
+                &capsule_queues,
                 &self.chain_locks,
                 matches,
                 topic,
@@ -270,16 +310,18 @@ impl EventDispatcher {
 /// Dispatch matching interceptors as a middleware chain.
 ///
 /// Interceptors are called sequentially in priority order (lower fires first).
-/// Each interceptor returns an [`InterceptResult`] that controls the chain:
+/// Each interceptor returns an [`crate::capsule::InterceptResult`] that
+/// controls the chain:
 /// - `Continue` — pass (possibly modified) payload to the next interceptor
 /// - `Final` — short-circuit with a response, no further interceptors fire
 /// - `Deny` — short-circuit with denial, audit-logged, no further interceptors fire
 ///
 /// Within a single capsule, events are still delivered in publish order via
-/// per-capsule mpsc queues (preserving IPC `seq` ordering). The chain semantics
-/// apply across capsules for the same event.
+/// per-(capsule, principal) mpsc queues (preserving IPC `seq` ordering and
+/// isolating principals from one another). The chain semantics apply across
+/// capsules for the same event.
 fn dispatch_to_capsule_queues(
-    queues: &mut HashMap<(CapsuleId, PrincipalClass), mpsc::Sender<InterceptorWork>>,
+    queues: &CapsuleQueues,
     chain_locks: &ChainLocks,
     matches: Vec<(Arc<dyn Capsule>, String)>,
     topic: Arc<String>,
@@ -296,8 +338,7 @@ fn dispatch_to_capsule_queues(
         .map(|(c, a)| (Arc::clone(&c), a))
         .collect();
 
-    let principal_class =
-        PrincipalClass::from_str_opt(ipc_message.as_deref().and_then(|m| m.principal.as_deref()));
+    let principal_key: PrincipalKey = ipc_message.as_deref().and_then(|m| m.principal.clone());
 
     // For single-interceptor events (common case), skip chain overhead.
     if matches_owned.len() == 1 {
@@ -309,7 +350,7 @@ fn dispatch_to_capsule_queues(
             topic,
             payload_bytes,
             ipc_message,
-            principal_class,
+            principal_key,
         );
         return;
     }
@@ -330,14 +371,14 @@ fn dispatch_to_capsule_queues(
                 "Dispatching interceptor (chain)"
             );
 
-            // Per-(capsule, principal-class) chain serialization. Two
-            // events with the same principal class targeting this
-            // capsule execute one-at-a-time (FIFO via tokio::Mutex)
-            // so the SET/CALL/CLEAR window in wasm/mod.rs can never
-            // race a sibling chain. Distinct principal classes on
-            // this capsule run concurrently — the orchestration
-            // cliff fix is per-class, not per-capsule (#813).
-            let chain_key = (capsule.id().clone(), principal_class);
+            // Per-(capsule, principal) chain serialization. Two
+            // events with the same principal targeting this capsule
+            // execute one-at-a-time (FIFO via tokio::Mutex) so the
+            // SET/CALL/CLEAR window in wasm/mod.rs can never race a
+            // sibling chain. Distinct principals on the same capsule
+            // run concurrently — the orchestration cliff fix is
+            // per-principal, not per-class (#813 Layer 3).
+            let chain_key = (capsule.id().clone(), principal_key.clone());
             let chain_mutex = {
                 // Read-fast / write-on-miss: the common case is a hit
                 // on an existing lock.
@@ -355,36 +396,6 @@ fn dispatch_to_capsule_queues(
                 }
             };
             let _chain_guard = chain_mutex.lock().await;
-
-            // Bound concurrent invokes of THIS capsule. The permit is
-            // re-acquired per chain step because each step is a separate
-            // `invoke_interceptor` call and Wasmtime Store contention is
-            // per-call; chains across distinct capsules don't share a
-            // permit pool. `acquire_owned()` only fails when the
-            // semaphore is closed (capsule unloaded); treat as benign
-            // and tear down the chain.
-            let wait_start = std::time::Instant::now();
-            let _permit = match capsule
-                .interceptor_semaphore()
-                .clone()
-                .acquire_owned()
-                .await
-            {
-                Ok(p) => p,
-                Err(_) => {
-                    debug!(
-                        capsule_id = %capsule.id(),
-                        "interceptor permit acquire failed (semaphore closed); \
-                         capsule likely unloading"
-                    );
-                    return;
-                },
-            };
-            metrics::histogram!(
-                "astrid_capsule_interceptor_permit_wait_seconds_total",
-                "capsule" => capsule.id().to_string(),
-            )
-            .record(wait_start.elapsed().as_secs_f64());
 
             let caller = ipc_clone.as_deref();
             match capsule.invoke_interceptor(action, &current_payload, caller) {
@@ -445,57 +456,87 @@ fn dispatch_to_capsule_queues(
     });
 }
 
-/// Fast path for single-interceptor dispatch — uses per-(capsule,
-/// principal-class) queue for ordered delivery without chain overhead.
-/// Keying on the class means alice's events don't head-of-line block
-/// bob's on the same capsule (#813).
-fn dispatch_single(
-    queues: &mut HashMap<(CapsuleId, PrincipalClass), mpsc::Sender<InterceptorWork>>,
+/// Count how many entries in `queues` have the given `capsule_id` —
+/// used to enforce `MAX_DISPATCHER_QUEUES_PER_CAPSULE`. Linear in the
+/// number of dispatcher queues, called only on the cold-miss path.
+fn queues_per_capsule(
+    queues: &HashMap<(CapsuleId, PrincipalKey), mpsc::Sender<InterceptorWork>>,
+    capsule_id: &CapsuleId,
+) -> usize {
+    queues.keys().filter(|(cid, _)| cid == capsule_id).count()
+}
+
+/// Get or spawn the per-(capsule, principal) consumer task and return
+/// its sender. On the cold-miss path this spawns a new consumer that
+/// will idle-evict itself after [`IDLE_CONSUMER_GRACE`] of inactivity.
+/// Enforces [`MAX_DISPATCHER_QUEUES_PER_CAPSULE`] by falling back to a
+/// single shared `PrincipalKey::None` queue when the cap is exceeded
+/// (audit-logged degrade).
+fn get_or_spawn_consumer(
+    queues: &CapsuleQueues,
+    capsule: &Arc<dyn Capsule>,
+    key: (CapsuleId, PrincipalKey),
+) -> mpsc::Sender<InterceptorWork> {
+    let mut guard = queues.lock();
+    if let Some(s) = guard.get(&key) {
+        return s.clone();
+    }
+
+    // Cap enforcement — if exceeded, degrade this insert to the
+    // shared `(capsule, None)` slot so the queue map can't grow
+    // unboundedly under a pathological principal-fanout. The
+    // shared slot itself counts toward the cap but is allowed to
+    // exist once per capsule.
+    let mut effective_key = key.clone();
+    if effective_key.1.is_some()
+        && queues_per_capsule(&guard, &effective_key.0) >= MAX_DISPATCHER_QUEUES_PER_CAPSULE
+    {
+        tracing::error!(
+            target: "astrid.audit.ipc",
+            security_event = true,
+            capsule = %effective_key.0,
+            principal_key_count = MAX_DISPATCHER_QUEUES_PER_CAPSULE,
+            "dispatcher: per-principal queue cap exceeded; degrading to shared queue"
+        );
+        effective_key.1 = None;
+        if let Some(s) = guard.get(&effective_key) {
+            return s.clone();
+        }
+    }
+
+    let (tx, rx) = mpsc::channel::<InterceptorWork>(CAPSULE_EVENT_QUEUE_CAPACITY);
+    guard.insert(effective_key.clone(), tx.clone());
+    drop(guard);
+
+    let capsule_arc = Arc::clone(capsule);
+    let queues_arc = Arc::clone(queues);
+    let cleanup_key = effective_key.clone();
+    tokio::task::spawn(async move {
+        run_consumer(rx, capsule_arc, queues_arc, cleanup_key).await;
+    });
+    tx
+}
+
+/// Consumer loop for one `(capsule, principal_key)` queue. Idle-evicts
+/// itself after [`IDLE_CONSUMER_GRACE`] of inactivity, atomically
+/// removing its sender from the queue map under the same lock that
+/// `get_or_spawn_consumer` takes — closes the race where an event
+/// arrives between timeout and unmap.
+async fn run_consumer(
+    mut rx: mpsc::Receiver<InterceptorWork>,
     capsule: Arc<dyn Capsule>,
-    action: String,
-    topic: Arc<String>,
-    payload_bytes: Arc<Vec<u8>>,
-    ipc_message: Option<Arc<astrid_events::ipc::IpcMessage>>,
-    principal_class: PrincipalClass,
+    queues: CapsuleQueues,
+    key: (CapsuleId, PrincipalKey),
 ) {
-    let key = (capsule.id().clone(), principal_class);
-    let sender = queues.entry(key).or_insert_with(|| {
-        let (tx, mut rx) = mpsc::channel::<InterceptorWork>(CAPSULE_EVENT_QUEUE_CAPACITY);
-        let capsule = Arc::clone(&capsule);
-        tokio::task::spawn(async move {
-            while let Some(work) = rx.recv().await {
+    loop {
+        match tokio::time::timeout(idle_consumer_grace(), rx.recv()).await {
+            Ok(Some(work)) => {
                 debug!(
                     capsule_id = %capsule.id(),
                     action = %work.action,
                     topic = %work.topic,
                     "Dispatching interceptor (ordered)"
                 );
-                // Bound concurrent invokes of THIS capsule. `continue`
-                // (not `return`) on a closed semaphore so a transient
-                // closure during hot-reload doesn't tear down the
-                // consumer loop for the replacement capsule.
-                let wait_start = std::time::Instant::now();
-                let _permit = match capsule
-                    .interceptor_semaphore()
-                    .clone()
-                    .acquire_owned()
-                    .await
-                {
-                    Ok(p) => p,
-                    Err(_) => {
-                        debug!(
-                            capsule_id = %capsule.id(),
-                            "interceptor permit acquire failed (semaphore closed); \
-                             capsule likely unloading"
-                        );
-                        continue;
-                    },
-                };
-                metrics::histogram!(
-                    "astrid_capsule_interceptor_permit_wait_seconds_total",
-                    "capsule" => capsule.id().to_string(),
-                )
-                .record(wait_start.elapsed().as_secs_f64());
 
                 let caller = work.ipc_message.as_deref();
                 match capsule.invoke_interceptor(&work.action, &work.payload, caller) {
@@ -540,17 +581,63 @@ fn dispatch_single(
                         );
                     },
                 }
-            }
-        });
-        tx
-    });
+            },
+            Ok(None) => {
+                // Sender side hung up (capsule unloaded). Drain
+                // anything queued and exit. Don't bother cleaning
+                // the map entry — the sender is already gone.
+                debug!(
+                    capsule_id = %capsule.id(),
+                    "Per-principal consumer exiting: sender dropped"
+                );
+                return;
+            },
+            Err(_elapsed) => {
+                // Idle-evict. Take the map lock; if the channel is
+                // still empty (no race with a concurrent dispatch),
+                // remove our entry and exit. Otherwise loop and
+                // drain the racing event.
+                let mut guard = queues.lock();
+                if rx.try_recv().is_err() {
+                    guard.remove(&key);
+                    drop(guard);
+                    debug!(
+                        capsule_id = %capsule.id(),
+                        "Per-principal consumer idle-evicted after grace"
+                    );
+                    return;
+                }
+                // Racing dispatch landed between the timeout and the
+                // map-lock acquisition — keep running. The map entry
+                // stays valid.
+                drop(guard);
+            },
+        }
+    }
+}
+
+/// Fast path for single-interceptor dispatch — uses per-(capsule,
+/// principal) queue for ordered delivery without chain overhead.
+/// Keying on the full `PrincipalKey` (Option<String>) means alice's
+/// events don't head-of-line block bob's on the same capsule, even
+/// when both fall in the same `PrincipalClass` (#813 Layer 3).
+fn dispatch_single(
+    queues: &CapsuleQueues,
+    capsule: Arc<dyn Capsule>,
+    action: String,
+    topic: Arc<String>,
+    payload_bytes: Arc<Vec<u8>>,
+    ipc_message: Option<Arc<astrid_events::ipc::IpcMessage>>,
+    principal_key: PrincipalKey,
+) {
+    let key = (capsule.id().clone(), principal_key);
+    let sender = get_or_spawn_consumer(queues, &capsule, key);
 
     let work = InterceptorWork {
         action,
         payload: Arc::clone(&payload_bytes),
         topic: Arc::clone(&topic),
         ipc_message: ipc_message.clone(),
-        principal_class,
     };
     if let Err(e) = sender.try_send(work) {
         warn!(
