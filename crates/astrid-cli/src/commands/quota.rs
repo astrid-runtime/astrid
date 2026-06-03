@@ -1,22 +1,24 @@
 //! `astrid quota` — per-principal resource quota inspection and edit.
 //!
-//! Calls Layer 6 admin IPC `astrid.v1.admin.quota.get` and
-//! `astrid.v1.admin.quota.set`. The `set` flow does a get-modify-set
-//! round-trip rather than requiring the operator to supply every quota
-//! field on the wire (which the kernel-side `Quotas` struct demands).
+//! Calls Layer 6 admin IPC `astrid.v1.admin.quota.get`,
+//! `astrid.v1.admin.quota.set`, and `astrid.v1.admin.usage.get` (the
+//! read-only usage-vs-budget report shown alongside `quota show`). The
+//! `set` flow does a get-modify-set round-trip rather than requiring the
+//! operator to supply every quota field on the wire (which the
+//! kernel-side `Quotas` struct demands).
 
 use std::process::ExitCode;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
 use astrid_core::PrincipalId;
-use astrid_core::kernel_api::{AdminRequestKind, AdminResponseBody};
+use astrid_core::kernel_api::{AdminRequestKind, AdminResponseBody, ResourceUsage};
 use astrid_core::profile::{BACKGROUND_PROCESSES_UPPER_BOUND, Quotas, TIMEOUT_SECS_UPPER_BOUND};
 use clap::{Args, Subcommand};
 use colored::Colorize;
 use serde::Serialize;
 
-use crate::admin_client::into_result;
+use crate::admin_client::{AdminClient, into_result};
 use crate::context;
 use crate::value_formatter::{ValueFormat, emit_structured};
 
@@ -92,6 +94,8 @@ pub(crate) struct QuotaRecord {
     pub max_background_processes: u32,
     /// Maximum persistent home-directory storage (bytes).
     pub max_storage_bytes: u64,
+    /// Maximum CPU rate in wasmtime fuel units per second.
+    pub max_cpu_fuel_per_sec: u64,
 }
 
 fn record(principal: &PrincipalId, q: &Quotas) -> QuotaRecord {
@@ -102,11 +106,11 @@ fn record(principal: &PrincipalId, q: &Quotas) -> QuotaRecord {
         max_ipc_throughput_bytes: q.max_ipc_throughput_bytes,
         max_background_processes: q.max_background_processes,
         max_storage_bytes: q.max_storage_bytes,
+        max_cpu_fuel_per_sec: q.max_cpu_fuel_per_sec,
     }
 }
 
-async fn fetch_quotas(target: &PrincipalId) -> Result<Quotas> {
-    let mut client = crate::admin_client::connect_as_active_agent().await?;
+async fn fetch_quotas(client: &mut AdminClient, target: &PrincipalId) -> Result<Quotas> {
     let body = client
         .request(AdminRequestKind::QuotaGet {
             principal: target.clone(),
@@ -119,6 +123,19 @@ async fn fetch_quotas(target: &PrincipalId) -> Result<Quotas> {
     }
 }
 
+async fn fetch_usage(client: &mut AdminClient, target: &PrincipalId) -> Result<ResourceUsage> {
+    let body = client
+        .request(AdminRequestKind::UsageGet {
+            principal: target.clone(),
+        })
+        .await?;
+    let body = into_result(body)?;
+    match body {
+        AdminResponseBody::Usage(u) => Ok(u),
+        other => anyhow::bail!("unexpected response from kernel: {other:?}"),
+    }
+}
+
 async fn run_show(args: ShowArgs) -> Result<ExitCode> {
     if args.group.is_some() {
         eprintln!("astrid: group-scoped quotas need a group quota IPC topic that has not shipped.");
@@ -126,12 +143,20 @@ async fn run_show(args: ShowArgs) -> Result<ExitCode> {
     }
     let target = context::resolve_agent(args.agent.as_deref())?;
     let format = ValueFormat::parse(&args.format);
-    let q = fetch_quotas(&target).await?;
+    let mut client = crate::admin_client::connect_as_active_agent().await?;
+    let q = fetch_quotas(&mut client, &target).await?;
     if !format.is_pretty() {
         emit_structured(&record(&target, &q), format)?;
         return Ok(ExitCode::SUCCESS);
     }
+    // Pretty mode pairs the configured ceilings with live consumption. Fetch
+    // usage over the SAME connection and BEFORE printing anything, so a failure
+    // on either request surfaces as a clean error instead of half-rendered
+    // output — and `astrid quota show` costs one socket handshake, not two.
+    let usage = fetch_usage(&mut client, &target).await?;
     print_quotas_pretty(&target, &q);
+    println!();
+    print_usage_pretty(&usage);
     Ok(ExitCode::SUCCESS)
 }
 
@@ -162,6 +187,72 @@ fn print_quotas_pretty(principal: &PrincipalId, q: &Quotas) {
         "ipc-rate".bold(),
         format_bytes(q.max_ipc_throughput_bytes)
     );
+    println!(
+        "  {:<24}  {}",
+        "cpu-rate".bold(),
+        format_fuel_rate(q.max_cpu_fuel_per_sec)
+    );
+}
+
+/// Render the read-only usage-vs-budget report: live consumption paired
+/// with the ceilings it's measured against. CPU is the cross-capsule fuel
+/// total; the per-instance memory ceiling is shown because there is no
+/// per-principal RAM aggregate yet (so `memory current` reads `n/a` until
+/// that lands).
+fn print_usage_pretty(u: &ResourceUsage) {
+    println!("{}", "Usage vs budget".bold());
+    println!(
+        "  {:<24}  {} fuel",
+        "cpu consumed".bold(),
+        format_fuel(u.cpu_fuel_consumed_total)
+    );
+    println!(
+        "  {:<24}  {}",
+        "cpu rate limit".bold(),
+        format_fuel_rate(u.cpu_fuel_per_sec_limit)
+    );
+    // Colour the security-relevant "exempt" affirmative and dim the n/a
+    // memory placeholder; the label text itself comes from pure helpers so
+    // both arms stay unit-testable without asserting on ANSI codes.
+    let exempt = exempt_label(u.exempt);
+    let exempt = if u.exempt {
+        exempt.yellow().to_string()
+    } else {
+        exempt
+    };
+    println!("  {:<24}  {}", "exempt".bold(), exempt);
+    let mem_current = mem_current_label(u.memory_bytes_current_total);
+    let mem_current = if u.memory_bytes_current_total.is_none() {
+        mem_current.dimmed().to_string()
+    } else {
+        mem_current
+    };
+    println!("  {:<24}  {}", "memory current".bold(), mem_current);
+    println!(
+        "  {:<24}  {}",
+        "memory limit/instance".bold(),
+        format_bytes(u.memory_bytes_limit_per_instance)
+    );
+}
+
+/// Plain text for the `exempt` row (the caller colourises the affirmative).
+/// `true` means the principal holds a resources-unbounded capability, so its
+/// configured limits are advisory, never enforced — the state worth flagging.
+fn exempt_label(exempt: bool) -> String {
+    if exempt {
+        "yes (limits advisory)".to_string()
+    } else {
+        "no".to_string()
+    }
+}
+
+/// Plain text for the `memory current` row. `None` (no per-principal RAM
+/// aggregate yet) renders the `n/a` placeholder the caller dims.
+fn mem_current_label(current: Option<u64>) -> String {
+    match current {
+        Some(b) => format_bytes(b),
+        None => "n/a".to_string(),
+    }
 }
 
 async fn run_set(args: SetArgs) -> Result<ExitCode> {
@@ -348,6 +439,45 @@ fn format_bytes(b: u64) -> String {
     }
 }
 
+/// Render a wasmtime-fuel count with decimal SI suffixes. Fuel is a raw
+/// instruction count, so decimal magnitudes (k/M/G) read more naturally
+/// than the binary units used for bytes.
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "human-readable rendering, exact magnitude is not the point"
+)]
+fn format_fuel(n: u64) -> String {
+    const K: f64 = 1_000.0;
+    const M: f64 = 1_000_000.0;
+    const G: f64 = 1_000_000_000.0;
+    const T: f64 = 1_000_000_000_000.0;
+    let f = n as f64;
+    // Thresholds are `999.95 * unit`, the point at which `{:.1}` of the
+    // *smaller* unit would round up to "1000.0" — so a value carries into the
+    // next unit instead (e.g. 999_999 renders "1.0M", never "1000.0k"), keeping
+    // the mantissa < 1000. Cumulative fuel is monotonic for the daemon's
+    // lifetime, so T is reachable; above T there is no larger unit, so a huge
+    // mantissa there is accepted rather than mis-rendered.
+    if f >= 999.95 * G {
+        format!("{:.1}T", f / T)
+    } else if f >= 999.95 * M {
+        format!("{:.1}G", f / G)
+    } else if f >= 999.95 * K {
+        format!("{:.1}M", f / M)
+    } else if f >= 999.95 {
+        format!("{:.1}k", f / K)
+    } else {
+        n.to_string()
+    }
+}
+
+/// Render a fuel-per-second ceiling. The configured ceiling is always `> 0`
+/// (validation rejects `0` — there is no "unlimited" sentinel; unbounded CPU is
+/// a capability, surfaced separately by the `exempt` flag).
+fn format_fuel_rate(n: u64) -> String {
+    format!("{}/s", format_fuel(n))
+}
+
 /// Render a duration as `1h2m3s` / `5m` / `30s` / `500ms`.
 fn format_duration(d: Duration) -> String {
     let total = d.as_secs();
@@ -424,6 +554,73 @@ mod tests {
     #[test]
     fn rejects_unknown_duration_suffix() {
         assert!(parse_duration("5z").is_err());
+    }
+
+    #[test]
+    fn formats_fuel_counts() {
+        assert_eq!(format_fuel(0), "0");
+        assert_eq!(format_fuel(999), "999");
+        assert_eq!(format_fuel(1_500), "1.5k");
+        assert_eq!(format_fuel(2_000_000), "2.0M");
+        assert_eq!(format_fuel(3_500_000_000), "3.5G");
+        // Cumulative fuel scales into the trillions over a long daemon run.
+        assert_eq!(format_fuel(1_500_000_000_000), "1.5T");
+    }
+
+    #[test]
+    fn format_fuel_hits_exact_unit_boundaries() {
+        // Pin the `>=` thresholds so a `>` off-by-one would regress.
+        assert_eq!(format_fuel(1_000), "1.0k");
+        assert_eq!(format_fuel(1_000_000), "1.0M");
+        assert_eq!(format_fuel(1_000_000_000), "1.0G");
+        assert_eq!(format_fuel(1_000_000_000_000), "1.0T");
+    }
+
+    #[test]
+    fn format_fuel_carries_at_the_rounding_boundary() {
+        // A value just under a unit must NOT render as "1000.0<smaller>": the
+        // mantissa stays < 1000 by carrying into the next unit.
+        assert_eq!(format_fuel(999_999), "1.0M");
+        assert_eq!(format_fuel(999_999_999), "1.0G");
+        assert_eq!(format_fuel(999_999_999_999), "1.0T");
+        // Just below the carry point still renders in the smaller unit.
+        assert_eq!(format_fuel(999_949), "999.9k");
+    }
+
+    #[test]
+    fn record_copies_cpu_ceiling_into_wire_shape() {
+        // record() feeds the --format json/yaml/toml surface; assert the
+        // same-typed ceilings land in their own slots (a swap would compile).
+        let p = PrincipalId::new("alice").unwrap();
+        let q = Quotas {
+            max_cpu_fuel_per_sec: 7_777,
+            max_memory_bytes: 11,
+            max_storage_bytes: 22,
+            ..Quotas::default()
+        };
+        let r = record(&p, &q);
+        assert_eq!(r.principal, "alice");
+        assert_eq!(r.max_cpu_fuel_per_sec, 7_777);
+        assert_eq!(r.max_memory_bytes, 11);
+        assert_eq!(r.max_storage_bytes, 22);
+    }
+
+    #[test]
+    fn usage_row_labels_cover_both_arms() {
+        // The kernel stub returns exempt=false / memory=None today, so the
+        // exempt=true and Some(memory) render paths are otherwise unexercised.
+        assert_eq!(exempt_label(true), "yes (limits advisory)");
+        assert_eq!(exempt_label(false), "no");
+        assert_eq!(mem_current_label(None), "n/a");
+        assert_eq!(mem_current_label(Some(2048)), "2.0 KiB");
+    }
+
+    #[test]
+    fn formats_fuel_rate_as_per_second() {
+        // The ceiling is always > 0 (validation rejects 0); unbounded CPU is
+        // the `exempt` flag, never a "0 = unlimited" sentinel here.
+        assert_eq!(format_fuel_rate(1_000_000_000), "1.0G/s");
+        assert_eq!(format_fuel_rate(500), "500/s");
     }
 
     #[test]
