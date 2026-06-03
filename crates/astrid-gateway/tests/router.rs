@@ -293,6 +293,7 @@ fn openapi_types_kernel_payloads_instead_of_opaque_json() {
         "AgentSummaryView",
         "CapabilityInfoView",
         "QuotasView",
+        "ResourceUsageView",
         "GroupSummaryView",
         "InviteIssuedView",
         "InviteSummaryView",
@@ -300,6 +301,39 @@ fn openapi_types_kernel_payloads_instead_of_opaque_json() {
         assert!(
             schemas.contains_key(mirror),
             "typed schema mirror {mirror} is missing — a kernel payload regressed to opaque JSON"
+        );
+    }
+
+    // `QuotasView` must mirror `Quotas` field-for-field, including the CPU
+    // ceiling that previously drifted off the write-shape mirror.
+    let quotas_props = schemas
+        .get("QuotasView")
+        .and_then(|v| v.get("properties"))
+        .and_then(|v| v.as_object())
+        .expect("QuotasView must have properties");
+    assert!(
+        quotas_props.contains_key("max_cpu_fuel_per_sec"),
+        "QuotasView must mirror Quotas::max_cpu_fuel_per_sec"
+    );
+
+    // `ResourceUsageView` must mirror the live `ResourceUsage` payload —
+    // the consumed total and the budget it's measured against.
+    let usage_props = schemas
+        .get("ResourceUsageView")
+        .and_then(|v| v.get("properties"))
+        .and_then(|v| v.as_object())
+        .expect("ResourceUsageView must have properties");
+    for field in [
+        "principal",
+        "cpu_fuel_consumed_total",
+        "cpu_fuel_per_sec_limit",
+        "exempt",
+        "memory_bytes_limit_per_instance",
+        "memory_bytes_current_total",
+    ] {
+        assert!(
+            usage_props.contains_key(field),
+            "ResourceUsageView must mirror ResourceUsage::{field}"
         );
     }
 
@@ -364,6 +398,7 @@ fn openapi_lists_every_router_route() {
         "/api/sys/principals/{id}/disable",
         "/api/sys/principals/{id}/caps",
         "/api/sys/principals/{id}/quotas",
+        "/api/sys/principals/{id}/usage",
         "/api/sys/groups",
         "/api/sys/groups/{name}",
         "/api/sys/invites",
