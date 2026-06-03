@@ -102,6 +102,12 @@ pub struct Kernel {
     /// principals' state is untouched. Ephemeral shutdown still waits on
     /// the global sum via [`total_connection_count`](Self::total_connection_count).
     active_connections: DashMap<PrincipalId, AtomicUsize>,
+    /// Shared per-principal CPU fuel ledger, cloned into every capsule's
+    /// `WasmEngine` (via the loader) so a principal's interceptor CPU is summed
+    /// across all capsules into one per-principal total. Telemetry today; the
+    /// substrate for a per-principal CPU budget. See
+    /// [`FuelLedger`](astrid_capsule::FuelLedger).
+    fuel_ledger: astrid_capsule::FuelLedger,
     /// Ephemeral mode: shut down immediately when the last client disconnects.
     pub ephemeral: AtomicBool,
     /// Instant when the kernel was booted (for uptime calculation).
@@ -309,6 +315,7 @@ impl Kernel {
             kv,
             audit_log,
             active_connections: DashMap::new(),
+            fuel_ledger: astrid_capsule::FuelLedger::default(),
             ephemeral: AtomicBool::new(false),
             boot_time: std::time::Instant::now(),
             shutdown_tx: tokio::sync::watch::channel(false).0,
@@ -369,7 +376,8 @@ impl Kernel {
             }
         }
 
-        let loader = astrid_capsule::loader::CapsuleLoader::new(self.mcp.clone());
+        let loader =
+            astrid_capsule::loader::CapsuleLoader::new(self.mcp.clone(), self.fuel_ledger.clone());
         let mut capsule = loader.create_capsule(manifest, dir.clone())?;
 
         // Build the context — use the shared kernel KV so capsules can
@@ -988,6 +996,7 @@ pub(crate) async fn test_kernel_with_home(home: astrid_core::dirs::AstridHome) -
         kv,
         audit_log,
         active_connections: DashMap::new(),
+        fuel_ledger: astrid_capsule::FuelLedger::default(),
         ephemeral: AtomicBool::new(false),
         boot_time: std::time::Instant::now(),
         shutdown_tx: tokio::sync::watch::channel(false).0,

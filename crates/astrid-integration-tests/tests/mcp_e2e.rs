@@ -66,7 +66,10 @@ async fn test_mcp_host_engine_capability_validation() {
         tools: ::std::vec::Vec::new(),
     };
 
-    let loader = CapsuleLoader::new(test_secure_mcp_client());
+    let loader = CapsuleLoader::new(
+        test_secure_mcp_client(),
+        astrid_capsule::FuelLedger::default(),
+    );
 
     let mut capsule = loader
         .create_capsule(manifest, PathBuf::from("/tmp"))

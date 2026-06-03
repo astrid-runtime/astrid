@@ -4,6 +4,7 @@ use std::path::PathBuf;
 
 use crate::capsule::{Capsule, CompositeCapsule};
 use crate::error::CapsuleResult;
+use crate::fuel_ledger::FuelLedger;
 use crate::manifest::CapsuleManifest;
 
 use astrid_mcp::SecureMcpClient;
@@ -12,13 +13,24 @@ use astrid_mcp::SecureMcpClient;
 /// a live, unified `CompositeCapsule` packed with the correct execution engines.
 pub struct CapsuleLoader {
     mcp_client: SecureMcpClient,
+    /// Kernel-owned shared per-principal CPU ledger. The loader hands this same
+    /// handle to every capsule's `WasmEngine` so CPU is aggregated per principal
+    /// across all capsules (not per-capsule). See [`FuelLedger`].
+    fuel_ledger: FuelLedger,
 }
 
 impl CapsuleLoader {
     /// Create a new Capsule Loader.
+    ///
+    /// `fuel_ledger` is the kernel-owned, shared per-principal CPU ledger
+    /// (clone of the kernel's single instance); pass `FuelLedger::default()` in
+    /// tests that don't exercise cross-capsule CPU aggregation.
     #[must_use]
-    pub fn new(mcp_client: SecureMcpClient) -> Self {
-        Self { mcp_client }
+    pub fn new(mcp_client: SecureMcpClient, fuel_ledger: FuelLedger) -> Self {
+        Self {
+            mcp_client,
+            fuel_ledger,
+        }
     }
 
     /// Parse a `CapsuleManifest` and build a unified `CompositeCapsule`.
@@ -42,6 +54,7 @@ impl CapsuleLoader {
             composite.add_engine(Box::new(crate::engine::WasmEngine::new(
                 manifest.clone(),
                 capsule_dir.clone(),
+                self.fuel_ledger.clone(),
             )));
         }
 

@@ -13,6 +13,7 @@ pub mod discovery;
 pub mod dispatcher;
 pub mod engine;
 pub mod error;
+pub mod fuel_ledger;
 pub mod loader;
 pub mod manifest;
 pub mod principal_class;
@@ -23,3 +24,5 @@ pub mod security;
 pub mod topic;
 pub mod toposort;
 pub(crate) mod watcher;
+
+pub use fuel_ledger::FuelLedger;
