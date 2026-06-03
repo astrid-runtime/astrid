@@ -154,13 +154,18 @@ pub async fn post_prompt(
     // stream gets its own per-(topic, principal) DRR queue inside
     // the bus, replacing the broadcast-channel back-pressure that
     // collapsed the 100-principal fan-in (#813 Layer 4).
+    // Per-connection routing identity. Sharing one
+    // `state.gateway_route_uuid` across every concurrent SSE connection
+    // made them all drain a single routed queue, so concurrent prompts
+    // *competed* for `agent.v1.response`: each event was consumed by
+    // whichever connection recv'd first and dropped (wrong session) if
+    // that wasn't its target, collapsing concurrent response delivery to
+    // ~1 per batch regardless of N (astrid#813 layer 4). A fresh rep per
+    // connection gives each its own routed queue, so every connection
+    // sees every response and forwards its own (filtered by session_id).
+    let conn_route_uuid = Uuid::new_v4();
     let subscribe = |topic: &'static str| {
-        bus.subscribe_topic_routed(
-            state.gateway_route_uuid,
-            topic,
-            "gateway",
-            "gateway::agent_sse",
-        )
+        bus.subscribe_topic_routed(conn_route_uuid, topic, "gateway", "gateway::agent_sse")
     };
     let mut response_rx = subscribe("agent.v1.response");
     let mut delta_rx = subscribe("agent.v1.stream.delta");
@@ -215,10 +220,16 @@ pub async fn post_prompt(
                     let Some(event) = event else { break };
                     if let Some(ev) = forward_event(&event, &session_id_for_stream, "response") {
                         yield Ok(ev);
+                        // `agent.v1.response` is terminal — but only for
+                        // OUR session. Close once we've forwarded our own
+                        // response; a different session's response (now
+                        // visible because each connection fans in every
+                        // response) must NOT close this stream, or the
+                        // connection that consumed someone else's reply
+                        // would close empty and the real target would
+                        // never be served.
+                        break;
                     }
-                    // `agent.v1.response` is terminal — close the
-                    // stream once we've forwarded it.
-                    break;
                 }
                 event = delta_rx.recv(None) => {
                     let Some(event) = event else { break };
