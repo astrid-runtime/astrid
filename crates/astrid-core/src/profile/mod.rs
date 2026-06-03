@@ -57,6 +57,20 @@ pub const DEFAULT_MAX_BACKGROUND_PROCESSES: u32 = 8;
 /// Default per-principal storage ceiling in bytes (1 `GiB`).
 pub const DEFAULT_MAX_STORAGE_BYTES: u64 = 1024 * 1024 * 1024;
 
+/// Default per-principal CPU rate ceiling in wasmtime fuel units per second
+/// (2e9 ≈ a 2 GHz-equivalent guest-instruction budget).
+///
+/// Fuel meters **executed guest instructions** independently of host-call
+/// yields. This per-principal rate is the quota surface for CPU attribution
+/// and future per-invocation budgeting; the capsule engine records the exact
+/// fuel each interceptor call consumes (per-principal ledger) against it. The
+/// run-loop CPU **bound** itself is enforced by the capsule engine's epoch
+/// interrupt (a no-recv spinner is trapped after a few windows, a recv loop
+/// never is), not by this rate directly. Operators tier this up per-principal;
+/// admin is exempt by capability, not by quota value, so there is no
+/// "unlimited" sentinel here.
+pub const DEFAULT_MAX_CPU_FUEL_PER_SEC: u64 = 2_000_000_000;
+
 /// Absolute upper bound on [`Quotas::max_timeout_secs`] (24 hours).
 ///
 /// A sanity guard against runaway invocations — the enforcement layer may
@@ -233,6 +247,19 @@ pub struct Quotas {
     /// Maximum persistent storage in bytes. Must be > 0.
     #[serde(default = "default_max_storage_bytes")]
     pub max_storage_bytes: u64,
+
+    /// Maximum CPU rate in wasmtime fuel units per second. Must be > 0.
+    ///
+    /// Per-principal CPU attribution surface: the capsule engine meters the
+    /// exact fuel each interceptor invocation consumes and accumulates it per
+    /// principal against this rate (telemetry today, per-invocation budgeting
+    /// later). The run-loop CPU **bound** is enforced separately by the capsule
+    /// engine's epoch interrupt (a no-recv spinner traps after a few windows; a
+    /// recv loop never does), not by this value. A principal holding
+    /// [`CAP_RESOURCES_UNBOUNDED`](crate::CAP_RESOURCES_UNBOUNDED) (e.g. any
+    /// `admin`) is exempt from the run-loop bound regardless of this value.
+    #[serde(default = "default_max_cpu_fuel_per_sec")]
+    pub max_cpu_fuel_per_sec: u64,
 }
 
 // ── serde default helpers ────────────────────────────────────────────────
@@ -263,6 +290,10 @@ fn default_max_background_processes() -> u32 {
 
 fn default_max_storage_bytes() -> u64 {
     DEFAULT_MAX_STORAGE_BYTES
+}
+
+fn default_max_cpu_fuel_per_sec() -> u64 {
+    DEFAULT_MAX_CPU_FUEL_PER_SEC
 }
 
 // ── Default impls ────────────────────────────────────────────────────────
@@ -306,6 +337,7 @@ impl Default for Quotas {
             max_ipc_throughput_bytes: DEFAULT_MAX_IPC_THROUGHPUT_BYTES,
             max_background_processes: DEFAULT_MAX_BACKGROUND_PROCESSES,
             max_storage_bytes: DEFAULT_MAX_STORAGE_BYTES,
+            max_cpu_fuel_per_sec: DEFAULT_MAX_CPU_FUEL_PER_SEC,
         }
     }
 }
@@ -337,6 +369,7 @@ mod tests {
             DEFAULT_MAX_BACKGROUND_PROCESSES
         );
         assert_eq!(p.quotas.max_storage_bytes, DEFAULT_MAX_STORAGE_BYTES);
+        assert_eq!(p.quotas.max_cpu_fuel_per_sec, DEFAULT_MAX_CPU_FUEL_PER_SEC);
         p.validate().expect("defaults validate");
     }
 
@@ -382,6 +415,7 @@ mod tests {
                 max_ipc_throughput_bytes: 5 * 1024 * 1024,
                 max_background_processes: 16,
                 max_storage_bytes: 2 * 1024 * 1024 * 1024,
+                max_cpu_fuel_per_sec: 4_000_000_000,
             },
         };
         let s = toml::to_string_pretty(&p).unwrap();

@@ -394,6 +394,22 @@ impl HostSubscription for HostState {
         self_: Resource<Subscription>,
         timeout_ms: u64,
     ) -> Result<IpcEnvelope, ErrorCode> {
+        // Run-loop CPU-bound cooperative-yield signal: a guest that calls
+        // `ipc::recv` is a legitimate event loop, not a no-recv spinner. The
+        // bound run-loop's epoch-deadline callback reads + clears this each
+        // window to avoid trapping a healthy loop (see `epoch_decision`). Set
+        // unconditionally on entry — even a non-blocking `recv(0)` counts as a
+        // cooperative yield, because the call drives the guest through the host
+        // boundary and back into the executor. Inert for pooled/lifecycle
+        // Stores (their epoch callback never reads it).
+        //
+        // SCOPE: only `ipc::recv` sets this. A bounded run-loop that blocks on
+        // some OTHER host import instead (e.g. a net-accept uplink) would not
+        // mark progress and could be epoch-trapped — out of scope today because
+        // the one uplink (cli) holds the granted net_bind capability and is
+        // therefore exempt from the bound entirely. Revisit if a non-exempt
+        // uplink ever needs bounding.
+        self.recv_yielded = true;
         let timeout_ms = timeout_ms.min(MAX_RECV_TIMEOUT_MS);
         let rep = self_.rep();
 

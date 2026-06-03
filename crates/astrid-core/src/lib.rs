@@ -32,7 +32,8 @@ pub mod uplink;
 pub(crate) mod utils;
 
 pub use capability_grammar::{
-    CapabilityGrammarError, MAX_CAPABILITY_LEN, capability_matches, validate_capability,
+    CAP_NET_BIND, CAP_RESOURCES_UNBOUNDED, CAP_UPLINK, CapabilityGrammarError, MAX_CAPABILITY_LEN,
+    capability_matches, validate_capability,
 };
 pub use elicitation::{
     ElicitationAction, ElicitationRequest, ElicitationResponse, ElicitationSchema, SelectOption,

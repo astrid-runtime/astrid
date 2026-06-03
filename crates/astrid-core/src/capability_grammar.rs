@@ -27,6 +27,51 @@ use thiserror::Error;
 /// they reach the matcher.
 pub const MAX_CAPABILITY_LEN: usize = 256;
 
+/// Capability that exempts a principal from per-principal capsule resource
+/// bounds (run-loop CPU epoch interrupt + linear-memory cap).
+///
+/// A principal holding this capability — directly, via a grant, or via a
+/// group whose capability set matches it (the built-in `admin` group's `*`
+/// matches everything) — runs its capsules **unbounded**: never
+/// epoch-interrupt-trapped, and the full
+/// [`DEFAULT_MAX_MEMORY_BYTES`](crate::DEFAULT_MAX_MEMORY_BYTES) linear-memory
+/// ceiling.
+///
+/// The exemption axis is the **capability**, never a group-name string match:
+/// admin is unbounded automatically because `*` matches this string
+/// ([`capability_matches`](crate::capability_matches)), with no special case.
+/// A capsule can never influence its own exemption — it does not choose its
+/// load principal (always [`PrincipalId::default`](crate::PrincipalId::default))
+/// nor its operator-owned profile capabilities. The grammar already accepts
+/// this string (colon-delimited `a-zA-Z0-9_-` segments); no grammar change is
+/// needed. The default for every non-holder is **bounded** (fail-secure).
+pub const CAP_RESOURCES_UNBOUNDED: &str = "system:resources:unbounded";
+
+/// Capability that authorizes a principal to bind/accept network sockets
+/// (the CLI/web/Discord uplink proxy pattern).
+///
+/// This is the **principal-profile** capability — operator/user-granted via
+/// groups or grants — NOT the capsule-authored `[capabilities] net_bind`
+/// manifest field. The manifest field is untrusted self-declaration; THIS
+/// string is what an operator grants a trusted uplink's load principal. A
+/// holder's run-loop is exempt from the per-principal CPU+memory bound,
+/// because a uplink legitimately blocks indefinitely on socket-accept and
+/// must never be epoch-trapped. admin holds it via `*`. A capsule that merely
+/// *declares* `net_bind` in its own manifest without the principal holding
+/// this granted capability is **bounded** (not exempt). Bare single segment,
+/// grammar-valid (`a-zA-Z0-9_-`); no grammar change needed.
+pub const CAP_NET_BIND: &str = "net_bind";
+
+/// Capability that authorizes a principal to register as a long-lived uplink
+/// daemon (parallel to [`CAP_NET_BIND`] for the manifest `uplink` bool).
+///
+/// Operator/user-granted on the principal profile; a holder's run-loop is
+/// exempt from the per-principal CPU+memory bound for the same reason as
+/// [`CAP_NET_BIND`] — a uplink daemon blocks indefinitely and must not be
+/// epoch-trapped. admin holds it via `*`. Manifest self-declaration of
+/// `uplink` does NOT confer it.
+pub const CAP_UPLINK: &str = "uplink";
+
 /// Errors raised by [`validate_capability`].
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum CapabilityGrammarError {

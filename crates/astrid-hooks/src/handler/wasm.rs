@@ -302,6 +302,10 @@ impl WasmHandler {
             capsule_uuid: uuid::Uuid::new_v4(),
             caller_context: None,
             interceptor_active: false,
+            // Hooks run as a transient one-shot, not a bound run loop, so the
+            // run-loop CPU cooperative-yield state is inert here.
+            recv_yielded: false,
+            no_yield_windows: 0,
             invocation_kv: None,
             capsule_log: None,
             capsule_id: CapsuleId::from_static(&hook_identity),

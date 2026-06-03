@@ -389,6 +389,23 @@ pub struct HostState {
     /// without iterating the whole resource table.
     pub process_count_by_principal:
         std::collections::HashMap<astrid_core::principal::PrincipalId, usize>,
+    /// Bound run-loop CPU-bound signal: set `true` by the ipc `recv` host fn
+    /// each time the guest blocks on recv, read + cleared by the run-loop's
+    /// epoch-deadline callback once per window.
+    ///
+    /// This is the cooperative-yield signal that distinguishes a legitimate
+    /// recv/accept loop (sets it every iteration → never trapped) from a
+    /// no-recv spinner (never sets it → interrupt-trapped after
+    /// `MAX_NO_YIELD_WINDOWS`). Only the dedicated, mutex-guarded run-loop
+    /// Store reads it; pooled/lifecycle Stores leave it inert. Single Store =
+    /// single thread, so the callback and the host fn never race.
+    pub recv_yielded: bool,
+    /// Bound run-loop CPU-bound counter: consecutive epoch windows in which
+    /// the guest burned CPU without a single `recv` (`recv_yielded` stayed
+    /// false). The run-loop epoch callback increments it each no-recv window
+    /// and traps the guest once it reaches `MAX_NO_YIELD_WINDOWS`; a recv
+    /// resets it to 0. Inert for pooled/lifecycle Stores.
+    pub no_yield_windows: u32,
 }
 
 impl wasmtime_wasi::WasiView for HostState {

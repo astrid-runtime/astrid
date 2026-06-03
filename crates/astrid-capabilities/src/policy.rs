@@ -230,6 +230,24 @@ mod tests {
     }
 
     #[test]
+    fn resources_unbounded_is_admin_only() {
+        // The capsule resource-bound exemption capability: admin holds it via
+        // `*`, a plain agent does not. This is the axis the run-loop CPU/memory
+        // bound keys exemption on.
+        let cfg = gc();
+        let admin = profile_in(&["admin"]);
+        assert!(
+            CapabilityCheck::new(&admin, &cfg, pid()).has(astrid_core::CAP_RESOURCES_UNBOUNDED),
+            "admin must hold CAP_RESOURCES_UNBOUNDED via `*`"
+        );
+        let agent = profile_in(&["agent"]);
+        assert!(
+            !CapabilityCheck::new(&agent, &cfg, pid()).has(astrid_core::CAP_RESOURCES_UNBOUNDED),
+            "agent must NOT hold CAP_RESOURCES_UNBOUNDED"
+        );
+    }
+
+    #[test]
     fn restricted_has_nothing_by_default() {
         let p = profile_in(&["restricted"]);
         let cfg = gc();

@@ -238,6 +238,32 @@ mod tests {
     }
 
     #[test]
+    fn load_roundtrips_cpu_fuel_quota() {
+        let (_d, home, principal) = scratch_home();
+        let mut p = PrincipalProfile::default();
+        p.quotas.max_cpu_fuel_per_sec = 1_500_000_000;
+        p.save(&home, &principal).unwrap();
+        let loaded = PrincipalProfile::load(&home, &principal).unwrap();
+        assert_eq!(loaded.quotas.max_cpu_fuel_per_sec, 1_500_000_000);
+    }
+
+    #[test]
+    fn load_quotas_missing_cpu_fuel_uses_default() {
+        // A pre-existing profile.toml that predates the field still loads,
+        // with `max_cpu_fuel_per_sec` falling back to the serde default
+        // (deny_unknown_fields rejects UNKNOWN fields, not missing ones).
+        let (_d, home, principal) = scratch_home();
+        let path = PrincipalProfile::path_for(&home, &principal);
+        fs::write(&path, "[quotas]\nmax_memory_bytes = 1048576\n").unwrap();
+        let loaded = PrincipalProfile::load(&home, &principal).unwrap();
+        assert_eq!(loaded.quotas.max_memory_bytes, 1_048_576);
+        assert_eq!(
+            loaded.quotas.max_cpu_fuel_per_sec,
+            super::super::DEFAULT_MAX_CPU_FUEL_PER_SEC
+        );
+    }
+
+    #[test]
     fn load_rejects_future_version() {
         let (_d, home, principal) = scratch_home();
         let path = PrincipalProfile::path_for(&home, &principal);
