@@ -34,6 +34,7 @@ fn assert_success(res: &AdminResponseBody) {
     match res {
         AdminResponseBody::Success(_)
         | AdminResponseBody::Quotas(_)
+        | AdminResponseBody::Usage(_)
         | AdminResponseBody::AgentList(_)
         | AdminResponseBody::GroupList(_)
         | AdminResponseBody::Invite(_)

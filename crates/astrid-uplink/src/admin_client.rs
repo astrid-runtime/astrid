@@ -57,6 +57,7 @@ pub const fn topic_suffix(req: &AdminRequestKind) -> &'static str {
         AdminRequestKind::AgentList => "agent.list",
         AdminRequestKind::QuotaSet { .. } => "quota.set",
         AdminRequestKind::QuotaGet { .. } => "quota.get",
+        AdminRequestKind::UsageGet { .. } => "usage.get",
         AdminRequestKind::GroupCreate { .. } => "group.create",
         AdminRequestKind::GroupDelete { .. } => "group.delete",
         AdminRequestKind::GroupModify { .. } => "group.modify",

@@ -26,6 +26,7 @@ mod enforcement_tests;
 mod handlers;
 mod invite_handlers;
 mod pair_device_handlers;
+mod quota;
 #[cfg(test)]
 mod state_tests;
 #[cfg(test)]
@@ -128,7 +129,9 @@ fn admin_response_topic(input_topic: &str) -> String {
 #[must_use]
 pub fn resolve_admin_scope(req: &AdminRequestKind, caller: &PrincipalId) -> AuthorityScope {
     match req {
-        AdminRequestKind::QuotaGet { principal } | AdminRequestKind::QuotaSet { principal, .. } => {
+        AdminRequestKind::QuotaGet { principal }
+        | AdminRequestKind::QuotaSet { principal, .. }
+        | AdminRequestKind::UsageGet { principal } => {
             if principal == caller {
                 AuthorityScope::Self_
             } else {
@@ -196,8 +199,17 @@ pub fn required_capability_for_admin_request(
         (AdminRequestKind::AgentList, AuthorityScope::Global) => "agent:list",
         (AdminRequestKind::QuotaSet { .. }, AuthorityScope::Self_) => "self:quota:set",
         (AdminRequestKind::QuotaSet { .. }, AuthorityScope::Global) => "quota:set",
-        (AdminRequestKind::QuotaGet { .. }, AuthorityScope::Self_) => "self:quota:get",
-        (AdminRequestKind::QuotaGet { .. }, AuthorityScope::Global) => "quota:get",
+        // Usage is a read over the same quota surface; reuse the quota:get
+        // capability so no new grant is minted (a principal that can read its
+        // quota can read its usage).
+        (
+            AdminRequestKind::QuotaGet { .. } | AdminRequestKind::UsageGet { .. },
+            AuthorityScope::Self_,
+        ) => "self:quota:get",
+        (
+            AdminRequestKind::QuotaGet { .. } | AdminRequestKind::UsageGet { .. },
+            AuthorityScope::Global,
+        ) => "quota:get",
         (AdminRequestKind::GroupCreate { .. }, _) => "group:create",
         (AdminRequestKind::GroupDelete { .. }, _) => "group:delete",
         (AdminRequestKind::GroupModify { .. }, _) => "group:modify",
@@ -238,6 +250,7 @@ pub fn admin_request_method(req: &AdminRequestKind) -> &'static str {
         AdminRequestKind::AgentList => "admin.agent.list",
         AdminRequestKind::QuotaSet { .. } => "admin.quota.set",
         AdminRequestKind::QuotaGet { .. } => "admin.quota.get",
+        AdminRequestKind::UsageGet { .. } => "admin.usage.get",
         AdminRequestKind::GroupCreate { .. } => "admin.group.create",
         AdminRequestKind::GroupDelete { .. } => "admin.group.delete",
         AdminRequestKind::GroupModify { .. } => "admin.group.modify",
@@ -345,6 +358,7 @@ pub fn admin_target_principal(req: &AdminRequestKind) -> Option<&PrincipalId> {
         | AdminRequestKind::AgentModify { principal, .. }
         | AdminRequestKind::QuotaSet { principal, .. }
         | AdminRequestKind::QuotaGet { principal }
+        | AdminRequestKind::UsageGet { principal }
         | AdminRequestKind::CapsGrant { principal, .. }
         | AdminRequestKind::CapsRevoke { principal, .. } => Some(principal),
         AdminRequestKind::AgentCreate { .. }
