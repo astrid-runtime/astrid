@@ -2037,9 +2037,10 @@ impl ExecutionEngine for WasmEngine {
         let fuel_used = INTERCEPTOR_FUEL_BUDGET.saturating_sub(fuel_after);
         self.fuel_ledger.charge(&invoking_principal, fuel_used);
         // Feed this call's fuel into the CPU-rate window stamped at the moment
-        // the burn FINISHED, not `invoke_start`. The gate at the top reads with
-        // `invoke_start` (correct — it asks "what had this principal burned
-        // *before* this call?"), but the fuel itself was spent over the whole
+        // the burn FINISHED, not `invoke_start`. The gate at the top reads the
+        // window with a fresh admission-time `Instant::now()` (it asks what this
+        // principal had burned *before* this call), but the fuel itself was
+        // spent over the whole
         // call. A long call (interceptors run up to WASM_CAPSULE_TIMEOUT_SECS —
         // minutes, for LLM streaming) stamped at `invoke_start` lands its fuel
         // in a window that is already stale by the time it returns, so the next
