@@ -3,8 +3,8 @@
 //! Update flow: read every installed capsule's recorded `source`,
 //! ask the source's host (GitHub releases today) for the latest
 //! tagged version, compare against the installed semver, force a
-//! reinstall when strictly newer. Local-path and `OpenClaw` sources
-//! are reported as "skipped" rather than treated as errors.
+//! reinstall when strictly newer. Local-path sources are reported as
+//! "skipped" rather than treated as errors.
 //!
 //! `regenerate_distro_lock` re-emits `Distro.lock` from the current
 //! on-disk state after a successful update batch so the lockfile
@@ -76,12 +76,6 @@ pub(super) async fn check_remote_version(
             reason: format!("installed version '{current_version}' is not valid semver"),
         };
     };
-
-    if source.starts_with("openclaw:") && !source.contains('@') {
-        return UpdateCheck::Skipped {
-            reason: "OpenClaw registry not yet implemented".to_string(),
-        };
-    }
 
     if source.starts_with('.') || source.starts_with('/') {
         return UpdateCheck::Skipped {
@@ -310,13 +304,6 @@ fn regenerate_distro_lock(home: &AstridHome) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[tokio::test]
-    async fn test_check_remote_version_openclaw_skipped() {
-        let client = reqwest::Client::new();
-        let result = check_remote_version(&client, "openclaw:my-capsule", "1.0.0").await;
-        assert!(matches!(result, UpdateCheck::Skipped { reason } if reason.contains("OpenClaw")));
-    }
 
     #[tokio::test]
     async fn test_check_remote_version_invalid_semver() {

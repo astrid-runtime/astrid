@@ -145,8 +145,6 @@ impl MyTools {
 
 The `#[capsule]` proc macro generates all WASM ABI boilerplate: `extern "C"` exports, JSON serialization across the boundary, and dispatch routing for tools, commands, hooks, install, and upgrade entry points. Capsule authors depend on `astrid-sdk` and `serde`.
 
-TypeScript and JavaScript plugins from the OpenClaw ecosystem compile to WASM via an all-Rust pipeline (OXC transpiler, QuickJS/Wizer, export stitcher). No Node.js required for Tier 1 plugins.
-
 ## Interceptors
 
 Capsules can register interceptors on IPC topics — eBPF-style middleware that fires before (or instead of) the core handler. Interceptors return `Continue`, `Final`, or `Deny` to control the chain. A guard at priority 10 can veto an event before the core handler at priority 100 ever sees it. Tools are an IPC convention: tool capsules intercept `tool.v1.execute.<name>` and `tool.v1.request.describe` topics. The router capsule handles discovery and dispatch. The kernel has no knowledge of tool schemas.
@@ -316,7 +314,6 @@ Astrid follows a strict kernel/user-space divide. The kernel (native Rust daemon
 | Crate | Role |
 |---|---|
 | [`astrid-sdk`](https://github.com/unicity-astrid/sdk-rust) | Safe Rust SDK for capsule authors. Mirrors `std` layout. Includes `astrid-sys` (syscall table) and `astrid-sdk-macros` (`#[capsule]` proc macro). Standalone repo. |
-| `astrid-openclaw` | TypeScript-to-WASM compiler for OpenClaw plugin compatibility. All-Rust pipeline: OXC + QuickJS/Wizer. |
 
 ### Binaries
 
@@ -324,7 +321,7 @@ Astrid follows a strict kernel/user-space divide. The kernel (native Rust daemon
 |---|---|---|
 | `astrid` | `astrid-cli` | Terminal frontend. Connects to daemon over Unix socket. TUI rendering, headless/scripting mode, capsule management, distro init, daemon lifecycle commands. |
 | `astrid-daemon` | `astrid-daemon` | Background kernel process. Boots the kernel, loads capsules, serves IPC requests. `--ephemeral` flag for CLI-spawned instances. |
-| `astrid-build` | `astrid-build` | Capsule compiler and packager. Handles Rust, OpenClaw (JS/TS), and legacy MCP projects. Invoked by CLI as a companion binary. |
+| `astrid-build` | `astrid-build` | Capsule compiler and packager. Handles Rust and legacy MCP projects. Invoked by CLI as a companion binary. |
 
 ### Infrastructure crates
 
@@ -360,7 +357,6 @@ The major changes in this release:
 - **Short-circuit interceptors** — `Continue`, `Final`, or `Deny` wire format controls the middleware chain.
 - **Per-principal audit chains** — independently verifiable via `verify_principal_chain()`.
 - **`astrid capsule tree`** — renders the imports/exports dependency graph.
-- **OpenClaw Tier 2** — TypeScript plugins with npm dependencies install, transpile, and run as MCP capsules.
 - **`--snapshot-tui`** — renders the full TUI to stdout for automated smoke testing without an interactive terminal.
 
 See [CHANGELOG.md](CHANGELOG.md) for the complete list of changes, fixes, and breaking changes.
@@ -377,7 +373,6 @@ See [CHANGELOG.md](CHANGELOG.md) for the complete list of changes, fixes, and br
 - IPC event bus with broadcast subscribers and capability-scoped publish/subscribe ACLs
 - Capsule dependency resolution via topological sort with semver-versioned interface matching
 - Capsule manifest supporting commands, skills, interceptors, IPC topics, MCP servers, and uplinks
-- OpenClaw TypeScript-to-WASM compiler (OXC + QuickJS/Wizer, Tier 1 and Tier 2)
 - CLI with TUI, streaming responses, session persistence, headless mode, capsule management
 - Distro system with `Distro.toml` manifests and `Distro.lock` for reproducible installs
 - Layered configuration with workspace-level security tightening

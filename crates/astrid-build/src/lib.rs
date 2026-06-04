@@ -1,6 +1,6 @@
 //! Astrid Build - Capsule compilation and packaging tool.
 //!
-//! Compiles Rust, `OpenClaw`, and legacy MCP projects into `.capsule` archives.
+//! Compiles Rust and legacy MCP projects into `.capsule` archives.
 //! Typically invoked by the CLI (`astrid build`) but can be used standalone.
 
 #![deny(unsafe_code)]
@@ -15,7 +15,6 @@ use clap::Parser;
 mod archiver;
 mod build;
 mod mcp;
-mod openclaw;
 mod rust;
 /// WIT record → JSON Schema conversion for IPC topic schemas.
 pub mod wit_schema;
@@ -39,10 +38,6 @@ pub struct Args {
     /// Import a legacy `mcp.json` to auto-convert
     #[arg(long)]
     pub from_mcp_json: Option<String>,
-
-    /// Internal: run Wizer on the embedded `QuickJS` kernel (used by compiler subprocess)
-    #[arg(long, hide = true)]
-    pub wizer_internal: Option<std::path::PathBuf>,
 }
 
 /// Parse CLI arguments and run the build tool.
@@ -53,11 +48,6 @@ pub struct Args {
 /// Returns an error if the build fails (missing manifest, compile error, etc.).
 pub fn run() -> anyhow::Result<()> {
     let args = Args::parse();
-
-    if let Some(output) = args.wizer_internal {
-        return astrid_openclaw::compiler::run_wizer_internal(&output)
-            .map_err(|e| anyhow::anyhow!("wizer-internal failed: {e}"));
-    }
 
     build::run_build(
         args.path.as_deref(),

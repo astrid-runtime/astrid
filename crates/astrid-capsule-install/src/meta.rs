@@ -27,7 +27,7 @@ pub struct CapsuleMeta {
     pub installed_at: String,
     /// When the capsule was last updated.
     pub updated_at: String,
-    /// The original install source (local path, GitHub URL, openclaw: prefix, etc.).
+    /// The original install source (local path, GitHub URL, etc.).
     /// Used by `astrid capsule update` to re-fetch from the same source.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<String>,
@@ -43,7 +43,7 @@ pub struct CapsuleMeta {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub topics: Vec<BakedTopic>,
     /// BLAKE3 hash of the WASM binary, stored content-addressed in `bin/`.
-    /// `None` for non-WASM capsules (MCP/OpenClaw).
+    /// `None` for non-WASM capsules (MCP).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wasm_hash: Option<String>,
     /// Content-addressed WIT files stored in `wit/`.

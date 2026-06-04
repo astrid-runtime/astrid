@@ -517,7 +517,7 @@ pub struct McpServerDef {
     pub id: String,
     /// Optional description.
     pub description: Option<String>,
-    /// Server type: "wasm-ipc", "stdio", "openclaw".
+    /// Server type: "wasm-ipc", "stdio".
     #[serde(rename = "type")]
     pub server_type: Option<String>,
     /// The host command (if type = stdio).

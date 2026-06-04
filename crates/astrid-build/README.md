@@ -6,7 +6,7 @@
 
 **Capsule compilation and packaging for the Astrid OS.**
 
-Compiles Rust, OpenClaw (JS/TS), and legacy MCP server projects into `.capsule` archives that the Astrid kernel can load. Typically invoked by the CLI (`astrid build`) but can be used standalone.
+Compiles Rust and legacy MCP server projects into `.capsule` archives that the Astrid kernel can load. Typically invoked by the CLI (`astrid build`) but can be used standalone.
 
 ## Usage
 
@@ -38,7 +38,7 @@ astrid-build [PATH] [OPTIONS]
 |---|---|
 | `[PATH]` | Project directory (defaults to current directory) |
 | `-o, --output <DIR>` | Output directory for the `.capsule` archive |
-| `-t, --type <TYPE>` | Explicit project type: `rust`, `openclaw`, `mcp`, `extension` |
+| `-t, --type <TYPE>` | Explicit project type: `rust`, `mcp`, `extension` |
 | `--from-mcp-json <FILE>` | Import a legacy `mcp.json` or `gemini-extension.json` to auto-convert |
 
 ## Supported project types
@@ -46,7 +46,6 @@ astrid-build [PATH] [OPTIONS]
 | Type | Detection | What happens |
 |---|---|---|
 | **Rust** | `Cargo.toml` + `Cargo.lock` | `cargo build --target wasm32-wasip1 --release`, extracts tool schemas from WASM, merges into `Capsule.toml`, packs archive |
-| **OpenClaw** | `openclaw.plugin.json` | Transpiles JS/TS via the OpenClaw pipeline (Tier 1 WASM or Tier 2 Node.js), packs archive |
 | **MCP** | `mcp.json` | Converts legacy MCP server manifest to `Capsule.toml`, packs archive |
 | **Extension** | `gemini-extension.json` | Same as MCP, for Gemini extension format |
 
@@ -55,8 +54,7 @@ astrid-build [PATH] [OPTIONS]
 A `.capsule` file — a gzipped tar archive containing:
 
 - `Capsule.toml` — manifest with package metadata, capabilities, tool schemas
-- `plugin.wasm` — the compiled WASM binary (Rust and Tier 1 OpenClaw)
-- `node_modules/` + source — for Tier 2 OpenClaw (Node.js runtime)
+- `plugin.wasm` — the compiled WASM binary
 
 Install the built capsule:
 

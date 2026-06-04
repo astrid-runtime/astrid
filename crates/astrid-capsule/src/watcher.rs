@@ -48,7 +48,7 @@ const IGNORED_FILENAMES: &[&str] = &["astrid_bridge.mjs"];
 pub(crate) enum WatchEvent {
     /// A capsule's source files changed and may need recompilation.
     CapsuleChanged {
-        /// The capsule's root directory (contains `Capsule.toml` or `openclaw.plugin.json`).
+        /// The capsule's root directory (contains `Capsule.toml`).
         capsule_dir: PathBuf,
         /// blake3 hash of the capsule's source tree after the change.
         source_hash: String,
@@ -239,9 +239,9 @@ impl CapsuleWatcher {
 
     /// Walk up from a changed file to find its parent capsule directory.
     ///
-    /// A capsule directory is identified by containing `Capsule.toml` or
-    /// `openclaw.plugin.json`. Starts from the parent of the changed path
-    /// to avoid an unnecessary `stat` syscall on the path itself.
+    /// A capsule directory is identified by containing `Capsule.toml`.
+    /// Starts from the parent of the changed path to avoid an unnecessary
+    /// `stat` syscall on the path itself.
     fn resolve_capsule_dir(&self, path: &Path) -> Option<PathBuf> {
         // Start from the parent directory — for files in the capsule root
         // (including manifests like Capsule.toml), parent() gives the capsule
@@ -249,9 +249,7 @@ impl CapsuleWatcher {
         let mut current = path.parent()?.to_path_buf();
 
         loop {
-            if current.join(MANIFEST_FILE_NAME).exists()
-                || current.join("openclaw.plugin.json").exists()
-            {
+            if current.join(MANIFEST_FILE_NAME).exists() {
                 return Some(current);
             }
 

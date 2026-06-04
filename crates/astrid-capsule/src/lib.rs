@@ -5,7 +5,7 @@
 //! Core capsule runtime implementing the "Manifest-First" architecture.
 //! It provides the definition for `Capsule.toml`
 //! manifests, handles discovery, and routes execution to the appropriate
-//! environments (WASM sandboxes, legacy host processes, or OpenClaw bridges).
+//! environments (WASM sandboxes or legacy host processes).
 
 pub mod capsule;
 pub mod context;

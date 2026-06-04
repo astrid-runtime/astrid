@@ -71,8 +71,8 @@ pub struct InstallRequest {
     /// Source path or package locator. The **kernel-side handler**
     /// accepts only local paths — either a directory containing
     /// `Capsule.toml` or a `*.capsule` archive. Network-shaped
-    /// sources (`@org/repo`, `github.com/...`, `openclaw:...`,
-    /// `gh:`, `https://`) are rejected; resolve them via a future
+    /// sources (`@org/repo`, `github.com/...`, `gh:`, `https://`)
+    /// are rejected; resolve them via a future
     /// `POST /api/capsules/install-by-id` registry route, which will
     /// download to a local archive and re-call this endpoint.
     pub source: String,

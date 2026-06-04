@@ -1,9 +1,9 @@
 //! Install a capsule from a directory on disk.
 //!
 //! By the time we get here, the source has already been resolved to
-//! a real directory containing a `Capsule.toml`. GitHub clones,
-//! `.capsule` archive unpacks, `OpenClaw` transpile output — all of
-//! that happens in the CLI before this is called. Archive unpack
+//! a real directory containing a `Capsule.toml`. GitHub clones and
+//! `.capsule` archive unpacks — all of that happens in the CLI
+//! before this is called. Archive unpack
 //! lives in [`crate::archive::unpack_and_install`], which staged the
 //! archive into a tempdir and then forwards here.
 //!
@@ -56,7 +56,7 @@ pub struct InstallOptions {
     /// principal's home directory.
     pub workspace: bool,
     /// The source string the user originally typed (e.g. a GitHub
-    /// URL, an openclaw spec). Stored verbatim in `meta.json` so
+    /// URL). Stored verbatim in `meta.json` so
     /// `astrid capsule update` can re-fetch from the same place.
     /// `None` for direct local-path installs where the source IS the
     /// path.
