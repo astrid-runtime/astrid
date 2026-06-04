@@ -93,6 +93,24 @@ impl FuelLedger {
             Some(v.saturating_add(fuel))
         });
     }
+
+    /// Read `principal`'s cumulative cross-capsule fuel total, or `0` if the
+    /// principal has never been charged.
+    ///
+    /// Cheap: a DashMap shard *read* guard plus a single `Relaxed` atomic load —
+    /// the same ordering the [`charge`](FuelLedger::charge) hot path uses, and
+    /// correct for the read side because this is a monotonic counter with no
+    /// happens-before dependency on other memory. (The shard read guard is a
+    /// lightweight read-lock, not strictly lock-free, but distinct principals
+    /// live on distinct shards and never contend.) The value is a snapshot:
+    /// concurrent charges may land immediately after the load, so a reader sees
+    /// a total that is correct-as-of-read, never torn.
+    #[must_use]
+    pub fn total(&self, principal: &PrincipalId) -> u64 {
+        self.inner
+            .get(principal)
+            .map_or(0, |counter| counter.load(Ordering::Relaxed))
+    }
 }
 
 /// One principal's sliding 1-second CPU-fuel window.
@@ -335,6 +353,20 @@ mod tests {
             engine_a.inner.get(&p).unwrap().load(Ordering::Relaxed),
             42,
             "two engines sharing one ledger sum cross-capsule"
+        );
+    }
+
+    #[test]
+    fn total_sums_charges_and_defaults_to_zero() {
+        let ledger = FuelLedger::default();
+        let a = pid("alice");
+        ledger.charge(&a, 100);
+        ledger.charge(&a, 50);
+        assert_eq!(ledger.total(&a), 150, "total returns the cumulative sum");
+        assert_eq!(
+            ledger.total(&pid("absent")),
+            0,
+            "a never-charged principal reads as zero, not an error"
         );
     }
 
