@@ -59,7 +59,14 @@ pub(crate) trait ExecutionEngine: Send + Sync {
     ///
     /// The default implementation returns an error. Engines that support
     /// interceptors (e.g., `WasmEngine`) override this.
-    fn invoke_interceptor(
+    ///
+    /// **Async contract:** the future returned by this method MAY be
+    /// cancelled (e.g. the dispatcher task is aborted). Implementations
+    /// must ensure any per-invocation state set on the engine is cleared
+    /// before any `.await` that may not return — typically via an RAII
+    /// guard that runs in `Drop`. The wasm engine uses `ClearOnDrop`
+    /// across the `call_async` await.
+    async fn invoke_interceptor(
         &self,
         _action: &str,
         _payload: &[u8],

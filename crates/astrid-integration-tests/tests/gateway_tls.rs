@@ -64,6 +64,7 @@ fn tls_state(bind_addr: SocketAddr, cert_path: PathBuf, key_path: PathBuf) -> Ar
         revoked_at: std::sync::Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
         audit_log: None,
         session_id: None,
+        gateway_route_uuid: uuid::Uuid::new_v4(),
     })
 }
 
@@ -196,6 +197,7 @@ async fn plain_http_path_still_works_when_no_tls_block() {
         revoked_at: std::sync::Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
         audit_log: None,
         session_id: None,
+        gateway_route_uuid: uuid::Uuid::new_v4(),
     });
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();

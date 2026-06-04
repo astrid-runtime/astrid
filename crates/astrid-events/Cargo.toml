@@ -19,6 +19,10 @@ dashmap = { workspace = true }
 # daemon installs (the gateway's Prometheus recorder today); no exporter
 # dependency here — recording is decoupled from export.
 metrics = { workspace = true }
+# Synchronous routing demux uses `parking_lot::RwLock + Mutex` so
+# `EventBus::publish` stays sync (the reentrant `SubscriberRegistry`
+# notify path would deadlock if every publish became async).
+parking_lot = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

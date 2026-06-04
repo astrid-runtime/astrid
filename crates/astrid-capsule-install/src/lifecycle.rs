@@ -95,15 +95,22 @@ pub fn run_lifecycle(
         secret_store,
     };
 
+    // `engine::wasm::run_lifecycle` is async — async wasmtime requires
+    // it to `.await` instantiate_async / call_async. Drive the future
+    // through the available runtime handle.
     let result = if let Some(rt) = &owned_rt {
-        // Enter the runtime context so Handle::current() works inside
-        // run_lifecycle. Do NOT use block_in_place here — we are not
-        // a tokio worker thread, and block_in_place would panic.
-        let _guard = rt.enter();
-        astrid_capsule::engine::wasm::run_lifecycle(cfg, phase, previous_version)
+        rt.block_on(astrid_capsule::engine::wasm::run_lifecycle(
+            cfg,
+            phase,
+            previous_version,
+        ))
     } else {
         tokio::task::block_in_place(|| {
-            astrid_capsule::engine::wasm::run_lifecycle(cfg, phase, previous_version)
+            handle.block_on(astrid_capsule::engine::wasm::run_lifecycle(
+                cfg,
+                phase,
+                previous_version,
+            ))
         })
     };
 

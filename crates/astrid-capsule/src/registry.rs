@@ -268,7 +268,6 @@ mod tests {
     use std::time::Duration;
 
     use async_trait::async_trait;
-    use tokio::sync::Semaphore;
 
     use crate::capsule::{CapsuleState, ReadyStatus};
     use crate::context::CapsuleContext;
@@ -278,7 +277,6 @@ mod tests {
     struct MockCapsule {
         id: CapsuleId,
         manifest: CapsuleManifest,
-        semaphore: Arc<Semaphore>,
     }
 
     impl MockCapsule {
@@ -321,7 +319,6 @@ mod tests {
                     subscribes: ::std::collections::HashMap::new(),
                     tools: ::std::vec::Vec::new(),
                 },
-                semaphore: Arc::new(Semaphore::new(4)),
             }
         }
     }
@@ -351,7 +348,7 @@ mod tests {
         async fn wait_ready(&self, _timeout: Duration) -> ReadyStatus {
             ReadyStatus::Ready
         }
-        fn invoke_interceptor(
+        async fn invoke_interceptor(
             &self,
             _action: &str,
             _payload: &[u8],
@@ -364,9 +361,6 @@ mod tests {
         }
         fn source_dir(&self) -> Option<&Path> {
             None
-        }
-        fn interceptor_semaphore(&self) -> &Arc<Semaphore> {
-            &self.semaphore
         }
     }
 

@@ -111,6 +111,7 @@ mod tests {
             schema_catalog: std::sync::Arc::new(crate::schema_catalog::SchemaCatalog::new()),
             profile_cache: None,
             overlay_registry: None,
+            group_config: None,
         };
 
         let result = engine.load(&ctx).await;
@@ -175,6 +176,7 @@ mod tests {
             schema_catalog: std::sync::Arc::new(crate::schema_catalog::SchemaCatalog::new()),
             profile_cache: None,
             overlay_registry: None,
+            group_config: None,
         };
 
         let result = engine.load(&ctx).await;
@@ -236,6 +238,7 @@ mod tests {
             schema_catalog: std::sync::Arc::new(crate::schema_catalog::SchemaCatalog::new()),
             profile_cache: None,
             overlay_registry: None,
+            group_config: None,
         };
 
         let result = engine.load(&ctx).await;

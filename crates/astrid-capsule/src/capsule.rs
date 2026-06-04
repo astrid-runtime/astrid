@@ -2,18 +2,13 @@
 
 use std::fmt;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
-use tokio::sync::Semaphore;
 
 use crate::context::CapsuleContext;
 use crate::error::{CapsuleError, CapsuleResult};
 use crate::manifest::CapsuleManifest;
-
-/// Maximum concurrent interceptor invocations per capsule.
-const MAX_CONCURRENT_INTERCEPTORS: usize = 4;
 
 /// Result of an interceptor invocation, determining how the dispatcher
 /// continues the middleware chain.
@@ -218,7 +213,7 @@ pub trait Capsule: Send + Sync {
     /// - `Continue` — pass (possibly modified) payload to the next interceptor
     /// - `Final` — short-circuit the chain with a response
     /// - `Deny` — short-circuit the chain, audit-logged
-    fn invoke_interceptor(
+    async fn invoke_interceptor(
         &self,
         _action: &str,
         _payload: &[u8],
@@ -245,25 +240,6 @@ pub trait Capsule: Send + Sync {
     fn source_dir(&self) -> Option<&Path> {
         None
     }
-
-    /// Per-capsule semaphore that bounds concurrent interceptor invocations.
-    ///
-    /// The event dispatcher acquires a permit before calling
-    /// [`invoke_interceptor`](Self::invoke_interceptor), preventing any single
-    /// capsule from spawning unbounded tasks under high event volume.
-    ///
-    /// # Default implementation
-    ///
-    /// Returns a **shared global** semaphore as a fallback. This means all
-    /// capsules using the default share the same permit pool, which does NOT
-    /// provide per-capsule isolation. Concrete types (e.g., `CompositeCapsule`)
-    /// should override this with their own `Arc<Semaphore>`.
-    fn interceptor_semaphore(&self) -> &Arc<Semaphore> {
-        use std::sync::LazyLock;
-        static FALLBACK: LazyLock<Arc<Semaphore>> =
-            LazyLock::new(|| Arc::new(Semaphore::new(MAX_CONCURRENT_INTERCEPTORS)));
-        &FALLBACK
-    }
 }
 
 /// The universal, additive implementation of a Capsule.
@@ -278,7 +254,6 @@ pub(crate) struct CompositeCapsule {
     state: CapsuleState,
     engines: Vec<Box<dyn crate::engine::ExecutionEngine>>,
     capsule_dir: Option<PathBuf>,
-    interceptor_semaphore: Arc<Semaphore>,
 }
 
 impl CompositeCapsule {
@@ -291,7 +266,6 @@ impl CompositeCapsule {
             state: CapsuleState::Unloaded,
             engines: Vec::new(),
             capsule_dir: None,
-            interceptor_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_INTERCEPTORS)),
         })
     }
 
@@ -369,14 +343,14 @@ impl Capsule for CompositeCapsule {
         None
     }
 
-    fn invoke_interceptor(
+    async fn invoke_interceptor(
         &self,
         action: &str,
         payload: &[u8],
         caller: Option<&astrid_events::ipc::IpcMessage>,
     ) -> CapsuleResult<InterceptResult> {
         for engine in &self.engines {
-            match engine.invoke_interceptor(action, payload, caller) {
+            match engine.invoke_interceptor(action, payload, caller).await {
                 Ok(result) => return Ok(result),
                 // Engine doesn't support interceptors — try the next one.
                 Err(CapsuleError::NotSupported(_)) => continue,
@@ -400,10 +374,6 @@ impl Capsule for CompositeCapsule {
 
     fn source_dir(&self) -> Option<&Path> {
         self.capsule_dir.as_deref()
-    }
-
-    fn interceptor_semaphore(&self) -> &Arc<Semaphore> {
-        &self.interceptor_semaphore
     }
 }
 
@@ -557,38 +527,5 @@ mod tests {
             .wait_ready(std::time::Duration::from_millis(100))
             .await;
         assert_eq!(status, ReadyStatus::Ready);
-    }
-
-    #[test]
-    fn composite_interceptor_semaphore_is_bounded() {
-        let capsule = CompositeCapsule::new(test_manifest()).unwrap();
-        let sem = capsule.interceptor_semaphore();
-        assert_eq!(sem.available_permits(), MAX_CONCURRENT_INTERCEPTORS);
-    }
-
-    #[test]
-    fn trait_default_interceptor_semaphore_returns_valid_semaphore() {
-        struct MinimalCapsule;
-        #[async_trait]
-        impl Capsule for MinimalCapsule {
-            fn id(&self) -> &CapsuleId {
-                unimplemented!()
-            }
-            fn manifest(&self) -> &CapsuleManifest {
-                unimplemented!()
-            }
-            fn state(&self) -> CapsuleState {
-                CapsuleState::Unloaded
-            }
-            async fn load(&mut self, _: &crate::context::CapsuleContext) -> CapsuleResult<()> {
-                Ok(())
-            }
-            async fn unload(&mut self) -> CapsuleResult<()> {
-                Ok(())
-            }
-        }
-        let capsule = MinimalCapsule;
-        let sem = capsule.interceptor_semaphore();
-        assert_eq!(sem.available_permits(), MAX_CONCURRENT_INTERCEPTORS);
     }
 }

@@ -1,11 +1,19 @@
 //! `astrid:ipc@1.0.0` host implementation.
 //!
 //! Subscriptions are first-class wasmtime resources. `subscribe` allocates
-//! an `EventReceiver` against the kernel event bus, stores it in the
-//! capsule's resource table, and hands back a `Resource<Subscription>`.
+//! a [`RoutedEventReceiver`] against the kernel event bus, stores it in
+//! the capsule's resource table, and hands back a `Resource<Subscription>`.
 //! All drop / lifetime / cross-capsule isolation rides wasmtime's
 //! resource machinery — there is no parallel `HashMap<u64, EventReceiver>`
 //! on `HostState` anymore.
+//!
+//! Per-(capsule, topic, principal) isolation lives one layer down in
+//! `astrid_events::route`: each guest subscription gets its own routed
+//! entry in the bus's `routes` table, with per-principal FIFO queues
+//! drained under deficit-round-robin. The legacy "pending bucket
+//! requeue" workaround that lived here is gone — routed receivers
+//! never see mixed-principal batches in the first place because the
+//! demux happens publish-side, not consumer-side.
 //!
 //! Audit envelope: every publish / publish-as / subscribe / poll / recv
 //! / drop emits a tracing event under `target = "astrid.audit.ipc"` with
@@ -27,7 +35,7 @@ use crate::engine::wasm::host::util;
 use crate::engine::wasm::host_state::HostState;
 use astrid_events::AstridEvent;
 use astrid_events::EventMetadata;
-use astrid_events::EventReceiver;
+use astrid_events::RoutedEventReceiver;
 use astrid_events::ipc::{IpcMessage as InternalIpcMessage, IpcPayload};
 
 /// Per-call payload cap. Matches the IPC bus message-size ceiling.
@@ -47,79 +55,25 @@ const MAX_RECV_TIMEOUT_MS: u64 = 60_000;
 /// Storage type for `Resource<Subscription>` entries in the wasmtime
 /// resource table.
 ///
-/// The `EventReceiver` is wrapped in `Arc<Mutex<…>>` so a blocking
-/// `recv` can hold an exclusive borrow on the receiver across the
-/// `bounded_block_on_cancellable` await without keeping the wasmtime
-/// `ResourceTable` borrowed for the duration of the wait. A naive
-/// `get_mut` on the table would force `&mut self.resource_table` to
-/// outlive the await, blocking every other host fn the guest might
-/// want to call from a co-running stream.
-///
-/// Wasmtime stores are single-threaded for the WASM guest, so the
-/// `Mutex` is contention-free in practice — its job is to make the
-/// borrow checker happy across the await boundary, not to coordinate
-/// real concurrent access.
+/// The [`RoutedEventReceiver`] is wrapped in `Arc<Mutex<…>>` so a
+/// blocking `recv` can hold an exclusive borrow on the receiver across
+/// the `bounded_block_on_cancellable` await without keeping the wasmtime
+/// `ResourceTable` borrowed for the duration of the wait. Wasmtime
+/// stores are single-threaded for the WASM guest, so the `Mutex` is
+/// contention-free in practice — its job is to make the borrow checker
+/// happy across the await boundary.
 pub(super) struct SubscriptionEntry {
-    pub(super) receiver: Arc<Mutex<EventReceiver>>,
+    pub(super) receiver: Arc<Mutex<RoutedEventReceiver>>,
     pub(super) topic_pattern: String,
 }
 
-/// Drain result returned by `drain_receiver`.
-struct DrainResult {
-    messages: Vec<InternalIpcMessage>,
-    dropped: u64,
-    lagged: u64,
-}
-
-/// Drain all available IPC messages from a receiver (non-blocking).
-fn drain_receiver(receiver: &mut EventReceiver, max_payload_bytes: usize) -> DrainResult {
-    let mut messages = Vec::new();
-    let mut payload_bytes: usize = 0;
-    let mut dropped: u64 = 0;
-    while let Some(event) = receiver.try_recv() {
-        if let AstridEvent::Ipc { message, .. } = &*event {
-            let msg_len = serde_json::to_vec(&message.payload)
-                .map(|v| v.len())
-                .unwrap_or(max_payload_bytes);
-            if payload_bytes + msg_len > max_payload_bytes {
-                dropped += 1;
-                break;
-            }
-            messages.push(message.clone());
-            payload_bytes += msg_len;
-        }
-    }
-    let lagged = receiver.drain_lagged();
-    DrainResult {
-        messages,
-        dropped,
-        lagged,
-    }
-}
-
-/// Truncate a drained batch so every retained message shares the same
-/// publisher principal as the first — the per-recv principal context
-/// installed by `install_recv_invocation_context` is keyed off a single
-/// principal, so mixed batches would silently mis-stamp tail messages.
-fn truncate_to_homogeneous_principal(messages: &mut Vec<InternalIpcMessage>) {
-    let Some(first) = messages.first() else {
-        return;
-    };
-    let first_principal = first.principal.clone();
-    let first_match = messages
-        .iter()
-        .position(|m| m.principal != first_principal)
-        .unwrap_or(messages.len());
-    if first_match < messages.len() {
-        let dropped = messages.len() - first_match;
-        tracing::warn!(
-            kept = first_match,
-            dropped,
-            first_principal = first_principal.as_deref().unwrap_or("<none>"),
-            security_event = true,
-            "ipc::recv: mixed-principal batch truncated to first publisher's messages",
-        );
-        messages.truncate(first_match);
+/// Convert an `AstridEvent::Ipc` arc into the internal message clone the
+/// WIT translation layer expects. Returns `None` for non-IPC events;
+/// the routed demux already filters non-IPC, so this is just defensive.
+fn extract_message(event: &Arc<AstridEvent>) -> Option<InternalIpcMessage> {
+    match &**event {
+        AstridEvent::Ipc { message, .. } => Some(message.clone()),
+        _ => None,
     }
 }
 
@@ -147,11 +101,11 @@ fn to_wit_message(msg: &InternalIpcMessage) -> WitIpcMessage {
     }
 }
 
-fn drain_to_envelope(drain: &DrainResult) -> IpcEnvelope {
+fn envelope_from(messages: Vec<InternalIpcMessage>, lagged: u64) -> IpcEnvelope {
     IpcEnvelope {
-        messages: drain.messages.iter().map(to_wit_message).collect(),
-        dropped: drain.dropped,
-        lagged: drain.lagged,
+        messages: messages.iter().map(to_wit_message).collect(),
+        dropped: 0,
+        lagged,
     }
 }
 
@@ -314,9 +268,10 @@ impl ipc::Host for HostState {
         if !crate::topic::has_valid_segments(&topic_pattern) {
             return Err(ErrorCode::InvalidInput);
         }
-        // EventReceiver::matches only supports trailing-suffix wildcards
-        // (e.g. `foo.bar.*`) and exact matches. Reject mid-segment
-        // wildcards (`a.*.b`) up front.
+        // TopicMatcher (route layer) supports both trailing-suffix
+        // wildcards and mid-segment single-segment wildcards. Reject
+        // multiple wildcards in one pattern to keep the ACL surface
+        // small.
         {
             let mut segments = topic_pattern.split('.');
             #[expect(clippy::search_is_some)]
@@ -334,7 +289,18 @@ impl ipc::Host for HostState {
             return Err(ErrorCode::Quota);
         }
 
-        let receiver = self.event_bus.subscribe_topic(topic_pattern.clone());
+        // Per-(capsule, topic, principal) routed receiver. The bus
+        // owns a publish-side demux that buckets messages by the
+        // originating principal, so the guest never sees a
+        // mixed-principal batch and the cross-principal fairness lives
+        // in the bus's DRR drain — no consumer-side requeue logic
+        // needed here (#813).
+        let receiver = self.event_bus.subscribe_topic_routed(
+            self.capsule_uuid,
+            topic_pattern.clone(),
+            self.capsule_id.as_str().to_string(),
+            "capsule_guest",
+        );
         let entry = SubscriptionEntry {
             receiver: Arc::new(Mutex::new(receiver)),
             topic_pattern: topic_pattern.clone(),
@@ -379,31 +345,40 @@ impl HostSubscription for HostState {
         let rep = self_.rep();
         let entry = self
             .resource_table
-            .get::<SubscriptionEntry>(&Resource::new_borrow(rep))
+            .get_mut::<SubscriptionEntry>(&Resource::new_borrow(rep))
             .map_err(|_| ErrorCode::Closed)?;
         let topic_for_audit = entry.topic_pattern.clone();
         let receiver_arc = Arc::clone(&entry.receiver);
 
-        // Drain through the shared lock. `try_lock` is fine — wasmtime
-        // stores are single-threaded so contention is impossible; we
-        // would only hit a blocked lock if someone smuggled an Arc
-        // across a thread boundary, which the kernel never does.
-        let drain = {
+        // Drain the routed sub via DRR. The bus's per-route DRR
+        // guarantees fairness; we just budget the byte total per call.
+        let drained = {
             let mut receiver = receiver_arc
                 .try_lock()
                 .expect("Subscription receiver Arc accessed across threads");
-            drain_receiver(&mut receiver, MAX_DRAIN_BYTES)
+            receiver.try_drain(MAX_DRAIN_BYTES)
         };
-        let mut drain = drain;
-        truncate_to_homogeneous_principal(&mut drain.messages);
+        let messages: Vec<InternalIpcMessage> =
+            drained.iter().filter_map(extract_message).collect();
+        let lagged = {
+            let mut receiver = receiver_arc
+                .try_lock()
+                .expect("Subscription receiver Arc accessed across threads");
+            receiver.drain_lagged()
+        };
 
-        match drain.messages.first() {
-            Some(first) => self.install_recv_invocation_context(first),
-            None => self.clear_recv_invocation_context(),
+        // Empty drains keep the prior caller context. A run-loop
+        // capsule (prompt-builder, registry) frequently dispatches its
+        // own follow-up publishes between recvs — e.g. fetching session
+        // messages after a hook fan-out timed out. Clearing here would
+        // force those follow-up publishes to fall back to the
+        // capsule's load-time principal.
+        if let Some(first) = messages.first() {
+            self.install_recv_invocation_context(first);
         }
 
-        let count = drain.messages.len() as u64;
-        let result: Result<IpcEnvelope, ErrorCode> = Ok(drain_to_envelope(&drain));
+        let count = messages.len() as u64;
+        let result: Result<IpcEnvelope, ErrorCode> = Ok(envelope_from(messages, lagged));
         audit_ipc(
             self,
             "astrid:ipc/host.subscription.poll",
@@ -414,68 +389,95 @@ impl HostSubscription for HostState {
         result
     }
 
-    fn recv(
+    async fn recv(
         &mut self,
         self_: Resource<Subscription>,
         timeout_ms: u64,
     ) -> Result<IpcEnvelope, ErrorCode> {
+        // Run-loop CPU-bound cooperative-yield signal: a guest that calls
+        // `ipc::recv` is a legitimate event loop, not a no-recv spinner. The
+        // bound run-loop's epoch-deadline callback reads + clears this each
+        // window to avoid trapping a healthy loop (see `epoch_decision`). Set
+        // unconditionally on entry — even a non-blocking `recv(0)` counts as a
+        // cooperative yield, because the call drives the guest through the host
+        // boundary and back into the executor. Inert for pooled/lifecycle
+        // Stores (their epoch callback never reads it).
+        //
+        // SCOPE: only `ipc::recv` sets this. A bounded run-loop that blocks on
+        // some OTHER host import instead (e.g. a net-accept uplink) would not
+        // mark progress and could be epoch-trapped — out of scope today because
+        // the one uplink (cli) holds the granted net_bind capability and is
+        // therefore exempt from the bound entirely. Revisit if a non-exempt
+        // uplink ever needs bounding.
+        self.recv_yielded = true;
         let timeout_ms = timeout_ms.min(MAX_RECV_TIMEOUT_MS);
         let rep = self_.rep();
 
-        // Borrow the entry to clone its receiver Arc. The resource
-        // stays in the table — the guest's `Resource<Subscription>`
-        // remains valid across repeated `recv` calls.
         let (receiver_arc, topic_for_audit) = {
             let entry = self
                 .resource_table
-                .get::<SubscriptionEntry>(&Resource::new_borrow(rep))
+                .get_mut::<SubscriptionEntry>(&Resource::new_borrow(rep))
                 .map_err(|_| ErrorCode::Closed)?;
             (Arc::clone(&entry.receiver), entry.topic_pattern.clone())
         };
 
-        let runtime_handle = self.runtime_handle.clone();
+        // Wait for at least one event up to `timeout_ms`, then drain
+        // additional events without further blocking. This is an `async`
+        // host fn (see the bindgen async selector), so we `.await` the
+        // wait directly via `bounded_await_cancellable` — the tokio worker
+        // is freed while the receiver is idle rather than pinned via
+        // `block_in_place` (issue #816).
         let cancel_token = self.cancel_token.clone();
         let host_semaphore = self.host_semaphore.clone();
-
         let receiver_for_wait = Arc::clone(&receiver_arc);
-        let event = util::bounded_block_on_cancellable(
-            &runtime_handle,
-            &host_semaphore,
-            &cancel_token,
-            async move {
-                let mut receiver = receiver_for_wait.lock().await;
-                tokio::time::timeout(
-                    std::time::Duration::from_millis(timeout_ms),
-                    receiver.recv(),
-                )
+        let first = util::bounded_await_cancellable(&host_semaphore, &cancel_token, async move {
+            let mut receiver = receiver_for_wait.lock().await;
+            receiver
+                .recv(Some(std::time::Duration::from_millis(timeout_ms)))
                 .await
-                .ok()
-                .flatten()
-            },
-        )
+        })
+        .await
         .flatten();
 
-        let mut drain = {
+        let mut messages: Vec<InternalIpcMessage> = Vec::new();
+        let mut consumed = 0usize;
+        if let Some(event) = first
+            && let Some(msg) = extract_message(&event)
+        {
+            consumed = msg
+                .payload
+                .to_guest_bytes()
+                .map(|v| v.len())
+                .unwrap_or(0)
+                .saturating_add(msg.topic.len());
+            messages.push(msg);
+        }
+
+        let drained = {
             let mut receiver = receiver_arc
                 .try_lock()
                 .expect("Subscription receiver Arc accessed across threads");
-            drain_receiver(&mut receiver, MAX_DRAIN_BYTES)
+            receiver.try_drain(MAX_DRAIN_BYTES.saturating_sub(consumed))
+        };
+        for event in &drained {
+            if let Some(msg) = extract_message(event) {
+                messages.push(msg);
+            }
+        }
+
+        let lagged = {
+            let mut receiver = receiver_arc
+                .try_lock()
+                .expect("Subscription receiver Arc accessed across threads");
+            receiver.drain_lagged()
         };
 
-        if let Some(event) = event
-            && let AstridEvent::Ipc { message, .. } = &*event
-        {
-            drain.messages.insert(0, message.clone());
+        if let Some(first) = messages.first() {
+            self.install_recv_invocation_context(first);
         }
 
-        truncate_to_homogeneous_principal(&mut drain.messages);
-        match drain.messages.first() {
-            Some(first) => self.install_recv_invocation_context(first),
-            None => self.clear_recv_invocation_context(),
-        }
-
-        let count = drain.messages.len() as u64;
-        let result: Result<IpcEnvelope, ErrorCode> = Ok(drain_to_envelope(&drain));
+        let count = messages.len() as u64;
+        let result: Result<IpcEnvelope, ErrorCode> = Ok(envelope_from(messages, lagged));
         audit_ipc(
             self,
             "astrid:ipc/host.subscription.recv",
@@ -503,74 +505,5 @@ impl HostSubscription for HostState {
             self.subscription_count = self.subscription_count.saturating_sub(1);
         }
         Ok(())
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    //! Regression tests for the multi-principal recv batching fix.
-    //!
-    //! Background (PR #752 review): a drained batch of subscription
-    //! messages must be truncated at the first publisher-principal
-    //! boundary, otherwise tail messages get stamped with the first
-    //! message's principal context and break attribution.
-    use super::truncate_to_homogeneous_principal;
-    use astrid_events::ipc::{IpcMessage as InternalIpcMessage, IpcPayload};
-    use serde_json::json;
-    use uuid::Uuid;
-
-    fn msg(principal: Option<&str>) -> InternalIpcMessage {
-        let mut m =
-            InternalIpcMessage::new("test.topic", IpcPayload::RawJson(json!({})), Uuid::nil());
-        m.principal = principal.map(String::from);
-        m
-    }
-
-    #[test]
-    fn empty_batch_is_noop() {
-        let mut batch: Vec<InternalIpcMessage> = vec![];
-        truncate_to_homogeneous_principal(&mut batch);
-        assert!(batch.is_empty());
-    }
-
-    #[test]
-    fn homogeneous_batch_is_preserved() {
-        let mut batch = vec![msg(Some("alice")), msg(Some("alice")), msg(Some("alice"))];
-        truncate_to_homogeneous_principal(&mut batch);
-        assert_eq!(batch.len(), 3);
-    }
-
-    #[test]
-    fn mixed_principal_truncates_at_first_boundary() {
-        let mut batch = vec![msg(Some("alice")), msg(Some("alice")), msg(Some("bob"))];
-        truncate_to_homogeneous_principal(&mut batch);
-        assert_eq!(batch.len(), 2);
-        assert_eq!(batch[0].principal.as_deref(), Some("alice"));
-        assert_eq!(batch[1].principal.as_deref(), Some("alice"));
-    }
-
-    #[test]
-    fn system_then_principal_truncates() {
-        let mut batch = vec![msg(None), msg(None), msg(Some("alice"))];
-        truncate_to_homogeneous_principal(&mut batch);
-        assert_eq!(batch.len(), 2);
-        assert!(batch[0].principal.is_none());
-        assert!(batch[1].principal.is_none());
-    }
-
-    #[test]
-    fn principal_then_system_truncates() {
-        let mut batch = vec![msg(Some("alice")), msg(None)];
-        truncate_to_homogeneous_principal(&mut batch);
-        assert_eq!(batch.len(), 1);
-        assert_eq!(batch[0].principal.as_deref(), Some("alice"));
-    }
-
-    #[test]
-    fn boundary_at_index_one_keeps_only_first() {
-        let mut batch = vec![msg(Some("alice")), msg(Some("bob")), msg(Some("alice"))];
-        truncate_to_homogeneous_principal(&mut batch);
-        assert_eq!(batch.len(), 1);
-        assert_eq!(batch[0].principal.as_deref(), Some("alice"));
     }
 }

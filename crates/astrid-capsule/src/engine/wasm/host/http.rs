@@ -161,12 +161,11 @@ fn build_headers(raw: &[KeyValuePair]) -> Result<HeaderMap, ErrorCode> {
     Ok(headers)
 }
 
-fn check_http_security(
+async fn check_http_security(
     security: &Option<Arc<dyn crate::security::CapsuleSecurityGate>>,
     capsule_id: String,
     url: &str,
     method: &str,
-    runtime_handle: &tokio::runtime::Handle,
     host_semaphore: &Arc<tokio::sync::Semaphore>,
 ) -> Result<(), ErrorCode> {
     if let Some(gate) = security {
@@ -176,9 +175,10 @@ fn check_http_security(
         let full_url = url.to_string();
         let m = method.to_string();
         let gate = gate.clone();
-        let check = util::bounded_block_on(runtime_handle, host_semaphore, async move {
+        let check = util::bounded_await(host_semaphore, async move {
             gate.check_http_request(&capsule_id, &m, &full_url).await
-        });
+        })
+        .await;
         if check.is_err() {
             return Err(ErrorCode::CapabilityDenied);
         }
@@ -206,10 +206,12 @@ const HTTP_STREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 const HTTP_STREAM_READ_TIMEOUT: Duration = Duration::from_secs(120);
 
 impl http::Host for HostState {
-    fn http_request(&mut self, request: HttpRequestData) -> Result<HttpResponseData, ErrorCode> {
+    async fn http_request(
+        &mut self,
+        request: HttpRequestData,
+    ) -> Result<HttpResponseData, ErrorCode> {
         let capsule_id = self.capsule_id.as_str().to_owned();
         let security = self.security.clone();
-        let runtime_handle = self.runtime_handle.clone();
         let host_semaphore = self.host_semaphore.clone();
 
         check_http_security(
@@ -217,9 +219,9 @@ impl http::Host for HostState {
             capsule_id,
             &request.url,
             method_name(&request.method),
-            &runtime_handle,
             &host_semaphore,
-        )?;
+        )
+        .await?;
 
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(30))
@@ -236,10 +238,10 @@ impl http::Host for HostState {
             request_builder = request_builder.body(body);
         }
 
-        let response = util::bounded_block_on(&runtime_handle, &host_semaphore, async move {
-            request_builder.send().await
-        })
-        .map_err(|e| map_reqwest_err(&e))?;
+        let response =
+            util::bounded_await(&host_semaphore, async move { request_builder.send().await })
+                .await
+                .map_err(|e| map_reqwest_err(&e))?;
 
         let status = response.status().as_u16();
 
@@ -253,7 +255,7 @@ impl http::Host for HostState {
             }
         }
 
-        let body = util::bounded_block_on(&runtime_handle, &host_semaphore, async move {
+        let body = util::bounded_await(&host_semaphore, async move {
             let mut response = response;
             let mut bytes = Vec::new();
             while let Some(chunk) = response.chunk().await.map_err(|e| map_reqwest_err(&e))? {
@@ -263,7 +265,8 @@ impl http::Host for HostState {
                 bytes.extend_from_slice(&chunk);
             }
             Ok(bytes)
-        })?;
+        })
+        .await?;
 
         Ok(HttpResponseData {
             status,
@@ -272,7 +275,7 @@ impl http::Host for HostState {
         })
     }
 
-    fn http_stream_start(
+    async fn http_stream_start(
         &mut self,
         request: HttpRequestData,
     ) -> Result<Resource<HttpStream>, ErrorCode> {
@@ -290,7 +293,6 @@ impl http::Host for HostState {
 
         let capsule_id = self.capsule_id.as_str().to_owned();
         let security = self.security.clone();
-        let runtime_handle = self.runtime_handle.clone();
         let host_semaphore = self.host_semaphore.clone();
 
         check_http_security(
@@ -298,9 +300,9 @@ impl http::Host for HostState {
             capsule_id,
             &request.url,
             method_name(&request.method),
-            &runtime_handle,
             &host_semaphore,
-        )?;
+        )
+        .await?;
 
         let client = reqwest::Client::builder()
             .connect_timeout(HTTP_STREAM_CONNECT_TIMEOUT)
@@ -316,10 +318,10 @@ impl http::Host for HostState {
             request_builder = request_builder.body(body);
         }
 
-        let response = util::bounded_block_on(&runtime_handle, &host_semaphore, async move {
-            request_builder.send().await
-        })
-        .map_err(|e| map_reqwest_err(&e))?;
+        let response =
+            util::bounded_await(&host_semaphore, async move { request_builder.send().await })
+                .await
+                .map_err(|e| map_reqwest_err(&e))?;
 
         let status = response.status().as_u16();
 
@@ -373,21 +375,21 @@ impl HostHttpStream for HostState {
             .unwrap_or_default()
     }
 
-    fn read_chunk(&mut self, self_: Resource<HttpStream>) -> Result<Vec<u8>, ErrorCode> {
+    async fn read_chunk(&mut self, self_: Resource<HttpStream>) -> Result<Vec<u8>, ErrorCode> {
         let rep = self_.rep();
         let stream = self
             .resource_table
             .get::<ActiveHttpStream>(&Resource::new_borrow(rep))
             .map_err(|_| ErrorCode::Closed)?;
         let response_arc = stream.response.clone();
-        let rt = self.runtime_handle.clone();
         let cancel = self.cancel_token.clone();
         let sem = self.host_semaphore.clone();
         let started = std::time::Instant::now();
-        let result = util::bounded_block_on_cancellable(&rt, &sem, &cancel, async {
+        let result = util::bounded_await_cancellable(&sem, &cancel, async {
             let mut resp = response_arc.lock().await;
             tokio::time::timeout(HTTP_STREAM_READ_TIMEOUT, resp.chunk()).await
-        });
+        })
+        .await;
         let bytes_result: Result<Vec<u8>, ErrorCode> = match result {
             None => Ok(Vec::new()), // cancelled
             Some(Err(_)) => Err(ErrorCode::Timeout),

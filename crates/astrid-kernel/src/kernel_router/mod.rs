@@ -41,6 +41,11 @@ pub(crate) fn spawn_kernel_router(kernel: Arc<crate::Kernel>) -> tokio::task::Jo
     // Spawn the Layer 6 admin dispatcher as a sibling task (issue #672).
     drop(admin::spawn_admin_router(Arc::clone(&kernel)));
 
+    // Broadcast-path subscriber. Routed demux
+    // (`EventBus::subscribe_topic_routed`) is reserved for guest
+    // subscriptions where per-principal isolation matters; kernel-
+    // internal consumers see every event by design (no synthetic
+    // capsule_uuid).
     let mut receiver = kernel
         .event_bus
         .subscribe_topic_as("astrid.v1.request.*", "kernel_router");
@@ -138,6 +143,8 @@ fn connection_signal(topic: &str, payload: &IpcPayload) -> Option<ConnectionSign
 /// Listens on `client.v1.*` topics and adjusts the per-principal connection
 /// count via [`connection_signal`] (typed payload or topic).
 fn spawn_connection_tracker(kernel: Arc<crate::Kernel>) -> tokio::task::JoinHandle<()> {
+    // Broadcast-path subscriber. See `spawn_kernel_router` for the
+    // rationale on staying on the untargeted subscribe path.
     let mut receiver = kernel
         .event_bus
         .subscribe_topic_as("client.v1.*", "connection_tracker");

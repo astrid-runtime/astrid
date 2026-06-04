@@ -417,7 +417,11 @@ impl Kernel {
         .with_allowance_store(Arc::clone(&self.allowance_store))
         .with_identity_store(Arc::clone(&self.identity_store))
         .with_profile_cache(Arc::clone(&self.profile_cache))
-        .with_overlay_registry(Arc::clone(&self.overlay_registry));
+        .with_overlay_registry(Arc::clone(&self.overlay_registry))
+        // Snapshot the live group config so the capsule load path can resolve
+        // the run-loop resource-exemption capability (CAP_RESOURCES_UNBOUNDED)
+        // against the owner principal's groups/grants/revokes.
+        .with_group_config(self.groups.load_full());
 
         capsule.load(&ctx).await?;
 
@@ -498,7 +502,9 @@ impl Kernel {
             registry.get(id)
         };
         if let Some(capsule) = capsule
-            && let Err(e) = capsule.invoke_interceptor("handle_lifecycle_restart", &[], None)
+            && let Err(e) = capsule
+                .invoke_interceptor("handle_lifecycle_restart", &[], None)
+                .await
         {
             tracing::debug!(
                 capsule_id = %id,

@@ -29,20 +29,153 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::time::Duration;
 
 use tokio::sync::{RwLock, mpsc};
 use tracing::{debug, warn};
 
 use crate::capsule::{Capsule, CapsuleId};
 use crate::registry::CapsuleRegistry;
+use astrid_events::PrincipalKey;
 use astrid_events::{AstridEvent, EventBus, EventReceiver};
 
-/// Capacity of each per-capsule event dispatch queue.
+/// Capacity of each per-(capsule, principal) event dispatch queue.
 ///
-/// If a capsule's queue fills up (i.e. it is processing events slower than
-/// they arrive), new events are dropped with a warning rather than blocking
-/// the dispatcher. 256 is generous for typical usage.
-const CAPSULE_EVENT_QUEUE_CAPACITY: usize = 256;
+/// Per-principal partitioning means the working set per queue is much
+/// smaller than the legacy per-class queue. A queue full event is dropped
+/// with a warning rather than blocking the dispatcher; 64 is generous for
+/// per-principal traffic and tightens the worst-case envelope footprint
+/// (10k principals × 16 capsules × 64 slots stays under the half-gig
+/// ceiling called out in the design's risk register).
+const CAPSULE_EVENT_QUEUE_CAPACITY: usize = 64;
+
+/// Maximum number of per-(capsule, principal) dispatcher queues to
+/// hold simultaneously **per capsule**. Beyond this cap, new principals
+/// for that capsule fall back to a single shared `PrincipalKey::None`
+/// queue (with an audit-logged degrade) so the queue map can never grow
+/// unboundedly even under a pathological N-principal storm.
+const MAX_DISPATCHER_QUEUES_PER_CAPSULE: usize = 10_000;
+
+/// Default idle grace before a per-(capsule, principal) consumer task exits.
+///
+/// Each consumer awaits `recv()` under this timeout; on timeout the task
+/// cleans up its sender from the queue map and exits. The next event for
+/// that principal re-spawns the consumer through `or_insert_with`. This
+/// mirrors the demand-allocation invariant on the bus's `RouteEntry`
+/// fanout and bounds steady-state dispatcher memory at the working set.
+const DEFAULT_IDLE_CONSUMER_GRACE_MS: u64 = 60_000;
+
+/// Live override of [`DEFAULT_IDLE_CONSUMER_GRACE_MS`] in milliseconds.
+/// Tests collapse the grace to a sub-second value to exercise the
+/// idle-eviction path without sleeping in real time. Production uses the
+/// 60-second default; the override is `cfg(test)`-only mutated through
+/// [`set_idle_consumer_grace_for_test`].
+static IDLE_CONSUMER_GRACE_MS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(DEFAULT_IDLE_CONSUMER_GRACE_MS);
+
+/// Current idle-eviction grace, honouring any test override.
+fn idle_consumer_grace() -> Duration {
+    Duration::from_millis(IDLE_CONSUMER_GRACE_MS.load(std::sync::atomic::Ordering::Relaxed))
+}
+
+/// Test hook: collapse the idle-eviction grace to a short interval so
+/// the eviction path can be exercised in unit tests without sleeping
+/// for a full minute. Public-in-crate; not exposed to consumers.
+#[cfg(test)]
+pub(crate) fn set_idle_consumer_grace_for_test(ms: u64) {
+    IDLE_CONSUMER_GRACE_MS.store(ms, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Shared map of per-(capsule, principal) chain mutexes. One
+/// `Arc<tokio::sync::Mutex<()>>` per `(CapsuleId, PrincipalKey)` so
+/// chain dispatches for the same key serialize FIFO while distinct
+/// keys (including distinct principals within the same class) run
+/// concurrently. Held across the chain task's lifetime in
+/// `dispatch_to_capsule_queues`.
+type ChainLocks =
+    Arc<parking_lot::RwLock<HashMap<(CapsuleId, PrincipalKey), Arc<tokio::sync::Mutex<()>>>>>;
+
+/// RAII chain-lock lease that prunes its `ChainLocks` map entry on drop
+/// when it was the last referrer.
+///
+/// Without this, the map gains an entry per `(capsule, principal)` on first
+/// use and never sheds it — ephemeral recursive sub-agents (high principal
+/// churn) would grow it unboundedly, unlike `capsule_queues` which idle-evicts
+/// (Gemini #828). The acquire path stays race-safe: a concurrent acquirer that
+/// raced the removal simply re-inserts via `or_insert_with`, so a pruned-then-
+/// reused key costs one extra allocation, never a correctness loss.
+struct ChainLockGuard {
+    /// The held mutex guard. Dropped FIRST in [`Drop`] so the mutex is free
+    /// before we inspect the Arc's strong count.
+    ///
+    /// `Option` so `drop` can take it and release the lock explicitly before
+    /// taking the map's write lock.
+    guard: Option<tokio::sync::OwnedMutexGuard<()>>,
+    /// Our own clone of the per-key mutex `Arc`. With `guard` dropped, this is
+    /// the only referrer outside the map, so `strong_count == 2` (map + this)
+    /// proves no other chain task holds the lock and the entry can be pruned.
+    mutex: Arc<tokio::sync::Mutex<()>>,
+    chain_locks: ChainLocks,
+    key: (CapsuleId, PrincipalKey),
+}
+
+impl Drop for ChainLockGuard {
+    fn drop(&mut self) {
+        // Release the lock first so the strong-count check below sees only
+        // map + `self.mutex` referrers (the `OwnedMutexGuard` holds its own
+        // internal `Arc` clone, which must be gone before we count).
+        self.guard.take();
+        let mut write = self.chain_locks.write();
+        // Re-fetch under the write lock: a concurrent acquirer may have
+        // replaced the entry after a previous prune, so only remove the
+        // exact Arc we hold, and only when we are its last non-map referrer.
+        if let Some(entry) = write.get(&self.key)
+            && Arc::ptr_eq(entry, &self.mutex)
+            && Arc::strong_count(entry) == 2
+        {
+            write.remove(&self.key);
+        }
+    }
+}
+
+/// Acquire the per-(capsule, principal) chain lock, returning a guard that
+/// prunes the map entry on drop. Read-fast / write-on-miss: the common case
+/// is a hit on an existing lock.
+async fn acquire_chain_lock(
+    chain_locks: &ChainLocks,
+    key: (CapsuleId, PrincipalKey),
+) -> ChainLockGuard {
+    let mutex = {
+        let read = chain_locks.read();
+        if let Some(m) = read.get(&key) {
+            Arc::clone(m)
+        } else {
+            drop(read);
+            let mut write = chain_locks.write();
+            Arc::clone(
+                write
+                    .entry(key.clone())
+                    .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))),
+            )
+        }
+    };
+    let guard = Arc::clone(&mutex).lock_owned().await;
+    ChainLockGuard {
+        guard: Some(guard),
+        mutex,
+        chain_locks: Arc::clone(chain_locks),
+        key,
+    }
+}
+
+/// Shared map of per-(capsule, principal) dispatcher mpsc senders.
+/// Wrapped in `parking_lot::Mutex` so the consumer task can remove its
+/// own entry under the same lock that admits new principals — this
+/// closes the race where an idle-evicting consumer exits between the
+/// dispatcher's `entry().or_insert_with(...)` and the subsequent
+/// `try_send`.
+type CapsuleQueues =
+    Arc<parking_lot::Mutex<HashMap<(CapsuleId, PrincipalKey), mpsc::Sender<InterceptorWork>>>>;
 
 /// Work item sent to a per-capsule ordered queue.
 struct InterceptorWork {
@@ -71,6 +204,13 @@ pub struct EventDispatcher {
     /// home directories created. When `None`, provisioning is ungated
     /// (pre-production behavior).
     identity_store: Option<Arc<dyn astrid_storage::IdentityStore>>,
+    /// Per-(capsule, principal) chain serialization mutexes.
+    /// Chains for the same `(CapsuleId, PrincipalKey)` are mutually
+    /// exclusive (FIFO via `tokio::sync::Mutex`) but distinct
+    /// principals — even within the same class — run concurrently.
+    /// Closes the cross-principal SET/CALL race at the dispatcher
+    /// layer in addition to the bus-side routing demux (#813).
+    chain_locks: ChainLocks,
 }
 
 impl EventDispatcher {
@@ -86,6 +226,7 @@ impl EventDispatcher {
             event_bus,
             receiver,
             identity_store: None,
+            chain_locks: Arc::new(parking_lot::RwLock::new(HashMap::new())),
         }
     }
 
@@ -109,7 +250,11 @@ impl EventDispatcher {
         let mut last_lag_notification = std::time::Instant::now()
             .checked_sub(std::time::Duration::from_secs(10))
             .unwrap_or_else(std::time::Instant::now);
-        let mut capsule_queues: HashMap<CapsuleId, mpsc::Sender<InterceptorWork>> = HashMap::new();
+        // Per-(capsule, principal) ordered queue. Per-principal keying
+        // means the dispatcher's worst case at N distinct principals
+        // is N independent FIFO consumers, not a single class-keyed
+        // queue collapsing the load (#813 Layer 3).
+        let capsule_queues: CapsuleQueues = Arc::new(parking_lot::Mutex::new(HashMap::new()));
         let mut known_principals: HashSet<String> = HashSet::new();
         // The "default" principal is always provisioned by the kernel boot sequence.
         known_principals.insert("default".to_string());
@@ -222,7 +367,8 @@ impl EventDispatcher {
 
             let matches = find_matching_interceptors(&self.registry, &topic).await;
             dispatch_to_capsule_queues(
-                &mut capsule_queues,
+                &capsule_queues,
+                &self.chain_locks,
                 matches,
                 topic,
                 payload_bytes,
@@ -237,16 +383,19 @@ impl EventDispatcher {
 /// Dispatch matching interceptors as a middleware chain.
 ///
 /// Interceptors are called sequentially in priority order (lower fires first).
-/// Each interceptor returns an [`InterceptResult`] that controls the chain:
+/// Each interceptor returns an [`crate::capsule::InterceptResult`] that
+/// controls the chain:
 /// - `Continue` — pass (possibly modified) payload to the next interceptor
 /// - `Final` — short-circuit with a response, no further interceptors fire
 /// - `Deny` — short-circuit with denial, audit-logged, no further interceptors fire
 ///
 /// Within a single capsule, events are still delivered in publish order via
-/// per-capsule mpsc queues (preserving IPC `seq` ordering). The chain semantics
-/// apply across capsules for the same event.
+/// per-(capsule, principal) mpsc queues (preserving IPC `seq` ordering and
+/// isolating principals from one another). The chain semantics apply across
+/// capsules for the same event.
 fn dispatch_to_capsule_queues(
-    queues: &mut HashMap<CapsuleId, mpsc::Sender<InterceptorWork>>,
+    queues: &CapsuleQueues,
+    chain_locks: &ChainLocks,
     matches: Vec<(Arc<dyn Capsule>, String)>,
     topic: Arc<String>,
     payload_bytes: Arc<Vec<u8>>,
@@ -262,10 +411,20 @@ fn dispatch_to_capsule_queues(
         .map(|(c, a)| (Arc::clone(&c), a))
         .collect();
 
+    let principal_key: PrincipalKey = ipc_message.as_deref().and_then(|m| m.principal.clone());
+
     // For single-interceptor events (common case), skip chain overhead.
     if matches_owned.len() == 1 {
         let (capsule, action) = matches_owned.into_iter().next().unwrap();
-        dispatch_single(queues, capsule, action, topic, payload_bytes, ipc_message);
+        dispatch_single(
+            queues,
+            capsule,
+            action,
+            topic,
+            payload_bytes,
+            ipc_message,
+            principal_key,
+        );
         return;
     }
 
@@ -273,6 +432,7 @@ fn dispatch_to_capsule_queues(
     // Spawned as a task so the dispatcher loop doesn't block.
     let topic_clone = Arc::clone(&topic);
     let ipc_clone = ipc_message.clone();
+    let chain_locks_clone = Arc::clone(chain_locks);
     tokio::task::spawn(async move {
         let mut current_payload = (*payload_bytes).clone();
 
@@ -283,8 +443,24 @@ fn dispatch_to_capsule_queues(
                 topic = %topic_clone,
                 "Dispatching interceptor (chain)"
             );
+
+            // Per-(capsule, principal) chain serialization. Two
+            // events with the same principal targeting this capsule
+            // execute one-at-a-time (FIFO via tokio::Mutex) so the
+            // SET/CALL/CLEAR window in wasm/mod.rs can never race a
+            // sibling chain. Distinct principals on the same capsule
+            // run concurrently — the orchestration cliff fix is
+            // per-principal, not per-class (#813 Layer 3). The guard
+            // prunes its map entry on drop so the lock map stays bounded
+            // under high principal churn (#828).
+            let chain_key = (capsule.id().clone(), principal_key.clone());
+            let _chain_guard = acquire_chain_lock(&chain_locks_clone, chain_key).await;
+
             let caller = ipc_clone.as_deref();
-            match capsule.invoke_interceptor(action, &current_payload, caller) {
+            match capsule
+                .invoke_interceptor(action, &current_payload, caller)
+                .await
+            {
                 Ok(crate::capsule::InterceptResult::Continue(modified_payload)) => {
                     debug!(
                         capsule_id = %capsule.id(),
@@ -342,29 +518,93 @@ fn dispatch_to_capsule_queues(
     });
 }
 
-/// Fast path for single-interceptor dispatch — uses per-capsule queue
-/// for ordered delivery without chain overhead.
-fn dispatch_single(
-    queues: &mut HashMap<CapsuleId, mpsc::Sender<InterceptorWork>>,
+/// Count how many entries in `queues` have the given `capsule_id` —
+/// used to enforce `MAX_DISPATCHER_QUEUES_PER_CAPSULE`. Linear in the
+/// number of dispatcher queues, called only on the cold-miss path.
+fn queues_per_capsule(
+    queues: &HashMap<(CapsuleId, PrincipalKey), mpsc::Sender<InterceptorWork>>,
+    capsule_id: &CapsuleId,
+) -> usize {
+    queues.keys().filter(|(cid, _)| cid == capsule_id).count()
+}
+
+/// Get or spawn the per-(capsule, principal) consumer task and return
+/// its sender. On the cold-miss path this spawns a new consumer that
+/// will idle-evict itself after [`IDLE_CONSUMER_GRACE`] of inactivity.
+/// Enforces [`MAX_DISPATCHER_QUEUES_PER_CAPSULE`] by falling back to a
+/// single shared `PrincipalKey::None` queue when the cap is exceeded
+/// (audit-logged degrade).
+fn get_or_spawn_consumer(
+    queues: &CapsuleQueues,
+    capsule: &Arc<dyn Capsule>,
+    key: (CapsuleId, PrincipalKey),
+) -> mpsc::Sender<InterceptorWork> {
+    let mut guard = queues.lock();
+    if let Some(s) = guard.get(&key) {
+        return s.clone();
+    }
+
+    // Cap enforcement — if exceeded, degrade this insert to the
+    // shared `(capsule, None)` slot so the queue map can't grow
+    // unboundedly under a pathological principal-fanout. The
+    // shared slot itself counts toward the cap but is allowed to
+    // exist once per capsule.
+    let mut effective_key = key.clone();
+    if effective_key.1.is_some()
+        && queues_per_capsule(&guard, &effective_key.0) >= MAX_DISPATCHER_QUEUES_PER_CAPSULE
+    {
+        tracing::error!(
+            target: "astrid.audit.ipc",
+            security_event = true,
+            capsule = %effective_key.0,
+            principal_key_count = MAX_DISPATCHER_QUEUES_PER_CAPSULE,
+            "dispatcher: per-principal queue cap exceeded; degrading to shared queue"
+        );
+        effective_key.1 = None;
+        if let Some(s) = guard.get(&effective_key) {
+            return s.clone();
+        }
+    }
+
+    let (tx, rx) = mpsc::channel::<InterceptorWork>(CAPSULE_EVENT_QUEUE_CAPACITY);
+    guard.insert(effective_key.clone(), tx.clone());
+    drop(guard);
+
+    let capsule_arc = Arc::clone(capsule);
+    let queues_arc = Arc::clone(queues);
+    let cleanup_key = effective_key.clone();
+    tokio::task::spawn(async move {
+        run_consumer(rx, capsule_arc, queues_arc, cleanup_key).await;
+    });
+    tx
+}
+
+/// Consumer loop for one `(capsule, principal_key)` queue. Idle-evicts
+/// itself after [`IDLE_CONSUMER_GRACE`] of inactivity, atomically
+/// removing its sender from the queue map under the same lock that
+/// `get_or_spawn_consumer` takes — closes the race where an event
+/// arrives between timeout and unmap.
+async fn run_consumer(
+    mut rx: mpsc::Receiver<InterceptorWork>,
     capsule: Arc<dyn Capsule>,
-    action: String,
-    topic: Arc<String>,
-    payload_bytes: Arc<Vec<u8>>,
-    ipc_message: Option<Arc<astrid_events::ipc::IpcMessage>>,
+    queues: CapsuleQueues,
+    key: (CapsuleId, PrincipalKey),
 ) {
-    let sender = queues.entry(capsule.id().clone()).or_insert_with(|| {
-        let (tx, mut rx) = mpsc::channel::<InterceptorWork>(CAPSULE_EVENT_QUEUE_CAPACITY);
-        let capsule = Arc::clone(&capsule);
-        tokio::task::spawn(async move {
-            while let Some(work) = rx.recv().await {
+    loop {
+        match tokio::time::timeout(idle_consumer_grace(), rx.recv()).await {
+            Ok(Some(work)) => {
                 debug!(
                     capsule_id = %capsule.id(),
                     action = %work.action,
                     topic = %work.topic,
                     "Dispatching interceptor (ordered)"
                 );
+
                 let caller = work.ipc_message.as_deref();
-                match capsule.invoke_interceptor(&work.action, &work.payload, caller) {
+                match capsule
+                    .invoke_interceptor(&work.action, &work.payload, caller)
+                    .await
+                {
                     Ok(crate::capsule::InterceptResult::Continue(_)) => {
                         debug!(
                             capsule_id = %capsule.id(),
@@ -406,10 +646,72 @@ fn dispatch_single(
                         );
                     },
                 }
-            }
-        });
-        tx
-    });
+            },
+            Ok(None) => {
+                // Sender side hung up (capsule unloaded). Drain
+                // anything queued and exit. Don't bother cleaning
+                // the map entry — the sender is already gone.
+                debug!(
+                    capsule_id = %capsule.id(),
+                    "Per-principal consumer exiting: sender dropped"
+                );
+                return;
+            },
+            Err(_elapsed) => {
+                // Idle-evict — but only when it is provably safe to drop
+                // `rx`, i.e. no queued item AND no other live `Sender`.
+                //
+                // Holding the `queues` lock across the check stops a NEW
+                // `get_or_spawn_consumer` from cloning our sender, but it
+                // does NOT stop a `dispatch_single` that already cloned the
+                // sender (under an earlier lock acquisition) from calling
+                // `try_send` after we remove the entry and drop `rx`: that
+                // send would fail and the event would be lost silently
+                // (TOCTOU). `sender_strong_count` closes it — the map holds
+                // exactly one `Sender` for this key, so a count of 1 means
+                // the map's copy is the ONLY sender and no in-flight
+                // dispatch can still send. Any in-flight clone bumps the
+                // count to ≥2 and we keep running, so the racing `try_send`
+                // lands in `rx` and is drained next iteration. The clone's
+                // count drops back when that dispatch finishes, so a stale
+                // sender can delay eviction by at most one grace window —
+                // bounded, and it always errs toward NOT dropping events.
+                let mut guard = queues.lock();
+                if rx.try_recv().is_err() && rx.sender_strong_count() == 1 {
+                    guard.remove(&key);
+                    drop(guard);
+                    debug!(
+                        capsule_id = %capsule.id(),
+                        "Per-principal consumer idle-evicted after grace"
+                    );
+                    return;
+                }
+                // Either a racing dispatch landed between the timeout and
+                // the map-lock acquisition, or an in-flight dispatch still
+                // holds a sender clone that may `try_send` — keep running.
+                // The map entry stays valid.
+                drop(guard);
+            },
+        }
+    }
+}
+
+/// Fast path for single-interceptor dispatch — uses per-(capsule,
+/// principal) queue for ordered delivery without chain overhead.
+/// Keying on the full `PrincipalKey` (Option<String>) means alice's
+/// events don't head-of-line block bob's on the same capsule, even
+/// when both fall in the same `PrincipalClass` (#813 Layer 3).
+fn dispatch_single(
+    queues: &CapsuleQueues,
+    capsule: Arc<dyn Capsule>,
+    action: String,
+    topic: Arc<String>,
+    payload_bytes: Arc<Vec<u8>>,
+    ipc_message: Option<Arc<astrid_events::ipc::IpcMessage>>,
+    principal_key: PrincipalKey,
+) {
+    let key = (capsule.id().clone(), principal_key);
+    let sender = get_or_spawn_consumer(queues, &capsule, key);
 
     let work = InterceptorWork {
         action,
@@ -466,477 +768,5 @@ async fn find_matching_interceptors(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    // ── Dispatch integration tests ──────────────────────────────────
-
-    use async_trait::async_trait;
-    use std::sync::Mutex;
-    use std::sync::atomic::{AtomicBool, Ordering};
-    use std::time::Duration;
-
-    use crate::capsule::{Capsule, CapsuleId, CapsuleState, InterceptResult};
-    use crate::context::CapsuleContext;
-    use crate::error::CapsuleResult;
-    use crate::manifest::{CapabilitiesDef, CapsuleManifest, InterceptorDef, PackageDef};
-    use astrid_events::ipc::IpcPayload;
-
-    /// A minimal mock capsule for dispatch tests.
-    struct MockCapsule {
-        id: CapsuleId,
-        manifest: CapsuleManifest,
-        invoked: Arc<AtomicBool>,
-        /// Optional shared log for recording invocation order across capsules.
-        invocation_log: Option<Arc<Mutex<Vec<String>>>>,
-        /// Override the default `Continue` result for testing chain semantics.
-        result_override: Option<InterceptResult>,
-    }
-
-    impl MockCapsule {
-        fn new(name: &str, interceptor_event: &str) -> (Self, Arc<AtomicBool>) {
-            Self::with_priority(name, interceptor_event, 100, None)
-        }
-
-        fn with_priority(
-            name: &str,
-            interceptor_event: &str,
-            priority: u32,
-            invocation_log: Option<Arc<Mutex<Vec<String>>>>,
-        ) -> (Self, Arc<AtomicBool>) {
-            let invoked = Arc::new(AtomicBool::new(false));
-            let manifest = CapsuleManifest {
-                package: PackageDef {
-                    name: name.to_string(),
-                    version: "0.0.1".to_string(),
-                    description: None,
-                    authors: Vec::new(),
-                    repository: None,
-                    homepage: None,
-                    documentation: None,
-                    license: None,
-                    license_file: None,
-                    readme: None,
-                    keywords: Vec::new(),
-                    categories: Vec::new(),
-                    astrid_version: None,
-                    publish: None,
-                    include: None,
-                    exclude: None,
-                    metadata: None,
-                },
-                components: Vec::new(),
-                imports: std::collections::HashMap::new(),
-                exports: std::collections::HashMap::new(),
-                capabilities: CapabilitiesDef::default(),
-                env: std::collections::HashMap::new(),
-                context_files: Vec::new(),
-                commands: Vec::new(),
-                mcp_servers: Vec::new(),
-                skills: Vec::new(),
-                uplinks: Vec::new(),
-                interceptors: vec![InterceptorDef {
-                    event: interceptor_event.to_string(),
-                    action: "test_action".to_string(),
-                    priority,
-                }],
-                topics: Vec::new(),
-                publishes: ::std::collections::HashMap::new(),
-                subscribes: ::std::collections::HashMap::new(),
-                tools: ::std::vec::Vec::new(),
-            };
-            let capsule = Self {
-                id: CapsuleId::from_static(name),
-                manifest,
-                invoked: Arc::clone(&invoked),
-                invocation_log,
-                result_override: None,
-            };
-            (capsule, invoked)
-        }
-    }
-
-    #[async_trait]
-    impl Capsule for MockCapsule {
-        fn id(&self) -> &CapsuleId {
-            &self.id
-        }
-        fn manifest(&self) -> &CapsuleManifest {
-            &self.manifest
-        }
-        fn state(&self) -> CapsuleState {
-            CapsuleState::Ready
-        }
-        async fn load(&mut self, _ctx: &CapsuleContext) -> CapsuleResult<()> {
-            Ok(())
-        }
-        async fn unload(&mut self) -> CapsuleResult<()> {
-            Ok(())
-        }
-        fn invoke_interceptor(
-            &self,
-            _action: &str,
-            _payload: &[u8],
-            _caller: Option<&astrid_events::ipc::IpcMessage>,
-        ) -> CapsuleResult<InterceptResult> {
-            self.invoked.store(true, Ordering::SeqCst);
-            if let Some(ref log) = self.invocation_log {
-                log.lock().unwrap().push(self.id.to_string());
-            }
-            if let Some(ref result) = self.result_override {
-                return Ok(result.clone());
-            }
-            Ok(InterceptResult::Continue(Vec::new()))
-        }
-    }
-
-    /// Helper: publish an IPC event on the bus.
-    fn publish_ipc(bus: &EventBus, topic: &str) {
-        let msg = astrid_events::ipc::IpcMessage::new(
-            topic,
-            IpcPayload::Custom {
-                data: serde_json::json!({}),
-            },
-            uuid::Uuid::nil(),
-        );
-        bus.publish(AstridEvent::Ipc {
-            metadata: astrid_events::EventMetadata::new("test"),
-            message: msg,
-        });
-    }
-
-    #[tokio::test]
-    async fn dispatch_routes_to_matching_interceptor() {
-        let (capsule, invoked) = MockCapsule::new("test-capsule", "test.topic");
-
-        let mut registry = CapsuleRegistry::new();
-        registry.register(Box::new(capsule)).unwrap();
-        let registry = Arc::new(RwLock::new(registry));
-
-        let bus = Arc::new(EventBus::with_capacity(64));
-        let dispatcher = EventDispatcher::new(Arc::clone(&registry), Arc::clone(&bus));
-        let handle = tokio::spawn(dispatcher.run());
-
-        // Yield to let the dispatcher subscribe before publishing.
-        tokio::task::yield_now().await;
-
-        publish_ipc(&bus, "test.topic");
-
-        // Give the dispatcher time to process.
-        tokio::time::sleep(Duration::from_millis(200)).await;
-
-        assert!(
-            invoked.load(Ordering::SeqCst),
-            "interceptor should have been invoked for matching topic"
-        );
-
-        handle.abort();
-    }
-
-    #[tokio::test]
-    async fn dispatch_skips_non_matching_topic() {
-        let (capsule, invoked) = MockCapsule::new("test-capsule-skip", "specific.topic");
-
-        let mut registry = CapsuleRegistry::new();
-        registry.register(Box::new(capsule)).unwrap();
-        let registry = Arc::new(RwLock::new(registry));
-
-        let bus = Arc::new(EventBus::with_capacity(64));
-        let dispatcher = EventDispatcher::new(Arc::clone(&registry), Arc::clone(&bus));
-        let handle = tokio::spawn(dispatcher.run());
-
-        tokio::task::yield_now().await;
-
-        publish_ipc(&bus, "other.topic");
-
-        tokio::time::sleep(Duration::from_millis(200)).await;
-
-        assert!(
-            !invoked.load(Ordering::SeqCst),
-            "interceptor should NOT have been invoked for non-matching topic"
-        );
-
-        handle.abort();
-    }
-
-    #[tokio::test]
-    async fn dispatch_concurrent_does_not_block() {
-        // Both capsules match different topics. With concurrent dispatch,
-        // the second event is processed immediately without waiting for
-        // the first interceptor to complete.
-        let (cap_a, invoked_a) = MockCapsule::new("capsule-a", "topic.a");
-        let (cap_b, invoked_b) = MockCapsule::new("capsule-b", "topic.b");
-
-        let mut registry = CapsuleRegistry::new();
-        registry.register(Box::new(cap_a)).unwrap();
-        registry.register(Box::new(cap_b)).unwrap();
-        let registry = Arc::new(RwLock::new(registry));
-
-        let bus = Arc::new(EventBus::with_capacity(64));
-        let dispatcher = EventDispatcher::new(Arc::clone(&registry), Arc::clone(&bus));
-        let handle = tokio::spawn(dispatcher.run());
-
-        tokio::task::yield_now().await;
-
-        publish_ipc(&bus, "topic.a");
-        publish_ipc(&bus, "topic.b");
-
-        tokio::time::sleep(Duration::from_millis(200)).await;
-
-        assert!(
-            invoked_a.load(Ordering::SeqCst),
-            "capsule-a interceptor should have been invoked"
-        );
-        assert!(
-            invoked_b.load(Ordering::SeqCst),
-            "capsule-b interceptor should have been invoked"
-        );
-
-        handle.abort();
-    }
-
-    #[tokio::test]
-    async fn dispatch_routes_lifecycle_events() {
-        // Lifecycle events are dispatched by event_type() as the topic.
-        let (capsule, invoked) =
-            MockCapsule::new("lifecycle-capsule", "astrid.v1.lifecycle.tool_call_started");
-
-        let mut registry = CapsuleRegistry::new();
-        registry.register(Box::new(capsule)).unwrap();
-        let registry = Arc::new(RwLock::new(registry));
-
-        let bus = Arc::new(EventBus::with_capacity(64));
-        let dispatcher = EventDispatcher::new(Arc::clone(&registry), Arc::clone(&bus));
-        let handle = tokio::spawn(dispatcher.run());
-
-        tokio::task::yield_now().await;
-
-        // Publish a lifecycle event
-        bus.publish(AstridEvent::ToolCallStarted {
-            metadata: astrid_events::EventMetadata::new("test"),
-            call_id: uuid::Uuid::nil(),
-            tool_name: "search".into(),
-            server_name: None,
-        });
-
-        tokio::time::sleep(Duration::from_millis(200)).await;
-
-        assert!(
-            invoked.load(Ordering::SeqCst),
-            "EventDispatcher should dispatch lifecycle events by event_type()"
-        );
-
-        handle.abort();
-    }
-
-    #[tokio::test]
-    async fn dispatch_publishes_lag_event_on_overflow() {
-        // Use a tiny bus capacity so publishing more events than capacity triggers lag.
-        let bus = Arc::new(EventBus::with_capacity(2));
-
-        // A capsule that listens for lag events.
-        let (lag_capsule, _lag_invoked) =
-            MockCapsule::new("lag-listener", "astrid.v1.event_bus.lagged");
-
-        let mut registry = CapsuleRegistry::new();
-        registry.register(Box::new(lag_capsule)).unwrap();
-        let registry = Arc::new(RwLock::new(registry));
-
-        let dispatcher = EventDispatcher::new(Arc::clone(&registry), Arc::clone(&bus));
-        let handle = tokio::spawn(dispatcher.run());
-
-        tokio::task::yield_now().await;
-
-        // Flood the bus to trigger lag (the dispatcher's receiver has capacity 2,
-        // so publishing many events quickly should cause overflow).
-        for i in 0..20 {
-            publish_ipc(&bus, &format!("flood.event.{i}"));
-        }
-
-        tokio::time::sleep(Duration::from_millis(500)).await;
-
-        // If lag was detected, the dispatcher should have published
-        // astrid.v1.event_bus.lagged which routes to our lag-listener capsule.
-        // Note: this test may not trigger lag on fast machines where the
-        // dispatcher drains fast enough. That's acceptable - the test
-        // validates the wiring, not the race condition.
-        // We just verify no panics occurred and the dispatcher is still running.
-        assert!(!handle.is_finished(), "dispatcher should still be running");
-        handle.abort();
-    }
-
-    #[test]
-    fn mock_capsule_check_health_returns_ready() {
-        let (capsule, _) = MockCapsule::new("health-test", "test.topic");
-        assert_eq!(capsule.check_health(), CapsuleState::Ready);
-    }
-
-    #[tokio::test]
-    async fn dispatch_respects_interceptor_priority_order() {
-        // Three capsules intercept the same topic with different priorities.
-        // Priority 10 (guard) should fire before 50 (transform) before 100 (handler).
-        let order = Arc::new(Mutex::new(Vec::<String>::new()));
-
-        let (guard, _) =
-            MockCapsule::with_priority("guard", "shared.topic", 10, Some(Arc::clone(&order)));
-        let (handler, _) =
-            MockCapsule::with_priority("handler", "shared.topic", 100, Some(Arc::clone(&order)));
-        let (transform, _) =
-            MockCapsule::with_priority("transform", "shared.topic", 50, Some(Arc::clone(&order)));
-
-        let mut registry = CapsuleRegistry::new();
-        // Register in non-priority order to prove sorting works.
-        registry.register(Box::new(handler)).unwrap();
-        registry.register(Box::new(guard)).unwrap();
-        registry.register(Box::new(transform)).unwrap();
-        let registry = Arc::new(RwLock::new(registry));
-
-        let bus = Arc::new(EventBus::with_capacity(64));
-        let dispatcher = EventDispatcher::new(Arc::clone(&registry), Arc::clone(&bus));
-        let handle = tokio::spawn(dispatcher.run());
-
-        tokio::task::yield_now().await;
-
-        publish_ipc(&bus, "shared.topic");
-
-        tokio::time::sleep(Duration::from_millis(300)).await;
-
-        let recorded = order.lock().unwrap().clone();
-        assert_eq!(
-            recorded,
-            vec!["guard", "transform", "handler"],
-            "interceptors must fire in priority order (lower first)"
-        );
-
-        handle.abort();
-    }
-
-    #[tokio::test]
-    async fn find_matching_interceptors_sorts_by_priority() {
-        // Unit test for find_matching_interceptors directly.
-        let (low, _) = MockCapsule::with_priority("low-pri", "test.event", 10, None);
-        let (high, _) = MockCapsule::with_priority("high-pri", "test.event", 200, None);
-        let (mid, _) = MockCapsule::with_priority("mid-pri", "test.event", 50, None);
-
-        let mut registry = CapsuleRegistry::new();
-        registry.register(Box::new(high)).unwrap();
-        registry.register(Box::new(low)).unwrap();
-        registry.register(Box::new(mid)).unwrap();
-        let registry = Arc::new(RwLock::new(registry));
-
-        let matches = find_matching_interceptors(&registry, "test.event").await;
-        let names: Vec<&str> = matches.iter().map(|(c, _)| c.id().as_str()).collect();
-        assert_eq!(
-            names,
-            vec!["low-pri", "mid-pri", "high-pri"],
-            "find_matching_interceptors must return results sorted by priority"
-        );
-    }
-
-    #[tokio::test]
-    async fn deny_interceptor_short_circuits_chain() {
-        // Guard at priority 10 denies, handler at priority 100 should never fire.
-        let order = Arc::new(Mutex::new(Vec::<String>::new()));
-
-        let (mut guard, _) =
-            MockCapsule::with_priority("guard", "shared.topic", 10, Some(Arc::clone(&order)));
-        guard.result_override = Some(InterceptResult::Deny {
-            reason: "blocked by guard".into(),
-        });
-
-        let (handler, invoked_handler) =
-            MockCapsule::with_priority("handler", "shared.topic", 100, Some(Arc::clone(&order)));
-
-        let mut registry = CapsuleRegistry::new();
-        registry.register(Box::new(handler)).unwrap();
-        registry.register(Box::new(guard)).unwrap();
-        let registry = Arc::new(RwLock::new(registry));
-
-        let bus = Arc::new(EventBus::with_capacity(64));
-        let dispatcher = EventDispatcher::new(Arc::clone(&registry), Arc::clone(&bus));
-        let handle = tokio::spawn(dispatcher.run());
-
-        tokio::task::yield_now().await;
-
-        publish_ipc(&bus, "shared.topic");
-
-        tokio::time::sleep(Duration::from_millis(300)).await;
-
-        let recorded = order.lock().unwrap().clone();
-        assert_eq!(
-            recorded,
-            vec!["guard"],
-            "only the guard should have fired — handler should be short-circuited"
-        );
-        assert!(
-            !invoked_handler.load(Ordering::SeqCst),
-            "handler must NOT be invoked after Deny"
-        );
-
-        handle.abort();
-    }
-
-    #[tokio::test]
-    async fn final_interceptor_short_circuits_chain() {
-        // Cache at priority 30 returns Final, core at priority 100 should never fire.
-        let order = Arc::new(Mutex::new(Vec::<String>::new()));
-
-        let (mut cache, _) =
-            MockCapsule::with_priority("cache", "shared.topic", 30, Some(Arc::clone(&order)));
-        cache.result_override = Some(InterceptResult::Final(b"cached response".to_vec()));
-
-        let (core, invoked_core) =
-            MockCapsule::with_priority("core", "shared.topic", 100, Some(Arc::clone(&order)));
-
-        let mut registry = CapsuleRegistry::new();
-        registry.register(Box::new(core)).unwrap();
-        registry.register(Box::new(cache)).unwrap();
-        let registry = Arc::new(RwLock::new(registry));
-
-        let bus = Arc::new(EventBus::with_capacity(64));
-        let dispatcher = EventDispatcher::new(Arc::clone(&registry), Arc::clone(&bus));
-        let handle = tokio::spawn(dispatcher.run());
-
-        tokio::task::yield_now().await;
-
-        publish_ipc(&bus, "shared.topic");
-
-        tokio::time::sleep(Duration::from_millis(300)).await;
-
-        let recorded = order.lock().unwrap().clone();
-        assert_eq!(
-            recorded,
-            vec!["cache"],
-            "only the cache should have fired — core should be short-circuited"
-        );
-        assert!(
-            !invoked_core.load(Ordering::SeqCst),
-            "core must NOT be invoked after Final"
-        );
-
-        handle.abort();
-    }
-
-    #[test]
-    fn intercept_result_from_guest_bytes() {
-        // Empty = Continue
-        let r = InterceptResult::from_guest_bytes(vec![]);
-        assert!(matches!(r, InterceptResult::Continue(ref b) if b.is_empty()));
-
-        // 0x00 + payload = Continue
-        let r = InterceptResult::from_guest_bytes(vec![0x00, 1, 2, 3]);
-        assert!(matches!(r, InterceptResult::Continue(ref b) if b == &[1, 2, 3]));
-
-        // 0x01 + payload = Final
-        let r = InterceptResult::from_guest_bytes(vec![0x01, 4, 5]);
-        assert!(matches!(r, InterceptResult::Final(ref b) if b == &[4, 5]));
-
-        // 0x02 + reason = Deny
-        let r = InterceptResult::from_guest_bytes(vec![0x02, b'n', b'o']);
-        assert!(matches!(r, InterceptResult::Deny { ref reason } if reason == "no"));
-
-        // Unknown discriminant = Continue with full bytes
-        let r = InterceptResult::from_guest_bytes(vec![0xFF, 1]);
-        assert!(matches!(r, InterceptResult::Continue(ref b) if b == &[0xFF, 1]));
-    }
-}
+#[path = "dispatcher_tests.rs"]
+mod tests;

@@ -103,5 +103,30 @@ wasmtime::component::bindgen!({
     },
     imports: {
         "astrid:io/streams": trappable,
+        // `subscription.recv` is the only host import on the orchestration
+        // hot path that *blocks* — every chained capsule (react ->
+        // prompt-builder -> registry -> openai-compat) waits here for the
+        // next stage's response. Making just this one function `async`
+        // lets the host impl `.await` the broadcast receiver instead of
+        // pinning a tokio worker via `block_in_place`/`block_on`, which is
+        // the actual fix for the worker-pool exhaustion in issue #816.
+        // Selector is function-level (per wasmtime-wasi-45's own bindgen):
+        // `<iface>.[method]<resource>.<func>`, no version, dot-separated.
+        // Every other import stays synchronous — non-blocking host fns
+        // (publish/subscribe/kv/sys/...) gain nothing from async.
+        "astrid:ipc/host.[method]subscription.recv": async,
+        // The HTTP host fns that *wait on the network* are the second
+        // worker-pin on the orchestration hot path: openai-compat opens an
+        // LLM stream (`http-stream-start`), then loops `read-chunk` over the
+        // SSE body — each blocking the worker for the whole LLM round-trip.
+        // `http-request` is the non-streaming sibling (describe/health).
+        // Making just these three async lets the host impls `.await` reqwest
+        // directly instead of pinning a worker via `block_in_place`, which is
+        // what kept response throughput at zero under concurrency once the
+        // recv-pin was removed (issue #816). The remaining sync net/elicit
+        // host fns are off the orchestration hot path (tracked follow-up).
+        "astrid:http/host.http-request": async,
+        "astrid:http/host.http-stream-start": async,
+        "astrid:http/host.[method]http-stream.read-chunk": async,
     },
 });

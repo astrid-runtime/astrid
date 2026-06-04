@@ -79,6 +79,64 @@ where
     })
 }
 
+/// Async-native sibling of [`bounded_block_on`] for host fns that are
+/// themselves `async` (see the bindgen `imports` async selectors). Bounds
+/// concurrency on the host semaphore and `.await`s directly, so the calling
+/// tokio worker is freed while the future is pending instead of being
+/// pinned via `block_in_place`/`block_on` (issue #816).
+///
+/// Use this for blocking I/O that has no cancellation token (e.g. the
+/// non-streaming `http_request` send + body read). For I/O that must abort
+/// promptly on capsule unload, use [`bounded_await_cancellable`].
+pub(crate) async fn bounded_await<F, T>(semaphore: &Semaphore, fut: F) -> T
+where
+    F: Future<Output = T>,
+{
+    let _permit = semaphore
+        .acquire()
+        .await
+        .expect("host semaphore closed: capsule HostState was dropped");
+    fut.await
+}
+
+/// Async-native sibling of [`bounded_block_on_cancellable`] for host fns
+/// that are themselves `async` (see the bindgen `imports` async selector).
+///
+/// Same semantics — bounded by the host semaphore, abortable via the
+/// cancellation token with a `biased` select that prioritises cancel over
+/// permit acquisition — but it `.await`s directly instead of wrapping the
+/// wait in `block_in_place`/`block_on`. The calling tokio worker is
+/// released back to the pool while the future is pending rather than being
+/// pinned for the whole wait, which is the point of issue #816: a capsule
+/// blocked in `ipc::recv` waiting for the next stage no longer holds a
+/// worker hostage.
+///
+/// Returns `Some(T)` if the future completes before cancellation, `None` if
+/// the token fires first.
+pub(crate) async fn bounded_await_cancellable<F, T>(
+    semaphore: &Semaphore,
+    cancel_token: &CancellationToken,
+    fut: F,
+) -> Option<T>
+where
+    F: Future<Output = T>,
+{
+    if cancel_token.is_cancelled() {
+        return None;
+    }
+    tokio::select! {
+        biased;
+        () = cancel_token.cancelled() => None,
+        result = async {
+            let _permit = semaphore
+                .acquire()
+                .await
+                .expect("host semaphore closed: capsule HostState was dropped");
+            fut.await
+        } => Some(result),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

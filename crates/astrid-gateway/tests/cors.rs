@@ -44,6 +44,7 @@ fn state_with_origins(origins: Vec<&str>) -> Arc<GatewayState> {
         revoked_at: std::sync::Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
         audit_log: None,
         session_id: None,
+        gateway_route_uuid: uuid::Uuid::new_v4(),
     })
 }
 
