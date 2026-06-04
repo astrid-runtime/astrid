@@ -25,4 +25,4 @@ pub mod topic;
 pub mod toposort;
 pub(crate) mod watcher;
 
-pub use fuel_ledger::FuelLedger;
+pub use fuel_ledger::{FuelLedger, FuelRateLimiter};

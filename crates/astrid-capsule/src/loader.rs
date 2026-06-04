@@ -4,7 +4,7 @@ use std::path::PathBuf;
 
 use crate::capsule::{Capsule, CompositeCapsule};
 use crate::error::CapsuleResult;
-use crate::fuel_ledger::FuelLedger;
+use crate::fuel_ledger::{FuelLedger, FuelRateLimiter};
 use crate::manifest::CapsuleManifest;
 
 use astrid_mcp::SecureMcpClient;
@@ -17,6 +17,10 @@ pub struct CapsuleLoader {
     /// handle to every capsule's `WasmEngine` so CPU is aggregated per principal
     /// across all capsules (not per-capsule). See [`FuelLedger`].
     fuel_ledger: FuelLedger,
+    /// Kernel-owned shared per-principal CPU-rate limiter (the deny side). Like
+    /// `fuel_ledger`, handed to every `WasmEngine` so a principal's 1-second CPU
+    /// rate is throttled cross-capsule. See [`FuelRateLimiter`].
+    fuel_rate: FuelRateLimiter,
 }
 
 impl CapsuleLoader {
@@ -24,12 +28,19 @@ impl CapsuleLoader {
     ///
     /// `fuel_ledger` is the kernel-owned, shared per-principal CPU ledger
     /// (clone of the kernel's single instance); pass `FuelLedger::default()` in
-    /// tests that don't exercise cross-capsule CPU aggregation.
+    /// tests that don't exercise cross-capsule CPU aggregation. `fuel_rate` is
+    /// the matching shared per-principal CPU-rate limiter (the deny side); pass
+    /// `FuelRateLimiter::default()` in tests that don't exercise enforcement.
     #[must_use]
-    pub fn new(mcp_client: SecureMcpClient, fuel_ledger: FuelLedger) -> Self {
+    pub fn new(
+        mcp_client: SecureMcpClient,
+        fuel_ledger: FuelLedger,
+        fuel_rate: FuelRateLimiter,
+    ) -> Self {
         Self {
             mcp_client,
             fuel_ledger,
+            fuel_rate,
         }
     }
 
@@ -55,6 +66,7 @@ impl CapsuleLoader {
                 manifest.clone(),
                 capsule_dir.clone(),
                 self.fuel_ledger.clone(),
+                self.fuel_rate.clone(),
             )));
         }
 

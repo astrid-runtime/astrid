@@ -88,6 +88,7 @@ async fn setup_test_capsule(
     let loader = CapsuleLoader::new(
         test_secure_mcp_client(),
         astrid_capsule::FuelLedger::default(),
+        astrid_capsule::FuelRateLimiter::default(),
     );
 
     let mut capsule = loader
@@ -196,6 +197,7 @@ async fn setup_test_capsule_with_home(
     let loader = CapsuleLoader::new(
         test_secure_mcp_client(),
         astrid_capsule::FuelLedger::default(),
+        astrid_capsule::FuelRateLimiter::default(),
     );
 
     let mut capsule = loader

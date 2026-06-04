@@ -108,6 +108,12 @@ pub struct Kernel {
     /// substrate for a per-principal CPU budget. See
     /// [`FuelLedger`](astrid_capsule::FuelLedger).
     fuel_ledger: astrid_capsule::FuelLedger,
+    /// Shared per-principal CPU-rate limiter (the deny side of the budget),
+    /// cloned into every capsule's `WasmEngine` (via the loader) alongside
+    /// `fuel_ledger`. A principal over its `max_cpu_fuel_per_sec` in the rolling
+    /// 1-second window is denied at interceptor entry, cross-capsule. See
+    /// [`FuelRateLimiter`](astrid_capsule::FuelRateLimiter).
+    fuel_rate: astrid_capsule::FuelRateLimiter,
     /// Ephemeral mode: shut down immediately when the last client disconnects.
     pub ephemeral: AtomicBool,
     /// Instant when the kernel was booted (for uptime calculation).
@@ -316,6 +322,7 @@ impl Kernel {
             audit_log,
             active_connections: DashMap::new(),
             fuel_ledger: astrid_capsule::FuelLedger::default(),
+            fuel_rate: astrid_capsule::FuelRateLimiter::default(),
             ephemeral: AtomicBool::new(false),
             boot_time: std::time::Instant::now(),
             shutdown_tx: tokio::sync::watch::channel(false).0,
@@ -376,8 +383,11 @@ impl Kernel {
             }
         }
 
-        let loader =
-            astrid_capsule::loader::CapsuleLoader::new(self.mcp.clone(), self.fuel_ledger.clone());
+        let loader = astrid_capsule::loader::CapsuleLoader::new(
+            self.mcp.clone(),
+            self.fuel_ledger.clone(),
+            self.fuel_rate.clone(),
+        );
         let mut capsule = loader.create_capsule(manifest, dir.clone())?;
 
         // Build the context — use the shared kernel KV so capsules can
@@ -997,6 +1007,7 @@ pub(crate) async fn test_kernel_with_home(home: astrid_core::dirs::AstridHome) -
         audit_log,
         active_connections: DashMap::new(),
         fuel_ledger: astrid_capsule::FuelLedger::default(),
+        fuel_rate: astrid_capsule::FuelRateLimiter::default(),
         ephemeral: AtomicBool::new(false),
         boot_time: std::time::Instant::now(),
         shutdown_tx: tokio::sync::watch::channel(false).0,
