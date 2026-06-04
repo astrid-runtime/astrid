@@ -86,6 +86,7 @@ use crate::state::GatewayState;
         // Quotas
         routes::quotas::get_quotas,
         routes::quotas::set_quotas,
+        routes::quotas::get_usage,
         // Groups
         routes::groups::list_groups,
         routes::groups::create_group,
@@ -139,6 +140,7 @@ use crate::state::GatewayState;
             // Quotas
             routes::quotas::QuotaRequest,
             routes::quotas::QuotasView,
+            routes::quotas::ResourceUsageView,
             // Groups
             routes::groups::GroupListResponse,
             routes::groups::GroupSummaryView,

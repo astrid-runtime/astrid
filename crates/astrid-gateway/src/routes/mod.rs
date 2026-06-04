@@ -88,6 +88,7 @@ pub fn build(state: Arc<GatewayState>) -> Router {
         // ── Quotas ──
         .route("/api/sys/principals/:id/quotas", get(quotas::get_quotas))
         .route("/api/sys/principals/:id/quotas", put(quotas::set_quotas))
+        .route("/api/sys/principals/:id/usage", get(quotas::get_usage))
         // ── Groups ──
         .route("/api/sys/groups", get(groups::list_groups))
         .route("/api/sys/groups", post(groups::create_group))
