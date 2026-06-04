@@ -85,7 +85,10 @@ async fn setup_test_capsule(
         tools: ::std::vec::Vec::new(),
     };
 
-    let loader = CapsuleLoader::new(test_secure_mcp_client());
+    let loader = CapsuleLoader::new(
+        test_secure_mcp_client(),
+        astrid_capsule::FuelLedger::default(),
+    );
 
     let mut capsule = loader
         .create_capsule(manifest, fixture_path.parent().unwrap().to_path_buf())
@@ -190,7 +193,10 @@ async fn setup_test_capsule_with_home(
         tools: ::std::vec::Vec::new(),
     };
 
-    let loader = CapsuleLoader::new(test_secure_mcp_client());
+    let loader = CapsuleLoader::new(
+        test_secure_mcp_client(),
+        astrid_capsule::FuelLedger::default(),
+    );
 
     let mut capsule = loader
         .create_capsule(manifest, fixture_path.parent().unwrap().to_path_buf())

@@ -217,22 +217,37 @@ pub struct WasmEngine {
     /// (exact deterministic guest-instruction count).
     ///
     /// `invoke_interceptor` reads `get_fuel` before/after each guest call and
-    /// adds the delta to the invoking principal's counter. This is the
-    /// measurement hook the operator question ("who is burning CPU?") needs —
-    /// it feeds the per-invocation `astrid.sample` span today and `astrid top`
-    /// (#66) later. TELEMETRY ONLY: the full windowed/decaying rate-limiting
-    /// ledger (deny/throttle when over budget in the invoke preamble) is a
-    /// deliberate FOLLOW-UP — the run-loop CPU bound is enforced by the epoch
-    /// interrupt mechanism (not this ledger, not fuel); this counter only
-    /// attributes interceptor cost for telemetry. Keyed by
-    /// the *invoking* principal (caller or owner). Unbounded-growth caveat: one
-    /// entry per distinct principal; with many ephemeral sub-agents this can
-    /// grow — bound it (LRU) when it graduates from telemetry to enforcement.
-    fuel_ledger: Arc<Mutex<std::collections::HashMap<astrid_core::PrincipalId, u64>>>,
+    /// charges the delta to the invoking principal. This is the measurement
+    /// hook the operator question ("who is burning CPU?") needs — it feeds the
+    /// per-invocation `astrid.sample` span today and `astrid top` (#66) later.
+    ///
+    /// **Shared, cross-capsule.** This handle is cloned from the kernel-owned
+    /// [`FuelLedger`](crate::FuelLedger), so a principal's CPU is summed across
+    /// *every* capsule it drives into one per-principal total — the
+    /// prerequisite for a per-principal CPU budget. (It used to be a per-engine
+    /// `HashMap`, which fragmented the same principal into N per-capsule
+    /// sub-totals.) The ledger is sharded + atomic, never a single mutex, so it
+    /// does not re-serialise the hot interceptor path (astrid#813/#817).
+    ///
+    /// TELEMETRY ONLY today: the windowed/decaying deny/throttle that consumes
+    /// this aggregate is the deliberate FOLLOW-UP. The run-loop CPU bound stays
+    /// enforced by the epoch-interrupt mechanism (not this ledger, not fuel).
+    /// Keyed by the *invoking* principal (caller or owner).
+    fuel_ledger: crate::FuelLedger,
 }
 
 impl WasmEngine {
-    pub fn new(manifest: CapsuleManifest, capsule_dir: PathBuf) -> Self {
+    /// Construct a WASM engine for one capsule.
+    ///
+    /// `fuel_ledger` is the kernel-owned, shared per-principal CPU ledger; the
+    /// kernel passes the *same* handle to every capsule's engine so per-principal
+    /// CPU is aggregated cross-capsule. Tests that don't care about aggregation
+    /// pass `FuelLedger::default()` for an isolated ledger.
+    pub fn new(
+        manifest: CapsuleManifest,
+        capsule_dir: PathBuf,
+        fuel_ledger: crate::FuelLedger,
+    ) -> Self {
         Self {
             manifest,
             _capsule_dir: capsule_dir,
@@ -246,7 +261,7 @@ impl WasmEngine {
             profile_cache: None,
             owner_principal: None,
             overlay_registry: None,
-            fuel_ledger: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            fuel_ledger,
         }
     }
 }
@@ -1876,16 +1891,13 @@ impl ExecutionEngine for WasmEngine {
         // Per-invocation CPU measurement: fuel counts DOWN from the seed, so
         // `seed - remaining` is the exact deterministic instruction count for
         // this call. Read while `checkout` is still alive (the `s` borrow above
-        // has ended). Attribute to the invoking principal and accumulate into
-        // the per-principal fuel ledger (telemetry only — the run-loop CPU
-        // bound is ENFORCED by the epoch interrupt mechanism, not fuel;
-        // windowed deny/throttle on this ledger is a deliberate follow-up).
+        // has ended). Charge it to the invoking principal in the shared,
+        // cross-capsule fuel ledger (telemetry only — the run-loop CPU bound is
+        // ENFORCED by the epoch interrupt mechanism, not fuel; windowed
+        // deny/throttle on this aggregate is the deliberate follow-up).
         let fuel_after = checkout.store_mut().get_fuel().unwrap_or(0);
         let fuel_used = INTERCEPTOR_FUEL_BUDGET.saturating_sub(fuel_after);
-        if let Ok(mut ledger) = self.fuel_ledger.lock() {
-            let entry = ledger.entry(invoking_principal.clone()).or_insert(0);
-            *entry = entry.saturating_add(fuel_used);
-        }
+        self.fuel_ledger.charge(&invoking_principal, fuel_used);
         // Drop the lease: Phase 3 CLEAR runs and the instance returns to the
         // pool, so a parallel invocation can lease it with clean state.
         drop(checkout);
