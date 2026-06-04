@@ -1766,11 +1766,15 @@ impl ExecutionEngine for WasmEngine {
         // rolling 1-second window, refuse THIS invocation before it costs any
         // CPU (before pool checkout / fuel seeding). The `record` feed AFTER
         // the call (next to `fuel_ledger.charge`) is what populates the window;
-        // this is purely the read, stamped with `invoke_start` (captured above):
-        // it asks what the principal had already burned BEFORE this call. The
-        // matching `record` is stamped at call COMPLETION, not `invoke_start`,
-        // so a long call's fuel lands in the live window rather than a stale one
-        // (see the `record` call site for why).
+        // this is purely the read, stamped with a fresh `Instant::now()` taken
+        // HERE at the admission decision — NOT the earlier `invoke_start`.
+        // `invoke_start` is captured at the very top of the invocation, before
+        // the per-invocation setup and profile resolution that can hit disk
+        // (`PrincipalProfile::load`); reusing it here would read the window
+        // seconds in the past and can underflow `now < window_start` against a
+        // window a concurrent `record` just stamped. The matching `record` is
+        // stamped at call COMPLETION (see its call site), so a long call's fuel
+        // lands in the live window rather than a stale one.
         //
         // Two orthogonal axes, deliberately opposite fail directions:
         //   • EXEMPTION fails CLOSED. `resolve_exemption` returns `false`
@@ -1791,7 +1795,7 @@ impl ExecutionEngine for WasmEngine {
         // CONTINUES it on `Err` (a broken capsule must not block the pipeline,
         // see dispatcher.rs). An `Err`-based deny would therefore be a SILENT
         // enforcement BYPASS — the chain would carry on as if nothing happened.
-        let now = invoke_start;
+        let now = std::time::Instant::now();
         if let Some(reason) = cpu_rate_deny(
             &self.fuel_rate,
             invocation_profile.as_deref(),
