@@ -259,6 +259,15 @@ pub enum AdminRequestKind {
         /// Principal whose quotas are being read.
         principal: PrincipalId,
     },
+    /// Read the target principal's current resource **usage** vs budget —
+    /// the cross-capsule CPU total plus the configured ceilings. Read-only,
+    /// scoped exactly like [`QuotaGet`](Self::QuotaGet) (`self:quota:get` /
+    /// `quota:get`): a principal can read its own usage, an admin can read
+    /// anyone's.
+    UsageGet {
+        /// Principal whose usage is being read.
+        principal: PrincipalId,
+    },
     /// Create a custom group, validated through the same rules the boot
     /// loader applies to `groups.toml`.
     GroupCreate {
@@ -447,6 +456,8 @@ pub enum AdminResponseBody {
     GroupList(Vec<GroupSummary>),
     /// Response for [`AdminRequestKind::QuotaGet`].
     Quotas(Quotas),
+    /// Response for [`AdminRequestKind::UsageGet`].
+    Usage(ResourceUsage),
     /// Response for [`AdminRequestKind::InviteIssue`] — the freshly
     /// minted token plus its persisted metadata. The redemption URL is
     /// derived client-side from the deployment's public gateway base
@@ -466,6 +477,40 @@ pub enum AdminResponseBody {
     PairTokenRedeemed(PairTokenRedeemed),
     /// The request failed.
     Error(String),
+}
+
+/// Per-principal resource usage vs configured budget — the payload of
+/// [`AdminRequestKind::UsageGet`], rendered by `astrid quota`/`astrid top` and
+/// `GET /api/sys/principals/{id}/usage` so per-principal usage is measurable.
+///
+/// **CPU** is the live cross-capsule aggregate: the kernel's shared fuel ledger
+/// sums every interceptor's exact wasmtime-fuel cost per invoking principal
+/// across all capsules. **Memory** has no per-principal *total* yet — it is
+/// bounded per-Store (per capsule instance), so `memory_bytes_current_total`
+/// stays `None` until per-principal memory aggregation lands; the limit field
+/// reports the per-instance ceiling.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResourceUsage {
+    /// Principal this usage report describes.
+    pub principal: PrincipalId,
+    /// Cumulative interceptor CPU burned across ALL capsules, in wasmtime fuel
+    /// units (exact deterministic instruction count, monotonic for the process
+    /// lifetime).
+    pub cpu_fuel_consumed_total: u64,
+    /// Configured CPU rate ceiling ([`Quotas::max_cpu_fuel_per_sec`]), always
+    /// `> 0` (validation rejects `0` — there is no "unlimited" sentinel;
+    /// unbounded CPU is a capability, surfaced by `exempt`).
+    pub cpu_fuel_per_sec_limit: u64,
+    /// Whether the principal is exempt from resource budgets — it holds
+    /// `system:resources:unbounded`, `net_bind`, or `uplink` (admins via `*`).
+    /// When `true` the limit fields are advisory, never enforced.
+    pub exempt: bool,
+    /// Per-capsule-instance memory ceiling ([`Quotas::max_memory_bytes`]). This
+    /// is a per-Store cap, not a cross-capsule total.
+    pub memory_bytes_limit_per_instance: u64,
+    /// Current cross-capsule resident memory total, or `None` while a
+    /// per-principal aggregate RAM budget is unimplemented.
+    pub memory_bytes_current_total: Option<u64>,
 }
 
 /// Summary of an agent principal returned by

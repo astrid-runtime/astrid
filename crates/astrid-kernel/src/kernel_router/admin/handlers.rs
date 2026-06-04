@@ -75,9 +75,10 @@ pub(super) async fn dispatch(
             remove_groups,
         } => agent_modify(kernel, principal, add_groups, remove_groups).await,
         AdminRequestKind::QuotaSet { principal, quotas } => {
-            quota_set(kernel, principal, quotas).await
+            super::quota::quota_set(kernel, principal, quotas).await
         },
-        AdminRequestKind::QuotaGet { principal } => quota_get(kernel, &principal),
+        AdminRequestKind::QuotaGet { principal } => super::quota::quota_get(kernel, &principal),
+        AdminRequestKind::UsageGet { principal } => super::quota::usage_get(kernel, &principal),
         AdminRequestKind::GroupCreate {
             name,
             capabilities,
@@ -497,50 +498,6 @@ fn agent_list(kernel: &Arc<crate::Kernel>) -> AdminResponseBody {
     AdminResponseBody::AgentList(summaries)
 }
 
-// ── Quotas ─────────────────────────────────────────────────────────────
-
-async fn quota_set(
-    kernel: &Arc<crate::Kernel>,
-    principal: PrincipalId,
-    quotas: astrid_core::profile::Quotas,
-) -> AdminResponseBody {
-    // Validate before taking the write lock — quick reject on bad input.
-    if let Err(e) = quotas.validate() {
-        return err_bad_input(format!("quotas rejected: {e}"));
-    }
-
-    let _guard = kernel.admin_write_lock.lock().await;
-    let path = principal_profile_path(kernel, &principal);
-    if let Err(msg) = require_principal_exists(&principal, &path) {
-        return err_bad_input(msg);
-    }
-    let mut profile = match PrincipalProfile::load_from_path(&path) {
-        Ok(p) => p,
-        Err(e) => return err_profile(&principal, &e),
-    };
-    profile.quotas = quotas;
-    if let Err(e) = profile.save_to_path(&path) {
-        return err_profile(&principal, &e);
-    }
-    kernel.profile_cache.invalidate(&principal);
-    success_json(serde_json::json!({ "principal": principal.as_str() }))
-}
-
-fn quota_get(kernel: &Arc<crate::Kernel>, principal: &PrincipalId) -> AdminResponseBody {
-    // quota.get reads through the cache. The cache.resolve path
-    // returns Default on missing profile.toml, so a typo'd name would
-    // silently return Default-shaped quotas without revealing the
-    // mistake. Surface "no such principal" as a hard error.
-    let path = principal_profile_path(kernel, principal);
-    if let Err(msg) = require_principal_exists(principal, &path) {
-        return err_bad_input(msg);
-    }
-    match kernel.profile_cache.resolve(principal) {
-        Ok(profile) => AdminResponseBody::Quotas(profile.quotas.clone()),
-        Err(e) => err_profile(principal, &e),
-    }
-}
-
 // ── Groups ─────────────────────────────────────────────────────────────
 
 async fn group_create(
@@ -721,7 +678,10 @@ async fn mutate_caps(
 
 // ── Helpers ────────────────────────────────────────────────────────────
 
-fn principal_profile_path(kernel: &Arc<crate::Kernel>, principal: &PrincipalId) -> PathBuf {
+pub(super) fn principal_profile_path(
+    kernel: &Arc<crate::Kernel>,
+    principal: &PrincipalId,
+) -> PathBuf {
     PrincipalProfile::path_for(&kernel.astrid_home, principal)
 }
 
@@ -730,7 +690,7 @@ fn principal_profile_path(kernel: &Arc<crate::Kernel>, principal: &PrincipalId) 
 /// [`PrincipalProfile::load_from_path`] returns `Default` on `NotFound`,
 /// which would let a typo'd name silently materialize a phantom
 /// principal with grants on disk.
-fn require_principal_exists(principal: &PrincipalId, path: &Path) -> Result<(), String> {
+pub(super) fn require_principal_exists(principal: &PrincipalId, path: &Path) -> Result<(), String> {
     if path.exists() {
         Ok(())
     } else {
@@ -741,7 +701,7 @@ fn require_principal_exists(principal: &PrincipalId, path: &Path) -> Result<(), 
     }
 }
 
-fn err_bad_input(msg: String) -> AdminResponseBody {
+pub(super) fn err_bad_input(msg: String) -> AdminResponseBody {
     warn!(error = %msg, "admin request rejected: bad input");
     AdminResponseBody::Error(msg)
 }
@@ -751,11 +711,11 @@ fn err_internal(msg: String) -> AdminResponseBody {
     AdminResponseBody::Error(msg)
 }
 
-fn err_profile(principal: &PrincipalId, e: &ProfileError) -> AdminResponseBody {
+pub(super) fn err_profile(principal: &PrincipalId, e: &ProfileError) -> AdminResponseBody {
     err_internal(format!("profile error for {principal}: {e}"))
 }
 
-fn success_json(val: serde_json::Value) -> AdminResponseBody {
+pub(super) fn success_json(val: serde_json::Value) -> AdminResponseBody {
     AdminResponseBody::Success(val)
 }
 
