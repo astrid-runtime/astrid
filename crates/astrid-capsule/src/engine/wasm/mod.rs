@@ -234,6 +234,29 @@ pub struct WasmEngine {
     /// enforced by the epoch-interrupt mechanism (not this ledger, not fuel).
     /// Keyed by the *invoking* principal (caller or owner).
     fuel_ledger: crate::FuelLedger,
+    /// Shared per-principal CPU-**rate** limiter — the deny side of the budget
+    /// (PR2), built on the same shared-handle model as `fuel_ledger`.
+    ///
+    /// `invoke_interceptor` consults [`over_budget`](
+    /// crate::FuelRateLimiter::over_budget) BEFORE checking out a pooled
+    /// instance, and feeds the exact post-hoc fuel via [`record`](
+    /// crate::FuelRateLimiter::record) right after `fuel_ledger.charge`. Cloned
+    /// from the kernel-owned limiter so a principal's 1-second CPU rate is
+    /// throttled cross-capsule, not per-capsule. Keyed by the *invoking*
+    /// principal (caller or owner), same as the ledger.
+    ///
+    /// Fail-OPEN on the window math (non-poisoning `parking_lot` + saturating
+    /// arithmetic); the orthogonal exemption decision fails CLOSED.
+    fuel_rate: crate::FuelRateLimiter,
+    /// Live group config, cached from [`CapsuleContext`] at load time (same
+    /// snapshot the run-loop budget resolution uses).
+    ///
+    /// `invoke_interceptor` passes this to [`resolve_exemption`] so the CPU-rate
+    /// deny gate exempts the same capability holders (unbounded / net_bind /
+    /// uplink; admin via `*`) the run-loop bound exempts. `None` in tests /
+    /// single-tenant => no exemption resolvable => the invoking principal is
+    /// bounded (fail-secure), but still under the generous default budget.
+    group_config: Option<Arc<astrid_core::GroupConfig>>,
 }
 
 impl WasmEngine {
@@ -243,10 +266,15 @@ impl WasmEngine {
     /// kernel passes the *same* handle to every capsule's engine so per-principal
     /// CPU is aggregated cross-capsule. Tests that don't care about aggregation
     /// pass `FuelLedger::default()` for an isolated ledger.
+    ///
+    /// `fuel_rate` is the matching kernel-owned, shared per-principal CPU-rate
+    /// limiter (the deny side); pass `FuelRateLimiter::default()` for an
+    /// isolated limiter in tests.
     pub fn new(
         manifest: CapsuleManifest,
         capsule_dir: PathBuf,
         fuel_ledger: crate::FuelLedger,
+        fuel_rate: crate::FuelRateLimiter,
     ) -> Self {
         Self {
             manifest,
@@ -262,6 +290,8 @@ impl WasmEngine {
             owner_principal: None,
             overlay_registry: None,
             fuel_ledger,
+            fuel_rate,
+            group_config: None,
         }
     }
 }
@@ -439,6 +469,52 @@ pub(crate) fn resolve_exemption(
     check.has(astrid_core::CAP_RESOURCES_UNBOUNDED)
         || check.has(astrid_core::CAP_NET_BIND)
         || check.has(astrid_core::CAP_UPLINK)
+}
+
+/// The per-principal CPU-rate DENY decision, factored out of
+/// `invoke_interceptor` so the production path and the unit tests run the
+/// *exact same* function (no copies — same discipline as
+/// [`resolve_run_loop_budget`]).
+///
+/// Returns `Some(reason)` when this invocation must be denied (the caller wraps
+/// it in `Ok(InterceptResult::Deny { reason })`, NEVER `Err` — see the call
+/// site), or `None` to admit. The decision composes the two orthogonal axes:
+///
+/// - **Exemption (fails CLOSED).** [`resolve_exemption`] returns `false`
+///   (bounded) on any missing input, so an unidentifiable principal is gated;
+///   the holders it exempts (unbounded / net_bind / uplink; admin via `*`) are
+///   never denied here.
+/// - **Budget.** `invocation_profile`'s `max_cpu_fuel_per_sec`, or
+///   [`DEFAULT_MAX_CPU_FUEL_PER_SEC`](astrid_core::profile::DEFAULT_MAX_CPU_FUEL_PER_SEC)
+///   when there is no profile (tests / single-tenant). `0` means UNLIMITED —
+///   never deny-all.
+/// - **Window (fails OPEN).** [`FuelRateLimiter::over_budget`](
+///   crate::FuelRateLimiter::over_budget) is total (non-poisoning parking_lot +
+///   saturating arithmetic); there is deliberately no deny-all-on-error path.
+///
+/// No I/O, no wasmtime — unit-testable directly.
+fn cpu_rate_deny(
+    fuel_rate: &crate::FuelRateLimiter,
+    invocation_profile: Option<&astrid_core::profile::PrincipalProfile>,
+    group_config: Option<&astrid_core::GroupConfig>,
+    principal: &astrid_core::PrincipalId,
+    now: std::time::Instant,
+) -> Option<String> {
+    // Exemption resolves the INVOKING principal's profile against the cached
+    // group config — fail-CLOSED (bounded) on any missing input.
+    if resolve_exemption(invocation_profile, group_config, principal) {
+        return None;
+    }
+    let budget = invocation_profile
+        .map(|p| p.quotas.max_cpu_fuel_per_sec)
+        .unwrap_or(astrid_core::profile::DEFAULT_MAX_CPU_FUEL_PER_SEC);
+    // 0 = unlimited; never deny-all. Window math fails OPEN (cannot fail).
+    if budget > 0 && fuel_rate.over_budget(principal, budget, now) {
+        return Some(format!(
+            "principal '{principal}' exceeded CPU budget of {budget} fuel/sec"
+        ));
+    }
+    None
 }
 
 /// Pure resolution of a capsule's run-loop resource bound from the owner
@@ -1569,6 +1645,11 @@ impl ExecutionEngine for WasmEngine {
         self.profile_cache = ctx.profile_cache.clone();
         self.overlay_registry = ctx.overlay_registry.clone();
         self.owner_principal = Some(ctx.principal.clone());
+        // Cache the live group config so the CPU-rate deny gate can resolve the
+        // invoking principal's exemption (same snapshot the run-loop budget
+        // uses). `None` in tests / single-tenant => no exemption resolvable =>
+        // the principal is bounded (fail-secure).
+        self.group_config = ctx.group_config.clone();
 
         Ok(())
     }
@@ -1677,6 +1758,59 @@ impl ExecutionEngine for WasmEngine {
                 },
                 None => None,
             };
+
+        // ── Per-principal CPU-rate DENY gate (PR2, security boundary) ──────
+        //
+        // The deny side of the per-principal CPU budget: if the invoking
+        // principal has burned more than `max_cpu_fuel_per_sec` in the current
+        // rolling 1-second window, refuse THIS invocation before it costs any
+        // CPU (before pool checkout / fuel seeding). The `record` feed AFTER
+        // the call (next to `fuel_ledger.charge`) is what populates the window;
+        // this is purely the read, stamped with `invoke_start` (captured above):
+        // it asks what the principal had already burned BEFORE this call. The
+        // matching `record` is stamped at call COMPLETION, not `invoke_start`,
+        // so a long call's fuel lands in the live window rather than a stale one
+        // (see the `record` call site for why).
+        //
+        // Two orthogonal axes, deliberately opposite fail directions:
+        //   • EXEMPTION fails CLOSED. `resolve_exemption` returns `false`
+        //     (bounded) on any missing input — no profile, no group config — so
+        //     an unidentifiable principal is *gated*, never waved through. The
+        //     holders it DOES exempt are capability-driven (unbounded /
+        //     net_bind / uplink; admin via `*`), the same set the run-loop
+        //     bound exempts — resolved against the INVOKING principal's profile
+        //     (`invocation_profile`, already in hand) and the cached group
+        //     config.
+        //   • The window MATH fails OPEN, and structurally cannot fail
+        //     (`over_budget` is total: non-poisoning parking_lot + saturating
+        //     arithmetic, no `?`, no panic path). There is deliberately NO
+        //     deny-all-on-error branch here.
+        //
+        // CRITICAL — the deny is `Ok(InterceptResult::Deny { .. })`, NEVER
+        // `Err`. The dispatcher HALTS the interceptor chain on `Ok(Deny)` but
+        // CONTINUES it on `Err` (a broken capsule must not block the pipeline,
+        // see dispatcher.rs). An `Err`-based deny would therefore be a SILENT
+        // enforcement BYPASS — the chain would carry on as if nothing happened.
+        let now = invoke_start;
+        if let Some(reason) = cpu_rate_deny(
+            &self.fuel_rate,
+            invocation_profile.as_deref(),
+            self.group_config.as_deref(),
+            &invoking_principal,
+            now,
+        ) {
+            tracing::warn!(
+                principal = %invoking_principal,
+                capsule = %self.manifest.package.name,
+                action,
+                "CPU-rate budget exceeded; denying invocation (per-principal throttle)"
+            );
+            // CRITICAL: `Ok(Deny)`, never `Err` — the dispatcher halts the chain
+            // on `Ok(Deny)` and CONTINUES on `Err`; an `Err`-deny is a silent
+            // enforcement bypass.
+            return Ok(crate::capsule::InterceptResult::Deny { reason });
+        }
+
         // Is the capsule a daemon (uplink / long-lived)? Daemons keep their
         // load-time `u64::MAX` epoch deadline; only non-daemon capsules
         // accept a per-invocation timeout from the profile.
@@ -1898,6 +2032,20 @@ impl ExecutionEngine for WasmEngine {
         let fuel_after = checkout.store_mut().get_fuel().unwrap_or(0);
         let fuel_used = INTERCEPTOR_FUEL_BUDGET.saturating_sub(fuel_after);
         self.fuel_ledger.charge(&invoking_principal, fuel_used);
+        // Feed this call's fuel into the CPU-rate window stamped at the moment
+        // the burn FINISHED, not `invoke_start`. The gate at the top reads with
+        // `invoke_start` (correct — it asks "what had this principal burned
+        // *before* this call?"), but the fuel itself was spent over the whole
+        // call. A long call (interceptors run up to WASM_CAPSULE_TIMEOUT_SECS —
+        // minutes, for LLM streaming) stamped at `invoke_start` lands its fuel
+        // in a window that is already stale by the time it returns, so the next
+        // invocation's `over_budget` roll discards it — a principal issuing
+        // back-to-back >1s calls would never be throttled despite each call
+        // burning up to 5x the per-second budget (INTERCEPTOR_FUEL_BUDGET vs
+        // max_cpu_fuel_per_sec). Stamping at completion places the fuel in the
+        // live window so the next call sees it.
+        self.fuel_rate
+            .record(&invoking_principal, fuel_used, std::time::Instant::now());
         // Drop the lease: Phase 3 CLEAR runs and the instance returns to the
         // pool, so a parallel invocation can lease it with clean state.
         drop(checkout);
@@ -2535,6 +2683,203 @@ mod tests {
         let p = profile_with(&["agent"], &[], &[]);
         let g = builtin_groups();
         assert!(!resolve_exemption(Some(&p), Some(&g), &pid("a")));
+    }
+
+    // ── CPU-rate DENY gate (PR2, the security boundary) ──────────────────
+    //
+    // These drive `cpu_rate_deny` — the SAME function the production
+    // `invoke_interceptor` calls (no copies). Inputs are injected, including a
+    // synthetic `now: Instant`, so the gate is exercised with no wasmtime and
+    // no real sleep. `cpu_rate_deny` returns `Some(reason)` to deny / `None` to
+    // admit; the call site wraps `Some` in `Ok(InterceptResult::Deny)`.
+
+    // A budget small enough that one recorded charge blows it.
+    const RATE_BUDGET: u64 = 1_000;
+
+    /// Drive a principal far over `RATE_BUDGET` in the limiter's current window.
+    fn saturate(
+        rl: &crate::FuelRateLimiter,
+        p: &astrid_core::PrincipalId,
+        now: std::time::Instant,
+    ) {
+        rl.record(p, RATE_BUDGET * 100, now);
+    }
+
+    /// A profile pinning the small test budget, in the given groups/grants.
+    fn budgeted_profile(
+        groups: &[&str],
+        grants: &[&str],
+    ) -> astrid_core::profile::PrincipalProfile {
+        let mut p = profile_with(groups, grants, &[]);
+        p.quotas.max_cpu_fuel_per_sec = RATE_BUDGET;
+        p
+    }
+
+    #[test]
+    fn rate_gate_bounded_principal_is_denied_when_over_budget() {
+        // A plain agent over its budget IS denied — the core enforcement.
+        let rl = crate::FuelRateLimiter::default();
+        let now = std::time::Instant::now();
+        let p = pid("alice");
+        let prof = budgeted_profile(&["agent"], &[]);
+        let g = builtin_groups();
+        saturate(&rl, &p, now);
+        let decision = cpu_rate_deny(&rl, Some(&prof), Some(&g), &p, now);
+        assert!(
+            decision.is_some(),
+            "a bounded principal over budget must be denied"
+        );
+        assert!(
+            decision.unwrap().contains("alice"),
+            "the deny reason must name the principal"
+        );
+    }
+
+    #[test]
+    fn rate_gate_self_heals_after_window_rolls() {
+        // Anti-brick guarantee, pinned on the PRODUCTION entry point: a bounded
+        // principal denied while over budget is ADMITTED again once its
+        // 1-second window rolls. A budget throttles; it never permanently
+        // bricks. Injected clock — no real sleep.
+        let rl = crate::FuelRateLimiter::default();
+        let t0 = std::time::Instant::now();
+        let p = pid("alice");
+        let prof = budgeted_profile(&["agent"], &[]);
+        let g = builtin_groups();
+        saturate(&rl, &p, t0);
+        assert!(
+            cpu_rate_deny(&rl, Some(&prof), Some(&g), &p, t0).is_some(),
+            "over budget at t0 -> denied"
+        );
+        let t1 = t0 + std::time::Duration::from_millis(1_001);
+        assert!(
+            cpu_rate_deny(&rl, Some(&prof), Some(&g), &p, t1).is_none(),
+            "after the 1s window rolls -> admitted again (no permanent brick)"
+        );
+    }
+
+    #[test]
+    fn rate_gate_exempt_principal_not_denied_even_over_budget() {
+        // system:resources:unbounded holder: NEVER denied, even pinned way over
+        // budget. Exemption short-circuits before the window is even consulted.
+        let rl = crate::FuelRateLimiter::default();
+        let now = std::time::Instant::now();
+        let p = pid("uplink");
+        let prof = budgeted_profile(&["agent"], &[astrid_core::CAP_RESOURCES_UNBOUNDED]);
+        let g = builtin_groups();
+        saturate(&rl, &p, now);
+        assert!(
+            cpu_rate_deny(&rl, Some(&prof), Some(&g), &p, now).is_none(),
+            "an exempt (unbounded) principal must never be CPU-rate denied"
+        );
+    }
+
+    #[test]
+    fn rate_gate_admin_with_group_config_is_never_gated() {
+        // Admin holds `*` => exempt via capability when group_config is present.
+        // Even saturated, admin is admitted.
+        let rl = crate::FuelRateLimiter::default();
+        let now = std::time::Instant::now();
+        let p = pid("default");
+        let prof = budgeted_profile(&["admin"], &[]);
+        let g = builtin_groups();
+        saturate(&rl, &p, now);
+        assert!(
+            cpu_rate_deny(&rl, Some(&prof), Some(&g), &p, now).is_none(),
+            "admin (`*`) with group_config must never be CPU-rate gated"
+        );
+    }
+
+    #[test]
+    fn rate_gate_missing_group_config_makes_admin_bounded() {
+        // Regression proving group_config is LOAD-BEARING: the SAME admin
+        // profile, but with group_config unthreaded (None), can no longer
+        // resolve its `*` exemption, so it fails CLOSED to bounded and — over
+        // budget — IS denied. If group_config were ignored this would wrongly
+        // admit.
+        let rl = crate::FuelRateLimiter::default();
+        let now = std::time::Instant::now();
+        let p = pid("default");
+        let prof = budgeted_profile(&["admin"], &[]);
+        saturate(&rl, &p, now);
+        assert!(
+            cpu_rate_deny(&rl, Some(&prof), None, &p, now).is_some(),
+            "missing group_config must fail-secure: admin becomes bounded and is denied over budget"
+        );
+    }
+
+    #[test]
+    fn rate_gate_zero_budget_is_unlimited() {
+        // budget == 0 => unlimited; a bounded principal saturated way past any
+        // finite budget is still admitted (must not become deny-all).
+        let rl = crate::FuelRateLimiter::default();
+        let now = std::time::Instant::now();
+        let p = pid("alice");
+        let mut prof = profile_with(&["agent"], &[], &[]);
+        prof.quotas.max_cpu_fuel_per_sec = 0;
+        let g = builtin_groups();
+        saturate(&rl, &p, now);
+        assert!(
+            cpu_rate_deny(&rl, Some(&prof), Some(&g), &p, now).is_none(),
+            "a zero (unlimited) budget must never deny, even when saturated"
+        );
+    }
+
+    #[test]
+    fn rate_gate_no_profile_uses_generous_default_budget() {
+        // No profile (tests / single-tenant) => DEFAULT_MAX_CPU_FUEL_PER_SEC,
+        // still enforced but generous: a principal under the default is
+        // admitted, and one driven past the default is denied. Proves the
+        // default is wired AND enforced.
+        let rl = crate::FuelRateLimiter::default();
+        let now = std::time::Instant::now();
+        let p = pid("anon");
+        let g = builtin_groups();
+        // Under the (very large) default: admitted.
+        rl.record(&p, 1_000, now);
+        assert!(
+            cpu_rate_deny(&rl, None, Some(&g), &p, now).is_none(),
+            "a principal under the default budget is admitted"
+        );
+        // Past the default: denied.
+        rl.record(&p, astrid_core::profile::DEFAULT_MAX_CPU_FUEL_PER_SEC, now);
+        assert!(
+            cpu_rate_deny(&rl, None, Some(&g), &p, now).is_some(),
+            "with no profile the generous DEFAULT budget is still enforced"
+        );
+    }
+
+    #[test]
+    fn rate_gate_deny_is_ok_deny_not_err() {
+        // The single most important regression: the gate's deny must surface as
+        // `Ok(InterceptResult::Deny { .. })`, NEVER `Err`. The dispatcher HALTS
+        // the chain on `Ok(Deny)` but CONTINUES on `Err` (see dispatcher.rs), so
+        // an `Err`-based deny would be a SILENT enforcement bypass. We mirror
+        // the call site's wrapping exactly and assert the result is the Deny
+        // variant carrying the reason.
+        let rl = crate::FuelRateLimiter::default();
+        let now = std::time::Instant::now();
+        let p = pid("alice");
+        let prof = budgeted_profile(&["agent"], &[]);
+        let g = builtin_groups();
+        saturate(&rl, &p, now);
+
+        let reason = cpu_rate_deny(&rl, Some(&prof), Some(&g), &p, now)
+            .expect("a saturated bounded principal must be denied");
+        // EXACTLY how invoke_interceptor wraps it.
+        let result: CapsuleResult<crate::capsule::InterceptResult> =
+            Ok(crate::capsule::InterceptResult::Deny { reason });
+
+        match result {
+            Ok(crate::capsule::InterceptResult::Deny { reason }) => {
+                assert!(reason.contains("alice"), "deny reason names the principal");
+            },
+            Ok(other) => panic!("deny must be InterceptResult::Deny, got {other:?}"),
+            Err(e) => panic!(
+                "deny must be Ok(Deny), NEVER Err — an Err-deny is a silent \
+                 enforcement bypass (dispatcher continues the chain on Err): {e}"
+            ),
+        }
     }
 
     // ── epoch_decision (the FIX 2 callback logic, directly) ──────────────
