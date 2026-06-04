@@ -95,6 +95,79 @@ pub(crate) fn set_idle_consumer_grace_for_test(ms: u64) {
 type ChainLocks =
     Arc<parking_lot::RwLock<HashMap<(CapsuleId, PrincipalKey), Arc<tokio::sync::Mutex<()>>>>>;
 
+/// RAII chain-lock lease that prunes its `ChainLocks` map entry on drop
+/// when it was the last referrer.
+///
+/// Without this, the map gains an entry per `(capsule, principal)` on first
+/// use and never sheds it — ephemeral recursive sub-agents (high principal
+/// churn) would grow it unboundedly, unlike `capsule_queues` which idle-evicts
+/// (Gemini #828). The acquire path stays race-safe: a concurrent acquirer that
+/// raced the removal simply re-inserts via `or_insert_with`, so a pruned-then-
+/// reused key costs one extra allocation, never a correctness loss.
+struct ChainLockGuard {
+    /// The held mutex guard. Dropped FIRST in [`Drop`] so the mutex is free
+    /// before we inspect the Arc's strong count.
+    ///
+    /// `Option` so `drop` can take it and release the lock explicitly before
+    /// taking the map's write lock.
+    guard: Option<tokio::sync::OwnedMutexGuard<()>>,
+    /// Our own clone of the per-key mutex `Arc`. With `guard` dropped, this is
+    /// the only referrer outside the map, so `strong_count == 2` (map + this)
+    /// proves no other chain task holds the lock and the entry can be pruned.
+    mutex: Arc<tokio::sync::Mutex<()>>,
+    chain_locks: ChainLocks,
+    key: (CapsuleId, PrincipalKey),
+}
+
+impl Drop for ChainLockGuard {
+    fn drop(&mut self) {
+        // Release the lock first so the strong-count check below sees only
+        // map + `self.mutex` referrers (the `OwnedMutexGuard` holds its own
+        // internal `Arc` clone, which must be gone before we count).
+        self.guard.take();
+        let mut write = self.chain_locks.write();
+        // Re-fetch under the write lock: a concurrent acquirer may have
+        // replaced the entry after a previous prune, so only remove the
+        // exact Arc we hold, and only when we are its last non-map referrer.
+        if let Some(entry) = write.get(&self.key)
+            && Arc::ptr_eq(entry, &self.mutex)
+            && Arc::strong_count(entry) == 2
+        {
+            write.remove(&self.key);
+        }
+    }
+}
+
+/// Acquire the per-(capsule, principal) chain lock, returning a guard that
+/// prunes the map entry on drop. Read-fast / write-on-miss: the common case
+/// is a hit on an existing lock.
+async fn acquire_chain_lock(
+    chain_locks: &ChainLocks,
+    key: (CapsuleId, PrincipalKey),
+) -> ChainLockGuard {
+    let mutex = {
+        let read = chain_locks.read();
+        if let Some(m) = read.get(&key) {
+            Arc::clone(m)
+        } else {
+            drop(read);
+            let mut write = chain_locks.write();
+            Arc::clone(
+                write
+                    .entry(key.clone())
+                    .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))),
+            )
+        }
+    };
+    let guard = Arc::clone(&mutex).lock_owned().await;
+    ChainLockGuard {
+        guard: Some(guard),
+        mutex,
+        chain_locks: Arc::clone(chain_locks),
+        key,
+    }
+}
+
 /// Shared map of per-(capsule, principal) dispatcher mpsc senders.
 /// Wrapped in `parking_lot::Mutex` so the consumer task can remove its
 /// own entry under the same lock that admits new principals — this
@@ -377,25 +450,11 @@ fn dispatch_to_capsule_queues(
             // SET/CALL/CLEAR window in wasm/mod.rs can never race a
             // sibling chain. Distinct principals on the same capsule
             // run concurrently — the orchestration cliff fix is
-            // per-principal, not per-class (#813 Layer 3).
+            // per-principal, not per-class (#813 Layer 3). The guard
+            // prunes its map entry on drop so the lock map stays bounded
+            // under high principal churn (#828).
             let chain_key = (capsule.id().clone(), principal_key.clone());
-            let chain_mutex = {
-                // Read-fast / write-on-miss: the common case is a hit
-                // on an existing lock.
-                let read = chain_locks_clone.read();
-                if let Some(m) = read.get(&chain_key) {
-                    Arc::clone(m)
-                } else {
-                    drop(read);
-                    let mut write = chain_locks_clone.write();
-                    Arc::clone(
-                        write
-                            .entry(chain_key.clone())
-                            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))),
-                    )
-                }
-            };
-            let _chain_guard = chain_mutex.lock().await;
+            let _chain_guard = acquire_chain_lock(&chain_locks_clone, chain_key).await;
 
             let caller = ipc_clone.as_deref();
             match capsule
@@ -599,12 +658,26 @@ async fn run_consumer(
                 return;
             },
             Err(_elapsed) => {
-                // Idle-evict. Take the map lock; if the channel is
-                // still empty (no race with a concurrent dispatch),
-                // remove our entry and exit. Otherwise loop and
-                // drain the racing event.
+                // Idle-evict — but only when it is provably safe to drop
+                // `rx`, i.e. no queued item AND no other live `Sender`.
+                //
+                // Holding the `queues` lock across the check stops a NEW
+                // `get_or_spawn_consumer` from cloning our sender, but it
+                // does NOT stop a `dispatch_single` that already cloned the
+                // sender (under an earlier lock acquisition) from calling
+                // `try_send` after we remove the entry and drop `rx`: that
+                // send would fail and the event would be lost silently
+                // (TOCTOU). `sender_strong_count` closes it — the map holds
+                // exactly one `Sender` for this key, so a count of 1 means
+                // the map's copy is the ONLY sender and no in-flight
+                // dispatch can still send. Any in-flight clone bumps the
+                // count to ≥2 and we keep running, so the racing `try_send`
+                // lands in `rx` and is drained next iteration. The clone's
+                // count drops back when that dispatch finishes, so a stale
+                // sender can delay eviction by at most one grace window —
+                // bounded, and it always errs toward NOT dropping events.
                 let mut guard = queues.lock();
-                if rx.try_recv().is_err() {
+                if rx.try_recv().is_err() && rx.sender_strong_count() == 1 {
                     guard.remove(&key);
                     drop(guard);
                     debug!(
@@ -613,9 +686,10 @@ async fn run_consumer(
                     );
                     return;
                 }
-                // Racing dispatch landed between the timeout and the
-                // map-lock acquisition — keep running. The map entry
-                // stays valid.
+                // Either a racing dispatch landed between the timeout and
+                // the map-lock acquisition, or an in-flight dispatch still
+                // holds a sender clone that may `try_send` — keep running.
+                // The map entry stays valid.
                 drop(guard);
             },
         }

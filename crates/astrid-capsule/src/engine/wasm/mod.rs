@@ -1338,7 +1338,18 @@ impl ExecutionEngine for WasmEngine {
                 store_arc = Some(Arc::new(AsyncMutex::new(pi.store)));
                 run_instance = Some(pi.instance);
             } else {
-                pool_opt = Some(pool::CapsuleInstancePool::new(pooled));
+                // Free-checkout pools tear down each returned instance's
+                // resource table so a cancelled/panicked invocation can't leak
+                // a live handle into the next (possibly different-principal)
+                // lease. The `host_process` carve-out (size 1) is the sole
+                // exception: it holds `ManagedProcess` handles across
+                // invocations, and never leases a second Store, so its table
+                // must persist. See `pool::clear_on_return`.
+                let reset_resources_on_return = manifest.capabilities.host_process.is_empty();
+                pool_opt = Some(pool::CapsuleInstancePool::new(
+                    pooled,
+                    reset_resources_on_return,
+                ));
             }
 
             // Only allocate the watch channel for run-loop capsules.

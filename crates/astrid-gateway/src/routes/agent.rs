@@ -154,15 +154,17 @@ pub async fn post_prompt(
     // stream gets its own per-(topic, principal) DRR queue inside
     // the bus, replacing the broadcast-channel back-pressure that
     // collapsed the 100-principal fan-in (#813 Layer 4).
-    // Per-connection routing identity. Sharing one
-    // `state.gateway_route_uuid` across every concurrent SSE connection
-    // made them all drain a single routed queue, so concurrent prompts
-    // *competed* for `agent.v1.response`: each event was consumed by
-    // whichever connection recv'd first and dropped (wrong session) if
-    // that wasn't its target, collapsing concurrent response delivery to
-    // ~1 per batch regardless of N (astrid#813 layer 4). A fresh rep per
-    // connection gives each its own routed queue, so every connection
-    // sees every response and forwards its own (filtered by session_id).
+    //
+    // Per-connection routing isolation is provided by the bus, not by
+    // this UUID: `subscribe_topic_routed` stamps every subscribe call
+    // with a fresh `subscription_rep` (monotonic allocator), so the
+    // resulting `RouteKey` is distinct per call even when the
+    // `capsule_uuid` argument is shared. Each connection therefore drains
+    // its own routed queue and sees every response (forwarding only its
+    // own, filtered by session_id) regardless of what UUID is passed
+    // here. A per-connection `Uuid::new_v4()` only relabels this
+    // connection's routes; the audit-firehose route (`events.rs`) shares
+    // the single `state.gateway_route_uuid` and is just as isolated.
     let conn_route_uuid = Uuid::new_v4();
     let subscribe = |topic: &'static str| {
         bus.subscribe_topic_routed(conn_route_uuid, topic, "gateway", "gateway::agent_sse")

@@ -755,3 +755,73 @@ async fn dispatcher_idle_evicts_per_principal_consumers_after_grace() {
 
     handle.abort();
 }
+
+// ── Chain-lock map bounding (#828) ──────────────────────────────
+
+#[tokio::test]
+async fn chain_lock_prunes_entry_when_last_referrer_drops() {
+    // Each distinct (capsule, principal) chain key inserts a mutex on
+    // first use. Without RAII pruning the map grows one entry per
+    // principal forever (ephemeral sub-agent churn). Acquire+drop a lock
+    // for many distinct principals and assert the map sheds every entry.
+    let chain_locks: ChainLocks = Arc::new(parking_lot::RwLock::new(HashMap::new()));
+    let cap = CapsuleId::from_static("chainmap-cap");
+
+    for i in 0..256 {
+        let key = (cap.clone(), Some(format!("user-{i}")));
+        let guard = acquire_chain_lock(&chain_locks, key).await;
+        // While the guard is alive the entry exists.
+        assert_eq!(chain_locks.read().len(), 1, "entry present while held");
+        drop(guard);
+        // Dropping the sole referrer prunes it.
+        assert!(
+            chain_locks.read().is_empty(),
+            "map must shed the entry once the last referrer drops"
+        );
+    }
+
+    assert!(
+        chain_locks.read().is_empty(),
+        "chain_locks must not retain one entry per principal"
+    );
+}
+
+#[tokio::test]
+async fn chain_lock_retained_while_another_holder_exists() {
+    // Two acquirers of the SAME key share one map entry; the entry
+    // survives until BOTH guards drop. This proves the prune only fires
+    // for the last referrer — a held sibling chain is never stranded
+    // without its serialization mutex.
+    let chain_locks: ChainLocks = Arc::new(parking_lot::RwLock::new(HashMap::new()));
+    let cap = CapsuleId::from_static("shared-cap");
+    let key = (cap.clone(), Some("alice".to_string()));
+
+    let g1 = acquire_chain_lock(&chain_locks, key.clone()).await;
+    assert_eq!(chain_locks.read().len(), 1);
+
+    // A second acquirer for the same key blocks on the mutex (g1 holds
+    // it). Acquire it on a task; it shares the same map Arc, so the
+    // entry must NOT be pruned while g1 lives.
+    let cl = Arc::clone(&chain_locks);
+    let k2 = key.clone();
+    let task = tokio::spawn(async move {
+        let g2 = acquire_chain_lock(&cl, k2).await;
+        tokio::task::yield_now().await;
+        drop(g2);
+    });
+
+    // g1 still alive → entry present regardless of the racing acquirer.
+    assert_eq!(
+        chain_locks.read().len(),
+        1,
+        "entry must persist while g1 holds it"
+    );
+    drop(g1);
+    task.await.unwrap();
+
+    // Both guards gone → entry pruned.
+    assert!(
+        chain_locks.read().is_empty(),
+        "entry pruned once both holders drop"
+    );
+}
