@@ -60,13 +60,19 @@ pub(super) fn quota_get(kernel: &Arc<crate::Kernel>, principal: &PrincipalId) ->
 
 /// Read a principal's resource usage vs budget.
 ///
-/// CONTRACT STUB (PR3 fills the live fields). Today it resolves the principal's
-/// configured ceilings and returns them with `cpu_fuel_consumed_total = 0`,
-/// `exempt = false`, and no current memory — placeholders the read-path PR
-/// replaces with the shared fuel-ledger total and a capability-based exempt
-/// check. The request routing, scope (`self:quota:get` / `quota:get`), and
-/// response shape are real now so the gateway + CLI surfaces can build against
-/// them in parallel.
+/// Returns the principal's live cross-capsule CPU total (summed by the shared
+/// [`FuelLedger`](astrid_capsule::FuelLedger)), its configured ceilings, and
+/// whether it is exempt from the per-principal CPU+memory bound.
+///
+/// **Displayed-exempt MUST equal enforced-exempt.** The enforcement side
+/// (PR2, `astrid_capsule::engine::wasm::resolve_exemption`) decides exemption
+/// with `CapabilityCheck::has` over the shared
+/// [`EXEMPT_CAPABILITIES`](astrid_core::EXEMPT_CAPABILITIES) list. This read
+/// path recomputes the *same* predicate over the *same* list with the kernel's
+/// own profile + group snapshot — decoupled from the enforcement branch but
+/// guaranteed to yield the identical answer because both iterate one source of
+/// truth. admin holds all of them via the `*` grant, so an admin principal
+/// reports `exempt = true`.
 pub(super) fn usage_get(kernel: &Arc<crate::Kernel>, principal: &PrincipalId) -> AdminResponseBody {
     // Same "no such principal" guard as quota_get — a typo'd name must not
     // silently report Default-shaped ceilings.
@@ -75,19 +81,41 @@ pub(super) fn usage_get(kernel: &Arc<crate::Kernel>, principal: &PrincipalId) ->
         return err_bad_input(msg);
     }
     match kernel.profile_cache.resolve(principal) {
-        Ok(profile) => AdminResponseBody::Usage(ResourceUsage {
-            principal: principal.clone(),
-            // TODO(PR3 feat/resource-usage-readpath): read the cross-capsule
-            // total from kernel.fuel_ledger.
-            cpu_fuel_consumed_total: 0,
-            cpu_fuel_per_sec_limit: profile.quotas.max_cpu_fuel_per_sec,
-            // TODO(PR3): resolve via the capability check
-            // (system:resources:unbounded / net_bind / uplink).
-            exempt: false,
-            memory_bytes_limit_per_instance: profile.quotas.max_memory_bytes,
-            // Per-principal aggregate RAM is not implemented.
-            memory_bytes_current_total: None,
-        }),
+        Ok(profile) => {
+            let exempt = principal_is_exempt(kernel, principal, &profile);
+            AdminResponseBody::Usage(ResourceUsage {
+                principal: principal.clone(),
+                cpu_fuel_consumed_total: kernel.fuel_ledger.total(principal),
+                cpu_fuel_per_sec_limit: profile.quotas.max_cpu_fuel_per_sec,
+                exempt,
+                memory_bytes_limit_per_instance: profile.quotas.max_memory_bytes,
+                // Per-principal aggregate RAM is not implemented.
+                memory_bytes_current_total: None,
+            })
+        },
         Err(e) => err_profile(principal, &e),
     }
+}
+
+/// Does `principal` hold any capability that exempts it from the per-principal
+/// CPU+memory bound?
+///
+/// This is the *read-path* mirror of the enforcement predicate
+/// `astrid_capsule::engine::wasm::resolve_exemption`: it must return the same
+/// answer so displayed-exempt == enforced-exempt. Both iterate the single
+/// shared [`EXEMPT_CAPABILITIES`](astrid_core::EXEMPT_CAPABILITIES) list and ask
+/// [`CapabilityCheck::has`] with the capability grammar's precedence (revokes >
+/// grants > group-inherited) and wildcard semantics, so an admin holder of `*`
+/// matches all of them and the two sides cannot drift.
+fn principal_is_exempt(
+    kernel: &Arc<crate::Kernel>,
+    principal: &PrincipalId,
+    profile: &PrincipalProfile,
+) -> bool {
+    let groups = kernel.groups.load_full();
+    let check =
+        astrid_capabilities::CapabilityCheck::new(profile, groups.as_ref(), principal.clone());
+    astrid_core::EXEMPT_CAPABILITIES
+        .iter()
+        .any(|&cap| check.has(cap))
 }

@@ -34,6 +34,8 @@ mod state_tests_agent_modify;
 #[cfg(test)]
 mod state_tests_caps;
 #[cfg(test)]
+mod state_tests_usage;
+#[cfg(test)]
 mod tests;
 
 use std::sync::Arc;

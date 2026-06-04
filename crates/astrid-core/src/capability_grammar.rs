@@ -72,6 +72,19 @@ pub const CAP_NET_BIND: &str = "net_bind";
 /// `uplink` does NOT confer it.
 pub const CAP_UPLINK: &str = "uplink";
 
+/// The capabilities that exempt a principal from the per-principal CPU+memory
+/// bound — the single source of truth shared by every site that decides
+/// exemption.
+///
+/// A principal is exempt iff it holds ANY of these (admin matches all three via
+/// `*`). Both the enforcement path
+/// (`astrid_capsule::engine::wasm::resolve_exemption`) and the read path
+/// (`astrid quota`'s usage report) iterate this array, so displayed-exempt can
+/// never drift from enforced-exempt — adding or removing an exemption is a
+/// one-line edit here, reflected on both sides. The default for a holder of
+/// none is **bounded** (fail-secure).
+pub const EXEMPT_CAPABILITIES: [&str; 3] = [CAP_RESOURCES_UNBOUNDED, CAP_NET_BIND, CAP_UPLINK];
+
 /// Errors raised by [`validate_capability`].
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum CapabilityGrammarError {

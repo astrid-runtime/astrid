@@ -443,13 +443,17 @@ pub(crate) struct RunLoopBudget {
 ///
 /// Exemption is purely **capability-driven**, resolved through the permission
 /// system (groups → grants → revokes) against the owner principal's profile:
-/// a holder of any of [`CAP_RESOURCES_UNBOUNDED`](
-/// astrid_core::CAP_RESOURCES_UNBOUNDED), [`CAP_NET_BIND`](
-/// astrid_core::CAP_NET_BIND) or [`CAP_UPLINK`](astrid_core::CAP_UPLINK) is
-/// exempt. admin holds all three via `*`, with no special-case group-name
-/// match. The capsule-authored manifest (`is_daemon` / `net_bind` /
-/// `uplink`) plays **no** part — a capsule cannot self-exempt: it chooses
-/// neither its load principal nor its operator-owned profile capabilities.
+/// a holder of any capability in the shared
+/// [`EXEMPT_CAPABILITIES`](astrid_core::EXEMPT_CAPABILITIES) list
+/// ([`CAP_RESOURCES_UNBOUNDED`](astrid_core::CAP_RESOURCES_UNBOUNDED),
+/// [`CAP_NET_BIND`](astrid_core::CAP_NET_BIND),
+/// [`CAP_UPLINK`](astrid_core::CAP_UPLINK)) is exempt. admin holds all of them
+/// via `*`, with no special-case group-name match. The kernel's read-path
+/// mirror (`astrid quota`'s usage report) iterates the same list, so the
+/// enforced and displayed answers cannot drift. The capsule-authored manifest
+/// (`is_daemon` / `net_bind` / `uplink`) plays **no** part — a capsule cannot
+/// self-exempt: it chooses neither its load principal nor its operator-owned
+/// profile capabilities.
 ///
 /// FAIL-SECURE: any missing input (no profile, no group config) → `false`
 /// (bounded), never exempt. No I/O, no locking — the caller resolves the
@@ -466,9 +470,9 @@ pub(crate) fn resolve_exemption(
         return false;
     };
     let check = astrid_capabilities::CapabilityCheck::new(profile, groups, principal.clone());
-    check.has(astrid_core::CAP_RESOURCES_UNBOUNDED)
-        || check.has(astrid_core::CAP_NET_BIND)
-        || check.has(astrid_core::CAP_UPLINK)
+    astrid_core::EXEMPT_CAPABILITIES
+        .iter()
+        .any(|&cap| check.has(cap))
 }
 
 /// The per-principal CPU-rate DENY decision, factored out of
