@@ -48,11 +48,12 @@ use astrid_uplink::SocketClient;
 use clap::Parser;
 use serde_json::{Value, json};
 
-/// The fixed stdout line written on every code path — success and
-/// failure alike. An agent hook process reads this to decide whether to
-/// proceed; `astrid-emit` always says "continue" because it is a pipe,
-/// not a gate. The verdict (if any) is sage's job, delivered out of
-/// band on the bus.
+/// The fixed stdout line written on every hook-invocation code path —
+/// success and failure alike. (The exceptions are `--help` / `--version`,
+/// which clap handles and exits before any hook logic runs.) An agent
+/// hook process reads this to decide whether to proceed; `astrid-emit`
+/// always says "continue" because it is a pipe, not a gate. The verdict
+/// (if any) is sage's job, delivered out of band on the bus.
 const CONTINUE_LINE: &str = "{\"continue\":true}";
 
 /// Command-line surface for `astrid-emit`.
@@ -307,8 +308,12 @@ fn read_stdin_lossy() -> String {
     let mut buf = Vec::new();
     // A read error here is treated as "no/partial stdin" — the agent
     // hook process may have closed early. We still publish what we have
-    // and continue, never fail closed.
-    let _ = std::io::stdin().read_to_end(&mut buf);
+    // and continue, never fail closed. Cap the read at 10 MiB so a large
+    // or unbounded pipe cannot OOM the process: hook payloads are small
+    // JSON blobs, so anything approaching this is pathological.
+    let _ = std::io::stdin()
+        .take(10 * 1024 * 1024)
+        .read_to_end(&mut buf);
     String::from_utf8_lossy(&buf).into_owned()
 }
 
