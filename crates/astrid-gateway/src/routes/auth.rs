@@ -78,7 +78,8 @@ pub struct MeResponse {
         (status = 200, body = RedeemResponse, description = "New principal minted; session bearer attached."),
         (status = 400, body = ErrorBody, description = "Malformed token / public key."),
         (status = 429, body = ErrorBody, description = "Per-IP rate limit hit; respect `retry_after_secs`."),
-        (status = 500, body = ErrorBody, description = "Kernel rejected the redeem or upstream is unreachable."),
+        (status = 500, body = ErrorBody, description = "Upstream daemon unreachable or an unexpected response shape."),
+        (status = 502, body = ErrorBody, description = "Kernel rejected the redeem (e.g. invalid / expired / consumed token)."),
     )
 )]
 pub async fn post_redeem(
@@ -102,7 +103,15 @@ pub async fn post_redeem(
         let mut limiter = state.redeem_limiter.lock().await;
         if let Some(wait) = limiter.check(client_ip, interval) {
             return Err(GatewayError::RateLimited {
-                retry_after_secs: wait.as_secs().max(1),
+                // Round UP: a strict client that honours `Retry-After`
+                // must not retry before the window actually elapses (e.g.
+                // 4.5s remaining → 5, not 4). `.max(1)` keeps a positive
+                // floor since the limiter only returns `Some(wait)` while
+                // backing off.
+                retry_after_secs: wait
+                    .as_secs()
+                    .saturating_add(u64::from(wait.subsec_nanos() > 0))
+                    .max(1),
             });
         }
     }
@@ -279,13 +288,48 @@ pub async fn post_pair_device_issue(
     responses(
         (status = 200, body = PairDeviceRedeemResponse, description = "Device's key registered; session bearer attached."),
         (status = 400, body = ErrorBody, description = "Malformed token / public key."),
-        (status = 500, body = ErrorBody, description = "Kernel rejected the redeem or upstream is unreachable."),
+        (status = 429, body = ErrorBody, description = "Per-IP rate limit hit; respect `retry_after_secs`."),
+        (status = 500, body = ErrorBody, description = "Upstream daemon unreachable or an unexpected response shape."),
+        (status = 502, body = ErrorBody, description = "Kernel rejected the redeem (e.g. invalid / expired / consumed token)."),
     )
 )]
 pub async fn post_pair_device_redeem(
     State(state): State<Arc<GatewayState>>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    headers: axum::http::HeaderMap,
     Json(body): Json<PairDeviceRedeemRequest>,
 ) -> GatewayResult<Json<PairDeviceRedeemResponse>> {
+    // Rate-limit per source IP, exactly like `post_redeem`. This is
+    // the ONLY brute-force fence in front of the kernel's
+    // constant-time pair-token scan: the route is public/unauthenticated
+    // and the token is the auth, so without this an attacker could
+    // enumerate pair-tokens as fast as the network allows.
+    //
+    // We deliberately share `redeem_limiter` (not a second limiter) so
+    // the per-IP budget is spent across BOTH unauthenticated redeem
+    // routes — an attacker cannot dodge the throttle by alternating
+    // `/api/auth/redeem` and `/api/auth/pair-device/redeem`.
+    // `resolve_client_ip` honours `X-Forwarded-For` only behind a
+    // configured trusted proxy.
+    let client_ip = resolve_client_ip(&state, peer.ip(), &headers);
+    let interval = state.config.redeem_rate_limit();
+    if !interval.is_zero() {
+        let mut limiter = state.redeem_limiter.lock().await;
+        if let Some(wait) = limiter.check(client_ip, interval) {
+            return Err(GatewayError::RateLimited {
+                // Round UP: a strict client that honours `Retry-After`
+                // must not retry before the window actually elapses (e.g.
+                // 4.5s remaining → 5, not 4). `.max(1)` keeps a positive
+                // floor since the limiter only returns `Some(wait)` while
+                // backing off.
+                retry_after_secs: wait
+                    .as_secs()
+                    .saturating_add(u64::from(wait.subsec_nanos() > 0))
+                    .max(1),
+            });
+        }
+    }
+
     // Same trust posture as invite-redeem: connect as the bootstrap
     // default principal (the gateway has system.token access), let
     // the kernel's special-cased dispatcher verify the token.

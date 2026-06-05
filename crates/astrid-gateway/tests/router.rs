@@ -487,3 +487,50 @@ async fn metrics_endpoint_decomposes_request_by_status_and_records_latency() {
         "missing +Inf bucket; body was:\n{text}"
     );
 }
+
+#[tokio::test]
+async fn pair_device_redeem_is_rate_limited_per_ip() {
+    // The unauthenticated `/api/auth/pair-device/redeem` route must
+    // share the same per-IP redeem throttle as `/api/auth/redeem` —
+    // otherwise pair-tokens are brute-forceable as fast as the network
+    // allows. We pre-seed the shared limiter for one IP, then fire a
+    // single pair-redeem from that IP: it must be rejected with 429
+    // BEFORE the handler ever reaches the (absent) daemon.
+    use std::net::{IpAddr, SocketAddr};
+
+    let state = fresh_state_with_distro(None);
+    let ip = IpAddr::from([203, 0, 113, 7]);
+
+    // First probe is free and records the timestamp; the next attempt
+    // from this IP within the interval must back off.
+    {
+        let mut limiter = state.redeem_limiter.lock().await;
+        assert!(
+            limiter
+                .check(ip, state.config.redeem_rate_limit())
+                .is_none(),
+            "first probe for a fresh IP must be allowed"
+        );
+    }
+
+    let router = routes::build(state);
+    let mut req = Request::builder()
+        .method("POST")
+        .uri("/api/auth/pair-device/redeem")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(
+            r#"{"token":"deadbeef","public_key":"ed25519:00"}"#,
+        ))
+        .unwrap();
+    // `oneshot` doesn't run the connect-info layer, so inject the peer
+    // the `ConnectInfo<SocketAddr>` extractor reads.
+    req.extensions_mut()
+        .insert(axum::extract::ConnectInfo(SocketAddr::new(ip, 40000)));
+
+    let resp = router.oneshot(req).await.unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::TOO_MANY_REQUESTS,
+        "pair-device/redeem must enforce the shared per-IP redeem limiter"
+    );
+}
