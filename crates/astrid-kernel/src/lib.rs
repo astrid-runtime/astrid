@@ -114,6 +114,12 @@ pub struct Kernel {
     /// 1-second window is denied at interceptor entry, cross-capsule. See
     /// [`FuelRateLimiter`](astrid_capsule::FuelRateLimiter).
     fuel_rate: astrid_capsule::FuelRateLimiter,
+    /// Host-derived (operator-overridable) concurrency ceilings for capsule
+    /// host calls, resolved once by the daemon and forwarded to every
+    /// `WasmEngine` via the loader. The kernel only stores and forwards this
+    /// `Copy` value — no resolution logic lives here. See
+    /// [`CapsuleRuntimeLimits`](astrid_capsule::CapsuleRuntimeLimits).
+    runtime_limits: astrid_capsule::CapsuleRuntimeLimits,
     /// Ephemeral mode: shut down immediately when the last client disconnects.
     pub ephemeral: AtomicBool,
     /// Instant when the kernel was booted (for uptime calculation).
@@ -174,6 +180,12 @@ pub struct Kernel {
 impl Kernel {
     /// Boot a new Kernel instance mounted at the specified directory.
     ///
+    /// `runtime_limits` is the resolved per-host capsule concurrency ceiling
+    /// pair (blocking vs async-I/O host calls); the daemon resolves it from
+    /// config + CLI + host defaults and the kernel forwards it, unmodified, to
+    /// every capsule's `WasmEngine`. Tests pass
+    /// [`CapsuleRuntimeLimits::default()`](astrid_capsule::CapsuleRuntimeLimits::default).
+    ///
     /// # Panics
     ///
     /// Panics if called on a single-threaded tokio runtime. The capsule
@@ -189,6 +201,7 @@ impl Kernel {
     pub async fn new(
         session_id: SessionId,
         workspace_root: PathBuf,
+        runtime_limits: astrid_capsule::CapsuleRuntimeLimits,
     ) -> Result<Arc<Self>, std::io::Error> {
         use astrid_core::dirs::AstridHome;
 
@@ -323,6 +336,7 @@ impl Kernel {
             active_connections: DashMap::new(),
             fuel_ledger: astrid_capsule::FuelLedger::default(),
             fuel_rate: astrid_capsule::FuelRateLimiter::default(),
+            runtime_limits,
             ephemeral: AtomicBool::new(false),
             boot_time: std::time::Instant::now(),
             shutdown_tx: tokio::sync::watch::channel(false).0,
@@ -387,6 +401,7 @@ impl Kernel {
             self.mcp.clone(),
             self.fuel_ledger.clone(),
             self.fuel_rate.clone(),
+            self.runtime_limits,
         );
         let mut capsule = loader.create_capsule(manifest, dir.clone())?;
 
@@ -1008,6 +1023,7 @@ pub(crate) async fn test_kernel_with_home(home: astrid_core::dirs::AstridHome) -
         active_connections: DashMap::new(),
         fuel_ledger: astrid_capsule::FuelLedger::default(),
         fuel_rate: astrid_capsule::FuelRateLimiter::default(),
+        runtime_limits: astrid_capsule::CapsuleRuntimeLimits::default(),
         ephemeral: AtomicBool::new(false),
         boot_time: std::time::Instant::now(),
         shutdown_tx: tokio::sync::watch::channel(false).0,

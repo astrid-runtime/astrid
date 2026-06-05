@@ -418,6 +418,26 @@ max_depth = 3
 timeout_secs = 300
 
 # ============================================================================
+# Capsule Runtime
+# ============================================================================
+# Concurrency ceilings for capsule host calls. Both keys are commented out on
+# purpose: when unset the daemon derives them from the host at boot (CPU cores
+# for blocking calls, the file-descriptor limit for async-I/O calls). Uncomment
+# to pin an explicit value. Precedence: CLI flag > this file > ASTRID_CAPSULE_*
+# env > host-derived default.
+
+[capsule]
+# Max concurrent BLOCKING host calls (KV, fs, identity, sys, sockets, the
+# net/process security gates). These pin a tokio worker, so keep this near the
+# core count. Host default ≈ cores - 2.
+# host_blocking_concurrency = 6
+
+# Max concurrent ASYNC-I/O host calls (HTTP, ipc::recv) — calls that .await real
+# I/O and free the worker. This is the outbound-throughput gate the LLM path
+# rides on. Host default is cores-scaled and clamped by half the fd limit.
+# host_io_concurrency = 512
+
+# ============================================================================
 # Spark (Agent Identity)
 # ============================================================================
 # Static seed for the agent's identity. These values are used as a fallback

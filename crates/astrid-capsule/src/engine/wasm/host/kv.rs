@@ -28,7 +28,7 @@ fn store_err(op: &str, msg: impl std::fmt::Display) -> ErrorCode {
 impl kv::Host for HostState {
     fn kv_get(&mut self, key: String) -> Result<Option<Vec<u8>>, ErrorCode> {
         let kv = self.effective_kv().clone();
-        util::bounded_block_on(&self.runtime_handle, &self.host_semaphore, async {
+        util::bounded_block_on(&self.runtime_handle, &self.blocking_semaphore, async {
             kv.get(&key).await
         })
         .map_err(|e| store_err("kv_get", e))
@@ -36,7 +36,7 @@ impl kv::Host for HostState {
 
     fn kv_set(&mut self, key: String, value: Vec<u8>) -> Result<(), ErrorCode> {
         let kv = self.effective_kv().clone();
-        util::bounded_block_on(&self.runtime_handle, &self.host_semaphore, async {
+        util::bounded_block_on(&self.runtime_handle, &self.blocking_semaphore, async {
             kv.set(&key, value).await
         })
         .map_err(|e| store_err("kv_set", e))
@@ -44,7 +44,7 @@ impl kv::Host for HostState {
 
     fn kv_delete(&mut self, key: String) -> Result<(), ErrorCode> {
         let kv = self.effective_kv().clone();
-        util::bounded_block_on(&self.runtime_handle, &self.host_semaphore, async {
+        util::bounded_block_on(&self.runtime_handle, &self.blocking_semaphore, async {
             kv.delete(&key).await
         })
         .map(|_| ())
@@ -53,7 +53,7 @@ impl kv::Host for HostState {
 
     fn kv_list_keys(&mut self, prefix: String) -> Result<Vec<String>, ErrorCode> {
         let kv = self.effective_kv().clone();
-        let keys = util::bounded_block_on(&self.runtime_handle, &self.host_semaphore, async {
+        let keys = util::bounded_block_on(&self.runtime_handle, &self.blocking_semaphore, async {
             kv.list_keys_with_prefix(&prefix).await
         })
         .map_err(|e| store_err("kv_list_keys", e))?;
@@ -74,10 +74,11 @@ impl kv::Host for HostState {
         // the store backend has a 1024-key cap; revisit if a capsule
         // legitimately needs unbounded paging.
         let kv = self.effective_kv().clone();
-        let mut keys = util::bounded_block_on(&self.runtime_handle, &self.host_semaphore, async {
-            kv.list_keys_with_prefix(&prefix).await
-        })
-        .map_err(|e| store_err("kv_list_keys_page", e))?;
+        let mut keys =
+            util::bounded_block_on(&self.runtime_handle, &self.blocking_semaphore, async {
+                kv.list_keys_with_prefix(&prefix).await
+            })
+            .map_err(|e| store_err("kv_list_keys_page", e))?;
         keys.sort();
         let limit = if limit == 0 { 1024 } else { limit.min(1024) } as usize;
         let start = cursor
@@ -99,7 +100,7 @@ impl kv::Host for HostState {
 
     fn kv_clear_prefix(&mut self, prefix: String) -> Result<u64, ErrorCode> {
         let kv = self.effective_kv().clone();
-        util::bounded_block_on(&self.runtime_handle, &self.host_semaphore, async {
+        util::bounded_block_on(&self.runtime_handle, &self.blocking_semaphore, async {
             kv.clear_prefix(&prefix).await
         })
         .map_err(|e| store_err("kv_clear_prefix", e))
@@ -124,7 +125,7 @@ impl kv::Host for HostState {
         // `Err(CasMismatch)` for the routine lost-race retry and use
         // `?` for everything else.
         let kv = self.effective_kv().clone();
-        util::bounded_block_on(&self.runtime_handle, &self.host_semaphore, async {
+        util::bounded_block_on(&self.runtime_handle, &self.blocking_semaphore, async {
             match kv.compare_and_swap(&key, expected.as_deref(), new).await {
                 Ok(true) => Ok(()),
                 Ok(false) => Err(ErrorCode::CasMismatch),

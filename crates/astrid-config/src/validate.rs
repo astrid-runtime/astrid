@@ -23,6 +23,7 @@ pub fn validate(config: &Config) -> ConfigResult<()> {
     validate_timeouts(config)?;
     validate_logging(config)?;
     validate_subagents(config)?;
+    validate_capsule(config)?;
     validate_retry(config)?;
     Ok(())
 }
@@ -279,6 +280,29 @@ fn validate_subagents(config: &Config) -> ConfigResult<()> {
     Ok(())
 }
 
+fn validate_capsule(config: &Config) -> ConfigResult<()> {
+    let c = &config.capsule;
+
+    // `None` means host-derived; only an explicit override can be invalid. A
+    // zero ceiling would wedge every host call of that class, so reject it here
+    // rather than silently clamp.
+    if c.host_blocking_concurrency == Some(0) {
+        return Err(ConfigError::ValidationError {
+            field: "capsule.host_blocking_concurrency".to_owned(),
+            message: "host_blocking_concurrency must be greater than 0".to_owned(),
+        });
+    }
+
+    if c.host_io_concurrency == Some(0) {
+        return Err(ConfigError::ValidationError {
+            field: "capsule.host_io_concurrency".to_owned(),
+            message: "host_io_concurrency must be greater than 0".to_owned(),
+        });
+    }
+
+    Ok(())
+}
+
 fn validate_retry(config: &Config) -> ConfigResult<()> {
     let r = &config.retry;
 
@@ -357,6 +381,47 @@ mod tests {
         let mut config = Config::default();
         config.budget.per_action_max_usd = 200.0;
         assert!(validate(&config).is_err());
+    }
+
+    #[test]
+    fn test_capsule_none_is_valid() {
+        // Default (all `None` → host-derived) must pass validation.
+        let config = Config::default();
+        assert!(config.capsule.host_blocking_concurrency.is_none());
+        assert!(config.capsule.host_io_concurrency.is_none());
+        assert!(validate(&config).is_ok());
+    }
+
+    #[test]
+    fn test_capsule_positive_override_is_valid() {
+        let mut config = Config::default();
+        config.capsule.host_blocking_concurrency = Some(4);
+        config.capsule.host_io_concurrency = Some(256);
+        assert!(validate(&config).is_ok());
+    }
+
+    #[test]
+    fn test_capsule_zero_blocking_rejected() {
+        let mut config = Config::default();
+        config.capsule.host_blocking_concurrency = Some(0);
+        let err = validate(&config).unwrap_err();
+        assert!(matches!(
+            err,
+            ConfigError::ValidationError { field, .. }
+                if field == "capsule.host_blocking_concurrency"
+        ));
+    }
+
+    #[test]
+    fn test_capsule_zero_io_rejected() {
+        let mut config = Config::default();
+        config.capsule.host_io_concurrency = Some(0);
+        let err = validate(&config).unwrap_err();
+        assert!(matches!(
+            err,
+            ConfigError::ValidationError { field, .. }
+                if field == "capsule.host_io_concurrency"
+        ));
     }
 
     #[test]

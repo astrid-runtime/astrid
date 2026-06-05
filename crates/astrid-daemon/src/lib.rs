@@ -33,15 +33,22 @@ pub struct Args {
     /// Enable verbose logging
     #[arg(short, long)]
     pub verbose: bool,
+
+    /// Override the async-I/O host-call concurrency ceiling for capsules
+    /// (HTTP, `ipc::recv`). Highest-precedence override; defaults to a
+    /// host-derived value (cores-scaled, file-descriptor-clamped).
+    #[arg(long)]
+    pub host_io_concurrency: Option<usize>,
+
+    /// Override the blocking host-call concurrency ceiling for capsules (KV,
+    /// fs, identity, sys, sockets). Highest-precedence override; defaults to a
+    /// host-derived value (≈ cores - 2).
+    #[arg(long)]
+    pub host_blocking_concurrency: Option<usize>,
 }
 
-fn init_logging(verbose: bool) {
-    let workspace_root = std::env::current_dir().ok();
-    let unified_cfg = astrid_config::Config::load(workspace_root.as_deref())
-        .ok()
-        .map(|r| r.config);
-
-    let log_config = if let Some(cfg) = &unified_cfg {
+fn init_logging(verbose: bool, unified_cfg: Option<&astrid_config::Config>) {
+    let log_config = if let Some(cfg) = unified_cfg {
         let mut lc = astrid_telemetry::log_config_from(cfg);
         if verbose {
             "debug".clone_into(&mut lc.level);
@@ -65,6 +72,22 @@ fn init_logging(verbose: bool) {
     }
 }
 
+/// Resolve the capsule host-call concurrency ceilings from CLI flags, the
+/// loaded config (which already folded in `ASTRID_CAPSULE_*` env), and the
+/// host-derived defaults. Precedence: CLI flag > config file > env > host.
+fn resolve_capsule_limits(
+    args: &Args,
+    cfg: Option<&astrid_config::Config>,
+) -> astrid_capsule::CapsuleRuntimeLimits {
+    let capsule_cfg = cfg.map(|c| &c.capsule);
+    astrid_capsule::CapsuleRuntimeLimits::resolve(
+        args.host_blocking_concurrency
+            .or_else(|| capsule_cfg.and_then(|c| c.host_blocking_concurrency)),
+        args.host_io_concurrency
+            .or_else(|| capsule_cfg.and_then(|c| c.host_io_concurrency)),
+    )
+}
+
 /// Run the Astrid daemon with the given arguments.
 ///
 /// This is the shared entry point used by both the standalone `astrid-daemon`
@@ -77,18 +100,31 @@ fn init_logging(verbose: bool) {
 pub async fn run() -> Result<()> {
     let args = Args::parse();
 
-    init_logging(args.verbose);
+    // Load the unified config once: it drives both logging and the capsule
+    // runtime concurrency ceilings below. Loaded against the current dir (as
+    // logging always did), independent of `--workspace`.
+    let workspace_root_for_cfg = std::env::current_dir().ok();
+    let unified_cfg = astrid_config::Config::load(workspace_root_for_cfg.as_deref())
+        .ok()
+        .map(|r| r.config);
+
+    init_logging(args.verbose, unified_cfg.as_ref());
 
     let session_id = astrid_core::SessionId::from_uuid(
         uuid::Uuid::parse_str(&args.session)
             .map_err(|e| anyhow::anyhow!("Invalid UUID format: {e}"))?,
     );
 
+    // Resolve the capsule host-call concurrency ceilings (CLI > config+env >
+    // host-derived default); the kernel forwards them to every `WasmEngine`.
+    // Done before `args.workspace` is consumed below.
+    let runtime_limits = resolve_capsule_limits(&args, unified_cfg.as_ref());
+
     let ws = args.workspace.unwrap_or_else(|| {
         std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."))
     });
 
-    let kernel = astrid_kernel::Kernel::new(session_id.clone(), ws)
+    let kernel = astrid_kernel::Kernel::new(session_id.clone(), ws, runtime_limits)
         .await
         .map_err(|e| anyhow::anyhow!("Failed to boot Kernel: {e}"))?;
 

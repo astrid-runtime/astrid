@@ -17,6 +17,7 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow = { workspace = true }
+astrid-capsule = { workspace = true }
 astrid-config = { workspace = true }
 astrid-core = { workspace = true }
 astrid-gateway = { workspace = true }

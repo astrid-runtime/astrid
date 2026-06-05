@@ -102,7 +102,7 @@ impl process::Host for HostState {
         let security = self.security.clone();
         let capsule_id = self.capsule_id.as_str().to_owned();
         let handle = self.runtime_handle.clone();
-        let semaphore = self.host_semaphore.clone();
+        let semaphore = self.blocking_semaphore.clone();
         let cancel_token = self.cancel_token.clone();
         let process_tracker = self.process_tracker.clone();
         let call_id = extract_call_id(self);
@@ -200,7 +200,7 @@ impl process::Host for HostState {
         let security = self.security.clone();
         let capsule_id = self.capsule_id.as_str().to_owned();
         let handle = self.runtime_handle.clone();
-        let semaphore = self.host_semaphore.clone();
+        let semaphore = self.blocking_semaphore.clone();
         let cmd_for_audit = request.cmd.clone();
 
         if let Some(sec) = security {

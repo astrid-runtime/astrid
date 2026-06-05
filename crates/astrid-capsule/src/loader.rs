@@ -3,6 +3,7 @@
 use std::path::PathBuf;
 
 use crate::capsule::{Capsule, CompositeCapsule};
+use crate::engine::wasm::limits::CapsuleRuntimeLimits;
 use crate::error::CapsuleResult;
 use crate::fuel_ledger::{FuelLedger, FuelRateLimiter};
 use crate::manifest::CapsuleManifest;
@@ -21,6 +22,11 @@ pub struct CapsuleLoader {
     /// `fuel_ledger`, handed to every `WasmEngine` so a principal's 1-second CPU
     /// rate is throttled cross-capsule. See [`FuelRateLimiter`].
     fuel_rate: FuelRateLimiter,
+    /// Host-derived (operator-overridable) concurrency ceilings, resolved once
+    /// by the daemon and handed to every `WasmEngine` to size its host-call
+    /// semaphores. A plain `Copy` value, not a shared handle. See
+    /// [`CapsuleRuntimeLimits`].
+    runtime_limits: CapsuleRuntimeLimits,
 }
 
 impl CapsuleLoader {
@@ -31,16 +37,20 @@ impl CapsuleLoader {
     /// tests that don't exercise cross-capsule CPU aggregation. `fuel_rate` is
     /// the matching shared per-principal CPU-rate limiter (the deny side); pass
     /// `FuelRateLimiter::default()` in tests that don't exercise enforcement.
+    /// `runtime_limits` is the resolved per-host concurrency ceiling pair; pass
+    /// [`CapsuleRuntimeLimits::default()`] for all-host-derived sizing in tests.
     #[must_use]
     pub fn new(
         mcp_client: SecureMcpClient,
         fuel_ledger: FuelLedger,
         fuel_rate: FuelRateLimiter,
+        runtime_limits: CapsuleRuntimeLimits,
     ) -> Self {
         Self {
             mcp_client,
             fuel_ledger,
             fuel_rate,
+            runtime_limits,
         }
     }
 
@@ -67,6 +77,7 @@ impl CapsuleLoader {
                 capsule_dir.clone(),
                 self.fuel_ledger.clone(),
                 self.fuel_rate.clone(),
+                self.runtime_limits,
             )));
         }
 

@@ -150,7 +150,7 @@ impl sys::Host for HostState {
         }
         let cancel = self.cancel_token.clone();
         let rt = self.runtime_handle.clone();
-        let sem = self.host_semaphore.clone();
+        let sem = self.blocking_semaphore.clone();
         let duration = std::time::Duration::from_nanos(duration_ns);
         let cancelled = util::bounded_block_on(&rt, &sem, async move {
             tokio::select! {
@@ -188,7 +188,7 @@ impl sys::Host for HostState {
     ) -> Result<CapabilityCheckResponse, ErrorCode> {
         let registry = self.capsule_registry.clone();
         let rt_handle = self.runtime_handle.clone();
-        let host_semaphore = self.host_semaphore.clone();
+        let blocking_semaphore = self.blocking_semaphore.clone();
 
         let registry = registry.ok_or(ErrorCode::RegistryUnavailable)?;
         let Ok(source_uuid) = uuid::Uuid::parse_str(&request.source_uuid) else {
@@ -196,7 +196,7 @@ impl sys::Host for HostState {
             return Ok(CapabilityCheckResponse { allowed: false });
         };
 
-        let allowed = util::bounded_block_on(&rt_handle, &host_semaphore, async {
+        let allowed = util::bounded_block_on(&rt_handle, &blocking_semaphore, async {
             let reg = registry.read().await;
             let Some(capsule_id) = reg.find_by_uuid(&source_uuid) else {
                 return false;

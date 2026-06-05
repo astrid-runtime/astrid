@@ -428,9 +428,9 @@ impl HostSubscription for HostState {
         // is freed while the receiver is idle rather than pinned via
         // `block_in_place` (issue #816).
         let cancel_token = self.cancel_token.clone();
-        let host_semaphore = self.host_semaphore.clone();
+        let io_semaphore = self.io_semaphore.clone();
         let receiver_for_wait = Arc::clone(&receiver_arc);
-        let first = util::bounded_await_cancellable(&host_semaphore, &cancel_token, async move {
+        let first = util::bounded_await_cancellable(&io_semaphore, &cancel_token, async move {
             let mut receiver = receiver_for_wait.lock().await;
             receiver
                 .recv(Some(std::time::Duration::from_millis(timeout_ms)))

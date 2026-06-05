@@ -77,7 +77,7 @@ impl elicit::Host for HostState {
         let capsule_id = self.capsule_id.to_string();
         let secret_store = self.effective_secret_store().clone();
         let cancel_token = self.cancel_token.clone();
-        let host_semaphore = self.host_semaphore.clone();
+        let blocking_semaphore = self.blocking_semaphore.clone();
 
         // Publish the elicit request to the event bus
         let request_payload = IpcPayload::ElicitRequest {
@@ -113,7 +113,7 @@ impl elicit::Host for HostState {
         // during teardown and prevents delayed shutdown under high throughput.
         let event = util::bounded_block_on_cancellable(
             &runtime_handle,
-            &host_semaphore,
+            &blocking_semaphore,
             &cancel_token,
             async {
                 tokio::time::timeout(

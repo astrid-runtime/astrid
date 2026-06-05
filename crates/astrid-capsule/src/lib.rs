@@ -25,4 +25,5 @@ pub mod topic;
 pub mod toposort;
 pub(crate) mod watcher;
 
+pub use engine::wasm::limits::CapsuleRuntimeLimits;
 pub use fuel_ledger::{FuelLedger, FuelRateLimiter};

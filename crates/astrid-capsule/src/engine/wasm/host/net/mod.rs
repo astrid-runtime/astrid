@@ -169,7 +169,7 @@ where
 {
     let stream = net_stream(&state.resource_table, rep)?;
     let rt = state.runtime_handle.clone();
-    let sem = state.host_semaphore.clone();
+    let sem = state.blocking_semaphore.clone();
     let tok = state.cancel_token.clone();
     match stream {
         NetStream::Tcp(slot) => {
@@ -193,7 +193,7 @@ impl net::Host for HostState {
             let capsule_id = self.capsule_id.as_str().to_owned();
             let gate = gate.clone();
             let handle = self.runtime_handle.clone();
-            let semaphore = self.host_semaphore.clone();
+            let semaphore = self.blocking_semaphore.clone();
             let check = util::bounded_block_on(&handle, &semaphore, async move {
                 gate.check_net_bind(&capsule_id).await
             });
@@ -231,7 +231,7 @@ impl net::Host for HostState {
             let host_for_check = host.clone();
             let gate = gate.clone();
             let rt = self.runtime_handle.clone();
-            let semaphore = self.host_semaphore.clone();
+            let semaphore = self.blocking_semaphore.clone();
             let check = util::bounded_block_on(&rt, &semaphore, async move {
                 gate.check_net_connect(&capsule_id, &host_for_check, port)
                     .await
@@ -246,11 +246,14 @@ impl net::Host for HostState {
         }
 
         let rt_handle = self.runtime_handle.clone();
-        let host_semaphore = self.host_semaphore.clone();
+        let blocking_semaphore = self.blocking_semaphore.clone();
         let cancel_token = self.cancel_token.clone();
 
-        let connect_result =
-            util::bounded_block_on_cancellable(&rt_handle, &host_semaphore, &cancel_token, async {
+        let connect_result = util::bounded_block_on_cancellable(
+            &rt_handle,
+            &blocking_semaphore,
+            &cancel_token,
+            async {
                 tokio::time::timeout(CONNECT_TIMEOUT, async {
                     let addrs: Vec<std::net::SocketAddr> =
                         tokio::net::lookup_host((host.as_str(), port))
@@ -272,7 +275,8 @@ impl net::Host for HostState {
                 .await
                 .map_err(|_| ErrorCode::Timeout)
                 .and_then(|inner| inner)
-            });
+            },
+        );
 
         let stream = match connect_result {
             Some(Ok(s)) => s,
@@ -313,7 +317,7 @@ impl net::Host for HostState {
             let host_for_check = host.clone();
             let gate = gate.clone();
             let rt = self.runtime_handle.clone();
-            let semaphore = self.host_semaphore.clone();
+            let semaphore = self.blocking_semaphore.clone();
             // Port 0 here is "no specific port": the gate is being
             // asked "may this capsule resolve this hostname?" rather
             // than "may it connect to host:port?". Manifest entries
@@ -334,7 +338,7 @@ impl net::Host for HostState {
         }
 
         let rt = self.runtime_handle.clone();
-        let sem = self.host_semaphore.clone();
+        let sem = self.blocking_semaphore.clone();
         let host_owned = host.clone();
         // Collect inside the closure so the borrow on `host_owned` ends
         // before the async block returns — the iterator from
