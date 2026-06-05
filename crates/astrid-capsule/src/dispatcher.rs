@@ -540,17 +540,22 @@ fn get_or_spawn_consumer(
     key: (CapsuleId, PrincipalKey),
 ) -> mpsc::Sender<InterceptorWork> {
     let mut guard = queues.lock();
-    if let Some(s) = guard.get(&key) {
-        // Never hand back a CLOSED sender. The mapped entry can be stale: an
-        // idle-evicting consumer that exited (or, defensively, a consumer task
-        // that ended abnormally) leaves its `Sender` in the map with the
-        // receiver gone. Returning it would make every `try_send` fail `Closed`
-        // and silently drop events forever — the burst-induced `user.v1.prompt`
-        // stall. If the entry is dead, fall through and re-spawn; the
-        // `insert` below overwrites the stale sender with a live one.
-        if !s.is_closed() {
-            return s.clone();
-        }
+    // Never hand back a CLOSED sender. The mapped entry can be stale: an
+    // idle-evicting consumer that exited (or, defensively, a consumer task that
+    // ended abnormally) leaves its `Sender` in the map with the receiver gone.
+    // Returning it would make every `try_send` fail `Closed` and silently drop
+    // events forever — the burst-induced `user.v1.prompt` stall. If the entry
+    // is dead, REMOVE it and fall through to re-spawn. The explicit remove
+    // matters for the degrade-to-shared path below: that re-keys the insert to
+    // `(capsule, None)`, so it would never overwrite a stale
+    // `(capsule, Some(principal))` entry — the dead `Sender` and its
+    // `PrincipalKey` string would leak and slow `queues_per_capsule`'s scan.
+    match guard.get(&key) {
+        Some(s) if !s.is_closed() => return s.clone(),
+        Some(_) => {
+            guard.remove(&key);
+        },
+        None => {},
     }
 
     // Cap enforcement — if exceeded, degrade this insert to the
@@ -570,10 +575,15 @@ fn get_or_spawn_consumer(
             "dispatcher: per-principal queue cap exceeded; degrading to shared queue"
         );
         effective_key.1 = None;
-        if let Some(s) = guard.get(&effective_key)
-            && !s.is_closed()
-        {
-            return s.clone();
+        match guard.get(&effective_key) {
+            Some(s) if !s.is_closed() => return s.clone(),
+            // A closed shared sender is removed too. The insert below would
+            // overwrite it anyway, but removing keeps the handling uniform with
+            // the per-principal path and avoids a transient dead entry.
+            Some(_) => {
+                guard.remove(&effective_key);
+            },
+            None => {},
         }
     }
 
@@ -763,12 +773,31 @@ fn dispatch_single(
             // and every later prompt was dropped.) The re-spawn just spawned its
             // consumer, so the retry cannot hit the same race.
             let sender = get_or_spawn_consumer(queues, &capsule, key);
-            if let Err(e) = sender.try_send(work) {
-                warn!(
-                    capsule_id = %capsule.id(),
-                    topic = %topic,
-                    "Capsule dispatch dropped after re-spawn retry: {e}"
-                );
+            match sender.try_send(work) {
+                Ok(()) => {},
+                // `Full` after a fresh re-spawn is the same intended shed-load
+                // drop as the steady-state arm below: the new consumer is alive
+                // but its bounded queue saturated under the ongoing burst.
+                // Recoverable via the requester's IPC/SSE timeout.
+                Err(e @ mpsc::error::TrySendError::Full(_)) => {
+                    warn!(
+                        capsule_id = %capsule.id(),
+                        topic = %topic,
+                        "Capsule dispatch queue full after re-spawn, dropping event (backpressure): {e}"
+                    );
+                },
+                // `Closed` immediately after we spawned a fresh consumer is a
+                // BUG, not backpressure — it would break the "Closed is never
+                // dropped" invariant. Flag it as a security/correctness event
+                // rather than folding it into the benign backpressure log.
+                Err(e @ mpsc::error::TrySendError::Closed(_)) => {
+                    warn!(
+                        capsule_id = %capsule.id(),
+                        topic = %topic,
+                        security_event = true,
+                        "BUG: capsule dispatch sender closed immediately after re-spawn; event dropped: {e}"
+                    );
+                },
             }
         },
         Err(e @ mpsc::error::TrySendError::Full(_)) => {
