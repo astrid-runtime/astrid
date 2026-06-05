@@ -847,8 +847,12 @@ async fn unscoped_route_unchanged_regression() {
     // publish mix delivers EVERY event — the gateway firehose path is
     // intact and the #813 fan-out is undisturbed.
     let bus = EventBus::new();
-    let mut sub =
-        bus.subscribe_topic_routed(uuid::Uuid::new_v4(), AUDIT_TOPIC, "audit-firehose", "test_sub");
+    let mut sub = bus.subscribe_topic_routed(
+        uuid::Uuid::new_v4(),
+        AUDIT_TOPIC,
+        "audit-firehose",
+        "test_sub",
+    );
 
     for _ in 0..7 {
         bus.publish(ipc_evt(AUDIT_TOPIC, Some("alice")));

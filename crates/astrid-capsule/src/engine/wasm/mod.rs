@@ -2852,11 +2852,19 @@ mod tests {
         // admin holds `audit:read_all` via `*` — the firehose case.
         let admin = profile_with(&["admin"], &[], &[]);
         let g = builtin_groups();
-        assert!(resolve_audit_firehose(Some(&admin), Some(&g), &pid("default")));
+        assert!(resolve_audit_firehose(
+            Some(&admin),
+            Some(&g),
+            &pid("default")
+        ));
 
         // A non-admin explicitly granted the capability also gets the firehose.
         let granted = profile_with(&["agent"], &[AUDIT_FIREHOSE_CAP], &[]);
-        assert!(resolve_audit_firehose(Some(&granted), Some(&g), &pid("alice")));
+        assert!(resolve_audit_firehose(
+            Some(&granted),
+            Some(&g),
+            &pid("alice")
+        ));
     }
 
     #[test]
@@ -2869,7 +2877,11 @@ mod tests {
         assert!(!resolve_audit_firehose(Some(&admin), None, &pid("default")));
         // A profile WITHOUT the capability → false.
         let plain = profile_with(&["agent"], &[], &[]);
-        assert!(!resolve_audit_firehose(Some(&plain), Some(&g), &pid("alice")));
+        assert!(!resolve_audit_firehose(
+            Some(&plain),
+            Some(&g),
+            &pid("alice")
+        ));
     }
 
     #[test]
@@ -2893,9 +2905,17 @@ mod tests {
         // requires the operator-owned grant.
         let g = builtin_groups();
         let no_cap = profile_with(&["agent"], &[], &[]);
-        assert!(!resolve_audit_firehose(Some(&no_cap), Some(&g), &pid("self-declarer")));
+        assert!(!resolve_audit_firehose(
+            Some(&no_cap),
+            Some(&g),
+            &pid("self-declarer")
+        ));
         let with_cap = profile_with(&["agent"], &[AUDIT_FIREHOSE_CAP], &[]);
-        assert!(resolve_audit_firehose(Some(&with_cap), Some(&g), &pid("self-declarer")));
+        assert!(resolve_audit_firehose(
+            Some(&with_cap),
+            Some(&g),
+            &pid("self-declarer")
+        ));
     }
 
     // ── CPU-rate DENY gate (PR2, the security boundary) ──────────────────
