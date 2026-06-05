@@ -143,15 +143,6 @@ const WASM_CAPSULE_TIMEOUT_SECS: u64 = 5 * 60;
 /// granularity is `EPOCH_TICK_INTERVAL * epoch_deadline`.
 const EPOCH_TICK_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
 
-/// Number of `(Store, Instance)` pairs a pooled (non-run-loop) capsule
-/// instantiates, so that many principals' interceptors run concurrently
-/// instead of serialising through one Store (`astrid#816`). Each instance
-/// costs one WASM linear memory (capped at [`WASM_MAX_MEMORY_BYTES`] virtual;
-/// committed RSS is only what the guest touches), so this trades a bounded
-/// memory footprint for genuine per-capsule parallelism. Capsules carved out
-/// via `host_process` (live cross-invocation resource handles) use size 1.
-const INSTANCE_POOL_SIZE: usize = 16;
-
 /// Executes WASM Components via the wasmtime Component Model.
 ///
 /// This engine sandboxes execution in wasmtime and wires the
@@ -169,10 +160,12 @@ pub struct WasmEngine {
     /// interceptors run concurrently instead of serialising through one Store
     /// (the throughput floor behind `astrid#813`; see `astrid#816` and
     /// [`pool`]). `None` for run-loop capsules — they keep one dedicated
-    /// Store owned by `run_handle` and never go through this pool. Pool size
-    /// is [`INSTANCE_POOL_SIZE`], or `1` for capsules carved out via the
-    /// `host_process` capability (they hold live resources across
-    /// invocations and must stay single-Store).
+    /// Store owned by `run_handle` and never go through this pool. The pool is
+    /// dynamic: it warm-starts at `min_idle`, grows lazily toward the
+    /// host-derived (operator-overridable) `instance_pool_size` max under load,
+    /// and idle-evicts back down. Capsules carved out via the `host_process`
+    /// capability are pinned to a single Store (live cross-invocation resource
+    /// handles must never move to a second Store).
     pool: Option<pool::CapsuleInstancePool>,
     inbound_rx: Option<tokio::sync::mpsc::Receiver<astrid_core::InboundMessage>>,
     run_handle: Option<tokio::task::JoinHandle<()>>,
@@ -1224,7 +1217,24 @@ impl ExecutionEngine for WasmEngine {
             // no pooled capsule relies on in-WASM-memory state surviving
             // across invocations, so distinct Stores per principal-invocation
             // are sound (issue #816).
-            let make_state = || HostState {
+            //
+            // Owned (`move`) and `Arc`-wrapped so it is a `'static` factory the
+            // dynamic pool keeps to lazily grow new instances long after this
+            // load frame returns — not just a borrow used by the eager loop. The
+            // shared state it needs from outside this block (the host semaphores,
+            // the cancel token, the process tracker) and from `ctx` (principal,
+            // registry, allowance/identity stores) is cloned into owned locals
+            // first, so the `move` closure takes them without borrowing the
+            // frame.
+            let blocking_semaphore = blocking_semaphore.clone();
+            let io_semaphore = io_semaphore.clone();
+            let cancel_token_for_state = cancel_token_for_state.clone();
+            let process_tracker = process_tracker.clone();
+            let st_principal = ctx.principal.clone();
+            let st_capsule_registry = ctx.capsule_registry.clone();
+            let st_allowance_store = ctx.allowance_store.clone();
+            let st_identity_store = ctx.identity_store.clone();
+            let make_state: Arc<dyn Fn() -> HostState + Send + Sync> = Arc::new(move || HostState {
                 wasi_ctx: build_wasi_ctx(),
                 resource_table: wasmtime::component::ResourceTable::new(),
                 // Memory cap baked in BEFORE instantiation. For a bound
@@ -1236,7 +1246,7 @@ impl ExecutionEngine for WasmEngine {
                 store_limits: wasmtime::StoreLimitsBuilder::new()
                     .memory_size(run_loop_mem_bytes)
                     .build(),
-                principal: ctx.principal.clone(),
+                principal: st_principal.clone(),
                 capsule_uuid,
                 caller_context: None,
                 interceptor_active: false,
@@ -1270,7 +1280,7 @@ impl ExecutionEngine for WasmEngine {
                     Arc::clone(&security_gate) as Arc<dyn crate::security::CapsuleSecurityGate>
                 ),
                 hook_manager: None, // Will be injected by Gateway
-                capsule_registry: ctx.capsule_registry.clone(),
+                capsule_registry: st_capsule_registry.clone(),
                 runtime_handle: tokio::runtime::Handle::current(),
                 has_uplink_capability: has_uplink,
                 inbound_tx: tx.clone(),
@@ -1283,8 +1293,8 @@ impl ExecutionEngine for WasmEngine {
                 cancel_token: cancel_token_for_state.clone(),
                 session_token: session_tok.clone(),
                 interceptor_handles: Vec::new(),
-                allowance_store: ctx.allowance_store.clone(),
-                identity_store: ctx.identity_store.clone(),
+                allowance_store: st_allowance_store.clone(),
+                identity_store: st_identity_store.clone(),
                 process_tracker: process_tracker.clone(),
                 net_stream_count: 0,
                 subscription_count: 0,
@@ -1297,7 +1307,7 @@ impl ExecutionEngine for WasmEngine {
                 // `no_yield_windows` counts consecutive windows with no recv.
                 recv_yielded: false,
                 no_yield_windows: 0,
-            };
+            });
 
             // Initial epoch deadline applied to every freshly-instantiated
             // pool Store below. This is a wall-clock placeholder, NOT the
@@ -1341,44 +1351,47 @@ impl ExecutionEngine for WasmEngine {
                 ))
             })?;
 
-            // Pool size: run-loop builds one dedicated Store (owned by the run
-            // loop, not pooled); `host_process` capsules are carved out to one
-            // Store (they hold live resource handles across invocations and
-            // must stay single-Store); everyone else gets INSTANCE_POOL_SIZE
-            // for concurrent interceptor invocation (issue #816).
-            let pool_size = if has_run_export || !manifest.capabilities.host_process.is_empty() {
-                1
+            // Dynamic-pool sizing. Run-loop and `host_process` capsules are
+            // pinned to a single Store regardless of the configured pool max:
+            // run-loops own their dedicated Store; `host_process` capsules hold
+            // live resource handles across invocations and must never lease a
+            // second Store. Everyone else gets a dynamic pool that warm-starts
+            // at `min_idle`, grows lazily toward `instance_pool_size` under
+            // load, and is trimmed back to `min_idle` when idle (issue #816,
+            // replacing the old fixed `INSTANCE_POOL_SIZE`).
+            let is_single_store =
+                has_run_export || !manifest.capabilities.host_process.is_empty();
+            let (pool_max, pool_min_idle) = if is_single_store {
+                (1, 1)
             } else {
-                INSTANCE_POOL_SIZE
+                (
+                    self.runtime_limits.instance_pool_size,
+                    self.runtime_limits.instance_pool_min_idle(),
+                )
             };
-            let mut pooled: Vec<pool::PooledInstance> = Vec::with_capacity(pool_size);
-            for _ in 0..pool_size {
-                let mut store = Store::new(&wt_engine, make_state());
-                // Memory limit (per-Store, from make_state) + epoch deadline.
-                store.limiter(|state| &mut state.store_limits);
-                store.set_epoch_deadline(pool_epoch_deadline);
-                // Fuel is engine-wide, so a fresh Store starts at 0 fuel and
-                // would trap on the first instruction of `instantiate_async`
-                // (component init runs guest code). Seed every Store before
-                // instantiation; the bound run-loop / per-invocation budgets
-                // re-set fuel afterwards. INTERCEPTOR_FUEL_BUDGET is a generous
-                // seed that covers instantiation for all classes.
-                store.set_fuel(INTERCEPTOR_FUEL_BUDGET).map_err(|e| {
-                    CapsuleError::UnsupportedEntryPoint(format!("Failed to seed store fuel: {e}"))
-                })?;
-                let instance = instance_pre
-                    .instantiate_async(&mut store)
-                    .await
-                    .map_err(|e| {
-                        CapsuleError::UnsupportedEntryPoint(format!(
-                            "Failed to instantiate WASM component: {e}"
-                        ))
-                    })?;
-                pooled.push(pool::PooledInstance { store, instance });
+
+            // On-demand instance factory. The eager warm-start instances are
+            // built through it too, so an eagerly-built and a lazily-grown
+            // instance are identical (required for free checkout). The factory
+            // outlives this frame, owning `make_state` and the compiled
+            // component, so the pool can grow after load returns.
+            let builder = pool::InstanceBuilder::new(
+                wt_engine.clone(),
+                instance_pre,
+                Arc::clone(&make_state),
+                pool_epoch_deadline,
+                INTERCEPTOR_FUEL_BUDGET,
+            );
+            let mut initial_instances: Vec<pool::PooledInstance> =
+                Vec::with_capacity(pool_min_idle);
+            for _ in 0..pool_min_idle {
+                initial_instances.push(builder.build().await?);
             }
             tracing::debug!(
                 capsule = %manifest.package.name,
-                pool_size,
+                pool_max,
+                pool_min_idle,
+                warm = initial_instances.len(),
                 has_run = has_run_export,
                 host_process = !manifest.capabilities.host_process.is_empty(),
                 "Instantiated capsule instance pool"
@@ -1392,7 +1405,9 @@ impl ExecutionEngine for WasmEngine {
             let mut store_arc: Option<Arc<AsyncMutex<Store<HostState>>>> = None;
             let mut run_instance: Option<wasmtime::component::Instance> = None;
             if has_run {
-                let mut pi = pooled.pop().expect("pool_size >= 1 for run-loop");
+                let mut pi = initial_instances
+                    .pop()
+                    .expect("min_idle >= 1, so the run-loop instance exists");
                 // The run-loop Store's memory cap is already baked into
                 // `store_limits` by `make_state` (pool_size 1 ⇒ this IS the
                 // run-loop Store) and was enforced during `instantiate_async`.
@@ -1464,8 +1479,12 @@ impl ExecutionEngine for WasmEngine {
                 // must persist. See `pool::clear_on_return`.
                 let reset_resources_on_return = manifest.capabilities.host_process.is_empty();
                 pool_opt = Some(pool::CapsuleInstancePool::new(
-                    pooled,
+                    initial_instances,
+                    pool_max,
+                    pool_min_idle,
                     reset_resources_on_return,
+                    builder,
+                    &cancel_token,
                 ));
             }
 
@@ -1910,10 +1929,15 @@ impl ExecutionEngine for WasmEngine {
         // borrowing the store mutably for the SET/CALL block; `PoolCheckout`
         // clears the invocation state and returns the instance on drop.
         let checkout_start = std::time::Instant::now();
-        let mut checkout = pool
-            .checkout()
-            .await
-            .ok_or_else(|| CapsuleError::NotSupported("capsule is unloading".into()))?;
+        let mut checkout = pool.checkout().await.ok_or_else(|| {
+            // `checkout` returns `None` for any of: the capsule is unloading
+            // (semaphore closed), a lazy pool-grow instantiation failed, or a
+            // size-1 carve-out found no warm instance. The true cause is logged
+            // at the checkout site; keep the surfaced error generic rather than
+            // asserting "unloading", which misleads when the real cause was a
+            // transient grow failure on a fully-loaded capsule.
+            CapsuleError::NotSupported("no capsule instance available".into())
+        })?;
         // Time spent waiting for a free pooled instance — a rising
         // `pool_wait_ms` is the signal the pool is saturated (all instances
         // busy), distinct from a slow guest call.

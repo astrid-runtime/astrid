@@ -39,6 +39,27 @@ const IO_PER_CORE: usize = 64;
 /// usable amount of outbound parallelism.
 const IO_MIN: usize = 64;
 
+/// Pooled instances granted per CPU core (the dynamic pool's *max*, the
+/// concurrency ceiling for a capsule's interceptor invocations).
+const POOL_PER_CORE: usize = 2;
+
+/// Floor for the instance-pool max, so even a small host keeps useful
+/// per-capsule concurrency (and is not *below* the old fixed value on a typical
+/// box: an 8-core host resolves to 16, matching the previous constant).
+const POOL_MIN: usize = 8;
+
+/// Ceiling for the host-derived instance-pool max. Each pooled instance is a
+/// linear memory (capped per-invocation), so the default is bounded to avoid a
+/// large worst-case footprint on big hosts; an operator who wants more sets
+/// `instance_pool_size` explicitly. A RAM-budget-derived ceiling lands with the
+/// per-principal memory ledger.
+const POOL_MAX: usize = 64;
+
+/// Instances kept warm (eagerly built, never evicted) so a burst does not pay
+/// instantiate latency for the first few invocations. The pool grows lazily
+/// above this toward the max and an idle timer reclaims back down to it.
+const WARM_MIN_IDLE: usize = 4;
+
 /// CPU cores reported for this process, honouring the cgroup CPU quota on Linux
 /// (`available_parallelism` reads `sched_getaffinity` / `cpu.max`). Falls back
 /// to a conservative [`SCHED_RESERVE`] if the count cannot be determined.
@@ -85,6 +106,21 @@ pub fn host_io_concurrency_default() -> usize {
     }
 }
 
+/// Host-derived default for the dynamic instance pool's **max** size — the
+/// ceiling on a capsule's concurrent interceptor invocations.
+///
+/// `cores * POOL_PER_CORE`, clamped to `[POOL_MIN, POOL_MAX]`. Replaces the old
+/// fixed `INSTANCE_POOL_SIZE = 16`: it scales with the machine (more
+/// concurrency on big hosts, less eager memory on small ones) instead of one
+/// magic number. The pool warm-starts well below this and grows lazily, so the
+/// max bounds the peak, not the resting footprint.
+#[must_use]
+pub fn host_instance_pool_size_default() -> usize {
+    cores()
+        .saturating_mul(POOL_PER_CORE)
+        .clamp(POOL_MIN, POOL_MAX)
+}
+
 /// Process file-descriptor soft limit (`RLIMIT_NOFILE`), if readable.
 ///
 /// `None` on non-Unix, on read error, or when the limit is unbounded
@@ -121,21 +157,33 @@ pub struct CapsuleRuntimeLimits {
     /// Ceiling on concurrent **async-I/O** host calls (`.await` real I/O);
     /// sizes the I/O host semaphore.
     pub io_concurrency: usize,
+    /// **Max** size of a capsule's dynamic instance pool — the ceiling on its
+    /// concurrent interceptor invocations. The pool warm-starts below this and
+    /// grows lazily toward it. (Run-loop and `host_process` capsules are pinned
+    /// to a single Store regardless and ignore this.)
+    pub instance_pool_size: usize,
 }
 
 impl CapsuleRuntimeLimits {
     /// Resolve from optional operator overrides, falling back to the
-    /// host-derived default for any field left `None`. Both ceilings are
-    /// clamped to at least 1 permit (fail-secure: a zero-permit semaphore would
-    /// wedge every host call rather than merely throttle).
+    /// host-derived default for any field left `None`. Every ceiling is clamped
+    /// to at least 1 (fail-secure: a zero would wedge a host-call class or
+    /// leave a capsule with no instance to lease, rather than merely throttle).
     #[must_use]
-    pub fn resolve(blocking_concurrency: Option<usize>, io_concurrency: Option<usize>) -> Self {
+    pub fn resolve(
+        blocking_concurrency: Option<usize>,
+        io_concurrency: Option<usize>,
+        instance_pool_size: Option<usize>,
+    ) -> Self {
         Self {
             blocking_concurrency: blocking_concurrency
                 .unwrap_or_else(host_blocking_concurrency_default)
                 .max(1),
             io_concurrency: io_concurrency
                 .unwrap_or_else(host_io_concurrency_default)
+                .max(1),
+            instance_pool_size: instance_pool_size
+                .unwrap_or_else(host_instance_pool_size_default)
                 .max(1),
         }
     }
@@ -151,12 +199,20 @@ impl CapsuleRuntimeLimits {
     pub fn io_semaphore(self) -> Arc<Semaphore> {
         Arc::new(Semaphore::new(self.io_concurrency))
     }
+
+    /// Warm-start size for an interceptor pool: [`WARM_MIN_IDLE`] instances,
+    /// never exceeding the pool max. The idle-eviction timer reclaims back down
+    /// to this. (Single-Store carve-outs pass `max == min_idle == 1`.)
+    #[must_use]
+    pub fn instance_pool_min_idle(self) -> usize {
+        WARM_MIN_IDLE.min(self.instance_pool_size).max(1)
+    }
 }
 
 impl Default for CapsuleRuntimeLimits {
     /// All-host-derived limits (no operator overrides).
     fn default() -> Self {
-        Self::resolve(None, None)
+        Self::resolve(None, None, None)
     }
 }
 
@@ -204,27 +260,49 @@ mod tests {
 
     #[test]
     fn resolve_prefers_overrides_and_clamps_zero() {
-        let r = CapsuleRuntimeLimits::resolve(Some(7), Some(900));
+        let r = CapsuleRuntimeLimits::resolve(Some(7), Some(900), Some(40));
         assert_eq!(r.blocking_concurrency, 7);
         assert_eq!(r.io_concurrency, 900);
+        assert_eq!(r.instance_pool_size, 40);
 
-        // A zero override is clamped up to 1 rather than wedging host calls.
-        let z = CapsuleRuntimeLimits::resolve(Some(0), Some(0));
+        // A zero override is clamped up to 1 rather than wedging a class.
+        let z = CapsuleRuntimeLimits::resolve(Some(0), Some(0), Some(0));
         assert_eq!(z.blocking_concurrency, 1);
         assert_eq!(z.io_concurrency, 1);
+        assert_eq!(z.instance_pool_size, 1);
     }
 
     #[test]
     fn resolve_none_uses_host_defaults() {
-        let r = CapsuleRuntimeLimits::resolve(None, None);
+        let r = CapsuleRuntimeLimits::resolve(None, None, None);
         assert_eq!(r.blocking_concurrency, host_blocking_concurrency_default());
         assert_eq!(r.io_concurrency, host_io_concurrency_default());
+        assert_eq!(r.instance_pool_size, host_instance_pool_size_default());
     }
 
     #[test]
     fn semaphores_match_resolved_counts() {
-        let r = CapsuleRuntimeLimits::resolve(Some(3), Some(11));
+        let r = CapsuleRuntimeLimits::resolve(Some(3), Some(11), None);
         assert_eq!(r.blocking_semaphore().available_permits(), 3);
         assert_eq!(r.io_semaphore().available_permits(), 11);
+    }
+
+    #[test]
+    fn pool_default_is_bounded_and_beats_the_old_constant_on_a_typical_box() {
+        let max = host_instance_pool_size_default();
+        assert!((POOL_MIN..=POOL_MAX).contains(&max));
+        // The old fixed value was 16; the floor guarantees we never resolve
+        // below 8, and an 8-core host lands exactly on 16.
+        assert!(max >= POOL_MIN);
+    }
+
+    #[test]
+    fn min_idle_is_clamped_to_the_max() {
+        // Large pool keeps WARM_MIN_IDLE warm.
+        let big = CapsuleRuntimeLimits::resolve(None, None, Some(32));
+        assert_eq!(big.instance_pool_min_idle(), WARM_MIN_IDLE);
+        // A size-1 (carve-out) pool warm-starts its single instance.
+        let one = CapsuleRuntimeLimits::resolve(None, None, Some(1));
+        assert_eq!(one.instance_pool_min_idle(), 1);
     }
 }

@@ -437,6 +437,12 @@ timeout_secs = 300
 # rides on. Host default is cores-scaled and clamped by half the fd limit.
 # host_io_concurrency = 512
 
+# Max size of a capsule's dynamic instance pool (concurrent interceptor
+# invocations). Replaces the old fixed 16; host default is cores-scaled. The
+# pool warm-starts small and grows lazily toward this, so it bounds the peak,
+# not the resting footprint. Run-loop / host_process capsules ignore it.
+# instance_pool_size = 32
+
 # ============================================================================
 # Spark (Agent Identity)
 # ============================================================================
