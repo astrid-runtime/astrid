@@ -35,14 +35,14 @@ impl uplink::Host for HostState {
         let capsule_id = self.capsule_id.as_str().to_owned();
         let security = self.security.clone();
         let handle = self.runtime_handle.clone();
-        let host_semaphore = self.host_semaphore.clone();
+        let blocking_semaphore = self.blocking_semaphore.clone();
 
         if let Some(gate) = &security {
             let gate = gate.clone();
             let pid = capsule_id.clone();
             let cname = name.clone();
             let plat = platform.clone();
-            let check = util::bounded_block_on(&handle, &host_semaphore, async move {
+            let check = util::bounded_block_on(&handle, &blocking_semaphore, async move {
                 gate.check_uplink_register(&pid, &cname, &plat).await
             });
             if check.is_err() {

@@ -29,12 +29,12 @@ impl HostUnixListener for HostState {
         let rt_handle = self.runtime_handle.clone();
         let cancel_token = self.cancel_token.clone();
         let session_token = self.session_token.clone();
-        let host_semaphore = self.host_semaphore.clone();
+        let blocking_semaphore = self.blocking_semaphore.clone();
 
         let stream = loop {
             let accept_result = util::bounded_block_on_cancellable(
                 &rt_handle,
-                &host_semaphore,
+                &blocking_semaphore,
                 &cancel_token,
                 async {
                     let l = listener_arc.lock().await;
@@ -61,7 +61,7 @@ impl HostUnixListener for HostState {
                 // doesn't enter the handshake at all.
                 let _ = util::bounded_block_on_cancellable(
                     &rt_handle,
-                    &host_semaphore,
+                    &blocking_semaphore,
                     &cancel_token,
                     async {
                         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -74,7 +74,7 @@ impl HostUnixListener for HostState {
             if let Some(ref token) = session_token {
                 let handshake_result = util::bounded_block_on_cancellable(
                     &rt_handle,
-                    &host_semaphore,
+                    &blocking_semaphore,
                     &cancel_token,
                     validate_handshake(&mut stream, token),
                 );
@@ -121,18 +121,22 @@ impl HostUnixListener for HostState {
         let rt_handle = self.runtime_handle.clone();
         let cancel_token = self.cancel_token.clone();
         let session_token = self.session_token.clone();
-        let host_semaphore = self.host_semaphore.clone();
+        let blocking_semaphore = self.blocking_semaphore.clone();
 
         if self.net_stream_count >= MAX_ACTIVE_STREAMS {
             return Ok(None);
         }
 
         let timeout_ms = timeout_ms.min(60_000);
-        let accept_result =
-            util::bounded_block_on_cancellable(&rt_handle, &host_semaphore, &cancel_token, async {
+        let accept_result = util::bounded_block_on_cancellable(
+            &rt_handle,
+            &blocking_semaphore,
+            &cancel_token,
+            async {
                 let l = listener_arc.lock().await;
                 tokio::time::timeout(Duration::from_millis(timeout_ms), l.accept()).await
-            });
+            },
+        );
 
         let (stream, _addr) = match accept_result {
             None => return Ok(None),
@@ -156,7 +160,7 @@ impl HostUnixListener for HostState {
         if let Some(ref token) = session_token {
             let handshake_result = util::bounded_block_on_cancellable(
                 &rt_handle,
-                &host_semaphore,
+                &blocking_semaphore,
                 &cancel_token,
                 validate_handshake(&mut stream, token),
             );

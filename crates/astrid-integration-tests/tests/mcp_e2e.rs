@@ -70,6 +70,7 @@ async fn test_mcp_host_engine_capability_validation() {
         test_secure_mcp_client(),
         astrid_capsule::FuelLedger::default(),
         astrid_capsule::FuelRateLimiter::default(),
+        astrid_capsule::CapsuleRuntimeLimits::default(),
     );
 
     let mut capsule = loader

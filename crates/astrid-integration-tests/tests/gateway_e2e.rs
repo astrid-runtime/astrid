@@ -88,7 +88,13 @@ async fn kernel_and_gateway_boot_against_shared_home() {
     std::fs::create_dir_all(&workspace).expect("workspace dir");
 
     let session_id = astrid_core::SessionId::new();
-    let kernel = match astrid_kernel::Kernel::new(session_id.clone(), workspace.clone()).await {
+    let kernel = match astrid_kernel::Kernel::new(
+        session_id.clone(),
+        workspace.clone(),
+        astrid_capsule::CapsuleRuntimeLimits::default(),
+    )
+    .await
+    {
         Ok(k) => k,
         Err(e) if looks_like_sandbox_block(&e) => {
             eprintln!("skipping: sandbox blocks Unix socket bind: {e}");

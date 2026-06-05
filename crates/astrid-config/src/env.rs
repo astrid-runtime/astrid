@@ -63,6 +63,15 @@ const ENV_MAPPINGS: &[EnvMapping] = &[
         var_name: "ASTRID_SUBAGENT_TIMEOUT_SECS",
         field_path: "subagents.timeout_secs",
     },
+    // Capsule runtime concurrency ceilings.
+    EnvMapping {
+        var_name: "ASTRID_CAPSULE_HOST_BLOCKING_CONCURRENCY",
+        field_path: "capsule.host_blocking_concurrency",
+    },
+    EnvMapping {
+        var_name: "ASTRID_CAPSULE_HOST_IO_CONCURRENCY",
+        field_path: "capsule.host_io_concurrency",
+    },
     // Retry settings.
     EnvMapping {
         var_name: "ASTRID_RETRY_LLM_MAX_ATTEMPTS",
@@ -281,6 +290,8 @@ fn coerce_to_toml_value(path: &str, val: &str) -> toml::Value {
             | "subagents.max_concurrent"
             | "subagents.max_depth"
             | "subagents.timeout_secs"
+            | "capsule.host_blocking_concurrency"
+            | "capsule.host_io_concurrency"
             | "retry.llm_max_attempts"
             | "retry.mcp_max_attempts"
     ) && let Ok(i) = val.parse::<i64>()

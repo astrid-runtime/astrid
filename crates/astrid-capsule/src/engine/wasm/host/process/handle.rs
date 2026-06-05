@@ -157,7 +157,7 @@ impl HostProcessHandle for HostState {
         timeout_ms: Option<u64>,
     ) -> Result<ExitInfo, ErrorCode> {
         let rt = self.runtime_handle.clone();
-        let sem = self.host_semaphore.clone();
+        let sem = self.blocking_semaphore.clone();
         let tok = self.cancel_token.clone();
         // Borrow the child from the resource table directly — no
         // `take()`. `tokio::process::Child::wait` is `&mut self`, so

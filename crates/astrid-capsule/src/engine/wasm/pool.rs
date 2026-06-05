@@ -189,7 +189,8 @@ impl Drop for PoolCheckout {
 /// cross-principal reuse can occur (see [`CapsuleInstancePool`]).
 ///
 /// NOTE: the per-Store *owner* state (`vfs`, `kv`, `secret_store`,
-/// `ipc_limiter`, `host_semaphore`, `process_tracker`, `event_bus`, …) is
+/// `ipc_limiter`, `blocking_semaphore`, `io_semaphore`, `process_tracker`,
+/// `event_bus`, …) is
 /// deliberately untouched — it is shared, immutable for the Store's lifetime,
 /// and must survive every checkout. `wasi_ctx` likewise needs no reset:
 /// capsules import zero `wasi:*` functions, so the only WASI-created handles

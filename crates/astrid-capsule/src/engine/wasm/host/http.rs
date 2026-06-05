@@ -166,7 +166,7 @@ async fn check_http_security(
     capsule_id: String,
     url: &str,
     method: &str,
-    host_semaphore: &Arc<tokio::sync::Semaphore>,
+    io_semaphore: &Arc<tokio::sync::Semaphore>,
 ) -> Result<(), ErrorCode> {
     if let Some(gate) = security {
         let url_obj = reqwest::Url::parse(url).map_err(|_| ErrorCode::InvalidRequest)?;
@@ -175,7 +175,7 @@ async fn check_http_security(
         let full_url = url.to_string();
         let m = method.to_string();
         let gate = gate.clone();
-        let check = util::bounded_await(host_semaphore, async move {
+        let check = util::bounded_await(io_semaphore, async move {
             gate.check_http_request(&capsule_id, &m, &full_url).await
         })
         .await;
@@ -212,14 +212,14 @@ impl http::Host for HostState {
     ) -> Result<HttpResponseData, ErrorCode> {
         let capsule_id = self.capsule_id.as_str().to_owned();
         let security = self.security.clone();
-        let host_semaphore = self.host_semaphore.clone();
+        let io_semaphore = self.io_semaphore.clone();
 
         check_http_security(
             &security,
             capsule_id,
             &request.url,
             method_name(&request.method),
-            &host_semaphore,
+            &io_semaphore,
         )
         .await?;
 
@@ -239,7 +239,7 @@ impl http::Host for HostState {
         }
 
         let response =
-            util::bounded_await(&host_semaphore, async move { request_builder.send().await })
+            util::bounded_await(&io_semaphore, async move { request_builder.send().await })
                 .await
                 .map_err(|e| map_reqwest_err(&e))?;
 
@@ -255,7 +255,7 @@ impl http::Host for HostState {
             }
         }
 
-        let body = util::bounded_await(&host_semaphore, async move {
+        let body = util::bounded_await(&io_semaphore, async move {
             let mut response = response;
             let mut bytes = Vec::new();
             while let Some(chunk) = response.chunk().await.map_err(|e| map_reqwest_err(&e))? {
@@ -293,14 +293,14 @@ impl http::Host for HostState {
 
         let capsule_id = self.capsule_id.as_str().to_owned();
         let security = self.security.clone();
-        let host_semaphore = self.host_semaphore.clone();
+        let io_semaphore = self.io_semaphore.clone();
 
         check_http_security(
             &security,
             capsule_id,
             &request.url,
             method_name(&request.method),
-            &host_semaphore,
+            &io_semaphore,
         )
         .await?;
 
@@ -319,7 +319,7 @@ impl http::Host for HostState {
         }
 
         let response =
-            util::bounded_await(&host_semaphore, async move { request_builder.send().await })
+            util::bounded_await(&io_semaphore, async move { request_builder.send().await })
                 .await
                 .map_err(|e| map_reqwest_err(&e))?;
 
@@ -383,7 +383,7 @@ impl HostHttpStream for HostState {
             .map_err(|_| ErrorCode::Closed)?;
         let response_arc = stream.response.clone();
         let cancel = self.cancel_token.clone();
-        let sem = self.host_semaphore.clone();
+        let sem = self.io_semaphore.clone();
         let started = std::time::Instant::now();
         let result = util::bounded_await_cancellable(&sem, &cancel, async {
             let mut resp = response_arc.lock().await;

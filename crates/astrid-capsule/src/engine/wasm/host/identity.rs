@@ -37,9 +37,9 @@ impl identity::Host for HostState {
 
         let capsule_id = self.capsule_id.to_string();
         let runtime_handle = self.runtime_handle.clone();
-        let host_semaphore = self.host_semaphore.clone();
+        let blocking_semaphore = self.blocking_semaphore.clone();
 
-        let result = util::bounded_block_on(&runtime_handle, &host_semaphore, async {
+        let result = util::bounded_block_on(&runtime_handle, &blocking_semaphore, async {
             security
                 .check_identity(&capsule_id, IdentityOperation::Resolve)
                 .await
@@ -71,9 +71,9 @@ impl identity::Host for HostState {
         let security = self.security.clone().ok_or(ErrorCode::CapabilityDenied)?;
         let capsule_id = self.capsule_id.to_string();
         let runtime_handle = self.runtime_handle.clone();
-        let host_semaphore = self.host_semaphore.clone();
+        let blocking_semaphore = self.blocking_semaphore.clone();
 
-        util::bounded_block_on(&runtime_handle, &host_semaphore, async {
+        util::bounded_block_on(&runtime_handle, &blocking_semaphore, async {
             security
                 .check_identity(&capsule_id, IdentityOperation::Link)
                 .await
@@ -100,9 +100,9 @@ impl identity::Host for HostState {
         let security = self.security.clone().ok_or(ErrorCode::CapabilityDenied)?;
         let capsule_id = self.capsule_id.to_string();
         let runtime_handle = self.runtime_handle.clone();
-        let host_semaphore = self.host_semaphore.clone();
+        let blocking_semaphore = self.blocking_semaphore.clone();
 
-        let removed = util::bounded_block_on(&runtime_handle, &host_semaphore, async {
+        let removed = util::bounded_block_on(&runtime_handle, &blocking_semaphore, async {
             security
                 .check_identity(&capsule_id, IdentityOperation::Unlink)
                 .await
@@ -131,9 +131,9 @@ impl identity::Host for HostState {
         let security = self.security.clone().ok_or(ErrorCode::CapabilityDenied)?;
         let capsule_id = self.capsule_id.to_string();
         let runtime_handle = self.runtime_handle.clone();
-        let host_semaphore = self.host_semaphore.clone();
+        let blocking_semaphore = self.blocking_semaphore.clone();
 
-        let created = util::bounded_block_on(&runtime_handle, &host_semaphore, async {
+        let created = util::bounded_block_on(&runtime_handle, &blocking_semaphore, async {
             security
                 .check_identity(&capsule_id, IdentityOperation::CreateUser)
                 .await
@@ -164,9 +164,9 @@ impl identity::Host for HostState {
         let security = self.security.clone().ok_or(ErrorCode::CapabilityDenied)?;
         let capsule_id = self.capsule_id.to_string();
         let runtime_handle = self.runtime_handle.clone();
-        let host_semaphore = self.host_semaphore.clone();
+        let blocking_semaphore = self.blocking_semaphore.clone();
 
-        let links = util::bounded_block_on(&runtime_handle, &host_semaphore, async {
+        let links = util::bounded_block_on(&runtime_handle, &blocking_semaphore, async {
             security
                 .check_identity(&capsule_id, IdentityOperation::ListLinks)
                 .await

@@ -54,6 +54,8 @@ pub struct Config {
     pub sessions: SessionsSection,
     /// Sub-agent pool limits.
     pub subagents: SubagentsSection,
+    /// Capsule runtime concurrency ceilings (host-call semaphores, etc.).
+    pub capsule: CapsuleSection,
     /// Retry behaviour for transient failures.
     pub retry: RetrySection,
     /// Agent identity seed (static fallback for spark.toml).
@@ -759,6 +761,34 @@ impl Default for SubagentsSection {
             timeout_secs: 300,
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// CapsuleSection
+// ---------------------------------------------------------------------------
+
+/// Capsule runtime tuning knobs (host-call concurrency ceilings).
+///
+/// Every field is `Option`: `None` means "use the host-derived default" (the
+/// daemon reads CPU cores / the file-descriptor limit at boot). An explicit
+/// value overrides that default. This is the config-file layer of the
+/// precedence chain CLI flag > config file > `ASTRID_CAPSULE_*` env > host
+/// default; the daemon merges the layers and hands the resolved ceilings to the
+/// kernel.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CapsuleSection {
+    /// Ceiling on concurrent **blocking** host calls (`block_in_place` +
+    /// `block_on`: KV, identity, sys, fs, the net/process security gates, DNS,
+    /// sockets). `None` → roughly `cores - 2`. Keep this near the worker-pool
+    /// size; too high and blocking host work starves the tokio scheduler.
+    pub host_blocking_concurrency: Option<usize>,
+    /// Ceiling on concurrent **async-I/O** host calls (HTTP, `ipc::recv` —
+    /// calls that `.await` real I/O and free the worker). `None` →
+    /// cores-scaled, clamped by half the process file-descriptor limit. This is
+    /// the outbound-throughput gate the LLM path rides on; sizing it well above
+    /// the blocking ceiling is the point of the split.
+    pub host_io_concurrency: Option<usize>,
 }
 
 // ---------------------------------------------------------------------------

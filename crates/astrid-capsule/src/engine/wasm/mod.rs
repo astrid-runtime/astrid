@@ -15,6 +15,7 @@ use crate::manifest::CapsuleManifest;
 pub mod bindings;
 pub mod host;
 pub mod host_state;
+pub mod limits;
 mod pool;
 #[cfg(test)]
 mod test_fixtures;
@@ -257,6 +258,12 @@ pub struct WasmEngine {
     /// single-tenant => no exemption resolvable => the invoking principal is
     /// bounded (fail-secure), but still under the generous default budget.
     group_config: Option<Arc<astrid_core::GroupConfig>>,
+    /// Host-derived (operator-overridable) concurrency ceilings for this
+    /// capsule's host calls. Resolved once by the daemon and handed down the
+    /// loader chain like the fuel handles; sizes the per-instance
+    /// `blocking_semaphore` / `io_semaphore` at load time. `Default` (all
+    /// host-derived) in tests.
+    runtime_limits: limits::CapsuleRuntimeLimits,
 }
 
 impl WasmEngine {
@@ -270,11 +277,17 @@ impl WasmEngine {
     /// `fuel_rate` is the matching kernel-owned, shared per-principal CPU-rate
     /// limiter (the deny side); pass `FuelRateLimiter::default()` for an
     /// isolated limiter in tests.
+    ///
+    /// `runtime_limits` is the host-derived (operator-overridable) concurrency
+    /// ceiling pair the daemon resolves once and hands to every engine; pass
+    /// [`CapsuleRuntimeLimits::default`](limits::CapsuleRuntimeLimits::default)
+    /// for all-host-derived sizing in tests.
     pub fn new(
         manifest: CapsuleManifest,
         capsule_dir: PathBuf,
         fuel_ledger: crate::FuelLedger,
         fuel_rate: crate::FuelRateLimiter,
+        runtime_limits: limits::CapsuleRuntimeLimits,
     ) -> Self {
         Self {
             manifest,
@@ -292,6 +305,7 @@ impl WasmEngine {
             fuel_ledger,
             fuel_rate,
             group_config: None,
+            runtime_limits,
         }
     }
 }
@@ -958,8 +972,15 @@ impl ExecutionEngine for WasmEngine {
         // capsule registry after the blocking plugin build completes.
         let capsule_uuid = uuid::Uuid::new_v4();
 
-        // Create shared concurrency controls before entering the blocking plugin build.
-        let host_semaphore = HostState::default_host_semaphore();
+        // Create shared concurrency controls before entering the blocking
+        // plugin build. The blocking semaphore (cores-2-ish) gates host calls
+        // that pin a worker; the I/O semaphore (large, fd-clamped) gates async
+        // host calls that free the worker — sized from the resolved per-host
+        // limits so the LLM/HTTP path is not throttled by the blocking cap
+        // (`astrid#816`). Both are cloned into every pooled `HostState` so the
+        // ceilings are shared across the whole instance pool.
+        let blocking_semaphore = self.runtime_limits.blocking_semaphore();
+        let io_semaphore = self.runtime_limits.io_semaphore();
         let cancel_token = tokio_util::sync::CancellationToken::new();
         let cancel_token_for_state = cancel_token.clone();
         let process_tracker = Arc::new(crate::engine::wasm::host::process::ProcessTracker::new());
@@ -1257,7 +1278,8 @@ impl ExecutionEngine for WasmEngine {
                 lifecycle_phase: None,
                 secret_store: secret_store.clone(),
                 ready_tx: None,
-                host_semaphore: host_semaphore.clone(),
+                blocking_semaphore: blocking_semaphore.clone(),
+                io_semaphore: io_semaphore.clone(),
                 cancel_token: cancel_token_for_state.clone(),
                 session_token: session_tok.clone(),
                 interceptor_handles: Vec::new(),
@@ -2225,7 +2247,8 @@ pub async fn run_lifecycle(
         lifecycle_phase: Some(phase),
         secret_store: cfg.secret_store,
         ready_tx: None,
-        host_semaphore: HostState::default_host_semaphore(),
+        blocking_semaphore: HostState::default_blocking_semaphore(),
+        io_semaphore: HostState::default_io_semaphore(),
         cancel_token: tokio_util::sync::CancellationToken::new(),
         session_token: None,
         interceptor_handles: Vec::new(),

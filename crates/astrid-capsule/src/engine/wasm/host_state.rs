@@ -315,12 +315,24 @@ pub struct HostState {
     /// on this channel. The kernel waits on the corresponding receiver before
     /// loading dependent capsules.
     pub ready_tx: Option<watch::Sender<bool>>,
-    /// Bounded concurrency semaphore for host function blocking calls.
-    ///
-    /// Limits the number of concurrent `block_in_place` / `block_on` operations
-    /// across all capsules to prevent tokio thread-pool exhaustion.
-    /// Created via [`default_host_semaphore`].
-    pub host_semaphore: Arc<Semaphore>,
+    /// Bounded-concurrency semaphore for **blocking** host calls — the ones
+    /// that `block_in_place` + `block_on` and pin a tokio worker for the whole
+    /// permit-held wait (KV, identity, sys, fs, the net/process security gates,
+    /// DNS, sockets). Sized to roughly `cores - 2` so blocking host work cannot
+    /// starve the tokio scheduler. Created via
+    /// [`default_blocking_semaphore`](HostState::default_blocking_semaphore);
+    /// override via `[capsule].host_blocking_concurrency`.
+    pub blocking_semaphore: Arc<Semaphore>,
+    /// Bounded-concurrency semaphore for **async-I/O** host calls — the ones
+    /// that `.await` real I/O directly and free the tokio worker while pending
+    /// (HTTP request/stream, `ipc::recv`). Sized much larger than
+    /// [`blocking_semaphore`](Self::blocking_semaphore) and clamped by the
+    /// process file-descriptor limit, since each in-flight call may hold a
+    /// socket — this is the outbound-throughput gate the LLM path rides on
+    /// (`astrid#816`). Created via
+    /// [`default_io_semaphore`](HostState::default_io_semaphore); override via
+    /// `[capsule].host_io_concurrency`.
+    pub io_semaphore: Arc<Semaphore>,
     /// Cooperative cancellation token for long-running host function calls.
     ///
     /// Triggered during capsule unload to unblock every blocking host
@@ -447,17 +459,28 @@ impl HostState {
         &self.registered_uplinks
     }
 
-    /// Create the default host semaphore for bounding concurrent blocking calls.
+    /// Default **blocking** host-call semaphore (host-derived).
     ///
-    /// Reserves 2 threads for the tokio scheduler and event dispatch, with a
-    /// minimum of 2 permits so capsules can always make progress.
+    /// Sized to roughly `cores - 2`, reserving headroom for the tokio scheduler
+    /// and event dispatch so blocking host work cannot starve them. See
+    /// [`limits::host_blocking_concurrency_default`](super::limits::host_blocking_concurrency_default).
+    /// Used by the lifecycle-hook and test paths; the pooled interceptor path
+    /// sizes from the resolved [`CapsuleRuntimeLimits`](super::limits::CapsuleRuntimeLimits).
     #[must_use]
-    pub fn default_host_semaphore() -> Arc<Semaphore> {
+    pub fn default_blocking_semaphore() -> Arc<Semaphore> {
         Arc::new(Semaphore::new(
-            std::thread::available_parallelism()
-                .map(|n| n.get().saturating_sub(2).max(2))
-                .unwrap_or(2),
+            super::limits::host_blocking_concurrency_default(),
         ))
+    }
+
+    /// Default **async-I/O** host-call semaphore (host-derived, fd-clamped).
+    ///
+    /// Sized much larger than the blocking semaphore and clamped by the process
+    /// file-descriptor limit. See
+    /// [`limits::host_io_concurrency_default`](super::limits::host_io_concurrency_default).
+    #[must_use]
+    pub fn default_io_semaphore() -> Arc<Semaphore> {
+        Arc::new(Semaphore::new(super::limits::host_io_concurrency_default()))
     }
 
     /// Set the inbound message sender.
@@ -727,8 +750,12 @@ impl std::fmt::Debug for HostState {
             .field("has_inbound_tx", &self.inbound_tx.is_some())
             .field("registered_uplinks", &self.registered_uplinks.len())
             .field(
-                "host_semaphore_permits",
-                &self.host_semaphore.available_permits(),
+                "blocking_semaphore_permits",
+                &self.blocking_semaphore.available_permits(),
+            )
+            .field(
+                "io_semaphore_permits",
+                &self.io_semaphore.available_permits(),
             )
             .field("cancel_token_cancelled", &self.cancel_token.is_cancelled())
             .field("has_identity_store", &self.identity_store.is_some())

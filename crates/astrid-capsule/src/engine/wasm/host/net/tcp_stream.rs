@@ -36,7 +36,7 @@ impl HostTcpStream for HostState {
     fn read(&mut self, self_: Resource<TcpStream>) -> Result<NetReadStatus, ErrorCode> {
         let stream = net_stream(&self.resource_table, self_.rep())?;
         let rt = self.runtime_handle.clone();
-        let sem = self.host_semaphore.clone();
+        let sem = self.blocking_semaphore.clone();
         let tok = self.cancel_token.clone();
         let status = util::bounded_block_on_cancellable(&rt, &sem, &tok, async {
             match stream {
@@ -73,7 +73,7 @@ impl HostTcpStream for HostState {
         let bytes = data.len() as u64;
         let stream = net_stream(&self.resource_table, self_.rep())?;
         let rt = self.runtime_handle.clone();
-        let sem = self.host_semaphore.clone();
+        let sem = self.blocking_semaphore.clone();
         let tok = self.cancel_token.clone();
         let result = util::bounded_block_on_cancellable(&rt, &sem, &tok, async {
             match stream {
@@ -112,7 +112,7 @@ impl HostTcpStream for HostState {
     ) -> Result<Vec<u8>, ErrorCode> {
         let stream = net_stream(&self.resource_table, self_.rep())?;
         let rt = self.runtime_handle.clone();
-        let sem = self.host_semaphore.clone();
+        let sem = self.blocking_semaphore.clone();
         let tok = self.cancel_token.clone();
         let max = (max_bytes as usize).min(MAX_BYTES_PER_CALL);
         let result = util::bounded_block_on_cancellable(&rt, &sem, &tok, async {
@@ -155,7 +155,7 @@ impl HostTcpStream for HostState {
     fn write_bytes(&mut self, self_: Resource<TcpStream>, data: Vec<u8>) -> Result<u32, ErrorCode> {
         let stream = net_stream(&self.resource_table, self_.rep())?;
         let rt = self.runtime_handle.clone();
-        let sem = self.host_semaphore.clone();
+        let sem = self.blocking_semaphore.clone();
         let tok = self.cancel_token.clone();
         let result = util::bounded_block_on_cancellable(&rt, &sem, &tok, async {
             match stream {
@@ -189,7 +189,7 @@ impl HostTcpStream for HostState {
     fn peek(&mut self, self_: Resource<TcpStream>, max_bytes: u32) -> Result<Vec<u8>, ErrorCode> {
         let stream = net_stream(&self.resource_table, self_.rep())?;
         let rt = self.runtime_handle.clone();
-        let sem = self.host_semaphore.clone();
+        let sem = self.blocking_semaphore.clone();
         let tok = self.cancel_token.clone();
         let max = (max_bytes as usize).min(MAX_BYTES_PER_CALL);
         let result: Result<Vec<u8>, ErrorCode> = match stream {
@@ -226,7 +226,7 @@ impl HostTcpStream for HostState {
     fn shutdown(&mut self, self_: Resource<TcpStream>, how: ShutdownHow) -> Result<(), ErrorCode> {
         let stream = net_stream(&self.resource_table, self_.rep())?;
         let rt = self.runtime_handle.clone();
-        let sem = self.host_semaphore.clone();
+        let sem = self.blocking_semaphore.clone();
         let tok = self.cancel_token.clone();
         let std_how = match how {
             ShutdownHow::Receive => std::net::Shutdown::Read,

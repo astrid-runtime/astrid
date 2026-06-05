@@ -205,7 +205,7 @@ impl approval::Host for HostState {
         let runtime_handle = self.runtime_handle.clone();
         let capsule_id = self.capsule_id.to_string();
         let cancel_token = self.cancel_token.clone();
-        let host_semaphore = self.host_semaphore.clone();
+        let blocking_semaphore = self.blocking_semaphore.clone();
         let workspace_root = self.workspace_root.clone();
         // Layer 4 (#668): the invoking principal scopes allowance lookups.
         // Falls back to the capsule owner for load-time / tests / daemons.
@@ -276,7 +276,7 @@ impl approval::Host for HostState {
         // Block until response, timeout, or cancellation.
         let event = util::bounded_block_on_cancellable(
             &runtime_handle,
-            &host_semaphore,
+            &blocking_semaphore,
             &cancel_token,
             async {
                 tokio::time::timeout(
