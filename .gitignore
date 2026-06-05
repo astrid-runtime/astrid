@@ -26,18 +26,11 @@ secrets.toml
 # Tools
 /tools
 
-# Compiled WASM test fixtures (rebuild via scripts/compile-test-plugin.sh)
+# Compiled WASM artifacts and test fixtures
 **/*.wasm
 
 # Generated test fixtures (rebuilt by test setup)
 crates/astrid-integration-tests/tests/fixtures/
-
-# QuickJS kernel (rebuild via scripts/build-quickjs-kernel.sh)
-# (covered by **/*.wasm above)
-
-# Node.js (packages/)
-packages/*/node_modules/
-packages/*/dist/
 
 # AI
 .astrid

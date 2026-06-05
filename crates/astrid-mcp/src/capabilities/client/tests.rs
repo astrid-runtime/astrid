@@ -47,7 +47,7 @@ fn register_test_uplink(
     platform: &str,
     capsule_id: &str,
 ) -> UplinkId {
-    let source = UplinkSource::new_openclaw(capsule_id).expect("valid capsule_id");
+    let source = UplinkSource::new_bridge(capsule_id).expect("valid capsule_id");
     let descriptor = UplinkDescriptor::builder(name, platform)
         .source(source)
         .profile(UplinkProfile::Bridge)

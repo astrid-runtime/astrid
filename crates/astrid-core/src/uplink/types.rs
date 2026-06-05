@@ -148,7 +148,7 @@ pub enum UplinkProfile {
     Interactive,
     /// Fire-and-forget notifications only.
     Notify,
-    /// Protocol bridge (`OpenClaw`, MCP relay).
+    /// Protocol bridge (Telegram, Discord, MCP relay).
     Bridge,
 }
 
@@ -185,7 +185,7 @@ impl FromStr for UplinkProfile {
 ///
 /// # Trust boundary
 ///
-/// The [`new_wasm`](Self::new_wasm) and [`new_openclaw`](Self::new_openclaw)
+/// The [`new_wasm`](Self::new_wasm) and [`new_bridge`](Self::new_bridge)
 /// constructors validate the `capsule_id`. Direct struct construction or
 /// [`Deserialize`] bypass this validation — only use those paths with
 /// trusted data.
@@ -195,7 +195,7 @@ impl FromStr for UplinkProfile {
 /// Uses serde's default externally-tagged representation:
 /// - `"native"` for [`Native`](Self::Native)
 /// - `{"wasm": {"capsule_id": "..."}}` for [`Wasm`](Self::Wasm)
-/// - `{"open_claw": {"capsule_id": "..."}}` for [`OpenClaw`](Self::OpenClaw)
+/// - `{"bridge": {"capsule_id": "..."}}` for [`Bridge`](Self::Bridge)
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum UplinkSource {
@@ -209,11 +209,11 @@ pub enum UplinkSource {
         /// lives in `astrid-capsule`.
         capsule_id: String,
     },
-    /// `OpenClaw`-bridged capsule uplink.
-    OpenClaw {
+    /// Protocol-bridged capsule uplink (Telegram, Discord, MCP relay).
+    Bridge {
         /// Capsule identifier — lowercase alphanumeric and hyphens, must not
         /// start or end with a hyphen. Validated by
-        /// [`UplinkSource::new_openclaw`]; the canonical `CapsuleId` type
+        /// [`UplinkSource::new_bridge`]; the canonical `CapsuleId` type
         /// lives in `astrid-capsule`.
         capsule_id: String,
     },
@@ -237,7 +237,7 @@ impl UplinkSource {
         Ok(Self::Wasm { capsule_id: id })
     }
 
-    /// Create an [`OpenClaw`](Self::OpenClaw) source with a validated capsule ID.
+    /// Create a [`Bridge`](Self::Bridge) source with a validated capsule ID.
     ///
     /// The `capsule_id` must be non-empty, contain only lowercase ASCII
     /// alphanumeric characters and hyphens, and must not start or end with
@@ -248,10 +248,10 @@ impl UplinkSource {
     /// Returns [`UplinkError::InvalidCapsuleId`] if the ID is empty,
     /// starts or ends with a hyphen, or contains characters outside
     /// `[a-z0-9-]`.
-    pub fn new_openclaw(capsule_id: impl Into<String>) -> UplinkResult<Self> {
+    pub fn new_bridge(capsule_id: impl Into<String>) -> UplinkResult<Self> {
         let id = capsule_id.into();
         validate_capsule_id(&id)?;
-        Ok(Self::OpenClaw { capsule_id: id })
+        Ok(Self::Bridge { capsule_id: id })
     }
 }
 
@@ -296,9 +296,9 @@ impl fmt::Display for UplinkSource {
                 let safe = crate::utils::truncate_to_boundary(capsule_id, 64);
                 write!(f, "wasm({safe})")
             },
-            Self::OpenClaw { capsule_id } => {
+            Self::Bridge { capsule_id } => {
                 let safe = crate::utils::truncate_to_boundary(capsule_id, 64);
-                write!(f, "openclaw({safe})")
+                write!(f, "bridge({safe})")
             },
         }
     }

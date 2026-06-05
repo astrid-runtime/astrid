@@ -1,5 +1,0 @@
-# Allow duplicate symbols from coexisting wasmtime v36 (wizer) and v37 (extism).
-# Both versions export `wasmtime_continuation_start` as a C symbol; the linker
-# picks the first definition and ignores the duplicate.
-[target.x86_64-unknown-linux-gnu]
-rustflags = ["-C", "link-args=-Wl,--allow-multiple-definition"]

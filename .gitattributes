@@ -1,5 +1,3 @@
-crates/astrid-openclaw/kernel/engine.wasm binary
-
 # Use union merge for CHANGELOG to avoid conflicts when multiple PRs
 # update [Unreleased] concurrently. Both sets of lines are kept.
 CHANGELOG.md merge=union

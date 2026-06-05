@@ -843,7 +843,7 @@ impl SparkSection {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct UplinkConfig {
-    /// Plugin ID (e.g. `"openclaw-telegram"`).
+    /// Plugin ID (e.g. `"telegram-uplink"`).
     pub plugin: String,
     /// Expected uplink profile: `"chat"`, `"interactive"`, `"notify"`, or
     /// `"bridge"`. Unknown values are logged and default to `"chat"`.
@@ -1014,18 +1014,18 @@ core = "I value clarity."
     fn test_uplinks_parse() {
         let toml = r#"
 [[uplinks]]
-plugin = "openclaw-telegram"
+plugin = "telegram-uplink"
 profile = "chat"
 
 [[uplinks]]
-plugin = "openclaw-discord"
+plugin = "discord-uplink"
 profile = "bridge"
 "#;
         let cfg: Config = toml::from_str(toml).unwrap();
         assert_eq!(cfg.uplinks.len(), 2);
-        assert_eq!(cfg.uplinks[0].plugin, "openclaw-telegram");
+        assert_eq!(cfg.uplinks[0].plugin, "telegram-uplink");
         assert_eq!(cfg.uplinks[0].profile, "chat");
-        assert_eq!(cfg.uplinks[1].plugin, "openclaw-discord");
+        assert_eq!(cfg.uplinks[1].plugin, "discord-uplink");
         assert_eq!(cfg.uplinks[1].profile, "bridge");
     }
 

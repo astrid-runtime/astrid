@@ -172,7 +172,7 @@ mod tests {
     /// the capsule directory remains accessible.
     #[test]
     fn test_seatbelt_prefix_writable_inside_hidden_path() {
-        let config = ProcessSandboxConfig::new("/Users/testuser/.astrid/capsules/openclaw-unicity")
+        let config = ProcessSandboxConfig::new("/Users/testuser/.astrid/capsules/bridge-unicity")
             .with_hidden("/Users/testuser/.astrid");
         let prefix = config.build_seatbelt_prefix().unwrap();
 

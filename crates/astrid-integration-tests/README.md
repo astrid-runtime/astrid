@@ -26,10 +26,6 @@ Unit tests prove a crate works in isolation. Integration tests prove the OS work
 ## Running
 
 ```bash
-# Build the WASM test fixture first
-./scripts/compile-test-plugin.sh
-
-# Run the full suite
 cargo test -p astrid-integration-tests
 ```
 

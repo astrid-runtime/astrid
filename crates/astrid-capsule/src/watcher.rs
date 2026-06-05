@@ -40,9 +40,6 @@ pub(crate) const IGNORED_DIRS: &[&str] = &["node_modules", "target", "dist", ".g
 /// File extensions to exclude from source hashing (generated artifacts).
 const IGNORED_EXTENSIONS: &[&str] = &["wasm"];
 
-/// Specific filenames to exclude from source hashing (generated files).
-const IGNORED_FILENAMES: &[&str] = &["astrid_bridge.mjs"];
-
 /// Events emitted by the capsule watcher.
 #[derive(Debug, Clone)]
 pub(crate) enum WatchEvent {
@@ -360,8 +357,7 @@ fn is_in_ignored_dir(path: &Path) -> bool {
 /// both file paths (to detect renames) and file contents.
 ///
 /// Directories in [`IGNORED_DIRS`] are skipped. Generated artifacts (`.wasm`
-/// files, `astrid_bridge.mjs`) are excluded to prevent recompilation feedback
-/// loops.
+/// files) are excluded to prevent recompilation feedback loops.
 ///
 /// # Errors
 ///
@@ -424,12 +420,6 @@ fn collect_source_paths(dir: &Path, paths: &mut Vec<PathBuf>) -> std::io::Result
             }
             collect_source_paths(&path, paths)?;
         } else if file_type.is_file() {
-            let name = entry.file_name();
-            let name_str = name.to_string_lossy();
-
-            if IGNORED_FILENAMES.contains(&name_str.as_ref()) {
-                continue;
-            }
             if path
                 .extension()
                 .and_then(|e| e.to_str())

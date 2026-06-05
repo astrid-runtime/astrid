@@ -14,17 +14,17 @@ Pre-declare connectors to be validated at startup. This ensures that essential c
 
 ```toml
 [[connectors]]
-plugin = "openclaw-telegram"
+plugin = "telegram-uplink"
 profile = "chat"
 
 [[connectors]]
-plugin = "openclaw-discord"
+plugin = "discord-uplink"
 profile = "bridge"
 ```
 
 | Field | Type | Description |
 |---|---|---|
-| `plugin` | string | The ID of the plugin providing the connector (e.g., `"openclaw-telegram"`). |
+| `plugin` | string | The ID of the plugin providing the connector (e.g., `"telegram-uplink"`). |
 | `profile` | string | The expected behavioral profile: `"chat"`, `"interactive"`, `"notify"`, or `"bridge"`. |
 
 ## Identity Links

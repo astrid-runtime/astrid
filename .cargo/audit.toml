@@ -3,7 +3,7 @@
 #
 # All ignored advisories are transitive dependencies we cannot patch directly.
 # Each entry documents the risk assessment and our defensive measures.
-# Re-evaluate on every extism or surrealdb major version bump.
+# Re-evaluate on every surrealdb or wasmtime major version bump.
 
 [advisories]
 ignore = [
@@ -12,25 +12,6 @@ ignore = [
     # Mitigation: Astrid uses ed25519 for all auth/signing (astrid-crypto). RSA is only
     # used internally by SurrealDB for JWT in embedded mode, not exposed to network attackers.
     "RUSTSEC-2023-0071",
-
-    # wasmtime WASI resource exhaustion (medium, 6.9) - transitive via extism -> wasmtime 37.
-    # Waiting on extism to bump wasmtime to a patched release.
-    # Mitigation: Capsules run with Extism memory limits (page cap via Manifest). Host-side
-    # timeouts and resource budgets bound execution. WASI preview 1 only (no network/sockets).
-    "RUSTSEC-2026-0020",
-
-    # wasmtime HTTP fields panic (medium, 6.9) - transitive via extism -> wasmtime 37.
-    # Waiting on extism to bump wasmtime to a patched release.
-    # Mitigation: Not reachable. Capsules use WASI preview 1 (wasi-common), which does not
-    # expose wasi:http. All HTTP goes through Astrid host functions.
-    "RUSTSEC-2026-0021",
-
-    # wasmtime f64.copysign out-of-sandbox read (medium, 4.1) - transitive via extism -> wasmtime 37.
-    # Waiting on extism to bump wasmtime to a patched release.
-    # Mitigation: Exploitation requires a crafted WASM module targeting a specific x86-64
-    # instruction sequence. All capsules are blake3 hash-verified before loading. Untrusted
-    # capsule sources are rejected unless explicitly allowed by the operator.
-    "RUSTSEC-2026-0006",
 ]
 informational_warnings = []
 
