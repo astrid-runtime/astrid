@@ -271,7 +271,7 @@ mod tests {
     /// through.
     #[test]
     fn test_bwrap_prefix_writable_inside_hidden_path() {
-        let config = ProcessSandboxConfig::new("/home/user/.astrid/capsules/openclaw-unicity")
+        let config = ProcessSandboxConfig::new("/home/user/.astrid/capsules/bridge-unicity")
             .with_hidden("/home/user/.astrid");
         let prefix = config.build_bwrap_prefix();
 
@@ -295,7 +295,7 @@ mod tests {
             .filter(|(_, a)| *a == "--bind")
             .find(|(i, _)| {
                 args_str.get(i + 1)
-                    == Some(&"/home/user/.astrid/capsules/openclaw-unicity".to_string())
+                    == Some(&"/home/user/.astrid/capsules/bridge-unicity".to_string())
             })
             .map(|(i, _)| i)
             .expect("should have --bind for writable root");

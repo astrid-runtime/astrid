@@ -19,7 +19,7 @@ This crate exists because the kernel, the capsule runtime, the approval system, 
 
 ## Uplinks
 
-`UplinkDescriptor` (builder pattern) with `UplinkCapabilities` (flag struct: `full()`, `notify_only()`, `receive_only()` presets), `UplinkProfile` (chat, interactive, notify, bridge), and `UplinkSource` (native, WASM, OpenClaw). Hard limit of 32 uplinks per capsule, enforced at the type level.
+`UplinkDescriptor` (builder pattern) with `UplinkCapabilities` (flag struct: `full()`, `notify_only()`, `receive_only()` presets), `UplinkProfile` (chat, interactive, notify, bridge), and `UplinkSource` (native, WASM, Bridge). Hard limit of 32 uplinks per capsule, enforced at the type level.
 
 ## Elicitation
 

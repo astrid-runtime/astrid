@@ -40,15 +40,12 @@ pub(crate) const IGNORED_DIRS: &[&str] = &["node_modules", "target", "dist", ".g
 /// File extensions to exclude from source hashing (generated artifacts).
 const IGNORED_EXTENSIONS: &[&str] = &["wasm"];
 
-/// Specific filenames to exclude from source hashing (generated files).
-const IGNORED_FILENAMES: &[&str] = &["astrid_bridge.mjs"];
-
 /// Events emitted by the capsule watcher.
 #[derive(Debug, Clone)]
 pub(crate) enum WatchEvent {
     /// A capsule's source files changed and may need recompilation.
     CapsuleChanged {
-        /// The capsule's root directory (contains `Capsule.toml` or `openclaw.plugin.json`).
+        /// The capsule's root directory (contains `Capsule.toml`).
         capsule_dir: PathBuf,
         /// blake3 hash of the capsule's source tree after the change.
         source_hash: String,
@@ -239,9 +236,9 @@ impl CapsuleWatcher {
 
     /// Walk up from a changed file to find its parent capsule directory.
     ///
-    /// A capsule directory is identified by containing `Capsule.toml` or
-    /// `openclaw.plugin.json`. Starts from the parent of the changed path
-    /// to avoid an unnecessary `stat` syscall on the path itself.
+    /// A capsule directory is identified by containing `Capsule.toml`.
+    /// Starts from the parent of the changed path to avoid an unnecessary
+    /// `stat` syscall on the path itself.
     fn resolve_capsule_dir(&self, path: &Path) -> Option<PathBuf> {
         // Start from the parent directory — for files in the capsule root
         // (including manifests like Capsule.toml), parent() gives the capsule
@@ -249,9 +246,7 @@ impl CapsuleWatcher {
         let mut current = path.parent()?.to_path_buf();
 
         loop {
-            if current.join(MANIFEST_FILE_NAME).exists()
-                || current.join("openclaw.plugin.json").exists()
-            {
+            if current.join(MANIFEST_FILE_NAME).exists() {
                 return Some(current);
             }
 
@@ -362,8 +357,7 @@ fn is_in_ignored_dir(path: &Path) -> bool {
 /// both file paths (to detect renames) and file contents.
 ///
 /// Directories in [`IGNORED_DIRS`] are skipped. Generated artifacts (`.wasm`
-/// files, `astrid_bridge.mjs`) are excluded to prevent recompilation feedback
-/// loops.
+/// files) are excluded to prevent recompilation feedback loops.
 ///
 /// # Errors
 ///
@@ -426,12 +420,6 @@ fn collect_source_paths(dir: &Path, paths: &mut Vec<PathBuf>) -> std::io::Result
             }
             collect_source_paths(&path, paths)?;
         } else if file_type.is_file() {
-            let name = entry.file_name();
-            let name_str = name.to_string_lossy();
-
-            if IGNORED_FILENAMES.contains(&name_str.as_ref()) {
-                continue;
-            }
             if path
                 .extension()
                 .and_then(|e| e.to_str())

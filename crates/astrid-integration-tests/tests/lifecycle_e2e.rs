@@ -2,8 +2,8 @@
 //!
 //! Tests that don't require lifecycle exports in the fixture (skip path, invalid
 //! WASM) run against the current fixture. Tests that exercise actual lifecycle
-//! hooks require the fixture to be rebuilt after adding `#[astrid::install]` /
-//! `#[astrid::upgrade]` to `test-plugin-guest` (see `scripts/compile-test-plugin.sh`).
+//! hooks self-skip unless a fixture exporting `#[astrid::install]` /
+//! `#[astrid::upgrade]` is present.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -98,8 +98,7 @@ async fn test_lifecycle_rejects_invalid_wasm() {
 /// full install lifecycle with elicit. A background task responds to elicit
 /// requests so the host function unblocks.
 ///
-/// Requires: `./scripts/compile-test-plugin.sh` after adding `#[astrid::install]`
-/// to the test guest.
+/// Self-skips unless a fixture exporting `#[astrid::install]` is present.
 #[tokio::test(flavor = "multi_thread")]
 async fn test_lifecycle_install_with_elicit() {
     let Some(path) = fixture_path() else {

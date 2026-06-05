@@ -16,7 +16,7 @@ Three companion binaries work together:
 |---|---|---|
 | `astrid` | astrid-cli | Terminal frontend (TUI, REPL, capsule management) |
 | `astrid-daemon` | astrid-daemon | Background kernel process (boots kernel, loads capsules, serves IPC) |
-| `astrid-build` | astrid-build | Capsule compiler and packager (Rust, OpenClaw, MCP) |
+| `astrid-build` | astrid-build | Capsule compiler and packager (Rust, MCP) |
 
 The CLI discovers companion binaries in the same directory as itself, falling back to `PATH`. It never links the kernel directly — all communication is over the Unix domain socket via length-prefixed JSON.
 

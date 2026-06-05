@@ -2,7 +2,7 @@
 //!
 //! Delegates to the shared install library at
 //! [`astrid_capsule_install`]. The handler is **path-only**: network
-//! sources (`@org/repo`, GitHub URLs, `openclaw:…`, `gh:`, raw HTTPS)
+//! sources (`@org/repo`, GitHub URLs, `gh:`, raw HTTPS)
 //! are rejected with a structured error. The daemon must not fetch
 //! arbitrary bytes during an install — that posture is enforced here.
 //!
@@ -52,7 +52,6 @@ pub(super) async fn handle_install_capsule(
         || source.starts_with("http://")
         || source.starts_with("github.com/")
         || source.starts_with('@')
-        || source.starts_with("openclaw:")
         || source.starts_with("gh:");
     if is_remote {
         return KernelResponse::Error(format!(

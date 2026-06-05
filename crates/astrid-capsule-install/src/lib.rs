@@ -25,7 +25,7 @@
 //!   capsule has unset `[env]` fields, here's the env file path". The
 //!   CLI prompts on that signal; the kernel-side handler ignores it
 //!   (the dashboard collects env via a separate gateway route).
-//! * Source resolution. `gh:`, `github:`, `openclaw:`, build-from-
+//! * Source resolution. `gh:`, `github:`, build-from-
 //!   source, .capsule download — all of that lives in the CLI. By the
 //!   time we get called the source is a path on disk.
 //! * Import-conflict reporting. Both [`validate_imports`] and

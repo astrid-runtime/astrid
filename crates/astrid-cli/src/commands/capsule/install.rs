@@ -1,11 +1,10 @@
 //! `astrid capsule install` — source resolution, then hand off to the install lib.
 //!
 //! This file owns the **source-resolution** side of installing a capsule:
-//! GitHub release-asset download with clone-and-build fallback, `OpenClaw`
-//! transpile via `astrid-build`, archive (`*.capsule`) detection, local
-//! Cargo-source auto-build, and the dispatcher that routes `@org/repo`,
-//! `openclaw:…`, `github.com/…`, and `./local` shapes to the right
-//! pathway.
+//! GitHub release-asset download with clone-and-build fallback, archive
+//! (`*.capsule`) detection, local Cargo-source auto-build, and the
+//! dispatcher that routes `@org/repo`, `github.com/…`, and `./local`
+//! shapes to the right pathway.
 //!
 //! The **post-resolution** install machinery (file layout, content
 //! addressing of WASM/WIT into `bin/<hash>.wasm` / `wit/<hash>.wit`,
@@ -77,23 +76,13 @@ fn extract_github_org_repo(url: &str) -> Option<(&str, &str)> {
 
 /// Parse a capsule source string into `(org, repo)` for GitHub-backed sources.
 ///
-/// Handles `@org/repo`, `openclaw:@org/repo`, `github.com/org/repo`, and
+/// Handles `@org/repo`, `github.com/org/repo`, and
 /// `https://github.com/org/repo`.
 pub(super) fn parse_github_source(source: &str) -> Option<(String, String)> {
     if let Some(repo_path) = source.strip_prefix('@') {
         let parts: Vec<&str> = repo_path.splitn(2, '/').collect();
         if parts.len() == 2 && !parts[0].is_empty() && !parts[1].is_empty() {
             return Some((parts[0].to_string(), parts[1].to_string()));
-        }
-        return None;
-    }
-
-    if let Some(rest) = source.strip_prefix("openclaw:") {
-        if let Some(repo_path) = rest.strip_prefix('@') {
-            let parts: Vec<&str> = repo_path.splitn(2, '/').collect();
-            if parts.len() == 2 && !parts[0].is_empty() && !parts[1].is_empty() {
-                return Some((parts[0].to_string(), parts[1].to_string()));
-            }
         }
         return None;
     }
@@ -131,27 +120,18 @@ async fn install_capsule_inner(source: &str, workspace: bool) -> anyhow::Result<
         return install_from_local(source, workspace, &home, None);
     }
 
-    // 2. OpenClaw prefix.
-    if let Some(rest) = source.strip_prefix("openclaw:") {
-        if let Some(repo) = rest.strip_prefix('@') {
-            let url = format!("https://github.com/{repo}");
-            return install_from_github(&url, workspace, &home, true, Some(source)).await;
-        }
-        return install_from_openclaw(rest, workspace, &home, Some(source));
-    }
-
-    // 3. Namespace alias @org/repo → GitHub.
+    // 2. Namespace alias @org/repo → GitHub.
     if let Some(repo) = source.strip_prefix('@') {
         let url = format!("https://github.com/{repo}");
-        return install_from_github(&url, workspace, &home, false, Some(source)).await;
+        return install_from_github(&url, workspace, &home, Some(source)).await;
     }
 
-    // 4. Raw GitHub URL.
+    // 3. Raw GitHub URL.
     if source.starts_with("github.com/") || source.starts_with("https://github.com/") {
-        return install_from_github(source, workspace, &home, false, Some(source)).await;
+        return install_from_github(source, workspace, &home, Some(source)).await;
     }
 
-    // 5. Fallback: assume local folder.
+    // 4. Fallback: assume local folder.
     install_from_local(source, workspace, &home, None)
 }
 
@@ -163,7 +143,6 @@ async fn install_from_github(
     url: &str,
     workspace: bool,
     home: &AstridHome,
-    _is_openclaw: bool,
     original_source: Option<&str>,
 ) -> anyhow::Result<()> {
     let client = reqwest::Client::builder()
@@ -262,63 +241,6 @@ fn clone_and_build(
 }
 
 // ---------------------------------------------------------------------------
-// OpenClaw flow — local transpile via astrid-build.
-// ---------------------------------------------------------------------------
-
-fn install_from_openclaw(
-    source: &str,
-    workspace: bool,
-    home: &AstridHome,
-    original_source: Option<&str>,
-) -> anyhow::Result<()> {
-    let capsule_name = source.strip_prefix("openclaw:").unwrap_or(source);
-
-    let source_path = Path::new(capsule_name);
-    if !source_path.exists() {
-        bail!(
-            "OpenClaw registry fetch not yet implemented. Please provide a local path to the \
-             OpenClaw capsule directory."
-        );
-    }
-
-    transpile_and_install(source_path, workspace, home, original_source)
-}
-
-fn transpile_and_install(
-    source_path: &Path,
-    workspace: bool,
-    home: &AstridHome,
-    original_source: Option<&str>,
-) -> anyhow::Result<()> {
-    let tmp_dir = tempfile::tempdir().context("failed to create temp dir for transpilation")?;
-    let output_dir = tmp_dir.path();
-
-    let build_bin = crate::bootstrap::find_companion_binary("astrid-build")?;
-    let status = std::process::Command::new(build_bin)
-        .arg(source_path)
-        .arg("--output")
-        .arg(output_dir)
-        .arg("--type")
-        .arg("openclaw")
-        .status()
-        .context("Failed to run astrid-build for OpenClaw transpilation")?;
-    if !status.success() {
-        bail!(
-            "OpenClaw compilation failed (astrid-build exit code {})",
-            status.code().unwrap_or(1)
-        );
-    }
-
-    for entry in std::fs::read_dir(output_dir)? {
-        let entry = entry?;
-        if entry.path().extension().and_then(|s| s.to_str()) == Some("capsule") {
-            return unpack_via_lib(&entry.path(), workspace, home, original_source);
-        }
-    }
-    bail!("OpenClaw compilation succeeded but no .capsule archive was produced")
-}
-
-// ---------------------------------------------------------------------------
 // Local-source dispatcher — archive vs directory vs Rust-source autobuild.
 // ---------------------------------------------------------------------------
 
@@ -331,13 +253,6 @@ fn install_from_local(
     let source_path = Path::new(source);
     if !source_path.exists() {
         bail!("Source path does not exist: {source}");
-    }
-
-    // Auto-detect OpenClaw (no Capsule.toml, has openclaw.plugin.json).
-    if source_path.join("openclaw.plugin.json").exists()
-        && !source_path.join("Capsule.toml").exists()
-    {
-        return transpile_and_install(source_path, workspace, home, original_source);
     }
 
     // Unpack `.capsule` archive when source is a file.
@@ -575,15 +490,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_github_source_openclaw_at() {
-        let (org, repo) = parse_github_source("openclaw:@org/repo").unwrap();
-        assert_eq!(org, "org");
-        assert_eq!(repo, "repo");
-    }
-
-    #[test]
     fn test_parse_github_source_non_github() {
-        assert!(parse_github_source("openclaw:my-capsule").is_none());
         assert!(parse_github_source("./local/path").is_none());
         assert!(parse_github_source("/absolute/path").is_none());
     }

@@ -33,12 +33,6 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: "1.95"
-          targets: wasm32-wasip1
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: "22"
 
       - name: Cache cargo registry
         uses: actions/cache@v4
@@ -84,12 +78,6 @@ jobs:
         with:
           toolchain: "1.95"
           components: clippy
-          targets: wasm32-wasip1
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: "22"
 
       - name: Cache cargo registry
         uses: actions/cache@v4
@@ -120,12 +108,7 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: "1.95"
-          targets: wasm32-unknown-unknown,wasm32-wasip1
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: "22"
+          targets: wasm32-unknown-unknown
 
       - name: Cache cargo registry
         uses: actions/cache@v4
@@ -139,12 +122,7 @@ jobs:
             ${{ runner.os }}-cargo-
 
       - name: Run tests
-        # astrid-openclaw is parked (preserved on the archive/openclaw branch).
-        # Its Tier 1 e2e tests need a QuickJS kernel built from a now-dead
-        # js-pdk fork, and that auto-build exhausted the runner disk (SIGBUS).
-        # Excluded from the test run until the crate's future is settled; it
-        # still compiles via build.rs's placeholder kernel under check/clippy.
-        run: cargo test --workspace --exclude astrid-openclaw
+        run: cargo test --workspace
 
   msrv:
     name: MSRV
@@ -158,12 +136,6 @@ jobs:
         uses: dtolnay/rust-toolchain@master
         with:
           toolchain: "1.95"
-          targets: wasm32-wasip1
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: "22"
 
       - name: Cache cargo registry
         uses: actions/cache@v4

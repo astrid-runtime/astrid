@@ -1,7 +1,6 @@
 # AppArmor profile for Astrid OS — allows unprivileged user namespace
 # creation so the bundled bubblewrap sandbox can build its mount /
-# pid / network namespace for native subprocess capsules (MCP servers,
-# OpenClaw Tier 2 plugins).
+# pid / network namespace for native subprocess capsules (MCP servers).
 #
 # Why this profile exists
 # -----------------------

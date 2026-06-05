@@ -42,12 +42,8 @@ pub(crate) fn run_build(
         "rust" => crate::rust::build(&target_dir, output)?,
         "mcp" => crate::mcp::convert(&target_dir, "mcp.json", output)?,
         "extension" => crate::mcp::convert(&target_dir, "gemini-extension.json", output)?,
-        "openclaw" => crate::openclaw::build(&target_dir, output)?,
         "js" | "ts" | "node" => {
-            bail!(
-                "Native JS/TS capsule SDK is not yet implemented. \
-                 For OpenClaw plugins, use --type openclaw or ensure openclaw.plugin.json exists."
-            );
+            bail!("Native JS/TS capsule SDK is not yet implemented.");
         },
         "static" => {
             bail!("Static No-Code building is not yet implemented in the CLI.");
@@ -55,7 +51,7 @@ pub(crate) fn run_build(
         unknown => {
             bail!(
                 "Unknown project type: {unknown}. \
-                 Supported types: rust, openclaw, mcp, extension"
+                 Supported types: rust, mcp, extension"
             );
         },
     }
@@ -72,12 +68,6 @@ fn detect_project_type(dir: &Path) -> Result<String> {
         return Ok("extension".to_string());
     }
 
-    // OpenClaw plugins are identified by their manifest file, distinct from
-    // a future native Astrid JS/TS SDK which would use Capsule.toml directly.
-    if dir.join("openclaw.plugin.json").exists() {
-        return Ok("openclaw".to_string());
-    }
-
     if dir.join("package.json").exists() {
         return Ok("js".to_string());
     }
@@ -92,7 +82,7 @@ fn detect_project_type(dir: &Path) -> Result<String> {
 
     bail!(
         "Could not automatically detect the project type. \
-         Please ensure a Cargo.toml, openclaw.plugin.json, gemini-extension.json, \
+         Please ensure a Cargo.toml, gemini-extension.json, \
          package.json, or Capsule.toml exists in the directory, or use the --type flag."
     );
 }
@@ -100,40 +90,8 @@ fn detect_project_type(dir: &Path) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use crate::archiver::pack_capsule_archive;
-    use astrid_capsule::discovery::load_manifest;
-    use astrid_openclaw::pipeline::{self, CompileOptions};
-    use astrid_openclaw::tier::PluginTier;
     use std::fs;
-    use std::path::{Path, PathBuf};
-
-    /// Create a minimal Tier 2 OpenClaw plugin (Node.js — no QuickJS kernel needed).
-    fn create_tier2_plugin(dir: &Path) {
-        let manifest = r#"{
-            "id": "lifecycle-test",
-            "name": "Lifecycle Test Plugin",
-            "version": "1.0.0",
-            "description": "Tests the full compile-archive-unpack-load cycle",
-            "kind": "tool",
-            "skills": ["testing"],
-            "configSchema": {
-                "type": "object",
-                "properties": {
-                    "apiKey": {"type": "string"},
-                    "endpoint": {"type": "string"}
-                }
-            }
-        }"#;
-        fs::write(dir.join("openclaw.plugin.json"), manifest).unwrap();
-
-        let pkg = r#"{"name": "lifecycle-test", "dependencies": {"got": "^1.0"}}"#;
-        fs::write(dir.join("package.json"), pkg).unwrap();
-
-        fs::create_dir_all(dir.join("src")).unwrap();
-        fs::write(
-            dir.join("src/index.js"),
-            "const got = require('got');\nmodule.exports.activate = function(ctx) {\n  ctx.registerTool('test', { description: 'test' }, () => 'ok');\n};",
-        ).unwrap();
-    }
+    use std::path::Path;
 
     /// Unpack a .capsule archive into a directory (mirrors install.rs logic).
     fn unpack_capsule(archive_path: &Path, dest: &Path) {
@@ -170,187 +128,6 @@ mod tests {
             }
             entry.unpack(&out_path).unwrap();
         }
-    }
-
-    #[test]
-    fn full_lifecycle_tier2_compile_archive_unpack_load() {
-        let plugin_dir = tempfile::tempdir().unwrap();
-        create_tier2_plugin(plugin_dir.path());
-
-        let build_dir = tempfile::tempdir().unwrap();
-        let config = std::collections::HashMap::new();
-        let result = pipeline::compile_plugin(&CompileOptions {
-            plugin_dir: plugin_dir.path(),
-            output_dir: build_dir.path(),
-            config: &config,
-            cache_dir: None,
-            js_only: false,
-            no_cache: true,
-        })
-        .expect("compilation should succeed");
-
-        assert_eq!(result.astrid_id, "lifecycle-test");
-        assert_eq!(result.tier, PluginTier::Node);
-
-        let toml_content = fs::read_to_string(build_dir.path().join("Capsule.toml"))
-            .expect("Capsule.toml should exist after compilation");
-
-        let archive_dir = tempfile::tempdir().unwrap();
-        let capsule_path = archive_dir.path().join("lifecycle-test.capsule");
-
-        let mut additional: Vec<PathBuf> = Vec::new();
-        for entry in fs::read_dir(build_dir.path()).unwrap() {
-            let entry = entry.unwrap();
-            if entry.file_name() == "Capsule.toml" {
-                continue;
-            }
-            additional.push(entry.path());
-        }
-        let refs: Vec<&Path> = additional.iter().map(PathBuf::as_path).collect();
-
-        pack_capsule_archive(
-            &capsule_path,
-            &toml_content,
-            None,
-            build_dir.path(),
-            &refs,
-            None,
-        )
-        .expect("archiving should succeed");
-
-        assert!(capsule_path.exists(), ".capsule file should exist");
-        assert!(
-            fs::metadata(&capsule_path).unwrap().len() > 0,
-            ".capsule should not be empty"
-        );
-
-        // Verify exactly one Capsule.toml in the archive
-        {
-            let tar_gz = fs::File::open(&capsule_path).unwrap();
-            let decoder = flate2::read::GzDecoder::new(tar_gz);
-            let mut archive = tar::Archive::new(decoder);
-            let toml_count = archive
-                .entries()
-                .unwrap()
-                .map(|e| e.expect("archive entry must be readable"))
-                .filter(|e| {
-                    e.path().expect("archive entry path must be valid").as_ref()
-                        == Path::new("Capsule.toml")
-                })
-                .count();
-            assert_eq!(
-                toml_count, 1,
-                "archive must contain exactly one Capsule.toml, found {toml_count}"
-            );
-        }
-
-        let unpack_dir = tempfile::tempdir().unwrap();
-        unpack_capsule(&capsule_path, unpack_dir.path());
-
-        assert!(unpack_dir.path().join("Capsule.toml").exists());
-        assert!(unpack_dir.path().join("astrid_bridge.mjs").exists());
-        assert!(unpack_dir.path().join("src").exists());
-        assert!(unpack_dir.path().join("package.json").exists());
-
-        let npm_available = build_dir.path().join("node_modules").exists();
-        if npm_available {
-            assert!(unpack_dir.path().join("node_modules").exists());
-        }
-
-        let manifest = load_manifest(&unpack_dir.path().join("Capsule.toml"))
-            .expect("unpacked Capsule.toml must be loadable");
-
-        assert_eq!(manifest.package.name, "lifecycle-test");
-        assert_eq!(manifest.package.version, "1.0.0");
-        assert!(!manifest.mcp_servers.is_empty());
-    }
-
-    #[test]
-    fn full_lifecycle_tier1_js_only_compile_archive_unpack_load() {
-        let plugin_dir = tempfile::tempdir().unwrap();
-        let manifest = r#"{
-            "id": "tier1-lifecycle",
-            "name": "Tier 1 Lifecycle",
-            "version": "2.0.0",
-            "description": "Tier 1 lifecycle test",
-            "configSchema": {
-                "type": "object",
-                "properties": {
-                    "token": {"type": "string"}
-                }
-            }
-        }"#;
-        fs::write(plugin_dir.path().join("openclaw.plugin.json"), manifest).unwrap();
-        fs::create_dir_all(plugin_dir.path().join("src")).unwrap();
-        fs::write(
-            plugin_dir.path().join("src/index.js"),
-            "module.exports.activate = function(ctx) {};",
-        )
-        .unwrap();
-
-        let build_dir = tempfile::tempdir().unwrap();
-        let config = std::collections::HashMap::new();
-        let result = pipeline::compile_plugin(&CompileOptions {
-            plugin_dir: plugin_dir.path(),
-            output_dir: build_dir.path(),
-            config: &config,
-            cache_dir: None,
-            js_only: true,
-            no_cache: true,
-        })
-        .expect("js_only compilation should succeed");
-
-        assert_eq!(result.tier, PluginTier::Wasm);
-
-        let shim_path = build_dir.path().join("shim.js");
-        assert!(shim_path.exists());
-
-        let shim = fs::read_to_string(&shim_path).unwrap();
-        assert!(shim.contains("_ensureActivated"));
-        assert!(shim.contains("astrid_deactivate"));
-        assert!(shim.contains("_Buffer.from"));
-    }
-
-    #[test]
-    fn full_lifecycle_config_validation_rejects_bad_config() {
-        let plugin_dir = tempfile::tempdir().unwrap();
-        let manifest = r#"{
-            "id": "config-test",
-            "configSchema": {
-                "type": "object",
-                "properties": {
-                    "apiKey": {"type": "string"}
-                },
-                "required": ["apiKey"]
-            }
-        }"#;
-        fs::write(plugin_dir.path().join("openclaw.plugin.json"), manifest).unwrap();
-        fs::create_dir_all(plugin_dir.path().join("src")).unwrap();
-        fs::write(
-            plugin_dir.path().join("src/index.js"),
-            "module.exports = {};",
-        )
-        .unwrap();
-
-        let build_dir = tempfile::tempdir().unwrap();
-        let mut config = std::collections::HashMap::new();
-        config.insert("bogusKey".into(), serde_json::json!("val"));
-
-        let err = pipeline::compile_plugin(&CompileOptions {
-            plugin_dir: plugin_dir.path(),
-            output_dir: build_dir.path(),
-            config: &config,
-            cache_dir: None,
-            js_only: true,
-            no_cache: true,
-        });
-
-        assert!(err.is_err(), "should reject unknown config key");
-        let msg = err.unwrap_err().to_string();
-        assert!(
-            msg.contains("bogusKey"),
-            "error should mention the bad key, got: {msg}"
-        );
     }
 
     fn assert_symlinks_dereferenced(symlink_fn: impl FnOnce(&Path, &Path)) {

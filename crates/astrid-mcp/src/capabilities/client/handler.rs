@@ -212,7 +212,7 @@ impl AstridClientHandler {
         capsule_id: &str,
         channels: &[BridgeChannelInfo],
     ) {
-        let source = match UplinkSource::new_openclaw(capsule_id) {
+        let source = match UplinkSource::new_bridge(capsule_id) {
             Ok(s) => s,
             Err(e) => {
                 warn!(error = %e, "register_channels_locally: invalid capsule_id for UplinkSource");

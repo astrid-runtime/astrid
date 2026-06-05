@@ -19,7 +19,6 @@ members = [
     "crates/astrid-integration-tests",
     "crates/astrid-kernel",
     "crates/astrid-mcp",
-    "crates/astrid-openclaw",
     "crates/astrid-prelude",
     "crates/astrid-storage",
     "crates/astrid-telemetry",
@@ -52,7 +51,6 @@ astrid-events = { path = "crates/astrid-events", version = "0.7.0" }
 astrid-hooks = { path = "crates/astrid-hooks", version = "0.7.0" }
 astrid-kernel = { path = "crates/astrid-kernel", version = "0.7.0" }
 astrid-mcp = { path = "crates/astrid-mcp", version = "0.7.0" }
-astrid-openclaw = { path = "crates/astrid-openclaw", version = "0.7.0" }
 astrid-prelude = { path = "crates/astrid-prelude", version = "0.7.0" }
 astrid-storage = { path = "crates/astrid-storage", version = "0.7.0" }
 astrid-telemetry = { path = "crates/astrid-telemetry", version = "0.7.0" }
@@ -151,8 +149,6 @@ notify = "7"
 # path). No poisoning + fewer kernel calls than `std::sync` under
 # contention.
 parking_lot = "0.12"
-oxc = { version = "0.112", features = ["transformer", "semantic", "codegen"] }
-oxc_allocator = "0.112"
 rand = "0.8"
 ratatui = { version = "0.29", features = ["unstable-rendered-line-info"] }
 # Self-signed certificate generation for gateway TLS integration
@@ -216,7 +212,6 @@ wasmtime = { version = "45", features = ["component-model", "cranelift"] }
 wasmtime-wasi = "45"
 unicode-width = "0.2"
 which = "7"
-wizer = "10"
 zeroize = { version = "1.8", features = ["derive"] }
 
 [workspace.lints.rust]
