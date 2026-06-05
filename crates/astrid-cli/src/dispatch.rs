@@ -26,6 +26,16 @@ const fn tracker_657() -> TrackingIssue {
 
 /// Top-level dispatcher. Returns the process [`ExitCode`].
 pub(crate) async fn dispatch(cli: Cli) -> Result<ExitCode> {
+    // Discovery flag: print the co-installed `astrid-emit` path and
+    // exit. Handled FIRST — before the update banner, config load, or
+    // any subcommand routing — so hook-bridge installers can resolve
+    // the path on a half-configured host without side effects.
+    if cli.emit_path {
+        let path = bootstrap::find_companion_binary("astrid-emit")?;
+        println!("{}", path.display());
+        return Ok(ExitCode::SUCCESS);
+    }
+
     // Update banner check (cached) — skip for non-interactive paths.
     if cli.prompt.is_none()
         && !matches!(

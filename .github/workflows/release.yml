@@ -71,6 +71,7 @@ jobs:
           cp "target/${{ matrix.target }}/release/astrid" "$DIR/"
           cp "target/${{ matrix.target }}/release/astrid-daemon" "$DIR/"
           cp "target/${{ matrix.target }}/release/astrid-build" "$DIR/"
+          cp "target/${{ matrix.target }}/release/astrid-emit" "$DIR/"
           cp LICENSE* README.md "$DIR/" 2>/dev/null || true
           tar czf "${DIR}.tar.gz" "$DIR"
           echo "ASSET=${DIR}.tar.gz" >> "$GITHUB_ENV"
@@ -166,7 +167,7 @@ jobs:
             Download the archive for your platform, extract, and add to PATH:
             ```
             tar xzf astrid-*-$(uname -m)-*.tar.gz
-            sudo mv astrid-*/astrid astrid-*/astrid-daemon astrid-*/astrid-build /usr/local/bin/
+            sudo mv astrid-*/astrid astrid-*/astrid-daemon astrid-*/astrid-build astrid-*/astrid-emit /usr/local/bin/
             ```
 
             Then run `astrid init` to set up capsules.
