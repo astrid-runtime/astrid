@@ -169,11 +169,20 @@ mod tests {
     fn io_default_is_large_and_floored() {
         let io = host_io_concurrency_default();
         assert!(io >= IO_MIN, "io concurrency must keep the floor");
-        // The whole point of the split: I/O concurrency dwarfs blocking.
-        assert!(
-            io >= host_blocking_concurrency_default(),
-            "io ceiling should not be tighter than the blocking ceiling"
-        );
+        // The point of the split is that I/O concurrency dwarfs blocking — but
+        // only when descriptors are not scarcer than cores. On a pathological
+        // host (very high core count AND a low `RLIMIT_NOFILE`) the fd clamp can
+        // legitimately pull io below blocking; that is the CORRECT fail-secure
+        // behaviour (you cannot hold more concurrent sockets than the process
+        // has descriptors). So assert `io >= blocking` only on hosts where the
+        // fd budget is not the binding constraint — never unconditionally.
+        let fd_not_scarce = fd_soft_limit().is_none_or(|soft| soft >= cores().saturating_mul(2));
+        if fd_not_scarce {
+            assert!(
+                io >= host_blocking_concurrency_default(),
+                "with ample fds the io ceiling must not be tighter than blocking"
+            );
+        }
     }
 
     #[test]
