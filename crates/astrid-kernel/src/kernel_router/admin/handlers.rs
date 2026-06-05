@@ -68,7 +68,7 @@ pub(super) async fn dispatch(
         AdminRequestKind::AgentDisable { principal } => {
             agent_set_enabled(kernel, principal, false).await
         },
-        AdminRequestKind::AgentList => agent_list(kernel),
+        AdminRequestKind::AgentList => agent_list(kernel, caller),
         AdminRequestKind::AgentModify {
             principal,
             add_groups,
@@ -446,7 +446,24 @@ async fn agent_modify(
     }))
 }
 
-fn agent_list(kernel: &Arc<crate::Kernel>) -> AdminResponseBody {
+/// Does `caller` hold the admin-tier global `agent:list` capability
+/// (directly, via `agent:*`, or `*`)?
+///
+/// Self-scoped agents hold only `self:agent:list` (the `agent` builtin
+/// grants it via `self:*`), and `self:*` does not match `agent:list`
+/// (segment 1 `self` ≠ `agent`), so this returns `false` for them — they
+/// are filtered to their own row. Fail-closed: an unresolvable caller
+/// profile yields `false` (most restrictive, self-only).
+fn caller_has_global_agent_list(kernel: &Arc<crate::Kernel>, caller: &PrincipalId) -> bool {
+    let Ok(profile) = kernel.profile_cache.resolve(caller) else {
+        return false;
+    };
+    let groups = kernel.groups.load_full();
+    astrid_capabilities::CapabilityCheck::new(profile.as_ref(), groups.as_ref(), caller.clone())
+        .has("agent:list")
+}
+
+fn agent_list(kernel: &Arc<crate::Kernel>, caller: &PrincipalId) -> AdminResponseBody {
     // Source of truth: `etc/profiles/{principal}.toml`. Iterating the
     // home directory was the pre-#672 approach but stopped working
     // when profiles moved out — and was always wrong in spirit since
@@ -495,6 +512,25 @@ fn agent_list(kernel: &Arc<crate::Kernel>) -> AdminResponseBody {
         });
     }
     summaries.sort_by(|a, b| a.principal.as_str().cmp(b.principal.as_str()));
+
+    // Authority-scope filter (fail-secure). `AgentList` always resolves
+    // to `AuthorityScope::Self_`, so the preamble already requires
+    // `self:agent:list` to reach this handler at all — which the `agent`
+    // builtin holds via `self:*`. That lowering lets an agent resolve its
+    // own group-inherited capabilities (e.g. `caps check <self>`) WITHOUT
+    // being handed the admin-tier `agent:list`, but it must NOT leak the
+    // full roster (every other principal's groups / grants / revokes). So
+    // a caller is narrowed to its own row unless it ALSO holds the global
+    // `agent:list` capability. Both are required for the full roster: a
+    // bare `agent:list` grant does not satisfy the `self:agent:list`
+    // preamble (the grammar does not make a global cap imply its
+    // self-scoped form), so in practice only the `admin` group's `*`
+    // (which matches both) sees everyone. This realises the gateway's
+    // documented "the kernel filters server-side" contract.
+    if !caller_has_global_agent_list(kernel, caller) {
+        summaries.retain(|s| s.principal == *caller);
+    }
+
     AdminResponseBody::AgentList(summaries)
 }
 

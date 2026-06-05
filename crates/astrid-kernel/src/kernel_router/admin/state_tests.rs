@@ -26,6 +26,21 @@ async fn fixture() -> (TempDir, Arc<Kernel>) {
     let dir = tempfile::tempdir().expect("tempdir");
     let home = AstridHome::from_path(dir.path());
     let kernel = crate::test_kernel_with_home(home).await;
+    // Mirror production: `Kernel::new` admin-seeds the `default`
+    // principal (lib.rs `seed_default_principal_admin_profile`), so
+    // dispatch through `default` carries admin authority. `agent_list`'s
+    // authority-scope filter depends on this — without it `default`
+    // resolves to an empty profile and is treated as a self-scoped
+    // caller, which would (correctly) hide the roster from it.
+    let mut admin = PrincipalProfile::default();
+    admin.groups = vec![BUILTIN_ADMIN.to_string()];
+    admin
+        .save_to_path(&PrincipalProfile::path_for(
+            &kernel.astrid_home,
+            &PrincipalId::default(),
+        ))
+        .expect("seed default admin profile");
+    kernel.profile_cache.invalidate(&PrincipalId::default());
     (dir, kernel)
 }
 
@@ -720,4 +735,58 @@ async fn group_delete_reference_from_profile_does_not_elevate_privileges() {
         check.require("capsule:install").is_err(),
         "dangling group reference must not silently elevate"
     );
+}
+
+// ── agent.list authority-scope filter (info-disclosure fix) ──────────
+
+#[tokio::test(flavor = "multi_thread")]
+async fn agent_list_filters_to_self_for_non_admin_caller() {
+    let (_dir, kernel) = fixture().await;
+
+    // Two ordinary agents — empty groups default to the `agent` builtin,
+    // which grants `self:*` / `self:agent:list` but NOT global `agent:list`.
+    for name in ["alice", "bob"] {
+        let res = handlers::dispatch(
+            &kernel,
+            &PrincipalId::default(),
+            AdminRequestKind::AgentCreate {
+                name: name.into(),
+                groups: Vec::new(),
+                grants: Vec::new(),
+            },
+        )
+        .await;
+        assert_success(&res);
+    }
+
+    // The admin-seeded `default` principal holds `*` → sees the full roster.
+    let res = handlers::dispatch(
+        &kernel,
+        &PrincipalId::default(),
+        AdminRequestKind::AgentList,
+    )
+    .await;
+    let all = match res {
+        AdminResponseBody::AgentList(v) => v,
+        other => panic!("expected AgentList, got {other:?}"),
+    };
+    let names: Vec<&str> = all.iter().map(|s| s.principal.as_str()).collect();
+    assert!(
+        names.contains(&"alice") && names.contains(&"bob"),
+        "admin must see the full roster, got {names:?}"
+    );
+
+    // A non-admin agent (`alice`) holds only `self:agent:list` → must see
+    // ONLY its own row, never the rest of the roster.
+    let res = handlers::dispatch(&kernel, &pid("alice"), AdminRequestKind::AgentList).await;
+    let mine = match res {
+        AdminResponseBody::AgentList(v) => v,
+        other => panic!("expected AgentList, got {other:?}"),
+    };
+    assert_eq!(
+        mine.len(),
+        1,
+        "self-scoped caller must see exactly one row, got {mine:?}"
+    );
+    assert_eq!(mine[0].principal.as_str(), "alice");
 }
