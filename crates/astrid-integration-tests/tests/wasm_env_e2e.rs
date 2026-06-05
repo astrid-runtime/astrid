@@ -113,6 +113,7 @@ async fn test_wasm_capsule_e2e_env_config_injection() {
         test_secure_mcp_client(),
         astrid_capsule::FuelLedger::default(),
         astrid_capsule::FuelRateLimiter::default(),
+        astrid_capsule::MemoryLedger::default(),
         astrid_capsule::CapsuleRuntimeLimits::default(),
     );
     let mut capsule = loader

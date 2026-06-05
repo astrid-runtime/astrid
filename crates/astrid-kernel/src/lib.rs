@@ -114,6 +114,12 @@ pub struct Kernel {
     /// 1-second window is denied at interceptor entry, cross-capsule. See
     /// [`FuelRateLimiter`](astrid_capsule::FuelRateLimiter).
     fuel_rate: astrid_capsule::FuelRateLimiter,
+    /// Shared per-principal peak-memory ledger, the RAM analogue of
+    /// `fuel_ledger`: cloned into every capsule's `WasmEngine` (via the loader)
+    /// so a principal's linear-memory high-water mark is the max across all
+    /// capsules. Telemetry today; fills `ResourceUsage::memory_bytes_peak_total`.
+    /// See [`MemoryLedger`](astrid_capsule::MemoryLedger).
+    memory_ledger: astrid_capsule::MemoryLedger,
     /// Host-derived (operator-overridable) concurrency ceilings for capsule
     /// host calls, resolved once by the daemon and forwarded to every
     /// `WasmEngine` via the loader. The kernel only stores and forwards this
@@ -336,6 +342,7 @@ impl Kernel {
             active_connections: DashMap::new(),
             fuel_ledger: astrid_capsule::FuelLedger::default(),
             fuel_rate: astrid_capsule::FuelRateLimiter::default(),
+            memory_ledger: astrid_capsule::MemoryLedger::default(),
             runtime_limits,
             ephemeral: AtomicBool::new(false),
             boot_time: std::time::Instant::now(),
@@ -401,6 +408,7 @@ impl Kernel {
             self.mcp.clone(),
             self.fuel_ledger.clone(),
             self.fuel_rate.clone(),
+            self.memory_ledger.clone(),
             self.runtime_limits,
         );
         let mut capsule = loader.create_capsule(manifest, dir.clone())?;
@@ -1023,6 +1031,7 @@ pub(crate) async fn test_kernel_with_home(home: astrid_core::dirs::AstridHome) -
         active_connections: DashMap::new(),
         fuel_ledger: astrid_capsule::FuelLedger::default(),
         fuel_rate: astrid_capsule::FuelRateLimiter::default(),
+        memory_ledger: astrid_capsule::MemoryLedger::default(),
         runtime_limits: astrid_capsule::CapsuleRuntimeLimits::default(),
         ephemeral: AtomicBool::new(false),
         boot_time: std::time::Instant::now(),

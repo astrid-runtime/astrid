@@ -133,8 +133,12 @@ pub struct HostState {
     pub wasi_ctx: wasmtime_wasi::WasiCtx,
     /// Resource table for WASI resource types (streams, descriptors, etc.).
     pub resource_table: wasmtime::component::ResourceTable,
-    /// Memory limits for the WASM store (64 MB cap).
-    pub store_limits: wasmtime::StoreLimits,
+    /// Per-Store memory limiter: enforces the per-invocation linear-memory
+    /// ceiling **and** records the invoking principal's peak into the shared
+    /// memory ledger. Wired via `Store::limiter`; re-targeted per invocation
+    /// (cap + attributee principal) since a pooled Store crosses principals.
+    /// Replaces a plain `wasmtime::StoreLimits`.
+    pub store_meter: crate::memory_ledger::StoreMemoryMeter,
     /// The principal this capsule is running on behalf of.
     pub principal: astrid_core::principal::PrincipalId,
     /// The plugin this state belongs to.
@@ -667,7 +671,7 @@ impl HostState {
     /// - `invocation_home` / `invocation_tmp` / `invocation_secret_store` —
     ///   none of the current run+recv capsules touch home/tmp paths
     ///   or secrets from the recv loop. Add when one starts to.
-    /// - `invocation_profile` / `store_limits` — quotas remain the
+    /// - `invocation_profile` / `store_meter` — quotas remain the
     ///   capsule owner's. Acceptable for the immediate fix because
     ///   the run+recv capsules are shared singletons whose per-call
     ///   work is bounded by the message size limits already in the

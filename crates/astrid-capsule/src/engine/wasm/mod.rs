@@ -228,6 +228,13 @@ pub struct WasmEngine {
     /// enforced by the epoch-interrupt mechanism (not this ledger, not fuel).
     /// Keyed by the *invoking* principal (caller or owner).
     fuel_ledger: crate::FuelLedger,
+    /// Shared per-principal **peak-memory** ledger, the RAM analogue of
+    /// `fuel_ledger`: the per-Store [`StoreMemoryMeter`](crate::StoreMemoryMeter)
+    /// records the high-water linear-memory size each invoking principal grows a
+    /// Store to. Cloned from the kernel-owned ledger so a principal's peak is the
+    /// max across every capsule it drives, filling
+    /// `ResourceUsage::memory_bytes_peak_total`. Telemetry only.
+    memory_ledger: crate::MemoryLedger,
     /// Shared per-principal CPU-**rate** limiter — the deny side of the budget
     /// (PR2), built on the same shared-handle model as `fuel_ledger`.
     ///
@@ -280,6 +287,7 @@ impl WasmEngine {
         capsule_dir: PathBuf,
         fuel_ledger: crate::FuelLedger,
         fuel_rate: crate::FuelRateLimiter,
+        memory_ledger: crate::MemoryLedger,
         runtime_limits: limits::CapsuleRuntimeLimits,
     ) -> Self {
         Self {
@@ -296,6 +304,7 @@ impl WasmEngine {
             owner_principal: None,
             overlay_registry: None,
             fuel_ledger,
+            memory_ledger,
             fuel_rate,
             group_config: None,
             runtime_limits,
@@ -978,6 +987,10 @@ impl ExecutionEngine for WasmEngine {
         let cancel_token_for_state = cancel_token.clone();
         let process_tracker = Arc::new(crate::engine::wasm::host::process::ProcessTracker::new());
         let process_tracker_for_listener = process_tracker.clone();
+        // Shared peak-memory ledger, cloned into every pooled `HostState`'s
+        // `StoreMemoryMeter` so a principal's high-water linear memory sums
+        // cross-capsule (the RAM analogue of the fuel ledger).
+        let memory_ledger = self.memory_ledger.clone();
 
         let capsule_dir_for_verify = self._capsule_dir.clone();
         // Inlined async block — was previously wrapped in
@@ -1230,6 +1243,7 @@ impl ExecutionEngine for WasmEngine {
             let io_semaphore = io_semaphore.clone();
             let cancel_token_for_state = cancel_token_for_state.clone();
             let process_tracker = process_tracker.clone();
+            let memory_ledger = memory_ledger.clone();
             let st_principal = ctx.principal.clone();
             let st_capsule_registry = ctx.capsule_registry.clone();
             let st_allowance_store = ctx.allowance_store.clone();
@@ -1240,12 +1254,14 @@ impl ExecutionEngine for WasmEngine {
                 // Memory cap baked in BEFORE instantiation. For a bound
                 // run-loop (pool_size 1) this is the owner quota, enforced on
                 // the FIRST `memory.grow` during `instantiate_async` (the
-                // store's `limiter` reads `store_limits`). For interceptor
+                // store's `limiter` reads `store_meter`). For interceptor
                 // pools this is the 64 MiB placeholder; the real per-invocation
                 // cap is applied at invoke time.
-                store_limits: wasmtime::StoreLimitsBuilder::new()
-                    .memory_size(run_loop_mem_bytes)
-                    .build(),
+                store_meter: crate::memory_ledger::StoreMemoryMeter::new(
+                    run_loop_mem_bytes,
+                    st_principal.clone(),
+                    memory_ledger.clone(),
+                ),
                 principal: st_principal.clone(),
                 capsule_uuid,
                 caller_context: None,
@@ -1409,7 +1425,7 @@ impl ExecutionEngine for WasmEngine {
                     .pop()
                     .expect("min_idle >= 1, so the run-loop instance exists");
                 // The run-loop Store's memory cap is already baked into
-                // `store_limits` by `make_state` (pool_size 1 ⇒ this IS the
+                // `store_meter` by `make_state` (pool_size 1 ⇒ this IS the
                 // run-loop Store) and was enforced during `instantiate_async`.
                 // Fuel was seeded to INTERCEPTOR_FUEL_BUDGET above for
                 // instantiation; the run loop is NOT fuel-bound, so re-seed it
@@ -1977,16 +1993,17 @@ impl ExecutionEngine for WasmEngine {
                 // from its empty / cross-publisher batches. See the field
                 // doc on `interceptor_active` for the full rationale.
                 state.interceptor_active = true;
-                // Apply per-principal memory cap by rebuilding `StoreLimits`.
-                // The store's `limiter` callback reads this field on each
+                // Re-target the per-Store memory meter for THIS invocation: the
+                // principal's `max_memory_bytes` ceiling and the invoking
+                // principal to attribute peak growth to (same principal the fuel
+                // ledger charges). The store's `limiter` reads the meter on each
                 // `memory.grow`, so mutating in place takes effect for the
-                // upcoming call.
-                state.store_limits = wasmtime::StoreLimitsBuilder::new()
-                    .memory_size(
-                        usize::try_from(applied_profile.quotas.max_memory_bytes)
-                            .unwrap_or(usize::MAX),
-                    )
-                    .build();
+                // upcoming call — independent of the previous leaseholder of
+                // this pooled Store.
+                state.store_meter.set(
+                    usize::try_from(applied_profile.quotas.max_memory_bytes).unwrap_or(usize::MAX),
+                    invoking_principal.clone(),
+                );
                 state.invocation_profile = invocation_profile.clone();
 
                 let invocation_principal: Option<astrid_core::PrincipalId> = caller
@@ -2227,9 +2244,14 @@ pub async fn run_lifecycle(
 
     let host_state = HostState {
         wasi_ctx: build_wasi_ctx(),
-        store_limits: wasmtime::StoreLimitsBuilder::new()
-            .memory_size(WASM_MAX_MEMORY_BYTES)
-            .build(),
+        // Lifecycle hooks (install/upgrade) run rarely and briefly; their memory
+        // is not part of per-principal usage reporting, so a throwaway ledger is
+        // fine — the cap is still enforced.
+        store_meter: crate::memory_ledger::StoreMemoryMeter::new(
+            WASM_MAX_MEMORY_BYTES,
+            astrid_core::PrincipalId::default(),
+            crate::MemoryLedger::default(),
+        ),
         resource_table: wasmtime::component::ResourceTable::new(),
         principal: astrid_core::PrincipalId::default(),
         capsule_uuid: uuid::Uuid::new_v4(),
