@@ -689,6 +689,24 @@ async fn run_consumer(
                 // bounded, and it always errs toward NOT dropping events.
                 let mut guard = queues.lock();
                 if rx.try_recv().is_err() && rx.sender_strong_count() == 1 {
+                    // KNOWN RESIDUAL (bounded, non-correctness): this `remove` is
+                    // identity-blind — unlike `ChainLockGuard::drop`'s
+                    // `Arc::ptr_eq` guard above, it removes whatever sits at
+                    // `key` even if a *newer* consumer generation was cold-spawned
+                    // (and re-`insert`ed) for this key in the gap between the
+                    // grace timeout firing and this lock acquisition. The
+                    // `sender_strong_count()==1` check reads THIS consumer's own
+                    // channel, decoupled from the map entry, so it cannot catch
+                    // the cross-generation case. Consequence is bounded churn (a
+                    // transient orphaned consumer + a re-spawn), NOT event loss:
+                    // `get_or_spawn_consumer` skips `is_closed()` senders and
+                    // re-spawns, so no dispatch is ever dropped to a reclaimed
+                    // generation. A complete root fix would tag each generation
+                    // (e.g. an `Arc<()>` stored beside the sender) and only
+                    // remove when it matches, mirroring the chain-lock identity
+                    // discipline. Tracked separately; left here so the
+                    // already-shipped, live-verified detect-and-replace fix is
+                    // not entangled with a deeper map-shape change.
                     guard.remove(&key);
                     drop(guard);
                     debug!(
