@@ -451,7 +451,7 @@ async fn handle_admin_request(
                 method,
                 required_cap,
                 target_principal: None,
-                params: audit_params.clone(),
+                params: audit_params,
                 authorization,
                 outcome,
             },
