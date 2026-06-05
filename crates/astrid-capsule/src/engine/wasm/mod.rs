@@ -1929,10 +1929,15 @@ impl ExecutionEngine for WasmEngine {
         // borrowing the store mutably for the SET/CALL block; `PoolCheckout`
         // clears the invocation state and returns the instance on drop.
         let checkout_start = std::time::Instant::now();
-        let mut checkout = pool
-            .checkout()
-            .await
-            .ok_or_else(|| CapsuleError::NotSupported("capsule is unloading".into()))?;
+        let mut checkout = pool.checkout().await.ok_or_else(|| {
+            // `checkout` returns `None` for any of: the capsule is unloading
+            // (semaphore closed), a lazy pool-grow instantiation failed, or a
+            // size-1 carve-out found no warm instance. The true cause is logged
+            // at the checkout site; keep the surfaced error generic rather than
+            // asserting "unloading", which misleads when the real cause was a
+            // transient grow failure on a fully-loaded capsule.
+            CapsuleError::NotSupported("no capsule instance available".into())
+        })?;
         // Time spent waiting for a free pooled instance — a rising
         // `pool_wait_ms` is the signal the pool is saturated (all instances
         // busy), distinct from a slow guest call.
