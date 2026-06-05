@@ -227,12 +227,16 @@ impl CapsuleInstancePool {
     /// instance — all treated by the caller as "not invocable".
     pub(super) async fn checkout(&self) -> Option<PoolCheckout> {
         let permit = Arc::clone(&self.permits).acquire_owned().await.ok()?;
-        // Pop under the lock; never hold it across the build `.await` below.
+        // Pop the most-recently-returned instance (the BACK — return pushes
+        // back) so we lease the warmest, hottest store for cache locality and
+        // memory residency. Idle instances sink toward the front, where
+        // `drain_excess` reclaims them. Pop under the lock; never hold it
+        // across the build `.await` below.
         let warm = self
             .available
             .lock()
             .expect("instance pool mutex poisoned")
-            .pop_front();
+            .pop_back();
         let pooled = match warm {
             Some(pooled) => pooled,
             None => {
@@ -305,13 +309,15 @@ async fn evict_loop(
     }
 }
 
-/// Pop entries above `min_idle` off the back of `queue` (the oldest-returned,
-/// since checkout pops the front and return pushes the back). Returns them for
-/// the caller to drop outside any lock.
+/// Pop entries above `min_idle` off the **front** of `queue` (the
+/// oldest-returned, since checkout pops the back and return pushes the back, so
+/// idle instances accumulate at the front). Evicting the front reclaims the
+/// coldest instances first (LRU). Returns them for the caller to drop outside
+/// any lock.
 fn drain_excess<T>(queue: &mut VecDeque<T>, min_idle: usize) -> Vec<T> {
     let mut evicted = Vec::new();
     while queue.len() > min_idle {
-        match queue.pop_back() {
+        match queue.pop_front() {
             Some(item) => evicted.push(item),
             None => break,
         }
@@ -538,16 +544,20 @@ mod tests {
     }
 
     /// Eviction trims the warm set down to exactly `min_idle`, evicting the
-    /// oldest-returned (back of the queue) first, and is a no-op at/below
+    /// oldest-returned (front of the queue) first, and is a no-op at/below
     /// `min_idle`.
     #[test]
-    fn drain_excess_trims_to_min_idle_from_the_back() {
-        // 5 warm, min_idle 2 → evict 3 (the oldest-returned: 4, 3, 2 off the
-        // back), keeping the 2 most-recently-returned at the front (0, 1).
+    fn drain_excess_trims_to_min_idle_from_the_front() {
+        // 5 warm, min_idle 2 → evict 3 (the oldest-returned: 0, 1, 2 off the
+        // front), keeping the 2 most-recently-returned at the back (3, 4).
         let mut q: VecDeque<i32> = (0..5).collect();
         let evicted = drain_excess(&mut q, 2);
-        assert_eq!(evicted, vec![4, 3, 2], "evict oldest-returned off the back");
-        assert_eq!(q.into_iter().collect::<Vec<_>>(), vec![0, 1]);
+        assert_eq!(
+            evicted,
+            vec![0, 1, 2],
+            "evict oldest-returned off the front"
+        );
+        assert_eq!(q.into_iter().collect::<Vec<_>>(), vec![3, 4]);
 
         // At min_idle: nothing to evict.
         let mut q: VecDeque<i32> = (0..2).collect();
