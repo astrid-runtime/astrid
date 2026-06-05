@@ -27,9 +27,12 @@
 //!
 //! **Concurrency + growth.** Same shape as [`FuelLedger`]: a sharded
 //! [`DashMap`] of per-principal [`AtomicU64`], so concurrent invocations record
-//! lock-free per principal. One entry per distinct principal, never evicted —
-//! bound it (alongside the fuel ledger) before it gains any deny path so a flood
-//! of ephemeral sub-agent principals cannot grow it without limit.
+//! lock-free per principal. One entry per distinct principal, capped at
+//! [`MAX_PRINCIPALS`] (the `astrid#827` lesson, since this map gains no deny
+//! path that would prune it): at capacity a new principal evicts the
+//! lowest-peak entry — but only if it is itself a bigger user — so a flood of
+//! ephemeral sub-agent principals cannot grow the map without limit, and the
+//! biggest memory users (the interesting telemetry) are the ones retained.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -75,23 +78,32 @@ impl MemoryLedger {
             return;
         }
         // New principal. Bound the map (`astrid#827` lesson): if at capacity,
-        // evict the lowest-peak entry first so the ledger keeps the biggest
-        // memory users rather than growing without limit. A benign race may let
-        // the size briefly exceed the cap under concurrent new inserts — bounded
-        // by the number of concurrent inserters, never unbounded.
-        if self.inner.len() >= MAX_PRINCIPALS {
-            self.evict_lowest();
+        // evict the lowest-peak entry — but ONLY if this newcomer's peak is
+        // strictly above it. Evicting a bigger user to record a smaller one
+        // would defeat the goal of keeping the biggest memory users (the
+        // interesting telemetry) and let a flood of small, ephemeral
+        // sub-agent principals thrash the real ones out. If the newcomer is
+        // not bigger, drop it. A benign race may let the size briefly exceed
+        // the cap under concurrent new inserts — bounded by the number of
+        // concurrent inserters, never unbounded.
+        if self.inner.len() >= MAX_PRINCIPALS && !self.evict_lowest_if_below(bytes) {
+            return;
         }
         Self::raise_to(&self.inner.entry(principal.clone()).or_default(), bytes);
     }
 
-    /// Remove the entry with the smallest recorded peak (best-effort under
-    /// concurrency). `O(n)` over the map, but only on the rare
-    /// new-principal-while-at-capacity path; `n` is bounded by [`MAX_PRINCIPALS`]
-    /// and each probe is a `Relaxed` load, so the scan is microseconds. The
-    /// iterator's shard guards are dropped before the `remove`, so it cannot
-    /// deadlock against a concurrent `record_peak`.
-    fn evict_lowest(&self) {
+    /// At capacity, remove the entry with the smallest recorded peak — but only
+    /// when `threshold` exceeds it, so a smaller newcomer never displaces a
+    /// bigger user. Returns `true` if there is now room to insert (an entry was
+    /// evicted, or — racing — the map dipped empty), `false` if the newcomer
+    /// should be dropped.
+    ///
+    /// `O(n)` over the map, but only on the rare new-principal-while-at-capacity
+    /// path; `n` is bounded by [`MAX_PRINCIPALS`] and each probe is a `Relaxed`
+    /// load, so the scan is microseconds. The iterator's shard guards are
+    /// dropped before the `remove`, so it cannot deadlock against a concurrent
+    /// `record_peak`.
+    fn evict_lowest_if_below(&self, threshold: u64) -> bool {
         let mut victim: Option<PrincipalId> = None;
         let mut lowest = u64::MAX;
         for entry in &*self.inner {
@@ -101,9 +113,17 @@ impl MemoryLedger {
                 victim = Some(entry.key().clone());
             }
         }
-        if let Some(key) = victim {
-            self.inner.remove(&key);
+        let Some(key) = victim else {
+            // Map raced empty — there is room.
+            return true;
+        };
+        if threshold <= lowest {
+            // The newcomer is no bigger than our smallest user; keep the
+            // bigger one and drop the newcomer.
+            return false;
         }
+        self.inner.remove(&key);
+        true
     }
 
     /// Relaxed atomic max: raise `counter` to `bytes` if larger. The closure
@@ -262,6 +282,22 @@ mod tests {
         assert!(ledger.inner.len() <= MAX_PRINCIPALS, "stays bounded");
         assert_eq!(ledger.peak(&newcomer), 1_000_000, "newcomer recorded");
         assert_eq!(ledger.peak(&lowest), 0, "lowest-peak principal evicted");
+
+        // A NEW principal whose peak is NOT above the current lowest must be
+        // DROPPED rather than evict a bigger user (else a flood of small
+        // ephemeral principals would thrash out the real ones). After the
+        // eviction above the smallest retained user is `p1` (peak 2); a
+        // newcomer at peak 2 (== the lowest) must not displace it.
+        let p1 = PrincipalId::new("p1").unwrap();
+        assert_eq!(ledger.peak(&p1), 2, "p1 is now the lowest retained user");
+        let smaller = PrincipalId::new("smaller").unwrap();
+        ledger.record_peak(&smaller, 2);
+        assert_eq!(
+            ledger.peak(&smaller),
+            0,
+            "smaller newcomer dropped, not recorded"
+        );
+        assert_eq!(ledger.peak(&p1), 2, "existing bigger user retained");
     }
 
     #[test]

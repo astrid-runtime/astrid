@@ -1254,7 +1254,7 @@ impl ExecutionEngine for WasmEngine {
                 // Memory cap baked in BEFORE instantiation. For a bound
                 // run-loop (pool_size 1) this is the owner quota, enforced on
                 // the FIRST `memory.grow` during `instantiate_async` (the
-                // store's `limiter` reads `store_limits`). For interceptor
+                // store's `limiter` reads `store_meter`). For interceptor
                 // pools this is the 64 MiB placeholder; the real per-invocation
                 // cap is applied at invoke time.
                 store_meter: crate::memory_ledger::StoreMemoryMeter::new(
@@ -1425,7 +1425,7 @@ impl ExecutionEngine for WasmEngine {
                     .pop()
                     .expect("min_idle >= 1, so the run-loop instance exists");
                 // The run-loop Store's memory cap is already baked into
-                // `store_limits` by `make_state` (pool_size 1 ⇒ this IS the
+                // `store_meter` by `make_state` (pool_size 1 ⇒ this IS the
                 // run-loop Store) and was enforced during `instantiate_async`.
                 // Fuel was seeded to INTERCEPTOR_FUEL_BUDGET above for
                 // instantiation; the run loop is NOT fuel-bound, so re-seed it
