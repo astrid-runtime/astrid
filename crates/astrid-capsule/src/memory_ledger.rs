@@ -9,11 +9,21 @@
 //!
 //! **Attribution under pooling.** A capsule's pooled Stores are shared across
 //! principals under free checkout, and grown linear memory persists across
-//! leases. The attributable signal is therefore "the largest memory any of this
-//! principal's invocations GREW a Store to": the principal that caused the
-//! growth owns the peak; one that reuses an already-grown Store without growing
-//! is not charged (memory growth is the only event the limiter sees). For a
-//! run-loop capsule's dedicated Store the attributee is the owner, set once.
+//! leases (wasmtime cannot shrink a linear memory). The attributable signal is
+//! therefore "the largest memory any of this principal's invocations GREW a
+//! Store to": the principal that caused the growth owns the peak; one that
+//! reuses an already-grown Store without growing is not charged (memory growth
+//! is the only event the limiter sees). For a run-loop capsule's dedicated
+//! Store the attributee is the owner, set once.
+//!
+//! KNOWN IMPRECISION (telemetry-only, no deny path): growth records the
+//! ABSOLUTE new size, so a principal that grows an already-grown pooled Store —
+//! even by one page — is attributed that absolute high-water, which may include
+//! linear memory a *prior* leaseholder allocated. The peak is thus an upper
+//! bound on a principal's own footprint: never below its true peak, never above
+//! its `max_memory_bytes` ceiling, but possibly inflated by inherited pooled
+//! memory. Acceptable while this is operator-facing telemetry; revisit (e.g.
+//! per-lease baseline deltas) before it ever gates a budget decision.
 //!
 //! **Concurrency + growth.** Same shape as [`FuelLedger`]: a sharded
 //! [`DashMap`] of per-principal [`AtomicU64`], so concurrent invocations record
