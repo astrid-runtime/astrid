@@ -340,6 +340,9 @@ impl WasmHandler {
             capsule_registry: None,
             runtime_handle: tokio::runtime::Handle::current(),
             has_uplink_capability: false,
+            // Transient hook execution never subscribes to the audit feed;
+            // fail-secure to scoped.
+            audit_firehose: false,
             inbound_tx: None,
             registered_uplinks: Vec::new(),
             cli_socket_listener: None,

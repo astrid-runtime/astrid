@@ -795,3 +795,97 @@ async fn routed_receiver_isolation_between_subscriptions() {
     let drained_b = b.try_drain(super::MAX_SUBSCRIPTION_BUDGET_BYTES);
     assert_eq!(drained_b.len(), 10, "b independently sees all 10");
 }
+
+// ── Self-scoped routed subscriptions (Option B audit scoping) ────
+
+/// The audit topic, mirrored from `astrid-kernel`'s `AUDIT_TOPIC` and
+/// `astrid-gateway`'s `events::AUDIT_TOPIC`. Used only as a routing
+/// pattern in these tests; the bus does not special-case it.
+const AUDIT_TOPIC: &str = "astrid.v1.audit.entry";
+
+#[tokio::test]
+async fn cross_principal_audit_isolation_at_bus() {
+    // A subscription scoped to alice over the audit topic receives ONLY
+    // alice's entries; bob's and the system (None) entries never arrive.
+    // On today's firehose-default (scope=None) this would drain all of
+    // them — that is exactly the security gap this closes.
+    let bus = EventBus::new();
+    let mut sub = bus.subscribe_topic_routed_scoped(
+        uuid::Uuid::new_v4(),
+        AUDIT_TOPIC,
+        "audit-consumer",
+        "test_sub",
+        Some(Some("alice".into())),
+    );
+
+    for _ in 0..7 {
+        bus.publish(ipc_evt(AUDIT_TOPIC, Some("alice")));
+    }
+    for _ in 0..4 {
+        bus.publish(ipc_evt(AUDIT_TOPIC, Some("bob")));
+    }
+    // A system/kernel (None-principal) audit entry must also be excluded.
+    bus.publish(ipc_evt(AUDIT_TOPIC, None));
+
+    // Only alice's bucket ever materialised.
+    assert_eq!(sub.active_principals(), 1);
+
+    let drained = sub.try_drain(super::MAX_SUBSCRIPTION_BUDGET_BYTES);
+    assert_eq!(drained.len(), 7, "only alice's seven entries are delivered");
+    for ev in &drained {
+        if let AstridEvent::Ipc { message, .. } = &**ev {
+            assert_eq!(message.principal.as_deref(), Some("alice"));
+        } else {
+            panic!("expected IPC event");
+        }
+    }
+}
+
+#[tokio::test]
+async fn unscoped_route_unchanged_regression() {
+    // The unscoped path (subscribe_topic_routed, scope=None) over the same
+    // publish mix delivers EVERY event — the gateway firehose path is
+    // intact and the #813 fan-out is undisturbed.
+    let bus = EventBus::new();
+    let mut sub =
+        bus.subscribe_topic_routed(uuid::Uuid::new_v4(), AUDIT_TOPIC, "audit-firehose", "test_sub");
+
+    for _ in 0..7 {
+        bus.publish(ipc_evt(AUDIT_TOPIC, Some("alice")));
+    }
+    for _ in 0..4 {
+        bus.publish(ipc_evt(AUDIT_TOPIC, Some("bob")));
+    }
+    bus.publish(ipc_evt(AUDIT_TOPIC, None));
+
+    // alice, bob, and system → three distinct buckets.
+    assert_eq!(sub.active_principals(), 3);
+
+    let drained = sub.try_drain(super::MAX_SUBSCRIPTION_BUDGET_BYTES);
+    assert_eq!(drained.len(), 12, "firehose delivers all 7 + 4 + 1 events");
+}
+
+#[tokio::test]
+async fn scoped_drop_no_spurious_notify() {
+    // A scoped route fed only foreign-principal events must not wake its
+    // receiver: dispatch_to_routes skips notify_one on the accepts()==false
+    // continue, so a bounded recv on the idle owner times out.
+    let bus = EventBus::new();
+    let mut sub = bus.subscribe_topic_routed_scoped(
+        uuid::Uuid::new_v4(),
+        AUDIT_TOPIC,
+        "audit-consumer",
+        "test_sub",
+        Some(Some("alice".into())),
+    );
+
+    // Burst of bob-only audit entries — all dropped, none notified.
+    for _ in 0..50 {
+        bus.publish(ipc_evt(AUDIT_TOPIC, Some("bob")));
+    }
+
+    // recv parks and must time out: no wakeup was delivered.
+    let got = sub.recv(Some(std::time::Duration::from_millis(50))).await;
+    assert!(got.is_none(), "foreign-only burst must not wake the owner");
+    assert_eq!(sub.active_principals(), 0, "no bucket ever allocated");
+}
