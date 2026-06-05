@@ -7,6 +7,7 @@ use crate::engine::wasm::limits::CapsuleRuntimeLimits;
 use crate::error::CapsuleResult;
 use crate::fuel_ledger::{FuelLedger, FuelRateLimiter};
 use crate::manifest::CapsuleManifest;
+use crate::memory_ledger::MemoryLedger;
 
 use astrid_mcp::SecureMcpClient;
 
@@ -22,6 +23,10 @@ pub struct CapsuleLoader {
     /// `fuel_ledger`, handed to every `WasmEngine` so a principal's 1-second CPU
     /// rate is throttled cross-capsule. See [`FuelRateLimiter`].
     fuel_rate: FuelRateLimiter,
+    /// Kernel-owned shared per-principal peak-memory ledger. Like `fuel_ledger`,
+    /// handed to every `WasmEngine` so a principal's memory peak is the max
+    /// across all capsules. See [`MemoryLedger`].
+    memory_ledger: MemoryLedger,
     /// Host-derived (operator-overridable) concurrency ceilings, resolved once
     /// by the daemon and handed to every `WasmEngine` to size its host-call
     /// semaphores. A plain `Copy` value, not a shared handle. See
@@ -44,12 +49,14 @@ impl CapsuleLoader {
         mcp_client: SecureMcpClient,
         fuel_ledger: FuelLedger,
         fuel_rate: FuelRateLimiter,
+        memory_ledger: MemoryLedger,
         runtime_limits: CapsuleRuntimeLimits,
     ) -> Self {
         Self {
             mcp_client,
             fuel_ledger,
             fuel_rate,
+            memory_ledger,
             runtime_limits,
         }
     }
@@ -77,6 +84,7 @@ impl CapsuleLoader {
                 capsule_dir.clone(),
                 self.fuel_ledger.clone(),
                 self.fuel_rate.clone(),
+                self.memory_ledger.clone(),
                 self.runtime_limits,
             )));
         }

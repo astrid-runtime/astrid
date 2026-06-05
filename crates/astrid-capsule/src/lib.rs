@@ -16,6 +16,7 @@ pub mod error;
 pub mod fuel_ledger;
 pub mod loader;
 pub mod manifest;
+pub mod memory_ledger;
 pub mod principal_class;
 pub mod profile_cache;
 pub mod registry;
@@ -27,3 +28,4 @@ pub(crate) mod watcher;
 
 pub use engine::wasm::limits::CapsuleRuntimeLimits;
 pub use fuel_ledger::{FuelLedger, FuelRateLimiter};
+pub use memory_ledger::{MemoryLedger, StoreMemoryMeter};

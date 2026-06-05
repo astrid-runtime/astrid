@@ -295,9 +295,13 @@ impl WasmHandler {
         Ok(HostState {
             wasi_ctx: wasmtime_wasi::WasiCtxBuilder::new().build(),
             resource_table: wasmtime::component::ResourceTable::new(),
-            store_limits: wasmtime::StoreLimitsBuilder::new()
-                .memory_size(usize::try_from(self.config.max_memory_bytes).unwrap_or(usize::MAX))
-                .build(),
+            // Hook execution memory is not part of per-principal usage; a
+            // throwaway ledger is fine — the cap is still enforced.
+            store_meter: astrid_capsule::StoreMemoryMeter::new(
+                usize::try_from(self.config.max_memory_bytes).unwrap_or(usize::MAX),
+                astrid_core::PrincipalId::default(),
+                astrid_capsule::MemoryLedger::default(),
+            ),
             principal: astrid_core::PrincipalId::default(),
             capsule_uuid: uuid::Uuid::new_v4(),
             caller_context: None,

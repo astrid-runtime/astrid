@@ -485,9 +485,12 @@ pub enum AdminResponseBody {
 ///
 /// **CPU** is the live cross-capsule aggregate: the kernel's shared fuel ledger
 /// sums every interceptor's exact wasmtime-fuel cost per invoking principal
-/// across all capsules. **Memory** has no per-principal *total* yet — it is
-/// bounded per-Store (per capsule instance), so `memory_bytes_current_total`
-/// stays `None` until per-principal memory aggregation lands; the limit field
+/// across all capsules. **Memory** is reported as a per-principal *peak*
+/// (`memory_bytes_peak_total`): the kernel's shared memory ledger records the
+/// high-water linear-memory size each invoking principal grows a Store to,
+/// max'd across all capsules. A live cross-capsule *current* total
+/// (`memory_bytes_current_total`) is not implemented — under pooled, shared
+/// Stores it is not cleanly attributable — so it stays `None`; the limit field
 /// reports the per-instance ceiling.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ResourceUsage {
@@ -508,9 +511,17 @@ pub struct ResourceUsage {
     /// Per-capsule-instance memory ceiling ([`Quotas::max_memory_bytes`]). This
     /// is a per-Store cap, not a cross-capsule total.
     pub memory_bytes_limit_per_instance: u64,
-    /// Current cross-capsule resident memory total, or `None` while a
-    /// per-principal aggregate RAM budget is unimplemented.
+    /// Current cross-capsule resident memory total, or `None` — a live
+    /// "current" total is not cleanly attributable under pooled, shared Stores,
+    /// so the peak (below) is the reported memory signal instead.
     pub memory_bytes_current_total: Option<u64>,
+    /// Peak cross-capsule linear-memory high-water mark this principal has
+    /// driven, in bytes, max'd across every capsule it invokes (from the shared
+    /// memory ledger). `None` while no peak has been recorded — including
+    /// single-tenant deployments before any guest grows memory. The principal
+    /// that *grows* a Store owns the peak; one reusing an already-grown Store
+    /// without growing is not charged.
+    pub memory_bytes_peak_total: Option<u64>,
 }
 
 /// Summary of an agent principal returned by

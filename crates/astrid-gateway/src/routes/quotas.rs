@@ -82,9 +82,13 @@ pub struct ResourceUsageView {
     /// Per-capsule-instance memory ceiling (`max_memory_bytes`). A per-Store
     /// cap, not a cross-capsule total.
     pub memory_bytes_limit_per_instance: u64,
-    /// Current cross-capsule resident memory total, or `null` while a
-    /// per-principal aggregate RAM budget is unimplemented.
+    /// Current cross-capsule resident memory total, or `null` — not cleanly
+    /// attributable under pooled, shared Stores; the peak below is the reported
+    /// memory signal instead.
     pub memory_bytes_current_total: Option<u64>,
+    /// Peak cross-capsule linear-memory high-water mark this principal has
+    /// driven, in bytes (max across all capsules), or `null` if none recorded.
+    pub memory_bytes_peak_total: Option<u64>,
 }
 
 impl From<ResourceUsage> for ResourceUsageView {
@@ -96,6 +100,7 @@ impl From<ResourceUsage> for ResourceUsageView {
             exempt: u.exempt,
             memory_bytes_limit_per_instance: u.memory_bytes_limit_per_instance,
             memory_bytes_current_total: u.memory_bytes_current_total,
+            memory_bytes_peak_total: u.memory_bytes_peak_total,
         }
     }
 }
@@ -219,8 +224,8 @@ mod tests {
     use super::*;
 
     fn sample_usage() -> ResourceUsage {
-        // Six distinct sentinels so a field transposition can't hide — the
-        // three `u64`s especially would otherwise type-check when swapped.
+        // Distinct sentinels so a field transposition can't hide — the `u64`s
+        // especially would otherwise type-check when swapped.
         ResourceUsage {
             principal: PrincipalId::new("alice").unwrap(),
             cpu_fuel_consumed_total: 11,
@@ -228,6 +233,7 @@ mod tests {
             exempt: true,
             memory_bytes_limit_per_instance: 33,
             memory_bytes_current_total: Some(44),
+            memory_bytes_peak_total: Some(55),
         }
     }
 
@@ -240,6 +246,7 @@ mod tests {
         assert!(v.exempt);
         assert_eq!(v.memory_bytes_limit_per_instance, 33);
         assert_eq!(v.memory_bytes_current_total, Some(44));
+        assert_eq!(v.memory_bytes_peak_total, Some(55));
     }
 
     #[test]

@@ -74,7 +74,11 @@ pub(crate) fn minimal_host_state(rt: tokio::runtime::Handle) -> HostState {
     HostState {
         wasi_ctx: wasmtime_wasi::WasiCtxBuilder::new().build(),
         resource_table: wasmtime::component::ResourceTable::new(),
-        store_limits: wasmtime::StoreLimitsBuilder::new().build(),
+        store_meter: crate::memory_ledger::StoreMemoryMeter::new(
+            usize::MAX,
+            astrid_core::PrincipalId::default(),
+            crate::MemoryLedger::default(),
+        ),
         principal: astrid_core::PrincipalId::default(),
         capsule_uuid: uuid::Uuid::new_v4(),
         caller_context: None,

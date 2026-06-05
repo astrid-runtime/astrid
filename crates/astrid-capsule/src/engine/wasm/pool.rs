@@ -102,7 +102,7 @@ impl InstanceBuilder {
     /// checkout.
     pub(super) async fn build(&self) -> CapsuleResult<PooledInstance> {
         let mut store = Store::new(&self.engine, (self.make_state)());
-        store.limiter(|state| &mut state.store_limits);
+        store.limiter(|state| &mut state.store_meter);
         store.set_epoch_deadline(self.epoch_deadline);
         // Fuel is engine-wide; a fresh Store starts at 0 and would trap on the
         // first instruction of `instantiate_async`. Seed it; the per-invocation

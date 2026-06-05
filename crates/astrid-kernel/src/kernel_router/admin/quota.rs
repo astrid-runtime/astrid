@@ -89,8 +89,13 @@ pub(super) fn usage_get(kernel: &Arc<crate::Kernel>, principal: &PrincipalId) ->
                 cpu_fuel_per_sec_limit: profile.quotas.max_cpu_fuel_per_sec,
                 exempt,
                 memory_bytes_limit_per_instance: profile.quotas.max_memory_bytes,
-                // Per-principal aggregate RAM is not implemented.
+                // A live cross-capsule "current" total is not cleanly
+                // attributable under pooled, shared Stores; report the peak.
                 memory_bytes_current_total: None,
+                memory_bytes_peak_total: match kernel.memory_ledger.peak(principal) {
+                    0 => None,
+                    bytes => Some(bytes),
+                },
             })
         },
         Err(e) => err_profile(principal, &e),

@@ -221,13 +221,20 @@ fn print_usage_pretty(u: &ResourceUsage) {
         exempt
     };
     println!("  {:<24}  {}", "exempt".bold(), exempt);
-    let mem_current = mem_current_label(u.memory_bytes_current_total);
+    let mem_current = mem_bytes_label(u.memory_bytes_current_total);
     let mem_current = if u.memory_bytes_current_total.is_none() {
         mem_current.dimmed().to_string()
     } else {
         mem_current
     };
     println!("  {:<24}  {}", "memory current".bold(), mem_current);
+    let mem_peak = mem_bytes_label(u.memory_bytes_peak_total);
+    let mem_peak = if u.memory_bytes_peak_total.is_none() {
+        mem_peak.dimmed().to_string()
+    } else {
+        mem_peak
+    };
+    println!("  {:<24}  {}", "memory peak".bold(), mem_peak);
     println!(
         "  {:<24}  {}",
         "memory limit/instance".bold(),
@@ -246,10 +253,11 @@ fn exempt_label(exempt: bool) -> String {
     }
 }
 
-/// Plain text for the `memory current` row. `None` (no per-principal RAM
-/// aggregate yet) renders the `n/a` placeholder the caller dims.
-fn mem_current_label(current: Option<u64>) -> String {
-    match current {
+/// Plain text for an optional byte total (the `memory current` / `memory peak`
+/// rows). `None` renders the `n/a` placeholder the caller dims: `current` has no
+/// per-principal aggregate, and `peak` is `None` until a guest grows memory.
+fn mem_bytes_label(bytes: Option<u64>) -> String {
+    match bytes {
         Some(b) => format_bytes(b),
         None => "n/a".to_string(),
     }
@@ -611,8 +619,8 @@ mod tests {
         // exempt=true and Some(memory) render paths are otherwise unexercised.
         assert_eq!(exempt_label(true), "yes (limits advisory)");
         assert_eq!(exempt_label(false), "no");
-        assert_eq!(mem_current_label(None), "n/a");
-        assert_eq!(mem_current_label(Some(2048)), "2.0 KiB");
+        assert_eq!(mem_bytes_label(None), "n/a");
+        assert_eq!(mem_bytes_label(Some(2048)), "2.0 KiB");
     }
 
     #[test]
