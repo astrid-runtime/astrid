@@ -756,6 +756,52 @@ async fn dispatcher_idle_evicts_per_principal_consumers_after_grace() {
     handle.abort();
 }
 
+#[tokio::test]
+async fn dispatch_respawns_when_mapped_consumer_is_closed() {
+    // Regression for the burst-induced `user.v1.prompt` stall: a stale CLOSED
+    // sender left in the queue map (its consumer gone — idle-evict race or an
+    // abnormally-ended task) must NOT make every later dispatch fail `Closed`
+    // and drop forever. `get_or_spawn_consumer` skips a closed entry and
+    // re-spawns; the event is delivered, not dropped.
+    let counter = Arc::new(AtomicUsize::new(0));
+    let (mut capsule, _) = MockCapsule::new("respawn-cap", "respawn.topic");
+    capsule.invoke_counter = Some(Arc::clone(&counter));
+    let capsule: Arc<dyn Capsule> = Arc::new(capsule);
+
+    // Pre-seed the queue map with a CLOSED sender for the key (receiver dropped).
+    let queues: CapsuleQueues = Arc::new(parking_lot::Mutex::new(HashMap::new()));
+    let key = (capsule.id().clone(), Some("alice".to_string()));
+    let (dead_tx, dead_rx) = mpsc::channel::<InterceptorWork>(CAPSULE_EVENT_QUEUE_CAPACITY);
+    drop(dead_rx);
+    assert!(
+        dead_tx.is_closed(),
+        "precondition: the seeded sender is closed"
+    );
+    queues.lock().insert(key.clone(), dead_tx);
+
+    // Dispatch through the closed entry — must re-spawn a live consumer and
+    // deliver rather than hand back the dead sender and drop.
+    dispatch_single(
+        &queues,
+        Arc::clone(&capsule),
+        "test_action".to_string(),
+        Arc::new("respawn.topic".to_string()),
+        Arc::new(Vec::new()),
+        None,
+        Some("alice".to_string()),
+    );
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    while counter.load(Ordering::SeqCst) < 1 && std::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        counter.load(Ordering::SeqCst),
+        1,
+        "a dispatch through a closed mapped sender must re-spawn and deliver, not drop"
+    );
+}
+
 // ── Chain-lock map bounding (#828) ──────────────────────────────
 
 #[tokio::test]
