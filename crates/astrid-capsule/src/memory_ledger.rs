@@ -27,6 +27,16 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use astrid_core::PrincipalId;
 use dashmap::DashMap;
 
+/// Cap on distinct principals tracked. A flood of ephemeral sub-agent
+/// principals must not grow the ledger without bound — the lesson of the
+/// `chain_locks` / fuel-ledger churn (`astrid#827`). When full, recording a
+/// *new* principal first evicts the entry with the lowest recorded peak, so the
+/// ledger retains the biggest memory users (the interesting telemetry) instead
+/// of growing or dropping arbitrarily. Sized generously: real deployments have
+/// far fewer concurrent principals, so the cap only bites under adversarial
+/// ephemeral churn.
+const MAX_PRINCIPALS: usize = 4096;
+
 /// Shared, cloneable handle to the per-principal peak-memory ledger.
 ///
 /// Cloning is an `Arc` bump; every clone observes the same map, so the kernel
@@ -54,7 +64,36 @@ impl MemoryLedger {
             Self::raise_to(&counter, bytes);
             return;
         }
+        // New principal. Bound the map (`astrid#827` lesson): if at capacity,
+        // evict the lowest-peak entry first so the ledger keeps the biggest
+        // memory users rather than growing without limit. A benign race may let
+        // the size briefly exceed the cap under concurrent new inserts — bounded
+        // by the number of concurrent inserters, never unbounded.
+        if self.inner.len() >= MAX_PRINCIPALS {
+            self.evict_lowest();
+        }
         Self::raise_to(&self.inner.entry(principal.clone()).or_default(), bytes);
+    }
+
+    /// Remove the entry with the smallest recorded peak (best-effort under
+    /// concurrency). `O(n)` over the map, but only on the rare
+    /// new-principal-while-at-capacity path; `n` is bounded by [`MAX_PRINCIPALS`]
+    /// and each probe is a `Relaxed` load, so the scan is microseconds. The
+    /// iterator's shard guards are dropped before the `remove`, so it cannot
+    /// deadlock against a concurrent `record_peak`.
+    fn evict_lowest(&self) {
+        let mut victim: Option<PrincipalId> = None;
+        let mut lowest = u64::MAX;
+        for entry in &*self.inner {
+            let peak = entry.value().load(Ordering::Relaxed);
+            if peak <= lowest {
+                lowest = peak;
+                victim = Some(entry.key().clone());
+            }
+        }
+        if let Some(key) = victim {
+            self.inner.remove(&key);
+        }
     }
 
     /// Relaxed atomic max: raise `counter` to `bytes` if larger. The closure
@@ -191,6 +230,28 @@ mod tests {
         assert_eq!(ledger.peak(&a), 2048);
         assert_eq!(ledger.peak(&b), 8192);
         assert_eq!(clone.peak(&a), 2048);
+    }
+
+    #[test]
+    fn ledger_is_bounded_and_evicts_the_lowest_peak() {
+        let ledger = MemoryLedger::default();
+        // Fill to capacity; principal `pi` gets peak `i + 1`, so peaks are all
+        // distinct and the lowest is `p0` (peak 1).
+        for i in 0..MAX_PRINCIPALS {
+            let p = PrincipalId::new(format!("p{i}")).unwrap();
+            ledger.record_peak(&p, (i as u64) + 1);
+        }
+        assert_eq!(ledger.inner.len(), MAX_PRINCIPALS);
+        let lowest = PrincipalId::new("p0").unwrap();
+        assert_eq!(ledger.peak(&lowest), 1);
+
+        // One more NEW principal at a high peak evicts the lowest (`p0`) and the
+        // map stays bounded.
+        let newcomer = PrincipalId::new("newcomer").unwrap();
+        ledger.record_peak(&newcomer, 1_000_000);
+        assert!(ledger.inner.len() <= MAX_PRINCIPALS, "stays bounded");
+        assert_eq!(ledger.peak(&newcomer), 1_000_000, "newcomer recorded");
+        assert_eq!(ledger.peak(&lowest), 0, "lowest-peak principal evicted");
     }
 
     #[test]
