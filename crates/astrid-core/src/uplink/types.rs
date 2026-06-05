@@ -195,7 +195,9 @@ impl FromStr for UplinkProfile {
 /// Uses serde's default externally-tagged representation:
 /// - `"native"` for [`Native`](Self::Native)
 /// - `{"wasm": {"capsule_id": "..."}}` for [`Wasm`](Self::Wasm)
-/// - `{"bridge": {"capsule_id": "..."}}` for [`Bridge`](Self::Bridge)
+/// - `{"bridge": {"capsule_id": "..."}}` for [`Bridge`](Self::Bridge) —
+///   also accepts the legacy `{"open_claw": {...}}` tag on deserialize
+///   for backward compatibility with persisted [`UplinkDescriptor`] rows.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum UplinkSource {
@@ -210,6 +212,13 @@ pub enum UplinkSource {
         capsule_id: String,
     },
     /// Protocol-bridged capsule uplink (Telegram, Discord, MCP relay).
+    ///
+    /// `#[serde(alias = "open_claw")]` preserves backward compatibility
+    /// with `UplinkDescriptor` rows persisted under this variant's
+    /// pre-removal name (`OpenClaw`): an old `{"open_claw": {...}}` payload
+    /// still deserializes as `Bridge`. New writes always serialize as
+    /// `bridge`.
+    #[serde(alias = "open_claw")]
     Bridge {
         /// Capsule identifier — lowercase alphanumeric and hyphens, must not
         /// start or end with a hyphen. Validated by

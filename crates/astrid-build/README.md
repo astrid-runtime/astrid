@@ -45,7 +45,7 @@ astrid-build [PATH] [OPTIONS]
 
 | Type | Detection | What happens |
 |---|---|---|
-| **Rust** | `Cargo.toml` + `Cargo.lock` | `cargo build --target wasm32-wasip1 --release`, extracts tool schemas from WASM, merges into `Capsule.toml`, packs archive |
+| **Rust** | `Cargo.toml` + `Cargo.lock` | `cargo build --release` (the capsule's own `.cargo/config.toml` selects the target — canonical `wasm32-unknown-unknown`, with `wasm32-wasip2` accepted as a migration fallback; no `--target` is passed), extracts tool schemas from WASM, merges into `Capsule.toml`, packs archive |
 | **MCP** | `mcp.json` | Converts legacy MCP server manifest to `Capsule.toml`, packs archive |
 | **Extension** | `gemini-extension.json` | Same as MCP, for Gemini extension format |
 

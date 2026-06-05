@@ -220,6 +220,28 @@ mod tests {
         assert_eq!(src, back);
     }
 
+    #[test]
+    fn source_deserializes_legacy_open_claw_tag_as_bridge() {
+        // Back-compat: `UplinkSource::OpenClaw` was renamed to `Bridge`
+        // (serde tag `open_claw` -> `bridge`). A persisted `UplinkDescriptor`
+        // row written before the rename still carries the `open_claw` tag,
+        // so `#[serde(alias = "open_claw")]` must accept it on deserialize.
+        let legacy = r#"{"open_claw":{"capsule_id":"telegram-bridge"}}"#;
+        let back: UplinkSource = serde_json::from_str(legacy).unwrap();
+        assert_eq!(back, UplinkSource::new_bridge("telegram-bridge").unwrap());
+
+        // New writes must serialize under the current tag, never the legacy one.
+        let json = serde_json::to_string(&back).unwrap();
+        assert!(
+            json.contains("\"bridge\""),
+            "must serialize as bridge: {json}"
+        );
+        assert!(
+            !json.contains("open_claw"),
+            "must not re-emit legacy tag: {json}"
+        );
+    }
+
     // -- UplinkDescriptor --
 
     #[test]
