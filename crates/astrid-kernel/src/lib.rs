@@ -183,7 +183,7 @@ impl Kernel {
     /// `runtime_limits` is the resolved per-host capsule concurrency ceiling
     /// pair (blocking vs async-I/O host calls); the daemon resolves it from
     /// config + CLI + host defaults and the kernel forwards it, unmodified, to
-    /// every capsule's `WasmEngine`. Tests pass
+    /// every capsule's `WasmEngine`. In tests, pass
     /// [`CapsuleRuntimeLimits::default()`](astrid_capsule::CapsuleRuntimeLimits::default).
     ///
     /// # Panics

@@ -60,7 +60,7 @@ pub fn host_blocking_concurrency_default() -> usize {
 }
 
 /// Host-derived default for the **async-I/O** host-call semaphore: `cores *
-/// IO_PER_CORE`, floored at [`IO_MIN`], then clamped to half the process
+/// IO_PER_CORE` floored at [`IO_MIN`], then clamped to half the process
 /// file-descriptor soft limit (`RLIMIT_NOFILE`).
 ///
 /// Async host calls free the worker while pending, so cores are not the bound;
@@ -68,11 +68,19 @@ pub fn host_blocking_concurrency_default() -> usize {
 /// half-budget leaves descriptors for listeners, the KV store, log files, and
 /// the uplink socket — the daemon is one process among many and must not claim
 /// every fd. When the fd limit is unreadable or unbounded the clamp is skipped.
+///
+/// On an fd-scarce host the clamp wins and the result can fall **below**
+/// [`IO_MIN`]: the clamp is floored at `1`, not `IO_MIN`, so the gate stays
+/// strictly bounded by the available descriptors (preventing `EMFILE`) while
+/// still guaranteeing at least one permit so it never wedges.
 #[must_use]
 pub fn host_io_concurrency_default() -> usize {
     let by_cores = cores().saturating_mul(IO_PER_CORE).max(IO_MIN);
     match fd_soft_limit() {
-        Some(soft) => by_cores.min((soft / 2).max(IO_MIN)),
+        // Floor the clamp at 1, NOT IO_MIN: flooring at IO_MIN would let the
+        // result exceed `soft / 2` on a low-fd host (e.g. soft=50 → 25 < 64),
+        // re-opening the EMFILE risk this clamp exists to close.
+        Some(soft) => by_cores.min((soft / 2).max(1)),
         None => by_cores,
     }
 }
@@ -168,7 +176,16 @@ mod tests {
     #[test]
     fn io_default_is_large_and_floored() {
         let io = host_io_concurrency_default();
-        assert!(io >= IO_MIN, "io concurrency must keep the floor");
+
+        // The cores-based value is floored at IO_MIN, but the fd clamp can pull
+        // the result below IO_MIN on an fd-scarce host (the clamp is floored at
+        // 1, not IO_MIN). So only assert the IO_MIN floor when fds are ample; on
+        // a scarce host the result must equal the clamp `(soft / 2).max(1)`.
+        match fd_soft_limit() {
+            Some(soft) if soft / 2 < IO_MIN => assert_eq!(io, (soft / 2).max(1)),
+            _ => assert!(io >= IO_MIN),
+        }
+
         // The point of the split is that I/O concurrency dwarfs blocking — but
         // only when descriptors are not scarcer than cores. On a pathological
         // host (very high core count AND a low `RLIMIT_NOFILE`) the fd clamp can

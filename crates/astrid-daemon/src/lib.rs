@@ -37,14 +37,27 @@ pub struct Args {
     /// Override the async-I/O host-call concurrency ceiling for capsules
     /// (HTTP, `ipc::recv`). Highest-precedence override; defaults to a
     /// host-derived value (cores-scaled, file-descriptor-clamped).
-    #[arg(long)]
+    #[arg(long, value_parser = parse_nonzero_concurrency)]
     pub host_io_concurrency: Option<usize>,
 
     /// Override the blocking host-call concurrency ceiling for capsules (KV,
     /// fs, identity, sys, sockets). Highest-precedence override; defaults to a
     /// host-derived value (≈ cores - 2).
-    #[arg(long)]
+    #[arg(long, value_parser = parse_nonzero_concurrency)]
     pub host_blocking_concurrency: Option<usize>,
+}
+
+/// Reject a concurrency ceiling of `0` at CLI parse time. `0` would otherwise
+/// parse as `Some(0)` and be silently clamped to `1` by
+/// `CapsuleRuntimeLimits::resolve`, diverging from the config layer (which
+/// rejects an explicit zero) and quietly serialising the gate. Failing fast
+/// keeps the two configuration surfaces consistent.
+fn parse_nonzero_concurrency(s: &str) -> Result<usize, String> {
+    match s.parse::<usize>() {
+        Ok(0) => Err("must be >= 1 (a concurrency ceiling of 0 would wedge the gate)".to_string()),
+        Ok(n) => Ok(n),
+        Err(e) => Err(format!("not a valid concurrency value: {e}")),
+    }
 }
 
 fn init_logging(verbose: bool, unified_cfg: Option<&astrid_config::Config>) {
