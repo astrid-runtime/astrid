@@ -19,7 +19,6 @@ on:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
-  QUICKJS_KERNEL_VERSION: v1.6.0
 
 jobs:
   check:
@@ -139,20 +138,13 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-
 
-      - name: Cache QuickJS kernel
-        uses: actions/cache@v4
-        with:
-          path: |
-            crates/astrid-openclaw/kernel/engine.wasm
-            crates/astrid-openclaw/kernel/engine.wasm.blake3
-          key: quickjs-kernel-${{ env.QUICKJS_KERNEL_VERSION }}-${{ runner.os }}-${{ runner.arch }}
-          restore-keys: |
-            quickjs-kernel-${{ env.QUICKJS_KERNEL_VERSION }}-${{ runner.os }}-
-
       - name: Run tests
-        env:
-          ASTRID_AUTO_BUILD_KERNEL: "1"
-        run: cargo test --workspace
+        # astrid-openclaw is parked (preserved on the archive/openclaw branch).
+        # Its Tier 1 e2e tests need a QuickJS kernel built from a now-dead
+        # js-pdk fork, and that auto-build exhausted the runner disk (SIGBUS).
+        # Excluded from the test run until the crate's future is settled; it
+        # still compiles via build.rs's placeholder kernel under check/clippy.
+        run: cargo test --workspace --exclude astrid-openclaw
 
   msrv:
     name: MSRV
