@@ -540,8 +540,22 @@ fn get_or_spawn_consumer(
     key: (CapsuleId, PrincipalKey),
 ) -> mpsc::Sender<InterceptorWork> {
     let mut guard = queues.lock();
-    if let Some(s) = guard.get(&key) {
-        return s.clone();
+    // Never hand back a CLOSED sender. The mapped entry can be stale: an
+    // idle-evicting consumer that exited (or, defensively, a consumer task that
+    // ended abnormally) leaves its `Sender` in the map with the receiver gone.
+    // Returning it would make every `try_send` fail `Closed` and silently drop
+    // events forever — the burst-induced `user.v1.prompt` stall. If the entry
+    // is dead, REMOVE it and fall through to re-spawn. The explicit remove
+    // matters for the degrade-to-shared path below: that re-keys the insert to
+    // `(capsule, None)`, so it would never overwrite a stale
+    // `(capsule, Some(principal))` entry — the dead `Sender` and its
+    // `PrincipalKey` string would leak and slow `queues_per_capsule`'s scan.
+    match guard.get(&key) {
+        Some(s) if !s.is_closed() => return s.clone(),
+        Some(_) => {
+            guard.remove(&key);
+        },
+        None => {},
     }
 
     // Cap enforcement — if exceeded, degrade this insert to the
@@ -561,8 +575,15 @@ fn get_or_spawn_consumer(
             "dispatcher: per-principal queue cap exceeded; degrading to shared queue"
         );
         effective_key.1 = None;
-        if let Some(s) = guard.get(&effective_key) {
-            return s.clone();
+        match guard.get(&effective_key) {
+            Some(s) if !s.is_closed() => return s.clone(),
+            // A closed shared sender is removed too. The insert below would
+            // overwrite it anyway, but removing keeps the handling uniform with
+            // the per-principal path and avoids a transient dead entry.
+            Some(_) => {
+                guard.remove(&effective_key);
+            },
+            None => {},
         }
     }
 
@@ -678,6 +699,24 @@ async fn run_consumer(
                 // bounded, and it always errs toward NOT dropping events.
                 let mut guard = queues.lock();
                 if rx.try_recv().is_err() && rx.sender_strong_count() == 1 {
+                    // KNOWN RESIDUAL (bounded, non-correctness): this `remove` is
+                    // identity-blind — unlike `ChainLockGuard::drop`'s
+                    // `Arc::ptr_eq` guard above, it removes whatever sits at
+                    // `key` even if a *newer* consumer generation was cold-spawned
+                    // (and re-`insert`ed) for this key in the gap between the
+                    // grace timeout firing and this lock acquisition. The
+                    // `sender_strong_count()==1` check reads THIS consumer's own
+                    // channel, decoupled from the map entry, so it cannot catch
+                    // the cross-generation case. Consequence is bounded churn (a
+                    // transient orphaned consumer + a re-spawn), NOT event loss:
+                    // `get_or_spawn_consumer` skips `is_closed()` senders and
+                    // re-spawns, so no dispatch is ever dropped to a reclaimed
+                    // generation. A complete root fix would tag each generation
+                    // (e.g. an `Arc<()>` stored beside the sender) and only
+                    // remove when it matches, mirroring the chain-lock identity
+                    // discipline. Tracked separately; left here so the
+                    // already-shipped, live-verified detect-and-replace fix is
+                    // not entangled with a deeper map-shape change.
                     guard.remove(&key);
                     drop(guard);
                     debug!(
@@ -711,7 +750,7 @@ fn dispatch_single(
     principal_key: PrincipalKey,
 ) {
     let key = (capsule.id().clone(), principal_key);
-    let sender = get_or_spawn_consumer(queues, &capsule, key);
+    let sender = get_or_spawn_consumer(queues, &capsule, key.clone());
 
     let work = InterceptorWork {
         action,
@@ -719,12 +758,58 @@ fn dispatch_single(
         topic: Arc::clone(&topic),
         ipc_message: ipc_message.clone(),
     };
-    if let Err(e) = sender.try_send(work) {
-        warn!(
-            capsule_id = %capsule.id(),
-            topic = %topic,
-            "Capsule dispatch queue full or closed, dropping event: {e}"
-        );
+    match sender.try_send(work) {
+        Ok(()) => {},
+        Err(mpsc::error::TrySendError::Closed(work)) => {
+            // The consumer idle-evicted in the window between
+            // `get_or_spawn_consumer` cloning its sender and this send. The
+            // `sender_strong_count` guard in `run_consumer` narrows that TOCTOU
+            // but cannot fully close it under a concurrent burst: a stale clone
+            // can outlive the count==1 check, so a send can still land on a
+            // just-closed channel. Eviction is benign (the queue was idle), so
+            // re-spawn a fresh consumer and retry ONCE — the event must not be
+            // lost to a race against reclamation. (Symptom: a `user.v1.prompt`
+            // stall under a 100-wide prompt burst — the route's consumer closed
+            // and every later prompt was dropped.) The re-spawn just spawned its
+            // consumer, so the retry cannot hit the same race.
+            let sender = get_or_spawn_consumer(queues, &capsule, key);
+            match sender.try_send(work) {
+                Ok(()) => {},
+                // `Full` after a fresh re-spawn is the same intended shed-load
+                // drop as the steady-state arm below: the new consumer is alive
+                // but its bounded queue saturated under the ongoing burst.
+                // Recoverable via the requester's IPC/SSE timeout.
+                Err(e @ mpsc::error::TrySendError::Full(_)) => {
+                    warn!(
+                        capsule_id = %capsule.id(),
+                        topic = %topic,
+                        "Capsule dispatch queue full after re-spawn, dropping event (backpressure): {e}"
+                    );
+                },
+                // `Closed` immediately after we spawned a fresh consumer is a
+                // BUG, not backpressure — it would break the "Closed is never
+                // dropped" invariant. Flag it as a security/correctness event
+                // rather than folding it into the benign backpressure log.
+                Err(e @ mpsc::error::TrySendError::Closed(_)) => {
+                    warn!(
+                        capsule_id = %capsule.id(),
+                        topic = %topic,
+                        security_event = true,
+                        "BUG: capsule dispatch sender closed immediately after re-spawn; event dropped: {e}"
+                    );
+                },
+            }
+        },
+        Err(e @ mpsc::error::TrySendError::Full(_)) => {
+            // Genuine backpressure: the consumer is alive but its bounded queue
+            // is saturated. Dropping is the intended shed-load behaviour (a
+            // slow/looping consumer must not let the queue grow without bound).
+            warn!(
+                capsule_id = %capsule.id(),
+                topic = %topic,
+                "Capsule dispatch queue full, dropping event (backpressure): {e}"
+            );
+        },
     }
 }
 
