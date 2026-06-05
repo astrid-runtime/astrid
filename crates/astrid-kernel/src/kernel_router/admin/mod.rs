@@ -378,6 +378,29 @@ pub fn admin_target_principal(req: &AdminRequestKind) -> Option<&PrincipalId> {
     }
 }
 
+/// Map a redeem handler's response to the audit `(authorization, outcome)`
+/// pair. Redeems bypass the capability preamble (the token is the auth),
+/// so the outcome can only be known *after* the handler runs: a rejected
+/// token (`Error`) must record a `Denied` / `Failure` row so brute-force
+/// or forged-token attempts are visible in the audit log itself, not only
+/// in tracing; a mint records the `System` / `Success` row.
+fn redeem_audit_proof(body: &AdminResponseBody) -> (AuthorizationProof, AuditOutcome) {
+    match body {
+        AdminResponseBody::Error(reason) => (
+            AuthorizationProof::Denied {
+                reason: reason.clone(),
+            },
+            AuditOutcome::failure(reason.clone()),
+        ),
+        _ => (
+            AuthorizationProof::System {
+                reason: "redeem (invite or pair-device): token is the auth".to_string(),
+            },
+            AuditOutcome::success(),
+        ),
+    }
+}
+
 async fn handle_admin_request(
     kernel: &Arc<crate::Kernel>,
     topic: String,
@@ -399,16 +422,28 @@ async fn handle_admin_request(
     // lives on `AuthConfig.public_keys`.
     let audit_params = sanitize_admin_audit_params(&req.kind);
 
-    // `InviteRedeem` is the one variant that bypasses the capability
-    // preamble: the redeemer's principal does not exist yet at the
-    // moment the request arrives — the token IS the auth. The handler
-    // verifies the token internally and either mints a principal or
-    // rejects the request. Every redeem still produces an audit row
-    // (allow OR deny) below.
+    // `InviteRedeem` / `PairDeviceRedeem` are the two variants that
+    // bypass the capability preamble: the redeemer's principal does not
+    // exist yet at the moment the request arrives — the token IS the
+    // auth. The handler verifies the token internally and either mints a
+    // principal (success) or rejects it (invalid / expired / consumed /
+    // forged token, or an internal store error).
+    //
+    // Dispatch FIRST, then audit with the REAL outcome. Stamping
+    // `success` before dispatch (as this used to) meant a rejected token
+    // still wrote a success row, so brute-force / forged-token attempts
+    // were invisible in the audit log itself — only in tracing.
+    // Recording after dispatch makes the row's outcome match what
+    // actually happened: this is the "allow OR deny" the comment always
+    // promised. The handler still emits its own `security_event` warn on
+    // rejection; this adds the missing audit-store signal so the
+    // security team can detect token brute-forcing from audit rows alone.
     if matches!(
         req.kind,
         AdminRequestKind::InviteRedeem { .. } | AdminRequestKind::PairDeviceRedeem { .. }
     ) {
+        let body = handlers::dispatch(kernel, &caller, req.kind).await;
+        let (authorization, outcome) = redeem_audit_proof(&body);
         record_admin_audit(
             kernel,
             AdminAuditEntry {
@@ -417,13 +452,10 @@ async fn handle_admin_request(
                 required_cap,
                 target_principal: None,
                 params: audit_params.clone(),
-                authorization: AuthorizationProof::System {
-                    reason: "redeem (invite or pair-device): token is the auth".to_string(),
-                },
-                outcome: AuditOutcome::success(),
+                authorization,
+                outcome,
             },
         );
-        let body = handlers::dispatch(kernel, &caller, req.kind).await;
         publish_response(
             kernel,
             response_topic,

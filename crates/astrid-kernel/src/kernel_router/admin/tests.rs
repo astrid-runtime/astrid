@@ -435,3 +435,37 @@ fn caps_revoke_of_unheld_capability_is_not_an_error_shape() {
     let check = CapabilityCheck::new(&profile, &groups, caller);
     assert!(check.require("capsule:install").is_err(), "revoke wins");
 }
+
+// ── redeem audit-outcome fidelity ───────────────────────────────────
+
+#[test]
+fn redeem_audit_proof_marks_rejected_token_as_failure() {
+    use astrid_audit::{AuditOutcome, AuthorizationProof};
+    use astrid_events::kernel_api::AdminResponseBody;
+
+    // A rejected / expired / consumed / forged token returns `Error`. It
+    // MUST audit as Denied + Failure so brute-force attempts are visible
+    // in the audit log itself, not only in tracing. Before the fix this
+    // path was hard-stamped success *before* dispatch, so a failed redeem
+    // left a success row.
+    let (auth, outcome) =
+        super::redeem_audit_proof(&AdminResponseBody::Error("invite token not found".into()));
+    assert!(
+        matches!(auth, AuthorizationProof::Denied { .. }),
+        "rejected redeem must record a Denied authorization proof"
+    );
+    match outcome {
+        AuditOutcome::Failure { error } => assert!(error.contains("not found")),
+        AuditOutcome::Success { .. } => panic!("rejected redeem must record a Failure outcome"),
+    }
+
+    // A successful mint (any non-Error body) audits as System + Success —
+    // the token was the auth and it worked.
+    let (auth, outcome) =
+        super::redeem_audit_proof(&AdminResponseBody::Success(serde_json::Value::Null));
+    assert!(
+        matches!(auth, AuthorizationProof::System { .. }),
+        "successful redeem keeps the System (token-is-auth) proof"
+    );
+    assert!(matches!(outcome, AuditOutcome::Success { .. }));
+}
