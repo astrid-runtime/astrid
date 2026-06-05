@@ -300,6 +300,13 @@ fn validate_capsule(config: &Config) -> ConfigResult<()> {
         });
     }
 
+    if c.instance_pool_size == Some(0) {
+        return Err(ConfigError::ValidationError {
+            field: "capsule.instance_pool_size".to_owned(),
+            message: "instance_pool_size must be greater than 0".to_owned(),
+        });
+    }
+
     Ok(())
 }
 
@@ -421,6 +428,18 @@ mod tests {
             err,
             ConfigError::ValidationError { field, .. }
                 if field == "capsule.host_io_concurrency"
+        ));
+    }
+
+    #[test]
+    fn test_capsule_zero_pool_size_rejected() {
+        let mut config = Config::default();
+        config.capsule.instance_pool_size = Some(0);
+        let err = validate(&config).unwrap_err();
+        assert!(matches!(
+            err,
+            ConfigError::ValidationError { field, .. }
+                if field == "capsule.instance_pool_size"
         ));
     }
 

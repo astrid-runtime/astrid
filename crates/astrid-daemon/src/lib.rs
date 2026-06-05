@@ -45,6 +45,12 @@ pub struct Args {
     /// host-derived value (≈ cores - 2).
     #[arg(long, value_parser = parse_nonzero_concurrency)]
     pub host_blocking_concurrency: Option<usize>,
+
+    /// Override the max size of each capsule's dynamic instance pool (concurrent
+    /// interceptor invocations). Highest-precedence override; defaults to a
+    /// host-derived value (cores-scaled, replacing the old fixed 16).
+    #[arg(long)]
+    pub instance_pool_size: Option<usize>,
 }
 
 /// Reject a concurrency ceiling of `0` at CLI parse time. `0` would otherwise
@@ -98,6 +104,8 @@ fn resolve_capsule_limits(
             .or_else(|| capsule_cfg.and_then(|c| c.host_blocking_concurrency)),
         args.host_io_concurrency
             .or_else(|| capsule_cfg.and_then(|c| c.host_io_concurrency)),
+        args.instance_pool_size
+            .or_else(|| capsule_cfg.and_then(|c| c.instance_pool_size)),
     )
 }
 

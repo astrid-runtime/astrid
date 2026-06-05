@@ -789,6 +789,12 @@ pub struct CapsuleSection {
     /// the outbound-throughput gate the LLM path rides on; sizing it well above
     /// the blocking ceiling is the point of the split.
     pub host_io_concurrency: Option<usize>,
+    /// **Max** size of a capsule's dynamic instance pool — the ceiling on its
+    /// concurrent interceptor invocations. `None` → cores-scaled (replacing the
+    /// old fixed 16). The pool warm-starts well below this and grows lazily, so
+    /// this bounds the peak, not the resting footprint. (Run-loop and
+    /// `host_process` capsules stay single-Store regardless.)
+    pub instance_pool_size: Option<usize>,
 }
 
 // ---------------------------------------------------------------------------
