@@ -30,7 +30,8 @@ use tracing::warn;
 use wasmtime::component::Resource;
 
 use crate::engine::wasm::bindings::astrid::process::host::{
-    self as process, EnvVar, ErrorCode, ExitInfo, ProcessHandle, ProcessResult, SpawnRequest,
+    self as process, EnvVar, ErrorCode, ExitInfo, KillResult, LogChunk, LogCursor, LogStream,
+    ProcessHandle, ProcessInfo, ProcessResult, ProcessSignal, ReadLogsResult, SpawnRequest,
 };
 use crate::engine::wasm::host::util;
 use crate::engine::wasm::host_state::HostState;
@@ -287,5 +288,91 @@ impl process::Host for HostState {
             &result,
         );
         result
+    }
+
+    // ================================================================
+    // PERSISTENT TIER — `astrid:process@1.0.0`.
+    //
+    // The WIT declares the full surface; the host fills it in
+    // incrementally (see the `(NOT YET IMPLEMENTED)` notes in
+    // `host/process@1.0.0.wit`). Until the host-owned
+    // `PersistentProcessRegistry` lands, these are fail-secure stubs:
+    //   - `spawn-persistent` => `persist-unsupported` (persistence off).
+    //   - every id-keyed op => `no-such-process` (no registry => no id
+    //     resolves; honest + denies any cross-principal oracle).
+    //   - `list-processes` / `status-many` => empty (the caller has no
+    //     persistent processes).
+    // No behaviour here is reachable in a way that could leak or escape;
+    // the SHAPES are wired so the SDK can generate and the registry can
+    // drop in behind this contract without a WIT change.
+    // ================================================================
+
+    fn spawn_persistent(&mut self, _request: SpawnRequest) -> Result<String, ErrorCode> {
+        Err(ErrorCode::PersistUnsupported)
+    }
+
+    fn attach(&mut self, _id: String) -> Result<Resource<ProcessHandle>, ErrorCode> {
+        Err(ErrorCode::NoSuchProcess)
+    }
+
+    fn list_processes(
+        &mut self,
+        _label_filter: Option<String>,
+    ) -> Result<Vec<ProcessInfo>, ErrorCode> {
+        Ok(Vec::new())
+    }
+
+    fn status(&mut self, _id: String) -> Result<ProcessInfo, ErrorCode> {
+        Err(ErrorCode::NoSuchProcess)
+    }
+
+    fn status_many(&mut self, _ids: Vec<String>) -> Result<Vec<ProcessInfo>, ErrorCode> {
+        Ok(Vec::new())
+    }
+
+    fn read_logs(&mut self, _id: String) -> Result<ReadLogsResult, ErrorCode> {
+        Err(ErrorCode::NoSuchProcess)
+    }
+
+    fn read_since(
+        &mut self,
+        _id: String,
+        _which_stream: LogStream,
+        _cursor: LogCursor,
+        _max_bytes: u32,
+    ) -> Result<LogChunk, ErrorCode> {
+        Err(ErrorCode::NoSuchProcess)
+    }
+
+    fn write_stdin(&mut self, _id: String, _data: Vec<u8>) -> Result<u32, ErrorCode> {
+        Err(ErrorCode::NoSuchProcess)
+    }
+
+    fn close_stdin(&mut self, _id: String) -> Result<(), ErrorCode> {
+        Err(ErrorCode::NoSuchProcess)
+    }
+
+    fn signal(&mut self, _id: String, _sig: ProcessSignal) -> Result<(), ErrorCode> {
+        Err(ErrorCode::NoSuchProcess)
+    }
+
+    fn wait(&mut self, _id: String, _timeout_ms: u64) -> Result<ExitInfo, ErrorCode> {
+        Err(ErrorCode::NoSuchProcess)
+    }
+
+    fn stop(&mut self, _id: String, _grace_ms: Option<u64>) -> Result<KillResult, ErrorCode> {
+        Err(ErrorCode::NoSuchProcess)
+    }
+
+    fn release_process(&mut self, _id: String) -> Result<(), ErrorCode> {
+        Err(ErrorCode::NoSuchProcess)
+    }
+
+    fn watch(&mut self, _id: String, _suffix: Option<String>) -> Result<(), ErrorCode> {
+        Err(ErrorCode::NoSuchProcess)
+    }
+
+    fn unwatch(&mut self, _id: String) -> Result<(), ErrorCode> {
+        Err(ErrorCode::NoSuchProcess)
     }
 }
