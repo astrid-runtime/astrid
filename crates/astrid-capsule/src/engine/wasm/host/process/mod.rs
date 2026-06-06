@@ -30,8 +30,8 @@ use tracing::warn;
 use wasmtime::component::Resource;
 
 use crate::engine::wasm::bindings::astrid::process::host::{
-    self as process, EnvVar, ErrorCode, ExitInfo, KillResult, LogChunk, LogCursor, LogStream,
-    ProcessHandle, ProcessInfo, ProcessResult, ProcessSignal, ReadLogsResult, SpawnRequest,
+    self as process, EnvVar, ErrorCode, ExitInfo, LogChunk, LogCursor, LogStream, ProcessHandle,
+    ProcessInfo, ProcessResult, ProcessSignal, ReadLogsResult, SpawnRequest,
 };
 use crate::engine::wasm::host::util;
 use crate::engine::wasm::host_state::HostState;
@@ -360,7 +360,7 @@ impl process::Host for HostState {
         Err(ErrorCode::NoSuchProcess)
     }
 
-    fn stop(&mut self, _id: String, _grace_ms: Option<u64>) -> Result<KillResult, ErrorCode> {
+    fn stop(&mut self, _id: String, _grace_ms: Option<u64>) -> Result<ExitInfo, ErrorCode> {
         Err(ErrorCode::NoSuchProcess)
     }
 

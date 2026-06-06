@@ -25,9 +25,12 @@
 /// ephemeral and persistent tiers") for the full design, security model,
 /// and lifecycle.
 ///
-/// Child stdio is byte-oriented (`write-stdin` / `read-logs` / cursored
-/// `read-since`) rather than stream-based; stream halves stay deferred to
-/// a concrete need per the original rationale.
+/// Child stdio is byte-oriented (pipe-based) rather than stream-based; stream
+/// halves stay deferred to a concrete need per the original rationale. The
+/// byte-faithful read path is `read-since` (`list<u8>`); the convenience
+/// `read-logs` / `read-logs-result` (and the synchronous `process-result`)
+/// surface stdout/stderr as UTF-8, which is LOSSY on non-UTF-8 output — fine
+/// for text, use `read-since` for binary.
 ///
 /// IMPLEMENTATION STATUS. This file is the full 1.0 contract; the host
 /// fills it in incrementally. Symbols tagged `(NOT YET IMPLEMENTED)`,
@@ -65,17 +68,17 @@ interface host {
         wait-timeout,
         /// No PERSISTENT process with this id is visible to the calling
         /// principal: unknown, already released/reaped, owned by a different
-        /// principal, OR owned by a different capsule. The host MUST NOT
-        /// distinguish these — "exists but not yours" is a cross-principal
-        /// oracle. The post-restart / post-reap recovery signal is an empty
-        /// `list-processes`, not this error.
+        /// principal, owned by a different capsule, OR structurally malformed.
+        /// The host MUST NOT distinguish these — "exists but not yours" and
+        /// "well-formed vs garbage" are both cross-principal/structural oracles.
+        /// (The host MAY fast-reject obvious garbage internally to avoid a
+        /// lookup, but the guest-visible result is identical.) The post-restart
+        /// / post-reap recovery signal is an empty `list-processes`, not this
+        /// error.
         no-such-process,
         /// The per-principal/per-capsule RETAINED-id cap is full (live +
         /// exited-but-unreleased). Distinct from `quota` (the CONCURRENT cap).
         registry-full,
-        /// The id is structurally malformed; returned WITHOUT a registry
-        /// lookup (timing-oracle defense). Treat as `no-such-process`.
-        invalid-id,
         /// `spawn-persistent` refused: the host cannot keep a detached child
         /// contained for this configuration (sandbox disabled; macOS without
         /// the operator persistence opt-in; or an owner-fallback principal).
@@ -143,8 +146,10 @@ interface host {
     record resource-limits {
         /// Address-space / RSS ceiling (RLIMIT_AS or cgroup memory.max).
         max-memory-bytes: option<u64>,
-        /// Cumulative CPU-time ceiling (RLIMIT_CPU -> SIGXCPU then SIGKILL).
-        max-cpu-ms: option<u64>,
+        /// Cumulative CPU-time ceiling in WHOLE SECONDS (RLIMIT_CPU -> SIGXCPU
+        /// then SIGKILL; second-granularity is all RLIMIT_CPU enforces, so the
+        /// unit is seconds, not ms).
+        max-cpu-secs: option<u64>,
         /// Max concurrent child PIDs (RLIMIT_NPROC / cgroup pids.max) — a
         /// fork-bomb fence.
         max-pids: option<u32>,
@@ -260,27 +265,32 @@ interface host {
     /// process that survives instance churn (pool reset / per-principal
     /// multiplexing).
     ///
-    /// Wire form: a 256-bit host-minted CSPRNG token (host entropy, NEVER
-    /// the guest), base32; the host stores only a keyed hash. Possession is
+    /// Wire form: a 256-bit host-minted CSPRNG token (host entropy, NEVER the
+    /// guest), **lowercase base32** (RFC 4648 `a-z2-7`, NO padding) — chosen so
+    /// the id is itself a valid IPC topic suffix (`[a-z0-9._-]+`), usable
+    /// directly as the `watch` suffix without sanitisation. The host stores
+    /// only a keyed hash. Possession is
     /// necessary but NOT sufficient — the host re-checks the calling
     /// principal == creator on EVERY id-keyed call, so a token that leaks
     /// across the principal boundary is inert. Treat as an opaque secret:
     /// never parse, pattern-match, or synthesize it.
     type process-id = string;
 
-    /// Lifecycle phase of a persistent process, reported WITHOUT draining
-    /// log buffers (see `status` / `process-info`).
+    /// Lifecycle phase of a persistent process, reported WITHOUT draining log
+    /// buffers (see `status` / `process-info`). There is deliberately NO
+    /// `reaped` phase: once a process is reaped, its id resolves to
+    /// `no-such-process` and drops out of `list-processes`, so `exited` is the
+    /// terminal observable phase. The reap (and its reason) is delivered via
+    /// the `watch` exit event, not `status`.
     enum process-phase {
         /// Spawn accepted; child not yet confirmed running.
         starting,
         /// Child is running.
         running,
-        /// Terminated; `exit-info` available; logs readable until released
-        /// or the exit-retention TTL elapses.
+        /// Terminated; `exit-info` available; logs readable until released or
+        /// the exit-retention TTL elapses, after which the id becomes
+        /// `no-such-process`.
         exited,
-        /// Exited AND its retained id/buffers were reaped. Terminal; the id
-        /// is permanently dead.
-        reaped,
     }
 
     /// Opaque, host-encoded, resumable cursor into a persistent process's
@@ -391,6 +401,11 @@ interface host {
         /// patterns that mustn't hang on a runaway child.
         /// Returns exit-info on exit, `wait-timeout` error if the
         /// timeout elapsed first.
+        ///
+        /// On a handle obtained via `attach` (a persistent process), `none` is
+        /// REJECTED with `invalid-input`: an unbounded wait would pin the
+        /// pooled instance. Use a bounded timeout, the id-keyed `wait` (also
+        /// bounded), or the durable `watch` event for long-lived waits.
         wait: func(timeout-ms: option<u64>) -> result<exit-info, error-code>;
 
         /// Wait for the process to exit AND drain remaining stdout /
@@ -474,7 +489,13 @@ interface host {
     /// polling N children on a timer. Unknown ids are absent from the result.
     status-many: func(ids: list<process-id>) -> result<list<process-info>, error-code>;
 
-    /// `attach(id)?.read-logs()` — DRAINS buffered logs since the last read.
+    /// `attach(id)?.read-logs()` — DRAINS the SINGLE shared ring per
+    /// `process-id`: whoever drains first consumes those bytes, so concurrent
+    /// drainers across invocations/attachments race over one cursor. For
+    /// independent multi-reader use (a UI tailer AND the capsule's own parser)
+    /// OR byte-faithful output, use `read-since` (per-cursor, non-draining,
+    /// `list<u8>`). `read-logs-result` stdout/stderr are UTF-8 (lossy on
+    /// non-UTF-8 child output).
     read-logs: func(id: process-id) -> result<read-logs-result, error-code>;
 
     /// NON-DRAINING, cursor-addressed, resumable read from a persistent
@@ -498,10 +519,15 @@ interface host {
     wait: func(id: process-id, timeout-ms: u64) -> result<exit-info, error-code>;
 
     /// Graceful terminal stop: SIGTERM, wait up to `grace-ms`, then SIGKILL;
-    /// drain final buffers; REMOVE the id (frees the concurrent + retained
-    /// slot). `grace-ms: none` => host default. (For an immediate SIGKILL use
-    /// `attach(id)?.kill()`.)
-    stop: func(id: process-id, grace-ms: option<u64>) -> result<kill-result, error-code>;
+    /// REMOVE the id (frees the concurrent + retained slot). `grace-ms: none`
+    /// => host default. (For an immediate SIGKILL use `attach(id)?.kill()`.)
+    ///
+    /// Returns only `exit-info`, NOT the final buffers: `stop` reaps the id, so
+    /// to keep a child's last output drain it with `read-since` (byte-faithful)
+    /// BEFORE `stop`. Returning the buffers here would hand back stdout/stderr
+    /// the guest must UTF-8-decode (lossy on non-UTF-8 output); `read-since` is
+    /// the byte-exact path.
+    stop: func(id: process-id, grace-ms: option<u64>) -> result<exit-info, error-code>;
 
     /// Drop the host's retention of an ALREADY-EXITED process: frees the
     /// retained-id slot + discards the buffered tail WITHOUT signalling.
