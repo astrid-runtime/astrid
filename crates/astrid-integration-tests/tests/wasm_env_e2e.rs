@@ -102,7 +102,6 @@ async fn test_wasm_capsule_e2e_env_config_injection() {
         mcp_servers: vec![],
         skills: vec![],
         uplinks: vec![],
-        interceptors: vec![],
         topics: vec![],
         publishes: ::std::collections::HashMap::new(),
         subscribes: ::std::collections::HashMap::new(),

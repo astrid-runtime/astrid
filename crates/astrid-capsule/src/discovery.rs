@@ -247,13 +247,14 @@ pub fn load_manifest(path: &Path) -> CapsuleResult<CapsuleManifest> {
     }
 
     // Validate ipc_publish and interceptor patterns for empty segments.
+    // Interceptor bindings are resolved from `[subscribe]` handler entries.
+    let effective_interceptors = manifest.effective_interceptors();
     let ipc_patterns = manifest
         .capabilities
         .ipc_publish
         .iter()
         .map(|p| ("ipc_publish pattern", p.as_str()));
-    let interceptor_patterns = manifest
-        .interceptors
+    let interceptor_patterns = effective_interceptors
         .iter()
         .map(|i| ("interceptor event pattern", i.event.as_str()));
 
@@ -437,10 +438,11 @@ version = "0.1.0"
     }
 
     #[test]
-    fn load_manifest_rejects_empty_segment_in_interceptor_event() {
+    fn load_manifest_rejects_empty_segment_in_subscribe_handler_event() {
         for bad in &["a..b", ".event", "event.", "", ".", "a...b"] {
-            let toml =
-                format!("{VALID_HEADER}\n[[interceptor]]\nevent = \"{bad}\"\naction = \"handle\"");
+            let toml = format!(
+                "{VALID_HEADER}\n[subscribe]\n\"{bad}\" = {{ wit = \"x\", handler = \"handle\" }}"
+            );
             let err = load_from_toml(&toml).unwrap_err();
             let msg = err.to_string();
             assert!(
@@ -451,9 +453,9 @@ version = "0.1.0"
     }
 
     #[test]
-    fn load_manifest_accepts_valid_interceptor_event() {
+    fn load_manifest_accepts_valid_subscribe_handler_event() {
         let toml = format!(
-            "{VALID_HEADER}\n[[interceptor]]\nevent = \"user.prompt\"\naction = \"handle\""
+            "{VALID_HEADER}\n[subscribe]\n\"user.prompt\" = {{ wit = \"x\", handler = \"handle\" }}"
         );
         assert!(load_from_toml(&toml).is_ok());
     }

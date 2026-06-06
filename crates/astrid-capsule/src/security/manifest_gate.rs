@@ -381,7 +381,6 @@ mod tests {
             mcp_servers: vec![],
             skills: vec![],
             uplinks: vec![],
-            interceptors: vec![],
             topics: vec![],
             publishes: ::std::collections::HashMap::new(),
             subscribes: ::std::collections::HashMap::new(),

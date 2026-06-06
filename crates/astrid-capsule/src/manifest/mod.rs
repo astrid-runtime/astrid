@@ -4,7 +4,7 @@
 //! required capabilities, integrations, and configuration settings. Manifests are
 //! loaded from disk during capsule discovery.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fmt;
 use std::path::PathBuf;
 
@@ -58,9 +58,9 @@ pub struct CapsuleManifest {
     pub publishes: HashMap<String, PublishDef>,
     /// Topics this capsule subscribes to (RFC: cargo-like-manifest).
     ///
-    /// Same shape as `publishes`. Entries with a `handler = "..."` field bind
-    /// the topic to a `#[astrid::interceptor("...")]` export — superseding
-    /// `[[interceptor]]` blocks for the same event. Keys also serve as the
+    /// Same shape as `publishes`. An entry with a `handler = "..."` field (and
+    /// optional `priority`) binds the topic to a `#[astrid::interceptor("...")]`
+    /// export — the single interceptor-binding form. Keys also serve as the
     /// IPC subscribe ACL when non-empty.
     #[serde(default, rename = "subscribe")]
     pub subscribes: HashMap<String, SubscribeDef>,
@@ -91,9 +91,6 @@ pub struct CapsuleManifest {
     /// Uplinks this capsule provides (e.g. Telegram, CLI).
     #[serde(default, rename = "uplink")]
     pub uplinks: Vec<UplinkDef>,
-    /// Interceptors (eBPF-style hooks) this capsule registers.
-    #[serde(default, rename = "interceptor")]
-    pub interceptors: Vec<InterceptorDef>,
     /// Topic API declarations describing the payload shape of IPC topics.
     #[serde(default, rename = "topic")]
     pub topics: Vec<TopicDef>,
@@ -157,33 +154,26 @@ impl CapsuleManifest {
         }
     }
 
-    /// Effective interceptor bindings. Combines:
-    ///   - `[subscribe]` entries with a `handler` field (new format)
-    ///   - `[[interceptor]]` blocks (legacy format), skipping any whose
-    ///     `event` is already covered by a new-form binding
+    /// Interceptor bindings declared in `[subscribe]`: every entry that
+    /// carries a `handler` binds that topic to a `#[astrid::interceptor]`
+    /// export in the guest. The entry's optional `priority` controls dispatch
+    /// order (lower fires first; `None` means the default, 100).
     ///
-    /// Lets a capsule migrate one event at a time without losing handlers
-    /// declared the old way.
+    /// This is the single interceptor-binding form — the legacy
+    /// `[[interceptor]]` block was removed (see #858); a manifest still
+    /// carrying one is rejected at load.
     #[must_use]
     pub fn effective_interceptors(&self) -> Vec<InterceptorDef> {
-        let mut out: Vec<InterceptorDef> = self
-            .subscribes
+        self.subscribes
             .iter()
             .filter_map(|(topic, def)| {
                 def.handler.as_ref().map(|action| InterceptorDef {
                     event: topic.clone(),
                     action: action.clone(),
-                    priority: default_interceptor_priority(),
+                    priority: def.priority.unwrap_or_else(default_interceptor_priority),
                 })
             })
-            .collect();
-        let already: HashSet<String> = out.iter().map(|i| i.event.clone()).collect();
-        for legacy in &self.interceptors {
-            if !already.contains(&legacy.event) {
-                out.push(legacy.clone());
-            }
-        }
-        out
+            .collect()
     }
 }
 
@@ -551,25 +541,28 @@ pub struct UplinkDef {
     pub profile: UplinkProfile,
 }
 
-/// An event interceptor registered by the capsule.
+/// A resolved interceptor binding.
 ///
-/// Maps an IPC event topic pattern to a named action (WASM export handler).
-/// The kernel's event dispatcher matches incoming IPC events against the
-/// `event` pattern and invokes `astrid_hook_trigger` with the `action` name
-/// and the event payload.
+/// This is the kernel-internal representation produced by
+/// [`CapsuleManifest::effective_interceptors`] from each `[subscribe]` entry
+/// that carries a `handler`; it is not parsed directly from the manifest. The
+/// event dispatcher matches incoming IPC events against the `event` pattern
+/// and invokes `astrid_hook_trigger` with the `action` name and payload.
 ///
 /// Topic patterns support single-segment wildcards: `tool.execute.*.result`
 /// matches `tool.execute.search.result` but not `tool.execute.result`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InterceptorDef {
-    /// IPC topic pattern to match (e.g., `user.prompt`, `tool.execute.*.result`).
+    /// IPC topic pattern to match (the `[subscribe]` key).
     pub event: String,
-    /// Name of the handler function inside the WASM guest
-    /// (must match an `#[astrid::interceptor("...")]` annotation).
+    /// Name of the handler function inside the WASM guest — the
+    /// `[subscribe]` entry's `handler` (must match an
+    /// `#[astrid::interceptor("...")]` annotation).
     pub action: String,
     /// Dispatch priority — lower values fire first. Default 100.
     /// Enables layered interception (e.g. input guard at 10 fires before
-    /// react loop at 100).
+    /// react loop at 100). Sourced from the `[subscribe]` entry's optional
+    /// `priority`.
     #[serde(default = "default_interceptor_priority")]
     pub priority: u32,
 }

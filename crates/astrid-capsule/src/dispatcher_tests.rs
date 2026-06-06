@@ -16,7 +16,7 @@ use std::time::Duration;
 use crate::capsule::{Capsule, CapsuleId, CapsuleState, InterceptResult};
 use crate::context::CapsuleContext;
 use crate::error::CapsuleResult;
-use crate::manifest::{CapabilitiesDef, CapsuleManifest, InterceptorDef, PackageDef};
+use crate::manifest::{CapabilitiesDef, CapsuleManifest, PackageDef, SubscribeDef};
 use astrid_events::ipc::IpcPayload;
 
 /// A minimal mock capsule for dispatch tests.
@@ -79,14 +79,24 @@ impl MockCapsule {
             mcp_servers: Vec::new(),
             skills: Vec::new(),
             uplinks: Vec::new(),
-            interceptors: vec![InterceptorDef {
-                event: interceptor_event.to_string(),
-                action: "test_action".to_string(),
-                priority,
-            }],
             topics: Vec::new(),
             publishes: ::std::collections::HashMap::new(),
-            subscribes: ::std::collections::HashMap::new(),
+            // Interceptor binding = a [subscribe] entry with a handler (and
+            // priority). effective_interceptors() resolves this to the same
+            // dispatch tuple the removed [[interceptor]] block produced.
+            subscribes: ::std::collections::HashMap::from([(
+                interceptor_event.to_string(),
+                SubscribeDef {
+                    wit: "opaque".to_string(),
+                    version: None,
+                    tag: None,
+                    rev: None,
+                    branch: None,
+                    path: None,
+                    handler: Some("test_action".to_string()),
+                    priority: Some(priority),
+                },
+            )]),
             tools: ::std::vec::Vec::new(),
         };
         let capsule = Self {
