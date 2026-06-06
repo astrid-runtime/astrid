@@ -77,6 +77,40 @@ fn audit_process<T, E: std::fmt::Debug>(
     }
 }
 
+/// Audit an id-keyed persistent-process op. Logs a short, non-reversible
+/// hash of the `process-id` — never the raw token, per the WIT ("never the
+/// raw id") — plus the op, principal, and capsule.
+fn audit_process_id<T, E: std::fmt::Debug>(
+    state: &HostState,
+    op: &'static str,
+    id: &str,
+    result: &Result<T, E>,
+) {
+    let id_hash = blake3::hash(id.as_bytes()).to_hex();
+    let id = &id_hash[..16];
+    let capsule_id = state.capsule_id.as_str();
+    let principal = state.effective_principal();
+    match result {
+        Ok(_) => tracing::debug!(
+            target: "astrid.audit.process",
+            %capsule_id,
+            %principal,
+            fn = op,
+            id,
+            "audit",
+        ),
+        Err(e) => tracing::debug!(
+            target: "astrid.audit.process",
+            %capsule_id,
+            %principal,
+            fn = op,
+            id,
+            error = ?e,
+            "audit",
+        ),
+    }
+}
+
 /// Extract the call_id from the caller's IPC context if it carried a
 /// `ToolExecuteRequest` payload.
 fn extract_call_id(state: &HostState) -> Option<String> {
@@ -347,22 +381,16 @@ impl process::Host for HostState {
     // ================================================================
 
     fn spawn_persistent(&mut self, request: SpawnRequest) -> Result<String, ErrorCode> {
-        // Refuse the owner-fallback principal (see `authenticated_principal`).
-        let Some(principal) = authenticated_principal(self) else {
-            return Err(ErrorCode::PersistUnsupported);
-        };
-        // `some(0)` idle timeout is rejected per the WIT.
-        if request.idle_timeout_ms == Some(0) {
-            return Err(ErrorCode::InvalidInput);
-        }
-
         let cmd_for_audit = request.cmd.clone();
-        let capsule_id_arc: Arc<str> = Arc::from(self.capsule_id.as_str());
-        let workspace_root = self.workspace_root.clone();
         let handle = self.runtime_handle.clone();
         let semaphore = self.blocking_semaphore.clone();
 
-        // Capability gate — identical to `spawn-background`.
+        // Capability gate FIRST — a capsule lacking `host_process` gets
+        // `capability-denied` (consistent with `spawn` / `spawn-background`
+        // and the WIT "Security-gated" header), BEFORE any persistence-
+        // feasibility checks. Otherwise an ungranted capsule with no caller in
+        // scope would observe `persist-unsupported` instead of the capability
+        // error.
         let Some(sec) = self.security.clone() else {
             let result: Result<String, ErrorCode> = Err(ErrorCode::CapabilityDenied);
             audit_process(
@@ -390,10 +418,24 @@ impl process::Host for HostState {
                 return result;
             }
         }
+
+        // Persistence feasibility: refuse the owner-fallback principal — a
+        // persistent id must be scoped to an authenticated principal, else
+        // unauthenticated paths would share a `default` namespace that
+        // `list-processes` enumerates.
+        let Some(principal) = authenticated_principal(self) else {
+            return Err(ErrorCode::PersistUnsupported);
+        };
+        // `some(0)` idle timeout is rejected per the WIT.
+        if request.idle_timeout_ms == Some(0) {
+            return Err(ErrorCode::InvalidInput);
+        }
         if self.cancel_token.is_cancelled() {
             return Err(ErrorCode::Cancelled);
         }
 
+        let capsule_id_arc: Arc<str> = Arc::from(self.capsule_id.as_str());
+        let workspace_root = self.workspace_root.clone();
         // Per-principal concurrent cap (shared with `spawn-background`).
         let concurrent_cap =
             usize::try_from(self.effective_profile().quotas.max_background_processes)
@@ -466,14 +508,16 @@ impl process::Host for HostState {
         result
     }
 
-    fn attach(&mut self, _id: String) -> Result<Resource<ProcessHandle>, ErrorCode> {
+    fn attach(&mut self, id: String) -> Result<Resource<ProcessHandle>, ErrorCode> {
         // Deferred: materialising a `process-handle` resource over a registry
         // entry needs dual-typed dispatch in the resource table. The id-keyed
         // free functions below ARE the documented `attach(id)?.method()`
         // equivalents, so the persistent tier is fully usable without it.
-        Err(ErrorCode::Unknown(
+        let result: Result<Resource<ProcessHandle>, ErrorCode> = Err(ErrorCode::Unknown(
             "attach: resource-handle materialisation pending — use the id-keyed ops".to_string(),
-        ))
+        ));
+        audit_process_id(self, "astrid:process/host.attach", &id, &result);
+        result
     }
 
     fn list_processes(
@@ -481,32 +525,54 @@ impl process::Host for HostState {
         label_filter: Option<String>,
     ) -> Result<Vec<ProcessInfo>, ErrorCode> {
         let principal = self.effective_principal();
-        let capsule_id = self.capsule_id.as_str();
-        Ok(self
-            .persistent_processes
-            .list(&principal, capsule_id, label_filter.as_deref()))
+        let capsule_id = self.capsule_id.as_str().to_owned();
+        let result =
+            Ok(self
+                .persistent_processes
+                .list(&principal, &capsule_id, label_filter.as_deref()));
+        // Not id-keyed: audit the op + (non-secret) label filter, no id.
+        audit_process(
+            self,
+            "astrid:process/host.list-processes",
+            label_filter.as_deref().unwrap_or("*"),
+            &result,
+        );
+        result
     }
 
     fn status(&mut self, id: String) -> Result<ProcessInfo, ErrorCode> {
         let principal = self.effective_principal();
-        let capsule_id = self.capsule_id.as_str();
-        self.persistent_processes
-            .status(&id, &principal, capsule_id)
+        let capsule_id = self.capsule_id.as_str().to_owned();
+        let result = self
+            .persistent_processes
+            .status(&id, &principal, &capsule_id);
+        audit_process_id(self, "astrid:process/host.status", &id, &result);
+        result
     }
 
     fn status_many(&mut self, ids: Vec<String>) -> Result<Vec<ProcessInfo>, ErrorCode> {
         let principal = self.effective_principal();
-        let capsule_id = self.capsule_id.as_str();
-        Ok(self
+        let capsule_id = self.capsule_id.as_str().to_owned();
+        let result = Ok(self
             .persistent_processes
-            .status_many(&ids, &principal, capsule_id))
+            .status_many(&ids, &principal, &capsule_id));
+        audit_process(
+            self,
+            "astrid:process/host.status-many",
+            &format!("{} ids", ids.len()),
+            &result,
+        );
+        result
     }
 
     fn read_logs(&mut self, id: String) -> Result<ReadLogsResult, ErrorCode> {
         let principal = self.effective_principal();
-        let capsule_id = self.capsule_id.as_str();
-        self.persistent_processes
-            .read_logs(&id, &principal, capsule_id)
+        let capsule_id = self.capsule_id.as_str().to_owned();
+        let result = self
+            .persistent_processes
+            .read_logs(&id, &principal, &capsule_id);
+        audit_process_id(self, "astrid:process/host.read-logs", &id, &result);
+        result
     }
 
     fn read_since(
@@ -517,15 +583,17 @@ impl process::Host for HostState {
         max_bytes: u32,
     ) -> Result<LogChunk, ErrorCode> {
         let principal = self.effective_principal();
-        let capsule_id = self.capsule_id.as_str();
-        self.persistent_processes.read_since(
+        let capsule_id = self.capsule_id.as_str().to_owned();
+        let result = self.persistent_processes.read_since(
             &id,
             &principal,
-            capsule_id,
+            &capsule_id,
             which_stream,
             &cursor,
             max_bytes,
-        )
+        );
+        audit_process_id(self, "astrid:process/host.read-since", &id, &result);
+        result
     }
 
     fn write_stdin(&mut self, id: String, data: Vec<u8>) -> Result<u32, ErrorCode> {
@@ -534,25 +602,39 @@ impl process::Host for HostState {
         let handle = self.runtime_handle.clone();
         let semaphore = self.io_semaphore.clone();
         let registry = self.persistent_processes.clone();
-        util::bounded_block_on(&handle, &semaphore, async move {
+        let id_for_audit = id.clone();
+        let result = util::bounded_block_on(&handle, &semaphore, async move {
             registry
                 .write_stdin(&id, &principal, &capsule_id, &data)
                 .await
-        })
+        });
+        audit_process_id(
+            self,
+            "astrid:process/host.write-stdin",
+            &id_for_audit,
+            &result,
+        );
+        result
     }
 
     fn close_stdin(&mut self, id: String) -> Result<(), ErrorCode> {
         let principal = self.effective_principal();
-        let capsule_id = self.capsule_id.as_str();
-        self.persistent_processes
-            .close_stdin(&id, &principal, capsule_id)
+        let capsule_id = self.capsule_id.as_str().to_owned();
+        let result = self
+            .persistent_processes
+            .close_stdin(&id, &principal, &capsule_id);
+        audit_process_id(self, "astrid:process/host.close-stdin", &id, &result);
+        result
     }
 
     fn signal(&mut self, id: String, sig: ProcessSignal) -> Result<(), ErrorCode> {
         let principal = self.effective_principal();
-        let capsule_id = self.capsule_id.as_str();
-        self.persistent_processes
-            .signal(&id, &principal, capsule_id, sig)
+        let capsule_id = self.capsule_id.as_str().to_owned();
+        let result = self
+            .persistent_processes
+            .signal(&id, &principal, &capsule_id, sig);
+        audit_process_id(self, "astrid:process/host.signal", &id, &result);
+        result
     }
 
     fn wait(&mut self, id: String, timeout_ms: u64) -> Result<ExitInfo, ErrorCode> {
@@ -563,10 +645,13 @@ impl process::Host for HostState {
         let cancel = self.cancel_token.clone();
         let registry = self.persistent_processes.clone();
         let timeout = std::time::Duration::from_millis(timeout_ms);
-        util::bounded_block_on_cancellable(&handle, &semaphore, &cancel, async move {
+        let id_for_audit = id.clone();
+        let result = util::bounded_block_on_cancellable(&handle, &semaphore, &cancel, async move {
             registry.wait(&id, &principal, &capsule_id, timeout).await
         })
-        .unwrap_or(Err(ErrorCode::Cancelled))
+        .unwrap_or(Err(ErrorCode::Cancelled));
+        audit_process_id(self, "astrid:process/host.wait", &id_for_audit, &result);
+        result
     }
 
     fn stop(&mut self, id: String, grace_ms: Option<u64>) -> Result<ExitInfo, ErrorCode> {
@@ -577,31 +662,41 @@ impl process::Host for HostState {
         let cancel = self.cancel_token.clone();
         let registry = self.persistent_processes.clone();
         let grace = grace_ms.map(std::time::Duration::from_millis);
-        util::bounded_block_on_cancellable(&handle, &semaphore, &cancel, async move {
+        let id_for_audit = id.clone();
+        let result = util::bounded_block_on_cancellable(&handle, &semaphore, &cancel, async move {
             registry.stop(&id, &principal, &capsule_id, grace).await
         })
-        .unwrap_or(Err(ErrorCode::Cancelled))
+        .unwrap_or(Err(ErrorCode::Cancelled));
+        audit_process_id(self, "astrid:process/host.stop", &id_for_audit, &result);
+        result
     }
 
     fn release_process(&mut self, id: String) -> Result<(), ErrorCode> {
         let principal = self.effective_principal();
-        let capsule_id = self.capsule_id.as_str();
-        self.persistent_processes
-            .release(&id, &principal, capsule_id)
+        let capsule_id = self.capsule_id.as_str().to_owned();
+        let result = self
+            .persistent_processes
+            .release(&id, &principal, &capsule_id);
+        audit_process_id(self, "astrid:process/host.release-process", &id, &result);
+        result
     }
 
-    fn watch(&mut self, _id: String, _suffix: Option<String>) -> Result<(), ErrorCode> {
+    fn watch(&mut self, id: String, _suffix: Option<String>) -> Result<(), ErrorCode> {
         // Deferred by design: host-published lifecycle events raise an OPEN
         // publish-authority question (manifest `[publish]` vs kernel-authored
         // topic class) tracked in RFC host_abi. `status` + bounded `wait` is
         // the working polling alternative until that resolves.
-        Err(ErrorCode::Unknown(
+        let result: Result<(), ErrorCode> = Err(ErrorCode::Unknown(
             "watch: host lifecycle events deferred (publish-authority — RFC host_abi)".to_string(),
-        ))
+        ));
+        audit_process_id(self, "astrid:process/host.watch", &id, &result);
+        result
     }
 
-    fn unwatch(&mut self, _id: String) -> Result<(), ErrorCode> {
+    fn unwatch(&mut self, id: String) -> Result<(), ErrorCode> {
         // Idempotent: nothing is armed while `watch` is deferred.
-        Ok(())
+        let result: Result<(), ErrorCode> = Ok(());
+        audit_process_id(self, "astrid:process/host.unwatch", &id, &result);
+        result
     }
 }
