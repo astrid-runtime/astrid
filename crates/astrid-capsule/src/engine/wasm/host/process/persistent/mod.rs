@@ -240,6 +240,7 @@ impl PersistentProcessRegistry {
         map.insert(
             key,
             PersistentEntry {
+                id: id.clone(),
                 creator: p.creator,
                 capsule_id: p.capsule_id,
                 label,
@@ -255,6 +256,19 @@ impl PersistentProcessRegistry {
             },
         );
         Ok(id)
+    }
+
+    /// Number of LIVE (not-yet-exited) persistent processes a principal owns.
+    /// Lets the ephemeral `spawn-background` tier share the per-principal
+    /// concurrent cap with the persistent tier (and vice-versa).
+    pub(in crate::engine::wasm::host::process) fn live_count(
+        &self,
+        principal: &PrincipalId,
+    ) -> usize {
+        self.lock()
+            .values()
+            .filter(|e| &e.creator == principal && e.is_live())
+            .count()
     }
 
     /// Non-draining status snapshot of one process.

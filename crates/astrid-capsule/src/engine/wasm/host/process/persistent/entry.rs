@@ -63,6 +63,11 @@ pub(super) struct ProcessCore {
 /// One persistent process. Metadata is immutable after spawn; live state
 /// lives behind `core`.
 pub(super) struct PersistentEntry {
+    /// The raw `process-id`. Stored so `status` / `list-processes` can return
+    /// the reattach key (the WIT requires `process-info.id`); the map is still
+    /// *keyed* by the BLAKE3 hash of the id for lookup. Only ever returned to
+    /// the owning `(principal, capsule)` — never logged (audit uses a hash).
+    pub(super) id: String,
     pub(super) creator: PrincipalId,
     pub(super) capsule_id: Arc<str>,
     pub(super) label: String,
@@ -89,14 +94,14 @@ impl PersistentEntry {
             .unwrap_or(false)
     }
 
-    /// Non-draining status snapshot. The `id` is left empty — a token is
-    /// never echoed back out of the registry.
+    /// Non-draining status snapshot. Returns the reattach `id` (the WIT
+    /// `process-info.id`); the caller is always the owning principal+capsule.
     pub(super) fn info(&self) -> ProcessInfo {
         let c = self.core.lock().unwrap_or_else(|e| e.into_inner());
         let now = Instant::now();
         let running = c.phase != Phase::Exited;
         ProcessInfo {
-            id: String::new(),
+            id: self.id.clone(),
             label: self.label.clone(),
             command: self.command.clone(),
             os_pid: running.then_some(self.os_pid),
@@ -189,6 +194,12 @@ fn exit_signal(_st: &std::process::ExitStatus) -> Option<i32> {
     None
 }
 
+/// Reader read size. MUST be `<=` the minimum ring capacity
+/// (`config::MIN_LOG_RING_BYTES` = 4096) so a full chunk always fits in an
+/// *empty* `backpressure` ring — otherwise an over-cap chunk could never be
+/// accepted (all-or-nothing) and the reader would spin forever.
+pub(super) const READER_CHUNK_BYTES: usize = 4096;
+
 /// Spawn a reader task draining a child pipe into the in-core ring. Honors
 /// `backpressure` by parking (not reading) when the ring is full — the OS
 /// pipe fills and the child blocks on write; the WASM task is never parked.
@@ -201,7 +212,7 @@ pub(super) fn spawn_ring_reader<R>(
     R: tokio::io::AsyncReadExt + Unpin + Send + 'static,
 {
     runtime.spawn(async move {
-        let mut chunk = vec![0u8; 8192];
+        let mut chunk = vec![0u8; READER_CHUNK_BYTES];
         loop {
             match pipe.read(&mut chunk).await {
                 Ok(0) => break,
@@ -254,6 +265,12 @@ pub(super) fn map_signal(sig: ProcessSignal) -> nix::sys::signal::Signal {
 /// `process_group(0)`, so descendants are signalled too), falling back to
 /// the bare pid if the group send fails.
 pub(super) fn send_signal(pid: u32, sig: nix::sys::signal::Signal) -> Result<(), ErrorCode> {
+    // Refuse pid 0: `killpg(0)` / `kill(0)` target the CALLER's (daemon's) own
+    // process group — never the child. A reaped child surfaces pid `None`
+    // (stored as 0); guard here as defense-in-depth (spawn also rejects it).
+    if pid == 0 {
+        return Err(ErrorCode::Closed);
+    }
     #[cfg(unix)]
     {
         let raw = i32::try_from(pid).map_err(|_| ErrorCode::InvalidInput)?;

@@ -87,6 +87,14 @@ async fn spawn_wait_read_and_owner_isolation() {
     assert!(reg.status(&id, &alice, "cap-b").is_err());
     assert!(reg.status("not-a-real-id", &alice, "cap-a").is_err());
 
+    // `status` / `list` return the reattach id (the WIT `process-info.id`),
+    // not an empty string — otherwise `list-processes` can't be used to
+    // recover ids.
+    assert_eq!(reg.status(&id, &alice, "cap-a").unwrap().id, id);
+    let listed = reg.list(&alice, "cap-a", None);
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].id, id);
+
     // Wait for exit (bounded) — code 0.
     let exit = reg
         .wait(&id, &alice, "cap-a", Duration::from_secs(5))

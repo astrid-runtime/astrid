@@ -57,14 +57,20 @@ pub(super) fn clamp_log_ring(bytes: Option<u32>) -> usize {
         .unwrap_or(DEFAULT_LOG_RING_BYTES)
 }
 
-/// Clamp a guest label (strip control chars, length-cap), or derive from
-/// `cmd`. The label is NOT an identity — only the `process-id` is.
+/// Clamp a guest label (strip control chars, cap at `MAX_LABEL_BYTES`
+/// **bytes**), or derive from `cmd`. The label is NOT an identity — only the
+/// `process-id` is. Truncation is byte-aware (never splits a UTF-8 char) so a
+/// non-ASCII label cannot exceed the documented byte ceiling.
 pub(super) fn clamp_label(label: Option<String>, cmd: &str) -> String {
     let raw = label.unwrap_or_else(|| cmd.to_string());
-    raw.chars()
-        .filter(|c| !c.is_control())
-        .take(MAX_LABEL_BYTES)
-        .collect()
+    let mut out = String::with_capacity(MAX_LABEL_BYTES);
+    for c in raw.chars().filter(|c| !c.is_control()) {
+        if out.len() + c.len_utf8() > MAX_LABEL_BYTES {
+            break;
+        }
+        out.push(c);
+    }
+    out
 }
 
 /// Resolve the effective `(lifetime, idle, retention)` durations from the
@@ -87,4 +93,24 @@ pub(super) fn resolve_ttls(
         .unwrap_or(DEFAULT_EXIT_RETENTION)
         .min(MAX_EXIT_RETENTION);
     (lifetime, idle, retention)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn clamp_label_caps_bytes_not_chars() {
+        // Multi-byte chars must not push the label past the BYTE ceiling.
+        let long = "é".repeat(MAX_LABEL_BYTES); // 2 bytes each → 256 bytes
+        let clamped = clamp_label(Some(long), "cmd");
+        assert!(clamped.len() <= MAX_LABEL_BYTES);
+        assert!(clamped.is_char_boundary(clamped.len())); // never split a char
+    }
+
+    #[test]
+    fn clamp_label_strips_control_and_derives_from_cmd() {
+        assert_eq!(clamp_label(Some("a\nb\tc".into()), "cmd"), "abc");
+        assert_eq!(clamp_label(None, "my-cmd"), "my-cmd");
+    }
 }

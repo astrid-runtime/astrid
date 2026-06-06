@@ -60,20 +60,34 @@ impl LogRing {
         self.front_offset + self.buf.len() as u64
     }
 
-    /// Append reader-task bytes. Returns `false` when `backpressure` should
-    /// park the reader (ring full) so the OS pipe — not the host — buffers.
+    /// Append reader-task bytes. `drop-oldest` always accepts (evicting the
+    /// oldest bytes on overflow). `backpressure` is **all-or-nothing**: it
+    /// accepts only if the whole chunk fits, else returns `false` and stores
+    /// nothing — so it NEVER evicts (no byte loss / framing corruption); the
+    /// reader holds the chunk and retries, the OS pipe fills, and the child
+    /// blocks on write. The caller must size reads `<= cap` so a chunk can
+    /// always fit in an empty ring (otherwise backpressure would never accept
+    /// it); see `entry::READER_CHUNK_BYTES`.
     pub(super) fn push(&mut self, bytes: &[u8]) -> bool {
-        if matches!(self.overflow, Overflow::Backpressure) && self.buf.len() >= self.cap {
-            return false;
+        match self.overflow {
+            Overflow::Backpressure => {
+                if self.buf.len() + bytes.len() > self.cap {
+                    return false;
+                }
+                self.buf.extend(bytes);
+                true
+            },
+            Overflow::DropOldest => {
+                self.buf.extend(bytes);
+                if self.buf.len() > self.cap {
+                    let excess = self.buf.len() - self.cap;
+                    self.buf.drain(..excess);
+                    self.front_offset += excess as u64;
+                    self.overflow_dropped += excess as u64;
+                }
+                true
+            },
         }
-        self.buf.extend(bytes);
-        if self.buf.len() > self.cap {
-            let excess = self.buf.len() - self.cap;
-            self.buf.drain(..excess);
-            self.front_offset += excess as u64;
-            self.overflow_dropped += excess as u64;
-        }
-        true
     }
 
     /// Drain ALL retained bytes (`read-logs` semantics). Advances
@@ -172,6 +186,20 @@ mod tests {
         assert!(ring.push(b"abcd"));
         assert!(!ring.push(b"e")); // full → reader parks
         assert_eq!(ring.overflow_dropped, 0);
+    }
+
+    #[test]
+    fn backpressure_never_evicts_on_crossing_push() {
+        // A push that would cross the cap from below is rejected WHOLE —
+        // backpressure must never drop bytes (the bug: it used to evict).
+        let mut ring = LogRing::new(10, Overflow::Backpressure);
+        assert!(ring.push(b"abcdef")); // 6 <= 10 → accepted
+        assert!(!ring.push(b"ghijkl")); // 6+6=12 > 10 → rejected, nothing stored
+        assert_eq!(ring.len(), 6);
+        assert_eq!(ring.overflow_dropped, 0);
+        let (data, _next, dropped) = ring.read_since(None, 100);
+        assert_eq!(data, b"abcdef"); // exactly what was accepted, contiguous
+        assert_eq!(dropped, 0);
     }
 
     #[test]

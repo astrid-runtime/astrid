@@ -47,6 +47,10 @@ pub use managed::ManagedProcess as PublicManagedProcess;
 /// Per-capsule hard ceiling on concurrent background processes.
 pub(crate) const MAX_BACKGROUND_PROCESSES: usize = 8;
 
+/// Per-spawn stdin prelude cap (the WIT: `spawn-request.stdin` "Capped at
+/// 4 MiB per spawn"). Oversized preludes are rejected with `too-large`.
+const MAX_SPAWN_STDIN_BYTES: usize = 4 * 1024 * 1024;
+
 /// Audit a process host fn invocation.
 fn audit_process<T, E: std::fmt::Debug>(
     state: &HostState,
@@ -266,7 +270,13 @@ impl process::Host for HostState {
             .get(&principal)
             .copied()
             .unwrap_or(0);
-        if by_principal >= effective_cap || self.process_count_total >= MAX_BACKGROUND_PROCESSES {
+        // The per-principal concurrent cap is SHARED with the persistent tier:
+        // count this principal's live persistent processes too, so mixing the
+        // two tiers cannot exceed the cap.
+        let persistent_live = self.persistent_processes.live_count(&principal);
+        if by_principal + persistent_live >= effective_cap
+            || self.process_count_total >= MAX_BACKGROUND_PROCESSES
+        {
             return Err(ErrorCode::Quota);
         }
 
@@ -436,11 +446,35 @@ impl process::Host for HostState {
 
         let capsule_id_arc: Arc<str> = Arc::from(self.capsule_id.as_str());
         let workspace_root = self.workspace_root.clone();
-        // Per-principal concurrent cap (shared with `spawn-background`).
+        // Per-principal concurrent cap, SHARED with `spawn-background`: subtract
+        // this instance's live ephemeral handles so the registry's own check
+        // (`registry-live < effective`) bounds the COMBINED count to the cap.
         let concurrent_cap =
             usize::try_from(self.effective_profile().quotas.max_background_processes)
                 .unwrap_or(MAX_BACKGROUND_PROCESSES)
                 .min(MAX_BACKGROUND_PROCESSES);
+        let ephemeral_used = self
+            .process_count_by_principal
+            .get(&principal)
+            .copied()
+            .unwrap_or(0);
+        let effective_cap = concurrent_cap.saturating_sub(ephemeral_used);
+
+        // Reject an oversized stdin prelude BEFORE spawning (avoids orphaning).
+        if request
+            .stdin
+            .as_ref()
+            .is_some_and(|s| s.len() > MAX_SPAWN_STDIN_BYTES)
+        {
+            let result: Result<String, ErrorCode> = Err(ErrorCode::TooLarge);
+            audit_process(
+                self,
+                "astrid:process/host.spawn-persistent",
+                &cmd_for_audit,
+                &result,
+            );
+            return result;
+        }
 
         let want_stdin = request.keep_stdin_open.unwrap_or(false) || request.stdin.is_some();
         let mut child = match build_persistent_child(&request, &workspace_root, want_stdin) {
@@ -456,7 +490,21 @@ impl process::Host for HostState {
                 return result;
             },
         };
-        let os_pid = child.id().unwrap_or(0);
+        // Reject a missing/zero pid: `killpg(0)` / `kill(0)` would target the
+        // daemon's OWN process group. A reaped child surfaces `None`; drop it
+        // (kill_on_drop reaps) and fail rather than store an unsignalable entry.
+        let Some(os_pid) = child.id().filter(|&p| p != 0) else {
+            let result: Result<String, ErrorCode> = Err(ErrorCode::Unknown(
+                "spawn-persistent: child has no usable pid".to_string(),
+            ));
+            audit_process(
+                self,
+                "astrid:process/host.spawn-persistent",
+                &cmd_for_audit,
+                &result,
+            );
+            return result;
+        };
         let (Some(stdout), Some(stderr)) = (child.stdout.take(), child.stderr.take()) else {
             return Err(ErrorCode::Unknown(
                 "spawn-persistent: missing stdio pipes".to_string(),
@@ -464,16 +512,29 @@ impl process::Host for HostState {
         };
         let mut stdin = child.stdin.take();
 
-        // Write the optional stdin prelude, retaining the pipe ONLY when the
-        // guest asked to keep stdin open (else dropping it closes stdin = EOF).
+        // Write the optional stdin prelude; on failure, fail the spawn (the
+        // child drops on return → kill_on_drop reaps the orphan). Retain the
+        // pipe ONLY when the guest asked to keep stdin open.
         if let (Some(prelude), Some(pipe)) = (request.stdin.clone(), stdin.take()) {
-            let written = util::bounded_block_on(&handle, &semaphore, async move {
+            let (pipe, write_res) = util::bounded_block_on(&handle, &semaphore, async move {
                 use tokio::io::AsyncWriteExt as _;
                 let mut pipe = pipe;
-                let _ = pipe.write_all(&prelude).await;
-                pipe
+                let r = pipe.write_all(&prelude).await;
+                (pipe, r)
             });
-            stdin = Some(written);
+            if write_res.is_err() {
+                let result: Result<String, ErrorCode> = Err(ErrorCode::Unknown(
+                    "spawn-persistent: stdin prelude write failed".to_string(),
+                ));
+                audit_process(
+                    self,
+                    "astrid:process/host.spawn-persistent",
+                    &cmd_for_audit,
+                    &result,
+                );
+                return result;
+            }
+            stdin = Some(pipe);
         }
         let stdin_for_registry = if request.keep_stdin_open.unwrap_or(false) {
             stdin
@@ -491,7 +552,7 @@ impl process::Host for HostState {
             stdout,
             stderr,
             stdin: stdin_for_registry,
-            concurrent_cap,
+            concurrent_cap: effective_cap,
             label: request.label.clone(),
             overflow: request.overflow,
             log_ring_bytes: request.log_ring_bytes,
