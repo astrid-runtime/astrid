@@ -12,15 +12,33 @@
 /// child-process workflows on the unikernel target; remaining
 /// workloads stay desktop-only by design.
 ///
-/// Child stdio is byte-oriented (`write-stdin` / `read-logs`) rather
-/// than stream-based. The bus already handles high-throughput
-/// capsule-to-capsule traffic; stream halves on `process-handle` would
-/// pull weight only for niche "splice TCP into child into TCP" media-
-/// gateway scenarios that haven't materialised yet. Add as
-/// `process-handle@1.1.0` if/when concrete need arises.
+/// Two tiers. EPHEMERAL — `spawn` / `spawn-background`, returning a
+/// `process-handle` resource owned by the spawning instance's resource
+/// table and reaped on resource (instance) drop. PERSISTENT — host-owned,
+/// via `spawn-persistent`, returning an opaque, principal-scoped
+/// `process-id` whose child lives in a host registry (lifetime = the
+/// capsule, not the instance) and is reattachable from any later
+/// invocation, including a different pooled instance. The persistent tier
+/// exists because a pooled, stateless instance is reset between tool
+/// invocations, so an instance-owned handle cannot survive the
+/// start-then-read-then-stop pattern. See RFC: host_abi ("Process:
+/// ephemeral and persistent tiers") for the full design, security model,
+/// and lifecycle.
 ///
-/// Frozen per the ABI evolution discipline (RFC: host_abi). Shape changes
-/// ship as a new file at a new version path; never edit this file.
+/// Child stdio is byte-oriented (pipe-based) rather than stream-based; stream
+/// halves stay deferred to a concrete need per the original rationale. The
+/// byte-faithful read path is `read-since` (`list<u8>`); the convenience
+/// `read-logs` / `read-logs-result` (and the synchronous `process-result`)
+/// surface stdout/stderr as UTF-8, which is LOSSY on non-UTF-8 output — fine
+/// for text, use `read-since` for binary.
+///
+/// IMPLEMENTATION STATUS. This file is the full 1.0 contract; the host
+/// fills it in incrementally. Symbols tagged `(NOT YET IMPLEMENTED)`,
+/// `(NOT YET ENFORCED)`, or `(NOT YET POPULATED)` parse and link but the
+/// host currently stubs them (returns `unknown` / `persist-unsupported`,
+/// leaves an `option` `none`, or skips enforcement) — the SHAPE is fixed
+/// now so behaviour can land without a breaking change. Draft until the
+/// 1.0 release freezes it per the ABI evolution discipline (RFC: host_abi).
 
 package astrid:process@1.0.0;
 
@@ -36,7 +54,8 @@ interface host {
         invalid-input,
         /// `cwd` resolved outside the workspace.
         boundary-escape,
-        /// Per-capsule background-process cap exhausted (max 8).
+        /// Per-principal CONCURRENT background-process cap exhausted (shared
+        /// between ephemeral `spawn-background` and `spawn-persistent`).
         quota,
         /// Stdin payload exceeded the per-call 1 MB cap or the
         /// cumulative-per-process write quota.
@@ -47,6 +66,24 @@ interface host {
         cancelled,
         /// Wait timed out before the process exited.
         wait-timeout,
+        /// No PERSISTENT process with this id is visible to the calling
+        /// principal: unknown, already released/reaped, owned by a different
+        /// principal, owned by a different capsule, OR structurally malformed.
+        /// The host MUST NOT distinguish these — "exists but not yours" and
+        /// "well-formed vs garbage" are both cross-principal/structural oracles.
+        /// (The host MAY fast-reject obvious garbage internally to avoid a
+        /// lookup, but the guest-visible result is identical.) The post-restart
+        /// / post-reap recovery signal is an empty `list-processes`, not this
+        /// error.
+        no-such-process,
+        /// The per-principal/per-capsule RETAINED-id cap is full (live +
+        /// exited-but-unreleased). Distinct from `quota` (the CONCURRENT cap).
+        registry-full,
+        /// `spawn-persistent` refused: the host cannot keep a detached child
+        /// contained for this configuration (sandbox disabled; macOS without
+        /// the operator persistence opt-in; or an owner-fallback principal).
+        /// Fail-closed: never persist a process the host cannot reap.
+        persist-unsupported,
         /// Unspecific host error; detail is best-effort.
         unknown(string),
     }
@@ -67,12 +104,57 @@ interface host {
         usr2,
         /// SIGINT — interrupt (Ctrl-C equivalent).
         int,
+        /// SIGSTOP — pause the child (cannot be caught/ignored). Lets a
+        /// supervisor throttle a runaway without killing it.
+        stop,
+        /// SIGCONT — resume a paused child.
+        cont,
     }
 
     /// Environment variable to pass to a spawned process.
+    ///
+    /// Environment is the ONLY path into the child: the sandbox strips the
+    /// host's ambient environment except a small kernel passthrough
+    /// allowlist. Carries operator-reviewable, non-secret configuration; a
+    /// SECRET reaches a child over `write-stdin` / `spawn-request.stdin`,
+    /// NOT `args` (which are recorded verbatim in the audit log).
     record env-var {
         key: string,
         value: string,
+    }
+
+    /// Per-stream ring-overflow policy for a persistent process's buffered
+    /// stdout/stderr (the ephemeral tier is always `drop-oldest`).
+    enum overflow-policy {
+        /// Drop oldest bytes to make room; cumulative loss is surfaced as
+        /// `bytes-dropped` so the reader knows the stream is non-contiguous.
+        drop-oldest,
+        /// Stop draining the child's pipe when the ring is full, so the OS
+        /// pipe buffer fills and the child blocks on write. Parks the host
+        /// reader task only — never the WASM task. Correct for REPL /
+        /// MCP-stdio children where dropping output corrupts protocol framing.
+        backpressure,
+    }
+
+    /// Per-child OS resource ceilings (RLIMIT / cgroup), applicable to every
+    /// tier. `none` per field => the principal's profile default.
+    ///
+    /// (NOT YET ENFORCED) — declared so the record shape is stable; the host
+    /// currently bounds only the process slot, log buffers, and lifetime, so
+    /// a single child can still consume unbounded CPU/RAM. Including the
+    /// fields now avoids a breaking record change when enforcement lands.
+    record resource-limits {
+        /// Address-space / RSS ceiling (RLIMIT_AS or cgroup memory.max).
+        max-memory-bytes: option<u64>,
+        /// Cumulative CPU-time ceiling in WHOLE SECONDS (RLIMIT_CPU -> SIGXCPU
+        /// then SIGKILL; second-granularity is all RLIMIT_CPU enforces, so the
+        /// unit is seconds, not ms).
+        max-cpu-secs: option<u64>,
+        /// Max concurrent child PIDs (RLIMIT_NPROC / cgroup pids.max) — a
+        /// fork-bomb fence.
+        max-pids: option<u32>,
+        /// Max open file descriptors (RLIMIT_NOFILE).
+        max-open-files: option<u32>,
     }
 
     /// Request to spawn a host process.
@@ -92,6 +174,41 @@ interface host {
         /// inside the sandbox; absolute paths and `..` escapes are
         /// rejected with `boundary-escape`.
         cwd: option<string>,
+        /// Per-child OS resource ceilings. Applies to EVERY tier.
+        /// (NOT YET ENFORCED — see `resource-limits`.)
+        limits: option<resource-limits>,
+
+        // ---- the fields below are honored ONLY by `spawn-persistent`
+        //      and ignored by `spawn` / `spawn-background`. ----
+
+        /// Operator-readable label surfaced in `list-processes` / audit /
+        /// `astrid ps`-style tooling. Untrusted: host length-clamps (<= 128
+        /// bytes) + strips control chars. NOT an identity — the `process-id`
+        /// is the only identity. `none` => derived from `cmd`.
+        label: option<string>,
+        /// Keep a writable stdin pipe open after the optional `stdin` prelude
+        /// so `write-stdin` works across invocations (REPL / `psql` /
+        /// MCP-stdio). `none` => false (stdin closed after the prelude).
+        keep-stdin-open: option<bool>,
+        /// Ring-overflow policy. `none` => `drop-oldest`.
+        overflow: option<overflow-policy>,
+        /// Per-stream output ring capacity (bytes), stdout and stderr each.
+        /// `none` => host default (1 MiB). Host-clamped to the profile ceiling.
+        log-ring-bytes: option<u32>,
+        /// Wall-clock lifetime ceiling from spawn. On expiry: SIGTERM -> grace
+        /// -> SIGKILL -> reap. `none` => the profile ceiling. Any value is
+        /// clamped DOWN to that ceiling — a guest CANNOT request an unbounded
+        /// lifetime.
+        max-lifetime-ms: option<u64>,
+        /// Reap an UNTOUCHED persistent process (no read / wait / reattach /
+        /// signal / write) after this idle interval — the primary anti-leak
+        /// backstop for spawn-and-forget. `none` => profile default.
+        /// `some(0)` is rejected with `invalid-input`.
+        idle-timeout-ms: option<u64>,
+        /// After a persistent process EXITS, retain its id + drained log tail
+        /// this long before the host auto-reaps the registry entry (the "read
+        /// its output later" window). `none` => profile default. Host-clamped.
+        exit-retention-ms: option<u64>,
     }
 
     /// Exit information for a process that has terminated.
@@ -139,11 +256,121 @@ interface host {
         stderr: string,
     }
 
+    // ================================================================
+    // PERSISTENT TIER value types. (NOT YET IMPLEMENTED — the host stubs
+    // the persistent functions below; the SHAPES are fixed now.)
+    // ================================================================
+
+    /// Opaque, unforgeable, principal-scoped identity for a PERSISTENT
+    /// process that survives instance churn (pool reset / per-principal
+    /// multiplexing).
+    ///
+    /// Wire form: a 256-bit host-minted CSPRNG token (host entropy, NEVER the
+    /// guest), **lowercase base32** (RFC 4648 `a-z2-7`, NO padding) — chosen so
+    /// the id is itself a valid IPC topic suffix (`[a-z0-9._-]+`), usable
+    /// directly as the `watch` suffix without sanitisation. The host stores
+    /// only a keyed hash. Possession is
+    /// necessary but NOT sufficient — the host re-checks the calling
+    /// principal == creator on EVERY id-keyed call, so a token that leaks
+    /// across the principal boundary is inert. Treat as an opaque secret:
+    /// never parse, pattern-match, or synthesize it.
+    type process-id = string;
+
+    /// Lifecycle phase of a persistent process, reported WITHOUT draining log
+    /// buffers (see `status` / `process-info`). There is deliberately NO
+    /// `reaped` phase: once a process is reaped, its id resolves to
+    /// `no-such-process` and drops out of `list-processes`, so `exited` is the
+    /// terminal observable phase. The reap (and its reason) is delivered via
+    /// the `watch` exit event, not `status`.
+    enum process-phase {
+        /// Spawn accepted; child not yet confirmed running.
+        starting,
+        /// Child is running.
+        running,
+        /// Terminated; `exit-info` available; logs readable until released or
+        /// the exit-retention TTL elapses, after which the id becomes
+        /// `no-such-process`.
+        exited,
+    }
+
+    /// Opaque, host-encoded, resumable cursor into a persistent process's
+    /// log streams, for NON-DRAINING reads (`read-since`). Encodes per-stream
+    /// offset + a generation, so a stale cursor after ring eviction / reap
+    /// resolves to reported drops or `no-such-process`, never to another
+    /// process's bytes. `token: none` on the first read = from the oldest
+    /// retained byte. Treat as opaque; do not construct or parse.
+    record log-cursor {
+        token: option<string>,
+    }
+
+    /// Which stream a cursor read addresses.
+    enum log-stream {
+        stdout,
+        stderr,
+    }
+
+    /// A NON-DRAINING slice of a persistent process's stream, addressed by
+    /// cursor — the polling-safe complement to `read-logs` (which DRAINS).
+    /// Multiple independent readers each keep their own cursor and observe
+    /// the full retained stream.
+    record log-chunk {
+        /// Bytes in `[requested-cursor, next)`. `list<u8>` not `string`:
+        /// children emit non-UTF-8; the caller decodes.
+        data: list<u8>,
+        /// Cursor to pass to the NEXT `read-since` to resume exactly here.
+        next: log-cursor,
+        /// Cumulative bytes evicted from this stream's ring before they could
+        /// be delivered through this cursor (0 unless the reader fell behind).
+        bytes-dropped: u64,
+        /// `true` once the child has exited AND all retained output on this
+        /// stream has been delivered through this cursor — the clean EOF.
+        drained-eof: bool,
+    }
+
+    /// A NON-DRAINING status snapshot of one persistent process — the unit of
+    /// `list-processes` and the return of `status`. Repeated calls never
+    /// consume log bytes and never mutate process state.
+    record process-info {
+        /// Reattach key. Stable across invocations / instances.
+        id: process-id,
+        /// Operator-supplied label (or one derived from `cmd`).
+        label: string,
+        /// cmd + args, pre-sandbox-wrap, as the capsule requested it.
+        command: string,
+        /// OS PID while running; `none` once reaped. Advisory ONLY (PIDs are
+        /// recycled); never use as cross-call identity — use `id`.
+        os-pid: option<u32>,
+        /// Lifecycle phase (no buffer drain).
+        phase: process-phase,
+        /// Present once `exited` / `reaped`.
+        exit: option<exit-info>,
+        /// Host-monotonic milliseconds since spawn (uptime).
+        age-ms: u64,
+        /// Milliseconds since the last operation touched this process (drives
+        /// `idle-timeout-ms`).
+        idle-ms: u64,
+        /// Bytes currently buffered and drainable (stdout + stderr).
+        buffered-bytes: u64,
+        /// Cumulative bytes evicted from the rings since spawn.
+        bytes-dropped: u64,
+        /// Whether stdin is still open for `write-stdin`.
+        stdin-open: bool,
+        /// Cumulative CPU time the child has consumed. (NOT YET POPULATED.)
+        cpu-ms: option<u64>,
+        /// Peak resident memory observed for the child. (NOT YET POPULATED.)
+        mem-bytes-peak: option<u64>,
+    }
+
     /// A running or recently-terminated background process. Drop is
     /// automatic — capsules don't need to explicitly close; the
     /// host reaps the process on resource drop.
     ///
-    /// Per-capsule cap: 8 concurrent background processes.
+    /// Obtained from `spawn-background` (reap-on-drop) or `attach`
+    /// (DETACH-on-drop — dropping it does NOT reap the underlying persistent
+    /// process; it severs this instance's view).
+    ///
+    /// Per-principal cap: see `quota` (shared between ephemeral and
+    /// persistent spawns).
     resource process-handle {
         /// Read buffered logs since the last call. Drains the buffers
         /// (subsequent reads return only new data). Buffers are 1 MiB
@@ -153,9 +380,11 @@ interface host {
         /// Write to the process's stdin. Useful for REPL-style
         /// children (`python -i`, `psql`, MCP stdio subprocesses).
         /// Returns bytes actually written; capped at 1 MB per call.
+        /// (NOT YET IMPLEMENTED — stdin pipe capture pending.)
         write-stdin: func(data: list<u8>) -> result<u32, error-code>;
 
         /// Close the stdin pipe (child observes EOF on read).
+        /// (NOT YET IMPLEMENTED — stdin pipe capture pending.)
         close-stdin: func() -> result<_, error-code>;
 
         /// Send a signal. Fire-and-forget; for graceful shutdown use
@@ -172,6 +401,11 @@ interface host {
         /// patterns that mustn't hang on a runaway child.
         /// Returns exit-info on exit, `wait-timeout` error if the
         /// timeout elapsed first.
+        ///
+        /// On a handle obtained via `attach` (a persistent process), `none` is
+        /// REJECTED with `invalid-input`: an unbounded wait would pin the
+        /// pooled instance. Use a bounded timeout, the id-keyed `wait` (also
+        /// bounded), or the durable `watch` event for long-lived waits.
         wait: func(timeout-ms: option<u64>) -> result<exit-info, error-code>;
 
         /// Wait for the process to exit AND drain remaining stdout /
@@ -189,11 +423,16 @@ interface host {
 
         /// Pollable that fires when the process has exited. Compose
         /// with other pollables to multiplex "wait on child OR
-        /// receive IPC event."
+        /// receive IPC event." Instance-local: dies on instance reset, so
+        /// for a PERSISTENT process the durable exit signal is the event
+        /// model (`watch`), not this pollable.
+        /// (NOT YET IMPLEMENTED — returns an always-ready stub pollable.)
         subscribe-exit: func() -> pollable;
 
         /// Pollable that fires when stdout / stderr has buffered
-        /// data ready to be drained via `read-logs`.
+        /// data ready to be drained via `read-logs`. Same instance-local
+        /// caveat as `subscribe-exit`.
+        /// (NOT YET IMPLEMENTED — returns an always-ready stub pollable.)
         subscribe-logs: func() -> pollable;
     }
 
@@ -208,4 +447,106 @@ interface host {
     /// stdout/stderr are buffered (1 MiB per stream, ring buffer).
     /// Audit: recorded.
     spawn-background: func(request: spawn-request) -> result<process-handle, error-code>;
+
+    // ================================================================
+    // PERSISTENT TIER functions. (NOT YET IMPLEMENTED — the host stubs
+    // these, returning `persist-unsupported` / `no-such-process` / `unknown`
+    // until the registry lands. The SHAPES are fixed now.)
+    //
+    // Every id-keyed function re-resolves the live calling principal +
+    // capsule and checks them against the recorded creator BEFORE touching
+    // the entry; wrong-owner / unknown / reaped all collapse to
+    // `no-such-process` (no oracle). Audited (op + principal + capsule +
+    // id-hash; never the raw id, env, stdin, or log contents).
+    // ================================================================
+
+    /// Spawn a PERSISTENT background process whose lifetime is decoupled from
+    /// the spawning instance. Returns a `process-id` any LATER invocation of
+    /// the SAME capsule under the SAME principal can reattach to. Gated on
+    /// `host_process` AND the operator `allow_persistent` sub-grant; counts
+    /// against BOTH the per-principal concurrent cap (shared with
+    /// `spawn-background`) AND the retained-id cap. Fail-closed refusals
+    /// (`persist-unsupported`): owner-fallback principal; sandbox disabled;
+    /// macOS without the operator persistence opt-in.
+    spawn-persistent: func(request: spawn-request) -> result<process-id, error-code>;
+
+    /// Re-materialise a `process-handle` over a persistent process for THIS
+    /// invocation — the composition primitive (every ephemeral method works).
+    /// DETACH-on-drop: dropping it (incl. on instance reset) does NOT reap.
+    /// `no-such-process` if the id is unknown to the caller.
+    attach: func(id: process-id) -> result<process-handle, error-code>;
+
+    /// List the caller `(capsule, principal)`'s persistent processes,
+    /// optionally filtered by a label substring. NEVER another principal's or
+    /// capsule's. Empty is normal (post-restart / post-reap recovery signal).
+    list-processes: func(label-filter: option<string>) -> result<list<process-info>, error-code>;
+
+    /// Resolve an id to its `process-info` WITHOUT draining buffers — the safe
+    /// poll primitive. `no-such-process` if unknown to the caller.
+    status: func(id: process-id) -> result<process-info, error-code>;
+
+    /// Batch `status`: one registry pass + one audit record for a supervisor
+    /// polling N children on a timer. Unknown ids are absent from the result.
+    status-many: func(ids: list<process-id>) -> result<list<process-info>, error-code>;
+
+    /// `attach(id)?.read-logs()` — DRAINS the SINGLE shared ring per
+    /// `process-id`: whoever drains first consumes those bytes, so concurrent
+    /// drainers across invocations/attachments race over one cursor. For
+    /// independent multi-reader use (a UI tailer AND the capsule's own parser)
+    /// OR byte-faithful output, use `read-since` (per-cursor, non-draining,
+    /// `list<u8>`). `read-logs-result` stdout/stderr are UTF-8 (lossy on
+    /// non-UTF-8 child output).
+    read-logs: func(id: process-id) -> result<read-logs-result, error-code>;
+
+    /// NON-DRAINING, cursor-addressed, resumable read from a persistent
+    /// process's stream. Works on an exited process's retained tail until
+    /// released / TTL. `max-bytes` bounds the chunk (host also hard-caps).
+    read-since: func(id: process-id, which-stream: log-stream, cursor: log-cursor, max-bytes: u32) -> result<log-chunk, error-code>;
+
+    /// `attach(id)?.write-stdin(data)`. Requires `keep-stdin-open = true`.
+    /// (NOT YET IMPLEMENTED — stdin pipe capture pending.)
+    write-stdin: func(id: process-id, data: list<u8>) -> result<u32, error-code>;
+
+    /// `attach(id)?.close-stdin()`. (NOT YET IMPLEMENTED.)
+    close-stdin: func(id: process-id) -> result<_, error-code>;
+
+    /// `attach(id)?.signal(sig)`. Fire-and-forget signal delivery.
+    signal: func(id: process-id, sig: process-signal) -> result<_, error-code>;
+
+    /// `attach(id)?.wait(timeout-ms)` with a REQUIRED bounded timeout (an
+    /// unbounded wait would pin a pooled instance). Does NOT release on exit.
+    /// `wait-timeout` on elapse. For long-lived waits use `watch`.
+    wait: func(id: process-id, timeout-ms: u64) -> result<exit-info, error-code>;
+
+    /// Graceful terminal stop: SIGTERM, wait up to `grace-ms`, then SIGKILL;
+    /// REMOVE the id (frees the concurrent + retained slot). `grace-ms: none`
+    /// => host default. (For an immediate SIGKILL use `attach(id)?.kill()`.)
+    ///
+    /// Returns only `exit-info`, NOT the final buffers: `stop` reaps the id, so
+    /// to keep a child's last output drain it with `read-since` (byte-faithful)
+    /// BEFORE `stop`. Returning the buffers here would hand back stdout/stderr
+    /// the guest must UTF-8-decode (lossy on non-UTF-8 output); `read-since` is
+    /// the byte-exact path.
+    stop: func(id: process-id, grace-ms: option<u64>) -> result<exit-info, error-code>;
+
+    /// Drop the host's retention of an ALREADY-EXITED process: frees the
+    /// retained-id slot + discards the buffered tail WITHOUT signalling.
+    /// `invalid-input` if still running (use `stop`). Idempotent.
+    release-process: func(id: process-id) -> result<_, error-code>;
+
+    /// Arm DURABLE lifecycle events for `id`, published by the host UNDER THE
+    /// CREATOR PRINCIPAL on
+    /// `astrid.process.v1.{exited,log-ready,stdin-drained}.<suffix>` (a
+    /// pollable cannot survive instance reset, so the durable channel is the
+    /// IPC bus the capsule already subscribes to). The `exited` payload carries
+    /// a reason (self-exit / killed / reaped-ttl / reaped-shutdown). `suffix:
+    /// none` => the id. Idempotent. `no-such-process` if unknown to the caller.
+    /// OPEN (RFC: host_abi): whether the host-published topics need a manifest
+    /// `[publish]` declaration or are a kernel-authored topic class — `watch`
+    /// may be cut in favour of `status` + bounded `wait` polling.
+    watch: func(id: process-id, suffix: option<string>) -> result<_, error-code>;
+
+    /// Stop publishing lifecycle events for `id` (the child keeps running).
+    /// Idempotent.
+    unwatch: func(id: process-id) -> result<_, error-code>;
 }

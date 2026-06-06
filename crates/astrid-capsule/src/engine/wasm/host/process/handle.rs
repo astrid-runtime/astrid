@@ -111,6 +111,8 @@ impl HostProcessHandle for HostState {
                 ProcessSignal::Usr1 => nix::sys::signal::Signal::SIGUSR1,
                 ProcessSignal::Usr2 => nix::sys::signal::Signal::SIGUSR2,
                 ProcessSignal::Int => nix::sys::signal::Signal::SIGINT,
+                ProcessSignal::Stop => nix::sys::signal::Signal::SIGSTOP,
+                ProcessSignal::Cont => nix::sys::signal::Signal::SIGCONT,
             };
             let raw = i32::try_from(pid).map_err(|_| ErrorCode::InvalidInput)?;
             nix::sys::signal::kill(nix::unistd::Pid::from_raw(raw), nix_sig)

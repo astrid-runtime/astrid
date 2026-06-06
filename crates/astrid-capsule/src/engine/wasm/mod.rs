@@ -1001,6 +1001,15 @@ impl ExecutionEngine for WasmEngine {
         let cancel_token_for_state = cancel_token.clone();
         let process_tracker = Arc::new(crate::engine::wasm::host::process::ProcessTracker::new());
         let process_tracker_for_listener = process_tracker.clone();
+        // Host-owned persistent-process registry — one per engine, cloned
+        // into every pooled `HostState` so a `process-id` survives instance
+        // reset. Children are owned by the daemon runtime, NOT an instance.
+        let persistent_registry = Arc::new(
+            crate::engine::wasm::host::process::PersistentProcessRegistry::new(
+                tokio::runtime::Handle::current(),
+            ),
+        );
+        let persistent_registry_for_reaper = persistent_registry.clone();
         // Shared peak-memory ledger, cloned into every pooled `HostState`'s
         // `StoreMemoryMeter` so a principal's high-water linear memory sums
         // cross-capsule (the RAM analogue of the fuel ledger).
@@ -1277,6 +1286,7 @@ impl ExecutionEngine for WasmEngine {
             let io_semaphore = io_semaphore.clone();
             let cancel_token_for_state = cancel_token_for_state.clone();
             let process_tracker = process_tracker.clone();
+            let persistent_registry = persistent_registry.clone();
             let memory_ledger = memory_ledger.clone();
             let st_principal = ctx.principal.clone();
             let st_capsule_registry = ctx.capsule_registry.clone();
@@ -1347,6 +1357,7 @@ impl ExecutionEngine for WasmEngine {
                 allowance_store: st_allowance_store.clone(),
                 identity_store: st_identity_store.clone(),
                 process_tracker: process_tracker.clone(),
+                persistent_processes: persistent_registry.clone(),
                 net_stream_count: 0,
                 subscription_count: 0,
                 process_count_total: 0,
@@ -1689,6 +1700,29 @@ impl ExecutionEngine for WasmEngine {
                                 Some(_) => {},  // Non-IPC event on this topic - ignore.
                                 None => break,  // Channel closed.
                             }
+                        }
+                    }
+                }
+            });
+
+            // Persistent-process reaper: sweep idle / over-lifetime /
+            // exit-retention-elapsed entries on a timer, and reap the whole
+            // registry on capsule unload (cancel). Same `host_process` gate as
+            // the cancel listener — only those capsules have a live registry.
+            let registry = persistent_registry_for_reaper;
+            let ct = cancel_token.clone();
+            tokio::task::spawn(async move {
+                let mut tick = tokio::time::interval(std::time::Duration::from_secs(2));
+                tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                loop {
+                    tokio::select! {
+                        biased;
+                        () = ct.cancelled() => {
+                            registry.shutdown();
+                            break;
+                        }
+                        _ = tick.tick() => {
+                            registry.reap_sweep();
                         }
                     }
                 }
@@ -2338,6 +2372,11 @@ pub async fn run_lifecycle(
         allowance_store: None,
         identity_store: None,
         process_tracker: Arc::new(host::process::ProcessTracker::new()),
+        // Lifecycle hooks never spawn persistent processes (no run loop); a
+        // throwaway registry satisfies the field. Reaped when this state drops.
+        persistent_processes: Arc::new(host::process::PersistentProcessRegistry::new(
+            tokio::runtime::Handle::current(),
+        )),
         net_stream_count: 0,
         subscription_count: 0,
         process_count_total: 0,
