@@ -192,6 +192,15 @@ impl EventBus {
 
         for (_key, entry_arc) in matched {
             let mut entry = entry_arc.lock();
+            // Self-scope gate: a route scoped to a single principal drops a
+            // foreign-principal event here, skipping BOTH the push and the
+            // wakeup. Without the notify-skip the receiver would be woken to
+            // drain nothing and immediately re-park. Unscoped routes
+            // (`scope == None`) accept every publisher, so this is a pure
+            // no-op for them and the push path is byte-identical to before.
+            if !entry.accepts(&principal) {
+                continue;
+            }
             entry.push_with_eviction(
                 Arc::clone(event),
                 principal.clone(),
@@ -278,6 +287,41 @@ impl EventBus {
         capsule_id_label: impl Into<String>,
         subscriber: &'static str,
     ) -> RoutedEventReceiver {
+        self.subscribe_topic_routed_scoped(
+            capsule_uuid,
+            topic_pattern,
+            capsule_id_label,
+            subscriber,
+            None,
+        )
+    }
+
+    /// Routed subscription self-scoped to a single publisher principal.
+    ///
+    /// Identical to [`subscribe_topic_routed`](Self::subscribe_topic_routed)
+    /// except the route only ever admits events whose publisher
+    /// [`PrincipalKey`] equals `scope`; foreign-principal events are dropped
+    /// at enqueue so they never enter this route's byte budget (see
+    /// [`RouteEntry::accepts`](crate::route::RouteEntry::accepts)). Pass
+    /// `scope == None` for the unscoped, all-principals behaviour —
+    /// `subscribe_topic_routed` is exactly that delegation.
+    ///
+    /// The scope is the authorization seam for capability-gated firehose
+    /// topics (e.g. the audit feed): a non-privileged subscriber is scoped
+    /// to its own principal so it can never observe another principal's
+    /// events, while a privileged firehose holder subscribes with
+    /// `scope == None`.
+    ///
+    /// Dropping the receiver removes its route from the bus.
+    #[must_use]
+    pub fn subscribe_topic_routed_scoped(
+        &self,
+        capsule_uuid: uuid::Uuid,
+        topic_pattern: impl Into<String>,
+        capsule_id_label: impl Into<String>,
+        subscriber: &'static str,
+        scope: Option<PrincipalKey>,
+    ) -> RoutedEventReceiver {
         let topic_pattern = topic_pattern.into();
         let capsule_label = capsule_id_label.into();
         let route_key = RouteKey {
@@ -289,6 +333,7 @@ impl EventBus {
         let entry = Arc::new(parking_lot::Mutex::new(RouteEntry::new(
             matcher,
             capsule_label,
+            scope,
         )));
         let notify = Arc::clone(&entry.lock().notify);
         {

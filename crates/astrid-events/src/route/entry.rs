@@ -101,21 +101,72 @@ pub(crate) struct RouteEntry {
     /// Stable capsule label for telemetry. Bounded by deployed capsule
     /// count.
     pub(crate) capsule_id_label: String,
+    /// Authz self-scope. `Some(p)` ⇒ only events whose publisher
+    /// [`PrincipalKey`] equals `p` are admitted; foreign-principal events
+    /// are dropped at enqueue ([`accepts`](Self::accepts) → `false`) so
+    /// they never consume this route's 1 `MiB` byte budget, never enter
+    /// the [`fanout`](Self::fanout) map, and can never head-evict the
+    /// owner's own entries. `None` ⇒ unscoped (all principals) — the
+    /// default and the only behaviour pre-existing subscriptions get.
+    ///
+    /// This is orthogonal to the per-principal DRR fan-out buckets, which
+    /// remain fairness-only (#813): scoping decides *admission*, DRR
+    /// decides *order* among whatever was admitted. A scoped route admits
+    /// at most one principal, so its DRR rotation holds exactly one
+    /// bucket — strictly less work than an unscoped firehose route.
+    ///
+    /// COMPLETENESS is CROSS-PRINCIPAL ONLY. The guarantee above ("can never
+    /// head-evict the owner's own entries") is about FOREIGN principals — a
+    /// noisy co-principal cannot evict the owner. A scoped route still applies
+    /// the 1 `MiB` byte budget and the 256-message per-principal cap to the
+    /// owner's OWN bucket, so if the owner publishes faster than the consumer
+    /// drains, the owner's OWN oldest entries can still self-evict (host
+    /// `tracing::error!`/metric only — no in-band guest signal). A
+    /// completeness-critical consumer (e.g. an audit-to-blockchain mint
+    /// pipeline) must therefore drain promptly or treat the persisted audit
+    /// log (`append_with_principal`) as the source of truth, not the live bus
+    /// feed. In-band drop-signalling / log reconciliation is a future
+    /// (Phase 2) concern.
+    pub(crate) scope: Option<PrincipalKey>,
     /// Wakeup for `RoutedEventReceiver::recv`.
     pub(crate) notify: Arc<Notify>,
 }
 
 impl RouteEntry {
     /// Construct a new entry for the given matcher.
-    pub(crate) fn new(matcher: TopicMatcher, capsule_id_label: String) -> Self {
+    ///
+    /// `scope` self-scopes the route to a single publisher principal (see
+    /// [`scope`](Self::scope)); pass `None` for the unscoped, all-principals
+    /// behaviour that every pre-existing subscription relies on. The
+    /// argument is mandatory so every constructor must state its intent —
+    /// a forgotten scope is a compile error, the secure-by-default failure
+    /// mode.
+    pub(crate) fn new(
+        matcher: TopicMatcher,
+        capsule_id_label: String,
+        scope: Option<PrincipalKey>,
+    ) -> Self {
         Self {
             matcher,
             fanout: HashMap::new(),
             principal_order: VecDeque::new(),
             total_bytes: 0,
             capsule_id_label,
+            scope,
             notify: Arc::new(Notify::new()),
         }
+    }
+
+    /// Whether an event published by `publisher` is admitted into this
+    /// route. Unscoped routes (`scope == None`) admit every publisher;
+    /// scoped routes admit only their own principal. This is the single
+    /// named home of the authz rule — both the [`dispatch_to_routes`]
+    /// notify-skip and the [`push_with_eviction`](Self::push_with_eviction)
+    /// defence-in-depth guard consult it.
+    ///
+    /// [`dispatch_to_routes`]: crate::bus::EventBus
+    pub(crate) fn accepts(&self, publisher: &PrincipalKey) -> bool {
+        self.scope.as_ref().is_none_or(|s| s == publisher)
     }
 
     /// Push an event into the route, applying oldest-head eviction under
@@ -127,6 +178,16 @@ impl RouteEntry {
         principal: PrincipalKey,
         budget_bytes: usize,
     ) -> usize {
+        // Defence in depth: enforce the self-scope at the very TOP, before
+        // the oversize reject and the eviction loop, so a foreign-principal
+        // event never touches `total_bytes`, `fanout`, or `principal_order`
+        // even if a future caller forgets the `accepts()` gate in
+        // `dispatch_to_routes`. A scoped route's budget is therefore only
+        // ever consumable by its own principal.
+        if !self.accepts(&principal) {
+            return 0;
+        }
+
         let msg_size = ipc_size_of(&event);
 
         if msg_size > budget_bytes {
@@ -402,7 +463,7 @@ mod tests {
 
     #[test]
     fn push_and_drain_single_principal() {
-        let mut entry = RouteEntry::new(TopicMatcher::new("t.*"), "capsule-a".into());
+        let mut entry = RouteEntry::new(TopicMatcher::new("t.*"), "capsule-a".into(), None);
         for _ in 0..3 {
             entry.push_with_eviction(
                 ipc("t.x", Some("alice")),
@@ -424,7 +485,7 @@ mod tests {
         // fairness is therefore measured by equal *counts* delivered,
         // not strict per-message interleaving — DRR semantics, not
         // pure round-robin. Both principals should each see 2 events.
-        let mut entry = RouteEntry::new(TopicMatcher::new("t.*"), "capsule-a".into());
+        let mut entry = RouteEntry::new(TopicMatcher::new("t.*"), "capsule-a".into(), None);
         for _ in 0..2 {
             entry.push_with_eviction(
                 ipc("t.x", Some("alice")),
@@ -463,7 +524,7 @@ mod tests {
         // interleaved.
         let payload_size = 8 * 1024; // 8 KiB > DRR_QUANTUM_MIN_BYTES/2
         let budget = payload_size * 4 + 1024;
-        let mut entry = RouteEntry::new(TopicMatcher::new("t.*"), "capsule-a".into());
+        let mut entry = RouteEntry::new(TopicMatcher::new("t.*"), "capsule-a".into(), None);
         entry.push_with_eviction(
             ipc_sized("t.x", Some("alice"), payload_size),
             Some("alice".into()),
@@ -506,7 +567,7 @@ mod tests {
 
     #[test]
     fn drr_isolates_principals_under_burst() {
-        let mut entry = RouteEntry::new(TopicMatcher::new("t.*"), "capsule-a".into());
+        let mut entry = RouteEntry::new(TopicMatcher::new("t.*"), "capsule-a".into(), None);
         for _ in 0..200 {
             entry.push_with_eviction(
                 ipc("t.x", Some("alice")),
@@ -525,7 +586,7 @@ mod tests {
         // of the oldest head (alice's first), not bob's later message.
         let payload_size = 64 * 1024;
         let budget = payload_size * 3 + 4096;
-        let mut entry = RouteEntry::new(TopicMatcher::new("t.*"), "capsule-a".into());
+        let mut entry = RouteEntry::new(TopicMatcher::new("t.*"), "capsule-a".into(), None);
 
         for _ in 0..3 {
             entry.push_with_eviction(
@@ -580,7 +641,7 @@ mod tests {
     fn pathological_message_alone_is_rejected() {
         // budget = 1 KiB; message > 1 KiB → rejected, queue unchanged.
         let small_budget = 1024;
-        let mut entry = RouteEntry::new(TopicMatcher::new("t.*"), "capsule-a".into());
+        let mut entry = RouteEntry::new(TopicMatcher::new("t.*"), "capsule-a".into(), None);
         entry.push_with_eviction(
             ipc_sized("t.alice", Some("alice"), 4096),
             Some("alice".into()),
@@ -592,7 +653,7 @@ mod tests {
 
     #[test]
     fn fairness_under_5000_principals_makes_progress() {
-        let mut entry = RouteEntry::new(TopicMatcher::new("t.*"), "capsule-a".into());
+        let mut entry = RouteEntry::new(TopicMatcher::new("t.*"), "capsule-a".into(), None);
         for i in 0..5000 {
             let p = format!("p{i}");
             entry.push_with_eviction(ipc("t.x", Some(&p)), Some(p), MAX_SUBSCRIPTION_BUDGET_BYTES);
@@ -603,6 +664,106 @@ mod tests {
         // should drain all of them under the quantum floor.
         assert_eq!(out.len(), 5000);
         assert_eq!(entry.fanout.len(), 0);
+    }
+
+    // ── Self-scope (Option B route-level audit scoping) ──────────────
+
+    #[test]
+    fn accepts_predicate_authz_rule() {
+        // Scoped to alice: only alice's publisher key is admitted.
+        let scoped = RouteEntry::new(
+            TopicMatcher::new("t.*"),
+            "capsule-a".into(),
+            Some(Some("alice".into())),
+        );
+        assert!(scoped.accepts(&Some("alice".into())));
+        assert!(!scoped.accepts(&Some("bob".into())));
+        // The system/kernel (None) bucket is foreign to a user-scoped route.
+        assert!(!scoped.accepts(&None));
+
+        // Unscoped: every publisher (including system None) is admitted.
+        let unscoped = RouteEntry::new(TopicMatcher::new("t.*"), "capsule-a".into(), None);
+        assert!(unscoped.accepts(&Some("alice".into())));
+        assert!(unscoped.accepts(&Some("bob".into())));
+        assert!(unscoped.accepts(&None));
+    }
+
+    #[test]
+    fn scoped_drops_foreign_at_enqueue() {
+        // A route scoped to alice must drop bob's events at enqueue: bob's
+        // bytes never enter total_bytes, bob gets no fanout bucket, and a
+        // drain yields only alice.
+        let mut entry = RouteEntry::new(
+            TopicMatcher::new("t.*"),
+            "capsule-a".into(),
+            Some(Some("alice".into())),
+        );
+        for _ in 0..3 {
+            entry.push_with_eviction(
+                ipc("t.x", Some("alice")),
+                Some("alice".into()),
+                MAX_SUBSCRIPTION_BUDGET_BYTES,
+            );
+        }
+        for _ in 0..5 {
+            let evicted = entry.push_with_eviction(
+                ipc("t.x", Some("bob")),
+                Some("bob".into()),
+                MAX_SUBSCRIPTION_BUDGET_BYTES,
+            );
+            assert_eq!(evicted, 0, "foreign push is a no-op, never evicts");
+        }
+        // Only alice's bucket exists; bob's bytes never accrued.
+        assert_eq!(entry.fanout.len(), 1);
+        assert!(entry.fanout.contains_key(&Some("alice".into())));
+        assert!(!entry.fanout.contains_key(&Some("bob".into())));
+
+        let mut out = Vec::new();
+        entry.drr_drain(&mut out, MAX_SUBSCRIPTION_BUDGET_BYTES);
+        assert_eq!(out.len(), 3, "only alice's three events drain");
+        for ev in &out {
+            if let AstridEvent::Ipc { message, .. } = &**ev {
+                assert_eq!(message.principal.as_deref(), Some("alice"));
+            }
+        }
+    }
+
+    #[test]
+    fn scoped_budget_not_evictable_by_foreign_burst() {
+        // THE Option-B completeness guarantee: a foreign-principal burst far
+        // past the budget can NEVER evict the owner's entries, because the
+        // foreign bytes never enter the budget in the first place. A
+        // drain-time-filter design would FAIL this — bob's bytes would
+        // occupy the shared budget and head-evict alice before any filter.
+        let payload_size = 64 * 1024;
+        let budget = payload_size * 3 + 4096;
+        let mut entry = RouteEntry::new(
+            TopicMatcher::new("t.*"),
+            "capsule-a".into(),
+            Some(Some("alice".into())),
+        );
+        // Alice writes one entry well within budget.
+        entry.push_with_eviction(
+            ipc_sized("t.alice.keep", Some("alice"), payload_size),
+            Some("alice".into()),
+            budget,
+        );
+        // Bob floods far past the budget.
+        for _ in 0..100 {
+            entry.push_with_eviction(
+                ipc_sized("t.bob.flood", Some("bob"), payload_size),
+                Some("bob".into()),
+                budget,
+            );
+        }
+        // Alice's single entry is intact; bob never entered.
+        let alice_q = entry
+            .fanout
+            .get(&Some("alice".into()))
+            .expect("alice queue survives");
+        assert_eq!(alice_q.queue.len(), 1, "alice's entry never evicted");
+        assert!(!entry.fanout.contains_key(&Some("bob".into())));
+        assert_eq!(entry.total_bytes, alice_q.bytes);
     }
 
     #[test]

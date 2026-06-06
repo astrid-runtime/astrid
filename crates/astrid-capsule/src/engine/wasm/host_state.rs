@@ -297,6 +297,20 @@ pub struct HostState {
     /// Used to gate `astrid_register_uplink` — only uplink plugins
     /// are allowed to register uplinks.
     pub has_uplink_capability: bool,
+    /// Whether this capsule's OWNER principal holds `audit:read_all`,
+    /// resolved at LOAD the PRIVILEGED way (against the profile cache +
+    /// live group config — **not** the manifest, unlike
+    /// [`has_uplink_capability`](Self::has_uplink_capability) which is read
+    /// straight off `manifest.capabilities.uplink`).
+    ///
+    /// Governs the audit-topic subscription seam: `true` ⇒ a subscription
+    /// covering `astrid.v1.audit.entry` is the unscoped firehose (every
+    /// principal's entries, as before); `false` (the default) ⇒ the
+    /// subscription is route-scoped to the owner principal so it observes
+    /// only its own audit entries. Fail-secure: `false`. A capsule cannot
+    /// flip this via its `Capsule.toml` — it chooses neither its load
+    /// principal nor that principal's operator-owned capabilities.
+    pub audit_firehose: bool,
     /// Sender for inbound messages from uplink plugins.
     ///
     /// Set during plugin loading when the manifest declares
@@ -751,6 +765,7 @@ impl std::fmt::Debug for HostState {
             .field("has_tmp", &self.tmp.is_some())
             .field("has_security", &self.security.is_some())
             .field("has_uplink_capability", &self.has_uplink_capability)
+            .field("audit_firehose", &self.audit_firehose)
             .field("has_inbound_tx", &self.inbound_tx.is_some())
             .field("registered_uplinks", &self.registered_uplinks.len())
             .field(

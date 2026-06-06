@@ -460,6 +460,51 @@ pub(crate) fn resolve_exemption(
         .any(|&cap| check.has(cap))
 }
 
+/// The single catalogued, enforced audit-firehose capability. Holding it
+/// grants the unscoped, cross-principal audit feed (every principal's
+/// `astrid.v1.audit.entry` events); without it an audit subscription is
+/// route-scoped to the subscriber's own principal.
+///
+/// This is the SAME string the gateway SSE firehose gates on
+/// (`astrid-gateway`'s `events::AUDIT_FIREHOSE_CAP`) and the same one
+/// catalogued in `astrid-core`'s capability grammar (scope Global, danger
+/// Elevated). A capsule-local literal keeps the kernel/capsule dependency
+/// boundary clean (the capsule must not reach into the gateway or grow the
+/// core grammar surface for one internal reference); the value is pinned by
+/// [`tests::audit_firehose_cap_literal_pinned`].
+const AUDIT_FIREHOSE_CAP: &str = "audit:read_all";
+
+/// Pure decision: does this load principal's profile hold the audit
+/// firehose capability ([`AUDIT_FIREHOSE_CAP`])?
+///
+/// Resolved the PRIVILEGED way — the SAME permission-system path as
+/// [`resolve_exemption`] (groups → grants → revokes against the owner
+/// principal's profile + the live group config), NEVER from the
+/// capsule-authored manifest. This is the load-bearing distinction from
+/// [`HostState::has_uplink_capability`](crate::engine::wasm::host_state::HostState::has_uplink_capability),
+/// which IS read straight off `manifest.capabilities.uplink`: the firehose
+/// must not be a thing a capsule can self-grant in its own `Capsule.toml`.
+/// admin holds it via `*`; revokes win over grants.
+///
+/// FAIL-SECURE: any missing input (no owner profile in tests / single-tenant,
+/// or an unthreaded group config) → `false`, i.e. own-principal-only audit
+/// scoping — the SECURE default — exactly as [`resolve_exemption`] fails
+/// closed to bounded. No I/O, no locking: unit-testable without wasmtime.
+pub(crate) fn resolve_audit_firehose(
+    owner_profile: Option<&astrid_core::profile::PrincipalProfile>,
+    group_config: Option<&astrid_core::GroupConfig>,
+    principal: &astrid_core::PrincipalId,
+) -> bool {
+    let (Some(profile), Some(groups)) = (owner_profile, group_config) else {
+        // Fail-secure: an unidentifiable principal or an unthreaded group
+        // config NEVER gets the firehose — the audit subscription stays
+        // scoped to the owner principal.
+        return false;
+    };
+    astrid_capabilities::CapabilityCheck::new(profile, groups, principal.clone())
+        .has(AUDIT_FIREHOSE_CAP)
+}
+
 /// The per-principal CPU-rate DENY decision, factored out of
 /// `invoke_interceptor` so the production path and the unit tests run the
 /// *exact same* function (no copies — same discipline as
@@ -1192,6 +1237,26 @@ impl ExecutionEngine for WasmEngine {
                 );
             }
 
+            // ── Audit firehose (privileged, load-time, manifest-independent) ─
+            //
+            // Does the OWNER principal hold `audit:read_all`? Resolved the
+            // SAME privileged way as the run-loop exemption above — against
+            // the already-resolved `owner_profile` + the live group config,
+            // NEVER the capsule manifest — so a capsule cannot self-grant the
+            // firehose by listing the audit topic in its `Capsule.toml`
+            // `ipc_subscribe` array (that array only grants the syntactic
+            // right to NAME the topic; `check_subscribe_acl` enforces it).
+            // Reuses `owner_profile` rather than re-resolving so there is no
+            // second cache hit / duplicate warn-log. A Copy `bool` captured by
+            // the `make_state` move closure below, beside `has_uplink`.
+            // Fail-secure: `false` ⇒ audit subscriptions are scoped to the
+            // owner principal. See [`resolve_audit_firehose`].
+            let audit_firehose = resolve_audit_firehose(
+                owner_profile.as_deref(),
+                ctx.group_config.as_deref(),
+                &ctx.principal,
+            );
+
             // Per-instance `HostState` factory. Shared services clone (Arc or
             // cheap value clones); per-Store fields (`wasi_ctx`,
             // `resource_table`, the http-stream map, the resource-table-mirror
@@ -1268,6 +1333,7 @@ impl ExecutionEngine for WasmEngine {
                 capsule_registry: st_capsule_registry.clone(),
                 runtime_handle: tokio::runtime::Handle::current(),
                 has_uplink_capability: has_uplink,
+                audit_firehose,
                 inbound_tx: tx.clone(),
                 registered_uplinks: Vec::new(),
                 lifecycle_phase: None,
@@ -2254,6 +2320,8 @@ pub async fn run_lifecycle(
         capsule_registry: None,
         runtime_handle: tokio::runtime::Handle::current(),
         has_uplink_capability: false,
+        // Lifecycle hooks never subscribe to the audit feed; fail-secure.
+        audit_firehose: false,
         inbound_tx: None,
         registered_uplinks: Vec::new(),
         cli_socket_listener: None,
@@ -2730,6 +2798,93 @@ mod tests {
         let p = profile_with(&["agent"], &[], &[]);
         let g = builtin_groups();
         assert!(!resolve_exemption(Some(&p), Some(&g), &pid("a")));
+    }
+
+    // ── resolve_audit_firehose (the audit-scope decision, directly) ──────
+    //
+    // Same discipline as the resolve_exemption tests: drive the PURE
+    // function the production load path calls (no copies). The firehose is
+    // resolved the PRIVILEGED way (profile + group config), NEVER from the
+    // manifest — encoded structurally (the fn has no manifest input) and
+    // pinned positively/negatively below.
+
+    #[test]
+    fn audit_firehose_cap_literal_pinned() {
+        // The capsule-local literal must stay byte-equal to the gateway's
+        // `events::AUDIT_FIREHOSE_CAP` and the core grammar's `audit:read_all`
+        // so the three references can never drift.
+        assert_eq!(AUDIT_FIREHOSE_CAP, "audit:read_all");
+    }
+
+    #[test]
+    fn audit_firehose_holder_true() {
+        // admin holds `audit:read_all` via `*` — the firehose case.
+        let admin = profile_with(&["admin"], &[], &[]);
+        let g = builtin_groups();
+        assert!(resolve_audit_firehose(
+            Some(&admin),
+            Some(&g),
+            &pid("default")
+        ));
+
+        // A non-admin explicitly granted the capability also gets the firehose.
+        let granted = profile_with(&["agent"], &[AUDIT_FIREHOSE_CAP], &[]);
+        assert!(resolve_audit_firehose(
+            Some(&granted),
+            Some(&g),
+            &pid("alice")
+        ));
+    }
+
+    #[test]
+    fn audit_firehose_fail_secure_false() {
+        let g = builtin_groups();
+        let admin = profile_with(&["admin"], &[], &[]);
+        // No owner profile → false (own-principal scoping).
+        assert!(!resolve_audit_firehose(None, Some(&g), &pid("ghost")));
+        // No group config, even for admin `*` → false (load-bearing config).
+        assert!(!resolve_audit_firehose(Some(&admin), None, &pid("default")));
+        // A profile WITHOUT the capability → false.
+        let plain = profile_with(&["agent"], &[], &[]);
+        assert!(!resolve_audit_firehose(
+            Some(&plain),
+            Some(&g),
+            &pid("alice")
+        ));
+    }
+
+    #[test]
+    fn audit_firehose_revoke_overrides_admin() {
+        // admin `*` but with the firehose capability revoked: revokes win →
+        // scoped, not firehose. Proves revoke precedence on the audit path.
+        let p = profile_with(&["admin"], &[], &[AUDIT_FIREHOSE_CAP]);
+        let g = builtin_groups();
+        assert!(
+            !resolve_audit_firehose(Some(&p), Some(&g), &pid("alice")),
+            "revoking audit:read_all must override the admin `*` grant"
+        );
+    }
+
+    #[test]
+    fn audit_firehose_ignores_manifest_by_construction() {
+        // The decision is profile-only: a principal whose profile lacks
+        // audit:read_all is `false` no matter what an ipc_subscribe array
+        // in some Capsule.toml claims — the function has NO manifest input,
+        // so a capsule can never self-grant the firehose. The positive case
+        // requires the operator-owned grant.
+        let g = builtin_groups();
+        let no_cap = profile_with(&["agent"], &[], &[]);
+        assert!(!resolve_audit_firehose(
+            Some(&no_cap),
+            Some(&g),
+            &pid("self-declarer")
+        ));
+        let with_cap = profile_with(&["agent"], &[AUDIT_FIREHOSE_CAP], &[]);
+        assert!(resolve_audit_firehose(
+            Some(&with_cap),
+            Some(&g),
+            &pid("self-declarer")
+        ));
     }
 
     // ── CPU-rate DENY gate (PR2, the security boundary) ──────────────────

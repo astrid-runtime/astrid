@@ -52,6 +52,50 @@ const MAX_SUBSCRIPTIONS: usize = 128;
 /// Maximum blocking-recv timeout in milliseconds. Larger values are clamped.
 const MAX_RECV_TIMEOUT_MS: u64 = 60_000;
 
+/// The cross-principal audit feed topic. Mirrors `astrid-kernel`'s
+/// `kernel_router::AUDIT_TOPIC` (the sole production publisher) and
+/// `astrid-gateway`'s `events::AUDIT_TOPIC` (the SSE consumer). Kept as a
+/// capsule-local literal so the capsule does not depend on `astrid-kernel`;
+/// its value is pinned by [`audit_scope_tests::audit_topic_literal_pinned`]
+/// so the copies cannot silently drift (a drift would make
+/// [`pattern_covers_audit`] stop recognising the kernel's renamed topic and
+/// silently leave every audit subscription on the unscoped firehose default).
+const AUDIT_TOPIC: &str = "astrid.v1.audit.entry";
+
+/// Whether `pattern` (a subscribe topic pattern) covers the audit topic —
+/// i.e. a subscription to `pattern` would receive `astrid.v1.audit.entry`
+/// events.
+///
+/// Uses the ROUTE-LAYER [`astrid_events::TopicMatcher`], NOT
+/// [`crate::topic::topic_matches`]: the latter only does equal-segment
+/// single-`*` matching and so CANNOT detect that a trailing-suffix wildcard
+/// like `astrid.v1.*` covers the 4-segment audit topic. The route matcher's
+/// trailing-`*` branch does — which is the matcher the bus actually routes
+/// with — so this closes the wildcard-superset bypass: any audit-covering
+/// pattern is scoped, not just the exact string.
+///
+/// NOTE on over-scoping: the scope is per-ROUTE, not per-subtopic. An
+/// audit-covering SUPERSET pattern (`astrid.v1.*`, `astrid.*`) therefore
+/// scopes the WHOLE subscription to the owner principal, not just its audit
+/// subtree — a future capsule using `astrid.v1.*` to gather all-principal
+/// NON-audit telemetry without holding the firehose cap would have that whole
+/// feed silently collapse to own-principal-only. This is the deliberate
+/// secure default (an audit leak is worse than over-scoping), and no current
+/// capsule subscribes to an audit-covering superset, so the #813 fan-in is
+/// untouched in practice. Such a telemetry consumer must hold `audit:read_all`
+/// (firehose ⇒ unscoped) or narrow its pattern below the audit topic.
+fn pattern_covers_audit(pattern: &str) -> bool {
+    let synthetic = AstridEvent::Ipc {
+        metadata: EventMetadata::new("audit_scope_probe"),
+        message: InternalIpcMessage::new(
+            AUDIT_TOPIC,
+            IpcPayload::RawJson(serde_json::Value::Null),
+            uuid::Uuid::nil(),
+        ),
+    };
+    astrid_events::TopicMatcher::new(pattern).matches(&synthetic)
+}
+
 /// Storage type for `Resource<Subscription>` entries in the wasmtime
 /// resource table.
 ///
@@ -289,17 +333,67 @@ impl ipc::Host for HostState {
             return Err(ErrorCode::Quota);
         }
 
+        // Audit self-scope: a subscription whose pattern COVERS the audit
+        // topic is route-scoped to the OWNER principal unless this capsule
+        // holds `audit:read_all` (the privileged firehose, resolved at load
+        // — see `HostState::audit_firehose`). Default-deny: a capsule that
+        // merely declared the audit topic in its `Capsule.toml` gets only
+        // its own principal's entries, closing the firehose leak.
+        //
+        // Scope identity is the LOAD-TIME owner (`self.principal`),
+        // DELIBERATELY NOT `effective_principal()`: this RouteEntry is
+        // created once at subscribe() and outlives every per-invocation
+        // `caller_context`, so the stable identity that owns the receiver is
+        // the owner principal. (At a dedicated run-loop's subscribe call
+        // `caller_context` is None anyway, so `effective_principal()` would
+        // already fall back to `self.principal` — binding it explicitly
+        // documents intent and removes any dependence on transient caller
+        // context. Do not "fix" this to `effective_principal()`.)
+        //
+        // AXIS: own-principal scoping matches against the bus bucket key,
+        // which `record_admin_audit` sets to the audited CALLER (the actor who
+        // performed the admin action), NOT the action's `target_principal`.
+        // So an owner scoped to itself sees audit entries it ACTED in, not
+        // admin-on-me entries where it was the target but not the actor. This
+        // is deliberate and exactly mirrors the gateway SSE reference filter
+        // (which also keys on the JSON `principal` == caller). The
+        // target-principal axis ("all audit about me") is a separate, future
+        // (Phase 2) concern.
+        // `pattern_covers_audit` recompiles the matcher and rebuilds a
+        // synthetic probe event, so evaluate it once and reuse for both the
+        // scope decision and the audit log line.
+        let covers_audit = pattern_covers_audit(&topic_pattern);
+        let scope: Option<astrid_events::PrincipalKey> = if covers_audit && !self.audit_firehose {
+            Some(Some(self.principal.to_string()))
+        } else {
+            None
+        };
+        if covers_audit {
+            tracing::info!(
+                target: "astrid.audit.ipc",
+                security_event = true,
+                capsule_id = %self.capsule_id.as_str(),
+                principal = %self.principal,
+                topic = %topic_pattern,
+                scoped = scope.is_some(),
+                firehose = self.audit_firehose,
+                "ipc::subscribe: audit-covering subscription scoped to owner principal unless firehose holder",
+            );
+        }
+
         // Per-(capsule, topic, principal) routed receiver. The bus
         // owns a publish-side demux that buckets messages by the
         // originating principal, so the guest never sees a
         // mixed-principal batch and the cross-principal fairness lives
         // in the bus's DRR drain — no consumer-side requeue logic
-        // needed here (#813).
-        let receiver = self.event_bus.subscribe_topic_routed(
+        // needed here (#813). `scope` (Option B) additionally self-scopes
+        // an audit-covering subscription to the owner principal at enqueue.
+        let receiver = self.event_bus.subscribe_topic_routed_scoped(
             self.capsule_uuid,
             topic_pattern.clone(),
             self.capsule_id.as_str().to_string(),
             "capsule_guest",
+            scope,
         );
         let entry = SubscriptionEntry {
             receiver: Arc::new(Mutex::new(receiver)),
@@ -505,5 +599,192 @@ impl HostSubscription for HostState {
             self.subscription_count = self.subscription_count.saturating_sub(1);
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod audit_scope_tests {
+    use super::*;
+    use crate::engine::wasm::bindings::astrid::ipc::host::Host as IpcHost;
+    use crate::engine::wasm::test_fixtures::minimal_host_state;
+
+    #[test]
+    fn audit_topic_literal_pinned() {
+        // The capsule-local `AUDIT_TOPIC` must stay byte-equal to the
+        // kernel's sole publisher (`astrid_kernel::kernel_router::AUDIT_TOPIC`)
+        // and the gateway SSE consumer (`astrid-gateway`'s
+        // `events::AUDIT_TOPIC`). The capsule cannot import the kernel
+        // constant without a dependency cycle, so this pins the literal the
+        // capsule routes against. If the kernel ever renames the topic,
+        // `pattern_covers_audit` would otherwise silently stop recognising
+        // audit subscriptions and leave them on the unscoped firehose default
+        // for the renamed topic — exactly the drift the doc comment promises
+        // is guarded. Mirrors `tests::audit_firehose_cap_literal_pinned`.
+        assert_eq!(AUDIT_TOPIC, "astrid.v1.audit.entry");
+    }
+
+    // ── pattern_covers_audit (route-layer matcher, NOT topic_matches) ──
+
+    #[test]
+    fn pattern_covers_audit_via_route_matcher() {
+        // Exact + audit-subtree wildcard + broad superset all COVER the
+        // audit topic via the route matcher's trailing-suffix branch.
+        assert!(pattern_covers_audit("astrid.v1.audit.entry"));
+        assert!(pattern_covers_audit("astrid.v1.audit.*"));
+        // The wildcard-superset bypass the route matcher closes: the
+        // capsule's own topic_matches CANNOT see this coverage, but the
+        // route matcher (what the bus routes with) DOES.
+        assert!(pattern_covers_audit("astrid.v1.*"));
+        assert!(pattern_covers_audit("astrid.*"));
+
+        // Non-audit patterns are NOT covered → never scoped.
+        assert!(!pattern_covers_audit("astrid.v1.request.*"));
+        assert!(!pattern_covers_audit("astrid.v1.session.*"));
+        assert!(!pattern_covers_audit("astrid.v1.audit"));
+        assert!(!pattern_covers_audit("user.prompt"));
+    }
+
+    /// Build a routed publish on `bus` for an audit entry attributed to
+    /// `principal` (mirrors the kernel's `record_admin_audit` shape: topic
+    /// `astrid.v1.audit.entry`, `with_principal`).
+    fn publish_audit(bus: &astrid_events::EventBus, principal: &str) {
+        let msg = InternalIpcMessage::new(
+            AUDIT_TOPIC,
+            IpcPayload::RawJson(serde_json::json!({ "principal": principal })),
+            uuid::Uuid::nil(),
+        )
+        .with_principal(principal.to_string());
+        bus.publish(AstridEvent::Ipc {
+            metadata: EventMetadata::new("test_kernel"),
+            message: msg,
+        });
+    }
+
+    /// Drain the subscription's delivered messages and collect the
+    /// `Verified` principal strings.
+    fn drained_principals(state: &mut HostState, sub: &Resource<Subscription>) -> Vec<String> {
+        let envelope = HostSubscription::poll(state, Resource::new_borrow(sub.rep()))
+            .expect("poll should succeed");
+        envelope
+            .messages
+            .iter()
+            .map(|m| match &m.principal {
+                PrincipalAttribution::Verified(p) | PrincipalAttribution::Claimed(p) => p.clone(),
+                PrincipalAttribution::System => "<system>".to_string(),
+            })
+            .collect()
+    }
+
+    fn host_state_for(
+        rt: tokio::runtime::Handle,
+        owner: &str,
+        firehose: bool,
+        subscribe_acl: &[&str],
+    ) -> HostState {
+        let mut state = minimal_host_state(rt);
+        state.principal = astrid_core::PrincipalId::new(owner).expect("valid principal");
+        state.audit_firehose = firehose;
+        state.ipc_subscribe_patterns = subscribe_acl.iter().map(|s| (*s).to_string()).collect();
+        state
+    }
+
+    #[tokio::test]
+    async fn subscribe_audit_default_is_scoped_regression() {
+        // THE bug regression. A capsule with audit_firehose=false and the
+        // audit topic in its ACL, owner=alice, must receive ONLY alice's
+        // entries — bob's leak on today's unconditional firehose default.
+        let rt = tokio::runtime::Handle::current();
+        let mut state = host_state_for(rt, "alice", false, &["astrid.v1.audit.entry"]);
+        let bus = state.event_bus.clone();
+
+        let sub = IpcHost::subscribe(&mut state, AUDIT_TOPIC.to_string())
+            .expect("subscribe should be allowed by the ACL");
+
+        for _ in 0..5 {
+            publish_audit(&bus, "alice");
+        }
+        for _ in 0..5 {
+            publish_audit(&bus, "bob");
+        }
+
+        let got = drained_principals(&mut state, &sub);
+        assert_eq!(got.len(), 5, "only alice's five entries are delivered");
+        assert!(
+            got.iter().all(|p| p == "alice"),
+            "no foreign-principal audit entry may leak, got: {got:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn subscribe_wildcard_superset_is_scoped() {
+        // A broad `astrid.v1.*` subscription (covers audit) by a
+        // non-firehose capsule is still scoped — closes the wildcard bypass.
+        let rt = tokio::runtime::Handle::current();
+        let mut state = host_state_for(rt, "alice", false, &["astrid.v1.*"]);
+        let bus = state.event_bus.clone();
+
+        let sub = IpcHost::subscribe(&mut state, "astrid.v1.*".to_string())
+            .expect("subscribe should be allowed by the ACL");
+
+        publish_audit(&bus, "alice");
+        publish_audit(&bus, "bob");
+
+        let got = drained_principals(&mut state, &sub);
+        assert!(
+            got.iter().all(|p| p == "alice"),
+            "wildcard superset must not leak bob's audit entry, got: {got:?}"
+        );
+        assert_eq!(got.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn subscribe_firehose_holder_unscoped() {
+        // audit_firehose=true ⇒ unscoped: both alice and bob delivered.
+        let rt = tokio::runtime::Handle::current();
+        let mut state = host_state_for(rt, "alice", true, &["astrid.v1.audit.entry"]);
+        let bus = state.event_bus.clone();
+
+        let sub = IpcHost::subscribe(&mut state, AUDIT_TOPIC.to_string())
+            .expect("subscribe should be allowed by the ACL");
+
+        publish_audit(&bus, "alice");
+        publish_audit(&bus, "bob");
+
+        let got = drained_principals(&mut state, &sub);
+        assert_eq!(got.len(), 2, "firehose holder receives both principals");
+        assert!(got.iter().any(|p| p == "alice"));
+        assert!(got.iter().any(|p| p == "bob"));
+    }
+
+    #[tokio::test]
+    async fn subscribe_non_audit_topic_unaffected() {
+        // A non-audit subscription (pattern_covers_audit=false) stays
+        // unscoped even for a non-firehose capsule: cross-principal fan-in
+        // is untouched by the audit flip.
+        let rt = tokio::runtime::Handle::current();
+        let mut state = host_state_for(rt, "alice", false, &["astrid.v1.session.*"]);
+        let bus = state.event_bus.clone();
+
+        let sub = IpcHost::subscribe(&mut state, "astrid.v1.session.*".to_string())
+            .expect("subscribe should be allowed by the ACL");
+
+        // Publish session events from two principals.
+        for who in ["alice", "bob"] {
+            let msg = InternalIpcMessage::new(
+                "astrid.v1.session.update",
+                IpcPayload::RawJson(serde_json::json!({})),
+                uuid::Uuid::nil(),
+            )
+            .with_principal(who.to_string());
+            bus.publish(AstridEvent::Ipc {
+                metadata: EventMetadata::new("test"),
+                message: msg,
+            });
+        }
+
+        let got = drained_principals(&mut state, &sub);
+        assert_eq!(got.len(), 2, "non-audit fan-in delivers all principals");
+        assert!(got.iter().any(|p| p == "alice"));
+        assert!(got.iter().any(|p| p == "bob"));
     }
 }
