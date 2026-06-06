@@ -3,18 +3,6 @@ use std::io;
 
 use super::{ProcessSandboxConfig, SandboxPrefix, validate_sandbox_str};
 
-/// Returns the Darwin kernel major version (e.g. 25 for macOS 15 Sequoia).
-/// Used to detect macOS 15+ where `sandbox-exec` is deprecated.
-pub(super) fn darwin_major_version() -> u32 {
-    std::process::Command::new("uname")
-        .arg("-r")
-        .output()
-        .ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .and_then(|s| s.split('.').next()?.parse().ok())
-        .unwrap_or(0)
-}
-
 impl ProcessSandboxConfig {
     pub(super) fn build_seatbelt_prefix(&self) -> io::Result<SandboxPrefix> {
         let writable_root_str = validate_sandbox_str(&self.writable_root, "writable root")?;
@@ -184,6 +172,93 @@ mod tests {
         assert!(
             !profile.contains(r#"(deny file-write* (subpath "/Users/testuser/.astrid"))"#),
             "should NOT deny file-write for hidden path that is ancestor of writable root"
+        );
+    }
+
+    /// Locate a `node` binary for the enforcement test, or `None` to skip.
+    #[cfg(target_os = "macos")]
+    fn which_node() -> Option<std::path::PathBuf> {
+        let out = std::process::Command::new("/usr/bin/which")
+            .arg("node")
+            .output()
+            .ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        let path = String::from_utf8(out.stdout).ok()?.trim().to_string();
+        (!path.is_empty()).then(|| std::path::PathBuf::from(path))
+    }
+
+    /// Probe whether `sandbox-exec` can actually apply a profile here. Returns
+    /// false inside a nested sandbox (CI, or an outer `sandbox-exec`) where
+    /// `sandbox_apply` is denied, so the enforcement test skips rather than
+    /// reporting a false failure for an environment constraint.
+    #[cfg(target_os = "macos")]
+    fn sandbox_exec_can_apply() -> bool {
+        std::process::Command::new("sandbox-exec")
+            .args(["-p", "(version 1)(allow default)", "/usr/bin/true"])
+            .status()
+            .is_ok_and(|s| s.success())
+    }
+
+    /// End-to-end Seatbelt enforcement (#855 regression). The generated
+    /// profile must let a real dynamically-linked binary (`node`) start, and
+    /// the *same* profile with the root-read rule stripped must fail closed —
+    /// the SIGABRT that the removed macOS-15+ version guard used to mask. This
+    /// proves both that `sandbox-exec` still enforces on current macOS and that
+    /// `(literal "/")` is the load-bearing rule. Skipped when `node` is absent
+    /// so it never fails a host that simply lacks node; macOS-only.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn seatbelt_root_read_is_load_bearing_for_real_binary() {
+        if !sandbox_exec_can_apply() {
+            eprintln!(
+                "sandbox-exec cannot apply a profile in this environment \
+                 (nested sandbox?); skipping Seatbelt enforcement test"
+            );
+            return;
+        }
+        let Some(node) = which_node() else {
+            eprintln!("node not found on PATH; skipping Seatbelt enforcement test");
+            return;
+        };
+
+        let prefix = ProcessSandboxConfig::new("/tmp")
+            .build_seatbelt_prefix()
+            .unwrap();
+        let profile = prefix.args[1].to_string_lossy().to_string();
+        assert!(
+            profile.contains(r#"(literal "/")"#),
+            "the shared profile must carry the root-read rule"
+        );
+
+        // T1: under the real profile, node starts and runs to completion.
+        let status = std::process::Command::new(&prefix.program)
+            .args(&prefix.args)
+            .arg(&node)
+            .args(["-e", "process.stdout.write(\"ran\")"])
+            .status()
+            .expect("spawn sandbox-exec");
+        assert!(
+            status.success(),
+            "node must run under the shared Seatbelt profile (got {status:?})"
+        );
+
+        // T3 contrast: strip the root-read rule and the same binary fails
+        // closed instead of launching unsandboxed. `(literal "/")` is not a
+        // substring of `(literal "/dev/null")`, so only the root rule is
+        // removed.
+        let broken = profile.replace(r#"(literal "/")"#, "");
+        let status = std::process::Command::new("sandbox-exec")
+            .args(["-p", &broken])
+            .arg(&node)
+            .args(["-e", "process.stdout.write(\"ran\")"])
+            .status()
+            .expect("spawn sandbox-exec");
+        assert!(
+            !status.success(),
+            "without (literal \"/\") the profile must fail closed — node should \
+             abort, not run (got {status:?})"
         );
     }
 }
