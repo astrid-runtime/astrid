@@ -126,8 +126,8 @@ impl CapsuleManifest {
 
     /// IPC publish ACL patterns the kernel enforces against this capsule —
     /// the keys of the `[publish]` table. An empty list means the capsule may
-    /// not publish to any topic (fail-closed). Returned vector preserves the
-    /// table's discovery order.
+    /// not publish to any topic (fail-closed). The order of the returned vector
+    /// is unspecified, since the backing `[publish]` table is a `HashMap`.
     #[must_use]
     pub fn effective_ipc_publish_patterns(&self) -> Vec<String> {
         self.publishes.keys().cloned().collect()
@@ -147,8 +147,11 @@ impl CapsuleManifest {
     /// order (lower fires first; `None` means the default, 100).
     ///
     /// This is the single interceptor-binding form — the legacy
-    /// `[[interceptor]]` block was removed (see #858); a manifest still
-    /// carrying one is rejected at load.
+    /// `[[interceptor]]` block was removed (see #858). The manifest does not set
+    /// `deny_unknown_fields`, so a stray `[[interceptor]]` table is an unknown
+    /// field that is silently ignored rather than rejected at load: it simply
+    /// has no effect. Capsule authors must migrate any such bindings to
+    /// `[subscribe]` entries that carry a `handler`.
     #[must_use]
     pub fn effective_interceptors(&self) -> Vec<InterceptorDef> {
         self.subscribes

@@ -69,6 +69,22 @@ impl SchemaCatalog {
                     .map(|(topic, def)| (topic, &def.wit)),
             );
         for (topic, wit_ref) in entries {
+            if let Some(prev) = schemas.get(topic) {
+                // A topic in both `[publish]` and `[subscribe]` is fine when
+                // both carry the same payload contract (the bus record is
+                // identical either direction). Differing refs are a manifest
+                // authoring mistake the silent overwrite would otherwise hide.
+                if &prev.wit_ref != wit_ref {
+                    tracing::warn!(
+                        capsule = %capsule_id,
+                        topic = %topic,
+                        publish_wit = %prev.wit_ref,
+                        subscribe_wit = %wit_ref,
+                        "topic declared in both [publish] and [subscribe] with \
+                         conflicting wit refs; keeping the [subscribe] ref"
+                    );
+                }
+            }
             schemas.insert(
                 topic.clone(),
                 TopicSchema {

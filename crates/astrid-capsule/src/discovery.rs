@@ -246,18 +246,22 @@ pub fn load_manifest(path: &Path) -> CapsuleResult<CapsuleManifest> {
         });
     }
 
-    // Validate publish + interceptor patterns for empty segments. Both are
-    // resolved from the `[publish]` / `[subscribe]` tables.
-    let effective_publishes = manifest.effective_ipc_publish_patterns();
-    let effective_interceptors = manifest.effective_interceptors();
-    let publish_patterns = effective_publishes
-        .iter()
+    // Validate publish + subscribe patterns for empty segments. Both are the
+    // keys of the `[publish]` / `[subscribe]` tables. The subscribe set is ALL
+    // `[subscribe]` keys (handler-less ACL-only entries included), since every
+    // key installs a `check_subscribe_acl` pattern; interceptor event patterns
+    // are a subset of these keys, so they are covered here too. Borrow the keys
+    // directly — no `effective_*` Vec allocation, the loop only reads them.
+    let publish_patterns = manifest
+        .publishes
+        .keys()
         .map(|p| ("publish pattern", p.as_str()));
-    let interceptor_patterns = effective_interceptors
-        .iter()
-        .map(|i| ("interceptor event pattern", i.event.as_str()));
+    let subscribe_patterns = manifest
+        .subscribes
+        .keys()
+        .map(|p| ("subscribe pattern", p.as_str()));
 
-    for (kind, pattern) in publish_patterns.chain(interceptor_patterns) {
+    for (kind, pattern) in publish_patterns.chain(subscribe_patterns) {
         if !crate::topic::has_valid_segments(pattern) {
             return Err(CapsuleError::ManifestParseError {
                 path: path.to_path_buf(),
@@ -354,6 +358,23 @@ version = "0.1.0"
             "{VALID_HEADER}\n[subscribe]\n\"user.prompt\" = {{ wit = \"x\", handler = \"handle\" }}"
         );
         assert!(load_from_toml(&toml).is_ok());
+    }
+
+    #[test]
+    fn load_manifest_rejects_empty_segment_in_handlerless_subscribe() {
+        // ACL-only `[subscribe]` entries (no handler) still install
+        // `ipc_subscribe_patterns` matched by `check_subscribe_acl`, so their
+        // keys must be validated for empty segments too — not just the
+        // handler-bearing (interceptor) ones.
+        for bad in &["a..b", ".event", "event.", "", ".", "a...b"] {
+            let toml = format!("{VALID_HEADER}\n[subscribe]\n\"{bad}\" = {{ wit = \"opaque\" }}");
+            let err = load_from_toml(&toml).unwrap_err();
+            let msg = err.to_string();
+            assert!(
+                msg.contains("empty segments"),
+                "expected 'empty segments' error for subscribe key '{bad}', got: {msg}"
+            );
+        }
     }
 
     #[test]
