@@ -359,13 +359,16 @@ impl ipc::Host for HostState {
         // (which also keys on the JSON `principal` == caller). The
         // target-principal axis ("all audit about me") is a separate, future
         // (Phase 2) concern.
-        let scope: Option<astrid_events::PrincipalKey> =
-            if pattern_covers_audit(&topic_pattern) && !self.audit_firehose {
-                Some(Some(self.principal.to_string()))
-            } else {
-                None
-            };
-        if pattern_covers_audit(&topic_pattern) {
+        // `pattern_covers_audit` recompiles the matcher and rebuilds a
+        // synthetic probe event, so evaluate it once and reuse for both the
+        // scope decision and the audit log line.
+        let covers_audit = pattern_covers_audit(&topic_pattern);
+        let scope: Option<astrid_events::PrincipalKey> = if covers_audit && !self.audit_firehose {
+            Some(Some(self.principal.to_string()))
+        } else {
+            None
+        };
+        if covers_audit {
             tracing::info!(
                 target: "astrid.audit.ipc",
                 security_event = true,
