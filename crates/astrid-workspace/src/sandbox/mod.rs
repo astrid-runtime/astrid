@@ -59,13 +59,7 @@ impl SandboxCommand {
     /// Returns an error if the worktree path is not absolute, not valid UTF-8,
     /// or contains characters unsafe for SBPL interpolation (double-quote,
     /// backslash, or null byte).
-    ///
-    /// # Panics
-    ///
-    /// Panics on macOS if `validate_sandbox_str` passes but the path is not
-    /// valid UTF-8. This is unreachable because the validation rejects
-    /// non-UTF-8 paths.
-    #[allow(clippy::needless_pass_by_value)] // Consumed on macOS early return, borrowed on Linux bwrap
+    #[allow(clippy::needless_pass_by_value)] // Moved on the unsupported-OS passthrough arm; borrowed on Linux/macOS.
     pub fn wrap(inner_cmd: Command, worktree_path: &Path) -> io::Result<Command> {
         // Validate on all platforms for defense in depth and API consistency.
         // On macOS the validated string is needed for SBPL interpolation.
@@ -111,61 +105,30 @@ impl SandboxCommand {
 
         #[cfg(target_os = "macos")]
         {
-            // sandbox-exec (Seatbelt) is deprecated on macOS 15+ (Darwin >= 24).
-            if seatbelt::darwin_major_version() >= 24 {
-                tracing::warn!(
-                    "macOS 15+ detected: sandbox-exec is deprecated. Running host process unsandboxed."
-                );
-                return Ok(inner_cmd);
-            }
+            // Route through the shared Seatbelt profile builder so this path
+            // and the MCP spawn path (`ProcessSandboxConfig::sandbox_prefix`)
+            // generate one identical profile instead of two divergent ones.
+            // `build_seatbelt_prefix` carries the `(allow mach*)` and
+            // `(allow file-read* (literal "/"))` rules a dynamically-linked
+            // binary such as `node` needs to stat the filesystem root at
+            // startup. The inline profile that used to live here omitted the
+            // root-read rule, so Seatbelt correctly aborted such a process
+            // with SIGABRT — a fail-closed signal that was then mistaken for a
+            // macOS-15+ `sandbox-exec` incompatibility and papered over by
+            // disabling the sandbox entirely. `sandbox-exec` is deprecated but
+            // still enforces on current macOS. See #855.
+            let prefix = ProcessSandboxConfig::new(worktree_path).build_seatbelt_prefix()?;
 
-            // Safe: validate_sandbox_str above confirmed valid UTF-8.
-            let worktree_str = worktree_path
-                .to_str()
-                .expect("unreachable: validated UTF-8 above");
+            let mut sb_cmd = Command::new(&prefix.program);
+            sb_cmd.args(&prefix.args);
 
-            // macOS Seatbelt implementation
-            // Deny all writes except to the worktree and /tmp.
-            // Restrict reads to system directories, the worktree, and tmp to protect user dotfiles.
-            let profile = format!(
-                r#"(version 1)
-(deny default)
-(allow process-exec*)
-(allow process-fork)
-(allow network*)
-(allow sysctl-read)
-(allow ipc-posix-shm)
-(allow file-read*
-    (subpath "/usr")
-    (subpath "/bin")
-    (subpath "/sbin")
-    (subpath "/System")
-    (subpath "/Library")
-    (subpath "/opt")
-    (subpath "/dev")
-    (subpath "{worktree_str}")
-    (subpath "/private/tmp")
-    (subpath "/var/folders")
-)
-(allow file-write*
-    (subpath "{worktree_str}")
-    (subpath "/private/tmp")
-    (subpath "/var/folders")
-    (literal "/dev/null")
-)"#
-            );
-
-            // Pass profile inline via -p to avoid temp-file leaks and TOCTOU races.
-            let mut sb_cmd = Command::new("sandbox-exec");
-            sb_cmd.arg("-p").arg(&profile);
-
-            // Extract original
+            // Append the original program and its arguments.
             sb_cmd.arg(inner_cmd.get_program());
             for arg in inner_cmd.get_args() {
                 sb_cmd.arg(arg);
             }
 
-            // Inherit env and dir
+            // Inherit env and working directory from the original command.
             for (k, v) in inner_cmd.get_envs() {
                 if let Some(v) = v {
                     sb_cmd.env(k, v);
@@ -657,26 +620,36 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn wrap_uses_inline_profile() {
+    fn wrap_always_sandboxes_via_shared_profile() {
+        // Regression for #855: wrap() must always produce a `sandbox-exec`
+        // wrapped command — never a passthrough — on every macOS version, and
+        // the profile must carry the load-bearing root-read rule whose absence
+        // caused the SIGABRT that the old macOS-15+ version guard masked.
         let cmd = Command::new("echo");
         let path = PathBuf::from("/tmp/safe-workspace");
         let wrapped = SandboxCommand::wrap(cmd, &path).unwrap();
 
-        if super::seatbelt::darwin_major_version() >= 24 {
-            assert_eq!(
-                wrapped.get_program(),
-                "echo",
-                "on macOS 15+, command should pass through unwrapped"
-            );
-        } else {
-            let args: Vec<_> = wrapped.get_args().collect();
-            assert_eq!(args[0], "-p", "expected -p for inline profile delivery");
-            let profile = args[1].to_string_lossy();
-            assert!(
-                profile.contains("/tmp/safe-workspace"),
-                "profile should contain the worktree path"
-            );
-        }
+        assert_eq!(
+            wrapped.get_program(),
+            "sandbox-exec",
+            "wrap() must wrap the command in sandbox-exec, not pass it through"
+        );
+        let args: Vec<_> = wrapped.get_args().collect();
+        assert_eq!(args[0], "-p", "expected -p for inline profile delivery");
+        let profile = args[1].to_string_lossy();
+        assert!(
+            profile.contains("/tmp/safe-workspace"),
+            "profile should contain the worktree path"
+        );
+        assert!(
+            profile.contains(r#"(literal "/")"#),
+            "profile must allow reading the filesystem root — the rule whose \
+             absence caused the SIGABRT that #855's version guard masked"
+        );
+        assert!(
+            args.iter().any(|a| *a == "echo"),
+            "the wrapped command must still invoke the original program"
+        );
     }
 
     // --- ProcessSandboxConfig builder tests ---
