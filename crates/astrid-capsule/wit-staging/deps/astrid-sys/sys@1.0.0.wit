@@ -133,10 +133,39 @@ interface host {
     /// Audit: not recorded (read-only, no side effects).
     random-bytes: func(length: u64) -> result<list<u8>, error-code>;
 
-    /// Check whether a capsule has a specific manifest capability.
+    /// Check whether a capsule has a specific manifest capability — self or
+    /// any other capsule (by UUID). The per-name dual of
+    /// `enumerate-capabilities`.
     ///
     /// Fail-closed: returns `allowed: false` for unknown UUIDs and
     /// unknown capabilities. Returns `registry-unavailable` when the
-    /// registry itself can't be consulted.
+    /// registry itself can't be consulted. Ungated: capability posture is
+    /// structural metadata, not a secret (enforce-don't-conceal) — knowing a
+    /// capability conveys no ability to use it. Audit: not recorded.
     check-capsule-capability: func(request: capability-check-request) -> result<capability-check-response, error-code>;
+
+    /// Enumerate the CALLING capsule's OWN held capability NAMES — the
+    /// categories the kernel enforces at host-call time (e.g. `host_process`,
+    /// `net_connect`, `fs_read`), NOT the scoped arguments within them (a
+    /// `host_process` allowlist, `host:port`, paths). It is the list dual of
+    /// `check-capsule-capability`: the set of names for which a self-`check`
+    /// returns true.
+    ///
+    /// Argument-free — the kernel already knows the caller. The set is the
+    /// capsule's manifest-declared capabilities as the kernel registered them;
+    /// capsule capabilities are not revoked at runtime (the grant/revoke model
+    /// is principal-scoped, a separate axis), so "what I declared" and "what I
+    /// can do" coincide at the capsule level.
+    ///
+    /// Ungated, like `check-capsule-capability`: a capsule grounds its
+    /// behaviour in what it can actually do — a reusable supervisor binary
+    /// deployed under different manifests reads its real set instead of
+    /// hard-coding it; any capsule avoids code-vs-manifest drift by grounding
+    /// on the registered set. Audit: not recorded (read-only self-
+    /// introspection). See RFC: host_abi ("Capability introspection").
+    ///
+    /// Infallible: the kernel always knows the caller's own registered set, so
+    /// there is no failure mode (an empty list is the valid "no capabilities"
+    /// answer) — like `clock-ms` / `clock-monotonic-ns`, no `result` wrapper.
+    enumerate-capabilities: func() -> list<string>;
 }

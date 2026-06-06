@@ -297,6 +297,18 @@ pub struct HostState {
     /// Used to gate `astrid_register_uplink` — only uplink plugins
     /// are allowed to register uplinks.
     pub has_uplink_capability: bool,
+    /// The calling capsule's OWN held capability NAMES, precomputed at load
+    /// from `manifest.capabilities` via
+    /// [`CapabilitiesDef::held_names`](crate::manifest::CapabilitiesDef::held_names).
+    ///
+    /// Backs `astrid:sys/host.enumerate-capabilities`, which is **infallible**
+    /// — so it reads this owned, lock-free snapshot rather than the
+    /// `capsule_registry` (whose lookup can fail with `registry-unavailable`,
+    /// the failure mode `check-capsule-capability` carries but `enumerate`
+    /// must not). Capsule capabilities are fixed at load (the grant/revoke
+    /// model is principal-scoped, a separate axis), so a snapshot taken once
+    /// is correct for the capsule's whole lifetime and across the pool.
+    pub capability_names: Vec<String>,
     /// Whether this capsule's OWNER principal holds `audit:read_all`,
     /// resolved at LOAD the PRIVILEGED way (against the profile cache +
     /// live group config — **not** the manifest, unlike

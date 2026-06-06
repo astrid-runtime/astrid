@@ -111,6 +111,7 @@ pub(crate) fn minimal_host_state(rt: tokio::runtime::Handle) -> HostState {
         capsule_registry: None,
         runtime_handle: rt.clone(),
         has_uplink_capability: false,
+        capability_names: Vec::new(),
         audit_firehose: false,
         inbound_tx: None,
         registered_uplinks: Vec::new(),

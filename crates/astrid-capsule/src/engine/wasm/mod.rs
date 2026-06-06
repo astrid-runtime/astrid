@@ -1175,6 +1175,10 @@ impl ExecutionEngine for WasmEngine {
             };
             // `[capabilities].uplink` bit (binds a socket), gating ipc-publish-as.
             let has_uplink = manifest.capabilities.uplink;
+            // Snapshot of the capsule's held capability names, fixed at load —
+            // backs the infallible `enumerate-capabilities` host fn. Cloned per
+            // pooled instance inside the `make_state` closure below.
+            let capability_names = manifest.capabilities.held_names();
             // One IPC rate limiter shared by every pooled instance, so the
             // per-capsule throughput budget is not multiplied by pool size.
             let ipc_limiter = Arc::new(astrid_events::ipc::IpcRateLimiter::new());
@@ -1343,6 +1347,7 @@ impl ExecutionEngine for WasmEngine {
                 capsule_registry: st_capsule_registry.clone(),
                 runtime_handle: tokio::runtime::Handle::current(),
                 has_uplink_capability: has_uplink,
+                capability_names: capability_names.clone(),
                 audit_firehose,
                 inbound_tx: tx.clone(),
                 registered_uplinks: Vec::new(),
@@ -2354,6 +2359,11 @@ pub async fn run_lifecycle(
         capsule_registry: None,
         runtime_handle: tokio::runtime::Handle::current(),
         has_uplink_capability: false,
+        // Lifecycle hooks run a restricted, short-lived context and the
+        // manifest capabilities are not plumbed into `LifecycleConfig`;
+        // capability introspection is not exposed here (matches the
+        // hard-coded `has_uplink_capability: false` above). Fail-closed.
+        capability_names: Vec::new(),
         // Lifecycle hooks never subscribe to the audit feed; fail-secure.
         audit_firehose: false,
         inbound_tx: None,
