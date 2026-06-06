@@ -246,19 +246,18 @@ pub fn load_manifest(path: &Path) -> CapsuleResult<CapsuleManifest> {
         });
     }
 
-    // Validate ipc_publish and interceptor patterns for empty segments.
-    // Interceptor bindings are resolved from `[subscribe]` handler entries.
+    // Validate publish + interceptor patterns for empty segments. Both are
+    // resolved from the `[publish]` / `[subscribe]` tables.
+    let effective_publishes = manifest.effective_ipc_publish_patterns();
     let effective_interceptors = manifest.effective_interceptors();
-    let ipc_patterns = manifest
-        .capabilities
-        .ipc_publish
+    let publish_patterns = effective_publishes
         .iter()
-        .map(|p| ("ipc_publish pattern", p.as_str()));
+        .map(|p| ("publish pattern", p.as_str()));
     let interceptor_patterns = effective_interceptors
         .iter()
         .map(|i| ("interceptor event pattern", i.event.as_str()));
 
-    for (kind, pattern) in ipc_patterns.chain(interceptor_patterns) {
+    for (kind, pattern) in publish_patterns.chain(interceptor_patterns) {
         if !crate::topic::has_valid_segments(pattern) {
             return Err(CapsuleError::ManifestParseError {
                 path: path.to_path_buf(),
@@ -425,9 +424,9 @@ version = "0.1.0"
     }
 
     #[test]
-    fn load_manifest_rejects_empty_segment_in_ipc_publish() {
+    fn load_manifest_rejects_empty_segment_in_publish_pattern() {
         for bad in &["a..b", ".a.b", "a.b.", "", ".", "a...b"] {
-            let toml = format!("{VALID_HEADER}\n[capabilities]\nipc_publish = [\"{bad}\"]");
+            let toml = format!("{VALID_HEADER}\n[publish]\n\"{bad}\" = {{ wit = \"opaque\" }}");
             let err = load_from_toml(&toml).unwrap_err();
             let msg = err.to_string();
             assert!(

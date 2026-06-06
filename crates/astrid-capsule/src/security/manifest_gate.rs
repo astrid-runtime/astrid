@@ -370,8 +370,6 @@ mod tests {
                 fs_write: fs_write.into_iter().map(String::from).collect(),
                 host_process: vec![],
                 uplink: false,
-                ipc_publish: vec![],
-                ipc_subscribe: vec![],
                 identity: vec![],
                 allow_prompt_injection: false,
             },

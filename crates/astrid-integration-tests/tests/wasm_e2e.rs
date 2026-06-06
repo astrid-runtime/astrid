@@ -67,8 +67,6 @@ async fn setup_test_capsule(
             fs_write: fs_write_caps,
             host_process: vec![],
             uplink: false,
-            ipc_publish: vec![],
-            ipc_subscribe: vec!["test.*".into()],
             identity: vec![],
             allow_prompt_injection: false,
         },
@@ -80,7 +78,22 @@ async fn setup_test_capsule(
         uplinks: vec![],
         topics: vec![],
         publishes: ::std::collections::HashMap::new(),
-        subscribes: ::std::collections::HashMap::new(),
+        // Subscribe ACL: the `[subscribe]` keys are the only IPC-subscribe
+        // declaration (the legacy `ipc_subscribe` array is gone). A handler-less
+        // `wit = "opaque"` entry is ACL-only.
+        subscribes: ::std::collections::HashMap::from([(
+            "test.*".to_string(),
+            astrid_capsule::manifest::SubscribeDef {
+                wit: "opaque".to_string(),
+                version: None,
+                tag: None,
+                rev: None,
+                branch: None,
+                path: None,
+                handler: None,
+                priority: None,
+            },
+        )]),
         tools: ::std::vec::Vec::new(),
     };
 
@@ -177,8 +190,6 @@ async fn setup_test_capsule_with_home(
             fs_write: fs_write_caps,
             host_process: vec![],
             uplink: false,
-            ipc_publish: vec![],
-            ipc_subscribe: vec![],
             identity: vec![],
             allow_prompt_injection: false,
         },

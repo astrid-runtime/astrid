@@ -52,16 +52,17 @@ pub struct CapsuleManifest {
     ///
     /// Each entry is keyed by the topic name (or wildcard pattern) and carries
     /// the typed WIT payload reference plus optional source pinning. The keys
-    /// also serve as the IPC publish ACL — when this map is non-empty, it
-    /// supersedes `capabilities.ipc_publish`.
+    /// are the IPC publish ACL — the only way a capsule declares what it may
+    /// publish (an empty table = may not publish, fail-closed).
     #[serde(default, rename = "publish")]
     pub publishes: HashMap<String, PublishDef>,
     /// Topics this capsule subscribes to (RFC: cargo-like-manifest).
     ///
     /// Same shape as `publishes`. An entry with a `handler = "..."` field (and
     /// optional `priority`) binds the topic to a `#[astrid::interceptor("...")]`
-    /// export — the single interceptor-binding form. Keys also serve as the
-    /// IPC subscribe ACL when non-empty.
+    /// export — the single interceptor-binding form. An entry without a handler
+    /// is ACL-only (use `wit = "opaque"` for an untyped proxy subscription). The
+    /// keys are the IPC subscribe ACL (an empty table = may not subscribe).
     #[serde(default, rename = "subscribe")]
     pub subscribes: HashMap<String, SubscribeDef>,
     /// Tools this capsule surfaces to the LLM (RFC: cargo-like-manifest).
@@ -127,31 +128,21 @@ impl CapsuleManifest {
         })
     }
 
-    /// IPC publish ACL patterns the kernel should enforce against this capsule.
-    ///
-    /// New manifests (RFC cargo-like-manifest) declare publishes as keys in
-    /// the `[publish]` table; legacy manifests use `capabilities.ipc_publish`.
-    /// The new format takes precedence when present so operators never
-    /// double-declare. Returned vector preserves discovery order — the keys
-    /// of the table for new manifests, the array order for legacy.
+    /// IPC publish ACL patterns the kernel enforces against this capsule —
+    /// the keys of the `[publish]` table. An empty list means the capsule may
+    /// not publish to any topic (fail-closed). Returned vector preserves the
+    /// table's discovery order.
     #[must_use]
     pub fn effective_ipc_publish_patterns(&self) -> Vec<String> {
-        if self.publishes.is_empty() {
-            self.capabilities.ipc_publish.clone()
-        } else {
-            self.publishes.keys().cloned().collect()
-        }
+        self.publishes.keys().cloned().collect()
     }
 
-    /// IPC subscribe ACL patterns. Same precedence rule as
-    /// [`effective_ipc_publish_patterns`].
+    /// IPC subscribe ACL patterns — the keys of the `[subscribe]` table. An
+    /// empty list means the capsule may not subscribe to any topic
+    /// (fail-closed).
     #[must_use]
     pub fn effective_ipc_subscribe_patterns(&self) -> Vec<String> {
-        if self.subscribes.is_empty() {
-            self.capabilities.ipc_subscribe.clone()
-        } else {
-            self.subscribes.keys().cloned().collect()
-        }
+        self.subscribes.keys().cloned().collect()
     }
 
     /// Interceptor bindings declared in `[subscribe]`: every entry that

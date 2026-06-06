@@ -45,34 +45,6 @@ pub struct CapabilitiesDef {
     /// check passes.
     #[serde(default)]
     pub net_connect: Vec<String>,
-    /// IPC topic patterns this capsule is allowed to publish to.
-    ///
-    /// Supports exact matches and `*` wildcards per segment
-    /// (e.g. `registry.*`, `llm.stream.anthropic`).
-    /// An empty list means the capsule may NOT publish to any topic
-    /// (fail-closed). Capsules must explicitly declare at least one
-    /// pattern to be allowed to publish.
-    #[serde(default)]
-    pub ipc_publish: Vec<String>,
-    /// IPC topic patterns this capsule is allowed to subscribe to.
-    ///
-    /// Uses the same matching semantics as `ipc_publish`: exact matches
-    /// and `*` wildcards per segment, with segment counts required to
-    /// match. An empty list means the capsule may NOT subscribe to any
-    /// topic (fail-closed).
-    ///
-    /// Note: the ACL gates the subscription *pattern string*, not
-    /// individual messages. The ACL uses `topic_matches` semantics
-    /// (single-segment `*`, equal segment count required), but the
-    /// `EventBus` delivers events using `EventReceiver::matches` where
-    /// a trailing `*` matches one or more segments. This means
-    /// `ipc_subscribe = ["foo.v1.*"]` authorizes subscribing to the
-    /// pattern `"foo.v1.*"`, which the EventBus will use to deliver
-    /// events at any depth under `foo.v1.` - not just single-segment.
-    /// Per-message ACL checking would be O(n) per delivery and is
-    /// architecturally wrong for a broadcast bus.
-    #[serde(default)]
-    pub ipc_subscribe: Vec<String>,
     /// Identity operations this capsule is allowed to perform.
     ///
     /// Valid values: `"resolve"` (read-only lookups), `"link"` (create/delete

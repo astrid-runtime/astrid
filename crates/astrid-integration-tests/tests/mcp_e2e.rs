@@ -42,8 +42,6 @@ async fn test_mcp_host_engine_capability_validation() {
             fs_write: vec![],
             host_process: vec!["npx".into()], // Only "npx" is allowed
             uplink: false,
-            ipc_publish: vec![],
-            ipc_subscribe: vec![],
             identity: vec![],
             allow_prompt_injection: false,
         },
