@@ -58,7 +58,6 @@ mod tests {
             skills: vec![],
             commands: vec![],
             uplinks: vec![],
-            topics: vec![],
             publishes: ::std::collections::HashMap::new(),
             subscribes: ::std::collections::HashMap::new(),
             tools: ::std::vec::Vec::new(),

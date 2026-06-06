@@ -79,7 +79,6 @@ impl MockCapsule {
             mcp_servers: Vec::new(),
             skills: Vec::new(),
             uplinks: Vec::new(),
-            topics: Vec::new(),
             publishes: ::std::collections::HashMap::new(),
             // Interceptor binding = a [subscribe] entry with a handler (and
             // priority). effective_interceptors() resolves this to the same

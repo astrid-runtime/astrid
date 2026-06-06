@@ -76,7 +76,6 @@ async fn setup_test_capsule(
         mcp_servers: vec![],
         skills: vec![],
         uplinks: vec![],
-        topics: vec![],
         publishes: ::std::collections::HashMap::new(),
         // Subscribe ACL: the `[subscribe]` keys are the only IPC-subscribe
         // declaration (the legacy `ipc_subscribe` array is gone). A handler-less
@@ -199,7 +198,6 @@ async fn setup_test_capsule_with_home(
         mcp_servers: vec![],
         skills: vec![],
         uplinks: vec![],
-        topics: vec![],
         publishes: ::std::collections::HashMap::new(),
         subscribes: ::std::collections::HashMap::new(),
         tools: ::std::vec::Vec::new(),

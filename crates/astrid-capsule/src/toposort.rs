@@ -230,7 +230,6 @@ mod tests {
             mcp_servers: Vec::new(),
             skills: Vec::new(),
             uplinks: Vec::new(),
-            topics: Vec::new(),
             publishes: ::std::collections::HashMap::new(),
             subscribes: ::std::collections::HashMap::new(),
             tools: ::std::vec::Vec::new(),

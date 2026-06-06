@@ -5,7 +5,6 @@
 //! loaded from disk during capsule discovery.
 
 use std::collections::HashMap;
-use std::fmt;
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
@@ -92,9 +91,6 @@ pub struct CapsuleManifest {
     /// Uplinks this capsule provides (e.g. Telegram, CLI).
     #[serde(default, rename = "uplink")]
     pub uplinks: Vec<UplinkDef>,
-    /// Topic API declarations describing the payload shape of IPC topics.
-    #[serde(default, rename = "topic")]
-    pub topics: Vec<TopicDef>,
 }
 
 impl CapsuleManifest {
@@ -561,53 +557,6 @@ pub struct InterceptorDef {
 /// Default interceptor priority.
 const fn default_interceptor_priority() -> u32 {
     100
-}
-
-/// Direction a capsule interacts with an IPC topic.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum TopicDirection {
-    /// The capsule publishes messages to this topic.
-    Publish,
-    /// The capsule subscribes to messages on this topic.
-    Subscribe,
-}
-
-impl fmt::Display for TopicDirection {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Publish => f.write_str("publish"),
-            Self::Subscribe => f.write_str("subscribe"),
-        }
-    }
-}
-
-/// A topic API declaration describing the payload shape of an IPC topic.
-///
-/// Capsules declare each published or subscribed topic with an optional
-/// JSON Schema file or a reference to a WIT record type. At install time,
-/// the schema is baked into `meta.json` for tooling and A2UI consumption.
-///
-/// If both `schema` and `wit_type` are set, `wit_type` takes precedence.
-///
-/// **Legacy**: superseded by `[publish]` / `[subscribe]` tables in the
-/// cargo-like manifest schema (RFC). Retained so legacy manifests parse
-/// unchanged during the migration window.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TopicDef {
-    /// The concrete topic name (e.g. `"llm.v1.response.chunk.anthropic"`).
-    /// Wildcards are not permitted; topic declarations must be concrete API contracts.
-    pub name: String,
-    /// Whether the capsule publishes or subscribes to this topic.
-    pub direction: TopicDirection,
-    /// Human-readable description of the topic's purpose.
-    pub description: Option<String>,
-    /// Path to a JSON Schema file (relative to the capsule directory).
-    pub schema: Option<PathBuf>,
-    /// Name of a WIT record type (kebab-case) defined in the capsule's `wit/` directory.
-    /// At install time, the record is parsed from WIT and converted to JSON Schema
-    /// with field descriptions from `///` doc comments.
-    pub wit_type: Option<String>,
 }
 
 /// A tool this capsule surfaces to the LLM (RFC: cargo-like-manifest).

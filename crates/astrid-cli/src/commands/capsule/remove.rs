@@ -181,7 +181,6 @@ mod tests {
             source: None,
             exports: export_map,
             imports: import_map,
-            topics: vec![],
             wasm_hash: hash.map(String::from),
             wit_files: std::collections::HashMap::new(),
         }
