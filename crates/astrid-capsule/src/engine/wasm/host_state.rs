@@ -402,6 +402,14 @@ pub struct HostState {
     /// registers/unregisters PIDs; the listener calls `cancel_all()` when a
     /// `tool.v1.request.cancel` event arrives.
     pub process_tracker: Arc<ProcessTracker>,
+    /// Host-owned registry for the PERSISTENT tier of `astrid:process`.
+    ///
+    /// Cloned (`Arc`) into every pooled `HostState` of a capsule exactly like
+    /// `process_tracker`, so a `process-id` minted on one instance is
+    /// reattachable from another after a pool reset. Persistent children live
+    /// here — off the wasmtime resource table — which is what lets them
+    /// survive instance churn.
+    pub persistent_processes: Arc<crate::engine::wasm::host::process::PersistentProcessRegistry>,
     /// Live count of `NetStream` entries currently in the resource table.
     /// Maintained alongside `ResourceTable` insertions / drops so the
     /// `MAX_ACTIVE_STREAMS` gate is O(1) instead of iterating every
@@ -780,6 +788,7 @@ impl std::fmt::Debug for HostState {
             .field("has_identity_store", &self.identity_store.is_some())
             .field("active_http_streams", &self.active_http_streams.len())
             .field("process_tracker", &self.process_tracker)
+            .field("persistent_processes", &self.persistent_processes)
             .finish_non_exhaustive()
     }
 }

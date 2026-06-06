@@ -364,6 +364,13 @@ impl WasmHandler {
             process_tracker: Arc::new(
                 astrid_capsule::engine::wasm::host::process::ProcessTracker::new(),
             ),
+            // Hooks never spawn persistent processes; a throwaway registry
+            // satisfies the field (reaped when this state drops).
+            persistent_processes: Arc::new(
+                astrid_capsule::engine::wasm::host::process::PersistentProcessRegistry::new(
+                    tokio::runtime::Handle::current(),
+                ),
+            ),
             net_stream_count: 0,
             subscription_count: 0,
             process_count_total: 0,

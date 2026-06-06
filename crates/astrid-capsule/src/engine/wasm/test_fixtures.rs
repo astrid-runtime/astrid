@@ -109,7 +109,7 @@ pub(crate) fn minimal_host_state(rt: tokio::runtime::Handle) -> HostState {
         security: None,
         hook_manager: None,
         capsule_registry: None,
-        runtime_handle: rt,
+        runtime_handle: rt.clone(),
         has_uplink_capability: false,
         audit_firehose: false,
         inbound_tx: None,
@@ -128,6 +128,9 @@ pub(crate) fn minimal_host_state(rt: tokio::runtime::Handle) -> HostState {
         allowance_store: None,
         identity_store: None,
         process_tracker: Arc::new(ProcessTracker::new()),
+        persistent_processes: Arc::new(
+            crate::engine::wasm::host::process::PersistentProcessRegistry::new(rt),
+        ),
         net_stream_count: 0,
         subscription_count: 0,
         process_count_total: 0,
