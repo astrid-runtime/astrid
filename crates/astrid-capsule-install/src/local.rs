@@ -15,18 +15,17 @@
 //! 2. Check export conflicts (advisory).
 //! 3. Hash WASM at source → `bin/<hash>.wasm`.
 //! 4. Hash WIT at source → `wit/<hash>.wit`.
-//! 5. Bake topic schemas from source.
 //!
 //! If any of those fail we haven't touched `target_dir` and the
 //! existing install is intact. Only then do we:
 //!
-//! 6. Backup existing `target_dir` (rename to `.bak`).
-//! 7. Copy non-WASM tree → `target_dir` (excludes `*.wasm` and
+//! 5. Backup existing `target_dir` (rename to `.bak`).
+//! 6. Copy non-WASM tree → `target_dir` (excludes `*.wasm` and
 //!    `wit/`).
-//! 8. Restore `.env.json` from the backup if present.
-//! 9. Run lifecycle hook with bytes from `bin/`.
-//! 10. Write `meta.json`.
-//! 11. Cleanup backup.
+//! 7. Restore `.env.json` from the backup if present.
+//! 8. Run lifecycle hook with bytes from `bin/`.
+//! 9. Write `meta.json`.
+//! 10. Cleanup backup.
 //!
 //! Failure after step 6 restores the backup over `target_dir`.
 
@@ -45,7 +44,6 @@ use crate::manifest_check::{
 };
 use crate::meta::{CapsuleMeta, read_meta, write_meta};
 use crate::paths::{resolve_env_path, resolve_target_dir, restore_env_from_backup};
-use crate::topics::bake_topics;
 use crate::wasm::{WasmAddressed, content_address_wasm};
 use crate::wit::{content_address_wit, version_map_to_strings};
 
@@ -178,8 +176,6 @@ pub fn install_from_local_path(
         .context("failed to content-address WASM binary")?;
     let wit_files =
         content_address_wit(home, source_dir).context("failed to content-address WIT files")?;
-    let baked_topics =
-        bake_topics(&manifest, source_dir).context("failed to bake topic schemas")?;
 
     // Backup the existing install (rename to .bak). Any failure from
     // this point onward must restore the backup over target_dir.
@@ -242,7 +238,6 @@ pub fn install_from_local_path(
             .or_else(|| existing_meta.and_then(|m| m.source)),
         imports: version_map_to_strings(&manifest.imports, |d| d.version.to_string()),
         exports: version_map_to_strings(&manifest.exports, |d| d.version.to_string()),
-        topics: baked_topics,
         wasm_hash: wasm.as_ref().map(|w: &WasmAddressed| w.hash.clone()),
         wit_files,
     };

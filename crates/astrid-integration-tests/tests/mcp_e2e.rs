@@ -42,8 +42,6 @@ async fn test_mcp_host_engine_capability_validation() {
             fs_write: vec![],
             host_process: vec!["npx".into()], // Only "npx" is allowed
             uplink: false,
-            ipc_publish: vec![],
-            ipc_subscribe: vec![],
             identity: vec![],
             allow_prompt_injection: false,
         },
@@ -59,8 +57,6 @@ async fn test_mcp_host_engine_capability_validation() {
         }],
         skills: vec![],
         uplinks: vec![],
-        interceptors: vec![],
-        topics: vec![],
         publishes: ::std::collections::HashMap::new(),
         subscribes: ::std::collections::HashMap::new(),
         tools: ::std::vec::Vec::new(),

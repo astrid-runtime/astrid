@@ -109,7 +109,6 @@ fn print_verbose(capsules: &[super::meta::InstalledCapsule]) {
 
         print_interface_map("Exports", &meta.exports);
         print_interface_map("Imports", &meta.imports);
-        print_topics(&meta.topics);
     }
 }
 
@@ -125,50 +124,6 @@ fn print_interface_map(
         for (ns, ifaces) in map {
             for (name, version) in ifaces {
                 println!("    {ns}/{name} {version}");
-            }
-        }
-    }
-}
-
-/// Maximum number of schema lines to display before truncating.
-const MAX_SCHEMA_DISPLAY_LINES: usize = 20;
-
-/// Print topic API declarations, if any.
-fn print_topics(topics: &[super::meta::BakedTopic]) {
-    if topics.is_empty() {
-        return;
-    }
-    println!("  {}:", "Topics".bold());
-    for topic in topics {
-        let desc = topic.description.as_deref().unwrap_or_default();
-        let desc_suffix = if desc.is_empty() {
-            String::new()
-        } else {
-            format!(" - {desc}")
-        };
-        println!(
-            "    {} {}{}",
-            topic.name,
-            Theme::dimmed(&format!("[{}]", topic.direction)),
-            Theme::dimmed(&desc_suffix),
-        );
-        if let Some(ref schema) = topic.schema {
-            let pretty = serde_json::to_string_pretty(schema)
-                .unwrap_or_else(|e| format!("<schema serialization error: {e}>"));
-            let lines: Vec<&str> = pretty.lines().collect();
-            if lines.len() > MAX_SCHEMA_DISPLAY_LINES {
-                for line in &lines[..MAX_SCHEMA_DISPLAY_LINES] {
-                    println!("      {line}");
-                }
-                let remaining = lines.len().saturating_sub(MAX_SCHEMA_DISPLAY_LINES);
-                println!(
-                    "      {}",
-                    Theme::dimmed(&format!("... ({remaining} more lines)"))
-                );
-            } else {
-                for line in &lines {
-                    println!("      {line}");
-                }
             }
         }
     }

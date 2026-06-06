@@ -1,30 +1,37 @@
 //! Topic schema catalog for A2UI integration.
 //!
-//! Maps IPC topics to their schema definitions. Populated at capsule load time
-//! from `Capsule.toml` topic declarations. The A2UI bridge (Track 2) reads
-//! this catalog to generate schema context for the LLM system prompt.
+//! Maps IPC topics to the typed WIT payload reference declared on the capsule's
+//! `[publish]` / `[subscribe]` entries. Populated at capsule load time. The
+//! A2UI bridge (Track 2) reads this catalog and resolves each `wit` ref to a
+//! JSON Schema + description via the WIT registry, to generate schema context
+//! for the LLM system prompt.
 //!
-//! Currently intentionally empty infrastructure — no capsule defines WIT types
-//! for IPC events yet. Population happens when capsules define WIT records for
-//! their published event types (Phase 3 of the wasmtime migration).
+//! Schemas come from WIT — the typed payload contract on the `[publish]` /
+//! `[subscribe]` entry — rather than capsule-self-described inline schemas, so
+//! the description is authoritative and not dependent on bus-time self-report.
 
 use std::collections::HashMap;
 
 use tokio::sync::RwLock;
 
 use crate::capsule::CapsuleId;
+use crate::manifest::CapsuleManifest;
 
 /// Schema metadata for a single IPC topic.
 #[derive(Debug, Clone)]
 pub struct TopicSchema {
     /// ID of the capsule that owns this topic.
     pub capsule_id: CapsuleId,
-    /// Human-readable description of the topic (from `Capsule.toml`).
+    /// The typed WIT payload reference from the `[publish]` / `[subscribe]`
+    /// entry (e.g. `@unicity-astrid/wit/types/tool-call`, or `"opaque"` for an
+    /// untyped proxy topic). The A2UI bridge resolves this to a schema +
+    /// description via the WIT registry.
+    pub wit_ref: String,
+    /// Human-readable description, resolved from the WIT record's doc comments.
+    /// `None` until the WIT registry resolver populates it (Phase 3).
     pub description: Option<String>,
-    /// Schema data (JSON Schema or WIT-derived metadata).
-    ///
-    /// Currently `None` for all topics — populated when capsules define
-    /// WIT records for their IPC payloads.
+    /// JSON Schema for the payload, resolved from the WIT record. `None` until
+    /// the WIT registry resolver populates it (Phase 3).
     pub schema: Option<serde_json::Value>,
 }
 
@@ -44,26 +51,47 @@ impl SchemaCatalog {
         Self::default()
     }
 
-    /// Register topic schemas from a capsule's manifest declarations.
+    /// Register a capsule's topics from its `[publish]` / `[subscribe]` tables.
     ///
-    /// Called during `WasmEngine::load()`. The `baked_schemas` map contains
-    /// JSON Schemas derived from WIT records at install time (keyed by topic
-    /// name). Topics without a baked schema are still registered with
-    /// `schema: None` so the catalog knows they exist.
-    pub async fn register_topics(
-        &self,
-        capsule_id: &CapsuleId,
-        topics: &[crate::manifest::TopicDef],
-        baked_schemas: &HashMap<String, serde_json::Value>,
-    ) {
+    /// Called during `WasmEngine::load()`. Each topic is recorded with the
+    /// `wit` ref declared on its table entry; the A2UI bridge resolves that ref
+    /// to a schema + description, so `description` / `schema` start `None`.
+    pub async fn register_topics(&self, capsule_id: &CapsuleId, manifest: &CapsuleManifest) {
         let mut schemas = self.schemas.write().await;
-        for topic in topics {
+        let entries = manifest
+            .publishes
+            .iter()
+            .map(|(topic, def)| (topic, &def.wit))
+            .chain(
+                manifest
+                    .subscribes
+                    .iter()
+                    .map(|(topic, def)| (topic, &def.wit)),
+            );
+        for (topic, wit_ref) in entries {
+            if let Some(prev) = schemas.get(topic) {
+                // A topic in both `[publish]` and `[subscribe]` is fine when
+                // both carry the same payload contract (the bus record is
+                // identical either direction). Differing refs are a manifest
+                // authoring mistake the silent overwrite would otherwise hide.
+                if &prev.wit_ref != wit_ref {
+                    tracing::warn!(
+                        capsule = %capsule_id,
+                        topic = %topic,
+                        publish_wit = %prev.wit_ref,
+                        subscribe_wit = %wit_ref,
+                        "topic declared in both [publish] and [subscribe] with \
+                         conflicting wit refs; keeping the [subscribe] ref"
+                    );
+                }
+            }
             schemas.insert(
-                topic.name.clone(),
+                topic.clone(),
                 TopicSchema {
                     capsule_id: capsule_id.clone(),
-                    description: topic.description.clone(),
-                    schema: baked_schemas.get(&topic.name).cloned(),
+                    wit_ref: wit_ref.clone(),
+                    description: None,
+                    schema: None,
                 },
             );
         }
@@ -102,91 +130,98 @@ impl SchemaCatalog {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::manifest::{TopicDef, TopicDirection};
+    use crate::manifest::{PublishDef, SubscribeDef};
 
     fn test_capsule_id() -> CapsuleId {
         CapsuleId::from_static("test-capsule")
     }
 
+    fn publish(wit: &str) -> PublishDef {
+        PublishDef {
+            wit: wit.into(),
+            version: None,
+            tag: None,
+            rev: None,
+            branch: None,
+            path: None,
+            fanout: false,
+        }
+    }
+
+    fn subscribe(wit: &str) -> SubscribeDef {
+        SubscribeDef {
+            wit: wit.into(),
+            version: None,
+            tag: None,
+            rev: None,
+            branch: None,
+            path: None,
+            handler: None,
+            priority: None,
+        }
+    }
+
+    fn manifest_with(publishes: &[(&str, &str)], subscribes: &[(&str, &str)]) -> CapsuleManifest {
+        CapsuleManifest {
+            publishes: publishes
+                .iter()
+                .map(|(t, w)| ((*t).to_string(), publish(w)))
+                .collect(),
+            subscribes: subscribes
+                .iter()
+                .map(|(t, w)| ((*t).to_string(), subscribe(w)))
+                .collect(),
+            ..Default::default()
+        }
+    }
+
     #[tokio::test]
-    async fn register_and_lookup() {
+    async fn register_records_wit_ref_from_publish_table() {
         let catalog = SchemaCatalog::new();
-        let topics = vec![TopicDef {
-            name: "registry.v1.active_model_changed".into(),
-            direction: TopicDirection::Publish,
-            description: Some("Published when the active model changes".into()),
-            schema: None,
-            wit_type: None,
-        }];
+        let manifest = manifest_with(
+            &[(
+                "registry.v1.active_model_changed",
+                "@unicity-astrid/wit/registry/active-model",
+            )],
+            &[],
+        );
 
-        catalog
-            .register_topics(&test_capsule_id(), &topics, &HashMap::new())
-            .await;
+        catalog.register_topics(&test_capsule_id(), &manifest).await;
 
-        let schema = catalog.get("registry.v1.active_model_changed").await;
-        assert!(schema.is_some());
-        let schema = schema.unwrap();
+        let schema = catalog
+            .get("registry.v1.active_model_changed")
+            .await
+            .expect("topic registered");
         assert_eq!(schema.capsule_id, test_capsule_id());
-        assert!(schema.description.is_some());
+        assert_eq!(schema.wit_ref, "@unicity-astrid/wit/registry/active-model");
+        // description + schema are resolved from the WIT ref by A2UI later.
+        assert!(schema.description.is_none());
         assert!(schema.schema.is_none());
     }
 
     #[tokio::test]
-    async fn register_with_baked_schema() {
+    async fn register_covers_publish_and_subscribe() {
         let catalog = SchemaCatalog::new();
-        let topics = vec![TopicDef {
-            name: "registry.v1.active_model_changed".into(),
-            direction: TopicDirection::Publish,
-            description: Some("Published when the active model changes".into()),
-            schema: None,
-            wit_type: Some("provider-entry".into()),
-        }];
-
-        let mut baked = HashMap::new();
-        baked.insert(
-            "registry.v1.active_model_changed".into(),
-            serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "id": {"type": "string", "description": "Model ID"}
-                }
-            }),
+        let manifest = manifest_with(
+            &[("a.v1.foo", "@scope/wit/a/foo")],
+            &[("a.v1.bar", "opaque")],
         );
 
-        catalog
-            .register_topics(&test_capsule_id(), &topics, &baked)
-            .await;
-
-        let schema = catalog.get("registry.v1.active_model_changed").await;
-        assert!(schema.is_some());
-        let schema = schema.unwrap();
-        assert!(schema.schema.is_some());
-        let json_schema = schema.schema.unwrap();
-        assert_eq!(json_schema["properties"]["id"]["type"], "string");
+        catalog.register_topics(&test_capsule_id(), &manifest).await;
+        assert_eq!(catalog.len().await, 2);
+        assert_eq!(catalog.get("a.v1.bar").await.unwrap().wit_ref, "opaque");
     }
 
     #[tokio::test]
     async fn unregister_capsule_removes_its_topics() {
         let catalog = SchemaCatalog::new();
         let id = test_capsule_id();
-        let topics = vec![
-            TopicDef {
-                name: "a.v1.foo".into(),
-                direction: TopicDirection::Publish,
-                description: None,
-                schema: None,
-                wit_type: None,
-            },
-            TopicDef {
-                name: "a.v1.bar".into(),
-                direction: TopicDirection::Subscribe,
-                description: None,
-                schema: None,
-                wit_type: None,
-            },
-        ];
+        let manifest = manifest_with(
+            &[("a.v1.foo", "@scope/wit/a/foo")],
+            &[("a.v1.bar", "@scope/wit/a/bar")],
+        );
 
-        catalog.register_topics(&id, &topics, &HashMap::new()).await;
+        catalog.register_topics(&id, &manifest).await;
         assert_eq!(catalog.len().await, 2);
 
         catalog.unregister_capsule(&id).await;
@@ -202,28 +237,13 @@ mod tests {
         catalog
             .register_topics(
                 &id_a,
-                &[TopicDef {
-                    name: "a.v1.event".into(),
-                    direction: TopicDirection::Publish,
-                    description: None,
-                    schema: None,
-                    wit_type: None,
-                }],
-                &HashMap::new(),
+                &manifest_with(&[("a.v1.event", "@scope/wit/a/e")], &[]),
             )
             .await;
-
         catalog
             .register_topics(
                 &id_b,
-                &[TopicDef {
-                    name: "b.v1.event".into(),
-                    direction: TopicDirection::Publish,
-                    description: None,
-                    schema: None,
-                    wit_type: None,
-                }],
-                &HashMap::new(),
+                &manifest_with(&[("b.v1.event", "@scope/wit/b/e")], &[]),
             )
             .await;
 

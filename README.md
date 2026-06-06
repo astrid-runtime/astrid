@@ -353,7 +353,7 @@ The major changes in this release:
 - **`astrid self-update`** — downloads platform-specific binaries from GitHub releases to `~/.astrid/bin/`, no sudo required. Startup update banner (cached 24h).
 - **`astrid init` distro system** — fetches `Distro.toml`, multi-select provider groups, `{{ var }}` template resolution, atomic `Distro.lock` writes with BLAKE3 hashes.
 - **Export conflict detection** — `astrid capsule install` detects when a new capsule exports interfaces already provided by an installed capsule and prompts to replace.
-- **Interceptor priority** — `priority` field on `[[interceptor]]` enables layered interception chains.
+- **Interceptor priority** — optional `priority` on a `[subscribe]` handler entry enables layered interception chains (lower fires first).
 - **Short-circuit interceptors** — `Continue`, `Final`, or `Deny` wire format controls the middleware chain.
 - **Per-principal audit chains** — independently verifiable via `verify_principal_chain()`.
 - **`astrid capsule tree`** — renders the imports/exports dependency graph.

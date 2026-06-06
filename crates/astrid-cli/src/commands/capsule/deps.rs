@@ -235,7 +235,6 @@ mod tests {
                 source: None,
                 imports: import_map,
                 exports: export_map,
-                topics: vec![],
                 wasm_hash: None,
                 wit_files: std::collections::HashMap::new(),
             }),

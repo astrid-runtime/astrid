@@ -363,9 +363,10 @@ async fn handle_request(
                 entries.push(astrid_events::kernel_api::CapsuleMetadataEntry {
                     name: manifest.package.name.clone(),
                     interceptor_events: manifest
-                        .interceptors
+                        .subscribes
                         .iter()
-                        .map(|i| i.event.clone())
+                        .filter(|(_, def)| def.handler.is_some())
+                        .map(|(topic, _)| topic.clone())
                         .collect(),
                 });
             }

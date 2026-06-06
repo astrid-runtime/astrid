@@ -11,6 +11,5 @@
 // unused-import warning on non-test builds.
 #[allow(unused_imports)]
 pub(crate) use astrid_capsule_install::meta::{
-    BakedTopic, CapsuleLocation, CapsuleMeta, InstalledCapsule, read_meta, scan_installed_capsules,
-    write_meta,
+    CapsuleLocation, CapsuleMeta, InstalledCapsule, read_meta, scan_installed_capsules, write_meta,
 };

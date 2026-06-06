@@ -2,8 +2,8 @@
 //!
 //! `meta.json` lives alongside each installed capsule's `Capsule.toml`
 //! and records the installed version, source, timestamps, content
-//! hashes for the WASM/WIT blobs in the shared stores, and the baked
-//! topic-schema list. Reads are non-fatal — a missing or corrupt
+//! hashes for the WASM/WIT blobs in the shared stores. Reads are
+//! non-fatal — a missing or corrupt
 //! `meta.json` is logged and treated as "no metadata", so an installer
 //! can still upgrade over a partially-broken capsule. Writes are
 //! atomic (temp file + rename) so a crash mid-write never leaves a
@@ -14,7 +14,6 @@ use std::fmt;
 use std::path::Path;
 
 use anyhow::Context;
-use astrid_capsule::manifest::TopicDirection;
 use astrid_core::dirs::AstridHome;
 use serde::{Deserialize, Serialize};
 
@@ -39,9 +38,6 @@ pub struct CapsuleMeta {
     /// Outer key = namespace, inner key = interface name, value = version string.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub exports: HashMap<String, HashMap<String, String>>,
-    /// Topic API declarations with inline schema content, baked at install time.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub topics: Vec<BakedTopic>,
     /// BLAKE3 hash of the WASM binary, stored content-addressed in `bin/`.
     /// `None` for non-WASM capsules (MCP).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -50,21 +46,6 @@ pub struct CapsuleMeta {
     /// Maps original filename to BLAKE3 hash (e.g. `"my-analytics.wit" → "abc123"`).
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub wit_files: HashMap<String, String>,
-}
-
-/// A topic API declaration baked into `meta.json` with inline schema content.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct BakedTopic {
-    /// The topic name (e.g. `"llm.v1.response.chunk.anthropic"`).
-    pub name: String,
-    /// Whether the capsule publishes or subscribes to this topic.
-    pub direction: TopicDirection,
-    /// Human-readable description of the topic.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub description: Option<String>,
-    /// Inline JSON Schema content (read from the schema file at install time).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub schema: Option<serde_json::Value>,
 }
 
 /// Read existing `meta.json` from a capsule's install directory (if present).
@@ -284,75 +265,6 @@ mod tests {
         assert!(
             results[0].meta.is_none(),
             "corrupt meta.json should be treated as missing"
-        );
-    }
-
-    #[test]
-    fn baked_topic_round_trip() {
-        let meta = CapsuleMeta {
-            version: "1.0.0".into(),
-            installed_at: "2026-01-01T00:00:00Z".into(),
-            updated_at: "2026-01-01T00:00:00Z".into(),
-            source: None,
-            imports: HashMap::new(),
-            exports: HashMap::new(),
-            topics: vec![
-                BakedTopic {
-                    name: "llm.v1.chunk".into(),
-                    direction: TopicDirection::Publish,
-                    description: Some("Streaming chunk".into()),
-                    schema: Some(serde_json::json!({"type": "object"})),
-                },
-                BakedTopic {
-                    name: "llm.v1.request".into(),
-                    direction: TopicDirection::Subscribe,
-                    description: None,
-                    schema: None,
-                },
-            ],
-            wasm_hash: None,
-            wit_files: HashMap::new(),
-        };
-
-        let json = serde_json::to_string_pretty(&meta).expect("serialize");
-        let parsed: CapsuleMeta = serde_json::from_str(&json).expect("deserialize");
-
-        assert_eq!(parsed.topics.len(), 2);
-        assert_eq!(parsed.topics[0].name, "llm.v1.chunk");
-        assert_eq!(parsed.topics[0].direction, TopicDirection::Publish);
-        assert_eq!(
-            parsed.topics[0].description.as_deref(),
-            Some("Streaming chunk")
-        );
-        assert!(parsed.topics[0].schema.is_some());
-        assert_eq!(parsed.topics[1].direction, TopicDirection::Subscribe);
-        assert!(parsed.topics[1].schema.is_none());
-    }
-
-    #[test]
-    fn meta_without_topics_deserializes() {
-        let json = r#"{"version":"1.0.0","installed_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z"}"#;
-        let meta: CapsuleMeta = serde_json::from_str(json).expect("deserialize");
-        assert!(meta.topics.is_empty());
-    }
-
-    #[test]
-    fn baked_topic_omits_empty_topics_from_json() {
-        let meta = CapsuleMeta {
-            version: "1.0.0".into(),
-            installed_at: "2026-01-01T00:00:00Z".into(),
-            updated_at: "2026-01-01T00:00:00Z".into(),
-            source: None,
-            imports: HashMap::new(),
-            exports: HashMap::new(),
-            topics: vec![],
-            wasm_hash: None,
-            wit_files: HashMap::new(),
-        };
-        let json = serde_json::to_string(&meta).expect("serialize");
-        assert!(
-            !json.contains("topics"),
-            "empty topics should be omitted from JSON"
         );
     }
 }

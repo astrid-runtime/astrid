@@ -4,8 +4,7 @@
 //! required capabilities, integrations, and configuration settings. Manifests are
 //! loaded from disk during capsule discovery.
 
-use std::collections::{HashMap, HashSet};
-use std::fmt;
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
@@ -52,16 +51,17 @@ pub struct CapsuleManifest {
     ///
     /// Each entry is keyed by the topic name (or wildcard pattern) and carries
     /// the typed WIT payload reference plus optional source pinning. The keys
-    /// also serve as the IPC publish ACL — when this map is non-empty, it
-    /// supersedes `capabilities.ipc_publish`.
+    /// are the IPC publish ACL — the only way a capsule declares what it may
+    /// publish (an empty table = may not publish, fail-closed).
     #[serde(default, rename = "publish")]
     pub publishes: HashMap<String, PublishDef>,
     /// Topics this capsule subscribes to (RFC: cargo-like-manifest).
     ///
-    /// Same shape as `publishes`. Entries with a `handler = "..."` field bind
-    /// the topic to a `#[astrid::interceptor("...")]` export — superseding
-    /// `[[interceptor]]` blocks for the same event. Keys also serve as the
-    /// IPC subscribe ACL when non-empty.
+    /// Same shape as `publishes`. An entry with a `handler = "..."` field (and
+    /// optional `priority`) binds the topic to a `#[astrid::interceptor("...")]`
+    /// export — the single interceptor-binding form. An entry without a handler
+    /// is ACL-only (use `wit = "opaque"` for an untyped proxy subscription). The
+    /// keys are the IPC subscribe ACL (an empty table = may not subscribe).
     #[serde(default, rename = "subscribe")]
     pub subscribes: HashMap<String, SubscribeDef>,
     /// Tools this capsule surfaces to the LLM (RFC: cargo-like-manifest).
@@ -91,12 +91,6 @@ pub struct CapsuleManifest {
     /// Uplinks this capsule provides (e.g. Telegram, CLI).
     #[serde(default, rename = "uplink")]
     pub uplinks: Vec<UplinkDef>,
-    /// Interceptors (eBPF-style hooks) this capsule registers.
-    #[serde(default, rename = "interceptor")]
-    pub interceptors: Vec<InterceptorDef>,
-    /// Topic API declarations describing the payload shape of IPC topics.
-    #[serde(default, rename = "topic")]
-    pub topics: Vec<TopicDef>,
 }
 
 impl CapsuleManifest {
@@ -130,60 +124,46 @@ impl CapsuleManifest {
         })
     }
 
-    /// IPC publish ACL patterns the kernel should enforce against this capsule.
-    ///
-    /// New manifests (RFC cargo-like-manifest) declare publishes as keys in
-    /// the `[publish]` table; legacy manifests use `capabilities.ipc_publish`.
-    /// The new format takes precedence when present so operators never
-    /// double-declare. Returned vector preserves discovery order — the keys
-    /// of the table for new manifests, the array order for legacy.
+    /// IPC publish ACL patterns the kernel enforces against this capsule —
+    /// the keys of the `[publish]` table. An empty list means the capsule may
+    /// not publish to any topic (fail-closed). The order of the returned vector
+    /// is unspecified, since the backing `[publish]` table is a `HashMap`.
     #[must_use]
     pub fn effective_ipc_publish_patterns(&self) -> Vec<String> {
-        if self.publishes.is_empty() {
-            self.capabilities.ipc_publish.clone()
-        } else {
-            self.publishes.keys().cloned().collect()
-        }
+        self.publishes.keys().cloned().collect()
     }
 
-    /// IPC subscribe ACL patterns. Same precedence rule as
-    /// [`effective_ipc_publish_patterns`].
+    /// IPC subscribe ACL patterns — the keys of the `[subscribe]` table. An
+    /// empty list means the capsule may not subscribe to any topic
+    /// (fail-closed).
     #[must_use]
     pub fn effective_ipc_subscribe_patterns(&self) -> Vec<String> {
-        if self.subscribes.is_empty() {
-            self.capabilities.ipc_subscribe.clone()
-        } else {
-            self.subscribes.keys().cloned().collect()
-        }
+        self.subscribes.keys().cloned().collect()
     }
 
-    /// Effective interceptor bindings. Combines:
-    ///   - `[subscribe]` entries with a `handler` field (new format)
-    ///   - `[[interceptor]]` blocks (legacy format), skipping any whose
-    ///     `event` is already covered by a new-form binding
+    /// Interceptor bindings declared in `[subscribe]`: every entry that
+    /// carries a `handler` binds that topic to a `#[astrid::interceptor]`
+    /// export in the guest. The entry's optional `priority` controls dispatch
+    /// order (lower fires first; `None` means the default, 100).
     ///
-    /// Lets a capsule migrate one event at a time without losing handlers
-    /// declared the old way.
+    /// This is the single interceptor-binding form — the legacy
+    /// `[[interceptor]]` block was removed (see #858). The manifest does not set
+    /// `deny_unknown_fields`, so a stray `[[interceptor]]` table is an unknown
+    /// field that is silently ignored rather than rejected at load: it simply
+    /// has no effect. Capsule authors must migrate any such bindings to
+    /// `[subscribe]` entries that carry a `handler`.
     #[must_use]
     pub fn effective_interceptors(&self) -> Vec<InterceptorDef> {
-        let mut out: Vec<InterceptorDef> = self
-            .subscribes
+        self.subscribes
             .iter()
             .filter_map(|(topic, def)| {
                 def.handler.as_ref().map(|action| InterceptorDef {
                     event: topic.clone(),
                     action: action.clone(),
-                    priority: default_interceptor_priority(),
+                    priority: def.priority.unwrap_or_else(default_interceptor_priority),
                 })
             })
-            .collect();
-        let already: HashSet<String> = out.iter().map(|i| i.event.clone()).collect();
-        for legacy in &self.interceptors {
-            if !already.contains(&legacy.event) {
-                out.push(legacy.clone());
-            }
-        }
-        out
+            .collect()
     }
 }
 
@@ -551,25 +531,28 @@ pub struct UplinkDef {
     pub profile: UplinkProfile,
 }
 
-/// An event interceptor registered by the capsule.
+/// A resolved interceptor binding.
 ///
-/// Maps an IPC event topic pattern to a named action (WASM export handler).
-/// The kernel's event dispatcher matches incoming IPC events against the
-/// `event` pattern and invokes `astrid_hook_trigger` with the `action` name
-/// and the event payload.
+/// This is the kernel-internal representation produced by
+/// [`CapsuleManifest::effective_interceptors`] from each `[subscribe]` entry
+/// that carries a `handler`; it is not parsed directly from the manifest. The
+/// event dispatcher matches incoming IPC events against the `event` pattern
+/// and invokes `astrid_hook_trigger` with the `action` name and payload.
 ///
 /// Topic patterns support single-segment wildcards: `tool.execute.*.result`
 /// matches `tool.execute.search.result` but not `tool.execute.result`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InterceptorDef {
-    /// IPC topic pattern to match (e.g., `user.prompt`, `tool.execute.*.result`).
+    /// IPC topic pattern to match (the `[subscribe]` key).
     pub event: String,
-    /// Name of the handler function inside the WASM guest
-    /// (must match an `#[astrid::interceptor("...")]` annotation).
+    /// Name of the handler function inside the WASM guest — the
+    /// `[subscribe]` entry's `handler` (must match an
+    /// `#[astrid::interceptor("...")]` annotation).
     pub action: String,
     /// Dispatch priority — lower values fire first. Default 100.
     /// Enables layered interception (e.g. input guard at 10 fires before
-    /// react loop at 100).
+    /// react loop at 100). Sourced from the `[subscribe]` entry's optional
+    /// `priority`.
     #[serde(default = "default_interceptor_priority")]
     pub priority: u32,
 }
@@ -577,53 +560,6 @@ pub struct InterceptorDef {
 /// Default interceptor priority.
 const fn default_interceptor_priority() -> u32 {
     100
-}
-
-/// Direction a capsule interacts with an IPC topic.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum TopicDirection {
-    /// The capsule publishes messages to this topic.
-    Publish,
-    /// The capsule subscribes to messages on this topic.
-    Subscribe,
-}
-
-impl fmt::Display for TopicDirection {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Publish => f.write_str("publish"),
-            Self::Subscribe => f.write_str("subscribe"),
-        }
-    }
-}
-
-/// A topic API declaration describing the payload shape of an IPC topic.
-///
-/// Capsules declare each published or subscribed topic with an optional
-/// JSON Schema file or a reference to a WIT record type. At install time,
-/// the schema is baked into `meta.json` for tooling and A2UI consumption.
-///
-/// If both `schema` and `wit_type` are set, `wit_type` takes precedence.
-///
-/// **Legacy**: superseded by `[publish]` / `[subscribe]` tables in the
-/// cargo-like manifest schema (RFC). Retained so legacy manifests parse
-/// unchanged during the migration window.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TopicDef {
-    /// The concrete topic name (e.g. `"llm.v1.response.chunk.anthropic"`).
-    /// Wildcards are not permitted; topic declarations must be concrete API contracts.
-    pub name: String,
-    /// Whether the capsule publishes or subscribes to this topic.
-    pub direction: TopicDirection,
-    /// Human-readable description of the topic's purpose.
-    pub description: Option<String>,
-    /// Path to a JSON Schema file (relative to the capsule directory).
-    pub schema: Option<PathBuf>,
-    /// Name of a WIT record type (kebab-case) defined in the capsule's `wit/` directory.
-    /// At install time, the record is parsed from WIT and converted to JSON Schema
-    /// with field descriptions from `///` doc comments.
-    pub wit_type: Option<String>,
 }
 
 /// A tool this capsule surfaces to the LLM (RFC: cargo-like-manifest).

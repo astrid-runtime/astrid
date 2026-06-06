@@ -48,9 +48,8 @@
 // listing would just paraphrase what `with_context(...)` already
 // records. Match the posture astrid-gateway uses for the same reason.
 #![allow(clippy::missing_errors_doc)]
-// Same logic for `# Panics` — the install path has only one
-// expect-with-rationale (in `bake_topics`, behind an invariant that's
-// checked one line earlier).
+// Same logic for `# Panics` — install-path expects carry their
+// rationale inline.
 #![allow(clippy::missing_panics_doc)]
 // `must_use_candidate` on pure-data accessors is noise here; the
 // caller of `validate_imports` / `check_export_conflicts` always
@@ -64,7 +63,6 @@ pub mod local;
 pub mod manifest_check;
 pub mod meta;
 pub mod paths;
-pub mod topics;
 pub mod wasm;
 pub mod wit;
 
@@ -73,7 +71,6 @@ pub use copy::copy_capsule_dir;
 pub use local::{InstallOptions, InstallOutput, InstallPhase, install_from_local_path};
 pub use manifest_check::{ExportConflict, MissingImport, check_export_conflicts, validate_imports};
 pub use meta::{
-    BakedTopic, CapsuleLocation, CapsuleMeta, InstalledCapsule, read_meta, scan_installed_capsules,
-    write_meta,
+    CapsuleLocation, CapsuleMeta, InstalledCapsule, read_meta, scan_installed_capsules, write_meta,
 };
 pub use paths::{resolve_env_path, resolve_target_dir, restore_env_from_backup};

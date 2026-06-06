@@ -145,10 +145,18 @@ pub struct SubscribeDef {
     /// Local filesystem path.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
-    /// Name of the `#[astrid::interceptor("...")]` export to bind. When set,
-    /// supersedes any `[[interceptor]]` block targeting the same event.
+    /// Name of the `#[astrid::interceptor("...")]` export to bind. A
+    /// `[subscribe]` entry with a `handler` is the single way to declare an
+    /// interceptor binding.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub handler: Option<String>,
+    /// Dispatch priority for the bound interceptor — lower values fire first
+    /// (default 100). Enables layered interception (e.g. an input guard at 10
+    /// ahead of the react loop at 100). Only meaningful alongside a `handler`;
+    /// a `priority` on a handler-less (ACL-only) entry is rejected at parse
+    /// time. `None` means the default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub priority: Option<u32>,
 }
 
 impl<'de> Deserialize<'de> for SubscribeDef {
@@ -171,6 +179,8 @@ impl<'de> Deserialize<'de> for SubscribeDef {
             path: Option<String>,
             #[serde(default)]
             handler: Option<String>,
+            #[serde(default)]
+            priority: Option<u32>,
         }
         #[derive(Deserialize)]
         #[serde(untagged)]
@@ -188,6 +198,7 @@ impl<'de> Deserialize<'de> for SubscribeDef {
                 branch: None,
                 path: None,
                 handler: None,
+                priority: None,
             },
             Raw::Long(l) => {
                 let pins = [&l.version, &l.tag, &l.rev, &l.branch, &l.path]
@@ -199,6 +210,12 @@ impl<'de> Deserialize<'de> for SubscribeDef {
                         "[subscribe] entry: at most one of version / tag / rev / branch / path may be set",
                     ));
                 }
+                if l.priority.is_some() && l.handler.is_none() {
+                    return Err(serde::de::Error::custom(
+                        "[subscribe] entry: `priority` requires a `handler` — a handler-less \
+                         subscribe is ACL-only and has no dispatch order",
+                    ));
+                }
                 SubscribeDef {
                     wit: l.wit,
                     version: l.version,
@@ -207,6 +224,7 @@ impl<'de> Deserialize<'de> for SubscribeDef {
                     branch: l.branch,
                     path: l.path,
                     handler: l.handler,
+                    priority: l.priority,
                 }
             },
         })
@@ -284,6 +302,30 @@ mod tests {
         assert!(
             msg.contains("at most one of version / tag / rev / branch / path"),
             "missing invariant message: {msg}"
+        );
+    }
+
+    #[test]
+    fn subscribe_priority_with_handler_parses() {
+        let s = parse_subscribe("{ wit = \"r\", handler = \"on_x\", priority = 10 }").unwrap();
+        assert_eq!(s.handler.as_deref(), Some("on_x"));
+        assert_eq!(s.priority, Some(10));
+    }
+
+    #[test]
+    fn subscribe_handler_without_priority_leaves_priority_unset() {
+        let s = parse_subscribe("{ wit = \"r\", handler = \"on_x\" }").unwrap();
+        assert_eq!(s.handler.as_deref(), Some("on_x"));
+        assert!(s.priority.is_none());
+    }
+
+    #[test]
+    fn subscribe_priority_without_handler_rejected() {
+        let err = parse_subscribe("{ wit = \"r\", priority = 10 }").unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("`priority` requires a `handler`"),
+            "missing priority-needs-handler message: {msg}"
         );
     }
 }
