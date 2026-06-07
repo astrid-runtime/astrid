@@ -70,6 +70,39 @@ fn params(
     }
 }
 
+/// Like [`spawn_raw`] but with stdin PIPED — the keep-stdin-open path. Returns
+/// the write end so the test can hand it to the registry as the retained pipe.
+fn spawn_raw_stdin(
+    script: &str,
+) -> (
+    tokio::process::Child,
+    tokio::process::ChildStdout,
+    tokio::process::ChildStderr,
+    tokio::process::ChildStdin,
+    u32,
+) {
+    let mut std_cmd = std::process::Command::new("sh");
+    std_cmd
+        .arg("-c")
+        .arg(script)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .stdin(Stdio::piped());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt as _;
+        std_cmd.process_group(0);
+    }
+    let mut cmd = tokio::process::Command::from(std_cmd);
+    cmd.kill_on_drop(true);
+    let mut child = cmd.spawn().expect("spawn test child");
+    let pid = child.id().expect("child pid");
+    let stdout = child.stdout.take().expect("stdout pipe");
+    let stderr = child.stderr.take().expect("stderr pipe");
+    let stdin = child.stdin.take().expect("stdin pipe");
+    (child, stdout, stderr, stdin, pid)
+}
+
 #[tokio::test]
 async fn spawn_wait_read_and_owner_isolation() {
     let reg = PersistentProcessRegistry::new(tokio::runtime::Handle::current());
@@ -203,4 +236,100 @@ async fn read_since_is_non_draining_with_cursor() {
     assert_eq!(from_start.data, b"abcXYZ"); // never drained
 
     reg.release(&id, &p, "cap").expect("release");
+}
+
+#[tokio::test]
+async fn write_stdin_delivers_survives_reset_and_close_eofs() {
+    use crate::engine::wasm::bindings::astrid::process::host::ErrorCode;
+
+    let reg = PersistentProcessRegistry::new(tokio::runtime::Handle::current());
+    let alice = PrincipalId::new("alice").unwrap();
+    let bob = PrincipalId::new("bob").unwrap();
+
+    // A child that echoes each stdin line back on stdout and EXITS when stdin
+    // closes (`read` fails at EOF, ending the loop). `sh`'s builtin `echo`
+    // writes unbuffered, so each line surfaces on stdout immediately.
+    let (child, so, se, stdin, pid) =
+        spawn_raw_stdin("while IFS= read -r line; do echo \"got:$line\"; done");
+    let spawn_params = SpawnParams {
+        creator: alice.clone(),
+        capsule_id: Arc::from("cap"),
+        command: "sh -c <stdin-echo>".to_string(),
+        os_pid: pid,
+        child,
+        stdout: so,
+        stderr: se,
+        // keep-stdin-open: the registry retains the write end off-instance.
+        stdin: Some(stdin),
+        concurrent_cap: 8,
+        label: None,
+        overflow: None,
+        log_ring_bytes: None,
+        max_lifetime_ms: None,
+        idle_timeout_ms: None,
+        exit_retention_ms: None,
+    };
+    let id = reg
+        .spawn(spawn_params)
+        .expect("spawn-persistent with stdin");
+
+    // Over-cap write is rejected before any I/O.
+    assert!(matches!(
+        reg.write_stdin(&id, &alice, "cap", &vec![0u8; super::MAX_STDIN_WRITE + 1])
+            .await,
+        Err(ErrorCode::TooLarge)
+    ));
+
+    // First write reaches the retained pipe; the child echoes it.
+    let n = reg
+        .write_stdin(&id, &alice, "cap", b"hello\n")
+        .await
+        .expect("write 1");
+    assert_eq!(n, 6);
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    let logs = reg.read_logs(&id, &alice, "cap").expect("read 1");
+    assert!(
+        logs.stdout.contains("got:hello"),
+        "stdout: {:?}",
+        logs.stdout
+    );
+
+    // The second write is a standalone by-id call needing ONLY (registry, id) —
+    // no per-instance state — so it stands in for a write issued from a
+    // DIFFERENT pooled instance after an instance reset. The pipe lives in the
+    // host-owned registry, so it still reaches the same child.
+    let n2 = reg
+        .write_stdin(&id, &alice, "cap", b"world\n")
+        .await
+        .expect("write 2 (post-reset)");
+    assert_eq!(n2, 6);
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    let logs = reg.read_logs(&id, &alice, "cap").expect("read 2");
+    assert!(
+        logs.stdout.contains("got:world"),
+        "stdout: {:?}",
+        logs.stdout
+    );
+
+    // A foreign principal cannot write — no oracle.
+    assert!(matches!(
+        reg.write_stdin(&id, &bob, "cap", b"x\n").await,
+        Err(ErrorCode::NoSuchProcess)
+    ));
+
+    // close-stdin → child observes EOF → the read loop ends → clean exit.
+    reg.close_stdin(&id, &alice, "cap").expect("close-stdin");
+    let exit = reg
+        .wait(&id, &alice, "cap", Duration::from_secs(5))
+        .await
+        .expect("wait after close-stdin");
+    assert_eq!(exit.exit_code, Some(0), "child exits cleanly on stdin EOF");
+
+    // Writing after close is rejected — the pipe is gone.
+    assert!(matches!(
+        reg.write_stdin(&id, &alice, "cap", b"late\n").await,
+        Err(ErrorCode::Closed)
+    ));
+
+    reg.release(&id, &alice, "cap").expect("release");
 }
