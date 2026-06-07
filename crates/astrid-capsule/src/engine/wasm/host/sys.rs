@@ -204,13 +204,25 @@ impl sys::Host for HostState {
             let Some(capsule) = reg.get(capsule_id) else {
                 return false;
             };
-            match request.capability.as_str() {
-                "allow_prompt_injection" => capsule.manifest().capabilities.allow_prompt_injection,
-                _ => false,
-            }
+            // The full capability namespace, not just `allow_prompt_injection`:
+            // `CapabilitiesDef::has` is the per-name dual of the snapshot
+            // `enumerate-capabilities` returns, so the two host fns agree on
+            // what "held" means. Unknown names fail closed inside `has`.
+            capsule.manifest().capabilities.has(&request.capability)
         });
 
         Ok(CapabilityCheckResponse { allowed })
+    }
+
+    fn enumerate_capabilities(&mut self) -> Vec<String> {
+        // Infallible self-introspection (the WIT returns a bare `list<string>`,
+        // no `result`). The held-capability snapshot is taken once at load
+        // (`CapabilitiesDef::held_names`) and stored on `HostState`, so this
+        // never consults `capsule_registry` — there is no `registry-
+        // unavailable` failure mode to surface, and an empty list is the valid
+        // "no capabilities" answer. The set is the list dual of a self
+        // `check-capsule-capability`.
+        self.capability_names.clone()
     }
 }
 
@@ -359,10 +371,34 @@ mod log_chain_tests {
 }
 
 #[cfg(test)]
+mod capability_introspection_tests {
+    use crate::engine::wasm::bindings::astrid::sys::host::Host as SysHost;
+    use crate::engine::wasm::test_fixtures::minimal_host_state;
+
+    /// `enumerate-capabilities` returns the load-time snapshot and never
+    /// fails: the empty default is the valid "no capabilities" answer, and a
+    /// populated snapshot (what `make_state` stores from
+    /// `CapabilitiesDef::held_names`) round-trips verbatim and in order.
+    #[tokio::test]
+    async fn enumerate_returns_load_time_snapshot() {
+        let mut state = minimal_host_state(tokio::runtime::Handle::current());
+        assert!(
+            state.enumerate_capabilities().is_empty(),
+            "fail-closed default holds nothing"
+        );
+
+        state.capability_names = vec!["host_process".to_string(), "net_connect".to_string()];
+        assert_eq!(
+            state.enumerate_capabilities(),
+            vec!["host_process".to_string(), "net_connect".to_string()],
+        );
+    }
+}
+
+#[cfg(test)]
 mod get_config_tests {
     use std::collections::HashMap;
 
-    use super::*;
     use crate::engine::wasm::bindings::astrid::sys::host::Host as SysHost;
     use crate::engine::wasm::test_fixtures::minimal_host_state;
 

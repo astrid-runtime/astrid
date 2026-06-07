@@ -340,6 +340,10 @@ impl WasmHandler {
             capsule_registry: None,
             runtime_handle: tokio::runtime::Handle::current(),
             has_uplink_capability: false,
+            // Hooks run outside the capsule manifest/security-gate lifecycle and
+            // hold no manifest capabilities, so capability introspection reports
+            // an empty set (fail-closed, like `has_uplink_capability` above).
+            capability_names: Vec::new(),
             // Transient hook execution never subscribes to the audit feed;
             // fail-secure to scoped.
             audit_firehose: false,
