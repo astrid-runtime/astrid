@@ -506,11 +506,15 @@ interface host {
     read-since: func(id: process-id, which-stream: log-stream, cursor: log-cursor, max-bytes: u32) -> result<log-chunk, error-code>;
 
     /// `attach(id)?.write-stdin(data)`. Requires `keep-stdin-open = true`.
-    /// Caps at 1 MiB/call (`too-large` above that); returns bytes written. The
-    /// retained pipe lives in the host registry, so a later instance that
-    /// re-attached keeps writing to the same child across pooled-instance
-    /// resets. A non-reading child backpressures the write (all-or-nothing per
-    /// call, so framed stdin is never torn).
+    /// Caps at 1 MiB/call (`too-large` above that). The retained pipe lives in
+    /// the host registry, so a later instance that re-attached keeps writing to
+    /// the same child across pooled-instance resets. A non-reading child
+    /// backpressures the call until the OS pipe buffer drains. A successful
+    /// return wrote every byte of `data`, in order, and yields `len(data)`. An
+    /// error is NOT all-or-nothing: a prefix may already have reached the child,
+    /// and the stream is then marked closed (`closed` thereafter) — a caller
+    /// that needs intact framing must treat a failed write as a torn frame, not
+    /// a no-op.
     write-stdin: func(id: process-id, data: list<u8>) -> result<u32, error-code>;
 
     /// `attach(id)?.close-stdin()`. Child observes EOF; idempotent.

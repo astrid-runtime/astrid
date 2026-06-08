@@ -103,6 +103,33 @@ fn spawn_raw_stdin(
     (child, stdout, stderr, stdin, pid)
 }
 
+/// Poll the (draining) log reader until `needle` shows up on stdout, or the
+/// ~2 s bound elapses; returns the accumulated stdout for the caller to assert
+/// on. `read_logs` drains, so we accumulate across polls. This replaces a fixed
+/// sleep that would race the reader tasks against the child's echo+flush — flaky
+/// under slow CI, needlessly slow on fast machines. Returns the instant the
+/// marker lands. Used only for output from a *live* child; post-exit reads stay
+/// on a one-shot `read_logs` since `wait()` already fenced the flush.
+async fn drain_stdout_until(
+    reg: &PersistentProcessRegistry,
+    id: &str,
+    principal: &PrincipalId,
+    capsule: &str,
+    needle: &str,
+) -> String {
+    let mut stdout = String::new();
+    for _ in 0..200 {
+        if let Ok(logs) = reg.read_logs(id, principal, capsule) {
+            stdout.push_str(&logs.stdout);
+            if stdout.contains(needle) {
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    stdout
+}
+
 #[tokio::test]
 async fn spawn_wait_read_and_owner_isolation() {
     let reg = PersistentProcessRegistry::new(tokio::runtime::Handle::current());
@@ -286,13 +313,8 @@ async fn write_stdin_delivers_survives_reset_and_close_eofs() {
         .await
         .expect("write 1");
     assert_eq!(n, 6);
-    tokio::time::sleep(Duration::from_millis(250)).await;
-    let logs = reg.read_logs(&id, &alice, "cap").expect("read 1");
-    assert!(
-        logs.stdout.contains("got:hello"),
-        "stdout: {:?}",
-        logs.stdout
-    );
+    let stdout = drain_stdout_until(&reg, &id, &alice, "cap", "got:hello").await;
+    assert!(stdout.contains("got:hello"), "stdout: {stdout:?}");
 
     // The second write is a standalone by-id call needing ONLY (registry, id) —
     // no per-instance state — so it stands in for a write issued from a
@@ -303,13 +325,8 @@ async fn write_stdin_delivers_survives_reset_and_close_eofs() {
         .await
         .expect("write 2 (post-reset)");
     assert_eq!(n2, 6);
-    tokio::time::sleep(Duration::from_millis(250)).await;
-    let logs = reg.read_logs(&id, &alice, "cap").expect("read 2");
-    assert!(
-        logs.stdout.contains("got:world"),
-        "stdout: {:?}",
-        logs.stdout
-    );
+    let stdout = drain_stdout_until(&reg, &id, &alice, "cap", "got:world").await;
+    assert!(stdout.contains("got:world"), "stdout: {stdout:?}");
 
     // A foreign principal cannot write — no oracle.
     assert!(matches!(
