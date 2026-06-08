@@ -171,6 +171,12 @@ pub(crate) enum Commands {
         command: CapsuleCommands,
     },
 
+    /// Expose Astrid capsule tools over the Model Context Protocol.
+    Mcp {
+        #[command(subcommand)]
+        command: McpCommands,
+    },
+
     /// Manage the system distro (curated capsule bundle).
     Distro {
         #[command(subcommand)]
@@ -331,7 +337,26 @@ pub(crate) enum CapsuleCommands {
     Show(CapsuleShowArgs),
 }
 
-/// Admin commands for managing the content-addressed WIT store.
+/// Model Context Protocol surfaces — expose Astrid's capsule tools to an
+/// external MCP client (e.g. `claude -p`, Codex).
+#[derive(Subcommand)]
+pub(crate) enum McpCommands {
+    /// Run a Model Context Protocol stdio server that bridges the
+    /// daemon's capsule tool surface to a generic MCP client.
+    ///
+    /// Long-running: serves on stdin/stdout until the client closes the
+    /// stream (EOF) or the process is killed. Stdout carries the MCP
+    /// JSON-RPC protocol only — all diagnostics go to stderr.
+    Serve {
+        /// Principal to act as. Defaults to the active CLI agent (or
+        /// the `default` principal when no context is set). Stamped onto
+        /// every IPC message so the kernel scopes tool execution to this
+        /// identity.
+        #[arg(long)]
+        principal: Option<String>,
+    },
+}
+
 #[derive(Subcommand)]
 pub(crate) enum WitCommands {
     /// Garbage-collect unreferenced WIT blobs (legacy — use `astrid gc`).

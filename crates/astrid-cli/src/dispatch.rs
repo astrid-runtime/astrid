@@ -10,7 +10,9 @@ use std::process::ExitCode;
 use anyhow::Result;
 
 use crate::bootstrap;
-use crate::cli::{Cli, Commands, ConfigCommands, DistroCommands, SessionCommands, WitCommands};
+use crate::cli::{
+    Cli, Commands, ConfigCommands, DistroCommands, McpCommands, SessionCommands, WitCommands,
+};
 use crate::commands;
 use crate::commands::stub::TrackingIssue;
 use crate::formatter::OutputFormat;
@@ -40,7 +42,14 @@ pub(crate) async fn dispatch(cli: Cli) -> Result<ExitCode> {
     if cli.prompt.is_none()
         && !matches!(
             cli.command,
-            Some(Commands::SelfUpdate | Commands::Update | Commands::Completions(_))
+            Some(
+                Commands::SelfUpdate
+                    | Commands::Update
+                    | Commands::Completions(_)
+                    // `mcp serve` owns stdout for the MCP JSON-RPC stream;
+                    // a banner there would corrupt the protocol framing.
+                    | Commands::Mcp { .. }
+            )
         )
     {
         commands::self_update::print_update_banner().await;
@@ -156,6 +165,7 @@ async fn dispatch_subcommand(
             Ok(ExitCode::SUCCESS)
         },
         Some(Commands::Capsule { command }) => dispatch_capsule(command).await,
+        Some(Commands::Mcp { command }) => dispatch_mcp(command).await,
         Some(Commands::Distro { command }) => dispatch_distro(command).await,
         Some(Commands::Wit { command }) => dispatch_wit(&command),
         Some(Commands::Gc(args)) => commands::gc::run(&args),
@@ -231,6 +241,12 @@ async fn dispatch_capsule(command: crate::cli::CapsuleCommands) -> Result<ExitCo
         ),
         CapsuleCommands::Config(args) => commands::capsule::config::run(&args),
         CapsuleCommands::Show(args) => commands::capsule::show::run(&args),
+    }
+}
+
+async fn dispatch_mcp(command: McpCommands) -> Result<ExitCode> {
+    match command {
+        McpCommands::Serve { principal } => commands::mcp::serve(principal.as_deref()).await,
     }
 }
 

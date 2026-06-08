@@ -30,48 +30,30 @@ use super::notice::ServerNotice;
 
 impl rmcp::ClientHandler for AstridClientHandler {
     fn get_info(&self) -> ClientInfo {
-        // Build capabilities directly to avoid typestate builder limitations
-        // with conditional enable_* calls.
-        let capabilities = ClientCapabilities {
-            roots: if self.inner.has_roots() {
-                Some(RootsCapabilities::default())
-            } else {
-                None
-            },
-            sampling: if self.inner.has_sampling() {
-                Some(SamplingCapability::default())
-            } else {
-                None
-            },
-            elicitation: {
-                let has_form = self.inner.has_elicitation();
-                let has_url = self.inner.has_url_elicitation();
-                if has_form || has_url {
-                    Some(ElicitationCapability {
-                        form: has_form.then(FormElicitationCapability::default),
-                        url: has_url.then(UrlElicitationCapability::default),
-                    })
-                } else {
-                    None
-                }
-            },
-            ..Default::default()
+        // `ClientCapabilities` is `#[non_exhaustive]`, so it can't be built with
+        // a struct literal from this crate. Start from `default()` and set the
+        // fields we care about via their public accessors — this keeps the
+        // conditional logic flat without fighting the typestate `enable_*`
+        // builder.
+        let mut capabilities = ClientCapabilities::default();
+        capabilities.roots = self.inner.has_roots().then(RootsCapabilities::default);
+        capabilities.sampling = self.inner.has_sampling().then(SamplingCapability::default);
+        capabilities.elicitation = {
+            let has_form = self.inner.has_elicitation();
+            let has_url = self.inner.has_url_elicitation();
+            (has_form || has_url).then(|| ElicitationCapability {
+                form: has_form.then(FormElicitationCapability::default),
+                url: has_url.then(UrlElicitationCapability::default),
+            })
         };
 
-        ClientInfo {
-            meta: None,
-            protocol_version: serde_json::from_value(serde_json::json!("2025-11-25"))
+        let mut client_info = Implementation::new("astrid", env!("CARGO_PKG_VERSION"));
+        client_info.title = Some("Astrid Secure Agent Runtime".to_string());
+
+        ClientInfo::new(capabilities, client_info).with_protocol_version(
+            serde_json::from_value(serde_json::json!("2025-11-25"))
                 .expect("valid protocol version"),
-            capabilities,
-            client_info: Implementation {
-                name: "astrid".to_string(),
-                title: Some("Astrid Secure Agent Runtime".to_string()),
-                version: env!("CARGO_PKG_VERSION").to_string(),
-                description: None,
-                icons: None,
-                website_url: None,
-            },
-        }
+        )
     }
 
     async fn create_message(
@@ -147,11 +129,12 @@ impl rmcp::ClientHandler for AstridClientHandler {
         }
 
         let text = response.content.unwrap_or_default();
-        Ok(CreateMessageResult {
-            model: response.model.unwrap_or_else(|| "unknown".to_string()),
-            stop_reason: response.stop_reason,
-            message: rmcp::model::SamplingMessage::assistant_text(text),
-        })
+        let mut result = CreateMessageResult::new(
+            rmcp::model::SamplingMessage::assistant_text(text),
+            response.model.unwrap_or_else(|| "unknown".to_string()),
+        );
+        result.stop_reason = response.stop_reason;
+        Ok(result)
     }
 
     async fn list_roots(
@@ -169,16 +152,17 @@ impl rmcp::ClientHandler for AstridClientHandler {
 
         let response = roots_handler.handle_roots(request).await;
 
-        Ok(ListRootsResult {
-            roots: response
+        Ok(ListRootsResult::new(
+            response
                 .roots
                 .into_iter()
-                .map(|r| rmcp::model::Root {
-                    uri: r.uri,
-                    name: r.name,
+                .map(|r| {
+                    let mut root = rmcp::model::Root::new(r.uri);
+                    root.name = r.name;
+                    root
                 })
                 .collect(),
-        })
+        ))
     }
 
     async fn create_elicitation(
@@ -227,15 +211,18 @@ impl rmcp::ClientHandler for AstridClientHandler {
                         Ok(CreateElicitationResult {
                             action: RmcpElicitationAction::Accept,
                             content: Some(content),
+                            meta: None,
                         })
                     },
                     CoreElicitationAction::Cancel => Ok(CreateElicitationResult {
                         action: RmcpElicitationAction::Cancel,
                         content: None,
+                        meta: None,
                     }),
                     CoreElicitationAction::Dismiss => Ok(CreateElicitationResult {
                         action: RmcpElicitationAction::Decline,
                         content: None,
+                        meta: None,
                     }),
                 }
             },
@@ -254,11 +241,13 @@ impl rmcp::ClientHandler for AstridClientHandler {
                     Ok(CreateElicitationResult {
                         action: RmcpElicitationAction::Accept,
                         content: None,
+                        meta: None,
                     })
                 } else {
                     Ok(CreateElicitationResult {
                         action: RmcpElicitationAction::Decline,
                         content: None,
+                        meta: None,
                     })
                 }
             },

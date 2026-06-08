@@ -4,7 +4,6 @@
 
 use rmcp::model::CallToolRequestParams;
 use serde_json::Value;
-use std::borrow::Cow;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
@@ -278,12 +277,8 @@ impl McpClient {
             },
         };
 
-        let params = CallToolRequestParams {
-            meta: None,
-            name: Cow::Owned(tool.to_string()),
-            arguments,
-            task: None,
-        };
+        let mut params = CallToolRequestParams::new(tool.to_string());
+        params.arguments = arguments;
 
         let result = peer
             .call_tool(params)
