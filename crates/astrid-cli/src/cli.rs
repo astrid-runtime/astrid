@@ -337,7 +337,8 @@ pub(crate) enum CapsuleCommands {
     Show(CapsuleShowArgs),
 }
 
-/// Admin commands for managing the content-addressed WIT store.
+/// Model Context Protocol surfaces — expose Astrid's capsule tools to an
+/// external MCP client (e.g. `claude -p`, Codex).
 #[derive(Subcommand)]
 pub(crate) enum McpCommands {
     /// Run a Model Context Protocol stdio server that bridges the

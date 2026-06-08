@@ -6,11 +6,16 @@
 //! earlier holds a stale `tools/list`; the MCP spec lets the server push
 //! `notifications/tools/list_changed` to invite a re-fetch.
 //!
-//! This task subscribes to that broadcast on a **dedicated** uplink (so it
-//! never contends with, or steals reply frames from, the request handlers'
-//! shared client), re-enumerates the broker tool surface on each delivery,
-//! and pushes a `tools/list_changed` notification through the held
-//! [`Peer<RoleServer>`] **only when the tool-name set actually changed**.
+//! The kernel auto-broadcasts that topic to **every** uplink (no explicit
+//! subscribe — the same delivery the TUI relies on), so this task just reads
+//! frames off its watch uplink and filters for it. Tool re-enumeration runs
+//! on a **separate, short-lived** uplink per delivery, so a reload broadcast
+//! arriving mid-enumeration can never be consumed (and discarded) by the
+//! reply drain on the watch uplink. It pushes a `tools/list_changed`
+//! notification through the held [`Peer<RoleServer>`] **only when the
+//! tool-name set actually changed**, diffing against a baseline seeded from
+//! the live surface at startup (so the first post-connect reload is not
+//! swallowed).
 //!
 //! ## Why a coarse signal
 //!
@@ -58,7 +63,7 @@ pub(super) async fn run(peer: Peer<RoleServer>, principal: String) {
     // transport's frames. Work is attributed via the per-message
     // `principal`, not the session (same as the request-path uplink).
     let session = astrid_core::SessionId::from_uuid(Uuid::new_v4());
-    let mut client = match SocketClient::connect(session).await {
+    let mut watch_client = match SocketClient::connect(session).await {
         Ok(c) => c,
         Err(e) => {
             // Non-fatal: the server still serves tools; clients just won't
@@ -68,15 +73,27 @@ pub(super) async fn run(peer: Peer<RoleServer>, principal: String) {
         },
     };
 
-    info!("MCP hot-reload watcher: subscribed to {CAPSULES_LOADED_TOPIC}");
+    // `astrid.v1.capsules_loaded` is auto-broadcast to every uplink (no
+    // explicit subscribe — the same path the TUI uses), so the watch uplink
+    // receives it just by reading frames.
+    info!("MCP hot-reload watcher: watching for {CAPSULES_LOADED_TOPIC} broadcasts");
 
-    // `None` until the first successful enumeration so the initial reload
-    // establishes a baseline without firing a redundant push (the client
-    // already has the list it fetched at connect time).
-    let mut last_known: Option<BTreeSet<String>> = None;
+    // Seed the baseline from the live surface NOW, so the FIRST reload after
+    // the client connected is diffed against reality and pushed when it
+    // changed — rather than swallowed as a synthetic baseline. On a seed
+    // failure, fall back to the empty set: the first successful enumeration
+    // then over-notifies once (the client harmlessly re-fetches) rather than
+    // under-notifying.
+    let mut last_known: BTreeSet<String> = match enumerate_tool_names(&principal).await {
+        Ok(names) => names,
+        Err(e) => {
+            warn!(error = %e, "MCP hot-reload watcher: baseline seed failed; starting from empty set");
+            BTreeSet::new()
+        },
+    };
 
     loop {
-        let frame = match client.read_raw_frame().await {
+        let frame = match watch_client.read_raw_frame().await {
             Ok(Some(bytes)) => bytes,
             Ok(None) => {
                 debug!("MCP hot-reload watcher: watch uplink closed; stopping");
@@ -103,7 +120,7 @@ pub(super) async fn run(peer: Peer<RoleServer>, principal: String) {
 
         debug!("MCP hot-reload watcher: capsules_loaded received; re-enumerating tools");
 
-        let names = match enumerate_tool_names(&mut client, &principal).await {
+        let names = match enumerate_tool_names(&principal).await {
             Ok(names) => names,
             Err(e) => {
                 warn!(error = %e, "MCP hot-reload watcher: tool re-enumeration failed; keeping last-known set");
@@ -111,46 +128,36 @@ pub(super) async fn run(peer: Peer<RoleServer>, principal: String) {
             },
         };
 
-        match &last_known {
-            // First enumeration: record the baseline, suppress the push.
-            None => {
-                debug!(
-                    tools = names.len(),
-                    "MCP hot-reload watcher: baseline tool set recorded"
-                );
-                last_known = Some(names);
-            },
-            // Unchanged: suppress the no-op notification.
-            Some(prev) if *prev == names => {
-                debug!("MCP hot-reload watcher: tool set unchanged; suppressing notification");
-            },
-            // Changed: push `tools/list_changed`, then adopt the new set.
-            Some(_) => {
-                if let Err(e) = peer.notify_tool_list_changed().await {
-                    // Peer channel closed -> the transport is gone; stop.
-                    warn!(error = %e, "MCP hot-reload watcher: notify failed (peer closed); stopping");
-                    return;
-                }
-                info!(
-                    tools = names.len(),
-                    "MCP hot-reload watcher: tool set changed; pushed tools/list_changed"
-                );
-                last_known = Some(names);
-            },
+        if names == last_known {
+            debug!("MCP hot-reload watcher: tool set unchanged; suppressing notification");
+            continue;
         }
+
+        if let Err(e) = peer.notify_tool_list_changed().await {
+            // Peer channel closed -> the transport is gone; stop.
+            warn!(error = %e, "MCP hot-reload watcher: notify failed (peer closed); stopping");
+            return;
+        }
+        info!(
+            tools = names.len(),
+            "MCP hot-reload watcher: tool set changed; pushed tools/list_changed"
+        );
+        last_known = names;
     }
 }
 
-/// Publish a `tools.list` request on the watcher's own uplink and collect
-/// the set of tool names from the broker reply.
+/// Publish a `tools.list` request on a **fresh, short-lived** uplink and
+/// collect the set of tool names from the broker reply.
 ///
-/// Mirrors the request-handler round trip but on a dedicated connection so
-/// the reply frame is never raced against an in-flight `tools/list` or
-/// `tools/call` on the handlers' shared client.
-async fn enumerate_tool_names(
-    client: &mut SocketClient,
-    principal: &str,
-) -> anyhow::Result<BTreeSet<String>> {
+/// The dedicated connection is the point: the watch loop's own uplink only
+/// ever reads the `capsules_loaded` broadcast, so a reload frame arriving
+/// while this round trip is draining its reply can never be consumed (and
+/// silently discarded) by `read_until_topic` here — nor raced against an
+/// in-flight `tools/list` / `tools/call` on the request handlers' client.
+/// Reloads are infrequent, so a connect-per-enumeration is cheap.
+async fn enumerate_tool_names(principal: &str) -> anyhow::Result<BTreeSet<String>> {
+    let session = astrid_core::SessionId::from_uuid(Uuid::new_v4());
+    let mut client = SocketClient::connect(session).await?;
     let req_id = new_req_id();
     let reply_topic = format!("{RESPONSE_PREFIX}{req_id}");
     let body = json!({ "req_id": req_id });

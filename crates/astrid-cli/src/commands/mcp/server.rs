@@ -137,7 +137,12 @@ impl ServerHandler for AstridMcpServer {
         // struct literal.
         ServerInfo::new(capabilities)
             .with_server_info(Implementation::new("astrid", env!("CARGO_PKG_VERSION")))
-            .with_protocol_version(ProtocolVersion::LATEST)
+            // Pin the advertised revision to exactly the one this server is
+            // built and verified against, rather than `ProtocolVersion::LATEST`
+            // (which would silently advance on a future rmcp bump to a spec we
+            // have not yet implemented). Bump deliberately when adopting a newer
+            // revision. rmcp negotiates older clients down at `initialize`.
+            .with_protocol_version(ProtocolVersion::V_2025_11_25)
             .with_instructions("Astrid secure agent runtime — capsule tools bridged over MCP.")
     }
 

@@ -100,9 +100,10 @@ pub(crate) async fn serve(principal: Option<&str>) -> Result<ExitCode> {
         .await
         .context("Failed to start MCP stdio transport")?;
 
-    // Hot-reload bridge: subscribe to the kernel's `capsules_loaded`
-    // broadcast on a dedicated uplink and push `tools/list_changed` to the
-    // connected client whenever the broker's tool surface changes. The held
+    // Hot-reload bridge: read the kernel's `capsules_loaded` auto-broadcast
+    // (delivered to every uplink; no explicit subscribe) on a dedicated
+    // uplink and push `tools/list_changed` to the connected client whenever
+    // the broker's tool surface changes. The held
     // peer (cloned from the running service) is the only handle the
     // background task needs; it never touches stdout. The task is detached —
     // if the watch uplink dies, tool-list pushes simply stop, but the server
