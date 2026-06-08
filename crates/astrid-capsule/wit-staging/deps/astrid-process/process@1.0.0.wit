@@ -257,8 +257,8 @@ interface host {
     }
 
     // ================================================================
-    // PERSISTENT TIER value types. (NOT YET IMPLEMENTED — the host stubs
-    // the persistent functions below; the SHAPES are fixed now.)
+    // PERSISTENT TIER value types. The persistent registry has landed; these
+    // shapes are in use. The SHAPES are frozen.
     // ================================================================
 
     /// Opaque, unforgeable, principal-scoped identity for a PERSISTENT
@@ -449,9 +449,11 @@ interface host {
     spawn-background: func(request: spawn-request) -> result<process-handle, error-code>;
 
     // ================================================================
-    // PERSISTENT TIER functions. (NOT YET IMPLEMENTED — the host stubs
-    // these, returning `persist-unsupported` / `no-such-process` / `unknown`
-    // until the registry lands. The SHAPES are fixed now.)
+    // PERSISTENT TIER functions. The host registry has LANDED — these are
+    // implemented and audited. Still deferred (the host returns a stub
+    // `unknown`): `attach` (resource-handle materialisation — the id-keyed ops
+    // below ARE the documented `attach(id)?.method()` equivalent) and `watch` /
+    // `unwatch` (the lifecycle-event channel, RFC-open). The SHAPES are frozen.
     //
     // Every id-keyed function re-resolves the live calling principal +
     // capsule and checks them against the recorded creator BEFORE touching
@@ -504,10 +506,18 @@ interface host {
     read-since: func(id: process-id, which-stream: log-stream, cursor: log-cursor, max-bytes: u32) -> result<log-chunk, error-code>;
 
     /// `attach(id)?.write-stdin(data)`. Requires `keep-stdin-open = true`.
-    /// (NOT YET IMPLEMENTED — stdin pipe capture pending.)
+    /// Caps at 1 MiB/call (`too-large` above that). The retained pipe lives in
+    /// the host registry, so a later instance that re-attached keeps writing to
+    /// the same child across pooled-instance resets. A non-reading child
+    /// backpressures the call until the OS pipe buffer drains. A successful
+    /// return wrote every byte of `data`, in order, and yields `len(data)`. An
+    /// error is NOT all-or-nothing: a prefix may already have reached the child,
+    /// and the stream is then marked closed (`closed` thereafter) — a caller
+    /// that needs intact framing must treat a failed write as a torn frame, not
+    /// a no-op.
     write-stdin: func(id: process-id, data: list<u8>) -> result<u32, error-code>;
 
-    /// `attach(id)?.close-stdin()`. (NOT YET IMPLEMENTED.)
+    /// `attach(id)?.close-stdin()`. Child observes EOF; idempotent.
     close-stdin: func(id: process-id) -> result<_, error-code>;
 
     /// `attach(id)?.signal(sig)`. Fire-and-forget signal delivery.
