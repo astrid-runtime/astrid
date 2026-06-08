@@ -369,6 +369,7 @@ mod tests {
                 fs_read: fs_read.into_iter().map(String::from).collect(),
                 fs_write: fs_write.into_iter().map(String::from).collect(),
                 host_process: vec![],
+                allow_persistent: false,
                 uplink: false,
                 identity: vec![],
                 allow_prompt_injection: false,

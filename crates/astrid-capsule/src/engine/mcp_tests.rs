@@ -42,6 +42,7 @@ mod tests {
                 fs_read: vec![],
                 fs_write: vec![],
                 host_process: allowed_commands.into_iter().map(String::from).collect(),
+                allow_persistent: false,
                 uplink: false,
                 identity: vec![],
                 allow_prompt_injection: false,

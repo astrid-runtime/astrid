@@ -30,6 +30,20 @@ pub struct CapabilitiesDef {
     /// Legacy host process executions (the "Airlock Override").
     #[serde(default)]
     pub host_process: Vec<String>,
+    /// Operator sub-grant of `host_process`: whether the capsule may spawn
+    /// PERSISTENT (host-owned, instance-outliving) background processes via
+    /// `astrid:process.spawn-persistent`, not just ephemeral `spawn-background`.
+    ///
+    /// Fail-closed (default `false`). `host_process` alone grants only
+    /// ephemeral exec, whose child is reaped when the spawning instance resets.
+    /// A persistent child survives the instance and — on macOS, which has no
+    /// `die-with-parent` — a daemon hard-crash can orphan a still-sandboxed
+    /// child, so persistence is an additional operator-reviewed opt-in on top
+    /// of `host_process`. Without it, `spawn-persistent` returns
+    /// `capability-denied` (the ephemeral `spawn` / `spawn-background` stay
+    /// available under `host_process`).
+    #[serde(default)]
+    pub allow_persistent: bool,
     /// Unix/TCP socket bind addresses the capsule requires.
     #[serde(default)]
     pub net_bind: Vec<String>,
@@ -144,6 +158,7 @@ mod tests {
             fs_read: vec!["/r".into()],
             fs_write: vec!["/w".into()],
             host_process: vec!["bash".into()],
+            allow_persistent: true,
             net_bind: vec!["127.0.0.1:0".into()],
             net_connect: vec!["host:443".into()],
             identity: vec!["resolve".into()],
@@ -151,6 +166,7 @@ mod tests {
         };
         let names = caps.held_names();
         let expected = [
+            "allow_persistent",
             "allow_prompt_injection",
             "fs_read",
             "fs_write",
@@ -164,7 +180,7 @@ mod tests {
         ];
         assert_eq!(
             names, expected,
-            "deterministic, sorted order — all 10 fields"
+            "deterministic, sorted order — all 11 fields"
         );
         for n in expected {
             assert!(caps.has(n), "has({n}) must agree with held_names");
@@ -197,6 +213,7 @@ mod tests {
             "fs_read",
             "fs_write",
             "host_process",
+            "allow_persistent",
             "net_bind",
             "net_connect",
             "identity",

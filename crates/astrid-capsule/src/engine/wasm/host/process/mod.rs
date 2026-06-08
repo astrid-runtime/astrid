@@ -429,6 +429,26 @@ impl process::Host for HostState {
             }
         }
 
+        // Persistent exec is an operator sub-grant ON TOP of `host_process`:
+        // the capsule must also declare `allow_persistent` to spawn a child
+        // that OUTLIVES the instance. `host_process` alone keeps only the
+        // ephemeral `spawn` / `spawn-background`. Manifest-derived, so it's the
+        // same capability set `enumerate-capabilities` reports.
+        if !self
+            .capability_names
+            .iter()
+            .any(|c| c == "allow_persistent")
+        {
+            let result: Result<String, ErrorCode> = Err(ErrorCode::CapabilityDenied);
+            audit_process(
+                self,
+                "astrid:process/host.spawn-persistent",
+                &cmd_for_audit,
+                &result,
+            );
+            return result;
+        }
+
         // Persistence feasibility: refuse the owner-fallback principal — a
         // persistent id must be scoped to an authenticated principal, else
         // unauthenticated paths would share a `default` namespace that
