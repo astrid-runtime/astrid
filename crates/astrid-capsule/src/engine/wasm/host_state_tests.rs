@@ -357,3 +357,76 @@ fn install_recv_invocation_context_preserves_outer_caller_inside_interceptor() {
         "Nested recv inside interceptor must not rewrite the outer caller"
     );
 }
+
+/// The guest-pulled `recv` path resolves the invoking principal's quota
+/// profile, so per-principal ceilings (here `max_background_processes`)
+/// apply to run+recv capsules instead of silently using the default
+/// profile — the gap this fix closes. Previously `invocation_profile` was
+/// only ever set on the dispatcher-driven interceptor path.
+#[test]
+fn install_recv_invocation_context_resolves_invoking_principal_profile() {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap();
+    let mut state = minimal_host_state(rt.handle().clone());
+
+    // Seed an on-disk profile for `alice` with a non-default
+    // background-process quota, behind a tempdir-rooted cache.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let home = astrid_core::dirs::AstridHome::from_path(dir.path());
+    let alice = astrid_core::PrincipalId::new("alice").expect("valid alice");
+    std::fs::create_dir_all(home.profiles_dir()).expect("mkdir etc/profiles");
+    std::fs::write(
+        home.profile_path(&alice),
+        format!(
+            "profile_version = {}\n[quotas]\nmax_background_processes = 3\n",
+            astrid_core::profile::CURRENT_PROFILE_VERSION
+        ),
+    )
+    .expect("write profile");
+    state.profile_cache = Some(Arc::new(
+        crate::profile_cache::PrincipalProfileCache::with_home(home),
+    ));
+
+    // No caller yet → no override → the process-global default quota.
+    assert!(state.invocation_profile.is_none());
+    assert_eq!(
+        state.effective_profile().quotas.max_background_processes,
+        astrid_core::profile::DEFAULT_MAX_BACKGROUND_PROCESSES
+    );
+
+    // A recv message from alice installs HER profile → her quota applies.
+    let msg = astrid_events::ipc::IpcMessage::new(
+        "some.v1.event",
+        astrid_events::ipc::IpcPayload::RawJson(serde_json::json!({})),
+        uuid::Uuid::new_v4(),
+    )
+    .with_principal(alice.to_string());
+    state.install_recv_invocation_context(&msg);
+
+    assert!(
+        state.invocation_profile.is_some(),
+        "alice's profile must be resolved on the recv path"
+    );
+    assert_eq!(
+        state.effective_profile().quotas.max_background_processes,
+        3,
+        "recv path must apply the invoking principal's quota, not the default"
+    );
+
+    // A subsequent recv from the owner/default principal clears the override
+    // (the invoking-principal filter drops `self.principal`), so the quota
+    // falls back to the default rather than leaking alice's.
+    let owner_msg = astrid_events::ipc::IpcMessage::new(
+        "some.v1.event",
+        astrid_events::ipc::IpcPayload::RawJson(serde_json::json!({})),
+        uuid::Uuid::new_v4(),
+    )
+    .with_principal(state.principal.to_string());
+    state.install_recv_invocation_context(&owner_msg);
+
+    assert!(
+        state.invocation_profile.is_none(),
+        "owner-principal recv clears the per-principal override"
+    );
+}

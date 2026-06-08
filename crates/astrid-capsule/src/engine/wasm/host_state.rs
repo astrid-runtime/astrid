@@ -221,7 +221,26 @@ pub struct HostState {
     /// Host functions that gate on per-principal sub-budgets (IPC
     /// throughput, background processes, HTTP streams) read this through
     /// [`effective_profile`](Self::effective_profile). Cleared on exit.
+    ///
+    /// Resolved on BOTH per-invocation paths: the dispatcher-driven
+    /// interceptor path (`invoke_interceptor`) and the guest-pulled
+    /// `ipc::recv` path ([`install_recv_invocation_context`](Self::install_recv_invocation_context),
+    /// via [`profile_cache`](Self::profile_cache)). On a path with no cache or
+    /// no on-disk profile, `effective_profile()` falls back to the
+    /// process-global default.
     pub invocation_profile: Option<Arc<astrid_core::profile::PrincipalProfile>>,
+    /// Shared profile-cache handle, used by the `ipc::recv` path to resolve
+    /// the invoking principal's [`PrincipalProfile`](astrid_core::profile::PrincipalProfile)
+    /// into [`invocation_profile`](Self::invocation_profile).
+    ///
+    /// The interceptor path resolves the profile in
+    /// [`WasmEngine::invoke_interceptor`](super::WasmEngine::invoke_interceptor)
+    /// and installs it directly; the guest-pulled `ipc::recv` path has no
+    /// dispatcher frame to do that, so
+    /// [`install_recv_invocation_context`](Self::install_recv_invocation_context)
+    /// resolves through this handle. `None` in tests / single-tenant — the
+    /// per-principal quota fields then fall back to the default profile.
+    pub profile_cache: Option<Arc<crate::profile_cache::PrincipalProfileCache>>,
     /// Per-invocation env overlay for the invoking principal.
     ///
     /// Loaded from
@@ -753,6 +772,7 @@ impl HostState {
             self.invocation_kv = None;
             self.invocation_capsule_log = None;
             self.invocation_env_overlay = None;
+            self.invocation_profile = None;
             return;
         };
 
@@ -772,6 +792,31 @@ impl HostState {
         self.invocation_capsule_log = super::open_capsule_log(&p, self.capsule_id.as_str(), false);
         self.invocation_env_overlay =
             super::load_invocation_env_overlay(&p, self.capsule_id.as_str());
+
+        // Resolve the invoking principal's quota profile so per-principal
+        // ceilings (background-process count, IPC throughput, HTTP streams)
+        // apply on the guest-pulled `recv` path too — not only the
+        // dispatcher-driven interceptor path, which sets `invocation_profile`
+        // in `invoke_interceptor`. Without this, `effective_profile()` falls
+        // back to the process-global default and a run+recv capsule runs every
+        // invoking principal under the default quota rather than its own.
+        // Best-effort: a failed load leaves `invocation_profile = None` — the
+        // same default fall-back as a missing cache — logged for auditability,
+        // never denying the message (the recv path has no error channel).
+        self.invocation_profile = match self.profile_cache.as_ref() {
+            Some(cache) => match cache.resolve(&p) {
+                Ok(profile) => Some(profile),
+                Err(e) => {
+                    tracing::warn!(
+                        principal = %p,
+                        error = %e,
+                        "recv-path profile resolve failed; per-principal quotas fall back to the default profile"
+                    );
+                    None
+                },
+            },
+            None => None,
+        };
     }
 }
 

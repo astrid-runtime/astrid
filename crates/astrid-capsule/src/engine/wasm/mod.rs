@@ -1296,6 +1296,7 @@ impl ExecutionEngine for WasmEngine {
             let st_capsule_registry = ctx.capsule_registry.clone();
             let st_allowance_store = ctx.allowance_store.clone();
             let st_identity_store = ctx.identity_store.clone();
+            let st_profile_cache = ctx.profile_cache.clone();
             let make_state: Arc<dyn Fn() -> HostState + Send + Sync> = Arc::new(move || HostState {
                 wasi_ctx: build_wasi_ctx(),
                 resource_table: wasmtime::component::ResourceTable::new(),
@@ -1327,6 +1328,7 @@ impl ExecutionEngine for WasmEngine {
                 invocation_secret_store: None,
                 invocation_capsule_log: None,
                 invocation_profile: None,
+                profile_cache: st_profile_cache.clone(),
                 invocation_env_overlay: None,
                 overlay_vfs: Some(Arc::clone(&overlay_vfs)),
                 upper_dir: Some(Arc::clone(&upper_dir_arc)),
@@ -2344,6 +2346,8 @@ pub async fn run_lifecycle(
         invocation_secret_store: None,
         invocation_capsule_log: None,
         invocation_profile: None,
+        // Lifecycle hooks don't run the per-principal recv loop; no cache needed.
+        profile_cache: None,
         invocation_env_overlay: None,
         overlay_vfs: None,
         upper_dir: None,
