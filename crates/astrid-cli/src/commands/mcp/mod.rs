@@ -34,6 +34,8 @@
 //! config, so a stray diagnostic can never corrupt the protocol stream.
 
 mod elicit;
+#[cfg(test)]
+mod rmcp_resource_guards;
 mod server;
 mod watch;
 
