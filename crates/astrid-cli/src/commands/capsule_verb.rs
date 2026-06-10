@@ -266,10 +266,11 @@ fn render_result(provider: &str, raw: &serde_json::Value) -> ExitCode {
         eprintln!("{error}");
     }
 
-    // Clamp to the u8 process-exit range. `clamp` already pins the value
-    // into `0..=255`, so the conversion can never truncate or lose sign.
-    let clamped = u8::try_from(exit_code.clamp(0, i64::from(u8::MAX))).unwrap_or(1);
-    ExitCode::from(clamped)
+    // Map to the u8 process-exit range, failing secure: a negative or
+    // overlong exit code is garbage from the capsule and must surface as
+    // failure (1), never clamp down to 0 (success).
+    let code = u8::try_from(exit_code).unwrap_or(1);
+    ExitCode::from(code)
 }
 
 /// Print all available CLI verbs (name + description + provider).
@@ -348,10 +349,12 @@ mod tests {
     }
 
     #[test]
-    fn render_result_handles_valid_and_overlong_exit_codes() {
+    fn render_result_handles_valid_and_out_of_range_exit_codes() {
         // `ExitCode` exposes no inner-value accessor, so these assert the
-        // valid/overlong-clamp paths execute without panicking (rendering
-        // output to stdout/stderr) and return a process exit code.
+        // valid and out-of-range paths execute without panicking (rendering
+        // output to stdout/stderr) and return a process exit code. Out-of-
+        // range codes (negative or > 255) map to failure (1), never to 0 —
+        // a capsule sending garbage must not look like success.
         let frame = serde_json::json!({
             "payload": { "req_id": "x", "exit_code": 5, "output": "" }
         });
@@ -361,6 +364,11 @@ mod tests {
             "payload": { "req_id": "x", "exit_code": 99999, "output": "hi" }
         });
         let _ = render_result("p", &over);
+
+        let negative = serde_json::json!({
+            "payload": { "req_id": "x", "exit_code": -1, "output": "" }
+        });
+        let _ = render_result("p", &negative);
     }
 
     #[test]
