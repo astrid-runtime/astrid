@@ -2,9 +2,14 @@
 //!
 //! Performs the session-token handshake and exposes length-prefixed
 //! JSON framing for [`IpcMessage`](astrid_types::ipc::IpcMessage).
-//! Callers are responsible for stamping `principal` on outbound
-//! messages — this crate has no opinion on how a consumer resolves
-//! the caller (CLI active-agent context vs gateway-verified bearer).
+//! The client is bound to one `principal` at [`SocketClient::connect`]
+//! time — the consumer resolves it (CLI process-wide `--principal` vs
+//! gateway-verified bearer vs emit `publish-as` attribution) and the
+//! transport stamps it onto every outbound message that does not
+//! already carry an explicit principal. This matches the uplink proxy,
+//! which pins the first principal it sees on a connection and drops
+//! any message stamped with a different one: a single connection
+//! carries a single principal.
 
 use anyhow::{Context, Result};
 use astrid_core::PrincipalId;
@@ -73,16 +78,25 @@ pub struct SocketClient {
     write_half: tokio::net::unix::OwnedWriteHalf,
     /// The unique identifier for this session.
     pub session_id: SessionId,
+    /// The principal this connection acts as. Stamped onto every
+    /// outbound message that does not already carry an explicit
+    /// principal (see [`SocketClient::send_message`]).
+    principal: PrincipalId,
 }
 
 impl SocketClient {
     /// Connect to an existing session socket and perform the
-    /// authenticated handshake.
+    /// authenticated handshake, binding the connection to `principal`.
+    ///
+    /// Every outbound message that does not already set its own
+    /// principal is stamped with `principal`, so the kernel scopes
+    /// session, KV, home, secret, and quota state to one consistent
+    /// identity for the whole connection.
     ///
     /// # Errors
     /// Returns an error if the socket file does not exist, connection
     /// fails, or the handshake is rejected.
-    pub async fn connect(session_id: SessionId) -> Result<Self> {
+    pub async fn connect(session_id: SessionId, principal: PrincipalId) -> Result<Self> {
         let path = proxy_socket_path();
 
         if !path.exists() {
@@ -101,6 +115,7 @@ impl SocketClient {
             read_half,
             write_half,
             session_id,
+            principal,
         })
     }
 
@@ -254,37 +269,42 @@ impl SocketClient {
         serde_json::from_value::<astrid_core::kernel_api::KernelResponse>(value).ok()
     }
 
-    /// Send a user-prompt message on behalf of `caller`.
+    /// Send a user-prompt message as this connection's principal.
     ///
-    /// Convenience helper for chat-style uplinks. Stamps
-    /// `IpcMessage.principal` from the caller so the kernel's
-    /// `resolve_caller` sees the right principal for session, KV,
-    /// home, secret, and quota scoping.
+    /// Convenience helper for chat-style uplinks. The connection's
+    /// bound principal is stamped by [`send_message`](Self::send_message)
+    /// so the kernel's `resolve_caller` sees the right principal for
+    /// session, KV, home, secret, and quota scoping.
     ///
     /// # Errors
     /// Returns an error if the message cannot be sent.
-    pub async fn send_input(&mut self, text: String, caller: &PrincipalId) -> Result<()> {
+    pub async fn send_input(&mut self, text: String) -> Result<()> {
         let payload = IpcPayload::UserInput {
             text,
             session_id: self.session_id.0.to_string(),
             context: None,
         };
 
-        let msg = IpcMessage::new("user.v1.prompt", payload, self.session_id.0)
-            .with_principal(caller.to_string());
+        let msg = IpcMessage::new("user.v1.prompt", payload, self.session_id.0);
 
         self.send_message(msg).await
     }
 
     /// Send a raw IPC message to the kernel.
     ///
-    /// The caller is responsible for stamping
-    /// [`IpcMessage::principal`](astrid_types::ipc::IpcMessage::principal)
-    /// before calling — this transport does not infer it.
+    /// If `msg` does not already carry an explicit principal, it is
+    /// stamped with this connection's bound principal before sending —
+    /// so every message on the connection attributes to one consistent
+    /// identity (the uplink proxy drops mismatches). A caller that has
+    /// already set `principal` (e.g. `publish-as` attribution) is left
+    /// untouched.
     ///
     /// # Errors
     /// Returns an error if the message cannot be serialized or sent.
-    pub async fn send_message(&mut self, msg: IpcMessage) -> Result<()> {
+    pub async fn send_message(&mut self, mut msg: IpcMessage) -> Result<()> {
+        if msg.principal.is_none() {
+            msg.principal = Some(self.principal.to_string());
+        }
         let bytes = serde_json::to_vec(&msg)?;
         let len =
             u32::try_from(bytes.len()).context("IPC message too large (exceeds 4 GiB limit)")?;

@@ -62,8 +62,13 @@ pub(super) async fn run(peer: Peer<RoleServer>, principal: String) {
     // The watch uplink's session id is ephemeral — it only keys this
     // transport's frames. Work is attributed via the per-message
     // `principal`, not the session (same as the request-path uplink).
+    // The connection's principal binding is the fallback for messages
+    // that omit one; this watcher always stamps `principal` explicitly
+    // (below), so bind the default and let the explicit stamp win.
     let session = astrid_core::SessionId::from_uuid(Uuid::new_v4());
-    let mut watch_client = match SocketClient::connect(session).await {
+    let mut watch_client = match SocketClient::connect(session, astrid_core::PrincipalId::default())
+        .await
+    {
         Ok(c) => c,
         Err(e) => {
             // Non-fatal: the server still serves tools; clients just won't
@@ -157,7 +162,7 @@ pub(super) async fn run(peer: Peer<RoleServer>, principal: String) {
 /// Reloads are infrequent, so a connect-per-enumeration is cheap.
 async fn enumerate_tool_names(principal: &str) -> anyhow::Result<BTreeSet<String>> {
     let session = astrid_core::SessionId::from_uuid(Uuid::new_v4());
-    let mut client = SocketClient::connect(session).await?;
+    let mut client = SocketClient::connect(session, astrid_core::PrincipalId::default()).await?;
     let req_id = new_req_id();
     let reply_topic = format!("{RESPONSE_PREFIX}{req_id}");
     let body = json!({ "req_id": req_id });

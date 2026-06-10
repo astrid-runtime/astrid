@@ -42,6 +42,7 @@
 use std::process::ExitCode;
 
 use anyhow::Result;
+use astrid_core::PrincipalId;
 use astrid_core::SessionId;
 use astrid_types::ipc::{IpcMessage, IpcPayload};
 use astrid_uplink::SocketClient;
@@ -176,7 +177,11 @@ impl Emitter for SocketEmitter {
         let sid = SessionId::new();
         let source_id = sid.0;
 
-        let mut client = SocketClient::connect(sid).await?;
+        // The message carries its own principal attribution via
+        // `publish-as` below, so the connection binding is only the
+        // fallback for messages that omit one (none here). Bind the
+        // default; the explicit `with_principal` always wins.
+        let mut client = SocketClient::connect(sid, PrincipalId::default()).await?;
 
         let msg = IpcMessage::new(topic, IpcPayload::RawJson(envelope), source_id)
             .with_principal(principal);

@@ -30,6 +30,16 @@ pub(crate) struct Cli {
     #[arg(long, global = true, default_value = "pretty")]
     pub format: String,
 
+    /// Principal this CLI process acts as. Stamped on every IPC message
+    /// the process sends, so the kernel scopes session, KV, home,
+    /// secrets, and quotas to this identity. Falls back to the
+    /// `ASTRID_PRINCIPAL` env var, then to `default`. Must be 1-64
+    /// chars of `[a-zA-Z0-9_-]`. The uplink proxy pins the first
+    /// principal it sees on a connection and drops any message stamped
+    /// with a different one, so this is fixed for the whole process.
+    #[arg(long, global = true, env = "ASTRID_PRINCIPAL")]
+    pub principal: Option<String>,
+
     /// Non-interactive prompt. Sends the prompt, prints the response, and exits.
     /// Forces headless mode (no TUI). Stdin is appended to the prompt if piped.
     #[arg(short, long)]
@@ -363,10 +373,12 @@ pub(crate) enum McpCommands {
     /// stream (EOF) or the process is killed. Stdout carries the MCP
     /// JSON-RPC protocol only — all diagnostics go to stderr.
     Serve {
-        /// Principal to act as. Defaults to the active CLI agent (or
-        /// the `default` principal when no context is set). Stamped onto
-        /// every IPC message so the kernel scopes tool execution to this
-        /// identity.
+        /// Principal to act as for this MCP server. Overrides the
+        /// process-wide principal (the global `--principal` /
+        /// `ASTRID_PRINCIPAL`); when omitted, falls back to it (which
+        /// itself defaults to the active CLI agent, then `default`).
+        /// Stamped onto every IPC message so the kernel scopes tool
+        /// execution to this identity.
         #[arg(long)]
         principal: Option<String>,
     },

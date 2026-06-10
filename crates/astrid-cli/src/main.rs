@@ -36,6 +36,7 @@ mod commands;
 mod context;
 mod dispatch;
 mod formatter;
+mod principal;
 mod repl;
 /// The socket client for interacting with the Kernel.
 pub mod socket_client;
@@ -47,6 +48,19 @@ mod value_formatter;
 async fn main() -> ExitCode {
     let parsed = cli::Cli::parse();
     bootstrap::init_logging(&parsed);
+
+    // Resolve and validate the process-wide principal ONCE, before any
+    // socket connection. Every IPC message the process sends stamps
+    // this identity (the uplink proxy pins one principal per connection
+    // and drops mismatches). Invalid input exits with a clear error
+    // naming the constraint.
+    match principal::resolve_process(parsed.principal.as_deref()) {
+        Ok(p) => principal::set(p),
+        Err(e) => {
+            eprintln!("{}", theme::Theme::error(&format!("error: {e:#}")));
+            return ExitCode::from(1);
+        },
+    }
 
     match dispatch::dispatch(parsed).await {
         Ok(code) => code,

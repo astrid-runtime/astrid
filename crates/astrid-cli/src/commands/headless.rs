@@ -50,9 +50,10 @@ pub(crate) async fn run_snapshot_tui(
         SessionId::from_uuid(uuid::Uuid::new_v4())
     };
 
-    let mut client = socket_client::SocketClient::connect(session_id.clone())
-        .await
-        .context("Failed to connect to daemon")?;
+    let mut client =
+        socket_client::SocketClient::connect(session_id.clone(), crate::principal::current())
+            .await
+            .context("Failed to connect to daemon")?;
 
     let workspace = std::env::current_dir().ok();
     tui::headless::run(tui::headless::HeadlessConfig {
@@ -112,9 +113,10 @@ pub(crate) async fn run_headless(
         }
         SessionId::from_uuid(id)
     };
-    let mut client = socket_client::SocketClient::connect(session_id.clone())
-        .await
-        .context("Failed to connect to daemon")?;
+    let mut client =
+        socket_client::SocketClient::connect(session_id.clone(), crate::principal::current())
+            .await
+            .context("Failed to connect to daemon")?;
 
     // Also read stdin if there's piped content and -p was used
     let full_prompt = if std::io::stdin().is_terminal() {

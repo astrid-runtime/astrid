@@ -613,7 +613,7 @@ async fn handle_pending_actions(
                 answers,
             } => {
                 if let Ok(home) = astrid_core::dirs::AstridHome::resolve() {
-                    let principal = astrid_core::PrincipalId::default();
+                    let principal = crate::principal::current();
                     let ph = home.principal_home(&principal);
                     let env_path = ph.env_dir().join(format!("{capsule_id}.env.json"));
                     if let Ok(json) = serde_json::to_string_pretty(&answers) {
