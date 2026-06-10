@@ -14,20 +14,15 @@ Closes #<!-- issue number -->
 
 -
 
-## Test Plan
+## Verification
 
-<!-- How was this tested? Include both automated and manual verification steps. -->
-
-### Automated
-
-- [ ] `cargo test --workspace` passes
-- [ ] No new clippy warnings
-
-### Manual (optional)
-
-<!-- Step-by-step instructions for a reviewer to manually verify the change. Delete this section if not applicable. -->
+<!-- How was this PR validated? Pick what applies:
+     - Code: `cargo test --workspace` passes, no new clippy warnings, new/updated tests for the change.
+     - Release: CI green on the version bump + changelog roll; no code changes.
+     - Docs / CI / chore: how you checked the result (rendered output, workflow run, dry-run, etc.).
+     Include manual verification steps for a reviewer where they add signal. -->
 
 ## Checklist
 
 - [ ] Linked to an issue
-- [ ] CHANGELOG.md updated under `[Unreleased]`
+- [ ] CHANGELOG.md updated (entry under `[Unreleased]` — or `[Unreleased]` rolled into a version section for a release PR; not applicable to docs/CI-only changes)

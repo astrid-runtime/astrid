@@ -17,20 +17,34 @@ jobs:
           ERRORS=""
 
           # Check required sections exist and have content beyond the template placeholder
+          section_content() {
+            # Extract text between this section header and the next ## header.
+            # The closing header is removed by pattern (not `$d`) so a section that
+            # happens to be the last one in the body keeps its final content line.
+            echo "$PR_BODY" | sed -n "/^## $1/,/^## /p" | sed '1d' | sed '/^## /d' | sed '/^<!--.*-->$/d' | sed '/^\s*$/d'
+          }
+
           check_section() {
-            local section="$1"
-            local content
-            # Extract text between this section header and the next ## header
-            content=$(echo "$PR_BODY" | sed -n "/^## $section/,/^## /p" | sed '1d;$d' | sed '/^<!--.*-->$/d' | sed '/^\s*$/d')
-            if [ -z "$content" ]; then
-              ERRORS="${ERRORS}Missing or empty section: ## $section\n"
+            if [ -z "$(section_content "$1")" ]; then
+              ERRORS="${ERRORS}Missing or empty section: ## $1\n"
             fi
+          }
+
+          # Accept any one of the named sections (e.g. the current name and a legacy alias)
+          check_section_any() {
+            local section
+            for section in "$@"; do
+              if [ -n "$(section_content "$section")" ]; then
+                return 0
+              fi
+            done
+            ERRORS="${ERRORS}Missing or empty section: ## $1 (or: $(printf '## %s ' "${@:2}"))\n"
           }
 
           check_section "Linked Issue"
           check_section "Summary"
           check_section "Changes"
-          check_section "Test Plan"
+          check_section_any "Verification" "Test Plan"
 
           # Check that Linked Issue has an actual issue number, not just the placeholder
           if ! echo "$PR_BODY" | grep -qE '#[0-9]+'; then
