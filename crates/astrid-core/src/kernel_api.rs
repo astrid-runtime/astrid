@@ -123,15 +123,86 @@ pub struct CapsuleMetadataEntry {
     pub interceptor_events: Vec<String>,
 }
 
-/// Information about a registered slash command.
+/// How a capsule-declared command is surfaced to operators.
+///
+/// A capsule declares commands via `[[command]]` in its `Capsule.toml`.
+/// The `kind` selects the surface:
+///
+/// * [`CommandKind::Slash`] — an in-TUI slash command (`/git`), dispatched
+///   through the chat loop. This is the historical behaviour and the
+///   default when `kind` is absent, so every pre-existing manifest keeps
+///   parsing and behaving identically.
+/// * [`CommandKind::Cli`] — a top-level CLI verb invocable as
+///   `astrid capsule <verb> [args...]`, dispatched to the providing capsule
+///   over IPC as a non-interactive one-shot.
+///
+/// # CLI-verb wire contract (kernel does NOT interpret it)
+///
+/// The kernel plays no part in running a CLI verb beyond surfacing its
+/// existence through `GetCommands`. Dispatch is pure capsule-space IPC:
+///
+/// * **Run** — the CLI publishes an `IpcPayload::RawJson` message on the
+///   provider-targeted topic `cli.v1.command.run.<provider_capsule>` with
+///   body `{ "req_id": <uuid>, "command": <verb>, "args": [<string>...] }`.
+/// * **Result** — the capsule replies on `cli.v1.command.result.<req_id>`
+///   with body `{ "req_id": <uuid>, "exit_code": <number>,
+///   "output": <string>, "error": <string?> }`.
+///
+/// **Security rationale for the provider-targeted run topic:** a capsule
+/// subscribes only `cli.v1.command.run.<its-own-id>`, so a capsule never
+/// observes the command arguments addressed to a *different* capsule.
+/// Per-`req_id` result topics keep concurrent invocations isolated. The
+/// kernel routes these topics but never reads or validates the payload
+/// bodies — they are capsule-space contract, not kernel surface.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CommandKind {
+    /// In-TUI slash command (default). Listed and dispatched by the chat
+    /// loop, never as a top-level CLI verb.
+    #[default]
+    Slash,
+    /// Top-level CLI verb: `astrid capsule <verb> [args...]`.
+    Cli,
+}
+
+impl CommandKind {
+    /// Returns `true` for the default kind so serializers can omit it
+    /// (matches the rest of the manifest fields' conventions).
+    #[must_use]
+    pub fn is_default(&self) -> bool {
+        matches!(self, Self::Slash)
+    }
+}
+
+/// Built-in `astrid capsule` subcommand names that a capsule-declared CLI
+/// verb (`kind = "cli"`) may NOT shadow.
+///
+/// A `kind = "cli"` command whose name appears here is rejected at manifest
+/// parse time (fail closed) so a capsule cannot mask or impersonate a
+/// built-in verb such as `install` or `remove`.
+///
+/// **This list MUST stay in sync with the `CapsuleCommands` clap enum in
+/// `astrid-cli` (`cli.rs`).** A unit test in astrid-cli asserts every
+/// `CapsuleCommands` variant's clap name appears here; if you add a
+/// built-in `astrid capsule` subcommand, add its name here too.
+pub const RESERVED_CAPSULE_VERBS: &[&str] = &[
+    "install", "update", "list", "remove", "tree", "deps", "build", "config", "show", "run", "help",
+];
+
+/// Information about a registered capsule command.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CommandInfo {
-    /// The slash command trigger (e.g. `/git`).
+    /// The command trigger (e.g. `git`; rendered `/git` for slash commands).
     pub name: String,
     /// A brief description of what the command does.
     pub description: String,
     /// The capsule that provides this command.
     pub provider_capsule: String,
+    /// How this command is surfaced (slash vs CLI verb). Defaults to
+    /// [`CommandKind::Slash`] for wire compatibility with daemons that
+    /// predate the field.
+    #[serde(default, skip_serializing_if = "CommandKind::is_default")]
+    pub kind: CommandKind,
 }
 
 // ---------------------------------------------------------------------------
@@ -639,4 +710,52 @@ pub struct GroupSummary {
     /// `true` for built-in groups (`admin`, `agent`, `restricted`).
     /// Clients should treat built-ins as read-only.
     pub builtin: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{CommandInfo, CommandKind};
+
+    #[test]
+    fn command_info_kind_defaults_to_slash_on_wire() {
+        // A frame from a daemon that predates the `kind` field has no
+        // `kind` key; it must deserialize to the Slash default so an older
+        // daemon's commands keep listing as slash commands.
+        let json = serde_json::json!({
+            "name": "git",
+            "description": "git ops",
+            "provider_capsule": "git-capsule",
+        });
+        let info: CommandInfo = serde_json::from_value(json).unwrap();
+        assert_eq!(info.kind, CommandKind::Slash);
+    }
+
+    #[test]
+    fn command_info_kind_roundtrips_cli() {
+        let info = CommandInfo {
+            name: "deploy".into(),
+            description: "deploy it".into(),
+            provider_capsule: "ops".into(),
+            kind: CommandKind::Cli,
+        };
+        let json = serde_json::to_value(&info).unwrap();
+        // `cli` is not the default, so it is serialized.
+        assert_eq!(json.get("kind").and_then(|k| k.as_str()), Some("cli"));
+        let back: CommandInfo = serde_json::from_value(json).unwrap();
+        assert_eq!(back.kind, CommandKind::Cli);
+    }
+
+    #[test]
+    fn command_info_default_kind_omitted_from_wire() {
+        let info = CommandInfo {
+            name: "git".into(),
+            description: "git ops".into(),
+            provider_capsule: "git-capsule".into(),
+            kind: CommandKind::Slash,
+        };
+        let json = serde_json::to_value(&info).unwrap();
+        // Default kind is skipped so the wire shape is byte-compatible with
+        // pre-field consumers.
+        assert!(json.get("kind").is_none());
+    }
 }

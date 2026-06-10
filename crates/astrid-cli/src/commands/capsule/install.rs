@@ -382,11 +382,35 @@ where
 fn finish_install(output: &InstallOutput, _home: &AstridHome) -> anyhow::Result<()> {
     let batch = BATCH_MODE.load(Ordering::Relaxed);
 
+    // Load the manifest once (always present post-install) — used both for
+    // env prompting and for surfacing the CLI commands this capsule adds.
+    let manifest_path = output.target_dir.join("Capsule.toml");
+    let manifest = astrid_capsule::discovery::load_manifest(&manifest_path)
+        .context("re-reading manifest for post-install diagnostics")?;
+
+    // Visibility (no approval gate in this phase): if the capsule declares
+    // any `kind = "cli"` commands, list the new top-level `astrid capsule
+    // <verb>` verbs it adds so the operator knows what just became
+    // invocable. Printed adjacent to the other manifest-derived notices.
+    let capsule_id = output.target_dir.file_name().map_or_else(
+        || "capsule".to_string(),
+        |n| n.to_string_lossy().into_owned(),
+    );
+    let cli_commands: Vec<&astrid_capsule::manifest::CommandDef> = manifest
+        .commands
+        .iter()
+        .filter(|c| c.kind == astrid_core::kernel_api::CommandKind::Cli)
+        .collect();
+    if !cli_commands.is_empty() {
+        eprintln!();
+        eprintln!("This capsule adds CLI commands:");
+        for c in cli_commands {
+            let desc = c.description.as_deref().unwrap_or("(no description)");
+            eprintln!("  {} — {desc} (provider: {capsule_id})", c.name);
+        }
+    }
+
     if !batch && output.env_needs_prompt {
-        // Load manifest from the target (always present post-install).
-        let manifest_path = output.target_dir.join("Capsule.toml");
-        let manifest = astrid_capsule::discovery::load_manifest(&manifest_path)
-            .context("re-reading manifest for env prompts")?;
         prompt_env_fields(&manifest.env, &output.env_path)?;
     }
 

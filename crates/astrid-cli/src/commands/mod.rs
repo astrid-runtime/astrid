@@ -5,6 +5,7 @@ pub(crate) mod audit;
 pub(crate) mod budget;
 pub(crate) mod caps;
 pub(crate) mod capsule;
+pub(crate) mod capsule_verb;
 pub(crate) mod chat;
 pub(crate) mod completions;
 pub(crate) mod config;

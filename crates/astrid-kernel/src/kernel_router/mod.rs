@@ -288,6 +288,7 @@ async fn handle_request(
                             .clone()
                             .unwrap_or_else(|| "No description".to_string()),
                         provider_capsule: c.id().to_string(),
+                        kind: cmd.kind,
                     });
                 }
             }
