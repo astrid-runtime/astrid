@@ -370,20 +370,32 @@ fn install_recv_invocation_context_resolves_invoking_principal_profile() {
         .unwrap();
     let mut state = minimal_host_state(rt.handle().clone());
 
-    // Seed an on-disk profile for `alice` with a non-default
-    // background-process quota, behind a tempdir-rooted cache.
+    // Seed on-disk profiles for `alice` (max_background_processes = 3) and the
+    // capsule owner / `default` principal (= 7), behind a tempdir-rooted cache.
+    // Both differ from the process-global default (8) so the recv path can be
+    // shown to apply the *publisher's* configured quota in every case —
+    // including when the publisher is the capsule owner.
     let dir = tempfile::tempdir().expect("tempdir");
     let home = astrid_core::dirs::AstridHome::from_path(dir.path());
     let alice = astrid_core::PrincipalId::new("alice").expect("valid alice");
     std::fs::create_dir_all(home.profiles_dir()).expect("mkdir etc/profiles");
-    std::fs::write(
-        home.profile_path(&alice),
-        format!(
-            "profile_version = {}\n[quotas]\nmax_background_processes = 3\n",
-            astrid_core::profile::CURRENT_PROFILE_VERSION
-        ),
-    )
-    .expect("write profile");
+    let write_profile = |principal: &astrid_core::PrincipalId, max_bg: u32| {
+        std::fs::write(
+            home.profile_path(principal),
+            format!(
+                "profile_version = {}\n[quotas]\nmax_background_processes = {max_bg}\n",
+                astrid_core::profile::CURRENT_PROFILE_VERSION
+            ),
+        )
+        .expect("write profile");
+    };
+    write_profile(&alice, 3);
+    write_profile(&state.principal, 7);
+    // Guard the fixture's premise: the seeded quotas must be distinct from the
+    // process-global default, or the assertions below couldn't tell the
+    // publisher's profile apart from the fall-back.
+    assert_ne!(astrid_core::profile::DEFAULT_MAX_BACKGROUND_PROCESSES, 3);
+    assert_ne!(astrid_core::profile::DEFAULT_MAX_BACKGROUND_PROCESSES, 7);
     state.profile_cache = Some(Arc::new(
         crate::profile_cache::PrincipalProfileCache::with_home(home),
     ));
@@ -404,19 +416,19 @@ fn install_recv_invocation_context_resolves_invoking_principal_profile() {
     .with_principal(alice.to_string());
     state.install_recv_invocation_context(&msg);
 
-    assert!(
-        state.invocation_profile.is_some(),
-        "alice's profile must be resolved on the recv path"
-    );
     assert_eq!(
         state.effective_profile().quotas.max_background_processes,
         3,
         "recv path must apply the invoking principal's quota, not the default"
     );
 
-    // A subsequent recv from the owner/default principal clears the override
-    // (the invoking-principal filter drops `self.principal`), so the quota
-    // falls back to the default rather than leaking alice's.
+    // A subsequent recv from the owner/default principal applies the OWNER's
+    // configured profile — NOT the process-global default and NOT a leak of
+    // alice's quota. `effective_profile()`'s fall-back is the global default,
+    // never the owner's on-disk profile, so the recv path must resolve the
+    // owner explicitly (as the interceptor path always has). Asserting on the
+    // effective quota value keeps the test off the `Option`'s internal
+    // representation.
     let owner_msg = astrid_events::ipc::IpcMessage::new(
         "some.v1.event",
         astrid_events::ipc::IpcPayload::RawJson(serde_json::json!({})),
@@ -425,8 +437,9 @@ fn install_recv_invocation_context_resolves_invoking_principal_profile() {
     .with_principal(state.principal.to_string());
     state.install_recv_invocation_context(&owner_msg);
 
-    assert!(
-        state.invocation_profile.is_none(),
-        "owner-principal recv clears the per-principal override"
+    assert_eq!(
+        state.effective_profile().quotas.max_background_processes,
+        7,
+        "owner-principal recv must apply the owner's configured profile, not the default or alice's"
     );
 }
