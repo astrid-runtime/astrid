@@ -35,40 +35,55 @@ impl TopicMatcher {
         let AstridEvent::Ipc { message, .. } = event else {
             return false;
         };
-        let topic = &message.topic;
-        if topic.split('.').count() > Self::MAX_TOPIC_DEPTH {
-            return false;
-        }
+        self.matches_topic(&message.topic)
+    }
 
-        if let Some(prefix_pat) = self.pattern.strip_suffix(".*") {
-            // Trailing `*` matches 1+ remaining segments after the
-            // prefix.
-            let prefix_segs: Vec<&str> = prefix_pat.split('.').collect();
-            let topic_segs: Vec<&str> = topic.split('.').collect();
-            if topic_segs.len() <= prefix_segs.len() {
-                return false;
-            }
-            prefix_segs
-                .iter()
-                .zip(topic_segs.iter())
-                .all(|(p, t)| p == &"*" || p == t)
-        } else {
-            // Exact: segment counts must match and every segment must
-            // pass single-segment wildcard semantics.
-            let pat_segs: Vec<&str> = self.pattern.split('.').collect();
-            let topic_segs: Vec<&str> = topic.split('.').collect();
-            pat_segs.len() == topic_segs.len()
-                && pat_segs
-                    .iter()
-                    .zip(topic_segs.iter())
-                    .all(|(p, t)| p == &"*" || p == t)
-        }
+    /// True iff `topic` matches this pattern. Thin wrapper over the shared,
+    /// allocation-free [`topic_pattern_matches`].
+    #[must_use]
+    pub fn matches_topic(&self, topic: &str) -> bool {
+        topic_pattern_matches(&self.pattern, topic)
     }
 
     /// Pattern as configured.
     #[must_use]
     pub fn pattern(&self) -> &str {
         &self.pattern
+    }
+}
+
+/// True iff `topic` matches `pattern` using trailing-`*`-is-subtree semantics:
+/// a trailing `*` matches one OR MORE remaining segments at any depth, a
+/// mid-segment `*` matches exactly one segment, otherwise segment counts must
+/// be equal. Allocation-free — iterates the segment splits directly.
+///
+/// The single source of truth shared by routed delivery ([`TopicMatcher`]),
+/// broadcast delivery (`EventReceiver::matches`), and the capsule
+/// publish/subscribe ACL authorization, so what a capsule is *allowed* to
+/// publish/subscribe can never diverge from what is actually delivered.
+/// `topic` is either a concrete published topic or a requested sub-pattern
+/// being authorized against an ACL entry.
+#[must_use]
+pub fn topic_pattern_matches(pattern: &str, topic: &str) -> bool {
+    if topic.split('.').count() > TopicMatcher::MAX_TOPIC_DEPTH {
+        return false;
+    }
+
+    if let Some(prefix_pat) = pattern.strip_suffix(".*") {
+        // Trailing `*`: the topic must be strictly deeper than the prefix and
+        // every prefix segment must match (the `*` covers 1+ remaining).
+        topic.split('.').count() > prefix_pat.split('.').count()
+            && prefix_pat
+                .split('.')
+                .zip(topic.split('.'))
+                .all(|(p, t)| p == "*" || p == t)
+    } else {
+        // Exact: equal segment count, each pair single-segment-wildcard match.
+        pattern.split('.').count() == topic.split('.').count()
+            && pattern
+                .split('.')
+                .zip(topic.split('.'))
+                .all(|(p, t)| p == "*" || p == t)
     }
 }
 
@@ -143,6 +158,48 @@ mod tests {
         assert!(m.matches(&ipc("a.zz.c")));
         assert!(!m.matches(&ipc("a.b.d")));
         assert!(!m.matches(&ipc("a.b.c.d")));
+    }
+
+    #[test]
+    fn matches_topic_subtree_for_acl() {
+        // Trailing `*` authorizes the whole subtree at any depth — the ACL
+        // semantics that let `astrid.v1.admin.*` cover every admin topic
+        // without enumerating each depth.
+        let m = TopicMatcher::new("astrid.v1.admin.*");
+        assert!(m.matches_topic("astrid.v1.admin.quota"));
+        assert!(m.matches_topic("astrid.v1.admin.agent.list"));
+        assert!(m.matches_topic("astrid.v1.admin.auth.pair.issue"));
+        // The prefix itself is not "under" the namespace.
+        assert!(!m.matches_topic("astrid.v1.admin"));
+        // A different namespace never matches.
+        assert!(!m.matches_topic("astrid.v1.registry.get"));
+
+        // Mid-segment `*` stays single-segment.
+        let mid = TopicMatcher::new("tool.v1.execute.*.result");
+        assert!(mid.matches_topic("tool.v1.execute.read_file.result"));
+        assert!(!mid.matches_topic("tool.v1.execute.a.b.result"));
+
+        // Exact (no `*`) stays equal-segment.
+        let exact = TopicMatcher::new("a.b.c");
+        assert!(exact.matches_topic("a.b.c"));
+        assert!(!exact.matches_topic("a.b.c.d"));
+    }
+
+    #[test]
+    fn matches_topic_enumerated_patterns_stay_compatible() {
+        // Backwards-compat: a depth-enumerated `*.*` / `*.*.*` pattern (as
+        // existing manifests declare today) still authorizes every topic it did
+        // under the old strict matcher — it now also matches deeper, harmlessly —
+        // so no capsule manifest needs to change when this lands.
+        let five = TopicMatcher::new("astrid.v1.admin.*.*");
+        assert!(five.matches_topic("astrid.v1.admin.agent.list")); // old 5-seg target
+        assert!(five.matches_topic("astrid.v1.admin.auth.pair")); // old 5-seg target
+        assert!(five.matches_topic("astrid.v1.admin.auth.pair.issue")); // now also deeper
+        assert!(!five.matches_topic("astrid.v1.admin.quota")); // 4-seg: below the pattern, as before
+
+        let six = TopicMatcher::new("astrid.v1.admin.*.*.*");
+        assert!(six.matches_topic("astrid.v1.admin.auth.pair.issue")); // old 6-seg target
+        assert!(!six.matches_topic("astrid.v1.admin.agent.list")); // 5-seg: below the pattern, as before
     }
 
     #[test]

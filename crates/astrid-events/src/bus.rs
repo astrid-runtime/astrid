@@ -432,9 +432,6 @@ impl EventReceiver {
         }
     }
 
-    /// Maximum allowed topic depth (dot-separated segments).
-    const MAX_TOPIC_DEPTH: usize = 20;
-
     /// Check if an event matches our topic pattern.
     ///
     /// Uses segment-aware matching. A `*` in a non-trailing position matches
@@ -455,40 +452,7 @@ impl EventReceiver {
             return false;
         };
 
-        let topic = &message.topic;
-
-        // Reject topics deeper than the maximum allowed depth.
-        if topic.split('.').count() > Self::MAX_TOPIC_DEPTH {
-            return false;
-        }
-
-        // Trailing wildcard: last segment is `*` and matches 1+ remaining segments.
-        if let Some(prefix_pat) = pattern.strip_suffix(".*") {
-            let mut prefix_segs = prefix_pat.split('.');
-            let mut topic_segs = topic.split('.');
-
-            // All prefix segments must match (with single-segment `*` support).
-            let prefix_matched = prefix_segs
-                .by_ref()
-                .zip(topic_segs.by_ref())
-                .all(|(p, t)| p == "*" || p == t);
-
-            // Prefix must be fully consumed and topic must have 1+ remaining
-            // segments (the trailing `*` matches 1+ segments).
-            prefix_matched && prefix_segs.next().is_none() && topic_segs.next().is_some()
-        } else {
-            // Exact segment-count match with single-segment `*` wildcards.
-            let mut pat_segs = pattern.split('.');
-            let mut topic_segs = topic.split('.');
-
-            let all_matched = pat_segs
-                .by_ref()
-                .zip(topic_segs.by_ref())
-                .all(|(p, t)| p == "*" || p == t);
-
-            // Both iterators must be exhausted (equal segment count).
-            all_matched && pat_segs.next().is_none() && topic_segs.next().is_none()
-        }
+        crate::topic_pattern_matches(pattern, &message.topic)
     }
 
     /// Returns and resets the cumulative count of messages lost due to

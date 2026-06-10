@@ -59,7 +59,7 @@ pub use entry::{
     METRIC_ROUTE_QUANTUM_STARVED_TOTAL, PrincipalKey, RouteKey,
 };
 pub(crate) use entry::{RouteEntry, SubscriptionRepAllocator};
-pub use matcher::{TopicMatcher, ipc_size_of, principal_class_label};
+pub use matcher::{TopicMatcher, ipc_size_of, principal_class_label, topic_pattern_matches};
 pub use receiver::{
     METRIC_ROUTE_ACTIVE_PRINCIPALS, METRIC_ROUTE_BUDGET_BYTES_IN_USE, RoutedEventReceiver,
 };

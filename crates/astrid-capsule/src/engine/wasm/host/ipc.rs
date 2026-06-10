@@ -187,6 +187,14 @@ fn audit_ipc<T, E: std::fmt::Debug>(
 
 /// Check whether `topic_pattern` is allowed by the capsule's
 /// `ipc_subscribe` ACL.
+///
+/// Uses the ROUTE-LAYER [`astrid_events::TopicMatcher`] so a declared trailing
+/// `*` authorizes the whole subtree (any depth) — the same semantics by which
+/// events are actually delivered. A manifest `[subscribe]` entry of
+/// `astrid.v1.admin.*` therefore authorizes subscribing to anything under that
+/// namespace without enumerating each depth. Breadth is the operator's call
+/// (the manifest declares intent; capabilities + install review are the
+/// boundary), not something the matcher enforces by forcing enumeration.
 fn check_subscribe_acl(state: &HostState, topic_pattern: &str) -> Result<(), ErrorCode> {
     if state.ipc_subscribe_patterns.is_empty() {
         return Err(ErrorCode::CapabilityDenied);
@@ -194,7 +202,7 @@ fn check_subscribe_acl(state: &HostState, topic_pattern: &str) -> Result<(), Err
     if !state
         .ipc_subscribe_patterns
         .iter()
-        .any(|acl| crate::topic::topic_matches(topic_pattern, acl))
+        .any(|acl| astrid_events::topic_pattern_matches(acl, topic_pattern))
     {
         return Err(ErrorCode::CapabilityDenied);
     }
@@ -232,10 +240,14 @@ fn publish_inner(
     if state.ipc_publish_patterns.is_empty() {
         return Err(ErrorCode::CapabilityDenied);
     }
+    // Route-layer matcher: a declared trailing `*` authorizes publishing the
+    // whole subtree (any depth), matching delivery semantics — so a manifest
+    // `[publish]` entry of `astrid.v1.admin.*` covers `astrid.v1.admin.agent.list`,
+    // `astrid.v1.admin.auth.pair.issue`, etc. without enumerating each depth.
     if !state
         .ipc_publish_patterns
         .iter()
-        .any(|pattern| crate::topic::topic_matches(&topic, pattern))
+        .any(|pattern| astrid_events::topic_pattern_matches(pattern, &topic))
     {
         return Err(ErrorCode::CapabilityDenied);
     }
@@ -786,5 +798,43 @@ mod audit_scope_tests {
         assert_eq!(got.len(), 2, "non-audit fan-in delivers all principals");
         assert!(got.iter().any(|p| p == "alice"));
         assert!(got.iter().any(|p| p == "bob"));
+    }
+
+    #[tokio::test]
+    async fn subscribe_rejects_non_terminal_wildcard() {
+        // Regression guard for the daemon-down crash (capsule-cli #25). The cli
+        // run loop tried to runtime-subscribe to a multi-wildcard pattern; the
+        // syntactic gate returned InvalidInput, run() returned Err before
+        // signal_ready, and the whole daemon went unreachable (the cli owns the
+        // socket). The patterns are even DECLARED in the subscribe ACL here — the
+        // gate rejects them regardless, so a manifest can declare a [subscribe]
+        // pattern a runtime subscribe can never use. Pin it: a `*` that is not the
+        // final segment is rejected; the single trailing `*` the fix kept works.
+        let rt = tokio::runtime::Handle::current();
+        let acl = &[
+            "astrid.v1.admin.response.*",
+            "astrid.v1.admin.response.*.*",
+            "astrid.v1.admin.response.*.*.*",
+        ];
+        let mut state = host_state_for(rt, "default", false, acl);
+
+        assert!(
+            matches!(
+                IpcHost::subscribe(&mut state, "astrid.v1.admin.response.*.*".to_string()),
+                Err(ErrorCode::InvalidInput)
+            ),
+            "a non-terminal wildcard must be rejected even when declared in the ACL",
+        );
+        assert!(
+            matches!(
+                IpcHost::subscribe(&mut state, "astrid.v1.admin.response.*.*.*".to_string()),
+                Err(ErrorCode::InvalidInput)
+            ),
+            "a deeper multi-wildcard must be rejected too",
+        );
+        assert!(
+            IpcHost::subscribe(&mut state, "astrid.v1.admin.response.*".to_string()).is_ok(),
+            "the single trailing wildcard the fix kept must be subscribable",
+        );
     }
 }
