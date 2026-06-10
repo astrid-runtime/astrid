@@ -93,8 +93,19 @@ impl sys::Host for HostState {
             use std::io::Write;
             match log_file.lock() {
                 Ok(mut f) => {
-                    let _ = writeln!(f, "{timestamp} {level_str} [{capsule_id}] {message}");
-                    true
+                    match writeln!(f, "{timestamp} {level_str} [{capsule_id}] {message}") {
+                        Ok(()) => true,
+                        Err(e) => {
+                            // Write failed (e.g. disk full). Fall through to the
+                            // tracing subscriber rather than dropping the line.
+                            tracing::warn!(
+                                capsule = %capsule_id,
+                                error = %e,
+                                "capsule log write failed; falling back to tracing subscriber"
+                            );
+                            false
+                        },
+                    }
                 },
                 Err(e) => {
                     tracing::warn!(
@@ -109,7 +120,15 @@ impl sys::Host for HostState {
             false
         };
 
-        if !wrote_to_file {
+        // ERROR-level guest logs ALWAYS surface to the daemon's tracing
+        // subscriber, even when also written to a per-capsule file. The SDK
+        // `#[astrid::run]` macro logs a run loop's failure via `log::error`
+        // before returning; without this, that reason lands ONLY in the
+        // per-capsule file and the daemon log shows just a contextless
+        // "Capsule run loop exited before signaling ready" — the silent crash
+        // that is painful to diagnose. Lower levels stay file-only when a
+        // capsule log captured them, to preserve the daemon log's signal.
+        if should_emit_to_daemon_log(wrote_to_file, level) {
             match level {
                 LogLevel::Trace => tracing::trace!(plugin = %capsule_id, "{message}"),
                 LogLevel::Debug => tracing::debug!(plugin = %capsule_id, "{message}"),
@@ -279,6 +298,16 @@ fn resolve_secret(state: &HostState, key: &str) -> String {
     String::new()
 }
 
+/// Whether a guest log line should ALSO be emitted to the daemon's tracing
+/// subscriber. Lines written to a per-capsule file are normally kept out of
+/// the daemon log to preserve its signal-to-noise; ERROR-level lines are the
+/// exception — they always surface, so a run-loop capsule's `run()` exiting
+/// via `log::error` (the SDK macro logs it before returning) is visible in the
+/// daemon log, not only the per-capsule file.
+fn should_emit_to_daemon_log(wrote_to_file: bool, level: LogLevel) -> bool {
+    !wrote_to_file || matches!(level, LogLevel::Error)
+}
+
 #[cfg(test)]
 mod log_chain_tests {
     use std::sync::Arc;
@@ -367,6 +396,21 @@ mod log_chain_tests {
         state.capsule_log = Some(log_file);
 
         state.log(LogLevel::Error, "post-poison line".into());
+    }
+
+    #[test]
+    fn error_logs_always_surface_to_daemon_log() {
+        // The silent-run-loop-crash fix: an ERROR line surfaces to the daemon
+        // log even when also captured by a per-capsule file, so a run loop
+        // exiting via `log::error` is visible where operators look.
+        assert!(should_emit_to_daemon_log(true, LogLevel::Error));
+        assert!(should_emit_to_daemon_log(false, LogLevel::Error));
+        // Lower levels stay file-only when a per-capsule file captured them.
+        assert!(!should_emit_to_daemon_log(true, LogLevel::Warn));
+        assert!(!should_emit_to_daemon_log(true, LogLevel::Info));
+        // With no per-capsule file, everything still goes to the daemon log.
+        assert!(should_emit_to_daemon_log(false, LogLevel::Warn));
+        assert!(should_emit_to_daemon_log(false, LogLevel::Info));
     }
 }
 
