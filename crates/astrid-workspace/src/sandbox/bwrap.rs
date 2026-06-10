@@ -168,6 +168,19 @@ impl ProcessSandboxConfig {
             ]);
         }
 
+        // Read-only file injections: bind each host-owned verified snapshot at
+        // its in-sandbox target. Placed AFTER the writable --bind entries (so a
+        // later writable bind can't shadow the ro-bind) and BEFORE
+        // --unshare-all (so it sits within the namespace setup). The namespace
+        // creates the mount point, so `target` need not exist on the host.
+        for inj in &self.ro_injections {
+            args.extend([
+                OsString::from("--ro-bind"),
+                inj.source.as_os_str().into(),
+                inj.target.as_os_str().into(),
+            ]);
+        }
+
         // Drop all namespaces
         args.push(OsString::from("--unshare-all"));
 
@@ -305,6 +318,55 @@ mod tests {
             "writable --bind (pos {writable_bind_pos}) must come after \
              hidden --tmpfs (pos {hidden_tmpfs_pos}) so capsule dir \
              punches through the tmpfs overlay"
+        );
+    }
+
+    #[test]
+    fn test_bwrap_prefix_ro_inject_position() {
+        // The injection --ro-bind must appear AFTER the writable --bind and
+        // BEFORE --unshare-all so a later bind cannot shadow it and it sits
+        // inside the namespace setup.
+        let config = ProcessSandboxConfig::new("/project").with_ro_inject("/host/snap", "/etc/x");
+        let prefix = config.build_bwrap_prefix();
+
+        let args_str: Vec<String> = prefix
+            .args
+            .iter()
+            .map(|a| a.to_string_lossy().to_string())
+            .collect();
+
+        let writable_bind_pos = args_str
+            .iter()
+            .enumerate()
+            .filter(|(_, a)| *a == "--bind")
+            .find(|(i, _)| args_str.get(i + 1) == Some(&"/project".to_string()))
+            .map(|(i, _)| i)
+            .expect("should have writable --bind for /project");
+
+        let ro_inject_pos = args_str
+            .iter()
+            .enumerate()
+            .filter(|(_, a)| *a == "--ro-bind")
+            .find(|(i, _)| args_str.get(i + 1) == Some(&"/host/snap".to_string()))
+            .map(|(i, _)| i)
+            .expect("should have --ro-bind for the injection snapshot");
+
+        let unshare_pos = args_str
+            .iter()
+            .position(|a| a == "--unshare-all")
+            .expect("should have --unshare-all");
+
+        assert_eq!(args_str[ro_inject_pos + 1], "/host/snap", "ro-bind source");
+        assert_eq!(args_str[ro_inject_pos + 2], "/etc/x", "ro-bind target");
+        assert!(
+            ro_inject_pos > writable_bind_pos,
+            "injection --ro-bind (pos {ro_inject_pos}) must come after the \
+             writable --bind (pos {writable_bind_pos})"
+        );
+        assert!(
+            ro_inject_pos < unshare_pos,
+            "injection --ro-bind (pos {ro_inject_pos}) must come before \
+             --unshare-all (pos {unshare_pos})"
         );
     }
 

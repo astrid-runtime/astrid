@@ -32,6 +32,14 @@ pub struct ManagedProcess {
     #[allow(dead_code)]
     pub(super) command: String,
     pub(super) creator: astrid_core::principal::PrincipalId,
+    /// Cleanup guard for any read-only file injections wired into this child's
+    /// sandbox. Lives as long as the handle: on Linux it keeps the ro-bind
+    /// snapshot source alive for the child's lifetime and removes the scratch
+    /// dir on drop; on macOS it unlinks the materialized target files on drop.
+    /// `None` when the spawn had no injections. Cleaned by the struct's own
+    /// drop — no logic needed in `ManagedProcess::Drop`.
+    #[allow(dead_code)] // Held purely for its Drop; never read after spawn.
+    pub(super) injection_guard: Option<super::inject::InjectionGuard>,
 }
 
 /// Synchronously kill a child process group on Unix and start the kill
@@ -103,10 +111,18 @@ pub(super) fn spawn_reader_task<R>(
 }
 
 /// Prepare a sandboxed command. Shared between spawn and spawn-background.
+///
+/// `injections` exposes host-verified, read-only files inside the child's
+/// sandbox (see [`InjectionGuard`](super::inject)); pass `&[]` for none.
+/// `inject_env` sets host-controlled env vars on the child (the `env-pointer`
+/// placements point an agent at its injected file); pass `&[]` for none. These
+/// are set by the HOST authoritatively — not via the guest `spawn-request.env`.
 pub(super) fn prepare_sandboxed_command(
     cmd: &str,
     args: &[String],
     workspace_root: &std::path::Path,
+    injections: &[astrid_workspace::RoInjection],
+    inject_env: &[(String, String)],
 ) -> Result<Command, String> {
     let mut inner_cmd = Command::new(cmd);
     let str_args: Vec<&str> = args.iter().map(String::as_str).collect();
@@ -114,8 +130,11 @@ pub(super) fn prepare_sandboxed_command(
     inner_cmd.env_remove("ASTRID_SOCKET_PATH");
     inner_cmd.env_remove("ASTRID_SESSION_TOKEN");
     inner_cmd.env_remove("ASTRID_HOME");
+    for (k, v) in inject_env {
+        inner_cmd.env(k, v);
+    }
 
-    SandboxCommand::wrap(inner_cmd, workspace_root)
+    SandboxCommand::wrap_with_injections(inner_cmd, workspace_root, injections)
         .map_err(|e| format!("failed to wrap command in sandbox: {e}"))
 }
 

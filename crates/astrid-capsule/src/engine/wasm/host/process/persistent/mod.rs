@@ -102,6 +102,12 @@ pub(in crate::engine::wasm::host::process) struct SpawnParams {
     pub(in crate::engine::wasm::host::process) max_lifetime_ms: Option<u64>,
     pub(in crate::engine::wasm::host::process) idle_timeout_ms: Option<u64>,
     pub(in crate::engine::wasm::host::process) exit_retention_ms: Option<u64>,
+    /// Cleanup guard for any read-only file injections wired into the child's
+    /// sandbox. Stored on the entry so it lives as long as the persistent
+    /// process and cleans up when the entry is reaped (`reap_entry` consumes
+    /// the entry by value on every reap path, so the guard's drop fires then).
+    pub(in crate::engine::wasm::host::process) injection_guard:
+        Option<super::inject::InjectionGuard>,
 }
 
 /// Host-owned registry of a capsule's persistent processes. Cloned (`Arc`)
@@ -221,6 +227,7 @@ impl PersistentProcessRegistry {
         spawn_ring_reader(&self.runtime, p.stderr, Arc::clone(&core), Stream::Err);
         let (exit_tx, exit_rx) = watch::channel::<Option<entry::ExitRecord>>(None);
         let monitor = spawn_monitor(&self.runtime, p.child, Arc::clone(&core), exit_tx);
+        let injection_guard = p.injection_guard;
 
         let mut id = mint_id();
         let mut key = self.key_of(&id);
@@ -253,6 +260,7 @@ impl PersistentProcessRegistry {
                 core,
                 exit_rx,
                 monitor,
+                injection_guard,
             },
         );
         Ok(id)
