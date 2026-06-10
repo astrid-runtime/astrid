@@ -357,3 +357,89 @@ fn install_recv_invocation_context_preserves_outer_caller_inside_interceptor() {
         "Nested recv inside interceptor must not rewrite the outer caller"
     );
 }
+
+/// The guest-pulled `recv` path resolves the invoking principal's quota
+/// profile, so per-principal ceilings (here `max_background_processes`)
+/// apply to run+recv capsules instead of silently using the default
+/// profile — the gap this fix closes. Previously `invocation_profile` was
+/// only ever set on the dispatcher-driven interceptor path.
+#[test]
+fn install_recv_invocation_context_resolves_invoking_principal_profile() {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap();
+    let mut state = minimal_host_state(rt.handle().clone());
+
+    // Seed on-disk profiles for `alice` (max_background_processes = 3) and the
+    // capsule owner / `default` principal (= 7), behind a tempdir-rooted cache.
+    // Both differ from the process-global default (8) so the recv path can be
+    // shown to apply the *publisher's* configured quota in every case —
+    // including when the publisher is the capsule owner.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let home = astrid_core::dirs::AstridHome::from_path(dir.path());
+    let alice = astrid_core::PrincipalId::new("alice").expect("valid alice");
+    std::fs::create_dir_all(home.profiles_dir()).expect("mkdir etc/profiles");
+    let write_profile = |principal: &astrid_core::PrincipalId, max_bg: u32| {
+        std::fs::write(
+            home.profile_path(principal),
+            format!(
+                "profile_version = {}\n[quotas]\nmax_background_processes = {max_bg}\n",
+                astrid_core::profile::CURRENT_PROFILE_VERSION
+            ),
+        )
+        .expect("write profile");
+    };
+    write_profile(&alice, 3);
+    write_profile(&state.principal, 7);
+    // Guard the fixture's premise: the seeded quotas must be distinct from the
+    // process-global default, or the assertions below couldn't tell the
+    // publisher's profile apart from the fall-back.
+    assert_ne!(astrid_core::profile::DEFAULT_MAX_BACKGROUND_PROCESSES, 3);
+    assert_ne!(astrid_core::profile::DEFAULT_MAX_BACKGROUND_PROCESSES, 7);
+    state.profile_cache = Some(Arc::new(
+        crate::profile_cache::PrincipalProfileCache::with_home(home),
+    ));
+
+    // No caller yet → no override → the process-global default quota.
+    assert!(state.invocation_profile.is_none());
+    assert_eq!(
+        state.effective_profile().quotas.max_background_processes,
+        astrid_core::profile::DEFAULT_MAX_BACKGROUND_PROCESSES
+    );
+
+    // A recv message from alice installs HER profile → her quota applies.
+    let msg = astrid_events::ipc::IpcMessage::new(
+        "some.v1.event",
+        astrid_events::ipc::IpcPayload::RawJson(serde_json::json!({})),
+        uuid::Uuid::new_v4(),
+    )
+    .with_principal(alice.to_string());
+    state.install_recv_invocation_context(&msg);
+
+    assert_eq!(
+        state.effective_profile().quotas.max_background_processes,
+        3,
+        "recv path must apply the invoking principal's quota, not the default"
+    );
+
+    // A subsequent recv from the owner/default principal applies the OWNER's
+    // configured profile — NOT the process-global default and NOT a leak of
+    // alice's quota. `effective_profile()`'s fall-back is the global default,
+    // never the owner's on-disk profile, so the recv path must resolve the
+    // owner explicitly (as the interceptor path always has). Asserting on the
+    // effective quota value keeps the test off the `Option`'s internal
+    // representation.
+    let owner_msg = astrid_events::ipc::IpcMessage::new(
+        "some.v1.event",
+        astrid_events::ipc::IpcPayload::RawJson(serde_json::json!({})),
+        uuid::Uuid::new_v4(),
+    )
+    .with_principal(state.principal.to_string());
+    state.install_recv_invocation_context(&owner_msg);
+
+    assert_eq!(
+        state.effective_profile().quotas.max_background_processes,
+        7,
+        "owner-principal recv must apply the owner's configured profile, not the default or alice's"
+    );
+}

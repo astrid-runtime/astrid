@@ -221,7 +221,30 @@ pub struct HostState {
     /// Host functions that gate on per-principal sub-budgets (IPC
     /// throughput, background processes, HTTP streams) read this through
     /// [`effective_profile`](Self::effective_profile). Cleared on exit.
+    ///
+    /// Resolved on BOTH per-invocation paths: the dispatcher-driven
+    /// interceptor path (`invoke_interceptor`) and the guest-pulled
+    /// `ipc::recv` path ([`install_recv_invocation_context`](Self::install_recv_invocation_context),
+    /// via [`profile_cache`](Self::profile_cache)). Either way the *default*
+    /// quotas apply when the principal is unconfigured, by one of two
+    /// mechanisms: with no cache (tests / single-tenant) this stays `None`
+    /// and [`effective_profile`](Self::effective_profile) substitutes the
+    /// process-global default; with a cache, a principal that has no profile
+    /// file resolves to `Some(PrincipalProfile::default())` (a missing file is
+    /// not an error — see [`PrincipalProfile::load`](astrid_core::profile::PrincipalProfile::load)).
     pub invocation_profile: Option<Arc<astrid_core::profile::PrincipalProfile>>,
+    /// Shared profile-cache handle, used by the `ipc::recv` path to resolve
+    /// the invoking principal's [`PrincipalProfile`](astrid_core::profile::PrincipalProfile)
+    /// into [`invocation_profile`](Self::invocation_profile).
+    ///
+    /// The interceptor path resolves the profile in
+    /// [`WasmEngine::invoke_interceptor`](super::WasmEngine::invoke_interceptor)
+    /// and installs it directly; the guest-pulled `ipc::recv` path has no
+    /// dispatcher frame to do that, so
+    /// [`install_recv_invocation_context`](Self::install_recv_invocation_context)
+    /// resolves through this handle. `None` in tests / single-tenant — the
+    /// per-principal quota fields then fall back to the default profile.
+    pub profile_cache: Option<Arc<crate::profile_cache::PrincipalProfileCache>>,
     /// Per-invocation env overlay for the invoking principal.
     ///
     /// Loaded from
@@ -698,6 +721,12 @@ impl HostState {
     /// - [`invocation_capsule_log`](Self::invocation_capsule_log) —
     ///   per-principal log file; falls back to load-time `capsule_log`
     ///   when the principal has no home directory yet.
+    /// - [`invocation_profile`](Self::invocation_profile) — the publishing
+    ///   principal's quota profile (owner included), resolved through
+    ///   [`profile_cache`](Self::profile_cache) so per-principal ceilings
+    ///   (background-process count, IPC throughput, HTTP streams) apply on
+    ///   this path too; falls back to the process-global default on a missing
+    ///   cache or failed load.
     ///
     /// Skipped vs the interceptor path (each is independently
     /// recoverable; documenting the gaps so the omissions are
@@ -705,12 +734,12 @@ impl HostState {
     /// - `invocation_home` / `invocation_tmp` / `invocation_secret_store` —
     ///   none of the current run+recv capsules touch home/tmp paths
     ///   or secrets from the recv loop. Add when one starts to.
-    /// - `invocation_profile` / `store_meter` — quotas remain the
-    ///   capsule owner's. Acceptable for the immediate fix because
-    ///   the run+recv capsules are shared singletons whose per-call
-    ///   work is bounded by the message size limits already in the
-    ///   bus. Move to a real lookup when per-principal quota
-    ///   enforcement is needed.
+    /// - `store_meter` — the per-invocation linear-memory ceiling stays the
+    ///   capsule owner's; the recv path does not re-target it per publisher
+    ///   the way `invoke_interceptor` does. Acceptable because the run+recv
+    ///   capsules are shared singletons whose per-call allocation is bounded
+    ///   by the bus message-size limits. Re-target when a recv-driven capsule
+    ///   needs per-principal memory enforcement.
     pub(crate) fn install_recv_invocation_context(&mut self, msg: &astrid_events::ipc::IpcMessage) {
         // Fast path: if the new message's principal matches whatever
         // we already have installed, keep the existing
@@ -743,13 +772,57 @@ impl HostState {
 
         self.caller_context = Some(msg.clone());
 
-        let invocation_principal: Option<astrid_core::PrincipalId> = msg
+        // The publishing principal, parsed once. Used two different ways
+        // below, matching the split in the interceptor path
+        // (`invoke_interceptor`):
+        //
+        //   • QUOTA profile — resolved for EVERY publisher, the owner
+        //     included. `effective_profile()`'s fallback is the process-global
+        //     *default*, never the owner's profile, so an owner-published
+        //     message must still resolve the owner's profile or its on-disk
+        //     quotas are silently ignored. (For an owner with no profile file
+        //     the cache returns the default, so this is a no-op in the common
+        //     single-tenant case and only bites once an operator configures
+        //     the owner principal.)
+        //
+        //   • KV / log / env overrides — installed only when the publisher
+        //     DIFFERS from the load-time owner. The load-time `kv` /
+        //     `capsule_log` / `config` are already the owner's, so an
+        //     owner-published message has nothing to override and these are
+        //     cleared back to the load-time values.
+        let publisher: Option<astrid_core::PrincipalId> = msg
             .principal
             .as_deref()
-            .and_then(|p| astrid_core::PrincipalId::new(p).ok())
-            .filter(|p| *p != self.principal);
+            .and_then(|p| astrid_core::PrincipalId::new(p).ok());
 
-        let Some(p) = invocation_principal else {
+        // Resolve the publisher's quota profile (owner included) so
+        // per-principal ceilings (background-process count, IPC throughput,
+        // HTTP streams) apply on the guest-pulled `recv` path too — not only
+        // the dispatcher-driven interceptor path. When `msg.principal` is
+        // absent/unparseable the owner's own profile is resolved, mirroring
+        // `invoke_interceptor`'s `owner_principal` fallback. Best-effort: a
+        // failed load logs and leaves `invocation_profile = None` (the same
+        // process-global default fall-back as a missing cache), never denying
+        // the message — the recv path has no error channel.
+        let profile_principal = publisher.clone().unwrap_or_else(|| self.principal.clone());
+        self.invocation_profile = self.profile_cache.as_ref().and_then(|cache| {
+            match cache.resolve(&profile_principal) {
+                Ok(profile) => Some(profile),
+                Err(e) => {
+                    tracing::warn!(
+                        principal = %profile_principal,
+                        error = %e,
+                        "recv-path profile resolve failed; per-principal quotas fall back to the default profile"
+                    );
+                    None
+                },
+            }
+        });
+
+        // KV / log / env scoping overrides only kick in for a non-owner
+        // publisher; an owner-published message clears them back to the
+        // load-time (owner) values.
+        let Some(p) = publisher.filter(|p| *p != self.principal) else {
             self.invocation_kv = None;
             self.invocation_capsule_log = None;
             self.invocation_env_overlay = None;
