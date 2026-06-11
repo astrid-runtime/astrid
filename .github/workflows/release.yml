@@ -45,7 +45,14 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: "1.95"
+          # MUST match rust-toolchain.toml's channel EXACTLY (incl. patch).
+          # rustup treats "1.95" and "1.95.0" as distinct toolchains: the
+          # action adds `targets` to the toolchain it installs, but the build
+          # uses the one rust-toolchain.toml pins. A mismatch installs the
+          # cross-target std onto the wrong toolchain, so cross builds fail with
+          # `error[E0463]: can't find crate for core/std`. Native builds escape
+          # it because the host std ships with every toolchain by default.
+          toolchain: "1.95.0"
           targets: ${{ matrix.target }}
 
       - name: Install cross-compilation tools (Linux ARM)
