@@ -9,6 +9,10 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Multi-subscriber fan-out is dispatched concurrently instead of as one serial chain, so every subscriber reliably receives the event.** When more than one capsule subscribed to a topic with a handler, the dispatcher ran them all as a single sequential interceptor chain on one task, serialized per-(capsule, principal) chain lock. For a fan-out — independent responders, e.g. the 6-way `tool.v1.request.describe` describe broadcast — a slow leading member starved the later ones, so the requester collected responses from only a non-deterministic subset (~3 of 6) within its window, and re-firing the request contended on the chain lock rather than parallelizing. Matches that all share one priority (which have no defined order, and are every multi-subscriber topic today: tool-describe, the prompt hook fan-out, and LLM-provider discovery) are now dispatched independently on their own per-(capsule, principal) consumers and run concurrently; one subscriber's `Final`/`Deny`/error/slowness no longer suppresses or stalls another. A genuinely ordered set (members at distinct priorities) keeps the sequential, short-circuiting chain. Kernel-internal; no host-ABI / WIT / IPC change. Closes #902.
+
 ## [0.8.0] - 2026-06-10
 
 A large release — roughly fifty PRs since v0.7.0 — landing three bodies of work plus a security-hardening pass:
