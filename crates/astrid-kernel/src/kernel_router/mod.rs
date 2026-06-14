@@ -89,7 +89,20 @@ pub(crate) fn spawn_kernel_router(kernel: Arc<crate::Kernel>) -> tokio::task::Jo
                     handle_request(&kernel, message.topic.clone(), caller, req).await;
                 },
                 Err(e) => {
-                    warn!(error = %e, topic = %message.topic, "Failed to parse KernelRequest from IPC");
+                    // The kernel router shares the broadcast
+                    // `astrid.v1.request.*` namespace with capsule traffic — the
+                    // sage-mcp broker's `astrid.v1.request.mcp.*`, and any future
+                    // capsule-to-capsule request topics. `KernelRequest` is
+                    // `#[serde(tag = "method")]`, so a payload WITHOUT a `method`
+                    // discriminator was never addressed to the kernel; ignore it
+                    // quietly rather than warning. Only a payload that IS shaped
+                    // like a kernel request (`method` present) yet fails to parse
+                    // is a genuinely malformed management request worth a warning.
+                    if val.get("method").is_some() {
+                        warn!(error = %e, topic = %message.topic, "Failed to parse KernelRequest from IPC");
+                    } else {
+                        debug!(topic = %message.topic, "Ignoring non-kernel request on shared astrid.v1.request.* namespace");
+                    }
                 },
             }
         }
