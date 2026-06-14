@@ -879,10 +879,22 @@ async fn find_matching_interceptors(
             }
         }
     }
-    // Sort by priority — lower values fire first. Priority rides along in the
+    // Sort by priority (lower fires first), then by capsule id and action as a
+    // STABLE tiebreak so equal-priority members have a deterministic order.
+    // `registry.list()` iterates a HashMap (arbitrary per run), so a
+    // priority-only sort left ties (e.g. a mixed chain `[10, 20, 20]`) in
+    // non-deterministic order — which matters in the ordered-chain path, where a
+    // tied member's `Final`/`Deny` short-circuits its sibling. (An all-equal set
+    // dispatches concurrently, so order is irrelevant there, but a stable order
+    // keeps dispatch reproducible everywhere.) Priority rides along in the
     // returned tuple so dispatch can distinguish an ordered chain (distinct
     // priorities) from an independent fan-out (all equal).
-    matches.sort_by_key(|(_, _, priority)| *priority);
+    matches.sort_by(|(a_cap, a_act, a_pri), (b_cap, b_act, b_pri)| {
+        a_pri
+            .cmp(b_pri)
+            .then_with(|| a_cap.id().as_str().cmp(b_cap.id().as_str()))
+            .then_with(|| a_act.cmp(b_act))
+    });
     matches
 }
 

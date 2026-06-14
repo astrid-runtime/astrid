@@ -414,6 +414,34 @@ async fn find_matching_interceptors_sorts_by_priority() {
 }
 
 #[tokio::test]
+async fn find_matching_interceptors_tiebreaks_equal_priority_by_id() {
+    // Equal-priority members must have a DETERMINISTIC order — `registry.list()`
+    // is HashMap order, so a priority-only sort left ties arbitrary, which
+    // matters in the ordered-chain path where a tied member's Final/Deny
+    // short-circuits its sibling. The stable tiebreak is (priority, capsule id,
+    // action). Two members tie at 20; the lone 10 sorts first, then the 20s by
+    // id ("a-tie" before "z-tie") regardless of registration order.
+    let (z_tie, _) = MockCapsule::with_priority("z-tie", "test.event", 20, None);
+    let (a_tie, _) = MockCapsule::with_priority("a-tie", "test.event", 20, None);
+    let (guard, _) = MockCapsule::with_priority("guard", "test.event", 10, None);
+
+    let mut registry = CapsuleRegistry::new();
+    // Register in an order that does NOT match the expected sort.
+    registry.register(Box::new(z_tie)).unwrap();
+    registry.register(Box::new(guard)).unwrap();
+    registry.register(Box::new(a_tie)).unwrap();
+    let registry = Arc::new(RwLock::new(registry));
+
+    let matches = find_matching_interceptors(&registry, "test.event").await;
+    let names: Vec<&str> = matches.iter().map(|(c, _, _)| c.id().as_str()).collect();
+    assert_eq!(
+        names,
+        vec!["guard", "a-tie", "z-tie"],
+        "equal-priority members must tiebreak deterministically by capsule id"
+    );
+}
+
+#[tokio::test]
 async fn deny_interceptor_short_circuits_chain() {
     // Guard at priority 10 denies, handler at priority 100 should never fire.
     let order = Arc::new(Mutex::new(Vec::<String>::new()));
