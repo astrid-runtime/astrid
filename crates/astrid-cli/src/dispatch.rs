@@ -43,8 +43,7 @@ pub(crate) async fn dispatch(cli: Cli) -> Result<ExitCode> {
         && !matches!(
             cli.command,
             Some(
-                Commands::SelfUpdate
-                    | Commands::Update
+                Commands::Update(_)
                     | Commands::Completions(_)
                     // `mcp serve` owns stdout for the MCP JSON-RPC stream;
                     // a banner there would corrupt the protocol framing.
@@ -193,8 +192,8 @@ async fn dispatch_subcommand(
         Some(Commands::Setup(args)) => commands::setup::run(&args),
         Some(Commands::Version(args)) => commands::version::run(&args),
         Some(Commands::Completions(args)) => commands::completions::run(&args),
-        Some(Commands::Update | Commands::SelfUpdate) => {
-            commands::self_update::run_self_update().await?;
+        Some(Commands::Update(args)) => {
+            commands::self_update::run_self_update(args).await?;
             Ok(ExitCode::SUCCESS)
         },
     }

@@ -259,12 +259,27 @@ pub(crate) enum Commands {
     /// Generate shell completion scripts.
     Completions(CompletionsArgs),
 
-    /// Update Astrid to the latest release.
-    Update,
+    /// Update Astrid to the latest release (`self-update` is a legacy alias).
+    #[command(alias = "self-update")]
+    Update(UpdateArgs),
+}
 
-    /// Update Astrid to the latest release (legacy — use `astrid update`).
-    #[command(hide = true)]
-    SelfUpdate,
+/// Arguments for `astrid update`.
+#[derive(Debug, clap::Args)]
+pub(crate) struct UpdateArgs {
+    /// Install without the interactive confirmation prompt.
+    #[arg(short = 'y', long)]
+    pub(crate) yes: bool,
+
+    /// Report whether an update is available without installing it.
+    #[arg(long)]
+    pub(crate) check: bool,
+
+    /// Override the release source as `owner/repo` — rehearse the update flow
+    /// against a fork or pre-release. (Env: `ASTRID_UPDATE_REPO`; API base:
+    /// `ASTRID_UPDATE_API`.)
+    #[arg(long, value_name = "OWNER/REPO")]
+    pub(crate) source: Option<String>,
 }
 
 #[derive(Subcommand)]
