@@ -9,7 +9,7 @@ use parking_lot::{Mutex, RwLock};
 use tokio::sync::Notify;
 
 use crate::event::AstridEvent;
-use crate::route::entry::{MAX_SUBSCRIPTION_BUDGET_BYTES, RouteEntry, RouteKey};
+use crate::route::entry::{RouteEntry, RouteKey};
 
 /// Gauge: number of active principal sub-queues currently held by a
 /// route. Labelled by `capsule`.
@@ -43,12 +43,17 @@ impl RoutedEventReceiver {
     /// first event from the next DRR round.
     pub async fn recv(&mut self, timeout: Option<std::time::Duration>) -> Option<Arc<AstridEvent>> {
         loop {
-            // Fast path: try to drain one event immediately.
+            // Fast path: pop exactly ONE event. Draining a full batch here
+            // (`drr_drain`) and returning only its first element would discard
+            // the rest of the batch — those events are removed from the queue
+            // but never handed back, so they are lost. The host recv pairs this
+            // single pop with a `try_drain` for the remainder, so taking one
+            // event and leaving the rest in the entry is loss-free even when a
+            // burst of events (e.g. a fan-out where every responder replies at
+            // once) lands between two recv calls.
             {
-                let mut out: Vec<Arc<AstridEvent>> = Vec::with_capacity(1);
                 let mut entry = self.route_entry.lock();
-                let _ = entry.drr_drain(&mut out, MAX_SUBSCRIPTION_BUDGET_BYTES);
-                if let Some(first) = out.into_iter().next() {
+                if let Some(first) = entry.drr_pop_one() {
                     return Some(first);
                 }
             }
