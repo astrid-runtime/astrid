@@ -405,11 +405,39 @@ async fn find_matching_interceptors_sorts_by_priority() {
     let registry = Arc::new(RwLock::new(registry));
 
     let matches = find_matching_interceptors(&registry, "test.event").await;
-    let names: Vec<&str> = matches.iter().map(|(c, _)| c.id().as_str()).collect();
+    let names: Vec<&str> = matches.iter().map(|(c, _, _)| c.id().as_str()).collect();
     assert_eq!(
         names,
         vec!["low-pri", "mid-pri", "high-pri"],
         "find_matching_interceptors must return results sorted by priority"
+    );
+}
+
+#[tokio::test]
+async fn find_matching_interceptors_tiebreaks_equal_priority_by_id() {
+    // Equal-priority members must have a DETERMINISTIC order — `registry.list()`
+    // is HashMap order, so a priority-only sort left ties arbitrary, which
+    // matters in the ordered-chain path where a tied member's Final/Deny
+    // short-circuits its sibling. The stable tiebreak is (priority, capsule id,
+    // action). Two members tie at 20; the lone 10 sorts first, then the 20s by
+    // id ("a-tie" before "z-tie") regardless of registration order.
+    let (z_tie, _) = MockCapsule::with_priority("z-tie", "test.event", 20, None);
+    let (a_tie, _) = MockCapsule::with_priority("a-tie", "test.event", 20, None);
+    let (guard, _) = MockCapsule::with_priority("guard", "test.event", 10, None);
+
+    let mut registry = CapsuleRegistry::new();
+    // Register in an order that does NOT match the expected sort.
+    registry.register(Box::new(z_tie)).unwrap();
+    registry.register(Box::new(guard)).unwrap();
+    registry.register(Box::new(a_tie)).unwrap();
+    let registry = Arc::new(RwLock::new(registry));
+
+    let matches = find_matching_interceptors(&registry, "test.event").await;
+    let names: Vec<&str> = matches.iter().map(|(c, _, _)| c.id().as_str()).collect();
+    assert_eq!(
+        names,
+        vec!["guard", "a-tie", "z-tie"],
+        "equal-priority members must tiebreak deterministically by capsule id"
     );
 }
 
@@ -492,6 +520,56 @@ async fn final_interceptor_short_circuits_chain() {
     assert!(
         !invoked_core.load(Ordering::SeqCst),
         "core must NOT be invoked after Final"
+    );
+
+    handle.abort();
+}
+
+#[tokio::test]
+async fn equal_priority_matches_fan_out_without_cross_suppression() {
+    // Regression: multiple subscribers at the SAME priority are an independent
+    // fan-out, not an ordered chain. Every subscriber must fire, and one
+    // returning Deny must NOT short-circuit the others. (A 6-way tool-describe
+    // fan-out previously reached only ~3 of 6 responders because it ran as a
+    // single serial, short-circuiting chain whose lead member could starve the
+    // rest.)
+    let (mut denier, denier_invoked) =
+        MockCapsule::with_priority("denier", "fanout.topic", 100, None);
+    denier.result_override = Some(InterceptResult::Deny {
+        reason: "must not suppress siblings".into(),
+    });
+
+    let (resp_a, invoked_a) = MockCapsule::with_priority("resp-a", "fanout.topic", 100, None);
+    let (resp_b, invoked_b) = MockCapsule::with_priority("resp-b", "fanout.topic", 100, None);
+    let (resp_c, invoked_c) = MockCapsule::with_priority("resp-c", "fanout.topic", 100, None);
+
+    let mut registry = CapsuleRegistry::new();
+    // Register the denier first — under the old chain it could sort ahead of the
+    // responders and short-circuit them; the fan-out path fires every match.
+    registry.register(Box::new(denier)).unwrap();
+    registry.register(Box::new(resp_a)).unwrap();
+    registry.register(Box::new(resp_b)).unwrap();
+    registry.register(Box::new(resp_c)).unwrap();
+    let registry = Arc::new(RwLock::new(registry));
+
+    let bus = Arc::new(EventBus::with_capacity(64));
+    let dispatcher = EventDispatcher::new(Arc::clone(&registry), Arc::clone(&bus));
+    let handle = tokio::spawn(dispatcher.run());
+
+    tokio::task::yield_now().await;
+    publish_ipc(&bus, "fanout.topic");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    assert!(
+        denier_invoked.load(Ordering::SeqCst),
+        "the denier itself must fire"
+    );
+    assert!(
+        invoked_a.load(Ordering::SeqCst)
+            && invoked_b.load(Ordering::SeqCst)
+            && invoked_c.load(Ordering::SeqCst),
+        "every equal-priority subscriber must fire — a sibling's Deny must not \
+         short-circuit the fan-out"
     );
 
     handle.abort();

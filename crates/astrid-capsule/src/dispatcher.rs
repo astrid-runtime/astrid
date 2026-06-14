@@ -380,23 +380,28 @@ impl EventDispatcher {
     }
 }
 
-/// Dispatch matching interceptors as a middleware chain.
+/// Dispatch matching interceptors for an event.
 ///
-/// Interceptors are called sequentially in priority order (lower fires first).
-/// Each interceptor returns an [`crate::capsule::InterceptResult`] that
-/// controls the chain:
+/// Matches at DISTINCT priorities form an ordered middleware chain: called
+/// sequentially in priority order (lower fires first), each returning an
+/// [`crate::capsule::InterceptResult`] that controls the chain:
 /// - `Continue` — pass (possibly modified) payload to the next interceptor
 /// - `Final` — short-circuit with a response, no further interceptors fire
 /// - `Deny` — short-circuit with denial, audit-logged, no further interceptors fire
 ///
+/// Matches that all share ONE priority have no defined order, so they are an
+/// independent fan-out (N capsules each reacting to the same event): each is
+/// dispatched on its own per-(capsule, principal) consumer and runs
+/// concurrently, with no cross-subscriber short-circuit — one responder's
+/// `Final`/`Deny`/error/slowness cannot suppress or stall the others.
+///
 /// Within a single capsule, events are still delivered in publish order via
 /// per-(capsule, principal) mpsc queues (preserving IPC `seq` ordering and
-/// isolating principals from one another). The chain semantics apply across
-/// capsules for the same event.
+/// isolating principals from one another).
 fn dispatch_to_capsule_queues(
     queues: &CapsuleQueues,
     chain_locks: &ChainLocks,
-    matches: Vec<(Arc<dyn Capsule>, String)>,
+    matches: Vec<(Arc<dyn Capsule>, String, u32)>,
     topic: Arc<String>,
     payload_bytes: Arc<Vec<u8>>,
     ipc_message: Option<Arc<astrid_events::ipc::IpcMessage>>,
@@ -405,17 +410,11 @@ fn dispatch_to_capsule_queues(
         return;
     }
 
-    // Clone what we need for the spawned chain task.
-    let matches_owned: Vec<_> = matches
-        .into_iter()
-        .map(|(c, a)| (Arc::clone(&c), a))
-        .collect();
-
     let principal_key: PrincipalKey = ipc_message.as_deref().and_then(|m| m.principal.clone());
 
     // For single-interceptor events (common case), skip chain overhead.
-    if matches_owned.len() == 1 {
-        let (capsule, action) = matches_owned.into_iter().next().unwrap();
+    if matches.len() == 1 {
+        let (capsule, action, _priority) = matches.into_iter().next().unwrap();
         dispatch_single(
             queues,
             capsule,
@@ -428,8 +427,42 @@ fn dispatch_to_capsule_queues(
         return;
     }
 
-    // Multi-interceptor chain: run sequentially in priority order.
-    // Spawned as a task so the dispatcher loop doesn't block.
+    // Multiple matches at the SAME priority have no defined order between them
+    // (the priority sort is arbitrary among equal keys), so they are an
+    // independent fan-out — N capsules each reacting to one event — NOT an
+    // ordered middleware chain. Dispatch each on its OWN per-(capsule,
+    // principal) consumer so they run CONCURRENTLY and no subscriber's outcome
+    // (`Final`/`Deny`, an error, or a slow/throttled invocation) can suppress or
+    // stall the others. The previous single serial chain task let a slow leading
+    // member starve later ones — a 6-way `tool.v1.request.describe` fan-out
+    // reached only ~3 of 6 responders before the requester's window elapsed —
+    // and its per-(capsule, principal) chain lock made re-firing serialize
+    // instead of parallelize. Only a genuinely ORDERED set (members at DISTINCT
+    // priorities — an explicit "fire me before you" signal) keeps the
+    // sequential, short-circuiting chain below.
+    let lead_priority = matches[0].2;
+    if matches
+        .iter()
+        .all(|(_, _, priority)| *priority == lead_priority)
+    {
+        for (capsule, action, _priority) in matches {
+            dispatch_single(
+                queues,
+                capsule,
+                action,
+                Arc::clone(&topic),
+                Arc::clone(&payload_bytes),
+                ipc_message.clone(),
+                principal_key.clone(),
+            );
+        }
+        return;
+    }
+
+    // Distinct priorities → ordered middleware chain: run sequentially in
+    // priority order. Spawned as a task so the dispatcher loop doesn't block.
+    let matches_owned: Vec<(Arc<dyn Capsule>, String)> =
+        matches.into_iter().map(|(c, a, _)| (c, a)).collect();
     let topic_clone = Arc::clone(&topic);
     let ipc_clone = ipc_message.clone();
     let chain_locks_clone = Arc::clone(chain_locks);
@@ -816,12 +849,14 @@ fn dispatch_single(
 /// Find all capsules with interceptors matching the given topic.
 ///
 /// Takes a brief read lock on the registry. Only `Ready` capsules are
-/// considered. Returns `(capsule, action)` pairs sorted by interceptor
-/// priority (lower values fire first, default 100).
+/// considered. Returns `(capsule, action, priority)` tuples sorted by
+/// interceptor priority (lower values fire first, default 100). The priority is
+/// returned so the caller can distinguish an ordered chain (distinct
+/// priorities) from an independent fan-out (all equal).
 async fn find_matching_interceptors(
     registry: &RwLock<CapsuleRegistry>,
     topic: &str,
-) -> Vec<(Arc<dyn crate::capsule::Capsule>, String)> {
+) -> Vec<(Arc<dyn crate::capsule::Capsule>, String, u32)> {
     let registry = registry.read().await;
     let mut matches: Vec<(Arc<dyn crate::capsule::Capsule>, String, u32)> = Vec::new();
     for capsule_id in registry.list() {
@@ -844,12 +879,23 @@ async fn find_matching_interceptors(
             }
         }
     }
-    // Sort by priority — lower values fire first.
-    matches.sort_by_key(|(_, _, priority)| *priority);
+    // Sort by priority (lower fires first), then by capsule id and action as a
+    // STABLE tiebreak so equal-priority members have a deterministic order.
+    // `registry.list()` iterates a HashMap (arbitrary per run), so a
+    // priority-only sort left ties (e.g. a mixed chain `[10, 20, 20]`) in
+    // non-deterministic order — which matters in the ordered-chain path, where a
+    // tied member's `Final`/`Deny` short-circuits its sibling. (An all-equal set
+    // dispatches concurrently, so order is irrelevant there, but a stable order
+    // keeps dispatch reproducible everywhere.) Priority rides along in the
+    // returned tuple so dispatch can distinguish an ordered chain (distinct
+    // priorities) from an independent fan-out (all equal).
+    matches.sort_by(|(a_cap, a_act, a_pri), (b_cap, b_act, b_pri)| {
+        a_pri
+            .cmp(b_pri)
+            .then_with(|| a_cap.id().as_str().cmp(b_cap.id().as_str()))
+            .then_with(|| a_act.cmp(b_act))
+    });
     matches
-        .into_iter()
-        .map(|(capsule, action, _)| (capsule, action))
-        .collect()
 }
 
 #[cfg(test)]
