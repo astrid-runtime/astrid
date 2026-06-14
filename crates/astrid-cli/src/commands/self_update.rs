@@ -89,8 +89,11 @@ fn running_binary() -> anyhow::Result<PathBuf> {
 /// contains a `Cellar` component. Such installs update via `brew upgrade`, not
 /// self-update — we must not shadow them with a second copy.
 fn is_homebrew_managed(exe: &Path) -> bool {
-    exe.components()
-        .any(|c| c.as_os_str().eq_ignore_ascii_case("Cellar"))
+    exe.components().any(|c| {
+        c.as_os_str()
+            .to_str()
+            .is_some_and(|s| s.eq_ignore_ascii_case("Cellar"))
+    })
 }
 
 /// Cached update check result.
@@ -275,6 +278,16 @@ fn verify_sha256(archive: &[u8], sums_body: &str, asset_name: &str) -> anyhow::R
 /// the install is never left half-swapped. The `.bak` copies are left in place
 /// for manual rollback after a successful update.
 fn backup_and_swap(install_dir: &Path, extract_dir: &Path, names: &[&str]) -> anyhow::Result<()> {
+    // 0. The expected binaries are a SET. A release missing one would otherwise
+    //    leave a version-mismatched pair (new `astrid`, old `astrid-daemon`)
+    //    while still reporting success — require them all before touching disk.
+    for name in names {
+        anyhow::ensure!(
+            extract_dir.join(name).exists(),
+            "release archive is missing '{name}'"
+        );
+    }
+
     // 1. Back up existing live binaries.
     let mut backups: Vec<(PathBuf, PathBuf)> = Vec::new(); // (live, bak)
     for name in names {
@@ -291,12 +304,9 @@ fn backup_and_swap(install_dir: &Path, extract_dir: &Path, names: &[&str]) -> an
     //    target, so the rename below is atomic).
     let mut staged: Vec<(PathBuf, PathBuf)> = Vec::new(); // (tmp, live)
     for name in names {
-        let src = extract_dir.join(name);
-        if !src.exists() {
-            continue;
-        }
         let tmp = install_dir.join(format!(".{name}.new"));
-        std::fs::copy(&src, &tmp).with_context(|| format!("failed to stage {name}"))?;
+        std::fs::copy(extract_dir.join(name), &tmp)
+            .with_context(|| format!("failed to stage {name}"))?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -304,36 +314,48 @@ fn backup_and_swap(install_dir: &Path, extract_dir: &Path, names: &[&str]) -> an
         }
         staged.push((tmp, install_dir.join(name)));
     }
-    if staged.is_empty() {
-        bail!("release archive contained none of the expected binaries");
-    }
 
     // 3. Atomically rename each staged binary into place. On the first failure,
-    //    roll every binary back from its backup and clean up the temps.
+    //    roll every binary back from its backup and clean up the remaining temps.
+    //    Rollback uses `rename` (not `copy`): copying over a binary that is
+    //    currently executing fails with ETXTBSY, whereas renaming swaps the
+    //    directory entry without touching the running inode. A rollback failure
+    //    is surfaced rather than swallowed.
     for (idx, (tmp, live)) in staged.iter().enumerate() {
         if let Err(e) = std::fs::rename(tmp, live) {
+            let mut rollback_errs = Vec::new();
             for (blive, bak) in &backups {
-                let _ = std::fs::copy(bak, blive);
+                if let Err(re) = std::fs::rename(bak, blive) {
+                    rollback_errs.push(format!("{}: {re}", blive.display()));
+                }
             }
             for (t, _) in &staged[idx..] {
                 let _ = std::fs::remove_file(t);
             }
-            return Err(e).with_context(|| format!("failed to install {}", live.display()));
+            let base = format!("failed to install {}", live.display());
+            let msg = if rollback_errs.is_empty() {
+                base
+            } else {
+                format!(
+                    "{base}; ROLLBACK ALSO FAILED ({}) — restore *.bak manually",
+                    rollback_errs.join("; ")
+                )
+            };
+            return Err(e).context(msg);
         }
     }
     Ok(())
 }
 
-/// Best-effort writability check for a directory.
+/// Best-effort writability check for a directory: create and drop a uniquely
+/// named temp file in it. A fixed probe name could collide with (and clobber) a
+/// real file or another concurrent updater; `tempfile` picks a random suffix and
+/// removes the file on drop.
 fn is_writable_dir(dir: &Path) -> bool {
-    let probe = dir.join(".astrid-write-probe");
-    match std::fs::File::create(&probe) {
-        Ok(_) => {
-            let _ = std::fs::remove_file(&probe);
-            true
-        },
-        Err(_) => false,
-    }
+    tempfile::Builder::new()
+        .prefix(".astrid-write-probe")
+        .tempfile_in(dir)
+        .is_ok()
 }
 
 /// Confirm an action. True if `assume_yes`, if stdin is not a TTY (scripted —
@@ -346,7 +368,11 @@ fn confirm(prompt: &str, assume_yes: bool) -> anyhow::Result<bool> {
     eprint!("{prompt} [Y/n] ");
     std::io::Write::flush(&mut std::io::stderr())?;
     let mut input = String::new();
-    std::io::stdin().read_line(&mut input)?;
+    if std::io::stdin().read_line(&mut input)? == 0 {
+        // EOF (Ctrl-D) before any answer — treat as "no" rather than defaulting
+        // to yes; a closed stdin is not consent to overwrite the binary.
+        return Ok(false);
+    }
     let input = input.trim();
     Ok(input.is_empty() || input.eq_ignore_ascii_case("y") || input.eq_ignore_ascii_case("yes"))
 }
@@ -470,17 +496,21 @@ async fn download_verify_extract(
         .to_string();
     let archive = download(client, &url).await?;
 
-    if let Some(sums_url) = asset_url(release, "SHA256SUMS.txt").map(str::to_owned) {
-        let sums = download(client, &sums_url).await?;
-        let sums_body = String::from_utf8(sums).context("SHA256SUMS.txt is not UTF-8")?;
-        verify_sha256(&archive, &sums_body, &asset_name)?;
-        println!("{}", Theme::dimmed("Checksum verified."));
-    } else {
-        println!(
-            "{}",
-            Theme::warning("Release has no SHA256SUMS.txt — skipping checksum verification.")
-        );
-    }
+    // Fail closed: a release with no SHA256SUMS.txt is unverifiable, so we refuse
+    // to install it rather than swap in an unchecked binary. (SHA256SUMS is
+    // integrity, not authenticity — but skipping it entirely would defeat even
+    // the on-the-wire / corrupted-download check.)
+    let sums_url = asset_url(release, "SHA256SUMS.txt")
+        .map(str::to_owned)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "release has no SHA256SUMS.txt — refusing to install an unverifiable binary"
+            )
+        })?;
+    let sums = download(client, &sums_url).await?;
+    let sums_body = String::from_utf8(sums).context("SHA256SUMS.txt is not UTF-8")?;
+    verify_sha256(&archive, &sums_body, &asset_name)?;
+    println!("{}", Theme::dimmed("Checksum verified."));
 
     let tmp_dir = tempfile::tempdir()?;
     let archive_path = tmp_dir.path().join(&asset_name);
@@ -696,13 +726,13 @@ mod tests {
 
     #[test]
     fn resolve_repo_precedence_and_validation() {
+        // An explicit `--source` wins over env/default and parses owner/repo.
+        // (The `None` path falls through to ASTRID_UPDATE_REPO then the default
+        // — not asserted here, since the env var can't be isolated under the
+        // clippy ban on set_var/remove_var.)
         assert_eq!(
             resolve_repo(Some("acme/astrid")).unwrap(),
             ("acme".to_string(), "astrid".to_string())
-        );
-        assert_eq!(
-            resolve_repo(None).unwrap(),
-            (DEFAULT_ORG.to_string(), DEFAULT_REPO.to_string())
         );
         assert!(resolve_repo(Some("no-slash")).is_err());
         assert!(resolve_repo(Some("owner/")).is_err());
@@ -753,6 +783,32 @@ mod tests {
             b"OLD-D"
         );
         // No staging temps left behind.
+        assert!(!install.join(".astrid.new").exists());
+    }
+
+    #[test]
+    fn backup_and_swap_bails_when_archive_missing_a_binary() {
+        let dir = tempfile::tempdir().unwrap();
+        let install = dir.path().join("bin");
+        let extract = dir.path().join("new");
+        std::fs::create_dir_all(&install).unwrap();
+        std::fs::create_dir_all(&extract).unwrap();
+
+        std::fs::write(install.join("astrid"), b"OLD").unwrap();
+        std::fs::write(install.join("astrid-daemon"), b"OLD-D").unwrap();
+        // Archive only ships `astrid`; `astrid-daemon` is absent.
+        std::fs::write(extract.join("astrid"), b"NEW").unwrap();
+
+        assert!(backup_and_swap(&install, &extract, MANAGED_BINARIES).is_err());
+
+        // The completeness check runs before anything is touched: live binaries
+        // are unchanged and no backups or staging temps were created.
+        assert_eq!(std::fs::read(install.join("astrid")).unwrap(), b"OLD");
+        assert_eq!(
+            std::fs::read(install.join("astrid-daemon")).unwrap(),
+            b"OLD-D"
+        );
+        assert!(!install.join("astrid.bak").exists());
         assert!(!install.join(".astrid.new").exists());
     }
 }
