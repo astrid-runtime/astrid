@@ -7,5 +7,6 @@ pub(crate) mod install_prompts;
 pub(crate) mod install_update;
 pub(crate) mod list;
 pub(crate) mod meta;
+pub(crate) mod new;
 pub(crate) mod remove;
 pub(crate) mod show;
