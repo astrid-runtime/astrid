@@ -995,10 +995,16 @@ impl ExecutionEngine for WasmEngine {
         // kernel from the real publishing capsule, so a predictable value still
         // cannot be forged by a guest. One instance per capsule per daemon, so
         // the name is a unique, stable key.
-        let capsule_uuid = uuid::Uuid::new_v5(
-            &uuid::Uuid::NAMESPACE_OID,
-            self.manifest.package.name.as_bytes(),
-        );
+        //
+        // Namespace is a dedicated, fixed Astrid value — NOT `Uuid::NAMESPACE_OID`
+        // (reserved for ISO OIDs), so a capsule-name-derived id can never
+        // semantically collide with an OID-derived uuid from another system.
+        // Arbitrary but FIXED: changing it changes every capsule's identity, so
+        // it must never change.
+        const CAPSULE_ID_NAMESPACE: uuid::Uuid =
+            uuid::Uuid::from_u128(0x310714d5_9c6d_4c94_8187_75258f393bb6);
+        let capsule_uuid =
+            uuid::Uuid::new_v5(&CAPSULE_ID_NAMESPACE, self.manifest.package.name.as_bytes());
 
         // Create shared concurrency controls before entering the blocking
         // plugin build. The blocking semaphore (cores-2-ish) gates host calls
