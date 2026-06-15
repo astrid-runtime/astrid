@@ -11,6 +11,13 @@ use astrid_capsule_install::{
 };
 use astrid_core::dirs::AstridHome;
 
+/// Resolve the `home://wit/` mirror directory for the default principal.
+fn wit_mirror_dir(home: &AstridHome) -> std::path::PathBuf {
+    home.principal_home(&astrid_core::PrincipalId::default())
+        .root()
+        .join("wit")
+}
+
 fn write_minimal_capsule(base: &std::path::Path, name: &str, version: &str) {
     std::fs::write(
         base.join("Capsule.toml"),
@@ -240,6 +247,88 @@ fn install_writes_meta_json() {
         .join("meta-test");
     let meta = read_meta(&installed).expect("meta.json should exist after install");
     assert_eq!(meta.version, "2.0.0");
+}
+
+#[test]
+fn install_materializes_home_wit_mirror() {
+    // The system capsule's list_interfaces / read_interface tools read
+    // `home://wit/<basename>`, which resolves to <principal_home>/wit/.
+    // Install must mirror the content-addressed WIT blobs there, keyed
+    // by basename (read_interface rejects names containing '/').
+    let capsule_dir = tempfile::tempdir().unwrap();
+    let base = capsule_dir.path();
+    write_minimal_capsule(base, "wit-mirror-test", "1.0.0");
+
+    std::fs::create_dir_all(base.join("wit/deps/astrid-contracts")).unwrap();
+    let broker_src = "package astrid:broker;\ninterface broker {}\n";
+    let contracts_src = "package astrid:contracts;\ninterface contracts {}\n";
+    std::fs::write(base.join("wit/broker.wit"), broker_src).unwrap();
+    // Nested path — must be flattened to basename in the mirror.
+    std::fs::write(
+        base.join("wit/deps/astrid-contracts/astrid-contracts.wit"),
+        contracts_src,
+    )
+    .unwrap();
+
+    let home_dir = tempfile::tempdir().unwrap();
+    let home = AstridHome::from_path(home_dir.path());
+    install_from_local_path(base, &home, InstallOptions::default())
+        .expect("install should succeed");
+
+    let mirror = wit_mirror_dir(&home);
+    let broker = mirror.join("broker.wit");
+    let contracts = mirror.join("astrid-contracts.wit");
+
+    assert!(
+        broker.exists(),
+        "broker.wit must be mirrored to home://wit/"
+    );
+    assert!(
+        contracts.exists(),
+        "nested astrid-contracts.wit must be flattened to its basename in home://wit/"
+    );
+    assert_eq!(std::fs::read_to_string(&broker).unwrap(), broker_src);
+    assert_eq!(std::fs::read_to_string(&contracts).unwrap(), contracts_src);
+    // No nested directory should be created in the mirror — basename only.
+    assert!(
+        !mirror.join("deps").exists(),
+        "mirror must be flat (basename), not a nested tree"
+    );
+}
+
+#[test]
+fn install_wit_mirror_is_idempotent() {
+    // Re-installing the same capsule must not error and must converge
+    // to the same mirror state (idempotency requirement).
+    let capsule_dir = tempfile::tempdir().unwrap();
+    let base = capsule_dir.path();
+    write_minimal_capsule(base, "wit-idem-test", "1.0.0");
+
+    std::fs::create_dir_all(base.join("wit")).unwrap();
+    let src = "package astrid:idem;\ninterface idem {}\n";
+    std::fs::write(base.join("wit/idem.wit"), src).unwrap();
+
+    let home_dir = tempfile::tempdir().unwrap();
+    let home = AstridHome::from_path(home_dir.path());
+
+    install_from_local_path(base, &home, InstallOptions::default()).expect("first install");
+    let mirrored = wit_mirror_dir(&home).join("idem.wit");
+    assert_eq!(std::fs::read_to_string(&mirrored).unwrap(), src);
+
+    // Second install (same bytes) must not error and must leave the same
+    // content. Also confirm no stray temp files leak into the mirror.
+    install_from_local_path(base, &home, InstallOptions::default()).expect("re-install");
+    assert_eq!(std::fs::read_to_string(&mirrored).unwrap(), src);
+
+    let entries: Vec<String> = std::fs::read_dir(wit_mirror_dir(&home))
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(
+        entries,
+        vec!["idem.wit".to_string()],
+        "mirror must contain exactly the one file, no temp leftovers"
+    );
 }
 
 #[test]
