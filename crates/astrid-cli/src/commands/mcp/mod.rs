@@ -34,6 +34,7 @@
 //! config, so a stray diagnostic can never corrupt the protocol stream.
 
 mod elicit;
+mod ingress;
 mod server;
 mod watch;
 

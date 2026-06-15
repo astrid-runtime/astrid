@@ -52,6 +52,7 @@ use uuid::Uuid;
 use crate::socket_client::SocketClient;
 
 use super::elicit;
+use super::ingress;
 
 /// Request topic for the broker `tools/list` front door.
 pub(super) const TOOLS_LIST_TOPIC: &str = "astrid.v1.request.mcp.tools.list";
@@ -170,16 +171,44 @@ impl ServerHandler for AstridMcpServer {
         request: CallToolRequestParams,
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        let req_id = new_req_id();
         let arguments = request.arguments.map_or(Value::Null, Value::Object);
 
-        let body = json!({
-            "req_id": req_id,
-            "name": request.name,
-            "arguments": arguments,
-        });
+        // Build the broker `tool.call` body for a fresh `req_id`. The same
+        // (name, arguments) may be sent twice — once that trips the ingress
+        // consent gate, then once more after consent is recorded — each with
+        // its own correlation id so their replies never collide.
+        let call_body = |req_id: &str| {
+            json!({
+                "req_id": req_id,
+                "name": request.name,
+                "arguments": arguments,
+            })
+        };
 
-        let reply = self.round_trip(TOOL_CALL_TOPIC, &req_id, body).await?;
+        let req_id = new_req_id();
+        let reply = self
+            .round_trip(TOOL_CALL_TOPIC, &req_id, call_body(&req_id))
+            .await?;
+
+        // If the broker gated the call on an untrusted ingress, it replies an
+        // `ingress_approval_required` signal (NOT a result). Elicit the user's
+        // consent; on accept, record trust via the broker and RE-SEND the
+        // original call (now passing the gate). On deny / no-capability /
+        // error, fail secure with an MCP error.
+        let reply = if let Some(ingress) = ingress::IngressRequest::from_reply(&reply) {
+            let granted = self.resolve_ingress(&context.peer, &ingress).await?;
+            if !granted {
+                return Ok(CallToolResult::error(vec![Content::text(
+                    "Astrid tool calls were not authorized for this session.",
+                )]));
+            }
+            // Re-send the original call now that the ingress is trusted.
+            let retry_id = new_req_id();
+            self.round_trip(TOOL_CALL_TOPIC, &retry_id, call_body(&retry_id))
+                .await?
+        } else {
+            reply
+        };
 
         // If the routed tool parked on a capability approval, the broker
         // surfaces an `approval_required` flag instead of a terminal result.
@@ -223,6 +252,47 @@ impl AstridMcpServer {
             respond_body,
         )
         .await
+    }
+
+    /// Drive the ingress-consent bridge for a `tools/call` the broker gated on
+    /// an untrusted ingress: elicit the user's decision and, on accept,
+    /// forward it on the broker's
+    /// [`INGRESS_RESPOND_TOPIC`](ingress::INGRESS_RESPOND_TOPIC) front door so
+    /// the broker records trust (keyed on the kernel-stamped caller, never a
+    /// body field). Returns whether the ingress is now trusted — `true` only
+    /// when the user accepted AND the broker confirmed it persisted the grant.
+    ///
+    /// Fail-secure: a decline / no-capability / elicit error never sends a
+    /// respond and returns `false`. An accept that the broker could not
+    /// persist (ack `granted:false`) also returns `false` so the caller does
+    /// not re-send a call that would just trip the gate again.
+    async fn resolve_ingress(
+        &self,
+        peer: &rmcp::service::Peer<RoleServer>,
+        request: &ingress::IngressRequest,
+    ) -> Result<bool, McpError> {
+        if !ingress::elicit_consent(peer, request).await {
+            return Ok(false);
+        }
+
+        // The respond body carries NO source_id — the broker trusts the
+        // kernel-stamped caller of this message. A fresh req_id keys the ack.
+        let respond_req_id = new_req_id();
+        let respond_body = json!({ "req_id": respond_req_id, "accept": true });
+
+        let ack = self
+            .round_trip(
+                ingress::INGRESS_RESPOND_TOPIC,
+                &respond_req_id,
+                respond_body,
+            )
+            .await?;
+
+        let granted = ack.get("granted").and_then(Value::as_bool).unwrap_or(false);
+        if !granted {
+            warn!("MCP shim: broker did not confirm ingress trust grant; not retrying call");
+        }
+        Ok(granted)
     }
 }
 
