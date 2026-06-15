@@ -984,9 +984,21 @@ impl ExecutionEngine for WasmEngine {
             wasm_config.insert(key, serde_json::Value::String(val));
         }
 
-        // Pre-generate the session UUID so it can be registered in the
-        // capsule registry after the blocking plugin build completes.
-        let capsule_uuid = uuid::Uuid::new_v4();
+        // Capsule identity, used as the IPC `source_id` (kernel-stamped, never
+        // guest-settable) and the per-(capsule, topic, principal) route key.
+        // DETERMINISTIC (uuid v5 from the capsule name) so it is STABLE across
+        // daemon restarts. A per-boot random v4 made confused-deputy allow-sets
+        // that pin a capsule's source_id — e.g. sage-mcp's `trusted_ingress_ids`
+        // — impossible to configure: the value changed every boot and was
+        // surfaced by no command, so MCP tool calls were permanently denied.
+        // Determinism does not weaken the gate: `source_id` is stamped by the
+        // kernel from the real publishing capsule, so a predictable value still
+        // cannot be forged by a guest. One instance per capsule per daemon, so
+        // the name is a unique, stable key.
+        let capsule_uuid = uuid::Uuid::new_v5(
+            &uuid::Uuid::NAMESPACE_OID,
+            self.manifest.package.name.as_bytes(),
+        );
 
         // Create shared concurrency controls before entering the blocking
         // plugin build. The blocking semaphore (cores-2-ish) gates host calls
