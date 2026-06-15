@@ -104,6 +104,26 @@ impl SocketClient {
         })
     }
 
+    /// Re-establish the connection to the (possibly restarted) daemon,
+    /// re-reading the current session token and re-handshaking. The
+    /// [`session_id`](Self::session_id) is preserved.
+    ///
+    /// A daemon restart rebinds `system.sock` and rewrites the session
+    /// token; a long-lived uplink that kept its original socket is left
+    /// writing into a dead fd (every send fails `Broken pipe`). Calling
+    /// this swaps in a fresh connection to the live daemon. Used by the
+    /// MCP shim to survive a daemon restart instead of going stale for
+    /// the life of the session.
+    ///
+    /// # Errors
+    /// Returns an error if the daemon socket is absent (daemon down) or
+    /// the re-handshake is rejected — the caller should surface that
+    /// rather than retry indefinitely.
+    pub async fn reconnect(&mut self) -> Result<()> {
+        *self = Self::connect(self.session_id.clone()).await?;
+        Ok(())
+    }
+
     /// Read the next IPC message from the daemon.
     ///
     /// Frames that don't deserialize cleanly as

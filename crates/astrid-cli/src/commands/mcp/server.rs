@@ -105,10 +105,24 @@ impl AstridMcpServer {
 
         let mut client = self.client.lock().await;
 
-        client.send_message(msg).await.map_err(|e| {
-            warn!(topic = request_topic, error = %e, "MCP shim: failed to publish broker request");
-            McpError::internal_error(format!("failed to publish broker request: {e}"), None)
-        })?;
+        // Survive a daemon restart. If the publish fails — e.g. the daemon
+        // rebound `system.sock` under us and our socket is now a dead fd
+        // (`Broken pipe`) — re-dial the live daemon once and retry. Retrying
+        // is safe precisely because the *send* failed: the request never
+        // reached the broker, so no tool ran and there is no double-execution
+        // risk. A failure *after* a successful send is surfaced (below), not
+        // retried, since the routed tool may already have executed.
+        if let Err(first) = client.send_message(msg.clone()).await {
+            warn!(topic = request_topic, error = %first, "MCP shim: broker publish failed; reconnecting to daemon and retrying once");
+            client.reconnect().await.map_err(|e| {
+                warn!(error = %e, "MCP shim: reconnect to daemon failed");
+                McpError::internal_error(format!("reconnect to daemon failed: {e}"), None)
+            })?;
+            client.send_message(msg).await.map_err(|e| {
+                warn!(topic = request_topic, error = %e, "MCP shim: failed to publish broker request after reconnect");
+                McpError::internal_error(format!("failed to publish broker request after reconnect: {e}"), None)
+            })?;
+        }
 
         let raw = client
             .read_until_topic(&reply_topic, REQUEST_DEADLINE)
