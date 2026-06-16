@@ -452,15 +452,30 @@ fn mint_principal_keypair(
         return Err(err_internal(format!("keys dir create failed: {e}")));
     }
     let key_path = keys_dir.join(format!("{principal}.key"));
-    if let Err(e) = std::fs::write(&key_path, keypair.secret_key_bytes()) {
-        return Err(err_internal(format!("principal key write failed: {e}")));
-    }
+    // Create the key file 0600 atomically (via `OpenOptions::mode`) BEFORE
+    // writing the secret bytes, so the ed25519 private key is never momentarily
+    // group/world readable in the (0755) keys dir between a `write` and a
+    // follow-up `set_permissions` chmod — the TOCTOU a co-tenant could race.
+    // Mirrors `mint_default_principal_keypair` in the kernel bootstrap.
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        if let Err(e) = std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600))
-        {
-            return Err(err_internal(format!("principal key chmod failed: {e}")));
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let write_result = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&key_path)
+            .and_then(|mut f| f.write_all(&keypair.secret_key_bytes()));
+        if let Err(e) = write_result {
+            return Err(err_internal(format!("principal key write failed: {e}")));
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        if let Err(e) = std::fs::write(&key_path, keypair.secret_key_bytes()) {
+            return Err(err_internal(format!("principal key write failed: {e}")));
         }
     }
     let public_key = format!("ed25519:{}", keypair.export_public_key().to_hex());

@@ -99,7 +99,23 @@ impl SandboxCommand {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     fn sensitive_astrid_paths() -> io::Result<Vec<PathBuf>> {
         let home = astrid_core::dirs::AstridHome::resolve()?;
-        Ok(vec![home.keys_dir(), home.secrets_dir(), home.var_dir()])
+        Ok(Self::sensitive_astrid_paths_in(&home))
+    }
+
+    /// The masked set for a given home, filtered to paths that exist on disk.
+    ///
+    /// `secrets/` is created lazily on the first secret write (it is NOT in
+    /// [`AstridHome::ensure`](astrid_core::dirs::AstridHome::ensure)), so on a
+    /// fresh install it may be absent at spawn time. bwrap's `--tmpfs` mounts
+    /// the target over the read-only root bind and fails to `mkdir` a missing
+    /// mount point, which would abort every sandboxed spawn. Skipping a
+    /// non-existent dir is fail-safe: an absent dir holds no bytes to mask.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn sensitive_astrid_paths_in(home: &astrid_core::dirs::AstridHome) -> Vec<PathBuf> {
+        vec![home.keys_dir(), home.secrets_dir(), home.var_dir()]
+            .into_iter()
+            .filter(|p| p.exists())
+            .collect()
     }
 
     /// Like [`wrap`](Self::wrap), but additionally exposes a set of

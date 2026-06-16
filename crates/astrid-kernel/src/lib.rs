@@ -2309,11 +2309,24 @@ fn mint_default_principal_keypair(
     let keys_dir = home.keys_dir();
     std::fs::create_dir_all(&keys_dir)?;
     let key_path = keys_dir.join(format!("{principal}.key"));
-    std::fs::write(&key_path, keypair.secret_key_bytes())?;
+    // Create the file 0600 atomically (via `OpenOptions::mode`) BEFORE writing
+    // the secret bytes, so the private key is never momentarily group/world
+    // readable between a `write` and a follow-up `set_permissions` chmod.
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600))?;
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&key_path)?;
+        f.write_all(&keypair.secret_key_bytes())?;
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(&key_path, keypair.secret_key_bytes())?;
     }
 
     let public_key = format!("ed25519:{}", keypair.export_public_key().to_hex());

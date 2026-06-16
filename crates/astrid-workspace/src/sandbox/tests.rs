@@ -426,10 +426,20 @@ fn test_sandbox_prefix_rejects_null_byte_in_paths() {
 
 // --- #856: sensitive Astrid-home subpaths are masked in every spawn ---
 
+/// The masked set is `keys/`, `secrets/`, `var/` in that order. The exact
+/// subset is existence-filtered (see `sensitive_astrid_paths_in`), so this
+/// drives a fully-populated `tempdir` home to assert all three are emitted in
+/// the documented order rather than depending on the test runner's real home.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn sensitive_astrid_paths_are_keys_secrets_var() {
-    let paths = SandboxCommand::sensitive_astrid_paths().expect("resolve astrid home");
+    let tmp = tempfile::tempdir().expect("create temp astrid home");
+    let home = astrid_core::dirs::AstridHome::from_path(tmp.path());
+    for dir in [home.keys_dir(), home.secrets_dir(), home.var_dir()] {
+        std::fs::create_dir_all(&dir).expect("create masked dir");
+    }
+
+    let paths = SandboxCommand::sensitive_astrid_paths_in(&home);
     assert_eq!(paths.len(), 3, "exactly keys/, secrets/, var/ are masked");
     assert!(
         paths[0].ends_with("keys"),
@@ -448,26 +458,75 @@ fn sensitive_astrid_paths_are_keys_secrets_var() {
     );
 }
 
+/// Regression for the fresh-install crash: `AstridHome::ensure` does NOT create
+/// `secrets/` (it is made lazily on the first secret write), so on a fresh
+/// install that dir is absent at spawn time. Passing a non-existent `--tmpfs`
+/// target to bwrap under `--ro-bind / /` aborts every sandboxed spawn. The
+/// masked set must therefore skip paths that do not exist on disk. Filtering is
+/// fail-safe: an absent dir holds no bytes to leak.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn sensitive_astrid_paths_skips_missing_dirs() {
+    let tmp = tempfile::tempdir().expect("create temp astrid home");
+    let home = astrid_core::dirs::AstridHome::from_path(tmp.path());
+
+    // Fresh-install shape: keys/ and var/ exist (created by ensure()), but
+    // secrets/ has never been written.
+    std::fs::create_dir_all(home.keys_dir()).expect("create keys/");
+    std::fs::create_dir_all(home.var_dir()).expect("create var/");
+    assert!(
+        !home.secrets_dir().exists(),
+        "precondition: secrets/ absent"
+    );
+
+    let paths = SandboxCommand::sensitive_astrid_paths_in(&home);
+    assert_eq!(
+        paths.len(),
+        2,
+        "the absent secrets/ dir is filtered out: {paths:?}"
+    );
+    assert!(
+        paths.iter().any(|p| p.ends_with("keys")),
+        "keys/ is masked: {paths:?}"
+    );
+    assert!(
+        paths.iter().any(|p| p.ends_with("var")),
+        "var/ is masked: {paths:?}"
+    );
+    assert!(
+        !paths.iter().any(|p| p.ends_with("secrets")),
+        "the non-existent secrets/ is NOT passed to bwrap: {paths:?}"
+    );
+
+    // Once secrets/ exists (first secret written), it rejoins the masked set.
+    std::fs::create_dir_all(home.secrets_dir()).expect("create secrets/");
+    let paths = SandboxCommand::sensitive_astrid_paths_in(&home);
+    assert_eq!(paths.len(), 3, "secrets/ rejoins once it exists: {paths:?}");
+}
+
 /// On Linux the `--ro-bind / /` mount exposes the whole host FS read-only, so
 /// each sensitive Astrid subpath must be overlaid with an empty tmpfs. Without
 /// this a spawned agent reads `~/.astrid/keys/<principal>.key` and impersonates
-/// any principal (issue #856).
+/// any principal (issue #856). The masked set is existence-filtered, so this
+/// asserts every path the filter actually returns is wired into the bwrap args
+/// (rather than hardcoding dirs the test runner's home may not have).
 #[cfg(target_os = "linux")]
 #[test]
 fn linux_spawn_masks_sensitive_astrid_paths_with_tmpfs() {
+    let expected = SandboxCommand::sensitive_astrid_paths().expect("resolve astrid home");
     let wrapped = SandboxCommand::wrap(Command::new("echo"), Path::new("/tmp/ws")).expect("wrap");
     let args: Vec<String> = wrapped
         .get_args()
         .map(|a| a.to_string_lossy().into_owned())
         .collect();
-    for tail in ["keys", "secrets", "var"] {
-        let suffix = format!("/{tail}");
+    for path in &expected {
+        let path_str = path.to_string_lossy();
         let masked = args
             .windows(2)
-            .any(|w| w[0] == "--tmpfs" && w[1].ends_with(&suffix));
+            .any(|w| w[0] == "--tmpfs" && w[1] == path_str);
         assert!(
             masked,
-            "expected `--tmpfs <astrid_home>/{tail}` in bwrap args: {args:?}"
+            "expected `--tmpfs {path_str}` in bwrap args: {args:?}"
         );
     }
 }
@@ -475,20 +534,25 @@ fn linux_spawn_masks_sensitive_astrid_paths_with_tmpfs() {
 /// On macOS the seatbelt profile must carry a `deny file-read*` rule for each
 /// sensitive Astrid subpath. (Belt-and-suspenders: the profile already
 /// default-denies anything outside its allowlist, which excludes `~/.astrid` —
-/// but an explicit deny holds even if that allowlist ever widens.)
+/// but an explicit deny holds even if that allowlist ever widens.) The masked
+/// set is existence-filtered, so this asserts every path the filter actually
+/// returns appears in the profile (rather than hardcoding dirs the test
+/// runner's home may not have).
 #[cfg(target_os = "macos")]
 #[test]
 fn macos_spawn_denies_sensitive_astrid_paths_in_profile() {
+    let expected = SandboxCommand::sensitive_astrid_paths().expect("resolve astrid home");
     let wrapped = SandboxCommand::wrap(Command::new("echo"), Path::new("/tmp/ws")).expect("wrap");
     let profile = wrapped
         .get_args()
         .map(|a| a.to_string_lossy().into_owned())
         .find(|a| a.contains("(deny default)"))
         .expect("seatbelt profile present in sandbox-exec args");
-    for tail in ["keys", "secrets", "var"] {
+    for path in &expected {
+        let rule = format!("(subpath \"{}\")", path.to_string_lossy());
         assert!(
-            profile.contains(&format!("/{tail}\"))")),
-            "expected a `(deny file-read* (subpath \"<astrid_home>/{tail}\"))` rule in the profile"
+            profile.contains(&rule),
+            "expected a `(deny file-read* {rule})` rule in the profile"
         );
     }
 }
