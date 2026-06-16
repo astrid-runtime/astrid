@@ -350,7 +350,10 @@ async fn install_capsules(selected: &[DistroCapsule]) -> anyhow::Result<Vec<Lock
     for cap in selected {
         pb.set_message(cap.name.clone());
 
-        if let Err(e) = super::capsule::install::install_capsule_batch(&cap.source, false).await {
+        if let Err(e) =
+            super::capsule::install::install_capsule_batch(&cap.source, Some(&cap.name), false)
+                .await
+        {
             eprintln!("\n  Failed to install {}: {e}", cap.name);
             failed.push(cap.name.clone());
             pb.inc(1);
