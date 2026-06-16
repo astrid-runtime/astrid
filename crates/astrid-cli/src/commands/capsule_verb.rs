@@ -162,7 +162,14 @@ async fn resolve_commands() -> Result<Vec<CommandInfo>> {
     daemon::ensure_daemon("capsule").await?;
 
     let session = astrid_core::SessionId::from_uuid(Uuid::new_v4());
-    let mut client = SocketClient::connect(session)
+    let source_id = session.0;
+    // Bind the connection to the active principal (and stamp it on the
+    // request) so the daemon scopes this management request to the invoking
+    // identity. A nil source with no principal falls back to the `default`
+    // (admin) principal — letting a non-admin enumerate capsule verbs under
+    // admin context, an RBAC bypass.
+    let caller = crate::principal::current();
+    let mut client = SocketClient::connect(session, caller.clone())
         .await
         .map_err(|e| anyhow::anyhow!("Failed to connect to daemon: {e}"))?;
 
@@ -171,14 +178,20 @@ async fn resolve_commands() -> Result<Vec<CommandInfo>> {
     let msg = astrid_types::ipc::IpcMessage::new(
         "astrid.v1.request.get_commands",
         astrid_types::ipc::IpcPayload::RawJson(val),
-        Uuid::nil(),
-    );
+        source_id,
+    )
+    .with_principal(caller.to_string());
     client.send_message(msg).await?;
     let raw = client
         .read_until_topic("astrid.v1.response.get_commands", Duration::from_secs(10))
         .await?;
     match SocketClient::extract_kernel_response(&raw) {
         Some(astrid_core::kernel_api::KernelResponse::Commands(cmds)) => Ok(cmds),
+        // Surface the daemon's own error (e.g. a capability/permission denial)
+        // instead of folding it into a generic "unexpected response".
+        Some(astrid_core::kernel_api::KernelResponse::Error(err)) => {
+            anyhow::bail!("Daemon error: {err}")
+        },
         _ => anyhow::bail!("Daemon returned an unexpected response to GetCommands"),
     }
 }
@@ -186,7 +199,12 @@ async fn resolve_commands() -> Result<Vec<CommandInfo>> {
 /// Publish the run request and await + render the result.
 async fn execute(provider: &str, verb: &str, args: &[String]) -> Result<ExitCode> {
     let session = astrid_core::SessionId::from_uuid(Uuid::new_v4());
-    let mut client = match SocketClient::connect(session).await {
+    let source_id = session.0;
+    // Bind the connection to the active principal so the capsule verb runs
+    // under the invoking identity's context (VFS/KV/secrets), not the
+    // `default` (admin) principal a nil/unstamped message falls back to.
+    let caller = crate::principal::current();
+    let mut client = match SocketClient::connect(session, caller.clone()).await {
         Ok(c) => c,
         Err(e) => {
             eprintln!(
@@ -209,8 +227,9 @@ async fn execute(provider: &str, verb: &str, args: &[String]) -> Result<ExitCode
     let msg = astrid_types::ipc::IpcMessage::new(
         run_topic,
         astrid_types::ipc::IpcPayload::RawJson(body),
-        Uuid::nil(),
-    );
+        source_id,
+    )
+    .with_principal(caller.to_string());
     if let Err(e) = client.send_message(msg).await {
         eprintln!(
             "{}",
