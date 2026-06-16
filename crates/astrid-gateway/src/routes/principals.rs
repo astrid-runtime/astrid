@@ -174,6 +174,10 @@ pub async fn create_principal(
             name: body.name,
             groups: body.groups,
             grants: body.grants,
+            // Non-inheriting by default — the API does not expose the
+            // opt-in inheritance source yet. Exposing an API-level
+            // `inherit_from` is a follow-up.
+            inherit_from: None,
         })
         .await
         .map_err(daemon_internal)?;

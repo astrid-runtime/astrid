@@ -60,7 +60,8 @@ pub(super) async fn dispatch(
             name,
             groups,
             grants,
-        } => agent_create(kernel, name, groups, grants).await,
+            inherit_from,
+        } => agent_create(kernel, name, groups, grants, inherit_from).await,
         AdminRequestKind::AgentDelete { principal } => agent_delete(kernel, principal).await,
         AdminRequestKind::AgentEnable { principal } => {
             agent_set_enabled(kernel, principal, true).await
@@ -148,6 +149,7 @@ async fn agent_create(
     name: String,
     groups: Vec<String>,
     grants: Vec<String>,
+    inherit_from: Option<PrincipalId>,
 ) -> AdminResponseBody {
     let principal = match PrincipalId::new(name.clone()) {
         Ok(p) => p,
@@ -163,7 +165,30 @@ async fn agent_create(
         ));
     }
 
+    // Acquire the admin write lock BEFORE validating the inheritance source.
+    // The source's existence is state this lock protects: every admin mutator
+    // (create/delete/...) takes it, so checking the source outside the lock
+    // would let a concurrent delete remove it between the existence check and
+    // the inheritance copy below (TOCTOU) — the creation would then silently
+    // produce an empty agent instead of inheriting. Holding the lock pins the
+    // source in place across the check-then-copy.
     let _guard = kernel.admin_write_lock.lock().await;
+
+    // Self-inherit is meaningless (the source home tree does not exist yet),
+    // and a non-existent source must fail loudly rather than silently
+    // producing an empty agent the operator believes was provisioned.
+    if let Some(ref source) = inherit_from {
+        if *source == principal {
+            return err_bad_input(format!(
+                "inherit_from source {source} is the same as the new principal"
+            ));
+        }
+        let source_path = principal_profile_path(kernel, source);
+        if let Err(e) = require_principal_exists(source, &source_path) {
+            return err_bad_input(format!("inherit_from source rejected: {e}"));
+        }
+    }
+
     let profile_path = principal_profile_path(kernel, &principal);
 
     // Collision: a profile on disk means this principal already exists.
@@ -240,14 +265,21 @@ async fn agent_create(
         ));
     }
 
-    // Inherit `default`'s per-principal state so the new agent works
-    // out of the box: env JSON (non-secret config like base URL /
-    // model name), per-capsule KV namespaces, and per-capsule secret
-    // files. Best-effort — a copy failure logs a warn and leaves the
-    // agent in a "needs manual setup" state but doesn't roll back the
-    // profile or the home tree (those already succeeded; the
-    // confidentiality boundary is intact regardless).
-    inherit_from_default(kernel, &principal).await;
+    // Inheritance is OPT-IN. By default the new principal inherits
+    // NOTHING — least privilege, and no silent leak of `default`'s env
+    // JSON, KV namespaces, or (critically) secret files / API keys into
+    // every created agent. When the operator names a source principal,
+    // we perform a full copy from THAT principal: env JSON (non-secret
+    // config like base URL / model name), per-capsule KV namespaces, and
+    // per-capsule secret files. Best-effort — a copy failure logs a warn
+    // and leaves the agent in a "needs manual setup" state but doesn't
+    // roll back the profile or the home tree (those already succeeded;
+    // the confidentiality boundary is intact regardless). The source's
+    // existence was already validated above, so a copy reaching here has
+    // a real source.
+    if let Some(ref source) = inherit_from {
+        inherit_from_principal(kernel, source, &principal).await;
+    }
 
     info!(%principal, user_id = %user.id, "Layer 6 agent.create");
     success_json(serde_json::json!({
@@ -755,23 +787,26 @@ pub(super) fn success_json(val: serde_json::Value) -> AdminResponseBody {
     AdminResponseBody::Success(val)
 }
 
-// ── agent.create: inherit `default`'s per-principal state ──────────────
+// ── agent.create: opt-in inheritance from a source principal ───────────
 
-/// Copy `default`'s env JSON, per-capsule KV namespaces, and
-/// per-capsule secret files into the new principal's slots so the
+/// Copy the `source` principal's env JSON, per-capsule KV namespaces,
+/// and per-capsule secret files into the new principal's slots so the
 /// agent works out of the box.
 ///
+/// This is invoked ONLY when the operator opts in via
+/// `inherit_from`; the default path copies nothing. The caller has
+/// already verified that `source` exists and is not the new principal.
+///
 /// Best-effort: any single failure logs at `warn` and the rest of the
-/// inheritance proceeds. The home tree already exists by the time
-/// this is called (its absence is what makes the parent fail-closed
-/// rollback necessary, not this).
-async fn inherit_from_default(kernel: &Arc<crate::Kernel>, principal: &PrincipalId) {
-    if principal == &PrincipalId::default() {
-        return;
-    }
-    let default = PrincipalId::default();
-
-    copy_env_dir(kernel, &default, principal);
+/// inheritance proceeds. The new principal's home tree already exists
+/// by the time this is called (its absence is what makes the parent
+/// fail-closed rollback necessary, not this).
+async fn inherit_from_principal(
+    kernel: &Arc<crate::Kernel>,
+    source: &PrincipalId,
+    principal: &PrincipalId,
+) {
+    copy_env_dir(kernel, source, principal);
 
     // Snapshot manifest data under the registry lock, then drop it
     // before any async / blocking I/O. Holding the read lock across
@@ -802,30 +837,31 @@ async fn inherit_from_default(kernel: &Arc<crate::Kernel>, principal: &Principal
         (ids, secrets)
     };
 
-    let total_keys = copy_kv_namespaces(kernel, &default, principal, &capsule_ids).await;
+    let total_keys = copy_kv_namespaces(kernel, source, principal, &capsule_ids).await;
     let (probed_secrets, copied_secrets) =
-        copy_secret_files(kernel, &default, principal, &secret_keys_by_capsule);
+        copy_secret_files(kernel, source, principal, &secret_keys_by_capsule);
 
     info!(
         %principal,
+        %source,
         total_keys,
         copied_secrets,
         probed_secrets,
-        "agent.create: inherited default's env JSON + KV namespaces + secrets"
+        "agent.create: inherited source's env JSON + KV namespaces + secrets"
     );
 }
 
-fn copy_env_dir(kernel: &Arc<crate::Kernel>, default: &PrincipalId, principal: &PrincipalId) {
-    let default_env = kernel.astrid_home.principal_home(default).env_dir();
+fn copy_env_dir(kernel: &Arc<crate::Kernel>, source: &PrincipalId, principal: &PrincipalId) {
+    let source_env = kernel.astrid_home.principal_home(source).env_dir();
     let agent_env = kernel.astrid_home.principal_home(principal).env_dir();
-    if !default_env.is_dir() {
+    if !source_env.is_dir() {
         return;
     }
     if let Err(e) = std::fs::create_dir_all(&agent_env) {
         tracing::warn!(%principal, error = %e, "agent.create: env_dir mkdir failed");
         return;
     }
-    let Ok(entries) = std::fs::read_dir(&default_env) else {
+    let Ok(entries) = std::fs::read_dir(&source_env) else {
         return;
     };
     for entry in entries.flatten() {
@@ -845,14 +881,14 @@ fn copy_env_dir(kernel: &Arc<crate::Kernel>, default: &PrincipalId, principal: &
 
 async fn copy_kv_namespaces(
     kernel: &Arc<crate::Kernel>,
-    default: &PrincipalId,
+    source: &PrincipalId,
     principal: &PrincipalId,
     capsule_ids: &[astrid_capsule::capsule::CapsuleId],
 ) -> usize {
     use astrid_storage::KvStore;
     let mut total_keys = 0usize;
     for capsule_id in capsule_ids {
-        let src_ns = format!("{default}:capsule:{capsule_id}");
+        let src_ns = format!("{source}:capsule:{capsule_id}");
         let dst_ns = format!("{principal}:capsule:{capsule_id}");
         let keys = match kernel.kv.list_keys(&src_ns).await {
             Ok(k) => k,
@@ -907,7 +943,7 @@ async fn copy_kv_namespaces(
 
 fn copy_secret_files(
     kernel: &Arc<crate::Kernel>,
-    default: &PrincipalId,
+    source: &PrincipalId,
     principal: &PrincipalId,
     secret_keys_by_capsule: &[(astrid_capsule::capsule::CapsuleId, Vec<String>)],
 ) -> (usize, usize) {
@@ -916,11 +952,8 @@ fn copy_secret_files(
     let mut copied = 0usize;
     let secrets_root = kernel.astrid_home.secrets_dir();
     for (capsule_id, secret_keys) in secret_keys_by_capsule {
-        let src = FileSecretStore::new(
-            secrets_root
-                .join(default.as_str())
-                .join(capsule_id.as_str()),
-        );
+        let src =
+            FileSecretStore::new(secrets_root.join(source.as_str()).join(capsule_id.as_str()));
         let dst = FileSecretStore::new(
             secrets_root
                 .join(principal.as_str())
@@ -938,7 +971,7 @@ fn copy_secret_files(
                         key = %key,
                         error = %e,
                         security_event = true,
-                        "agent.create: secret read failed for default's slot"
+                        "agent.create: secret read failed for source's slot"
                     );
                     continue;
                 },

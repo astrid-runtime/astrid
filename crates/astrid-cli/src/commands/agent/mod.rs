@@ -102,6 +102,12 @@ pub(crate) struct CreateArgs {
     /// Non-interactive mode (accept defaults).
     #[arg(short = 'y', long)]
     pub yes: bool,
+    /// Copy env, KV, and secrets from this principal (default: inherit
+    /// nothing). The named principal's `.config/env/`, per-capsule KV
+    /// namespaces, and per-capsule secret files are copied into the new
+    /// agent. Omit to provision a clean, least-privilege agent.
+    #[arg(long = "inherit-from", value_name = "PRINCIPAL")]
+    pub inherit_from: Option<String>,
 
     // ── Deferred delegation flags (#656) ─────────────────────────────
     /// Delegation parent agent (deferred — see #656).
@@ -278,6 +284,14 @@ async fn run_create(mut args: CreateArgs) -> Result<ExitCode> {
     let principal = PrincipalId::new(&args.name).context("invalid agent name")?;
     let quota_updates = parse_quota_flags(&args)?;
     let caps_to_grant = build_caps_to_grant(&args)?;
+    // Validate the inheritance source client-side so a typo fails the
+    // whole command before any IPC, matching how `name` is handled.
+    let inherit_from = args
+        .inherit_from
+        .as_deref()
+        .map(PrincipalId::new)
+        .transpose()
+        .context("invalid --inherit-from principal")?;
 
     // Empty defaults to the kernel's `agent` group (Layer 6 default).
     // Pass empty so the kernel applies the default rather than the CLI
@@ -296,6 +310,7 @@ async fn run_create(mut args: CreateArgs) -> Result<ExitCode> {
             name: args.name.clone(),
             groups,
             grants: caps_to_grant,
+            inherit_from,
         })
         .await?;
     let _ = into_result(body)?;
@@ -780,6 +795,7 @@ mod tests {
             storage: None,
             processes: None,
             yes: true,
+            inherit_from: None,
             spawned_by: Some("parent".into()),
             budget_voucher: None,
             grant_access: None,
@@ -805,6 +821,7 @@ mod tests {
             storage: None,
             processes: None,
             yes: true,
+            inherit_from: None,
             spawned_by: None,
             budget_voucher: None,
             grant_access: None,

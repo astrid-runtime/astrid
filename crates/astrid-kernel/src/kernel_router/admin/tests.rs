@@ -34,6 +34,7 @@ fn all_admin_variants() -> Vec<AdminRequestKind> {
             name: "n".into(),
             groups: Vec::new(),
             grants: Vec::new(),
+            inherit_from: None,
         },
         AdminRequestKind::AgentDelete {
             principal: pid("a"),
@@ -204,6 +205,7 @@ fn admin_target_principal_none_for_self_or_collection_variants() {
             name: "n".into(),
             groups: Vec::new(),
             grants: Vec::new(),
+            inherit_from: None,
         })
         .is_none()
     );
