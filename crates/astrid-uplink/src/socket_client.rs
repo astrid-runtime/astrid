@@ -162,6 +162,32 @@ impl SocketClient {
         })
     }
 
+    /// Consume the client and return the underlying connected socket as a raw
+    /// fd — the daemon side of [`from_raw_fd`](Self::from_raw_fd).
+    ///
+    /// Path-1 spawn binding (issue #45/#852): the daemon dials + authenticates a
+    /// connection as the spawned agent's principal, then hands the live socket to
+    /// the sandboxed child by fd-passing this fd (env `ASTRID_CONN_FD`). The
+    /// caller clears `FD_CLOEXEC` on the returned fd before `exec` so the child
+    /// inherits it; ownership transfers to the caller (this stops driving the
+    /// connection on the daemon's reactor).
+    ///
+    /// # Errors
+    /// Returns an error if the split halves cannot be reunited (they always can
+    /// for a `SocketClient` — both came from one stream) or the tokio stream
+    /// cannot be detached back to a std socket.
+    pub fn into_raw_fd(self) -> Result<std::os::fd::RawFd> {
+        use std::os::fd::IntoRawFd;
+        let stream = self
+            .read_half
+            .reunite(self.write_half)
+            .map_err(|e| anyhow::anyhow!("reunite socket halves: {e}"))?;
+        let std_stream = stream
+            .into_std()
+            .context("detach socket from the tokio reactor")?;
+        Ok(std_stream.into_raw_fd())
+    }
+
     /// Re-establish the connection to the (possibly restarted) daemon,
     /// re-reading the current session token and re-handshaking. The
     /// [`session_id`](Self::session_id) is preserved.
@@ -545,6 +571,42 @@ mod tests {
             .await
             .expect("read")
             .expect("a frame");
+        assert_eq!(got, payload);
+    }
+
+    /// `into_raw_fd` hands the live connection back out as a raw fd without
+    /// closing it — the daemon → child handoff. Round-trips through
+    /// `from_raw_fd` and confirms the re-adopted fd still reads framed bytes.
+    #[tokio::test]
+    async fn into_raw_fd_preserves_the_live_connection() {
+        use std::os::fd::IntoRawFd;
+
+        let (peer, child) = std::os::unix::net::UnixStream::pair().expect("socketpair");
+        let raw = child.into_raw_fd();
+        let client =
+            SocketClient::from_raw_fd(raw, SessionId::new(), PrincipalId::new("claude").unwrap())
+                .expect("adopt");
+        // Hand the connection back out (the daemon side of the handoff) ...
+        let handed = client.into_raw_fd().expect("extract fd");
+        // ... and re-adopt it (the child side): the fd is still a live socket.
+        let mut re = SocketClient::from_raw_fd(
+            handed,
+            SessionId::new(),
+            PrincipalId::new("claude").unwrap(),
+        )
+        .expect("re-adopt");
+
+        peer.set_nonblocking(true).unwrap();
+        let mut daemon = UnixStream::from_std(peer).expect("tokio adopt peer");
+        let payload = br#"{"k":1}"#;
+        daemon
+            .write_all(&u32::try_from(payload.len()).unwrap().to_be_bytes())
+            .await
+            .unwrap();
+        daemon.write_all(payload).await.unwrap();
+        daemon.flush().await.unwrap();
+
+        let got = re.read_raw_frame().await.expect("read").expect("a frame");
         assert_eq!(got, payload);
     }
 }
