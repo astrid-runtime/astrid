@@ -11,9 +11,13 @@ use astrid_capsule_install::{
 };
 use astrid_core::dirs::AstridHome;
 
-/// Resolve the `home://wit/` mirror directory for the default principal.
+/// Resolve the `home://wit/` mirror directory for the install principal.
+///
+/// Uses [`astrid_capsule_install::paths::install_principal`] — the same
+/// single source of truth the mirror writer resolves against — so the test
+/// stays aligned if the install principal ever changes.
 fn wit_mirror_dir(home: &AstridHome) -> std::path::PathBuf {
-    home.principal_home(&astrid_core::PrincipalId::default())
+    home.principal_home(&astrid_capsule_install::paths::install_principal())
         .root()
         .join("wit")
 }

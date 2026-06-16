@@ -138,9 +138,13 @@ fn content_address_wit_recursive(
 /// so the store alone leaves those tools with an empty directory. This
 /// mirrors a readable, human-named copy into the principal's home.
 ///
-/// `principal` is the install target — the caller passes the same id it
-/// resolved the capsule directory for (see [`crate::paths::install_principal`]),
-/// so the mirror and the capsule never land in different homes.
+/// `principal` names the mirror's home target: the WIT lands under
+/// `home.principal_home(principal)/wit`. The caller passes
+/// [`crate::paths::install_principal`] — the same id used for the home-scoped
+/// install paths — so introspection tools resolve the mirror under the home
+/// they read from. (For a workspace install the capsule itself lives under
+/// `<cwd>/.astrid`, so `principal` names the mirror home, not necessarily the
+/// capsule's own directory.)
 ///
 /// `wit_files` is the name→hash map returned by [`content_address_wit`]:
 /// keys are paths relative to the source `wit/` directory (e.g.
@@ -170,7 +174,14 @@ pub fn materialize_wit_mirror<S: std::hash::BuildHasher>(
     std::fs::create_dir_all(&mirror_dir)
         .with_context(|| format!("failed to create WIT mirror dir {}", mirror_dir.display()))?;
 
-    for (rel_path, hash) in wit_files {
+    // Iterate in a stable order. `wit_files` is a HashMap, so raw iteration
+    // order is nondeterministic; in the (rare, documented) basename-collision
+    // case that would make the last-writer-wins winner depend on hash order.
+    // Sort by relative path so the outcome is reproducible across runs.
+    let mut entries: Vec<(&String, &String)> = wit_files.iter().collect();
+    entries.sort_by(|a, b| a.0.cmp(b.0));
+
+    for (rel_path, hash) in entries {
         let Some(basename) = Path::new(rel_path).file_name() else {
             continue;
         };
@@ -197,8 +208,13 @@ pub fn materialize_wit_mirror<S: std::hash::BuildHasher>(
             basename.to_string_lossy(),
             uuid::Uuid::new_v4().simple()
         ));
-        std::fs::write(&tmp, &content)
-            .with_context(|| format!("failed to write WIT mirror temp {}", tmp.display()))?;
+        if let Err(e) = std::fs::write(&tmp, &content) {
+            // Clean up the partial temp so a failed write doesn't leak an
+            // orphan into the mirror dir (mirrors the rename-failure path).
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e)
+                .with_context(|| format!("failed to write WIT mirror temp {}", tmp.display()));
+        }
         if let Err(e) = std::fs::rename(&tmp, &dest) {
             let _ = std::fs::remove_file(&tmp);
             return Err(e)
