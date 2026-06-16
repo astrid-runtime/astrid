@@ -6,7 +6,6 @@ use astrid_core::types::Permission;
 use astrid_crypto::KeyPair;
 use std::sync::Arc;
 
-use super::types::ALLOW_ALWAYS_DEFAULT_TTL;
 use super::types::InterceptProof;
 use crate::action::SensitiveAction;
 use crate::error::{ApprovalError, ApprovalResult};
@@ -108,6 +107,11 @@ impl CapabilityValidator {
     /// the signing payload (`SIGNING_DATA_VERSION` v2, issue #668), so cross-
     /// principal copy-forge attempts fail signature verification.
     ///
+    /// The minted token is **permanent** (`ttl: None`): "Allow Always" means
+    /// the human's decision persists until the token is explicitly revoked,
+    /// not for a fixed window. An operator who wants a bounded grant instead
+    /// uses the admin `caps token mint --ttl` path (issue #929).
+    ///
     /// # Errors
     ///
     /// Returns an error if the action cannot be mapped to a resource, or if the resource pattern is invalid.
@@ -136,7 +140,7 @@ impl CapabilityValidator {
             self.runtime_key.key_id(),
             approval_audit_id.clone(),
             &self.runtime_key,
-            Some(ALLOW_ALWAYS_DEFAULT_TTL),
+            None,
             principal.clone(),
         );
         let token_id = token.id.clone();
@@ -146,7 +150,7 @@ impl CapabilityValidator {
             return Ok(InterceptProof::UserApproval { approval_audit_id });
         }
 
-        tracing::info!(%token_id, %resource_str, "created 'Allow Always' capability token (TTL: 1h)");
+        tracing::info!(%token_id, %resource_str, "created 'Allow Always' capability token (permanent until revoked)");
         Ok(InterceptProof::CapabilityCreated {
             token_id,
             approval_audit_id,
@@ -334,6 +338,37 @@ mod tests {
             validator
                 .check_capability(&bob, &mcp_action("test", "tool"))
                 .is_some()
+        );
+    }
+
+    #[test]
+    fn handle_allow_always_mints_permanent_token() {
+        // "Allow Always" must mint a PERMANENT token (issue #929) — the
+        // human's decision persists until revoked, not for a fixed window.
+        let runtime_key = Arc::new(KeyPair::generate());
+        let store = Arc::new(CapabilityStore::in_memory());
+        let validator = CapabilityValidator::new(Arc::clone(&store), runtime_key);
+
+        let proof = validator
+            .handle_allow_always(
+                &default_principal(),
+                &mcp_action("test", "tool"),
+                AuditEntryId::new(),
+            )
+            .expect("allow-always mint");
+        let token_id = match proof {
+            InterceptProof::CapabilityCreated { token_id, .. } => token_id,
+            other => panic!("expected CapabilityCreated, got {other:?}"),
+        };
+
+        let token = store
+            .get(&token_id)
+            .expect("store get")
+            .expect("token present");
+        assert!(
+            token.expires_at.is_none(),
+            "Allow-Always token must be permanent (expires_at == None), got {:?}",
+            token.expires_at
         );
     }
 }

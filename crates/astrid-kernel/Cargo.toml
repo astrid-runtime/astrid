@@ -24,6 +24,11 @@ astrid-mcp = { workspace = true }
 astrid-storage = { workspace = true, features = ["kv"] }
 astrid-vfs = { workspace = true }
 base64 = { workspace = true }
+# Used to build the `chrono::Duration` TTL passed to `CapabilityToken::create`
+# in the admin token-mint handler (issue #929). The token API takes a signed
+# chrono duration; `default-features = false` (workspace) is sufficient —
+# `Duration::seconds` needs no clock feature.
+chrono = { workspace = true }
 dashmap = { workspace = true }
 hex = { workspace = true }
 # Metric recording facade. Connection-count, background-loop-tick, and

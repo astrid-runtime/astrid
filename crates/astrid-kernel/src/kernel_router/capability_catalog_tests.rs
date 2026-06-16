@@ -115,6 +115,18 @@ fn known_capabilities_covers_every_admin_request_cap() {
             principal: p.clone(),
             capabilities: vec![],
         },
+        AdminRequestKind::CapsTokenMint {
+            principal: p.clone(),
+            resource: "mcp://server:tool".into(),
+            permission: None,
+            ttl_secs: None,
+        },
+        AdminRequestKind::CapsTokenRevoke {
+            token_id: "00000000-0000-0000-0000-000000000000".into(),
+        },
+        AdminRequestKind::CapsTokenList {
+            principal: p.clone(),
+        },
         AdminRequestKind::InviteIssue {
             group: "agent".into(),
             expires_secs: None,

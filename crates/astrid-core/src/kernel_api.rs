@@ -432,6 +432,45 @@ pub enum AdminRequestKind {
         /// Capability patterns to revoke.
         capabilities: Vec<String>,
     },
+    /// Mint a signed capability token granting `principal` access to
+    /// `resource` (issue #929). Lets an operator pre-grant tool access (e.g.
+    /// `mcp://server:tool`) so the agent never hits a per-use approval
+    /// elicitation. The token is signed by the runtime key — the same key the
+    /// approval interceptor trusts as issuer — so it authorizes immediately
+    /// and survives daemon restarts (persistent scope). Revocable via
+    /// [`Self::CapsTokenRevoke`]; principal-scoped (a token minted for Alice
+    /// never authorizes Bob); admin-gated by `caps:token:mint`.
+    CapsTokenMint {
+        /// Principal the token is minted for. Only this principal can
+        /// consume it (issue #668 cross-principal binding).
+        principal: PrincipalId,
+        /// Resource pattern the token grants, e.g. `mcp://server:tool`.
+        resource: String,
+        /// Permission to grant. Defaults to `"invoke"` when absent. Parsed
+        /// into [`Permission`](astrid_core::types::Permission); an unknown
+        /// string is rejected with a bad-input error.
+        #[serde(default)]
+        permission: Option<String>,
+        /// Token lifetime in seconds. `None` = permanent (valid until
+        /// revoked); `Some(n)` = expires after `n` seconds.
+        #[serde(default)]
+        ttl_secs: Option<u64>,
+    },
+    /// Revoke a previously minted capability token by its id (issue #929).
+    /// Revocation is global and final — the token no longer authorizes for
+    /// any principal. Admin-gated by `caps:token:revoke`.
+    CapsTokenRevoke {
+        /// The token id to revoke (the `token_id` string returned by
+        /// [`Self::CapsTokenMint`]).
+        token_id: String,
+    },
+    /// List the capability tokens minted for `principal` (issue #929).
+    /// Returns only non-revoked, non-expired tokens owned by that principal.
+    /// Admin-gated by `caps:token:list`.
+    CapsTokenList {
+        /// Principal whose tokens are listed.
+        principal: PrincipalId,
+    },
     /// Issue a new invite token. Capability-gated by `invite:issue`.
     /// The kernel persists the token under `etc/invites.toml` with
     /// expiry + remaining use count, and the caller publishes the
