@@ -133,11 +133,19 @@ fn write_and_verify(
     Ok(())
 }
 
-/// Write `bytes` to `dest` creating it with file mode 0600.
+/// Write `bytes` to `dest` creating it fresh with file mode 0600.
+///
+/// Uses `create_new` (`O_CREAT | O_EXCL`): the snapshot path is always a
+/// unique index under a freshly-minted host-private `TempDir`, so the file
+/// never pre-exists on the legitimate path. `O_EXCL` makes that an enforced
+/// invariant rather than an assumption — it refuses to open an existing file
+/// or follow a symlink planted at `dest`, so a write can never truncate or
+/// redirect through a pre-existing entry (defense in depth against a future
+/// caller that routes a non-scratch path here).
 fn write_private(dest: &std::path::Path, bytes: &[u8]) -> Result<(), ErrorCode> {
     use std::io::Write as _;
     let mut opts = std::fs::OpenOptions::new();
-    opts.write(true).create(true).truncate(true);
+    opts.write(true).create_new(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt as _;
@@ -348,6 +356,24 @@ mod tests {
             let mode = std::fs::metadata(&dest).unwrap().permissions().mode();
             assert_eq!(mode & 0o777, 0o600, "snapshot must be owner-only 0600");
         }
+    }
+
+    #[test]
+    fn write_private_refuses_existing_path() {
+        // O_EXCL invariant: the snapshot writer must never open — and so never
+        // truncate, nor follow a symlink planted at — a path that already
+        // exists. A pre-existing entry makes the write fail with its content
+        // left intact, rather than being overwritten through.
+        let dir = tempfile::TempDir::new().unwrap();
+        let dest = dir.path().join("snap");
+        std::fs::write(&dest, b"pre-existing").unwrap();
+        let err = write_private(&dest, b"new bytes").unwrap_err();
+        assert!(matches!(err, ErrorCode::Unknown(_)));
+        assert_eq!(
+            std::fs::read(&dest).unwrap(),
+            b"pre-existing",
+            "existing content must not be truncated through"
+        );
     }
 
     #[test]
