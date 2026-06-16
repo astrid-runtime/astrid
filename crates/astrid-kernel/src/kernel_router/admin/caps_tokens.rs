@@ -105,15 +105,21 @@ pub(super) async fn caps_token_mint(
     }
 
     // The token API takes a `chrono::Duration` (signed). Convert the
-    // operator-supplied seconds, rejecting a value too large to represent
-    // rather than silently saturating to a near-permanent token.
+    // operator-supplied seconds via the non-panicking `try_seconds`:
+    // `Duration::seconds` PANICS for a value beyond chrono's internal bound
+    // (~9.2e15 s, far below `i64::MAX`), so guarding only the `u64`→`i64` cast
+    // would still let a large `ttl_secs` crash the handler. An out-of-range
+    // value must be a clean bad-input error, not a panic.
     let ttl = match ttl_secs {
         None => None,
-        Some(secs) => match i64::try_from(secs).map(chrono::Duration::seconds) {
-            Ok(d) => Some(d),
-            Err(_) => {
-                return err_bad_input(format!("ttl_secs {secs} is too large (max {})", i64::MAX));
-            },
+        Some(secs) => {
+            let Some(d) = i64::try_from(secs)
+                .ok()
+                .and_then(chrono::Duration::try_seconds)
+            else {
+                return err_bad_input(format!("ttl_secs {secs} is out of range"));
+            };
+            Some(d)
         },
     };
     // A fresh audit id: the admin action's own provenance is captured by

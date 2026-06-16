@@ -323,3 +323,35 @@ async fn mint_rejects_invalid_permission() {
         "no token should be minted on a bad permission"
     );
 }
+
+// ── 8. Mint with an out-of-range TTL → bad input, never a panic ────────
+
+/// A `ttl_secs` that fits in `i64` but exceeds chrono's internal bound
+/// (~9.2e15 s) must be a clean bad-input error. `chrono::Duration::seconds`
+/// panics for such a value, so this locks the non-panicking `try_seconds`
+/// conversion — the value below clears the `u64`→`i64` cast yet overflows
+/// chrono, exercising exactly that guard.
+#[tokio::test(flavor = "multi_thread")]
+async fn mint_rejects_out_of_range_ttl() {
+    let (_dir, kernel) = fixture().await;
+    let alice = pid("alice");
+    create_agent(&kernel, "alice").await;
+
+    let res = mint(
+        &kernel,
+        &alice,
+        "mcp://server:tool",
+        None,
+        Some(9_300_000_000_000_000),
+    )
+    .await;
+    assert_error_contains(&res, "out of range");
+
+    assert!(
+        kernel
+            .capabilities
+            .find_capability(&alice, "mcp://server:tool", Permission::Invoke)
+            .is_none(),
+        "no token should be minted on an out-of-range ttl"
+    );
+}
