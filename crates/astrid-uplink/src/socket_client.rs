@@ -135,7 +135,11 @@ impl SocketClient {
     /// the re-handshake is rejected — the caller should surface that
     /// rather than retry indefinitely.
     pub async fn reconnect(&mut self) -> Result<()> {
-        *self = Self::connect(self.session_id.clone()).await?;
+        // Re-bind to the SAME principal: a reconnect must preserve the
+        // connection's identity, since the proxy pins the first principal it
+        // sees per connection and a fresh one bound to a different principal
+        // would have this uplink's messages dropped.
+        *self = Self::connect(self.session_id.clone(), self.principal.clone()).await?;
         Ok(())
     }
 
