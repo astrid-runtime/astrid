@@ -10,6 +10,7 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 
 use astrid_core::UplinkProfile;
+use astrid_core::kernel_api::CommandKind;
 
 mod capabilities;
 mod topics;
@@ -482,12 +483,30 @@ pub struct ContextFileDef {
 /// A command provided by the capsule.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CommandDef {
-    /// The slash-command trigger.
+    /// The command trigger (slash command, or CLI verb when
+    /// `kind = "cli"`).
     pub name: String,
     /// Optional description.
     pub description: Option<String>,
     /// Path to the declarative command TOML (if static).
     pub file: Option<PathBuf>,
+    /// How the command is surfaced. `kind = "slash"` (the default when
+    /// absent) is an in-TUI slash command; `kind = "cli"` is a top-level
+    /// CLI verb dispatched to this capsule over IPC as a non-interactive
+    /// one-shot.
+    ///
+    /// For the CLI-verb wire contract (run/result topic shapes, the
+    /// provider-targeted-topic security rationale, and the fact that the
+    /// kernel does not interpret the payloads) see [`CommandKind`].
+    ///
+    /// `kind = "cli"` names are validated at manifest parse time (see
+    /// [`load_manifest`](crate::discovery::load_manifest)): they must
+    /// match `[a-z][a-z0-9-]*`, be 1-32 chars, and must not collide with a
+    /// built-in `astrid capsule` subcommand
+    /// ([`RESERVED_CAPSULE_VERBS`]). Slash commands are not subject to this
+    /// validation and parse exactly as before.
+    #[serde(default, skip_serializing_if = "CommandKind::is_default")]
+    pub kind: CommandKind,
 }
 
 /// An MCP server provided by the capsule.

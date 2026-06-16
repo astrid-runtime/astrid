@@ -240,6 +240,12 @@ async fn dispatch_capsule(command: crate::cli::CapsuleCommands) -> Result<ExitCo
         ),
         CapsuleCommands::Config(args) => commands::capsule::config::run(&args),
         CapsuleCommands::Show(args) => commands::capsule::show::run(&args),
+        CapsuleCommands::Run {
+            provider,
+            verb,
+            args,
+        } => commands::capsule_verb::run_explicit(provider, verb, args).await,
+        CapsuleCommands::External(tokens) => commands::capsule_verb::run_external(tokens).await,
     }
 }
 

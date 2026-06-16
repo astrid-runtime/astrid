@@ -360,6 +360,27 @@ pub(crate) enum CapsuleCommands {
     Config(CapsuleConfigArgs),
     /// Show manifest, interfaces, source for an installed capsule.
     Show(CapsuleShowArgs),
+    /// Run a capsule-provided command, explicitly naming the provider
+    /// (needed when two capsules provide the same verb).
+    Run {
+        /// The capsule that provides the verb.
+        provider: String,
+        /// The capsule-declared CLI verb.
+        verb: String,
+        /// Arguments forwarded verbatim to the capsule.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+    /// Capsule-provided verbs: `astrid capsule <verb> [args...]`.
+    ///
+    /// The named variants above (`install`, `update`, `list`, ...)
+    /// structurally shadow capsule verbs: clap matches a declared variant
+    /// before falling through to this external-subcommand catch-all, so a
+    /// capsule can never override a built-in verb (manifest parsing also
+    /// rejects reserved names — defence in depth). Any unrecognised verb
+    /// lands here and is resolved against the daemon's command registry.
+    #[command(external_subcommand)]
+    External(Vec<String>),
 }
 
 /// Model Context Protocol surfaces — expose Astrid's capsule tools to an
@@ -455,4 +476,41 @@ pub(crate) enum DistroCommands {
         #[arg(short, long)]
         agent: Option<String>,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::CapsuleCommands;
+    use clap::Subcommand;
+
+    /// Every built-in `astrid capsule` subcommand name must appear in
+    /// [`astrid_core::kernel_api::RESERVED_CAPSULE_VERBS`]. The reserved
+    /// list is what manifest parsing uses to reject a `kind = "cli"`
+    /// command that would shadow a built-in verb; if the two drift, a
+    /// capsule could declare a verb that clap silently shadows (or, worse,
+    /// the reserved list could block a name that is not actually a
+    /// built-in). This test pins them together.
+    ///
+    /// The catch-all `External` external-subcommand variant has no fixed
+    /// clap name (it matches arbitrary verbs), so it is excluded.
+    #[test]
+    fn reserved_verbs_match_clap_subcommands() {
+        let cmd = CapsuleCommands::augment_subcommands(clap::Command::new("capsule"));
+        let clap_names: Vec<String> = cmd
+            .get_subcommands()
+            .map(|s| s.get_name().to_string())
+            .collect();
+
+        for name in &clap_names {
+            assert!(
+                astrid_core::kernel_api::RESERVED_CAPSULE_VERBS.contains(&name.as_str()),
+                "built-in `astrid capsule {name}` is missing from RESERVED_CAPSULE_VERBS \
+                 (add it so a capsule cannot shadow it)"
+            );
+        }
+
+        // `help` is injected by clap, not a declared variant, but is a real
+        // reserved word — assert it is covered too.
+        assert!(astrid_core::kernel_api::RESERVED_CAPSULE_VERBS.contains(&"help"));
+    }
 }

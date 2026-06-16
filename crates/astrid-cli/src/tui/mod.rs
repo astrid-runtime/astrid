@@ -378,8 +378,14 @@ pub(crate) fn handle_daemon_event(app: &mut App, message: &IpcMessage) {
                 },
             ];
 
-            // Append all dynamically discovered capsule commands
+            // Append all dynamically discovered capsule commands. Only
+            // slash-kind commands belong in the slash palette; CLI verbs
+            // (`kind = "cli"`) are top-level `astrid capsule <verb>`
+            // subcommands and must not appear as in-TUI slash commands.
             for cmd in &cmds {
+                if cmd.kind != astrid_core::kernel_api::CommandKind::Slash {
+                    continue;
+                }
                 app.slash_commands.push(state::SlashCommandDef {
                     name: format!("/{}", cmd.name),
                     description: format!("{} (via {})", cmd.description, cmd.provider_capsule),

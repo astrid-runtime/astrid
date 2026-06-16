@@ -54,6 +54,39 @@ fn validate_interface_identifiers<'a>(
     Ok(())
 }
 
+/// Validate a `kind = "cli"` command name (a top-level
+/// `astrid capsule <verb>` subcommand).
+///
+/// Rules (fail closed): the name must match `[a-z][a-z0-9-]*`, be 1-32
+/// characters, and must not collide with a built-in `astrid capsule`
+/// subcommand ([`astrid_core::kernel_api::RESERVED_CAPSULE_VERBS`]).
+fn validate_cli_verb_name(name: &str) -> Result<(), String> {
+    if name.is_empty() {
+        return Err("must not be empty".into());
+    }
+    if name.len() > 32 {
+        return Err("must be at most 32 characters".into());
+    }
+    let mut chars = name.chars();
+    let first = chars.next().expect("non-empty checked above");
+    if !first.is_ascii_lowercase() {
+        return Err("must start with a lowercase ASCII letter (a-z)".into());
+    }
+    for c in chars {
+        if !(c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-') {
+            return Err(format!(
+                "contains invalid character '{c}' (allowed: a-z, 0-9, '-')"
+            ));
+        }
+    }
+    if astrid_core::kernel_api::RESERVED_CAPSULE_VERBS.contains(&name) {
+        return Err(format!(
+            "'{name}' is a reserved built-in `astrid capsule` subcommand"
+        ));
+    }
+    Ok(())
+}
+
 /// Discover capsule manifests from standard locations with precedence.
 ///
 /// Scans directories in priority order:
@@ -282,6 +315,24 @@ pub fn load_manifest(path: &Path) -> CapsuleResult<CapsuleManifest> {
         validate_interface_identifiers(path, "exports", namespace, ifaces.keys())?;
     }
 
+    // Validate `kind = "cli"` command names. A CLI verb becomes a
+    // top-level `astrid capsule <verb>` subcommand, so a hostile manifest
+    // could otherwise shadow a built-in verb or smuggle shell-unsafe
+    // characters into the dispatch path. Fail closed at parse time. Slash
+    // commands (the default) are deliberately untouched — zero behaviour
+    // change for the existing fleet.
+    for cmd in &manifest.commands {
+        if cmd.kind != astrid_core::kernel_api::CommandKind::Cli {
+            continue;
+        }
+        if let Err(reason) = validate_cli_verb_name(&cmd.name) {
+            return Err(CapsuleError::ManifestParseError {
+                path: path.to_path_buf(),
+                message: format!("invalid CLI command name '{}': {reason}", cmd.name),
+            });
+        }
+    }
+
     // Uplink capsules load in a partition before non-uplinks.
     // Declaring [imports] on an uplink would violate this ordering.
     if manifest.capabilities.uplink && manifest.has_imports() {
@@ -381,6 +432,86 @@ version = "0.1.0"
     fn load_manifest_accepts_valid_semver() {
         let toml = "[package]\nname = \"test\"\nversion = \"1.2.3\"\n";
         assert!(load_from_toml(toml).is_ok());
+    }
+
+    #[test]
+    fn command_kind_defaults_to_slash_when_absent() {
+        // An existing fleet manifest with no `kind` field parses unchanged
+        // and the command is a slash command (zero behaviour change).
+        let toml =
+            format!("{VALID_HEADER}\n[[command]]\nname = \"git\"\ndescription = \"git ops\"\n");
+        let m = load_from_toml(&toml).unwrap();
+        assert_eq!(m.commands.len(), 1);
+        assert_eq!(
+            m.commands[0].kind,
+            astrid_core::kernel_api::CommandKind::Slash
+        );
+    }
+
+    #[test]
+    fn command_kind_cli_valid_name_parses() {
+        for good in &["deploy", "a", "x-y", "v2", "a1-b2-c3", "abcdefghijklmnop"] {
+            let toml = format!("{VALID_HEADER}\n[[command]]\nname = \"{good}\"\nkind = \"cli\"\n");
+            let m = load_from_toml(&toml)
+                .unwrap_or_else(|e| panic!("expected CLI verb '{good}' to parse, got: {e}"));
+            assert_eq!(
+                m.commands[0].kind,
+                astrid_core::kernel_api::CommandKind::Cli
+            );
+        }
+    }
+
+    #[test]
+    fn command_kind_cli_invalid_pattern_rejected() {
+        // Uppercase, leading digit, leading dash, illegal chars, unicode,
+        // empty, and over-length names must all fail the parse (fail closed).
+        let long = "a".repeat(33);
+        let bad: Vec<String> = vec![
+            "Deploy".into(),
+            "1deploy".into(),
+            "-deploy".into(),
+            "de_ploy".into(),
+            "de ploy".into(),
+            "déploy".into(),
+            "deploy!".into(),
+            String::new(),
+            long,
+        ];
+        for name in &bad {
+            let toml = format!("{VALID_HEADER}\n[[command]]\nname = \"{name}\"\nkind = \"cli\"\n");
+            let err = load_from_toml(&toml).unwrap_err();
+            assert!(
+                err.to_string().contains("invalid CLI command name"),
+                "expected rejection for CLI verb '{name}', got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn command_kind_cli_reserved_name_rejected() {
+        for reserved in astrid_core::kernel_api::RESERVED_CAPSULE_VERBS {
+            let toml =
+                format!("{VALID_HEADER}\n[[command]]\nname = \"{reserved}\"\nkind = \"cli\"\n");
+            let err = load_from_toml(&toml).unwrap_err();
+            assert!(
+                err.to_string().contains("reserved"),
+                "expected reserved-name rejection for '{reserved}', got: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn slash_command_names_unaffected_by_cli_validation() {
+        // Names that would be illegal as CLI verbs (uppercase, reserved,
+        // long, unicode) are perfectly fine as slash commands — the new
+        // validation must not touch them.
+        for name in &["Install", "remove", "1abc", "MyCommand", "déjà"] {
+            let toml = format!("{VALID_HEADER}\n[[command]]\nname = \"{name}\"\n");
+            assert!(
+                load_from_toml(&toml).is_ok(),
+                "slash command '{name}' should parse without CLI validation"
+            );
+        }
     }
 
     #[test]
