@@ -32,8 +32,13 @@ fn challenge_signature_verifies_against_registered_key() {
 
     // A registered key over the exact challenge message verifies.
     assert!(
-        verify_signature_against_keys(&principal, &[registered.clone()], &nonce_hex, &signature)
-            .is_ok(),
+        verify_signature_against_keys(
+            &principal,
+            std::slice::from_ref(&registered),
+            &nonce_hex,
+            &signature
+        )
+        .is_ok(),
         "valid signature must verify against the registered key"
     );
 
@@ -52,7 +57,7 @@ fn challenge_signature_verifies_against_registered_key() {
     assert!(
         verify_signature_against_keys(
             &principal,
-            &[registered.clone()],
+            std::slice::from_ref(&registered),
             &tampered_nonce,
             &signature
         )
@@ -171,7 +176,7 @@ async fn handshake_signed_returns_verified_principal() {
         .expect("daemon must issue a challenge");
 
     // Frame 2: sign the challenge → expect final OK.
-    let message = principal_auth_challenge_message(&principal.to_string(), &nonce_hex);
+    let message = principal_auth_challenge_message(principal.as_str(), &nonce_hex);
     let signature = keypair.sign(message.as_bytes()).to_hex();
     let second = HandshakeRequest {
         token: tok_hex,
@@ -217,7 +222,7 @@ async fn handshake_bad_signature_fails_closed() {
 
     // Sign with a DIFFERENT (unregistered) key → must fail closed.
     let attacker = astrid_crypto::KeyPair::generate();
-    let message = principal_auth_challenge_message(&principal.to_string(), &nonce_hex);
+    let message = principal_auth_challenge_message(principal.as_str(), &nonce_hex);
     let bad_signature = attacker.sign(message.as_bytes()).to_hex();
     let second = HandshakeRequest {
         token: tok_hex,

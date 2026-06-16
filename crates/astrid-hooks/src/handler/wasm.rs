@@ -383,6 +383,8 @@ impl WasmHandler {
             // Transient hook execution never accepts socket connections; a
             // throwaway registry satisfies the field (issue #45/#852).
             connection_principals: HostState::new_connection_principals(),
+            // No client frame in flight; hooks never forward over publish-as.
+            ingress_principal: None,
         })
     }
 }

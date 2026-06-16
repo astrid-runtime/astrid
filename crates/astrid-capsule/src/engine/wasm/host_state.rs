@@ -476,6 +476,26 @@ pub struct HostState {
     /// enforcement that consumes it (binding the connection's principal to
     /// outbound traffic) lands separately.
     pub connection_principals: Arc<dashmap::DashMap<u32, astrid_core::principal::PrincipalId>>,
+    /// The verified principal of the source connection whose inbound frame is
+    /// currently in flight — the ENFORCEMENT side of
+    /// [`connection_principals`](Self::connection_principals) (issue #45/#852).
+    ///
+    /// Set by the framed [`net::tcp-stream.read`](super::host::net) host fn when
+    /// a read returns a data frame on a connection that carries a kernel-bound
+    /// principal; cleared to `None` on a closed/pending read. When the uplink
+    /// (capsule-cli) forwards that frame via `publish-as`, the host stamps THIS
+    /// principal in place of the capsule-supplied name, so a socket client can
+    /// no longer name a principal it has not proven (the self-stamp fix). It
+    /// holds from one framed read until the next, so a forwarded message AND its
+    /// one-shot `client.v1.connect` both attribute to the same verified
+    /// principal.
+    ///
+    /// `None` for an unbound connection (a legacy peer-cred-trusted local
+    /// operator), in which case `publish-as` falls back to the supplied name.
+    /// Per-instance state, NOT the shared `Arc`: the single pooled run-loop
+    /// instance of the uplink both reads the frame and forwards it, so the
+    /// binding lives exactly as long as the in-flight frame.
+    pub ingress_principal: Option<astrid_core::principal::PrincipalId>,
     /// Bound run-loop CPU-bound signal: set `true` by the ipc `recv` host fn
     /// each time the guest blocks on recv, read + cleared by the run-loop's
     /// epoch-deadline callback once per window.
