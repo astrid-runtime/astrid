@@ -476,6 +476,18 @@ pub struct HostState {
     /// enforcement that consumes it (binding the connection's principal to
     /// outbound traffic) lands separately.
     pub connection_principals: Arc<dashmap::DashMap<u32, astrid_core::principal::PrincipalId>>,
+    /// Daemon-injected broker that opens an authenticated, principal-bound
+    /// connection for a host-spawned native agent and yields it as a raw fd to
+    /// fd-pass into the sandboxed child (Path-1 spawn binding, issue #45/#852).
+    ///
+    /// `None` outside the daemon-hosted engine (lifecycle hooks, tests) and
+    /// until the daemon injects it; a `host_process` spawn then fd-passes a
+    /// pre-authenticated connection instead of leaving the child to dial + claim
+    /// a principal. The engine cannot depend on the uplink client crate, so this
+    /// is a trait object the daemon supplies — see [`SpawnConnectionBroker`].
+    ///
+    /// [`SpawnConnectionBroker`]: crate::spawn_conn::SpawnConnectionBroker
+    pub spawn_connection_broker: Option<Arc<dyn crate::spawn_conn::SpawnConnectionBroker>>,
     /// The verified principal of the source connection whose inbound frame is
     /// currently in flight — the ENFORCEMENT side of
     /// [`connection_principals`](Self::connection_principals) (issue #45/#852).

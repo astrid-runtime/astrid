@@ -22,6 +22,7 @@ pub mod profile_cache;
 pub mod registry;
 pub mod schema_catalog;
 pub mod security;
+pub mod spawn_conn;
 pub mod topic;
 pub mod toposort;
 pub(crate) mod watcher;

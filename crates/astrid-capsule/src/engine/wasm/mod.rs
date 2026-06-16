@@ -1395,6 +1395,8 @@ impl ExecutionEngine for WasmEngine {
                 process_count_total: 0,
                 process_count_by_principal: std::collections::HashMap::new(),
                 connection_principals: connection_principals.clone(),
+                // Injected by the daemon after engine construction (issue #45/#852).
+                spawn_connection_broker: None,
                 // No frame in flight at construction; set per framed read.
                 ingress_principal: None,
                 // Run-loop epoch-interrupt state. `recv_yielded` is set true by
@@ -2426,6 +2428,8 @@ pub async fn run_lifecycle(
         // Lifecycle hooks never accept socket connections; a throwaway
         // registry satisfies the field (issue #45/#852).
         connection_principals: Arc::new(dashmap::DashMap::new()),
+        // Lifecycle hooks never spawn principal-bound agents.
+        spawn_connection_broker: None,
         // Lifecycle hooks never forward client frames; no in-flight principal.
         ingress_principal: None,
         // Lifecycle hooks are not run loops; the epoch-interrupt run-loop
