@@ -18,6 +18,7 @@
 //! table is the canonical storage for `ManagedProcess`.
 
 mod handle;
+mod inject;
 mod managed;
 mod persistent;
 mod tracker;
@@ -75,6 +76,48 @@ fn audit_process<T, E: std::fmt::Debug>(
             %principal,
             fn = op,
             cmd,
+            error = ?e,
+            "audit",
+        ),
+    }
+}
+
+/// Audit a spawn that carried read-only file injections. Emits the same
+/// `astrid.audit.process` line as [`audit_process`] plus an `injections` field
+/// = a formatted `"<target>=<blake3hex>"` list. Only the target paths and
+/// content hashes are logged — never the source path's parent, the bytes, or
+/// any token (consistent with the existing audit discipline).
+fn audit_process_injections<T, E: std::fmt::Debug>(
+    state: &HostState,
+    op: &'static str,
+    cmd: &str,
+    audit: &[(String, String)],
+    result: &Result<T, E>,
+) {
+    let injections = audit
+        .iter()
+        .map(|(target, hash)| format!("{target}={hash}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let capsule_id = state.capsule_id.as_str();
+    let principal = state.effective_principal();
+    match result {
+        Ok(_) => tracing::debug!(
+            target: "astrid.audit.process",
+            %capsule_id,
+            %principal,
+            fn = op,
+            cmd,
+            injections = %injections,
+            "audit",
+        ),
+        Err(e) => tracing::debug!(
+            target: "astrid.audit.process",
+            %capsule_id,
+            %principal,
+            fn = op,
+            cmd,
+            injections = %injections,
             error = ?e,
             "audit",
         ),
@@ -157,9 +200,17 @@ fn build_persistent_child(
     request: &SpawnRequest,
     workspace_root: &std::path::Path,
     want_stdin: bool,
+    injections: &[astrid_workspace::RoInjection],
+    inject_env: &[(String, String)],
 ) -> Result<tokio::process::Child, ErrorCode> {
-    let mut sandboxed = prepare_sandboxed_command(&request.cmd, &request.args, workspace_root)
-        .map_err(|_| ErrorCode::InvalidInput)?;
+    let mut sandboxed = prepare_sandboxed_command(
+        &request.cmd,
+        &request.args,
+        workspace_root,
+        injections,
+        inject_env,
+    )
+    .map_err(|_| ErrorCode::InvalidInput)?;
     // `configure_piped` sets the process group + stdout/stderr pipes.
     configure_piped(&mut sandboxed);
     if want_stdin {
@@ -204,9 +255,30 @@ impl process::Host for HostState {
             return result;
         }
 
-        let mut sandboxed_cmd =
-            prepare_sandboxed_command(&request.cmd, &request.args, &workspace_root)
-                .map_err(|_| ErrorCode::InvalidInput)?;
+        // Snapshot + verify any read-only file injections before building the
+        // command. `_injection_guard` is held to the end of this fn so the
+        // host-owned snapshot lives for the child's lifetime and is cleaned up
+        // after the child has run.
+        let prepared = match inject::prepare_injections(&request.file_injections) {
+            Ok(p) => p,
+            Err(e) => {
+                let result: Result<ProcessResult, ErrorCode> = Err(e);
+                audit_process(self, "astrid:process/host.spawn", &cmd_for_audit, &result);
+                return result;
+            },
+        };
+        let injection_audit = prepared.audit;
+        let injection_env = prepared.env;
+        let _injection_guard = prepared.guard;
+
+        let mut sandboxed_cmd = prepare_sandboxed_command(
+            &request.cmd,
+            &request.args,
+            &workspace_root,
+            &prepared.sandbox,
+            &injection_env,
+        )
+        .map_err(|_| ErrorCode::InvalidInput)?;
         sandboxed_cmd.stdout(Stdio::piped());
         sandboxed_cmd.stderr(Stdio::piped());
 
@@ -253,7 +325,17 @@ impl process::Host for HostState {
                 Err(ErrorCode::Cancelled)
             },
         };
-        audit_process(self, "astrid:process/host.spawn", &cmd_for_audit, &result);
+        if injection_audit.is_empty() {
+            audit_process(self, "astrid:process/host.spawn", &cmd_for_audit, &result);
+        } else {
+            audit_process_injections(
+                self,
+                "astrid:process/host.spawn",
+                &cmd_for_audit,
+                &injection_audit,
+                &result,
+            );
+        }
         result
     }
 
@@ -309,9 +391,33 @@ impl process::Host for HostState {
             return Err(ErrorCode::Cancelled);
         }
 
-        let mut sandboxed_cmd =
-            prepare_sandboxed_command(&request.cmd, &request.args, &workspace_root)
-                .map_err(|_| ErrorCode::InvalidInput)?;
+        // Snapshot + verify any read-only file injections. The guard is stored
+        // on the `ManagedProcess` below so it lives as long as the handle and
+        // cleans up the host-owned snapshot dir when it drops.
+        let prepared = match inject::prepare_injections(&request.file_injections) {
+            Ok(p) => p,
+            Err(e) => {
+                let result: Result<Resource<ProcessHandle>, ErrorCode> = Err(e);
+                audit_process(
+                    self,
+                    "astrid:process/host.spawn-background",
+                    &cmd_for_audit,
+                    &result,
+                );
+                return result;
+            },
+        };
+        let injection_audit = prepared.audit;
+        let injection_env = prepared.env;
+
+        let mut sandboxed_cmd = prepare_sandboxed_command(
+            &request.cmd,
+            &request.args,
+            &workspace_root,
+            &prepared.sandbox,
+            &injection_env,
+        )
+        .map_err(|_| ErrorCode::InvalidInput)?;
         configure_piped(&mut sandboxed_cmd);
 
         // Convert the prepared std::Command into a tokio::Command so the
@@ -336,6 +442,7 @@ impl process::Host for HostState {
             stderr_buf: Arc::clone(&stderr_buf),
             command: command_str,
             creator: principal.clone(),
+            injection_guard: Some(prepared.guard),
         };
 
         let pid = managed
@@ -364,12 +471,22 @@ impl process::Host for HostState {
             .entry(principal)
             .or_insert(0) += 1;
         let result: Result<Resource<ProcessHandle>, ErrorCode> = Ok(Resource::new_own(res.rep()));
-        audit_process(
-            self,
-            "astrid:process/host.spawn-background",
-            &cmd_for_audit,
-            &result,
-        );
+        if injection_audit.is_empty() {
+            audit_process(
+                self,
+                "astrid:process/host.spawn-background",
+                &cmd_for_audit,
+                &result,
+            );
+        } else {
+            audit_process_injections(
+                self,
+                "astrid:process/host.spawn-background",
+                &cmd_for_audit,
+                &injection_audit,
+                &result,
+            );
+        }
         result
     }
 
@@ -464,6 +581,24 @@ impl process::Host for HostState {
             return Err(ErrorCode::Cancelled);
         }
 
+        // Snapshot + verify any read-only file injections. The guard is threaded
+        // into the registry entry below so it lives as long as the persistent
+        // process and is cleaned up by `reap_entry` (which consumes the entry by
+        // value) on every reap path.
+        let prepared = match inject::prepare_injections(&request.file_injections) {
+            Ok(p) => p,
+            Err(e) => {
+                let result: Result<String, ErrorCode> = Err(e);
+                audit_process(
+                    self,
+                    "astrid:process/host.spawn-persistent",
+                    &cmd_for_audit,
+                    &result,
+                );
+                return result;
+            },
+        };
+
         let capsule_id_arc: Arc<str> = Arc::from(self.capsule_id.as_str());
         let workspace_root = self.workspace_root.clone();
         // Per-principal concurrent cap, SHARED with `spawn-background`: subtract
@@ -497,7 +632,13 @@ impl process::Host for HostState {
         }
 
         let want_stdin = request.keep_stdin_open.unwrap_or(false) || request.stdin.is_some();
-        let mut child = match build_persistent_child(&request, &workspace_root, want_stdin) {
+        let mut child = match build_persistent_child(
+            &request,
+            &workspace_root,
+            want_stdin,
+            &prepared.sandbox,
+            &prepared.env,
+        ) {
             Ok(c) => c,
             Err(e) => {
                 let result: Result<String, ErrorCode> = Err(e);
@@ -563,6 +704,7 @@ impl process::Host for HostState {
         };
 
         let command = format!("{} {}", request.cmd, request.args.join(" "));
+        let injection_audit = prepared.audit;
         let result = self.persistent_processes.spawn(persistent::SpawnParams {
             creator: principal,
             capsule_id: capsule_id_arc,
@@ -579,7 +721,18 @@ impl process::Host for HostState {
             max_lifetime_ms: request.max_lifetime_ms,
             idle_timeout_ms: request.idle_timeout_ms,
             exit_retention_ms: request.exit_retention_ms,
+            injection_guard: Some(prepared.guard),
         });
+        if !injection_audit.is_empty() {
+            audit_process_injections(
+                self,
+                "astrid:process/host.spawn-persistent",
+                &cmd_for_audit,
+                &injection_audit,
+                &result,
+            );
+            return result;
+        }
         audit_process(
             self,
             "astrid:process/host.spawn-persistent",

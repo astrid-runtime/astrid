@@ -40,6 +40,23 @@ fn validate_sandbox_str<'a>(path: &'a Path, label: &str) -> io::Result<&'a str> 
     Ok(s)
 }
 
+/// A host-verified, read-only file the sandbox materializes inside a spawned
+/// child. `source` is the host-owned path the verified snapshot already lives
+/// at (the in-sandbox bytes are bound/copied FROM here); `target` is the
+/// absolute path inside the child's sandbox at which it reads those bytes.
+///
+/// The caller is responsible for ensuring `source` is a host-owned location
+/// the child and the spawning principal's capsule fs surface cannot write —
+/// the sandbox layer only wires the read-only exposure, it does not snapshot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RoInjection {
+    /// Host-owned path holding the verified snapshot bytes (the bind source on
+    /// Linux; the materialized literal on macOS — equal to `target` there).
+    pub source: PathBuf,
+    /// Absolute path inside the child's sandbox at which it reads the bytes.
+    pub target: PathBuf,
+}
+
 /// Wraps a standard OS command in a native kernel sandbox (bwrap or Seatbelt).
 ///
 /// Ensures that agent-executed native tools are restricted from accessing
@@ -61,11 +78,38 @@ impl SandboxCommand {
     /// backslash, or null byte).
     #[allow(clippy::needless_pass_by_value)] // Moved on the unsupported-OS passthrough arm; borrowed on Linux/macOS.
     pub fn wrap(inner_cmd: Command, worktree_path: &Path) -> io::Result<Command> {
+        Self::wrap_with_injections(inner_cmd, worktree_path, &[])
+    }
+
+    /// Like [`wrap`](Self::wrap), but additionally exposes a set of
+    /// host-verified, READ-ONLY files at chosen paths inside the child's
+    /// sandbox. Each [`RoInjection`] binds the host-owned bytes at `source` so
+    /// the child reads them at `target` but neither it nor a subprocess it
+    /// spawns can modify them. An empty `injections` slice is byte-for-byte
+    /// identical to [`wrap`](Self::wrap).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the worktree path or any injection `source` /
+    /// `target` is not absolute, not valid UTF-8, or contains characters unsafe
+    /// for SBPL interpolation (double-quote, backslash, or null byte); or, on a
+    /// platform without an OS-level sandbox, if `injections` is non-empty (the
+    /// read-only guarantee cannot be enforced without a sandbox — fail-secure).
+    #[allow(clippy::needless_pass_by_value)] // Moved on the unsupported-OS passthrough arm; borrowed on Linux/macOS.
+    pub fn wrap_with_injections(
+        inner_cmd: Command,
+        worktree_path: &Path,
+        injections: &[RoInjection],
+    ) -> io::Result<Command> {
         // Validate on all platforms for defense in depth and API consistency.
         // On macOS the validated string is needed for SBPL interpolation.
         // On Linux bwrap passes paths as argv entries (no injection risk),
         // but we still reject unsafe paths at the API boundary.
         let _ = validate_sandbox_str(worktree_path, "worktree path")?;
+        for inj in injections {
+            let _ = validate_sandbox_str(&inj.source, "injection source")?;
+            let _ = validate_sandbox_str(&inj.target, "injection target")?;
+        }
 
         #[cfg(target_os = "linux")]
         {
@@ -77,7 +121,18 @@ impl SandboxCommand {
                 .arg("--dev").arg("/dev")           // Standard dev mounts
                 .arg("--proc").arg("/proc")         // Standard proc mounts
                 .arg("--bind").arg(worktree_path).arg(worktree_path) // Write access to the worktree
-                .arg("--tmpfs").arg("/tmp")         // Disposable tmpfs
+                .arg("--tmpfs").arg("/tmp"); // Disposable tmpfs
+
+            // Read-only file injections: bind each host-owned verified snapshot
+            // at its in-sandbox target. Placed AFTER the writable worktree
+            // --bind so a later bind can't shadow it, and BEFORE --unshare-all
+            // so the ro-bind sits within the namespace setup. The namespace
+            // creates the mount point, so `target` need not exist on the host.
+            for inj in injections {
+                bwrap.arg("--ro-bind").arg(&inj.source).arg(&inj.target);
+            }
+
+            bwrap
                 .arg("--unshare-all")               // Drop namespaces (network, pid, etc.)
                 .arg("--share-net")                 // Re-enable network so npm/cargo can fetch
                 .arg("--die-with-parent"); // Prevent orphan processes
@@ -117,7 +172,15 @@ impl SandboxCommand {
             // macOS-15+ `sandbox-exec` incompatibility and papered over by
             // disabling the sandbox entirely. `sandbox-exec` is deprecated but
             // still enforces on current macOS. See #855.
-            let prefix = ProcessSandboxConfig::new(worktree_path).build_seatbelt_prefix()?;
+            //
+            // Seatbelt has no mount namespace, so the caller has already
+            // materialized the verified snapshot AT `target`; the profile
+            // grants read and a trailing deny-write on that literal path.
+            let mut config = ProcessSandboxConfig::new(worktree_path);
+            for inj in injections {
+                config = config.with_ro_inject(&inj.source, &inj.target);
+            }
+            let prefix = config.build_seatbelt_prefix()?;
 
             let mut sb_cmd = Command::new(&prefix.program);
             sb_cmd.args(&prefix.args);
@@ -145,6 +208,14 @@ impl SandboxCommand {
 
         #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         {
+            // Without an OS-level sandbox there is no mechanism to enforce the
+            // read-only guarantee; refuse rather than expose writable bytes.
+            if !injections.is_empty() {
+                return Err(io::Error::other(
+                    "read-only file injection requires an OS sandbox \
+                     (bwrap/Seatbelt); unavailable on this platform",
+                ));
+            }
             tracing::warn!(
                 "Host-level sandboxing is not supported on this OS. Processes will run unsandboxed."
             );
@@ -301,6 +372,11 @@ pub struct ProcessSandboxConfig {
     allow_network: bool,
     /// Paths to overlay with empty tmpfs (Linux) or exclude (macOS), blocking access.
     hidden_paths: Vec<PathBuf>,
+    /// Read-only file injections: host-verified bytes exposed at an in-sandbox
+    /// `target`. On macOS the snapshot is materialized at `target` (so
+    /// `source == target`) and the profile gets a read-allow plus a trailing
+    /// write-deny on that literal path.
+    ro_injections: Vec<RoInjection>,
     /// What to do when OS-level sandboxing is unavailable (see [`SandboxPolicy`]).
     policy: SandboxPolicy,
 }
@@ -321,6 +397,7 @@ impl ProcessSandboxConfig {
             extra_write_paths: Vec::new(),
             allow_network: true,
             hidden_paths: Vec::new(),
+            ro_injections: Vec::new(),
             policy: SandboxPolicy::from_env(),
         }
     }
@@ -361,6 +438,27 @@ impl ProcessSandboxConfig {
     #[must_use]
     pub fn with_hidden(mut self, path: impl Into<PathBuf>) -> Self {
         self.hidden_paths.push(path.into());
+        self
+    }
+
+    /// Add a read-only file injection: expose the host-verified bytes at
+    /// `source` so the sandboxed process reads them at `target`, with no way
+    /// for the child (or any subprocess) to write them.
+    ///
+    /// On macOS the snapshot must already be materialized at `target`, so
+    /// `source` and `target` are typically equal there; the generated Seatbelt
+    /// profile grants `file-read*` on `target` and appends a trailing
+    /// `file-write*` deny on it.
+    #[must_use]
+    pub fn with_ro_inject(
+        mut self,
+        source: impl Into<PathBuf>,
+        target: impl Into<PathBuf>,
+    ) -> Self {
+        self.ro_injections.push(RoInjection {
+            source: source.into(),
+            target: target.into(),
+        });
         self
     }
 
@@ -458,6 +556,10 @@ impl ProcessSandboxConfig {
         }
         for p in &self.hidden_paths {
             validate_sandbox_str(p, "hidden path")?;
+        }
+        for inj in &self.ro_injections {
+            validate_sandbox_str(&inj.source, "injection source")?;
+            validate_sandbox_str(&inj.target, "injection target")?;
         }
         Ok(())
     }
@@ -650,6 +752,57 @@ mod tests {
             args.iter().any(|a| *a == "echo"),
             "the wrapped command must still invoke the original program"
         );
+    }
+
+    // --- wrap_with_injections() tests ---
+
+    #[test]
+    fn wrap_with_injections_rejects_unsafe_paths() {
+        // Relative target rejected as non-absolute; a double-quote in either
+        // path rejected as a forbidden char (mirrors validate_sandbox_str).
+        for (source, target, needle) in [
+            ("/host/snap", "relative/target", "absolute path"),
+            ("/host/evil\"snap", "/etc/x", "forbidden characters"),
+            ("/host/snap", "/etc/ev\"il", "forbidden characters"),
+        ] {
+            let inj = [RoInjection {
+                source: PathBuf::from(source),
+                target: PathBuf::from(target),
+            }];
+            let result = SandboxCommand::wrap_with_injections(
+                Command::new("echo"),
+                Path::new("/tmp/ws"),
+                &inj,
+            );
+            let msg = result
+                .expect_err("unsafe injection path must be rejected")
+                .to_string();
+            assert!(msg.contains(needle), "expected {needle:?} in: {msg}");
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn wrap_with_injections_emits_ro_bind_pair() {
+        let cmd = Command::new("echo");
+        let inj = [RoInjection {
+            source: PathBuf::from("/host/snap"),
+            target: PathBuf::from("/etc/x"),
+        }];
+        let wrapped =
+            SandboxCommand::wrap_with_injections(cmd, Path::new("/tmp/ws"), &inj).unwrap();
+        let args: Vec<String> = wrapped
+            .get_args()
+            .map(|a| a.to_string_lossy().to_string())
+            .collect();
+        let pos = args
+            .iter()
+            .enumerate()
+            .filter(|(_, a)| *a == "--ro-bind")
+            .find(|(i, _)| args.get(i + 1) == Some(&"/host/snap".to_string()))
+            .map(|(i, _)| i)
+            .expect("wrapped command must carry the injection --ro-bind");
+        assert_eq!(args[pos + 2], "/etc/x", "ro-bind target");
     }
 
     // --- ProcessSandboxConfig builder tests ---
