@@ -71,6 +71,8 @@ async fn caps_grant_appends_and_invalidates_cache() {
             groups: vec!["restricted".into()],
             grants: Vec::new(),
             inherit_from: None,
+            clone_from: None,
+            allow_admin_clone: false,
         },
     )
     .await;
@@ -115,6 +117,8 @@ async fn caps_grant_does_not_clear_matching_revoke() {
             groups: vec!["admin".into()],
             grants: Vec::new(),
             inherit_from: None,
+            clone_from: None,
+            allow_admin_clone: false,
         },
     )
     .await;
@@ -162,6 +166,8 @@ async fn caps_revoke_of_unheld_capability_appends_preemptive() {
             groups: vec!["restricted".into()],
             grants: Vec::new(),
             inherit_from: None,
+            clone_from: None,
+            allow_admin_clone: false,
         },
     )
     .await;
@@ -195,6 +201,8 @@ async fn caps_grant_is_idempotent_no_disk_growth_on_repeat() {
             groups: vec!["restricted".into()],
             grants: Vec::new(),
             inherit_from: None,
+            clone_from: None,
+            allow_admin_clone: false,
         },
     )
     .await;
@@ -236,6 +244,8 @@ async fn caps_revoke_is_idempotent_no_disk_growth_on_repeat() {
             groups: vec!["admin".into()],
             grants: Vec::new(),
             inherit_from: None,
+            clone_from: None,
+            allow_admin_clone: false,
         },
     )
     .await;
@@ -266,6 +276,8 @@ async fn caps_grant_rejects_invalid_capability_grammar() {
             groups: Vec::new(),
             grants: Vec::new(),
             inherit_from: None,
+            clone_from: None,
+            allow_admin_clone: false,
         },
     )
     .await;
@@ -297,6 +309,8 @@ async fn caps_grant_universal_requires_unsafe_admin_acknowledgement() {
             groups: Vec::new(),
             grants: Vec::new(),
             inherit_from: None,
+            clone_from: None,
+            allow_admin_clone: false,
         },
     )
     .await;
@@ -367,6 +381,8 @@ async fn concurrent_caps_grants_serialized_by_admin_write_lock() {
             groups: vec!["restricted".into()],
             grants: Vec::new(),
             inherit_from: None,
+            clone_from: None,
+            allow_admin_clone: false,
         },
     )
     .await;

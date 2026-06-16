@@ -286,6 +286,27 @@ pub enum AdminRequestKind {
         /// deserializing as `None`, which is the secure default.
         #[serde(default)]
         inherit_from: Option<PrincipalId>,
+        /// Opt-in clone source. When `Some`, the new principal is a full
+        /// replica of this source: its capability **profile** (groups,
+        /// grants, revokes, network egress, process-spawn allow-list,
+        /// quotas) AND its **state** (the same env/KV/secret copy
+        /// `inherit_from` performs). The source's `auth` (public keys /
+        /// authenticators) is deliberately NOT copied — each principal keeps
+        /// its own identity. Mutually exclusive with `inherit_from`,
+        /// `groups`, and `grants` (the source determines all of them); the
+        /// kernel rejects a request that sets both `clone_from` and any of
+        /// those. When the source confers admin (resolves to `*`), the
+        /// request is rejected unless `allow_admin_clone` is set.
+        ///
+        /// `#[serde(default)]` keeps older requests deserializing as `None`.
+        #[serde(default)]
+        clone_from: Option<PrincipalId>,
+        /// Acknowledge cloning an admin-conferring source (one that resolves
+        /// to the universal `*`). Without it, `clone_from` of such a source
+        /// is rejected — mirrors `--unsafe-admin` on `caps grant '*'` and
+        /// `group create --caps '*'`. Ignored unless `clone_from` is set.
+        #[serde(default)]
+        allow_admin_clone: bool,
     },
     /// Delete an existing agent identity. The `default` principal is
     /// rejected unconditionally. The principal's home directory is NOT
