@@ -202,8 +202,13 @@ async fn dispatch_subcommand(
 async fn dispatch_capsule(command: crate::cli::CapsuleCommands) -> Result<ExitCode> {
     use crate::cli::CapsuleCommands;
     match command {
-        CapsuleCommands::Install { source, workspace } => {
-            commands::capsule::install::install_capsule(&source, workspace).await?;
+        CapsuleCommands::Install {
+            source,
+            capsule,
+            workspace,
+        } => {
+            commands::capsule::install::install_capsule(&source, capsule.as_deref(), workspace)
+                .await?;
             Ok(ExitCode::SUCCESS)
         },
         CapsuleCommands::Update { target, workspace } => {
