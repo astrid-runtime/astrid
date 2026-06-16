@@ -165,8 +165,16 @@ async fn agent_create(
         ));
     }
 
-    // Validate the inheritance source BEFORE touching any state. Self-
-    // inherit is meaningless (the source home tree does not exist yet),
+    // Acquire the admin write lock BEFORE validating the inheritance source.
+    // The source's existence is state this lock protects: every admin mutator
+    // (create/delete/...) takes it, so checking the source outside the lock
+    // would let a concurrent delete remove it between the existence check and
+    // the inheritance copy below (TOCTOU) — the creation would then silently
+    // produce an empty agent instead of inheriting. Holding the lock pins the
+    // source in place across the check-then-copy.
+    let _guard = kernel.admin_write_lock.lock().await;
+
+    // Self-inherit is meaningless (the source home tree does not exist yet),
     // and a non-existent source must fail loudly rather than silently
     // producing an empty agent the operator believes was provisioned.
     if let Some(ref source) = inherit_from {
@@ -181,7 +189,6 @@ async fn agent_create(
         }
     }
 
-    let _guard = kernel.admin_write_lock.lock().await;
     let profile_path = principal_profile_path(kernel, &principal);
 
     // Collision: a profile on disk means this principal already exists.
