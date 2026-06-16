@@ -74,3 +74,4 @@ pub use meta::{
     CapsuleLocation, CapsuleMeta, InstalledCapsule, read_meta, scan_installed_capsules, write_meta,
 };
 pub use paths::{resolve_env_path, resolve_target_dir, restore_env_from_backup};
+pub use wit::{content_address_wit, materialize_wit_mirror};
