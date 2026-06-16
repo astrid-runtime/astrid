@@ -293,13 +293,12 @@ fn pick_capsule(names: &[&str], name_hint: Option<&str>) -> anyhow::Result<Optio
         [] => Ok(None),
         [_] => Ok(Some(0)),
         many => {
-            let hint = match name_hint {
-                Some(h) => h,
-                None => bail!(
+            let Some(hint) = name_hint else {
+                bail!(
                     "source produced {} .capsule archives but no capsule name to pick one; \
                      expected an archive named '<capsule>.capsule'",
                     many.len()
-                ),
+                );
             };
             // Match the hint against each candidate's stem via `strip_suffix`
             // (no per-call allocation) rather than `format!`-ing the target.
