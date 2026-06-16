@@ -716,7 +716,8 @@ async fn handle_slash_command(
                 // Force a redraw before starting blocking task
                 let _ = terminal.draw(|frame| render::render_frame(frame, app));
 
-                match crate::commands::capsule::install::install_capsule(source, false).await {
+                match crate::commands::capsule::install::install_capsule(source, None, false).await
+                {
                     Ok(()) => {
                         let success_msg =
                             "Installation complete. Sending refresh signal to Kernel...";

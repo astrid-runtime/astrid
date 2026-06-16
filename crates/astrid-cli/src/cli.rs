@@ -305,6 +305,9 @@ pub(crate) enum CapsuleCommands {
     Install {
         /// Capsule source (local path or package name)
         source: String,
+        /// Install only this capsule from a multi-capsule release (default: install all)
+        #[arg(long)]
+        capsule: Option<String>,
         /// Install to workspace instead of user-level
         #[arg(long)]
         workspace: bool,
