@@ -64,8 +64,16 @@ use server::AstridMcpServer;
 /// Returns an error if the daemon socket is unreachable, the principal
 /// is invalid, or the MCP transport fails to initialize.
 pub(crate) async fn serve(principal: Option<&str>) -> Result<ExitCode> {
-    let caller = crate::context::resolve_agent(principal)
-        .context("Failed to resolve principal for `astrid mcp serve`")?;
+    // The subcommand `--principal` is an explicit per-invocation
+    // override; when absent, fall back to the process-wide principal
+    // (the global `--principal` / `ASTRID_PRINCIPAL`, already validated
+    // at startup) so every uplink this CLI opens attributes to one
+    // identity.
+    let caller = match principal {
+        Some(p) => astrid_core::PrincipalId::new(p)
+            .with_context(|| format!("invalid principal for `astrid mcp serve`: {p}"))?,
+        None => crate::principal::current(),
+    };
 
     let socket_path = crate::socket_client::proxy_socket_path();
     if !socket_path.exists() {
@@ -81,7 +89,7 @@ pub(crate) async fn serve(principal: Option<&str>) -> Result<ExitCode> {
     // not a chat session; the kernel attributes work via the per-message
     // `principal`, not the session.
     let session = astrid_core::SessionId::from_uuid(Uuid::new_v4());
-    let client = SocketClient::connect(session)
+    let client = SocketClient::connect(session, caller.clone())
         .await
         .context("Failed to connect to the Astrid daemon socket")?;
 

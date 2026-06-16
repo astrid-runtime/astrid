@@ -7,22 +7,21 @@
 
 pub(crate) use astrid_uplink::socket_client::{SocketClient, proxy_socket_path, readiness_path};
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 
-/// Convenience wrapper around [`SocketClient::send_input`] that pulls
-/// the operator's active agent from `~/.astrid/run/cli-context.toml`.
+/// Send a user prompt over an established uplink.
 ///
-/// Solo self-hosters with no active-agent context file fall back to
-/// `default`, matching the historical CLI behaviour.
+/// The connection is already bound to the process principal (resolved
+/// once at startup from `--principal` / `ASTRID_PRINCIPAL` / `default`),
+/// so [`SocketClient::send_input`] stamps that identity — no per-call
+/// resolution. Kept as a thin named seam so callers read intent
+/// (`send_input_as_active_agent`) without re-resolving.
 ///
 /// # Errors
-/// Returns an error if the active-agent context cannot be resolved or
-/// the underlying send fails.
+/// Returns an error if the underlying send fails.
 pub(crate) async fn send_input_as_active_agent(
     client: &mut SocketClient,
     text: String,
 ) -> Result<()> {
-    let caller =
-        crate::context::active_agent().context("Failed to resolve active agent context")?;
-    client.send_input(text, &caller).await
+    client.send_input(text).await
 }

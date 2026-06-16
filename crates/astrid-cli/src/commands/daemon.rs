@@ -185,7 +185,7 @@ pub(crate) async fn handle_status() -> Result<()> {
     }
 
     let session_id = astrid_core::SessionId::from_uuid(uuid::Uuid::new_v4());
-    match socket_client::SocketClient::connect(session_id).await {
+    match socket_client::SocketClient::connect(session_id, crate::principal::current()).await {
         Ok(mut client) => {
             let req = astrid_core::kernel_api::KernelRequest::GetStatus;
             if let Ok(val) = serde_json::to_value(req) {
@@ -246,7 +246,9 @@ pub(crate) async fn handle_stop() -> Result<()> {
     }
 
     let session_id = astrid_core::SessionId::from_uuid(uuid::Uuid::new_v4());
-    if let Ok(mut client) = socket_client::SocketClient::connect(session_id).await {
+    if let Ok(mut client) =
+        socket_client::SocketClient::connect(session_id, crate::principal::current()).await
+    {
         let req = astrid_core::kernel_api::KernelRequest::Shutdown {
             reason: Some("astrid stop".to_string()),
         };
