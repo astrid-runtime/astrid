@@ -60,15 +60,21 @@ const ENUMERATE_DEADLINE: Duration = Duration::from_secs(55);
 /// drives it to EOF; it returns when the daemon closes the watch uplink.
 pub(super) async fn run(peer: Peer<RoleServer>, principal: String) {
     // The watch uplink's session id is ephemeral — it only keys this
-    // transport's frames. Work is attributed via the per-message
-    // `principal`, not the session (same as the request-path uplink).
-    // The connection's principal binding is the fallback for messages
-    // that omit one; this watcher always stamps `principal` explicitly
-    // (below), so bind the default and let the explicit stamp win.
+    // transport's frames. Bind the connection to the SAME principal the
+    // request handlers use: the proxy pins the first principal it sees per
+    // connection and DROPS any message stamped with a different one, so a
+    // `default`-bound uplink would have this watcher's explicitly-stamped
+    // enumerate requests silently dropped whenever the principal is not
+    // `default`.
+    let caller = match astrid_core::PrincipalId::new(&principal) {
+        Ok(c) => c,
+        Err(e) => {
+            warn!(error = %e, %principal, "MCP hot-reload watcher: invalid principal; live tool-reload pushes disabled");
+            return;
+        },
+    };
     let session = astrid_core::SessionId::from_uuid(Uuid::new_v4());
-    let mut watch_client = match SocketClient::connect(session, astrid_core::PrincipalId::default())
-        .await
-    {
+    let mut watch_client = match SocketClient::connect(session, caller).await {
         Ok(c) => c,
         Err(e) => {
             // Non-fatal: the server still serves tools; clients just won't
@@ -161,8 +167,13 @@ pub(super) async fn run(peer: Peer<RoleServer>, principal: String) {
 /// in-flight `tools/list` / `tools/call` on the request handlers' client.
 /// Reloads are infrequent, so a connect-per-enumeration is cheap.
 async fn enumerate_tool_names(principal: &str) -> anyhow::Result<BTreeSet<String>> {
+    // Bind the connection to the request's principal (not `default`): the
+    // proxy pins the first principal per connection and drops mismatched
+    // stamps, so a default-bound uplink would have the stamped enumerate
+    // request below silently dropped for any non-`default` principal.
+    let caller = astrid_core::PrincipalId::new(principal)?;
     let session = astrid_core::SessionId::from_uuid(Uuid::new_v4());
-    let mut client = SocketClient::connect(session, astrid_core::PrincipalId::default()).await?;
+    let mut client = SocketClient::connect(session, caller).await?;
     let req_id = new_req_id();
     let reply_topic = format!("{RESPONSE_PREFIX}{req_id}");
     let body = json!({ "req_id": req_id });

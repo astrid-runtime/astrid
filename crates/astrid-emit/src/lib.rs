@@ -177,11 +177,14 @@ impl Emitter for SocketEmitter {
         let sid = SessionId::new();
         let source_id = sid.0;
 
-        // The message carries its own principal attribution via
-        // `publish-as` below, so the connection binding is only the
-        // fallback for messages that omit one (none here). Bind the
-        // default; the explicit `with_principal` always wins.
-        let mut client = SocketClient::connect(sid, PrincipalId::default()).await?;
+        // Bind the connection to the publishing principal: the proxy pins
+        // the first principal it sees per connection and DROPS any message
+        // stamped with a different one, so a `default`-bound connection
+        // would have this hook envelope silently dropped whenever
+        // `principal` is not `default`. The `with_principal` stamp below
+        // then matches the connection's pinned identity.
+        let caller = PrincipalId::new(principal)?;
+        let mut client = SocketClient::connect(sid, caller).await?;
 
         let msg = IpcMessage::new(topic, IpcPayload::RawJson(envelope), source_id)
             .with_principal(principal);
