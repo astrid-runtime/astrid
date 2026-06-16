@@ -504,6 +504,72 @@ fn sensitive_astrid_paths_skips_missing_dirs() {
     assert_eq!(paths.len(), 3, "secrets/ rejoins once it exists: {paths:?}");
 }
 
+/// The home credential deny-list masks the well-known credential stores that
+/// EXIST under the operator's home (issue #856 — a spawned agent must not read
+/// `~/.ssh`, cloud creds, GPG keyrings), and never passes a non-existent path to
+/// the sandbox (a missing `--tmpfs` mount point would abort the spawn).
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn sensitive_home_paths_masks_only_existing_credential_dirs() {
+    let tmp = tempfile::tempdir().expect("create temp home");
+    let home = tmp.path();
+    std::fs::create_dir_all(home.join(".ssh")).expect(".ssh");
+    std::fs::create_dir_all(home.join(".aws")).expect(".aws");
+    std::fs::create_dir_all(home.join(".config/gcloud")).expect("gcloud");
+    std::fs::write(home.join(".netrc"), b"machine x").expect(".netrc");
+    // `.gnupg` / `.docker` / `.kube` deliberately absent.
+
+    let masked = SandboxCommand::sensitive_home_paths_in(home);
+
+    for present in [".ssh", ".aws", ".netrc", ".config/gcloud"] {
+        assert!(
+            masked.contains(&home.join(present)),
+            "{present} must be masked: {masked:?}"
+        );
+    }
+    for absent in [".gnupg", ".docker", ".kube"] {
+        assert!(
+            !masked.contains(&home.join(absent)),
+            "absent {absent} must NOT be passed to the sandbox: {masked:?}"
+        );
+    }
+}
+
+/// A masked DIRECTORY is shadowed with `--tmpfs`, but a masked regular FILE
+/// (e.g. `~/.netrc`) must use a `--ro-bind /dev/null` — `--tmpfs` on a file
+/// fails `ENOTDIR` and would abort every spawn (regression guard for the #937
+/// review finding).
+#[cfg(target_os = "linux")]
+#[test]
+fn mask_arg_uses_tmpfs_for_dir_and_dev_null_bind_for_file() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let dir = tmp.path().join("creddir");
+    std::fs::create_dir_all(&dir).expect("create masked dir");
+    let file = tmp.path().join("netrc");
+    std::fs::write(&file, b"machine x").expect("create masked file");
+
+    let mut cmd = Command::new("bwrap");
+    SandboxCommand::push_mask_arg(&mut cmd, &dir);
+    SandboxCommand::push_mask_arg(&mut cmd, &file);
+    let args: Vec<String> = cmd
+        .get_args()
+        .map(|a| a.to_string_lossy().into_owned())
+        .collect();
+
+    let dir_pos = args
+        .iter()
+        .position(|a| a == "--tmpfs")
+        .expect("a directory is masked with --tmpfs");
+    assert_eq!(args[dir_pos + 1], dir.to_string_lossy());
+
+    let bind_pos = args
+        .iter()
+        .position(|a| a == "--ro-bind")
+        .expect("a regular file is masked with --ro-bind /dev/null");
+    assert_eq!(args[bind_pos + 1], "/dev/null");
+    assert_eq!(args[bind_pos + 2], file.to_string_lossy());
+}
+
 /// On Linux the `--ro-bind / /` mount exposes the whole host FS read-only, so
 /// each sensitive Astrid subpath must be overlaid with an empty tmpfs. Without
 /// this a spawned agent reads `~/.astrid/keys/<principal>.key` and impersonates
