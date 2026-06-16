@@ -100,19 +100,29 @@ pub(super) fn parse_github_source(source: &str) -> Option<(String, String)> {
 // ---------------------------------------------------------------------------
 
 pub(crate) async fn install_capsule(source: &str, workspace: bool) -> anyhow::Result<()> {
-    install_capsule_inner(source, workspace).await
+    install_capsule_inner(source, None, workspace).await
 }
 
 /// Install a capsule in batch mode (from distro init) — skips import
-/// validation and env prompting.
-pub(crate) async fn install_capsule_batch(source: &str, workspace: bool) -> anyhow::Result<()> {
+/// validation and env prompting. `name_hint` is the distro capsule `name`,
+/// used to pick the right archive when one source ships several (a monorepo
+/// builds/releases one `.capsule` per capsule crate).
+pub(crate) async fn install_capsule_batch(
+    source: &str,
+    name_hint: Option<&str>,
+    workspace: bool,
+) -> anyhow::Result<()> {
     BATCH_MODE.store(true, Ordering::Relaxed);
-    let result = install_capsule_inner(source, workspace).await;
+    let result = install_capsule_inner(source, name_hint, workspace).await;
     BATCH_MODE.store(false, Ordering::Relaxed);
     result
 }
 
-async fn install_capsule_inner(source: &str, workspace: bool) -> anyhow::Result<()> {
+async fn install_capsule_inner(
+    source: &str,
+    name_hint: Option<&str>,
+    workspace: bool,
+) -> anyhow::Result<()> {
     let home = AstridHome::resolve()?;
 
     // 1. Explicit local path — no source tracking (re-fetch doesn't make sense).
@@ -123,12 +133,12 @@ async fn install_capsule_inner(source: &str, workspace: bool) -> anyhow::Result<
     // 2. Namespace alias @org/repo → GitHub.
     if let Some(repo) = source.strip_prefix('@') {
         let url = format!("https://github.com/{repo}");
-        return install_from_github(&url, workspace, &home, Some(source)).await;
+        return install_from_github(&url, workspace, &home, Some(source), name_hint).await;
     }
 
     // 3. Raw GitHub URL.
     if source.starts_with("github.com/") || source.starts_with("https://github.com/") {
-        return install_from_github(source, workspace, &home, Some(source)).await;
+        return install_from_github(source, workspace, &home, Some(source), name_hint).await;
     }
 
     // 4. Fallback: assume local folder.
@@ -144,6 +154,7 @@ async fn install_from_github(
     workspace: bool,
     home: &AstridHome,
     original_source: Option<&str>,
+    name_hint: Option<&str>,
 ) -> anyhow::Result<()> {
     let client = reqwest::Client::builder()
         .user_agent("astrid-cli")
@@ -163,34 +174,42 @@ async fn install_from_github(
         && let Ok(json) = response.json::<serde_json::Value>().await
         && let Some(assets) = json.get("assets").and_then(serde_json::Value::as_array)
     {
-        for asset in assets {
-            if let Some(name) = asset.get("name").and_then(serde_json::Value::as_str)
-                && name.ends_with(".capsule")
-                && let Some(download_url) = asset
-                    .get("browser_download_url")
-                    .and_then(serde_json::Value::as_str)
-            {
-                let tmp_dir = tempfile::tempdir()?;
-                let sanitized_name = Path::new(name).file_name().unwrap_or_default();
-                let download_path = tmp_dir.path().join(sanitized_name);
-                // Stream with 50 MB limit.
-                let mut dl = client.get(download_url).send().await?;
-                let mut bytes = Vec::new();
-                while let Some(chunk) = dl.chunk().await? {
-                    bytes.extend_from_slice(&chunk);
-                    anyhow::ensure!(
-                        bytes.len() <= 50 * 1024 * 1024,
-                        "capsule archive exceeds 50 MB limit",
-                    );
+        let candidates: Vec<(&str, &str)> = assets
+            .iter()
+            .filter_map(|asset| {
+                let name = asset.get("name").and_then(serde_json::Value::as_str)?;
+                if !name.ends_with(".capsule") {
+                    return None;
                 }
-                std::fs::write(&download_path, &bytes)?;
-                return unpack_via_lib(&download_path, workspace, home, original_source);
+                let download_url = asset
+                    .get("browser_download_url")
+                    .and_then(serde_json::Value::as_str)?;
+                Some((name, download_url))
+            })
+            .collect();
+        let names: Vec<&str> = candidates.iter().map(|(n, _)| *n).collect();
+        if let Some(idx) = pick_capsule(&names, name_hint)? {
+            let (name, download_url) = candidates[idx];
+            let tmp_dir = tempfile::tempdir()?;
+            let sanitized_name = Path::new(name).file_name().unwrap_or_default();
+            let download_path = tmp_dir.path().join(sanitized_name);
+            // Stream with 50 MB limit.
+            let mut dl = client.get(download_url).send().await?;
+            let mut bytes = Vec::new();
+            while let Some(chunk) = dl.chunk().await? {
+                bytes.extend_from_slice(&chunk);
+                anyhow::ensure!(
+                    bytes.len() <= 50 * 1024 * 1024,
+                    "capsule archive exceeds 50 MB limit",
+                );
             }
+            std::fs::write(&download_path, &bytes)?;
+            return unpack_via_lib(&download_path, workspace, home, original_source);
         }
     }
 
     // Priority 2: clone + build from source via astrid-build.
-    clone_and_build(url, repo, workspace, home, original_source)
+    clone_and_build(url, repo, workspace, home, original_source, name_hint)
 }
 
 /// Clone a GitHub repository and build the capsule from source using `astrid-build`.
@@ -200,6 +219,7 @@ fn clone_and_build(
     workspace: bool,
     home: &AstridHome,
     original_source: Option<&str>,
+    name_hint: Option<&str>,
 ) -> anyhow::Result<()> {
     let tmp_dir = tempfile::tempdir().context("failed to create temp dir for cloning")?;
     let clone_dir = tmp_dir.path().join(repo);
@@ -230,14 +250,70 @@ fn clone_and_build(
         );
     }
 
+    // Surface (not swallow) a per-entry read error rather than silently
+    // dropping a file with `filter_map(Result::ok)` — a transient I/O or
+    // permissions error on one entry should be reported, not hide a capsule
+    // the operator expects to be installed.
+    let mut produced: Vec<std::path::PathBuf> = Vec::new();
     for entry in std::fs::read_dir(&output_dir)? {
-        let entry = entry?;
-        if entry.path().extension().and_then(|s| s.to_str()) == Some("capsule") {
-            return unpack_via_lib(&entry.path(), workspace, home, original_source);
+        let entry = match entry {
+            Ok(e) => e,
+            Err(err) => {
+                eprintln!("warning: skipping unreadable build-output entry: {err}");
+                continue;
+            },
+        };
+        let path = entry.path();
+        if path.extension().and_then(|s| s.to_str()) == Some("capsule") {
+            produced.push(path);
         }
     }
+    let names: Vec<&str> = produced
+        .iter()
+        .map(|p| p.file_name().and_then(|n| n.to_str()).unwrap_or(""))
+        .collect();
+    if let Some(idx) = pick_capsule(&names, name_hint)? {
+        return unpack_via_lib(&produced[idx], workspace, home, original_source);
+    }
 
-    bail!("Universal Migrator failed to produce a .capsule archive.");
+    bail!("astrid-build produced no .capsule archive.");
+}
+
+/// Choose which `.capsule` to install when a source yields several. A monorepo
+/// builds/releases one archive per capsule crate, named `<capsule>.capsule`, so
+/// picking "the first" would install the wrong one. Returns the index into
+/// `names` of the chosen archive.
+///
+/// * none        -> `Ok(None)` (caller falls back, e.g. release -> clone+build).
+/// * exactly one -> `Ok(Some(0))` — unambiguous; `name_hint` is irrelevant.
+/// * several     -> the one named `<name_hint>.capsule`. Without a hint, or with
+///   no matching name, refuse rather than silently install the wrong capsule.
+fn pick_capsule(names: &[&str], name_hint: Option<&str>) -> anyhow::Result<Option<usize>> {
+    match names {
+        [] => Ok(None),
+        [_] => Ok(Some(0)),
+        many => {
+            let Some(hint) = name_hint else {
+                bail!(
+                    "source produced {} .capsule archives but no capsule name to pick one; \
+                     expected an archive named '<capsule>.capsule'",
+                    many.len()
+                );
+            };
+            // Match the hint against each candidate's stem via `strip_suffix`
+            // (no per-call allocation) rather than `format!`-ing the target.
+            match many
+                .iter()
+                .position(|n| n.strip_suffix(".capsule") == Some(hint))
+            {
+                Some(idx) => Ok(Some(idx)),
+                None => bail!(
+                    "no '.capsule' archive named '{hint}.capsule' among [{}]",
+                    many.join(", ")
+                ),
+            }
+        },
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -570,6 +646,41 @@ mod tests {
             Some("capsule.WASM"),
             "should match .WASM case-insensitively"
         );
+    }
+
+    #[test]
+    fn pick_capsule_none_when_empty() {
+        assert!(matches!(pick_capsule(&[], Some("sage")), Ok(None)));
+    }
+
+    #[test]
+    fn pick_capsule_single_is_unambiguous() {
+        // A lone archive is used regardless of name — a single-capsule repo's
+        // asset need not match the requested capsule name.
+        assert_eq!(
+            pick_capsule(&["whatever.capsule"], Some("sage")).unwrap(),
+            Some(0)
+        );
+        assert_eq!(pick_capsule(&["whatever.capsule"], None).unwrap(), Some(0));
+    }
+
+    #[test]
+    fn pick_capsule_several_matches_by_exact_name() {
+        let names = ["sage.capsule", "sage-mcp.capsule", "sage-install.capsule"];
+        assert_eq!(pick_capsule(&names, Some("sage-mcp")).unwrap(), Some(1));
+        // exact match — "sage" must NOT collide with "sage-mcp.capsule"
+        assert_eq!(pick_capsule(&names, Some("sage")).unwrap(), Some(0));
+        assert_eq!(pick_capsule(&names, Some("sage-install")).unwrap(), Some(2));
+    }
+
+    #[test]
+    fn pick_capsule_several_without_hint_errors() {
+        assert!(pick_capsule(&["a.capsule", "b.capsule"], None).is_err());
+    }
+
+    #[test]
+    fn pick_capsule_several_no_match_errors() {
+        assert!(pick_capsule(&["a.capsule", "b.capsule"], Some("c")).is_err());
     }
 
     #[test]
