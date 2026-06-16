@@ -119,6 +119,49 @@ impl SocketClient {
         })
     }
 
+    /// Adopt an already-connected, already-authenticated socket handed in as a
+    /// raw fd — skipping both the dial and the handshake.
+    ///
+    /// Path-1 spawn binding (issue #45/#852): the daemon opens a connection that
+    /// is principal-bound kernel-side (it authenticates as `principal` on the
+    /// child's behalf) and fd-passes the connected socket to a sandboxed child
+    /// via `ASTRID_CONN_FD`. The child has no socket or key access of its own —
+    /// the sandbox masks `~/.astrid`, so it can neither dial a fresh connection
+    /// nor read a key to authenticate — and instead adopts the pre-authenticated
+    /// fd here. `principal` is the verified identity the daemon bound the
+    /// connection to; the transport stamps it onto every outbound message just
+    /// as [`connect`](Self::connect) does, and the kernel already enforces it
+    /// per-connection, so a child claiming a different one cannot escalate.
+    ///
+    /// # Errors
+    /// Returns an error if the fd is not a usable `AF_UNIX` stream socket.
+    #[allow(unsafe_code)] // adopting an inherited fd requires FromRawFd
+    pub fn from_raw_fd(
+        fd: std::os::fd::RawFd,
+        session_id: SessionId,
+        principal: PrincipalId,
+    ) -> Result<Self> {
+        use std::os::fd::FromRawFd;
+        // SAFETY: the caller guarantees `fd` is an open, connected AF_UNIX
+        // stream socket owned by this process — inherited via `ASTRID_CONN_FD`
+        // with FD_CLOEXEC cleared by the daemon. We take exclusive ownership of
+        // the fd here; it is not retained or closed elsewhere by the caller.
+        let std_stream = unsafe { std::os::unix::net::UnixStream::from_raw_fd(fd) };
+        std_stream
+            .set_nonblocking(true)
+            .context("set inherited socket non-blocking")?;
+        let stream = UnixStream::from_std(std_stream)
+            .context("adopt inherited socket into the tokio reactor")?;
+        let (read_half, write_half) = stream.into_split();
+
+        Ok(Self {
+            read_half,
+            write_half,
+            session_id,
+            principal,
+        })
+    }
+
     /// Re-establish the connection to the (possibly restarted) daemon,
     /// re-reading the current session token and re-handshaking. The
     /// [`session_id`](Self::session_id) is preserved.
@@ -458,4 +501,50 @@ async fn send_request_read_response(
         .context("Failed to read handshake response payload")?;
 
     serde_json::from_slice(&resp_payload).context("Failed to parse handshake response")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `from_raw_fd` adopts a live, connected `AF_UNIX` socket and reads framed
+    /// bytes off it without dialing or handshaking — the child side of the
+    /// daemon's fd-passed, pre-authenticated connection (issue #45/#852).
+    #[tokio::test]
+    async fn from_raw_fd_adopts_a_live_connected_socket() {
+        use std::os::fd::IntoRawFd;
+
+        // A socketpair stands in for the daemon's pre-authenticated connection:
+        // `peer` is the daemon-held end, `child` is the fd handed to the child.
+        let (peer, child) = std::os::unix::net::UnixStream::pair().expect("socketpair");
+        peer.set_nonblocking(true).unwrap();
+        let mut daemon = UnixStream::from_std(peer).expect("tokio adopt peer end");
+
+        let raw = child.into_raw_fd();
+        let mut client =
+            SocketClient::from_raw_fd(raw, SessionId::new(), PrincipalId::new("claude").unwrap())
+                .expect("adopt fd-passed socket");
+        assert_eq!(
+            client.principal,
+            PrincipalId::new("claude").unwrap(),
+            "adopted connection is bound to the daemon-supplied principal"
+        );
+
+        // The daemon end writes one length-prefixed frame; the adopted client
+        // reads it back — proving the inherited fd is a live framed transport.
+        let payload = br#"{"topic":"x"}"#;
+        daemon
+            .write_all(&u32::try_from(payload.len()).unwrap().to_be_bytes())
+            .await
+            .unwrap();
+        daemon.write_all(payload).await.unwrap();
+        daemon.flush().await.unwrap();
+
+        let got = client
+            .read_raw_frame()
+            .await
+            .expect("read")
+            .expect("a frame");
+        assert_eq!(got, payload);
+    }
 }
