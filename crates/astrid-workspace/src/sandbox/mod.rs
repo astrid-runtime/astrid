@@ -118,6 +118,73 @@ impl SandboxCommand {
             .collect()
     }
 
+    /// Well-known credential / secret-material directories under the operator's
+    /// home that a spawned native agent must never read (issue #856: bwrap's
+    /// `--ro-bind / /` otherwise exposes the operator's SSH / cloud / GPG /
+    /// registry credentials to the agent). Resolved from `$HOME`; filtered to
+    /// existing paths (an absent dir holds nothing to mask, and a missing
+    /// `--tmpfs` mount point would abort the spawn). A spawned agent that
+    /// legitimately needs one of these is a future per-agent opt-out, not the
+    /// default. This is a credential deny-list, not full home isolation —
+    /// hiding arbitrary sibling projects is the separate allow-list change.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn sensitive_home_paths() -> Vec<PathBuf> {
+        std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .map(|home| Self::sensitive_home_paths_in(&home))
+            .unwrap_or_default()
+    }
+
+    /// The home credential deny-list rooted at `home`, filtered to existing
+    /// paths. Split out from [`sensitive_home_paths`](Self::sensitive_home_paths)
+    /// so the set is testable against a controlled directory.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn sensitive_home_paths_in(home: &Path) -> Vec<PathBuf> {
+        [
+            ".ssh",           // SSH private keys + known_hosts
+            ".aws",           // AWS access keys
+            ".gnupg",         // GPG private keyrings
+            ".netrc",         // machine login credentials
+            ".docker",        // registry auth tokens
+            ".kube",          // kubeconfig credentials
+            ".config/gcloud", // GCP credentials
+        ]
+        .into_iter()
+        .map(|rel| home.join(rel))
+        .filter(|p| p.exists())
+        .collect()
+    }
+
+    /// The full set of paths masked in every sandboxed spawn: Astrid's own
+    /// secret / key / state dirs plus the operator's home credential stores.
+    /// Both `wrap_with_injections` arms consume this.
+    ///
+    /// # Errors
+    /// Propagates a failure to locate the Astrid home (see
+    /// [`sensitive_astrid_paths`](Self::sensitive_astrid_paths)).
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn masked_paths() -> io::Result<Vec<PathBuf>> {
+        let mut masked = Self::sensitive_astrid_paths()?;
+        masked.extend(Self::sensitive_home_paths());
+        Ok(masked)
+    }
+
+    /// Append the bwrap arguments that shadow `masked` so the spawned process
+    /// reads nothing through it: an empty `--tmpfs` over a directory, or a
+    /// read-only bind of `/dev/null` over a regular file. `--tmpfs` on a file
+    /// fails with `ENOTDIR` (a tmpfs is a directory filesystem), which would
+    /// abort every spawn for any operator who has, e.g., a `~/.netrc`. Callers
+    /// pass only existing paths (`masked_paths` is existence-filtered), so the
+    /// `is_dir` probe is reliable.
+    #[cfg(target_os = "linux")]
+    fn push_mask_arg(bwrap: &mut Command, masked: &Path) {
+        if masked.is_dir() {
+            bwrap.arg("--tmpfs").arg(masked);
+        } else {
+            bwrap.arg("--ro-bind").arg("/dev/null").arg(masked);
+        }
+    }
+
     /// Like [`wrap`](Self::wrap), but additionally exposes a set of
     /// host-verified, READ-ONLY files at chosen paths inside the child's
     /// sandbox. Each [`RoInjection`] binds the host-owned bytes at `source` so
@@ -170,15 +237,15 @@ impl SandboxCommand {
             }
 
             // #856 read-hole fix: the `--ro-bind / /` above mounts the entire
-            // host filesystem read-only, which exposed ~/.astrid/{keys,secrets,
-            // var} to the spawned process. Overlay an empty tmpfs on each so a
-            // spawned agent cannot read another principal's private keys, the
-            // secret store, or the kernel state DB. Placed AFTER the root
-            // ro-bind (so it overlays) and the worktree/injection binds; `run/`
-            // (socket+token) and `etc/` stay reachable for daemon access.
-            // Fail-secure: refuse the spawn if the home is unresolvable.
-            for masked in Self::sensitive_astrid_paths()? {
-                bwrap.arg("--tmpfs").arg(masked);
+            // host filesystem read-only, which exposed Astrid's secret/key/state
+            // dirs and the operator's home credential stores to the spawned
+            // process. Shadow each masked path so the agent reads nothing (see
+            // `push_mask_arg`). Placed AFTER the root ro-bind (so it overlays)
+            // and the worktree/injection binds; `run/` (socket+token) and `etc/`
+            // stay reachable for daemon access. Fail-secure: refuse the spawn if
+            // the home is unresolvable.
+            for masked in Self::masked_paths()? {
+                Self::push_mask_arg(&mut bwrap, &masked);
             }
 
             bwrap
@@ -233,7 +300,7 @@ impl SandboxCommand {
             // macOS seatbelt is already `(deny default)` + an allowlist that
             // excludes ~/.astrid, so these denies are belt-and-suspenders that
             // still hold if the allowlist ever widens to include the home.
-            for masked in Self::sensitive_astrid_paths()? {
+            for masked in Self::masked_paths()? {
                 config = config.with_hidden(masked);
             }
             let prefix = config.build_seatbelt_prefix()?;
