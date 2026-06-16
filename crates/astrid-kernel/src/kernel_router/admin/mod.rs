@@ -24,11 +24,14 @@
 #[cfg(test)]
 mod enforcement_tests;
 mod handlers;
+mod inheritance;
 mod invite_handlers;
 mod pair_device_handlers;
 mod quota;
 #[cfg(test)]
 mod state_tests;
+#[cfg(test)]
+mod state_tests_agent_clone;
 #[cfg(test)]
 mod state_tests_agent_modify;
 #[cfg(test)]

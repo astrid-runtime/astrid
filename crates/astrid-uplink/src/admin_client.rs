@@ -258,6 +258,8 @@ mod tests {
                 groups: vec![],
                 grants: vec![],
                 inherit_from: None,
+                clone_from: None,
+                allow_admin_clone: false,
             }),
             "agent.create"
         );

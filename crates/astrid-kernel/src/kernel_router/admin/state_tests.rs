@@ -90,6 +90,8 @@ async fn agent_create_writes_profile_and_links_identity() {
             groups: Vec::new(),
             grants: Vec::new(),
             inherit_from: None,
+            clone_from: None,
+            allow_admin_clone: false,
         },
     )
     .await;
@@ -130,6 +132,8 @@ async fn agent_create_rejects_collision_with_existing_profile() {
             groups: Vec::new(),
             grants: Vec::new(),
             inherit_from: None,
+            clone_from: None,
+            allow_admin_clone: false,
         },
     )
     .await;
@@ -143,6 +147,8 @@ async fn agent_create_rejects_collision_with_existing_profile() {
             groups: Vec::new(),
             grants: Vec::new(),
             inherit_from: None,
+            clone_from: None,
+            allow_admin_clone: false,
         },
     )
     .await;
@@ -160,6 +166,8 @@ async fn agent_create_rejects_invalid_name() {
             groups: Vec::new(),
             grants: Vec::new(),
             inherit_from: None,
+            clone_from: None,
+            allow_admin_clone: false,
         },
     )
     .await;
@@ -177,6 +185,8 @@ async fn agent_create_rejects_default_bootstrap_name() {
             groups: Vec::new(),
             grants: Vec::new(),
             inherit_from: None,
+            clone_from: None,
+            allow_admin_clone: false,
         },
     )
     .await;
@@ -211,6 +221,8 @@ async fn agent_create_without_inherit_copies_nothing() {
             groups: Vec::new(),
             grants: Vec::new(),
             inherit_from: None,
+            clone_from: None,
+            allow_admin_clone: false,
         },
     )
     .await;
@@ -251,6 +263,8 @@ async fn agent_create_with_inherit_copies_from_source() {
             groups: Vec::new(),
             grants: Vec::new(),
             inherit_from: None,
+            clone_from: None,
+            allow_admin_clone: false,
         },
     )
     .await;
@@ -271,6 +285,8 @@ async fn agent_create_with_inherit_copies_from_source() {
             groups: Vec::new(),
             grants: Vec::new(),
             inherit_from: Some(pid("source")),
+            clone_from: None,
+            allow_admin_clone: false,
         },
     )
     .await;
@@ -297,6 +313,8 @@ async fn agent_create_rejects_nonexistent_inherit_source() {
             groups: Vec::new(),
             grants: Vec::new(),
             inherit_from: Some(pid("ghost")),
+            clone_from: None,
+            allow_admin_clone: false,
         },
     )
     .await;
@@ -320,6 +338,8 @@ async fn agent_create_rejects_self_inherit() {
             groups: Vec::new(),
             grants: Vec::new(),
             inherit_from: Some(pid("alice")),
+            clone_from: None,
+            allow_admin_clone: false,
         },
     )
     .await;
@@ -350,6 +370,8 @@ async fn agent_create_rolls_back_when_home_provisioning_fails() {
             groups: Vec::new(),
             grants: Vec::new(),
             inherit_from: None,
+            clone_from: None,
+            allow_admin_clone: false,
         },
     )
     .await;
@@ -412,6 +434,8 @@ async fn agent_delete_removes_identity_profile_and_invalidates_cache() {
             groups: Vec::new(),
             grants: Vec::new(),
             inherit_from: None,
+            clone_from: None,
+            allow_admin_clone: false,
         },
     )
     .await;
@@ -589,6 +613,8 @@ async fn agent_enable_toggle_and_cache_invalidation() {
             groups: Vec::new(),
             grants: Vec::new(),
             inherit_from: None,
+            clone_from: None,
+            allow_admin_clone: false,
         },
     )
     .await;
@@ -636,6 +662,8 @@ async fn agent_list_returns_every_home_dir_principal() {
                 groups: Vec::new(),
                 grants: Vec::new(),
                 inherit_from: None,
+                clone_from: None,
+                allow_admin_clone: false,
             },
         )
         .await;
@@ -671,6 +699,8 @@ async fn quota_set_rejects_zero_memory() {
             groups: Vec::new(),
             grants: Vec::new(),
             inherit_from: None,
+            clone_from: None,
+            allow_admin_clone: false,
         },
     )
     .await;
@@ -700,6 +730,8 @@ async fn quota_set_updates_profile_and_invalidates_cache() {
             groups: Vec::new(),
             grants: Vec::new(),
             inherit_from: None,
+            clone_from: None,
+            allow_admin_clone: false,
         },
     )
     .await;
@@ -867,6 +899,8 @@ async fn group_delete_reference_from_profile_does_not_elevate_privileges() {
             groups: vec!["ops".into()],
             grants: Vec::new(),
             inherit_from: None,
+            clone_from: None,
+            allow_admin_clone: false,
         },
     )
     .await;
@@ -909,6 +943,8 @@ async fn agent_list_filters_to_self_for_non_admin_caller() {
                 groups: Vec::new(),
                 grants: Vec::new(),
                 inherit_from: None,
+                clone_from: None,
+                allow_admin_clone: false,
             },
         )
         .await;

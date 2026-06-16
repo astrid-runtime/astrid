@@ -67,6 +67,8 @@ fn all_admin_variants() -> Vec<AdminRequestKind> {
             groups: Vec::new(),
             grants: Vec::new(),
             inherit_from: None,
+            clone_from: None,
+            allow_admin_clone: false,
         },
         AdminRequestKind::AgentDelete {
             principal: pid("target"),
@@ -262,6 +264,8 @@ fn admin_target_principal_matches_wire_shape() {
             groups: Vec::new(),
             grants: Vec::new(),
             inherit_from: None,
+            clone_from: None,
+            allow_admin_clone: false,
         })
         .is_none()
     );
