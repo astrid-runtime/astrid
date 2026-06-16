@@ -296,26 +296,23 @@ impl ipc::Host for HostState {
         &mut self,
         topic: String,
         payload: String,
-        principal: String,
+        _principal: String,
     ) -> Result<(), ErrorCode> {
         if !self.has_uplink_capability {
             return Err(ErrorCode::CapabilityDenied);
         }
-        // The verified principal bound to the source connection — a Path-1
-        // daemon-spawned agent or a Path-2 crypto-authenticated client, recorded
-        // by the framed `tcp-stream.read` that pulled this frame — OVERRIDES the
-        // capsule-supplied name. An uplink relays a connection; it does not get
-        // to NAME a principal, so a socket client can no longer forge one it has
-        // not proven (issue #45/#852, the self-stamp fix). A connection with no
-        // kernel binding — a local operator trusted by peer-credential match —
-        // falls back to the supplied name.
+        // The principal is DERIVED from the source connection, never named by
+        // the capsule (issue #45/#852). A connection the kernel verified at the
+        // handshake — recorded by the framed `tcp-stream.read` that pulled this
+        // frame — stamps that verified principal. An UNAUTHENTICATED (unbound)
+        // connection stamps the reserved no-capability `anonymous` identity, NOT
+        // the name it claimed: an uplink relays a connection, it cannot forge a
+        // principal, and an unproven claim earns no privilege (it fails closed
+        // on every capability check). The capsule-supplied name is ignored.
         let effective = match self.ingress_principal.as_ref() {
-            Some(verified) => verified.to_string(),
-            None => principal,
+            Some(verified) => verified.as_str().to_owned(),
+            None => astrid_core::principal::PrincipalId::anonymous().into_inner(),
         };
-        if astrid_core::principal::PrincipalId::new(&effective).is_err() {
-            return Err(ErrorCode::InvalidInput);
-        }
         let bytes = payload.len() as u64;
         let topic_for_audit = topic.clone();
         let result = publish_inner(self, topic, payload, effective);
@@ -886,12 +883,13 @@ mod audit_scope_tests {
         );
     }
 
-    /// Without a kernel binding — a legacy local operator trusted by
-    /// peer-credential match — `publish-as` falls back to the supplied name, so
-    /// the zero-config operator CLI keeps acting as `default`. This pins that
-    /// the enforcement does NOT regress the operator path.
+    /// An UNAUTHENTICATED (unbound) connection is stamped with the reserved
+    /// no-capability `anonymous` identity, NOT the principal it claimed — an
+    /// unproven claim earns no privilege (issue #45/#852). This is the residual
+    /// self-stamp #932 left for unbound connections, now closed: a client that
+    /// did not authenticate cannot act as `default` (or any named principal).
     #[tokio::test]
-    async fn publish_as_without_binding_honours_claimed_name() {
+    async fn publish_as_unbound_connection_is_stamped_anonymous() {
         let rt = tokio::runtime::Handle::current();
         let mut state = minimal_host_state(rt);
         state.has_uplink_capability = true;
@@ -903,6 +901,7 @@ mod audit_scope_tests {
         let sub = IpcHost::subscribe(&mut state, "client.v1.connect".to_string())
             .expect("subscribe allowed by ACL");
 
+        // The client claims `default` (admin) without having authenticated.
         IpcHost::publish_as(
             &mut state,
             "client.v1.connect".to_string(),
@@ -913,8 +912,8 @@ mod audit_scope_tests {
 
         assert_eq!(
             drained_principals(&mut state, &sub),
-            vec!["default".to_string()],
-            "an unbound connection's supplied name is honoured (operator fallback)"
+            vec![astrid_core::principal::PrincipalId::anonymous().to_string()],
+            "an unauthenticated connection's claim earns no privilege — stamped anonymous"
         );
     }
 }

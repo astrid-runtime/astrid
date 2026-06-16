@@ -174,23 +174,29 @@ async fn agent_create_rejects_invalid_name() {
     assert_error_contains(&res, "invalid principal name");
 }
 
+/// `default` (the single-tenant bootstrap anchor) and `anonymous` (the
+/// no-capability identity stamped on unauthenticated connections, #45/#852) are
+/// reserved: `agent create` must reject both so neither can be created — and
+/// thus never granted capabilities.
 #[tokio::test(flavor = "multi_thread")]
-async fn agent_create_rejects_default_bootstrap_name() {
+async fn agent_create_rejects_reserved_names() {
     let (_dir, kernel) = fixture().await;
-    let res = handlers::dispatch(
-        &kernel,
-        &astrid_core::PrincipalId::default(),
-        AdminRequestKind::AgentCreate {
-            name: "default".into(),
-            groups: Vec::new(),
-            grants: Vec::new(),
-            inherit_from: None,
-            clone_from: None,
-            allow_admin_clone: false,
-        },
-    )
-    .await;
-    assert_error_contains(&res, "reserved");
+    for name in ["default", "anonymous"] {
+        let res = handlers::dispatch(
+            &kernel,
+            &astrid_core::PrincipalId::default(),
+            AdminRequestKind::AgentCreate {
+                name: name.into(),
+                groups: Vec::new(),
+                grants: Vec::new(),
+                inherit_from: None,
+                clone_from: None,
+                allow_admin_clone: false,
+            },
+        )
+        .await;
+        assert_error_contains(&res, "reserved");
+    }
 }
 
 /// Security-critical direction: a default `inherit_from: None` create
