@@ -69,6 +69,7 @@ async fn agent_modify_adds_and_removes_groups_idempotently() {
             name: "mia".into(),
             groups: vec![BUILTIN_AGENT.into()],
             grants: Vec::new(),
+            inherit_from: None,
         },
     )
     .await;
@@ -132,6 +133,7 @@ async fn agent_modify_rejects_empty_changes() {
             name: "nina".into(),
             groups: Vec::new(),
             grants: Vec::new(),
+            inherit_from: None,
         },
     )
     .await;

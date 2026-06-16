@@ -66,6 +66,7 @@ fn known_capabilities_covers_every_admin_request_cap() {
             name: "alice".into(),
             groups: vec![],
             grants: vec![],
+            inherit_from: None,
         },
         AdminRequestKind::AgentDelete {
             principal: p.clone(),

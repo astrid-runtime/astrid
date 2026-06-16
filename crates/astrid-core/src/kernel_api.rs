@@ -205,6 +205,16 @@ pub enum AdminRequestKind {
         /// Per-principal capability grants beyond group inheritance.
         #[serde(default)]
         grants: Vec<String>,
+        /// Opt-in inheritance source. When `Some`, the new principal
+        /// receives a full copy of this source principal's `.config/env/`,
+        /// per-capsule KV namespaces, and per-capsule secret files. When
+        /// `None` (the default) the new principal inherits **nothing** —
+        /// least privilege, no silent credential leak from `default`.
+        ///
+        /// `#[serde(default)]` keeps older serialized requests (no field)
+        /// deserializing as `None`, which is the secure default.
+        #[serde(default)]
+        inherit_from: Option<PrincipalId>,
     },
     /// Delete an existing agent identity. The `default` principal is
     /// rejected unconditionally. The principal's home directory is NOT

@@ -48,6 +48,7 @@ async fn create_agent(kernel: &Arc<Kernel>, name: &str, groups: Vec<String>) {
             name: name.into(),
             groups,
             grants: Vec::new(),
+            inherit_from: None,
         },
     )
     .await;

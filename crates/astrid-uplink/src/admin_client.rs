@@ -257,6 +257,7 @@ mod tests {
                 name: "x".into(),
                 groups: vec![],
                 grants: vec![],
+                inherit_from: None,
             }),
             "agent.create"
         );
