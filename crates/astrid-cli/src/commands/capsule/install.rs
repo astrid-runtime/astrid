@@ -250,11 +250,24 @@ fn clone_and_build(
         );
     }
 
-    let produced: Vec<std::path::PathBuf> = std::fs::read_dir(&output_dir)?
-        .filter_map(Result::ok)
-        .map(|e| e.path())
-        .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("capsule"))
-        .collect();
+    // Surface (not swallow) a per-entry read error rather than silently
+    // dropping a file with `filter_map(Result::ok)` — a transient I/O or
+    // permissions error on one entry should be reported, not hide a capsule
+    // the operator expects to be installed.
+    let mut produced: Vec<std::path::PathBuf> = Vec::new();
+    for entry in std::fs::read_dir(&output_dir)? {
+        let entry = match entry {
+            Ok(e) => e,
+            Err(err) => {
+                eprintln!("warning: skipping unreadable build-output entry: {err}");
+                continue;
+            },
+        };
+        let path = entry.path();
+        if path.extension().and_then(|s| s.to_str()) == Some("capsule") {
+            produced.push(path);
+        }
+    }
     let names: Vec<&str> = produced
         .iter()
         .map(|p| p.file_name().and_then(|n| n.to_str()).unwrap_or(""))
@@ -280,18 +293,23 @@ fn pick_capsule(names: &[&str], name_hint: Option<&str>) -> anyhow::Result<Optio
         [] => Ok(None),
         [_] => Ok(Some(0)),
         many => {
-            let wanted = match name_hint {
-                Some(h) => format!("{h}.capsule"),
+            let hint = match name_hint {
+                Some(h) => h,
                 None => bail!(
                     "source produced {} .capsule archives but no capsule name to pick one; \
                      expected an archive named '<capsule>.capsule'",
                     many.len()
                 ),
             };
-            match many.iter().position(|n| *n == wanted.as_str()) {
+            // Match the hint against each candidate's stem via `strip_suffix`
+            // (no per-call allocation) rather than `format!`-ing the target.
+            match many
+                .iter()
+                .position(|n| n.strip_suffix(".capsule") == Some(hint))
+            {
                 Some(idx) => Ok(Some(idx)),
                 None => bail!(
-                    "no '.capsule' archive named '{wanted}' among [{}]",
+                    "no '.capsule' archive named '{hint}.capsule' among [{}]",
                     many.join(", ")
                 ),
             }
