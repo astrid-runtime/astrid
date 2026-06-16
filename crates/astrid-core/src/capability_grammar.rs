@@ -524,6 +524,30 @@ pub const CAPABILITY_CATALOG: &[CapabilityInfo] = {
             scope: Global,
             danger: Elevated,
         },
+        CapabilityInfo {
+            id: "caps:token:mint",
+            label: "Mint capability tokens",
+            description: "Mint a signed capability token pre-granting a principal access to a resource (e.g. `mcp://server:tool`), bypassing per-use approval. An escalation primitive — anyone with this can pre-authorize tool access.",
+            category: Caps,
+            scope: Global,
+            danger: Extreme,
+        },
+        CapabilityInfo {
+            id: "caps:token:revoke",
+            label: "Revoke capability tokens",
+            description: "Revoke a previously minted capability token by id. Revocation is global and final — the token no longer authorizes for any principal.",
+            category: Caps,
+            scope: Global,
+            danger: Elevated,
+        },
+        CapabilityInfo {
+            id: "caps:token:list",
+            label: "List capability tokens",
+            description: "List the non-revoked, non-expired capability tokens minted for a principal.",
+            category: Caps,
+            scope: Global,
+            danger: Safe,
+        },
         // ── Invites ──
         CapabilityInfo {
             id: "invite:issue",
@@ -619,7 +643,7 @@ pub fn known_capabilities_list() -> &'static [&'static str] {
 /// in the same commit that adds a new capability so a kernel
 /// addition without updating the catalog fails the consuming
 /// crate's tests.
-pub const KNOWN_CAPABILITIES_COUNT: usize = 34;
+pub const KNOWN_CAPABILITIES_COUNT: usize = 37;
 
 const _: () = assert!(
     CAPABILITY_CATALOG.len() == KNOWN_CAPABILITIES_COUNT,

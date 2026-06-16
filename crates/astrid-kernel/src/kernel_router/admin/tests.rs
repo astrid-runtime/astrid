@@ -78,6 +78,18 @@ fn all_admin_variants() -> Vec<AdminRequestKind> {
             principal: pid("a"),
             capabilities: vec!["self:*".into()],
         },
+        AdminRequestKind::CapsTokenMint {
+            principal: pid("a"),
+            resource: "mcp://server:tool".into(),
+            permission: None,
+            ttl_secs: None,
+        },
+        AdminRequestKind::CapsTokenRevoke {
+            token_id: "00000000-0000-0000-0000-000000000000".into(),
+        },
+        AdminRequestKind::CapsTokenList {
+            principal: pid("a"),
+        },
     ]
 }
 

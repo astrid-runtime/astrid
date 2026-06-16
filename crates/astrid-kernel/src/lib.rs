@@ -95,6 +95,15 @@ pub struct Kernel {
     pub kv: Arc<astrid_storage::SurrealKvStore>,
     /// Chain-linked cryptographic audit log with persistent storage.
     pub audit_log: Arc<AuditLog>,
+    /// The runtime ed25519 signing key (issue #929).
+    ///
+    /// Loaded once at boot from `~/.astrid/keys/runtime.key` and shared
+    /// (`Arc`) with [`AuditLog`] — both sign with the exact same key bytes,
+    /// never loaded twice. Reachable from the admin token-mint handlers so an
+    /// operator can pre-grant `mcp://` tool access by minting a capability
+    /// token signed by this key (the same key the approval interceptor's
+    /// validator trusts as issuer).
+    pub runtime_key: Arc<astrid_crypto::KeyPair>,
     /// Per-principal active connection counters (Layer 4, issue #668).
     ///
     /// Keyed by [`PrincipalId`]. When a principal's counter hits zero the
@@ -261,7 +270,15 @@ impl Kernel {
                     std::io::Error::other(format!("Failed to init capability store: {e}"))
                 })?,
         );
-        let audit_log = open_audit_log()?;
+        // Load the runtime signing key ONCE and share it (issue #929):
+        // the audit log signs chain entries with it, and the admin
+        // token-mint path signs capability tokens with the same key. Never
+        // load it from disk twice — a second load would still yield the same
+        // persisted bytes, but routing one `Arc` makes the single-source-of-
+        // truth explicit and lets `kernel.runtime_key` mint tokens the
+        // approval interceptor's validator trusts as issuer.
+        let runtime_key = Arc::new(load_or_generate_runtime_key(&home.keys_dir())?);
+        let audit_log = open_audit_log(Arc::clone(&runtime_key))?;
         let mcp = SecureMcpClient::new(
             mcp_client,
             Arc::clone(&capabilities),
@@ -339,6 +356,7 @@ impl Kernel {
             singleton_lock: Some(singleton_lock),
             kv,
             audit_log,
+            runtime_key,
             active_connections: DashMap::new(),
             fuel_ledger: astrid_capsule::FuelLedger::default(),
             fuel_rate: astrid_capsule::FuelRateLimiter::default(),
@@ -967,14 +985,14 @@ pub(crate) async fn test_kernel_with_home(home: astrid_core::dirs::AstridHome) -
     // Audit log at the tempdir — chain verification is trivially Ok on a
     // fresh log, no historical entries.
     let runtime_key =
-        load_or_generate_runtime_key(&home.keys_dir()).expect("test kernel: runtime key");
+        Arc::new(load_or_generate_runtime_key(&home.keys_dir()).expect("test kernel: runtime key"));
     let default_principal = astrid_core::PrincipalId::default();
     let principal_home = home.principal_home(&default_principal);
     principal_home
         .ensure()
         .expect("test kernel: ensure principal home");
     let audit_log = Arc::new(
-        AuditLog::open(principal_home.audit_dir(), runtime_key)
+        AuditLog::open(principal_home.audit_dir(), Arc::clone(&runtime_key))
             .expect("test kernel: open audit log"),
     );
 
@@ -1028,6 +1046,7 @@ pub(crate) async fn test_kernel_with_home(home: astrid_core::dirs::AstridHome) -
         singleton_lock: None,
         kv,
         audit_log,
+        runtime_key,
         active_connections: DashMap::new(),
         fuel_ledger: astrid_capsule::FuelLedger::default(),
         fuel_rate: astrid_capsule::FuelRateLimiter::default(),
@@ -1060,7 +1079,7 @@ pub(crate) async fn test_kernel_with_home(home: astrid_core::dirs::AstridHome) -
 /// `~/.astrid/audit.db` and runs `verify_all()` to detect any tampering of
 /// historical entries. Verification failures are logged at `error!` level but
 /// do not block boot (fail-open for availability, loud alert for integrity).
-fn open_audit_log() -> std::io::Result<Arc<AuditLog>> {
+fn open_audit_log(runtime_key: Arc<astrid_crypto::KeyPair>) -> std::io::Result<Arc<AuditLog>> {
     use astrid_core::dirs::AstridHome;
 
     let home = AstridHome::resolve()
@@ -1068,12 +1087,14 @@ fn open_audit_log() -> std::io::Result<Arc<AuditLog>> {
     home.ensure()
         .map_err(|e| std::io::Error::other(format!("cannot create Astrid home dirs: {e}")))?;
 
-    let runtime_key = load_or_generate_runtime_key(&home.keys_dir())?;
     let default_principal = astrid_core::PrincipalId::default();
     let principal_home = home.principal_home(&default_principal);
     principal_home
         .ensure()
         .map_err(|e| std::io::Error::other(format!("cannot create principal home dirs: {e}")))?;
+    // Share the kernel's single runtime key — never load it from disk twice
+    // (issue #929). The audit log and the admin token-mint path sign with the
+    // exact same key bytes.
     let audit_log = AuditLog::open(principal_home.audit_dir(), runtime_key)
         .map_err(|e| std::io::Error::other(format!("cannot open audit log: {e}")))?;
 

@@ -56,25 +56,7 @@ pub(super) async fn dispatch(
     req: AdminRequestKind,
 ) -> AdminResponseBody {
     match req {
-        AdminRequestKind::AgentCreate {
-            name,
-            groups,
-            grants,
-            inherit_from,
-            clone_from,
-            allow_admin_clone,
-        } => {
-            agent_create(
-                kernel,
-                name,
-                groups,
-                grants,
-                inherit_from,
-                clone_from,
-                allow_admin_clone,
-            )
-            .await
-        },
+        req @ AdminRequestKind::AgentCreate { .. } => agent_create_from_req(kernel, req).await,
         AdminRequestKind::AgentDelete { principal } => agent_delete(kernel, principal).await,
         AdminRequestKind::AgentEnable { principal } => {
             agent_set_enabled(kernel, principal, true).await
@@ -124,6 +106,11 @@ pub(super) async fn dispatch(
             principal,
             capabilities,
         } => mutate_caps(kernel, &principal, capabilities, CapsMutation::Revoke).await,
+        req @ (AdminRequestKind::CapsTokenMint { .. }
+        | AdminRequestKind::CapsTokenRevoke { .. }
+        | AdminRequestKind::CapsTokenList { .. }) => {
+            super::caps_tokens::dispatch(kernel, req).await
+        },
         AdminRequestKind::InviteIssue {
             group,
             expires_secs,
@@ -156,6 +143,39 @@ pub(super) async fn dispatch(
 }
 
 // ── Agent lifecycle ────────────────────────────────────────────────────
+
+/// Destructure an [`AdminRequestKind::AgentCreate`] and forward to
+/// [`agent_create`]. Split from the `dispatch` match arm to keep that
+/// router under the per-function line cap; the caller guarantees the
+/// variant, so the fallback is unreachable in practice.
+async fn agent_create_from_req(
+    kernel: &Arc<crate::Kernel>,
+    req: AdminRequestKind,
+) -> AdminResponseBody {
+    let AdminRequestKind::AgentCreate {
+        name,
+        groups,
+        grants,
+        inherit_from,
+        clone_from,
+        allow_admin_clone,
+    } = req
+    else {
+        return err_internal(
+            "agent_create_from_req received a non-AgentCreate variant".to_string(),
+        );
+    };
+    agent_create(
+        kernel,
+        name,
+        groups,
+        grants,
+        inherit_from,
+        clone_from,
+        allow_admin_clone,
+    )
+    .await
+}
 
 async fn agent_create(
     kernel: &Arc<crate::Kernel>,
@@ -888,7 +908,7 @@ pub(super) fn err_bad_input(msg: String) -> AdminResponseBody {
     AdminResponseBody::Error(msg)
 }
 
-fn err_internal(msg: String) -> AdminResponseBody {
+pub(super) fn err_internal(msg: String) -> AdminResponseBody {
     warn!(error = %msg, "admin request failed: internal error");
     AdminResponseBody::Error(msg)
 }
