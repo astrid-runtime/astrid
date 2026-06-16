@@ -1315,6 +1315,13 @@ impl ExecutionEngine for WasmEngine {
             let st_allowance_store = ctx.allowance_store.clone();
             let st_identity_store = ctx.identity_store.clone();
             let st_profile_cache = ctx.profile_cache.clone();
+            // Shared across the whole pool so a verified per-connection
+            // principal (issue #45/#852) bound on the accepting instance is
+            // visible to whichever pooled instance later serves that
+            // connection — same Arc-sharing rationale as `process_tracker`.
+            let connection_principals: Arc<
+                dashmap::DashMap<u32, astrid_core::principal::PrincipalId>,
+            > = Arc::new(dashmap::DashMap::new());
             let make_state: Arc<dyn Fn() -> HostState + Send + Sync> = Arc::new(move || HostState {
                 wasi_ctx: build_wasi_ctx(),
                 resource_table: wasmtime::component::ResourceTable::new(),
@@ -1387,6 +1394,7 @@ impl ExecutionEngine for WasmEngine {
                 subscription_count: 0,
                 process_count_total: 0,
                 process_count_by_principal: std::collections::HashMap::new(),
+                connection_principals: connection_principals.clone(),
                 // Run-loop epoch-interrupt state. `recv_yielded` is set true by
                 // the ipc `recv` host fn each time the guest blocks on recv;
                 // the bound run-loop's epoch callback reads + clears it to
@@ -2413,6 +2421,9 @@ pub async fn run_lifecycle(
         subscription_count: 0,
         process_count_total: 0,
         process_count_by_principal: std::collections::HashMap::new(),
+        // Lifecycle hooks never accept socket connections; a throwaway
+        // registry satisfies the field (issue #45/#852).
+        connection_principals: Arc::new(dashmap::DashMap::new()),
         // Lifecycle hooks are not run loops; the epoch-interrupt run-loop
         // state is inert here but initialised for completeness.
         recv_yielded: false,

@@ -31,7 +31,21 @@ impl HostUnixListener for HostState {
         let session_token = self.session_token.clone();
         let blocking_semaphore = self.blocking_semaphore.clone();
 
-        let stream = loop {
+        // Resolved once and reused for every accept iteration: where a claimed
+        // principal's profile/keys load from during the handshake challenge
+        // (issue #45/#852). Only resolved when a session token gates the
+        // handshake; an unauthenticated daemon never reaches
+        // `validate_handshake`, so `None` is fine there.
+        let astrid_home = if session_token.is_some() {
+            Some(
+                astrid_core::dirs::AstridHome::resolve()
+                    .map_err(|e| ErrorCode::Unknown(format!("cannot resolve astrid home: {e}")))?,
+            )
+        } else {
+            None
+        };
+
+        let (stream, verified_principal) = loop {
             let accept_result = util::bounded_block_on_cancellable(
                 &rt_handle,
                 &blocking_semaphore,
@@ -71,16 +85,16 @@ impl HostUnixListener for HostState {
             }
 
             let mut stream = stream;
-            if let Some(ref token) = session_token {
+            if let (Some(token), Some(home)) = (&session_token, &astrid_home) {
                 let handshake_result = util::bounded_block_on_cancellable(
                     &rt_handle,
                     &blocking_semaphore,
                     &cancel_token,
-                    validate_handshake(&mut stream, token),
+                    validate_handshake(&mut stream, token, home),
                 );
                 match handshake_result {
                     None => return Err(ErrorCode::Closed),
-                    Some(Ok(())) => break stream,
+                    Some(Ok(principal)) => break (stream, principal),
                     Some(Err(reason)) => {
                         tracing::warn!(
                             security_event = true,
@@ -92,7 +106,7 @@ impl HostUnixListener for HostState {
                     },
                 }
             } else {
-                break stream;
+                break (stream, None);
             }
         };
 
@@ -107,7 +121,15 @@ impl HostUnixListener for HostState {
             .push(net_stream)
             .map_err(|e| ErrorCode::Unknown(format!("resource table: {e}")))?;
         self.net_stream_count += 1;
-        let result: Result<Resource<TcpStream>, ErrorCode> = Ok(Resource::new_own(res.rep()));
+        let rep = res.rep();
+        // Record the verified principal (issue #45/#852) keyed by the stream
+        // resource rep, now that the rep is known. Storage only; enforcement
+        // reads this registry separately. The binding is removed when the
+        // stream resource drops (see `TcpStream::drop`).
+        if let Some(principal) = verified_principal {
+            self.bind_connection_principal(rep, principal);
+        }
+        let result: Result<Resource<TcpStream>, ErrorCode> = Ok(Resource::new_own(rep));
         audit_net(self, "astrid:net/host.unix-listener.accept", 0, &result);
         result
     }
@@ -157,12 +179,26 @@ impl HostUnixListener for HostState {
         }
 
         let mut stream = stream;
+        let mut verified_principal = None;
         if let Some(ref token) = session_token {
+            // See `accept` for why home is resolved here (issue #45/#852).
+            let home = match astrid_core::dirs::AstridHome::resolve() {
+                Ok(h) => h,
+                Err(e) => {
+                    tracing::warn!(
+                        security_event = true,
+                        error = %e,
+                        "rejected unix poll_accept: cannot resolve astrid home"
+                    );
+                    drop(stream);
+                    return Ok(None);
+                },
+            };
             let handshake_result = util::bounded_block_on_cancellable(
                 &rt_handle,
                 &blocking_semaphore,
                 &cancel_token,
-                validate_handshake(&mut stream, token),
+                validate_handshake(&mut stream, token, &home),
             );
             match handshake_result {
                 None => return Ok(None),
@@ -175,7 +211,7 @@ impl HostUnixListener for HostState {
                     drop(stream);
                     return Ok(None);
                 },
-                Some(Ok(())) => {},
+                Some(Ok(principal)) => verified_principal = principal,
             }
         }
 
@@ -190,7 +226,12 @@ impl HostUnixListener for HostState {
             .push(net_stream)
             .map_err(|e| ErrorCode::Unknown(format!("resource table: {e}")))?;
         self.net_stream_count += 1;
-        Ok(Some(Resource::new_own(res.rep())))
+        let rep = res.rep();
+        // Same per-connection principal binding as `accept` (issue #45/#852).
+        if let Some(principal) = verified_principal {
+            self.bind_connection_principal(rep, principal);
+        }
+        Ok(Some(Resource::new_own(rep)))
     }
 
     fn subscribe_readiness(&mut self, _self_: Resource<UnixListener>) -> Resource<DynPollable> {

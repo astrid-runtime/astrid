@@ -462,6 +462,20 @@ pub struct HostState {
     /// without iterating the whole resource table.
     pub process_count_by_principal:
         std::collections::HashMap<astrid_core::principal::PrincipalId, usize>,
+    /// Verified principal bound to each accepted Unix-socket connection,
+    /// keyed by the stream resource rep (`u32`). Populated by the
+    /// `net.unix-listener.accept` path after a successful per-connection
+    /// principal challenge-response (issue #45/#852) and torn down when the
+    /// stream resource drops.
+    ///
+    /// `Arc<DashMap>` so the binding is SHARED across a capsule's pooled
+    /// `HostState` instances exactly like [`process_tracker`](Self::process_tracker):
+    /// the same socket-owning capsule may serve a connection from a
+    /// different pooled instance than the one that accepted it. This map only
+    /// STORES the verified identity — nothing in this change reads it; the
+    /// enforcement that consumes it (binding the connection's principal to
+    /// outbound traffic) lands separately.
+    pub connection_principals: Arc<dashmap::DashMap<u32, astrid_core::principal::PrincipalId>>,
     /// Bound run-loop CPU-bound signal: set `true` by the ipc `recv` host fn
     /// each time the guest blocks on recv, read + cleared by the run-loop's
     /// epoch-deadline callback once per window.
@@ -532,6 +546,18 @@ impl HostState {
         Arc::new(Semaphore::new(
             super::limits::host_blocking_concurrency_default(),
         ))
+    }
+
+    /// Build a fresh, empty per-connection principal registry.
+    ///
+    /// Callers that construct a `HostState` outside the pooled-capsule path
+    /// (lifecycle hooks, the hook handler, tests) use this so they do not have
+    /// to name the `dashmap` type. The pooled path instead clones one shared
+    /// registry into every instance (issue #45/#852).
+    #[must_use]
+    pub fn new_connection_principals()
+    -> Arc<dashmap::DashMap<u32, astrid_core::principal::PrincipalId>> {
+        Arc::new(dashmap::DashMap::new())
     }
 
     /// Default **async-I/O** host-call semaphore (host-derived, fd-clamped).
@@ -845,6 +871,44 @@ impl HostState {
         self.invocation_capsule_log = super::open_capsule_log(&p, self.capsule_id.as_str(), false);
         self.invocation_env_overlay =
             super::load_invocation_env_overlay(&p, self.capsule_id.as_str());
+    }
+
+    /// Bind `principal` to the connection identified by stream resource `rep`.
+    ///
+    /// Called by the `net.unix-listener.accept` path after a verified
+    /// per-connection principal challenge-response (issue #45/#852). Storage
+    /// only — see [`connection_principals`](Self::connection_principals).
+    pub(crate) fn bind_connection_principal(
+        &self,
+        rep: u32,
+        principal: astrid_core::principal::PrincipalId,
+    ) {
+        self.connection_principals.insert(rep, principal);
+    }
+
+    /// Return the verified principal bound to the connection identified by
+    /// stream resource `rep`, if any.
+    ///
+    /// The READ side of the registry (issue #45/#852). This change only
+    /// POPULATES the registry; the enforcement that consumes it — binding the
+    /// connection's verified principal to its outbound traffic — lands
+    /// separately, so the accessor is exercised by tests but not yet by any
+    /// non-test call path. `allow(dead_code)` keeps the accessor in place for
+    /// that follow-up without tripping `-D warnings` in the interim.
+    #[must_use]
+    #[allow(dead_code)]
+    pub(crate) fn connection_principal(
+        &self,
+        rep: u32,
+    ) -> Option<astrid_core::principal::PrincipalId> {
+        self.connection_principals.get(&rep).map(|e| e.clone())
+    }
+
+    /// Remove any verified-principal binding for the connection identified by
+    /// stream resource `rep`. Called when the stream resource drops so the
+    /// registry does not leak entries for closed connections.
+    pub(crate) fn unbind_connection_principal(&self, rep: u32) {
+        self.connection_principals.remove(&rep);
     }
 }
 

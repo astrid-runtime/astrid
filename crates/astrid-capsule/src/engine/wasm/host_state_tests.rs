@@ -443,3 +443,35 @@ fn install_recv_invocation_context_resolves_invoking_principal_profile() {
         "owner-principal recv must apply the owner's configured profile, not the default or alice's"
     );
 }
+
+#[test]
+fn connection_principal_registry_round_trip() {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap();
+    let state = minimal_host_state(rt.handle().clone());
+
+    let rep = 42u32;
+    let alice = astrid_core::PrincipalId::new("alice").expect("valid principal");
+
+    // Unset → None.
+    assert_eq!(state.connection_principal(rep), None);
+
+    // Bind → reads back the same principal.
+    state.bind_connection_principal(rep, alice.clone());
+    assert_eq!(state.connection_principal(rep), Some(alice.clone()));
+
+    // A different rep is independent.
+    assert_eq!(state.connection_principal(rep.wrapping_add(1)), None);
+
+    // Rebinding the same rep overwrites.
+    let bob = astrid_core::PrincipalId::new("bob").expect("valid principal");
+    state.bind_connection_principal(rep, bob.clone());
+    assert_eq!(state.connection_principal(rep), Some(bob));
+
+    // Unbind → back to None, idempotent on a second unbind.
+    state.unbind_connection_principal(rep);
+    assert_eq!(state.connection_principal(rep), None);
+    state.unbind_connection_principal(rep);
+    assert_eq!(state.connection_principal(rep), None);
+}

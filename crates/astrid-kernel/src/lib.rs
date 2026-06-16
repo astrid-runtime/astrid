@@ -1841,6 +1841,70 @@ mod tests {
         assert_eq!(profile.groups, vec!["admin".to_string()]);
         assert!(profile.grants.is_empty());
         assert!(profile.revokes.is_empty());
+
+        // Default now carries a per-principal ed25519 key + the Keypair
+        // method, and the private key is on disk 0600 (issue #45/#852).
+        assert!(
+            profile
+                .auth
+                .public_keys
+                .iter()
+                .any(|k| k.starts_with("ed25519:")),
+            "default must have an ed25519 key registered"
+        );
+        assert!(
+            profile
+                .auth
+                .methods
+                .contains(&astrid_core::profile::AuthMethod::Keypair),
+            "default must record the Keypair auth method"
+        );
+        let key_path = home.keys_dir().join("default.key");
+        assert!(key_path.exists(), "default.key must be written to disk");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&key_path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600, "default.key must be owner-only");
+        }
+    }
+
+    #[test]
+    fn seed_admin_keypair_is_idempotent() {
+        // A second seed must NOT mint a fresh key — the registered key and the
+        // on-disk private key are stable across reboots so an operator who has
+        // started signing with it keeps working (issue #45/#852).
+        let (_d, home) = scratch_home();
+        let default = astrid_core::PrincipalId::default();
+        let path = astrid_core::PrincipalProfile::path_for(&home, &default);
+
+        seed_default_principal_admin_profile(&home).unwrap();
+        let first = astrid_core::PrincipalProfile::load_from_path(&path).unwrap();
+        let first_keys = first.auth.public_keys.clone();
+        let first_bytes = std::fs::read(home.keys_dir().join("default.key")).unwrap();
+
+        seed_default_principal_admin_profile(&home).unwrap();
+        let second = astrid_core::PrincipalProfile::load_from_path(&path).unwrap();
+        let second_bytes = std::fs::read(home.keys_dir().join("default.key")).unwrap();
+
+        assert_eq!(
+            first_keys, second.auth.public_keys,
+            "key must not be re-minted"
+        );
+        assert_eq!(
+            first_bytes, second_bytes,
+            "private key bytes must be stable"
+        );
+        assert_eq!(
+            second
+                .auth
+                .public_keys
+                .iter()
+                .filter(|k| k.starts_with("ed25519:"))
+                .count(),
+            1,
+            "exactly one ed25519 key — no duplication across reboots"
+        );
     }
 
     #[test]
@@ -2175,26 +2239,95 @@ fn seed_default_principal_admin_profile(
     }
 
     let path = PrincipalProfile::path_for(home, &default_principal);
-    let profile = PrincipalProfile::load_from_path(&path)?;
+    let mut profile = PrincipalProfile::load_from_path(&path)?;
 
-    if !profile.groups.is_empty() || !profile.grants.is_empty() || !profile.revokes.is_empty() {
+    // Two independent idempotent steps that may each mutate the profile:
+    //   1. seed the built-in `admin` group on a fresh-default profile, and
+    //   2. mint `default`'s per-principal keypair if it has none.
+    // `mutated` tracks whether either ran so we save at most once.
+    let mut mutated = false;
+
+    // 1. Admin-group seeding. Only on a truly fresh default (no groups,
+    // grants, or revokes) — an operator-configured profile is left intact.
+    if profile.groups.is_empty() && profile.grants.is_empty() && profile.revokes.is_empty() {
+        profile
+            .groups
+            .push(astrid_core::groups::BUILTIN_ADMIN.to_string());
+        mutated = true;
+        tracing::info!(
+            principal = %default_principal,
+            "Seeded default principal with built-in `admin` group"
+        );
+    } else {
         tracing::debug!(
             principal = %default_principal,
-            "Default principal profile already has group/grant/revoke entries — leaving intact"
+            "Default principal profile already has group/grant/revoke entries — leaving groups intact"
         );
-        return Ok(());
     }
 
-    let mut updated = profile;
-    updated
-        .groups
-        .push(astrid_core::groups::BUILTIN_ADMIN.to_string());
-    updated.save_to_path(&path)?;
-    tracing::info!(
-        principal = %default_principal,
-        "Seeded default principal with built-in `admin` group"
-    );
+    // 2. Per-principal keypair (issue #45/#852). Mint only if `default` has no
+    // ed25519 key yet, so the operator can authenticate as `default` over the
+    // socket. Independent of the admin-group step above: an operator-configured
+    // default still gets a key.
+    if mint_default_principal_keypair(home, &default_principal, &mut profile)? {
+        mutated = true;
+    }
+
+    if mutated {
+        profile.save_to_path(&path)?;
+    }
     Ok(())
+}
+
+/// Mint `default`'s per-principal ed25519 keypair if it has none, writing the
+/// private key to `keys/default.key` (0600) and registering the public key on
+/// `profile` (issue #45/#852). Mirrors
+/// [`mint_principal_keypair`](crate::kernel_router::admin::handlers) but takes
+/// only `home` + the profile, since the boot path has no `Kernel` yet.
+///
+/// Returns `Ok(true)` if the profile's auth config was mutated (so the caller
+/// saves it), `Ok(false)` if a key was already registered (no-op).
+fn mint_default_principal_keypair(
+    home: &astrid_core::dirs::AstridHome,
+    principal: &astrid_core::PrincipalId,
+    profile: &mut astrid_core::PrincipalProfile,
+) -> Result<bool, astrid_core::ProfileError> {
+    use astrid_core::profile::AuthMethod;
+
+    // Already has a key registered → nothing to do. (Re-minting would orphan
+    // the on-disk key the operator may already be signing with.)
+    let has_key = profile
+        .auth
+        .public_keys
+        .iter()
+        .any(|k| k.starts_with("ed25519:"));
+    if has_key {
+        return Ok(false);
+    }
+
+    let keypair = astrid_crypto::KeyPair::generate();
+    let keys_dir = home.keys_dir();
+    std::fs::create_dir_all(&keys_dir)?;
+    let key_path = keys_dir.join(format!("{principal}.key"));
+    std::fs::write(&key_path, keypair.secret_key_bytes())?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600))?;
+    }
+
+    let public_key = format!("ed25519:{}", keypair.export_public_key().to_hex());
+    if !profile.auth.public_keys.contains(&public_key) {
+        profile.auth.public_keys.push(public_key);
+    }
+    if !profile.auth.methods.contains(&AuthMethod::Keypair) {
+        profile.auth.methods.push(AuthMethod::Keypair);
+    }
+    tracing::info!(
+        principal = %principal,
+        "Minted per-principal keypair for default principal"
+    );
+    Ok(true)
 }
 
 /// Apply pre-configured identity links from the config file.

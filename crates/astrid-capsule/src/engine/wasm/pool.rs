@@ -432,6 +432,13 @@ fn clear_on_return(state: &mut HostState, reset_resources: bool) {
         state.subscription_count = 0;
         state.process_count_total = 0;
         state.process_count_by_principal.clear();
+        // Rebuilding the table drops every `NetStream` (the raw value's
+        // `Drop`, not the host-trait `drop` that normally calls
+        // `unbind_connection_principal`), so clear the per-connection
+        // principal registry to the same empty-table baseline rather than
+        // leaking entries for connections whose stream is now gone
+        // (issue #45/#852).
+        state.connection_principals.clear();
     }
 }
 

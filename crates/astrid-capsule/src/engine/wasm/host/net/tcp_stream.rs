@@ -403,13 +403,19 @@ impl HostTcpStream for HostState {
     }
 
     fn drop(&mut self, rep: Resource<TcpStream>) -> wasmtime::Result<()> {
+        let table_rep = rep.rep();
         if self
             .resource_table
-            .delete::<NetStream>(Resource::new_own(rep.rep()))
+            .delete::<NetStream>(Resource::new_own(table_rep))
             .is_ok()
         {
             self.net_stream_count = self.net_stream_count.saturating_sub(1);
         }
+        // Drop any verified per-connection principal binding (issue #45/#852)
+        // so the registry does not leak entries for closed connections. A
+        // no-op for outbound TCP streams (never bound) and for unauthenticated
+        // unix connections.
+        self.unbind_connection_principal(table_rep);
         Ok(())
     }
 }
