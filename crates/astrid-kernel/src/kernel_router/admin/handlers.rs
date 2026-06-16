@@ -191,13 +191,10 @@ async fn agent_create(
         Err(e) => return err_bad_input(format!("invalid principal name: {e}")),
     };
 
-    // Reject bootstrap name: the `default` principal is seeded by
-    // bootstrap_cli_root_user and must not be re-created through the
-    // admin surface.
-    if principal == PrincipalId::default() {
-        return err_bad_input(format!(
-            "principal {name:?} is reserved for single-tenant bootstrap"
-        ));
+    // `default` (the bootstrap anchor) and `anonymous` (the no-capability
+    // identity stamped on unauthenticated connections, #45/#852) are reserved.
+    if let Some(reason) = principal.reserved_reason() {
+        return err_bad_input(format!("principal {name:?} is {reason}"));
     }
 
     // `clone_from` is a full replica: the source supplies groups, grants,
