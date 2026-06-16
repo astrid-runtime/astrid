@@ -246,7 +246,7 @@ async fn agent_create(
     // Build the profile: a `clone_from` replica (validated + admin-guarded) or
     // a fresh profile from the supplied groups/grants. Runs under the lock so
     // the clone source is pinned across the read.
-    let profile = match build_create_profile(
+    let mut profile = match build_create_profile(
         kernel,
         &principal,
         groups,
@@ -257,6 +257,16 @@ async fn agent_create(
         Ok(p) => p,
         Err(resp) => return resp,
     };
+
+    // Mint a per-principal ed25519 keypair so this principal can authenticate
+    // its local socket connections (issue #45/#852): the private key lands in
+    // system custody under `keys/` (NOT the principal home — the agent sandbox
+    // denies it, but the operator/OS-user CLI can read it to sign), and the
+    // public key + the `Keypair` auth method are registered on the profile so
+    // the handshake can verify a signature against it.
+    if let Err(resp) = mint_principal_keypair(kernel, &principal, &mut profile) {
+        return resp;
+    }
 
     if let Err(e) = profile.validate() {
         return err_bad_input(format!("profile rejected: {e}"));
@@ -420,6 +430,69 @@ fn build_create_profile(
         quotas: source_profile.quotas,
         ..PrincipalProfile::default()
     })
+}
+
+/// Mint a per-principal ed25519 keypair and register it on `profile`.
+///
+/// The private key is written to `keys/<principal>.key` in SYSTEM custody
+/// (0600) — outside the principal home, so the spawned-agent sandbox can deny
+/// it while the operator's CLI (running as the OS user) can read it to sign a
+/// handshake challenge. The public key is appended to `AuthConfig.public_keys`
+/// as `ed25519:<hex>` and `AuthMethod::Keypair` is recorded, so the kernel-side
+/// handshake can verify a signature against it (issue #45/#852). Returns the
+/// error response to propagate on a filesystem failure.
+fn mint_principal_keypair(
+    kernel: &Arc<crate::Kernel>,
+    principal: &PrincipalId,
+    profile: &mut PrincipalProfile,
+) -> Result<(), AdminResponseBody> {
+    let keypair = astrid_crypto::KeyPair::generate();
+    let keys_dir = kernel.astrid_home.keys_dir();
+    if let Err(e) = std::fs::create_dir_all(&keys_dir) {
+        return Err(err_internal(format!("keys dir create failed: {e}")));
+    }
+    let key_path = keys_dir.join(format!("{principal}.key"));
+    // Create the key file 0600 atomically (via `OpenOptions::mode`) BEFORE
+    // writing the secret bytes, so the ed25519 private key is never momentarily
+    // group/world readable in the (0755) keys dir between a `write` and a
+    // follow-up `set_permissions` chmod — the TOCTOU a co-tenant could race.
+    // Mirrors `mint_default_principal_keypair` in the kernel bootstrap.
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let write_result = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&key_path)
+            .and_then(|mut f| f.write_all(&keypair.secret_key_bytes()));
+        if let Err(e) = write_result {
+            return Err(err_internal(format!("principal key write failed: {e}")));
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        if let Err(e) = std::fs::write(&key_path, keypair.secret_key_bytes()) {
+            return Err(err_internal(format!("principal key write failed: {e}")));
+        }
+    }
+    let public_key = format!("ed25519:{}", keypair.export_public_key().to_hex());
+    if !profile.auth.public_keys.contains(&public_key) {
+        profile.auth.public_keys.push(public_key);
+    }
+    if !profile
+        .auth
+        .methods
+        .contains(&astrid_core::profile::AuthMethod::Keypair)
+    {
+        profile
+            .auth
+            .methods
+            .push(astrid_core::profile::AuthMethod::Keypair);
+    }
+    Ok(())
 }
 
 async fn agent_delete(kernel: &Arc<crate::Kernel>, principal: PrincipalId) -> AdminResponseBody {

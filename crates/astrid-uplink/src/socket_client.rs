@@ -107,7 +107,7 @@ impl SocketClient {
             .await
             .context("Failed to connect to IPC socket")?;
 
-        perform_handshake(&mut stream).await?;
+        perform_handshake(&mut stream, &principal).await?;
 
         let (read_half, write_half) = stream.into_split();
 
@@ -327,9 +327,29 @@ const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10
 /// Maximum allowed size of a handshake response payload (bytes).
 const MAX_HANDSHAKE_RESPONSE_SIZE: usize = 4096;
 
+/// Path to the per-principal signing key (`keys/<principal>.key`), if
+/// `ASTRID_HOME` resolves. The daemon writes this 0600 file when the
+/// principal's keypair is minted (issue #45/#852); the connecting process,
+/// running as the OS user, can read it to sign a handshake challenge.
+fn principal_key_path(principal: &PrincipalId) -> Option<std::path::PathBuf> {
+    use astrid_core::dirs::AstridHome;
+    let home = AstridHome::resolve().ok()?;
+    Some(home.keys_dir().join(format!("{principal}.key")))
+}
+
 /// Read the session token from disk and execute the authentication
-/// handshake.
-async fn perform_handshake(stream: &mut UnixStream) -> Result<()> {
+/// handshake, authenticating as `principal` when a per-principal key exists.
+///
+/// Two flows, picked by key presence:
+/// - **Authenticated (two frames):** when `keys/<principal>.key` exists, the
+///   first request frame carries `claimed_principal` (no signature); the
+///   daemon replies with a challenge nonce; a second frame carries the
+///   ed25519 signature over
+///   `astrid-principal-auth:v1:{principal}:{nonce_hex}`.
+/// - **Legacy (single frame):** when no key file exists, the request omits
+///   `claimed_principal` and the handshake completes in one round trip,
+///   preserving behaviour for callers without a key.
+async fn perform_handshake(stream: &mut UnixStream, principal: &PrincipalId) -> Result<()> {
     let tok_path = token_path()?;
     let token = SessionToken::read_from_file(&tok_path).with_context(|| {
         format!(
@@ -338,14 +358,76 @@ async fn perform_handshake(stream: &mut UnixStream) -> Result<()> {
         )
     })?;
 
+    // Load the signing key only if it exists; absence ⇒ legacy single-frame.
+    let keypair = match principal_key_path(principal) {
+        Some(path) => match std::fs::read(&path) {
+            Ok(bytes) => Some(
+                astrid_crypto::KeyPair::from_secret_key(&bytes)
+                    .with_context(|| format!("invalid principal key at {}", path.display()))?,
+            ),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => {
+                return Err(e).with_context(|| {
+                    format!("failed to read principal key at {}", path.display())
+                });
+            },
+        },
+        None => None,
+    };
+
+    let claimed_principal = keypair.as_ref().map(|_| principal.to_string());
     let request = HandshakeRequest {
         token: token.to_hex(),
         protocol_version: PROTOCOL_VERSION,
         client_version: env!("CARGO_PKG_VERSION").to_string(),
+        claimed_principal,
+        // The signature rides the SECOND frame (after the challenge), never
+        // the first.
+        signature: None,
     };
 
+    let response = send_request_read_response(stream, &request).await?;
+
+    // Authenticated path: the daemon's first response carries a challenge
+    // nonce. Sign it and send a second frame, then read the final response.
+    let response = if let (Some(keypair), Some(nonce_hex)) =
+        (keypair.as_ref(), response.challenge.as_deref())
+    {
+        let message = astrid_core::session_token::principal_auth_challenge_message(
+            principal.as_str(),
+            nonce_hex,
+        );
+        let signature = keypair.sign(message.as_bytes()).to_hex();
+        let signed = HandshakeRequest {
+            token: token.to_hex(),
+            protocol_version: PROTOCOL_VERSION,
+            client_version: env!("CARGO_PKG_VERSION").to_string(),
+            claimed_principal: Some(principal.to_string()),
+            signature: Some(signature),
+        };
+        send_request_read_response(stream, &signed).await?
+    } else {
+        response
+    };
+
+    if !response.is_ok() {
+        let reason = response
+            .reason
+            .unwrap_or_else(|| "unknown error".to_string());
+        anyhow::bail!("Daemon rejected connection: {reason}");
+    }
+
+    Ok(())
+}
+
+/// Write one length-prefixed [`HandshakeRequest`] frame and read the
+/// length-prefixed [`HandshakeResponse`] frame, with per-operation timeouts.
+async fn send_request_read_response(
+    stream: &mut UnixStream,
+    request: &HandshakeRequest,
+) -> Result<HandshakeResponse> {
     let request_bytes =
-        serde_json::to_vec(&request).context("Failed to serialize handshake request")?;
+        serde_json::to_vec(request).context("Failed to serialize handshake request")?;
     let len = u32::try_from(request_bytes.len()).context("Handshake request too large")?;
 
     tokio::time::timeout(HANDSHAKE_TIMEOUT, async {
@@ -375,15 +457,5 @@ async fn perform_handshake(stream: &mut UnixStream) -> Result<()> {
         .context("Handshake response payload timed out")?
         .context("Failed to read handshake response payload")?;
 
-    let response: HandshakeResponse =
-        serde_json::from_slice(&resp_payload).context("Failed to parse handshake response")?;
-
-    if !response.is_ok() {
-        let reason = response
-            .reason
-            .unwrap_or_else(|| "unknown error".to_string());
-        anyhow::bail!("Daemon rejected connection: {reason}");
-    }
-
-    Ok(())
+    serde_json::from_slice(&resp_payload).context("Failed to parse handshake response")
 }

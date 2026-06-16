@@ -301,12 +301,24 @@ impl ipc::Host for HostState {
         if !self.has_uplink_capability {
             return Err(ErrorCode::CapabilityDenied);
         }
-        if astrid_core::principal::PrincipalId::new(&principal).is_err() {
+        // The verified principal bound to the source connection — a Path-1
+        // daemon-spawned agent or a Path-2 crypto-authenticated client, recorded
+        // by the framed `tcp-stream.read` that pulled this frame — OVERRIDES the
+        // capsule-supplied name. An uplink relays a connection; it does not get
+        // to NAME a principal, so a socket client can no longer forge one it has
+        // not proven (issue #45/#852, the self-stamp fix). A connection with no
+        // kernel binding — a local operator trusted by peer-credential match —
+        // falls back to the supplied name.
+        let effective = match self.ingress_principal.as_ref() {
+            Some(verified) => verified.to_string(),
+            None => principal,
+        };
+        if astrid_core::principal::PrincipalId::new(&effective).is_err() {
             return Err(ErrorCode::InvalidInput);
         }
         let bytes = payload.len() as u64;
         let topic_for_audit = topic.clone();
-        let result = publish_inner(self, topic, payload, principal);
+        let result = publish_inner(self, topic, payload, effective);
         audit_ipc(
             self,
             "astrid:ipc/host.publish-as",
@@ -835,6 +847,74 @@ mod audit_scope_tests {
         assert!(
             IpcHost::subscribe(&mut state, "astrid.v1.admin.response.*".to_string()).is_ok(),
             "the single trailing wildcard the fix kept must be subscribable",
+        );
+    }
+
+    // ── publish-as principal enforcement (issue #45/#852) ──
+
+    /// The self-stamp fix: when the source connection carries a kernel-verified
+    /// principal (recorded by the framed read that pulled the frame), `publish-as`
+    /// stamps THAT principal and ignores the capsule-supplied name. A socket
+    /// client that authenticated as `claude` but names `default` (admin) on the
+    /// wire cannot escalate — the kernel-bound identity wins.
+    #[tokio::test]
+    async fn publish_as_verified_principal_overrides_claimed_name() {
+        let rt = tokio::runtime::Handle::current();
+        let mut state = minimal_host_state(rt);
+        state.has_uplink_capability = true;
+        state.ipc_publish_patterns = vec!["client.v1.*".to_string()];
+        state.ipc_subscribe_patterns = vec!["client.v1.*".to_string()];
+        // The framed read recorded the connection's verified principal.
+        state.ingress_principal = Some(astrid_core::PrincipalId::new("claude").unwrap());
+
+        let sub = IpcHost::subscribe(&mut state, "client.v1.connect".to_string())
+            .expect("subscribe allowed by ACL");
+
+        // The client lies on the wire: it names `default`.
+        IpcHost::publish_as(
+            &mut state,
+            "client.v1.connect".to_string(),
+            "{}".to_string(),
+            "default".to_string(),
+        )
+        .expect("publish_as should succeed");
+
+        assert_eq!(
+            drained_principals(&mut state, &sub),
+            vec!["claude".to_string()],
+            "the verified principal must override the claimed name (no escalation)"
+        );
+    }
+
+    /// Without a kernel binding — a legacy local operator trusted by
+    /// peer-credential match — `publish-as` falls back to the supplied name, so
+    /// the zero-config operator CLI keeps acting as `default`. This pins that
+    /// the enforcement does NOT regress the operator path.
+    #[tokio::test]
+    async fn publish_as_without_binding_honours_claimed_name() {
+        let rt = tokio::runtime::Handle::current();
+        let mut state = minimal_host_state(rt);
+        state.has_uplink_capability = true;
+        state.ipc_publish_patterns = vec!["client.v1.*".to_string()];
+        state.ipc_subscribe_patterns = vec!["client.v1.*".to_string()];
+        // No in-flight verified principal (an unbound connection).
+        assert_eq!(state.ingress_principal, None);
+
+        let sub = IpcHost::subscribe(&mut state, "client.v1.connect".to_string())
+            .expect("subscribe allowed by ACL");
+
+        IpcHost::publish_as(
+            &mut state,
+            "client.v1.connect".to_string(),
+            "{}".to_string(),
+            "default".to_string(),
+        )
+        .expect("publish_as should succeed");
+
+        assert_eq!(
+            drained_principals(&mut state, &sub),
+            vec!["default".to_string()],
+            "an unbound connection's supplied name is honoured (operator fallback)"
         );
     }
 }

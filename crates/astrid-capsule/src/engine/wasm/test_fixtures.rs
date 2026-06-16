@@ -137,6 +137,8 @@ pub(crate) fn minimal_host_state(rt: tokio::runtime::Handle) -> HostState {
         subscription_count: 0,
         process_count_total: 0,
         process_count_by_principal: HashMap::new(),
+        connection_principals: Arc::new(dashmap::DashMap::new()),
+        ingress_principal: None,
         recv_yielded: false,
         no_yield_windows: 0,
     }
