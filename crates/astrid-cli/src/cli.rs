@@ -294,6 +294,8 @@ pub(crate) struct UpdateArgs {
 
 #[derive(Subcommand)]
 pub(crate) enum CapsuleCommands {
+    /// Scaffold a new, first-try-compiling capsule project.
+    New(crate::commands::capsule::new::NewArgs),
     /// Install a capsule from a local path or registry.
     ///
     /// Capsules are deployed once and shared across every principal —

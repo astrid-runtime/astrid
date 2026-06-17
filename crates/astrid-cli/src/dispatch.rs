@@ -202,6 +202,7 @@ async fn dispatch_subcommand(
 async fn dispatch_capsule(command: crate::cli::CapsuleCommands) -> Result<ExitCode> {
     use crate::cli::CapsuleCommands;
     match command {
+        CapsuleCommands::New(args) => commands::capsule::new::run(&args),
         CapsuleCommands::Install {
             source,
             capsule,
