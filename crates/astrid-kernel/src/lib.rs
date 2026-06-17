@@ -678,6 +678,10 @@ impl Kernel {
         let other_names: Vec<String> = others.iter().map(|(m, _)| m.package.name.clone()).collect();
         self.await_capsule_readiness(&other_names).await;
 
+        // Mirror the read-only introspection furniture into every principal's
+        // home so non-install principals see the globally-loaded capsule set.
+        self.sync_all_principal_furniture().await;
+
         // Signal that all capsules have been loaded so uplink capsules
         // (like the registry) can proceed with discovery instead of
         // polling with arbitrary timeouts.
@@ -690,6 +694,76 @@ impl Kernel {
             metadata: astrid_events::EventMetadata::new("kernel"),
             message: msg,
         });
+    }
+
+    /// Mirror the read-only introspection furniture (installed-capsule
+    /// registry + `home://wit/`) into every principal's home.
+    ///
+    /// Capsules are deployed once and shared globally, but the read-only
+    /// *view* of that set is materialized only into the install principal's
+    /// home at install time — so a non-install principal (e.g. `claude-code`)
+    /// would see `system_status` `capsule_count: 0` and `list_interfaces`
+    /// "WIT directory not found". Run on boot (and after install, since
+    /// [`Self::load_all_capsules`] also runs post-install) to rebuild the
+    /// mirror for every principal enumerated from `etc/profiles/*.toml`.
+    ///
+    /// Best-effort: a per-principal sync failure logs a warning and continues
+    /// — it degrades that principal's introspection visibility, never boot.
+    /// Env config (`.config/env/`) is excluded for secret isolation (enforced
+    /// inside [`astrid_capsule_install::materialize_principal_furniture`]).
+    async fn sync_all_principal_furniture(&self) {
+        // The sweep enumerates `etc/profiles/*.toml` and does synchronous
+        // recursive directory copies per principal. Offload the whole loop to
+        // the blocking pool so it never pins a tokio worker, and `.await` it so
+        // boot ordering is preserved (the `capsules_loaded` signal must not fire
+        // before the mirrors exist). `AstridHome` is `Clone` and cheap to move.
+        let home = self.astrid_home.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            let profiles_dir = home.profiles_dir();
+            let entries = match std::fs::read_dir(&profiles_dir) {
+                Ok(entries) => entries,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+                Err(e) => {
+                    tracing::warn!(
+                        dir = %profiles_dir.display(),
+                        error = %e,
+                        "failed to enumerate principals for home-furniture sync"
+                    );
+                    return;
+                },
+            };
+
+            for entry in entries.flatten() {
+                if !entry.file_type().is_ok_and(|t| t.is_file()) {
+                    continue;
+                }
+                let file_name = entry.file_name();
+                let Some(stem) = file_name.to_str().and_then(|n| n.strip_suffix(".toml")) else {
+                    continue;
+                };
+                let Ok(principal) = PrincipalId::new(stem) else {
+                    continue;
+                };
+                if let Err(e) =
+                    astrid_capsule_install::materialize_principal_furniture(&home, &principal)
+                {
+                    tracing::warn!(
+                        %principal,
+                        error = %format!("{e:#}"),
+                        "failed to materialize per-principal home furniture; \
+                         this principal's introspection tools may not see the loaded capsule set"
+                    );
+                }
+            }
+        })
+        .await;
+        if let Err(join_err) = result {
+            tracing::warn!(
+                error = %join_err,
+                "per-principal home-furniture sweep task panicked; \
+                 some principals' introspection tools may not see the loaded capsule set"
+            );
+        }
     }
 
     /// Record that a new client connection for `principal` has been established.
