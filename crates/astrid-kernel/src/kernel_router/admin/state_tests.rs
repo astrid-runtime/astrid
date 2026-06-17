@@ -89,6 +89,9 @@ async fn agent_create_writes_profile_and_links_identity() {
             name: "alice".into(),
             groups: Vec::new(),
             grants: Vec::new(),
+            inherit_from: None,
+            clone_from: None,
+            allow_admin_clone: false,
         },
     )
     .await;
@@ -128,6 +131,9 @@ async fn agent_create_rejects_collision_with_existing_profile() {
             name: "alice".into(),
             groups: Vec::new(),
             grants: Vec::new(),
+            inherit_from: None,
+            clone_from: None,
+            allow_admin_clone: false,
         },
     )
     .await;
@@ -140,6 +146,9 @@ async fn agent_create_rejects_collision_with_existing_profile() {
             name: "alice".into(),
             groups: Vec::new(),
             grants: Vec::new(),
+            inherit_from: None,
+            clone_from: None,
+            allow_admin_clone: false,
         },
     )
     .await;
@@ -156,26 +165,191 @@ async fn agent_create_rejects_invalid_name() {
             name: "bad/name".into(),
             groups: Vec::new(),
             grants: Vec::new(),
+            inherit_from: None,
+            clone_from: None,
+            allow_admin_clone: false,
         },
     )
     .await;
     assert_error_contains(&res, "invalid principal name");
 }
 
+/// `default` (the single-tenant bootstrap anchor) and `anonymous` (the
+/// no-capability identity stamped on unauthenticated connections, #45/#852) are
+/// reserved: `agent create` must reject both so neither can be created — and
+/// thus never granted capabilities.
 #[tokio::test(flavor = "multi_thread")]
-async fn agent_create_rejects_default_bootstrap_name() {
+async fn agent_create_rejects_reserved_names() {
+    let (_dir, kernel) = fixture().await;
+    for name in ["default", "anonymous"] {
+        let res = handlers::dispatch(
+            &kernel,
+            &astrid_core::PrincipalId::default(),
+            AdminRequestKind::AgentCreate {
+                name: name.into(),
+                groups: Vec::new(),
+                grants: Vec::new(),
+                inherit_from: None,
+                clone_from: None,
+                allow_admin_clone: false,
+            },
+        )
+        .await;
+        assert_error_contains(&res, "reserved");
+    }
+}
+
+/// Security-critical direction: a default `inherit_from: None` create
+/// must NOT copy the `default` principal's env JSON into the new agent.
+/// Before the opt-in flip this copy happened unconditionally, leaking
+/// `default`'s config (and, for registered capsules, KV + secrets/API
+/// keys) into every created agent.
+#[tokio::test(flavor = "multi_thread")]
+async fn agent_create_without_inherit_copies_nothing() {
+    let (_dir, kernel) = fixture().await;
+
+    // Seed an env file under `default`'s env dir. If the old
+    // unconditional inheritance were still in place, this file would be
+    // copied into every new agent.
+    let default_env = kernel
+        .astrid_home
+        .principal_home(&PrincipalId::default())
+        .env_dir();
+    std::fs::create_dir_all(&default_env).expect("default env dir");
+    std::fs::write(default_env.join("openai.json"), br#"{"base_url":"x"}"#)
+        .expect("seed default env file");
+
+    let res = handlers::dispatch(
+        &kernel,
+        &astrid_core::PrincipalId::default(),
+        AdminRequestKind::AgentCreate {
+            name: "alice".into(),
+            groups: Vec::new(),
+            grants: Vec::new(),
+            inherit_from: None,
+            clone_from: None,
+            allow_admin_clone: false,
+        },
+    )
+    .await;
+    assert_success(&res);
+
+    // The new principal's env dir was provisioned (empty) but inherited
+    // NOTHING from `default`. The seeded file must not be present.
+    let alice_env = kernel.astrid_home.principal_home(&pid("alice")).env_dir();
+    assert!(
+        !alice_env.join("openai.json").exists(),
+        "default's env file leaked into a non-inheriting agent"
+    );
+    let leaked: Vec<_> = std::fs::read_dir(&alice_env)
+        .map(|rd| rd.flatten().map(|e| e.file_name()).collect())
+        .unwrap_or_default();
+    assert!(
+        leaked.is_empty(),
+        "non-inheriting agent's env dir is not empty: {leaked:?}"
+    );
+}
+
+/// Opt-in direction: `inherit_from: Some(source)` performs a full copy
+/// of the source's per-principal state. The env-dir copy path is the
+/// one exercisable here (the empty test registry means `copy_kv_*` /
+/// `copy_secret_files` find no capsule namespaces to probe — see the
+/// gap note below), so we assert an env file seeded on a real source
+/// lands in the new agent.
+#[tokio::test(flavor = "multi_thread")]
+async fn agent_create_with_inherit_copies_from_source() {
+    let (_dir, kernel) = fixture().await;
+
+    // Create the source principal first so its profile + home tree exist.
+    let res = handlers::dispatch(
+        &kernel,
+        &astrid_core::PrincipalId::default(),
+        AdminRequestKind::AgentCreate {
+            name: "source".into(),
+            groups: Vec::new(),
+            grants: Vec::new(),
+            inherit_from: None,
+            clone_from: None,
+            allow_admin_clone: false,
+        },
+    )
+    .await;
+    assert_success(&res);
+
+    // Seed an env file under the source's env dir.
+    let source_env = kernel.astrid_home.principal_home(&pid("source")).env_dir();
+    std::fs::create_dir_all(&source_env).expect("source env dir");
+    std::fs::write(source_env.join("openai.json"), br#"{"base_url":"src"}"#)
+        .expect("seed source env file");
+
+    // Create the inheriting agent.
+    let res = handlers::dispatch(
+        &kernel,
+        &astrid_core::PrincipalId::default(),
+        AdminRequestKind::AgentCreate {
+            name: "child".into(),
+            groups: Vec::new(),
+            grants: Vec::new(),
+            inherit_from: Some(pid("source")),
+            clone_from: None,
+            allow_admin_clone: false,
+        },
+    )
+    .await;
+    assert_success(&res);
+
+    // The source's env file landed in the child verbatim.
+    let child_env = kernel.astrid_home.principal_home(&pid("child")).env_dir();
+    let copied = std::fs::read(child_env.join("openai.json"))
+        .expect("source env file should have been copied into the child");
+    assert_eq!(copied, br#"{"base_url":"src"}"#);
+}
+
+/// A named-but-nonexistent inheritance source must fail loudly rather
+/// than silently no-op into an empty agent the operator believes was
+/// provisioned from a template.
+#[tokio::test(flavor = "multi_thread")]
+async fn agent_create_rejects_nonexistent_inherit_source() {
     let (_dir, kernel) = fixture().await;
     let res = handlers::dispatch(
         &kernel,
         &astrid_core::PrincipalId::default(),
         AdminRequestKind::AgentCreate {
-            name: "default".into(),
+            name: "alice".into(),
             groups: Vec::new(),
             grants: Vec::new(),
+            inherit_from: Some(pid("ghost")),
+            clone_from: None,
+            allow_admin_clone: false,
         },
     )
     .await;
-    assert_error_contains(&res, "reserved");
+    assert_error_contains(&res, "inherit_from source rejected");
+
+    // The create was rejected before any state was written.
+    let path = PrincipalProfile::path_for(&kernel.astrid_home, &pid("alice"));
+    assert!(!path.exists(), "rejected create left a profile on disk");
+}
+
+/// Self-inherit is meaningless (the source home tree does not exist at
+/// the moment the copy would run) and must be rejected.
+#[tokio::test(flavor = "multi_thread")]
+async fn agent_create_rejects_self_inherit() {
+    let (_dir, kernel) = fixture().await;
+    let res = handlers::dispatch(
+        &kernel,
+        &astrid_core::PrincipalId::default(),
+        AdminRequestKind::AgentCreate {
+            name: "alice".into(),
+            groups: Vec::new(),
+            grants: Vec::new(),
+            inherit_from: Some(pid("alice")),
+            clone_from: None,
+            allow_admin_clone: false,
+        },
+    )
+    .await;
+    assert_error_contains(&res, "same as the new principal");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -201,6 +375,9 @@ async fn agent_create_rolls_back_when_home_provisioning_fails() {
             name: "blocked".into(),
             groups: Vec::new(),
             grants: Vec::new(),
+            inherit_from: None,
+            clone_from: None,
+            allow_admin_clone: false,
         },
     )
     .await;
@@ -262,6 +439,9 @@ async fn agent_delete_removes_identity_profile_and_invalidates_cache() {
             name: "bob".into(),
             groups: Vec::new(),
             grants: Vec::new(),
+            inherit_from: None,
+            clone_from: None,
+            allow_admin_clone: false,
         },
     )
     .await;
@@ -438,6 +618,9 @@ async fn agent_enable_toggle_and_cache_invalidation() {
             name: "carol".into(),
             groups: Vec::new(),
             grants: Vec::new(),
+            inherit_from: None,
+            clone_from: None,
+            allow_admin_clone: false,
         },
     )
     .await;
@@ -484,6 +667,9 @@ async fn agent_list_returns_every_home_dir_principal() {
                 name: name.into(),
                 groups: Vec::new(),
                 grants: Vec::new(),
+                inherit_from: None,
+                clone_from: None,
+                allow_admin_clone: false,
             },
         )
         .await;
@@ -518,6 +704,9 @@ async fn quota_set_rejects_zero_memory() {
             name: "dave".into(),
             groups: Vec::new(),
             grants: Vec::new(),
+            inherit_from: None,
+            clone_from: None,
+            allow_admin_clone: false,
         },
     )
     .await;
@@ -546,6 +735,9 @@ async fn quota_set_updates_profile_and_invalidates_cache() {
             name: "eve".into(),
             groups: Vec::new(),
             grants: Vec::new(),
+            inherit_from: None,
+            clone_from: None,
+            allow_admin_clone: false,
         },
     )
     .await;
@@ -712,6 +904,9 @@ async fn group_delete_reference_from_profile_does_not_elevate_privileges() {
             name: "frank".into(),
             groups: vec!["ops".into()],
             grants: Vec::new(),
+            inherit_from: None,
+            clone_from: None,
+            allow_admin_clone: false,
         },
     )
     .await;
@@ -753,6 +948,9 @@ async fn agent_list_filters_to_self_for_non_admin_caller() {
                 name: name.into(),
                 groups: Vec::new(),
                 grants: Vec::new(),
+                inherit_from: None,
+                clone_from: None,
+                allow_admin_clone: false,
             },
         )
         .await;

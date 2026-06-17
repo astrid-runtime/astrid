@@ -157,6 +157,66 @@ interface host {
         max-open-files: option<u32>,
     }
 
+    /// Host-verified, read-only bytes exposed to a spawned child's OS sandbox.
+    /// The motivating consumer is un-overridable per-spawn governance (a
+    /// supervised agent reads a policy file a prompt-injected session cannot
+    /// rewrite), but the primitive is AGENT-NEUTRAL: the capsule hands over the
+    /// bytes plus how the child should find them (see `injection-placement`), and
+    /// the host owns placement, integrity, and exposure. `content` is OPAQUE to
+    /// the host — it never parses, validates, or filters the bytes.
+    ///
+    /// Write-protection invariant: the bytes the child reads MUST NOT be writable
+    /// by (a) the child or any subprocess it spawns, NOR (b) the spawning
+    /// principal's capsule `fs` surface (`fs_*` runs in capsule space, OUTSIDE the
+    /// child's sandbox; a `home://`-spanning `fs` capability could otherwise
+    /// rewrite a home-staged file between authoring and read). The host therefore
+    /// SNAPSHOTS `content` into a host-owned path outside every VFS mount,
+    /// BLAKE3-hashes the snapshot, VERIFIES the exposed bytes against the pin
+    /// (closing the copy->expose TOCTOU), records the hash in the spawn audit, and
+    /// exposes ONLY that host-owned snapshot — never a live bind of bytes the
+    /// capsule can still reach.
+    ///
+    /// No new capability: injection rides `host_process` and is permitted only
+    /// into the caller's OWN child. It is strictly a RESTRICTION surface — a
+    /// capsule that already dictates the child's `args` / `env` / `cwd` / `stdin`
+    /// gains nothing from also handing it an UNMODIFIABLE file. The host owns the
+    /// materialized path (`env-pointer`) or only remaps within the child's own
+    /// namespace (`fixed-path`), so it never writes to a caller-named host path.
+    record file-injection {
+        /// The bytes to expose. The capsule already holds them (it authored the
+        /// policy), so there is no host-side file read, no read gate, and no
+        /// home-staged intermediate file the `fs` surface could race.
+        content: list<u8>,
+        /// How the child is pointed at the bytes.
+        placement: injection-placement,
+    }
+
+    /// How an injected file is exposed to the child. Both modes expose the SAME
+    /// verified bytes read-only; they differ only in how the agent finds them,
+    /// chosen to match the target agent's config mechanism.
+    variant injection-placement {
+        /// The host materializes the verified snapshot at a HOST-OWNED path
+        /// (outside every VFS mount), exposes it read-only (Linux `--ro-bind P P`
+        /// in the `bwrap` namespace; macOS Seatbelt `allow file-read*` plus a
+        /// trailing `deny file-write*` on that literal path), and sets the named
+        /// environment variable on the child to that path. The host owns the path,
+        /// so there is no caller-chosen target and no host write to a caller-named
+        /// path. Works on Linux AND macOS — the OS-agnostic mode. For agents whose
+        /// un-overridable config tier is reachable via an env-redirected file
+        /// (Claude `CLAUDE_CODE_MANAGED_SETTINGS_PATH`, Gemini
+        /// `GEMINI_CLI_SYSTEM_SETTINGS_PATH`). The string is the env-var name; the
+        /// host supplies its value.
+        env-pointer(string),
+        /// The host ro-binds the verified snapshot at this absolute in-sandbox
+        /// path (`--ro-bind <snapshot> <path>` in the `bwrap` namespace, which
+        /// creates the mount point, so `path` need not exist on the host). LINUX
+        /// ONLY: rejected on macOS with `invalid-input`, since Seatbelt has no
+        /// mount namespace and materializing at a caller-named host path would be
+        /// an arbitrary host write (escalation). For agents whose enforced tier is
+        /// a FIXED path with no env redirect (Codex `/etc/codex/requirements.toml`).
+        fixed-path(string),
+    }
+
     /// Request to spawn a host process.
     record spawn-request {
         /// Command to execute.
@@ -177,6 +237,13 @@ interface host {
         /// Per-child OS resource ceilings. Applies to EVERY tier.
         /// (NOT YET ENFORCED — see `resource-limits`.)
         limits: option<resource-limits>,
+        /// Read-only files the host exposes inside the child's sandbox. Applies
+        /// to EVERY tier. Each entry hands the host verified, unmodifiable bytes
+        /// plus how the child should find them (see `file-injection` /
+        /// `injection-placement`); empty => no injection. The host never parses
+        /// the bytes; the BLAKE3 hash of each snapshot is recorded in the spawn
+        /// audit.
+        file-injections: list<file-injection>,
 
         // ---- the fields below are honored ONLY by `spawn-persistent`
         //      and ignored by `spawn` / `spawn-background`. ----

@@ -66,6 +66,9 @@ fn known_capabilities_covers_every_admin_request_cap() {
             name: "alice".into(),
             groups: vec![],
             grants: vec![],
+            inherit_from: None,
+            clone_from: None,
+            allow_admin_clone: false,
         },
         AdminRequestKind::AgentDelete {
             principal: p.clone(),
@@ -111,6 +114,18 @@ fn known_capabilities_covers_every_admin_request_cap() {
         AdminRequestKind::CapsRevoke {
             principal: p.clone(),
             capabilities: vec![],
+        },
+        AdminRequestKind::CapsTokenMint {
+            principal: p.clone(),
+            resource: "mcp://server:tool".into(),
+            permission: None,
+            ttl_secs: None,
+        },
+        AdminRequestKind::CapsTokenRevoke {
+            token_id: "00000000-0000-0000-0000-000000000000".into(),
+        },
+        AdminRequestKind::CapsTokenList {
+            principal: p.clone(),
         },
         AdminRequestKind::InviteIssue {
             group: "agent".into(),

@@ -203,8 +203,13 @@ async fn dispatch_capsule(command: crate::cli::CapsuleCommands) -> Result<ExitCo
     use crate::cli::CapsuleCommands;
     match command {
         CapsuleCommands::New(args) => commands::capsule::new::run(&args),
-        CapsuleCommands::Install { source, workspace } => {
-            commands::capsule::install::install_capsule(&source, workspace).await?;
+        CapsuleCommands::Install {
+            source,
+            capsule,
+            workspace,
+        } => {
+            commands::capsule::install::install_capsule(&source, capsule.as_deref(), workspace)
+                .await?;
             Ok(ExitCode::SUCCESS)
         },
         CapsuleCommands::Update { target, workspace } => {
@@ -241,6 +246,12 @@ async fn dispatch_capsule(command: crate::cli::CapsuleCommands) -> Result<ExitCo
         ),
         CapsuleCommands::Config(args) => commands::capsule::config::run(&args),
         CapsuleCommands::Show(args) => commands::capsule::show::run(&args),
+        CapsuleCommands::Run {
+            provider,
+            verb,
+            args,
+        } => commands::capsule_verb::run_explicit(provider, verb, args).await,
+        CapsuleCommands::External(tokens) => commands::capsule_verb::run_external(tokens).await,
     }
 }
 

@@ -99,20 +99,40 @@ pub(super) fn parse_github_source(source: &str) -> Option<(String, String)> {
 // Top-level install dispatch
 // ---------------------------------------------------------------------------
 
-pub(crate) async fn install_capsule(source: &str, workspace: bool) -> anyhow::Result<()> {
-    install_capsule_inner(source, workspace).await
+/// Install a capsule from `source` (the manual `astrid capsule install` path).
+///
+/// `capsule` is the optional `--capsule <name>` selector. When `Some`, a
+/// multi-capsule release installs only `<name>.capsule`; when `None` (the
+/// default), a release ships every `.capsule` asset and all of them are
+/// installed. A single-asset release installs that one either way.
+pub(crate) async fn install_capsule(
+    source: &str,
+    capsule: Option<&str>,
+    workspace: bool,
+) -> anyhow::Result<()> {
+    install_capsule_inner(source, capsule, workspace).await
 }
 
 /// Install a capsule in batch mode (from distro init) — skips import
-/// validation and env prompting.
-pub(crate) async fn install_capsule_batch(source: &str, workspace: bool) -> anyhow::Result<()> {
+/// validation and env prompting. `name_hint` is the distro capsule `name`,
+/// used to pick the right archive when one source ships several (a monorepo
+/// builds/releases one `.capsule` per capsule crate).
+pub(crate) async fn install_capsule_batch(
+    source: &str,
+    name_hint: Option<&str>,
+    workspace: bool,
+) -> anyhow::Result<()> {
     BATCH_MODE.store(true, Ordering::Relaxed);
-    let result = install_capsule_inner(source, workspace).await;
+    let result = install_capsule_inner(source, name_hint, workspace).await;
     BATCH_MODE.store(false, Ordering::Relaxed);
     result
 }
 
-async fn install_capsule_inner(source: &str, workspace: bool) -> anyhow::Result<()> {
+async fn install_capsule_inner(
+    source: &str,
+    name_hint: Option<&str>,
+    workspace: bool,
+) -> anyhow::Result<()> {
     let home = AstridHome::resolve()?;
 
     // 1. Explicit local path — no source tracking (re-fetch doesn't make sense).
@@ -123,12 +143,12 @@ async fn install_capsule_inner(source: &str, workspace: bool) -> anyhow::Result<
     // 2. Namespace alias @org/repo → GitHub.
     if let Some(repo) = source.strip_prefix('@') {
         let url = format!("https://github.com/{repo}");
-        return install_from_github(&url, workspace, &home, Some(source)).await;
+        return install_from_github(&url, workspace, &home, Some(source), name_hint).await;
     }
 
     // 3. Raw GitHub URL.
     if source.starts_with("github.com/") || source.starts_with("https://github.com/") {
-        return install_from_github(source, workspace, &home, Some(source)).await;
+        return install_from_github(source, workspace, &home, Some(source), name_hint).await;
     }
 
     // 4. Fallback: assume local folder.
@@ -144,6 +164,7 @@ async fn install_from_github(
     workspace: bool,
     home: &AstridHome,
     original_source: Option<&str>,
+    name_hint: Option<&str>,
 ) -> anyhow::Result<()> {
     let client = reqwest::Client::builder()
         .user_agent("astrid-cli")
@@ -154,43 +175,141 @@ async fn install_from_github(
         anyhow::anyhow!("Invalid GitHub URL format. Expected github.com/org/repo or @org/repo")
     })?;
 
-    // Priority 1: download a packed `.capsule` archive from the
-    // latest release. The archive contains everything an install
-    // needs (WASM, manifest, bundled WIT definitions).
+    // Priority 1: download packed `.capsule` archive(s) from the latest
+    // release. Each archive contains everything an install needs (WASM,
+    // manifest, bundled WIT definitions).
     let api_url = format!("https://api.github.com/repos/{org}/{repo}/releases/latest");
     if let Ok(response) = client.get(&api_url).send().await
         && response.status().is_success()
         && let Ok(json) = response.json::<serde_json::Value>().await
         && let Some(assets) = json.get("assets").and_then(serde_json::Value::as_array)
     {
-        for asset in assets {
-            if let Some(name) = asset.get("name").and_then(serde_json::Value::as_str)
-                && name.ends_with(".capsule")
-                && let Some(download_url) = asset
-                    .get("browser_download_url")
-                    .and_then(serde_json::Value::as_str)
-            {
-                let tmp_dir = tempfile::tempdir()?;
-                let sanitized_name = Path::new(name).file_name().unwrap_or_default();
-                let download_path = tmp_dir.path().join(sanitized_name);
-                // Stream with 50 MB limit.
-                let mut dl = client.get(download_url).send().await?;
-                let mut bytes = Vec::new();
-                while let Some(chunk) = dl.chunk().await? {
-                    bytes.extend_from_slice(&chunk);
-                    anyhow::ensure!(
-                        bytes.len() <= 50 * 1024 * 1024,
-                        "capsule archive exceeds 50 MB limit",
-                    );
-                }
-                std::fs::write(&download_path, &bytes)?;
-                return unpack_via_lib(&download_path, workspace, home, original_source);
-            }
+        let candidates = capsule_assets(assets);
+        if !candidates.is_empty() {
+            return match name_hint {
+                // Distro path, or manual `--capsule <name>`: install exactly
+                // `<name>.capsule` (a single-asset release installs that one
+                // regardless of the hint, via `pick_capsule`).
+                Some(hint) => {
+                    let names: Vec<&str> = candidates.iter().map(|(n, _)| n.as_str()).collect();
+                    let idx = pick_capsule(&names, Some(hint))?
+                        .expect("non-empty candidates always select an index");
+                    let (name, download_url) = &candidates[idx];
+                    download_and_unpack(
+                        &client,
+                        name,
+                        download_url,
+                        workspace,
+                        home,
+                        original_source,
+                    )
+                    .await
+                },
+                // Manual install with no `--capsule`: install EVERY capsule
+                // the release ships. Best-effort — report which assets fail
+                // but keep going, then fail if any did.
+                None => {
+                    install_all_capsules(&client, &candidates, workspace, home, original_source)
+                        .await
+                },
+            };
         }
     }
 
     // Priority 2: clone + build from source via astrid-build.
-    clone_and_build(url, repo, workspace, home, original_source)
+    clone_and_build(url, repo, workspace, home, original_source, name_hint)
+}
+
+/// Collect every `.capsule` release asset as `(name, download_url)` pairs,
+/// skipping any asset that is not a `.capsule` or lacks a download URL.
+///
+/// Pure over the GitHub release `assets` JSON array so the selection logic is
+/// unit-testable without a live release.
+fn capsule_assets(assets: &[serde_json::Value]) -> Vec<(String, String)> {
+    assets
+        .iter()
+        .filter_map(|asset| {
+            let name = asset.get("name").and_then(serde_json::Value::as_str)?;
+            if !name.ends_with(".capsule") {
+                return None;
+            }
+            let download_url = asset
+                .get("browser_download_url")
+                .and_then(serde_json::Value::as_str)?;
+            Some((name.to_string(), download_url.to_string()))
+        })
+        .collect()
+}
+
+/// Download a single `.capsule` asset (streamed, 50 MB cap) and install it.
+async fn download_and_unpack(
+    client: &reqwest::Client,
+    name: &str,
+    download_url: &str,
+    workspace: bool,
+    home: &AstridHome,
+    original_source: Option<&str>,
+) -> anyhow::Result<()> {
+    let tmp_dir = tempfile::tempdir()?;
+    let sanitized_name = Path::new(name).file_name().unwrap_or_default();
+    let download_path = tmp_dir.path().join(sanitized_name);
+    // Stream with 50 MB limit.
+    let mut dl = client.get(download_url).send().await?;
+    let mut bytes = Vec::new();
+    while let Some(chunk) = dl.chunk().await? {
+        bytes.extend_from_slice(&chunk);
+        anyhow::ensure!(
+            bytes.len() <= 50 * 1024 * 1024,
+            "capsule archive exceeds 50 MB limit",
+        );
+    }
+    std::fs::write(&download_path, &bytes)?;
+    unpack_via_lib(&download_path, workspace, home, original_source)
+}
+
+/// Install every `.capsule` asset in a release (the manual-install default).
+///
+/// Best-effort: each failure is reported with the asset name, but the loop
+/// continues so one bad archive doesn't block the rest. Returns an error if
+/// **any** asset failed, naming all that did — failures are surfaced, never
+/// silently swallowed.
+async fn install_all_capsules(
+    client: &reqwest::Client,
+    candidates: &[(String, String)],
+    workspace: bool,
+    home: &AstridHome,
+    original_source: Option<&str>,
+) -> anyhow::Result<()> {
+    eprintln!("Release ships {} capsule(s):", candidates.len());
+    let mut installed: Vec<&str> = Vec::new();
+    let mut failed: Vec<(&str, String)> = Vec::new();
+    for (name, download_url) in candidates {
+        eprintln!("Installing {name}...");
+        match download_and_unpack(client, name, download_url, workspace, home, original_source)
+            .await
+        {
+            Ok(()) => installed.push(name),
+            Err(e) => {
+                eprintln!("  Failed to install {name}: {e}");
+                failed.push((name, e.to_string()));
+            },
+        }
+    }
+
+    eprintln!(
+        "Done: {} installed, {} failed.",
+        installed.len(),
+        failed.len()
+    );
+    if !failed.is_empty() {
+        let names = failed
+            .iter()
+            .map(|(n, _)| *n)
+            .collect::<Vec<_>>()
+            .join(", ");
+        bail!("failed to install {} capsule(s): {names}", failed.len());
+    }
+    Ok(())
 }
 
 /// Clone a GitHub repository and build the capsule from source using `astrid-build`.
@@ -200,6 +319,7 @@ fn clone_and_build(
     workspace: bool,
     home: &AstridHome,
     original_source: Option<&str>,
+    name_hint: Option<&str>,
 ) -> anyhow::Result<()> {
     let tmp_dir = tempfile::tempdir().context("failed to create temp dir for cloning")?;
     let clone_dir = tmp_dir.path().join(repo);
@@ -230,14 +350,70 @@ fn clone_and_build(
         );
     }
 
+    // Surface (not swallow) a per-entry read error rather than silently
+    // dropping a file with `filter_map(Result::ok)` — a transient I/O or
+    // permissions error on one entry should be reported, not hide a capsule
+    // the operator expects to be installed.
+    let mut produced: Vec<std::path::PathBuf> = Vec::new();
     for entry in std::fs::read_dir(&output_dir)? {
-        let entry = entry?;
-        if entry.path().extension().and_then(|s| s.to_str()) == Some("capsule") {
-            return unpack_via_lib(&entry.path(), workspace, home, original_source);
+        let entry = match entry {
+            Ok(e) => e,
+            Err(err) => {
+                eprintln!("warning: skipping unreadable build-output entry: {err}");
+                continue;
+            },
+        };
+        let path = entry.path();
+        if path.extension().and_then(|s| s.to_str()) == Some("capsule") {
+            produced.push(path);
         }
     }
+    let names: Vec<&str> = produced
+        .iter()
+        .map(|p| p.file_name().and_then(|n| n.to_str()).unwrap_or(""))
+        .collect();
+    if let Some(idx) = pick_capsule(&names, name_hint)? {
+        return unpack_via_lib(&produced[idx], workspace, home, original_source);
+    }
 
-    bail!("Universal Migrator failed to produce a .capsule archive.");
+    bail!("astrid-build produced no .capsule archive.");
+}
+
+/// Choose which `.capsule` to install when a source yields several. A monorepo
+/// builds/releases one archive per capsule crate, named `<capsule>.capsule`, so
+/// picking "the first" would install the wrong one. Returns the index into
+/// `names` of the chosen archive.
+///
+/// * none        -> `Ok(None)` (caller falls back, e.g. release -> clone+build).
+/// * exactly one -> `Ok(Some(0))` — unambiguous; `name_hint` is irrelevant.
+/// * several     -> the one named `<name_hint>.capsule`. Without a hint, or with
+///   no matching name, refuse rather than silently install the wrong capsule.
+fn pick_capsule(names: &[&str], name_hint: Option<&str>) -> anyhow::Result<Option<usize>> {
+    match names {
+        [] => Ok(None),
+        [_] => Ok(Some(0)),
+        many => {
+            let Some(hint) = name_hint else {
+                bail!(
+                    "source produced {} .capsule archives but no capsule name to pick one; \
+                     expected an archive named '<capsule>.capsule'",
+                    many.len()
+                );
+            };
+            // Match the hint against each candidate's stem via `strip_suffix`
+            // (no per-call allocation) rather than `format!`-ing the target.
+            match many
+                .iter()
+                .position(|n| n.strip_suffix(".capsule") == Some(hint))
+            {
+                Some(idx) => Ok(Some(idx)),
+                None => bail!(
+                    "no '.capsule' archive named '{hint}.capsule' among [{}]",
+                    many.join(", ")
+                ),
+            }
+        },
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -382,11 +558,35 @@ where
 fn finish_install(output: &InstallOutput, _home: &AstridHome) -> anyhow::Result<()> {
     let batch = BATCH_MODE.load(Ordering::Relaxed);
 
+    // Load the manifest once (always present post-install) — used both for
+    // env prompting and for surfacing the CLI commands this capsule adds.
+    let manifest_path = output.target_dir.join("Capsule.toml");
+    let manifest = astrid_capsule::discovery::load_manifest(&manifest_path)
+        .context("re-reading manifest for post-install diagnostics")?;
+
+    // Visibility (no approval gate in this phase): if the capsule declares
+    // any `kind = "cli"` commands, list the new top-level `astrid capsule
+    // <verb>` verbs it adds so the operator knows what just became
+    // invocable. Printed adjacent to the other manifest-derived notices.
+    let capsule_id = output.target_dir.file_name().map_or_else(
+        || "capsule".to_string(),
+        |n| n.to_string_lossy().into_owned(),
+    );
+    let cli_commands: Vec<&astrid_capsule::manifest::CommandDef> = manifest
+        .commands
+        .iter()
+        .filter(|c| c.kind == astrid_core::kernel_api::CommandKind::Cli)
+        .collect();
+    if !cli_commands.is_empty() {
+        eprintln!();
+        eprintln!("This capsule adds CLI commands:");
+        for c in cli_commands {
+            let desc = c.description.as_deref().unwrap_or("(no description)");
+            eprintln!("  {} — {desc} (provider: {capsule_id})", c.name);
+        }
+    }
+
     if !batch && output.env_needs_prompt {
-        // Load manifest from the target (always present post-install).
-        let manifest_path = output.target_dir.join("Capsule.toml");
-        let manifest = astrid_capsule::discovery::load_manifest(&manifest_path)
-            .context("re-reading manifest for env prompts")?;
         prompt_env_fields(&manifest.env, &output.env_path)?;
     }
 
@@ -546,6 +746,103 @@ mod tests {
             Some("capsule.WASM"),
             "should match .WASM case-insensitively"
         );
+    }
+
+    #[test]
+    fn pick_capsule_none_when_empty() {
+        assert!(matches!(pick_capsule(&[], Some("sage")), Ok(None)));
+    }
+
+    #[test]
+    fn pick_capsule_single_is_unambiguous() {
+        // A lone archive is used regardless of name — a single-capsule repo's
+        // asset need not match the requested capsule name.
+        assert_eq!(
+            pick_capsule(&["whatever.capsule"], Some("sage")).unwrap(),
+            Some(0)
+        );
+        assert_eq!(pick_capsule(&["whatever.capsule"], None).unwrap(), Some(0));
+    }
+
+    #[test]
+    fn pick_capsule_several_matches_by_exact_name() {
+        let names = ["sage.capsule", "sage-mcp.capsule", "sage-install.capsule"];
+        assert_eq!(pick_capsule(&names, Some("sage-mcp")).unwrap(), Some(1));
+        // exact match — "sage" must NOT collide with "sage-mcp.capsule"
+        assert_eq!(pick_capsule(&names, Some("sage")).unwrap(), Some(0));
+        assert_eq!(pick_capsule(&names, Some("sage-install")).unwrap(), Some(2));
+    }
+
+    #[test]
+    fn pick_capsule_several_without_hint_errors() {
+        assert!(pick_capsule(&["a.capsule", "b.capsule"], None).is_err());
+    }
+
+    #[test]
+    fn pick_capsule_several_no_match_errors() {
+        assert!(pick_capsule(&["a.capsule", "b.capsule"], Some("c")).is_err());
+    }
+
+    #[test]
+    fn capsule_assets_collects_all_capsule_entries() {
+        let assets = vec![
+            serde_json::json!({
+                "name": "sage.capsule",
+                "browser_download_url": "https://example.com/sage.capsule"
+            }),
+            serde_json::json!({
+                "name": "sage-mcp.capsule",
+                "browser_download_url": "https://example.com/sage-mcp.capsule"
+            }),
+        ];
+        let got = capsule_assets(&assets);
+        assert_eq!(
+            got,
+            vec![
+                (
+                    "sage.capsule".to_string(),
+                    "https://example.com/sage.capsule".to_string()
+                ),
+                (
+                    "sage-mcp.capsule".to_string(),
+                    "https://example.com/sage-mcp.capsule".to_string()
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn capsule_assets_skips_non_capsule_and_urlless() {
+        let assets = vec![
+            serde_json::json!({
+                "name": "release-notes.txt",
+                "browser_download_url": "https://example.com/release-notes.txt"
+            }),
+            serde_json::json!({
+                "name": "cli.capsule",
+                "browser_download_url": "https://example.com/cli.capsule"
+            }),
+            serde_json::json!({ "name": "checksums.sha256" }),
+            // `.capsule` asset with no download URL is skipped, not panicked on.
+            serde_json::json!({ "name": "broken.capsule" }),
+        ];
+        let got = capsule_assets(&assets);
+        assert_eq!(
+            got,
+            vec![(
+                "cli.capsule".to_string(),
+                "https://example.com/cli.capsule".to_string()
+            )]
+        );
+    }
+
+    #[test]
+    fn capsule_assets_empty_when_no_capsule_assets() {
+        let assets = vec![serde_json::json!({
+            "name": "binary.tar.gz",
+            "browser_download_url": "https://example.com/binary.tar.gz"
+        })];
+        assert!(capsule_assets(&assets).is_empty());
     }
 
     #[test]

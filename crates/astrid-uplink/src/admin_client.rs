@@ -64,6 +64,9 @@ pub const fn topic_suffix(req: &AdminRequestKind) -> &'static str {
         AdminRequestKind::GroupList => "group.list",
         AdminRequestKind::CapsGrant { .. } => "caps.grant",
         AdminRequestKind::CapsRevoke { .. } => "caps.revoke",
+        AdminRequestKind::CapsTokenMint { .. } => "caps.token.mint",
+        AdminRequestKind::CapsTokenRevoke { .. } => "caps.token.revoke",
+        AdminRequestKind::CapsTokenList { .. } => "caps.token.list",
         AdminRequestKind::InviteIssue { .. } => "invite.issue",
         AdminRequestKind::InviteRedeem { .. } => "invite.redeem",
         AdminRequestKind::InviteList => "invite.list",
@@ -104,7 +107,7 @@ impl AdminClient {
     /// connection fails, or the handshake is rejected.
     pub async fn connect(caller: PrincipalId) -> Result<Self> {
         let session_id = astrid_core::SessionId::from_uuid(Uuid::new_v4());
-        let inner = SocketClient::connect(session_id)
+        let inner = SocketClient::connect(session_id, caller.clone())
             .await
             .context("Failed to connect to Astrid daemon. Run `astrid start` to launch it.")?;
         Ok(Self {
@@ -257,6 +260,9 @@ mod tests {
                 name: "x".into(),
                 groups: vec![],
                 grants: vec![],
+                inherit_from: None,
+                clone_from: None,
+                allow_admin_clone: false,
             }),
             "agent.create"
         );

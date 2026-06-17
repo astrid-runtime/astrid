@@ -21,18 +21,25 @@
 //! quotas set, group definition) for forensic replay without diffing
 //! `profile.toml` snapshots.
 
+mod caps_tokens;
 #[cfg(test)]
 mod enforcement_tests;
+mod group;
 mod handlers;
+mod inheritance;
 mod invite_handlers;
 mod pair_device_handlers;
 mod quota;
 #[cfg(test)]
 mod state_tests;
 #[cfg(test)]
+mod state_tests_agent_clone;
+#[cfg(test)]
 mod state_tests_agent_modify;
 #[cfg(test)]
 mod state_tests_caps;
+#[cfg(test)]
+mod state_tests_caps_tokens;
 #[cfg(test)]
 mod state_tests_usage;
 #[cfg(test)]
@@ -165,6 +172,9 @@ pub fn resolve_admin_scope(req: &AdminRequestKind, caller: &PrincipalId) -> Auth
         | AdminRequestKind::GroupModify { .. }
         | AdminRequestKind::CapsGrant { .. }
         | AdminRequestKind::CapsRevoke { .. }
+        | AdminRequestKind::CapsTokenMint { .. }
+        | AdminRequestKind::CapsTokenRevoke { .. }
+        | AdminRequestKind::CapsTokenList { .. }
         | AdminRequestKind::InviteIssue { .. }
         | AdminRequestKind::InviteRedeem { .. }
         | AdminRequestKind::InviteList
@@ -219,6 +229,13 @@ pub fn required_capability_for_admin_request(
         (AdminRequestKind::GroupList, AuthorityScope::Global) => "group:list",
         (AdminRequestKind::CapsGrant { .. }, _) => "caps:grant",
         (AdminRequestKind::CapsRevoke { .. }, _) => "caps:revoke",
+        // Token lifecycle is admin-meta: minting a token that bypasses
+        // approval is an escalation primitive, so it is gated identically to
+        // `caps:grant` (Global, no `self:` form). A scoped `agent` principal
+        // must never hold these — only the `admin` group's `*` confers them.
+        (AdminRequestKind::CapsTokenMint { .. }, _) => "caps:token:mint",
+        (AdminRequestKind::CapsTokenRevoke { .. }, _) => "caps:token:revoke",
+        (AdminRequestKind::CapsTokenList { .. }, _) => "caps:token:list",
         (AdminRequestKind::InviteIssue { .. }, _) => "invite:issue",
         // `InviteRedeem` is special-cased in `handle_admin_request`
         // below — the dispatcher bypasses the capability preamble
@@ -259,6 +276,9 @@ pub fn admin_request_method(req: &AdminRequestKind) -> &'static str {
         AdminRequestKind::GroupList => "admin.group.list",
         AdminRequestKind::CapsGrant { .. } => "admin.caps.grant",
         AdminRequestKind::CapsRevoke { .. } => "admin.caps.revoke",
+        AdminRequestKind::CapsTokenMint { .. } => "admin.caps.token.mint",
+        AdminRequestKind::CapsTokenRevoke { .. } => "admin.caps.token.revoke",
+        AdminRequestKind::CapsTokenList { .. } => "admin.caps.token.list",
         AdminRequestKind::InviteIssue { .. } => "admin.invite.issue",
         AdminRequestKind::InviteRedeem { .. } => "admin.invite.redeem",
         AdminRequestKind::InviteList => "admin.invite.list",
@@ -362,8 +382,13 @@ pub fn admin_target_principal(req: &AdminRequestKind) -> Option<&PrincipalId> {
         | AdminRequestKind::QuotaGet { principal }
         | AdminRequestKind::UsageGet { principal }
         | AdminRequestKind::CapsGrant { principal, .. }
-        | AdminRequestKind::CapsRevoke { principal, .. } => Some(principal),
-        AdminRequestKind::AgentCreate { .. }
+        | AdminRequestKind::CapsRevoke { principal, .. }
+        | AdminRequestKind::CapsTokenMint { principal, .. }
+        | AdminRequestKind::CapsTokenList { principal } => Some(principal),
+        // `CapsTokenRevoke` carries a token id, not a principal — the token's
+        // owner is recovered from the store, not the request body.
+        AdminRequestKind::CapsTokenRevoke { .. }
+        | AdminRequestKind::AgentCreate { .. }
         | AdminRequestKind::AgentList
         | AdminRequestKind::GroupCreate { .. }
         | AdminRequestKind::GroupDelete { .. }

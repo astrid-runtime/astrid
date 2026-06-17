@@ -102,6 +102,32 @@ pub(crate) struct CreateArgs {
     /// Non-interactive mode (accept defaults).
     #[arg(short = 'y', long)]
     pub yes: bool,
+    /// Copy env, KV, and secrets from this principal (default: inherit
+    /// nothing). The named principal's `.config/env/`, per-capsule KV
+    /// namespaces, and per-capsule secret files are copied into the new
+    /// agent. Omit to provision a clean, least-privilege agent.
+    #[arg(long = "inherit-from", value_name = "PRINCIPAL")]
+    pub inherit_from: Option<String>,
+    /// Clone an existing principal: a full replica of its capability profile
+    /// (groups, grants, revokes, egress, process allow-list, quotas) AND its
+    /// state (env/KV/secrets, exactly as `--inherit-from`). An exact copy —
+    /// customize afterward with `caps grant` / `quota set` / `agent modify`.
+    /// Mutually exclusive with the profile/quota-shaping flags. Cloning a
+    /// source that confers admin (`*`) requires `--unsafe-admin`.
+    #[arg(
+        long = "clone",
+        value_name = "PRINCIPAL",
+        conflicts_with_all = [
+            "groups", "egress", "process_allow", "inherit_from",
+            "memory", "timeout", "storage", "processes"
+        ]
+    )]
+    pub clone_from: Option<String>,
+    /// Acknowledge cloning an admin-conferring source (one that resolves to
+    /// the universal `*`). Required by `--clone <admin-source>`; mirrors the
+    /// `--unsafe-admin` flag on `caps grant` / `group create`.
+    #[arg(long = "unsafe-admin", requires = "clone_from")]
+    pub unsafe_admin: bool,
 
     // ── Deferred delegation flags (#656) ─────────────────────────────
     /// Delegation parent agent (deferred — see #656).
@@ -278,6 +304,20 @@ async fn run_create(mut args: CreateArgs) -> Result<ExitCode> {
     let principal = PrincipalId::new(&args.name).context("invalid agent name")?;
     let quota_updates = parse_quota_flags(&args)?;
     let caps_to_grant = build_caps_to_grant(&args)?;
+    // Validate the inheritance source client-side so a typo fails the
+    // whole command before any IPC, matching how `name` is handled.
+    let inherit_from = args
+        .inherit_from
+        .as_deref()
+        .map(PrincipalId::new)
+        .transpose()
+        .context("invalid --inherit-from principal")?;
+    let clone_from = args
+        .clone_from
+        .as_deref()
+        .map(PrincipalId::new)
+        .transpose()
+        .context("invalid --clone principal")?;
 
     // Empty defaults to the kernel's `agent` group (Layer 6 default).
     // Pass empty so the kernel applies the default rather than the CLI
@@ -296,6 +336,9 @@ async fn run_create(mut args: CreateArgs) -> Result<ExitCode> {
             name: args.name.clone(),
             groups,
             grants: caps_to_grant,
+            inherit_from,
+            clone_from,
+            allow_admin_clone: args.unsafe_admin,
         })
         .await?;
     let _ = into_result(body)?;
@@ -780,6 +823,9 @@ mod tests {
             storage: None,
             processes: None,
             yes: true,
+            inherit_from: None,
+            clone_from: None,
+            unsafe_admin: false,
             spawned_by: Some("parent".into()),
             budget_voucher: None,
             grant_access: None,
@@ -805,6 +851,9 @@ mod tests {
             storage: None,
             processes: None,
             yes: true,
+            inherit_from: None,
+            clone_from: None,
+            unsafe_admin: false,
             spawned_by: None,
             budget_voucher: None,
             grant_access: None,

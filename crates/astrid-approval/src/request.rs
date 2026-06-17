@@ -143,7 +143,8 @@ pub enum ApprovalDecision {
     /// workspace directory. Full persistence (state.db) comes in Step 4;
     /// for now they live in `AllowanceStore` as non-session entries.
     ApproveWorkspace,
-    /// Allow always — creates a persistent `CapabilityToken` (1h default TTL).
+    /// Allow always — creates a persistent, permanent `CapabilityToken`
+    /// (no TTL; valid until explicitly revoked).
     ///
     /// Unlike session allowances (in-memory), this creates a cryptographically
     /// signed capability token with an `approval_audit_id` chain-link.

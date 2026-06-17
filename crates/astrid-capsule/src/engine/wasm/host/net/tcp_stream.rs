@@ -61,6 +61,25 @@ impl HostTcpStream for HostState {
             // Closed terminates the read loop cleanly.
             None => Ok(NetReadStatus::Closed),
         };
+        // ENFORCEMENT side of the per-connection principal registry
+        // (issue #45/#852): when this framed read pulls a client frame off a
+        // kernel-bound connection, record that connection's verified principal
+        // so the uplink's subsequent `publish-as` stamps THAT principal in place
+        // of the capsule-supplied name (the self-stamp fix). A non-data read
+        // (closed / pending) clears it, so a stale principal can never leak onto
+        // a later forward. Gated on the uplink capability: only the uplink
+        // forwards client frames, and only its accept path ever binds an entry,
+        // so a non-uplink read stays inert and skips the registry lookup.
+        if self.has_uplink_capability {
+            let bound = match &result {
+                Ok(NetReadStatus::Data(_)) => self
+                    .connection_principals
+                    .get(&self_.rep())
+                    .map(|entry| entry.clone()),
+                _ => None,
+            };
+            self.ingress_principal = bound;
+        }
         let bytes = match &result {
             Ok(NetReadStatus::Data(d)) => d.len() as u64,
             _ => 0,
@@ -403,13 +422,19 @@ impl HostTcpStream for HostState {
     }
 
     fn drop(&mut self, rep: Resource<TcpStream>) -> wasmtime::Result<()> {
+        let table_rep = rep.rep();
         if self
             .resource_table
-            .delete::<NetStream>(Resource::new_own(rep.rep()))
+            .delete::<NetStream>(Resource::new_own(table_rep))
             .is_ok()
         {
             self.net_stream_count = self.net_stream_count.saturating_sub(1);
         }
+        // Drop any verified per-connection principal binding (issue #45/#852)
+        // so the registry does not leak entries for closed connections. A
+        // no-op for outbound TCP streams (never bound) and for unauthenticated
+        // unix connections.
+        self.unbind_connection_principal(table_rep);
         Ok(())
     }
 }
@@ -474,5 +499,111 @@ mod tests {
         // Timeouts are NOT peer disconnect — capsule can retry.
         let e = io::Error::new(io::ErrorKind::TimedOut, "slow");
         assert!(matches!(map_write_frame_err(&e), ErrorCode::Unknown(_)));
+    }
+
+    /// ENFORCEMENT wiring for the per-connection principal registry
+    /// (issue #45/#852): a framed read off a kernel-bound connection must
+    /// record that connection's verified principal in
+    /// [`HostState::ingress_principal`], and a non-data read must clear it.
+    ///
+    /// This guards the link DIRECTLY rather than via a manually-set field: the
+    /// `publish-as` override in `host/ipc.rs` consumes `ingress_principal`, so
+    /// if this read never populated it the override would silently fall back to
+    /// the capsule-supplied (forgeable) name and the self-stamp hole would
+    /// reopen — with `publish-as`-level tests still green. A socketpair stands
+    /// in for an accepted client connection; it binds no filesystem path, so it
+    /// works under the sandbox (unlike a named Unix socket).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn framed_read_records_then_clears_verified_ingress_principal() {
+        use tokio::io::AsyncWriteExt;
+
+        use crate::engine::wasm::host_state::NetStream;
+        use crate::engine::wasm::test_fixtures::minimal_host_state;
+
+        let rt = tokio::runtime::Handle::current();
+        let mut state = minimal_host_state(rt);
+        // Only the uplink records ingress principals (and only its accept path
+        // ever binds an entry).
+        state.has_uplink_capability = true;
+
+        let (host_end, mut peer) = tokio::net::UnixStream::pair().expect("socketpair");
+        let net = NetStream::Unix(std::sync::Arc::new(tokio::sync::Mutex::new(host_end)));
+        let rep = state.resource_table.push(net).expect("push stream").rep();
+
+        // The handshake bound this connection to `claude` (Path 2 crypto, or a
+        // Path 1 daemon spawn-binding).
+        let claude = astrid_core::PrincipalId::new("claude").unwrap();
+        state.bind_connection_principal(rep, claude.clone());
+
+        // Peer sends one length-prefixed frame (4-byte BE length + payload).
+        let payload = br#"{"topic":"client.v1.connect","payload":{}}"#;
+        peer.write_all(&(payload.len() as u32).to_be_bytes())
+            .await
+            .unwrap();
+        peer.write_all(payload).await.unwrap();
+        peer.flush().await.unwrap();
+
+        // A data read records the connection's verified principal.
+        let status = HostTcpStream::read(&mut state, Resource::new_borrow(rep))
+            .expect("read should succeed");
+        assert!(
+            matches!(status, NetReadStatus::Data(_)),
+            "expected a data frame, got {status:?}"
+        );
+        assert_eq!(
+            state.ingress_principal,
+            Some(claude),
+            "a data read on a kernel-bound connection must record its verified principal"
+        );
+
+        // A subsequent non-data read (no more frames → pending) clears it, so a
+        // stale principal can never leak onto a later forward.
+        let status = HostTcpStream::read(&mut state, Resource::new_borrow(rep))
+            .expect("read should succeed");
+        assert!(
+            matches!(status, NetReadStatus::Pending),
+            "expected pending, got {status:?}"
+        );
+        assert_eq!(
+            state.ingress_principal, None,
+            "a non-data read must clear the in-flight ingress principal"
+        );
+    }
+
+    /// A non-uplink capsule never records an ingress principal even when it
+    /// reads a (hypothetically) bound stream — the gate keeps the registry
+    /// lookup off every non-uplink framed read and prevents any cross-capsule
+    /// principal bleed through `ingress_principal`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn framed_read_is_inert_without_uplink_capability() {
+        use tokio::io::AsyncWriteExt;
+
+        use crate::engine::wasm::host_state::NetStream;
+        use crate::engine::wasm::test_fixtures::minimal_host_state;
+
+        let rt = tokio::runtime::Handle::current();
+        let mut state = minimal_host_state(rt);
+        // No uplink capability — the default.
+        assert!(!state.has_uplink_capability);
+
+        let (host_end, mut peer) = tokio::net::UnixStream::pair().expect("socketpair");
+        let net = NetStream::Unix(std::sync::Arc::new(tokio::sync::Mutex::new(host_end)));
+        let rep = state.resource_table.push(net).expect("push stream").rep();
+        state.bind_connection_principal(rep, astrid_core::PrincipalId::new("claude").unwrap());
+
+        let payload = br#"{"topic":"x","payload":{}}"#;
+        peer.write_all(&(payload.len() as u32).to_be_bytes())
+            .await
+            .unwrap();
+        peer.write_all(payload).await.unwrap();
+        peer.flush().await.unwrap();
+
+        let status = HostTcpStream::read(&mut state, Resource::new_borrow(rep))
+            .expect("read should succeed");
+        assert!(matches!(status, NetReadStatus::Data(_)));
+        assert_eq!(
+            state.ingress_principal, None,
+            "a non-uplink read must not populate the ingress principal"
+        );
     }
 }

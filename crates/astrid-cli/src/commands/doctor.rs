@@ -113,9 +113,12 @@ fn check_fail(name: &str, detail: &str) {
 
 async fn daemon_roundtrip() -> Result<()> {
     let session = astrid_core::SessionId::from_uuid(Uuid::new_v4());
-    let mut client = tokio::time::timeout(Duration::from_secs(5), SocketClient::connect(session))
-        .await
-        .map_err(|_| anyhow::anyhow!("connection timed out after 5s"))??;
+    let mut client = tokio::time::timeout(
+        Duration::from_secs(5),
+        SocketClient::connect(session, crate::principal::current()),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("connection timed out after 5s"))??;
     let req = astrid_core::kernel_api::KernelRequest::GetStatus;
     let val = serde_json::to_value(req)?;
     let msg = astrid_types::ipc::IpcMessage::new(

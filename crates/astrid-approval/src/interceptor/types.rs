@@ -1,9 +1,5 @@
 use astrid_audit::AuditEntryId;
 use astrid_core::types::TokenId;
-use chrono::Duration;
-
-/// Default TTL for "Allow Always" capability tokens (1 hour).
-pub(crate) const ALLOW_ALWAYS_DEFAULT_TTL: Duration = Duration::hours(1);
 
 /// Budget warning info to surface to the user.
 #[derive(Debug, Clone)]

@@ -45,7 +45,7 @@ use crate::manifest_check::{
 use crate::meta::{CapsuleMeta, read_meta, write_meta};
 use crate::paths::{resolve_env_path, resolve_target_dir, restore_env_from_backup};
 use crate::wasm::{WasmAddressed, content_address_wasm};
-use crate::wit::{content_address_wit, version_map_to_strings};
+use crate::wit::{content_address_wit, materialize_wit_mirror, version_map_to_strings};
 
 /// Knobs passed to [`install_from_local_path`].
 #[derive(Default)]
@@ -244,6 +244,22 @@ pub fn install_from_local_path(
     if let Err(e) = write_meta(&target_dir, &meta) {
         rollback(&target_dir, backup_dir.as_deref());
         return Err(e);
+    }
+
+    // Mirror the capsule's WIT into the principal's `home://wit/` so the
+    // system capsule's `list_interfaces` / `read_interface` tools can
+    // read it — the canonical content store is BLAKE3-keyed and outside
+    // any VFS scheme a capsule can reach. Best-effort: the capsule is
+    // already installed and committed, so a mirror failure must not roll
+    // it back. It degrades introspection visibility, not the install.
+    if let Err(e) =
+        materialize_wit_mirror(home, &crate::paths::install_principal(), &meta.wit_files)
+    {
+        tracing::warn!(
+            capsule = %id,
+            error = %format!("{e:#}"),
+            "failed to materialize home://wit mirror; introspection tools may not see this capsule's interfaces"
+        );
     }
 
     // Determine env-prompt signal for the caller.

@@ -378,8 +378,14 @@ pub(crate) fn handle_daemon_event(app: &mut App, message: &IpcMessage) {
                 },
             ];
 
-            // Append all dynamically discovered capsule commands
+            // Append all dynamically discovered capsule commands. Only
+            // slash-kind commands belong in the slash palette; CLI verbs
+            // (`kind = "cli"`) are top-level `astrid capsule <verb>`
+            // subcommands and must not appear as in-TUI slash commands.
             for cmd in &cmds {
+                if cmd.kind != astrid_core::kernel_api::CommandKind::Slash {
+                    continue;
+                }
                 app.slash_commands.push(state::SlashCommandDef {
                     name: format!("/{}", cmd.name),
                     description: format!("{} (via {})", cmd.description, cmd.provider_capsule),
@@ -613,7 +619,7 @@ async fn handle_pending_actions(
                 answers,
             } => {
                 if let Ok(home) = astrid_core::dirs::AstridHome::resolve() {
-                    let principal = astrid_core::PrincipalId::default();
+                    let principal = crate::principal::current();
                     let ph = home.principal_home(&principal);
                     let env_path = ph.env_dir().join(format!("{capsule_id}.env.json"));
                     if let Ok(json) = serde_json::to_string_pretty(&answers) {
@@ -710,7 +716,8 @@ async fn handle_slash_command(
                 // Force a redraw before starting blocking task
                 let _ = terminal.draw(|frame| render::render_frame(frame, app));
 
-                match crate::commands::capsule::install::install_capsule(source, false).await {
+                match crate::commands::capsule::install::install_capsule(source, None, false).await
+                {
                     Ok(()) => {
                         let success_msg =
                             "Installation complete. Sending refresh signal to Kernel...";

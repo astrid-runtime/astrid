@@ -67,6 +67,7 @@ fn params(
         max_lifetime_ms: None,
         idle_timeout_ms: None,
         exit_retention_ms: None,
+        injection_guard: None,
     }
 }
 
@@ -295,6 +296,7 @@ async fn write_stdin_delivers_survives_reset_and_close_eofs() {
         max_lifetime_ms: None,
         idle_timeout_ms: None,
         exit_retention_ms: None,
+        injection_guard: None,
     };
     let id = reg
         .spawn(spawn_params)

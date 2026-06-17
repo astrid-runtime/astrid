@@ -40,6 +40,23 @@ fn validate_sandbox_str<'a>(path: &'a Path, label: &str) -> io::Result<&'a str> 
     Ok(s)
 }
 
+/// A host-verified, read-only file the sandbox materializes inside a spawned
+/// child. `source` is the host-owned path the verified snapshot already lives
+/// at (the in-sandbox bytes are bound/copied FROM here); `target` is the
+/// absolute path inside the child's sandbox at which it reads those bytes.
+///
+/// The caller is responsible for ensuring `source` is a host-owned location
+/// the child and the spawning principal's capsule fs surface cannot write —
+/// the sandbox layer only wires the read-only exposure, it does not snapshot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RoInjection {
+    /// Host-owned path holding the verified snapshot bytes (the bind source on
+    /// Linux; the materialized literal on macOS — equal to `target` there).
+    pub source: PathBuf,
+    /// Absolute path inside the child's sandbox at which it reads the bytes.
+    pub target: PathBuf,
+}
+
 /// Wraps a standard OS command in a native kernel sandbox (bwrap or Seatbelt).
 ///
 /// Ensures that agent-executed native tools are restricted from accessing
@@ -61,11 +78,142 @@ impl SandboxCommand {
     /// backslash, or null byte).
     #[allow(clippy::needless_pass_by_value)] // Moved on the unsupported-OS passthrough arm; borrowed on Linux/macOS.
     pub fn wrap(inner_cmd: Command, worktree_path: &Path) -> io::Result<Command> {
+        Self::wrap_with_injections(inner_cmd, worktree_path, &[])
+    }
+
+    /// Astrid-home subpaths that hold cross-principal secret material or kernel
+    /// state and must never be readable by a spawned native process. Masked in
+    /// every sandboxed spawn (issue #856 — bwrap's `--ro-bind / /` mounts the
+    /// whole host filesystem read-only, which exposed these): `keys/` (ed25519
+    /// private keys → principal impersonation), `secrets/` (the secret store →
+    /// credential theft), and `var/` (the kernel state DB → every principal's
+    /// KV). `run/` (socket + token) and `etc/` (config) are deliberately left
+    /// reachable so a spawned agent can still reach the daemon; once fd-passing
+    /// (issue #45/#852) lets the agent drop direct socket access, the whole home
+    /// is masked instead.
+    ///
+    /// # Errors
+    /// Propagates a failure to locate the Astrid home — a spawn whose security
+    /// boundary cannot be established is refused (fail-secure), mirroring the
+    /// MCP-server spawn path (`astrid-mcp`'s `with_hidden(astrid_home)`).
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn sensitive_astrid_paths() -> io::Result<Vec<PathBuf>> {
+        let home = astrid_core::dirs::AstridHome::resolve()?;
+        Ok(Self::sensitive_astrid_paths_in(&home))
+    }
+
+    /// The masked set for a given home, filtered to paths that exist on disk.
+    ///
+    /// `secrets/` is created lazily on the first secret write (it is NOT in
+    /// [`AstridHome::ensure`](astrid_core::dirs::AstridHome::ensure)), so on a
+    /// fresh install it may be absent at spawn time. bwrap's `--tmpfs` mounts
+    /// the target over the read-only root bind and fails to `mkdir` a missing
+    /// mount point, which would abort every sandboxed spawn. Skipping a
+    /// non-existent dir is fail-safe: an absent dir holds no bytes to mask.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn sensitive_astrid_paths_in(home: &astrid_core::dirs::AstridHome) -> Vec<PathBuf> {
+        vec![home.keys_dir(), home.secrets_dir(), home.var_dir()]
+            .into_iter()
+            .filter(|p| p.exists())
+            .collect()
+    }
+
+    /// Well-known credential / secret-material directories under the operator's
+    /// home that a spawned native agent must never read (issue #856: bwrap's
+    /// `--ro-bind / /` otherwise exposes the operator's SSH / cloud / GPG /
+    /// registry credentials to the agent). Resolved from `$HOME`; filtered to
+    /// existing paths (an absent dir holds nothing to mask, and a missing
+    /// `--tmpfs` mount point would abort the spawn). A spawned agent that
+    /// legitimately needs one of these is a future per-agent opt-out, not the
+    /// default. This is a credential deny-list, not full home isolation —
+    /// hiding arbitrary sibling projects is the separate allow-list change.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn sensitive_home_paths() -> Vec<PathBuf> {
+        std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .map(|home| Self::sensitive_home_paths_in(&home))
+            .unwrap_or_default()
+    }
+
+    /// The home credential deny-list rooted at `home`, filtered to existing
+    /// paths. Split out from [`sensitive_home_paths`](Self::sensitive_home_paths)
+    /// so the set is testable against a controlled directory.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn sensitive_home_paths_in(home: &Path) -> Vec<PathBuf> {
+        [
+            ".ssh",           // SSH private keys + known_hosts
+            ".aws",           // AWS access keys
+            ".gnupg",         // GPG private keyrings
+            ".netrc",         // machine login credentials
+            ".docker",        // registry auth tokens
+            ".kube",          // kubeconfig credentials
+            ".config/gcloud", // GCP credentials
+        ]
+        .into_iter()
+        .map(|rel| home.join(rel))
+        .filter(|p| p.exists())
+        .collect()
+    }
+
+    /// The full set of paths masked in every sandboxed spawn: Astrid's own
+    /// secret / key / state dirs plus the operator's home credential stores.
+    /// Both `wrap_with_injections` arms consume this.
+    ///
+    /// # Errors
+    /// Propagates a failure to locate the Astrid home (see
+    /// [`sensitive_astrid_paths`](Self::sensitive_astrid_paths)).
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn masked_paths() -> io::Result<Vec<PathBuf>> {
+        let mut masked = Self::sensitive_astrid_paths()?;
+        masked.extend(Self::sensitive_home_paths());
+        Ok(masked)
+    }
+
+    /// Append the bwrap arguments that shadow `masked` so the spawned process
+    /// reads nothing through it: an empty `--tmpfs` over a directory, or a
+    /// read-only bind of `/dev/null` over a regular file. `--tmpfs` on a file
+    /// fails with `ENOTDIR` (a tmpfs is a directory filesystem), which would
+    /// abort every spawn for any operator who has, e.g., a `~/.netrc`. Callers
+    /// pass only existing paths (`masked_paths` is existence-filtered), so the
+    /// `is_dir` probe is reliable.
+    #[cfg(target_os = "linux")]
+    fn push_mask_arg(bwrap: &mut Command, masked: &Path) {
+        if masked.is_dir() {
+            bwrap.arg("--tmpfs").arg(masked);
+        } else {
+            bwrap.arg("--ro-bind").arg("/dev/null").arg(masked);
+        }
+    }
+
+    /// Like [`wrap`](Self::wrap), but additionally exposes a set of
+    /// host-verified, READ-ONLY files at chosen paths inside the child's
+    /// sandbox. Each [`RoInjection`] binds the host-owned bytes at `source` so
+    /// the child reads them at `target` but neither it nor a subprocess it
+    /// spawns can modify them. An empty `injections` slice is byte-for-byte
+    /// identical to [`wrap`](Self::wrap).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the worktree path or any injection `source` /
+    /// `target` is not absolute, not valid UTF-8, or contains characters unsafe
+    /// for SBPL interpolation (double-quote, backslash, or null byte); or, on a
+    /// platform without an OS-level sandbox, if `injections` is non-empty (the
+    /// read-only guarantee cannot be enforced without a sandbox — fail-secure).
+    #[allow(clippy::needless_pass_by_value)] // Moved on the unsupported-OS passthrough arm; borrowed on Linux/macOS.
+    pub fn wrap_with_injections(
+        inner_cmd: Command,
+        worktree_path: &Path,
+        injections: &[RoInjection],
+    ) -> io::Result<Command> {
         // Validate on all platforms for defense in depth and API consistency.
         // On macOS the validated string is needed for SBPL interpolation.
         // On Linux bwrap passes paths as argv entries (no injection risk),
         // but we still reject unsafe paths at the API boundary.
         let _ = validate_sandbox_str(worktree_path, "worktree path")?;
+        for inj in injections {
+            let _ = validate_sandbox_str(&inj.source, "injection source")?;
+            let _ = validate_sandbox_str(&inj.target, "injection target")?;
+        }
 
         #[cfg(target_os = "linux")]
         {
@@ -77,7 +225,30 @@ impl SandboxCommand {
                 .arg("--dev").arg("/dev")           // Standard dev mounts
                 .arg("--proc").arg("/proc")         // Standard proc mounts
                 .arg("--bind").arg(worktree_path).arg(worktree_path) // Write access to the worktree
-                .arg("--tmpfs").arg("/tmp")         // Disposable tmpfs
+                .arg("--tmpfs").arg("/tmp"); // Disposable tmpfs
+
+            // Read-only file injections: bind each host-owned verified snapshot
+            // at its in-sandbox target. Placed AFTER the writable worktree
+            // --bind so a later bind can't shadow it, and BEFORE --unshare-all
+            // so the ro-bind sits within the namespace setup. The namespace
+            // creates the mount point, so `target` need not exist on the host.
+            for inj in injections {
+                bwrap.arg("--ro-bind").arg(&inj.source).arg(&inj.target);
+            }
+
+            // #856 read-hole fix: the `--ro-bind / /` above mounts the entire
+            // host filesystem read-only, which exposed Astrid's secret/key/state
+            // dirs and the operator's home credential stores to the spawned
+            // process. Shadow each masked path so the agent reads nothing (see
+            // `push_mask_arg`). Placed AFTER the root ro-bind (so it overlays)
+            // and the worktree/injection binds; `run/` (socket+token) and `etc/`
+            // stay reachable for daemon access. Fail-secure: refuse the spawn if
+            // the home is unresolvable.
+            for masked in Self::masked_paths()? {
+                Self::push_mask_arg(&mut bwrap, &masked);
+            }
+
+            bwrap
                 .arg("--unshare-all")               // Drop namespaces (network, pid, etc.)
                 .arg("--share-net")                 // Re-enable network so npm/cargo can fetch
                 .arg("--die-with-parent"); // Prevent orphan processes
@@ -117,7 +288,22 @@ impl SandboxCommand {
             // macOS-15+ `sandbox-exec` incompatibility and papered over by
             // disabling the sandbox entirely. `sandbox-exec` is deprecated but
             // still enforces on current macOS. See #855.
-            let prefix = ProcessSandboxConfig::new(worktree_path).build_seatbelt_prefix()?;
+            //
+            // Seatbelt has no mount namespace, so the caller has already
+            // materialized the verified snapshot AT `target`; the profile
+            // grants read and a trailing deny-write on that literal path.
+            let mut config = ProcessSandboxConfig::new(worktree_path);
+            for inj in injections {
+                config = config.with_ro_inject(&inj.source, &inj.target);
+            }
+            // #856: mask the sensitive Astrid subpaths (see the Linux branch).
+            // macOS seatbelt is already `(deny default)` + an allowlist that
+            // excludes ~/.astrid, so these denies are belt-and-suspenders that
+            // still hold if the allowlist ever widens to include the home.
+            for masked in Self::masked_paths()? {
+                config = config.with_hidden(masked);
+            }
+            let prefix = config.build_seatbelt_prefix()?;
 
             let mut sb_cmd = Command::new(&prefix.program);
             sb_cmd.args(&prefix.args);
@@ -145,6 +331,14 @@ impl SandboxCommand {
 
         #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         {
+            // Without an OS-level sandbox there is no mechanism to enforce the
+            // read-only guarantee; refuse rather than expose writable bytes.
+            if !injections.is_empty() {
+                return Err(io::Error::other(
+                    "read-only file injection requires an OS sandbox \
+                     (bwrap/Seatbelt); unavailable on this platform",
+                ));
+            }
             tracing::warn!(
                 "Host-level sandboxing is not supported on this OS. Processes will run unsandboxed."
             );
@@ -301,6 +495,11 @@ pub struct ProcessSandboxConfig {
     allow_network: bool,
     /// Paths to overlay with empty tmpfs (Linux) or exclude (macOS), blocking access.
     hidden_paths: Vec<PathBuf>,
+    /// Read-only file injections: host-verified bytes exposed at an in-sandbox
+    /// `target`. On macOS the snapshot is materialized at `target` (so
+    /// `source == target`) and the profile gets a read-allow plus a trailing
+    /// write-deny on that literal path.
+    ro_injections: Vec<RoInjection>,
     /// What to do when OS-level sandboxing is unavailable (see [`SandboxPolicy`]).
     policy: SandboxPolicy,
 }
@@ -321,6 +520,7 @@ impl ProcessSandboxConfig {
             extra_write_paths: Vec::new(),
             allow_network: true,
             hidden_paths: Vec::new(),
+            ro_injections: Vec::new(),
             policy: SandboxPolicy::from_env(),
         }
     }
@@ -361,6 +561,27 @@ impl ProcessSandboxConfig {
     #[must_use]
     pub fn with_hidden(mut self, path: impl Into<PathBuf>) -> Self {
         self.hidden_paths.push(path.into());
+        self
+    }
+
+    /// Add a read-only file injection: expose the host-verified bytes at
+    /// `source` so the sandboxed process reads them at `target`, with no way
+    /// for the child (or any subprocess) to write them.
+    ///
+    /// On macOS the snapshot must already be materialized at `target`, so
+    /// `source` and `target` are typically equal there; the generated Seatbelt
+    /// profile grants `file-read*` on `target` and appends a trailing
+    /// `file-write*` deny on it.
+    #[must_use]
+    pub fn with_ro_inject(
+        mut self,
+        source: impl Into<PathBuf>,
+        target: impl Into<PathBuf>,
+    ) -> Self {
+        self.ro_injections.push(RoInjection {
+            source: source.into(),
+            target: target.into(),
+        });
         self
     }
 
@@ -459,384 +680,13 @@ impl ProcessSandboxConfig {
         for p in &self.hidden_paths {
             validate_sandbox_str(p, "hidden path")?;
         }
+        for inj in &self.ro_injections {
+            validate_sandbox_str(&inj.source, "injection source")?;
+            validate_sandbox_str(&inj.target, "injection target")?;
+        }
         Ok(())
     }
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use std::path::PathBuf;
-
-    /// Validates that a path is safe for interpolation into an SBPL profile string.
-    fn validate_sandbox_path(path: &Path) -> io::Result<()> {
-        let s = path.to_str().ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("sandbox path is not valid UTF-8: {}", path.display()),
-            )
-        })?;
-        if s.contains(['"', '\\', '\0']) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!(
-                    "sandbox path contains forbidden characters (double-quote, backslash, or null): {}",
-                    path.display()
-                ),
-            ));
-        }
-        Ok(())
-    }
-
-    // --- validate_sandbox_path tests ---
-
-    #[test]
-    fn validate_sandbox_path_accepts_normal_path() {
-        let path = PathBuf::from("/Users/agent/workspace/project");
-        assert!(validate_sandbox_path(&path).is_ok());
-    }
-
-    #[test]
-    fn validate_sandbox_path_accepts_path_with_spaces() {
-        let path = PathBuf::from("/Users/agent/my project/src");
-        assert!(validate_sandbox_path(&path).is_ok());
-    }
-
-    #[test]
-    fn validate_sandbox_path_rejects_double_quote() {
-        let path = PathBuf::from("/Users/agent/work\"inject");
-        let err = validate_sandbox_path(&path).unwrap_err();
-        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
-        assert!(
-            err.to_string().contains("forbidden characters"),
-            "unexpected error message: {err}"
-        );
-    }
-
-    #[test]
-    fn validate_sandbox_path_rejects_sbpl_injection_payload() {
-        // Simulates an actual SBPL escape attempt.
-        let path = PathBuf::from(r#"/tmp/evil") (allow file-write* (subpath "/"))"#);
-        let err = validate_sandbox_path(&path).unwrap_err();
-        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
-        assert!(
-            err.to_string().contains("forbidden characters"),
-            "unexpected error message: {err}"
-        );
-    }
-
-    #[test]
-    fn validate_sandbox_path_rejects_backslash() {
-        let path = PathBuf::from("/tmp/work\\nspace");
-        let err = validate_sandbox_path(&path).unwrap_err();
-        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
-        assert!(
-            err.to_string().contains("forbidden characters"),
-            "unexpected error message: {err}"
-        );
-    }
-
-    #[test]
-    fn validate_sandbox_path_rejects_null_byte() {
-        let path = PathBuf::from("/tmp/work\0space");
-        let err = validate_sandbox_path(&path).unwrap_err();
-        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
-        assert!(
-            err.to_string().contains("forbidden characters"),
-            "unexpected error message: {err}"
-        );
-    }
-
-    // --- SandboxCommand::wrap() tests ---
-
-    #[test]
-    fn test_wrap_rejects_non_utf8_path() {
-        use std::ffi::OsStr;
-        use std::os::unix::ffi::OsStrExt;
-
-        let bad_bytes: &[u8] = b"/tmp/\xff\xfe/workspace";
-        let bad_path = Path::new(OsStr::from_bytes(bad_bytes));
-        let cmd = Command::new("echo");
-        let result = SandboxCommand::wrap(cmd, bad_path);
-        assert!(result.is_err());
-        let err_msg = result.unwrap_err().to_string();
-        assert!(
-            err_msg.contains("not valid UTF-8"),
-            "error should mention UTF-8: {err_msg}"
-        );
-    }
-
-    #[test]
-    fn test_wrap_rejects_double_quote_path() {
-        let bad_path = Path::new("/tmp/evil\"injection/workspace");
-        let cmd = Command::new("echo");
-        let result = SandboxCommand::wrap(cmd, bad_path);
-        assert!(result.is_err());
-        let err_msg = result.unwrap_err().to_string();
-        assert!(
-            err_msg.contains("forbidden characters"),
-            "error should mention forbidden chars: {err_msg}"
-        );
-    }
-
-    #[test]
-    fn test_wrap_rejects_null_byte_path() {
-        let bad_path = Path::new("/tmp/evil\0null/workspace");
-        let cmd = Command::new("echo");
-        let result = SandboxCommand::wrap(cmd, bad_path);
-        assert!(result.is_err());
-        let err_msg = result.unwrap_err().to_string();
-        assert!(
-            err_msg.contains("forbidden characters"),
-            "error should mention forbidden chars: {err_msg}"
-        );
-    }
-
-    #[test]
-    fn test_wrap_rejects_backslash_path() {
-        let bad_path = Path::new("/tmp/work\\nspace");
-        let cmd = Command::new("echo");
-        let result = SandboxCommand::wrap(cmd, bad_path);
-        assert!(result.is_err());
-        let err_msg = result.unwrap_err().to_string();
-        assert!(
-            err_msg.contains("forbidden characters"),
-            "error should mention forbidden chars: {err_msg}"
-        );
-    }
-
-    #[test]
-    fn test_wrap_rejects_relative_path() {
-        let bad_path = Path::new("relative/workspace");
-        let cmd = Command::new("echo");
-        let result = SandboxCommand::wrap(cmd, bad_path);
-        assert!(result.is_err());
-        let err_msg = result.unwrap_err().to_string();
-        assert!(
-            err_msg.contains("absolute path"),
-            "error should mention absolute path: {err_msg}"
-        );
-    }
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn wrap_always_sandboxes_via_shared_profile() {
-        // Regression for #855: wrap() must always produce a `sandbox-exec`
-        // wrapped command — never a passthrough — on every macOS version, and
-        // the profile must carry the load-bearing root-read rule whose absence
-        // caused the SIGABRT that the old macOS-15+ version guard masked.
-        let cmd = Command::new("echo");
-        let path = PathBuf::from("/tmp/safe-workspace");
-        let wrapped = SandboxCommand::wrap(cmd, &path).unwrap();
-
-        assert_eq!(
-            wrapped.get_program(),
-            "sandbox-exec",
-            "wrap() must wrap the command in sandbox-exec, not pass it through"
-        );
-        let args: Vec<_> = wrapped.get_args().collect();
-        assert_eq!(args[0], "-p", "expected -p for inline profile delivery");
-        let profile = args[1].to_string_lossy();
-        assert!(
-            profile.contains("/tmp/safe-workspace"),
-            "profile should contain the worktree path"
-        );
-        assert!(
-            profile.contains(r#"(literal "/")"#),
-            "profile must allow reading the filesystem root — the rule whose \
-             absence caused the SIGABRT that #855's version guard masked"
-        );
-        assert!(
-            args.iter().any(|a| *a == "echo"),
-            "the wrapped command must still invoke the original program"
-        );
-    }
-
-    // --- ProcessSandboxConfig builder tests ---
-
-    #[test]
-    fn test_sandbox_config_builder() {
-        let config = ProcessSandboxConfig::new("/project")
-            .with_network(false)
-            .with_extra_read("/data")
-            .with_extra_write("/output")
-            .with_hidden("/home/user/.astrid");
-
-        assert_eq!(config.writable_root, PathBuf::from("/project"));
-        assert!(!config.allow_network);
-        assert_eq!(config.extra_read_paths, vec![PathBuf::from("/data")]);
-        assert_eq!(config.extra_write_paths, vec![PathBuf::from("/output")]);
-        assert_eq!(
-            config.hidden_paths,
-            vec![PathBuf::from("/home/user/.astrid")]
-        );
-    }
-
-    #[test]
-    fn test_sandbox_config_defaults() {
-        let config = ProcessSandboxConfig::new("/project");
-        assert!(config.allow_network);
-        assert!(config.extra_read_paths.is_empty());
-        assert!(config.extra_write_paths.is_empty());
-        assert!(config.hidden_paths.is_empty());
-    }
-
-    // --- SandboxPolicy tests ---
-
-    #[test]
-    fn policy_parse_accepts_known_values() {
-        assert_eq!(
-            SandboxPolicy::parse("required"),
-            Some(SandboxPolicy::Required)
-        );
-        assert_eq!(
-            SandboxPolicy::parse("Required"),
-            Some(SandboxPolicy::Required)
-        );
-        assert_eq!(SandboxPolicy::parse("OFF"), Some(SandboxPolicy::Off));
-        assert_eq!(SandboxPolicy::parse("  off  "), Some(SandboxPolicy::Off));
-    }
-
-    #[test]
-    fn policy_parse_rejects_unknown_values() {
-        assert_eq!(SandboxPolicy::parse(""), None);
-        // The pre-#655 "warn and fall through" middle state was removed
-        // intentionally — `preferred` is no longer a valid policy.
-        assert_eq!(SandboxPolicy::parse("preferred"), None);
-        assert_eq!(SandboxPolicy::parse("relaxed"), None);
-        assert_eq!(SandboxPolicy::parse("required-ish"), None);
-    }
-
-    #[test]
-    fn policy_default_is_required() {
-        assert_eq!(SandboxPolicy::default(), SandboxPolicy::Required);
-    }
-
-    #[test]
-    #[allow(unsafe_code)] // env mutation is unsafe in 2024 edition; see SAFETY note below
-    fn config_default_policy_is_required_when_env_unset() {
-        // The bug from #655: a fresh `ProcessSandboxConfig::new(...)`
-        // silently bypassing the sandbox. The constructor reads
-        // `ASTRID_SANDBOX_POLICY` from the env, falling back to
-        // `Required`. Confirm it lands on `Required` when the env var
-        // is unset.
-        //
-        // SAFETY: `std::env::remove_var` is unsafe in 2024 edition
-        // because env mutation isn't thread-safe; this test is racy if
-        // another test concurrently sets the same var. None do — the
-        // policy-test set is the only consumer.
-        unsafe {
-            std::env::remove_var("ASTRID_SANDBOX_POLICY");
-        }
-        let config = ProcessSandboxConfig::new("/project");
-        assert_eq!(
-            config.policy,
-            SandboxPolicy::Required,
-            "fresh config with unset env must default to Required — \
-             silent unsandboxed launches are the bug from #655"
-        );
-    }
-
-    #[test]
-    fn with_policy_overrides_default() {
-        let config = ProcessSandboxConfig::new("/project").with_policy(SandboxPolicy::Off);
-        assert_eq!(config.policy, SandboxPolicy::Off);
-    }
-
-    #[test]
-    fn sandbox_prefix_with_off_policy_returns_none_silently() {
-        // `Off` short-circuits and returns None regardless of platform
-        // sandbox availability.
-        let config = ProcessSandboxConfig::new("/project").with_policy(SandboxPolicy::Off);
-        let result = config.sandbox_prefix();
-        assert!(matches!(result, Ok(None)));
-    }
-
-    // The Required-vs-Preferred behaviour around real bwrap availability
-    // is platform-specific and probe-cached, so it's covered by the
-    // bwrap-targeted tests below rather than reproduced here.
-
-    // --- Cross-platform sandbox_prefix() rejection tests ---
-
-    #[test]
-    fn test_sandbox_prefix_rejects_relative_writable_root() {
-        let config = ProcessSandboxConfig::new("relative/project");
-        assert!(config.sandbox_prefix().is_err());
-    }
-
-    #[test]
-    fn test_sandbox_prefix_rejects_non_utf8_writable_root() {
-        use std::ffi::OsStr;
-        use std::os::unix::ffi::OsStrExt;
-
-        let bad_bytes: &[u8] = b"/tmp/\xff\xfe/workspace";
-        let bad_path = PathBuf::from(OsStr::from_bytes(bad_bytes));
-        let config = ProcessSandboxConfig::new(bad_path);
-        let result = config.sandbox_prefix();
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("not valid UTF-8"));
-    }
-
-    #[test]
-    fn test_sandbox_prefix_rejects_non_utf8_extra_paths() {
-        use std::ffi::OsStr;
-        use std::os::unix::ffi::OsStrExt;
-
-        let bad_bytes: &[u8] = b"/data/\xff\xfe";
-        let bad_path = PathBuf::from(OsStr::from_bytes(bad_bytes));
-
-        let config = ProcessSandboxConfig::new("/project").with_extra_read(bad_path.clone());
-        assert!(config.sandbox_prefix().is_err());
-
-        let config = ProcessSandboxConfig::new("/project").with_extra_write(bad_path.clone());
-        assert!(config.sandbox_prefix().is_err());
-
-        let config = ProcessSandboxConfig::new("/project").with_hidden(bad_path);
-        assert!(config.sandbox_prefix().is_err());
-    }
-
-    #[test]
-    fn test_sandbox_prefix_rejects_double_quote_in_paths() {
-        let config = ProcessSandboxConfig::new("/project/evil\"dir");
-        assert!(config.sandbox_prefix().is_err());
-
-        let config = ProcessSandboxConfig::new("/project").with_extra_read("/data/evil\"path");
-        assert!(config.sandbox_prefix().is_err());
-
-        let config = ProcessSandboxConfig::new("/project").with_extra_write("/output/evil\"path");
-        assert!(config.sandbox_prefix().is_err());
-
-        let config = ProcessSandboxConfig::new("/project").with_hidden("/hidden/evil\"path");
-        assert!(config.sandbox_prefix().is_err());
-    }
-
-    #[test]
-    fn test_sandbox_prefix_rejects_backslash_in_paths() {
-        let config = ProcessSandboxConfig::new("/project/evil\\dir");
-        assert!(config.sandbox_prefix().is_err());
-
-        let config = ProcessSandboxConfig::new("/project").with_extra_read("/data/evil\\path");
-        assert!(config.sandbox_prefix().is_err());
-
-        let config = ProcessSandboxConfig::new("/project").with_extra_write("/output/evil\\path");
-        assert!(config.sandbox_prefix().is_err());
-
-        let config = ProcessSandboxConfig::new("/project").with_hidden("/hidden/evil\\path");
-        assert!(config.sandbox_prefix().is_err());
-    }
-
-    #[test]
-    fn test_sandbox_prefix_rejects_null_byte_in_paths() {
-        let config = ProcessSandboxConfig::new("/project/evil\0dir");
-        assert!(config.sandbox_prefix().is_err());
-
-        let config = ProcessSandboxConfig::new("/project").with_extra_read("/data/evil\0path");
-        assert!(config.sandbox_prefix().is_err());
-
-        let config = ProcessSandboxConfig::new("/project").with_extra_write("/output/evil\0path");
-        assert!(config.sandbox_prefix().is_err());
-
-        let config = ProcessSandboxConfig::new("/project").with_hidden("/hidden/evil\0path");
-        assert!(config.sandbox_prefix().is_err());
-    }
-}
+mod tests;

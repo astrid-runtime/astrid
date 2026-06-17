@@ -6,7 +6,7 @@ use astrid_capabilities::AuditEntryId;
 use astrid_core::SessionId;
 use astrid_crypto::{ContentHash, KeyPair};
 use std::path::Path;
-use std::sync::RwLock;
+use std::sync::{Arc, RwLock};
 use tracing::{debug, error, warn};
 
 use crate::entry::{AuditAction, AuditEntry, AuditOutcome, AuthorizationProof};
@@ -24,7 +24,12 @@ pub struct AuditLog {
     /// Storage backend.
     storage: Box<dyn AuditStorage>,
     /// Runtime signing key.
-    runtime_key: KeyPair,
+    ///
+    /// Held behind an [`Arc`] so the single runtime key can also be shared
+    /// onto the [`Kernel`](../../astrid_kernel/struct.Kernel.html) (issue
+    /// #929) without loading the key from disk twice — the audit log and the
+    /// kernel's admin token-mint path sign with the exact same key bytes.
+    runtime_key: Arc<KeyPair>,
     /// Current chain heads per (session, principal) pair.
     ///
     /// Each principal maintains its own independent chain within a session.
@@ -35,25 +40,33 @@ pub struct AuditLog {
 impl AuditLog {
     /// Create a new audit log with `SurrealKV` persistence.
     ///
+    /// The key is stored behind an [`Arc`]: callers may pass an owned
+    /// [`KeyPair`] (converted via `Arc::from`) or an existing `Arc<KeyPair>`.
+    /// Passing the kernel's already-`Arc`-wrapped runtime key lets the audit
+    /// log and the kernel's admin token-mint path (issue #929) sign with the
+    /// exact same key without a second load from disk.
+    ///
     /// # Errors
     ///
     /// Returns an error if the storage backend fails to open at the given path.
-    pub fn open(path: impl AsRef<Path>, runtime_key: KeyPair) -> AuditResult<Self> {
+    pub fn open(path: impl AsRef<Path>, runtime_key: impl Into<Arc<KeyPair>>) -> AuditResult<Self> {
         let storage = SurrealKvAuditStorage::open(path)?;
         Ok(Self {
             storage: Box::new(storage),
-            runtime_key,
+            runtime_key: runtime_key.into(),
             chain_heads: RwLock::new(std::collections::HashMap::new()),
         })
     }
 
     /// Create an in-memory audit log (for testing).
+    ///
+    /// Accepts an owned [`KeyPair`] or an `Arc<KeyPair>` — see [`open`](Self::open).
     #[must_use]
-    pub fn in_memory(runtime_key: KeyPair) -> Self {
+    pub fn in_memory(runtime_key: impl Into<Arc<KeyPair>>) -> Self {
         let storage = SurrealKvAuditStorage::in_memory();
         Self {
             storage: Box::new(storage),
-            runtime_key,
+            runtime_key: runtime_key.into(),
             chain_heads: RwLock::new(std::collections::HashMap::new()),
         }
     }

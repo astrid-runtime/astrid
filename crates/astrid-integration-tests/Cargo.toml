@@ -38,6 +38,7 @@ tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 uuid = { workspace = true }
 
 [dev-dependencies]
+nix = { workspace = true }
 rcgen = { workspace = true }
 reqwest = { workspace = true }
 which = { workspace = true }

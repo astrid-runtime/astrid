@@ -34,6 +34,9 @@ fn all_admin_variants() -> Vec<AdminRequestKind> {
             name: "n".into(),
             groups: Vec::new(),
             grants: Vec::new(),
+            inherit_from: None,
+            clone_from: None,
+            allow_admin_clone: false,
         },
         AdminRequestKind::AgentDelete {
             principal: pid("a"),
@@ -74,6 +77,18 @@ fn all_admin_variants() -> Vec<AdminRequestKind> {
         AdminRequestKind::CapsRevoke {
             principal: pid("a"),
             capabilities: vec!["self:*".into()],
+        },
+        AdminRequestKind::CapsTokenMint {
+            principal: pid("a"),
+            resource: "mcp://server:tool".into(),
+            permission: None,
+            ttl_secs: None,
+        },
+        AdminRequestKind::CapsTokenRevoke {
+            token_id: "00000000-0000-0000-0000-000000000000".into(),
+        },
+        AdminRequestKind::CapsTokenList {
+            principal: pid("a"),
         },
     ]
 }
@@ -204,6 +219,9 @@ fn admin_target_principal_none_for_self_or_collection_variants() {
             name: "n".into(),
             groups: Vec::new(),
             grants: Vec::new(),
+            inherit_from: None,
+            clone_from: None,
+            allow_admin_clone: false,
         })
         .is_none()
     );

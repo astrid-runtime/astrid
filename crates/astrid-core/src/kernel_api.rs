@@ -123,15 +123,86 @@ pub struct CapsuleMetadataEntry {
     pub interceptor_events: Vec<String>,
 }
 
-/// Information about a registered slash command.
+/// How a capsule-declared command is surfaced to operators.
+///
+/// A capsule declares commands via `[[command]]` in its `Capsule.toml`.
+/// The `kind` selects the surface:
+///
+/// * [`CommandKind::Slash`] — an in-TUI slash command (`/git`), dispatched
+///   through the chat loop. This is the historical behaviour and the
+///   default when `kind` is absent, so every pre-existing manifest keeps
+///   parsing and behaving identically.
+/// * [`CommandKind::Cli`] — a top-level CLI verb invocable as
+///   `astrid capsule <verb> [args...]`, dispatched to the providing capsule
+///   over IPC as a non-interactive one-shot.
+///
+/// # CLI-verb wire contract (kernel does NOT interpret it)
+///
+/// The kernel plays no part in running a CLI verb beyond surfacing its
+/// existence through `GetCommands`. Dispatch is pure capsule-space IPC:
+///
+/// * **Run** — the CLI publishes an `IpcPayload::RawJson` message on the
+///   provider-targeted topic `cli.v1.command.run.<provider_capsule>` with
+///   body `{ "req_id": <uuid>, "command": <verb>, "args": [<string>...] }`.
+/// * **Result** — the capsule replies on `cli.v1.command.result.<req_id>`
+///   with body `{ "req_id": <uuid>, "exit_code": <number>,
+///   "output": <string>, "error": <string?> }`.
+///
+/// **Security rationale for the provider-targeted run topic:** a capsule
+/// subscribes only `cli.v1.command.run.<its-own-id>`, so a capsule never
+/// observes the command arguments addressed to a *different* capsule.
+/// Per-`req_id` result topics keep concurrent invocations isolated. The
+/// kernel routes these topics but never reads or validates the payload
+/// bodies — they are capsule-space contract, not kernel surface.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CommandKind {
+    /// In-TUI slash command (default). Listed and dispatched by the chat
+    /// loop, never as a top-level CLI verb.
+    #[default]
+    Slash,
+    /// Top-level CLI verb: `astrid capsule <verb> [args...]`.
+    Cli,
+}
+
+impl CommandKind {
+    /// Returns `true` for the default kind so serializers can omit it
+    /// (matches the rest of the manifest fields' conventions).
+    #[must_use]
+    pub fn is_default(&self) -> bool {
+        matches!(self, Self::Slash)
+    }
+}
+
+/// Built-in `astrid capsule` subcommand names that a capsule-declared CLI
+/// verb (`kind = "cli"`) may NOT shadow.
+///
+/// A `kind = "cli"` command whose name appears here is rejected at manifest
+/// parse time (fail closed) so a capsule cannot mask or impersonate a
+/// built-in verb such as `install` or `remove`.
+///
+/// **This list MUST stay in sync with the `CapsuleCommands` clap enum in
+/// `astrid-cli` (`cli.rs`).** A unit test in astrid-cli asserts every
+/// `CapsuleCommands` variant's clap name appears here; if you add a
+/// built-in `astrid capsule` subcommand, add its name here too.
+pub const RESERVED_CAPSULE_VERBS: &[&str] = &[
+    "install", "update", "list", "remove", "tree", "deps", "build", "config", "show", "run", "help",
+];
+
+/// Information about a registered capsule command.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CommandInfo {
-    /// The slash command trigger (e.g. `/git`).
+    /// The command trigger (e.g. `git`; rendered `/git` for slash commands).
     pub name: String,
     /// A brief description of what the command does.
     pub description: String,
     /// The capsule that provides this command.
     pub provider_capsule: String,
+    /// How this command is surfaced (slash vs CLI verb). Defaults to
+    /// [`CommandKind::Slash`] for wire compatibility with daemons that
+    /// predate the field.
+    #[serde(default, skip_serializing_if = "CommandKind::is_default")]
+    pub kind: CommandKind,
 }
 
 // ---------------------------------------------------------------------------
@@ -205,6 +276,37 @@ pub enum AdminRequestKind {
         /// Per-principal capability grants beyond group inheritance.
         #[serde(default)]
         grants: Vec<String>,
+        /// Opt-in inheritance source. When `Some`, the new principal
+        /// receives a full copy of this source principal's `.config/env/`,
+        /// per-capsule KV namespaces, and per-capsule secret files. When
+        /// `None` (the default) the new principal inherits **nothing** —
+        /// least privilege, no silent credential leak from `default`.
+        ///
+        /// `#[serde(default)]` keeps older serialized requests (no field)
+        /// deserializing as `None`, which is the secure default.
+        #[serde(default)]
+        inherit_from: Option<PrincipalId>,
+        /// Opt-in clone source. When `Some`, the new principal is a full
+        /// replica of this source: its capability **profile** (groups,
+        /// grants, revokes, network egress, process-spawn allow-list,
+        /// quotas) AND its **state** (the same env/KV/secret copy
+        /// `inherit_from` performs). The source's `auth` (public keys /
+        /// authenticators) is deliberately NOT copied — each principal keeps
+        /// its own identity. Mutually exclusive with `inherit_from`,
+        /// `groups`, and `grants` (the source determines all of them); the
+        /// kernel rejects a request that sets both `clone_from` and any of
+        /// those. When the source confers admin (resolves to `*`), the
+        /// request is rejected unless `allow_admin_clone` is set.
+        ///
+        /// `#[serde(default)]` keeps older requests deserializing as `None`.
+        #[serde(default)]
+        clone_from: Option<PrincipalId>,
+        /// Acknowledge cloning an admin-conferring source (one that resolves
+        /// to the universal `*`). Without it, `clone_from` of such a source
+        /// is rejected — mirrors `--unsafe-admin` on `caps grant '*'` and
+        /// `group create --caps '*'`. Ignored unless `clone_from` is set.
+        #[serde(default)]
+        allow_admin_clone: bool,
     },
     /// Delete an existing agent identity. The `default` principal is
     /// rejected unconditionally. The principal's home directory is NOT
@@ -329,6 +431,45 @@ pub enum AdminRequestKind {
         principal: PrincipalId,
         /// Capability patterns to revoke.
         capabilities: Vec<String>,
+    },
+    /// Mint a signed capability token granting `principal` access to
+    /// `resource` (issue #929). Lets an operator pre-grant tool access (e.g.
+    /// `mcp://server:tool`) so the agent never hits a per-use approval
+    /// elicitation. The token is signed by the runtime key — the same key the
+    /// approval interceptor trusts as issuer — so it authorizes immediately
+    /// and survives daemon restarts (persistent scope). Revocable via
+    /// [`Self::CapsTokenRevoke`]; principal-scoped (a token minted for Alice
+    /// never authorizes Bob); admin-gated by `caps:token:mint`.
+    CapsTokenMint {
+        /// Principal the token is minted for. Only this principal can
+        /// consume it (issue #668 cross-principal binding).
+        principal: PrincipalId,
+        /// Resource pattern the token grants, e.g. `mcp://server:tool`.
+        resource: String,
+        /// Permission to grant. Defaults to `"invoke"` when absent. Parsed
+        /// into [`Permission`](astrid_core::types::Permission); an unknown
+        /// string is rejected with a bad-input error.
+        #[serde(default)]
+        permission: Option<String>,
+        /// Token lifetime in seconds. `None` = permanent (valid until
+        /// revoked); `Some(n)` = expires after `n` seconds.
+        #[serde(default)]
+        ttl_secs: Option<u64>,
+    },
+    /// Revoke a previously minted capability token by its id (issue #929).
+    /// Revocation is global and final — the token no longer authorizes for
+    /// any principal. Admin-gated by `caps:token:revoke`.
+    CapsTokenRevoke {
+        /// The token id to revoke (the `token_id` string returned by
+        /// [`Self::CapsTokenMint`]).
+        token_id: String,
+    },
+    /// List the capability tokens minted for `principal` (issue #929).
+    /// Returns only non-revoked, non-expired tokens owned by that principal.
+    /// Admin-gated by `caps:token:list`.
+    CapsTokenList {
+        /// Principal whose tokens are listed.
+        principal: PrincipalId,
     },
     /// Issue a new invite token. Capability-gated by `invite:issue`.
     /// The kernel persists the token under `etc/invites.toml` with
@@ -639,4 +780,52 @@ pub struct GroupSummary {
     /// `true` for built-in groups (`admin`, `agent`, `restricted`).
     /// Clients should treat built-ins as read-only.
     pub builtin: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{CommandInfo, CommandKind};
+
+    #[test]
+    fn command_info_kind_defaults_to_slash_on_wire() {
+        // A frame from a daemon that predates the `kind` field has no
+        // `kind` key; it must deserialize to the Slash default so an older
+        // daemon's commands keep listing as slash commands.
+        let json = serde_json::json!({
+            "name": "git",
+            "description": "git ops",
+            "provider_capsule": "git-capsule",
+        });
+        let info: CommandInfo = serde_json::from_value(json).unwrap();
+        assert_eq!(info.kind, CommandKind::Slash);
+    }
+
+    #[test]
+    fn command_info_kind_roundtrips_cli() {
+        let info = CommandInfo {
+            name: "deploy".into(),
+            description: "deploy it".into(),
+            provider_capsule: "ops".into(),
+            kind: CommandKind::Cli,
+        };
+        let json = serde_json::to_value(&info).unwrap();
+        // `cli` is not the default, so it is serialized.
+        assert_eq!(json.get("kind").and_then(|k| k.as_str()), Some("cli"));
+        let back: CommandInfo = serde_json::from_value(json).unwrap();
+        assert_eq!(back.kind, CommandKind::Cli);
+    }
+
+    #[test]
+    fn command_info_default_kind_omitted_from_wire() {
+        let info = CommandInfo {
+            name: "git".into(),
+            description: "git ops".into(),
+            provider_capsule: "git-capsule".into(),
+            kind: CommandKind::Slash,
+        };
+        let json = serde_json::to_value(&info).unwrap();
+        // Default kind is skipped so the wire shape is byte-compatible with
+        // pre-field consumers.
+        assert!(json.get("kind").is_none());
+    }
 }

@@ -5,19 +5,31 @@ use std::path::{Path, PathBuf};
 use anyhow::Context;
 use astrid_core::dirs::AstridHome;
 
+/// The principal a non-workspace install targets.
+///
+/// All user installs land in the default principal's home today, and so
+/// must everything keyed off that home: the capsule directory, the env
+/// config, and the `home://wit/` interface mirror. This is the single
+/// source of truth — per-principal installs would thread a real id
+/// through here (and `InstallOptions`) so those locations can never
+/// drift apart. Resolving the principal in one place keeps the mirror
+/// honest instead of re-hardcoding `PrincipalId::default()` per call site.
+#[must_use]
+pub fn install_principal() -> astrid_core::PrincipalId {
+    astrid_core::PrincipalId::default()
+}
+
 /// Resolve the directory a capsule should be installed into.
 ///
 /// User installs (`workspace = false`) land in the principal's home
-/// under `capsules/<id>/`. The default principal is used today —
-/// per-principal installs would set this differently. Workspace
+/// under `capsules/<id>/`, for the [`install_principal`]. Workspace
 /// installs go to `<cwd>/.astrid/capsules/<id>/`.
 pub fn resolve_target_dir(home: &AstridHome, id: &str, workspace: bool) -> anyhow::Result<PathBuf> {
     if workspace {
         let root = std::env::current_dir().context("could not determine current directory")?;
         Ok(root.join(".astrid").join("capsules").join(id))
     } else {
-        let principal = astrid_core::PrincipalId::default();
-        let ph = home.principal_home(&principal);
+        let ph = home.principal_home(&install_principal());
         Ok(ph.capsules_dir().join(id))
     }
 }
@@ -26,8 +38,7 @@ pub fn resolve_target_dir(home: &AstridHome, id: &str, workspace: bool) -> anyho
 ///
 /// Returns `home/{principal}/.config/env/{capsule}.env.json`.
 pub fn resolve_env_path(home: &AstridHome, capsule_name: &str) -> anyhow::Result<PathBuf> {
-    let principal = astrid_core::PrincipalId::default();
-    let ph = home.principal_home(&principal);
+    let ph = home.principal_home(&install_principal());
     let env_dir = ph.env_dir();
     std::fs::create_dir_all(&env_dir)?;
     Ok(env_dir.join(format!("{capsule_name}.env.json")))

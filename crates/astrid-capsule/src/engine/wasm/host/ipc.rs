@@ -296,17 +296,26 @@ impl ipc::Host for HostState {
         &mut self,
         topic: String,
         payload: String,
-        principal: String,
+        _principal: String,
     ) -> Result<(), ErrorCode> {
         if !self.has_uplink_capability {
             return Err(ErrorCode::CapabilityDenied);
         }
-        if astrid_core::principal::PrincipalId::new(&principal).is_err() {
-            return Err(ErrorCode::InvalidInput);
-        }
+        // The principal is DERIVED from the source connection, never named by
+        // the capsule (issue #45/#852). A connection the kernel verified at the
+        // handshake — recorded by the framed `tcp-stream.read` that pulled this
+        // frame — stamps that verified principal. An UNAUTHENTICATED (unbound)
+        // connection stamps the reserved no-capability `anonymous` identity, NOT
+        // the name it claimed: an uplink relays a connection, it cannot forge a
+        // principal, and an unproven claim earns no privilege (it fails closed
+        // on every capability check). The capsule-supplied name is ignored.
+        let effective = match self.ingress_principal.as_ref() {
+            Some(verified) => verified.as_str().to_owned(),
+            None => astrid_core::principal::PrincipalId::anonymous().into_inner(),
+        };
         let bytes = payload.len() as u64;
         let topic_for_audit = topic.clone();
-        let result = publish_inner(self, topic, payload, principal);
+        let result = publish_inner(self, topic, payload, effective);
         audit_ipc(
             self,
             "astrid:ipc/host.publish-as",
@@ -835,6 +844,76 @@ mod audit_scope_tests {
         assert!(
             IpcHost::subscribe(&mut state, "astrid.v1.admin.response.*".to_string()).is_ok(),
             "the single trailing wildcard the fix kept must be subscribable",
+        );
+    }
+
+    // ── publish-as principal enforcement (issue #45/#852) ──
+
+    /// The self-stamp fix: when the source connection carries a kernel-verified
+    /// principal (recorded by the framed read that pulled the frame), `publish-as`
+    /// stamps THAT principal and ignores the capsule-supplied name. A socket
+    /// client that authenticated as `claude` but names `default` (admin) on the
+    /// wire cannot escalate — the kernel-bound identity wins.
+    #[tokio::test]
+    async fn publish_as_verified_principal_overrides_claimed_name() {
+        let rt = tokio::runtime::Handle::current();
+        let mut state = minimal_host_state(rt);
+        state.has_uplink_capability = true;
+        state.ipc_publish_patterns = vec!["client.v1.*".to_string()];
+        state.ipc_subscribe_patterns = vec!["client.v1.*".to_string()];
+        // The framed read recorded the connection's verified principal.
+        state.ingress_principal = Some(astrid_core::PrincipalId::new("claude").unwrap());
+
+        let sub = IpcHost::subscribe(&mut state, "client.v1.connect".to_string())
+            .expect("subscribe allowed by ACL");
+
+        // The client lies on the wire: it names `default`.
+        IpcHost::publish_as(
+            &mut state,
+            "client.v1.connect".to_string(),
+            "{}".to_string(),
+            "default".to_string(),
+        )
+        .expect("publish_as should succeed");
+
+        assert_eq!(
+            drained_principals(&mut state, &sub),
+            vec!["claude".to_string()],
+            "the verified principal must override the claimed name (no escalation)"
+        );
+    }
+
+    /// An UNAUTHENTICATED (unbound) connection is stamped with the reserved
+    /// no-capability `anonymous` identity, NOT the principal it claimed — an
+    /// unproven claim earns no privilege (issue #45/#852). This is the residual
+    /// self-stamp #932 left for unbound connections, now closed: a client that
+    /// did not authenticate cannot act as `default` (or any named principal).
+    #[tokio::test]
+    async fn publish_as_unbound_connection_is_stamped_anonymous() {
+        let rt = tokio::runtime::Handle::current();
+        let mut state = minimal_host_state(rt);
+        state.has_uplink_capability = true;
+        state.ipc_publish_patterns = vec!["client.v1.*".to_string()];
+        state.ipc_subscribe_patterns = vec!["client.v1.*".to_string()];
+        // No in-flight verified principal (an unbound connection).
+        assert_eq!(state.ingress_principal, None);
+
+        let sub = IpcHost::subscribe(&mut state, "client.v1.connect".to_string())
+            .expect("subscribe allowed by ACL");
+
+        // The client claims `default` (admin) without having authenticated.
+        IpcHost::publish_as(
+            &mut state,
+            "client.v1.connect".to_string(),
+            "{}".to_string(),
+            "default".to_string(),
+        )
+        .expect("publish_as should succeed");
+
+        assert_eq!(
+            drained_principals(&mut state, &sub),
+            vec![astrid_core::principal::PrincipalId::anonymous().to_string()],
+            "an unauthenticated connection's claim earns no privilege — stamped anonymous"
         );
     }
 }

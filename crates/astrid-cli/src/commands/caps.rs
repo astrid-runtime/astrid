@@ -36,6 +36,50 @@ pub(crate) enum CapsCommand {
     Revoke(RevokeArgs),
     /// Test whether an agent holds a specific capability.
     Check(CheckArgs),
+    /// Manage signed capability tokens (pre-grant tool access without
+    /// per-use approval).
+    #[command(subcommand)]
+    Token(TokenCommand),
+}
+
+#[derive(Subcommand, Debug, Clone)]
+pub(crate) enum TokenCommand {
+    /// Mint a capability token pre-granting an agent access to a resource.
+    Mint(TokenMintArgs),
+    /// Revoke a capability token by its id.
+    Revoke(TokenRevokeArgs),
+    /// List the capability tokens minted for an agent.
+    List(TokenListArgs),
+}
+
+#[derive(Args, Debug, Clone)]
+pub(crate) struct TokenMintArgs {
+    /// Agent (principal) the token is minted for. Only this principal can
+    /// consume it.
+    pub principal: String,
+    /// Resource pattern to grant, e.g. `mcp://server:tool`.
+    pub resource: String,
+    /// Permission to grant. Defaults to `invoke` (the natural default for
+    /// `mcp://` tool grants). One of: read, write, execute, delete, invoke,
+    /// list, create.
+    #[arg(long)]
+    pub permission: Option<String>,
+    /// Token lifetime (e.g. `30m`, `24h`, or bare seconds). Omit for a
+    /// permanent token (valid until revoked).
+    #[arg(long)]
+    pub ttl: Option<String>,
+}
+
+#[derive(Args, Debug, Clone)]
+pub(crate) struct TokenRevokeArgs {
+    /// The token id (the `token_id` printed by `caps token mint`/`list`).
+    pub token_id: String,
+}
+
+#[derive(Args, Debug, Clone)]
+pub(crate) struct TokenListArgs {
+    /// Agent (principal) whose tokens are listed.
+    pub principal: String,
 }
 
 #[derive(Args, Debug, Clone)]
@@ -97,6 +141,11 @@ pub(crate) async fn run(cmd: CapsCommand) -> Result<ExitCode> {
         CapsCommand::Grant(args) => run_grant(args).await,
         CapsCommand::Revoke(args) => run_revoke(args).await,
         CapsCommand::Check(args) => run_check(args).await,
+        CapsCommand::Token(cmd) => match cmd {
+            TokenCommand::Mint(args) => run_token_mint(args).await,
+            TokenCommand::Revoke(args) => run_token_revoke(args).await,
+            TokenCommand::List(args) => run_token_list(args).await,
+        },
     }
 }
 
@@ -387,6 +436,138 @@ async fn run_check(args: CheckArgs) -> Result<ExitCode> {
         args.capability
     );
     Ok(ExitCode::from(1))
+}
+
+/// Extract the JSON body from a `Success` admin response, erroring on any
+/// other variant (errors are already lifted by [`into_result`]).
+fn success_value(body: AdminResponseBody) -> Result<serde_json::Value> {
+    match body {
+        AdminResponseBody::Success(v) => Ok(v),
+        other => anyhow::bail!("unexpected response from kernel: {other:?}"),
+    }
+}
+
+async fn run_token_mint(args: TokenMintArgs) -> Result<ExitCode> {
+    let principal = PrincipalId::new(&args.principal).context("invalid agent name")?;
+    // Reuse the shared duration parser (same one `agent create --timeout`
+    // uses) so `--ttl 30m` / `24h` / bare seconds all work; the kernel takes
+    // whole seconds.
+    let ttl_secs = match args.ttl.as_deref() {
+        Some(s) => Some(
+            crate::commands::quota::parse_duration(s)
+                .context("invalid --ttl")?
+                .as_secs(),
+        ),
+        None => None,
+    };
+
+    let mut client = crate::admin_client::connect_as_active_agent().await?;
+    let body = client
+        .request(AdminRequestKind::CapsTokenMint {
+            principal,
+            resource: args.resource.clone(),
+            permission: args.permission.clone(),
+            ttl_secs,
+        })
+        .await?;
+    let value = success_value(into_result(body)?)?;
+
+    let token_id = value
+        .get("token_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("?");
+    let resource = value
+        .get("resource")
+        .and_then(|v| v.as_str())
+        .unwrap_or(&args.resource);
+    let permission = value
+        .get("permission")
+        .and_then(|v| v.as_str())
+        .unwrap_or("invoke");
+    let expiry = value
+        .get("expires_at")
+        .and_then(|v| v.as_str())
+        .map_or_else(|| "never".to_string(), ToString::to_string);
+
+    println!(
+        "{}",
+        Theme::success(&format!(
+            "Minted token {token_id} for agent '{}'",
+            args.principal
+        ))
+    );
+    println!("  resource:   {resource}");
+    println!("  permission: {permission}");
+    println!("  expires:    {expiry}");
+    Ok(ExitCode::SUCCESS)
+}
+
+async fn run_token_revoke(args: TokenRevokeArgs) -> Result<ExitCode> {
+    let mut client = crate::admin_client::connect_as_active_agent().await?;
+    let body = client
+        .request(AdminRequestKind::CapsTokenRevoke {
+            token_id: args.token_id.clone(),
+        })
+        .await?;
+    let _ = success_value(into_result(body)?)?;
+    println!(
+        "{}",
+        Theme::success(&format!("Revoked token {}", args.token_id))
+    );
+    Ok(ExitCode::SUCCESS)
+}
+
+async fn run_token_list(args: TokenListArgs) -> Result<ExitCode> {
+    let principal = PrincipalId::new(&args.principal).context("invalid agent name")?;
+    let mut client = crate::admin_client::connect_as_active_agent().await?;
+    let body = client
+        .request(AdminRequestKind::CapsTokenList { principal })
+        .await?;
+    let value = success_value(into_result(body)?)?;
+
+    let tokens = value
+        .get("tokens")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    if tokens.is_empty() {
+        let principal = &args.principal;
+        println!("{}", Theme::info(&format!("(no tokens for '{principal}')")));
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    println!(
+        "  {}  {}  {}  {}",
+        format!("{:<38}", "TOKEN ID").bold(),
+        format!("{:<32}", "RESOURCE").bold(),
+        format!("{:<10}", "SCOPE").bold(),
+        "EXPIRES".bold()
+    );
+    for t in &tokens {
+        let id = t.get("token_id").and_then(|v| v.as_str()).unwrap_or("?");
+        let resource = t.get("resource").and_then(|v| v.as_str()).unwrap_or("?");
+        let scope = t.get("scope").and_then(|v| v.as_str()).unwrap_or("?");
+        let perms = t
+            .get("permissions")
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|p| p.as_str())
+                    .collect::<Vec<_>>()
+                    .join(",")
+            })
+            .unwrap_or_default();
+        let expires = t
+            .get("expires_at")
+            .and_then(|v| v.as_str())
+            .unwrap_or("never");
+        // Pad raw strings before printing (consistent with `print_caps_pretty`).
+        let id = format!("{id:<38}");
+        let resource = format!("{resource:<32}");
+        let scope = format!("{scope:<10}");
+        println!("  {id}  {resource}  {scope}  {expires}  [{perms}]");
+    }
+    Ok(ExitCode::SUCCESS)
 }
 
 #[cfg(test)]

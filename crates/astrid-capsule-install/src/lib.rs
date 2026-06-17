@@ -58,6 +58,7 @@
 
 pub mod archive;
 pub mod copy;
+pub mod furniture;
 pub mod lifecycle;
 pub mod local;
 pub mod manifest_check;
@@ -68,9 +69,11 @@ pub mod wit;
 
 pub use archive::unpack_and_install;
 pub use copy::copy_capsule_dir;
+pub use furniture::materialize_principal_furniture;
 pub use local::{InstallOptions, InstallOutput, InstallPhase, install_from_local_path};
 pub use manifest_check::{ExportConflict, MissingImport, check_export_conflicts, validate_imports};
 pub use meta::{
     CapsuleLocation, CapsuleMeta, InstalledCapsule, read_meta, scan_installed_capsules, write_meta,
 };
 pub use paths::{resolve_env_path, resolve_target_dir, restore_env_from_backup};
+pub use wit::{content_address_wit, materialize_wit_mirror};
