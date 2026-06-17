@@ -59,6 +59,25 @@ pub fn readiness_path() -> std::path::PathBuf {
     }
 }
 
+/// Path to the daemon PID file (`run/system.pid`).
+///
+/// The daemon records its PID here at boot (after acquiring the singleton
+/// lock). `astrid stop`/`astrid restart` read it to signal a wedged daemon
+/// that is unreachable over the socket but still holding the lock. Falls back
+/// to the same `/tmp` location as the socket so single-host development keeps
+/// working without env setup — and so the CLI looks where the daemon wrote.
+#[must_use]
+pub fn pid_path() -> std::path::PathBuf {
+    use astrid_core::dirs::AstridHome;
+    match AstridHome::resolve() {
+        Ok(home) => home.pid_path(),
+        Err(e) => {
+            warn!(error = %e, "Failed to resolve ASTRID_HOME; falling back to /tmp/.astrid/run/system.pid");
+            std::path::PathBuf::from("/tmp/.astrid/run/system.pid")
+        },
+    }
+}
+
 /// Path to the session-authentication token file.
 ///
 /// # Errors
@@ -71,6 +90,46 @@ pub fn token_path() -> Result<std::path::PathBuf> {
         .map_err(|e| anyhow::anyhow!("Failed to resolve ASTRID_HOME for token path: {e}"))?;
     Ok(home.token_path())
 }
+
+/// Why a [`SocketClient::read_until_topic_typed`] read ended without the
+/// awaited frame.
+///
+/// The two cases demand different recovery: a [`ConnectionLost`](Self::ConnectionLost)
+/// means the socket is dead and the caller should reconnect (and, for an
+/// idempotent request, retry); a [`Timeout`](Self::Timeout) means the deadline
+/// elapsed while the connection was still open — the broker is merely slow, so
+/// the caller must NOT reconnect (the request may still be in flight).
+#[derive(Debug)]
+pub enum ReadError {
+    /// The socket reached EOF or a read failed (peer closed / reset / broken
+    /// pipe). The connection is unusable; reconnect before the next request.
+    ConnectionLost(anyhow::Error),
+    /// The deadline elapsed with the connection still open. Do not reconnect.
+    Timeout,
+}
+
+impl std::fmt::Display for ReadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ConnectionLost(e) => write!(f, "connection lost: {e}"),
+            Self::Timeout => write!(f, "timed out waiting for broker reply"),
+        }
+    }
+}
+
+impl std::error::Error for ReadError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::ConnectionLost(e) => Some(e.as_ref()),
+            Self::Timeout => None,
+        }
+    }
+}
+
+// NOTE: no explicit `From<ReadError> for anyhow::Error` — `ReadError` is
+// `Send + Sync + 'static` and implements `std::error::Error`, so anyhow's
+// blanket `From<E>` already covers the `.map_err(Into::into)` in
+// `read_until_topic`. Adding our own would conflict with that blanket impl.
 
 /// A client connection to the kernel's Unix-domain socket.
 pub struct SocketClient {
@@ -215,20 +274,59 @@ impl SocketClient {
         want_topic: &str,
         timeout: std::time::Duration,
     ) -> Result<serde_json::Value> {
+        // Preserve the historical `anyhow` surface for the many callers that
+        // only care that *something* went wrong. The typed variant below is
+        // for callers (the MCP shim) that must distinguish a dead connection
+        // from a live-but-slow broker.
+        self.read_until_topic_typed(want_topic, timeout)
+            .await
+            .map_err(Into::into)
+    }
+
+    /// Like [`read_until_topic`](Self::read_until_topic) but returns a typed
+    /// [`ReadError`] so the caller can tell a connection-loss (EOF / reset)
+    /// apart from a genuine deadline timeout against a live daemon.
+    ///
+    /// This distinction matters for reconnect logic: a dead connection should
+    /// trigger a re-handshake (and, for idempotent requests, a retry), whereas
+    /// a deadline against a still-alive broker must NOT reconnect — the request
+    /// may still be in flight and the slow path is expected (a long-running
+    /// tool).
+    ///
+    /// # Errors
+    /// Returns [`ReadError::ConnectionLost`] if the socket reaches EOF or a
+    /// read fails (reset/broken pipe); [`ReadError::Timeout`] if `timeout`
+    /// elapses with the connection still open.
+    pub async fn read_until_topic_typed(
+        &mut self,
+        want_topic: &str,
+        timeout: std::time::Duration,
+    ) -> std::result::Result<serde_json::Value, ReadError> {
         let deadline = tokio::time::Instant::now()
             .checked_add(timeout)
             .unwrap_or_else(tokio::time::Instant::now);
         loop {
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
             if remaining.is_zero() {
-                anyhow::bail!("timed out waiting for {want_topic}");
+                return Err(ReadError::Timeout);
             }
             let read = tokio::time::timeout(remaining, self.read_raw_frame()).await;
             let frame = match read {
                 Ok(Ok(Some(bytes))) => bytes,
-                Ok(Ok(None)) => anyhow::bail!("connection closed before {want_topic}"),
-                Ok(Err(e)) => return Err(e),
-                Err(_) => anyhow::bail!("timed out waiting for {want_topic}"),
+                // `read_raw_frame` maps a clean EOF mid-length-prefix to
+                // `Ok(None)`: the peer closed the connection (daemon restart /
+                // half-open socket), which is a connection-loss, not a timeout.
+                Ok(Ok(None)) => {
+                    return Err(ReadError::ConnectionLost(anyhow::anyhow!(
+                        "connection closed before {want_topic}"
+                    )));
+                },
+                // A read error (reset / broken pipe / over-large frame) is also
+                // an unusable connection.
+                Ok(Err(e)) => return Err(ReadError::ConnectionLost(e)),
+                // The outer `tokio::time::timeout` fired: the deadline elapsed
+                // with the connection still open. The broker may simply be slow.
+                Err(_) => return Err(ReadError::Timeout),
             };
             let raw: serde_json::Value = match serde_json::from_slice(&frame) {
                 Ok(v) => v,

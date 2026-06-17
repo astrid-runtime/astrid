@@ -309,6 +309,15 @@ impl Kernel {
         // generated before any capsule can accept connections, preventing
         // a race where a client connects before the token file exists.
         let (listener, singleton_lock) = socket::bind_session_socket(&home)?;
+        // Record our PID immediately after acquiring the singleton lock, so the
+        // PID on disk always belongs to the process that holds the state-db
+        // lock. The CLI reads this to signal a wedged daemon that is no longer
+        // reachable over the socket but still holding the lock (which would
+        // otherwise wedge the next `astrid start`). Best-effort: a write
+        // failure only degrades `stop`/`restart` to socket-only cleanup.
+        if let Err(e) = socket::write_pid_file() {
+            tracing::warn!(error = %e, "Failed to write daemon PID file; stop/restart will fall back to socket-only cleanup");
+        }
         let (session_token, token_path) = socket::generate_session_token()?;
 
         let allowance_store = Arc::new(astrid_approval::AllowanceStore::new());
@@ -956,6 +965,7 @@ impl Kernel {
         let _ = std::fs::remove_file(&socket_path);
         let _ = std::fs::remove_file(&self.token_path);
         crate::socket::remove_readiness_file();
+        crate::socket::remove_pid_file();
 
         tracing::info!("Kernel shutdown complete");
     }

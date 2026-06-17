@@ -291,6 +291,20 @@ impl AstridHome {
         self.run_dir().join("system.ready")
     }
 
+    /// Path to the daemon PID file (`run/system.pid`).
+    ///
+    /// Written by the daemon at boot (after it has acquired the singleton
+    /// lock) and best-effort-removed on graceful shutdown. The CLI reads it
+    /// in `astrid stop`/`astrid restart` so that, when the socket is present
+    /// but unreachable (a wedged half-dead daemon still holding the state-db
+    /// lock), it can signal the orphaned process instead of merely deleting
+    /// the socket and leaving the lock held — which would wedge the next
+    /// `astrid start`.
+    #[must_use]
+    pub fn pid_path(&self) -> PathBuf {
+        self.run_dir().join("system.pid")
+    }
+
     /// Path to the deferred queue database (`run/deferred.db/`).
     #[must_use]
     pub fn deferred_db_path(&self) -> PathBuf {

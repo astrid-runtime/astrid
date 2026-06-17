@@ -10,6 +10,7 @@ pub(crate) mod chat;
 pub(crate) mod completions;
 pub(crate) mod config;
 pub(crate) mod daemon;
+pub(crate) mod daemon_control;
 pub(crate) mod distro;
 pub(crate) mod doctor;
 pub(crate) mod gc;

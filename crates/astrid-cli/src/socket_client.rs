@@ -5,7 +5,9 @@
 //! the shared crate now; this module keeps the historical import path
 //! (`crate::socket_client::*`) working without churning every caller.
 
-pub(crate) use astrid_uplink::socket_client::{SocketClient, proxy_socket_path, readiness_path};
+pub(crate) use astrid_uplink::socket_client::{
+    SocketClient, pid_path, proxy_socket_path, readiness_path,
+};
 
 use anyhow::Result;
 

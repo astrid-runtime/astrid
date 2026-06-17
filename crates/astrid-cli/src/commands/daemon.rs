@@ -3,6 +3,7 @@
 use anyhow::{Context, Result};
 
 use crate::bootstrap::find_companion_binary;
+use crate::commands::daemon_control;
 use crate::{socket_client, theme};
 
 /// Build a hint string pointing the user to the daemon log directory.
@@ -10,6 +11,32 @@ fn log_hint() -> String {
     astrid_core::dirs::AstridHome::resolve()
         .map(|h| format!(" Check logs: {}", h.log_dir().display()))
         .unwrap_or_default()
+}
+
+/// Open the daemon boot log (`log/daemon-boot.log`) for append, creating the
+/// log directory if needed, so the spawned daemon's stderr is captured.
+///
+/// A lock-acquisition failure (or any panic) before the kernel's own tracing
+/// subscriber initializes prints to stderr and is otherwise lost when stderr
+/// is `Stdio::null()`. Capturing it here is the only record of why a daemon
+/// died on boot. Returns `None` on any IO error, in which case the caller
+/// falls back to `Stdio::null()` rather than failing the spawn.
+fn boot_log_stderr() -> Option<std::process::Stdio> {
+    let home = astrid_core::dirs::AstridHome::resolve().ok()?;
+    let log_dir = home.log_dir();
+    std::fs::create_dir_all(&log_dir).ok()?;
+    let path = log_dir.join("daemon-boot.log");
+    let mut opts = std::fs::OpenOptions::new();
+    opts.create(true).append(true);
+    // Boot stderr can carry sensitive paths/state (home layout, lock paths,
+    // panic backtraces) — create it owner-only so other users can't read it.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        opts.mode(0o600);
+    }
+    let file = opts.open(path).ok()?;
+    Some(std::process::Stdio::from(file))
 }
 
 /// Spawn the daemon process and wait for it to signal readiness.
@@ -32,9 +59,14 @@ pub(crate) async fn spawn_daemon(ready_path: &std::path::Path) -> Result<std::pr
         cmd.arg("--workspace").arg(ws_path);
     }
 
+    // Capture the daemon's stderr to an append log so a boot failure (lock
+    // contention, panic before tracing init) leaves a record instead of
+    // vanishing into /dev/null. Stdout stays null — the daemon logs through
+    // tracing, not stdout. Fall back to null if the log file can't be opened.
+    let stderr = boot_log_stderr().unwrap_or_else(std::process::Stdio::null);
     cmd.stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
+        .stderr(stderr);
 
     // Remove stale readiness file before spawning so we don't
     // mistake a leftover from a crashed daemon for the new one.
@@ -117,9 +149,14 @@ pub(crate) async fn spawn_persistent_daemon() -> Result<()> {
         cmd.arg("--workspace").arg(ws_path);
     }
 
+    // Capture the daemon's stderr to an append log so a boot failure (lock
+    // contention, panic before tracing init) leaves a record instead of
+    // vanishing into /dev/null. Stdout stays null — the daemon logs through
+    // tracing, not stdout. Fall back to null if the log file can't be opened.
+    let stderr = boot_log_stderr().unwrap_or_else(std::process::Stdio::null);
     cmd.stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
+        .stderr(stderr);
 
     let _ = std::fs::remove_file(&ready_path);
 
@@ -261,11 +298,51 @@ pub(crate) async fn handle_stop() -> Result<()> {
             client.send_message(msg).await?;
             println!("{}", theme::Theme::success("Astrid daemon stopped."));
         }
+        // The daemon removes its own PID file on graceful shutdown; clean up
+        // best-effort here too in case the shutdown raced or the file was
+        // left behind by an earlier wedged run.
+        let _ = std::fs::remove_file(socket_client::pid_path());
     } else {
-        // Socket exists but can't connect — stale. Clean up.
+        // Socket exists but the handshake failed — the daemon is hung or
+        // half-dead. Deleting the socket alone is NOT enough: the orphaned
+        // process keeps holding the singleton/state-db lock, so the next
+        // `astrid start` would die with "Database … is already locked". Read
+        // the PID it recorded at boot and signal it (SIGTERM, then SIGKILL)
+        // before cleaning up, so the lock is actually released.
+        let pid_path = socket_client::pid_path();
+        match daemon_control::terminate_orphan(&pid_path).await {
+            daemon_control::KillOutcome::NotRunning => {
+                println!("{}", theme::Theme::info("Cleaned up stale daemon socket."));
+            },
+            daemon_control::KillOutcome::TermExited | daemon_control::KillOutcome::KilledExited => {
+                println!(
+                    "{}",
+                    theme::Theme::success("Stopped an unresponsive Astrid daemon.")
+                );
+            },
+            daemon_control::KillOutcome::StillAlive => {
+                eprintln!(
+                    "{}",
+                    theme::Theme::error(
+                        "An unresponsive Astrid daemon did not exit even after SIGKILL; \
+                         the state-db lock may still be held."
+                    )
+                );
+            },
+            daemon_control::KillOutcome::Unverified(pid) => {
+                eprintln!(
+                    "{}",
+                    theme::Theme::warning(&format!(
+                        "A process (PID {pid}) holds the recorded daemon PID but I can't \
+                         confirm it's the Astrid daemon (possible PID reuse) — not killing it. \
+                         If the daemon is genuinely stuck, inspect PID {pid} and stop it manually."
+                    ))
+                );
+            },
+        }
         let _ = std::fs::remove_file(&socket_path);
         let _ = std::fs::remove_file(socket_client::readiness_path());
-        println!("{}", theme::Theme::info("Cleaned up stale daemon socket."));
+        let _ = std::fs::remove_file(&pid_path);
     }
     Ok(())
 }
