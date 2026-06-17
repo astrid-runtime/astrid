@@ -323,9 +323,22 @@ pub fn write_pid_file() -> Result<(), std::io::Error> {
         opts.mode(0o600);
     }
 
+    // Resolve our own executable, canonicalized to defeat the launch symlink
+    // (`~/.astrid/bin/astrid-daemon` → the real binary). The CLI compares this
+    // against the live process's exe before signalling, so a recycled PID owned
+    // by an unrelated process is never killed. Best-effort: if we can't resolve
+    // it, write the PID alone and the CLI fails secure (treats it as unverifiable).
+    let exe_line = std::env::current_exe()
+        .and_then(std::fs::canonicalize)
+        .ok()
+        .and_then(|p| p.to_str().map(str::to_owned));
+
     let write_result = (|| -> std::io::Result<()> {
         let mut file = opts.open(&tmp)?;
-        write!(file, "{}", std::process::id())?;
+        match &exe_line {
+            Some(exe) => write!(file, "{}\n{}", std::process::id(), exe)?,
+            None => write!(file, "{}", std::process::id())?,
+        }
         file.flush()?;
         file.sync_all()?;
         Ok(())

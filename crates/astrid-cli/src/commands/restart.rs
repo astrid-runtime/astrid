@@ -49,20 +49,33 @@ pub(crate) async fn run() -> Result<ExitCode> {
     // already locked". Verify the recorded PID is actually gone (signalling it
     // if it survived `handle_stop`'s own kill path) before spawning.
     let pid_path = socket_client::pid_path();
-    if let Some(pid) = daemon_control::read_pid_file(&pid_path)
+    if let Some((pid, _exe)) = daemon_control::read_pid_file(&pid_path)
         && daemon_control::is_process_alive(pid)
     {
         eprintln!(
             "{}",
-            Theme::warning(
-                "Previous Astrid daemon is still alive after stop — terminating it before restart."
-            )
+            Theme::warning(&format!(
+                "A process holding the recorded daemon PID {pid} is still alive after stop — \
+                 verifying before restart."
+            ))
         );
         match daemon_control::terminate_orphan(&pid_path).await {
             daemon_control::KillOutcome::StillAlive => {
                 anyhow::bail!(
                     "The previous Astrid daemon (PID {pid}) did not exit even after SIGKILL; \
                      refusing to start a second daemon while the lock may still be held."
+                );
+            },
+            daemon_control::KillOutcome::Unverified(p) => {
+                // Fail-secure: a live PID we can't confirm is the daemon (likely
+                // PID reuse) is NOT killed. Don't blindly spawn either — if it
+                // *were* the daemon, the lock is still held and the spawn would
+                // fail on it anyway. Make the operator resolve it explicitly.
+                anyhow::bail!(
+                    "Cannot confirm PID {p} is the Astrid daemon (possible PID reuse); \
+                     refusing to auto-restart. Inspect PID {p} — if it is not Astrid, \
+                     remove {} and retry.",
+                    pid_path.display()
                 );
             },
             _ => {

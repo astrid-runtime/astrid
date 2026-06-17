@@ -93,13 +93,32 @@ fn pid_file_write_read_remove_round_trip() {
     let pid_path = astrid_kernel::socket::pid_path();
     assert!(pid_path.exists(), "pid file should exist after write");
 
-    // CLI reads the same path and gets the current process PID back.
+    // CLI reads the same path: line 1 is the PID, line 2 (optional) is the
+    // canonicalized daemon executable used for the identity guard on kill.
     let contents = std::fs::read_to_string(&pid_path).unwrap();
-    let parsed: u32 = contents
+    let mut lines = contents.lines();
+    let parsed: u32 = lines
+        .next()
+        .expect("pid file has a first line")
         .trim()
         .parse()
-        .expect("pid file is a plain integer");
+        .expect("first line is a plain integer");
     assert_eq!(parsed, std::process::id(), "recorded pid is this process");
+
+    // The recorded exe must match this process's canonicalized executable (so
+    // the orphan-kill path can confirm identity before signalling). If the
+    // platform couldn't resolve current_exe, write_pid_file degrades to PID-only
+    // and both sides are None.
+    let recorded_exe = lines.next().map(str::trim).filter(|s| !s.is_empty());
+    let expected_exe = std::env::current_exe()
+        .and_then(std::fs::canonicalize)
+        .ok()
+        .and_then(|p| p.to_str().map(str::to_owned));
+    assert_eq!(
+        recorded_exe.map(str::to_owned),
+        expected_exe,
+        "recorded exe matches this process's canonical executable"
+    );
 
     // Graceful shutdown removes it.
     astrid_kernel::socket::remove_pid_file();

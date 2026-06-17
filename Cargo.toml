@@ -128,6 +128,7 @@ keyring = { version = "3", features = [
     "crypto-rust",
 ] }
 landlock = "0.4"
+libc = "0.2"
 nix = { version = "0.29", features = ["process", "signal", "user", "fs", "resource"] }
 # Metric recording facade + Prometheus exporter. The facade decouples
 # recording (`counter!()`, `histogram!()` macros) from export format,

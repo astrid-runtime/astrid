@@ -324,6 +324,16 @@ pub(crate) async fn handle_stop() -> Result<()> {
                     )
                 );
             },
+            daemon_control::KillOutcome::Unverified(pid) => {
+                eprintln!(
+                    "{}",
+                    theme::Theme::warning(&format!(
+                        "A process (PID {pid}) holds the recorded daemon PID but I can't \
+                         confirm it's the Astrid daemon (possible PID reuse) — not killing it. \
+                         If the daemon is genuinely stuck, inspect PID {pid} and stop it manually."
+                    ))
+                );
+            },
         }
         let _ = std::fs::remove_file(&socket_path);
         let _ = std::fs::remove_file(socket_client::readiness_path());
