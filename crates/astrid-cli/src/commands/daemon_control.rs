@@ -121,14 +121,15 @@ fn exe_path_of_pid(pid: u32) -> Option<PathBuf> {
 #[cfg(target_os = "macos")]
 #[allow(unsafe_code)]
 fn exe_path_of_pid(pid: u32) -> Option<PathBuf> {
-    // `PROC_PIDPATHINFO_MAXSIZE` = 4 * MAXPATHLEN (4096) = 16384.
-    const BUF_LEN: u32 = 16384;
+    // `PROC_PIDPATHINFO_MAXSIZE` = 4 * MAXPATHLEN (4096) = 16384. A fixed
+    // stack buffer of that exact size avoids a heap allocation per call.
+    let mut buf = [0u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
     let raw = i32::try_from(pid).ok()?;
-    let mut buf = vec![0u8; BUF_LEN as usize];
-    // SAFETY: `proc_pidpath` writes at most `BUF_LEN` bytes into `buf`,
+    let buf_len = u32::try_from(buf.len()).ok()?;
+    // SAFETY: `proc_pidpath` writes at most `buf_len` bytes into `buf`,
     // returning the count written (> 0) or <= 0 on error. We pass the true
     // buffer length and only read the returned count.
-    let n = unsafe { libc::proc_pidpath(raw, buf.as_mut_ptr().cast::<libc::c_void>(), BUF_LEN) };
+    let n = unsafe { libc::proc_pidpath(raw, buf.as_mut_ptr().cast::<libc::c_void>(), buf_len) };
     if n <= 0 {
         return None;
     }
@@ -230,6 +231,17 @@ pub(crate) async fn terminate_orphan(pid_path: &Path) -> KillOutcome {
     let _ = signal(pid, nix::sys::signal::Signal::SIGTERM);
     if wait_for_exit(pid, GRACE).await {
         return KillOutcome::TermExited;
+    }
+
+    // Re-verify identity before escalating (fail-secure, grace-window race): the
+    // daemon may have exited cleanly during the grace window and the OS may have
+    // recycled its PID for an unrelated process. In that case `wait_for_exit`
+    // returns false (the recycled PID is alive), but escalating to SIGKILL here
+    // would kill an innocent process. Recompute the live exe and refuse to
+    // signal unless it still provably matches the recorded daemon exe.
+    let live_exe = exe_path_of_pid(pid);
+    if !exe_matches(recorded_exe.as_deref(), live_exe.as_deref()) {
+        return KillOutcome::Unverified(pid);
     }
 
     // Escalate. A truly wedged process (e.g. stuck in uninterruptible IO) may
@@ -410,5 +422,31 @@ mod tests {
         let path = dir.path().join("system.pid");
         std::fs::write(&path, "2000000000").unwrap();
         assert_eq!(terminate_orphan(&path).await, KillOutcome::NotRunning);
+    }
+
+    /// The SIGKILL escalation is gated by the SAME identity check as the initial
+    /// SIGTERM ([`exe_matches`]): a live PID whose exe no longer matches the
+    /// recorded daemon must yield `Unverified` rather than be killed. This
+    /// asserts the gate predicate directly.
+    ///
+    /// A fully deterministic test of the live grace-window race — daemon exits
+    /// AND the OS recycles its exact PID to an unrelated process between SIGTERM
+    /// and SIGKILL — is impractical: it would require driving real PID reuse on a
+    /// known PID within a ~3s window, which is racy and OS-scheduler-dependent.
+    /// The `terminate_orphan_refuses_*` tests above already prove the pre-SIGTERM
+    /// gate against a live mismatched PID (the test runner itself); the
+    /// escalation re-verification reuses that identical predicate, so the gate's
+    /// correctness is what we assert here.
+    #[test]
+    fn escalation_identity_gate_refuses_on_mismatch() {
+        let recorded = PathBuf::from("/opt/astrid/astrid-daemon");
+        // Recycled PID now runs an unrelated binary → must not be killed.
+        let recycled = PathBuf::from("/usr/bin/unrelated-process");
+        assert!(
+            !exe_matches(Some(&recorded), Some(&recycled)),
+            "escalation must refuse to SIGKILL when the live exe no longer matches"
+        );
+        // Recorded exe still resolves to the same binary → escalation proceeds.
+        assert!(exe_matches(Some(&recorded), Some(&recorded)));
     }
 }

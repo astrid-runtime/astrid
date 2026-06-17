@@ -80,6 +80,10 @@ pub(crate) struct AstridMcpServer {
     /// out on a stale/half-open fd left behind by a daemon restart. A clean
     /// 55 s deadline against a live-but-slow broker does NOT set this — that is
     /// not a dead connection.
+    ///
+    /// Every access is made while the `client` mutex is held (see `forward`), so
+    /// the flag is already serialized by that lock and needs no inter-thread
+    /// ordering of its own — all accesses use `Ordering::Relaxed`.
     needs_reconnect: AtomicBool,
 }
 
@@ -126,7 +130,7 @@ impl AstridMcpServer {
         // fully-authenticated connection rather than silently dropping into a
         // half-open socket. A clean deadline against a slow broker never sets
         // the flag, so a slow tool does not force a needless reconnect.
-        if self.needs_reconnect.swap(false, Ordering::SeqCst) {
+        if self.needs_reconnect.swap(false, Ordering::Relaxed) {
             warn!(
                 topic = request_topic,
                 "MCP shim: pre-healing a connection flagged dead by a prior round trip"
@@ -134,7 +138,7 @@ impl AstridMcpServer {
             if let Err(e) = client.reconnect().await {
                 // Re-arm the flag: the connection is still dead, so the next
                 // attempt must try to heal again rather than assume health.
-                self.needs_reconnect.store(true, Ordering::SeqCst);
+                self.needs_reconnect.store(true, Ordering::Relaxed);
                 warn!(error = %e, "MCP shim: pre-heal reconnect failed");
                 return Err(McpError::internal_error(
                     format!("reconnect to daemon failed: {e}"),
@@ -178,7 +182,7 @@ impl AstridMcpServer {
             // a `tools/call` (or a consent/approval respond) may have already
             // taken effect on the broker, so we must NOT silently re-run it.
             Err(ReadError::ConnectionLost(e)) => {
-                self.needs_reconnect.store(true, Ordering::SeqCst);
+                self.needs_reconnect.store(true, Ordering::Relaxed);
                 if is_request_retriable(request_topic) {
                     warn!(topic = request_topic, error = %e, "MCP shim: connection lost awaiting reply; reconnecting and retrying idempotent request once");
                     client.reconnect().await.map_err(|re| {
@@ -186,7 +190,7 @@ impl AstridMcpServer {
                         McpError::internal_error(format!("reconnect to daemon failed: {re}"), None)
                     })?;
                     // Healed in-line; clear the flag we just set.
-                    self.needs_reconnect.store(false, Ordering::SeqCst);
+                    self.needs_reconnect.store(false, Ordering::Relaxed);
                     client.send_message(msg).await.map_err(|se| {
                         warn!(topic = request_topic, error = %se, "MCP shim: re-publish after reconnect failed");
                         McpError::internal_error(
@@ -200,7 +204,7 @@ impl AstridMcpServer {
                         .map_err(|re| {
                             // Flag again — the retry's connection may also be dead.
                             if matches!(re, ReadError::ConnectionLost(_)) {
-                                self.needs_reconnect.store(true, Ordering::SeqCst);
+                                self.needs_reconnect.store(true, Ordering::Relaxed);
                             }
                             warn!(topic = %reply_topic, error = %re, "MCP shim: broker reply not received after idempotent retry");
                             McpError::internal_error(

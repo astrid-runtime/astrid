@@ -26,11 +26,16 @@ fn boot_log_stderr() -> Option<std::process::Stdio> {
     let log_dir = home.log_dir();
     std::fs::create_dir_all(&log_dir).ok()?;
     let path = log_dir.join("daemon-boot.log");
-    let file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-        .ok()?;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.create(true).append(true);
+    // Boot stderr can carry sensitive paths/state (home layout, lock paths,
+    // panic backtraces) — create it owner-only so other users can't read it.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        opts.mode(0o600);
+    }
+    let file = opts.open(path).ok()?;
     Some(std::process::Stdio::from(file))
 }
 
