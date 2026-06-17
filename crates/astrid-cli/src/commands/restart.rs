@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 use tokio::time::sleep;
 
-use crate::commands::daemon;
+use crate::commands::{daemon, daemon_control};
 use crate::socket_client;
 use crate::theme::Theme;
 
@@ -40,6 +40,35 @@ pub(crate) async fn run() -> Result<ExitCode> {
                 "Daemon did not exit cleanly within 5s — cleaning up stale socket and restarting."
             )
         );
+    }
+
+    // The socket file being gone does NOT prove the daemon process exited and
+    // released the singleton/state-db lock — a wedged daemon `handle_stop`
+    // could not reach over the socket may still be alive. Spawning now would
+    // race the new daemon against a held lock and fail with "Database … is
+    // already locked". Verify the recorded PID is actually gone (signalling it
+    // if it survived `handle_stop`'s own kill path) before spawning.
+    let pid_path = socket_client::pid_path();
+    if let Some(pid) = daemon_control::read_pid_file(&pid_path)
+        && daemon_control::is_process_alive(pid)
+    {
+        eprintln!(
+            "{}",
+            Theme::warning(
+                "Previous Astrid daemon is still alive after stop — terminating it before restart."
+            )
+        );
+        match daemon_control::terminate_orphan(&pid_path).await {
+            daemon_control::KillOutcome::StillAlive => {
+                anyhow::bail!(
+                    "The previous Astrid daemon (PID {pid}) did not exit even after SIGKILL; \
+                     refusing to start a second daemon while the lock may still be held."
+                );
+            },
+            _ => {
+                let _ = std::fs::remove_file(&pid_path);
+            },
+        }
     }
 
     daemon::spawn_persistent_daemon().await?;

@@ -269,6 +269,89 @@ pub fn remove_readiness_file() {
     let _ = std::fs::remove_file(readiness_path());
 }
 
+/// Path to the daemon PID file (`run/system.pid`).
+///
+/// NOTE: kept here alongside the other run-dir path helpers; the canonical
+/// definition is `AstridHome::pid_path()` in `astrid-core`. Falls back to
+/// the same `/tmp` location as the socket so a dev daemon that can't resolve
+/// `ASTRID_HOME` still records its PID consistently with where the CLI looks.
+#[must_use]
+pub fn pid_path() -> PathBuf {
+    use astrid_core::dirs::AstridHome;
+    match AstridHome::resolve() {
+        Ok(home) => home.pid_path(),
+        Err(e) => {
+            warn!(error = %e, "Failed to resolve ASTRID_HOME; falling back to /tmp/.astrid/run/system.pid");
+            PathBuf::from("/tmp/.astrid/run/system.pid")
+        },
+    }
+}
+
+/// Write the current process PID to the daemon PID file, atomically.
+///
+/// Called at boot AFTER the singleton lock is acquired, so the recorded PID
+/// always belongs to the process that holds the state-db lock. The CLI reads
+/// this in `astrid stop`/`astrid restart` to signal a wedged daemon that is
+/// no longer reachable over the socket but is still holding the lock.
+///
+/// Written via temp-file + rename so a reader never observes a half-written
+/// PID, and with 0o600 permissions to match the other run-dir artifacts.
+///
+/// # Errors
+/// Returns an error if the run directory cannot be created or the file cannot
+/// be written/renamed. The caller treats this as best-effort (a missing PID
+/// file only degrades `stop`/`restart` to socket-only cleanup), so it logs
+/// rather than aborting boot.
+pub fn write_pid_file() -> Result<(), std::io::Error> {
+    use std::io::Write as _;
+
+    let path = pid_path();
+
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    // Write to a uniquely-named temp file in the same directory, then rename
+    // over the target so the swap is atomic on the same filesystem.
+    let tmp = path.with_extension(format!("pid.tmp.{}", std::process::id()));
+
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+
+    let write_result = (|| -> std::io::Result<()> {
+        let mut file = opts.open(&tmp)?;
+        write!(file, "{}", std::process::id())?;
+        file.flush()?;
+        file.sync_all()?;
+        Ok(())
+    })();
+    if let Err(e) = write_result {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+
+    if let Err(e) = std::fs::rename(&tmp, &path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    Ok(())
+}
+
+/// Remove the daemon PID file (best-effort).
+///
+/// Called during graceful shutdown. Errors are silently ignored — a missing
+/// file is not an error, and a stale PID file is handled by the CLI's
+/// liveness check (a PID that is dead is treated as already-gone) plus the
+/// pre-spawn cleanup on next boot.
+pub fn remove_pid_file() {
+    let _ = std::fs::remove_file(pid_path());
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -54,6 +54,7 @@ crossterm = { workspace = true }
 directories = { workspace = true }
 flate2 = { workspace = true }
 indicatif = { workspace = true }
+nix = { workspace = true }
 ratatui = { workspace = true }
 reqwest = { workspace = true, features = ["json"] }
 rmcp = { workspace = true }
