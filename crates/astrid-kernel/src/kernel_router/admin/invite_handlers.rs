@@ -126,24 +126,7 @@ pub(crate) async fn invite_redeem(
     };
     let _ = invite::prune_expired(&mut invites);
 
-    let token_hash = invite::hash_token(&token);
-    let now = invite::now_epoch();
-
-    // Constant-time scan over all live invites. We avoid `Vec::find`
-    // short-circuiting because timing on its early-return would leak
-    // partial-match length information.
-    let mut matched_index: Option<usize> = None;
-    for (i, inv) in invites.iter().enumerate() {
-        let live = inv.remaining_uses > 0 && inv.expires_at_epoch.is_none_or(|e| e > now);
-        // Always run the hash compare so a malformed/expired/consumed
-        // entry takes the same time as a live one.
-        let hit = invite::ct_hash_eq(&inv.token_hash, &token_hash) && live;
-        if hit && matched_index.is_none() {
-            matched_index = Some(i);
-        }
-    }
-
-    let Some(idx) = matched_index else {
+    let Some(idx) = find_live_invite_index(&invites, &token) else {
         return err_unauthorized("invite token invalid, expired, or already consumed".into());
     };
 
@@ -214,6 +197,8 @@ pub(crate) async fn invite_redeem(
         return err_internal(format!("principal home tree provisioning failed: {e}"));
     }
 
+    super::handlers::sync_principal_furniture(kernel, &principal);
+
     // Decrement / remove the invite. Saturating sub guards against
     // an externally-edited `remaining_uses = 0` slipping past the
     // live-check above.
@@ -246,6 +231,29 @@ pub(crate) async fn invite_redeem(
         group: chosen.group,
         public_key_fingerprint: fingerprint,
     })
+}
+
+/// Find the index of the first live invite whose token hashes to `token`.
+///
+/// Constant-time scan over all invites: we avoid `Iterator::find`'s
+/// short-circuit because timing on its early return would leak
+/// partial-match length information. The hash compare runs for every entry
+/// (including malformed / expired / consumed ones) so all entries take the
+/// same time, and only the first live hit is recorded. Returns `None` when
+/// no live invite matches.
+fn find_live_invite_index(invites: &[Invite], token: &str) -> Option<usize> {
+    let token_hash = invite::hash_token(token);
+    let now = invite::now_epoch();
+
+    let mut matched_index: Option<usize> = None;
+    for (i, inv) in invites.iter().enumerate() {
+        let live = inv.remaining_uses > 0 && inv.expires_at_epoch.is_none_or(|e| e > now);
+        let hit = invite::ct_hash_eq(&inv.token_hash, &token_hash) && live;
+        if hit && matched_index.is_none() {
+            matched_index = Some(i);
+        }
+    }
+    matched_index
 }
 
 // ── invite.list ───────────────────────────────────────────────────────

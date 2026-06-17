@@ -24,6 +24,7 @@
 mod caps_tokens;
 #[cfg(test)]
 mod enforcement_tests;
+mod group;
 mod handlers;
 mod inheritance;
 mod invite_handlers;

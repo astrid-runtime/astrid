@@ -29,10 +29,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use astrid_core::capability_grammar::validate_capability;
-use astrid_core::groups::{Group, GroupConfig};
 use astrid_core::principal::PrincipalId;
 use astrid_core::profile::{PrincipalProfile, ProfileError};
-use astrid_events::kernel_api::{AdminRequestKind, AdminResponseBody, AgentSummary, GroupSummary};
+use astrid_events::kernel_api::{AdminRequestKind, AdminResponseBody, AgentSummary};
 use tracing::{info, warn};
 
 /// Platform label used by the identity store for agent principals
@@ -80,15 +79,19 @@ pub(super) async fn dispatch(
             capabilities,
             description,
             unsafe_admin,
-        } => group_create(kernel, name, capabilities, description, unsafe_admin).await,
-        AdminRequestKind::GroupDelete { name } => group_delete(kernel, name).await,
+        } => {
+            super::group::group_create(kernel, name, capabilities, description, unsafe_admin).await
+        },
+        AdminRequestKind::GroupDelete { name } => super::group::group_delete(kernel, name).await,
         AdminRequestKind::GroupModify {
             name,
             capabilities,
             description,
             unsafe_admin,
-        } => group_modify(kernel, name, capabilities, description, unsafe_admin).await,
-        AdminRequestKind::GroupList => group_list(kernel),
+        } => {
+            super::group::group_modify(kernel, name, capabilities, description, unsafe_admin).await
+        },
+        AdminRequestKind::GroupList => super::group::group_list(kernel),
         AdminRequestKind::CapsGrant {
             principal,
             capabilities,
@@ -322,6 +325,11 @@ async fn agent_create(
             "principal home tree provisioning failed (rolled back): {e}"
         ));
     }
+
+    // Mirror the read-only introspection furniture so this fresh principal's
+    // `system_status` / `list_interfaces` reflect the globally-loaded capsule
+    // set instead of an empty home. Best-effort (see helper docs).
+    sync_principal_furniture(kernel, &principal);
 
     // State inheritance is OPT-IN. By default the new principal inherits
     // NOTHING — least privilege, and no silent leak of `default`'s env
@@ -770,88 +778,6 @@ fn agent_list(kernel: &Arc<crate::Kernel>, caller: &PrincipalId) -> AdminRespons
     AdminResponseBody::AgentList(summaries)
 }
 
-// ── Groups ─────────────────────────────────────────────────────────────
-
-async fn group_create(
-    kernel: &Arc<crate::Kernel>,
-    name: String,
-    capabilities: Vec<String>,
-    description: Option<String>,
-    unsafe_admin: bool,
-) -> AdminResponseBody {
-    let group = Group {
-        capabilities,
-        description,
-        unsafe_admin,
-    };
-    let _guard = kernel.admin_write_lock.lock().await;
-    let current = kernel.groups.load_full();
-    let next = match current.insert_custom_group(name, group) {
-        Ok(n) => n,
-        Err(e) => return err_bad_input(format!("group.create rejected: {e}")),
-    };
-    commit_group_config(kernel, next)
-}
-
-async fn group_delete(kernel: &Arc<crate::Kernel>, name: String) -> AdminResponseBody {
-    let _guard = kernel.admin_write_lock.lock().await;
-    let current = kernel.groups.load_full();
-    let next = match current.remove_group(&name) {
-        Ok(n) => n,
-        Err(e) => return err_bad_input(format!("group.delete rejected: {e}")),
-    };
-    commit_group_config(kernel, next)
-}
-
-// `Option<Option<String>>` intentionally encodes three states: `None` =
-// keep existing description, `Some(None)` = clear it, `Some(Some(v))` =
-// replace with `v`. Collapsing to a single `Option` would conflate "no
-// change" with "clear" at the wire format. Clippy's `option_option` lint
-// is overly cautious for partial-update APIs.
-#[allow(clippy::option_option)]
-async fn group_modify(
-    kernel: &Arc<crate::Kernel>,
-    name: String,
-    capabilities: Option<Vec<String>>,
-    description: Option<Option<String>>,
-    unsafe_admin: Option<bool>,
-) -> AdminResponseBody {
-    let _guard = kernel.admin_write_lock.lock().await;
-    let current = kernel.groups.load_full();
-    let next = match current.modify_custom_group(&name, capabilities, description, unsafe_admin) {
-        Ok(n) => n,
-        Err(e) => return err_bad_input(format!("group.modify rejected: {e}")),
-    };
-    commit_group_config(kernel, next)
-}
-
-fn group_list(kernel: &Arc<crate::Kernel>) -> AdminResponseBody {
-    let cfg = kernel.groups.load_full();
-    let mut summaries: Vec<GroupSummary> = cfg
-        .iter()
-        .map(|(name, group)| GroupSummary {
-            name: name.clone(),
-            capabilities: group.capabilities.clone(),
-            description: group.description.clone(),
-            unsafe_admin: group.unsafe_admin,
-            builtin: GroupConfig::is_builtin_name(name),
-        })
-        .collect();
-    summaries.sort_by(|a, b| a.name.cmp(&b.name));
-    AdminResponseBody::GroupList(summaries)
-}
-
-/// Commit a new [`GroupConfig`] to disk and the
-/// [`ArcSwap`](arc_swap::ArcSwap). Caller must hold the admin write lock.
-fn commit_group_config(kernel: &Arc<crate::Kernel>, next: GroupConfig) -> AdminResponseBody {
-    let path = GroupConfig::path_for(&kernel.astrid_home);
-    if let Err(e) = next.save_to_path(&path) {
-        return err_internal(format!("groups.toml save failed: {e}"));
-    }
-    kernel.groups.store(Arc::new(next));
-    success_json(serde_json::json!({ "status": "ok" }))
-}
-
 // ── Per-principal grants / revokes ─────────────────────────────────────
 
 enum CapsMutation {
@@ -970,6 +896,30 @@ pub(super) fn require_principal_exists(principal: &PrincipalId, path: &Path) -> 
             "principal {principal} does not exist (no profile.toml at {})",
             path.display()
         ))
+    }
+}
+
+/// Mirror the read-only introspection furniture (installed-capsule registry
+/// plus the `home://wit/` interface mirror) from the install principal's home
+/// into a freshly-created principal's home, so its `system_status` /
+/// `list_interfaces` reflect the globally-loaded capsule set, not an empty home.
+///
+/// Best-effort: callers invoke this AFTER the principal's home tree is
+/// provisioned, so a sync failure must not fail the create/redeem — it only
+/// degrades introspection visibility, and the boot sweep retries on next
+/// daemon start. Env config (`.config/env/`) is deliberately excluded inside
+/// [`astrid_capsule_install::materialize_principal_furniture`] for secret
+/// isolation.
+pub(super) fn sync_principal_furniture(kernel: &Arc<crate::Kernel>, principal: &PrincipalId) {
+    if let Err(e) =
+        astrid_capsule_install::materialize_principal_furniture(&kernel.astrid_home, principal)
+    {
+        warn!(
+            %principal,
+            error = %format!("{e:#}"),
+            "failed to materialize per-principal home furniture; \
+             introspection tools may not see the loaded capsule set"
+        );
     }
 }
 
