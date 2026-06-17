@@ -38,6 +38,11 @@ pub(crate) struct NewArgs {
     /// Overwrite an existing non-empty target directory.
     #[arg(long)]
     pub force: bool,
+    /// If the `wasm32-unknown-unknown` target is missing and `rustup` is
+    /// available, install it without prompting (`rustup target add
+    /// wasm32-unknown-unknown`). Useful in non-interactive setups.
+    #[arg(long)]
+    pub install_target: bool,
 }
 
 /// Entry point for `astrid capsule new`.
@@ -87,11 +92,193 @@ pub(crate) fn run(args: &NewArgs) -> Result<ExitCode> {
         }
     }
 
+    // Toolchain preflight runs BEFORE we write the skeleton so any missing
+    // piece is surfaced up-front. It is fail-FRIENDLY: a missing toolchain
+    // only warns and guides — we still generate the project so the author has
+    // something to build once they install what they need.
+    preflight::check(args.install_target);
+
     scaffold(&target, &args.name)
         .with_context(|| format!("failed to scaffold capsule into {}", target.display()))?;
 
     print_next_steps(&target, &args.name);
     Ok(ExitCode::SUCCESS)
+}
+
+/// Rust-toolchain preflight: verify `cargo`/`rustc` and the
+/// `wasm32-unknown-unknown` target are present, warn + guide if not, and offer
+/// to install the target when `rustup` is available.
+///
+/// Every check is fail-FRIENDLY: nothing here aborts the scaffold. A capsule
+/// author who runs `astrid capsule new` on a machine without the wasm target
+/// still gets a complete, correct project — they just get told exactly what to
+/// install before the first build succeeds.
+mod preflight {
+    use std::io::IsTerminal;
+    use std::process::Command;
+
+    use crate::theme::Theme;
+
+    /// The compile target every capsule builds for.
+    const WASM_TARGET: &str = "wasm32-unknown-unknown";
+
+    /// Run the full preflight. `install_target` forces a non-interactive
+    /// `rustup target add` when the target is missing and `rustup` is present.
+    pub(super) fn check(install_target: bool) {
+        // cargo / rustc presence. A missing toolchain is the only thing that
+        // makes the rest moot, so report it and stop probing (but still let
+        // the caller scaffold).
+        let have_cargo = tool_present("cargo");
+        let have_rustc = tool_present("rustc");
+        if !have_cargo || !have_rustc {
+            warn_no_rust_toolchain(have_cargo, have_rustc);
+            return;
+        }
+
+        if wasm_target_installed() {
+            return;
+        }
+
+        // Target missing. If rustup drives the toolchain we can fix it for the
+        // author; otherwise we can only point at the right command.
+        if rustup_present() {
+            if install_target || prompt_install() {
+                if run_target_add() {
+                    eprintln!(
+                        "{}",
+                        Theme::success(&format!("installed the {WASM_TARGET} target"))
+                    );
+                    return;
+                }
+                eprintln!(
+                    "{}",
+                    Theme::warning(&format!(
+                        "could not install the {WASM_TARGET} target automatically — \
+                         run `rustup target add {WASM_TARGET}` yourself."
+                    ))
+                );
+            } else {
+                guide_rustup_target_add();
+            }
+        } else {
+            guide_rustup_target_add();
+        }
+    }
+
+    /// Whether `tool --version` runs successfully (i.e. the binary is on PATH).
+    fn tool_present(tool: &str) -> bool {
+        Command::new(tool)
+            .arg("--version")
+            .output()
+            .is_ok_and(|o| o.status.success())
+    }
+
+    /// Whether `rustup` is the active toolchain manager.
+    fn rustup_present() -> bool {
+        tool_present("rustup")
+    }
+
+    /// Whether the wasm target's std is available to build against.
+    ///
+    /// Preferred probe is `rustup target list --installed` (cheap, exact). When
+    /// `rustup` is not in play we fall back to asking `rustc` to emit the
+    /// target cfg — that only succeeds if the target's libstd is present, so it
+    /// is a reliable installed/not check for a rustup-free (e.g. distro or Nix)
+    /// toolchain too.
+    fn wasm_target_installed() -> bool {
+        if rustup_present()
+            && let Ok(out) = Command::new("rustup")
+                .args(["target", "list", "--installed"])
+                .output()
+            && out.status.success()
+        {
+            return String::from_utf8_lossy(&out.stdout)
+                .lines()
+                .any(|line| line.trim() == WASM_TARGET);
+        }
+        // rustup absent or the query failed: probe rustc directly.
+        Command::new("rustc")
+            .args(["--target", WASM_TARGET, "--print", "cfg"])
+            .output()
+            .is_ok_and(|o| o.status.success())
+    }
+
+    /// Run `rustup target add wasm32-unknown-unknown`, streaming its output.
+    fn run_target_add() -> bool {
+        eprintln!(
+            "{}",
+            Theme::dimmed(&format!("running `rustup target add {WASM_TARGET}`..."))
+        );
+        Command::new("rustup")
+            .args(["target", "add", WASM_TARGET])
+            .status()
+            .is_ok_and(|s| s.success())
+    }
+
+    /// Ask whether to install the missing target. Non-interactive sessions
+    /// (no TTY) default to NO — we never silently mutate the toolchain without
+    /// either a TTY answer or the explicit `--install-target` flag.
+    fn prompt_install() -> bool {
+        if !std::io::stdin().is_terminal() {
+            return false;
+        }
+        eprintln!(
+            "{}",
+            Theme::warning(&format!(
+                "the {WASM_TARGET} target (required to build capsules) is not installed."
+            ))
+        );
+        eprint!("Install it now with `rustup target add {WASM_TARGET}`? [Y/n] ");
+        if std::io::Write::flush(&mut std::io::stderr()).is_err() {
+            return false;
+        }
+        let mut input = String::new();
+        if std::io::stdin().read_line(&mut input).unwrap_or(0) == 0 {
+            // EOF before an answer — treat as no.
+            return false;
+        }
+        let input = input.trim();
+        input.is_empty() || input.eq_ignore_ascii_case("y") || input.eq_ignore_ascii_case("yes")
+    }
+
+    /// Print actionable guidance when the wasm target is missing and we did not
+    /// (or could not) install it.
+    fn guide_rustup_target_add() {
+        eprintln!(
+            "{}",
+            Theme::warning(&format!(
+                "the {WASM_TARGET} target is not installed — capsules cannot build without it."
+            ))
+        );
+        eprintln!("  Install it with:");
+        eprintln!("    rustup target add {WASM_TARGET}");
+        eprintln!(
+            "{}",
+            Theme::dimmed(
+                "  (or pass --install-target to have `astrid capsule new` add it for you.)"
+            )
+        );
+    }
+
+    /// Print actionable guidance when cargo/rustc are not on PATH at all.
+    fn warn_no_rust_toolchain(have_cargo: bool, have_rustc: bool) {
+        let missing = match (have_cargo, have_rustc) {
+            (false, false) => "cargo and rustc were",
+            (false, true) => "cargo was",
+            (true, false) => "rustc was",
+            (true, true) => unreachable!("warn only called when one is missing"),
+        };
+        eprintln!(
+            "{}",
+            Theme::warning(&format!(
+                "{missing} not found on PATH — you need a Rust toolchain to build this capsule."
+            ))
+        );
+        eprintln!("  Install Rust (rustup) with:");
+        eprintln!("    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh");
+        eprintln!("  then add the capsule build target:");
+        eprintln!("    rustup target add {WASM_TARGET}");
+    }
 }
 
 /// Validate that `name` is a usable capsule + Rust package name.
@@ -134,17 +321,26 @@ fn dir_is_non_empty(path: &Path) -> bool {
 
 /// Write the full project skeleton into `target`.
 fn scaffold(target: &Path, name: &str) -> Result<()> {
+    use super::new_templates as t;
+
     let crate_ident = name.replace('-', "_");
 
-    write_file(&target.join(".cargo/config.toml"), &cargo_config_toml())?;
-    write_file(&target.join("rust-toolchain.toml"), &rust_toolchain_toml())?;
-    write_file(&target.join("Cargo.toml"), &cargo_toml(name))?;
+    write_file(&target.join(".cargo/config.toml"), &t::cargo_config_toml())?;
+    write_file(
+        &target.join("rust-toolchain.toml"),
+        &t::rust_toolchain_toml(),
+    )?;
+    write_file(&target.join("Cargo.toml"), &t::cargo_toml(name))?;
     write_file(
         &target.join("Capsule.toml"),
-        &capsule_toml(name, &crate_ident),
+        &t::capsule_toml(name, &crate_ident),
     )?;
-    write_file(&target.join("src/lib.rs"), &lib_rs())?;
-    write_file(&target.join("README.md"), &readme_md(name))?;
+    write_file(&target.join("src/lib.rs"), &t::lib_rs())?;
+    write_file(&target.join("README.md"), &t::readme_md(name))?;
+    write_file(
+        &target.join("AUTHORING.md"),
+        &t::authoring_md(name, &crate_ident),
+    )?;
     Ok(())
 }
 
@@ -157,185 +353,6 @@ fn write_file(path: &Path, contents: &str) -> Result<()> {
     std::fs::write(path, contents)
         .with_context(|| format!("failed to write {}", path.display()))?;
     Ok(())
-}
-
-/// `.cargo/config.toml` — the getrandom footgun fix. Without the custom
-/// backend cfg, `getrandom` (pulled transitively by uuid v4 and `HashMap`'s
-/// `RandomState`) fails to link on `wasm32-unknown-unknown`.
-fn cargo_config_toml() -> String {
-    r#"[build]
-target = "wasm32-unknown-unknown"
-
-[target.wasm32-unknown-unknown]
-rustflags = ["--cfg=getrandom_backend=\"custom\""]
-"#
-    .to_string()
-}
-
-/// `rust-toolchain.toml` — pins the toolchain and wasm target so the project
-/// builds identically everywhere.
-fn rust_toolchain_toml() -> String {
-    r#"[toolchain]
-channel = "1.94.0"
-targets = ["wasm32-unknown-unknown"]
-components = ["rustfmt", "clippy"]
-"#
-    .to_string()
-}
-
-/// `Cargo.toml` — `cdylib` for the WASM component, edition 2024, and a
-/// size-optimised release profile.
-fn cargo_toml(name: &str) -> String {
-    format!(
-        r#"[package]
-name = "{name}"
-version = "0.1.0"
-edition = "2024"
-publish = false
-description = "An Astrid tool capsule."
-
-[lib]
-crate-type = ["cdylib"]
-
-[dependencies]
-astrid-sdk = {{ version = "0.7", features = ["derive"] }}
-serde = {{ version = "1.0", features = ["derive"] }}
-serde_json = "1.0"
-
-[profile.release]
-opt-level = "z"
-lto = true
-codegen-units = 1
-strip = true
-panic = "abort"
-"#
-    )
-}
-
-/// `Capsule.toml` — manifest with the `[[component]]` block and the mandatory
-/// tool-bus ACL. The `[publish]`/`[subscribe]` tables are the only IPC-intent
-/// surface; a `[subscribe]` entry's `handler` binds the topic to the matching
-/// `#[astrid::tool]` / `tool_describe` export.
-fn capsule_toml(name: &str, crate_ident: &str) -> String {
-    format!(
-        r#"[package]
-name = "{name}"
-version = "0.1.0"
-description = "An Astrid tool capsule."
-astrid-version = ">=0.7.0"
-
-[[component]]
-id = "{name}"
-file = "{crate_ident}.wasm"
-type = "executable"
-
-# Host capabilities this capsule needs. The hello example needs none. Grant
-# only what your tools actually use — capabilities are enforced by the kernel.
-#
-# [capabilities]
-# fs_read  = ["home://"]
-# fs_write = ["home://output/"]
-
-# Publish ACL: the [publish] keys are the only IPC-publish declaration.
-[publish]
-"tool.v1.execute.*.result" = {{ wit = "@unicity-astrid/wit/types/tool-call-result" }}
-"tool.v1.response.describe.*" = {{ wit = "@unicity-astrid/wit/tool/describe-response" }}
-
-# Interceptor bindings: a [subscribe] entry's `handler` binds the topic to an
-# `#[astrid::tool]` export. The keys also serve as the subscribe ACL.
-[subscribe]
-"tool.v1.execute.hello" = {{ wit = "@unicity-astrid/wit/types/tool-call", handler = "tool_execute_hello" }}
-"tool.v1.request.describe" = {{ wit = "@unicity-astrid/wit/tool/describe-request", handler = "tool_describe" }}
-"#
-    )
-}
-
-/// `src/lib.rs` — a working `hello` tool example.
-fn lib_rs() -> String {
-    r#"#![deny(unsafe_code)]
-use astrid_sdk::prelude::*;
-use astrid_sdk::schemars;
-use serde::Deserialize;
-
-#[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
-pub struct HelloArgs {
-    /// Who to greet.
-    pub name: String,
-}
-
-#[derive(Default)]
-pub struct Capsule;
-
-#[capsule]
-impl Capsule {
-    /// Greet someone by name. Replace this with your own tool.
-    #[astrid::tool("hello")]
-    pub fn hello(&self, args: HelloArgs) -> Result<String, SysError> {
-        Ok(format!("Hello, {}!", args.name.trim()))
-    }
-}
-"#
-    .to_string()
-}
-
-/// `README.md` for the generated project: build/install/iterate commands and
-/// pointers to the in-runtime skill and the Astrid Book.
-fn readme_md(name: &str) -> String {
-    format!(
-        r#"# {name}
-
-An [Astrid](https://github.com/unicity-astrid/astrid) tool capsule, scaffolded
-by `astrid capsule new`.
-
-A capsule is a WebAssembly component that runs in the Astrid kernel's sandbox
-and exposes typed tools to the agent. This one ships a single `hello` tool —
-replace it with your own.
-
-## Layout
-
-| File | Purpose |
-|------|---------|
-| `src/lib.rs` | Tool implementations (`#[astrid::tool]` exports). |
-| `Capsule.toml` | Manifest: component, capabilities, and the tool-bus ACL. |
-| `Cargo.toml` | Crate config — `cdylib` + size-optimised release profile. |
-| `.cargo/config.toml` | Targets `wasm32-unknown-unknown` and sets the `getrandom` custom backend (required — without it, uuid/`HashMap` fail to link). |
-| `rust-toolchain.toml` | Pins the toolchain and wasm target. |
-
-The `wit/` directory is generated at build time; do not commit it.
-
-## Build
-
-```sh
-astrid capsule build
-```
-
-This compiles to `wasm32-unknown-unknown` and packages a `.capsule` archive
-under `dist/`.
-
-## Install
-
-```sh
-astrid capsule install ./dist/{name}.capsule
-```
-
-## Iterate
-
-1. Edit `src/lib.rs` — add a tool with `#[astrid::tool("my_tool")]`.
-2. Declare it in `Capsule.toml` under `[subscribe]`:
-   ```toml
-   "tool.v1.execute.my_tool" = {{ wit = "@unicity-astrid/wit/types/tool-call", handler = "tool_execute_my_tool" }}
-   ```
-3. Rebuild and reinstall.
-
-## Learn more
-
-- If the `capsule-forge` capsule is installed, its authoring skill — the
-  from-zero guide to writing capsules — lives at
-  `home://skills/capsule-forge/SKILL.md`.
-- The [Astrid Book](https://github.com/unicity-astrid/astrid) covers the
-  capsule model, the IPC bus, capabilities, and the WIT contracts in depth.
-"#
-    )
 }
 
 /// Print the friendly next-steps message after a successful scaffold.
@@ -414,83 +431,12 @@ mod tests {
             "Capsule.toml",
             "src/lib.rs",
             "README.md",
+            "AUTHORING.md",
         ] {
             assert!(
                 target.join(rel).is_file(),
                 "expected scaffolded file {rel} to exist"
             );
         }
-    }
-
-    #[test]
-    fn cargo_config_has_getrandom_backend() {
-        let cfg = cargo_config_toml();
-        assert!(
-            cfg.contains(r#"getrandom_backend=\"custom\""#),
-            "getrandom custom backend cfg is mandatory for wasm linking"
-        );
-        assert!(cfg.contains("wasm32-unknown-unknown"));
-    }
-
-    #[test]
-    fn cargo_toml_uses_crate_name_and_cdylib() {
-        let toml = cargo_toml("my-tool");
-        assert!(toml.contains(r#"name = "my-tool""#));
-        assert!(toml.contains(r#"crate-type = ["cdylib"]"#));
-        assert!(toml.contains(r#"edition = "2024""#));
-        assert!(toml.contains("panic = \"abort\""));
-        // Must parse as TOML.
-        toml.parse::<toml::Value>().expect("Cargo.toml must parse");
-    }
-
-    #[test]
-    fn capsule_toml_wasm_file_uses_underscored_ident() {
-        // The component `file` must be the crate ident (hyphens → underscores)
-        // plus `.wasm`, matching cargo's cdylib output name.
-        let manifest = capsule_toml("my-tool", "my_tool");
-        assert!(
-            manifest.contains(r#"file = "my_tool.wasm""#),
-            "wasm filename must use the underscored crate ident"
-        );
-        assert!(manifest.contains(r#"id = "my-tool""#));
-    }
-
-    #[test]
-    fn capsule_toml_parses_and_has_tool_acl() {
-        let manifest = capsule_toml("hello-cap", "hello_cap");
-        let value: toml::Value = manifest.parse().expect("Capsule.toml must parse");
-
-        // Package block.
-        assert_eq!(value["package"]["name"].as_str(), Some("hello-cap"));
-        assert_eq!(value["package"]["version"].as_str(), Some("0.1.0"));
-
-        // Component block.
-        let component = &value["component"][0];
-        assert_eq!(component["id"].as_str(), Some("hello-cap"));
-        assert_eq!(component["type"].as_str(), Some("executable"));
-
-        // Tool-bus ACL: the hello tool + describe must be subscribed with
-        // their handlers, and results/describe responses publishable.
-        let subscribe = value["subscribe"].as_table().expect("subscribe table");
-        let hello = subscribe["tool.v1.execute.hello"]
-            .as_table()
-            .expect("hello subscribe entry");
-        assert_eq!(hello["handler"].as_str(), Some("tool_execute_hello"));
-        let describe = subscribe["tool.v1.request.describe"]
-            .as_table()
-            .expect("describe subscribe entry");
-        assert_eq!(describe["handler"].as_str(), Some("tool_describe"));
-
-        let publish = value["publish"].as_table().expect("publish table");
-        assert!(publish.contains_key("tool.v1.execute.*.result"));
-        assert!(publish.contains_key("tool.v1.response.describe.*"));
-    }
-
-    #[test]
-    fn lib_rs_has_hello_tool() {
-        let src = lib_rs();
-        assert!(src.contains(r#"#[astrid::tool("hello")]"#));
-        assert!(src.contains("pub fn hello"));
-        assert!(src.contains("#[capsule]"));
     }
 }
