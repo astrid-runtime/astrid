@@ -329,7 +329,7 @@ async fn agent_create(
     // Mirror the read-only introspection furniture so this fresh principal's
     // `system_status` / `list_interfaces` reflect the globally-loaded capsule
     // set instead of an empty home. Best-effort (see helper docs).
-    sync_principal_furniture(kernel, &principal);
+    sync_principal_furniture(kernel, &principal).await;
 
     // State inheritance is OPT-IN. By default the new principal inherits
     // NOTHING — least privilege, and no silent leak of `default`'s env
@@ -910,16 +910,36 @@ pub(super) fn require_principal_exists(principal: &PrincipalId, path: &Path) -> 
 /// daemon start. Env config (`.config/env/`) is deliberately excluded inside
 /// [`astrid_capsule_install::materialize_principal_furniture`] for secret
 /// isolation.
-pub(super) fn sync_principal_furniture(kernel: &Arc<crate::Kernel>, principal: &PrincipalId) {
-    if let Err(e) =
-        astrid_capsule_install::materialize_principal_furniture(&kernel.astrid_home, principal)
-    {
-        warn!(
-            %principal,
-            error = %format!("{e:#}"),
-            "failed to materialize per-principal home furniture; \
-             introspection tools may not see the loaded capsule set"
-        );
+pub(super) async fn sync_principal_furniture(kernel: &Arc<crate::Kernel>, principal: &PrincipalId) {
+    // `materialize_principal_furniture` does synchronous recursive directory
+    // copies. Run it on the blocking pool so it never pins a tokio worker, but
+    // `.await` the handle so the furniture is materialized before this handler
+    // returns — a freshly-created principal must have its introspection mirror
+    // ready by the time `agent.create`/`invite.redeem` completes.
+    let home = kernel.astrid_home.clone();
+    let principal = principal.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        astrid_capsule_install::materialize_principal_furniture(&home, &principal)
+            .map_err(|e| (principal, e))
+    })
+    .await;
+    match result {
+        Ok(Ok(())) => {},
+        Ok(Err((principal, e))) => {
+            warn!(
+                %principal,
+                error = %format!("{e:#}"),
+                "failed to materialize per-principal home furniture; \
+                 introspection tools may not see the loaded capsule set"
+            );
+        },
+        Err(join_err) => {
+            warn!(
+                error = %join_err,
+                "per-principal home-furniture task panicked; \
+                 introspection tools may not see the loaded capsule set"
+            );
+        },
     }
 }
 

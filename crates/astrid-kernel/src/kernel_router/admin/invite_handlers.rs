@@ -197,7 +197,7 @@ pub(crate) async fn invite_redeem(
         return err_internal(format!("principal home tree provisioning failed: {e}"));
     }
 
-    super::handlers::sync_principal_furniture(kernel, &principal);
+    super::handlers::sync_principal_furniture(kernel, &principal).await;
 
     // Decrement / remove the invite. Saturating sub guards against
     // an externally-edited `remaining_uses = 0` slipping past the
