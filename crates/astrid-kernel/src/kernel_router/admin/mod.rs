@@ -21,6 +21,7 @@
 //! quotas set, group definition) for forensic replay without diffing
 //! `profile.toml` snapshots.
 
+mod agent_create_helpers;
 mod caps_tokens;
 #[cfg(test)]
 mod enforcement_tests;
@@ -32,6 +33,8 @@ mod pair_device_handlers;
 mod quota;
 #[cfg(test)]
 mod state_tests;
+#[cfg(test)]
+mod state_tests_agent_backfill;
 #[cfg(test)]
 mod state_tests_agent_clone;
 #[cfg(test)]
