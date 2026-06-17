@@ -2,29 +2,33 @@
 //!
 //! Capsules are deployed once and shared across the daemon, but the
 //! read-only *view* of that set — the installed-capsule registry under
-//! `home://.local/capsules/` and the human-named WIT mirror under
-//! `home://wit/` — is materialized only into the authoritative
+//! `home://.local/capsules/`, the human-named WIT mirror under
+//! `home://wit/`, and any install-hook-provided Skills under
+//! `home://skills/` — is materialized only into the authoritative
 //! [`crate::paths::install_principal`]'s home (see [`crate::local`] /
-//! [`crate::wit::materialize_wit_mirror`]). A freshly-provisioned
-//! principal (e.g. `claude-code`) therefore gets an *empty* home, so the
-//! system capsule's `system_status` reports `capsule_count: 0` and
-//! `list_interfaces` reports "WIT directory not found" even though the
-//! kernel has every capsule loaded globally.
+//! [`crate::wit::materialize_wit_mirror`]; a capsule's `#[astrid::install]`
+//! hook writes its Skill to the install principal's `home://skills/`). A
+//! freshly-provisioned principal (e.g. `claude-code`) therefore gets an
+//! *empty* home, so the system capsule's `system_status` reports
+//! `capsule_count: 0`, `list_interfaces` reports "WIT directory not found",
+//! and install-hook Skills are invisible — even though the kernel has every
+//! capsule loaded globally.
 //!
-//! [`materialize_principal_furniture`] closes that gap by copying the two
+//! [`materialize_principal_furniture`] closes that gap by copying the three
 //! read-only mirror subdirectories from the install principal's home into a
 //! target principal's home.
 //!
 //! ## Security
 //!
 //! This copies ONLY public, non-secret material: capsule manifests /
-//! `meta.json` and WIT interface definitions. It deliberately NEVER touches
-//! the target's `.config/env/` (per-principal secrets — API keys), nor its
-//! `.local/kv`, `.local/audit`, `.local/tokens`, `.local/log`, or anything
-//! else under the home. Only the two mirror subdirectories
-//! (`.local/capsules` and `wit`) are ever removed or written under the
-//! target. Crossing the `.config/env/` boundary would leak one principal's
-//! secrets into another's home, so it is hard-excluded by construction.
+//! `meta.json`, WIT interface definitions, and install-hook-provided Skills
+//! (Markdown authoring docs). It deliberately NEVER touches the target's
+//! `.config/env/` (per-principal secrets — API keys), nor its `.local/kv`,
+//! `.local/audit`, `.local/tokens`, `.local/log`, or anything else under the
+//! home. Only the three mirror subdirectories (`.local/capsules`, `wit`, and
+//! `skills`) are ever removed or written under the target. Crossing the
+//! `.config/env/` boundary would leak one principal's secrets into another's
+//! home, so it is hard-excluded by construction.
 
 use std::path::Path;
 
@@ -33,15 +37,16 @@ use astrid_core::PrincipalId;
 use astrid_core::dirs::AstridHome;
 
 /// Mirror the read-only introspection view (installed-capsule registry +
-/// `home://wit/`) from the authoritative install principal's home into
-/// `target`'s home, so a non-install principal's `system_status` /
-/// `list_interfaces` reflect the globally-loaded capsule set.
+/// `home://wit/` + install-hook-provided `home://skills/`) from the
+/// authoritative install principal's home into `target`'s home, so a
+/// non-install principal's `system_status` / `list_interfaces` reflect the
+/// globally-loaded capsule set and so it can see install-hook Skills.
 ///
-/// SECURITY: copies ONLY public capsule metadata (manifests, meta.json) and
-/// WIT interface definitions. It MUST NOT copy `.config/env/` — that holds
-/// per-principal secrets (API keys) that must never cross principal
-/// boundaries. Idempotent. No-op when `target` is the install principal
-/// (that home is authoritative, not a mirror).
+/// SECURITY: copies ONLY public capsule metadata (manifests, meta.json),
+/// WIT interface definitions, and install-hook Skills. It MUST NOT copy
+/// `.config/env/` — that holds per-principal secrets (API keys) that must
+/// never cross principal boundaries. Idempotent. No-op when `target` is the
+/// install principal (that home is authoritative, not a mirror).
 pub fn materialize_principal_furniture(
     home: &AstridHome,
     target: &PrincipalId,
@@ -64,6 +69,12 @@ pub fn materialize_principal_furniture(
     // `read_interface` read.
     mirror_subtree(&src.root().join("wit"), &dst.root().join("wit"))
         .context("failed to mirror wit/ into principal home")?;
+
+    // `skills/` — Skills a capsule's `#[astrid::install]` hook writes to the
+    // install principal's home (e.g. the forge's `skills/capsule-forge/
+    // SKILL.md`). Mirrored so a non-install principal can discover them.
+    mirror_subtree(&src.root().join("skills"), &dst.root().join("skills"))
+        .context("failed to mirror skills/ into principal home")?;
 
     Ok(())
 }
@@ -100,8 +111,8 @@ fn mirror_subtree(src: &Path, dst: &Path) -> anyhow::Result<()> {
 /// Plain recursive directory copy. Regular files are copied byte-for-byte;
 /// subdirectories recurse. Symlinks and other special files are skipped —
 /// the source is the install principal's own mirror (`meta.json`,
-/// `Capsule.toml`, `.wit`), which contains only regular files and dirs by
-/// construction, so there is nothing legitimate to follow.
+/// `Capsule.toml`, `.wit`, `SKILL.md`), which contains only regular files
+/// and dirs by construction, so there is nothing legitimate to follow.
 fn copy_dir_recursive(src: &Path, dst: &Path) -> anyhow::Result<()> {
     std::fs::create_dir_all(dst).with_context(|| format!("failed to create {}", dst.display()))?;
 
@@ -153,6 +164,10 @@ mod tests {
             &install.root().join("wit").join("system.wit"),
             "interface system {}",
         );
+        write_file(
+            &install.root().join("skills").join("foo").join("SKILL.md"),
+            "# Foo skill",
+        );
     }
 
     #[test]
@@ -187,6 +202,48 @@ mod tests {
             std::fs::read_to_string(target_home.root().join("wit").join("system.wit"))
                 .expect("system wit"),
             "interface system {}"
+        );
+
+        // CRITICAL: the per-principal secret was neither deleted nor
+        // overwritten — env config never crosses the principal boundary.
+        assert_eq!(
+            std::fs::read_to_string(&secret_path).expect("secret survives"),
+            r#"{"API_KEY":"top-secret"}"#
+        );
+    }
+
+    #[test]
+    fn mirrors_install_hook_skill_without_touching_target_secret() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = AstridHome::from_path(tmp.path());
+
+        // Seed an install-hook-provided Skill in the install principal's home.
+        let install = home.principal_home(&crate::paths::install_principal());
+        write_file(
+            &install.root().join("skills").join("foo").join("SKILL.md"),
+            "# Foo skill",
+        );
+
+        let target = PrincipalId::new("claude-code").expect("principal id");
+        let target_home = home.principal_home(&target);
+
+        // Seed a target-side secret to prove it is never touched.
+        let secret_path = target_home.env_dir().join("secret.env.json");
+        write_file(&secret_path, r#"{"API_KEY":"top-secret"}"#);
+
+        materialize_principal_furniture(&home, &target).expect("materialize");
+
+        // The Skill reached the non-install principal's home.
+        assert_eq!(
+            std::fs::read_to_string(
+                target_home
+                    .root()
+                    .join("skills")
+                    .join("foo")
+                    .join("SKILL.md")
+            )
+            .expect("foo skill mirrored"),
+            "# Foo skill"
         );
 
         // CRITICAL: the per-principal secret was neither deleted nor
