@@ -210,6 +210,11 @@ async fn dispatch_capsule(command: crate::cli::CapsuleCommands) -> Result<ExitCo
         } => {
             commands::capsule::install::install_capsule(&source, capsule.as_deref(), workspace)
                 .await?;
+            // Live-load (v1): a fresh on-disk install is standalone, but if a
+            // daemon is running, nudge it to hot-load the new capsule so it's
+            // usable without a restart. Best-effort and non-fatal — never
+            // affects the install's success.
+            commands::capsule::live_load::nudge_daemon_reload().await;
             Ok(ExitCode::SUCCESS)
         },
         CapsuleCommands::Update { target, workspace } => {
