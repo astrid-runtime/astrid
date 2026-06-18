@@ -99,6 +99,16 @@ jobs:
     strategy:
       matrix:
         os: [ubuntu-latest, macos-latest]
+    env:
+      # The astrid-capsule test binary statically links the entire dependency
+      # tree (wasmtime, aws-lc, ring, surrealkv, ...). With full debug info the
+      # final link exhausts the runner and the linker dies (collect2/lld SIGBUS
+      # / SIGABRT). Strip debug info for the test build only — debuginfo is the
+      # dominant contributor to both linker peak memory and target/ disk. This
+      # is CI-scoped via Cargo profile env overrides; local and dev builds keep
+      # full debug info. See #954.
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
     steps:
       - uses: actions/checkout@v4
         with:
