@@ -435,6 +435,15 @@ impl HostTcpStream for HostState {
         // no-op for outbound TCP streams (never bound) and for unauthenticated
         // unix connections.
         self.unbind_connection_principal(table_rep);
+        // Emit `client.v1.disconnect` for the kernel connection tracker if this
+        // rep was an INBOUND uplink connection, stamped with the SAME
+        // host-verified principal its `client.v1.connect` carried, and drop the
+        // lifecycle entry. A no-op for outbound TCP streams and non-net
+        // resources (never registered), so a capsule-dialed socket dropping
+        // never moves the connection counter. Pairs connect/disconnect on one
+        // identity → the per-principal count balances (connection-tracker leak
+        // fix).
+        super::client_lifecycle::emit_client_disconnect(self, table_rep);
         Ok(())
     }
 }

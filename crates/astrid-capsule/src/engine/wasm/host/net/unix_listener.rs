@@ -10,6 +10,7 @@ use std::time::Duration;
 use wasmtime::component::Resource;
 use wasmtime_wasi::p2::DynPollable;
 
+use super::client_lifecycle;
 use super::handshake::validate_handshake;
 #[cfg(unix)]
 use super::handshake::verify_peer_credentials;
@@ -126,9 +127,20 @@ impl HostUnixListener for HostState {
         // resource rep, now that the rep is known. Storage only; enforcement
         // reads this registry separately. The binding is removed when the
         // stream resource drops (see `TcpStream::drop`).
-        if let Some(principal) = verified_principal {
+        if let Some(principal) = verified_principal.clone() {
             self.bind_connection_principal(rep, principal);
         }
+        // Emit `client.v1.connect` for the kernel connection tracker, stamped
+        // with the host-verified principal — `anonymous` for a legacy /
+        // unauthenticated peer so connect/disconnect balance on one identity.
+        // The matching disconnect fires from the stream-resource drop path
+        // (see `TcpStream::drop`). Inbound-only: outbound TCP never reaches
+        // here, so a capsule-dialed socket never moves the counter.
+        client_lifecycle::register_and_emit_connect(
+            self,
+            rep,
+            verified_principal.unwrap_or_else(astrid_core::principal::PrincipalId::anonymous),
+        );
         let result: Result<Resource<TcpStream>, ErrorCode> = Ok(Resource::new_own(rep));
         audit_net(self, "astrid:net/host.unix-listener.accept", 0, &result);
         result
@@ -228,9 +240,16 @@ impl HostUnixListener for HostState {
         self.net_stream_count += 1;
         let rep = res.rep();
         // Same per-connection principal binding as `accept` (issue #45/#852).
-        if let Some(principal) = verified_principal {
+        if let Some(principal) = verified_principal.clone() {
             self.bind_connection_principal(rep, principal);
         }
+        // Same `client.v1.connect` emission as `accept` — see there for the
+        // anonymous-fallback and inbound-only rationale.
+        client_lifecycle::register_and_emit_connect(
+            self,
+            rep,
+            verified_principal.unwrap_or_else(astrid_core::principal::PrincipalId::anonymous),
+        );
         Ok(Some(Resource::new_own(rep)))
     }
 

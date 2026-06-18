@@ -496,6 +496,27 @@ pub struct HostState {
     /// instance of the uplink both reads the frame and forwards it, so the
     /// binding lives exactly as long as the in-flight frame.
     pub ingress_principal: Option<astrid_core::principal::PrincipalId>,
+    /// Host-verified principal each INBOUND uplink connection was accepted
+    /// under, keyed by stream resource rep (`u32`). The lifecycle registry the
+    /// kernel connection counter rides on: `net.unix-listener.{accept,
+    /// poll-accept}` inserts on accept and emits `client.v1.connect`; the
+    /// stream-resource drop removes and emits `client.v1.disconnect`. Both
+    /// emissions stamp the principal stored here, so the pair always balances
+    /// on the identical identity (the connection-tracker leak fix).
+    ///
+    /// Populated for EVERY inbound connection — the handshake-verified
+    /// principal, or the reserved `anonymous` for a legacy/unauthenticated peer
+    /// — so connect/disconnect balance even when unauthenticated. OUTBOUND TCP
+    /// (`connect-tcp`) is never inserted, so a capsule-dialed socket never
+    /// moves the client counter. The emitted principal is ALWAYS the
+    /// host-verified one (never a guest-supplied name), preserving the
+    /// anti-forge boundary (issues #45/#852).
+    ///
+    /// Distinct from [`connection_principals`](Self::connection_principals),
+    /// which stores only authenticated principals (absence ⇒ `publish-as`
+    /// anonymous fallback). `Arc<DashMap>` so the binding survives drop landing
+    /// on a different pooled instance than the one that accepted.
+    pub client_connections: Arc<dashmap::DashMap<u32, astrid_core::principal::PrincipalId>>,
     /// Bound run-loop CPU-bound signal: set `true` by the ipc `recv` host fn
     /// each time the guest blocks on recv, read + cleared by the run-loop's
     /// epoch-deadline callback once per window.
