@@ -383,6 +383,10 @@ impl WasmHandler {
             // Transient hook execution never accepts socket connections; a
             // throwaway registry satisfies the field (issue #45/#852).
             connection_principals: HostState::new_connection_principals(),
+            // Hooks never accept inbound uplink connections, so no client
+            // lifecycle events are ever emitted; a throwaway registry satisfies
+            // the field.
+            client_connections: HostState::new_connection_principals(),
             // No client frame in flight; hooks never forward over publish-as.
             ingress_principal: None,
         })
