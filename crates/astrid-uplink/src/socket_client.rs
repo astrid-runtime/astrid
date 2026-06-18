@@ -141,6 +141,13 @@ pub struct SocketClient {
     /// outbound message that does not already carry an explicit
     /// principal (see [`SocketClient::send_message`]).
     principal: PrincipalId,
+    /// Whether the handshake authenticated as [`principal`](Self::principal)
+    /// via the signed challenge — i.e. the daemon bound this connection to that
+    /// identity — versus the legacy single-frame path the daemon stamps the
+    /// no-capability `anonymous`. Lets a caller that REQUIRES a real identity
+    /// (the MCP shim) refuse to serve silently as `anonymous`; see
+    /// [`is_authenticated`](Self::is_authenticated).
+    authenticated: bool,
 }
 
 impl SocketClient {
@@ -166,7 +173,7 @@ impl SocketClient {
             .await
             .context("Failed to connect to IPC socket")?;
 
-        perform_handshake(&mut stream, &principal).await?;
+        let authenticated = perform_handshake(&mut stream, &principal).await?;
 
         let (read_half, write_half) = stream.into_split();
 
@@ -175,7 +182,20 @@ impl SocketClient {
             write_half,
             session_id,
             principal,
+            authenticated,
         })
+    }
+
+    /// Whether the handshake bound this connection to its requested
+    /// [`principal`](Self::principal) via the signed challenge. `false` means
+    /// the connection took the legacy single-frame path and the daemon stamped
+    /// it the no-capability `anonymous`. A caller that must act as a real
+    /// identity should refuse to proceed when this is `false` for a
+    /// non-`anonymous` requested principal, rather than silently operating with
+    /// no capabilities (the MCP shim does — see its `serve` entrypoint).
+    #[must_use]
+    pub fn is_authenticated(&self) -> bool {
+        self.authenticated
     }
 
     /// Re-establish the connection to the (possibly restarted) daemon,
@@ -447,7 +467,13 @@ fn principal_key_path(principal: &PrincipalId) -> Option<std::path::PathBuf> {
 /// - **Legacy (single frame):** when no key file exists, the request omits
 ///   `claimed_principal` and the handshake completes in one round trip,
 ///   preserving behaviour for callers without a key.
-async fn perform_handshake(stream: &mut UnixStream, principal: &PrincipalId) -> Result<()> {
+///
+/// Returns `true` when the connection authenticated as `principal` via the
+/// signed challenge (the daemon bound it to that identity), `false` when it
+/// took the legacy single-frame path that the daemon stamps the no-capability
+/// `anonymous`. An outright-rejected handshake (e.g. a bad signature) is an
+/// `Err`, never a silent `false`.
+async fn perform_handshake(stream: &mut UnixStream, principal: &PrincipalId) -> Result<bool> {
     let tok_path = token_path()?;
     let token = SessionToken::read_from_file(&tok_path).with_context(|| {
         format!(
@@ -488,7 +514,7 @@ async fn perform_handshake(stream: &mut UnixStream, principal: &PrincipalId) -> 
 
     // Authenticated path: the daemon's first response carries a challenge
     // nonce. Sign it and send a second frame, then read the final response.
-    let response = if let (Some(keypair), Some(nonce_hex)) =
+    let (response, authenticated) = if let (Some(keypair), Some(nonce_hex)) =
         (keypair.as_ref(), response.challenge.as_deref())
     {
         let message = astrid_core::session_token::principal_auth_challenge_message(
@@ -503,9 +529,9 @@ async fn perform_handshake(stream: &mut UnixStream, principal: &PrincipalId) -> 
             claimed_principal: Some(principal.to_string()),
             signature: Some(signature),
         };
-        send_request_read_response(stream, &signed).await?
+        (send_request_read_response(stream, &signed).await?, true)
     } else {
-        response
+        (response, false)
     };
 
     if !response.is_ok() {
@@ -515,7 +541,7 @@ async fn perform_handshake(stream: &mut UnixStream, principal: &PrincipalId) -> 
         anyhow::bail!("Daemon rejected connection: {reason}");
     }
 
-    Ok(())
+    Ok(authenticated)
 }
 
 /// Write one length-prefixed [`HandshakeRequest`] frame and read the
