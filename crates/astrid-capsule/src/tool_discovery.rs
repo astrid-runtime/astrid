@@ -27,7 +27,7 @@ use astrid_mcp::{McpClient, SecureMcpClient, ServerManager, ServersConfig};
 use astrid_storage::{KvStore, MemoryKvStore, ScopedKvStore};
 use serde::{Deserialize, Serialize};
 
-use crate::capsule::InterceptResult;
+use crate::capsule::{Capsule, InterceptResult};
 use crate::context::CapsuleContext;
 use crate::discovery::load_manifest;
 use crate::loader::CapsuleLoader;
@@ -120,19 +120,32 @@ pub async fn describe_capsule_tools(dir: &Path) -> anyhow::Result<Vec<ToolDescri
         .await
         .map_err(|e| anyhow::anyhow!("failed to load capsule: {e}"))?;
 
-    // Primary capture: the `tool_describe` interceptor returns the
-    // descriptor JSON in its `CapsuleResult { action: "continue",
-    // data: Some(...) }`, which the engine surfaces as
-    // `InterceptResult::Continue(bytes)`.
-    //
-    // A capsule with no `#[astrid::tool]` has no `tool_describe` arm, and the
-    // engine signals that two different ways depending on whether the capsule
-    // has *any* interceptors: a capsule with none yields a `NotSupported`
-    // error, while a capsule with other interceptors (e.g. the sage-mcp broker)
-    // has its generated dispatch *deny* the unknown action with "unknown hook
-    // action: tool_describe". Both mean "no tools", not a failure — otherwise a
-    // pure-interceptor capsule (which includes the broker itself) would be left
-    // unmarked and a consumer could never trust the static surface.
+    describe_loaded_capsule(capsule.as_ref()).await
+}
+
+/// Invoke an already-loaded capsule's `tool_describe` interceptor and parse the
+/// tool descriptors it returns.
+///
+/// Shared by the build-time path ([`describe_capsule_tools`], which instantiates
+/// the capsule first) and the kernel's load-time path (which calls this on a
+/// live, already-loaded instance to capture the surface of a capsule whose tools
+/// were not baked at build — no rebuild required).
+///
+/// The `tool_describe` interceptor returns the descriptor JSON in its
+/// `CapsuleResult { action: "continue", data: Some(...) }`, surfaced as
+/// `InterceptResult::Continue(bytes)`. A capsule with no `#[astrid::tool]` has no
+/// `tool_describe` arm, and the engine signals that two ways depending on whether
+/// the capsule has *any* interceptors: a capsule with none yields a
+/// `NotSupported` error, while a capsule with other interceptors (e.g. the
+/// sage-mcp broker) has its generated dispatch *deny* the unknown action with
+/// "unknown hook action: tool_describe". Both mean "no tools", not a failure.
+///
+/// # Errors
+///
+/// Returns an error if the interceptor errors for any reason other than "not
+/// implemented", genuinely denies (a reason other than the unknown-action one),
+/// or returns a payload that is present but not the expected JSON shape.
+pub async fn describe_loaded_capsule(capsule: &dyn Capsule) -> anyhow::Result<Vec<ToolDescriptor>> {
     let result = match capsule.invoke_interceptor("tool_describe", &[], None).await {
         Ok(r) => r,
         Err(e) if is_unsupported(&e) => return Ok(Vec::new()),

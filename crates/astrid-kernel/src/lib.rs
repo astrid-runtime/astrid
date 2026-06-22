@@ -695,40 +695,61 @@ impl Kernel {
     /// `astrid mcp serve` shim, which turns this into an MCP
     /// `notifications/tools/list_changed` for connected clients.
     ///
-    /// The payload carries, per loaded capsule, its installed `meta.json` as an
-    /// **opaque** JSON value under `capsules[].meta`. The kernel does not parse
-    /// or interpret that metadata — it surfaces it verbatim, the way a Linux
-    /// uevent carries a device's attributes and leaves all interpretation to
-    /// userspace. A sandboxed consumer (e.g. the sage-mcp broker) can derive a
-    /// deterministic tool surface from this signal it already receives, instead
-    /// of a racy describe fan-out, without the kernel gaining any tool awareness
-    /// and without widening the consumer's own capabilities. The legacy
-    /// `status: "ready"` field is retained so existing subscribers (the shim,
-    /// the TUI) that treat this as a bare signal keep working; the `capsules`
-    /// field is additive.
+    /// The payload carries, per loaded capsule, its installed `meta.json` under
+    /// `capsules[].meta`, with the capsule's tool surface guaranteed present.
+    /// When the surface was baked into `meta.json` at build time it is forwarded
+    /// verbatim; when it was **not** baked (a capsule built before tool-baking,
+    /// or a third-party one), the kernel probes the live instance once —
+    /// invoking its `tool_describe` interceptor (the same hook the dispatcher
+    /// already routes) and injecting the captured descriptors — so a consumer
+    /// (e.g. the sage-mcp broker) gets a deterministic, complete tool surface
+    /// from this signal **without the capsule having been rebuilt**. The kernel
+    /// invokes-and-forwards: it never interprets the descriptors (the broker
+    /// owns all policy). A describe failure leaves `tools` absent for that
+    /// capsule this cycle (the consumer falls back to its fan-out). The legacy
+    /// `status: "ready"` field is retained so bare-signal subscribers (the shim,
+    /// the TUI) keep working; the `capsules` field is additive.
     async fn publish_capsules_loaded(&self) {
-        // Collect (name, source_dir) under a brief read lock, then release it
-        // before any filesystem I/O.
-        let entries: Vec<(String, Option<PathBuf>)> = {
+        // Clone the loaded-capsule handles under a brief read lock, then release
+        // it before any filesystem I/O or `tool_describe` invocation (which can
+        // `block_in_place` and must never run while holding the registry lock).
+        let capsules = {
             let reg = self.capsules.read().await;
-            reg.values()
-                .map(|c| (c.id().to_string(), c.source_dir().map(Path::to_path_buf)))
-                .collect()
+            reg.cloned_values()
         };
 
-        // Forward each capsule's installed metadata verbatim as an opaque
-        // value. Best-effort: a capsule with no source dir, or a missing /
-        // unreadable / non-JSON `meta.json`, contributes a null `meta` and
-        // never blocks the signal (these are small files, read off the lock).
-        let with_meta: Vec<(String, Option<serde_json::Value>)> = entries
-            .into_iter()
-            .map(|(name, source_dir)| {
-                let meta = source_dir
-                    .as_deref()
-                    .and_then(capsules_loaded::read_capsule_meta_opaque);
-                (name, meta)
-            })
-            .collect();
+        let mut with_meta: Vec<(String, Option<serde_json::Value>)> =
+            Vec::with_capacity(capsules.len());
+        for capsule in &capsules {
+            let name = capsule.id().to_string();
+            let mut meta = capsule
+                .source_dir()
+                .and_then(capsules_loaded::read_capsule_meta_opaque);
+
+            // If the tool surface wasn't baked into `meta.json`, probe the live
+            // instance and inject what it reports — so an un-rebuilt capsule
+            // still contributes a complete surface. Best-effort: a describe
+            // (or serialize) failure leaves `tools` absent and the consumer
+            // falls back to its fan-out for this cycle.
+            if !capsules_loaded::meta_has_tools(meta.as_ref()) {
+                match astrid_capsule::describe_loaded_capsule(capsule.as_ref()).await {
+                    Ok(tools) => match serde_json::to_value(&tools) {
+                        Ok(tools_json) => {
+                            meta = Some(capsules_loaded::inject_tools(meta, tools_json));
+                        },
+                        Err(e) => tracing::debug!(
+                            capsule_id = %name, error = %e,
+                            "failed to serialize live-described tools; capsule left uncaptured this cycle"
+                        ),
+                    },
+                    Err(e) => tracing::debug!(
+                        capsule_id = %name, error = %e,
+                        "live tool_describe failed; capsule left uncaptured this cycle"
+                    ),
+                }
+            }
+            with_meta.push((name, meta));
+        }
         let payload = capsules_loaded::build_capsules_loaded_payload(with_meta);
 
         let msg = astrid_events::ipc::IpcMessage::new(

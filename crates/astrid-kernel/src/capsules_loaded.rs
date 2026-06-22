@@ -1,15 +1,20 @@
 //! Helpers for the `astrid.v1.capsules_loaded` broadcast payload.
 //!
-//! The kernel surfaces, per loaded capsule, its installed `meta.json` as an
-//! **opaque** JSON value — it never parses or interprets that metadata (no tool
-//! awareness), the way a Linux uevent carries a device's attributes and leaves
+//! The kernel surfaces, per loaded capsule, its installed `meta.json` plus its
+//! tool surface. A surface baked into `meta.json` at build time is forwarded
+//! verbatim; one that was not baked is filled in by the kernel probing the live
+//! capsule's `tool_describe` and injecting the result ([`inject_tools`]), so an
+//! un-rebuilt (or third-party) capsule still contributes a complete surface.
+//! Either way the kernel invokes-and-forwards — it does not interpret the
+//! descriptors, the way a Linux uevent carries a device's attributes and leaves
 //! all interpretation to userspace. A sandboxed consumer (e.g. the sage-mcp
-//! broker) derives a deterministic tool surface from this signal it already
-//! receives, instead of a racy describe fan-out — without the kernel gaining
-//! any tool knowledge and without widening the consumer's own capabilities.
+//! broker) derives a deterministic tool surface from this signal, instead of a
+//! racy describe fan-out, without itself gaining filesystem access.
 //!
-//! Kept off [`crate::Kernel`] so the pure payload assembly is unit-testable
-//! without standing up a running kernel.
+//! These helpers are the pure payload-assembly pieces ([`read_capsule_meta_opaque`],
+//! [`meta_has_tools`], [`inject_tools`], [`build_capsules_loaded_payload`]), kept
+//! off [`crate::Kernel`] so they are unit-testable without a running kernel; the
+//! live `tool_describe` probe itself lives in `Kernel::publish_capsules_loaded`.
 
 use std::path::Path;
 
@@ -24,6 +29,33 @@ use serde_json::{Value, json};
 pub(crate) fn read_capsule_meta_opaque(source_dir: &Path) -> Option<Value> {
     let bytes = std::fs::read(source_dir.join("meta.json")).ok()?;
     serde_json::from_slice(&bytes).ok()
+}
+
+/// Whether a capsule's opaque `meta` already carries a baked tool surface — a
+/// present, non-null `tools` value. When `false`, the kernel probes the live
+/// capsule's `tool_describe` and injects the result via [`inject_tools`], so a
+/// capsule whose tools were not baked at build still contributes a complete
+/// surface without a rebuild.
+pub(crate) fn meta_has_tools(meta: Option<&Value>) -> bool {
+    meta.and_then(|m| m.get("tools"))
+        .is_some_and(|t| !t.is_null())
+}
+
+/// Inject a freshly-described `tools` array into a capsule's opaque `meta`.
+///
+/// `meta` is the capsule's `meta.json` value (or `None` if it had none); the
+/// result is the same object with its `tools` key set to `tools` (a JSON array
+/// of descriptors). A `None` or non-object `meta` becomes a fresh
+/// `{ "tools": [...] }` object so the consumer sees the surface either way. The
+/// kernel does not interpret the descriptors — it forwards what the capsule
+/// reported.
+pub(crate) fn inject_tools(meta: Option<Value>, tools: Value) -> Value {
+    let mut obj = match meta {
+        Some(Value::Object(map)) => map,
+        _ => serde_json::Map::new(),
+    };
+    obj.insert("tools".to_string(), tools);
+    Value::Object(obj)
 }
 
 /// Build the `astrid.v1.capsules_loaded` payload from per-capsule
@@ -43,6 +75,40 @@ pub(crate) fn build_capsules_loaded_payload(entries: Vec<(String, Option<Value>)
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn meta_has_tools_distinguishes_baked_from_unknown() {
+        // Baked (present, even empty) => true; skip the live probe.
+        assert!(meta_has_tools(Some(&json!({ "tools": [{ "name": "x" }] }))));
+        assert!(meta_has_tools(Some(&json!({ "tools": [] }))));
+        // Not captured => false; probe the live capsule.
+        assert!(!meta_has_tools(Some(&json!({ "version": "1.0.0" }))));
+        assert!(!meta_has_tools(Some(
+            &json!({ "tools": serde_json::Value::Null })
+        )));
+        assert!(!meta_has_tools(None));
+    }
+
+    #[test]
+    fn inject_tools_sets_tools_preserving_other_meta() {
+        let meta = json!({ "version": "1.0.0", "wasm_hash": "abc" });
+        let tools = json!([{ "name": "read_file", "description": "", "input_schema": {} }]);
+        let out = inject_tools(Some(meta), tools.clone());
+        assert_eq!(out["tools"], tools);
+        assert_eq!(out["version"], "1.0.0");
+        assert_eq!(out["wasm_hash"], "abc");
+    }
+
+    #[test]
+    fn inject_tools_builds_object_when_meta_absent_or_nonobject() {
+        let tools = json!([{ "name": "t" }]);
+        // None meta -> fresh object.
+        let out = inject_tools(None, tools.clone());
+        assert_eq!(out["tools"], tools);
+        // Non-object meta -> fresh object (don't lose the tools).
+        let out2 = inject_tools(Some(json!("oops")), tools.clone());
+        assert_eq!(out2["tools"], tools);
+    }
 
     #[test]
     fn payload_retains_status_and_lists_capsules() {

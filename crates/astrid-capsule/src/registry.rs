@@ -152,6 +152,17 @@ impl CapsuleRegistry {
         self.capsules.values().map(|c| c.as_ref())
     }
 
+    /// Snapshot of cloned `Arc` handles to every registered capsule.
+    ///
+    /// One pass over the map (the public [`Self::values`] yields `&dyn Capsule`,
+    /// so it can't be `cloned()` into owned handles). Lets a caller release the
+    /// registry lock before doing async work on the capsules (e.g. invoking an
+    /// interceptor that may `block_in_place`).
+    #[must_use]
+    pub fn cloned_values(&self) -> Vec<Arc<dyn Capsule>> {
+        self.capsules.values().cloned().collect()
+    }
+
     /// Number of registered capsules.
     #[must_use]
     pub fn len(&self) -> usize {
