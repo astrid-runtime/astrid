@@ -92,6 +92,9 @@ fn all_request_variants() -> Vec<KernelRequest> {
         KernelRequest::ReloadCapsule {
             id: "x".to_string(),
         },
+        KernelRequest::UnloadCapsule {
+            id: "x".to_string(),
+        },
         KernelRequest::InstallCapsule {
             source: "x".to_string(),
             workspace: false,
@@ -136,6 +139,13 @@ fn required_capability_mapping_per_variant_self_scope() {
     );
     assert_eq!(
         required_capability(
+            &KernelRequest::UnloadCapsule { id: String::new() },
+            AuthorityScope::Self_
+        ),
+        "self:capsule:remove"
+    );
+    assert_eq!(
+        required_capability(
             &KernelRequest::InstallCapsule {
                 source: String::new(),
                 workspace: false
@@ -175,6 +185,13 @@ fn required_capability_mapping_global_scope() {
     assert_eq!(
         required_capability(&KernelRequest::ReloadCapsules, AuthorityScope::Global),
         "capsule:reload"
+    );
+    assert_eq!(
+        required_capability(
+            &KernelRequest::UnloadCapsule { id: String::new() },
+            AuthorityScope::Global
+        ),
+        "capsule:remove"
     );
     assert_eq!(
         required_capability(

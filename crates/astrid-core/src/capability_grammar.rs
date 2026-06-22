@@ -361,6 +361,22 @@ pub const CAPABILITY_CATALOG: &[CapabilityInfo] = {
             danger: Normal,
         },
         CapabilityInfo {
+            id: "capsule:remove",
+            label: "Remove capsules",
+            description: "Remove an installed capsule from the system-wide capsule directory and unload it from the running daemon. Affects every principal on the host; reversible by reinstalling.",
+            category: Capsule,
+            scope: Global,
+            danger: Elevated,
+        },
+        CapabilityInfo {
+            id: "self:capsule:remove",
+            label: "Remove capsules (self)",
+            description: "Self-scoped variant of capsule:remove.",
+            category: Capsule,
+            scope: Self_,
+            danger: Normal,
+        },
+        CapabilityInfo {
             id: "capsule:list",
             label: "List all capsules",
             description: "Enumerate every capsule installed on the host, including manifest metadata.",
@@ -643,7 +659,7 @@ pub fn known_capabilities_list() -> &'static [&'static str] {
 /// in the same commit that adds a new capability so a kernel
 /// addition without updating the catalog fails the consuming
 /// crate's tests.
-pub const KNOWN_CAPABILITIES_COUNT: usize = 37;
+pub const KNOWN_CAPABILITIES_COUNT: usize = 39;
 
 const _: () = assert!(
     CAPABILITY_CATALOG.len() == KNOWN_CAPABILITIES_COUNT,

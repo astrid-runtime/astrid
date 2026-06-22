@@ -31,6 +31,9 @@ fn all_kernel_request_variants() -> Vec<KernelRequest> {
         KernelRequest::ReloadCapsule {
             id: "x".to_string(),
         },
+        KernelRequest::UnloadCapsule {
+            id: "x".to_string(),
+        },
         KernelRequest::InstallCapsule {
             source: "x".to_string(),
             workspace: false,
