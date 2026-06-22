@@ -148,15 +148,21 @@ pub async fn describe_capsule_tools(dir: &Path) -> anyhow::Result<Vec<ToolDescri
 
 /// Parse the `tools` array out of a `tool_describe` descriptor payload
 /// (`{ "tools": [ {name, description, input_schema}, ... ], "description": "..." }`).
+///
+/// Deserializes straight into a typed wrapper rather than walking a generic
+/// `serde_json::Value` — no intermediate allocation or clone. A missing
+/// `tools` key defaults to empty (a non-tool payload), while a present-but-
+/// malformed `tools` array is a hard error.
 fn parse_tool_descriptors(payload: &[u8]) -> anyhow::Result<Vec<ToolDescriptor>> {
-    let value: serde_json::Value = serde_json::from_slice(payload)
-        .map_err(|e| anyhow::anyhow!("tool_describe payload is not valid JSON: {e}"))?;
-    let Some(tools) = value.get("tools") else {
-        return Ok(Vec::new());
-    };
-    let descriptors: Vec<ToolDescriptor> = serde_json::from_value(tools.clone())
-        .map_err(|e| anyhow::anyhow!("tool_describe `tools` array has unexpected shape: {e}"))?;
-    Ok(descriptors)
+    #[derive(Deserialize)]
+    struct ToolDescribePayload {
+        #[serde(default)]
+        tools: Vec<ToolDescriptor>,
+    }
+    let parsed: ToolDescribePayload = serde_json::from_slice(payload).map_err(|e| {
+        anyhow::anyhow!("tool_describe payload is not valid JSON or has an unexpected shape: {e}")
+    })?;
+    Ok(parsed.tools)
 }
 
 /// Whether a capsule error signals "this interceptor action is not

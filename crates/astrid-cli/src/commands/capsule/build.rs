@@ -47,7 +47,17 @@ pub(crate) async fn run(
         return Ok(ExitCode::SUCCESS);
     }
 
-    if let Err(e) = bake_tools_into_latest(&out_dir, before).await {
+    // Resolve the package name from the source manifest so we can locate the
+    // produced archive deterministically by name (`<name>.capsule`) rather
+    // than by mtime alone — robust against a stale archive or a concurrent
+    // build in the same output dir.
+    let source = path.unwrap_or(".");
+    let package_name =
+        astrid_capsule::discovery::load_manifest(&Path::new(source).join("Capsule.toml"))
+            .map(|m| m.package.name)
+            .ok();
+
+    if let Err(e) = bake_tools_into_latest(&out_dir, package_name.as_deref(), before).await {
         eprintln!(
             "{}",
             Theme::warning(&format!(
@@ -63,9 +73,10 @@ pub(crate) async fn run(
 /// Capture tools from the just-built archive and inject `tools.json`.
 async fn bake_tools_into_latest(
     out_dir: &Path,
+    package_name: Option<&str>,
     before: Option<std::time::SystemTime>,
 ) -> Result<()> {
-    let archive = locate_built_capsule(out_dir, before)
+    let archive = locate_built_capsule(out_dir, package_name, before)
         .context("could not locate the built .capsule archive")?;
 
     // Unpack into a temp dir so we get the canonical install-staging
@@ -123,9 +134,27 @@ fn newest_capsule_mtime(dir: &Path) -> Option<std::time::SystemTime> {
         .max()
 }
 
-/// The `.capsule` the build just produced: the newest archive whose
-/// mtime is at or after the pre-build high-water mark.
-fn locate_built_capsule(dir: &Path, before: Option<std::time::SystemTime>) -> Result<PathBuf> {
+/// The `.capsule` the build just produced. Prefers a deterministic match on
+/// the package name (`<name>.capsule`, with the underscore variant as a
+/// safety net), and only falls back to the mtime heuristic — the newest
+/// archive at or after the pre-build high-water mark — when the name is
+/// unknown or no name-matched file exists.
+fn locate_built_capsule(
+    dir: &Path,
+    package_name: Option<&str>,
+    before: Option<std::time::SystemTime>,
+) -> Result<PathBuf> {
+    if let Some(name) = package_name {
+        for candidate in [
+            dir.join(format!("{name}.capsule")),
+            dir.join(format!("{}.capsule", name.replace('-', "_"))),
+        ] {
+            if candidate.exists() {
+                return Ok(candidate);
+            }
+        }
+    }
+
     let mut newest: Option<(std::time::SystemTime, PathBuf)> = None;
     for path in capsule_archives(dir) {
         let Ok(mtime) = std::fs::metadata(&path).and_then(|m| m.modified()) else {
