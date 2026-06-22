@@ -133,7 +133,7 @@ pub enum ApprovalProof {
         /// ID of the newly created allowance.
         allowance_id: crate::allowance::AllowanceId,
     },
-    /// Authorized by "Allow Always" — the interceptor should create a
+    /// Authorized by "Allow Always" — the caller (the kernel) should create a
     /// persistent `CapabilityToken` with an `approval_audit_id` chain-link.
     AlwaysAllow,
     /// Authorized with a custom allowance created by the user.
@@ -276,18 +276,18 @@ impl ApprovalManager {
                 proof: ApprovalProof::OneTimeApproval,
             },
             ApprovalDecision::ApproveSession => {
-                // The caller (e.g., SecurityInterceptor) is responsible for
+                // The caller (the kernel's approval handler) is responsible for
                 // creating the session allowance based on the original action,
                 // since only it knows the correct AllowancePattern to create.
                 ApprovalOutcome::Allowed {
                     proof: ApprovalProof::SessionApproval {
-                        // Placeholder — the interceptor fills this in
+                        // Placeholder — the caller fills this in
                         allowance_id: crate::allowance::AllowanceId::new(),
                     },
                 }
             },
             ApprovalDecision::ApproveWorkspace => {
-                // Workspace-scoped allowance — the interceptor creates a non-session
+                // Workspace-scoped allowance — the caller creates a non-session
                 // allowance (workspace-scoped, survives session end).
                 ApprovalOutcome::Allowed {
                     proof: ApprovalProof::WorkspaceApproval {
@@ -296,8 +296,9 @@ impl ApprovalManager {
                 }
             },
             ApprovalDecision::ApproveAlways => {
-                // The interceptor is responsible for creating the CapabilityToken
-                // since it holds the runtime signing key and capability store.
+                // The caller (the kernel) is responsible for creating the
+                // CapabilityToken since it holds the runtime signing key and
+                // capability store.
                 ApprovalOutcome::Allowed {
                     proof: ApprovalProof::AlwaysAllow,
                 }

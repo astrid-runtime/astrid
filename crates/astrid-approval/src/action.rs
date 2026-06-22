@@ -18,8 +18,8 @@ pub enum SensitiveAction {
     /// Read a file or search the filesystem.
     ///
     /// Even read-only operations can expose sensitive data (credentials,
-    /// private keys, personal information). All tool calls go through the
-    /// interceptor so the policy and allowance system can gate access.
+    /// private keys, personal information). Sensitive actions are gated by the
+    /// allowance and approval system before they execute.
     FileRead {
         /// Path or pattern being read/searched.
         path: String,
