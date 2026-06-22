@@ -13,6 +13,8 @@
 
 /// Passive event-bus storm diagnostics (publish-rate monitor).
 mod bus_monitor;
+/// `astrid.v1.capsules_loaded` payload assembly (opaque per-capsule metadata).
+mod capsules_loaded;
 /// Persistent invite-token store (issue #756).
 pub mod invite;
 /// The Management API router listening to the `EventBus`.
@@ -685,17 +687,53 @@ impl Kernel {
         // Signal that all capsules have been loaded so uplink capsules
         // (like the registry) can proceed with discovery instead of
         // polling with arbitrary timeouts.
-        self.publish_capsules_loaded();
+        self.publish_capsules_loaded().await;
     }
 
     /// Publish `astrid.v1.capsules_loaded` so subscribers re-read the current
     /// capsule/tool set after the loaded set changes — the registry, and the
     /// `astrid mcp serve` shim, which turns this into an MCP
     /// `notifications/tools/list_changed` for connected clients.
-    fn publish_capsules_loaded(&self) {
+    ///
+    /// The payload carries, per loaded capsule, its installed `meta.json` as an
+    /// **opaque** JSON value under `capsules[].meta`. The kernel does not parse
+    /// or interpret that metadata — it surfaces it verbatim, the way a Linux
+    /// uevent carries a device's attributes and leaves all interpretation to
+    /// userspace. A sandboxed consumer (e.g. the sage-mcp broker) can derive a
+    /// deterministic tool surface from this signal it already receives, instead
+    /// of a racy describe fan-out, without the kernel gaining any tool awareness
+    /// and without widening the consumer's own capabilities. The legacy
+    /// `status: "ready"` field is retained so existing subscribers (the shim,
+    /// the TUI) that treat this as a bare signal keep working; the `capsules`
+    /// field is additive.
+    async fn publish_capsules_loaded(&self) {
+        // Collect (name, source_dir) under a brief read lock, then release it
+        // before any filesystem I/O.
+        let entries: Vec<(String, Option<PathBuf>)> = {
+            let reg = self.capsules.read().await;
+            reg.values()
+                .map(|c| (c.id().to_string(), c.source_dir().map(Path::to_path_buf)))
+                .collect()
+        };
+
+        // Forward each capsule's installed metadata verbatim as an opaque
+        // value. Best-effort: a capsule with no source dir, or a missing /
+        // unreadable / non-JSON `meta.json`, contributes a null `meta` and
+        // never blocks the signal (these are small files, read off the lock).
+        let with_meta: Vec<(String, Option<serde_json::Value>)> = entries
+            .into_iter()
+            .map(|(name, source_dir)| {
+                let meta = source_dir
+                    .as_deref()
+                    .and_then(capsules_loaded::read_capsule_meta_opaque);
+                (name, meta)
+            })
+            .collect();
+        let payload = capsules_loaded::build_capsules_loaded_payload(with_meta);
+
         let msg = astrid_events::ipc::IpcMessage::new(
             "astrid.v1.capsules_loaded",
-            astrid_events::ipc::IpcPayload::RawJson(serde_json::json!({"status": "ready"})),
+            astrid_events::ipc::IpcPayload::RawJson(payload),
             self.session_id.0,
         );
         let _ = self.event_bus.publish(astrid_events::AstridEvent::Ipc {
@@ -720,7 +758,7 @@ impl Kernel {
         let registered = { self.capsules.read().await.get(id).is_some() };
         if registered {
             self.restart_capsule(id).await?;
-            self.publish_capsules_loaded();
+            self.publish_capsules_loaded().await;
         } else {
             // load_all_capsules discovers + loads the new capsule (existing ones
             // are skipped) and publishes capsules_loaded itself. It logs-and-
@@ -796,7 +834,7 @@ impl Kernel {
             }
         }
 
-        self.publish_capsules_loaded();
+        self.publish_capsules_loaded().await;
         Ok(true)
     }
 
