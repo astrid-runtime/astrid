@@ -88,16 +88,23 @@ async fn bake_tools_into_latest(
     // The WASM engine drives itself on the ambient (multi-thread) tokio
     // runtime via `block_in_place`, so capture is awaited inline, not run
     // on a nested runtime (which would panic "runtime within a runtime").
+    // A capsule that embeds an MCP server surfaces tools through the MCP
+    // engine, not `#[astrid::tool]` — so the WASM `tool_describe` capture is
+    // *incomplete* for it. Leave such a capsule unmarked (no `tools.json`) so
+    // the installed `meta.json` records `tools: None` and a consumer discovers
+    // its full surface at runtime instead of trusting a partial static set.
+    if manifest_declares_mcp_server(staging.path()) {
+        return Ok(());
+    }
+
     let tools = describe_capsule_tools(staging.path())
         .await
         .context("failed to capture tool descriptors")?;
 
-    if tools.is_empty() {
-        // A capsule with no tools needs no `tools.json` — install
-        // defaults the field to empty.
-        return Ok(());
-    }
-
+    // Always write `tools.json` when the capture succeeds — even for a
+    // zero-tool capsule. The file's presence is the "surface captured" marker
+    // that lets a consumer trust an empty set as authoritative ("no tools")
+    // rather than "not yet baked"; an empty array is `Some(vec![])` on install.
     let json = serde_json::to_vec_pretty(&tools).context("failed to serialize tool descriptors")?;
     append_file_to_capsule(&archive, "tools.json", &json)
         .context("failed to inject tools.json into the capsule archive")?;
@@ -105,12 +112,21 @@ async fn bake_tools_into_latest(
     println!(
         "{}",
         Theme::success(&format!(
-            "baked {} tool descriptor(s) into {}",
+            "captured {} tool descriptor(s) into {}",
             tools.len(),
             archive.display()
         ))
     );
     Ok(())
+}
+
+/// Whether the capsule unpacked at `dir` declares an `[[mcp_server]]` — its
+/// WASM `tool_describe` capture would be incomplete, so it must be left
+/// unmarked. A manifest that fails to load is treated as "no MCP server"
+/// (capture proceeds); the describe step surfaces any real load problem.
+fn manifest_declares_mcp_server(dir: &Path) -> bool {
+    astrid_capsule::discovery::load_manifest(&dir.join("Capsule.toml"))
+        .is_ok_and(|m| !m.mcp_servers.is_empty())
 }
 
 /// Resolve the build output directory, mirroring `astrid-build`'s default

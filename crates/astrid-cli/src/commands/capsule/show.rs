@@ -45,6 +45,9 @@ pub(crate) struct CapsuleShow {
     pub installed_at: String,
     /// ISO 8601 last-update timestamp.
     pub updated_at: String,
+    /// Whether the tool surface was captured at build time (`meta.json` has a
+    /// `tools` key). Distinguishes "captured, no tools" from "not captured".
+    pub tools_captured: bool,
     /// Build-captured tool descriptors (name + description), baked into
     /// `meta.json` at build time. Empty for capsules with no tools.
     pub tools: Vec<ToolSummary>,
@@ -120,6 +123,10 @@ pub(crate) fn run(args: &ShowArgs) -> Result<ExitCode> {
             .and_then(|v| v.as_str())
             .unwrap_or_default()
             .to_string(),
+        // A present-but-null `tools` is `None` (not captured) — match the typed
+        // `Option<Vec>` deserialization, which maps JSON null to None. Only a
+        // present, non-null `tools` (an array) counts as captured.
+        tools_captured: meta.get("tools").is_some_and(|v| !v.is_null()),
         tools: extract_tool_summaries(&meta),
         manifest: manifest.clone(),
     };
@@ -137,8 +144,10 @@ pub(crate) fn run(args: &ShowArgs) -> Result<ExitCode> {
     println!("  Updated:      {}", record.updated_at);
     println!("  Agent:        {principal}");
     println!();
-    if record.tools.is_empty() {
-        println!("{} (none captured at build)", "Tools".bold());
+    if !record.tools_captured {
+        println!("{} (not captured at build)", "Tools".bold());
+    } else if record.tools.is_empty() {
+        println!("{} (none)", "Tools".bold());
     } else {
         println!("{} ({})", "Tools".bold(), record.tools.len());
         for tool in &record.tools {
@@ -196,6 +205,7 @@ mod tests {
             wasm_hash: "abc".into(),
             installed_at: "2026-04-28T00:00:00Z".into(),
             updated_at: "2026-04-28T00:00:00Z".into(),
+            tools_captured: true,
             tools: vec![ToolSummary {
                 name: "do_thing".into(),
                 description: "Does the thing".into(),

@@ -237,7 +237,7 @@ mod tests {
                 exports: export_map,
                 wasm_hash: None,
                 wit_files: std::collections::HashMap::new(),
-                tools: Vec::new(),
+                tools: None,
             }),
             location: CapsuleLocation::User,
         }

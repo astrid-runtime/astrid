@@ -183,7 +183,7 @@ mod tests {
             imports: import_map,
             wasm_hash: hash.map(String::from),
             wit_files: std::collections::HashMap::new(),
-            tools: Vec::new(),
+            tools: None,
         }
     }
 
