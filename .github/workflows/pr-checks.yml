@@ -168,13 +168,29 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Check changed files under 1000 lines
+      - name: Check changed files under the size cap
         env:
           GH_TOKEN: ${{ github.token }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
           PR_BASE: ${{ github.event.pull_request.base.sha }}
           REPO: ${{ github.repository }}
         run: |
+          # WHY THIS CAP EXISTS: it keeps files small enough that an AI coding
+          # agent — and a human reviewer — can read a file in full and edit it
+          # reliably. Oversized files cause missed context and fragile,
+          # ambiguous edits. It is a tool to help whoever (or whatever) is
+          # working in this repo, not bureaucracy.
+          #
+          # Source files keep the tight cap. TEST files (`*_tests.rs`,
+          # `tests/**`) get 2x headroom: they grow linearly with coverage, are
+          # read top-to-bottom, and hold no invariants in the reader's head, so
+          # the cognitive-load rationale is weak — and a tight cap there only
+          # pressures people toward LESS test coverage to stay under the line.
+          # The `large-file-ok` label still overrides everything for a genuine
+          # maintainer refactor.
+          SRC_CAP=1000
+          TEST_CAP=2000
+
           LABELS=$(gh api "repos/$REPO/issues/$PR_NUMBER/labels" --jq '.[].name' 2>/dev/null || echo "")
           if echo "$LABELS" | grep -q "large-file-ok"; then
             echo "Large file override label present. Skipping check."
@@ -186,26 +202,31 @@ jobs:
 
           for file in $CHANGED; do
             if [ -f "$file" ]; then
+              # Test files get the higher cap.
+              case "$file" in
+                *_tests.rs|*/tests/*|*/tests.rs) CAP=$TEST_CAP ;;
+                *) CAP=$SRC_CAP ;;
+              esac
               LINES=$(wc -l < "$file" | tr -d ' ')
-              if [ "$LINES" -gt 1000 ]; then
-                # Check if file was already over 1000 lines on the base branch
+              if [ "$LINES" -gt "$CAP" ]; then
+                # Grandfather files already over their cap on the base branch.
                 BASE_LINES=$(git show "$PR_BASE:$file" 2>/dev/null | wc -l | tr -d ' ')
-                if [ "$BASE_LINES" -le 1000 ]; then
-                  VIOLATIONS="${VIOLATIONS}  $file ($LINES lines, was $BASE_LINES)\n"
+                if [ "$BASE_LINES" -le "$CAP" ]; then
+                  VIOLATIONS="${VIOLATIONS}  $file ($LINES lines, cap $CAP, was $BASE_LINES)\n"
                 else
-                  echo "::notice::$file ($LINES lines) was already over 1000 lines ($BASE_LINES). Skipping."
+                  echo "::notice::$file ($LINES lines) was already over its $CAP-line cap ($BASE_LINES). Skipping."
                 fi
               fi
             fi
           done
 
           if [ -n "$VIOLATIONS" ]; then
-            echo "::error::Files pushed over 1000 lines by this PR:"
+            echo "::error::Files pushed over their size cap by this PR (source $SRC_CAP, tests $TEST_CAP):"
             echo -e "$VIOLATIONS" | while read -r line; do
               [ -n "$line" ] && echo "::error::$line"
             done
             echo ""
-            echo "Split large files or add the 'large-file-ok' label if this is a maintainer refactor."
+            echo "Split large files, or add the 'large-file-ok' label if this is a maintainer refactor."
             exit 1
           fi
 
