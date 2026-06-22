@@ -89,6 +89,9 @@ fn all_request_variants() -> Vec<KernelRequest> {
         KernelRequest::Shutdown { reason: None },
         KernelRequest::GetStatus,
         KernelRequest::ReloadCapsules,
+        KernelRequest::ReloadCapsule {
+            id: "x".to_string(),
+        },
         KernelRequest::InstallCapsule {
             source: "x".to_string(),
             workspace: false,

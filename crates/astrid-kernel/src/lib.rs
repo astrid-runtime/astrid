@@ -685,6 +685,14 @@ impl Kernel {
         // Signal that all capsules have been loaded so uplink capsules
         // (like the registry) can proceed with discovery instead of
         // polling with arbitrary timeouts.
+        self.publish_capsules_loaded();
+    }
+
+    /// Publish `astrid.v1.capsules_loaded` so subscribers re-read the current
+    /// capsule/tool set after the loaded set changes — the registry, and the
+    /// `astrid mcp serve` shim, which turns this into an MCP
+    /// `notifications/tools/list_changed` for connected clients.
+    fn publish_capsules_loaded(&self) {
         let msg = astrid_events::ipc::IpcMessage::new(
             "astrid.v1.capsules_loaded",
             astrid_events::ipc::IpcPayload::RawJson(serde_json::json!({"status": "ready"})),
@@ -694,6 +702,39 @@ impl Kernel {
             metadata: astrid_events::EventMetadata::new("kernel"),
             message: msg,
         });
+    }
+
+    /// Reload a single capsule by id without a daemon restart.
+    ///
+    /// If the capsule is already registered, [`Self::restart_capsule`] re-reads
+    /// its source directory — picking up the new content-addressed bytes a
+    /// reinstall wrote (a live upgrade / hot-swap). If it isn't registered yet,
+    /// the currently-installed set is discovered and loaded (a fresh add;
+    /// already-loaded capsules are skipped by `load_capsule`'s guard). Either
+    /// way `astrid.v1.capsules_loaded` is published so the tool surface
+    /// refreshes. Backs [`astrid_core::kernel_api::KernelRequest::ReloadCapsule`].
+    pub(crate) async fn reload_one_capsule(
+        &self,
+        id: &astrid_capsule::capsule::CapsuleId,
+    ) -> Result<(), anyhow::Error> {
+        let registered = { self.capsules.read().await.get(id).is_some() };
+        if registered {
+            self.restart_capsule(id).await?;
+            self.publish_capsules_loaded();
+        } else {
+            // load_all_capsules discovers + loads the new capsule (existing ones
+            // are skipped) and publishes capsules_loaded itself. It logs-and-
+            // continues on a per-capsule load failure, so confirm the requested
+            // capsule actually registered — otherwise the caller would report a
+            // false success for a capsule that failed to load or isn't on disk.
+            self.load_all_capsules().await;
+            if self.capsules.read().await.get(id).is_none() {
+                return Err(anyhow::anyhow!(
+                    "capsule '{id}' was not found in the install directories or failed to load"
+                ));
+            }
+        }
+        Ok(())
     }
 
     /// Mirror the read-only introspection furniture (installed-capsule

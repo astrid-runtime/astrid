@@ -110,7 +110,13 @@ pub(crate) async fn install_capsule(
     capsule: Option<&str>,
     workspace: bool,
 ) -> anyhow::Result<()> {
-    install_capsule_inner(source, capsule, workspace).await
+    let installed = install_capsule_inner(source, capsule, workspace).await?;
+    // Live-load: if a daemon is running, hot-load (or upgrade) each just-installed
+    // capsule so it's usable without a restart. Best-effort and non-fatal — the
+    // on-disk install above already succeeded standalone. The `update` and TUI
+    // install paths route through here too, so they inherit live hot-swap.
+    super::live_load::nudge_daemon_reload(&installed).await;
+    Ok(())
 }
 
 /// Install a capsule in batch mode (from distro init) — skips import
@@ -125,14 +131,16 @@ pub(crate) async fn install_capsule_batch(
     BATCH_MODE.store(true, Ordering::Relaxed);
     let result = install_capsule_inner(source, name_hint, workspace).await;
     BATCH_MODE.store(false, Ordering::Relaxed);
-    result
+    // Distro batch install does not nudge a live reload (init manages its own
+    // load, and the daemon is typically down during init) — drop the ids.
+    result.map(|_| ())
 }
 
 async fn install_capsule_inner(
     source: &str,
     name_hint: Option<&str>,
     workspace: bool,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Vec<String>> {
     let home = AstridHome::resolve()?;
 
     // 1. Explicit local path — no source tracking (re-fetch doesn't make sense).
@@ -165,7 +173,7 @@ async fn install_from_github(
     home: &AstridHome,
     original_source: Option<&str>,
     name_hint: Option<&str>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Vec<String>> {
     let client = reqwest::Client::builder()
         .user_agent("astrid-cli")
         .timeout(std::time::Duration::from_secs(30))
@@ -204,6 +212,7 @@ async fn install_from_github(
                         original_source,
                     )
                     .await
+                    .map(|id| vec![id])
                 },
                 // Manual install with no `--capsule`: install EVERY capsule
                 // the release ships. Best-effort — report which assets fail
@@ -217,7 +226,7 @@ async fn install_from_github(
     }
 
     // Priority 2: clone + build from source via astrid-build.
-    clone_and_build(url, repo, workspace, home, original_source, name_hint)
+    clone_and_build(url, repo, workspace, home, original_source, name_hint).map(|id| vec![id])
 }
 
 /// Collect every `.capsule` release asset as `(name, download_url)` pairs,
@@ -242,6 +251,7 @@ fn capsule_assets(assets: &[serde_json::Value]) -> Vec<(String, String)> {
 }
 
 /// Download a single `.capsule` asset (streamed, 50 MB cap) and install it.
+/// Returns the installed capsule id.
 async fn download_and_unpack(
     client: &reqwest::Client,
     name: &str,
@@ -249,7 +259,7 @@ async fn download_and_unpack(
     workspace: bool,
     home: &AstridHome,
     original_source: Option<&str>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<String> {
     let tmp_dir = tempfile::tempdir()?;
     let sanitized_name = Path::new(name).file_name().unwrap_or_default();
     let download_path = tmp_dir.path().join(sanitized_name);
@@ -279,16 +289,16 @@ async fn install_all_capsules(
     workspace: bool,
     home: &AstridHome,
     original_source: Option<&str>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Vec<String>> {
     eprintln!("Release ships {} capsule(s):", candidates.len());
-    let mut installed: Vec<&str> = Vec::new();
+    let mut installed: Vec<String> = Vec::new();
     let mut failed: Vec<(&str, String)> = Vec::new();
     for (name, download_url) in candidates {
         eprintln!("Installing {name}...");
         match download_and_unpack(client, name, download_url, workspace, home, original_source)
             .await
         {
-            Ok(()) => installed.push(name),
+            Ok(id) => installed.push(id),
             Err(e) => {
                 eprintln!("  Failed to install {name}: {e}");
                 failed.push((name, e.to_string()));
@@ -309,10 +319,11 @@ async fn install_all_capsules(
             .join(", ");
         bail!("failed to install {} capsule(s): {names}", failed.len());
     }
-    Ok(())
+    Ok(installed)
 }
 
-/// Clone a GitHub repository and build the capsule from source using `astrid-build`.
+/// Clone a GitHub repository and build the capsule from source using
+/// `astrid-build`. Returns the installed capsule id.
 fn clone_and_build(
     url: &str,
     repo: &str,
@@ -320,7 +331,7 @@ fn clone_and_build(
     home: &AstridHome,
     original_source: Option<&str>,
     name_hint: Option<&str>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<String> {
     let tmp_dir = tempfile::tempdir().context("failed to create temp dir for cloning")?;
     let clone_dir = tmp_dir.path().join(repo);
 
@@ -425,7 +436,7 @@ fn install_from_local(
     workspace: bool,
     home: &AstridHome,
     original_source: Option<&str>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Vec<String>> {
     let source_path = Path::new(source);
     if !source_path.exists() {
         bail!("Source path does not exist: {source}");
@@ -433,7 +444,7 @@ fn install_from_local(
 
     // Unpack `.capsule` archive when source is a file.
     if source_path.is_file() && source.ends_with(".capsule") {
-        return unpack_via_lib(source_path, workspace, home, original_source);
+        return unpack_via_lib(source_path, workspace, home, original_source).map(|id| vec![id]);
     }
 
     // Auto-build Rust capsules when source is a directory with a Cargo.toml.
@@ -460,13 +471,14 @@ fn install_from_local(
         for entry in std::fs::read_dir(&output_dir)? {
             let entry = entry?;
             if entry.path().extension().and_then(|s| s.to_str()) == Some("capsule") {
-                return unpack_via_lib(&entry.path(), workspace, home, original_source);
+                return unpack_via_lib(&entry.path(), workspace, home, original_source)
+                    .map(|id| vec![id]);
             }
         }
         bail!("Failed to auto-build capsule from Cargo project.");
     }
 
-    install_from_local_path(source_path, workspace, home, original_source)
+    install_from_local_path(source_path, workspace, home, original_source).map(|id| vec![id])
 }
 
 // ---------------------------------------------------------------------------
@@ -485,7 +497,7 @@ pub(crate) fn install_from_local_path(
     workspace: bool,
     home: &AstridHome,
     original_source: Option<&str>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<String> {
     let opts = InstallOptions {
         workspace,
         original_source: original_source.map(String::from),
@@ -505,13 +517,14 @@ pub(crate) fn install_from_local_path(
     finish_install(&output, home)
 }
 
-/// Unpack a `.capsule` archive and install from it.
+/// Unpack a `.capsule` archive and install from it. Returns the installed
+/// capsule id.
 fn unpack_via_lib(
     archive: &Path,
     workspace: bool,
     home: &AstridHome,
     original_source: Option<&str>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<String> {
     let opts = InstallOptions {
         workspace,
         original_source: original_source.map(String::from),
@@ -554,8 +567,10 @@ where
     result
 }
 
-/// Render post-install diagnostics and prompt for unset env fields.
-fn finish_install(output: &InstallOutput, _home: &AstridHome) -> anyhow::Result<()> {
+/// Render post-install diagnostics and prompt for unset env fields. Returns the
+/// installed capsule id (its directory name), so the manual-install path can
+/// nudge a running daemon to hot-load exactly that capsule.
+fn finish_install(output: &InstallOutput, _home: &AstridHome) -> anyhow::Result<String> {
     let batch = BATCH_MODE.load(Ordering::Relaxed);
 
     // Load the manifest once (always present post-install) — used both for
@@ -615,7 +630,7 @@ fn finish_install(output: &InstallOutput, _home: &AstridHome) -> anyhow::Result<
         );
     }
 
-    Ok(())
+    Ok(capsule_id)
 }
 
 // ---------------------------------------------------------------------------
