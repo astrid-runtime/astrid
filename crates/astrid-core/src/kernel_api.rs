@@ -41,6 +41,14 @@ pub enum KernelRequest {
     ListCapsules,
     /// Reload all capsules from the file system.
     ReloadCapsules,
+    /// Reload a single capsule by id without a daemon restart: hot-swap it if
+    /// already loaded (picking up the new on-disk bytes a reinstall wrote), or
+    /// load it if not yet registered. Lets a fresh `astrid capsule install` /
+    /// `update` make the capsule usable without restarting the daemon.
+    ReloadCapsule {
+        /// The capsule id (its `[package].name`).
+        id: String,
+    },
     /// Request the list of globally registered slash commands.
     GetCommands,
     /// Request metadata about loaded capsules (manifests, providers, interceptors).

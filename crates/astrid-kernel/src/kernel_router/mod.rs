@@ -327,6 +327,24 @@ async fn handle_request(
             kernel.load_all_capsules().await;
             KernelResponse::Success(serde_json::json!({"status": "reloaded"}))
         },
+        KernelRequest::ReloadCapsule { id } => {
+            // Hot-swap a single capsule (or add it if not yet loaded) without a
+            // daemon restart. The kernel publishes capsules_loaded on success so
+            // the tool surface refreshes. `id` is client-supplied over IPC, so
+            // validate it (CapsuleId::new rejects unsafe ids) before using it as
+            // a registry key — never construct it unchecked from untrusted input.
+            match astrid_capsule::capsule::CapsuleId::new(id.clone()) {
+                Ok(cap_id) => match kernel.reload_one_capsule(&cap_id).await {
+                    Ok(()) => KernelResponse::Success(
+                        serde_json::json!({"status": "reloaded", "capsule": id}),
+                    ),
+                    Err(e) => {
+                        KernelResponse::Error(format!("reload of capsule '{id}' failed: {e}"))
+                    },
+                },
+                Err(e) => KernelResponse::Error(format!("invalid capsule id '{id}': {e}")),
+            }
+        },
         KernelRequest::Shutdown { reason } => {
             info!(
                 reason = reason.as_deref().unwrap_or("none"),
@@ -457,7 +475,7 @@ fn rate_limit_for_request(req: &KernelRequest) -> (&'static str, Option<u32>) {
 /// Return the max-per-minute rate limit for a request type, if any.
 fn rate_limit_max(req: &KernelRequest) -> Option<u32> {
     match req {
-        KernelRequest::ReloadCapsules => Some(5),
+        KernelRequest::ReloadCapsules | KernelRequest::ReloadCapsule { .. } => Some(5),
         KernelRequest::InstallCapsule { .. } | KernelRequest::ApproveCapability { .. } => Some(10),
         KernelRequest::Shutdown { .. } => Some(1),
         KernelRequest::ListCapsules
@@ -504,8 +522,13 @@ pub fn required_capability(req: &KernelRequest, scope: AuthorityScope) -> &'stat
     match (req, scope) {
         (KernelRequest::Shutdown { .. }, _) => "system:shutdown",
         (KernelRequest::GetStatus, _) => "system:status",
-        (KernelRequest::ReloadCapsules, AuthorityScope::Self_) => "self:capsule:reload",
-        (KernelRequest::ReloadCapsules, _) => "capsule:reload",
+        (
+            KernelRequest::ReloadCapsules | KernelRequest::ReloadCapsule { .. },
+            AuthorityScope::Self_,
+        ) => "self:capsule:reload",
+        (KernelRequest::ReloadCapsules | KernelRequest::ReloadCapsule { .. }, _) => {
+            "capsule:reload"
+        },
         (KernelRequest::InstallCapsule { .. }, AuthorityScope::Self_) => "self:capsule:install",
         (KernelRequest::InstallCapsule { .. }, _) => "capsule:install",
         (
@@ -530,6 +553,7 @@ pub fn required_capability(req: &KernelRequest, scope: AuthorityScope) -> &'stat
 pub fn kernel_request_method(req: &KernelRequest) -> &'static str {
     match req {
         KernelRequest::ReloadCapsules => "ReloadCapsules",
+        KernelRequest::ReloadCapsule { .. } => "ReloadCapsule",
         KernelRequest::InstallCapsule { .. } => "InstallCapsule",
         KernelRequest::ApproveCapability { .. } => "ApproveCapability",
         KernelRequest::ListCapsules => "ListCapsules",
