@@ -301,29 +301,33 @@ pub fn install_from_local_path(
     })
 }
 
-/// Read build-captured tool descriptors from `<source_dir>/tools.json`.
+/// Read the build-captured tool surface from `<source_dir>/tools.json`.
 ///
-/// Written by `astrid capsule build` and packed into the `.capsule`
-/// archive. Treated like `read_meta`: a missing file is "no tools"
-/// (empty vec, the common case for non-tool capsules and capsules built
-/// before this capability), and a corrupt file is logged and treated as
-/// missing rather than failing the install — the tool surface degrades
-/// to "unknown", it does not block a working capsule.
-fn read_tools_json(source_dir: &Path) -> Vec<ToolDescriptor> {
+/// Written by `astrid capsule build` (and packed into the `.capsule` archive)
+/// whenever the WASM tool surface was captured in full — even for a capsule
+/// with zero tools, so the file's *presence* is the "captured" marker.
+/// Returns `Some(tools)` when the file is present and valid (`Some(vec![])`
+/// for a captured zero-tool capsule), and `None` when it is absent (a capsule
+/// built before tool-baking, or one left unmarked because its capture is
+/// incomplete) or corrupt — `None` means "unknown surface, discover at
+/// runtime". Install never instantiates WASM, so this is a plain file read,
+/// keeping install daemon-free / standalone. A corrupt file is logged and
+/// treated as `None` rather than failing a working capsule's install.
+fn read_tools_json(source_dir: &Path) -> Option<Vec<ToolDescriptor>> {
     let path = source_dir.join("tools.json");
     let data = match std::fs::read_to_string(&path) {
         Ok(d) => d,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
         Err(e) => {
-            tracing::warn!(path = %path.display(), error = %e, "failed to read tools.json, treating as no tools");
-            return Vec::new();
+            tracing::warn!(path = %path.display(), error = %e, "failed to read tools.json, treating as unknown surface");
+            return None;
         },
     };
     match serde_json::from_str::<Vec<ToolDescriptor>>(&data) {
-        Ok(tools) => tools,
+        Ok(tools) => Some(tools),
         Err(e) => {
-            tracing::warn!(path = %path.display(), error = %e, "tools.json is corrupt, treating as no tools");
-            Vec::new()
+            tracing::warn!(path = %path.display(), error = %e, "tools.json is corrupt, treating as unknown surface");
+            None
         },
     }
 }
