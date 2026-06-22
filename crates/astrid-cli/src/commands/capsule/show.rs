@@ -45,8 +45,22 @@ pub(crate) struct CapsuleShow {
     pub installed_at: String,
     /// ISO 8601 last-update timestamp.
     pub updated_at: String,
+    /// Build-captured tool descriptors (name + description), baked into
+    /// `meta.json` at build time. Empty for capsules with no tools.
+    pub tools: Vec<ToolSummary>,
     /// Verbatim `Capsule.toml` body.
     pub manifest: String,
+}
+
+/// A tool's name + description, surfaced from the baked `meta.json`
+/// `tools` array. The full `input_schema` lives in `meta.json`; `show`
+/// lists the surface, not the schemas.
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct ToolSummary {
+    /// Tool name.
+    pub name: String,
+    /// Human-readable description.
+    pub description: String,
 }
 
 /// Entry point for `astrid capsule show`.
@@ -106,6 +120,7 @@ pub(crate) fn run(args: &ShowArgs) -> Result<ExitCode> {
             .and_then(|v| v.as_str())
             .unwrap_or_default()
             .to_string(),
+        tools: extract_tool_summaries(&meta),
         manifest: manifest.clone(),
     };
 
@@ -122,11 +137,50 @@ pub(crate) fn run(args: &ShowArgs) -> Result<ExitCode> {
     println!("  Updated:      {}", record.updated_at);
     println!("  Agent:        {principal}");
     println!();
+    if record.tools.is_empty() {
+        println!("{} (none captured at build)", "Tools".bold());
+    } else {
+        println!("{} ({})", "Tools".bold(), record.tools.len());
+        for tool in &record.tools {
+            // Tool descriptions are doc comments and can span lines; show
+            // only the first line here so the listing stays scannable. The
+            // full description + input schema live in `meta.json`.
+            let summary = tool.description.lines().next().unwrap_or_default();
+            if summary.is_empty() {
+                println!("  {}", tool.name.cyan());
+            } else {
+                println!("  {}  {}", tool.name.cyan(), summary.dimmed());
+            }
+        }
+    }
+    println!();
     println!("{}", "Manifest".bold());
     for line in manifest.lines() {
         println!("  {line}");
     }
     Ok(ExitCode::SUCCESS)
+}
+
+/// Pull `name` + `description` out of the baked `meta.json` `tools`
+/// array. Tolerant of a missing / malformed array (yields empty) — a
+/// capsule built before tool-baking, or a non-tool capsule, simply has
+/// no tools to show.
+fn extract_tool_summaries(meta: &serde_json::Value) -> Vec<ToolSummary> {
+    let Some(tools) = meta.get("tools").and_then(|v| v.as_array()) else {
+        return Vec::new();
+    };
+    tools
+        .iter()
+        .filter_map(|t| {
+            let name = t.get("name")?.as_str()?.to_string();
+            let description = t
+                .get("description")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string();
+            Some(ToolSummary { name, description })
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -142,11 +196,39 @@ mod tests {
             wasm_hash: "abc".into(),
             installed_at: "2026-04-28T00:00:00Z".into(),
             updated_at: "2026-04-28T00:00:00Z".into(),
+            tools: vec![ToolSummary {
+                name: "do_thing".into(),
+                description: "Does the thing".into(),
+            }],
             manifest: "[package]\nname = \"x\"\n".into(),
         };
         let json = serde_json::to_string(&rec).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed["name"], "x");
         assert_eq!(parsed["version"], "0.1.0");
+        assert_eq!(parsed["tools"][0]["name"], "do_thing");
+    }
+
+    #[test]
+    fn extract_tool_summaries_reads_baked_tools() {
+        let meta = serde_json::json!({
+            "version": "0.1.0",
+            "tools": [
+                { "name": "read_file", "description": "Read a file", "input_schema": {} },
+                { "name": "write_file", "input_schema": {} },
+            ]
+        });
+        let tools = extract_tool_summaries(&meta);
+        assert_eq!(tools.len(), 2);
+        assert_eq!(tools[0].name, "read_file");
+        assert_eq!(tools[0].description, "Read a file");
+        assert_eq!(tools[1].name, "write_file");
+        assert_eq!(tools[1].description, "");
+    }
+
+    #[test]
+    fn extract_tool_summaries_tolerates_missing_array() {
+        let meta = serde_json::json!({ "version": "0.1.0" });
+        assert!(extract_tool_summaries(&meta).is_empty());
     }
 }

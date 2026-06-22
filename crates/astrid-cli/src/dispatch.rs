@@ -151,12 +151,13 @@ async fn dispatch_subcommand(
                     "`astrid build` is deprecated; use `astrid capsule build` instead."
                 )
             );
-            bootstrap::run_build_companion(
+            commands::capsule::build::run(
                 path.as_deref(),
                 output.as_deref(),
                 project_type.as_deref(),
                 from_mcp_json.as_deref(),
             )
+            .await
         },
         Some(Commands::Init { distro }) => {
             commands::init::run_init(&distro).await?;
@@ -243,12 +244,15 @@ async fn dispatch_capsule(command: crate::cli::CapsuleCommands) -> Result<ExitCo
             output,
             project_type,
             from_mcp_json,
-        } => bootstrap::run_build_companion(
-            path.as_deref(),
-            output.as_deref(),
-            project_type.as_deref(),
-            from_mcp_json.as_deref(),
-        ),
+        } => {
+            commands::capsule::build::run(
+                path.as_deref(),
+                output.as_deref(),
+                project_type.as_deref(),
+                from_mcp_json.as_deref(),
+            )
+            .await
+        },
         CapsuleCommands::Config(args) => commands::capsule::config::run(&args),
         CapsuleCommands::Show(args) => commands::capsule::show::run(&args),
         CapsuleCommands::Run {

@@ -14,6 +14,7 @@ use std::fmt;
 use std::path::Path;
 
 use anyhow::Context;
+use astrid_capsule::ToolDescriptor;
 use astrid_core::dirs::AstridHome;
 use serde::{Deserialize, Serialize};
 
@@ -46,6 +47,13 @@ pub struct CapsuleMeta {
     /// Maps original filename to BLAKE3 hash (e.g. `"my-analytics.wit" → "abc123"`).
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub wit_files: HashMap<String, String>,
+    /// Tool descriptors captured at build time from the capsule's
+    /// `#[astrid::tool]`-generated `tool_describe` interceptor. Baked
+    /// into `meta.json` so the tool surface is a static, offline-
+    /// inspectable artifact (`astrid capsule show`) rather than a
+    /// runtime describe fan-out. Empty for capsules with no tools.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tools: Vec<ToolDescriptor>,
 }
 
 /// Read existing `meta.json` from a capsule's install directory (if present).
