@@ -30,4 +30,4 @@ pub(crate) mod watcher;
 pub use engine::wasm::limits::CapsuleRuntimeLimits;
 pub use fuel_ledger::{FuelLedger, FuelRateLimiter};
 pub use memory_ledger::{MemoryLedger, StoreMemoryMeter};
-pub use tool_discovery::{ToolDescriptor, describe_capsule_tools};
+pub use tool_discovery::{ToolDescriptor, describe_capsule_tools, describe_loaded_capsule};
