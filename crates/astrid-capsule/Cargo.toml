@@ -11,6 +11,7 @@ build = "build.rs"
 
 [dependencies]
 astrid-approval = { workspace = true }
+astrid-audit = { workspace = true }
 astrid-capabilities = { workspace = true }
 astrid-core = { workspace = true }
 astrid-crypto = { workspace = true }
@@ -19,6 +20,7 @@ astrid-mcp = { workspace = true }
 astrid-storage = { workspace = true, features = ["keychain"] }
 astrid-vfs = { workspace = true }
 astrid-workspace = { workspace = true }
+anyhow = { workspace = true }
 async-trait = { workspace = true }
 blake3 = { workspace = true }
 bytes = "1"

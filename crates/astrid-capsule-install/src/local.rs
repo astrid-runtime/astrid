@@ -32,6 +32,7 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, bail};
+use astrid_capsule::ToolDescriptor;
 use astrid_capsule::discovery::load_manifest;
 use astrid_capsule::engine::wasm::host_state::LifecyclePhase;
 use astrid_core::dirs::AstridHome;
@@ -224,6 +225,13 @@ pub fn install_from_local_path(
         }
     }
 
+    // Build-captured tool descriptors travel in `<source>/tools.json`
+    // (written by `astrid capsule build` and packed into the archive).
+    // Absent — a non-tool capsule, or one built before this capability
+    // landed — yields an empty vec. Install never instantiates WASM, so
+    // this is a plain file read, keeping install daemon-free / standalone.
+    let tools = read_tools_json(source_dir);
+
     // Persist meta.json.
     let now = chrono::Utc::now().to_rfc3339();
     let meta = CapsuleMeta {
@@ -240,6 +248,7 @@ pub fn install_from_local_path(
         exports: version_map_to_strings(&manifest.exports, |d| d.version.to_string()),
         wasm_hash: wasm.as_ref().map(|w: &WasmAddressed| w.hash.clone()),
         wit_files,
+        tools,
     };
     if let Err(e) = write_meta(&target_dir, &meta) {
         rollback(&target_dir, backup_dir.as_deref());
@@ -290,6 +299,33 @@ pub fn install_from_local_path(
         missing_imports,
         export_conflicts,
     })
+}
+
+/// Read build-captured tool descriptors from `<source_dir>/tools.json`.
+///
+/// Written by `astrid capsule build` and packed into the `.capsule`
+/// archive. Treated like `read_meta`: a missing file is "no tools"
+/// (empty vec, the common case for non-tool capsules and capsules built
+/// before this capability), and a corrupt file is logged and treated as
+/// missing rather than failing the install — the tool surface degrades
+/// to "unknown", it does not block a working capsule.
+fn read_tools_json(source_dir: &Path) -> Vec<ToolDescriptor> {
+    let path = source_dir.join("tools.json");
+    let data = match std::fs::read_to_string(&path) {
+        Ok(d) => d,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
+        Err(e) => {
+            tracing::warn!(path = %path.display(), error = %e, "failed to read tools.json, treating as no tools");
+            return Vec::new();
+        },
+    };
+    match serde_json::from_str::<Vec<ToolDescriptor>>(&data) {
+        Ok(tools) => tools,
+        Err(e) => {
+            tracing::warn!(path = %path.display(), error = %e, "tools.json is corrupt, treating as no tools");
+            Vec::new()
+        },
+    }
 }
 
 /// Restore `backup_dir` over `target_dir`. Best-effort — logs and
