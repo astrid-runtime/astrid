@@ -40,45 +40,6 @@ use crate::registry::CapsuleRegistry;
 use astrid_events::PrincipalKey;
 use astrid_events::{AstridEvent, EventBus, EventReceiver};
 
-/// Topic prefix for the user-invocable **tool execute** surface. A tool
-/// invocation is `tool.v1.execute.<name>` — a single segment after this
-/// prefix. Result-delivery sub-topics (`...<name>.result`, `...result`) are
-/// deliberately NOT gated; see [`is_user_invocable_surface`].
-const TOOL_EXECUTE_PREFIX: &str = "tool.v1.execute.";
-
-/// The user-invocable **CLI command execute** topic. Matched exactly.
-const CLI_COMMAND_EXECUTE_TOPIC: &str = "cli.v1.command.execute";
-
-/// Is `topic` part of the **user-invocable surface** that the
-/// per-principal capsule-access filter gates?
-///
-/// CRITICAL SCOPING: only `tool.v1.execute.*` and
-/// `cli.v1.command.execute` are gated. Every other topic — the internal
-/// orchestration mesh (`session.*`, `spark.*`, `registry.*`,
-/// `prompt_builder.*`, `context_engine.*`, lifecycle/hooks, llm streams)
-/// — dispatches UNCHANGED, or the runtime wedges. This is why a dual-role
-/// capsule (e.g. `identity` handling both `tool.v1.execute.save_identity`
-/// and `spark.v1.request.build`) has its tool gated while its
-/// orchestration role stays open: the gate is keyed on the **topic**, not
-/// the capsule.
-#[must_use]
-fn is_user_invocable_surface(topic: &str) -> bool {
-    if topic == CLI_COMMAND_EXECUTE_TOPIC {
-        return true;
-    }
-    // A tool INVOCATION is exactly `tool.v1.execute.<name>` — a single
-    // segment after the prefix. Result-delivery topics must NOT be gated:
-    // `tool.v1.execute.<name>.result` (router `handle_execute_result`) and
-    // react's bare `tool.v1.execute.result` (`handle_tool_result`) are
-    // handled by orchestration capsules that are never in a principal's
-    // grant set, so gating them would drop every tool result and hang the
-    // turn. Match only a single, non-`result` segment after the prefix.
-    match topic.strip_prefix(TOOL_EXECUTE_PREFIX) {
-        Some(name) => !name.is_empty() && !name.contains('.') && name != "result",
-        None => false,
-    }
-}
-
 /// Capacity of each per-(capsule, principal) event dispatch queue.
 ///
 /// Per-principal partitioning means the working set per queue is much
@@ -948,7 +909,7 @@ async fn find_matching_interceptors(
     // Compute the gate once per event, not per capsule. The filter only
     // engages for the user-invocable surface with a resolver present;
     // otherwise every topic dispatches unchanged (orchestration mesh).
-    let gate_surface = is_user_invocable_surface(topic);
+    let gate_surface = crate::access::is_user_invocable_surface(topic);
     let registry = registry.read().await;
     let mut matches: Vec<(Arc<dyn crate::capsule::Capsule>, String, u32)> = Vec::new();
     for capsule_id in registry.list() {

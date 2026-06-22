@@ -50,6 +50,47 @@ use tracing::warn;
 use crate::capsule::CapsuleId;
 use crate::profile_cache::PrincipalProfileCache;
 
+/// Topic prefix for the user-invocable **tool execute** surface. A tool
+/// invocation is `tool.v1.execute.<name>` — a single segment after this
+/// prefix. Result-delivery sub-topics (`...<name>.result`, `...result`) are
+/// deliberately NOT gated; see [`is_user_invocable_surface`].
+const TOOL_EXECUTE_PREFIX: &str = "tool.v1.execute.";
+
+/// The user-invocable **CLI command execute** topic. Matched exactly.
+const CLI_COMMAND_EXECUTE_TOPIC: &str = "cli.v1.command.execute";
+
+/// Is `topic` part of the **user-invocable surface** that the per-principal
+/// capsule-access filter gates? Co-located with the resolver because it
+/// defines *which* topics the grant set applies to.
+///
+/// CRITICAL SCOPING: only `tool.v1.execute.<name>` and
+/// `cli.v1.command.execute` are gated. Every other topic — the internal
+/// orchestration mesh (`session.*`, `spark.*`, `registry.*`,
+/// `prompt_builder.*`, `context_engine.*`, lifecycle/hooks, llm streams) AND
+/// tool-result delivery (`tool.v1.execute.<name>.result`, react's bare
+/// `tool.v1.execute.result`) — dispatches UNCHANGED, or the runtime wedges. A
+/// dual-role capsule (e.g. `identity` handling both
+/// `tool.v1.execute.save_identity` and `spark.v1.request.build`) has its tool
+/// gated while its orchestration role stays open: the gate is keyed on the
+/// **topic**, not the capsule.
+#[must_use]
+pub(crate) fn is_user_invocable_surface(topic: &str) -> bool {
+    if topic == CLI_COMMAND_EXECUTE_TOPIC {
+        return true;
+    }
+    // A tool INVOCATION is exactly `tool.v1.execute.<name>` — a single
+    // segment after the prefix. Result-delivery topics must NOT be gated:
+    // `tool.v1.execute.<name>.result` (router `handle_execute_result`) and
+    // react's bare `tool.v1.execute.result` (`handle_tool_result`) are handled
+    // by orchestration capsules that are never in a principal's grant set, so
+    // gating them would drop every tool result and hang the turn. Match only a
+    // single, non-`result` segment after the prefix.
+    match topic.strip_prefix(TOOL_EXECUTE_PREFIX) {
+        Some(name) => !name.is_empty() && !name.contains('.') && name != "result",
+        None => false,
+    }
+}
+
 /// Resolves whether a principal may invoke a given capsule, for the
 /// dispatcher's user-invocable-surface filter.
 ///

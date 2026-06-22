@@ -1313,7 +1313,7 @@ mod access_enforcement {
     /// unrelated topics are not.
     #[test]
     fn surface_predicate_gates_only_bare_invocation() {
-        use super::super::is_user_invocable_surface as gated;
+        use crate::access::is_user_invocable_surface as gated;
         assert!(gated("tool.v1.execute.save_identity"));
         assert!(gated("cli.v1.command.execute"));
         assert!(!gated("tool.v1.execute.save_identity.result"));
