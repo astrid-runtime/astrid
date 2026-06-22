@@ -396,12 +396,22 @@ impl Kernel {
         drop(bus_monitor::spawn_bus_activity_monitor(&kernel.event_bus));
 
         // Spawn the event dispatcher — routes EventBus events to capsule interceptors.
-        // Wire the identity store so auto-provisioning is gated.
+        // Wire the identity store so auto-provisioning is gated, and the
+        // per-principal capsule-access resolver so the user-invocable tool
+        // surface (`tool.v1.execute.*`, `cli.v1.command.execute`) is gated
+        // at dispatch (admin `*` bypass, fail-closed). The resolver reuses
+        // the kernel-owned profile cache + live group config — cloned in
+        // the same way the fuel/memory ledgers are.
+        let access_resolver = astrid_capsule::CapsuleAccessResolver::new(
+            Arc::clone(&kernel.profile_cache),
+            Arc::clone(&kernel.groups),
+        );
         let dispatcher = astrid_capsule::dispatcher::EventDispatcher::new(
             Arc::clone(&kernel.capsules),
             Arc::clone(&kernel.event_bus),
         )
-        .with_identity_store(Arc::clone(&kernel.identity_store));
+        .with_identity_store(Arc::clone(&kernel.identity_store))
+        .with_access_resolver(access_resolver);
         tokio::spawn(dispatcher.run());
 
         debug_assert_eq!(

@@ -89,6 +89,8 @@ fn known_capabilities_covers_every_admin_request_cap() {
             principal: p.clone(),
             add_groups: vec![],
             remove_groups: vec![],
+            add_capsules: vec![],
+            remove_capsules: vec![],
         },
         AdminRequestKind::AgentList,
         AdminRequestKind::QuotaSet {

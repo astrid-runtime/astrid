@@ -441,6 +441,18 @@ pub enum AdminRequestKind {
         /// who want a baseline should add `agent` explicitly.
         #[serde(default)]
         remove_groups: Vec<String>,
+        /// Granted capsule ids to add (idempotent). Grants the principal
+        /// access to invoke the named capsule's user-invocable tool
+        /// surface; the kernel gates `tool.v1.execute.*` /
+        /// `cli.v1.command.execute` at dispatch against this set. New
+        /// principals start with none; admins (`*`) bypass the gate.
+        #[serde(default)]
+        add_capsules: Vec<String>,
+        /// Granted capsule ids to remove (idempotent — missing entries
+        /// are no-ops). Revokes the principal's access to the named
+        /// capsule's tool surface.
+        #[serde(default)]
+        remove_capsules: Vec<String>,
     },
     /// Replace the target principal's [`Quotas`] block. Values are
     /// validated before the atomic profile write.

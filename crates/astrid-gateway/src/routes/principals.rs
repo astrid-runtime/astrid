@@ -75,6 +75,14 @@ pub struct ModifyPrincipalRequest {
     /// Groups to remove. Idempotent — absent groups are no-ops.
     #[serde(default)]
     pub remove_groups: Vec<String>,
+    /// Capsule grants to add. Idempotent — already-granted capsules are
+    /// no-ops. Grants the principal access to invoke the named capsule's
+    /// user-invocable tool surface (kernel-gated at dispatch, #992).
+    #[serde(default)]
+    pub add_capsules: Vec<String>,
+    /// Capsule grants to remove. Idempotent — absent grants are no-ops.
+    #[serde(default)]
+    pub remove_capsules: Vec<String>,
 }
 
 /// `GET /api/sys/principals` — list every agent principal visible
@@ -317,6 +325,8 @@ pub async fn modify_principal(
             principal,
             add_groups: body.add_groups,
             remove_groups: body.remove_groups,
+            add_capsules: body.add_capsules,
+            remove_capsules: body.remove_capsules,
         })
         .await
         .map_err(daemon_internal)?;
