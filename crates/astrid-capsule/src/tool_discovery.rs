@@ -123,9 +123,16 @@ pub async fn describe_capsule_tools(dir: &Path) -> anyhow::Result<Vec<ToolDescri
     // Primary capture: the `tool_describe` interceptor returns the
     // descriptor JSON in its `CapsuleResult { action: "continue",
     // data: Some(...) }`, which the engine surfaces as
-    // `InterceptResult::Continue(bytes)`. A capsule with no tools has
-    // no such interceptor — the engine returns `NotSupported`, which
-    // is "no tools", not a failure.
+    // `InterceptResult::Continue(bytes)`.
+    //
+    // A capsule with no `#[astrid::tool]` has no `tool_describe` arm, and the
+    // engine signals that two different ways depending on whether the capsule
+    // has *any* interceptors: a capsule with none yields a `NotSupported`
+    // error, while a capsule with other interceptors (e.g. the sage-mcp broker)
+    // has its generated dispatch *deny* the unknown action with "unknown hook
+    // action: tool_describe". Both mean "no tools", not a failure — otherwise a
+    // pure-interceptor capsule (which includes the broker itself) would be left
+    // unmarked and a consumer could never trust the static surface.
     let result = match capsule.invoke_interceptor("tool_describe", &[], None).await {
         Ok(r) => r,
         Err(e) if is_unsupported(&e) => return Ok(Vec::new()),
@@ -134,6 +141,11 @@ pub async fn describe_capsule_tools(dir: &Path) -> anyhow::Result<Vec<ToolDescri
 
     let payload = match result {
         InterceptResult::Continue(bytes) | InterceptResult::Final(bytes) => bytes,
+        // No `tool_describe` arm => "no tools", treated like NotSupported above.
+        InterceptResult::Deny { reason } if is_unknown_action(&reason) => {
+            return Ok(Vec::new());
+        },
+        // Any other deny is a genuine refusal — surface it.
         InterceptResult::Deny { reason } => {
             anyhow::bail!("tool_describe interceptor denied: {reason}");
         },
@@ -171,6 +183,18 @@ fn parse_tool_descriptors(payload: &[u8]) -> anyhow::Result<Vec<ToolDescriptor>>
 /// action and the trait default does the same.
 fn is_unsupported(err: &crate::error::CapsuleError) -> bool {
     matches!(err, crate::error::CapsuleError::NotSupported(_))
+}
+
+/// Whether a `tool_describe` deny reason means the capsule simply has no
+/// `tool_describe` arm (a capsule with other interceptors but no
+/// `#[astrid::tool]`), as opposed to a genuine refusal. The SDK's generated
+/// interceptor dispatch denies an unhandled action with the exact reason
+/// "unknown hook action: <action>" — match it precisely (this is only ever
+/// called for the `tool_describe` action) rather than by substring, so a
+/// genuine deny whose message happens to contain the phrase is never silently
+/// swallowed as "no tools".
+fn is_unknown_action(reason: &str) -> bool {
+    reason == "unknown hook action: tool_describe"
 }
 
 /// RAII handle for a transient build-time `meta.json` staged so the WASM
@@ -239,6 +263,23 @@ fn no_op_mcp_client() -> SecureMcpClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unknown_action_deny_matches_only_tool_describe() {
+        // A capsule with interceptors but no `#[astrid::tool]` (e.g. the broker)
+        // denies the unknown `tool_describe` action — that is "no tools".
+        assert!(is_unknown_action("unknown hook action: tool_describe"));
+        // An unknown action for a DIFFERENT endpoint is not our signal — don't
+        // swallow it (this fn is only ever called for `tool_describe`, but the
+        // exact match keeps it honest).
+        assert!(!is_unknown_action("unknown hook action: other_action"));
+        // A genuine refusal must NOT be swallowed as "no tools", even if its
+        // message happens to contain the phrase.
+        assert!(!is_unknown_action("capability denied: caps:token:mint"));
+        assert!(!is_unknown_action(
+            "policy blocked: unknown hook action is not allowed here"
+        ));
+    }
 
     #[test]
     fn parses_tool_describe_payload() {
