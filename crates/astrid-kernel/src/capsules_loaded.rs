@@ -31,16 +31,6 @@ pub(crate) fn read_capsule_meta_opaque(source_dir: &Path) -> Option<Value> {
     serde_json::from_slice(&bytes).ok()
 }
 
-/// Whether a capsule's opaque `meta` already carries a baked tool surface — a
-/// present, non-null `tools` value. When `false`, the kernel probes the live
-/// capsule's `tool_describe` and injects the result via [`inject_tools`], so a
-/// capsule whose tools were not baked at build still contributes a complete
-/// surface without a rebuild.
-pub(crate) fn meta_has_tools(meta: Option<&Value>) -> bool {
-    meta.and_then(|m| m.get("tools"))
-        .is_some_and(|t| !t.is_null())
-}
-
 /// Inject a freshly-described `tools` array into a capsule's opaque `meta`.
 ///
 /// `meta` is the capsule's `meta.json` value (or `None` if it had none); the
@@ -75,19 +65,6 @@ pub(crate) fn build_capsules_loaded_payload(entries: Vec<(String, Option<Value>)
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn meta_has_tools_distinguishes_baked_from_unknown() {
-        // Baked (present, even empty) => true; skip the live probe.
-        assert!(meta_has_tools(Some(&json!({ "tools": [{ "name": "x" }] }))));
-        assert!(meta_has_tools(Some(&json!({ "tools": [] }))));
-        // Not captured => false; probe the live capsule.
-        assert!(!meta_has_tools(Some(&json!({ "version": "1.0.0" }))));
-        assert!(!meta_has_tools(Some(
-            &json!({ "tools": serde_json::Value::Null })
-        )));
-        assert!(!meta_has_tools(None));
-    }
 
     #[test]
     fn inject_tools_sets_tools_preserving_other_meta() {
