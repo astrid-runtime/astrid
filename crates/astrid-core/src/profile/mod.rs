@@ -36,8 +36,11 @@ use std::sync::OnceLock;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+mod device;
 mod io_impl;
 mod validation;
+
+pub use device::{DEVICE_KEY_ID_HEX_LEN, DeviceKey, DeviceScope, device_key_id_fingerprint};
 
 /// Current profile schema version. Bumped on breaking field changes.
 ///
@@ -183,9 +186,31 @@ pub struct AuthConfig {
     #[serde(default)]
     pub methods: Vec<AuthMethod>,
 
-    /// Public keys bound to this principal (encoding TBD; see Layer 5).
+    /// Device keys bound to this principal.
+    ///
+    /// Each entry is a [`DeviceKey`] carrying the registered ed25519 public
+    /// key plus the capability [`DeviceScope`] that pairing was granted. On
+    /// disk an entry may be a legacy bare `"ed25519:<hex>"` string (migrated
+    /// to a Full-scope device on load) or the full struct form; serialization
+    /// always re-emits the struct form.
     #[serde(default)]
-    pub public_keys: Vec<String>,
+    pub public_keys: Vec<DeviceKey>,
+}
+
+impl AuthConfig {
+    /// Look up a registered device by its deterministic `key_id`.
+    #[must_use]
+    pub fn device_by_key_id(&self, key_id: &str) -> Option<&DeviceKey> {
+        self.public_keys.iter().find(|k| k.key_id == key_id)
+    }
+
+    /// Look up a registered device by its canonical lowercase-hex pubkey.
+    #[must_use]
+    pub fn device_by_pubkey(&self, hex_lower: &str) -> Option<&DeviceKey> {
+        self.public_keys
+            .iter()
+            .find(|k| k.matches_pubkey(hex_lower))
+    }
 }
 
 /// Network egress configuration for a principal.
@@ -401,7 +426,7 @@ mod tests {
             revokes: vec!["system:shutdown".into()],
             auth: AuthConfig {
                 methods: vec![AuthMethod::Keypair, AuthMethod::Passkey],
-                public_keys: vec!["ed25519:AAAA".into()],
+                public_keys: vec![DeviceKey::new("a".repeat(64), DeviceScope::Full, None, 0)],
             },
             network: NetworkConfig {
                 egress: vec!["api.example.com:443".into()],
@@ -421,5 +446,64 @@ mod tests {
         let s = toml::to_string_pretty(&p).unwrap();
         let back: PrincipalProfile = toml::from_str(&s).unwrap();
         assert_eq!(p, back);
+    }
+
+    // ── AuthConfig device-key list (migration + lookups) ──────────────────
+
+    #[test]
+    fn auth_config_legacy_bare_list_loads_as_full_devices() {
+        // The historical `public_keys = ["ed25519:<hex>"]` TOML form round-
+        // trips into Full-scope DeviceKeys.
+        let hex = "a".repeat(64);
+        let toml_src = format!("methods = [\"keypair\"]\npublic_keys = [\"ed25519:{hex}\"]\n");
+        let auth: AuthConfig = toml::from_str(&toml_src).unwrap();
+        assert_eq!(auth.public_keys.len(), 1);
+        assert_eq!(auth.public_keys[0].pubkey, hex);
+        assert_eq!(auth.public_keys[0].scope, DeviceScope::Full);
+    }
+
+    #[test]
+    fn auth_config_mixed_bare_and_struct_list() {
+        // One legacy bare string + one full struct entry deserialize together.
+        let bare = "a".repeat(64);
+        let full = "b".repeat(64);
+        let json = format!(
+            r#"{{"methods":["keypair"],"public_keys":["ed25519:{bare}",{{"pubkey":"{full}","scope":{{"type":"scoped","allow":["self:agent:prompt"],"deny":[]}},"label":"tablet","created_at":99}}]}}"#
+        );
+        let auth: AuthConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(auth.public_keys.len(), 2);
+        assert_eq!(auth.public_keys[0].scope, DeviceScope::Full);
+        assert_eq!(auth.public_keys[0].pubkey, bare);
+        assert!(matches!(
+            auth.public_keys[1].scope,
+            DeviceScope::Scoped { .. }
+        ));
+        assert_eq!(auth.public_keys[1].label.as_deref(), Some("tablet"));
+
+        // Lookups resolve by key_id and pubkey.
+        let id0 = auth.public_keys[0].key_id.clone();
+        assert!(auth.device_by_key_id(&id0).is_some());
+        assert!(auth.device_by_pubkey(&full).is_some());
+        assert!(auth.device_by_pubkey(&"c".repeat(64)).is_none());
+    }
+
+    #[test]
+    fn auth_config_reemits_struct_form() {
+        // Serialization always writes the struct form, never the bare string.
+        let hex = "a".repeat(64);
+        let toml_src = format!("public_keys = [\"ed25519:{hex}\"]\n");
+        let auth: AuthConfig = toml::from_str(&toml_src).unwrap();
+        let out = toml::to_string(&auth).unwrap();
+        assert!(
+            out.contains("pubkey"),
+            "serialized form must be a struct: {out}"
+        );
+        assert!(
+            out.contains("key_id"),
+            "serialized form carries key_id: {out}"
+        );
+        // And it round-trips back to the same value.
+        let back: AuthConfig = toml::from_str(&out).unwrap();
+        assert_eq!(auth, back);
     }
 }

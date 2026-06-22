@@ -625,6 +625,14 @@ pub const CAPABILITY_CATALOG: &[CapabilityInfo] = {
             danger: Normal,
         },
         CapabilityInfo {
+            id: "self:auth:pair:admin",
+            label: "Pair a full-scope device",
+            description: "Mint a FULL-scope (unattenuated) pair-device token; a scoped device cannot. A device paired without this capability is restricted to a capability scope that can never widen the principal's effective permissions, so this gates the ability to add a device that acts with the principal's full authority.",
+            category: Approval,
+            scope: Self_,
+            danger: Elevated,
+        },
+        CapabilityInfo {
             id: "auth:pair:redeem",
             label: "Redeem pair-device tokens (no-op grant)",
             description: "Capability name preserved for completeness — the kernel bypasses the cap check on pair-device redemption because the token itself is the auth. Granting this to anyone is a no-op.",
@@ -659,7 +667,7 @@ pub fn known_capabilities_list() -> &'static [&'static str] {
 /// in the same commit that adds a new capability so a kernel
 /// addition without updating the catalog fails the consuming
 /// crate's tests.
-pub const KNOWN_CAPABILITIES_COUNT: usize = 39;
+pub const KNOWN_CAPABILITIES_COUNT: usize = 40;
 
 const _: () = assert!(
     CAPABILITY_CATALOG.len() == KNOWN_CAPABILITIES_COUNT,
