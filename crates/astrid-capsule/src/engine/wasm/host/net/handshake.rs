@@ -30,6 +30,7 @@
 //! fallback to unauthenticated.
 
 use astrid_core::principal::PrincipalId;
+use astrid_core::profile::DeviceKey;
 use astrid_core::session_token::{
     HandshakeRequest, HandshakeResponse, PRINCIPAL_AUTH_NONCE_LEN, PROTOCOL_VERSION, SessionToken,
     principal_auth_challenge_message,
@@ -227,15 +228,17 @@ fn verify_principal_signature(
 }
 
 /// Pure signature check: does `signature_hex` verify the challenge message for
-/// `principal` against any `ed25519:<hex>` entry in `public_keys`?
+/// `principal` against any registered [`DeviceKey`] in `public_keys`?
 ///
 /// Separated from profile/disk loading so it is unit-testable without an
 /// `AstridHome` or environment. We do NOT short-circuit on the first key
 /// whose hex fails to parse — a malformed entry must not block a later valid
-/// one.
+/// one. The per-device scope is not consulted here: this gate establishes
+/// *which key authenticated the connection*; the scope is applied later at
+/// the capability gate once the matched device is known.
 fn verify_signature_against_keys(
     principal: &PrincipalId,
-    public_keys: &[String],
+    public_keys: &[DeviceKey],
     nonce_hex: &str,
     signature_hex: &str,
 ) -> Result<(), String> {
@@ -246,12 +249,9 @@ fn verify_signature_against_keys(
     let message_bytes = message.as_bytes();
 
     let mut saw_key = false;
-    for entry in public_keys {
-        let Some(hex) = entry.strip_prefix("ed25519:") else {
-            continue;
-        };
+    for key in public_keys {
         saw_key = true;
-        let Ok(public_key) = astrid_crypto::PublicKey::from_hex(hex) else {
+        let Ok(public_key) = astrid_crypto::PublicKey::from_hex(&key.pubkey) else {
             continue;
         };
         if public_key.verify(message_bytes, &signature).is_ok() {

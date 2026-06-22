@@ -13,7 +13,7 @@ use std::sync::Arc;
 use astrid_core::PrincipalId;
 use astrid_core::groups::GroupConfig;
 use astrid_core::kernel_api::{AdminResponseBody, InviteIssued, InviteRedeemed, InviteSummary};
-use astrid_core::profile::{AuthConfig, AuthMethod, PrincipalProfile};
+use astrid_core::profile::{AuthConfig, AuthMethod, DeviceKey, DeviceScope, PrincipalProfile};
 use sha2::{Digest, Sha256};
 use tracing::{info, warn};
 
@@ -144,9 +144,19 @@ pub(crate) async fn invite_redeem(
     // Build the profile up-front so we can register the public key
     // before saving — no two-write race window in which a redeemer
     // sees their principal exist but the key not yet registered.
+    //
+    // The redeemed device is registered Full-scope: an invite mints a
+    // first-class principal, so its initial device acts with the principal's
+    // full authority. Per-device attenuation is opt-in on the pair-device
+    // path, not the invite path.
     let mut auth = AuthConfig::default();
     auth.methods.push(AuthMethod::Keypair);
-    auth.public_keys.push(format!("ed25519:{normalised_key}"));
+    auth.public_keys.push(DeviceKey::new(
+        normalised_key.clone(),
+        DeviceScope::Full,
+        None,
+        i64::try_from(invite::now_epoch()).unwrap_or(0),
+    ));
 
     let profile = PrincipalProfile {
         groups: vec![chosen.group.clone()],

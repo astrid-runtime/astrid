@@ -21,7 +21,7 @@ use std::sync::Arc;
 
 use astrid_core::PrincipalId;
 use astrid_core::kernel_api::{AdminResponseBody, PairTokenIssued, PairTokenRedeemed};
-use astrid_core::profile::{AuthMethod, PrincipalProfile};
+use astrid_core::profile::{AuthMethod, DeviceKey, DeviceScope, PrincipalProfile};
 use tracing::{info, warn};
 
 use crate::pair_token::{self, MAX_EXPIRY_SECS, PairToken, PairTokenStore};
@@ -150,9 +150,17 @@ pub(crate) async fn pair_device_redeem(
         Err(e) => return err_internal(format!("profile load failed: {e}")),
     };
 
-    let key_entry = format!("ed25519:{normalised_key}");
-    if !profile.auth.public_keys.contains(&key_entry) {
-        profile.auth.public_keys.push(key_entry.clone());
+    // Dedup by canonical pubkey so re-redeeming the same key is idempotent
+    // (the deterministic key_id makes the device handle stable). The redeemed
+    // device is registered Full-scope — per-device scope wiring lands with the
+    // issue/redeem path that carries a requested scope on the token.
+    if profile.auth.device_by_pubkey(&normalised_key).is_none() {
+        profile.auth.public_keys.push(DeviceKey::new(
+            normalised_key.clone(),
+            DeviceScope::Full,
+            None,
+            i64::try_from(now).unwrap_or(0),
+        ));
     }
     if !profile.auth.methods.contains(&AuthMethod::Keypair) {
         profile.auth.methods.push(AuthMethod::Keypair);
@@ -177,7 +185,8 @@ pub(crate) async fn pair_device_redeem(
         );
     }
 
-    let fingerprint = super::invite_handlers::fingerprint_public_key(&key_entry);
+    let fingerprint =
+        super::invite_handlers::fingerprint_public_key(&format!("ed25519:{normalised_key}"));
     info!(
         principal = %chosen.principal,
         public_key_fingerprint = %fingerprint,

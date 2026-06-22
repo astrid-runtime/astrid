@@ -282,9 +282,20 @@ fn mint_principal_keypair(
             return Err(err_internal(format!("principal key write failed: {e}")));
         }
     }
-    let public_key = format!("ed25519:{}", keypair.export_public_key().to_hex());
-    if !profile.auth.public_keys.contains(&public_key) {
-        profile.auth.public_keys.push(public_key);
+    // Register the minted public key Full-scope: a principal's own bootstrap
+    // keypair acts with the principal's full authority. Dedup by canonical
+    // pubkey so a re-mint is idempotent.
+    let pubkey_hex = keypair.export_public_key().to_hex();
+    if profile.auth.device_by_pubkey(&pubkey_hex).is_none() {
+        profile
+            .auth
+            .public_keys
+            .push(astrid_core::profile::DeviceKey::new(
+                pubkey_hex,
+                astrid_core::profile::DeviceScope::Full,
+                None,
+                0,
+            ));
     }
     if !profile
         .auth
@@ -348,11 +359,7 @@ pub(super) fn backfill_keypair(
         .auth
         .methods
         .contains(&astrid_core::profile::AuthMethod::Keypair)
-        || profile
-            .auth
-            .public_keys
-            .iter()
-            .any(|k| k.starts_with("ed25519:"));
+        || !profile.auth.public_keys.is_empty();
     if has_keypair {
         return err_bad_input(format!("principal {principal} already exists"));
     }
