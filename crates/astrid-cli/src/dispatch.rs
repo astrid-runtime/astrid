@@ -157,7 +157,6 @@ async fn dispatch_subcommand(
                 project_type.as_deref(),
                 from_mcp_json.as_deref(),
             )
-            .await
         },
         Some(Commands::Init { distro }) => {
             commands::init::run_init(&distro).await?;
@@ -244,15 +243,12 @@ async fn dispatch_capsule(command: crate::cli::CapsuleCommands) -> Result<ExitCo
             output,
             project_type,
             from_mcp_json,
-        } => {
-            commands::capsule::build::run(
-                path.as_deref(),
-                output.as_deref(),
-                project_type.as_deref(),
-                from_mcp_json.as_deref(),
-            )
-            .await
-        },
+        } => commands::capsule::build::run(
+            path.as_deref(),
+            output.as_deref(),
+            project_type.as_deref(),
+            from_mcp_json.as_deref(),
+        ),
         CapsuleCommands::Config(args) => commands::capsule::config::run(&args),
         CapsuleCommands::Show(args) => commands::capsule::show::run(&args),
         CapsuleCommands::Run {

@@ -696,19 +696,17 @@ impl Kernel {
     /// `notifications/tools/list_changed` for connected clients.
     ///
     /// The payload carries, per loaded capsule, its installed `meta.json` under
-    /// `capsules[].meta`, with the capsule's tool surface guaranteed present.
-    /// When the surface was baked into `meta.json` at build time it is forwarded
-    /// verbatim; when it was **not** baked (a capsule built before tool-baking,
-    /// or a third-party one), the kernel probes the live instance once —
-    /// invoking its `tool_describe` interceptor (the same hook the dispatcher
-    /// already routes) and injecting the captured descriptors — so a consumer
-    /// (e.g. the sage-mcp broker) gets a deterministic, complete tool surface
-    /// from this signal **without the capsule having been rebuilt**. The kernel
-    /// invokes-and-forwards: it never interprets the descriptors (the broker
-    /// owns all policy). A describe failure leaves `tools` absent for that
-    /// capsule this cycle (the consumer falls back to its fan-out). The legacy
-    /// `status: "ready"` field is retained so bare-signal subscribers (the shim,
-    /// the TUI) keep working; the `capsules` field is additive.
+    /// `capsules[].meta` with the capsule's tool surface injected. The kernel
+    /// probes each loaded capsule once — invoking its `tool_describe`
+    /// interceptor (the same hook the dispatcher already routes) and injecting
+    /// the captured descriptors — so a consumer (e.g. the sage-mcp broker) gets
+    /// a deterministic, complete tool surface from this signal **without the
+    /// capsule having been rebuilt**. The kernel invokes-and-forwards: it never
+    /// interprets the descriptors (the broker owns all policy). A describe
+    /// failure leaves `tools` absent for that capsule this cycle (the consumer
+    /// falls back to its fan-out). The legacy `status: "ready"` field is
+    /// retained so bare-signal subscribers (the shim, the TUI) keep working; the
+    /// `capsules` field is additive.
     async fn publish_capsules_loaded(&self) {
         // Clone the loaded-capsule handles under a brief read lock, then release
         // it before any filesystem I/O or `tool_describe` invocation (which can
@@ -726,27 +724,23 @@ impl Kernel {
                 .source_dir()
                 .and_then(capsules_loaded::read_capsule_meta_opaque);
 
-            // If the tool surface wasn't baked into `meta.json`, probe the live
-            // instance and inject what it reports — so an un-rebuilt capsule
-            // still contributes a complete surface. Best-effort: a describe
-            // (or serialize) failure leaves `tools` absent and the consumer
-            // falls back to its fan-out for this cycle.
-            if !capsules_loaded::meta_has_tools(meta.as_ref()) {
-                match astrid_capsule::describe_loaded_capsule(capsule.as_ref()).await {
-                    Ok(tools) => match serde_json::to_value(&tools) {
-                        Ok(tools_json) => {
-                            meta = Some(capsules_loaded::inject_tools(meta, tools_json));
-                        },
-                        Err(e) => tracing::debug!(
-                            capsule_id = %name, error = %e,
-                            "failed to serialize live-described tools; capsule left uncaptured this cycle"
-                        ),
+            // Probe the live instance for its tool surface and inject it. Best-
+            // effort: a describe (or serialize) failure leaves `tools` absent
+            // and the consumer falls back to its fan-out for this cycle.
+            match astrid_capsule::describe_loaded_capsule(capsule.as_ref()).await {
+                Ok(tools) => match serde_json::to_value(&tools) {
+                    Ok(tools_json) => {
+                        meta = Some(capsules_loaded::inject_tools(meta, tools_json));
                     },
                     Err(e) => tracing::debug!(
                         capsule_id = %name, error = %e,
-                        "live tool_describe failed; capsule left uncaptured this cycle"
+                        "failed to serialize live-described tools; capsule left uncaptured this cycle"
                     ),
-                }
+                },
+                Err(e) => tracing::debug!(
+                    capsule_id = %name, error = %e,
+                    "live tool_describe failed; capsule left uncaptured this cycle"
+                ),
             }
             with_meta.push((name, meta));
         }
