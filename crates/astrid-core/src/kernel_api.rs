@@ -49,6 +49,15 @@ pub enum KernelRequest {
         /// The capsule id (its `[package].name`).
         id: String,
     },
+    /// Unload a single capsule by id without a daemon restart: unregister it
+    /// from the running daemon so it stops receiving events and its tools leave
+    /// the surface. Lets a fresh `astrid capsule remove` take effect live. The
+    /// on-disk removal is authoritative and dependency-checked by the CLI; this
+    /// only mirrors that into the running registry.
+    UnloadCapsule {
+        /// The capsule id (its `[package].name`).
+        id: String,
+    },
     /// Request the list of globally registered slash commands.
     GetCommands,
     /// Request metadata about loaded capsules (manifests, providers, interceptors).

@@ -737,6 +737,69 @@ impl Kernel {
         Ok(())
     }
 
+    /// Unload a single capsule by id without a daemon restart.
+    ///
+    /// Mirrors the unregister half of [`Self::restart_capsule`]: it removes the
+    /// capsule from the running registry and explicitly unloads it (there is no
+    /// async `Drop`, so we must do it here to avoid leaking MCP subprocesses and
+    /// other engine resources), then publishes `astrid.v1.capsules_loaded` so the
+    /// tool surface refreshes — the departed capsule self-excludes from the next
+    /// fan-out. Backs [`astrid_core::kernel_api::KernelRequest::UnloadCapsule`].
+    ///
+    /// Returns `Ok(true)` if the capsule was loaded and is now unregistered, or
+    /// `Ok(false)` if it was not loaded (a no-op — nothing to unload, no signal
+    /// published). The on-disk removal that precedes this call is authoritative;
+    /// a capsule absent from the running registry is not an error here.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error only if the registry fails to unregister a capsule it
+    /// reported as present.
+    pub(crate) async fn unload_one_capsule(
+        &self,
+        id: &astrid_capsule::capsule::CapsuleId,
+    ) -> Result<bool, anyhow::Error> {
+        // Unregister under the write lock. A NotFound means the capsule was
+        // never loaded here (e.g. the daemon started after it was removed, or
+        // it failed to load) — that is a benign no-op for an unload, so report
+        // it as "not loaded" rather than an error.
+        let old_capsule = {
+            let mut registry = self.capsules.write().await;
+            match registry.unregister(id) {
+                Ok(capsule) => capsule,
+                Err(astrid_capsule::error::CapsuleError::NotFound(_)) => return Ok(false),
+                Err(e) => {
+                    return Err(anyhow::anyhow!("failed to unregister capsule '{id}': {e}"));
+                },
+            }
+        };
+
+        // Explicitly unload the old capsule. There is no Drop impl that calls
+        // unload() (it's async), so we must do it here to avoid leaking MCP
+        // subprocesses and other engine resources. Arc::get_mut requires
+        // exclusive ownership (strong_count == 1).
+        {
+            let mut old = old_capsule;
+            if let Some(capsule) = std::sync::Arc::get_mut(&mut old) {
+                if let Err(e) = capsule.unload().await {
+                    tracing::warn!(
+                        capsule_id = %id,
+                        error = %e,
+                        "Capsule unload failed during unload request"
+                    );
+                }
+            } else {
+                tracing::warn!(
+                    capsule_id = %id,
+                    "Cannot call unload - Arc still held by in-flight task"
+                );
+            }
+        }
+
+        self.publish_capsules_loaded();
+        Ok(true)
+    }
+
     /// Mirror the read-only introspection furniture (installed-capsule
     /// registry + `home://wit/`) into every principal's home.
     ///

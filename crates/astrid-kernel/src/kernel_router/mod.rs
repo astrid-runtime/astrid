@@ -345,6 +345,28 @@ async fn handle_request(
                 Err(e) => KernelResponse::Error(format!("invalid capsule id '{id}': {e}")),
             }
         },
+        KernelRequest::UnloadCapsule { id } => {
+            // Unload a single capsule from the running daemon without a restart.
+            // The on-disk removal that triggers this is authoritative and
+            // dependency-checked by the CLI; here we only unregister the live
+            // instance. `id` is client-supplied over IPC, so validate it
+            // (CapsuleId::new rejects unsafe ids) before using it as a registry
+            // key — never construct it unchecked from untrusted input.
+            match astrid_capsule::capsule::CapsuleId::new(id.clone()) {
+                Ok(cap_id) => match kernel.unload_one_capsule(&cap_id).await {
+                    Ok(true) => KernelResponse::Success(
+                        serde_json::json!({"status": "unloaded", "capsule": id}),
+                    ),
+                    Ok(false) => KernelResponse::Success(
+                        serde_json::json!({"status": "not_loaded", "capsule": id}),
+                    ),
+                    Err(e) => {
+                        KernelResponse::Error(format!("unload of capsule '{id}' failed: {e}"))
+                    },
+                },
+                Err(e) => KernelResponse::Error(format!("invalid capsule id '{id}': {e}")),
+            }
+        },
         KernelRequest::Shutdown { reason } => {
             info!(
                 reason = reason.as_deref().unwrap_or("none"),
@@ -475,7 +497,9 @@ fn rate_limit_for_request(req: &KernelRequest) -> (&'static str, Option<u32>) {
 /// Return the max-per-minute rate limit for a request type, if any.
 fn rate_limit_max(req: &KernelRequest) -> Option<u32> {
     match req {
-        KernelRequest::ReloadCapsules | KernelRequest::ReloadCapsule { .. } => Some(5),
+        KernelRequest::ReloadCapsules
+        | KernelRequest::ReloadCapsule { .. }
+        | KernelRequest::UnloadCapsule { .. } => Some(5),
         KernelRequest::InstallCapsule { .. } | KernelRequest::ApproveCapability { .. } => Some(10),
         KernelRequest::Shutdown { .. } => Some(1),
         KernelRequest::ListCapsules
@@ -529,6 +553,8 @@ pub fn required_capability(req: &KernelRequest, scope: AuthorityScope) -> &'stat
         (KernelRequest::ReloadCapsules | KernelRequest::ReloadCapsule { .. }, _) => {
             "capsule:reload"
         },
+        (KernelRequest::UnloadCapsule { .. }, AuthorityScope::Self_) => "self:capsule:remove",
+        (KernelRequest::UnloadCapsule { .. }, _) => "capsule:remove",
         (KernelRequest::InstallCapsule { .. }, AuthorityScope::Self_) => "self:capsule:install",
         (KernelRequest::InstallCapsule { .. }, _) => "capsule:install",
         (
@@ -554,6 +580,7 @@ pub fn kernel_request_method(req: &KernelRequest) -> &'static str {
     match req {
         KernelRequest::ReloadCapsules => "ReloadCapsules",
         KernelRequest::ReloadCapsule { .. } => "ReloadCapsule",
+        KernelRequest::UnloadCapsule { .. } => "UnloadCapsule",
         KernelRequest::InstallCapsule { .. } => "InstallCapsule",
         KernelRequest::ApproveCapability { .. } => "ApproveCapability",
         KernelRequest::ListCapsules => "ListCapsules",

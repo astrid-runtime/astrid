@@ -66,6 +66,7 @@ pub const fn topic_suffix(req: &KernelRequest) -> &'static str {
         KernelRequest::ListCapsules => "list_capsules",
         KernelRequest::ReloadCapsules => "reload_capsules",
         KernelRequest::ReloadCapsule { .. } => "reload_capsule",
+        KernelRequest::UnloadCapsule { .. } => "unload_capsule",
         KernelRequest::GetCommands => "get_commands",
         KernelRequest::GetCapsuleMetadata => "metadata",
         KernelRequest::Shutdown { .. } => "shutdown",

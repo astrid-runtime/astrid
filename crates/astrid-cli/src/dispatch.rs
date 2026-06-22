@@ -227,6 +227,11 @@ async fn dispatch_capsule(command: crate::cli::CapsuleCommands) -> Result<ExitCo
             purge,
         } => {
             commands::capsule::remove::remove_capsule(&name, workspace, force, purge)?;
+            // The disk removal above is authoritative; this best-effort nudge
+            // mirrors it into a running daemon so the capsule's tools leave the
+            // live surface without a restart. Non-fatal: never affects the exit
+            // status of a successful removal.
+            commands::capsule::live_load::nudge_daemon_unload(&name).await;
             Ok(ExitCode::SUCCESS)
         },
         CapsuleCommands::Tree | CapsuleCommands::Deps => {
