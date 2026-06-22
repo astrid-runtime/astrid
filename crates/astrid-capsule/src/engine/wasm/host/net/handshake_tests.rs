@@ -43,16 +43,18 @@ fn challenge_signature_verifies_against_registered_key() {
     let message = principal_auth_challenge_message(principal.as_str(), &nonce_hex);
     let signature = keypair.sign(message.as_bytes()).to_hex();
 
-    // A registered key over the exact challenge message verifies.
-    assert!(
+    // A registered key over the exact challenge message verifies, returning
+    // THAT device's key_id so the connection can be scoped to it.
+    assert_eq!(
         verify_signature_against_keys(
             &principal,
             std::slice::from_ref(&registered),
             &nonce_hex,
             &signature
         )
-        .is_ok(),
-        "valid signature must verify against the registered key"
+        .as_deref(),
+        Ok(registered.key_id.as_str()),
+        "valid signature must verify and return the matched device key_id"
     );
 
     // A DIFFERENT key fails.
@@ -199,10 +201,11 @@ async fn handshake_signed_returns_verified_principal() {
     assert!(final_resp.is_ok(), "signed handshake must succeed");
 
     let verified = server_task.await.unwrap().expect("handshake ok");
+    let expected_key_id = full_device(&keypair).key_id;
     assert_eq!(
         verified,
-        Some(principal),
-        "a valid signed handshake yields the verified principal"
+        Some((principal, expected_key_id)),
+        "a valid signed handshake yields the verified principal and matched device key_id"
     );
 }
 

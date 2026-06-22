@@ -51,14 +51,16 @@ const MAX_HANDSHAKE_SIZE: usize = 4096;
 /// challenge path is unit-testable against a tempdir-backed home (the crate
 /// is `#![deny(unsafe_code)]`, so env mutation in tests is impossible).
 ///
-/// Returns `Ok(Some(principal))` when the client signed a valid
-/// challenge for a registered key, `Ok(None)` for a legacy/unauthenticated
-/// handshake, or `Err(reason)` with a human-readable rejection reason.
+/// Returns `Ok(Some((principal, key_id)))` when the client signed a valid
+/// challenge for a registered key (`key_id` is the matched [`DeviceKey`]'s
+/// fingerprint, carried forward so the cap-gate can apply that device's
+/// scope), `Ok(None)` for a legacy/unauthenticated handshake, or
+/// `Err(reason)` with a human-readable rejection reason.
 pub(super) async fn validate_handshake(
     stream: &mut tokio::net::UnixStream,
     expected_token: &SessionToken,
     home: &astrid_core::dirs::AstridHome,
-) -> Result<Option<PrincipalId>, String> {
+) -> Result<Option<(PrincipalId, String)>, String> {
     let request = read_handshake_request(stream).await?;
 
     // 1. Validate protocol version FIRST - this check reveals no information
@@ -148,15 +150,17 @@ async fn read_handshake_request(
 /// principal: issue a random nonce, read the signed second frame, and verify
 /// the signature against a registered key.
 ///
-/// Returns the verified [`PrincipalId`] on success, or `Err(reason)` on any
-/// failure (unknown/disabled principal, missing/invalid signature). Sends an
+/// Returns the verified [`PrincipalId`] paired with the `key_id` of the
+/// matched [`DeviceKey`] on success, or `Err(reason)` on any failure
+/// (unknown/disabled principal, missing/invalid signature). Sends an
 /// `authentication failed` response before returning an error so the client
-/// observes a uniform rejection.
+/// observes a uniform rejection. The `key_id` carries the matched device's
+/// identity forward so the cap-gate can apply that device's scope.
 async fn run_principal_challenge(
     stream: &mut tokio::net::UnixStream,
     claimed: &str,
     home: &astrid_core::dirs::AstridHome,
-) -> Result<PrincipalId, String> {
+) -> Result<(PrincipalId, String), String> {
     // Validate the principal id shape before touching disk so a malformed
     // claim never reaches the filesystem.
     let principal = match PrincipalId::new(claimed) {
@@ -188,12 +192,17 @@ async fn run_principal_challenge(
     };
 
     // Verify against a key registered on the claimed principal's profile.
-    if let Err(reason) = verify_principal_signature(&principal, &nonce_hex, &signature_hex, home) {
-        send_auth_failed(stream).await;
-        return Err(reason);
-    }
+    // On success this yields the matched device's `key_id` so the connection
+    // can be scoped to that device at the cap-gate.
+    let key_id = match verify_principal_signature(&principal, &nonce_hex, &signature_hex, home) {
+        Ok(key_id) => key_id,
+        Err(reason) => {
+            send_auth_failed(stream).await;
+            return Err(reason);
+        },
+    };
 
-    Ok(principal)
+    Ok((principal, key_id))
 }
 
 /// Verify `signature_hex` over the challenge message for `principal` against
@@ -202,16 +211,16 @@ async fn run_principal_challenge(
 /// Loads the principal's profile from the resolved [`AstridHome`] and
 /// delegates the pure check to [`verify_signature_against_keys`].
 ///
-/// Returns `Ok(())` if any registered `ed25519:<hex>` key verifies the
-/// signature, `Err(reason)` otherwise. Fail-closed: an unreadable profile, a
-/// disabled principal, a principal with no registered keys, or a malformed
-/// signature all reject.
+/// Returns `Ok(key_id)` — the matched [`DeviceKey`]'s fingerprint — if any
+/// registered `ed25519:<hex>` key verifies the signature, `Err(reason)`
+/// otherwise. Fail-closed: an unreadable profile, a disabled principal, a
+/// principal with no registered keys, or a malformed signature all reject.
 fn verify_principal_signature(
     principal: &PrincipalId,
     nonce_hex: &str,
     signature_hex: &str,
     home: &astrid_core::dirs::AstridHome,
-) -> Result<(), String> {
+) -> Result<String, String> {
     let profile = astrid_core::PrincipalProfile::load(home, principal)
         .map_err(|e| format!("cannot load principal profile: {e}"))?;
 
@@ -230,18 +239,20 @@ fn verify_principal_signature(
 /// Pure signature check: does `signature_hex` verify the challenge message for
 /// `principal` against any registered [`DeviceKey`] in `public_keys`?
 ///
-/// Separated from profile/disk loading so it is unit-testable without an
-/// `AstridHome` or environment. We do NOT short-circuit on the first key
-/// whose hex fails to parse — a malformed entry must not block a later valid
-/// one. The per-device scope is not consulted here: this gate establishes
-/// *which key authenticated the connection*; the scope is applied later at
-/// the capability gate once the matched device is known.
+/// Returns the matched [`DeviceKey::key_id`] on success so the caller can bind
+/// the connection to that specific device for scope attenuation at the
+/// cap-gate. Separated from profile/disk loading so it is unit-testable
+/// without an `AstridHome` or environment. We do NOT short-circuit on the
+/// first key whose hex fails to parse — a malformed entry must not block a
+/// later valid one. The per-device scope is not consulted here: this gate
+/// establishes *which key authenticated the connection*; the scope is applied
+/// later at the capability gate once the matched device is known.
 fn verify_signature_against_keys(
     principal: &PrincipalId,
     public_keys: &[DeviceKey],
     nonce_hex: &str,
     signature_hex: &str,
-) -> Result<(), String> {
+) -> Result<String, String> {
     let signature = astrid_crypto::Signature::from_hex(signature_hex)
         .map_err(|e| format!("malformed signature: {e}"))?;
 
@@ -255,7 +266,7 @@ fn verify_signature_against_keys(
             continue;
         };
         if public_key.verify(message_bytes, &signature).is_ok() {
-            return Ok(());
+            return Ok(key.key_id.clone());
         }
     }
 

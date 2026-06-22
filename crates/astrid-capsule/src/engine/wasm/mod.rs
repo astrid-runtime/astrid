@@ -8,7 +8,9 @@ use wasmtime::component::{Component, Linker};
 
 use crate::context::CapsuleContext;
 use crate::engine::ExecutionEngine;
-use crate::engine::wasm::host_state::{HostState, LifecyclePhase, PrincipalMount};
+use crate::engine::wasm::host_state::{
+    ConnectionIdentity, HostState, LifecyclePhase, PrincipalMount,
+};
 use crate::error::{CapsuleError, CapsuleResult};
 use crate::manifest::CapsuleManifest;
 
@@ -1319,9 +1321,8 @@ impl ExecutionEngine for WasmEngine {
             // principal (issue #45/#852) bound on the accepting instance is
             // visible to whichever pooled instance later serves that
             // connection — same Arc-sharing rationale as `process_tracker`.
-            let connection_principals: Arc<
-                dashmap::DashMap<u32, astrid_core::principal::PrincipalId>,
-            > = Arc::new(dashmap::DashMap::new());
+            let connection_principals: Arc<dashmap::DashMap<u32, ConnectionIdentity>> =
+                Arc::new(dashmap::DashMap::new());
             // Lifecycle-tracking registry for the kernel connection counter:
             // an accept inserts and emits `client.v1.connect`, the matching
             // drop removes and emits `client.v1.disconnect`. Shared across the
@@ -1404,8 +1405,11 @@ impl ExecutionEngine for WasmEngine {
                 process_count_by_principal: std::collections::HashMap::new(),
                 connection_principals: connection_principals.clone(),
                 client_connections: client_connections.clone(),
-                // No frame in flight at construction; set per framed read.
+                // No frame in flight at construction; both the ingress
+                // principal and its authenticating device key_id are set per
+                // framed read.
                 ingress_principal: None,
+                ingress_device_key_id: None,
                 // Run-loop epoch-interrupt state. `recv_yielded` is set true by
                 // the ipc `recv` host fn each time the guest blocks on recv;
                 // the bound run-loop's epoch callback reads + clears it to
@@ -2438,8 +2442,10 @@ pub async fn run_lifecycle(
         // Lifecycle hooks never accept inbound uplink connections; a throwaway
         // lifecycle registry satisfies the field.
         client_connections: Arc::new(dashmap::DashMap::new()),
-        // Lifecycle hooks never forward client frames; no in-flight principal.
+        // Lifecycle hooks never forward client frames; no in-flight principal
+        // or authenticating device.
         ingress_principal: None,
+        ingress_device_key_id: None,
         // Lifecycle hooks are not run loops; the epoch-interrupt run-loop
         // state is inert here but initialised for completeness.
         recv_yielded: false,

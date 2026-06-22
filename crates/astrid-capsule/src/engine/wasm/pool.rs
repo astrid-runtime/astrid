@@ -419,9 +419,11 @@ fn clear_on_return(state: &mut HostState, reset_resources: bool) {
     state.invocation_capsule_log = None;
     state.invocation_profile = None;
     state.invocation_env_overlay = None;
-    // The in-flight verified ingress principal is per-frame state; a fresh
-    // lease must not inherit a stale one (issue #45/#852).
+    // The in-flight verified ingress principal AND its authenticating device
+    // key_id are per-frame state; a fresh lease must not inherit a stale one
+    // (issue #45/#852).
     state.ingress_principal = None;
+    state.ingress_device_key_id = None;
 
     if reset_resources {
         // Drops every entry still in the old table (orphaned subscriptions,

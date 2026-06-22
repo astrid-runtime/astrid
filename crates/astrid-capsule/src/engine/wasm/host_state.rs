@@ -127,6 +127,29 @@ impl std::fmt::Debug for PrincipalMount {
     }
 }
 
+/// Verified identity bound to an accepted Unix-socket connection.
+///
+/// Pairs the handshake-verified [`PrincipalId`](astrid_core::principal::PrincipalId)
+/// with the `key_id` of the [`DeviceKey`](astrid_core::profile::DeviceKey)
+/// whose pubkey verified the challenge signature. Held as one unit in the
+/// per-connection registry so the principal and the device that authenticated
+/// it can never desync — the uplink forwards BOTH onto outbound traffic, so
+/// the cap-gate can apply the device's scope as an attenuation floor.
+///
+/// `device_key_id` is `Option` because a Path-1 (peer-cred-trusted, no
+/// keypair challenge) binding can carry a principal with no specific device.
+/// In practice the socket challenge path always yields `Some`, but the type
+/// keeps the field honest for any future principal binding that is not
+/// device-scoped.
+#[derive(Clone, Debug)]
+pub struct ConnectionIdentity {
+    /// The handshake-verified principal this connection authenticated as.
+    pub principal: astrid_core::principal::PrincipalId,
+    /// The `key_id` of the device key that verified the challenge, if the
+    /// principal authenticated via the keypair challenge.
+    pub device_key_id: Option<String>,
+}
+
 /// Shared state accessible to all host functions via `Store<HostState>`.
 pub struct HostState {
     /// WASI context for Component Model WASI imports (clocks, random, etc.).
@@ -471,11 +494,11 @@ pub struct HostState {
     /// `Arc<DashMap>` so the binding is SHARED across a capsule's pooled
     /// `HostState` instances exactly like [`process_tracker`](Self::process_tracker):
     /// the same socket-owning capsule may serve a connection from a
-    /// different pooled instance than the one that accepted it. This map only
-    /// STORES the verified identity — nothing in this change reads it; the
-    /// enforcement that consumes it (binding the connection's principal to
-    /// outbound traffic) lands separately.
-    pub connection_principals: Arc<dashmap::DashMap<u32, astrid_core::principal::PrincipalId>>,
+    /// different pooled instance than the one that accepted it. Each entry
+    /// carries the verified principal AND the `key_id` of the device that
+    /// authenticated it ([`ConnectionIdentity`]) so the cap-gate can apply the
+    /// device's scope as an attenuation floor on the principal's authority.
+    pub connection_principals: Arc<dashmap::DashMap<u32, ConnectionIdentity>>,
     /// The verified principal of the source connection whose inbound frame is
     /// currently in flight — the ENFORCEMENT side of
     /// [`connection_principals`](Self::connection_principals) (issue #45/#852).
@@ -496,6 +519,20 @@ pub struct HostState {
     /// instance of the uplink both reads the frame and forwards it, so the
     /// binding lives exactly as long as the in-flight frame.
     pub ingress_principal: Option<astrid_core::principal::PrincipalId>,
+    /// The device `key_id` of the source connection whose inbound frame is
+    /// currently in flight — the per-device companion to
+    /// [`ingress_principal`](Self::ingress_principal).
+    ///
+    /// Set and cleared in LOCKSTEP with `ingress_principal` by the framed
+    /// `tcp-stream.read` host fn (same data-frame populate / non-data clear),
+    /// from the same [`ConnectionIdentity`] entry, so the principal and the
+    /// device that authenticated it never desync onto a later forward. When
+    /// the uplink forwards a frame via `publish-as`, the host stamps THIS
+    /// `key_id` onto the outbound message's `device_key_id` so the kernel
+    /// cap-gate can resolve the device's scope and attenuate the principal's
+    /// effective capabilities. `None` for an unbound connection or a binding
+    /// that carried no specific device.
+    pub ingress_device_key_id: Option<String>,
     /// Host-verified principal each INBOUND uplink connection was accepted
     /// under, keyed by stream resource rep (`u32`). The lifecycle registry the
     /// kernel connection counter rides on: `net.unix-listener.{accept,
