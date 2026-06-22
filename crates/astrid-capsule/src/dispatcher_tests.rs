@@ -1261,4 +1261,65 @@ mod access_enforcement {
         );
         handle.abort();
     }
+
+    /// REGRESSION: result-delivery topics must NOT be gated. A tool result
+    /// `tool.v1.execute.<name>.result` is collected by an orchestration
+    /// capsule (router `handle_execute_result`) that is never in a
+    /// principal's grant set. If the surface predicate gated it (e.g. a
+    /// naive `starts_with("tool.v1.execute.")`), the result would be dropped
+    /// for every non-admin caller and the turn would hang. It must reach its
+    /// handler even for a principal granted nothing.
+    #[tokio::test]
+    async fn result_topics_are_not_gated() {
+        let (_dir, home, resolver) = resolver_fixture();
+        write_profile(&home, "bob", &agent_with_capsules(&[]));
+
+        let (invoked, bus, handle) =
+            spawn_with_capsule(resolver, "router-like", "tool.v1.execute.*.result");
+        tokio::task::yield_now().await;
+        publish_ipc_as(&bus, "tool.v1.execute.do_thing.result", "bob");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        assert!(
+            invoked.load(Ordering::SeqCst),
+            "result topic must dispatch to its orchestration handler even for an ungranted principal"
+        );
+        handle.abort();
+    }
+
+    /// REGRESSION: react's bare `tool.v1.execute.result` is a result-
+    /// collection topic (handler `handle_tool_result`), not a tool named
+    /// "result". It must not be gated.
+    #[tokio::test]
+    async fn bare_react_result_topic_is_not_gated() {
+        let (_dir, home, resolver) = resolver_fixture();
+        write_profile(&home, "bob", &agent_with_capsules(&[]));
+
+        let (invoked, bus, handle) =
+            spawn_with_capsule(resolver, "react-like", "tool.v1.execute.result");
+        tokio::task::yield_now().await;
+        publish_ipc_as(&bus, "tool.v1.execute.result", "bob");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        assert!(
+            invoked.load(Ordering::SeqCst),
+            "react's bare result topic must dispatch even for an ungranted principal"
+        );
+        handle.abort();
+    }
+
+    /// Unit cover for the surface predicate: only the bare single-segment
+    /// invocation (and the exact CLI execute topic) is gated; result and
+    /// unrelated topics are not.
+    #[test]
+    fn surface_predicate_gates_only_bare_invocation() {
+        use super::super::is_user_invocable_surface as gated;
+        assert!(gated("tool.v1.execute.save_identity"));
+        assert!(gated("cli.v1.command.execute"));
+        assert!(!gated("tool.v1.execute.save_identity.result"));
+        assert!(!gated("tool.v1.execute.result"));
+        assert!(!gated("tool.v1.execute."));
+        assert!(!gated("session.v1.append"));
+        assert!(!gated("tool.v1.response.describe.foo"));
+    }
 }

@@ -40,9 +40,10 @@ use crate::registry::CapsuleRegistry;
 use astrid_events::PrincipalKey;
 use astrid_events::{AstridEvent, EventBus, EventReceiver};
 
-/// Topic prefix for the user-invocable **tool execute** surface
-/// (`tool.v1.execute.<name>`). Matched as a prefix so every tool name is
-/// covered.
+/// Topic prefix for the user-invocable **tool execute** surface. A tool
+/// invocation is `tool.v1.execute.<name>` — a single segment after this
+/// prefix. Result-delivery sub-topics (`...<name>.result`, `...result`) are
+/// deliberately NOT gated; see [`is_user_invocable_surface`].
 const TOOL_EXECUTE_PREFIX: &str = "tool.v1.execute.";
 
 /// The user-invocable **CLI command execute** topic. Matched exactly.
@@ -62,7 +63,20 @@ const CLI_COMMAND_EXECUTE_TOPIC: &str = "cli.v1.command.execute";
 /// the capsule.
 #[must_use]
 fn is_user_invocable_surface(topic: &str) -> bool {
-    topic.starts_with(TOOL_EXECUTE_PREFIX) || topic == CLI_COMMAND_EXECUTE_TOPIC
+    if topic == CLI_COMMAND_EXECUTE_TOPIC {
+        return true;
+    }
+    // A tool INVOCATION is exactly `tool.v1.execute.<name>` — a single
+    // segment after the prefix. Result-delivery topics must NOT be gated:
+    // `tool.v1.execute.<name>.result` (router `handle_execute_result`) and
+    // react's bare `tool.v1.execute.result` (`handle_tool_result`) are
+    // handled by orchestration capsules that are never in a principal's
+    // grant set, so gating them would drop every tool result and hang the
+    // turn. Match only a single, non-`result` segment after the prefix.
+    match topic.strip_prefix(TOOL_EXECUTE_PREFIX) {
+        Some(name) => !name.is_empty() && !name.contains('.') && name != "result",
+        None => false,
+    }
 }
 
 /// Capacity of each per-(capsule, principal) event dispatch queue.
