@@ -39,6 +39,23 @@ pub struct IpcMessage {
     /// kernel boundary. `None` for system events (boot, lifecycle).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub principal: Option<String>,
+
+    /// The device key that authenticated this message, if any.
+    ///
+    /// Identifies which registered `DeviceKey` on the acting principal's
+    /// `AuthConfig` this message was authenticated with, so the cap-gate can
+    /// apply that device's scope as an attenuation floor on the principal's
+    /// effective capabilities. `None` means an unattenuated (full-principal)
+    /// message — the legacy behaviour for every existing connection.
+    ///
+    /// This is **host-derived** internal bus metadata, NOT a client-settable
+    /// hint: it is stamped from the per-connection registry on the socket
+    /// path (or the gateway-signed bearer on the HTTP path), never read off a
+    /// client-controlled field. Like `principal`, it is a `String` because
+    /// `astrid-types` must not depend on `astrid-core`; resolution to a live
+    /// `DeviceKey` happens at the kernel boundary.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device_key_id: Option<String>,
 }
 
 /// `DateTime<Utc>` at the Unix epoch — used as the serde default for
@@ -69,6 +86,7 @@ impl IpcMessage {
             timestamp: Utc::now(),
             seq: 0,
             principal: None,
+            device_key_id: None,
         }
     }
 
@@ -83,6 +101,18 @@ impl IpcMessage {
     #[must_use]
     pub fn with_principal(mut self, principal: impl Into<String>) -> Self {
         self.principal = Some(principal.into());
+        self
+    }
+
+    /// Set the authenticating device key id for this message.
+    ///
+    /// Host-derived metadata used by the cap-gate to apply per-device scope
+    /// attenuation. Callers on the host paths stamp this from the
+    /// per-connection registry / signed bearer; it is never sourced from a
+    /// client-controlled field.
+    #[must_use]
+    pub fn with_device_key_id(mut self, id: impl Into<String>) -> Self {
+        self.device_key_id = Some(id.into());
         self
     }
 }
@@ -414,6 +444,58 @@ mod tests {
         let msg = IpcMessage::new("test.topic", IpcPayload::Connect, Uuid::nil());
         let json = serde_json::to_string(&msg).unwrap();
         assert!(!json.contains("principal"));
+    }
+
+    #[test]
+    fn ipc_message_device_key_id_builder() {
+        let msg = IpcMessage::new(
+            "test.topic",
+            IpcPayload::Custom {
+                data: serde_json::json!({}),
+            },
+            Uuid::new_v4(),
+        );
+        assert!(msg.device_key_id.is_none());
+
+        let with_key = msg.with_device_key_id("abcdef0123456789");
+        assert_eq!(with_key.device_key_id.as_deref(), Some("abcdef0123456789"));
+    }
+
+    #[test]
+    fn ipc_message_device_key_id_serde_roundtrip() {
+        let msg = IpcMessage::new(
+            "test.topic",
+            IpcPayload::Custom {
+                data: serde_json::json!({}),
+            },
+            Uuid::nil(),
+        )
+        .with_device_key_id("abcdef0123456789");
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(json.contains(r#""device_key_id":"abcdef0123456789""#));
+
+        let parsed: IpcMessage = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.device_key_id.as_deref(), Some("abcdef0123456789"));
+    }
+
+    #[test]
+    fn ipc_message_device_key_id_absent_in_json() {
+        // A message constructed without a device key must not serialize the
+        // key at all (legacy wire compatibility), and must round-trip to None.
+        let msg = IpcMessage::new("test.topic", IpcPayload::Connect, Uuid::nil());
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(!json.contains("device_key_id"));
+
+        let parsed: IpcMessage = serde_json::from_str(&json).unwrap();
+        assert!(parsed.device_key_id.is_none());
+    }
+
+    #[test]
+    fn ipc_message_device_key_id_defaults_when_missing() {
+        // A frame from a peer that predates the field deserializes with None.
+        let json = r#"{"topic":"t","payload":{"type":"connect"},"source_id":"00000000-0000-0000-0000-000000000000","timestamp":"2024-01-01T00:00:00Z","seq":0}"#;
+        let msg: IpcMessage = serde_json::from_str(json).unwrap();
+        assert!(msg.device_key_id.is_none());
     }
 
     #[test]
