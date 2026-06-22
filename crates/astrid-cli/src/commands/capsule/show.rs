@@ -123,7 +123,10 @@ pub(crate) fn run(args: &ShowArgs) -> Result<ExitCode> {
             .and_then(|v| v.as_str())
             .unwrap_or_default()
             .to_string(),
-        tools_captured: meta.get("tools").is_some(),
+        // A present-but-null `tools` is `None` (not captured) — match the typed
+        // `Option<Vec>` deserialization, which maps JSON null to None. Only a
+        // present, non-null `tools` (an array) counts as captured.
+        tools_captured: meta.get("tools").is_some_and(|v| !v.is_null()),
         tools: extract_tool_summaries(&meta),
         manifest: manifest.clone(),
     };
