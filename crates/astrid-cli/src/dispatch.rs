@@ -217,7 +217,72 @@ async fn dispatch_subcommand(
             commands::self_update::run_self_update(args).await?;
             Ok(ExitCode::SUCCESS)
         },
+        Some(Commands::External(tokens)) => dispatch_root_shorthand(tokens).await,
     }
+}
+
+/// Route the root capsule-verb shorthand (`astrid <verb> [args…]`).
+///
+/// Built-in verbs never reach here — clap matches a declared `Commands`
+/// variant before the `external_subcommand` catch-all. An unrecognised
+/// token that is a near-miss of a built-in is rejected with a "did you
+/// mean …?" hint and exits `2` **without booting the daemon**, mirroring
+/// the clap parse error this catch-all replaced. Only a non-near-miss
+/// token is forwarded to daemon-backed capsule-verb resolution, which
+/// binds the active principal exactly as `astrid capsule <verb>` does.
+async fn dispatch_root_shorthand(tokens: Vec<String>) -> Result<ExitCode> {
+    let verb = tokens.first().map_or("", String::as_str);
+    let builtins = builtin_subcommand_names();
+    if let Some(suggestion) = commands::verb_suggest::nearest_builtin(verb, &builtins) {
+        eprintln!(
+            "{}",
+            theme::Theme::error(&format!(
+                "unrecognized subcommand '{verb}'\n\n\tDid you mean '{suggestion}'?"
+            ))
+        );
+        // Exit WITHOUT booting the daemon — mirrors clap's pre-catch-all
+        // error for a mistyped built-in. Exit 2 matches clap's
+        // `InvalidSubcommand` usage-error convention so scripts see the
+        // same status they did before this shorthand existed.
+        return Ok(ExitCode::from(2));
+    }
+    // Not a near-miss → genuine capsule-verb shorthand. Reuse the exact
+    // same daemon-backed, principal-scoped resolution path as
+    // `astrid capsule <verb>`.
+    commands::capsule_verb::run_external(tokens).await
+}
+
+/// Built-in root subcommand names harvested from the clap command tree, for
+/// the typo guard to measure unrecognised tokens against. Built fresh on
+/// each call; a CLI process dispatches a single command and exits, so the
+/// only caller ([`dispatch_root_shorthand`]) invokes this at most once per
+/// process — no caching is warranted.
+///
+/// Each subcommand contributes its primary name **and every invocable
+/// alias** (e.g. `self-update` aliases `update`). Aliases are real tokens a
+/// user can type and therefore mistype; harvesting only primary names would
+/// leave the guard blind to alias typos (`self-updte`), routing them to the
+/// daemon instead of suggesting the alias. The collected set is de-duplicated
+/// — clap permits a name to surface more than once across the tree, and the
+/// guard must not weigh any candidate twice.
+///
+/// The `external_subcommand` catch-all is reported by clap with an empty
+/// placeholder name; filter empties so the guard can never "suggest" the
+/// catch-all itself.
+fn builtin_subcommand_names() -> Vec<String> {
+    use clap::CommandFactory;
+    use std::collections::BTreeSet;
+    Cli::command()
+        .get_subcommands()
+        .flat_map(|s| {
+            std::iter::once(s.get_name().to_string())
+                .chain(s.get_all_aliases().map(std::string::ToString::to_string))
+        })
+        .filter(|n| !n.is_empty())
+        // De-dup via a sorted set: deterministic order, no repeated candidate.
+        .collect::<BTreeSet<String>>()
+        .into_iter()
+        .collect()
 }
 
 async fn dispatch_capsule(command: crate::cli::CapsuleCommands) -> Result<ExitCode> {
@@ -411,5 +476,59 @@ fn dispatch_session(command: SessionCommands) -> Result<ExitCode> {
             commands::sessions::session_info(&id)?;
             Ok(ExitCode::SUCCESS)
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The production harvest must include invocable **aliases**, not just
+    /// primary subcommand names. `self-update` is an alias of `update`; if
+    /// the harvest dropped aliases, the typo guard would be blind to alias
+    /// typos and route them to the daemon instead of suggesting the alias.
+    #[test]
+    fn builtin_names_include_invocable_aliases() {
+        let names = builtin_subcommand_names();
+        assert!(
+            names.iter().any(|n| n == "self-update"),
+            "production builtin harvest must include the `self-update` alias \
+             (aliased on `update`); got {names:?}"
+        );
+        // The primary it aliases must of course also be present.
+        assert!(
+            names.iter().any(|n| n == "update"),
+            "production builtin harvest must include the `update` primary; got {names:?}"
+        );
+    }
+
+    /// The catch-all placeholder name is empty; it must never enter the
+    /// harvested set (otherwise the guard could "suggest" the catch-all
+    /// itself).
+    #[test]
+    fn builtin_names_drop_empty_catch_all_placeholder() {
+        let names = builtin_subcommand_names();
+        assert!(
+            names.iter().all(|n| !n.is_empty()),
+            "harvested builtin names must never contain the empty catch-all placeholder"
+        );
+    }
+
+    /// End-to-end regression: a near-miss of an **alias** (`self-updte` for
+    /// `self-update`) must be caught by `nearest_builtin` against the real
+    /// production harvest — proving the guard suggests the alias without ever
+    /// contacting the daemon. This fails if the harvest omits aliases, since
+    /// the nearest primary (`update`) is edit-distance 4 from `self-updte`
+    /// and clears no threshold.
+    #[test]
+    fn alias_near_miss_is_caught_against_production_builtins() {
+        let builtins = builtin_subcommand_names();
+        let refs: Vec<&str> = builtins.iter().map(String::as_str).collect();
+        assert_eq!(
+            commands::verb_suggest::nearest_builtin("self-updte", &refs),
+            Some("self-update"),
+            "a one-character slip off the `self-update` alias must suggest it; \
+             this fails if the production harvest drops aliases"
+        );
     }
 }

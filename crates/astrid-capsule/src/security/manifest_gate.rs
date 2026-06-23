@@ -317,7 +317,12 @@ impl CapsuleSecurityGate for ManifestSecurityGate {
 /// per RFC 1035). The pattern host segment is taken literally — DNS-style
 /// wildcards (`*.example.com`) are intentionally NOT supported in this version
 /// (see RFC: rfcs#27 Unresolved questions).
-fn net_connect_pattern_matches(pattern: &str, host: &str, port: u16) -> bool {
+///
+/// Shared with the HTTP host's local-egress allowlist
+/// (`engine::wasm::host::http`) so manifest `net_connect` and the operator
+/// `[security.capsule_local_egress]` allowlist use identical `host:port`
+/// matching semantics.
+pub(crate) fn net_connect_pattern_matches(pattern: &str, host: &str, port: u16) -> bool {
     let Some((pat_host, pat_port)) = pattern.rsplit_once(':') else {
         return false;
     };

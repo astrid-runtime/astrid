@@ -206,6 +206,22 @@ pub struct SecurityConfig {
     /// How long (in seconds) to wait for a human to respond to an approval
     /// request before timing out.
     pub approval_timeout_secs: u64,
+    /// Operator-approved per-capsule local-egress allowlist.
+    ///
+    /// Maps a capsule id (the `Capsule.toml` `package.name`) to a list of
+    /// `host:port` / `host:*` endpoints that are exempt from the host
+    /// `astrid:http` SSRF airlock **for that capsule only** — the sanctioned
+    /// way to let a specific capsule reach a loopback/private LLM endpoint
+    /// (e.g. LM Studio on `127.0.0.1:1234`, Ollama on a LAN address). `host`
+    /// may be an IP literal or a hostname; `port` is a decimal `u16` or `*`.
+    ///
+    /// Default empty = no exemptions (fail-closed). This is **operator
+    /// config**: a capsule's own (untrusted) `Capsule.toml` cannot set it, and
+    /// a project/workspace config layer cannot widen it (enforced in
+    /// `merge::restrict`). It only *exempts* endpoints from the airlock; it
+    /// never grants network access a capsule's manifest `net` allowlist
+    /// doesn't already declare.
+    pub capsule_local_egress: HashMap<String, Vec<String>>,
 }
 
 impl Default for SecurityConfig {
@@ -213,6 +229,7 @@ impl Default for SecurityConfig {
         Self {
             require_signatures: false,
             approval_timeout_secs: 300,
+            capsule_local_egress: HashMap::new(),
         }
     }
 }

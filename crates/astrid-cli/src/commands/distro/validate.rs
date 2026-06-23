@@ -6,7 +6,35 @@
 
 use std::collections::HashSet;
 
+use semver::{Version, VersionReq};
+
 use super::manifest::{DistroManifest, SCHEMA_VERSION};
+
+/// The running CLI version, taken from the astrid-cli binary crate
+/// (`CARGO_PKG_VERSION`) — the same source `astrid version` prints.
+pub(crate) const RUNNING_ASTRID_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// The running CLI is older than a distro's `[distro].astrid-version` floor.
+///
+/// Carried as a *typed* (downcastable) error rather than a bare string so callers
+/// can distinguish "your CLI is too old, upgrade" from every other validation
+/// failure without fragile message matching. The `Display` text is the
+/// actionable upgrade message surfaced to users on the `astrid init` /
+/// `astrid distro apply` paths; the post-update sync path
+/// (`self_update::sync_distro_and_capsules`) downcasts to this type and
+/// substitutes a benign "it takes effect on next run" message instead, because
+/// there the new binary is already on disk — only the in-flight process is stale.
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "This distro requires astrid {req}, but you are running {running}. \
+     Run `astrid update` to upgrade."
+)]
+pub(crate) struct AstridVersionTooOld {
+    /// The distro's `[distro].astrid-version` requirement string (e.g. `>=0.6.0`).
+    pub req: String,
+    /// The running CLI version that failed to satisfy `req`.
+    pub running: String,
+}
 
 /// Check if a string is a valid identifier: `^[a-z][a-z0-9-]*$`.
 fn is_valid_id(s: &str) -> bool {
@@ -194,6 +222,89 @@ pub(crate) fn validate_manifest(manifest: &DistroManifest) -> anyhow::Result<()>
     }
 
     Ok(())
+}
+
+/// Enforce a manifest's `[distro].astrid-version` floor against the running CLI.
+///
+/// Called on the init / `distro apply` path *after* the manifest is fetched and
+/// parsed but *before* any prompting or install, so a distro whose `Distro.toml`
+/// (fetched from the repo `main` tip) bumps its CLI floor fails fast with an
+/// actionable message instead of breaking onboarding mid-flight on an older CLI.
+///
+/// A manifest with no `astrid-version` floor imposes no requirement.
+pub(crate) fn enforce_astrid_version(manifest: &DistroManifest) -> anyhow::Result<()> {
+    let Some(req) = manifest.distro.astrid_version.as_deref() else {
+        return Ok(());
+    };
+    let running = Version::parse(RUNNING_ASTRID_VERSION).map_err(|e| {
+        // The binary's own version should always be valid semver; if it isn't,
+        // that's a build-time defect, not a distro problem.
+        anyhow::anyhow!(
+            "running astrid version {RUNNING_ASTRID_VERSION:?} is not valid semver: {e}"
+        )
+    })?;
+    distro_astrid_version_satisfied(req, &running)
+}
+
+/// Decide whether the running CLI `running` satisfies a distro's
+/// `[distro].astrid-version` requirement `req`.
+///
+/// Pure (no fetch, no env) so it is unit-testable in isolation.
+///
+/// **Prerelease policy.** By default `semver::VersionReq::matches` refuses a
+/// prerelease running version (e.g. `0.6.0-dev.3` does *not* satisfy `>=0.6.0`),
+/// which would falsely reject a locally-built / dev CLI that is, by release
+/// triple, at or above the floor. That is the classic semver footgun. When the
+/// requirement is a plain release floor we compare on the **release triple
+/// only** — the running version's `(major, minor, patch)` with the prerelease
+/// and build metadata stripped — so a dev build of a sufficiently-new astrid is
+/// accepted, while still rejecting a CLI whose release triple genuinely falls
+/// below the floor. A clean (non-prerelease) running version compares unchanged.
+///
+/// **When the requirement itself names a prerelease** (e.g. `>=0.6.0-rc.3`) the
+/// operator is deliberately gating on a specific prerelease, so triple-stripping
+/// the running version would *over-accept*: `0.6.0-rc.2` would be lifted to
+/// `0.6.0` and wrongly satisfy `>=0.6.0-rc.3`. In that case we drop the
+/// dev-build convenience and compare the running version **as-is** under exact
+/// semver semantics, so prerelease ordering (`rc.2 < rc.3`) is honoured.
+pub(crate) fn distro_astrid_version_satisfied(req: &str, running: &Version) -> anyhow::Result<()> {
+    let version_req = VersionReq::parse(req).map_err(|e| {
+        anyhow::anyhow!("distro.astrid-version {req:?} is not a valid requirement: {e}")
+    })?;
+
+    // If any comparator in the requirement carries a prerelease, the operator
+    // is gating on an exact prerelease — honour real semver semantics (no
+    // triple-strip) so a lower prerelease of the same triple is not lifted past
+    // the floor. Otherwise apply the dev-build footgun fix below.
+    let req_names_prerelease = version_req.comparators.iter().any(|c| !c.pre.is_empty());
+    if req_names_prerelease {
+        if version_req.matches(running) {
+            return Ok(());
+        }
+        return Err(AstridVersionTooOld {
+            req: req.to_string(),
+            running: running.to_string(),
+        }
+        .into());
+    }
+
+    // Plain release floor: strip prerelease / build metadata and compare on the
+    // release triple so a dev / prerelease CLI at or above the floor is not
+    // falsely rejected.
+    let release_triple = Version::new(running.major, running.minor, running.patch);
+
+    if version_req.matches(&release_triple) {
+        return Ok(());
+    }
+
+    // Typed (downcastable) so the post-update sync path can recognise this exact
+    // condition and swap in a benign message; init / distro apply propagate it to
+    // the top-level handler, where its `Display` is the actionable upgrade text.
+    Err(AstridVersionTooOld {
+        req: req.to_string(),
+        running: running.to_string(),
+    }
+    .into())
 }
 
 /// Parse the operator-friendly duration form (`24h`, `7d`, `30m`, `30s`)
@@ -422,6 +533,156 @@ tag = "v0.2.0-rc1"
 "#;
         let manifest: DistroManifest = toml::from_str(toml_src).unwrap();
         validate_manifest(&manifest).expect("version/tag release selectors are allowed");
+    }
+
+    #[test]
+    fn astrid_version_rejects_running_below_floor() {
+        // Running CLI is older than the distro's floor — must reject with the
+        // actionable upgrade message.
+        let running = Version::parse("0.5.0").unwrap();
+        let err = distro_astrid_version_satisfied(">=0.6.0", &running)
+            .expect_err("0.5.0 must not satisfy >=0.6.0");
+
+        // It must be the TYPED error, downcastable with the right req/running so
+        // the post-update sync path can recognise it without string matching.
+        let typed = err
+            .downcast_ref::<AstridVersionTooOld>()
+            .expect("below-floor rejection must be a typed AstridVersionTooOld error");
+        assert_eq!(typed.req, ">=0.6.0");
+        assert_eq!(typed.running, "0.5.0");
+
+        // And its Display must remain the actionable upgrade message so the
+        // init / distro-apply UX is unchanged for users.
+        let msg = err.to_string();
+        assert!(
+            msg.contains("This distro requires astrid >=0.6.0")
+                && msg.contains("you are running 0.5.0")
+                && msg.contains("astrid update"),
+            "expected actionable upgrade message, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn astrid_version_accepts_running_at_or_above_floor() {
+        // Exactly at the floor.
+        let at = Version::parse("0.6.0").unwrap();
+        distro_astrid_version_satisfied(">=0.6.0", &at).expect("0.6.0 satisfies >=0.6.0");
+
+        // Above the floor (same minor and a newer minor).
+        let above_patch = Version::parse("0.6.3").unwrap();
+        distro_astrid_version_satisfied(">=0.6.0", &above_patch).expect("0.6.3 satisfies >=0.6.0");
+        let above_minor = Version::parse("0.7.0").unwrap();
+        distro_astrid_version_satisfied(">=0.6.0", &above_minor).expect("0.7.0 satisfies >=0.6.0");
+    }
+
+    #[test]
+    fn astrid_version_accepts_prerelease_at_or_above_floor() {
+        // The footgun: a locally-built / dev CLI whose release triple is at or
+        // above the floor must be ACCEPTED, even though raw `VersionReq::matches`
+        // refuses a prerelease against `>=0.6.0`. We compare on the release triple.
+        let dev_at_floor = Version::parse("0.6.0-dev.3").unwrap();
+        // Sanity: prove the naive comparison would have falsely rejected it.
+        assert!(
+            !VersionReq::parse(">=0.6.0").unwrap().matches(&dev_at_floor),
+            "guard: naive matches must reject the prerelease, else the test proves nothing"
+        );
+        distro_astrid_version_satisfied(">=0.6.0", &dev_at_floor)
+            .expect("0.6.0-dev.3 (release triple 0.6.0) satisfies >=0.6.0");
+
+        // A dev build of a newer release is likewise accepted.
+        let dev_above = Version::parse("0.7.0-rc.1").unwrap();
+        distro_astrid_version_satisfied(">=0.6.0", &dev_above)
+            .expect("0.7.0-rc.1 (release triple 0.7.0) satisfies >=0.6.0");
+    }
+
+    #[test]
+    fn astrid_version_rejects_prerelease_below_floor() {
+        // The triple-strip must not over-accept: a prerelease whose release
+        // triple is genuinely below the floor still fails.
+        let dev_below = Version::parse("0.5.0-dev.9").unwrap();
+        distro_astrid_version_satisfied(">=0.6.0", &dev_below)
+            .expect_err("0.5.0-dev.9 (release triple 0.5.0) must not satisfy >=0.6.0");
+    }
+
+    #[test]
+    fn prerelease_requirement_compares_running_exactly_no_triple_strip() {
+        // FIX E: when the REQUIREMENT itself names a prerelease, the running
+        // version's prerelease must NOT be stripped to its release triple —
+        // otherwise a lower prerelease of the same triple is wrongly lifted
+        // past the floor.
+
+        // The bug: `0.6.0-rc.2` is BELOW `>=0.6.0-rc.3`. Triple-stripping it to
+        // `0.6.0` would have wrongly satisfied the floor. It must be rejected.
+        let rc2 = Version::parse("0.6.0-rc.2").unwrap();
+        let err = distro_astrid_version_satisfied(">=0.6.0-rc.3", &rc2)
+            .expect_err("0.6.0-rc.2 must NOT satisfy >=0.6.0-rc.3");
+        let typed = err
+            .downcast_ref::<AstridVersionTooOld>()
+            .expect("below-floor prerelease rejection must be a typed error");
+        assert_eq!(typed.req, ">=0.6.0-rc.3");
+        assert_eq!(typed.running, "0.6.0-rc.2");
+
+        // Exactly at the prerelease floor is accepted.
+        let rc3 = Version::parse("0.6.0-rc.3").unwrap();
+        distro_astrid_version_satisfied(">=0.6.0-rc.3", &rc3)
+            .expect("0.6.0-rc.3 satisfies >=0.6.0-rc.3");
+
+        // A later prerelease of the same triple is accepted (rc.4 > rc.3).
+        let rc4 = Version::parse("0.6.0-rc.4").unwrap();
+        distro_astrid_version_satisfied(">=0.6.0-rc.3", &rc4)
+            .expect("0.6.0-rc.4 satisfies >=0.6.0-rc.3");
+
+        // The final release of the same triple is accepted (0.6.0 > any
+        // 0.6.0-pre under semver ordering).
+        let release = Version::parse("0.6.0").unwrap();
+        distro_astrid_version_satisfied(">=0.6.0-rc.3", &release)
+            .expect("0.6.0 satisfies >=0.6.0-rc.3");
+
+        // A newer release is also accepted.
+        let newer = Version::parse("0.7.0").unwrap();
+        distro_astrid_version_satisfied(">=0.6.0-rc.3", &newer)
+            .expect("0.7.0 satisfies >=0.6.0-rc.3");
+    }
+
+    #[test]
+    fn astrid_version_malformed_requirement_is_an_error() {
+        // A malformed requirement is still rejected (distinct from "no floor").
+        let running = Version::parse("0.6.0").unwrap();
+        let err = distro_astrid_version_satisfied("not-a-version", &running)
+            .expect_err("a malformed astrid-version requirement must error");
+        assert!(
+            err.to_string().contains("is not a valid requirement"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn enforce_astrid_version_no_floor_is_ok() {
+        // A manifest with no astrid-version imposes no requirement.
+        let toml_src = r##"
+schema-version = 1
+
+[distro]
+id = "no-floor"
+name = "No Floor"
+version = "0.1.0"
+
+[[capsule]]
+name = "astrid-capsule-cli"
+source = "@unicity-astrid/capsule-cli"
+version = "0.7.0"
+role = "uplink"
+"##;
+        let manifest: DistroManifest = toml::from_str(toml_src).unwrap();
+        assert!(manifest.distro.astrid_version.is_none());
+        enforce_astrid_version(&manifest).expect("no floor → no requirement");
+    }
+
+    #[test]
+    fn running_astrid_version_is_valid_semver() {
+        // The enforcement reads RUNNING_ASTRID_VERSION as semver; guard against a
+        // build whose CARGO_PKG_VERSION cannot parse (would break every init).
+        Version::parse(RUNNING_ASTRID_VERSION).expect("the CLI's own version must be valid semver");
     }
 
     #[test]
