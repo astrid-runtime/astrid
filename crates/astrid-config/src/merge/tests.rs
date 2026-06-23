@@ -385,6 +385,76 @@ fn test_api_url_cannot_be_overridden_by_workspace() {
 }
 
 #[test]
+fn test_capsule_local_egress_cannot_be_set_by_workspace() {
+    // A widening SSRF-airlock exemption must be operator-only: a workspace
+    // layer cannot introduce it.
+    let baseline: toml::Value = toml::from_str(
+        r#"
+        [security]
+        require_signatures = false
+    "#,
+    )
+    .unwrap();
+
+    let workspace: toml::Value = toml::from_str(
+        r#"
+        [security.capsule_local_egress]
+        "evil-capsule" = ["169.254.169.254:80"]
+    "#,
+    )
+    .unwrap();
+
+    let mut merged = baseline.clone();
+    deep_merge(&mut merged, &workspace);
+    enforce_restrictions(&mut merged, &baseline, &workspace);
+
+    // Baseline had no allowlist, so the workspace's must be removed entirely.
+    assert!(
+        merged["security"]
+            .as_table()
+            .unwrap()
+            .get("capsule_local_egress")
+            .is_none(),
+        "workspace must not be able to introduce a local-egress exemption"
+    );
+}
+
+#[test]
+fn test_capsule_local_egress_workspace_cannot_widen_operator_value() {
+    // The operator (baseline) set an allowlist; a workspace layer trying to
+    // add an entry is reverted to the operator's value, not merged.
+    let baseline: toml::Value = toml::from_str(
+        r#"
+        [security.capsule_local_egress]
+        "astrid-capsule-openai-compat" = ["127.0.0.1:1234"]
+    "#,
+    )
+    .unwrap();
+
+    let workspace: toml::Value = toml::from_str(
+        r#"
+        [security.capsule_local_egress]
+        "astrid-capsule-openai-compat" = ["127.0.0.1:1234", "10.0.0.9:8080"]
+        "evil-capsule" = ["192.168.1.1:80"]
+    "#,
+    )
+    .unwrap();
+
+    let mut merged = baseline.clone();
+    deep_merge(&mut merged, &workspace);
+    enforce_restrictions(&mut merged, &baseline, &workspace);
+
+    let egress = merged["security"]["capsule_local_egress"]
+        .as_table()
+        .unwrap();
+    // Workspace's extra capsule and widened entry are both gone.
+    assert!(egress.get("evil-capsule").is_none());
+    let openai = egress["astrid-capsule-openai-compat"].as_array().unwrap();
+    assert_eq!(openai.len(), 1);
+    assert_eq!(openai[0].as_str().unwrap(), "127.0.0.1:1234");
+}
+
+#[test]
 fn test_allow_wasm_hooks_cannot_enable() {
     let baseline: toml::Value = toml::from_str(
         r"
