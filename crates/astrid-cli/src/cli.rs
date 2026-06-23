@@ -549,7 +549,18 @@ mod tests {
             .expect("unknown root token must fall through to the external catch-all");
         match cli.command {
             Some(Commands::External(v)) => {
-                assert_eq!(v, vec!["frobnicate", "--flag", "x"]);
+                // Compare owned `String`s explicitly. `Vec<String>:
+                // PartialEq<Vec<&str>>` already makes the `&str` form compile
+                // and pass, but spelling out the owned type keeps the element
+                // type unambiguous for reviewers (and review bots).
+                assert_eq!(
+                    v,
+                    vec![
+                        "frobnicate".to_string(),
+                        "--flag".to_string(),
+                        "x".to_string()
+                    ]
+                );
             },
             _ => panic!("expected Commands::External for an unknown root token"),
         }

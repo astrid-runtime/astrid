@@ -50,9 +50,14 @@ pub(crate) fn nearest_builtin<'a>(token: &str, builtin_names: &[&'a str]) -> Opt
     let length_scaled = token_chars.len().checked_div(3).unwrap_or(0);
     let threshold = std::cmp::max(2, length_scaled);
 
+    // Reused across every built-in so the per-name char collection allocates
+    // once and is refilled in place, not freed and re-grown each iteration.
+    let mut name_chars: Vec<char> = Vec::new();
     let mut best: Option<(usize, &'a str)> = None;
     for &name in builtin_names {
-        let dist = levenshtein_chars(&token_chars, &name.chars().collect::<Vec<char>>());
+        name_chars.clear();
+        name_chars.extend(name.chars());
+        let dist = levenshtein_chars(&token_chars, &name_chars);
         // Distance 0 is an exact match. Clap would have consumed it before
         // the catch-all, so it cannot legitimately reach here; refuse to
         // "suggest" the name the user typed verbatim.
