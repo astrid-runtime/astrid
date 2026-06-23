@@ -539,7 +539,7 @@ fn modify_response(
 /// changed, so an order-only churn (e.g. removing then re-adding a present
 /// entry) is never reflected back to the caller as a mutated profile that
 /// then goes unpersisted (`changed=false`).
-fn apply_set_delta(target: &mut Vec<String>, add: &[String], remove: &[String]) -> bool {
+pub(crate) fn apply_set_delta(target: &mut Vec<String>, add: &[String], remove: &[String]) -> bool {
     // Build the resulting order on a scratch copy WITHOUT touching `target`:
     // surviving entries keep their order, then new additions append.
     let mut next: Vec<String> = target
@@ -751,7 +751,7 @@ async fn mutate_caps(
 
 // ── Helpers ────────────────────────────────────────────────────────────
 
-pub(super) fn principal_profile_path(
+pub(crate) fn principal_profile_path(
     kernel: &Arc<crate::Kernel>,
     principal: &PrincipalId,
 ) -> PathBuf {
@@ -763,7 +763,7 @@ pub(super) fn principal_profile_path(
 /// [`PrincipalProfile::load_from_path`] returns `Default` on `NotFound`,
 /// which would let a typo'd name silently materialize a phantom
 /// principal with grants on disk.
-pub(super) fn require_principal_exists(principal: &PrincipalId, path: &Path) -> Result<(), String> {
+pub(crate) fn require_principal_exists(principal: &PrincipalId, path: &Path) -> Result<(), String> {
     if path.exists() {
         Ok(())
     } else {

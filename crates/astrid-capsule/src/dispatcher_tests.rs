@@ -403,8 +403,9 @@ async fn find_matching_interceptors_sorts_by_priority() {
     registry.register(Box::new(low)).unwrap();
     registry.register(Box::new(mid)).unwrap();
     let registry = Arc::new(RwLock::new(registry));
+    let bus = EventBus::with_capacity(64);
 
-    let matches = find_matching_interceptors(&registry, "test.event", None, None).await;
+    let matches = find_matching_interceptors(&registry, "test.event", None, None, &bus).await;
     let names: Vec<&str> = matches.iter().map(|(c, _, _)| c.id().as_str()).collect();
     assert_eq!(
         names,
@@ -431,8 +432,9 @@ async fn find_matching_interceptors_tiebreaks_equal_priority_by_id() {
     registry.register(Box::new(guard)).unwrap();
     registry.register(Box::new(a_tie)).unwrap();
     let registry = Arc::new(RwLock::new(registry));
+    let bus = EventBus::with_capacity(64);
 
-    let matches = find_matching_interceptors(&registry, "test.event", None, None).await;
+    let matches = find_matching_interceptors(&registry, "test.event", None, None, &bus).await;
     let names: Vec<&str> = matches.iter().map(|(c, _, _)| c.id().as_str()).collect();
     assert_eq!(
         names,
@@ -1107,6 +1109,98 @@ mod access_enforcement {
         assert!(
             !invoked.load(Ordering::SeqCst),
             "`anonymous` caller must see no tool capsules (fail-closed)"
+        );
+        handle.abort();
+    }
+
+    /// Await the next `GrantRequired` on `astrid.v1.approval`, with a bounded
+    /// timeout so a failing test does not hang. Returns the decoded tuple.
+    async fn recv_grant_required(
+        receiver: &mut astrid_events::EventReceiver,
+    ) -> Option<(String, String, String)> {
+        let deadline = std::time::Instant::now() + Duration::from_millis(500);
+        while std::time::Instant::now() < deadline {
+            let next = tokio::time::timeout(Duration::from_millis(200), receiver.recv()).await;
+            let Ok(Some(event)) = next else { continue };
+            if let AstridEvent::Ipc { message, .. } = &*event
+                && let IpcPayload::GrantRequired {
+                    request_id,
+                    principal,
+                    capsule_id,
+                } = &message.payload
+            {
+                return Some((request_id.clone(), principal.clone(), capsule_id.clone()));
+            }
+        }
+        None
+    }
+
+    /// Grant-on-first-use (#998): an ungranted, authenticated, non-admin
+    /// caller hitting a tool-surface gate-miss publishes a `GrantRequired`
+    /// on `astrid.v1.approval` carrying the kernel-stamped principal + the
+    /// missing capsule id and a non-empty UUID request id — instead of the
+    /// old pure silent drop.
+    #[tokio::test]
+    async fn gate_miss_emits_grant_required() {
+        let (_dir, home, resolver) = resolver_fixture();
+        write_profile(&home, "bob", &agent_with_capsules(&[]));
+
+        let (_invoked, bus, handle) =
+            spawn_with_capsule(resolver, "secret-tool", "tool.v1.execute.do_thing");
+        let mut approval = bus.subscribe_topic("astrid.v1.approval");
+        tokio::task::yield_now().await;
+        publish_ipc_as(&bus, "tool.v1.execute.do_thing", "bob");
+
+        let signal = recv_grant_required(&mut approval).await;
+        let (request_id, principal, capsule_id) =
+            signal.expect("gate-miss must publish a GrantRequired signal");
+        assert_eq!(principal, "bob", "grant target principal is the caller");
+        assert_eq!(
+            capsule_id, "secret-tool",
+            "grant target is the missing capsule"
+        );
+        assert!(
+            uuid::Uuid::parse_str(&request_id).is_ok() && !request_id.is_empty(),
+            "request_id must be a non-empty UUID, got {request_id:?}"
+        );
+        handle.abort();
+    }
+
+    /// A `None`/`anonymous` caller has no authenticated principal to grant to,
+    /// so the gate-miss is a pure silent drop — NO `GrantRequired` is emitted.
+    #[tokio::test]
+    async fn anonymous_gate_miss_emits_no_grant_required() {
+        let (_dir, _home, resolver) = resolver_fixture();
+
+        let (_invoked, bus, handle) =
+            spawn_with_capsule(resolver, "secret-tool", "tool.v1.execute.do_thing");
+        let mut approval = bus.subscribe_topic("astrid.v1.approval");
+        tokio::task::yield_now().await;
+        publish_ipc_as(&bus, "tool.v1.execute.do_thing", "anonymous");
+
+        assert!(
+            recv_grant_required(&mut approval).await.is_none(),
+            "`anonymous` caller must NOT trigger a GrantRequired (no principal to grant)"
+        );
+        handle.abort();
+    }
+
+    /// An admin (`*`) caller passes `is_capsule_allowed` so never reaches the
+    /// gate-miss branch — no `GrantRequired` is emitted for them.
+    #[tokio::test]
+    async fn admin_gate_miss_emits_no_grant_required() {
+        let (_dir, home, resolver) = resolver_fixture();
+        write_profile(&home, "root", &admin_profile());
+
+        let (_invoked, bus, handle) =
+            spawn_with_capsule(resolver, "secret-tool", "tool.v1.execute.do_thing");
+        let mut approval = bus.subscribe_topic("astrid.v1.approval");
+        tokio::task::yield_now().await;
+        publish_ipc_as(&bus, "tool.v1.execute.do_thing", "root");
+
+        assert!(
+            recv_grant_required(&mut approval).await.is_none(),
+            "admin bypasses the gate and must NOT trigger a GrantRequired"
         );
         handle.abort();
     }

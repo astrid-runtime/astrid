@@ -26,7 +26,7 @@ mod caps_tokens;
 #[cfg(test)]
 mod enforcement_tests;
 mod group;
-mod handlers;
+pub(crate) mod handlers;
 mod inheritance;
 mod invite_handlers;
 mod pair_device_handlers;

@@ -15,6 +15,8 @@
 mod bus_monitor;
 /// `astrid.v1.capsules_loaded` payload assembly (opaque per-capsule metadata).
 mod capsules_loaded;
+/// Grant-on-first-use consent handler (issue #998).
+mod grant_on_use;
 /// Persistent invite-token store (issue #756).
 pub mod invite;
 /// The Management API router listening to the `EventBus`.
@@ -394,6 +396,14 @@ impl Kernel {
         // call (before the debug-assert below) so it counts toward
         // `INTERNAL_SUBSCRIBER_COUNT`.
         drop(bus_monitor::spawn_bus_activity_monitor(&kernel.event_bus));
+        // Grant-on-first-use (#998): observe `astrid.v1.approval` for
+        // `GrantRequired` signals the dispatcher emits at the access-gate
+        // miss, and grant the capsule on an elicited APPROVE. Subscribes
+        // synchronously (before the debug-assert below) so its one permanent
+        // broadcast subscriber counts toward `INTERNAL_SUBSCRIBER_COUNT`.
+        drop(grant_on_use::spawn_grant_on_use_handler(Arc::clone(
+            &kernel,
+        )));
 
         // Spawn the event dispatcher — routes EventBus events to capsule interceptors.
         // Wire the identity store so auto-provisioning is gated, and the
@@ -1439,9 +1449,11 @@ fn load_or_generate_runtime_key(keys_dir: &Path) -> std::io::Result<KeyPair> {
 /// Number of permanent internal event bus subscribers that are not client
 /// connections: `KernelRouter` (`kernel.request.*`), `AdminRouter`
 /// (`kernel.admin.*`), `ConnectionTracker` (`client.*`),
-/// `EventDispatcher` (all events), and the bus activity monitor (all events,
-/// storm diagnostics — see [`bus_monitor::spawn_bus_activity_monitor`]).
-const INTERNAL_SUBSCRIBER_COUNT: usize = 5;
+/// `EventDispatcher` (all events), the bus activity monitor (all events,
+/// storm diagnostics — see [`bus_monitor::spawn_bus_activity_monitor`]), and
+/// the grant-on-first-use observer (`astrid.v1.approval` — see
+/// [`grant_on_use::spawn_grant_on_use_handler`]).
+const INTERNAL_SUBSCRIBER_COUNT: usize = 6;
 
 /// Gauge: current active client connections (sum across principals).
 /// Mirrors [`Kernel::total_connection_count`]; lets a dashboard graph

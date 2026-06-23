@@ -398,6 +398,7 @@ impl EventDispatcher {
                 &topic,
                 caller_principal,
                 self.access_resolver.as_ref(),
+                &self.event_bus,
             )
             .await;
             dispatch_to_capsule_queues(
@@ -897,14 +898,20 @@ fn dispatch_single(
 /// dual-role capsule's orchestration interceptors (on non-tool topics) are
 /// never filtered — they fall through the surface check unchanged. For all
 /// other topics the filter is a no-op and dispatch is identical to before.
-/// A denied match is dropped silently here (the capsule never sees the
-/// ungranted call); the caller's request simply finds no tool, exactly as
-/// if the capsule were not installed.
+/// For an **authenticated, non-admin** caller a denied match is no longer a
+/// pure silent drop: before dropping, a [`IpcPayload::GrantRequired`] signal is
+/// published on `astrid.v1.approval` (grant-on-first-use, #998) so a broker/shim
+/// can elicit consent and, on approve, the kernel grants the capsule. The match
+/// is still dropped for THIS call (the capsule never sees the ungranted call);
+/// the caller's request simply finds no tool, exactly as if the capsule were not
+/// installed. A `None`/empty/`anonymous` caller (no authenticated principal to
+/// grant to) is still a pure silent drop with no signal.
 async fn find_matching_interceptors(
     registry: &RwLock<CapsuleRegistry>,
     topic: &str,
     caller_principal: Option<&str>,
     access_resolver: Option<&CapsuleAccessResolver>,
+    event_bus: &EventBus,
 ) -> Vec<(Arc<dyn crate::capsule::Capsule>, String, u32)> {
     // Compute the gate once per event, not per capsule. The filter only
     // engages for the user-invocable surface with a resolver present;
@@ -912,6 +919,12 @@ async fn find_matching_interceptors(
     let gate_surface = crate::access::is_user_invocable_surface(topic);
     let registry = registry.read().await;
     let mut matches: Vec<(Arc<dyn crate::capsule::Capsule>, String, u32)> = Vec::new();
+    // Dedup grant-on-use signals within a single dispatch pass (principal is
+    // fixed per call, so key on `capsule_id`). A `Vec<&str>` borrowing the
+    // registry-held ids beats a `HashSet<String>` for this tiny, gate-miss-only
+    // set — linear `contains`, no per-check allocation, a `String` built only on
+    // emit.
+    let mut grant_signalled: Vec<&str> = Vec::new();
     for capsule_id in registry.list() {
         if let Some(capsule) = registry.get(capsule_id) {
             if !matches!(capsule.state(), crate::capsule::CapsuleState::Ready) {
@@ -925,6 +938,25 @@ async fn find_matching_interceptors(
                 && let Some(resolver) = access_resolver
                 && !resolver.is_capsule_allowed(caller_principal, capsule.id())
             {
+                // Grant-on-first-use (#998): for an authenticated non-admin
+                // caller, emit a `GrantRequired` signal before dropping. The
+                // grant TARGET is the kernel-stamped caller + this capsule —
+                // never any caller-supplied claim. Skip a `None`/empty/
+                // `anonymous` principal (no authenticated principal to grant).
+                if let Some(principal) = caller_principal
+                    && !principal.is_empty()
+                    && principal != "anonymous"
+                {
+                    let capsule_key = capsule_id.as_str();
+                    if !grant_signalled.contains(&capsule_key) {
+                        grant_signalled.push(capsule_key);
+                        crate::access::emit_grant_required(
+                            event_bus,
+                            principal,
+                            capsule_key.to_string(),
+                        );
+                    }
+                }
                 continue;
             }
             // RFC cargo-like-manifest: read effective interceptors
