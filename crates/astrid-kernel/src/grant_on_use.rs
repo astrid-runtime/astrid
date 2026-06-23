@@ -62,6 +62,12 @@ const MAX_INFLIGHT_GRANTS: usize = 1024;
 /// Stable lag label for the permanent `astrid.v1.approval` observer.
 const OBSERVER_SUBSCRIBER: &str = "grant_on_use_observer";
 
+/// Stable lag label for the short-lived per-request response awaiters. Kept
+/// distinct from [`OBSERVER_SUBSCRIBER`] so the many transient awaiter
+/// subscriptions are attributed to their own bucket and never skew the
+/// permanent observer's lag metric.
+const AWAITER_SUBSCRIBER: &str = "grant_on_use_awaiter";
+
 /// The approve set, replicated from `host/approval.rs::decision_from_str`.
 /// Anything else — explicit deny, unknown string, or empty — is NOT an approve.
 fn is_approved(decision: &str) -> bool {
@@ -150,7 +156,7 @@ pub(crate) fn spawn_grant_on_use_handler(kernel: Arc<Kernel>) -> tokio::task::Jo
             let response_topic = format!("astrid.v1.approval.response.{request_id}");
             let receiver = kernel
                 .event_bus
-                .subscribe_topic_as(&response_topic, OBSERVER_SUBSCRIBER);
+                .subscribe_topic_as(&response_topic, AWAITER_SUBSCRIBER);
 
             let kernel = Arc::clone(&kernel);
             tokio::spawn(async move {

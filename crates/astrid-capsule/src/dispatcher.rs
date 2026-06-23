@@ -919,12 +919,12 @@ async fn find_matching_interceptors(
     let gate_surface = crate::access::is_user_invocable_surface(topic);
     let registry = registry.read().await;
     let mut matches: Vec<(Arc<dyn crate::capsule::Capsule>, String, u32)> = Vec::new();
-    // Dedup grant-on-use signals within a single dispatch pass: the principal
-    // is fixed per call, so key on `capsule_id`. The gate-miss branch is
-    // already per-capsule (one capsule per loop iteration), but this guard
-    // keeps emission idempotent if a future change iterates interceptors of
-    // the same capsule.
-    let mut grant_signalled: HashSet<String> = HashSet::new();
+    // Dedup grant-on-use signals within a single dispatch pass (principal is
+    // fixed per call, so key on `capsule_id`). A `Vec<&str>` borrowing the
+    // registry-held ids beats a `HashSet<String>` for this tiny, gate-miss-only
+    // set — linear `contains`, no per-check allocation, a `String` built only on
+    // emit.
+    let mut grant_signalled: Vec<&str> = Vec::new();
     for capsule_id in registry.list() {
         if let Some(capsule) = registry.get(capsule_id) {
             if !matches!(capsule.state(), crate::capsule::CapsuleState::Ready) {
@@ -947,9 +947,14 @@ async fn find_matching_interceptors(
                     && !principal.is_empty()
                     && principal != "anonymous"
                 {
-                    let capsule_key = capsule.id().as_str().to_string();
-                    if grant_signalled.insert(capsule_key.clone()) {
-                        crate::access::emit_grant_required(event_bus, principal, capsule_key);
+                    let capsule_key = capsule_id.as_str();
+                    if !grant_signalled.contains(&capsule_key) {
+                        grant_signalled.push(capsule_key);
+                        crate::access::emit_grant_required(
+                            event_bus,
+                            principal,
+                            capsule_key.to_string(),
+                        );
                     }
                 }
                 continue;
