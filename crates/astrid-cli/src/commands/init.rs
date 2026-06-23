@@ -41,6 +41,12 @@ pub(crate) async fn run_init(distro_source: &str) -> anyhow::Result<()> {
     // Fetch and parse the distro manifest.
     let manifest = fetch_and_parse_manifest(distro_source).await?;
 
+    // Enforce the distro's CLI-version floor BEFORE any prompting or install.
+    // The manifest is fetched from the repo `main` tip, so a distro that bumps
+    // its `[distro].astrid-version` would otherwise break onboarding mid-flight
+    // on an older CLI; fail fast with an actionable upgrade message instead.
+    super::distro::validate::enforce_astrid_version(&manifest)?;
+
     // Check lock freshness AFTER parsing manifest (need manifest to compare).
     if let Some(existing_lock) = load_lock(&lock_path)?
         && is_lock_fresh(&existing_lock, &manifest)
