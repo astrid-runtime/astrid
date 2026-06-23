@@ -20,13 +20,19 @@
 //!   `{ request_id, capsule_id, principal, tool_name, call_id }` when the
 //!   caller does not hold the capsule. `request_id` is the kernel-minted
 //!   grant correlation id, echoed back verbatim so the broker routes the
-//!   decision; the rest are display/diagnostic. The signal is NOT
-//!   `isError` — it is a prompt-needed state, not a failure.
+//!   decision; `capsule_id` is echoed back so the broker can clear its dedup
+//!   marker; the rest are display/diagnostic. Both `request_id` and
+//!   `capsule_id` MUST be present and non-empty — a signal missing either is
+//!   unanswerable and is rejected as malformed (see [`GrantRequest::classify`]).
+//!   The signal is NOT `isError` — it is a prompt-needed state, not a failure.
 //! * The respond body the broker expects on [`GRANT_RESPOND_TOPIC`] is
-//!   `{ req_id, request_id, decision }`, where `req_id` is a fresh proxy
-//!   correlation token (the ack lands on `astrid.v1.response.<req_id>`),
-//!   `request_id` is the grant id echoed verbatim, and `decision` is
-//!   `"approve"` or `"deny"`.
+//!   `{ req_id, request_id, decision, capsule_id }`, where `req_id` is a fresh
+//!   proxy correlation token (the ack lands on `astrid.v1.response.<req_id>`),
+//!   `request_id` is the grant id echoed verbatim, `decision` is `"approve"` or
+//!   `"deny"`, and `capsule_id` is echoed so the broker can clear its
+//!   per-`(principal, capsule)` dedup marker. `capsule_id` is display/routing
+//!   only — never a grant target (the kernel derives the target from its own
+//!   observed signal), so it cannot forge a grant.
 //! * The broker acks on `astrid.v1.response.<req_id>` with
 //!   `{ kind:"grant.respond", req_id, granted:bool }`. The caller only
 //!   re-sends the dropped `tools/call` when `granted` is true.
@@ -112,27 +118,57 @@ pub(super) struct GrantRequest {
     tool_name: String,
 }
 
+/// Classification of a broker `tools/call` reply's `grant_required` field.
+///
+/// The three states are deliberately distinct so the caller never collapses a
+/// *present-but-broken* signal into the already-granted path: a dropped call
+/// must surface as a terminal error, never a silent empty success.
+pub(super) enum GrantSignal {
+    /// No actionable signal — the `grant_required` field is absent or JSON
+    /// `null` (the common, already-granted path). Fall through to the normal
+    /// result handling.
+    Absent,
+    /// A `grant_required` field is present but cannot be answered: wrong shape,
+    /// or missing the routing token (`request_id`) / the `capsule_id` the
+    /// broker needs to clear its dedup marker. The caller MUST surface a
+    /// terminal error rather than treat the (empty) reply as a result.
+    Malformed,
+    /// A well-formed grant signal to elicit consent on.
+    Present(GrantRequest),
+}
+
 impl GrantRequest {
-    /// Parse the `grant_required` signal from a broker `tools/call` reply, or
-    /// `None` when the reply does not carry one (the common, already-granted
-    /// path).
+    /// Classify the `grant_required` field of a broker `tools/call` reply.
     ///
-    /// Keyed on the presence of the `grant_required` OBJECT. A signal present
-    /// but missing the routing token (`request_id`) cannot be answered — it
-    /// deserializes to `None` and the caller falls through to the non-elicit
-    /// path. This is a shape check, not a trust check: the kernel mints
-    /// `request_id`.
-    pub(super) fn from_reply(reply: &Value) -> Option<Self> {
-        let flag = reply.get("grant_required")?;
+    /// An absent field — or an explicit JSON `null`, treated as absent to
+    /// mirror typed deserialization where `null` maps to `None` — is
+    /// [`GrantSignal::Absent`]. A present field that cannot be answered
+    /// (unparseable, or missing the non-empty `request_id` / `capsule_id` the
+    /// respond needs) is [`GrantSignal::Malformed`] so the caller fails the
+    /// call loudly instead of returning the empty body as a success. A
+    /// well-formed signal is [`GrantSignal::Present`]. This is a shape check,
+    /// not a trust check: the kernel mints `request_id` and derives the grant
+    /// target itself.
+    pub(super) fn classify(reply: &Value) -> GrantSignal {
+        let Some(flag) = reply.get("grant_required").filter(|v| !v.is_null()) else {
+            return GrantSignal::Absent;
+        };
         match serde_json::from_value::<Self>(flag.clone()) {
-            Ok(req) if !req.request_id.is_empty() => Some(req),
-            Ok(_) => {
-                warn!("MCP shim: grant_required signal missing request_id; ignoring");
-                None
+            Ok(req) if req.request_id.is_empty() => {
+                warn!("MCP shim: grant_required signal missing request_id; treating as malformed");
+                GrantSignal::Malformed
             },
+            Ok(req) if req.capsule_id.is_empty() => {
+                // The broker needs `capsule_id` echoed back to clear its
+                // `(principal, capsule)` dedup marker; without it the respond is
+                // unusable and the marker would stick. Refuse the signal.
+                warn!("MCP shim: grant_required signal missing capsule_id; treating as malformed");
+                GrantSignal::Malformed
+            },
+            Ok(req) => GrantSignal::Present(req),
             Err(e) => {
-                warn!(error = %e, "MCP shim: malformed grant_required signal; ignoring");
-                None
+                warn!(error = %e, "MCP shim: malformed grant_required signal");
+                GrantSignal::Malformed
             },
         }
     }
@@ -229,7 +265,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn from_reply_parses_signal() {
+    fn classify_parses_present_signal() {
         let reply = json!({
             "kind": "tool.call",
             "content": [],
@@ -242,7 +278,9 @@ mod tests {
                 "call_id": "call-abc"
             }
         });
-        let req = GrantRequest::from_reply(&reply).expect("signal should parse");
+        let GrantSignal::Present(req) = GrantRequest::classify(&reply) else {
+            panic!("a complete signal should classify as Present");
+        };
         assert_eq!(req.request_id, "grant-123");
         assert_eq!(req.capsule_id, "shell");
         assert_eq!(req.principal, "claude-code");
@@ -250,13 +288,27 @@ mod tests {
     }
 
     #[test]
-    fn from_reply_none_when_absent() {
+    fn classify_absent_when_field_missing() {
         let reply = json!({ "kind": "tool.call", "content": [], "isError": false });
-        assert!(GrantRequest::from_reply(&reply).is_none());
+        assert!(matches!(
+            GrantRequest::classify(&reply),
+            GrantSignal::Absent
+        ));
     }
 
     #[test]
-    fn from_reply_none_when_request_id_blank() {
+    fn classify_absent_when_field_is_null() {
+        // An explicit JSON null is treated as absent (mirrors typed
+        // deserialization where null maps to None), not as a malformed signal.
+        let reply = json!({ "grant_required": Value::Null });
+        assert!(matches!(
+            GrantRequest::classify(&reply),
+            GrantSignal::Absent
+        ));
+    }
+
+    #[test]
+    fn classify_malformed_when_request_id_blank() {
         let reply = json!({
             "grant_required": {
                 "request_id": "",
@@ -264,19 +316,22 @@ mod tests {
                 "tool_name": "t"
             }
         });
-        assert!(GrantRequest::from_reply(&reply).is_none());
+        assert!(matches!(
+            GrantRequest::classify(&reply),
+            GrantSignal::Malformed
+        ));
     }
 
     #[test]
-    fn from_reply_present_with_only_request_id() {
-        // The routing token alone is a valid signal; display fields are
-        // best-effort and default to empty.
+    fn classify_malformed_when_capsule_id_missing() {
+        // The routing token alone is NOT answerable: the broker needs the
+        // capsule id echoed back to clear its dedup marker, so a signal without
+        // it is malformed rather than a partial-but-usable Present.
         let reply = json!({ "grant_required": { "request_id": "g1" } });
-        let req = GrantRequest::from_reply(&reply).expect("request_id alone is a valid signal");
-        assert_eq!(req.request_id, "g1");
-        assert_eq!(req.capsule_id, "");
-        assert_eq!(req.principal, "");
-        assert_eq!(req.tool_name, "");
+        assert!(matches!(
+            GrantRequest::classify(&reply),
+            GrantSignal::Malformed
+        ));
     }
 
     #[test]

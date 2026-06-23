@@ -373,19 +373,30 @@ impl ServerHandler for AstridMcpServer {
         // approval block, so a re-sent call still flows into the approval gate:
         // a tool that is both ungranted and capability-gated resolves in
         // sequence.
-        let reply = if let Some(grant) = grant::GrantRequest::from_reply(&reply) {
-            let granted = self.resolve_grant(&context.peer, &grant).await?;
-            if !granted {
+        let reply = match grant::GrantRequest::classify(&reply) {
+            // No grant signal (or an explicit null) — the common already-granted
+            // path. Carry the reply through unchanged.
+            grant::GrantSignal::Absent => reply,
+            // A grant signal was present but unanswerable. The call was DROPPED
+            // at the access gate, so the (empty) reply is NOT a result — surface
+            // a terminal error rather than letting it masquerade as success.
+            grant::GrantSignal::Malformed => {
                 return Ok(CallToolResult::error(vec![Content::text(
-                    "Capsule access was not granted for this tool.",
+                    "Astrid returned a malformed capsule-grant signal; the tool call was dropped.",
                 )]));
-            }
-            // Re-send the original call now that the capsule is granted.
-            let retry_id = new_req_id();
-            self.round_trip(TOOL_CALL_TOPIC, &retry_id, call_body(&retry_id))
-                .await?
-        } else {
-            reply
+            },
+            grant::GrantSignal::Present(grant) => {
+                let granted = self.resolve_grant(&context.peer, &grant).await?;
+                if !granted {
+                    return Ok(CallToolResult::error(vec![Content::text(
+                        "Capsule access was not granted for this tool.",
+                    )]));
+                }
+                // Re-send the original call now that the capsule is granted.
+                let retry_id = new_req_id();
+                self.round_trip(TOOL_CALL_TOPIC, &retry_id, call_body(&retry_id))
+                    .await?
+            },
         };
 
         // If the routed tool parked on a capability approval, the broker
