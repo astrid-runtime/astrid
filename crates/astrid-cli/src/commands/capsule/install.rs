@@ -553,6 +553,42 @@ pub(crate) fn install_from_local_path(
     finish_install(&output, home)
 }
 
+/// Install a capsule from a local `.capsule` file in batch (offline)
+/// mode, recording `original_source` and signing provenance in
+/// `meta.json`.
+///
+/// Used by the `.shuttle` offline-install path: the file already lives
+/// in the verified mirror, so no network is touched. `original_source`
+/// is the distro's canonical `@org/repo` (NOT the mirror path) so a
+/// later online `update` can re-resolve. Provenance fields are
+/// descriptive — trust was established by the distro signature check
+/// before this is called, not re-derived here.
+pub(crate) fn install_offline_capsule(
+    archive: &Path,
+    home: &AstridHome,
+    name: &str,
+    original_source: &str,
+    resolved_ref: Option<&str>,
+    signer: Option<&str>,
+    signature: Option<&str>,
+) -> anyhow::Result<()> {
+    BATCH_MODE.store(true, Ordering::Relaxed);
+    let result = (|| {
+        unpack_via_lib(archive, false, home, Some(original_source))?;
+        // Post-stamp provenance into the freshly-written meta.json.
+        let target_dir = resolve_target_dir(home, name, false)?;
+        if let Some(mut meta) = super::meta::read_meta(&target_dir) {
+            meta.resolved_ref = resolved_ref.map(String::from);
+            meta.signer = signer.map(String::from);
+            meta.signature = signature.map(String::from);
+            super::meta::write_meta(&target_dir, &meta)?;
+        }
+        Ok(())
+    })();
+    BATCH_MODE.store(false, Ordering::Relaxed);
+    result
+}
+
 /// Unpack a `.capsule` archive and install from it.
 fn unpack_via_lib(
     archive: &Path,
