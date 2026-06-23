@@ -91,6 +91,38 @@ pub(crate) fn is_user_invocable_surface(topic: &str) -> bool {
     }
 }
 
+/// Publish a grant-on-first-use [`astrid_events::ipc::IpcPayload::GrantRequired`]
+/// signal on `astrid.v1.approval` for an access-gate miss (#998), so a
+/// broker/shim can elicit consent and, on approve, the kernel grants the
+/// capsule. Co-located with the access gate it serves.
+///
+/// Synchronous fire-and-forget: `event_bus.publish` never blocks, so the
+/// dispatch hot path takes no new lock or `.await`. The `request_id` is a fresh
+/// unguessable UUID the broker keys the response on. The message carries a nil
+/// `source_id` (kernel-originated): the kernel's grant handler only honours
+/// nil-sourced `GrantRequired`, so this must stay kernel-published.
+pub(crate) fn emit_grant_required(
+    event_bus: &astrid_events::EventBus,
+    principal: &str,
+    capsule_id: String,
+) {
+    let request_id = uuid::Uuid::new_v4().to_string();
+    let payload = astrid_events::ipc::IpcPayload::GrantRequired {
+        request_id,
+        principal: principal.to_string(),
+        capsule_id,
+    };
+    let message = astrid_events::ipc::IpcMessage::new(
+        "astrid.v1.approval",
+        payload,
+        uuid::Uuid::nil(), // Kernel-originated; the grant handler requires nil source.
+    );
+    event_bus.publish(astrid_events::AstridEvent::Ipc {
+        message,
+        metadata: astrid_events::EventMetadata::new("dispatcher"),
+    });
+}
+
 /// Resolves whether a principal may invoke a given capsule, for the
 /// dispatcher's user-invocable-surface filter.
 ///

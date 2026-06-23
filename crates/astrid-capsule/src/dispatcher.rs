@@ -898,30 +898,6 @@ fn dispatch_single(
 /// dual-role capsule's orchestration interceptors (on non-tool topics) are
 /// never filtered — they fall through the surface check unchanged. For all
 /// other topics the filter is a no-op and dispatch is identical to before.
-/// Publish a grant-on-first-use [`IpcPayload::GrantRequired`] signal on
-/// `astrid.v1.approval` for the access-gate miss (`#998`).
-///
-/// Synchronous fire-and-forget: `event_bus.publish` returns a subscriber count
-/// and never blocks, so the dispatch hot path takes NO new lock or `.await`.
-/// The `request_id` is a fresh unguessable UUID the broker keys the response on.
-fn emit_grant_required(event_bus: &EventBus, principal: &str, capsule_id: String) {
-    let request_id = uuid::Uuid::new_v4().to_string();
-    let payload = astrid_events::ipc::IpcPayload::GrantRequired {
-        request_id,
-        principal: principal.to_string(),
-        capsule_id,
-    };
-    let message = astrid_events::ipc::IpcMessage::new(
-        "astrid.v1.approval",
-        payload,
-        uuid::Uuid::nil(), // Kernel-originated.
-    );
-    event_bus.publish(AstridEvent::Ipc {
-        message,
-        metadata: astrid_events::EventMetadata::new("dispatcher"),
-    });
-}
-
 /// For an **authenticated, non-admin** caller a denied match is no longer a
 /// pure silent drop: before dropping, a [`IpcPayload::GrantRequired`] signal is
 /// published on `astrid.v1.approval` (grant-on-first-use, #998) so a broker/shim
@@ -973,7 +949,7 @@ async fn find_matching_interceptors(
                 {
                     let capsule_key = capsule.id().as_str().to_string();
                     if grant_signalled.insert(capsule_key.clone()) {
-                        emit_grant_required(event_bus, principal, capsule_key);
+                        crate::access::emit_grant_required(event_bus, principal, capsule_key);
                     }
                 }
                 continue;
