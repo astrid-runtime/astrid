@@ -9,6 +9,10 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
 
 ## [Unreleased]
 
+### Docs
+
+- Added `docs/models.md` -- user guide for LLM model selection (`astrid models list/current/set/unset`), provider discovery (openai and openai-compat capsules), install-time onboarding, and the no-model error path. Relates to #961.
+
 ### Security
 
 - **The HTTP gateway's admin routes now enforce per-device capability scope (#999), closing a gap where a device-scoped bearer reached the kernel cap-gate as unattenuated full-principal authority.** The `KernelClient` transport (`astrid-uplink`) behind `GET /api/sys/status`, the new `GET /api/sys/readiness`, `POST /api/sys/capsules/reload`, and the `/api/capsules` list/get/install routes stamped only the caller's *principal* on outbound requests, never the authenticating device's `key_id` — so the kernel's `authorize_request` saw `device_key_id = None` and skipped the `DeviceScope` attenuation floor. A `use-only` device whose scope *denies* `capsule:list` / `capsule:reload` / `capsule:install` but whose principal *holds* it could therefore drive those routes (e.g. read the full loaded-capsule inventory via `/api/sys/readiness`, or trigger a reload). `KernelClient` now carries an optional `device_key_id` (`with_device_key_id`) and stamps it on every request via a unit-tested message builder; all six gateway call sites thread `CallerContext.device_key_id`, mirroring the bus-direct `BusAdminClient` path that already did so. Full-authority bearers stamp `None` (unattenuated — single-tenant behaviour unchanged). No WIT / host-ABI change — uplink transport + gateway routes only. Found by the branch's own adversarial security review. Refs #999.
