@@ -305,13 +305,8 @@ async fn resolve_github_source(
     };
     let (name, download_url) = &candidates[idx];
 
-    // Stream the asset to a temp file with a hard size cap. The temp dir
-    // guard is returned so the file survives until the kernel reads it.
-    let tmp = tempfile::TempDir::new()
-        .map_err(|e| internal(format!("create temp dir for capsule download: {e}")))?;
-    let sanitized = std::path::Path::new(name).file_name().unwrap_or_default();
-    let download_path = tmp.path().join(sanitized);
-
+    // Stream the asset into memory with a hard size cap, then stage it to
+    // disk for the kernel to install by path.
     let mut dl = client
         .get(download_url)
         .send()
@@ -330,7 +325,33 @@ async fn resolve_github_source(
             ));
         }
     }
-    std::fs::write(&download_path, &bytes)
+    stage_capsule_archive(name, bytes).await
+}
+
+/// Stage downloaded `.capsule` bytes into a fresh temp dir and return the
+/// guarded path for the kernel to install from.
+///
+/// The file write runs inside `spawn_blocking`: an archive up to 50 MB
+/// would otherwise block a gateway worker thread. The asset name is
+/// reduced to its final path component (`file_name`), so a crafted release
+/// asset name (e.g. `../../x.capsule`) cannot escape the temp dir. The
+/// returned [`ResolvedArchive::guard`] owns the temp dir; the caller MUST
+/// keep it alive until the kernel has read the file.
+async fn stage_capsule_archive(asset_name: &str, bytes: Vec<u8>) -> GatewayResult<ResolvedArchive> {
+    let tmp = tempfile::TempDir::new()
+        .map_err(|e| internal(format!("create temp dir for capsule download: {e}")))?;
+    let sanitized = std::path::Path::new(asset_name)
+        .file_name()
+        .unwrap_or_default();
+    let download_path = tmp.path().join(sanitized);
+
+    // Move `bytes` into the task (not needed afterwards) and clone only the
+    // small path so `download_path` survives for the result. A join error
+    // maps to an internal error rather than panicking the worker.
+    let write_path = download_path.clone();
+    tokio::task::spawn_blocking(move || std::fs::write(&write_path, &bytes))
+        .await
+        .map_err(|e| internal(format!("join capsule-write task: {e}")))?
         .map_err(|e| internal(format!("write capsule archive to disk: {e}")))?;
 
     Ok(ResolvedArchive {
@@ -421,4 +442,74 @@ fn daemon_internal(e: anyhow::Error) -> GatewayError {
 
 fn internal(msg: String) -> GatewayError {
     GatewayError::Internal(anyhow::anyhow!(msg))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The staged archive lands on disk inside the guard's temp dir, with
+    /// the asset's bytes intact and its file name preserved.
+    #[tokio::test]
+    async fn stage_capsule_archive_writes_and_round_trips() {
+        let bytes = b"fake .capsule archive bytes".to_vec();
+        let resolved = stage_capsule_archive("cli.capsule", bytes.clone())
+            .await
+            .expect("staging should succeed");
+
+        let path = std::path::PathBuf::from(&resolved.path);
+        assert!(path.exists(), "staged archive must exist on disk");
+        assert_eq!(
+            path.file_name().and_then(|n| n.to_str()),
+            Some("cli.capsule"),
+            "asset file name is preserved",
+        );
+        assert!(
+            path.starts_with(resolved.guard.path()),
+            "archive must live inside the guarded temp dir",
+        );
+        assert_eq!(
+            std::fs::read(&path).expect("read back staged archive"),
+            bytes,
+            "bytes must round-trip through the spawn_blocking write",
+        );
+    }
+
+    /// Dropping the [`ResolvedArchive`] guard removes the staged file — the
+    /// kernel must finish reading it before the gateway handler returns.
+    #[tokio::test]
+    async fn stage_capsule_archive_guard_drop_removes_file() {
+        let resolved = stage_capsule_archive("x.capsule", b"x".to_vec())
+            .await
+            .expect("staging should succeed");
+        let path = resolved.path.clone();
+        assert!(std::path::Path::new(&path).exists());
+
+        drop(resolved);
+        assert!(
+            !std::path::Path::new(&path).exists(),
+            "guard drop must delete the staged archive",
+        );
+    }
+
+    /// A crafted release-asset name with path traversal is reduced to its
+    /// final component, so the write stays inside the temp dir (the asset
+    /// name originates from GitHub's release JSON — untrusted input).
+    #[tokio::test]
+    async fn stage_capsule_archive_sanitizes_path_traversal() {
+        let resolved = stage_capsule_archive("../../../etc/evil.capsule", b"x".to_vec())
+            .await
+            .expect("staging should succeed");
+
+        let path = std::path::PathBuf::from(&resolved.path);
+        assert_eq!(
+            path.file_name().and_then(|n| n.to_str()),
+            Some("evil.capsule"),
+            "traversal components are stripped to the bare file name",
+        );
+        assert!(
+            path.starts_with(resolved.guard.path()),
+            "sanitized archive must not escape the temp dir",
+        );
+    }
 }
