@@ -306,6 +306,7 @@ fn create_lock_from_parts(
             resolved_at: chrono::Utc::now().to_rfc3339(),
         },
         capsules,
+        manifest_hash: None,
     }
 }
 
@@ -350,7 +351,10 @@ async fn install_capsules(selected: &[DistroCapsule]) -> anyhow::Result<Vec<Lock
     for cap in selected {
         pb.set_message(cap.name.clone());
 
-        if let Err(e) = super::capsule::install::install_capsule_batch(&cap.source, false).await {
+        let refspec = super::capsule::install::RefSpec::from_capsule(cap);
+        if let Err(e) =
+            super::capsule::install::install_capsule_batch(&cap.source, false, &refspec).await
+        {
             eprintln!("\n  Failed to install {}: {e}", cap.name);
             failed.push(cap.name.clone());
             pb.inc(1);
@@ -369,6 +373,7 @@ async fn install_capsules(selected: &[DistroCapsule]) -> anyhow::Result<Vec<Lock
                 .and_then(|m| m.wasm_hash)
                 .map(|h| format!("blake3:{h}"))
                 .unwrap_or_default(),
+            resolved_ref: cap.resolved_ref(),
         });
 
         pb.inc(1);

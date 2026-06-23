@@ -18,7 +18,7 @@ use astrid_core::dirs::AstridHome;
 use serde::{Deserialize, Serialize};
 
 /// Capsule installation metadata, persisted as `meta.json` alongside `Capsule.toml`.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Default, Serialize, Deserialize)]
 pub struct CapsuleMeta {
     /// The currently installed version.
     pub version: String,
@@ -46,6 +46,19 @@ pub struct CapsuleMeta {
     /// Maps original filename to BLAKE3 hash (e.g. `"my-analytics.wit" → "abc123"`).
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub wit_files: HashMap<String, String>,
+    /// Descriptive provenance — the signer identity recorded when this
+    /// capsule was installed from a signed distro (`.shuttle`). This is
+    /// a record, NOT a trust anchor: trust is established by the distro
+    /// signature check at install time, not re-derived from this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signer: Option<String>,
+    /// Descriptive provenance — the distro signature under which this
+    /// capsule was installed. Recorded for audit, not re-verified here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signature: Option<String>,
+    /// The concrete ref (tag/branch/commit) this capsule resolved to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved_ref: Option<String>,
 }
 
 /// Read existing `meta.json` from a capsule's install directory (if present).

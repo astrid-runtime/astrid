@@ -139,6 +139,28 @@ pub(crate) struct DistroMeta {
     /// Example: `[distro.requires.astrid] llm = "^1.0"`
     #[serde(default)]
     pub(crate) requires: HashMap<String, HashMap<String, String>>,
+    /// Optional signing configuration. When present, declares the
+    /// ed25519 public key the distro's maintainer signs `.shuttle`
+    /// archives with. Drives trust-store pinning at install time.
+    #[serde(default)]
+    pub(crate) signing: Option<SigningConfig>,
+}
+
+/// Signing configuration from `[distro.signing]`.
+///
+/// The `pubkey` is the maintainer's ed25519 verification key in
+/// `ed25519:<base64>` wire form. `endorses` carries a successor key for
+/// future key-rotation chains — it is parsed and recorded but chain
+/// verification is deferred (the field is wire-stable so older clients
+/// don't reject manifests that carry it).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) struct SigningConfig {
+    /// Maintainer verification key as `ed25519:<base64>`.
+    pub(crate) pubkey: String,
+    /// Successor key for rotation (wire field; chain verify deferred).
+    #[serde(default)]
+    pub(crate) endorses: Option<String>,
 }
 
 /// A shared variable defined at the distro level.
@@ -164,6 +186,20 @@ pub(crate) struct DistroCapsule {
     pub(crate) source: String,
     /// Exact version to install (resolved to a git tag).
     pub(crate) version: String,
+    /// Explicit git tag to install. Highest-priority ref selector —
+    /// overrides `version` when both are set.
+    #[serde(default)]
+    pub(crate) tag: Option<String>,
+    /// Git branch to track. Used when no tag/version pins a release.
+    #[serde(default)]
+    pub(crate) branch: Option<String>,
+    /// Exact git revision (commit SHA) to install.
+    #[serde(default)]
+    pub(crate) rev: Option<String>,
+    /// Whether this capsule is the default choice within its
+    /// [`Self::group`] for non-interactive (`--yes`) selection.
+    #[serde(default)]
+    pub(crate) default: bool,
     /// Provider group for multi-select during init (e.g. `llm`).
     #[serde(default)]
     pub(crate) group: Option<String>,
@@ -173,6 +209,31 @@ pub(crate) struct DistroCapsule {
     /// Environment variable mappings with `{{ var }}` template references.
     #[serde(default)]
     pub(crate) env: HashMap<String, String>,
+}
+
+impl DistroCapsule {
+    /// The concrete ref this capsule pins, for recording in the lock.
+    ///
+    /// Priority: explicit `rev` (commit) > `tag` > `branch` > the
+    /// `version` field rendered as a `v`-prefixed tag. Returns `None`
+    /// only when nothing pins a ref (which, given `version` is
+    /// required, does not happen for a valid manifest — but the field
+    /// stays optional so the lock format tolerates legacy inputs).
+    pub(crate) fn resolved_ref(&self) -> Option<String> {
+        if let Some(rev) = &self.rev {
+            return Some(rev.clone());
+        }
+        if let Some(tag) = &self.tag {
+            return Some(tag.clone());
+        }
+        if let Some(branch) = &self.branch {
+            return Some(branch.clone());
+        }
+        if !self.version.is_empty() {
+            return Some(format!("v{}", self.version));
+        }
+        None
+    }
 }
 
 /// Parse a `Distro.toml` string into a [`DistroManifest`].
@@ -281,6 +342,57 @@ base_url = "{{ base_url }}"
         assert_eq!(m.capsules[1].env["api_key"], "{{ api_key }}");
         let requires = &m.distro.requires;
         assert_eq!(requires["astrid"]["llm"], "^1.0");
+    }
+
+    #[test]
+    fn parse_capsule_ref_and_default_fields() {
+        let toml = r#"
+schema-version = 1
+
+[distro]
+id = "test"
+name = "Test"
+version = "0.1.0"
+
+[distro.signing]
+pubkey = "ed25519:AAAA"
+
+[[capsule]]
+name = "astrid-capsule-cli"
+source = "@org/cli"
+version = "0.1.0"
+role = "uplink"
+
+[[capsule]]
+name = "astrid-capsule-a"
+source = "@org/a"
+version = "0.2.0"
+tag = "v0.2.0-rc1"
+group = "llm"
+default = true
+
+[[capsule]]
+name = "astrid-capsule-b"
+source = "@org/b"
+version = "0.3.0"
+branch = "main"
+group = "llm"
+"#;
+        let m = parse_manifest(toml).unwrap();
+        assert_eq!(m.distro.signing.as_ref().unwrap().pubkey, "ed25519:AAAA");
+        let a = m.capsules.iter().find(|c| c.name == "astrid-capsule-a").unwrap();
+        assert_eq!(a.tag.as_deref(), Some("v0.2.0-rc1"));
+        assert!(a.default);
+        // Explicit tag wins over version for the resolved ref.
+        assert_eq!(a.resolved_ref().as_deref(), Some("v0.2.0-rc1"));
+        let b = m.capsules.iter().find(|c| c.name == "astrid-capsule-b").unwrap();
+        assert_eq!(b.branch.as_deref(), Some("main"));
+        assert!(!b.default);
+        // Branch wins over version when no tag/rev.
+        assert_eq!(b.resolved_ref().as_deref(), Some("main"));
+        // CLI capsule has only version → v-prefixed.
+        let cli = m.capsules.iter().find(|c| c.name == "astrid-capsule-cli").unwrap();
+        assert_eq!(cli.resolved_ref().as_deref(), Some("v0.1.0"));
     }
 
     #[test]
