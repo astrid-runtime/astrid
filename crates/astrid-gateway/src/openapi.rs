@@ -79,6 +79,8 @@ use crate::state::GatewayState;
         routes::principals::delete_principal,
         routes::principals::enable_principal,
         routes::principals::disable_principal,
+        routes::principals::list_principal_devices,
+        routes::principals::delete_principal_device,
         routes::principals::list_capabilities,
         // Caps
         routes::caps::grant_caps,
@@ -134,6 +136,8 @@ use crate::state::GatewayState;
             routes::principals::ModifyPrincipalRequest,
             routes::principals::CapabilityCatalogResponse,
             routes::principals::CapabilityInfoView,
+            routes::principals::DeviceListResponse,
+            routes::principals::DeviceKeyInfoView,
             // Caps
             routes::caps::GrantRequest,
             routes::caps::RevokeRequest,

@@ -5,7 +5,7 @@
 //! keypair, a hot-cached copy of the deployment's `Distro.toml`, the
 //! redeem rate-limiter, and the configuration.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
@@ -195,6 +195,19 @@ pub struct GatewayState {
     /// by orders of magnitude, and the critical sections are
     /// non-`await`-blocking.
     pub revoked_at: Arc<RwLock<HashMap<PrincipalId, u64>>>,
+    /// Per-device bearer revocation set: the `key_id`s of paired devices that
+    /// have been revoked via `PairDeviceRevoke`. Populated by a background task
+    /// watching the audit stream for successful `admin.auth.pair.revoke` ops.
+    /// The auth middleware rejects any device-scoped bearer whose `key_id` is
+    /// in this set — see [`crate::auth::verify_bearer`].
+    ///
+    /// This is defense-in-depth on the HTTP path so a live bearer stops
+    /// immediately; the kernel cap-gate is the primary mechanism (a revoked
+    /// key is gone from `public_keys`, so every kernel request fails closed).
+    /// Deliberately in-memory only: it never needs to survive a restart
+    /// because a restart re-derives correctness from the (now key-less)
+    /// profile, and the bearer's own expiry bounds the window regardless.
+    pub revoked_key_ids: Arc<RwLock<HashSet<String>>>,
     /// Live audit-log handle backing `GET /api/sys/audit`. `Some`
     /// when the gateway is spawned by `astrid-daemon` (which holds
     /// the kernel's `Arc<AuditLog>`); `None` for the standalone-
@@ -270,6 +283,7 @@ impl GatewayState {
             metrics_handle,
             event_bus,
             revoked_at,
+            revoked_key_ids: Arc::new(RwLock::new(HashSet::new())),
             audit_log,
             session_id,
             gateway_route_uuid: Uuid::new_v4(),

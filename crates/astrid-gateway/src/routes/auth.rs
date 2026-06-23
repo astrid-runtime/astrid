@@ -211,6 +211,51 @@ pub struct PairDeviceIssueRequest {
     /// key entry on `AuthConfig.public_keys` once redeemed.
     #[serde(default)]
     pub label: Option<String>,
+    /// Capability scope the redeemed device authenticates under.
+    ///
+    /// A friendly preset name: `"full"` (unattenuated — requires the issuer
+    /// to hold `self:auth:pair:admin`) or `"use-only"` (the device may act
+    /// with the principal's self-scoped caps but cannot pair further devices
+    /// or delegate). Omitted ⇒ `"full"`, preserving the prior behaviour.
+    ///
+    /// For a custom allow/deny scope, leave `scope` unset (or `"full"`) and
+    /// supply `allow` / `deny` instead — any non-empty `allow`/`deny` selects
+    /// an explicit scope, validated to be a subset of the issuer's authority.
+    #[serde(default)]
+    pub scope: Option<String>,
+    /// Explicit allow patterns for a custom scope. When non-empty (or `deny`
+    /// is), the request is an explicit scope and `scope` is ignored. Every
+    /// pattern must be held by the issuer (no escalation).
+    #[serde(default)]
+    pub allow: Vec<String>,
+    /// Explicit deny patterns for a custom scope (deny wins). Purely
+    /// restrictive — needs no subset validation.
+    #[serde(default)]
+    pub deny: Vec<String>,
+}
+
+impl PairDeviceIssueRequest {
+    /// Map the friendly HTTP scope fields to the kernel [`PairScopeArg`].
+    ///
+    /// Precedence: a non-empty `allow`/`deny` ⇒ `Explicit`; otherwise a
+    /// `scope` of `"full"`/absent ⇒ `Full`, and any other `scope` string ⇒
+    /// `Preset { name }` (the kernel rejects an unknown preset). This keeps
+    /// the common cases one field while still exposing explicit caps.
+    fn to_scope_arg(&self) -> astrid_core::kernel_api::PairScopeArg {
+        use astrid_core::kernel_api::PairScopeArg;
+        if !self.allow.is_empty() || !self.deny.is_empty() {
+            return PairScopeArg::Explicit {
+                allow: self.allow.clone(),
+                deny: self.deny.clone(),
+            };
+        }
+        match self.scope.as_deref() {
+            None | Some("full") => PairScopeArg::Full,
+            Some(name) => PairScopeArg::Preset {
+                name: name.to_string(),
+            },
+        }
+    }
 }
 
 /// Inbound body for `POST /api/auth/pair-device/redeem`. Unauthenticated
@@ -270,14 +315,18 @@ pub async fn post_pair_device_issue(
         .cloned()
         .ok_or(GatewayError::Unauthorized)?;
     let body: PairDeviceIssueRequest = crate::routes::principals::read_json_body(req).await?;
+    let scope = body.to_scope_arg();
     // Carry the issuer's device scope to the kernel: a use-only paired device
     // calling `pair-device issue` must be denied at the cap-gate even though
     // its principal holds `self:auth:pair` — the device's deny-list fences it.
+    // The requested child scope is validated kernel-side against the issuer's
+    // attenuated effective set (no escalation) and the full-mint gate.
     let client = state.admin_client_for(&caller)?;
     let resp = client
         .request(AdminRequestKind::PairDeviceIssue {
             expires_secs: body.expires_secs,
             label: body.label,
+            scope,
         })
         .await
         .map_err(|e| GatewayError::Internal(anyhow::anyhow!("daemon request: {e}")))?;

@@ -241,6 +241,70 @@ pub fn spawn_watcher(
     });
 }
 
+/// Spawn the per-device bearer-revocation watcher. Subscribes to the kernel's
+/// audit topic and adds a device's `key_id` to `revoked_key_ids` whenever a
+/// successful `admin.auth.pair.revoke` admin op lands, so a live device-scoped
+/// bearer is rejected at the HTTP edge immediately (the kernel cap-gate already
+/// fails it closed — this is defense in depth on the bearer).
+///
+/// Detached: terminates when the bus is dropped (daemon shutdown). In-memory
+/// only — a revoked key never needs to survive a restart because the profile
+/// it was removed from is the source of truth and the bearer's TTL bounds the
+/// window regardless.
+///
+/// # Panics
+/// Panics if the `revoked_key_ids` `RwLock` is poisoned — same fail-stop
+/// posture as the verify path.
+#[allow(clippy::implicit_hasher)] // set shape is internal to this module
+pub fn spawn_key_revocation_watcher(
+    bus: Arc<astrid_events::EventBus>,
+    revoked_key_ids: Arc<RwLock<std::collections::HashSet<String>>>,
+) {
+    tokio::spawn(async move {
+        let mut receiver =
+            bus.subscribe_topic_as(crate::routes::events::AUDIT_TOPIC, "key_revocation_watcher");
+        while let Some(event) = receiver.recv().await {
+            let astrid_events::AstridEvent::Ipc { message, .. } = &*event else {
+                continue;
+            };
+            let astrid_events::ipc::IpcPayload::RawJson(val) = &message.payload else {
+                continue;
+            };
+            // The top-level `method` is the kernel's wire-name for the op (see
+            // `admin_request_method`). Only successful device revocations evict.
+            if val.get("method").and_then(serde_json::Value::as_str)
+                != Some("admin.auth.pair.revoke")
+            {
+                continue;
+            }
+            if val.get("outcome").and_then(serde_json::Value::as_str) != Some("success") {
+                continue;
+            }
+            // `key_id` lives in the sanitized request params (a non-secret
+            // fingerprint, recorded verbatim): `params.params.key_id`.
+            let Some(key_id) = val
+                .get("params")
+                .and_then(|p| p.get("params"))
+                .and_then(|p| p.get("key_id"))
+                .and_then(serde_json::Value::as_str)
+            else {
+                tracing::warn!(
+                    audit = ?val,
+                    "pair-device revoke audit event missing key_id — cannot evict bearer"
+                );
+                continue;
+            };
+            {
+                let mut guard = revoked_key_ids
+                    .write()
+                    .expect("revoked-key-id set poisoned — fail-stop");
+                guard.insert(key_id.to_string());
+            }
+            tracing::info!(key_id = %key_id, "device bearer revocation recorded");
+        }
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

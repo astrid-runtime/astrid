@@ -89,6 +89,15 @@ pub fn build(state: Arc<GatewayState>) -> Router {
         .route("/api/sys/principals/:id/quotas", get(quotas::get_quotas))
         .route("/api/sys/principals/:id/quotas", put(quotas::set_quotas))
         .route("/api/sys/principals/:id/usage", get(quotas::get_usage))
+        // ── Devices (paired keys) ──
+        .route(
+            "/api/sys/principals/:id/devices",
+            get(principals::list_principal_devices),
+        )
+        .route(
+            "/api/sys/principals/:id/devices/:key_id",
+            delete(principals::delete_principal_device),
+        )
         // ── Groups ──
         .route("/api/sys/groups", get(groups::list_groups))
         .route("/api/sys/groups", post(groups::create_group))

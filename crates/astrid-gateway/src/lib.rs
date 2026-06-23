@@ -119,7 +119,10 @@ pub async fn run(
     // bus. Detached: the task exits when the bus drops at daemon
     // shutdown, so no explicit join is needed.
     if let Some(bus) = state.event_bus.clone() {
-        revocations::spawn_watcher(bus, Arc::clone(&state.revoked_at));
+        revocations::spawn_watcher(bus.clone(), Arc::clone(&state.revoked_at));
+        // Per-device bearer revocation: evict a device-scoped bearer the
+        // instant its key_id is revoked via PairDeviceRevoke.
+        revocations::spawn_key_revocation_watcher(bus, Arc::clone(&state.revoked_key_ids));
     } else {
         tracing::warn!(
             "gateway running without a kernel event bus — bearer revocations on principal delete will NOT take effect for this process"

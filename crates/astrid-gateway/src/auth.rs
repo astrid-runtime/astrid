@@ -238,6 +238,21 @@ pub fn verify_bearer(state: &GatewayState, raw: &str) -> Result<CallerContext, G
         return Err(GatewayError::Unauthorized);
     }
 
+    // Per-device revocation: a device-scoped bearer whose `key_id` was revoked
+    // (`PairDeviceRevoke`) is a dead session — stop it immediately rather than
+    // waiting for its TTL. Defense in depth: the key is already gone from the
+    // principal's `public_keys`, so every kernel request would fail closed
+    // anyway, but this rejects the HTTP bearer at the edge.
+    if let Some(key_id) = &device_key_id
+        && state
+            .revoked_key_ids
+            .read()
+            .expect("revoked-key-id set poisoned — fail-stop on the auth path")
+            .contains(key_id)
+    {
+        return Err(GatewayError::Unauthorized);
+    }
+
     Ok(CallerContext {
         principal,
         issued_at_epoch,
@@ -298,6 +313,9 @@ mod tests {
             event_bus: None,
             revoked_at: std::sync::Arc::new(std::sync::RwLock::new(
                 std::collections::HashMap::new(),
+            )),
+            revoked_key_ids: std::sync::Arc::new(std::sync::RwLock::new(
+                std::collections::HashSet::new(),
             )),
             audit_log: None,
             session_id: None,
