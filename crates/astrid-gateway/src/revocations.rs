@@ -155,7 +155,10 @@ pub fn spawn_watcher(
             let astrid_events::ipc::IpcPayload::RawJson(val) = &message.payload else {
                 continue;
             };
-            if val.get("method").and_then(serde_json::Value::as_str) != Some("AgentDelete") {
+            // The kernel publishes the dotted wire-name from `admin_request_method`
+            // (`admin.agent.delete`), NOT the PascalCase enum variant — matching
+            // the variant name here meant the watcher never fired in production.
+            if val.get("method").and_then(serde_json::Value::as_str) != Some("admin.agent.delete") {
                 continue;
             }
             if val.get("outcome").and_then(serde_json::Value::as_str) != Some("success") {
@@ -351,7 +354,7 @@ mod tests {
 
         let event = serde_json::json!({
             "ts_epoch": 1_700_000_500_u64,
-            "method": "AgentDelete",
+            "method": "admin.agent.delete",
             "required_capability": "self:agent:delete",
             "principal": "admin",
             "target_principal": "alice",
@@ -407,7 +410,8 @@ mod tests {
                 let astrid_events::ipc::IpcPayload::RawJson(val) = &message.payload else {
                     continue;
                 };
-                if val.get("method").and_then(serde_json::Value::as_str) != Some("AgentDelete")
+                if val.get("method").and_then(serde_json::Value::as_str)
+                    != Some("admin.agent.delete")
                     || val.get("outcome").and_then(serde_json::Value::as_str) != Some("success")
                 {
                     continue;
