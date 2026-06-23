@@ -416,8 +416,21 @@ async fn install_from_github(
         }
     }
 
-    // Priority 2: clone + build from source via astrid-build. No single
-    // release ref was resolved.
+    // Priority 2: clone + build from source via astrid-build — ONLY when
+    // nothing was pinned. A pinned version/tag that didn't resolve to an
+    // installable release asset is a hard error: silently building HEAD
+    // would install something other than what was pinned and break the
+    // reproducibility the pin exists to guarantee. Fail loudly instead.
+    if version.is_some() || tag.is_some() {
+        let pin = tag
+            .map(|t| format!("tag {t}"))
+            .or_else(|| version.map(|v| format!("version {v}")))
+            .unwrap_or_default();
+        bail!(
+            "no installable .capsule release found for {org}/{repo} at pinned {pin} — \
+             refusing to build from HEAD (that would violate the pin)"
+        );
+    }
     let id = clone_and_build(url, repo, workspace, home, original_source, name_hint)?;
     Ok((vec![id], None))
 }
