@@ -163,7 +163,7 @@ pub async fn list_capsules(
     responses(
         (status = 200, description = "Install completed; body is the `InstallOutput` JSON shape: `{ target_dir, phase, installed_version, previous_version?, wasm_hash?, env_path, env_needs_prompt, missing_imports[], export_conflicts[] }`. May instead be `{ status: 'approval_required', request_id, description, capabilities }` when the kernel needs operator sign-off on dangerous capabilities the capsule declares.", content_type = "application/json"),
         (status = 401, body = ErrorBody),
-        (status = 403, body = ErrorBody, description = "Caller lacks `capsule:install`, source is a non-GitHub URL the kernel rejects, or the workspace flag is set on a local-path source."),
+        (status = 403, body = ErrorBody, description = "Surfaces every kernel-side `InstallCapsule` failure: capability denial, a non-GitHub URL or `workspace` flag the kernel rejects, AND install/validation failures (missing path, malformed archive, lifecycle-hook error). The kernel returns an undifferentiated error string, so these are not split into distinct status codes here."),
         (status = 404, body = ErrorBody, description = "GitHub release or .capsule asset not found."),
         (status = 400, body = ErrorBody, description = "Ambiguous multi-capsule release (specify `capsule`), or archive too large."),
     )
@@ -274,15 +274,10 @@ async fn resolve_github_source(
         .await
         .map_err(|e| internal(format!("fetch GitHub release for {org}/{repo}: {e}")))?;
     if !response.status().is_success() {
-        // No release for the repo (404), or any other API failure: treat
-        // a missing release as not-found, anything else as upstream error.
-        if response.status() == reqwest::StatusCode::NOT_FOUND {
-            return Err(GatewayError::NotFound);
-        }
-        return Err(internal(format!(
-            "GitHub release API returned {} for {org}/{repo}",
-            response.status()
-        )));
+        return Err(github_http_error(
+            response.status(),
+            &format!("release lookup for {org}/{repo}"),
+        ));
     }
     let json: serde_json::Value = response
         .json()
@@ -312,6 +307,15 @@ async fn resolve_github_source(
         .send()
         .await
         .map_err(|e| internal(format!("download capsule asset {name}: {e}")))?;
+    // Guard the status before streaming: a non-2xx body (e.g. a 404/403
+    // error page) must not be staged as a `.capsule` and handed to the
+    // kernel, which would then fail with an unrelated install error.
+    if !dl.status().is_success() {
+        return Err(github_http_error(
+            dl.status(),
+            &format!("download of asset {name}"),
+        ));
+    }
     let mut bytes = Vec::new();
     while let Some(chunk) = dl
         .chunk()
@@ -444,9 +448,40 @@ fn internal(msg: String) -> GatewayError {
     GatewayError::Internal(anyhow::anyhow!(msg))
 }
 
+/// Map a non-success GitHub HTTP status to a gateway error. A `404` is a
+/// genuine "not found" (no release for the repo, or the asset vanished
+/// between listing and download); anything else is an upstream failure
+/// surfaced as a `500`.
+fn github_http_error(status: reqwest::StatusCode, context: &str) -> GatewayError {
+    if status == reqwest::StatusCode::NOT_FOUND {
+        GatewayError::NotFound
+    } else {
+        internal(format!("{context}: GitHub returned {status}"))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A GitHub `404` (no release, or a vanished asset) maps to `NotFound`;
+    /// any other non-2xx is an upstream failure surfaced as an internal
+    /// error — never silently streamed as a `.capsule` body.
+    #[test]
+    fn github_http_error_maps_status_codes() {
+        assert!(matches!(
+            github_http_error(reqwest::StatusCode::NOT_FOUND, "x"),
+            GatewayError::NotFound
+        ));
+        assert!(matches!(
+            github_http_error(reqwest::StatusCode::FORBIDDEN, "x"),
+            GatewayError::Internal(_)
+        ));
+        assert!(matches!(
+            github_http_error(reqwest::StatusCode::INTERNAL_SERVER_ERROR, "x"),
+            GatewayError::Internal(_)
+        ));
+    }
 
     /// The staged archive lands on disk inside the guard's temp dir, with
     /// the asset's bytes intact and its file name preserved.

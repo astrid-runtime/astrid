@@ -17,18 +17,32 @@ pub fn strip_version_prefix(tag: &str) -> &str {
         .unwrap_or(tag)
 }
 
+/// Reduce a repo path segment to the bare repo name: the first path
+/// component, minus any `?query` / `#fragment` and an optional `.git`
+/// suffix. Returns `None` if nothing is left.
+///
+/// These segments are untrusted (a source string from a caller, or a
+/// path scraped out of a URL), so normalising here keeps a malformed
+/// shape (`repo/extra`, `repo?tab=readme`, `repo.git`) from leaking into
+/// the `api.github.com/repos/{org}/{repo}` URL the uplink builds.
+fn normalize_repo_segment(rest: &str) -> Option<&str> {
+    let repo = rest.split('/').next()?;
+    let repo = repo.split(['?', '#']).next().unwrap_or(repo);
+    let repo = repo.strip_suffix(".git").unwrap_or(repo);
+    (!repo.is_empty()).then_some(repo)
+}
+
 /// Extract `(org, repo)` from a GitHub URL. Anchors on the
-/// `github.com/` marker so extra path segments (`/tree/main`, `.git`)
-/// are safely ignored.
+/// `github.com/` marker so extra path segments (`/tree/main`, `.git`,
+/// `?tab=readme`) are safely ignored.
 #[must_use]
 pub fn extract_github_org_repo(url: &str) -> Option<(&str, &str)> {
     let idx = url.find("github.com/")?;
     let after_host = &url[idx.saturating_add("github.com/".len())..];
     let trimmed = after_host.trim_end_matches('/');
     let (org, rest) = trimmed.split_once('/')?;
-    let repo = rest.split('/').next()?;
-    let repo = repo.strip_suffix(".git").unwrap_or(repo);
-    if org.is_empty() || repo.is_empty() {
+    let repo = normalize_repo_segment(rest)?;
+    if org.is_empty() {
         return None;
     }
     Some((org, repo))
@@ -37,18 +51,26 @@ pub fn extract_github_org_repo(url: &str) -> Option<(&str, &str)> {
 /// Parse a capsule source string into `(org, repo)` for GitHub-backed sources.
 ///
 /// Handles `@org/repo`, `github.com/org/repo`, and
-/// `https://github.com/org/repo`.
+/// `https://github.com/org/repo`. The URL forms are matched on a known
+/// **prefix**, not a substring — a local path that merely contains
+/// `github.com/` (e.g. a vendored checkout under
+/// `/tmp/github.com/org/repo`) must NOT be misread as a remote source and
+/// fetched. This mirrors the CLI's own dispatch shapes.
 #[must_use]
 pub fn parse_github_source(source: &str) -> Option<(String, String)> {
     if let Some(repo_path) = source.strip_prefix('@') {
-        let parts: Vec<&str> = repo_path.splitn(2, '/').collect();
-        if parts.len() == 2 && !parts[0].is_empty() && !parts[1].is_empty() {
-            return Some((parts[0].to_string(), parts[1].to_string()));
+        let (org, rest) = repo_path.split_once('/')?;
+        let repo = normalize_repo_segment(rest)?;
+        if org.is_empty() {
+            return None;
         }
-        return None;
+        return Some((org.to_string(), repo.to_string()));
     }
 
-    if source.contains("github.com/") {
+    if source.starts_with("github.com/")
+        || source.starts_with("https://github.com/")
+        || source.starts_with("http://github.com/")
+    {
         let (org, repo) = extract_github_org_repo(source)?;
         return Some((org.to_string(), repo.to_string()));
     }
@@ -184,6 +206,54 @@ mod tests {
     fn test_parse_github_source_non_github() {
         assert!(parse_github_source("./local/path").is_none());
         assert!(parse_github_source("/absolute/path").is_none());
+    }
+
+    #[test]
+    fn extract_github_org_repo_strips_query_and_fragment() {
+        let (org, repo) =
+            extract_github_org_repo("https://github.com/org/repo?tab=readme").unwrap();
+        assert_eq!((org, repo), ("org", "repo"));
+        let (org, repo) = extract_github_org_repo("https://github.com/org/repo#frag").unwrap();
+        assert_eq!((org, repo), ("org", "repo"));
+        let (org, repo) = extract_github_org_repo("github.com/org/repo.git?x=y").unwrap();
+        assert_eq!((org, repo), ("org", "repo"));
+    }
+
+    #[test]
+    fn parse_github_source_at_form_takes_first_segment_only() {
+        // Extra path segments / query strings on `@org/repo` are trimmed to
+        // the bare repo name rather than leaking into the API URL.
+        assert_eq!(
+            parse_github_source("@org/repo/extra"),
+            Some(("org".to_string(), "repo".to_string()))
+        );
+        assert_eq!(
+            parse_github_source("@org/repo?x=y"),
+            Some(("org".to_string(), "repo".to_string()))
+        );
+        assert_eq!(
+            parse_github_source("@org/repo.git"),
+            Some(("org".to_string(), "repo".to_string()))
+        );
+        // No repo segment at all is not GitHub-shaped.
+        assert!(parse_github_source("@org").is_none());
+    }
+
+    #[test]
+    fn parse_github_source_requires_github_prefix_not_substring() {
+        // A local path that merely CONTAINS `github.com/` must not be
+        // classified as remote (which would trigger an unwanted fetch).
+        assert!(parse_github_source("/tmp/github.com/org/repo").is_none());
+        assert!(parse_github_source("./vendor/github.com/org/repo").is_none());
+        // The genuine prefix forms still resolve.
+        assert_eq!(
+            parse_github_source("github.com/org/repo"),
+            Some(("org".to_string(), "repo".to_string()))
+        );
+        assert_eq!(
+            parse_github_source("https://github.com/org/repo"),
+            Some(("org".to_string(), "repo".to_string()))
+        );
     }
 
     #[test]
