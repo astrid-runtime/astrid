@@ -17,6 +17,11 @@ pub fn strip_version_prefix(tag: &str) -> &str {
         .unwrap_or(tag)
 }
 
+/// Strip a `?query` / `#fragment` tail from a single URL path segment.
+fn strip_query_fragment(seg: &str) -> &str {
+    seg.split(['?', '#']).next().unwrap_or(seg)
+}
+
 /// Reduce a repo path segment to the bare repo name: the first path
 /// component, minus any `?query` / `#fragment` and an optional `.git`
 /// suffix. Returns `None` if nothing is left.
@@ -27,20 +32,23 @@ pub fn strip_version_prefix(tag: &str) -> &str {
 /// the `api.github.com/repos/{org}/{repo}` URL the uplink builds.
 fn normalize_repo_segment(rest: &str) -> Option<&str> {
     let repo = rest.split('/').next()?;
-    let repo = repo.split(['?', '#']).next().unwrap_or(repo);
+    let repo = strip_query_fragment(repo);
     let repo = repo.strip_suffix(".git").unwrap_or(repo);
     (!repo.is_empty()).then_some(repo)
 }
 
 /// Extract `(org, repo)` from a GitHub URL. Anchors on the
 /// `github.com/` marker so extra path segments (`/tree/main`, `.git`,
-/// `?tab=readme`) are safely ignored.
+/// `?tab=readme`) are safely ignored. Both segments are normalised so a
+/// query/fragment on either (`org?x=y`, `repo#frag`) can't leak into the
+/// API URL.
 #[must_use]
 pub fn extract_github_org_repo(url: &str) -> Option<(&str, &str)> {
     let idx = url.find("github.com/")?;
     let after_host = &url[idx.saturating_add("github.com/".len())..];
     let trimmed = after_host.trim_end_matches('/');
     let (org, rest) = trimmed.split_once('/')?;
+    let org = strip_query_fragment(org);
     let repo = normalize_repo_segment(rest)?;
     if org.is_empty() {
         return None;
@@ -60,6 +68,7 @@ pub fn extract_github_org_repo(url: &str) -> Option<(&str, &str)> {
 pub fn parse_github_source(source: &str) -> Option<(String, String)> {
     if let Some(repo_path) = source.strip_prefix('@') {
         let (org, rest) = repo_path.split_once('/')?;
+        let org = strip_query_fragment(org);
         let repo = normalize_repo_segment(rest)?;
         if org.is_empty() {
             return None;
@@ -217,6 +226,9 @@ mod tests {
         assert_eq!((org, repo), ("org", "repo"));
         let (org, repo) = extract_github_org_repo("github.com/org/repo.git?x=y").unwrap();
         assert_eq!((org, repo), ("org", "repo"));
+        // A query/fragment clinging to the ORG segment is stripped too.
+        let (org, repo) = extract_github_org_repo("https://github.com/org?x=y/repo").unwrap();
+        assert_eq!((org, repo), ("org", "repo"));
     }
 
     #[test]
@@ -233,6 +245,11 @@ mod tests {
         );
         assert_eq!(
             parse_github_source("@org/repo.git"),
+            Some(("org".to_string(), "repo".to_string()))
+        );
+        // A query/fragment on the ORG segment is stripped, not leaked.
+        assert_eq!(
+            parse_github_source("@org?x=y/repo"),
             Some(("org".to_string(), "repo".to_string()))
         );
         // No repo segment at all is not GitHub-shaped.

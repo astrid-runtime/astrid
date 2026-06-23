@@ -300,6 +300,16 @@ async fn resolve_github_source(
     };
     let (name, download_url) = &candidates[idx];
 
+    // Enforce (not just document) the SSRF containment: the asset URL comes
+    // from GitHub's release JSON and is expected to be `https://github.com/…`.
+    // Pin scheme+host before issuing the request so a surprising
+    // `browser_download_url` can't turn into an arbitrary outbound fetch.
+    if !is_allowed_download_url(download_url) {
+        return Err(internal(format!(
+            "refusing capsule download from non-GitHub URL: {download_url}"
+        )));
+    }
+
     // Stream the asset into memory with a hard size cap, then stage it to
     // disk for the kernel to install by path.
     let mut dl = client
@@ -460,6 +470,17 @@ fn github_http_error(status: reqwest::StatusCode, context: &str) -> GatewayError
     }
 }
 
+/// SSRF containment for the asset download: a GitHub release
+/// `browser_download_url` is always `https://github.com/…` (the redirect to
+/// the CDN is GitHub's own and followed by the client). Pin scheme+host so a
+/// surprising release-JSON value can't become an arbitrary outbound fetch —
+/// defence in depth on top of only ever resolving GitHub-shaped sources.
+fn is_allowed_download_url(url: &str) -> bool {
+    reqwest::Url::parse(url)
+        .ok()
+        .is_some_and(|u| u.scheme() == "https" && u.host_str() == Some("github.com"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -481,6 +502,30 @@ mod tests {
             github_http_error(reqwest::StatusCode::INTERNAL_SERVER_ERROR, "x"),
             GatewayError::Internal(_)
         ));
+    }
+
+    /// Only `https://github.com/…` asset URLs are fetched; any other
+    /// scheme/host is refused before a request goes out (SSRF containment).
+    #[test]
+    fn is_allowed_download_url_pins_github_https() {
+        assert!(is_allowed_download_url(
+            "https://github.com/org/repo/releases/download/v1/cli.capsule"
+        ));
+        // Wrong scheme, wrong host, the CDN redirect target, and a
+        // look-alike host are all refused.
+        assert!(!is_allowed_download_url(
+            "http://github.com/org/repo/releases/download/v1/cli.capsule"
+        ));
+        assert!(!is_allowed_download_url(
+            "https://evil.example.com/x.capsule"
+        ));
+        assert!(!is_allowed_download_url(
+            "https://objects.githubusercontent.com/x.capsule"
+        ));
+        assert!(!is_allowed_download_url(
+            "https://github.com.evil.example/x.capsule"
+        ));
+        assert!(!is_allowed_download_url("not a url"));
     }
 
     /// The staged archive lands on disk inside the guard's temp dir, with
