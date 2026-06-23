@@ -129,6 +129,39 @@ async fn me_route_refuses_request_without_bearer() {
 }
 
 #[tokio::test]
+async fn device_routes_require_a_bearer() {
+    // The paired-device management routes (list + revoke) are
+    // capability-gated admin operations and MUST sit behind the auth
+    // middleware. A regression that moved them to the public router would
+    // expose — and let anyone revoke — a principal's device fleet without a
+    // bearer. Assert both reject an unauthenticated request at the middleware,
+    // before any handler or kernel round-trip runs.
+    let state = fresh_state_with_distro(None);
+    let router = routes::build(state);
+
+    let list = Request::builder()
+        .uri("/api/sys/principals/alice/devices")
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(
+        router.clone().oneshot(list).await.unwrap().status(),
+        StatusCode::UNAUTHORIZED,
+        "GET /devices must require a bearer"
+    );
+
+    let revoke = Request::builder()
+        .method("DELETE")
+        .uri("/api/sys/principals/alice/devices/deadbeefdeadbeef")
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(
+        router.oneshot(revoke).await.unwrap().status(),
+        StatusCode::UNAUTHORIZED,
+        "DELETE /devices/{{key_id}} must require a bearer"
+    );
+}
+
+#[tokio::test]
 async fn me_route_refuses_tampered_bearer() {
     let state = fresh_state_with_distro(None);
     let router = routes::build(Arc::clone(&state));
@@ -406,6 +439,8 @@ fn openapi_lists_every_router_route() {
         "/api/sys/principals/{id}/caps",
         "/api/sys/principals/{id}/quotas",
         "/api/sys/principals/{id}/usage",
+        "/api/sys/principals/{id}/devices",
+        "/api/sys/principals/{id}/devices/{key_id}",
         "/api/sys/groups",
         "/api/sys/groups/{name}",
         "/api/sys/invites",
