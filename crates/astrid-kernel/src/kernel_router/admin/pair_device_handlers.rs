@@ -98,10 +98,20 @@ pub(crate) async fn pair_device_issue(
 
     match &requested_scope {
         // FULL-MINT GATE: minting an unattenuated device is the broadest grant
-        // possible, so it requires the issuer to hold `self:auth:pair:admin`
-        // under their *attenuated* effective set. A scoped issuer whose own
-        // scope denies that cap cannot mint a Full child.
+        // possible. It requires BOTH:
+        //  1. that the ISSUER is itself unattenuated. A device under its own
+        //     scope cannot grant "no restrictions" to a child — a Full child
+        //     applies no attenuation, so it would escape the issuer's own
+        //     denies (deny-inheritance below only narrows *Scoped* children,
+        //     not Full ones). A scoped issuer must mint a Scoped child instead.
+        //  2. that the issuer holds `self:auth:pair:admin` under their
+        //     attenuated effective set.
         DeviceScope::Full => {
+            if matches!(&issuer_scope, Some(DeviceScope::Scoped { .. })) {
+                return err_unauthorized(format!(
+                    "a scoped device cannot mint a full-scope (unattenuated) device; issue a scoped device instead — {caller}"
+                ));
+            }
             if !issuer_check.has("self:auth:pair:admin") {
                 return err_unauthorized(format!(
                     "minting a full-scope device requires self:auth:pair:admin, which {caller} does not effectively hold"

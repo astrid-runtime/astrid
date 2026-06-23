@@ -104,13 +104,16 @@ async fn full_device_can_issue_full_token() {
 // ── Criterion 7: full-mint gate — a Scoped-only issuer is denied Full ─
 
 #[tokio::test(flavor = "multi_thread")]
-async fn scoped_issuer_denied_full_mint() {
+async fn scoped_device_cannot_mint_full_even_when_admin_cap_admitted() {
+    // No-escalation: a device authenticating under its OWN scope cannot mint a
+    // Full (unattenuated) child — even a degenerate `allow self:*, deny []`
+    // scope that admits every cap. A Full child applies NO attenuation, so it
+    // would escape the issuer's denies (deny-inheritance only narrows scoped
+    // children). Minting "no restrictions" requires the issuer to itself be
+    // unattenuated; a scoped device must mint a scoped child instead.
     let (_dir, kernel) = fixture().await;
     let caller = pid("scoped_issuer");
-    // Holds the issue cap but its OWN device scope denies the admin cap. The
-    // issuer authenticates with that scoped device (key_id threaded in), so the
-    // full-mint gate evaluates against the attenuated effective set.
-    let dev = scoped_device('a', &["self:*"], &["self:auth:pair:admin"]);
+    let dev = scoped_device('a', &["self:*"], &[]); // effectively allow-all
     let dev_id = dev.key_id.clone();
     seed(&kernel, &caller, &["self:*"], vec![dev]);
 
@@ -119,21 +122,52 @@ async fn scoped_issuer_denied_full_mint() {
             .await;
     match resp {
         AdminResponseBody::Error(msg) => assert!(
+            msg.contains("scoped device cannot mint a full-scope"),
+            "a scoped device must be denied a Full mint on scoped-ness grounds: {msg}"
+        ),
+        other => panic!("scoped issuer must be denied a Full mint, got: {other:?}"),
+    }
+
+    // It CAN, however, mint a scoped child (the deny-inheritance path).
+    let ok = issue(PairScopeArg::Explicit {
+        allow: vec!["self:*".into()],
+        deny: vec![],
+    });
+    let resp = handlers::dispatch_with_device(&kernel, &caller, Some(&dev_id), ok).await;
+    assert!(
+        matches!(resp, AdminResponseBody::PairToken(_)),
+        "a scoped device must still be able to mint a scoped child: {resp:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn non_admin_principal_denied_full_mint() {
+    // The admin-cap gate, reachable only for an UNATTENUATED issuer (no device
+    // scope / Full device): a principal that holds the issue cap `self:auth:pair`
+    // but NOT `self:auth:pair:admin` cannot mint a Full token — it may only mint
+    // scoped ones.
+    let (_dir, kernel) = fixture().await;
+    let caller = pid("issue_only");
+    seed(&kernel, &caller, &["self:auth:pair"], vec![]);
+
+    let resp =
+        handlers::dispatch_with_device(&kernel, &caller, None, issue(PairScopeArg::Full)).await;
+    match resp {
+        AdminResponseBody::Error(msg) => assert!(
             msg.contains("self:auth:pair:admin"),
             "full-mint denial must name the admin cap: {msg}"
         ),
-        other => panic!("scoped issuer must be denied a Full mint, got: {other:?}"),
+        other => panic!("a non-admin principal must be denied a Full mint, got: {other:?}"),
     }
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn full_authority_issuer_can_mint_full_via_admin_cap() {
-    // The common admin/agent case is unchanged: a principal whose effective
-    // set holds the admin cap mints Full fine even when authenticating with a
-    // scoped device that ADMITS the admin cap.
+async fn full_scope_device_can_mint_full() {
+    // The common case is unchanged: a `full`-preset device (DeviceScope::Full,
+    // NOT Scoped) whose principal holds the admin cap mints Full fine.
     let (_dir, kernel) = fixture().await;
-    let caller = pid("admin_scoped");
-    let dev = scoped_device('a', &["self:*"], &[]); // admits self:auth:pair:admin
+    let caller = pid("full_device_issuer");
+    let dev = full_device('a');
     let dev_id = dev.key_id.clone();
     seed(&kernel, &caller, &["self:*"], vec![dev]);
 
@@ -142,7 +176,7 @@ async fn full_authority_issuer_can_mint_full_via_admin_cap() {
             .await;
     assert!(
         matches!(resp, AdminResponseBody::PairToken(_)),
-        "a device that admits the admin cap can mint Full: {resp:?}"
+        "a full-scope device can mint Full: {resp:?}"
     );
 }
 
