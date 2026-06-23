@@ -81,6 +81,17 @@ pub fn enforce_restrictions(
         "security.approval_timeout_secs",
     );
 
+    // security.capsule_local_egress: operator-only SSRF-airlock exemption.
+    // A widening control, so a workspace/project layer must not be able to
+    // set or expand it — only the operator's global config can.
+    block_workspace_override(
+        merged,
+        baseline,
+        workspace_layer,
+        &["security", "capsule_local_egress"],
+        "security.capsule_local_egress",
+    );
+
     // workspace.auto_allow_read: cannot expand beyond baseline.
     block_workspace_expansion(
         merged,

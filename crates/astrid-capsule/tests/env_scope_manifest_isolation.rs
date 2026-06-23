@@ -31,6 +31,7 @@ fn env_def_scope_round_trips_when_constructed_in_rust() {
         default: None,
         enum_values: vec![],
         placeholder: None,
+        options_from: None,
         scope: EnvScope::Shared,
     };
     let toml = toml::to_string(&def).expect("EnvDef should serialize");

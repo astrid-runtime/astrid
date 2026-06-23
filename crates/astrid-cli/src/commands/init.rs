@@ -41,6 +41,12 @@ pub(crate) async fn run_init(distro_source: &str) -> anyhow::Result<()> {
     // Fetch and parse the distro manifest.
     let manifest = fetch_and_parse_manifest(distro_source).await?;
 
+    // Enforce the distro's CLI-version floor BEFORE any prompting or install.
+    // The manifest is fetched from the repo `main` tip, so a distro that bumps
+    // its `[distro].astrid-version` would otherwise break onboarding mid-flight
+    // on an older CLI; fail fast with an actionable upgrade message instead.
+    super::distro::validate::enforce_astrid_version(&manifest)?;
+
     // Check lock freshness AFTER parsing manifest (need manifest to compare).
     if let Some(existing_lock) = load_lock(&lock_path)?
         && is_lock_fresh(&existing_lock, &manifest)
@@ -90,6 +96,13 @@ pub(crate) async fn run_init(distro_source: &str) -> anyhow::Result<()> {
 
     // Install each capsule with progress.
     let locked = install_capsules(&selected).await?;
+
+    // Per-provider onboarding: for each selected llm-group capsule, run its
+    // own `[env]` schema prompt so capsule-specific fields (api_key,
+    // base_url) and the dynamic `model` select resolve from the installed
+    // manifest — not just the shared free-text `[variables]`. Shared values
+    // already written above are preserved (the prompt skips set keys).
+    onboard_llm_providers(&home, &selected);
 
     // Write Distro.lock.
     let lock = create_lock_from_parts(schema_version, &distro_id, &distro_version, locked);
@@ -183,6 +196,21 @@ async fn fetch_and_parse_manifest(source: &str) -> anyhow::Result<DistroManifest
     parse_manifest(content)
 }
 
+/// Parse a comma-separated multi-select entry into a deduped, ordered list
+/// of 1-based indices, dropping anything out of `[1, count]` or unparseable.
+///
+/// Order follows the user's entry; duplicates are collapsed to the first
+/// occurrence so selecting `1,1,2` installs each provider once.
+fn parse_provider_selection(input: &str, count: usize) -> Vec<usize> {
+    let mut seen = std::collections::HashSet::new();
+    input
+        .split(',')
+        .filter_map(|s| s.trim().parse::<usize>().ok())
+        .filter(|&n| n >= 1 && n <= count)
+        .filter(|&n| seen.insert(n))
+        .collect()
+}
+
 /// Select which capsules to install. Capsules without a group are always
 /// included. Capsules with a group are presented for multi-select.
 /// Takes ownership of the manifest's capsule list to avoid cloning.
@@ -199,7 +227,11 @@ fn select_capsules(capsules: Vec<DistroCapsule>) -> anyhow::Result<Vec<DistroCap
     }
 
     for (group_name, group_caps) in &groups {
-        eprintln!("Select {group_name} provider(s):");
+        if group_name == "llm" {
+            eprintln!("Which LLM provider(s) do you want to set up?");
+        } else {
+            eprintln!("Select {group_name} provider(s):");
+        }
         for (i, cap) in group_caps.iter().enumerate() {
             eprintln!("  [{}] {}", i.saturating_add(1), cap.name);
         }
@@ -210,11 +242,7 @@ fn select_capsules(capsules: Vec<DistroCapsule>) -> anyhow::Result<Vec<DistroCap
         let mut input = String::new();
         std::io::stdin().read_line(&mut input)?;
 
-        let choices: Vec<usize> = input
-            .split(',')
-            .filter_map(|s| s.trim().parse::<usize>().ok())
-            .filter(|&n| n >= 1 && n <= group_caps.len())
-            .collect();
+        let choices = parse_provider_selection(&input, group_caps.len());
 
         if choices.is_empty() {
             eprintln!("  No selection — defaulting to {}", group_caps[0].name);
@@ -437,9 +465,86 @@ fn write_env_files(
     Ok(())
 }
 
+/// Run per-provider env onboarding for selected `group = "llm"` capsules.
+///
+/// Non-llm capsules are configured entirely from the distro's shared
+/// `[variables]` (templated into env files before install). LLM providers,
+/// by contrast, own capsule-specific fields — credentials and a model that
+/// is best chosen from a live list — so each selected llm capsule runs its
+/// own `[env]` schema prompt here, after install (the manifest is on disk).
+///
+/// The prompt skips keys that already hold a non-empty value, so any
+/// `[variables]`-templated shared values survive. Dynamic `model` selects
+/// (declared via `options-from`) resolve their option list live at this
+/// point. A missing manifest or env error for one provider is reported and
+/// skipped — it never aborts the whole install.
+fn onboard_llm_providers(home: &AstridHome, selected: &[DistroCapsule]) {
+    let principal = astrid_core::PrincipalId::default();
+    let env_dir = home.principal_home(&principal).env_dir();
+
+    for cap in selected {
+        if cap.group.as_deref() != Some("llm") {
+            continue;
+        }
+
+        let target_dir = match super::capsule::install::resolve_target_dir(home, &cap.name, false) {
+            Ok(dir) => dir,
+            Err(e) => {
+                eprintln!("  Skipping {} onboarding: {e}", cap.name);
+                continue;
+            },
+        };
+        let manifest_path = target_dir.join("Capsule.toml");
+        let manifest = match astrid_capsule::discovery::load_manifest(&manifest_path) {
+            Ok(m) => m,
+            Err(e) => {
+                eprintln!("  Skipping {} onboarding (no manifest): {e}", cap.name);
+                continue;
+            },
+        };
+
+        if manifest.env.is_empty() {
+            continue;
+        }
+
+        eprintln!();
+        eprintln!("{}", Theme::header(&format!("Configure {}", cap.name)));
+        let env_path = env_dir.join(format!("{}.env.json", cap.name));
+        if let Err(e) = super::capsule::install_prompts::prompt_env_fields(&manifest.env, &env_path)
+        {
+            eprintln!("  Configuration for {} failed: {e}", cap.name);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn provider_selection_parses_multi_select() {
+        assert_eq!(parse_provider_selection("1,2", 3), vec![1, 2]);
+        assert_eq!(parse_provider_selection(" 2 , 3 ", 3), vec![2, 3]);
+        assert_eq!(parse_provider_selection("1", 3), vec![1]);
+    }
+
+    #[test]
+    fn provider_selection_drops_out_of_range_and_garbage() {
+        assert_eq!(parse_provider_selection("0,4,2,abc", 3), vec![2]);
+        assert!(parse_provider_selection("", 3).is_empty());
+        assert!(parse_provider_selection("9,10", 3).is_empty());
+    }
+
+    #[test]
+    fn provider_selection_dedupes_preserving_order() {
+        assert_eq!(parse_provider_selection("2,1,2,1", 3), vec![2, 1]);
+    }
+
+    #[test]
+    fn provider_selection_preserves_entry_order() {
+        // User order is honoured (3 then 1), not numeric-sorted.
+        assert_eq!(parse_provider_selection("3,1", 3), vec![3, 1]);
+    }
 
     #[test]
     fn extract_var_refs_finds_all() {

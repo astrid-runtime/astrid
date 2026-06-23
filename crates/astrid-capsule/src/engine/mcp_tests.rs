@@ -109,6 +109,7 @@ mod tests {
             profile_cache: None,
             overlay_registry: None,
             group_config: None,
+            local_egress: Vec::new(),
         };
 
         let result = engine.load(&ctx).await;
@@ -174,6 +175,7 @@ mod tests {
             profile_cache: None,
             overlay_registry: None,
             group_config: None,
+            local_egress: Vec::new(),
         };
 
         let result = engine.load(&ctx).await;
@@ -236,6 +238,7 @@ mod tests {
             profile_cache: None,
             overlay_registry: None,
             group_config: None,
+            local_egress: Vec::new(),
         };
 
         let result = engine.load(&ctx).await;

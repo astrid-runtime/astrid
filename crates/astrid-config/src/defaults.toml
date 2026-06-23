@@ -79,6 +79,20 @@ require_signatures = false
 # this time, the action is denied.
 approval_timeout_secs = 300
 
+# Per-capsule local-egress allowlist: operator-approved exemptions from the
+# astrid:http SSRF airlock, keyed by capsule id. Each value is a list of
+# "host:port" (or "host:*") endpoints that capsule may reach even though they
+# resolve to a loopback/private/link-local address — the sanctioned way to let
+# a specific capsule talk to a local LLM (LM Studio, Ollama, llama.cpp, ...).
+#
+# Operator config ONLY: a capsule's own Capsule.toml cannot set this, and a
+# project/workspace config layer cannot widen it. It only exempts endpoints
+# from the airlock; it does not grant access a capsule's manifest `net`
+# allowlist doesn't already declare. Default: empty (no exemptions).
+#
+# [security.capsule_local_egress]
+# "astrid-capsule-openai-compat" = ["127.0.0.1:1234", "192.168.1.50:11434"]
+
 # ============================================================================
 # Budget Configuration
 # ============================================================================

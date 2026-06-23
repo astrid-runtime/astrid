@@ -33,6 +33,7 @@ pub(crate) mod setup;
 pub(crate) mod stub;
 pub(crate) mod top;
 pub(crate) mod trust;
+pub(crate) mod verb_suggest;
 pub(crate) mod version;
 pub(crate) mod voucher;
 pub(crate) mod who;

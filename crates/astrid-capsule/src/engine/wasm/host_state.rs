@@ -355,6 +355,16 @@ pub struct HostState {
     /// model is principal-scoped, a separate axis), so a snapshot taken once
     /// is correct for the capsule's whole lifetime and across the pool.
     pub capability_names: Vec<String>,
+    /// Operator-approved local-egress allowlist for THIS capsule, as
+    /// `host:port` / `host:*` patterns (from `[security.capsule_local_egress]`,
+    /// keyed by capsule id). Endpoints listed here are exempt from the
+    /// `astrid:http` SSRF airlock for this capsule only — the sanctioned way
+    /// to reach a loopback/private LLM endpoint. Like
+    /// [`capability_names`](Self::capability_names) this is fixed at load and
+    /// snapshotted onto every pooled instance (operator config does not change
+    /// per principal or per invocation); the pool reset must NOT clear it.
+    /// Empty = no exemptions (fail-closed).
+    pub local_egress: Vec<String>,
     /// Whether this capsule's OWNER principal holds `audit:read_all`,
     /// resolved at LOAD the PRIVILEGED way (against the profile cache +
     /// live group config — **not** the manifest, unlike

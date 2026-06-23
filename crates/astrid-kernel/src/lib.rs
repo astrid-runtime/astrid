@@ -139,6 +139,13 @@ pub struct Kernel {
     /// `Copy` value — no resolution logic lives here. See
     /// [`CapsuleRuntimeLimits`](astrid_capsule::CapsuleRuntimeLimits).
     runtime_limits: astrid_capsule::CapsuleRuntimeLimits,
+    /// Operator-approved per-capsule local-egress allowlist
+    /// (`[security.capsule_local_egress]`), keyed by capsule id. Resolved
+    /// once from config by the daemon; the kernel only stores it and hands
+    /// each capsule its own slice at load time so the SSRF airlock can
+    /// exempt operator-sanctioned loopback/private endpoints. Empty = no
+    /// exemptions (fail-closed).
+    local_egress: std::collections::HashMap<String, Vec<String>>,
     /// Ephemeral mode: shut down immediately when the last client disconnects.
     pub ephemeral: AtomicBool,
     /// Instant when the kernel was booted (for uptime calculation).
@@ -221,6 +228,7 @@ impl Kernel {
         session_id: SessionId,
         workspace_root: PathBuf,
         runtime_limits: astrid_capsule::CapsuleRuntimeLimits,
+        local_egress: std::collections::HashMap<String, Vec<String>>,
     ) -> Result<Arc<Self>, std::io::Error> {
         use astrid_core::dirs::AstridHome;
 
@@ -375,6 +383,7 @@ impl Kernel {
             fuel_rate: astrid_capsule::FuelRateLimiter::default(),
             memory_ledger: astrid_capsule::MemoryLedger::default(),
             runtime_limits,
+            local_egress,
             ephemeral: AtomicBool::new(false),
             boot_time: std::time::Instant::now(),
             shutdown_tx: tokio::sync::watch::channel(false).0,
@@ -511,7 +520,11 @@ impl Kernel {
         // Snapshot the live group config so the capsule load path can resolve
         // the run-loop resource-exemption capability (CAP_RESOURCES_UNBOUNDED)
         // against the owner principal's groups/grants/revokes.
-        .with_group_config(self.groups.load_full());
+        .with_group_config(self.groups.load_full())
+        // Hand this capsule its operator-approved local-egress allowlist (if
+        // any) so the SSRF airlock can exempt sanctioned loopback/private
+        // endpoints for it. Absent entry = empty = no exemptions.
+        .with_local_egress(self.local_egress.get(&capsule_name).cloned().unwrap_or_default());
 
         capsule.load(&ctx).await?;
 
@@ -1353,6 +1366,7 @@ pub(crate) async fn test_kernel_with_home(home: astrid_core::dirs::AstridHome) -
         fuel_rate: astrid_capsule::FuelRateLimiter::default(),
         memory_ledger: astrid_capsule::MemoryLedger::default(),
         runtime_limits: astrid_capsule::CapsuleRuntimeLimits::default(),
+        local_egress: std::collections::HashMap::new(),
         ephemeral: AtomicBool::new(false),
         boot_time: std::time::Instant::now(),
         shutdown_tx: tokio::sync::watch::channel(false).0,

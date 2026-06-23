@@ -145,7 +145,15 @@ pub async fn run() -> Result<()> {
         std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."))
     });
 
-    let kernel = astrid_kernel::Kernel::new(session_id.clone(), ws, runtime_limits)
+    // Operator-approved per-capsule local-egress allowlist (SSRF-airlock
+    // exemptions). Operator config only — the kernel hands each capsule its
+    // own slice at load time. Absent config = empty = no exemptions.
+    let local_egress = unified_cfg
+        .as_ref()
+        .map(|c| c.security.capsule_local_egress.clone())
+        .unwrap_or_default();
+
+    let kernel = astrid_kernel::Kernel::new(session_id.clone(), ws, runtime_limits, local_egress)
         .await
         .map_err(|e| anyhow::anyhow!("Failed to boot Kernel: {e}"))?;
 
