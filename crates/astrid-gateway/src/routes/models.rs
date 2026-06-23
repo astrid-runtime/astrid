@@ -19,8 +19,9 @@
 //! KV; the kernel scopes it by the invocation principal. The gateway
 //! preserves that end-to-end:
 //!
-//! 1. The principal is the **verified** [`CallerContext::principal`] from
-//!    the signed bearer — never a body/query field.
+//! 1. The principal is the **verified**
+//!    [`CallerContext::principal`](crate::auth::CallerContext::principal)
+//!    from the signed bearer — never a body/query field.
 //! 2. The request IPC is **stamped** with that principal
 //!    ([`IpcMessage::with_principal`]), which routes it into the caller's
 //!    registry KV scope and is the value the reply is matched against.
@@ -45,7 +46,8 @@ use serde_json::json;
 use utoipa::ToSchema;
 use uuid::Uuid;
 
-use crate::auth::CallerContext;
+use astrid_core::PrincipalId;
+
 use crate::error::{ErrorBody, GatewayError, GatewayResult};
 use crate::routes::principals::caller_from;
 use crate::state::GatewayState;
@@ -109,6 +111,41 @@ fn reply_satisfies_corr_id(reply: &serde_json::Value, expected: Option<&str>) ->
     }
 }
 
+/// Outcome of classifying a `set_active_model` registry reply.
+///
+/// Pure core of the SET response mapping, lifted out of the async handler so
+/// the shape decision — including the explicit-`null` edge — is unit-testable
+/// without a live bus.
+enum SetActiveOutcome {
+    /// Registry persisted an entry; the inner value is the canonical
+    /// provider-entry to return as a 200 body.
+    Bound(serde_json::Value),
+    /// Registry rejected the id; the string is its verbatim message (→ 400).
+    Rejected(String),
+    /// Reply carried neither a non-null `active_model` nor an `error` — a
+    /// shape the registry contract says cannot happen (→ 500).
+    Malformed,
+}
+
+/// Classify a `set_active_model` registry reply into the response the handler
+/// returns.
+///
+/// An `error` string maps to [`SetActiveOutcome::Rejected`]. A **non-null**
+/// `active_model` maps to [`SetActiveOutcome::Bound`]. An explicit JSON `null`
+/// for `active_model` is treated as ABSENT — a successful bind always carries
+/// the canonical entry, so a `null` is a malformed reply, not a `200 null`.
+/// This mirrors typed deserialization where `active_model: null` → `None`.
+/// Anything else is [`SetActiveOutcome::Malformed`].
+fn classify_set_active_reply(reply: &serde_json::Value) -> SetActiveOutcome {
+    if let Some(error) = reply.get("error").and_then(serde_json::Value::as_str) {
+        return SetActiveOutcome::Rejected(error.to_string());
+    }
+    if let Some(active) = reply.get("active_model").filter(|v| !v.is_null()) {
+        return SetActiveOutcome::Bound(active.clone());
+    }
+    SetActiveOutcome::Malformed
+}
+
 /// Publish `request_topic` (stamped with the caller's principal) and await
 /// the matching reply on `response_topic`, scoped to the caller so no other
 /// principal's registry reply can be observed. Mirrors the subscribe-first
@@ -123,7 +160,7 @@ fn reply_satisfies_corr_id(reply: &serde_json::Value, expected: Option<&str>) ->
 /// first reply on the scoped route is taken unconditionally.
 async fn registry_round_trip(
     state: &GatewayState,
-    caller: &CallerContext,
+    principal_id: &PrincipalId,
     request_topic: &'static str,
     response_topic: &'static str,
     payload: serde_json::Value,
@@ -135,7 +172,7 @@ async fn registry_round_trip(
         )));
     };
 
-    let principal = caller.principal.to_string();
+    let principal = principal_id.to_string();
 
     // Subscribe FIRST, then publish. Reverse order would race a fast
     // registry reply — the reply could land before subscribe returns and
@@ -232,7 +269,7 @@ pub async fn list_models(
     let caller = caller_from(&req)?;
     let reply = registry_round_trip(
         &state,
-        caller,
+        &caller.principal,
         GET_PROVIDERS_REQUEST,
         GET_PROVIDERS_RESPONSE,
         json!({}),
@@ -262,7 +299,7 @@ pub async fn get_active_model(
     let caller = caller_from(&req)?;
     let reply = registry_round_trip(
         &state,
-        caller,
+        &caller.principal,
         GET_ACTIVE_REQUEST,
         GET_ACTIVE_RESPONSE,
         json!({}),
@@ -291,7 +328,11 @@ pub async fn set_active_model(
     State(state): State<Arc<GatewayState>>,
     req: Request<axum::body::Body>,
 ) -> GatewayResult<Json<serde_json::Value>> {
-    let caller = caller_from(&req)?.clone();
+    // Clone only the principal id, not the whole `CallerContext`: the
+    // round-trip needs nothing else, and `read_json_body` below consumes
+    // `req` (which `caller_from` borrows), so the value we carry past it must
+    // be owned.
+    let principal = caller_from(&req)?.principal.clone();
     let body: SetActiveModelRequest = crate::routes::principals::read_json_body(req).await?;
 
     // Reject an empty / whitespace id BEFORE contacting the bus — no point
@@ -312,7 +353,7 @@ pub async fn set_active_model(
 
     let reply = registry_round_trip(
         &state,
-        &caller,
+        &principal,
         SET_ACTIVE_REQUEST,
         SET_ACTIVE_RESPONSE,
         // The registry reads `model_id` (also accepted under `data`); the
@@ -327,25 +368,67 @@ pub async fn set_active_model(
     // persisted entry so the caller sees the canonical id the registry
     // bound. Error: `{ "error": "<msg>" }` → 400 with the registry's
     // message surfaced verbatim (the gateway does not reinterpret
-    // resolution / ambiguity errors).
-    if let Some(error) = reply.get("error").and_then(serde_json::Value::as_str) {
-        return Err(GatewayError::BadRequest(error.to_string()));
+    // resolution / ambiguity errors). An explicit `null` active_model is a
+    // malformed reply, not a success — see `classify_set_active_reply`.
+    match classify_set_active_reply(&reply) {
+        SetActiveOutcome::Bound(active) => Ok(Json(active)),
+        SetActiveOutcome::Rejected(message) => Err(GatewayError::BadRequest(message)),
+        SetActiveOutcome::Malformed => Err(GatewayError::Internal(anyhow::anyhow!(
+            "registry set_active_model reply missing both 'active_model' and 'error'"
+        ))),
     }
-    if let Some(active) = reply.get("active_model") {
-        return Ok(Json(active.clone()));
-    }
-    // Neither `error` nor `active_model` — a malformed reply shape the
-    // registry contract says cannot happen; surface as 500 rather than
-    // pretend success.
-    Err(GatewayError::Internal(anyhow::anyhow!(
-        "registry set_active_model reply missing both 'active_model' and 'error'"
-    )))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::reply_satisfies_corr_id;
+    use super::{SetActiveOutcome, classify_set_active_reply, reply_satisfies_corr_id};
     use serde_json::json;
+
+    #[test]
+    fn set_reply_with_entry_binds() {
+        // A non-null `active_model` is a successful bind: the canonical entry
+        // is returned verbatim as the 200 body.
+        let entry = json!({ "id": "openai:gpt-4o" });
+        match classify_set_active_reply(&json!({ "status": "ok", "active_model": entry })) {
+            SetActiveOutcome::Bound(active) => {
+                assert_eq!(active, json!({ "id": "openai:gpt-4o" }));
+            },
+            _ => panic!("a non-null active_model must classify as Bound"),
+        }
+    }
+
+    #[test]
+    fn set_reply_with_explicit_null_active_model_is_malformed() {
+        // Regression: an explicit JSON `null` for `active_model` must NOT be
+        // surfaced as a `200 null` success. A genuine bind always carries the
+        // canonical entry, so a null is a malformed reply (→ 500), matching
+        // the typed view where `active_model: null` deserializes to `None`.
+        assert!(
+            matches!(
+                classify_set_active_reply(&json!({ "status": "ok", "active_model": null })),
+                SetActiveOutcome::Malformed
+            ),
+            "explicit null active_model must classify as Malformed, not Bound(null)"
+        );
+    }
+
+    #[test]
+    fn set_reply_with_error_is_rejected() {
+        // An `error` string maps to a 400 with the registry message verbatim.
+        match classify_set_active_reply(&json!({ "error": "unknown model 'foo'" })) {
+            SetActiveOutcome::Rejected(msg) => assert_eq!(msg, "unknown model 'foo'"),
+            _ => panic!("an error string must classify as Rejected"),
+        }
+    }
+
+    #[test]
+    fn set_reply_missing_both_fields_is_malformed() {
+        // Neither `error` nor `active_model` → malformed (→ 500).
+        assert!(matches!(
+            classify_set_active_reply(&json!({ "status": "ok" })),
+            SetActiveOutcome::Malformed
+        ));
+    }
 
     #[test]
     fn uncorrelated_get_accepts_any_reply() {
