@@ -50,6 +50,35 @@ fn map_to_onboarding_field(req: &ElicitRequest) -> Result<OnboardingField, Error
     })
 }
 
+/// The acting principal carried on an `AstridEvent::Ipc`, if any.
+///
+/// Used by the elicit wait loop (see [`elicit::Host::elicit`]) to authorize a
+/// candidate reply against the originating principal before it is allowed to
+/// unblock the waiter. Returns `None` for a non-IPC event or a system message
+/// with no principal stamped.
+fn event_principal(event: &AstridEvent) -> Option<&str> {
+    match event {
+        AstridEvent::Ipc { message, .. } => message.principal.as_deref(),
+        _ => None,
+    }
+}
+
+/// Whether an elicit-response `event` may answer an elicit originating from
+/// `expected` principal.
+///
+/// The check is exact-equality on the principal string and is the security
+/// boundary that stops a cross-principal elicit hijack: request_ids are
+/// forwarded verbatim to every client, so a reply must additionally prove it
+/// comes from the same principal the elicit is being collected for. A reply
+/// with no principal (`None`) never matches — fail-closed.
+///
+/// Used inside the wait loop of [`elicit::Host::elicit`]; extracted as a pure
+/// function so the responder-principal enforcement is unit-testable without a
+/// live bus and blocking runtime.
+fn response_principal_matches(expected: &str, event: &AstridEvent) -> bool {
+    event_principal(event) == Some(expected)
+}
+
 impl elicit::Host for HostState {
     /// Host function: `elicit(request) -> ElicitResponse`
     ///
@@ -68,6 +97,15 @@ impl elicit::Host for HostState {
         let request_id = Uuid::new_v4();
         let response_topic = format!("astrid.v1.elicit.response.{request_id}");
 
+        // The principal this elicit is being collected on behalf of. The
+        // matching reply must be attributed to the SAME principal — a request_id
+        // is forwarded verbatim to every SSE/uplink client, so without this
+        // check any authenticated caller who learns an in-flight request_id
+        // could answer or cancel another principal's elicit. The kernel
+        // enforces (kernel-is-dumb); the answering uplink only stamps the
+        // verified principal it already proved.
+        let originating_principal = self.principal.to_string();
+
         // Subscribe to the response topic BEFORE publishing the request
         // to prevent a race where the response arrives before we're listening.
         let mut receiver = self.event_bus.subscribe_topic(&response_topic);
@@ -79,7 +117,9 @@ impl elicit::Host for HostState {
         let cancel_token = self.cancel_token.clone();
         let blocking_semaphore = self.blocking_semaphore.clone();
 
-        // Publish the elicit request to the event bus
+        // Publish the elicit request to the event bus, stamped with the
+        // originating principal so request and reply principals are symmetric
+        // (and the request is attributable in the audit trail).
         let request_payload = IpcPayload::ElicitRequest {
             request_id,
             capsule_id: capsule_id.clone(),
@@ -89,7 +129,8 @@ impl elicit::Host for HostState {
             "astrid.v1.elicit",
             request_payload,
             Uuid::nil(), // Kernel-originated
-        );
+        )
+        .with_principal(originating_principal.clone());
         event_bus.publish(AstridEvent::Ipc {
             message,
             metadata: astrid_events::EventMetadata::default(),
@@ -100,35 +141,68 @@ impl elicit::Host for HostState {
             key = %request.key,
             ?request.kind,
             %request_id,
+            principal = %originating_principal,
             "Published elicit request, waiting for response"
         );
 
-        // Block the WASM thread until a response arrives, timeout expires, or
-        // the capsule is unloaded (cancellation). Routed through the host
-        // semaphore to bound concurrent blocking operations across all capsules.
+        // Block the WASM thread until a MATCHING response arrives, the overall
+        // timeout expires, or the capsule is unloaded (cancellation). Routed
+        // through the host semaphore to bound concurrent blocking operations
+        // across all capsules — a single permit covers the whole wait.
         //
         // Note: the helper uses a biased select that strictly prioritises
         // cancellation over completion. If a response arrives in the same poll
         // tick as cancellation, the response is discarded. This is acceptable
         // during teardown and prevents delayed shutdown under high throughput.
+        //
+        // Inside the permit we run a deadline loop: a spurious or cross-principal
+        // response must NOT unblock the legitimate waiter, nor reset its budget.
+        // We keep an overall deadline of `MAX_ELICIT_TIMEOUT_MS` from the start
+        // and only count down — each `recv` gets the *remaining* time, so a flood
+        // of mismatched replies cannot extend the wait and DoS the real answer.
+        let request_id_for_wait = request_id;
+        let expected_principal = originating_principal.clone();
         let event = util::bounded_block_on_cancellable(
             &runtime_handle,
             &blocking_semaphore,
             &cancel_token,
-            async {
-                tokio::time::timeout(
-                    std::time::Duration::from_millis(MAX_ELICIT_TIMEOUT_MS),
-                    receiver.recv(),
-                )
-                .await
-                .ok()
-                .flatten()
+            async move {
+                let deadline = tokio::time::Instant::now()
+                    + std::time::Duration::from_millis(MAX_ELICIT_TIMEOUT_MS);
+                loop {
+                    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                    if remaining.is_zero() {
+                        return None;
+                    }
+                    let Ok(Some(event)) = tokio::time::timeout(remaining, receiver.recv()).await
+                    else {
+                        // Inner timeout (deadline hit) or closed channel.
+                        return None;
+                    };
+                    if response_principal_matches(&expected_principal, &event) {
+                        return Some(event);
+                    }
+                    // A response landed on our reply topic carrying a different
+                    // principal than the one this elicit is being collected for.
+                    // Reject it (audit) and keep waiting on the remaining budget
+                    // rather than letting an unauthorized caller unblock or
+                    // cancel another principal's elicit.
+                    let got = event_principal(&event);
+                    tracing::warn!(
+                        capsule = %capsule_id,
+                        %request_id_for_wait,
+                        expected_principal = %expected_principal,
+                        got_principal = got.unwrap_or("<none>"),
+                        "Rejected cross-principal elicit response; continuing to wait"
+                    );
+                }
             },
         )
         .flatten();
 
         // Extract the response, mapping the inner IPC reply into the typed
-        // `ElicitResponse` variant required by the WIT contract.
+        // `ElicitResponse` variant required by the WIT contract. The principal
+        // match was already enforced in the wait loop above.
         let response = match event {
             Some(event) => {
                 let AstridEvent::Ipc { message, .. } = &*event else {
@@ -290,6 +364,185 @@ mod tests {
         let field = map_to_onboarding_field(&req).unwrap();
         assert_eq!(field.prompt, "my_setting");
         assert!(field.description.is_none());
+    }
+
+    /// Build an `AstridEvent::Ipc` carrying an `ElicitResponse` stamped (or not)
+    /// with `principal`. Mirrors what a real answerer (`POST
+    /// /api/agent/elicit-response`, the CLI, the TUI) publishes.
+    fn elicit_response_event(
+        request_id: Uuid,
+        principal: Option<&str>,
+        value: Option<String>,
+    ) -> AstridEvent {
+        let topic = format!("astrid.v1.elicit.response.{request_id}");
+        let mut msg = IpcMessage::new(
+            topic,
+            IpcPayload::ElicitResponse {
+                request_id,
+                value,
+                values: None,
+            },
+            Uuid::nil(),
+        );
+        if let Some(p) = principal {
+            msg = msg.with_principal(p);
+        }
+        AstridEvent::Ipc {
+            message: msg,
+            metadata: astrid_events::EventMetadata::default(),
+        }
+    }
+
+    /// SECURITY REGRESSION: the responder-principal check that backs the elicit
+    /// wait loop must reject a reply whose principal differs from the one the
+    /// elicit is being collected for, and must accept one that matches.
+    ///
+    /// This guards the actual `elicit()` wait loop (see
+    /// [`response_principal_matches`]'s call site there): request_ids are
+    /// forwarded verbatim to every client, so without this check any
+    /// authenticated caller who learns an in-flight request_id could
+    /// answer/cancel another principal's elicit. The test MUST fail if the
+    /// principal check is removed (i.e. if the loop unblocked on any reply).
+    #[test]
+    fn response_principal_match_enforced() {
+        let request_id = Uuid::new_v4();
+
+        // Matching principal → may answer.
+        let same = elicit_response_event(request_id, Some("agent-alice"), Some("v".into()));
+        assert!(response_principal_matches("agent-alice", &same));
+
+        // Different principal → rejected (the cross-principal hijack case).
+        let other = elicit_response_event(request_id, Some("agent-bob"), Some("v".into()));
+        assert!(!response_principal_matches("agent-alice", &other));
+
+        // No principal stamped → fail-closed, never matches.
+        let none = elicit_response_event(request_id, None, Some("v".into()));
+        assert!(!response_principal_matches("agent-alice", &none));
+    }
+
+    /// A non-IPC event carries no principal — `event_principal` returns `None`
+    /// and it can never satisfy the responder-principal check.
+    #[test]
+    fn non_ipc_event_has_no_principal() {
+        let ev = AstridEvent::Custom {
+            metadata: astrid_events::EventMetadata::default(),
+            name: "noise".to_string(),
+            data: serde_json::json!({}),
+        };
+        assert_eq!(event_principal(&ev), None);
+        assert!(!response_principal_matches("agent-alice", &ev));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Wait-loop integration test: drive the real `elicit()` host fn against a live
+// `EventBus` and prove the responder-principal enforcement end to end — a reply
+// from the WRONG principal does NOT unblock the waiter, while a reply from the
+// MATCHING principal does. The pure-helper test above guards the decision; this
+// one guards the loop that consumes it (the cross-principal reply must be
+// skipped and the wait must continue on its remaining budget).
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod wait_loop_tests {
+    use std::time::Duration;
+
+    use crate::engine::wasm::bindings::astrid::elicit::host::{
+        ElicitRequest, ElicitResponse, ElicitType, Host as ElicitHost,
+    };
+    use crate::engine::wasm::host_state::LifecyclePhase;
+    use crate::engine::wasm::test_fixtures::minimal_host_state;
+    use astrid_events::AstridEvent;
+    use astrid_events::ipc::{IpcMessage, IpcPayload};
+    use uuid::Uuid;
+
+    fn text_request(key: &str) -> ElicitRequest {
+        ElicitRequest {
+            kind: ElicitType::Text,
+            key: key.to_string(),
+            description: "Enter a value".to_string(),
+            options: None,
+            default_value: None,
+        }
+    }
+
+    /// Publish an `ElicitResponse` for `request_id` stamped with `principal`.
+    fn publish_response(
+        bus: &astrid_events::EventBus,
+        request_id: Uuid,
+        principal: &str,
+        value: &str,
+    ) {
+        let topic = format!("astrid.v1.elicit.response.{request_id}");
+        let msg = IpcMessage::new(
+            topic,
+            IpcPayload::ElicitResponse {
+                request_id,
+                value: Some(value.to_string()),
+                values: None,
+            },
+            Uuid::nil(),
+        )
+        .with_principal(principal);
+        bus.publish(AstridEvent::Ipc {
+            message: msg,
+            metadata: astrid_events::EventMetadata::default(),
+        });
+    }
+
+    /// Subscribe to `astrid.v1.elicit`, wait for the request, return its
+    /// `request_id`. The host mints the id internally, so a driver learns it
+    /// the same way every real answerer does — off the published request.
+    async fn await_request_id(mut req_rx: astrid_events::EventReceiver) -> Uuid {
+        loop {
+            let ev = tokio::time::timeout(Duration::from_secs(5), req_rx.recv())
+                .await
+                .expect("elicit request observed")
+                .expect("bus open");
+            if let AstridEvent::Ipc { message, .. } = &*ev
+                && let IpcPayload::ElicitRequest { request_id, .. } = &message.payload
+            {
+                return *request_id;
+            }
+        }
+    }
+
+    /// End-to-end: a cross-principal reply must be ignored; the matching reply
+    /// (published AFTER the bad one) unblocks the waiter with the right value.
+    /// Fails if the principal check is removed — the waiter would unblock on
+    /// the wrong-principal reply and return "intruder".
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cross_principal_reply_does_not_unblock_matching_does() {
+        let rt = tokio::runtime::Handle::current();
+        let mut state = minimal_host_state(rt);
+        state.principal = astrid_core::PrincipalId::new("agent-alice").unwrap();
+        state.lifecycle_phase = Some(LifecyclePhase::Install);
+
+        let bus = state.event_bus.clone();
+        let req_rx = bus.subscribe_topic("astrid.v1.elicit");
+
+        // Drive the blocking host fn on a dedicated thread (it uses
+        // block_in_place). We can't move the non-Send HostState across an
+        // await, so run it inside spawn_blocking and bridge the result back.
+        let elicit_handle =
+            tokio::task::spawn_blocking(move || (state.elicit(text_request("api_url")), state));
+
+        // Learn the request_id, then publish a WRONG-principal reply first.
+        let request_id = await_request_id(req_rx).await;
+        publish_response(&bus, request_id, "agent-bob", "intruder");
+
+        // Give the loop a beat to (correctly) reject the intruder reply, then
+        // send the legitimate one.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        publish_response(&bus, request_id, "agent-alice", "legit");
+
+        let (result, _state) = elicit_handle.await.expect("elicit thread joined");
+        match result {
+            Ok(ElicitResponse::Value(v)) => {
+                assert_eq!(v, "legit", "must return the matching principal's value");
+                assert_ne!(v, "intruder", "cross-principal reply must not win");
+            },
+            other => panic!("expected matching value, got {other:?}"),
+        }
     }
 }
 
