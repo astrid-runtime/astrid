@@ -7,7 +7,7 @@
 
 use std::sync::Arc;
 
-use astrid_core::kernel_api::{DaemonStatus, KernelRequest, KernelResponse};
+use astrid_core::kernel_api::{AgentLoopReadiness, DaemonStatus, KernelRequest, KernelResponse};
 use astrid_uplink::KernelClient;
 use axum::Json;
 use axum::extract::State;
@@ -44,6 +44,37 @@ pub async fn get_status(
         KernelResponse::Error(msg) => Err(GatewayError::Forbidden { reason: msg }),
         other => Err(GatewayError::Internal(anyhow::anyhow!(
             "unexpected response for GetStatus: {other:?}"
+        ))),
+    }
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/sys/readiness",
+    tag = "system",
+    responses(
+        (status = 200, description = "`AgentLoopReadiness` JSON shape: `{ ready: bool, prompt_subscribers: [string], response_publishers: [string], unsatisfied_required_imports: [{ capsule, namespace, interface, requirement }], loaded_capsules: [string] }`. `ready` is false when the installed capsule set can't serve an agent chat turn.", content_type = "application/json"),
+        (status = 401, body = ErrorBody),
+        (status = 403, body = ErrorBody, description = "Caller lacks `capsule:list`."),
+    )
+)]
+pub async fn get_readiness(
+    State(_state): State<Arc<GatewayState>>,
+    req: Request<axum::body::Body>,
+) -> GatewayResult<Json<AgentLoopReadiness>> {
+    let caller = caller_from(&req)?.clone();
+    let mut client = KernelClient::connect(caller.principal)
+        .await
+        .map_err(daemon_internal)?;
+    let resp = client
+        .request(KernelRequest::GetAgentReadiness)
+        .await
+        .map_err(daemon_internal)?;
+    match resp {
+        KernelResponse::AgentReadiness(r) => Ok(Json(r)),
+        KernelResponse::Error(msg) => Err(GatewayError::Forbidden { reason: msg }),
+        other => Err(GatewayError::Internal(anyhow::anyhow!(
+            "unexpected response for GetAgentReadiness: {other:?}"
         ))),
     }
 }

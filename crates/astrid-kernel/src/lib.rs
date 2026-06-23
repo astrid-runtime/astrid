@@ -647,6 +647,12 @@ impl Kernel {
         // Validate imports/exports: every required import must have a matching export.
         validate_imports_exports(&sorted);
 
+        // Warn loudly if the loaded set can't actually serve an agent chat
+        // turn. Without this a fresh daemon (socket uplink only) boots clean
+        // yet silently drops every prompt — name-agnostic introspection turns
+        // that silent failure into a single actionable warning.
+        warn_agent_loop_readiness(&sorted);
+
         // Partition after sorting: uplinks first, then the rest.
         // The relative order within each partition is preserved from the
         // toposort, so dependency edges are still respected. Cross-partition
@@ -2297,6 +2303,13 @@ mod tests {
 /// from another loaded capsule. Logs errors for unsatisfied required imports
 /// and info messages for unsatisfied optional imports. Also warns about
 /// duplicate exports of the same interface from multiple capsules.
+///
+/// The set of unsatisfied *required* imports is sourced from
+/// [`astrid_capsule::readiness::unsatisfied_required_imports`] so this boot
+/// validator and the agent-loop readiness report share a single source of
+/// truth — they can never disagree on whether a required dependency is met.
+/// Optional-import info, the satisfied count, and duplicate-export warnings
+/// stay local since the shared fn only covers required imports.
 fn validate_imports_exports(
     manifests: &[(
         astrid_capsule::manifest::CapsuleManifest,
@@ -2332,31 +2345,49 @@ fn validate_imports_exports(
         }
     }
 
+    // Single source of truth for unsatisfied required imports. Key on
+    // (capsule, namespace, interface) so the per-import loop below can decide
+    // the required-error branch by membership rather than recomputing.
+    let plain: Vec<astrid_capsule::manifest::CapsuleManifest> =
+        manifests.iter().map(|(m, _)| m.clone()).collect();
+    let unsatisfied_required: std::collections::HashSet<(String, String, String)> =
+        astrid_capsule::readiness::unsatisfied_required_imports(&plain)
+            .into_iter()
+            .map(|m| (m.capsule, m.namespace, m.interface))
+            .collect();
+
     let mut satisfied_count: u32 = 0;
     let mut warning_count: u32 = 0;
 
     for (manifest, _) in manifests {
         for (ns, name, req, optional) in manifest.import_tuples() {
-            let has_provider = exports_by_interface
-                .get(&(ns, name))
-                .is_some_and(|providers| providers.iter().any(|(_, v)| req.matches(v)));
-
-            if has_provider {
-                satisfied_count = satisfied_count.saturating_add(1);
-            } else if optional {
-                tracing::info!(
-                    capsule = %manifest.package.name,
-                    import = %format!("{ns}/{name} {req}"),
-                    "Optional import not satisfied — capsule will boot with reduced functionality"
-                );
-                warning_count = warning_count.saturating_add(1);
-            } else {
+            if optional {
+                let has_provider = exports_by_interface
+                    .get(&(ns, name))
+                    .is_some_and(|providers| providers.iter().any(|(_, v)| req.matches(v)));
+                if has_provider {
+                    satisfied_count = satisfied_count.saturating_add(1);
+                } else {
+                    tracing::info!(
+                        capsule = %manifest.package.name,
+                        import = %format!("{ns}/{name} {req}"),
+                        "Optional import not satisfied — capsule will boot with reduced functionality"
+                    );
+                    warning_count = warning_count.saturating_add(1);
+                }
+            } else if unsatisfied_required.contains(&(
+                manifest.package.name.clone(),
+                ns.to_string(),
+                name.to_string(),
+            )) {
                 tracing::error!(
                     capsule = %manifest.package.name,
                     import = %format!("{ns}/{name} {req}"),
                     "Required import not satisfied — no loaded capsule exports this interface"
                 );
                 warning_count = warning_count.saturating_add(1);
+            } else {
+                satisfied_count = satisfied_count.saturating_add(1);
             }
         }
     }
@@ -2366,6 +2397,60 @@ fn validate_imports_exports(
         imports_satisfied = satisfied_count,
         warnings = warning_count,
         "Boot validation complete"
+    );
+}
+
+/// Emit a single concise WARN when the loaded capsule set can't serve an
+/// agent chat turn, naming the missing piece(s). Summarized — never a
+/// per-import flood. Reuses the shared
+/// [`astrid_capsule::readiness::agent_loop_readiness`] so the boot signal,
+/// the `/api/sys/readiness` route, and `astrid doctor` all agree.
+fn warn_agent_loop_readiness(
+    manifests: &[(
+        astrid_capsule::manifest::CapsuleManifest,
+        std::path::PathBuf,
+    )],
+) {
+    let plain: Vec<astrid_capsule::manifest::CapsuleManifest> =
+        manifests.iter().map(|(m, _)| m.clone()).collect();
+    let readiness = astrid_capsule::readiness::agent_loop_readiness(&plain);
+    if readiness.ready {
+        tracing::info!(
+            capsules = readiness.loaded_capsules.len(),
+            "Agent loop ready — a capsule subscribes the prompt topic and publishes the response topic"
+        );
+        return;
+    }
+
+    let mut missing: Vec<String> = Vec::new();
+    if readiness.prompt_subscribers.is_empty() {
+        missing.push(format!(
+            "no capsule subscribes to {}",
+            astrid_capsule::readiness::AGENT_PROMPT_TOPIC
+        ));
+    }
+    if readiness.response_publishers.is_empty() {
+        missing.push(format!(
+            "no capsule publishes {}",
+            astrid_capsule::readiness::AGENT_RESPONSE_TOPIC
+        ));
+    }
+    if !readiness.unsatisfied_required_imports.is_empty() {
+        let ifaces: Vec<String> = readiness
+            .unsatisfied_required_imports
+            .iter()
+            .map(|m| format!("{}:{}", m.namespace, m.interface))
+            .collect();
+        missing.push(format!(
+            "required interface(s) unsatisfied: {}",
+            ifaces.join(" ")
+        ));
+    }
+
+    tracing::warn!(
+        reasons = %missing.join("; "),
+        "Agent chat is not configured — POST /api/agent/prompt will return an immediate error. \
+         Install the capsules that complete the loop (run `astrid doctor` for details)."
     );
 }
 

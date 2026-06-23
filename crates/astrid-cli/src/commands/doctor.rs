@@ -82,6 +82,26 @@ pub(crate) async fn run(args: DoctorArgs) -> Result<ExitCode> {
                 check_fail("Daemon roundtrip", &e.to_string());
             },
         }
+
+        // Agent-loop readiness: can the loaded capsule set actually serve a
+        // chat turn? A daemon can be healthy yet have no prompt subscriber /
+        // response publisher, in which case prompts silently never reply.
+        match agent_readiness().await {
+            Ok(report) => {
+                if report.ready {
+                    check_pass(
+                        "Agent loop readiness",
+                        &format!("ready ({} capsule(s) loaded)", report.loaded_capsules.len()),
+                    );
+                } else {
+                    all_passed = false;
+                    check_fail("Agent loop readiness", &readiness_detail(&report));
+                }
+            },
+            // Probe failure is not a hard failure — the daemon may simply be
+            // an older build that doesn't answer this request. Warn, don't fail.
+            Err(e) => check_warn("Agent loop readiness", &format!("could not probe: {e}")),
+        }
     }
 
     println!();
@@ -131,4 +151,62 @@ async fn daemon_roundtrip() -> Result<()> {
         .read_until_topic("astrid.v1.response.status", Duration::from_secs(5))
         .await?;
     Ok(())
+}
+
+/// Query the daemon for agent-loop readiness over the same socket the
+/// other daemon-dependent checks use. Rides the existing
+/// `astrid.v1.request.` ingress allowlist prefix — no capsule change needed.
+async fn agent_readiness() -> Result<astrid_core::kernel_api::AgentLoopReadiness> {
+    let session = astrid_core::SessionId::from_uuid(Uuid::new_v4());
+    let mut client = tokio::time::timeout(
+        Duration::from_secs(5),
+        SocketClient::connect(session, crate::principal::current()),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("connection timed out after 5s"))??;
+    let req = astrid_core::kernel_api::KernelRequest::GetAgentReadiness;
+    let val = serde_json::to_value(req)?;
+    let msg = astrid_types::ipc::IpcMessage::new(
+        "astrid.v1.request.agent_readiness",
+        astrid_types::ipc::IpcPayload::RawJson(val),
+        Uuid::nil(),
+    );
+    client.send_message(msg).await?;
+    let raw = client
+        .read_until_topic("astrid.v1.response.agent_readiness", Duration::from_secs(5))
+        .await?;
+    match SocketClient::extract_kernel_response(&raw) {
+        Some(astrid_core::kernel_api::KernelResponse::AgentReadiness(r)) => Ok(r),
+        Some(astrid_core::kernel_api::KernelResponse::Error(msg)) => {
+            Err(anyhow::anyhow!("daemon rejected readiness query: {msg}"))
+        },
+        _ => Err(anyhow::anyhow!(
+            "daemon did not return an agent-readiness response"
+        )),
+    }
+}
+
+/// Render the FAIL detail line for a not-ready report: each missing piece,
+/// space-separated, with unsatisfied interfaces as `ns:iface (req)`.
+fn readiness_detail(report: &astrid_core::kernel_api::AgentLoopReadiness) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if report.prompt_subscribers.is_empty() {
+        parts.push("no capsule subscribes user.v1.prompt".to_string());
+    }
+    if report.response_publishers.is_empty() {
+        parts.push("no capsule publishes agent.v1.response".to_string());
+    }
+    if !report.unsatisfied_required_imports.is_empty() {
+        let ifaces: Vec<String> = report
+            .unsatisfied_required_imports
+            .iter()
+            .map(|m| format!("{}:{} ({})", m.namespace, m.interface, m.requirement))
+            .collect();
+        parts.push(format!("unsatisfied interfaces: {}", ifaces.join(", ")));
+    }
+    if parts.is_empty() {
+        "not ready".to_string()
+    } else {
+        parts.join("; ")
+    }
 }

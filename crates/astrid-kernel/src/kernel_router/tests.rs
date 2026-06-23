@@ -102,6 +102,7 @@ fn all_request_variants() -> Vec<KernelRequest> {
         KernelRequest::ListCapsules,
         KernelRequest::GetCommands,
         KernelRequest::GetCapsuleMetadata,
+        KernelRequest::GetAgentReadiness,
         KernelRequest::ApproveCapability {
             request_id: "r".to_string(),
             signature: "s".to_string(),
@@ -167,6 +168,10 @@ fn required_capability_mapping_per_variant_self_scope() {
         "self:capsule:list"
     );
     assert_eq!(
+        required_capability(&KernelRequest::GetAgentReadiness, AuthorityScope::Self_),
+        "self:capsule:list"
+    );
+    assert_eq!(
         required_capability(
             &KernelRequest::ApproveCapability {
                 request_id: String::new(),
@@ -205,6 +210,10 @@ fn required_capability_mapping_global_scope() {
     );
     assert_eq!(
         required_capability(&KernelRequest::ListCapsules, AuthorityScope::Global),
+        "capsule:list"
+    );
+    assert_eq!(
+        required_capability(&KernelRequest::GetAgentReadiness, AuthorityScope::Global),
         "capsule:list"
     );
     // system:* variants are scope-invariant.
@@ -265,4 +274,76 @@ fn resolve_caller_falls_back_to_default_on_invalid_principal() {
     msg.principal = Some("alice@evil.example".to_string());
     let caller = resolve_caller(&msg);
     assert_eq!(caller, PrincipalId::default());
+}
+
+// ── Agent-loop readiness dispatch (roundtrip) ────────────────────
+
+/// Driving `GetAgentReadiness` through the live management router must
+/// return a `KernelResponse::AgentReadiness`, not an error or a wrong
+/// variant. Mirrors the `enforcement_tests::send_admin` pattern but on the
+/// `astrid.v1.request.*` management plane (not `astrid.v1.admin.*`).
+#[tokio::test(flavor = "multi_thread")]
+async fn get_agent_readiness_returns_readiness_response() {
+    use astrid_core::profile::PrincipalProfile;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let home = astrid_core::dirs::AstridHome::from_path(dir.path());
+    let kernel = crate::test_kernel_with_home(home).await;
+
+    // Seed the default principal as admin so it satisfies the
+    // `self:capsule:list` gate (the lightweight test constructor does not
+    // admin-seed the default profile).
+    let caller = PrincipalId::default();
+    let mut profile = PrincipalProfile::default();
+    profile.groups = vec!["admin".to_string()];
+    let path = PrincipalProfile::path_for(&kernel.astrid_home, &caller);
+    profile.save_to_path(&path).expect("seed admin profile");
+    kernel.profile_cache.invalidate(&caller);
+
+    // The test constructor only spawns the admin router; spin up the
+    // management-API router so `astrid.v1.request.*` traffic is serviced.
+    drop(spawn_kernel_router(Arc::clone(&kernel)));
+
+    let request_topic = "astrid.v1.request.agent_readiness";
+    let response_topic = "astrid.v1.response.agent_readiness";
+    let mut rx = kernel.event_bus.subscribe_topic(response_topic);
+
+    let payload =
+        serde_json::to_value(KernelRequest::GetAgentReadiness).expect("serialize request");
+    let mut msg = IpcMessage::new(
+        request_topic,
+        IpcPayload::RawJson(payload),
+        kernel.session_id.0,
+    );
+    msg.principal = Some(caller.as_str().to_string());
+    let _ = kernel.event_bus.publish(astrid_events::AstridEvent::Ipc {
+        metadata: astrid_events::EventMetadata::new("test"),
+        message: msg,
+    });
+
+    let value = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            let event = rx.recv().await.expect("response event");
+            if let astrid_events::AstridEvent::Ipc { message, .. } = &*event
+                && let IpcPayload::RawJson(val) = &message.payload
+            {
+                return val.clone();
+            }
+        }
+    })
+    .await
+    .expect("readiness response within 2s");
+
+    let resp: KernelResponse =
+        serde_json::from_value(value).expect("response deserializes as KernelResponse");
+    // An empty registry isn't ready, but the point is the dispatch path
+    // returns the readiness variant rather than erroring or timing out.
+    match resp {
+        KernelResponse::AgentReadiness(r) => {
+            assert!(!r.ready, "empty capsule set must not be ready");
+            assert!(r.prompt_subscribers.is_empty());
+            assert!(r.response_publishers.is_empty());
+        },
+        other => panic!("expected AgentReadiness, got {other:?}"),
+    }
 }

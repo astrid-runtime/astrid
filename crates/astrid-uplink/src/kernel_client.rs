@@ -69,6 +69,7 @@ pub const fn topic_suffix(req: &KernelRequest) -> &'static str {
         KernelRequest::UnloadCapsule { .. } => "unload_capsule",
         KernelRequest::GetCommands => "get_commands",
         KernelRequest::GetCapsuleMetadata => "metadata",
+        KernelRequest::GetAgentReadiness => "agent_readiness",
         KernelRequest::Shutdown { .. } => "shutdown",
         KernelRequest::GetStatus => "status",
     }
@@ -178,6 +179,10 @@ mod tests {
         assert_eq!(topic_suffix(&KernelRequest::ListCapsules), "list_capsules");
         assert_eq!(topic_suffix(&KernelRequest::GetCommands), "get_commands");
         assert_eq!(topic_suffix(&KernelRequest::GetCapsuleMetadata), "metadata");
+        assert_eq!(
+            topic_suffix(&KernelRequest::GetAgentReadiness),
+            "agent_readiness"
+        );
         assert_eq!(
             topic_suffix(&KernelRequest::ReloadCapsules),
             "reload_capsules"

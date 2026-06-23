@@ -130,6 +130,7 @@ pub fn build(state: Arc<GatewayState>) -> Router {
         .route("/api/agent/prompt", post(agent::post_prompt))
         // ── System ──
         .route("/api/sys/status", get(system::get_status))
+        .route("/api/sys/readiness", get(system::get_readiness))
         .route(
             "/api/sys/capsules/reload",
             post(system::reload_capsules),
