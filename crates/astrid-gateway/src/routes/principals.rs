@@ -210,8 +210,8 @@ pub async fn delete_principal(
 ) -> GatewayResult<StatusCode> {
     let principal = PrincipalId::new(&id)
         .map_err(|e| GatewayError::BadRequest(format!("invalid principal id: {e}")))?;
-    let caller = caller_from(&req)?.clone();
-    let client = state.admin_client_for(&caller)?;
+    let caller = caller_from(&req)?;
+    let client = state.admin_client_for(caller)?;
     let resp = client
         .request(AdminRequestKind::AgentDelete { principal })
         .await
@@ -274,8 +274,8 @@ async fn set_enabled(
 ) -> GatewayResult<Json<serde_json::Value>> {
     let principal = PrincipalId::new(&id)
         .map_err(|e| GatewayError::BadRequest(format!("invalid principal id: {e}")))?;
-    let caller = caller_from(&req)?.clone();
-    let client = state.admin_client_for(&caller)?;
+    let caller = caller_from(&req)?;
+    let client = state.admin_client_for(caller)?;
     let kind = if enabled {
         AdminRequestKind::AgentEnable { principal }
     } else {
@@ -473,8 +473,8 @@ pub async fn list_principal_devices(
 ) -> GatewayResult<Json<DeviceListResponse>> {
     let principal = PrincipalId::new(&id)
         .map_err(|e| GatewayError::BadRequest(format!("invalid principal id: {e}")))?;
-    let caller = caller_from(&req)?.clone();
-    let client = state.admin_client_for(&caller)?;
+    let caller = caller_from(&req)?;
+    let client = state.admin_client_for(caller)?;
     let resp = client
         .request(AdminRequestKind::PairDeviceList { principal })
         .await
@@ -516,8 +516,8 @@ pub async fn delete_principal_device(
 ) -> GatewayResult<StatusCode> {
     let principal = PrincipalId::new(&id)
         .map_err(|e| GatewayError::BadRequest(format!("invalid principal id: {e}")))?;
-    let caller = caller_from(&req)?.clone();
-    let client = state.admin_client_for(&caller)?;
+    let caller = caller_from(&req)?;
+    let client = state.admin_client_for(caller)?;
     let resp = client
         .request(AdminRequestKind::PairDeviceRevoke { principal, key_id })
         .await
