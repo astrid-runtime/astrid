@@ -54,6 +54,7 @@ use uuid::Uuid;
 use crate::socket_client::SocketClient;
 
 use super::elicit;
+use super::grant;
 use super::ingress;
 
 /// Request topic for the broker `tools/list` front door.
@@ -263,9 +264,13 @@ fn is_request_retriable(request_topic: &str) -> bool {
         TOOLS_LIST_TOPIC => true,
         // Running a tool (MCP `tools/call`) may have executed already.
         TOOL_CALL_TOPIC => false,
-        // Recording an approval / ingress-consent decision is a state mutation
-        // on the broker; re-issuing could double-apply or race a stale decision.
-        elicit::APPROVAL_RESPOND_TOPIC | ingress::INGRESS_RESPOND_TOPIC => false,
+        // Recording an approval / ingress-consent / grant-on-use decision is a
+        // state mutation on the broker (and, for grant, persists a capsule on
+        // the principal kernel-side); re-issuing could double-apply or race a
+        // stale decision.
+        elicit::APPROVAL_RESPOND_TOPIC
+        | ingress::INGRESS_RESPOND_TOPIC
+        | grant::GRANT_RESPOND_TOPIC => false,
         // Default-deny anything not explicitly enumerated above.
         _ => false,
     }
@@ -358,6 +363,31 @@ impl ServerHandler for AstridMcpServer {
             reply
         };
 
+        // If the broker gated the call on a capsule the caller does not hold,
+        // it replies a `grant_required` signal (NOT a result) — the kernel
+        // DROPPED the original call at the access gate. Elicit the user's
+        // consent; on approve the kernel persists the capsule grant and we
+        // RE-SEND the original call (now passing the gate, exactly as the
+        // ingress flow re-sends). On deny / no-capability / error, fail secure
+        // with an MCP error. This sits AFTER the ingress block and BEFORE the
+        // approval block, so a re-sent call still flows into the approval gate:
+        // a tool that is both ungranted and capability-gated resolves in
+        // sequence.
+        let reply = if let Some(grant) = grant::GrantRequest::from_reply(&reply) {
+            let granted = self.resolve_grant(&context.peer, &grant).await?;
+            if !granted {
+                return Ok(CallToolResult::error(vec![Content::text(
+                    "Capsule access was not granted for this tool.",
+                )]));
+            }
+            // Re-send the original call now that the capsule is granted.
+            let retry_id = new_req_id();
+            self.round_trip(TOOL_CALL_TOPIC, &retry_id, call_body(&retry_id))
+                .await?
+        } else {
+            reply
+        };
+
         // If the routed tool parked on a capability approval, the broker
         // surfaces an `approval_required` flag instead of a terminal result.
         // Elicit the choice from the client, forward the decision to the
@@ -439,6 +469,59 @@ impl AstridMcpServer {
         let granted = ack.get("granted").and_then(Value::as_bool).unwrap_or(false);
         if !granted {
             warn!("MCP shim: broker did not confirm ingress trust grant; not retrying call");
+        }
+        Ok(granted)
+    }
+
+    /// Drive the grant-on-use bridge for a `tools/call` the broker gated on a
+    /// capsule the caller does not hold: elicit the user's decision and forward
+    /// it on the broker's [`GRANT_RESPOND_TOPIC`](grant::GRANT_RESPOND_TOPIC)
+    /// front door so the kernel persists (or declines) the capsule grant.
+    /// Returns whether the capsule is now granted — `true` only when the user
+    /// approved AND the broker confirmed the grant persisted.
+    ///
+    /// Marker discipline (the divergence from [`resolve_ingress`]): the broker
+    /// holds a per-`(principal, capsule)` pending marker that is consumed on
+    /// EVERY respond, so this ALWAYS responds — `approve` on accept, `deny` on
+    /// decline / no-capability / elicit error — or the marker would stick and
+    /// a later call would get a benign "already pending" terminal instead of a
+    /// fresh prompt.
+    ///
+    /// Fail-secure: any non-accept path publishes `deny` and returns `false`.
+    /// An accept the broker could not persist (ack `granted:false`) also
+    /// returns `false`, so the caller does not re-send a call that would just
+    /// trip the gate again. A respond round-trip error returns the error
+    /// (caller fails the call) — the marker still clears on the broker's side
+    /// only if the publish landed, so the broker treats a never-arriving
+    /// respond as its own timeout concern; the shim's contract is to always
+    /// attempt a respond, which it does.
+    async fn resolve_grant(
+        &self,
+        peer: &rmcp::service::Peer<RoleServer>,
+        request: &grant::GrantRequest,
+    ) -> Result<bool, McpError> {
+        let approved = grant::elicit_grant(peer, request).await;
+        let decision = grant::grant_decision(approved);
+
+        // A fresh req_id keys the ack. The respond body echoes the kernel-minted
+        // grant `request_id` so the broker routes the decision; the grant target
+        // is never a body field (the kernel derives it from its own signal).
+        let respond_req_id = new_req_id();
+        let respond_body = request.respond_body(&respond_req_id, decision);
+
+        let ack = self
+            .round_trip(grant::GRANT_RESPOND_TOPIC, &respond_req_id, respond_body)
+            .await?;
+
+        // On decline we still published `deny` (to clear the broker marker) but
+        // never grant — short-circuit to false without reading the ack.
+        if !approved {
+            return Ok(false);
+        }
+
+        let granted = ack.get("granted").and_then(Value::as_bool).unwrap_or(false);
+        if !granted {
+            warn!("MCP shim: broker did not confirm capsule grant; not retrying call");
         }
         Ok(granted)
     }
@@ -565,13 +648,15 @@ mod tests {
         assert!(!is_request_retriable(TOOL_CALL_TOPIC));
     }
 
-    /// Recording a capability-approval or ingress-consent decision is a state
-    /// mutation on the broker; re-issuing could double-apply, so these are not
-    /// retriable either.
+    /// Recording a capability-approval, ingress-consent, or grant-on-use
+    /// decision is a state mutation on the broker (grant additionally persists
+    /// a capsule on the principal); re-issuing could double-apply, so these are
+    /// not retriable either.
     #[test]
     fn respond_front_doors_are_not_retriable() {
         assert!(!is_request_retriable(elicit::APPROVAL_RESPOND_TOPIC));
         assert!(!is_request_retriable(ingress::INGRESS_RESPOND_TOPIC));
+        assert!(!is_request_retriable(grant::GRANT_RESPOND_TOPIC));
     }
 
     /// Default-deny: an unrecognized topic must never be treated as retriable.
