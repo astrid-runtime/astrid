@@ -32,10 +32,16 @@ use crate::commands::init::InitOpts;
 use crate::theme::Theme;
 
 /// Install a distro from a `.shuttle` archive.
-pub(crate) async fn install_from_shuttle(
-    shuttle_path: &Path,
-    opts: &InitOpts,
-) -> anyhow::Result<()> {
+///
+/// Synchronous: every step (unpack, verify, install from local files)
+/// is offline and blocking. The caller awaits the surrounding init
+/// future, but no `.await` happens inside.
+#[allow(
+    clippy::too_many_lines,
+    reason = "intentional linear unpack→verify→install→lock pipeline; \
+              the security ordering is clearer kept in one place"
+)]
+pub(crate) fn install_from_shuttle(shuttle_path: &Path, opts: &InitOpts) -> anyhow::Result<()> {
     let home = AstridHome::resolve()?;
     home.ensure()?;
 
@@ -70,34 +76,33 @@ pub(crate) async fn install_from_shuttle(
 
     // 3. Trust gate. A sealed `.shuttle` is a remote-origin artifact:
     //    a missing signature is refused unless --allow-unsigned.
-    let (signer, signature) = match (&manifest.distro.signing, &sig) {
-        (Some(signing), Some(sig_hex)) => {
-            let outcome = trust::verify_and_pin(
-                &home,
-                &distro_id,
-                &signing.pubkey,
-                sig_hex,
-                &lock,
-                opts.accept_new_key,
-            )?;
-            report_trust(&outcome);
-            (Some(outcome.key_str), Some(sig_hex.trim().to_string()))
-        },
-        _ => {
-            if !opts.allow_unsigned {
-                bail!(
-                    "shuttle for '{distro_id}' is unsigned (no [distro.signing] or Distro.sig) — \
-                     refusing. Re-run with --allow-unsigned to install anyway."
-                );
-            }
-            eprintln!(
-                "{}",
-                Theme::warning(&format!(
-                    "installing UNSIGNED distro '{distro_id}' (--allow-unsigned)"
-                ))
+    let (signer, signature) = if let (Some(signing), Some(sig_hex)) =
+        (&manifest.distro.signing, &sig)
+    {
+        let outcome = trust::verify_and_pin(
+            &home,
+            &distro_id,
+            &signing.pubkey,
+            sig_hex,
+            &lock,
+            opts.accept_new_key,
+        )?;
+        report_trust(&outcome);
+        (Some(outcome.key_str), Some(sig_hex.trim().to_string()))
+    } else {
+        if !opts.allow_unsigned {
+            bail!(
+                "shuttle for '{distro_id}' is unsigned (no [distro.signing] or Distro.sig) — \
+                 refusing. Re-run with --allow-unsigned to install anyway."
             );
-            (None, None)
-        },
+        }
+        eprintln!(
+            "{}",
+            Theme::warning(&format!(
+                "installing UNSIGNED distro '{distro_id}' (--allow-unsigned)"
+            ))
+        );
+        (None, None)
     };
 
     // 4. Manifest-hash integrity: the lock's manifest_hash must match
@@ -137,67 +142,14 @@ pub(crate) async fn install_from_shuttle(
     )?;
     crate::commands::init::write_env_files(&home, &selected, &vars)?;
 
-    // Index lock entries by name for hash verification.
-    let lock_by_name: std::collections::HashMap<&str, &LockedCapsule> =
-        lock.capsules.iter().map(|c| (c.name.as_str(), c)).collect();
-
     // 6. Install each selected capsule from the verified mirror.
-    let mut locked: Vec<LockedCapsule> = Vec::with_capacity(selected.len());
-    for cap in &selected {
-        let file = shuttle::capsule_mirror_path(mirror, &cap.name);
-        if !file.is_file() {
-            bail!(
-                "capsule '{}' is not present in the shuttle (offline install cannot fetch it)",
-                cap.name
-            );
-        }
-
-        // Verify blake3 against the lock entry BEFORE installing.
-        let bytes = std::fs::read(&file)
-            .with_context(|| format!("failed to read mirrored capsule {}", cap.name))?;
-        let actual_hash = format!("blake3:{}", blake3::hash(&bytes).to_hex());
-        let lock_entry = lock_by_name.get(cap.name.as_str()).ok_or_else(|| {
-            anyhow::anyhow!("capsule '{}' has no entry in Distro.lock", cap.name)
-        })?;
-        if lock_entry.hash != actual_hash {
-            bail!(
-                "capsule '{}' hash mismatch: lock has {}, archive has {actual_hash} — refusing",
-                cap.name,
-                lock_entry.hash
-            );
-        }
-
-        let resolved_ref = cap.resolved_ref();
-        crate::commands::capsule::install::install_offline_capsule(
-            &file,
-            &home,
-            &cap.name,
-            &cap.source,
-            resolved_ref.as_deref(),
-            signer.as_deref(),
-            signature.as_deref(),
-        )
-        .with_context(|| format!("failed to install capsule {}", cap.name))?;
-
-        // The lock the WE write records the installed wasm hash from
-        // meta (content-addressed), preserving the archive's capsule
-        // blake3 as the resolved artifact hash for reproducibility.
-        let target_dir =
-            crate::commands::capsule::install::resolve_target_dir(&home, &cap.name, false)?;
-        let installed_hash = crate::commands::capsule::meta::read_meta(&target_dir)
-            .and_then(|m| m.wasm_hash)
-            .map(|h| format!("blake3:{h}"))
-            .unwrap_or_else(|| actual_hash.clone());
-
-        locked.push(LockedCapsule {
-            name: cap.name.clone(),
-            version: cap.version.clone(),
-            source: cap.source.clone(),
-            hash: installed_hash,
-            resolved_ref,
-        });
-        eprintln!("  installed {}", cap.name);
-    }
+    let locked = install_selected_capsules(
+        &home,
+        mirror,
+        &selected,
+        signer.as_deref(),
+        signature.as_deref(),
+    )?;
 
     // 7. Write the user's Distro.lock, carrying the sealed manifest hash.
     let principal = astrid_core::PrincipalId::default();
@@ -220,6 +172,67 @@ pub(crate) async fn install_from_shuttle(
     eprintln!();
     eprintln!("{}", Theme::success("Offline installation complete."));
     Ok(())
+}
+
+/// Install each selected capsule from the verified mirror and return
+/// the resolved [`LockedCapsule`] entries for the user's lock.
+///
+/// Capsule blake3 was already validated against the lock up front by
+/// [`verify_capsule_hashes`]; this re-reads the installed `meta.json` to
+/// record the content-addressed WASM hash (falling back to the archive
+/// blake3 if meta is absent).
+fn install_selected_capsules(
+    home: &AstridHome,
+    mirror: &Path,
+    selected: &[super::manifest::DistroCapsule],
+    signer: Option<&str>,
+    signature: Option<&str>,
+) -> anyhow::Result<Vec<LockedCapsule>> {
+    let mut locked: Vec<LockedCapsule> = Vec::with_capacity(selected.len());
+    for cap in selected {
+        let file = shuttle::capsule_mirror_path(mirror, &cap.name);
+        if !file.is_file() {
+            bail!(
+                "capsule '{}' is not present in the shuttle (offline install cannot fetch it)",
+                cap.name
+            );
+        }
+        let archive_hash = {
+            let bytes = std::fs::read(&file)
+                .with_context(|| format!("failed to read mirrored capsule {}", cap.name))?;
+            format!("blake3:{}", blake3::hash(&bytes).to_hex())
+        };
+
+        let resolved_ref = cap.resolved_ref();
+        crate::commands::capsule::install::install_offline_capsule(
+            &file,
+            home,
+            &cap.name,
+            &cap.source,
+            resolved_ref.as_deref(),
+            signer,
+            signature,
+        )
+        .with_context(|| format!("failed to install capsule {}", cap.name))?;
+
+        // Record the installed content-addressed WASM hash from meta,
+        // falling back to the archive blake3.
+        let target_dir =
+            crate::commands::capsule::install::resolve_target_dir(home, &cap.name, false)?;
+        let installed_hash = crate::commands::capsule::meta::read_meta(&target_dir)
+            .and_then(|m| m.wasm_hash)
+            .map_or(archive_hash, |h| format!("blake3:{h}"));
+
+        locked.push(LockedCapsule {
+            name: cap.name.clone(),
+            version: cap.version.clone(),
+            source: cap.source.clone(),
+            hash: installed_hash,
+            resolved_ref,
+        });
+        eprintln!("  installed {}", cap.name);
+    }
+    Ok(locked)
 }
 
 /// Verify the per-capsule blake3 of every lock entry against the bytes

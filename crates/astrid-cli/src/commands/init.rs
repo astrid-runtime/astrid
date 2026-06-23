@@ -30,6 +30,10 @@ const DEFAULT_ORG: &str = "unicity-astrid";
 /// be bypassed (`--yes`), network access forbidden (`--offline`), and
 /// signing posture chosen (`--allow-unsigned`, `--accept-new-key`).
 #[derive(Debug, Clone, Default)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "distinct CLI flag toggles, not a state machine"
+)]
 pub(crate) struct InitOpts {
     /// Non-interactive: accept all defaults, never read stdin.
     pub(crate) yes: bool,
@@ -70,7 +74,7 @@ pub(crate) async fn run_init(distro_source: &str, opts: &InitOpts) -> anyhow::Re
 
     // Offline, signed, self-contained install path.
     if distro_source.ends_with(".shuttle") {
-        return run_init_from_shuttle(distro_source, opts).await;
+        return run_init_from_shuttle(distro_source, opts);
     }
 
     // Check lockfile — if fresh, we're already initialized.
@@ -150,12 +154,8 @@ pub(crate) async fn run_init(distro_source: &str, opts: &InitOpts) -> anyhow::Re
 /// Implemented in [`super::distro::shuttle_install`] (Part C/D): unpack
 /// to a mirror, verify the signature against the trust store, then
 /// install each capsule offline from the mirror.
-async fn run_init_from_shuttle(source: &str, opts: &InitOpts) -> anyhow::Result<()> {
-    super::distro::shuttle_install::install_from_shuttle(
-        std::path::Path::new(source),
-        opts,
-    )
-    .await
+fn run_init_from_shuttle(source: &str, opts: &InitOpts) -> anyhow::Result<()> {
+    super::distro::shuttle_install::install_from_shuttle(std::path::Path::new(source), opts)
 }
 
 /// Initialize the current directory as an Astrid workspace (if not already).

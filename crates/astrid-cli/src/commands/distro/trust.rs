@@ -177,8 +177,8 @@ pub(crate) fn verify_and_pin(
 /// Mirror a trust decision into the audit trail.
 ///
 /// DECISION: the `astrid-audit` crate's `AuditLog` is built for the
-/// daemon (it needs a runtime KeyPair + SurrealKV chain). Spinning that
-/// up for a one-shot CLI trust decision is the wrong tool, so per the
+/// daemon (it needs a runtime `KeyPair` + `SurrealKV` chain). Spinning
+/// that up for a one-shot CLI trust decision is the wrong tool, so per the
 /// issue's explicit fallback we emit a structured `tracing` event that
 /// the existing log pipeline captures. If the CLI later gains a
 /// first-class audit handle, route this through it.
