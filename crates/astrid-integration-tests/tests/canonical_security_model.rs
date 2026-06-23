@@ -368,6 +368,11 @@ mod allowance_patterns {
         let traversal = SensitiveAction::FileDelete {
             path: "/workspace/../etc/passwd".to_string(),
         };
+        // A literal triple-dot segment is a NORMAL path component, not a `..`
+        // traversal — it must not be over-blocked.
+        let triple_dot = SensitiveAction::FileDelete {
+            path: "/workspace/.../archive.txt".to_string(),
+        };
 
         assert!(
             pattern.matches(&delete, None),
@@ -380,6 +385,10 @@ mod allowance_patterns {
         assert!(
             !pattern.matches(&traversal, None),
             "a `..` traversal path must never auto-approve, even under a matching glob"
+        );
+        assert!(
+            pattern.matches(&triple_dot, None),
+            "a literal triple-dot segment is a normal component, not traversal — must not be over-blocked"
         );
     }
 

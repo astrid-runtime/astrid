@@ -1,8 +1,8 @@
 //! Unified configuration system for the Astrid runtime.
 //!
 //! This crate provides a single [`Config`] type that consolidates all
-//! configuration previously scattered across `RuntimeConfig`, `SecurityPolicy`,
-//! `BudgetConfig`, `ServersConfig`, `GatewayConfig`, and `HooksConfig`.
+//! configuration previously scattered across `RuntimeConfig`, `BudgetConfig`,
+//! `ServersConfig`, `GatewayConfig`, and `HooksConfig`.
 //!
 //! # Usage
 //!

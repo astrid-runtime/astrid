@@ -75,8 +75,8 @@ keep_recent_count = 10
 # Disable for standard AI assistant use, enable for high-security scenarios.
 require_signatures = false
 
-# Timeout in seconds for approval requests. If user doesn't respond within
-# this time, the action is denied (unless fallback policy says otherwise).
+# Timeout in seconds for approval requests. If the user doesn't respond within
+# this time, the action is denied.
 approval_timeout_secs = 300
 
 # ============================================================================
