@@ -28,9 +28,14 @@ const PROVIDER_BASE_URL_KEY: &str = "base_url";
 /// Maximum models-response body size, in bytes.
 ///
 /// Caps an otherwise-unbounded `GET` over an operator-supplied (and thus
-/// untrusted) endpoint. Matches the manifest-fetch streaming limit. An
-/// over-limit body errors, which the caller maps to the free-text fallback.
-const MAX_RESPONSE_BYTES: usize = 512 * 1024;
+/// untrusted) endpoint. A typical `/v1/models` response is KB-scale; the cap
+/// exists to stop a hostile or broken endpoint from OOM-ing the installer.
+/// 5 MB is generous enough to accommodate the largest legitimate catalogs
+/// (large aggregators listing hundreds of models with metadata) without
+/// clipping them to the free-text fallback, while still bounding the OOM
+/// vector. An over-limit body errors, which the caller maps to the free-text
+/// fallback.
+const MAX_RESPONSE_BYTES: usize = 5 * 1024 * 1024;
 
 /// Substitute `{key}` placeholders in `template` with values from `values`.
 ///
@@ -435,11 +440,16 @@ mod tests {
 
     #[test]
     fn capped_body_rejects_over_limit() {
-        // DoS guard: an over-cap body must error → free-text fallback.
+        // The cap is 5 MB: generous for large aggregator `/v1/models`
+        // catalogs, while still bounding the OOM vector.
+        assert_eq!(MAX_RESPONSE_BYTES, 5 * 1024 * 1024);
+
+        // DoS guard: an over-cap body (one byte past 5 MB) must error →
+        // free-text fallback.
         let oversized = vec![b'x'; MAX_RESPONSE_BYTES + 1];
         let err = decode_capped_body(&oversized).expect_err("over-cap body must error");
         assert!(err.to_string().contains("too large"), "got: {err}");
-        // Exactly at the limit is allowed.
+        // A within-limit body (exactly at 5 MB) is allowed.
         let at_limit = vec![b'x'; MAX_RESPONSE_BYTES];
         assert!(decode_capped_body(&at_limit).is_ok());
     }
