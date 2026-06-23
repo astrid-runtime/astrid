@@ -13,9 +13,11 @@
 //! never panics on a discovery miss.
 
 use std::collections::HashMap;
+use std::sync::LazyLock;
 
 use anyhow::Context;
 use astrid_capsule::manifest::OptionsFrom;
+use regex::Regex;
 
 /// Env key holding the user-configured provider location, by convention.
 ///
@@ -37,18 +39,35 @@ const PROVIDER_BASE_URL_KEY: &str = "base_url";
 /// fallback.
 const MAX_RESPONSE_BYTES: usize = 5 * 1024 * 1024;
 
+/// Matches a single `{key}` placeholder, capturing the bare key.
+///
+/// `\w+` deliberately excludes `{`/`}`, so a placeholder cannot span another
+/// brace and substring keys (`{api}` vs `{api_key}`) are matched whole.
+static PLACEHOLDER: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\{(\w+)\}").expect("static placeholder regex is valid"));
+
 /// Substitute `{key}` placeholders in `template` with values from `values`.
 ///
-/// Unknown placeholders are left intact (the caller treats a still-templated
-/// URL as a resolution failure). Substitution is single-pass and does not
-/// recurse into substituted values.
+/// A single deterministic left-to-right pass over the `{key}` placeholders:
+/// each placeholder is replaced by its mapped value, and an unknown key is
+/// left intact (the caller treats a still-templated URL as a resolution
+/// failure). Because the scan is over the original template — not the
+/// growing result — map iteration order is irrelevant and a substituted
+/// value can never itself be re-scanned, so substring keys (e.g. `{api}` vs
+/// `{api_key}`) and credential values containing `{...}` cannot corrupt the
+/// output.
 pub(crate) fn resolve_template(template: &str, values: &HashMap<String, String>) -> String {
-    let mut result = template.to_string();
-    for (key, value) in values {
-        let pattern = format!("{{{key}}}");
-        result = result.replace(&pattern, value);
-    }
-    result
+    PLACEHOLDER
+        .replace_all(template, |caps: &regex::Captures<'_>| {
+            let key = &caps[1];
+            match values.get(key) {
+                // Leave an unknown placeholder verbatim so the caller can
+                // detect the miss. `caps[0]` is the full `{key}` match.
+                Some(value) => value.clone(),
+                None => caps[0].to_string(),
+            }
+        })
+        .into_owned()
 }
 
 /// Decide whether the `Authorization: Bearer` header may be attached to a
@@ -64,12 +83,14 @@ pub(crate) fn resolve_template(template: &str, values: &HashMap<String, String>)
 /// an arbitrary host the moment the installer resolves the field.
 ///
 /// The bearer is therefore bound to the provider: it is attached **only**
-/// when the resolved fetch host equals the host of the user-configured
-/// `base_url` value the `http` template is built from. Host comparison is
-/// case-insensitive (DNS is case-insensitive); port and scheme must match
-/// exactly, so a downgrade or alternate-port redirect to the same hostname
-/// does not leak the token. Any parse failure (either URL invalid, or
-/// either lacking a host) fails closed — the bearer is withheld.
+/// when the resolved fetch URL has the same scheme, host, and port as the
+/// user-configured `base_url` value the `http` template is built from. Host
+/// comparison is case-insensitive (DNS is case-insensitive); scheme and port
+/// must match exactly, so a cleartext `http://` downgrade of an `https://`
+/// `base_url` — even on the same host and the same explicit port (e.g.
+/// `http://provider:443` vs `https://provider`) — or an alternate-port
+/// redirect does not leak the token. Any parse failure (either URL invalid,
+/// or either lacking a host) fails closed — the bearer is withheld.
 ///
 /// The legitimate openai / openai-compat case builds `http` from
 /// `{base_url}`, so the hosts (and ports) are identical and the bearer is
@@ -85,6 +106,14 @@ pub(crate) fn should_send_bearer(http_url: &str, base_url: &str) -> bool {
     let (Some(http_host), Some(base_host)) = (http.host_str(), base.host_str()) else {
         return false;
     };
+
+    // Scheme must match exactly: an `http://` downgrade of an `https://`
+    // base_url must never carry the bearer, even on the same host and the
+    // same explicit port — otherwise `http://provider:443` would tunnel the
+    // credential in cleartext. `Url::scheme` is already lowercased.
+    if http.scheme() != base.scheme() {
+        return false;
+    }
 
     // DNS hostnames are case-insensitive; ports must match exactly so that a
     // same-host redirect to a different port cannot smuggle the credential
@@ -209,10 +238,10 @@ pub(crate) async fn fetch_options(
 
     // Cap the body: the endpoint is operator-supplied and otherwise
     // unbounded. Reject up-front on an advertised over-limit length so a
-    // hostile `Content-Length` can't force a large buffer, then bound the
-    // actual bytes read (the header is advisory and may be absent/lying for
-    // a chunked response). An over-limit response errors → free-text
-    // fallback.
+    // hostile `Content-Length` can't even start a large transfer (fast
+    // path), then stream-read with the same bound so an absent/lying length
+    // (e.g. a chunked response with no `Content-Length`) cannot OOM the
+    // installer either. An over-limit response errors → free-text fallback.
     anyhow::ensure!(
         response
             .content_length()
@@ -220,8 +249,7 @@ pub(crate) async fn fetch_options(
         "models response too large (advertised {} bytes; limit {MAX_RESPONSE_BYTES})",
         response.content_length().unwrap_or_default()
     );
-    let body = response.bytes().await?;
-    let body = decode_capped_body(&body)?;
+    let body = read_capped_body(response).await?;
     let options = parse_options_response(&body, opts.select_or_default());
     anyhow::ensure!(
         !options.is_empty(),
@@ -230,11 +258,44 @@ pub(crate) async fn fetch_options(
     Ok(options)
 }
 
-/// Bound a fetched response body and decode it as UTF-8.
+/// Stream the response body into memory under a hard [`MAX_RESPONSE_BYTES`]
+/// cap, then decode it as UTF-8.
 ///
-/// Rejects a body larger than [`MAX_RESPONSE_BYTES`] (the operator-supplied
-/// endpoint is otherwise unbounded) and any non-UTF-8 payload. Errors map
-/// to the free-text fallback at the call site.
+/// The body is accumulated chunk-by-chunk and the running total is checked
+/// **before** each chunk is appended, so the buffer never exceeds the cap
+/// (the transfer is aborted the moment the next chunk would cross it). This
+/// is the streaming guard the up-front `Content-Length` check cannot
+/// provide: a chunked / unknown-length (or lying-`Content-Length`) response
+/// is bounded by the bytes actually read, not by an advisory header.
+///
+/// Rejects an over-cap body and any non-UTF-8 payload; both errors map to
+/// the free-text fallback at the call site.
+async fn read_capped_body(response: reqwest::Response) -> anyhow::Result<String> {
+    use futures::StreamExt;
+
+    let mut stream = response.bytes_stream();
+    let mut body: Vec<u8> = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.context("error reading models response body")?;
+        // Check before appending so we never hold more than the cap plus the
+        // tail of one already-received chunk. The moment the total would
+        // exceed the limit we abort — the rest of the stream is dropped.
+        anyhow::ensure!(
+            body.len().saturating_add(chunk.len()) <= MAX_RESPONSE_BYTES,
+            "models response too large (exceeded {MAX_RESPONSE_BYTES} bytes; aborted mid-stream)"
+        );
+        body.extend_from_slice(&chunk);
+    }
+    String::from_utf8(body).context("models response was not valid UTF-8")
+}
+
+/// Bound an in-memory body and decode it as UTF-8 (test helper for the
+/// streaming guard's cap/decoding logic).
+///
+/// Rejects a body larger than [`MAX_RESPONSE_BYTES`] and any non-UTF-8
+/// payload — the same invariants [`read_capped_body`] enforces while
+/// streaming.
+#[cfg(test)]
 fn decode_capped_body(body: &[u8]) -> anyhow::Result<String> {
     anyhow::ensure!(
         body.len() <= MAX_RESPONSE_BYTES,
@@ -293,6 +354,43 @@ mod tests {
             "https://api.openai.com/v1/models"
         );
         assert_eq!(resolve_template("{api_key}", &v), "sk-x");
+    }
+
+    #[test]
+    fn resolve_template_substring_keys_are_order_independent() {
+        // Regression: a naive HashMap-iteration string-replace could match
+        // `{api}` inside `{api_key}` (or vice versa) depending on map order,
+        // corrupting the result. The single regex pass replaces each whole
+        // placeholder exactly once, so the output is identical regardless of
+        // which key the map happens to yield first.
+        let template = "{base_url}?a={api}&k={api_key}";
+        let expected = "https://h?a=AAA&k=KKK";
+
+        // Build the same logical map twice; insertion order differs but the
+        // result must not.
+        let mut v1 = HashMap::new();
+        v1.insert("api".to_string(), "AAA".to_string());
+        v1.insert("api_key".to_string(), "KKK".to_string());
+        v1.insert("base_url".to_string(), "https://h".to_string());
+
+        let mut v2 = HashMap::new();
+        v2.insert("api_key".to_string(), "KKK".to_string());
+        v2.insert("base_url".to_string(), "https://h".to_string());
+        v2.insert("api".to_string(), "AAA".to_string());
+
+        assert_eq!(resolve_template(template, &v1), expected);
+        assert_eq!(resolve_template(template, &v2), expected);
+    }
+
+    #[test]
+    fn resolve_template_does_not_rescan_substituted_value() {
+        // A substituted value that itself contains a `{key}` sequence must
+        // NOT be re-expanded — the scan is over the original template only.
+        let v = vals(&[("base_url", "https://h/{api_key}"), ("api_key", "secret")]);
+        assert_eq!(
+            resolve_template("{base_url}/v1", &v),
+            "https://h/{api_key}/v1"
+        );
     }
 
     #[test]
@@ -408,10 +506,23 @@ mod tests {
             "https://api.openai.com:8443/v1/models",
             "https://api.openai.com"
         ));
-        // Scheme downgrade to the same host → different default port → no.
+        // Scheme downgrade to the same host (implicit ports) → withheld.
         assert!(!should_send_bearer(
             "http://api.openai.com/v1/models",
             "https://api.openai.com"
+        ));
+        // Scheme-downgrade smuggle: same host, same *explicit* port 443, but
+        // `http` vs `https`. Port-only matching (`port_or_known_default`)
+        // would have folded these to 443 and leaked the bearer in cleartext;
+        // the scheme check withholds it. This is the FIX B regression.
+        assert!(!should_send_bearer(
+            "http://api.openai.com:443/v1/models",
+            "https://api.openai.com"
+        ));
+        // And the reverse: https fetch against an http-configured base_url.
+        assert!(!should_send_bearer(
+            "https://api.openai.com:80/v1/models",
+            "http://api.openai.com"
         ));
     }
 
@@ -466,5 +577,95 @@ mod tests {
             .await
             .expect_err("non-http endpoint must error");
         assert!(err.to_string().contains("not an http"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn fetch_rejects_oversized_chunked_body_without_buffering_it_all() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        // Regression for FIX A: a chunked response with NO Content-Length
+        // must be rejected by the streaming guard the moment the running
+        // total crosses the cap — never buffered whole. We prove this two
+        // ways: the fetch errors with "too large", AND the server is never
+        // required to send the full oversized payload (the client drops the
+        // connection mid-stream, so far fewer than `MAX_RESPONSE_BYTES`
+        // bytes leave the server before it gives up).
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let port = listener.local_addr().expect("local_addr").port();
+
+        // Bytes the server actually managed to write to the socket. If the
+        // streaming guard aborts early, the client closes the connection and
+        // the server's writes start failing well before the full payload is
+        // sent.
+        let sent = Arc::new(AtomicUsize::new(0));
+        let sent_srv = Arc::clone(&sent);
+
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.expect("accept");
+            // Drain the request line/headers (best-effort; we don't parse).
+            let mut buf = [0u8; 1024];
+            let _ = sock.read(&mut buf).await;
+
+            // Chunked response, deliberately NO Content-Length, so only the
+            // streaming guard can bound it.
+            let head = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\n\r\n";
+            if sock.write_all(head).await.is_err() {
+                return;
+            }
+
+            // Each chunk is 64 KiB of payload, framed in HTTP/1.1 chunked
+            // encoding (`<hex-len>\r\n<data>\r\n`). Send far more than the
+            // cap; the client should bail long before we finish.
+            let chunk_payload = vec![b'x'; 64 * 1024];
+            let frame_header = format!("{:x}\r\n", chunk_payload.len());
+            // Cap how many chunks we even attempt so a buggy guard (that
+            // buffers everything) still terminates the test rather than
+            // looping forever — but we attempt comfortably more than the cap.
+            let max_chunks = (MAX_RESPONSE_BYTES / chunk_payload.len()) + 16;
+            for _ in 0..max_chunks {
+                if sock.write_all(frame_header.as_bytes()).await.is_err() {
+                    break;
+                }
+                if sock.write_all(&chunk_payload).await.is_err() {
+                    break;
+                }
+                if sock.write_all(b"\r\n").await.is_err() {
+                    break;
+                }
+                sent_srv.fetch_add(chunk_payload.len(), Ordering::SeqCst);
+            }
+            let _ = sock.write_all(b"0\r\n\r\n").await;
+        });
+
+        let opts = OptionsFrom {
+            http: format!("http://127.0.0.1:{port}/v1/models"),
+            bearer: None,
+            select: None,
+            after: vec![],
+        };
+        let err = fetch_options(&opts, &HashMap::new())
+            .await
+            .expect_err("oversized chunked body must error");
+        assert!(
+            err.to_string().contains("too large"),
+            "expected a size-cap error, got: {err}"
+        );
+
+        // Let the server observe the dropped connection and stop.
+        let _ = server.await;
+
+        // Non-buffering proof: the server could not push the whole oversized
+        // payload through — the client aborted mid-stream. We allow a
+        // generous slack for socket/TCP buffering (a few hundred KiB in
+        // flight), but it must be far below a second full cap's worth.
+        let total_sent = sent.load(Ordering::SeqCst);
+        assert!(
+            total_sent < MAX_RESPONSE_BYTES + 4 * 1024 * 1024,
+            "server sent {total_sent} bytes; client did not abort the stream early enough"
+        );
     }
 }

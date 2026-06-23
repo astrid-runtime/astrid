@@ -53,11 +53,13 @@ colored = { workspace = true }
 crossterm = { workspace = true }
 directories = { workspace = true }
 flate2 = { workspace = true }
+futures = { workspace = true }
 indicatif = { workspace = true }
 libc = { workspace = true }
 nix = { workspace = true }
 ratatui = { workspace = true }
-reqwest = { workspace = true, features = ["json"] }
+regex = { workspace = true }
+reqwest = { workspace = true, features = ["json", "stream"] }
 rmcp = { workspace = true }
 rustyline = { workspace = true }
 semver = { workspace = true }

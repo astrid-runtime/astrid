@@ -103,13 +103,7 @@ pub(crate) fn prompt_env_fields(
     let keys = order_env_keys(env_defs);
 
     for key in &keys {
-        if values.contains_key(key.as_str())
-            && !values
-                .get(key.as_str())
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or_default()
-                .is_empty()
-        {
+        if !should_prompt_for_key(&values, key) {
             continue;
         }
 
@@ -138,6 +132,21 @@ pub(crate) fn prompt_env_fields(
     }
 
     Ok(())
+}
+
+/// Decide whether to prompt the user for `key`, given the env values already
+/// on disk.
+///
+/// We prompt **only** when the key is absent (UNSET). A key that is already
+/// present is skipped even when its value is the empty string:
+/// `write_env_files` deliberately writes an empty string to mean "use the
+/// capsule's built-in default" for fields the distro pre-configured, so
+/// re-prompting for a present-but-empty field would nag the user for a
+/// blank-as-default value they never had to supply. Distinguishing UNSET
+/// (absent → prompt) from EXPLICITLY-EMPTY (present `""` → skip) preserves
+/// that contract.
+fn should_prompt_for_key(values: &serde_json::Map<String, serde_json::Value>, key: &str) -> bool {
+    !values.contains_key(key)
 }
 
 /// Prompt for one `[env]` field, honouring secret/enum/dynamic-select
@@ -389,6 +398,55 @@ mod tests {
 
     fn env(toml_src: &str) -> HashMap<String, EnvDef> {
         toml::from_str(toml_src).expect("env table parses")
+    }
+
+    #[test]
+    fn explicitly_empty_value_is_not_reprompted() {
+        // Regression for the blank-as-default nag: `write_env_files` writes an
+        // empty string to mean "use the capsule default". A present-but-empty
+        // field must be SKIPPED (not re-prompted), while a genuinely absent
+        // field still prompts.
+        let mut values = serde_json::Map::new();
+        values.insert(
+            "model".to_string(),
+            serde_json::Value::String(String::new()),
+        );
+        values.insert(
+            "base_url".to_string(),
+            serde_json::Value::String("https://h".to_string()),
+        );
+
+        // Present-but-empty → skip.
+        assert!(!should_prompt_for_key(&values, "model"));
+        // Present-and-non-empty → skip.
+        assert!(!should_prompt_for_key(&values, "base_url"));
+        // Absent (UNSET) → prompt.
+        assert!(should_prompt_for_key(&values, "api_key"));
+    }
+
+    #[test]
+    fn fully_preconfigured_env_file_is_left_untouched() {
+        // End-to-end: an env file whose keys are all present (one of them
+        // explicitly empty) must not trigger any prompt — so `prompt_env_fields`
+        // returns Ok without reading stdin and without rewriting the file.
+        let defs = env(r#"
+[model]
+type = "text"
+
+[base_url]
+type = "text"
+"#);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let env_path = dir.path().join("cap.env.json");
+        // `model` explicitly empty (blank-as-default), `base_url` populated.
+        std::fs::write(&env_path, r#"{"model":"","base_url":"https://h"}"#).expect("write");
+
+        prompt_env_fields(&defs, &env_path).expect("no prompt → Ok");
+
+        // Untouched: still exactly what we wrote (the function only rewrites
+        // when it actually prompted).
+        let after = std::fs::read_to_string(&env_path).expect("read");
+        assert_eq!(after, r#"{"model":"","base_url":"https://h"}"#);
     }
 
     #[test]
