@@ -225,19 +225,43 @@ pub(crate) fn enforce_astrid_version(manifest: &DistroManifest) -> anyhow::Resul
 /// **Prerelease policy.** By default `semver::VersionReq::matches` refuses a
 /// prerelease running version (e.g. `0.6.0-dev.3` does *not* satisfy `>=0.6.0`),
 /// which would falsely reject a locally-built / dev CLI that is, by release
-/// triple, at or above the floor. That is the classic semver footgun. We compare
-/// on the **release triple only** — the running version's `(major, minor, patch)`
-/// with the prerelease and build metadata stripped — so a dev build of a
-/// sufficiently-new astrid is accepted, while still rejecting a CLI whose release
-/// triple genuinely falls below the floor. A clean (non-prerelease) running
-/// version compares unchanged.
+/// triple, at or above the floor. That is the classic semver footgun. When the
+/// requirement is a plain release floor we compare on the **release triple
+/// only** — the running version's `(major, minor, patch)` with the prerelease
+/// and build metadata stripped — so a dev build of a sufficiently-new astrid is
+/// accepted, while still rejecting a CLI whose release triple genuinely falls
+/// below the floor. A clean (non-prerelease) running version compares unchanged.
+///
+/// **When the requirement itself names a prerelease** (e.g. `>=0.6.0-rc.3`) the
+/// operator is deliberately gating on a specific prerelease, so triple-stripping
+/// the running version would *over-accept*: `0.6.0-rc.2` would be lifted to
+/// `0.6.0` and wrongly satisfy `>=0.6.0-rc.3`. In that case we drop the
+/// dev-build convenience and compare the running version **as-is** under exact
+/// semver semantics, so prerelease ordering (`rc.2 < rc.3`) is honoured.
 pub(crate) fn distro_astrid_version_satisfied(req: &str, running: &Version) -> anyhow::Result<()> {
     let version_req = VersionReq::parse(req).map_err(|e| {
         anyhow::anyhow!("distro.astrid-version {req:?} is not a valid requirement: {e}")
     })?;
 
-    // Strip prerelease / build metadata: compare on the release triple so a
-    // dev / prerelease CLI at or above the floor is not falsely rejected.
+    // If any comparator in the requirement carries a prerelease, the operator
+    // is gating on an exact prerelease — honour real semver semantics (no
+    // triple-strip) so a lower prerelease of the same triple is not lifted past
+    // the floor. Otherwise apply the dev-build footgun fix below.
+    let req_names_prerelease = version_req.comparators.iter().any(|c| !c.pre.is_empty());
+    if req_names_prerelease {
+        if version_req.matches(running) {
+            return Ok(());
+        }
+        return Err(AstridVersionTooOld {
+            req: req.to_string(),
+            running: running.to_string(),
+        }
+        .into());
+    }
+
+    // Plain release floor: strip prerelease / build metadata and compare on the
+    // release triple so a dev / prerelease CLI at or above the floor is not
+    // falsely rejected.
     let release_triple = Version::new(running.major, running.minor, running.patch);
 
     if version_req.matches(&release_triple) {
@@ -456,6 +480,46 @@ issuers = ["admin"]
         let dev_below = Version::parse("0.5.0-dev.9").unwrap();
         distro_astrid_version_satisfied(">=0.6.0", &dev_below)
             .expect_err("0.5.0-dev.9 (release triple 0.5.0) must not satisfy >=0.6.0");
+    }
+
+    #[test]
+    fn prerelease_requirement_compares_running_exactly_no_triple_strip() {
+        // FIX E: when the REQUIREMENT itself names a prerelease, the running
+        // version's prerelease must NOT be stripped to its release triple —
+        // otherwise a lower prerelease of the same triple is wrongly lifted
+        // past the floor.
+
+        // The bug: `0.6.0-rc.2` is BELOW `>=0.6.0-rc.3`. Triple-stripping it to
+        // `0.6.0` would have wrongly satisfied the floor. It must be rejected.
+        let rc2 = Version::parse("0.6.0-rc.2").unwrap();
+        let err = distro_astrid_version_satisfied(">=0.6.0-rc.3", &rc2)
+            .expect_err("0.6.0-rc.2 must NOT satisfy >=0.6.0-rc.3");
+        let typed = err
+            .downcast_ref::<AstridVersionTooOld>()
+            .expect("below-floor prerelease rejection must be a typed error");
+        assert_eq!(typed.req, ">=0.6.0-rc.3");
+        assert_eq!(typed.running, "0.6.0-rc.2");
+
+        // Exactly at the prerelease floor is accepted.
+        let rc3 = Version::parse("0.6.0-rc.3").unwrap();
+        distro_astrid_version_satisfied(">=0.6.0-rc.3", &rc3)
+            .expect("0.6.0-rc.3 satisfies >=0.6.0-rc.3");
+
+        // A later prerelease of the same triple is accepted (rc.4 > rc.3).
+        let rc4 = Version::parse("0.6.0-rc.4").unwrap();
+        distro_astrid_version_satisfied(">=0.6.0-rc.3", &rc4)
+            .expect("0.6.0-rc.4 satisfies >=0.6.0-rc.3");
+
+        // The final release of the same triple is accepted (0.6.0 > any
+        // 0.6.0-pre under semver ordering).
+        let release = Version::parse("0.6.0").unwrap();
+        distro_astrid_version_satisfied(">=0.6.0-rc.3", &release)
+            .expect("0.6.0 satisfies >=0.6.0-rc.3");
+
+        // A newer release is also accepted.
+        let newer = Version::parse("0.7.0").unwrap();
+        distro_astrid_version_satisfied(">=0.6.0-rc.3", &newer)
+            .expect("0.7.0 satisfies >=0.6.0-rc.3");
     }
 
     #[test]
