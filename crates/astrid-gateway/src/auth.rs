@@ -12,6 +12,23 @@
 //! as raw bytes. Compact, easy to debug by eye, and tied to the
 //! same ed25519 primitive the rest of Astrid uses.
 //!
+//! ## Device-scoped bearers (v2.1)
+//!
+//! A bearer may OPTIONALLY carry the `key_id` of the registered device key it
+//! was minted for, so a paired device's per-device scope can be enforced at
+//! the kernel cap-gate. This adds a fifth segment:
+//!
+//! ```text
+//! b64(principal) "." b64(iat) "." b64(exp) "." b64(key_id) "." hex(sig)
+//! ```
+//!
+//! whose signature covers `principal:iat:exp:key_id`. The two arities are
+//! distinguished by segment count alone — a 4-segment token is a legacy
+//! full-authority bearer (`device_key_id = None`), a 5-segment token is
+//! device-scoped. The `key_id` is part of the signed message, so it cannot be
+//! tampered with or stripped without invalidating the signature. Legacy
+//! 4-segment bearers keep verifying unchanged.
+//!
 //! The `issued_at_epoch` (`iat`) claim was added in v0.7.1 so the
 //! gateway can mint cryptographically-scoped revocations: when an
 //! admin deletes a principal at time `T`, every bearer for that
@@ -58,6 +75,13 @@ pub struct CallerContext {
     pub issued_at_epoch: u64,
     /// Wall-clock epoch the bearer expires.
     pub expires_at_epoch: u64,
+    /// The registered device `key_id` this bearer was minted for, when the
+    /// token is device-scoped (5-segment form). `None` for a legacy
+    /// full-authority (4-segment) bearer. Stamped onto every gateway→kernel
+    /// admin request so the cap-gate can apply the device's scope as an
+    /// attenuation floor. Cryptographically bound: it is part of the signed
+    /// message, so a tampered or stripped `key_id` fails verification.
+    pub device_key_id: Option<String>,
 }
 
 /// Mint a fresh session bearer for `principal`.
@@ -77,6 +101,36 @@ pub fn mint_bearer(signer: &SigningKey, principal: &PrincipalId, lifetime_secs: 
     format!("{p_b64}.{i_b64}.{e_b64}.{s_hex}")
 }
 
+/// Mint a device-scoped session bearer for `principal` bound to the registered
+/// device `key_id`.
+///
+/// The five-segment form carries `key_id` as a fourth base64url segment and
+/// signs `principal:iat:exp:key_id`, so the kernel cap-gate can resolve the
+/// device's scope and attenuate the principal's authority. Used for a new
+/// device's bearer at pair-device redeem, and to preserve the device dimension
+/// across a refresh of an already-scoped bearer.
+#[must_use]
+pub fn mint_bearer_scoped(
+    signer: &SigningKey,
+    principal: &PrincipalId,
+    key_id: &str,
+    lifetime_secs: u64,
+) -> String {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    let expires = now.saturating_add(lifetime_secs);
+    let msg = format!("{principal}:{now}:{expires}:{key_id}");
+    let sig: Signature = signer.sign(msg.as_bytes());
+
+    let p_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(principal.as_str());
+    let i_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(now.to_string());
+    let e_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(expires.to_string());
+    let k_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(key_id);
+    let s_hex = hex::encode(sig.to_bytes());
+    format!("{p_b64}.{i_b64}.{e_b64}.{k_b64}.{s_hex}")
+}
+
 /// Parse and verify a bearer token. Returns the [`CallerContext`] on
 /// success, or `Err` with a generic shape so callers can't tell
 /// which check failed (avoids leaking validity oracle).
@@ -88,18 +142,24 @@ pub fn mint_bearer(signer: &SigningKey, principal: &PrincipalId, lifetime_secs: 
 /// snapshot would be worse than crashing the request handler, so we
 /// fail-stop on the auth path.
 pub fn verify_bearer(state: &GatewayState, raw: &str) -> Result<CallerContext, GatewayError> {
-    // `splitn(5, '.')` caps allocation at five slices regardless of
-    // input length. Without the cap, an attacker sending an
-    // Authorization header packed with dots would coerce `split('.')`
-    // into materialising millions of empty slices — a cheap path to
-    // memory / CPU exhaustion against an unauthenticated route.
-    // The cap is one beyond the expected segment count so a 5+
-    // segment input lands the trailing dots in `parts[3]` (the hex
-    // signature), where `hex::decode` will reject it.
-    let parts: Vec<&str> = raw.splitn(5, '.').collect();
-    if parts.len() != 4 {
-        return Err(GatewayError::Unauthorized);
-    }
+    // `splitn(6, '.')` caps allocation at six slices regardless of input
+    // length. Without the cap, an attacker sending an Authorization header
+    // packed with dots would coerce `split('.')` into materialising millions
+    // of empty slices — a cheap path to memory / CPU exhaustion against an
+    // unauthenticated route. Six is one beyond the largest valid arity (5), so
+    // a 6+ segment input still collapses to exactly six slices (the surplus
+    // dots ride in the final slice) and is then rejected by the arity check
+    // below — a malformed token never allocates unboundedly.
+    let parts: Vec<&str> = raw.splitn(6, '.').collect();
+    // Two valid arities: 4 = legacy full-authority bearer (no key_id), 5 =
+    // device-scoped bearer carrying a key_id. Any other length — including the
+    // capped 6-slice case above — is malformed and rejected before any decode.
+    let (key_id_seg, sig_seg) = match parts.len() {
+        4 => (None, 3),
+        5 => (Some(3usize), 4),
+        _ => return Err(GatewayError::Unauthorized),
+    };
+
     let p_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
         .decode(parts[0])
         .map_err(|_| GatewayError::Unauthorized)?;
@@ -109,7 +169,21 @@ pub fn verify_bearer(state: &GatewayState, raw: &str) -> Result<CallerContext, G
     let e_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
         .decode(parts[2])
         .map_err(|_| GatewayError::Unauthorized)?;
-    let s_bytes = hex::decode(parts[3]).map_err(|_| GatewayError::Unauthorized)?;
+    // The device key_id segment (5-segment form only). Decoded BEFORE the
+    // signature so the signed message can be reconstructed exactly.
+    let device_key_id = match key_id_seg {
+        Some(idx) => {
+            let k_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .decode(parts[idx])
+                .map_err(|_| GatewayError::Unauthorized)?;
+            let k = std::str::from_utf8(&k_bytes)
+                .map_err(|_| GatewayError::Unauthorized)?
+                .to_string();
+            Some(k)
+        },
+        None => None,
+    };
+    let s_bytes = hex::decode(parts[sig_seg]).map_err(|_| GatewayError::Unauthorized)?;
     if s_bytes.len() != ed25519_dalek::SIGNATURE_LENGTH {
         return Err(GatewayError::Unauthorized);
     }
@@ -126,7 +200,13 @@ pub fn verify_bearer(state: &GatewayState, raw: &str) -> Result<CallerContext, G
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_secs());
 
-    let msg = format!("{principal_str}:{issued_at_epoch}:{expires_at_epoch}");
+    // Reconstruct the signed message for the bearer's arity. A 5-segment
+    // token signs `principal:iat:exp:key_id`, so a tampered or stripped
+    // key_id (or a 4-vs-5 arity swap) invalidates the signature.
+    let msg = match &device_key_id {
+        Some(key_id) => format!("{principal_str}:{issued_at_epoch}:{expires_at_epoch}:{key_id}"),
+        None => format!("{principal_str}:{issued_at_epoch}:{expires_at_epoch}"),
+    };
     let mut sig_arr = [0u8; ed25519_dalek::SIGNATURE_LENGTH];
     sig_arr.copy_from_slice(&s_bytes);
     let sig = Signature::from_bytes(&sig_arr);
@@ -160,10 +240,30 @@ pub fn verify_bearer(state: &GatewayState, raw: &str) -> Result<CallerContext, G
         return Err(GatewayError::Unauthorized);
     }
 
+    // Per-device revocation: a device-scoped bearer minted at-or-before the
+    // moment its `key_id` was revoked (`PairDeviceRevoke`) is a dead session —
+    // stop it immediately rather than waiting for its TTL. Defense in depth: the
+    // key is already gone from the principal's `public_keys`, so every kernel
+    // request would fail closed anyway, but this rejects the HTTP bearer at the
+    // edge. The `iat <= revoked_at` comparison (mirroring principal revocation)
+    // means a bearer minted *after* the same deterministic key was re-paired
+    // still authenticates — the map is not a permanent deny-list.
+    if let Some(key_id) = &device_key_id
+        && let Some(&revoked_at) = state
+            .revoked_key_ids
+            .read()
+            .expect("revoked-key-id map poisoned — fail-stop on the auth path")
+            .get(key_id)
+        && issued_at_epoch <= revoked_at
+    {
+        return Err(GatewayError::Unauthorized);
+    }
+
     Ok(CallerContext {
         principal,
         issued_at_epoch,
         expires_at_epoch,
+        device_key_id,
     })
 }
 
@@ -220,6 +320,9 @@ mod tests {
             revoked_at: std::sync::Arc::new(std::sync::RwLock::new(
                 std::collections::HashMap::new(),
             )),
+            revoked_key_ids: std::sync::Arc::new(std::sync::RwLock::new(
+                std::collections::HashMap::new(),
+            )),
             audit_log: None,
             session_id: None,
             gateway_route_uuid: uuid::Uuid::new_v4(),
@@ -233,6 +336,74 @@ mod tests {
         let raw = mint_bearer(&state.signing.signer, &principal, 3600);
         let caller = verify_bearer(&state, &raw).expect("verify");
         assert_eq!(caller.principal, principal);
+    }
+
+    #[test]
+    fn legacy_bearer_carries_no_device_key_id() {
+        // A 4-segment (legacy / full-authority) bearer verifies and resolves to
+        // `device_key_id = None` — unattenuated at the cap-gate, the existing
+        // behaviour for every pre-pairing session.
+        let state = test_state();
+        let principal = PrincipalId::new("alice").unwrap();
+        let raw = mint_bearer(&state.signing.signer, &principal, 3600);
+        let caller = verify_bearer(&state, &raw).expect("verify");
+        assert_eq!(caller.device_key_id, None);
+    }
+
+    #[test]
+    fn scoped_bearer_round_trips_and_carries_key_id() {
+        // A 5-segment device-scoped bearer verifies and surfaces the bound
+        // key_id, so the cap-gate can apply that device's scope.
+        let state = test_state();
+        let principal = PrincipalId::new("alice").unwrap();
+        let raw = mint_bearer_scoped(&state.signing.signer, &principal, "dev-abc123", 3600);
+        let caller = verify_bearer(&state, &raw).expect("verify");
+        assert_eq!(caller.principal, principal);
+        assert_eq!(
+            caller.device_key_id.as_deref(),
+            Some("dev-abc123"),
+            "a scoped bearer must surface its device key_id"
+        );
+    }
+
+    #[test]
+    fn scoped_bearer_tampered_key_id_rejected() {
+        // The key_id is part of the signed message, so swapping it for a
+        // different (e.g. full-scope) device's id invalidates the signature —
+        // a scoped device cannot escalate by re-labelling its bearer.
+        let state = test_state();
+        let principal = PrincipalId::new("alice").unwrap();
+        let raw = mint_bearer_scoped(&state.signing.signer, &principal, "dev-scoped", 3600);
+        let parts: Vec<&str> = raw.split('.').collect();
+        assert_eq!(parts.len(), 5, "scoped bearer must be 5 segments");
+        // Replace the encoded key_id with a different device id but keep the
+        // original signature.
+        let forged_key = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode("dev-full-admin");
+        let tampered = format!(
+            "{}.{}.{}.{forged_key}.{}",
+            parts[0], parts[1], parts[2], parts[4]
+        );
+        assert!(
+            verify_bearer(&state, &tampered).is_err(),
+            "a tampered key_id must fail signature verification"
+        );
+    }
+
+    #[test]
+    fn scoped_bearer_stripped_to_legacy_rejected() {
+        // Dropping the key_id segment to forge a full-authority (4-seg) bearer
+        // out of a scoped one must fail: the signature was computed over the
+        // 5-segment message, so the reconstructed 4-segment message won't match.
+        let state = test_state();
+        let principal = PrincipalId::new("alice").unwrap();
+        let raw = mint_bearer_scoped(&state.signing.signer, &principal, "dev-scoped", 3600);
+        let parts: Vec<&str> = raw.split('.').collect();
+        // Reassemble as 4 segments (principal.iat.exp.sig), dropping key_id.
+        let stripped = format!("{}.{}.{}.{}", parts[0], parts[1], parts[2], parts[4]);
+        assert!(
+            verify_bearer(&state, &stripped).is_err(),
+            "stripping the key_id to forge a legacy bearer must fail"
+        );
     }
 
     #[test]

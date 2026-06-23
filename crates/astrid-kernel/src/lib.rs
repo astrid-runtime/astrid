@@ -2086,12 +2086,16 @@ mod tests {
         // Default now carries a per-principal ed25519 key + the Keypair
         // method, and the private key is on disk 0600 (issue #45/#852).
         assert!(
+            !profile.auth.public_keys.is_empty(),
+            "default must have an ed25519 key registered"
+        );
+        assert!(
             profile
                 .auth
                 .public_keys
                 .iter()
-                .any(|k| k.starts_with("ed25519:")),
-            "default must have an ed25519 key registered"
+                .all(|k| matches!(k.scope, astrid_core::profile::DeviceScope::Full)),
+            "bootstrap key must be Full-scope"
         );
         assert!(
             profile
@@ -2137,12 +2141,7 @@ mod tests {
             "private key bytes must be stable"
         );
         assert_eq!(
-            second
-                .auth
-                .public_keys
-                .iter()
-                .filter(|k| k.starts_with("ed25519:"))
-                .count(),
+            second.auth.public_keys.len(),
             1,
             "exactly one ed25519 key — no duplication across reboots"
         );
@@ -2537,11 +2536,7 @@ fn mint_default_principal_keypair(
 
     // Already has a key registered → nothing to do. (Re-minting would orphan
     // the on-disk key the operator may already be signing with.)
-    let has_key = profile
-        .auth
-        .public_keys
-        .iter()
-        .any(|k| k.starts_with("ed25519:"));
+    let has_key = !profile.auth.public_keys.is_empty();
     if has_key {
         return Ok(false);
     }
@@ -2570,9 +2565,22 @@ fn mint_default_principal_keypair(
         std::fs::write(&key_path, keypair.secret_key_bytes())?;
     }
 
-    let public_key = format!("ed25519:{}", keypair.export_public_key().to_hex());
-    if !profile.auth.public_keys.contains(&public_key) {
-        profile.auth.public_keys.push(public_key);
+    // Register Full-scope: the default principal's bootstrap keypair acts
+    // with the principal's full authority. Dedup by canonical pubkey.
+    let pubkey_hex = keypair.export_public_key().to_hex();
+    if profile.auth.device_by_pubkey(&pubkey_hex).is_none() {
+        profile
+            .auth
+            .public_keys
+            .push(astrid_core::profile::DeviceKey::new(
+                pubkey_hex,
+                astrid_core::profile::DeviceScope::Full,
+                None,
+                // Stamp the real mint epoch — `0` is the migrated-legacy-key
+                // sentinel, so using it for a freshly minted key would show a
+                // 1970 timestamp in `pair-device list` / audit.
+                i64::try_from(crate::invite::now_epoch()).unwrap_or(0),
+            ));
     }
     if !profile.auth.methods.contains(&AuthMethod::Keypair) {
         profile.auth.methods.push(AuthMethod::Keypair);

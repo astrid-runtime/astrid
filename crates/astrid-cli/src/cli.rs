@@ -11,9 +11,9 @@ use crate::commands::{
     agent::AgentCommand, audit::AuditArgs, budget::BudgetCommand, caps::CapsCommand,
     capsule::config::ConfigArgs as CapsuleConfigArgs, capsule::show::ShowArgs as CapsuleShowArgs,
     completions::CompletionsArgs, doctor::DoctorArgs, gc::GcArgs, group::GroupCommand,
-    invite::InviteCommand, keypair::KeypairCommand, logs::LogsArgs, ps::PsArgs,
-    quota::QuotaCommand, run::RunArgs, secret::SecretCommand, setup::SetupArgs, top::TopArgs,
-    trust::TrustCommand, version::VersionArgs, voucher::VoucherCommand, who::WhoArgs,
+    invite::InviteCommand, keypair::KeypairCommand, logs::LogsArgs, pair_device::PairDeviceCommand,
+    ps::PsArgs, quota::QuotaCommand, run::RunArgs, secret::SecretCommand, setup::SetupArgs,
+    top::TopArgs, trust::TrustCommand, version::VersionArgs, voucher::VoucherCommand, who::WhoArgs,
 };
 
 /// Astrid - Secure Agent Runtime
@@ -140,6 +140,13 @@ pub(crate) enum Commands {
     Keypair {
         #[command(subcommand)]
         command: KeypairCommand,
+    },
+
+    /// Pair an additional device with an existing principal: issue scoped
+    /// pair-tokens, list paired devices, and revoke them.
+    PairDevice {
+        #[command(subcommand)]
+        command: PairDeviceCommand,
     },
 
     /// Store and inspect capsule env configuration (API keys, base URLs).

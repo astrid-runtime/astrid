@@ -46,7 +46,13 @@ impl HostUnixListener for HostState {
             None
         };
 
-        let (stream, verified_principal) = loop {
+        // The handshake yields `Some((principal, device_key_id))` for a
+        // crypto-authenticated connection — the device id rides forward so the
+        // cap-gate can scope it — or `None` for a legacy/unauthenticated peer.
+        let (stream, verified_identity): (
+            _,
+            Option<(astrid_core::principal::PrincipalId, String)>,
+        ) = loop {
             let accept_result = util::bounded_block_on_cancellable(
                 &rt_handle,
                 &blocking_semaphore,
@@ -95,7 +101,7 @@ impl HostUnixListener for HostState {
                 );
                 match handshake_result {
                     None => return Err(ErrorCode::Closed),
-                    Some(Ok(principal)) => break (stream, principal),
+                    Some(Ok(identity)) => break (stream, identity),
                     Some(Err(reason)) => {
                         tracing::warn!(
                             security_event = true,
@@ -123,12 +129,15 @@ impl HostUnixListener for HostState {
             .map_err(|e| ErrorCode::Unknown(format!("resource table: {e}")))?;
         self.net_stream_count += 1;
         let rep = res.rep();
-        // Record the verified principal (issue #45/#852) keyed by the stream
-        // resource rep, now that the rep is known. Storage only; enforcement
-        // reads this registry separately. The binding is removed when the
-        // stream resource drops (see `TcpStream::drop`).
-        if let Some(principal) = verified_principal.clone() {
-            self.bind_connection_principal(rep, principal);
+        // Record the verified principal AND its authenticating device key_id
+        // (issue #45/#852) keyed by the stream resource rep, now that the rep
+        // is known. Storage only; enforcement reads this registry separately —
+        // the framed read copies both onto the in-flight ingress fields so
+        // `publish-as` stamps the device id for cap-gate scoping. The binding
+        // is removed when the stream resource drops (see `TcpStream::drop`).
+        let verified_principal = verified_identity.as_ref().map(|(p, _)| p.clone());
+        if let Some((principal, key_id)) = verified_identity {
+            self.bind_connection_principal(rep, principal, Some(key_id));
         }
         // Emit `client.v1.connect` for the kernel connection tracker, stamped
         // with the host-verified principal — `anonymous` for a legacy /
@@ -191,7 +200,7 @@ impl HostUnixListener for HostState {
         }
 
         let mut stream = stream;
-        let mut verified_principal = None;
+        let mut verified_identity: Option<(astrid_core::principal::PrincipalId, String)> = None;
         if let Some(ref token) = session_token {
             // See `accept` for why home is resolved here (issue #45/#852).
             let home = match astrid_core::dirs::AstridHome::resolve() {
@@ -223,7 +232,7 @@ impl HostUnixListener for HostState {
                     drop(stream);
                     return Ok(None);
                 },
-                Some(Ok(principal)) => verified_principal = principal,
+                Some(Ok(identity)) => verified_identity = identity,
             }
         }
 
@@ -239,9 +248,11 @@ impl HostUnixListener for HostState {
             .map_err(|e| ErrorCode::Unknown(format!("resource table: {e}")))?;
         self.net_stream_count += 1;
         let rep = res.rep();
-        // Same per-connection principal binding as `accept` (issue #45/#852).
-        if let Some(principal) = verified_principal.clone() {
-            self.bind_connection_principal(rep, principal);
+        // Same per-connection principal + device-key binding as `accept`
+        // (issue #45/#852).
+        let verified_principal = verified_identity.as_ref().map(|(p, _)| p.clone());
+        if let Some((principal, key_id)) = verified_identity {
+            self.bind_connection_principal(rep, principal, Some(key_id));
         }
         // Same `client.v1.connect` emission as `accept` — see there for the
         // anonymous-fallback and inbound-only rationale.

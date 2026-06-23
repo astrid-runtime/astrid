@@ -61,15 +61,18 @@ impl HostTcpStream for HostState {
             // Closed terminates the read loop cleanly.
             None => Ok(NetReadStatus::Closed),
         };
-        // ENFORCEMENT side of the per-connection principal registry
+        // ENFORCEMENT side of the per-connection identity registry
         // (issue #45/#852): when this framed read pulls a client frame off a
         // kernel-bound connection, record that connection's verified principal
-        // so the uplink's subsequent `publish-as` stamps THAT principal in place
-        // of the capsule-supplied name (the self-stamp fix). A non-data read
-        // (closed / pending) clears it, so a stale principal can never leak onto
-        // a later forward. Gated on the uplink capability: only the uplink
-        // forwards client frames, and only its accept path ever binds an entry,
-        // so a non-uplink read stays inert and skips the registry lookup.
+        // AND the device key_id that authenticated it, so the uplink's
+        // subsequent `publish-as` stamps THAT principal in place of the
+        // capsule-supplied name (the self-stamp fix) and THAT device's key_id
+        // so the kernel cap-gate can apply the device's scope. A non-data read
+        // (closed / pending) clears BOTH in lockstep, so a stale principal or
+        // device id can never leak onto a later forward. Gated on the uplink
+        // capability: only the uplink forwards client frames, and only its
+        // accept path ever binds an entry, so a non-uplink read stays inert
+        // and skips the registry lookup.
         if self.has_uplink_capability {
             let bound = match &result {
                 Ok(NetReadStatus::Data(_)) => self
@@ -78,7 +81,16 @@ impl HostTcpStream for HostState {
                     .map(|entry| entry.clone()),
                 _ => None,
             };
-            self.ingress_principal = bound;
+            match bound {
+                Some(identity) => {
+                    self.ingress_principal = Some(identity.principal);
+                    self.ingress_device_key_id = identity.device_key_id;
+                },
+                None => {
+                    self.ingress_principal = None;
+                    self.ingress_device_key_id = None;
+                },
+            }
         }
         let bytes = match &result {
             Ok(NetReadStatus::Data(d)) => d.len() as u64,
@@ -540,9 +552,10 @@ mod tests {
         let rep = state.resource_table.push(net).expect("push stream").rep();
 
         // The handshake bound this connection to `claude` (Path 2 crypto, or a
-        // Path 1 daemon spawn-binding).
+        // Path 1 daemon spawn-binding), with the matched device key_id so the
+        // cap-gate can scope it.
         let claude = astrid_core::PrincipalId::new("claude").unwrap();
-        state.bind_connection_principal(rep, claude.clone());
+        state.bind_connection_principal(rep, claude.clone(), Some("dev-abc123".to_string()));
 
         // Peer sends one length-prefixed frame (4-byte BE length + payload).
         let payload = br#"{"topic":"client.v1.connect","payload":{}}"#;
@@ -552,7 +565,8 @@ mod tests {
         peer.write_all(payload).await.unwrap();
         peer.flush().await.unwrap();
 
-        // A data read records the connection's verified principal.
+        // A data read records the connection's verified principal AND the
+        // device key_id that authenticated it.
         let status = HostTcpStream::read(&mut state, Resource::new_borrow(rep))
             .expect("read should succeed");
         assert!(
@@ -564,9 +578,14 @@ mod tests {
             Some(claude),
             "a data read on a kernel-bound connection must record its verified principal"
         );
+        assert_eq!(
+            state.ingress_device_key_id.as_deref(),
+            Some("dev-abc123"),
+            "a data read must record the connection's authenticating device key_id"
+        );
 
-        // A subsequent non-data read (no more frames → pending) clears it, so a
-        // stale principal can never leak onto a later forward.
+        // A subsequent non-data read (no more frames → pending) clears BOTH, so
+        // a stale principal or device id can never leak onto a later forward.
         let status = HostTcpStream::read(&mut state, Resource::new_borrow(rep))
             .expect("read should succeed");
         assert!(
@@ -576,6 +595,10 @@ mod tests {
         assert_eq!(
             state.ingress_principal, None,
             "a non-data read must clear the in-flight ingress principal"
+        );
+        assert_eq!(
+            state.ingress_device_key_id, None,
+            "a non-data read must clear the in-flight ingress device key_id"
         );
     }
 
@@ -598,7 +621,11 @@ mod tests {
         let (host_end, mut peer) = tokio::net::UnixStream::pair().expect("socketpair");
         let net = NetStream::Unix(std::sync::Arc::new(tokio::sync::Mutex::new(host_end)));
         let rep = state.resource_table.push(net).expect("push stream").rep();
-        state.bind_connection_principal(rep, astrid_core::PrincipalId::new("claude").unwrap());
+        state.bind_connection_principal(
+            rep,
+            astrid_core::PrincipalId::new("claude").unwrap(),
+            Some("dev-abc123".to_string()),
+        );
 
         let payload = br#"{"topic":"x","payload":{}}"#;
         peer.write_all(&(payload.len() as u32).to_be_bytes())
@@ -613,6 +640,10 @@ mod tests {
         assert_eq!(
             state.ingress_principal, None,
             "a non-uplink read must not populate the ingress principal"
+        );
+        assert_eq!(
+            state.ingress_device_key_id, None,
+            "a non-uplink read must not populate the ingress device key_id"
         );
     }
 }

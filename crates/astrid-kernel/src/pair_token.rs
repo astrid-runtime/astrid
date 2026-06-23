@@ -33,6 +33,7 @@
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use astrid_core::DeviceScope;
 use astrid_core::PrincipalId;
 use astrid_core::dirs::AstridHome;
 use base64::Engine;
@@ -66,6 +67,21 @@ pub struct PairToken {
     /// alongside the new key entry once the token is redeemed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
+    /// Capability scope the redeemed device will authenticate under,
+    /// resolved + validated at issue time. Redeem stamps this onto the new
+    /// [`DeviceKey`](astrid_core::DeviceKey) so the paired device is
+    /// attenuated to exactly this scope on every transport. Defaults to
+    /// [`DeviceScope::Full`] when absent so any pre-scope on-disk token (and
+    /// older serialized records) round-trips as an unattenuated device,
+    /// preserving the prior behaviour.
+    #[serde(default = "default_full_scope")]
+    pub scope: DeviceScope,
+}
+
+/// Serde default for [`PairToken::scope`] — `Full`, so an on-disk record
+/// written before scoping existed loads as an unattenuated device.
+fn default_full_scope() -> DeviceScope {
+    DeviceScope::Full
 }
 
 /// File-backed pair-token store. Read-modify-write with atomic
@@ -255,10 +271,32 @@ mod tests {
             expires_at_epoch: 9_999_999_999,
             issued_at_epoch: 1,
             label: Some("phone".into()),
+            scope: DeviceScope::Scoped {
+                allow: vec!["self:*".into()],
+                deny: vec!["self:auth:pair".into()],
+            },
         };
         store.save(&[token.clone()]).unwrap();
         let loaded = store.load().unwrap();
         assert_eq!(loaded, vec![token]);
+    }
+
+    #[test]
+    fn legacy_token_without_scope_loads_as_full() {
+        // A pair-token record written before the `scope` field existed has no
+        // `scope` key on disk; it must load as a Full-scope (unattenuated)
+        // device so the round-trip preserves the prior behaviour.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pair-tokens.toml");
+        let legacy = "[[pair_token]]\n\
+            token_hash = \"abc\"\n\
+            principal = \"alice\"\n\
+            expires_at_epoch = 9999999999\n\
+            issued_at_epoch = 1\n";
+        std::fs::write(&path, legacy).unwrap();
+        let loaded = PairTokenStore::new(path).load().unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].scope, DeviceScope::Full);
     }
 
     #[test]
@@ -271,6 +309,7 @@ mod tests {
                 expires_at_epoch: now.saturating_add(60),
                 issued_at_epoch: now,
                 label: None,
+                scope: DeviceScope::Full,
             },
             PairToken {
                 token_hash: "b".into(),
@@ -278,6 +317,7 @@ mod tests {
                 expires_at_epoch: now.saturating_sub(60),
                 issued_at_epoch: now.saturating_sub(120),
                 label: None,
+                scope: DeviceScope::Full,
             },
         ];
         assert_eq!(prune_expired(&mut v), 1);

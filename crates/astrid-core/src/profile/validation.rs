@@ -93,22 +93,67 @@ impl Quotas {
 }
 
 impl AuthConfig {
-    /// Validate public keys. Method variants are enforced by serde via the
-    /// closed [`AuthMethod`](super::AuthMethod) enum.
+    /// Validate registered device keys. Method variants are enforced by serde
+    /// via the closed [`AuthMethod`](super::AuthMethod) enum.
+    ///
+    /// Each [`DeviceKey`](super::DeviceKey) must carry a non-empty, 64-char
+    /// lowercase-hex pubkey and a non-empty `key_id`. For a
+    /// [`DeviceScope::Scoped`](super::DeviceScope::Scoped) device, every
+    /// `allow`/`deny` pattern must be a syntactically valid capability string
+    /// (same grammar as grants/revokes), so an attacker-crafted profile can't
+    /// smuggle a shell-metachar or double-glob through the device scope and
+    /// have it reach the matcher.
     ///
     /// # Errors
     ///
-    /// Returns [`ProfileError::Invalid`] if any public key is empty.
+    /// Returns [`ProfileError::Invalid`] on the first failing rule.
     pub fn validate(&self) -> ProfileResult<()> {
         for key in &self.public_keys {
-            if key.is_empty() {
-                return Err(ProfileError::Invalid(
-                    "auth.public_keys entries must be non-empty".into(),
-                ));
-            }
+            validate_device_key(key)?;
         }
         Ok(())
     }
+}
+
+/// Validate a single registered device key (pubkey shape + `key_id` presence +
+/// scope-pattern grammar). Fail-closed: the first failing rule errors.
+fn validate_device_key(key: &super::DeviceKey) -> ProfileResult<()> {
+    use super::DeviceScope;
+
+    if key.pubkey.is_empty() {
+        return Err(ProfileError::Invalid(
+            "auth.public_keys: device pubkey must be non-empty".into(),
+        ));
+    }
+    if key.pubkey.len() != 64 || !key.pubkey.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(ProfileError::Invalid(format!(
+            "auth.public_keys: device pubkey must be 64 hex chars, got {:?}",
+            key.pubkey
+        )));
+    }
+    // Canonical form is lowercase; an uppercase entry means an un-normalised
+    // key reached storage, which would defeat the deterministic key_id /
+    // dedup-by-pubkey contract.
+    if key.pubkey.chars().any(|c| c.is_ascii_uppercase()) {
+        return Err(ProfileError::Invalid(
+            "auth.public_keys: device pubkey must be lowercase hex".into(),
+        ));
+    }
+    if key.key_id.is_empty() {
+        return Err(ProfileError::Invalid(
+            "auth.public_keys: device key_id must be non-empty".into(),
+        ));
+    }
+    if let DeviceScope::Scoped { allow, deny } = &key.scope {
+        for pattern in allow.iter().chain(deny.iter()) {
+            validate_capability(pattern).map_err(|e| {
+                ProfileError::Invalid(format!(
+                    "auth.public_keys: device scope pattern {pattern:?} rejected: {e}"
+                ))
+            })?;
+        }
+    }
+    Ok(())
 }
 
 impl NetworkConfig {
@@ -254,9 +299,92 @@ mod tests {
     }
 
     #[test]
-    fn rejects_empty_public_key() {
+    fn accepts_full_scope_device_key() {
+        use super::super::{DeviceKey, DeviceScope};
         let mut p = PrincipalProfile::default();
-        p.auth.public_keys = vec![String::new()];
+        p.auth.public_keys = vec![DeviceKey::new("a".repeat(64), DeviceScope::Full, None, 0)];
+        p.validate().unwrap();
+    }
+
+    #[test]
+    fn accepts_scoped_device_key_with_valid_patterns() {
+        use super::super::{DeviceKey, DeviceScope};
+        let mut p = PrincipalProfile::default();
+        p.auth.public_keys = vec![DeviceKey::new(
+            "b".repeat(64),
+            DeviceScope::Scoped {
+                allow: vec!["self:*".into()],
+                deny: vec!["self:auth:pair".into()],
+            },
+            Some("laptop".into()),
+            0,
+        )];
+        p.validate().unwrap();
+    }
+
+    #[test]
+    fn rejects_device_key_with_bad_pubkey_len() {
+        use super::super::{DeviceKey, DeviceScope};
+        let mut p = PrincipalProfile::default();
+        // Construct directly so the bad pubkey bypasses the deserialize-time
+        // validation and reaches the profile validator.
+        p.auth.public_keys = vec![DeviceKey {
+            key_id: "deadbeef".into(),
+            pubkey: "abc".into(),
+            scope: DeviceScope::Full,
+            label: None,
+            created_at: 0,
+        }];
+        assert!(matches!(p.validate(), Err(ProfileError::Invalid(_))));
+    }
+
+    #[test]
+    fn rejects_device_key_with_empty_key_id() {
+        use super::super::{DeviceKey, DeviceScope};
+        let mut p = PrincipalProfile::default();
+        p.auth.public_keys = vec![DeviceKey {
+            key_id: String::new(),
+            pubkey: "a".repeat(64),
+            scope: DeviceScope::Full,
+            label: None,
+            created_at: 0,
+        }];
+        assert!(matches!(p.validate(), Err(ProfileError::Invalid(_))));
+    }
+
+    #[test]
+    fn rejects_device_scope_pattern_with_shell_metachar() {
+        use super::super::{DeviceKey, DeviceScope};
+        let mut p = PrincipalProfile::default();
+        p.auth.public_keys = vec![DeviceKey::new(
+            "c".repeat(64),
+            DeviceScope::Scoped {
+                allow: vec!["self:shutdown;rm".into()],
+                deny: vec![],
+            },
+            None,
+            0,
+        )];
+        let err = p.validate().unwrap_err();
+        match err {
+            ProfileError::Invalid(msg) => {
+                assert!(msg.contains("device scope pattern"), "msg: {msg}");
+            },
+            other => panic!("expected Invalid, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_device_pubkey_uppercase() {
+        use super::super::{DeviceKey, DeviceScope};
+        let mut p = PrincipalProfile::default();
+        p.auth.public_keys = vec![DeviceKey {
+            key_id: "deadbeef".into(),
+            pubkey: "A".repeat(64),
+            scope: DeviceScope::Full,
+            label: None,
+            created_at: 0,
+        }];
         assert!(matches!(p.validate(), Err(ProfileError::Invalid(_))));
     }
 

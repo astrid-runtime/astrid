@@ -41,7 +41,9 @@ fn assert_success(res: &AdminResponseBody) {
         | AdminResponseBody::InviteRedeemed(_)
         | AdminResponseBody::InviteList(_)
         | AdminResponseBody::PairToken(_)
-        | AdminResponseBody::PairTokenRedeemed(_) => {},
+        | AdminResponseBody::PairTokenRedeemed(_)
+        | AdminResponseBody::PairDeviceListed(_)
+        | AdminResponseBody::PairDeviceRevoked { .. } => {},
         AdminResponseBody::Error(msg) => panic!("expected success, got Error: {msg}"),
     }
 }

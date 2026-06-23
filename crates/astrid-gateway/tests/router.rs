@@ -21,7 +21,7 @@ use std::sync::Arc;
 use astrid_core::PrincipalId;
 use astrid_gateway::{
     GatewayConfig, GatewayState,
-    auth::{CallerContext, mint_bearer, verify_bearer},
+    auth::{CallerContext, mint_bearer, mint_bearer_scoped, verify_bearer},
     routes,
     routes::distribution::{
         DistributionInfo, OnboardingFields, parse_distribution, parse_onboarding,
@@ -71,6 +71,9 @@ fn fresh_state_with_distro(distro: Option<&str>) -> Arc<GatewayState> {
         metrics_handle: astrid_gateway::metrics::install_recorder().expect("recorder"),
         event_bus: None,
         revoked_at: std::sync::Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
+        revoked_key_ids: std::sync::Arc::new(std::sync::RwLock::new(
+            std::collections::HashMap::new(),
+        )),
         audit_log: None,
         session_id: None,
         gateway_route_uuid: uuid::Uuid::new_v4(),
@@ -123,6 +126,39 @@ async fn me_route_refuses_request_without_bearer() {
         .unwrap();
     let resp = router.oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn device_routes_require_a_bearer() {
+    // The paired-device management routes (list + revoke) are
+    // capability-gated admin operations and MUST sit behind the auth
+    // middleware. A regression that moved them to the public router would
+    // expose — and let anyone revoke — a principal's device fleet without a
+    // bearer. Assert both reject an unauthenticated request at the middleware,
+    // before any handler or kernel round-trip runs.
+    let state = fresh_state_with_distro(None);
+    let router = routes::build(state);
+
+    let list = Request::builder()
+        .uri("/api/sys/principals/alice/devices")
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(
+        router.clone().oneshot(list).await.unwrap().status(),
+        StatusCode::UNAUTHORIZED,
+        "GET /devices must require a bearer"
+    );
+
+    let revoke = Request::builder()
+        .method("DELETE")
+        .uri("/api/sys/principals/alice/devices/deadbeefdeadbeef")
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(
+        router.oneshot(revoke).await.unwrap().status(),
+        StatusCode::UNAUTHORIZED,
+        "DELETE /devices/{{key_id}} must require a bearer"
+    );
 }
 
 #[tokio::test]
@@ -252,7 +288,10 @@ async fn openapi_route_serves_valid_spec_unauthenticated() {
     for canary in [
         "/api/auth/redeem",
         "/api/auth/me",
+        "/api/auth/pair-device",
         "/api/sys/principals",
+        "/api/sys/principals/{id}/devices",
+        "/api/sys/principals/{id}/devices/{key_id}",
         "/api/sys/capabilities",
         "/api/capsules",
         "/api/events",
@@ -297,6 +336,7 @@ fn openapi_types_kernel_payloads_instead_of_opaque_json() {
         "GroupSummaryView",
         "InviteIssuedView",
         "InviteSummaryView",
+        "DeviceKeyInfoView",
     ] {
         assert!(
             schemas.contains_key(mirror),
@@ -399,6 +439,8 @@ fn openapi_lists_every_router_route() {
         "/api/sys/principals/{id}/caps",
         "/api/sys/principals/{id}/quotas",
         "/api/sys/principals/{id}/usage",
+        "/api/sys/principals/{id}/devices",
+        "/api/sys/principals/{id}/devices/{key_id}",
         "/api/sys/groups",
         "/api/sys/groups/{name}",
         "/api/sys/invites",
@@ -532,5 +574,78 @@ async fn pair_device_redeem_is_rate_limited_per_ip() {
         resp.status(),
         StatusCode::TOO_MANY_REQUESTS,
         "pair-device/redeem must enforce the shared per-IP redeem limiter"
+    );
+}
+
+// ── Device-scoped bearer: key_id extraction + per-key revocation ──────
+
+#[tokio::test]
+async fn scoped_bearer_carries_device_key_id_to_caller_context() {
+    // A 5-segment device-scoped bearer must verify and surface its `key_id`
+    // on the CallerContext. The gateway stamps that key_id onto every admin
+    // request (via `admin_client_for`), so the kernel cap-gate attenuates the
+    // op to the device's scope — the HTTP half of the cross-transport
+    // guarantee. (The kernel-side denial is proven in the kernel crate.)
+    let state = fresh_state_with_distro(None);
+    let principal = PrincipalId::new("alice").unwrap();
+    let key_id = "abc123def4567890";
+    let bearer = mint_bearer_scoped(&state.signing.signer, &principal, key_id, 3600);
+
+    let caller = verify_bearer(&state, &bearer).expect("scoped bearer verifies");
+    assert_eq!(caller.principal, principal);
+    assert_eq!(
+        caller.device_key_id.as_deref(),
+        Some(key_id),
+        "the scoped bearer's key_id must reach the CallerContext"
+    );
+}
+
+#[tokio::test]
+async fn revoked_device_key_id_rejects_bearer() {
+    // Criterion 4 (HTTP half): a device-scoped bearer minted at-or-before its
+    // key_id's revocation epoch (recorded from the PairDeviceRevoke audit
+    // signal) is rejected by `verify_bearer` — the live HTTP session stops
+    // immediately, independent of the bearer's remaining TTL.
+    let state = fresh_state_with_distro(None);
+    let principal = PrincipalId::new("alice").unwrap();
+    let key_id = "deadbeefcafe0001";
+    let bearer = mint_bearer_scoped(&state.signing.signer, &principal, key_id, 3600);
+
+    // The bearer's iat anchors the at-or-before-revoke comparison.
+    let iat = verify_bearer(&state, &bearer)
+        .expect("scoped bearer verifies before revocation")
+        .issued_at_epoch;
+
+    // Revoke at-or-after the bearer's iat (what the audit watcher records on a
+    // successful PairDeviceRevoke) → the bearer is a dead session.
+    state
+        .revoked_key_ids
+        .write()
+        .expect("revoked key map")
+        .insert(key_id.to_string(), iat);
+    assert!(
+        verify_bearer(&state, &bearer).is_err(),
+        "a bearer minted at-or-before the revoke epoch must be rejected"
+    );
+
+    // Re-pair: the same deterministic key_id, but recorded with an EARLIER
+    // revoke epoch than this bearer was minted (iat > revoked_at — i.e. a bearer
+    // minted after the device was re-paired). Keying on the epoch rather than a
+    // bare membership set lets it authenticate instead of being dead forever.
+    state
+        .revoked_key_ids
+        .write()
+        .expect("revoked key map")
+        .insert(key_id.to_string(), iat.saturating_sub(1));
+    assert!(
+        verify_bearer(&state, &bearer).is_ok(),
+        "a bearer minted after the revoke epoch (re-pair) must authenticate"
+    );
+
+    // A bearer for a DIFFERENT key on the same principal is unaffected.
+    let other = mint_bearer_scoped(&state.signing.signer, &principal, "0000111122223333", 3600);
+    assert!(
+        verify_bearer(&state, &other).is_ok(),
+        "revoking one device must not stop another device's bearer"
     );
 }

@@ -19,7 +19,7 @@ use axum::http::Request;
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
-use crate::auth::{CallerContext, mint_bearer};
+use crate::auth::{CallerContext, mint_bearer, mint_bearer_scoped};
 use crate::error::{ErrorBody, GatewayError, GatewayResult};
 use crate::state::GatewayState;
 
@@ -64,6 +64,12 @@ pub struct MeResponse {
     pub principal: PrincipalId,
     /// Bearer expiry — clients can use this to schedule a refresh.
     pub expires_at_epoch: u64,
+    /// The device `key_id` this session is bound to, when the bearer is
+    /// device-scoped. Omitted for a legacy full-authority session. Lets a
+    /// client see (and surface to the user) which paired device it is acting
+    /// as, and what scope dimension a refresh will preserve.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub device_key_id: Option<String>,
 }
 
 /// Handler: redeem an invite token, mint a principal, return a
@@ -177,6 +183,7 @@ pub async fn get_me(req: Request<axum::body::Body>) -> GatewayResult<Json<MeResp
     Ok(Json(MeResponse {
         principal: caller.principal.clone(),
         expires_at_epoch: caller.expires_at_epoch,
+        device_key_id: caller.device_key_id.clone(),
     }))
 }
 
@@ -204,6 +211,51 @@ pub struct PairDeviceIssueRequest {
     /// key entry on `AuthConfig.public_keys` once redeemed.
     #[serde(default)]
     pub label: Option<String>,
+    /// Capability scope the redeemed device authenticates under.
+    ///
+    /// A friendly preset name: `"full"` (unattenuated — requires the issuer
+    /// to hold `self:auth:pair:admin`) or `"use-only"` (the device may act
+    /// with the principal's self-scoped caps but cannot pair further devices
+    /// or delegate). Omitted ⇒ `"full"`, preserving the prior behaviour.
+    ///
+    /// For a custom allow/deny scope, leave `scope` unset (or `"full"`) and
+    /// supply `allow` / `deny` instead — any non-empty `allow`/`deny` selects
+    /// an explicit scope, validated to be a subset of the issuer's authority.
+    #[serde(default)]
+    pub scope: Option<String>,
+    /// Explicit allow patterns for a custom scope. When non-empty (or `deny`
+    /// is), the request is an explicit scope and `scope` is ignored. Every
+    /// pattern must be held by the issuer (no escalation).
+    #[serde(default)]
+    pub allow: Vec<String>,
+    /// Explicit deny patterns for a custom scope (deny wins). Purely
+    /// restrictive — needs no subset validation.
+    #[serde(default)]
+    pub deny: Vec<String>,
+}
+
+impl PairDeviceIssueRequest {
+    /// Map the friendly HTTP scope fields to the kernel [`PairScopeArg`].
+    ///
+    /// Precedence: a non-empty `allow`/`deny` ⇒ `Explicit`; otherwise a
+    /// `scope` of `"full"`/absent ⇒ `Full`, and any other `scope` string ⇒
+    /// `Preset { name }` (the kernel rejects an unknown preset). This keeps
+    /// the common cases one field while still exposing explicit caps.
+    fn to_scope_arg(&self) -> astrid_core::kernel_api::PairScopeArg {
+        use astrid_core::kernel_api::PairScopeArg;
+        if !self.allow.is_empty() || !self.deny.is_empty() {
+            return PairScopeArg::Explicit {
+                allow: self.allow.clone(),
+                deny: self.deny.clone(),
+            };
+        }
+        match self.scope.as_deref() {
+            None | Some("full") => PairScopeArg::Full,
+            Some(name) => PairScopeArg::Preset {
+                name: name.to_string(),
+            },
+        }
+    }
 }
 
 /// Inbound body for `POST /api/auth/pair-device/redeem`. Unauthenticated
@@ -227,7 +279,12 @@ pub struct PairDeviceRedeemResponse {
     pub principal: PrincipalId,
     /// SHA-256 fingerprint of the registered key.
     pub public_key_fingerprint: String,
-    /// Signed bearer token for subsequent requests.
+    /// Deterministic `key_id` of the registered device key. The session
+    /// bearer is scoped to this `key_id`, so the device authenticates with —
+    /// and is attenuated to — its own registered key at the kernel cap-gate.
+    pub key_id: String,
+    /// Signed bearer token for subsequent requests. Device-scoped: it carries
+    /// `key_id` so the kernel applies this device's scope.
     pub session_token: String,
     /// Wall-clock epoch the bearer expires.
     pub session_expires_at_epoch: u64,
@@ -258,11 +315,18 @@ pub async fn post_pair_device_issue(
         .cloned()
         .ok_or(GatewayError::Unauthorized)?;
     let body: PairDeviceIssueRequest = crate::routes::principals::read_json_body(req).await?;
-    let client = state.admin_client(caller.principal)?;
+    let scope = body.to_scope_arg();
+    // Carry the issuer's device scope to the kernel: a use-only paired device
+    // calling `pair-device issue` must be denied at the cap-gate even though
+    // its principal holds `self:auth:pair` — the device's deny-list fences it.
+    // The requested child scope is validated kernel-side against the issuer's
+    // attenuated effective set (no escalation) and the full-mint gate.
+    let client = state.admin_client_for(&caller)?;
     let resp = client
         .request(AdminRequestKind::PairDeviceIssue {
             expires_secs: body.expires_secs,
             label: body.label,
+            scope,
         })
         .await
         .map_err(|e| GatewayError::Internal(anyhow::anyhow!("daemon request: {e}")))?;
@@ -351,9 +415,13 @@ pub async fn post_pair_device_redeem(
         },
     };
 
-    let session_token = mint_bearer(
+    // The new device's bearer is scoped to ITS key_id (returned by the kernel
+    // redeem), so the device authenticates as — and is attenuated to — its own
+    // registered key at the cap-gate, not the principal's full authority.
+    let session_token = mint_bearer_scoped(
         &state.signing.signer,
         &redeemed.principal,
+        &redeemed.key_id,
         state.config.session_lifetime_secs,
     );
     let session_expires_at_epoch = std::time::SystemTime::now()
@@ -364,6 +432,7 @@ pub async fn post_pair_device_redeem(
     Ok(Json(PairDeviceRedeemResponse {
         principal: redeemed.principal,
         public_key_fingerprint: redeemed.public_key_fingerprint,
+        key_id: redeemed.key_id,
         session_token,
         session_expires_at_epoch,
     }))
@@ -396,11 +465,23 @@ pub async fn post_refresh(
         .extensions()
         .get::<CallerContext>()
         .ok_or(GatewayError::Unauthorized)?;
-    let session_token = mint_bearer(
-        &state.signing.signer,
-        &caller.principal,
-        state.config.session_lifetime_secs,
-    );
+    // A refresh must NEVER drop or change the device-scope dimension: a
+    // scoped bearer re-mints scoped to the SAME key_id, a legacy bearer
+    // re-mints as legacy. Otherwise a scoped device could shed its
+    // attenuation simply by refreshing.
+    let session_token = match &caller.device_key_id {
+        Some(key_id) => mint_bearer_scoped(
+            &state.signing.signer,
+            &caller.principal,
+            key_id,
+            state.config.session_lifetime_secs,
+        ),
+        None => mint_bearer(
+            &state.signing.signer,
+            &caller.principal,
+            state.config.session_lifetime_secs,
+        ),
+    };
     let session_expires_at_epoch = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs())

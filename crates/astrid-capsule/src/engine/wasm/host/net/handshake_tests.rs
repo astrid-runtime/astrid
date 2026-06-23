@@ -12,10 +12,23 @@
 use super::*;
 
 use astrid_core::dirs::AstridHome;
+use astrid_core::profile::{DeviceKey, DeviceScope};
 use astrid_core::session_token::{
     HandshakeRequest, HandshakeResponse, PROTOCOL_VERSION, principal_auth_challenge_message,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+/// Build a Full-scope [`DeviceKey`] from a keypair's exported public key for
+/// the signature-verification tests (the scope is irrelevant to the pure
+/// signature check, which only consults the registered pubkey).
+fn full_device(keypair: &astrid_crypto::KeyPair) -> DeviceKey {
+    DeviceKey::new(
+        keypair.export_public_key().to_hex(),
+        DeviceScope::Full,
+        None,
+        0,
+    )
+}
 
 // ── Crypto-core: challenge-message sign/verify round trip ──────────────
 
@@ -25,26 +38,28 @@ fn challenge_signature_verifies_against_registered_key() {
     let nonce_hex = hex::encode([7u8; PRINCIPAL_AUTH_NONCE_LEN]);
 
     let keypair = astrid_crypto::KeyPair::generate();
-    let registered = format!("ed25519:{}", keypair.export_public_key().to_hex());
+    let registered = full_device(&keypair);
 
     let message = principal_auth_challenge_message(principal.as_str(), &nonce_hex);
     let signature = keypair.sign(message.as_bytes()).to_hex();
 
-    // A registered key over the exact challenge message verifies.
-    assert!(
+    // A registered key over the exact challenge message verifies, returning
+    // THAT device's key_id so the connection can be scoped to it.
+    assert_eq!(
         verify_signature_against_keys(
             &principal,
             std::slice::from_ref(&registered),
             &nonce_hex,
             &signature
         )
-        .is_ok(),
-        "valid signature must verify against the registered key"
+        .as_deref(),
+        Ok(registered.key_id.as_str()),
+        "valid signature must verify and return the matched device key_id"
     );
 
     // A DIFFERENT key fails.
     let other = astrid_crypto::KeyPair::generate();
-    let other_registered = format!("ed25519:{}", other.export_public_key().to_hex());
+    let other_registered = full_device(&other);
     assert!(
         verify_signature_against_keys(&principal, &[other_registered], &nonce_hex, &signature)
             .is_err(),
@@ -83,10 +98,7 @@ fn home_with_registered_key(
     let dir = tempfile::tempdir().expect("tempdir");
     let home = AstridHome::from_path(dir.path());
     let mut profile = astrid_core::PrincipalProfile::default();
-    profile
-        .auth
-        .public_keys
-        .push(format!("ed25519:{}", keypair.export_public_key().to_hex()));
+    profile.auth.public_keys.push(full_device(keypair));
     profile
         .auth
         .methods
@@ -189,10 +201,11 @@ async fn handshake_signed_returns_verified_principal() {
     assert!(final_resp.is_ok(), "signed handshake must succeed");
 
     let verified = server_task.await.unwrap().expect("handshake ok");
+    let expected_key_id = full_device(&keypair).key_id;
     assert_eq!(
         verified,
-        Some(principal),
-        "a valid signed handshake yields the verified principal"
+        Some((principal, expected_key_id)),
+        "a valid signed handshake yields the verified principal and matched device key_id"
     );
 }
 

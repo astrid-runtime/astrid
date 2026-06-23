@@ -211,11 +211,18 @@ fn check_subscribe_acl(state: &HostState, topic_pattern: &str) -> Result<(), Err
 
 /// Shared publish path used by [`ipc::Host::publish`] and
 /// [`ipc::Host::publish_as`].
+///
+/// `device_key_id` is the host-derived authenticating-device fingerprint to
+/// stamp onto the outbound message so the kernel cap-gate can apply the
+/// device's scope. `None` for a capsule's own-principal `publish` (its own
+/// host calls are never device-scoped) and for an unauthenticated forward;
+/// `publish_as` passes the connection's in-flight `ingress_device_key_id`.
 fn publish_inner(
     state: &mut HostState,
     topic: String,
     payload: String,
     principal_str: String,
+    device_key_id: Option<&str>,
 ) -> Result<(), ErrorCode> {
     if topic.len() > 256 {
         return Err(ErrorCode::InvalidInput);
@@ -262,8 +269,15 @@ fn publish_inner(
         Err(_) => return Err(ErrorCode::InvalidInput),
     };
 
-    let message = InternalIpcMessage::new(topic, ipc_payload, state.capsule_uuid)
+    let mut message = InternalIpcMessage::new(topic, ipc_payload, state.capsule_uuid)
         .with_principal(principal_str);
+    // Stamp the host-derived authenticating-device fingerprint so the kernel
+    // cap-gate can apply the device's scope as an attenuation floor. Only the
+    // `publish_as` forward path carries one; a capsule's own `publish` passes
+    // `None` (its host calls run at the owner's full authority).
+    if let Some(id) = device_key_id {
+        message = message.with_device_key_id(id);
+    }
 
     state.event_bus.publish(AstridEvent::Ipc {
         metadata: EventMetadata::new("wasm_guest").with_session_id(state.capsule_uuid),
@@ -281,7 +295,9 @@ impl ipc::Host for HostState {
             .unwrap_or_else(|| self.principal.to_string());
         let bytes = payload.len() as u64;
         let topic_for_audit = topic.clone();
-        let result = publish_inner(self, topic, payload, principal_str);
+        // A capsule's own host calls are never device-scoped: the owner acts at
+        // full principal authority, so no device_key_id is stamped here.
+        let result = publish_inner(self, topic, payload, principal_str, None);
         audit_ipc(
             self,
             "astrid:ipc/host.publish",
@@ -313,9 +329,16 @@ impl ipc::Host for HostState {
             Some(verified) => verified.as_str().to_owned(),
             None => astrid_core::principal::PrincipalId::anonymous().into_inner(),
         };
+        // The authenticating device is host-derived from the same in-flight
+        // connection (recorded by the framed read that pulled this frame),
+        // never named by the capsule. It rides onto the message so the kernel
+        // cap-gate attenuates the principal's authority to the device's scope.
+        // `None` for an unbound (unauthenticated) connection — the anonymous
+        // stamp already fails closed on every capability check.
+        let device_key_id = self.ingress_device_key_id.clone();
         let bytes = payload.len() as u64;
         let topic_for_audit = topic.clone();
-        let result = publish_inner(self, topic, payload, effective);
+        let result = publish_inner(self, topic, payload, effective, device_key_id.as_deref());
         audit_ipc(
             self,
             "astrid:ipc/host.publish-as",
@@ -624,296 +647,5 @@ impl HostSubscription for HostState {
 }
 
 #[cfg(test)]
-mod audit_scope_tests {
-    use super::*;
-    use crate::engine::wasm::bindings::astrid::ipc::host::Host as IpcHost;
-    use crate::engine::wasm::test_fixtures::minimal_host_state;
-
-    #[test]
-    fn audit_topic_literal_pinned() {
-        // The capsule-local `AUDIT_TOPIC` must stay byte-equal to the
-        // kernel's sole publisher (`astrid_kernel::kernel_router::AUDIT_TOPIC`)
-        // and the gateway SSE consumer (`astrid-gateway`'s
-        // `events::AUDIT_TOPIC`). The capsule cannot import the kernel
-        // constant without a dependency cycle, so this pins the literal the
-        // capsule routes against. If the kernel ever renames the topic,
-        // `pattern_covers_audit` would otherwise silently stop recognising
-        // audit subscriptions and leave them on the unscoped firehose default
-        // for the renamed topic — exactly the drift the doc comment promises
-        // is guarded. Mirrors `tests::audit_firehose_cap_literal_pinned`.
-        assert_eq!(AUDIT_TOPIC, "astrid.v1.audit.entry");
-    }
-
-    // ── pattern_covers_audit (route-layer matcher, NOT topic_matches) ──
-
-    #[test]
-    fn pattern_covers_audit_via_route_matcher() {
-        // Exact + audit-subtree wildcard + broad superset all COVER the
-        // audit topic via the route matcher's trailing-suffix branch.
-        assert!(pattern_covers_audit("astrid.v1.audit.entry"));
-        assert!(pattern_covers_audit("astrid.v1.audit.*"));
-        // The wildcard-superset bypass the route matcher closes: the
-        // capsule's own topic_matches CANNOT see this coverage, but the
-        // route matcher (what the bus routes with) DOES.
-        assert!(pattern_covers_audit("astrid.v1.*"));
-        assert!(pattern_covers_audit("astrid.*"));
-
-        // Non-audit patterns are NOT covered → never scoped.
-        assert!(!pattern_covers_audit("astrid.v1.request.*"));
-        assert!(!pattern_covers_audit("astrid.v1.session.*"));
-        assert!(!pattern_covers_audit("astrid.v1.audit"));
-        assert!(!pattern_covers_audit("user.prompt"));
-    }
-
-    /// Build a routed publish on `bus` for an audit entry attributed to
-    /// `principal` (mirrors the kernel's `record_admin_audit` shape: topic
-    /// `astrid.v1.audit.entry`, `with_principal`).
-    fn publish_audit(bus: &astrid_events::EventBus, principal: &str) {
-        let msg = InternalIpcMessage::new(
-            AUDIT_TOPIC,
-            IpcPayload::RawJson(serde_json::json!({ "principal": principal })),
-            uuid::Uuid::nil(),
-        )
-        .with_principal(principal.to_string());
-        bus.publish(AstridEvent::Ipc {
-            metadata: EventMetadata::new("test_kernel"),
-            message: msg,
-        });
-    }
-
-    /// Drain the subscription's delivered messages and collect the
-    /// `Verified` principal strings.
-    fn drained_principals(state: &mut HostState, sub: &Resource<Subscription>) -> Vec<String> {
-        let envelope = HostSubscription::poll(state, Resource::new_borrow(sub.rep()))
-            .expect("poll should succeed");
-        envelope
-            .messages
-            .iter()
-            .map(|m| match &m.principal {
-                PrincipalAttribution::Verified(p) | PrincipalAttribution::Claimed(p) => p.clone(),
-                PrincipalAttribution::System => "<system>".to_string(),
-            })
-            .collect()
-    }
-
-    fn host_state_for(
-        rt: tokio::runtime::Handle,
-        owner: &str,
-        firehose: bool,
-        subscribe_acl: &[&str],
-    ) -> HostState {
-        let mut state = minimal_host_state(rt);
-        state.principal = astrid_core::PrincipalId::new(owner).expect("valid principal");
-        state.audit_firehose = firehose;
-        state.ipc_subscribe_patterns = subscribe_acl.iter().map(|s| (*s).to_string()).collect();
-        state
-    }
-
-    #[tokio::test]
-    async fn subscribe_audit_default_is_scoped_regression() {
-        // THE bug regression. A capsule with audit_firehose=false and the
-        // audit topic in its ACL, owner=alice, must receive ONLY alice's
-        // entries — bob's leak on today's unconditional firehose default.
-        let rt = tokio::runtime::Handle::current();
-        let mut state = host_state_for(rt, "alice", false, &["astrid.v1.audit.entry"]);
-        let bus = state.event_bus.clone();
-
-        let sub = IpcHost::subscribe(&mut state, AUDIT_TOPIC.to_string())
-            .expect("subscribe should be allowed by the ACL");
-
-        for _ in 0..5 {
-            publish_audit(&bus, "alice");
-        }
-        for _ in 0..5 {
-            publish_audit(&bus, "bob");
-        }
-
-        let got = drained_principals(&mut state, &sub);
-        assert_eq!(got.len(), 5, "only alice's five entries are delivered");
-        assert!(
-            got.iter().all(|p| p == "alice"),
-            "no foreign-principal audit entry may leak, got: {got:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn subscribe_wildcard_superset_is_scoped() {
-        // A broad `astrid.v1.*` subscription (covers audit) by a
-        // non-firehose capsule is still scoped — closes the wildcard bypass.
-        let rt = tokio::runtime::Handle::current();
-        let mut state = host_state_for(rt, "alice", false, &["astrid.v1.*"]);
-        let bus = state.event_bus.clone();
-
-        let sub = IpcHost::subscribe(&mut state, "astrid.v1.*".to_string())
-            .expect("subscribe should be allowed by the ACL");
-
-        publish_audit(&bus, "alice");
-        publish_audit(&bus, "bob");
-
-        let got = drained_principals(&mut state, &sub);
-        assert!(
-            got.iter().all(|p| p == "alice"),
-            "wildcard superset must not leak bob's audit entry, got: {got:?}"
-        );
-        assert_eq!(got.len(), 1);
-    }
-
-    #[tokio::test]
-    async fn subscribe_firehose_holder_unscoped() {
-        // audit_firehose=true ⇒ unscoped: both alice and bob delivered.
-        let rt = tokio::runtime::Handle::current();
-        let mut state = host_state_for(rt, "alice", true, &["astrid.v1.audit.entry"]);
-        let bus = state.event_bus.clone();
-
-        let sub = IpcHost::subscribe(&mut state, AUDIT_TOPIC.to_string())
-            .expect("subscribe should be allowed by the ACL");
-
-        publish_audit(&bus, "alice");
-        publish_audit(&bus, "bob");
-
-        let got = drained_principals(&mut state, &sub);
-        assert_eq!(got.len(), 2, "firehose holder receives both principals");
-        assert!(got.iter().any(|p| p == "alice"));
-        assert!(got.iter().any(|p| p == "bob"));
-    }
-
-    #[tokio::test]
-    async fn subscribe_non_audit_topic_unaffected() {
-        // A non-audit subscription (pattern_covers_audit=false) stays
-        // unscoped even for a non-firehose capsule: cross-principal fan-in
-        // is untouched by the audit flip.
-        let rt = tokio::runtime::Handle::current();
-        let mut state = host_state_for(rt, "alice", false, &["astrid.v1.session.*"]);
-        let bus = state.event_bus.clone();
-
-        let sub = IpcHost::subscribe(&mut state, "astrid.v1.session.*".to_string())
-            .expect("subscribe should be allowed by the ACL");
-
-        // Publish session events from two principals.
-        for who in ["alice", "bob"] {
-            let msg = InternalIpcMessage::new(
-                "astrid.v1.session.update",
-                IpcPayload::RawJson(serde_json::json!({})),
-                uuid::Uuid::nil(),
-            )
-            .with_principal(who.to_string());
-            bus.publish(AstridEvent::Ipc {
-                metadata: EventMetadata::new("test"),
-                message: msg,
-            });
-        }
-
-        let got = drained_principals(&mut state, &sub);
-        assert_eq!(got.len(), 2, "non-audit fan-in delivers all principals");
-        assert!(got.iter().any(|p| p == "alice"));
-        assert!(got.iter().any(|p| p == "bob"));
-    }
-
-    #[tokio::test]
-    async fn subscribe_rejects_non_terminal_wildcard() {
-        // Regression guard for the daemon-down crash (capsule-cli #25). The cli
-        // run loop tried to runtime-subscribe to a multi-wildcard pattern; the
-        // syntactic gate returned InvalidInput, run() returned Err before
-        // signal_ready, and the whole daemon went unreachable (the cli owns the
-        // socket). The patterns are even DECLARED in the subscribe ACL here — the
-        // gate rejects them regardless, so a manifest can declare a [subscribe]
-        // pattern a runtime subscribe can never use. Pin it: a `*` that is not the
-        // final segment is rejected; the single trailing `*` the fix kept works.
-        let rt = tokio::runtime::Handle::current();
-        let acl = &[
-            "astrid.v1.admin.response.*",
-            "astrid.v1.admin.response.*.*",
-            "astrid.v1.admin.response.*.*.*",
-        ];
-        let mut state = host_state_for(rt, "default", false, acl);
-
-        assert!(
-            matches!(
-                IpcHost::subscribe(&mut state, "astrid.v1.admin.response.*.*".to_string()),
-                Err(ErrorCode::InvalidInput)
-            ),
-            "a non-terminal wildcard must be rejected even when declared in the ACL",
-        );
-        assert!(
-            matches!(
-                IpcHost::subscribe(&mut state, "astrid.v1.admin.response.*.*.*".to_string()),
-                Err(ErrorCode::InvalidInput)
-            ),
-            "a deeper multi-wildcard must be rejected too",
-        );
-        assert!(
-            IpcHost::subscribe(&mut state, "astrid.v1.admin.response.*".to_string()).is_ok(),
-            "the single trailing wildcard the fix kept must be subscribable",
-        );
-    }
-
-    // ── publish-as principal enforcement (issue #45/#852) ──
-
-    /// The self-stamp fix: when the source connection carries a kernel-verified
-    /// principal (recorded by the framed read that pulled the frame), `publish-as`
-    /// stamps THAT principal and ignores the capsule-supplied name. A socket
-    /// client that authenticated as `claude` but names `default` (admin) on the
-    /// wire cannot escalate — the kernel-bound identity wins.
-    #[tokio::test]
-    async fn publish_as_verified_principal_overrides_claimed_name() {
-        let rt = tokio::runtime::Handle::current();
-        let mut state = minimal_host_state(rt);
-        state.has_uplink_capability = true;
-        state.ipc_publish_patterns = vec!["client.v1.*".to_string()];
-        state.ipc_subscribe_patterns = vec!["client.v1.*".to_string()];
-        // The framed read recorded the connection's verified principal.
-        state.ingress_principal = Some(astrid_core::PrincipalId::new("claude").unwrap());
-
-        let sub = IpcHost::subscribe(&mut state, "client.v1.connect".to_string())
-            .expect("subscribe allowed by ACL");
-
-        // The client lies on the wire: it names `default`.
-        IpcHost::publish_as(
-            &mut state,
-            "client.v1.connect".to_string(),
-            "{}".to_string(),
-            "default".to_string(),
-        )
-        .expect("publish_as should succeed");
-
-        assert_eq!(
-            drained_principals(&mut state, &sub),
-            vec!["claude".to_string()],
-            "the verified principal must override the claimed name (no escalation)"
-        );
-    }
-
-    /// An UNAUTHENTICATED (unbound) connection is stamped with the reserved
-    /// no-capability `anonymous` identity, NOT the principal it claimed — an
-    /// unproven claim earns no privilege (issue #45/#852). This is the residual
-    /// self-stamp #932 left for unbound connections, now closed: a client that
-    /// did not authenticate cannot act as `default` (or any named principal).
-    #[tokio::test]
-    async fn publish_as_unbound_connection_is_stamped_anonymous() {
-        let rt = tokio::runtime::Handle::current();
-        let mut state = minimal_host_state(rt);
-        state.has_uplink_capability = true;
-        state.ipc_publish_patterns = vec!["client.v1.*".to_string()];
-        state.ipc_subscribe_patterns = vec!["client.v1.*".to_string()];
-        // No in-flight verified principal (an unbound connection).
-        assert_eq!(state.ingress_principal, None);
-
-        let sub = IpcHost::subscribe(&mut state, "client.v1.connect".to_string())
-            .expect("subscribe allowed by ACL");
-
-        // The client claims `default` (admin) without having authenticated.
-        IpcHost::publish_as(
-            &mut state,
-            "client.v1.connect".to_string(),
-            "{}".to_string(),
-            "default".to_string(),
-        )
-        .expect("publish_as should succeed");
-
-        assert_eq!(
-            drained_principals(&mut state, &sub),
-            vec![astrid_core::principal::PrincipalId::anonymous().to_string()],
-            "an unauthenticated connection's claim earns no privilege — stamped anonymous"
-        );
-    }
-}
+#[path = "ipc_tests.rs"]
+mod audit_scope_tests;

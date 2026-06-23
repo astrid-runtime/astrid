@@ -42,6 +42,9 @@ fn state_with_origins(origins: Vec<&str>) -> Arc<GatewayState> {
         metrics_handle: astrid_gateway::metrics::install_recorder().expect("recorder"),
         event_bus: None,
         revoked_at: std::sync::Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
+        revoked_key_ids: std::sync::Arc::new(std::sync::RwLock::new(
+            std::collections::HashMap::new(),
+        )),
         audit_log: None,
         session_id: None,
         gateway_route_uuid: uuid::Uuid::new_v4(),

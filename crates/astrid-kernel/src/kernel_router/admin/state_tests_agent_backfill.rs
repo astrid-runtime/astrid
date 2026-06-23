@@ -152,7 +152,21 @@ async fn agent_create_keyless_backfills_keypair() {
     let healed = load(&kernel, "bob");
     assert_eq!(healed.auth.methods, vec![AuthMethod::Keypair]);
     assert_eq!(healed.auth.public_keys.len(), 1);
-    assert!(healed.auth.public_keys[0].starts_with("ed25519:"));
+    assert!(
+        healed.auth.public_keys[0]
+            .ed25519_entry()
+            .starts_with("ed25519:")
+    );
+    assert_eq!(
+        healed.auth.public_keys[0].scope,
+        astrid_core::profile::DeviceScope::Full,
+        "backfilled key must be Full-scope"
+    );
+    assert!(
+        healed.auth.public_keys[0].created_at > 0,
+        "a freshly minted device key must carry the real mint epoch, not the \
+         `0` migrated-legacy sentinel (which would show 1970 in listings/audit)"
+    );
     assert!(
         key_path(&kernel, "bob").exists(),
         "keys/<p>.key must be written"

@@ -86,7 +86,9 @@ pub(crate) fn spawn_kernel_router(kernel: Arc<crate::Kernel>) -> tokio::task::Jo
                         continue;
                     }
                     let caller = resolve_caller(message);
-                    handle_request(&kernel, message.topic.clone(), caller, req).await;
+                    let device_key_id = resolve_device_key_id(message);
+                    handle_request(&kernel, message.topic.clone(), caller, device_key_id, req)
+                        .await;
                 },
                 Err(e) => {
                     // The kernel router shares the broadcast
@@ -197,6 +199,7 @@ async fn handle_request(
     kernel: &Arc<crate::Kernel>,
     topic: String,
     caller: PrincipalId,
+    device_key_id: Option<String>,
     req: KernelRequest,
 ) {
     let response_topic = if let Some(suffix) = topic.strip_prefix("astrid.v1.request.") {
@@ -212,7 +215,7 @@ async fn handle_request(
     let method = kernel_request_method(&req);
     let scope = resolve_scope(&req, &caller);
     let required_cap = required_capability(&req, scope);
-    match authorize_request(kernel, &caller, required_cap) {
+    match authorize_request(kernel, &caller, device_key_id.as_deref(), required_cap) {
         Ok(()) => {
             record_admin_audit(
                 kernel,
@@ -220,6 +223,7 @@ async fn handle_request(
                     caller: &caller,
                     method,
                     required_cap,
+                    device_key_id: device_key_id.as_deref(),
                     target_principal: None,
                     params: None,
                     authorization: AuthorizationProof::System {
@@ -243,6 +247,7 @@ async fn handle_request(
                     caller: &caller,
                     method,
                     required_cap,
+                    device_key_id: device_key_id.as_deref(),
                     target_principal: None,
                     params: None,
                     authorization: AuthorizationProof::Denied {
@@ -605,6 +610,17 @@ fn resolve_caller(message: &IpcMessage) -> PrincipalId {
         .unwrap_or_default()
 }
 
+/// Resolve the authenticating device `key_id` from an incoming [`IpcMessage`].
+///
+/// Host-derived metadata stamped by the socket per-connection registry or the
+/// gateway-signed bearer (never a client-controlled field). `Some(key_id)`
+/// means the request authenticated with a specific registered device, whose
+/// scope the cap-gate applies as an attenuation floor; `None` means an
+/// unattenuated full-principal request (every legacy / unpaired connection).
+fn resolve_device_key_id(message: &IpcMessage) -> Option<String> {
+    message.device_key_id.clone()
+}
+
 /// Evaluate the capability check for `caller` against the kernel's
 /// resolved group config and the caller's profile.
 ///
@@ -615,6 +631,7 @@ fn resolve_caller(message: &IpcMessage) -> PrincipalId {
 fn authorize_request(
     kernel: &crate::Kernel,
     caller: &PrincipalId,
+    device_key_id: Option<&str>,
     required_cap: &str,
 ) -> Result<(), PermissionError> {
     let profile = match kernel.profile_cache.resolve(caller) {
@@ -650,7 +667,42 @@ fn authorize_request(
         });
     }
     let groups = kernel.groups.load_full();
-    let check = CapabilityCheck::new(profile.as_ref(), groups.as_ref(), caller.clone());
+
+    // Per-device scope attenuation. When the request authenticated with a
+    // specific registered device, the device's scope is applied as a floor on
+    // the principal's effective capabilities (deny wins, can only narrow).
+    //
+    // Fail-closed on an unresolved key_id: a request that names a device the
+    // principal no longer has (revoked / unknown) must NOT fall back to the
+    // principal's full authority — that would let a revoked device keep acting.
+    //
+    // The scope is cloned into a local so it outlives the borrow of `profile`
+    // for the `require` call below (a `DeviceScope` clone is cheap — at most a
+    // couple of small pattern vectors — and avoids fighting the borrow that
+    // `device_by_key_id` takes on `profile`).
+    let device_scope: Option<astrid_core::profile::DeviceScope> = if let Some(kid) = device_key_id {
+        let Some(dev) = profile.auth.device_by_key_id(kid) else {
+            warn!(
+                security_event = true,
+                principal = %caller,
+                key_id = %kid,
+                required = required_cap,
+                "device_key_id resolves to no registered key — fail-closed deny"
+            );
+            return Err(PermissionError::DeviceScopeDenied {
+                principal: caller.clone(),
+                required: required_cap.to_string(),
+            });
+        };
+        Some(dev.scope.clone())
+    } else {
+        None
+    };
+
+    let mut check = CapabilityCheck::new(profile.as_ref(), groups.as_ref(), caller.clone());
+    if let Some(scope) = &device_scope {
+        check = check.with_device_scope(scope);
+    }
     check.require(required_cap)
 }
 
@@ -663,6 +715,10 @@ pub(crate) struct AdminAuditEntry<'a> {
     pub method: &'a str,
     /// Capability string evaluated for this request.
     pub required_cap: &'a str,
+    /// The authenticating device `key_id` when the request was device-scoped,
+    /// so the audit row records which paired device acted. Non-secret (derived
+    /// from the public key); `None` for a full-authority request.
+    pub device_key_id: Option<&'a str>,
     /// `None` when the request operates on the caller's own principal
     /// (Layer 5) and `Some` when the request mutates another principal
     /// (Layer 6 admin topics like `admin.quota.set`).
@@ -698,6 +754,7 @@ fn record_admin_audit(kernel: &crate::Kernel, entry: AdminAuditEntry<'_>) {
         caller,
         method,
         required_cap,
+        device_key_id,
         target_principal,
         params,
         authorization,
@@ -708,6 +765,7 @@ fn record_admin_audit(kernel: &crate::Kernel, entry: AdminAuditEntry<'_>) {
         required_capability: required_cap.to_string(),
         target_principal: target_principal.clone(),
         params: params.clone(),
+        device_key_id: device_key_id.map(str::to_owned),
     };
     if let Err(e) = kernel.audit_log.append_with_principal(
         kernel.session_id.clone(),
@@ -736,6 +794,7 @@ fn record_admin_audit(kernel: &crate::Kernel, entry: AdminAuditEntry<'_>) {
         "method": method,
         "required_capability": required_cap,
         "principal": caller.to_string(),
+        "device_key_id": device_key_id,
         "target_principal": target_principal.as_ref().map(ToString::to_string),
         "params": params,
         "outcome": match &outcome {

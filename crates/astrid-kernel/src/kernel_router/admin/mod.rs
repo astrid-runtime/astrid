@@ -30,6 +30,8 @@ mod handlers;
 mod inheritance;
 mod invite_handlers;
 mod pair_device_handlers;
+#[cfg(test)]
+mod pair_device_tests;
 mod quota;
 #[cfg(test)]
 mod state_tests;
@@ -60,7 +62,7 @@ use tracing::warn;
 
 use super::{
     AdminAuditEntry, AuthorityScope, authorize_request, publish_response, record_admin_audit,
-    resolve_caller,
+    resolve_caller, resolve_device_key_id,
 };
 
 /// Admin IPC input topic prefix.
@@ -107,8 +109,9 @@ pub(crate) fn spawn_admin_router(kernel: Arc<crate::Kernel>) -> tokio::task::Joi
                     let kernel = Arc::clone(&kernel);
                     let topic = message.topic.clone();
                     let caller = resolve_caller(message);
+                    let device_key_id = resolve_device_key_id(message);
                     tokio::spawn(async move {
-                        handle_admin_request(&kernel, topic, caller, req).await;
+                        handle_admin_request(&kernel, topic, caller, device_key_id, req).await;
                     });
                 },
                 Err(e) => {
@@ -143,7 +146,12 @@ pub fn resolve_admin_scope(req: &AdminRequestKind, caller: &PrincipalId) -> Auth
     match req {
         AdminRequestKind::QuotaGet { principal }
         | AdminRequestKind::QuotaSet { principal, .. }
-        | AdminRequestKind::UsageGet { principal } => {
+        | AdminRequestKind::UsageGet { principal }
+        // Device management is self-scoped when the target IS the caller —
+        // a principal lists / revokes its own devices with `self:auth:pair`;
+        // operating on another principal's devices needs the global form.
+        | AdminRequestKind::PairDeviceList { principal }
+        | AdminRequestKind::PairDeviceRevoke { principal, .. } => {
             if principal == caller {
                 AuthorityScope::Self_
             } else {
@@ -250,12 +258,24 @@ pub fn required_capability_for_admin_request(
         (AdminRequestKind::InviteRedeem { .. }, _) => "invite:redeem",
         (AdminRequestKind::InviteList, _) => "invite:list",
         (AdminRequestKind::InviteRevoke { .. }, _) => "invite:revoke",
-        // PairDeviceIssue is self-scoped (kernel binds to caller).
-        (AdminRequestKind::PairDeviceIssue { .. }, _) => "self:auth:pair",
-        // PairDeviceRedeem mirrors InviteRedeem: dispatcher
-        // bypasses the cap-gate because the token IS the auth.
-        // String kept here for audit-log readability.
+        // PairDeviceRedeem mirrors InviteRedeem: dispatcher bypasses the
+        // cap-gate because the token IS the auth. String kept here for
+        // audit-log readability.
         (AdminRequestKind::PairDeviceRedeem { .. }, _) => "auth:pair:redeem",
+        // PairDeviceIssue is intrinsically self-scoped (kernel binds the
+        // token to the caller). Device list / revoke reuse the same pairing
+        // capability (no new base cap): a principal manages its own devices
+        // with `self:auth:pair`; an admin manages anyone's via the global
+        // `auth:pair`.
+        (AdminRequestKind::PairDeviceIssue { .. }, _)
+        | (
+            AdminRequestKind::PairDeviceList { .. } | AdminRequestKind::PairDeviceRevoke { .. },
+            AuthorityScope::Self_,
+        ) => "self:auth:pair",
+        (
+            AdminRequestKind::PairDeviceList { .. } | AdminRequestKind::PairDeviceRevoke { .. },
+            AuthorityScope::Global,
+        ) => "auth:pair",
     }
 }
 
@@ -288,6 +308,8 @@ pub fn admin_request_method(req: &AdminRequestKind) -> &'static str {
         AdminRequestKind::InviteRevoke { .. } => "admin.invite.revoke",
         AdminRequestKind::PairDeviceIssue { .. } => "admin.auth.pair.issue",
         AdminRequestKind::PairDeviceRedeem { .. } => "admin.auth.pair.redeem",
+        AdminRequestKind::PairDeviceList { .. } => "admin.auth.pair.list",
+        AdminRequestKind::PairDeviceRevoke { .. } => "admin.auth.pair.revoke",
     }
 }
 
@@ -312,6 +334,13 @@ pub fn admin_request_method(req: &AdminRequestKind) -> &'static str {
 ///   `InviteRedeem.token`: the caller can pass either the raw token or
 ///   the already-fingerprinted form. Hash unconditionally when the
 ///   input doesn't already look like a fingerprint (64 hex chars).
+/// * `PairDeviceRedeem` `token` / `public_key` → fingerprints, as above.
+///
+/// `PairDeviceIssue` (carries `expires_secs` / `label` / `scope`),
+/// `PairDeviceList` (`principal`), and `PairDeviceRevoke`
+/// (`principal` / `key_id`) carry NO raw key or token — only the granted
+/// scope and the non-secret `key_id` fingerprint — so they record verbatim,
+/// satisfying "`key_id` + scope, never a raw key/token" with no redaction.
 fn sanitize_admin_audit_params(req: &AdminRequestKind) -> Option<serde_json::Value> {
     let mut val = serde_json::to_value(req).ok()?;
     let params = val
@@ -387,7 +416,9 @@ pub fn admin_target_principal(req: &AdminRequestKind) -> Option<&PrincipalId> {
         | AdminRequestKind::CapsGrant { principal, .. }
         | AdminRequestKind::CapsRevoke { principal, .. }
         | AdminRequestKind::CapsTokenMint { principal, .. }
-        | AdminRequestKind::CapsTokenList { principal } => Some(principal),
+        | AdminRequestKind::CapsTokenList { principal }
+        | AdminRequestKind::PairDeviceList { principal }
+        | AdminRequestKind::PairDeviceRevoke { principal, .. } => Some(principal),
         // `CapsTokenRevoke` carries a token id, not a principal — the token's
         // owner is recovered from the store, not the request body.
         AdminRequestKind::CapsTokenRevoke { .. }
@@ -433,6 +464,7 @@ async fn handle_admin_request(
     kernel: &Arc<crate::Kernel>,
     topic: String,
     caller: PrincipalId,
+    device_key_id: Option<String>,
     req: AdminKernelRequest,
 ) {
     let response_topic = admin_response_topic(&topic);
@@ -470,6 +502,8 @@ async fn handle_admin_request(
         req.kind,
         AdminRequestKind::InviteRedeem { .. } | AdminRequestKind::PairDeviceRedeem { .. }
     ) {
+        // Redeem variants carry no issuer device scope — the token is the
+        // auth, not a paired device.
         let body = handlers::dispatch(kernel, &caller, req.kind).await;
         let (authorization, outcome) = redeem_audit_proof(&body);
         record_admin_audit(
@@ -478,6 +512,9 @@ async fn handle_admin_request(
                 caller: &caller,
                 method,
                 required_cap,
+                // Redeems mint an identity and carry no device scope — the
+                // token is the auth, not a paired device.
+                device_key_id: None,
                 target_principal: None,
                 params: audit_params,
                 authorization,
@@ -492,7 +529,7 @@ async fn handle_admin_request(
         return;
     }
 
-    match authorize_request(kernel, &caller, required_cap) {
+    match authorize_request(kernel, &caller, device_key_id.as_deref(), required_cap) {
         Ok(()) => {
             record_admin_audit(
                 kernel,
@@ -500,6 +537,7 @@ async fn handle_admin_request(
                     caller: &caller,
                     method,
                     required_cap,
+                    device_key_id: device_key_id.as_deref(),
                     target_principal: target.clone(),
                     params: audit_params.clone(),
                     authorization: AuthorizationProof::System {
@@ -524,6 +562,7 @@ async fn handle_admin_request(
                     caller: &caller,
                     method,
                     required_cap,
+                    device_key_id: device_key_id.as_deref(),
                     target_principal: target,
                     params: audit_params,
                     authorization: AuthorizationProof::Denied {
@@ -544,7 +583,13 @@ async fn handle_admin_request(
         },
     }
 
-    let body = handlers::dispatch(kernel, &caller, req.kind).await;
+    // Pass the issuer's authenticating device key id through so
+    // `pair_device_issue` can resolve the issuer's OWN device scope and
+    // enforce no-escalation against the issuer's *attenuated* effective set
+    // (a scoped issuer cannot mint a broader child). Every other handler
+    // ignores it.
+    let body =
+        handlers::dispatch_with_device(kernel, &caller, device_key_id.as_deref(), req.kind).await;
     publish_response(
         kernel,
         response_topic,

@@ -80,7 +80,13 @@ pub async fn get_events(
     // SSE handshakes happen once per dashboard tab open, and the
     // socket-dial latency would otherwise dominate first-byte
     // time for the audit stream.
-    let firehose = caller_holds(&state, &caller.principal, AUDIT_FIREHOSE_CAP).await;
+    let firehose = caller_holds(
+        &state,
+        &caller.principal,
+        caller.device_key_id.as_deref(),
+        AUDIT_FIREHOSE_CAP,
+    )
+    .await;
 
     // Routed subscription so the audit firehose gets the same
     // per-(topic, principal) DRR fairness the rest of the gateway
@@ -145,10 +151,18 @@ pub async fn get_events(
 pub(super) async fn caller_holds(
     state: &GatewayState,
     principal: &PrincipalId,
+    device_key_id: Option<&str>,
     capability: &str,
 ) -> bool {
     use astrid_core::kernel_api::{AdminRequestKind, AdminResponseBody};
-    let Ok(client) = state.admin_client(principal.clone()) else {
+    // Carry the session's device scope: a device-scoped caller whose scope
+    // denies `self:agent:list` cannot read its own row, so the firehose check
+    // fails closed to the narrower per-principal view — a scoped device must
+    // not gain the audit firehose its principal would otherwise hold.
+    let Ok(client) = state
+        .admin_client(principal.clone())
+        .map(|c| c.with_device_key_id(device_key_id.map(str::to_owned)))
+    else {
         return false;
     };
     let Ok(resp) = client.request(AdminRequestKind::AgentList).await else {

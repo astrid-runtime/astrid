@@ -195,6 +195,25 @@ pub struct GatewayState {
     /// by orders of magnitude, and the critical sections are
     /// non-`await`-blocking.
     pub revoked_at: Arc<RwLock<HashMap<PrincipalId, u64>>>,
+    /// Per-device bearer revocation map: `key_id` → the epoch the device was
+    /// revoked via `PairDeviceRevoke`. Populated by a background task watching
+    /// the audit stream for successful `admin.auth.pair.revoke` ops. The auth
+    /// middleware rejects a device-scoped bearer whose `key_id` is present and
+    /// whose `iat` is at-or-before the recorded epoch — see
+    /// [`crate::auth::verify_bearer`].
+    ///
+    /// This is defense-in-depth on the HTTP path so a live bearer stops
+    /// immediately; the kernel cap-gate is the primary mechanism (a revoked
+    /// key is gone from `public_keys`, so every kernel request fails closed).
+    /// Keying on the revoke epoch (mirroring principal-level `revoked_at`)
+    /// rather than a bare membership set matters because a `key_id` is a
+    /// deterministic fingerprint of its pubkey: re-pairing the same key yields
+    /// the same id, so a bearer minted *after* a re-pair (`iat` > the recorded
+    /// epoch) authenticates again instead of being dead forever — and the map
+    /// is not a permanent, unbounded deny-list.
+    /// Deliberately in-memory only: a restart re-derives correctness from the
+    /// (now key-less) profile, and the bearer's own expiry bounds the window.
+    pub revoked_key_ids: Arc<RwLock<HashMap<String, u64>>>,
     /// Live audit-log handle backing `GET /api/sys/audit`. `Some`
     /// when the gateway is spawned by `astrid-daemon` (which holds
     /// the kernel's `Arc<AuditLog>`); `None` for the standalone-
@@ -270,6 +289,7 @@ impl GatewayState {
             metrics_handle,
             event_bus,
             revoked_at,
+            revoked_key_ids: Arc::new(RwLock::new(HashMap::new())),
             audit_log,
             session_id,
             gateway_route_uuid: Uuid::new_v4(),
@@ -296,6 +316,28 @@ impl GatewayState {
             ))
         })?;
         Ok(crate::bus_admin::BusAdminClient::new(bus, caller))
+    }
+
+    /// Build a bus-direct admin client for an authenticated caller, carrying
+    /// the caller's device scope through to the kernel cap-gate.
+    ///
+    /// Use this for every admin op behind the auth middleware: it stamps the
+    /// caller's `device_key_id` (when the bearer was device-scoped) onto each
+    /// outbound request so a paired device's scope is enforced kernel-side.
+    /// The two unauthenticated redeem routes (which act as the bootstrap
+    /// `default` principal) keep [`admin_client`](Self::admin_client) — their
+    /// caller has no device scope.
+    ///
+    /// # Errors
+    /// Returns an internal error if the state was built without a live event
+    /// bus (the standalone tests-only constructor).
+    pub fn admin_client_for(
+        &self,
+        caller: &crate::auth::CallerContext,
+    ) -> Result<crate::bus_admin::BusAdminClient, crate::error::GatewayError> {
+        Ok(self
+            .admin_client(caller.principal.clone())?
+            .with_device_key_id(caller.device_key_id.clone()))
     }
 }
 

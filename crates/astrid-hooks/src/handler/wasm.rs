@@ -385,10 +385,13 @@ impl WasmHandler {
             connection_principals: HostState::new_connection_principals(),
             // Hooks never accept inbound uplink connections, so no client
             // lifecycle events are ever emitted; a throwaway registry satisfies
-            // the field.
-            client_connections: HostState::new_connection_principals(),
-            // No client frame in flight; hooks never forward over publish-as.
+            // the field. Keyed by the verified principal directly (distinct
+            // from the device-aware `connection_principals` registry).
+            client_connections: HostState::new_client_connections(),
+            // No client frame in flight; hooks never forward over publish-as,
+            // so neither the ingress principal nor its device id is ever set.
             ingress_principal: None,
+            ingress_device_key_id: None,
         })
     }
 }

@@ -61,7 +61,7 @@ pub async fn grant_caps(
         .map_err(|e| GatewayError::BadRequest(format!("invalid principal id: {e}")))?;
     let caller = caller_from(&req)?.clone();
     let body: GrantRequest = read_json_body(req).await?;
-    let client = state.admin_client(caller.principal)?;
+    let client = state.admin_client_for(&caller)?;
     let resp = client
         .request(AdminRequestKind::CapsGrant {
             principal,
@@ -98,7 +98,7 @@ pub async fn revoke_caps(
         .map_err(|e| GatewayError::BadRequest(format!("invalid principal id: {e}")))?;
     let caller = caller_from(&req)?.clone();
     let body: RevokeRequest = read_json_body(req).await?;
-    let client = state.admin_client(caller.principal)?;
+    let client = state.admin_client_for(&caller)?;
     let resp = client
         .request(AdminRequestKind::CapsRevoke {
             principal,
