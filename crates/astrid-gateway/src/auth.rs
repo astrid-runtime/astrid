@@ -146,12 +146,14 @@ pub fn verify_bearer(state: &GatewayState, raw: &str) -> Result<CallerContext, G
     // length. Without the cap, an attacker sending an Authorization header
     // packed with dots would coerce `split('.')` into materialising millions
     // of empty slices — a cheap path to memory / CPU exhaustion against an
-    // unauthenticated route. The cap is one beyond the largest expected
-    // segment count (5) so a 6+ segment input lands the trailing dots in the
-    // final (hex signature) slice, where `hex::decode` will reject it.
+    // unauthenticated route. Six is one beyond the largest valid arity (5), so
+    // a 6+ segment input still collapses to exactly six slices (the surplus
+    // dots ride in the final slice) and is then rejected by the arity check
+    // below — a malformed token never allocates unboundedly.
     let parts: Vec<&str> = raw.splitn(6, '.').collect();
-    // Two arities: 4 = legacy full-authority bearer (no key_id), 5 =
-    // device-scoped bearer carrying a key_id. Anything else is malformed.
+    // Two valid arities: 4 = legacy full-authority bearer (no key_id), 5 =
+    // device-scoped bearer carrying a key_id. Any other length — including the
+    // capped 6-slice case above — is malformed and rejected before any decode.
     let (key_id_seg, sig_seg) = match parts.len() {
         4 => (None, 3),
         5 => (Some(3usize), 4),
