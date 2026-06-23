@@ -136,7 +136,7 @@ pub(crate) async fn run_init(distro_source: &str, opts: &InitOpts) -> anyhow::Re
     write_env_files(&home, &selected, &vars)?;
 
     // Install each capsule with progress.
-    let locked = install_capsules(&selected).await?;
+    let locked = install_capsules(&selected, opts.offline).await?;
 
     // Write Distro.lock.
     let lock = create_lock_from_parts(schema_version, &distro_id, &distro_version, locked);
@@ -502,7 +502,31 @@ fn resolve_template(template: &str, vars: &HashMap<String, String>) -> String {
 }
 
 /// Install each selected capsule with a progress bar.
-async fn install_capsules(selected: &[DistroCapsule]) -> anyhow::Result<Vec<LockedCapsule>> {
+///
+/// Under `offline`, a capsule whose source is not a local path is a
+/// hard error — the `--offline` contract forbids any network, and a
+/// remote `@org/repo` capsule in a local `Distro.toml` would otherwise
+/// silently fetch from GitHub. (A fully self-contained offline install
+/// uses a `.shuttle` instead.)
+async fn install_capsules(
+    selected: &[DistroCapsule],
+    offline: bool,
+) -> anyhow::Result<Vec<LockedCapsule>> {
+    if offline {
+        for cap in selected {
+            let src = cap.source.trim();
+            if !(src.starts_with('.') || src.starts_with('/')) {
+                bail!(
+                    "--offline: capsule '{}' has a non-local source '{}' — \
+                     refusing to fetch. Use a .shuttle archive for a self-contained \
+                     offline install.",
+                    cap.name,
+                    cap.source
+                );
+            }
+        }
+    }
+
     let total = selected.len();
     let pb = ProgressBar::new(total as u64);
     pb.set_style(
@@ -767,6 +791,16 @@ mod tests {
         })
         .unwrap();
         assert_eq!(vars["base_url"], "https://from-env");
+    }
+
+    #[tokio::test]
+    async fn offline_refuses_remote_capsule_source() {
+        // A local Distro.toml with a remote @org/repo capsule must not
+        // silently fetch under --offline.
+        let selected = vec![cap("llm", None, false)]; // source "@org/llm"
+        let err = install_capsules(&selected, true).await.unwrap_err();
+        assert!(err.to_string().contains("--offline"), "got: {err}");
+        assert!(err.to_string().contains("non-local"), "got: {err}");
     }
 
     #[test]
