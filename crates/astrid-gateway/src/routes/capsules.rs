@@ -14,22 +14,29 @@
 //! `caps: ["capsule:install"]`); the kernel's cap-gate enforces
 //! it before the handler runs.
 //!
-//! The handler that actually unpacks a `.capsule` archive and
-//! writes it to disk is a stub in the kernel today (`kernel_router/
-//! mod.rs:186-193` returns "Installation logic not yet
-//! implemented"). The route forwards that error verbatim — the
-//! cap-gate still works, the route is reachable, and when the
-//! kernel handler lands no gateway change is needed.
+//! The kernel-side `InstallCapsule` handler is fully implemented
+//! (`kernel_router/install.rs`): it unpacks a `.capsule` archive (or
+//! installs from a directory containing `Capsule.toml`), content-
+//! addresses the WASM/WIT, runs lifecycle hooks, and hot-loads the
+//! result. It is deliberately **path-only** — the daemon never fetches
+//! URLs. So the gateway resolves GitHub-shaped sources HERE (it is an
+//! uplink, the same role the CLI plays): it downloads the `.capsule`
+//! release asset to a local temp file and then calls the kernel handler
+//! with that local path. Local-path and arbitrary-URL sources are
+//! forwarded verbatim; the kernel installs the former and rejects the
+//! latter.
 //!
 //! Routes:
 //!
 //! * `GET  /api/capsules` — list of capsule ids
-//! * `POST /api/capsules` — install (cap-gated, kernel handler currently stubbed)
+//! * `POST /api/capsules` — install (cap-gated; GitHub sources resolved in the gateway)
 //! * `GET  /api/capsules/{id}` — manifest excerpt (env defs, etc.)
 //! * `GET  /api/capsules/{id}/topics` — declared `TopicDef` entries
 
 use std::sync::Arc;
+use std::time::Duration;
 
+use astrid_capsule_install::github_source;
 use astrid_core::kernel_api::{CapsuleMetadataEntry, KernelRequest, KernelResponse};
 use astrid_uplink::KernelClient;
 use axum::Json;
@@ -68,20 +75,29 @@ pub struct CapsuleTopicsResponse {
 
 #[derive(Debug, Clone, Deserialize, ToSchema)]
 pub struct InstallRequest {
-    /// Source path or package locator. The **kernel-side handler**
-    /// accepts only local paths — either a directory containing
-    /// `Capsule.toml` or a `*.capsule` archive. Network-shaped
-    /// sources (`@org/repo`, `github.com/...`, `gh:`, `https://`)
-    /// are rejected; resolve them via a future
-    /// `POST /api/capsules/install-by-id` registry route, which will
-    /// download to a local archive and re-call this endpoint.
+    /// Source path or package locator. GitHub-shaped sources
+    /// (`@org/repo`, `github.com/org/repo`,
+    /// `https://github.com/org/repo`) are resolved **by the gateway**:
+    /// it downloads the matching `.capsule` release asset to a local
+    /// archive and hands the kernel that local path. A local path —
+    /// either a directory containing `Capsule.toml` or a `*.capsule`
+    /// archive — is forwarded verbatim and interpreted on the daemon
+    /// host. Arbitrary non-GitHub URLs (`http(s)://…`, `gh:`) are
+    /// forwarded verbatim and rejected kernel-side; the daemon never
+    /// fetches URLs.
     pub source: String,
     /// `true` to install into the workspace-local capsules slot
     /// instead of the system-wide one. Always rejected kernel-side
     /// when called via this route — the daemon has no meaningful
-    /// CWD.
+    /// CWD. Ignored (forced `false`) for gateway-resolved GitHub
+    /// sources.
     #[serde(default)]
     pub workspace: bool,
+    /// Optional capsule name selector for a multi-capsule GitHub release
+    /// (one `.capsule` asset per capsule). Mirrors the CLI's `--capsule`.
+    /// Ignored for local-path sources.
+    #[serde(default)]
+    pub capsule: Option<String>,
 }
 
 #[utoipa::path(
@@ -124,8 +140,21 @@ pub async fn list_capsules(
 
 /// `POST /api/capsules` — install a capsule. Cap-gated by
 /// `capsule:install` (or `self:capsule:install` for self-scope) at
-/// the kernel boundary. The kernel handler accepts only local paths
-/// (see `InstallRequest::source`).
+/// the kernel boundary.
+///
+/// GitHub-shaped sources are resolved **in the gateway** (it is an
+/// uplink, like the CLI): the gateway downloads the chosen `.capsule`
+/// release asset to a local temp file and hands the kernel that local
+/// path. Local paths and arbitrary URLs are forwarded verbatim — the
+/// kernel installs the former and rejects the latter; the daemon never
+/// fetches.
+///
+/// The gateway intentionally implements a **narrower** GitHub path than
+/// the CLI: the CLI additionally falls back to clone-and-build, auto-
+/// builds a local Cargo directory, and installs every asset of a multi-
+/// capsule release ("install all"). The gateway does **none** of those.
+/// It requires resolving to exactly one `.capsule` — a release with a
+/// single `.capsule` asset, or one selected via the `capsule` field.
 #[utoipa::path(
     post,
     path = "/api/capsules",
@@ -134,7 +163,9 @@ pub async fn list_capsules(
     responses(
         (status = 200, description = "Install completed; body is the `InstallOutput` JSON shape: `{ target_dir, phase, installed_version, previous_version?, wasm_hash?, env_path, env_needs_prompt, missing_imports[], export_conflicts[] }`. May instead be `{ status: 'approval_required', request_id, description, capabilities }` when the kernel needs operator sign-off on dangerous capabilities the capsule declares.", content_type = "application/json"),
         (status = 401, body = ErrorBody),
-        (status = 403, body = ErrorBody, description = "Caller lacks `capsule:install`, source is remote (use registry route), or workspace flag is set."),
+        (status = 403, body = ErrorBody, description = "Caller lacks `capsule:install`, source is a non-GitHub URL the kernel rejects, or the workspace flag is set on a local-path source."),
+        (status = 404, body = ErrorBody, description = "GitHub release or .capsule asset not found."),
+        (status = 400, body = ErrorBody, description = "Ambiguous multi-capsule release (specify `capsule`), or archive too large."),
     )
 )]
 pub async fn install_capsule(
@@ -143,14 +174,32 @@ pub async fn install_capsule(
 ) -> GatewayResult<Json<serde_json::Value>> {
     let caller = caller_from(&req)?.clone();
     let body: InstallRequest = crate::routes::principals::read_json_body(req).await?;
+
+    // GitHub-shaped sources are resolved HERE (the gateway is an
+    // uplink). Everything else — a local path, or an arbitrary URL —
+    // is forwarded verbatim; the kernel installs on-disk paths and
+    // rejects URLs, so the daemon never fetches.
+    //
+    // SSRF note: only GitHub-shaped sources are ever fetched, and the
+    // download URL comes from GitHub's own release API for the named
+    // repo — the gateway never fetches an attacker-supplied arbitrary
+    // URL. An arbitrary `https://…` is NOT GitHub-shaped, so it falls
+    // into the else-branch and is rejected by the kernel.
+    let (source, workspace, _tmp) =
+        if let Some((org, repo)) = github_source::parse_github_source(&body.source) {
+            let resolved = resolve_github_source(&org, &repo, body.capsule.as_deref()).await?;
+            // The temp dir guard MUST outlive the kernel request below —
+            // the kernel reads the archive off disk during the request.
+            (resolved.path, false, Some(resolved.guard))
+        } else {
+            (body.source, body.workspace, None)
+        };
+
     let mut client = KernelClient::connect(caller.principal)
         .await
         .map_err(daemon_internal)?;
     let resp = client
-        .request(KernelRequest::InstallCapsule {
-            source: body.source,
-            workspace: body.workspace,
-        })
+        .request(KernelRequest::InstallCapsule { source, workspace })
         .await
         .map_err(daemon_internal)?;
     match resp {
@@ -170,16 +219,124 @@ pub async fn install_capsule(
             "description": description,
             "capabilities": capabilities,
         }))),
-        // The kernel returns `Error` either for cap-denied (kernel
-        // gate refused) or "Installation logic not yet implemented"
-        // (handler stub). Surface both as 403 Forbidden for the
-        // cap-denied shape; the stub message will read clearly to
-        // operators inspecting the response.
+        // The kernel returns `Error` for cap-denied (the cap-gate
+        // refused), a rejected non-GitHub URL, or an install failure
+        // (bad archive, missing path, lifecycle-hook error). Surface as
+        // 403 Forbidden — the kernel message reads clearly to operators
+        // inspecting the response.
         KernelResponse::Error(msg) => Err(GatewayError::Forbidden { reason: msg }),
         other => Err(internal(format!(
             "unexpected response shape for InstallCapsule: {other:?}"
         ))),
     }
+}
+
+/// A `.capsule` archive the gateway downloaded from a GitHub release,
+/// staged on disk for the kernel to install by path. The `guard` keeps
+/// the temp dir (and thus the file at `path`) alive — it MUST outlive
+/// the kernel request that reads the file.
+struct ResolvedArchive {
+    /// Absolute path to the downloaded `.capsule` on disk.
+    path: String,
+    /// Temp-dir guard; dropping it deletes `path`.
+    guard: tempfile::TempDir,
+}
+
+/// Hard cap on a downloaded `.capsule` archive (mirrors the CLI).
+const MAX_CAPSULE_BYTES: usize = 50 * 1024 * 1024;
+
+/// Resolve a GitHub `(org, repo)` to a locally-staged `.capsule` archive.
+///
+/// Fetches the latest release via the GitHub API, selects the matching
+/// `.capsule` asset (the lone one, or the one named via `capsule`), and
+/// streams it to a temp file with a 50 MB cap. The returned guard owns
+/// the temp dir; the caller MUST keep it alive across the kernel call.
+///
+/// This is the ONLY place the gateway performs a network fetch, and only
+/// for a GitHub-shaped source — the download URL is taken from GitHub's
+/// own release JSON for the named repo, never an attacker-supplied URL.
+async fn resolve_github_source(
+    org: &str,
+    repo: &str,
+    capsule: Option<&str>,
+) -> GatewayResult<ResolvedArchive> {
+    let client = reqwest::Client::builder()
+        .user_agent("astrid-gateway")
+        .timeout(Duration::from_secs(30))
+        .build()
+        .map_err(|e| internal(format!("build http client: {e}")))?;
+
+    // Latest release metadata.
+    let api_url = format!("https://api.github.com/repos/{org}/{repo}/releases/latest");
+    let response = client
+        .get(&api_url)
+        .send()
+        .await
+        .map_err(|e| internal(format!("fetch GitHub release for {org}/{repo}: {e}")))?;
+    if !response.status().is_success() {
+        // No release for the repo (404), or any other API failure: treat
+        // a missing release as not-found, anything else as upstream error.
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            return Err(GatewayError::NotFound);
+        }
+        return Err(internal(format!(
+            "GitHub release API returned {} for {org}/{repo}",
+            response.status()
+        )));
+    }
+    let json: serde_json::Value = response
+        .json()
+        .await
+        .map_err(|e| internal(format!("decode GitHub release JSON: {e}")))?;
+    let assets = json
+        .get("assets")
+        .and_then(serde_json::Value::as_array)
+        .map_or(&[][..], Vec::as_slice);
+
+    // Select exactly one `.capsule` asset.
+    let candidates = github_source::capsule_assets(assets);
+    let names: Vec<&str> = candidates.iter().map(|(n, _)| n.as_str()).collect();
+    let idx = match github_source::pick_capsule(&names, capsule) {
+        // No `.capsule` assets in the release at all.
+        Ok(None) => return Err(GatewayError::NotFound),
+        // Several assets and no/!matching selector — the error names them.
+        Err(e) => return Err(GatewayError::BadRequest(e.to_string())),
+        Ok(Some(idx)) => idx,
+    };
+    let (name, download_url) = &candidates[idx];
+
+    // Stream the asset to a temp file with a hard size cap. The temp dir
+    // guard is returned so the file survives until the kernel reads it.
+    let tmp = tempfile::TempDir::new()
+        .map_err(|e| internal(format!("create temp dir for capsule download: {e}")))?;
+    let sanitized = std::path::Path::new(name).file_name().unwrap_or_default();
+    let download_path = tmp.path().join(sanitized);
+
+    let mut dl = client
+        .get(download_url)
+        .send()
+        .await
+        .map_err(|e| internal(format!("download capsule asset {name}: {e}")))?;
+    let mut bytes = Vec::new();
+    while let Some(chunk) = dl
+        .chunk()
+        .await
+        .map_err(|e| internal(format!("stream capsule asset {name}: {e}")))?
+    {
+        bytes.extend_from_slice(&chunk);
+        if bytes.len() > MAX_CAPSULE_BYTES {
+            return Err(GatewayError::BadRequest(
+                "capsule archive exceeds 50 MB limit".to_string(),
+            ));
+        }
+    }
+    std::fs::write(&download_path, &bytes)
+        .map_err(|e| internal(format!("write capsule archive to disk: {e}")))?;
+
+    Ok(ResolvedArchive {
+        path: download_path.to_string_lossy().into_owned(),
+        guard: tmp,
+    })
 }
 
 #[utoipa::path(

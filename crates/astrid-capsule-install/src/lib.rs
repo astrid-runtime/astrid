@@ -59,6 +59,7 @@
 pub mod archive;
 pub mod copy;
 pub mod furniture;
+pub mod github_source;
 pub mod lifecycle;
 pub mod local;
 pub mod manifest_check;
