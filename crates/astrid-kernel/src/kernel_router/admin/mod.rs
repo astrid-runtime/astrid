@@ -60,7 +60,7 @@ use tracing::warn;
 
 use super::{
     AdminAuditEntry, AuthorityScope, authorize_request, publish_response, record_admin_audit,
-    resolve_caller,
+    resolve_caller, resolve_device_key_id,
 };
 
 /// Admin IPC input topic prefix.
@@ -107,8 +107,9 @@ pub(crate) fn spawn_admin_router(kernel: Arc<crate::Kernel>) -> tokio::task::Joi
                     let kernel = Arc::clone(&kernel);
                     let topic = message.topic.clone();
                     let caller = resolve_caller(message);
+                    let device_key_id = resolve_device_key_id(message);
                     tokio::spawn(async move {
-                        handle_admin_request(&kernel, topic, caller, req).await;
+                        handle_admin_request(&kernel, topic, caller, device_key_id, req).await;
                     });
                 },
                 Err(e) => {
@@ -433,6 +434,7 @@ async fn handle_admin_request(
     kernel: &Arc<crate::Kernel>,
     topic: String,
     caller: PrincipalId,
+    device_key_id: Option<String>,
     req: AdminKernelRequest,
 ) {
     let response_topic = admin_response_topic(&topic);
@@ -478,6 +480,9 @@ async fn handle_admin_request(
                 caller: &caller,
                 method,
                 required_cap,
+                // Redeems mint an identity and carry no device scope — the
+                // token is the auth, not a paired device.
+                device_key_id: None,
                 target_principal: None,
                 params: audit_params,
                 authorization,
@@ -492,7 +497,7 @@ async fn handle_admin_request(
         return;
     }
 
-    match authorize_request(kernel, &caller, required_cap) {
+    match authorize_request(kernel, &caller, device_key_id.as_deref(), required_cap) {
         Ok(()) => {
             record_admin_audit(
                 kernel,
@@ -500,6 +505,7 @@ async fn handle_admin_request(
                     caller: &caller,
                     method,
                     required_cap,
+                    device_key_id: device_key_id.as_deref(),
                     target_principal: target.clone(),
                     params: audit_params.clone(),
                     authorization: AuthorizationProof::System {
@@ -524,6 +530,7 @@ async fn handle_admin_request(
                     caller: &caller,
                     method,
                     required_cap,
+                    device_key_id: device_key_id.as_deref(),
                     target_principal: target,
                     params: audit_params,
                     authorization: AuthorizationProof::Denied {

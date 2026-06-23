@@ -21,7 +21,9 @@ use std::sync::Arc;
 
 use astrid_core::PrincipalId;
 use astrid_core::kernel_api::{AdminResponseBody, PairTokenIssued, PairTokenRedeemed};
-use astrid_core::profile::{AuthMethod, DeviceKey, DeviceScope, PrincipalProfile};
+use astrid_core::profile::{
+    AuthMethod, DeviceKey, DeviceScope, PrincipalProfile, device_key_id_fingerprint,
+};
 use tracing::{info, warn};
 
 use crate::pair_token::{self, MAX_EXPIRY_SECS, PairToken, PairTokenStore};
@@ -187,9 +189,15 @@ pub(crate) async fn pair_device_redeem(
 
     let fingerprint =
         super::invite_handlers::fingerprint_public_key(&format!("ed25519:{normalised_key}"));
+    // Deterministic device handle from the canonical pubkey — the stable
+    // key_id the registered DeviceKey carries and that a device-scoped bearer
+    // binds to. Computed over the same normalised key the device was
+    // registered under, so a re-redeem of the same key yields the same id.
+    let key_id = device_key_id_fingerprint(&normalised_key);
     info!(
         principal = %chosen.principal,
         public_key_fingerprint = %fingerprint,
+        key_id = %key_id,
         label = ?chosen.label,
         "Layer 6 auth.pair.redeem"
     );
@@ -197,6 +205,7 @@ pub(crate) async fn pair_device_redeem(
     AdminResponseBody::PairTokenRedeemed(PairTokenRedeemed {
         principal: chosen.principal,
         public_key_fingerprint: fingerprint,
+        key_id,
     })
 }
 
