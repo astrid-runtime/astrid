@@ -314,9 +314,12 @@ fn seed_principal_with_devices(kernel: &Arc<Kernel>, principal: &PrincipalId) ->
     use astrid_core::profile::{AuthMethod, DeviceKey, DeviceScope};
 
     let mut profile = PrincipalProfile::default();
-    // Grant the pair capability directly so the test does not depend on the
-    // `agent` builtin group's `self:*` being loaded in the test kernel.
-    profile.grants = vec!["self:auth:pair".to_string()];
+    // Grant `self:*` directly so the test does not depend on the `agent`
+    // builtin group being loaded in the test kernel. `self:*` subsumes both
+    // `self:auth:pair` (the issue cap-gate) and `self:auth:pair:admin` (the
+    // full-mint gate), so an unattenuated request succeeds and the device
+    // scope is the only thing that can deny.
+    profile.grants = vec!["self:*".to_string()];
     profile.enabled = true;
     profile.auth.methods.push(AuthMethod::Keypair);
 
@@ -351,6 +354,7 @@ async fn device_scope_denies_pair_issue_but_full_device_and_none_allow() {
         AdminRequestKind::PairDeviceIssue {
             expires_secs: Some(300),
             label: Some("test".into()),
+            scope: astrid_events::kernel_api::PairScopeArg::Full,
         }
         .into()
     };
@@ -404,6 +408,7 @@ async fn unknown_device_key_id_fails_closed() {
         AdminRequestKind::PairDeviceIssue {
             expires_secs: Some(300),
             label: None,
+            scope: astrid_events::kernel_api::PairScopeArg::Full,
         }
         .into(),
     )

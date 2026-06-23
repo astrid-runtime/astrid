@@ -146,6 +146,22 @@ fn known_capabilities_covers_every_admin_request_cap() {
         },
         AdminRequestKind::InviteList,
         AdminRequestKind::InviteRevoke { token: "x".into() },
+        AdminRequestKind::PairDeviceIssue {
+            expires_secs: None,
+            label: None,
+            scope: astrid_core::kernel_api::PairScopeArg::Full,
+        },
+        AdminRequestKind::PairDeviceRedeem {
+            token: "x".into(),
+            public_key: String::new(),
+        },
+        AdminRequestKind::PairDeviceList {
+            principal: p.clone(),
+        },
+        AdminRequestKind::PairDeviceRevoke {
+            principal: p.clone(),
+            key_id: "k".into(),
+        },
     ];
 
     let scopes = [AuthorityScope::Self_, AuthorityScope::Global];
