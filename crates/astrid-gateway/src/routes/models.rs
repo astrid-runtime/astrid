@@ -114,8 +114,13 @@ async fn registry_round_trip(
 
     // Stamp the request with the caller's principal: it both routes the
     // request into the caller's registry KV scope and is the value the
-    // reply is matched against on the scoped subscription above.
-    let msg = IpcMessage::new(request_topic, IpcPayload::RawJson(payload), Uuid::nil())
+    // reply is matched against on the scoped subscription above. The source
+    // id is a fresh per-request UUID — never `Uuid::nil()`, which is the
+    // reserved `SYSTEM_SESSION_UUID` and would mis-attribute this
+    // client-originated request as the system session. Reply correlation is
+    // unaffected: replies are matched by the principal-scoped routed
+    // subscription, not by this source id.
+    let msg = IpcMessage::new(request_topic, IpcPayload::RawJson(payload), Uuid::new_v4())
         .with_principal(principal);
     bus.publish(AstridEvent::Ipc {
         metadata: astrid_events::EventMetadata::new("gateway::models"),
@@ -163,10 +168,10 @@ pub async fn list_models(
     State(state): State<Arc<GatewayState>>,
     req: Request<axum::body::Body>,
 ) -> GatewayResult<Json<serde_json::Value>> {
-    let caller = caller_from(&req)?.clone();
+    let caller = caller_from(&req)?;
     let reply = registry_round_trip(
         &state,
-        &caller,
+        caller,
         GET_PROVIDERS_REQUEST,
         GET_PROVIDERS_RESPONSE,
         json!({}),
@@ -191,10 +196,10 @@ pub async fn get_active_model(
     State(state): State<Arc<GatewayState>>,
     req: Request<axum::body::Body>,
 ) -> GatewayResult<Json<serde_json::Value>> {
-    let caller = caller_from(&req)?.clone();
+    let caller = caller_from(&req)?;
     let reply = registry_round_trip(
         &state,
-        &caller,
+        caller,
         GET_ACTIVE_REQUEST,
         GET_ACTIVE_RESPONSE,
         json!({}),
