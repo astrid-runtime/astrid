@@ -12,6 +12,11 @@ This document covers four topics:
 3. [Install-time onboarding](#install-time-onboarding) -- what `astrid init` walks you through
 4. [When no model is selected](#when-no-model-is-selected) -- the error you see and how to fix it
 
+> **Running a local LLM?** The SSRF airlock blocks runtime egress to loopback and
+> private-network addresses by default. See
+> [Local LLM endpoints and the SSRF airlock](#local-llm-endpoints-and-the-ssrf-airlock)
+> for the operator config that lifts the block for specific endpoints.
+
 ## Picking a model at runtime
 
 The `models` verb is provided by the registry capsule. It is reachable through
@@ -214,6 +219,57 @@ Because the openai-compat capsule connects to an arbitrary endpoint, model ids
 can be anything the server returns -- including names with embedded colons
 (e.g. `llama3.3:70b`).
 
+### Local LLM endpoints and the SSRF airlock
+
+The `astrid:http` host capability runs all capsule outbound HTTP through an SSRF
+airlock. Before every request, the airlock resolves the target hostname and
+rejects it if the resolved address falls within any of the following ranges:
+
+- Loopback: `127.0.0.0/8`, `::1`
+- Private: `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`
+- Link-local: `169.254.0.0/16`, `fe80::/10`
+
+This is on by default and cannot be widened from inside a capsule.
+
+**Consequence for a local LLM server.** If you point the openai-compat capsule
+at a server running on the same machine or on a LAN box -- LM Studio on
+`127.0.0.1:1234`, Ollama on `127.0.0.1:11434`, llama.cpp, or a box at
+`192.168.x.x` -- the airlock blocks both the describe call (`GET /v1/models`)
+and every generate request at runtime. The capsule's model list comes back empty
+and every prompt fails. A remote or public `base_url` (e.g. `api.openai.com` or
+a cloud-hosted OpenAI-compatible endpoint) is unaffected.
+
+**Install-time picker vs. runtime.** The onboarding step that fetches
+`/v1/models` to build the model selection menu runs natively in the installer
+process, not inside the WASM sandbox and not through the airlock. This means the
+install-time model picker works fine against a local endpoint: you can select a
+model, the install succeeds, and the config is written -- but every subsequent
+runtime prompt fails because the capsule's HTTP is blocked. The gap between a
+successful install and failing prompts is intentional (the installer needs to
+reach local endpoints to enumerate models), but it can be confusing. If you see
+an empty model list or prompt errors after configuring a local server, the
+airlock is the most likely cause.
+
+**Operator exemption.** To let the openai-compat capsule reach specific local
+endpoints at runtime, an operator adds a `[security.capsule_local_egress]`
+table to `astrid.toml`. This is an operator-only setting: a capsule's own
+`Capsule.toml` cannot set it, and a project or workspace config layer cannot
+widen it either.
+
+```toml
+[security.capsule_local_egress]
+# host:port (or host:*) endpoints this capsule may reach even though they
+# resolve to a local address.
+"astrid-capsule-openai-compat" = ["127.0.0.1:1234", "192.168.1.50:11434"]
+```
+
+The exemption is scoped to the listed `host:port` pairs. It lifts the airlock
+only for those entries -- it does not widen the capsule's `net` allowlist (which
+is already `*` for openai-compat) or grant any other capability.
+
+Wildcard port: `"127.0.0.1:*"` exempts all ports on that host. Prefer listing
+exact ports to minimise exposure.
+
 ## Install-time onboarding
 
 `astrid init` (and `astrid distro install <distro>`) walks you through LLM
@@ -259,6 +315,12 @@ Select [1-N]:
 The configured default is pre-selected (item 1). If the endpoint cannot be
 reached during install, the installer falls back to a free-text entry prompt
 for the model id.
+
+> **Local server users:** the install-time fetch above runs natively and is not
+> subject to the SSRF airlock, so onboarding succeeds even for a loopback or
+> LAN endpoint. Runtime requests from the capsule are blocked by the airlock
+> until you add an operator exemption. See
+> [Local LLM endpoints and the SSRF airlock](#local-llm-endpoints-and-the-ssrf-airlock).
 
 The mechanism behind this is the `options_from` field in the capsule's
 `[env]` manifest:
