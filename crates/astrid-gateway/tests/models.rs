@@ -302,6 +302,144 @@ async fn set_active_model_returns_persisted_entry() {
 }
 
 #[tokio::test]
+async fn set_active_model_skips_foreign_corr_id_reply() {
+    // Concurrency-race regression. Two concurrent same-principal SETs land
+    // their replies on the SAME principal-scoped route. The handler stamps
+    // its request with a fresh `corr_id` and must IGNORE any reply carrying a
+    // different `corr_id` (another concurrent SET's reply), accepting only
+    // the reply that echoes ITS OWN `corr_id`.
+    //
+    // The stub reads the request's `corr_id`, then publishes — IN ORDER — a
+    // FOREIGN-`corr_id` reply (a wrong binding that must be skipped) followed
+    // by the matching reply (echoing the request's `corr_id`, the correct
+    // binding). The handler must surface the matching binding, not the
+    // foreign one.
+    let bus = Arc::new(EventBus::new());
+    let state = state_with_bus(Some(Arc::clone(&bus)));
+    let bearer = bearer_for(&state, "alice");
+
+    let mut rx = bus.subscribe_topic_routed(
+        Uuid::new_v4(),
+        "registry.v1.set_active_model",
+        "test",
+        "test::corr-stub",
+    );
+    {
+        let bus = Arc::clone(&bus);
+        tokio::spawn(async move {
+            let Some(event) = rx.recv(Some(Duration::from_secs(5))).await else {
+                return;
+            };
+            let AstridEvent::Ipc { message, .. } = &*event else {
+                return;
+            };
+            let principal = message.principal.clone();
+            // Pull the gateway's per-request `corr_id` out of the request
+            // payload so we can echo it on the MATCHING reply.
+            let corr_id = match &message.payload {
+                IpcPayload::RawJson(v) => v
+                    .get("corr_id")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned),
+                _ => None,
+            }
+            .expect("gateway must stamp a corr_id on the set request");
+
+            let publish = |body: serde_json::Value| {
+                let mut resp = IpcMessage::new(
+                    "registry.v1.response.set_active_model",
+                    IpcPayload::RawJson(body),
+                    Uuid::nil(),
+                );
+                if let Some(p) = principal.clone() {
+                    resp = resp.with_principal(p);
+                }
+                bus.publish(AstridEvent::Ipc {
+                    metadata: EventMetadata::new("test::corr-stub"),
+                    message: resp,
+                });
+            };
+
+            // (1) FOREIGN corr_id — a different concurrent SET's reply. Must
+            //     be SKIPPED. Carries the WRONG binding to prove it is never
+            //     surfaced.
+            publish(serde_json::json!({
+                "status": "ok",
+                "active_model": { "id": "foreign:wrong-model" },
+                "corr_id": "00000000-0000-0000-0000-000000000000",
+            }));
+            // (2) MATCHING corr_id — our own reply, the correct binding.
+            publish(serde_json::json!({
+                "status": "ok",
+                "active_model": { "id": "openai:gpt-4o", "provider": "openai", "model": "gpt-4o" },
+                "corr_id": corr_id,
+            }));
+        });
+    }
+
+    let router = routes::build(state);
+    let req = Request::builder()
+        .method("PUT")
+        .uri("/api/models/active")
+        .header(header::AUTHORIZATION, format!("Bearer {bearer}"))
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(r#"{"id":"openai:gpt-4o"}"#))
+        .unwrap();
+    let resp = router.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(
+        body["id"], "openai:gpt-4o",
+        "the handler must return the reply matching its own corr_id, not the foreign one"
+    );
+    let text = String::from_utf8_lossy(&bytes);
+    assert!(
+        !text.contains("foreign:wrong-model"),
+        "a reply with a foreign corr_id must be skipped, never surfaced; body was: {text}"
+    );
+}
+
+#[tokio::test]
+async fn set_active_model_accepts_reply_without_corr_id() {
+    // Back-compat: a not-yet-updated registry replies WITHOUT echoing
+    // `corr_id`. The handler still expects a `corr_id` (it stamps one), but a
+    // reply that carries none is accepted — otherwise upgrading the gateway
+    // ahead of the registry would break every set. Uses the shared stub,
+    // whose reply has no `corr_id` field.
+    let bus = Arc::new(EventBus::new());
+    let state = state_with_bus(Some(Arc::clone(&bus)));
+    let bearer = bearer_for(&state, "alice");
+
+    let entry =
+        serde_json::json!({ "id": "openai:gpt-4o", "provider": "openai", "model": "gpt-4o" });
+    spawn_stub_responder(
+        &bus,
+        "registry.v1.set_active_model",
+        "registry.v1.response.set_active_model",
+        serde_json::json!({ "status": "ok", "active_model": entry.clone() }),
+    );
+
+    let router = routes::build(state);
+    let req = Request::builder()
+        .method("PUT")
+        .uri("/api/models/active")
+        .header(header::AUTHORIZATION, format!("Bearer {bearer}"))
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(r#"{"id":"openai:gpt-4o"}"#))
+        .unwrap();
+    let resp = router.oneshot(req).await.unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "a reply with no corr_id must still be accepted (legacy registry)"
+    );
+    let bytes = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(body, entry, "the persisted active entry must be returned");
+}
+
+#[tokio::test]
 async fn models_principal_isolation() {
     // Threat-model regression. With a single shared bus, a responder
     // publishes an active-model reply stamped for principal B. A handler

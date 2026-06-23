@@ -77,16 +77,57 @@ pub struct SetActiveModelRequest {
     pub id: String,
 }
 
+/// Decide whether a registry reply satisfies a correlation filter.
+///
+/// The set-model path stamps each request with a fresh per-request
+/// `corr_id` and threads it here as `expected`. The rule (the gateway side
+/// of the shared correlation contract) is deliberately permissive on the
+/// "no id" case so it cannot break legacy paths:
+///
+/// * `expected == None` — GET paths, which are not correlated. Every reply
+///   is accepted; concurrent same-principal reads are idempotent and benign.
+/// * `expected == Some(ours)` — a SET reply is accepted iff it carries our
+///   `corr_id` **or** carries no `corr_id` field at all. A reply whose
+///   `corr_id` is *present and different* is some other concurrent
+///   same-principal SET's reply and is SKIPPED. Accepting the no-`corr_id`
+///   case keeps a not-yet-updated registry (and any GET reply that races
+///   onto the same scoped route) working.
+///
+/// This is the pure core of the race fix: two concurrent same-principal SET
+/// requests no longer consume each other's reply body. It is kept free of
+/// IO so the decision can be unit-tested directly.
+fn reply_satisfies_corr_id(reply: &serde_json::Value, expected: Option<&str>) -> bool {
+    let Some(expected) = expected else {
+        // Uncorrelated (GET) path: accept any reply.
+        return true;
+    };
+    match reply.get("corr_id").and_then(serde_json::Value::as_str) {
+        // No `corr_id` on the reply → accept (legacy registry / GET reply).
+        None => true,
+        // Present → accept only an exact match; a foreign id is skipped.
+        Some(found) => found == expected,
+    }
+}
+
 /// Publish `request_topic` (stamped with the caller's principal) and await
-/// the single reply on `response_topic`, scoped to the caller so no other
+/// the matching reply on `response_topic`, scoped to the caller so no other
 /// principal's registry reply can be observed. Mirrors the subscribe-first
 /// / publish-second ordering and timeout discipline of `agent.rs`.
+///
+/// `corr_id` is the set-path correlation filter (see
+/// [`reply_satisfies_corr_id`]). When `Some`, the reply-draining loop SKIPS
+/// any reply whose `corr_id` is present and differs from ours — that reply
+/// belongs to another concurrent same-principal SET — and keeps receiving
+/// (within the same overall timeout budget) until a matching / un-correlated
+/// reply arrives or the budget is spent. When `None` (the GET paths) the
+/// first reply on the scoped route is taken unconditionally.
 async fn registry_round_trip(
     state: &GatewayState,
     caller: &CallerContext,
     request_topic: &'static str,
     response_topic: &'static str,
     payload: serde_json::Value,
+    corr_id: Option<&str>,
 ) -> GatewayResult<serde_json::Value> {
     let Some(bus) = state.event_bus.clone() else {
         return Err(GatewayError::Internal(anyhow::anyhow!(
@@ -127,30 +168,50 @@ async fn registry_round_trip(
         message: msg,
     });
 
-    // Await the single reply. `recv(Some(..))` returns `None` on timeout.
+    // Await the matching reply. `recv(Some(..))` returns `None` on timeout.
     // The wait budget defaults to the production `REGISTRY_TIMEOUT`; a test
     // may shorten it via `GatewayState::registry_timeout` so a negative
     // (no-reply) assertion doesn't block for the full 10s.
+    //
+    // The loop drains replies on the scoped route, skipping any that carry a
+    // foreign `corr_id` (another concurrent same-principal SET's reply). The
+    // budget is an absolute DEADLINE, not a per-iteration timeout: each
+    // `recv` is bounded by the time REMAINING, so a stream of skipped foreign
+    // replies can never extend the total wait past the original budget.
     let timeout = state.registry_timeout.unwrap_or(REGISTRY_TIMEOUT);
-    let Some(event) = reply_rx.recv(Some(timeout)).await else {
-        return Err(GatewayError::Internal(anyhow::anyhow!(
-            "registry did not respond"
-        )));
-    };
-    let AstridEvent::Ipc { message, .. } = &*event else {
-        return Err(GatewayError::Internal(anyhow::anyhow!(
-            "registry reply was not an IPC message"
-        )));
-    };
-    // Extract the reply payload exactly as agent.rs does: a `RawJson`
-    // body is the bare inner value; any other payload shape is serialized
-    // structurally.
-    let value = match &message.payload {
-        IpcPayload::RawJson(v) => v.clone(),
-        other => serde_json::to_value(other)
-            .map_err(|e| GatewayError::Internal(anyhow::anyhow!("registry reply not JSON: {e}")))?,
-    };
-    Ok(value)
+    // `checked_add` over the bare `+` so an absurd timeout can't panic on
+    // overflow; saturating to `now` (a zero remaining budget) on overflow is
+    // a harmless immediate timeout that the production budget never hits.
+    let deadline = tokio::time::Instant::now()
+        .checked_add(timeout)
+        .unwrap_or_else(tokio::time::Instant::now);
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let Some(event) = reply_rx.recv(Some(remaining)).await else {
+            return Err(GatewayError::Internal(anyhow::anyhow!(
+                "registry did not respond"
+            )));
+        };
+        let AstridEvent::Ipc { message, .. } = &*event else {
+            return Err(GatewayError::Internal(anyhow::anyhow!(
+                "registry reply was not an IPC message"
+            )));
+        };
+        // Extract the reply payload exactly as agent.rs does: a `RawJson`
+        // body is the bare inner value; any other payload shape is serialized
+        // structurally.
+        let value = match &message.payload {
+            IpcPayload::RawJson(v) => v.clone(),
+            other => serde_json::to_value(other).map_err(|e| {
+                GatewayError::Internal(anyhow::anyhow!("registry reply not JSON: {e}"))
+            })?,
+        };
+        // Skip a reply that belongs to a different concurrent same-principal
+        // SET (foreign `corr_id`); keep waiting within the remaining budget.
+        if reply_satisfies_corr_id(&value, corr_id) {
+            return Ok(value);
+        }
+    }
 }
 
 /// `GET /api/models` — list the caller's available provider-entries.
@@ -175,6 +236,8 @@ pub async fn list_models(
         GET_PROVIDERS_REQUEST,
         GET_PROVIDERS_RESPONSE,
         json!({}),
+        // GET is uncorrelated: concurrent same-principal reads are idempotent.
+        None,
     )
     .await?;
     // Pass the array through unchanged; the gateway does not reshape it.
@@ -203,6 +266,8 @@ pub async fn get_active_model(
         GET_ACTIVE_REQUEST,
         GET_ACTIVE_RESPONSE,
         json!({}),
+        // GET is uncorrelated: concurrent same-principal reads are idempotent.
+        None,
     )
     .await?;
     // `null` means "no model bound" — a valid 200 response, not an error.
@@ -236,6 +301,15 @@ pub async fn set_active_model(
         return Err(GatewayError::BadRequest("id must not be empty".to_string()));
     }
 
+    // A fresh per-request correlation id. The set path can be raced by two
+    // concurrent same-principal SETs whose replies land on the same
+    // principal-scoped route; without correlation each could consume the
+    // other's reply BODY (the registry CAS already keeps the persisted state
+    // correct, but the wrong reply could be surfaced to the caller). The
+    // `corr_id` travels in the request PAYLOAD; the registry echoes it
+    // verbatim, and the round-trip skips any reply carrying a different one.
+    let corr_id = Uuid::new_v4().to_string();
+
     let reply = registry_round_trip(
         &state,
         &caller,
@@ -243,7 +317,9 @@ pub async fn set_active_model(
         SET_ACTIVE_RESPONSE,
         // The registry reads `model_id` (also accepted under `data`); the
         // gateway forwards the raw `id` untouched and never interprets it.
-        json!({ "model_id": body.id }),
+        // `corr_id` is echoed verbatim by the registry for reply correlation.
+        json!({ "model_id": body.id, "corr_id": corr_id }),
+        Some(corr_id.as_str()),
     )
     .await?;
 
@@ -264,4 +340,72 @@ pub async fn set_active_model(
     Err(GatewayError::Internal(anyhow::anyhow!(
         "registry set_active_model reply missing both 'active_model' and 'error'"
     )))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::reply_satisfies_corr_id;
+    use serde_json::json;
+
+    #[test]
+    fn uncorrelated_get_accepts_any_reply() {
+        // GET paths thread `None`: every reply is accepted regardless of
+        // whether it carries a `corr_id`.
+        assert!(reply_satisfies_corr_id(&json!({}), None));
+        assert!(reply_satisfies_corr_id(&json!(null), None));
+        assert!(reply_satisfies_corr_id(
+            &json!({ "corr_id": "anything" }),
+            None
+        ));
+    }
+
+    #[test]
+    fn set_accepts_matching_corr_id() {
+        // A SET reply carrying our exact `corr_id` is accepted.
+        assert!(reply_satisfies_corr_id(
+            &json!({ "status": "ok", "corr_id": "abc" }),
+            Some("abc")
+        ));
+        assert!(reply_satisfies_corr_id(
+            &json!({ "error": "nope", "corr_id": "abc" }),
+            Some("abc")
+        ));
+    }
+
+    #[test]
+    fn set_skips_foreign_corr_id() {
+        // A reply whose `corr_id` is PRESENT and differs belongs to another
+        // concurrent same-principal SET — it must be skipped (false).
+        assert!(!reply_satisfies_corr_id(
+            &json!({ "status": "ok", "corr_id": "other" }),
+            Some("abc")
+        ));
+        assert!(!reply_satisfies_corr_id(
+            &json!({ "error": "nope", "corr_id": "other" }),
+            Some("abc")
+        ));
+    }
+
+    #[test]
+    fn set_accepts_reply_without_corr_id() {
+        // Back-compat: a reply with NO `corr_id` field (legacy registry that
+        // hasn't started echoing it, or a GET reply racing onto the route) is
+        // accepted even when a `corr_id` was expected.
+        assert!(reply_satisfies_corr_id(
+            &json!({ "status": "ok", "active_model": { "id": "openai:gpt-4o" } }),
+            Some("abc")
+        ));
+        assert!(reply_satisfies_corr_id(&json!(null), Some("abc")));
+    }
+
+    #[test]
+    fn non_string_corr_id_is_treated_as_absent() {
+        // A malformed `corr_id` (not a string) is not a usable correlation
+        // value; `as_str` yields `None`, so the reply is accepted rather than
+        // silently skipped forever.
+        assert!(reply_satisfies_corr_id(
+            &json!({ "corr_id": 42 }),
+            Some("abc")
+        ));
+    }
 }
