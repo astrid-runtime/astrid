@@ -110,6 +110,20 @@ pub(crate) fn validate_manifest(manifest: &DistroManifest) -> anyhow::Result<()>
         if !seen_names.insert(&cap.name) {
             anyhow::bail!("duplicate capsule name '{}'", cap.name);
         }
+        // Distros compose *released* capsules. `branch`/`rev` selectors
+        // can only be honored by compiling from a git ref — the exact
+        // toolchain dependency offline/headless distro seeding exists to
+        // remove. Reject them: a distro must pin a released `version` or
+        // `tag`. (Git-ref installs remain available via the standalone
+        // `astrid capsule install` command.)
+        if cap.branch.is_some() || cap.rev.is_some() {
+            anyhow::bail!(
+                "capsule '{}': branch/rev require building from source and are not allowed in a \
+                 distro manifest — pin a released `version` or `tag` (git-ref installs are \
+                 available via `astrid capsule install`).",
+                cap.name,
+            );
+        }
     }
 
     // At least one uplink.
@@ -336,6 +350,78 @@ role = "uplink"
         let manifest: DistroManifest = toml::from_str(toml_src).unwrap();
         let err = validate_manifest(&manifest).expect_err("slash name must be rejected");
         assert!(err.to_string().contains("capsule name"), "got: {err}");
+    }
+
+    #[test]
+    fn rejects_branch_selector_in_distro() {
+        let toml_src = r#"
+schema-version = 1
+
+[distro]
+id = "test"
+name = "Test"
+version = "0.1.0"
+
+[[capsule]]
+name = "astrid-capsule-cli"
+source = "@org/cli"
+version = "0.1.0"
+branch = "main"
+role = "uplink"
+"#;
+        let manifest: DistroManifest = toml::from_str(toml_src).unwrap();
+        let err = validate_manifest(&manifest).expect_err("branch must be rejected");
+        let msg = err.to_string();
+        assert!(msg.contains("branch/rev"), "got: {msg}");
+        assert!(msg.contains("astrid-capsule-cli"), "got: {msg}");
+    }
+
+    #[test]
+    fn rejects_rev_selector_in_distro() {
+        let toml_src = r#"
+schema-version = 1
+
+[distro]
+id = "test"
+name = "Test"
+version = "0.1.0"
+
+[[capsule]]
+name = "astrid-capsule-cli"
+source = "@org/cli"
+version = "0.1.0"
+rev = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
+role = "uplink"
+"#;
+        let manifest: DistroManifest = toml::from_str(toml_src).unwrap();
+        let err = validate_manifest(&manifest).expect_err("rev must be rejected");
+        assert!(err.to_string().contains("branch/rev"), "got: {err}");
+    }
+
+    #[test]
+    fn accepts_version_and_tag_release_selectors() {
+        let toml_src = r#"
+schema-version = 1
+
+[distro]
+id = "test"
+name = "Test"
+version = "0.1.0"
+
+[[capsule]]
+name = "astrid-capsule-cli"
+source = "@org/cli"
+version = "0.1.0"
+role = "uplink"
+
+[[capsule]]
+name = "astrid-capsule-a"
+source = "@org/a"
+version = "0.2.0"
+tag = "v0.2.0-rc1"
+"#;
+        let manifest: DistroManifest = toml::from_str(toml_src).unwrap();
+        validate_manifest(&manifest).expect("version/tag release selectors are allowed");
     }
 
     #[test]
