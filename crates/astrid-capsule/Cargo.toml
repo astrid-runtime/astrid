@@ -19,10 +19,13 @@ astrid-mcp = { workspace = true }
 astrid-storage = { workspace = true, features = ["keychain"] }
 astrid-vfs = { workspace = true }
 astrid-workspace = { workspace = true }
+anyhow = { workspace = true }
+arc-swap = { workspace = true }
 async-trait = { workspace = true }
 blake3 = { workspace = true }
 bytes = "1"
 dashmap = { workspace = true }
+hex = { workspace = true }
 metrics = { workspace = true }
 notify = "7"
 parking_lot = { workspace = true }

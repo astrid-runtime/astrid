@@ -48,7 +48,7 @@ pub(crate) async fn run(args: PsArgs) -> Result<ExitCode> {
         return Ok(ExitCode::SUCCESS);
     }
     let session = astrid_core::SessionId::from_uuid(Uuid::new_v4());
-    let Ok(mut client) = SocketClient::connect(session).await else {
+    let Ok(mut client) = SocketClient::connect(session, crate::principal::current()).await else {
         eprintln!("{}", Theme::error("Failed to connect to daemon"));
         return Ok(ExitCode::from(1));
     };

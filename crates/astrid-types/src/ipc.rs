@@ -39,6 +39,23 @@ pub struct IpcMessage {
     /// kernel boundary. `None` for system events (boot, lifecycle).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub principal: Option<String>,
+
+    /// The device key that authenticated this message, if any.
+    ///
+    /// Identifies which registered `DeviceKey` on the acting principal's
+    /// `AuthConfig` this message was authenticated with, so the cap-gate can
+    /// apply that device's scope as an attenuation floor on the principal's
+    /// effective capabilities. `None` means an unattenuated (full-principal)
+    /// message — the legacy behaviour for every existing connection.
+    ///
+    /// This is **host-derived** internal bus metadata, NOT a client-settable
+    /// hint: it is stamped from the per-connection registry on the socket
+    /// path (or the gateway-signed bearer on the HTTP path), never read off a
+    /// client-controlled field. Like `principal`, it is a `String` because
+    /// `astrid-types` must not depend on `astrid-core`; resolution to a live
+    /// `DeviceKey` happens at the kernel boundary.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device_key_id: Option<String>,
 }
 
 /// `DateTime<Utc>` at the Unix epoch — used as the serde default for
@@ -69,6 +86,7 @@ impl IpcMessage {
             timestamp: Utc::now(),
             seq: 0,
             principal: None,
+            device_key_id: None,
         }
     }
 
@@ -83,6 +101,18 @@ impl IpcMessage {
     #[must_use]
     pub fn with_principal(mut self, principal: impl Into<String>) -> Self {
         self.principal = Some(principal.into());
+        self
+    }
+
+    /// Set the authenticating device key id for this message.
+    ///
+    /// Host-derived metadata used by the cap-gate to apply per-device scope
+    /// attenuation. Callers on the host paths stamp this from the
+    /// per-connection registry / signed bearer; it is never sourced from a
+    /// client-controlled field.
+    #[must_use]
+    pub fn with_device_key_id(mut self, id: impl Into<String>) -> Self {
+        self.device_key_id = Some(id.into());
         self
     }
 }
@@ -139,6 +169,20 @@ pub enum IpcPayload {
         /// Optional reason for the decision.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         reason: Option<String>,
+    },
+    /// A grant-on-first-use signal: principal `principal` invoked a tool from
+    /// capsule `capsule_id` that they do not currently hold. The broker/shim
+    /// elicits consent and, on approve, the kernel grants the capsule.
+    /// Distinct from [`ApprovalRequired`](IpcPayload::ApprovalRequired) so the
+    /// broker can tell a grant-on-use from a plain capability approval.
+    GrantRequired {
+        /// Unguessable correlation id (a UUID) the response is keyed on, used
+        /// to build `astrid.v1.approval.response.<request_id>`.
+        request_id: String,
+        /// The kernel-stamped caller principal that hit the access-gate miss.
+        principal: String,
+        /// The capsule id the principal needs granted.
+        capsule_id: String,
     },
     /// A capsule needs environment variables to be provided by the user.
     OnboardingRequired {
@@ -255,6 +299,7 @@ impl IpcPayload {
                 | "agent_response"
                 | "approval_required"
                 | "approval_response"
+                | "grant_required"
                 | "onboarding_required"
                 | "llm_request"
                 | "llm_stream_event"
@@ -417,6 +462,58 @@ mod tests {
     }
 
     #[test]
+    fn ipc_message_device_key_id_builder() {
+        let msg = IpcMessage::new(
+            "test.topic",
+            IpcPayload::Custom {
+                data: serde_json::json!({}),
+            },
+            Uuid::new_v4(),
+        );
+        assert!(msg.device_key_id.is_none());
+
+        let with_key = msg.with_device_key_id("abcdef0123456789");
+        assert_eq!(with_key.device_key_id.as_deref(), Some("abcdef0123456789"));
+    }
+
+    #[test]
+    fn ipc_message_device_key_id_serde_roundtrip() {
+        let msg = IpcMessage::new(
+            "test.topic",
+            IpcPayload::Custom {
+                data: serde_json::json!({}),
+            },
+            Uuid::nil(),
+        )
+        .with_device_key_id("abcdef0123456789");
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(json.contains(r#""device_key_id":"abcdef0123456789""#));
+
+        let parsed: IpcMessage = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.device_key_id.as_deref(), Some("abcdef0123456789"));
+    }
+
+    #[test]
+    fn ipc_message_device_key_id_absent_in_json() {
+        // A message constructed without a device key must not serialize the
+        // key at all (legacy wire compatibility), and must round-trip to None.
+        let msg = IpcMessage::new("test.topic", IpcPayload::Connect, Uuid::nil());
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(!json.contains("device_key_id"));
+
+        let parsed: IpcMessage = serde_json::from_str(&json).unwrap();
+        assert!(parsed.device_key_id.is_none());
+    }
+
+    #[test]
+    fn ipc_message_device_key_id_defaults_when_missing() {
+        // A frame from a peer that predates the field deserializes with None.
+        let json = r#"{"topic":"t","payload":{"type":"connect"},"source_id":"00000000-0000-0000-0000-000000000000","timestamp":"2024-01-01T00:00:00Z","seq":0}"#;
+        let msg: IpcMessage = serde_json::from_str(json).unwrap();
+        assert!(msg.device_key_id.is_none());
+    }
+
+    #[test]
     fn unknown_type_tag_deserializes_to_unknown() {
         let json = r#"{"type":"future_variant","some_data":42}"#;
         let payload: IpcPayload = serde_json::from_str(json).unwrap();
@@ -470,7 +567,7 @@ mod tests {
     #[test]
     #[allow(clippy::too_many_lines, reason = "exhaustive variant table")]
     fn is_known_tag_covers_all_variants() {
-        const EXPECTED_VARIANT_COUNT: usize = 17;
+        const EXPECTED_VARIANT_COUNT: usize = 18;
 
         let representatives: Vec<IpcPayload> = vec![
             IpcPayload::RawJson(serde_json::json!({"key": "val"})),
@@ -494,6 +591,11 @@ mod tests {
                 request_id: "req-1".into(),
                 decision: "approve".into(),
                 reason: None,
+            },
+            IpcPayload::GrantRequired {
+                request_id: "req-1".into(),
+                principal: "alice".into(),
+                capsule_id: "cap".into(),
             },
             IpcPayload::OnboardingRequired {
                 capsule_id: String::new(),
@@ -593,6 +695,21 @@ mod tests {
         assert!(!IpcPayload::is_known_tag("unknown"));
         assert!(!IpcPayload::is_known_tag(""));
         assert!(!IpcPayload::is_known_tag("Raw_Json"));
+    }
+
+    #[test]
+    fn grant_required_roundtrips_with_tag() {
+        let payload = IpcPayload::GrantRequired {
+            request_id: "req-1".into(),
+            principal: "alice".into(),
+            capsule_id: "secret-tool".into(),
+        };
+        let json = serde_json::to_value(&payload).unwrap();
+        assert_eq!(json["type"].as_str(), Some("grant_required"));
+        assert!(IpcPayload::is_known_tag("grant_required"));
+
+        let parsed: IpcPayload = serde_json::from_value(json).unwrap();
+        assert_eq!(parsed, payload);
     }
 
     #[test]

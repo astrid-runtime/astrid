@@ -35,6 +35,33 @@ impl ProcessSandboxConfig {
             .collect::<io::Result<Vec<_>>>()?
             .join("\n");
 
+        // Read-only file injections: allow reading the materialized literal
+        // (it lives AT `target` on macOS, there being no mount namespace), and
+        // append a trailing write-deny below so the child cannot modify it.
+        let inject_read_rules: String = self
+            .ro_injections
+            .iter()
+            .map(|inj| {
+                validate_sandbox_str(&inj.target, "injection target")
+                    .map(|s| format!("    (literal \"{s}\")"))
+            })
+            .collect::<io::Result<Vec<_>>>()?
+            .join("\n");
+
+        // Trailing write-deny on each injection target. Emitted AFTER
+        // `hidden_deny_rules` so it is the last match — in SBPL the last
+        // matching rule wins, so this denies the write even if an
+        // allow-write subpath above (e.g. the writable root) covers `target`.
+        let inject_deny_rules: String = self
+            .ro_injections
+            .iter()
+            .map(|inj| {
+                validate_sandbox_str(&inj.target, "injection target")
+                    .map(|s| format!("(deny file-write* (literal \"{s}\"))"))
+            })
+            .collect::<io::Result<Vec<_>>>()?
+            .join("\n");
+
         // Build deny rules for hidden paths (e.g. ~/.astrid/).
         // Skip any hidden path that is an ancestor of or equal to the
         // writable_root — the capsule must be able to access its own
@@ -77,6 +104,7 @@ impl ProcessSandboxConfig {
     (subpath "/var/folders")
     (literal "/")
 {extra_read_rules}
+{inject_read_rules}
 )
 (allow file-write*
     (subpath "{writable_root_str}")
@@ -85,7 +113,8 @@ impl ProcessSandboxConfig {
     (literal "/dev/null")
 {extra_write_rules}
 )
-{hidden_deny_rules}"#
+{hidden_deny_rules}
+{inject_deny_rules}"#
         );
 
         // Pass profile inline via -p to avoid temp file leak.
@@ -152,6 +181,40 @@ mod tests {
         assert!(
             profile.contains(r#"(deny file-write* (subpath "/Users/testuser/.astrid"))"#),
             "should deny file-write for hidden path"
+        );
+    }
+
+    #[test]
+    fn test_seatbelt_prefix_ro_inject() {
+        // The injection target must be read-allowed and write-denied, and the
+        // trailing write-deny must appear AFTER the allow-write block so the
+        // last-match-wins SBPL semantics keep the file unmodifiable even
+        // though the writable root's allow-write covers it.
+        let config = ProcessSandboxConfig::new("/project")
+            .with_ro_inject("/snap/policy.json", "/etc/agent/policy.json");
+        let prefix = config.build_seatbelt_prefix().unwrap();
+        let profile = prefix.args[1].to_string_lossy().to_string();
+
+        assert!(
+            profile.contains(r#"(literal "/etc/agent/policy.json")"#),
+            "profile must read-allow the injection target literal"
+        );
+        let deny = r#"(deny file-write* (literal "/etc/agent/policy.json"))"#;
+        assert!(
+            profile.contains(deny),
+            "profile must write-deny the injection target literal"
+        );
+
+        let allow_write_pos = profile
+            .find("(allow file-write*")
+            .expect("profile should have an allow file-write* block");
+        let deny_pos = profile
+            .find(deny)
+            .expect("profile should have the injection write-deny");
+        assert!(
+            deny_pos > allow_write_pos,
+            "the injection write-deny (offset {deny_pos}) must appear after \
+             the allow-write block (offset {allow_write_pos}) so last-match-wins"
         );
     }
 

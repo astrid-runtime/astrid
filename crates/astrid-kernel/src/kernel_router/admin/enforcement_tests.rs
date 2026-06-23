@@ -266,3 +266,155 @@ async fn admin_request_id_echoed_on_deny_path_too() {
     assert_eq!(resp["request_id"], "req-deny-correlate");
     assert_eq!(resp["status"], "Error");
 }
+
+// ── Per-device scope attenuation at the cap-gate ────────────────────
+
+/// Like [`send_admin`] but stamps a host-derived `device_key_id` on the IPC
+/// message — modelling a request that authenticated with a specific registered
+/// device (socket per-connection registry or gateway-signed scoped bearer). A
+/// `None` here is the unattenuated full-principal request.
+async fn send_admin_scoped(
+    kernel: &Arc<Kernel>,
+    caller: &PrincipalId,
+    device_key_id: Option<&str>,
+    suffix: &str,
+    req: AdminKernelRequest,
+) -> serde_json::Value {
+    let topic = format!("astrid.v1.admin.{suffix}");
+    let response_topic = format!("astrid.v1.admin.response.{suffix}");
+    let mut rx = kernel.event_bus.subscribe_topic(&response_topic);
+
+    let payload = serde_json::to_value(&req).expect("serialize admin request");
+    let mut msg = IpcMessage::new(topic, IpcPayload::RawJson(payload), kernel.session_id.0);
+    msg.principal = Some(caller.as_str().to_string());
+    msg.device_key_id = device_key_id.map(str::to_owned);
+    let _ = kernel.event_bus.publish(astrid_events::AstridEvent::Ipc {
+        metadata: astrid_events::EventMetadata::new("test"),
+        message: msg,
+    });
+
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            let event = rx.recv().await.expect("response event");
+            if let astrid_events::AstridEvent::Ipc { message, .. } = &*event
+                && let IpcPayload::RawJson(val) = &message.payload
+            {
+                return val.clone();
+            }
+        }
+    })
+    .await
+    .expect("admin response within 2s")
+}
+
+/// Seed a principal that holds `self:auth:pair` and registers two devices: a
+/// Full-scope device and a use-only device whose scope denies `self:auth:pair`.
+/// Returns `(full_key_id, scoped_key_id)`.
+fn seed_principal_with_devices(kernel: &Arc<Kernel>, principal: &PrincipalId) -> (String, String) {
+    use astrid_core::profile::{AuthMethod, DeviceKey, DeviceScope};
+
+    let mut profile = PrincipalProfile::default();
+    // Grant `self:*` directly so the test does not depend on the `agent`
+    // builtin group being loaded in the test kernel. `self:*` subsumes both
+    // `self:auth:pair` (the issue cap-gate) and `self:auth:pair:admin` (the
+    // full-mint gate), so an unattenuated request succeeds and the device
+    // scope is the only thing that can deny.
+    profile.grants = vec!["self:*".to_string()];
+    profile.enabled = true;
+    profile.auth.methods.push(AuthMethod::Keypair);
+
+    // A Full-scope device (unattenuated) and a use-only device that denies the
+    // pair capability. Distinct dummy pubkeys → distinct deterministic key_ids.
+    let full = DeviceKey::new("a".repeat(64), DeviceScope::Full, None, 0);
+    let scoped = DeviceKey::new(
+        "b".repeat(64),
+        DeviceScope::Scoped {
+            allow: vec!["self:*".to_string()],
+            deny: vec!["self:auth:pair".to_string()],
+        },
+        None,
+        0,
+    );
+    let full_id = full.key_id.clone();
+    let scoped_id = scoped.key_id.clone();
+    profile.auth.public_keys = vec![full, scoped];
+
+    seed_profile(kernel, principal, &profile);
+    (full_id, scoped_id)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn device_scope_denies_pair_issue_but_full_device_and_none_allow() {
+    let (_dir, kernel) = fixture().await;
+    let caller = pid("paired_user");
+    let (full_id, scoped_id) = seed_principal_with_devices(&kernel, &caller);
+
+    // PairDeviceIssue is gated by `self:auth:pair`, which the principal holds.
+    let req = || {
+        AdminRequestKind::PairDeviceIssue {
+            expires_secs: Some(300),
+            label: Some("test".into()),
+            scope: astrid_events::kernel_api::PairScopeArg::Full,
+        }
+        .into()
+    };
+
+    // 1. No device scope (full-principal request) → ALLOWED. The handler runs
+    //    and returns a PairToken.
+    let resp = send_admin_scoped(&kernel, &caller, None, "auth.pair.issue", req()).await;
+    assert_eq!(
+        resp["status"], "PairToken",
+        "an unattenuated request must be allowed: {resp}"
+    );
+
+    // 2. A Full-scope device → ALLOWED (Full is equivalent to no attenuation).
+    let resp = send_admin_scoped(&kernel, &caller, Some(&full_id), "auth.pair.issue", req()).await;
+    assert_eq!(
+        resp["status"], "PairToken",
+        "a full-scope device must be allowed: {resp}"
+    );
+
+    // 3. The use-only device (deny: self:auth:pair) → DENIED, even though the
+    //    SAME principal holds `self:auth:pair`. This is the headline guarantee:
+    //    a paired device cannot exceed its scope.
+    let resp =
+        send_admin_scoped(&kernel, &caller, Some(&scoped_id), "auth.pair.issue", req()).await;
+    assert_eq!(
+        resp["status"], "Error",
+        "a use-only device must be denied at the cap-gate: {resp}"
+    );
+    let err = resp["data"].as_str().unwrap_or_default();
+    assert!(
+        err.contains("outside the authenticating device's scope") || err.contains("device"),
+        "deny must be a device-scope denial, got: {err}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn unknown_device_key_id_fails_closed() {
+    let (_dir, kernel) = fixture().await;
+    let caller = pid("paired_user");
+    let _ = seed_principal_with_devices(&kernel, &caller);
+
+    // A request naming a device key the principal does not have (revoked or
+    // never registered) must FAIL CLOSED — never fall back to the principal's
+    // full authority. The principal holds `self:auth:pair`, so a fallback would
+    // wrongly allow.
+    let resp = send_admin_scoped(
+        &kernel,
+        &caller,
+        Some("deadbeefdeadbeef"),
+        "auth.pair.issue",
+        AdminRequestKind::PairDeviceIssue {
+            expires_secs: Some(300),
+            label: None,
+            scope: astrid_events::kernel_api::PairScopeArg::Full,
+        }
+        .into(),
+    )
+    .await;
+    assert_eq!(
+        resp["status"], "Error",
+        "an unresolved device_key_id must fail closed: {resp}"
+    );
+}

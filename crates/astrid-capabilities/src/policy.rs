@@ -41,7 +41,7 @@
 //! caching. The caller is expected to have resolved the profile and
 //! the group config beforehand.
 
-use astrid_core::{GroupConfig, PrincipalId, PrincipalProfile, capability_matches};
+use astrid_core::{DeviceScope, GroupConfig, PrincipalId, PrincipalProfile, capability_matches};
 use thiserror::Error;
 use tracing::warn;
 
@@ -80,6 +80,20 @@ pub enum PermissionError {
         /// The resolved principal identifier.
         principal: PrincipalId,
     },
+    /// The principal holds the capability, but the device that authenticated
+    /// this request carries a [`DeviceScope::Scoped`](astrid_core::DeviceScope)
+    /// floor that does not admit it (the `allow` list does not match, or a
+    /// `deny` pattern overrides). The principal could exercise this capability
+    /// from a full-scope device; this specific device cannot.
+    #[error(
+        "permission denied for principal {principal}: capability {required} is outside the authenticating device's scope"
+    )]
+    DeviceScopeDenied {
+        /// The resolved principal identifier.
+        principal: PrincipalId,
+        /// The capability pattern that was required.
+        required: String,
+    },
 }
 
 /// Borrowed evaluator over a resolved profile and the shared group
@@ -93,11 +107,20 @@ pub struct CapabilityCheck<'a> {
     profile: &'a PrincipalProfile,
     groups: &'a GroupConfig,
     principal: PrincipalId,
+    /// Optional per-device attenuation floor. `None` (the default) means the
+    /// check is unattenuated — the principal's full effective capability set
+    /// applies, which is the behaviour for every full-scope / un-paired
+    /// connection. A `Some(Scoped { .. })` floor additionally narrows an
+    /// ALLOW decision; a `Some(Full)` floor is equivalent to `None`.
+    device_scope: Option<&'a DeviceScope>,
 }
 
 impl<'a> CapabilityCheck<'a> {
     /// Build a new check for `profile` against `groups`, associated with
     /// the resolved principal `principal` for audit and error messages.
+    ///
+    /// The check is unattenuated by default; apply a per-device floor with
+    /// [`with_device_scope`](Self::with_device_scope).
     #[must_use]
     pub fn new(
         profile: &'a PrincipalProfile,
@@ -108,15 +131,77 @@ impl<'a> CapabilityCheck<'a> {
             profile,
             groups,
             principal,
+            device_scope: None,
         }
     }
 
-    /// Return `true` if the principal holds capability `cap`.
+    /// Attenuate this check with a per-device [`DeviceScope`] floor.
     ///
-    /// Precedence: revokes > grants > group-inherited. Missing group
-    /// names are fail-closed and logged at `warn!`.
+    /// The floor is applied AFTER the principal decision: it can only narrow
+    /// an ALLOW, never widen a DENY. A [`DeviceScope::Full`] floor leaves the
+    /// decision unchanged (equivalent to not setting one), preserving the
+    /// behaviour of every full-scope device and every migrated legacy key.
+    #[must_use]
+    pub fn with_device_scope(mut self, scope: &'a DeviceScope) -> Self {
+        self.device_scope = Some(scope);
+        self
+    }
+
+    /// Return `true` if the principal holds capability `cap` AND the
+    /// authenticating device's scope admits it.
+    ///
+    /// Precedence: revokes > grants > group-inherited, then the device-scope
+    /// floor. Missing group names are fail-closed and logged at `warn!`. The
+    /// device floor is purely restrictive — a `Scoped` device can never make
+    /// a capability the principal lacks become held.
     #[must_use]
     pub fn has(&self, cap: &str) -> bool {
+        if !self.principal_has(cap) {
+            return false;
+        }
+        self.device_scope_admits(cap)
+    }
+
+    /// Enforce that the principal holds capability `cap` and the
+    /// authenticating device's scope admits it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PermissionError::RevokedCapability`] if the capability
+    /// is satisfied via a grant or group but a revoke pattern overrides
+    /// it, [`PermissionError::MissingCapability`] if the capability is
+    /// simply not held by the principal, or
+    /// [`PermissionError::DeviceScopeDenied`] if the principal holds it but
+    /// the authenticating device's scope does not admit it.
+    pub fn require(&self, cap: &str) -> Result<(), PermissionError> {
+        if let Some(revoke) = self.first_matching_revoke(cap) {
+            return Err(PermissionError::RevokedCapability {
+                principal: self.principal.clone(),
+                required: cap.to_string(),
+                revoke_pattern: revoke.to_string(),
+            });
+        }
+        let principal_holds = matches_any(self.profile.grants.iter().map(String::as_str), cap)
+            || self.holds_via_groups(cap);
+        if !principal_holds {
+            return Err(PermissionError::MissingCapability {
+                principal: self.principal.clone(),
+                required: cap.to_string(),
+            });
+        }
+        // Principal floor satisfied. Apply the per-device scope floor last so
+        // a scoped device's narrower grant can deny without ever widening.
+        if !self.device_scope_admits(cap) {
+            return Err(PermissionError::DeviceScopeDenied {
+                principal: self.principal.clone(),
+                required: cap.to_string(),
+            });
+        }
+        Ok(())
+    }
+
+    /// The unattenuated principal decision: revokes > grants > group-inherited.
+    fn principal_has(&self, cap: &str) -> bool {
         if matches_any(self.profile.revokes.iter().map(String::as_str), cap) {
             return false;
         }
@@ -126,32 +211,19 @@ impl<'a> CapabilityCheck<'a> {
         self.holds_via_groups(cap)
     }
 
-    /// Enforce that the principal holds capability `cap`.
+    /// Whether the authenticating device's scope admits `cap`.
     ///
-    /// # Errors
-    ///
-    /// Returns [`PermissionError::RevokedCapability`] if the capability
-    /// is satisfied via a grant or group but a revoke pattern overrides
-    /// it, or [`PermissionError::MissingCapability`] if the capability
-    /// is simply not held.
-    pub fn require(&self, cap: &str) -> Result<(), PermissionError> {
-        if let Some(revoke) = self.first_matching_revoke(cap) {
-            return Err(PermissionError::RevokedCapability {
-                principal: self.principal.clone(),
-                required: cap.to_string(),
-                revoke_pattern: revoke.to_string(),
-            });
+    /// `None` or [`DeviceScope::Full`] always admits (no attenuation). A
+    /// [`DeviceScope::Scoped`] floor admits iff `cap` matches an `allow`
+    /// pattern and matches no `deny` pattern (deny wins).
+    fn device_scope_admits(&self, cap: &str) -> bool {
+        match self.device_scope {
+            None | Some(DeviceScope::Full) => true,
+            Some(DeviceScope::Scoped { allow, deny }) => {
+                matches_any(allow.iter().map(String::as_str), cap)
+                    && !matches_any(deny.iter().map(String::as_str), cap)
+            },
         }
-        if matches_any(self.profile.grants.iter().map(String::as_str), cap) {
-            return Ok(());
-        }
-        if self.holds_via_groups(cap) {
-            return Ok(());
-        }
-        Err(PermissionError::MissingCapability {
-            principal: self.principal.clone(),
-            required: cap.to_string(),
-        })
     }
 
     fn first_matching_revoke(&self, cap: &str) -> Option<&'a str> {
@@ -186,6 +258,50 @@ where
     I: IntoIterator<Item = &'b str>,
 {
     patterns.into_iter().any(|p| capability_matches(p, cap))
+}
+
+/// Validate that a requested device scope stays within the issuer's authority
+/// — the no-escalation guarantee enforced at pair-token issue time.
+///
+/// `issuer_check` is the issuer's *effective* check: its principal decision
+/// already narrowed by the issuer's OWN authenticating device scope (a scoped
+/// device can only mint a child no broader than itself). For a
+/// [`DeviceScope::Scoped`] request, every `allow` pattern `P` must satisfy
+/// `issuer_check.has(P)` — the issuer can only confer capabilities it actually
+/// holds. `deny` patterns need no validation: they purely restrict, so a child
+/// denying something is always safe.
+///
+/// A [`DeviceScope::Full`] request is *not* validated here — minting an
+/// unattenuated device is gated separately by the `self:auth:pair:admin`
+/// capability at the call site (a full device inherits the principal's whole
+/// effective set, which the principal already holds by definition).
+///
+/// # Errors
+///
+/// Returns [`PermissionError::MissingCapability`] naming the first `allow`
+/// pattern the issuer does not effectively hold, so the issue is rejected
+/// fail-closed. `MissingCapability` (not `DeviceScopeDenied`) is the accurate
+/// shape here: this is the *issuer authority* subset check, and the pattern may
+/// be unheld because the principal lacks it OR because the issuer's own device
+/// scope excludes it — "{cap} is not held by {issuer}" is correct either way,
+/// whereas "outside the authenticating device's scope" would mis-attribute the
+/// principal-lacks-it case.
+pub fn device_scope_within(
+    issuer_check: &CapabilityCheck<'_>,
+    requested: &DeviceScope,
+) -> Result<(), PermissionError> {
+    let DeviceScope::Scoped { allow, .. } = requested else {
+        return Ok(());
+    };
+    for pattern in allow {
+        if !issuer_check.has(pattern) {
+            return Err(PermissionError::MissingCapability {
+                principal: issuer_check.principal.clone(),
+                required: pattern.clone(),
+            });
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -388,5 +504,147 @@ mod tests {
         let cfg = gc();
         let chk = CapabilityCheck::new(&p, &cfg, pid());
         assert!(!chk.has("system:shutdown"));
+    }
+
+    // ── Device-scope attenuation ──────────────────────────────────────────
+
+    #[test]
+    fn device_full_scope_is_unattenuated() {
+        // A Full device floor leaves the principal decision untouched —
+        // identical to no floor at all.
+        let p = profile_in(&["agent"]);
+        let cfg = gc();
+        let scope = DeviceScope::Full;
+        let chk = CapabilityCheck::new(&p, &cfg, pid()).with_device_scope(&scope);
+        assert!(chk.has("self:capsule:install"));
+        assert!(!chk.has("system:shutdown"));
+        chk.require("self:capsule:install").unwrap();
+    }
+
+    #[test]
+    fn device_scope_allows_when_principal_allows_and_device_allows() {
+        let p = profile_in(&["agent"]);
+        let cfg = gc();
+        let scope = DeviceScope::Scoped {
+            allow: vec!["self:*".into()],
+            deny: vec![],
+        };
+        let chk = CapabilityCheck::new(&p, &cfg, pid()).with_device_scope(&scope);
+        assert!(chk.has("self:capsule:install"));
+        chk.require("self:capsule:install").unwrap();
+    }
+
+    #[test]
+    fn device_scope_deny_wins_over_allow() {
+        // Principal holds it, device allow matches, but a device deny pattern
+        // overrides → DeviceScopeDenied.
+        let p = profile_in(&["agent"]);
+        let cfg = gc();
+        let scope = DeviceScope::Scoped {
+            allow: vec!["self:*".into()],
+            deny: vec!["self:capsule:install".into()],
+        };
+        let chk = CapabilityCheck::new(&p, &cfg, pid()).with_device_scope(&scope);
+        assert!(!chk.has("self:capsule:install"));
+        let err = chk.require("self:capsule:install").unwrap_err();
+        match err {
+            PermissionError::DeviceScopeDenied {
+                required,
+                principal,
+            } => {
+                assert_eq!(required, "self:capsule:install");
+                assert_eq!(principal, pid());
+            },
+            other => panic!("expected DeviceScopeDenied, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn device_scope_cannot_widen_principal_deny() {
+        // Principal does NOT hold the capability; even a permissive device
+        // allow can't grant it — the principal floor still applies.
+        let p = profile_in(&["agent"]);
+        let cfg = gc();
+        let scope = DeviceScope::Scoped {
+            allow: vec!["*".into()],
+            deny: vec![],
+        };
+        let chk = CapabilityCheck::new(&p, &cfg, pid()).with_device_scope(&scope);
+        assert!(!chk.has("system:shutdown"));
+        let err = chk.require("system:shutdown").unwrap_err();
+        // The principal floor is what denies — not the device scope.
+        match err {
+            PermissionError::MissingCapability { required, .. } => {
+                assert_eq!(required, "system:shutdown");
+            },
+            other => panic!("expected MissingCapability, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn device_scope_outside_allow_is_denied() {
+        // Principal holds it (agent has self:*), but the device allow list
+        // doesn't cover this capability → denied.
+        let p = profile_in(&["agent"]);
+        let cfg = gc();
+        let scope = DeviceScope::Scoped {
+            allow: vec!["self:capsule:list".into()],
+            deny: vec![],
+        };
+        let chk = CapabilityCheck::new(&p, &cfg, pid()).with_device_scope(&scope);
+        assert!(chk.has("self:capsule:list"));
+        assert!(!chk.has("self:capsule:install"));
+        assert!(matches!(
+            chk.require("self:capsule:install").unwrap_err(),
+            PermissionError::DeviceScopeDenied { .. }
+        ));
+    }
+
+    #[test]
+    fn device_scope_wildcard_intersection() {
+        // The headline use-case: principal self:*, device allow self:* deny
+        // self:auth:pair → a self capability is allowed, the paired-denied one
+        // is denied. Mirrors the `use-only` preset semantics.
+        let mut p = profile_in(&["agent"]);
+        // Give the agent the self-scoped pair capability so the principal floor
+        // alone would allow it; the device scope is what restricts it.
+        p.grants.push("self:auth:pair".into());
+        let cfg = gc();
+        let scope = DeviceScope::Scoped {
+            allow: vec!["self:*".into()],
+            deny: vec!["self:auth:pair".into(), "self:auth:pair:admin".into()],
+        };
+        let chk = CapabilityCheck::new(&p, &cfg, pid()).with_device_scope(&scope);
+
+        // A general self capability is admitted.
+        assert!(chk.has("self:agent:prompt"));
+        chk.require("self:agent:prompt").unwrap();
+
+        // The denied pairing capability is rejected even though the principal
+        // holds it and the allow pattern matches.
+        assert!(!chk.has("self:auth:pair"));
+        assert!(matches!(
+            chk.require("self:auth:pair").unwrap_err(),
+            PermissionError::DeviceScopeDenied { .. }
+        ));
+    }
+
+    #[test]
+    fn device_scope_revoke_still_takes_top_precedence() {
+        // A principal revoke must still win even with a permissive device
+        // scope — the revoke is the highest-precedence floor.
+        let mut p = profile_in(&["admin"]);
+        p.revokes.push("system:shutdown".into());
+        let cfg = gc();
+        let scope = DeviceScope::Scoped {
+            allow: vec!["*".into()],
+            deny: vec![],
+        };
+        let chk = CapabilityCheck::new(&p, &cfg, pid()).with_device_scope(&scope);
+        assert!(!chk.has("system:shutdown"));
+        assert!(matches!(
+            chk.require("system:shutdown").unwrap_err(),
+            PermissionError::RevokedCapability { .. }
+        ));
     }
 }

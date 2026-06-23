@@ -85,8 +85,8 @@ impl fmt::Display for RiskAssessment {
 
 /// A request for human approval of a sensitive action.
 ///
-/// Created by the security interceptor when an action requires explicit
-/// human confirmation. Contains all context needed for an informed decision.
+/// Created when an action requires explicit human confirmation. Contains all
+/// context needed for an informed decision.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ApprovalRequest {
     /// Unique request identifier.
@@ -143,7 +143,8 @@ pub enum ApprovalDecision {
     /// workspace directory. Full persistence (state.db) comes in Step 4;
     /// for now they live in `AllowanceStore` as non-session entries.
     ApproveWorkspace,
-    /// Allow always — creates a persistent `CapabilityToken` (1h default TTL).
+    /// Allow always — creates a persistent, permanent `CapabilityToken`
+    /// (no TTL; valid until explicitly revoked).
     ///
     /// Unlike session allowances (in-memory), this creates a cryptographically
     /// signed capability token with an `approval_audit_id` chain-link.

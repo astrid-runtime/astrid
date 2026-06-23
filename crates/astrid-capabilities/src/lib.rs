@@ -70,7 +70,7 @@ mod validator;
 pub use error::{CapabilityError, CapabilityResult};
 pub use handle::{DirHandle, FileHandle};
 pub use pattern::ResourcePattern;
-pub use policy::{CapabilityCheck, PermissionError};
+pub use policy::{CapabilityCheck, PermissionError, device_scope_within};
 pub use store::CapabilityStore;
 pub use token::{AuditEntryId, CapabilityToken, TokenScope};
 pub use validator::{AuthorizationResult, CapabilityValidator};

@@ -85,7 +85,7 @@ pub async fn list_groups(
     req: Request<axum::body::Body>,
 ) -> GatewayResult<Json<GroupListResponse>> {
     let caller = caller_from(&req)?.clone();
-    let client = state.admin_client(caller.principal)?;
+    let client = state.admin_client_for(&caller)?;
     let resp = client
         .request(AdminRequestKind::GroupList)
         .await
@@ -114,7 +114,7 @@ pub async fn create_group(
 ) -> GatewayResult<Json<serde_json::Value>> {
     let caller = caller_from(&req)?.clone();
     let body: CreateGroupRequest = read_json_body(req).await?;
-    let client = state.admin_client(caller.principal)?;
+    let client = state.admin_client_for(&caller)?;
     let resp = client
         .request(AdminRequestKind::GroupCreate {
             name: body.name,
@@ -150,7 +150,7 @@ pub async fn modify_group(
 ) -> GatewayResult<Json<serde_json::Value>> {
     let caller = caller_from(&req)?.clone();
     let body: ModifyGroupRequest = read_json_body(req).await?;
-    let client = state.admin_client(caller.principal)?;
+    let client = state.admin_client_for(&caller)?;
     let resp = client
         .request(AdminRequestKind::GroupModify {
             name,
@@ -184,7 +184,7 @@ pub async fn delete_group(
     req: Request<axum::body::Body>,
 ) -> GatewayResult<StatusCode> {
     let caller = caller_from(&req)?.clone();
-    let client = state.admin_client(caller.principal)?;
+    let client = state.admin_client_for(&caller)?;
     let resp = client
         .request(AdminRequestKind::GroupDelete { name })
         .await

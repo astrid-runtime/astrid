@@ -546,19 +546,25 @@ async fn install_capsules(
         // The installer returns the ref it ACTUALLY resolved and fetched
         // (`Some` for GitHub sources, `None` for local paths). Record
         // that — never a guess derived from the manifest fields — so the
-        // lock attests what was truly installed.
-        let resolved_ref =
-            match super::capsule::install::install_capsule_batch(&cap.source, false, &refspec)
-                .await
-            {
-                Ok(resolved_ref) => resolved_ref,
-                Err(e) => {
-                    eprintln!("\n  Failed to install {}: {e}", cap.name);
-                    failed.push(cap.name.clone());
-                    pb.inc(1);
-                    continue;
-                },
-            };
+        // lock attests what was truly installed. `Some(&cap.name)` is the
+        // name hint used to pick the right archive from a multi-asset
+        // release.
+        let resolved_ref = match super::capsule::install::install_capsule_batch(
+            &cap.source,
+            Some(&cap.name),
+            false,
+            &refspec,
+        )
+        .await
+        {
+            Ok(resolved_ref) => resolved_ref,
+            Err(e) => {
+                eprintln!("\n  Failed to install {}: {e}", cap.name);
+                failed.push(cap.name.clone());
+                pb.inc(1);
+                continue;
+            },
+        };
 
         // Read the installed meta to get the wasm_hash for the lock.
         let target_dir = super::capsule::install::resolve_target_dir(&home, &cap.name, false)?;

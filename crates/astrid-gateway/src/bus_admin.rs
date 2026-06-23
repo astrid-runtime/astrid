@@ -59,19 +59,38 @@ const DEFAULT_TIMEOUT: Duration = Duration::from_secs(15);
 pub struct BusAdminClient {
     bus: Arc<EventBus>,
     caller: PrincipalId,
+    /// The device `key_id` the inbound bearer was scoped to, if any. Stamped
+    /// onto every outbound admin request so the kernel cap-gate can apply this
+    /// device's scope as an attenuation floor on `caller`'s authority. `None`
+    /// for a legacy full-authority bearer or a bootstrap (`default`) caller.
+    device_key_id: Option<String>,
     timeout: Duration,
 }
 
 impl BusAdminClient {
     /// Build a client bound to `caller`. Cloning `Arc<EventBus>` is
     /// cheap — every gateway request can mint one.
+    ///
+    /// The client is unscoped (no device key); use
+    /// [`with_device_key_id`](Self::with_device_key_id) for a request that must
+    /// carry a scoped caller's device id to the kernel cap-gate.
     #[must_use]
     pub fn new(bus: Arc<EventBus>, caller: PrincipalId) -> Self {
         Self {
             bus,
             caller,
+            device_key_id: None,
             timeout: DEFAULT_TIMEOUT,
         }
+    }
+
+    /// Bind the device `key_id` this caller's bearer was scoped to, so the
+    /// kernel cap-gate attenuates the request to that device's scope. `None`
+    /// leaves the request unattenuated (full principal authority).
+    #[must_use]
+    pub fn with_device_key_id(mut self, device_key_id: Option<String>) -> Self {
+        self.device_key_id = device_key_id;
+        self
     }
 
     /// Override the response timeout (used in tests).
@@ -98,8 +117,15 @@ impl BusAdminClient {
 
         let req = AdminKernelRequest::with_request_id(request_id.clone(), kind);
         let payload = serde_json::to_value(&req).context("serialize AdminKernelRequest")?;
-        let msg = IpcMessage::new(topic, IpcPayload::RawJson(payload), Uuid::nil())
+        let mut msg = IpcMessage::new(topic, IpcPayload::RawJson(payload), Uuid::nil())
             .with_principal(self.caller.to_string());
+        // Carry the caller's device scope to the kernel cap-gate. A scoped
+        // bearer's key_id rides on every admin op so a paired device cannot
+        // exceed its scope (e.g. a use-only device's PairDeviceIssue is denied
+        // even though its principal holds `self:auth:pair`).
+        if let Some(key_id) = &self.device_key_id {
+            msg = msg.with_device_key_id(key_id.clone());
+        }
         self.bus.publish(AstridEvent::Ipc {
             metadata: EventMetadata::new("astrid-gateway::bus_admin"),
             message: msg,

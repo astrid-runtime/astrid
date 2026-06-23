@@ -84,6 +84,12 @@ pub(super) struct PersistentEntry {
     /// The monitor task owning the `Child`. Aborting it drops the `Child`,
     /// whose `kill_on_drop(true)` SIGKILLs the process — the reap backstop.
     pub(super) monitor: tokio::task::JoinHandle<()>,
+    /// Cleanup guard for any read-only file injections wired into this child's
+    /// sandbox. Held for the process's lifetime; its `Drop` (Linux scratch dir
+    /// removal / macOS target unlink) fires when the entry is consumed by
+    /// `reap_entry`. `None` when the spawn had no injections.
+    #[allow(dead_code)] // Held purely for its Drop; never read after spawn.
+    pub(super) injection_guard: Option<super::super::inject::InjectionGuard>,
 }
 
 impl PersistentEntry {

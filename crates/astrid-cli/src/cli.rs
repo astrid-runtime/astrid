@@ -13,9 +13,9 @@ use crate::commands::{
     agent::AgentCommand, audit::AuditArgs, budget::BudgetCommand, caps::CapsCommand,
     capsule::config::ConfigArgs as CapsuleConfigArgs, capsule::show::ShowArgs as CapsuleShowArgs,
     completions::CompletionsArgs, doctor::DoctorArgs, gc::GcArgs, group::GroupCommand,
-    invite::InviteCommand, keypair::KeypairCommand, logs::LogsArgs, ps::PsArgs,
-    quota::QuotaCommand, run::RunArgs, secret::SecretCommand, setup::SetupArgs, top::TopArgs,
-    trust::TrustCommand, version::VersionArgs, voucher::VoucherCommand, who::WhoArgs,
+    invite::InviteCommand, keypair::KeypairCommand, logs::LogsArgs, pair_device::PairDeviceCommand,
+    ps::PsArgs, quota::QuotaCommand, run::RunArgs, secret::SecretCommand, setup::SetupArgs,
+    top::TopArgs, trust::TrustCommand, version::VersionArgs, voucher::VoucherCommand, who::WhoArgs,
 };
 
 /// Astrid - Secure Agent Runtime
@@ -31,6 +31,16 @@ pub(crate) struct Cli {
     /// Output format: pretty (default), json, or stream-json
     #[arg(long, global = true, default_value = "pretty")]
     pub format: String,
+
+    /// Principal this CLI process acts as. Stamped on every IPC message
+    /// the process sends, so the kernel scopes session, KV, home,
+    /// secrets, and quotas to this identity. Falls back to the
+    /// `ASTRID_PRINCIPAL` env var, then to `default`. Must be 1-64
+    /// chars of `[a-zA-Z0-9_-]`. The uplink proxy pins the first
+    /// principal it sees on a connection and drops any message stamped
+    /// with a different one, so this is fixed for the whole process.
+    #[arg(long, global = true, env = "ASTRID_PRINCIPAL")]
+    pub principal: Option<String>,
 
     /// Non-interactive prompt. Sends the prompt, prints the response, and exits.
     /// Forces headless mode (no TUI). Stdin is appended to the prompt if piped.
@@ -132,6 +142,13 @@ pub(crate) enum Commands {
     Keypair {
         #[command(subcommand)]
         command: KeypairCommand,
+    },
+
+    /// Pair an additional device with an existing principal: issue scoped
+    /// pair-tokens, list paired devices, and revoke them.
+    PairDevice {
+        #[command(subcommand)]
+        command: PairDeviceCommand,
     },
 
     /// Store and inspect capsule env configuration (API keys, base URLs).
@@ -276,16 +293,33 @@ pub(crate) enum Commands {
     /// Generate shell completion scripts.
     Completions(CompletionsArgs),
 
-    /// Update Astrid to the latest release.
-    Update,
+    /// Update Astrid to the latest release (`self-update` is a legacy alias).
+    #[command(alias = "self-update")]
+    Update(UpdateArgs),
+}
 
-    /// Update Astrid to the latest release (legacy — use `astrid update`).
-    #[command(hide = true)]
-    SelfUpdate,
+/// Arguments for `astrid update`.
+#[derive(Debug, clap::Args)]
+pub(crate) struct UpdateArgs {
+    /// Install without the interactive confirmation prompt.
+    #[arg(short = 'y', long)]
+    pub(crate) yes: bool,
+
+    /// Report whether an update is available without installing it.
+    #[arg(long)]
+    pub(crate) check: bool,
+
+    /// Override the release source as `owner/repo` — rehearse the update flow
+    /// against a fork or pre-release. (Env: `ASTRID_UPDATE_REPO`; API base:
+    /// `ASTRID_UPDATE_API`.)
+    #[arg(long, value_name = "OWNER/REPO")]
+    pub(crate) source: Option<String>,
 }
 
 #[derive(Subcommand)]
 pub(crate) enum CapsuleCommands {
+    /// Scaffold a new, first-try-compiling capsule project.
+    New(crate::commands::capsule::new::NewArgs),
     /// Install a capsule from a local path or registry.
     ///
     /// Capsules are deployed once and shared across every principal —
@@ -297,6 +331,9 @@ pub(crate) enum CapsuleCommands {
     Install {
         /// Capsule source (local path or package name)
         source: String,
+        /// Install only this capsule from a multi-capsule release (default: install all)
+        #[arg(long)]
+        capsule: Option<String>,
         /// Install to workspace instead of user-level
         #[arg(long)]
         workspace: bool,
@@ -352,6 +389,27 @@ pub(crate) enum CapsuleCommands {
     Config(CapsuleConfigArgs),
     /// Show manifest, interfaces, source for an installed capsule.
     Show(CapsuleShowArgs),
+    /// Run a capsule-provided command, explicitly naming the provider
+    /// (needed when two capsules provide the same verb).
+    Run {
+        /// The capsule that provides the verb.
+        provider: String,
+        /// The capsule-declared CLI verb.
+        verb: String,
+        /// Arguments forwarded verbatim to the capsule.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+    /// Capsule-provided verbs: `astrid capsule <verb> [args...]`.
+    ///
+    /// The named variants above (`install`, `update`, `list`, ...)
+    /// structurally shadow capsule verbs: clap matches a declared variant
+    /// before falling through to this external-subcommand catch-all, so a
+    /// capsule can never override a built-in verb (manifest parsing also
+    /// rejects reserved names — defence in depth). Any unrecognised verb
+    /// lands here and is resolved against the daemon's command registry.
+    #[command(external_subcommand)]
+    External(Vec<String>),
 }
 
 /// Model Context Protocol surfaces — expose Astrid's capsule tools to an
@@ -365,10 +423,12 @@ pub(crate) enum McpCommands {
     /// stream (EOF) or the process is killed. Stdout carries the MCP
     /// JSON-RPC protocol only — all diagnostics go to stderr.
     Serve {
-        /// Principal to act as. Defaults to the active CLI agent (or
-        /// the `default` principal when no context is set). Stamped onto
-        /// every IPC message so the kernel scopes tool execution to this
-        /// identity.
+        /// Principal to act as for this MCP server. Overrides the
+        /// process-wide principal (the global `--principal` /
+        /// `ASTRID_PRINCIPAL`); when omitted, falls back to it (which
+        /// itself defaults to the active CLI agent, then `default`).
+        /// Stamped onto every IPC message so the kernel scopes tool
+        /// execution to this identity.
         #[arg(long)]
         principal: Option<String>,
     },
@@ -474,4 +534,41 @@ pub(crate) enum DistroCommands {
         #[arg(short, long)]
         key: PathBuf,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::CapsuleCommands;
+    use clap::Subcommand;
+
+    /// Every built-in `astrid capsule` subcommand name must appear in
+    /// [`astrid_core::kernel_api::RESERVED_CAPSULE_VERBS`]. The reserved
+    /// list is what manifest parsing uses to reject a `kind = "cli"`
+    /// command that would shadow a built-in verb; if the two drift, a
+    /// capsule could declare a verb that clap silently shadows (or, worse,
+    /// the reserved list could block a name that is not actually a
+    /// built-in). This test pins them together.
+    ///
+    /// The catch-all `External` external-subcommand variant has no fixed
+    /// clap name (it matches arbitrary verbs), so it is excluded.
+    #[test]
+    fn reserved_verbs_match_clap_subcommands() {
+        let cmd = CapsuleCommands::augment_subcommands(clap::Command::new("capsule"));
+        let clap_names: Vec<String> = cmd
+            .get_subcommands()
+            .map(|s| s.get_name().to_string())
+            .collect();
+
+        for name in &clap_names {
+            assert!(
+                astrid_core::kernel_api::RESERVED_CAPSULE_VERBS.contains(&name.as_str()),
+                "built-in `astrid capsule {name}` is missing from RESERVED_CAPSULE_VERBS \
+                 (add it so a capsule cannot shadow it)"
+            );
+        }
+
+        // `help` is injected by clap, not a declared variant, but is a real
+        // reserved word — assert it is covered too.
+        assert!(astrid_core::kernel_api::RESERVED_CAPSULE_VERBS.contains(&"help"));
+    }
 }

@@ -106,7 +106,7 @@ pub(crate) fn run(args: &ShowArgs) -> Result<ExitCode> {
             .and_then(|v| v.as_str())
             .unwrap_or_default()
             .to_string(),
-        manifest: manifest.clone(),
+        manifest,
     };
 
     if !format.is_pretty() {
@@ -123,7 +123,7 @@ pub(crate) fn run(args: &ShowArgs) -> Result<ExitCode> {
     println!("  Agent:        {principal}");
     println!();
     println!("{}", "Manifest".bold());
-    for line in manifest.lines() {
+    for line in record.manifest.lines() {
         println!("  {line}");
     }
     Ok(ExitCode::SUCCESS)

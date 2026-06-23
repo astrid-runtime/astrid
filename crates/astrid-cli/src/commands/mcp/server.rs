@@ -35,8 +35,10 @@
 
 use std::borrow::Cow;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
+use astrid_uplink::socket_client::ReadError;
 use rmcp::ErrorData as McpError;
 use rmcp::ServerHandler;
 use rmcp::model::{
@@ -52,6 +54,8 @@ use uuid::Uuid;
 use crate::socket_client::SocketClient;
 
 use super::elicit;
+use super::grant;
+use super::ingress;
 
 /// Request topic for the broker `tools/list` front door.
 pub(super) const TOOLS_LIST_TOPIC: &str = "astrid.v1.request.mcp.tools.list";
@@ -71,12 +75,27 @@ pub(crate) struct AstridMcpServer {
     client: Arc<Mutex<SocketClient>>,
     /// Principal stamped on every outbound IPC message.
     principal: String,
+    /// Set when a prior round trip ended in a connection-loss condition (a
+    /// failed send, or a reply read that hit EOF / reset). The NEXT round trip
+    /// re-handshakes (`reconnect()`) before sending, so a request never goes
+    /// out on a stale/half-open fd left behind by a daemon restart. A clean
+    /// 55 s deadline against a live-but-slow broker does NOT set this — that is
+    /// not a dead connection.
+    ///
+    /// Every access is made while the `client` mutex is held (see `forward`), so
+    /// the flag is already serialized by that lock and needs no inter-thread
+    /// ordering of its own — all accesses use `Ordering::Relaxed`.
+    needs_reconnect: AtomicBool,
 }
 
 impl AstridMcpServer {
     /// Build a new shim over an established uplink and resolved principal.
     pub(crate) fn new(client: Arc<Mutex<SocketClient>>, principal: String) -> Self {
-        Self { client, principal }
+        Self {
+            client,
+            principal,
+            needs_reconnect: AtomicBool::new(false),
+        }
     }
 
     /// Publish `body` on `request_topic` and await the broker reply on
@@ -105,20 +124,155 @@ impl AstridMcpServer {
 
         let mut client = self.client.lock().await;
 
-        client.send_message(msg).await.map_err(|e| {
-            warn!(topic = request_topic, error = %e, "MCP shim: failed to publish broker request");
-            McpError::internal_error(format!("failed to publish broker request: {e}"), None)
-        })?;
+        // Pre-heal: a PRIOR round trip may have ended in a connection-loss
+        // condition (failed send, or a reply read that hit EOF / reset because
+        // the daemon restarted under us). If so, the held socket is a dead fd;
+        // re-handshake before sending so this request goes out on a fresh,
+        // fully-authenticated connection rather than silently dropping into a
+        // half-open socket. A clean deadline against a slow broker never sets
+        // the flag, so a slow tool does not force a needless reconnect.
+        if self.needs_reconnect.swap(false, Ordering::Relaxed) {
+            warn!(
+                topic = request_topic,
+                "MCP shim: pre-healing a connection flagged dead by a prior round trip"
+            );
+            if let Err(e) = client.reconnect().await {
+                // Re-arm the flag: the connection is still dead, so the next
+                // attempt must try to heal again rather than assume health.
+                self.needs_reconnect.store(true, Ordering::Relaxed);
+                warn!(error = %e, "MCP shim: pre-heal reconnect failed");
+                return Err(McpError::internal_error(
+                    format!("reconnect to daemon failed: {e}"),
+                    None,
+                ));
+            }
+        }
 
-        let raw = client
-            .read_until_topic(&reply_topic, REQUEST_DEADLINE)
-            .await
-            .map_err(|e| {
-                warn!(topic = %reply_topic, error = %e, "MCP shim: broker reply not received");
-                McpError::internal_error(format!("broker reply not received: {e}"), None)
+        // Survive a daemon restart. If the publish fails — e.g. the daemon
+        // rebound `system.sock` under us and our socket is now a dead fd
+        // (`Broken pipe`) — re-dial the live daemon once and retry. Retrying
+        // is safe precisely because the *send* failed: the request never
+        // reached the broker, so no tool ran and there is no double-execution
+        // risk. A failure *after* a successful send is handled below (and only
+        // retried for idempotent requests).
+        if let Err(first) = client.send_message(msg.clone()).await {
+            warn!(topic = request_topic, error = %first, "MCP shim: broker publish failed; reconnecting to daemon and retrying once");
+            client.reconnect().await.map_err(|e| {
+                warn!(error = %e, "MCP shim: reconnect to daemon failed");
+                McpError::internal_error(format!("reconnect to daemon failed: {e}"), None)
             })?;
+            client.send_message(msg.clone()).await.map_err(|e| {
+                warn!(topic = request_topic, error = %e, "MCP shim: failed to publish broker request after reconnect");
+                McpError::internal_error(format!("failed to publish broker request after reconnect: {e}"), None)
+            })?;
+        }
 
-        Ok(unwrap_reply_payload(&raw))
+        // Await the reply. The typed read lets us tell a dead connection (the
+        // daemon died while we waited) apart from a legitimate slow-broker
+        // deadline.
+        match client
+            .read_until_topic_typed(&reply_topic, REQUEST_DEADLINE)
+            .await
+        {
+            Ok(raw) => Ok(unwrap_reply_payload(&raw)),
+
+            // Connection died mid-wait. The held socket is now unusable, so the
+            // NEXT request must reconnect first — always flag that. Whether we
+            // transparently retry THIS request depends on idempotence: a
+            // read-only enumeration (`tools/list`) can be safely re-issued, but
+            // a `tools/call` (or a consent/approval respond) may have already
+            // taken effect on the broker, so we must NOT silently re-run it.
+            Err(ReadError::ConnectionLost(e)) => {
+                self.needs_reconnect.store(true, Ordering::Relaxed);
+                if is_request_retriable(request_topic) {
+                    warn!(topic = request_topic, error = %e, "MCP shim: connection lost awaiting reply; reconnecting and retrying idempotent request once");
+                    client.reconnect().await.map_err(|re| {
+                        warn!(error = %re, "MCP shim: reconnect for idempotent retry failed");
+                        McpError::internal_error(format!("reconnect to daemon failed: {re}"), None)
+                    })?;
+                    // Healed in-line; clear the flag we just set.
+                    self.needs_reconnect.store(false, Ordering::Relaxed);
+                    client.send_message(msg).await.map_err(|se| {
+                        warn!(topic = request_topic, error = %se, "MCP shim: re-publish after reconnect failed");
+                        McpError::internal_error(
+                            format!("failed to re-publish broker request after reconnect: {se}"),
+                            None,
+                        )
+                    })?;
+                    let raw = client
+                        .read_until_topic_typed(&reply_topic, REQUEST_DEADLINE)
+                        .await
+                        .map_err(|re| {
+                            // Flag again — the retry's connection may also be dead.
+                            if matches!(re, ReadError::ConnectionLost(_)) {
+                                self.needs_reconnect.store(true, Ordering::Relaxed);
+                            }
+                            warn!(topic = %reply_topic, error = %re, "MCP shim: broker reply not received after idempotent retry");
+                            McpError::internal_error(
+                                format!("broker reply not received after retry: {re}"),
+                                None,
+                            )
+                        })?;
+                    Ok(unwrap_reply_payload(&raw))
+                } else {
+                    // Mutating / side-effecting request: surface the loss to the
+                    // MCP client (it must decide whether to re-issue), but keep
+                    // the reconnect flag set so the NEXT call is healthy.
+                    warn!(topic = request_topic, error = %e, "MCP shim: connection lost awaiting reply for a non-idempotent request; not auto-retrying (a mutating call may have executed)");
+                    Err(McpError::internal_error(
+                        format!("connection to daemon lost while awaiting reply: {e}"),
+                        None,
+                    ))
+                }
+            },
+
+            // Deadline against a still-open connection: the broker is slow, not
+            // dead. Surface the timeout; do NOT reconnect (the request may still
+            // be in flight, and a needless reconnect would drop the in-flight
+            // reply on the floor).
+            Err(ReadError::Timeout) => {
+                warn!(topic = %reply_topic, "MCP shim: broker reply timed out (connection still live); not reconnecting");
+                Err(McpError::internal_error(
+                    "broker reply not received before deadline".to_string(),
+                    None,
+                ))
+            },
+        }
+    }
+}
+
+/// Whether a broker round trip on `request_topic` may be transparently
+/// re-issued after the connection drops mid-wait, WITHOUT risking a duplicate
+/// side effect.
+///
+/// Pure, exhaustive allow-set so the safety rule is auditable and unit-tested:
+/// only read-only / enumeration front doors are retriable. Anything that can
+/// mutate state — running a tool, recording an approval or ingress-consent
+/// decision — is NOT retriable, because the broker may have already applied
+/// the effect before the connection died; the caller surfaces the loss instead
+/// of silently re-running it. Default-deny: an unrecognized topic is treated
+/// as not retriable.
+fn is_request_retriable(request_topic: &str) -> bool {
+    // The non-retriable arms are deliberately enumerated separately rather than
+    // collapsed into the wildcard: each documents WHY a specific front door is
+    // unsafe to re-issue, which is the point of an auditable allow-set. The
+    // identical `false` bodies are intentional.
+    #[allow(clippy::match_same_arms)]
+    match request_topic {
+        // Read-only enumeration of the tool surface (MCP `tools/list`). Safe to
+        // re-issue: it never mutates state.
+        TOOLS_LIST_TOPIC => true,
+        // Running a tool (MCP `tools/call`) may have executed already.
+        TOOL_CALL_TOPIC => false,
+        // Recording an approval / ingress-consent / grant-on-use decision is a
+        // state mutation on the broker (and, for grant, persists a capsule on
+        // the principal kernel-side); re-issuing could double-apply or race a
+        // stale decision.
+        elicit::APPROVAL_RESPOND_TOPIC
+        | ingress::INGRESS_RESPOND_TOPIC
+        | grant::GRANT_RESPOND_TOPIC => false,
+        // Default-deny anything not explicitly enumerated above.
+        _ => false,
     }
 }
 
@@ -170,16 +324,80 @@ impl ServerHandler for AstridMcpServer {
         request: CallToolRequestParams,
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
-        let req_id = new_req_id();
         let arguments = request.arguments.map_or(Value::Null, Value::Object);
 
-        let body = json!({
-            "req_id": req_id,
-            "name": request.name,
-            "arguments": arguments,
-        });
+        // Build the broker `tool.call` body for a fresh `req_id`. The same
+        // (name, arguments) may be sent twice — once that trips the ingress
+        // consent gate, then once more after consent is recorded — each with
+        // its own correlation id so their replies never collide.
+        let call_body = |req_id: &str| {
+            json!({
+                "req_id": req_id,
+                "name": request.name,
+                "arguments": arguments,
+            })
+        };
 
-        let reply = self.round_trip(TOOL_CALL_TOPIC, &req_id, body).await?;
+        let req_id = new_req_id();
+        let reply = self
+            .round_trip(TOOL_CALL_TOPIC, &req_id, call_body(&req_id))
+            .await?;
+
+        // If the broker gated the call on an untrusted ingress, it replies an
+        // `ingress_approval_required` signal (NOT a result). Elicit the user's
+        // consent; on accept, record trust via the broker and RE-SEND the
+        // original call (now passing the gate). On deny / no-capability /
+        // error, fail secure with an MCP error.
+        let reply = if let Some(ingress) = ingress::IngressRequest::from_reply(&reply) {
+            let granted = self.resolve_ingress(&context.peer, &ingress).await?;
+            if !granted {
+                return Ok(CallToolResult::error(vec![Content::text(
+                    "Astrid tool calls were not authorized for this session.",
+                )]));
+            }
+            // Re-send the original call now that the ingress is trusted.
+            let retry_id = new_req_id();
+            self.round_trip(TOOL_CALL_TOPIC, &retry_id, call_body(&retry_id))
+                .await?
+        } else {
+            reply
+        };
+
+        // If the broker gated the call on a capsule the caller does not hold,
+        // it replies a `grant_required` signal (NOT a result) — the kernel
+        // DROPPED the original call at the access gate. Elicit the user's
+        // consent; on approve the kernel persists the capsule grant and we
+        // RE-SEND the original call (now passing the gate, exactly as the
+        // ingress flow re-sends). On deny / no-capability / error, fail secure
+        // with an MCP error. This sits AFTER the ingress block and BEFORE the
+        // approval block, so a re-sent call still flows into the approval gate:
+        // a tool that is both ungranted and capability-gated resolves in
+        // sequence.
+        let reply = match grant::GrantRequest::classify(&reply) {
+            // No grant signal (or an explicit null) — the common already-granted
+            // path. Carry the reply through unchanged.
+            grant::GrantSignal::Absent => reply,
+            // A grant signal was present but unanswerable. The call was DROPPED
+            // at the access gate, so the (empty) reply is NOT a result — surface
+            // a terminal error rather than letting it masquerade as success.
+            grant::GrantSignal::Malformed => {
+                return Ok(CallToolResult::error(vec![Content::text(
+                    "Astrid returned a malformed capsule-grant signal; the tool call was dropped.",
+                )]));
+            },
+            grant::GrantSignal::Present(grant) => {
+                let granted = self.resolve_grant(&context.peer, &grant).await?;
+                if !granted {
+                    return Ok(CallToolResult::error(vec![Content::text(
+                        "Capsule access was not granted for this tool.",
+                    )]));
+                }
+                // Re-send the original call now that the capsule is granted.
+                let retry_id = new_req_id();
+                self.round_trip(TOOL_CALL_TOPIC, &retry_id, call_body(&retry_id))
+                    .await?
+            },
+        };
 
         // If the routed tool parked on a capability approval, the broker
         // surfaces an `approval_required` flag instead of a terminal result.
@@ -223,6 +441,100 @@ impl AstridMcpServer {
             respond_body,
         )
         .await
+    }
+
+    /// Drive the ingress-consent bridge for a `tools/call` the broker gated on
+    /// an untrusted ingress: elicit the user's decision and, on accept,
+    /// forward it on the broker's
+    /// [`INGRESS_RESPOND_TOPIC`](ingress::INGRESS_RESPOND_TOPIC) front door so
+    /// the broker records trust (keyed on the kernel-stamped caller, never a
+    /// body field). Returns whether the ingress is now trusted — `true` only
+    /// when the user accepted AND the broker confirmed it persisted the grant.
+    ///
+    /// Fail-secure: a decline / no-capability / elicit error never sends a
+    /// respond and returns `false`. An accept that the broker could not
+    /// persist (ack `granted:false`) also returns `false` so the caller does
+    /// not re-send a call that would just trip the gate again.
+    async fn resolve_ingress(
+        &self,
+        peer: &rmcp::service::Peer<RoleServer>,
+        request: &ingress::IngressRequest,
+    ) -> Result<bool, McpError> {
+        if !ingress::elicit_consent(peer, request).await {
+            return Ok(false);
+        }
+
+        // The respond body carries NO source_id — the broker trusts the
+        // kernel-stamped caller of this message. A fresh req_id keys the ack.
+        let respond_req_id = new_req_id();
+        let respond_body = json!({ "req_id": respond_req_id, "accept": true });
+
+        let ack = self
+            .round_trip(
+                ingress::INGRESS_RESPOND_TOPIC,
+                &respond_req_id,
+                respond_body,
+            )
+            .await?;
+
+        let granted = ack.get("granted").and_then(Value::as_bool).unwrap_or(false);
+        if !granted {
+            warn!("MCP shim: broker did not confirm ingress trust grant; not retrying call");
+        }
+        Ok(granted)
+    }
+
+    /// Drive the grant-on-use bridge for a `tools/call` the broker gated on a
+    /// capsule the caller does not hold: elicit the user's decision and forward
+    /// it on the broker's [`GRANT_RESPOND_TOPIC`](grant::GRANT_RESPOND_TOPIC)
+    /// front door so the kernel persists (or declines) the capsule grant.
+    /// Returns whether the capsule is now granted — `true` only when the user
+    /// approved AND the broker confirmed the grant persisted.
+    ///
+    /// Marker discipline (the divergence from [`resolve_ingress`]): the broker
+    /// holds a per-`(principal, capsule)` pending marker that is consumed on
+    /// EVERY respond, so this ALWAYS responds — `approve` on accept, `deny` on
+    /// decline / no-capability / elicit error — or the marker would stick and
+    /// a later call would get a benign "already pending" terminal instead of a
+    /// fresh prompt.
+    ///
+    /// Fail-secure: any non-accept path publishes `deny` and returns `false`.
+    /// An accept the broker could not persist (ack `granted:false`) also
+    /// returns `false`, so the caller does not re-send a call that would just
+    /// trip the gate again. A respond round-trip error returns the error
+    /// (caller fails the call) — the marker still clears on the broker's side
+    /// only if the publish landed, so the broker treats a never-arriving
+    /// respond as its own timeout concern; the shim's contract is to always
+    /// attempt a respond, which it does.
+    async fn resolve_grant(
+        &self,
+        peer: &rmcp::service::Peer<RoleServer>,
+        request: &grant::GrantRequest,
+    ) -> Result<bool, McpError> {
+        let approved = grant::elicit_grant(peer, request).await;
+        let decision = grant::grant_decision(approved);
+
+        // A fresh req_id keys the ack. The respond body echoes the kernel-minted
+        // grant `request_id` so the broker routes the decision; the grant target
+        // is never a body field (the kernel derives it from its own signal).
+        let respond_req_id = new_req_id();
+        let respond_body = request.respond_body(&respond_req_id, decision);
+
+        let ack = self
+            .round_trip(grant::GRANT_RESPOND_TOPIC, &respond_req_id, respond_body)
+            .await?;
+
+        // On decline we still published `deny` (to clear the broker marker) but
+        // never grant — short-circuit to false without reading the ack.
+        if !approved {
+            return Ok(false);
+        }
+
+        let granted = ack.get("granted").and_then(Value::as_bool).unwrap_or(false);
+        if !granted {
+            warn!("MCP shim: broker did not confirm capsule grant; not retrying call");
+        }
+        Ok(granted)
     }
 }
 
@@ -325,4 +637,43 @@ fn content_from_block(block: &Value) -> Content {
     }
     debug!("MCP shim: non-text broker content block, serializing to text");
     Content::text(block.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The read-only tool-enumeration front door (MCP `tools/list`) is the only
+    /// round trip safe to transparently re-issue after a mid-wait connection
+    /// loss: it never mutates state.
+    #[test]
+    fn tools_list_is_retriable() {
+        assert!(is_request_retriable(TOOLS_LIST_TOPIC));
+    }
+
+    /// Running a tool (MCP `tools/call`) may have ALREADY executed on the
+    /// broker before the connection died — never auto-retry it, or a mutating
+    /// tool could run twice.
+    #[test]
+    fn tool_call_is_not_retriable() {
+        assert!(!is_request_retriable(TOOL_CALL_TOPIC));
+    }
+
+    /// Recording a capability-approval, ingress-consent, or grant-on-use
+    /// decision is a state mutation on the broker (grant additionally persists
+    /// a capsule on the principal); re-issuing could double-apply, so these are
+    /// not retriable either.
+    #[test]
+    fn respond_front_doors_are_not_retriable() {
+        assert!(!is_request_retriable(elicit::APPROVAL_RESPOND_TOPIC));
+        assert!(!is_request_retriable(ingress::INGRESS_RESPOND_TOPIC));
+        assert!(!is_request_retriable(grant::GRANT_RESPOND_TOPIC));
+    }
+
+    /// Default-deny: an unrecognized topic must never be treated as retriable.
+    #[test]
+    fn unknown_topic_is_not_retriable() {
+        assert!(!is_request_retriable("astrid.v1.request.mcp.something.new"));
+        assert!(!is_request_retriable(""));
+    }
 }

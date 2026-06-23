@@ -29,16 +29,15 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use astrid_core::capability_grammar::validate_capability;
-use astrid_core::groups::{Group, GroupConfig};
 use astrid_core::principal::PrincipalId;
 use astrid_core::profile::{PrincipalProfile, ProfileError};
-use astrid_events::kernel_api::{AdminRequestKind, AdminResponseBody, AgentSummary, GroupSummary};
+use astrid_events::kernel_api::{AdminRequestKind, AdminResponseBody, AgentSummary};
 use tracing::{info, warn};
 
 /// Platform label used by the identity store for agent principals
 /// created via [`AdminRequestKind::AgentCreate`]. The per-principal
 /// `platform_user_id` equals the `PrincipalId` string.
-const AGENT_IDENTITY_PLATFORM: &str = "cli";
+pub(super) const AGENT_IDENTITY_PLATFORM: &str = "cli";
 
 /// Dispatch an already-authorized [`AdminRequestKind`] to the matching
 /// handler.
@@ -50,17 +49,35 @@ const AGENT_IDENTITY_PLATFORM: &str = "cli";
 /// (notably [`AdminRequestKind::PairDeviceIssue`], which mints a
 /// token tied to the caller's own principal regardless of any
 /// wire-level hint) need it.
+///
+/// Thin wrapper over [`dispatch_with_device`] for callers (tests, any
+/// non-device path) that have no authenticating device key id. The
+/// production admin path uses [`dispatch_with_device`] so a paired issuer's
+/// own device scope is threaded into `PairDeviceIssue`'s no-escalation checks.
 pub(super) async fn dispatch(
     kernel: &Arc<crate::Kernel>,
     caller: &PrincipalId,
     req: AdminRequestKind,
 ) -> AdminResponseBody {
+    dispatch_with_device(kernel, caller, None, req).await
+}
+
+/// Dispatch carrying the issuer's authenticating device key id.
+///
+/// `issuer_device_key_id` is the device key that authenticated this request,
+/// when one did. Only [`AdminRequestKind::PairDeviceIssue`] consumes it: it
+/// resolves the issuer's OWN device scope so the no-escalation subset check
+/// and the full-mint gate run against the issuer's *attenuated* effective set
+/// (a scoped device cannot mint a child broader than itself). Every other
+/// handler ignores it.
+pub(super) async fn dispatch_with_device(
+    kernel: &Arc<crate::Kernel>,
+    caller: &PrincipalId,
+    issuer_device_key_id: Option<&str>,
+    req: AdminRequestKind,
+) -> AdminResponseBody {
     match req {
-        AdminRequestKind::AgentCreate {
-            name,
-            groups,
-            grants,
-        } => agent_create(kernel, name, groups, grants).await,
+        req @ AdminRequestKind::AgentCreate { .. } => agent_create_from_req(kernel, req).await,
         AdminRequestKind::AgentDelete { principal } => agent_delete(kernel, principal).await,
         AdminRequestKind::AgentEnable { principal } => {
             agent_set_enabled(kernel, principal, true).await
@@ -69,11 +86,7 @@ pub(super) async fn dispatch(
             agent_set_enabled(kernel, principal, false).await
         },
         AdminRequestKind::AgentList => agent_list(kernel, caller),
-        AdminRequestKind::AgentModify {
-            principal,
-            add_groups,
-            remove_groups,
-        } => agent_modify(kernel, principal, add_groups, remove_groups).await,
+        req @ AdminRequestKind::AgentModify { .. } => agent_modify_from_req(kernel, req).await,
         AdminRequestKind::QuotaSet { principal, quotas } => {
             super::quota::quota_set(kernel, principal, quotas).await
         },
@@ -84,15 +97,19 @@ pub(super) async fn dispatch(
             capabilities,
             description,
             unsafe_admin,
-        } => group_create(kernel, name, capabilities, description, unsafe_admin).await,
-        AdminRequestKind::GroupDelete { name } => group_delete(kernel, name).await,
+        } => {
+            super::group::group_create(kernel, name, capabilities, description, unsafe_admin).await
+        },
+        AdminRequestKind::GroupDelete { name } => super::group::group_delete(kernel, name).await,
         AdminRequestKind::GroupModify {
             name,
             capabilities,
             description,
             unsafe_admin,
-        } => group_modify(kernel, name, capabilities, description, unsafe_admin).await,
-        AdminRequestKind::GroupList => group_list(kernel),
+        } => {
+            super::group::group_modify(kernel, name, capabilities, description, unsafe_admin).await
+        },
+        AdminRequestKind::GroupList => super::group::group_list(kernel),
         AdminRequestKind::CapsGrant {
             principal,
             capabilities,
@@ -110,6 +127,11 @@ pub(super) async fn dispatch(
             principal,
             capabilities,
         } => mutate_caps(kernel, &principal, capabilities, CapsMutation::Revoke).await,
+        req @ (AdminRequestKind::CapsTokenMint { .. }
+        | AdminRequestKind::CapsTokenRevoke { .. }
+        | AdminRequestKind::CapsTokenList { .. }) => {
+            super::caps_tokens::dispatch(kernel, req).await
+        },
         AdminRequestKind::InviteIssue {
             group,
             expires_secs,
@@ -128,132 +150,180 @@ pub(super) async fn dispatch(
         AdminRequestKind::InviteRevoke { token } => {
             super::invite_handlers::invite_revoke(kernel, token).await
         },
-        AdminRequestKind::PairDeviceIssue {
-            expires_secs,
-            label,
-        } => {
-            super::pair_device_handlers::pair_device_issue(kernel, caller, expires_secs, label)
-                .await
-        },
-        AdminRequestKind::PairDeviceRedeem { token, public_key } => {
-            super::pair_device_handlers::pair_device_redeem(kernel, token, public_key).await
+        req @ (AdminRequestKind::PairDeviceIssue { .. }
+        | AdminRequestKind::PairDeviceRedeem { .. }
+        | AdminRequestKind::PairDeviceList { .. }
+        | AdminRequestKind::PairDeviceRevoke { .. }) => {
+            pair_device_dispatch(kernel, caller, issuer_device_key_id, req).await
         },
     }
 }
 
+/// Dispatch the four pair-device variants. Split from the main `dispatch`
+/// router to keep that function under the per-function line cap; the caller
+/// guarantees the variant, so the fallback is unreachable in practice.
+async fn pair_device_dispatch(
+    kernel: &Arc<crate::Kernel>,
+    caller: &PrincipalId,
+    issuer_device_key_id: Option<&str>,
+    req: AdminRequestKind,
+) -> AdminResponseBody {
+    match req {
+        AdminRequestKind::PairDeviceIssue {
+            expires_secs,
+            label,
+            scope,
+        } => {
+            super::pair_device_handlers::pair_device_issue(
+                kernel,
+                caller,
+                issuer_device_key_id,
+                expires_secs,
+                label,
+                scope,
+            )
+            .await
+        },
+        AdminRequestKind::PairDeviceRedeem { token, public_key } => {
+            super::pair_device_handlers::pair_device_redeem(kernel, token, public_key).await
+        },
+        AdminRequestKind::PairDeviceList { principal } => {
+            super::pair_device_handlers::pair_device_list(kernel, &principal)
+        },
+        AdminRequestKind::PairDeviceRevoke { principal, key_id } => {
+            super::pair_device_handlers::pair_device_revoke(kernel, &principal, &key_id).await
+        },
+        _ => AdminResponseBody::Error("not a pair-device request".to_string()),
+    }
+}
+
 // ── Agent lifecycle ────────────────────────────────────────────────────
+
+/// Destructure an [`AdminRequestKind::AgentCreate`] and forward to
+/// [`agent_create`]. Split from the `dispatch` match arm to keep that
+/// router under the per-function line cap; the caller guarantees the
+/// variant, so the fallback is unreachable in practice.
+async fn agent_create_from_req(
+    kernel: &Arc<crate::Kernel>,
+    req: AdminRequestKind,
+) -> AdminResponseBody {
+    let AdminRequestKind::AgentCreate {
+        name,
+        groups,
+        grants,
+        inherit_from,
+        clone_from,
+        allow_admin_clone,
+    } = req
+    else {
+        return err_internal(
+            "agent_create_from_req received a non-AgentCreate variant".to_string(),
+        );
+    };
+    agent_create(
+        kernel,
+        name,
+        groups,
+        grants,
+        inherit_from,
+        clone_from,
+        allow_admin_clone,
+    )
+    .await
+}
 
 async fn agent_create(
     kernel: &Arc<crate::Kernel>,
     name: String,
     groups: Vec<String>,
     grants: Vec<String>,
+    inherit_from: Option<PrincipalId>,
+    clone_from: Option<PrincipalId>,
+    allow_admin_clone: bool,
 ) -> AdminResponseBody {
     let principal = match PrincipalId::new(name.clone()) {
         Ok(p) => p,
         Err(e) => return err_bad_input(format!("invalid principal name: {e}")),
     };
 
-    // Reject bootstrap name: the `default` principal is seeded by
-    // bootstrap_cli_root_user and must not be re-created through the
-    // admin surface.
-    if principal == PrincipalId::default() {
-        return err_bad_input(format!(
-            "principal {name:?} is reserved for single-tenant bootstrap"
-        ));
+    // `default` (the bootstrap anchor) and `anonymous` (the no-capability
+    // identity stamped on unauthenticated connections, #45/#852) are reserved.
+    if let Some(reason) = principal.reserved_reason() {
+        return err_bad_input(format!("principal {name:?} is {reason}"));
     }
 
+    // `clone_from` is a full replica: the source supplies groups, grants,
+    // revokes, network, process, quotas, AND the state copy. Mixing it with
+    // the profile-shaping inputs is ambiguous, so reject rather than silently
+    // pick a winner. The CLI also enforces this via clap `conflicts_with`; the
+    // kernel enforces it too — defense in depth against a hand-built request.
+    if clone_from.is_some() && (inherit_from.is_some() || !groups.is_empty() || !grants.is_empty())
+    {
+        return err_bad_input(
+            "clone_from is mutually exclusive with inherit_from, groups, and grants".to_string(),
+        );
+    }
+
+    // Acquire the admin write lock BEFORE validating the inheritance source.
+    // The source's existence is state this lock protects: every admin mutator
+    // (create/delete/...) takes it, so checking the source outside the lock
+    // would let a concurrent delete remove it between the existence check and
+    // the inheritance copy below (TOCTOU) — the creation would then silently
+    // produce an empty agent instead of inheriting. Holding the lock pins the
+    // source in place across the check-then-copy.
     let _guard = kernel.admin_write_lock.lock().await;
+
+    // Self-inherit is meaningless (the source home tree does not exist yet),
+    // and a non-existent source must fail loudly rather than silently
+    // producing an empty agent the operator believes was provisioned.
+    if let Some(ref source) = inherit_from {
+        if *source == principal {
+            return err_bad_input(format!(
+                "inherit_from source {source} is the same as the new principal"
+            ));
+        }
+        let source_path = principal_profile_path(kernel, source);
+        if let Err(e) = require_principal_exists(source, &source_path) {
+            return err_bad_input(format!("inherit_from source rejected: {e}"));
+        }
+    }
+
     let profile_path = principal_profile_path(kernel, &principal);
 
-    // Collision: a profile on disk means this principal already exists.
+    // Collision: a profile on disk means this principal already exists. Rather
+    // than unconditionally reject, defer to the keypair-backfill heal — a bare
+    // re-create of an existing KEYLESS (pre-#45/#852) principal surgically adds
+    // its missing keypair so `astrid-up`'s per-boot re-run auto-heals upgraders;
+    // an already-keyed principal (or any shaping input) still errors. See
+    // `agent_create_helpers::backfill_keypair` for the full rationale + invariants.
     if profile_path.exists() {
-        return err_bad_input(format!("principal {principal} already exists"));
+        // A backfill is not a re-create: any profile-shaping input (last arg)
+        // keeps the hard "already exists" error rather than being silently
+        // dropped.
+        return super::agent_create_helpers::backfill_keypair(
+            kernel,
+            &principal,
+            &profile_path,
+            clone_from.is_some()
+                || inherit_from.is_some()
+                || !groups.is_empty()
+                || !grants.is_empty(),
+        );
     }
 
-    let resolved_groups = if groups.is_empty() {
-        vec![astrid_core::groups::BUILTIN_AGENT.to_string()]
-    } else {
-        groups
-    };
-    let profile = PrincipalProfile {
-        groups: resolved_groups,
+    // A genuinely new principal: build its profile, mint its keypair, register
+    // its identity, and provision its home tree + state.
+    super::agent_create_helpers::provision_new_principal(
+        kernel,
+        principal,
+        profile_path,
+        groups,
         grants,
-        ..PrincipalProfile::default()
-    };
-
-    if let Err(e) = profile.validate() {
-        return err_bad_input(format!("profile rejected: {e}"));
-    }
-
-    let user = match kernel
-        .identity_store
-        .create_user(Some(principal.as_str()))
-        .await
-    {
-        Ok(u) => u,
-        Err(e) => return err_internal(format!("identity store create_user failed: {e}")),
-    };
-    if let Err(e) = kernel
-        .identity_store
-        .link(
-            AGENT_IDENTITY_PLATFORM,
-            principal.as_str(),
-            user.id,
-            "system",
-        )
-        .await
-    {
-        // Best-effort rollback so partial state doesn't persist.
-        let _ = kernel.identity_store.delete_user(user.id).await;
-        return err_internal(format!("identity store link failed: {e}"));
-    }
-
-    if let Err(e) = profile.save_to_path(&profile_path) {
-        let _ = kernel
-            .identity_store
-            .unlink(AGENT_IDENTITY_PLATFORM, principal.as_str())
-            .await;
-        let _ = kernel.identity_store.delete_user(user.id).await;
-        return err_internal(format!("profile save failed: {e}"));
-    }
-
-    // Provision the per-principal home tree so per-invocation KV, log,
-    // tmp, secrets, audit, and capability tokens have a place to land.
-    // Capsule WASM stays shared (loaded once from the system/default
-    // location); only the principal-scoped data namespaces live here.
-    //
-    // Fail-closed: if the home tree cannot be created, downstream
-    // per-invocation lookups silently fall back to the `default`
-    // principal's namespace — a confidentiality break across tenants.
-    // Roll back identity + profile so the agent isn't left in a state
-    // where future invocations would leak into someone else's data.
-    if let Err(e) = kernel.astrid_home.principal_home(&principal).ensure() {
-        let _ = kernel
-            .identity_store
-            .unlink(AGENT_IDENTITY_PLATFORM, principal.as_str())
-            .await;
-        let _ = kernel.identity_store.delete_user(user.id).await;
-        let _ = std::fs::remove_file(&profile_path);
-        return err_internal(format!(
-            "principal home tree provisioning failed (rolled back): {e}"
-        ));
-    }
-
-    // Inherit `default`'s per-principal state so the new agent works
-    // out of the box: env JSON (non-secret config like base URL /
-    // model name), per-capsule KV namespaces, and per-capsule secret
-    // files. Best-effort — a copy failure logs a warn and leaves the
-    // agent in a "needs manual setup" state but doesn't roll back the
-    // profile or the home tree (those already succeeded; the
-    // confidentiality boundary is intact regardless).
-    inherit_from_default(kernel, &principal).await;
-
-    info!(%principal, user_id = %user.id, "Layer 6 agent.create");
-    success_json(serde_json::json!({
-        "principal": principal.as_str(),
-        "astrid_user_id": user.id,
-    }))
+        inherit_from,
+        clone_from,
+        allow_admin_clone,
+    )
+    .await
 }
 
 async fn agent_delete(kernel: &Arc<crate::Kernel>, principal: PrincipalId) -> AdminResponseBody {
@@ -364,15 +434,30 @@ async fn agent_set_enabled(
     }))
 }
 
-async fn agent_modify(
+async fn agent_modify_from_req(
     kernel: &Arc<crate::Kernel>,
-    principal: PrincipalId,
-    add_groups: Vec<String>,
-    remove_groups: Vec<String>,
+    req: AdminRequestKind,
 ) -> AdminResponseBody {
-    if add_groups.is_empty() && remove_groups.is_empty() {
+    let AdminRequestKind::AgentModify {
+        principal,
+        add_groups,
+        remove_groups,
+        add_capsules,
+        remove_capsules,
+    } = req
+    else {
+        return err_internal(
+            "agent_modify_from_req received a non-AgentModify variant".to_string(),
+        );
+    };
+    if add_groups.is_empty()
+        && remove_groups.is_empty()
+        && add_capsules.is_empty()
+        && remove_capsules.is_empty()
+    {
         return err_bad_input(
-            "agent.modify: at least one of `add_groups` or `remove_groups` must be non-empty"
+            "agent.modify: at least one of `add_groups`, `remove_groups`, `add_capsules`, or \
+             `remove_capsules` must be non-empty"
                 .to_string(),
         );
     }
@@ -387,45 +472,25 @@ async fn agent_modify(
         Err(e) => return err_profile(&principal, &e),
     };
 
-    // Apply removes first so a (remove, add) of the same group is an
-    // idempotent rename rather than a duplicate. Both ops are per-group
-    // idempotent: adding present groups and removing absent ones are
-    // no-ops.
-    let before = profile.groups.clone();
-    profile.groups.retain(|g| !remove_groups.contains(g));
-    for g in &add_groups {
-        if !profile.groups.iter().any(|existing| existing == g) {
-            profile.groups.push(g.clone());
-        }
-    }
-
-    // Set-based comparison: group membership is a set semantically, so
-    // a no-op modify (adding present, removing absent, or add+remove
-    // of the same group) should report `changed = false` regardless
-    // of the underlying Vec's order. `retain` + `push` happens to
-    // preserve the order of pre-existing groups today, but the
-    // correctness of `changed` shouldn't depend on that implementation
-    // detail.
-    let before_set: std::collections::HashSet<&String> = before.iter().collect();
-    let after_set: std::collections::HashSet<&String> = profile.groups.iter().collect();
-    if before_set == after_set {
+    // Capsule grants mirror the group mechanism EXACTLY via the shared
+    // `apply_set_delta`: idempotent remove-then-add, set-based change
+    // detection. The capsule grant set is what the kernel gates the
+    // user-invocable tool surface against at dispatch (#992).
+    let groups_changed = apply_set_delta(&mut profile.groups, &add_groups, &remove_groups);
+    let capsules_changed = apply_set_delta(&mut profile.capsules, &add_capsules, &remove_capsules);
+    if !groups_changed && !capsules_changed {
         kernel.profile_cache.invalidate(&principal);
-        return success_json(serde_json::json!({
-            "principal": principal.as_str(),
-            "groups": profile.groups,
-            "changed": false,
-        }));
+        return modify_response(&principal, &profile, false);
     }
 
     // Validate before saving: re-runs the profile invariants (group
-    // names match groups.toml, grants/revokes still well-formed, etc.).
-    // Without this an operator could `agent modify --add-group typo`
-    // and the Layer 5 cap lookup would silently miss the typo'd group
-    // at every authz check.
+    // names match groups.toml, grants/revokes still well-formed, capsule
+    // grants well-formed, etc.). Without this an operator could
+    // `agent modify --add-group typo` and the Layer 5 cap lookup would
+    // silently miss the typo'd group at every authz check.
     if let Err(e) = profile.validate() {
         return err_bad_input(format!("profile rejected: {e}"));
     }
-
     if let Err(e) = profile.save_to_path(&path) {
         return err_profile(&principal, &e);
     }
@@ -433,17 +498,71 @@ async fn agent_modify(
 
     info!(
         %principal,
-        added = ?add_groups,
-        removed = ?remove_groups,
+        added_groups = ?add_groups,
+        removed_groups = ?remove_groups,
+        added_capsules = ?add_capsules,
+        removed_capsules = ?remove_capsules,
         groups = ?profile.groups,
+        capsules = ?profile.capsules,
         "Layer 6 agent.modify"
     );
+    modify_response(&principal, &profile, true)
+}
 
+/// Build the `agent.modify` success body reporting the principal's
+/// resulting groups + capsule grants and whether the call changed state.
+fn modify_response(
+    principal: &PrincipalId,
+    profile: &PrincipalProfile,
+    changed: bool,
+) -> AdminResponseBody {
     success_json(serde_json::json!({
         "principal": principal.as_str(),
         "groups": profile.groups,
-        "changed": true,
+        "capsules": profile.capsules,
+        "changed": changed,
     }))
+}
+
+/// Apply an idempotent set delta to `target`: remove every entry in
+/// `remove`, then append every entry in `add` not already present.
+///
+/// Returns `true` if the resulting set differs from the original
+/// (order-insensitive). Removes are applied first so a (remove, add) of
+/// the same entry is an idempotent rename rather than a duplicate; adding
+/// a present entry or removing an absent one is a no-op. Shared by the
+/// group and capsule mechanisms so they behave identically.
+///
+/// On a no-op (the resulting set equals the original) `target` is left
+/// byte-for-byte unchanged — including its element order. The delta is
+/// computed on a scratch copy and written back only when the set actually
+/// changed, so an order-only churn (e.g. removing then re-adding a present
+/// entry) is never reflected back to the caller as a mutated profile that
+/// then goes unpersisted (`changed=false`).
+pub(crate) fn apply_set_delta(target: &mut Vec<String>, add: &[String], remove: &[String]) -> bool {
+    // Build the resulting order on a scratch copy WITHOUT touching `target`:
+    // surviving entries keep their order, then new additions append.
+    let mut next: Vec<String> = target
+        .iter()
+        .filter(|e| !remove.contains(e))
+        .cloned()
+        .collect();
+    for entry in add {
+        if !next.contains(entry) {
+            next.push(entry.clone());
+        }
+    }
+    // Order-insensitive set comparison; the borrows end with the block so the
+    // write-back below can take `&mut *target`.
+    let changed = {
+        let before: std::collections::HashSet<&String> = target.iter().collect();
+        let after: std::collections::HashSet<&String> = next.iter().collect();
+        before != after
+    };
+    if changed {
+        *target = next;
+    }
+    changed
 }
 
 /// Does `caller` hold the admin-tier global `agent:list` capability
@@ -532,88 +651,6 @@ fn agent_list(kernel: &Arc<crate::Kernel>, caller: &PrincipalId) -> AdminRespons
     }
 
     AdminResponseBody::AgentList(summaries)
-}
-
-// ── Groups ─────────────────────────────────────────────────────────────
-
-async fn group_create(
-    kernel: &Arc<crate::Kernel>,
-    name: String,
-    capabilities: Vec<String>,
-    description: Option<String>,
-    unsafe_admin: bool,
-) -> AdminResponseBody {
-    let group = Group {
-        capabilities,
-        description,
-        unsafe_admin,
-    };
-    let _guard = kernel.admin_write_lock.lock().await;
-    let current = kernel.groups.load_full();
-    let next = match current.insert_custom_group(name, group) {
-        Ok(n) => n,
-        Err(e) => return err_bad_input(format!("group.create rejected: {e}")),
-    };
-    commit_group_config(kernel, next)
-}
-
-async fn group_delete(kernel: &Arc<crate::Kernel>, name: String) -> AdminResponseBody {
-    let _guard = kernel.admin_write_lock.lock().await;
-    let current = kernel.groups.load_full();
-    let next = match current.remove_group(&name) {
-        Ok(n) => n,
-        Err(e) => return err_bad_input(format!("group.delete rejected: {e}")),
-    };
-    commit_group_config(kernel, next)
-}
-
-// `Option<Option<String>>` intentionally encodes three states: `None` =
-// keep existing description, `Some(None)` = clear it, `Some(Some(v))` =
-// replace with `v`. Collapsing to a single `Option` would conflate "no
-// change" with "clear" at the wire format. Clippy's `option_option` lint
-// is overly cautious for partial-update APIs.
-#[allow(clippy::option_option)]
-async fn group_modify(
-    kernel: &Arc<crate::Kernel>,
-    name: String,
-    capabilities: Option<Vec<String>>,
-    description: Option<Option<String>>,
-    unsafe_admin: Option<bool>,
-) -> AdminResponseBody {
-    let _guard = kernel.admin_write_lock.lock().await;
-    let current = kernel.groups.load_full();
-    let next = match current.modify_custom_group(&name, capabilities, description, unsafe_admin) {
-        Ok(n) => n,
-        Err(e) => return err_bad_input(format!("group.modify rejected: {e}")),
-    };
-    commit_group_config(kernel, next)
-}
-
-fn group_list(kernel: &Arc<crate::Kernel>) -> AdminResponseBody {
-    let cfg = kernel.groups.load_full();
-    let mut summaries: Vec<GroupSummary> = cfg
-        .iter()
-        .map(|(name, group)| GroupSummary {
-            name: name.clone(),
-            capabilities: group.capabilities.clone(),
-            description: group.description.clone(),
-            unsafe_admin: group.unsafe_admin,
-            builtin: GroupConfig::is_builtin_name(name),
-        })
-        .collect();
-    summaries.sort_by(|a, b| a.name.cmp(&b.name));
-    AdminResponseBody::GroupList(summaries)
-}
-
-/// Commit a new [`GroupConfig`] to disk and the
-/// [`ArcSwap`](arc_swap::ArcSwap). Caller must hold the admin write lock.
-fn commit_group_config(kernel: &Arc<crate::Kernel>, next: GroupConfig) -> AdminResponseBody {
-    let path = GroupConfig::path_for(&kernel.astrid_home);
-    if let Err(e) = next.save_to_path(&path) {
-        return err_internal(format!("groups.toml save failed: {e}"));
-    }
-    kernel.groups.store(Arc::new(next));
-    success_json(serde_json::json!({ "status": "ok" }))
 }
 
 // ── Per-principal grants / revokes ─────────────────────────────────────
@@ -714,7 +751,7 @@ async fn mutate_caps(
 
 // ── Helpers ────────────────────────────────────────────────────────────
 
-pub(super) fn principal_profile_path(
+pub(crate) fn principal_profile_path(
     kernel: &Arc<crate::Kernel>,
     principal: &PrincipalId,
 ) -> PathBuf {
@@ -726,7 +763,7 @@ pub(super) fn principal_profile_path(
 /// [`PrincipalProfile::load_from_path`] returns `Default` on `NotFound`,
 /// which would let a typo'd name silently materialize a phantom
 /// principal with grants on disk.
-pub(super) fn require_principal_exists(principal: &PrincipalId, path: &Path) -> Result<(), String> {
+pub(crate) fn require_principal_exists(principal: &PrincipalId, path: &Path) -> Result<(), String> {
     if path.exists() {
         Ok(())
     } else {
@@ -737,12 +774,56 @@ pub(super) fn require_principal_exists(principal: &PrincipalId, path: &Path) -> 
     }
 }
 
+/// Mirror the read-only introspection furniture (installed-capsule registry
+/// plus the `home://wit/` interface mirror) from the install principal's home
+/// into a freshly-created principal's home, so its `system_status` /
+/// `list_interfaces` reflect the globally-loaded capsule set, not an empty home.
+///
+/// Best-effort: callers invoke this AFTER the principal's home tree is
+/// provisioned, so a sync failure must not fail the create/redeem — it only
+/// degrades introspection visibility, and the boot sweep retries on next
+/// daemon start. Env config (`.config/env/`) is deliberately excluded inside
+/// [`astrid_capsule_install::materialize_principal_furniture`] for secret
+/// isolation.
+pub(super) async fn sync_principal_furniture(kernel: &Arc<crate::Kernel>, principal: &PrincipalId) {
+    // `materialize_principal_furniture` does synchronous recursive directory
+    // copies. Run it on the blocking pool so it never pins a tokio worker, but
+    // `.await` the handle so the furniture is materialized before this handler
+    // returns — a freshly-created principal must have its introspection mirror
+    // ready by the time `agent.create`/`invite.redeem` completes.
+    let home = kernel.astrid_home.clone();
+    let principal = principal.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        astrid_capsule_install::materialize_principal_furniture(&home, &principal)
+            .map_err(|e| (principal, e))
+    })
+    .await;
+    match result {
+        Ok(Ok(())) => {},
+        Ok(Err((principal, e))) => {
+            warn!(
+                %principal,
+                error = %format!("{e:#}"),
+                "failed to materialize per-principal home furniture; \
+                 introspection tools may not see the loaded capsule set"
+            );
+        },
+        Err(join_err) => {
+            warn!(
+                error = %join_err,
+                "per-principal home-furniture task panicked; \
+                 introspection tools may not see the loaded capsule set"
+            );
+        },
+    }
+}
+
 pub(super) fn err_bad_input(msg: String) -> AdminResponseBody {
     warn!(error = %msg, "admin request rejected: bad input");
     AdminResponseBody::Error(msg)
 }
 
-fn err_internal(msg: String) -> AdminResponseBody {
+pub(super) fn err_internal(msg: String) -> AdminResponseBody {
     warn!(error = %msg, "admin request failed: internal error");
     AdminResponseBody::Error(msg)
 }
@@ -753,209 +834,4 @@ pub(super) fn err_profile(principal: &PrincipalId, e: &ProfileError) -> AdminRes
 
 pub(super) fn success_json(val: serde_json::Value) -> AdminResponseBody {
     AdminResponseBody::Success(val)
-}
-
-// ── agent.create: inherit `default`'s per-principal state ──────────────
-
-/// Copy `default`'s env JSON, per-capsule KV namespaces, and
-/// per-capsule secret files into the new principal's slots so the
-/// agent works out of the box.
-///
-/// Best-effort: any single failure logs at `warn` and the rest of the
-/// inheritance proceeds. The home tree already exists by the time
-/// this is called (its absence is what makes the parent fail-closed
-/// rollback necessary, not this).
-async fn inherit_from_default(kernel: &Arc<crate::Kernel>, principal: &PrincipalId) {
-    if principal == &PrincipalId::default() {
-        return;
-    }
-    let default = PrincipalId::default();
-
-    copy_env_dir(kernel, &default, principal);
-
-    // Snapshot manifest data under the registry lock, then drop it
-    // before any async / blocking I/O. Holding the read lock across
-    // `copy_kv_namespaces` (async KV) and `copy_secret_files`
-    // (blocking fs) would serialise every concurrent install / update
-    // / remove against the inherit path for as long as the copy ran.
-    let (capsule_ids, secret_keys_by_capsule): (
-        Vec<astrid_capsule::capsule::CapsuleId>,
-        Vec<(astrid_capsule::capsule::CapsuleId, Vec<String>)>,
-    ) = {
-        let registry = kernel.capsules.read().await;
-        let ids: Vec<_> = registry.list().into_iter().cloned().collect();
-        let mut secrets: Vec<(astrid_capsule::capsule::CapsuleId, Vec<String>)> = Vec::new();
-        for id in &ids {
-            if let Some(capsule) = registry.get(id) {
-                let keys: Vec<String> = capsule
-                    .manifest()
-                    .env
-                    .iter()
-                    .filter(|(_, def)| def.env_type == "secret")
-                    .map(|(k, _)| k.clone())
-                    .collect();
-                if !keys.is_empty() {
-                    secrets.push((id.clone(), keys));
-                }
-            }
-        }
-        (ids, secrets)
-    };
-
-    let total_keys = copy_kv_namespaces(kernel, &default, principal, &capsule_ids).await;
-    let (probed_secrets, copied_secrets) =
-        copy_secret_files(kernel, &default, principal, &secret_keys_by_capsule);
-
-    info!(
-        %principal,
-        total_keys,
-        copied_secrets,
-        probed_secrets,
-        "agent.create: inherited default's env JSON + KV namespaces + secrets"
-    );
-}
-
-fn copy_env_dir(kernel: &Arc<crate::Kernel>, default: &PrincipalId, principal: &PrincipalId) {
-    let default_env = kernel.astrid_home.principal_home(default).env_dir();
-    let agent_env = kernel.astrid_home.principal_home(principal).env_dir();
-    if !default_env.is_dir() {
-        return;
-    }
-    if let Err(e) = std::fs::create_dir_all(&agent_env) {
-        tracing::warn!(%principal, error = %e, "agent.create: env_dir mkdir failed");
-        return;
-    }
-    let Ok(entries) = std::fs::read_dir(&default_env) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let name = entry.file_name();
-        let src = entry.path();
-        let dst = agent_env.join(&name);
-        if let Err(e) = std::fs::copy(&src, &dst) {
-            tracing::warn!(
-                %principal,
-                file = %name.to_string_lossy(),
-                error = %e,
-                "agent.create: env JSON copy failed"
-            );
-        }
-    }
-}
-
-async fn copy_kv_namespaces(
-    kernel: &Arc<crate::Kernel>,
-    default: &PrincipalId,
-    principal: &PrincipalId,
-    capsule_ids: &[astrid_capsule::capsule::CapsuleId],
-) -> usize {
-    use astrid_storage::KvStore;
-    let mut total_keys = 0usize;
-    for capsule_id in capsule_ids {
-        let src_ns = format!("{default}:capsule:{capsule_id}");
-        let dst_ns = format!("{principal}:capsule:{capsule_id}");
-        let keys = match kernel.kv.list_keys(&src_ns).await {
-            Ok(k) => k,
-            Err(e) => {
-                tracing::warn!(
-                    %principal,
-                    capsule_id = %capsule_id,
-                    error = %e,
-                    "agent.create: KV list_keys failed for capsule namespace"
-                );
-                continue;
-            },
-        };
-        if !keys.is_empty() {
-            info!(
-                %principal,
-                capsule_id = %capsule_id,
-                key_count = keys.len(),
-                src_ns = %src_ns,
-                "agent.create: copying KV namespace"
-            );
-            total_keys = total_keys.saturating_add(keys.len());
-        }
-        for key in keys {
-            match kernel.kv.get(&src_ns, &key).await {
-                Ok(Some(value)) => {
-                    if let Err(e) = kernel.kv.set(&dst_ns, &key, value).await {
-                        tracing::warn!(
-                            %principal,
-                            capsule_id = %capsule_id,
-                            key = %key,
-                            error = %e,
-                            "agent.create: KV copy write failed"
-                        );
-                    }
-                },
-                Ok(None) => { /* benign race: key disappeared between list and get */ },
-                Err(e) => {
-                    tracing::warn!(
-                        %principal,
-                        capsule_id = %capsule_id,
-                        key = %key,
-                        error = %e,
-                        "agent.create: KV copy read failed"
-                    );
-                },
-            }
-        }
-    }
-    total_keys
-}
-
-fn copy_secret_files(
-    kernel: &Arc<crate::Kernel>,
-    default: &PrincipalId,
-    principal: &PrincipalId,
-    secret_keys_by_capsule: &[(astrid_capsule::capsule::CapsuleId, Vec<String>)],
-) -> (usize, usize) {
-    use astrid_storage::{FileSecretStore, SecretStore};
-    let mut probed = 0usize;
-    let mut copied = 0usize;
-    let secrets_root = kernel.astrid_home.secrets_dir();
-    for (capsule_id, secret_keys) in secret_keys_by_capsule {
-        let src = FileSecretStore::new(
-            secrets_root
-                .join(default.as_str())
-                .join(capsule_id.as_str()),
-        );
-        let dst = FileSecretStore::new(
-            secrets_root
-                .join(principal.as_str())
-                .join(capsule_id.as_str()),
-        );
-        for key in secret_keys {
-            probed = probed.saturating_add(1);
-            let value = match src.get(key) {
-                Ok(Some(v)) => v,
-                Ok(None) => continue,
-                Err(e) => {
-                    tracing::warn!(
-                        %principal,
-                        capsule_id = %capsule_id,
-                        key = %key,
-                        error = %e,
-                        security_event = true,
-                        "agent.create: secret read failed for default's slot"
-                    );
-                    continue;
-                },
-            };
-            if let Err(e) = dst.set(key, &value) {
-                tracing::warn!(
-                    %principal,
-                    capsule_id = %capsule_id,
-                    key = %key,
-                    error = %e,
-                    security_event = true,
-                    "agent.create: secret write failed for new principal"
-                );
-            } else {
-                copied = copied.saturating_add(1);
-            }
-        }
-    }
-    (probed, copied)
 }

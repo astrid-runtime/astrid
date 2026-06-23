@@ -75,6 +75,14 @@ pub struct ModifyPrincipalRequest {
     /// Groups to remove. Idempotent — absent groups are no-ops.
     #[serde(default)]
     pub remove_groups: Vec<String>,
+    /// Capsule grants to add. Idempotent — already-granted capsules are
+    /// no-ops. Grants the principal access to invoke the named capsule's
+    /// user-invocable tool surface (kernel-gated at dispatch, #992).
+    #[serde(default)]
+    pub add_capsules: Vec<String>,
+    /// Capsule grants to remove. Idempotent — absent grants are no-ops.
+    #[serde(default)]
+    pub remove_capsules: Vec<String>,
 }
 
 /// `GET /api/sys/principals` — list every agent principal visible
@@ -96,7 +104,7 @@ pub async fn list_principals(
     req: Request<axum::body::Body>,
 ) -> GatewayResult<Json<PrincipalListResponse>> {
     let caller = caller_from(&req)?;
-    let client = state.admin_client(caller.principal.clone())?;
+    let client = state.admin_client_for(caller)?;
     let resp = client
         .request(AdminRequestKind::AgentList)
         .await
@@ -133,7 +141,7 @@ pub async fn get_principal(
     let target = PrincipalId::new(&id)
         .map_err(|e| GatewayError::BadRequest(format!("invalid principal id: {e}")))?;
     let caller = caller_from(&req)?;
-    let client = state.admin_client(caller.principal.clone())?;
+    let client = state.admin_client_for(caller)?;
     let resp = client
         .request(AdminRequestKind::AgentList)
         .await
@@ -168,12 +176,18 @@ pub async fn create_principal(
 ) -> GatewayResult<Json<serde_json::Value>> {
     let caller = caller_from(&req)?.clone();
     let body: CreatePrincipalRequest = read_json_body(req).await?;
-    let client = state.admin_client(caller.principal)?;
+    let client = state.admin_client_for(&caller)?;
     let resp = client
         .request(AdminRequestKind::AgentCreate {
             name: body.name,
             groups: body.groups,
             grants: body.grants,
+            // Non-inheriting by default — the API does not expose the
+            // opt-in inheritance source yet. Exposing an API-level
+            // `inherit_from` / `clone_from` is a follow-up.
+            inherit_from: None,
+            clone_from: None,
+            allow_admin_clone: false,
         })
         .await
         .map_err(daemon_internal)?;
@@ -204,8 +218,8 @@ pub async fn delete_principal(
 ) -> GatewayResult<StatusCode> {
     let principal = PrincipalId::new(&id)
         .map_err(|e| GatewayError::BadRequest(format!("invalid principal id: {e}")))?;
-    let caller = caller_from(&req)?.clone();
-    let client = state.admin_client(caller.principal)?;
+    let caller = caller_from(&req)?;
+    let client = state.admin_client_for(caller)?;
     let resp = client
         .request(AdminRequestKind::AgentDelete { principal })
         .await
@@ -268,8 +282,8 @@ async fn set_enabled(
 ) -> GatewayResult<Json<serde_json::Value>> {
     let principal = PrincipalId::new(&id)
         .map_err(|e| GatewayError::BadRequest(format!("invalid principal id: {e}")))?;
-    let caller = caller_from(&req)?.clone();
-    let client = state.admin_client(caller.principal)?;
+    let caller = caller_from(&req)?;
+    let client = state.admin_client_for(caller)?;
     let kind = if enabled {
         AdminRequestKind::AgentEnable { principal }
     } else {
@@ -305,12 +319,14 @@ pub async fn modify_principal(
         .map_err(|e| GatewayError::BadRequest(format!("invalid principal id: {e}")))?;
     let caller = caller_from(&req)?.clone();
     let body: ModifyPrincipalRequest = read_json_body(req).await?;
-    let client = state.admin_client(caller.principal)?;
+    let client = state.admin_client_for(&caller)?;
     let resp = client
         .request(AdminRequestKind::AgentModify {
             principal,
             add_groups: body.add_groups,
             remove_groups: body.remove_groups,
+            add_capsules: body.add_capsules,
+            remove_capsules: body.remove_capsules,
         })
         .await
         .map_err(daemon_internal)?;
@@ -410,6 +426,124 @@ pub async fn list_capabilities(
         capabilities: astrid_core::capability_grammar::CAPABILITY_CATALOG,
         categories: CATEGORY_RENDER_ORDER,
     }))
+}
+
+// ── Device management ────────────────────────────────────────────
+
+/// `OpenAPI` schema mirror of [`astrid_core::kernel_api::DeviceKeyInfo`].
+///
+/// Like [`AgentSummaryView`], this is never constructed — it exists so the
+/// `value_type` on [`DeviceListResponse::devices`] resolves to a typed schema
+/// instead of opaque JSON. Keep it field-for-field with the serialized shape
+/// of `DeviceKeyInfo`. The raw pubkey is deliberately absent — only the
+/// fingerprint-level `key_id` is ever surfaced.
+#[derive(ToSchema)]
+pub struct DeviceKeyInfoView {
+    /// Deterministic per-device fingerprint handle.
+    pub key_id: String,
+    /// Operator/user-facing label captured at pairing time, if any.
+    pub label: Option<String>,
+    /// Capability attenuation scope the device authenticates under. Serialized
+    /// as the `DeviceScope` shape: `{ "type": "full" }` or
+    /// `{ "type": "scoped", "allow": [...], "deny": [...] }`.
+    #[schema(value_type = Object)]
+    pub scope: serde_json::Value,
+    /// Unix epoch seconds when the device was paired (`0` for migrated
+    /// legacy keys).
+    pub created_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct DeviceListResponse {
+    /// Paired devices on the principal, as fingerprint-level summaries.
+    #[schema(value_type = Vec<DeviceKeyInfoView>)]
+    pub devices: Vec<astrid_core::kernel_api::DeviceKeyInfo>,
+}
+
+/// `GET /api/sys/principals/{id}/devices` — list a principal's paired
+/// devices. Maps to [`AdminRequestKind::PairDeviceList`]; the kernel's
+/// self-vs-global authority scope applies (a principal lists its own devices
+/// with `self:auth:pair`; managing another's needs the global `auth:pair`).
+#[utoipa::path(
+    get,
+    path = "/api/sys/principals/{id}/devices",
+    tag = "principals",
+    params(("id" = String, Path, description = "Target principal id")),
+    responses(
+        (status = 200, body = DeviceListResponse, description = "Paired devices (key_id + scope + label + created_at; never the raw pubkey)."),
+        (status = 401, body = ErrorBody),
+        (status = 403, body = ErrorBody, description = "Caller lacks `self:auth:pair` / `auth:pair`."),
+        (status = 404, body = ErrorBody, description = "Principal does not exist."),
+    )
+)]
+pub async fn list_principal_devices(
+    State(state): State<Arc<GatewayState>>,
+    Path(id): Path<String>,
+    req: Request<axum::body::Body>,
+) -> GatewayResult<Json<DeviceListResponse>> {
+    let principal = PrincipalId::new(&id)
+        .map_err(|e| GatewayError::BadRequest(format!("invalid principal id: {e}")))?;
+    let caller = caller_from(&req)?;
+    let client = state.admin_client_for(caller)?;
+    let resp = client
+        .request(AdminRequestKind::PairDeviceList { principal })
+        .await
+        .map_err(daemon_internal)?;
+    match resp {
+        AdminResponseBody::PairDeviceListed(devices) => Ok(Json(DeviceListResponse { devices })),
+        AdminResponseBody::Error(msg) if msg.contains("does not exist") => {
+            Err(GatewayError::NotFound)
+        },
+        AdminResponseBody::Error(msg) => Err(GatewayError::Forbidden { reason: msg }),
+        other => Err(unexpected(other)),
+    }
+}
+
+/// `DELETE /api/sys/principals/{id}/devices/{key_id}` — revoke one paired
+/// device. Maps to [`AdminRequestKind::PairDeviceRevoke`]. A revoked device
+/// fails closed at the kernel cap-gate immediately (its key is gone from
+/// `public_keys`) and the gateway evicts any live bearer scoped to its
+/// `key_id` via the revoked-key-id watcher.
+#[utoipa::path(
+    delete,
+    path = "/api/sys/principals/{id}/devices/{key_id}",
+    tag = "principals",
+    params(
+        ("id" = String, Path, description = "Target principal id"),
+        ("key_id" = String, Path, description = "Device key_id to revoke"),
+    ),
+    responses(
+        (status = 204, description = "Device revoked."),
+        (status = 401, body = ErrorBody),
+        (status = 403, body = ErrorBody, description = "Caller lacks `self:auth:pair` / `auth:pair`."),
+        (status = 404, body = ErrorBody, description = "No device with that key_id (or principal does not exist)."),
+    )
+)]
+pub async fn delete_principal_device(
+    State(state): State<Arc<GatewayState>>,
+    Path((id, key_id)): Path<(String, String)>,
+    req: Request<axum::body::Body>,
+) -> GatewayResult<StatusCode> {
+    let principal = PrincipalId::new(&id)
+        .map_err(|e| GatewayError::BadRequest(format!("invalid principal id: {e}")))?;
+    let caller = caller_from(&req)?;
+    let client = state.admin_client_for(caller)?;
+    let resp = client
+        .request(AdminRequestKind::PairDeviceRevoke { principal, key_id })
+        .await
+        .map_err(daemon_internal)?;
+    match resp {
+        AdminResponseBody::PairDeviceRevoked { .. } => Ok(StatusCode::NO_CONTENT),
+        // The kernel returns a bad-input error for an unknown key_id or a
+        // missing principal — both surface to the client as 404.
+        AdminResponseBody::Error(msg)
+            if msg.contains("no paired device") || msg.contains("does not exist") =>
+        {
+            Err(GatewayError::NotFound)
+        },
+        AdminResponseBody::Error(msg) => Err(GatewayError::Forbidden { reason: msg }),
+        other => Err(unexpected(other)),
+    }
 }
 
 // ── Helpers ──────────────────────────────────────────────────────

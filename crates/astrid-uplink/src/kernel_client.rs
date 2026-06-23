@@ -65,8 +65,11 @@ pub const fn topic_suffix(req: &KernelRequest) -> &'static str {
         KernelRequest::ApproveCapability { .. } => "approve_capability",
         KernelRequest::ListCapsules => "list_capsules",
         KernelRequest::ReloadCapsules => "reload_capsules",
+        KernelRequest::ReloadCapsule { .. } => "reload_capsule",
+        KernelRequest::UnloadCapsule { .. } => "unload_capsule",
         KernelRequest::GetCommands => "get_commands",
         KernelRequest::GetCapsuleMetadata => "metadata",
+        KernelRequest::GetAgentReadiness => "agent_readiness",
         KernelRequest::Shutdown { .. } => "shutdown",
         KernelRequest::GetStatus => "status",
     }
@@ -80,6 +83,38 @@ pub struct KernelClient {
     inner: SocketClient,
     caller: PrincipalId,
     timeout: Duration,
+    /// The authenticating device's `key_id`, when the caller's bearer/handshake
+    /// was device-scoped. Stamped on every outbound request so the kernel
+    /// cap-gate applies the per-device capability scope (#999); `None` for a
+    /// full-authority caller (no attenuation).
+    device_key_id: Option<String>,
+}
+
+/// Build the request message and its private response topic for `req` on behalf
+/// of `caller`, carrying `device_key_id` when the caller was device-scoped.
+///
+/// Free function (no `self`) so the principal + device-scope stamping is
+/// unit-testable without a live socket. The kernel strips the
+/// `astrid.v1.request.` prefix and reprefixes `astrid.v1.response.`, so the
+/// per-call correlation UUID gives a response channel concurrent calls can't
+/// collide on.
+fn build_request_message(
+    caller: &PrincipalId,
+    device_key_id: Option<&str>,
+    req: &KernelRequest,
+) -> Result<(IpcMessage, String)> {
+    let correlation = Uuid::new_v4().simple().to_string();
+    let suffix = format!("{}.{correlation}", topic_suffix(req));
+    let request_topic = format!("{REQUEST_PREFIX}{suffix}");
+    let want_response = format!("{RESPONSE_PREFIX}{suffix}");
+
+    let payload = serde_json::to_value(req).context("serialise KernelRequest")?;
+    let mut msg = IpcMessage::new(request_topic, IpcPayload::RawJson(payload), Uuid::nil())
+        .with_principal(caller.to_string());
+    if let Some(kid) = device_key_id {
+        msg = msg.with_device_key_id(kid);
+    }
+    Ok((msg, want_response))
 }
 
 impl KernelClient {
@@ -93,13 +128,14 @@ impl KernelClient {
     /// connection fails, or the handshake is rejected.
     pub async fn connect(caller: PrincipalId) -> Result<Self> {
         let session_id = astrid_core::SessionId::from_uuid(Uuid::new_v4());
-        let inner = SocketClient::connect(session_id)
+        let inner = SocketClient::connect(session_id, caller.clone())
             .await
             .context("Failed to connect to Astrid daemon. Run `astrid start` to launch it.")?;
         Ok(Self {
             inner,
             caller,
             timeout: DEFAULT_TIMEOUT,
+            device_key_id: None,
         })
     }
 
@@ -110,6 +146,16 @@ impl KernelClient {
         self
     }
 
+    /// Carry the authenticating device's `key_id` so the kernel cap-gate
+    /// applies the per-device capability scope (#999). Callers behind the
+    /// gateway auth middleware pass the bearer's `CallerContext.device_key_id`;
+    /// a full-authority bearer passes `None` (unattenuated, the prior behaviour).
+    #[must_use]
+    pub fn with_device_key_id(mut self, device_key_id: Option<String>) -> Self {
+        self.device_key_id = device_key_id;
+        self
+    }
+
     /// Send a [`KernelRequest`] and await the matching
     /// [`KernelResponse`].
     ///
@@ -117,19 +163,8 @@ impl KernelClient {
     /// Returns an error on serialization failure, send failure, or
     /// timeout / connection drop before a matching response arrives.
     pub async fn request(&mut self, req: KernelRequest) -> Result<KernelResponse> {
-        // Per-call UUID suffix. The kernel's `handle_request` strips
-        // the `astrid.v1.request.` prefix and reprefixes with
-        // `astrid.v1.response.`, so embedding a UUID here gives us a
-        // private response channel that other concurrent in-flight
-        // calls can't collide on.
-        let correlation = Uuid::new_v4().simple().to_string();
-        let suffix = format!("{}.{correlation}", topic_suffix(&req));
-        let request_topic = format!("{REQUEST_PREFIX}{suffix}");
-        let want_response = format!("{RESPONSE_PREFIX}{suffix}");
-
-        let payload = serde_json::to_value(&req).context("serialise KernelRequest")?;
-        let msg = IpcMessage::new(request_topic, IpcPayload::RawJson(payload), Uuid::nil())
-            .with_principal(self.caller.to_string());
+        let (msg, want_response) =
+            build_request_message(&self.caller, self.device_key_id.as_deref(), &req)?;
         self.inner.send_message(msg).await?;
 
         let raw = self
@@ -177,6 +212,10 @@ mod tests {
         assert_eq!(topic_suffix(&KernelRequest::GetCommands), "get_commands");
         assert_eq!(topic_suffix(&KernelRequest::GetCapsuleMetadata), "metadata");
         assert_eq!(
+            topic_suffix(&KernelRequest::GetAgentReadiness),
+            "agent_readiness"
+        );
+        assert_eq!(
             topic_suffix(&KernelRequest::ReloadCapsules),
             "reload_capsules"
         );
@@ -184,6 +223,41 @@ mod tests {
             topic_suffix(&KernelRequest::Shutdown { reason: None }),
             "shutdown"
         );
+    }
+
+    #[test]
+    fn request_message_stamps_principal_and_device_key_id() {
+        // A device-scoped caller's key_id MUST ride the outbound request so the
+        // kernel cap-gate applies the per-device scope (#999). Regression guard:
+        // without the stamp, every HTTP gateway admin call (status, readiness,
+        // reload, capsule list/install) bypasses device-scope attenuation.
+        let caller = PrincipalId::new("alice").unwrap();
+        let (msg, want) = build_request_message(
+            &caller,
+            Some("abcdef0123456789"),
+            &KernelRequest::GetAgentReadiness,
+        )
+        .expect("build message");
+        assert_eq!(msg.principal.as_deref(), Some("alice"));
+        assert_eq!(
+            msg.device_key_id.as_deref(),
+            Some("abcdef0123456789"),
+            "device key id must reach the kernel cap-gate"
+        );
+        // Response topic carries the request suffix so the reply is correlated.
+        assert!(want.starts_with(RESPONSE_PREFIX));
+        assert!(want.contains("agent_readiness"));
+    }
+
+    #[test]
+    fn request_message_omits_device_key_id_for_full_authority_caller() {
+        // A full-authority bearer carries no device scope — the message must
+        // leave device_key_id unset so the kernel treats it as unattenuated,
+        // preserving the prior single-tenant behaviour.
+        let caller = PrincipalId::new("alice").unwrap();
+        let (msg, _) =
+            build_request_message(&caller, None, &KernelRequest::GetStatus).expect("build message");
+        assert!(msg.device_key_id.is_none());
     }
 
     #[test]

@@ -86,10 +86,25 @@ pub(crate) fn spawn_kernel_router(kernel: Arc<crate::Kernel>) -> tokio::task::Jo
                         continue;
                     }
                     let caller = resolve_caller(message);
-                    handle_request(&kernel, message.topic.clone(), caller, req).await;
+                    let device_key_id = resolve_device_key_id(message);
+                    handle_request(&kernel, message.topic.clone(), caller, device_key_id, req)
+                        .await;
                 },
                 Err(e) => {
-                    warn!(error = %e, topic = %message.topic, "Failed to parse KernelRequest from IPC");
+                    // The kernel router shares the broadcast
+                    // `astrid.v1.request.*` namespace with capsule traffic — the
+                    // sage-mcp broker's `astrid.v1.request.mcp.*`, and any future
+                    // capsule-to-capsule request topics. `KernelRequest` is
+                    // `#[serde(tag = "method")]`, so a payload WITHOUT a `method`
+                    // discriminator was never addressed to the kernel; ignore it
+                    // quietly rather than warning. Only a payload that IS shaped
+                    // like a kernel request (`method` present) yet fails to parse
+                    // is a genuinely malformed management request worth a warning.
+                    if val.get("method").is_some() {
+                        warn!(error = %e, topic = %message.topic, "Failed to parse KernelRequest from IPC");
+                    } else {
+                        debug!(topic = %message.topic, "Ignoring non-kernel request on shared astrid.v1.request.* namespace");
+                    }
                 },
             }
         }
@@ -184,6 +199,7 @@ async fn handle_request(
     kernel: &Arc<crate::Kernel>,
     topic: String,
     caller: PrincipalId,
+    device_key_id: Option<String>,
     req: KernelRequest,
 ) {
     let response_topic = if let Some(suffix) = topic.strip_prefix("astrid.v1.request.") {
@@ -199,7 +215,7 @@ async fn handle_request(
     let method = kernel_request_method(&req);
     let scope = resolve_scope(&req, &caller);
     let required_cap = required_capability(&req, scope);
-    match authorize_request(kernel, &caller, required_cap) {
+    match authorize_request(kernel, &caller, device_key_id.as_deref(), required_cap) {
         Ok(()) => {
             record_admin_audit(
                 kernel,
@@ -207,6 +223,7 @@ async fn handle_request(
                     caller: &caller,
                     method,
                     required_cap,
+                    device_key_id: device_key_id.as_deref(),
                     target_principal: None,
                     params: None,
                     authorization: AuthorizationProof::System {
@@ -230,6 +247,7 @@ async fn handle_request(
                     caller: &caller,
                     method,
                     required_cap,
+                    device_key_id: device_key_id.as_deref(),
                     target_principal: None,
                     params: None,
                     authorization: AuthorizationProof::Denied {
@@ -275,6 +293,7 @@ async fn handle_request(
                             .clone()
                             .unwrap_or_else(|| "No description".to_string()),
                         provider_capsule: c.id().to_string(),
+                        kind: cmd.kind,
                     });
                 }
             }
@@ -312,6 +331,46 @@ async fn handle_request(
 
             kernel.load_all_capsules().await;
             KernelResponse::Success(serde_json::json!({"status": "reloaded"}))
+        },
+        KernelRequest::ReloadCapsule { id } => {
+            // Hot-swap a single capsule (or add it if not yet loaded) without a
+            // daemon restart. The kernel publishes capsules_loaded on success so
+            // the tool surface refreshes. `id` is client-supplied over IPC, so
+            // validate it (CapsuleId::new rejects unsafe ids) before using it as
+            // a registry key — never construct it unchecked from untrusted input.
+            match astrid_capsule::capsule::CapsuleId::new(id.clone()) {
+                Ok(cap_id) => match kernel.reload_one_capsule(&cap_id).await {
+                    Ok(()) => KernelResponse::Success(
+                        serde_json::json!({"status": "reloaded", "capsule": id}),
+                    ),
+                    Err(e) => {
+                        KernelResponse::Error(format!("reload of capsule '{id}' failed: {e}"))
+                    },
+                },
+                Err(e) => KernelResponse::Error(format!("invalid capsule id '{id}': {e}")),
+            }
+        },
+        KernelRequest::UnloadCapsule { id } => {
+            // Unload a single capsule from the running daemon without a restart.
+            // The on-disk removal that triggers this is authoritative and
+            // dependency-checked by the CLI; here we only unregister the live
+            // instance. `id` is client-supplied over IPC, so validate it
+            // (CapsuleId::new rejects unsafe ids) before using it as a registry
+            // key — never construct it unchecked from untrusted input.
+            match astrid_capsule::capsule::CapsuleId::new(id.clone()) {
+                Ok(cap_id) => match kernel.unload_one_capsule(&cap_id).await {
+                    Ok(true) => KernelResponse::Success(
+                        serde_json::json!({"status": "unloaded", "capsule": id}),
+                    ),
+                    Ok(false) => KernelResponse::Success(
+                        serde_json::json!({"status": "not_loaded", "capsule": id}),
+                    ),
+                    Err(e) => {
+                        KernelResponse::Error(format!("unload of capsule '{id}' failed: {e}"))
+                    },
+                },
+                Err(e) => KernelResponse::Error(format!("invalid capsule id '{id}': {e}")),
+            }
         },
         KernelRequest::Shutdown { reason } => {
             info!(
@@ -371,6 +430,15 @@ async fn handle_request(
                 });
             }
             KernelResponse::CapsuleMetadata(entries)
+        },
+        KernelRequest::GetAgentReadiness => {
+            let reg = kernel.capsules.read().await;
+            let manifests: Vec<&astrid_capsule::manifest::CapsuleManifest> = reg
+                .values()
+                .map(astrid_capsule::capsule::Capsule::manifest)
+                .collect();
+            let readiness = astrid_capsule::readiness::agent_loop_readiness(&manifests);
+            KernelResponse::AgentReadiness(readiness)
         },
     };
 
@@ -443,12 +511,15 @@ fn rate_limit_for_request(req: &KernelRequest) -> (&'static str, Option<u32>) {
 /// Return the max-per-minute rate limit for a request type, if any.
 fn rate_limit_max(req: &KernelRequest) -> Option<u32> {
     match req {
-        KernelRequest::ReloadCapsules => Some(5),
+        KernelRequest::ReloadCapsules
+        | KernelRequest::ReloadCapsule { .. }
+        | KernelRequest::UnloadCapsule { .. } => Some(5),
         KernelRequest::InstallCapsule { .. } | KernelRequest::ApproveCapability { .. } => Some(10),
         KernelRequest::Shutdown { .. } => Some(1),
         KernelRequest::ListCapsules
         | KernelRequest::GetCommands
         | KernelRequest::GetCapsuleMetadata
+        | KernelRequest::GetAgentReadiness
         | KernelRequest::GetStatus => None,
     }
 }
@@ -490,20 +561,29 @@ pub fn required_capability(req: &KernelRequest, scope: AuthorityScope) -> &'stat
     match (req, scope) {
         (KernelRequest::Shutdown { .. }, _) => "system:shutdown",
         (KernelRequest::GetStatus, _) => "system:status",
-        (KernelRequest::ReloadCapsules, AuthorityScope::Self_) => "self:capsule:reload",
-        (KernelRequest::ReloadCapsules, _) => "capsule:reload",
+        (
+            KernelRequest::ReloadCapsules | KernelRequest::ReloadCapsule { .. },
+            AuthorityScope::Self_,
+        ) => "self:capsule:reload",
+        (KernelRequest::ReloadCapsules | KernelRequest::ReloadCapsule { .. }, _) => {
+            "capsule:reload"
+        },
+        (KernelRequest::UnloadCapsule { .. }, AuthorityScope::Self_) => "self:capsule:remove",
+        (KernelRequest::UnloadCapsule { .. }, _) => "capsule:remove",
         (KernelRequest::InstallCapsule { .. }, AuthorityScope::Self_) => "self:capsule:install",
         (KernelRequest::InstallCapsule { .. }, _) => "capsule:install",
         (
             KernelRequest::ListCapsules
             | KernelRequest::GetCommands
-            | KernelRequest::GetCapsuleMetadata,
+            | KernelRequest::GetCapsuleMetadata
+            | KernelRequest::GetAgentReadiness,
             AuthorityScope::Self_,
         ) => "self:capsule:list",
         (
             KernelRequest::ListCapsules
             | KernelRequest::GetCommands
-            | KernelRequest::GetCapsuleMetadata,
+            | KernelRequest::GetCapsuleMetadata
+            | KernelRequest::GetAgentReadiness,
             _,
         ) => "capsule:list",
         (KernelRequest::ApproveCapability { .. }, _) => "self:approval:respond",
@@ -516,11 +596,14 @@ pub fn required_capability(req: &KernelRequest, scope: AuthorityScope) -> &'stat
 pub fn kernel_request_method(req: &KernelRequest) -> &'static str {
     match req {
         KernelRequest::ReloadCapsules => "ReloadCapsules",
+        KernelRequest::ReloadCapsule { .. } => "ReloadCapsule",
+        KernelRequest::UnloadCapsule { .. } => "UnloadCapsule",
         KernelRequest::InstallCapsule { .. } => "InstallCapsule",
         KernelRequest::ApproveCapability { .. } => "ApproveCapability",
         KernelRequest::ListCapsules => "ListCapsules",
         KernelRequest::GetCommands => "GetCommands",
         KernelRequest::GetCapsuleMetadata => "GetCapsuleMetadata",
+        KernelRequest::GetAgentReadiness => "GetAgentReadiness",
         KernelRequest::Shutdown { .. } => "Shutdown",
         KernelRequest::GetStatus => "GetStatus",
     }
@@ -540,6 +623,17 @@ fn resolve_caller(message: &IpcMessage) -> PrincipalId {
         .unwrap_or_default()
 }
 
+/// Resolve the authenticating device `key_id` from an incoming [`IpcMessage`].
+///
+/// Host-derived metadata stamped by the socket per-connection registry or the
+/// gateway-signed bearer (never a client-controlled field). `Some(key_id)`
+/// means the request authenticated with a specific registered device, whose
+/// scope the cap-gate applies as an attenuation floor; `None` means an
+/// unattenuated full-principal request (every legacy / unpaired connection).
+fn resolve_device_key_id(message: &IpcMessage) -> Option<String> {
+    message.device_key_id.clone()
+}
+
 /// Evaluate the capability check for `caller` against the kernel's
 /// resolved group config and the caller's profile.
 ///
@@ -550,6 +644,7 @@ fn resolve_caller(message: &IpcMessage) -> PrincipalId {
 fn authorize_request(
     kernel: &crate::Kernel,
     caller: &PrincipalId,
+    device_key_id: Option<&str>,
     required_cap: &str,
 ) -> Result<(), PermissionError> {
     let profile = match kernel.profile_cache.resolve(caller) {
@@ -585,7 +680,42 @@ fn authorize_request(
         });
     }
     let groups = kernel.groups.load_full();
-    let check = CapabilityCheck::new(profile.as_ref(), groups.as_ref(), caller.clone());
+
+    // Per-device scope attenuation. When the request authenticated with a
+    // specific registered device, the device's scope is applied as a floor on
+    // the principal's effective capabilities (deny wins, can only narrow).
+    //
+    // Fail-closed on an unresolved key_id: a request that names a device the
+    // principal no longer has (revoked / unknown) must NOT fall back to the
+    // principal's full authority — that would let a revoked device keep acting.
+    //
+    // The scope is cloned into a local so it outlives the borrow of `profile`
+    // for the `require` call below (a `DeviceScope` clone is cheap — at most a
+    // couple of small pattern vectors — and avoids fighting the borrow that
+    // `device_by_key_id` takes on `profile`).
+    let device_scope: Option<astrid_core::profile::DeviceScope> = if let Some(kid) = device_key_id {
+        let Some(dev) = profile.auth.device_by_key_id(kid) else {
+            warn!(
+                security_event = true,
+                principal = %caller,
+                key_id = %kid,
+                required = required_cap,
+                "device_key_id resolves to no registered key — fail-closed deny"
+            );
+            return Err(PermissionError::DeviceScopeDenied {
+                principal: caller.clone(),
+                required: required_cap.to_string(),
+            });
+        };
+        Some(dev.scope.clone())
+    } else {
+        None
+    };
+
+    let mut check = CapabilityCheck::new(profile.as_ref(), groups.as_ref(), caller.clone());
+    if let Some(scope) = &device_scope {
+        check = check.with_device_scope(scope);
+    }
     check.require(required_cap)
 }
 
@@ -598,6 +728,10 @@ pub(crate) struct AdminAuditEntry<'a> {
     pub method: &'a str,
     /// Capability string evaluated for this request.
     pub required_cap: &'a str,
+    /// The authenticating device `key_id` when the request was device-scoped,
+    /// so the audit row records which paired device acted. Non-secret (derived
+    /// from the public key); `None` for a full-authority request.
+    pub device_key_id: Option<&'a str>,
     /// `None` when the request operates on the caller's own principal
     /// (Layer 5) and `Some` when the request mutates another principal
     /// (Layer 6 admin topics like `admin.quota.set`).
@@ -633,6 +767,7 @@ fn record_admin_audit(kernel: &crate::Kernel, entry: AdminAuditEntry<'_>) {
         caller,
         method,
         required_cap,
+        device_key_id,
         target_principal,
         params,
         authorization,
@@ -643,6 +778,7 @@ fn record_admin_audit(kernel: &crate::Kernel, entry: AdminAuditEntry<'_>) {
         required_capability: required_cap.to_string(),
         target_principal: target_principal.clone(),
         params: params.clone(),
+        device_key_id: device_key_id.map(str::to_owned),
     };
     if let Err(e) = kernel.audit_log.append_with_principal(
         kernel.session_id.clone(),
@@ -671,6 +807,7 @@ fn record_admin_audit(kernel: &crate::Kernel, entry: AdminAuditEntry<'_>) {
         "method": method,
         "required_capability": required_cap,
         "principal": caller.to_string(),
+        "device_key_id": device_key_id,
         "target_principal": target_principal.as_ref().map(ToString::to_string),
         "params": params,
         "outcome": match &outcome {
@@ -687,250 +824,4 @@ fn record_admin_audit(kernel: &crate::Kernel, entry: AdminAuditEntry<'_>) {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn rate_limiter_allows_within_limit() {
-        let mut limiter = ManagementRateLimiter::new();
-        for _ in 0..5 {
-            assert!(limiter.check("ReloadCapsules", 5));
-        }
-        // 6th should be rejected
-        assert!(!limiter.check("ReloadCapsules", 5));
-    }
-
-    #[test]
-    fn rate_limiter_independent_buckets() {
-        let mut limiter = ManagementRateLimiter::new();
-        // Fill ReloadCapsules
-        for _ in 0..5 {
-            assert!(limiter.check("ReloadCapsules", 5));
-        }
-        assert!(!limiter.check("ReloadCapsules", 5));
-
-        // InstallCapsule should still be allowed
-        assert!(limiter.check("InstallCapsule", 10));
-    }
-
-    #[test]
-    fn rate_limiter_sliding_window_eviction() {
-        let mut limiter = ManagementRateLimiter::new();
-        // Fill the bucket
-        for _ in 0..5 {
-            assert!(limiter.check("ReloadCapsules", 5));
-        }
-        assert!(!limiter.check("ReloadCapsules", 5));
-
-        // Manually set all timestamps to 61 seconds ago to simulate expiry.
-        if let Some(timestamps) = limiter.buckets.get_mut("ReloadCapsules") {
-            let past = Instant::now() - std::time::Duration::from_secs(61);
-            for ts in timestamps.iter_mut() {
-                *ts = past;
-            }
-        }
-
-        // Should be allowed again after old entries are evicted
-        assert!(limiter.check("ReloadCapsules", 5));
-    }
-
-    #[test]
-    fn rate_limiter_sliding_window_prevents_boundary_burst() {
-        let mut limiter = ManagementRateLimiter::new();
-        // Fill 5 requests
-        for _ in 0..5 {
-            assert!(limiter.check("ReloadCapsules", 5));
-        }
-
-        // Move only 3 of the 5 timestamps to the past (beyond 60s window).
-        // This simulates partial window expiry - only 3 slots should free up.
-        if let Some(timestamps) = limiter.buckets.get_mut("ReloadCapsules") {
-            let past = Instant::now() - std::time::Duration::from_secs(61);
-            for ts in timestamps.iter_mut().take(3) {
-                *ts = past;
-            }
-        }
-
-        // Should allow exactly 3 more (the evicted slots), not 5
-        for _ in 0..3 {
-            assert!(limiter.check("ReloadCapsules", 5));
-        }
-        assert!(!limiter.check("ReloadCapsules", 5));
-    }
-
-    #[test]
-    fn rate_limit_for_request_returns_correct_limits() {
-        let (name, limit) = rate_limit_for_request(&KernelRequest::ReloadCapsules);
-        assert_eq!(name, "ReloadCapsules");
-        assert_eq!(limit, Some(5));
-
-        let (name, limit) = rate_limit_for_request(&KernelRequest::ListCapsules);
-        assert_eq!(name, "ListCapsules");
-        assert_eq!(limit, None);
-    }
-
-    // ── Capability mapping (issue #670) ──────────────────────────────
-
-    fn all_request_variants() -> Vec<KernelRequest> {
-        vec![
-            KernelRequest::Shutdown { reason: None },
-            KernelRequest::GetStatus,
-            KernelRequest::ReloadCapsules,
-            KernelRequest::InstallCapsule {
-                source: "x".to_string(),
-                workspace: false,
-            },
-            KernelRequest::ListCapsules,
-            KernelRequest::GetCommands,
-            KernelRequest::GetCapsuleMetadata,
-            KernelRequest::ApproveCapability {
-                request_id: "r".to_string(),
-                signature: "s".to_string(),
-            },
-        ]
-    }
-
-    #[test]
-    fn required_capability_every_variant_has_non_empty_mapping() {
-        for req in all_request_variants() {
-            let cap = required_capability(&req, AuthorityScope::Self_);
-            assert!(
-                !cap.is_empty(),
-                "required_capability returned empty for {req:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn required_capability_mapping_per_variant_self_scope() {
-        assert_eq!(
-            required_capability(
-                &KernelRequest::Shutdown { reason: None },
-                AuthorityScope::Self_
-            ),
-            "system:shutdown"
-        );
-        assert_eq!(
-            required_capability(&KernelRequest::GetStatus, AuthorityScope::Self_),
-            "system:status"
-        );
-        assert_eq!(
-            required_capability(&KernelRequest::ReloadCapsules, AuthorityScope::Self_),
-            "self:capsule:reload"
-        );
-        assert_eq!(
-            required_capability(
-                &KernelRequest::InstallCapsule {
-                    source: String::new(),
-                    workspace: false
-                },
-                AuthorityScope::Self_
-            ),
-            "self:capsule:install"
-        );
-        assert_eq!(
-            required_capability(&KernelRequest::ListCapsules, AuthorityScope::Self_),
-            "self:capsule:list"
-        );
-        assert_eq!(
-            required_capability(&KernelRequest::GetCommands, AuthorityScope::Self_),
-            "self:capsule:list"
-        );
-        assert_eq!(
-            required_capability(&KernelRequest::GetCapsuleMetadata, AuthorityScope::Self_),
-            "self:capsule:list"
-        );
-        assert_eq!(
-            required_capability(
-                &KernelRequest::ApproveCapability {
-                    request_id: String::new(),
-                    signature: String::new(),
-                },
-                AuthorityScope::Self_
-            ),
-            "self:approval:respond"
-        );
-    }
-
-    #[test]
-    fn required_capability_mapping_global_scope() {
-        // Global scope strips the `self:` prefix from capsule operations
-        // (Layer 6 will start using this when cross-agent variants land).
-        assert_eq!(
-            required_capability(&KernelRequest::ReloadCapsules, AuthorityScope::Global),
-            "capsule:reload"
-        );
-        assert_eq!(
-            required_capability(
-                &KernelRequest::InstallCapsule {
-                    source: String::new(),
-                    workspace: false
-                },
-                AuthorityScope::Global
-            ),
-            "capsule:install"
-        );
-        assert_eq!(
-            required_capability(&KernelRequest::ListCapsules, AuthorityScope::Global),
-            "capsule:list"
-        );
-        // system:* variants are scope-invariant.
-        assert_eq!(
-            required_capability(
-                &KernelRequest::Shutdown { reason: None },
-                AuthorityScope::Global
-            ),
-            "system:shutdown"
-        );
-    }
-
-    #[test]
-    fn resolve_scope_defaults_to_self() {
-        let caller = PrincipalId::new("alice").unwrap();
-        for req in all_request_variants() {
-            assert_eq!(
-                resolve_scope(&req, &caller),
-                AuthorityScope::Self_,
-                "scope should default to Self_ for today's variants"
-            );
-        }
-    }
-
-    // ── Caller resolution ────────────────────────────────────────────
-
-    #[test]
-    fn resolve_caller_uses_ipc_principal_when_present() {
-        let mut msg = IpcMessage::new(
-            "astrid.v1.request.system",
-            IpcPayload::RawJson(serde_json::json!({})),
-            uuid::Uuid::nil(),
-        );
-        msg.principal = Some("alice".to_string());
-        let caller = resolve_caller(&msg);
-        assert_eq!(caller.as_str(), "alice");
-    }
-
-    #[test]
-    fn resolve_caller_falls_back_to_default_when_missing() {
-        let msg = IpcMessage::new(
-            "astrid.v1.request.system",
-            IpcPayload::RawJson(serde_json::json!({})),
-            uuid::Uuid::nil(),
-        );
-        let caller = resolve_caller(&msg);
-        assert_eq!(caller, PrincipalId::default());
-    }
-
-    #[test]
-    fn resolve_caller_falls_back_to_default_on_invalid_principal() {
-        let mut msg = IpcMessage::new(
-            "astrid.v1.request.system",
-            IpcPayload::RawJson(serde_json::json!({})),
-            uuid::Uuid::nil(),
-        );
-        // Invalid principal chars → PrincipalId::new fails → fall back.
-        msg.principal = Some("alice@evil.example".to_string());
-        let caller = resolve_caller(&msg);
-        assert_eq!(caller, PrincipalId::default());
-    }
-}
+mod tests;

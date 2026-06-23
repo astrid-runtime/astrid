@@ -10,6 +10,7 @@ use std::time::Duration;
 use wasmtime::component::Resource;
 use wasmtime_wasi::p2::DynPollable;
 
+use super::client_lifecycle;
 use super::handshake::validate_handshake;
 #[cfg(unix)]
 use super::handshake::verify_peer_credentials;
@@ -31,7 +32,27 @@ impl HostUnixListener for HostState {
         let session_token = self.session_token.clone();
         let blocking_semaphore = self.blocking_semaphore.clone();
 
-        let stream = loop {
+        // Resolved once and reused for every accept iteration: where a claimed
+        // principal's profile/keys load from during the handshake challenge
+        // (issue #45/#852). Only resolved when a session token gates the
+        // handshake; an unauthenticated daemon never reaches
+        // `validate_handshake`, so `None` is fine there.
+        let astrid_home = if session_token.is_some() {
+            Some(
+                astrid_core::dirs::AstridHome::resolve()
+                    .map_err(|e| ErrorCode::Unknown(format!("cannot resolve astrid home: {e}")))?,
+            )
+        } else {
+            None
+        };
+
+        // The handshake yields `Some((principal, device_key_id))` for a
+        // crypto-authenticated connection — the device id rides forward so the
+        // cap-gate can scope it — or `None` for a legacy/unauthenticated peer.
+        let (stream, verified_identity): (
+            _,
+            Option<(astrid_core::principal::PrincipalId, String)>,
+        ) = loop {
             let accept_result = util::bounded_block_on_cancellable(
                 &rt_handle,
                 &blocking_semaphore,
@@ -71,16 +92,16 @@ impl HostUnixListener for HostState {
             }
 
             let mut stream = stream;
-            if let Some(ref token) = session_token {
+            if let (Some(token), Some(home)) = (&session_token, &astrid_home) {
                 let handshake_result = util::bounded_block_on_cancellable(
                     &rt_handle,
                     &blocking_semaphore,
                     &cancel_token,
-                    validate_handshake(&mut stream, token),
+                    validate_handshake(&mut stream, token, home),
                 );
                 match handshake_result {
                     None => return Err(ErrorCode::Closed),
-                    Some(Ok(())) => break stream,
+                    Some(Ok(identity)) => break (stream, identity),
                     Some(Err(reason)) => {
                         tracing::warn!(
                             security_event = true,
@@ -92,7 +113,7 @@ impl HostUnixListener for HostState {
                     },
                 }
             } else {
-                break stream;
+                break (stream, None);
             }
         };
 
@@ -107,7 +128,29 @@ impl HostUnixListener for HostState {
             .push(net_stream)
             .map_err(|e| ErrorCode::Unknown(format!("resource table: {e}")))?;
         self.net_stream_count += 1;
-        let result: Result<Resource<TcpStream>, ErrorCode> = Ok(Resource::new_own(res.rep()));
+        let rep = res.rep();
+        // Record the verified principal AND its authenticating device key_id
+        // (issue #45/#852) keyed by the stream resource rep, now that the rep
+        // is known. Storage only; enforcement reads this registry separately —
+        // the framed read copies both onto the in-flight ingress fields so
+        // `publish-as` stamps the device id for cap-gate scoping. The binding
+        // is removed when the stream resource drops (see `TcpStream::drop`).
+        let verified_principal = verified_identity.as_ref().map(|(p, _)| p.clone());
+        if let Some((principal, key_id)) = verified_identity {
+            self.bind_connection_principal(rep, principal, Some(key_id));
+        }
+        // Emit `client.v1.connect` for the kernel connection tracker, stamped
+        // with the host-verified principal — `anonymous` for a legacy /
+        // unauthenticated peer so connect/disconnect balance on one identity.
+        // The matching disconnect fires from the stream-resource drop path
+        // (see `TcpStream::drop`). Inbound-only: outbound TCP never reaches
+        // here, so a capsule-dialed socket never moves the counter.
+        client_lifecycle::register_and_emit_connect(
+            self,
+            rep,
+            verified_principal.unwrap_or_else(astrid_core::principal::PrincipalId::anonymous),
+        );
+        let result: Result<Resource<TcpStream>, ErrorCode> = Ok(Resource::new_own(rep));
         audit_net(self, "astrid:net/host.unix-listener.accept", 0, &result);
         result
     }
@@ -157,12 +200,26 @@ impl HostUnixListener for HostState {
         }
 
         let mut stream = stream;
+        let mut verified_identity: Option<(astrid_core::principal::PrincipalId, String)> = None;
         if let Some(ref token) = session_token {
+            // See `accept` for why home is resolved here (issue #45/#852).
+            let home = match astrid_core::dirs::AstridHome::resolve() {
+                Ok(h) => h,
+                Err(e) => {
+                    tracing::warn!(
+                        security_event = true,
+                        error = %e,
+                        "rejected unix poll_accept: cannot resolve astrid home"
+                    );
+                    drop(stream);
+                    return Ok(None);
+                },
+            };
             let handshake_result = util::bounded_block_on_cancellable(
                 &rt_handle,
                 &blocking_semaphore,
                 &cancel_token,
-                validate_handshake(&mut stream, token),
+                validate_handshake(&mut stream, token, &home),
             );
             match handshake_result {
                 None => return Ok(None),
@@ -175,7 +232,7 @@ impl HostUnixListener for HostState {
                     drop(stream);
                     return Ok(None);
                 },
-                Some(Ok(())) => {},
+                Some(Ok(identity)) => verified_identity = identity,
             }
         }
 
@@ -190,7 +247,21 @@ impl HostUnixListener for HostState {
             .push(net_stream)
             .map_err(|e| ErrorCode::Unknown(format!("resource table: {e}")))?;
         self.net_stream_count += 1;
-        Ok(Some(Resource::new_own(res.rep())))
+        let rep = res.rep();
+        // Same per-connection principal + device-key binding as `accept`
+        // (issue #45/#852).
+        let verified_principal = verified_identity.as_ref().map(|(p, _)| p.clone());
+        if let Some((principal, key_id)) = verified_identity {
+            self.bind_connection_principal(rep, principal, Some(key_id));
+        }
+        // Same `client.v1.connect` emission as `accept` — see there for the
+        // anonymous-fallback and inbound-only rationale.
+        client_lifecycle::register_and_emit_connect(
+            self,
+            rep,
+            verified_principal.unwrap_or_else(astrid_core::principal::PrincipalId::anonymous),
+        );
+        Ok(Some(Resource::new_own(rep)))
     }
 
     fn subscribe_readiness(&mut self, _self_: Resource<UnixListener>) -> Resource<DynPollable> {

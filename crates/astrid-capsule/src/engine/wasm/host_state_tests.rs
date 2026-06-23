@@ -443,3 +443,54 @@ fn install_recv_invocation_context_resolves_invoking_principal_profile() {
         "owner-principal recv must apply the owner's configured profile, not the default or alice's"
     );
 }
+
+#[test]
+fn connection_principal_registry_round_trip() {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap();
+    let state = minimal_host_state(rt.handle().clone());
+
+    let rep = 42u32;
+    let alice = astrid_core::PrincipalId::new("alice").expect("valid principal");
+
+    // Unset → None.
+    assert_eq!(state.connection_principal(rep), None);
+
+    // Bind → reads back the same principal AND the authenticating device id is
+    // stored alongside it as one unit (no desync).
+    state.bind_connection_principal(rep, alice.clone(), Some("dev-alice".to_string()));
+    assert_eq!(state.connection_principal(rep), Some(alice.clone()));
+    assert_eq!(
+        state
+            .connection_principals
+            .get(&rep)
+            .and_then(|e| e.device_key_id.clone())
+            .as_deref(),
+        Some("dev-alice"),
+        "the device key_id must be stored alongside the principal"
+    );
+
+    // A different rep is independent.
+    assert_eq!(state.connection_principal(rep.wrapping_add(1)), None);
+
+    // Rebinding the same rep overwrites both principal and device id. A binding
+    // with no specific device (peer-cred path) carries `None`.
+    let bob = astrid_core::PrincipalId::new("bob").expect("valid principal");
+    state.bind_connection_principal(rep, bob.clone(), None);
+    assert_eq!(state.connection_principal(rep), Some(bob));
+    assert_eq!(
+        state
+            .connection_principals
+            .get(&rep)
+            .and_then(|e| e.device_key_id.clone()),
+        None,
+        "rebinding without a device must clear the prior device id"
+    );
+
+    // Unbind → back to None, idempotent on a second unbind.
+    state.unbind_connection_principal(rep);
+    assert_eq!(state.connection_principal(rep), None);
+    state.unbind_connection_principal(rep);
+    assert_eq!(state.connection_principal(rep), None);
+}

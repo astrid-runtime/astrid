@@ -361,6 +361,22 @@ pub const CAPABILITY_CATALOG: &[CapabilityInfo] = {
             danger: Normal,
         },
         CapabilityInfo {
+            id: "capsule:remove",
+            label: "Remove capsules",
+            description: "Remove an installed capsule from the system-wide capsule directory and unload it from the running daemon. Affects every principal on the host; reversible by reinstalling.",
+            category: Capsule,
+            scope: Global,
+            danger: Elevated,
+        },
+        CapabilityInfo {
+            id: "self:capsule:remove",
+            label: "Remove capsules (self)",
+            description: "Self-scoped variant of capsule:remove.",
+            category: Capsule,
+            scope: Self_,
+            danger: Normal,
+        },
+        CapabilityInfo {
             id: "capsule:list",
             label: "List all capsules",
             description: "Enumerate every capsule installed on the host, including manifest metadata.",
@@ -524,6 +540,30 @@ pub const CAPABILITY_CATALOG: &[CapabilityInfo] = {
             scope: Global,
             danger: Elevated,
         },
+        CapabilityInfo {
+            id: "caps:token:mint",
+            label: "Mint capability tokens",
+            description: "Mint a signed capability token pre-granting a principal access to a resource (e.g. `mcp://server:tool`), bypassing per-use approval. An escalation primitive — anyone with this can pre-authorize tool access.",
+            category: Caps,
+            scope: Global,
+            danger: Extreme,
+        },
+        CapabilityInfo {
+            id: "caps:token:revoke",
+            label: "Revoke capability tokens",
+            description: "Revoke a previously minted capability token by id. Revocation is global and final — the token no longer authorizes for any principal.",
+            category: Caps,
+            scope: Global,
+            danger: Elevated,
+        },
+        CapabilityInfo {
+            id: "caps:token:list",
+            label: "List capability tokens",
+            description: "List the non-revoked, non-expired capability tokens minted for a principal.",
+            category: Caps,
+            scope: Global,
+            danger: Safe,
+        },
         // ── Invites ──
         CapabilityInfo {
             id: "invite:issue",
@@ -585,12 +625,28 @@ pub const CAPABILITY_CATALOG: &[CapabilityInfo] = {
             danger: Normal,
         },
         CapabilityInfo {
+            id: "self:auth:pair:admin",
+            label: "Pair a full-scope device",
+            description: "Mint a FULL-scope (unattenuated) pair-device token; a scoped device cannot. A device paired without this capability is restricted to a capability scope that can never widen the principal's effective permissions, so this gates the ability to add a device that acts with the principal's full authority.",
+            category: Approval,
+            scope: Self_,
+            danger: Elevated,
+        },
+        CapabilityInfo {
             id: "auth:pair:redeem",
             label: "Redeem pair-device tokens (no-op grant)",
             description: "Capability name preserved for completeness — the kernel bypasses the cap check on pair-device redemption because the token itself is the auth. Granting this to anyone is a no-op.",
             category: Approval,
             scope: Global,
             danger: Normal,
+        },
+        CapabilityInfo {
+            id: "auth:pair",
+            label: "Manage any principal's paired devices",
+            description: "List and revoke the paired devices (registered ed25519 keys) of ANY principal. The self form, self:auth:pair, lets a principal manage its own devices; this global form is the admin-tier sibling for operating on another principal's device fleet. Conferred by the admin group's universal grant.",
+            category: Approval,
+            scope: Global,
+            danger: Elevated,
         },
     ]
 };
@@ -619,7 +675,7 @@ pub fn known_capabilities_list() -> &'static [&'static str] {
 /// in the same commit that adds a new capability so a kernel
 /// addition without updating the catalog fails the consuming
 /// crate's tests.
-pub const KNOWN_CAPABILITIES_COUNT: usize = 34;
+pub const KNOWN_CAPABILITIES_COUNT: usize = 41;
 
 const _: () = assert!(
     CAPABILITY_CATALOG.len() == KNOWN_CAPABILITIES_COUNT,

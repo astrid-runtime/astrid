@@ -85,6 +85,11 @@ pub struct AuditEntryView {
     pub required_capability: Option<String>,
     /// Principal that acted (the caller).
     pub principal: Option<String>,
+    /// The authenticating device `key_id` when the request was device-scoped.
+    /// `None` for a full-authority request. Non-secret (derived from the
+    /// device's public key); lets an auditor see which paired device acted.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub device_key_id: Option<String>,
     /// Principal the action was scoped to, when distinct from the
     /// caller. `None` for self-targeted ops.
     pub target_principal: Option<String>,
@@ -154,7 +159,13 @@ pub async fn get_audit(
     // Cap-gate: admin / `audit:read_all` callers get the firehose;
     // everyone else is silently scoped to their own principal,
     // matching the SSE handler's posture.
-    let firehose = super::events::caller_holds(&state, &caller_principal, AUDIT_FIREHOSE_CAP).await;
+    let firehose = super::events::caller_holds(
+        &state,
+        &caller_principal,
+        caller.device_key_id.as_deref(),
+        AUDIT_FIREHOSE_CAP,
+    )
+    .await;
 
     // Pull the full session slice from the audit log. The audit log
     // doesn't expose an "after cursor" query primitive today, so we
@@ -330,6 +341,7 @@ fn render_entry(entry: &AuditEntry) -> Option<AuditEntryView> {
         required_capability,
         target_principal,
         params,
+        device_key_id,
     } = &entry.action
     else {
         return None;
@@ -343,6 +355,7 @@ fn render_entry(entry: &AuditEntry) -> Option<AuditEntryView> {
         method: Some(method.clone()),
         required_capability: Some(required_capability.clone()),
         principal: entry.principal.as_ref().map(ToString::to_string),
+        device_key_id: device_key_id.clone(),
         target_principal: target_principal.as_ref().map(ToString::to_string),
         params: params.clone(),
         outcome,
@@ -363,6 +376,7 @@ mod tests {
             required_capability: "*".into(),
             target_principal: target.map(|s| PrincipalId::new(s).unwrap()),
             params: None,
+            device_key_id: None,
         }
     }
 

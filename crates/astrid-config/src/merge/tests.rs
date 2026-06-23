@@ -113,32 +113,6 @@ fn test_enforce_restrictions_budget_clamp() {
     assert!((budget["per_action_max_usd"].as_float().unwrap() - 5.0).abs() < f64::EPSILON);
 }
 
-#[test]
-fn test_enforce_restrictions_bool_only_true() {
-    let baseline: toml::Value = toml::from_str(
-        r"
-        [security.policy]
-        require_approval_for_delete = true
-    ",
-    )
-    .unwrap();
-
-    let workspace: toml::Value = toml::from_str(
-        r"
-        [security.policy]
-        require_approval_for_delete = false
-    ",
-    )
-    .unwrap();
-
-    let mut merged = baseline.clone();
-    deep_merge(&mut merged, &workspace);
-    enforce_restrictions(&mut merged, &baseline, &workspace);
-
-    let policy = merged["security"]["policy"].as_table().unwrap();
-    assert!(policy["require_approval_for_delete"].as_bool().unwrap());
-}
-
 // ---- Step 2: Restrictions work without user config ----
 
 #[test]
@@ -165,37 +139,6 @@ fn test_restrictions_work_without_user_config() {
     enforce_restrictions(&mut merged, &baseline, &workspace);
 
     assert!((merged["budget"]["session_max_usd"].as_float().unwrap() - 100.0).abs() < f64::EPSILON);
-}
-
-#[test]
-fn test_blocked_tools_union_works_without_user_config() {
-    let baseline: toml::Value = toml::from_str(
-        r#"
-        [security.policy]
-        blocked_tools = ["sudo", "rm -rf /"]
-    "#,
-    )
-    .unwrap();
-
-    // Workspace tries to remove "sudo".
-    let workspace: toml::Value = toml::from_str(
-        r#"
-        [security.policy]
-        blocked_tools = ["rm -rf /"]
-    "#,
-    )
-    .unwrap();
-
-    let mut merged = baseline.clone();
-    deep_merge(&mut merged, &workspace);
-    enforce_restrictions(&mut merged, &baseline, &workspace);
-
-    let blocked = merged["security"]["policy"]["blocked_tools"]
-        .as_array()
-        .unwrap();
-    let blocked_strs: Vec<&str> = blocked.iter().filter_map(|v| v.as_str()).collect();
-    assert!(blocked_strs.contains(&"sudo"));
-    assert!(blocked_strs.contains(&"rm -rf /"));
 }
 
 // ---- Step 3: Mode tighten ----
@@ -388,94 +331,6 @@ fn test_approval_timeout_cannot_increase() {
             .unwrap(),
         300
     );
-}
-
-#[test]
-fn test_approval_required_tools_union() {
-    let baseline: toml::Value = toml::from_str(
-        r#"
-        [security.policy]
-        approval_required_tools = ["delete", "exec"]
-    "#,
-    )
-    .unwrap();
-
-    let workspace: toml::Value = toml::from_str(
-        r#"
-        [security.policy]
-        approval_required_tools = ["exec"]
-    "#,
-    )
-    .unwrap();
-
-    let mut merged = baseline.clone();
-    deep_merge(&mut merged, &workspace);
-    enforce_restrictions(&mut merged, &baseline, &workspace);
-
-    let arr = merged["security"]["policy"]["approval_required_tools"]
-        .as_array()
-        .unwrap();
-    let strs: Vec<&str> = arr.iter().filter_map(|v| v.as_str()).collect();
-    assert!(strs.contains(&"delete"));
-    assert!(strs.contains(&"exec"));
-}
-
-#[test]
-fn test_allowed_paths_cannot_expand() {
-    let baseline: toml::Value = toml::from_str(
-        r#"
-        [security.policy]
-        allowed_paths = ["/home/user"]
-    "#,
-    )
-    .unwrap();
-
-    let workspace: toml::Value = toml::from_str(
-        r#"
-        [security.policy]
-        allowed_paths = ["/home/user", "/etc/secrets"]
-    "#,
-    )
-    .unwrap();
-
-    let mut merged = baseline.clone();
-    deep_merge(&mut merged, &workspace);
-    enforce_restrictions(&mut merged, &baseline, &workspace);
-
-    let arr = merged["security"]["policy"]["allowed_paths"]
-        .as_array()
-        .unwrap();
-    let strs: Vec<&str> = arr.iter().filter_map(|v| v.as_str()).collect();
-    assert!(strs.contains(&"/home/user"));
-    assert!(!strs.contains(&"/etc/secrets"));
-}
-
-#[test]
-fn test_allowed_hosts_cannot_expand() {
-    let baseline: toml::Value = toml::from_str(
-        r"
-        [security.policy]
-        allowed_hosts = []
-    ",
-    )
-    .unwrap();
-
-    let workspace: toml::Value = toml::from_str(
-        r#"
-        [security.policy]
-        allowed_hosts = ["evil.com"]
-    "#,
-    )
-    .unwrap();
-
-    let mut merged = baseline.clone();
-    deep_merge(&mut merged, &workspace);
-    enforce_restrictions(&mut merged, &baseline, &workspace);
-
-    let arr = merged["security"]["policy"]["allowed_hosts"]
-        .as_array()
-        .unwrap();
-    assert!(arr.is_empty());
 }
 
 #[test]

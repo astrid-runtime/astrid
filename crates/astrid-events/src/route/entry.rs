@@ -412,6 +412,49 @@ impl RouteEntry {
         served
     }
 
+    /// Pop a SINGLE event in round-robin principal order, with the same
+    /// rotation/eviction bookkeeping as [`drr_drain`](Self::drr_drain).
+    ///
+    /// This is the receive fast-path: the caller wants one event now and
+    /// collects the remainder via `drr_drain`/`try_drain`. Draining a whole
+    /// batch here and returning only its first element would DISCARD (lose)
+    /// the rest of the batch — they are already removed from the queue but
+    /// never handed back. Serving exactly one event makes the fast path
+    /// loss-free no matter how many events are queued (e.g. a fan-out burst
+    /// where every responder replies at once).
+    pub(crate) fn drr_pop_one(&mut self) -> Option<Arc<AstridEvent>> {
+        let visit = self.principal_order.len();
+        for _ in 0..visit {
+            let Some(key) = self.principal_order.pop_front() else {
+                break;
+            };
+            let Some(bucket) = self.fanout.get_mut(&key) else {
+                continue;
+            };
+            if let Some(msg) = bucket.queue.pop_front() {
+                let sz = ipc_size_of(&msg);
+                bucket.bytes = bucket.bytes.saturating_sub(sz);
+                self.total_bytes = self.total_bytes.saturating_sub(sz);
+                bucket.head_enqueued_at = if bucket.queue.is_empty() {
+                    None
+                } else {
+                    Some(Instant::now())
+                };
+                if bucket.queue.is_empty() {
+                    self.fanout.remove(&key);
+                } else {
+                    // Rotate the served principal to the back so the next
+                    // single-pop serves a different bucket (round-robin).
+                    self.principal_order.push_back(key);
+                }
+                return Some(msg);
+            }
+            // Empty bucket — drop it from the rotation.
+            self.fanout.remove(&key);
+        }
+        None
+    }
+
     /// Number of distinct active principal buckets.
     pub(crate) fn active_principals(&self) -> usize {
         self.fanout.len()
@@ -476,6 +519,58 @@ mod tests {
         assert_eq!(out.len(), 3);
         assert_eq!(entry.fanout.len(), 0);
         assert_eq!(entry.total_bytes, 0);
+    }
+
+    #[test]
+    fn pop_one_takes_exactly_one_and_keeps_the_rest() {
+        // Regression: the receive fast-path takes ONE event and leaves the rest
+        // for `try_drain`/`drr_drain`. The old fast-path drained the whole batch
+        // and returned only its first element, silently discarding (losing) the
+        // remainder — so a fan-out burst lost all-but-one per recv.
+        let mut entry = RouteEntry::new(TopicMatcher::new("t.*"), "capsule-a".into(), None);
+        for _ in 0..3 {
+            entry.push_with_eviction(
+                ipc("t.x", Some("alice")),
+                Some("alice".into()),
+                MAX_SUBSCRIPTION_BUDGET_BYTES,
+            );
+        }
+        // One pop yields exactly one event...
+        assert!(entry.drr_pop_one().is_some());
+        // ...and the other two are STILL queued — not discarded.
+        let mut out = Vec::new();
+        entry.drr_drain(&mut out, MAX_SUBSCRIPTION_BUDGET_BYTES);
+        assert_eq!(
+            out.len(),
+            2,
+            "the two un-popped events must remain, not be lost"
+        );
+        assert_eq!(entry.total_bytes, 0);
+        assert_eq!(entry.fanout.len(), 0);
+    }
+
+    #[test]
+    fn pop_one_serves_each_principal_without_loss() {
+        let mut entry = RouteEntry::new(TopicMatcher::new("t.*"), "capsule-a".into(), None);
+        entry.push_with_eviction(
+            ipc("t.x", Some("alice")),
+            Some("alice".into()),
+            MAX_SUBSCRIPTION_BUDGET_BYTES,
+        );
+        entry.push_with_eviction(
+            ipc("t.x", Some("bob")),
+            Some("bob".into()),
+            MAX_SUBSCRIPTION_BUDGET_BYTES,
+        );
+        // Two single-pops serve both queued events (round-robin), losing nothing.
+        assert!(entry.drr_pop_one().is_some());
+        assert!(entry.drr_pop_one().is_some());
+        assert!(
+            entry.drr_pop_one().is_none(),
+            "only two events were queued; the third pop must be empty"
+        );
+        assert_eq!(entry.total_bytes, 0);
+        assert_eq!(entry.fanout.len(), 0);
     }
 
     #[test]

@@ -7,9 +7,9 @@
 use crate::capability_grammar::validate_capability;
 
 use super::{
-    AuthConfig, BACKGROUND_PROCESSES_UPPER_BOUND, CURRENT_PROFILE_VERSION, MAX_GROUP_NAME_LEN,
-    NetworkConfig, PrincipalProfile, ProcessConfig, ProfileError, ProfileResult, Quotas,
-    TIMEOUT_SECS_UPPER_BOUND,
+    AuthConfig, BACKGROUND_PROCESSES_UPPER_BOUND, CURRENT_PROFILE_VERSION, MAX_CAPSULE_GRANT_LEN,
+    MAX_GROUP_NAME_LEN, NetworkConfig, PrincipalProfile, ProcessConfig, ProfileError,
+    ProfileResult, Quotas, TIMEOUT_SECS_UPPER_BOUND,
 };
 
 impl PrincipalProfile {
@@ -40,6 +40,9 @@ impl PrincipalProfile {
             validate_capability(cap).map_err(|e| {
                 ProfileError::Invalid(format!("revokes entry {cap:?} rejected: {e}"))
             })?;
+        }
+        for capsule in &self.capsules {
+            validate_capsule_grant(capsule)?;
         }
         self.network.validate()?;
         self.process.validate()?;
@@ -93,22 +96,67 @@ impl Quotas {
 }
 
 impl AuthConfig {
-    /// Validate public keys. Method variants are enforced by serde via the
-    /// closed [`AuthMethod`](super::AuthMethod) enum.
+    /// Validate registered device keys. Method variants are enforced by serde
+    /// via the closed [`AuthMethod`](super::AuthMethod) enum.
+    ///
+    /// Each [`DeviceKey`](super::DeviceKey) must carry a non-empty, 64-char
+    /// lowercase-hex pubkey and a non-empty `key_id`. For a
+    /// [`DeviceScope::Scoped`](super::DeviceScope::Scoped) device, every
+    /// `allow`/`deny` pattern must be a syntactically valid capability string
+    /// (same grammar as grants/revokes), so an attacker-crafted profile can't
+    /// smuggle a shell-metachar or double-glob through the device scope and
+    /// have it reach the matcher.
     ///
     /// # Errors
     ///
-    /// Returns [`ProfileError::Invalid`] if any public key is empty.
+    /// Returns [`ProfileError::Invalid`] on the first failing rule.
     pub fn validate(&self) -> ProfileResult<()> {
         for key in &self.public_keys {
-            if key.is_empty() {
-                return Err(ProfileError::Invalid(
-                    "auth.public_keys entries must be non-empty".into(),
-                ));
-            }
+            validate_device_key(key)?;
         }
         Ok(())
     }
+}
+
+/// Validate a single registered device key (pubkey shape + `key_id` presence +
+/// scope-pattern grammar). Fail-closed: the first failing rule errors.
+fn validate_device_key(key: &super::DeviceKey) -> ProfileResult<()> {
+    use super::DeviceScope;
+
+    if key.pubkey.is_empty() {
+        return Err(ProfileError::Invalid(
+            "auth.public_keys: device pubkey must be non-empty".into(),
+        ));
+    }
+    if key.pubkey.len() != 64 || !key.pubkey.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(ProfileError::Invalid(format!(
+            "auth.public_keys: device pubkey must be 64 hex chars, got {:?}",
+            key.pubkey
+        )));
+    }
+    // Canonical form is lowercase; an uppercase entry means an un-normalised
+    // key reached storage, which would defeat the deterministic key_id /
+    // dedup-by-pubkey contract.
+    if key.pubkey.chars().any(|c| c.is_ascii_uppercase()) {
+        return Err(ProfileError::Invalid(
+            "auth.public_keys: device pubkey must be lowercase hex".into(),
+        ));
+    }
+    if key.key_id.is_empty() {
+        return Err(ProfileError::Invalid(
+            "auth.public_keys: device key_id must be non-empty".into(),
+        ));
+    }
+    if let DeviceScope::Scoped { allow, deny } = &key.scope {
+        for pattern in allow.iter().chain(deny.iter()) {
+            validate_capability(pattern).map_err(|e| {
+                ProfileError::Invalid(format!(
+                    "auth.public_keys: device scope pattern {pattern:?} rejected: {e}"
+                ))
+            })?;
+        }
+    }
+    Ok(())
 }
 
 impl NetworkConfig {
@@ -147,6 +195,38 @@ impl ProcessConfig {
         }
         Ok(())
     }
+}
+
+/// Validate a single capsule-grant entry against the same character set a
+/// `CapsuleId` enforces — non-empty, lowercase alphanumeric and hyphens
+/// only — plus a defensive length cap of [`MAX_CAPSULE_GRANT_LEN`].
+///
+/// The length cap is the profile's own sanity bound on operator-supplied
+/// input, NOT a mirror of `CapsuleId`: `astrid_capsule::CapsuleId::validate`
+/// caps the charset but imposes no length limit. A grant entry that cannot
+/// name a real capsule is rejected on load — fail-closed: a malformed grant
+/// never silently widens (or, by failing the whole profile, narrows) access
+/// in a way the operator did not intend.
+fn validate_capsule_grant(id: &str) -> ProfileResult<()> {
+    if id.is_empty() {
+        return Err(ProfileError::Invalid(
+            "capsules entries must be non-empty".into(),
+        ));
+    }
+    if id.len() > MAX_CAPSULE_GRANT_LEN {
+        return Err(ProfileError::Invalid(format!(
+            "capsules entry exceeds {MAX_CAPSULE_GRANT_LEN} characters: {id:?}",
+        )));
+    }
+    if let Some(bad) = id
+        .chars()
+        .find(|c| !c.is_ascii_lowercase() && !c.is_ascii_digit() && *c != '-')
+    {
+        return Err(ProfileError::Invalid(format!(
+            "capsules entry {id:?} contains invalid character {bad:?} (allowed: a-z, 0-9, -)",
+        )));
+    }
+    Ok(())
 }
 
 /// Same character set + length cap as [`PrincipalId`](crate::PrincipalId):
@@ -254,9 +334,92 @@ mod tests {
     }
 
     #[test]
-    fn rejects_empty_public_key() {
+    fn accepts_full_scope_device_key() {
+        use super::super::{DeviceKey, DeviceScope};
         let mut p = PrincipalProfile::default();
-        p.auth.public_keys = vec![String::new()];
+        p.auth.public_keys = vec![DeviceKey::new("a".repeat(64), DeviceScope::Full, None, 0)];
+        p.validate().unwrap();
+    }
+
+    #[test]
+    fn accepts_scoped_device_key_with_valid_patterns() {
+        use super::super::{DeviceKey, DeviceScope};
+        let mut p = PrincipalProfile::default();
+        p.auth.public_keys = vec![DeviceKey::new(
+            "b".repeat(64),
+            DeviceScope::Scoped {
+                allow: vec!["self:*".into()],
+                deny: vec!["self:auth:pair".into()],
+            },
+            Some("laptop".into()),
+            0,
+        )];
+        p.validate().unwrap();
+    }
+
+    #[test]
+    fn rejects_device_key_with_bad_pubkey_len() {
+        use super::super::{DeviceKey, DeviceScope};
+        let mut p = PrincipalProfile::default();
+        // Construct directly so the bad pubkey bypasses the deserialize-time
+        // validation and reaches the profile validator.
+        p.auth.public_keys = vec![DeviceKey {
+            key_id: "deadbeef".into(),
+            pubkey: "abc".into(),
+            scope: DeviceScope::Full,
+            label: None,
+            created_at: 0,
+        }];
+        assert!(matches!(p.validate(), Err(ProfileError::Invalid(_))));
+    }
+
+    #[test]
+    fn rejects_device_key_with_empty_key_id() {
+        use super::super::{DeviceKey, DeviceScope};
+        let mut p = PrincipalProfile::default();
+        p.auth.public_keys = vec![DeviceKey {
+            key_id: String::new(),
+            pubkey: "a".repeat(64),
+            scope: DeviceScope::Full,
+            label: None,
+            created_at: 0,
+        }];
+        assert!(matches!(p.validate(), Err(ProfileError::Invalid(_))));
+    }
+
+    #[test]
+    fn rejects_device_scope_pattern_with_shell_metachar() {
+        use super::super::{DeviceKey, DeviceScope};
+        let mut p = PrincipalProfile::default();
+        p.auth.public_keys = vec![DeviceKey::new(
+            "c".repeat(64),
+            DeviceScope::Scoped {
+                allow: vec!["self:shutdown;rm".into()],
+                deny: vec![],
+            },
+            None,
+            0,
+        )];
+        let err = p.validate().unwrap_err();
+        match err {
+            ProfileError::Invalid(msg) => {
+                assert!(msg.contains("device scope pattern"), "msg: {msg}");
+            },
+            other => panic!("expected Invalid, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_device_pubkey_uppercase() {
+        use super::super::{DeviceKey, DeviceScope};
+        let mut p = PrincipalProfile::default();
+        p.auth.public_keys = vec![DeviceKey {
+            key_id: "deadbeef".into(),
+            pubkey: "A".repeat(64),
+            scope: DeviceScope::Full,
+            label: None,
+            created_at: 0,
+        }];
         assert!(matches!(p.validate(), Err(ProfileError::Invalid(_))));
     }
 
@@ -293,6 +456,49 @@ mod tests {
     fn rejects_group_too_long() {
         let mut p = PrincipalProfile::default();
         p.groups = vec!["a".repeat(MAX_GROUP_NAME_LEN + 1)];
+        assert!(matches!(p.validate(), Err(ProfileError::Invalid(_))));
+    }
+
+    // ── Capsule grants ────────────────────────────────────────────────
+
+    #[test]
+    fn accepts_valid_capsule_grants() {
+        let mut p = PrincipalProfile::default();
+        p.capsules = vec![
+            "identity".into(),
+            "registry".into(),
+            "context-engine".into(),
+            "openai-compat".into(),
+            "a".repeat(MAX_CAPSULE_GRANT_LEN),
+        ];
+        p.validate().unwrap();
+    }
+
+    #[test]
+    fn rejects_empty_capsule_grant() {
+        let mut p = PrincipalProfile::default();
+        p.capsules = vec![String::new()];
+        assert!(matches!(p.validate(), Err(ProfileError::Invalid(_))));
+    }
+
+    #[test]
+    fn rejects_capsule_grant_with_uppercase() {
+        let mut p = PrincipalProfile::default();
+        p.capsules = vec!["Identity".into()];
+        assert!(matches!(p.validate(), Err(ProfileError::Invalid(_))));
+    }
+
+    #[test]
+    fn rejects_capsule_grant_with_bad_char() {
+        let mut p = PrincipalProfile::default();
+        p.capsules = vec!["ident_ity".into()];
+        assert!(matches!(p.validate(), Err(ProfileError::Invalid(_))));
+    }
+
+    #[test]
+    fn rejects_capsule_grant_too_long() {
+        let mut p = PrincipalProfile::default();
+        p.capsules = vec!["a".repeat(MAX_CAPSULE_GRANT_LEN + 1)];
         assert!(matches!(p.validate(), Err(ProfileError::Invalid(_))));
     }
 

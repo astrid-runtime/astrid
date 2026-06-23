@@ -59,6 +59,37 @@ impl PrincipalId {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+
+    /// The reserved, no-capability identity stamped on an unauthenticated
+    /// (unbound) socket connection (issue #45/#852). It has no profile, so a
+    /// capability check fails closed — an unauthenticated client can never act
+    /// as a privileged principal. `agent create` refuses this name, so it can
+    /// never be granted capabilities.
+    #[must_use]
+    pub fn anonymous() -> Self {
+        Self("anonymous".to_string())
+    }
+
+    /// If this is a reserved principal that must not be created through the
+    /// admin surface, the human-readable reason; otherwise `None`. `default` is
+    /// the single-tenant bootstrap anchor; `anonymous` is the no-capability
+    /// identity stamped on unauthenticated connections (issue #45/#852) — both
+    /// must never become real, grantable profiles.
+    #[must_use]
+    pub fn reserved_reason(&self) -> Option<&'static str> {
+        match self.0.as_str() {
+            "default" => Some("reserved for single-tenant bootstrap"),
+            "anonymous" => Some("reserved (the unauthenticated no-capability identity)"),
+            _ => None,
+        }
+    }
+
+    /// Consume the id and return the owned inner string, moving it out without
+    /// re-allocating (unlike `to_string()`, which copies).
+    #[must_use]
+    pub fn into_inner(self) -> String {
+        self.0
+    }
 }
 
 impl Default for PrincipalId {

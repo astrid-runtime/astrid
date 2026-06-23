@@ -33,52 +33,6 @@ pub fn enforce_restrictions(
         "budget.per_action_max_usd",
     );
 
-    // Max argument size: can only decrease.
-    clamp_max_int(
-        merged,
-        baseline,
-        workspace_layer,
-        &["security", "policy", "max_argument_size"],
-        "security.policy.max_argument_size",
-    );
-
-    // Booleans that can only become true (workspace cannot disable).
-    enforce_bool_only_true(
-        merged,
-        workspace_layer,
-        &["security", "policy", "require_approval_for_delete"],
-        "security.policy.require_approval_for_delete",
-    );
-    enforce_bool_only_true(
-        merged,
-        workspace_layer,
-        &["security", "policy", "require_approval_for_network"],
-        "security.policy.require_approval_for_network",
-    );
-
-    // Union array fields: workspace can only add, not remove.
-    union_string_arrays(
-        merged,
-        baseline,
-        workspace_layer,
-        &["security", "policy", "blocked_tools"],
-        "security.policy.blocked_tools",
-    );
-    union_string_arrays(
-        merged,
-        baseline,
-        workspace_layer,
-        &["security", "policy", "denied_paths"],
-        "security.policy.denied_paths",
-    );
-    union_string_arrays(
-        merged,
-        baseline,
-        workspace_layer,
-        &["security", "policy", "denied_hosts"],
-        "security.policy.denied_hosts",
-    );
-
     // --- Step 3: Additional restriction enforcement ---
 
     // Workspace mode: can only tighten (safe < guided < autonomous).
@@ -125,33 +79,6 @@ pub fn enforce_restrictions(
         workspace_layer,
         &["security", "approval_timeout_secs"],
         "security.approval_timeout_secs",
-    );
-
-    // security.policy.approval_required_tools: union (can only add).
-    union_string_arrays(
-        merged,
-        baseline,
-        workspace_layer,
-        &["security", "policy", "approval_required_tools"],
-        "security.policy.approval_required_tools",
-    );
-
-    // security.policy.allowed_paths: cannot expand beyond baseline.
-    block_workspace_expansion(
-        merged,
-        baseline,
-        workspace_layer,
-        &["security", "policy", "allowed_paths"],
-        "security.policy.allowed_paths",
-    );
-
-    // security.policy.allowed_hosts: cannot expand beyond baseline.
-    block_workspace_expansion(
-        merged,
-        baseline,
-        workspace_layer,
-        &["security", "policy", "allowed_hosts"],
-        "security.policy.allowed_hosts",
     );
 
     // workspace.auto_allow_read: cannot expand beyond baseline.

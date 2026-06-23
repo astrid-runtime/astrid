@@ -8,7 +8,9 @@ use wasmtime::component::{Component, Linker};
 
 use crate::context::CapsuleContext;
 use crate::engine::ExecutionEngine;
-use crate::engine::wasm::host_state::{HostState, LifecyclePhase, PrincipalMount};
+use crate::engine::wasm::host_state::{
+    ConnectionIdentity, HostState, LifecyclePhase, PrincipalMount,
+};
 use crate::error::{CapsuleError, CapsuleResult};
 use crate::manifest::CapsuleManifest;
 
@@ -984,9 +986,27 @@ impl ExecutionEngine for WasmEngine {
             wasm_config.insert(key, serde_json::Value::String(val));
         }
 
-        // Pre-generate the session UUID so it can be registered in the
-        // capsule registry after the blocking plugin build completes.
-        let capsule_uuid = uuid::Uuid::new_v4();
+        // Capsule identity, used as the IPC `source_id` (kernel-stamped, never
+        // guest-settable) and the per-(capsule, topic, principal) route key.
+        // DETERMINISTIC (uuid v5 from the capsule name) so it is STABLE across
+        // daemon restarts. A per-boot random v4 made confused-deputy allow-sets
+        // that pin a capsule's source_id — e.g. sage-mcp's `trusted_ingress_ids`
+        // — impossible to configure: the value changed every boot and was
+        // surfaced by no command, so MCP tool calls were permanently denied.
+        // Determinism does not weaken the gate: `source_id` is stamped by the
+        // kernel from the real publishing capsule, so a predictable value still
+        // cannot be forged by a guest. One instance per capsule per daemon, so
+        // the name is a unique, stable key.
+        //
+        // Namespace is a dedicated, fixed Astrid value — NOT `Uuid::NAMESPACE_OID`
+        // (reserved for ISO OIDs), so a capsule-name-derived id can never
+        // semantically collide with an OID-derived uuid from another system.
+        // Arbitrary but FIXED: changing it changes every capsule's identity, so
+        // it must never change.
+        const CAPSULE_ID_NAMESPACE: uuid::Uuid =
+            uuid::Uuid::from_u128(0x310714d5_9c6d_4c94_8187_75258f393bb6);
+        let capsule_uuid =
+            uuid::Uuid::new_v5(&CAPSULE_ID_NAMESPACE, self.manifest.package.name.as_bytes());
 
         // Create shared concurrency controls before entering the blocking
         // plugin build. The blocking semaphore (cores-2-ish) gates host calls
@@ -1297,6 +1317,20 @@ impl ExecutionEngine for WasmEngine {
             let st_allowance_store = ctx.allowance_store.clone();
             let st_identity_store = ctx.identity_store.clone();
             let st_profile_cache = ctx.profile_cache.clone();
+            // Shared across the whole pool so a verified per-connection
+            // principal (issue #45/#852) bound on the accepting instance is
+            // visible to whichever pooled instance later serves that
+            // connection — same Arc-sharing rationale as `process_tracker`.
+            let connection_principals: Arc<dashmap::DashMap<u32, ConnectionIdentity>> =
+                Arc::new(dashmap::DashMap::new());
+            // Lifecycle-tracking registry for the kernel connection counter:
+            // an accept inserts and emits `client.v1.connect`, the matching
+            // drop removes and emits `client.v1.disconnect`. Shared across the
+            // pool for the same reason as `connection_principals` (drop may
+            // land on a different instance than the accept).
+            let client_connections: Arc<
+                dashmap::DashMap<u32, astrid_core::principal::PrincipalId>,
+            > = Arc::new(dashmap::DashMap::new());
             let make_state: Arc<dyn Fn() -> HostState + Send + Sync> = Arc::new(move || HostState {
                 wasi_ctx: build_wasi_ctx(),
                 resource_table: wasmtime::component::ResourceTable::new(),
@@ -1369,6 +1403,13 @@ impl ExecutionEngine for WasmEngine {
                 subscription_count: 0,
                 process_count_total: 0,
                 process_count_by_principal: std::collections::HashMap::new(),
+                connection_principals: connection_principals.clone(),
+                client_connections: client_connections.clone(),
+                // No frame in flight at construction; both the ingress
+                // principal and its authenticating device key_id are set per
+                // framed read.
+                ingress_principal: None,
+                ingress_device_key_id: None,
                 // Run-loop epoch-interrupt state. `recv_yielded` is set true by
                 // the ipc `recv` host fn each time the guest blocks on recv;
                 // the bound run-loop's epoch callback reads + clears it to
@@ -2395,6 +2436,16 @@ pub async fn run_lifecycle(
         subscription_count: 0,
         process_count_total: 0,
         process_count_by_principal: std::collections::HashMap::new(),
+        // Lifecycle hooks never accept socket connections; a throwaway
+        // registry satisfies the field (issue #45/#852).
+        connection_principals: Arc::new(dashmap::DashMap::new()),
+        // Lifecycle hooks never accept inbound uplink connections; a throwaway
+        // lifecycle registry satisfies the field.
+        client_connections: Arc::new(dashmap::DashMap::new()),
+        // Lifecycle hooks never forward client frames; no in-flight principal
+        // or authenticating device.
+        ingress_principal: None,
+        ingress_device_key_id: None,
         // Lifecycle hooks are not run loops; the epoch-interrupt run-loop
         // state is inert here but initialised for completeness.
         recv_yielded: false,

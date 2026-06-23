@@ -34,6 +34,8 @@
 //! config, so a stray diagnostic can never corrupt the protocol stream.
 
 mod elicit;
+mod grant;
+mod ingress;
 mod server;
 mod watch;
 
@@ -50,6 +52,37 @@ use crate::socket_client::SocketClient;
 
 use server::AstridMcpServer;
 
+/// Refuse to serve the MCP bridge silently as the no-capability `anonymous`
+/// identity.
+///
+/// `astrid mcp serve --principal X` connects, but if `X` has no keypair the
+/// handshake falls to the legacy single-frame path and the daemon stamps the
+/// connection `anonymous`. The bridge would then come up "successfully" yet
+/// every `tools/call` fails the ingress-trust and capability checks — to a
+/// client it just hangs/times out, with no hint why. This turns that silent,
+/// confusing failure into a loud, actionable error at startup.
+///
+/// Requesting `anonymous` explicitly (`--principal anonymous`) is allowed:
+/// serving unauthenticated is then a deliberate choice, not an accident.
+fn require_authenticated_unless_anonymous(
+    caller: &astrid_core::PrincipalId,
+    authenticated: bool,
+) -> Result<()> {
+    if authenticated || *caller == astrid_core::PrincipalId::anonymous() {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "could not authenticate as principal '{caller}' for `astrid mcp serve`: \
+         no keypair found (keys/{caller}.key), so the daemon would bind this \
+         connection to the no-capability `anonymous` identity. Every tool call \
+         would then fail the ingress-trust and capability checks and appear to \
+         hang. Refusing to serve the MCP bridge as `anonymous`.\n\n\
+         Fix: run `astrid agent create {caller}` to mint its keypair (or \
+         back-fill an existing keyless principal's), then retry. To serve \
+         unauthenticated on purpose, pass `--principal anonymous`."
+    );
+}
+
 /// Run the MCP stdio server until the client closes stdin (EOF) or the
 /// process is signalled.
 ///
@@ -63,8 +96,16 @@ use server::AstridMcpServer;
 /// Returns an error if the daemon socket is unreachable, the principal
 /// is invalid, or the MCP transport fails to initialize.
 pub(crate) async fn serve(principal: Option<&str>) -> Result<ExitCode> {
-    let caller = crate::context::resolve_agent(principal)
-        .context("Failed to resolve principal for `astrid mcp serve`")?;
+    // The subcommand `--principal` is an explicit per-invocation
+    // override; when absent, fall back to the process-wide principal
+    // (the global `--principal` / `ASTRID_PRINCIPAL`, already validated
+    // at startup) so every uplink this CLI opens attributes to one
+    // identity.
+    let caller = match principal {
+        Some(p) => astrid_core::PrincipalId::new(p)
+            .with_context(|| format!("invalid principal for `astrid mcp serve`: {p}"))?,
+        None => crate::principal::current(),
+    };
 
     let socket_path = crate::socket_client::proxy_socket_path();
     if !socket_path.exists() {
@@ -80,9 +121,15 @@ pub(crate) async fn serve(principal: Option<&str>) -> Result<ExitCode> {
     // not a chat session; the kernel attributes work via the per-message
     // `principal`, not the session.
     let session = astrid_core::SessionId::from_uuid(Uuid::new_v4());
-    let client = SocketClient::connect(session)
+    let client = SocketClient::connect(session, caller.clone())
         .await
         .context("Failed to connect to the Astrid daemon socket")?;
+
+    // The uplink connected, but a non-`anonymous` principal with no keypair is
+    // silently stamped `anonymous` by the daemon — every tool call would then
+    // fail the ingress-trust / capability checks and appear to hang. Fail loud
+    // instead of serving a broken bridge.
+    require_authenticated_unless_anonymous(&caller, client.is_authenticated())?;
 
     info!(
         principal = %caller,
@@ -118,4 +165,36 @@ pub(crate) async fn serve(principal: Option<&str>) -> Result<ExitCode> {
 
     info!(?quit_reason, "astrid mcp serve: MCP transport closed");
     Ok(ExitCode::SUCCESS)
+}
+
+#[cfg(test)]
+mod fail_loud_tests {
+    use super::require_authenticated_unless_anonymous;
+    use astrid_core::PrincipalId;
+
+    #[test]
+    fn authenticated_principal_is_allowed() {
+        let p = PrincipalId::new("claude-code").unwrap();
+        assert!(require_authenticated_unless_anonymous(&p, true).is_ok());
+    }
+
+    #[test]
+    fn unauthenticated_non_anonymous_is_refused_with_actionable_message() {
+        let p = PrincipalId::new("claude-code").unwrap();
+        let err = require_authenticated_unless_anonymous(&p, false)
+            .expect_err("an unauthenticated non-anonymous principal must be refused");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("anonymous"),
+            "explains the anonymous fallback: {msg}"
+        );
+        assert!(msg.contains("claude-code"), "names the principal: {msg}");
+        assert!(msg.contains("agent create"), "gives the fix: {msg}");
+    }
+
+    #[test]
+    fn explicit_anonymous_is_allowed_even_unauthenticated() {
+        // Serving unauthenticated on purpose is fine.
+        assert!(require_authenticated_unless_anonymous(&PrincipalId::anonymous(), false).is_ok());
+    }
 }

@@ -13,6 +13,10 @@
 
 /// Passive event-bus storm diagnostics (publish-rate monitor).
 mod bus_monitor;
+/// `astrid.v1.capsules_loaded` payload assembly (opaque per-capsule metadata).
+mod capsules_loaded;
+/// Grant-on-first-use consent handler (issue #998).
+mod grant_on_use;
 /// Persistent invite-token store (issue #756).
 pub mod invite;
 /// The Management API router listening to the `EventBus`.
@@ -95,6 +99,15 @@ pub struct Kernel {
     pub kv: Arc<astrid_storage::SurrealKvStore>,
     /// Chain-linked cryptographic audit log with persistent storage.
     pub audit_log: Arc<AuditLog>,
+    /// The runtime ed25519 signing key (issue #929).
+    ///
+    /// Loaded once at boot from `~/.astrid/keys/runtime.key` and shared
+    /// (`Arc`) with [`AuditLog`] — both sign with the exact same key bytes,
+    /// never loaded twice. Reachable from the admin token-mint handlers so an
+    /// operator can pre-grant `mcp://` tool access by minting a capability
+    /// token signed by this key (the same key the approval interceptor's
+    /// validator trusts as issuer).
+    pub runtime_key: Arc<astrid_crypto::KeyPair>,
     /// Per-principal active connection counters (Layer 4, issue #668).
     ///
     /// Keyed by [`PrincipalId`]. When a principal's counter hits zero the
@@ -261,7 +274,15 @@ impl Kernel {
                     std::io::Error::other(format!("Failed to init capability store: {e}"))
                 })?,
         );
-        let audit_log = open_audit_log()?;
+        // Load the runtime signing key ONCE and share it (issue #929):
+        // the audit log signs chain entries with it, and the admin
+        // token-mint path signs capability tokens with the same key. Never
+        // load it from disk twice — a second load would still yield the same
+        // persisted bytes, but routing one `Arc` makes the single-source-of-
+        // truth explicit and lets `kernel.runtime_key` mint tokens the
+        // approval interceptor's validator trusts as issuer.
+        let runtime_key = Arc::new(load_or_generate_runtime_key(&home.keys_dir())?);
+        let audit_log = open_audit_log(Arc::clone(&runtime_key))?;
         let mcp = SecureMcpClient::new(
             mcp_client,
             Arc::clone(&capabilities),
@@ -292,6 +313,15 @@ impl Kernel {
         // generated before any capsule can accept connections, preventing
         // a race where a client connects before the token file exists.
         let (listener, singleton_lock) = socket::bind_session_socket(&home)?;
+        // Record our PID immediately after acquiring the singleton lock, so the
+        // PID on disk always belongs to the process that holds the state-db
+        // lock. The CLI reads this to signal a wedged daemon that is no longer
+        // reachable over the socket but still holding the lock (which would
+        // otherwise wedge the next `astrid start`). Best-effort: a write
+        // failure only degrades `stop`/`restart` to socket-only cleanup.
+        if let Err(e) = socket::write_pid_file() {
+            tracing::warn!(error = %e, "Failed to write daemon PID file; stop/restart will fall back to socket-only cleanup");
+        }
         let (session_token, token_path) = socket::generate_session_token()?;
 
         let allowance_store = Arc::new(astrid_approval::AllowanceStore::new());
@@ -339,6 +369,7 @@ impl Kernel {
             singleton_lock: Some(singleton_lock),
             kv,
             audit_log,
+            runtime_key,
             active_connections: DashMap::new(),
             fuel_ledger: astrid_capsule::FuelLedger::default(),
             fuel_rate: astrid_capsule::FuelRateLimiter::default(),
@@ -365,14 +396,32 @@ impl Kernel {
         // call (before the debug-assert below) so it counts toward
         // `INTERNAL_SUBSCRIBER_COUNT`.
         drop(bus_monitor::spawn_bus_activity_monitor(&kernel.event_bus));
+        // Grant-on-first-use (#998): observe `astrid.v1.approval` for
+        // `GrantRequired` signals the dispatcher emits at the access-gate
+        // miss, and grant the capsule on an elicited APPROVE. Subscribes
+        // synchronously (before the debug-assert below) so its one permanent
+        // broadcast subscriber counts toward `INTERNAL_SUBSCRIBER_COUNT`.
+        drop(grant_on_use::spawn_grant_on_use_handler(Arc::clone(
+            &kernel,
+        )));
 
         // Spawn the event dispatcher — routes EventBus events to capsule interceptors.
-        // Wire the identity store so auto-provisioning is gated.
+        // Wire the identity store so auto-provisioning is gated, and the
+        // per-principal capsule-access resolver so the user-invocable tool
+        // surface (`tool.v1.execute.*`, `cli.v1.command.execute`) is gated
+        // at dispatch (admin `*` bypass, fail-closed). The resolver reuses
+        // the kernel-owned profile cache + live group config — cloned in
+        // the same way the fuel/memory ledgers are.
+        let access_resolver = astrid_capsule::CapsuleAccessResolver::new(
+            Arc::clone(&kernel.profile_cache),
+            Arc::clone(&kernel.groups),
+        );
         let dispatcher = astrid_capsule::dispatcher::EventDispatcher::new(
             Arc::clone(&kernel.capsules),
             Arc::clone(&kernel.event_bus),
         )
-        .with_identity_store(Arc::clone(&kernel.identity_store));
+        .with_identity_store(Arc::clone(&kernel.identity_store))
+        .with_access_resolver(access_resolver);
         tokio::spawn(dispatcher.run());
 
         debug_assert_eq!(
@@ -651,18 +700,287 @@ impl Kernel {
         let other_names: Vec<String> = others.iter().map(|(m, _)| m.package.name.clone()).collect();
         self.await_capsule_readiness(&other_names).await;
 
+        // Warn loudly if the loaded set can't actually serve an agent chat
+        // turn. Computed from the live registry *after* load completes (not the
+        // pre-load discovered set) so a manifest that failed to load is not
+        // mistaken for a working capability. Without this a fresh daemon
+        // (socket uplink only) boots clean yet silently drops every prompt —
+        // name-agnostic introspection turns that into one actionable warning.
+        {
+            let reg = self.capsules.read().await;
+            let loaded: Vec<&astrid_capsule::manifest::CapsuleManifest> = reg
+                .values()
+                .map(astrid_capsule::capsule::Capsule::manifest)
+                .collect();
+            warn_agent_loop_readiness(&loaded);
+        }
+
+        // Mirror the read-only introspection furniture into every principal's
+        // home so non-install principals see the globally-loaded capsule set.
+        self.sync_all_principal_furniture().await;
+
         // Signal that all capsules have been loaded so uplink capsules
         // (like the registry) can proceed with discovery instead of
         // polling with arbitrary timeouts.
+        self.publish_capsules_loaded().await;
+    }
+
+    /// Build an in-process agent-loop readiness probe over the live registry.
+    ///
+    /// Handed to the co-located gateway so its prompt fail-fast can ask whether
+    /// the loaded set can serve a chat turn directly — agent-loop serviceability
+    /// is global daemon health, not per-principal authorization, so it needs no
+    /// capability check and no socket round-trip (unlike the capability-gated
+    /// `GetAgentReadiness` request, which exists for the detailed, ops-facing
+    /// `/api/sys/readiness` view and `astrid doctor`). The closure clones the
+    /// registry `Arc`, so each call reflects the current loaded set.
+    #[must_use]
+    pub fn agent_readiness_probe(&self) -> astrid_core::kernel_api::AgentReadinessProbe {
+        let registry = Arc::clone(&self.capsules);
+        astrid_core::kernel_api::AgentReadinessProbe::new(move || {
+            let registry = Arc::clone(&registry);
+            Box::pin(async move {
+                let reg = registry.read().await;
+                let manifests: Vec<&astrid_capsule::manifest::CapsuleManifest> = reg
+                    .values()
+                    .map(astrid_capsule::capsule::Capsule::manifest)
+                    .collect();
+                astrid_capsule::readiness::agent_loop_readiness(&manifests)
+            })
+        })
+    }
+
+    /// Publish `astrid.v1.capsules_loaded` so subscribers re-read the current
+    /// capsule/tool set after the loaded set changes — the registry, and the
+    /// `astrid mcp serve` shim, which turns this into an MCP
+    /// `notifications/tools/list_changed` for connected clients.
+    ///
+    /// The payload carries, per loaded capsule, its installed `meta.json` under
+    /// `capsules[].meta` with the capsule's tool surface injected. The kernel
+    /// probes each loaded capsule once — invoking its `tool_describe`
+    /// interceptor (the same hook the dispatcher already routes) and injecting
+    /// the captured descriptors — so a consumer (e.g. the sage-mcp broker) gets
+    /// a deterministic, complete tool surface from this signal **without the
+    /// capsule having been rebuilt**. The kernel invokes-and-forwards: it never
+    /// interprets the descriptors (the broker owns all policy). A describe
+    /// failure leaves `tools` absent for that capsule this cycle (the consumer
+    /// falls back to its fan-out). The legacy `status: "ready"` field is
+    /// retained so bare-signal subscribers (the shim, the TUI) keep working; the
+    /// `capsules` field is additive.
+    async fn publish_capsules_loaded(&self) {
+        // Clone the loaded-capsule handles under a brief read lock, then release
+        // it before any filesystem I/O or `tool_describe` invocation (which can
+        // `block_in_place` and must never run while holding the registry lock).
+        let capsules = {
+            let reg = self.capsules.read().await;
+            reg.cloned_values()
+        };
+
+        let mut with_meta: Vec<(String, Option<serde_json::Value>)> =
+            Vec::with_capacity(capsules.len());
+        for capsule in &capsules {
+            let name = capsule.id().to_string();
+            let mut meta = capsule
+                .source_dir()
+                .and_then(capsules_loaded::read_capsule_meta_opaque);
+
+            // Probe the live instance for its tool surface and inject it. Best-
+            // effort: a describe (or serialize) failure leaves `tools` absent
+            // and the consumer falls back to its fan-out for this cycle.
+            match astrid_capsule::describe_loaded_capsule(capsule.as_ref()).await {
+                Ok(tools) => match serde_json::to_value(&tools) {
+                    Ok(tools_json) => {
+                        meta = Some(capsules_loaded::inject_tools(meta, tools_json));
+                    },
+                    Err(e) => tracing::debug!(
+                        capsule_id = %name, error = %e,
+                        "failed to serialize live-described tools; capsule left uncaptured this cycle"
+                    ),
+                },
+                Err(e) => tracing::debug!(
+                    capsule_id = %name, error = %e,
+                    "live tool_describe failed; capsule left uncaptured this cycle"
+                ),
+            }
+            with_meta.push((name, meta));
+        }
+        let payload = capsules_loaded::build_capsules_loaded_payload(with_meta);
+
         let msg = astrid_events::ipc::IpcMessage::new(
             "astrid.v1.capsules_loaded",
-            astrid_events::ipc::IpcPayload::RawJson(serde_json::json!({"status": "ready"})),
+            astrid_events::ipc::IpcPayload::RawJson(payload),
             self.session_id.0,
         );
         let _ = self.event_bus.publish(astrid_events::AstridEvent::Ipc {
             metadata: astrid_events::EventMetadata::new("kernel"),
             message: msg,
         });
+    }
+
+    /// Reload a single capsule by id without a daemon restart.
+    ///
+    /// If the capsule is already registered, [`Self::restart_capsule`] re-reads
+    /// its source directory — picking up the new content-addressed bytes a
+    /// reinstall wrote (a live upgrade / hot-swap). If it isn't registered yet,
+    /// the currently-installed set is discovered and loaded (a fresh add;
+    /// already-loaded capsules are skipped by `load_capsule`'s guard). Either
+    /// way `astrid.v1.capsules_loaded` is published so the tool surface
+    /// refreshes. Backs [`astrid_core::kernel_api::KernelRequest::ReloadCapsule`].
+    pub(crate) async fn reload_one_capsule(
+        &self,
+        id: &astrid_capsule::capsule::CapsuleId,
+    ) -> Result<(), anyhow::Error> {
+        let registered = { self.capsules.read().await.get(id).is_some() };
+        if registered {
+            self.restart_capsule(id).await?;
+            self.publish_capsules_loaded().await;
+        } else {
+            // load_all_capsules discovers + loads the new capsule (existing ones
+            // are skipped) and publishes capsules_loaded itself. It logs-and-
+            // continues on a per-capsule load failure, so confirm the requested
+            // capsule actually registered — otherwise the caller would report a
+            // false success for a capsule that failed to load or isn't on disk.
+            self.load_all_capsules().await;
+            if self.capsules.read().await.get(id).is_none() {
+                return Err(anyhow::anyhow!(
+                    "capsule '{id}' was not found in the install directories or failed to load"
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Unload a single capsule by id without a daemon restart.
+    ///
+    /// Mirrors the unregister half of [`Self::restart_capsule`]: it removes the
+    /// capsule from the running registry and explicitly unloads it (there is no
+    /// async `Drop`, so we must do it here to avoid leaking MCP subprocesses and
+    /// other engine resources), then publishes `astrid.v1.capsules_loaded` so the
+    /// tool surface refreshes — the departed capsule self-excludes from the next
+    /// fan-out. Backs [`astrid_core::kernel_api::KernelRequest::UnloadCapsule`].
+    ///
+    /// Returns `Ok(true)` if the capsule was loaded and is now unregistered, or
+    /// `Ok(false)` if it was not loaded (a no-op — nothing to unload, no signal
+    /// published). The on-disk removal that precedes this call is authoritative;
+    /// a capsule absent from the running registry is not an error here.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error only if the registry fails to unregister a capsule it
+    /// reported as present.
+    pub(crate) async fn unload_one_capsule(
+        &self,
+        id: &astrid_capsule::capsule::CapsuleId,
+    ) -> Result<bool, anyhow::Error> {
+        // Unregister under the write lock. A NotFound means the capsule was
+        // never loaded here (e.g. the daemon started after it was removed, or
+        // it failed to load) — that is a benign no-op for an unload, so report
+        // it as "not loaded" rather than an error.
+        let old_capsule = {
+            let mut registry = self.capsules.write().await;
+            match registry.unregister(id) {
+                Ok(capsule) => capsule,
+                Err(astrid_capsule::error::CapsuleError::NotFound(_)) => return Ok(false),
+                Err(e) => {
+                    return Err(anyhow::anyhow!("failed to unregister capsule '{id}': {e}"));
+                },
+            }
+        };
+
+        // Explicitly unload the old capsule. There is no Drop impl that calls
+        // unload() (it's async), so we must do it here to avoid leaking MCP
+        // subprocesses and other engine resources. Arc::get_mut requires
+        // exclusive ownership (strong_count == 1).
+        {
+            let mut old = old_capsule;
+            if let Some(capsule) = std::sync::Arc::get_mut(&mut old) {
+                if let Err(e) = capsule.unload().await {
+                    tracing::warn!(
+                        capsule_id = %id,
+                        error = %e,
+                        "Capsule unload failed during unload request"
+                    );
+                }
+            } else {
+                tracing::warn!(
+                    capsule_id = %id,
+                    "Cannot call unload - Arc still held by in-flight task"
+                );
+            }
+        }
+
+        self.publish_capsules_loaded().await;
+        Ok(true)
+    }
+
+    /// Mirror the read-only introspection furniture (installed-capsule
+    /// registry + `home://wit/`) into every principal's home.
+    ///
+    /// Capsules are deployed once and shared globally, but the read-only
+    /// *view* of that set is materialized only into the install principal's
+    /// home at install time — so a non-install principal (e.g. `claude-code`)
+    /// would see `system_status` `capsule_count: 0` and `list_interfaces`
+    /// "WIT directory not found". Run on boot (and after install, since
+    /// [`Self::load_all_capsules`] also runs post-install) to rebuild the
+    /// mirror for every principal enumerated from `etc/profiles/*.toml`.
+    ///
+    /// Best-effort: a per-principal sync failure logs a warning and continues
+    /// — it degrades that principal's introspection visibility, never boot.
+    /// Env config (`.config/env/`) is excluded for secret isolation (enforced
+    /// inside [`astrid_capsule_install::materialize_principal_furniture`]).
+    async fn sync_all_principal_furniture(&self) {
+        // The sweep enumerates `etc/profiles/*.toml` and does synchronous
+        // recursive directory copies per principal. Offload the whole loop to
+        // the blocking pool so it never pins a tokio worker, and `.await` it so
+        // boot ordering is preserved (the `capsules_loaded` signal must not fire
+        // before the mirrors exist). `AstridHome` is `Clone` and cheap to move.
+        let home = self.astrid_home.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            let profiles_dir = home.profiles_dir();
+            let entries = match std::fs::read_dir(&profiles_dir) {
+                Ok(entries) => entries,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+                Err(e) => {
+                    tracing::warn!(
+                        dir = %profiles_dir.display(),
+                        error = %e,
+                        "failed to enumerate principals for home-furniture sync"
+                    );
+                    return;
+                },
+            };
+
+            for entry in entries.flatten() {
+                if !entry.file_type().is_ok_and(|t| t.is_file()) {
+                    continue;
+                }
+                let file_name = entry.file_name();
+                let Some(stem) = file_name.to_str().and_then(|n| n.strip_suffix(".toml")) else {
+                    continue;
+                };
+                let Ok(principal) = PrincipalId::new(stem) else {
+                    continue;
+                };
+                if let Err(e) =
+                    astrid_capsule_install::materialize_principal_furniture(&home, &principal)
+                {
+                    tracing::warn!(
+                        %principal,
+                        error = %format!("{e:#}"),
+                        "failed to materialize per-principal home furniture; \
+                         this principal's introspection tools may not see the loaded capsule set"
+                    );
+                }
+            }
+        })
+        .await;
+        if let Err(join_err) = result {
+            tracing::warn!(
+                error = %join_err,
+                "per-principal home-furniture sweep task panicked; \
+                 some principals' introspection tools may not see the loaded capsule set"
+            );
+        }
     }
 
     /// Record that a new client connection for `principal` has been established.
@@ -864,6 +1182,7 @@ impl Kernel {
         let _ = std::fs::remove_file(&socket_path);
         let _ = std::fs::remove_file(&self.token_path);
         crate::socket::remove_readiness_file();
+        crate::socket::remove_pid_file();
 
         tracing::info!("Kernel shutdown complete");
     }
@@ -967,14 +1286,14 @@ pub(crate) async fn test_kernel_with_home(home: astrid_core::dirs::AstridHome) -
     // Audit log at the tempdir — chain verification is trivially Ok on a
     // fresh log, no historical entries.
     let runtime_key =
-        load_or_generate_runtime_key(&home.keys_dir()).expect("test kernel: runtime key");
+        Arc::new(load_or_generate_runtime_key(&home.keys_dir()).expect("test kernel: runtime key"));
     let default_principal = astrid_core::PrincipalId::default();
     let principal_home = home.principal_home(&default_principal);
     principal_home
         .ensure()
         .expect("test kernel: ensure principal home");
     let audit_log = Arc::new(
-        AuditLog::open(principal_home.audit_dir(), runtime_key)
+        AuditLog::open(principal_home.audit_dir(), Arc::clone(&runtime_key))
             .expect("test kernel: open audit log"),
     );
 
@@ -1028,6 +1347,7 @@ pub(crate) async fn test_kernel_with_home(home: astrid_core::dirs::AstridHome) -
         singleton_lock: None,
         kv,
         audit_log,
+        runtime_key,
         active_connections: DashMap::new(),
         fuel_ledger: astrid_capsule::FuelLedger::default(),
         fuel_rate: astrid_capsule::FuelRateLimiter::default(),
@@ -1060,7 +1380,7 @@ pub(crate) async fn test_kernel_with_home(home: astrid_core::dirs::AstridHome) -
 /// `~/.astrid/audit.db` and runs `verify_all()` to detect any tampering of
 /// historical entries. Verification failures are logged at `error!` level but
 /// do not block boot (fail-open for availability, loud alert for integrity).
-fn open_audit_log() -> std::io::Result<Arc<AuditLog>> {
+fn open_audit_log(runtime_key: Arc<astrid_crypto::KeyPair>) -> std::io::Result<Arc<AuditLog>> {
     use astrid_core::dirs::AstridHome;
 
     let home = AstridHome::resolve()
@@ -1068,12 +1388,14 @@ fn open_audit_log() -> std::io::Result<Arc<AuditLog>> {
     home.ensure()
         .map_err(|e| std::io::Error::other(format!("cannot create Astrid home dirs: {e}")))?;
 
-    let runtime_key = load_or_generate_runtime_key(&home.keys_dir())?;
     let default_principal = astrid_core::PrincipalId::default();
     let principal_home = home.principal_home(&default_principal);
     principal_home
         .ensure()
         .map_err(|e| std::io::Error::other(format!("cannot create principal home dirs: {e}")))?;
+    // Share the kernel's single runtime key — never load it from disk twice
+    // (issue #929). The audit log and the admin token-mint path sign with the
+    // exact same key bytes.
     let audit_log = AuditLog::open(principal_home.audit_dir(), runtime_key)
         .map_err(|e| std::io::Error::other(format!("cannot open audit log: {e}")))?;
 
@@ -1167,9 +1489,11 @@ fn load_or_generate_runtime_key(keys_dir: &Path) -> std::io::Result<KeyPair> {
 /// Number of permanent internal event bus subscribers that are not client
 /// connections: `KernelRouter` (`kernel.request.*`), `AdminRouter`
 /// (`kernel.admin.*`), `ConnectionTracker` (`client.*`),
-/// `EventDispatcher` (all events), and the bus activity monitor (all events,
-/// storm diagnostics — see [`bus_monitor::spawn_bus_activity_monitor`]).
-const INTERNAL_SUBSCRIBER_COUNT: usize = 5;
+/// `EventDispatcher` (all events), the bus activity monitor (all events,
+/// storm diagnostics — see [`bus_monitor::spawn_bus_activity_monitor`]), and
+/// the grant-on-first-use observer (`astrid.v1.approval` — see
+/// [`grant_on_use::spawn_grant_on_use_handler`]).
+const INTERNAL_SUBSCRIBER_COUNT: usize = 6;
 
 /// Gauge: current active client connections (sum across principals).
 /// Mirrors [`Kernel::total_connection_count`]; lets a dashboard graph
@@ -1820,6 +2144,69 @@ mod tests {
         assert_eq!(profile.groups, vec!["admin".to_string()]);
         assert!(profile.grants.is_empty());
         assert!(profile.revokes.is_empty());
+
+        // Default now carries a per-principal ed25519 key + the Keypair
+        // method, and the private key is on disk 0600 (issue #45/#852).
+        assert!(
+            !profile.auth.public_keys.is_empty(),
+            "default must have an ed25519 key registered"
+        );
+        assert!(
+            profile
+                .auth
+                .public_keys
+                .iter()
+                .all(|k| matches!(k.scope, astrid_core::profile::DeviceScope::Full)),
+            "bootstrap key must be Full-scope"
+        );
+        assert!(
+            profile
+                .auth
+                .methods
+                .contains(&astrid_core::profile::AuthMethod::Keypair),
+            "default must record the Keypair auth method"
+        );
+        let key_path = home.keys_dir().join("default.key");
+        assert!(key_path.exists(), "default.key must be written to disk");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&key_path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600, "default.key must be owner-only");
+        }
+    }
+
+    #[test]
+    fn seed_admin_keypair_is_idempotent() {
+        // A second seed must NOT mint a fresh key — the registered key and the
+        // on-disk private key are stable across reboots so an operator who has
+        // started signing with it keeps working (issue #45/#852).
+        let (_d, home) = scratch_home();
+        let default = astrid_core::PrincipalId::default();
+        let path = astrid_core::PrincipalProfile::path_for(&home, &default);
+
+        seed_default_principal_admin_profile(&home).unwrap();
+        let first = astrid_core::PrincipalProfile::load_from_path(&path).unwrap();
+        let first_keys = first.auth.public_keys.clone();
+        let first_bytes = std::fs::read(home.keys_dir().join("default.key")).unwrap();
+
+        seed_default_principal_admin_profile(&home).unwrap();
+        let second = astrid_core::PrincipalProfile::load_from_path(&path).unwrap();
+        let second_bytes = std::fs::read(home.keys_dir().join("default.key")).unwrap();
+
+        assert_eq!(
+            first_keys, second.auth.public_keys,
+            "key must not be re-minted"
+        );
+        assert_eq!(
+            first_bytes, second_bytes,
+            "private key bytes must be stable"
+        );
+        assert_eq!(
+            second.auth.public_keys.len(),
+            1,
+            "exactly one ed25519 key — no duplication across reboots"
+        );
     }
 
     #[test]
@@ -1962,6 +2349,13 @@ mod tests {
 /// from another loaded capsule. Logs errors for unsatisfied required imports
 /// and info messages for unsatisfied optional imports. Also warns about
 /// duplicate exports of the same interface from multiple capsules.
+///
+/// The set of unsatisfied *required* imports is sourced from
+/// [`astrid_capsule::readiness::unsatisfied_required_imports`] so this boot
+/// validator and the agent-loop readiness report share a single source of
+/// truth — they can never disagree on whether a required dependency is met.
+/// Optional-import info, the satisfied count, and duplicate-export warnings
+/// stay local since the shared fn only covers required imports.
 fn validate_imports_exports(
     manifests: &[(
         astrid_capsule::manifest::CapsuleManifest,
@@ -1997,31 +2391,57 @@ fn validate_imports_exports(
         }
     }
 
+    // Single source of truth for unsatisfied imports — both the required and
+    // the optional sets come from the shared readiness helpers, which apply the
+    // SAME cross-capsule self-exclusion rule (a capsule cannot self-satisfy its
+    // own import). Keying on (capsule, namespace, interface) lets the per-import
+    // loop below decide each branch by membership, so the required-error and
+    // optional-info diagnostics can never disagree on what "satisfied" means.
+    let plain: Vec<&astrid_capsule::manifest::CapsuleManifest> =
+        manifests.iter().map(|(m, _)| m).collect();
+    let key_set = |missing: Vec<astrid_core::kernel_api::MissingImport>| {
+        missing
+            .into_iter()
+            .map(|m| (m.capsule, m.namespace, m.interface))
+            .collect::<std::collections::HashSet<(String, String, String)>>()
+    };
+    let unsatisfied_required = key_set(astrid_capsule::readiness::unsatisfied_required_imports(
+        &plain,
+    ));
+    let unsatisfied_optional = key_set(astrid_capsule::readiness::unsatisfied_optional_imports(
+        &plain,
+    ));
+
     let mut satisfied_count: u32 = 0;
     let mut warning_count: u32 = 0;
 
     for (manifest, _) in manifests {
         for (ns, name, req, optional) in manifest.import_tuples() {
-            let has_provider = exports_by_interface
-                .get(&(ns, name))
-                .is_some_and(|providers| providers.iter().any(|(_, v)| req.matches(v)));
-
-            if has_provider {
-                satisfied_count = satisfied_count.saturating_add(1);
-            } else if optional {
-                tracing::info!(
-                    capsule = %manifest.package.name,
-                    import = %format!("{ns}/{name} {req}"),
-                    "Optional import not satisfied — capsule will boot with reduced functionality"
-                );
-                warning_count = warning_count.saturating_add(1);
-            } else {
+            let key = (
+                manifest.package.name.clone(),
+                ns.to_string(),
+                name.to_string(),
+            );
+            if optional {
+                if unsatisfied_optional.contains(&key) {
+                    tracing::info!(
+                        capsule = %manifest.package.name,
+                        import = %format!("{ns}/{name} {req}"),
+                        "Optional import not satisfied — capsule will boot with reduced functionality"
+                    );
+                    warning_count = warning_count.saturating_add(1);
+                } else {
+                    satisfied_count = satisfied_count.saturating_add(1);
+                }
+            } else if unsatisfied_required.contains(&key) {
                 tracing::error!(
                     capsule = %manifest.package.name,
                     import = %format!("{ns}/{name} {req}"),
                     "Required import not satisfied — no loaded capsule exports this interface"
                 );
                 warning_count = warning_count.saturating_add(1);
+            } else {
+                satisfied_count = satisfied_count.saturating_add(1);
             }
         }
     }
@@ -2031,6 +2451,58 @@ fn validate_imports_exports(
         imports_satisfied = satisfied_count,
         warnings = warning_count,
         "Boot validation complete"
+    );
+}
+
+/// Emit a single concise WARN when the loaded capsule set can't serve an
+/// agent chat turn, naming the missing piece(s). Summarized — never a
+/// per-import flood. Reuses the shared
+/// [`astrid_capsule::readiness::agent_loop_readiness`] so the boot signal,
+/// the `/api/sys/readiness` route, and `astrid doctor` all agree.
+///
+/// Takes the manifests of the capsules that are actually **loaded** (read from
+/// the live registry after load completes), not the pre-load discovered set —
+/// a manifest can be discovered but fail to load (missing env, WASM error), so
+/// only the loaded registry reflects what can really serve a turn.
+fn warn_agent_loop_readiness(manifests: &[&astrid_capsule::manifest::CapsuleManifest]) {
+    let readiness = astrid_capsule::readiness::agent_loop_readiness(manifests);
+    if readiness.ready {
+        tracing::info!(
+            capsules = readiness.loaded_capsules.len(),
+            "Agent loop ready — a capsule subscribes the prompt topic and publishes the response topic"
+        );
+        return;
+    }
+
+    let mut missing: Vec<String> = Vec::new();
+    if readiness.prompt_subscribers.is_empty() {
+        missing.push(format!(
+            "no capsule subscribes to {}",
+            astrid_capsule::readiness::AGENT_PROMPT_TOPIC
+        ));
+    }
+    if readiness.response_publishers.is_empty() {
+        missing.push(format!(
+            "no capsule publishes {}",
+            astrid_capsule::readiness::AGENT_RESPONSE_TOPIC
+        ));
+    }
+    if !readiness.unsatisfied_required_imports.is_empty() {
+        let ifaces: Vec<String> = readiness
+            .unsatisfied_required_imports
+            .iter()
+            .map(|m| format!("{}:{}", m.namespace, m.interface))
+            .collect();
+        missing.push(format!(
+            "required interface(s) unsatisfied: {}",
+            ifaces.join(" ")
+        ));
+    }
+
+    tracing::warn!(
+        reasons = %missing.join("; "),
+        "Agent chat is not configured — POST /api/agent/prompt will return an immediate error. \
+         Install the capsules that complete the loop (run `astrid doctor` for details)."
     );
 }
 
@@ -2154,26 +2626,117 @@ fn seed_default_principal_admin_profile(
     }
 
     let path = PrincipalProfile::path_for(home, &default_principal);
-    let profile = PrincipalProfile::load_from_path(&path)?;
+    let mut profile = PrincipalProfile::load_from_path(&path)?;
 
-    if !profile.groups.is_empty() || !profile.grants.is_empty() || !profile.revokes.is_empty() {
+    // Two independent idempotent steps that may each mutate the profile:
+    //   1. seed the built-in `admin` group on a fresh-default profile, and
+    //   2. mint `default`'s per-principal keypair if it has none.
+    // `mutated` tracks whether either ran so we save at most once.
+    let mut mutated = false;
+
+    // 1. Admin-group seeding. Only on a truly fresh default (no groups,
+    // grants, or revokes) — an operator-configured profile is left intact.
+    if profile.groups.is_empty() && profile.grants.is_empty() && profile.revokes.is_empty() {
+        profile
+            .groups
+            .push(astrid_core::groups::BUILTIN_ADMIN.to_string());
+        mutated = true;
+        tracing::info!(
+            principal = %default_principal,
+            "Seeded default principal with built-in `admin` group"
+        );
+    } else {
         tracing::debug!(
             principal = %default_principal,
-            "Default principal profile already has group/grant/revoke entries — leaving intact"
+            "Default principal profile already has group/grant/revoke entries — leaving groups intact"
         );
-        return Ok(());
     }
 
-    let mut updated = profile;
-    updated
-        .groups
-        .push(astrid_core::groups::BUILTIN_ADMIN.to_string());
-    updated.save_to_path(&path)?;
-    tracing::info!(
-        principal = %default_principal,
-        "Seeded default principal with built-in `admin` group"
-    );
+    // 2. Per-principal keypair (issue #45/#852). Mint only if `default` has no
+    // ed25519 key yet, so the operator can authenticate as `default` over the
+    // socket. Independent of the admin-group step above: an operator-configured
+    // default still gets a key.
+    if mint_default_principal_keypair(home, &default_principal, &mut profile)? {
+        mutated = true;
+    }
+
+    if mutated {
+        profile.save_to_path(&path)?;
+    }
     Ok(())
+}
+
+/// Mint `default`'s per-principal ed25519 keypair if it has none, writing the
+/// private key to `keys/default.key` (0600) and registering the public key on
+/// `profile` (issue #45/#852). Mirrors
+/// [`mint_principal_keypair`](crate::kernel_router::admin::handlers) but takes
+/// only `home` + the profile, since the boot path has no `Kernel` yet.
+///
+/// Returns `Ok(true)` if the profile's auth config was mutated (so the caller
+/// saves it), `Ok(false)` if a key was already registered (no-op).
+fn mint_default_principal_keypair(
+    home: &astrid_core::dirs::AstridHome,
+    principal: &astrid_core::PrincipalId,
+    profile: &mut astrid_core::PrincipalProfile,
+) -> Result<bool, astrid_core::ProfileError> {
+    use astrid_core::profile::AuthMethod;
+
+    // Already has a key registered → nothing to do. (Re-minting would orphan
+    // the on-disk key the operator may already be signing with.)
+    let has_key = !profile.auth.public_keys.is_empty();
+    if has_key {
+        return Ok(false);
+    }
+
+    let keypair = astrid_crypto::KeyPair::generate();
+    let keys_dir = home.keys_dir();
+    std::fs::create_dir_all(&keys_dir)?;
+    let key_path = keys_dir.join(format!("{principal}.key"));
+    // Create the file 0600 atomically (via `OpenOptions::mode`) BEFORE writing
+    // the secret bytes, so the private key is never momentarily group/world
+    // readable between a `write` and a follow-up `set_permissions` chmod.
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&key_path)?;
+        f.write_all(&keypair.secret_key_bytes())?;
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(&key_path, keypair.secret_key_bytes())?;
+    }
+
+    // Register Full-scope: the default principal's bootstrap keypair acts
+    // with the principal's full authority. Dedup by canonical pubkey.
+    let pubkey_hex = keypair.export_public_key().to_hex();
+    if profile.auth.device_by_pubkey(&pubkey_hex).is_none() {
+        profile
+            .auth
+            .public_keys
+            .push(astrid_core::profile::DeviceKey::new(
+                pubkey_hex,
+                astrid_core::profile::DeviceScope::Full,
+                None,
+                // Stamp the real mint epoch — `0` is the migrated-legacy-key
+                // sentinel, so using it for a freshly minted key would show a
+                // 1970 timestamp in `pair-device list` / audit.
+                i64::try_from(crate::invite::now_epoch()).unwrap_or(0),
+            ));
+    }
+    if !profile.auth.methods.contains(&AuthMethod::Keypair) {
+        profile.auth.methods.push(AuthMethod::Keypair);
+    }
+    tracing::info!(
+        principal = %principal,
+        "Minted per-principal keypair for default principal"
+    );
+    Ok(true)
 }
 
 /// Apply pre-configured identity links from the config file.

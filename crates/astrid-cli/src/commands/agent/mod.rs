@@ -102,6 +102,32 @@ pub(crate) struct CreateArgs {
     /// Non-interactive mode (accept defaults).
     #[arg(short = 'y', long)]
     pub yes: bool,
+    /// Copy env, KV, and secrets from this principal (default: inherit
+    /// nothing). The named principal's `.config/env/`, per-capsule KV
+    /// namespaces, and per-capsule secret files are copied into the new
+    /// agent. Omit to provision a clean, least-privilege agent.
+    #[arg(long = "inherit-from", value_name = "PRINCIPAL")]
+    pub inherit_from: Option<String>,
+    /// Clone an existing principal: a full replica of its capability profile
+    /// (groups, grants, revokes, egress, process allow-list, quotas) AND its
+    /// state (env/KV/secrets, exactly as `--inherit-from`). An exact copy —
+    /// customize afterward with `caps grant` / `quota set` / `agent modify`.
+    /// Mutually exclusive with the profile/quota-shaping flags. Cloning a
+    /// source that confers admin (`*`) requires `--unsafe-admin`.
+    #[arg(
+        long = "clone",
+        value_name = "PRINCIPAL",
+        conflicts_with_all = [
+            "groups", "egress", "process_allow", "inherit_from",
+            "memory", "timeout", "storage", "processes"
+        ]
+    )]
+    pub clone_from: Option<String>,
+    /// Acknowledge cloning an admin-conferring source (one that resolves to
+    /// the universal `*`). Required by `--clone <admin-source>`; mirrors the
+    /// `--unsafe-admin` flag on `caps grant` / `group create`.
+    #[arg(long = "unsafe-admin", requires = "clone_from")]
+    pub unsafe_admin: bool,
 
     // ── Deferred delegation flags (#656) ─────────────────────────────
     /// Delegation parent agent (deferred — see #656).
@@ -186,6 +212,12 @@ pub(crate) struct ModifyArgs {
     /// Remove the agent from a group (repeatable).
     #[arg(long = "remove-group", value_name = "NAME")]
     pub remove_group: Vec<String>,
+    /// Grant the agent access to a capsule's tools (repeatable).
+    #[arg(long = "add-capsule", value_name = "ID")]
+    pub add_capsule: Vec<String>,
+    /// Revoke the agent's access to a capsule's tools (repeatable).
+    #[arg(long = "remove-capsule", value_name = "ID")]
+    pub remove_capsule: Vec<String>,
     /// Rename the principal (deferred — needs kernel-side rename IPC).
     #[arg(long, value_name = "NEW-NAME", hide = true)]
     pub rename: Option<String>,
@@ -278,6 +310,20 @@ async fn run_create(mut args: CreateArgs) -> Result<ExitCode> {
     let principal = PrincipalId::new(&args.name).context("invalid agent name")?;
     let quota_updates = parse_quota_flags(&args)?;
     let caps_to_grant = build_caps_to_grant(&args)?;
+    // Validate the inheritance source client-side so a typo fails the
+    // whole command before any IPC, matching how `name` is handled.
+    let inherit_from = args
+        .inherit_from
+        .as_deref()
+        .map(PrincipalId::new)
+        .transpose()
+        .context("invalid --inherit-from principal")?;
+    let clone_from = args
+        .clone_from
+        .as_deref()
+        .map(PrincipalId::new)
+        .transpose()
+        .context("invalid --clone principal")?;
 
     // Empty defaults to the kernel's `agent` group (Layer 6 default).
     // Pass empty so the kernel applies the default rather than the CLI
@@ -296,6 +342,9 @@ async fn run_create(mut args: CreateArgs) -> Result<ExitCode> {
             name: args.name.clone(),
             groups,
             grants: caps_to_grant,
+            inherit_from,
+            clone_from,
+            allow_admin_clone: args.unsafe_admin,
         })
         .await?;
     let _ = into_result(body)?;
@@ -670,8 +719,14 @@ async fn run_modify(args: ModifyArgs) -> Result<ExitCode> {
         return Ok(ExitCode::from(2));
     }
     let principal = PrincipalId::new(&args.name).context("invalid agent name")?;
-    if args.add_group.is_empty() && args.remove_group.is_empty() {
-        eprintln!("astrid: nothing to do (specify --add-group or --remove-group)");
+    if args.add_group.is_empty()
+        && args.remove_group.is_empty()
+        && args.add_capsule.is_empty()
+        && args.remove_capsule.is_empty()
+    {
+        eprintln!(
+            "astrid: nothing to do (specify --add-group, --remove-group, --add-capsule, or --remove-capsule)"
+        );
         return Ok(ExitCode::from(1));
     }
     let mut client = crate::admin_client::connect_as_active_agent().await?;
@@ -680,6 +735,8 @@ async fn run_modify(args: ModifyArgs) -> Result<ExitCode> {
             principal: principal.clone(),
             add_groups: args.add_group.clone(),
             remove_groups: args.remove_group.clone(),
+            add_capsules: args.add_capsule.clone(),
+            remove_capsules: args.remove_capsule.clone(),
         })
         .await?;
     let body = into_result(body)?;
@@ -689,15 +746,19 @@ async fn run_modify(args: ModifyArgs) -> Result<ExitCode> {
         other => anyhow::bail!("unexpected response from kernel: {other:?}"),
     };
 
-    let groups: Vec<String> = value
-        .get("groups")
-        .and_then(|g| g.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|v| v.as_str().map(str::to_string))
-                .collect()
-        })
-        .unwrap_or_default();
+    let string_array = |key: &str| -> Vec<String> {
+        value
+            .get(key)
+            .and_then(|g| g.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let groups = string_array("groups");
+    let capsules = string_array("capsules");
     let changed = value
         .get("changed")
         .and_then(serde_json::Value::as_bool)
@@ -706,15 +767,16 @@ async fn run_modify(args: ModifyArgs) -> Result<ExitCode> {
         println!(
             "{}",
             Theme::success(&format!(
-                "Updated agent '{principal}' groups: [{}]",
-                groups.join(", ")
+                "Updated agent '{principal}' groups: [{}] capsules: [{}]",
+                groups.join(", "),
+                capsules.join(", ")
             ))
         );
     } else {
         println!(
             "{}",
             Theme::info(&format!(
-                "agent '{principal}' already in the requested groups (no change)"
+                "agent '{principal}' already has the requested groups and capsules (no change)"
             ))
         );
     }
@@ -780,6 +842,9 @@ mod tests {
             storage: None,
             processes: None,
             yes: true,
+            inherit_from: None,
+            clone_from: None,
+            unsafe_admin: false,
             spawned_by: Some("parent".into()),
             budget_voucher: None,
             grant_access: None,
@@ -805,6 +870,9 @@ mod tests {
             storage: None,
             processes: None,
             yes: true,
+            inherit_from: None,
+            clone_from: None,
+            unsafe_admin: false,
             spawned_by: None,
             budget_voucher: None,
             grant_access: None,

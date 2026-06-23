@@ -34,6 +34,7 @@ use std::time::Duration;
 use tokio::sync::{RwLock, mpsc};
 use tracing::{debug, warn};
 
+use crate::access::CapsuleAccessResolver;
 use crate::capsule::{Capsule, CapsuleId};
 use crate::registry::CapsuleRegistry;
 use astrid_events::PrincipalKey;
@@ -211,6 +212,13 @@ pub struct EventDispatcher {
     /// Closes the cross-principal SET/CALL race at the dispatcher
     /// layer in addition to the bus-side routing demux (#813).
     chain_locks: ChainLocks,
+    /// Per-principal capsule-access resolver. When set, dispatch of the
+    /// **user-invocable surface** (`tool.v1.execute.*`,
+    /// `cli.v1.command.execute`) is filtered to capsules the caller is
+    /// granted; admins (`*`) bypass. When `None` (e.g. legacy tests),
+    /// the surface is ungated — the kernel always wires the resolver in
+    /// production so the security boundary is present at runtime.
+    access_resolver: Option<CapsuleAccessResolver>,
 }
 
 impl EventDispatcher {
@@ -227,6 +235,7 @@ impl EventDispatcher {
             receiver,
             identity_store: None,
             chain_locks: Arc::new(parking_lot::RwLock::new(HashMap::new())),
+            access_resolver: None,
         }
     }
 
@@ -234,6 +243,19 @@ impl EventDispatcher {
     #[must_use]
     pub fn with_identity_store(mut self, store: Arc<dyn astrid_storage::IdentityStore>) -> Self {
         self.identity_store = Some(store);
+        self
+    }
+
+    /// Set the per-principal capsule-access resolver.
+    ///
+    /// Once set, dispatch of the user-invocable surface
+    /// (`tool.v1.execute.*`, `cli.v1.command.execute`) is filtered to the
+    /// caller's granted capsules (admins bypass; fail-closed for unknown
+    /// callers). Wired by the kernel at boot, mirroring how the fuel and
+    /// memory ledgers are cloned in from the kernel.
+    #[must_use]
+    pub fn with_access_resolver(mut self, resolver: CapsuleAccessResolver) -> Self {
+        self.access_resolver = Some(resolver);
         self
     }
 
@@ -365,7 +387,20 @@ impl EventDispatcher {
                 }
             }
 
-            let matches = find_matching_interceptors(&self.registry, &topic).await;
+            // Caller principal (kernel-stamped on the IPC message; `None`
+            // for lifecycle events). Threaded into matching so the
+            // user-invocable surface can be filtered to the caller's
+            // granted capsules — never a caller-supplied claim.
+            let caller_principal: Option<&str> =
+                ipc_message.as_deref().and_then(|m| m.principal.as_deref());
+            let matches = find_matching_interceptors(
+                &self.registry,
+                &topic,
+                caller_principal,
+                self.access_resolver.as_ref(),
+                &self.event_bus,
+            )
+            .await;
             dispatch_to_capsule_queues(
                 &capsule_queues,
                 &self.chain_locks,
@@ -380,23 +415,28 @@ impl EventDispatcher {
     }
 }
 
-/// Dispatch matching interceptors as a middleware chain.
+/// Dispatch matching interceptors for an event.
 ///
-/// Interceptors are called sequentially in priority order (lower fires first).
-/// Each interceptor returns an [`crate::capsule::InterceptResult`] that
-/// controls the chain:
+/// Matches at DISTINCT priorities form an ordered middleware chain: called
+/// sequentially in priority order (lower fires first), each returning an
+/// [`crate::capsule::InterceptResult`] that controls the chain:
 /// - `Continue` — pass (possibly modified) payload to the next interceptor
 /// - `Final` — short-circuit with a response, no further interceptors fire
 /// - `Deny` — short-circuit with denial, audit-logged, no further interceptors fire
 ///
+/// Matches that all share ONE priority have no defined order, so they are an
+/// independent fan-out (N capsules each reacting to the same event): each is
+/// dispatched on its own per-(capsule, principal) consumer and runs
+/// concurrently, with no cross-subscriber short-circuit — one responder's
+/// `Final`/`Deny`/error/slowness cannot suppress or stall the others.
+///
 /// Within a single capsule, events are still delivered in publish order via
 /// per-(capsule, principal) mpsc queues (preserving IPC `seq` ordering and
-/// isolating principals from one another). The chain semantics apply across
-/// capsules for the same event.
+/// isolating principals from one another).
 fn dispatch_to_capsule_queues(
     queues: &CapsuleQueues,
     chain_locks: &ChainLocks,
-    matches: Vec<(Arc<dyn Capsule>, String)>,
+    matches: Vec<(Arc<dyn Capsule>, String, u32)>,
     topic: Arc<String>,
     payload_bytes: Arc<Vec<u8>>,
     ipc_message: Option<Arc<astrid_events::ipc::IpcMessage>>,
@@ -405,17 +445,11 @@ fn dispatch_to_capsule_queues(
         return;
     }
 
-    // Clone what we need for the spawned chain task.
-    let matches_owned: Vec<_> = matches
-        .into_iter()
-        .map(|(c, a)| (Arc::clone(&c), a))
-        .collect();
-
     let principal_key: PrincipalKey = ipc_message.as_deref().and_then(|m| m.principal.clone());
 
     // For single-interceptor events (common case), skip chain overhead.
-    if matches_owned.len() == 1 {
-        let (capsule, action) = matches_owned.into_iter().next().unwrap();
+    if matches.len() == 1 {
+        let (capsule, action, _priority) = matches.into_iter().next().unwrap();
         dispatch_single(
             queues,
             capsule,
@@ -428,8 +462,42 @@ fn dispatch_to_capsule_queues(
         return;
     }
 
-    // Multi-interceptor chain: run sequentially in priority order.
-    // Spawned as a task so the dispatcher loop doesn't block.
+    // Multiple matches at the SAME priority have no defined order between them
+    // (the priority sort is arbitrary among equal keys), so they are an
+    // independent fan-out — N capsules each reacting to one event — NOT an
+    // ordered middleware chain. Dispatch each on its OWN per-(capsule,
+    // principal) consumer so they run CONCURRENTLY and no subscriber's outcome
+    // (`Final`/`Deny`, an error, or a slow/throttled invocation) can suppress or
+    // stall the others. The previous single serial chain task let a slow leading
+    // member starve later ones — a 6-way `tool.v1.request.describe` fan-out
+    // reached only ~3 of 6 responders before the requester's window elapsed —
+    // and its per-(capsule, principal) chain lock made re-firing serialize
+    // instead of parallelize. Only a genuinely ORDERED set (members at DISTINCT
+    // priorities — an explicit "fire me before you" signal) keeps the
+    // sequential, short-circuiting chain below.
+    let lead_priority = matches[0].2;
+    if matches
+        .iter()
+        .all(|(_, _, priority)| *priority == lead_priority)
+    {
+        for (capsule, action, _priority) in matches {
+            dispatch_single(
+                queues,
+                capsule,
+                action,
+                Arc::clone(&topic),
+                Arc::clone(&payload_bytes),
+                ipc_message.clone(),
+                principal_key.clone(),
+            );
+        }
+        return;
+    }
+
+    // Distinct priorities → ordered middleware chain: run sequentially in
+    // priority order. Spawned as a task so the dispatcher loop doesn't block.
+    let matches_owned: Vec<(Arc<dyn Capsule>, String)> =
+        matches.into_iter().map(|(c, a, _)| (c, a)).collect();
     let topic_clone = Arc::clone(&topic);
     let ipc_clone = ipc_message.clone();
     let chain_locks_clone = Arc::clone(chain_locks);
@@ -816,17 +884,79 @@ fn dispatch_single(
 /// Find all capsules with interceptors matching the given topic.
 ///
 /// Takes a brief read lock on the registry. Only `Ready` capsules are
-/// considered. Returns `(capsule, action)` pairs sorted by interceptor
-/// priority (lower values fire first, default 100).
+/// considered. Returns `(capsule, action, priority)` tuples sorted by
+/// interceptor priority (lower values fire first, default 100). The priority is
+/// returned so the caller can distinguish an ordered chain (distinct
+/// priorities) from an independent fan-out (all equal).
+///
+/// # Per-principal capsule-access filter
+///
+/// When `topic` is in the **user-invocable surface** (`tool.v1.execute.*`,
+/// `cli.v1.command.execute`) **and** an `access_resolver` is wired, a
+/// matched capsule is kept only if `caller_principal` is granted it (or is
+/// an admin holding `*`). The filter is keyed on the **topic**, so a
+/// dual-role capsule's orchestration interceptors (on non-tool topics) are
+/// never filtered — they fall through the surface check unchanged. For all
+/// other topics the filter is a no-op and dispatch is identical to before.
+/// For an **authenticated, non-admin** caller a denied match is no longer a
+/// pure silent drop: before dropping, a [`IpcPayload::GrantRequired`] signal is
+/// published on `astrid.v1.approval` (grant-on-first-use, #998) so a broker/shim
+/// can elicit consent and, on approve, the kernel grants the capsule. The match
+/// is still dropped for THIS call (the capsule never sees the ungranted call);
+/// the caller's request simply finds no tool, exactly as if the capsule were not
+/// installed. A `None`/empty/`anonymous` caller (no authenticated principal to
+/// grant to) is still a pure silent drop with no signal.
 async fn find_matching_interceptors(
     registry: &RwLock<CapsuleRegistry>,
     topic: &str,
-) -> Vec<(Arc<dyn crate::capsule::Capsule>, String)> {
+    caller_principal: Option<&str>,
+    access_resolver: Option<&CapsuleAccessResolver>,
+    event_bus: &EventBus,
+) -> Vec<(Arc<dyn crate::capsule::Capsule>, String, u32)> {
+    // Compute the gate once per event, not per capsule. The filter only
+    // engages for the user-invocable surface with a resolver present;
+    // otherwise every topic dispatches unchanged (orchestration mesh).
+    let gate_surface = crate::access::is_user_invocable_surface(topic);
     let registry = registry.read().await;
     let mut matches: Vec<(Arc<dyn crate::capsule::Capsule>, String, u32)> = Vec::new();
+    // Dedup grant-on-use signals within a single dispatch pass (principal is
+    // fixed per call, so key on `capsule_id`). A `Vec<&str>` borrowing the
+    // registry-held ids beats a `HashSet<String>` for this tiny, gate-miss-only
+    // set — linear `contains`, no per-check allocation, a `String` built only on
+    // emit.
+    let mut grant_signalled: Vec<&str> = Vec::new();
     for capsule_id in registry.list() {
         if let Some(capsule) = registry.get(capsule_id) {
             if !matches!(capsule.state(), crate::capsule::CapsuleState::Ready) {
+                continue;
+            }
+            // Per-principal access gate for the user-invocable surface.
+            // Fail-closed: with the gate engaged and a resolver wired, an
+            // ungranted (or unknown/anonymous) caller drops this capsule's
+            // tool interceptors entirely.
+            if gate_surface
+                && let Some(resolver) = access_resolver
+                && !resolver.is_capsule_allowed(caller_principal, capsule.id())
+            {
+                // Grant-on-first-use (#998): for an authenticated non-admin
+                // caller, emit a `GrantRequired` signal before dropping. The
+                // grant TARGET is the kernel-stamped caller + this capsule —
+                // never any caller-supplied claim. Skip a `None`/empty/
+                // `anonymous` principal (no authenticated principal to grant).
+                if let Some(principal) = caller_principal
+                    && !principal.is_empty()
+                    && principal != "anonymous"
+                {
+                    let capsule_key = capsule_id.as_str();
+                    if !grant_signalled.contains(&capsule_key) {
+                        grant_signalled.push(capsule_key);
+                        crate::access::emit_grant_required(
+                            event_bus,
+                            principal,
+                            capsule_key.to_string(),
+                        );
+                    }
+                }
                 continue;
             }
             // RFC cargo-like-manifest: read effective interceptors
@@ -844,12 +974,23 @@ async fn find_matching_interceptors(
             }
         }
     }
-    // Sort by priority — lower values fire first.
-    matches.sort_by_key(|(_, _, priority)| *priority);
+    // Sort by priority (lower fires first), then by capsule id and action as a
+    // STABLE tiebreak so equal-priority members have a deterministic order.
+    // `registry.list()` iterates a HashMap (arbitrary per run), so a
+    // priority-only sort left ties (e.g. a mixed chain `[10, 20, 20]`) in
+    // non-deterministic order — which matters in the ordered-chain path, where a
+    // tied member's `Final`/`Deny` short-circuits its sibling. (An all-equal set
+    // dispatches concurrently, so order is irrelevant there, but a stable order
+    // keeps dispatch reproducible everywhere.) Priority rides along in the
+    // returned tuple so dispatch can distinguish an ordered chain (distinct
+    // priorities) from an independent fan-out (all equal).
+    matches.sort_by(|(a_cap, a_act, a_pri), (b_cap, b_act, b_pri)| {
+        a_pri
+            .cmp(b_pri)
+            .then_with(|| a_cap.id().as_str().cmp(b_cap.id().as_str()))
+            .then_with(|| a_act.cmp(b_act))
+    });
     matches
-        .into_iter()
-        .map(|(capsule, action, _)| (capsule, action))
-        .collect()
 }
 
 #[cfg(test)]

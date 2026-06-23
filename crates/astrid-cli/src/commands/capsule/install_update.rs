@@ -11,10 +11,11 @@
 //! never drifts from reality.
 
 use anyhow::{Context, bail};
+use astrid_capsule_install::github_source::{parse_github_source, strip_version_prefix};
 use astrid_capsule_install::scan_installed_capsules;
 use astrid_core::dirs::AstridHome;
 
-use super::install::{install_capsule, parse_github_source, strip_version_prefix};
+use super::install::install_capsule;
 use super::meta::{CapsuleMeta, read_meta};
 
 /// Result of checking a remote source for a newer capsule version.
@@ -133,7 +134,11 @@ pub(crate) async fn update_capsule(target: Option<&str>, workspace: bool) -> any
         })?;
 
         eprintln!("Updating {name} from {source}...");
-        install_capsule(&source, workspace).await
+        // Re-install exactly the capsule being updated. When `source` is a
+        // monorepo release that ships several `.capsule` assets, pass `name`
+        // as the selector so update refreshes only that one — not every
+        // capsule the release contains.
+        install_capsule(&source, Some(name), workspace).await
     } else {
         update_all_capsules(&home, workspace).await
     }
@@ -215,7 +220,9 @@ async fn update_all_capsules(home: &AstridHome, workspace: bool) -> anyhow::Resu
     let mut install_failed = 0u32;
     for (name, source) in &to_update {
         eprintln!("Updating {name} from {source}...");
-        if let Err(e) = install_capsule(source, workspace).await {
+        // Selector = the capsule being updated, so a monorepo source refreshes
+        // only this one (see the single-target update above).
+        if let Err(e) = install_capsule(source, Some(name), workspace).await {
             eprintln!("  Failed to update {name}: {e}");
             install_failed = install_failed.saturating_add(1);
         } else {

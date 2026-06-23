@@ -28,6 +28,12 @@ fn all_kernel_request_variants() -> Vec<KernelRequest> {
         KernelRequest::Shutdown { reason: None },
         KernelRequest::GetStatus,
         KernelRequest::ReloadCapsules,
+        KernelRequest::ReloadCapsule {
+            id: "x".to_string(),
+        },
+        KernelRequest::UnloadCapsule {
+            id: "x".to_string(),
+        },
         KernelRequest::InstallCapsule {
             source: "x".to_string(),
             workspace: false,
@@ -66,6 +72,9 @@ fn known_capabilities_covers_every_admin_request_cap() {
             name: "alice".into(),
             groups: vec![],
             grants: vec![],
+            inherit_from: None,
+            clone_from: None,
+            allow_admin_clone: false,
         },
         AdminRequestKind::AgentDelete {
             principal: p.clone(),
@@ -80,6 +89,8 @@ fn known_capabilities_covers_every_admin_request_cap() {
             principal: p.clone(),
             add_groups: vec![],
             remove_groups: vec![],
+            add_capsules: vec![],
+            remove_capsules: vec![],
         },
         AdminRequestKind::AgentList,
         AdminRequestKind::QuotaSet {
@@ -112,6 +123,18 @@ fn known_capabilities_covers_every_admin_request_cap() {
             principal: p.clone(),
             capabilities: vec![],
         },
+        AdminRequestKind::CapsTokenMint {
+            principal: p.clone(),
+            resource: "mcp://server:tool".into(),
+            permission: None,
+            ttl_secs: None,
+        },
+        AdminRequestKind::CapsTokenRevoke {
+            token_id: "00000000-0000-0000-0000-000000000000".into(),
+        },
+        AdminRequestKind::CapsTokenList {
+            principal: p.clone(),
+        },
         AdminRequestKind::InviteIssue {
             group: "agent".into(),
             expires_secs: None,
@@ -125,6 +148,22 @@ fn known_capabilities_covers_every_admin_request_cap() {
         },
         AdminRequestKind::InviteList,
         AdminRequestKind::InviteRevoke { token: "x".into() },
+        AdminRequestKind::PairDeviceIssue {
+            expires_secs: None,
+            label: None,
+            scope: astrid_core::kernel_api::PairScopeArg::Full,
+        },
+        AdminRequestKind::PairDeviceRedeem {
+            token: "x".into(),
+            public_key: String::new(),
+        },
+        AdminRequestKind::PairDeviceList {
+            principal: p.clone(),
+        },
+        AdminRequestKind::PairDeviceRevoke {
+            principal: p.clone(),
+            key_id: "k".into(),
+        },
     ];
 
     let scopes = [AuthorityScope::Self_, AuthorityScope::Global];

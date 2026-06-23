@@ -18,6 +18,7 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use anyhow::{Context, bail};
+use astrid_core::PrincipalId;
 use astrid_core::dirs::AstridHome;
 
 /// Content-address all `.wit` files under `source_dir/wit/`
@@ -121,6 +122,104 @@ fn content_address_wit_recursive(
         }
 
         hashes.insert(rel_path, hash);
+    }
+
+    Ok(())
+}
+
+/// Materialize the content-addressed WIT blobs into `principal`'s
+/// `home://wit/` directory so the introspection tools (`list_interfaces`
+/// / `read_interface` in the system capsule) can read them.
+///
+/// Those tools read `home://wit/<basename>`, which resolves to
+/// `<principal_home>/wit/<basename>`. The canonical content store at
+/// [`AstridHome::wit_dir`] is BLAKE3-keyed and lives outside any VFS
+/// scheme a capsule can reach (its `fs_read` grant is `home://` only),
+/// so the store alone leaves those tools with an empty directory. This
+/// mirrors a readable, human-named copy into the principal's home.
+///
+/// `principal` names the mirror's home target: the WIT lands under
+/// `home.principal_home(principal)/wit`. The caller passes
+/// [`crate::paths::install_principal`] — the same id used for the home-scoped
+/// install paths — so introspection tools resolve the mirror under the home
+/// they read from. (For a workspace install the capsule itself lives under
+/// `<cwd>/.astrid`, so `principal` names the mirror home, not necessarily the
+/// capsule's own directory.)
+///
+/// `wit_files` is the name→hash map returned by [`content_address_wit`]:
+/// keys are paths relative to the source `wit/` directory (e.g.
+/// `deps/astrid-contracts/astrid-contracts.wit`), values are BLAKE3
+/// hex. Bytes are read back from the store at `home.wit_dir()/{hash}.wit`
+/// — they were just written there, so no source round-trip is needed.
+///
+/// Files are named by the **basename** of the key: `read_interface`
+/// rejects any name containing `/`, so nested paths must be flattened.
+/// Idempotent: a basename already present with byte-identical content is
+/// skipped; one present with different content is overwritten
+/// (last-writer-wins). Collisions are acceptable for introspection
+/// tooling — the common shared files (`astrid-contracts.wit`,
+/// `capsule.wit`) are byte-identical across capsules by construction
+/// (same hash), so overwrite is a no-op for them.
+pub fn materialize_wit_mirror<S: std::hash::BuildHasher>(
+    home: &AstridHome,
+    principal: &PrincipalId,
+    wit_files: &HashMap<String, String, S>,
+) -> anyhow::Result<()> {
+    if wit_files.is_empty() {
+        return Ok(());
+    }
+
+    let wit_store = home.wit_dir();
+    let mirror_dir = home.principal_home(principal).root().join("wit");
+    std::fs::create_dir_all(&mirror_dir)
+        .with_context(|| format!("failed to create WIT mirror dir {}", mirror_dir.display()))?;
+
+    // Iterate in a stable order. `wit_files` is a HashMap, so raw iteration
+    // order is nondeterministic; in the (rare, documented) basename-collision
+    // case that would make the last-writer-wins winner depend on hash order.
+    // Sort by relative path so the outcome is reproducible across runs.
+    let mut entries: Vec<(&String, &String)> = wit_files.iter().collect();
+    entries.sort_by(|a, b| a.0.cmp(b.0));
+
+    for (rel_path, hash) in entries {
+        let Some(basename) = Path::new(rel_path).file_name() else {
+            continue;
+        };
+
+        let blob = wit_store.join(format!("{hash}.wit"));
+        let content = std::fs::read(&blob)
+            .with_context(|| format!("failed to read WIT blob {}", blob.display()))?;
+
+        let dest = mirror_dir.join(basename);
+
+        // Skip if already byte-identical — keeps re-installs idempotent
+        // and avoids churning the file when nothing changed.
+        if let Ok(existing) = std::fs::read(&dest)
+            && existing == content
+        {
+            continue;
+        }
+
+        // Atomic temp-and-rename so a concurrent reader never sees a
+        // half-written file. UUID temp name — sibling tokio tasks in
+        // the daemon share a pid and would race on a pid-based name.
+        let tmp = mirror_dir.join(format!(
+            "{}.tmp.{}",
+            basename.to_string_lossy(),
+            uuid::Uuid::new_v4().simple()
+        ));
+        if let Err(e) = std::fs::write(&tmp, &content) {
+            // Clean up the partial temp so a failed write doesn't leak an
+            // orphan into the mirror dir (mirrors the rename-failure path).
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e)
+                .with_context(|| format!("failed to write WIT mirror temp {}", tmp.display()));
+        }
+        if let Err(e) = std::fs::rename(&tmp, &dest) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e)
+                .with_context(|| format!("failed to rename WIT mirror to {}", dest.display()));
+        }
     }
 
     Ok(())

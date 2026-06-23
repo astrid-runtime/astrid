@@ -43,8 +43,7 @@ pub(crate) async fn dispatch(cli: Cli) -> Result<ExitCode> {
         && !matches!(
             cli.command,
             Some(
-                Commands::SelfUpdate
-                    | Commands::Update
+                Commands::Update(_)
                     | Commands::Completions(_)
                     // `mcp serve` owns stdout for the MCP JSON-RPC stream;
                     // a banner there would corrupt the protocol framing.
@@ -135,6 +134,7 @@ async fn dispatch_subcommand(
         Some(Commands::Quota { command }) => commands::quota::run(command).await,
         Some(Commands::Invite { command }) => commands::invite::run(command).await,
         Some(Commands::Keypair { command }) => commands::keypair::run(command),
+        Some(Commands::PairDevice { command }) => commands::pair_device::run(command).await,
         Some(Commands::Secret { command }) => commands::secret::run(command),
         Some(Commands::Voucher { command }) => commands::voucher::run(command),
         Some(Commands::Trust { command }) => commands::trust::run(command),
@@ -152,7 +152,7 @@ async fn dispatch_subcommand(
                     "`astrid build` is deprecated; use `astrid capsule build` instead."
                 )
             );
-            bootstrap::run_build_companion(
+            commands::capsule::build::run(
                 path.as_deref(),
                 output.as_deref(),
                 project_type.as_deref(),
@@ -207,8 +207,8 @@ async fn dispatch_subcommand(
         Some(Commands::Setup(args)) => commands::setup::run(&args),
         Some(Commands::Version(args)) => commands::version::run(&args),
         Some(Commands::Completions(args)) => commands::completions::run(&args),
-        Some(Commands::Update | Commands::SelfUpdate) => {
-            commands::self_update::run_self_update().await?;
+        Some(Commands::Update(args)) => {
+            commands::self_update::run_self_update(args).await?;
             Ok(ExitCode::SUCCESS)
         },
     }
@@ -217,8 +217,14 @@ async fn dispatch_subcommand(
 async fn dispatch_capsule(command: crate::cli::CapsuleCommands) -> Result<ExitCode> {
     use crate::cli::CapsuleCommands;
     match command {
-        CapsuleCommands::Install { source, workspace } => {
-            commands::capsule::install::install_capsule(&source, workspace).await?;
+        CapsuleCommands::New(args) => commands::capsule::new::run(&args),
+        CapsuleCommands::Install {
+            source,
+            capsule,
+            workspace,
+        } => {
+            commands::capsule::install::install_capsule(&source, capsule.as_deref(), workspace)
+                .await?;
             Ok(ExitCode::SUCCESS)
         },
         CapsuleCommands::Update { target, workspace } => {
@@ -236,6 +242,11 @@ async fn dispatch_capsule(command: crate::cli::CapsuleCommands) -> Result<ExitCo
             purge,
         } => {
             commands::capsule::remove::remove_capsule(&name, workspace, force, purge)?;
+            // The disk removal above is authoritative; this best-effort nudge
+            // mirrors it into a running daemon so the capsule's tools leave the
+            // live surface without a restart. Non-fatal: never affects the exit
+            // status of a successful removal.
+            commands::capsule::live_load::nudge_daemon_unload(&name).await;
             Ok(ExitCode::SUCCESS)
         },
         CapsuleCommands::Tree | CapsuleCommands::Deps => {
@@ -247,7 +258,7 @@ async fn dispatch_capsule(command: crate::cli::CapsuleCommands) -> Result<ExitCo
             output,
             project_type,
             from_mcp_json,
-        } => bootstrap::run_build_companion(
+        } => commands::capsule::build::run(
             path.as_deref(),
             output.as_deref(),
             project_type.as_deref(),
@@ -255,6 +266,12 @@ async fn dispatch_capsule(command: crate::cli::CapsuleCommands) -> Result<ExitCo
         ),
         CapsuleCommands::Config(args) => commands::capsule::config::run(&args),
         CapsuleCommands::Show(args) => commands::capsule::show::run(&args),
+        CapsuleCommands::Run {
+            provider,
+            verb,
+            args,
+        } => commands::capsule_verb::run_explicit(provider, verb, args).await,
+        CapsuleCommands::External(tokens) => commands::capsule_verb::run_external(tokens).await,
     }
 }
 

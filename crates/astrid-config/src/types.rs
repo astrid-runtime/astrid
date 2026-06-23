@@ -26,7 +26,7 @@ pub struct Config {
     pub model: ModelConfig,
     /// Runtime behaviour (context limits, summarisation).
     pub runtime: RuntimeSection,
-    /// Security policy and signature requirements.
+    /// Signature requirements and approval timeout.
     pub security: SecurityConfig,
     /// Budget limits for sessions and individual actions.
     pub budget: BudgetSection,
@@ -197,7 +197,7 @@ impl Default for RuntimeSection {
 // SecurityConfig
 // ---------------------------------------------------------------------------
 
-/// Top-level security settings (signatures, approval timeout, policy).
+/// Top-level security settings (signatures, approval timeout).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct SecurityConfig {
@@ -206,8 +206,6 @@ pub struct SecurityConfig {
     /// How long (in seconds) to wait for a human to respond to an approval
     /// request before timing out.
     pub approval_timeout_secs: u64,
-    /// Fine-grained policy rules (blocked tools, path restrictions, etc.).
-    pub policy: PolicySection,
 }
 
 impl Default for SecurityConfig {
@@ -215,73 +213,6 @@ impl Default for SecurityConfig {
         Self {
             require_signatures: false,
             approval_timeout_secs: 300,
-            policy: PolicySection::default(),
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// PolicySection
-// ---------------------------------------------------------------------------
-
-/// Fine-grained security policy controlling which tools, paths, and hosts are
-/// permitted, denied, or require explicit approval.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
-pub struct PolicySection {
-    /// Tool invocations that are unconditionally blocked.
-    pub blocked_tools: Vec<String>,
-    /// Tool invocations that always require human approval regardless of
-    /// capability tokens.
-    pub approval_required_tools: Vec<String>,
-    /// Filesystem path globs the agent is allowed to access. An empty list
-    /// means "no explicit allowlist" (workspace rules apply instead).
-    pub allowed_paths: Vec<String>,
-    /// Filesystem path globs the agent is never allowed to access.
-    pub denied_paths: Vec<String>,
-    /// Network host patterns the agent is allowed to contact. An empty list
-    /// means "no explicit allowlist".
-    pub allowed_hosts: Vec<String>,
-    /// Network host patterns the agent is never allowed to contact.
-    pub denied_hosts: Vec<String>,
-    /// Maximum size (in bytes) of any single tool argument. Prevents
-    /// exfiltration of large blobs.
-    pub max_argument_size: usize,
-    /// Whether delete operations always require human approval.
-    pub require_approval_for_delete: bool,
-    /// Whether network-accessing operations always require human approval.
-    pub require_approval_for_network: bool,
-}
-
-impl Default for PolicySection {
-    fn default() -> Self {
-        Self {
-            blocked_tools: vec![
-                "rm -rf /".to_owned(),
-                "rm -rf /*".to_owned(),
-                "sudo".to_owned(),
-                "su".to_owned(),
-                "mkfs".to_owned(),
-                "dd".to_owned(),
-                "chmod 777".to_owned(),
-                "shutdown".to_owned(),
-                "reboot".to_owned(),
-                "init".to_owned(),
-            ],
-            approval_required_tools: Vec::new(),
-            allowed_paths: Vec::new(),
-            denied_paths: vec![
-                "/etc/**".to_owned(),
-                "/boot/**".to_owned(),
-                "/sys/**".to_owned(),
-                "/proc/**".to_owned(),
-                "/dev/**".to_owned(),
-            ],
-            allowed_hosts: Vec::new(),
-            denied_hosts: Vec::new(),
-            max_argument_size: 1_048_576, // 1 MB
-            require_approval_for_delete: true,
-            require_approval_for_network: true,
         }
     }
 }

@@ -429,6 +429,12 @@ pub enum AuditAction {
         /// entries that have no params struct.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         params: Option<serde_json::Value>,
+        /// The authenticating device `key_id` when the request was
+        /// device-scoped, so an auditor can see which paired device acted and
+        /// whether the deny was a per-device-scope denial. Non-secret (derived
+        /// from the public key); `None` for a full-authority request.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        device_key_id: Option<String>,
     },
 }
 
@@ -526,6 +532,7 @@ impl AuditAction {
                 required_capability,
                 target_principal,
                 params: _,
+                device_key_id: _,
             } => match target_principal {
                 Some(target) => {
                     format!("Admin {method} on {target} (capability {required_capability})")

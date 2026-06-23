@@ -8,6 +8,9 @@
 //! has no dependency on `astrid-core` — it must compile on
 //! `wasm32-unknown-unknown` without dragging in the kernel).
 
+mod readiness;
+pub use readiness::{AgentLoopReadiness, AgentReadinessProbe, MissingImport};
+
 use crate::PrincipalId;
 use crate::profile::Quotas;
 use serde::{Deserialize, Serialize};
@@ -41,6 +44,23 @@ pub enum KernelRequest {
     ListCapsules,
     /// Reload all capsules from the file system.
     ReloadCapsules,
+    /// Reload a single capsule by id without a daemon restart: hot-swap it if
+    /// already loaded (picking up the new on-disk bytes a reinstall wrote), or
+    /// load it if not yet registered. Lets a fresh `astrid capsule install` /
+    /// `update` make the capsule usable without restarting the daemon.
+    ReloadCapsule {
+        /// The capsule id (its `[package].name`).
+        id: String,
+    },
+    /// Unload a single capsule by id without a daemon restart: unregister it
+    /// from the running daemon so it stops receiving events and its tools leave
+    /// the surface. Lets a fresh `astrid capsule remove` take effect live. The
+    /// on-disk removal is authoritative and dependency-checked by the CLI; this
+    /// only mirrors that into the running registry.
+    UnloadCapsule {
+        /// The capsule id (its `[package].name`).
+        id: String,
+    },
     /// Request the list of globally registered slash commands.
     GetCommands,
     /// Request metadata about loaded capsules (manifests, providers, interceptors).
@@ -53,6 +73,9 @@ pub enum KernelRequest {
     },
     /// Request daemon status information.
     GetStatus,
+    /// Request agent-loop readiness: whether the loaded capsule set can serve
+    /// an agent chat turn. Read-only, name-agnostic — see [`AgentLoopReadiness`].
+    GetAgentReadiness,
 }
 
 /// Management API responses from the core daemon.
@@ -69,6 +92,8 @@ pub enum KernelResponse {
     Error(String),
     /// Daemon status information.
     Status(DaemonStatus),
+    /// Agent-loop readiness report.
+    AgentReadiness(AgentLoopReadiness),
     /// The request requires user capability approval before it can proceed.
     ApprovalRequired {
         /// Unique ID for this specific action request.
@@ -123,15 +148,87 @@ pub struct CapsuleMetadataEntry {
     pub interceptor_events: Vec<String>,
 }
 
-/// Information about a registered slash command.
+/// How a capsule-declared command is surfaced to operators.
+///
+/// A capsule declares commands via `[[command]]` in its `Capsule.toml`.
+/// The `kind` selects the surface:
+///
+/// * [`CommandKind::Slash`] — an in-TUI slash command (`/git`), dispatched
+///   through the chat loop. This is the historical behaviour and the
+///   default when `kind` is absent, so every pre-existing manifest keeps
+///   parsing and behaving identically.
+/// * [`CommandKind::Cli`] — a top-level CLI verb invocable as
+///   `astrid capsule <verb> [args...]`, dispatched to the providing capsule
+///   over IPC as a non-interactive one-shot.
+///
+/// # CLI-verb wire contract (kernel does NOT interpret it)
+///
+/// The kernel plays no part in running a CLI verb beyond surfacing its
+/// existence through `GetCommands`. Dispatch is pure capsule-space IPC:
+///
+/// * **Run** — the CLI publishes an `IpcPayload::RawJson` message on the
+///   provider-targeted topic `cli.v1.command.run.<provider_capsule>` with
+///   body `{ "req_id": <uuid>, "command": <verb>, "args": [<string>...] }`.
+/// * **Result** — the capsule replies on `cli.v1.command.result.<req_id>`
+///   with body `{ "req_id": <uuid>, "exit_code": <number>,
+///   "output": <string>, "error": <string?> }`.
+///
+/// **Security rationale for the provider-targeted run topic:** a capsule
+/// subscribes only `cli.v1.command.run.<its-own-id>`, so a capsule never
+/// observes the command arguments addressed to a *different* capsule.
+/// Per-`req_id` result topics keep concurrent invocations isolated. The
+/// kernel routes these topics but never reads or validates the payload
+/// bodies — they are capsule-space contract, not kernel surface.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CommandKind {
+    /// In-TUI slash command (default). Listed and dispatched by the chat
+    /// loop, never as a top-level CLI verb.
+    #[default]
+    Slash,
+    /// Top-level CLI verb: `astrid capsule <verb> [args...]`.
+    Cli,
+}
+
+impl CommandKind {
+    /// Returns `true` for the default kind so serializers can omit it
+    /// (matches the rest of the manifest fields' conventions).
+    #[must_use]
+    pub fn is_default(&self) -> bool {
+        matches!(self, Self::Slash)
+    }
+}
+
+/// Built-in `astrid capsule` subcommand names that a capsule-declared CLI
+/// verb (`kind = "cli"`) may NOT shadow.
+///
+/// A `kind = "cli"` command whose name appears here is rejected at manifest
+/// parse time (fail closed) so a capsule cannot mask or impersonate a
+/// built-in verb such as `install` or `remove`.
+///
+/// **This list MUST stay in sync with the `CapsuleCommands` clap enum in
+/// `astrid-cli` (`cli.rs`).** A unit test in astrid-cli asserts every
+/// `CapsuleCommands` variant's clap name appears here; if you add a
+/// built-in `astrid capsule` subcommand, add its name here too.
+pub const RESERVED_CAPSULE_VERBS: &[&str] = &[
+    "new", "install", "update", "list", "remove", "tree", "deps", "build", "config", "show", "run",
+    "help",
+];
+
+/// Information about a registered capsule command.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CommandInfo {
-    /// The slash command trigger (e.g. `/git`).
+    /// The command trigger (e.g. `git`; rendered `/git` for slash commands).
     pub name: String,
     /// A brief description of what the command does.
     pub description: String,
     /// The capsule that provides this command.
     pub provider_capsule: String,
+    /// How this command is surfaced (slash vs CLI verb). Defaults to
+    /// [`CommandKind::Slash`] for wire compatibility with daemons that
+    /// predate the field.
+    #[serde(default, skip_serializing_if = "CommandKind::is_default")]
+    pub kind: CommandKind,
 }
 
 // ---------------------------------------------------------------------------
@@ -181,6 +278,82 @@ impl From<AdminRequestKind> for AdminKernelRequest {
     }
 }
 
+/// Requested capability scope for a [`AdminRequestKind::PairDeviceIssue`]
+/// token — what the redeemed device is allowed to do with the principal's
+/// authority.
+///
+/// The kernel resolves this against the ISSUER's *effective* capability set at
+/// issue time (no-escalation: a device can never confer more than the issuer
+/// holds, where the issuer's effective set is itself narrowed by the issuer's
+/// own authenticating device scope) and stamps the resolved
+/// [`DeviceScope`](crate::DeviceScope) onto the minted token, so the redeemed
+/// device is attenuated to exactly the granted scope on every transport.
+///
+/// On the wire it is an internally-tagged object: `{ "kind": "full" }`,
+/// `{ "kind": "preset", "name": "use-only" }`, or
+/// `{ "kind": "explicit", "allow": [...], "deny": [...] }`. The `scope` field
+/// on `PairDeviceIssue` defaults to [`PairScopeArg::Full`] when omitted, so
+/// pre-scope callers (and single-tenant admin flows) keep their existing
+/// behaviour — but minting a `Full` device additionally requires the issuer to
+/// hold `self:auth:pair:admin`, enforced in the handler.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+pub enum PairScopeArg {
+    /// Mint an unattenuated device — it acts with the principal's full
+    /// effective capability set. Requires the issuer to hold
+    /// `self:auth:pair:admin`. The default when `scope` is omitted (the
+    /// permissive default is still gated on the admin cap, so it does not
+    /// relax authority).
+    #[default]
+    Full,
+    /// Resolve a named scope preset (e.g. `"use-only"`) via
+    /// [`DeviceScope::preset`](crate::DeviceScope::preset). An unknown name is
+    /// rejected at issue time.
+    Preset {
+        /// The preset name.
+        name: String,
+    },
+    /// An explicit allow/deny capability scope. Every `allow` pattern must be
+    /// held by the issuer (subset check); `deny` patterns purely restrict.
+    Explicit {
+        /// Capability patterns the device may exercise.
+        #[serde(default)]
+        allow: Vec<String>,
+        /// Capability patterns the device is forbidden to exercise (deny wins).
+        #[serde(default)]
+        deny: Vec<String>,
+    },
+}
+
+/// Serde default for [`AdminRequestKind::PairDeviceIssue::scope`] — `Full`,
+/// for back-compat with callers that predate the `scope` field. A `Full` mint
+/// is independently gated on `self:auth:pair:admin` in the handler, so the
+/// permissive *default* does not relax the *authority* required to use it.
+fn default_pair_scope() -> PairScopeArg {
+    PairScopeArg::Full
+}
+
+/// Per-device summary returned by [`AdminRequestKind::PairDeviceList`].
+///
+/// Carries only non-secret, fingerprint-level identity — the deterministic
+/// `key_id`, the operator label, the granted [`DeviceScope`](crate::DeviceScope),
+/// and the pairing timestamp. The raw ed25519 public key is **never** surfaced;
+/// the `key_id` (derived from the already-public pubkey) is the stable handle
+/// for listing and revocation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeviceKeyInfo {
+    /// Deterministic per-device fingerprint handle.
+    pub key_id: String,
+    /// Operator/user-facing label captured at pairing time, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    /// Capability attenuation scope the device authenticates under.
+    pub scope: crate::DeviceScope,
+    /// Unix epoch seconds when the device was paired (`0` for migrated
+    /// legacy keys that predate pairing-time recording).
+    pub created_at: i64,
+}
+
 /// Typed admin request body — flattened into [`AdminKernelRequest`] on
 /// the wire as `{ "method": "...", "params": {...} }`.
 ///
@@ -205,6 +378,37 @@ pub enum AdminRequestKind {
         /// Per-principal capability grants beyond group inheritance.
         #[serde(default)]
         grants: Vec<String>,
+        /// Opt-in inheritance source. When `Some`, the new principal
+        /// receives a full copy of this source principal's `.config/env/`,
+        /// per-capsule KV namespaces, and per-capsule secret files. When
+        /// `None` (the default) the new principal inherits **nothing** —
+        /// least privilege, no silent credential leak from `default`.
+        ///
+        /// `#[serde(default)]` keeps older serialized requests (no field)
+        /// deserializing as `None`, which is the secure default.
+        #[serde(default)]
+        inherit_from: Option<PrincipalId>,
+        /// Opt-in clone source. When `Some`, the new principal is a full
+        /// replica of this source: its capability **profile** (groups,
+        /// grants, revokes, network egress, process-spawn allow-list,
+        /// quotas) AND its **state** (the same env/KV/secret copy
+        /// `inherit_from` performs). The source's `auth` (public keys /
+        /// authenticators) is deliberately NOT copied — each principal keeps
+        /// its own identity. Mutually exclusive with `inherit_from`,
+        /// `groups`, and `grants` (the source determines all of them); the
+        /// kernel rejects a request that sets both `clone_from` and any of
+        /// those. When the source confers admin (resolves to `*`), the
+        /// request is rejected unless `allow_admin_clone` is set.
+        ///
+        /// `#[serde(default)]` keeps older requests deserializing as `None`.
+        #[serde(default)]
+        clone_from: Option<PrincipalId>,
+        /// Acknowledge cloning an admin-conferring source (one that resolves
+        /// to the universal `*`). Without it, `clone_from` of such a source
+        /// is rejected — mirrors `--unsafe-admin` on `caps grant '*'` and
+        /// `group create --caps '*'`. Ignored unless `clone_from` is set.
+        #[serde(default)]
+        allow_admin_clone: bool,
     },
     /// Delete an existing agent identity. The `default` principal is
     /// rejected unconditionally. The principal's home directory is NOT
@@ -245,6 +449,18 @@ pub enum AdminRequestKind {
         /// who want a baseline should add `agent` explicitly.
         #[serde(default)]
         remove_groups: Vec<String>,
+        /// Granted capsule ids to add (idempotent). Grants the principal
+        /// access to invoke the named capsule's user-invocable tool
+        /// surface; the kernel gates `tool.v1.execute.*` /
+        /// `cli.v1.command.execute` at dispatch against this set. New
+        /// principals start with none; admins (`*`) bypass the gate.
+        #[serde(default)]
+        add_capsules: Vec<String>,
+        /// Granted capsule ids to remove (idempotent — missing entries
+        /// are no-ops). Revokes the principal's access to the named
+        /// capsule's tool surface.
+        #[serde(default)]
+        remove_capsules: Vec<String>,
     },
     /// Replace the target principal's [`Quotas`] block. Values are
     /// validated before the atomic profile write.
@@ -330,6 +546,45 @@ pub enum AdminRequestKind {
         /// Capability patterns to revoke.
         capabilities: Vec<String>,
     },
+    /// Mint a signed capability token granting `principal` access to
+    /// `resource` (issue #929). Lets an operator pre-grant tool access (e.g.
+    /// `mcp://server:tool`) so the agent never hits a per-use approval
+    /// elicitation. The token is signed by the runtime key — the same key the
+    /// approval interceptor trusts as issuer — so it authorizes immediately
+    /// and survives daemon restarts (persistent scope). Revocable via
+    /// [`Self::CapsTokenRevoke`]; principal-scoped (a token minted for Alice
+    /// never authorizes Bob); admin-gated by `caps:token:mint`.
+    CapsTokenMint {
+        /// Principal the token is minted for. Only this principal can
+        /// consume it (issue #668 cross-principal binding).
+        principal: PrincipalId,
+        /// Resource pattern the token grants, e.g. `mcp://server:tool`.
+        resource: String,
+        /// Permission to grant. Defaults to `"invoke"` when absent. Parsed
+        /// into [`Permission`](astrid_core::types::Permission); an unknown
+        /// string is rejected with a bad-input error.
+        #[serde(default)]
+        permission: Option<String>,
+        /// Token lifetime in seconds. `None` = permanent (valid until
+        /// revoked); `Some(n)` = expires after `n` seconds.
+        #[serde(default)]
+        ttl_secs: Option<u64>,
+    },
+    /// Revoke a previously minted capability token by its id (issue #929).
+    /// Revocation is global and final — the token no longer authorizes for
+    /// any principal. Admin-gated by `caps:token:revoke`.
+    CapsTokenRevoke {
+        /// The token id to revoke (the `token_id` string returned by
+        /// [`Self::CapsTokenMint`]).
+        token_id: String,
+    },
+    /// List the capability tokens minted for `principal` (issue #929).
+    /// Returns only non-revoked, non-expired tokens owned by that principal.
+    /// Admin-gated by `caps:token:list`.
+    CapsTokenList {
+        /// Principal whose tokens are listed.
+        principal: PrincipalId,
+    },
     /// Issue a new invite token. Capability-gated by `invite:issue`.
     /// The kernel persists the token under `etc/invites.toml` with
     /// expiry + remaining use count, and the caller publishes the
@@ -398,6 +653,14 @@ pub enum AdminRequestKind {
         /// `AuthConfig.public_keys` once the token is redeemed.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         label: Option<String>,
+        /// Capability scope the redeemed device will authenticate under.
+        /// Defaults to [`PairScopeArg::Full`] when omitted, for back-compat
+        /// with pre-scope callers; a `Full` mint is independently gated on
+        /// `self:auth:pair:admin` in the handler, and an `Explicit`/`Preset`
+        /// scope is validated to be a subset of the issuer's effective
+        /// capabilities (no escalation).
+        #[serde(default = "default_pair_scope")]
+        scope: PairScopeArg,
     },
     /// Redeem a pair-device token. Like `InviteRedeem`, the kernel
     /// dispatcher special-cases this to bypass the capability
@@ -410,6 +673,30 @@ pub enum AdminRequestKind {
         token: String,
         /// Hex-encoded ed25519 public key (32 bytes / 64 hex chars).
         public_key: String,
+    },
+    /// List the paired devices (registered keys) on a principal's
+    /// `AuthConfig.public_keys`. Gated by `self:auth:pair` (self form) /
+    /// `auth:pair` (global form) exactly like [`PairDeviceIssue`] — a caller
+    /// lists their own devices unless they hold the global form. The response
+    /// carries only fingerprint-level identity ([`DeviceKeyInfo`]); the raw
+    /// pubkey is never surfaced.
+    PairDeviceList {
+        /// Principal whose devices are listed.
+        principal: PrincipalId,
+    },
+    /// Revoke a single paired device by its deterministic `key_id`, removing
+    /// the matching [`DeviceKey`](crate::DeviceKey) from the principal's
+    /// `AuthConfig.public_keys`. If it was the last keypair entry the
+    /// `AuthMethod::Keypair` method is dropped too (mirrors the add side). A
+    /// revoked device fails closed at the kernel cap-gate immediately (its key
+    /// is gone from `public_keys`), and the gateway evicts any live bearer
+    /// scoped to that `key_id`. Gated by `self:auth:pair` (self form) /
+    /// `auth:pair` (global form), like [`PairDeviceIssue`].
+    PairDeviceRevoke {
+        /// Principal whose device is being revoked.
+        principal: PrincipalId,
+        /// The deterministic `key_id` of the device to remove.
+        key_id: String,
     },
 }
 
@@ -475,6 +762,15 @@ pub enum AdminResponseBody {
     PairToken(PairTokenIssued),
     /// Response for [`AdminRequestKind::PairDeviceRedeem`].
     PairTokenRedeemed(PairTokenRedeemed),
+    /// Response for [`AdminRequestKind::PairDeviceList`] — the principal's
+    /// paired devices as fingerprint-level summaries (never the raw pubkey).
+    PairDeviceListed(Vec<DeviceKeyInfo>),
+    /// Response for [`AdminRequestKind::PairDeviceRevoke`] — the `key_id`
+    /// of the device that was removed.
+    PairDeviceRevoked {
+        /// The `key_id` of the revoked device.
+        key_id: String,
+    },
     /// The request failed.
     Error(String),
 }
@@ -600,6 +896,11 @@ pub struct PairTokenRedeemed {
     /// Lets the redeemer verify the kernel registered the key it
     /// sent rather than substituting one of its own.
     pub public_key_fingerprint: String,
+    /// Deterministic `key_id` of the registered device key (the stable
+    /// per-device handle derived from the pubkey). The gateway mints the new
+    /// device's bearer scoped to THIS `key_id` so the device authenticates
+    /// with — and is attenuated to — its own registered key.
+    pub key_id: String,
 }
 
 /// Summary of an outstanding invite returned by
@@ -639,4 +940,52 @@ pub struct GroupSummary {
     /// `true` for built-in groups (`admin`, `agent`, `restricted`).
     /// Clients should treat built-ins as read-only.
     pub builtin: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{CommandInfo, CommandKind};
+
+    #[test]
+    fn command_info_kind_defaults_to_slash_on_wire() {
+        // A frame from a daemon that predates the `kind` field has no
+        // `kind` key; it must deserialize to the Slash default so an older
+        // daemon's commands keep listing as slash commands.
+        let json = serde_json::json!({
+            "name": "git",
+            "description": "git ops",
+            "provider_capsule": "git-capsule",
+        });
+        let info: CommandInfo = serde_json::from_value(json).unwrap();
+        assert_eq!(info.kind, CommandKind::Slash);
+    }
+
+    #[test]
+    fn command_info_kind_roundtrips_cli() {
+        let info = CommandInfo {
+            name: "deploy".into(),
+            description: "deploy it".into(),
+            provider_capsule: "ops".into(),
+            kind: CommandKind::Cli,
+        };
+        let json = serde_json::to_value(&info).unwrap();
+        // `cli` is not the default, so it is serialized.
+        assert_eq!(json.get("kind").and_then(|k| k.as_str()), Some("cli"));
+        let back: CommandInfo = serde_json::from_value(json).unwrap();
+        assert_eq!(back.kind, CommandKind::Cli);
+    }
+
+    #[test]
+    fn command_info_default_kind_omitted_from_wire() {
+        let info = CommandInfo {
+            name: "git".into(),
+            description: "git ops".into(),
+            provider_capsule: "git-capsule".into(),
+            kind: CommandKind::Slash,
+        };
+        let json = serde_json::to_value(&info).unwrap();
+        // Default kind is skipped so the wire shape is byte-compatible with
+        // pre-field consumers.
+        assert!(json.get("kind").is_none());
+    }
 }

@@ -155,7 +155,10 @@ pub fn spawn_watcher(
             let astrid_events::ipc::IpcPayload::RawJson(val) = &message.payload else {
                 continue;
             };
-            if val.get("method").and_then(serde_json::Value::as_str) != Some("AgentDelete") {
+            // The kernel publishes the dotted wire-name from `admin_request_method`
+            // (`admin.agent.delete`), NOT the PascalCase enum variant — matching
+            // the variant name here meant the watcher never fired in production.
+            if val.get("method").and_then(serde_json::Value::as_str) != Some("admin.agent.delete") {
                 continue;
             }
             if val.get("outcome").and_then(serde_json::Value::as_str) != Some("success") {
@@ -241,6 +244,86 @@ pub fn spawn_watcher(
     });
 }
 
+/// Spawn the per-device bearer-revocation watcher. Subscribes to the kernel's
+/// audit topic and adds a device's `key_id` to `revoked_key_ids` whenever a
+/// successful `admin.auth.pair.revoke` admin op lands, so a live device-scoped
+/// bearer is rejected at the HTTP edge immediately (the kernel cap-gate already
+/// fails it closed — this is defense in depth on the bearer).
+///
+/// Detached: terminates when the bus is dropped (daemon shutdown). In-memory
+/// only — a revoked key never needs to survive a restart because the profile
+/// it was removed from is the source of truth and the bearer's TTL bounds the
+/// window regardless.
+///
+/// # Panics
+/// Panics if the `revoked_key_ids` `RwLock` is poisoned — same fail-stop
+/// posture as the verify path.
+#[allow(clippy::implicit_hasher)] // map shape is internal to this module
+pub fn spawn_key_revocation_watcher(
+    bus: Arc<astrid_events::EventBus>,
+    revoked_key_ids: Arc<RwLock<std::collections::HashMap<String, u64>>>,
+) {
+    tokio::spawn(async move {
+        let mut receiver =
+            bus.subscribe_topic_as(crate::routes::events::AUDIT_TOPIC, "key_revocation_watcher");
+        while let Some(event) = receiver.recv().await {
+            let astrid_events::AstridEvent::Ipc { message, .. } = &*event else {
+                continue;
+            };
+            let astrid_events::ipc::IpcPayload::RawJson(val) = &message.payload else {
+                continue;
+            };
+            // The top-level `method` is the kernel's wire-name for the op (see
+            // `admin_request_method`). Only successful device revocations evict.
+            if val.get("method").and_then(serde_json::Value::as_str)
+                != Some("admin.auth.pair.revoke")
+            {
+                continue;
+            }
+            if val.get("outcome").and_then(serde_json::Value::as_str) != Some("success") {
+                continue;
+            }
+            // `key_id` lives in the sanitized request params (a non-secret
+            // fingerprint, recorded verbatim): `params.params.key_id`.
+            let Some(key_id) = val
+                .get("params")
+                .and_then(|p| p.get("params"))
+                .and_then(|p| p.get("key_id"))
+                .and_then(serde_json::Value::as_str)
+            else {
+                tracing::warn!(
+                    audit = ?val,
+                    "pair-device revoke audit event missing key_id — cannot evict bearer"
+                );
+                continue;
+            };
+            // `ts_epoch` from the audit envelope is the revocation moment; a
+            // bearer minted at-or-before it is dead, one minted after a re-pair
+            // survives. Mirrors the principal-level `AgentDelete` watcher.
+            let ts_epoch = val
+                .get("ts_epoch")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or_else(|| {
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map_or(0, |d| d.as_secs())
+                });
+            {
+                let mut guard = revoked_key_ids
+                    .write()
+                    .expect("revoked-key-id map poisoned — fail-stop");
+                // Idempotent: a duplicate / replayed revoke event must not move
+                // the epoch backward (which could resurrect a dead bearer).
+                let prev = guard.get(key_id).copied().unwrap_or(0);
+                if ts_epoch > prev {
+                    guard.insert(key_id.to_string(), ts_epoch);
+                }
+            }
+            tracing::info!(key_id = %key_id, revoked_at_epoch = ts_epoch, "device bearer revocation recorded");
+        }
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -287,7 +370,7 @@ mod tests {
 
         let event = serde_json::json!({
             "ts_epoch": 1_700_000_500_u64,
-            "method": "AgentDelete",
+            "method": "admin.agent.delete",
             "required_capability": "self:agent:delete",
             "principal": "admin",
             "target_principal": "alice",
@@ -343,7 +426,8 @@ mod tests {
                 let astrid_events::ipc::IpcPayload::RawJson(val) = &message.payload else {
                     continue;
                 };
-                if val.get("method").and_then(serde_json::Value::as_str) != Some("AgentDelete")
+                if val.get("method").and_then(serde_json::Value::as_str)
+                    != Some("admin.agent.delete")
                     || val.get("outcome").and_then(serde_json::Value::as_str) != Some("success")
                 {
                     continue;

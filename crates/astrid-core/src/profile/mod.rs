@@ -36,8 +36,11 @@ use std::sync::OnceLock;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+mod device;
 mod io_impl;
 mod validation;
+
+pub use device::{DEVICE_KEY_ID_HEX_LEN, DeviceKey, DeviceScope, device_key_id_fingerprint};
 
 /// Current profile schema version. Bumped on breaking field changes.
 ///
@@ -81,6 +84,14 @@ pub const BACKGROUND_PROCESSES_UPPER_BOUND: u32 = 256;
 
 /// Maximum length of a single entry in [`PrincipalProfile::groups`].
 pub const MAX_GROUP_NAME_LEN: usize = 64;
+
+/// Maximum length of a single entry in [`PrincipalProfile::capsules`].
+///
+/// A defensive sanity bound on operator-supplied grant entries — `CapsuleId`
+/// itself caps only the charset, not the length, so this is the profile's own
+/// limit rather than a kernel-enforced capsule-id cap. An entry longer than
+/// this is well beyond any realistic capsule id, so reject it on load.
+pub const MAX_CAPSULE_GRANT_LEN: usize = 128;
 
 /// Result alias for profile operations.
 pub type ProfileResult<T> = Result<T, ProfileError>;
@@ -142,6 +153,24 @@ pub struct PrincipalProfile {
     #[serde(default)]
     pub revokes: Vec<String>,
 
+    /// Capsule ids this principal is granted access to invoke.
+    ///
+    /// The kernel gates the **user-invocable tool surface**
+    /// (`tool.v1.execute.*`, `cli.v1.command.execute`) at dispatch: a
+    /// principal may have a capsule's tool dispatched to it only if the
+    /// capsule's [`CapsuleId`](../../astrid_capsule/capsule/struct.CapsuleId.html)
+    /// appears here. The internal orchestration mesh is **not** gated by
+    /// this field — only the tool/CLI execute surface. New principals get
+    /// **no** capsule access by default (empty), consistent with the
+    /// inherit-nothing model (#924); admins (`*`) bypass the filter
+    /// entirely, so single-tenant `default` is unaffected.
+    ///
+    /// Each entry is validated against the same grammar as a
+    /// [`CapsuleId`](../../astrid_capsule/capsule/struct.CapsuleId.html):
+    /// non-empty, lowercase alphanumeric and hyphens only.
+    #[serde(default)]
+    pub capsules: Vec<String>,
+
     /// Authentication configuration.
     #[serde(default)]
     pub auth: AuthConfig,
@@ -183,9 +212,31 @@ pub struct AuthConfig {
     #[serde(default)]
     pub methods: Vec<AuthMethod>,
 
-    /// Public keys bound to this principal (encoding TBD; see Layer 5).
+    /// Device keys bound to this principal.
+    ///
+    /// Each entry is a [`DeviceKey`] carrying the registered ed25519 public
+    /// key plus the capability [`DeviceScope`] that pairing was granted. On
+    /// disk an entry may be a legacy bare `"ed25519:<hex>"` string (migrated
+    /// to a Full-scope device on load) or the full struct form; serialization
+    /// always re-emits the struct form.
     #[serde(default)]
-    pub public_keys: Vec<String>,
+    pub public_keys: Vec<DeviceKey>,
+}
+
+impl AuthConfig {
+    /// Look up a registered device by its deterministic `key_id`.
+    #[must_use]
+    pub fn device_by_key_id(&self, key_id: &str) -> Option<&DeviceKey> {
+        self.public_keys.iter().find(|k| k.key_id == key_id)
+    }
+
+    /// Look up a registered device by its canonical lowercase-hex pubkey.
+    #[must_use]
+    pub fn device_by_pubkey(&self, hex_lower: &str) -> Option<&DeviceKey> {
+        self.public_keys
+            .iter()
+            .find(|k| k.matches_pubkey(hex_lower))
+    }
 }
 
 /// Network egress configuration for a principal.
@@ -306,6 +357,7 @@ impl Default for PrincipalProfile {
             groups: Vec::new(),
             grants: Vec::new(),
             revokes: Vec::new(),
+            capsules: Vec::new(),
             auth: AuthConfig::default(),
             network: NetworkConfig::default(),
             process: ProcessConfig::default(),
@@ -354,6 +406,7 @@ mod tests {
         assert!(p.groups.is_empty());
         assert!(p.grants.is_empty());
         assert!(p.revokes.is_empty());
+        assert!(p.capsules.is_empty(), "capsule grants must default empty");
         assert!(p.auth.methods.is_empty());
         assert!(p.auth.public_keys.is_empty());
         assert!(p.network.egress.is_empty(), "egress must fail-closed");
@@ -399,9 +452,10 @@ mod tests {
             groups: vec!["admins".into(), "ops_team".into()],
             grants: vec!["capsule:install".into()],
             revokes: vec!["system:shutdown".into()],
+            capsules: vec!["identity".into(), "registry".into()],
             auth: AuthConfig {
                 methods: vec![AuthMethod::Keypair, AuthMethod::Passkey],
-                public_keys: vec!["ed25519:AAAA".into()],
+                public_keys: vec![DeviceKey::new("a".repeat(64), DeviceScope::Full, None, 0)],
             },
             network: NetworkConfig {
                 egress: vec!["api.example.com:443".into()],
@@ -421,5 +475,64 @@ mod tests {
         let s = toml::to_string_pretty(&p).unwrap();
         let back: PrincipalProfile = toml::from_str(&s).unwrap();
         assert_eq!(p, back);
+    }
+
+    // ── AuthConfig device-key list (migration + lookups) ──────────────────
+
+    #[test]
+    fn auth_config_legacy_bare_list_loads_as_full_devices() {
+        // The historical `public_keys = ["ed25519:<hex>"]` TOML form round-
+        // trips into Full-scope DeviceKeys.
+        let hex = "a".repeat(64);
+        let toml_src = format!("methods = [\"keypair\"]\npublic_keys = [\"ed25519:{hex}\"]\n");
+        let auth: AuthConfig = toml::from_str(&toml_src).unwrap();
+        assert_eq!(auth.public_keys.len(), 1);
+        assert_eq!(auth.public_keys[0].pubkey, hex);
+        assert_eq!(auth.public_keys[0].scope, DeviceScope::Full);
+    }
+
+    #[test]
+    fn auth_config_mixed_bare_and_struct_list() {
+        // One legacy bare string + one full struct entry deserialize together.
+        let bare = "a".repeat(64);
+        let full = "b".repeat(64);
+        let json = format!(
+            r#"{{"methods":["keypair"],"public_keys":["ed25519:{bare}",{{"pubkey":"{full}","scope":{{"type":"scoped","allow":["self:agent:prompt"],"deny":[]}},"label":"tablet","created_at":99}}]}}"#
+        );
+        let auth: AuthConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(auth.public_keys.len(), 2);
+        assert_eq!(auth.public_keys[0].scope, DeviceScope::Full);
+        assert_eq!(auth.public_keys[0].pubkey, bare);
+        assert!(matches!(
+            auth.public_keys[1].scope,
+            DeviceScope::Scoped { .. }
+        ));
+        assert_eq!(auth.public_keys[1].label.as_deref(), Some("tablet"));
+
+        // Lookups resolve by key_id and pubkey.
+        let id0 = auth.public_keys[0].key_id.clone();
+        assert!(auth.device_by_key_id(&id0).is_some());
+        assert!(auth.device_by_pubkey(&full).is_some());
+        assert!(auth.device_by_pubkey(&"c".repeat(64)).is_none());
+    }
+
+    #[test]
+    fn auth_config_reemits_struct_form() {
+        // Serialization always writes the struct form, never the bare string.
+        let hex = "a".repeat(64);
+        let toml_src = format!("public_keys = [\"ed25519:{hex}\"]\n");
+        let auth: AuthConfig = toml::from_str(&toml_src).unwrap();
+        let out = toml::to_string(&auth).unwrap();
+        assert!(
+            out.contains("pubkey"),
+            "serialized form must be a struct: {out}"
+        );
+        assert!(
+            out.contains("key_id"),
+            "serialized form carries key_id: {out}"
+        );
+        // And it round-trips back to the same value.
+        let back: AuthConfig = toml::from_str(&out).unwrap();
+        assert_eq!(auth, back);
     }
 }

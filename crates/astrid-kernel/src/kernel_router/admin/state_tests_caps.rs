@@ -41,7 +41,9 @@ fn assert_success(res: &AdminResponseBody) {
         | AdminResponseBody::InviteRedeemed(_)
         | AdminResponseBody::InviteList(_)
         | AdminResponseBody::PairToken(_)
-        | AdminResponseBody::PairTokenRedeemed(_) => {},
+        | AdminResponseBody::PairTokenRedeemed(_)
+        | AdminResponseBody::PairDeviceListed(_)
+        | AdminResponseBody::PairDeviceRevoked { .. } => {},
         AdminResponseBody::Error(msg) => panic!("expected success, got Error: {msg}"),
     }
 }
@@ -70,6 +72,9 @@ async fn caps_grant_appends_and_invalidates_cache() {
             name: "grace".into(),
             groups: vec!["restricted".into()],
             grants: Vec::new(),
+            inherit_from: None,
+            clone_from: None,
+            allow_admin_clone: false,
         },
     )
     .await;
@@ -113,6 +118,9 @@ async fn caps_grant_does_not_clear_matching_revoke() {
             name: "henry".into(),
             groups: vec!["admin".into()],
             grants: Vec::new(),
+            inherit_from: None,
+            clone_from: None,
+            allow_admin_clone: false,
         },
     )
     .await;
@@ -159,6 +167,9 @@ async fn caps_revoke_of_unheld_capability_appends_preemptive() {
             name: "ivy".into(),
             groups: vec!["restricted".into()],
             grants: Vec::new(),
+            inherit_from: None,
+            clone_from: None,
+            allow_admin_clone: false,
         },
     )
     .await;
@@ -191,6 +202,9 @@ async fn caps_grant_is_idempotent_no_disk_growth_on_repeat() {
             name: "indy".into(),
             groups: vec!["restricted".into()],
             grants: Vec::new(),
+            inherit_from: None,
+            clone_from: None,
+            allow_admin_clone: false,
         },
     )
     .await;
@@ -231,6 +245,9 @@ async fn caps_revoke_is_idempotent_no_disk_growth_on_repeat() {
             name: "isaac".into(),
             groups: vec!["admin".into()],
             grants: Vec::new(),
+            inherit_from: None,
+            clone_from: None,
+            allow_admin_clone: false,
         },
     )
     .await;
@@ -260,6 +277,9 @@ async fn caps_grant_rejects_invalid_capability_grammar() {
             name: "julia".into(),
             groups: Vec::new(),
             grants: Vec::new(),
+            inherit_from: None,
+            clone_from: None,
+            allow_admin_clone: false,
         },
     )
     .await;
@@ -290,6 +310,9 @@ async fn caps_grant_universal_requires_unsafe_admin_acknowledgement() {
             name: "luke".into(),
             groups: Vec::new(),
             grants: Vec::new(),
+            inherit_from: None,
+            clone_from: None,
+            allow_admin_clone: false,
         },
     )
     .await;
@@ -359,6 +382,9 @@ async fn concurrent_caps_grants_serialized_by_admin_write_lock() {
             name: "kate".into(),
             groups: vec!["restricted".into()],
             grants: Vec::new(),
+            inherit_from: None,
+            clone_from: None,
+            allow_admin_clone: false,
         },
     )
     .await;

@@ -127,6 +127,29 @@ impl std::fmt::Debug for PrincipalMount {
     }
 }
 
+/// Verified identity bound to an accepted Unix-socket connection.
+///
+/// Pairs the handshake-verified [`PrincipalId`](astrid_core::principal::PrincipalId)
+/// with the `key_id` of the [`DeviceKey`](astrid_core::profile::DeviceKey)
+/// whose pubkey verified the challenge signature. Held as one unit in the
+/// per-connection registry so the principal and the device that authenticated
+/// it can never desync — the uplink forwards BOTH onto outbound traffic, so
+/// the cap-gate can apply the device's scope as an attenuation floor.
+///
+/// `device_key_id` is `Option` because a Path-1 (peer-cred-trusted, no
+/// keypair challenge) binding can carry a principal with no specific device.
+/// In practice the socket challenge path always yields `Some`, but the type
+/// keeps the field honest for any future principal binding that is not
+/// device-scoped.
+#[derive(Clone, Debug)]
+pub struct ConnectionIdentity {
+    /// The handshake-verified principal this connection authenticated as.
+    pub principal: astrid_core::principal::PrincipalId,
+    /// The `key_id` of the device key that verified the challenge, if the
+    /// principal authenticated via the keypair challenge.
+    pub device_key_id: Option<String>,
+}
+
 /// Shared state accessible to all host functions via `Store<HostState>`.
 pub struct HostState {
     /// WASI context for Component Model WASI imports (clocks, random, etc.).
@@ -462,6 +485,75 @@ pub struct HostState {
     /// without iterating the whole resource table.
     pub process_count_by_principal:
         std::collections::HashMap<astrid_core::principal::PrincipalId, usize>,
+    /// Verified principal bound to each accepted Unix-socket connection,
+    /// keyed by the stream resource rep (`u32`). Populated by the
+    /// `net.unix-listener.accept` path after a successful per-connection
+    /// principal challenge-response (issue #45/#852) and torn down when the
+    /// stream resource drops.
+    ///
+    /// `Arc<DashMap>` so the binding is SHARED across a capsule's pooled
+    /// `HostState` instances exactly like [`process_tracker`](Self::process_tracker):
+    /// the same socket-owning capsule may serve a connection from a
+    /// different pooled instance than the one that accepted it. Each entry
+    /// carries the verified principal AND the `key_id` of the device that
+    /// authenticated it ([`ConnectionIdentity`]) so the cap-gate can apply the
+    /// device's scope as an attenuation floor on the principal's authority.
+    pub connection_principals: Arc<dashmap::DashMap<u32, ConnectionIdentity>>,
+    /// The verified principal of the source connection whose inbound frame is
+    /// currently in flight — the ENFORCEMENT side of
+    /// [`connection_principals`](Self::connection_principals) (issue #45/#852).
+    ///
+    /// Set by the framed [`net::tcp-stream.read`](super::host::net) host fn when
+    /// a read returns a data frame on a connection that carries a kernel-bound
+    /// principal; cleared to `None` on a closed/pending read. When the uplink
+    /// (capsule-cli) forwards that frame via `publish-as`, the host stamps THIS
+    /// principal in place of the capsule-supplied name, so a socket client can
+    /// no longer name a principal it has not proven (the self-stamp fix). It
+    /// holds from one framed read until the next, so a forwarded message AND its
+    /// one-shot `client.v1.connect` both attribute to the same verified
+    /// principal.
+    ///
+    /// `None` for an unbound connection (a legacy peer-cred-trusted local
+    /// operator), in which case `publish-as` falls back to the supplied name.
+    /// Per-instance state, NOT the shared `Arc`: the single pooled run-loop
+    /// instance of the uplink both reads the frame and forwards it, so the
+    /// binding lives exactly as long as the in-flight frame.
+    pub ingress_principal: Option<astrid_core::principal::PrincipalId>,
+    /// The device `key_id` of the source connection whose inbound frame is
+    /// currently in flight — the per-device companion to
+    /// [`ingress_principal`](Self::ingress_principal).
+    ///
+    /// Set and cleared in LOCKSTEP with `ingress_principal` by the framed
+    /// `tcp-stream.read` host fn (same data-frame populate / non-data clear),
+    /// from the same [`ConnectionIdentity`] entry, so the principal and the
+    /// device that authenticated it never desync onto a later forward. When
+    /// the uplink forwards a frame via `publish-as`, the host stamps THIS
+    /// `key_id` onto the outbound message's `device_key_id` so the kernel
+    /// cap-gate can resolve the device's scope and attenuate the principal's
+    /// effective capabilities. `None` for an unbound connection or a binding
+    /// that carried no specific device.
+    pub ingress_device_key_id: Option<String>,
+    /// Host-verified principal each INBOUND uplink connection was accepted
+    /// under, keyed by stream resource rep (`u32`). The lifecycle registry the
+    /// kernel connection counter rides on: `net.unix-listener.{accept,
+    /// poll-accept}` inserts on accept and emits `client.v1.connect`; the
+    /// stream-resource drop removes and emits `client.v1.disconnect`. Both
+    /// emissions stamp the principal stored here, so the pair always balances
+    /// on the identical identity (the connection-tracker leak fix).
+    ///
+    /// Populated for EVERY inbound connection — the handshake-verified
+    /// principal, or the reserved `anonymous` for a legacy/unauthenticated peer
+    /// — so connect/disconnect balance even when unauthenticated. OUTBOUND TCP
+    /// (`connect-tcp`) is never inserted, so a capsule-dialed socket never
+    /// moves the client counter. The emitted principal is ALWAYS the
+    /// host-verified one (never a guest-supplied name), preserving the
+    /// anti-forge boundary (issues #45/#852).
+    ///
+    /// Distinct from [`connection_principals`](Self::connection_principals),
+    /// which stores only authenticated principals (absence ⇒ `publish-as`
+    /// anonymous fallback). `Arc<DashMap>` so the binding survives drop landing
+    /// on a different pooled instance than the one that accepted.
+    pub client_connections: Arc<dashmap::DashMap<u32, astrid_core::principal::PrincipalId>>,
     /// Bound run-loop CPU-bound signal: set `true` by the ipc `recv` host fn
     /// each time the guest blocks on recv, read + cleared by the run-loop's
     /// epoch-deadline callback once per window.
@@ -549,27 +641,6 @@ impl HostState {
         self.inbound_tx = Some(tx);
     }
 
-    /// Return the KV namespace for this capsule scoped to its principal.
-    ///
-    /// Format: `{principal}:capsule:{capsule_id}`. This is the same namespace
-    /// used when the `ScopedKvStore` was created, but exposed here for cases
-    /// where host functions need to construct the namespace dynamically.
-    #[must_use]
-    pub fn principal_kv_namespace(&self) -> String {
-        format!("{}:capsule:{}", self.principal, self.capsule_id)
-    }
-
-    /// Return the effective KV store for the current invocation.
-    ///
-    /// Uses `invocation_kv` if set (different principal), falls back to
-    /// the capsule's default `kv` store.
-    #[must_use]
-    pub fn effective_kv(&self) -> &ScopedKvStore {
-        #[cfg(debug_assertions)]
-        self.debug_assert_invocation_field_set(self.invocation_kv.is_some(), "invocation_kv");
-        self.invocation_kv.as_ref().unwrap_or(&self.kv)
-    }
-
     /// Debug-only consistency check: when the caller's principal differs from
     /// the capsule owner's, the corresponding `invocation_*` field **must** be
     /// populated. Otherwise the accessor silently returns the owner's resource
@@ -602,251 +673,14 @@ impl HostState {
             );
         }
     }
-
-    /// Return the effective home mount for the current invocation.
-    ///
-    /// Prefers `invocation_home` (set when serving a different principal)
-    /// over `home` (set at capsule load for the owning principal).
-    #[must_use]
-    pub fn effective_home(&self) -> Option<&PrincipalMount> {
-        self.invocation_home.as_ref().or(self.home.as_ref())
-    }
-
-    /// Return the effective tmp mount for the current invocation. Same
-    /// precedence as [`effective_home`](Self::effective_home).
-    #[must_use]
-    pub fn effective_tmp(&self) -> Option<&PrincipalMount> {
-        self.invocation_tmp.as_ref().or(self.tmp.as_ref())
-    }
-
-    /// Owned copy of the effective home root path.
-    ///
-    /// Convenience for host fs functions that need to pass the principal
-    /// home into a security-gate check running inside an `async move` block.
-    #[must_use]
-    pub fn effective_home_root_buf(&self) -> Option<PathBuf> {
-        self.effective_home().map(|m| m.root.clone())
-    }
-
-    /// Return the effective secret store for the current invocation.
-    ///
-    /// Prefers `invocation_secret_store` (set when serving a different
-    /// principal) over the load-time `secret_store`.
-    #[must_use]
-    pub fn effective_secret_store(&self) -> &Arc<dyn SecretStore> {
-        #[cfg(debug_assertions)]
-        self.debug_assert_invocation_field_set(
-            self.invocation_secret_store.is_some(),
-            "invocation_secret_store",
-        );
-        self.invocation_secret_store
-            .as_ref()
-            .unwrap_or(&self.secret_store)
-    }
-
-    /// Return the effective capsule log file for the current invocation.
-    ///
-    /// Same precedence as [`effective_secret_store`](Self::effective_secret_store).
-    /// Returns `None` if neither the invocation nor load-time log is open.
-    #[must_use]
-    pub fn effective_capsule_log(&self) -> Option<&Arc<std::sync::Mutex<std::fs::File>>> {
-        self.invocation_capsule_log
-            .as_ref()
-            .or(self.capsule_log.as_ref())
-    }
-
-    /// Return the principal whose budget should be charged for host-fn
-    /// side-effects in the current invocation.
-    ///
-    /// Prefers the invoking principal from [`caller_context`](Self::caller_context)
-    /// (set per-invocation by [`WasmEngine::invoke_interceptor`](super::WasmEngine::invoke_interceptor))
-    /// and falls back to the capsule owner's [`principal`](Self::principal) when
-    /// no caller is in scope — load-time host calls, tests, and daemons'
-    /// self-triggered paths run on the owner's budget, matching the VFS/KV
-    /// `effective_*` accessors.
-    #[must_use]
-    pub fn effective_principal(&self) -> astrid_core::principal::PrincipalId {
-        self.caller_context
-            .as_ref()
-            .and_then(|m| m.principal.as_deref())
-            .and_then(|p| astrid_core::principal::PrincipalId::new(p).ok())
-            .unwrap_or_else(|| self.principal.clone())
-    }
-
-    /// Return the effective quota profile for the current invocation.
-    ///
-    /// Prefers `invocation_profile` (set by
-    /// [`WasmEngine::invoke_interceptor`](super::WasmEngine::invoke_interceptor)
-    /// for the calling principal) and falls back to the process-global
-    /// [`PrincipalProfile::default_ref`](astrid_core::profile::PrincipalProfile::default_ref)
-    /// when no invocation profile is in scope — load-time host calls, tests,
-    /// and single-tenant deployments all legitimately run without one.
-    ///
-    /// The fallback path intentionally does **not** substitute the capsule
-    /// owner's profile: that would leak the owner's quotas to every
-    /// unauthenticated call path. Using `Default` preserves single-tenant
-    /// parity while keeping the security invariant honest.
-    #[must_use]
-    pub fn effective_profile(&self) -> &astrid_core::profile::PrincipalProfile {
-        match self.invocation_profile.as_deref() {
-            Some(p) => p,
-            None => astrid_core::profile::PrincipalProfile::default_ref(),
-        }
-    }
-
-    /// Install per-invocation context from an inbound IPC message picked
-    /// up via [`ipc::Host::ipc_recv`](crate::engine::wasm::host::ipc) /
-    /// [`ipc::Host::ipc_poll`].
-    ///
-    /// Mirrors the principal-isolation setup done in
-    /// [`WasmEngine::invoke_interceptor`](super::WasmEngine::invoke_interceptor)
-    /// for the dispatcher path, but driven by `recv`/`poll` so that
-    /// `run + ipc::recv` capsules (prompt-builder, registry,
-    /// context-engine) also stamp publishes with the publisher's
-    /// principal and route reads/writes to the invoking principal's
-    /// namespaces. Without this hook these capsules silently fall back
-    /// to the owner principal (`default` for the standard distro),
-    /// breaking chat for any non-default agent: the publish goes out
-    /// stamped `default`, downstream interceptors load the wrong KV
-    /// namespace, the turn-state phase doesn't match, and the chain
-    /// stalls.
-    ///
-    /// Sets up the subset relevant to publish stamping and per-principal
-    /// KV / log routing:
-    /// - [`caller_context`](Self::caller_context) — drives both
-    ///   [`effective_principal`](Self::effective_principal) and the
-    ///   `principal_str` chosen by `publish_inner`.
-    /// - [`invocation_kv`](Self::invocation_kv) — per-principal KV
-    ///   namespace; falls back to load-time `kv` on failure.
-    /// - [`invocation_capsule_log`](Self::invocation_capsule_log) —
-    ///   per-principal log file; falls back to load-time `capsule_log`
-    ///   when the principal has no home directory yet.
-    /// - [`invocation_profile`](Self::invocation_profile) — the publishing
-    ///   principal's quota profile (owner included), resolved through
-    ///   [`profile_cache`](Self::profile_cache) so per-principal ceilings
-    ///   (background-process count, IPC throughput, HTTP streams) apply on
-    ///   this path too; falls back to the process-global default on a missing
-    ///   cache or failed load.
-    ///
-    /// Skipped vs the interceptor path (each is independently
-    /// recoverable; documenting the gaps so the omissions are
-    /// auditable):
-    /// - `invocation_home` / `invocation_tmp` / `invocation_secret_store` —
-    ///   none of the current run+recv capsules touch home/tmp paths
-    ///   or secrets from the recv loop. Add when one starts to.
-    /// - `store_meter` — the per-invocation linear-memory ceiling stays the
-    ///   capsule owner's; the recv path does not re-target it per publisher
-    ///   the way `invoke_interceptor` does. Acceptable because the run+recv
-    ///   capsules are shared singletons whose per-call allocation is bounded
-    ///   by the bus message-size limits. Re-target when a recv-driven capsule
-    ///   needs per-principal memory enforcement.
-    pub(crate) fn install_recv_invocation_context(&mut self, msg: &astrid_events::ipc::IpcMessage) {
-        // Fast path: if the new message's principal matches whatever
-        // we already have installed, keep the existing
-        // `invocation_kv` / `invocation_capsule_log` rather than
-        // re-opening the namespace and log file. The chat-stack run
-        // loop calls this on every recv tick — re-init each time
-        // burns I/O and allocations for no behavioural change.
-        // An interceptor's caller is owned by the dispatch path
-        // (`WasmEngine::invoke_interceptor`), not by recv. Nested
-        // `ipc::recv` calls inside an interceptor must NOT overwrite
-        // it — otherwise a recv'd message from a different publisher
-        // (or the empty-batch clear path below) would silently flip
-        // every subsequent `publish_json` away from the principal the
-        // interceptor was dispatched under.
-        if self.interceptor_active {
-            return;
-        }
-
-        let new_principal = msg.principal.clone();
-        let existing_principal = self
-            .caller_context
-            .as_ref()
-            .and_then(|c| c.principal.clone());
-        if new_principal == existing_principal {
-            // Refresh the caller context so e.g. topic name / payload
-            // tracking stays current, but skip the expensive resets.
-            self.caller_context = Some(msg.clone());
-            return;
-        }
-
-        self.caller_context = Some(msg.clone());
-
-        // The publishing principal, parsed once. Used two different ways
-        // below, matching the split in the interceptor path
-        // (`invoke_interceptor`):
-        //
-        //   • QUOTA profile — resolved for EVERY publisher, the owner
-        //     included. `effective_profile()`'s fallback is the process-global
-        //     *default*, never the owner's profile, so an owner-published
-        //     message must still resolve the owner's profile or its on-disk
-        //     quotas are silently ignored. (For an owner with no profile file
-        //     the cache returns the default, so this is a no-op in the common
-        //     single-tenant case and only bites once an operator configures
-        //     the owner principal.)
-        //
-        //   • KV / log / env overrides — installed only when the publisher
-        //     DIFFERS from the load-time owner. The load-time `kv` /
-        //     `capsule_log` / `config` are already the owner's, so an
-        //     owner-published message has nothing to override and these are
-        //     cleared back to the load-time values.
-        let publisher: Option<astrid_core::PrincipalId> = msg
-            .principal
-            .as_deref()
-            .and_then(|p| astrid_core::PrincipalId::new(p).ok());
-
-        // Resolve the publisher's quota profile (owner included) so
-        // per-principal ceilings (background-process count, IPC throughput,
-        // HTTP streams) apply on the guest-pulled `recv` path too — not only
-        // the dispatcher-driven interceptor path. When `msg.principal` is
-        // absent/unparseable the owner's own profile is resolved, mirroring
-        // `invoke_interceptor`'s `owner_principal` fallback. Best-effort: a
-        // failed load logs and leaves `invocation_profile = None` (the same
-        // process-global default fall-back as a missing cache), never denying
-        // the message — the recv path has no error channel.
-        let profile_principal = publisher.clone().unwrap_or_else(|| self.principal.clone());
-        self.invocation_profile = self.profile_cache.as_ref().and_then(|cache| {
-            match cache.resolve(&profile_principal) {
-                Ok(profile) => Some(profile),
-                Err(e) => {
-                    tracing::warn!(
-                        principal = %profile_principal,
-                        error = %e,
-                        "recv-path profile resolve failed; per-principal quotas fall back to the default profile"
-                    );
-                    None
-                },
-            }
-        });
-
-        // KV / log / env scoping overrides only kick in for a non-owner
-        // publisher; an owner-published message clears them back to the
-        // load-time (owner) values.
-        let Some(p) = publisher.filter(|p| *p != self.principal) else {
-            self.invocation_kv = None;
-            self.invocation_capsule_log = None;
-            self.invocation_env_overlay = None;
-            return;
-        };
-
-        let ns = format!("{}:capsule:{}", p, self.capsule_id);
-        self.invocation_kv = match self.kv.with_namespace(&ns) {
-            Ok(kv) => Some(kv),
-            Err(e) => {
-                tracing::warn!(
-                    principal = %p,
-                    error = %e,
-                    "Failed to create invocation KV scope on ipc::recv path"
-                );
-                None
-            },
-        };
-
-        self.invocation_capsule_log = super::open_capsule_log(&p, self.capsule_id.as_str(), false);
-        self.invocation_env_overlay =
-            super::load_invocation_env_overlay(&p, self.capsule_id.as_str());
-    }
 }
+
+#[path = "host_state_connection.rs"]
+mod connection;
+#[path = "host_state_effective.rs"]
+mod effective;
+#[path = "host_state_invocation.rs"]
+mod invocation;
 
 impl std::fmt::Debug for HostState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

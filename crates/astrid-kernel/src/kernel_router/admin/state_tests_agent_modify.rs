@@ -40,7 +40,9 @@ fn assert_success(res: &AdminResponseBody) {
         | AdminResponseBody::InviteRedeemed(_)
         | AdminResponseBody::InviteList(_)
         | AdminResponseBody::PairToken(_)
-        | AdminResponseBody::PairTokenRedeemed(_) => {},
+        | AdminResponseBody::PairTokenRedeemed(_)
+        | AdminResponseBody::PairDeviceListed(_)
+        | AdminResponseBody::PairDeviceRevoked { .. } => {},
         AdminResponseBody::Error(msg) => panic!("expected success, got Error: {msg}"),
     }
 }
@@ -69,6 +71,9 @@ async fn agent_modify_adds_and_removes_groups_idempotently() {
             name: "mia".into(),
             groups: vec![BUILTIN_AGENT.into()],
             grants: Vec::new(),
+            inherit_from: None,
+            clone_from: None,
+            allow_admin_clone: false,
         },
     )
     .await;
@@ -81,6 +86,8 @@ async fn agent_modify_adds_and_removes_groups_idempotently() {
             principal: pid("mia"),
             add_groups: vec![BUILTIN_RESTRICTED.into()],
             remove_groups: Vec::new(),
+            add_capsules: Vec::new(),
+            remove_capsules: Vec::new(),
         },
     )
     .await;
@@ -101,6 +108,8 @@ async fn agent_modify_adds_and_removes_groups_idempotently() {
             principal: pid("mia"),
             add_groups: vec![BUILTIN_RESTRICTED.into()],
             remove_groups: Vec::new(),
+            add_capsules: Vec::new(),
+            remove_capsules: Vec::new(),
         },
     )
     .await;
@@ -114,6 +123,8 @@ async fn agent_modify_adds_and_removes_groups_idempotently() {
             principal: pid("mia"),
             add_groups: Vec::new(),
             remove_groups: vec![BUILTIN_AGENT.into()],
+            add_capsules: Vec::new(),
+            remove_capsules: Vec::new(),
         },
     )
     .await;
@@ -132,6 +143,9 @@ async fn agent_modify_rejects_empty_changes() {
             name: "nina".into(),
             groups: Vec::new(),
             grants: Vec::new(),
+            inherit_from: None,
+            clone_from: None,
+            allow_admin_clone: false,
         },
     )
     .await;
@@ -142,6 +156,8 @@ async fn agent_modify_rejects_empty_changes() {
             principal: pid("nina"),
             add_groups: Vec::new(),
             remove_groups: Vec::new(),
+            add_capsules: Vec::new(),
+            remove_capsules: Vec::new(),
         },
     )
     .await;
@@ -158,9 +174,82 @@ async fn agent_modify_rejects_unknown_principal() {
             principal: pid("ghost"),
             add_groups: vec![BUILTIN_RESTRICTED.into()],
             remove_groups: Vec::new(),
+            add_capsules: Vec::new(),
+            remove_capsules: Vec::new(),
         },
     )
     .await;
     // require_principal_exists's phantom-principal guard.
     assert_error_contains(&res, "ghost");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn agent_modify_adds_and_removes_capsules_idempotently() {
+    // #992: agent.modify partial-updates the capsule grant set, mirroring
+    // the group mechanism exactly — idempotent add/remove, persisted to
+    // the principal's profile (the set the dispatcher gates the
+    // user-invocable tool surface against).
+    let (_dir, kernel) = fixture().await;
+    handlers::dispatch(
+        &kernel,
+        &astrid_core::PrincipalId::default(),
+        AdminRequestKind::AgentCreate {
+            name: "ivy".into(),
+            groups: vec![BUILTIN_AGENT.into()],
+            grants: Vec::new(),
+            inherit_from: None,
+            clone_from: None,
+            allow_admin_clone: false,
+        },
+    )
+    .await;
+    let path = PrincipalProfile::path_for(&kernel.astrid_home, &pid("ivy"));
+
+    // Fresh agents start with no capsule grants.
+    let profile = PrincipalProfile::load_from_path(&path).unwrap();
+    assert!(
+        profile.capsules.is_empty(),
+        "new agents inherit no capsule grants"
+    );
+
+    // Grant `identity` and `registry`.
+    let res = handlers::dispatch(
+        &kernel,
+        &astrid_core::PrincipalId::default(),
+        AdminRequestKind::AgentModify {
+            principal: pid("ivy"),
+            add_groups: Vec::new(),
+            remove_groups: Vec::new(),
+            add_capsules: vec!["identity".into(), "registry".into()],
+            remove_capsules: Vec::new(),
+        },
+    )
+    .await;
+    assert_success(&res);
+    let profile = PrincipalProfile::load_from_path(&path).unwrap();
+    assert_eq!(
+        profile.capsules,
+        vec!["identity".to_string(), "registry".to_string()]
+    );
+
+    // Re-granting `identity` is a no-op; revoking `registry` leaves only
+    // `identity`. A (add, remove) in one call applies remove-then-add.
+    let res = handlers::dispatch(
+        &kernel,
+        &astrid_core::PrincipalId::default(),
+        AdminRequestKind::AgentModify {
+            principal: pid("ivy"),
+            add_groups: Vec::new(),
+            remove_groups: Vec::new(),
+            add_capsules: vec!["identity".into()],
+            remove_capsules: vec!["registry".into()],
+        },
+    )
+    .await;
+    assert_success(&res);
+    let profile = PrincipalProfile::load_from_path(&path).unwrap();
+    assert_eq!(profile.capsules, vec!["identity".to_string()]);
+
+    // Group membership is untouched by capsule-only modifies.
+    assert_eq!(profile.groups, vec![BUILTIN_AGENT.to_string()]);
 }
