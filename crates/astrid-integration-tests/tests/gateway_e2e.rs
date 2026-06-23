@@ -250,6 +250,43 @@ async fn kernel_and_gateway_boot_against_shared_home() {
     let me: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(me["principal"], "e2e-test-principal");
 
+    // ── Agent-loop fail-fast for a non-admin principal ──────────
+    //
+    // The in-process readiness probe (wired from the kernel registry via
+    // `kernel.agent_readiness_probe()`) reports not-ready for this
+    // empty-registry daemon, so `POST /api/agent/prompt` must emit a single
+    // `error` SSE event and close immediately rather than `ready` + a long
+    // timeout. Crucially it must do so for ANY authenticated caller — the
+    // `e2e-test-principal` bearer above holds no `capsule:list`, which is the
+    // whole point of reading readiness in-process instead of through the
+    // capability-gated request. The timeout guards against a regression that
+    // turns the fail-fast back into an open stream (which would hang `oneshot`).
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/agent/prompt")
+        .header(header::AUTHORIZATION, format!("Bearer {bearer}"))
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(r#"{"text":"hi"}"#))
+        .unwrap();
+    let resp = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        router.clone().oneshot(req),
+    )
+    .await
+    .expect("fail-fast must close the stream, not hang")
+    .expect("prompt");
+    assert_eq!(resp.status(), StatusCode::OK, "SSE responses are 200");
+    let bytes = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+    let body = std::str::from_utf8(&bytes).unwrap();
+    assert!(
+        body.contains("agent loop not ready"),
+        "fail-fast must name the unconfigured loop; body: {body}"
+    );
+    assert!(
+        !body.contains("event:ready") && !body.contains("event: ready"),
+        "must NOT emit a ready event on the fail-fast path; body: {body}"
+    );
+
     // ── Cleanup ─────────────────────────────────────────────────
     kernel.shutdown(Some("e2e-test-complete".into())).await;
 }

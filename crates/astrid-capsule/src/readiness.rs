@@ -108,11 +108,37 @@ pub fn topic_publishers<'a, M: AsRef<CapsuleManifest>>(
 pub fn unsatisfied_required_imports<M: AsRef<CapsuleManifest>>(
     manifests: &[M],
 ) -> Vec<MissingImport> {
+    unsatisfied_imports(manifests, false)
+}
+
+/// Optional imports that no OTHER loaded capsule exports.
+///
+/// Same cross-capsule self-exclusion rule as [`unsatisfied_required_imports`]
+/// (a capsule cannot self-satisfy its own import), applied to `optional`
+/// imports. The kernel boot validator uses this for its optional-import
+/// "reduced functionality" diagnostics so the optional and required paths share
+/// one definition of "satisfied" and can never disagree.
+#[must_use]
+pub fn unsatisfied_optional_imports<M: AsRef<CapsuleManifest>>(
+    manifests: &[M],
+) -> Vec<MissingImport> {
+    unsatisfied_imports(manifests, true)
+}
+
+/// Shared body for [`unsatisfied_required_imports`] /
+/// [`unsatisfied_optional_imports`]: missing imports of the requested
+/// optionality, with cross-capsule self-exclusion (`other_idx != idx`). One
+/// definition so the required and optional diagnostics never diverge on what
+/// "satisfied" means.
+fn unsatisfied_imports<M: AsRef<CapsuleManifest>>(
+    manifests: &[M],
+    want_optional: bool,
+) -> Vec<MissingImport> {
     let mut missing = Vec::new();
     for (idx, manifest) in manifests.iter().enumerate() {
         let manifest = manifest.as_ref();
         for (imp_ns, imp_name, imp_req, optional) in manifest.import_tuples() {
-            if optional {
+            if optional != want_optional {
                 continue;
             }
             let satisfied = manifests.iter().enumerate().any(|(other_idx, other)| {
@@ -372,5 +398,29 @@ mod tests {
         let missing = unsatisfied_required_imports(&set);
         assert_eq!(missing.len(), 1, "self-export must not satisfy own import");
         assert_eq!(missing[0].capsule, "solo");
+    }
+
+    #[test]
+    fn optional_import_satisfied_only_by_self_is_unsatisfied() {
+        // Parity with the required case: a capsule that self-exports an
+        // interface it OPTIONALLY imports does not self-satisfy either — the
+        // optional and required diagnostics share one self-exclusion rule, so
+        // the boot validator's two branches can never disagree.
+        let set = vec![manifest(
+            "solo",
+            &[AGENT_PROMPT_TOPIC],
+            &[AGENT_RESPONSE_TOPIC],
+            &[("astrid", "telemetry", "^1.0", true)],
+            &[("astrid", "telemetry", "1.0.0")],
+        )];
+        let missing = unsatisfied_optional_imports(&set);
+        assert_eq!(
+            missing.len(),
+            1,
+            "self-export must not satisfy own optional import"
+        );
+        assert_eq!(missing[0].interface, "telemetry");
+        // The same self-only optional import is NOT counted as a required miss.
+        assert!(unsatisfied_required_imports(&set).is_empty());
     }
 }

@@ -321,6 +321,16 @@ fn unready_event_stream(
 /// The JSON body of the single `error` SSE event emitted when the agent loop
 /// is not ready — names which piece(s) of the loop are missing. Split out as a
 /// pure function so the fail-fast content is unit-testable without a live bus.
+///
+/// Disclosure: `POST /api/agent/prompt` requires only authentication (no
+/// `capsule:list`), so this payload is deliberately narrowed — it carries the
+/// two boolean gaps and the unsatisfied **WIT interface ids** (`astrid:llm`),
+/// but NOT capsule names or the loaded-capsule inventory (those stay behind the
+/// `capsule:list`-gated `GET /api/sys/readiness`). WIT interface ids are public
+/// contract surface (they live in the published `wit/` mirror and the RFCs),
+/// not tenant-specific data, and they only appear here in a globally
+/// loop-unconfigured state — so surfacing them to any authenticated caller is
+/// an accepted, intentional trade for an actionable error over a silent hang.
 fn unready_payload(report: &AgentLoopReadiness) -> serde_json::Value {
     serde_json::json!({
         "error": "agent loop not ready",

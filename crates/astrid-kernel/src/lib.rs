@@ -2379,41 +2379,49 @@ fn validate_imports_exports(
         }
     }
 
-    // Single source of truth for unsatisfied required imports. Key on
-    // (capsule, namespace, interface) so the per-import loop below can decide
-    // the required-error branch by membership rather than recomputing.
+    // Single source of truth for unsatisfied imports — both the required and
+    // the optional sets come from the shared readiness helpers, which apply the
+    // SAME cross-capsule self-exclusion rule (a capsule cannot self-satisfy its
+    // own import). Keying on (capsule, namespace, interface) lets the per-import
+    // loop below decide each branch by membership, so the required-error and
+    // optional-info diagnostics can never disagree on what "satisfied" means.
     let plain: Vec<&astrid_capsule::manifest::CapsuleManifest> =
         manifests.iter().map(|(m, _)| m).collect();
-    let unsatisfied_required: std::collections::HashSet<(String, String, String)> =
-        astrid_capsule::readiness::unsatisfied_required_imports(&plain)
+    let key_set = |missing: Vec<astrid_core::kernel_api::MissingImport>| {
+        missing
             .into_iter()
             .map(|m| (m.capsule, m.namespace, m.interface))
-            .collect();
+            .collect::<std::collections::HashSet<(String, String, String)>>()
+    };
+    let unsatisfied_required = key_set(astrid_capsule::readiness::unsatisfied_required_imports(
+        &plain,
+    ));
+    let unsatisfied_optional = key_set(astrid_capsule::readiness::unsatisfied_optional_imports(
+        &plain,
+    ));
 
     let mut satisfied_count: u32 = 0;
     let mut warning_count: u32 = 0;
 
     for (manifest, _) in manifests {
         for (ns, name, req, optional) in manifest.import_tuples() {
+            let key = (
+                manifest.package.name.clone(),
+                ns.to_string(),
+                name.to_string(),
+            );
             if optional {
-                let has_provider = exports_by_interface
-                    .get(&(ns, name))
-                    .is_some_and(|providers| providers.iter().any(|(_, v)| req.matches(v)));
-                if has_provider {
-                    satisfied_count = satisfied_count.saturating_add(1);
-                } else {
+                if unsatisfied_optional.contains(&key) {
                     tracing::info!(
                         capsule = %manifest.package.name,
                         import = %format!("{ns}/{name} {req}"),
                         "Optional import not satisfied — capsule will boot with reduced functionality"
                     );
                     warning_count = warning_count.saturating_add(1);
+                } else {
+                    satisfied_count = satisfied_count.saturating_add(1);
                 }
-            } else if unsatisfied_required.contains(&(
-                manifest.package.name.clone(),
-                ns.to_string(),
-                name.to_string(),
-            )) {
+            } else if unsatisfied_required.contains(&key) {
                 tracing::error!(
                     capsule = %manifest.package.name,
                     import = %format!("{ns}/{name} {req}"),
