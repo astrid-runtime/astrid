@@ -79,6 +79,55 @@ fn response_principal_matches(expected: &str, event: &AstridEvent) -> bool {
     event_principal(event) == Some(expected)
 }
 
+/// Wait for an elicit reply on `receiver` that is attributed to
+/// `expected_principal`, rejecting (and audit-logging) any cross-principal reply
+/// and continuing on the REMAINING budget so a flood of mismatched replies
+/// cannot extend the wait. Returns the matching event, or `None` on
+/// deadline-expiry / closed channel.
+///
+/// `timeout` is the overall budget from now; the host fn passes
+/// `MAX_ELICIT_TIMEOUT_MS`. Pulled out of [`elicit::Host::elicit`] so the
+/// deadline-countdown + DoS-resistance can be unit-tested directly against a
+/// real `EventBus` receiver — without the semaphore / cancel-token /
+/// `block_in_place` machinery and with an injectable short timeout. The host fn
+/// runs this as the future inside `bounded_block_on_cancellable`, so
+/// cancellation (capsule unload) still races it at the outer layer, unchanged.
+async fn await_matching_elicit_response(
+    receiver: &mut astrid_events::EventReceiver,
+    expected_principal: &str,
+    capsule_id: &str,
+    request_id: Uuid,
+    timeout: std::time::Duration,
+) -> Option<std::sync::Arc<AstridEvent>> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return None;
+        }
+        let Ok(Some(event)) = tokio::time::timeout(remaining, receiver.recv()).await else {
+            // Inner timeout (deadline hit) or closed channel.
+            return None;
+        };
+        if response_principal_matches(expected_principal, &event) {
+            return Some(event);
+        }
+        // A response landed on our reply topic carrying a different
+        // principal than the one this elicit is being collected for.
+        // Reject it (audit) and keep waiting on the remaining budget
+        // rather than letting an unauthorized caller unblock or
+        // cancel another principal's elicit.
+        let got = event_principal(&event);
+        tracing::warn!(
+            capsule = %capsule_id,
+            %request_id,
+            expected_principal = %expected_principal,
+            got_principal = got.unwrap_or("<none>"),
+            "Rejected cross-principal elicit response; continuing to wait"
+        );
+    }
+}
+
 impl elicit::Host for HostState {
     /// Host function: `elicit(request) -> ElicitResponse`
     ///
@@ -155,47 +204,27 @@ impl elicit::Host for HostState {
         // tick as cancellation, the response is discarded. This is acceptable
         // during teardown and prevents delayed shutdown under high throughput.
         //
-        // Inside the permit we run a deadline loop: a spurious or cross-principal
+        // Inside the permit we run a deadline loop (the extracted
+        // `await_matching_elicit_response`): a spurious or cross-principal
         // response must NOT unblock the legitimate waiter, nor reset its budget.
-        // We keep an overall deadline of `MAX_ELICIT_TIMEOUT_MS` from the start
-        // and only count down — each `recv` gets the *remaining* time, so a flood
-        // of mismatched replies cannot extend the wait and DoS the real answer.
-        let request_id_for_wait = request_id;
+        // It keeps an overall deadline of `MAX_ELICIT_TIMEOUT_MS` from the start
+        // and only counts down — each `recv` gets the *remaining* time, so a
+        // flood of mismatched replies cannot extend the wait and DoS the real
+        // answer.
         let expected_principal = originating_principal.clone();
         let event = util::bounded_block_on_cancellable(
             &runtime_handle,
             &blocking_semaphore,
             &cancel_token,
             async move {
-                let deadline = tokio::time::Instant::now()
-                    + std::time::Duration::from_millis(MAX_ELICIT_TIMEOUT_MS);
-                loop {
-                    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-                    if remaining.is_zero() {
-                        return None;
-                    }
-                    let Ok(Some(event)) = tokio::time::timeout(remaining, receiver.recv()).await
-                    else {
-                        // Inner timeout (deadline hit) or closed channel.
-                        return None;
-                    };
-                    if response_principal_matches(&expected_principal, &event) {
-                        return Some(event);
-                    }
-                    // A response landed on our reply topic carrying a different
-                    // principal than the one this elicit is being collected for.
-                    // Reject it (audit) and keep waiting on the remaining budget
-                    // rather than letting an unauthorized caller unblock or
-                    // cancel another principal's elicit.
-                    let got = event_principal(&event);
-                    tracing::warn!(
-                        capsule = %capsule_id,
-                        %request_id_for_wait,
-                        expected_principal = %expected_principal,
-                        got_principal = got.unwrap_or("<none>"),
-                        "Rejected cross-principal elicit response; continuing to wait"
-                    );
-                }
+                await_matching_elicit_response(
+                    &mut receiver,
+                    &expected_principal,
+                    &capsule_id,
+                    request_id,
+                    std::time::Duration::from_millis(MAX_ELICIT_TIMEOUT_MS),
+                )
+                .await
             },
         )
         .flatten();
@@ -432,6 +461,112 @@ mod tests {
         assert_eq!(event_principal(&ev), None);
         assert!(!response_principal_matches("agent-alice", &ev));
     }
+
+    /// Publish an `ElicitResponse` for `request_id` onto its reply topic,
+    /// stamped (or not) with `principal`. Mirrors a real answerer's publish.
+    fn publish_reply(
+        bus: &astrid_events::EventBus,
+        request_id: Uuid,
+        principal: Option<&str>,
+        value: &str,
+    ) {
+        bus.publish(elicit_response_event(
+            request_id,
+            principal,
+            Some(value.to_string()),
+        ));
+    }
+
+    /// Test 1a — DEADLINE TERMINATION: with no reply at all,
+    /// `await_matching_elicit_response` must return `None` at roughly the
+    /// injected budget and NOT hang. Proves the deadline countdown terminates
+    /// the wait (the bug it guards: a removed/inverted countdown would block the
+    /// full `MAX_ELICIT_TIMEOUT_MS`).
+    #[tokio::test]
+    async fn await_response_times_out_when_no_reply() {
+        let bus = astrid_events::EventBus::with_capacity(256);
+        let request_id = Uuid::new_v4();
+        let mut rx = bus.subscribe_topic(format!("astrid.v1.elicit.response.{request_id}"));
+
+        let budget = std::time::Duration::from_millis(150);
+        let start = std::time::Instant::now();
+        let got =
+            await_matching_elicit_response(&mut rx, "agent-alice", "test", request_id, budget)
+                .await;
+        let elapsed = start.elapsed();
+
+        assert!(got.is_none(), "no reply → must time out to None");
+        // Generous upper bound for CI jitter while still proving it didn't wait
+        // out anything near the 120s production timeout.
+        assert!(
+            elapsed < budget * 5,
+            "must terminate near the budget, took {elapsed:?} for a {budget:?} budget"
+        );
+    }
+
+    /// Test 1b — DoS-RESISTANCE: a flood of ~50 cross-principal replies buffered
+    /// BEFORE the wait must neither unblock it (returns `None`) nor EXTEND it
+    /// (elapsed stays near the budget). This is the security guarantee — a
+    /// mismatched-reply flood cannot reset or stretch the legitimate waiter's
+    /// deadline. Fails if the loop reset the budget per reply or stopped
+    /// checking the principal.
+    #[tokio::test]
+    async fn await_response_flood_does_not_extend_deadline() {
+        let bus = astrid_events::EventBus::with_capacity(256);
+        let request_id = Uuid::new_v4();
+        let mut rx = bus.subscribe_topic(format!("astrid.v1.elicit.response.{request_id}"));
+
+        // Buffer the flood before we start waiting so the loop drains them all
+        // within one budget window.
+        for _ in 0..50 {
+            publish_reply(&bus, request_id, Some("agent-bob"), "intruder");
+        }
+
+        let budget = std::time::Duration::from_millis(150);
+        let start = std::time::Instant::now();
+        let got =
+            await_matching_elicit_response(&mut rx, "agent-alice", "test", request_id, budget)
+                .await;
+        let elapsed = start.elapsed();
+
+        assert!(got.is_none(), "mismatch flood must not unblock the waiter");
+        assert!(
+            elapsed < budget * 5,
+            "a mismatch flood must not extend the deadline; took {elapsed:?} for {budget:?}"
+        );
+    }
+
+    /// Test 1c — DRAIN-PAST-MISMATCHES: a few wrong-principal replies followed
+    /// by one matching reply, all buffered before the wait. The helper must skip
+    /// the bad ones and return the matching event.
+    #[tokio::test]
+    async fn await_response_drains_past_mismatches_to_match() {
+        let bus = astrid_events::EventBus::with_capacity(256);
+        let request_id = Uuid::new_v4();
+        let mut rx = bus.subscribe_topic(format!("astrid.v1.elicit.response.{request_id}"));
+
+        publish_reply(&bus, request_id, Some("agent-bob"), "intruder-1");
+        publish_reply(&bus, request_id, Some("agent-carol"), "intruder-2");
+        publish_reply(&bus, request_id, Some("agent-alice"), "legit");
+
+        let budget = std::time::Duration::from_millis(500);
+        let got =
+            await_matching_elicit_response(&mut rx, "agent-alice", "test", request_id, budget)
+                .await
+                .expect("matching reply must be returned after draining mismatches");
+
+        // The returned event is the matching one carrying "legit".
+        let AstridEvent::Ipc { message, .. } = &*got else {
+            panic!("expected IPC event");
+        };
+        assert_eq!(message.principal.as_deref(), Some("agent-alice"));
+        match &message.payload {
+            IpcPayload::ElicitResponse { value, .. } => {
+                assert_eq!(value.as_deref(), Some("legit"));
+            },
+            other => panic!("expected ElicitResponse, got {other:?}"),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -447,7 +582,7 @@ mod wait_loop_tests {
     use std::time::Duration;
 
     use crate::engine::wasm::bindings::astrid::elicit::host::{
-        ElicitRequest, ElicitResponse, ElicitType, Host as ElicitHost,
+        ElicitRequest, ElicitResponse, ElicitType, ErrorCode, Host as ElicitHost,
     };
     use crate::engine::wasm::host_state::LifecyclePhase;
     use crate::engine::wasm::test_fixtures::minimal_host_state;
@@ -489,10 +624,32 @@ mod wait_loop_tests {
         });
     }
 
+    /// Publish an `ElicitResponse` for `request_id` with BOTH `value` and
+    /// `values` `None` — the host's cancellation sentinel — stamped with
+    /// `principal`.
+    fn publish_cancel(bus: &astrid_events::EventBus, request_id: Uuid, principal: &str) {
+        let topic = format!("astrid.v1.elicit.response.{request_id}");
+        let msg = IpcMessage::new(
+            topic,
+            IpcPayload::ElicitResponse {
+                request_id,
+                value: None,
+                values: None,
+            },
+            Uuid::nil(),
+        )
+        .with_principal(principal);
+        bus.publish(AstridEvent::Ipc {
+            message: msg,
+            metadata: astrid_events::EventMetadata::default(),
+        });
+    }
+
     /// Subscribe to `astrid.v1.elicit`, wait for the request, return its
-    /// `request_id`. The host mints the id internally, so a driver learns it
-    /// the same way every real answerer does — off the published request.
-    async fn await_request_id(mut req_rx: astrid_events::EventReceiver) -> Uuid {
+    /// `request_id` AND the principal stamped on the request message. The host
+    /// mints the id internally, so a driver learns it the same way every real
+    /// answerer does — off the published request.
+    async fn await_request(mut req_rx: astrid_events::EventReceiver) -> (Uuid, Option<String>) {
         loop {
             let ev = tokio::time::timeout(Duration::from_secs(5), req_rx.recv())
                 .await
@@ -501,7 +658,7 @@ mod wait_loop_tests {
             if let AstridEvent::Ipc { message, .. } = &*ev
                 && let IpcPayload::ElicitRequest { request_id, .. } = &message.payload
             {
-                return *request_id;
+                return (*request_id, message.principal.clone());
             }
         }
     }
@@ -510,6 +667,10 @@ mod wait_loop_tests {
     /// (published AFTER the bad one) unblocks the waiter with the right value.
     /// Fails if the principal check is removed — the waiter would unblock on
     /// the wrong-principal reply and return "intruder".
+    ///
+    /// Test 4 folded in: also asserts the published `ElicitRequest` carries the
+    /// originating principal, pinning that the host STAMPS it on the outbound
+    /// request (not just checks it on replies).
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn cross_principal_reply_does_not_unblock_matching_does() {
         let rt = tokio::runtime::Handle::current();
@@ -527,7 +688,12 @@ mod wait_loop_tests {
             tokio::task::spawn_blocking(move || (state.elicit(text_request("api_url")), state));
 
         // Learn the request_id, then publish a WRONG-principal reply first.
-        let request_id = await_request_id(req_rx).await;
+        let (request_id, req_principal) = await_request(req_rx).await;
+        assert_eq!(
+            req_principal.as_deref(),
+            Some("agent-alice"),
+            "host must stamp the originating principal on the outbound ElicitRequest"
+        );
         publish_response(&bus, request_id, "agent-bob", "intruder");
 
         // Give the loop a beat to (correctly) reject the intruder reply, then
@@ -543,6 +709,75 @@ mod wait_loop_tests {
             },
             other => panic!("expected matching value, got {other:?}"),
         }
+    }
+
+    /// Test 2 — CANCEL TOKEN UNBLOCKS THE WAIT: firing the host state's
+    /// `cancel_token` mid-wait (no reply published) must make `elicit()` return
+    /// promptly, well under `MAX_ELICIT_TIMEOUT_MS`, rather than waiting the full
+    /// 120s. Guards that the deadline-loop restructure kept unload-wins: the
+    /// outer `bounded_block_on_cancellable` races the token against the wait.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancel_token_unblocks_elicit_wait() {
+        let rt = tokio::runtime::Handle::current();
+        let mut state = minimal_host_state(rt);
+        state.principal = astrid_core::PrincipalId::new("agent-alice").unwrap();
+        state.lifecycle_phase = Some(LifecyclePhase::Install);
+
+        let bus = state.event_bus.clone();
+        let cancel_token = state.cancel_token.clone();
+        let req_rx = bus.subscribe_topic("astrid.v1.elicit");
+
+        let start = std::time::Instant::now();
+        let elicit_handle =
+            tokio::task::spawn_blocking(move || (state.elicit(text_request("api_url")), state));
+
+        // Wait until the host has published its request (so it is actually
+        // blocked in the wait), then cancel — NO reply is ever published.
+        let (_request_id, _principal) = await_request(req_rx).await;
+        cancel_token.cancel();
+
+        let (result, _state) = elicit_handle.await.expect("elicit thread joined");
+        let elapsed = start.elapsed();
+
+        // Cancellation surfaces as Timeout (the helper returns None for both
+        // deadline-expiry and cancel — same as before the refactor).
+        assert!(
+            matches!(result, Err(ErrorCode::Timeout)),
+            "cancelled wait must return Timeout, got {result:?}"
+        );
+        // The load-bearing property: it returned PROMPTLY, not after 120s.
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "cancel must unblock promptly, took {elapsed:?}"
+        );
+    }
+
+    /// Test 3 — FULL-HOST-FN CANCELLATION ANSWER: a MATCHING-principal reply
+    /// carrying both `value: None` and `values: None` (the user-cancel sentinel)
+    /// must drive the real `elicit()` to `Err(ErrorCode::Cancelled)` — not
+    /// `Timeout`, not `Ok`. Exercises the cancel-sentinel mapping through the
+    /// whole host fn, past the principal check.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn matching_cancel_sentinel_returns_cancelled() {
+        let rt = tokio::runtime::Handle::current();
+        let mut state = minimal_host_state(rt);
+        state.principal = astrid_core::PrincipalId::new("agent-alice").unwrap();
+        state.lifecycle_phase = Some(LifecyclePhase::Install);
+
+        let bus = state.event_bus.clone();
+        let req_rx = bus.subscribe_topic("astrid.v1.elicit");
+
+        let elicit_handle =
+            tokio::task::spawn_blocking(move || (state.elicit(text_request("api_url")), state));
+
+        let (request_id, _principal) = await_request(req_rx).await;
+        publish_cancel(&bus, request_id, "agent-alice");
+
+        let (result, _state) = elicit_handle.await.expect("elicit thread joined");
+        assert!(
+            matches!(result, Err(ErrorCode::Cancelled)),
+            "both-None reply from the matching principal must map to Cancelled, got {result:?}"
+        );
     }
 }
 
