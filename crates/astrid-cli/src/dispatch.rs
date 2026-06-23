@@ -233,8 +233,11 @@ async fn dispatch_root_shorthand(tokens: Vec<String>) -> Result<ExitCode> {
     commands::capsule_verb::run_external(tokens).await
 }
 
-/// Built-in root subcommand names, harvested once from the clap command
-/// tree, for the typo guard to measure unrecognised tokens against.
+/// Built-in root subcommand names harvested from the clap command tree, for
+/// the typo guard to measure unrecognised tokens against. Built fresh on
+/// each call; a CLI process dispatches a single command and exits, so the
+/// only caller ([`dispatch_root_shorthand`]) invokes this at most once per
+/// process — no caching is warranted.
 ///
 /// The `external_subcommand` catch-all is reported by clap with an empty
 /// placeholder name; filter empties so the guard can never "suggest" the

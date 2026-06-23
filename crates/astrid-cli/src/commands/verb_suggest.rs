@@ -44,12 +44,15 @@ pub(crate) fn nearest_builtin<'a>(token: &str, builtin_names: &[&'a str]) -> Opt
     // without pulling in its crate. Division is checked (the divisor is a
     // nonzero literal, so the fallback is unreachable) to satisfy the
     // workspace `arithmetic_side_effects` deny.
-    let length_scaled = token.chars().count().checked_div(3).unwrap_or(0);
+    // Collect the typed token's chars ONCE; the per-name loop below reuses
+    // this slice instead of re-walking the token's UTF-8 on every iteration.
+    let token_chars: Vec<char> = token.chars().collect();
+    let length_scaled = token_chars.len().checked_div(3).unwrap_or(0);
     let threshold = std::cmp::max(2, length_scaled);
 
     let mut best: Option<(usize, &'a str)> = None;
     for &name in builtin_names {
-        let dist = levenshtein(token, name);
+        let dist = levenshtein_chars(&token_chars, &name.chars().collect::<Vec<char>>());
         // Distance 0 is an exact match. Clap would have consumed it before
         // the catch-all, so it cannot legitimately reach here; refuse to
         // "suggest" the name the user typed verbatim.
@@ -67,16 +70,16 @@ pub(crate) fn nearest_builtin<'a>(token: &str, builtin_names: &[&'a str]) -> Opt
     best.map(|(_, name)| name)
 }
 
-/// Levenshtein edit distance between two strings, counting Unicode scalar
-/// values (not bytes) so multi-byte verbs are measured by character.
+/// Levenshtein edit distance between two char slices, counting Unicode
+/// scalar values (not bytes) so multi-byte verbs are measured by character.
+/// Operating on pre-collected slices lets [`nearest_builtin`] walk the typed
+/// token's chars once and reuse them across every built-in comparison.
 ///
 /// Standard two-row dynamic program: O(a·b) time, O(b) space. Arithmetic
 /// is saturating throughout — distances are bounded by short verb lengths,
 /// so saturation is unreachable in practice and only satisfies the
 /// workspace `arithmetic_side_effects` deny without changing the result.
-fn levenshtein(a: &str, b: &str) -> usize {
-    let a: Vec<char> = a.chars().collect();
-    let b: Vec<char> = b.chars().collect();
+fn levenshtein_chars(a: &[char], b: &[char]) -> usize {
     if a.is_empty() {
         return b.len();
     }
