@@ -20,6 +20,7 @@ use crate::engine::wasm::bindings::astrid::http::host::{
 use crate::engine::wasm::bindings::astrid::io::streams::InputStream;
 use crate::engine::wasm::host::util;
 use crate::engine::wasm::host_state::HostState;
+use crate::security::net_connect_pattern_matches;
 use wasmtime_wasi::p2::DynPollable;
 
 // ── SSRF prevention ──────────────────────────────────────────────────
@@ -39,18 +40,28 @@ const MAX_HTTP_REDIRECTS: usize = 10;
 #[derive(Clone)]
 struct SafeDnsResolver {
     tripped: Arc<AtomicBool>,
+    /// The exact request hostname that the operator allowlist exempts from
+    /// the airlock (decided at pre-flight, where the port is known). When the
+    /// name being resolved equals this, private/loopback addresses are kept.
+    /// `None` = no exemption. Scoped to the one allow-listed host so redirect
+    /// hops to other hostnames are still airlocked.
+    exempt_host: Option<Arc<str>>,
 }
 
 impl reqwest::dns::Resolve for SafeDnsResolver {
     fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
         let name_str = name.as_str().to_string();
         let tripped = self.tripped.clone();
+        let exempt = self
+            .exempt_host
+            .as_deref()
+            .is_some_and(|h| h.eq_ignore_ascii_case(&name_str));
         Box::pin(async move {
             let addrs = tokio::net::lookup_host((name_str.as_str(), 0))
                 .await
                 .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
 
-            let (safe_addrs, saw_unsafe) = filter_safe_addrs(addrs);
+            let (safe_addrs, saw_unsafe) = filter_safe_addrs(addrs, exempt);
 
             if safe_addrs.is_empty() {
                 // All resolved addresses failed the airlock: a genuine SSRF
@@ -83,7 +94,16 @@ impl reqwest::dns::Resolve for SafeDnsResolver {
 /// whether any address was dropped as unsafe. An all-unsafe result (empty
 /// safe set with `saw_unsafe == true`) is an airlock rejection; an empty
 /// input is an ordinary resolution miss.
-fn filter_safe_addrs(addrs: impl Iterator<Item = SocketAddr>) -> (Vec<SocketAddr>, bool) {
+///
+/// `exempt` (the operator allowlist matched this host:port at pre-flight)
+/// keeps every resolved address — the sanctioned local-endpoint case.
+fn filter_safe_addrs(
+    addrs: impl Iterator<Item = SocketAddr>,
+    exempt: bool,
+) -> (Vec<SocketAddr>, bool) {
+    if exempt {
+        return (addrs.collect(), false);
+    }
     let mut safe = Vec::new();
     let mut saw_unsafe = false;
     for addr in addrs {
@@ -220,23 +240,45 @@ fn literal_ip(host: &str) -> Option<IpAddr> {
     IpAddr::from_str(bare).ok()
 }
 
-/// Airlock an IP-literal request URL before it is issued.
+/// True if `host:port` matches any pattern in this capsule's operator
+/// local-egress allowlist. Entries use the same `host:port` / `host:*`
+/// semantics as a manifest `net_connect` entry.
+fn egress_allowed(allowlist: &[String], host: &str, port: u16) -> bool {
+    allowlist
+        .iter()
+        .any(|entry| net_connect_pattern_matches(entry, host, port))
+}
+
+/// Pre-flight the request URL against the SSRF airlock and this capsule's
+/// operator local-egress allowlist.
 ///
-/// reqwest only consults the custom DNS resolver for *hostnames*; a URL
-/// whose authority is already an IP literal (`http://127.0.0.1`,
-/// `http://[::1]`) connects directly and never reaches [`SafeDnsResolver`],
-/// so without this pre-flight a capsule could reach loopback/private
-/// addresses over HTTP. Hostnames pass through untouched and are airlocked
-/// at resolution time.
-fn preflight_airlock(url: &str) -> Result<(), ErrorCode> {
+/// - `Ok(Some(host))` — the operator allowlisted this `host:port`; the
+///   request is exempt. The host is propagated to [`SafeDnsResolver`] so a
+///   hostname endpoint (e.g. `localhost:1234`) resolves through to its
+///   loopback address. Port-specificity is enforced here, where the port is
+///   known — the resolver only ever sees the host.
+/// - `Ok(None)` — not exempt; proceed normally (hostnames are airlocked at
+///   resolution; public IP literals are allowed).
+/// - `Err(AirlockRejected)` — an IP-literal URL to a private/loopback
+///   address that is NOT allowlisted. reqwest never runs the resolver on a
+///   literal, so this pre-flight is the only place it can be caught.
+///
+/// The allowlist check runs first so an operator-sanctioned private literal
+/// (`127.0.0.1:1234`) is permitted rather than airlock-rejected.
+fn egress_decision(allowlist: &[String], url: &str) -> Result<Option<Arc<str>>, ErrorCode> {
     let parsed = reqwest::Url::parse(url).map_err(|_| ErrorCode::InvalidRequest)?;
     let host = parsed.host_str().ok_or(ErrorCode::InvalidRequest)?;
+    if let Some(port) = parsed.port_or_known_default()
+        && egress_allowed(allowlist, host, port)
+    {
+        return Ok(Some(Arc::from(host)));
+    }
     if let Some(ip) = literal_ip(host)
         && !is_safe_ip(ip)
     {
         return Err(ErrorCode::AirlockRejected);
     }
-    Ok(())
+    Ok(None)
 }
 
 /// What to do with a redirect hop.
@@ -292,6 +334,22 @@ fn airlock_redirect_policy(tripped: Arc<AtomicBool>) -> reqwest::redirect::Polic
             RedirectAction::Follow => attempt.follow(),
         }
     })
+}
+
+/// Build the redirect policy for a request.
+///
+/// An operator-allowlisted (`exempt`) request must **not** follow redirects:
+/// the resolver exemption is host-only, so a `30x` to a *different port* on
+/// the same host (or to another allow-listed host) would escape the
+/// port-scoped allowlist. A sanctioned local LLM endpoint has no reason to
+/// redirect, so exempt requests refuse to follow any. Non-exempt requests
+/// use the per-hop [`airlock_redirect_policy`].
+fn build_redirect_policy(exempt: bool, tripped: Arc<AtomicBool>) -> reqwest::redirect::Policy {
+    if exempt {
+        reqwest::redirect::Policy::none()
+    } else {
+        airlock_redirect_policy(tripped)
+    }
 }
 
 /// Choose the typed error for a failed request. An airlock rejection
@@ -415,14 +473,18 @@ impl http::Host for HostState {
         )
         .await?;
 
-        preflight_airlock(&request.url)?;
+        let exempt_host = egress_decision(&self.local_egress, &request.url)?;
 
         let tripped = Arc::new(AtomicBool::new(false));
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(30))
-            .redirect(airlock_redirect_policy(tripped.clone()))
+            .redirect(build_redirect_policy(
+                exempt_host.is_some(),
+                tripped.clone(),
+            ))
             .dns_resolver(Arc::new(SafeDnsResolver {
                 tripped: tripped.clone(),
+                exempt_host,
             }))
             .build()
             .map_err(|e| ErrorCode::Unknown(format!("client: {e}")))?;
@@ -502,14 +564,18 @@ impl http::Host for HostState {
         )
         .await?;
 
-        preflight_airlock(&request.url)?;
+        let exempt_host = egress_decision(&self.local_egress, &request.url)?;
 
         let tripped = Arc::new(AtomicBool::new(false));
         let client = reqwest::Client::builder()
             .connect_timeout(HTTP_STREAM_CONNECT_TIMEOUT)
-            .redirect(airlock_redirect_policy(tripped.clone()))
+            .redirect(build_redirect_policy(
+                exempt_host.is_some(),
+                tripped.clone(),
+            ))
             .dns_resolver(Arc::new(SafeDnsResolver {
                 tripped: tripped.clone(),
+                exempt_host,
             }))
             .build()
             .map_err(|e| ErrorCode::Unknown(format!("client: {e}")))?;
@@ -674,219 +740,5 @@ fn map_reqwest_err(e: &reqwest::Error) -> ErrorCode {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn ip(s: &str) -> IpAddr {
-        IpAddr::from_str(s).unwrap()
-    }
-
-    #[test]
-    fn safe_public_ips() {
-        assert!(is_safe_ip(IpAddr::from_str("8.8.8.8").unwrap()));
-        assert!(is_safe_ip(IpAddr::from_str("1.1.1.1").unwrap()));
-        assert!(is_safe_ip(IpAddr::from_str("198.51.100.1").unwrap()));
-        assert!(is_safe_ip(
-            IpAddr::from_str("2001:4860:4860::8888").unwrap()
-        ));
-    }
-
-    #[test]
-    fn blocks_loopback_and_unspecified() {
-        assert!(!is_safe_ip(IpAddr::from_str("127.0.0.1").unwrap()));
-        assert!(!is_safe_ip(IpAddr::from_str("::1").unwrap()));
-        assert!(!is_safe_ip(IpAddr::from_str("0.0.0.0").unwrap()));
-        assert!(!is_safe_ip(IpAddr::from_str("::").unwrap()));
-    }
-
-    #[test]
-    fn blocks_zero_block() {
-        assert!(!is_safe_ip(IpAddr::from_str("0.0.0.1").unwrap()));
-        assert!(!is_safe_ip(IpAddr::from_str("0.255.255.255").unwrap()));
-    }
-
-    #[test]
-    fn blocks_rfc1918_private() {
-        assert!(!is_safe_ip(IpAddr::from_str("10.0.0.1").unwrap()));
-        assert!(!is_safe_ip(IpAddr::from_str("10.255.255.255").unwrap()));
-        assert!(!is_safe_ip(IpAddr::from_str("172.16.0.1").unwrap()));
-        assert!(!is_safe_ip(IpAddr::from_str("172.31.255.255").unwrap()));
-        assert!(!is_safe_ip(IpAddr::from_str("192.168.0.1").unwrap()));
-        assert!(!is_safe_ip(IpAddr::from_str("192.168.255.255").unwrap()));
-    }
-
-    #[test]
-    fn blocks_link_local_and_cgnat() {
-        assert!(!is_safe_ip(IpAddr::from_str("169.254.169.254").unwrap()));
-        assert!(!is_safe_ip(IpAddr::from_str("100.64.0.1").unwrap()));
-        assert!(!is_safe_ip(IpAddr::from_str("100.127.255.255").unwrap()));
-    }
-
-    #[test]
-    fn blocks_private_ipv6() {
-        assert!(!is_safe_ip(IpAddr::from_str("fc00::1").unwrap()));
-        assert!(!is_safe_ip(IpAddr::from_str("fd00::1").unwrap()));
-        assert!(!is_safe_ip(IpAddr::from_str("fe80::1").unwrap()));
-    }
-
-    #[test]
-    fn blocks_ipv4_mapped_ipv6_bypass() {
-        assert!(!is_safe_ip(IpAddr::from_str("::ffff:127.0.0.1").unwrap()));
-        assert!(!is_safe_ip(IpAddr::from_str("::ffff:10.0.0.1").unwrap()));
-        assert!(!is_safe_ip(
-            IpAddr::from_str("::ffff:169.254.169.254").unwrap()
-        ));
-    }
-
-    #[test]
-    fn blocks_ipv4_compatible_ipv6_bypass() {
-        assert!(!is_safe_ip(IpAddr::from_str("::127.0.0.1").unwrap()));
-        assert!(!is_safe_ip(IpAddr::from_str("::10.0.0.1").unwrap()));
-        assert!(!is_safe_ip(IpAddr::from_str("::169.254.169.254").unwrap()));
-        assert!(!is_safe_ip(IpAddr::from_str("::0.0.0.1").unwrap()));
-    }
-
-    #[test]
-    fn blocks_nat64_embedded_private_ipv4() {
-        // NAT64 well-known prefix 64:ff9b::/96 embedding private/metadata IPv4.
-        assert!(!is_safe_ip(ip("64:ff9b::7f00:1"))); // -> 127.0.0.1
-        assert!(!is_safe_ip(ip("64:ff9b::a00:1"))); // -> 10.0.0.1
-        assert!(!is_safe_ip(ip("64:ff9b::c0a8:1"))); // -> 192.168.0.1
-        assert!(!is_safe_ip(ip("64:ff9b::a9fe:a9fe"))); // -> 169.254.169.254 (cloud metadata)
-    }
-
-    #[test]
-    fn blocks_6to4_embedded_private_ipv4() {
-        // 6to4 2002::/16 embedding private IPv4 in bits 16..48.
-        assert!(!is_safe_ip(ip("2002:7f00:1::"))); // -> 127.0.0.1
-        assert!(!is_safe_ip(ip("2002:c0a8:1::"))); // -> 192.168.0.1
-        assert!(!is_safe_ip(ip("2002:a9fe:a9fe::"))); // -> 169.254.169.254
-    }
-
-    #[test]
-    fn blocks_teredo_embedded_private_ipv4() {
-        // Teredo 2001:0::/32 server IPv4 (bits 32..64) is loopback.
-        assert!(!is_safe_ip(ip("2001:0:7f00:1::"))); // server -> 127.0.0.1
-        // Public server (8.8.8.8) but private client: the client IPv4 is
-        // the bitwise-NOT of the last 32 bits — !f5ff:!fffe == 0a00:0001
-        // == 10.0.0.1. Must still be blocked.
-        assert!(!is_safe_ip(ip("2001:0:808:808:0:0:f5ff:fffe")));
-    }
-
-    #[test]
-    fn embedded_transition_with_public_ipv4_stays_safe() {
-        // A transition address embedding a *public* IPv4 must not be
-        // over-blocked: only embedded private/loopback ranges are rejected.
-        assert!(is_safe_ip(ip("64:ff9b::808:808"))); // NAT64 -> 8.8.8.8
-        assert!(is_safe_ip(ip("2002:808:808::"))); // 6to4 -> 8.8.8.8
-    }
-
-    #[test]
-    fn literal_ip_parses_literals_not_domains() {
-        assert_eq!(literal_ip("127.0.0.1"), Some(ip("127.0.0.1")));
-        assert_eq!(literal_ip("8.8.8.8"), Some(ip("8.8.8.8")));
-        assert_eq!(literal_ip("[::1]"), Some(ip("::1")));
-        assert_eq!(
-            literal_ip("[2606:4700:4700::1111]"),
-            Some(ip("2606:4700:4700::1111"))
-        );
-        assert_eq!(literal_ip("example.com"), None);
-        assert_eq!(literal_ip("localhost"), None);
-        // Non-canonical numeric forms are not IP literals here; they fall
-        // through to the resolver, which airlocks the resolved address.
-        assert_eq!(literal_ip("2130706433"), None);
-    }
-
-    #[test]
-    fn preflight_blocks_ip_literal_local_urls() {
-        // The IP-literal SSRF bypass: these never reach SafeDnsResolver,
-        // so the pre-flight is the only thing that blocks them.
-        for url in [
-            "http://127.0.0.1:1234/",
-            "http://192.168.1.5:1234/v1/chat/completions",
-            "http://[::1]:1234/",
-            "http://169.254.169.254/latest/meta-data/",
-        ] {
-            assert!(
-                matches!(preflight_airlock(url), Err(ErrorCode::AirlockRejected)),
-                "expected airlock rejection for {url}"
-            );
-        }
-    }
-
-    #[test]
-    fn preflight_allows_public_literals_and_hostnames() {
-        // Public IP literals pass; hostnames pass pre-flight (the resolver
-        // airlocks them later).
-        assert!(preflight_airlock("https://8.8.8.8/").is_ok());
-        assert!(preflight_airlock("https://api.openai.com/v1/models").is_ok());
-        assert!(preflight_airlock("http://localhost:1234/").is_ok());
-    }
-
-    #[test]
-    fn preflight_rejects_unparsable_url() {
-        assert!(matches!(
-            preflight_airlock("not a url"),
-            Err(ErrorCode::InvalidRequest)
-        ));
-    }
-
-    #[test]
-    fn redirect_blocks_ip_literal_targets() {
-        // Redirect SSRF: a 302 Location pointing at an IP literal never
-        // reaches the resolver, so the policy must block it per hop.
-        assert_eq!(
-            classify_redirect(Some("127.0.0.1"), 0),
-            RedirectAction::Block
-        );
-        assert_eq!(classify_redirect(Some("[::1]"), 0), RedirectAction::Block);
-        assert_eq!(
-            classify_redirect(Some("169.254.169.254"), 0),
-            RedirectAction::Block
-        );
-        assert_eq!(
-            classify_redirect(Some("10.0.0.5"), 2),
-            RedirectAction::Block
-        );
-    }
-
-    #[test]
-    fn redirect_follows_safe_targets_within_cap() {
-        // Hostnames are airlocked by the resolver, public literals are
-        // safe; both follow until the hop cap.
-        assert_eq!(
-            classify_redirect(Some("example.com"), 0),
-            RedirectAction::Follow
-        );
-        assert_eq!(
-            classify_redirect(Some("8.8.8.8"), 0),
-            RedirectAction::Follow
-        );
-        assert_eq!(classify_redirect(None, 0), RedirectAction::Follow);
-        assert_eq!(
-            classify_redirect(Some("example.com"), MAX_HTTP_REDIRECTS),
-            RedirectAction::Stop
-        );
-    }
-
-    #[test]
-    fn filter_safe_addrs_reports_airlock_trip() {
-        let loopback = SocketAddr::from(([127, 0, 0, 1], 1234));
-        let public = SocketAddr::from(([8, 8, 8, 8], 443));
-
-        // All-unsafe -> empty safe set, saw_unsafe true (the airlock trip).
-        let (safe, saw) = filter_safe_addrs([loopback].into_iter());
-        assert!(safe.is_empty());
-        assert!(saw);
-
-        // Mixed -> drop unsafe, keep public, no trip (request proceeds).
-        let (safe, saw) = filter_safe_addrs([loopback, public].into_iter());
-        assert_eq!(safe, vec![public]);
-        assert!(saw);
-
-        // Empty input is a resolution miss, not an airlock trip.
-        let (safe, saw) = filter_safe_addrs(std::iter::empty());
-        assert!(safe.is_empty());
-        assert!(!saw);
-    }
-}
+#[path = "http_tests.rs"]
+mod tests;
