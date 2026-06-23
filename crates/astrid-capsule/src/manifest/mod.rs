@@ -414,6 +414,25 @@ pub struct EnvDef {
     /// Placeholder hint text shown in an empty input field (e.g. `"sk-..."`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub placeholder: Option<String>,
+    /// Dynamic-select source. When present, this field is a SELECT whose
+    /// options are fetched live at prompt time from an HTTP endpoint
+    /// (typically the provider's `/v1/models`) rather than enumerated
+    /// statically in `enum_values`.
+    ///
+    /// The fetch runs in the operator-facing **installer** (the native
+    /// CLI, which has network access) — never inside the sandboxed
+    /// capsule. Resolution is best-effort: any failure falls back to a
+    /// free-text prompt. See [`OptionsFrom`].
+    ///
+    /// Keyed `options_from` to match the snake-case convention of the
+    /// sibling `enum_values` field; the kebab `options-from` form is
+    /// accepted as an alias for author convenience.
+    #[serde(
+        default,
+        alias = "options-from",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub options_from: Option<OptionsFrom>,
     /// Sharing model for this env variable across principals on the
     /// same host. Defaults to [`EnvScope::Agent`] (fail-closed: every
     /// principal has their own isolated value, miss = no value).
@@ -435,6 +454,64 @@ pub struct EnvDef {
         skip_deserializing
     )]
     pub scope: EnvScope,
+}
+
+/// Dynamic-select source for an [`EnvDef`].
+///
+/// Declares an HTTP endpoint whose JSON response enumerates the valid
+/// choices for a field. At prompt time, the installer substitutes the
+/// already-collected env values into the `http`/`bearer` templates,
+/// performs `GET <http>` (with `Authorization: Bearer <bearer>` only
+/// when `bearer` resolves to a non-empty value), and parses the response
+/// shape named by `select`.
+///
+/// Template placeholders use `{key}` syntax, where `key` is the name of
+/// another `[env]` field. Fields named in [`Self::after`] are guaranteed
+/// to be collected before this field is prompted, so their values are
+/// available for substitution.
+///
+/// # Security
+///
+/// This resolution is performed by the native installer, which has
+/// network access — **never** by the sandboxed capsule. A capsule
+/// cannot make outbound requests through this mechanism; it only
+/// declares the shape of the discovery call the operator's installer
+/// performs on its behalf. Failure is non-fatal: the field degrades to
+/// a free-text prompt.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct OptionsFrom {
+    /// HTTP endpoint template, e.g. `"{base_url}/v1/models"`. Resolved
+    /// against the already-collected env values at prompt time.
+    pub http: String,
+    /// Optional bearer-token template, e.g. `"{api_key}"`. The
+    /// `Authorization: Bearer` header is sent **only** when this
+    /// resolves to a non-empty value after trimming.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bearer: Option<String>,
+    /// JSON shape hint identifying the option list in the response.
+    /// Defaults to `"data[].id"` — the standard OpenAI `/v1/models`
+    /// shape (`{ "data": [ { "id": "..." } ] }`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub select: Option<String>,
+    /// Env keys that must be collected before this field is prompted.
+    /// Ensures dependency values (base URL, API key) are available for
+    /// template substitution. The installer orders prompts so that
+    /// fields with `after` dependencies come after their dependencies.
+    #[serde(default)]
+    pub after: Vec<String>,
+}
+
+impl OptionsFrom {
+    /// The default JSON shape hint when `select` is unset: the standard
+    /// OpenAI `/v1/models` response (`data[].id`).
+    pub const DEFAULT_SELECT: &'static str = "data[].id";
+
+    /// The configured `select` shape hint, or [`Self::DEFAULT_SELECT`]
+    /// when unset.
+    #[must_use]
+    pub fn select_or_default(&self) -> &str {
+        self.select.as_deref().unwrap_or(Self::DEFAULT_SELECT)
+    }
 }
 
 /// Sharing model for an env / secret value across principals.
@@ -599,4 +676,49 @@ pub struct ToolDef {
     /// Whether this tool may mutate state (drives the approval-prompt copy).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub mutable: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn env_def_parses_options_from() {
+        let toml_src = r#"
+type = "select"
+description = "Default model"
+default = "gpt-4o"
+options-from = { http = "{base_url}/v1/models", bearer = "{api_key}", select = "data[].id", after = ["base_url", "api_key"] }
+"#;
+        let def: EnvDef = toml::from_str(toml_src).expect("env def with options-from parses");
+        let opts = def.options_from.expect("options_from present");
+        assert_eq!(opts.http, "{base_url}/v1/models");
+        assert_eq!(opts.bearer.as_deref(), Some("{api_key}"));
+        assert_eq!(opts.select.as_deref(), Some("data[].id"));
+        assert_eq!(opts.after, vec!["base_url", "api_key"]);
+    }
+
+    #[test]
+    fn options_from_select_defaults_when_absent() {
+        let toml_src = r#"
+type = "select"
+options-from = { http = "https://api.example.com/v1/models" }
+"#;
+        let def: EnvDef = toml::from_str(toml_src).unwrap();
+        let opts = def.options_from.expect("options_from present");
+        assert_eq!(opts.bearer, None);
+        assert!(opts.after.is_empty());
+        assert_eq!(opts.select_or_default(), OptionsFrom::DEFAULT_SELECT);
+        assert_eq!(opts.select_or_default(), "data[].id");
+    }
+
+    #[test]
+    fn env_def_without_options_from_is_none() {
+        let toml_src = r#"
+type = "text"
+description = "Base URL"
+"#;
+        let def: EnvDef = toml::from_str(toml_src).unwrap();
+        assert!(def.options_from.is_none());
+    }
 }
