@@ -118,8 +118,12 @@ astrid init ./astralis-0.1.0.shuttle
 The install runs, in order: unpack (hardened — traversal/symlink/size
 defended) → verify signature + apply trust policy → verify
 `manifest_hash` binds `Distro.toml` to the signed lock → verify every
-capsule's BLAKE3 → install offline from the verified mirror. Any failure
-aborts **before** anything is written to the capsule store.
+capsule's BLAKE3 → install offline from the verified mirror. All
+*verification* gates (signature + trust, manifest-hash binding, every
+capsule's BLAKE3) run **before** any capsule is installed, so a
+tampered, unsigned, or mismatched bundle installs nothing. Capsule
+installation itself is sequential and not transactional, so a failure
+partway through can leave earlier capsules installed.
 
 Relevant flags (also on `astrid distro apply`):
 
