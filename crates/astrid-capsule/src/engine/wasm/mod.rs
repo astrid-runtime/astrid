@@ -1199,6 +1199,10 @@ impl ExecutionEngine for WasmEngine {
             // backs the infallible `enumerate-capabilities` host fn. Cloned per
             // pooled instance inside the `make_state` closure below.
             let capability_names = manifest.capabilities.held_names();
+            // Operator-approved local-egress allowlist for this capsule,
+            // snapshotted from the load context onto every pooled instance
+            // (load-time-fixed, like `capability_names`).
+            let local_egress = ctx.local_egress.clone();
             // One IPC rate limiter shared by every pooled instance, so the
             // per-capsule throughput budget is not multiplied by pool size.
             let ipc_limiter = Arc::new(astrid_events::ipc::IpcRateLimiter::new());
@@ -1384,6 +1388,7 @@ impl ExecutionEngine for WasmEngine {
                 runtime_handle: tokio::runtime::Handle::current(),
                 has_uplink_capability: has_uplink,
                 capability_names: capability_names.clone(),
+                local_egress: local_egress.clone(),
                 audit_firehose,
                 inbound_tx: tx.clone(),
                 registered_uplinks: Vec::new(),
@@ -2409,6 +2414,9 @@ pub async fn run_lifecycle(
         // capability introspection is not exposed here (matches the
         // hard-coded `has_uplink_capability: false` above). Fail-closed.
         capability_names: Vec::new(),
+        // Lifecycle (install/upgrade) hooks run briefly and do not carry a
+        // local-egress exemption; the SSRF airlock applies in full.
+        local_egress: Vec::new(),
         // Lifecycle hooks never subscribe to the audit feed; fail-secure.
         audit_firehose: false,
         inbound_tx: None,
@@ -3456,6 +3464,7 @@ mod tests {
             default: None,
             enum_values: vec![],
             placeholder: None,
+            options_from: None,
             scope: crate::manifest::EnvScope::default(),
         };
         let field = crate::engine::build_onboarding_field("owner", &def);
@@ -3478,6 +3487,7 @@ mod tests {
             default: None,
             enum_values: vec!["a".into()], // enum_values ignored for secrets
             placeholder: None,
+            options_from: None,
             scope: crate::manifest::EnvScope::default(),
         };
         let field = crate::engine::build_onboarding_field("apiKey", &def);
@@ -3496,6 +3506,7 @@ mod tests {
             default: Some(serde_json::json!("testnet")),
             enum_values: vec!["testnet".into(), "mainnet".into()],
             placeholder: None,
+            options_from: None,
             scope: crate::manifest::EnvScope::default(),
         };
         let field = crate::engine::build_onboarding_field("network", &def);
@@ -3515,6 +3526,7 @@ mod tests {
             default: None,
             enum_values: vec![],
             placeholder: None,
+            options_from: None,
             scope: crate::manifest::EnvScope::default(),
         };
         let field = crate::engine::build_onboarding_field("someKey", &def);
@@ -3530,6 +3542,7 @@ mod tests {
             default: None,
             enum_values: vec!["only".into()],
             placeholder: None,
+            options_from: None,
             scope: crate::manifest::EnvScope::default(),
         };
         let field = crate::engine::build_onboarding_field("single", &def);
@@ -3554,6 +3567,7 @@ mod tests {
             default: None,
             enum_values: vec![],
             placeholder: None,
+            options_from: None,
             scope: crate::manifest::EnvScope::default(),
         };
         let field = crate::engine::build_onboarding_field("relays", &def);
@@ -3573,6 +3587,7 @@ mod tests {
             default: None,
             enum_values: vec![],
             placeholder: None,
+            options_from: None,
             scope: crate::manifest::EnvScope::default(),
         };
         let field = crate::engine::build_onboarding_field("empty", &def);

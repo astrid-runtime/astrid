@@ -580,7 +580,7 @@ async fn sync_distro_and_capsules() -> anyhow::Result<()> {
     // Re-run init which handles: fetch manifest, diff lock, install new capsules.
     // init is idempotent — if lock is fresh it returns immediately.
     if let Err(e) = super::init::run_init(distro_id).await {
-        println!("{}", Theme::warning(&format!("Distro sync: {e}")));
+        println!("{}", Theme::warning(&post_update_sync_message(&e)));
     }
 
     // Update individual capsules (checks GitHub releases for newer versions).
@@ -589,6 +589,40 @@ async fn sync_distro_and_capsules() -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+/// Choose the warning text for a failed post-update distro sync.
+///
+/// The post-swap sync re-runs `init` inside the **still-running old process**
+/// (old `CARGO_PKG_VERSION`) after the new binary is already on disk. If the
+/// freshly-fetched `Distro.toml` raised its `[distro].astrid-version` floor to
+/// the new release, the version gate fires — but here it is *expected and benign*:
+/// the on-disk binary is already correct, only the in-flight process is stale, so
+/// the raw "Run `astrid update`" text would be confusing right after a successful
+/// update. We look for the typed [`AstridVersionTooOld`] and substitute an
+/// accurate "takes effect next run" message; every other failure keeps the
+/// generic "Distro sync: {e}" warning.
+///
+/// The match walks the **whole error chain** (`err.chain()`), not just the root,
+/// so the softening still fires if a caller has wrapped the gate error with
+/// `.context(...)` — a `downcast_ref` on the root alone would silently miss a
+/// context-wrapped gate and resurface the confusing raw "Run `astrid update`"
+/// text right after a successful update.
+///
+/// Pure over the error so the decision is unit-testable without running a real
+/// update.
+fn post_update_sync_message(err: &anyhow::Error) -> String {
+    let is_version_gate = err.chain().any(|e| {
+        e.downcast_ref::<super::distro::validate::AstridVersionTooOld>()
+            .is_some()
+    });
+    if is_version_gate {
+        "The updated distro manifest requires the new astrid; it will take effect \
+         on your next run — restart astrid (or re-run `astrid distro apply`)."
+            .to_string()
+    } else {
+        format!("Distro sync: {err}")
+    }
 }
 
 // ── PATH setup helpers ──────────────────────────────────────────────────
@@ -810,5 +844,63 @@ mod tests {
         );
         assert!(!install.join("astrid.bak").exists());
         assert!(!install.join(".astrid.new").exists());
+    }
+
+    #[test]
+    fn post_update_sync_message_softens_version_gate() {
+        use super::super::distro::validate::AstridVersionTooOld;
+
+        // The version-floor gate fired during the post-swap sync (old in-flight
+        // process, new binary already on disk) — the user must see the benign
+        // "takes effect next run" message, NOT the raw "Run `astrid update`" text.
+        let gate: anyhow::Error = AstridVersionTooOld {
+            req: ">=0.8.0".to_string(),
+            running: "0.7.0".to_string(),
+        }
+        .into();
+        let msg = post_update_sync_message(&gate);
+        assert!(
+            msg.contains("take effect")
+                && msg.contains("next run")
+                && !msg.contains("Run `astrid update`"),
+            "version-gate failure must yield the benign restart message, got: {msg}"
+        );
+
+        // FIX F: a CONTEXT-WRAPPED gate error must still be softened. The
+        // typed gate is buried under two `.context(...)` layers; the displayed
+        // (outermost) message is now the context string, so a match that only
+        // looked at the surface text would miss it. `post_update_sync_message`
+        // walks `err.chain()` to find `AstridVersionTooOld` underneath.
+        use anyhow::Context as _;
+        let wrapped: anyhow::Error = Err::<(), _>(anyhow::Error::from(AstridVersionTooOld {
+            req: ">=0.8.0".to_string(),
+            running: "0.7.0".to_string(),
+        }))
+        .context("re-running init after update")
+        .context("syncing distro")
+        .unwrap_err();
+        // Guard: the outermost display text is the context, not the gate's own
+        // message — so the softening must come from a chain walk, not from
+        // inspecting the surface error.
+        assert_eq!(wrapped.to_string(), "syncing distro");
+        assert!(
+            wrapped.chain().any(|e| e.is::<AstridVersionTooOld>()),
+            "guard: the typed gate must be reachable by walking the chain"
+        );
+        let msg = post_update_sync_message(&wrapped);
+        assert!(
+            msg.contains("take effect")
+                && msg.contains("next run")
+                && !msg.contains("Run `astrid update`"),
+            "context-wrapped version-gate failure must still be softened, got: {msg}"
+        );
+
+        // Any OTHER sync failure keeps the generic warn path verbatim.
+        let other = anyhow::anyhow!("network unreachable while fetching Distro.toml");
+        let msg = post_update_sync_message(&other);
+        assert!(
+            msg.starts_with("Distro sync:") && msg.contains("network unreachable"),
+            "non-gate failure must use the generic warn path, got: {msg}"
+        );
     }
 }

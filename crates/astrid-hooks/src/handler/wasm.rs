@@ -263,6 +263,9 @@ impl WasmHandler {
 
     /// Build a [`HostState`] with minimal permissions for hook execution.
     fn build_host_state(&self, module_path: &str) -> Result<HostState, HandlerError> {
+        use astrid_capsule::engine::wasm::host::process::{
+            PersistentProcessRegistry, ProcessTracker,
+        };
         let kv = if let Some(kv) = &self.kv {
             kv.clone()
         } else {
@@ -341,10 +344,10 @@ impl WasmHandler {
             capsule_registry: None,
             runtime_handle: tokio::runtime::Handle::current(),
             has_uplink_capability: false,
-            // Hooks run outside the capsule manifest/security-gate lifecycle and
-            // hold no manifest capabilities, so capability introspection reports
-            // an empty set (fail-closed, like `has_uplink_capability` above).
+            // Hooks run outside the manifest/security-gate lifecycle: no held
+            // capabilities and no local-egress exemptions (both fail-closed).
             capability_names: Vec::new(),
+            local_egress: Vec::new(),
             // Transient hook execution never subscribes to the audit feed;
             // fail-secure to scoped.
             audit_firehose: false,
@@ -362,20 +365,14 @@ impl WasmHandler {
             session_token: None,
             interceptor_handles: Vec::new(),
             allowance_store: None,
-            // Hooks run outside the full capsule lifecycle and intentionally
-            // do not receive the identity store. Identity resolution requires
-            // a kernel-managed security gate which hooks don't have.
+            // Hooks have no kernel-managed security gate, so no identity store.
             identity_store: None,
-            process_tracker: Arc::new(
-                astrid_capsule::engine::wasm::host::process::ProcessTracker::new(),
-            ),
+            process_tracker: Arc::new(ProcessTracker::new()),
             // Hooks never spawn persistent processes; a throwaway registry
             // satisfies the field (reaped when this state drops).
-            persistent_processes: Arc::new(
-                astrid_capsule::engine::wasm::host::process::PersistentProcessRegistry::new(
-                    tokio::runtime::Handle::current(),
-                ),
-            ),
+            persistent_processes: Arc::new(PersistentProcessRegistry::new(
+                tokio::runtime::Handle::current(),
+            )),
             net_stream_count: 0,
             subscription_count: 0,
             process_count_total: 0,
