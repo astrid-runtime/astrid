@@ -124,7 +124,10 @@ pub(crate) fn unpack(archive_path: &Path, dest: &Path) -> anyhow::Result<()> {
         .context("failed to read shuttle entries (truncated or not a gzip tar?)")?
     {
         let mut entry = entry.context("failed to read shuttle entry (truncated archive?)")?;
-        let entry_path = entry.path().context("invalid path in shuttle")?.into_owned();
+        let entry_path = entry
+            .path()
+            .context("invalid path in shuttle")?
+            .into_owned();
 
         if entry_path.is_absolute()
             || entry_path

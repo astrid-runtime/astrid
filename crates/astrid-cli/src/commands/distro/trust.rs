@@ -234,7 +234,10 @@ mod tests {
         let out = verify_and_pin(&home, "test", &pubkey, &sig, &lock, false).unwrap();
         assert_eq!(out.action, TrustAction::ToFuTrusted);
         // Pinned now.
-        assert_eq!(read_pinned(&home, "test").unwrap().unwrap(), kp.export_public_key());
+        assert_eq!(
+            read_pinned(&home, "test").unwrap().unwrap(),
+            kp.export_public_key()
+        );
     }
 
     #[test]
@@ -311,7 +314,10 @@ mod tests {
         )
         .unwrap();
         assert_eq!(out.action, TrustAction::NewKeyAccepted);
-        assert_eq!(read_pinned(&home, "test").unwrap().unwrap(), kp2.export_public_key());
+        assert_eq!(
+            read_pinned(&home, "test").unwrap().unwrap(),
+            kp2.export_public_key()
+        );
     }
 
     #[test]

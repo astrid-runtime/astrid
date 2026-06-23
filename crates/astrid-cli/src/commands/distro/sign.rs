@@ -75,11 +75,10 @@ pub(crate) fn sign_lock(lock: &DistroLock, keypair: &KeyPair) -> anyhow::Result<
 
 /// Parse the `ed25519:<base64>` wire form into a [`PublicKey`].
 pub(crate) fn parse_pubkey(wire: &str) -> anyhow::Result<PublicKey> {
-    let b64 = wire
-        .strip_prefix("ed25519:")
-        .ok_or_else(|| anyhow::anyhow!("public key must be in 'ed25519:<base64>' form, got {wire:?}"))?;
-    PublicKey::from_base64(b64)
-        .map_err(|e| anyhow::anyhow!("invalid ed25519 public key: {e}"))
+    let b64 = wire.strip_prefix("ed25519:").ok_or_else(|| {
+        anyhow::anyhow!("public key must be in 'ed25519:<base64>' form, got {wire:?}")
+    })?;
+    PublicKey::from_base64(b64).map_err(|e| anyhow::anyhow!("invalid ed25519 public key: {e}"))
 }
 
 /// Render a [`PublicKey`] as `ed25519:<base64>`.

@@ -23,9 +23,7 @@ use std::path::Path;
 use anyhow::{Context, bail};
 use astrid_core::dirs::AstridHome;
 
-use super::lock::{
-    DistroLock, DistroLockMeta, LockedCapsule, manifest_hash, write_lock,
-};
+use super::lock::{DistroLock, DistroLockMeta, LockedCapsule, manifest_hash, write_lock};
 use super::manifest::parse_manifest;
 use super::{shuttle, trust};
 use crate::commands::init::InitOpts;
@@ -76,34 +74,33 @@ pub(crate) fn install_from_shuttle(shuttle_path: &Path, opts: &InitOpts) -> anyh
 
     // 3. Trust gate. A sealed `.shuttle` is a remote-origin artifact:
     //    a missing signature is refused unless --allow-unsigned.
-    let (signer, signature) = if let (Some(signing), Some(sig_hex)) =
-        (&manifest.distro.signing, &sig)
-    {
-        let outcome = trust::verify_and_pin(
-            &home,
-            &distro_id,
-            &signing.pubkey,
-            sig_hex,
-            &lock,
-            opts.accept_new_key,
-        )?;
-        report_trust(&outcome);
-        (Some(outcome.key_str), Some(sig_hex.trim().to_string()))
-    } else {
-        if !opts.allow_unsigned {
-            bail!(
-                "shuttle for '{distro_id}' is unsigned (no [distro.signing] or Distro.sig) — \
+    let (signer, signature) =
+        if let (Some(signing), Some(sig_hex)) = (&manifest.distro.signing, &sig) {
+            let outcome = trust::verify_and_pin(
+                &home,
+                &distro_id,
+                &signing.pubkey,
+                sig_hex,
+                &lock,
+                opts.accept_new_key,
+            )?;
+            report_trust(&outcome);
+            (Some(outcome.key_str), Some(sig_hex.trim().to_string()))
+        } else {
+            if !opts.allow_unsigned {
+                bail!(
+                    "shuttle for '{distro_id}' is unsigned (no [distro.signing] or Distro.sig) — \
                  refusing. Re-run with --allow-unsigned to install anyway."
+                );
+            }
+            eprintln!(
+                "{}",
+                Theme::warning(&format!(
+                    "installing UNSIGNED distro '{distro_id}' (--allow-unsigned)"
+                ))
             );
-        }
-        eprintln!(
-            "{}",
-            Theme::warning(&format!(
-                "installing UNSIGNED distro '{distro_id}' (--allow-unsigned)"
-            ))
-        );
-        (None, None)
-    };
+            (None, None)
+        };
 
     // 4. Manifest-hash integrity. The signature covers the *lock*, not
     //    `Distro.toml`; `manifest_hash` is the ONLY thing binding the
@@ -122,7 +119,11 @@ pub(crate) fn install_from_shuttle(shuttle_path: &Path, opts: &InitOpts) -> anyh
         "{}",
         Theme::header(&format!(
             "Installing {} {} (offline)",
-            manifest.distro.pretty_name.as_deref().unwrap_or(&manifest.distro.name),
+            manifest
+                .distro
+                .pretty_name
+                .as_deref()
+                .unwrap_or(&manifest.distro.name),
             manifest.distro.version,
         ))
     );
@@ -135,12 +136,8 @@ pub(crate) fn install_from_shuttle(shuttle_path: &Path, opts: &InitOpts) -> anyh
     // 5. Select capsules + collect variables (headless-aware).
     let variables = manifest.variables.clone();
     let selected = crate::commands::init::select_capsules(manifest.capsules.clone(), opts.yes)?;
-    let vars = crate::commands::init::collect_variables(
-        &variables,
-        &selected,
-        opts.yes,
-        &opts.vars,
-    )?;
+    let vars =
+        crate::commands::init::collect_variables(&variables, &selected, opts.yes, &opts.vars)?;
     crate::commands::init::write_env_files(&home, &selected, &vars)?;
 
     // 6. Install each selected capsule from the verified mirror. The
@@ -295,7 +292,10 @@ fn verify_capsule_hashes(mirror: &Path, lock: &DistroLock) -> anyhow::Result<()>
     for entry in &lock.capsules {
         let file = shuttle::capsule_mirror_path(mirror, &entry.name);
         if !file.is_file() {
-            bail!("capsule '{}' is missing from the shuttle mirror", entry.name);
+            bail!(
+                "capsule '{}' is missing from the shuttle mirror",
+                entry.name
+            );
         }
         let bytes = std::fs::read(&file)
             .with_context(|| format!("failed to read mirrored capsule {}", entry.name))?;
@@ -325,7 +325,10 @@ fn report_trust(outcome: &trust::TrustOutcome) {
             outcome.key_str
         ),
         trust::TrustAction::NewKeyAccepted => {
-            format!("re-pinned to new key {} (--accept-new-key)", outcome.key_str)
+            format!(
+                "re-pinned to new key {} (--accept-new-key)",
+                outcome.key_str
+            )
         },
     };
     eprintln!("{}", Theme::info(&msg));
@@ -412,7 +415,10 @@ mod tests {
 
         // Manifest-hash gate.
         let manifest_bytes = std::fs::read(mirror.join(shuttle::MANIFEST_NAME)).unwrap();
-        assert_eq!(lock.manifest_hash.as_deref().unwrap(), manifest_hash(&manifest_bytes));
+        assert_eq!(
+            lock.manifest_hash.as_deref().unwrap(),
+            manifest_hash(&manifest_bytes)
+        );
         // Signature gate.
         let sig = std::fs::read_to_string(mirror.join(shuttle::SIG_NAME)).unwrap();
         assert!(sign::verify_lock(&lock, &sig, &kp.export_public_key()).is_ok());
@@ -442,8 +448,7 @@ mod tests {
         let (shuttle_path, _kp) = make_signed_shuttle(dir.path(), b"FAKE CAPSULE");
         let (lock, mirror) = load_mirror(&shuttle_path, dir.path());
 
-        std::fs::remove_file(shuttle::capsule_mirror_path(&mirror, "astrid-capsule-cli"))
-            .unwrap();
+        std::fs::remove_file(shuttle::capsule_mirror_path(&mirror, "astrid-capsule-cli")).unwrap();
         let err = verify_capsule_hashes(&mirror, &lock).unwrap_err();
         assert!(err.to_string().contains("missing"), "got: {err}");
     }
@@ -479,7 +484,10 @@ mod tests {
         let manifest_bytes = b"schema-version = 1\n";
         let lock = lock_with_manifest_hash(None);
         let err = check_manifest_binding("test", true, &lock, manifest_bytes).unwrap_err();
-        assert!(err.to_string().contains("manifest_hash binding"), "got: {err}");
+        assert!(
+            err.to_string().contains("manifest_hash binding"),
+            "got: {err}"
+        );
     }
 
     #[test]
@@ -493,7 +501,10 @@ mod tests {
     fn signed_shuttle_with_wrong_manifest_hash_fails() {
         let lock = lock_with_manifest_hash(Some(manifest_hash(b"original")));
         let err = check_manifest_binding("test", true, &lock, b"TAMPERED").unwrap_err();
-        assert!(err.to_string().contains("manifest hash mismatch"), "got: {err}");
+        assert!(
+            err.to_string().contains("manifest hash mismatch"),
+            "got: {err}"
+        );
     }
 
     #[test]
@@ -509,7 +520,10 @@ mod tests {
         // A present hash is still verified best-effort even when unsigned.
         let lock = lock_with_manifest_hash(Some(manifest_hash(b"original")));
         let err = check_manifest_binding("test", false, &lock, b"TAMPERED").unwrap_err();
-        assert!(err.to_string().contains("manifest hash mismatch"), "got: {err}");
+        assert!(
+            err.to_string().contains("manifest hash mismatch"),
+            "got: {err}"
+        );
     }
 
     #[test]
@@ -542,7 +556,11 @@ mod tests {
             .map(|c| (c.name.as_str(), c.resolved_ref.clone()))
             .collect();
         assert_eq!(
-            sealed_refs.get("astrid-capsule-cli").cloned().flatten().as_deref(),
+            sealed_refs
+                .get("astrid-capsule-cli")
+                .cloned()
+                .flatten()
+                .as_deref(),
             Some("v0.1.0-actually-resolved"),
         );
     }

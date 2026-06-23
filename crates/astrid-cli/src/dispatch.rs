@@ -104,6 +104,12 @@ pub(crate) async fn dispatch(cli: Cli) -> Result<ExitCode> {
     dispatch_subcommand(cli.command, output_format).await
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "top-level subcommand dispatch is one linear match over every CLI verb; \
+              each arm already delegates to a dispatch_* helper, so splitting further \
+              would scatter the routing without reducing complexity"
+)]
 async fn dispatch_subcommand(
     command: Option<Commands>,
     output_format: OutputFormat,

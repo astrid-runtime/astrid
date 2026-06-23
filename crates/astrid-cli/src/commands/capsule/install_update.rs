@@ -288,10 +288,7 @@ fn regenerate_distro_lock(home: &AstridHome) -> anyhow::Result<()> {
                 version,
                 source,
                 hash,
-                resolved_ref: c
-                    .meta
-                    .as_ref()
-                    .and_then(|m| m.resolved_ref.clone()),
+                resolved_ref: c.meta.as_ref().and_then(|m| m.resolved_ref.clone()),
             }
         })
         .collect();

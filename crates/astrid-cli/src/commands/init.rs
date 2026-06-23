@@ -253,7 +253,10 @@ async fn fetch_and_parse_manifest(source: &str, offline: bool) -> anyhow::Result
 /// included. Capsules with a group are presented for multi-select
 /// (interactive) or resolved from their `default` flag (`--yes`).
 /// Takes ownership of the manifest's capsule list to avoid cloning.
-pub(crate) fn select_capsules(capsules: Vec<DistroCapsule>, yes: bool) -> anyhow::Result<Vec<DistroCapsule>> {
+pub(crate) fn select_capsules(
+    capsules: Vec<DistroCapsule>,
+    yes: bool,
+) -> anyhow::Result<Vec<DistroCapsule>> {
     if yes {
         return select_capsules_headless(capsules);
     }
@@ -305,9 +308,7 @@ pub(crate) fn select_capsules(capsules: Vec<DistroCapsule>, yes: bool) -> anyhow
 /// A group with no default warns and falls back to its first capsule
 /// (deterministic — manifest order), so a misconfigured manifest still
 /// produces a working install rather than aborting.
-fn select_capsules_headless(
-    capsules: Vec<DistroCapsule>,
-) -> anyhow::Result<Vec<DistroCapsule>> {
+fn select_capsules_headless(capsules: Vec<DistroCapsule>) -> anyhow::Result<Vec<DistroCapsule>> {
     let mut selected = Vec::new();
     // Preserve manifest order within each group for deterministic
     // fallback; iterate groups in sorted order for stable warnings.
@@ -824,8 +825,8 @@ mod tests {
         let mut needed = std::collections::HashSet::new();
         needed.insert("api_key".to_string());
 
-        let err = collect_variables_headless(&variables, &needed, &HashMap::new(), |_| None)
-            .unwrap_err();
+        let err =
+            collect_variables_headless(&variables, &needed, &HashMap::new(), |_| None).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("api_key"), "got: {msg}");
         assert!(msg.contains("ASTRID_VAR_API_KEY"), "got: {msg}");

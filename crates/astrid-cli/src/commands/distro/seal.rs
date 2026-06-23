@@ -31,8 +31,8 @@ pub(crate) async fn run_seal(distro: &str, output: &Path, key: &Path) -> anyhow:
     let manifest_path = resolve_manifest_path(distro)?;
     let manifest_bytes = std::fs::read(&manifest_path)
         .with_context(|| format!("failed to read {}", manifest_path.display()))?;
-    let manifest_text = std::str::from_utf8(&manifest_bytes)
-        .context("Distro.toml is not valid UTF-8")?;
+    let manifest_text =
+        std::str::from_utf8(&manifest_bytes).context("Distro.toml is not valid UTF-8")?;
     let manifest: DistroManifest = parse_manifest(manifest_text)?;
 
     // 2. Load the signing key (32 raw bytes). Never logged.

@@ -267,7 +267,10 @@ async fn resolve_github_ref(
         .await
         .context("failed to reach GitHub API for latest release")?;
     if !r.status().is_success() {
-        bail!("GitHub API returned {} for {org}/{repo} latest release", r.status());
+        bail!(
+            "GitHub API returned {} for {org}/{repo} latest release",
+            r.status()
+        );
     }
     let json: serde_json::Value = r.json().await.context("invalid GitHub API response")?;
     Ok(json
@@ -287,8 +290,7 @@ async fn find_capsule_asset_url(
     repo: &str,
     resolved_ref: &str,
 ) -> anyhow::Result<Option<String>> {
-    let api_url =
-        format!("https://api.github.com/repos/{org}/{repo}/releases/tags/{resolved_ref}");
+    let api_url = format!("https://api.github.com/repos/{org}/{repo}/releases/tags/{resolved_ref}");
     let response = client
         .get(&api_url)
         .send()
@@ -333,8 +335,7 @@ async fn download_capsule_asset(
             "capsule archive exceeds 50 MB limit",
         );
     }
-    std::fs::write(dest, &bytes)
-        .with_context(|| format!("failed to write {}", dest.display()))?;
+    std::fs::write(dest, &bytes).with_context(|| format!("failed to write {}", dest.display()))?;
     Ok(())
 }
 
@@ -381,8 +382,7 @@ async fn install_from_github(
                     // `<name>.capsule` (a single-asset release installs that one
                     // regardless of the hint, via `pick_capsule`).
                     Some(hint) => {
-                        let names: Vec<&str> =
-                            candidates.iter().map(|(n, _)| n.as_str()).collect();
+                        let names: Vec<&str> = candidates.iter().map(|(n, _)| n.as_str()).collect();
                         let idx = pick_capsule(&names, Some(hint))?
                             .expect("non-empty candidates always select an index");
                         let (name, download_url) = &candidates[idx];
@@ -401,14 +401,8 @@ async fn install_from_github(
                     // the release ships. Best-effort — report which assets fail
                     // but keep going, then fail if any did.
                     None => {
-                        install_all_capsules(
-                            &client,
-                            &candidates,
-                            workspace,
-                            home,
-                            original_source,
-                        )
-                        .await?
+                        install_all_capsules(&client, &candidates, workspace, home, original_source)
+                            .await?
                     },
                 };
                 return Ok((ids, Some(resolved_ref)));

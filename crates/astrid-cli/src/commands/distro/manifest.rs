@@ -357,10 +357,18 @@ group = "llm"
 "#;
         let m = parse_manifest(toml).unwrap();
         assert_eq!(m.distro.signing.as_ref().unwrap().pubkey, "ed25519:AAAA");
-        let a = m.capsules.iter().find(|c| c.name == "astrid-capsule-a").unwrap();
+        let a = m
+            .capsules
+            .iter()
+            .find(|c| c.name == "astrid-capsule-a")
+            .unwrap();
         assert_eq!(a.tag.as_deref(), Some("v0.2.0-rc1"));
         assert!(a.default);
-        let b = m.capsules.iter().find(|c| c.name == "astrid-capsule-b").unwrap();
+        let b = m
+            .capsules
+            .iter()
+            .find(|c| c.name == "astrid-capsule-b")
+            .unwrap();
         assert!(!b.default);
         assert_eq!(b.group.as_deref(), Some("llm"));
     }
