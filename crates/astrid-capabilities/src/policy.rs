@@ -278,9 +278,14 @@ where
 ///
 /// # Errors
 ///
-/// Returns [`PermissionError::DeviceScopeDenied`] naming the first `allow`
-/// pattern the issuer does not hold, so the issue is rejected fail-closed with
-/// a clear "requested scope exceeds your authority" signal.
+/// Returns [`PermissionError::MissingCapability`] naming the first `allow`
+/// pattern the issuer does not effectively hold, so the issue is rejected
+/// fail-closed. `MissingCapability` (not `DeviceScopeDenied`) is the accurate
+/// shape here: this is the *issuer authority* subset check, and the pattern may
+/// be unheld because the principal lacks it OR because the issuer's own device
+/// scope excludes it — "{cap} is not held by {issuer}" is correct either way,
+/// whereas "outside the authenticating device's scope" would mis-attribute the
+/// principal-lacks-it case.
 pub fn device_scope_within(
     issuer_check: &CapabilityCheck<'_>,
     requested: &DeviceScope,
@@ -290,7 +295,7 @@ pub fn device_scope_within(
     };
     for pattern in allow {
         if !issuer_check.has(pattern) {
-            return Err(PermissionError::DeviceScopeDenied {
+            return Err(PermissionError::MissingCapability {
                 principal: issuer_check.principal.clone(),
                 required: pattern.clone(),
             });
