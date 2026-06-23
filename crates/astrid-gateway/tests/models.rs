@@ -57,6 +57,7 @@ fn state_with_bus_timeout(
         audit_log: None,
         session_id: None,
         gateway_route_uuid: Uuid::new_v4(),
+        readiness_probe: None,
         registry_timeout,
     })
 }

@@ -29,6 +29,11 @@ pub mod quotas;
 pub mod system;
 
 /// Build the gateway's HTTP router.
+// A flat list of route registrations: its length tracks the API surface,
+// not branching complexity, and both the readiness and models surfaces add
+// rows here. Splitting it into sub-routers would obscure the single
+// public/authed grouping for no readability gain.
+#[allow(clippy::too_many_lines)]
 pub fn build(state: Arc<GatewayState>) -> Router {
     // Unauthenticated routes — discovery + redeem + ops probes.
     let public = Router::new()
