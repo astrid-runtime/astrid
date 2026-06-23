@@ -134,6 +134,7 @@ async fn dispatch_subcommand(
         Some(Commands::Quota { command }) => commands::quota::run(command).await,
         Some(Commands::Invite { command }) => commands::invite::run(command).await,
         Some(Commands::Keypair { command }) => commands::keypair::run(command),
+        Some(Commands::PairDevice { command }) => commands::pair_device::run(command).await,
         Some(Commands::Secret { command }) => commands::secret::run(command),
         Some(Commands::Voucher { command }) => commands::voucher::run(command),
         Some(Commands::Trust { command }) => commands::trust::run(command),

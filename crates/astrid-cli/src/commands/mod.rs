@@ -21,6 +21,7 @@ pub(crate) mod invite;
 pub(crate) mod keypair;
 pub(crate) mod logs;
 pub(crate) mod mcp;
+pub(crate) mod pair_device;
 pub(crate) mod ps;
 pub(crate) mod quota;
 pub(crate) mod restart;
