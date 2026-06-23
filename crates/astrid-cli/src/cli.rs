@@ -279,6 +279,18 @@ pub(crate) enum Commands {
     /// Update Astrid to the latest release (`self-update` is a legacy alias).
     #[command(alias = "self-update")]
     Update(UpdateArgs),
+
+    /// Root shorthand for a capsule-provided CLI verb: `astrid <verb> [args…]`.
+    ///
+    /// Clap matches every declared variant above before falling through to
+    /// this catch-all, so a capsule verb can never shadow a built-in. The
+    /// canonical, unshadowable form remains `astrid capsule <verb>`.
+    /// An unrecognised token that is a near-miss of a built-in is rejected
+    /// with a "did you mean …?" hint *before* the daemon is contacted (see
+    /// [`crate::dispatch`] and [`crate::commands::verb_suggest`]); only a
+    /// non-near-miss token reaches capsule resolution.
+    #[command(external_subcommand)]
+    External(Vec<String>),
 }
 
 /// Arguments for `astrid update`.
@@ -492,8 +504,8 @@ pub(crate) enum DistroCommands {
 
 #[cfg(test)]
 mod tests {
-    use super::CapsuleCommands;
-    use clap::Subcommand;
+    use super::{CapsuleCommands, Cli, Commands};
+    use clap::{CommandFactory, Parser, Subcommand};
 
     /// Every built-in `astrid capsule` subcommand name must appear in
     /// [`astrid_core::kernel_api::RESERVED_CAPSULE_VERBS`]. The reserved
@@ -524,5 +536,66 @@ mod tests {
         // `help` is injected by clap, not a declared variant, but is a real
         // reserved word — assert it is covered too.
         assert!(astrid_core::kernel_api::RESERVED_CAPSULE_VERBS.contains(&"help"));
+    }
+
+    /// An unrecognised root token (and everything after it, including
+    /// flags) is captured by the root `external_subcommand` catch-all
+    /// rather than rejected as a clap parse error. This is the entry point
+    /// for the `astrid <verb>` capsule-verb shorthand; without the
+    /// catch-all clap would error on the unknown first token.
+    #[test]
+    fn root_external_subcommand_captures_unknown_verb() {
+        let cli = Cli::try_parse_from(["astrid", "frobnicate", "--flag", "x"])
+            .expect("unknown root token must fall through to the external catch-all");
+        match cli.command {
+            Some(Commands::External(v)) => {
+                // Compare owned `String`s explicitly. `Vec<String>:
+                // PartialEq<Vec<&str>>` already makes the `&str` form compile
+                // and pass, but spelling out the owned type keeps the element
+                // type unambiguous for reviewers (and review bots).
+                assert_eq!(
+                    v,
+                    vec![
+                        "frobnicate".to_string(),
+                        "--flag".to_string(),
+                        "x".to_string()
+                    ]
+                );
+            },
+            _ => panic!("expected Commands::External for an unknown root token"),
+        }
+    }
+
+    /// A declared built-in always wins over the catch-all: clap matches
+    /// `Commands` variants before the `external_subcommand`. Pins the
+    /// precedence so a future refactor can't let the catch-all swallow a
+    /// built-in (which would let a capsule shadow `status`).
+    #[test]
+    fn root_builtin_wins_over_external() {
+        let cli = Cli::try_parse_from(["astrid", "status"]).expect("`status` is a built-in");
+        assert!(
+            matches!(cli.command, Some(Commands::Status)),
+            "`status` must parse to the built-in, never External"
+        );
+    }
+
+    /// The built-in name list fed to the typo guard (harvested from
+    /// `Cli::command().get_subcommands()`) must contain real built-ins and
+    /// must not contain the empty-string placeholder clap reports for the
+    /// `external_subcommand` catch-all — otherwise the guard could
+    /// "suggest" the catch-all itself.
+    #[test]
+    fn builtin_subcommand_names_excludes_external_placeholder() {
+        let names: Vec<String> = Cli::command()
+            .get_subcommands()
+            .map(|s| s.get_name().to_string())
+            .filter(|n| !n.is_empty())
+            .collect();
+        assert!(names.iter().any(|n| n == "status"));
+        assert!(names.iter().any(|n| n == "agent"));
+        assert!(
+            !names.iter().any(String::is_empty),
+            "harvested built-in names must not include the empty External placeholder"
+        );
     }
 }
