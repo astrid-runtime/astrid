@@ -640,6 +640,14 @@ pub const CAPABILITY_CATALOG: &[CapabilityInfo] = {
             scope: Global,
             danger: Normal,
         },
+        CapabilityInfo {
+            id: "auth:pair",
+            label: "Manage any principal's paired devices",
+            description: "List and revoke the paired devices (registered ed25519 keys) of ANY principal. The self form, self:auth:pair, lets a principal manage its own devices; this global form is the admin-tier sibling for operating on another principal's device fleet. Conferred by the admin group's universal grant.",
+            category: Approval,
+            scope: Global,
+            danger: Elevated,
+        },
     ]
 };
 
@@ -667,7 +675,7 @@ pub fn known_capabilities_list() -> &'static [&'static str] {
 /// in the same commit that adds a new capability so a kernel
 /// addition without updating the catalog fails the consuming
 /// crate's tests.
-pub const KNOWN_CAPABILITIES_COUNT: usize = 40;
+pub const KNOWN_CAPABILITIES_COUNT: usize = 41;
 
 const _: () = assert!(
     CAPABILITY_CATALOG.len() == KNOWN_CAPABILITIES_COUNT,

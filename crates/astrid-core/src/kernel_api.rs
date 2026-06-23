@@ -270,6 +270,82 @@ impl From<AdminRequestKind> for AdminKernelRequest {
     }
 }
 
+/// Requested capability scope for a [`AdminRequestKind::PairDeviceIssue`]
+/// token — what the redeemed device is allowed to do with the principal's
+/// authority.
+///
+/// The kernel resolves this against the ISSUER's *effective* capability set at
+/// issue time (no-escalation: a device can never confer more than the issuer
+/// holds, where the issuer's effective set is itself narrowed by the issuer's
+/// own authenticating device scope) and stamps the resolved
+/// [`DeviceScope`](crate::DeviceScope) onto the minted token, so the redeemed
+/// device is attenuated to exactly the granted scope on every transport.
+///
+/// On the wire it is an internally-tagged object: `{ "kind": "full" }`,
+/// `{ "kind": "preset", "name": "use-only" }`, or
+/// `{ "kind": "explicit", "allow": [...], "deny": [...] }`. The `scope` field
+/// on `PairDeviceIssue` defaults to [`PairScopeArg::Full`] when omitted, so
+/// pre-scope callers (and single-tenant admin flows) keep their existing
+/// behaviour — but minting a `Full` device additionally requires the issuer to
+/// hold `self:auth:pair:admin`, enforced in the handler.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+pub enum PairScopeArg {
+    /// Mint an unattenuated device — it acts with the principal's full
+    /// effective capability set. Requires the issuer to hold
+    /// `self:auth:pair:admin`. The default when `scope` is omitted (the
+    /// permissive default is still gated on the admin cap, so it does not
+    /// relax authority).
+    #[default]
+    Full,
+    /// Resolve a named scope preset (e.g. `"use-only"`) via
+    /// [`DeviceScope::preset`](crate::DeviceScope::preset). An unknown name is
+    /// rejected at issue time.
+    Preset {
+        /// The preset name.
+        name: String,
+    },
+    /// An explicit allow/deny capability scope. Every `allow` pattern must be
+    /// held by the issuer (subset check); `deny` patterns purely restrict.
+    Explicit {
+        /// Capability patterns the device may exercise.
+        #[serde(default)]
+        allow: Vec<String>,
+        /// Capability patterns the device is forbidden to exercise (deny wins).
+        #[serde(default)]
+        deny: Vec<String>,
+    },
+}
+
+/// Serde default for [`AdminRequestKind::PairDeviceIssue::scope`] — `Full`,
+/// for back-compat with callers that predate the `scope` field. A `Full` mint
+/// is independently gated on `self:auth:pair:admin` in the handler, so the
+/// permissive *default* does not relax the *authority* required to use it.
+fn default_pair_scope() -> PairScopeArg {
+    PairScopeArg::Full
+}
+
+/// Per-device summary returned by [`AdminRequestKind::PairDeviceList`].
+///
+/// Carries only non-secret, fingerprint-level identity — the deterministic
+/// `key_id`, the operator label, the granted [`DeviceScope`](crate::DeviceScope),
+/// and the pairing timestamp. The raw ed25519 public key is **never** surfaced;
+/// the `key_id` (derived from the already-public pubkey) is the stable handle
+/// for listing and revocation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeviceKeyInfo {
+    /// Deterministic per-device fingerprint handle.
+    pub key_id: String,
+    /// Operator/user-facing label captured at pairing time, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    /// Capability attenuation scope the device authenticates under.
+    pub scope: crate::DeviceScope,
+    /// Unix epoch seconds when the device was paired (`0` for migrated
+    /// legacy keys that predate pairing-time recording).
+    pub created_at: i64,
+}
+
 /// Typed admin request body — flattened into [`AdminKernelRequest`] on
 /// the wire as `{ "method": "...", "params": {...} }`.
 ///
@@ -557,6 +633,14 @@ pub enum AdminRequestKind {
         /// `AuthConfig.public_keys` once the token is redeemed.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         label: Option<String>,
+        /// Capability scope the redeemed device will authenticate under.
+        /// Defaults to [`PairScopeArg::Full`] when omitted, for back-compat
+        /// with pre-scope callers; a `Full` mint is independently gated on
+        /// `self:auth:pair:admin` in the handler, and an `Explicit`/`Preset`
+        /// scope is validated to be a subset of the issuer's effective
+        /// capabilities (no escalation).
+        #[serde(default = "default_pair_scope")]
+        scope: PairScopeArg,
     },
     /// Redeem a pair-device token. Like `InviteRedeem`, the kernel
     /// dispatcher special-cases this to bypass the capability
@@ -569,6 +653,30 @@ pub enum AdminRequestKind {
         token: String,
         /// Hex-encoded ed25519 public key (32 bytes / 64 hex chars).
         public_key: String,
+    },
+    /// List the paired devices (registered keys) on a principal's
+    /// `AuthConfig.public_keys`. Gated by `self:auth:pair` (self form) /
+    /// `auth:pair` (global form) exactly like [`PairDeviceIssue`] — a caller
+    /// lists their own devices unless they hold the global form. The response
+    /// carries only fingerprint-level identity ([`DeviceKeyInfo`]); the raw
+    /// pubkey is never surfaced.
+    PairDeviceList {
+        /// Principal whose devices are listed.
+        principal: PrincipalId,
+    },
+    /// Revoke a single paired device by its deterministic `key_id`, removing
+    /// the matching [`DeviceKey`](crate::DeviceKey) from the principal's
+    /// `AuthConfig.public_keys`. If it was the last keypair entry the
+    /// `AuthMethod::Keypair` method is dropped too (mirrors the add side). A
+    /// revoked device fails closed at the kernel cap-gate immediately (its key
+    /// is gone from `public_keys`), and the gateway evicts any live bearer
+    /// scoped to that `key_id`. Gated by `self:auth:pair` (self form) /
+    /// `auth:pair` (global form), like [`PairDeviceIssue`].
+    PairDeviceRevoke {
+        /// Principal whose device is being revoked.
+        principal: PrincipalId,
+        /// The deterministic `key_id` of the device to remove.
+        key_id: String,
     },
 }
 
@@ -634,6 +742,15 @@ pub enum AdminResponseBody {
     PairToken(PairTokenIssued),
     /// Response for [`AdminRequestKind::PairDeviceRedeem`].
     PairTokenRedeemed(PairTokenRedeemed),
+    /// Response for [`AdminRequestKind::PairDeviceList`] — the principal's
+    /// paired devices as fingerprint-level summaries (never the raw pubkey).
+    PairDeviceListed(Vec<DeviceKeyInfo>),
+    /// Response for [`AdminRequestKind::PairDeviceRevoke`] — the `key_id`
+    /// of the device that was removed.
+    PairDeviceRevoked {
+        /// The `key_id` of the revoked device.
+        key_id: String,
+    },
     /// The request failed.
     Error(String),
 }

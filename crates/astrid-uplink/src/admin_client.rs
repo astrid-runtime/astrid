@@ -73,6 +73,8 @@ pub const fn topic_suffix(req: &AdminRequestKind) -> &'static str {
         AdminRequestKind::InviteRevoke { .. } => "invite.revoke",
         AdminRequestKind::PairDeviceIssue { .. } => "auth.pair.issue",
         AdminRequestKind::PairDeviceRedeem { .. } => "auth.pair.redeem",
+        AdminRequestKind::PairDeviceList { .. } => "auth.pair.list",
+        AdminRequestKind::PairDeviceRevoke { .. } => "auth.pair.revoke",
     }
 }
 

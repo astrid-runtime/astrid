@@ -260,6 +260,45 @@ where
     patterns.into_iter().any(|p| capability_matches(p, cap))
 }
 
+/// Validate that a requested device scope stays within the issuer's authority
+/// — the no-escalation guarantee enforced at pair-token issue time.
+///
+/// `issuer_check` is the issuer's *effective* check: its principal decision
+/// already narrowed by the issuer's OWN authenticating device scope (a scoped
+/// device can only mint a child no broader than itself). For a
+/// [`DeviceScope::Scoped`] request, every `allow` pattern `P` must satisfy
+/// `issuer_check.has(P)` — the issuer can only confer capabilities it actually
+/// holds. `deny` patterns need no validation: they purely restrict, so a child
+/// denying something is always safe.
+///
+/// A [`DeviceScope::Full`] request is *not* validated here — minting an
+/// unattenuated device is gated separately by the `self:auth:pair:admin`
+/// capability at the call site (a full device inherits the principal's whole
+/// effective set, which the principal already holds by definition).
+///
+/// # Errors
+///
+/// Returns [`PermissionError::DeviceScopeDenied`] naming the first `allow`
+/// pattern the issuer does not hold, so the issue is rejected fail-closed with
+/// a clear "requested scope exceeds your authority" signal.
+pub fn device_scope_within(
+    issuer_check: &CapabilityCheck<'_>,
+    requested: &DeviceScope,
+) -> Result<(), PermissionError> {
+    let DeviceScope::Scoped { allow, .. } = requested else {
+        return Ok(());
+    };
+    for pattern in allow {
+        if !issuer_check.has(pattern) {
+            return Err(PermissionError::DeviceScopeDenied {
+                principal: issuer_check.principal.clone(),
+                required: pattern.clone(),
+            });
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

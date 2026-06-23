@@ -49,9 +49,31 @@ pub(super) const AGENT_IDENTITY_PLATFORM: &str = "cli";
 /// (notably [`AdminRequestKind::PairDeviceIssue`], which mints a
 /// token tied to the caller's own principal regardless of any
 /// wire-level hint) need it.
+///
+/// Thin wrapper over [`dispatch_with_device`] for callers (tests, any
+/// non-device path) that have no authenticating device key id. The
+/// production admin path uses [`dispatch_with_device`] so a paired issuer's
+/// own device scope is threaded into `PairDeviceIssue`'s no-escalation checks.
 pub(super) async fn dispatch(
     kernel: &Arc<crate::Kernel>,
     caller: &PrincipalId,
+    req: AdminRequestKind,
+) -> AdminResponseBody {
+    dispatch_with_device(kernel, caller, None, req).await
+}
+
+/// Dispatch carrying the issuer's authenticating device key id.
+///
+/// `issuer_device_key_id` is the device key that authenticated this request,
+/// when one did. Only [`AdminRequestKind::PairDeviceIssue`] consumes it: it
+/// resolves the issuer's OWN device scope so the no-escalation subset check
+/// and the full-mint gate run against the issuer's *attenuated* effective set
+/// (a scoped device cannot mint a child broader than itself). Every other
+/// handler ignores it.
+pub(super) async fn dispatch_with_device(
+    kernel: &Arc<crate::Kernel>,
+    caller: &PrincipalId,
+    issuer_device_key_id: Option<&str>,
     req: AdminRequestKind,
 ) -> AdminResponseBody {
     match req {
@@ -132,16 +154,50 @@ pub(super) async fn dispatch(
         AdminRequestKind::InviteRevoke { token } => {
             super::invite_handlers::invite_revoke(kernel, token).await
         },
+        req @ (AdminRequestKind::PairDeviceIssue { .. }
+        | AdminRequestKind::PairDeviceRedeem { .. }
+        | AdminRequestKind::PairDeviceList { .. }
+        | AdminRequestKind::PairDeviceRevoke { .. }) => {
+            pair_device_dispatch(kernel, caller, issuer_device_key_id, req).await
+        },
+    }
+}
+
+/// Dispatch the four pair-device variants. Split from the main `dispatch`
+/// router to keep that function under the per-function line cap; the caller
+/// guarantees the variant, so the fallback is unreachable in practice.
+async fn pair_device_dispatch(
+    kernel: &Arc<crate::Kernel>,
+    caller: &PrincipalId,
+    issuer_device_key_id: Option<&str>,
+    req: AdminRequestKind,
+) -> AdminResponseBody {
+    match req {
         AdminRequestKind::PairDeviceIssue {
             expires_secs,
             label,
+            scope,
         } => {
-            super::pair_device_handlers::pair_device_issue(kernel, caller, expires_secs, label)
-                .await
+            super::pair_device_handlers::pair_device_issue(
+                kernel,
+                caller,
+                issuer_device_key_id,
+                expires_secs,
+                label,
+                scope,
+            )
+            .await
         },
         AdminRequestKind::PairDeviceRedeem { token, public_key } => {
             super::pair_device_handlers::pair_device_redeem(kernel, token, public_key).await
         },
+        AdminRequestKind::PairDeviceList { principal } => {
+            super::pair_device_handlers::pair_device_list(kernel, &principal)
+        },
+        AdminRequestKind::PairDeviceRevoke { principal, key_id } => {
+            super::pair_device_handlers::pair_device_revoke(kernel, &principal, &key_id).await
+        },
+        _ => AdminResponseBody::Error("not a pair-device request".to_string()),
     }
 }
 
