@@ -45,6 +45,7 @@ description = "HTTP gateway for the Astrid admin API — translates HTTP request
 anyhow = { workspace = true }
 async-stream = { workspace = true }
 astrid-audit = { workspace = true }
+astrid-capsule-install = { workspace = true }
 astrid-core = { workspace = true }
 astrid-events = { workspace = true }
 astrid-storage = { workspace = true }
@@ -61,11 +62,17 @@ metrics = { workspace = true }
 metrics-exporter-prometheus = { workspace = true }
 metrics-process = { workspace = true }
 rand = { workspace = true }
+# GitHub-source resolution for `POST /api/capsules`: the gateway (an uplink)
+# downloads a `.capsule` release asset to a temp file, then hands the kernel a
+# LOCAL path — the daemon never fetches URLs. `reqwest` performs the streamed,
+# size-capped fetch; `tempfile` owns the short-lived download dir.
+reqwest = { workspace = true, features = ["json"] }
 rustls = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
 subtle = { workspace = true }
+tempfile = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
 tokio-stream = { workspace = true }

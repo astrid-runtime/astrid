@@ -28,6 +28,9 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::{Context, bail};
+use astrid_capsule_install::github_source::{
+    capsule_assets, extract_github_org_repo, pick_capsule,
+};
 use astrid_capsule_install::{InstallOptions, InstallOutput};
 use astrid_core::dirs::AstridHome;
 use astrid_events::EventBus;
@@ -46,54 +49,6 @@ pub(crate) use super::install_update::update_capsule;
 /// Set by `install_capsule_batch` (called from distro init) where the
 /// distro handles env config and all capsules are installed together.
 static BATCH_MODE: AtomicBool = AtomicBool::new(false);
-
-// ---------------------------------------------------------------------------
-// GitHub source-resolution helpers — shared with `install_update`.
-// ---------------------------------------------------------------------------
-
-/// Strip common version prefixes (`v`, `V`) from a Git tag before semver parsing.
-pub(super) fn strip_version_prefix(tag: &str) -> &str {
-    tag.strip_prefix('v')
-        .or_else(|| tag.strip_prefix('V'))
-        .unwrap_or(tag)
-}
-
-/// Extract `(org, repo)` from a GitHub URL. Anchors on the
-/// `github.com/` marker so extra path segments (`/tree/main`, `.git`)
-/// are safely ignored.
-fn extract_github_org_repo(url: &str) -> Option<(&str, &str)> {
-    let idx = url.find("github.com/")?;
-    let after_host = &url[idx.saturating_add("github.com/".len())..];
-    let trimmed = after_host.trim_end_matches('/');
-    let (org, rest) = trimmed.split_once('/')?;
-    let repo = rest.split('/').next()?;
-    let repo = repo.strip_suffix(".git").unwrap_or(repo);
-    if org.is_empty() || repo.is_empty() {
-        return None;
-    }
-    Some((org, repo))
-}
-
-/// Parse a capsule source string into `(org, repo)` for GitHub-backed sources.
-///
-/// Handles `@org/repo`, `github.com/org/repo`, and
-/// `https://github.com/org/repo`.
-pub(super) fn parse_github_source(source: &str) -> Option<(String, String)> {
-    if let Some(repo_path) = source.strip_prefix('@') {
-        let parts: Vec<&str> = repo_path.splitn(2, '/').collect();
-        if parts.len() == 2 && !parts[0].is_empty() && !parts[1].is_empty() {
-            return Some((parts[0].to_string(), parts[1].to_string()));
-        }
-        return None;
-    }
-
-    if source.contains("github.com/") {
-        let (org, repo) = extract_github_org_repo(source)?;
-        return Some((org.to_string(), repo.to_string()));
-    }
-
-    None
-}
 
 // ---------------------------------------------------------------------------
 // Top-level install dispatch
@@ -227,27 +182,6 @@ async fn install_from_github(
 
     // Priority 2: clone + build from source via astrid-build.
     clone_and_build(url, repo, workspace, home, original_source, name_hint).map(|id| vec![id])
-}
-
-/// Collect every `.capsule` release asset as `(name, download_url)` pairs,
-/// skipping any asset that is not a `.capsule` or lacks a download URL.
-///
-/// Pure over the GitHub release `assets` JSON array so the selection logic is
-/// unit-testable without a live release.
-fn capsule_assets(assets: &[serde_json::Value]) -> Vec<(String, String)> {
-    assets
-        .iter()
-        .filter_map(|asset| {
-            let name = asset.get("name").and_then(serde_json::Value::as_str)?;
-            if !name.ends_with(".capsule") {
-                return None;
-            }
-            let download_url = asset
-                .get("browser_download_url")
-                .and_then(serde_json::Value::as_str)?;
-            Some((name.to_string(), download_url.to_string()))
-        })
-        .collect()
 }
 
 /// Download a single `.capsule` asset (streamed, 50 MB cap) and install it.
@@ -388,43 +322,6 @@ fn clone_and_build(
     }
 
     bail!("astrid-build produced no .capsule archive.");
-}
-
-/// Choose which `.capsule` to install when a source yields several. A monorepo
-/// builds/releases one archive per capsule crate, named `<capsule>.capsule`, so
-/// picking "the first" would install the wrong one. Returns the index into
-/// `names` of the chosen archive.
-///
-/// * none        -> `Ok(None)` (caller falls back, e.g. release -> clone+build).
-/// * exactly one -> `Ok(Some(0))` — unambiguous; `name_hint` is irrelevant.
-/// * several     -> the one named `<name_hint>.capsule`. Without a hint, or with
-///   no matching name, refuse rather than silently install the wrong capsule.
-fn pick_capsule(names: &[&str], name_hint: Option<&str>) -> anyhow::Result<Option<usize>> {
-    match names {
-        [] => Ok(None),
-        [_] => Ok(Some(0)),
-        many => {
-            let Some(hint) = name_hint else {
-                bail!(
-                    "source produced {} .capsule archives but no capsule name to pick one; \
-                     expected an archive named '<capsule>.capsule'",
-                    many.len()
-                );
-            };
-            // Match the hint against each candidate's stem via `strip_suffix`
-            // (no per-call allocation) rather than `format!`-ing the target.
-            match many
-                .iter()
-                .position(|n| n.strip_suffix(".capsule") == Some(hint))
-            {
-                Some(idx) => Ok(Some(idx)),
-                None => bail!(
-                    "no '.capsule' archive named '{hint}.capsule' among [{}]",
-                    many.join(", ")
-                ),
-            }
-        },
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -643,73 +540,6 @@ fn finish_install(output: &InstallOutput, _home: &AstridHome) -> anyhow::Result<
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_strip_version_prefix() {
-        assert_eq!(strip_version_prefix("v1.2.3"), "1.2.3");
-        assert_eq!(strip_version_prefix("V1.0.0"), "1.0.0");
-        assert_eq!(strip_version_prefix("1.0.0"), "1.0.0");
-        assert_eq!(strip_version_prefix("v0.0.1-alpha"), "0.0.1-alpha");
-        assert_eq!(strip_version_prefix("release-1.0.0"), "release-1.0.0");
-    }
-
-    #[test]
-    fn test_extract_github_org_repo() {
-        let (org, repo) = extract_github_org_repo("https://github.com/org/repo").unwrap();
-        assert_eq!(org, "org");
-        assert_eq!(repo, "repo");
-
-        let (org, repo) = extract_github_org_repo("github.com/myorg/myrepo").unwrap();
-        assert_eq!(org, "myorg");
-        assert_eq!(repo, "myrepo");
-
-        let (org, repo) = extract_github_org_repo("https://github.com/org/repo/").unwrap();
-        assert_eq!(org, "org");
-        assert_eq!(repo, "repo");
-
-        assert!(extract_github_org_repo("singlepart").is_none());
-    }
-
-    #[test]
-    fn test_extract_github_org_repo_extra_path() {
-        let (org, repo) = extract_github_org_repo("https://github.com/org/repo/tree/main").unwrap();
-        assert_eq!(org, "org");
-        assert_eq!(repo, "repo");
-    }
-
-    #[test]
-    fn test_extract_github_org_repo_git_suffix() {
-        let (org, repo) = extract_github_org_repo("https://github.com/org/repo.git").unwrap();
-        assert_eq!(org, "org");
-        assert_eq!(repo, "repo");
-    }
-
-    #[test]
-    fn test_parse_github_source_at_prefix() {
-        let (org, repo) = parse_github_source("@org/repo").unwrap();
-        assert_eq!(org, "org");
-        assert_eq!(repo, "repo");
-    }
-
-    #[test]
-    fn test_parse_github_source_https() {
-        let (org, repo) = parse_github_source("https://github.com/org/repo").unwrap();
-        assert_eq!(org, "org");
-        assert_eq!(repo, "repo");
-    }
-
-    #[test]
-    fn test_parse_github_source_bare() {
-        let (org, repo) = parse_github_source("github.com/org/repo").unwrap();
-        assert_eq!(org, "org");
-        assert_eq!(repo, "repo");
-    }
-
-    #[test]
-    fn test_parse_github_source_non_github() {
-        assert!(parse_github_source("./local/path").is_none());
-        assert!(parse_github_source("/absolute/path").is_none());
-    }
-
     fn find_wasm_asset(assets: &[serde_json::Value]) -> Option<String> {
         assets.iter().find_map(|asset| {
             let name = asset.get("name")?.as_str()?;
@@ -761,103 +591,6 @@ mod tests {
             Some("capsule.WASM"),
             "should match .WASM case-insensitively"
         );
-    }
-
-    #[test]
-    fn pick_capsule_none_when_empty() {
-        assert!(matches!(pick_capsule(&[], Some("sage")), Ok(None)));
-    }
-
-    #[test]
-    fn pick_capsule_single_is_unambiguous() {
-        // A lone archive is used regardless of name — a single-capsule repo's
-        // asset need not match the requested capsule name.
-        assert_eq!(
-            pick_capsule(&["whatever.capsule"], Some("sage")).unwrap(),
-            Some(0)
-        );
-        assert_eq!(pick_capsule(&["whatever.capsule"], None).unwrap(), Some(0));
-    }
-
-    #[test]
-    fn pick_capsule_several_matches_by_exact_name() {
-        let names = ["sage.capsule", "sage-mcp.capsule", "sage-install.capsule"];
-        assert_eq!(pick_capsule(&names, Some("sage-mcp")).unwrap(), Some(1));
-        // exact match — "sage" must NOT collide with "sage-mcp.capsule"
-        assert_eq!(pick_capsule(&names, Some("sage")).unwrap(), Some(0));
-        assert_eq!(pick_capsule(&names, Some("sage-install")).unwrap(), Some(2));
-    }
-
-    #[test]
-    fn pick_capsule_several_without_hint_errors() {
-        assert!(pick_capsule(&["a.capsule", "b.capsule"], None).is_err());
-    }
-
-    #[test]
-    fn pick_capsule_several_no_match_errors() {
-        assert!(pick_capsule(&["a.capsule", "b.capsule"], Some("c")).is_err());
-    }
-
-    #[test]
-    fn capsule_assets_collects_all_capsule_entries() {
-        let assets = vec![
-            serde_json::json!({
-                "name": "sage.capsule",
-                "browser_download_url": "https://example.com/sage.capsule"
-            }),
-            serde_json::json!({
-                "name": "sage-mcp.capsule",
-                "browser_download_url": "https://example.com/sage-mcp.capsule"
-            }),
-        ];
-        let got = capsule_assets(&assets);
-        assert_eq!(
-            got,
-            vec![
-                (
-                    "sage.capsule".to_string(),
-                    "https://example.com/sage.capsule".to_string()
-                ),
-                (
-                    "sage-mcp.capsule".to_string(),
-                    "https://example.com/sage-mcp.capsule".to_string()
-                ),
-            ]
-        );
-    }
-
-    #[test]
-    fn capsule_assets_skips_non_capsule_and_urlless() {
-        let assets = vec![
-            serde_json::json!({
-                "name": "release-notes.txt",
-                "browser_download_url": "https://example.com/release-notes.txt"
-            }),
-            serde_json::json!({
-                "name": "cli.capsule",
-                "browser_download_url": "https://example.com/cli.capsule"
-            }),
-            serde_json::json!({ "name": "checksums.sha256" }),
-            // `.capsule` asset with no download URL is skipped, not panicked on.
-            serde_json::json!({ "name": "broken.capsule" }),
-        ];
-        let got = capsule_assets(&assets);
-        assert_eq!(
-            got,
-            vec![(
-                "cli.capsule".to_string(),
-                "https://example.com/cli.capsule".to_string()
-            )]
-        );
-    }
-
-    #[test]
-    fn capsule_assets_empty_when_no_capsule_assets() {
-        let assets = vec![serde_json::json!({
-            "name": "binary.tar.gz",
-            "browser_download_url": "https://example.com/binary.tar.gz"
-        })];
-        assert!(capsule_assets(&assets).is_empty());
     }
 
     #[test]

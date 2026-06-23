@@ -11,10 +11,11 @@
 //! never drifts from reality.
 
 use anyhow::{Context, bail};
+use astrid_capsule_install::github_source::{parse_github_source, strip_version_prefix};
 use astrid_capsule_install::scan_installed_capsules;
 use astrid_core::dirs::AstridHome;
 
-use super::install::{install_capsule, parse_github_source, strip_version_prefix};
+use super::install::install_capsule;
 use super::meta::{CapsuleMeta, read_meta};
 
 /// Result of checking a remote source for a newer capsule version.
