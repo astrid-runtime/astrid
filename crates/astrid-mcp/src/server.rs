@@ -412,9 +412,13 @@ impl ServerManager {
             McpError::InitializationFailed(format!("MCP handshake failed for {name}: {e}"))
         })?;
 
-        // Get server info from the handshake result
+        // Get server info from the handshake result. rmcp 1.8 changed
+        // `peer_info()` to return `Option<Arc<InitializeResult>>` (was
+        // `Option<&InitializeResult>`); `as_deref()` recovers the borrow
+        // `from_rmcp` takes and works against the pre-1.8 signature too.
         let server_info = service
             .peer_info()
+            .as_deref()
             .map(|info| ServerInfo::from_rmcp(info, name));
 
         // Fetch available tools
