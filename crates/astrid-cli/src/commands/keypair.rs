@@ -104,7 +104,9 @@ pub(crate) struct PubkeyArgs {
     pub name: String,
     /// Output format. `hex` matches what `astrid invite redeem
     /// --public-key` expects; `openssh` produces `ssh-ed25519 AAAA…`
-    /// for reuse with SSH-style tooling.
+    /// for reuse with SSH-style tooling; `wire` produces the
+    /// `ed25519:<base64>` form that `[distro.signing].pubkey`,
+    /// `astrid distro seal`, and the trust store consume.
     #[arg(long, value_enum, default_value_t = PubkeyFormat::Hex)]
     pub format: PubkeyFormat,
 }
@@ -122,6 +124,9 @@ pub(crate) struct DeleteArgs {
 pub(crate) enum PubkeyFormat {
     Hex,
     Openssh,
+    /// `ed25519:<base64>` — the form `[distro.signing].pubkey`,
+    /// `astrid distro seal`, and the distro trust store consume.
+    Wire,
 }
 
 // ── Persistence model ─────────────────────────────────────────────
@@ -323,6 +328,7 @@ fn run_pubkey(args: &PubkeyArgs) -> Result<ExitCode> {
             let bytes = hex::decode(pub_hex.trim()).context("decode public key hex")?;
             println!("{}", encode_openssh_ed25519(&bytes));
         },
+        PubkeyFormat::Wire => println!("{}", pubkey_hex_to_wire(&pub_hex)?),
     }
     Ok(ExitCode::SUCCESS)
 }
@@ -562,6 +568,16 @@ fn fingerprint_pubkey(hex_pub: &str) -> String {
     hex::encode(hasher.finalize())
 }
 
+/// Convert a 64-char hex ed25519 public key into the `ed25519:<base64>`
+/// wire form that `[distro.signing].pubkey`, `astrid distro seal`, and
+/// the distro trust store consume. Reuses `astrid-crypto`'s encoder so
+/// the base64 variant matches the verifier byte-for-byte.
+fn pubkey_hex_to_wire(pub_hex: &str) -> Result<String> {
+    let pk = astrid_crypto::PublicKey::from_hex(pub_hex.trim())
+        .map_err(|e| anyhow::anyhow!("decode public key hex: {e}"))?;
+    Ok(format!("ed25519:{}", pk.to_base64()))
+}
+
 /// Encode a 32-byte ed25519 public key in the `OpenSSH` wire format
 /// (`ssh-ed25519 <base64>` — RFC 8709 §4). Lets operators paste the
 /// same key into `authorized_keys` if they want to reuse it for SSH.
@@ -583,6 +599,21 @@ fn encode_openssh_ed25519(pubkey: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wire_format_is_ed25519_base64_and_parser_roundtrips() {
+        // The `wire` output must be exactly what the distro signing
+        // verifier parses back — same 32 bytes, STANDARD base64,
+        // `ed25519:` prefix.
+        let hex = "0".repeat(64);
+        let wire = pubkey_hex_to_wire(&hex).unwrap();
+        assert!(wire.starts_with("ed25519:"));
+        let b64 = wire.strip_prefix("ed25519:").unwrap();
+        assert_eq!(
+            astrid_crypto::PublicKey::from_base64(b64).unwrap(),
+            astrid_crypto::PublicKey::from_hex(&hex).unwrap(),
+        );
+    }
 
     #[test]
     fn validate_name_accepts_well_formed() {
