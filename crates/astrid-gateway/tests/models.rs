@@ -440,6 +440,62 @@ async fn set_active_model_accepts_reply_without_corr_id() {
 }
 
 #[tokio::test]
+async fn zero_budget_round_trip_times_out_deterministically() {
+    // Robustness regression for the reply-draining loop. When the registry
+    // round-trip's wait budget is exhausted (here: zero from the start), the
+    // loop must break to the timeout path (500) BEFORE calling
+    // `recv(Some(remaining))` with a zero duration — `recv`'s behaviour with a
+    // zero timeout is implementation-defined (tokio polls the inner future
+    // once before the timer, so a reply already sitting in the route queue can
+    // be returned, racily, on some polls but not others).
+    //
+    // The stub publishes a fully-matching reply, so WITHOUT the zero-budget
+    // guard the handler can non-deterministically surface that reply as a 200
+    // (when `recv`'s fast path pops the queued event before the zero timer
+    // fires). WITH the guard, the handler returns 500 deterministically on
+    // every run: `remaining` is zero at the top of the very first iteration,
+    // so it never calls `recv` at all. Asserting the 500 therefore fails on
+    // the un-guarded code (which can yield 200) and passes once guarded.
+    let bus = Arc::new(EventBus::new());
+    let state = state_with_bus_timeout(Some(Arc::clone(&bus)), Some(Duration::ZERO));
+    let bearer = bearer_for(&state, "alice");
+
+    // A prompt, fully-valid matching responder: if the un-guarded loop ever
+    // polls `recv` and the reply has landed, it would return a 200 with this
+    // entry — exactly the non-determinism the guard removes.
+    let entry =
+        serde_json::json!({ "id": "openai:gpt-4o", "provider": "openai", "model": "gpt-4o" });
+    spawn_stub_responder(
+        &bus,
+        "registry.v1.set_active_model",
+        "registry.v1.response.set_active_model",
+        serde_json::json!({ "status": "ok", "active_model": entry.clone() }),
+    );
+
+    let router = routes::build(state);
+    let req = Request::builder()
+        .method("PUT")
+        .uri("/api/models/active")
+        .header(header::AUTHORIZATION, format!("Bearer {bearer}"))
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(r#"{"id":"openai:gpt-4o"}"#))
+        .unwrap();
+    let resp = router.oneshot(req).await.unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "a zero (exhausted) budget must time out to 500 deterministically, never \
+         call recv with a zero duration and racily surface a queued reply"
+    );
+    let bytes = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+    let text = String::from_utf8_lossy(&bytes);
+    assert!(
+        !text.contains("openai:gpt-4o"),
+        "a zero-budget round-trip must never surface a registry reply; body was: {text}"
+    );
+}
+
+#[tokio::test]
 async fn models_principal_isolation() {
     // Threat-model regression. With a single shared bus, a responder
     // publishes an active-model reply stamped for principal B. A handler

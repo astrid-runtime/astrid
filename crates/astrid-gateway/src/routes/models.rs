@@ -91,23 +91,35 @@ pub struct SetActiveModelRequest {
 /// * `expected == Some(ours)` — a SET reply is accepted iff it carries our
 ///   `corr_id` **or** carries no `corr_id` field at all. A reply whose
 ///   `corr_id` is *present and different* is some other concurrent
-///   same-principal SET's reply and is SKIPPED. Accepting the no-`corr_id`
+///   same-principal SET's reply and is SKIPPED. A `corr_id` that is present
+///   but **not a string** is anomalous — it can never equal our id, so it is
+///   treated as a non-match and SKIPPED rather than accepted; accepting it
+///   would let a malformed or forged reply satisfy the correlation filter and
+///   be surfaced as the matching SET response. Accepting the no-`corr_id`
 ///   case keeps a not-yet-updated registry (and any GET reply that races
 ///   onto the same scoped route) working.
 ///
 /// This is the pure core of the race fix: two concurrent same-principal SET
 /// requests no longer consume each other's reply body. It is kept free of
-/// IO so the decision can be unit-tested directly.
+/// IO so the decision can be unit-tested directly. The bounded recv deadline
+/// in [`registry_round_trip`] bounds the skip path, so skipping an anomalous
+/// reply degrades to a timeout (500) — the correct fail-safe — rather than
+/// surfacing the wrong body.
 fn reply_satisfies_corr_id(reply: &serde_json::Value, expected: Option<&str>) -> bool {
     let Some(expected) = expected else {
         // Uncorrelated (GET) path: accept any reply.
         return true;
     };
-    match reply.get("corr_id").and_then(serde_json::Value::as_str) {
-        // No `corr_id` on the reply → accept (legacy registry / GET reply).
+    match reply.get("corr_id") {
+        // No `corr_id` field on the reply → accept (legacy registry / GET
+        // reply that hasn't started echoing the id).
         None => true,
-        // Present → accept only an exact match; a foreign id is skipped.
-        Some(found) => found == expected,
+        // Present as a string → accept only an exact match; a foreign id is
+        // skipped.
+        Some(serde_json::Value::String(found)) => found == expected,
+        // Present but NOT a string → anomalous; it cannot be our id, so it is
+        // a non-match and is skipped (fail-safe to a timeout, not accept).
+        Some(_) => false,
     }
 }
 
@@ -224,6 +236,15 @@ async fn registry_round_trip(
         .unwrap_or_else(tokio::time::Instant::now);
     loop {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        // No budget left (deadline already elapsed, or zero remaining): break
+        // to the timeout path rather than calling `recv(Some(ZERO))`, whose
+        // behaviour with a zero duration is implementation-defined. The
+        // absolute deadline above keeps total wait bounded regardless.
+        if remaining.is_zero() {
+            return Err(GatewayError::Internal(anyhow::anyhow!(
+                "registry did not respond"
+            )));
+        }
         let Some(event) = reply_rx.recv(Some(remaining)).await else {
             return Err(GatewayError::Internal(anyhow::anyhow!(
                 "registry did not respond"
@@ -374,7 +395,9 @@ pub async fn set_active_model(
         SetActiveOutcome::Bound(active) => Ok(Json(active)),
         SetActiveOutcome::Rejected(message) => Err(GatewayError::BadRequest(message)),
         SetActiveOutcome::Malformed => Err(GatewayError::Internal(anyhow::anyhow!(
-            "registry set_active_model reply missing both 'active_model' and 'error'"
+            "registry set_active_model reply carried neither an 'error' nor a \
+             non-null 'active_model' (an explicit-null 'active_model' is treated \
+             as absent)"
         ))),
     }
 }
@@ -482,13 +505,36 @@ mod tests {
     }
 
     #[test]
-    fn non_string_corr_id_is_treated_as_absent() {
-        // A malformed `corr_id` (not a string) is not a usable correlation
-        // value; `as_str` yields `None`, so the reply is accepted rather than
-        // silently skipped forever.
-        assert!(reply_satisfies_corr_id(
-            &json!({ "corr_id": 42 }),
-            Some("abc")
-        ));
+    fn non_string_corr_id_is_skipped() {
+        // Security regression: a `corr_id` that is PRESENT but not a string is
+        // anomalous — it can never equal our id, so it must be a non-match and
+        // SKIPPED, not accepted. Accepting it would let a malformed or forged
+        // reply satisfy the correlation filter and be surfaced as the matching
+        // SET response; the bounded recv deadline turns the skip into a
+        // timeout (500), the correct fail-safe. Several non-string JSON shapes
+        // are covered so the rule is "present-non-string ⇒ skip", not a single
+        // type quirk.
+        assert!(
+            !reply_satisfies_corr_id(&json!({ "corr_id": 42 }), Some("abc")),
+            "a numeric corr_id must be skipped (non-match), not accepted"
+        );
+        assert!(
+            !reply_satisfies_corr_id(&json!({ "corr_id": true }), Some("abc")),
+            "a boolean corr_id must be skipped (non-match), not accepted"
+        );
+        assert!(
+            !reply_satisfies_corr_id(&json!({ "corr_id": ["abc"] }), Some("abc")),
+            "an array corr_id must be skipped (non-match), not accepted"
+        );
+        assert!(
+            !reply_satisfies_corr_id(&json!({ "corr_id": { "v": "abc" } }), Some("abc")),
+            "an object corr_id must be skipped (non-match), not accepted"
+        );
+        // An explicit JSON `null` is a present field too — and not a string —
+        // so it is likewise a non-match and skipped.
+        assert!(
+            !reply_satisfies_corr_id(&json!({ "corr_id": null }), Some("abc")),
+            "an explicit-null corr_id must be skipped (non-match), not accepted"
+        );
     }
 }
