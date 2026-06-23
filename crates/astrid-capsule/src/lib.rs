@@ -7,6 +7,7 @@
 //! manifests, handles discovery, and routes execution to the appropriate
 //! environments (WASM sandboxes or legacy host processes).
 
+pub mod access;
 pub mod capsule;
 pub mod context;
 pub mod discovery;
@@ -27,6 +28,7 @@ pub mod topic;
 pub mod toposort;
 pub(crate) mod watcher;
 
+pub use access::CapsuleAccessResolver;
 pub use engine::wasm::limits::CapsuleRuntimeLimits;
 pub use fuel_ledger::{FuelLedger, FuelRateLimiter};
 pub use memory_ledger::{MemoryLedger, StoreMemoryMeter};

@@ -212,6 +212,12 @@ pub(crate) struct ModifyArgs {
     /// Remove the agent from a group (repeatable).
     #[arg(long = "remove-group", value_name = "NAME")]
     pub remove_group: Vec<String>,
+    /// Grant the agent access to a capsule's tools (repeatable).
+    #[arg(long = "add-capsule", value_name = "ID")]
+    pub add_capsule: Vec<String>,
+    /// Revoke the agent's access to a capsule's tools (repeatable).
+    #[arg(long = "remove-capsule", value_name = "ID")]
+    pub remove_capsule: Vec<String>,
     /// Rename the principal (deferred — needs kernel-side rename IPC).
     #[arg(long, value_name = "NEW-NAME", hide = true)]
     pub rename: Option<String>,
@@ -713,8 +719,14 @@ async fn run_modify(args: ModifyArgs) -> Result<ExitCode> {
         return Ok(ExitCode::from(2));
     }
     let principal = PrincipalId::new(&args.name).context("invalid agent name")?;
-    if args.add_group.is_empty() && args.remove_group.is_empty() {
-        eprintln!("astrid: nothing to do (specify --add-group or --remove-group)");
+    if args.add_group.is_empty()
+        && args.remove_group.is_empty()
+        && args.add_capsule.is_empty()
+        && args.remove_capsule.is_empty()
+    {
+        eprintln!(
+            "astrid: nothing to do (specify --add-group, --remove-group, --add-capsule, or --remove-capsule)"
+        );
         return Ok(ExitCode::from(1));
     }
     let mut client = crate::admin_client::connect_as_active_agent().await?;
@@ -723,6 +735,8 @@ async fn run_modify(args: ModifyArgs) -> Result<ExitCode> {
             principal: principal.clone(),
             add_groups: args.add_group.clone(),
             remove_groups: args.remove_group.clone(),
+            add_capsules: args.add_capsule.clone(),
+            remove_capsules: args.remove_capsule.clone(),
         })
         .await?;
     let body = into_result(body)?;
@@ -732,15 +746,19 @@ async fn run_modify(args: ModifyArgs) -> Result<ExitCode> {
         other => anyhow::bail!("unexpected response from kernel: {other:?}"),
     };
 
-    let groups: Vec<String> = value
-        .get("groups")
-        .and_then(|g| g.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|v| v.as_str().map(str::to_string))
-                .collect()
-        })
-        .unwrap_or_default();
+    let string_array = |key: &str| -> Vec<String> {
+        value
+            .get(key)
+            .and_then(|g| g.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let groups = string_array("groups");
+    let capsules = string_array("capsules");
     let changed = value
         .get("changed")
         .and_then(serde_json::Value::as_bool)
@@ -749,15 +767,16 @@ async fn run_modify(args: ModifyArgs) -> Result<ExitCode> {
         println!(
             "{}",
             Theme::success(&format!(
-                "Updated agent '{principal}' groups: [{}]",
-                groups.join(", ")
+                "Updated agent '{principal}' groups: [{}] capsules: [{}]",
+                groups.join(", "),
+                capsules.join(", ")
             ))
         );
     } else {
         println!(
             "{}",
             Theme::info(&format!(
-                "agent '{principal}' already in the requested groups (no change)"
+                "agent '{principal}' already has the requested groups and capsules (no change)"
             ))
         );
     }

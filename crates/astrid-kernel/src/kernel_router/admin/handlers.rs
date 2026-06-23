@@ -86,11 +86,7 @@ pub(super) async fn dispatch_with_device(
             agent_set_enabled(kernel, principal, false).await
         },
         AdminRequestKind::AgentList => agent_list(kernel, caller),
-        AdminRequestKind::AgentModify {
-            principal,
-            add_groups,
-            remove_groups,
-        } => agent_modify(kernel, principal, add_groups, remove_groups).await,
+        req @ AdminRequestKind::AgentModify { .. } => agent_modify_from_req(kernel, req).await,
         AdminRequestKind::QuotaSet { principal, quotas } => {
             super::quota::quota_set(kernel, principal, quotas).await
         },
@@ -438,15 +434,30 @@ async fn agent_set_enabled(
     }))
 }
 
-async fn agent_modify(
+async fn agent_modify_from_req(
     kernel: &Arc<crate::Kernel>,
-    principal: PrincipalId,
-    add_groups: Vec<String>,
-    remove_groups: Vec<String>,
+    req: AdminRequestKind,
 ) -> AdminResponseBody {
-    if add_groups.is_empty() && remove_groups.is_empty() {
+    let AdminRequestKind::AgentModify {
+        principal,
+        add_groups,
+        remove_groups,
+        add_capsules,
+        remove_capsules,
+    } = req
+    else {
+        return err_internal(
+            "agent_modify_from_req received a non-AgentModify variant".to_string(),
+        );
+    };
+    if add_groups.is_empty()
+        && remove_groups.is_empty()
+        && add_capsules.is_empty()
+        && remove_capsules.is_empty()
+    {
         return err_bad_input(
-            "agent.modify: at least one of `add_groups` or `remove_groups` must be non-empty"
+            "agent.modify: at least one of `add_groups`, `remove_groups`, `add_capsules`, or \
+             `remove_capsules` must be non-empty"
                 .to_string(),
         );
     }
@@ -461,45 +472,25 @@ async fn agent_modify(
         Err(e) => return err_profile(&principal, &e),
     };
 
-    // Apply removes first so a (remove, add) of the same group is an
-    // idempotent rename rather than a duplicate. Both ops are per-group
-    // idempotent: adding present groups and removing absent ones are
-    // no-ops.
-    let before = profile.groups.clone();
-    profile.groups.retain(|g| !remove_groups.contains(g));
-    for g in &add_groups {
-        if !profile.groups.iter().any(|existing| existing == g) {
-            profile.groups.push(g.clone());
-        }
-    }
-
-    // Set-based comparison: group membership is a set semantically, so
-    // a no-op modify (adding present, removing absent, or add+remove
-    // of the same group) should report `changed = false` regardless
-    // of the underlying Vec's order. `retain` + `push` happens to
-    // preserve the order of pre-existing groups today, but the
-    // correctness of `changed` shouldn't depend on that implementation
-    // detail.
-    let before_set: std::collections::HashSet<&String> = before.iter().collect();
-    let after_set: std::collections::HashSet<&String> = profile.groups.iter().collect();
-    if before_set == after_set {
+    // Capsule grants mirror the group mechanism EXACTLY via the shared
+    // `apply_set_delta`: idempotent remove-then-add, set-based change
+    // detection. The capsule grant set is what the kernel gates the
+    // user-invocable tool surface against at dispatch (#992).
+    let groups_changed = apply_set_delta(&mut profile.groups, &add_groups, &remove_groups);
+    let capsules_changed = apply_set_delta(&mut profile.capsules, &add_capsules, &remove_capsules);
+    if !groups_changed && !capsules_changed {
         kernel.profile_cache.invalidate(&principal);
-        return success_json(serde_json::json!({
-            "principal": principal.as_str(),
-            "groups": profile.groups,
-            "changed": false,
-        }));
+        return modify_response(&principal, &profile, false);
     }
 
     // Validate before saving: re-runs the profile invariants (group
-    // names match groups.toml, grants/revokes still well-formed, etc.).
-    // Without this an operator could `agent modify --add-group typo`
-    // and the Layer 5 cap lookup would silently miss the typo'd group
-    // at every authz check.
+    // names match groups.toml, grants/revokes still well-formed, capsule
+    // grants well-formed, etc.). Without this an operator could
+    // `agent modify --add-group typo` and the Layer 5 cap lookup would
+    // silently miss the typo'd group at every authz check.
     if let Err(e) = profile.validate() {
         return err_bad_input(format!("profile rejected: {e}"));
     }
-
     if let Err(e) = profile.save_to_path(&path) {
         return err_profile(&principal, &e);
     }
@@ -507,17 +498,71 @@ async fn agent_modify(
 
     info!(
         %principal,
-        added = ?add_groups,
-        removed = ?remove_groups,
+        added_groups = ?add_groups,
+        removed_groups = ?remove_groups,
+        added_capsules = ?add_capsules,
+        removed_capsules = ?remove_capsules,
         groups = ?profile.groups,
+        capsules = ?profile.capsules,
         "Layer 6 agent.modify"
     );
+    modify_response(&principal, &profile, true)
+}
 
+/// Build the `agent.modify` success body reporting the principal's
+/// resulting groups + capsule grants and whether the call changed state.
+fn modify_response(
+    principal: &PrincipalId,
+    profile: &PrincipalProfile,
+    changed: bool,
+) -> AdminResponseBody {
     success_json(serde_json::json!({
         "principal": principal.as_str(),
         "groups": profile.groups,
-        "changed": true,
+        "capsules": profile.capsules,
+        "changed": changed,
     }))
+}
+
+/// Apply an idempotent set delta to `target`: remove every entry in
+/// `remove`, then append every entry in `add` not already present.
+///
+/// Returns `true` if the resulting set differs from the original
+/// (order-insensitive). Removes are applied first so a (remove, add) of
+/// the same entry is an idempotent rename rather than a duplicate; adding
+/// a present entry or removing an absent one is a no-op. Shared by the
+/// group and capsule mechanisms so they behave identically.
+///
+/// On a no-op (the resulting set equals the original) `target` is left
+/// byte-for-byte unchanged — including its element order. The delta is
+/// computed on a scratch copy and written back only when the set actually
+/// changed, so an order-only churn (e.g. removing then re-adding a present
+/// entry) is never reflected back to the caller as a mutated profile that
+/// then goes unpersisted (`changed=false`).
+fn apply_set_delta(target: &mut Vec<String>, add: &[String], remove: &[String]) -> bool {
+    // Build the resulting order on a scratch copy WITHOUT touching `target`:
+    // surviving entries keep their order, then new additions append.
+    let mut next: Vec<String> = target
+        .iter()
+        .filter(|e| !remove.contains(e))
+        .cloned()
+        .collect();
+    for entry in add {
+        if !next.contains(entry) {
+            next.push(entry.clone());
+        }
+    }
+    // Order-insensitive set comparison; the borrows end with the block so the
+    // write-back below can take `&mut *target`.
+    let changed = {
+        let before: std::collections::HashSet<&String> = target.iter().collect();
+        let after: std::collections::HashSet<&String> = next.iter().collect();
+        before != after
+    };
+    if changed {
+        *target = next;
+    }
+    changed
 }
 
 /// Does `caller` hold the admin-tier global `agent:list` capability

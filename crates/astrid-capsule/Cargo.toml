@@ -20,6 +20,7 @@ astrid-storage = { workspace = true, features = ["keychain"] }
 astrid-vfs = { workspace = true }
 astrid-workspace = { workspace = true }
 anyhow = { workspace = true }
+arc-swap = { workspace = true }
 async-trait = { workspace = true }
 blake3 = { workspace = true }
 bytes = "1"

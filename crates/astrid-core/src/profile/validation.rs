@@ -7,9 +7,9 @@
 use crate::capability_grammar::validate_capability;
 
 use super::{
-    AuthConfig, BACKGROUND_PROCESSES_UPPER_BOUND, CURRENT_PROFILE_VERSION, MAX_GROUP_NAME_LEN,
-    NetworkConfig, PrincipalProfile, ProcessConfig, ProfileError, ProfileResult, Quotas,
-    TIMEOUT_SECS_UPPER_BOUND,
+    AuthConfig, BACKGROUND_PROCESSES_UPPER_BOUND, CURRENT_PROFILE_VERSION, MAX_CAPSULE_GRANT_LEN,
+    MAX_GROUP_NAME_LEN, NetworkConfig, PrincipalProfile, ProcessConfig, ProfileError,
+    ProfileResult, Quotas, TIMEOUT_SECS_UPPER_BOUND,
 };
 
 impl PrincipalProfile {
@@ -40,6 +40,9 @@ impl PrincipalProfile {
             validate_capability(cap).map_err(|e| {
                 ProfileError::Invalid(format!("revokes entry {cap:?} rejected: {e}"))
             })?;
+        }
+        for capsule in &self.capsules {
+            validate_capsule_grant(capsule)?;
         }
         self.network.validate()?;
         self.process.validate()?;
@@ -192,6 +195,38 @@ impl ProcessConfig {
         }
         Ok(())
     }
+}
+
+/// Validate a single capsule-grant entry against the same character set a
+/// `CapsuleId` enforces — non-empty, lowercase alphanumeric and hyphens
+/// only — plus a defensive length cap of [`MAX_CAPSULE_GRANT_LEN`].
+///
+/// The length cap is the profile's own sanity bound on operator-supplied
+/// input, NOT a mirror of `CapsuleId`: `astrid_capsule::CapsuleId::validate`
+/// caps the charset but imposes no length limit. A grant entry that cannot
+/// name a real capsule is rejected on load — fail-closed: a malformed grant
+/// never silently widens (or, by failing the whole profile, narrows) access
+/// in a way the operator did not intend.
+fn validate_capsule_grant(id: &str) -> ProfileResult<()> {
+    if id.is_empty() {
+        return Err(ProfileError::Invalid(
+            "capsules entries must be non-empty".into(),
+        ));
+    }
+    if id.len() > MAX_CAPSULE_GRANT_LEN {
+        return Err(ProfileError::Invalid(format!(
+            "capsules entry exceeds {MAX_CAPSULE_GRANT_LEN} characters: {id:?}",
+        )));
+    }
+    if let Some(bad) = id
+        .chars()
+        .find(|c| !c.is_ascii_lowercase() && !c.is_ascii_digit() && *c != '-')
+    {
+        return Err(ProfileError::Invalid(format!(
+            "capsules entry {id:?} contains invalid character {bad:?} (allowed: a-z, 0-9, -)",
+        )));
+    }
+    Ok(())
 }
 
 /// Same character set + length cap as [`PrincipalId`](crate::PrincipalId):
@@ -421,6 +456,49 @@ mod tests {
     fn rejects_group_too_long() {
         let mut p = PrincipalProfile::default();
         p.groups = vec!["a".repeat(MAX_GROUP_NAME_LEN + 1)];
+        assert!(matches!(p.validate(), Err(ProfileError::Invalid(_))));
+    }
+
+    // ── Capsule grants ────────────────────────────────────────────────
+
+    #[test]
+    fn accepts_valid_capsule_grants() {
+        let mut p = PrincipalProfile::default();
+        p.capsules = vec![
+            "identity".into(),
+            "registry".into(),
+            "context-engine".into(),
+            "openai-compat".into(),
+            "a".repeat(MAX_CAPSULE_GRANT_LEN),
+        ];
+        p.validate().unwrap();
+    }
+
+    #[test]
+    fn rejects_empty_capsule_grant() {
+        let mut p = PrincipalProfile::default();
+        p.capsules = vec![String::new()];
+        assert!(matches!(p.validate(), Err(ProfileError::Invalid(_))));
+    }
+
+    #[test]
+    fn rejects_capsule_grant_with_uppercase() {
+        let mut p = PrincipalProfile::default();
+        p.capsules = vec!["Identity".into()];
+        assert!(matches!(p.validate(), Err(ProfileError::Invalid(_))));
+    }
+
+    #[test]
+    fn rejects_capsule_grant_with_bad_char() {
+        let mut p = PrincipalProfile::default();
+        p.capsules = vec!["ident_ity".into()];
+        assert!(matches!(p.validate(), Err(ProfileError::Invalid(_))));
+    }
+
+    #[test]
+    fn rejects_capsule_grant_too_long() {
+        let mut p = PrincipalProfile::default();
+        p.capsules = vec!["a".repeat(MAX_CAPSULE_GRANT_LEN + 1)];
         assert!(matches!(p.validate(), Err(ProfileError::Invalid(_))));
     }
 

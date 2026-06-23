@@ -85,6 +85,14 @@ pub const BACKGROUND_PROCESSES_UPPER_BOUND: u32 = 256;
 /// Maximum length of a single entry in [`PrincipalProfile::groups`].
 pub const MAX_GROUP_NAME_LEN: usize = 64;
 
+/// Maximum length of a single entry in [`PrincipalProfile::capsules`].
+///
+/// A defensive sanity bound on operator-supplied grant entries — `CapsuleId`
+/// itself caps only the charset, not the length, so this is the profile's own
+/// limit rather than a kernel-enforced capsule-id cap. An entry longer than
+/// this is well beyond any realistic capsule id, so reject it on load.
+pub const MAX_CAPSULE_GRANT_LEN: usize = 128;
+
 /// Result alias for profile operations.
 pub type ProfileResult<T> = Result<T, ProfileError>;
 
@@ -144,6 +152,24 @@ pub struct PrincipalProfile {
     /// [`PrincipalProfile::grants`].
     #[serde(default)]
     pub revokes: Vec<String>,
+
+    /// Capsule ids this principal is granted access to invoke.
+    ///
+    /// The kernel gates the **user-invocable tool surface**
+    /// (`tool.v1.execute.*`, `cli.v1.command.execute`) at dispatch: a
+    /// principal may have a capsule's tool dispatched to it only if the
+    /// capsule's [`CapsuleId`](../../astrid_capsule/capsule/struct.CapsuleId.html)
+    /// appears here. The internal orchestration mesh is **not** gated by
+    /// this field — only the tool/CLI execute surface. New principals get
+    /// **no** capsule access by default (empty), consistent with the
+    /// inherit-nothing model (#924); admins (`*`) bypass the filter
+    /// entirely, so single-tenant `default` is unaffected.
+    ///
+    /// Each entry is validated against the same grammar as a
+    /// [`CapsuleId`](../../astrid_capsule/capsule/struct.CapsuleId.html):
+    /// non-empty, lowercase alphanumeric and hyphens only.
+    #[serde(default)]
+    pub capsules: Vec<String>,
 
     /// Authentication configuration.
     #[serde(default)]
@@ -331,6 +357,7 @@ impl Default for PrincipalProfile {
             groups: Vec::new(),
             grants: Vec::new(),
             revokes: Vec::new(),
+            capsules: Vec::new(),
             auth: AuthConfig::default(),
             network: NetworkConfig::default(),
             process: ProcessConfig::default(),
@@ -379,6 +406,7 @@ mod tests {
         assert!(p.groups.is_empty());
         assert!(p.grants.is_empty());
         assert!(p.revokes.is_empty());
+        assert!(p.capsules.is_empty(), "capsule grants must default empty");
         assert!(p.auth.methods.is_empty());
         assert!(p.auth.public_keys.is_empty());
         assert!(p.network.egress.is_empty(), "egress must fail-closed");
@@ -424,6 +452,7 @@ mod tests {
             groups: vec!["admins".into(), "ops_team".into()],
             grants: vec!["capsule:install".into()],
             revokes: vec!["system:shutdown".into()],
+            capsules: vec!["identity".into(), "registry".into()],
             auth: AuthConfig {
                 methods: vec![AuthMethod::Keypair, AuthMethod::Passkey],
                 public_keys: vec![DeviceKey::new("a".repeat(64), DeviceScope::Full, None, 0)],

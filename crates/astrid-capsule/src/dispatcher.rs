@@ -34,6 +34,7 @@ use std::time::Duration;
 use tokio::sync::{RwLock, mpsc};
 use tracing::{debug, warn};
 
+use crate::access::CapsuleAccessResolver;
 use crate::capsule::{Capsule, CapsuleId};
 use crate::registry::CapsuleRegistry;
 use astrid_events::PrincipalKey;
@@ -211,6 +212,13 @@ pub struct EventDispatcher {
     /// Closes the cross-principal SET/CALL race at the dispatcher
     /// layer in addition to the bus-side routing demux (#813).
     chain_locks: ChainLocks,
+    /// Per-principal capsule-access resolver. When set, dispatch of the
+    /// **user-invocable surface** (`tool.v1.execute.*`,
+    /// `cli.v1.command.execute`) is filtered to capsules the caller is
+    /// granted; admins (`*`) bypass. When `None` (e.g. legacy tests),
+    /// the surface is ungated — the kernel always wires the resolver in
+    /// production so the security boundary is present at runtime.
+    access_resolver: Option<CapsuleAccessResolver>,
 }
 
 impl EventDispatcher {
@@ -227,6 +235,7 @@ impl EventDispatcher {
             receiver,
             identity_store: None,
             chain_locks: Arc::new(parking_lot::RwLock::new(HashMap::new())),
+            access_resolver: None,
         }
     }
 
@@ -234,6 +243,19 @@ impl EventDispatcher {
     #[must_use]
     pub fn with_identity_store(mut self, store: Arc<dyn astrid_storage::IdentityStore>) -> Self {
         self.identity_store = Some(store);
+        self
+    }
+
+    /// Set the per-principal capsule-access resolver.
+    ///
+    /// Once set, dispatch of the user-invocable surface
+    /// (`tool.v1.execute.*`, `cli.v1.command.execute`) is filtered to the
+    /// caller's granted capsules (admins bypass; fail-closed for unknown
+    /// callers). Wired by the kernel at boot, mirroring how the fuel and
+    /// memory ledgers are cloned in from the kernel.
+    #[must_use]
+    pub fn with_access_resolver(mut self, resolver: CapsuleAccessResolver) -> Self {
+        self.access_resolver = Some(resolver);
         self
     }
 
@@ -365,7 +387,19 @@ impl EventDispatcher {
                 }
             }
 
-            let matches = find_matching_interceptors(&self.registry, &topic).await;
+            // Caller principal (kernel-stamped on the IPC message; `None`
+            // for lifecycle events). Threaded into matching so the
+            // user-invocable surface can be filtered to the caller's
+            // granted capsules — never a caller-supplied claim.
+            let caller_principal: Option<&str> =
+                ipc_message.as_deref().and_then(|m| m.principal.as_deref());
+            let matches = find_matching_interceptors(
+                &self.registry,
+                &topic,
+                caller_principal,
+                self.access_resolver.as_ref(),
+            )
+            .await;
             dispatch_to_capsule_queues(
                 &capsule_queues,
                 &self.chain_locks,
@@ -853,15 +887,44 @@ fn dispatch_single(
 /// interceptor priority (lower values fire first, default 100). The priority is
 /// returned so the caller can distinguish an ordered chain (distinct
 /// priorities) from an independent fan-out (all equal).
+///
+/// # Per-principal capsule-access filter
+///
+/// When `topic` is in the **user-invocable surface** (`tool.v1.execute.*`,
+/// `cli.v1.command.execute`) **and** an `access_resolver` is wired, a
+/// matched capsule is kept only if `caller_principal` is granted it (or is
+/// an admin holding `*`). The filter is keyed on the **topic**, so a
+/// dual-role capsule's orchestration interceptors (on non-tool topics) are
+/// never filtered — they fall through the surface check unchanged. For all
+/// other topics the filter is a no-op and dispatch is identical to before.
+/// A denied match is dropped silently here (the capsule never sees the
+/// ungranted call); the caller's request simply finds no tool, exactly as
+/// if the capsule were not installed.
 async fn find_matching_interceptors(
     registry: &RwLock<CapsuleRegistry>,
     topic: &str,
+    caller_principal: Option<&str>,
+    access_resolver: Option<&CapsuleAccessResolver>,
 ) -> Vec<(Arc<dyn crate::capsule::Capsule>, String, u32)> {
+    // Compute the gate once per event, not per capsule. The filter only
+    // engages for the user-invocable surface with a resolver present;
+    // otherwise every topic dispatches unchanged (orchestration mesh).
+    let gate_surface = crate::access::is_user_invocable_surface(topic);
     let registry = registry.read().await;
     let mut matches: Vec<(Arc<dyn crate::capsule::Capsule>, String, u32)> = Vec::new();
     for capsule_id in registry.list() {
         if let Some(capsule) = registry.get(capsule_id) {
             if !matches!(capsule.state(), crate::capsule::CapsuleState::Ready) {
+                continue;
+            }
+            // Per-principal access gate for the user-invocable surface.
+            // Fail-closed: with the gate engaged and a resolver wired, an
+            // ungranted (or unknown/anonymous) caller drops this capsule's
+            // tool interceptors entirely.
+            if gate_surface
+                && let Some(resolver) = access_resolver
+                && !resolver.is_capsule_allowed(caller_principal, capsule.id())
+            {
                 continue;
             }
             // RFC cargo-like-manifest: read effective interceptors

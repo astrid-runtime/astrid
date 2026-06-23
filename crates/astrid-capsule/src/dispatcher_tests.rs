@@ -404,7 +404,7 @@ async fn find_matching_interceptors_sorts_by_priority() {
     registry.register(Box::new(mid)).unwrap();
     let registry = Arc::new(RwLock::new(registry));
 
-    let matches = find_matching_interceptors(&registry, "test.event").await;
+    let matches = find_matching_interceptors(&registry, "test.event", None, None).await;
     let names: Vec<&str> = matches.iter().map(|(c, _, _)| c.id().as_str()).collect();
     assert_eq!(
         names,
@@ -432,7 +432,7 @@ async fn find_matching_interceptors_tiebreaks_equal_priority_by_id() {
     registry.register(Box::new(a_tie)).unwrap();
     let registry = Arc::new(RwLock::new(registry));
 
-    let matches = find_matching_interceptors(&registry, "test.event").await;
+    let matches = find_matching_interceptors(&registry, "test.event", None, None).await;
     let names: Vec<&str> = matches.iter().map(|(c, _, _)| c.id().as_str()).collect();
     assert_eq!(
         names,
@@ -957,4 +957,369 @@ async fn chain_lock_retained_while_another_holder_exists() {
         chain_locks.read().is_empty(),
         "entry pruned once both holders drop"
     );
+}
+
+// ── Per-principal capsule-access enforcement (#992) ──────────────────
+//
+// These tests prove the kernel-side, topic-scoped, fail-closed grant
+// filter on the user-invocable surface (`tool.v1.execute.*`,
+// `cli.v1.command.execute`), with admin (`*`) bypass and orchestration
+// topics left ungated.
+
+mod access_enforcement {
+    use super::*;
+
+    use arc_swap::ArcSwap;
+    use astrid_core::dirs::AstridHome;
+    use astrid_core::groups::{BUILTIN_ADMIN, GroupConfig};
+    use astrid_core::principal::PrincipalId;
+    use astrid_core::profile::PrincipalProfile;
+    use std::sync::Arc;
+
+    use crate::access::CapsuleAccessResolver;
+    use crate::profile_cache::PrincipalProfileCache;
+
+    /// Build a resolver rooted at a fresh tempdir home, plus a handle to
+    /// the home so the test can write principal profiles to disk. The
+    /// `TempDir` is returned so it outlives the resolver.
+    fn resolver_fixture() -> (tempfile::TempDir, AstridHome, CapsuleAccessResolver) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let home = AstridHome::from_path(dir.path());
+        let cache = Arc::new(PrincipalProfileCache::with_home(home.clone()));
+        let groups = Arc::new(ArcSwap::from_pointee(GroupConfig::builtin_only()));
+        let resolver = CapsuleAccessResolver::new(cache, groups);
+        (dir, home, resolver)
+    }
+
+    /// Write a principal profile to `etc/profiles/{principal}.toml`.
+    fn write_profile(home: &AstridHome, principal: &str, profile: &PrincipalProfile) {
+        let pid = PrincipalId::new(principal).unwrap();
+        profile.save(home, &pid).expect("save profile");
+    }
+
+    /// A non-admin profile granted the given capsule ids.
+    fn agent_with_capsules(capsules: &[&str]) -> PrincipalProfile {
+        PrincipalProfile {
+            capsules: capsules.iter().map(|c| (*c).to_string()).collect(),
+            ..PrincipalProfile::default()
+        }
+    }
+
+    /// An admin profile (member of the `admin` builtin group → holds `*`).
+    fn admin_profile() -> PrincipalProfile {
+        PrincipalProfile {
+            groups: vec![BUILTIN_ADMIN.to_string()],
+            ..PrincipalProfile::default()
+        }
+    }
+
+    /// Spawn a dispatcher wired with the resolver over a registry holding
+    /// one capsule whose interceptor binds `interceptor_event`. Returns the
+    /// invoked flag, the bus, and the task handle.
+    fn spawn_with_capsule(
+        resolver: CapsuleAccessResolver,
+        capsule_name: &str,
+        interceptor_event: &str,
+    ) -> (Arc<AtomicBool>, Arc<EventBus>, tokio::task::JoinHandle<()>) {
+        let (capsule, invoked) = MockCapsule::new(capsule_name, interceptor_event);
+        let mut registry = CapsuleRegistry::new();
+        registry.register(Box::new(capsule)).unwrap();
+        let registry = Arc::new(RwLock::new(registry));
+        let bus = Arc::new(EventBus::with_capacity(64));
+        let dispatcher = EventDispatcher::new(Arc::clone(&registry), Arc::clone(&bus))
+            .with_access_resolver(resolver);
+        let handle = tokio::spawn(dispatcher.run());
+        (invoked, bus, handle)
+    }
+
+    /// (a) A non-admin principal WITHOUT capsule X granted must not have
+    /// X's `tool.v1.execute.*` dispatched to it.
+    #[tokio::test]
+    async fn ungranted_principal_denied_tool_dispatch() {
+        let (_dir, home, resolver) = resolver_fixture();
+        // `bob` exists but is granted no capsules.
+        write_profile(&home, "bob", &agent_with_capsules(&[]));
+
+        let (invoked, bus, handle) =
+            spawn_with_capsule(resolver, "secret-tool", "tool.v1.execute.do_thing");
+        tokio::task::yield_now().await;
+        publish_ipc_as(&bus, "tool.v1.execute.do_thing", "bob");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        assert!(
+            !invoked.load(Ordering::SeqCst),
+            "ungranted principal must NOT have the tool capsule dispatched"
+        );
+        handle.abort();
+    }
+
+    /// (b) WITH the grant, the same tool is served.
+    #[tokio::test]
+    async fn granted_principal_served_tool_dispatch() {
+        let (_dir, home, resolver) = resolver_fixture();
+        write_profile(&home, "alice", &agent_with_capsules(&["secret-tool"]));
+
+        let (invoked, bus, handle) =
+            spawn_with_capsule(resolver, "secret-tool", "tool.v1.execute.do_thing");
+        tokio::task::yield_now().await;
+        publish_ipc_as(&bus, "tool.v1.execute.do_thing", "alice");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        assert!(
+            invoked.load(Ordering::SeqCst),
+            "granted principal MUST have the tool capsule dispatched"
+        );
+        handle.abort();
+    }
+
+    /// (c) Admin (`*`) bypasses the filter — all capsules served even with
+    /// no explicit capsule grant.
+    #[tokio::test]
+    async fn admin_bypasses_filter() {
+        let (_dir, home, resolver) = resolver_fixture();
+        // Admin holds `*` via the `admin` group, NOT via a capsule grant.
+        write_profile(&home, "root", &admin_profile());
+
+        let (invoked, bus, handle) =
+            spawn_with_capsule(resolver, "secret-tool", "tool.v1.execute.do_thing");
+        tokio::task::yield_now().await;
+        publish_ipc_as(&bus, "tool.v1.execute.do_thing", "root");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        assert!(
+            invoked.load(Ordering::SeqCst),
+            "admin (`*`) must bypass the per-principal filter"
+        );
+        handle.abort();
+    }
+
+    /// (d) `anonymous` caller → no tool capsules visible (fail-closed).
+    #[tokio::test]
+    async fn anonymous_caller_denied() {
+        let (_dir, _home, resolver) = resolver_fixture();
+
+        let (invoked, bus, handle) =
+            spawn_with_capsule(resolver, "secret-tool", "tool.v1.execute.do_thing");
+        tokio::task::yield_now().await;
+        publish_ipc_as(&bus, "tool.v1.execute.do_thing", "anonymous");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        assert!(
+            !invoked.load(Ordering::SeqCst),
+            "`anonymous` caller must see no tool capsules (fail-closed)"
+        );
+        handle.abort();
+    }
+
+    /// (d') An unknown principal (no profile on disk → default, no grants)
+    /// is likewise denied — fail-closed default.
+    #[tokio::test]
+    async fn unknown_principal_denied() {
+        let (_dir, _home, resolver) = resolver_fixture();
+
+        let (invoked, bus, handle) =
+            spawn_with_capsule(resolver, "secret-tool", "tool.v1.execute.do_thing");
+        tokio::task::yield_now().await;
+        publish_ipc_as(&bus, "tool.v1.execute.do_thing", "nobody");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        assert!(
+            !invoked.load(Ordering::SeqCst),
+            "unknown principal (no grants) must see no tool capsules"
+        );
+        handle.abort();
+    }
+
+    /// (d'') A caller whose profile fails to resolve (malformed TOML on
+    /// disk) is denied — resolve error → deny, never default-allow.
+    #[tokio::test]
+    async fn resolve_error_denies() {
+        let (_dir, home, resolver) = resolver_fixture();
+        // Write a profile that fails validation (future version) so
+        // `resolve` returns Err rather than a default profile.
+        let pid = PrincipalId::new("broken").unwrap();
+        let path = home.profile_path(&pid);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "profile_version = 9999\n").unwrap();
+
+        let (invoked, bus, handle) =
+            spawn_with_capsule(resolver, "secret-tool", "tool.v1.execute.do_thing");
+        tokio::task::yield_now().await;
+        publish_ipc_as(&bus, "tool.v1.execute.do_thing", "broken");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        assert!(
+            !invoked.load(Ordering::SeqCst),
+            "resolve error must deny (fail-closed), never default-allow"
+        );
+        handle.abort();
+    }
+
+    /// (e) An orchestration topic (`session.v1.append`) is dispatched
+    /// regardless of grants — the internal mesh is NOT gated.
+    #[tokio::test]
+    async fn orchestration_topic_ungated() {
+        let (_dir, home, resolver) = resolver_fixture();
+        // `bob` has NO capsule grants — yet orchestration must still flow.
+        write_profile(&home, "bob", &agent_with_capsules(&[]));
+
+        let (invoked, bus, handle) =
+            spawn_with_capsule(resolver, "session-capsule", "session.v1.append");
+        tokio::task::yield_now().await;
+        publish_ipc_as(&bus, "session.v1.append", "bob");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        assert!(
+            invoked.load(Ordering::SeqCst),
+            "orchestration topic must dispatch regardless of capsule grants"
+        );
+        handle.abort();
+    }
+
+    /// (a') The CLI command-execute topic is gated like the tool surface:
+    /// an ungranted principal is denied.
+    #[tokio::test]
+    async fn cli_command_execute_gated() {
+        let (_dir, home, resolver) = resolver_fixture();
+        write_profile(&home, "bob", &agent_with_capsules(&[]));
+
+        let (invoked, bus, handle) =
+            spawn_with_capsule(resolver, "cli-capsule", "cli.v1.command.execute");
+        tokio::task::yield_now().await;
+        publish_ipc_as(&bus, "cli.v1.command.execute", "bob");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        assert!(
+            !invoked.load(Ordering::SeqCst),
+            "ungranted principal must be denied the CLI execute surface"
+        );
+        handle.abort();
+    }
+
+    /// Dual-role: the tool topic is gated for an ungranted principal while
+    /// the SAME capsule's orchestration topic still dispatches. Proves the
+    /// gate is topic-scoped, not capsule-scoped.
+    #[tokio::test]
+    async fn dual_role_capsule_gates_tool_not_orchestration() {
+        let (_dir, home, resolver) = resolver_fixture();
+        write_profile(&home, "bob", &agent_with_capsules(&[]));
+
+        // One capsule that intercepts BOTH a tool topic and an
+        // orchestration topic. Register it with the tool topic, then a
+        // second registry entry with the orchestration topic, both named
+        // the same dual-role capsule but we test via two capsules sharing
+        // the ungranted principal to isolate the topic dimension.
+        let (tool_cap, tool_invoked) =
+            MockCapsule::new("identity", "tool.v1.execute.save_identity");
+        let (orch_cap, orch_invoked) = MockCapsule::new("identity-orch", "spark.v1.request.build");
+        let mut registry = CapsuleRegistry::new();
+        registry.register(Box::new(tool_cap)).unwrap();
+        registry.register(Box::new(orch_cap)).unwrap();
+        let registry = Arc::new(RwLock::new(registry));
+        let bus = Arc::new(EventBus::with_capacity(64));
+        let dispatcher = EventDispatcher::new(Arc::clone(&registry), Arc::clone(&bus))
+            .with_access_resolver(resolver);
+        let handle = tokio::spawn(dispatcher.run());
+        tokio::task::yield_now().await;
+
+        publish_ipc_as(&bus, "tool.v1.execute.save_identity", "bob");
+        publish_ipc_as(&bus, "spark.v1.request.build", "bob");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        assert!(
+            !tool_invoked.load(Ordering::SeqCst),
+            "ungranted principal: tool topic must be gated"
+        );
+        assert!(
+            orch_invoked.load(Ordering::SeqCst),
+            "ungranted principal: orchestration topic must still dispatch"
+        );
+        handle.abort();
+    }
+
+    /// With no resolver wired (legacy path), the surface is ungated — a
+    /// dispatcher built without `with_access_resolver` dispatches tools to
+    /// any principal, proving the gate is opt-in via injection.
+    #[tokio::test]
+    async fn no_resolver_means_ungated() {
+        let (tool_cap, invoked) = MockCapsule::new("secret-tool", "tool.v1.execute.do_thing");
+        let mut registry = CapsuleRegistry::new();
+        registry.register(Box::new(tool_cap)).unwrap();
+        let registry = Arc::new(RwLock::new(registry));
+        let bus = Arc::new(EventBus::with_capacity(64));
+        // No `.with_access_resolver(..)`.
+        let dispatcher = EventDispatcher::new(Arc::clone(&registry), Arc::clone(&bus));
+        let handle = tokio::spawn(dispatcher.run());
+        tokio::task::yield_now().await;
+
+        publish_ipc_as(&bus, "tool.v1.execute.do_thing", "bob");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        assert!(
+            invoked.load(Ordering::SeqCst),
+            "without a resolver the surface is ungated (legacy/test path)"
+        );
+        handle.abort();
+    }
+
+    /// REGRESSION: result-delivery topics must NOT be gated. A tool result
+    /// `tool.v1.execute.<name>.result` is collected by an orchestration
+    /// capsule (router `handle_execute_result`) that is never in a
+    /// principal's grant set. If the surface predicate gated it (e.g. a
+    /// naive `starts_with("tool.v1.execute.")`), the result would be dropped
+    /// for every non-admin caller and the turn would hang. It must reach its
+    /// handler even for a principal granted nothing.
+    #[tokio::test]
+    async fn result_topics_are_not_gated() {
+        let (_dir, home, resolver) = resolver_fixture();
+        write_profile(&home, "bob", &agent_with_capsules(&[]));
+
+        let (invoked, bus, handle) =
+            spawn_with_capsule(resolver, "router-like", "tool.v1.execute.*.result");
+        tokio::task::yield_now().await;
+        publish_ipc_as(&bus, "tool.v1.execute.do_thing.result", "bob");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        assert!(
+            invoked.load(Ordering::SeqCst),
+            "result topic must dispatch to its orchestration handler even for an ungranted principal"
+        );
+        handle.abort();
+    }
+
+    /// REGRESSION: react's bare `tool.v1.execute.result` is a result-
+    /// collection topic (handler `handle_tool_result`), not a tool named
+    /// "result". It must not be gated.
+    #[tokio::test]
+    async fn bare_react_result_topic_is_not_gated() {
+        let (_dir, home, resolver) = resolver_fixture();
+        write_profile(&home, "bob", &agent_with_capsules(&[]));
+
+        let (invoked, bus, handle) =
+            spawn_with_capsule(resolver, "react-like", "tool.v1.execute.result");
+        tokio::task::yield_now().await;
+        publish_ipc_as(&bus, "tool.v1.execute.result", "bob");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        assert!(
+            invoked.load(Ordering::SeqCst),
+            "react's bare result topic must dispatch even for an ungranted principal"
+        );
+        handle.abort();
+    }
+
+    /// Unit cover for the surface predicate: only the bare single-segment
+    /// invocation (and the exact CLI execute topic) is gated; result and
+    /// unrelated topics are not.
+    #[test]
+    fn surface_predicate_gates_only_bare_invocation() {
+        use crate::access::is_user_invocable_surface as gated;
+        assert!(gated("tool.v1.execute.save_identity"));
+        assert!(gated("cli.v1.command.execute"));
+        assert!(!gated("tool.v1.execute.save_identity.result"));
+        assert!(!gated("tool.v1.execute.result"));
+        assert!(!gated("tool.v1.execute."));
+        assert!(!gated("session.v1.append"));
+        assert!(!gated("tool.v1.response.describe.foo"));
+    }
 }
