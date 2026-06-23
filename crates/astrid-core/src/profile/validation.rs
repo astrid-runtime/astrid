@@ -197,12 +197,16 @@ impl ProcessConfig {
     }
 }
 
-/// Same character set + length cap the kernel enforces for a
-/// `CapsuleId`: non-empty, lowercase alphanumeric and hyphens only, up to
-/// [`MAX_CAPSULE_GRANT_LEN`] characters. A grant entry that cannot name a
-/// real capsule is rejected on load — fail-closed: a malformed grant never
-/// silently widens (or, by failing the whole profile, narrows) access in a
-/// way the operator did not intend.
+/// Validate a single capsule-grant entry against the same character set a
+/// `CapsuleId` enforces — non-empty, lowercase alphanumeric and hyphens
+/// only — plus a defensive length cap of [`MAX_CAPSULE_GRANT_LEN`].
+///
+/// The length cap is the profile's own sanity bound on operator-supplied
+/// input, NOT a mirror of `CapsuleId`: `astrid_capsule::CapsuleId::validate`
+/// caps the charset but imposes no length limit. A grant entry that cannot
+/// name a real capsule is rejected on load — fail-closed: a malformed grant
+/// never silently widens (or, by failing the whole profile, narrows) access
+/// in a way the operator did not intend.
 fn validate_capsule_grant(id: &str) -> ProfileResult<()> {
     if id.is_empty() {
         return Err(ProfileError::Invalid(

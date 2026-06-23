@@ -532,17 +532,37 @@ fn modify_response(
 /// the same entry is an idempotent rename rather than a duplicate; adding
 /// a present entry or removing an absent one is a no-op. Shared by the
 /// group and capsule mechanisms so they behave identically.
+///
+/// On a no-op (the resulting set equals the original) `target` is left
+/// byte-for-byte unchanged — including its element order. The delta is
+/// computed on a scratch copy and written back only when the set actually
+/// changed, so an order-only churn (e.g. removing then re-adding a present
+/// entry) is never reflected back to the caller as a mutated profile that
+/// then goes unpersisted (`changed=false`).
 fn apply_set_delta(target: &mut Vec<String>, add: &[String], remove: &[String]) -> bool {
-    let before: std::collections::HashSet<String> = target.iter().cloned().collect();
-    target.retain(|e| !remove.contains(e));
+    // Build the resulting order on a scratch copy WITHOUT touching `target`:
+    // surviving entries keep their order, then new additions append.
+    let mut next: Vec<String> = target
+        .iter()
+        .filter(|e| !remove.contains(e))
+        .cloned()
+        .collect();
     for entry in add {
-        if !target.iter().any(|existing| existing == entry) {
-            target.push(entry.clone());
+        if !next.contains(entry) {
+            next.push(entry.clone());
         }
     }
-    let after: std::collections::HashSet<&String> = target.iter().collect();
-    let before_refs: std::collections::HashSet<&String> = before.iter().collect();
-    after != before_refs
+    // Order-insensitive set comparison; the borrows end with the block so the
+    // write-back below can take `&mut *target`.
+    let changed = {
+        let before: std::collections::HashSet<&String> = target.iter().collect();
+        let after: std::collections::HashSet<&String> = next.iter().collect();
+        before != after
+    };
+    if changed {
+        *target = next;
+    }
+    changed
 }
 
 /// Does `caller` hold the admin-tier global `agent:list` capability

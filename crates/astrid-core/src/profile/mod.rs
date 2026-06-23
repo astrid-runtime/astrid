@@ -87,8 +87,10 @@ pub const MAX_GROUP_NAME_LEN: usize = 64;
 
 /// Maximum length of a single entry in [`PrincipalProfile::capsules`].
 ///
-/// Matches the de-facto capsule-id length the kernel accepts; an entry
-/// longer than this can never name a real capsule, so reject it on load.
+/// A defensive sanity bound on operator-supplied grant entries — `CapsuleId`
+/// itself caps only the charset, not the length, so this is the profile's own
+/// limit rather than a kernel-enforced capsule-id cap. An entry longer than
+/// this is well beyond any realistic capsule id, so reject it on load.
 pub const MAX_CAPSULE_GRANT_LEN: usize = 128;
 
 /// Result alias for profile operations.

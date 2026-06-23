@@ -181,7 +181,7 @@ impl CapsuleAccessResolver {
         // (3) Admin bypass — reuse the SAME machinery `authorize_request`
         // uses. A `*` holder (admin) bypasses the per-principal filter.
         let groups = self.groups.load();
-        let check = CapabilityCheck::new(profile.as_ref(), groups.as_ref(), pid.clone());
+        let check = CapabilityCheck::new(profile.as_ref(), groups.as_ref(), pid);
         if check.has("*") {
             return true;
         }
