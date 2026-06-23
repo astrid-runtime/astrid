@@ -105,17 +105,18 @@ pub(crate) fn install_from_shuttle(shuttle_path: &Path, opts: &InitOpts) -> anyh
         (None, None)
     };
 
-    // 4. Manifest-hash integrity: the lock's manifest_hash must match
-    //    the manifest bytes the archive actually carries.
-    if let Some(recorded) = &lock.manifest_hash {
-        let actual = manifest_hash(&manifest_bytes);
-        if recorded != &actual {
-            bail!(
-                "manifest hash mismatch: lock records {recorded}, archive Distro.toml hashes to \
-                 {actual} — the shuttle is inconsistent or tampered"
-            );
-        }
-    }
+    // 4. Manifest-hash integrity. The signature covers the *lock*, not
+    //    `Distro.toml`; `manifest_hash` is the ONLY thing binding the
+    //    manifest to the signed lock. Without it, an attacker could keep
+    //    a legitimately-signed lock+sig+pubkey and swap only the manifest
+    //    (malicious `[capsule.env]`, altered selection) — capsule bytes
+    //    stay pinned but env/selection become unauthenticated.
+    //
+    //    Therefore: when the shuttle is signed (verified above), the lock
+    //    MUST carry a `manifest_hash` AND it must match — a missing one
+    //    is a hard fail. For an unsigned `--allow-unsigned` install there
+    //    is no signed lock to bind to, so the check stays best-effort.
+    check_manifest_binding(&distro_id, signer.is_some(), &lock, &manifest_bytes)?;
 
     eprintln!(
         "{}",
@@ -142,11 +143,20 @@ pub(crate) fn install_from_shuttle(shuttle_path: &Path, opts: &InitOpts) -> anyh
     )?;
     crate::commands::init::write_env_files(&home, &selected, &vars)?;
 
-    // 6. Install each selected capsule from the verified mirror.
+    // 6. Install each selected capsule from the verified mirror. The
+    //    sealed lock IS the resolved truth offline — no resolution
+    //    happens here — so the per-capsule resolved_ref is carried over
+    //    from the sealed lock, never recomputed from the manifest.
+    let sealed_refs: std::collections::HashMap<&str, Option<String>> = lock
+        .capsules
+        .iter()
+        .map(|c| (c.name.as_str(), c.resolved_ref.clone()))
+        .collect();
     let locked = install_selected_capsules(
         &home,
         mirror,
         &selected,
+        &sealed_refs,
         signer.as_deref(),
         signature.as_deref(),
     )?;
@@ -185,6 +195,7 @@ fn install_selected_capsules(
     home: &AstridHome,
     mirror: &Path,
     selected: &[super::manifest::DistroCapsule],
+    sealed_refs: &std::collections::HashMap<&str, Option<String>>,
     signer: Option<&str>,
     signature: Option<&str>,
 ) -> anyhow::Result<Vec<LockedCapsule>> {
@@ -203,7 +214,10 @@ fn install_selected_capsules(
             format!("blake3:{}", blake3::hash(&bytes).to_hex())
         };
 
-        let resolved_ref = cap.resolved_ref();
+        // Carry the sealed lock's resolved_ref through verbatim — the
+        // shuttle was sealed online with the truly-resolved ref; nothing
+        // is resolved or guessed offline.
+        let resolved_ref = sealed_refs.get(cap.name.as_str()).cloned().flatten();
         crate::commands::capsule::install::install_offline_capsule(
             &file,
             home,
@@ -233,6 +247,44 @@ fn install_selected_capsules(
         eprintln!("  installed {}", cap.name);
     }
     Ok(locked)
+}
+
+/// Enforce the manifest↔lock binding (step 4 of the install pipeline).
+///
+/// The distro signature covers the *lock*, not `Distro.toml`. The lock's
+/// `manifest_hash` is the only thing transitively binding the manifest
+/// to that signature. So when the shuttle is `signed`, a `manifest_hash`
+/// is mandatory and must match — a `None` is a hard fail (an attacker
+/// could otherwise keep a signed lock+sig+pubkey and swap only the
+/// manifest, leaving env/selection unauthenticated). For an unsigned
+/// install there is no signed lock to bind against, so a `None` is
+/// tolerated and a present hash is still checked best-effort.
+///
+/// Pure (no I/O) so the binding gate is unit-testable.
+fn check_manifest_binding(
+    distro_id: &str,
+    signed: bool,
+    lock: &DistroLock,
+    manifest_bytes: &[u8],
+) -> anyhow::Result<()> {
+    let actual = manifest_hash(manifest_bytes);
+    match &lock.manifest_hash {
+        Some(recorded) => {
+            if recorded != &actual {
+                bail!(
+                    "manifest hash mismatch: lock records {recorded}, archive Distro.toml hashes \
+                     to {actual} — the shuttle is inconsistent or tampered"
+                );
+            }
+            Ok(())
+        },
+        None if signed => bail!(
+            "signed shuttle for '{distro_id}' is missing its manifest_hash binding — refusing. \
+             The signature covers the lock, not Distro.toml; without manifest_hash the manifest \
+             (env/selection) is unauthenticated and could be swapped."
+        ),
+        None => Ok(()),
+    }
 }
 
 /// Verify the per-capsule blake3 of every lock entry against the bytes
@@ -405,5 +457,93 @@ mod tests {
 
         let attacker = KeyPair::generate();
         assert!(sign::verify_lock(&lock, &sig, &attacker.export_public_key()).is_err());
+    }
+
+    fn lock_with_manifest_hash(manifest_hash: Option<String>) -> DistroLock {
+        DistroLock {
+            schema_version: 1,
+            distro: DistroLockMeta {
+                id: "test".into(),
+                version: "0.1.0".into(),
+                resolved_at: "1970-01-01T00:00:00+00:00".into(),
+            },
+            capsules: vec![],
+            manifest_hash,
+        }
+    }
+
+    #[test]
+    fn signed_shuttle_without_manifest_hash_hard_fails() {
+        // FIX 3: a signed shuttle whose lock omits manifest_hash leaves
+        // the manifest (env/selection) unauthenticated — must be refused.
+        let manifest_bytes = b"schema-version = 1\n";
+        let lock = lock_with_manifest_hash(None);
+        let err = check_manifest_binding("test", true, &lock, manifest_bytes).unwrap_err();
+        assert!(err.to_string().contains("manifest_hash binding"), "got: {err}");
+    }
+
+    #[test]
+    fn signed_shuttle_with_matching_manifest_hash_passes() {
+        let manifest_bytes = b"schema-version = 1\n";
+        let lock = lock_with_manifest_hash(Some(manifest_hash(manifest_bytes)));
+        assert!(check_manifest_binding("test", true, &lock, manifest_bytes).is_ok());
+    }
+
+    #[test]
+    fn signed_shuttle_with_wrong_manifest_hash_fails() {
+        let lock = lock_with_manifest_hash(Some(manifest_hash(b"original")));
+        let err = check_manifest_binding("test", true, &lock, b"TAMPERED").unwrap_err();
+        assert!(err.to_string().contains("manifest hash mismatch"), "got: {err}");
+    }
+
+    #[test]
+    fn unsigned_shuttle_without_manifest_hash_is_tolerated() {
+        // Unsigned (--allow-unsigned): there is no signed lock to bind
+        // against, so a missing manifest_hash is acceptable.
+        let lock = lock_with_manifest_hash(None);
+        assert!(check_manifest_binding("test", false, &lock, b"anything").is_ok());
+    }
+
+    #[test]
+    fn unsigned_shuttle_with_present_manifest_hash_still_checked() {
+        // A present hash is still verified best-effort even when unsigned.
+        let lock = lock_with_manifest_hash(Some(manifest_hash(b"original")));
+        let err = check_manifest_binding("test", false, &lock, b"TAMPERED").unwrap_err();
+        assert!(err.to_string().contains("manifest hash mismatch"), "got: {err}");
+    }
+
+    #[test]
+    fn offline_carries_sealed_resolved_ref_not_a_guess() {
+        // FIX 1 (offline): the resolved_ref written into the user's lock
+        // must come from the SEALED lock, never recomputed. Build the
+        // name→resolved_ref map the install path uses and assert it maps
+        // to the sealed ref, independent of the capsule's manifest fields.
+        let sealed = DistroLock {
+            schema_version: 1,
+            distro: DistroLockMeta {
+                id: "test".into(),
+                version: "0.1.0".into(),
+                resolved_at: "1970-01-01T00:00:00+00:00".into(),
+            },
+            capsules: vec![LockedCapsule {
+                name: "astrid-capsule-cli".into(),
+                version: "0.1.0".into(),
+                source: "@org/cli".into(),
+                hash: "blake3:abc".into(),
+                // Sealed ref deliberately differs from any `v{version}`
+                // guess to prove it is carried, not derived.
+                resolved_ref: Some("v0.1.0-actually-resolved".into()),
+            }],
+            manifest_hash: Some("blake3:def".into()),
+        };
+        let sealed_refs: std::collections::HashMap<&str, Option<String>> = sealed
+            .capsules
+            .iter()
+            .map(|c| (c.name.as_str(), c.resolved_ref.clone()))
+            .collect();
+        assert_eq!(
+            sealed_refs.get("astrid-capsule-cli").cloned().flatten().as_deref(),
+            Some("v0.1.0-actually-resolved"),
+        );
     }
 }
