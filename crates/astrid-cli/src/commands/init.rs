@@ -17,10 +17,6 @@ use super::distro::lock::{
 use super::distro::manifest::{DistroCapsule, DistroManifest, parse_manifest};
 use crate::theme::Theme;
 
-/// Default distro name when none specified.
-#[allow(dead_code)]
-const DEFAULT_DISTRO: &str = "astralis";
-
 /// Default GitHub org for distro repos.
 const DEFAULT_ORG: &str = "unicity-astrid";
 
@@ -434,11 +430,12 @@ fn collect_variables_headless(
 
     for var_name in sorted {
         let env_key = format!("ASTRID_VAR_{}", var_name.to_uppercase());
+        let var_def = variables.get(var_name);
         let value = cli_vars
             .get(var_name)
             .cloned()
             .or_else(|| env_lookup(&env_key))
-            .or_else(|| variables.get(var_name).and_then(|d| d.default.clone()))
+            .or_else(|| var_def.and_then(|d| d.default.clone()))
             .ok_or_else(|| {
                 anyhow::anyhow!(
                     "required variable '{var_name}' has no value \
@@ -446,7 +443,7 @@ fn collect_variables_headless(
                 )
             })?;
 
-        let is_secret = variables.get(var_name).is_some_and(|d| d.secret);
+        let is_secret = var_def.is_some_and(|d| d.secret);
         if is_secret {
             tracing::debug!(var = %var_name, "resolved distro variable [secret]");
         } else {

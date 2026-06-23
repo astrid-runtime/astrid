@@ -143,17 +143,17 @@ pub(crate) fn install_from_shuttle(shuttle_path: &Path, opts: &InitOpts) -> anyh
     // 6. Install each selected capsule from the verified mirror. The
     //    sealed lock IS the resolved truth offline — no resolution
     //    happens here — so the per-capsule resolved_ref is carried over
-    //    from the sealed lock, never recomputed from the manifest.
-    let sealed_refs: std::collections::HashMap<&str, Option<String>> = lock
-        .capsules
-        .iter()
-        .map(|c| (c.name.as_str(), c.resolved_ref.clone()))
-        .collect();
+    //    from the sealed lock, never recomputed from the manifest. The
+    //    map also carries each capsule's already-verified blake3 (proved
+    //    equal to the mirror bytes by `verify_capsule_hashes` above) so
+    //    the install does not re-read and re-hash every capsule.
+    let sealed_capsules: std::collections::HashMap<&str, &LockedCapsule> =
+        lock.capsules.iter().map(|c| (c.name.as_str(), c)).collect();
     let locked = install_selected_capsules(
         &home,
         mirror,
         &selected,
-        &sealed_refs,
+        &sealed_capsules,
         signer.as_deref(),
         signature.as_deref(),
     )?;
@@ -185,14 +185,15 @@ pub(crate) fn install_from_shuttle(shuttle_path: &Path, opts: &InitOpts) -> anyh
 /// the resolved [`LockedCapsule`] entries for the user's lock.
 ///
 /// Capsule blake3 was already validated against the lock up front by
-/// [`verify_capsule_hashes`]; this re-reads the installed `meta.json` to
-/// record the content-addressed WASM hash (falling back to the archive
-/// blake3 if meta is absent).
+/// [`verify_capsule_hashes`] (file bytes proven == lock hash), so this
+/// does NOT re-read or re-hash the archive: it reads the installed
+/// `meta.json` for the content-addressed WASM hash and falls back to the
+/// sealed lock's already-verified blake3 if meta is absent.
 fn install_selected_capsules(
     home: &AstridHome,
     mirror: &Path,
     selected: &[super::manifest::DistroCapsule],
-    sealed_refs: &std::collections::HashMap<&str, Option<String>>,
+    sealed_capsules: &std::collections::HashMap<&str, &LockedCapsule>,
     signer: Option<&str>,
     signature: Option<&str>,
 ) -> anyhow::Result<Vec<LockedCapsule>> {
@@ -205,16 +206,12 @@ fn install_selected_capsules(
                 cap.name
             );
         }
-        let archive_hash = {
-            let bytes = std::fs::read(&file)
-                .with_context(|| format!("failed to read mirrored capsule {}", cap.name))?;
-            format!("blake3:{}", blake3::hash(&bytes).to_hex())
-        };
 
-        // Carry the sealed lock's resolved_ref through verbatim — the
-        // shuttle was sealed online with the truly-resolved ref; nothing
-        // is resolved or guessed offline.
-        let resolved_ref = sealed_refs.get(cap.name.as_str()).cloned().flatten();
+        // The sealed lock entry: carries both the truly-resolved ref (sealed
+        // online; nothing is resolved or guessed offline) and the
+        // already-verified blake3 used as the hash fallback below.
+        let sealed = sealed_capsules.get(cap.name.as_str());
+        let resolved_ref = sealed.and_then(|c| c.resolved_ref.clone());
         crate::commands::capsule::install::install_offline_capsule(
             &file,
             home,
@@ -227,12 +224,16 @@ fn install_selected_capsules(
         .with_context(|| format!("failed to install capsule {}", cap.name))?;
 
         // Record the installed content-addressed WASM hash from meta,
-        // falling back to the archive blake3.
+        // falling back to the sealed lock's already-verified archive blake3
+        // (no re-read: `verify_capsule_hashes` proved file bytes == this).
         let target_dir =
             crate::commands::capsule::install::resolve_target_dir(home, &cap.name, false)?;
         let installed_hash = crate::commands::capsule::meta::read_meta(&target_dir)
             .and_then(|m| m.wasm_hash)
-            .map_or(archive_hash, |h| format!("blake3:{h}"));
+            .map_or_else(
+                || sealed.map(|c| c.hash.clone()).unwrap_or_default(),
+                |h| format!("blake3:{h}"),
+            );
 
         locked.push(LockedCapsule {
             name: cap.name.clone(),
@@ -379,19 +380,19 @@ mod tests {
         let entries = vec![
             shuttle::ShuttleEntry {
                 path: shuttle::MANIFEST_NAME.into(),
-                bytes: manifest_bytes,
+                content: shuttle::ShuttleContent::Bytes(manifest_bytes),
             },
             shuttle::ShuttleEntry {
                 path: shuttle::LOCK_NAME.into(),
-                bytes: lock_toml.into_bytes(),
+                content: shuttle::ShuttleContent::Bytes(lock_toml.into_bytes()),
             },
             shuttle::ShuttleEntry {
                 path: shuttle::SIG_NAME.into(),
-                bytes: sig.into_bytes(),
+                content: shuttle::ShuttleContent::Bytes(sig.into_bytes()),
             },
             shuttle::ShuttleEntry {
                 path: shuttle::capsule_member_path("astrid-capsule-cli"),
-                bytes: capsule_bytes.to_vec(),
+                content: shuttle::ShuttleContent::Bytes(capsule_bytes.to_vec()),
             },
         ];
         let out = dir.join("test.shuttle");
@@ -550,17 +551,15 @@ mod tests {
             }],
             manifest_hash: Some("blake3:def".into()),
         };
-        let sealed_refs: std::collections::HashMap<&str, Option<String>> = sealed
+        let sealed_capsules: std::collections::HashMap<&str, &LockedCapsule> = sealed
             .capsules
             .iter()
-            .map(|c| (c.name.as_str(), c.resolved_ref.clone()))
+            .map(|c| (c.name.as_str(), c))
             .collect();
         assert_eq!(
-            sealed_refs
+            sealed_capsules
                 .get("astrid-capsule-cli")
-                .cloned()
-                .flatten()
-                .as_deref(),
+                .and_then(|c| c.resolved_ref.as_deref()),
             Some("v0.1.0-actually-resolved"),
         );
     }
