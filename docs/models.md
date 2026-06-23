@@ -195,7 +195,8 @@ The `astrid-capsule-openai` capsule targets OpenAI's Responses API
   capsule falls back to the full hardcoded catalog -- the same models you see
   in `astrid models list` on an offline install.
 
-The default model env is `gpt-5.5` (overridable via `astrid capsule config`).
+The default model env is `gpt-5.5` (overridable via
+`astrid capsule config astrid-capsule-openai`).
 
 ### openai-compat capsule
 
@@ -206,7 +207,8 @@ server (LM Studio, vLLM, llama.cpp, a remote OpenAI-compatible API) via
 - Calls `GET {base_url}/v1/models` with the configured bearer at describe time.
 - Returns the live list enriched where possible. For local servers that expose
   no capability info, entries get conservative defaults; the operator can
-  override `context_window` and `max_output_tokens` via `astrid capsule config`.
+  override `context_window` and `max_output_tokens` via
+  `astrid capsule config astrid-capsule-openai-compat`.
 
 Because the openai-compat capsule connects to an arbitrary endpoint, model ids
 can be anything the server returns -- including names with embedded colons
