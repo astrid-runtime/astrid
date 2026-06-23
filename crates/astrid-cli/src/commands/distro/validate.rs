@@ -41,6 +41,11 @@ fn extract_variable_refs(template: &str) -> Vec<&str> {
 /// - At least one capsule with role = "uplink"
 /// - Variable references in capsule env resolve to defined variables
 /// - Requires version strings are valid semver requirements
+#[allow(
+    clippy::too_many_lines,
+    reason = "flat sequence of independent validation checks; \
+              inlining keeps the full ruleset auditable in one place"
+)]
 pub(crate) fn validate_manifest(manifest: &DistroManifest) -> anyhow::Result<()> {
     // Schema version.
     if manifest.schema_version != SCHEMA_VERSION {
