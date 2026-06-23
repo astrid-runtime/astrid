@@ -114,9 +114,10 @@ pub async fn list_capsules(
     req: Request<axum::body::Body>,
 ) -> GatewayResult<Json<CapsuleListResponse>> {
     let caller = caller_from(&req)?.clone();
-    let mut client = KernelClient::connect(caller.principal)
+    let mut client = KernelClient::connect(caller.principal.clone())
         .await
-        .map_err(daemon_internal)?;
+        .map_err(daemon_internal)?
+        .with_device_key_id(caller.device_key_id.clone());
     let resp = client
         .request(KernelRequest::ListCapsules)
         .await
@@ -195,9 +196,10 @@ pub async fn install_capsule(
             (body.source, body.workspace, None)
         };
 
-    let mut client = KernelClient::connect(caller.principal)
+    let mut client = KernelClient::connect(caller.principal.clone())
         .await
-        .map_err(daemon_internal)?;
+        .map_err(daemon_internal)?
+        .with_device_key_id(caller.device_key_id.clone());
     let resp = client
         .request(KernelRequest::InstallCapsule { source, workspace })
         .await
@@ -391,9 +393,10 @@ pub async fn get_capsule(
     req: Request<axum::body::Body>,
 ) -> GatewayResult<Json<CapsuleDetail>> {
     let caller = caller_from(&req)?.clone();
-    let mut client = KernelClient::connect(caller.principal)
+    let mut client = KernelClient::connect(caller.principal.clone())
         .await
-        .map_err(daemon_internal)?;
+        .map_err(daemon_internal)?
+        .with_device_key_id(caller.device_key_id.clone());
     let resp = client
         .request(KernelRequest::GetCapsuleMetadata)
         .await

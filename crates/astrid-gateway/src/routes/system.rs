@@ -32,9 +32,10 @@ pub async fn get_status(
     req: Request<axum::body::Body>,
 ) -> GatewayResult<Json<DaemonStatus>> {
     let caller = caller_from(&req)?.clone();
-    let mut client = KernelClient::connect(caller.principal)
+    let mut client = KernelClient::connect(caller.principal.clone())
         .await
-        .map_err(daemon_internal)?;
+        .map_err(daemon_internal)?
+        .with_device_key_id(caller.device_key_id.clone());
     let resp = client
         .request(KernelRequest::GetStatus)
         .await
@@ -63,9 +64,10 @@ pub async fn get_readiness(
     req: Request<axum::body::Body>,
 ) -> GatewayResult<Json<AgentLoopReadiness>> {
     let caller = caller_from(&req)?.clone();
-    let mut client = KernelClient::connect(caller.principal)
+    let mut client = KernelClient::connect(caller.principal.clone())
         .await
-        .map_err(daemon_internal)?;
+        .map_err(daemon_internal)?
+        .with_device_key_id(caller.device_key_id.clone());
     let resp = client
         .request(KernelRequest::GetAgentReadiness)
         .await
@@ -94,9 +96,10 @@ pub async fn reload_capsules(
     req: Request<axum::body::Body>,
 ) -> GatewayResult<StatusCode> {
     let caller = caller_from(&req)?.clone();
-    let mut client = KernelClient::connect(caller.principal)
+    let mut client = KernelClient::connect(caller.principal.clone())
         .await
-        .map_err(daemon_internal)?;
+        .map_err(daemon_internal)?
+        .with_device_key_id(caller.device_key_id.clone());
     let resp = client
         .request(KernelRequest::ReloadCapsules)
         .await
