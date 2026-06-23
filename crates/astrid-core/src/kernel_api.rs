@@ -759,6 +759,11 @@ pub struct PairTokenRedeemed {
     /// Lets the redeemer verify the kernel registered the key it
     /// sent rather than substituting one of its own.
     pub public_key_fingerprint: String,
+    /// Deterministic `key_id` of the registered device key (the stable
+    /// per-device handle derived from the pubkey). The gateway mints the new
+    /// device's bearer scoped to THIS `key_id` so the device authenticates
+    /// with — and is attenuated to — its own registered key.
+    pub key_id: String,
 }
 
 /// Summary of an outstanding invite returned by

@@ -19,7 +19,7 @@ use axum::http::Request;
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
-use crate::auth::{CallerContext, mint_bearer};
+use crate::auth::{CallerContext, mint_bearer, mint_bearer_scoped};
 use crate::error::{ErrorBody, GatewayError, GatewayResult};
 use crate::state::GatewayState;
 
@@ -64,6 +64,12 @@ pub struct MeResponse {
     pub principal: PrincipalId,
     /// Bearer expiry — clients can use this to schedule a refresh.
     pub expires_at_epoch: u64,
+    /// The device `key_id` this session is bound to, when the bearer is
+    /// device-scoped. Omitted for a legacy full-authority session. Lets a
+    /// client see (and surface to the user) which paired device it is acting
+    /// as, and what scope dimension a refresh will preserve.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub device_key_id: Option<String>,
 }
 
 /// Handler: redeem an invite token, mint a principal, return a
@@ -177,6 +183,7 @@ pub async fn get_me(req: Request<axum::body::Body>) -> GatewayResult<Json<MeResp
     Ok(Json(MeResponse {
         principal: caller.principal.clone(),
         expires_at_epoch: caller.expires_at_epoch,
+        device_key_id: caller.device_key_id.clone(),
     }))
 }
 
@@ -227,7 +234,12 @@ pub struct PairDeviceRedeemResponse {
     pub principal: PrincipalId,
     /// SHA-256 fingerprint of the registered key.
     pub public_key_fingerprint: String,
-    /// Signed bearer token for subsequent requests.
+    /// Deterministic `key_id` of the registered device key. The session
+    /// bearer is scoped to this `key_id`, so the device authenticates with —
+    /// and is attenuated to — its own registered key at the kernel cap-gate.
+    pub key_id: String,
+    /// Signed bearer token for subsequent requests. Device-scoped: it carries
+    /// `key_id` so the kernel applies this device's scope.
     pub session_token: String,
     /// Wall-clock epoch the bearer expires.
     pub session_expires_at_epoch: u64,
@@ -258,7 +270,10 @@ pub async fn post_pair_device_issue(
         .cloned()
         .ok_or(GatewayError::Unauthorized)?;
     let body: PairDeviceIssueRequest = crate::routes::principals::read_json_body(req).await?;
-    let client = state.admin_client(caller.principal)?;
+    // Carry the issuer's device scope to the kernel: a use-only paired device
+    // calling `pair-device issue` must be denied at the cap-gate even though
+    // its principal holds `self:auth:pair` — the device's deny-list fences it.
+    let client = state.admin_client_for(&caller)?;
     let resp = client
         .request(AdminRequestKind::PairDeviceIssue {
             expires_secs: body.expires_secs,
@@ -351,9 +366,13 @@ pub async fn post_pair_device_redeem(
         },
     };
 
-    let session_token = mint_bearer(
+    // The new device's bearer is scoped to ITS key_id (returned by the kernel
+    // redeem), so the device authenticates as — and is attenuated to — its own
+    // registered key at the cap-gate, not the principal's full authority.
+    let session_token = mint_bearer_scoped(
         &state.signing.signer,
         &redeemed.principal,
+        &redeemed.key_id,
         state.config.session_lifetime_secs,
     );
     let session_expires_at_epoch = std::time::SystemTime::now()
@@ -364,6 +383,7 @@ pub async fn post_pair_device_redeem(
     Ok(Json(PairDeviceRedeemResponse {
         principal: redeemed.principal,
         public_key_fingerprint: redeemed.public_key_fingerprint,
+        key_id: redeemed.key_id,
         session_token,
         session_expires_at_epoch,
     }))
@@ -396,11 +416,23 @@ pub async fn post_refresh(
         .extensions()
         .get::<CallerContext>()
         .ok_or(GatewayError::Unauthorized)?;
-    let session_token = mint_bearer(
-        &state.signing.signer,
-        &caller.principal,
-        state.config.session_lifetime_secs,
-    );
+    // A refresh must NEVER drop or change the device-scope dimension: a
+    // scoped bearer re-mints scoped to the SAME key_id, a legacy bearer
+    // re-mints as legacy. Otherwise a scoped device could shed its
+    // attenuation simply by refreshing.
+    let session_token = match &caller.device_key_id {
+        Some(key_id) => mint_bearer_scoped(
+            &state.signing.signer,
+            &caller.principal,
+            key_id,
+            state.config.session_lifetime_secs,
+        ),
+        None => mint_bearer(
+            &state.signing.signer,
+            &caller.principal,
+            state.config.session_lifetime_secs,
+        ),
+    };
     let session_expires_at_epoch = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs())

@@ -125,7 +125,7 @@ pub async fn get_quotas(
     let principal = PrincipalId::new(&id)
         .map_err(|e| GatewayError::BadRequest(format!("invalid principal id: {e}")))?;
     let caller = caller_from(&req)?.clone();
-    let client = state.admin_client(caller.principal)?;
+    let client = state.admin_client_for(&caller)?;
     let resp = client
         .request(AdminRequestKind::QuotaGet { principal })
         .await
@@ -164,7 +164,7 @@ pub async fn get_usage(
     let principal = PrincipalId::new(&id)
         .map_err(|e| GatewayError::BadRequest(format!("invalid principal id: {e}")))?;
     let caller = caller_from(&req)?.clone();
-    let client = state.admin_client(caller.principal)?;
+    let client = state.admin_client_for(&caller)?;
     let resp = client
         .request(AdminRequestKind::UsageGet { principal })
         .await
@@ -201,7 +201,7 @@ pub async fn set_quotas(
         .map_err(|e| GatewayError::BadRequest(format!("invalid principal id: {e}")))?;
     let caller = caller_from(&req)?.clone();
     let body: QuotaRequest = read_json_body(req).await?;
-    let client = state.admin_client(caller.principal)?;
+    let client = state.admin_client_for(&caller)?;
     let resp = client
         .request(AdminRequestKind::QuotaSet {
             principal,

@@ -297,6 +297,28 @@ impl GatewayState {
         })?;
         Ok(crate::bus_admin::BusAdminClient::new(bus, caller))
     }
+
+    /// Build a bus-direct admin client for an authenticated caller, carrying
+    /// the caller's device scope through to the kernel cap-gate.
+    ///
+    /// Use this for every admin op behind the auth middleware: it stamps the
+    /// caller's `device_key_id` (when the bearer was device-scoped) onto each
+    /// outbound request so a paired device's scope is enforced kernel-side.
+    /// The two unauthenticated redeem routes (which act as the bootstrap
+    /// `default` principal) keep [`admin_client`](Self::admin_client) — their
+    /// caller has no device scope.
+    ///
+    /// # Errors
+    /// Returns an internal error if the state was built without a live event
+    /// bus (the standalone tests-only constructor).
+    pub fn admin_client_for(
+        &self,
+        caller: &crate::auth::CallerContext,
+    ) -> Result<crate::bus_admin::BusAdminClient, crate::error::GatewayError> {
+        Ok(self
+            .admin_client(caller.principal.clone())?
+            .with_device_key_id(caller.device_key_id.clone()))
+    }
 }
 
 #[cfg(test)]

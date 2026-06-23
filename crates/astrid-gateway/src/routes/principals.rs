@@ -96,7 +96,7 @@ pub async fn list_principals(
     req: Request<axum::body::Body>,
 ) -> GatewayResult<Json<PrincipalListResponse>> {
     let caller = caller_from(&req)?;
-    let client = state.admin_client(caller.principal.clone())?;
+    let client = state.admin_client_for(caller)?;
     let resp = client
         .request(AdminRequestKind::AgentList)
         .await
@@ -133,7 +133,7 @@ pub async fn get_principal(
     let target = PrincipalId::new(&id)
         .map_err(|e| GatewayError::BadRequest(format!("invalid principal id: {e}")))?;
     let caller = caller_from(&req)?;
-    let client = state.admin_client(caller.principal.clone())?;
+    let client = state.admin_client_for(caller)?;
     let resp = client
         .request(AdminRequestKind::AgentList)
         .await
@@ -168,7 +168,7 @@ pub async fn create_principal(
 ) -> GatewayResult<Json<serde_json::Value>> {
     let caller = caller_from(&req)?.clone();
     let body: CreatePrincipalRequest = read_json_body(req).await?;
-    let client = state.admin_client(caller.principal)?;
+    let client = state.admin_client_for(&caller)?;
     let resp = client
         .request(AdminRequestKind::AgentCreate {
             name: body.name,
@@ -211,7 +211,7 @@ pub async fn delete_principal(
     let principal = PrincipalId::new(&id)
         .map_err(|e| GatewayError::BadRequest(format!("invalid principal id: {e}")))?;
     let caller = caller_from(&req)?.clone();
-    let client = state.admin_client(caller.principal)?;
+    let client = state.admin_client_for(&caller)?;
     let resp = client
         .request(AdminRequestKind::AgentDelete { principal })
         .await
@@ -275,7 +275,7 @@ async fn set_enabled(
     let principal = PrincipalId::new(&id)
         .map_err(|e| GatewayError::BadRequest(format!("invalid principal id: {e}")))?;
     let caller = caller_from(&req)?.clone();
-    let client = state.admin_client(caller.principal)?;
+    let client = state.admin_client_for(&caller)?;
     let kind = if enabled {
         AdminRequestKind::AgentEnable { principal }
     } else {
@@ -311,7 +311,7 @@ pub async fn modify_principal(
         .map_err(|e| GatewayError::BadRequest(format!("invalid principal id: {e}")))?;
     let caller = caller_from(&req)?.clone();
     let body: ModifyPrincipalRequest = read_json_body(req).await?;
-    let client = state.admin_client(caller.principal)?;
+    let client = state.admin_client_for(&caller)?;
     let resp = client
         .request(AdminRequestKind::AgentModify {
             principal,

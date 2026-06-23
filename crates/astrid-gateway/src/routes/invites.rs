@@ -81,7 +81,7 @@ pub async fn issue_invite(
         .map_err(|e| GatewayError::BadRequest(format!("body read: {e}")))?;
     let body: IssueRequest = serde_json::from_slice(&bytes)?;
 
-    let client = state.admin_client(caller.principal)?;
+    let client = state.admin_client_for(&caller)?;
     let resp = client
         .request(AdminRequestKind::InviteIssue {
             group: body.group,
@@ -148,7 +148,7 @@ pub async fn list_invites(
         .get::<CallerContext>()
         .cloned()
         .ok_or(GatewayError::Unauthorized)?;
-    let client = state.admin_client(caller.principal)?;
+    let client = state.admin_client_for(&caller)?;
     let resp = client
         .request(AdminRequestKind::InviteList)
         .await
@@ -184,7 +184,7 @@ pub async fn revoke_invite(
         .get::<CallerContext>()
         .cloned()
         .ok_or(GatewayError::Unauthorized)?;
-    let client = state.admin_client(caller.principal)?;
+    let client = state.admin_client_for(&caller)?;
     let resp = client
         .request(AdminRequestKind::InviteRevoke { token: fingerprint })
         .await
