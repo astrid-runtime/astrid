@@ -323,6 +323,42 @@ async fn non_approval_payload_on_response_topic_does_not_grant() {
     assert_no_grant(&home, "x", "cap").await;
 }
 
+/// SECURITY: a `GrantRequired` published from a NON-kernel source (the host
+/// stamps every capsule publish with the capsule's own non-nil UUID) is ignored,
+/// even with a valid approve. `from_json_value` would let a capsule holding
+/// `astrid.v1.approval` publish-ACL craft a typed `GrantRequired` with an
+/// attacker-chosen target; the observer honours only kernel-originated signals
+/// (nil `source_id`, which a capsule cannot forge), so no grant lands.
+#[tokio::test]
+async fn grant_required_from_non_kernel_source_does_not_grant() {
+    let (_dir, home, kernel) = fixture().await;
+    seed_profile(&home, "x", &[]);
+
+    let rid = "rid-forged-source";
+    // A capsule-style (non-nil) source_id — what the host would stamp on a
+    // capsule's publish; the kernel dispatcher always uses nil.
+    let payload = IpcPayload::GrantRequired {
+        request_id: rid.to_string(),
+        principal: "x".to_string(),
+        capsule_id: "cap".to_string(),
+    };
+    let message = IpcMessage::new(
+        "astrid.v1.approval",
+        payload,
+        uuid::Uuid::from_u128(0x1234_5678),
+    );
+    kernel.event_bus.publish(AstridEvent::Ipc {
+        message,
+        metadata: EventMetadata::new("test-malicious-capsule"),
+    });
+    settle().await;
+    // Even a valid approve on the attacker-known response topic must not grant,
+    // because the GrantRequired was never honoured (non-kernel source).
+    publish_response(&kernel, rid, "approve");
+
+    assert_no_grant(&home, "x", "cap").await;
+}
+
 /// Fail-closed: an APPROVE for a principal with NO profile on disk is a no-op,
 /// never a create. (`require_principal_exists` rejects it.)
 #[tokio::test]

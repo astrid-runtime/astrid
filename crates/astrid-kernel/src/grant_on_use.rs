@@ -104,6 +104,27 @@ pub(crate) fn spawn_grant_on_use_handler(kernel: Arc<Kernel>) -> tokio::task::Jo
                 continue;
             };
 
+            // SECURITY: only honour a GrantRequired the KERNEL emitted. The
+            // dispatcher publishes it with a nil `source_id`; the host stamps
+            // every CAPSULE publish with the capsule's own (non-nil v5) UUID,
+            // which a capsule cannot override. Without this, a capsule holding
+            // `astrid.v1.approval` publish-ACL could craft a typed
+            // `GrantRequired` (`IpcPayload::from_json_value` parses a
+            // `{"type":"grant_required",...}` body into the typed variant) with
+            // an attacker-chosen `(principal, capsule_id)` grant target. Reject
+            // anything not kernel-originated.
+            if message.source_id != uuid::Uuid::nil() {
+                warn!(
+                    security_event = true,
+                    source = %message.source_id,
+                    request_id = %request_id,
+                    principal = %principal,
+                    capsule = %capsule_id,
+                    "grant-on-use: GrantRequired from non-kernel source; ignoring (fail-closed)"
+                );
+                continue;
+            }
+
             // SECURITY: capture the grant target from THIS observed signal
             // (kernel-built from the authenticated caller). The awaiter reads
             // only `decision` from the response — never a target.
