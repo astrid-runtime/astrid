@@ -22,6 +22,7 @@ pub mod env;
 pub mod events;
 pub mod groups;
 pub mod invites;
+pub mod models;
 pub mod observability;
 pub mod principals;
 pub mod quotas;
@@ -128,6 +129,10 @@ pub fn build(state: Arc<GatewayState>) -> Router {
         .route("/api/sys/audit", get(audit::get_audit))
         // ── Agent invocation (SSE) ──
         .route("/api/agent/prompt", post(agent::post_prompt))
+        // ── Models (active-LLM selection) ──
+        .route("/api/models", get(models::list_models))
+        .route("/api/models/active", get(models::get_active_model))
+        .route("/api/models/active", put(models::set_active_model))
         // ── System ──
         .route("/api/sys/status", get(system::get_status))
         .route("/api/sys/readiness", get(system::get_readiness))

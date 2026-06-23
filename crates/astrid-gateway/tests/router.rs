@@ -476,6 +476,8 @@ fn openapi_lists_every_router_route() {
         "/api/events",
         "/api/sys/audit",
         "/api/agent/prompt",
+        "/api/models",
+        "/api/models/active",
         "/api/sys/status",
         "/api/sys/readiness",
         "/api/sys/capsules/reload",
