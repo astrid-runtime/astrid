@@ -139,12 +139,17 @@ impl GrantRequest {
 
     /// Build the respond body the broker expects on [`GRANT_RESPOND_TOPIC`].
     /// `req_id` is the fresh proxy correlation token for the ack; `request_id`
-    /// is the grant id echoed verbatim; `decision` is `"approve"` or `"deny"`.
+    /// is the grant id echoed verbatim; `decision` is `"approve"` or `"deny"`;
+    /// `capsule_id` is echoed so the broker can clear its per-`(principal,
+    /// capsule)` dedup marker on respond. `capsule_id` is display/routing only —
+    /// never a grant target (the kernel derives the target from its own observed
+    /// signal, never a body field), so it cannot forge a grant.
     pub(super) fn respond_body(&self, req_id: &str, decision: &str) -> Value {
         json!({
             "req_id": req_id,
             "request_id": self.request_id,
             "decision": decision,
+            "capsule_id": self.capsule_id,
         })
     }
 
@@ -288,9 +293,11 @@ mod tests {
         assert_eq!(approve["decision"], "approve");
         let deny = req.respond_body("proxy-req-2", "deny");
         assert_eq!(deny["decision"], "deny");
-        // The respond body carries no grant target — the kernel derives it
-        // from its own observed signal, never these display fields.
-        assert!(deny.get("capsule_id").is_none());
+        // `capsule_id` is echoed so the broker can clear its `(principal,
+        // capsule)` dedup marker — but it is NOT a grant target (the kernel
+        // derives that from its own observed signal, never a respond body
+        // field). `principal` is not sent at all.
+        assert_eq!(deny["capsule_id"], "shell");
         assert!(deny.get("principal").is_none());
     }
 
