@@ -126,7 +126,9 @@ pub(super) fn parse_github_source(source: &str) -> Option<(String, String)> {
 // ---------------------------------------------------------------------------
 
 pub(crate) async fn install_capsule(source: &str, workspace: bool) -> anyhow::Result<()> {
-    install_capsule_inner(source, workspace, &RefSpec::default()).await
+    install_capsule_inner(source, workspace, &RefSpec::default())
+        .await
+        .map(|_resolved_ref| ())
 }
 
 /// Which concrete git ref a GitHub install should resolve.
@@ -156,22 +158,31 @@ impl RefSpec {
 /// Install a capsule in batch mode (from distro init) — skips import
 /// validation and env prompting. Honors an explicit version/tag pin
 /// from the distro manifest.
+///
+/// Returns the concrete git ref that was actually resolved and fetched
+/// (`Some` for GitHub-backed sources, `None` for local-path sources),
+/// so the caller can record the *installed* ref in the lock rather than
+/// an optimistic guess from the manifest's declared fields.
 pub(crate) async fn install_capsule_batch(
     source: &str,
     workspace: bool,
     refspec: &RefSpec,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Option<String>> {
     BATCH_MODE.store(true, Ordering::Relaxed);
     let result = install_capsule_inner(source, workspace, refspec).await;
     BATCH_MODE.store(false, Ordering::Relaxed);
     result
 }
 
+/// Install dispatch shared by the CLI and distro-batch paths.
+///
+/// Returns the resolved git ref for GitHub-backed sources (`Some`), or
+/// `None` for local-path sources, which have no remote ref to resolve.
 async fn install_capsule_inner(
     source: &str,
     workspace: bool,
     refspec: &RefSpec,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Option<String>> {
     let home = AstridHome::resolve()?;
 
     // Recover any `@org/repo@version` CLI suffix and fold it into the
@@ -185,9 +196,11 @@ async fn install_capsule_inner(
 
     // 1. Explicit local path — record the path as the source so a
     //    later `astrid distro update` can re-resolve from it (it's the
-    //    canonical reference for a locally-sourced capsule).
+    //    canonical reference for a locally-sourced capsule). No remote
+    //    ref to resolve.
     if base.starts_with('.') || base.starts_with('/') {
-        return install_from_local(base, workspace, &home, Some(base));
+        install_from_local(base, workspace, &home, Some(base))?;
+        return Ok(None);
     }
 
     // 2. Namespace alias @org/repo → GitHub.
@@ -217,8 +230,9 @@ async fn install_capsule_inner(
         .await;
     }
 
-    // 4. Fallback: assume local folder.
-    install_from_local(base, workspace, &home, Some(base))
+    // 4. Fallback: assume local folder. No remote ref to resolve.
+    install_from_local(base, workspace, &home, Some(base))?;
+    Ok(None)
 }
 
 // ---------------------------------------------------------------------------
@@ -345,6 +359,10 @@ async fn download_capsule_asset(
     Ok(())
 }
 
+/// Install from a GitHub source, returning the concrete ref that was
+/// actually resolved and fetched (`Some` on the release-asset path). The
+/// clone-and-build fallback returns `None` — there is no single release
+/// tag it resolved (it builds from whatever `--depth 1` HEAD it cloned).
 async fn install_from_github(
     url: &str,
     workspace: bool,
@@ -352,7 +370,7 @@ async fn install_from_github(
     original_source: Option<&str>,
     version: Option<&str>,
     tag: Option<&str>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Option<String>> {
     let client = reqwest::Client::builder()
         .user_agent("astrid-cli")
         .timeout(std::time::Duration::from_secs(30))
@@ -364,7 +382,9 @@ async fn install_from_github(
 
     // Priority 1: download a packed `.capsule` archive from the release
     // resolved by version/tag (or latest when unpinned). The archive
-    // contains everything an install needs (WASM, manifest, WIT).
+    // contains everything an install needs (WASM, manifest, WIT). The
+    // ref returned here is the *actually resolved* tag — the single
+    // source of truth threaded into the lock.
     if let Ok(resolved_ref) = resolve_github_ref(&client, org, repo, version, tag).await
         && let Ok(Some(download_url)) =
             find_capsule_asset_url(&client, org, repo, &resolved_ref).await
@@ -372,14 +392,18 @@ async fn install_from_github(
         let tmp_dir = tempfile::tempdir()?;
         let download_path = tmp_dir.path().join("capsule.capsule");
         download_capsule_asset(&client, &download_url, &download_path).await?;
-        return unpack_via_lib(&download_path, workspace, home, original_source);
+        unpack_via_lib(&download_path, workspace, home, original_source)?;
+        return Ok(Some(resolved_ref));
     }
 
-    // Priority 2: clone + build from source via astrid-build.
-    clone_and_build(url, repo, workspace, home, original_source)
+    // Priority 2: clone + build from source via astrid-build. No single
+    // release ref was resolved.
+    clone_and_build(url, repo, workspace, home, original_source)?;
+    Ok(None)
 }
 
-/// Download a `.capsule` file to `dest_path` WITHOUT installing it.
+/// Download a `.capsule` file to `dest_path` WITHOUT installing it,
+/// returning the concrete git ref that was actually resolved.
 ///
 /// This is the seal pipeline's source-resolution primitive: it mirrors
 /// the release-asset download half of [`install_from_github`] but stops
@@ -387,12 +411,16 @@ async fn install_from_github(
 /// fallback here — a sealable distro must ship pre-built `.capsule`
 /// release assets, so a missing asset is a hard error the maintainer
 /// must resolve.
+///
+/// The returned ref is the single source of truth the seal records in
+/// the lock's `resolved_ref`: it is whatever GitHub reported as the
+/// release `tag_name`, never an optimistic guess from the manifest.
 pub(crate) async fn resolve_capsule_to_file(
     source: &str,
     version: Option<&str>,
     tag: Option<&str>,
     dest_path: &Path,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<String> {
     let (org, repo) = parse_github_source(source).ok_or_else(|| {
         anyhow::anyhow!(
             "seal can only resolve GitHub-backed capsule sources (@org/repo); got {source:?}"
@@ -414,7 +442,8 @@ pub(crate) async fn resolve_capsule_to_file(
             )
         })?;
 
-    download_capsule_asset(&client, &download_url, dest_path).await
+    download_capsule_asset(&client, &download_url, dest_path).await?;
+    Ok(resolved_ref)
 }
 
 /// Clone a GitHub repository and build the capsule from source using `astrid-build`.

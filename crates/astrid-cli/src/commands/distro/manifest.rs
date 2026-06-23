@@ -211,31 +211,6 @@ pub(crate) struct DistroCapsule {
     pub(crate) env: HashMap<String, String>,
 }
 
-impl DistroCapsule {
-    /// The concrete ref this capsule pins, for recording in the lock.
-    ///
-    /// Priority: explicit `rev` (commit) > `tag` > `branch` > the
-    /// `version` field rendered as a `v`-prefixed tag. Returns `None`
-    /// only when nothing pins a ref (which, given `version` is
-    /// required, does not happen for a valid manifest — but the field
-    /// stays optional so the lock format tolerates legacy inputs).
-    pub(crate) fn resolved_ref(&self) -> Option<String> {
-        if let Some(rev) = &self.rev {
-            return Some(rev.clone());
-        }
-        if let Some(tag) = &self.tag {
-            return Some(tag.clone());
-        }
-        if let Some(branch) = &self.branch {
-            return Some(branch.clone());
-        }
-        if !self.version.is_empty() {
-            return Some(format!("v{}", self.version));
-        }
-        None
-    }
-}
-
 /// Parse a `Distro.toml` string into a [`DistroManifest`].
 pub(crate) fn parse_manifest(content: &str) -> anyhow::Result<DistroManifest> {
     let manifest: DistroManifest =
@@ -346,6 +321,9 @@ base_url = "{{ base_url }}"
 
     #[test]
     fn parse_capsule_ref_and_default_fields() {
+        // Release selectors (`tag`, `default`, `group`) parse and
+        // validate. `version`/`tag` are the only ref selectors allowed
+        // in a distro manifest.
         let toml = r#"
 schema-version = 1
 
@@ -375,7 +353,6 @@ default = true
 name = "astrid-capsule-b"
 source = "@org/b"
 version = "0.3.0"
-branch = "main"
 group = "llm"
 "#;
         let m = parse_manifest(toml).unwrap();
@@ -383,16 +360,41 @@ group = "llm"
         let a = m.capsules.iter().find(|c| c.name == "astrid-capsule-a").unwrap();
         assert_eq!(a.tag.as_deref(), Some("v0.2.0-rc1"));
         assert!(a.default);
-        // Explicit tag wins over version for the resolved ref.
-        assert_eq!(a.resolved_ref().as_deref(), Some("v0.2.0-rc1"));
         let b = m.capsules.iter().find(|c| c.name == "astrid-capsule-b").unwrap();
-        assert_eq!(b.branch.as_deref(), Some("main"));
         assert!(!b.default);
-        // Branch wins over version when no tag/rev.
-        assert_eq!(b.resolved_ref().as_deref(), Some("main"));
-        // CLI capsule has only version → v-prefixed.
-        let cli = m.capsules.iter().find(|c| c.name == "astrid-capsule-cli").unwrap();
-        assert_eq!(cli.resolved_ref().as_deref(), Some("v0.1.0"));
+        assert_eq!(b.group.as_deref(), Some("llm"));
+    }
+
+    #[test]
+    fn branch_and_rev_fields_still_deserialize_on_struct() {
+        // The `branch`/`rev` fields stay ON `DistroCapsule` so validation
+        // can name them in a friendly error (rather than serde producing
+        // an opaque unknown-field failure). They parse syntactically; the
+        // semantic rejection happens in `validate_manifest`, exercised in
+        // the validate.rs tests. Bypass `parse_manifest` (which validates)
+        // and deserialize the struct directly.
+        let toml = r#"
+schema-version = 1
+
+[distro]
+id = "test"
+name = "Test"
+version = "0.1.0"
+
+[[capsule]]
+name = "astrid-capsule-b"
+source = "@org/b"
+version = "0.3.0"
+branch = "main"
+rev = "abc123"
+role = "uplink"
+"#;
+        let m: DistroManifest = toml::from_str(toml).unwrap();
+        let b = &m.capsules[0];
+        assert_eq!(b.branch.as_deref(), Some("main"));
+        assert_eq!(b.rev.as_deref(), Some("abc123"));
+        // And it is rejected once validated.
+        assert!(parse_manifest(toml).is_err());
     }
 
     #[test]

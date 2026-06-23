@@ -57,7 +57,11 @@ pub(crate) async fn run_seal(distro: &str, output: &Path, key: &Path) -> anyhow:
     for cap in &manifest.capsules {
         eprintln!("  resolving {} ({})", cap.name, cap.source);
         let dest = capsules_stage.join(format!("{}.capsule", cap.name));
-        resolve_capsule_to_file(
+        // The ref recorded in the lock is the one resolution ACTUALLY
+        // returned (GitHub's release `tag_name`), never a guess derived
+        // from the manifest's declared fields — so a signed shuttle's
+        // lock attests the ref that was truly fetched.
+        let resolved_ref = resolve_capsule_to_file(
             &cap.source,
             (!cap.version.is_empty()).then_some(cap.version.as_str()),
             cap.tag.as_deref(),
@@ -75,7 +79,7 @@ pub(crate) async fn run_seal(distro: &str, output: &Path, key: &Path) -> anyhow:
             version: cap.version.clone(),
             source: cap.source.clone(),
             hash,
-            resolved_ref: cap.resolved_ref(),
+            resolved_ref: Some(resolved_ref),
         });
         capsule_entries.push(ShuttleEntry {
             path: shuttle::capsule_member_path(&cap.name),

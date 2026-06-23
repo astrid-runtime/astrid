@@ -543,14 +543,22 @@ async fn install_capsules(
         pb.set_message(cap.name.clone());
 
         let refspec = super::capsule::install::RefSpec::from_capsule(cap);
-        if let Err(e) =
-            super::capsule::install::install_capsule_batch(&cap.source, false, &refspec).await
-        {
-            eprintln!("\n  Failed to install {}: {e}", cap.name);
-            failed.push(cap.name.clone());
-            pb.inc(1);
-            continue;
-        }
+        // The installer returns the ref it ACTUALLY resolved and fetched
+        // (`Some` for GitHub sources, `None` for local paths). Record
+        // that — never a guess derived from the manifest fields — so the
+        // lock attests what was truly installed.
+        let resolved_ref =
+            match super::capsule::install::install_capsule_batch(&cap.source, false, &refspec)
+                .await
+            {
+                Ok(resolved_ref) => resolved_ref,
+                Err(e) => {
+                    eprintln!("\n  Failed to install {}: {e}", cap.name);
+                    failed.push(cap.name.clone());
+                    pb.inc(1);
+                    continue;
+                },
+            };
 
         // Read the installed meta to get the wasm_hash for the lock.
         let target_dir = super::capsule::install::resolve_target_dir(&home, &cap.name, false)?;
@@ -564,7 +572,7 @@ async fn install_capsules(
                 .and_then(|m| m.wasm_hash)
                 .map(|h| format!("blake3:{h}"))
                 .unwrap_or_default(),
-            resolved_ref: cap.resolved_ref(),
+            resolved_ref,
         });
 
         pb.inc(1);
