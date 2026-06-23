@@ -63,7 +63,7 @@ fn tls_state(bind_addr: SocketAddr, cert_path: PathBuf, key_path: PathBuf) -> Ar
         event_bus: None,
         revoked_at: std::sync::Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
         revoked_key_ids: std::sync::Arc::new(std::sync::RwLock::new(
-            std::collections::HashSet::new(),
+            std::collections::HashMap::new(),
         )),
         audit_log: None,
         session_id: None,
@@ -199,7 +199,7 @@ async fn plain_http_path_still_works_when_no_tls_block() {
         event_bus: None,
         revoked_at: std::sync::Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
         revoked_key_ids: std::sync::Arc::new(std::sync::RwLock::new(
-            std::collections::HashSet::new(),
+            std::collections::HashMap::new(),
         )),
         audit_log: None,
         session_id: None,
