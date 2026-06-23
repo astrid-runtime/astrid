@@ -287,7 +287,6 @@ fn coerce_to_toml_value(path: &str, val: &str) -> toml::Value {
         path,
         "model.max_tokens"
             | "security.approval_timeout_secs"
-            | "security.policy.max_argument_size"
             | "budget.warn_at_percent"
             | "rate_limits.elicitation_per_server_per_min"
             | "rate_limits.max_pending_requests"
@@ -305,12 +304,8 @@ fn coerce_to_toml_value(path: &str, val: &str) -> toml::Value {
     }
 
     // Known boolean fields.
-    if matches!(
-        path,
-        "security.require_signatures"
-            | "security.policy.require_approval_for_delete"
-            | "security.policy.require_approval_for_network"
-    ) && let Ok(b) = val.parse::<bool>()
+    if matches!(path, "security.require_signatures")
+        && let Ok(b) = val.parse::<bool>()
     {
         return toml::Value::Boolean(b);
     }

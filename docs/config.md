@@ -89,7 +89,7 @@ auto_summarize = true
 keep_recent_count = 10
 ```
 
-## Security & Policy
+## Security
 
 Define the security boundary for the agent.
 
@@ -97,32 +97,12 @@ Define the security boundary for the agent.
 [security]
 require_signatures = false
 approval_timeout_secs = 300
-
-[security.policy]
-blocked_tools = ["rm -rf /", "sudo"]
-approval_required_tools = []
-allowed_paths = []
-denied_paths = ["/etc/**", "/boot/**", "/sys/**"]
-allowed_hosts = []
-denied_hosts = []
-require_approval_for_delete = true
-require_approval_for_network = true
-max_argument_size = 1048576
 ```
 
 | Field | Type | Description |
 |---|---|---|
 | `require_signatures` | bool | Require ed25519 signatures on user inputs. |
 | `approval_timeout_secs` | integer | Seconds before an unanswered approval request is denied. |
-| `policy.blocked_tools` | list | Tool invocations that are always blocked. |
-| `policy.approval_required_tools` | list | Tools that always require approval, even with capability tokens. |
-| `policy.allowed_paths` | list | Filesystem paths the agent may access (glob patterns). |
-| `policy.denied_paths` | list | Filesystem paths the agent is denied from accessing (glob patterns). |
-| `policy.allowed_hosts` | list | Network hosts the agent may contact (glob patterns). |
-| `policy.denied_hosts` | list | Network hosts the agent is denied from contacting (glob patterns). |
-| `policy.max_argument_size` | integer | Maximum size of a single tool argument in bytes. |
-| `policy.require_approval_for_delete` | bool | Whether file deletion requires approval. |
-| `policy.require_approval_for_network` | bool | Whether network access requires approval. |
 
 ## Budget
 

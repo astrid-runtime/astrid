@@ -51,37 +51,44 @@ How much authority you keep is up to you. `mode = "safe"` asks before every acti
 
 ## The security model
 
-Every sensitive action passes through five layers before it executes:
+Astrid's security is **decomposed**: there is no single gate every action funnels through. A capsule has no ambient authority, and authorization is enforced by independent, per-area mechanisms — each fail-closed, each enforced where the effect actually happens.
 
 ```text
-Agent proposes action
-       |
-  [1. Policy]    Hard blocks. "sudo" is always denied. Path traversal is always denied.
-       |         Admin-controlled deny lists, allowed paths, denied hosts.
-       |         Cannot be overridden by tokens or approvals.
-       |
-  [2. Token]     Does a valid ed25519 capability token cover this action?
-       |         Scoped to resource patterns via globset matching.
-       |         Time-bounded. Linked to the audit entry that created it.
-       |
-  [3. Budget]    Is the session within its spending limit?
-       |         Per-action and per-session limits, enforced atomically.
-       |         Dual-budget: session budget AND workspace budget must both allow.
-       |         Reservation-based: cost is held during approval, refunded on denial.
-       |
-  [4. Approval]  No token? Ask the human.
-       |         Allow Once / Allow Session / Allow Workspace / Allow Always / Deny.
-       |         "Allow Always" mints a signed capability token for next time.
-       |         "Allow Session" creates a scoped allowance that auto-matches future calls.
-       |         Human unavailable? The action queues, not silently skips.
-       |
-  [5. Audit]     Every decision — allowed, denied, deferred — is logged.
-                 Each entry is signed by the runtime's ed25519 key.
-                 Each entry contains the content hash of the previous.
-                 Tamper with the history and the chain breaks.
+A capsule has no ambient authority — every effect is a host call.
+
+  [WASM sandbox]   No syscalls, no file descriptors, no host memory.
+                   Every external resource is a capability-checked host function.
+
+  [Manifest gate]  Every host call is checked against the capsule's declared
+                   allowlist (fs / net / process), fail-closed (empty = deny-all),
+                   with path-traversal and SSRF defenses. A jailbroken or
+                   prompt-injected capsule still cannot exceed its manifest.
+
+  [IPC ACL]        Publish/subscribe authorized by the manifest's
+                   [publish]/[subscribe] keys, with per-principal routing.
+
+  [Capability]     ed25519 tokens scoped to resource patterns (globset),
+                   principal-bound, expiry-checked, globally revocable.
+
+  [Budget]         Per-action and per-session limits, enforced atomically.
+                   Dual-budget: session AND workspace must both allow.
+                   Reservation-based: cost held during approval, refunded on denial.
+
+  [Approval]       Human-in-the-loop for sensitive actions.
+                   Allow Once / Session / Workspace / Always / Deny.
+                   "Allow Always" mints a capability token; "Allow Session"
+                   creates a scoped allowance. Human unavailable? It queues,
+                   it does not silently skip.
+
+  [OS sandbox]     Spawned native subprocesses run under bwrap/seatbelt with
+                   the operator's credential directories masked.
+
+  [Audit]          Admin actions are logged on a hash-chained, ed25519-signed
+                   audit log; break the chain and tampering shows. (Per-action
+                   audit coverage for every host call is a tracked follow-up.)
 ```
 
-This is real code. [`SecurityInterceptor`](crates/astrid-approval/src/interceptor/mod.rs) implements this exact flow. The tests cover policy blocks, budget exhaustion, budget reservation refund on denial, budget refund on async cancellation, capability token authorization, the "Allow Session" allowance minting path, and the "Allow Always" token minting path.
+These mechanisms are real and independently tested. There is no unified interceptor orchestrating them — an earlier prototype of that idea was removed because it never ran (see issue #991); the decomposed model above is canonical.
 
 ## Two sandboxes
 
@@ -294,7 +301,7 @@ Astrid follows a strict kernel/user-space divide. The kernel (native Rust daemon
 | Crate | Role |
 |---|---|
 | `astrid-kernel` | Boots the runtime. Owns VFS, IPC bus, capsule registry, MCP client, audit log, KV store. Listens on Unix socket for CLI connections. |
-| `astrid-approval` | `SecurityInterceptor`: the five-layer gate. Policy engine, budget tracker, allowance store, approval manager. |
+| `astrid-approval` | Human-in-the-loop approval: `SensitiveAction`, allowance store, approval manager, budget tracker. |
 | `astrid-capabilities` | Ed25519-signed capability tokens with glob resource patterns and time bounds. |
 | `astrid-audit` | Chain-linked cryptographic audit log. Each entry is signed and hashes the previous. SurrealKV-backed with chain verification. Per-principal chain splitting. |
 | `astrid-vfs` | Copy-on-write overlay filesystem. `Vfs` trait with `HostVfs` and `OverlayVfs` implementations. Capability-based `DirHandle`/`FileHandle`. |
@@ -366,7 +373,7 @@ See [CHANGELOG.md](CHANGELOG.md) for the complete list of changes, fixes, and br
 **v0.5.0.** The core runtime works end-to-end:
 
 - Kernel boots, discovers and loads capsules, manages VFS overlay, listens on Unix socket
-- `SecurityInterceptor` with all five layers, tested with policy blocks, budget exhaustion, token auth, session/workspace allowances, and the "Allow Always" token minting path
+- Decomposed security floor: WASM sandbox, fail-closed manifest allowlist gate, IPC ACL, capability tokens, atomic budgets, and human-in-the-loop approval (session/workspace allowances, "Allow Always" token minting)
 - WASM sandbox with 49 host functions, 64 MB memory ceiling, 5-minute tool timeout
 - Chain-linked audit log with ed25519 signatures and per-principal chain integrity verification
 - MCP client (2025-11-25 spec) via `rmcp` with capability gating and binary hash verification

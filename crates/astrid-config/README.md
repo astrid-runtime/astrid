@@ -24,9 +24,9 @@ From highest to lowest priority:
 After merging the workspace layer, a hard enforcement pass runs against the pre-workspace baseline:
 
 - **Budgets can only decrease.** `session_max_usd` and `per_action_max_usd` are clamped to the baseline value.
-- **Security booleans can only tighten.** `require_approval_for_delete` can only become true. `allow_write_outside_workspace` can only become false.
-- **Deny-lists can only grow.** Workspace can add to `denied_hosts` and `denied_commands` but cannot remove entries.
-- **Allow-lists cannot expand.** Workspace cannot add entries to `allowed_paths`.
+- **Security can only tighten.** `require_signatures` can only become true; `approval_timeout_secs` can only decrease; `workspace.mode` and `escape_policy` can only move to a stricter level.
+- **Deny-lists can only grow.** Workspace can add to `workspace.never_allow` but cannot remove entries.
+- **Allow-lists cannot expand.** Workspace cannot add entries to `workspace.auto_allow_read` or `auto_allow_write`.
 - **API keys cannot be overridden.** `model.api_key` and `model.api_url` from workspace are reverted.
 - **Server injection blocked.** Workspace cannot add new MCP server definitions.
 

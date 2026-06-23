@@ -75,61 +75,9 @@ keep_recent_count = 10
 # Disable for standard AI assistant use, enable for high-security scenarios.
 require_signatures = false
 
-# Timeout in seconds for approval requests. If user doesn't respond within
-# this time, the action is denied (unless fallback policy says otherwise).
+# Timeout in seconds for approval requests. If the user doesn't respond within
+# this time, the action is denied.
 approval_timeout_secs = 300
-
-# Security policy: hard boundaries enforced by the runtime
-[security.policy]
-# Tool invocations that are ALWAYS blocked, regardless of capabilities.
-# These are extremely dangerous operations that should never be automated.
-blocked_tools = [
-    "rm -rf /",
-    "rm -rf /*",
-    "sudo",
-    "su",
-    "mkfs",
-    "dd",
-    "chmod 777",
-    "shutdown",
-    "reboot",
-    "init"
-]
-
-# Tools that ALWAYS require approval, even with capability tokens.
-# Use this for operations you want to review every time.
-approval_required_tools = []
-
-# Filesystem paths the agent is ALLOWED to access (glob patterns).
-# Empty list = no explicit allowlist (use workspace boundaries instead).
-allowed_paths = []
-
-# Filesystem paths the agent is DENIED from accessing (glob patterns).
-# These are enforced even if inside workspace or granted via capability.
-denied_paths = [
-    "/etc/**",
-    "/boot/**",
-    "/sys/**",
-    "/proc/**",
-    "/dev/**"
-]
-
-# Network hosts the agent is ALLOWED to contact (glob patterns).
-# Empty list = no explicit allowlist.
-allowed_hosts = []
-
-# Network hosts the agent is DENIED from contacting (glob patterns).
-denied_hosts = []
-
-# Maximum size of a single tool argument in bytes.
-# Prevents abuse via extremely large payloads.
-max_argument_size = 1048576  # 1MB
-
-# Whether file deletion operations require approval
-require_approval_for_delete = true
-
-# Whether network access operations require approval
-require_approval_for_network = true
 
 # ============================================================================
 # Budget Configuration

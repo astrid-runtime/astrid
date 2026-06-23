@@ -85,8 +85,8 @@ impl fmt::Display for RiskAssessment {
 
 /// A request for human approval of a sensitive action.
 ///
-/// Created by the security interceptor when an action requires explicit
-/// human confirmation. Contains all context needed for an informed decision.
+/// Created when an action requires explicit human confirmation. Contains all
+/// context needed for an informed decision.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ApprovalRequest {
     /// Unique request identifier.

@@ -10,8 +10,11 @@
 //! - **Allowance System**: [`Allowance`], [`AllowancePattern`], `AllowanceStore`
 //! - **Approval Manager**: Orchestrates the full approval flow
 //! - **Budget Tracking**: Session and per-action spending limits
-//! - **Security Policy**: Hard boundaries (blocked/approval-required tools)
-//! - **Security Interceptor**: Combines all layers (intersection semantics)
+//!
+//! Astrid's security is *decomposed*: these are the human-in-the-loop pieces.
+//! Authorization is enforced by independent, per-area mechanisms (the WASM
+//! sandbox, the manifest allowlist host gates, the IPC ACL, capability tokens,
+//! and budgets) — not a single unified gate. See issue #991.
 //!
 //! # Relationship to Frontend Types
 //!
@@ -56,9 +59,7 @@ pub mod budget;
 pub mod deferred;
 /// Error types and results for the approval module.
 pub mod error;
-pub mod interceptor;
 pub mod manager;
-pub mod policy;
 pub mod request;
 
 pub use action::SensitiveAction;
@@ -71,7 +72,5 @@ pub use deferred::{
     Priority, ResolutionId,
 };
 pub use error::{ApprovalError, ApprovalResult};
-pub use interceptor::{BudgetWarning, InterceptProof, InterceptResult, SecurityInterceptor};
 pub use manager::{ApprovalHandler, ApprovalManager, ApprovalOutcome, ApprovalProof};
-pub use policy::{PolicyResult, SecurityPolicy};
 pub use request::{ApprovalDecision, ApprovalRequest, ApprovalResponse, RequestId, RiskAssessment};
