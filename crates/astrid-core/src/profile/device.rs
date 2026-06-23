@@ -199,7 +199,15 @@ impl DeviceKey {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct DeviceKeyData {
+    /// Accepted on the wire so a serialized `DeviceKey` (which always writes
+    /// `key_id`) round-trips under `deny_unknown_fields`, but intentionally
+    /// NOT read: the `Deserialize` impl re-derives `key_id` from the pubkey
+    /// unconditionally, since it is a deterministic fingerprint by contract.
     #[serde(default)]
+    #[allow(
+        dead_code,
+        reason = "accepted for round-trip; key_id is re-derived from pubkey"
+    )]
     key_id: String,
     pubkey: String,
     #[serde(default = "device_scope_full")]
@@ -244,18 +252,20 @@ impl<'de> Deserialize<'de> for DeviceKey {
                 Ok(DeviceKey::new(hex, DeviceScope::Full, None, 0))
             },
             DeviceKeyRepr::Full(d) => {
-                // Full struct form. Derive the key_id from the pubkey when the
-                // file omits it (the canonical source is always the pubkey,
-                // never an operator-supplied id), so a hand-edited or older
-                // struct entry still resolves to the deterministic handle.
-                let key_id = if d.key_id.is_empty() {
-                    device_key_id_fingerprint(&d.pubkey)
-                } else {
-                    d.key_id
-                };
+                // Full struct form. The canonical source of `key_id` is ALWAYS
+                // the pubkey — it is a deterministic fingerprint by contract, and
+                // stable-handle / idempotent-redeem / revocation-targeting logic
+                // relies on that. So normalise the pubkey exactly like the bare
+                // form and re-derive `key_id` unconditionally, ignoring whatever
+                // `key_id` is on disk: a hand-edited or stale value can never
+                // diverge from its pubkey (which would desync the handshake-
+                // returned id from the gate/revocation fingerprint). The on-disk
+                // `key_id` field is accepted (so a serialized struct round-trips)
+                // but treated as informational only.
+                let hex = normalise_pubkey_hex(&d.pubkey).map_err(D::Error::custom)?;
                 Ok(DeviceKey {
-                    key_id,
-                    pubkey: d.pubkey,
+                    key_id: device_key_id_fingerprint(&hex),
+                    pubkey: hex,
                     scope: d.scope,
                     label: d.label,
                     created_at: d.created_at,
@@ -384,6 +394,36 @@ mod tests {
         assert_eq!(key.label.as_deref(), Some("phone"));
         assert_eq!(key.created_at, 123);
         assert!(matches!(key.scope, DeviceScope::Scoped { .. }));
+    }
+
+    #[test]
+    fn device_key_full_struct_rederives_key_id_ignoring_on_disk_value() {
+        // A hand-edited / stale `key_id` that does NOT match the pubkey is
+        // ignored: `key_id` is always re-derived as the deterministic
+        // fingerprint of the pubkey, so the handshake-returned id can never
+        // diverge from the gate/revocation fingerprint.
+        let hex = "a".repeat(64);
+        let json = format!(
+            r#"{{"key_id":"deadbeefdeadbeef","pubkey":"{hex}","scope":{{"type":"full"}}}}"#
+        );
+        let key: DeviceKey = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            key.key_id,
+            device_key_id_fingerprint(&hex),
+            "key_id must be re-derived from the pubkey, not taken from disk"
+        );
+        assert_ne!(key.key_id, "deadbeefdeadbeef");
+    }
+
+    #[test]
+    fn device_key_full_struct_normalizes_pubkey() {
+        // The struct form normalises its pubkey (strip `ed25519:`, lowercase)
+        // exactly like the bare form, so the derived key_id and `matches_pubkey`
+        // stay consistent regardless of how the pubkey was written on disk.
+        let json = format!(r#"{{"pubkey":"ed25519:{}"}}"#, "A".repeat(64));
+        let key: DeviceKey = serde_json::from_str(&json).unwrap();
+        assert_eq!(key.pubkey, "a".repeat(64));
+        assert_eq!(key.key_id, device_key_id_fingerprint(&"a".repeat(64)));
     }
 
     #[test]
