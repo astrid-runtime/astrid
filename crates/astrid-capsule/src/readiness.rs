@@ -42,20 +42,35 @@ pub const AGENT_PROMPT_TOPIC: &str = "user.v1.prompt";
 /// publishes a pattern matching this topic can produce a final response.
 pub const AGENT_RESPONSE_TOPIC: &str = "agent.v1.response";
 
+/// Reflexive `AsRef` so the readiness functions' `M: AsRef<CapsuleManifest>`
+/// bound accepts both owned slices (`&[CapsuleManifest]`, used by tests) and
+/// borrowed slices (`&[&CapsuleManifest]`, used by the kernel handler and the
+/// boot path that read the live registry) — without cloning every manifest on
+/// each prompt probe or boot check.
+impl AsRef<CapsuleManifest> for CapsuleManifest {
+    fn as_ref(&self) -> &CapsuleManifest {
+        self
+    }
+}
+
 /// Names of loaded capsules whose `[subscribe]` patterns match `topic`.
 ///
 /// Uses route-layer subtree semantics, so a declared `user.v1.*` matches
 /// `user.v1.prompt`.
 #[must_use]
-pub fn topic_subscribers<'a>(manifests: &'a [CapsuleManifest], topic: &str) -> Vec<&'a str> {
+pub fn topic_subscribers<'a, M: AsRef<CapsuleManifest>>(
+    manifests: &'a [M],
+    topic: &str,
+) -> Vec<&'a str> {
     manifests
         .iter()
         .filter(|m| {
-            m.subscribes
+            m.as_ref()
+                .subscribes
                 .keys()
                 .any(|pattern| topic_pattern_matches(pattern, topic))
         })
-        .map(|m| m.package.name.as_str())
+        .map(|m| m.as_ref().package.name.as_str())
         .collect()
 }
 
@@ -63,15 +78,19 @@ pub fn topic_subscribers<'a>(manifests: &'a [CapsuleManifest], topic: &str) -> V
 ///
 /// Uses route-layer subtree semantics, mirroring [`topic_subscribers`].
 #[must_use]
-pub fn topic_publishers<'a>(manifests: &'a [CapsuleManifest], topic: &str) -> Vec<&'a str> {
+pub fn topic_publishers<'a, M: AsRef<CapsuleManifest>>(
+    manifests: &'a [M],
+    topic: &str,
+) -> Vec<&'a str> {
     manifests
         .iter()
         .filter(|m| {
-            m.publishes
+            m.as_ref()
+                .publishes
                 .keys()
                 .any(|pattern| topic_pattern_matches(pattern, topic))
         })
-        .map(|m| m.package.name.as_str())
+        .map(|m| m.as_ref().package.name.as_str())
         .collect()
 }
 
@@ -86,16 +105,19 @@ pub fn topic_publishers<'a>(manifests: &'a [CapsuleManifest], topic: &str) -> Ve
 /// unmet"; the kernel boot validator delegates here so its warnings and this
 /// readiness report can never diverge.
 #[must_use]
-pub fn unsatisfied_required_imports(manifests: &[CapsuleManifest]) -> Vec<MissingImport> {
+pub fn unsatisfied_required_imports<M: AsRef<CapsuleManifest>>(
+    manifests: &[M],
+) -> Vec<MissingImport> {
     let mut missing = Vec::new();
     for (idx, manifest) in manifests.iter().enumerate() {
+        let manifest = manifest.as_ref();
         for (imp_ns, imp_name, imp_req, optional) in manifest.import_tuples() {
             if optional {
                 continue;
             }
             let satisfied = manifests.iter().enumerate().any(|(other_idx, other)| {
                 other_idx != idx
-                    && other.export_triples().any(|(ns, name, ver)| {
+                    && other.as_ref().export_triples().any(|(ns, name, ver)| {
                         import_satisfied_by(imp_ns, imp_name, imp_req, ns, name, ver)
                     })
             });
@@ -118,7 +140,7 @@ pub fn unsatisfied_required_imports(manifests: &[CapsuleManifest]) -> Vec<Missin
 /// `[publish]`, and `[imports]`/`[exports]` tables against the two well-known
 /// topic constants. `ready` is the conjunction of all three checks.
 #[must_use]
-pub fn agent_loop_readiness(manifests: &[CapsuleManifest]) -> AgentLoopReadiness {
+pub fn agent_loop_readiness<M: AsRef<CapsuleManifest>>(manifests: &[M]) -> AgentLoopReadiness {
     let prompt_subscribers: Vec<String> = topic_subscribers(manifests, AGENT_PROMPT_TOPIC)
         .into_iter()
         .map(ToString::to_string)
@@ -128,7 +150,10 @@ pub fn agent_loop_readiness(manifests: &[CapsuleManifest]) -> AgentLoopReadiness
         .map(ToString::to_string)
         .collect();
     let unsatisfied = unsatisfied_required_imports(manifests);
-    let loaded_capsules: Vec<String> = manifests.iter().map(|m| m.package.name.clone()).collect();
+    let loaded_capsules: Vec<String> = manifests
+        .iter()
+        .map(|m| m.as_ref().package.name.clone())
+        .collect();
 
     let ready =
         !prompt_subscribers.is_empty() && !response_publishers.is_empty() && unsatisfied.is_empty();

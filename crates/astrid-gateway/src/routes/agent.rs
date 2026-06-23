@@ -295,17 +295,37 @@ fn sse_with_keepalive(
     )
 }
 
+/// How long the readiness probe may take before the prompt path gives up and
+/// fails open. The whole point of the probe is to AVOID a hang, so both the
+/// socket connect and the request read are bounded well under any human's
+/// patience; on expiry we proceed exactly as if the loop were ready.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
+
 /// Probe the kernel for agent-loop readiness on behalf of `principal`.
 ///
 /// Returns `Some(report)` when the kernel answered (ready or not), and
-/// `None` when the probe could not complete (no daemon, timeout, wrong
-/// response variant) — the caller fails OPEN on `None`, never blocking a
-/// legitimately-configured prompt on a probe failure.
+/// `None` when the probe could not complete (no daemon, connect/read timeout,
+/// unexpected response, or the caller lacks the capability the kernel gates
+/// `GetAgentReadiness` with) — the caller fails OPEN on `None`, never blocking
+/// a legitimately-configured prompt on a probe failure.
+///
+/// Capability note: `GetAgentReadiness` is gated `capsule:list`. The common
+/// single-tenant principal (admin `*`) holds it, so the fail-fast fires there.
+/// A multi-tenant principal WITHOUT `capsule:list` gets a kernel `Error` here,
+/// falls open, and sees today's behaviour (the prompt stream waits out its
+/// timeout) — a graceful degradation, not a regression. Widening the probe to
+/// every prompt-capable principal is a capability-model decision tracked
+/// separately rather than silently broadened here.
 async fn probe_agent_readiness(principal: &PrincipalId) -> Option<AgentLoopReadiness> {
-    let mut client = match KernelClient::connect(principal.clone()).await {
-        Ok(c) => c,
-        Err(e) => {
+    let connect = tokio::time::timeout(PROBE_TIMEOUT, KernelClient::connect(principal.clone()));
+    let mut client = match connect.await {
+        Ok(Ok(c)) => c.with_timeout(PROBE_TIMEOUT),
+        Ok(Err(e)) => {
             tracing::debug!(error = %e, "agent readiness probe: connect failed; proceeding (fail-open)");
+            return None;
+        },
+        Err(_) => {
+            tracing::debug!("agent readiness probe: connect timed out; proceeding (fail-open)");
             return None;
         },
     };

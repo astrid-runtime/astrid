@@ -647,12 +647,6 @@ impl Kernel {
         // Validate imports/exports: every required import must have a matching export.
         validate_imports_exports(&sorted);
 
-        // Warn loudly if the loaded set can't actually serve an agent chat
-        // turn. Without this a fresh daemon (socket uplink only) boots clean
-        // yet silently drops every prompt — name-agnostic introspection turns
-        // that silent failure into a single actionable warning.
-        warn_agent_loop_readiness(&sorted);
-
         // Partition after sorting: uplinks first, then the rest.
         // The relative order within each partition is preserved from the
         // toposort, so dependency edges are still respected. Cross-partition
@@ -695,6 +689,21 @@ impl Kernel {
         // dependency edges between them are respected.
         let other_names: Vec<String> = others.iter().map(|(m, _)| m.package.name.clone()).collect();
         self.await_capsule_readiness(&other_names).await;
+
+        // Warn loudly if the loaded set can't actually serve an agent chat
+        // turn. Computed from the live registry *after* load completes (not the
+        // pre-load discovered set) so a manifest that failed to load is not
+        // mistaken for a working capability. Without this a fresh daemon
+        // (socket uplink only) boots clean yet silently drops every prompt —
+        // name-agnostic introspection turns that into one actionable warning.
+        {
+            let reg = self.capsules.read().await;
+            let loaded: Vec<&astrid_capsule::manifest::CapsuleManifest> = reg
+                .values()
+                .map(astrid_capsule::capsule::Capsule::manifest)
+                .collect();
+            warn_agent_loop_readiness(&loaded);
+        }
 
         // Mirror the read-only introspection furniture into every principal's
         // home so non-install principals see the globally-loaded capsule set.
@@ -2348,8 +2357,8 @@ fn validate_imports_exports(
     // Single source of truth for unsatisfied required imports. Key on
     // (capsule, namespace, interface) so the per-import loop below can decide
     // the required-error branch by membership rather than recomputing.
-    let plain: Vec<astrid_capsule::manifest::CapsuleManifest> =
-        manifests.iter().map(|(m, _)| m.clone()).collect();
+    let plain: Vec<&astrid_capsule::manifest::CapsuleManifest> =
+        manifests.iter().map(|(m, _)| m).collect();
     let unsatisfied_required: std::collections::HashSet<(String, String, String)> =
         astrid_capsule::readiness::unsatisfied_required_imports(&plain)
             .into_iter()
@@ -2405,15 +2414,13 @@ fn validate_imports_exports(
 /// per-import flood. Reuses the shared
 /// [`astrid_capsule::readiness::agent_loop_readiness`] so the boot signal,
 /// the `/api/sys/readiness` route, and `astrid doctor` all agree.
-fn warn_agent_loop_readiness(
-    manifests: &[(
-        astrid_capsule::manifest::CapsuleManifest,
-        std::path::PathBuf,
-    )],
-) {
-    let plain: Vec<astrid_capsule::manifest::CapsuleManifest> =
-        manifests.iter().map(|(m, _)| m.clone()).collect();
-    let readiness = astrid_capsule::readiness::agent_loop_readiness(&plain);
+///
+/// Takes the manifests of the capsules that are actually **loaded** (read from
+/// the live registry after load completes), not the pre-load discovered set —
+/// a manifest can be discovered but fail to load (missing env, WASM error), so
+/// only the loaded registry reflects what can really serve a turn.
+fn warn_agent_loop_readiness(manifests: &[&astrid_capsule::manifest::CapsuleManifest]) {
+    let readiness = astrid_capsule::readiness::agent_loop_readiness(manifests);
     if readiness.ready {
         tracing::info!(
             capsules = readiness.loaded_capsules.len(),

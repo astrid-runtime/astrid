@@ -433,7 +433,10 @@ async fn handle_request(
         },
         KernelRequest::GetAgentReadiness => {
             let reg = kernel.capsules.read().await;
-            let manifests: Vec<_> = reg.values().map(|c| c.manifest().clone()).collect();
+            let manifests: Vec<&astrid_capsule::manifest::CapsuleManifest> = reg
+                .values()
+                .map(astrid_capsule::capsule::Capsule::manifest)
+                .collect();
             let readiness = astrid_capsule::readiness::agent_loop_readiness(&manifests);
             KernelResponse::AgentReadiness(readiness)
         },
