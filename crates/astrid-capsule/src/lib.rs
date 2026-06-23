@@ -20,6 +20,7 @@ pub mod manifest;
 pub mod memory_ledger;
 pub mod principal_class;
 pub mod profile_cache;
+pub mod readiness;
 pub mod registry;
 pub mod schema_catalog;
 pub mod security;

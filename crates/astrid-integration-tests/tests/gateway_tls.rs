@@ -68,6 +68,7 @@ fn tls_state(bind_addr: SocketAddr, cert_path: PathBuf, key_path: PathBuf) -> Ar
         audit_log: None,
         session_id: None,
         gateway_route_uuid: uuid::Uuid::new_v4(),
+        readiness_probe: None,
     })
 }
 
@@ -204,6 +205,7 @@ async fn plain_http_path_still_works_when_no_tls_block() {
         audit_log: None,
         session_id: None,
         gateway_route_uuid: uuid::Uuid::new_v4(),
+        readiness_probe: None,
     });
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();

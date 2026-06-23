@@ -47,6 +47,7 @@ use std::convert::Infallible;
 use std::sync::Arc;
 use std::time::Duration;
 
+use astrid_core::kernel_api::AgentLoopReadiness;
 use astrid_events::AstridEvent;
 use astrid_events::ipc::{IpcMessage, IpcPayload};
 use astrid_types::ipc::IpcPayload as TypesIpcPayload;
@@ -147,6 +148,26 @@ pub async fn post_prompt(
         .session_id
         .filter(|s| !s.trim().is_empty())
         .unwrap_or_else(|| Uuid::new_v4().to_string());
+
+    // Fail fast on an unconfigured agent loop. A daemon whose loaded capsule
+    // set has no prompt subscriber / response publisher (or an unsatisfied
+    // required import) would otherwise emit `ready`, wait out the 5-minute
+    // timeout, and close empty — the client gets no signal. So when the loop
+    // is definitively NOT ready, return a single `error` SSE event and close
+    // immediately.
+    //
+    // Readiness is read from the in-process probe the daemon wired in: it
+    // reflects live daemon health and needs no per-principal capability, so the
+    // fail-fast fires for EVERY authenticated prompt caller (single- and
+    // multi-tenant alike), not only `capsule:list` holders. Fail OPEN: when no
+    // probe is wired (standalone test build) we proceed exactly as before,
+    // never blocking a legitimately-configured prompt.
+    if let Some(probe) = &state.readiness_probe {
+        let report = probe.probe().await;
+        if !report.ready {
+            return Ok(unready_stream(&report));
+        }
+    }
 
     // Subscribe FIRST, then publish. Reverse order would race a fast
     // model response — the first delta could land before subscribe
@@ -260,11 +281,69 @@ pub async fn post_prompt(
         }
     };
 
-    Ok(Sse::new(stream.boxed()).keep_alive(
+    Ok(sse_with_keepalive(stream.boxed()))
+}
+
+/// Wrap a boxed SSE stream with the standard 15s keep-alive heartbeat.
+/// Both the happy path and the fail-fast path go through here so they
+/// return the same concrete `Sse` type (the handler's `impl Stream`).
+fn sse_with_keepalive(
+    stream: futures::stream::BoxStream<'static, Result<Event, Infallible>>,
+) -> Sse<futures::stream::BoxStream<'static, Result<Event, Infallible>>> {
+    Sse::new(stream).keep_alive(
         KeepAlive::new()
             .interval(Duration::from_secs(15))
             .text("keep-alive"),
-    ))
+    )
+}
+
+/// Build a one-shot SSE stream that emits a single `error` event naming what
+/// the agent loop is missing, then closes — instead of `ready` + a 5-minute
+/// wait against a loop that can never reply.
+fn unready_stream(
+    report: &AgentLoopReadiness,
+) -> Sse<futures::stream::BoxStream<'static, Result<Event, Infallible>>> {
+    sse_with_keepalive(unready_event_stream(report))
+}
+
+/// The raw one-shot stream behind [`unready_stream`]: a single `error` event,
+/// then end-of-stream. Split out (un-wrapped from `Sse`) so a test can drive
+/// it directly — `axum::response::Sse` exposes no stream accessor.
+fn unready_event_stream(
+    report: &AgentLoopReadiness,
+) -> futures::stream::BoxStream<'static, Result<Event, Infallible>> {
+    let event = Event::default()
+        .event("error")
+        .data(serde_json::to_string(&unready_payload(report)).unwrap_or_default());
+    futures::stream::once(async move { Ok::<Event, Infallible>(event) }).boxed()
+}
+
+/// The JSON body of the single `error` SSE event emitted when the agent loop
+/// is not ready — names which piece(s) of the loop are missing. Split out as a
+/// pure function so the fail-fast content is unit-testable without a live bus.
+///
+/// Disclosure: `POST /api/agent/prompt` requires only authentication (no
+/// `capsule:list`), so this payload is deliberately narrowed — it carries the
+/// two boolean gaps and the unsatisfied **WIT interface ids** (`astrid:llm`),
+/// but NOT capsule names or the loaded-capsule inventory (those stay behind the
+/// `capsule:list`-gated `GET /api/sys/readiness`). WIT interface ids are public
+/// contract surface (they live in the published `wit/` mirror and the RFCs),
+/// not tenant-specific data, and they only appear here in a globally
+/// loop-unconfigured state — so surfacing them to any authenticated caller is
+/// an accepted, intentional trade for an actionable error over a silent hang.
+fn unready_payload(report: &AgentLoopReadiness) -> serde_json::Value {
+    serde_json::json!({
+        "error": "agent loop not ready",
+        "missing": {
+            "prompt_subscriber": report.prompt_subscribers.is_empty(),
+            "response_publisher": report.response_publishers.is_empty(),
+            "unsatisfied_imports": report
+                .unsatisfied_required_imports
+                .iter()
+                .map(|m| format!("{}:{} ({})", m.namespace, m.interface, m.requirement))
+                .collect::<Vec<_>>(),
+        }
+    })
 }
 
 /// Convert an in-bus `AstridEvent::Ipc` into an SSE `Event`, filtering by
@@ -294,4 +373,85 @@ fn forward_event(
     }
     let body = serde_json::to_string(&value).ok()?;
     Some(Event::default().event(sse_name).data(body))
+}
+
+#[cfg(test)]
+mod tests {
+    use astrid_core::kernel_api::MissingImport;
+
+    use super::*;
+
+    /// The fail-fast `error` payload must name exactly which piece of the
+    /// loop is missing — a not-ready report with no prompt subscriber and an
+    /// unsatisfied import must say so, so the client gets an actionable
+    /// signal instead of a 5-minute silent wait.
+    #[test]
+    fn unready_payload_names_missing_pieces() {
+        let report = AgentLoopReadiness {
+            ready: false,
+            prompt_subscribers: vec![],
+            response_publishers: vec!["loop".to_string()],
+            unsatisfied_required_imports: vec![MissingImport {
+                capsule: "loop".to_string(),
+                namespace: "astrid".to_string(),
+                interface: "llm".to_string(),
+                requirement: "^1.0".to_string(),
+            }],
+            loaded_capsules: vec!["loop".to_string()],
+        };
+        let payload = unready_payload(&report);
+        assert_eq!(payload["error"], "agent loop not ready");
+        assert_eq!(payload["missing"]["prompt_subscriber"], true);
+        assert_eq!(payload["missing"]["response_publisher"], false);
+        let imports = payload["missing"]["unsatisfied_imports"]
+            .as_array()
+            .expect("unsatisfied_imports is an array");
+        assert_eq!(imports.len(), 1);
+        assert_eq!(imports[0], "astrid:llm (^1.0)");
+    }
+
+    /// A ready report still serializes (defensive — `unready_payload` is only
+    /// called on the not-ready path, but it must not panic on a ready one).
+    #[test]
+    fn unready_payload_ready_report_reports_no_missing() {
+        let report = AgentLoopReadiness {
+            ready: true,
+            prompt_subscribers: vec!["loop".to_string()],
+            response_publishers: vec!["loop".to_string()],
+            unsatisfied_required_imports: vec![],
+            loaded_capsules: vec!["loop".to_string()],
+        };
+        let payload = unready_payload(&report);
+        assert_eq!(payload["missing"]["prompt_subscriber"], false);
+        assert_eq!(payload["missing"]["response_publisher"], false);
+        assert!(
+            payload["missing"]["unsatisfied_imports"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    /// The fail-fast stream emits exactly one `error` event and then closes —
+    /// it does NOT wait out the 5-minute timeout against a loop that can never
+    /// reply. Drive the inner stream and assert single-event termination.
+    #[tokio::test]
+    async fn unready_stream_emits_single_event_then_closes() {
+        let report = AgentLoopReadiness {
+            ready: false,
+            prompt_subscribers: vec![],
+            response_publishers: vec![],
+            unsatisfied_required_imports: vec![],
+            loaded_capsules: vec![],
+        };
+        let mut stream = unready_event_stream(&report);
+        // Exactly one event, then end-of-stream — the load-bearing property:
+        // the fail-fast path closes immediately rather than waiting out the
+        // 5-minute timeout against a loop that can never reply.
+        let _first = stream.next().await.expect("one event").expect("infallible");
+        assert!(
+            stream.next().await.is_none(),
+            "fail-fast stream must close after one event, not wait the timeout"
+        );
+    }
 }

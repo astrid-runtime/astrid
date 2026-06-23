@@ -431,6 +431,15 @@ async fn handle_request(
             }
             KernelResponse::CapsuleMetadata(entries)
         },
+        KernelRequest::GetAgentReadiness => {
+            let reg = kernel.capsules.read().await;
+            let manifests: Vec<&astrid_capsule::manifest::CapsuleManifest> = reg
+                .values()
+                .map(astrid_capsule::capsule::Capsule::manifest)
+                .collect();
+            let readiness = astrid_capsule::readiness::agent_loop_readiness(&manifests);
+            KernelResponse::AgentReadiness(readiness)
+        },
     };
 
     publish_response(kernel, response_topic, res);
@@ -510,6 +519,7 @@ fn rate_limit_max(req: &KernelRequest) -> Option<u32> {
         KernelRequest::ListCapsules
         | KernelRequest::GetCommands
         | KernelRequest::GetCapsuleMetadata
+        | KernelRequest::GetAgentReadiness
         | KernelRequest::GetStatus => None,
     }
 }
@@ -565,13 +575,15 @@ pub fn required_capability(req: &KernelRequest, scope: AuthorityScope) -> &'stat
         (
             KernelRequest::ListCapsules
             | KernelRequest::GetCommands
-            | KernelRequest::GetCapsuleMetadata,
+            | KernelRequest::GetCapsuleMetadata
+            | KernelRequest::GetAgentReadiness,
             AuthorityScope::Self_,
         ) => "self:capsule:list",
         (
             KernelRequest::ListCapsules
             | KernelRequest::GetCommands
-            | KernelRequest::GetCapsuleMetadata,
+            | KernelRequest::GetCapsuleMetadata
+            | KernelRequest::GetAgentReadiness,
             _,
         ) => "capsule:list",
         (KernelRequest::ApproveCapability { .. }, _) => "self:approval:respond",
@@ -591,6 +603,7 @@ pub fn kernel_request_method(req: &KernelRequest) -> &'static str {
         KernelRequest::ListCapsules => "ListCapsules",
         KernelRequest::GetCommands => "GetCommands",
         KernelRequest::GetCapsuleMetadata => "GetCapsuleMetadata",
+        KernelRequest::GetAgentReadiness => "GetAgentReadiness",
         KernelRequest::Shutdown { .. } => "Shutdown",
         KernelRequest::GetStatus => "GetStatus",
     }

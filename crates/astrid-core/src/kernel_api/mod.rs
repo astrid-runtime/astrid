@@ -8,6 +8,9 @@
 //! has no dependency on `astrid-core` — it must compile on
 //! `wasm32-unknown-unknown` without dragging in the kernel).
 
+mod readiness;
+pub use readiness::{AgentLoopReadiness, AgentReadinessProbe, MissingImport};
+
 use crate::PrincipalId;
 use crate::profile::Quotas;
 use serde::{Deserialize, Serialize};
@@ -70,6 +73,9 @@ pub enum KernelRequest {
     },
     /// Request daemon status information.
     GetStatus,
+    /// Request agent-loop readiness: whether the loaded capsule set can serve
+    /// an agent chat turn. Read-only, name-agnostic — see [`AgentLoopReadiness`].
+    GetAgentReadiness,
 }
 
 /// Management API responses from the core daemon.
@@ -86,6 +92,8 @@ pub enum KernelResponse {
     Error(String),
     /// Daemon status information.
     Status(DaemonStatus),
+    /// Agent-loop readiness report.
+    AgentReadiness(AgentLoopReadiness),
     /// The request requires user capability approval before it can proceed.
     ApprovalRequired {
         /// Unique ID for this specific action request.

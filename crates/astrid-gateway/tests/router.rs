@@ -77,6 +77,7 @@ fn fresh_state_with_distro(distro: Option<&str>) -> Arc<GatewayState> {
         audit_log: None,
         session_id: None,
         gateway_route_uuid: uuid::Uuid::new_v4(),
+        readiness_probe: None,
     })
 }
 
@@ -158,6 +159,27 @@ async fn device_routes_require_a_bearer() {
         router.oneshot(revoke).await.unwrap().status(),
         StatusCode::UNAUTHORIZED,
         "DELETE /devices/{{key_id}} must require a bearer"
+    );
+}
+
+#[tokio::test]
+async fn readiness_route_requires_a_bearer() {
+    // `GET /api/sys/readiness` is capsule-set introspection gated like the
+    // capsule-list family — it must sit behind the auth middleware. A
+    // regression that registered it on the public router would leak the
+    // loaded-capsule set without a bearer. Assert it rejects an
+    // unauthenticated request at the middleware, before any kernel round-trip.
+    let state = fresh_state_with_distro(None);
+    let router = routes::build(state);
+
+    let req = Request::builder()
+        .uri("/api/sys/readiness")
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(
+        router.oneshot(req).await.unwrap().status(),
+        StatusCode::UNAUTHORIZED,
+        "GET /api/sys/readiness must require a bearer"
     );
 }
 
@@ -455,6 +477,7 @@ fn openapi_lists_every_router_route() {
         "/api/sys/audit",
         "/api/agent/prompt",
         "/api/sys/status",
+        "/api/sys/readiness",
         "/api/sys/capsules/reload",
     ];
 

@@ -112,6 +112,7 @@ use crate::state::GatewayState;
         routes::audit::get_audit,
         // System
         routes::system::get_status,
+        routes::system::get_readiness,
         routes::system::reload_capsules,
         // Ops probes
         routes::observability::get_healthz,

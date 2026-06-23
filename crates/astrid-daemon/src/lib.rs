@@ -270,7 +270,7 @@ fn spawn_gateway(
     cfg: astrid_gateway::GatewayConfig,
     kernel: &std::sync::Arc<astrid_kernel::Kernel>,
 ) -> Result<std::sync::Arc<tokio::sync::Notify>> {
-    // Plumb three kernel handles into the gateway:
+    // Plumb four kernel handles into the gateway:
     //
     //   * the event bus, so the SSE audit stream and the bus-direct
     //     admin client can subscribe / publish locally without going
@@ -279,13 +279,23 @@ fn spawn_gateway(
     //     `GET /api/sys/audit` historical-query route has somewhere
     //     to read from;
     //   * the session id (paired with the audit log because the
-    //     log indexes entries by session).
+    //     log indexes entries by session);
+    //   * the agent-loop readiness probe, so the `POST /api/agent/prompt`
+    //     fail-fast can read live daemon health in-process — without a
+    //     per-principal capability check (serviceability is global health,
+    //     not authorization) or a socket round-trip.
     let bus = std::sync::Arc::clone(&kernel.event_bus);
     let audit_log = std::sync::Arc::clone(&kernel.audit_log);
     let session_id = kernel.session_id.clone();
-    let state =
-        astrid_gateway::GatewayState::new(cfg, Some(bus), Some(audit_log), Some(session_id))
-            .context("build gateway state")?;
+    let readiness_probe = kernel.agent_readiness_probe();
+    let state = astrid_gateway::GatewayState::new(
+        cfg,
+        Some(bus),
+        Some(audit_log),
+        Some(session_id),
+        Some(readiness_probe),
+    )
+    .context("build gateway state")?;
     let notify = std::sync::Arc::new(tokio::sync::Notify::new());
     let notify_for_task = std::sync::Arc::clone(&notify);
     tokio::spawn(async move {
