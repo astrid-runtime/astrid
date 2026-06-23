@@ -107,6 +107,10 @@ use crate::state::GatewayState;
         routes::env::write_env,
         // Agent invocation
         routes::agent::post_prompt,
+        // Models (active-LLM selection)
+        routes::models::list_models,
+        routes::models::get_active_model,
+        routes::models::set_active_model,
         // Audit
         routes::events::get_events,
         routes::audit::get_audit,
@@ -166,6 +170,8 @@ use crate::state::GatewayState;
             // Agent
             routes::agent::PromptRequest,
             routes::agent::PromptReady,
+            // Models
+            routes::models::SetActiveModelRequest,
             // Env
             routes::env::EnvFieldSchema,
             routes::env::EnvSchemaResponse,
@@ -195,6 +201,7 @@ use crate::state::GatewayState;
         (name = "capsules", description = "Capsule install + introspection"),
         (name = "env", description = "Per-principal capsule configuration"),
         (name = "agent", description = "Agent invocation (SSE response stream)"),
+        (name = "models", description = "Active-LLM model discovery + binding (per principal)"),
         (name = "audit", description = "Audit-event stream (SSE)"),
         (name = "system", description = "Daemon status + lifecycle"),
         (name = "discovery", description = "Pre-auth onboarding hints"),

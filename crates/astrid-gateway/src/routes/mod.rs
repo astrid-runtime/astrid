@@ -22,12 +22,18 @@ pub mod env;
 pub mod events;
 pub mod groups;
 pub mod invites;
+pub mod models;
 pub mod observability;
 pub mod principals;
 pub mod quotas;
 pub mod system;
 
 /// Build the gateway's HTTP router.
+// A flat list of route registrations: its length tracks the API surface,
+// not branching complexity, and both the readiness and models surfaces add
+// rows here. Splitting it into sub-routers would obscure the single
+// public/authed grouping for no readability gain.
+#[allow(clippy::too_many_lines)]
 pub fn build(state: Arc<GatewayState>) -> Router {
     // Unauthenticated routes — discovery + redeem + ops probes.
     let public = Router::new()
@@ -128,6 +134,10 @@ pub fn build(state: Arc<GatewayState>) -> Router {
         .route("/api/sys/audit", get(audit::get_audit))
         // ── Agent invocation (SSE) ──
         .route("/api/agent/prompt", post(agent::post_prompt))
+        // ── Models (active-LLM selection) ──
+        .route("/api/models", get(models::list_models))
+        .route("/api/models/active", get(models::get_active_model))
+        .route("/api/models/active", put(models::set_active_model))
         // ── System ──
         .route("/api/sys/status", get(system::get_status))
         .route("/api/sys/readiness", get(system::get_readiness))
