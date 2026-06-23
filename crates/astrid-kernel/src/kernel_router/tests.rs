@@ -347,3 +347,28 @@ async fn get_agent_readiness_returns_readiness_response() {
         other => panic!("expected AgentReadiness, got {other:?}"),
     }
 }
+
+/// The in-process readiness probe the gateway uses for the prompt fail-fast
+/// must reflect the live registry with NO capability check or socket round-trip
+/// — that is what makes the fail-fast fire for every authenticated prompt
+/// caller, single- and multi-tenant alike, not only `capsule:list` holders. A
+/// kernel with no capsules loaded can't serve a chat turn, so the probe reports
+/// not-ready. Regression guard: this would have failed when the prompt path
+/// went through the capability-gated `GetAgentReadiness` request as the caller.
+#[tokio::test]
+async fn agent_readiness_probe_reflects_loaded_registry_without_capability() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let home = astrid_core::dirs::AstridHome::from_path(dir.path());
+    let kernel = crate::test_kernel_with_home(home).await;
+
+    // No admin seeding, no router — the probe is a direct in-process read.
+    let report = kernel.agent_readiness_probe().probe().await;
+    assert!(
+        !report.ready,
+        "empty registry must not be ready: {report:?}"
+    );
+    assert!(
+        report.prompt_subscribers.is_empty(),
+        "no capsule subscribes the prompt topic"
+    );
+}

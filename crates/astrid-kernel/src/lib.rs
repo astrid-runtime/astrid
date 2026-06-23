@@ -715,6 +715,31 @@ impl Kernel {
         self.publish_capsules_loaded().await;
     }
 
+    /// Build an in-process agent-loop readiness probe over the live registry.
+    ///
+    /// Handed to the co-located gateway so its prompt fail-fast can ask whether
+    /// the loaded set can serve a chat turn directly — agent-loop serviceability
+    /// is global daemon health, not per-principal authorization, so it needs no
+    /// capability check and no socket round-trip (unlike the capability-gated
+    /// `GetAgentReadiness` request, which exists for the detailed, ops-facing
+    /// `/api/sys/readiness` view and `astrid doctor`). The closure clones the
+    /// registry `Arc`, so each call reflects the current loaded set.
+    #[must_use]
+    pub fn agent_readiness_probe(&self) -> astrid_core::kernel_api::AgentReadinessProbe {
+        let registry = Arc::clone(&self.capsules);
+        astrid_core::kernel_api::AgentReadinessProbe::new(move || {
+            let registry = Arc::clone(&registry);
+            Box::pin(async move {
+                let reg = registry.read().await;
+                let manifests: Vec<&astrid_capsule::manifest::CapsuleManifest> = reg
+                    .values()
+                    .map(astrid_capsule::capsule::Capsule::manifest)
+                    .collect();
+                astrid_capsule::readiness::agent_loop_readiness(&manifests)
+            })
+        })
+    }
+
     /// Publish `astrid.v1.capsules_loaded` so subscribers re-read the current
     /// capsule/tool set after the loaded set changes — the registry, and the
     /// `astrid mcp serve` shim, which turns this into an MCP

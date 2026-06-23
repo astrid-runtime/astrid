@@ -77,6 +77,7 @@ fn fresh_state_with_distro(distro: Option<&str>) -> Arc<GatewayState> {
         audit_log: None,
         session_id: None,
         gateway_route_uuid: uuid::Uuid::new_v4(),
+        readiness_probe: None,
     })
 }
 

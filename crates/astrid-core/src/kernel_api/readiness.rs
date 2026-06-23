@@ -31,6 +31,53 @@ pub struct AgentLoopReadiness {
     pub loaded_capsules: Vec<String>,
 }
 
+/// In-process agent-loop readiness probe.
+///
+/// Agent-loop serviceability ("can this daemon serve a chat turn?") is global
+/// daemon health, not per-principal authorization — so the co-located gateway's
+/// prompt fail-fast reads it directly instead of issuing the capability-gated
+/// [`crate::kernel_api::KernelRequest::GetAgentReadiness`] as the caller (which
+/// only admins/`capsule:list` holders could answer). The closure is built in
+/// `astrid-kernel` (which owns the live registry) and merely invoked by the
+/// gateway, so neither the capability model nor the gateway's dependency on the
+/// WASM engine is touched. Defined here so both crates can name it without a
+/// dependency cycle, and spelled with `std` types so `astrid-core` needs no
+/// `futures` dependency.
+#[derive(Clone)]
+pub struct AgentReadinessProbe(
+    #[allow(clippy::type_complexity)]
+    std::sync::Arc<
+        dyn Fn() -> std::pin::Pin<Box<dyn std::future::Future<Output = AgentLoopReadiness> + Send>>
+            + Send
+            + Sync,
+    >,
+);
+
+impl AgentReadinessProbe {
+    /// Wrap a readiness-computing closure. The closure must be cheap and
+    /// self-contained (it captures whatever state it reads) so each call
+    /// reflects the current loaded set.
+    pub fn new(
+        f: impl Fn() -> std::pin::Pin<Box<dyn std::future::Future<Output = AgentLoopReadiness> + Send>>
+        + Send
+        + Sync
+        + 'static,
+    ) -> Self {
+        Self(std::sync::Arc::new(f))
+    }
+
+    /// Compute current readiness.
+    pub async fn probe(&self) -> AgentLoopReadiness {
+        (self.0)().await
+    }
+}
+
+impl std::fmt::Debug for AgentReadinessProbe {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("AgentReadinessProbe(..)")
+    }
+}
+
 /// A required interface import with no matching export among loaded capsules.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MissingImport {

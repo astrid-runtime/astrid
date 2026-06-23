@@ -47,12 +47,10 @@ use std::convert::Infallible;
 use std::sync::Arc;
 use std::time::Duration;
 
-use astrid_core::PrincipalId;
-use astrid_core::kernel_api::{AgentLoopReadiness, KernelRequest, KernelResponse};
+use astrid_core::kernel_api::AgentLoopReadiness;
 use astrid_events::AstridEvent;
 use astrid_events::ipc::{IpcMessage, IpcPayload};
 use astrid_types::ipc::IpcPayload as TypesIpcPayload;
-use astrid_uplink::KernelClient;
 use axum::extract::State;
 use axum::http::Request;
 use axum::response::Sse;
@@ -154,17 +152,21 @@ pub async fn post_prompt(
     // Fail fast on an unconfigured agent loop. A daemon whose loaded capsule
     // set has no prompt subscriber / response publisher (or an unsatisfied
     // required import) would otherwise emit `ready`, wait out the 5-minute
-    // timeout, and close empty — the client gets no signal. Probe readiness
-    // first and, when it is definitively NOT ready, return a single `error`
-    // SSE event and close immediately.
+    // timeout, and close empty — the client gets no signal. So when the loop
+    // is definitively NOT ready, return a single `error` SSE event and close
+    // immediately.
     //
-    // Fail OPEN: if the readiness probe itself errors (daemon socket flake,
-    // timeout) we proceed exactly as before — never block a legitimately
-    // configured prompt on a probe failure.
-    if let Some(report) = probe_agent_readiness(&caller.principal).await
-        && !report.ready
-    {
-        return Ok(unready_stream(&report));
+    // Readiness is read from the in-process probe the daemon wired in: it
+    // reflects live daemon health and needs no per-principal capability, so the
+    // fail-fast fires for EVERY authenticated prompt caller (single- and
+    // multi-tenant alike), not only `capsule:list` holders. Fail OPEN: when no
+    // probe is wired (standalone test build) we proceed exactly as before,
+    // never blocking a legitimately-configured prompt.
+    if let Some(probe) = &state.readiness_probe {
+        let report = probe.probe().await;
+        if !report.ready {
+            return Ok(unready_stream(&report));
+        }
     }
 
     // Subscribe FIRST, then publish. Reverse order would race a fast
@@ -293,56 +295,6 @@ fn sse_with_keepalive(
             .interval(Duration::from_secs(15))
             .text("keep-alive"),
     )
-}
-
-/// How long the readiness probe may take before the prompt path gives up and
-/// fails open. The whole point of the probe is to AVOID a hang, so both the
-/// socket connect and the request read are bounded well under any human's
-/// patience; on expiry we proceed exactly as if the loop were ready.
-const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
-
-/// Probe the kernel for agent-loop readiness on behalf of `principal`.
-///
-/// Returns `Some(report)` when the kernel answered (ready or not), and
-/// `None` when the probe could not complete (no daemon, connect/read timeout,
-/// unexpected response, or the caller lacks the capability the kernel gates
-/// `GetAgentReadiness` with) — the caller fails OPEN on `None`, never blocking
-/// a legitimately-configured prompt on a probe failure.
-///
-/// Capability note: `GetAgentReadiness` is gated `capsule:list`. The common
-/// single-tenant principal (admin `*`) holds it, so the fail-fast fires there.
-/// A multi-tenant principal WITHOUT `capsule:list` gets a kernel `Error` here,
-/// falls open, and sees today's behaviour (the prompt stream waits out its
-/// timeout) — a graceful degradation, not a regression. Widening the probe to
-/// every prompt-capable principal is a capability-model decision tracked
-/// separately rather than silently broadened here.
-async fn probe_agent_readiness(principal: &PrincipalId) -> Option<AgentLoopReadiness> {
-    let connect = tokio::time::timeout(PROBE_TIMEOUT, KernelClient::connect(principal.clone()));
-    let mut client = match connect.await {
-        Ok(Ok(c)) => c.with_timeout(PROBE_TIMEOUT),
-        Ok(Err(e)) => {
-            tracing::debug!(error = %e, "agent readiness probe: connect failed; proceeding (fail-open)");
-            return None;
-        },
-        Err(_) => {
-            tracing::debug!("agent readiness probe: connect timed out; proceeding (fail-open)");
-            return None;
-        },
-    };
-    match client.request(KernelRequest::GetAgentReadiness).await {
-        Ok(KernelResponse::AgentReadiness(report)) => Some(report),
-        Ok(other) => {
-            tracing::debug!(
-                ?other,
-                "agent readiness probe: unexpected response; proceeding (fail-open)"
-            );
-            None
-        },
-        Err(e) => {
-            tracing::warn!(error = %e, "agent readiness probe failed; proceeding (fail-open)");
-            None
-        },
-    }
 }
 
 /// Build a one-shot SSE stream that emits a single `error` event naming what

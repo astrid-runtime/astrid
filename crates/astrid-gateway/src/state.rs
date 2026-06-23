@@ -238,6 +238,16 @@ pub struct GatewayState {
     /// receivers for the routed surface so the per-(topic, principal)
     /// DRR fairness machinery applies to the SSE streams.
     pub gateway_route_uuid: Uuid,
+    /// In-process agent-loop readiness probe. `Some` when the gateway is
+    /// spawned by `astrid-daemon` (co-located with the kernel); `None` for the
+    /// route-level / standalone test constructors, in which case the prompt
+    /// fail-fast proceeds (fails open) exactly as if the loop were ready.
+    ///
+    /// The prompt fail-fast calls this to learn whether the loaded capsule set
+    /// can serve a chat turn — global daemon health, so it needs no
+    /// per-principal capability and no socket round-trip. The detailed,
+    /// ops-facing view stays behind the capability-gated `GET /api/sys/readiness`.
+    pub readiness_probe: Option<astrid_core::kernel_api::AgentReadinessProbe>,
 }
 
 impl GatewayState {
@@ -252,6 +262,7 @@ impl GatewayState {
         event_bus: Option<Arc<astrid_events::EventBus>>,
         audit_log: Option<Arc<astrid_audit::AuditLog>>,
         session_id: Option<astrid_core::SessionId>,
+        readiness_probe: Option<astrid_core::kernel_api::AgentReadinessProbe>,
     ) -> anyhow::Result<Arc<Self>> {
         let (distribution, onboarding) = match &config.distro_path {
             Some(p) => {
@@ -293,6 +304,7 @@ impl GatewayState {
             audit_log,
             session_id,
             gateway_route_uuid: Uuid::new_v4(),
+            readiness_probe,
         }))
     }
 
