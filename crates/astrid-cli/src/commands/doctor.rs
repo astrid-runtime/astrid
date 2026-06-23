@@ -191,10 +191,16 @@ async fn agent_readiness() -> Result<astrid_core::kernel_api::AgentLoopReadiness
 fn readiness_detail(report: &astrid_core::kernel_api::AgentLoopReadiness) -> String {
     let mut parts: Vec<String> = Vec::new();
     if report.prompt_subscribers.is_empty() {
-        parts.push("no capsule subscribes user.v1.prompt".to_string());
+        parts.push(format!(
+            "no capsule subscribes {}",
+            astrid_capsule::readiness::AGENT_PROMPT_TOPIC
+        ));
     }
     if report.response_publishers.is_empty() {
-        parts.push("no capsule publishes agent.v1.response".to_string());
+        parts.push(format!(
+            "no capsule publishes {}",
+            astrid_capsule::readiness::AGENT_RESPONSE_TOPIC
+        ));
     }
     if !report.unsatisfied_required_imports.is_empty() {
         let ifaces: Vec<String> = report

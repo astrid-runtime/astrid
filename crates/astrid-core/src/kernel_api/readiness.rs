@@ -79,7 +79,11 @@ impl std::fmt::Debug for AgentReadinessProbe {
 }
 
 /// A required interface import with no matching export among loaded capsules.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// `Ord` (by capsule, namespace, interface, requirement in declaration order)
+/// so readiness reports can present a stable, sorted list — the loaded set is
+/// iterated from a `HashMap`, which has no inherent order.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct MissingImport {
     /// The capsule whose import is unsatisfied.
     pub capsule: String,

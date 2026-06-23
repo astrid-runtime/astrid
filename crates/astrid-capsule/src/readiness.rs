@@ -184,6 +184,19 @@ pub fn agent_loop_readiness<M: AsRef<CapsuleManifest>>(manifests: &[M]) -> Agent
     let ready =
         !prompt_subscribers.is_empty() && !response_publishers.is_empty() && unsatisfied.is_empty();
 
+    // Sort every collection: the loaded set is iterated from a `HashMap`, so
+    // raw order is nondeterministic run-to-run. This is an ops-facing API/CLI
+    // surface (`GET /api/sys/readiness`, `astrid doctor`), so a stable order
+    // keeps output diffable and downstream assertions non-flaky.
+    let mut prompt_subscribers = prompt_subscribers;
+    let mut response_publishers = response_publishers;
+    let mut loaded_capsules = loaded_capsules;
+    let mut unsatisfied = unsatisfied;
+    prompt_subscribers.sort();
+    response_publishers.sort();
+    loaded_capsules.sort();
+    unsatisfied.sort();
+
     AgentLoopReadiness {
         ready,
         prompt_subscribers,
@@ -422,5 +435,33 @@ mod tests {
         assert_eq!(missing[0].interface, "telemetry");
         // The same self-only optional import is NOT counted as a required miss.
         assert!(unsatisfied_required_imports(&set).is_empty());
+    }
+
+    #[test]
+    fn readiness_collections_are_sorted() {
+        // The loaded set is HashMap-iterated (nondeterministic order), so
+        // agent_loop_readiness sorts every collection for stable, diffable
+        // ops output. Pass capsules out of order and assert sorted results.
+        let set = vec![
+            manifest(
+                "zeta",
+                &[AGENT_PROMPT_TOPIC],
+                &[AGENT_RESPONSE_TOPIC],
+                &[],
+                &[],
+            ),
+            manifest(
+                "alpha",
+                &[AGENT_PROMPT_TOPIC],
+                &[AGENT_RESPONSE_TOPIC],
+                &[],
+                &[],
+            ),
+            manifest("mid", &[], &[], &[], &[]),
+        ];
+        let r = agent_loop_readiness(&set);
+        assert_eq!(r.loaded_capsules, vec!["alpha", "mid", "zeta"]);
+        assert_eq!(r.prompt_subscribers, vec!["alpha", "zeta"]);
+        assert_eq!(r.response_publishers, vec!["alpha", "zeta"]);
     }
 }
