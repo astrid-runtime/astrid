@@ -170,6 +170,20 @@ pub enum IpcPayload {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         reason: Option<String>,
     },
+    /// A grant-on-first-use signal: principal `principal` invoked a tool from
+    /// capsule `capsule_id` that they do not currently hold. The broker/shim
+    /// elicits consent and, on approve, the kernel grants the capsule.
+    /// Distinct from [`ApprovalRequired`](IpcPayload::ApprovalRequired) so the
+    /// broker can tell a grant-on-use from a plain capability approval.
+    GrantRequired {
+        /// Unguessable correlation id (a UUID) the response is keyed on, used
+        /// to build `astrid.v1.approval.response.<request_id>`.
+        request_id: String,
+        /// The kernel-stamped caller principal that hit the access-gate miss.
+        principal: String,
+        /// The capsule id the principal needs granted.
+        capsule_id: String,
+    },
     /// A capsule needs environment variables to be provided by the user.
     OnboardingRequired {
         /// The ID of the capsule requiring onboarding.
@@ -285,6 +299,7 @@ impl IpcPayload {
                 | "agent_response"
                 | "approval_required"
                 | "approval_response"
+                | "grant_required"
                 | "onboarding_required"
                 | "llm_request"
                 | "llm_stream_event"
@@ -552,7 +567,7 @@ mod tests {
     #[test]
     #[allow(clippy::too_many_lines, reason = "exhaustive variant table")]
     fn is_known_tag_covers_all_variants() {
-        const EXPECTED_VARIANT_COUNT: usize = 17;
+        const EXPECTED_VARIANT_COUNT: usize = 18;
 
         let representatives: Vec<IpcPayload> = vec![
             IpcPayload::RawJson(serde_json::json!({"key": "val"})),
@@ -576,6 +591,11 @@ mod tests {
                 request_id: "req-1".into(),
                 decision: "approve".into(),
                 reason: None,
+            },
+            IpcPayload::GrantRequired {
+                request_id: "req-1".into(),
+                principal: "alice".into(),
+                capsule_id: "cap".into(),
             },
             IpcPayload::OnboardingRequired {
                 capsule_id: String::new(),
@@ -675,6 +695,21 @@ mod tests {
         assert!(!IpcPayload::is_known_tag("unknown"));
         assert!(!IpcPayload::is_known_tag(""));
         assert!(!IpcPayload::is_known_tag("Raw_Json"));
+    }
+
+    #[test]
+    fn grant_required_roundtrips_with_tag() {
+        let payload = IpcPayload::GrantRequired {
+            request_id: "req-1".into(),
+            principal: "alice".into(),
+            capsule_id: "secret-tool".into(),
+        };
+        let json = serde_json::to_value(&payload).unwrap();
+        assert_eq!(json["type"].as_str(), Some("grant_required"));
+        assert!(IpcPayload::is_known_tag("grant_required"));
+
+        let parsed: IpcPayload = serde_json::from_value(json).unwrap();
+        assert_eq!(parsed, payload);
     }
 
     #[test]
