@@ -258,10 +258,10 @@ pub fn spawn_watcher(
 /// # Panics
 /// Panics if the `revoked_key_ids` `RwLock` is poisoned — same fail-stop
 /// posture as the verify path.
-#[allow(clippy::implicit_hasher)] // set shape is internal to this module
+#[allow(clippy::implicit_hasher)] // map shape is internal to this module
 pub fn spawn_key_revocation_watcher(
     bus: Arc<astrid_events::EventBus>,
-    revoked_key_ids: Arc<RwLock<std::collections::HashSet<String>>>,
+    revoked_key_ids: Arc<RwLock<std::collections::HashMap<String, u64>>>,
 ) {
     tokio::spawn(async move {
         let mut receiver =
@@ -297,13 +297,29 @@ pub fn spawn_key_revocation_watcher(
                 );
                 continue;
             };
+            // `ts_epoch` from the audit envelope is the revocation moment; a
+            // bearer minted at-or-before it is dead, one minted after a re-pair
+            // survives. Mirrors the principal-level `AgentDelete` watcher.
+            let ts_epoch = val
+                .get("ts_epoch")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or_else(|| {
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map_or(0, |d| d.as_secs())
+                });
             {
                 let mut guard = revoked_key_ids
                     .write()
-                    .expect("revoked-key-id set poisoned — fail-stop");
-                guard.insert(key_id.to_string());
+                    .expect("revoked-key-id map poisoned — fail-stop");
+                // Idempotent: a duplicate / replayed revoke event must not move
+                // the epoch backward (which could resurrect a dead bearer).
+                let prev = guard.get(key_id).copied().unwrap_or(0);
+                if ts_epoch > prev {
+                    guard.insert(key_id.to_string(), ts_epoch);
+                }
             }
-            tracing::info!(key_id = %key_id, "device bearer revocation recorded");
+            tracing::info!(key_id = %key_id, revoked_at_epoch = ts_epoch, "device bearer revocation recorded");
         }
     });
 }

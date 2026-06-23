@@ -72,7 +72,7 @@ fn fresh_state_with_distro(distro: Option<&str>) -> Arc<GatewayState> {
         event_bus: None,
         revoked_at: std::sync::Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
         revoked_key_ids: std::sync::Arc::new(std::sync::RwLock::new(
-            std::collections::HashSet::new(),
+            std::collections::HashMap::new(),
         )),
         audit_log: None,
         session_id: None,
@@ -602,33 +602,44 @@ async fn scoped_bearer_carries_device_key_id_to_caller_context() {
 
 #[tokio::test]
 async fn revoked_device_key_id_rejects_bearer() {
-    // Criterion 4 (HTTP half): once a device's key_id is in the gateway's
-    // revoked set (populated from the PairDeviceRevoke audit signal), its
-    // bearer is rejected by `verify_bearer` — the live HTTP session stops
+    // Criterion 4 (HTTP half): a device-scoped bearer minted at-or-before its
+    // key_id's revocation epoch (recorded from the PairDeviceRevoke audit
+    // signal) is rejected by `verify_bearer` — the live HTTP session stops
     // immediately, independent of the bearer's remaining TTL.
     let state = fresh_state_with_distro(None);
     let principal = PrincipalId::new("alice").unwrap();
     let key_id = "deadbeefcafe0001";
     let bearer = mint_bearer_scoped(&state.signing.signer, &principal, key_id, 3600);
 
-    // Before revocation the scoped bearer verifies.
-    assert!(
-        verify_bearer(&state, &bearer).is_ok(),
-        "scoped bearer verifies before revocation"
-    );
+    // The bearer's iat anchors the at-or-before-revoke comparison.
+    let iat = verify_bearer(&state, &bearer)
+        .expect("scoped bearer verifies before revocation")
+        .issued_at_epoch;
 
-    // Revoke the key_id (mirrors what the audit watcher does on a successful
-    // PairDeviceRevoke).
+    // Revoke at-or-after the bearer's iat (what the audit watcher records on a
+    // successful PairDeviceRevoke) → the bearer is a dead session.
     state
         .revoked_key_ids
         .write()
-        .expect("revoked key set")
-        .insert(key_id.to_string());
-
-    // Now the same bearer is rejected.
+        .expect("revoked key map")
+        .insert(key_id.to_string(), iat);
     assert!(
         verify_bearer(&state, &bearer).is_err(),
-        "a bearer scoped to a revoked key_id must be rejected"
+        "a bearer minted at-or-before the revoke epoch must be rejected"
+    );
+
+    // Re-pair: the same deterministic key_id, but recorded with an EARLIER
+    // revoke epoch than this bearer was minted (iat > revoked_at — i.e. a bearer
+    // minted after the device was re-paired). Keying on the epoch rather than a
+    // bare membership set lets it authenticate instead of being dead forever.
+    state
+        .revoked_key_ids
+        .write()
+        .expect("revoked key map")
+        .insert(key_id.to_string(), iat.saturating_sub(1));
+    assert!(
+        verify_bearer(&state, &bearer).is_ok(),
+        "a bearer minted after the revoke epoch (re-pair) must authenticate"
     );
 
     // A bearer for a DIFFERENT key on the same principal is unaffected.

@@ -238,17 +238,21 @@ pub fn verify_bearer(state: &GatewayState, raw: &str) -> Result<CallerContext, G
         return Err(GatewayError::Unauthorized);
     }
 
-    // Per-device revocation: a device-scoped bearer whose `key_id` was revoked
-    // (`PairDeviceRevoke`) is a dead session — stop it immediately rather than
-    // waiting for its TTL. Defense in depth: the key is already gone from the
-    // principal's `public_keys`, so every kernel request would fail closed
-    // anyway, but this rejects the HTTP bearer at the edge.
+    // Per-device revocation: a device-scoped bearer minted at-or-before the
+    // moment its `key_id` was revoked (`PairDeviceRevoke`) is a dead session —
+    // stop it immediately rather than waiting for its TTL. Defense in depth: the
+    // key is already gone from the principal's `public_keys`, so every kernel
+    // request would fail closed anyway, but this rejects the HTTP bearer at the
+    // edge. The `iat <= revoked_at` comparison (mirroring principal revocation)
+    // means a bearer minted *after* the same deterministic key was re-paired
+    // still authenticates — the map is not a permanent deny-list.
     if let Some(key_id) = &device_key_id
-        && state
+        && let Some(&revoked_at) = state
             .revoked_key_ids
             .read()
-            .expect("revoked-key-id set poisoned — fail-stop on the auth path")
-            .contains(key_id)
+            .expect("revoked-key-id map poisoned — fail-stop on the auth path")
+            .get(key_id)
+        && issued_at_epoch <= revoked_at
     {
         return Err(GatewayError::Unauthorized);
     }
@@ -315,7 +319,7 @@ mod tests {
                 std::collections::HashMap::new(),
             )),
             revoked_key_ids: std::sync::Arc::new(std::sync::RwLock::new(
-                std::collections::HashSet::new(),
+                std::collections::HashMap::new(),
             )),
             audit_log: None,
             session_id: None,

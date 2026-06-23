@@ -43,7 +43,7 @@ fn state_with_origins(origins: Vec<&str>) -> Arc<GatewayState> {
         event_bus: None,
         revoked_at: std::sync::Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
         revoked_key_ids: std::sync::Arc::new(std::sync::RwLock::new(
-            std::collections::HashSet::new(),
+            std::collections::HashMap::new(),
         )),
         audit_log: None,
         session_id: None,
