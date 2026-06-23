@@ -25,21 +25,45 @@
 //! Hex-encoded 64-byte ed25519 signature, single line, no prefix. Hex
 //! over base64 for auditability (every byte is visible, copy-pastes
 //! cleanly, no padding ambiguity).
+//!
+//! ## Domain separation (DECISION)
+//!
+//! [`astrid_crypto::KeyPair`] is the same ed25519 primitive used for
+//! capability tokens, so a key reused across protocols could otherwise
+//! enable cross-protocol signature confusion (a signature produced for
+//! one protocol replayed as a valid signature in another). To prevent
+//! this, the signed digest is domain-separated: we feed blake3 a fixed
+//! protocol context tag — [`SIG_DOMAIN_TAG`] — followed by the canonical
+//! lock bytes, and sign the resulting 32-byte hash. A signature over the
+//! un-tagged digest therefore does not verify here, and vice versa. The
+//! tag is prepended (rather than using `blake3::derive_key`'s keyed mode)
+//! because the input is auditable as `tag || canonical_json(lock)`.
 
 use anyhow::Context;
 use astrid_crypto::{KeyPair, PublicKey, Signature};
 
 use super::lock::DistroLock;
 
+/// Fixed protocol-context tag prepended to the canonical lock bytes
+/// before hashing, domain-separating distro-lock signatures from every
+/// other use of [`astrid_crypto::KeyPair`] (e.g. capability tokens). The
+/// trailing NUL is an unambiguous length-delimiter between the tag and
+/// the lock payload. Bumping the `-vN` suffix is a wire-breaking change.
+const SIG_DOMAIN_TAG: &[u8] = b"astrid-distro-lock-sig-v1\x00";
+
 /// Serialize the lock to its canonical signing bytes.
 pub(crate) fn canonical_lock_bytes(lock: &DistroLock) -> anyhow::Result<Vec<u8>> {
     serde_json::to_vec(lock).context("failed to canonicalize Distro.lock for signing")
 }
 
-/// The 32-byte blake3 digest that the signature is computed over.
+/// The 32-byte domain-separated blake3 digest the signature is computed
+/// over: `blake3(SIG_DOMAIN_TAG || canonical_json(lock))`.
 pub(crate) fn lock_signing_digest(lock: &DistroLock) -> anyhow::Result<[u8; 32]> {
     let bytes = canonical_lock_bytes(lock)?;
-    Ok(*blake3::hash(&bytes).as_bytes())
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(SIG_DOMAIN_TAG);
+    hasher.update(&bytes);
+    Ok(*hasher.finalize().as_bytes())
 }
 
 /// Sign a lock with `keypair`, returning the hex `Distro.sig` contents.
@@ -134,6 +158,29 @@ mod tests {
         let mut tampered = sample_lock();
         tampered.capsules[0].hash = "blake3:TAMPERED".into();
         assert!(verify_lock(&tampered, &sig, &pk).is_err());
+    }
+
+    #[test]
+    fn signature_over_untagged_digest_does_not_verify() {
+        // A signature computed over the un-domain-separated digest
+        // (`blake3(canonical_json(lock))`, no protocol tag) must NOT
+        // verify under the domain-separated scheme. This is the
+        // cross-protocol-confusion guard.
+        let kp = KeyPair::generate();
+        let lock = sample_lock();
+
+        let untagged = *blake3::hash(&canonical_lock_bytes(&lock).unwrap()).as_bytes();
+        let untagged_sig = kp.sign(&untagged).to_hex();
+
+        let pk = kp.export_public_key();
+        assert!(
+            verify_lock(&lock, &untagged_sig, &pk).is_err(),
+            "untagged signature must be rejected by the domain-separated verifier"
+        );
+
+        // Sanity: the properly-tagged signature still verifies.
+        let tagged_sig = sign_lock(&lock, &kp).unwrap();
+        assert!(verify_lock(&lock, &tagged_sig, &pk).is_ok());
     }
 
     #[test]
