@@ -123,7 +123,11 @@ async fn registry_round_trip(
     });
 
     // Await the single reply. `recv(Some(..))` returns `None` on timeout.
-    let Some(event) = reply_rx.recv(Some(REGISTRY_TIMEOUT)).await else {
+    // The wait budget defaults to the production `REGISTRY_TIMEOUT`; a test
+    // may shorten it via `GatewayState::registry_timeout` so a negative
+    // (no-reply) assertion doesn't block for the full 10s.
+    let timeout = state.registry_timeout.unwrap_or(REGISTRY_TIMEOUT);
+    let Some(event) = reply_rx.recv(Some(timeout)).await else {
         return Err(GatewayError::Internal(anyhow::anyhow!(
             "registry did not respond"
         )));

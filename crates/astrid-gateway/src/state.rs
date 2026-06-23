@@ -248,6 +248,12 @@ pub struct GatewayState {
     /// per-principal capability and no socket round-trip. The detailed,
     /// ops-facing view stays behind the capability-gated `GET /api/sys/readiness`.
     pub readiness_probe: Option<astrid_core::kernel_api::AgentReadinessProbe>,
+    /// Optional override for the registry round-trip wait budget. `None`
+    /// in production (the model routes fall back to the 10s
+    /// `REGISTRY_TIMEOUT`). Tests that assert a *negative* round-trip
+    /// outcome (no reply arrives) set a short duration so the assertion
+    /// doesn't block for the full production budget.
+    pub registry_timeout: Option<Duration>,
 }
 
 impl GatewayState {
@@ -305,6 +311,7 @@ impl GatewayState {
             session_id,
             gateway_route_uuid: Uuid::new_v4(),
             readiness_probe,
+            registry_timeout: None,
         }))
     }
 

@@ -30,8 +30,20 @@ use axum::http::{Request, StatusCode, header};
 use tower::ServiceExt;
 use uuid::Uuid;
 
-/// Build a gateway state, optionally wired to a live event bus.
+/// Build a gateway state, optionally wired to a live event bus. The
+/// registry round-trip uses the production `REGISTRY_TIMEOUT` (10s).
 fn state_with_bus(bus: Option<Arc<EventBus>>) -> Arc<GatewayState> {
+    state_with_bus_timeout(bus, None)
+}
+
+/// Like [`state_with_bus`] but with an explicit registry round-trip
+/// budget. A negative-path test (asserting *no* reply arrives) passes a
+/// short duration so the assertion doesn't block for the full 10s
+/// production budget; the production path (`None`) is unchanged.
+fn state_with_bus_timeout(
+    bus: Option<Arc<EventBus>>,
+    registry_timeout: Option<Duration>,
+) -> Arc<GatewayState> {
     Arc::new(GatewayState {
         config: GatewayConfig::default(),
         signing: SigningMaterial::fresh(),
@@ -45,6 +57,7 @@ fn state_with_bus(bus: Option<Arc<EventBus>>) -> Arc<GatewayState> {
         audit_log: None,
         session_id: None,
         gateway_route_uuid: Uuid::new_v4(),
+        registry_timeout,
     })
 }
 
@@ -297,7 +310,13 @@ async fn models_principal_isolation() {
     // published and A receives it. A regression to an unscoped subscription
     // would let A read B's binding and fail the first assertion.
     let bus = Arc::new(EventBus::new());
-    let state = state_with_bus(Some(Arc::clone(&bus)));
+    // Shorten the registry round-trip budget: the negative assertion below
+    // proves A receives *no* reply, which otherwise blocks for the full 10s
+    // production `REGISTRY_TIMEOUT`. 300ms is ample for the in-process bus to
+    // enqueue-and-drop the foreign-principal reply, and the later positive
+    // path (A's own reply) lands far inside that window. The isolation
+    // property under test is unchanged — only the wait duration is.
+    let state = state_with_bus_timeout(Some(Arc::clone(&bus)), Some(Duration::from_millis(300)));
     let bearer_a = bearer_for(&state, "alice");
 
     // A responder that replies to A's request stamped for B (the wrong
