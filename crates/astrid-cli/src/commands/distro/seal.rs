@@ -16,7 +16,7 @@ use anyhow::{Context, bail};
 
 use super::lock::{DistroLock, DistroLockMeta, LockedCapsule, manifest_hash};
 use super::manifest::{DistroManifest, parse_manifest};
-use super::shuttle::{self, ShuttleEntry};
+use super::shuttle::{self, ShuttleContent, ShuttleEntry};
 use super::sign;
 use crate::commands::capsule::install::resolve_capsule_to_file;
 use crate::theme::Theme;
@@ -60,19 +60,26 @@ pub(crate) async fn run_seal(distro: &str, output: &Path, key: &Path) -> anyhow:
         // The ref recorded in the lock is the one resolution ACTUALLY
         // returned (GitHub's release `tag_name`), never a guess derived
         // from the manifest's declared fields — so a signed shuttle's
-        // lock attests the ref that was truly fetched.
+        // lock attests the ref that was truly fetched. The `name` hint
+        // selects the right `<name>.capsule` when a source ships several.
         let resolved_ref = resolve_capsule_to_file(
             &cap.source,
             (!cap.version.is_empty()).then_some(cap.version.as_str()),
             cap.tag.as_deref(),
+            Some(&cap.name),
             &dest,
         )
         .await
         .with_context(|| format!("failed to resolve capsule {}", cap.name))?;
 
+        // Hash the staged file once for the lock. The capsule bytes are NOT
+        // held in memory beyond this — `pack` streams the staged file in
+        // (a `ShuttleContent::File`), so a multi-capsule seal never buffers
+        // every capsule (up to 50 MB each) at once.
         let bytes = std::fs::read(&dest)
             .with_context(|| format!("failed to read staged capsule {}", cap.name))?;
         let hash = format!("blake3:{}", blake3::hash(&bytes).to_hex());
+        drop(bytes);
 
         locked.push(LockedCapsule {
             name: cap.name.clone(),
@@ -83,7 +90,7 @@ pub(crate) async fn run_seal(distro: &str, output: &Path, key: &Path) -> anyhow:
         });
         capsule_entries.push(ShuttleEntry {
             path: shuttle::capsule_member_path(&cap.name),
-            bytes,
+            content: ShuttleContent::File(dest),
         });
     }
 
@@ -109,15 +116,15 @@ pub(crate) async fn run_seal(distro: &str, output: &Path, key: &Path) -> anyhow:
     let mut entries = vec![
         ShuttleEntry {
             path: shuttle::MANIFEST_NAME.to_string(),
-            bytes: manifest_bytes,
+            content: ShuttleContent::Bytes(manifest_bytes),
         },
         ShuttleEntry {
             path: shuttle::LOCK_NAME.to_string(),
-            bytes: lock_toml.into_bytes(),
+            content: ShuttleContent::Bytes(lock_toml.into_bytes()),
         },
         ShuttleEntry {
             path: shuttle::SIG_NAME.to_string(),
-            bytes: sig_hex.into_bytes(),
+            content: ShuttleContent::Bytes(sig_hex.into_bytes()),
         },
     ];
     entries.extend(capsule_entries);

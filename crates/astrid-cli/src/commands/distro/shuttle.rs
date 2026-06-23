@@ -28,7 +28,6 @@
 //! files `0o644`, directories `0o755`). Gzip is written at a fixed
 //! compression level with no embedded filename/mtime header.
 
-use std::io::Write;
 use std::path::{Component, Path, PathBuf};
 
 use anyhow::{Context, bail};
@@ -46,13 +45,25 @@ pub(crate) const CAPSULES_DIR: &str = "capsules";
 /// the capsule-download ceiling. Defends against decompression bombs.
 const MAX_MEMBER_BYTES: u64 = 50 * 1024 * 1024;
 
+/// The payload of a [`ShuttleEntry`]: either in-memory bytes (for the
+/// small manifest/lock/sig members) or a path to a staged file streamed
+/// in at pack time (for capsules, which are already on disk and can be up
+/// to 50 MB each — buffering them all in RAM risks OOM).
+pub(crate) enum ShuttleContent {
+    /// Owned in-memory bytes (small members, or test fixtures).
+    Bytes(Vec<u8>),
+    /// A source file on disk, streamed into the tar at pack time.
+    File(PathBuf),
+}
+
 /// A file to include in a `.shuttle`, addressed by its archive-relative
-/// path. Bytes are owned so the packer can sort without re-reading.
+/// path. Content is either owned bytes or a staged file path so large
+/// capsules need never be held fully in memory.
 pub(crate) struct ShuttleEntry {
     /// Archive-relative path (forward-slash, never absolute, no `..`).
     pub(crate) path: String,
-    /// Raw file contents.
-    pub(crate) bytes: Vec<u8>,
+    /// The member's content source.
+    pub(crate) content: ShuttleContent,
 }
 
 /// Pack `entries` into a deterministic gzipped tar at `out_path`.
@@ -67,37 +78,60 @@ pub(crate) fn pack(out_path: &Path, mut entries: Vec<ShuttleEntry>) -> anyhow::R
     }
     entries.sort_by(|a, b| a.path.cmp(&b.path));
 
-    let buf = Vec::new();
-    // Fixed compression level, and `GzBuilder` with no filename/mtime so
-    // the gzip header carries no environment-dependent bytes.
-    let encoder = flate2::GzBuilder::new().write(buf, flate2::Compression::new(6));
-    let mut tar = tar::Builder::new(encoder);
-    tar.mode(tar::HeaderMode::Deterministic);
-
-    for entry in &entries {
-        let mut header = tar::Header::new_gnu();
-        header.set_size(entry.bytes.len() as u64);
-        header.set_mtime(0);
-        header.set_uid(0);
-        header.set_gid(0);
-        header.set_mode(0o644);
-        header.set_entry_type(tar::EntryType::Regular);
-        header.set_cksum();
-        tar.append_data(&mut header, &entry.path, entry.bytes.as_slice())
-            .with_context(|| format!("failed to append {} to shuttle", entry.path))?;
-    }
-
-    let encoder = tar.into_inner().context("failed to finish tar stream")?;
-    let compressed = encoder.finish().context("failed to finish gzip stream")?;
-
     if let Some(parent) = out_path.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("failed to create {}", parent.display()))?;
     }
+
+    // Write the gzip stream DIRECTLY into the output temp file rather than
+    // buffering the whole compressed archive in memory. `File` members are
+    // streamed from disk into the tar (`append_data` copies from the reader),
+    // so nothing larger than a copy buffer is ever resident at once.
     let mut tmp = tempfile::NamedTempFile::new_in(out_path.parent().unwrap_or(Path::new(".")))
         .context("failed to create temp file for shuttle")?;
-    tmp.write_all(&compressed)
-        .context("failed to write shuttle staging")?;
+
+    {
+        // Fixed compression level, and `GzBuilder` with no filename/mtime so
+        // the gzip header carries no environment-dependent bytes.
+        let encoder =
+            flate2::GzBuilder::new().write(tmp.as_file_mut(), flate2::Compression::new(6));
+        let mut tar = tar::Builder::new(encoder);
+        tar.mode(tar::HeaderMode::Deterministic);
+
+        for entry in &entries {
+            let mut header = tar::Header::new_gnu();
+            header.set_mtime(0);
+            header.set_uid(0);
+            header.set_gid(0);
+            header.set_mode(0o644);
+            header.set_entry_type(tar::EntryType::Regular);
+
+            match &entry.content {
+                ShuttleContent::Bytes(bytes) => {
+                    header.set_size(bytes.len() as u64);
+                    header.set_cksum();
+                    tar.append_data(&mut header, &entry.path, bytes.as_slice())
+                        .with_context(|| format!("failed to append {} to shuttle", entry.path))?;
+                },
+                ShuttleContent::File(src) => {
+                    let metadata = std::fs::metadata(src).with_context(|| {
+                        format!("failed to stat staged capsule {}", src.display())
+                    })?;
+                    header.set_size(metadata.len());
+                    header.set_cksum();
+                    let mut file = std::fs::File::open(src).with_context(|| {
+                        format!("failed to open staged capsule {}", src.display())
+                    })?;
+                    tar.append_data(&mut header, &entry.path, &mut file)
+                        .with_context(|| format!("failed to append {} to shuttle", entry.path))?;
+                },
+            }
+        }
+
+        let encoder = tar.into_inner().context("failed to finish tar stream")?;
+        encoder.finish().context("failed to finish gzip stream")?;
+    }
+
     tmp.persist(out_path)
         .map_err(|e| anyhow::anyhow!("failed to persist {}: {e}", out_path.display()))?;
     Ok(())
@@ -201,15 +235,15 @@ mod tests {
         vec![
             ShuttleEntry {
                 path: SIG_NAME.to_string(),
-                bytes: b"deadbeef".to_vec(),
+                content: ShuttleContent::Bytes(b"deadbeef".to_vec()),
             },
             ShuttleEntry {
                 path: MANIFEST_NAME.to_string(),
-                bytes: b"schema-version = 1\n".to_vec(),
+                content: ShuttleContent::Bytes(b"schema-version = 1\n".to_vec()),
             },
             ShuttleEntry {
                 path: capsule_member_path("astrid-capsule-cli"),
-                bytes: b"FAKE CAPSULE BYTES".to_vec(),
+                content: ShuttleContent::Bytes(b"FAKE CAPSULE BYTES".to_vec()),
             },
         ]
     }
@@ -266,6 +300,53 @@ mod tests {
         assert!(
             msg.contains("truncated") || msg.contains("shuttle") || msg.contains("gzip"),
             "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn file_and_bytes_entries_roundtrip_identically() {
+        // A `File` capsule entry must pack byte-for-byte the same as the
+        // equivalent in-memory `Bytes` entry (streaming changes nothing the
+        // archive observes).
+        let dir = tempfile::tempdir().unwrap();
+        let staged = dir.path().join("astrid-capsule-cli.capsule");
+        std::fs::write(&staged, b"FAKE CAPSULE BYTES").unwrap();
+
+        let from_file = dir.path().join("file.shuttle");
+        pack(
+            &from_file,
+            vec![
+                ShuttleEntry {
+                    path: SIG_NAME.to_string(),
+                    content: ShuttleContent::Bytes(b"deadbeef".to_vec()),
+                },
+                ShuttleEntry {
+                    path: MANIFEST_NAME.to_string(),
+                    content: ShuttleContent::Bytes(b"schema-version = 1\n".to_vec()),
+                },
+                ShuttleEntry {
+                    path: capsule_member_path("astrid-capsule-cli"),
+                    content: ShuttleContent::File(staged),
+                },
+            ],
+        )
+        .unwrap();
+
+        let from_bytes = dir.path().join("bytes.shuttle");
+        pack(&from_bytes, sample_entries()).unwrap();
+
+        assert_eq!(
+            std::fs::read(&from_file).unwrap(),
+            std::fs::read(&from_bytes).unwrap(),
+            "a streamed File entry must pack identically to in-memory Bytes"
+        );
+
+        // And it still unpacks to the original capsule bytes.
+        let mirror = dir.path().join("mirror");
+        unpack(&from_file, &mirror).unwrap();
+        assert_eq!(
+            std::fs::read(capsule_mirror_path(&mirror, "astrid-capsule-cli")).unwrap(),
+            b"FAKE CAPSULE BYTES"
         );
     }
 

@@ -280,42 +280,6 @@ async fn resolve_github_ref(
         .to_string())
 }
 
-/// Locate the `.capsule` asset download URL for a resolved release tag.
-///
-/// Returns `Ok(None)` when the release exists but ships no `.capsule`
-/// asset (the caller then falls back to clone-and-build).
-async fn find_capsule_asset_url(
-    client: &reqwest::Client,
-    org: &str,
-    repo: &str,
-    resolved_ref: &str,
-) -> anyhow::Result<Option<String>> {
-    let api_url = format!("https://api.github.com/repos/{org}/{repo}/releases/tags/{resolved_ref}");
-    let response = client
-        .get(&api_url)
-        .send()
-        .await
-        .context("failed to fetch release metadata")?;
-    if !response.status().is_success() {
-        return Ok(None);
-    }
-    let json: serde_json::Value = response.json().await.context("invalid release metadata")?;
-    let Some(assets) = json.get("assets").and_then(serde_json::Value::as_array) else {
-        return Ok(None);
-    };
-    for asset in assets {
-        if let Some(name) = asset.get("name").and_then(serde_json::Value::as_str)
-            && name.ends_with(".capsule")
-            && let Some(download_url) = asset
-                .get("browser_download_url")
-                .and_then(serde_json::Value::as_str)
-        {
-            return Ok(Some(download_url.to_string()));
-        }
-    }
-    Ok(None)
-}
-
 /// Stream a `.capsule` asset to `dest`, enforcing a 50 MB ceiling.
 async fn download_capsule_asset(
     client: &reqwest::Client,
@@ -439,6 +403,12 @@ async fn install_from_github(
 /// release assets, so a missing asset is a hard error the maintainer
 /// must resolve.
 ///
+/// `name_hint` is the distro capsule `name`, used to pick the right
+/// archive when one source ships several (a monorepo builds/releases one
+/// `.capsule` per capsule crate) — the same `capsule_assets`/`pick_capsule`
+/// selection [`install_from_github`] uses. A single-asset release installs
+/// that one regardless of the hint.
+///
 /// The returned ref is the single source of truth the seal records in
 /// the lock's `resolved_ref`: it is whatever GitHub reported as the
 /// release `tag_name`, never an optimistic guess from the manifest.
@@ -446,6 +416,7 @@ pub(crate) async fn resolve_capsule_to_file(
     source: &str,
     version: Option<&str>,
     tag: Option<&str>,
+    name_hint: Option<&str>,
     dest_path: &Path,
 ) -> anyhow::Result<String> {
     let (org, repo) = parse_github_source(source).ok_or_else(|| {
@@ -460,16 +431,41 @@ pub(crate) async fn resolve_capsule_to_file(
         .build()?;
 
     let resolved_ref = resolve_github_ref(&client, &org, &repo, version, tag).await?;
-    let download_url = find_capsule_asset_url(&client, &org, &repo, &resolved_ref)
-        .await?
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "release {resolved_ref} of {org}/{repo} ships no .capsule asset — \
-                 seal requires pre-built release artifacts"
-            )
-        })?;
 
-    download_capsule_asset(&client, &download_url, dest_path).await?;
+    // Fetch the resolved release's assets and pick the right `<name>.capsule`
+    // (the same selection the install path uses), so a release shipping
+    // several capsules downloads the one the seal asked for rather than the
+    // first. A missing `.capsule` asset is a hard error — seal requires
+    // pre-built release artifacts.
+    let api_url = format!("https://api.github.com/repos/{org}/{repo}/releases/tags/{resolved_ref}");
+    let response = client
+        .get(&api_url)
+        .send()
+        .await
+        .context("failed to fetch release metadata")?;
+    if !response.status().is_success() {
+        bail!(
+            "GitHub API returned {} fetching release {resolved_ref} of {org}/{repo}",
+            response.status()
+        );
+    }
+    let json: serde_json::Value = response.json().await.context("invalid release metadata")?;
+    let assets = json
+        .get("assets")
+        .and_then(serde_json::Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    let candidates = capsule_assets(assets);
+    let names: Vec<&str> = candidates.iter().map(|(n, _)| n.as_str()).collect();
+    let Some(idx) = pick_capsule(&names, name_hint)? else {
+        bail!(
+            "release {resolved_ref} of {org}/{repo} ships no .capsule asset — \
+             seal requires pre-built release artifacts"
+        );
+    };
+    let (_, download_url) = &candidates[idx];
+
+    download_capsule_asset(&client, download_url, dest_path).await?;
     Ok(resolved_ref)
 }
 
