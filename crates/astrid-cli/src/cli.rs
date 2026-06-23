@@ -5,6 +5,8 @@
 //! definitions. Subcommand variants here are wired to handler modules
 //! in [`crate::commands`] by [`crate::dispatch`].
 
+use std::path::PathBuf;
+
 use clap::{Parser, Subcommand};
 
 use crate::commands::{
@@ -427,5 +429,19 @@ pub(crate) enum DistroCommands {
         /// Target agent (defaults to active context).
         #[arg(short, long)]
         agent: Option<String>,
+        /// Allow downgrading to an older distro version.
+        #[arg(long)]
+        force: bool,
+    },
+    /// Seal a distro into a signed, offline-installable `.shuttle` archive.
+    Seal {
+        /// Path to `Distro.toml` (or a directory containing one).
+        distro: String,
+        /// Output path for the `.shuttle` archive.
+        #[arg(short, long)]
+        output: PathBuf,
+        /// Path to the ed25519 private key (32 raw bytes).
+        #[arg(short, long)]
+        key: PathBuf,
     },
 }

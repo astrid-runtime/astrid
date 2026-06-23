@@ -278,13 +278,14 @@ async fn dispatch_distro(command: DistroCommands) -> Result<ExitCode> {
             );
             Ok(ExitCode::from(2))
         },
-        DistroCommands::Update { agent } => {
+        DistroCommands::Update { agent, force } => {
             if agent.is_some() {
                 return Ok(commands::stub::deferred(
                     "distro update -a <agent>",
                     &[tracker_657()],
                 ));
             }
+            let _ = force; // wired for downgrade protection; update is still a stub.
             eprintln!(
                 "{}",
                 theme::Theme::info(
@@ -292,6 +293,14 @@ async fn dispatch_distro(command: DistroCommands) -> Result<ExitCode> {
                 )
             );
             Ok(ExitCode::from(2))
+        },
+        DistroCommands::Seal {
+            distro,
+            output,
+            key,
+        } => {
+            commands::distro::seal::run_seal(&distro, &output, &key).await?;
+            Ok(ExitCode::SUCCESS)
         },
     }
 }
