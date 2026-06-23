@@ -89,9 +89,19 @@ pub(crate) fn validate_manifest(manifest: &DistroManifest) -> anyhow::Result<()>
         anyhow::bail!("distro must contain at least one capsule");
     }
 
-    // No duplicate capsule names.
+    // No duplicate capsule names, and each name must be a valid
+    // identifier. Names become path components in the `.shuttle` layout
+    // (`capsules/<name>.capsule`) and on disk under the capsule store;
+    // constraining them to `^[a-z][a-z0-9-]*$` keeps a manifest from
+    // introducing `/`, `..`, or other path-hostile characters there.
     let mut seen_names = HashSet::new();
     for cap in &manifest.capsules {
+        if !is_valid_id(&cap.name) {
+            anyhow::bail!(
+                "capsule name '{}' is invalid (must match ^[a-z][a-z0-9-]*$)",
+                cap.name,
+            );
+        }
         if !seen_names.insert(&cap.name) {
             anyhow::bail!("duplicate capsule name '{}'", cap.name);
         }
@@ -300,6 +310,27 @@ issuers = ["admin"]
             err.to_string().contains("default-group is unset"),
             "got: {err}"
         );
+    }
+
+    #[test]
+    fn rejects_path_hostile_capsule_name() {
+        let toml_src = r#"
+schema-version = 1
+
+[distro]
+id = "test"
+name = "Test"
+version = "0.1.0"
+
+[[capsule]]
+name = "evil/../escape"
+source = "@org/cli"
+version = "0.1.0"
+role = "uplink"
+"#;
+        let manifest: DistroManifest = toml::from_str(toml_src).unwrap();
+        let err = validate_manifest(&manifest).expect_err("slash name must be rejected");
+        assert!(err.to_string().contains("capsule name"), "got: {err}");
     }
 
     #[test]
