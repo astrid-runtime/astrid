@@ -159,8 +159,22 @@ async fn dispatch_subcommand(
                 from_mcp_json.as_deref(),
             )
         },
-        Some(Commands::Init { distro }) => {
-            commands::init::run_init(&distro).await?;
+        Some(Commands::Init {
+            distro,
+            yes,
+            offline,
+            allow_unsigned,
+            accept_new_key,
+            vars,
+        }) => {
+            let opts = commands::init::InitOpts {
+                yes,
+                offline,
+                allow_unsigned,
+                accept_new_key,
+                vars: commands::init::parse_cli_vars(&vars)?,
+            };
+            commands::init::run_init(&distro, &opts).await?;
             commands::self_update::ensure_path_setup()?;
             Ok(ExitCode::SUCCESS)
         },
@@ -252,7 +266,15 @@ async fn dispatch_mcp(command: McpCommands) -> Result<ExitCode> {
 
 async fn dispatch_distro(command: DistroCommands) -> Result<ExitCode> {
     match command {
-        DistroCommands::Apply { name, agent } => {
+        DistroCommands::Apply {
+            name,
+            agent,
+            yes,
+            offline,
+            allow_unsigned,
+            accept_new_key,
+            vars,
+        } => {
             if agent.is_some() {
                 return Ok(commands::stub::deferred(
                     "distro apply -a <agent>",
@@ -260,7 +282,14 @@ async fn dispatch_distro(command: DistroCommands) -> Result<ExitCode> {
                 ));
             }
             let distro = name.unwrap_or_else(|| "astralis".to_string());
-            commands::init::run_init(&distro).await?;
+            let opts = commands::init::InitOpts {
+                yes,
+                offline,
+                allow_unsigned,
+                accept_new_key,
+                vars: commands::init::parse_cli_vars(&vars)?,
+            };
+            commands::init::run_init(&distro, &opts).await?;
             Ok(ExitCode::SUCCESS)
         },
         DistroCommands::Show { agent } => {

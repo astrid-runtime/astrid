@@ -36,7 +36,7 @@ async fn ensure_initialized() -> Result<()> {
                 "{}",
                 theme::Theme::info("First run detected — running astrid init...")
             );
-            commands::init::run_init("astralis").await?;
+            commands::init::run_init("astralis", &commands::init::InitOpts::default()).await?;
             commands::self_update::ensure_path_setup()?;
         }
     }
