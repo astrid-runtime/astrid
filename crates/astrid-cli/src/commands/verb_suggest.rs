@@ -106,10 +106,14 @@ fn levenshtein(a: &str, b: &str) -> usize {
 mod tests {
     use super::*;
 
-    /// A representative slice of root built-ins. Kept literal (not derived
-    /// from clap) so the pure function is tested in isolation, exactly as
-    /// the dispatcher feeds it a `&[&str]` harvested once from
-    /// `Cli::command()`.
+    /// The full set of root built-ins fed to [`nearest_builtin`]. Kept
+    /// literal (not derived from clap) so the pure function is tested in
+    /// isolation, but it must mirror the real root subcommand set the
+    /// dispatcher harvests from `Cli::command()` — every primary name plus
+    /// invocable aliases (e.g. `self-update`). The
+    /// `builtins_slice_matches_clap_subcommands` test below pins this
+    /// against the live clap command tree so the slice cannot silently
+    /// drift when a root subcommand is added or renamed.
     const BUILTINS: &[&str] = &[
         "chat",
         "run",
@@ -119,6 +123,7 @@ mod tests {
         "quota",
         "invite",
         "keypair",
+        "pair-device",
         "secret",
         "voucher",
         "trust",
@@ -146,6 +151,7 @@ mod tests {
         "version",
         "completions",
         "update",
+        "self-update",
     ];
 
     #[test]
@@ -193,5 +199,43 @@ mod tests {
         // Reversing the slice must not change the winner.
         let tie_rev: &[&str] = &["ac", "bb"];
         assert_eq!(nearest_builtin("ab", tie_rev), Some("ac"));
+    }
+
+    #[test]
+    fn builtins_slice_matches_clap_subcommands() {
+        // The `BUILTINS` test slice must stay faithful to the real root
+        // subcommand set so the `nearest_builtin` tests exercise the same
+        // names production measures against. Drift (a new or renamed root
+        // subcommand, like the `pair-device` and `self-update` tokens this
+        // test guards) would otherwise silently leave the slice stale while
+        // the tests kept passing against a fictional command set.
+        //
+        // The set compared is every primary subcommand name plus its
+        // invocable aliases (`self-update` aliases `update`) — the complete
+        // set of root tokens a user can type and therefore mistype. The
+        // `external_subcommand` catch-all reports an empty placeholder name;
+        // filter it so the catch-all itself is never in the set.
+        use clap::CommandFactory;
+        use std::collections::BTreeSet;
+
+        let actual: BTreeSet<String> = crate::cli::Cli::command()
+            .get_subcommands()
+            .flat_map(|s| {
+                std::iter::once(s.get_name().to_string())
+                    .chain(s.get_all_aliases().map(std::string::ToString::to_string))
+            })
+            .filter(|name| !name.is_empty())
+            .collect();
+
+        let slice: BTreeSet<String> = BUILTINS.iter().map(|s| (*s).to_string()).collect();
+
+        let missing: Vec<&String> = actual.difference(&slice).collect();
+        let extra: Vec<&String> = slice.difference(&actual).collect();
+        assert!(
+            missing.is_empty() && extra.is_empty(),
+            "BUILTINS test slice drifted from clap's root subcommands.\n  \
+             missing (in clap, absent from slice): {missing:?}\n  \
+             extra (in slice, absent from clap):   {extra:?}"
+        );
     }
 }
