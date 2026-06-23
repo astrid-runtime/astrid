@@ -197,7 +197,55 @@ async fn dispatch_subcommand(
             commands::self_update::run_self_update(args).await?;
             Ok(ExitCode::SUCCESS)
         },
+        Some(Commands::External(tokens)) => dispatch_root_shorthand(tokens).await,
     }
+}
+
+/// Route the root capsule-verb shorthand (`astrid <verb> [args…]`).
+///
+/// Built-in verbs never reach here — clap matches a declared `Commands`
+/// variant before the `external_subcommand` catch-all. An unrecognised
+/// token that is a near-miss of a built-in is rejected with a "did you
+/// mean …?" hint and exits `2` **without booting the daemon**, mirroring
+/// the clap parse error this catch-all replaced. Only a non-near-miss
+/// token is forwarded to daemon-backed capsule-verb resolution, which
+/// binds the active principal exactly as `astrid capsule <verb>` does.
+async fn dispatch_root_shorthand(tokens: Vec<String>) -> Result<ExitCode> {
+    let verb = tokens.first().map_or("", String::as_str);
+    let builtins = builtin_subcommand_names();
+    let builtin_refs: Vec<&str> = builtins.iter().map(String::as_str).collect();
+    if let Some(suggestion) = commands::verb_suggest::nearest_builtin(verb, &builtin_refs) {
+        eprintln!(
+            "{}",
+            theme::Theme::error(&format!(
+                "unrecognized subcommand '{verb}'\n\n\tDid you mean '{suggestion}'?"
+            ))
+        );
+        // Exit WITHOUT booting the daemon — mirrors clap's pre-catch-all
+        // error for a mistyped built-in. Exit 2 matches clap's
+        // `InvalidSubcommand` usage-error convention so scripts see the
+        // same status they did before this shorthand existed.
+        return Ok(ExitCode::from(2));
+    }
+    // Not a near-miss → genuine capsule-verb shorthand. Reuse the exact
+    // same daemon-backed, principal-scoped resolution path as
+    // `astrid capsule <verb>`.
+    commands::capsule_verb::run_external(tokens).await
+}
+
+/// Built-in root subcommand names, harvested once from the clap command
+/// tree, for the typo guard to measure unrecognised tokens against.
+///
+/// The `external_subcommand` catch-all is reported by clap with an empty
+/// placeholder name; filter empties so the guard can never "suggest" the
+/// catch-all itself.
+fn builtin_subcommand_names() -> Vec<String> {
+    use clap::CommandFactory;
+    Cli::command()
+        .get_subcommands()
+        .map(|s| s.get_name().to_string())
+        .filter(|n| !n.is_empty())
+        .collect()
 }
 
 async fn dispatch_capsule(command: crate::cli::CapsuleCommands) -> Result<ExitCode> {
