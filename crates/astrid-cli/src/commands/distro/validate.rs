@@ -14,6 +14,28 @@ use super::manifest::{DistroManifest, SCHEMA_VERSION};
 /// (`CARGO_PKG_VERSION`) — the same source `astrid version` prints.
 pub(crate) const RUNNING_ASTRID_VERSION: &str = env!("CARGO_PKG_VERSION");
 
+/// The running CLI is older than a distro's `[distro].astrid-version` floor.
+///
+/// Carried as a *typed* (downcastable) error rather than a bare string so callers
+/// can distinguish "your CLI is too old, upgrade" from every other validation
+/// failure without fragile message matching. The `Display` text is the
+/// actionable upgrade message surfaced to users on the `astrid init` /
+/// `astrid distro apply` paths; the post-update sync path
+/// (`self_update::sync_distro_and_capsules`) downcasts to this type and
+/// substitutes a benign "it takes effect on next run" message instead, because
+/// there the new binary is already on disk — only the in-flight process is stale.
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "This distro requires astrid {req}, but you are running {running}. \
+     Run `astrid update` to upgrade."
+)]
+pub(crate) struct AstridVersionTooOld {
+    /// The distro's `[distro].astrid-version` requirement string (e.g. `>=0.6.0`).
+    pub req: String,
+    /// The running CLI version that failed to satisfy `req`.
+    pub running: String,
+}
+
 /// Check if a string is a valid identifier: `^[a-z][a-z0-9-]*$`.
 fn is_valid_id(s: &str) -> bool {
     let mut chars = s.chars();
@@ -188,7 +210,9 @@ pub(crate) fn enforce_astrid_version(manifest: &DistroManifest) -> anyhow::Resul
     let running = Version::parse(RUNNING_ASTRID_VERSION).map_err(|e| {
         // The binary's own version should always be valid semver; if it isn't,
         // that's a build-time defect, not a distro problem.
-        anyhow::anyhow!("running astrid version {RUNNING_ASTRID_VERSION:?} is not valid semver: {e}")
+        anyhow::anyhow!(
+            "running astrid version {RUNNING_ASTRID_VERSION:?} is not valid semver: {e}"
+        )
     })?;
     distro_astrid_version_satisfied(req, &running)
 }
@@ -207,12 +231,10 @@ pub(crate) fn enforce_astrid_version(manifest: &DistroManifest) -> anyhow::Resul
 /// sufficiently-new astrid is accepted, while still rejecting a CLI whose release
 /// triple genuinely falls below the floor. A clean (non-prerelease) running
 /// version compares unchanged.
-pub(crate) fn distro_astrid_version_satisfied(
-    req: &str,
-    running: &Version,
-) -> anyhow::Result<()> {
-    let version_req = VersionReq::parse(req)
-        .map_err(|e| anyhow::anyhow!("distro.astrid-version {req:?} is not a valid requirement: {e}"))?;
+pub(crate) fn distro_astrid_version_satisfied(req: &str, running: &Version) -> anyhow::Result<()> {
+    let version_req = VersionReq::parse(req).map_err(|e| {
+        anyhow::anyhow!("distro.astrid-version {req:?} is not a valid requirement: {e}")
+    })?;
 
     // Strip prerelease / build metadata: compare on the release triple so a
     // dev / prerelease CLI at or above the floor is not falsely rejected.
@@ -222,10 +244,14 @@ pub(crate) fn distro_astrid_version_satisfied(
         return Ok(());
     }
 
-    anyhow::bail!(
-        "This distro requires astrid {req}, but you are running {running}. \
-         Run `astrid update` to upgrade.",
-    );
+    // Typed (downcastable) so the post-update sync path can recognise this exact
+    // condition and swap in a benign message; init / distro apply propagate it to
+    // the top-level handler, where its `Display` is the actionable upgrade text.
+    Err(AstridVersionTooOld {
+        req: req.to_string(),
+        running: running.to_string(),
+    }
+    .into())
 }
 
 /// Parse the operator-friendly duration form (`24h`, `7d`, `30m`, `30s`)
@@ -370,6 +396,17 @@ issuers = ["admin"]
         let running = Version::parse("0.5.0").unwrap();
         let err = distro_astrid_version_satisfied(">=0.6.0", &running)
             .expect_err("0.5.0 must not satisfy >=0.6.0");
+
+        // It must be the TYPED error, downcastable with the right req/running so
+        // the post-update sync path can recognise it without string matching.
+        let typed = err
+            .downcast_ref::<AstridVersionTooOld>()
+            .expect("below-floor rejection must be a typed AstridVersionTooOld error");
+        assert_eq!(typed.req, ">=0.6.0");
+        assert_eq!(typed.running, "0.5.0");
+
+        // And its Display must remain the actionable upgrade message so the
+        // init / distro-apply UX is unchanged for users.
         let msg = err.to_string();
         assert!(
             msg.contains("This distro requires astrid >=0.6.0")
@@ -400,9 +437,7 @@ issuers = ["admin"]
         let dev_at_floor = Version::parse("0.6.0-dev.3").unwrap();
         // Sanity: prove the naive comparison would have falsely rejected it.
         assert!(
-            !VersionReq::parse(">=0.6.0")
-                .unwrap()
-                .matches(&dev_at_floor),
+            !VersionReq::parse(">=0.6.0").unwrap().matches(&dev_at_floor),
             "guard: naive matches must reject the prerelease, else the test proves nothing"
         );
         distro_astrid_version_satisfied(">=0.6.0", &dev_at_floor)
@@ -461,8 +496,7 @@ role = "uplink"
     fn running_astrid_version_is_valid_semver() {
         // The enforcement reads RUNNING_ASTRID_VERSION as semver; guard against a
         // build whose CARGO_PKG_VERSION cannot parse (would break every init).
-        Version::parse(RUNNING_ASTRID_VERSION)
-            .expect("the CLI's own version must be valid semver");
+        Version::parse(RUNNING_ASTRID_VERSION).expect("the CLI's own version must be valid semver");
     }
 
     #[test]
