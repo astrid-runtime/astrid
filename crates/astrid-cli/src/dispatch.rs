@@ -213,8 +213,7 @@ async fn dispatch_subcommand(
 async fn dispatch_root_shorthand(tokens: Vec<String>) -> Result<ExitCode> {
     let verb = tokens.first().map_or("", String::as_str);
     let builtins = builtin_subcommand_names();
-    let builtin_refs: Vec<&str> = builtins.iter().map(String::as_str).collect();
-    if let Some(suggestion) = commands::verb_suggest::nearest_builtin(verb, &builtin_refs) {
+    if let Some(suggestion) = commands::verb_suggest::nearest_builtin(verb, &builtins) {
         eprintln!(
             "{}",
             theme::Theme::error(&format!(

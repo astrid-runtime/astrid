@@ -28,7 +28,15 @@
 /// distance of zero is treated as "not a typo" and never suggested — that
 /// would short-circuit a name clap already handled. Ties on edit distance
 /// break alphabetically so script output is deterministic.
-pub(crate) fn nearest_builtin<'a>(token: &str, builtin_names: &[&'a str]) -> Option<&'a str> {
+///
+/// Generic over `S: AsRef<str>` so callers can pass the harvested-name
+/// slice directly (`&[String]`) without re-collecting an intermediate
+/// `Vec<&str>`; the returned `&str` borrows from that slice. Test slices of
+/// `&str` literals still satisfy `AsRef<str>` unchanged.
+pub(crate) fn nearest_builtin<'a, S: AsRef<str>>(
+    token: &str,
+    builtin_names: &'a [S],
+) -> Option<&'a str> {
     // An empty token is not a typo of any built-in — you cannot "mean" a
     // command by typing nothing. Clap never yields an empty external
     // vector, but guard it anyway so a degenerate input falls through to
@@ -54,7 +62,8 @@ pub(crate) fn nearest_builtin<'a>(token: &str, builtin_names: &[&'a str]) -> Opt
     // once and is refilled in place, not freed and re-grown each iteration.
     let mut name_chars: Vec<char> = Vec::new();
     let mut best: Option<(usize, &'a str)> = None;
-    for &name in builtin_names {
+    for name in builtin_names {
+        let name: &'a str = name.as_ref();
         name_chars.clear();
         name_chars.extend(name.chars());
         let dist = levenshtein_chars(&token_chars, &name_chars);
@@ -80,7 +89,10 @@ pub(crate) fn nearest_builtin<'a>(token: &str, builtin_names: &[&'a str]) -> Opt
 /// Operating on pre-collected slices lets [`nearest_builtin`] walk the typed
 /// token's chars once and reuse them across every built-in comparison.
 ///
-/// Standard two-row dynamic program: O(a·b) time, O(b) space. Arithmetic
+/// Standard two-row dynamic program: O(a·b) time, O(min(a,b)) space.
+/// Levenshtein is symmetric, so the rolling rows are driven by the *shorter*
+/// of the two strings (`inner`) and sized to `min(a.len(), b.len()) + 1`;
+/// swapping which string drives the rows cannot change the distance. Arithmetic
 /// is saturating throughout — distances are bounded by short verb lengths,
 /// so saturation is unreachable in practice and only satisfies the
 /// workspace `arithmetic_side_effects` deny without changing the result.
@@ -92,14 +104,19 @@ fn levenshtein_chars(a: &[char], b: &[char]) -> usize {
         return a.len();
     }
 
-    let width = b.len().saturating_add(1);
-    // `prev[j]` = distance between a[..i] and b[..j]; rolled forward per row.
+    // Drive the rolling rows by the shorter string so the DP table is sized to
+    // `min(a, b) + 1`, not the longer string. Symmetry of Levenshtein makes the
+    // choice of which string is `outer` vs `inner` immaterial to the result.
+    let (outer, inner) = if a.len() >= b.len() { (a, b) } else { (b, a) };
+
+    let width = inner.len().saturating_add(1);
+    // `prev[j]` = distance between outer[..i] and inner[..j]; rolled per row.
     let mut prev: Vec<usize> = (0..width).collect();
     let mut curr: Vec<usize> = vec![0; width];
-    for (i, &ca) in a.iter().enumerate() {
+    for (i, &co) in outer.iter().enumerate() {
         curr[0] = i.saturating_add(1);
-        for (j, &cb) in b.iter().enumerate() {
-            let cost = usize::from(ca != cb);
+        for (j, &ci) in inner.iter().enumerate() {
+            let cost = usize::from(co != ci);
             let deletion = curr[j].saturating_add(1);
             let insertion = prev[j.saturating_add(1)].saturating_add(1);
             let substitution = prev[j].saturating_add(cost);
@@ -107,7 +124,7 @@ fn levenshtein_chars(a: &[char], b: &[char]) -> usize {
         }
         std::mem::swap(&mut prev, &mut curr);
     }
-    prev[b.len()]
+    prev[inner.len()]
 }
 
 #[cfg(test)]
@@ -193,6 +210,24 @@ mod tests {
         // A degenerate empty token must not be matched to a short built-in
         // by edit distance; it falls through to capsule resolution.
         assert_eq!(nearest_builtin("", BUILTINS), None);
+    }
+
+    #[test]
+    fn levenshtein_is_symmetric() {
+        // The DP rows are sized to the shorter string and driven by it; the
+        // result must be invariant under swapping the arguments. Cover both
+        // orderings of differing-length inputs so the shorter-string-drives-
+        // the-rows branch is exercised in both directions.
+        let pairs: &[(&str, &str)] = &[("status", "statuss"), ("agnet", "agent"), ("", "run")];
+        for (a, b) in pairs {
+            let ca: Vec<char> = a.chars().collect();
+            let cb: Vec<char> = b.chars().collect();
+            assert_eq!(
+                levenshtein_chars(&ca, &cb),
+                levenshtein_chars(&cb, &ca),
+                "levenshtein({a:?}, {b:?}) must equal levenshtein({b:?}, {a:?})"
+            );
+        }
     }
 
     #[test]
