@@ -78,6 +78,14 @@ pub struct CapsuleContext {
     /// `ArcSwap`: runtime group mutations re-evaluate only on capsule reload,
     /// matching the profile-cache invalidation model.
     pub group_config: Option<Arc<GroupConfig>>,
+    /// Operator-approved local-egress allowlist for THIS capsule, as
+    /// `host:port` / `host:*` patterns. Resolved by the kernel from
+    /// `[security.capsule_local_egress]` keyed by capsule id and snapshotted
+    /// onto every pooled instance's `HostState` at load. Endpoints listed
+    /// here are exempt from the `astrid:http` SSRF airlock for this capsule
+    /// only. Empty = no exemptions (fail-closed). Operator config — never
+    /// settable by the capsule's own (untrusted) manifest.
+    pub local_egress: Vec<String>,
 }
 
 impl CapsuleContext {
@@ -105,6 +113,7 @@ impl CapsuleContext {
             profile_cache: None,
             overlay_registry: None,
             group_config: None,
+            local_egress: Vec::new(),
         }
     }
 
@@ -156,6 +165,15 @@ impl CapsuleContext {
     #[must_use]
     pub fn with_group_config(mut self, groups: Arc<GroupConfig>) -> Self {
         self.group_config = Some(groups);
+        self
+    }
+
+    /// Set this capsule's operator-approved local-egress allowlist
+    /// (`host:port` / `host:*` patterns) used to exempt sanctioned
+    /// loopback/private endpoints from the SSRF airlock.
+    #[must_use]
+    pub fn with_local_egress(mut self, allowlist: Vec<String>) -> Self {
+        self.local_egress = allowlist;
         self
     }
 }
