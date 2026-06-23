@@ -504,23 +504,36 @@ mod tests {
         );
     }
 
-    /// Test 1b — DoS-RESISTANCE: a flood of ~50 cross-principal replies buffered
-    /// BEFORE the wait must neither unblock it (returns `None`) nor EXTEND it
-    /// (elapsed stays near the budget). This is the security guarantee — a
-    /// mismatched-reply flood cannot reset or stretch the legitimate waiter's
-    /// deadline. Fails if the loop reset the budget per reply or stopped
-    /// checking the principal.
-    #[tokio::test]
+    /// Test 1b — DoS-RESISTANCE: a STREAM of cross-principal replies arriving
+    /// faster than the budget window must neither unblock the wait (returns
+    /// `None`) nor EXTEND it (elapsed stays near the budget). This is the
+    /// security guarantee: a mismatched-reply flood cannot reset or stretch the
+    /// legitimate waiter's deadline.
+    ///
+    /// The replies are spread over ~2s (one every ~40ms, never matching), well
+    /// past the ~150ms budget — so a buggy reset-the-deadline-per-reply
+    /// implementation would keep getting pushed and not return until the stream
+    /// stops (~2s), while the CORRECT fixed-deadline helper returns at ~150ms
+    /// regardless of the ongoing stream. (Verified: with the deadline recompute
+    /// moved inside the loop, this test fails with elapsed ~2s.) The instant
+    /// (pre-buffered) drain case is covered by 1c.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn await_response_flood_does_not_extend_deadline() {
         let bus = astrid_events::EventBus::with_capacity(256);
         let request_id = Uuid::new_v4();
         let mut rx = bus.subscribe_topic(format!("astrid.v1.elicit.response.{request_id}"));
 
-        // Buffer the flood before we start waiting so the loop drains them all
-        // within one budget window.
-        for _ in 0..50 {
-            publish_reply(&bus, request_id, Some("agent-bob"), "intruder");
-        }
+        // Publisher: a cross-principal reply every ~40ms for ~2s. The 40ms
+        // cadence is shorter than the 150ms budget, so a reset-per-reply bug
+        // would never see an idle window long enough to expire — it would only
+        // unblock when this stream ends.
+        let pub_bus = bus.clone();
+        let publisher = tokio::spawn(async move {
+            for _ in 0..50 {
+                publish_reply(&pub_bus, request_id, Some("agent-bob"), "intruder");
+                tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+            }
+        });
 
         let budget = std::time::Duration::from_millis(150);
         let start = std::time::Instant::now();
@@ -528,6 +541,8 @@ mod tests {
             await_matching_elicit_response(&mut rx, "agent-alice", "test", request_id, budget)
                 .await;
         let elapsed = start.elapsed();
+
+        publisher.abort();
 
         assert!(got.is_none(), "mismatch flood must not unblock the waiter");
         assert!(
