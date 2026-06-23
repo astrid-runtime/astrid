@@ -163,6 +163,11 @@ async fn agent_create_keyless_backfills_keypair() {
         "backfilled key must be Full-scope"
     );
     assert!(
+        healed.auth.public_keys[0].created_at > 0,
+        "a freshly minted device key must carry the real mint epoch, not the \
+         `0` migrated-legacy sentinel (which would show 1970 in listings/audit)"
+    );
+    assert!(
         key_path(&kernel, "bob").exists(),
         "keys/<p>.key must be written"
     );

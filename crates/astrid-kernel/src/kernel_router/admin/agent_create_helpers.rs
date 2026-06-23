@@ -294,7 +294,10 @@ fn mint_principal_keypair(
                 pubkey_hex,
                 astrid_core::profile::DeviceScope::Full,
                 None,
-                0,
+                // Stamp the real mint epoch — `0` is the migrated-legacy-key
+                // sentinel, so using it for a freshly minted key would show a
+                // 1970 timestamp in `pair-device list` / audit.
+                i64::try_from(crate::invite::now_epoch()).unwrap_or(0),
             ));
     }
     if !profile
