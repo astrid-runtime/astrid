@@ -211,7 +211,10 @@ async fn registry_round_trip(
     // unaffected: replies are matched by the principal-scoped routed
     // subscription, not by this source id.
     let msg = IpcMessage::new(request_topic, IpcPayload::RawJson(payload), Uuid::new_v4())
-        .with_principal(principal);
+        .with_principal(principal)
+        // Host-stamp the gateway transport origin (a remote API caller), so no
+        // gateway-published message inherits the `System` default.
+        .with_origin(astrid_events::ipc::MessageOrigin::RemoteGateway);
     bus.publish(AstridEvent::Ipc {
         metadata: astrid_events::EventMetadata::new("gateway::models"),
         message: msg,

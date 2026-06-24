@@ -67,7 +67,8 @@ async fn send_admin(
     // Wait briefly for the response. The admin router is spawned at
     // kernel construction time so this should fire on the next tokio
     // tick; a 2-second timeout keeps misbehaving tests from hanging CI.
-    let response = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
         loop {
             let event = rx.recv().await.expect("response event");
             if let astrid_events::AstridEvent::Ipc { message, .. } = &*event
@@ -78,9 +79,7 @@ async fn send_admin(
         }
     })
     .await
-    .expect("admin response within 2s");
-
-    response
+    .expect("admin response within 2s")
 }
 
 // ── enabled-flag enforcement (Layer 5 preamble + Layer 6 admin) ──
@@ -93,17 +92,21 @@ async fn disabled_principal_denied_on_admin_topic() {
     // would still satisfy `caps:grant` via group membership; with the
     // gate they are denied up front and the response carries the
     // `PrincipalDisabled` error message.
-    let mut profile = PrincipalProfile::default();
-    profile.groups = vec!["admin".to_string()];
-    profile.enabled = false;
+    let profile = PrincipalProfile {
+        groups: vec!["admin".to_string()],
+        enabled: false,
+        ..Default::default()
+    };
     let caller = pid("locked_out_admin");
     seed_profile(&kernel, &caller, &profile);
 
     // Create a separate principal we can target for caps.grant — not
     // strictly needed since the request is rejected before it reaches
     // the handler, but the wire shape must be valid.
-    let mut target_profile = PrincipalProfile::default();
-    target_profile.groups = vec!["restricted".to_string()];
+    let target_profile = PrincipalProfile {
+        groups: vec!["restricted".to_string()],
+        ..Default::default()
+    };
     seed_profile(&kernel, &pid("target_user"), &target_profile);
 
     let resp = send_admin(
@@ -141,14 +144,18 @@ async fn enabled_principal_proceeds_through_admin_topic() {
     let (_dir, kernel) = fixture().await;
 
     // Sanity: same setup with `enabled = true` succeeds.
-    let mut profile = PrincipalProfile::default();
-    profile.groups = vec!["admin".to_string()];
-    profile.enabled = true;
+    let profile = PrincipalProfile {
+        groups: vec!["admin".to_string()],
+        enabled: true,
+        ..Default::default()
+    };
     let caller = pid("active_admin");
     seed_profile(&kernel, &caller, &profile);
 
-    let mut target_profile = PrincipalProfile::default();
-    target_profile.groups = vec!["restricted".to_string()];
+    let target_profile = PrincipalProfile {
+        groups: vec!["restricted".to_string()],
+        ..Default::default()
+    };
     seed_profile(&kernel, &pid("target_user"), &target_profile);
 
     let resp = send_admin(
@@ -175,12 +182,16 @@ async fn enabled_principal_proceeds_through_admin_topic() {
 async fn admin_request_audit_includes_params_payload() {
     let (_dir, kernel) = fixture().await;
 
-    let mut admin = PrincipalProfile::default();
-    admin.groups = vec!["admin".to_string()];
+    let admin = PrincipalProfile {
+        groups: vec!["admin".to_string()],
+        ..Default::default()
+    };
     seed_profile(&kernel, &PrincipalId::default(), &admin);
 
-    let mut target = PrincipalProfile::default();
-    target.groups = vec!["restricted".to_string()];
+    let target = PrincipalProfile {
+        groups: vec!["restricted".to_string()],
+        ..Default::default()
+    };
     seed_profile(&kernel, &pid("target_user"), &target);
 
     // Drive a caps.grant via the IPC dispatcher so the audit entry is
@@ -228,8 +239,10 @@ async fn admin_request_audit_includes_params_payload() {
 async fn admin_request_id_is_echoed_back_on_response() {
     let (_dir, kernel) = fixture().await;
 
-    let mut admin = PrincipalProfile::default();
-    admin.groups = vec!["admin".to_string()];
+    let admin = PrincipalProfile {
+        groups: vec!["admin".to_string()],
+        ..Default::default()
+    };
     seed_profile(&kernel, &PrincipalId::default(), &admin);
 
     let resp = send_admin(
@@ -250,9 +263,11 @@ async fn admin_request_id_echoed_on_deny_path_too() {
     // Disabled admin — Layer 5 preamble denies, response should still
     // carry the request_id so the client can match it to its in-flight
     // request.
-    let mut admin = PrincipalProfile::default();
-    admin.groups = vec!["admin".to_string()];
-    admin.enabled = false;
+    let admin = PrincipalProfile {
+        groups: vec!["admin".to_string()],
+        enabled: false,
+        ..Default::default()
+    };
     let caller = pid("disabled_admin");
     seed_profile(&kernel, &caller, &admin);
 
@@ -313,14 +328,11 @@ async fn send_admin_scoped(
 fn seed_principal_with_devices(kernel: &Arc<Kernel>, principal: &PrincipalId) -> (String, String) {
     use astrid_core::profile::{AuthMethod, DeviceKey, DeviceScope};
 
-    let mut profile = PrincipalProfile::default();
-    // Grant `self:*` directly so the test does not depend on the `agent`
-    // builtin group being loaded in the test kernel. `self:*` subsumes both
-    // `self:auth:pair` (the issue cap-gate) and `self:auth:pair:admin` (the
-    // full-mint gate), so an unattenuated request succeeds and the device
-    // scope is the only thing that can deny.
-    profile.grants = vec!["self:*".to_string()];
-    profile.enabled = true;
+    let mut profile = PrincipalProfile {
+        grants: vec!["self:*".to_string()],
+        enabled: true,
+        ..Default::default()
+    };
     profile.auth.methods.push(AuthMethod::Keypair);
 
     // A Full-scope device (unattenuated) and a use-only device that denies the

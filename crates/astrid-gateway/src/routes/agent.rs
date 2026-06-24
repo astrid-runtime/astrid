@@ -23,8 +23,11 @@
 //!   * `astrid.v1.elicit.*` — agent requests for follow-up user
 //!     input. Dashboard rendering is out of scope here; we forward
 //!     the events so a client that knows the elicit contract can
-//!     respond out-of-band (the elicit response goes back through
-//!     `POST /api/agent/elicit-response` once that ships).
+//!     respond out-of-band. The client sends the answer back via
+//!     `POST /api/agent/elicit-response` (see [`post_elicit_response`]),
+//!     which publishes the reply onto the per-request topic the host
+//!     waiter is blocked on; the agent's continuation then streams
+//!     back over this still-open prompt SSE connection.
 //!
 //! ## Filtering
 //!
@@ -52,7 +55,8 @@ use astrid_events::AstridEvent;
 use astrid_events::ipc::{IpcMessage, IpcPayload};
 use astrid_types::ipc::IpcPayload as TypesIpcPayload;
 use axum::extract::State;
-use axum::http::Request;
+use axum::http::{Request, StatusCode};
+use axum::response::IntoResponse;
 use axum::response::Sse;
 use axum::response::sse::{Event, KeepAlive};
 use futures::Stream;
@@ -87,6 +91,48 @@ pub struct PromptRequest {
     /// gateway.
     #[serde(default)]
     pub context: Option<serde_json::Value>,
+}
+
+/// Inbound body for `POST /api/agent/elicit-response`.
+///
+/// Answers an in-flight `elicit` event the prompt stream forwarded. The
+/// `request_id` is the one carried verbatim on the `elicit` SSE event.
+///
+/// `value` and `values` are **mutually exclusive**: a scalar answer
+/// (`Text`/`Secret`/`Select`), an array answer (`Array`), or — with neither —
+/// the cancel sentinel (matching the host's `value.is_none() &&
+/// values.is_none()` contract). Supplying both is rejected with `400`.
+#[derive(Debug, Clone, Deserialize, ToSchema)]
+pub struct ElicitResponseRequest {
+    /// Correlates with the `request_id` from the forwarded `elicit` event.
+    /// Serialized as a UUID string; `utoipa` has no native `Uuid` schema
+    /// without its `uuid` feature, so we describe it as a formatted string.
+    #[schema(value_type = String, format = "uuid", example = "550e8400-e29b-41d4-a716-446655440000")]
+    pub request_id: Uuid,
+    /// Scalar answer for `Text` / `Secret` / `Select` fields. `None` (with
+    /// `values` also `None`) signals the user cancelled.
+    #[serde(default)]
+    pub value: Option<String>,
+    /// Collected items for an `Array` field.
+    #[serde(default)]
+    pub values: Option<Vec<String>>,
+}
+
+impl ElicitResponseRequest {
+    /// Reject the ambiguous body where both a scalar `value` and an array
+    /// `values` are supplied. The elicit contract treats them as mutually
+    /// exclusive; allowing both would let the host silently honour one side and
+    /// drop the other depending on the original request kind, masking a client
+    /// bug. The cancel sentinel (both `None`) and either single-sided answer are
+    /// valid.
+    fn validate(&self) -> Result<(), &'static str> {
+        if self.value.is_some() && self.values.is_some() {
+            return Err(
+                "`value` and `values` are mutually exclusive; supply at most one (omit both to cancel)",
+            );
+        }
+        Ok(())
+    }
 }
 
 /// Initial SSE event sent immediately after a successful prompt
@@ -201,7 +247,14 @@ pub async fn post_prompt(
         context: body.context,
     };
     let msg = IpcMessage::new("user.v1.prompt", payload, Uuid::nil())
-        .with_principal(caller.principal.to_string());
+        .with_principal(caller.principal.to_string())
+        // Host-stamp the transport origin: this prompt entered over the gateway
+        // HTTP listener (a remote API caller, even with a valid bearer), NOT the
+        // local Unix socket. It drives the SAME react/openai-compat egress path
+        // a local operator does, so the downstream local-egress consent gate
+        // must be able to tell them apart — a remote request must never earn
+        // local-operator privilege. Propagated unchanged through fan-out.
+        .with_origin(astrid_events::ipc::MessageOrigin::RemoteGateway);
     bus.publish(AstridEvent::Ipc {
         metadata: astrid_events::EventMetadata::new("gateway::agent.prompt"),
         message: msg,
@@ -270,9 +323,11 @@ pub async fn post_prompt(
                     let Some(event) = event else { break };
                     // Elicit events don't carry session_id in the
                     // same shape — forward unconditionally and let
-                    // the client filter. Replying out-of-band is on
-                    // the caller (a future POST /api/agent/elicit-response
-                    // is the planned path).
+                    // the client filter. The caller replies out-of-band
+                    // by POSTing the answer (carrying the forwarded
+                    // request_id) to /api/agent/elicit-response; the
+                    // agent's continuation then streams back over this
+                    // same connection.
                     if let Some(ev) = forward_event(&event, "", "elicit") {
                         yield Ok(ev);
                     }
@@ -282,6 +337,79 @@ pub async fn post_prompt(
     };
 
     Ok(sse_with_keepalive(stream.boxed()))
+}
+
+/// `POST /api/agent/elicit-response` — answer an in-flight `elicit`.
+///
+/// Fire-and-forget: the gateway publishes the answer onto the per-request reply
+/// topic (`astrid.v1.elicit.response.{request_id}`) that the host lifecycle
+/// waiter is blocked on, then returns `202 Accepted` immediately. The agent's
+/// continuation (deltas + final `response`) streams back over the still-open
+/// `POST /api/agent/prompt` SSE connection — NOT this request.
+///
+/// The reply is stamped with the caller's verified principal. The host waiter
+/// enforces same-principal: a reply whose principal differs from the one the
+/// elicit is being collected for is rejected, so a caller who merely observed
+/// another principal's forwarded `request_id` cannot answer or cancel it.
+#[utoipa::path(
+    post,
+    path = "/api/agent/elicit-response",
+    tag = "agent",
+    request_body = ElicitResponseRequest,
+    responses(
+        (status = 202, description = "Answer accepted and published onto the elicit reply topic. The agent's continuation streams over the open prompt SSE connection."),
+        (status = 400, body = ErrorBody, description = "Ambiguous body: `value` and `values` are mutually exclusive."),
+        (status = 401, body = ErrorBody, description = "Missing / invalid bearer."),
+        (status = 500, body = ErrorBody, description = "Gateway not wired to a live event bus."),
+    )
+)]
+pub async fn post_elicit_response(
+    State(state): State<Arc<GatewayState>>,
+    req: Request<axum::body::Body>,
+) -> GatewayResult<impl IntoResponse> {
+    let caller = caller_from(&req)?.clone();
+
+    let Some(bus) = state.event_bus.clone() else {
+        return Err(GatewayError::Internal(anyhow::anyhow!(
+            "gateway is not wired to a live event bus; agent invocation unavailable"
+        )));
+    };
+
+    let body: ElicitResponseRequest = crate::routes::principals::read_json_body(req).await?;
+    body.validate()
+        .map_err(|m| GatewayError::BadRequest(m.to_string()))?;
+
+    publish_elicit_response(&bus, caller.principal.as_str(), body);
+
+    Ok(StatusCode::ACCEPTED)
+}
+
+/// Publish an elicit answer onto the per-request reply topic the host lifecycle
+/// waiter is blocked on (`astrid.v1.elicit.response.{request_id}`), stamped with
+/// the caller's verified `principal`.
+///
+/// Split out of [`post_elicit_response`] so the message construction +
+/// publish — the load-bearing part — is unit-testable without standing up an
+/// authenticated axum request. The host's same-principal check (see the elicit
+/// host fn) accepts the reply only when this stamped principal matches the one
+/// the elicit is being collected for; that is why the verified principal, not a
+/// client-supplied field, is what gets stamped here.
+fn publish_elicit_response(
+    bus: &astrid_events::EventBus,
+    principal: &str,
+    body: ElicitResponseRequest,
+) {
+    let topic = format!("astrid.v1.elicit.response.{}", body.request_id);
+    let payload = IpcPayload::ElicitResponse {
+        request_id: body.request_id,
+        value: body.value,
+        values: body.values,
+    };
+    let msg = IpcMessage::new(topic, payload, Uuid::nil()).with_principal(principal);
+    bus.publish(AstridEvent::Ipc {
+        metadata: astrid_events::EventMetadata::new("gateway::agent.elicit_response"),
+        message: msg,
+    });
 }
 
 /// Wrap a boxed SSE stream with the standard 15s keep-alive heartbeat.
@@ -429,6 +557,145 @@ mod tests {
                 .as_array()
                 .unwrap()
                 .is_empty()
+        );
+    }
+
+    /// `publish_elicit_response` must publish an `ElicitResponse` onto the
+    /// per-request reply topic carrying the `request_id`, the value/values, AND
+    /// the caller's principal. That principal stamp is the security hinge: the
+    /// host waiter only accepts a reply whose principal matches the elicit's
+    /// originating principal, so a missing/wrong stamp would silently fail to
+    /// answer (or, worse, be the vector this endpoint must NOT open).
+    #[tokio::test]
+    async fn elicit_response_publishes_stamped_reply_on_topic() {
+        use astrid_events::ipc::IpcPayload as BusIpcPayload;
+
+        let bus = astrid_events::EventBus::with_capacity(64);
+        let request_id = Uuid::new_v4();
+        let topic = format!("astrid.v1.elicit.response.{request_id}");
+
+        // Subscribe BEFORE publishing — same ordering the host waiter uses.
+        let mut rx = bus.subscribe_topic(topic);
+
+        publish_elicit_response(
+            &bus,
+            "agent-alice",
+            ElicitResponseRequest {
+                request_id,
+                value: Some("hello".to_string()),
+                values: None,
+            },
+        );
+
+        let event = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("reply observed within timeout")
+            .expect("bus open");
+        let AstridEvent::Ipc { message, .. } = &*event else {
+            panic!("expected an IPC event");
+        };
+        assert_eq!(
+            message.principal.as_deref(),
+            Some("agent-alice"),
+            "reply must carry the caller's verified principal"
+        );
+        match &message.payload {
+            BusIpcPayload::ElicitResponse {
+                request_id: got_id,
+                value,
+                values,
+            } => {
+                assert_eq!(*got_id, request_id, "request_id must round-trip");
+                assert_eq!(value.as_deref(), Some("hello"));
+                assert!(values.is_none());
+            },
+            other => panic!("expected ElicitResponse, got {other:?}"),
+        }
+    }
+
+    /// A cancellation (both `value` and `values` `None`) round-trips as the
+    /// host's cancel sentinel — the endpoint must be able to express it.
+    #[tokio::test]
+    async fn elicit_response_cancellation_round_trips() {
+        use astrid_events::ipc::IpcPayload as BusIpcPayload;
+
+        let bus = astrid_events::EventBus::with_capacity(64);
+        let request_id = Uuid::new_v4();
+        let mut rx = bus.subscribe_topic(format!("astrid.v1.elicit.response.{request_id}"));
+
+        publish_elicit_response(
+            &bus,
+            "agent-alice",
+            ElicitResponseRequest {
+                request_id,
+                value: None,
+                values: None,
+            },
+        );
+
+        let event = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("reply observed")
+            .expect("bus open");
+        let AstridEvent::Ipc { message, .. } = &*event else {
+            panic!("expected IPC event");
+        };
+        match &message.payload {
+            BusIpcPayload::ElicitResponse { value, values, .. } => {
+                assert!(
+                    value.is_none() && values.is_none(),
+                    "cancellation = both None (host cancel sentinel)"
+                );
+            },
+            other => panic!("expected ElicitResponse, got {other:?}"),
+        }
+    }
+
+    /// REGRESSION: `value` and `values` are mutually exclusive. A body carrying
+    /// BOTH must be rejected by `validate()` (the handler maps that to a `400`),
+    /// so an ambiguous answer can't reach the bus where the host would silently
+    /// honour one side and drop the other. The cancel sentinel (both `None`) and
+    /// either single-sided answer stay valid.
+    #[test]
+    fn elicit_response_rejects_both_value_and_values() {
+        let request_id = Uuid::new_v4();
+        let both = ElicitResponseRequest {
+            request_id,
+            value: Some("scalar".to_string()),
+            values: Some(vec!["array".to_string()]),
+        };
+        assert!(both.validate().is_err(), "both set must be rejected");
+
+        // Each valid shape passes.
+        assert!(
+            ElicitResponseRequest {
+                request_id,
+                value: Some("v".into()),
+                values: None
+            }
+            .validate()
+            .is_ok(),
+            "scalar answer is valid"
+        );
+        assert!(
+            ElicitResponseRequest {
+                request_id,
+                value: None,
+                values: Some(vec!["a".into()])
+            }
+            .validate()
+            .is_ok(),
+            "array answer is valid"
+        );
+        assert!(
+            ElicitResponseRequest {
+                request_id,
+                value: None,
+                values: None
+            }
+            .validate()
+            .is_ok(),
+            "cancel sentinel (both None) is valid"
         );
     }
 

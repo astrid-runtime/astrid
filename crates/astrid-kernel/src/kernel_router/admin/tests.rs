@@ -8,7 +8,7 @@
 //! 2. **Composition tests** — reassemble the same pieces the runtime
 //!    uses ([`GroupConfig`] + [`PrincipalProfile`] +
 //!    [`CapabilityCheck`]) and assert the post-condition invariants
-//!    (cross-tenant deny for `agent`, ArcSwap hot-reload observed by the
+//!    (cross-tenant deny for `agent`, `ArcSwap` hot-reload observed by the
 //!    next check, cache invalidation reflects on-disk writes,
 //!    revoke-precedence preserved across a subsequent grant).
 
@@ -94,15 +94,17 @@ fn all_admin_variants() -> Vec<AdminRequestKind> {
 }
 
 fn agent_profile() -> PrincipalProfile {
-    let mut p = PrincipalProfile::default();
-    p.groups = vec!["agent".to_string()];
-    p
+    PrincipalProfile {
+        groups: vec!["agent".to_string()],
+        ..Default::default()
+    }
 }
 
 fn admin_profile() -> PrincipalProfile {
-    let mut p = PrincipalProfile::default();
-    p.groups = vec!["admin".to_string()];
-    p
+    PrincipalProfile {
+        groups: vec!["admin".to_string()],
+        ..Default::default()
+    }
 }
 
 fn authorize_with(
@@ -329,10 +331,9 @@ fn arcswap_groups_swap_observed_by_next_check() {
     let swap: Arc<ArcSwap<GroupConfig>> =
         Arc::new(ArcSwap::from_pointee(GroupConfig::builtin_only()));
 
-    let profile = {
-        let mut p = PrincipalProfile::default();
-        p.groups = vec!["ops".to_string()];
-        p
+    let profile = PrincipalProfile {
+        groups: vec!["ops".to_string()],
+        ..Default::default()
     };
     let caller = pid("ops_user");
 
@@ -395,8 +396,10 @@ fn profile_cache_invalidation_reflects_on_disk_mutation() {
     assert!(first.grants.is_empty());
 
     // Write a populated profile to disk behind the cache's back.
-    let mut updated = PrincipalProfile::default();
-    updated.grants = vec!["self:capsule:install".into()];
+    let updated = PrincipalProfile {
+        grants: vec!["self:capsule:install".into()],
+        ..Default::default()
+    };
     let path = PrincipalProfile::path_for(&home, &principal);
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
     updated.save_to_path(&path).unwrap();
@@ -420,10 +423,12 @@ fn caps_grant_preserves_revoke_precedence() {
     // (revoke > grant). This is the sequence
     // `handlers::mutate_caps(_, Grant)` produces when the target
     // profile already has revokes.
-    let mut profile = PrincipalProfile::default();
-    profile.groups = vec!["admin".to_string()];
-    profile.revokes = vec!["self:*".to_string()];
-    profile.grants.push("self:capsule:install".to_string());
+    let profile = PrincipalProfile {
+        groups: vec!["admin".to_string()],
+        revokes: vec!["self:*".to_string()],
+        grants: vec!["self:capsule:install".to_string()],
+        ..Default::default()
+    };
 
     let groups = GroupConfig::builtin_only();
     let caller = pid("alice");
@@ -443,10 +448,12 @@ fn caps_revoke_of_unheld_capability_is_not_an_error_shape() {
     // Pre-emptive revoke: principal doesn't hold X yet, we revoke X,
     // the revoke vec just appends. Later grants/groups are dominated
     // by the revoke.
-    let mut profile = PrincipalProfile::default();
-    profile.groups = vec!["restricted".to_string()];
-    profile.revokes.push("capsule:install".to_string()); // pre-emptive
-    profile.grants.push("capsule:install".to_string());
+    let profile = PrincipalProfile {
+        groups: vec!["restricted".to_string()],
+        revokes: vec!["capsule:install".to_string()],
+        grants: vec!["capsule:install".to_string()],
+        ..Default::default()
+    };
 
     let groups = GroupConfig::builtin_only();
     let caller = pid("alice");

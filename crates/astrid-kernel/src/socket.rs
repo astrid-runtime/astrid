@@ -389,8 +389,8 @@ mod tests {
         let sock = dir.path().join("test.sock");
 
         // Create and immediately drop a listener to leave a stale socket file.
-        let _listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
-        drop(_listener);
+        let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+        drop(listener);
 
         assert!(sock.exists(), "socket file should exist after bind");
         prepare_socket_path(&sock).unwrap();

@@ -304,6 +304,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn cas_concurrent_only_one_winner() {
+        const TASKS: usize = 32;
         // Hammer the same key from many tasks; exactly one CAS must
         // succeed at each (expected → new) transition. Reproduces the
         // race the previous get-then-set host-side emulation lost.
@@ -315,7 +316,6 @@ mod tests {
         let store = Arc::new(MemoryKvStore::new());
         store.set("ns", "k", b"0".to_vec()).await.unwrap();
 
-        const TASKS: usize = 32;
         let mut handles = Vec::with_capacity(TASKS);
         for i in 0..TASKS {
             let s = Arc::clone(&store);

@@ -20,16 +20,18 @@ fn test_allowance_pattern_display() {
     assert_eq!(pattern.to_string(), "mcp://github/*");
 
     let pattern = AllowancePattern::NetworkHost {
+        capsule_id: "react".to_string(),
         host: "api.example.com".to_string(),
         ports: Some(vec![443, 8080]),
     };
-    assert_eq!(pattern.to_string(), "net:api.example.com:[443,8080]");
+    assert_eq!(pattern.to_string(), "net:react:api.example.com:[443,8080]");
 
     let pattern = AllowancePattern::NetworkHost {
+        capsule_id: "react".to_string(),
         host: "api.example.com".to_string(),
         ports: None,
     };
-    assert_eq!(pattern.to_string(), "net:api.example.com:*");
+    assert_eq!(pattern.to_string(), "net:react:api.example.com:*");
 }
 
 #[test]
@@ -197,11 +199,13 @@ fn test_file_pattern_rejects_path_traversal() {
 #[test]
 fn test_network_host_matches() {
     let pattern = AllowancePattern::NetworkHost {
+        capsule_id: "react".to_string(),
         host: "api.example.com".to_string(),
         ports: None,
     };
     assert!(pattern.matches(
         &SensitiveAction::NetworkRequest {
+            capsule_id: "react".to_string(),
             host: "api.example.com".to_string(),
             port: 443,
         },
@@ -209,6 +213,7 @@ fn test_network_host_matches() {
     ));
     assert!(pattern.matches(
         &SensitiveAction::NetworkRequest {
+            capsule_id: "react".to_string(),
             host: "api.example.com".to_string(),
             port: 8080,
         },
@@ -219,11 +224,13 @@ fn test_network_host_matches() {
 #[test]
 fn test_network_host_with_ports() {
     let pattern = AllowancePattern::NetworkHost {
+        capsule_id: "react".to_string(),
         host: "api.example.com".to_string(),
         ports: Some(vec![443, 8443]),
     };
     assert!(pattern.matches(
         &SensitiveAction::NetworkRequest {
+            capsule_id: "react".to_string(),
             host: "api.example.com".to_string(),
             port: 443,
         },
@@ -231,6 +238,7 @@ fn test_network_host_with_ports() {
     ));
     assert!(!pattern.matches(
         &SensitiveAction::NetworkRequest {
+            capsule_id: "react".to_string(),
             host: "api.example.com".to_string(),
             port: 80,
         },
@@ -241,16 +249,49 @@ fn test_network_host_with_ports() {
 #[test]
 fn test_network_host_wrong_host() {
     let pattern = AllowancePattern::NetworkHost {
+        capsule_id: "react".to_string(),
         host: "api.example.com".to_string(),
         ports: None,
     };
     assert!(!pattern.matches(
         &SensitiveAction::NetworkRequest {
+            capsule_id: "react".to_string(),
             host: "evil.com".to_string(),
             port: 443,
         },
         None
     ));
+}
+
+#[test]
+fn test_network_host_is_capsule_scoped() {
+    // A grant for capsule "react" must NOT match a request from capsule
+    // "openai-compat" reaching the same host:port — the discriminator is
+    // load-bearing for per-capsule isolation (PR #1029, FIX 1).
+    let pattern = AllowancePattern::NetworkHost {
+        capsule_id: "react".to_string(),
+        host: "127.0.0.1".to_string(),
+        ports: Some(vec![1234]),
+    };
+    assert!(pattern.matches(
+        &SensitiveAction::NetworkRequest {
+            capsule_id: "react".to_string(),
+            host: "127.0.0.1".to_string(),
+            port: 1234,
+        },
+        None
+    ));
+    assert!(
+        !pattern.matches(
+            &SensitiveAction::NetworkRequest {
+                capsule_id: "openai-compat".to_string(),
+                host: "127.0.0.1".to_string(),
+                port: 1234,
+            },
+            None
+        ),
+        "a react grant must not exempt openai-compat for the same host:port"
+    );
 }
 
 // ---------------------------------------------------------------------------

@@ -854,6 +854,7 @@ mod tests {
     #[test]
     fn post_update_sync_message_softens_version_gate() {
         use super::super::distro::validate::AstridVersionTooOld;
+        use anyhow::Context as _;
 
         // The version-floor gate fired during the post-swap sync (old in-flight
         // process, new binary already on disk) — the user must see the benign
@@ -876,7 +877,6 @@ mod tests {
         // (outermost) message is now the context string, so a match that only
         // looked at the surface text would miss it. `post_update_sync_message`
         // walks `err.chain()` to find `AstridVersionTooOld` underneath.
-        use anyhow::Context as _;
         let wrapped: anyhow::Error = Err::<(), _>(anyhow::Error::from(AstridVersionTooOld {
             req: ">=0.8.0".to_string(),
             running: "0.7.0".to_string(),
@@ -889,7 +889,9 @@ mod tests {
         // inspecting the surface error.
         assert_eq!(wrapped.to_string(), "syncing distro");
         assert!(
-            wrapped.chain().any(|e| e.is::<AstridVersionTooOld>()),
+            wrapped
+                .chain()
+                .any(<dyn std::error::Error + 'static>::is::<AstridVersionTooOld>),
             "guard: the typed gate must be reachable by walking the chain"
         );
         let msg = post_update_sync_message(&wrapped);

@@ -3,10 +3,10 @@
 //! Each test builds a [`test_kernel_with_home`](crate::test_kernel_with_home)
 //! rooted in a private tempdir and invokes [`super::handlers::dispatch`]
 //! directly, bypassing the IPC dispatch but keeping the write-lock / cache /
-//! ArcSwap semantics identical to the production path.
+//! `ArcSwap` semantics identical to the production path.
 //!
 //! These tests cover the Layer 6 behavioural invariants: post-conditions
-//! on disk, cache invalidation, ArcSwap hot-reload, adversarial
+//! on disk, cache invalidation, `ArcSwap` hot-reload, adversarial
 //! sequences (grant-after-revoke, quota=0 rejection, built-in protection,
 //! concurrent writes).
 
@@ -32,8 +32,10 @@ async fn fixture() -> (TempDir, Arc<Kernel>) {
     // authority-scope filter depends on this — without it `default`
     // resolves to an empty profile and is treated as a self-scoped
     // caller, which would (correctly) hide the roster from it.
-    let mut admin = PrincipalProfile::default();
-    admin.groups = vec![BUILTIN_ADMIN.to_string()];
+    let admin = PrincipalProfile {
+        groups: vec![BUILTIN_ADMIN.to_string()],
+        ..Default::default()
+    };
     admin
         .save_to_path(&PrincipalProfile::path_for(
             &kernel.astrid_home,
@@ -713,8 +715,10 @@ async fn quota_set_rejects_zero_memory() {
     )
     .await;
 
-    let mut q = Quotas::default();
-    q.max_memory_bytes = 0;
+    let q = Quotas {
+        max_memory_bytes: 0,
+        ..Default::default()
+    };
     let res = handlers::dispatch(
         &kernel,
         &astrid_core::PrincipalId::default(),
@@ -745,8 +749,10 @@ async fn quota_set_updates_profile_and_invalidates_cache() {
     .await;
     let _warm = kernel.profile_cache.resolve(&pid("eve")).unwrap();
 
-    let mut q = Quotas::default();
-    q.max_memory_bytes = 8 * 1024 * 1024;
+    let q = Quotas {
+        max_memory_bytes: 8 * 1024 * 1024,
+        ..Default::default()
+    };
     handlers::dispatch(
         &kernel,
         &astrid_core::PrincipalId::default(),
@@ -882,6 +888,7 @@ async fn group_list_returns_every_group_marked_correctly() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn group_delete_reference_from_profile_does_not_elevate_privileges() {
+    use astrid_capabilities::CapabilityCheck;
     // Adversarial: a principal's profile references a custom group; we
     // delete that group. The principal must NOT be silently elevated
     // via any other group. Layer 5 fails closed on unknown group refs.
@@ -924,7 +931,6 @@ async fn group_delete_reference_from_profile_does_not_elevate_privileges() {
     // Re-resolve Frank's profile via cache. `ops` in groups vec, but
     // GroupConfig no longer contains it — fail-closed: `capsule:install`
     // must NOT be authorized.
-    use astrid_capabilities::CapabilityCheck;
     let profile = kernel.profile_cache.resolve(&pid("frank")).unwrap();
     let groups = kernel.groups.load_full();
     let check = CapabilityCheck::new(profile.as_ref(), groups.as_ref(), pid("frank"));

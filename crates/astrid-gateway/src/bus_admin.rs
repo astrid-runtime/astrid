@@ -118,7 +118,11 @@ impl BusAdminClient {
         let req = AdminKernelRequest::with_request_id(request_id.clone(), kind);
         let payload = serde_json::to_value(&req).context("serialize AdminKernelRequest")?;
         let mut msg = IpcMessage::new(topic, IpcPayload::RawJson(payload), Uuid::nil())
-            .with_principal(self.caller.to_string());
+            .with_principal(self.caller.to_string())
+            // Host-stamp the gateway transport origin so no message published by
+            // a gateway route inherits the `System` default; an admin op from
+            // a remote bearer is `RemoteGateway`, never a local operator.
+            .with_origin(astrid_events::ipc::MessageOrigin::RemoteGateway);
         // Carry the caller's device scope to the kernel cap-gate. A scoped
         // bearer's key_id rides on every admin op so a paired device cannot
         // exceed its scope (e.g. a use-only device's PairDeviceIssue is denied

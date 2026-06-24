@@ -1073,27 +1073,27 @@ mod tests {
         // attempt 2 = 30 * 2 = 60 s.
         assert_eq!(
             backoff.delay_for_attempt(2),
-            std::time::Duration::from_secs(60)
+            std::time::Duration::from_mins(1)
         );
         // attempt 3 = 30 * 4 = 120 s.
         assert_eq!(
             backoff.delay_for_attempt(3),
-            std::time::Duration::from_secs(120)
+            std::time::Duration::from_mins(2)
         );
         // attempt 4 = 30 * 8 = 240 s.
         assert_eq!(
             backoff.delay_for_attempt(4),
-            std::time::Duration::from_secs(240)
+            std::time::Duration::from_mins(4)
         );
         // attempt 5 = 30 * 16 = 480 s, capped at 300 s.
         assert_eq!(
             backoff.delay_for_attempt(5),
-            std::time::Duration::from_secs(300)
+            std::time::Duration::from_mins(5)
         );
         // further attempts also capped at 300 s.
         assert_eq!(
             backoff.delay_for_attempt(10),
-            std::time::Duration::from_secs(300)
+            std::time::Duration::from_mins(5)
         );
     }
 
@@ -1163,7 +1163,7 @@ mod tests {
             // is well past the cooldown.
             server.last_restart_attempt = Some(
                 Instant::now()
-                    .checked_sub(std::time::Duration::from_secs(60))
+                    .checked_sub(std::time::Duration::from_mins(1))
                     .expect("failed to sub 60s from Instant"),
             );
             running.insert("srv".to_string(), server);

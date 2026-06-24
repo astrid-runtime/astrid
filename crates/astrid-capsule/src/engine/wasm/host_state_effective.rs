@@ -95,6 +95,26 @@ impl HostState {
             .unwrap_or_else(|| self.principal.clone())
     }
 
+    /// Return the host-stamped transport [`MessageOrigin`] of the request
+    /// currently being served, for the local-egress consent decision.
+    ///
+    /// Read from the in-flight [`caller_context`](Self::caller_context) (set
+    /// per-invocation by the dispatcher), falling back to
+    /// [`System`](astrid_events::ipc::MessageOrigin::System) — the fail-closed,
+    /// **non-local** floor — when no caller is in scope (load-time host calls,
+    /// tests, a run-loop's self-triggered work). A non-`LocalSocket` origin
+    /// never earns runtime local-egress consent, so an absent caller context can
+    /// never accidentally grant a local exemption. Mirrors
+    /// [`effective_principal`](Self::effective_principal): the same
+    /// host-populated, never-guest-supplied caller context drives both.
+    #[must_use]
+    pub fn effective_origin(&self) -> astrid_events::ipc::MessageOrigin {
+        self.caller_context
+            .as_ref()
+            .map(|m| m.origin)
+            .unwrap_or(astrid_events::ipc::MessageOrigin::System)
+    }
+
     /// Return the effective quota profile for the current invocation.
     ///
     /// Prefers `invocation_profile` (set by
