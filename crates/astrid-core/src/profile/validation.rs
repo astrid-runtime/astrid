@@ -451,6 +451,21 @@ mod tests {
         assert!(super::super::CapabilityPattern::new("system:").is_err());
     }
 
+    #[test]
+    fn typed_field_errors_include_field_and_value() {
+        let mut p = PrincipalProfile::default();
+        p.grants = vec!["system:".into()];
+
+        let err = p.validate().unwrap_err();
+        match err {
+            ProfileError::Invalid(msg) => {
+                assert!(msg.contains("grants entry"), "msg: {msg}");
+                assert!(msg.contains("\"system:\""), "msg: {msg}");
+            },
+            other => panic!("expected Invalid, got: {other:?}"),
+        }
+    }
+
     // ── Network / process ─────────────────────────────────────────────
 
     #[test]

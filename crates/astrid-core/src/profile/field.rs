@@ -278,33 +278,41 @@ impl<'a> TryFrom<&'a PrincipalProfile> for ValidatedProfileFields<'a> {
             groups: profile
                 .groups
                 .iter()
-                .map(|value| GroupName::new(value.as_str()).map_err(|e| profile_field_error(&e)))
+                .map(|value| {
+                    GroupName::new(value.as_str())
+                        .map_err(|e| profile_field_error("groups", value, &e))
+                })
                 .collect::<ProfileResult<_>>()?,
             grants: profile
                 .grants
                 .iter()
                 .map(|value| {
-                    CapabilityPattern::new(value.as_str()).map_err(|e| profile_field_error(&e))
+                    CapabilityPattern::new(value.as_str())
+                        .map_err(|e| profile_field_error("grants", value, &e))
                 })
                 .collect::<ProfileResult<_>>()?,
             revokes: profile
                 .revokes
                 .iter()
                 .map(|value| {
-                    CapabilityPattern::new(value.as_str()).map_err(|e| profile_field_error(&e))
+                    CapabilityPattern::new(value.as_str())
+                        .map_err(|e| profile_field_error("revokes", value, &e))
                 })
                 .collect::<ProfileResult<_>>()?,
             capsules: profile
                 .capsules
                 .iter()
-                .map(|value| CapsuleGrant::new(value.as_str()).map_err(|e| profile_field_error(&e)))
+                .map(|value| {
+                    CapsuleGrant::new(value.as_str())
+                        .map_err(|e| profile_field_error("capsules", value, &e))
+                })
                 .collect::<ProfileResult<_>>()?,
         })
     }
 }
 
-fn profile_field_error(error: &ProfileFieldError) -> ProfileError {
-    ProfileError::Invalid(error.to_string())
+fn profile_field_error(field: &str, value: &str, error: &ProfileFieldError) -> ProfileError {
+    ProfileError::Invalid(format!("{field} entry {value:?} rejected: {error}"))
 }
 
 pub(super) fn validate_group_name_str(name: &str) -> Result<(), ProfileFieldError> {

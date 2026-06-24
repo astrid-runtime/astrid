@@ -102,12 +102,13 @@ pub enum PermissionError {
 /// Borrowed evaluator over a resolved profile and the shared group
 /// configuration.
 ///
-/// Zero-allocation and thread-safe: both inputs are shared references,
-/// so multiple concurrent handlers can evaluate against the same
-/// `&GroupConfig`/`&PrincipalProfile` without contention.
+/// The profile is validated into a borrowed typed view at construction, so
+/// repeated capability checks reuse the same field classification instead of
+/// reparsing the profile strings. The evaluator remains thread-safe: all
+/// runtime inputs are shared references.
 #[derive(Debug, Clone)]
 pub struct CapabilityCheck<'a> {
-    profile: &'a PrincipalProfile,
+    profile: Result<ValidatedProfileFields<'a>, String>,
     groups: &'a GroupConfig,
     principal: PrincipalId,
     /// Optional per-device attenuation floor. `None` (the default) means the
@@ -130,6 +131,7 @@ impl<'a> CapabilityCheck<'a> {
         groups: &'a GroupConfig,
         principal: PrincipalId,
     ) -> Self {
+        let profile = profile.typed_fields().map_err(|e| e.to_string());
         Self {
             profile,
             groups,
@@ -159,15 +161,19 @@ impl<'a> CapabilityCheck<'a> {
     /// a capability the principal lacks become held.
     #[must_use]
     pub fn has(&self, cap: &str) -> bool {
-        let Ok(profile) = self.profile.typed_fields() else {
-            warn!(
-                security_event = true,
-                principal = %self.principal,
-                "Principal profile contains invalid typed fields — no capabilities inherited"
-            );
-            return false;
+        let profile = match &self.profile {
+            Ok(profile) => profile,
+            Err(e) => {
+                warn!(
+                    security_event = true,
+                    principal = %self.principal,
+                    error = %e,
+                    "Principal profile contains invalid typed fields — no capabilities inherited"
+                );
+                return false;
+            },
         };
-        if !self.principal_has(&profile, cap) {
+        if !self.principal_has(profile, cap) {
             return false;
         }
         self.device_scope_admits(cap)
@@ -185,7 +191,7 @@ impl<'a> CapabilityCheck<'a> {
     /// [`PermissionError::DeviceScopeDenied`] if the principal holds it but
     /// the authenticating device's scope does not admit it.
     pub fn require(&self, cap: &str) -> Result<(), PermissionError> {
-        let profile = match self.profile.typed_fields() {
+        let profile = match &self.profile {
             Ok(profile) => profile,
             Err(e) => {
                 warn!(
@@ -200,7 +206,7 @@ impl<'a> CapabilityCheck<'a> {
                 });
             },
         };
-        if let Some(revoke) = Self::first_matching_revoke(&profile, cap) {
+        if let Some(revoke) = Self::first_matching_revoke(profile, cap) {
             return Err(PermissionError::RevokedCapability {
                 principal: self.principal.clone(),
                 required: cap.to_string(),
@@ -209,7 +215,7 @@ impl<'a> CapabilityCheck<'a> {
         }
         let principal_holds =
             matches_any(profile.grants.iter().map(CapabilityPattern::as_str), cap)
-                || self.holds_via_groups(&profile, cap);
+                || self.holds_via_groups(profile, cap);
         if !principal_holds {
             return Err(PermissionError::MissingCapability {
                 principal: self.principal.clone(),

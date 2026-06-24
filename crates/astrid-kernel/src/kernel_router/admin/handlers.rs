@@ -561,6 +561,10 @@ where
     T: TryFrom<String> + Into<String>,
     T::Error: std::fmt::Display,
 {
+    for entry in remove {
+        T::try_from(entry.clone()).map_err(|e| e.to_string())?;
+    }
+
     // Build the resulting order on a scratch copy WITHOUT touching `target`:
     // surviving entries keep their order, then new additions append.
     let mut next: Vec<String> = target
