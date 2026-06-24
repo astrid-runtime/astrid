@@ -56,8 +56,8 @@ pub(crate) async fn nudge_daemon_reload(capsule_ids: &[String]) {
         // reload's late response can never be mis-read as the next capsule's
         // response in this loop.
         let correlation = uuid::Uuid::new_v4().simple().to_string();
-        let request_topic = format!("astrid.v1.request.reload_capsule.{correlation}");
-        let response_topic = format!("astrid.v1.response.reload_capsule.{correlation}");
+        let request_topic = astrid_types::Topic::reload_capsule_request(&correlation);
+        let response_topic = astrid_types::Topic::reload_capsule_response(&correlation);
         let msg = astrid_types::ipc::IpcMessage::new(
             request_topic,
             astrid_types::ipc::IpcPayload::RawJson(val),
@@ -70,7 +70,7 @@ pub(crate) async fn nudge_daemon_reload(capsule_ids: &[String]) {
         // Confirm the daemon reloaded (it replies only after the load completes),
         // so the line we print is truthful. A timeout is non-fatal.
         let Ok(raw) = client
-            .read_until_topic(&response_topic, std::time::Duration::from_secs(15))
+            .read_until_topic(response_topic.as_str(), std::time::Duration::from_secs(15))
             .await
         else {
             eprintln!(
@@ -144,8 +144,10 @@ pub(crate) async fn nudge_daemon_unload(capsule_id: &str) {
     // suffix onto the response topic, so a slow or timed-out unload's late
     // response can't be mis-read as some other request's response.
     let correlation = uuid::Uuid::new_v4().simple().to_string();
-    let request_topic = format!("astrid.v1.request.unload_capsule.{correlation}");
-    let response_topic = format!("astrid.v1.response.unload_capsule.{correlation}");
+    let request_topic =
+        astrid_types::Topic::kernel_request(format!("unload_capsule.{correlation}"));
+    let response_topic =
+        astrid_types::Topic::kernel_response(format!("unload_capsule.{correlation}"));
     let msg = astrid_types::ipc::IpcMessage::new(
         request_topic,
         astrid_types::ipc::IpcPayload::RawJson(val),
@@ -158,7 +160,7 @@ pub(crate) async fn nudge_daemon_unload(capsule_id: &str) {
     // Confirm the daemon processed the unload (it replies only after the unload
     // completes), so the line we print is truthful. A timeout is non-fatal.
     let Ok(raw) = client
-        .read_until_topic(&response_topic, std::time::Duration::from_secs(15))
+        .read_until_topic(response_topic.as_str(), std::time::Duration::from_secs(15))
         .await
     else {
         eprintln!(

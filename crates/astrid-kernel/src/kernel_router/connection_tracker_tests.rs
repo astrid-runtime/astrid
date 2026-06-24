@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use astrid_events::AstridEvent;
 use astrid_events::EventMetadata;
-use astrid_events::ipc::{IpcMessage, IpcPayload};
+use astrid_events::ipc::{IpcMessage, IpcPayload, Topic};
 
 use super::{ConnectionSignal, connection_signal};
 
@@ -114,7 +114,7 @@ fn typed_payload_wins_even_on_an_unrelated_topic() {
 /// Publish a host-shaped `client.v1.connect` for `principal` onto the bus.
 fn publish_connect(kernel: &crate::Kernel, principal: &str) {
     let message = IpcMessage::new(
-        "client.v1.connect",
+        Topic::client_connect(),
         IpcPayload::RawJson(serde_json::json!({})),
         uuid::Uuid::nil(),
     )
@@ -128,7 +128,7 @@ fn publish_connect(kernel: &crate::Kernel, principal: &str) {
 /// Publish a host-shaped `client.v1.disconnect` for `principal` onto the bus.
 fn publish_disconnect(kernel: &crate::Kernel, principal: &str) {
     let message = IpcMessage::new(
-        "client.v1.disconnect",
+        Topic::client_disconnect(),
         IpcPayload::RawJson(serde_json::json!({ "reason": "socket closed" })),
         uuid::Uuid::nil(),
     )

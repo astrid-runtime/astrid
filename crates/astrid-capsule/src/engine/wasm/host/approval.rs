@@ -16,7 +16,7 @@ use astrid_core::principal::PrincipalId;
 use astrid_core::types::Timestamp;
 use astrid_crypto::KeyPair;
 use astrid_events::AstridEvent;
-use astrid_events::ipc::{IpcMessage, IpcPayload};
+use astrid_events::ipc::{IpcMessage, IpcPayload, Topic};
 use uuid::Uuid;
 
 /// Maximum timeout for approval requests (60 seconds).
@@ -244,10 +244,10 @@ impl approval::Host for HostState {
 
         // Slow path: publish ApprovalRequired and wait for response.
         let request_id = Uuid::new_v4().to_string();
-        let response_topic = format!("astrid.v1.approval.response.{request_id}");
+        let response_topic = Topic::approval_response(&request_id);
 
         // Subscribe BEFORE publishing to prevent a race.
-        let mut receiver = event_bus.subscribe_topic(&response_topic);
+        let mut receiver = event_bus.subscribe_topic(response_topic.as_str());
 
         let request_payload = IpcPayload::ApprovalRequired {
             request_id: request_id.clone(),
@@ -256,7 +256,7 @@ impl approval::Host for HostState {
             reason: format!("Capsule '{capsule_id}' requests approval"),
         };
         let message = IpcMessage::new(
-            "astrid.v1.approval",
+            Topic::approval_request(),
             request_payload,
             Uuid::nil(), // Kernel-originated
         );

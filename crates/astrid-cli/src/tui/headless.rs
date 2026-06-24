@@ -195,7 +195,7 @@ pub(crate) async fn run(cfg: HeadlessConfig<'_>) -> anyhow::Result<()> {
     let req = astrid_core::kernel_api::KernelRequest::GetCommands;
     if let Ok(val) = serde_json::to_value(req) {
         let msg = astrid_types::ipc::IpcMessage::new(
-            "astrid.v1.request.get_commands",
+            astrid_types::Topic::kernel_request("get_commands"),
             astrid_types::ipc::IpcPayload::RawJson(val),
             cfg.session_id.0,
         );
@@ -281,7 +281,7 @@ pub(crate) async fn run(cfg: HeadlessConfig<'_>) -> anyhow::Result<()> {
                 };
                 cfg.client
                     .send_message(astrid_types::ipc::IpcMessage::new(
-                        format!("astrid.v1.approval.response.{request_id}"),
+                        astrid_types::Topic::approval_response(&request_id),
                         astrid_types::ipc::IpcPayload::ApprovalResponse {
                             request_id: request_id.clone(),
                             decision: decision.into(),
@@ -318,7 +318,7 @@ pub(crate) async fn run(cfg: HeadlessConfig<'_>) -> anyhow::Result<()> {
     }
 
     let msg = astrid_types::ipc::IpcMessage::new(
-        "client.v1.disconnect",
+        astrid_types::Topic::client_disconnect(),
         astrid_types::ipc::IpcPayload::Disconnect {
             reason: Some("headless-tui-done".to_string()),
         },

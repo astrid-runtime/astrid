@@ -9,7 +9,7 @@ use crate::engine::wasm::bindings::astrid::elicit::host::{
 use crate::engine::wasm::host::util;
 use crate::engine::wasm::host_state::HostState;
 use astrid_events::AstridEvent;
-use astrid_events::ipc::{IpcMessage, IpcPayload, OnboardingField, OnboardingFieldType};
+use astrid_events::ipc::{IpcMessage, IpcPayload, OnboardingField, OnboardingFieldType, Topic};
 use uuid::Uuid;
 
 /// Maximum timeout for interactive elicitation (120 seconds).
@@ -146,7 +146,7 @@ impl elicit::Host for HostState {
 
         let field = map_to_onboarding_field(&request)?;
         let request_id = Uuid::new_v4();
-        let response_topic = format!("astrid.v1.elicit.response.{request_id}");
+        let response_topic = Topic::elicit_response(request_id);
 
         // The principal this elicit is being collected on behalf of. The
         // matching reply must be attributed to the SAME principal — a request_id
@@ -159,7 +159,7 @@ impl elicit::Host for HostState {
 
         // Subscribe to the response topic BEFORE publishing the request
         // to prevent a race where the response arrives before we're listening.
-        let mut receiver = self.event_bus.subscribe_topic(&response_topic);
+        let mut receiver = self.event_bus.subscribe_topic(response_topic.as_str());
 
         let runtime_handle = self.runtime_handle.clone();
         let event_bus = self.event_bus.clone();
@@ -177,7 +177,7 @@ impl elicit::Host for HostState {
             field,
         };
         let message = IpcMessage::new(
-            "astrid.v1.elicit",
+            Topic::elicit_request(),
             request_payload,
             Uuid::nil(), // Kernel-originated
         )
@@ -405,7 +405,7 @@ mod tests {
         principal: Option<&str>,
         value: Option<String>,
     ) -> AstridEvent {
-        let topic = format!("astrid.v1.elicit.response.{request_id}");
+        let topic = Topic::elicit_response(request_id);
         let mut msg = IpcMessage::new(
             topic,
             IpcPayload::ElicitResponse {
@@ -488,7 +488,7 @@ mod tests {
     async fn await_response_times_out_when_no_reply() {
         let bus = astrid_events::EventBus::with_capacity(256);
         let request_id = Uuid::new_v4();
-        let mut rx = bus.subscribe_topic(format!("astrid.v1.elicit.response.{request_id}"));
+        let mut rx = bus.subscribe_topic(Topic::elicit_response(request_id).as_str());
 
         let budget = std::time::Duration::from_millis(150);
         let start = std::time::Instant::now();
@@ -523,7 +523,7 @@ mod tests {
     async fn await_response_flood_does_not_extend_deadline() {
         let bus = astrid_events::EventBus::with_capacity(256);
         let request_id = Uuid::new_v4();
-        let mut rx = bus.subscribe_topic(format!("astrid.v1.elicit.response.{request_id}"));
+        let mut rx = bus.subscribe_topic(Topic::elicit_response(request_id).as_str());
 
         // Publisher: a cross-principal reply every ~40ms for ~2s. The 40ms
         // cadence is shorter than the 150ms budget, so a reset-per-reply bug
@@ -560,7 +560,7 @@ mod tests {
     async fn await_response_drains_past_mismatches_to_match() {
         let bus = astrid_events::EventBus::with_capacity(256);
         let request_id = Uuid::new_v4();
-        let mut rx = bus.subscribe_topic(format!("astrid.v1.elicit.response.{request_id}"));
+        let mut rx = bus.subscribe_topic(Topic::elicit_response(request_id).as_str());
 
         publish_reply(&bus, request_id, Some("agent-bob"), "intruder-1");
         publish_reply(&bus, request_id, Some("agent-carol"), "intruder-2");
@@ -604,7 +604,7 @@ mod wait_loop_tests {
     use crate::engine::wasm::host_state::LifecyclePhase;
     use crate::engine::wasm::test_fixtures::minimal_host_state;
     use astrid_events::AstridEvent;
-    use astrid_events::ipc::{IpcMessage, IpcPayload};
+    use astrid_events::ipc::{IpcMessage, IpcPayload, Topic};
     use uuid::Uuid;
 
     fn text_request(key: &str) -> ElicitRequest {
@@ -624,7 +624,7 @@ mod wait_loop_tests {
         principal: &str,
         value: &str,
     ) {
-        let topic = format!("astrid.v1.elicit.response.{request_id}");
+        let topic = Topic::elicit_response(request_id);
         let msg = IpcMessage::new(
             topic,
             IpcPayload::ElicitResponse {
@@ -645,7 +645,7 @@ mod wait_loop_tests {
     /// `values` `None` — the host's cancellation sentinel — stamped with
     /// `principal`.
     fn publish_cancel(bus: &astrid_events::EventBus, request_id: Uuid, principal: &str) {
-        let topic = format!("astrid.v1.elicit.response.{request_id}");
+        let topic = Topic::elicit_response(request_id);
         let msg = IpcMessage::new(
             topic,
             IpcPayload::ElicitResponse {

@@ -302,7 +302,7 @@ async fn consent_grant_yields_exempt_host() {
     use astrid_core::principal::PrincipalId;
     use astrid_core::types::Timestamp;
     use astrid_crypto::KeyPair;
-    use astrid_events::ipc::{IpcMessage, IpcPayload, MessageOrigin};
+    use astrid_events::ipc::{IpcMessage, IpcPayload, MessageOrigin, Topic};
 
     use crate::engine::wasm::test_fixtures::minimal_host_state;
 
@@ -336,7 +336,7 @@ async fn consent_grant_yields_exempt_host() {
         .unwrap();
     state.allowance_store = Some(store);
     state.caller_context = Some(
-        IpcMessage::new("t", IpcPayload::Connect, uuid::Uuid::nil())
+        IpcMessage::new(Topic::from_raw("t"), IpcPayload::Connect, uuid::Uuid::nil())
             .with_principal("alice")
             .with_origin(MessageOrigin::LocalSocket),
     );
@@ -353,7 +353,7 @@ async fn consent_grant_yields_exempt_host() {
     // Same endpoint, but the request is NOT local (RemoteGateway): no grant
     // applies to the origin gate, so it stays airlock-rejected.
     state.caller_context = Some(
-        IpcMessage::new("t", IpcPayload::Connect, uuid::Uuid::nil())
+        IpcMessage::new(Topic::from_raw("t"), IpcPayload::Connect, uuid::Uuid::nil())
             .with_principal("alice")
             .with_origin(MessageOrigin::RemoteGateway),
     );

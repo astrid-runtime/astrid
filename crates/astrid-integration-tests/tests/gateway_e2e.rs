@@ -62,7 +62,7 @@ use std::sync::Arc;
 
 use astrid_core::PrincipalId;
 use astrid_events::AstridEvent;
-use astrid_events::ipc::{IpcMessage, IpcPayload};
+use astrid_events::ipc::{IpcMessage, IpcPayload, Topic};
 use astrid_gateway::{GatewayConfig, GatewayState, routes};
 use axum::Router;
 use axum::body::{Body, to_bytes};
@@ -132,7 +132,7 @@ async fn check_audit_bus_roundtrip(event_bus: &astrid_events::EventBus) {
         "outcome": "success",
     });
     let msg = IpcMessage::new(
-        "astrid.v1.audit.entry",
+        Topic::audit_entry(),
         IpcPayload::RawJson(payload.clone()),
         uuid::Uuid::nil(),
     );

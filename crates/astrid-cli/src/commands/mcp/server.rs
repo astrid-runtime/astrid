@@ -61,8 +61,6 @@ use super::ingress;
 pub(super) const TOOLS_LIST_TOPIC: &str = "astrid.v1.request.mcp.tools.list";
 /// Request topic for the broker `tools/call` front door.
 const TOOL_CALL_TOPIC: &str = "astrid.v1.request.mcp.tool.call";
-/// Egress topic prefix the broker replies on (`<prefix><req_id>`).
-pub(super) const RESPONSE_PREFIX: &str = "astrid.v1.response.";
 
 /// Shim-side deadline for a single broker round trip. The broker bounds
 /// its own tool drain at 50 s; this sits just above that so a slow tool
@@ -110,10 +108,10 @@ impl AstridMcpServer {
         req_id: &str,
         body: Value,
     ) -> Result<Value, McpError> {
-        let reply_topic = format!("{RESPONSE_PREFIX}{req_id}");
+        let reply_topic = astrid_types::Topic::kernel_response(req_id);
 
         let msg = astrid_types::ipc::IpcMessage::new(
-            request_topic,
+            astrid_types::Topic::from_raw(request_topic),
             astrid_types::ipc::IpcPayload::RawJson(body),
             // Source attribution is set by the kernel from the
             // authenticated connection, not this field; match the other

@@ -51,7 +51,7 @@ fn pattern_covers_audit_via_route_matcher() {
 /// `astrid.v1.audit.entry`, `with_principal`).
 fn publish_audit(bus: &astrid_events::EventBus, principal: &str) {
     let msg = InternalIpcMessage::new(
-        AUDIT_TOPIC,
+        Topic::from_raw(AUDIT_TOPIC),
         IpcPayload::RawJson(serde_json::json!({ "principal": principal })),
         uuid::Uuid::nil(),
     )
@@ -173,7 +173,7 @@ async fn subscribe_non_audit_topic_unaffected() {
     // Publish session events from two principals.
     for who in ["alice", "bob"] {
         let msg = InternalIpcMessage::new(
-            "astrid.v1.session.update",
+            Topic::from_raw("astrid.v1.session.update"),
             IpcPayload::RawJson(serde_json::json!({})),
             uuid::Uuid::nil(),
         )
@@ -417,7 +417,7 @@ fn first_origin(receiver: &mut astrid_events::EventReceiver) -> astrid_events::i
 /// dispatcher installs per invocation.
 fn caller_with_origin(origin: astrid_events::ipc::MessageOrigin) -> astrid_events::ipc::IpcMessage {
     astrid_events::ipc::IpcMessage::new(
-        "in.flight",
+        astrid_events::ipc::Topic::from_raw("in.flight"),
         astrid_events::ipc::IpcPayload::Connect,
         uuid::Uuid::nil(),
     )

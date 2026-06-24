@@ -90,7 +90,7 @@ use astrid_core::principal::PrincipalId;
 use astrid_core::types::Timestamp;
 use astrid_crypto::KeyPair;
 use astrid_events::AstridEvent;
-use astrid_events::ipc::{IpcMessage, IpcPayload, MessageOrigin};
+use astrid_events::ipc::{IpcMessage, IpcPayload, MessageOrigin, Topic};
 use uuid::Uuid;
 
 use crate::engine::wasm::host::util;
@@ -482,9 +482,9 @@ impl HostState {
         // residual in this method's doc comment for why a distinct
         // `astrid.v1.egress.response.*` namespace is deferred (out-of-repo
         // operator-surface ACL spread).
-        let response_topic = format!("astrid.v1.approval.response.{request_id}");
+        let response_topic = Topic::approval_response(&request_id);
         // Subscribe BEFORE publishing to prevent a publish/subscribe race.
-        let mut receiver = event_bus.subscribe_topic(&response_topic);
+        let mut receiver = event_bus.subscribe_topic(response_topic.as_str());
 
         let payload = IpcPayload::ApprovalRequired {
             request_id: request_id.clone(),
@@ -497,7 +497,7 @@ impl HostState {
         };
         // Kernel-originated (nil source_id): the host is asking on the operator's
         // behalf, not a capsule forging an approval request.
-        let message = IpcMessage::new("astrid.v1.approval", payload, Uuid::nil());
+        let message = IpcMessage::new(Topic::approval_request(), payload, Uuid::nil());
         event_bus.publish(AstridEvent::Ipc {
             message,
             metadata: astrid_events::EventMetadata::default(),

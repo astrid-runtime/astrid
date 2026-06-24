@@ -52,7 +52,7 @@ use std::time::Duration;
 
 use astrid_core::kernel_api::AgentLoopReadiness;
 use astrid_events::AstridEvent;
-use astrid_events::ipc::{IpcMessage, IpcPayload};
+use astrid_events::ipc::{IpcMessage, IpcPayload, Topic};
 use astrid_types::ipc::IpcPayload as TypesIpcPayload;
 use axum::extract::State;
 use axum::http::{Request, StatusCode};
@@ -246,7 +246,7 @@ pub async fn post_prompt(
         session_id: session_id.clone(),
         context: body.context,
     };
-    let msg = IpcMessage::new("user.v1.prompt", payload, Uuid::nil())
+    let msg = IpcMessage::new(Topic::user_prompt(), payload, Uuid::nil())
         .with_principal(caller.principal.to_string())
         // Host-stamp the transport origin: this prompt entered over the gateway
         // HTTP listener (a remote API caller, even with a valid bearer), NOT the
@@ -399,13 +399,17 @@ fn publish_elicit_response(
     principal: &str,
     body: ElicitResponseRequest,
 ) {
-    let topic = format!("astrid.v1.elicit.response.{}", body.request_id);
     let payload = IpcPayload::ElicitResponse {
         request_id: body.request_id,
         value: body.value,
         values: body.values,
     };
-    let msg = IpcMessage::new(topic, payload, Uuid::nil()).with_principal(principal);
+    let msg = IpcMessage::new(
+        Topic::elicit_response(body.request_id),
+        payload,
+        Uuid::nil(),
+    )
+    .with_principal(principal);
     bus.publish(AstridEvent::Ipc {
         metadata: astrid_events::EventMetadata::new("gateway::agent.elicit_response"),
         message: msg,
@@ -572,10 +576,10 @@ mod tests {
 
         let bus = astrid_events::EventBus::with_capacity(64);
         let request_id = Uuid::new_v4();
-        let topic = format!("astrid.v1.elicit.response.{request_id}");
+        let topic = Topic::elicit_response(request_id);
 
         // Subscribe BEFORE publishing — same ordering the host waiter uses.
-        let mut rx = bus.subscribe_topic(topic);
+        let mut rx = bus.subscribe_topic(topic.as_str());
 
         publish_elicit_response(
             &bus,
@@ -621,7 +625,7 @@ mod tests {
 
         let bus = astrid_events::EventBus::with_capacity(64);
         let request_id = Uuid::new_v4();
-        let mut rx = bus.subscribe_topic(format!("astrid.v1.elicit.response.{request_id}"));
+        let mut rx = bus.subscribe_topic(Topic::elicit_response(request_id).as_str());
 
         publish_elicit_response(
             &bus,

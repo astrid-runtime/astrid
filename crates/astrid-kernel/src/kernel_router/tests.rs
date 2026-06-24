@@ -24,6 +24,16 @@ fn response_topic_for_maps_request_to_response() {
 }
 
 #[test]
+fn audit_topic_const_matches_constructor() {
+    // The audit wire string is published via `Topic::audit_entry()`, but the
+    // `pub const AUDIT_TOPIC` is the named cross-crate anchor that the capsule's
+    // `audit_topic_literal_pinned` test and the gateway SSE consumer mirror.
+    // Pin the two so a rename in one place can never silently leave the other
+    // (and thus the audit firehose scoping) pointing at a stale topic.
+    assert_eq!(Topic::audit_entry().as_str(), AUDIT_TOPIC);
+}
+
+#[test]
 fn rate_limiter_allows_within_limit() {
     let mut limiter = ManagementRateLimiter::new();
     for _ in 0..5 {
@@ -267,7 +277,7 @@ fn resolve_scope_defaults_to_self() {
 #[test]
 fn resolve_caller_uses_ipc_principal_when_present() {
     let mut msg = IpcMessage::new(
-        "astrid.v1.request.system",
+        Topic::kernel_request("system"),
         IpcPayload::RawJson(serde_json::json!({})),
         uuid::Uuid::nil(),
     );
@@ -279,7 +289,7 @@ fn resolve_caller_uses_ipc_principal_when_present() {
 #[test]
 fn resolve_caller_falls_back_to_default_when_missing() {
     let msg = IpcMessage::new(
-        "astrid.v1.request.system",
+        Topic::kernel_request("system"),
         IpcPayload::RawJson(serde_json::json!({})),
         uuid::Uuid::nil(),
     );
@@ -290,7 +300,7 @@ fn resolve_caller_falls_back_to_default_when_missing() {
 #[test]
 fn resolve_caller_falls_back_to_default_on_invalid_principal() {
     let mut msg = IpcMessage::new(
-        "astrid.v1.request.system",
+        Topic::kernel_request("system"),
         IpcPayload::RawJson(serde_json::json!({})),
         uuid::Uuid::nil(),
     );
@@ -330,9 +340,9 @@ async fn get_agent_readiness_returns_readiness_response() {
     // management-API router so `astrid.v1.request.*` traffic is serviced.
     drop(spawn_kernel_router(Arc::clone(&kernel)));
 
-    let request_topic = "astrid.v1.request.agent_readiness";
-    let response_topic = "astrid.v1.response.agent_readiness";
-    let mut rx = kernel.event_bus.subscribe_topic(response_topic);
+    let request_topic = Topic::kernel_request("agent_readiness");
+    let response_topic = Topic::kernel_response("agent_readiness");
+    let mut rx = kernel.event_bus.subscribe_topic(response_topic.as_str());
 
     let payload =
         serde_json::to_value(KernelRequest::GetAgentReadiness).expect("serialize request");

@@ -20,6 +20,7 @@ use std::path::Path;
 
 use astrid_capsule::manifest::EnvDef;
 use astrid_events::{AstridEvent, EventBus, EventMetadata, EventReceiver};
+use astrid_types::Topic;
 use astrid_types::ipc::{IpcMessage, IpcPayload, OnboardingFieldType};
 
 use super::model_discovery::fetch_options_blocking;
@@ -325,13 +326,16 @@ fn build_elicit_response_msg(
     value: Option<String>,
     values: Option<Vec<String>>,
 ) -> IpcMessage {
-    let response_topic = format!("astrid.v1.elicit.response.{request_id}");
     let response = IpcPayload::ElicitResponse {
         request_id,
         value,
         values,
     };
-    let mut msg = IpcMessage::new(response_topic, response, uuid::Uuid::nil());
+    let mut msg = IpcMessage::new(
+        Topic::elicit_response(request_id),
+        response,
+        uuid::Uuid::nil(),
+    );
     if let Some(p) = request_principal {
         msg = msg.with_principal(p);
     }
@@ -605,7 +609,7 @@ type = "text"
             Some("default"),
             "reply must carry the originating principal for the host's same-principal check"
         );
-        assert_eq!(msg.topic, format!("astrid.v1.elicit.response.{request_id}"));
+        assert_eq!(msg.topic, Topic::elicit_response(request_id));
         match msg.payload {
             IpcPayload::ElicitResponse {
                 request_id: got,

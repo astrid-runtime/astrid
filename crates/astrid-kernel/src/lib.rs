@@ -820,7 +820,7 @@ impl Kernel {
         let payload = capsules_loaded::build_capsules_loaded_payload(with_meta);
 
         let msg = astrid_events::ipc::IpcMessage::new(
-            "astrid.v1.capsules_loaded",
+            astrid_events::ipc::Topic::from_raw("astrid.v1.capsules_loaded"),
             astrid_events::ipc::IpcPayload::RawJson(payload),
             self.session_id.0,
         );
@@ -1774,7 +1774,7 @@ fn spawn_capsule_health_monitor(kernel: Arc<Kernel>) -> tokio::task::JoinHandle<
                     tracing::error!(capsule_id = %id_str, reason = %reason, "Capsule health check failed");
 
                     let msg = astrid_events::ipc::IpcMessage::new(
-                        "astrid.v1.health.failed",
+                        astrid_events::ipc::Topic::from_raw("astrid.v1.health.failed"),
                         astrid_events::ipc::IpcPayload::Custom {
                             data: serde_json::json!({
                                 "capsule_id": &id_str,
@@ -1850,7 +1850,7 @@ fn spawn_react_watchdog(event_bus: Arc<EventBus>) -> tokio::task::JoinHandle<()>
                 .increment(1);
 
             let msg = astrid_events::ipc::IpcMessage::new(
-                "astrid.v1.watchdog.tick",
+                astrid_events::ipc::Topic::from_raw("astrid.v1.watchdog.tick"),
                 astrid_events::ipc::IpcPayload::Custom {
                     data: serde_json::json!({}),
                 },

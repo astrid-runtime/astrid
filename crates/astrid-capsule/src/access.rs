@@ -113,7 +113,7 @@ pub(crate) fn emit_grant_required(
         capsule_id,
     };
     let message = astrid_events::ipc::IpcMessage::new(
-        "astrid.v1.approval",
+        astrid_events::ipc::Topic::approval_request(),
         payload,
         uuid::Uuid::nil(), // Kernel-originated; the grant handler requires nil source.
     );

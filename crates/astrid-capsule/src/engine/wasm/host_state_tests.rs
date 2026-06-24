@@ -9,6 +9,7 @@ use std::sync::Arc;
 
 use super::super::test_fixtures::{minimal_host_state, open_log};
 use super::*;
+use astrid_events::ipc::Topic;
 
 #[test]
 fn host_state_debug_format() {
@@ -288,7 +289,7 @@ fn effective_principal_prefers_caller_over_owner() {
     // Caller with a different principal → wins.
     let alice = astrid_core::PrincipalId::new("alice").expect("valid alice");
     let msg = astrid_events::ipc::IpcMessage::new(
-        "test",
+        Topic::from_raw("test"),
         astrid_events::ipc::IpcPayload::RawJson(serde_json::json!({})),
         uuid::Uuid::new_v4(),
     )
@@ -330,7 +331,7 @@ fn install_recv_invocation_context_preserves_outer_caller_inside_interceptor() {
     // outer caller (alice) owns outbound stamping for this
     // invocation — bob's message must not overwrite it.
     let outer = astrid_events::ipc::IpcMessage::new(
-        "user.v1.prompt",
+        Topic::from_raw("user.v1.prompt"),
         astrid_events::ipc::IpcPayload::RawJson(serde_json::json!({})),
         uuid::Uuid::new_v4(),
     )
@@ -339,7 +340,7 @@ fn install_recv_invocation_context_preserves_outer_caller_inside_interceptor() {
     state.interceptor_active = true;
 
     let inner = astrid_events::ipc::IpcMessage::new(
-        "some.v1.event",
+        Topic::from_raw("some.v1.event"),
         astrid_events::ipc::IpcPayload::RawJson(serde_json::json!({})),
         uuid::Uuid::new_v4(),
     )
@@ -409,7 +410,7 @@ fn install_recv_invocation_context_resolves_invoking_principal_profile() {
 
     // A recv message from alice installs HER profile → her quota applies.
     let msg = astrid_events::ipc::IpcMessage::new(
-        "some.v1.event",
+        Topic::from_raw("some.v1.event"),
         astrid_events::ipc::IpcPayload::RawJson(serde_json::json!({})),
         uuid::Uuid::new_v4(),
     )
@@ -430,7 +431,7 @@ fn install_recv_invocation_context_resolves_invoking_principal_profile() {
     // effective quota value keeps the test off the `Option`'s internal
     // representation.
     let owner_msg = astrid_events::ipc::IpcMessage::new(
-        "some.v1.event",
+        Topic::from_raw("some.v1.event"),
         astrid_events::ipc::IpcPayload::RawJson(serde_json::json!({})),
         uuid::Uuid::new_v4(),
     )
