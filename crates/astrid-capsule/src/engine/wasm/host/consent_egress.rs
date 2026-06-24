@@ -43,6 +43,22 @@
 //! list, so a remembered grant likewise cannot widen across capsules. The
 //! operator pre-bless (`[security.capsule_local_egress]`) stays capsule-keyed
 //! and unchanged.
+//!
+//! # Persistence is honored at runtime ("remember across restarts")
+//!
+//! The in-memory [`AllowanceStore`] starts EMPTY on every daemon boot, so the
+//! in-memory grant alone cannot survive a restart. To actually keep the
+//! `approve_always` promise, the gate ALSO consults the on-disk
+//! `profile.network.capsule_egress[<capsule>]` for the effective principal
+//! before eliciting (see [`has_persisted_grant`] and step 3 of
+//! [`consent_local_egress`](HostState::consent_local_egress)) — the same way it
+//! already consults the operator pre-bless allowlist
+//! ([`HostState::local_egress`]), just per-principal from the profile. The
+//! persisted consult preserves both isolation axes: it reads only THIS
+//! capsule's bucket in THIS principal's profile, so a remembered grant for
+//! capsule A / principal X never permits capsule B / principal Y. It is reached
+//! only AFTER the upstream origin gate (`LocalSocket` only) and SSRF airlock, so
+//! it short-circuits the elicitation — never the origin/airlock checks.
 
 use astrid_approval::action::SensitiveAction;
 use astrid_approval::{Allowance, AllowanceId, AllowancePattern, AllowanceStore};
@@ -55,6 +71,8 @@ use uuid::Uuid;
 
 use crate::engine::wasm::host::util;
 use crate::engine::wasm::host_state::HostState;
+use crate::profile_cache::PrincipalProfileCache;
+use crate::security::net_connect_pattern_matches;
 
 /// Maximum time to wait for the operator's consent response, in milliseconds.
 /// Mirrors `host/approval.rs`'s `MAX_APPROVAL_TIMEOUT_MS` so every runtime
@@ -96,6 +114,47 @@ fn has_runtime_grant(
     store
         .find_matching_and_consume(principal, &egress_action(capsule_id, host, port), None)
         .is_some()
+}
+
+/// `true` if `principal`'s on-disk profile remembers an `approve_always` grant
+/// for THIS capsule reaching `host:port`.
+///
+/// The in-memory [`AllowanceStore`] starts EMPTY on every daemon boot, so an
+/// `approve_always` grant — whose contract is "remember across restarts" — is
+/// only honored if the egress gate also consults the persisted profile. This is
+/// that consult: it reads `profile.network.capsule_egress[capsule_id]` for the
+/// effective principal and matches the requested `host:port` against those
+/// remembered endpoints with the SAME `host:port` / `host:*` semantics the
+/// operator pre-bless allowlist uses ([`egress_allowed`](super::http)).
+///
+/// Isolation is preserved across the persisted path exactly as it is for the
+/// in-memory store:
+/// - **per-capsule** — only the `capsule_egress[capsule_id]` bucket is read, so
+///   a remembered grant for capsule A never matches capsule B even for the same
+///   principal and endpoint; and
+/// - **per-principal** — the profile is resolved for THIS principal only, so
+///   principal X's remembered grant never matches principal Y.
+///
+/// Fail-closed: a profile load/parse error (malformed TOML, unknown field,
+/// future `profile_version`) returns `false` — the gate falls through to
+/// eliciting consent rather than silently permitting on an unreadable profile.
+fn has_persisted_grant(
+    cache: &PrincipalProfileCache,
+    principal: &PrincipalId,
+    capsule_id: &str,
+    host: &str,
+    port: u16,
+) -> bool {
+    let Ok(profile) = cache.resolve(principal) else {
+        // Unreadable/invalid profile → no remembered grant we can trust.
+        return false;
+    };
+    let Some(entries) = profile.network.capsule_egress.get(capsule_id) else {
+        return false;
+    };
+    entries
+        .iter()
+        .any(|entry| net_connect_pattern_matches(entry, host, port))
 }
 
 /// Add an unlimited runtime egress grant for `principal` + `capsule_id` to
@@ -185,7 +244,15 @@ impl HostState {
     ///    reaching `host:port`, return `true` immediately (no prompt). The grant
     ///    is keyed on `capsule_id` too, so capsule B never short-circuits on
     ///    capsule A's grant.
-    /// 3. Else elicit consent (`ApprovalRequired` on `astrid.v1.approval`,
+    /// 3. Else, if `principal`'s on-disk profile remembers an `approve_always`
+    ///    grant for THIS capsule reaching `host:port`
+    ///    (`network.capsule_egress[<capsule>]`), return `true` immediately (no
+    ///    prompt). The in-memory store above starts empty after a daemon
+    ///    restart, so this persisted consult is what makes `approve_always`
+    ///    actually survive a restart. It is per-capsule AND per-principal by
+    ///    construction (only this capsule's bucket in this principal's profile
+    ///    is read).
+    /// 4. Else elicit consent (`ApprovalRequired` on `astrid.v1.approval`,
     ///    resource = `host:port` only, reason names the capsule) and block,
     ///    bounded by [`CONSENT_TIMEOUT_MS`] and the capsule cancel token. On
     ///    approve / approve_session: cache a per-principal, per-capsule session
@@ -230,7 +297,30 @@ impl HostState {
             return true;
         }
 
-        // 3. ELICIT. Publish `ApprovalRequired` and block for the response.
+        // 3. PERSISTED-GRANT FAST PATH. The in-memory store above is empty
+        // after a daemon restart, so a prior `approve_always` would otherwise be
+        // silently forgotten and the operator re-prompted. Consult the
+        // principal's on-disk profile for a remembered grant under THIS capsule
+        // — the persistence half of the `approve_always` "remember across
+        // restarts" contract. Per-capsule AND per-principal by construction (see
+        // `has_persisted_grant`); never widens beyond this principal+capsule.
+        // This short-circuits only the ELICIT — the origin gate and SSRF airlock
+        // upstream still bind (we are only reached on a `LocalSocket`,
+        // airlock-rejected IP-literal endpoint).
+        if let Some(cache) = self.profile_cache.as_ref()
+            && has_persisted_grant(cache, &principal, &capsule_id, host, port)
+        {
+            tracing::debug!(
+                target: "astrid.audit.http",
+                capsule_id = %self.capsule_id.as_str(),
+                %principal,
+                endpoint = %endpoint,
+                "local-egress consent: honoring persisted approve_always grant (no prompt)"
+            );
+            return true;
+        }
+
+        // 4. ELICIT. Publish `ApprovalRequired` and block for the response.
         let decision = self.elicit_egress_consent(&principal, &endpoint);
         match classify_decision(&decision) {
             Decision::Deny => {

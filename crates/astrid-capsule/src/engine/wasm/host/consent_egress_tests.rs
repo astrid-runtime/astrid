@@ -412,6 +412,116 @@ async fn approve_always_for_one_capsule_does_not_exempt_another_capsule() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn persisted_approve_always_grant_survives_empty_store_and_is_isolated() {
+    // GAP FIX (PR #1029): an `approve_always` grant persists to
+    // `profile.network.capsule_egress[<capsule>]`, but the in-memory
+    // AllowanceStore starts EMPTY after a daemon restart. The egress gate must
+    // therefore ALSO consult the persisted profile, or the "remember across
+    // restarts" contract is silently broken and the operator is re-prompted.
+    //
+    // Simulate a fresh daemon: EMPTY AllowanceStore, but a profile on disk that
+    // already remembers react -> 127.0.0.1:1234 for principal "alice". The gate
+    // must PERMIT (alice, react, 127.0.0.1:1234) WITHOUT eliciting, while
+    // isolation holds across the persisted path too:
+    //   - (alice, openai-compat, 127.0.0.1:1234) still elicits (wrong capsule);
+    //   - (bob,   react,         127.0.0.1:1234) still elicits (wrong principal).
+    use astrid_core::dirs::AstridHome;
+    use astrid_core::principal::PrincipalId;
+    use astrid_core::profile::PrincipalProfile;
+
+    use crate::capsule::CapsuleId;
+    use crate::profile_cache::PrincipalProfileCache;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let home = AstridHome::from_path(dir.path());
+
+    // Seed alice's profile on disk with a remembered react grant — exactly the
+    // shape `persist_egress` writes — WITHOUT ever touching the in-memory store.
+    let alice = PrincipalId::new("alice").unwrap();
+    let mut alice_profile = PrincipalProfile::default();
+    alice_profile
+        .network
+        .capsule_egress
+        .insert("react".to_string(), vec!["127.0.0.1:1234".to_string()]);
+    alice_profile
+        .save_to_path(&home.profile_path(&alice))
+        .expect("seed alice profile");
+
+    let cache = Arc::new(PrincipalProfileCache::with_home(home.clone()));
+
+    // 1. (alice, react, 127.0.0.1:1234) — EMPTY store, but persisted grant
+    //    present. Must PERMIT with NO prompt. A responder that WOULD deny is
+    //    standing by; if the gate wrongly elicited, it would be denied (false).
+    let rt = tokio::runtime::Handle::current();
+    let mut state = minimal_host_state(rt.clone());
+    state.allowance_store = Some(Arc::new(AllowanceStore::new())); // fresh, EMPTY
+    state.profile_cache = Some(cache.clone());
+    state.capsule_id = CapsuleId::from_static("react");
+    set_caller(&mut state, MessageOrigin::LocalSocket, "alice");
+
+    let mut watch_rx = state.event_bus.subscribe_topic("astrid.v1.approval");
+    spawn_responder(state.event_bus.clone(), "deny");
+    let permitted = tokio::task::block_in_place(|| state.consent_local_egress("127.0.0.1", 1234));
+    assert!(
+        permitted,
+        "a persisted approve_always grant must permit on a fresh (empty) store"
+    );
+    let elicited = tokio::time::timeout(Duration::from_millis(50), watch_rx.recv())
+        .await
+        .ok()
+        .flatten()
+        .is_some();
+    assert!(
+        !elicited,
+        "a persisted grant must short-circuit WITHOUT eliciting a prompt"
+    );
+
+    // 2. ISOLATION — wrong capsule. (alice, openai-compat, 127.0.0.1:1234) must
+    //    NOT match react's persisted bucket; it must elicit its OWN consent
+    //    (and, with a deny responder, be denied).
+    state.capsule_id = CapsuleId::from_static("openai-compat");
+    let mut watch_rx = state.event_bus.subscribe_topic("astrid.v1.approval");
+    spawn_responder(state.event_bus.clone(), "deny");
+    let openai_permitted =
+        tokio::task::block_in_place(|| state.consent_local_egress("127.0.0.1", 1234));
+    assert!(
+        !openai_permitted,
+        "openai-compat must NOT inherit react's persisted grant; it elicits and is denied"
+    );
+    let openai_elicited = tokio::time::timeout(Duration::from_millis(50), watch_rx.recv())
+        .await
+        .ok()
+        .flatten()
+        .is_some();
+    assert!(
+        openai_elicited,
+        "wrong-capsule request must elicit its own consent, not reuse react's persisted grant"
+    );
+
+    // 3. ISOLATION — wrong principal. (bob, react, 127.0.0.1:1234) must NOT
+    //    match alice's persisted profile; it must elicit (and be denied).
+    state.capsule_id = CapsuleId::from_static("react");
+    set_caller(&mut state, MessageOrigin::LocalSocket, "bob");
+    let mut watch_rx = state.event_bus.subscribe_topic("astrid.v1.approval");
+    spawn_responder(state.event_bus.clone(), "deny");
+    let bob_permitted =
+        tokio::task::block_in_place(|| state.consent_local_egress("127.0.0.1", 1234));
+    assert!(
+        !bob_permitted,
+        "bob must NOT inherit alice's persisted grant; it elicits and is denied"
+    );
+    let bob_elicited = tokio::time::timeout(Duration::from_millis(50), watch_rx.recv())
+        .await
+        .ok()
+        .flatten()
+        .is_some();
+    assert!(
+        bob_elicited,
+        "wrong-principal request must elicit its own consent, not reuse alice's persisted grant"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn local_socket_existing_grant_short_circuits_without_eliciting() {
     // A pre-existing grant means consent returns true with NO prompt published
     // — even with no responder present.
