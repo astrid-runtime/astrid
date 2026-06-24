@@ -94,7 +94,8 @@ impl ResolvedOptions {
             resolved.redirect = r;
         }
         if let Some(n) = opts.max_redirects {
-            resolved.max_redirects = n as usize;
+            // Caller may request fewer hops, never more than the host ceiling.
+            resolved.max_redirects = (n as usize).min(MAX_HTTP_REDIRECTS);
         }
         if let Some(n) = opts.max_response_bytes {
             resolved.max_response_bytes = n.min(util::MAX_GUEST_PAYLOAD_LEN);

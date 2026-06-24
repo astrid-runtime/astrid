@@ -338,3 +338,7 @@ impl http_v11::HostHttpUpload for HostState {
 #[cfg(test)]
 #[path = "tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "regression.rs"]
+mod regression;

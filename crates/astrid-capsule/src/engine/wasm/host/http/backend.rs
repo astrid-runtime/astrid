@@ -46,13 +46,18 @@ pub(super) fn map_method(m: &HttpMethod) -> Result<reqwest::Method, ErrorCode> {
     })
 }
 
-fn build_headers(raw: &[KeyValuePair]) -> Result<HeaderMap, ErrorCode> {
+pub(super) fn build_headers(raw: &[KeyValuePair]) -> Result<HeaderMap, ErrorCode> {
     let mut headers = HeaderMap::new();
     for kv in raw {
         let h_name =
             HeaderName::from_bytes(kv.key.as_bytes()).map_err(|_| ErrorCode::InvalidRequest)?;
-        let h_value = HeaderValue::from_str(&kv.value).map_err(|_| ErrorCode::InvalidRequest)?;
-        headers.insert(h_name, h_value);
+        // The WIT contract explicitly allows duplicate request headers (e.g.
+        // multiple `Cookie` lines), so `append` — not `insert` (last-write-
+        // wins) — is required. `from_bytes` (not `from_str`) accepts header
+        // values carrying UTF-8 / obs-text while still rejecting control chars.
+        let h_value =
+            HeaderValue::from_bytes(kv.value.as_bytes()).map_err(|_| ErrorCode::InvalidRequest)?;
+        headers.append(h_name, h_value);
     }
     Ok(headers)
 }
@@ -99,6 +104,24 @@ pub struct ActiveHttpStream {
 }
 
 const HTTP_STREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Fallback time-to-first-byte (header) deadline applied in [`HostState::send_one_hop`]
+/// when the caller set neither `first-byte-ms` nor a total timeout (the
+/// streaming case, where the total deadline is cleared). Generous enough not to
+/// cut a slow-TTFT LLM stream, but finite so a server that accepts then hangs
+/// before sending headers can never block the executor indefinitely.
+pub(super) const HTTP_HEADER_DEADLINE_FLOOR: Duration = Duration::from_secs(120);
+
+/// The deadline for `send()` to produce response HEADERS. An explicit caller
+/// `first-byte-ms` wins; else the (buffered) total deadline; else the
+/// [`HTTP_HEADER_DEADLINE_FLOOR`] — so the streaming path (total cleared, no
+/// first-byte) is still bounded and a hung pre-header server can't block the
+/// executor forever, while a legitimately slow-TTFT LLM stream is not cut.
+pub(super) fn header_deadline(opts: &ResolvedOptions) -> Duration {
+    opts.first_byte_timeout
+        .or(opts.total_timeout)
+        .unwrap_or(HTTP_HEADER_DEADLINE_FLOOR)
+}
 
 /// Per-chunk read timeout for streaming HTTP responses. Kept as a
 /// named constant so per-principal timeout tuning has a single edit
@@ -210,10 +233,20 @@ impl HostState {
             request_builder = request_builder.body(b.to_vec());
         }
 
-        let response =
-            util::bounded_await(&io_semaphore, async move { request_builder.send().await })
-                .await
-                .map_err(|e| airlock_or(&tripped, &e))?;
+        // Header (time-to-first-byte) deadline — see [`header_deadline`].
+        // `send().await` resolves once the response HEADERS arrive; the body is
+        // streamed afterwards. On the streaming path `total_timeout` is cleared,
+        // so without this bound a server that accepts the TCP connection then
+        // hangs before sending headers would block this future forever
+        // (executor starvation).
+        let header_deadline = header_deadline(opts);
+        let response = util::bounded_await(&io_semaphore, async move {
+            match tokio::time::timeout(header_deadline, request_builder.send()).await {
+                Ok(result) => result.map_err(|e| airlock_or(&tripped, &e)),
+                Err(_elapsed) => Err(ErrorCode::Timeout),
+            }
+        })
+        .await?;
 
         let content_length = response.content_length();
         Ok(WireResponse {
@@ -389,7 +422,16 @@ impl HostState {
 
         let io_semaphore = self.io_semaphore.clone();
         let max_response = opts.max_response_bytes;
-        let max_decompressed = opts.max_decompressed_bytes;
+        // The decompressed cap is a decompression-BOMB defence, so it only
+        // applies when the host is actually decompressing. With
+        // `auto_decompress == false`, `chunk()` yields the raw (possibly
+        // compressed) wire bytes — enforcing the decompressed cap on those would
+        // false-positive `DecompressionBomb` on a large compressed download.
+        let max_decompressed = if opts.auto_decompress {
+            opts.max_decompressed_bytes
+        } else {
+            None
+        };
         let body = util::bounded_await(&io_semaphore, async move {
             let mut response = response;
             let mut bytes = Vec::new();
@@ -500,8 +542,17 @@ impl HostState {
         };
         let resource = self
             .resource_table
-            .push(active)
+            .push(active.clone())
             .map_err(|e| ErrorCode::Unknown(format!("resource table: {e}")))?;
+        // Mirror the stream into `active_http_streams`, keyed by the resource
+        // rep, so the per-principal + global concurrency quota (checked at the
+        // top of this fn) actually counts live streams. Without this the cap was
+        // dead — the resource table is not enumerable by principal. The mirror
+        // shares the same `Arc<Mutex<Response>>`, so `read_chunk` via the
+        // resource table stays consistent; this copy is purely for counting and
+        // is removed in `stream_close` / `stream_drop`.
+        self.active_http_streams
+            .insert(u64::from(resource.rep()), active);
         Ok(Resource::new_own(resource.rep()))
     }
 }
@@ -580,6 +631,8 @@ pub(super) fn stream_close(state: &mut HostState, rep: u32) -> Result<(), ErrorC
     let _ = state
         .resource_table
         .delete::<ActiveHttpStream>(Resource::new_own(rep));
+    // Release the quota slot (see the mirror insert in `http_stream_backend`).
+    state.active_http_streams.remove(&u64::from(rep));
     Ok(())
 }
 
@@ -587,6 +640,8 @@ pub(super) fn stream_drop(state: &mut HostState, rep: u32) {
     let _ = state
         .resource_table
         .delete::<ActiveHttpStream>(Resource::new_own(rep));
+    // Release the quota slot (see the mirror insert in `http_stream_backend`).
+    state.active_http_streams.remove(&u64::from(rep));
 }
 
 /// Classify a reqwest error into the typed `http::ErrorCode`.

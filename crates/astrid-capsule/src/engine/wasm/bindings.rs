@@ -34,7 +34,7 @@
 //! distinct packages. The wasmtime Component Model linker enforces exact
 //! `(package, version)` matches, so an old capsule binds `@1.0.0` and a new
 //! one binds `@1.1.0` off the same linker. The host trait impls for both
-//! versions live on `HostState` (see `engine/wasm/host/http.rs`).
+//! versions live on `HostState` (see `engine/wasm/host/http/mod.rs`).
 
 wasmtime::component::bindgen!({
     inline: "
