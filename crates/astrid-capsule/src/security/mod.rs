@@ -7,6 +7,7 @@
 
 use async_trait::async_trait;
 
+pub mod approval;
 mod manifest_gate;
 #[cfg(test)]
 mod test_gates;
