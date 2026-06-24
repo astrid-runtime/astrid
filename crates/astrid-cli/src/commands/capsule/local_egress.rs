@@ -186,10 +186,19 @@ fn write_atomic(path: &Path, data: &[u8]) -> std::io::Result<()> {
     {
         use std::io::Write;
         use std::os::unix::fs::OpenOptionsExt;
+        use std::sync::atomic::{AtomicU64, Ordering};
 
-        // Same-filesystem temp sibling so `rename` is atomic. PID disambiguates
-        // concurrent CLI invocations sharing the directory.
-        let tmp_path = path.with_extension(format!("toml.tmp.{}", std::process::id()));
+        // Per-process monotonic counter disambiguating concurrent tmp filenames.
+        // PID alone is not enough — two same-process writers to the same config
+        // (e.g. a `--set` collecting several local endpoints) would race on the
+        // same tmp path and stomp each other. Mirrors the profile io_impl.
+        static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+        // Same-filesystem temp sibling so `rename` is atomic. PID + monotonic
+        // counter → unique per call across threads within a process and across
+        // processes sharing the directory.
+        let seq = TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let tmp_path = path.with_extension(format!("toml.tmp.{}.{seq}", std::process::id()));
         let mut f = std::fs::OpenOptions::new()
             .write(true)
             .create(true)

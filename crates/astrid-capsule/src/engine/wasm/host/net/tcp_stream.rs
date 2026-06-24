@@ -83,6 +83,21 @@ impl HostTcpStream for HostState {
             };
             match bound {
                 Some(identity) => {
+                    // Record which capsule earned the LocalSocket stamp. The
+                    // downstream egress-consent gate trusts LocalSocket as "the
+                    // local operator"; that trust holds ONLY while this stamp is
+                    // reachable solely from the uplink capsule (the
+                    // `has_uplink_capability` gate above). Surfacing the
+                    // capsule_id here makes an unexpected stamper — a non-uplink
+                    // capsule that somehow earned the capability — observable in
+                    // the audit trail rather than silent. Emit before the move
+                    // below so the verified principal is still borrowable.
+                    tracing::debug!(
+                        target: "astrid.audit.net",
+                        capsule_id = %self.capsule_id.as_str(),
+                        principal = %identity.principal,
+                        "tcp-stream.read stamped LocalSocket origin (uplink-gated)"
+                    );
                     self.ingress_principal = Some(identity.principal);
                     self.ingress_device_key_id = identity.device_key_id;
                     // A data frame off a kernel-BOUND (handshake-verified)

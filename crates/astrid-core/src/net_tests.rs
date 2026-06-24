@@ -59,6 +59,13 @@ fn blocks_transition_embedded_private_ipv4() {
     assert!(ip_is_blocked(ip("2002:c0a8:1::")));
     // Teredo 2001:0::/32 server embedding 127.0.0.1.
     assert!(ip_is_blocked(ip("2001:0:7f00:1::")));
+    // Teredo 2001:0::/32 CLIENT arm: the obfuscated client IPv4 lives in the
+    // last 32 bits, bit-inverted. Server here is the PUBLIC 8.8.8.8, so only the
+    // client extraction can trip the block — !f5ff_fffe == 0a00_0001 == 10.0.0.1
+    // (RFC 1918). Asserted directly on the shared predicate so a future refactor
+    // cannot silently drop the Teredo-client extraction (it is otherwise only
+    // exercised indirectly through the HTTP airlock tests).
+    assert!(ip_is_blocked(ip("2001:0:808:808:0:0:f5ff:fffe")));
 }
 
 #[test]

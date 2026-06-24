@@ -174,6 +174,14 @@ impl PrincipalProfileCache {
         // Serialize the load-modify-save against any other writer on this cache
         // (and against a concurrent `resolve` populating the same key) by
         // holding the write lock for the whole operation.
+        //
+        // TRADEOFF (deliberate): the write lock is held across blocking disk
+        // I/O (load + validate + fsync + rename), so a concurrent `resolve()`
+        // on this cache waits for the whole persist. Accepted because this path
+        // runs only on an `approve_always` consent — a rare, operator-driven
+        // event — not on the hot read path. Revisit (e.g. drop the lock around
+        // the disk write, or snapshot-then-swap) only if this becomes a
+        // measurable `resolve()` latency source.
         let mut guard = self
             .cache
             .write()

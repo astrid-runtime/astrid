@@ -264,6 +264,16 @@ impl HostState {
     ///    `RemoteGateway`, or an unbound socket — return `false` WITHOUT
     ///    prompting. A remote/system request can never earn a local-egress
     ///    grant.
+    ///
+    ///    TRUST ASSUMPTION: treating `LocalSocket` as "the local operator" is
+    ///    only sound because that origin is stamped (in
+    ///    `net::tcp_stream::read`) exclusively on the uplink path — the stamp is
+    ///    gated on `has_uplink_capability`, and the uplink capability is granted
+    ///    only to the designated uplink capsule (capsule-cli). If that
+    ///    capability were ever granted to a non-uplink capsule, that capsule
+    ///    could forge a `LocalSocket` origin and self-approve local egress. The
+    ///    enforcement boundary is therefore the uplink-capability grant, not
+    ///    this check; keep it uplink-capsule-only.
     /// 2. Else, if `principal` already holds a runtime grant for THIS capsule
     ///    reaching `host:port`, return `true` immediately (no prompt). The grant
     ///    is keyed on `capsule_id` too, so capsule B never short-circuits on
