@@ -408,3 +408,20 @@ async fn agent_readiness_probe_reflects_loaded_registry_without_capability() {
         "no capsule subscribes the prompt topic"
     );
 }
+
+/// The capsule-topic probe answers from the live registry without a
+/// capability check. An empty registry has no subscriber for any topic, so
+/// the gateway's session-list gate degrades to `501` rather than waiting out
+/// a bus timeout. Mirrors the readiness-probe in-process pattern.
+#[tokio::test]
+async fn capsule_topic_probe_reflects_loaded_registry_without_capability() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let home = astrid_core::dirs::AstridHome::from_path(dir.path());
+    let kernel = crate::test_kernel_with_home(home).await;
+
+    let probe = kernel.capsule_topic_probe();
+    assert!(
+        !probe.is_subscribed("session.v1.request.list").await,
+        "empty registry must have no subscriber for the session list verb"
+    );
+}

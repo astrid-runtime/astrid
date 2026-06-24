@@ -53,6 +53,21 @@ impl AsRef<CapsuleManifest> for CapsuleManifest {
     }
 }
 
+/// True if `manifest`'s `[subscribe]` patterns match `topic`.
+///
+/// The short-circuiting, allocation-free predicate behind
+/// [`topic_subscribers`] — a caller that only needs *existence* (e.g. a
+/// capability probe checking whether any loaded capsule serves a verb) uses
+/// this to avoid materialising the full subscriber list. Route-layer subtree
+/// semantics, so a declared `user.v1.*` matches `user.v1.prompt`.
+#[must_use]
+pub fn manifest_subscribes_topic(manifest: &CapsuleManifest, topic: &str) -> bool {
+    manifest
+        .subscribes
+        .keys()
+        .any(|pattern| topic_pattern_matches(pattern, topic))
+}
+
 /// Names of loaded capsules whose `[subscribe]` patterns match `topic`.
 ///
 /// Uses route-layer subtree semantics, so a declared `user.v1.*` matches
@@ -64,12 +79,7 @@ pub fn topic_subscribers<'a, M: AsRef<CapsuleManifest>>(
 ) -> Vec<&'a str> {
     manifests
         .iter()
-        .filter(|m| {
-            m.as_ref()
-                .subscribes
-                .keys()
-                .any(|pattern| topic_pattern_matches(pattern, topic))
-        })
+        .filter(|m| manifest_subscribes_topic(m.as_ref(), topic))
         .map(|m| m.as_ref().package.name.as_str())
         .collect()
 }

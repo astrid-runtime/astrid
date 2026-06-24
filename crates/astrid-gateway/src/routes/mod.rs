@@ -26,6 +26,8 @@ pub mod models;
 pub mod observability;
 pub mod principals;
 pub mod quotas;
+pub mod sessions;
+pub mod stream;
 pub mod system;
 
 /// Build the gateway's HTTP router.
@@ -178,6 +180,25 @@ fn build_authed_router(state: &Arc<GatewayState>) -> Router<Arc<GatewayState>> {
         .route("/api/sys/audit", get(audit::get_audit))
         // ── Agent invocation (SSE) ──
         .route("/api/agent/prompt", post(agent::post_prompt))
+        // ── Per-principal live conversation feed (SSE, #973) ──
+        .route("/api/agent/stream", get(stream::get_stream))
+        // ── Conversation threads (proxied to capsule-session) ──
+        .route("/api/agent/sessions", get(sessions::list_sessions))
+        // `search` is a static segment and is registered before the `:id`
+        // routes; axum prefers the static match, so `/sessions/search` never
+        // collides with `/sessions/:id`.
+        .route("/api/agent/sessions/search", get(sessions::search_sessions))
+        .route(
+            "/api/agent/sessions/:id",
+            get(sessions::get_session)
+                .patch(sessions::update_session)
+                .delete(sessions::delete_session),
+        )
+        .route(
+            "/api/agent/sessions/:id/messages",
+            get(sessions::get_session_messages),
+        )
+        // ── Agent elicitation reply ──
         .route(
             "/api/agent/elicit-response",
             post(agent::post_elicit_response),

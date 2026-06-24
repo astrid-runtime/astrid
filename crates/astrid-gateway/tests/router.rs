@@ -78,6 +78,7 @@ fn fresh_state_with_distro(distro: Option<&str>) -> Arc<GatewayState> {
         session_id: None,
         gateway_route_uuid: uuid::Uuid::new_v4(),
         readiness_probe: None,
+        topic_probe: None,
         registry_timeout: None,
     })
 }
@@ -477,6 +478,11 @@ fn openapi_lists_every_router_route() {
         "/api/events",
         "/api/sys/audit",
         "/api/agent/prompt",
+        "/api/agent/stream",
+        "/api/agent/sessions",
+        "/api/agent/sessions/search",
+        "/api/agent/sessions/{id}",
+        "/api/agent/sessions/{id}/messages",
         "/api/models",
         "/api/models/active",
         "/api/sys/status",

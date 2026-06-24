@@ -9,7 +9,7 @@
 //! `wasm32-unknown-unknown` without dragging in the kernel).
 
 mod readiness;
-pub use readiness::{AgentLoopReadiness, AgentReadinessProbe, MissingImport};
+pub use readiness::{AgentLoopReadiness, AgentReadinessProbe, CapsuleTopicProbe, MissingImport};
 
 use crate::PrincipalId;
 use crate::profile::Quotas;

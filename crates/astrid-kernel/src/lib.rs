@@ -778,6 +778,33 @@ impl Kernel {
         })
     }
 
+    /// In-process probe for "does a loaded capsule subscribe to this topic",
+    /// computed from the live registry without a capability check. Mirrors
+    /// [`Self::agent_readiness_probe`]; the co-located gateway uses it to
+    /// gracefully degrade a route whose backing verb a pre-upgrade capsule
+    /// may not handle (e.g. answer `501` instead of waiting out a bus
+    /// timeout), for every authenticated caller — capsule serviceability is
+    /// global daemon health, not per-principal authorization.
+    #[must_use]
+    pub fn capsule_topic_probe(&self) -> astrid_core::kernel_api::CapsuleTopicProbe {
+        let registry = Arc::clone(&self.capsules);
+        astrid_core::kernel_api::CapsuleTopicProbe::new(move |topic: String| {
+            let registry = Arc::clone(&registry);
+            Box::pin(async move {
+                let reg = registry.read().await;
+                // Short-circuit on the first loaded capsule that subscribes the
+                // topic — no need to materialise the manifest list or the full
+                // subscriber set just to answer a boolean.
+                reg.values().any(|c| {
+                    astrid_capsule::readiness::manifest_subscribes_topic(
+                        astrid_capsule::capsule::Capsule::manifest(c),
+                        &topic,
+                    )
+                })
+            })
+        })
+    }
+
     /// Publish `astrid.v1.capsules_loaded` so subscribers re-read the current
     /// capsule/tool set after the loaded set changes — the registry, and the
     /// `astrid mcp serve` shim, which turns this into an MCP

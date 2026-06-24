@@ -25,11 +25,12 @@ use utoipa::ToSchema;
 pub struct ErrorBody {
     /// Machine-readable error tag. One of: `unauthorized`,
     /// `forbidden`, `bad_request`, `not_found`, `rate_limited`,
-    /// `kernel`, `internal`.
+    /// `kernel`, `not_implemented`, `internal`.
     #[schema(example = "forbidden")]
     pub error: String,
     /// Human-readable reason. Present on `forbidden`, `bad_request`,
-    /// `kernel`. Absent on `unauthorized`, `not_found`, `internal`.
+    /// `kernel`, `not_implemented`. Absent on `unauthorized`,
+    /// `not_found`, `internal`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
     /// Suggested back-off in seconds. Present only on `rate_limited`.
@@ -67,6 +68,13 @@ pub enum GatewayError {
     /// Upstream kernel returned an error.
     #[error("kernel rejected request: {0}")]
     Kernel(String),
+    /// The capability backing this route is not present in the current
+    /// deployment (e.g. a capsule old enough to predate a newer verb).
+    /// Distinct from a 502 — the request is well-formed and the gateway
+    /// is healthy; the feature simply isn't implemented by the loaded
+    /// capsule set.
+    #[error("not implemented: {0}")]
+    NotImplemented(String),
     /// Anything else — exposed as a 500 with a stable message.
     #[error("internal error")]
     Internal(#[from] anyhow::Error),
@@ -92,6 +100,10 @@ impl IntoResponse for GatewayError {
             Self::Kernel(msg) => (
                 StatusCode::BAD_GATEWAY,
                 json!({"error": "kernel", "reason": msg}),
+            ),
+            Self::NotImplemented(msg) => (
+                StatusCode::NOT_IMPLEMENTED,
+                json!({"error": "not_implemented", "reason": msg}),
             ),
             Self::Internal(e) => {
                 tracing::warn!(error = %e, "gateway internal error");

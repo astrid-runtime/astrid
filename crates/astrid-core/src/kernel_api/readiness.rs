@@ -78,6 +78,54 @@ impl std::fmt::Debug for AgentReadinessProbe {
     }
 }
 
+/// In-process probe answering "does a loaded capsule subscribe to this
+/// topic?", computed from the live registry without a capability check.
+///
+/// The cap-free counterpart to the capability-gated
+/// [`crate::kernel_api::KernelRequest::GetCapsuleMetadata`], built the same
+/// way as [`AgentReadinessProbe`] and for the same reason: whether a verb is
+/// served is global daemon health, not per-principal authorization, so a
+/// gateway route can probe it for **every** authenticated caller without a
+/// capability check or leaking the capsule inventory. Lets a route degrade
+/// gracefully — e.g. answer `501 Not Implemented` when no loaded capsule
+/// handles a newer verb — instead of waiting out a bus timeout. The closure
+/// is built in `astrid-kernel` (which owns the registry) and merely invoked
+/// here; spelled with `std` types so `astrid-core` needs no `futures` dep.
+#[derive(Clone)]
+pub struct CapsuleTopicProbe(
+    #[allow(clippy::type_complexity)]
+    std::sync::Arc<
+        dyn Fn(String) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send>>
+            + Send
+            + Sync,
+    >,
+);
+
+impl CapsuleTopicProbe {
+    /// Wrap a closure that answers whether `topic` has a loaded-capsule
+    /// subscriber. The closure captures the registry it reads, so each call
+    /// reflects the current loaded set (correct across live reloads).
+    pub fn new(
+        f: impl Fn(String) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send>>
+        + Send
+        + Sync
+        + 'static,
+    ) -> Self {
+        Self(std::sync::Arc::new(f))
+    }
+
+    /// True if some loaded capsule's `[subscribe]` matches `topic`.
+    pub async fn is_subscribed(&self, topic: &str) -> bool {
+        (self.0)(topic.to_string()).await
+    }
+}
+
+impl std::fmt::Debug for CapsuleTopicProbe {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("CapsuleTopicProbe(..)")
+    }
+}
+
 /// A required interface import with no matching export among loaded capsules.
 ///
 /// `Ord` (by capsule, namespace, interface, requirement in declaration order)

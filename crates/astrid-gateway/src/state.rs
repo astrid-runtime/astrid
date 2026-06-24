@@ -248,6 +248,16 @@ pub struct GatewayState {
     /// per-principal capability and no socket round-trip. The detailed,
     /// ops-facing view stays behind the capability-gated `GET /api/sys/readiness`.
     pub readiness_probe: Option<astrid_core::kernel_api::AgentReadinessProbe>,
+    /// In-process probe for whether a loaded capsule subscribes to a given
+    /// topic — the cap-free counterpart to the capability-gated
+    /// `GetCapsuleMetadata`. `Some` when co-located with the kernel
+    /// (daemon-spawned); `None` for standalone / test constructors, in which
+    /// case routes that use it skip the degradation gate and fall through to
+    /// the bus. The session thread-management routes (`list` / `get_meta` /
+    /// `update` / `delete` / `search`) use it to answer `501` when no loaded
+    /// session capsule implements the 1.1 verbs, instead of waiting out the
+    /// bus timeout.
+    pub topic_probe: Option<astrid_core::kernel_api::CapsuleTopicProbe>,
     /// Optional override for the registry round-trip wait budget. `None`
     /// in production, where the model routes fall back to their built-in
     /// default of 10 seconds. Tests that assert a *negative* round-trip
@@ -269,6 +279,7 @@ impl GatewayState {
         audit_log: Option<Arc<astrid_audit::AuditLog>>,
         session_id: Option<astrid_core::SessionId>,
         readiness_probe: Option<astrid_core::kernel_api::AgentReadinessProbe>,
+        topic_probe: Option<astrid_core::kernel_api::CapsuleTopicProbe>,
     ) -> anyhow::Result<Arc<Self>> {
         let (distribution, onboarding) = match &config.distro_path {
             Some(p) => {
@@ -311,6 +322,7 @@ impl GatewayState {
             session_id,
             gateway_route_uuid: Uuid::new_v4(),
             readiness_probe,
+            topic_probe,
             registry_timeout: None,
         }))
     }

@@ -69,6 +69,7 @@ fn tls_state(bind_addr: SocketAddr, cert_path: PathBuf, key_path: PathBuf) -> Ar
         session_id: None,
         gateway_route_uuid: uuid::Uuid::new_v4(),
         readiness_probe: None,
+        topic_probe: None,
         registry_timeout: None,
     })
 }
@@ -204,6 +205,7 @@ async fn plain_http_path_still_works_when_no_tls_block() {
         session_id: None,
         gateway_route_uuid: uuid::Uuid::new_v4(),
         readiness_probe: None,
+        topic_probe: None,
         registry_timeout: None,
     });
 
