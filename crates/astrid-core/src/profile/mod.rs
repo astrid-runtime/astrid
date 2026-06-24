@@ -42,7 +42,9 @@ mod io_impl;
 mod validation;
 
 pub use device::{DEVICE_KEY_ID_HEX_LEN, DeviceKey, DeviceScope, device_key_id_fingerprint};
-pub use field::{CapabilityPattern, CapsuleGrant, GroupName, ProfileFieldError};
+pub use field::{
+    CapabilityPattern, CapsuleGrant, GroupName, ProfileFieldError, ValidatedProfileFields,
+};
 
 /// Current profile schema version. Bumped on breaking field changes.
 ///
@@ -137,7 +139,7 @@ pub struct PrincipalProfile {
     /// Group memberships. Resolved to capability sets via
     /// [`GroupConfig`](crate::GroupConfig).
     #[serde(default)]
-    pub groups: Vec<GroupName>,
+    pub groups: Vec<String>,
 
     /// Capability patterns granted directly to this principal, beyond the
     /// capabilities inherited from the groups listed in
@@ -145,7 +147,7 @@ pub struct PrincipalProfile {
     /// capability grammar (see
     /// [`crate::capability_grammar::validate_capability`]) at load time.
     #[serde(default)]
-    pub grants: Vec<CapabilityPattern>,
+    pub grants: Vec<String>,
 
     /// Capability patterns explicitly denied to this principal. Revokes
     /// have the highest precedence — a matching revoke overrides any
@@ -153,7 +155,7 @@ pub struct PrincipalProfile {
     /// membership. Entries are validated against the same grammar as
     /// [`PrincipalProfile::grants`].
     #[serde(default)]
-    pub revokes: Vec<CapabilityPattern>,
+    pub revokes: Vec<String>,
 
     /// Capsule ids this principal is granted access to invoke.
     ///
@@ -171,7 +173,7 @@ pub struct PrincipalProfile {
     /// [`CapsuleId`](../../astrid_capsule/capsule/struct.CapsuleId.html):
     /// non-empty, lowercase alphanumeric and hyphens only.
     #[serde(default)]
-    pub capsules: Vec<CapsuleGrant>,
+    pub capsules: Vec<String>,
 
     /// Authentication configuration.
     #[serde(default)]
@@ -451,16 +453,10 @@ mod tests {
         let p = PrincipalProfile {
             profile_version: 1,
             enabled: false,
-            groups: vec![
-                GroupName::new("admins").unwrap(),
-                GroupName::new("ops_team").unwrap(),
-            ],
-            grants: vec![CapabilityPattern::new("capsule:install").unwrap()],
-            revokes: vec![CapabilityPattern::new("system:shutdown").unwrap()],
-            capsules: vec![
-                CapsuleGrant::new("identity").unwrap(),
-                CapsuleGrant::new("registry").unwrap(),
-            ],
+            groups: vec!["admins".into(), "ops_team".into()],
+            grants: vec!["capsule:install".into()],
+            revokes: vec!["system:shutdown".into()],
+            capsules: vec!["identity".into(), "registry".into()],
             auth: AuthConfig {
                 methods: vec![AuthMethod::Keypair, AuthMethod::Passkey],
                 public_keys: vec![DeviceKey::new("a".repeat(64), DeviceScope::Full, None, 0)],

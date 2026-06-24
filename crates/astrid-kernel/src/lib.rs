@@ -2245,7 +2245,7 @@ mod tests {
 
         // Operator wrote their own config pre-bootstrap.
         let mut existing = astrid_core::PrincipalProfile::default();
-        existing.groups = vec![astrid_core::GroupName::new("agent").unwrap()];
+        existing.groups = vec!["agent".to_string()];
         let path = astrid_core::PrincipalProfile::path_for(&home, &default);
         std::fs::create_dir_all(home.profiles_dir()).unwrap();
         existing.save_to_path(&path).unwrap();
@@ -2262,7 +2262,7 @@ mod tests {
         let default = astrid_core::PrincipalId::default();
 
         let mut existing = astrid_core::PrincipalProfile::default();
-        existing.grants = vec![astrid_core::CapabilityPattern::new("system:status").unwrap()];
+        existing.grants = vec!["system:status".to_string()];
         let path = astrid_core::PrincipalProfile::path_for(&home, &default);
         std::fs::create_dir_all(home.profiles_dir()).unwrap();
         existing.save_to_path(&path).unwrap();
@@ -2281,7 +2281,7 @@ mod tests {
         let default = astrid_core::PrincipalId::default();
 
         let mut existing = astrid_core::PrincipalProfile::default();
-        existing.revokes = vec![astrid_core::CapabilityPattern::new("system:shutdown").unwrap()];
+        existing.revokes = vec!["system:shutdown".to_string()];
         let path = astrid_core::PrincipalProfile::path_for(&home, &default);
         std::fs::create_dir_all(home.profiles_dir()).unwrap();
         existing.save_to_path(&path).unwrap();
@@ -2308,7 +2308,7 @@ mod tests {
             .join("profile.toml");
         std::fs::create_dir_all(legacy_path.parent().unwrap()).unwrap();
         let mut existing = astrid_core::PrincipalProfile::default();
-        existing.groups = vec![astrid_core::GroupName::new("operator-configured").unwrap()];
+        existing.groups = vec!["operator-configured".to_string()];
         existing.save_to_path(&legacy_path).unwrap();
 
         seed_default_principal_admin_profile(&home).unwrap();
@@ -2336,14 +2336,14 @@ mod tests {
             .join("profile.toml");
         std::fs::create_dir_all(legacy_path.parent().unwrap()).unwrap();
         let mut stale = astrid_core::PrincipalProfile::default();
-        stale.groups = vec![astrid_core::GroupName::new("stale").unwrap()];
+        stale.groups = vec!["stale".to_string()];
         stale.save_to_path(&legacy_path).unwrap();
 
         // Fresh new-path content (migrated already).
         let new_path = astrid_core::PrincipalProfile::path_for(&home, &default);
         std::fs::create_dir_all(new_path.parent().unwrap()).unwrap();
         let mut canonical = astrid_core::PrincipalProfile::default();
-        canonical.groups = vec![astrid_core::GroupName::new("canonical").unwrap()];
+        canonical.groups = vec!["canonical".to_string()];
         canonical.save_to_path(&new_path).unwrap();
 
         seed_default_principal_admin_profile(&home).unwrap();
@@ -2651,11 +2651,11 @@ fn seed_default_principal_admin_profile(
     // 1. Admin-group seeding. Only on a truly fresh default (no groups,
     // grants, or revokes) — an operator-configured profile is left intact.
     if profile.groups.is_empty() && profile.grants.is_empty() && profile.revokes.is_empty() {
-        profile.groups.push(
+        let admin_group =
             astrid_core::GroupName::new(astrid_core::groups::BUILTIN_ADMIN).map_err(|e| {
                 astrid_core::ProfileError::Invalid(format!("built-in admin group rejected: {e}"))
-            })?,
-        );
+            })?;
+        profile.groups.push(admin_group.as_str().to_string());
         mutated = true;
         tracing::info!(
             principal = %default_principal,

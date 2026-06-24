@@ -6,7 +6,6 @@
 
 use crate::capability_grammar::validate_capability;
 
-use super::field::{validate_capsule_grant_str, validate_group_name_str};
 use super::{
     AuthConfig, BACKGROUND_PROCESSES_UPPER_BOUND, CURRENT_PROFILE_VERSION, NetworkConfig,
     PrincipalProfile, ProcessConfig, ProfileError, ProfileResult, Quotas, TIMEOUT_SECS_UPPER_BOUND,
@@ -28,24 +27,7 @@ impl PrincipalProfile {
         }
         self.quotas.validate()?;
         self.auth.validate()?;
-        for group in &self.groups {
-            validate_group_name_str(group.as_str())
-                .map_err(|e| ProfileError::Invalid(e.to_string()))?;
-        }
-        for cap in &self.grants {
-            validate_capability(cap.as_str()).map_err(|e| {
-                ProfileError::Invalid(format!("grants entry {cap:?} rejected: {e}"))
-            })?;
-        }
-        for cap in &self.revokes {
-            validate_capability(cap.as_str()).map_err(|e| {
-                ProfileError::Invalid(format!("revokes entry {cap:?} rejected: {e}"))
-            })?;
-        }
-        for capsule in &self.capsules {
-            validate_capsule_grant_str(capsule.as_str())
-                .map_err(|e| ProfileError::Invalid(e.to_string()))?;
-        }
+        self.typed_fields()?;
         self.network.validate()?;
         self.process.validate()?;
         Ok(())
@@ -203,18 +185,6 @@ impl ProcessConfig {
 #[allow(clippy::field_reassign_with_default)] // tests mutate a known-good baseline
 mod tests {
     use super::*;
-
-    fn group(name: &str) -> super::super::GroupName {
-        super::super::GroupName::new(name).unwrap()
-    }
-
-    fn cap(pattern: &str) -> super::super::CapabilityPattern {
-        super::super::CapabilityPattern::new(pattern).unwrap()
-    }
-
-    fn capsule(id: &str) -> super::super::CapsuleGrant {
-        super::super::CapsuleGrant::new(id).unwrap()
-    }
 
     // ── Quotas ────────────────────────────────────────────────────────
 
@@ -387,11 +357,11 @@ mod tests {
     fn accepts_valid_group_names() {
         let mut p = PrincipalProfile::default();
         p.groups = vec![
-            group("admins"),
-            group("ops_team"),
-            group("agent-007"),
-            group("X"),
-            super::super::GroupName::new("a".repeat(super::super::MAX_GROUP_NAME_LEN)).unwrap(),
+            "admins".into(),
+            "ops_team".into(),
+            "agent-007".into(),
+            "X".into(),
+            "a".repeat(super::super::MAX_GROUP_NAME_LEN),
         ];
         p.validate().unwrap();
     }
@@ -419,12 +389,11 @@ mod tests {
     fn accepts_valid_capsule_grants() {
         let mut p = PrincipalProfile::default();
         p.capsules = vec![
-            capsule("identity"),
-            capsule("registry"),
-            capsule("context-engine"),
-            capsule("openai-compat"),
-            super::super::CapsuleGrant::new("a".repeat(super::super::MAX_CAPSULE_GRANT_LEN))
-                .unwrap(),
+            "identity".into(),
+            "registry".into(),
+            "context-engine".into(),
+            "openai-compat".into(),
+            "a".repeat(super::super::MAX_CAPSULE_GRANT_LEN),
         ];
         p.validate().unwrap();
     }
@@ -457,8 +426,8 @@ mod tests {
     #[test]
     fn accepts_valid_grants_and_revokes() {
         let mut p = PrincipalProfile::default();
-        p.grants = vec![cap("system:shutdown"), cap("self:*"), cap("*")];
-        p.revokes = vec![cap("audit:read:alice"), cap("a:*:b")];
+        p.grants = vec!["system:shutdown".into(), "self:*".into(), "*".into()];
+        p.revokes = vec!["audit:read:alice".into(), "a:*:b".into()];
         p.validate().unwrap();
     }
 

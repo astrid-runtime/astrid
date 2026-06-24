@@ -34,10 +34,7 @@ async fn fixture() -> (tempfile::TempDir, AstridHome, Arc<Kernel>) {
 fn seed_profile(home: &AstridHome, principal: &str, capsules: &[&str]) {
     let pid = PrincipalId::new(principal).expect("valid principal");
     let profile = PrincipalProfile {
-        capsules: capsules
-            .iter()
-            .map(|c| astrid_core::CapsuleGrant::new(*c).unwrap())
-            .collect(),
+        capsules: capsules.iter().map(|c| (*c).to_string()).collect(),
         ..PrincipalProfile::default()
     };
     let path = PrincipalProfile::path_for(home, &pid);
@@ -56,9 +53,6 @@ fn on_disk_capsules(home: &AstridHome, principal: &str) -> Vec<String> {
     PrincipalProfile::load_from_path(&path)
         .expect("load profile")
         .capsules
-        .into_iter()
-        .map(String::from)
-        .collect()
 }
 
 /// Publish a `GrantRequired` exactly as the dispatcher would.

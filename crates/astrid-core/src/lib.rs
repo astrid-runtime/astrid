@@ -50,7 +50,8 @@ pub use profile::{
     DEFAULT_MAX_IPC_THROUGHPUT_BYTES, DEFAULT_MAX_MEMORY_BYTES, DEFAULT_MAX_STORAGE_BYTES,
     DEFAULT_MAX_TIMEOUT_SECS, DEVICE_KEY_ID_HEX_LEN, DeviceKey, DeviceScope, GroupName,
     MAX_GROUP_NAME_LEN, NetworkConfig, PrincipalProfile, ProcessConfig, ProfileError,
-    ProfileFieldError, ProfileResult, Quotas, TIMEOUT_SECS_UPPER_BOUND, device_key_id_fingerprint,
+    ProfileFieldError, ProfileResult, Quotas, TIMEOUT_SECS_UPPER_BOUND, ValidatedProfileFields,
+    device_key_id_fingerprint,
 };
 pub use retry::RetryConfig;
 pub use types::{

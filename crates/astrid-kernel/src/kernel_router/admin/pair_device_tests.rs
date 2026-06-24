@@ -43,10 +43,7 @@ fn pid(name: &str) -> PrincipalId {
 /// Seed `principal` holding `grants`, enabled, with the supplied device keys.
 fn seed(kernel: &Arc<Kernel>, principal: &PrincipalId, grants: &[&str], devices: Vec<DeviceKey>) {
     let mut profile = PrincipalProfile::default();
-    profile.grants = grants
-        .iter()
-        .map(|g| astrid_core::CapabilityPattern::new(*g).unwrap())
-        .collect();
+    profile.grants = grants.iter().map(|g| (*g).to_string()).collect();
     profile.enabled = true;
     if !devices.is_empty() {
         profile.auth.methods.push(AuthMethod::Keypair);

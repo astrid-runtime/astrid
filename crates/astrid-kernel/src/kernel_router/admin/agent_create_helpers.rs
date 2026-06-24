@@ -185,6 +185,7 @@ fn build_create_profile(
         let groups = match resolved_groups
             .into_iter()
             .map(GroupName::new)
+            .map(|result| result.map(String::from))
             .collect::<Result<Vec<_>, _>>()
         {
             Ok(groups) => groups,
@@ -193,6 +194,7 @@ fn build_create_profile(
         let grants = match grants
             .into_iter()
             .map(CapabilityPattern::new)
+            .map(|result| result.map(String::from))
             .collect::<Result<Vec<_>, _>>()
         {
             Ok(grants) => grants,

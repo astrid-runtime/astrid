@@ -263,7 +263,11 @@ async fn grant_capsule(kernel: &Arc<Kernel>, principal: &str, capsule_id: &str) 
         },
     };
 
-    let changed = match apply_set_delta(&mut profile.capsules, &[capsule_id.to_string()], &[]) {
+    let changed = match apply_set_delta::<astrid_core::CapsuleGrant>(
+        &mut profile.capsules,
+        &[capsule_id.to_string()],
+        &[],
+    ) {
         Ok(changed) => changed,
         Err(e) => {
             warn!(

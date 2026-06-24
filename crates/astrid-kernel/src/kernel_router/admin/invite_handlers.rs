@@ -163,7 +163,7 @@ pub(crate) async fn invite_redeem(
         Err(e) => return err_internal(format!("invite group rejected: {e}")),
     };
     let profile = PrincipalProfile {
-        groups: vec![group],
+        groups: vec![group.into()],
         auth,
         ..PrincipalProfile::default()
     };

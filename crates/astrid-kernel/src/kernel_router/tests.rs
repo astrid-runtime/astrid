@@ -295,7 +295,7 @@ async fn get_agent_readiness_returns_readiness_response() {
     // admin-seed the default profile).
     let caller = PrincipalId::default();
     let mut profile = PrincipalProfile::default();
-    profile.groups = vec![astrid_core::GroupName::new("admin").unwrap()];
+    profile.groups = vec!["admin".to_string()];
     let path = PrincipalProfile::path_for(&kernel.astrid_home, &caller);
     profile.save_to_path(&path).expect("seed admin profile");
     kernel.profile_cache.invalidate(&caller);

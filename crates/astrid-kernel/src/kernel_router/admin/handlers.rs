@@ -30,7 +30,9 @@ use std::sync::Arc;
 
 use astrid_core::capability_grammar::validate_capability;
 use astrid_core::principal::PrincipalId;
-use astrid_core::profile::{CapabilityPattern, PrincipalProfile, ProfileError};
+use astrid_core::profile::{
+    CapabilityPattern, CapsuleGrant, GroupName, PrincipalProfile, ProfileError,
+};
 use astrid_events::kernel_api::{AdminRequestKind, AdminResponseBody, AgentSummary};
 use tracing::{info, warn};
 
@@ -476,15 +478,19 @@ async fn agent_modify_from_req(
     // `apply_set_delta`: idempotent remove-then-add, set-based change
     // detection. The capsule grant set is what the kernel gates the
     // user-invocable tool surface against at dispatch (#992).
-    let groups_changed = match apply_set_delta(&mut profile.groups, &add_groups, &remove_groups) {
-        Ok(changed) => changed,
-        Err(e) => return err_bad_input(format!("group delta rejected: {e}")),
-    };
-    let capsules_changed =
-        match apply_set_delta(&mut profile.capsules, &add_capsules, &remove_capsules) {
+    let groups_changed =
+        match apply_set_delta::<GroupName>(&mut profile.groups, &add_groups, &remove_groups) {
             Ok(changed) => changed,
-            Err(e) => return err_bad_input(format!("capsule delta rejected: {e}")),
+            Err(e) => return err_bad_input(format!("group delta rejected: {e}")),
         };
+    let capsules_changed = match apply_set_delta::<CapsuleGrant>(
+        &mut profile.capsules,
+        &add_capsules,
+        &remove_capsules,
+    ) {
+        Ok(changed) => changed,
+        Err(e) => return err_bad_input(format!("capsule delta rejected: {e}")),
+    };
     if !groups_changed && !capsules_changed {
         kernel.profile_cache.invalidate(&principal);
         return modify_response(&principal, &profile, false);
@@ -547,32 +553,32 @@ fn modify_response(
 /// entry) is never reflected back to the caller as a mutated profile that
 /// then goes unpersisted (`changed=false`).
 pub(crate) fn apply_set_delta<T>(
-    target: &mut Vec<T>,
+    target: &mut Vec<String>,
     add: &[String],
     remove: &[String],
 ) -> Result<bool, String>
 where
-    T: AsRef<str> + Clone + Eq + std::hash::Hash + TryFrom<String>,
+    T: TryFrom<String> + Into<String>,
     T::Error: std::fmt::Display,
 {
     // Build the resulting order on a scratch copy WITHOUT touching `target`:
     // surviving entries keep their order, then new additions append.
-    let mut next: Vec<T> = target
+    let mut next: Vec<String> = target
         .iter()
-        .filter(|e| !remove.iter().any(|r| r == e.as_ref()))
+        .filter(|e| !remove.contains(e))
         .cloned()
         .collect();
     for entry in add {
-        if !next.iter().any(|existing| existing.as_ref() == entry) {
+        if !next.contains(entry) {
             let typed = T::try_from(entry.clone()).map_err(|e| e.to_string())?;
-            next.push(typed);
+            next.push(typed.into());
         }
     }
     // Order-insensitive set comparison; the borrows end with the block so the
     // write-back below can take `&mut *target`.
     let changed = {
-        let before: std::collections::HashSet<&T> = target.iter().collect();
-        let after: std::collections::HashSet<&T> = next.iter().collect();
+        let before: std::collections::HashSet<&String> = target.iter().collect();
+        let after: std::collections::HashSet<&String> = next.iter().collect();
         before != after
     };
     if changed {
@@ -641,21 +647,9 @@ fn agent_list(kernel: &Arc<crate::Kernel>, caller: &PrincipalId) -> AdminRespons
         summaries.push(AgentSummary {
             principal,
             enabled: profile.enabled,
-            groups: profile
-                .groups
-                .iter()
-                .map(|g| g.as_str().to_string())
-                .collect(),
-            grants: profile
-                .grants
-                .iter()
-                .map(|g| g.as_str().to_string())
-                .collect(),
-            revokes: profile
-                .revokes
-                .iter()
-                .map(|r| r.as_str().to_string())
-                .collect(),
+            groups: profile.groups.clone(),
+            grants: profile.grants.clone(),
+            revokes: profile.revokes.clone(),
         });
     }
     summaries.sort_by(|a, b| a.principal.as_str().cmp(b.principal.as_str()));
@@ -767,7 +761,7 @@ async fn mutate_caps(
                 Ok(pattern) => pattern,
                 Err(e) => return err_bad_input(format!("capability {cap:?} rejected: {e}")),
             };
-            target.push(pattern);
+            target.push(pattern.into());
         }
     }
 

@@ -41,7 +41,10 @@
 //! caching. The caller is expected to have resolved the profile and
 //! the group config beforehand.
 
-use astrid_core::{DeviceScope, GroupConfig, PrincipalId, PrincipalProfile, capability_matches};
+use astrid_core::{
+    CapabilityPattern, DeviceScope, GroupConfig, PrincipalId, PrincipalProfile,
+    ValidatedProfileFields, capability_matches,
+};
 use thiserror::Error;
 use tracing::warn;
 
@@ -156,7 +159,15 @@ impl<'a> CapabilityCheck<'a> {
     /// a capability the principal lacks become held.
     #[must_use]
     pub fn has(&self, cap: &str) -> bool {
-        if !self.principal_has(cap) {
+        let Ok(profile) = self.profile.typed_fields() else {
+            warn!(
+                security_event = true,
+                principal = %self.principal,
+                "Principal profile contains invalid typed fields — no capabilities inherited"
+            );
+            return false;
+        };
+        if !self.principal_has(&profile, cap) {
             return false;
         }
         self.device_scope_admits(cap)
@@ -174,15 +185,31 @@ impl<'a> CapabilityCheck<'a> {
     /// [`PermissionError::DeviceScopeDenied`] if the principal holds it but
     /// the authenticating device's scope does not admit it.
     pub fn require(&self, cap: &str) -> Result<(), PermissionError> {
-        if let Some(revoke) = self.first_matching_revoke(cap) {
+        let profile = match self.profile.typed_fields() {
+            Ok(profile) => profile,
+            Err(e) => {
+                warn!(
+                    security_event = true,
+                    principal = %self.principal,
+                    error = %e,
+                    "Principal profile contains invalid typed fields — denying capability"
+                );
+                return Err(PermissionError::MissingCapability {
+                    principal: self.principal.clone(),
+                    required: cap.to_string(),
+                });
+            },
+        };
+        if let Some(revoke) = Self::first_matching_revoke(&profile, cap) {
             return Err(PermissionError::RevokedCapability {
                 principal: self.principal.clone(),
                 required: cap.to_string(),
                 revoke_pattern: revoke.to_string(),
             });
         }
-        let principal_holds = matches_any(self.profile.grants.iter().map(|p| p.as_str()), cap)
-            || self.holds_via_groups(cap);
+        let principal_holds =
+            matches_any(profile.grants.iter().map(CapabilityPattern::as_str), cap)
+                || self.holds_via_groups(&profile, cap);
         if !principal_holds {
             return Err(PermissionError::MissingCapability {
                 principal: self.principal.clone(),
@@ -201,14 +228,14 @@ impl<'a> CapabilityCheck<'a> {
     }
 
     /// The unattenuated principal decision: revokes > grants > group-inherited.
-    fn principal_has(&self, cap: &str) -> bool {
-        if matches_any(self.profile.revokes.iter().map(|p| p.as_str()), cap) {
+    fn principal_has(&self, profile: &ValidatedProfileFields<'_>, cap: &str) -> bool {
+        if matches_any(profile.revokes.iter().map(CapabilityPattern::as_str), cap) {
             return false;
         }
-        if matches_any(self.profile.grants.iter().map(|p| p.as_str()), cap) {
+        if matches_any(profile.grants.iter().map(CapabilityPattern::as_str), cap) {
             return true;
         }
-        self.holds_via_groups(cap)
+        self.holds_via_groups(profile, cap)
     }
 
     /// Whether the authenticating device's scope admits `cap`.
@@ -226,16 +253,19 @@ impl<'a> CapabilityCheck<'a> {
         }
     }
 
-    fn first_matching_revoke(&self, cap: &str) -> Option<&'a str> {
-        self.profile
+    fn first_matching_revoke<'profile>(
+        profile: &'profile ValidatedProfileFields<'_>,
+        cap: &str,
+    ) -> Option<&'profile str> {
+        profile
             .revokes
             .iter()
-            .map(|p| p.as_str())
+            .map(CapabilityPattern::as_str)
             .find(|p| capability_matches(p, cap))
     }
 
-    fn holds_via_groups(&self, cap: &str) -> bool {
-        for name in &self.profile.groups {
+    fn holds_via_groups(&self, profile: &ValidatedProfileFields<'_>, cap: &str) -> bool {
+        for name in &profile.groups {
             let Some(group) = self.groups.get(name.as_str()) else {
                 warn!(
                     security_event = true,
@@ -314,15 +344,12 @@ mod tests {
 
     fn profile_in(groups: &[&str]) -> PrincipalProfile {
         let mut p = PrincipalProfile::default();
-        p.groups = groups
-            .iter()
-            .map(|s| astrid_core::GroupName::new(*s).unwrap())
-            .collect();
+        p.groups = groups.iter().map(|s| (*s).to_string()).collect();
         p
     }
 
-    fn cap(pattern: &str) -> astrid_core::CapabilityPattern {
-        astrid_core::CapabilityPattern::new(pattern).unwrap()
+    fn cap(pattern: &str) -> String {
+        pattern.to_string()
     }
 
     fn pid() -> PrincipalId {

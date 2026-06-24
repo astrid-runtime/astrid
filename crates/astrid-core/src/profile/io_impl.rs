@@ -293,7 +293,7 @@ mod tests {
         let (_d, home, principal) = scratch_home();
         let mut p = PrincipalProfile::default();
         p.enabled = false;
-        p.groups.push(crate::GroupName::new("admins").unwrap());
+        p.groups.push("admins".into());
         p.save(&home, &principal).unwrap();
 
         let loaded = PrincipalProfile::load(&home, &principal).unwrap();
