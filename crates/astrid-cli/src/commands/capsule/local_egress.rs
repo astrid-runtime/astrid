@@ -233,6 +233,15 @@ pub(crate) fn maybe_prompt_local_egress(capsule_id: &str, value: &str, config_pa
         Ok(()) => {
             eprintln!("  Added {entry} to [security.capsule_local_egress].{capsule_id}.");
             eprintln!("  Restart the daemon for the change to take effect.");
+            // Revocation caveat: the operator allowlist is read into a load-time
+            // snapshot (HostState::local_egress), so REMOVING this entry later
+            // does NOT take effect until the daemon restarts. Surface it now so
+            // an operator who edits the config to revoke is not falsely
+            // reassured the exemption is gone.
+            eprintln!(
+                "  Note: removing this exemption later also requires a daemon restart \
+                 — editing the config alone does not revoke an in-flight grant."
+            );
         },
         Err(e) => {
             eprintln!("  Could not update operator config ({e}).");

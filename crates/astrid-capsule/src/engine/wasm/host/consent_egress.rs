@@ -59,6 +59,30 @@
 //! capsule A / principal X never permits capsule B / principal Y. It is reached
 //! only AFTER the upstream origin gate (`LocalSocket` only) and SSRF airlock, so
 //! it short-circuits the elicitation — never the origin/airlock checks.
+//!
+//! # Revocation requires a daemon restart (no live revocation)
+//!
+//! Neither exemption source is revoked live; both take effect on the **next
+//! daemon start**, so an operator who edits config (or deletes a grant) to
+//! revoke is NOT immediately protected:
+//!
+//! - **Operator pre-bless** (`[security.capsule_local_egress]`) is read into a
+//!   load-time snapshot ([`HostState::local_egress`], cloned per pooled instance
+//!   at capsule load). Removing or narrowing an entry has no effect on a running
+//!   daemon — the snapshot is fixed at load and only re-read on restart.
+//! - **Persisted `approve_always` grant**
+//!   (`profile.network.capsule_egress[<capsule>]`) is consulted through a
+//!   process-lifetime `PrincipalProfileCache` with no TTL or file watcher.
+//!   Deleting the on-disk grant (or revoking the bless that authorized it) does
+//!   not evict the cached profile, so the grant keeps permitting local egress
+//!   until the daemon restarts and the cache is rebuilt.
+//!
+//! This is a deliberate v1 limitation: the gate is fail-secure on the GRANT path
+//! (it never grants more than the snapshot/cache allows) but is NOT fail-secure
+//! on the REVOKE path within a single daemon lifetime. A live-revocation verb is
+//! tracked separately; until it lands, revocation = edit config / delete grant
+//! **then restart the daemon**. The CLI add-path prints this caveat at grant
+//! time so an operator is not falsely reassured a later config edit revokes.
 
 use astrid_approval::action::SensitiveAction;
 use astrid_approval::{Allowance, AllowanceId, AllowancePattern, AllowanceStore};

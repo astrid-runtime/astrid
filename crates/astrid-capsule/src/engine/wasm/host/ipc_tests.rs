@@ -453,6 +453,77 @@ async fn publish_preserves_remote_gateway_origin_through_fanout() {
     );
 }
 
+/// END-TO-END anti-forge invariant lock: a `RemoteGateway`-stamped request that
+/// flows through the REAL fan-out hop chain (gateway stamp → fan-out capsule's
+/// `publish` inherits caller_context.origin → `publish_inner` carries it onto
+/// the republished bus message → the downstream capsule's dispatcher installs
+/// that message as its `caller_context`) must be observed AS `RemoteGateway` at
+/// the egress consent site — so `consent_local_egress` DECLINES (fail-closed)
+/// and a remote API caller can never reach a loopback/private endpoint.
+///
+/// This closes the loop the bus-level propagation tests leave open: they prove
+/// the origin survives ONE publish; this proves the surviving origin, fed back
+/// into a downstream `HostState` exactly as the dispatcher does, makes the
+/// consent gate refuse. It pins the whole `dispatcher → caller_context.origin →
+/// publish_inner → downstream caller_context → consent_local_egress` chain
+/// against any future republish that resets origin to `System`/`LocalSocket`.
+#[tokio::test(flavor = "multi_thread")]
+async fn remote_gateway_origin_survives_fanout_and_consent_declines() {
+    use std::sync::Arc;
+
+    use astrid_approval::AllowanceStore;
+
+    let rt = tokio::runtime::Handle::current();
+
+    // ── Hop 1: the gateway-originated request enters fan-out capsule A
+    // (react stand-in). The dispatcher installed a RemoteGateway caller_context.
+    let mut react = minimal_host_state(rt.clone());
+    react.ipc_publish_patterns = vec!["capsule.v1.*".to_string()];
+    react.caller_context = Some(caller_with_origin(
+        astrid_events::ipc::MessageOrigin::RemoteGateway,
+    ));
+
+    // Capsule A re-publishes downstream (react → openai-compat) over the REAL
+    // publish path. Subscribe first to capture the republished message verbatim.
+    let mut downstream = react.event_bus.subscribe_topic("capsule.v1.infer");
+    IpcHost::publish(&mut react, "capsule.v1.infer".to_string(), "{}".to_string())
+        .expect("fan-out publish should succeed");
+
+    // The republished bus message — exactly what the kernel routes to capsule B.
+    let republished = match &*downstream.try_recv().expect("one republished message") {
+        AstridEvent::Ipc { message, .. } => message.clone(),
+        other => panic!("expected an Ipc event, got {other:?}"),
+    };
+    assert_eq!(
+        republished.origin,
+        astrid_events::ipc::MessageOrigin::RemoteGateway,
+        "publish_inner must carry the RemoteGateway origin onto the republished \
+         message — never reset it to the System default"
+    );
+
+    // ── Hop 2: the dispatcher installs the republished message as capsule B's
+    // (openai-compat stand-in) caller_context, exactly as it does per invocation.
+    let mut openai_compat = minimal_host_state(rt);
+    openai_compat.allowance_store = Some(Arc::new(AllowanceStore::new()));
+    openai_compat.caller_context = Some(republished);
+
+    // The egress site reads the inherited origin and refuses consent: a remote
+    // caller can neither see nor grant a local-egress prompt. fail-closed.
+    assert_eq!(
+        openai_compat.effective_origin(),
+        astrid_events::ipc::MessageOrigin::RemoteGateway,
+        "the downstream egress site must observe RemoteGateway after the hop"
+    );
+    let permitted =
+        tokio::task::block_in_place(|| openai_compat.consent_local_egress("127.0.0.1", 1234));
+    assert!(
+        !permitted,
+        "a RemoteGateway request that fanned out through a republish must be \
+         DECLINED at the egress consent gate — it must never be silently \
+         elevated to a local-operator grant across the hop"
+    );
+}
+
 /// A guest `publish` with no in-flight caller context (a run-loop's
 /// self-triggered / load-time publish) is `System` — the fail-closed,
 /// non-local floor. A guest can never name an origin.

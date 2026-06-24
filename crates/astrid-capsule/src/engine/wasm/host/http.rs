@@ -116,18 +116,52 @@ fn filter_safe_addrs(
     (safe, saw_unsafe)
 }
 
-/// Cached SSRF escape-hatch check. Evaluated once per process.
-static SSRF_BYPASS: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+/// Test-only SSRF bypass: honored ONLY in `cfg(test)` builds, where the unit
+/// tests need to exercise the egress path against loopback addresses. This is
+/// gated so the daemon's **release binary never reads `ASTRID_TEST_ALLOW_LOCAL_IP`**
+/// — a stray test env var in production can never silently disable the airlock
+/// (and with it the per-capsule local-egress consent gate). The non-test
+/// definition is a `const false`, so the entire env-var read is compiled out of
+/// every release/non-test build.
+#[cfg(test)]
+fn test_env_bypass() -> bool {
     if std::env::var("ASTRID_TEST_ALLOW_LOCAL_IP").is_ok() {
         tracing::warn!(
-            "ASTRID_TEST_ALLOW_LOCAL_IP is set - SSRF protection disabled for ALL capsules"
+            "ASTRID_TEST_ALLOW_LOCAL_IP is set - SSRF protection disabled for ALL capsules (test-only)"
         );
         return true;
     }
+    false
+}
+
+/// Production builds never honor the test bypass: the env var is not even read.
+#[cfg(not(test))]
+const fn test_env_bypass() -> bool {
+    false
+}
+
+/// Cached SSRF escape-hatch check. Evaluated once per process.
+static SSRF_BYPASS: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+    if test_env_bypass() {
+        return true;
+    }
+    // DEPRECATED. `ASTRID_ALLOW_LOCAL_IPS` is still recognized in production
+    // (operators/CI may rely on it) but is on a removal path. The one-time
+    // warning is HONEST about the blast radius: this is not a scoped exemption,
+    // it disables the SSRF airlock for EVERY loaded capsule AND — because the
+    // airlock is the gate the per-capsule local-egress *consent* check runs
+    // behind — it exposes loopback/private endpoints to REMOTE (`RemoteGateway`)
+    // API callers, bypassing the operator-consent gate entirely. Operators
+    // should migrate to the per-capsule `[security.capsule_local_egress]`
+    // allowlist, which exempts a named capsule for a named `host:port` only.
+    // Slated for removal in a future release.
     if std::env::var("ASTRID_ALLOW_LOCAL_IPS").is_ok() {
         tracing::warn!(
-            "ASTRID_ALLOW_LOCAL_IPS is set - SSRF protection disabled for ALL capsules. \
-             Private/loopback IP ranges are reachable by every loaded capsule."
+            "ASTRID_ALLOW_LOCAL_IPS is set and is DEPRECATED. It disables the SSRF airlock \
+             for ALL capsules and exposes local/loopback endpoints to REMOTE API callers, \
+             bypassing the per-capsule local-egress consent gate. Migrate to the per-capsule \
+             [security.capsule_local_egress] allowlist; this escape hatch will be removed in a \
+             future release."
         );
         return true;
     }
