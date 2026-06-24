@@ -484,6 +484,22 @@ impl PrincipalHome {
     pub fn env_dir(&self) -> PathBuf {
         self.root.join(".config").join("env")
     }
+
+    /// Install-time capability approvals (`.config/approvals/`).
+    ///
+    /// Operator-owned, capsule-unreachable trust records: one
+    /// `<capsule_id>.json` per approved capsule, each pinning the
+    /// capability fingerprint the operator approved. Lives under
+    /// `.config/` (NOT `.local/capsules/`) for the same reason as
+    /// `env_dir`: a capsule's own directory is copyable furniture and is
+    /// reachable from inside the sandbox via `home://`, so an approval
+    /// stored there could be forged or carried across principals. The
+    /// `.config/` tree is operator-written and never mounted into a
+    /// guest, so a runtime capsule cannot write its own approval.
+    #[must_use]
+    pub fn approvals_dir(&self) -> PathBuf {
+        self.root.join(".config").join("approvals")
+    }
 }
 
 // ── WorkspaceDir (per-project) ───────────────────────────────────────────
