@@ -22,7 +22,7 @@ use crate::engine::wasm::host_state::HostState;
 use super::options::{
     ResolvedOptions, check_scheme, same_origin, strip_credentials, verify_integrity,
 };
-use super::ssrf::{RedirectAction, SafeDnsResolver, airlock_or, classify_redirect};
+use super::ssrf::{SafeDnsResolver, airlock_or, redirect_target_blocked};
 use super::{
     ErrorCode, HttpMethod, HttpRequestData, HttpResponseData, HttpStream, KeyValuePair,
     RedirectPolicy, ResponseMeta,
@@ -141,12 +141,14 @@ impl HostState {
         opts: &ResolvedOptions,
         exempt_host: Option<Arc<str>>,
         tripped: Arc<AtomicBool>,
+        dns_failed: Arc<AtomicBool>,
         redirect_policy: reqwest::redirect::Policy,
     ) -> Result<reqwest::Client, ErrorCode> {
         let mut builder = reqwest::Client::builder()
             .redirect(redirect_policy)
             .dns_resolver(Arc::new(SafeDnsResolver {
                 tripped,
+                dns_failed,
                 exempt_host,
             }));
 
@@ -203,6 +205,10 @@ impl HostState {
         let exempt = exempt_host.is_some();
 
         let tripped = Arc::new(AtomicBool::new(false));
+        // Out-of-band DNS-miss flag: reqwest collapses a `dns_resolver` failure
+        // into an opaque connect error, so the resolver flags a genuine
+        // NXDOMAIN/no-address miss here for `airlock_or` to map to `dns-error`.
+        let dns_failed = Arc::new(AtomicBool::new(false));
         // Manual redirect following on BOTH the buffered and streaming paths:
         // reqwest must NEVER follow on its own, so every hop re-enters this fn
         // and re-runs the full airlock (scheme + async gate + egress).
@@ -210,6 +216,7 @@ impl HostState {
             opts,
             exempt_host,
             tripped.clone(),
+            dns_failed.clone(),
             reqwest::redirect::Policy::none(),
         )?;
 
@@ -227,7 +234,7 @@ impl HostState {
         let header_deadline = header_deadline(opts, self.http_limits.header_deadline_floor);
         let response = util::bounded_await(&io_semaphore, async move {
             match tokio::time::timeout(header_deadline, request_builder.send()).await {
-                Ok(result) => result.map_err(|e| airlock_or(&tripped, &e)),
+                Ok(result) => result.map_err(|e| airlock_or(&tripped, &dns_failed, &e)),
                 Err(_elapsed) => Err(ErrorCode::Timeout),
             }
         })
@@ -323,13 +330,9 @@ impl HostState {
                             .map_err(|_| ErrorCode::Protocol("invalid redirect target".into()))?;
                         // Per-hop SSRF re-validation on an IP-literal target
                         // (hostnames are airlocked at resolution by the next
-                        // hop's `send_one_hop`).
-                        if classify_redirect(
-                            next_url.host_str(),
-                            redirect_count as usize,
-                            opts.max_redirects,
-                        ) == RedirectAction::Block
-                        {
+                        // hop's `send_one_hop`). The hop ceiling is already
+                        // enforced above via `opts.max_redirects`.
+                        if redirect_target_blocked(next_url.host_str()) {
                             return Err(ErrorCode::RedirectBlocked);
                         }
                         // Strip credentials on a cross-origin hop.
@@ -496,7 +499,12 @@ impl HostState {
         if stream_opts.connect_timeout.is_none() {
             stream_opts.connect_timeout = Some(self.http_limits.stream_connect_timeout);
         }
-        if opts.total_was_default() {
+        // Clear the total ONLY when it is the host default (the caller did NOT
+        // explicitly set `total-ms`). An explicit caller total is honoured even
+        // if it happens to equal the configured host default — keyed on
+        // explicitness, not value, so a configured default can't silently clear
+        // a caller's matching deadline.
+        if !opts.total_explicit {
             stream_opts.total_timeout = None;
         }
         let read_timeout = opts
@@ -632,6 +640,21 @@ pub(super) fn stream_drop(state: &mut HostState, rep: u32) {
 }
 
 /// Classify a reqwest error into the typed `http::ErrorCode`.
+///
+/// `dns-error` is NOT recovered here — reqwest collapses a `dns_resolver`
+/// failure into an opaque `is_connect()` error, so a genuine resolution miss is
+/// distinguished out-of-band via the resolver's `dns_failed` flag in
+/// [`airlock_or`](super::ssrf::airlock_or), which runs before this on the send
+/// path.
+///
+// TODO(http): map TLS handshake / certificate failures to the contract's
+// `tls-error` arm. reqwest collapses them into `is_connect()` (→
+// `ConnectionError`). The TLS backend is `rustls`, a *transitive* dependency
+// (via hyper-rustls), so there is no stable typed error to `downcast` to
+// without adding rustls as a direct dependency and version-coupling to it;
+// walking `source()` and matching rustls' `Display` strings / type names is
+// brittle (not a stable API across rustls versions). Deferred rather than
+// shipping a fragile string matcher — the reliable `dns-error` half ships now.
 pub(super) fn map_reqwest_err(e: &reqwest::Error) -> ErrorCode {
     if e.is_timeout() {
         ErrorCode::Timeout

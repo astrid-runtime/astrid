@@ -19,20 +19,30 @@ use super::ErrorCode;
 /// Matches reqwest's historical default. The hop ceiling actually enforced in
 /// the request path is the resolved
 /// [`HttpLimits::max_redirects`](crate::engine::wasm::limits::HttpLimits::max_redirects)
-/// (operator-configurable), passed explicitly into [`classify_redirect`];
-/// redirect targets are airlocked per hop regardless.
+/// (operator-configurable), enforced by the manual-follow loop in
+/// `follow_redirects`; each redirect target is independently airlocked per hop
+/// via [`redirect_target_blocked`].
 pub(crate) const MAX_HTTP_REDIRECTS: usize = 10;
 
 /// A DNS resolver that prevents SSRF by blocking resolution to local,
 /// private, or multicast IP addresses.
 ///
-/// `tripped` is set when resolution is blocked *because* every resolved
-/// address failed the airlock (as opposed to an ordinary resolution
-/// failure), so the caller can surface the typed `airlock-rejected` error
-/// instead of a generic connection error.
+/// Two out-of-band flags let the caller recover the typed `ErrorCode` from
+/// reqwest's opaque resolver error (reqwest collapses any `dns_resolver`
+/// failure into a generic `is_connect()` error):
+/// - `tripped` is set when resolution is blocked *because* every resolved
+///   address failed the airlock — surfaced as `airlock-rejected`.
+/// - `dns_failed` is set on an ordinary resolution miss (the host did not
+///   resolve to any address) — surfaced as `dns-error`.
+///
+/// Airlock takes precedence over a plain DNS miss in [`airlock_or`].
 #[derive(Clone)]
 pub(super) struct SafeDnsResolver {
     pub(super) tripped: Arc<AtomicBool>,
+    /// Set on a genuine no-resolution miss (NXDOMAIN / no address), distinct
+    /// from an airlock block, so the caller can emit the typed `dns-error`
+    /// instead of a generic `connection-error`. Mirrors `tripped`.
+    pub(super) dns_failed: Arc<AtomicBool>,
     /// The exact request hostname that the operator allowlist exempts from
     /// the airlock (decided at pre-flight, where the port is known). When the
     /// name being resolved equals this, private/loopback addresses are kept.
@@ -45,14 +55,23 @@ impl reqwest::dns::Resolve for SafeDnsResolver {
     fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
         let name_str = name.as_str().to_string();
         let tripped = self.tripped.clone();
+        let dns_failed = self.dns_failed.clone();
         let exempt = self
             .exempt_host
             .as_deref()
             .is_some_and(|h| h.eq_ignore_ascii_case(&name_str));
         Box::pin(async move {
-            let addrs = tokio::net::lookup_host((name_str.as_str(), 0))
-                .await
-                .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+            let addrs = match tokio::net::lookup_host((name_str.as_str(), 0)).await {
+                Ok(addrs) => addrs,
+                Err(e) => {
+                    // The OS resolver itself failed (NXDOMAIN, no network, …).
+                    // Not an airlock block — mark `dns_failed` so the caller can
+                    // emit the typed `dns-error` instead of a generic connect
+                    // error. Mirrors the `tripped` recovery channel.
+                    dns_failed.store(true, Ordering::Relaxed);
+                    return Err(Box::new(e) as Box<dyn std::error::Error + Send + Sync>);
+                },
+            };
 
             let (safe_addrs, saw_unsafe) = filter_safe_addrs(addrs, exempt);
 
@@ -68,8 +87,9 @@ impl reqwest::dns::Resolve for SafeDnsResolver {
                     ))
                         as Box<dyn std::error::Error + Send + Sync>);
                 }
-                // No addresses at all: an ordinary resolution miss, not an
-                // airlock block — surface it as such (do NOT trip the airlock).
+                // Resolved to an empty address set: an ordinary resolution miss,
+                // not an airlock block — mark `dns_failed`, not `tripped`.
+                dns_failed.store(true, Ordering::Relaxed);
                 return Err(Box::new(std::io::Error::new(
                     std::io::ErrorKind::NotFound,
                     "host did not resolve to any address",
@@ -291,50 +311,50 @@ impl HostState {
     }
 }
 
-/// What to do with a redirect hop.
-#[derive(Debug, PartialEq, Eq)]
-pub(super) enum RedirectAction {
-    /// IP-literal target failed the airlock — refuse to follow.
-    Block,
-    /// Hop limit reached — stop following, return the last response.
-    Stop,
-    /// Safe to follow (hostname targets are airlocked at resolution).
-    Follow,
-}
-
-/// Decide a redirect hop's fate. An IP-literal `Location` never reaches
-/// the DNS resolver, so a public, allow-listed host could otherwise
-/// bounce a capsule onto a loopback/internal service — re-apply the
-/// airlock here. Hostname targets are left to [`SafeDnsResolver`].
+/// True if a redirect hop's IP-literal `Location` target fails the SSRF
+/// airlock and must be refused. An IP-literal `Location` never reaches the DNS
+/// resolver, so a public, allow-listed host could otherwise bounce a capsule
+/// onto a loopback/internal service — re-apply the airlock here. Hostname
+/// targets return `false` (safe): they are airlocked at resolution by the next
+/// hop's [`SafeDnsResolver`].
 ///
-/// `max_redirects` is the resolved operator hop ceiling (the request path also
-/// enforces it before calling this, so the `Stop` arm is a belt-and-braces
-/// backstop). Pass the configured ceiling, not the module default const.
-pub(super) fn classify_redirect(
-    host: Option<&str>,
-    prior_hops: usize,
-    max_redirects: usize,
-) -> RedirectAction {
-    if let Some(ip) = host.and_then(literal_ip)
-        && !is_safe_ip(ip)
-    {
-        return RedirectAction::Block;
-    }
-    if prior_hops >= max_redirects {
-        RedirectAction::Stop
-    } else {
-        RedirectAction::Follow
-    }
+/// This is ONLY the per-hop IP-literal airlock. The redirect hop *ceiling* is
+/// owned by the manual-follow loop (`follow_redirects` returns
+/// `TooManyRedirects` once `redirect_count >= opts.max_redirects`, the
+/// configured-and-clamped ceiling), so it is not re-checked here.
+pub(super) fn redirect_target_blocked(host: Option<&str>) -> bool {
+    host.and_then(literal_ip).is_some_and(|ip| !is_safe_ip(ip))
 }
 
-/// Choose the typed error for a failed request. An airlock rejection
-/// (resolver or redirect policy tripped) takes precedence over the
-/// generic reqwest classification, so a blocked local/private endpoint
-/// surfaces as `airlock-rejected` rather than a vague `connection-error`.
-pub(super) fn airlock_or(tripped: &AtomicBool, e: &reqwest::Error) -> ErrorCode {
+/// Choose the typed error for a failed request, recovering the typed arm from
+/// the resolver's out-of-band flags before falling back to reqwest's generic
+/// classification (reqwest collapses any `dns_resolver` failure into an opaque
+/// `is_connect()` error, losing the distinction). Precedence:
+/// 1. `tripped` → `airlock-rejected` (a blocked local/private endpoint, not a
+///    vague `connection-error`). Airlock wins over a plain DNS miss.
+/// 2. `dns_failed` → `dns-error` (NXDOMAIN / no address), so a guest can tell a
+///    name that does not resolve from a server that is down.
+/// 3. otherwise [`map_reqwest_err`](super::backend::map_reqwest_err).
+pub(super) fn airlock_or(
+    tripped: &AtomicBool,
+    dns_failed: &AtomicBool,
+    e: &reqwest::Error,
+) -> ErrorCode {
+    // The out-of-band resolver flags take precedence over reqwest's generic
+    // classification; `e` is only consulted when neither fired.
+    flag_error(tripped, dns_failed).unwrap_or_else(|| super::backend::map_reqwest_err(e))
+}
+
+/// The typed error implied by the resolver's out-of-band flags, if either
+/// fired: `tripped` → `airlock-rejected` (precedence), else `dns_failed` →
+/// `dns-error`, else `None` (fall back to the reqwest classification). Split out
+/// so the flag precedence is unit-testable without fabricating a `reqwest::Error`.
+pub(super) fn flag_error(tripped: &AtomicBool, dns_failed: &AtomicBool) -> Option<ErrorCode> {
     if tripped.load(Ordering::Relaxed) {
-        ErrorCode::AirlockRejected
+        Some(ErrorCode::AirlockRejected)
+    } else if dns_failed.load(Ordering::Relaxed) {
+        Some(ErrorCode::DnsError)
     } else {
-        super::backend::map_reqwest_err(e)
+        None
     }
 }

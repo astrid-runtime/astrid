@@ -35,13 +35,14 @@ pub(super) struct ResolvedOptions {
     pub(super) auto_decompress: bool,
     pub(super) https_only: bool,
     pub(super) integrity: Option<String>,
-    /// True while `total_timeout` still holds the host default (the caller set
-    /// no `total-ms`). The streaming path clears the default total so a
-    /// long-lived stream isn't cut at the buffered default; an explicit caller
-    /// total is kept. Tracked as a flag rather than comparing against the
-    /// default `Duration` so an operator-configured default cannot collide with
-    /// a caller who explicitly passes the same value.
-    total_is_host_default: bool,
+    /// True iff the caller EXPLICITLY set `timeouts.total-ms` (so `total_timeout`
+    /// is a caller deadline, not the host default). The streaming path clears
+    /// the *default* total so a long-lived stream isn't cut at the buffered
+    /// default, but keeps an explicit caller total. Tracked as explicitness, not
+    /// a value comparison: a caller who explicitly passes a `total-ms` that
+    /// happens to equal the configured host default must still have it honoured
+    /// (a value-equality check would silently clear it).
+    pub(super) total_explicit: bool,
 }
 
 impl ResolvedOptions {
@@ -65,7 +66,7 @@ impl ResolvedOptions {
             auto_decompress: true,
             https_only: false,
             integrity: None,
-            total_is_host_default: true,
+            total_explicit: false,
         }
     }
 
@@ -95,10 +96,11 @@ impl ResolvedOptions {
                 resolved.between_bytes_timeout = Some(Duration::from_millis(ms));
             }
             // `none` total keeps the host default; an explicit value overrides
-            // it (and may be longer for big downloads).
+            // it (and may be longer for big downloads). Mark it explicit so the
+            // streaming path honours it even when it equals the host default.
             if let Some(ms) = total_ms {
                 resolved.total_timeout = Some(Duration::from_millis(ms));
-                resolved.total_is_host_default = false;
+                resolved.total_explicit = true;
             }
         }
 
@@ -124,14 +126,6 @@ impl ResolvedOptions {
         resolved.integrity = opts.integrity;
 
         resolved
-    }
-
-    /// True if the caller left `total-ms` unset (so the resolved total is the
-    /// host default). The streaming path clears the default total timeout so a
-    /// long-lived stream isn't cut at the buffered default; an explicit caller
-    /// total is kept.
-    pub(super) fn total_was_default(&self) -> bool {
-        self.total_is_host_default
     }
 }
 

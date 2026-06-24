@@ -7,8 +7,8 @@ use std::str::FromStr;
 
 use super::ErrorCode;
 use super::ssrf::{
-    MAX_HTTP_REDIRECTS, RedirectAction, classify_redirect, egress_allowed, egress_decision,
-    filter_safe_addrs, is_safe_ip, literal_ip,
+    egress_allowed, egress_decision, filter_safe_addrs, is_safe_ip, literal_ip,
+    redirect_target_blocked,
 };
 
 fn ip(s: &str) -> IpAddr {
@@ -238,62 +238,23 @@ fn resolver_exempt_host_keeps_private_addrs() {
 
 #[test]
 fn redirect_blocks_ip_literal_targets() {
-    // Redirect SSRF: a 302 Location pointing at an IP literal never
-    // reaches the resolver, so the policy must block it per hop.
-    assert_eq!(
-        classify_redirect(Some("127.0.0.1"), 0, MAX_HTTP_REDIRECTS),
-        RedirectAction::Block
-    );
-    assert_eq!(
-        classify_redirect(Some("[::1]"), 0, MAX_HTTP_REDIRECTS),
-        RedirectAction::Block
-    );
-    assert_eq!(
-        classify_redirect(Some("169.254.169.254"), 0, MAX_HTTP_REDIRECTS),
-        RedirectAction::Block
-    );
-    assert_eq!(
-        classify_redirect(Some("10.0.0.5"), 2, MAX_HTTP_REDIRECTS),
-        RedirectAction::Block
-    );
+    // Redirect SSRF: a 302 Location pointing at a private/loopback/metadata IP
+    // literal never reaches the resolver, so `redirect_target_blocked` must
+    // refuse it per hop.
+    assert!(redirect_target_blocked(Some("127.0.0.1")));
+    assert!(redirect_target_blocked(Some("[::1]")));
+    assert!(redirect_target_blocked(Some("169.254.169.254")));
+    assert!(redirect_target_blocked(Some("10.0.0.5")));
 }
 
 #[test]
-fn redirect_follows_safe_targets_within_cap() {
-    // Hostnames are airlocked by the resolver, public literals are
-    // safe; both follow until the hop cap.
-    assert_eq!(
-        classify_redirect(Some("example.com"), 0, MAX_HTTP_REDIRECTS),
-        RedirectAction::Follow
-    );
-    assert_eq!(
-        classify_redirect(Some("8.8.8.8"), 0, MAX_HTTP_REDIRECTS),
-        RedirectAction::Follow
-    );
-    assert_eq!(
-        classify_redirect(None, 0, MAX_HTTP_REDIRECTS),
-        RedirectAction::Follow
-    );
-    assert_eq!(
-        classify_redirect(Some("example.com"), MAX_HTTP_REDIRECTS, MAX_HTTP_REDIRECTS),
-        RedirectAction::Stop
-    );
-}
-
-/// A configured redirect ceiling BELOW the default stops following at the lower
-/// bound — proving `classify_redirect` honours the passed ceiling, not the const.
-#[test]
-fn redirect_honours_configured_ceiling() {
-    // 3 prior hops with a ceiling of 3 must Stop; with the default ceiling of
-    // 10 the same hop count still Follows.
-    assert_eq!(
-        classify_redirect(Some("example.com"), 3, 3),
-        RedirectAction::Stop
-    );
-    assert_eq!(
-        classify_redirect(Some("example.com"), 3, MAX_HTTP_REDIRECTS),
-        RedirectAction::Follow
-    );
+fn redirect_allows_safe_targets() {
+    // Hostnames are airlocked by the resolver (not blocked here); public IP
+    // literals are safe. The hop CEILING is owned by the manual-follow loop
+    // (`follow_redirects` via `opts.max_redirects`), not by this per-hop check.
+    assert!(!redirect_target_blocked(Some("example.com")));
+    assert!(!redirect_target_blocked(Some("8.8.8.8")));
+    assert!(!redirect_target_blocked(None));
 }
 
 #[test]
@@ -673,7 +634,10 @@ mod v11 {
         assert!(resolved.auto_decompress);
         assert!(!resolved.https_only);
         assert!(resolved.integrity.is_none());
-        assert!(resolved.total_was_default());
+        assert!(
+            !resolved.total_explicit,
+            "an empty request-options leaves the total at the host default (not explicit)"
+        );
     }
 
     /// Caller-set option fields override the host defaults; the buffered body
@@ -713,7 +677,10 @@ mod v11 {
         assert!(!r.auto_decompress);
         assert!(r.https_only);
         assert_eq!(r.integrity.as_deref(), Some("sha256-abc"));
-        assert!(!r.total_was_default());
+        assert!(
+            r.total_explicit,
+            "an explicit total-ms must be flagged explicit"
+        );
     }
 
     /// `https-only` rejects an http URL with `SchemeDenied` before connecting;
@@ -827,8 +794,8 @@ mod v11 {
             "the configured default total timeout must drive the resolved default"
         );
         assert!(
-            resolved.total_was_default(),
-            "an unset caller total still counts as the host default"
+            !resolved.total_explicit,
+            "an unset caller total is not explicit (stays the host default)"
         );
     }
 
@@ -853,6 +820,64 @@ mod v11 {
         // The default (unset) also takes the configured ceiling, not the const.
         let d = ResolvedOptions::from_options(empty_options(), &limits);
         assert_eq!(d.max_redirects, 3);
+    }
+
+    /// FIX A regression: a caller who EXPLICITLY sets `total-ms` to a value that
+    /// happens to equal the configured host default must have it honoured on the
+    /// streaming path — the clear-the-default decision keys on *explicitness*,
+    /// not value-equality. With the old value-equality check
+    /// (`total == configured_default`), this explicit deadline was silently
+    /// cleared. An unset (default) total is still cleared.
+    #[test]
+    fn streaming_keeps_explicit_total_equal_to_configured_default() {
+        // Operator default of 5s; the caller explicitly asks for 5s too.
+        let mut limits = HttpLimits::default();
+        limits.default_total_timeout = Duration::from_secs(5);
+
+        let explicit = ResolvedOptions::from_options(
+            RequestOptions {
+                timeouts: Some(TimeoutConfig {
+                    connect_ms: None,
+                    first_byte_ms: None,
+                    between_bytes_ms: None,
+                    total_ms: Some(5_000),
+                }),
+                ..empty_options()
+            },
+            &limits,
+        );
+        assert!(
+            explicit.total_explicit,
+            "an explicit total-ms must be flagged explicit even when it equals the host default"
+        );
+
+        let defaulted = ResolvedOptions::from_options(empty_options(), &limits);
+        assert!(
+            !defaulted.total_explicit,
+            "an unset total-ms must NOT be flagged explicit"
+        );
+        // Both resolve to the same 5s Duration, so a value-equality check could
+        // not tell them apart — the explicitness flag is what distinguishes them.
+        assert_eq!(explicit.total_timeout, defaulted.total_timeout);
+
+        // The streaming path clears the total ONLY when it is NOT explicit, so
+        // the explicit one keeps its deadline while the defaulted one is cleared.
+        let kept = if explicit.total_explicit {
+            explicit.total_timeout
+        } else {
+            None
+        };
+        let cleared = if defaulted.total_explicit {
+            defaulted.total_timeout
+        } else {
+            None
+        };
+        assert_eq!(
+            kept,
+            Some(Duration::from_secs(5)),
+            "explicit total must survive the streaming clear"
+        );
+        assert_eq!(cleared, None, "default total must be cleared on the stream");
     }
 }
 
