@@ -115,11 +115,58 @@ pub(super) async fn handle_install_capsule(
         Err(e) => return KernelResponse::Error(format!("install task panicked: {e}")),
     };
 
+    // The admin/gateway install path is trusted (it required an authenticated
+    // admin principal to reach this handler), so auto-approve the capsule's
+    // declared capabilities (#995). Without this the freshly-installed capsule
+    // would load inert on the `load_all_capsules` call below. Best-effort: a
+    // failure here only means the capsule loads inert until an operator runs
+    // `astrid capsule approve`, which is the fail-secure direction.
+    auto_approve_admin_install(&home, &output.target_dir);
+
     // Pick up the new capsule without a daemon restart. The loader
     // is idempotent on already-registered IDs.
     kernel.load_all_capsules().await;
 
     KernelResponse::Success(install_output_json(&output))
+}
+
+/// Auto-approve the capability fingerprint of the capsule just installed under
+/// `target_dir` for the install principal (#995). The admin install path is
+/// trusted, so its capsules become active without an interactive prompt.
+fn auto_approve_admin_install(home: &astrid_core::dirs::AstridHome, target_dir: &std::path::Path) {
+    let capsule_id = target_dir
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned());
+    let Some(capsule_id) = capsule_id else {
+        tracing::warn!("admin install: target dir has no name; cannot record approval");
+        return;
+    };
+    let manifest_path = target_dir.join("Capsule.toml");
+    let manifest = match astrid_capsule::discovery::load_manifest(&manifest_path) {
+        Ok(m) => m,
+        Err(e) => {
+            tracing::warn!(
+                capsule = %capsule_id,
+                error = %e,
+                "admin install: could not re-read manifest to record approval; \
+                 capsule will load inert until approved"
+            );
+            return;
+        },
+    };
+    let fingerprint = astrid_capsule::security::approval::capability_fingerprint(&manifest);
+    let principal = astrid_capsule_install::install_principal();
+    if let Err(e) =
+        astrid_capsule::security::approval::approve(home, &principal, &capsule_id, fingerprint)
+    {
+        tracing::warn!(
+            capsule = %capsule_id,
+            %principal,
+            error = %e,
+            "admin install: failed to record capability approval; \
+             capsule will load inert until approved"
+        );
+    }
 }
 
 fn install_output_json(o: &InstallOutput) -> serde_json::Value {
