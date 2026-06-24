@@ -376,11 +376,7 @@ async fn approve_always_for_one_capsule_does_not_exempt_another_capsule() {
         Some(&vec!["127.0.0.1:1234".to_string()])
     );
     assert!(
-        profile
-            .network
-            .capsule_egress
-            .get("openai-compat")
-            .is_none(),
+        !profile.network.capsule_egress.contains_key("openai-compat"),
         "openai-compat must NOT inherit react's persisted grant"
     );
 

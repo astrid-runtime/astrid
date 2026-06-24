@@ -88,7 +88,9 @@ fn publish_response(kernel: &Kernel, request_id: &str, decision: &str) {
 /// Poll the on-disk grant set until it contains `capsule` or the deadline
 /// elapses. Returns whether the capsule landed.
 async fn wait_for_grant(home: &AstridHome, principal: &str, capsule: &str) -> bool {
-    let deadline = Instant::now() + Duration::from_secs(2);
+    let deadline = Instant::now()
+        .checked_add(Duration::from_secs(2))
+        .expect("deadline overflow");
     while Instant::now() < deadline {
         if on_disk_capsules(home, principal)
             .iter()
@@ -163,13 +165,13 @@ async fn approve_grants_capsule_end_to_end() {
     );
 
     // And the access resolver now allows the principal/capsule pair.
-    let resolver = astrid_capsule::CapsuleAccessResolver::new(
+    let access_resolver = astrid_capsule::CapsuleAccessResolver::new(
         Arc::clone(&kernel.profile_cache),
         Arc::clone(&kernel.groups),
     );
     let capsule_id = astrid_capsule::capsule::CapsuleId::new("cap").expect("capsule id");
     assert!(
-        resolver.is_capsule_allowed(Some("x"), &capsule_id),
+        access_resolver.is_capsule_allowed(Some("x"), &capsule_id),
         "is_capsule_allowed must be true for the freshly granted capsule"
     );
 }

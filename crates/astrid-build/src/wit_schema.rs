@@ -322,7 +322,7 @@ mod tests {
 
     #[test]
     fn parse_simple_record() {
-        let wit = r#"
+        let wit = r"
 package test:events@1.0.0;
 
 interface events {
@@ -338,7 +338,7 @@ interface events {
         tags: list<string>,
     }
 }
-"#;
+";
 
         let dir = tempfile::tempdir().unwrap();
         let wit_path = dir.path().join("events.wit");

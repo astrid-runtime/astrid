@@ -64,6 +64,7 @@ fn assert_error_contains(res: &AdminResponseBody, needle: &str) {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn caps_grant_appends_and_invalidates_cache() {
+    use astrid_capabilities::CapabilityCheck;
     let (_dir, kernel) = fixture().await;
     handlers::dispatch(
         &kernel,
@@ -80,7 +81,6 @@ async fn caps_grant_appends_and_invalidates_cache() {
     .await;
 
     // Pre-check: restricted principal can't do capsule:install.
-    use astrid_capabilities::CapabilityCheck;
     {
         let profile = kernel.profile_cache.resolve(&pid("grace")).unwrap();
         let groups = kernel.groups.load_full();
@@ -108,6 +108,7 @@ async fn caps_grant_appends_and_invalidates_cache() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn caps_grant_does_not_clear_matching_revoke() {
+    use astrid_capabilities::{CapabilityCheck, PermissionError};
     // Adversarial: pre-existing `self:*` revoke + caps.grant of a
     // matching cap → authz check still denies (revoke > grant).
     let (_dir, kernel) = fixture().await;
@@ -146,7 +147,6 @@ async fn caps_grant_does_not_clear_matching_revoke() {
     )
     .await;
 
-    use astrid_capabilities::{CapabilityCheck, PermissionError};
     let profile = kernel.profile_cache.resolve(&pid("henry")).unwrap();
     let groups = kernel.groups.load_full();
     let check = CapabilityCheck::new(profile.as_ref(), groups.as_ref(), pid("henry"));

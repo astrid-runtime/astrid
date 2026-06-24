@@ -561,7 +561,7 @@ mod tests {
     }
 
     /// `publish_elicit_response` must publish an `ElicitResponse` onto the
-    /// per-request reply topic carrying the request_id, the value/values, AND
+    /// per-request reply topic carrying the `request_id`, the value/values, AND
     /// the caller's principal. That principal stamp is the security hinge: the
     /// host waiter only accepts a reply whose principal matches the elicit's
     /// originating principal, so a missing/wrong stamp would silently fail to

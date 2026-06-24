@@ -78,6 +78,11 @@ fn pid_path_lives_in_run_dir_next_to_socket() {
 /// mutates process-global `ASTRID_HOME`.
 #[test]
 #[ignore = "mutates process-global ASTRID_HOME; run with --ignored"]
+// `std::env::set_var` and `std::env::remove_var` are disallowed by the
+// workspace lint policy; permitted here because this `#[ignore]`-gated test
+// is the only test in the binary that mutates the process env, so there is
+// no thread-safety hazard.
+#[allow(clippy::disallowed_methods)]
 fn pid_file_write_read_remove_round_trip() {
     let dir = tempfile::tempdir().unwrap();
     // SAFETY: single-threaded test entry; we set and restore the env var around
@@ -190,7 +195,7 @@ fn killing_lock_holder_frees_the_lock() {
     drop(contender);
 
     // SIGKILL the holder — the OS releases its flock on death.
-    let pid = nix::unistd::Pid::from_raw(child.id() as i32);
+    let pid = nix::unistd::Pid::from_raw(i32::try_from(child.id()).unwrap());
     nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGKILL).expect("kill child");
     let _ = child.wait();
 

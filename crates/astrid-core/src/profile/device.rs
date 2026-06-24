@@ -312,7 +312,7 @@ mod tests {
                 assert!(deny.contains(&"self:auth:pair:admin".to_string()));
                 assert!(deny.contains(&"delegate:self:*".to_string()));
             },
-            other => panic!("use-only must be Scoped, got {other:?}"),
+            DeviceScope::Full => panic!("use-only must be Scoped, got DeviceScope::Full"),
         }
         assert_eq!(DeviceScope::preset("nonexistent"), None);
     }

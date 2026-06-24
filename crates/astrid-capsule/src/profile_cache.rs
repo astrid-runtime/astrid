@@ -479,11 +479,7 @@ mod tests {
             "react holds its own grant"
         );
         assert!(
-            profile
-                .network
-                .capsule_egress
-                .get("openai-compat")
-                .is_none(),
+            !profile.network.capsule_egress.contains_key("openai-compat"),
             "openai-compat must NOT inherit react's persisted grant"
         );
     }

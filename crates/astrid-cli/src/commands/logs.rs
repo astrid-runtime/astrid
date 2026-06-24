@@ -169,7 +169,11 @@ mod tests {
     fn print_tail_returns_last_n_lines() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("a.log");
-        let body: String = (0..20).map(|i| format!("line {i}\n")).collect();
+        let mut body = String::new();
+        for i in 0..20 {
+            use std::fmt::Write as _;
+            let _ = writeln!(body, "line {i}");
+        }
         fs::write(&path, body).unwrap();
         // No assertion on stdout content — just confirms no panic.
         print_tail(&path, 5).unwrap();

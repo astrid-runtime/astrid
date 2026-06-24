@@ -276,7 +276,7 @@ mod tests {
                 deny: vec!["self:auth:pair".into()],
             },
         };
-        store.save(&[token.clone()]).unwrap();
+        store.save(std::slice::from_ref(&token)).unwrap();
         let loaded = store.load().unwrap();
         assert_eq!(loaded, vec![token]);
     }

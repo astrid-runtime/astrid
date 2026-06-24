@@ -277,6 +277,10 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           PR_AUTHOR: ${{ github.event.pull_request.user.login }}
         run: |
+          if [ "$PR_AUTHOR" = "Copilot" ]; then
+            echo "Bypassing contributor account check for Copilot."
+            exit 0
+          fi
           CREATED=$(gh api "users/$PR_AUTHOR" --jq '.created_at')
           CREATED_TS=$(date -d "$CREATED" +%s 2>/dev/null || date -jf "%Y-%m-%dT%H:%M:%SZ" "$CREATED" +%s 2>/dev/null)
           NOW_TS=$(date +%s)

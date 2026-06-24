@@ -1225,7 +1225,7 @@ mod tests {
             .iter()
             .filter_map(|s| match s {
                 InputSegment::Text(t) => Some(t.as_str()),
-                _ => None,
+                InputSegment::PasteBlock { .. } => None,
             })
             .collect();
         assert!(text_segments.contains(&"ab"));
@@ -1365,12 +1365,13 @@ mod tests {
 
     #[test]
     fn input_buffer_normalize_merges_adjacent_text() {
-        let mut buf = InputBuffer::default();
-        buf.segments = vec![
-            InputSegment::Text("aa".to_string()),
-            InputSegment::Text("bb".to_string()),
-        ];
-        buf.cursor = (1, 1);
+        let mut buf = InputBuffer {
+            segments: vec![
+                InputSegment::Text("aa".to_string()),
+                InputSegment::Text("bb".to_string()),
+            ],
+            cursor: (1, 1),
+        };
         buf.normalize();
         assert_eq!(buf.segments.len(), 1);
         assert_eq!(buf.flat_text(), "aabb");

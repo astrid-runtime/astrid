@@ -535,7 +535,7 @@ mod tests {
     use crate::HostVfs;
     use std::path::Path;
 
-    /// Create an OverlayVfs with separate physical lower and upper directories.
+    /// Create an `OverlayVfs` with separate physical lower and upper directories.
     async fn setup() -> (OverlayVfs, DirHandle, tempfile::TempDir, tempfile::TempDir) {
         let lower_dir = tempfile::TempDir::new().unwrap();
         let upper_dir = tempfile::TempDir::new().unwrap();

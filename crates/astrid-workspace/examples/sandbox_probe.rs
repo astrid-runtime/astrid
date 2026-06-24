@@ -5,7 +5,7 @@
 //! shell script can grep the output.
 //!
 //! Run via:
-//!     cargo run --example sandbox_probe -- [WRITABLE_ROOT]
+//!     cargo run --example `sandbox_probe` -- [`WRITABLE_ROOT`]
 //!
 //! Reads `ASTRID_SANDBOX_POLICY` from the env to exercise both the
 //! default (`Required`) path and the explicit `off` override.
@@ -27,11 +27,11 @@ fn main() {
     match cfg.sandbox_prefix() {
         Ok(Some(prefix)) => {
             println!("RESULT: Ok(Some) — sandboxed");
-            println!("  program: {:?}", prefix.program);
+            println!("  program: {}", prefix.program.to_string_lossy());
             println!("  arg_count: {}", prefix.args.len());
             println!("  first_args:");
             for arg in prefix.args.iter().take(4) {
-                println!("    {arg:?}");
+                println!("    {}", arg.to_string_lossy());
             }
         },
         Ok(None) => {
