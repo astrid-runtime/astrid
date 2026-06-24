@@ -158,8 +158,12 @@ pub(crate) async fn invite_redeem(
         i64::try_from(invite::now_epoch()).unwrap_or(0),
     ));
 
+    let group = match astrid_core::GroupName::new(chosen.group.clone()) {
+        Ok(group) => group,
+        Err(e) => return err_internal(format!("invite group rejected: {e}")),
+    };
     let profile = PrincipalProfile {
-        groups: vec![chosen.group.clone()],
+        groups: vec![group.into()],
         auth,
         ..PrincipalProfile::default()
     };

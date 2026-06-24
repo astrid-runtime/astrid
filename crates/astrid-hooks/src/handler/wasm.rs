@@ -289,11 +289,8 @@ impl WasmHandler {
             |s| format!("hook:{}", s.to_string_lossy()),
         );
 
-        let secret_store = astrid_storage::build_secret_store(
-            &hook_identity,
-            kv.clone(),
-            tokio::runtime::Handle::current(),
-        );
+        let rt = tokio::runtime::Handle::current();
+        let secret_store = astrid_storage::build_secret_store(&hook_identity, kv.clone(), rt);
 
         Ok(HostState {
             wasi_ctx: wasmtime_wasi::WasiCtxBuilder::new().build(),
@@ -389,6 +386,9 @@ impl WasmHandler {
             // so neither the ingress principal nor its device id is ever set.
             ingress_principal: None,
             ingress_device_key_id: None,
+            // A hook handler is never the local-socket uplink, so it never
+            // earns a local transport origin (fail-closed, non-local).
+            ingress_origin: None,
         })
     }
 }

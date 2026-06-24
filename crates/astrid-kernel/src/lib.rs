@@ -2160,9 +2160,11 @@ fn seed_default_principal_admin_profile(
     // 1. Admin-group seeding. Only on a truly fresh default (no groups,
     // grants, or revokes) — an operator-configured profile is left intact.
     if profile.groups.is_empty() && profile.grants.is_empty() && profile.revokes.is_empty() {
-        profile
-            .groups
-            .push(astrid_core::groups::BUILTIN_ADMIN.to_string());
+        let admin_group =
+            astrid_core::GroupName::new(astrid_core::groups::BUILTIN_ADMIN).map_err(|e| {
+                astrid_core::ProfileError::Invalid(format!("built-in admin group rejected: {e}"))
+            })?;
+        profile.groups.push(admin_group.as_str().to_string());
         mutated = true;
         tracing::info!(
             principal = %default_principal,

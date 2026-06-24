@@ -252,7 +252,7 @@ airlock is the most likely cause.
 
 **Operator exemption.** To let the openai-compat capsule reach specific local
 endpoints at runtime, an operator adds a `[security.capsule_local_egress]`
-table to `astrid.toml`. This is an operator-only setting: a capsule's own
+table to `config.toml`. This is an operator-only setting: a capsule's own
 `Capsule.toml` cannot set it, and a project or workspace config layer cannot
 widen it either.
 
@@ -379,7 +379,7 @@ loaded and `astrid capsule list` to see what is installed.
 
 ## See also
 
-- [Unified config schema](config.md) -- `astrid.toml` reference, including
+- [Unified config schema](config.md) -- `config.toml` reference, including
   the capsule env config overlay mechanism.
 - [Generating a gateway API client](gateway-client.md) -- HTTP access to the
   agent prompt endpoint that drives LLM turns.

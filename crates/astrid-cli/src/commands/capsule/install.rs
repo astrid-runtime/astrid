@@ -29,7 +29,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::{Context, bail};
 use astrid_capsule_install::github_source::{
-    capsule_assets, extract_github_org_repo, pick_capsule,
+    capsule_assets, extract_github_org_repo, parse_github_source, pick_capsule,
 };
 use astrid_capsule_install::{InstallOptions, InstallOutput};
 use astrid_core::dirs::AstridHome;
@@ -54,6 +54,29 @@ static BATCH_MODE: AtomicBool = AtomicBool::new(false);
 // Top-level install dispatch
 // ---------------------------------------------------------------------------
 
+/// Split a trailing `@version` suffix off a `@org/repo@version` source.
+///
+/// Returns `(base_source, Some(version))` when a version pin is present,
+/// `(source, None)` otherwise. The pin is the substring after the
+/// **second** `@` (the first introduces the `@org/repo` alias). Only
+/// the `@org/...` alias form carries a version suffix — plain
+/// `github.com/...` URLs and local paths are returned untouched, since
+/// a bare `@` is meaningful in neither.
+pub(super) fn split_version_suffix(source: &str) -> (&str, Option<&str>) {
+    let Some(rest) = source.strip_prefix('@') else {
+        return (source, None);
+    };
+    // `rest` is `org/repo` or `org/repo@version`. Split on the next `@`.
+    match rest.split_once('@') {
+        Some((base, version)) if !version.is_empty() => {
+            // Re-attach the leading `@` we stripped from `base`.
+            let base_len = base.len().saturating_add(1); // +1 for '@'
+            (&source[..base_len], Some(version))
+        },
+        _ => (source, None),
+    }
+}
+
 /// Install a capsule from `source` (the manual `astrid capsule install` path).
 ///
 /// `capsule` is the optional `--capsule <name>` selector. When `Some`, a
@@ -65,7 +88,8 @@ pub(crate) async fn install_capsule(
     capsule: Option<&str>,
     workspace: bool,
 ) -> anyhow::Result<()> {
-    let installed = install_capsule_inner(source, capsule, workspace).await?;
+    let (installed, _resolved) =
+        install_capsule_inner(source, capsule, workspace, &RefSpec::default()).await?;
     // Live-load: if a daemon is running, hot-load (or upgrade) each just-installed
     // capsule so it's usable without a restart. Best-effort and non-fatal — the
     // on-disk install above already succeeded standalone. The `update` and TUI
@@ -74,61 +98,260 @@ pub(crate) async fn install_capsule(
     Ok(())
 }
 
+/// Which concrete git ref a GitHub install should resolve.
+///
+/// Mirrors the manifest's `tag`/`version` selectors. When everything is
+/// `None`, the installer falls back to the latest release (documented,
+/// not silent — see [`resolve_github_ref`]).
+#[derive(Debug, Clone, Default)]
+pub(crate) struct RefSpec {
+    /// Semver version (resolved to a `v`-prefixed or bare release tag).
+    pub(crate) version: Option<String>,
+    /// Explicit git tag (highest priority).
+    pub(crate) tag: Option<String>,
+}
+
+impl RefSpec {
+    /// Build a [`RefSpec`] from a distro capsule's pinning fields.
+    pub(crate) fn from_capsule(cap: &super::super::distro::manifest::DistroCapsule) -> Self {
+        Self {
+            // An empty `version` string carries no pin.
+            version: (!cap.version.is_empty()).then(|| cap.version.clone()),
+            tag: cap.tag.clone(),
+        }
+    }
+}
+
 /// Install a capsule in batch mode (from distro init) — skips import
 /// validation and env prompting. `name_hint` is the distro capsule `name`,
 /// used to pick the right archive when one source ships several (a monorepo
-/// builds/releases one `.capsule` per capsule crate).
+/// builds/releases one `.capsule` per capsule crate). Honors an explicit
+/// version/tag pin from the distro manifest.
+///
+/// Returns the concrete git ref that was actually resolved and fetched
+/// (`Some` for GitHub-backed sources, `None` for local-path sources),
+/// so the caller can record the *installed* ref in the lock rather than
+/// an optimistic guess from the manifest's declared fields.
 pub(crate) async fn install_capsule_batch(
     source: &str,
     name_hint: Option<&str>,
     workspace: bool,
-) -> anyhow::Result<()> {
+    refspec: &RefSpec,
+) -> anyhow::Result<Option<String>> {
     BATCH_MODE.store(true, Ordering::Relaxed);
-    let result = install_capsule_inner(source, name_hint, workspace).await;
+    let result = install_capsule_inner(source, name_hint, workspace, refspec).await;
     BATCH_MODE.store(false, Ordering::Relaxed);
     // Distro batch install does not nudge a live reload (init manages its own
-    // load, and the daemon is typically down during init) — drop the ids.
-    result.map(|_| ())
+    // load, and the daemon is typically down during init) — keep only the
+    // resolved ref so the caller can record it in the lock.
+    result.map(|(_ids, resolved_ref)| resolved_ref)
 }
 
+/// Install dispatch shared by the CLI and distro-batch paths.
+///
+/// `name_hint` is the `--capsule <name>` / distro capsule `name` selector
+/// used to pick the right archive when a release ships several. Returns
+/// `(installed_capsule_ids, resolved_ref)`: the ids of every capsule
+/// installed, and the resolved git ref for GitHub-backed sources (`Some`),
+/// or `None` for local-path sources, which have no remote ref to resolve.
 async fn install_capsule_inner(
     source: &str,
     name_hint: Option<&str>,
     workspace: bool,
-) -> anyhow::Result<Vec<String>> {
+    refspec: &RefSpec,
+) -> anyhow::Result<(Vec<String>, Option<String>)> {
     let home = AstridHome::resolve()?;
 
-    // 1. Explicit local path — no source tracking (re-fetch doesn't make sense).
-    if source.starts_with('.') || source.starts_with('/') {
-        return install_from_local(source, workspace, &home, None);
+    // Recover any `@org/repo@version` CLI suffix and fold it into the
+    // ref spec (an explicit RefSpec from a distro manifest wins).
+    let (base, suffix_version) = split_version_suffix(source);
+    let version = refspec
+        .version
+        .clone()
+        .or_else(|| suffix_version.map(str::to_string));
+    let tag = refspec.tag.clone();
+
+    // 1. Explicit local path — record the path as the source so a
+    //    later `astrid distro update` can re-resolve from it (it's the
+    //    canonical reference for a locally-sourced capsule). No remote
+    //    ref to resolve.
+    if base.starts_with('.') || base.starts_with('/') {
+        let ids = install_from_local(base, workspace, &home, Some(base))?;
+        return Ok((ids, None));
     }
 
     // 2. Namespace alias @org/repo → GitHub.
-    if let Some(repo) = source.strip_prefix('@') {
+    if let Some(repo) = base.strip_prefix('@') {
         let url = format!("https://github.com/{repo}");
-        return install_from_github(&url, workspace, &home, Some(source), name_hint).await;
+        return install_from_github(
+            &url,
+            workspace,
+            &home,
+            Some(base),
+            name_hint,
+            version.as_deref(),
+            tag.as_deref(),
+        )
+        .await;
     }
 
     // 3. Raw GitHub URL.
-    if source.starts_with("github.com/") || source.starts_with("https://github.com/") {
-        return install_from_github(source, workspace, &home, Some(source), name_hint).await;
+    if base.starts_with("github.com/") || base.starts_with("https://github.com/") {
+        return install_from_github(
+            base,
+            workspace,
+            &home,
+            Some(base),
+            name_hint,
+            version.as_deref(),
+            tag.as_deref(),
+        )
+        .await;
     }
 
-    // 4. Fallback: assume local folder.
-    install_from_local(source, workspace, &home, None)
+    // 4. Fallback: assume local folder. No remote ref to resolve.
+    let ids = install_from_local(base, workspace, &home, Some(base))?;
+    Ok((ids, None))
 }
 
 // ---------------------------------------------------------------------------
 // GitHub installs — release-artifact download with clone-and-build fallback.
 // ---------------------------------------------------------------------------
 
+/// Build the GitHub "release by tag" API URL with the tag as a single,
+/// percent-encoded path segment.
+///
+/// Interpolating the tag into the path (`releases/tags/{tag}`) is unsafe: a
+/// tag legitimately containing `/` (e.g. `release/1.0`) would change the URL
+/// path structure. Parsing the base and pushing the tag through
+/// `path_segments_mut` encodes it as one segment (`release%2F1.0`).
+fn release_tag_url(org: &str, repo: &str, tag: &str) -> anyhow::Result<String> {
+    // Parse the base WITHOUT a trailing slash: a trailing `/` leaves an empty
+    // final path segment, so pushing onto it yields `releases//tags`. Pushing
+    // `tags` then `tag` onto the un-slashed base gives the right path, with the
+    // tag percent-encoded as a single segment.
+    let mut url = reqwest::Url::parse(&format!(
+        "https://api.github.com/repos/{org}/{repo}/releases"
+    ))
+    .context("failed to build GitHub releases URL")?;
+    url.path_segments_mut()
+        .map_err(|()| anyhow::anyhow!("GitHub releases URL cannot be a base"))?
+        .push("tags")
+        .push(tag);
+    Ok(url.to_string())
+}
+
+/// Resolve which GitHub release tag to install for `org/repo`.
+///
+/// Resolution priority:
+/// 1. An explicit `tag` is used verbatim — the caller asked for it.
+/// 2. A `version` is matched against a release tag: `v{version}` first
+///    (the convention), then the bare `{version}`. A version with no
+///    matching release is a hard error (we never silently fall through
+///    to "latest" when the caller pinned a version).
+/// 3. Neither set → the `latest` release. This fallback is explicit and
+///    logged, replacing the previous behaviour where `releases/latest`
+///    was fetched unconditionally and any `version` field was ignored.
+async fn resolve_github_ref(
+    client: &reqwest::Client,
+    org: &str,
+    repo: &str,
+    version: Option<&str>,
+    tag: Option<&str>,
+) -> anyhow::Result<String> {
+    if let Some(t) = tag {
+        return Ok(t.to_string());
+    }
+
+    if let Some(v) = version {
+        for candidate in [format!("v{v}"), v.to_string()] {
+            let tag_url = release_tag_url(org, repo, &candidate)?;
+            let r = client.get(&tag_url).send().await.with_context(|| {
+                format!("failed to query release tag {candidate} for {org}/{repo}")
+            })?;
+            // 404 → this candidate tag simply doesn't exist; try the next.
+            if r.status() == reqwest::StatusCode::NOT_FOUND {
+                continue;
+            }
+            // Any other non-success (5xx, rate-limit, auth) is a real failure
+            // that must surface — not be misreported as "no release found".
+            if !r.status().is_success() {
+                bail!(
+                    "GitHub API error querying release tag {candidate} for {org}/{repo}: HTTP {}",
+                    r.status()
+                );
+            }
+            let json = r
+                .json::<serde_json::Value>()
+                .await
+                .with_context(|| format!("invalid GitHub API response for tag {candidate}"))?;
+            return Ok(json
+                .get("tag_name")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or(&candidate)
+                .to_string());
+        }
+        bail!("no GitHub release found for version {v} in {org}/{repo}");
+    }
+
+    // Explicit, documented fallback to the latest release.
+    tracing::debug!(%org, %repo, "no version/tag pin — resolving latest release");
+    let api_url = format!("https://api.github.com/repos/{org}/{repo}/releases/latest");
+    let r = client
+        .get(&api_url)
+        .send()
+        .await
+        .context("failed to reach GitHub API for latest release")?;
+    if !r.status().is_success() {
+        bail!(
+            "GitHub API returned {} for {org}/{repo} latest release",
+            r.status()
+        );
+    }
+    let json: serde_json::Value = r.json().await.context("invalid GitHub API response")?;
+    Ok(json
+        .get("tag_name")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("latest")
+        .to_string())
+}
+
+/// Stream a `.capsule` asset to `dest`, enforcing a 50 MB ceiling.
+async fn download_capsule_asset(
+    client: &reqwest::Client,
+    download_url: &str,
+    dest: &Path,
+) -> anyhow::Result<()> {
+    let mut dl = client
+        .get(download_url)
+        .send()
+        .await
+        .context("failed to start capsule download")?;
+    let mut bytes = Vec::new();
+    while let Some(chunk) = dl.chunk().await? {
+        bytes.extend_from_slice(&chunk);
+        anyhow::ensure!(
+            bytes.len() <= 50 * 1024 * 1024,
+            "capsule archive exceeds 50 MB limit",
+        );
+    }
+    std::fs::write(dest, &bytes).with_context(|| format!("failed to write {}", dest.display()))?;
+    Ok(())
+}
+
+/// Install from a GitHub source, returning the concrete ref that was
+/// actually resolved and fetched (`Some` on the release-asset path). The
+/// clone-and-build fallback returns `None` — there is no single release
+/// tag it resolved (it builds from whatever `--depth 1` HEAD it cloned).
 async fn install_from_github(
     url: &str,
     workspace: bool,
     home: &AstridHome,
     original_source: Option<&str>,
     name_hint: Option<&str>,
-) -> anyhow::Result<Vec<String>> {
+    version: Option<&str>,
+    tag: Option<&str>,
+) -> anyhow::Result<(Vec<String>, Option<String>)> {
     let client = reqwest::Client::builder()
         .user_agent("astrid-cli")
         .timeout(std::time::Duration::from_secs(30))
@@ -138,50 +361,167 @@ async fn install_from_github(
         anyhow::anyhow!("Invalid GitHub URL format. Expected github.com/org/repo or @org/repo")
     })?;
 
-    // Priority 1: download packed `.capsule` archive(s) from the latest
-    // release. Each archive contains everything an install needs (WASM,
-    // manifest, bundled WIT definitions).
-    let api_url = format!("https://api.github.com/repos/{org}/{repo}/releases/latest");
-    if let Ok(response) = client.get(&api_url).send().await
-        && response.status().is_success()
-        && let Ok(json) = response.json::<serde_json::Value>().await
-        && let Some(assets) = json.get("assets").and_then(serde_json::Value::as_array)
-    {
-        let candidates = capsule_assets(assets);
-        if !candidates.is_empty() {
-            return match name_hint {
-                // Distro path, or manual `--capsule <name>`: install exactly
-                // `<name>.capsule` (a single-asset release installs that one
-                // regardless of the hint, via `pick_capsule`).
-                Some(hint) => {
-                    let names: Vec<&str> = candidates.iter().map(|(n, _)| n.as_str()).collect();
-                    let idx = pick_capsule(&names, Some(hint))?
-                        .expect("non-empty candidates always select an index");
-                    let (name, download_url) = &candidates[idx];
-                    download_and_unpack(
-                        &client,
-                        name,
-                        download_url,
-                        workspace,
-                        home,
-                        original_source,
-                    )
-                    .await
-                    .map(|id| vec![id])
-                },
-                // Manual install with no `--capsule`: install EVERY capsule
-                // the release ships. Best-effort — report which assets fail
-                // but keep going, then fail if any did.
-                None => {
-                    install_all_capsules(&client, &candidates, workspace, home, original_source)
-                        .await
-                },
+    // Whether the caller pinned a concrete release. A pin is a hard
+    // contract: if it cannot be honored we fail loudly rather than build
+    // HEAD, which would install something other than what was pinned and
+    // break the reproducibility the pin exists to guarantee.
+    let pinned = version.is_some() || tag.is_some();
+
+    // Priority 1: download packed `.capsule` archive(s) from the release
+    // resolved by version/tag (or latest when unpinned). Each archive
+    // contains everything an install needs (WASM, manifest, bundled WIT
+    // definitions). The ref resolved here is the *actually resolved* tag —
+    // the single source of truth threaded into the lock; we never silently
+    // fall back to `releases/latest` when a version/tag is pinned.
+    match resolve_github_ref(&client, org, repo, version, tag).await {
+        Ok(resolved_ref) => {
+            // Fetch the resolved release's assets. Build the URL via
+            // `release_tag_url` so a tag containing `/` is percent-encoded as
+            // one segment.
+            let api_url = release_tag_url(org, repo, &resolved_ref)?;
+            let candidates = if let Ok(response) = client.get(&api_url).send().await
+                && response.status().is_success()
+                && let Ok(json) = response.json::<serde_json::Value>().await
+                && let Some(assets) = json.get("assets").and_then(serde_json::Value::as_array)
+            {
+                capsule_assets(assets)
+            } else {
+                Vec::new()
             };
-        }
+
+            if !candidates.is_empty() {
+                let ids = match name_hint {
+                    // Distro path, or manual `--capsule <name>`: install exactly
+                    // `<name>.capsule` (a single-asset release installs that one
+                    // regardless of the hint, via `pick_capsule`).
+                    Some(hint) => {
+                        let names: Vec<&str> = candidates.iter().map(|(n, _)| n.as_str()).collect();
+                        let idx = pick_capsule(&names, Some(hint))?
+                            .expect("non-empty candidates always select an index");
+                        let (name, download_url) = &candidates[idx];
+                        let id = download_and_unpack(
+                            &client,
+                            name,
+                            download_url,
+                            workspace,
+                            home,
+                            original_source,
+                        )
+                        .await?;
+                        vec![id]
+                    },
+                    // Manual install with no `--capsule`: install EVERY capsule
+                    // the release ships. Best-effort — report which assets fail
+                    // but keep going, then fail if any did.
+                    None => {
+                        install_all_capsules(&client, &candidates, workspace, home, original_source)
+                            .await?
+                    },
+                };
+                return Ok((ids, Some(resolved_ref)));
+            }
+
+            // The ref resolved, but the release ships no `.capsule` asset. A
+            // pin must NOT silently fall through to building HEAD — fail with
+            // the real, actionable cause. Unpinned, fall through to
+            // clone-and-build.
+            if pinned {
+                bail!("release {resolved_ref} of {org}/{repo} ships no .capsule asset");
+            }
+        },
+        // A pinned ref that could not be resolved is a hard error: surface
+        // the real cause (a bad version/tag, a network failure) and never
+        // build HEAD for a pin.
+        Err(e) if pinned => {
+            return Err(e).context(format!(
+                "failed to resolve pinned version/tag for {org}/{repo}"
+            ));
+        },
+        // Unpinned resolution failure (e.g. no `latest` release): fall
+        // through to clone-and-build.
+        Err(_) => {},
     }
 
-    // Priority 2: clone + build from source via astrid-build.
-    clone_and_build(url, repo, workspace, home, original_source, name_hint).map(|id| vec![id])
+    // Priority 2: clone + build from source via astrid-build — reached only
+    // when nothing was pinned (a pin would have bailed above).
+    let id = clone_and_build(url, repo, workspace, home, original_source, name_hint)?;
+    Ok((vec![id], None))
+}
+
+/// Download a `.capsule` file to `dest_path` WITHOUT installing it,
+/// returning the concrete git ref that was actually resolved.
+///
+/// This is the seal pipeline's source-resolution primitive: it mirrors
+/// the release-asset download half of [`install_from_github`] but stops
+/// before handing off to the install lib. Clone-and-build is *not* a
+/// fallback here — a sealable distro must ship pre-built `.capsule`
+/// release assets, so a missing asset is a hard error the maintainer
+/// must resolve.
+///
+/// `name_hint` is the distro capsule `name`, used to pick the right
+/// archive when one source ships several (a monorepo builds/releases one
+/// `.capsule` per capsule crate) — the same `capsule_assets`/`pick_capsule`
+/// selection [`install_from_github`] uses. A single-asset release installs
+/// that one regardless of the hint.
+///
+/// The returned ref is the single source of truth the seal records in
+/// the lock's `resolved_ref`: it is whatever GitHub reported as the
+/// release `tag_name`, never an optimistic guess from the manifest.
+pub(crate) async fn resolve_capsule_to_file(
+    source: &str,
+    version: Option<&str>,
+    tag: Option<&str>,
+    name_hint: Option<&str>,
+    dest_path: &Path,
+) -> anyhow::Result<String> {
+    let (org, repo) = parse_github_source(source).ok_or_else(|| {
+        anyhow::anyhow!(
+            "seal can only resolve GitHub-backed capsule sources (@org/repo); got {source:?}"
+        )
+    })?;
+
+    let client = reqwest::Client::builder()
+        .user_agent("astrid-cli")
+        .timeout(std::time::Duration::from_secs(30))
+        .build()?;
+
+    let resolved_ref = resolve_github_ref(&client, &org, &repo, version, tag).await?;
+
+    // Fetch the resolved release's assets and pick the right `<name>.capsule`
+    // (the same selection the install path uses), so a release shipping
+    // several capsules downloads the one the seal asked for rather than the
+    // first. A missing `.capsule` asset is a hard error — seal requires
+    // pre-built release artifacts.
+    let api_url = release_tag_url(&org, &repo, &resolved_ref)?;
+    let response = client
+        .get(&api_url)
+        .send()
+        .await
+        .context("failed to fetch release metadata")?;
+    if !response.status().is_success() {
+        bail!(
+            "GitHub API returned {} fetching release {resolved_ref} of {org}/{repo}",
+            response.status()
+        );
+    }
+    let json: serde_json::Value = response.json().await.context("invalid release metadata")?;
+    let assets = json
+        .get("assets")
+        .and_then(serde_json::Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    let candidates = capsule_assets(assets);
+    let names: Vec<&str> = candidates.iter().map(|(n, _)| n.as_str()).collect();
+    let Some(idx) = pick_capsule(&names, name_hint)? else {
+        bail!(
+            "release {resolved_ref} of {org}/{repo} ships no .capsule asset — \
+             seal requires pre-built release artifacts"
+        );
+    };
+    let (_, download_url) = &candidates[idx];
+
+    download_capsule_asset(&client, download_url, dest_path).await?;
+    Ok(resolved_ref)
 }
 
 /// Download a single `.capsule` asset (streamed, 50 MB cap) and install it.
@@ -414,6 +754,42 @@ pub(crate) fn install_from_local_path(
     finish_install(&output, home)
 }
 
+/// Install a capsule from a local `.capsule` file in batch (offline)
+/// mode, recording `original_source` and signing provenance in
+/// `meta.json`.
+///
+/// Used by the `.shuttle` offline-install path: the file already lives
+/// in the verified mirror, so no network is touched. `original_source`
+/// is the distro's canonical `@org/repo` (NOT the mirror path) so a
+/// later online `update` can re-resolve. Provenance fields are
+/// descriptive — trust was established by the distro signature check
+/// before this is called, not re-derived here.
+pub(crate) fn install_offline_capsule(
+    archive: &Path,
+    home: &AstridHome,
+    name: &str,
+    original_source: &str,
+    resolved_ref: Option<&str>,
+    signer: Option<&str>,
+    signature: Option<&str>,
+) -> anyhow::Result<()> {
+    BATCH_MODE.store(true, Ordering::Relaxed);
+    let result = (|| {
+        unpack_via_lib(archive, false, home, Some(original_source))?;
+        // Post-stamp provenance into the freshly-written meta.json.
+        let target_dir = resolve_target_dir(home, name, false)?;
+        if let Some(mut meta) = super::meta::read_meta(&target_dir) {
+            meta.resolved_ref = resolved_ref.map(String::from);
+            meta.signer = signer.map(String::from);
+            meta.signature = signature.map(String::from);
+            super::meta::write_meta(&target_dir, &meta)?;
+        }
+        Ok(())
+    })();
+    BATCH_MODE.store(false, Ordering::Relaxed);
+    result
+}
+
 /// Unpack a `.capsule` archive and install from it. Returns the installed
 /// capsule id.
 fn unpack_via_lib(
@@ -467,7 +843,7 @@ where
 /// Render post-install diagnostics and prompt for unset env fields. Returns the
 /// installed capsule id (its directory name), so the manual-install path can
 /// nudge a running daemon to hot-load exactly that capsule.
-fn finish_install(output: &InstallOutput, _home: &AstridHome) -> anyhow::Result<String> {
+fn finish_install(output: &InstallOutput, home: &AstridHome) -> anyhow::Result<String> {
     let batch = BATCH_MODE.load(Ordering::Relaxed);
 
     // Load the manifest once (always present post-install) — used both for
@@ -499,7 +875,12 @@ fn finish_install(output: &InstallOutput, _home: &AstridHome) -> anyhow::Result<
     }
 
     if !batch && output.env_needs_prompt {
-        prompt_env_fields(&manifest.env, &output.env_path)?;
+        prompt_env_fields(
+            &manifest.env,
+            &output.env_path,
+            &capsule_id,
+            &home.config_path(),
+        )?;
     }
 
     if !batch && !output.missing_imports.is_empty() {
@@ -537,71 +918,5 @@ fn finish_install(output: &InstallOutput, _home: &AstridHome) -> anyhow::Result<
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn find_wasm_asset(assets: &[serde_json::Value]) -> Option<String> {
-        assets.iter().find_map(|asset| {
-            let name = asset.get("name")?.as_str()?;
-            if !Path::new(name)
-                .extension()
-                .is_some_and(|ext| ext.eq_ignore_ascii_case("wasm"))
-            {
-                return None;
-            }
-            Some(name.to_string())
-        })
-    }
-
-    #[test]
-    fn try_install_wasm_asset_prefers_first_wasm() {
-        let assets = vec![
-            serde_json::json!({
-                "name": "first.wasm",
-                "browser_download_url": "https://example.com/first.wasm"
-            }),
-            serde_json::json!({
-                "name": "second.wasm",
-                "browser_download_url": "https://example.com/second.wasm"
-            }),
-        ];
-        assert_eq!(find_wasm_asset(&assets).as_deref(), Some("first.wasm"));
-    }
-
-    #[test]
-    fn try_install_wasm_asset_skips_non_wasm() {
-        let assets = vec![serde_json::json!({
-            "name": "capsule.capsule",
-            "browser_download_url": "https://example.com/capsule.capsule"
-        })];
-        assert!(
-            find_wasm_asset(&assets).is_none(),
-            ".capsule should not match .wasm check"
-        );
-    }
-
-    #[test]
-    fn try_install_wasm_asset_case_insensitive() {
-        let assets = vec![serde_json::json!({
-            "name": "capsule.WASM",
-            "browser_download_url": "https://example.com/capsule.WASM"
-        })];
-        assert_eq!(
-            find_wasm_asset(&assets).as_deref(),
-            Some("capsule.WASM"),
-            "should match .WASM case-insensitively"
-        );
-    }
-
-    #[test]
-    fn capsule_toml_raw_url_format() {
-        let org = "unicity-astrid";
-        let repo = "capsule-cli";
-        let tag = "v0.1.0";
-        let url = format!("https://raw.githubusercontent.com/{org}/{repo}/{tag}/Capsule.toml");
-        assert_eq!(
-            url,
-            "https://raw.githubusercontent.com/unicity-astrid/capsule-cli/v0.1.0/Capsule.toml"
-        );
-    }
-}
+#[path = "install_tests.rs"]
+mod tests;

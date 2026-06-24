@@ -424,6 +424,12 @@ fn clear_on_return(state: &mut HostState, reset_resources: bool) {
     // (issue #45/#852).
     state.ingress_principal = None;
     state.ingress_device_key_id = None;
+    // The in-flight transport origin is the same per-frame state: a fresh lease
+    // must never inherit a stale `LocalSocket`, or a later request on a
+    // different (remote) connection could be mis-attributed as a local operator
+    // and wrongly earn local-egress consent. Cleared to `None` (= `System`,
+    // fail-closed) in lockstep.
+    state.ingress_origin = None;
 
     if reset_resources {
         // Drops every entry still in the old table (orphaned subscriptions,
@@ -553,6 +559,37 @@ mod tests {
         assert_eq!(state.process_count_total, 1);
         // Per-invocation scoping fields are still cleared even for the carve-out.
         assert!(!state.interceptor_active);
+    }
+
+    /// The in-flight transport origin is per-frame state: a pool return must
+    /// clear `ingress_origin` (alongside `ingress_principal` /
+    /// `ingress_device_key_id`) so a fresh lease never inherits a stale
+    /// `LocalSocket`. Otherwise a later request on a different (remote)
+    /// connection could be mis-attributed as a local operator and wrongly earn
+    /// local-egress consent. Cleared even under the resource-carve-out path
+    /// (`reset_resources = false`), since it is invocation state, not a
+    /// resource.
+    #[test]
+    fn clear_on_return_clears_ingress_origin() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("runtime");
+
+        for reset_resources in [true, false] {
+            let mut state = minimal_host_state(rt.handle().clone());
+            state.ingress_principal = Some(astrid_core::PrincipalId::default());
+            state.ingress_device_key_id = Some("dev-abc".to_string());
+            state.ingress_origin = Some(astrid_events::ipc::MessageOrigin::LocalSocket);
+
+            clear_on_return(&mut state, reset_resources);
+
+            assert_eq!(
+                state.ingress_origin, None,
+                "ingress_origin must reset to None on return (reset_resources = {reset_resources})"
+            );
+            assert_eq!(state.ingress_principal, None);
+            assert_eq!(state.ingress_device_key_id, None);
+        }
     }
 
     /// Eviction trims the warm set down to exactly `min_idle`, evicting the

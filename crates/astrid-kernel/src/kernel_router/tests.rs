@@ -4,6 +4,26 @@
 use super::*;
 
 #[test]
+fn response_topic_for_maps_request_to_response() {
+    // A kernel request topic maps to the correlated response topic so a reply
+    // lands on the channel the client is waiting on. Regression: the rate-limit
+    // path previously derived the topic with a no-op
+    // `replace("kernel.request.", "kernel.response.")` — which never matched the
+    // real `astrid.v1.request.*` topics — and published the error back on the
+    // request topic, so rate-limited clients timed out.
+    assert_eq!(
+        response_topic_for("astrid.v1.request.status.abc123"),
+        "astrid.v1.response.status.abc123",
+    );
+    assert_eq!(
+        response_topic_for("astrid.v1.request.reload_capsule.c-1"),
+        "astrid.v1.response.reload_capsule.c-1",
+    );
+    // A non-request topic is returned unchanged.
+    assert_eq!(response_topic_for("client.v1.connect"), "client.v1.connect");
+}
+
+#[test]
 fn rate_limiter_allows_within_limit() {
     let mut limiter = ManagementRateLimiter::new();
     for _ in 0..5 {
