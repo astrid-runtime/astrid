@@ -240,6 +240,9 @@ pub fn install_from_local_path(
         exports: version_map_to_strings(&manifest.exports, |d| d.version.to_string()),
         wasm_hash: wasm.as_ref().map(|w: &WasmAddressed| w.hash.clone()),
         wit_files,
+        // Provenance fields are stamped by the distro install path
+        // (offline `.shuttle`), not the generic local install.
+        ..Default::default()
     };
     if let Err(e) = write_meta(&target_dir, &meta) {
         rollback(&target_dir, backup_dir.as_deref());

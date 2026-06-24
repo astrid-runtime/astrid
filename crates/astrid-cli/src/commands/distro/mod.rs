@@ -6,4 +6,9 @@
 
 pub(crate) mod lock;
 pub(crate) mod manifest;
+pub(crate) mod seal;
+pub(crate) mod shuttle;
+pub(crate) mod shuttle_install;
+pub(crate) mod sign;
+pub(crate) mod trust;
 pub(crate) mod validate;

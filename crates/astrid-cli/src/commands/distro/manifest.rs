@@ -139,6 +139,28 @@ pub(crate) struct DistroMeta {
     /// Example: `[distro.requires.astrid] llm = "^1.0"`
     #[serde(default)]
     pub(crate) requires: HashMap<String, HashMap<String, String>>,
+    /// Optional signing configuration. When present, declares the
+    /// ed25519 public key the distro's maintainer signs `.shuttle`
+    /// archives with. Drives trust-store pinning at install time.
+    #[serde(default)]
+    pub(crate) signing: Option<SigningConfig>,
+}
+
+/// Signing configuration from `[distro.signing]`.
+///
+/// The `pubkey` is the maintainer's ed25519 verification key in
+/// `ed25519:<base64>` wire form. `endorses` carries a successor key for
+/// future key-rotation chains — it is parsed and recorded but chain
+/// verification is deferred (the field is wire-stable so older clients
+/// don't reject manifests that carry it).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) struct SigningConfig {
+    /// Maintainer verification key as `ed25519:<base64>`.
+    pub(crate) pubkey: String,
+    /// Successor key for rotation (wire field; chain verify deferred).
+    #[serde(default)]
+    pub(crate) endorses: Option<String>,
 }
 
 /// A shared variable defined at the distro level.
@@ -164,6 +186,20 @@ pub(crate) struct DistroCapsule {
     pub(crate) source: String,
     /// Exact version to install (resolved to a git tag).
     pub(crate) version: String,
+    /// Explicit git tag to install. Highest-priority ref selector —
+    /// overrides `version` when both are set.
+    #[serde(default)]
+    pub(crate) tag: Option<String>,
+    /// Git branch to track. Used when no tag/version pins a release.
+    #[serde(default)]
+    pub(crate) branch: Option<String>,
+    /// Exact git revision (commit SHA) to install.
+    #[serde(default)]
+    pub(crate) rev: Option<String>,
+    /// Whether this capsule is the default choice within its
+    /// [`Self::group`] for non-interactive (`--yes`) selection.
+    #[serde(default)]
+    pub(crate) default: bool,
     /// Provider group for multi-select during init (e.g. `llm`).
     #[serde(default)]
     pub(crate) group: Option<String>,
@@ -281,6 +317,92 @@ base_url = "{{ base_url }}"
         assert_eq!(m.capsules[1].env["api_key"], "{{ api_key }}");
         let requires = &m.distro.requires;
         assert_eq!(requires["astrid"]["llm"], "^1.0");
+    }
+
+    #[test]
+    fn parse_capsule_ref_and_default_fields() {
+        // Release selectors (`tag`, `default`, `group`) parse and
+        // validate. `version`/`tag` are the only ref selectors allowed
+        // in a distro manifest.
+        let toml = r#"
+schema-version = 1
+
+[distro]
+id = "test"
+name = "Test"
+version = "0.1.0"
+
+[distro.signing]
+pubkey = "ed25519:AAAA"
+
+[[capsule]]
+name = "astrid-capsule-cli"
+source = "@org/cli"
+version = "0.1.0"
+role = "uplink"
+
+[[capsule]]
+name = "astrid-capsule-a"
+source = "@org/a"
+version = "0.2.0"
+tag = "v0.2.0-rc1"
+group = "llm"
+default = true
+
+[[capsule]]
+name = "astrid-capsule-b"
+source = "@org/b"
+version = "0.3.0"
+group = "llm"
+"#;
+        let m = parse_manifest(toml).unwrap();
+        assert_eq!(m.distro.signing.as_ref().unwrap().pubkey, "ed25519:AAAA");
+        let a = m
+            .capsules
+            .iter()
+            .find(|c| c.name == "astrid-capsule-a")
+            .unwrap();
+        assert_eq!(a.tag.as_deref(), Some("v0.2.0-rc1"));
+        assert!(a.default);
+        let b = m
+            .capsules
+            .iter()
+            .find(|c| c.name == "astrid-capsule-b")
+            .unwrap();
+        assert!(!b.default);
+        assert_eq!(b.group.as_deref(), Some("llm"));
+    }
+
+    #[test]
+    fn branch_and_rev_fields_still_deserialize_on_struct() {
+        // The `branch`/`rev` fields stay ON `DistroCapsule` so validation
+        // can name them in a friendly error (rather than serde producing
+        // an opaque unknown-field failure). They parse syntactically; the
+        // semantic rejection happens in `validate_manifest`, exercised in
+        // the validate.rs tests. Bypass `parse_manifest` (which validates)
+        // and deserialize the struct directly.
+        let toml = r#"
+schema-version = 1
+
+[distro]
+id = "test"
+name = "Test"
+version = "0.1.0"
+
+[[capsule]]
+name = "astrid-capsule-b"
+source = "@org/b"
+version = "0.3.0"
+branch = "main"
+rev = "abc123"
+role = "uplink"
+"#;
+        let m: DistroManifest = toml::from_str(toml).unwrap();
+        let b = &m.capsules[0];
+        assert_eq!(b.branch.as_deref(), Some("main"));
+        assert_eq!(b.rev.as_deref(), Some("abc123"));
+        // And it is rejected once validated.
+        assert!(parse_manifest(toml).is_err());
     }
 
     #[test]

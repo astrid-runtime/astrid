@@ -107,6 +107,7 @@ use crate::state::GatewayState;
         routes::env::write_env,
         // Agent invocation
         routes::agent::post_prompt,
+        routes::agent::post_elicit_response,
         // Models (active-LLM selection)
         routes::models::list_models,
         routes::models::get_active_model,
@@ -170,6 +171,7 @@ use crate::state::GatewayState;
             // Agent
             routes::agent::PromptRequest,
             routes::agent::PromptReady,
+            routes::agent::ElicitResponseRequest,
             // Models
             routes::models::SetActiveModelRequest,
             // Env

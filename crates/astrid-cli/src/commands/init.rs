@@ -17,19 +17,61 @@ use super::distro::lock::{
 use super::distro::manifest::{DistroCapsule, DistroManifest, parse_manifest};
 use crate::theme::Theme;
 
-/// Default distro name when none specified.
-const DEFAULT_DISTRO: &str = "astralis";
-
 /// Default GitHub org for distro repos.
 const DEFAULT_ORG: &str = "unicity-astrid";
 
+/// Options controlling the init / `distro apply` flow.
+///
+/// Carries the headless and trust flags so the interactive prompts can
+/// be bypassed (`--yes`), network access forbidden (`--offline`), and
+/// signing posture chosen (`--allow-unsigned`, `--accept-new-key`).
+#[derive(Debug, Clone, Default)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "distinct CLI flag toggles, not a state machine"
+)]
+pub(crate) struct InitOpts {
+    /// Non-interactive: accept all defaults, never read stdin.
+    pub(crate) yes: bool,
+    /// Forbid all network access — install only from local/`.shuttle`.
+    pub(crate) offline: bool,
+    /// Allow installing a distro that ships no signature.
+    pub(crate) allow_unsigned: bool,
+    /// Accept and re-pin a signing key that differs from the pinned one.
+    pub(crate) accept_new_key: bool,
+    /// Pre-supplied variable values from `--var KEY=VALUE`.
+    pub(crate) vars: HashMap<String, String>,
+}
+
+/// Parse `--var KEY=VALUE` strings into a map.
+///
+/// Splits on the first `=`. A missing `=` or empty key is an error.
+pub(crate) fn parse_cli_vars(raw: &[String]) -> anyhow::Result<HashMap<String, String>> {
+    let mut map = HashMap::new();
+    for item in raw {
+        let (key, value) = item
+            .split_once('=')
+            .ok_or_else(|| anyhow::anyhow!("--var must be KEY=VALUE (got {item:?})"))?;
+        if key.is_empty() {
+            bail!("--var has an empty key (got {item:?})");
+        }
+        map.insert(key.to_string(), value.to_string());
+    }
+    Ok(map)
+}
+
 /// Run the init flow: workspace setup + distro-based capsule installation.
-pub(crate) async fn run_init(distro_source: &str) -> anyhow::Result<()> {
+pub(crate) async fn run_init(distro_source: &str, opts: &InitOpts) -> anyhow::Result<()> {
     let home = AstridHome::resolve()?;
     home.ensure()?;
 
     // Workspace init (existing behaviour).
     init_workspace()?;
+
+    // Offline, signed, self-contained install path.
+    if distro_source.ends_with(".shuttle") {
+        return run_init_from_shuttle(distro_source, opts);
+    }
 
     // Check lockfile — if fresh, we're already initialized.
     let principal = astrid_core::PrincipalId::default();
@@ -38,8 +80,9 @@ pub(crate) async fn run_init(distro_source: &str) -> anyhow::Result<()> {
         .config_dir()
         .join("distro.lock");
 
-    // Fetch and parse the distro manifest.
-    let manifest = fetch_and_parse_manifest(distro_source).await?;
+    // Fetch and parse the distro manifest. Network is forbidden under
+    // --offline unless the source resolves to a local file.
+    let manifest = fetch_and_parse_manifest(distro_source, opts.offline).await?;
 
     // Enforce the distro's CLI-version floor BEFORE any prompting or install.
     // The manifest is fetched from the repo `main` tip, so a distro that bumps
@@ -84,10 +127,10 @@ pub(crate) async fn run_init(distro_source: &str) -> anyhow::Result<()> {
     let distro_version = manifest.distro.version;
     let schema_version = manifest.schema_version;
 
-    let selected = select_capsules(manifest.capsules)?;
+    let selected = select_capsules(manifest.capsules, opts.yes)?;
 
     // Collect variables needed by selected capsules.
-    let vars = collect_variables(&variables, &selected)?;
+    let vars = collect_variables(&variables, &selected, opts.yes, &opts.vars)?;
 
     // Write per-capsule env files BEFORE installing capsules so that
     // install_capsule's onboarding check finds existing values and
@@ -95,7 +138,7 @@ pub(crate) async fn run_init(distro_source: &str) -> anyhow::Result<()> {
     write_env_files(&home, &selected, &vars)?;
 
     // Install each capsule with progress.
-    let locked = install_capsules(&selected).await?;
+    let locked = install_capsules(&selected, opts.offline).await?;
 
     // Per-provider onboarding: for each selected llm-group capsule, run its
     // own `[env]` schema prompt so capsule-specific fields (api_key,
@@ -113,6 +156,15 @@ pub(crate) async fn run_init(distro_source: &str) -> anyhow::Result<()> {
     eprintln!("  Run {} to start.", Theme::prompt("astrid"));
 
     Ok(())
+}
+
+/// Install a distro from a signed, self-contained `.shuttle` archive.
+///
+/// Implemented in [`super::distro::shuttle_install`] (Part C/D): unpack
+/// to a mirror, verify the signature against the trust store, then
+/// install each capsule offline from the mirror.
+fn run_init_from_shuttle(source: &str, opts: &InitOpts) -> anyhow::Result<()> {
+    super::distro::shuttle_install::install_from_shuttle(std::path::Path::new(source), opts)
 }
 
 /// Initialize the current directory as an Astrid workspace (if not already).
@@ -150,13 +202,23 @@ fn resolve_distro_url(source: &str) -> String {
 }
 
 /// Resolve a distro source string to a manifest URL or path, then parse it.
-async fn fetch_and_parse_manifest(source: &str) -> anyhow::Result<DistroManifest> {
+///
+/// When `offline` is set, only a local file is acceptable — any source
+/// that would require a network fetch is a hard error.
+async fn fetch_and_parse_manifest(source: &str, offline: bool) -> anyhow::Result<DistroManifest> {
     // Local file path.
     let path = std::path::Path::new(source);
     if path.exists() && path.is_file() {
         let content = std::fs::read_to_string(path)
             .with_context(|| format!("failed to read {}", path.display()))?;
         return parse_manifest(&content);
+    }
+
+    if offline {
+        bail!(
+            "--offline: '{source}' is not a local file and network fetch is forbidden \
+             (use a Distro.toml path or a .shuttle archive)"
+        );
     }
 
     let url = resolve_distro_url(source);
@@ -212,9 +274,16 @@ fn parse_provider_selection(input: &str, count: usize) -> Vec<usize> {
 }
 
 /// Select which capsules to install. Capsules without a group are always
-/// included. Capsules with a group are presented for multi-select.
+/// included. Capsules with a group are presented for multi-select
+/// (interactive) or resolved from their `default` flag (`--yes`).
 /// Takes ownership of the manifest's capsule list to avoid cloning.
-fn select_capsules(capsules: Vec<DistroCapsule>) -> anyhow::Result<Vec<DistroCapsule>> {
+pub(crate) fn select_capsules(
+    capsules: Vec<DistroCapsule>,
+    yes: bool,
+) -> anyhow::Result<Vec<DistroCapsule>> {
+    if yes {
+        return select_capsules_headless(capsules);
+    }
     let mut selected = Vec::new();
     let mut groups: HashMap<String, Vec<DistroCapsule>> = HashMap::new();
 
@@ -258,11 +327,56 @@ fn select_capsules(capsules: Vec<DistroCapsule>) -> anyhow::Result<Vec<DistroCap
     Ok(selected)
 }
 
+/// Non-interactive capsule selection (`--yes`): ungrouped capsules are
+/// always taken; each group contributes its `default = true` member(s).
+/// A group with no default warns and falls back to its first capsule
+/// (deterministic — manifest order), so a misconfigured manifest still
+/// produces a working install rather than aborting.
+fn select_capsules_headless(capsules: Vec<DistroCapsule>) -> anyhow::Result<Vec<DistroCapsule>> {
+    let mut selected = Vec::new();
+    // Preserve manifest order within each group for deterministic
+    // fallback; iterate groups in sorted order for stable warnings.
+    let mut groups: HashMap<String, Vec<DistroCapsule>> = HashMap::new();
+    for cap in capsules {
+        match &cap.group {
+            None => selected.push(cap),
+            Some(group) => groups.entry(group.clone()).or_default().push(cap),
+        }
+    }
+
+    let mut group_names: Vec<String> = groups.keys().cloned().collect();
+    group_names.sort_unstable();
+    for group_name in group_names {
+        let group_caps = groups.remove(&group_name).unwrap_or_default();
+        let defaults: Vec<DistroCapsule> =
+            group_caps.iter().filter(|c| c.default).cloned().collect();
+        if defaults.is_empty() {
+            let first = group_caps
+                .first()
+                .ok_or_else(|| anyhow::anyhow!("group '{group_name}' has no capsules"))?;
+            eprintln!(
+                "{}",
+                Theme::warning(&format!(
+                    "group '{group_name}' has no default capsule — selecting first: {}",
+                    first.name
+                ))
+            );
+            selected.push(first.clone());
+        } else {
+            selected.extend(defaults);
+        }
+    }
+
+    Ok(selected)
+}
+
 /// Prompt for distro-level variables needed by the selected capsules.
 /// Only prompts for variables that are actually referenced by a selected capsule's env.
-fn collect_variables(
+pub(crate) fn collect_variables(
     variables: &HashMap<String, super::distro::manifest::VariableDef>,
     selected: &[DistroCapsule],
+    yes: bool,
+    cli_vars: &HashMap<String, String>,
 ) -> anyhow::Result<HashMap<String, String>> {
     // Collect all variable references from selected capsules.
     let mut needed_vars: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -276,6 +390,12 @@ fn collect_variables(
 
     if needed_vars.is_empty() {
         return Ok(HashMap::new());
+    }
+
+    if yes {
+        return collect_variables_headless(variables, &needed_vars, cli_vars, |k| {
+            std::env::var(k).ok()
+        });
     }
 
     eprintln!("Configuration:");
@@ -319,6 +439,51 @@ fn collect_variables(
     Ok(vars)
 }
 
+/// Non-interactive variable resolution (`--yes`).
+///
+/// For each needed variable, the value is taken from (in priority
+/// order): a `--var KEY=VALUE` override, the `ASTRID_VAR_<KEY>` env var
+/// (key uppercased), or the manifest default. A variable with none of
+/// these is a hard error with an actionable message. Secret values are
+/// never logged.
+fn collect_variables_headless(
+    variables: &HashMap<String, super::distro::manifest::VariableDef>,
+    needed_vars: &std::collections::HashSet<String>,
+    cli_vars: &HashMap<String, String>,
+    env_lookup: impl Fn(&str) -> Option<String>,
+) -> anyhow::Result<HashMap<String, String>> {
+    let mut vars = HashMap::new();
+    let mut sorted: Vec<&str> = needed_vars.iter().map(String::as_str).collect();
+    sorted.sort_unstable();
+
+    for var_name in sorted {
+        let env_key = format!("ASTRID_VAR_{}", var_name.to_uppercase());
+        let var_def = variables.get(var_name);
+        let value = cli_vars
+            .get(var_name)
+            .cloned()
+            .or_else(|| env_lookup(&env_key))
+            .or_else(|| var_def.and_then(|d| d.default.clone()))
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "required variable '{var_name}' has no value \
+                     (no --var {var_name}=…, no {env_key}, no default)"
+                )
+            })?;
+
+        let is_secret = var_def.is_some_and(|d| d.secret);
+        if is_secret {
+            tracing::debug!(var = %var_name, "resolved distro variable [secret]");
+        } else {
+            tracing::debug!(var = %var_name, value = %value, "resolved distro variable");
+        }
+
+        vars.insert(var_name.to_string(), value);
+    }
+
+    Ok(vars)
+}
+
 /// Create a lockfile from resolved parts (avoids borrowing the full manifest).
 fn create_lock_from_parts(
     schema_version: u32,
@@ -334,6 +499,7 @@ fn create_lock_from_parts(
             resolved_at: chrono::Utc::now().to_rfc3339(),
         },
         capsules,
+        manifest_hash: None,
     }
 }
 
@@ -361,8 +527,44 @@ fn resolve_template(template: &str, vars: &HashMap<String, String>) -> String {
     result
 }
 
+/// Whether a capsule `source` would have to touch the network to install.
+///
+/// Only GitHub-backed shapes (`@org/repo`, `github.com/…`,
+/// `https://github.com/…`) are network sources; everything else — including
+/// a relative local path like `capsules/cli.capsule` — installs straight
+/// from disk. This is the predicate the `--offline` guard rejects on, so it
+/// must NOT reject a bare relative path the way the old `starts_with('.')`
+/// /`starts_with('/')` check wrongly did.
+fn is_network_capsule_source(source: &str) -> bool {
+    astrid_capsule_install::github_source::parse_github_source(source.trim()).is_some()
+}
+
 /// Install each selected capsule with a progress bar.
-async fn install_capsules(selected: &[DistroCapsule]) -> anyhow::Result<Vec<LockedCapsule>> {
+///
+/// Under `offline`, a capsule whose source is GitHub-backed is a hard
+/// error — the `--offline` contract forbids any network, and a remote
+/// `@org/repo` capsule in a local `Distro.toml` would otherwise silently
+/// fetch from GitHub. A local path (relative or absolute) installs from
+/// disk and is allowed. (A fully self-contained offline install uses a
+/// `.shuttle` instead.)
+async fn install_capsules(
+    selected: &[DistroCapsule],
+    offline: bool,
+) -> anyhow::Result<Vec<LockedCapsule>> {
+    if offline {
+        for cap in selected {
+            if is_network_capsule_source(&cap.source) {
+                bail!(
+                    "--offline: capsule '{}' has a network/GitHub source '{}' — \
+                     refusing to fetch. Use a .shuttle archive for a self-contained \
+                     offline install.",
+                    cap.name,
+                    cap.source
+                );
+            }
+        }
+    }
+
     let total = selected.len();
     let pb = ProgressBar::new(total as u64);
     pb.set_style(
@@ -378,15 +580,29 @@ async fn install_capsules(selected: &[DistroCapsule]) -> anyhow::Result<Vec<Lock
     for cap in selected {
         pb.set_message(cap.name.clone());
 
-        if let Err(e) =
-            super::capsule::install::install_capsule_batch(&cap.source, Some(&cap.name), false)
-                .await
+        let refspec = super::capsule::install::RefSpec::from_capsule(cap);
+        // The installer returns the ref it ACTUALLY resolved and fetched
+        // (`Some` for GitHub sources, `None` for local paths). Record
+        // that — never a guess derived from the manifest fields — so the
+        // lock attests what was truly installed. `Some(&cap.name)` is the
+        // name hint used to pick the right archive from a multi-asset
+        // release.
+        let resolved_ref = match super::capsule::install::install_capsule_batch(
+            &cap.source,
+            Some(&cap.name),
+            false,
+            &refspec,
+        )
+        .await
         {
-            eprintln!("\n  Failed to install {}: {e}", cap.name);
-            failed.push(cap.name.clone());
-            pb.inc(1);
-            continue;
-        }
+            Ok(resolved_ref) => resolved_ref,
+            Err(e) => {
+                eprintln!("\n  Failed to install {}: {e}", cap.name);
+                failed.push(cap.name.clone());
+                pb.inc(1);
+                continue;
+            },
+        };
 
         // Read the installed meta to get the wasm_hash for the lock.
         let target_dir = super::capsule::install::resolve_target_dir(&home, &cap.name, false)?;
@@ -400,6 +616,7 @@ async fn install_capsules(selected: &[DistroCapsule]) -> anyhow::Result<Vec<Lock
                 .and_then(|m| m.wasm_hash)
                 .map(|h| format!("blake3:{h}"))
                 .unwrap_or_default(),
+            resolved_ref,
         });
 
         pb.inc(1);
@@ -422,7 +639,7 @@ async fn install_capsules(selected: &[DistroCapsule]) -> anyhow::Result<Vec<Lock
 }
 
 /// Write per-capsule .env.json files with resolved variable templates.
-fn write_env_files(
+pub(crate) fn write_env_files(
     home: &AstridHome,
     selected: &[DistroCapsule],
     vars: &HashMap<String, String>,
@@ -597,5 +814,156 @@ mod tests {
     fn distro_source_resolution_full_url() {
         let url = "https://example.com/Distro.toml";
         assert_eq!(resolve_distro_url(url), url);
+    }
+
+    // ---- Part A: headless selection / variable resolution ----
+
+    use super::super::distro::manifest::{DistroCapsule, VariableDef};
+
+    fn cap(name: &str, group: Option<&str>, default: bool) -> DistroCapsule {
+        DistroCapsule {
+            name: name.to_string(),
+            source: format!("@org/{name}"),
+            version: "0.1.0".to_string(),
+            tag: None,
+            branch: None,
+            rev: None,
+            default,
+            group: group.map(String::from),
+            role: None,
+            env: HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn parse_cli_vars_splits_first_equals() {
+        let raw = vec!["A=1".to_string(), "URL=https://x?y=z".to_string()];
+        let map = parse_cli_vars(&raw).unwrap();
+        assert_eq!(map["A"], "1");
+        assert_eq!(map["URL"], "https://x?y=z");
+    }
+
+    #[test]
+    fn parse_cli_vars_rejects_no_equals() {
+        assert!(parse_cli_vars(&["NOEQ".to_string()]).is_err());
+        assert!(parse_cli_vars(&["=value".to_string()]).is_err());
+    }
+
+    #[test]
+    fn headless_select_takes_defaults_and_ungrouped() {
+        let caps = vec![
+            cap("cli", None, false),
+            cap("openai", Some("llm"), true),
+            cap("anthropic", Some("llm"), false),
+        ];
+        let selected = select_capsules(caps, true).unwrap();
+        let names: std::collections::HashSet<&str> =
+            selected.iter().map(|c| c.name.as_str()).collect();
+        assert!(names.contains("cli"), "ungrouped always selected");
+        assert!(names.contains("openai"), "group default selected");
+        assert!(!names.contains("anthropic"), "non-default not selected");
+    }
+
+    #[test]
+    fn headless_select_falls_back_to_first_when_no_default() {
+        let caps = vec![
+            cap("cli", None, false),
+            cap("alpha", Some("llm"), false),
+            cap("beta", Some("llm"), false),
+        ];
+        let selected = select_capsules(caps, true).unwrap();
+        let names: std::collections::HashSet<&str> =
+            selected.iter().map(|c| c.name.as_str()).collect();
+        // First in manifest order within the group is "alpha".
+        assert!(names.contains("alpha"));
+        assert!(!names.contains("beta"));
+    }
+
+    fn var(secret: bool, default: Option<&str>) -> VariableDef {
+        VariableDef {
+            secret,
+            description: None,
+            default: default.map(String::from),
+        }
+    }
+
+    fn cap_with_env(name: &str, key: &str, template: &str) -> DistroCapsule {
+        let mut c = cap(name, None, false);
+        c.env.insert(key.to_string(), template.to_string());
+        c
+    }
+
+    #[test]
+    fn headless_collect_uses_cli_var_override() {
+        let mut variables = HashMap::new();
+        variables.insert("api_key".to_string(), var(true, Some("from-default")));
+        let selected = vec![cap_with_env("llm", "API_KEY", "{{ api_key }}")];
+        let mut cli = HashMap::new();
+        cli.insert("api_key".to_string(), "from-cli".to_string());
+
+        let vars = collect_variables(&variables, &selected, true, &cli).unwrap();
+        assert_eq!(vars["api_key"], "from-cli");
+    }
+
+    #[test]
+    fn headless_collect_uses_env_then_default() {
+        let mut variables = HashMap::new();
+        variables.insert("base_url".to_string(), var(false, Some("https://default")));
+        let mut needed = std::collections::HashSet::new();
+        needed.insert("base_url".to_string());
+
+        // No CLI var, no env → default.
+        let vars =
+            collect_variables_headless(&variables, &needed, &HashMap::new(), |_| None).unwrap();
+        assert_eq!(vars["base_url"], "https://default");
+
+        // Env (ASTRID_VAR_BASE_URL) beats default — injected lookup, no
+        // process-global state.
+        let vars = collect_variables_headless(&variables, &needed, &HashMap::new(), |k| {
+            (k == "ASTRID_VAR_BASE_URL").then(|| "https://from-env".to_string())
+        })
+        .unwrap();
+        assert_eq!(vars["base_url"], "https://from-env");
+    }
+
+    #[tokio::test]
+    async fn offline_refuses_remote_capsule_source() {
+        // A local Distro.toml with a remote @org/repo capsule must not
+        // silently fetch under --offline.
+        let selected = vec![cap("llm", None, false)]; // source "@org/llm"
+        let err = install_capsules(&selected, true).await.unwrap_err();
+        assert!(err.to_string().contains("--offline"), "got: {err}");
+        assert!(err.to_string().contains("network/GitHub"), "got: {err}");
+    }
+
+    #[test]
+    fn offline_guard_blocks_only_github_sources() {
+        // GitHub-backed shapes are network sources (rejected under --offline).
+        assert!(is_network_capsule_source("@org/repo"));
+        assert!(is_network_capsule_source("@org/repo@1.2.0"));
+        assert!(is_network_capsule_source("github.com/org/repo"));
+        assert!(is_network_capsule_source("https://github.com/org/repo"));
+
+        // Local paths are NOT network sources — including a bare relative
+        // path like `capsules/cli.capsule`, which the old guard wrongly
+        // rejected because it didn't start with `.` or `/`.
+        assert!(!is_network_capsule_source("capsules/cli.capsule"));
+        assert!(!is_network_capsule_source("./capsules/cli.capsule"));
+        assert!(!is_network_capsule_source("/abs/path/cli.capsule"));
+        assert!(!is_network_capsule_source("cli.capsule"));
+    }
+
+    #[test]
+    fn headless_collect_errors_on_missing_required_var() {
+        let mut variables = HashMap::new();
+        variables.insert("api_key".to_string(), var(true, None)); // no default
+        let mut needed = std::collections::HashSet::new();
+        needed.insert("api_key".to_string());
+
+        let err =
+            collect_variables_headless(&variables, &needed, &HashMap::new(), |_| None).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("api_key"), "got: {msg}");
+        assert!(msg.contains("ASTRID_VAR_API_KEY"), "got: {msg}");
     }
 }
