@@ -218,6 +218,29 @@ async fn install_capsule_inner(
 // GitHub installs — release-artifact download with clone-and-build fallback.
 // ---------------------------------------------------------------------------
 
+/// Build the GitHub "release by tag" API URL with the tag as a single,
+/// percent-encoded path segment.
+///
+/// Interpolating the tag into the path (`releases/tags/{tag}`) is unsafe: a
+/// tag legitimately containing `/` (e.g. `release/1.0`) would change the URL
+/// path structure. Parsing the base and pushing the tag through
+/// `path_segments_mut` encodes it as one segment (`release%2F1.0`).
+fn release_tag_url(org: &str, repo: &str, tag: &str) -> anyhow::Result<String> {
+    // Parse the base WITHOUT a trailing slash: a trailing `/` leaves an empty
+    // final path segment, so pushing onto it yields `releases//tags`. Pushing
+    // `tags` then `tag` onto the un-slashed base gives the right path, with the
+    // tag percent-encoded as a single segment.
+    let mut url = reqwest::Url::parse(&format!(
+        "https://api.github.com/repos/{org}/{repo}/releases"
+    ))
+    .context("failed to build GitHub releases URL")?;
+    url.path_segments_mut()
+        .map_err(|()| anyhow::anyhow!("GitHub releases URL cannot be a base"))?
+        .push("tags")
+        .push(tag);
+    Ok(url.to_string())
+}
+
 /// Resolve which GitHub release tag to install for `org/repo`.
 ///
 /// Resolution priority:
@@ -242,8 +265,7 @@ async fn resolve_github_ref(
 
     if let Some(v) = version {
         for candidate in [format!("v{v}"), v.to_string()] {
-            let tag_url =
-                format!("https://api.github.com/repos/{org}/{repo}/releases/tags/{candidate}");
+            let tag_url = release_tag_url(org, repo, &candidate)?;
             if let Ok(r) = client.get(&tag_url).send().await
                 && r.status().is_success()
                 && let Ok(json) = r.json::<serde_json::Value>().await
@@ -325,21 +347,34 @@ async fn install_from_github(
         anyhow::anyhow!("Invalid GitHub URL format. Expected github.com/org/repo or @org/repo")
     })?;
 
+    // Whether the caller pinned a concrete release. A pin is a hard
+    // contract: if it cannot be honored we fail loudly rather than build
+    // HEAD, which would install something other than what was pinned and
+    // break the reproducibility the pin exists to guarantee.
+    let pinned = version.is_some() || tag.is_some();
+
     // Priority 1: download packed `.capsule` archive(s) from the release
     // resolved by version/tag (or latest when unpinned). Each archive
     // contains everything an install needs (WASM, manifest, bundled WIT
     // definitions). The ref resolved here is the *actually resolved* tag —
     // the single source of truth threaded into the lock; we never silently
     // fall back to `releases/latest` when a version/tag is pinned.
-    if let Ok(resolved_ref) = resolve_github_ref(&client, org, repo, version, tag).await {
-        let api_url =
-            format!("https://api.github.com/repos/{org}/{repo}/releases/tags/{resolved_ref}");
-        if let Ok(response) = client.get(&api_url).send().await
-            && response.status().is_success()
-            && let Ok(json) = response.json::<serde_json::Value>().await
-            && let Some(assets) = json.get("assets").and_then(serde_json::Value::as_array)
-        {
-            let candidates = capsule_assets(assets);
+    match resolve_github_ref(&client, org, repo, version, tag).await {
+        Ok(resolved_ref) => {
+            // Fetch the resolved release's assets. Build the URL via
+            // `release_tag_url` so a tag containing `/` is percent-encoded as
+            // one segment.
+            let api_url = release_tag_url(org, repo, &resolved_ref)?;
+            let candidates = if let Ok(response) = client.get(&api_url).send().await
+                && response.status().is_success()
+                && let Ok(json) = response.json::<serde_json::Value>().await
+                && let Some(assets) = json.get("assets").and_then(serde_json::Value::as_array)
+            {
+                capsule_assets(assets)
+            } else {
+                Vec::new()
+            };
+
             if !candidates.is_empty() {
                 let ids = match name_hint {
                     // Distro path, or manual `--capsule <name>`: install exactly
@@ -371,24 +406,30 @@ async fn install_from_github(
                 };
                 return Ok((ids, Some(resolved_ref)));
             }
-        }
+
+            // The ref resolved, but the release ships no `.capsule` asset. A
+            // pin must NOT silently fall through to building HEAD — fail with
+            // the real, actionable cause. Unpinned, fall through to
+            // clone-and-build.
+            if pinned {
+                bail!("release {resolved_ref} of {org}/{repo} ships no .capsule asset");
+            }
+        },
+        // A pinned ref that could not be resolved is a hard error: surface
+        // the real cause (a bad version/tag, a network failure) and never
+        // build HEAD for a pin.
+        Err(e) if pinned => {
+            return Err(e).context(format!(
+                "failed to resolve pinned version/tag for {org}/{repo}"
+            ));
+        },
+        // Unpinned resolution failure (e.g. no `latest` release): fall
+        // through to clone-and-build.
+        Err(_) => {},
     }
 
-    // Priority 2: clone + build from source via astrid-build — ONLY when
-    // nothing was pinned. A pinned version/tag that didn't resolve to an
-    // installable release asset is a hard error: silently building HEAD
-    // would install something other than what was pinned and break the
-    // reproducibility the pin exists to guarantee. Fail loudly instead.
-    if version.is_some() || tag.is_some() {
-        let pin = tag
-            .map(|t| format!("tag {t}"))
-            .or_else(|| version.map(|v| format!("version {v}")))
-            .unwrap_or_default();
-        bail!(
-            "no installable .capsule release found for {org}/{repo} at pinned {pin} — \
-             refusing to build from HEAD (that would violate the pin)"
-        );
-    }
+    // Priority 2: clone + build from source via astrid-build — reached only
+    // when nothing was pinned (a pin would have bailed above).
     let id = clone_and_build(url, repo, workspace, home, original_source, name_hint)?;
     Ok((vec![id], None))
 }
@@ -437,7 +478,7 @@ pub(crate) async fn resolve_capsule_to_file(
     // several capsules downloads the one the seal asked for rather than the
     // first. A missing `.capsule` asset is a hard error — seal requires
     // pre-built release artifacts.
-    let api_url = format!("https://api.github.com/repos/{org}/{repo}/releases/tags/{resolved_ref}");
+    let api_url = release_tag_url(&org, &repo, &resolved_ref)?;
     let response = client
         .get(&api_url)
         .send()
@@ -949,6 +990,34 @@ mod tests {
             find_wasm_asset(&assets).as_deref(),
             Some("capsule.WASM"),
             "should match .WASM case-insensitively"
+        );
+    }
+
+    #[test]
+    fn release_tag_url_percent_encodes_slash_in_tag() {
+        // A tag containing `/` must be encoded as a SINGLE path segment so it
+        // can't restructure the URL path. `release/1.0` → `release%2F1.0`.
+        let url = release_tag_url("org", "repo", "release/1.0").unwrap();
+        assert_eq!(
+            url,
+            "https://api.github.com/repos/org/repo/releases/tags/release%2F1.0"
+        );
+        assert!(
+            url.contains("%2F"),
+            "slash in tag must be percent-encoded: {url}"
+        );
+        assert!(
+            !url.contains("tags/release/1.0"),
+            "tag slash must not split into extra path segments: {url}"
+        );
+    }
+
+    #[test]
+    fn release_tag_url_plain_tag_unchanged() {
+        let url = release_tag_url("unicity-astrid", "capsule-cli", "v0.1.0").unwrap();
+        assert_eq!(
+            url,
+            "https://api.github.com/repos/unicity-astrid/capsule-cli/releases/tags/v0.1.0"
         );
     }
 
