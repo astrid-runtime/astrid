@@ -186,6 +186,24 @@ mod tests {
     }
 
     #[test]
+    fn test_show_http_section() {
+        // The [http] host-limits section surfaces in `config show` (it is part
+        // of the serialized Config, so generic serialization carries it).
+        let resolved = ResolvedConfig {
+            config: Config::default(),
+            field_sources: FieldSources::new(),
+            loaded_files: Vec::new(),
+        };
+
+        let output = resolved.show(ShowFormat::Toml, Some("http")).unwrap();
+        assert!(output.contains("default_timeout_secs"));
+        assert!(output.contains("max_concurrent_streams"));
+        assert!(output.contains("max_response_bytes"));
+        // Section-scoped: no unrelated sections leak in.
+        assert!(!output.contains("session_max_usd"));
+    }
+
+    #[test]
     fn test_config_paths() {
         let paths = ResolvedConfig::config_paths(Some("/home/user"), Some("/home/user/project"));
         assert_eq!(paths.len(), 3);

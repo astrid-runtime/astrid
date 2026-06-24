@@ -16,6 +16,7 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
+use crate::engine::wasm::limits::HttpLimits;
 use crate::engine::wasm::test_fixtures::minimal_host_state;
 use crate::security::AllowAllGate;
 
@@ -84,7 +85,7 @@ fn max_redirects_clamped_to_host_ceiling() {
         https_only: None,
         integrity: None,
     };
-    let resolved = super::options::ResolvedOptions::from_options(opts);
+    let resolved = super::options::ResolvedOptions::from_options(opts, &HttpLimits::default());
     assert_eq!(
         resolved.max_redirects, MAX_HTTP_REDIRECTS,
         "caller cannot raise max_redirects above the host ceiling"
@@ -169,10 +170,11 @@ async fn decompressed_cap_ignored_when_decompression_off() {
         https_only: None,
         integrity: None,
     };
+    let limits = state.http_limits;
     let resp = state
         .http_request_backend(
             get_request(format!("http://{addr}/")),
-            super::options::ResolvedOptions::from_options(opts),
+            super::options::ResolvedOptions::from_options(opts, &limits),
         )
         .await
         .expect("auto_decompress=off must not trip DecompressionBomb on raw bytes");
@@ -217,12 +219,13 @@ async fn stream_quota_triggers_and_releases() {
         .iter()
         .map(|a| format!("127.0.0.1:{}", a.port()))
         .collect();
+    let limits = state.http_limits;
 
     for addr in &addrs {
         let res = state
             .http_stream_backend(
                 get_request(format!("http://{addr}/")),
-                super::options::ResolvedOptions::from_options(follow()),
+                super::options::ResolvedOptions::from_options(follow(), &limits),
             )
             .await
             .expect("opening up to the cap must succeed");
@@ -245,7 +248,7 @@ async fn stream_quota_triggers_and_releases() {
     let err = state
         .http_stream_backend(
             get_request(format!("http://{addr5}/")),
-            super::options::ResolvedOptions::from_options(follow()),
+            super::options::ResolvedOptions::from_options(follow(), &limits),
         )
         .await
         .expect_err("the 5th concurrent stream must hit the quota");
@@ -264,7 +267,7 @@ async fn stream_quota_triggers_and_releases() {
     let opened = state
         .http_stream_backend(
             get_request(format!("http://{addr5}/")),
-            super::options::ResolvedOptions::from_options(follow()),
+            super::options::ResolvedOptions::from_options(follow(), &limits),
         )
         .await
         .expect("after a close, a new stream fits under the cap");
@@ -282,6 +285,70 @@ async fn stream_quota_triggers_and_releases() {
         let _ = s.await;
     }
     let _ = server5.await;
+}
+
+/// A NON-default operator `max_concurrent_streams` actually lowers the quota:
+/// with a configured cap of 2, the 3rd concurrent stream is rejected with
+/// `Quota` — where the host default (4) would allow it. Proves the stream cap
+/// reads `http_limits`, not the old `MAX_ACTIVE_HTTP_STREAMS` constant.
+#[tokio::test]
+async fn configured_max_concurrent_streams_lowers_quota() {
+    fn ok_response() -> Vec<u8> {
+        b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n".to_vec()
+    }
+
+    let rt = tokio::runtime::Handle::current();
+
+    // Three loopback servers; collect their ports so all can be allowlisted.
+    let mut servers = Vec::new();
+    let mut addrs = Vec::new();
+    for _ in 0..3 {
+        let Some((addr, server)) = one_shot_server(ok_response()).await else {
+            return;
+        };
+        addrs.push(addr);
+        servers.push(server);
+    }
+
+    let mut state = minimal_host_state(rt);
+    state.security = Some(Arc::new(AllowAllGate));
+    state.local_egress = addrs
+        .iter()
+        .map(|a| format!("127.0.0.1:{}", a.port()))
+        .collect();
+    // Operator override: cap concurrent streams at 2 (below the default 4).
+    state.http_limits.max_concurrent_streams = 2;
+    let limits = state.http_limits;
+
+    // The first two opens succeed.
+    for addr in &addrs[..2] {
+        state
+            .http_stream_backend(
+                get_request(format!("http://{addr}/")),
+                super::options::ResolvedOptions::from_options(follow(), &limits),
+            )
+            .await
+            .expect("opening up to the configured cap (2) must succeed");
+    }
+    assert_eq!(state.active_http_streams.len(), 2);
+
+    // The third open is rejected by the LOWERED quota — proving config lowered
+    // it (the host default of 4 would have allowed a third stream here).
+    let err = state
+        .http_stream_backend(
+            get_request(format!("http://{}/", addrs[2])),
+            super::options::ResolvedOptions::from_options(follow(), &limits),
+        )
+        .await
+        .expect_err("the 3rd stream must hit the configured cap of 2");
+    assert!(
+        matches!(err, ErrorCode::Quota),
+        "expected Quota at the configured cap, got {err:?}"
+    );
+
+    for s in servers {
+        let _ = s.await;
+    }
 }
 
 fn follow() -> RequestOptions {
@@ -307,29 +374,31 @@ fn follow() -> RequestOptions {
 /// is caught here without waiting 120s for a live hang.
 #[test]
 fn header_deadline_decision_table() {
-    use super::backend::{HTTP_HEADER_DEADLINE_FLOOR, header_deadline};
+    use super::backend::header_deadline;
     use super::options::ResolvedOptions;
 
-    let base = ResolvedOptions::v10_defaults();
+    let limits = HttpLimits::default();
+    let floor = limits.header_deadline_floor;
+    let base = ResolvedOptions::v10_defaults(&limits);
 
     // Explicit first-byte wins over everything.
     let mut o = base.clone();
     o.first_byte_timeout = Some(Duration::from_millis(250));
     o.total_timeout = Some(Duration::from_secs(30));
-    assert_eq!(header_deadline(&o), Duration::from_millis(250));
+    assert_eq!(header_deadline(&o, floor), Duration::from_millis(250));
 
     // No first-byte, but a total (the buffered default) → bound by total.
     let mut o = base.clone();
     o.first_byte_timeout = None;
     o.total_timeout = Some(Duration::from_secs(30));
-    assert_eq!(header_deadline(&o), Duration::from_secs(30));
+    assert_eq!(header_deadline(&o, floor), Duration::from_secs(30));
 
     // STREAMING shape: total cleared, no first-byte → the floor bounds it.
     // (Without the floor, `send()` on a hung pre-header server never returns.)
     let mut o = base;
     o.first_byte_timeout = None;
     o.total_timeout = None;
-    assert_eq!(header_deadline(&o), HTTP_HEADER_DEADLINE_FLOOR);
+    assert_eq!(header_deadline(&o, floor), floor);
 }
 
 /// End-to-end: a server that accepts the TCP connection then never sends
@@ -376,11 +445,12 @@ async fn hung_pre_header_server_times_out() {
         integrity: None,
     };
 
+    let limits = state.http_limits;
     let result = tokio::time::timeout(
         Duration::from_secs(5),
         state.http_request_backend(
             get_request(format!("http://{addr}/")),
-            super::options::ResolvedOptions::from_options(opts),
+            super::options::ResolvedOptions::from_options(opts, &limits),
         ),
     )
     .await

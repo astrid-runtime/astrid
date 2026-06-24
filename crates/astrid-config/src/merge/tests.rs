@@ -455,6 +455,44 @@ fn test_capsule_local_egress_workspace_cannot_widen_operator_value() {
 }
 
 #[test]
+fn test_http_section_cannot_be_set_by_workspace() {
+    // The [http] host limits are widening controls (raising a timeout, redirect
+    // cap, or body cap relaxes the host). A workspace/project layer must not be
+    // able to introduce or change them — operator config only. The whole
+    // section is reverted to the operator baseline as a unit.
+    let baseline: toml::Value =
+        toml::from_str("[http]\nmax_redirects = 10\nmax_concurrent_streams = 4\n").unwrap();
+    let workspace: toml::Value = toml::from_str(
+        "[http]\nmax_redirects = 100\nmax_concurrent_streams = 64\nmax_response_bytes = 1073741824\n",
+    )
+    .unwrap();
+
+    let mut merged = baseline.clone();
+    deep_merge(&mut merged, &workspace);
+    enforce_restrictions(&mut merged, &baseline, &workspace);
+
+    let http = merged["http"].as_table().unwrap();
+    assert_eq!(http["max_redirects"].as_integer(), Some(10));
+    assert_eq!(http["max_concurrent_streams"].as_integer(), Some(4));
+    assert!(
+        http.get("max_response_bytes").is_none(),
+        "workspace must not introduce an [http] key the operator didn't set"
+    );
+
+    // With no operator [http] baseline, a workspace attempt to set host HTTP
+    // limits is removed entirely — it cannot introduce the section at all.
+    let baseline: toml::Value = toml::from_str("[security]\nrequire_signatures = false\n").unwrap();
+    let workspace: toml::Value = toml::from_str("[http]\ndefault_timeout_secs = 600\n").unwrap();
+    let mut merged = baseline.clone();
+    deep_merge(&mut merged, &workspace);
+    enforce_restrictions(&mut merged, &baseline, &workspace);
+    assert!(
+        merged.as_table().unwrap().get("http").is_none(),
+        "workspace must not introduce an [http] section"
+    );
+}
+
+#[test]
 fn test_allow_wasm_hooks_cannot_enable() {
     let baseline: toml::Value = toml::from_str(
         r"

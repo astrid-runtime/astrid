@@ -87,9 +87,6 @@ async fn check_http_security(
     Ok(())
 }
 
-/// Per-capsule hard ceiling on concurrent HTTP streaming responses.
-pub(crate) const MAX_ACTIVE_HTTP_STREAMS: usize = 4;
-
 /// A live HTTP streaming response pinned to the principal that opened it.
 #[derive(Debug, Clone)]
 pub struct ActiveHttpStream {
@@ -98,35 +95,23 @@ pub struct ActiveHttpStream {
     pub status: u16,
     pub headers: Vec<KeyValuePair>,
     /// Per-chunk read timeout. Caller-overridable via
-    /// `timeout-config.between-bytes-ms`; defaults to
-    /// [`HTTP_STREAM_READ_TIMEOUT`].
+    /// `timeout-config.between-bytes-ms`; defaults to the host
+    /// [`HttpLimits::stream_read_timeout`](crate::engine::wasm::limits::HttpLimits::stream_read_timeout).
     pub read_timeout: Duration,
 }
 
-const HTTP_STREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
-
-/// Fallback time-to-first-byte (header) deadline applied in [`HostState::send_one_hop`]
-/// when the caller set neither `first-byte-ms` nor a total timeout (the
-/// streaming case, where the total deadline is cleared). Generous enough not to
-/// cut a slow-TTFT LLM stream, but finite so a server that accepts then hangs
-/// before sending headers can never block the executor indefinitely.
-pub(super) const HTTP_HEADER_DEADLINE_FLOOR: Duration = Duration::from_secs(120);
-
 /// The deadline for `send()` to produce response HEADERS. An explicit caller
-/// `first-byte-ms` wins; else the (buffered) total deadline; else the
-/// [`HTTP_HEADER_DEADLINE_FLOOR`] — so the streaming path (total cleared, no
+/// `first-byte-ms` wins; else the (buffered) total deadline; else the host
+/// `header_deadline_floor` — so the streaming path (total cleared, no
 /// first-byte) is still bounded and a hung pre-header server can't block the
-/// executor forever, while a legitimately slow-TTFT LLM stream is not cut.
-pub(super) fn header_deadline(opts: &ResolvedOptions) -> Duration {
+/// executor forever, while a legitimately slow-TTFT LLM stream is not cut. The
+/// floor comes from the resolved [`HttpLimits`](crate::engine::wasm::limits::HttpLimits)
+/// (operator-configurable; default 120s).
+pub(super) fn header_deadline(opts: &ResolvedOptions, floor: Duration) -> Duration {
     opts.first_byte_timeout
         .or(opts.total_timeout)
-        .unwrap_or(HTTP_HEADER_DEADLINE_FLOOR)
+        .unwrap_or(floor)
 }
-
-/// Per-chunk read timeout for streaming HTTP responses. Kept as a
-/// named constant so per-principal timeout tuning has a single edit
-/// point. Overridable per request via `timeout-config.between-bytes-ms`.
-const HTTP_STREAM_READ_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Outcome of one wire request: the response, the wire-byte count
 /// (content-length when present; otherwise filled in after buffering), and
@@ -239,7 +224,7 @@ impl HostState {
         // so without this bound a server that accepts the TCP connection then
         // hangs before sending headers would block this future forever
         // (executor starvation).
-        let header_deadline = header_deadline(opts);
+        let header_deadline = header_deadline(opts, self.http_limits.header_deadline_floor);
         let response = util::bounded_await(&io_semaphore, async move {
             match tokio::time::timeout(header_deadline, request_builder.send()).await {
                 Ok(result) => result.map_err(|e| airlock_or(&tripped, &e)),
@@ -339,8 +324,11 @@ impl HostState {
                         // Per-hop SSRF re-validation on an IP-literal target
                         // (hostnames are airlocked at resolution by the next
                         // hop's `send_one_hop`).
-                        if classify_redirect(next_url.host_str(), redirect_count as usize)
-                            == RedirectAction::Block
+                        if classify_redirect(
+                            next_url.host_str(),
+                            redirect_count as usize,
+                            opts.max_redirects,
+                        ) == RedirectAction::Block
                         {
                             return Err(ErrorCode::RedirectBlocked);
                         }
@@ -489,14 +477,13 @@ impl HostState {
         opts: ResolvedOptions,
     ) -> Result<Resource<HttpStream>, ErrorCode> {
         let principal = self.effective_principal();
+        let max_streams = self.http_limits.max_concurrent_streams;
         let per_principal_count = self
             .active_http_streams
             .values()
             .filter(|s| s.creator == principal)
             .count();
-        if per_principal_count >= MAX_ACTIVE_HTTP_STREAMS
-            || self.active_http_streams.len() >= MAX_ACTIVE_HTTP_STREAMS
-        {
+        if per_principal_count >= max_streams || self.active_http_streams.len() >= max_streams {
             return Err(ErrorCode::Quota);
         }
 
@@ -507,14 +494,14 @@ impl HostState {
         // timeout comes from `between-bytes-ms`, else the streaming default.
         let mut stream_opts = opts.clone();
         if stream_opts.connect_timeout.is_none() {
-            stream_opts.connect_timeout = Some(HTTP_STREAM_CONNECT_TIMEOUT);
+            stream_opts.connect_timeout = Some(self.http_limits.stream_connect_timeout);
         }
         if opts.total_was_default() {
             stream_opts.total_timeout = None;
         }
         let read_timeout = opts
             .between_bytes_timeout
-            .unwrap_or(HTTP_STREAM_READ_TIMEOUT);
+            .unwrap_or(self.http_limits.stream_read_timeout);
 
         // Manual follow with `stream_opts` so connect/total timeouts apply to
         // every hop. The terminal response is returned UNREAD.

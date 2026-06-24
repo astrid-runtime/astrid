@@ -13,10 +13,15 @@ use crate::security::net_connect_pattern_matches;
 
 use super::ErrorCode;
 
-/// Maximum redirect hops followed before the request is stopped. Matches
-/// reqwest's historical default; redirect targets are airlocked per hop
-/// (see [`classify_redirect`]).
-pub(super) const MAX_HTTP_REDIRECTS: usize = 10;
+/// DEFAULT maximum redirect hops. The single source of truth for the redirect
+/// default: [`HttpLimits::default`](crate::engine::wasm::limits::HttpLimits::default)
+/// reads this, and the `[http]` config `max_redirects` default mirrors it.
+/// Matches reqwest's historical default. The hop ceiling actually enforced in
+/// the request path is the resolved
+/// [`HttpLimits::max_redirects`](crate::engine::wasm::limits::HttpLimits::max_redirects)
+/// (operator-configurable), passed explicitly into [`classify_redirect`];
+/// redirect targets are airlocked per hop regardless.
+pub(crate) const MAX_HTTP_REDIRECTS: usize = 10;
 
 /// A DNS resolver that prevents SSRF by blocking resolution to local,
 /// private, or multicast IP addresses.
@@ -301,13 +306,21 @@ pub(super) enum RedirectAction {
 /// the DNS resolver, so a public, allow-listed host could otherwise
 /// bounce a capsule onto a loopback/internal service — re-apply the
 /// airlock here. Hostname targets are left to [`SafeDnsResolver`].
-pub(super) fn classify_redirect(host: Option<&str>, prior_hops: usize) -> RedirectAction {
+///
+/// `max_redirects` is the resolved operator hop ceiling (the request path also
+/// enforces it before calling this, so the `Stop` arm is a belt-and-braces
+/// backstop). Pass the configured ceiling, not the module default const.
+pub(super) fn classify_redirect(
+    host: Option<&str>,
+    prior_hops: usize,
+    max_redirects: usize,
+) -> RedirectAction {
     if let Some(ip) = host.and_then(literal_ip)
         && !is_safe_ip(ip)
     {
         return RedirectAction::Block;
     }
-    if prior_hops >= MAX_HTTP_REDIRECTS {
+    if prior_hops >= max_redirects {
         RedirectAction::Stop
     } else {
         RedirectAction::Follow

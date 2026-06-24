@@ -22,6 +22,7 @@
 
 use std::sync::Arc;
 use std::thread::available_parallelism;
+use std::time::Duration;
 
 use tokio::sync::Semaphore;
 
@@ -213,6 +214,62 @@ impl Default for CapsuleRuntimeLimits {
     /// All-host-derived limits (no operator overrides).
     fn default() -> Self {
         Self::resolve(None, None, None)
+    }
+}
+
+/// Resolved operator ceilings for the `astrid:http` host, handed from the daemon
+/// down to every [`HostState`](super::host_state::HostState) (mirrors the
+/// [`CapsuleRuntimeLimits`] plumbing). Resolved once from the `[http]` config
+/// section by the daemon; the kernel only stores and forwards this `Copy` value.
+///
+/// Timeouts are pre-converted to [`Duration`] here so the request hot path reads
+/// them directly (no per-request `from_secs`). Every field is a host default
+/// and/or hard ceiling: a per-request `request-options` value may tighten a
+/// limit but never exceed it. The [`Default`] reproduces the host's historical
+/// hardcoded constants exactly.
+#[derive(Debug, Clone, Copy)]
+pub struct HttpLimits {
+    /// Default whole-request timeout for the buffered path when the caller sets
+    /// no `total-ms`. Host const default: 30s.
+    pub default_total_timeout: Duration,
+    /// Connect timeout applied to the streaming path when the caller sets no
+    /// `connect-ms`. Host const default: 30s.
+    pub stream_connect_timeout: Duration,
+    /// Per-chunk read timeout for streaming responses when the caller sets no
+    /// `between-bytes-ms`. Host const default: 120s.
+    pub stream_read_timeout: Duration,
+    /// Time-to-first-byte (header) deadline floor for the streaming path when
+    /// the caller set neither `first-byte-ms` nor a total timeout. Host const
+    /// default: 120s.
+    pub header_deadline_floor: Duration,
+    /// Maximum redirect hops the host follows. A per-request `max-redirects`
+    /// clamps DOWN to this. Host const default: 10.
+    pub max_redirects: usize,
+    /// Per-capsule ceiling on concurrent HTTP streaming responses (checked per
+    /// principal and globally). Host const default: 4.
+    pub max_concurrent_streams: usize,
+    /// Default and hard ceiling on a buffered response body, in bytes. A
+    /// per-request `max-response-bytes` clamps DOWN to this; the value itself is
+    /// clamped to the absolute `MAX_GUEST_PAYLOAD_LEN` host limit by the request
+    /// path, so config can only lower it. Host const default: 10 MiB.
+    pub max_response_bytes: u64,
+}
+
+impl Default for HttpLimits {
+    /// The host's historical hardcoded constants — used in tests and whenever no
+    /// operator `[http]` config is present.
+    fn default() -> Self {
+        Self {
+            default_total_timeout: Duration::from_secs(30),
+            stream_connect_timeout: Duration::from_secs(30),
+            stream_read_timeout: Duration::from_secs(120),
+            header_deadline_floor: Duration::from_secs(120),
+            // Single source of truth for the redirect default (the request-path
+            // airlock owns the const).
+            max_redirects: super::host::http::ssrf::MAX_HTTP_REDIRECTS,
+            max_concurrent_streams: 4,
+            max_response_bytes: 10 * 1024 * 1024,
+        }
     }
 }
 

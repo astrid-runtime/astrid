@@ -109,6 +109,25 @@ fn resolve_capsule_limits(
     )
 }
 
+/// Resolve the `astrid:http` host ceilings from the `[http]` config section
+/// into the typed [`HttpLimits`](astrid_capsule::HttpLimits) the kernel forwards
+/// to every capsule. Seconds → `Duration` conversion happens once here, off the
+/// request hot path. An absent `[http]` section yields `HttpSection::default`,
+/// which equals the host's historical hardcoded constants — so this resolution
+/// changes nothing unless the operator set explicit `[http]` values.
+fn resolve_http_limits(cfg: Option<&astrid_config::Config>) -> astrid_capsule::HttpLimits {
+    let http = cfg.map(|c| c.http.clone()).unwrap_or_default();
+    astrid_capsule::HttpLimits {
+        default_total_timeout: std::time::Duration::from_secs(http.default_timeout_secs),
+        stream_connect_timeout: std::time::Duration::from_secs(http.stream_connect_timeout_secs),
+        stream_read_timeout: std::time::Duration::from_secs(http.stream_read_timeout_secs),
+        header_deadline_floor: std::time::Duration::from_secs(http.header_deadline_secs),
+        max_redirects: http.max_redirects as usize,
+        max_concurrent_streams: http.max_concurrent_streams as usize,
+        max_response_bytes: http.max_response_bytes,
+    }
+}
+
 /// Run the Astrid daemon with the given arguments.
 ///
 /// This is the shared entry point used by both the standalone `astrid-daemon`
@@ -118,6 +137,10 @@ fn resolve_capsule_limits(
 ///
 /// Returns an error if the kernel fails to boot, the CLI proxy capsule is
 /// missing, or the readiness file cannot be written.
+#[expect(
+    clippy::too_many_lines,
+    reason = "boot sequence: sequential config resolution + kernel/capsule setup that does not benefit from splitting"
+)]
 pub async fn run() -> Result<()> {
     let args = Args::parse();
 
@@ -153,9 +176,18 @@ pub async fn run() -> Result<()> {
         .map(|c| c.security.capsule_local_egress.clone())
         .unwrap_or_default();
 
-    let kernel = astrid_kernel::Kernel::new(session_id.clone(), ws, runtime_limits, local_egress)
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to boot Kernel: {e}"))?;
+    // Operator ceilings for the astrid:http host (global; absent `[http]`
+    // config = the host's historical constants). Forwarded to every capsule.
+    let http_limits = resolve_http_limits(unified_cfg.as_ref());
+    let kernel = astrid_kernel::Kernel::new(
+        session_id.clone(),
+        ws,
+        runtime_limits,
+        local_egress,
+        http_limits,
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("Failed to boot Kernel: {e}"))?;
 
     // In ephemeral mode, shut down immediately when the last client disconnects.
     if args.ephemeral {

@@ -241,16 +241,19 @@ fn redirect_blocks_ip_literal_targets() {
     // Redirect SSRF: a 302 Location pointing at an IP literal never
     // reaches the resolver, so the policy must block it per hop.
     assert_eq!(
-        classify_redirect(Some("127.0.0.1"), 0),
-        RedirectAction::Block
-    );
-    assert_eq!(classify_redirect(Some("[::1]"), 0), RedirectAction::Block);
-    assert_eq!(
-        classify_redirect(Some("169.254.169.254"), 0),
+        classify_redirect(Some("127.0.0.1"), 0, MAX_HTTP_REDIRECTS),
         RedirectAction::Block
     );
     assert_eq!(
-        classify_redirect(Some("10.0.0.5"), 2),
+        classify_redirect(Some("[::1]"), 0, MAX_HTTP_REDIRECTS),
+        RedirectAction::Block
+    );
+    assert_eq!(
+        classify_redirect(Some("169.254.169.254"), 0, MAX_HTTP_REDIRECTS),
+        RedirectAction::Block
+    );
+    assert_eq!(
+        classify_redirect(Some("10.0.0.5"), 2, MAX_HTTP_REDIRECTS),
         RedirectAction::Block
     );
 }
@@ -260,17 +263,36 @@ fn redirect_follows_safe_targets_within_cap() {
     // Hostnames are airlocked by the resolver, public literals are
     // safe; both follow until the hop cap.
     assert_eq!(
-        classify_redirect(Some("example.com"), 0),
+        classify_redirect(Some("example.com"), 0, MAX_HTTP_REDIRECTS),
         RedirectAction::Follow
     );
     assert_eq!(
-        classify_redirect(Some("8.8.8.8"), 0),
+        classify_redirect(Some("8.8.8.8"), 0, MAX_HTTP_REDIRECTS),
         RedirectAction::Follow
     );
-    assert_eq!(classify_redirect(None, 0), RedirectAction::Follow);
     assert_eq!(
-        classify_redirect(Some("example.com"), MAX_HTTP_REDIRECTS),
+        classify_redirect(None, 0, MAX_HTTP_REDIRECTS),
+        RedirectAction::Follow
+    );
+    assert_eq!(
+        classify_redirect(Some("example.com"), MAX_HTTP_REDIRECTS, MAX_HTTP_REDIRECTS),
         RedirectAction::Stop
+    );
+}
+
+/// A configured redirect ceiling BELOW the default stops following at the lower
+/// bound — proving `classify_redirect` honours the passed ceiling, not the const.
+#[test]
+fn redirect_honours_configured_ceiling() {
+    // 3 prior hops with a ceiling of 3 must Stop; with the default ceiling of
+    // 10 the same hop count still Follows.
+    assert_eq!(
+        classify_redirect(Some("example.com"), 3, 3),
+        RedirectAction::Stop
+    );
+    assert_eq!(
+        classify_redirect(Some("example.com"), 3, MAX_HTTP_REDIRECTS),
+        RedirectAction::Follow
     );
 }
 
@@ -518,10 +540,11 @@ mod e2e {
         state.security = Some(Arc::new(AllowAllGate));
         state.local_egress = vec![format!("127.0.0.1:{}", addr.port())];
 
+        let limits = state.http_limits;
         let resp = state
             .http_request_backend(
                 get_request(format!("http://{addr}/")),
-                super::super::options::ResolvedOptions::from_options(follow_opts()),
+                super::super::options::ResolvedOptions::from_options(follow_opts(), &limits),
             )
             .await
             .expect("exempt 302 should be returned, not followed");
@@ -551,10 +574,11 @@ mod e2e {
         state.security = Some(Arc::new(AllowAllGate));
         state.local_egress = vec![format!("127.0.0.1:{}", addr.port())];
 
+        let limits = state.http_limits;
         let resource = state
             .http_stream_backend(
                 get_request(format!("http://{addr}/")),
-                super::super::options::ResolvedOptions::from_options(follow_opts()),
+                super::super::options::ResolvedOptions::from_options(follow_opts(), &limits),
             )
             .await
             .expect("exempt streaming 302 should open a stream, not follow");
@@ -582,10 +606,11 @@ mod e2e {
             needle: "denied.example".to_string(),
         }));
 
+        let limits = state.http_limits;
         let err = state
             .http_stream_backend(
                 get_request("https://denied.example.invalid/v1/stream".to_string()),
-                super::super::options::ResolvedOptions::from_options(follow_opts()),
+                super::super::options::ResolvedOptions::from_options(follow_opts(), &limits),
             )
             .await
             .expect_err("the gate must deny this host on the streaming path");
@@ -605,10 +630,16 @@ mod v11 {
     use reqwest::header::{HeaderMap, HeaderValue};
 
     use super::super::options::{
-        HTTP_DEFAULT_TOTAL_TIMEOUT, ResolvedOptions, check_scheme, same_origin, strip_credentials,
-        verify_integrity,
+        ResolvedOptions, check_scheme, same_origin, strip_credentials, verify_integrity,
     };
     use super::super::{ErrorCode, RedirectPolicy, RequestOptions, TimeoutConfig};
+    use crate::engine::wasm::limits::HttpLimits;
+
+    /// Default host limits (the historical constants) for option-resolution
+    /// tests — the path that resolves against config-supplied limits.
+    fn limits() -> HttpLimits {
+        HttpLimits::default()
+    }
 
     fn empty_options() -> RequestOptions {
         RequestOptions {
@@ -629,10 +660,11 @@ mod v11 {
     /// @1.0.0 shim delegating to the @1.1.0 backend.
     #[test]
     fn empty_options_reproduce_v10_defaults() {
-        let resolved = ResolvedOptions::from_options(empty_options());
-        let defaults = ResolvedOptions::v10_defaults();
+        let limits = limits();
+        let resolved = ResolvedOptions::from_options(empty_options(), &limits);
+        let defaults = ResolvedOptions::v10_defaults(&limits);
 
-        assert_eq!(resolved.total_timeout, Some(HTTP_DEFAULT_TOTAL_TIMEOUT));
+        assert_eq!(resolved.total_timeout, Some(limits.default_total_timeout));
         assert_eq!(resolved.connect_timeout, None);
         assert_eq!(resolved.between_bytes_timeout, None);
         assert!(matches!(resolved.redirect, RedirectPolicy::Follow));
@@ -665,7 +697,7 @@ mod v11 {
             https_only: Some(true),
             integrity: Some("sha256-abc".to_string()),
         };
-        let r = ResolvedOptions::from_options(opts);
+        let r = ResolvedOptions::from_options(opts, &limits());
         assert_eq!(r.connect_timeout, Some(Duration::from_millis(1_000)));
         assert_eq!(r.first_byte_timeout, Some(Duration::from_millis(2_000)));
         assert_eq!(r.between_bytes_timeout, Some(Duration::from_millis(3_000)));
@@ -778,6 +810,49 @@ mod v11 {
             headers.contains_key("x-keep"),
             "non-credential headers must survive a cross-origin hop"
         );
+    }
+
+    /// A NON-default operator `default_total_timeout` actually changes the
+    /// resolved default total timeout (proves the config knob threads through
+    /// `v10_defaults`, not the old hardcoded 30s constant).
+    #[test]
+    fn config_default_timeout_changes_resolved_total() {
+        let mut limits = HttpLimits::default();
+        limits.default_total_timeout = Duration::from_secs(5);
+
+        let resolved = ResolvedOptions::from_options(empty_options(), &limits);
+        assert_eq!(
+            resolved.total_timeout,
+            Some(Duration::from_secs(5)),
+            "the configured default total timeout must drive the resolved default"
+        );
+        assert!(
+            resolved.total_was_default(),
+            "an unset caller total still counts as the host default"
+        );
+    }
+
+    /// A NON-default (lower) operator `max_redirects` ceiling clamps a caller
+    /// who requests MORE — proving the clamp uses the configured ceiling, not
+    /// the const. With ceiling 3, a caller asking for 9 resolves to 3.
+    #[test]
+    fn config_max_redirects_ceiling_clamps_caller() {
+        let mut limits = HttpLimits::default();
+        limits.max_redirects = 3;
+
+        let opts = RequestOptions {
+            max_redirects: Some(9),
+            ..empty_options()
+        };
+        let resolved = ResolvedOptions::from_options(opts, &limits);
+        assert_eq!(
+            resolved.max_redirects, 3,
+            "a caller cannot exceed the configured (lower) redirect ceiling"
+        );
+
+        // The default (unset) also takes the configured ceiling, not the const.
+        let d = ResolvedOptions::from_options(empty_options(), &limits);
+        assert_eq!(d.max_redirects, 3);
     }
 }
 

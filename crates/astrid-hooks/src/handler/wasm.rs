@@ -345,6 +345,9 @@ impl WasmHandler {
             // capabilities and no local-egress exemptions (both fail-closed).
             capability_names: Vec::new(),
             local_egress: Vec::new(),
+            // Hooks aren't handed the resolved `[http]` config; use the host's
+            // historical default ceilings (the airlock applies in full either way).
+            http_limits: astrid_capsule::HttpLimits::default(),
             // Transient hook execution never subscribes to the audit feed;
             // fail-secure to scoped.
             audit_firehose: false,

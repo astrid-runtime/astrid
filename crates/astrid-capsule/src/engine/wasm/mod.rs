@@ -235,6 +235,12 @@ pub struct WasmEngine {
     /// `blocking_semaphore` / `io_semaphore` at load time. `Default` (all
     /// host-derived) in tests.
     runtime_limits: limits::CapsuleRuntimeLimits,
+    /// Resolved operator ceilings for the `astrid:http` host. A GLOBAL value
+    /// (same for every capsule), resolved once by the daemon from the `[http]`
+    /// config section and handed down the loader chain like `runtime_limits`;
+    /// snapshotted onto every pooled `HostState` at load. `Default` (the host's
+    /// historical constants) in tests.
+    http_limits: limits::HttpLimits,
 }
 
 impl WasmEngine {
@@ -253,6 +259,12 @@ impl WasmEngine {
     /// ceiling pair the daemon resolves once and hands to every engine; pass
     /// [`CapsuleRuntimeLimits::default`](limits::CapsuleRuntimeLimits::default)
     /// for all-host-derived sizing in tests.
+    ///
+    /// `http_limits` is the resolved `astrid:http` host ceilings (timeouts,
+    /// redirect/stream caps, buffered-body limit) from the `[http]` config
+    /// section — a global value, the same for every engine; pass
+    /// [`HttpLimits::default`](limits::HttpLimits::default) for the host's
+    /// historical constants in tests.
     pub fn new(
         manifest: CapsuleManifest,
         capsule_dir: PathBuf,
@@ -260,6 +272,7 @@ impl WasmEngine {
         fuel_rate: crate::FuelRateLimiter,
         memory_ledger: crate::MemoryLedger,
         runtime_limits: limits::CapsuleRuntimeLimits,
+        http_limits: limits::HttpLimits,
     ) -> Self {
         Self {
             manifest,
@@ -279,6 +292,7 @@ impl WasmEngine {
             fuel_rate,
             group_config: None,
             runtime_limits,
+            http_limits,
         }
     }
 }
@@ -1203,6 +1217,10 @@ impl ExecutionEngine for WasmEngine {
             // snapshotted from the load context onto every pooled instance
             // (load-time-fixed, like `capability_names`).
             let local_egress = ctx.local_egress.clone();
+            // Resolved `astrid:http` host ceilings — a GLOBAL Copy value (same
+            // for every capsule), captured by the `make_state` move closure and
+            // snapshotted onto every pooled instance like `local_egress`.
+            let http_limits = self.http_limits;
             // One IPC rate limiter shared by every pooled instance, so the
             // per-capsule throughput budget is not multiplied by pool size.
             let ipc_limiter = Arc::new(astrid_events::ipc::IpcRateLimiter::new());
@@ -1389,6 +1407,7 @@ impl ExecutionEngine for WasmEngine {
                 has_uplink_capability: has_uplink,
                 capability_names: capability_names.clone(),
                 local_egress: local_egress.clone(),
+                http_limits,
                 audit_firehose,
                 inbound_tx: tx.clone(),
                 registered_uplinks: Vec::new(),
@@ -2418,6 +2437,10 @@ pub async fn run_lifecycle(
         // Lifecycle (install/upgrade) hooks run briefly and do not carry a
         // local-egress exemption; the SSRF airlock applies in full.
         local_egress: Vec::new(),
+        // Lifecycle hooks aren't handed the resolved `[http]` config (it isn't
+        // plumbed into `LifecycleConfig`); use the host's historical default
+        // ceilings. They share the same airlock; only the tunable limits differ.
+        http_limits: limits::HttpLimits::default(),
         // Lifecycle hooks never subscribe to the audit feed; fail-secure.
         audit_firehose: false,
         inbound_tx: None,

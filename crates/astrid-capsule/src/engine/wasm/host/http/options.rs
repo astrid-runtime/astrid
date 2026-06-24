@@ -9,13 +9,9 @@ use reqwest::header::HeaderMap;
 use sha2::{Digest, Sha256, Sha384, Sha512};
 
 use crate::engine::wasm::host::util;
+use crate::engine::wasm::limits::HttpLimits;
 
-use super::ssrf::MAX_HTTP_REDIRECTS;
 use super::{ErrorCode, RedirectPolicy, RequestOptions, TimeoutConfig};
-
-/// Host default whole-request timeout for the buffered path when the caller
-/// sets no `total-ms`. Matches the `@1.0.0` 30s behaviour.
-pub(super) const HTTP_DEFAULT_TOTAL_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Host-resolved view of `request-options`: caller fields with host defaults
 /// already applied. Threaded through the shared backend so `http_request`
@@ -39,33 +35,48 @@ pub(super) struct ResolvedOptions {
     pub(super) auto_decompress: bool,
     pub(super) https_only: bool,
     pub(super) integrity: Option<String>,
+    /// True while `total_timeout` still holds the host default (the caller set
+    /// no `total-ms`). The streaming path clears the default total so a
+    /// long-lived stream isn't cut at the buffered default; an explicit caller
+    /// total is kept. Tracked as a flag rather than comparing against the
+    /// default `Duration` so an operator-configured default cannot collide with
+    /// a caller who explicitly passes the same value.
+    total_is_host_default: bool,
 }
 
 impl ResolvedOptions {
-    /// The `@1.0.0`-equivalent defaults: follow redirects ≤10, host default
-    /// timeouts, 10 MB body cap, auto-decompress on, no https-only, no SRI.
-    pub(super) fn v10_defaults() -> Self {
+    /// The `@1.0.0`-equivalent defaults, read off the resolved [`HttpLimits`]:
+    /// follow redirects ≤ `limits.max_redirects`, the host default total
+    /// timeout, the host buffered-body cap, auto-decompress on, no https-only,
+    /// no SRI. With [`HttpLimits::default`] this reproduces the historical
+    /// constants (≤10 redirects, 30s, 10 MiB) exactly.
+    pub(super) fn v10_defaults(limits: &HttpLimits) -> Self {
         Self {
             connect_timeout: None,
-            total_timeout: Some(HTTP_DEFAULT_TOTAL_TIMEOUT),
+            total_timeout: Some(limits.default_total_timeout),
             between_bytes_timeout: None,
             first_byte_timeout: None,
             redirect: RedirectPolicy::Follow,
-            max_redirects: MAX_HTTP_REDIRECTS,
-            max_response_bytes: util::MAX_GUEST_PAYLOAD_LEN,
+            max_redirects: limits.max_redirects,
+            // The configured/default buffered cap, itself clamped to the
+            // absolute host payload limit so config can only LOWER it.
+            max_response_bytes: limits.max_response_bytes.min(util::MAX_GUEST_PAYLOAD_LEN),
             max_decompressed_bytes: None,
             auto_decompress: true,
             https_only: false,
             integrity: None,
+            total_is_host_default: true,
         }
     }
 
-    /// Resolve caller `request-options` against host defaults. `none` per field
-    /// keeps the `@1.0.0`-equivalent default. The `max_response_bytes` value is
-    /// always clamped to the hard `MAX_GUEST_PAYLOAD_LEN` ceiling — a caller
-    /// cannot raise the buffered cap above the host limit.
-    pub(super) fn from_options(opts: RequestOptions) -> Self {
-        let mut resolved = Self::v10_defaults();
+    /// Resolve caller `request-options` against the host [`HttpLimits`]. `none`
+    /// per field keeps the host default. The `max_redirects` and
+    /// `max_response_bytes` values are clamped DOWN to the host ceiling — a
+    /// caller can only tighten them, never raise them above the operator limit
+    /// (and `max_response_bytes` is additionally clamped to the absolute
+    /// `MAX_GUEST_PAYLOAD_LEN` host payload limit).
+    pub(super) fn from_options(opts: RequestOptions, limits: &HttpLimits) -> Self {
+        let mut resolved = Self::v10_defaults(limits);
 
         if let Some(t) = opts.timeouts {
             let TimeoutConfig {
@@ -87,6 +98,7 @@ impl ResolvedOptions {
             // it (and may be longer for big downloads).
             if let Some(ms) = total_ms {
                 resolved.total_timeout = Some(Duration::from_millis(ms));
+                resolved.total_is_host_default = false;
             }
         }
 
@@ -95,10 +107,12 @@ impl ResolvedOptions {
         }
         if let Some(n) = opts.max_redirects {
             // Caller may request fewer hops, never more than the host ceiling.
-            resolved.max_redirects = (n as usize).min(MAX_HTTP_REDIRECTS);
+            resolved.max_redirects = (n as usize).min(limits.max_redirects);
         }
         if let Some(n) = opts.max_response_bytes {
-            resolved.max_response_bytes = n.min(util::MAX_GUEST_PAYLOAD_LEN);
+            // Caller may request a smaller cap, never larger than the host
+            // ceiling — which is itself bounded by the absolute payload limit.
+            resolved.max_response_bytes = n.min(resolved.max_response_bytes);
         }
         resolved.max_decompressed_bytes = opts.max_decompressed_bytes;
         if let Some(b) = opts.auto_decompress {
@@ -112,12 +126,12 @@ impl ResolvedOptions {
         resolved
     }
 
-    /// True if the caller left `total-ms` unset (so the resolved value is the
-    /// `@1.0.0` 30s default). The streaming path clears the default total
-    /// timeout so a long-lived stream isn't cut at 30s; an explicit caller
+    /// True if the caller left `total-ms` unset (so the resolved total is the
+    /// host default). The streaming path clears the default total timeout so a
+    /// long-lived stream isn't cut at the buffered default; an explicit caller
     /// total is kept.
     pub(super) fn total_was_default(&self) -> bool {
-        self.total_timeout == Some(HTTP_DEFAULT_TOTAL_TIMEOUT)
+        self.total_is_host_default
     }
 }
 

@@ -83,6 +83,7 @@ fn default_loader() -> CapsuleLoader {
         astrid_capsule::FuelRateLimiter::default(),
         astrid_capsule::MemoryLedger::default(),
         astrid_capsule::CapsuleRuntimeLimits::default(),
+        astrid_capsule::HttpLimits::default(),
     )
 }
 
