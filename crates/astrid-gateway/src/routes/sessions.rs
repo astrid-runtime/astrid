@@ -1,7 +1,9 @@
-//! `GET /api/agent/sessions` + `GET /api/agent/sessions/{id}/messages` —
-//! expose a principal's conversation threads over HTTP.
+//! `GET /api/agent/sessions` (+ `/{id}`, `/{id}/messages`),
+//! `PATCH`/`DELETE /api/agent/sessions/{id}`, and
+//! `GET /api/agent/sessions/search` — expose and manage a principal's
+//! conversation threads over HTTP.
 //!
-//! Both routes proxy to the `capsule-session` capsule over the
+//! Every route proxies to the `capsule-session` capsule over the
 //! in-process event bus, mirroring the request/reply-over-bus shape
 //! `bus_admin.rs` uses for kernel admin ops but targeting capsule
 //! topics instead. The gateway:
@@ -87,6 +89,33 @@ const TOPIC_MESSAGES_REQUEST: &str = "session.v1.request.get_messages";
 /// `"{TOPIC_MESSAGES_RESPONSE_PREFIX}.{correlation_id}"`.
 const TOPIC_MESSAGES_RESPONSE_PREFIX: &str = "session.v1.response.get_messages";
 
+/// Request topic for one thread's metadata. 1.1 verb (its presence in a
+/// loaded capsule is implied by [`ensure_list_supported`]'s `list` probe —
+/// a 1.1 session capsule that handles `list` also handles `get_meta`).
+const TOPIC_GET_META_REQUEST: &str = "session.v1.request.get_meta";
+/// Response-topic prefix for a `get_meta` reply.
+const TOPIC_GET_META_RESPONSE_PREFIX: &str = "session.v1.response.get_meta";
+
+/// Request topic for a metadata update (`title`/`archived`/`meta` PATCH).
+const TOPIC_UPDATE_REQUEST: &str = "session.v1.request.update";
+/// Response-topic prefix for an `update` reply.
+const TOPIC_UPDATE_RESPONSE_PREFIX: &str = "session.v1.response.update";
+
+/// Request topic for a thread delete.
+const TOPIC_DELETE_REQUEST: &str = "session.v1.request.delete";
+/// Response-topic prefix for a `delete` reply.
+const TOPIC_DELETE_RESPONSE_PREFIX: &str = "session.v1.response.delete";
+
+/// Request topic for a full-text thread search.
+const TOPIC_SEARCH_REQUEST: &str = "session.v1.request.search";
+/// Response-topic prefix for a `search` reply.
+const TOPIC_SEARCH_RESPONSE_PREFIX: &str = "session.v1.response.search";
+
+/// Default page size for `search` when the caller omits `limit`.
+const DEFAULT_SEARCH_LIMIT: u32 = 20;
+/// Hard upper bound on the `search` page size.
+const MAX_SEARCH_LIMIT: u32 = 100;
+
 /// Query parameters for `GET /api/agent/sessions`. Both optional —
 /// the default is "the most recent [`DEFAULT_LIMIT`] threads".
 #[derive(Debug, Clone, Default, Deserialize, ToSchema)]
@@ -110,19 +139,37 @@ pub struct SessionSummary {
     /// Thread identifier. `"default"` for the implicit unnamed thread;
     /// otherwise the session id the agent loop minted.
     pub session_id: String,
+    /// Human-set thread title, or `null` when unset (the client renders a
+    /// preview-derived label in that case).
+    #[serde(default)]
+    pub title: Option<String>,
+    /// First user message, truncated by the capsule for a list preview,
+    /// or `null` when the thread has no user message yet.
+    #[serde(default)]
+    pub preview: Option<String>,
+    /// Most recent message, truncated for a list preview, or `null`.
+    #[serde(default)]
+    pub last_message_preview: Option<String>,
     /// Number of messages in the thread.
     pub message_count: u32,
     /// Unix epoch (seconds) the thread was created, or `null` when the
     /// capsule has no creation timestamp recorded for it.
+    #[serde(default)]
     pub created_at: Option<i64>,
     /// Unix epoch (seconds) of the most recent message, or `null`.
+    #[serde(default)]
     pub updated_at: Option<i64>,
+    /// Whether the thread is archived (hidden from the default list).
+    #[serde(default)]
+    pub archived: bool,
     /// Parent thread id when this thread was forked from another, else
     /// `null`.
+    #[serde(default)]
     pub parent_session_id: Option<String>,
-    /// First user message, truncated by the capsule for a list preview,
-    /// or `null` when the thread has no user message yet.
-    pub preview: Option<String>,
+    /// Opaque capsule-owned metadata, serialized as a JSON **string** (the
+    /// gateway never parses it — it is round-tripped verbatim).
+    #[serde(default)]
+    pub meta: Option<String>,
 }
 
 /// Response shape for `GET /api/agent/sessions`.
@@ -154,6 +201,83 @@ pub struct TranscriptResponse {
     /// The thread's messages, in order, as opaque JSON values.
     #[schema(value_type = Vec<Object>)]
     pub messages: Vec<Value>,
+}
+
+/// Body for `PATCH /api/agent/sessions/{id}`. Every field is optional;
+/// **only the keys actually present in the request body are forwarded**
+/// to the capsule, so the capsule's PATCH-by-presence semantics hold:
+/// an absent key leaves that field unchanged, a present key sets it, and
+/// an empty string clears it. We capture the raw body as
+/// [`serde_json::Value`] (not this struct) for the present-key detection;
+/// this typed view exists only to document the shape in `OpenAPI`.
+#[derive(Debug, Clone, Default, Deserialize, ToSchema)]
+pub struct SessionUpdateRequest {
+    /// New title. Present-and-`""` clears it; absent leaves it unchanged.
+    #[serde(default)]
+    pub title: Option<String>,
+    /// New archived flag.
+    #[serde(default)]
+    pub archived: Option<bool>,
+    /// New opaque metadata (a JSON string the gateway never parses).
+    /// Present-and-`""` clears it; absent leaves it unchanged.
+    #[serde(default)]
+    pub meta: Option<String>,
+}
+
+/// Response shape for `DELETE /api/agent/sessions/{id}`.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct DeleteResponse {
+    /// `true` when the caller's own thread existed and was removed;
+    /// `false` when there was nothing to delete. Not a 404 — the read is
+    /// principal-scoped, so reporting whether the caller's *own* thread
+    /// existed leaks nothing about anyone else.
+    pub deleted: bool,
+}
+
+/// Query parameters for `GET /api/agent/sessions/search`.
+#[derive(Debug, Clone, Default, Deserialize, ToSchema)]
+pub struct SearchQuery {
+    /// Full-text query. Required — an empty/whitespace `q` is a 400.
+    pub q: String,
+    /// Page size, default [`DEFAULT_SEARCH_LIMIT`], capped at
+    /// [`MAX_SEARCH_LIMIT`]. `0`/absent → default.
+    #[serde(default)]
+    pub limit: Option<u32>,
+    /// Opaque cursor from a previous search page.
+    #[serde(default)]
+    pub cursor: Option<String>,
+    /// Whether archived threads are included in the results.
+    #[serde(default)]
+    pub include_archived: Option<bool>,
+}
+
+/// One search hit, mirroring the frozen `session.v1.response.search`
+/// element shape.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct SearchResult {
+    /// The matching thread's id.
+    pub session_id: String,
+    /// The thread's title, or `null`.
+    #[serde(default)]
+    pub title: Option<String>,
+    /// A snippet around the match, or `null`.
+    #[serde(default)]
+    pub snippet: Option<String>,
+    /// Number of matches within the thread.
+    pub match_count: u32,
+    /// Unix epoch (seconds) of the thread's most recent message, or `null`.
+    #[serde(default)]
+    pub updated_at: Option<i64>,
+}
+
+/// Response shape for `GET /api/agent/sessions/search`.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct SearchResponse {
+    /// The page of hits.
+    pub results: Vec<SearchResult>,
+    /// Opaque cursor for the next page, or `null` on the last page.
+    #[serde(default)]
+    pub next_cursor: Option<String>,
 }
 
 /// `GET /api/agent/sessions` — list the caller's conversation threads.
@@ -272,6 +396,251 @@ pub async fn get_session_messages(
     }))
 }
 
+/// `GET /api/agent/sessions/{id}` — one thread's metadata.
+///
+/// Principal-scoped via the stamp. A thread that the caller's principal
+/// does not own (or that does not exist) yields a **404**: the capsule
+/// replies with a `null` `session`, and a null is mapped to `NotFound`.
+/// This does NOT leak cross-principal existence — the kernel scopes the
+/// capsule's read to the caller, so "null" means "not in *your* namespace",
+/// never "exists for someone else".
+#[utoipa::path(
+    get,
+    path = "/api/agent/sessions/{id}",
+    tag = "agent",
+    params(
+        ("id" = String, Path, description = "Thread id. Non-empty, ≤256 chars, no ASCII control characters."),
+    ),
+    responses(
+        (status = 200, body = SessionSummary, description = "The thread's metadata."),
+        (status = 400, body = ErrorBody, description = "Invalid `id`."),
+        (status = 401, body = ErrorBody, description = "Missing / invalid bearer."),
+        (status = 404, body = ErrorBody, description = "No such thread in the caller's namespace."),
+        (status = 500, body = ErrorBody, description = "Gateway not wired to a live event bus."),
+        (status = 501, body = ErrorBody, description = "No loaded session capsule implements the 1.1 `get_meta` verb."),
+        (status = 502, body = ErrorBody, description = "Session capsule did not reply within the timeout, or returned an unexpected shape."),
+    )
+)]
+pub async fn get_session(
+    State(state): State<Arc<GatewayState>>,
+    Path(id): Path<String>,
+    req: Request<axum::body::Body>,
+) -> GatewayResult<Json<SessionSummary>> {
+    let caller = caller_from(&req)?;
+    metrics::counter!("astrid_gateway_agent_sessions_get_meta_total").increment(1);
+
+    validate_session_id(&id)?;
+    // `get_meta` is a 1.1 verb, so gate it like update/delete/search: a
+    // pre-1.1 capsule answers an honest 501 rather than hanging to the bus
+    // timeout. (The transcript route needs no gate — `get_messages` is 1.0.)
+    ensure_list_supported(&state).await?;
+    let bus = require_bus(&state)?;
+    let correlation_id = Uuid::new_v4().to_string();
+    let payload = serde_json::json!({
+        "correlation_id": correlation_id,
+        "session_id": id,
+    });
+    let response_topic = format!("{TOPIC_GET_META_RESPONSE_PREFIX}.{correlation_id}");
+
+    let value = request_capsule(
+        &bus,
+        TOPIC_GET_META_REQUEST,
+        &response_topic,
+        payload,
+        &correlation_id,
+        &caller.principal,
+        caller.device_key_id.as_deref(),
+        CAPSULE_TIMEOUT,
+    )
+    .await?;
+
+    let summary = parse_session_field(&value)?.ok_or(GatewayError::NotFound)?;
+    Ok(Json(summary))
+}
+
+/// `PATCH /api/agent/sessions/{id}` — update a thread's metadata.
+///
+/// PATCH-by-presence: only the keys the client actually sent are
+/// forwarded to the capsule, so an absent key leaves the field unchanged,
+/// a present key sets it, and `""` clears it (the capsule owns that
+/// semantics; the gateway only decides *which keys to forward*). Gated on
+/// a 1.1 session capsule via [`ensure_list_supported`]. A `null` `session`
+/// in the reply (thread not in the caller's namespace) is a **404**.
+#[utoipa::path(
+    patch,
+    path = "/api/agent/sessions/{id}",
+    tag = "agent",
+    request_body = SessionUpdateRequest,
+    params(
+        ("id" = String, Path, description = "Thread id. Non-empty, ≤256 chars, no ASCII control characters."),
+    ),
+    responses(
+        (status = 200, body = SessionSummary, description = "The updated thread metadata."),
+        (status = 400, body = ErrorBody, description = "Invalid `id` or malformed body."),
+        (status = 401, body = ErrorBody, description = "Missing / invalid bearer."),
+        (status = 404, body = ErrorBody, description = "No such thread in the caller's namespace."),
+        (status = 500, body = ErrorBody, description = "Gateway not wired to a live event bus."),
+        (status = 501, body = ErrorBody, description = "No loaded session capsule implements the 1.1 verbs."),
+        (status = 502, body = ErrorBody, description = "Session capsule did not reply within the timeout, or returned an unexpected shape."),
+    )
+)]
+pub async fn update_session(
+    State(state): State<Arc<GatewayState>>,
+    Path(id): Path<String>,
+    req: Request<axum::body::Body>,
+) -> GatewayResult<Json<SessionSummary>> {
+    // Clone the principal/device floor before `read_json_body` consumes
+    // `req` (which `caller_from` borrows), exactly as `models.rs` does.
+    let caller = caller_from(&req)?;
+    let principal = caller.principal.clone();
+    let device_key_id = caller.device_key_id.clone();
+    metrics::counter!("astrid_gateway_agent_sessions_update_total").increment(1);
+
+    validate_session_id(&id)?;
+    ensure_list_supported(&state).await?;
+    let bus = require_bus(&state)?;
+
+    // Read the body as a raw JSON object so we can forward ONLY the keys
+    // the client actually sent. A typed struct would round-trip absent
+    // fields as `null`, collapsing "unchanged" into "clear".
+    let body: Value = crate::routes::principals::read_json_body(req).await?;
+    let correlation_id = Uuid::new_v4().to_string();
+    let payload = build_update_payload(&correlation_id, &id, &body)?;
+    let response_topic = format!("{TOPIC_UPDATE_RESPONSE_PREFIX}.{correlation_id}");
+
+    let value = request_capsule(
+        &bus,
+        TOPIC_UPDATE_REQUEST,
+        &response_topic,
+        payload,
+        &correlation_id,
+        &principal,
+        device_key_id.as_deref(),
+        CAPSULE_TIMEOUT,
+    )
+    .await?;
+
+    let summary = parse_session_field(&value)?.ok_or(GatewayError::NotFound)?;
+    Ok(Json(summary))
+}
+
+/// `DELETE /api/agent/sessions/{id}` — delete a thread.
+///
+/// Returns `{ "deleted": bool }`. Deliberately does NOT 404 on
+/// `deleted:false`: the delete is principal-scoped, so reporting whether
+/// the caller's *own* thread existed is safe and is the more useful
+/// idempotent signal for a client. Gated on a 1.1 session capsule.
+#[utoipa::path(
+    delete,
+    path = "/api/agent/sessions/{id}",
+    tag = "agent",
+    params(
+        ("id" = String, Path, description = "Thread id. Non-empty, ≤256 chars, no ASCII control characters."),
+    ),
+    responses(
+        (status = 200, body = DeleteResponse, description = "`deleted` is `true` when the caller's thread existed and was removed."),
+        (status = 400, body = ErrorBody, description = "Invalid `id`."),
+        (status = 401, body = ErrorBody, description = "Missing / invalid bearer."),
+        (status = 500, body = ErrorBody, description = "Gateway not wired to a live event bus."),
+        (status = 501, body = ErrorBody, description = "No loaded session capsule implements the 1.1 verbs."),
+        (status = 502, body = ErrorBody, description = "Session capsule did not reply within the timeout, or returned an unexpected shape."),
+    )
+)]
+pub async fn delete_session(
+    State(state): State<Arc<GatewayState>>,
+    Path(id): Path<String>,
+    req: Request<axum::body::Body>,
+) -> GatewayResult<Json<DeleteResponse>> {
+    let caller = caller_from(&req)?;
+    metrics::counter!("astrid_gateway_agent_sessions_delete_total").increment(1);
+
+    validate_session_id(&id)?;
+    ensure_list_supported(&state).await?;
+    let bus = require_bus(&state)?;
+    let correlation_id = Uuid::new_v4().to_string();
+    let payload = serde_json::json!({
+        "correlation_id": correlation_id,
+        "session_id": id,
+    });
+    let response_topic = format!("{TOPIC_DELETE_RESPONSE_PREFIX}.{correlation_id}");
+
+    let value = request_capsule(
+        &bus,
+        TOPIC_DELETE_REQUEST,
+        &response_topic,
+        payload,
+        &correlation_id,
+        &caller.principal,
+        caller.device_key_id.as_deref(),
+        CAPSULE_TIMEOUT,
+    )
+    .await?;
+
+    Ok(Json(DeleteResponse {
+        deleted: parse_deleted_field(&value),
+    }))
+}
+
+/// `GET /api/agent/sessions/search` — full-text search the caller's threads.
+///
+/// Principal-scoped via the stamp. Gated on a 1.1 session capsule.
+#[utoipa::path(
+    get,
+    path = "/api/agent/sessions/search",
+    tag = "agent",
+    params(
+        ("q" = String, Query, description = "Full-text query (required, non-empty)."),
+        ("limit" = Option<u32>, Query, description = "Page size; default 20, max 100."),
+        ("cursor" = Option<String>, Query, description = "Opaque cursor from a previous page."),
+        ("include_archived" = Option<bool>, Query, description = "Include archived threads; default false."),
+    ),
+    responses(
+        (status = 200, body = SearchResponse, description = "A page of search hits."),
+        (status = 400, body = ErrorBody, description = "Empty `q` or `limit` > 100."),
+        (status = 401, body = ErrorBody, description = "Missing / invalid bearer."),
+        (status = 500, body = ErrorBody, description = "Gateway not wired to a live event bus."),
+        (status = 501, body = ErrorBody, description = "No loaded session capsule implements the 1.1 verbs."),
+        (status = 502, body = ErrorBody, description = "Session capsule did not reply within the timeout, or returned an unexpected shape."),
+    )
+)]
+pub async fn search_sessions(
+    State(state): State<Arc<GatewayState>>,
+    Query(query): Query<SearchQuery>,
+    req: Request<axum::body::Body>,
+) -> GatewayResult<Json<SearchResponse>> {
+    let caller = caller_from(&req)?;
+    metrics::counter!("astrid_gateway_agent_sessions_search_total").increment(1);
+
+    let q = validate_search_query(&query.q)?;
+    let limit = resolve_search_limit(query.limit)?;
+    ensure_list_supported(&state).await?;
+    let bus = require_bus(&state)?;
+    let correlation_id = Uuid::new_v4().to_string();
+    let payload = build_search_payload(
+        &correlation_id,
+        q,
+        limit,
+        query.cursor.as_deref(),
+        query.include_archived.unwrap_or(false),
+    );
+    let response_topic = format!("{TOPIC_SEARCH_RESPONSE_PREFIX}.{correlation_id}");
+
+    let value = request_capsule(
+        &bus,
+        TOPIC_SEARCH_REQUEST,
+        &response_topic,
+        payload,
+        &correlation_id,
+        &caller.principal,
+        caller.device_key_id.as_deref(),
+        CAPSULE_TIMEOUT,
+    )
+    .await?;
+
+    let parsed = parse_search_response(value)?;
+    Ok(Json(parsed))
+}
+
 /// Pull the live event bus out of state, or fail with a 500 the same
 /// way `agent.rs` does when the gateway isn't co-located with a daemon.
 fn require_bus(state: &GatewayState) -> GatewayResult<Arc<EventBus>> {
@@ -388,6 +757,120 @@ fn parse_messages_response(value: &Value) -> GatewayResult<Vec<Value>> {
             "session capsule returned a non-array `messages` field".into(),
         )),
     }
+}
+
+/// Validate + normalise a `search` query string. An empty/whitespace
+/// query is a client error; otherwise the trimmed query is returned.
+fn validate_search_query(q: &str) -> GatewayResult<&str> {
+    let trimmed = q.trim();
+    if trimmed.is_empty() {
+        return Err(GatewayError::BadRequest(
+            "search query `q` must not be empty".into(),
+        ));
+    }
+    Ok(trimmed)
+}
+
+/// Resolve the effective search page size: reject over [`MAX_SEARCH_LIMIT`];
+/// treat `0`/absent as [`DEFAULT_SEARCH_LIMIT`].
+fn resolve_search_limit(limit: Option<u32>) -> GatewayResult<u32> {
+    match limit {
+        Some(l) if l > MAX_SEARCH_LIMIT => Err(GatewayError::BadRequest(format!(
+            "limit {l} exceeds the search cap of {MAX_SEARCH_LIMIT}"
+        ))),
+        Some(0) | None => Ok(DEFAULT_SEARCH_LIMIT),
+        Some(l) => Ok(l),
+    }
+}
+
+/// Build the `session.v1.request.update` payload, forwarding ONLY the keys
+/// the client actually sent so the capsule's PATCH-by-presence works.
+///
+/// The raw body MUST be a JSON object (a non-object body is a 400). We
+/// walk the three recognised keys (`title`, `archived`, `meta`) and copy
+/// each into the outbound payload **iff it is present in the body** —
+/// preserving an explicit `""` (clear) and an explicit `null` distinct
+/// from absence. Unknown keys are ignored (the gateway forwards a clean,
+/// minimal patch, never the client's whole object — so a client can't
+/// smuggle e.g. `session_id` or another principal's field into the
+/// capsule's update). `correlation_id` and `session_id` are always set by
+/// the gateway, never taken from the body.
+fn build_update_payload(
+    correlation_id: &str,
+    session_id: &str,
+    body: &Value,
+) -> GatewayResult<Value> {
+    let obj = body
+        .as_object()
+        .ok_or_else(|| GatewayError::BadRequest("update body must be a JSON object".into()))?;
+    let mut out = serde_json::Map::new();
+    out.insert(
+        "correlation_id".into(),
+        Value::String(correlation_id.into()),
+    );
+    out.insert("session_id".into(), Value::String(session_id.into()));
+    for key in ["title", "archived", "meta"] {
+        if let Some(v) = obj.get(key) {
+            out.insert(key.into(), v.clone());
+        }
+    }
+    Ok(Value::Object(out))
+}
+
+/// Build the `session.v1.request.search` payload to the frozen contract.
+fn build_search_payload(
+    correlation_id: &str,
+    query: &str,
+    limit: u32,
+    cursor: Option<&str>,
+    include_archived: bool,
+) -> Value {
+    serde_json::json!({
+        "correlation_id": correlation_id,
+        "query": query,
+        "limit": limit,
+        "cursor": cursor,
+        "include_archived": include_archived,
+    })
+}
+
+/// Extract and type-check the `session` field from a `get_meta` / `update`
+/// reply. The frozen contract is `{ correlation_id, session: SUMMARY|null }`:
+///
+/// * `null` (or absent) → `Ok(None)` — the handler maps this to a 404.
+/// * a present object → deserialize into [`SessionSummary`]; a shape the
+///   capsule never agreed to is a `Kernel`-class upstream error.
+fn parse_session_field(value: &Value) -> GatewayResult<Option<SessionSummary>> {
+    match value.get("session") {
+        None | Some(Value::Null) => Ok(None),
+        Some(session) => serde_json::from_value(session.clone())
+            .map(Some)
+            .map_err(|e| {
+                GatewayError::Kernel(format!(
+                    "session capsule returned an unexpected session shape: {e}"
+                ))
+            }),
+    }
+}
+
+/// Extract the `deleted` boolean from a `delete` reply. A missing /
+/// non-boolean field is treated as `false` — the delete is principal-scoped
+/// and idempotent, so the worst case is reporting "nothing deleted", which
+/// is exactly the no-op outcome and never a security leak.
+fn parse_deleted_field(value: &Value) -> bool {
+    value
+        .get("deleted")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
+/// Deserialize a `session.v1.response.search` body into the typed response.
+fn parse_search_response(value: Value) -> GatewayResult<SearchResponse> {
+    serde_json::from_value(value).map_err(|e| {
+        GatewayError::Kernel(format!(
+            "session capsule returned an unexpected search shape: {e}"
+        ))
+    })
 }
 
 /// Reusable capsule request/reply-over-bus primitive.
@@ -743,6 +1226,342 @@ mod tests {
         let parsed = parse_list_response(value).expect("reply deserializes");
         assert!(parsed.sessions.is_empty());
         assert!(parsed.next_cursor.is_none());
+    }
+
+    #[test]
+    fn resolve_search_limit_defaults_and_caps() {
+        assert_eq!(resolve_search_limit(None).unwrap(), DEFAULT_SEARCH_LIMIT);
+        assert_eq!(resolve_search_limit(Some(0)).unwrap(), DEFAULT_SEARCH_LIMIT);
+        assert_eq!(resolve_search_limit(Some(50)).unwrap(), 50);
+        assert_eq!(
+            resolve_search_limit(Some(MAX_SEARCH_LIMIT)).unwrap(),
+            MAX_SEARCH_LIMIT
+        );
+        assert!(matches!(
+            resolve_search_limit(Some(MAX_SEARCH_LIMIT + 1)).unwrap_err(),
+            GatewayError::BadRequest(_)
+        ));
+    }
+
+    #[test]
+    fn validate_search_query_rejects_empty_and_trims() {
+        // Empty / whitespace-only → 400.
+        assert!(matches!(
+            validate_search_query("").unwrap_err(),
+            GatewayError::BadRequest(_)
+        ));
+        assert!(matches!(
+            validate_search_query("   ").unwrap_err(),
+            GatewayError::BadRequest(_)
+        ));
+        // A real query is trimmed and returned.
+        assert_eq!(validate_search_query("  hello  ").unwrap(), "hello");
+    }
+
+    #[test]
+    fn build_update_payload_forwards_only_present_keys() {
+        // Only `title` present → the patch carries `correlation_id`,
+        // `session_id`, and `title`, but NOT `archived`/`meta` (absent =
+        // unchanged, so the gateway must not synthesise them).
+        let body = serde_json::json!({ "title": "renamed" });
+        let p = build_update_payload("corr-1", "sess-1", &body).unwrap();
+        let obj = p.as_object().unwrap();
+        assert_eq!(obj["correlation_id"], "corr-1");
+        assert_eq!(obj["session_id"], "sess-1");
+        assert_eq!(obj["title"], "renamed");
+        assert!(
+            !obj.contains_key("archived"),
+            "absent key must not be forwarded"
+        );
+        assert!(
+            !obj.contains_key("meta"),
+            "absent key must not be forwarded"
+        );
+    }
+
+    #[test]
+    fn build_update_payload_preserves_clear_and_explicit_null() {
+        // Present-and-`""` (clear) and present-and-archived=false must be
+        // forwarded verbatim — they are distinct from absence.
+        let body = serde_json::json!({ "title": "", "archived": false, "meta": "{}" });
+        let p = build_update_payload("c", "s", &body).unwrap();
+        let obj = p.as_object().unwrap();
+        assert_eq!(obj["title"], "");
+        assert_eq!(obj["archived"], false);
+        assert_eq!(obj["meta"], "{}");
+    }
+
+    #[test]
+    fn build_update_payload_empty_body_is_correlation_and_session_only() {
+        // `{}` body → an empty patch: only the gateway-set keys. The capsule
+        // sees a no-op update (nothing changes), never a clobber.
+        let body = serde_json::json!({});
+        let p = build_update_payload("c", "s", &body).unwrap();
+        let obj = p.as_object().unwrap();
+        assert_eq!(
+            obj.len(),
+            2,
+            "empty patch carries only correlation_id + session_id"
+        );
+        assert!(obj.contains_key("correlation_id"));
+        assert!(obj.contains_key("session_id"));
+    }
+
+    #[test]
+    fn build_update_payload_ignores_unknown_keys() {
+        // A client must not be able to smuggle arbitrary fields (e.g. another
+        // principal's session_id override, or capsule-internal keys) into the
+        // capsule's update via extra body keys. Only the three recognised keys
+        // are forwarded; `session_id` is always the gateway's path value.
+        let body = serde_json::json!({
+            "title": "ok",
+            "session_id": "attacker-controlled",
+            "owner": "someone-else",
+            "deleted": true
+        });
+        let p = build_update_payload("c", "path-session", &body).unwrap();
+        let obj = p.as_object().unwrap();
+        assert_eq!(
+            obj["session_id"], "path-session",
+            "path id wins, never the body"
+        );
+        assert!(!obj.contains_key("owner"));
+        assert!(!obj.contains_key("deleted"));
+        assert_eq!(obj.len(), 3, "only correlation_id + session_id + title");
+    }
+
+    #[test]
+    fn build_update_payload_rejects_non_object_body() {
+        let body = serde_json::json!("not-an-object");
+        assert!(matches!(
+            build_update_payload("c", "s", &body).unwrap_err(),
+            GatewayError::BadRequest(_)
+        ));
+    }
+
+    #[test]
+    fn build_search_payload_matches_frozen_contract() {
+        let p = build_search_payload("corr-1", "needle", 20, Some("cur"), true);
+        assert_eq!(p["correlation_id"], "corr-1");
+        assert_eq!(p["query"], "needle");
+        assert_eq!(p["limit"], 20);
+        assert_eq!(p["cursor"], "cur");
+        assert_eq!(p["include_archived"], true);
+        // Absent cursor serializes as null (key present), matching the frozen
+        // `cursor: <string>|null` shape.
+        let p = build_search_payload("c", "q", 5, None, false);
+        assert_eq!(p["cursor"], Value::Null);
+        assert!(p.get("cursor").is_some());
+        assert_eq!(p["include_archived"], false);
+    }
+
+    #[test]
+    fn session_summary_round_trips_frozen_summary() {
+        // The frozen SUMMARY shape, fully populated, then mostly-null.
+        let full = serde_json::json!({
+            "session_id": "default",
+            "title": "Planning",
+            "preview": "first user message",
+            "last_message_preview": "latest line",
+            "message_count": 12,
+            "created_at": 1_719_000_000_i64,
+            "updated_at": 1_719_000_100_i64,
+            "archived": false,
+            "parent_session_id": "old-id",
+            "meta": "{\"k\":1}"
+        });
+        let s: SessionSummary = serde_json::from_value(full).expect("frozen SUMMARY deserializes");
+        assert_eq!(s.session_id, "default");
+        assert_eq!(s.title.as_deref(), Some("Planning"));
+        assert_eq!(s.last_message_preview.as_deref(), Some("latest line"));
+        assert!(!s.archived);
+        assert_eq!(s.meta.as_deref(), Some("{\"k\":1}"));
+
+        // Minimal/sparse element: only the always-present fields.
+        let sparse = serde_json::json!({
+            "session_id": "fresh",
+            "message_count": 0,
+            "archived": true
+        });
+        let s: SessionSummary =
+            serde_json::from_value(sparse).expect("sparse SUMMARY deserializes");
+        assert!(s.title.is_none());
+        assert!(s.preview.is_none());
+        assert!(s.last_message_preview.is_none());
+        assert!(s.created_at.is_none());
+        assert!(s.meta.is_none());
+        assert!(s.archived);
+    }
+
+    #[test]
+    fn parse_session_field_null_is_none_for_404() {
+        // Explicit null → None (the handler maps None to a 404).
+        let null_reply = serde_json::json!({ "correlation_id": "c", "session": null });
+        assert!(parse_session_field(&null_reply).unwrap().is_none());
+        // Absent `session` → None too.
+        let absent = serde_json::json!({ "correlation_id": "c" });
+        assert!(parse_session_field(&absent).unwrap().is_none());
+    }
+
+    #[test]
+    fn parse_session_field_present_summary_deserializes() {
+        let reply = serde_json::json!({
+            "correlation_id": "c",
+            "session": {
+                "session_id": "s1",
+                "title": "T",
+                "message_count": 3,
+                "archived": false
+            }
+        });
+        let s = parse_session_field(&reply)
+            .unwrap()
+            .expect("present session");
+        assert_eq!(s.session_id, "s1");
+        assert_eq!(s.title.as_deref(), Some("T"));
+        assert_eq!(s.message_count, 3);
+    }
+
+    #[test]
+    fn parse_session_field_rejects_garbage_session() {
+        // `session` present but not an object the SUMMARY agrees to → Kernel.
+        let reply = serde_json::json!({ "session": { "session_id": 42 } });
+        assert!(matches!(
+            parse_session_field(&reply).unwrap_err(),
+            GatewayError::Kernel(_)
+        ));
+    }
+
+    #[test]
+    fn parse_deleted_field_reads_bool_defaults_false() {
+        assert!(parse_deleted_field(&serde_json::json!({ "deleted": true })));
+        assert!(!parse_deleted_field(
+            &serde_json::json!({ "deleted": false })
+        ));
+        // Missing / non-bool → false (idempotent no-op outcome).
+        assert!(!parse_deleted_field(
+            &serde_json::json!({ "correlation_id": "c" })
+        ));
+        assert!(!parse_deleted_field(
+            &serde_json::json!({ "deleted": "yes" })
+        ));
+    }
+
+    #[test]
+    fn parse_search_response_round_trips_frozen_shape() {
+        let body = serde_json::json!({
+            "correlation_id": "c",
+            "results": [
+                {
+                    "session_id": "s1",
+                    "title": "Trip planning",
+                    "snippet": "…book the flight…",
+                    "match_count": 2,
+                    "updated_at": 1_719_000_000_i64
+                },
+                { "session_id": "s2", "match_count": 1 }
+            ],
+            "next_cursor": "page-2"
+        });
+        let parsed = parse_search_response(body).expect("frozen search shape deserializes");
+        assert_eq!(parsed.results.len(), 2);
+        assert_eq!(parsed.next_cursor.as_deref(), Some("page-2"));
+        let first = &parsed.results[0];
+        assert_eq!(first.session_id, "s1");
+        assert_eq!(first.title.as_deref(), Some("Trip planning"));
+        assert_eq!(first.match_count, 2);
+        assert_eq!(first.updated_at, Some(1_719_000_000));
+        let second = &parsed.results[1];
+        assert!(second.title.is_none());
+        assert!(second.snippet.is_none());
+        assert!(second.updated_at.is_none());
+        assert_eq!(second.match_count, 1);
+    }
+
+    #[test]
+    fn parse_search_response_null_next_cursor_is_last_page() {
+        let body = serde_json::json!({ "results": [], "next_cursor": null });
+        let parsed = parse_search_response(body).expect("empty page deserializes");
+        assert!(parsed.results.is_empty());
+        assert!(parsed.next_cursor.is_none());
+        // Absent next_cursor is also fine (defaults to None).
+        let body = serde_json::json!({ "results": [] });
+        assert!(parse_search_response(body).unwrap().next_cursor.is_none());
+    }
+
+    #[test]
+    fn parse_search_response_rejects_garbage() {
+        let body = serde_json::json!({ "results": "not-an-array" });
+        assert!(matches!(
+            parse_search_response(body).unwrap_err(),
+            GatewayError::Kernel(_)
+        ));
+    }
+
+    /// Live round-trip over a real `EventBus` for the `update` verb: the
+    /// stand-in capsule receives the principal-stamped, present-keys-only
+    /// patch and replies with an updated SUMMARY on the scoped topic.
+    #[tokio::test]
+    async fn request_capsule_round_trips_update_reply() {
+        let bus = Arc::new(EventBus::new());
+        let principal = PrincipalId::new("alice").expect("valid principal");
+        let correlation_id = "corr-upd-1";
+        let response_topic = format!("{TOPIC_UPDATE_RESPONSE_PREFIX}.{correlation_id}");
+
+        let mut req_rx = bus.subscribe_topic(TOPIC_UPDATE_REQUEST.to_string());
+        let bus_capsule = Arc::clone(&bus);
+        let resp_topic = response_topic.clone();
+        let cid = correlation_id.to_string();
+        let capsule = tokio::spawn(async move {
+            let event = req_rx.recv().await.expect("request arrives");
+            let AstridEvent::Ipc { message, .. } = &*event else {
+                panic!("expected IPC request");
+            };
+            // Principal-stamped, and the patch carries only the sent key.
+            assert_eq!(message.principal.as_deref(), Some("alice"));
+            if let IpcPayload::RawJson(v) = &message.payload {
+                assert_eq!(v["title"], "renamed");
+                assert!(v.get("archived").is_none(), "absent key not forwarded");
+            } else {
+                panic!("expected RawJson payload");
+            }
+            let reply = serde_json::json!({
+                "correlation_id": cid,
+                "session": {
+                    "session_id": "sess-1",
+                    "title": "renamed",
+                    "message_count": 4,
+                    "archived": false
+                }
+            });
+            let msg = IpcMessage::new(resp_topic, IpcPayload::RawJson(reply), Uuid::nil());
+            bus_capsule.publish(AstridEvent::Ipc {
+                metadata: EventMetadata::new("test::capsule"),
+                message: msg,
+            });
+        });
+
+        let body = serde_json::json!({ "title": "renamed" });
+        let payload = build_update_payload(correlation_id, "sess-1", &body).unwrap();
+        let value = request_capsule(
+            &bus,
+            TOPIC_UPDATE_REQUEST,
+            &response_topic,
+            payload,
+            correlation_id,
+            &principal,
+            None,
+            CAPSULE_TIMEOUT,
+        )
+        .await
+        .expect("helper returns the scoped reply");
+
+        capsule.await.expect("stand-in capsule joins");
+        let summary = parse_session_field(&value)
+            .unwrap()
+            .expect("present session");
+        assert_eq!(summary.session_id, "sess-1");
+        assert_eq!(summary.title.as_deref(), Some("renamed"));
     }
 
     /// A reply whose `correlation_id` does NOT match is skipped; the
