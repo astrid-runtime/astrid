@@ -37,7 +37,9 @@ fn rate_limiter_sliding_window_eviction() {
 
     // Manually set all timestamps to 61 seconds ago to simulate expiry.
     if let Some(timestamps) = limiter.buckets.get_mut("ReloadCapsules") {
-        let past = Instant::now().checked_sub(std::time::Duration::from_secs(61)).unwrap();
+        let past = Instant::now()
+            .checked_sub(std::time::Duration::from_secs(61))
+            .unwrap();
         for ts in timestamps.iter_mut() {
             *ts = past;
         }
@@ -58,7 +60,9 @@ fn rate_limiter_sliding_window_prevents_boundary_burst() {
     // Move only 3 of the 5 timestamps to the past (beyond 60s window).
     // This simulates partial window expiry - only 3 slots should free up.
     if let Some(timestamps) = limiter.buckets.get_mut("ReloadCapsules") {
-        let past = Instant::now().checked_sub(std::time::Duration::from_secs(61)).unwrap();
+        let past = Instant::now()
+            .checked_sub(std::time::Duration::from_secs(61))
+            .unwrap();
         for ts in timestamps.iter_mut().take(3) {
             *ts = past;
         }

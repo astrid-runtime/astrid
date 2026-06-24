@@ -67,7 +67,6 @@ async fn send_admin(
     // Wait briefly for the response. The admin router is spawned at
     // kernel construction time so this should fire on the next tokio
     // tick; a 2-second timeout keeps misbehaving tests from hanging CI.
-    
 
     tokio::time::timeout(std::time::Duration::from_secs(2), async {
         loop {

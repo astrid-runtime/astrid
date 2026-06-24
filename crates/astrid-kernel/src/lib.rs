@@ -2579,7 +2579,11 @@ mod tests {
     fn restart_tracker_allows_restart_after_backoff() {
         let mut tracker = RestartTracker::new();
         // Simulate time passing by setting last_attempt in the past.
-        tracker.last_attempt = std::time::Instant::now().checked_sub(RestartTracker::INITIAL_BACKOFF).unwrap().checked_sub(std::time::Duration::from_millis(1)).unwrap();
+        tracker.last_attempt = std::time::Instant::now()
+            .checked_sub(RestartTracker::INITIAL_BACKOFF)
+            .unwrap()
+            .checked_sub(std::time::Duration::from_millis(1))
+            .unwrap();
         assert!(tracker.should_restart());
     }
 
@@ -2629,7 +2633,9 @@ mod tests {
             tracker.record_attempt();
         }
         // Even if backoff has elapsed, exhausted tracker should not restart.
-        tracker.last_attempt = std::time::Instant::now().checked_sub(RestartTracker::MAX_BACKOFF).unwrap();
+        tracker.last_attempt = std::time::Instant::now()
+            .checked_sub(RestartTracker::MAX_BACKOFF)
+            .unwrap();
         assert!(!tracker.should_restart());
     }
 

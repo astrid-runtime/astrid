@@ -429,7 +429,10 @@ mod tests {
 
     #[test]
     fn test_bwrap_probe_namespace_denied() {
-        let result = Ok(mock_output(1, "bwrap: setting up uid map: Permission denied\n"));
+        let result = Ok(mock_output(
+            1,
+            "bwrap: setting up uid map: Permission denied\n",
+        ));
         assert!(!interpret_bwrap_probe(result));
     }
 

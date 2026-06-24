@@ -88,7 +88,9 @@ fn publish_response(kernel: &Kernel, request_id: &str, decision: &str) {
 /// Poll the on-disk grant set until it contains `capsule` or the deadline
 /// elapses. Returns whether the capsule landed.
 async fn wait_for_grant(home: &AstridHome, principal: &str, capsule: &str) -> bool {
-    let deadline = Instant::now().checked_add(Duration::from_secs(2)).expect("deadline overflow");
+    let deadline = Instant::now()
+        .checked_add(Duration::from_secs(2))
+        .expect("deadline overflow");
     while Instant::now() < deadline {
         if on_disk_capsules(home, principal)
             .iter()

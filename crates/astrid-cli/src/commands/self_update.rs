@@ -884,7 +884,9 @@ mod tests {
         // inspecting the surface error.
         assert_eq!(wrapped.to_string(), "syncing distro");
         assert!(
-            wrapped.chain().any(<dyn std::error::Error + 'static>::is::<AstridVersionTooOld>),
+            wrapped
+                .chain()
+                .any(<dyn std::error::Error + 'static>::is::<AstridVersionTooOld>),
             "guard: the typed gate must be reachable by walking the chain"
         );
         let msg = post_update_sync_message(&wrapped);

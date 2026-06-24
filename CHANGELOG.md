@@ -9,6 +9,11 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
 
 ## [Unreleased]
 
+### Changed
+
+- **CI clippy checks updated to run with `--all-targets` and all pre-existing clippy lints resolved across test, example, and benchmark targets.** Refactored test-only code to address dead code, field reassignments with default, misplaced imports, and excessively long functions workspace-wide. Closes #1004.
+- **Added support for Copilot automated agents in CI checks.** Added `Copilot` to `.github/contributors.yml` under `maintainers` and bypassed the contributor account age check in `.github/workflows/pr-checks.yml` for automated agent PRs to allow successful workflow runs.
+
 ### Docs
 
 - Added `docs/models.md` -- user guide for LLM model selection (`astrid models list/current/set/unset`), provider discovery (openai and openai-compat capsules), install-time onboarding, and the no-model error path. Relates to #961.
