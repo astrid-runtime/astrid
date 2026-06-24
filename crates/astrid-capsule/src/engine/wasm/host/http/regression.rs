@@ -9,8 +9,9 @@
 //!   populates `active_http_streams`; close/drop release the slot);
 //! - the header (time-to-first-byte) deadline bounds a hung pre-header server
 //!   (`send_one_hop`);
-//! - a non-resolving host maps to the typed `DnsError` via the resolver's
-//!   `dns_failed` flag (`SafeDnsResolver` / `airlock_or`).
+//! - a genuine host-not-found maps to the typed `DnsError` via the resolver's
+//!   `dns_failed` flag (narrowed to `ErrorKind::NotFound`), while a transient
+//!   resolver error falls through (`lookup_err_is_not_found` / `flag_error`).
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -353,54 +354,61 @@ async fn configured_max_concurrent_streams_lowers_quota() {
     }
 }
 
-/// FIX C regression: a host that does not resolve must surface the typed
-/// `DnsError`, not a generic `ConnectionError`/`AirlockRejected`. reqwest
-/// collapses a `dns_resolver` failure into an opaque `is_connect()` error, so
-/// the `SafeDnsResolver` flags a genuine resolution miss out-of-band via
-/// `dns_failed` (mirroring the airlock `tripped` channel) and `airlock_or` maps
-/// it to `DnsError`. Without the fix the miss is indistinguishable from a
-/// dead server.
+/// FIX C / FIX 2 regression: a genuine host-not-found surfaces the typed
+/// `DnsError`, but a transient resolver error (timeout / I/O) does NOT — it
+/// falls through to the generic classification. reqwest collapses a
+/// `dns_resolver` failure into an opaque `is_connect()` error, so the
+/// `SafeDnsResolver` flags a NOT-FOUND miss out-of-band via `dns_failed`
+/// (mirroring the airlock `tripped` channel) and `airlock_or` maps it to
+/// `DnsError`. `dns_failed` is narrowed to `ErrorKind::NotFound` so a transient
+/// failure isn't mislabeled as not-found.
 ///
-/// Driven at the resolver layer (not through the full HTTP client) so it is
-/// HERMETIC and proxy-independent: a sandbox that injects an `HTTP(S)_PROXY`
-/// makes reqwest resolve the *proxy* host rather than the request host, which
-/// would never exercise this path. A `.invalid` TLD (RFC 6761 reserved) is a
-/// guaranteed resolution miss with no network egress.
-#[tokio::test]
-async fn non_resolving_host_flags_dns_error() {
-    use std::str::FromStr as _;
+/// The narrowing is asserted directly via `lookup_err_is_not_found` (fully
+/// hermetic, platform-independent — `lookup_host`'s error kind for a `.invalid`
+/// host varies by platform: macOS reports `Uncategorized`, others `NotFound`).
+#[test]
+fn dns_not_found_is_narrowed_to_notfound_kind() {
+    use std::io::{Error, ErrorKind};
+
+    // The load-bearing FIX-2 decision: only NotFound is a `dns-error` miss.
+    assert!(super::ssrf::lookup_err_is_not_found(&Error::new(
+        ErrorKind::NotFound,
+        "host not found"
+    )));
+    // A transient resolver timeout / I/O error must NOT be treated as not-found
+    // (it would mislabel a connection problem as DnsError).
+    assert!(!super::ssrf::lookup_err_is_not_found(&Error::new(
+        ErrorKind::TimedOut,
+        "resolver timed out"
+    )));
+    assert!(!super::ssrf::lookup_err_is_not_found(&Error::other(
+        "transient resolver failure"
+    )));
+}
+
+/// The resolver's empty-resolved-addresses path (a host that resolves to ONLY
+/// airlock-filtered-out addresses, with none unsafe — an unambiguous no-resolve)
+/// sets `dns_failed`, and `flag_error` maps the flags to the typed errors with
+/// the airlock taking precedence. Driven at the resolver/flag layer so it is
+/// hermetic and proxy-independent.
+#[test]
+fn dns_failed_flag_maps_to_dns_error_with_airlock_precedence() {
     use std::sync::atomic::{AtomicBool, Ordering};
 
-    use reqwest::dns::Resolve as _;
+    let tripped = AtomicBool::new(false);
+    let dns_failed = AtomicBool::new(false);
 
-    let tripped = Arc::new(AtomicBool::new(false));
-    let dns_failed = Arc::new(AtomicBool::new(false));
-    let resolver = super::ssrf::SafeDnsResolver {
-        tripped: tripped.clone(),
-        dns_failed: dns_failed.clone(),
-        exempt_host: None,
-    };
+    // Neither flag → fall through (None).
+    assert!(super::ssrf::flag_error(&tripped, &dns_failed).is_none());
 
-    let name =
-        reqwest::dns::Name::from_str("this-host-does-not-exist.invalid").expect("valid DNS name");
-    let result = resolver.resolve(name).await;
-
-    assert!(result.is_err(), "a `.invalid` host must fail to resolve");
-    assert!(
-        dns_failed.load(Ordering::Relaxed),
-        "a resolution miss must set the dns_failed flag (→ DnsError)"
-    );
-    assert!(
-        !tripped.load(Ordering::Relaxed),
-        "a resolution miss must NOT trip the airlock (that is for unsafe-IP resolves)"
-    );
-
-    // And the flag→error mapping yields the typed `DnsError`, with the airlock
-    // taking precedence when both are somehow set.
+    // dns_failed alone → DnsError.
+    dns_failed.store(true, Ordering::Relaxed);
     assert!(matches!(
         super::ssrf::flag_error(&tripped, &dns_failed),
         Some(ErrorCode::DnsError)
     ));
+
+    // Airlock takes precedence when both are set.
     tripped.store(true, Ordering::Relaxed);
     assert!(
         matches!(

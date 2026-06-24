@@ -47,9 +47,16 @@ struct HookAbiResult {
 /// config layer is the source; an absent section / failed load yields the host's
 /// historical constants (`HttpLimits::default`).
 fn resolve_http_limits() -> astrid_capsule::HttpLimits {
-    let http = astrid_config::Config::load(None)
-        .map(|r| r.config.http)
-        .unwrap_or_default();
+    let http = match astrid_config::Config::load(None) {
+        Ok(resolved) => resolved.config.http,
+        Err(e) => {
+            // Fail safe to host defaults, but NOT silently: a malformed global
+            // config would otherwise diverge hook HTTP policy from the
+            // operator's intent with no signal.
+            warn!(error = %e, "failed to load global [http] config for hook HTTP limits; using host defaults");
+            astrid_config::HttpSection::default()
+        },
+    };
     astrid_capsule::HttpLimits::from_config_values(
         http.default_timeout_secs,
         http.stream_connect_timeout_secs,

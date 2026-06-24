@@ -51,6 +51,14 @@ pub(super) struct SafeDnsResolver {
     pub(super) exempt_host: Option<Arc<str>>,
 }
 
+/// True if an `lookup_host` error is a genuine host-not-found (NXDOMAIN), the
+/// only resolver error that maps to the typed `dns-error`. A transient timeout /
+/// I/O error is NOT a not-found and must fall through to the generic
+/// classification. Split out so the narrowing is unit-testable.
+pub(super) fn lookup_err_is_not_found(e: &std::io::Error) -> bool {
+    e.kind() == std::io::ErrorKind::NotFound
+}
+
 impl reqwest::dns::Resolve for SafeDnsResolver {
     fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
         let name_str = name.as_str().to_string();
@@ -64,11 +72,19 @@ impl reqwest::dns::Resolve for SafeDnsResolver {
             let addrs = match tokio::net::lookup_host((name_str.as_str(), 0)).await {
                 Ok(addrs) => addrs,
                 Err(e) => {
-                    // The OS resolver itself failed (NXDOMAIN, no network, …).
-                    // Not an airlock block — mark `dns_failed` so the caller can
-                    // emit the typed `dns-error` instead of a generic connect
-                    // error. Mirrors the `tripped` recovery channel.
-                    dns_failed.store(true, Ordering::Relaxed);
+                    // Only a genuine host-not-found (NXDOMAIN) is `dns-error`,
+                    // which the contract documents as "DNS could not resolve the
+                    // hostname". A transient resolver timeout / I/O error is NOT
+                    // a not-found, so leave `dns_failed` clear and let
+                    // `airlock_or` fall through to reqwest's generic
+                    // classification (connection-error / timeout / unknown).
+                    // Under-producing `DnsError` on a platform that reports
+                    // not-found as some other kind is a safe degradation
+                    // (falls back to a connection error). Mirrors the `tripped`
+                    // recovery channel.
+                    if lookup_err_is_not_found(&e) {
+                        dns_failed.store(true, Ordering::Relaxed);
+                    }
                     return Err(Box::new(e) as Box<dyn std::error::Error + Send + Sync>);
                 },
             };

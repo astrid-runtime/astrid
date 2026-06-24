@@ -481,12 +481,12 @@ impl HostState {
     ) -> Result<Resource<HttpStream>, ErrorCode> {
         let principal = self.effective_principal();
         let max_streams = self.http_limits.max_concurrent_streams;
-        let per_principal_count = self
-            .active_http_streams
-            .values()
-            .filter(|s| s.creator == principal)
-            .count();
-        if per_principal_count >= max_streams || self.active_http_streams.len() >= max_streams {
+        // Per-capsule concurrency cap (matches the `max_concurrent_streams` field
+        // doc). `active_http_streams` holds this capsule's live streams, so its
+        // length is the per-capsule count. A separate, SMALLER per-principal
+        // limit would be needed for true per-principal isolation (one principal
+        // not starving others within the capsule) — out of scope here.
+        if self.active_http_streams.len() >= max_streams {
             return Err(ErrorCode::Quota);
         }
 
@@ -540,12 +540,12 @@ impl HostState {
             .push(active.clone())
             .map_err(|e| ErrorCode::Unknown(format!("resource table: {e}")))?;
         // Mirror the stream into `active_http_streams`, keyed by the resource
-        // rep, so the per-principal + global concurrency quota (checked at the
-        // top of this fn) actually counts live streams. Without this the cap was
-        // dead — the resource table is not enumerable by principal. The mirror
-        // shares the same `Arc<Mutex<Response>>`, so `read_chunk` via the
-        // resource table stays consistent; this copy is purely for counting and
-        // is removed in `stream_close` / `stream_drop`.
+        // rep, so the per-capsule concurrency quota (checked at the top of this
+        // fn) actually counts live streams. Without this the cap was dead — the
+        // resource table is not enumerable. The mirror shares the same
+        // `Arc<Mutex<Response>>`, so `read_chunk` via the resource table stays
+        // consistent; this copy is purely for counting and is removed in
+        // `stream_close` / `stream_drop`.
         self.active_http_streams
             .insert(u64::from(resource.rep()), active);
         Ok(Resource::new_own(resource.rep()))
