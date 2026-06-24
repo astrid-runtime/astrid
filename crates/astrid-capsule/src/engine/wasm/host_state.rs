@@ -682,6 +682,18 @@ impl HostState {
     /// which our format string never produces). This assertion catches any
     /// regression that breaks that invariant in debug builds.
     ///
+    /// Deliberately scoped to a *present, parseable* caller principal that
+    /// differs from the owner. A caller whose principal is **absent/unparseable**
+    /// is intentionally NOT asserted: principal-less system and lifecycle events
+    /// (e.g. capsule-react's `astrid.v1.watchdog.tick`, capsule-registry's
+    /// `astrid.v1.capsules_loaded`) are legitimately dispatched with no caller
+    /// principal and correctly fall back to the owner/global store, so a
+    /// blanket assert on the absent case would fire on sound paths. Principal-
+    /// scoped capsules (capsule-session) instead rely on the producer-side
+    /// invariant that every principal-scoped topic carries an authenticated
+    /// principal — pinned by the `effective_kv_*` tests, not by this assert.
+    /// Relates to #977.
+    ///
     /// Not applied to `invocation_home` / `invocation_tmp` / `invocation_capsule_log`:
     /// those legitimately stay `None` for unregistered principals (the VFS
     /// bundle registration gate and log-open registration gate).
