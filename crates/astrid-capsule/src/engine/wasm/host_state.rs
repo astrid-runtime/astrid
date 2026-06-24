@@ -543,6 +543,25 @@ pub struct HostState {
     /// effective capabilities. `None` for an unbound connection or a binding
     /// that carried no specific device.
     pub ingress_device_key_id: Option<String>,
+    /// The transport origin of the source connection whose inbound frame is
+    /// currently in flight — the per-frame companion to
+    /// [`ingress_principal`](Self::ingress_principal), feeding the host-stamped
+    /// [`MessageOrigin`](astrid_events::ipc::MessageOrigin) on a `publish-as`
+    /// forward.
+    ///
+    /// Set to `Some(MessageOrigin::LocalSocket)` by the framed `tcp-stream.read`
+    /// host fn ONLY for a kernel-BOUND connection (one with a verified
+    /// [`ConnectionIdentity`]), and cleared to `None` on a non-data read or a
+    /// read off an unbound connection — in LOCKSTEP with `ingress_principal` /
+    /// `ingress_device_key_id` so origin never desyncs from the identity it
+    /// describes. When the uplink forwards the frame via `publish-as`, the host
+    /// stamps THIS origin onto the outbound message so a downstream egress site
+    /// can positively identify a local-operator request. `None` for an unbound
+    /// (peer-cred-trusted but unauthenticated) local connection, which earns
+    /// `System` (the fail-closed, non-local floor) — an unproven local
+    /// connection does NOT earn `LocalSocket`, parallel to how an unbound
+    /// principal stamps the reserved `anonymous` identity.
+    pub ingress_origin: Option<astrid_events::ipc::MessageOrigin>,
     /// Host-verified principal each INBOUND uplink connection was accepted
     /// under, keyed by stream resource rep (`u32`). The lifecycle registry the
     /// kernel connection counter rides on: `net.unix-listener.{accept,

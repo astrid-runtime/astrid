@@ -96,6 +96,9 @@ pub(crate) fn run(args: &ConfigArgs) -> Result<ExitCode> {
 
     if !args.set.is_empty() {
         let mut env = read_env(&path)?;
+        // Collected so the local-egress pre-bless prompt runs AFTER the env file
+        // is written (a write failure should not orphan a prompt).
+        let mut set_values: Vec<String> = Vec::new();
         for pair in &args.set {
             let Some((k, v)) = pair.split_once('=') else {
                 eprintln!(
@@ -107,8 +110,21 @@ pub(crate) fn run(args: &ConfigArgs) -> Result<ExitCode> {
                 return Ok(ExitCode::from(1));
             };
             env.insert(k.trim().to_string(), Value::String(v.to_string()));
+            set_values.push(v.to_string());
         }
         write_env(&path, &env)?;
+
+        // Guided pre-bless: if any value the operator just set is a local
+        // provider endpoint, offer to add the SSRF-airlock exemption so the
+        // capsule can reach it. Operator is unambiguously local here (this is
+        // the CLI process), so a plain stdin prompt is safe — not the daemon's
+        // runtime elicitation. Non-local / free-text values are skipped.
+        if let Ok(home) = AstridHome::resolve() {
+            let config_path = home.config_path();
+            for v in &set_values {
+                super::local_egress::maybe_prompt_local_egress(&args.name, v, &config_path);
+            }
+        }
         println!(
             "{}",
             Theme::success(&format!(

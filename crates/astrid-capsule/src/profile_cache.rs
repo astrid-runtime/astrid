@@ -135,6 +135,62 @@ impl PrincipalProfileCache {
             .remove(principal);
     }
 
+    /// Persist an operator-consented local-egress endpoint to `principal`'s
+    /// profile on disk (`network.egress`), then invalidate the cache so the
+    /// next resolve reloads it.
+    ///
+    /// This is the `approve_always` path of the runtime local-egress consent
+    /// flow: a `host:port` the local operator chose to remember across daemon
+    /// restarts. The load-modify-save runs under the cache's own write lock so
+    /// two concurrent consents on the same principal cannot lose an entry, and
+    /// mirrors the kernel's `grant_on_use` discipline (load → mutate → validate
+    /// → save → invalidate). It is fail-closed and **idempotent**: an entry that
+    /// already exists is a no-op success.
+    ///
+    /// # Security
+    ///
+    /// The caller (the egress consent gate) guarantees the request was a
+    /// host-attributed `LocalSocket`-origin operator action that the operator
+    /// explicitly approved-always. This method does not itself re-check origin;
+    /// it is the persistence primitive, not the policy gate.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProfileError`] on load/validate/save failure. The caller treats
+    /// any error as a fail-closed no-op (the in-flight session grant still
+    /// stands; only the disk persistence is skipped).
+    pub fn persist_egress(&self, principal: &PrincipalId, endpoint: &str) -> ProfileResult<()> {
+        // Serialize the load-modify-save against any other writer on this cache
+        // (and against a concurrent `resolve` populating the same key) by
+        // holding the write lock for the whole operation.
+        let mut guard = self
+            .cache
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        let path = self.astrid_home.profile_path(principal);
+        let mut profile = PrincipalProfile::load_from_path(&path)?;
+
+        if profile
+            .network
+            .egress
+            .iter()
+            .any(|e| e.eq_ignore_ascii_case(endpoint))
+        {
+            // Already persisted — idempotent. Drop the stale cache entry so a
+            // reload reflects on-disk state, then return success.
+            guard.remove(principal);
+            return Ok(());
+        }
+
+        profile.network.egress.push(endpoint.to_string());
+        // `save_to_path` re-runs `validate()` before writing, so a malformed
+        // profile never reaches disk.
+        profile.save_to_path(&path)?;
+        guard.remove(principal);
+        Ok(())
+    }
+
     /// Number of principals currently cached. Test-only introspection.
     #[cfg(test)]
     #[must_use]
@@ -328,5 +384,70 @@ mod tests {
             h.join().expect("join");
         }
         assert_eq!(cache.len(), 1, "only one entry expected");
+    }
+
+    #[test]
+    fn persist_egress_appends_to_profile_and_invalidates() {
+        let (dir, cache) = fixture();
+        let p = principal("alice");
+        // Start from a profile with an existing egress entry to prove we append,
+        // not overwrite.
+        write_profile(
+            &dir,
+            &p,
+            &format!(
+                "profile_version = {CURRENT_PROFILE_VERSION}\n\
+                 [network]\n\
+                 egress = [\"api.example.com:443\"]\n"
+            ),
+        );
+        // Populate the cache so we can prove persist invalidates it.
+        let _ = cache.resolve(&p).expect("prime cache");
+        assert_eq!(cache.len(), 1);
+
+        cache
+            .persist_egress(&p, "127.0.0.1:1234")
+            .expect("persist egress");
+
+        // Cache was invalidated by the persist.
+        assert_eq!(cache.len(), 0, "persist_egress must invalidate the cache");
+
+        // A reload sees BOTH the pre-existing entry and the appended one.
+        let reloaded = cache.resolve(&p).expect("reload");
+        assert!(
+            reloaded
+                .network
+                .egress
+                .contains(&"api.example.com:443".to_string())
+        );
+        assert!(
+            reloaded
+                .network
+                .egress
+                .contains(&"127.0.0.1:1234".to_string())
+        );
+        assert_eq!(reloaded.network.egress.len(), 2);
+    }
+
+    #[test]
+    fn persist_egress_is_idempotent() {
+        let (_dir, cache) = fixture();
+        let p = principal("bob");
+        // No file on disk → starts from default (empty egress).
+        cache
+            .persist_egress(&p, "10.0.0.5:8080")
+            .expect("first persist");
+        // A second persist of the SAME endpoint (case-insensitive) is a no-op
+        // success, not a duplicate.
+        cache
+            .persist_egress(&p, "10.0.0.5:8080")
+            .expect("idempotent persist");
+
+        let profile = cache.resolve(&p).expect("reload");
+        assert_eq!(
+            profile.network.egress,
+            vec!["10.0.0.5:8080".to_string()],
+            "idempotent persist must not duplicate the entry"
+        );
     }
 }

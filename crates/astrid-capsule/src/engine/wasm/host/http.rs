@@ -281,6 +281,60 @@ fn egress_decision(allowlist: &[String], url: &str) -> Result<Option<Arc<str>>, 
     Ok(None)
 }
 
+/// Parse a URL's host and resolved port for the consent prompt. Returns `None`
+/// (declining consent, fail-closed) if the URL is unparseable or has no host /
+/// known-default port — the same shapes `egress_decision` already rejects.
+fn url_host_port(url: &str) -> Option<(String, u16)> {
+    let parsed = reqwest::Url::parse(url).ok()?;
+    let host = parsed.host_str()?.to_string();
+    let port = parsed.port_or_known_default()?;
+    Some((host, port))
+}
+
+impl HostState {
+    /// Resolve the egress disposition for `url`, eliciting runtime operator
+    /// consent on an airlock rejection for an IP-literal local endpoint.
+    ///
+    /// Wraps [`egress_decision`]:
+    /// - `Ok(Some(host))` / `Ok(None)` pass through unchanged (the endpoint is
+    ///   operator pre-blessed, or not local at all).
+    /// - `Err(AirlockRejected)` — a local IP-literal that is NOT pre-blessed —
+    ///   is where runtime consent runs. [`consent_local_egress`](Self::consent_local_egress)
+    ///   gates on transport origin (`LocalSocket` only) and prompts the
+    ///   operator. On grant, the endpoint is treated as **exempt** — the exact
+    ///   same `Ok(Some(host))` an operator pre-bless produces — so the resolver
+    ///   keeps its private address AND the redirect policy refuses to follow any
+    ///   hop ([`build_redirect_policy`] `exempt = true`), identical to a
+    ///   pre-blessed endpoint. On refusal/timeout/non-local origin the rejection
+    ///   stands.
+    ///
+    /// V1 covers only the IP-literal airlock-rejected arm: a hostname endpoint
+    /// (`localhost:1234`) returns `Ok(None)` from `egress_decision` and is left
+    /// to the resolver airlock — it is NOT consent-granted here and still
+    /// requires a pre-bless.
+    fn egress_decision_with_consent(&mut self, url: &str) -> Result<Option<Arc<str>>, ErrorCode> {
+        match egress_decision(&self.local_egress, url) {
+            Err(ErrorCode::AirlockRejected) => {
+                let Some((host, port)) = url_host_port(url) else {
+                    return Err(ErrorCode::AirlockRejected);
+                };
+                if self.consent_local_egress(&host, port) {
+                    // Consent granted: re-enter the EXEMPT path. The host is
+                    // propagated to `SafeDnsResolver.exempt_host` and
+                    // `build_redirect_policy(exempt = true)`, so a
+                    // consent-granted endpoint behaves identically to a
+                    // pre-blessed one (keeps its private literal, refuses
+                    // redirects).
+                    Ok(Some(Arc::from(host.as_str())))
+                } else {
+                    Err(ErrorCode::AirlockRejected)
+                }
+            },
+            other => other,
+        }
+    }
+}
+
 /// What to do with a redirect hop.
 #[derive(Debug, PartialEq, Eq)]
 enum RedirectAction {
@@ -473,7 +527,7 @@ impl http::Host for HostState {
         )
         .await?;
 
-        let exempt_host = egress_decision(&self.local_egress, &request.url)?;
+        let exempt_host = self.egress_decision_with_consent(&request.url)?;
 
         let tripped = Arc::new(AtomicBool::new(false));
         let client = reqwest::Client::builder()
@@ -564,7 +618,7 @@ impl http::Host for HostState {
         )
         .await?;
 
-        let exempt_host = egress_decision(&self.local_egress, &request.url)?;
+        let exempt_host = self.egress_decision_with_consent(&request.url)?;
 
         let tripped = Arc::new(AtomicBool::new(false));
         let client = reqwest::Client::builder()

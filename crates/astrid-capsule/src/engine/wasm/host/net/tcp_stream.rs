@@ -85,10 +85,21 @@ impl HostTcpStream for HostState {
                 Some(identity) => {
                     self.ingress_principal = Some(identity.principal);
                     self.ingress_device_key_id = identity.device_key_id;
+                    // A data frame off a kernel-BOUND (handshake-verified)
+                    // connection is the positive local-operator signal: stamp
+                    // the transport origin so a `publish-as` forward carries it
+                    // to the egress site. An UNBOUND connection never reaches
+                    // this arm (it has no ConnectionIdentity → `bound` is None),
+                    // so it stays `System` (fail-closed, non-local) — parallel
+                    // to the `anonymous` principal an unbound forward earns.
+                    self.ingress_origin = Some(astrid_events::ipc::MessageOrigin::LocalSocket);
                 },
                 None => {
                     self.ingress_principal = None;
                     self.ingress_device_key_id = None;
+                    // Cleared in LOCKSTEP so a stale local origin can never leak
+                    // onto a later forward off a closed/pending/unbound read.
+                    self.ingress_origin = None;
                 },
             }
         }
@@ -583,6 +594,11 @@ mod tests {
             Some("dev-abc123"),
             "a data read must record the connection's authenticating device key_id"
         );
+        assert_eq!(
+            state.ingress_origin,
+            Some(astrid_events::ipc::MessageOrigin::LocalSocket),
+            "a data read on a kernel-BOUND connection must stamp LocalSocket origin"
+        );
 
         // A subsequent non-data read (no more frames → pending) clears BOTH, so
         // a stale principal or device id can never leak onto a later forward.
@@ -599,6 +615,11 @@ mod tests {
         assert_eq!(
             state.ingress_device_key_id, None,
             "a non-data read must clear the in-flight ingress device key_id"
+        );
+        assert_eq!(
+            state.ingress_origin, None,
+            "a non-data read must clear the in-flight LocalSocket origin so a \
+             stale local origin can never leak onto a later forward"
         );
     }
 
@@ -644,6 +665,54 @@ mod tests {
         assert_eq!(
             state.ingress_device_key_id, None,
             "a non-uplink read must not populate the ingress device key_id"
+        );
+        assert_eq!(
+            state.ingress_origin, None,
+            "a non-uplink read must not stamp a transport origin"
+        );
+    }
+
+    /// A framed read off an UNBOUND connection (no `ConnectionIdentity`) must
+    /// NOT earn `LocalSocket` — it stays `None` (= `System`, fail-closed,
+    /// non-local), parallel to the `anonymous` principal an unbound forward
+    /// earns. This is the security floor that stops a peer-cred-trusted-but-
+    /// unauthenticated local connection from claiming local-operator privilege.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn framed_read_unbound_connection_does_not_earn_local_origin() {
+        use tokio::io::AsyncWriteExt;
+
+        use crate::engine::wasm::host_state::NetStream;
+        use crate::engine::wasm::test_fixtures::minimal_host_state;
+
+        let rt = tokio::runtime::Handle::current();
+        let mut state = minimal_host_state(rt);
+        // Uplink capability is set (so the registry lookup runs), but the
+        // connection is never bound — no `bind_connection_principal` call.
+        state.has_uplink_capability = true;
+
+        let (host_end, mut peer) = tokio::net::UnixStream::pair().expect("socketpair");
+        let net = NetStream::Unix(std::sync::Arc::new(tokio::sync::Mutex::new(host_end)));
+        let rep = state.resource_table.push(net).expect("push stream").rep();
+        // Deliberately NO bind: this is an unbound (unauthenticated) connection.
+
+        let payload = br#"{"topic":"x","payload":{}}"#;
+        peer.write_all(&(payload.len() as u32).to_be_bytes())
+            .await
+            .unwrap();
+        peer.write_all(payload).await.unwrap();
+        peer.flush().await.unwrap();
+
+        let status = HostTcpStream::read(&mut state, Resource::new_borrow(rep))
+            .expect("read should succeed");
+        assert!(matches!(status, NetReadStatus::Data(_)));
+        assert_eq!(
+            state.ingress_principal, None,
+            "an unbound connection stamps no verified principal"
+        );
+        assert_eq!(
+            state.ingress_origin, None,
+            "an unbound connection must NOT earn LocalSocket — it stays System \
+             (fail-closed, non-local)"
         );
     }
 }

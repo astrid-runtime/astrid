@@ -91,6 +91,8 @@ pub(crate) fn order_env_keys(env_defs: &HashMap<String, EnvDef>) -> Vec<String> 
 pub(crate) fn prompt_env_fields(
     env_defs: &HashMap<String, EnvDef>,
     env_path: &Path,
+    capsule_id: &str,
+    config_path: &Path,
 ) -> anyhow::Result<()> {
     let mut values: serde_json::Map<String, serde_json::Value> = if env_path.exists() {
         let content = std::fs::read_to_string(env_path)?;
@@ -116,6 +118,14 @@ pub(crate) fn prompt_env_fields(
         let value = prompt_single_field(key, def, &values);
 
         if !value.is_empty() {
+            // Guided pre-bless: if the operator just entered a provider endpoint
+            // pointing at a local/private address (e.g. an LM Studio / Ollama
+            // base_url), offer to add the SSRF-airlock exemption so the capsule
+            // can actually reach it. The operator is unambiguously local here
+            // (this runs in the CLI process), so a plain stdin prompt is safe —
+            // this is NOT the daemon's runtime elicitation. A non-local /
+            // free-text value is a silent no-op.
+            super::local_egress::maybe_prompt_local_egress(capsule_id, &value, config_path);
             values.insert(key.clone(), serde_json::Value::String(value));
         }
     }
@@ -441,7 +451,8 @@ type = "text"
         // `model` explicitly empty (blank-as-default), `base_url` populated.
         std::fs::write(&env_path, r#"{"model":"","base_url":"https://h"}"#).expect("write");
 
-        prompt_env_fields(&defs, &env_path).expect("no prompt → Ok");
+        let config_path = dir.path().join("config.toml");
+        prompt_env_fields(&defs, &env_path, "cap", &config_path).expect("no prompt → Ok");
 
         // Untouched: still exactly what we wrote (the function only rewrites
         // when it actually prompted).

@@ -288,6 +288,79 @@ fn filter_safe_addrs_reports_airlock_trip() {
     assert!(!saw);
 }
 
+/// A runtime consent grant must re-enter the EXEMPT path, returning the same
+/// `Ok(Some(host))` an operator pre-bless yields — so the consent-granted
+/// endpoint resolves its private literal AND refuses redirects identically
+/// (spec 8). A `LocalSocket` caller with an already-cached per-principal grant
+/// takes the existing-grant fast path (no elicitation), so this is hermetic.
+/// The complementary System/RemoteGateway case stays `Err(AirlockRejected)`.
+#[tokio::test(flavor = "multi_thread")]
+async fn consent_grant_yields_exempt_host() {
+    use std::sync::Arc;
+
+    use astrid_approval::{Allowance, AllowanceId, AllowancePattern, AllowanceStore};
+    use astrid_core::principal::PrincipalId;
+    use astrid_core::types::Timestamp;
+    use astrid_crypto::KeyPair;
+    use astrid_events::ipc::{IpcMessage, IpcPayload, MessageOrigin};
+
+    use crate::engine::wasm::test_fixtures::minimal_host_state;
+
+    let rt = tokio::runtime::Handle::current();
+    let mut state = minimal_host_state(rt);
+    let store = Arc::new(AllowanceStore::new());
+    let alice = PrincipalId::new("alice").unwrap();
+    // Pre-cache the per-principal grant (same shape `consent_local_egress`
+    // writes) so the consent call short-circuits on the existing-grant fast
+    // path — no blocking elicitation needed for this hermetic test.
+    let keypair = KeyPair::generate();
+    store
+        .add_allowance(Allowance {
+            id: AllowanceId::new(),
+            principal: alice.clone(),
+            action_pattern: AllowancePattern::NetworkHost {
+                host: "127.0.0.1".to_string(),
+                ports: Some(vec![1234]),
+            },
+            created_at: Timestamp::now(),
+            expires_at: None,
+            max_uses: None,
+            uses_remaining: None,
+            session_only: true,
+            workspace_root: None,
+            signature: keypair.sign(b"test"),
+        })
+        .unwrap();
+    state.allowance_store = Some(store);
+    state.caller_context = Some(
+        IpcMessage::new("t", IpcPayload::Connect, uuid::Uuid::nil())
+            .with_principal("alice")
+            .with_origin(MessageOrigin::LocalSocket),
+    );
+
+    // Granted local-operator endpoint → exempt host returned (re-enters exempt
+    // path).
+    let decision = state.egress_decision_with_consent("http://127.0.0.1:1234/v1/models");
+    assert_eq!(
+        decision.unwrap().as_deref(),
+        Some("127.0.0.1"),
+        "a consent-granted endpoint must return the exempt host"
+    );
+
+    // Same endpoint, but the request is NOT local (RemoteGateway): no grant
+    // applies to the origin gate, so it stays airlock-rejected.
+    state.caller_context = Some(
+        IpcMessage::new("t", IpcPayload::Connect, uuid::Uuid::nil())
+            .with_principal("alice")
+            .with_origin(MessageOrigin::RemoteGateway),
+    );
+    let decision = state.egress_decision_with_consent("http://127.0.0.1:1234/v1/models");
+    assert!(
+        matches!(decision, Err(ErrorCode::AirlockRejected)),
+        "a remote-origin request to the same endpoint must stay airlock-rejected"
+    );
+}
+
 /// An operator-allowlisted (exempt) request must NOT follow redirects:
 /// `build_redirect_policy(true, …)` yields `Policy::none()`, so a `30x` from
 /// an allowlisted endpoint can't escape the port-scoped exemption onto a

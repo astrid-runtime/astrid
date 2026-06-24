@@ -510,8 +510,12 @@ fn onboard_llm_providers(home: &AstridHome, selected: &[DistroCapsule]) {
         eprintln!();
         eprintln!("{}", Theme::header(&format!("Configure {}", cap.name)));
         let env_path = env_dir.join(format!("{}.env.json", cap.name));
-        if let Err(e) = super::capsule::install_prompts::prompt_env_fields(&manifest.env, &env_path)
-        {
+        if let Err(e) = super::capsule::install_prompts::prompt_env_fields(
+            &manifest.env,
+            &env_path,
+            &cap.name,
+            &home.config_path(),
+        ) {
             eprintln!("  Configuration for {} failed: {e}", cap.name);
         }
     }

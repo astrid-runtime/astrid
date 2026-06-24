@@ -201,7 +201,14 @@ pub async fn post_prompt(
         context: body.context,
     };
     let msg = IpcMessage::new("user.v1.prompt", payload, Uuid::nil())
-        .with_principal(caller.principal.to_string());
+        .with_principal(caller.principal.to_string())
+        // Host-stamp the transport origin: this prompt entered over the gateway
+        // HTTP listener (a remote API caller, even with a valid bearer), NOT the
+        // local Unix socket. It drives the SAME react/openai-compat egress path
+        // a local operator does, so the downstream local-egress consent gate
+        // must be able to tell them apart — a remote request must never earn
+        // local-operator privilege. Propagated unchanged through fan-out.
+        .with_origin(astrid_events::ipc::MessageOrigin::RemoteGateway);
     bus.publish(AstridEvent::Ipc {
         metadata: astrid_events::EventMetadata::new("gateway::agent.prompt"),
         message: msg,
