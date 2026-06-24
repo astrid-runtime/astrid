@@ -1,37 +1,29 @@
-#![allow(clippy::too_many_lines)]
-use std::path::PathBuf;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use astrid_capsule::capsule::CapsuleState;
 use astrid_capsule::loader::CapsuleLoader;
-use astrid_capsule::manifest::{CapabilitiesDef, CapsuleManifest, ComponentDef, PackageDef};
+use astrid_capsule::manifest::{
+    CapabilitiesDef, CapsuleManifest, ComponentDef, PackageDef, SubscribeDef,
+};
 use astrid_events::EventBus;
 use astrid_mcp::testing::test_secure_mcp_client;
 use astrid_storage::{MemoryKvStore, ScopedKvStore};
 
 use astrid_capsule::context::CapsuleContext;
 
-async fn setup_test_capsule(
+fn build_test_manifest(
+    name: &str,
+    fixture_path: &Path,
     fs_read_caps: Vec<String>,
     fs_write_caps: Vec<String>,
     net_caps: Vec<String>,
-) -> Option<(Box<dyn astrid_capsule::capsule::Capsule>, tempfile::TempDir)> {
-    let fixture_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("tests")
-        .join("fixtures")
-        .join("test-all-endpoints.wasm");
-
-    if !fixture_path.exists() {
-        eprintln!(
-            "Skipping test: Fixture not found at {}",
-            fixture_path.display()
-        );
-        return None;
-    }
-
-    let manifest = CapsuleManifest {
+    subscribes: HashMap<String, SubscribeDef>,
+) -> CapsuleManifest {
+    CapsuleManifest {
         package: PackageDef {
-            name: "test-plugin".into(),
+            name: name.into(),
             version: "0.1.0".into(),
             description: None,
             authors: vec![],
@@ -51,14 +43,14 @@ async fn setup_test_capsule(
         },
         components: vec![ComponentDef {
             id: "default".to_string(),
-            path: fixture_path.clone(),
+            path: fixture_path.to_path_buf(),
             hash: None,
             r#type: "executable".to_string(),
             link: vec![],
             capabilities: None,
         }],
-        imports: std::collections::HashMap::new(),
-        exports: std::collections::HashMap::new(),
+        imports: HashMap::new(),
+        exports: HashMap::new(),
         capabilities: CapabilitiesDef {
             net: net_caps,
             net_bind: vec![],
@@ -72,46 +64,76 @@ async fn setup_test_capsule(
             identity: vec![],
             allow_prompt_injection: false,
         },
-        env: std::collections::HashMap::default(),
+        env: HashMap::default(),
         context_files: vec![],
         commands: vec![],
         mcp_servers: vec![],
         skills: vec![],
         uplinks: vec![],
-        publishes: ::std::collections::HashMap::new(),
-        // Subscribe ACL: the `[subscribe]` keys are the only IPC-subscribe
-        // declaration (the legacy `ipc_subscribe` array is gone). A handler-less
-        // `wit = "opaque"` entry is ACL-only.
-        subscribes: ::std::collections::HashMap::from([(
-            "test.*".to_string(),
-            astrid_capsule::manifest::SubscribeDef {
-                wit: "opaque".to_string(),
-                version: None,
-                tag: None,
-                rev: None,
-                branch: None,
-                path: None,
-                handler: None,
-                priority: None,
-            },
-        )]),
-        tools: ::std::vec::Vec::new(),
-    };
+        publishes: HashMap::new(),
+        subscribes,
+        tools: vec![],
+    }
+}
 
-    let loader = CapsuleLoader::new(
+fn default_loader() -> CapsuleLoader {
+    CapsuleLoader::new(
         test_secure_mcp_client(),
         astrid_capsule::FuelLedger::default(),
         astrid_capsule::FuelRateLimiter::default(),
         astrid_capsule::MemoryLedger::default(),
         astrid_capsule::CapsuleRuntimeLimits::default(),
-    );
+    )
+}
 
-    let mut capsule = loader
-        .create_capsule(manifest, fixture_path.parent().unwrap().to_path_buf())
+fn fixture_path() -> Option<PathBuf> {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("fixtures")
+        .join("test-all-endpoints.wasm");
+    if path.exists() {
+        Some(path)
+    } else {
+        eprintln!("Skipping test: Fixture not found at {}", path.display());
+        None
+    }
+}
+
+async fn setup_test_capsule(
+    fs_read_caps: Vec<String>,
+    fs_write_caps: Vec<String>,
+    net_caps: Vec<String>,
+) -> Option<(Box<dyn astrid_capsule::capsule::Capsule>, tempfile::TempDir)> {
+    let fp = fixture_path()?;
+    // Subscribe ACL: the `[subscribe]` keys are the only IPC-subscribe
+    // declaration (the legacy `ipc_subscribe` array is gone). A handler-less
+    // `wit = "opaque"` entry is ACL-only.
+    let subscribes = HashMap::from([(
+        "test.*".to_string(),
+        SubscribeDef {
+            wit: "opaque".to_string(),
+            version: None,
+            tag: None,
+            rev: None,
+            branch: None,
+            path: None,
+            handler: None,
+            priority: None,
+        },
+    )]);
+    let manifest = build_test_manifest(
+        "test-plugin",
+        &fp,
+        fs_read_caps,
+        fs_write_caps,
+        net_caps,
+        subscribes,
+    );
+    let mut capsule = default_loader()
+        .create_capsule(manifest, fp.parent().unwrap().to_path_buf())
         .expect("Failed to create capsule");
 
     let temp_workspace = tempfile::tempdir().unwrap();
-
     let kv = ScopedKvStore::new(Arc::new(MemoryKvStore::new()), "test-plugin").unwrap();
     let event_bus = Arc::new(EventBus::with_capacity(128));
     let ctx = CapsuleContext::new(
@@ -139,88 +161,21 @@ async fn setup_test_capsule_with_home(
     tempfile::TempDir,
     tempfile::TempDir,
 )> {
-    let fixture_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("tests")
-        .join("fixtures")
-        .join("test-all-endpoints.wasm");
-
-    if !fixture_path.exists() {
-        eprintln!(
-            "Skipping test: Fixture not found at {}",
-            fixture_path.display()
-        );
-        return None;
-    }
-
-    let manifest = CapsuleManifest {
-        package: PackageDef {
-            name: "test-plugin-home".into(),
-            version: "0.1.0".into(),
-            description: None,
-            authors: vec![],
-            repository: None,
-            homepage: None,
-            documentation: None,
-            license: None,
-            license_file: None,
-            readme: None,
-            keywords: vec![],
-            categories: vec![],
-            astrid_version: None,
-            publish: None,
-            include: None,
-            exclude: None,
-            metadata: None,
-        },
-        components: vec![ComponentDef {
-            id: "default".to_string(),
-            path: fixture_path.clone(),
-            hash: None,
-            r#type: "executable".to_string(),
-            link: vec![],
-            capabilities: None,
-        }],
-        imports: std::collections::HashMap::new(),
-        exports: std::collections::HashMap::new(),
-        capabilities: CapabilitiesDef {
-            net: vec![],
-            net_bind: vec![],
-            net_connect: vec![],
-            kv: vec!["*".into()],
-            fs_read: fs_read_caps,
-            fs_write: fs_write_caps,
-            host_process: vec![],
-            allow_persistent: false,
-            uplink: false,
-            identity: vec![],
-            allow_prompt_injection: false,
-        },
-        env: std::collections::HashMap::default(),
-        context_files: vec![],
-        commands: vec![],
-        mcp_servers: vec![],
-        skills: vec![],
-        uplinks: vec![],
-        publishes: ::std::collections::HashMap::new(),
-        subscribes: ::std::collections::HashMap::new(),
-        tools: ::std::vec::Vec::new(),
-    };
-
-    let loader = CapsuleLoader::new(
-        test_secure_mcp_client(),
-        astrid_capsule::FuelLedger::default(),
-        astrid_capsule::FuelRateLimiter::default(),
-        astrid_capsule::MemoryLedger::default(),
-        astrid_capsule::CapsuleRuntimeLimits::default(),
+    let fp = fixture_path()?;
+    let manifest = build_test_manifest(
+        "test-plugin-home",
+        &fp,
+        fs_read_caps,
+        fs_write_caps,
+        vec![],
+        HashMap::new(),
     );
-
-    let mut capsule = loader
-        .create_capsule(manifest, fixture_path.parent().unwrap().to_path_buf())
+    let mut capsule = default_loader()
+        .create_capsule(manifest, fp.parent().unwrap().to_path_buf())
         .expect("Failed to create capsule");
 
     let temp_workspace = tempfile::tempdir().unwrap();
     let temp_home = tempfile::tempdir().unwrap();
-
     let kv = ScopedKvStore::new(Arc::new(MemoryKvStore::new()), "test-plugin-home").unwrap();
     let event_bus = Arc::new(EventBus::with_capacity(128));
     let ctx = CapsuleContext::new(

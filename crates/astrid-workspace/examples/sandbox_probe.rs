@@ -12,7 +12,6 @@
 
 use astrid_workspace::ProcessSandboxConfig;
 
-#[allow(clippy::unnecessary_debug_formatting)]
 fn main() {
     let writable = std::env::args()
         .nth(1)
@@ -28,11 +27,11 @@ fn main() {
     match cfg.sandbox_prefix() {
         Ok(Some(prefix)) => {
             println!("RESULT: Ok(Some) — sandboxed");
-            println!("  program: {:?}", prefix.program);
+            println!("  program: {}", prefix.program.to_string_lossy());
             println!("  arg_count: {}", prefix.args.len());
             println!("  first_args:");
             for arg in prefix.args.iter().take(4) {
-                println!("    {arg:?}");
+                println!("    {}", arg.to_string_lossy());
             }
         },
         Ok(None) => {

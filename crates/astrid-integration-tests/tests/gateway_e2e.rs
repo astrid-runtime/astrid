@@ -57,21 +57,24 @@
 // test binary before any other thread reads it, so the soundness
 // hazard doesn't apply here.
 #![allow(unsafe_code)]
-#![allow(
-    clippy::disallowed_methods,
-    clippy::too_many_lines,
-    clippy::items_after_statements
-)]
 
 use std::sync::Arc;
 
 use astrid_core::PrincipalId;
+use astrid_events::AstridEvent;
+use astrid_events::ipc::{IpcMessage, IpcPayload};
 use astrid_gateway::{GatewayConfig, GatewayState, routes};
+use axum::Router;
 use axum::body::{Body, to_bytes};
 use axum::http::{Request, StatusCode, header};
 use tempfile::TempDir;
 use tower::ServiceExt;
 
+// `std::env::set_var` is disallowed by the workspace lint policy; permitted
+// here because `set_astrid_home` is called once at the start of a single-test
+// binary before any other thread reads the env, so there is no thread-safety
+// hazard.
+#[allow(clippy::disallowed_methods)]
 fn set_astrid_home(dir: &TempDir) {
     // Safety: invoked once at the top of a single-test binary
     // before any thread reads $ASTRID_HOME.
@@ -82,6 +85,131 @@ fn set_astrid_home(dir: &TempDir) {
 
 fn looks_like_sandbox_block(err: &std::io::Error) -> bool {
     err.kind() == std::io::ErrorKind::PermissionDenied || err.raw_os_error() == Some(1) // EPERM
+}
+
+async fn check_unauthenticated_routes(router: Router) {
+    let req = Request::builder()
+        .uri("/api/distribution")
+        .body(Body::empty())
+        .unwrap();
+    let resp = router.clone().oneshot(req).await.expect("distribution");
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let req = Request::builder()
+        .uri("/api/openapi.json")
+        .body(Body::empty())
+        .unwrap();
+    let resp = router.clone().oneshot(req).await.expect("openapi");
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+    let doc: serde_json::Value = serde_json::from_slice(&bytes).expect("openapi parses");
+    assert!(
+        doc["paths"]["/api/auth/redeem"].is_object(),
+        "openapi spec must list /api/auth/redeem"
+    );
+
+    let req = Request::builder()
+        .uri("/healthz")
+        .body(Body::empty())
+        .unwrap();
+    let resp = router.clone().oneshot(req).await.expect("healthz");
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "healthz must report 200 when the daemon socket exists"
+    );
+}
+
+async fn check_audit_bus_roundtrip(event_bus: &astrid_events::EventBus) {
+    let mut bus_rx = event_bus.subscribe_topic("astrid.v1.audit.entry");
+    let payload = serde_json::json!({
+        "ts_epoch": 1_700_000_000_u64,
+        "method": "TestRoundTrip",
+        "required_capability": "none",
+        "principal": PrincipalId::default().to_string(),
+        "target_principal": serde_json::Value::Null,
+        "params": serde_json::Value::Null,
+        "outcome": "success",
+    });
+    let msg = IpcMessage::new(
+        "astrid.v1.audit.entry",
+        IpcPayload::RawJson(payload.clone()),
+        uuid::Uuid::nil(),
+    );
+    event_bus.publish(AstridEvent::Ipc {
+        metadata: astrid_events::EventMetadata::new("gateway_e2e_test"),
+        message: msg,
+    });
+
+    let recv = tokio::time::timeout(std::time::Duration::from_secs(2), bus_rx.recv()).await;
+    let event = recv
+        .expect("audit event timed out within 2s — bus wiring is broken")
+        .expect("event sender dropped before publish");
+    if let AstridEvent::Ipc { message, .. } = &*event {
+        if let IpcPayload::RawJson(v) = &message.payload {
+            assert_eq!(
+                v["method"], "TestRoundTrip",
+                "payload must round-trip intact"
+            );
+        } else {
+            panic!("expected RawJson payload, got {:?}", message.payload);
+        }
+    } else {
+        panic!("expected Ipc event variant");
+    }
+}
+
+async fn check_bearer_roundtrip(router: Router, state: &GatewayState) {
+    let pid = PrincipalId::new("e2e-test-principal").unwrap();
+    let bearer = astrid_gateway::auth::mint_bearer(&state.signing.signer, &pid, 3600);
+    let caller = astrid_gateway::auth::verify_bearer(state, &bearer)
+        .expect("gateway must verify its own bearer");
+    assert_eq!(caller.principal, pid);
+
+    let req = Request::builder()
+        .uri("/api/auth/me")
+        .header(header::AUTHORIZATION, format!("Bearer {bearer}"))
+        .body(Body::empty())
+        .unwrap();
+    let resp = router.clone().oneshot(req).await.expect("me");
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "valid bearer must reach /api/auth/me — middleware is broken otherwise"
+    );
+    let bytes = to_bytes(resp.into_body(), 4096).await.unwrap();
+    let me: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(me["principal"], "e2e-test-principal");
+
+    check_agent_fail_fast(router, &bearer).await;
+}
+
+async fn check_agent_fail_fast(router: Router, bearer: &str) {
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/agent/prompt")
+        .header(header::AUTHORIZATION, format!("Bearer {bearer}"))
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(r#"{"text":"hi"}"#))
+        .unwrap();
+    let resp = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        router.clone().oneshot(req),
+    )
+    .await
+    .expect("fail-fast must close the stream, not hang")
+    .expect("prompt");
+    assert_eq!(resp.status(), StatusCode::OK, "SSE responses are 200");
+    let bytes = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+    let body = std::str::from_utf8(&bytes).unwrap();
+    assert!(
+        body.contains("agent loop not ready"),
+        "fail-fast must name the unconfigured loop; body: {body}"
+    );
+    assert!(
+        !body.contains("event:ready") && !body.contains("event: ready"),
+        "must NOT emit a ready event on the fail-fast path; body: {body}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -145,37 +273,7 @@ async fn kernel_and_gateway_boot_against_shared_home() {
 
     // ── Unauthenticated routes against the live state ────────────
     let router = routes::build(Arc::clone(&state));
-
-    let req = Request::builder()
-        .uri("/api/distribution")
-        .body(Body::empty())
-        .unwrap();
-    let resp = router.clone().oneshot(req).await.expect("distribution");
-    assert_eq!(resp.status(), StatusCode::OK);
-
-    let req = Request::builder()
-        .uri("/api/openapi.json")
-        .body(Body::empty())
-        .unwrap();
-    let resp = router.clone().oneshot(req).await.expect("openapi");
-    assert_eq!(resp.status(), StatusCode::OK);
-    let bytes = to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
-    let doc: serde_json::Value = serde_json::from_slice(&bytes).expect("openapi parses");
-    assert!(
-        doc["paths"]["/api/auth/redeem"].is_object(),
-        "openapi spec must list /api/auth/redeem"
-    );
-
-    let req = Request::builder()
-        .uri("/healthz")
-        .body(Body::empty())
-        .unwrap();
-    let resp = router.clone().oneshot(req).await.expect("healthz");
-    assert_eq!(
-        resp.status(),
-        StatusCode::OK,
-        "healthz must report 200 when the daemon socket exists"
-    );
+    check_unauthenticated_routes(router.clone()).await;
 
     // ── Audit event bus round-trip ──────────────────────────────
     //
@@ -183,115 +281,15 @@ async fn kernel_and_gateway_boot_against_shared_home() {
     // publish a synthetic audit event via the kernel's bus and
     // confirm it reaches us. This proves the bus → SSE wiring
     // (everything below the HTTP layer) works against the live
-    // kernel. The kernel's own admin dispatchers publish on this
-    // same topic when their handlers run; the SSE handler's job is
-    // to forward those events to subscribers, which we'd hit here
-    // if `AdminClient::connect` could complete a handshake.
-    use astrid_events::AstridEvent;
-    use astrid_events::ipc::{IpcMessage, IpcPayload};
+    // kernel.
+    check_audit_bus_roundtrip(&kernel.event_bus).await;
 
-    let mut bus_rx = kernel.event_bus.subscribe_topic("astrid.v1.audit.entry");
-    let payload = serde_json::json!({
-        "ts_epoch": 1_700_000_000_u64,
-        "method": "TestRoundTrip",
-        "required_capability": "none",
-        "principal": PrincipalId::default().to_string(),
-        "target_principal": serde_json::Value::Null,
-        "params": serde_json::Value::Null,
-        "outcome": "success",
-    });
-    let msg = IpcMessage::new(
-        "astrid.v1.audit.entry",
-        IpcPayload::RawJson(payload.clone()),
-        uuid::Uuid::nil(),
-    );
-    kernel.event_bus.publish(AstridEvent::Ipc {
-        metadata: astrid_events::EventMetadata::new("gateway_e2e_test"),
-        message: msg,
-    });
-
-    let recv = tokio::time::timeout(std::time::Duration::from_secs(2), bus_rx.recv()).await;
-    let event = recv
-        .expect("audit event timed out within 2s — bus wiring is broken")
-        .expect("event sender dropped before publish");
-    if let AstridEvent::Ipc { message, .. } = &*event {
-        if let IpcPayload::RawJson(v) = &message.payload {
-            assert_eq!(
-                v["method"], "TestRoundTrip",
-                "payload must round-trip intact"
-            );
-        } else {
-            panic!("expected RawJson payload, got {:?}", message.payload);
-        }
-    } else {
-        panic!("expected Ipc event variant");
-    }
-
-    // ── Bearer mint / verify round-trip ─────────────────────────
+    // ── Bearer / verify round-trip + agent fail-fast ──
     //
-    // Independent of the kernel — exercises the gateway's own
-    // signing key. Mint a bearer for an arbitrary principal,
-    // re-verify it via the same state, confirm the principal
-    // round-trips.
-    let pid = PrincipalId::new("e2e-test-principal").unwrap();
-    let bearer = astrid_gateway::auth::mint_bearer(&state.signing.signer, &pid, 3600);
-    let caller = astrid_gateway::auth::verify_bearer(&state, &bearer)
-        .expect("gateway must verify its own bearer");
-    assert_eq!(caller.principal, pid);
-
-    // The bearer must also be honoured by the router (i.e. the
-    // auth middleware is reading from the same signing material).
-    let req = Request::builder()
-        .uri("/api/auth/me")
-        .header(header::AUTHORIZATION, format!("Bearer {bearer}"))
-        .body(Body::empty())
-        .unwrap();
-    let resp = router.clone().oneshot(req).await.expect("me");
-    assert_eq!(
-        resp.status(),
-        StatusCode::OK,
-        "valid bearer must reach /api/auth/me — middleware is broken otherwise"
-    );
-    let bytes = to_bytes(resp.into_body(), 4096).await.unwrap();
-    let me: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-    assert_eq!(me["principal"], "e2e-test-principal");
-
-    // ── Agent-loop fail-fast for a non-admin principal ──────────
-    //
-    // The in-process readiness probe (wired from the kernel registry via
-    // `kernel.agent_readiness_probe()`) reports not-ready for this
-    // empty-registry daemon, so `POST /api/agent/prompt` must emit a single
-    // `error` SSE event and close immediately rather than `ready` + a long
-    // timeout. Crucially it must do so for ANY authenticated caller — the
-    // `e2e-test-principal` bearer above holds no `capsule:list`, which is the
-    // whole point of reading readiness in-process instead of through the
-    // capability-gated request. The timeout guards against a regression that
-    // turns the fail-fast back into an open stream (which would hang `oneshot`).
-    let req = Request::builder()
-        .method("POST")
-        .uri("/api/agent/prompt")
-        .header(header::AUTHORIZATION, format!("Bearer {bearer}"))
-        .header(header::CONTENT_TYPE, "application/json")
-        .body(Body::from(r#"{"text":"hi"}"#))
-        .unwrap();
-    let resp = tokio::time::timeout(
-        std::time::Duration::from_secs(10),
-        router.clone().oneshot(req),
-    )
-    .await
-    .expect("fail-fast must close the stream, not hang")
-    .expect("prompt");
-    assert_eq!(resp.status(), StatusCode::OK, "SSE responses are 200");
-    let bytes = to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
-    let body = std::str::from_utf8(&bytes).unwrap();
-    assert!(
-        body.contains("agent loop not ready"),
-        "fail-fast must name the unconfigured loop; body: {body}"
-    );
-    assert!(
-        !body.contains("event:ready") && !body.contains("event: ready"),
-        "must NOT emit a ready event on the fail-fast path; body: {body}"
-    );
+    // Exercises the gateway's own signing key and confirms the
+    // agent-loop fail-fast path closes immediately when no capsule
+    // is loaded.
+    check_bearer_roundtrip(router, &state).await;
 
     // ── Cleanup ─────────────────────────────────────────────────
     kernel.shutdown(Some("e2e-test-complete".into())).await;

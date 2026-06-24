@@ -20,7 +20,7 @@
 //! wire-format / decision-matrix contract visible from outside the
 //! kernel crate.
 
-#![allow(clippy::arithmetic_side_effects, clippy::field_reassign_with_default)]
+#![allow(clippy::arithmetic_side_effects)]
 
 use astrid_capabilities::{CapabilityCheck, PermissionError};
 use astrid_core::kernel_api::{
@@ -43,21 +43,24 @@ fn pid(name: &str) -> PrincipalId {
 }
 
 fn admin_profile() -> PrincipalProfile {
-    let mut p = PrincipalProfile::default();
-    p.groups = vec!["admin".to_string()];
-    p
+    PrincipalProfile {
+        groups: vec!["admin".to_string()],
+        ..Default::default()
+    }
 }
 
 fn agent_profile() -> PrincipalProfile {
-    let mut p = PrincipalProfile::default();
-    p.groups = vec!["agent".to_string()];
-    p
+    PrincipalProfile {
+        groups: vec!["agent".to_string()],
+        ..Default::default()
+    }
 }
 
 fn restricted_profile() -> PrincipalProfile {
-    let mut p = PrincipalProfile::default();
-    p.groups = vec!["restricted".to_string()];
-    p
+    PrincipalProfile {
+        groups: vec!["restricted".to_string()],
+        ..Default::default()
+    }
 }
 
 fn all_admin_variants() -> Vec<AdminRequestKind> {
@@ -379,8 +382,10 @@ fn arcswap_groupconfig_reload_is_observable_from_subsequent_check() {
 
     let swap: Arc<ArcSwap<GroupConfig>> =
         Arc::new(ArcSwap::from_pointee(GroupConfig::builtin_only()));
-    let mut profile = PrincipalProfile::default();
-    profile.groups = vec!["ops".to_string()];
+    let profile = PrincipalProfile {
+        groups: vec!["ops".to_string()],
+        ..Default::default()
+    };
     let caller = pid("ops_user");
 
     // Pre-swap: unknown group `ops` fails closed.
