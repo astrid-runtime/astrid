@@ -33,8 +33,9 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::capability_grammar::{CapabilityGrammarError, validate_capability};
+use crate::capability_grammar::CapabilityGrammarError;
 use crate::dirs::AstridHome;
+use crate::profile::{CapabilityPattern, GroupName, ProfileFieldError};
 
 /// Canonical name of the built-in administrator group.
 pub const BUILTIN_ADMIN: &str = "admin";
@@ -69,6 +70,14 @@ pub enum GroupConfigError {
     DuplicateName {
         /// Duplicated group name.
         name: String,
+    },
+    /// A group entry uses a name outside the profile group-name grammar.
+    #[error("groups config: group name {name:?} rejected: {reason}")]
+    InvalidName {
+        /// Raw group name that failed validation.
+        name: String,
+        /// Underlying group-name validation error.
+        reason: ProfileFieldError,
     },
     /// A group entry contains a capability that fails the grammar
     /// validator.
@@ -137,6 +146,28 @@ pub struct Group {
 pub struct GroupConfig {
     /// Group name → group definition.
     pub groups: HashMap<String, Group>,
+}
+
+/// Borrowed typed view over a string-shaped [`Group`].
+///
+/// `Group` remains the public/wire shape for TOML, JSON, and admin APIs.
+/// Internal authorization code can use this view to keep group capability
+/// patterns distinct from other string domains without cloning group config.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ValidatedGroup<'a> {
+    /// Validated capability patterns conferred by this group.
+    pub capabilities: Vec<CapabilityPattern<&'a str>>,
+}
+
+/// Borrowed typed view over a string-shaped [`GroupConfig`].
+///
+/// The map keys are validated group names and each group contains validated
+/// capability patterns. Construction fails closed if a public caller has built
+/// an invalid in-memory [`GroupConfig`] without going through the loader or
+/// mutation helpers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ValidatedGroupConfig<'a> {
+    groups: HashMap<GroupName<&'a str>, ValidatedGroup<'a>>,
 }
 
 /// TOML wrapper: the on-disk representation uses a top-level `[groups.*]`
@@ -208,6 +239,7 @@ impl GroupConfig {
             if is_builtin(name) {
                 return Err(GroupConfigError::RedefinedBuiltin { name: name.clone() });
             }
+            validate_group_name(name)?;
         }
 
         // Validate each custom group's capability entries.
@@ -227,7 +259,9 @@ impl GroupConfig {
             groups.insert(name, group);
         }
 
-        Ok(Self { groups })
+        let config = Self { groups };
+        config.typed()?;
+        Ok(config)
     }
 
     /// Look up a group by name, if present.
@@ -282,6 +316,7 @@ impl GroupConfig {
         if is_builtin(&name) {
             return Err(GroupConfigError::RedefinedBuiltin { name });
         }
+        validate_group_name(&name)?;
         if self.groups.contains_key(&name) {
             return Err(GroupConfigError::DuplicateName { name });
         }
@@ -289,7 +324,9 @@ impl GroupConfig {
 
         let mut next = self.groups.clone();
         next.insert(name, group);
-        Ok(Self { groups: next })
+        let config = Self { groups: next };
+        config.typed()?;
+        Ok(config)
     }
 
     /// Return a new [`GroupConfig`] with a partial update applied to a
@@ -314,6 +351,7 @@ impl GroupConfig {
                 name: name.to_string(),
             });
         }
+        validate_group_name(name)?;
         let existing = self
             .groups
             .get(name)
@@ -334,7 +372,9 @@ impl GroupConfig {
 
         let mut next = self.groups.clone();
         next.insert(name.to_string(), updated);
-        Ok(Self { groups: next })
+        let config = Self { groups: next };
+        config.typed()?;
+        Ok(config)
     }
 
     /// Return a new [`GroupConfig`] with `name` removed.
@@ -353,6 +393,7 @@ impl GroupConfig {
                 name: name.to_string(),
             });
         }
+        validate_group_name(name)?;
         if !self.groups.contains_key(name) {
             return Err(GroupConfigError::UnknownGroup {
                 name: name.to_string(),
@@ -361,6 +402,46 @@ impl GroupConfig {
         let mut next = self.groups.clone();
         next.remove(name);
         Ok(Self { groups: next })
+    }
+
+    /// Convert this public string-shaped config into a borrowed typed view.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GroupConfigError`] if any group name or capability pattern
+    /// violates the same grammar enforced by load and mutation helpers.
+    pub fn typed(&self) -> GroupConfigResult<ValidatedGroupConfig<'_>> {
+        ValidatedGroupConfig::try_from(self)
+    }
+}
+
+impl<'a> ValidatedGroupConfig<'a> {
+    /// Look up a validated group by validated group name.
+    #[must_use]
+    pub fn get(&self, name: &GroupName<&'a str>) -> Option<&ValidatedGroup<'a>> {
+        self.groups.get(name)
+    }
+}
+
+impl<'a> TryFrom<&'a GroupConfig> for ValidatedGroupConfig<'a> {
+    type Error = GroupConfigError;
+
+    fn try_from(config: &'a GroupConfig) -> Result<Self, Self::Error> {
+        let mut groups = HashMap::with_capacity(config.groups.len());
+        for (name, group) in &config.groups {
+            let name =
+                GroupName::new(name.as_str()).map_err(|reason| GroupConfigError::InvalidName {
+                    name: name.clone(),
+                    reason,
+                })?;
+            let group = validate_group_view(name.as_str(), group)?;
+            if groups.insert(name, group).is_some() {
+                return Err(GroupConfigError::DuplicateName {
+                    name: name.as_str().to_string(),
+                });
+            }
+        }
+        Ok(Self { groups })
     }
 }
 
@@ -372,6 +453,13 @@ impl Default for GroupConfig {
 
 fn is_builtin(name: &str) -> bool {
     BUILTIN_NAMES.contains(&name)
+}
+
+fn validate_group_name(name: &str) -> GroupConfigResult<GroupName<&str>> {
+    GroupName::new(name).map_err(|reason| GroupConfigError::InvalidName {
+        name: name.to_string(),
+        reason,
+    })
 }
 
 fn builtin_entries() -> [(&'static str, Group); 3] {
@@ -421,14 +509,9 @@ fn builtin_entries() -> [(&'static str, Group); 3] {
 }
 
 fn validate_custom_group(name: &str, group: &Group) -> GroupConfigResult<()> {
+    validate_group_name(name)?;
     for cap in &group.capabilities {
-        if let Err(reason) = validate_capability(cap) {
-            return Err(GroupConfigError::InvalidCapability {
-                group: name.to_string(),
-                cap: cap.clone(),
-                reason,
-            });
-        }
+        validate_group_capability(name, cap)?;
         if cap == "*" && !group.unsafe_admin {
             return Err(GroupConfigError::UnsafeUniversalGrant {
                 group: name.to_string(),
@@ -436,6 +519,40 @@ fn validate_custom_group(name: &str, group: &Group) -> GroupConfigResult<()> {
         }
     }
     Ok(())
+}
+
+fn validate_group_view<'a>(name: &str, group: &'a Group) -> GroupConfigResult<ValidatedGroup<'a>> {
+    let capabilities = group
+        .capabilities
+        .iter()
+        .map(|cap| {
+            let pattern = validate_group_capability(name, cap.as_str())?;
+            if pattern == "*" && !group.unsafe_admin && name != BUILTIN_ADMIN {
+                return Err(GroupConfigError::UnsafeUniversalGrant {
+                    group: name.to_string(),
+                });
+            }
+            Ok(pattern)
+        })
+        .collect::<GroupConfigResult<_>>()?;
+    Ok(ValidatedGroup { capabilities })
+}
+
+fn validate_group_capability<'a>(
+    group: &str,
+    cap: &'a str,
+) -> GroupConfigResult<CapabilityPattern<&'a str>> {
+    match CapabilityPattern::new(cap) {
+        Ok(pattern) => Ok(pattern),
+        Err(ProfileFieldError::InvalidCapabilityPattern(reason)) => {
+            Err(GroupConfigError::InvalidCapability {
+                group: group.to_string(),
+                cap: cap.to_string(),
+                reason,
+            })
+        },
+        Err(other) => unreachable!("CapabilityPattern only returns capability errors: {other}"),
+    }
 }
 
 #[cfg(test)]
@@ -543,6 +660,19 @@ mod tests {
             GroupConfig::from_toml_str(toml_doc),
             Err(GroupConfigError::Parse(_))
         ));
+    }
+
+    #[test]
+    fn rejects_invalid_group_name_key() {
+        let toml_doc = r#"
+            [groups."ops/team"]
+            capabilities = ["capsule:install"]
+        "#;
+        let err = GroupConfig::from_toml_str(toml_doc).unwrap_err();
+        match err {
+            GroupConfigError::InvalidName { name, .. } => assert_eq!(name, "ops/team"),
+            other => panic!("expected InvalidName, got: {other:?}"),
+        }
     }
 
     #[test]
@@ -662,11 +792,45 @@ mod tests {
     }
 
     #[test]
+    fn insert_custom_group_rejects_invalid_group_name() {
+        let err = GroupConfig::builtin_only()
+            .insert_custom_group("ops/team".to_string(), custom(&["capsule:install"]))
+            .unwrap_err();
+        assert!(matches!(err, GroupConfigError::InvalidName { .. }));
+    }
+
+    #[test]
     fn insert_custom_group_rejects_unsafe_star_without_opt_in() {
         let err = GroupConfig::builtin_only()
             .insert_custom_group("privileged".to_string(), custom(&["*"]))
             .unwrap_err();
         assert!(matches!(err, GroupConfigError::UnsafeUniversalGrant { .. }));
+    }
+
+    #[test]
+    fn typed_view_rejects_manual_unsafe_star_without_opt_in() {
+        let cfg = GroupConfig {
+            groups: HashMap::from([(
+                "privileged".to_string(),
+                Group {
+                    capabilities: vec!["*".to_string()],
+                    description: None,
+                    unsafe_admin: false,
+                },
+            )]),
+        };
+        let err = cfg.typed().unwrap_err();
+        assert!(matches!(err, GroupConfigError::UnsafeUniversalGrant { .. }));
+    }
+
+    #[test]
+    fn typed_view_accepts_builtin_admin_star() {
+        let cfg = GroupConfig::builtin_only();
+        let typed = cfg.typed().unwrap();
+        assert!(
+            typed.get(&GroupName::new(BUILTIN_ADMIN).unwrap()).is_some(),
+            "built-in admin must remain valid despite unsafe_admin=false"
+        );
     }
 
     #[test]

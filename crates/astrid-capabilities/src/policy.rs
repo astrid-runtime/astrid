@@ -43,7 +43,7 @@
 
 use astrid_core::{
     CapabilityPattern, DeviceScope, GroupConfig, PrincipalId, PrincipalProfile,
-    ValidatedProfileFields, capability_matches,
+    ValidatedGroupConfig, ValidatedProfileFields, capability_matches,
 };
 use thiserror::Error;
 use tracing::warn;
@@ -102,14 +102,14 @@ pub enum PermissionError {
 /// Borrowed evaluator over a resolved profile and the shared group
 /// configuration.
 ///
-/// The profile is validated into a borrowed typed view at construction, so
-/// repeated capability checks reuse the same field classification instead of
-/// reparsing the profile strings. The evaluator remains thread-safe: all
-/// runtime inputs are shared references.
+/// The profile and group config are validated into borrowed typed views at
+/// construction, so repeated capability checks reuse the same field
+/// classification instead of reparsing strings. The evaluator remains
+/// thread-safe: all runtime inputs are shared references.
 #[derive(Debug, Clone)]
 pub struct CapabilityCheck<'a> {
     profile: Result<ValidatedProfileFields<'a>, String>,
-    groups: &'a GroupConfig,
+    groups: Result<ValidatedGroupConfig<'a>, String>,
     principal: PrincipalId,
     /// Optional per-device attenuation floor. `None` (the default) means the
     /// check is unattenuated — the principal's full effective capability set
@@ -132,6 +132,7 @@ impl<'a> CapabilityCheck<'a> {
         principal: PrincipalId,
     ) -> Self {
         let profile = profile.typed_fields().map_err(|e| e.to_string());
+        let groups = groups.typed().map_err(|e| e.to_string());
         Self {
             profile,
             groups,
@@ -271,8 +272,20 @@ impl<'a> CapabilityCheck<'a> {
     }
 
     fn holds_via_groups(&self, profile: &ValidatedProfileFields<'_>, cap: &str) -> bool {
+        let groups = match &self.groups {
+            Ok(groups) => groups,
+            Err(e) => {
+                warn!(
+                    security_event = true,
+                    principal = %self.principal,
+                    error = %e,
+                    "Group config contains invalid typed fields — no group capabilities inherited"
+                );
+                return false;
+            },
+        };
         for name in &profile.groups {
-            let Some(group) = self.groups.get(name.as_str()) else {
+            let Some(group) = groups.get(name) else {
                 warn!(
                     security_event = true,
                     principal = %self.principal,
@@ -281,7 +294,10 @@ impl<'a> CapabilityCheck<'a> {
                 );
                 continue;
             };
-            if matches_any(group.capabilities.iter().map(String::as_str), cap) {
+            if matches_any(
+                group.capabilities.iter().map(CapabilityPattern::as_str),
+                cap,
+            ) {
                 return true;
             }
         }
@@ -535,6 +551,53 @@ mod tests {
         let chk = CapabilityCheck::new(&p, &cfg, pid());
         assert!(chk.has("capsule:install"));
         assert!(!chk.has("capsule:reload"));
+    }
+
+    #[test]
+    fn invalid_group_config_fails_closed_for_inherited_caps() {
+        let cfg = GroupConfig {
+            groups: std::collections::HashMap::from([(
+                "ops/team".to_string(),
+                astrid_core::Group {
+                    capabilities: vec!["*".to_string()],
+                    description: None,
+                    unsafe_admin: true,
+                },
+            )]),
+        };
+        let mut p = profile_in(&["restricted"]);
+        p.grants.push(cap("capsule:install"));
+        let chk = CapabilityCheck::new(&p, &cfg, pid());
+
+        assert!(
+            !chk.has("system:shutdown"),
+            "invalid group config must not confer inherited capabilities"
+        );
+        assert!(
+            chk.has("capsule:install"),
+            "direct grants do not depend on group inheritance"
+        );
+    }
+
+    #[test]
+    fn manual_group_star_without_opt_in_fails_closed_for_inherited_caps() {
+        let cfg = GroupConfig {
+            groups: std::collections::HashMap::from([(
+                "privileged".to_string(),
+                astrid_core::Group {
+                    capabilities: vec!["*".to_string()],
+                    description: None,
+                    unsafe_admin: false,
+                },
+            )]),
+        };
+        let p = profile_in(&["privileged"]);
+        let chk = CapabilityCheck::new(&p, &cfg, pid());
+
+        assert!(
+            !chk.has("system:shutdown"),
+            "manual non-admin groups must not inherit universal access without unsafe_admin"
+        );
     }
 
     #[test]

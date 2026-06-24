@@ -42,7 +42,7 @@ pub use elicitation::{
 };
 pub use groups::{
     BUILTIN_ADMIN, BUILTIN_AGENT, BUILTIN_RESTRICTED, Group, GroupConfig, GroupConfigError,
-    GroupConfigResult,
+    GroupConfigResult, ValidatedGroup, ValidatedGroupConfig,
 };
 pub use principal::{PrincipalId, PrincipalIdError};
 pub use profile::{
