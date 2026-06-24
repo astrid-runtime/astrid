@@ -16,8 +16,27 @@ impl HostState {
 
     /// Return the effective KV store for the current invocation.
     ///
-    /// Uses `invocation_kv` if set (different principal), falls back to
-    /// the capsule's default `kv` store.
+    /// Per-principal isolation lives HERE, not in capsule keys. Every store is
+    /// namespaced `{principal}:capsule:{capsule_id}`, so two principals writing
+    /// the *same* logical key — e.g. capsule-session's principal-less
+    /// `session.data.{id}` — resolve to different backing namespaces and never
+    /// collide. A capsule therefore must not (and need not) fold the principal
+    /// into its own keys.
+    ///
+    /// Resolution: `invocation_kv` (the per-call store installed when the caller
+    /// differs from the load-time owner) wins; otherwise the owner `kv`. The
+    /// owner fallback is correct in exactly two cases — no caller in scope
+    /// (load-time, a run-loop's own work, tests) or the caller IS the owner.
+    /// The case it does NOT defend against is a caller whose principal is
+    /// absent/unparseable while `invocation_kv` is unset: a principal-scoped
+    /// capsule would then silently touch the owner's namespace. That cannot
+    /// happen today because every producer of a principal-scoped topic stamps
+    /// an authenticated principal (`publish_inner` → `with_principal`; uplink
+    /// ingress → verified `ingress_principal`). The invariant is emergent, so it
+    /// is pinned by the `effective_kv_*` / `scoped_kv_*` tests rather than a
+    /// host-wide assert — see `debug_assert_invocation_field_set` for why a
+    /// blanket fail-closed assert on the absent-principal case is unsound.
+    /// Relates to #977.
     #[must_use]
     pub fn effective_kv(&self) -> &ScopedKvStore {
         #[cfg(debug_assertions)]

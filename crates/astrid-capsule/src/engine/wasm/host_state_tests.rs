@@ -495,3 +495,107 @@ fn connection_principal_registry_round_trip() {
     state.unbind_connection_principal(rep);
     assert_eq!(state.connection_principal(rep), None);
 }
+
+// ── Per-principal KV isolation (#977) ────────────────────────────────────
+//
+// capsule-session keys its store as the principal-less `session.data.{id}`,
+// relying entirely on the host KV namespace (`{principal}:capsule:{capsule_id}`)
+// for cross-principal isolation. These tests pin that invariant explicitly and
+// guard the boundary of `effective_kv`'s owner-store fallback.
+
+#[test]
+fn effective_kv_prefers_invocation_over_owner_and_falls_back() {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap();
+    let mut state = minimal_host_state(rt.handle().clone());
+
+    // No invocation store installed → the load-time owner store.
+    assert!(
+        std::ptr::eq(state.effective_kv(), &state.kv),
+        "with no invocation store, effective_kv returns the owner store"
+    );
+
+    // Install a distinct per-invocation store → accessor switches to it.
+    state.invocation_kv = Some(super::super::test_fixtures::mem_kv("alice:capsule:session"));
+    assert!(
+        !std::ptr::eq(state.effective_kv(), &state.kv),
+        "with an invocation store installed, effective_kv returns it, not the owner store"
+    );
+
+    // Clear → falls back to the owner store.
+    state.invocation_kv = None;
+    assert!(
+        std::ptr::eq(state.effective_kv(), &state.kv),
+        "after clear, effective_kv falls back to the owner store"
+    );
+}
+
+#[test]
+fn scoped_kv_namespacing_isolates_identical_session_keys_across_principals() {
+    use astrid_storage::{MemoryKvStore, ScopedKvStore};
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap();
+
+    // One physical backend, two per-principal namespaces — the production shape
+    // (`ScopedKvStore::with_namespace` over a shared store).
+    let backend = Arc::new(MemoryKvStore::new());
+    let alice = ScopedKvStore::new(backend.clone(), "alice:capsule:session").unwrap();
+    let bob = ScopedKvStore::new(backend.clone(), "bob:capsule:session").unwrap();
+
+    // capsule-session's exact, principal-less key.
+    let key = "session.data.default";
+
+    rt.block_on(async {
+        alice.set(key, b"alice-history".to_vec()).await.unwrap();
+        bob.set(key, b"bob-history".to_vec()).await.unwrap();
+
+        assert_eq!(
+            alice.get(key).await.unwrap(),
+            Some(b"alice-history".to_vec()),
+            "alice must read her own session under an identical key"
+        );
+        assert_eq!(
+            bob.get(key).await.unwrap(),
+            Some(b"bob-history".to_vec()),
+            "bob must read his own session — same key, different namespace, no collision"
+        );
+    });
+}
+
+#[test]
+fn effective_kv_falls_back_to_owner_for_principalless_message() {
+    // The documented contamination edge (#977): a message IS in scope but
+    // carries no parseable principal, and no invocation store is installed —
+    // `effective_kv` falls back to the OWNER store. This pins the current,
+    // intentional behaviour. The host cannot fail closed here because
+    // principal-less system handlers (watchdog ticks, capsules_loaded) rely on
+    // the same fallback; capsule-session is protected instead by the
+    // producer-side invariant that session topics always carry an authenticated
+    // principal. If this assertion ever needs to change, the isolation contract
+    // is changing — make that deliberate.
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap();
+    let mut state = minimal_host_state(rt.handle().clone());
+    state.principal = astrid_core::PrincipalId::new("owner").expect("valid owner");
+
+    let msg = astrid_events::ipc::IpcMessage::new(
+        Topic::from_raw("session.v1.append"),
+        astrid_events::ipc::IpcPayload::RawJson(serde_json::json!({})),
+        uuid::Uuid::new_v4(),
+    );
+    assert!(
+        msg.principal.is_none(),
+        "fixture message must carry no principal for this edge"
+    );
+    state.caller_context = Some(msg);
+    // invocation_kv intentionally left None.
+
+    assert!(
+        std::ptr::eq(state.effective_kv(), &state.kv),
+        "a principal-less in-scope message falls back to the owner store (the #977 edge)"
+    );
+}
