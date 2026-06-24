@@ -45,6 +45,14 @@ pub(crate) const CAPSULES_DIR: &str = "capsules";
 /// the capsule-download ceiling. Defends against decompression bombs.
 const MAX_MEMBER_BYTES: u64 = 50 * 1024 * 1024;
 
+/// Whether a member of `len` bytes is within the per-member size cap.
+///
+/// Pulled out as a pure predicate so the boundary is unit-testable and the
+/// pack/unpack paths share one definition of "too big".
+fn within_member_limit(len: u64) -> bool {
+    len <= MAX_MEMBER_BYTES
+}
+
 /// The payload of a [`ShuttleEntry`]: either in-memory bytes (for the
 /// small manifest/lock/sig members) or a path to a staged file streamed
 /// in at pack time (for capsules, which are already on disk and can be up
@@ -117,6 +125,15 @@ pub(crate) fn pack(out_path: &Path, mut entries: Vec<ShuttleEntry>) -> anyhow::R
                     let metadata = std::fs::metadata(src).with_context(|| {
                         format!("failed to stat staged capsule {}", src.display())
                     })?;
+                    if !within_member_limit(metadata.len()) {
+                        bail!(
+                            "shuttle member '{}' is {} bytes ({}), exceeding the \
+                             {MAX_MEMBER_BYTES}-byte per-member limit",
+                            src.display(),
+                            metadata.len(),
+                            entry.path
+                        );
+                    }
                     header.set_size(metadata.len());
                     header.set_cksum();
                     let mut file = std::fs::File::open(src).with_context(|| {
@@ -184,6 +201,17 @@ pub(crate) fn unpack(archive_path: &Path, dest: &Path) -> anyhow::Result<()> {
         // Skip directory entries — parents are created as needed below.
         if et.is_dir() {
             continue;
+        }
+        // Everything that survives to here must be an ordinary file. Device
+        // nodes, FIFOs, sockets, and any other special entry type are
+        // rejected: a `.shuttle` only ever legitimately carries regular
+        // files, so an exotic type is either corruption or an attack.
+        if !et.is_file() {
+            bail!(
+                "malicious shuttle detected: unsupported entry type for '{}' \
+                 (only regular files are allowed)",
+                entry_path.display()
+            );
         }
 
         let size = entry.header().size().unwrap_or(0);
@@ -356,5 +384,79 @@ mod tests {
         assert!(validate_archive_path("/etc/passwd").is_err());
         assert!(validate_archive_path("").is_err());
         assert!(validate_archive_path("capsules/ok.capsule").is_ok());
+    }
+
+    #[test]
+    fn within_member_limit_boundary() {
+        // At the cap is allowed; one byte over is not.
+        assert!(within_member_limit(MAX_MEMBER_BYTES));
+        assert!(within_member_limit(MAX_MEMBER_BYTES - 1));
+        assert!(within_member_limit(0));
+        assert!(!within_member_limit(MAX_MEMBER_BYTES + 1));
+    }
+
+    #[test]
+    fn unpack_rejects_non_regular_entry() {
+        // Hand-build a gzipped tar whose single member is a FIFO (a
+        // non-regular entry). `unpack` must refuse it rather than try to
+        // materialize a special file.
+        let dir = tempfile::tempdir().unwrap();
+        let shuttle = dir.path().join("fifo.shuttle");
+
+        {
+            let file = std::fs::File::create(&shuttle).unwrap();
+            let encoder = flate2::GzBuilder::new().write(file, flate2::Compression::new(6));
+            let mut tar = tar::Builder::new(encoder);
+
+            let mut header = tar::Header::new_gnu();
+            header.set_mtime(0);
+            header.set_uid(0);
+            header.set_gid(0);
+            header.set_mode(0o644);
+            header.set_size(0);
+            header.set_entry_type(tar::EntryType::fifo());
+            header.set_cksum();
+            tar.append_data(&mut header, "capsules/evil.capsule", std::io::empty())
+                .unwrap();
+
+            let encoder = tar.into_inner().unwrap();
+            encoder.finish().unwrap();
+        }
+
+        let mirror = dir.path().join("mirror");
+        let err = unpack(&shuttle, &mirror).unwrap_err();
+        let msg = err.to_string().to_lowercase();
+        assert!(
+            msg.contains("unsupported entry type"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn pack_rejects_oversized_file_member() {
+        // A staged `File` member larger than the per-member cap must be
+        // rejected at pack time, naming the file. Use a sparse file so we
+        // don't actually write 50 MB to disk.
+        let dir = tempfile::tempdir().unwrap();
+        let staged = dir.path().join("astrid-capsule-cli.capsule");
+        let f = std::fs::File::create(&staged).unwrap();
+        f.set_len(MAX_MEMBER_BYTES + 1).unwrap();
+        drop(f);
+
+        let out = dir.path().join("over.shuttle");
+        let err = pack(
+            &out,
+            vec![ShuttleEntry {
+                path: capsule_member_path("astrid-capsule-cli"),
+                content: ShuttleContent::File(staged.clone()),
+            }],
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("per-member limit"), "unexpected error: {err}");
+        assert!(
+            msg.contains(&staged.display().to_string()),
+            "error should name the offending file: {err}"
+        );
     }
 }
