@@ -37,8 +37,15 @@ pub enum AllowancePattern {
         permission: Permission,
     },
 
-    /// Match network access to a host.
+    /// Match network access to a host, scoped to a single capsule.
+    ///
+    /// `capsule_id` is load-bearing: a grant for capsule A reaching `host:port`
+    /// must never exempt capsule B reaching the same endpoint for the same
+    /// principal. The matcher requires the action's `capsule_id` to equal this
+    /// one, so the discriminator cannot be widened across capsules.
     NetworkHost {
+        /// Capsule the grant is scoped to.
+        capsule_id: String,
         /// Target hostname.
         host: String,
         /// Allowed ports (None = all ports).
@@ -98,7 +105,7 @@ impl AllowancePattern {
     /// - `ServerTools` matches any `McpToolCall` on that server.
     /// - `FilePattern` matches `FileRead` (Read permission), `FileDelete` (Delete permission),
     ///   or `FileWriteOutsideSandbox` (Write permission) when the path matches the glob.
-    /// - `NetworkHost` matches `NetworkRequest` when host matches and port is allowed.
+    /// - `NetworkHost` matches `NetworkRequest` when `capsule_id`, host, and port all match.
     /// - `WorkspaceRelative` variants additionally validate that the action's path
     ///   starts with `workspace_root` (if provided) before matching the pattern.
     /// - `Custom` never matches (extensibility point for future use).
@@ -175,15 +182,23 @@ impl AllowancePattern {
                 SensitiveAction::FileRead { path },
             ) => path_in_workspace(path, workspace_root) && matches_file_glob(pattern, path),
 
-            // NetworkHost matches NetworkRequest
+            // NetworkHost matches NetworkRequest — capsule-scoped: the action's
+            // capsule_id MUST equal the grant's, so a grant for one capsule
+            // never exempts another reaching the same host:port.
             (
-                Self::NetworkHost { host, ports },
+                Self::NetworkHost {
+                    capsule_id,
+                    host,
+                    ports,
+                },
                 SensitiveAction::NetworkRequest {
+                    capsule_id: action_capsule_id,
                     host: action_host,
                     port: action_port,
                 },
             ) => {
-                host == action_host
+                capsule_id == action_capsule_id
+                    && host == action_host
                     && ports
                         .as_ref()
                         .is_none_or(|allowed| allowed.contains(action_port))
@@ -372,12 +387,16 @@ impl fmt::Display for AllowancePattern {
                 pattern,
                 permission,
             } => write!(f, "file:{pattern} ({permission})"),
-            Self::NetworkHost { host, ports } => {
+            Self::NetworkHost {
+                capsule_id,
+                host,
+                ports,
+            } => {
                 if let Some(ports) = ports {
                     let port_list: Vec<_> = ports.iter().map(ToString::to_string).collect();
-                    write!(f, "net:{host}:[{}]", port_list.join(","))
+                    write!(f, "net:{capsule_id}:{host}:[{}]", port_list.join(","))
                 } else {
-                    write!(f, "net:{host}:*")
+                    write!(f, "net:{capsule_id}:{host}:*")
                 }
             },
             Self::CommandPattern { command } => write!(f, "cmd:{command}"),

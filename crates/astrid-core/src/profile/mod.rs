@@ -252,6 +252,21 @@ pub struct NetworkConfig {
     /// that entries are non-empty strings.
     #[serde(default)]
     pub egress: Vec<String>,
+
+    /// Operator-consented local-egress endpoints, **keyed by capsule id**.
+    ///
+    /// Persistence target of the runtime `approve_always` local-egress consent:
+    /// a `host:port` the local operator chose to remember for a *specific*
+    /// capsule across daemon restarts. Mirrors the operator
+    /// `[security.capsule_local_egress]` shape so a grant is per-(principal,
+    /// capsule, endpoint) and never widens across capsules — a persisted grant
+    /// for capsule A reaching `127.0.0.1:1234` must not exempt capsule B.
+    ///
+    /// `#[serde(default)]` so profiles written before this field existed (flat
+    /// `egress` only) still load unchanged; absent/empty = no consented
+    /// endpoints (fail-closed).
+    #[serde(default)]
+    pub capsule_egress: std::collections::HashMap<String, Vec<String>>,
 }
 
 /// Process-spawn configuration for a principal.
@@ -459,6 +474,7 @@ mod tests {
             },
             network: NetworkConfig {
                 egress: vec!["api.example.com:443".into()],
+                capsule_egress: std::collections::HashMap::new(),
             },
             process: ProcessConfig {
                 allow: vec!["/usr/bin/env".into()],

@@ -843,7 +843,7 @@ where
 /// Render post-install diagnostics and prompt for unset env fields. Returns the
 /// installed capsule id (its directory name), so the manual-install path can
 /// nudge a running daemon to hot-load exactly that capsule.
-fn finish_install(output: &InstallOutput, _home: &AstridHome) -> anyhow::Result<String> {
+fn finish_install(output: &InstallOutput, home: &AstridHome) -> anyhow::Result<String> {
     let batch = BATCH_MODE.load(Ordering::Relaxed);
 
     // Load the manifest once (always present post-install) — used both for
@@ -875,7 +875,12 @@ fn finish_install(output: &InstallOutput, _home: &AstridHome) -> anyhow::Result<
     }
 
     if !batch && output.env_needs_prompt {
-        prompt_env_fields(&manifest.env, &output.env_path)?;
+        prompt_env_fields(
+            &manifest.env,
+            &output.env_path,
+            &capsule_id,
+            &home.config_path(),
+        )?;
     }
 
     if !batch && !output.missing_imports.is_empty() {
