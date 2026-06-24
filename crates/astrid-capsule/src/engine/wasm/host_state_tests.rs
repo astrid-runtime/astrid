@@ -510,23 +510,39 @@ fn effective_kv_prefers_invocation_over_owner_and_falls_back() {
         .unwrap();
     let mut state = minimal_host_state(rt.handle().clone());
 
+    // Assert on the resolved NAMESPACE, not the struct address: a
+    // `ScopedKvStore` is a value type whose `clone()` yields a distinct struct
+    // even for the same namespace, so pointer identity would pass even if the
+    // invocation store accidentally targeted the owner namespace. The namespace
+    // is the property that actually enforces isolation.
+    let owner_ns = state.kv.namespace().to_string();
+
     // No invocation store installed → the load-time owner store.
-    assert!(
-        std::ptr::eq(state.effective_kv(), &state.kv),
+    assert_eq!(
+        state.effective_kv().namespace(),
+        owner_ns.as_str(),
         "with no invocation store, effective_kv returns the owner store"
     );
 
-    // Install a distinct per-invocation store → accessor switches to it.
+    // Install a distinct per-invocation store → accessor switches to it and
+    // resolves to the per-principal namespace, not the owner's.
     state.invocation_kv = Some(super::super::test_fixtures::mem_kv("alice:capsule:session"));
-    assert!(
-        !std::ptr::eq(state.effective_kv(), &state.kv),
-        "with an invocation store installed, effective_kv returns it, not the owner store"
+    assert_eq!(
+        state.effective_kv().namespace(),
+        "alice:capsule:session",
+        "with an invocation store installed, effective_kv resolves to its principal namespace"
+    );
+    assert_ne!(
+        state.effective_kv().namespace(),
+        owner_ns.as_str(),
+        "the invocation store must not target the owner namespace"
     );
 
     // Clear → falls back to the owner store.
     state.invocation_kv = None;
-    assert!(
-        std::ptr::eq(state.effective_kv(), &state.kv),
+    assert_eq!(
+        state.effective_kv().namespace(),
+        owner_ns.as_str(),
         "after clear, effective_kv falls back to the owner store"
     );
 }
