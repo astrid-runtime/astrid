@@ -119,11 +119,13 @@ async fn await_matching_elicit_response(
         // cancel another principal's elicit.
         let got = event_principal(&event);
         tracing::warn!(
-            capsule = %capsule_id,
-            %request_id,
+            target: "astrid.audit.elicit",
+            security_event = true,
+            capsule_id = %capsule_id,
+            request_id = %request_id,
             expected_principal = %expected_principal,
             got_principal = got.unwrap_or("<none>"),
-            "Rejected cross-principal elicit response; continuing to wait"
+            "elicit: rejected cross-principal response; continuing to wait",
         );
     }
 }
