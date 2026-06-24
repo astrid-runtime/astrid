@@ -101,6 +101,18 @@ fn pin(home: &AstridHome, distro_id: &str, key_str: &str) -> anyhow::Result<()> 
         .context("failed to create temp file for trust pin")?;
     std::io::Write::write_all(&mut tmp, format!("{key_str}\n").as_bytes())
         .context("failed to write trust pin staging")?;
+    // Windows `rename` (which `persist` uses) won't overwrite an existing
+    // destination, so re-pinning (`--accept-new-key`) would fail there.
+    // Remove any existing pin first; a missing file is expected and fine.
+    match std::fs::remove_file(&path) {
+        Ok(()) => {},
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {},
+        Err(e) => {
+            return Err(e).with_context(|| {
+                format!("failed to replace existing trust pin {}", path.display())
+            });
+        },
+    }
     tmp.persist(&path)
         .map_err(|e| anyhow::anyhow!("failed to persist {}: {e}", path.display()))?;
     Ok(())

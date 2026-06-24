@@ -214,7 +214,12 @@ pub(crate) fn unpack(archive_path: &Path, dest: &Path) -> anyhow::Result<()> {
             );
         }
 
-        let size = entry.header().size().unwrap_or(0);
+        // A corrupt/undecodable size field must fail closed, not be coerced
+        // to 0 — otherwise header corruption silently bypasses the cap.
+        let size = entry
+            .header()
+            .size()
+            .context("malicious shuttle detected: unreadable member size")?;
         if size > MAX_MEMBER_BYTES {
             bail!(
                 "shuttle member '{}' is {size} bytes, exceeding the {MAX_MEMBER_BYTES}-byte limit",

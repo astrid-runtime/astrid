@@ -266,16 +266,30 @@ async fn resolve_github_ref(
     if let Some(v) = version {
         for candidate in [format!("v{v}"), v.to_string()] {
             let tag_url = release_tag_url(org, repo, &candidate)?;
-            if let Ok(r) = client.get(&tag_url).send().await
-                && r.status().is_success()
-                && let Ok(json) = r.json::<serde_json::Value>().await
-            {
-                return Ok(json
-                    .get("tag_name")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or(&candidate)
-                    .to_string());
+            let r = client.get(&tag_url).send().await.with_context(|| {
+                format!("failed to query release tag {candidate} for {org}/{repo}")
+            })?;
+            // 404 → this candidate tag simply doesn't exist; try the next.
+            if r.status() == reqwest::StatusCode::NOT_FOUND {
+                continue;
             }
+            // Any other non-success (5xx, rate-limit, auth) is a real failure
+            // that must surface — not be misreported as "no release found".
+            if !r.status().is_success() {
+                bail!(
+                    "GitHub API error querying release tag {candidate} for {org}/{repo}: HTTP {}",
+                    r.status()
+                );
+            }
+            let json = r
+                .json::<serde_json::Value>()
+                .await
+                .with_context(|| format!("invalid GitHub API response for tag {candidate}"))?;
+            return Ok(json
+                .get("tag_name")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or(&candidate)
+                .to_string());
         }
         bail!("no GitHub release found for version {v} in {org}/{repo}");
     }
