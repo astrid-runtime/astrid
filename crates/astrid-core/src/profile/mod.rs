@@ -37,10 +37,14 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 mod device;
+mod field;
 mod io_impl;
 mod validation;
 
 pub use device::{DEVICE_KEY_ID_HEX_LEN, DeviceKey, DeviceScope, device_key_id_fingerprint};
+pub use field::{
+    CapabilityPattern, CapsuleGrant, GroupName, ProfileFieldError, ValidatedProfileFields,
+};
 
 /// Current profile schema version. Bumped on breaking field changes.
 ///

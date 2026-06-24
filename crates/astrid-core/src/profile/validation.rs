@@ -7,9 +7,8 @@
 use crate::capability_grammar::validate_capability;
 
 use super::{
-    AuthConfig, BACKGROUND_PROCESSES_UPPER_BOUND, CURRENT_PROFILE_VERSION, MAX_CAPSULE_GRANT_LEN,
-    MAX_GROUP_NAME_LEN, NetworkConfig, PrincipalProfile, ProcessConfig, ProfileError,
-    ProfileResult, Quotas, TIMEOUT_SECS_UPPER_BOUND,
+    AuthConfig, BACKGROUND_PROCESSES_UPPER_BOUND, CURRENT_PROFILE_VERSION, NetworkConfig,
+    PrincipalProfile, ProcessConfig, ProfileError, ProfileResult, Quotas, TIMEOUT_SECS_UPPER_BOUND,
 };
 
 impl PrincipalProfile {
@@ -28,22 +27,7 @@ impl PrincipalProfile {
         }
         self.quotas.validate()?;
         self.auth.validate()?;
-        for group in &self.groups {
-            validate_group_name(group)?;
-        }
-        for cap in &self.grants {
-            validate_capability(cap).map_err(|e| {
-                ProfileError::Invalid(format!("grants entry {cap:?} rejected: {e}"))
-            })?;
-        }
-        for cap in &self.revokes {
-            validate_capability(cap).map_err(|e| {
-                ProfileError::Invalid(format!("revokes entry {cap:?} rejected: {e}"))
-            })?;
-        }
-        for capsule in &self.capsules {
-            validate_capsule_grant(capsule)?;
-        }
+        self.typed_fields()?;
         self.network.validate()?;
         self.process.validate()?;
         Ok(())
@@ -209,62 +193,6 @@ impl ProcessConfig {
         }
         Ok(())
     }
-}
-
-/// Validate a single capsule-grant entry against the same character set a
-/// `CapsuleId` enforces — non-empty, lowercase alphanumeric and hyphens
-/// only — plus a defensive length cap of [`MAX_CAPSULE_GRANT_LEN`].
-///
-/// The length cap is the profile's own sanity bound on operator-supplied
-/// input, NOT a mirror of `CapsuleId`: `astrid_capsule::CapsuleId::validate`
-/// caps the charset but imposes no length limit. A grant entry that cannot
-/// name a real capsule is rejected on load — fail-closed: a malformed grant
-/// never silently widens (or, by failing the whole profile, narrows) access
-/// in a way the operator did not intend.
-fn validate_capsule_grant(id: &str) -> ProfileResult<()> {
-    if id.is_empty() {
-        return Err(ProfileError::Invalid(
-            "capsules entries must be non-empty".into(),
-        ));
-    }
-    if id.len() > MAX_CAPSULE_GRANT_LEN {
-        return Err(ProfileError::Invalid(format!(
-            "capsules entry exceeds {MAX_CAPSULE_GRANT_LEN} characters: {id:?}",
-        )));
-    }
-    if let Some(bad) = id
-        .chars()
-        .find(|c| !c.is_ascii_lowercase() && !c.is_ascii_digit() && *c != '-')
-    {
-        return Err(ProfileError::Invalid(format!(
-            "capsules entry {id:?} contains invalid character {bad:?} (allowed: a-z, 0-9, -)",
-        )));
-    }
-    Ok(())
-}
-
-/// Same character set + length cap as [`PrincipalId`](crate::PrincipalId):
-/// `[a-zA-Z0-9_-]` and up to [`MAX_GROUP_NAME_LEN`] characters.
-fn validate_group_name(name: &str) -> ProfileResult<()> {
-    if name.is_empty() {
-        return Err(ProfileError::Invalid(
-            "groups entries must be non-empty".into(),
-        ));
-    }
-    if name.len() > MAX_GROUP_NAME_LEN {
-        return Err(ProfileError::Invalid(format!(
-            "groups entry exceeds {MAX_GROUP_NAME_LEN} characters: {name:?}",
-        )));
-    }
-    if let Some(bad) = name
-        .chars()
-        .find(|c| !c.is_ascii_alphanumeric() && *c != '-' && *c != '_')
-    {
-        return Err(ProfileError::Invalid(format!(
-            "groups entry {name:?} contains invalid character {bad:?} (allowed: a-z, A-Z, 0-9, -, _)",
-        )));
-    }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -447,30 +375,26 @@ mod tests {
             "ops_team".into(),
             "agent-007".into(),
             "X".into(),
-            "a".repeat(MAX_GROUP_NAME_LEN),
+            "a".repeat(super::super::MAX_GROUP_NAME_LEN),
         ];
         p.validate().unwrap();
     }
 
     #[test]
     fn rejects_empty_group() {
-        let mut p = PrincipalProfile::default();
-        p.groups = vec![String::new()];
-        assert!(matches!(p.validate(), Err(ProfileError::Invalid(_))));
+        assert!(super::super::GroupName::new(String::new()).is_err());
     }
 
     #[test]
     fn rejects_group_with_bad_char() {
-        let mut p = PrincipalProfile::default();
-        p.groups = vec!["ops/team".into()];
-        assert!(matches!(p.validate(), Err(ProfileError::Invalid(_))));
+        assert!(super::super::GroupName::new("ops/team").is_err());
     }
 
     #[test]
     fn rejects_group_too_long() {
-        let mut p = PrincipalProfile::default();
-        p.groups = vec!["a".repeat(MAX_GROUP_NAME_LEN + 1)];
-        assert!(matches!(p.validate(), Err(ProfileError::Invalid(_))));
+        assert!(
+            super::super::GroupName::new("a".repeat(super::super::MAX_GROUP_NAME_LEN + 1)).is_err()
+        );
     }
 
     // ── Capsule grants ────────────────────────────────────────────────
@@ -483,37 +407,32 @@ mod tests {
             "registry".into(),
             "context-engine".into(),
             "openai-compat".into(),
-            "a".repeat(MAX_CAPSULE_GRANT_LEN),
+            "a".repeat(super::super::MAX_CAPSULE_GRANT_LEN),
         ];
         p.validate().unwrap();
     }
 
     #[test]
     fn rejects_empty_capsule_grant() {
-        let mut p = PrincipalProfile::default();
-        p.capsules = vec![String::new()];
-        assert!(matches!(p.validate(), Err(ProfileError::Invalid(_))));
+        assert!(super::super::CapsuleGrant::new(String::new()).is_err());
     }
 
     #[test]
     fn rejects_capsule_grant_with_uppercase() {
-        let mut p = PrincipalProfile::default();
-        p.capsules = vec!["Identity".into()];
-        assert!(matches!(p.validate(), Err(ProfileError::Invalid(_))));
+        assert!(super::super::CapsuleGrant::new("Identity").is_err());
     }
 
     #[test]
     fn rejects_capsule_grant_with_bad_char() {
-        let mut p = PrincipalProfile::default();
-        p.capsules = vec!["ident_ity".into()];
-        assert!(matches!(p.validate(), Err(ProfileError::Invalid(_))));
+        assert!(super::super::CapsuleGrant::new("ident_ity").is_err());
     }
 
     #[test]
     fn rejects_capsule_grant_too_long() {
-        let mut p = PrincipalProfile::default();
-        p.capsules = vec!["a".repeat(MAX_CAPSULE_GRANT_LEN + 1)];
-        assert!(matches!(p.validate(), Err(ProfileError::Invalid(_))));
+        assert!(
+            super::super::CapsuleGrant::new("a".repeat(super::super::MAX_CAPSULE_GRANT_LEN + 1))
+                .is_err()
+        );
     }
 
     // ── Grants / revokes (capability grammar) ─────────────────────────
@@ -528,34 +447,37 @@ mod tests {
 
     #[test]
     fn rejects_grant_with_shell_metachar() {
-        let mut p = PrincipalProfile::default();
-        p.grants = vec!["system:shutdown;rm".into()];
-        let err = p.validate().unwrap_err();
-        match err {
-            ProfileError::Invalid(msg) => assert!(msg.contains("grants entry"), "msg: {msg}"),
-            other => panic!("expected Invalid, got: {other:?}"),
-        }
+        assert!(super::super::CapabilityPattern::new("system:shutdown;rm").is_err());
     }
 
     #[test]
     fn rejects_grant_with_double_glob() {
-        let mut p = PrincipalProfile::default();
-        p.grants = vec!["capsule:**".into()];
-        assert!(matches!(p.validate(), Err(ProfileError::Invalid(_))));
+        assert!(super::super::CapabilityPattern::new("capsule:**").is_err());
     }
 
     #[test]
     fn rejects_empty_grant_entry() {
-        let mut p = PrincipalProfile::default();
-        p.grants = vec![String::new()];
-        assert!(matches!(p.validate(), Err(ProfileError::Invalid(_))));
+        assert!(super::super::CapabilityPattern::new(String::new()).is_err());
     }
 
     #[test]
     fn rejects_revoke_with_trailing_colon() {
+        assert!(super::super::CapabilityPattern::new("system:").is_err());
+    }
+
+    #[test]
+    fn typed_field_errors_include_field_and_value() {
         let mut p = PrincipalProfile::default();
-        p.revokes = vec!["system:".into()];
-        assert!(matches!(p.validate(), Err(ProfileError::Invalid(_))));
+        p.grants = vec!["system:".into()];
+
+        let err = p.validate().unwrap_err();
+        match err {
+            ProfileError::Invalid(msg) => {
+                assert!(msg.contains("grants entry"), "msg: {msg}");
+                assert!(msg.contains("\"system:\""), "msg: {msg}");
+            },
+            other => panic!("expected Invalid, got: {other:?}"),
+        }
     }
 
     // ── Network / process ─────────────────────────────────────────────

@@ -396,7 +396,7 @@ fn profile_cache_invalidation_reflects_on_disk_mutation() {
 
     // Write a populated profile to disk behind the cache's back.
     let mut updated = PrincipalProfile::default();
-    updated.grants = vec!["self:capsule:install".into()];
+    updated.grants = vec!["self:capsule:install".to_string()];
     let path = PrincipalProfile::path_for(&home, &principal);
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
     updated.save_to_path(&path).unwrap();

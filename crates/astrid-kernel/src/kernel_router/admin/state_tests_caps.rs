@@ -363,8 +363,13 @@ async fn caps_grant_universal_requires_unsafe_admin_acknowledgement() {
     .await;
     assert_success(&accepted);
     let profile = PrincipalProfile::load_from_path(&path).unwrap();
-    assert!(profile.grants.contains(&"*".to_string()));
-    assert!(profile.grants.contains(&"network:egress:*".to_string()));
+    assert!(profile.grants.iter().any(|g| g.as_str() == "*"));
+    assert!(
+        profile
+            .grants
+            .iter()
+            .any(|g| g.as_str() == "network:egress:*")
+    );
 }
 
 // ── Concurrency: write lock serializes mutations ────────────────────

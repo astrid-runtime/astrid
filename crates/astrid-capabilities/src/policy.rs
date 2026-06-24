@@ -41,7 +41,10 @@
 //! caching. The caller is expected to have resolved the profile and
 //! the group config beforehand.
 
-use astrid_core::{DeviceScope, GroupConfig, PrincipalId, PrincipalProfile, capability_matches};
+use astrid_core::{
+    CapabilityPattern, DeviceScope, GroupConfig, PrincipalId, PrincipalProfile,
+    ValidatedProfileFields, capability_matches,
+};
 use thiserror::Error;
 use tracing::warn;
 
@@ -99,12 +102,13 @@ pub enum PermissionError {
 /// Borrowed evaluator over a resolved profile and the shared group
 /// configuration.
 ///
-/// Zero-allocation and thread-safe: both inputs are shared references,
-/// so multiple concurrent handlers can evaluate against the same
-/// `&GroupConfig`/`&PrincipalProfile` without contention.
+/// The profile is validated into a borrowed typed view at construction, so
+/// repeated capability checks reuse the same field classification instead of
+/// reparsing the profile strings. The evaluator remains thread-safe: all
+/// runtime inputs are shared references.
 #[derive(Debug, Clone)]
 pub struct CapabilityCheck<'a> {
-    profile: &'a PrincipalProfile,
+    profile: Result<ValidatedProfileFields<'a>, String>,
     groups: &'a GroupConfig,
     principal: PrincipalId,
     /// Optional per-device attenuation floor. `None` (the default) means the
@@ -127,6 +131,7 @@ impl<'a> CapabilityCheck<'a> {
         groups: &'a GroupConfig,
         principal: PrincipalId,
     ) -> Self {
+        let profile = profile.typed_fields().map_err(|e| e.to_string());
         Self {
             profile,
             groups,
@@ -156,7 +161,19 @@ impl<'a> CapabilityCheck<'a> {
     /// a capability the principal lacks become held.
     #[must_use]
     pub fn has(&self, cap: &str) -> bool {
-        if !self.principal_has(cap) {
+        let profile = match &self.profile {
+            Ok(profile) => profile,
+            Err(e) => {
+                warn!(
+                    security_event = true,
+                    principal = %self.principal,
+                    error = %e,
+                    "Principal profile contains invalid typed fields — no capabilities inherited"
+                );
+                return false;
+            },
+        };
+        if !self.principal_has(profile, cap) {
             return false;
         }
         self.device_scope_admits(cap)
@@ -174,15 +191,31 @@ impl<'a> CapabilityCheck<'a> {
     /// [`PermissionError::DeviceScopeDenied`] if the principal holds it but
     /// the authenticating device's scope does not admit it.
     pub fn require(&self, cap: &str) -> Result<(), PermissionError> {
-        if let Some(revoke) = self.first_matching_revoke(cap) {
+        let profile = match &self.profile {
+            Ok(profile) => profile,
+            Err(e) => {
+                warn!(
+                    security_event = true,
+                    principal = %self.principal,
+                    error = %e,
+                    "Principal profile contains invalid typed fields — denying capability"
+                );
+                return Err(PermissionError::MissingCapability {
+                    principal: self.principal.clone(),
+                    required: cap.to_string(),
+                });
+            },
+        };
+        if let Some(revoke) = Self::first_matching_revoke(profile, cap) {
             return Err(PermissionError::RevokedCapability {
                 principal: self.principal.clone(),
                 required: cap.to_string(),
                 revoke_pattern: revoke.to_string(),
             });
         }
-        let principal_holds = matches_any(self.profile.grants.iter().map(String::as_str), cap)
-            || self.holds_via_groups(cap);
+        let principal_holds =
+            matches_any(profile.grants.iter().map(CapabilityPattern::as_str), cap)
+                || self.holds_via_groups(profile, cap);
         if !principal_holds {
             return Err(PermissionError::MissingCapability {
                 principal: self.principal.clone(),
@@ -201,14 +234,14 @@ impl<'a> CapabilityCheck<'a> {
     }
 
     /// The unattenuated principal decision: revokes > grants > group-inherited.
-    fn principal_has(&self, cap: &str) -> bool {
-        if matches_any(self.profile.revokes.iter().map(String::as_str), cap) {
+    fn principal_has(&self, profile: &ValidatedProfileFields<'_>, cap: &str) -> bool {
+        if matches_any(profile.revokes.iter().map(CapabilityPattern::as_str), cap) {
             return false;
         }
-        if matches_any(self.profile.grants.iter().map(String::as_str), cap) {
+        if matches_any(profile.grants.iter().map(CapabilityPattern::as_str), cap) {
             return true;
         }
-        self.holds_via_groups(cap)
+        self.holds_via_groups(profile, cap)
     }
 
     /// Whether the authenticating device's scope admits `cap`.
@@ -226,17 +259,20 @@ impl<'a> CapabilityCheck<'a> {
         }
     }
 
-    fn first_matching_revoke(&self, cap: &str) -> Option<&'a str> {
-        self.profile
+    fn first_matching_revoke<'profile>(
+        profile: &'profile ValidatedProfileFields<'_>,
+        cap: &str,
+    ) -> Option<&'profile str> {
+        profile
             .revokes
             .iter()
-            .map(String::as_str)
+            .map(CapabilityPattern::as_str)
             .find(|p| capability_matches(p, cap))
     }
 
-    fn holds_via_groups(&self, cap: &str) -> bool {
-        for name in &self.profile.groups {
-            let Some(group) = self.groups.get(name) else {
+    fn holds_via_groups(&self, profile: &ValidatedProfileFields<'_>, cap: &str) -> bool {
+        for name in &profile.groups {
+            let Some(group) = self.groups.get(name.as_str()) else {
                 warn!(
                     security_event = true,
                     principal = %self.principal,
@@ -318,6 +354,10 @@ mod tests {
         p
     }
 
+    fn cap(pattern: &str) -> String {
+        pattern.to_string()
+    }
+
     fn pid() -> PrincipalId {
         PrincipalId::new("alice").unwrap()
     }
@@ -375,7 +415,7 @@ mod tests {
     #[test]
     fn grant_overrides_group_lack() {
         let mut p = profile_in(&["restricted"]);
-        p.grants.push("system:shutdown".into());
+        p.grants.push(cap("system:shutdown"));
         let cfg = gc();
         let chk = CapabilityCheck::new(&p, &cfg, pid());
         assert!(chk.has("system:shutdown"));
@@ -384,7 +424,7 @@ mod tests {
     #[test]
     fn revoke_overrides_admin() {
         let mut p = profile_in(&["admin"]);
-        p.revokes.push("system:shutdown".into());
+        p.revokes.push(cap("system:shutdown"));
         let cfg = gc();
         let chk = CapabilityCheck::new(&p, &cfg, pid());
         assert!(!chk.has("system:shutdown"));
@@ -396,8 +436,8 @@ mod tests {
     #[test]
     fn revoke_overrides_direct_grant() {
         let mut p = profile_in(&["restricted"]);
-        p.grants.push("capsule:install".into());
-        p.revokes.push("capsule:install".into());
+        p.grants.push(cap("capsule:install"));
+        p.revokes.push(cap("capsule:install"));
         let cfg = gc();
         let chk = CapabilityCheck::new(&p, &cfg, pid());
         assert!(!chk.has("capsule:install"));
@@ -406,7 +446,7 @@ mod tests {
     #[test]
     fn revoke_via_prefix_pattern() {
         let mut p = profile_in(&["admin"]);
-        p.revokes.push("self:*".into());
+        p.revokes.push(cap("self:*"));
         let cfg = gc();
         let chk = CapabilityCheck::new(&p, &cfg, pid());
         assert!(!chk.has("self:capsule:install"));
@@ -448,7 +488,7 @@ mod tests {
     #[test]
     fn require_returns_revoked_when_revoke_matches() {
         let mut p = profile_in(&["admin"]);
-        p.revokes.push("system:shutdown".into());
+        p.revokes.push(cap("system:shutdown"));
         let cfg = gc();
         let chk = CapabilityCheck::new(&p, &cfg, pid());
         let err = chk.require("system:shutdown").unwrap_err();
@@ -500,7 +540,7 @@ mod tests {
     #[test]
     fn grant_for_unrelated_cap_does_not_allow_requested_cap() {
         let mut p = profile_in(&["restricted"]);
-        p.grants.push("capsule:install".into());
+        p.grants.push(cap("capsule:install"));
         let cfg = gc();
         let chk = CapabilityCheck::new(&p, &cfg, pid());
         assert!(!chk.has("system:shutdown"));
@@ -608,7 +648,7 @@ mod tests {
         let mut p = profile_in(&["agent"]);
         // Give the agent the self-scoped pair capability so the principal floor
         // alone would allow it; the device scope is what restricts it.
-        p.grants.push("self:auth:pair".into());
+        p.grants.push(cap("self:auth:pair"));
         let cfg = gc();
         let scope = DeviceScope::Scoped {
             allow: vec!["self:*".into()],
@@ -634,7 +674,7 @@ mod tests {
         // A principal revoke must still win even with a permissive device
         // scope — the revoke is the highest-precedence floor.
         let mut p = profile_in(&["admin"]);
-        p.revokes.push("system:shutdown".into());
+        p.revokes.push(cap("system:shutdown"));
         let cfg = gc();
         let scope = DeviceScope::Scoped {
             allow: vec!["*".into()],

@@ -184,6 +184,52 @@ async fn agent_modify_rejects_unknown_principal() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn agent_modify_rejects_invalid_remove_entries() {
+    let (_dir, kernel) = fixture().await;
+    handlers::dispatch(
+        &kernel,
+        &astrid_core::PrincipalId::default(),
+        AdminRequestKind::AgentCreate {
+            name: "opal".into(),
+            groups: vec![BUILTIN_AGENT.into()],
+            grants: Vec::new(),
+            inherit_from: None,
+            clone_from: None,
+            allow_admin_clone: false,
+        },
+    )
+    .await;
+
+    let res = handlers::dispatch(
+        &kernel,
+        &astrid_core::PrincipalId::default(),
+        AdminRequestKind::AgentModify {
+            principal: pid("opal"),
+            add_groups: Vec::new(),
+            remove_groups: vec!["bad/group".into()],
+            add_capsules: Vec::new(),
+            remove_capsules: Vec::new(),
+        },
+    )
+    .await;
+    assert_error_contains(&res, "group delta rejected");
+
+    let res = handlers::dispatch(
+        &kernel,
+        &astrid_core::PrincipalId::default(),
+        AdminRequestKind::AgentModify {
+            principal: pid("opal"),
+            add_groups: Vec::new(),
+            remove_groups: Vec::new(),
+            add_capsules: Vec::new(),
+            remove_capsules: vec!["BadCapsule".into()],
+        },
+    )
+    .await;
+    assert_error_contains(&res, "capsule delta rejected");
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn agent_modify_adds_and_removes_capsules_idempotently() {
     // #992: agent.modify partial-updates the capsule grant set, mirroring
     // the group mechanism exactly — idempotent add/remove, persisted to
