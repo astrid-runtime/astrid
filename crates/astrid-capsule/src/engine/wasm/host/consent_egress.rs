@@ -32,9 +32,15 @@
 //!
 //! # Grant scoping
 //!
-//! The runtime grant is **per-principal** (keyed `principal` + the network
-//! `host:port`), held in the shared [`AllowanceStore`] — principal A's grant
-//! never exempts principal B, mirroring the store's per-principal isolation. The
+//! The runtime grant is **per-principal AND per-capsule** (keyed `principal` +
+//! `capsule_id` + the network `host:port`), held in the shared
+//! [`AllowanceStore`] — principal A's grant never exempts principal B (the store
+//! buckets by principal), and capsule A's grant never exempts capsule B even for
+//! the same principal (the [`AllowancePattern::NetworkHost`] carries the
+//! `capsule_id` and the matcher requires it to match). The `approve_always`
+//! persistence mirrors this: it writes to the capsule-keyed
+//! `profile.network.capsule_egress[<capsule>]` map, not a flat per-principal
+//! list, so a remembered grant likewise cannot widen across capsules. The
 //! operator pre-bless (`[security.capsule_local_egress]`) stays capsule-keyed
 //! and unchanged.
 
@@ -55,25 +61,31 @@ use crate::engine::wasm::host_state::HostState;
 /// consent shares one human-facing budget.
 const CONSENT_TIMEOUT_MS: u64 = 60_000;
 
-/// Build the per-principal network action this consent is about. The grant and
-/// the lookup must use the same shape so a cached grant short-circuits a repeat.
-fn egress_action(host: &str, port: u16) -> SensitiveAction {
+/// Build the per-principal, per-capsule network action this consent is about.
+/// The grant and the lookup must use the same shape so a cached grant
+/// short-circuits a repeat. `capsule_id` scopes the action so a grant for one
+/// capsule never exempts another reaching the same endpoint.
+fn egress_action(capsule_id: &str, host: &str, port: u16) -> SensitiveAction {
     SensitiveAction::NetworkRequest {
+        capsule_id: capsule_id.to_string(),
         host: host.to_string(),
         port,
     }
 }
 
-/// `true` if `principal` already holds a runtime grant for `host:port` in the
-/// allowance store. A prior `approve`/`approve_session`/`approve_always` left a
+/// `true` if `principal` already holds a runtime grant for `capsule_id`
+/// reaching `host:port` in the allowance store. A prior
+/// `approve`/`approve_session`/`approve_always` left a
 /// [`AllowancePattern::NetworkHost`] entry; matching it here is what makes a
 /// second request to the same endpoint silent.
 ///
-/// Per-principal by construction: the store buckets allowances by principal, so
-/// this can only ever see `principal`'s own grants.
+/// Per-principal AND per-capsule by construction: the store buckets allowances
+/// by principal, and the action carries `capsule_id`, so a grant for capsule A
+/// never short-circuits capsule B even for the same principal and endpoint.
 fn has_runtime_grant(
     store: &AllowanceStore,
     principal: &PrincipalId,
+    capsule_id: &str,
     host: &str,
     port: u16,
 ) -> bool {
@@ -82,19 +94,22 @@ fn has_runtime_grant(
     // with no side effect on them. Workspace scoping is irrelevant to a network
     // grant, so pass `None`.
     store
-        .find_matching_and_consume(principal, &egress_action(host, port), None)
+        .find_matching_and_consume(principal, &egress_action(capsule_id, host, port), None)
         .is_some()
 }
 
-/// Add an unlimited runtime egress grant for `principal` to `host:port`.
+/// Add an unlimited runtime egress grant for `principal` + `capsule_id` to
+/// `host:port`.
 ///
 /// `session_only = true` for `approve`/`approve_session` (cleared when the
 /// principal's last session disconnects); `false` for `approve_always` (also
 /// persisted to the profile on disk by the caller). Keyed per-principal in the
-/// shared store, so it never leaks to another principal.
+/// shared store and per-capsule via the pattern's `capsule_id`, so it never
+/// leaks to another principal NOR to another capsule of the same principal.
 fn add_runtime_grant(
     store: &AllowanceStore,
     principal: &PrincipalId,
+    capsule_id: &str,
     host: &str,
     port: u16,
     session_only: bool,
@@ -104,6 +119,7 @@ fn add_runtime_grant(
         id: AllowanceId::new(),
         principal: principal.clone(),
         action_pattern: AllowancePattern::NetworkHost {
+            capsule_id: capsule_id.to_string(),
             host: host.to_string(),
             ports: Some(vec![port]),
         },
@@ -165,15 +181,17 @@ impl HostState {
     ///    `RemoteGateway`, or an unbound socket — return `false` WITHOUT
     ///    prompting. A remote/system request can never earn a local-egress
     ///    grant.
-    /// 2. Else, if `principal` already holds a runtime grant for `host:port`,
-    ///    return `true` immediately (no prompt).
+    /// 2. Else, if `principal` already holds a runtime grant for THIS capsule
+    ///    reaching `host:port`, return `true` immediately (no prompt). The grant
+    ///    is keyed on `capsule_id` too, so capsule B never short-circuits on
+    ///    capsule A's grant.
     /// 3. Else elicit consent (`ApprovalRequired` on `astrid.v1.approval`,
     ///    resource = `host:port` only, reason names the capsule) and block,
     ///    bounded by [`CONSENT_TIMEOUT_MS`] and the capsule cancel token. On
-    ///    approve / approve_session: cache a per-principal session grant and
-    ///    return `true`. On approve_always: also persist to
-    ///    `profile.network.egress` on disk. On deny / timeout / cancel /
-    ///    unknown decision: return `false`.
+    ///    approve / approve_session: cache a per-principal, per-capsule session
+    ///    grant and return `true`. On approve_always: also persist to the
+    ///    capsule-keyed `profile.network.capsule_egress[<capsule>]` on disk. On
+    ///    deny / timeout / cancel / unknown decision: return `false`.
     ///
     /// `host` is the URL host (an IP literal in v1 scope); `port` is the
     /// resolved request port.
@@ -201,11 +219,14 @@ impl HostState {
             return false;
         };
         let principal = self.effective_principal();
+        // The grant is scoped to THIS capsule: a grant for capsule A reaching
+        // H:P must never exempt capsule B reaching H:P for the same principal.
+        let capsule_id = self.capsule_id.to_string();
         let endpoint = format!("{host}:{port}");
 
         // 2. EXISTING-GRANT FAST PATH. A prior consent for this principal +
-        // endpoint short-circuits the prompt.
-        if has_runtime_grant(&store, &principal, host, port) {
+        // capsule + endpoint short-circuits the prompt.
+        if has_runtime_grant(&store, &principal, &capsule_id, host, port) {
             return true;
         }
 
@@ -236,7 +257,7 @@ impl HostState {
                 true
             },
             Decision::Session => {
-                add_runtime_grant(&store, &principal, host, port, true);
+                add_runtime_grant(&store, &principal, &capsule_id, host, port, true);
                 tracing::info!(
                     security_event = true,
                     capsule_id = %self.capsule_id.as_str(),
@@ -251,9 +272,9 @@ impl HostState {
                 // to disk so it survives a restart. A disk-persist failure is a
                 // fail-closed no-op for the persistence only — the in-flight
                 // request still proceeds on the in-memory grant just added.
-                add_runtime_grant(&store, &principal, host, port, false);
+                add_runtime_grant(&store, &principal, &capsule_id, host, port, false);
                 if let Some(cache) = self.profile_cache.as_ref() {
-                    if let Err(e) = cache.persist_egress(&principal, &endpoint) {
+                    if let Err(e) = cache.persist_egress(&principal, &capsule_id, &endpoint) {
                         tracing::warn!(
                             security_event = true,
                             %principal,
@@ -292,6 +313,39 @@ impl HostState {
     /// is for the endpoint, not a specific request), and the reason names the
     /// capsule so the operator knows who is asking. Subscribe-before-publish
     /// avoids a response race, exactly like `host/approval.rs::request_approval`.
+    ///
+    /// # Response-topic isolation (documented residual, PR #1029 FIX 2)
+    ///
+    /// Egress consent reuses the shared `astrid.v1.approval[.response.*]`
+    /// channel rather than a structurally distinct `astrid.v1.egress.response.*`
+    /// namespace. A distinct namespace was considered and deliberately NOT
+    /// adopted: the only surfaces that may answer a consent are the ones holding
+    /// publish rights on the response topic — today the operator uplink
+    /// (`capsule-cli`) and the trusted MCP broker (`sage-mcp`), both of which
+    /// declare `astrid.v1.approval.response.*` in their `Capsule.toml [publish]`
+    /// ACL. Both repos are OUTSIDE this one, so switching the host to a new
+    /// `astrid.v1.egress.response.*` topic would silently break the consent
+    /// round-trip (the operator surface could no longer publish the decision)
+    /// until those out-of-repo manifests were extended in lockstep — an ACL
+    /// spread across repos this change must not require.
+    ///
+    /// The residual is therefore: a surface already holding response-topic
+    /// publish rights AND subscribed to `astrid.v1.approval` (where the
+    /// `request_id` is broadcast for the operator to render) could in principle
+    /// answer an egress consent. This is LOW severity and non-escalating:
+    /// - those rights belong only to TRUSTED operator/broker surfaces — an
+    ///   arbitrary untrusted tool capsule does not declare (and cannot obtain)
+    ///   publish on `astrid.v1.approval.response.*`, which the subtree publish
+    ///   ACL enforces — so this is not a capsule-forgeable approve;
+    /// - the consent is already origin-gated upstream
+    ///   ([`consent_local_egress`](Self::consent_local_egress) only reaches here
+    ///   for a verified `LocalSocket` operator), so a remote caller can never
+    ///   trigger one to be answered at all; and
+    /// - the `request_id` is an unguessable v4 UUID, so a surface NOT subscribed
+    ///   to `astrid.v1.approval` cannot blind-guess the response topic.
+    ///
+    /// Closing it fully (a distinct egress namespace) is deferred to a paired
+    /// change that also extends the operator-surface publish ACL in `capsule-cli`.
     fn elicit_egress_consent(&self, principal: &PrincipalId, endpoint: &str) -> String {
         let event_bus = self.event_bus.clone();
         let runtime_handle = self.runtime_handle.clone();
@@ -300,6 +354,10 @@ impl HostState {
         let capsule_id = self.capsule_id.to_string();
 
         let request_id = Uuid::new_v4().to_string();
+        // Shared approval response channel — see the "Response-topic isolation"
+        // residual in this method's doc comment for why a distinct
+        // `astrid.v1.egress.response.*` namespace is deferred (out-of-repo
+        // operator-surface ACL spread).
         let response_topic = format!("astrid.v1.approval.response.{request_id}");
         // Subscribe BEFORE publishing to prevent a publish/subscribe race.
         let mut receiver = event_bus.subscribe_topic(&response_topic);

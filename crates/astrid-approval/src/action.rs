@@ -46,7 +46,16 @@ pub enum SensitiveAction {
     },
 
     /// Make a network request.
+    ///
+    /// `capsule_id` scopes the action to the requesting capsule: a network
+    /// allowance granted to capsule A must never exempt capsule B reaching the
+    /// same `host:port` for the same principal. The local-egress consent flow
+    /// (`consent_local_egress`) is the sole constructor; the discriminator is
+    /// load-bearing for per-capsule isolation, so it is a required field rather
+    /// than an `Option`.
     NetworkRequest {
+        /// Requesting capsule identifier.
+        capsule_id: String,
         /// Target host.
         host: String,
         /// Target port.
@@ -166,7 +175,11 @@ impl SensitiveAction {
                     format!("Execute: {command} {}", args.join(" "))
                 }
             },
-            Self::NetworkRequest { host, port } => format!("Network request to {host}:{port}"),
+            Self::NetworkRequest {
+                capsule_id,
+                host,
+                port,
+            } => format!("Capsule '{capsule_id}' network request to {host}:{port}"),
             Self::TransmitData {
                 destination,
                 data_type,
@@ -381,6 +394,7 @@ mod tests {
     #[test]
     fn test_action_serialization() {
         let action = SensitiveAction::NetworkRequest {
+            capsule_id: "react".to_string(),
             host: "api.example.com".to_string(),
             port: 443,
         };

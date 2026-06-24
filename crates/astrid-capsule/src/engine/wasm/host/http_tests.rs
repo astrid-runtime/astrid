@@ -310,15 +310,18 @@ async fn consent_grant_yields_exempt_host() {
     let mut state = minimal_host_state(rt);
     let store = Arc::new(AllowanceStore::new());
     let alice = PrincipalId::new("alice").unwrap();
-    // Pre-cache the per-principal grant (same shape `consent_local_egress`
-    // writes) so the consent call short-circuits on the existing-grant fast
-    // path — no blocking elicitation needed for this hermetic test.
+    // Pre-cache the per-principal, per-capsule grant (same shape
+    // `consent_local_egress` writes) so the consent call short-circuits on the
+    // existing-grant fast path — no blocking elicitation needed for this
+    // hermetic test. `capsule_id` must match the fixture's ("test"), since the
+    // gate keys the lookup on the requesting capsule.
     let keypair = KeyPair::generate();
     store
         .add_allowance(Allowance {
             id: AllowanceId::new(),
             principal: alice.clone(),
             action_pattern: AllowancePattern::NetworkHost {
+                capsule_id: "test".to_string(),
                 host: "127.0.0.1".to_string(),
                 ports: Some(vec![1234]),
             },

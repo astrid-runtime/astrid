@@ -83,15 +83,34 @@ fn runtime_grant_is_per_principal() {
     let alice = PrincipalId::new("alice").unwrap();
     let bob = PrincipalId::new("bob").unwrap();
 
-    add_runtime_grant(&store, &alice, "127.0.0.1", 1234, true);
+    add_runtime_grant(&store, &alice, "react", "127.0.0.1", 1234, true);
 
     assert!(
-        has_runtime_grant(&store, &alice, "127.0.0.1", 1234),
+        has_runtime_grant(&store, &alice, "react", "127.0.0.1", 1234),
         "alice holds her own grant"
     );
     assert!(
-        !has_runtime_grant(&store, &bob, "127.0.0.1", 1234),
+        !has_runtime_grant(&store, &bob, "react", "127.0.0.1", 1234),
         "bob must NOT inherit alice's grant"
+    );
+}
+
+#[test]
+fn runtime_grant_is_per_capsule() {
+    // Spec (FIX 1a): a grant for capsule "react" must NOT exempt capsule
+    // "openai-compat" reaching the same host:port for the same principal.
+    let store = AllowanceStore::new();
+    let alice = PrincipalId::new("alice").unwrap();
+
+    add_runtime_grant(&store, &alice, "react", "127.0.0.1", 1234, true);
+
+    assert!(
+        has_runtime_grant(&store, &alice, "react", "127.0.0.1", 1234),
+        "react holds its own grant"
+    );
+    assert!(
+        !has_runtime_grant(&store, &alice, "openai-compat", "127.0.0.1", 1234),
+        "openai-compat must NOT inherit react's grant for the same endpoint"
     );
 }
 
@@ -99,11 +118,11 @@ fn runtime_grant_is_per_principal() {
 fn runtime_grant_is_port_specific() {
     let store = AllowanceStore::new();
     let p = PrincipalId::new("alice").unwrap();
-    add_runtime_grant(&store, &p, "127.0.0.1", 1234, true);
+    add_runtime_grant(&store, &p, "react", "127.0.0.1", 1234, true);
 
-    assert!(has_runtime_grant(&store, &p, "127.0.0.1", 1234));
+    assert!(has_runtime_grant(&store, &p, "react", "127.0.0.1", 1234));
     // A different port on the same host is a different grant — not covered.
-    assert!(!has_runtime_grant(&store, &p, "127.0.0.1", 5678));
+    assert!(!has_runtime_grant(&store, &p, "react", "127.0.0.1", 5678));
 }
 
 // Spec (8) — a consent-granted endpoint refuses redirects identically to a
@@ -209,8 +228,8 @@ async fn local_socket_approve_session_permits_and_caches_grant() {
 
     let alice = PrincipalId::new("alice").unwrap();
     assert!(
-        has_runtime_grant(&store, &alice, "127.0.0.1", 1234),
-        "approve_session must cache a per-principal grant"
+        has_runtime_grant(&store, &alice, "test", "127.0.0.1", 1234),
+        "approve_session must cache a per-principal, per-capsule grant"
     );
     // And a SECOND request to the same endpoint is now silent — no responder
     // present this time, so if it tried to elicit it would time out (deny).
@@ -236,7 +255,7 @@ async fn local_socket_approve_once_permits_without_caching() {
 
     let alice = PrincipalId::new("alice").unwrap();
     assert!(
-        !has_runtime_grant(&store, &alice, "127.0.0.1", 1234),
+        !has_runtime_grant(&store, &alice, "test", "127.0.0.1", 1234),
         "approve (once) must NOT cache a grant"
     );
 }
@@ -255,15 +274,18 @@ async fn local_socket_deny_fails_closed() {
 
     let alice = PrincipalId::new("alice").unwrap();
     assert!(
-        !has_runtime_grant(&store, &alice, "127.0.0.1", 1234),
+        !has_runtime_grant(&store, &alice, "test", "127.0.0.1", 1234),
         "a deny must cache nothing"
     );
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn local_socket_approve_always_persists_to_profile_egress() {
-    // Spec (5) tail: approve_always caches a (non-session) grant AND persists
-    // the endpoint to the principal's `profile.network.egress` on disk.
+async fn local_socket_approve_always_persists_under_capsule_key() {
+    // Spec (5) tail + FIX 1b: approve_always caches a (non-session) grant AND
+    // persists the endpoint to the principal's profile on disk, keyed by the
+    // requesting capsule id (`network.capsule_egress[<capsule>]`), NOT the flat
+    // general `egress` allowlist — so the persisted grant cannot widen across
+    // capsules.
     use astrid_core::dirs::AstridHome;
     use astrid_core::principal::PrincipalId;
     use astrid_core::profile::PrincipalProfile;
@@ -276,6 +298,7 @@ async fn local_socket_approve_always_persists_to_profile_egress() {
 
     let rt = tokio::runtime::Handle::current();
     let mut state = minimal_host_state(rt);
+    // The fixture's capsule id is "test"; the persisted grant lands under it.
     state.allowance_store = Some(Arc::new(AllowanceStore::new()));
     state.profile_cache = Some(cache);
     set_caller(&mut state, MessageOrigin::LocalSocket, "alice");
@@ -287,13 +310,104 @@ async fn local_socket_approve_always_persists_to_profile_egress() {
         "approve_always must permit the in-flight request"
     );
 
-    // The endpoint is now on disk in alice's profile egress allowlist.
+    // The endpoint is now on disk under the "test" capsule key — and NOT in the
+    // flat general egress allowlist.
     let alice = PrincipalId::new("alice").unwrap();
     let profile = PrincipalProfile::load(&home, &alice).expect("load profile");
+    assert_eq!(
+        profile.network.capsule_egress.get("test"),
+        Some(&vec!["127.0.0.1:1234".to_string()]),
+        "approve_always must persist under network.capsule_egress[<capsule>], got {:?}",
+        profile.network.capsule_egress
+    );
     assert!(
-        profile.network.egress.iter().any(|e| e == "127.0.0.1:1234"),
-        "approve_always must persist the endpoint to profile.network.egress, got {:?}",
+        profile.network.egress.is_empty(),
+        "approve_always must NOT touch the flat general egress allowlist, got {:?}",
         profile.network.egress
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn approve_always_for_one_capsule_does_not_exempt_another_capsule() {
+    // Spec (FIX 1b end-to-end): a session AND persisted approve_always grant
+    // for capsule "react" reaching 127.0.0.1:1234 must NOT permit capsule
+    // "openai-compat" reaching the same endpoint for the same principal — it
+    // still elicits (and here, with no responder, fails closed).
+    use astrid_core::dirs::AstridHome;
+    use astrid_core::principal::PrincipalId;
+    use astrid_core::profile::PrincipalProfile;
+
+    use crate::capsule::CapsuleId;
+    use crate::profile_cache::PrincipalProfileCache;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let home = AstridHome::from_path(dir.path());
+    let cache = Arc::new(PrincipalProfileCache::with_home(home.clone()));
+    let store = Arc::new(AllowanceStore::new());
+
+    let rt = tokio::runtime::Handle::current();
+    let mut state = minimal_host_state(rt);
+    state.allowance_store = Some(store.clone());
+    state.profile_cache = Some(cache);
+    set_caller(&mut state, MessageOrigin::LocalSocket, "alice");
+
+    // 1. Capsule "react" gets approve_always for 127.0.0.1:1234 (session grant
+    //    cached + persisted to disk under "react").
+    state.capsule_id = CapsuleId::from_static("react");
+    spawn_responder(state.event_bus.clone(), "approve_always");
+    let react_permitted =
+        tokio::task::block_in_place(|| state.consent_local_egress("127.0.0.1", 1234));
+    assert!(react_permitted, "react's approve_always must permit");
+
+    let alice = PrincipalId::new("alice").unwrap();
+    // The session grant is cached for react and NOT for openai-compat.
+    assert!(
+        has_runtime_grant(&store, &alice, "react", "127.0.0.1", 1234),
+        "react holds the session grant"
+    );
+    assert!(
+        !has_runtime_grant(&store, &alice, "openai-compat", "127.0.0.1", 1234),
+        "openai-compat must NOT inherit react's session grant"
+    );
+    // The persisted grant landed under "react" only.
+    let profile = PrincipalProfile::load(&home, &alice).expect("load profile");
+    assert_eq!(
+        profile.network.capsule_egress.get("react"),
+        Some(&vec!["127.0.0.1:1234".to_string()])
+    );
+    assert!(
+        profile
+            .network
+            .capsule_egress
+            .get("openai-compat")
+            .is_none(),
+        "openai-compat must NOT inherit react's persisted grant"
+    );
+
+    // 2. Now capsule "openai-compat" tries the SAME endpoint. It must NOT
+    //    short-circuit on react's grant — it must elicit its OWN consent. We
+    //    stand up a responder that DENIES, so a correct gate elicits and is
+    //    denied (returns false); a buggy gate that reused react's grant would
+    //    return true WITHOUT eliciting. (Using a deny responder rather than
+    //    relying on the 60s timeout keeps the test fast.)
+    state.capsule_id = CapsuleId::from_static("openai-compat");
+    let mut watch_rx = state.event_bus.subscribe_topic("astrid.v1.approval");
+    spawn_responder(state.event_bus.clone(), "deny");
+    let openai_permitted =
+        tokio::task::block_in_place(|| state.consent_local_egress("127.0.0.1", 1234));
+    assert!(
+        !openai_permitted,
+        "openai-compat must NOT be exempted by react's grant; it elicits and is denied"
+    );
+    // It DID elicit (proving it did not silently short-circuit on react's grant).
+    let elicited = tokio::time::timeout(Duration::from_millis(50), watch_rx.recv())
+        .await
+        .ok()
+        .flatten()
+        .is_some();
+    assert!(
+        elicited,
+        "openai-compat must elicit its own consent rather than reuse react's grant"
     );
 }
 
@@ -305,7 +419,7 @@ async fn local_socket_existing_grant_short_circuits_without_eliciting() {
     let mut state = minimal_host_state(rt);
     let store = Arc::new(AllowanceStore::new());
     let alice = PrincipalId::new("alice").unwrap();
-    add_runtime_grant(&store, &alice, "127.0.0.1", 1234, true);
+    add_runtime_grant(&store, &alice, "test", "127.0.0.1", 1234, true);
     state.allowance_store = Some(store.clone());
     set_caller(&mut state, MessageOrigin::LocalSocket, "alice");
 

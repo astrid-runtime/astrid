@@ -174,6 +174,20 @@ impl NetworkConfig {
                 ));
             }
         }
+        for (capsule_id, endpoints) in &self.capsule_egress {
+            if capsule_id.trim().is_empty() {
+                return Err(ProfileError::Invalid(
+                    "network.capsule_egress keys (capsule ids) must be non-empty".into(),
+                ));
+            }
+            for endpoint in endpoints {
+                if endpoint.trim().is_empty() {
+                    return Err(ProfileError::Invalid(
+                        "network.capsule_egress endpoints must be non-empty".into(),
+                    ));
+                }
+            }
+        }
         Ok(())
     }
 }

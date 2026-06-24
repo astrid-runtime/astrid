@@ -136,16 +136,22 @@ impl PrincipalProfileCache {
     }
 
     /// Persist an operator-consented local-egress endpoint to `principal`'s
-    /// profile on disk (`network.egress`), then invalidate the cache so the
-    /// next resolve reloads it.
+    /// profile on disk under `capsule_id` (`network.capsule_egress[capsule_id]`),
+    /// then invalidate the cache so the next resolve reloads it.
     ///
     /// This is the `approve_always` path of the runtime local-egress consent
     /// flow: a `host:port` the local operator chose to remember across daemon
-    /// restarts. The load-modify-save runs under the cache's own write lock so
-    /// two concurrent consents on the same principal cannot lose an entry, and
+    /// restarts, **for that capsule specifically**. The grant is keyed by
+    /// `capsule_id` so a persisted grant for capsule A reaching an endpoint
+    /// never exempts capsule B reaching the same endpoint for the same
+    /// principal — mirroring the operator `[security.capsule_local_egress]`
+    /// shape and the in-memory `AllowanceStore` grant's per-capsule scope.
+    ///
+    /// The load-modify-save runs under the cache's own write lock so two
+    /// concurrent consents on the same principal cannot lose an entry, and
     /// mirrors the kernel's `grant_on_use` discipline (load → mutate → validate
-    /// → save → invalidate). It is fail-closed and **idempotent**: an entry that
-    /// already exists is a no-op success.
+    /// → save → invalidate). It is fail-closed and **idempotent**: an endpoint
+    /// already present under that capsule is a no-op success.
     ///
     /// # Security
     ///
@@ -159,7 +165,12 @@ impl PrincipalProfileCache {
     /// Returns [`ProfileError`] on load/validate/save failure. The caller treats
     /// any error as a fail-closed no-op (the in-flight session grant still
     /// stands; only the disk persistence is skipped).
-    pub fn persist_egress(&self, principal: &PrincipalId, endpoint: &str) -> ProfileResult<()> {
+    pub fn persist_egress(
+        &self,
+        principal: &PrincipalId,
+        capsule_id: &str,
+        endpoint: &str,
+    ) -> ProfileResult<()> {
         // Serialize the load-modify-save against any other writer on this cache
         // (and against a concurrent `resolve` populating the same key) by
         // holding the write lock for the whole operation.
@@ -171,19 +182,21 @@ impl PrincipalProfileCache {
         let path = self.astrid_home.profile_path(principal);
         let mut profile = PrincipalProfile::load_from_path(&path)?;
 
-        if profile
+        let entries = profile
             .network
-            .egress
-            .iter()
-            .any(|e| e.eq_ignore_ascii_case(endpoint))
-        {
-            // Already persisted — idempotent. Drop the stale cache entry so a
-            // reload reflects on-disk state, then return success.
+            .capsule_egress
+            .entry(capsule_id.to_string())
+            .or_default();
+
+        if entries.iter().any(|e| e.eq_ignore_ascii_case(endpoint)) {
+            // Already persisted for this capsule — idempotent. Drop the stale
+            // cache entry so a reload reflects on-disk state, then return
+            // success.
             guard.remove(principal);
             return Ok(());
         }
 
-        profile.network.egress.push(endpoint.to_string());
+        entries.push(endpoint.to_string());
         // `save_to_path` re-runs `validate()` before writing, so a malformed
         // profile never reaches disk.
         profile.save_to_path(&path)?;
@@ -387,18 +400,21 @@ mod tests {
     }
 
     #[test]
-    fn persist_egress_appends_to_profile_and_invalidates() {
+    fn persist_egress_appends_under_capsule_key_and_invalidates() {
         let (dir, cache) = fixture();
         let p = principal("alice");
-        // Start from a profile with an existing egress entry to prove we append,
-        // not overwrite.
+        // Start from a profile with a pre-existing consented endpoint under a
+        // DIFFERENT capsule to prove we append per-capsule, not overwrite, and
+        // that the flat `egress` allowlist is left untouched.
         write_profile(
             &dir,
             &p,
             &format!(
                 "profile_version = {CURRENT_PROFILE_VERSION}\n\
                  [network]\n\
-                 egress = [\"api.example.com:443\"]\n"
+                 egress = [\"api.example.com:443\"]\n\
+                 [network.capsule_egress]\n\
+                 openai-compat = [\"127.0.0.1:5678\"]\n"
             ),
         );
         // Populate the cache so we can prove persist invalidates it.
@@ -406,47 +422,82 @@ mod tests {
         assert_eq!(cache.len(), 1);
 
         cache
-            .persist_egress(&p, "127.0.0.1:1234")
+            .persist_egress(&p, "react", "127.0.0.1:1234")
             .expect("persist egress");
 
         // Cache was invalidated by the persist.
         assert_eq!(cache.len(), 0, "persist_egress must invalidate the cache");
 
-        // A reload sees BOTH the pre-existing entry and the appended one.
         let reloaded = cache.resolve(&p).expect("reload");
-        assert!(
-            reloaded
-                .network
-                .egress
-                .contains(&"api.example.com:443".to_string())
+        // The flat general egress allowlist is untouched.
+        assert_eq!(reloaded.network.egress, vec!["api.example.com:443"]);
+        // The new grant lands ONLY under "react".
+        assert_eq!(
+            reloaded.network.capsule_egress.get("react"),
+            Some(&vec!["127.0.0.1:1234".to_string()])
+        );
+        // The pre-existing "openai-compat" grant is preserved and the react
+        // grant did NOT widen to it.
+        assert_eq!(
+            reloaded.network.capsule_egress.get("openai-compat"),
+            Some(&vec!["127.0.0.1:5678".to_string()])
         );
         assert!(
-            reloaded
+            !reloaded
                 .network
-                .egress
-                .contains(&"127.0.0.1:1234".to_string())
+                .capsule_egress
+                .get("openai-compat")
+                .unwrap()
+                .contains(&"127.0.0.1:1234".to_string()),
+            "a react grant must not appear under openai-compat"
         );
-        assert_eq!(reloaded.network.egress.len(), 2);
+    }
+
+    #[test]
+    fn persist_egress_is_per_capsule_isolated() {
+        // Spec (FIX 1b): a persisted grant for capsule "react" reaching
+        // 127.0.0.1:1234 must NOT exempt capsule "openai-compat" reaching the
+        // same endpoint for the same principal.
+        let (_dir, cache) = fixture();
+        let p = principal("alice");
+        cache
+            .persist_egress(&p, "react", "127.0.0.1:1234")
+            .expect("persist react grant");
+
+        let profile = cache.resolve(&p).expect("reload");
+        assert_eq!(
+            profile.network.capsule_egress.get("react"),
+            Some(&vec!["127.0.0.1:1234".to_string()]),
+            "react holds its own grant"
+        );
+        assert!(
+            profile
+                .network
+                .capsule_egress
+                .get("openai-compat")
+                .is_none(),
+            "openai-compat must NOT inherit react's persisted grant"
+        );
     }
 
     #[test]
     fn persist_egress_is_idempotent() {
         let (_dir, cache) = fixture();
         let p = principal("bob");
-        // No file on disk → starts from default (empty egress).
+        // No file on disk → starts from default (empty capsule_egress).
         cache
-            .persist_egress(&p, "10.0.0.5:8080")
+            .persist_egress(&p, "react", "10.0.0.5:8080")
             .expect("first persist");
-        // A second persist of the SAME endpoint (case-insensitive) is a no-op
-        // success, not a duplicate.
+        // A second persist of the SAME endpoint under the SAME capsule
+        // (case-insensitive) is a no-op success, not a duplicate.
         cache
-            .persist_egress(&p, "10.0.0.5:8080")
+            .persist_egress(&p, "react", "10.0.0.5:8080")
             .expect("idempotent persist");
 
         let profile = cache.resolve(&p).expect("reload");
         assert_eq!(
-            profile.network.egress,
-            vec!["10.0.0.5:8080".to_string()],
+            profile.network.capsule_egress.get("react"),
+            Some(&vec!["10.0.0.5:8080".to_string()]),
             "idempotent persist must not duplicate the entry"
         );
     }
