@@ -74,8 +74,7 @@ pub(crate) fn spawn_kernel_router(kernel: Arc<crate::Kernel>) -> tokio::task::Jo
                             method = method,
                             "Rate limited kernel management request"
                         );
-                        let response_topic =
-                            message.topic.replace("kernel.request.", "kernel.response.");
+                        let response_topic = response_topic_for(&message.topic);
                         publish_response(
                             &kernel,
                             response_topic,
@@ -194,6 +193,19 @@ fn spawn_connection_tracker(kernel: Arc<crate::Kernel>) -> tokio::task::JoinHand
     })
 }
 
+/// Map a kernel request topic (`astrid.v1.request.<suffix>`) to its correlated
+/// response topic (`astrid.v1.response.<suffix>`), so a reply lands on the
+/// channel the client is waiting on. A topic that is not a kernel request topic
+/// is returned unchanged.
+fn response_topic_for(request_topic: &str) -> String {
+    request_topic
+        .strip_prefix("astrid.v1.request.")
+        .map_or_else(
+            || request_topic.to_string(),
+            |suffix| format!("astrid.v1.response.{suffix}"),
+        )
+}
+
 #[expect(clippy::too_many_lines)]
 async fn handle_request(
     kernel: &Arc<crate::Kernel>,
@@ -202,11 +214,7 @@ async fn handle_request(
     device_key_id: Option<String>,
     req: KernelRequest,
 ) {
-    let response_topic = if let Some(suffix) = topic.strip_prefix("astrid.v1.request.") {
-        format!("astrid.v1.response.{suffix}")
-    } else {
-        topic.clone()
-    };
+    let response_topic = response_topic_for(&topic);
 
     // Capability enforcement preamble (issue #670). Resolve the caller's
     // profile, compute the required capability for this request, and
