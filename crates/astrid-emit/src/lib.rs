@@ -44,6 +44,7 @@ use std::process::ExitCode;
 use anyhow::Result;
 use astrid_core::PrincipalId;
 use astrid_core::SessionId;
+use astrid_types::Topic;
 use astrid_types::ipc::{IpcMessage, IpcPayload};
 use astrid_uplink::SocketClient;
 use clap::Parser;
@@ -186,8 +187,12 @@ impl Emitter for SocketEmitter {
         let caller = PrincipalId::new(principal)?;
         let mut client = SocketClient::connect(sid, caller).await?;
 
-        let msg = IpcMessage::new(topic, IpcPayload::RawJson(envelope), source_id)
-            .with_principal(principal);
+        let msg = IpcMessage::new(
+            Topic::from_raw(topic),
+            IpcPayload::RawJson(envelope),
+            source_id,
+        )
+        .with_principal(principal);
 
         client.send_message(msg).await
     }

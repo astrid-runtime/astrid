@@ -5,6 +5,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
 
+use crate::topic::Topic;
+
 /// Where a routed [`IpcMessage`] entered the system — the **transport
 /// origin** of the request, host-stamped at the listener ingress.
 ///
@@ -67,7 +69,7 @@ pub enum MessageOrigin {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct IpcMessage {
     /// Topic pattern or exact match (e.g., `astrid.cli.input`).
-    pub topic: String,
+    pub topic: Topic,
     /// Standardized payload structure.
     pub payload: IpcPayload,
     /// Optional cryptographic signature for stateless verification across a distributed swarm.
@@ -160,7 +162,7 @@ impl IpcMessage {
     /// payloads it receives, never from scratch.
     #[cfg(feature = "clock")]
     #[must_use]
-    pub fn new(topic: impl Into<String>, payload: IpcPayload, source_id: Uuid) -> Self {
+    pub fn new(topic: impl Into<Topic>, payload: IpcPayload, source_id: Uuid) -> Self {
         Self {
             topic: topic.into(),
             payload,
@@ -344,7 +346,7 @@ pub enum IpcPayload {
         /// The selectable options.
         options: Vec<SelectionOption>,
         /// IPC topic to publish the user's choice back on.
-        callback_topic: String,
+        callback_topic: Topic,
     },
     /// A lifecycle hook is requesting user input via the `elicit` API.
     ElicitRequest {

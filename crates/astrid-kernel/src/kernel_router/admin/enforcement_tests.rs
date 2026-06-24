@@ -18,7 +18,7 @@ use astrid_audit::AuditAction;
 use astrid_core::dirs::AstridHome;
 use astrid_core::principal::PrincipalId;
 use astrid_core::profile::PrincipalProfile;
-use astrid_events::ipc::{IpcMessage, IpcPayload};
+use astrid_events::ipc::{IpcMessage, IpcPayload, Topic};
 use astrid_events::kernel_api::{AdminKernelRequest, AdminRequestKind};
 use tempfile::TempDir;
 
@@ -52,9 +52,9 @@ async fn send_admin(
     suffix: &str,
     req: AdminKernelRequest,
 ) -> serde_json::Value {
-    let topic = format!("astrid.v1.admin.{suffix}");
-    let response_topic = format!("astrid.v1.admin.response.{suffix}");
-    let mut rx = kernel.event_bus.subscribe_topic(&response_topic);
+    let topic = Topic::admin_request(suffix);
+    let response_topic = Topic::admin_response(suffix);
+    let mut rx = kernel.event_bus.subscribe_topic(response_topic.as_str());
 
     let payload = serde_json::to_value(&req).expect("serialize admin request");
     let mut msg = IpcMessage::new(topic, IpcPayload::RawJson(payload), kernel.session_id.0);
@@ -295,9 +295,9 @@ async fn send_admin_scoped(
     suffix: &str,
     req: AdminKernelRequest,
 ) -> serde_json::Value {
-    let topic = format!("astrid.v1.admin.{suffix}");
-    let response_topic = format!("astrid.v1.admin.response.{suffix}");
-    let mut rx = kernel.event_bus.subscribe_topic(&response_topic);
+    let topic = Topic::admin_request(suffix);
+    let response_topic = Topic::admin_response(suffix);
+    let mut rx = kernel.event_bus.subscribe_topic(response_topic.as_str());
 
     let payload = serde_json::to_value(&req).expect("serialize admin request");
     let mut msg = IpcMessage::new(topic, IpcPayload::RawJson(payload), kernel.session_id.0);

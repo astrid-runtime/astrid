@@ -154,7 +154,7 @@ pub(crate) async fn run_headless(
 
     // Send disconnect
     let disconnect = astrid_types::ipc::IpcMessage::new(
-        "client.v1.disconnect",
+        astrid_types::Topic::client_disconnect(),
         astrid_types::ipc::IpcPayload::Disconnect {
             reason: Some("headless".to_string()),
         },
@@ -239,7 +239,7 @@ async fn collect_response(
                         .to_string(),
                     ),
                 };
-                let topic = format!("astrid.v1.approval.response.{request_id}");
+                let topic = astrid_types::Topic::approval_response(request_id);
                 let msg = astrid_types::ipc::IpcMessage::new(topic, response, session_id.0);
                 client.send_message(msg).await?;
             },

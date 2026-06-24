@@ -121,12 +121,16 @@ pub fn principal_class_label(principal: Option<&str>) -> &'static str {
 mod tests {
     use super::*;
     use crate::event::EventMetadata;
-    use crate::ipc::{IpcMessage, IpcPayload};
+    use crate::ipc::{IpcMessage, IpcPayload, Topic};
     use serde_json::json;
     use uuid::Uuid;
 
     fn ipc(topic: &str) -> Arc<AstridEvent> {
-        let msg = IpcMessage::new(topic, IpcPayload::RawJson(json!({})), Uuid::nil());
+        let msg = IpcMessage::new(
+            Topic::from_raw(topic),
+            IpcPayload::RawJson(json!({})),
+            Uuid::nil(),
+        );
         Arc::new(AstridEvent::Ipc {
             metadata: EventMetadata::new("test"),
             message: msg,

@@ -16,7 +16,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use astrid_core::PrincipalId;
-use astrid_events::ipc::{IpcMessage, IpcPayload};
+use astrid_events::ipc::{IpcMessage, IpcPayload, Topic};
 use astrid_events::{AstridEvent, EventBus, EventMetadata};
 use astrid_gateway::{
     GatewayConfig, GatewayState,
@@ -88,7 +88,11 @@ fn spawn_stub_responder(
                 return;
             };
             let principal = message.principal.clone();
-            let mut resp = IpcMessage::new(response_topic, IpcPayload::RawJson(reply), Uuid::nil());
+            let mut resp = IpcMessage::new(
+                Topic::from_raw(response_topic),
+                IpcPayload::RawJson(reply),
+                Uuid::nil(),
+            );
             // Reply stamped with the requester's principal, as the real
             // registry's own-principal `publish` does for a request whose
             // caller-context carries that principal.
@@ -348,7 +352,7 @@ async fn set_active_model_skips_foreign_corr_id_reply() {
 
             let publish = |body: serde_json::Value| {
                 let mut resp = IpcMessage::new(
-                    "registry.v1.response.set_active_model",
+                    Topic::from_raw("registry.v1.response.set_active_model"),
                     IpcPayload::RawJson(body),
                     Uuid::nil(),
                 );
@@ -532,7 +536,7 @@ async fn models_principal_isolation() {
         tokio::spawn(async move {
             if rx.recv(Some(Duration::from_secs(5))).await.is_some() {
                 let resp = IpcMessage::new(
-                    "registry.v1.response.get_active_model",
+                    Topic::from_raw("registry.v1.response.get_active_model"),
                     IpcPayload::RawJson(serde_json::json!({ "id": "bob-only:secret" })),
                     Uuid::nil(),
                 )

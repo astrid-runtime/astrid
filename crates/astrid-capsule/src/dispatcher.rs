@@ -303,7 +303,7 @@ impl EventDispatcher {
                 // is acceptable - the watchdog timeout is the actual recovery mechanism.
                 // The 10s rate limit prevents amplification feedback loops.
                 let msg = astrid_events::ipc::IpcMessage::new(
-                    "astrid.v1.event_bus.lagged",
+                    astrid_events::ipc::Topic::from_raw("astrid.v1.event_bus.lagged"),
                     astrid_events::ipc::IpcPayload::Custom {
                         data: serde_json::json!({ "lagged_count": lagged }),
                     },
@@ -317,7 +317,9 @@ impl EventDispatcher {
 
             let (topic, payload_bytes, ipc_message) = match &*event {
                 AstridEvent::Ipc { message, .. } => {
-                    let topic = Arc::new(message.topic.clone());
+                    // Dispatch-internal topic representation is `Arc<String>`;
+                    // the wire `Topic` is rendered to its string here.
+                    let topic = Arc::new(message.topic.to_string());
                     match message.payload.to_guest_bytes() {
                         Ok(bytes) => (topic, Arc::new(bytes), Some(Arc::new(message.clone()))),
                         Err(e) => {

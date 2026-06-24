@@ -378,7 +378,7 @@ mod tests {
             "outcome": "success",
         });
         let msg = astrid_events::ipc::IpcMessage::new(
-            crate::routes::events::AUDIT_TOPIC,
+            astrid_events::ipc::Topic::from_raw(crate::routes::events::AUDIT_TOPIC),
             astrid_events::ipc::IpcPayload::RawJson(event),
             uuid::Uuid::nil(),
         )

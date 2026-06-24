@@ -54,7 +54,7 @@ use std::sync::Arc;
 
 use astrid_audit::{AuditOutcome, AuthorizationProof};
 use astrid_core::principal::PrincipalId;
-use astrid_events::ipc::IpcPayload;
+use astrid_events::ipc::{IpcPayload, Topic};
 use astrid_events::kernel_api::{
     AdminKernelRequest, AdminKernelResponse, AdminRequestKind, AdminResponseBody,
 };
@@ -67,7 +67,8 @@ use super::{
 
 /// Admin IPC input topic prefix.
 const ADMIN_TOPIC_PREFIX: &str = "astrid.v1.admin.";
-/// Admin IPC response topic prefix (paired with [`ADMIN_TOPIC_PREFIX`]).
+/// Admin IPC response topic prefix. Used only as a loop-back guard (the
+/// outbound response topic is built through [`Topic::admin_response`]).
 const ADMIN_RESPONSE_PREFIX: &str = "astrid.v1.admin.response.";
 
 /// Spawn the admin dispatcher task. Mirrors [`super::spawn_kernel_router`]
@@ -127,11 +128,10 @@ pub(crate) fn spawn_admin_router(kernel: Arc<crate::Kernel>) -> tokio::task::Joi
 }
 
 /// Compute the response topic for an incoming admin request topic.
-fn admin_response_topic(input_topic: &str) -> String {
-    input_topic.strip_prefix(ADMIN_TOPIC_PREFIX).map_or_else(
-        || input_topic.to_string(),
-        |suffix| format!("{ADMIN_RESPONSE_PREFIX}{suffix}"),
-    )
+fn admin_response_topic(input_topic: &str) -> Topic {
+    input_topic
+        .strip_prefix(ADMIN_TOPIC_PREFIX)
+        .map_or_else(|| Topic::from_raw(input_topic), Topic::admin_response)
 }
 
 /// Return the authority scope `req` exercises for `caller`.
@@ -462,7 +462,7 @@ fn redeem_audit_proof(body: &AdminResponseBody) -> (AuthorizationProof, AuditOut
 
 async fn handle_admin_request(
     kernel: &Arc<crate::Kernel>,
-    topic: String,
+    topic: Topic,
     caller: PrincipalId,
     device_key_id: Option<String>,
     req: AdminKernelRequest,

@@ -12,7 +12,7 @@ use std::time::Instant;
 use astrid_audit::{AuditAction, AuditOutcome, AuthorizationProof};
 use astrid_capabilities::{CapabilityCheck, PermissionError};
 use astrid_core::principal::PrincipalId;
-use astrid_events::ipc::{IpcMessage, IpcPayload};
+use astrid_events::ipc::{IpcMessage, IpcPayload, Topic};
 use astrid_events::kernel_api::{KernelRequest, KernelResponse};
 use serde::Serialize;
 use tracing::{debug, info, warn};
@@ -197,19 +197,16 @@ fn spawn_connection_tracker(kernel: Arc<crate::Kernel>) -> tokio::task::JoinHand
 /// response topic (`astrid.v1.response.<suffix>`), so a reply lands on the
 /// channel the client is waiting on. A topic that is not a kernel request topic
 /// is returned unchanged.
-fn response_topic_for(request_topic: &str) -> String {
+fn response_topic_for(request_topic: &str) -> Topic {
     request_topic
         .strip_prefix("astrid.v1.request.")
-        .map_or_else(
-            || request_topic.to_string(),
-            |suffix| format!("astrid.v1.response.{suffix}"),
-        )
+        .map_or_else(|| Topic::from_raw(request_topic), Topic::kernel_response)
 }
 
 #[expect(clippy::too_many_lines)]
 async fn handle_request(
     kernel: &Arc<crate::Kernel>,
-    topic: String,
+    topic: Topic,
     caller: PrincipalId,
     device_key_id: Option<String>,
     req: KernelRequest,
@@ -453,7 +450,7 @@ async fn handle_request(
     publish_response(kernel, response_topic, res);
 }
 
-fn publish_response<R: Serialize>(kernel: &Arc<crate::Kernel>, response_topic: String, res: R) {
+fn publish_response<R: Serialize>(kernel: &Arc<crate::Kernel>, response_topic: Topic, res: R) {
     if let Ok(val) = serde_json::to_value(res) {
         let msg = IpcMessage::new(
             response_topic,
@@ -763,6 +760,13 @@ pub(crate) struct AdminAuditEntry<'a> {
 /// scope their view at the consumer end: operators with
 /// `audit:read_all` see the firehose, agents see only entries
 /// whose `principal` field matches their own.
+///
+/// The wire string is single-sourced through [`Topic::audit_entry`] at the
+/// publish site; this `pub const` remains the named cross-crate anchor that
+/// the capsule's `audit_topic_literal_pinned` test and the gateway SSE
+/// consumer mirror against. The
+/// [`audit_topic_const_matches_constructor`](tests::audit_topic_const_matches_constructor)
+/// test pins the two together so neither can drift.
 pub const AUDIT_TOPIC: &str = "astrid.v1.audit.entry";
 
 /// Append an `AdminRequest` audit entry for the given outcome.
@@ -823,8 +827,12 @@ fn record_admin_audit(kernel: &crate::Kernel, entry: AdminAuditEntry<'_>) {
             AuditOutcome::Failure { .. } => "failure",
         },
     });
-    let msg = IpcMessage::new(AUDIT_TOPIC, IpcPayload::RawJson(event), uuid::Uuid::nil())
-        .with_principal(caller.to_string());
+    let msg = IpcMessage::new(
+        Topic::audit_entry(),
+        IpcPayload::RawJson(event),
+        uuid::Uuid::nil(),
+    )
+    .with_principal(caller.to_string());
     let _ = kernel.event_bus.publish(astrid_events::AstridEvent::Ipc {
         metadata: astrid_events::EventMetadata::new("kernel_router::audit"),
         message: msg,

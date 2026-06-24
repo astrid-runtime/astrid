@@ -3,6 +3,8 @@
 use std::collections::HashSet;
 use std::time::{Duration, Instant};
 
+use astrid_types::Topic;
+
 // ─── Input Buffer ───────────────────────────────────────────────
 
 /// A segment of user input - either typed text or an atomic paste block.
@@ -789,7 +791,7 @@ pub(crate) struct App {
     // ── Session Hydration ──
     /// Expected reply topic for the pending hydration request. Precomputed to
     /// avoid per-event `format!` allocation. Cleared after the first response.
-    pub hydration_reply_topic: Option<String>,
+    pub hydration_reply_topic: Option<Topic>,
 }
 
 impl App {

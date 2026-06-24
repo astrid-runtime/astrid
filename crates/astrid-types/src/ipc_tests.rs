@@ -9,7 +9,7 @@ use super::*;
 #[test]
 fn ipc_message_signature() {
     let msg = IpcMessage::new(
-        "test.topic",
+        Topic::from_raw("test.topic"),
         IpcPayload::AgentResponse {
             text: "hello".into(),
             is_final: true,
@@ -26,7 +26,7 @@ fn ipc_message_signature() {
 #[test]
 fn ipc_message_principal() {
     let msg = IpcMessage::new(
-        "test.topic",
+        Topic::from_raw("test.topic"),
         IpcPayload::Custom {
             data: serde_json::json!({}),
         },
@@ -41,7 +41,7 @@ fn ipc_message_principal() {
 #[test]
 fn ipc_message_principal_serde_roundtrip() {
     let msg = IpcMessage::new(
-        "test.topic",
+        Topic::from_raw("test.topic"),
         IpcPayload::Custom {
             data: serde_json::json!({}),
         },
@@ -65,7 +65,11 @@ fn ipc_message_principal_absent_in_json() {
 
 #[test]
 fn ipc_message_principal_not_serialized_when_none() {
-    let msg = IpcMessage::new("test.topic", IpcPayload::Connect, Uuid::nil());
+    let msg = IpcMessage::new(
+        Topic::from_raw("test.topic"),
+        IpcPayload::Connect,
+        Uuid::nil(),
+    );
     let json = serde_json::to_string(&msg).unwrap();
     assert!(!json.contains("principal"));
 }
@@ -73,7 +77,7 @@ fn ipc_message_principal_not_serialized_when_none() {
 #[test]
 fn ipc_message_device_key_id_builder() {
     let msg = IpcMessage::new(
-        "test.topic",
+        Topic::from_raw("test.topic"),
         IpcPayload::Custom {
             data: serde_json::json!({}),
         },
@@ -88,7 +92,7 @@ fn ipc_message_device_key_id_builder() {
 #[test]
 fn ipc_message_device_key_id_serde_roundtrip() {
     let msg = IpcMessage::new(
-        "test.topic",
+        Topic::from_raw("test.topic"),
         IpcPayload::Custom {
             data: serde_json::json!({}),
         },
@@ -106,7 +110,11 @@ fn ipc_message_device_key_id_serde_roundtrip() {
 fn ipc_message_device_key_id_absent_in_json() {
     // A message constructed without a device key must not serialize the
     // key at all (legacy wire compatibility), and must round-trip to None.
-    let msg = IpcMessage::new("test.topic", IpcPayload::Connect, Uuid::nil());
+    let msg = IpcMessage::new(
+        Topic::from_raw("test.topic"),
+        IpcPayload::Connect,
+        Uuid::nil(),
+    );
     let json = serde_json::to_string(&msg).unwrap();
     assert!(!json.contains("device_key_id"));
 
@@ -126,14 +134,14 @@ fn ipc_message_device_key_id_defaults_when_missing() {
 fn message_origin_defaults_to_system() {
     // A freshly constructed message is System-origin (the fail-closed,
     // non-local floor) until the host stamps a transport origin.
-    let msg = IpcMessage::new("t", IpcPayload::Connect, Uuid::nil());
+    let msg = IpcMessage::new(Topic::from_raw("t"), IpcPayload::Connect, Uuid::nil());
     assert_eq!(msg.origin, MessageOrigin::System);
     assert!(msg.origin.is_system());
 }
 
 #[test]
 fn message_origin_builder_sets_and_serde_roundtrips() {
-    let msg = IpcMessage::new("t", IpcPayload::Connect, Uuid::nil())
+    let msg = IpcMessage::new(Topic::from_raw("t"), IpcPayload::Connect, Uuid::nil())
         .with_origin(MessageOrigin::LocalSocket);
     assert_eq!(msg.origin, MessageOrigin::LocalSocket);
 
@@ -147,7 +155,7 @@ fn message_origin_builder_sets_and_serde_roundtrips() {
 fn message_origin_system_not_serialized() {
     // System is the legacy/default origin: it must NOT appear on the wire,
     // so a system-origin message keeps the pre-origin frame shape.
-    let msg = IpcMessage::new("t", IpcPayload::Connect, Uuid::nil());
+    let msg = IpcMessage::new(Topic::from_raw("t"), IpcPayload::Connect, Uuid::nil());
     let json = serde_json::to_string(&msg).unwrap();
     assert!(!json.contains("origin"), "json: {json}");
 }
@@ -323,7 +331,7 @@ fn is_known_tag_covers_all_variants() {
             request_id: String::new(),
             title: String::new(),
             options: vec![],
-            callback_topic: String::new(),
+            callback_topic: Topic::from_raw(""),
         },
         IpcPayload::ElicitRequest {
             request_id: Uuid::nil(),

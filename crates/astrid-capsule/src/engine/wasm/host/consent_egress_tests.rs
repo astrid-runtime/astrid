@@ -14,7 +14,7 @@ use std::time::Duration;
 use astrid_approval::AllowanceStore;
 use astrid_core::principal::PrincipalId;
 use astrid_events::AstridEvent;
-use astrid_events::ipc::{IpcMessage, IpcPayload, MessageOrigin};
+use astrid_events::ipc::{IpcMessage, IpcPayload, MessageOrigin, Topic};
 
 use super::*;
 use crate::engine::wasm::test_fixtures::minimal_host_state;
@@ -23,7 +23,7 @@ use crate::engine::wasm::test_fixtures::minimal_host_state;
 /// `principal`, so `effective_origin()` / `effective_principal()` reflect it —
 /// exactly what the dispatcher does per invocation.
 fn set_caller(state: &mut HostState, origin: MessageOrigin, principal: &str) {
-    let msg = IpcMessage::new("t", IpcPayload::Connect, uuid::Uuid::nil())
+    let msg = IpcMessage::new(Topic::from_raw("t"), IpcPayload::Connect, uuid::Uuid::nil())
         .with_principal(principal)
         .with_origin(origin);
     state.caller_context = Some(msg);
@@ -42,7 +42,7 @@ fn spawn_responder(bus: astrid_events::EventBus, decision: &'static str) {
             let IpcPayload::ApprovalRequired { request_id, .. } = &message.payload else {
                 continue;
             };
-            let response_topic = format!("astrid.v1.approval.response.{request_id}");
+            let response_topic = Topic::approval_response(request_id);
             let payload = IpcPayload::ApprovalResponse {
                 request_id: request_id.clone(),
                 decision: decision.to_string(),

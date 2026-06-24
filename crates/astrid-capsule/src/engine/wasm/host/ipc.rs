@@ -36,7 +36,7 @@ use crate::engine::wasm::host_state::HostState;
 use astrid_events::AstridEvent;
 use astrid_events::EventMetadata;
 use astrid_events::RoutedEventReceiver;
-use astrid_events::ipc::{IpcMessage as InternalIpcMessage, IpcPayload};
+use astrid_events::ipc::{IpcMessage as InternalIpcMessage, IpcPayload, Topic};
 
 /// Per-call payload cap. Matches the IPC bus message-size ceiling.
 const MAX_PAYLOAD_BYTES: usize = 1024 * 1024;
@@ -88,7 +88,7 @@ fn pattern_covers_audit(pattern: &str) -> bool {
     let synthetic = AstridEvent::Ipc {
         metadata: EventMetadata::new("audit_scope_probe"),
         message: InternalIpcMessage::new(
-            AUDIT_TOPIC,
+            Topic::from_raw(AUDIT_TOPIC),
             IpcPayload::RawJson(serde_json::Value::Null),
             uuid::Uuid::nil(),
         ),
@@ -138,7 +138,8 @@ fn to_wit_message(msg: &InternalIpcMessage) -> WitIpcMessage {
         .map(|b| String::from_utf8_lossy(&b).into_owned())
         .unwrap_or_default();
     WitIpcMessage {
-        topic: msg.topic.clone(),
+        // Bindgen boundary OUT: the guest ABI carries the topic as `string`.
+        topic: msg.topic.to_string(),
         payload,
         source_id: msg.source_id.to_string(),
         principal: map_principal(msg),
@@ -280,15 +281,17 @@ fn publish_inner(
         Err(_) => return Err(ErrorCode::InvalidInput),
     };
 
-    let mut message = InternalIpcMessage::new(topic, ipc_payload, state.capsule_uuid)
-        .with_principal(principal_str)
-        // Carry the host-stamped transport origin of the originating request.
-        // A fresh `InternalIpcMessage` defaults to `System`; stamping it here
-        // preserves `RemoteGateway` / `LocalSocket` provenance across a
-        // guest-publish fan-out hop so a downstream egress gate sees the true
-        // origin. `origin` is host-populated by the caller (caller_context for
-        // `publish`, ingress_origin for `publish-as`), never guest-supplied.
-        .with_origin(origin);
+    // Bindgen boundary IN: the guest supplies the topic as `string`; wrap it
+    // explicitly (validation already ran above on the raw `&str`).
+    let mut message = InternalIpcMessage::new(Topic::from_raw(topic), ipc_payload, state.capsule_uuid)
+            .with_principal(principal_str)
+            // Carry the host-stamped transport origin of the originating request.
+            // A fresh `InternalIpcMessage` defaults to `System`; stamping it here
+            // preserves `RemoteGateway` / `LocalSocket` provenance across a
+            // guest-publish fan-out hop so a downstream egress gate sees the true
+            // origin. `origin` is host-populated by the caller (caller_context for
+            // `publish`, ingress_origin for `publish-as`), never guest-supplied.
+            .with_origin(origin);
     // Stamp the host-derived authenticating-device fingerprint so the kernel
     // cap-gate can apply the device's scope as an attenuation floor. Only the
     // `publish_as` forward path carries one; a capsule's own `publish` passes

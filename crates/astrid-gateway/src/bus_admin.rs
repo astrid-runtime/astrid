@@ -113,7 +113,7 @@ impl BusAdminClient {
         // Subscribe FIRST. A fast kernel handler can publish the
         // response on the same tokio task that processes the
         // request — subscribing afterwards would miss it.
-        let mut receiver = self.bus.subscribe_topic(&want_response);
+        let mut receiver = self.bus.subscribe_topic(want_response.as_str());
 
         let req = AdminKernelRequest::with_request_id(request_id.clone(), kind);
         let payload = serde_json::to_value(&req).context("serialize AdminKernelRequest")?;

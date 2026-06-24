@@ -23,7 +23,7 @@ fn next_client_event(receiver: &mut astrid_events::EventReceiver) -> (String, Op
         .try_recv()
         .expect("a client lifecycle event was emitted");
     match &*event {
-        AstridEvent::Ipc { message, .. } => (message.topic.clone(), message.principal.clone()),
+        AstridEvent::Ipc { message, .. } => (message.topic.to_string(), message.principal.clone()),
         other => panic!("expected an Ipc event, got {other:?}"),
     }
 }

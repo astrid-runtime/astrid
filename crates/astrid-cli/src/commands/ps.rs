@@ -55,14 +55,14 @@ pub(crate) async fn run(args: PsArgs) -> Result<ExitCode> {
     let req = astrid_core::kernel_api::KernelRequest::GetCapsuleMetadata;
     let val = serde_json::to_value(req)?;
     let msg = astrid_types::ipc::IpcMessage::new(
-        "astrid.v1.request.metadata",
+        astrid_types::Topic::kernel_request("metadata"),
         astrid_types::ipc::IpcPayload::RawJson(val),
         Uuid::nil(),
     );
     client.send_message(msg).await?;
     let raw = client
         .read_until_topic(
-            "astrid.v1.response.metadata",
+            astrid_types::Topic::kernel_response("metadata").as_str(),
             std::time::Duration::from_secs(10),
         )
         .await?;
