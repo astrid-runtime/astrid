@@ -96,10 +96,12 @@ pub struct PromptRequest {
 /// Inbound body for `POST /api/agent/elicit-response`.
 ///
 /// Answers an in-flight `elicit` event the prompt stream forwarded. The
-/// `request_id` is the one carried verbatim on the `elicit` SSE event. A
-/// cancellation is expressed by sending neither `value` nor `values` (both
-/// `None`) — matching the host's `value.is_none() && values.is_none()` cancel
-/// contract.
+/// `request_id` is the one carried verbatim on the `elicit` SSE event.
+///
+/// `value` and `values` are **mutually exclusive**: a scalar answer
+/// (`Text`/`Secret`/`Select`), an array answer (`Array`), or — with neither —
+/// the cancel sentinel (matching the host's `value.is_none() &&
+/// values.is_none()` contract). Supplying both is rejected with `400`.
 #[derive(Debug, Clone, Deserialize, ToSchema)]
 pub struct ElicitResponseRequest {
     /// Correlates with the `request_id` from the forwarded `elicit` event.
@@ -114,6 +116,23 @@ pub struct ElicitResponseRequest {
     /// Collected items for an `Array` field.
     #[serde(default)]
     pub values: Option<Vec<String>>,
+}
+
+impl ElicitResponseRequest {
+    /// Reject the ambiguous body where both a scalar `value` and an array
+    /// `values` are supplied. The elicit contract treats them as mutually
+    /// exclusive; allowing both would let the host silently honour one side and
+    /// drop the other depending on the original request kind, masking a client
+    /// bug. The cancel sentinel (both `None`) and either single-sided answer are
+    /// valid.
+    fn validate(&self) -> Result<(), &'static str> {
+        if self.value.is_some() && self.values.is_some() {
+            return Err(
+                "`value` and `values` are mutually exclusive; supply at most one (omit both to cancel)",
+            );
+        }
+        Ok(())
+    }
 }
 
 /// Initial SSE event sent immediately after a successful prompt
@@ -332,6 +351,7 @@ pub async fn post_prompt(
     request_body = ElicitResponseRequest,
     responses(
         (status = 202, description = "Answer accepted and published onto the elicit reply topic. The agent's continuation streams over the open prompt SSE connection."),
+        (status = 400, body = ErrorBody, description = "Ambiguous body: `value` and `values` are mutually exclusive."),
         (status = 401, body = ErrorBody, description = "Missing / invalid bearer."),
         (status = 500, body = ErrorBody, description = "Gateway not wired to a live event bus."),
     )
@@ -349,6 +369,8 @@ pub async fn post_elicit_response(
     };
 
     let body: ElicitResponseRequest = crate::routes::principals::read_json_body(req).await?;
+    body.validate()
+        .map_err(|m| GatewayError::BadRequest(m.to_string()))?;
 
     publish_elicit_response(&bus, caller.principal.as_str(), body);
 
@@ -620,6 +642,54 @@ mod tests {
             },
             other => panic!("expected ElicitResponse, got {other:?}"),
         }
+    }
+
+    /// REGRESSION: `value` and `values` are mutually exclusive. A body carrying
+    /// BOTH must be rejected by `validate()` (the handler maps that to a `400`),
+    /// so an ambiguous answer can't reach the bus where the host would silently
+    /// honour one side and drop the other. The cancel sentinel (both `None`) and
+    /// either single-sided answer stay valid.
+    #[test]
+    fn elicit_response_rejects_both_value_and_values() {
+        let request_id = Uuid::new_v4();
+        let both = ElicitResponseRequest {
+            request_id,
+            value: Some("scalar".to_string()),
+            values: Some(vec!["array".to_string()]),
+        };
+        assert!(both.validate().is_err(), "both set must be rejected");
+
+        // Each valid shape passes.
+        assert!(
+            ElicitResponseRequest {
+                request_id,
+                value: Some("v".into()),
+                values: None
+            }
+            .validate()
+            .is_ok(),
+            "scalar answer is valid"
+        );
+        assert!(
+            ElicitResponseRequest {
+                request_id,
+                value: None,
+                values: Some(vec!["a".into()])
+            }
+            .validate()
+            .is_ok(),
+            "array answer is valid"
+        );
+        assert!(
+            ElicitResponseRequest {
+                request_id,
+                value: None,
+                values: None
+            }
+            .validate()
+            .is_ok(),
+            "cancel sentinel (both None) is valid"
+        );
     }
 
     /// The fail-fast stream emits exactly one `error` event and then closes —
