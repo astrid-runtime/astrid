@@ -107,30 +107,10 @@ impl AuthConfig {
 fn validate_device_key(key: &super::DeviceKey) -> ProfileResult<()> {
     use super::DeviceScope;
 
-    if key.pubkey.is_empty() {
-        return Err(ProfileError::Invalid(
-            "auth.public_keys: device pubkey must be non-empty".into(),
-        ));
-    }
-    if key.pubkey.len() != 64 || !key.pubkey.chars().all(|c| c.is_ascii_hexdigit()) {
-        return Err(ProfileError::Invalid(format!(
-            "auth.public_keys: device pubkey must be 64 hex chars, got {:?}",
-            key.pubkey
-        )));
-    }
-    // Canonical form is lowercase; an uppercase entry means an un-normalised
-    // key reached storage, which would defeat the deterministic key_id /
-    // dedup-by-pubkey contract.
-    if key.pubkey.chars().any(|c| c.is_ascii_uppercase()) {
-        return Err(ProfileError::Invalid(
-            "auth.public_keys: device pubkey must be lowercase hex".into(),
-        ));
-    }
-    if key.key_id.is_empty() {
-        return Err(ProfileError::Invalid(
-            "auth.public_keys: device key_id must be non-empty".into(),
-        ));
-    }
+    key.typed_pubkey()
+        .map_err(|e| ProfileError::Invalid(format!("auth.public_keys: {e}")))?;
+    key.typed_key_id()
+        .map_err(|e| ProfileError::Invalid(format!("auth.public_keys: {e}")))?;
     if let DeviceScope::Scoped { allow, deny } = &key.scope {
         for pattern in allow.iter().chain(deny.iter()) {
             validate_capability(pattern).map_err(|e| {

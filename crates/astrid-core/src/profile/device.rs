@@ -14,6 +14,8 @@
 //! serialization always re-emits the struct form.
 
 use serde::{Deserialize, Serialize};
+use std::fmt;
+use std::str::FromStr;
 
 /// Capability attenuation scope bound to a single registered device key.
 ///
@@ -111,6 +113,203 @@ pub const DEVICE_KEY_ID_HEX_LEN: usize = 16;
 /// Number of hex characters in a canonical ed25519 public key (32 bytes).
 const ED25519_PUBKEY_HEX_LEN: usize = 64;
 
+/// Validated deterministic handle for a paired device key.
+///
+/// The public profile and management API remain string-shaped for
+/// compatibility. This wrapper lets internal code distinguish a revocation /
+/// bearer handle from the raw ed25519 public key it was derived from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct DeviceKeyId<S = String>(S);
+
+impl<S: AsRef<str>> DeviceKeyId<S> {
+    /// Create a validated device key handle.
+    ///
+    /// # Errors
+    ///
+    /// Returns a human-readable reason when `id` is not the canonical
+    /// lowercase hex fingerprint shape produced by
+    /// [`device_key_id_fingerprint`].
+    pub fn new(id: S) -> Result<Self, String> {
+        validate_device_key_id(id.as_ref())?;
+        Ok(Self(id))
+    }
+
+    /// Borrow the validated key id.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        self.0.as_ref()
+    }
+}
+
+impl DeviceKeyId<String> {
+    /// Derive the deterministic device key id for a canonical public key.
+    #[must_use]
+    pub fn for_pubkey(pubkey: &DevicePubkey<impl AsRef<str>>) -> Self {
+        Self(device_key_id_fingerprint(pubkey.as_str()))
+    }
+
+    /// Consume the wrapper and return the owned string.
+    #[must_use]
+    pub fn into_inner(self) -> String {
+        self.0
+    }
+}
+
+/// Validated canonical lowercase hex ed25519 public key, without prefix.
+///
+/// This is the profile storage form. Incoming operator/API values may include
+/// an `ed25519:` prefix and mixed case; use [`DevicePubkey::normalize`] at
+/// those edges.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct DevicePubkey<S = String>(S);
+
+impl<S: AsRef<str>> DevicePubkey<S> {
+    /// Create a typed view over a canonical stored public key.
+    ///
+    /// # Errors
+    ///
+    /// Returns a human-readable reason when `pubkey` is not 64 lowercase hex
+    /// characters without the `ed25519:` prefix.
+    pub fn from_canonical(pubkey: S) -> Result<Self, String> {
+        validate_pubkey_hex(pubkey.as_ref(), "device public key")?;
+        Ok(Self(pubkey))
+    }
+
+    /// Borrow the canonical public key hex.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        self.0.as_ref()
+    }
+}
+
+impl DevicePubkey<String> {
+    /// Normalize an incoming public key to the profile storage form.
+    ///
+    /// Accepts either bare 64-character hex or `ed25519:<hex>`, trims
+    /// surrounding whitespace, and lowercases the result.
+    ///
+    /// # Errors
+    ///
+    /// Returns a human-readable reason when the normalized key is not a
+    /// 32-byte ed25519 public key encoded as hex.
+    pub fn normalize(raw: &str) -> Result<Self, String> {
+        let trimmed = raw.trim();
+        let candidate = trimmed
+            .strip_prefix("ed25519:")
+            .unwrap_or(trimmed)
+            .to_ascii_lowercase();
+        validate_pubkey_hex(&candidate, "device public key")?;
+        Ok(Self(candidate))
+    }
+
+    /// Consume the wrapper and return the owned canonical public key hex.
+    #[must_use]
+    pub fn into_inner(self) -> String {
+        self.0
+    }
+}
+
+macro_rules! impl_string_newtype {
+    ($ty:ident) => {
+        impl<S: AsRef<str>> AsRef<str> for $ty<S> {
+            fn as_ref(&self) -> &str {
+                self.as_str()
+            }
+        }
+
+        impl<S: AsRef<str>> fmt::Display for $ty<S> {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str(self.as_str())
+            }
+        }
+
+        impl From<$ty<String>> for String {
+            fn from(value: $ty<String>) -> Self {
+                value.into_inner()
+            }
+        }
+
+        impl TryFrom<String> for $ty<String> {
+            type Error = String;
+
+            fn try_from(value: String) -> Result<Self, Self::Error> {
+                Self::new(value)
+            }
+        }
+
+        impl FromStr for $ty<String> {
+            type Err = String;
+
+            fn from_str(s: &str) -> Result<Self, Self::Err> {
+                Self::new(s.to_string())
+            }
+        }
+
+        impl<S: AsRef<str>> PartialEq<str> for $ty<S> {
+            fn eq(&self, other: &str) -> bool {
+                self.as_str() == other
+            }
+        }
+
+        impl<S: AsRef<str>> PartialEq<&str> for $ty<S> {
+            fn eq(&self, other: &&str) -> bool {
+                self.as_str() == *other
+            }
+        }
+
+        impl<S: AsRef<str>> PartialEq<String> for $ty<S> {
+            fn eq(&self, other: &String) -> bool {
+                self.as_str() == other
+            }
+        }
+
+        impl<S: AsRef<str>> PartialEq<&String> for $ty<S> {
+            fn eq(&self, other: &&String) -> bool {
+                self.as_str() == other.as_str()
+            }
+        }
+
+        impl<S: AsRef<str>> Serialize for $ty<S> {
+            fn serialize<Ser>(&self, serializer: Ser) -> Result<Ser::Ok, Ser::Error>
+            where
+                Ser: serde::Serializer,
+            {
+                serializer.serialize_str(self.as_str())
+            }
+        }
+
+        impl<'de> Deserialize<'de> for $ty<String> {
+            fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+            where
+                D: serde::Deserializer<'de>,
+            {
+                let value = String::deserialize(deserializer)?;
+                Self::new(value).map_err(serde::de::Error::custom)
+            }
+        }
+    };
+}
+
+impl_string_newtype!(DeviceKeyId);
+
+impl<S: AsRef<str>> AsRef<str> for DevicePubkey<S> {
+    fn as_ref(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl<S: AsRef<str>> fmt::Display for DevicePubkey<S> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl From<DevicePubkey<String>> for String {
+    fn from(value: DevicePubkey<String>) -> Self {
+        value.into_inner()
+    }
+}
+
 /// Derive a deterministic, non-secret fingerprint for a device key from its
 /// canonical lowercase-hex pubkey: the first [`DEVICE_KEY_ID_HEX_LEN`] hex
 /// chars of `SHA-256(pubkey_hex_bytes)`.
@@ -122,34 +321,57 @@ const ED25519_PUBKEY_HEX_LEN: usize = 64;
 /// (dedup by pubkey) and lets revocation target a single device by id.
 #[must_use]
 pub fn device_key_id_fingerprint(pubkey_hex: &str) -> String {
+    device_key_id_for_pubkey_hex(pubkey_hex).into_inner()
+}
+
+fn device_key_id_for_pubkey_hex(pubkey_hex: &str) -> DeviceKeyId<String> {
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
     hasher.update(pubkey_hex.as_bytes());
-    let digest = hex::encode(hasher.finalize());
-    // SHA-256 hex is always 64 chars, so this slice never panics; guard with
-    // a min anyway so a future hash swap can't introduce an out-of-bounds.
-    digest[..DEVICE_KEY_ID_HEX_LEN.min(digest.len())].to_string()
+    let mut digest = hex::encode(hasher.finalize());
+    // SHA-256 hex is always longer than the short device-key id; truncate
+    // defensively so a future hash swap still cannot panic.
+    digest.truncate(DEVICE_KEY_ID_HEX_LEN.min(digest.len()));
+    DeviceKeyId(digest)
 }
 
 /// Normalise a candidate ed25519 public key string to canonical lowercase hex
 /// without the `ed25519:` prefix, validating shape. Returns the bare hex on
 /// success or a human-readable reason on failure (fail-closed).
 fn normalise_pubkey_hex(raw: &str) -> Result<String, String> {
-    let candidate = raw
-        .strip_prefix("ed25519:")
-        .unwrap_or(raw)
-        .trim()
-        .to_ascii_lowercase();
+    DevicePubkey::normalize(raw).map(DevicePubkey::into_inner)
+}
+
+fn validate_pubkey_hex(candidate: &str, field: &str) -> Result<(), String> {
     if candidate.len() != ED25519_PUBKEY_HEX_LEN {
         return Err(format!(
-            "device public key must be 32 bytes hex-encoded ({ED25519_PUBKEY_HEX_LEN} hex chars); got {} chars",
+            "{field} must be 32 bytes hex-encoded ({ED25519_PUBKEY_HEX_LEN} hex chars); got {} chars",
             candidate.len()
         ));
     }
     if !candidate.chars().all(|c| c.is_ascii_hexdigit()) {
-        return Err("device public key contains non-hex characters".into());
+        return Err(format!("{field} contains non-hex characters"));
     }
-    Ok(candidate)
+    if candidate.chars().any(|c| c.is_ascii_uppercase()) {
+        return Err(format!("{field} must be lowercase hex"));
+    }
+    Ok(())
+}
+
+fn validate_device_key_id(id: &str) -> Result<(), String> {
+    if id.len() != DEVICE_KEY_ID_HEX_LEN {
+        return Err(format!(
+            "device key_id must be {DEVICE_KEY_ID_HEX_LEN} lowercase hex chars; got {} chars",
+            id.len()
+        ));
+    }
+    if !id.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err("device key_id contains non-hex characters".into());
+    }
+    if id.chars().any(|c| c.is_ascii_uppercase()) {
+        return Err("device key_id must be lowercase hex".into());
+    }
+    Ok(())
 }
 
 impl DeviceKey {
@@ -166,10 +388,11 @@ impl DeviceKey {
         label: Option<String>,
         created_at: i64,
     ) -> Self {
-        let key_id = device_key_id_fingerprint(&pubkey_hex);
+        let pubkey = DevicePubkey(pubkey_hex);
+        let key_id = DeviceKeyId::for_pubkey(&pubkey).into_inner();
         Self {
             key_id,
-            pubkey: pubkey_hex,
+            pubkey: pubkey.into_inner(),
             scope,
             label,
             created_at,
@@ -188,6 +411,26 @@ impl DeviceKey {
     #[must_use]
     pub fn matches_pubkey(&self, hex_lower: &str) -> bool {
         self.pubkey == hex_lower
+    }
+
+    /// Typed view of this device's stable key id.
+    ///
+    /// # Errors
+    ///
+    /// Returns a human-readable reason if the public `key_id` field has been
+    /// mutated into a non-canonical value.
+    pub fn typed_key_id(&self) -> Result<DeviceKeyId<&str>, String> {
+        DeviceKeyId::new(self.key_id.as_str())
+    }
+
+    /// Typed view of this device's canonical public key.
+    ///
+    /// # Errors
+    ///
+    /// Returns a human-readable reason if the public `pubkey` field has been
+    /// mutated into a non-canonical value.
+    pub fn typed_pubkey(&self) -> Result<DevicePubkey<&str>, String> {
+        DevicePubkey::from_canonical(self.pubkey.as_str())
     }
 }
 
@@ -328,6 +571,27 @@ mod tests {
     }
 
     #[test]
+    fn device_key_id_newtype_validates_shape() {
+        let id = DeviceKeyId::new("0123456789abcdef").unwrap();
+        assert_eq!(id.as_str(), "0123456789abcdef");
+        assert!(DeviceKeyId::new("0123456789abcde").is_err());
+        assert!(DeviceKeyId::new("0123456789abcdeg").is_err());
+        assert!(DeviceKeyId::new("0123456789ABCDEF").is_err());
+    }
+
+    #[test]
+    fn device_pubkey_newtype_normalizes_and_validates() {
+        let pubkey = DevicePubkey::normalize(&format!(" ed25519:{} ", "A".repeat(64))).unwrap();
+        assert_eq!(pubkey.as_str(), "a".repeat(64));
+        assert_eq!(
+            DeviceKeyId::for_pubkey(&pubkey).into_inner(),
+            device_key_id_fingerprint(pubkey.as_str())
+        );
+        assert!(DevicePubkey::normalize("deadbeef").is_err());
+        assert!(DevicePubkey::from_canonical("A".repeat(64)).is_err());
+    }
+
+    #[test]
     fn device_key_new_derives_key_id_and_ed25519_entry() {
         let hex = "f".repeat(64);
         let key = DeviceKey::new(hex.clone(), DeviceScope::Full, None, 0);
@@ -335,6 +599,8 @@ mod tests {
         assert_eq!(key.ed25519_entry(), format!("ed25519:{hex}"));
         assert!(key.matches_pubkey(&hex));
         assert!(!key.matches_pubkey(&"e".repeat(64)));
+        assert_eq!(key.typed_key_id().unwrap(), key.key_id);
+        assert_eq!(key.typed_pubkey().unwrap().as_str(), key.pubkey);
     }
 
     #[test]

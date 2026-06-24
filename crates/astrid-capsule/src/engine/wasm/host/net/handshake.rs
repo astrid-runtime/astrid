@@ -262,7 +262,10 @@ fn verify_signature_against_keys(
     let mut saw_key = false;
     for key in public_keys {
         saw_key = true;
-        let Ok(public_key) = astrid_crypto::PublicKey::from_hex(&key.pubkey) else {
+        let Ok(pubkey) = key.typed_pubkey() else {
+            continue;
+        };
+        let Ok(public_key) = astrid_crypto::PublicKey::from_hex(pubkey.as_str()) else {
             continue;
         };
         if public_key.verify(message_bytes, &signature).is_ok() {
