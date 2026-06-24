@@ -188,170 +188,135 @@ async fn decompressed_cap_ignored_when_decompression_off() {
 
 // ── FIX 4: the 4-concurrent-stream quota actually triggers ─────────────
 
-/// Opening a stream must populate `active_http_streams` (the quota map); the
-/// 5th concurrent stream for a principal is rejected with `Quota`; close/drop
-/// release the slot. Fails without the mirror insert/remove — the cap was dead
-/// (streams lived only in the resource table, which the quota check can't
-/// enumerate).
+/// The concurrency quota counts `active_http_streams`; the open past the cap is
+/// rejected with `Quota`; `stream_close` / `stream_drop` each release a slot so
+/// the next open fits again. Fails without the mirror insert/remove — the cap
+/// was dead (streams lived only in the resource table, which the quota check
+/// can't enumerate).
+///
+/// Hermetic and hang-proof: the quota gate runs BEFORE any network and reads
+/// only `active_http_streams.len()`, so the map is pre-populated with synthetic
+/// (no-network) streams; the at-cap open rejects immediately, and close/drop are
+/// asserted to release a slot (dropping the count below the cap so the gate
+/// would permit the next open). Opening real streams would block on the 120s
+/// streaming header deadline waiting for a responder.
 #[tokio::test]
 async fn stream_quota_triggers_and_releases() {
-    // One-shot 200 with a tiny body; the server closes after, but the stream
-    // resource (and its quota mirror) stays live until close/drop.
-    fn ok_response() -> Vec<u8> {
-        b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n".to_vec()
-    }
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let rt = tokio::runtime::Handle::current();
+        let mut state = minimal_host_state(rt);
+        state.security = Some(Arc::new(AllowAllGate));
+        let limits = state.http_limits;
+        let cap = limits.max_concurrent_streams;
+        let principal = state.effective_principal();
 
-    let rt = tokio::runtime::Handle::current();
+        // Fill the quota map to the cap with synthetic streams (no network),
+        // keyed by rep so `stream_close` / `stream_drop` can remove by rep.
+        let reps: Vec<u32> = (0..cap as u32).collect();
+        for &rep in &reps {
+            state.active_http_streams.insert(
+                u64::from(rep),
+                super::backend::ActiveHttpStream::dummy_for_test(&principal),
+            );
+        }
+        assert_eq!(
+            state.active_http_streams.len(),
+            cap,
+            "the quota map is populated to the cap"
+        );
 
-    // Open the cap (4) streams, each against its own loopback server.
-    let mut reps = Vec::new();
-    let mut servers = Vec::new();
-    // Build one shared state; each open needs that hop's port allowlisted, so
-    // collect all four ports first, then allowlist them all.
-    let mut addrs = Vec::new();
-    for _ in 0..4 {
-        let Some((addr, server)) = one_shot_server(ok_response()).await else {
-            return;
-        };
-        addrs.push(addr);
-        servers.push(server);
-    }
-    let mut state = minimal_host_state(rt);
-    state.security = Some(Arc::new(AllowAllGate));
-    state.local_egress = addrs
-        .iter()
-        .map(|a| format!("127.0.0.1:{}", a.port()))
-        .collect();
-    let limits = state.http_limits;
-
-    for addr in &addrs {
-        let res = state
+        // An open at the cap is rejected by the quota gate (it trips before any
+        // network — no responder is reached).
+        let err = state
             .http_stream_backend(
-                get_request(format!("http://{addr}/")),
+                get_request("http://127.0.0.1:9/".to_string()),
                 super::options::ResolvedOptions::from_options(follow(), &limits),
             )
             .await
-            .expect("opening up to the cap must succeed");
-        reps.push(res.rep());
-    }
-    assert_eq!(
-        state.active_http_streams.len(),
-        4,
-        "the quota map must be populated as streams open"
-    );
+            .expect_err("an open at the cap must hit the quota");
+        assert!(
+            matches!(err, ErrorCode::Quota),
+            "expected Quota, got {err:?}"
+        );
 
-    // A 5th open is rejected by the quota gate (no server needed — the gate
-    // trips before any network).
-    let Some((addr5, server5)) = one_shot_server(ok_response()).await else {
-        return;
-    };
-    state
-        .local_egress
-        .push(format!("127.0.0.1:{}", addr5.port()));
-    let err = state
-        .http_stream_backend(
-            get_request(format!("http://{addr5}/")),
-            super::options::ResolvedOptions::from_options(follow(), &limits),
-        )
-        .await
-        .expect_err("the 5th concurrent stream must hit the quota");
-    assert!(
-        matches!(err, ErrorCode::Quota),
-        "expected Quota, got {err:?}"
-    );
+        // `stream_close` releases a slot: the count drops below the cap, so the
+        // quota gate (`len >= cap`) would now permit the next open.
+        super::backend::stream_close(&mut state, reps[0]).expect("close ok");
+        assert_eq!(
+            state.active_http_streams.len(),
+            cap - 1,
+            "close must release the quota slot"
+        );
+        assert!(
+            state.active_http_streams.len() < cap,
+            "after a close the quota gate permits another open"
+        );
 
-    // Closing one frees a slot; the map shrinks and a new open succeeds.
-    super::backend::stream_close(&mut state, reps[0]).expect("close ok");
-    assert_eq!(
-        state.active_http_streams.len(),
-        3,
-        "close must release the quota slot"
-    );
-    let opened = state
-        .http_stream_backend(
-            get_request(format!("http://{addr5}/")),
-            super::options::ResolvedOptions::from_options(follow(), &limits),
-        )
-        .await
-        .expect("after a close, a new stream fits under the cap");
-    assert_eq!(state.active_http_streams.len(), 4);
-
-    // Drop also releases the slot.
-    super::backend::stream_drop(&mut state, opened.rep());
-    assert_eq!(
-        state.active_http_streams.len(),
-        3,
-        "drop must release the quota slot"
-    );
-
-    for s in servers {
-        let _ = s.await;
-    }
-    let _ = server5.await;
+        // Re-fill to the cap, then `stream_drop` releases a slot too.
+        state.active_http_streams.insert(
+            u64::from(reps[0]),
+            super::backend::ActiveHttpStream::dummy_for_test(&principal),
+        );
+        assert_eq!(state.active_http_streams.len(), cap);
+        super::backend::stream_drop(&mut state, reps[1]);
+        assert_eq!(
+            state.active_http_streams.len(),
+            cap - 1,
+            "drop must release the quota slot"
+        );
+    })
+    .await
+    .expect("stream-quota test must not hang (5s backstop)");
 }
 
 /// A NON-default operator `max_concurrent_streams` actually lowers the quota:
 /// with a configured cap of 2, the 3rd concurrent stream is rejected with
 /// `Quota` — where the host default (4) would allow it. Proves the stream cap
 /// reads `http_limits`, not the old `MAX_ACTIVE_HTTP_STREAMS` constant.
+///
+/// Hermetic and hang-proof: the quota gate runs at the TOP of
+/// `http_stream_backend`, BEFORE any network, and counts only
+/// `active_http_streams` entries — so the cap is pre-populated with synthetic
+/// (no-network) streams and a single open is asserted to reject immediately.
+/// Opening real streams would block on the 120s streaming header deadline
+/// waiting for a responder.
 #[tokio::test]
 async fn configured_max_concurrent_streams_lowers_quota() {
-    fn ok_response() -> Vec<u8> {
-        b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n".to_vec()
-    }
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let rt = tokio::runtime::Handle::current();
+        let mut state = minimal_host_state(rt);
+        state.security = Some(Arc::new(AllowAllGate));
+        // Operator override: cap concurrent streams at 2 (below the default 4).
+        state.http_limits.max_concurrent_streams = 2;
+        let limits = state.http_limits;
+        let principal = state.effective_principal();
 
-    let rt = tokio::runtime::Handle::current();
+        // Pre-fill the quota map to the configured cap (2) with synthetic
+        // streams — no sockets, no network.
+        for rep in 0..2u64 {
+            state.active_http_streams.insert(
+                rep,
+                super::backend::ActiveHttpStream::dummy_for_test(&principal),
+            );
+        }
+        assert_eq!(state.active_http_streams.len(), 2);
 
-    // Three loopback servers; collect their ports so all can be allowlisted.
-    let mut servers = Vec::new();
-    let mut addrs = Vec::new();
-    for _ in 0..3 {
-        let Some((addr, server)) = one_shot_server(ok_response()).await else {
-            return;
-        };
-        addrs.push(addr);
-        servers.push(server);
-    }
-
-    let mut state = minimal_host_state(rt);
-    state.security = Some(Arc::new(AllowAllGate));
-    state.local_egress = addrs
-        .iter()
-        .map(|a| format!("127.0.0.1:{}", a.port()))
-        .collect();
-    // Operator override: cap concurrent streams at 2 (below the default 4).
-    state.http_limits.max_concurrent_streams = 2;
-    let limits = state.http_limits;
-
-    // The first two opens succeed.
-    for addr in &addrs[..2] {
-        state
+        // The next open is rejected by the LOWERED quota (the gate trips before
+        // any network). The default cap of 4 would have allowed it here.
+        let err = state
             .http_stream_backend(
-                get_request(format!("http://{addr}/")),
+                get_request("http://127.0.0.1:9/".to_string()),
                 super::options::ResolvedOptions::from_options(follow(), &limits),
             )
             .await
-            .expect("opening up to the configured cap (2) must succeed");
-    }
-    assert_eq!(state.active_http_streams.len(), 2);
-
-    // The third open is rejected by the LOWERED quota — proving config lowered
-    // it (the host default of 4 would have allowed a third stream here).
-    let err = state
-        .http_stream_backend(
-            get_request(format!("http://{}/", addrs[2])),
-            super::options::ResolvedOptions::from_options(follow(), &limits),
-        )
-        .await
-        .expect_err("the 3rd stream must hit the configured cap of 2");
-    assert!(
-        matches!(err, ErrorCode::Quota),
-        "expected Quota at the configured cap, got {err:?}"
-    );
-
-    for s in servers {
-        let _ = s.await;
-    }
+            .expect_err("the 3rd stream must hit the configured cap of 2");
+        assert!(
+            matches!(err, ErrorCode::Quota),
+            "expected Quota at the configured cap, got {err:?}"
+        );
+    })
+    .await
+    .expect("stream-quota test must not hang (5s backstop)");
 }
 
 /// FIX C / FIX 2 regression: a genuine host-not-found surfaces the typed

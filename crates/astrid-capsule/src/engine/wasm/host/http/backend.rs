@@ -100,6 +100,31 @@ pub struct ActiveHttpStream {
     pub read_timeout: Duration,
 }
 
+impl ActiveHttpStream {
+    /// Build a quota-counting placeholder stream WITHOUT any network. The
+    /// streaming concurrency quota in [`HostState::http_stream_backend`] only
+    /// counts `active_http_streams` entries — it never reads the `response` — so
+    /// tests can pre-populate the map to the cap and assert the next open is
+    /// rejected with `Quota` immediately, instead of opening real streams (which
+    /// would block on the streaming header deadline waiting for a responder).
+    /// The `response` is a synthetic empty-body `200` made from an
+    /// `http::Response`, never an over-the-wire one.
+    #[cfg(test)]
+    pub(crate) fn dummy_for_test(creator: &astrid_core::principal::PrincipalId) -> Self {
+        let http_resp = http::Response::builder()
+            .status(200)
+            .body(reqwest::Body::from(Vec::<u8>::new()))
+            .expect("build synthetic http::Response");
+        Self {
+            response: Arc::new(tokio::sync::Mutex::new(reqwest::Response::from(http_resp))),
+            creator: creator.clone(),
+            status: 200,
+            headers: Vec::new(),
+            read_timeout: Duration::from_secs(120),
+        }
+    }
+}
+
 /// The deadline for `send()` to produce response HEADERS. An explicit caller
 /// `first-byte-ms` wins; else the (buffered) total deadline; else the host
 /// `header_deadline_floor` — so the streaming path (total cleared, no
