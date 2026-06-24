@@ -527,23 +527,35 @@ fn resolve_template(template: &str, vars: &HashMap<String, String>) -> String {
     result
 }
 
+/// Whether a capsule `source` would have to touch the network to install.
+///
+/// Only GitHub-backed shapes (`@org/repo`, `github.com/…`,
+/// `https://github.com/…`) are network sources; everything else — including
+/// a relative local path like `capsules/cli.capsule` — installs straight
+/// from disk. This is the predicate the `--offline` guard rejects on, so it
+/// must NOT reject a bare relative path the way the old `starts_with('.')`
+/// /`starts_with('/')` check wrongly did.
+fn is_network_capsule_source(source: &str) -> bool {
+    astrid_capsule_install::github_source::parse_github_source(source.trim()).is_some()
+}
+
 /// Install each selected capsule with a progress bar.
 ///
-/// Under `offline`, a capsule whose source is not a local path is a
-/// hard error — the `--offline` contract forbids any network, and a
-/// remote `@org/repo` capsule in a local `Distro.toml` would otherwise
-/// silently fetch from GitHub. (A fully self-contained offline install
-/// uses a `.shuttle` instead.)
+/// Under `offline`, a capsule whose source is GitHub-backed is a hard
+/// error — the `--offline` contract forbids any network, and a remote
+/// `@org/repo` capsule in a local `Distro.toml` would otherwise silently
+/// fetch from GitHub. A local path (relative or absolute) installs from
+/// disk and is allowed. (A fully self-contained offline install uses a
+/// `.shuttle` instead.)
 async fn install_capsules(
     selected: &[DistroCapsule],
     offline: bool,
 ) -> anyhow::Result<Vec<LockedCapsule>> {
     if offline {
         for cap in selected {
-            let src = cap.source.trim();
-            if !(src.starts_with('.') || src.starts_with('/')) {
+            if is_network_capsule_source(&cap.source) {
                 bail!(
-                    "--offline: capsule '{}' has a non-local source '{}' — \
+                    "--offline: capsule '{}' has a network/GitHub source '{}' — \
                      refusing to fetch. Use a .shuttle archive for a self-contained \
                      offline install.",
                     cap.name,
@@ -917,7 +929,24 @@ mod tests {
         let selected = vec![cap("llm", None, false)]; // source "@org/llm"
         let err = install_capsules(&selected, true).await.unwrap_err();
         assert!(err.to_string().contains("--offline"), "got: {err}");
-        assert!(err.to_string().contains("non-local"), "got: {err}");
+        assert!(err.to_string().contains("network/GitHub"), "got: {err}");
+    }
+
+    #[test]
+    fn offline_guard_blocks_only_github_sources() {
+        // GitHub-backed shapes are network sources (rejected under --offline).
+        assert!(is_network_capsule_source("@org/repo"));
+        assert!(is_network_capsule_source("@org/repo@1.2.0"));
+        assert!(is_network_capsule_source("github.com/org/repo"));
+        assert!(is_network_capsule_source("https://github.com/org/repo"));
+
+        // Local paths are NOT network sources — including a bare relative
+        // path like `capsules/cli.capsule`, which the old guard wrongly
+        // rejected because it didn't start with `.` or `/`.
+        assert!(!is_network_capsule_source("capsules/cli.capsule"));
+        assert!(!is_network_capsule_source("./capsules/cli.capsule"));
+        assert!(!is_network_capsule_source("/abs/path/cli.capsule"));
+        assert!(!is_network_capsule_source("cli.capsule"));
     }
 
     #[test]
