@@ -11,6 +11,7 @@ description = "Hook system for Astrid secure agent runtime"
 [dependencies]
 astrid-capabilities = { workspace = true }
 astrid-capsule = { workspace = true }
+astrid-config = { workspace = true }
 astrid-core = { workspace = true }
 astrid-events = { workspace = true }
 astrid-storage = { workspace = true }

@@ -109,23 +109,27 @@ fn resolve_capsule_limits(
     )
 }
 
-/// Resolve the `astrid:http` host ceilings from the `[http]` config section
-/// into the typed [`HttpLimits`](astrid_capsule::HttpLimits) the kernel forwards
-/// to every capsule. Seconds → `Duration` conversion happens once here, off the
-/// request hot path. An absent `[http]` section yields `HttpSection::default`,
-/// which equals the host's historical hardcoded constants — so this resolution
-/// changes nothing unless the operator set explicit `[http]` values.
+/// Resolve the `astrid:http` operator host policy from the `[http]` config
+/// section into the typed [`HttpLimits`](astrid_capsule::HttpLimits) the kernel
+/// forwards to every capsule. The timeout fields are per-request DEFAULTS (a
+/// caller may override with a larger value); `max_redirects` /
+/// `max_concurrent_streams` are caller ceilings; `max_response_bytes` is a
+/// caller ceiling that the request path further hard-clamps to
+/// `MAX_GUEST_PAYLOAD_LEN`. An absent `[http]` section yields
+/// `HttpSection::default`, which equals the host's historical hardcoded
+/// constants — so this resolution changes nothing unless the operator set
+/// explicit `[http]` values.
 fn resolve_http_limits(cfg: Option<&astrid_config::Config>) -> astrid_capsule::HttpLimits {
     let http = cfg.map(|c| c.http.clone()).unwrap_or_default();
-    astrid_capsule::HttpLimits {
-        default_total_timeout: std::time::Duration::from_secs(http.default_timeout_secs),
-        stream_connect_timeout: std::time::Duration::from_secs(http.stream_connect_timeout_secs),
-        stream_read_timeout: std::time::Duration::from_secs(http.stream_read_timeout_secs),
-        header_deadline_floor: std::time::Duration::from_secs(http.header_deadline_secs),
-        max_redirects: http.max_redirects as usize,
-        max_concurrent_streams: http.max_concurrent_streams as usize,
-        max_response_bytes: http.max_response_bytes,
-    }
+    astrid_capsule::HttpLimits::from_config_values(
+        http.default_timeout_secs,
+        http.stream_connect_timeout_secs,
+        http.stream_read_timeout_secs,
+        http.header_deadline_secs,
+        http.max_redirects,
+        http.max_concurrent_streams,
+        http.max_response_bytes,
+    )
 }
 
 /// Run the Astrid daemon with the given arguments.

@@ -784,8 +784,10 @@ mod v11 {
     /// `v10_defaults`, not the old hardcoded 30s constant).
     #[test]
     fn config_default_timeout_changes_resolved_total() {
-        let mut limits = HttpLimits::default();
-        limits.default_total_timeout = Duration::from_secs(5);
+        let limits = HttpLimits {
+            default_total_timeout: Duration::from_secs(5),
+            ..HttpLimits::default()
+        };
 
         let resolved = ResolvedOptions::from_options(empty_options(), &limits);
         assert_eq!(
@@ -804,8 +806,10 @@ mod v11 {
     /// the const. With ceiling 3, a caller asking for 9 resolves to 3.
     #[test]
     fn config_max_redirects_ceiling_clamps_caller() {
-        let mut limits = HttpLimits::default();
-        limits.max_redirects = 3;
+        let limits = HttpLimits {
+            max_redirects: 3,
+            ..HttpLimits::default()
+        };
 
         let opts = RequestOptions {
             max_redirects: Some(9),
@@ -831,8 +835,10 @@ mod v11 {
     #[test]
     fn streaming_keeps_explicit_total_equal_to_configured_default() {
         // Operator default of 5s; the caller explicitly asks for 5s too.
-        let mut limits = HttpLimits::default();
-        limits.default_total_timeout = Duration::from_secs(5);
+        let limits = HttpLimits {
+            default_total_timeout: Duration::from_secs(5),
+            ..HttpLimits::default()
+        };
 
         let explicit = ResolvedOptions::from_options(
             RequestOptions {

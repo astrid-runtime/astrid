@@ -96,16 +96,19 @@ approval_timeout_secs = 300
 # ============================================================================
 # HTTP Host Limits
 # ============================================================================
-# Operator ceilings for the astrid:http host (the SSRF-airlocked outbound HTTP
-# surface every capsule shares). Every value below is a host default and/or
-# hard ceiling: a per-request `request-options` value may tighten a limit (a
-# shorter timeout, fewer redirects, a smaller body cap) but can never exceed it.
+# Operator HTTP host policy for the astrid:http host (the SSRF-airlocked outbound
+# HTTP surface every capsule shares). As the trust root the operator MAY raise or
+# lower these soft limits. The four timeout values are per-request DEFAULTS: a
+# caller that sets the matching *-ms OVERRIDES them and may pick a LARGER value
+# (e.g. a longer total-ms for a big download) — they are not ceilings.
+# max_redirects and max_concurrent_streams ARE caller ceilings (a caller may
+# request fewer, never more). max_response_bytes is a default and caller ceiling,
+# itself hard-clamped to the host's absolute payload limit (the one hard cap).
 # The values shown are the defaults — an absent [http] section reproduces the
 # host's historical behaviour exactly.
 #
 # Operator config ONLY: like [security.capsule_local_egress], a project/workspace
-# config layer cannot set or widen these — a workspace must not be able to raise
-# the host's outbound HTTP limits.
+# config layer cannot set or widen these — only the operator sets host HTTP policy.
 #
 # [http]
 # Default whole-request timeout (seconds) for the buffered path when the caller
@@ -130,9 +133,10 @@ approval_timeout_secs = 300
 # Per-capsule ceiling on concurrent HTTP streaming responses.
 # max_concurrent_streams = 4
 #
-# Default and hard ceiling (bytes) on a buffered response body. A per-request
-# max-response-bytes may request a smaller cap, never larger. Itself clamped to
-# the host's absolute payload limit, so this can only lower the cap. 10 MiB.
+# Default and caller ceiling (bytes) on a buffered response body. A per-request
+# max-response-bytes may request a smaller cap, never larger. Hard-clamped by the
+# request path to the host's absolute payload limit (the one hard cap the
+# operator cannot exceed). 10 MiB.
 # max_response_bytes = 10485760
 
 # ============================================================================

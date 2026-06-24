@@ -241,19 +241,29 @@ impl Default for SecurityConfig {
 // HttpSection
 // ---------------------------------------------------------------------------
 
-/// Operator ceilings for the `astrid:http` host (the SSRF-airlocked outbound
-/// HTTP surface every capsule shares).
+/// Operator HTTP host policy for `astrid:http` (the SSRF-airlocked outbound HTTP
+/// surface every capsule shares).
 ///
-/// Every field is a **host default and/or hard ceiling**: a per-request
-/// `request-options` value may tighten a limit (a shorter timeout, fewer
-/// redirects, a smaller body cap) but can never exceed it. The defaults
-/// reproduce the host's historical hardcoded constants exactly, so an absent
-/// `[http]` section changes nothing.
+/// This is **operator policy**, set by the trust root: the operator MAY raise or
+/// lower the soft limits (timeouts, redirect/stream caps) — raising them is
+/// legitimate, not a violation. The fields play three distinct roles for a
+/// per-request `request-options` value:
+/// - the four **timeout fields** are per-request DEFAULTS, applied only when the
+///   caller sets no corresponding `*-ms`; an explicit caller value OVERRIDES the
+///   default and MAY be LARGER (e.g. a longer `total-ms` for a big download) —
+///   they are not ceilings;
+/// - `max_redirects` and `max_concurrent_streams` ARE caller ceilings — a caller
+///   is clamped to them (may request fewer, never more);
+/// - `max_response_bytes` is both a default and a caller ceiling, and is itself
+///   hard-clamped by the request path to the absolute `MAX_GUEST_PAYLOAD_LEN`
+///   payload limit — the one hard cap that even the operator cannot exceed.
+///
+/// The defaults reproduce the host's historical hardcoded constants exactly, so
+/// an absent `[http]` section changes nothing.
 ///
 /// **Operator config only.** Like `[security.capsule_local_egress]`, a
 /// project/workspace config layer cannot set or widen these (enforced in
-/// `merge::restrict`) — a workspace must not be able to raise the host's
-/// outbound HTTP limits.
+/// `merge::restrict`) — only the operator (the trust root) sets host HTTP policy.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct HttpSection {
@@ -280,12 +290,12 @@ pub struct HttpSection {
     /// `max-active-http-streams` quota is checked per principal and globally
     /// against this value. Default: 4.
     pub max_concurrent_streams: u32,
-    /// Default and hard ceiling (bytes) on a buffered response body. A
+    /// Default and caller ceiling (bytes) on a buffered response body. A
     /// per-request `max-response-bytes` may request a smaller cap, never a
-    /// larger one. This value is itself clamped to the host's absolute
-    /// `MAX_GUEST_PAYLOAD_LEN` payload limit, so config can only *lower* the
-    /// buffered cap, never raise it above the host hard limit. Default:
-    /// `10485760` (10 mebibytes).
+    /// larger one. This operator value is itself hard-clamped by the request
+    /// path to the host's absolute `MAX_GUEST_PAYLOAD_LEN` payload limit — the
+    /// one hard cap the operator cannot exceed (raising this above it has no
+    /// effect). Default: `10485760` (10 mebibytes).
     pub max_response_bytes: u64,
 }
 

@@ -2328,6 +2328,13 @@ pub struct LifecycleConfig {
     pub config: std::collections::HashMap<String, serde_json::Value>,
     /// Secret store for capsule credentials (keychain with KV fallback).
     pub secret_store: std::sync::Arc<dyn astrid_storage::secret::SecretStore>,
+    /// Resolved operator `astrid:http` host policy for the lifecycle hook's
+    /// `HostState`. The caller (the install path) resolves it from the `[http]`
+    /// config so lifecycle hooks (which may call `astrid:http`, e.g. to fetch a
+    /// model list during onboarding) honour the same operator limits as the live
+    /// runtime. [`HttpLimits::default`](limits::HttpLimits::default) reproduces
+    /// the host's historical constants when no config is available.
+    pub http_limits: limits::HttpLimits,
 }
 
 /// Run a capsule's lifecycle hook (install or upgrade).
@@ -2437,10 +2444,11 @@ pub async fn run_lifecycle(
         // Lifecycle (install/upgrade) hooks run briefly and do not carry a
         // local-egress exemption; the SSRF airlock applies in full.
         local_egress: Vec::new(),
-        // Lifecycle hooks aren't handed the resolved `[http]` config (it isn't
-        // plumbed into `LifecycleConfig`); use the host's historical default
-        // ceilings. They share the same airlock; only the tunable limits differ.
-        http_limits: limits::HttpLimits::default(),
+        // Operator `astrid:http` host policy, resolved by the install path from
+        // the `[http]` config and threaded in via `LifecycleConfig` so a
+        // lifecycle hook's HTTP calls honour the same limits as the live runtime
+        // (default = the host's historical constants when no config is present).
+        http_limits: cfg.http_limits,
         // Lifecycle hooks never subscribe to the audit feed; fail-secure.
         audit_firehose: false,
         inbound_tx: None,
