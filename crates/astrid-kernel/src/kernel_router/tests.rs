@@ -294,8 +294,10 @@ async fn get_agent_readiness_returns_readiness_response() {
     // `self:capsule:list` gate (the lightweight test constructor does not
     // admin-seed the default profile).
     let caller = PrincipalId::default();
-    let mut profile = PrincipalProfile::default();
-    profile.groups = vec!["admin".to_string()];
+    let profile = PrincipalProfile {
+        groups: vec!["admin".to_string()],
+        ..Default::default()
+    };
     let path = PrincipalProfile::path_for(&kernel.astrid_home, &caller);
     profile.save_to_path(&path).expect("seed admin profile");
     kernel.profile_cache.invalidate(&caller);

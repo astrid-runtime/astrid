@@ -3,12 +3,6 @@
 #![deny(clippy::all)]
 #![deny(unreachable_pub)]
 #![allow(clippy::module_name_repetitions)]
-#![cfg_attr(test, allow(
-    clippy::field_reassign_with_default,
-    clippy::items_after_statements,
-    clippy::similar_names,
-    clippy::too_many_lines
-))]
 
 //! Astrid Kernel - The core execution engine and IPC router.
 //!

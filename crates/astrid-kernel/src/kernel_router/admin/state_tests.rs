@@ -32,8 +32,10 @@ async fn fixture() -> (TempDir, Arc<Kernel>) {
     // authority-scope filter depends on this — without it `default`
     // resolves to an empty profile and is treated as a self-scoped
     // caller, which would (correctly) hide the roster from it.
-    let mut admin = PrincipalProfile::default();
-    admin.groups = vec![BUILTIN_ADMIN.to_string()];
+    let admin = PrincipalProfile {
+        groups: vec![BUILTIN_ADMIN.to_string()],
+        ..Default::default()
+    };
     admin
         .save_to_path(&PrincipalProfile::path_for(
             &kernel.astrid_home,
