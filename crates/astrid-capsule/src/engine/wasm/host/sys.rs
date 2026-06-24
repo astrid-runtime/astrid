@@ -261,7 +261,7 @@ impl sys_v11::Host for HostState {
         let rt_handle = self.runtime_handle.clone();
         let blocking_semaphore = self.blocking_semaphore.clone();
         util::bounded_block_on(&rt_handle, &blocking_semaphore, async move {
-            registry.read().await.set_epoch()
+            registry.read().await.set_epoch().get()
         })
     }
 }
@@ -492,7 +492,7 @@ mod capsule_set_epoch_tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn delegates_to_the_registry_epoch() {
         let registry = CapsuleRegistry::new();
-        let expected = registry.set_epoch();
+        let expected = registry.set_epoch().get();
 
         let mut state = minimal_host_state(tokio::runtime::Handle::current());
         state.capsule_registry = Some(Arc::new(RwLock::new(registry)));

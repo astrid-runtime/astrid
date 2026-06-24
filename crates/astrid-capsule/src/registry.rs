@@ -192,14 +192,14 @@ impl CapsuleRegistry {
     /// algorithm, costing at most one spurious cache refresh after a daemon
     /// binary upgrade — harmless and self-correcting.
     #[must_use]
-    pub fn set_epoch(&self) -> u64 {
+    pub fn set_epoch(&self) -> CapsuleSetEpoch {
         let mut pairs: Vec<(&str, &str)> = self
             .capsules
             .iter()
             .map(|(id, capsule)| (id.as_str(), capsule.manifest().package.version.as_str()))
             .collect();
         pairs.sort_unstable();
-        hash_capsule_set(&pairs)
+        CapsuleSetEpoch(hash_capsule_set(&pairs))
     }
 
     // -----------------------------------------------------------------
@@ -296,6 +296,33 @@ impl std::fmt::Debug for CapsuleRegistry {
             .field("capsule_ids", &self.list())
             .field("uplink_count", &self.uplinks.len())
             .finish()
+    }
+}
+
+/// A stable fingerprint of the loaded capsule set — the value returned by
+/// [`CapsuleRegistry::set_epoch`].
+///
+/// A newtype over the hash rather than a bare `u64`: it has exactly one meaning
+/// — "which capsules are loaded, at which versions" — and must not be conflated
+/// with other counters or hashes. Serde-transparent so it persists / crosses the
+/// `astrid:sys@1.1.0` `capsule-set-epoch` ABI boundary as a plain integer;
+/// `Copy` because it is a single word.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(transparent)]
+pub struct CapsuleSetEpoch(u64);
+
+impl CapsuleSetEpoch {
+    /// The raw fingerprint, for crossing an ABI boundary that speaks `u64` (the
+    /// host call returns a bare integer; the newtype lives on the Rust side).
+    #[must_use]
+    pub fn get(self) -> u64 {
+        self.0
+    }
+}
+
+impl std::fmt::Display for CapsuleSetEpoch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:016x}", self.0)
     }
 }
 
