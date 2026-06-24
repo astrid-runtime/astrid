@@ -310,6 +310,66 @@ impl From<DevicePubkey<String>> for String {
     }
 }
 
+impl TryFrom<String> for DevicePubkey<String> {
+    type Error = String;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        Self::from_canonical(value)
+    }
+}
+
+impl FromStr for DevicePubkey<String> {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        validate_pubkey_hex(s, "device public key")?;
+        Ok(Self(s.to_string()))
+    }
+}
+
+impl<S: AsRef<str>> PartialEq<str> for DevicePubkey<S> {
+    fn eq(&self, other: &str) -> bool {
+        self.as_str() == other
+    }
+}
+
+impl<S: AsRef<str>> PartialEq<&str> for DevicePubkey<S> {
+    fn eq(&self, other: &&str) -> bool {
+        self.as_str() == *other
+    }
+}
+
+impl<S: AsRef<str>> PartialEq<String> for DevicePubkey<S> {
+    fn eq(&self, other: &String) -> bool {
+        self.as_str() == other
+    }
+}
+
+impl<S: AsRef<str>> PartialEq<&String> for DevicePubkey<S> {
+    fn eq(&self, other: &&String) -> bool {
+        self.as_str() == other.as_str()
+    }
+}
+
+impl<S: AsRef<str>> Serialize for DevicePubkey<S> {
+    fn serialize<Ser>(&self, serializer: Ser) -> Result<Ser::Ok, Ser::Error>
+    where
+        Ser: serde::Serializer,
+    {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for DevicePubkey<String> {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::from_canonical(value).map_err(serde::de::Error::custom)
+    }
+}
+
 /// Derive a deterministic, non-secret fingerprint for a device key from its
 /// canonical lowercase-hex pubkey: the first [`DEVICE_KEY_ID_HEX_LEN`] hex
 /// chars of `SHA-256(pubkey_hex_bytes)`.
@@ -589,6 +649,35 @@ mod tests {
         );
         assert!(DevicePubkey::normalize("deadbeef").is_err());
         assert!(DevicePubkey::from_canonical("A".repeat(64)).is_err());
+    }
+
+    #[test]
+    fn device_pubkey_newtype_has_generic_string_traits() {
+        let hex = "b".repeat(64);
+        let pubkey = DevicePubkey::from_canonical(hex.clone()).unwrap();
+        assert_eq!(pubkey.as_str(), hex);
+        assert_eq!(pubkey, hex);
+        assert_eq!(pubkey, hex.as_str());
+        assert_eq!(pubkey.to_string(), hex);
+        assert_eq!(String::from(pubkey.clone()), hex);
+
+        let parsed: DevicePubkey<String> = hex.parse().unwrap();
+        assert_eq!(parsed, hex);
+        assert_eq!(DevicePubkey::try_from(hex.clone()).unwrap(), parsed);
+
+        let json = serde_json::to_string(&pubkey).unwrap();
+        assert_eq!(json, format!(r#""{hex}""#));
+        let decoded: DevicePubkey<String> = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded, hex);
+    }
+
+    #[test]
+    fn device_pubkey_deserialize_rejects_noncanonical_storage_form() {
+        let prefixed = format!(r#""ed25519:{}""#, "c".repeat(64));
+        assert!(serde_json::from_str::<DevicePubkey<String>>(&prefixed).is_err());
+
+        let uppercase = format!(r#""{}""#, "C".repeat(64));
+        assert!(serde_json::from_str::<DevicePubkey<String>>(&uppercase).is_err());
     }
 
     #[test]
