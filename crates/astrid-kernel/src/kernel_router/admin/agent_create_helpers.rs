@@ -16,7 +16,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use astrid_core::principal::PrincipalId;
-use astrid_core::profile::PrincipalProfile;
+use astrid_core::profile::{CapabilityPattern, GroupName, PrincipalProfile};
 use astrid_events::kernel_api::AdminResponseBody;
 use tracing::info;
 
@@ -182,8 +182,24 @@ fn build_create_profile(
         } else {
             groups
         };
+        let groups = match resolved_groups
+            .into_iter()
+            .map(GroupName::new)
+            .collect::<Result<Vec<_>, _>>()
+        {
+            Ok(groups) => groups,
+            Err(e) => return Err(err_bad_input(format!("group rejected: {e}"))),
+        };
+        let grants = match grants
+            .into_iter()
+            .map(CapabilityPattern::new)
+            .collect::<Result<Vec<_>, _>>()
+        {
+            Ok(grants) => grants,
+            Err(e) => return Err(err_bad_input(format!("grant rejected: {e}"))),
+        };
         return Ok(PrincipalProfile {
-            groups: resolved_groups,
+            groups,
             grants,
             ..PrincipalProfile::default()
         });

@@ -95,13 +95,13 @@ fn all_admin_variants() -> Vec<AdminRequestKind> {
 
 fn agent_profile() -> PrincipalProfile {
     let mut p = PrincipalProfile::default();
-    p.groups = vec!["agent".to_string()];
+    p.groups = vec![astrid_core::GroupName::new("agent").unwrap()];
     p
 }
 
 fn admin_profile() -> PrincipalProfile {
     let mut p = PrincipalProfile::default();
-    p.groups = vec!["admin".to_string()];
+    p.groups = vec![astrid_core::GroupName::new("admin").unwrap()];
     p
 }
 
@@ -331,7 +331,7 @@ fn arcswap_groups_swap_observed_by_next_check() {
 
     let profile = {
         let mut p = PrincipalProfile::default();
-        p.groups = vec!["ops".to_string()];
+        p.groups = vec![astrid_core::GroupName::new("ops").unwrap()];
         p
     };
     let caller = pid("ops_user");
@@ -396,7 +396,7 @@ fn profile_cache_invalidation_reflects_on_disk_mutation() {
 
     // Write a populated profile to disk behind the cache's back.
     let mut updated = PrincipalProfile::default();
-    updated.grants = vec!["self:capsule:install".into()];
+    updated.grants = vec![astrid_core::CapabilityPattern::new("self:capsule:install").unwrap()];
     let path = PrincipalProfile::path_for(&home, &principal);
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
     updated.save_to_path(&path).unwrap();
@@ -421,9 +421,11 @@ fn caps_grant_preserves_revoke_precedence() {
     // `handlers::mutate_caps(_, Grant)` produces when the target
     // profile already has revokes.
     let mut profile = PrincipalProfile::default();
-    profile.groups = vec!["admin".to_string()];
-    profile.revokes = vec!["self:*".to_string()];
-    profile.grants.push("self:capsule:install".to_string());
+    profile.groups = vec![astrid_core::GroupName::new("admin").unwrap()];
+    profile.revokes = vec![astrid_core::CapabilityPattern::new("self:*").unwrap()];
+    profile
+        .grants
+        .push(astrid_core::CapabilityPattern::new("self:capsule:install").unwrap());
 
     let groups = GroupConfig::builtin_only();
     let caller = pid("alice");
@@ -444,9 +446,13 @@ fn caps_revoke_of_unheld_capability_is_not_an_error_shape() {
     // the revoke vec just appends. Later grants/groups are dominated
     // by the revoke.
     let mut profile = PrincipalProfile::default();
-    profile.groups = vec!["restricted".to_string()];
-    profile.revokes.push("capsule:install".to_string()); // pre-emptive
-    profile.grants.push("capsule:install".to_string());
+    profile.groups = vec![astrid_core::GroupName::new("restricted").unwrap()];
+    profile
+        .revokes
+        .push(astrid_core::CapabilityPattern::new("capsule:install").unwrap()); // pre-emptive
+    profile
+        .grants
+        .push(astrid_core::CapabilityPattern::new("capsule:install").unwrap());
 
     let groups = GroupConfig::builtin_only();
     let caller = pid("alice");

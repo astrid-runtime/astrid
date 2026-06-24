@@ -125,8 +125,8 @@ async fn agent_create_keyless_backfills_keypair() {
     assert_success(&handlers::dispatch(&kernel, &PrincipalId::default(), bare_create("bob")).await);
     {
         let mut p = load(&kernel, "bob");
-        p.groups = vec![BUILTIN_RESTRICTED.to_string()];
-        p.grants = vec!["self:capsule:list".to_string()];
+        p.groups = vec![astrid_core::GroupName::new(BUILTIN_RESTRICTED).unwrap()];
+        p.grants = vec![astrid_core::CapabilityPattern::new("self:capsule:list").unwrap()];
         p.save_to_path(&PrincipalProfile::path_for(
             &kernel.astrid_home,
             &pid("bob"),

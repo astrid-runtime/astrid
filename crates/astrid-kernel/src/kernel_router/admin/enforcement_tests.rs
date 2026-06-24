@@ -94,7 +94,7 @@ async fn disabled_principal_denied_on_admin_topic() {
     // gate they are denied up front and the response carries the
     // `PrincipalDisabled` error message.
     let mut profile = PrincipalProfile::default();
-    profile.groups = vec!["admin".to_string()];
+    profile.groups = vec![astrid_core::GroupName::new("admin").unwrap()];
     profile.enabled = false;
     let caller = pid("locked_out_admin");
     seed_profile(&kernel, &caller, &profile);
@@ -103,7 +103,7 @@ async fn disabled_principal_denied_on_admin_topic() {
     // strictly needed since the request is rejected before it reaches
     // the handler, but the wire shape must be valid.
     let mut target_profile = PrincipalProfile::default();
-    target_profile.groups = vec!["restricted".to_string()];
+    target_profile.groups = vec![astrid_core::GroupName::new("restricted").unwrap()];
     seed_profile(&kernel, &pid("target_user"), &target_profile);
 
     let resp = send_admin(
@@ -142,13 +142,13 @@ async fn enabled_principal_proceeds_through_admin_topic() {
 
     // Sanity: same setup with `enabled = true` succeeds.
     let mut profile = PrincipalProfile::default();
-    profile.groups = vec!["admin".to_string()];
+    profile.groups = vec![astrid_core::GroupName::new("admin").unwrap()];
     profile.enabled = true;
     let caller = pid("active_admin");
     seed_profile(&kernel, &caller, &profile);
 
     let mut target_profile = PrincipalProfile::default();
-    target_profile.groups = vec!["restricted".to_string()];
+    target_profile.groups = vec![astrid_core::GroupName::new("restricted").unwrap()];
     seed_profile(&kernel, &pid("target_user"), &target_profile);
 
     let resp = send_admin(
@@ -176,11 +176,11 @@ async fn admin_request_audit_includes_params_payload() {
     let (_dir, kernel) = fixture().await;
 
     let mut admin = PrincipalProfile::default();
-    admin.groups = vec!["admin".to_string()];
+    admin.groups = vec![astrid_core::GroupName::new("admin").unwrap()];
     seed_profile(&kernel, &PrincipalId::default(), &admin);
 
     let mut target = PrincipalProfile::default();
-    target.groups = vec!["restricted".to_string()];
+    target.groups = vec![astrid_core::GroupName::new("restricted").unwrap()];
     seed_profile(&kernel, &pid("target_user"), &target);
 
     // Drive a caps.grant via the IPC dispatcher so the audit entry is
@@ -229,7 +229,7 @@ async fn admin_request_id_is_echoed_back_on_response() {
     let (_dir, kernel) = fixture().await;
 
     let mut admin = PrincipalProfile::default();
-    admin.groups = vec!["admin".to_string()];
+    admin.groups = vec![astrid_core::GroupName::new("admin").unwrap()];
     seed_profile(&kernel, &PrincipalId::default(), &admin);
 
     let resp = send_admin(
@@ -251,7 +251,7 @@ async fn admin_request_id_echoed_on_deny_path_too() {
     // carry the request_id so the client can match it to its in-flight
     // request.
     let mut admin = PrincipalProfile::default();
-    admin.groups = vec!["admin".to_string()];
+    admin.groups = vec![astrid_core::GroupName::new("admin").unwrap()];
     admin.enabled = false;
     let caller = pid("disabled_admin");
     seed_profile(&kernel, &caller, &admin);
@@ -319,7 +319,7 @@ fn seed_principal_with_devices(kernel: &Arc<Kernel>, principal: &PrincipalId) ->
     // `self:auth:pair` (the issue cap-gate) and `self:auth:pair:admin` (the
     // full-mint gate), so an unattenuated request succeeds and the device
     // scope is the only thing that can deny.
-    profile.grants = vec!["self:*".to_string()];
+    profile.grants = vec![astrid_core::CapabilityPattern::new("self:*").unwrap()];
     profile.enabled = true;
     profile.auth.methods.push(AuthMethod::Keypair);
 

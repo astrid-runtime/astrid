@@ -263,7 +263,19 @@ async fn grant_capsule(kernel: &Arc<Kernel>, principal: &str, capsule_id: &str) 
         },
     };
 
-    let changed = apply_set_delta(&mut profile.capsules, &[capsule_id.to_string()], &[]);
+    let changed = match apply_set_delta(&mut profile.capsules, &[capsule_id.to_string()], &[]) {
+        Ok(changed) => changed,
+        Err(e) => {
+            warn!(
+                security_event = true,
+                principal = %pid,
+                capsule = %capsule_id,
+                error = %e,
+                "grant-on-use: capsule grant rejected; no grant (fail-closed)"
+            );
+            return;
+        },
+    };
     if !changed {
         // Already granted — idempotent. Invalidate to be safe; no save needed.
         kernel.profile_cache.invalidate(&pid);

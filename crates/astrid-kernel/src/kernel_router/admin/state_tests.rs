@@ -33,7 +33,7 @@ async fn fixture() -> (TempDir, Arc<Kernel>) {
     // resolves to an empty profile and is treated as a self-scoped
     // caller, which would (correctly) hide the roster from it.
     let mut admin = PrincipalProfile::default();
-    admin.groups = vec![BUILTIN_ADMIN.to_string()];
+    admin.groups = vec![astrid_core::GroupName::new(BUILTIN_ADMIN).unwrap()];
     admin
         .save_to_path(&PrincipalProfile::path_for(
             &kernel.astrid_home,

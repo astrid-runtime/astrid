@@ -31,7 +31,7 @@ async fn fixture() -> (TempDir, Arc<Kernel>) {
     let home = AstridHome::from_path(dir.path());
     let kernel = crate::test_kernel_with_home(home).await;
     let admin = PrincipalProfile {
-        groups: vec![BUILTIN_ADMIN.to_string()],
+        groups: vec![astrid_core::GroupName::new(BUILTIN_ADMIN).unwrap()],
         ..PrincipalProfile::default()
     };
     admin
@@ -75,9 +75,9 @@ async fn agent_create_clone_copies_capability_profile() {
 
     // A source profile with distinctive, non-default values on disk.
     let mut src = PrincipalProfile {
-        groups: vec![BUILTIN_RESTRICTED.to_string()],
-        grants: vec!["self:capsule:list".to_string()],
-        revokes: vec!["self:quota:set".to_string()],
+        groups: vec![astrid_core::GroupName::new(BUILTIN_RESTRICTED).unwrap()],
+        grants: vec![astrid_core::CapabilityPattern::new("self:capsule:list").unwrap()],
+        revokes: vec![astrid_core::CapabilityPattern::new("self:quota:set").unwrap()],
         enabled: false, // must NOT carry to the clone
         ..PrincipalProfile::default()
     };
