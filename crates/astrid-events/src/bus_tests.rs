@@ -4,6 +4,7 @@
 
 use super::*;
 use crate::event::EventMetadata;
+use crate::ipc::Topic;
 
 #[tokio::test]
 async fn test_event_bus_creation() {
@@ -251,7 +252,7 @@ async fn test_topic_subscription_exact() {
     let mut specific_receiver = bus.subscribe_topic("astrid.cli.input");
 
     let msg = crate::ipc::IpcMessage::new(
-        "astrid.cli.input",
+        Topic::from_raw("astrid.cli.input"),
         crate::ipc::IpcPayload::UserInput {
             text: "hello".into(),
             session_id: "default".into(),
@@ -272,7 +273,7 @@ async fn test_topic_subscription_exact() {
 
     // Publish to a different topic
     let msg2 = crate::ipc::IpcMessage::new(
-        "astrid.telegram.input",
+        Topic::from_raw("astrid.telegram.input"),
         crate::ipc::IpcPayload::UserInput {
             text: "hello".into(),
             session_id: "default".into(),
@@ -301,7 +302,7 @@ async fn test_topic_subscription_wildcard() {
     let mut wildcard_receiver = bus.subscribe_topic("astrid.*");
 
     let msg1 = crate::ipc::IpcMessage::new(
-        "astrid.cli.input",
+        Topic::from_raw("astrid.cli.input"),
         crate::ipc::IpcPayload::UserInput {
             text: "hello".into(),
             session_id: "default".into(),
@@ -315,7 +316,7 @@ async fn test_topic_subscription_wildcard() {
     };
 
     let msg2 = crate::ipc::IpcMessage::new(
-        "system.log",
+        Topic::from_raw("system.log"),
         crate::ipc::IpcPayload::UserInput {
             text: "hello".into(),
             session_id: "default".into(),
@@ -364,7 +365,7 @@ fn ipc_event(topic: &str) -> AstridEvent {
     AstridEvent::Ipc {
         metadata: EventMetadata::new("test"),
         message: crate::ipc::IpcMessage::new(
-            topic,
+            Topic::from_raw(topic),
             crate::ipc::IpcPayload::UserInput {
                 text: "x".into(),
                 session_id: "default".into(),
@@ -606,7 +607,7 @@ fn lag_and_publish_metrics_record_with_labels() {
 
 fn ipc_evt(topic: &str, principal: Option<&str>) -> AstridEvent {
     let mut msg = crate::ipc::IpcMessage::new(
-        topic,
+        Topic::from_raw(topic),
         crate::ipc::IpcPayload::RawJson(serde_json::json!({})),
         uuid::Uuid::nil(),
     );

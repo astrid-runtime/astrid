@@ -416,7 +416,7 @@ mod tests {
 
     #[test]
     fn invites_block_validates_coherence() {
-        let toml_src = r##"
+        let toml_src = r#"
 schema-version = 1
 
 [distro]
@@ -432,7 +432,7 @@ role = "uplink"
 
 [invites]
 issuers = ["admin"]
-"##;
+"#;
         let manifest: DistroManifest =
             toml::from_str(toml_src).expect("manifest should parse syntactically");
         let err = validate_manifest(&manifest).expect_err("missing default-group must reject");
@@ -659,7 +659,7 @@ tag = "v0.2.0-rc1"
     #[test]
     fn enforce_astrid_version_no_floor_is_ok() {
         // A manifest with no astrid-version imposes no requirement.
-        let toml_src = r##"
+        let toml_src = r#"
 schema-version = 1
 
 [distro]
@@ -672,7 +672,7 @@ name = "astrid-capsule-cli"
 source = "@unicity-astrid/capsule-cli"
 version = "0.7.0"
 role = "uplink"
-"##;
+"#;
         let manifest: DistroManifest = toml::from_str(toml_src).unwrap();
         assert!(manifest.distro.astrid_version.is_none());
         enforce_astrid_version(&manifest).expect("no floor → no requirement");

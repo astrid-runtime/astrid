@@ -24,8 +24,10 @@ async fn fixture() -> (TempDir, Arc<Kernel>) {
     let kernel = crate::test_kernel_with_home(home).await;
     // Mirror production: `Kernel::new` admin-seeds the `default` principal so
     // dispatch through `default` carries admin authority.
-    let mut admin = PrincipalProfile::default();
-    admin.groups = vec![astrid_core::groups::BUILTIN_ADMIN.to_string()];
+    let admin = PrincipalProfile {
+        groups: vec![astrid_core::groups::BUILTIN_ADMIN.to_string()],
+        ..Default::default()
+    };
     admin
         .save_to_path(&PrincipalProfile::path_for(
             &kernel.astrid_home,

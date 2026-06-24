@@ -36,7 +36,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use astrid_core::PrincipalId;
-use astrid_events::ipc::{IpcMessage, IpcPayload};
+use astrid_events::ipc::{IpcMessage, IpcPayload, Topic};
 use astrid_events::{AstridEvent, EventBus, EventMetadata};
 use axum::Json;
 use axum::extract::{Path, Query, State};
@@ -922,7 +922,7 @@ async fn request_capsule(
     let mut receiver = bus.subscribe_topic(response_topic.to_string());
 
     let mut msg = IpcMessage::new(
-        request_topic.to_string(),
+        Topic::from_raw(request_topic),
         IpcPayload::RawJson(payload),
         Uuid::nil(),
     )
@@ -1231,7 +1231,11 @@ mod tests {
                 "sessions": [],
                 "next_cursor": null
             });
-            let msg = IpcMessage::new(resp_topic.clone(), IpcPayload::RawJson(reply), Uuid::nil());
+            let msg = IpcMessage::new(
+                Topic::from_raw(resp_topic.clone()),
+                IpcPayload::RawJson(reply),
+                Uuid::nil(),
+            );
             bus_capsule.publish(AstridEvent::Ipc {
                 metadata: EventMetadata::new("test::capsule"),
                 message: msg,
@@ -1564,7 +1568,11 @@ mod tests {
                     "archived": false
                 }
             });
-            let msg = IpcMessage::new(resp_topic, IpcPayload::RawJson(reply), Uuid::nil());
+            let msg = IpcMessage::new(
+                Topic::from_raw(resp_topic),
+                IpcPayload::RawJson(reply),
+                Uuid::nil(),
+            );
             bus_capsule.publish(AstridEvent::Ipc {
                 metadata: EventMetadata::new("test::capsule"),
                 message: msg,
@@ -1616,7 +1624,11 @@ mod tests {
                 "sessions": [],
                 "next_cursor": null
             });
-            let msg = IpcMessage::new(resp_topic, IpcPayload::RawJson(reply), Uuid::nil());
+            let msg = IpcMessage::new(
+                Topic::from_raw(resp_topic),
+                IpcPayload::RawJson(reply),
+                Uuid::nil(),
+            );
             bus_bg.publish(AstridEvent::Ipc {
                 metadata: EventMetadata::new("test::foreign"),
                 message: msg,

@@ -503,6 +503,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn surreal_cas_concurrent_only_one_winner() {
+        const TASKS: usize = 16;
         // SurrealKV's MVCC plus the `is_transaction_conflict` mapping
         // means at most one of the concurrent CAS attempts ever
         // returns Ok(true) for the same (expected → new) transition.
@@ -513,7 +514,6 @@ mod tests {
         let store = Arc::new(store);
         store.set("ns", "k", b"0".to_vec()).await.unwrap();
 
-        const TASKS: usize = 16;
         let mut handles = Vec::with_capacity(TASKS);
         for i in 0..TASKS {
             let s = Arc::clone(&store);

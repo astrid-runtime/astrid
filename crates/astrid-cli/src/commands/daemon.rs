@@ -227,7 +227,7 @@ pub(crate) async fn handle_status() -> Result<()> {
             let req = astrid_core::kernel_api::KernelRequest::GetStatus;
             if let Ok(val) = serde_json::to_value(req) {
                 let msg = astrid_types::ipc::IpcMessage::new(
-                    "astrid.v1.request.status",
+                    astrid_types::Topic::kernel_request("status"),
                     astrid_types::ipc::IpcPayload::RawJson(val),
                     uuid::Uuid::nil(),
                 );
@@ -235,7 +235,7 @@ pub(crate) async fn handle_status() -> Result<()> {
 
                 let raw = client
                     .read_until_topic(
-                        "astrid.v1.response.status",
+                        astrid_types::Topic::kernel_response("status").as_str(),
                         std::time::Duration::from_secs(10),
                     )
                     .await?;
@@ -291,7 +291,7 @@ pub(crate) async fn handle_stop() -> Result<()> {
         };
         if let Ok(val) = serde_json::to_value(req) {
             let msg = astrid_types::ipc::IpcMessage::new(
-                "astrid.v1.request.shutdown",
+                astrid_types::Topic::kernel_request("shutdown"),
                 astrid_types::ipc::IpcPayload::RawJson(val),
                 uuid::Uuid::nil(),
             );

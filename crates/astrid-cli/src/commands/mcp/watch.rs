@@ -41,7 +41,7 @@ use uuid::Uuid;
 
 use crate::socket_client::SocketClient;
 
-use super::server::{RESPONSE_PREFIX, TOOLS_LIST_TOPIC, new_req_id, unwrap_reply_payload};
+use super::server::{TOOLS_LIST_TOPIC, new_req_id, unwrap_reply_payload};
 
 /// Kernel broadcast emitted once every capsule (re)load completes.
 const CAPSULES_LOADED_TOPIC: &str = "astrid.v1.capsules_loaded";
@@ -175,11 +175,11 @@ async fn enumerate_tool_names(principal: &str) -> anyhow::Result<BTreeSet<String
     let session = astrid_core::SessionId::from_uuid(Uuid::new_v4());
     let mut client = SocketClient::connect(session, caller).await?;
     let req_id = new_req_id();
-    let reply_topic = format!("{RESPONSE_PREFIX}{req_id}");
+    let reply_topic = astrid_types::Topic::kernel_response(&req_id);
     let body = json!({ "req_id": req_id });
 
     let msg = astrid_types::ipc::IpcMessage::new(
-        TOOLS_LIST_TOPIC,
+        astrid_types::Topic::from_raw(TOOLS_LIST_TOPIC),
         astrid_types::ipc::IpcPayload::RawJson(body),
         Uuid::nil(),
     )

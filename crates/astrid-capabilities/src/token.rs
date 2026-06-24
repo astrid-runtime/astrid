@@ -576,9 +576,11 @@ mod tests {
 
         let token =
             TokenBuilder::new(ResourcePattern::exact("mcp://filesystem:read_file").unwrap())
-                .permission(Permission::Invoke)
-                .permission(Permission::Read)
+                .permissions(vec![Permission::Invoke, Permission::Read])
+                .permission(Permission::Write)
+                .session()
                 .persistent()
+                .single_use()
                 .ttl(Duration::hours(24))
                 .build(keypair.key_id(), AuditEntryId::new(), &keypair);
 
@@ -586,6 +588,7 @@ mod tests {
         assert!(token.expires_at.is_some());
         assert!(token.permissions.contains(&Permission::Invoke));
         assert!(token.permissions.contains(&Permission::Read));
+        assert!(token.permissions.contains(&Permission::Write));
     }
 
     #[test]

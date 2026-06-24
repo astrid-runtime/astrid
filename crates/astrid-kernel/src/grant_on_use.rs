@@ -36,14 +36,10 @@ use std::time::Duration;
 use astrid_core::principal::PrincipalId;
 use astrid_core::profile::PrincipalProfile;
 use astrid_events::AstridEvent;
-use astrid_events::ipc::IpcPayload;
+use astrid_events::ipc::{IpcPayload, Topic};
 use tracing::{info, warn};
 
 use crate::Kernel;
-
-/// The topic the dispatcher publishes [`IpcPayload::GrantRequired`] on (shared
-/// with the capability-approval flow; the variant discriminates the two).
-const APPROVAL_TOPIC: &str = "astrid.v1.approval";
 
 /// Maximum time the per-request awaiter waits for a consent response before it
 /// drops fail-closed, in milliseconds. Mirrors `host/approval.rs`'s
@@ -91,7 +87,7 @@ pub(crate) fn spawn_grant_on_use_handler(kernel: Arc<Kernel>) -> tokio::task::Jo
     // different topic, caught only by the per-request subscription below.
     let mut observer = kernel
         .event_bus
-        .subscribe_topic_as(APPROVAL_TOPIC, OBSERVER_SUBSCRIBER);
+        .subscribe_topic_as(Topic::approval_request().as_str(), OBSERVER_SUBSCRIBER);
 
     // Bound concurrent in-flight grants. Cheap to clone (Arc inside).
     let inflight = Arc::new(tokio::sync::Semaphore::new(MAX_INFLIGHT_GRANTS));
@@ -153,10 +149,10 @@ pub(crate) fn spawn_grant_on_use_handler(kernel: Arc<Kernel>) -> tokio::task::Jo
 
             // Subscribe to the response topic BEFORE the await (and before the
             // next observe-loop iteration) to avoid a publish/subscribe race.
-            let response_topic = format!("astrid.v1.approval.response.{request_id}");
+            let response_topic = Topic::approval_response(&request_id);
             let receiver = kernel
                 .event_bus
-                .subscribe_topic_as(&response_topic, AWAITER_SUBSCRIBER);
+                .subscribe_topic_as(response_topic.as_str(), AWAITER_SUBSCRIBER);
 
             let kernel = Arc::clone(&kernel);
             tokio::spawn(async move {
@@ -263,7 +259,23 @@ async fn grant_capsule(kernel: &Arc<Kernel>, principal: &str, capsule_id: &str) 
         },
     };
 
-    let changed = apply_set_delta(&mut profile.capsules, &[capsule_id.to_string()], &[]);
+    let changed = match apply_set_delta::<astrid_core::CapsuleGrant>(
+        &mut profile.capsules,
+        &[capsule_id.to_string()],
+        &[],
+    ) {
+        Ok(changed) => changed,
+        Err(e) => {
+            warn!(
+                security_event = true,
+                principal = %pid,
+                capsule = %capsule_id,
+                error = %e,
+                "grant-on-use: capsule grant rejected; no grant (fail-closed)"
+            );
+            return;
+        },
+    };
     if !changed {
         // Already granted — idempotent. Invalidate to be safe; no save needed.
         kernel.profile_cache.invalidate(&pid);

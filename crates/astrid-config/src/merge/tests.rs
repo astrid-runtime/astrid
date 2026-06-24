@@ -389,10 +389,10 @@ fn test_capsule_local_egress_cannot_be_set_by_workspace() {
     // A widening SSRF-airlock exemption must be operator-only: a workspace
     // layer cannot introduce it.
     let baseline: toml::Value = toml::from_str(
-        r#"
+        r"
         [security]
         require_signatures = false
-    "#,
+    ",
     )
     .unwrap();
 

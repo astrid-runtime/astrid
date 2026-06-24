@@ -62,7 +62,51 @@ pub fn build(state: Arc<GatewayState>) -> Router {
 
     // Authenticated routes — bearer required, principal attached to
     // request extensions.
-    let authed = Router::new()
+    let authed = build_authed_router(&state);
+
+    let combined = public.merge(authed)
+        // Count every request after it routes — axum's `MatchedPath`
+        // extractor gives the registered template (e.g.
+        // `/api/sys/principals/:id`) so the metric stays bounded
+        // even under high-cardinality path params.
+        .layer(axum::middleware::from_fn_with_state(
+            Arc::clone(&state),
+            metrics_middleware,
+        ));
+
+    // Apply CORS only when the operator opted in via
+    // `cors_allow_origins`. Empty allowlist = no CORS headers in any
+    // response = browsers refuse cross-origin requests = same-origin
+    // only. That's the secure default; adding the layer when nothing's
+    // configured would mint unnecessary `Vary: Origin` and break
+    // shared-cache assumptions further downstream.
+    //
+    // Origins were validated at config-load time (`GatewayConfig::
+    // validate`) so the `parse::<HeaderValue>` here is infallible by
+    // construction. We still `unwrap_or_else` defensively rather than
+    // `expect` so a future grammar drift doesn't crash a live gateway.
+    let with_cors = if state.config.cors_allow_origins.is_empty() {
+        combined
+    } else {
+        let cors = build_cors_layer(&state.config.cors_allow_origins);
+        combined.layer(cors)
+    };
+
+    // Security-headers stack applies to every response, including
+    // CORS preflights and error paths. The gateway returns JSON,
+    // SSE, plain text, and Prometheus — never HTML — so a strict
+    // CSP and `X-Frame-Options: DENY` are safe blanket defaults.
+    // A future misconfigured handler that accidentally renders HTML
+    // would be neutered rather than ship a clickjacking / XSS
+    // surface.
+    apply_security_headers(with_cors).with_state(state)
+}
+
+/// Build the bearer-gated router half. Split out of [`build`] so each stays
+/// under the per-function line cap; every route here inherits the
+/// `require_session` middleware applied as the final `route_layer`.
+fn build_authed_router(state: &Arc<GatewayState>) -> Router<Arc<GatewayState>> {
+    Router::new()
         // ── Session ──
         .route("/api/auth/me", get(auth::get_me))
         .route("/api/auth/refresh", post(auth::post_refresh))
@@ -154,6 +198,11 @@ pub fn build(state: Arc<GatewayState>) -> Router {
             "/api/agent/sessions/:id/messages",
             get(sessions::get_session_messages),
         )
+        // ── Agent elicitation reply ──
+        .route(
+            "/api/agent/elicit-response",
+            post(agent::post_elicit_response),
+        )
         // ── Models (active-LLM selection) ──
         .route("/api/models", get(models::list_models))
         .route("/api/models/active", get(models::get_active_model))
@@ -166,46 +215,9 @@ pub fn build(state: Arc<GatewayState>) -> Router {
             post(system::reload_capsules),
         )
         .route_layer(axum::middleware::from_fn_with_state(
-            Arc::clone(&state),
+            Arc::clone(state),
             crate::auth::require_session,
-        ));
-
-    let combined = public.merge(authed)
-        // Count every request after it routes — axum's `MatchedPath`
-        // extractor gives the registered template (e.g.
-        // `/api/sys/principals/:id`) so the metric stays bounded
-        // even under high-cardinality path params.
-        .layer(axum::middleware::from_fn_with_state(
-            Arc::clone(&state),
-            metrics_middleware,
-        ));
-
-    // Apply CORS only when the operator opted in via
-    // `cors_allow_origins`. Empty allowlist = no CORS headers in any
-    // response = browsers refuse cross-origin requests = same-origin
-    // only. That's the secure default; adding the layer when nothing's
-    // configured would mint unnecessary `Vary: Origin` and break
-    // shared-cache assumptions further downstream.
-    //
-    // Origins were validated at config-load time (`GatewayConfig::
-    // validate`) so the `parse::<HeaderValue>` here is infallible by
-    // construction. We still `unwrap_or_else` defensively rather than
-    // `expect` so a future grammar drift doesn't crash a live gateway.
-    let with_cors = if state.config.cors_allow_origins.is_empty() {
-        combined
-    } else {
-        let cors = build_cors_layer(&state.config.cors_allow_origins);
-        combined.layer(cors)
-    };
-
-    // Security-headers stack applies to every response, including
-    // CORS preflights and error paths. The gateway returns JSON,
-    // SSE, plain text, and Prometheus — never HTML — so a strict
-    // CSP and `X-Frame-Options: DENY` are safe blanket defaults.
-    // A future misconfigured handler that accidentally renders HTML
-    // would be neutered rather than ship a clickjacking / XSS
-    // surface.
-    apply_security_headers(with_cors).with_state(state)
+        ))
 }
 
 /// Apply the four static security headers every gateway response

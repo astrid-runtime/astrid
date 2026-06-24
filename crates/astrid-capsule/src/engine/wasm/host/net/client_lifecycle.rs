@@ -31,14 +31,10 @@
 use astrid_core::principal::PrincipalId;
 use astrid_events::AstridEvent;
 use astrid_events::EventMetadata;
-use astrid_events::ipc::{IpcMessage as InternalIpcMessage, IpcPayload};
+use astrid_events::ipc::{IpcMessage as InternalIpcMessage, IpcPayload, Topic};
 
 use crate::engine::wasm::host_state::HostState;
 
-/// Bus topic published when an inbound uplink connection is accepted.
-const CLIENT_CONNECT_TOPIC: &str = "client.v1.connect";
-/// Bus topic published when an inbound uplink connection's stream drops.
-const CLIENT_DISCONNECT_TOPIC: &str = "client.v1.disconnect";
 /// `source` tag on the emitted event metadata, for audit/trace attribution.
 const EVENT_SOURCE: &str = "net_client_lifecycle";
 
@@ -54,7 +50,7 @@ pub(super) fn register_and_emit_connect(state: &HostState, rep: u32, principal: 
     state.client_connections.insert(rep, principal.clone());
     publish_lifecycle(
         state,
-        CLIENT_CONNECT_TOPIC,
+        Topic::client_connect(),
         IpcPayload::RawJson(serde_json::json!({})),
         &principal,
     );
@@ -73,7 +69,7 @@ pub(super) fn emit_client_disconnect(state: &HostState, rep: u32) {
     };
     publish_lifecycle(
         state,
-        CLIENT_DISCONNECT_TOPIC,
+        Topic::client_disconnect(),
         IpcPayload::RawJson(serde_json::json!({ "reason": "socket closed" })),
         &principal,
     );
@@ -83,7 +79,12 @@ pub(super) fn emit_client_disconnect(state: &HostState, rep: u32) {
 /// host-verified `principal`. The host is trusted, so this bypasses the
 /// guest-facing publish capability/quota gates — but the principal is never
 /// guest-controlled, so the anti-forge boundary is preserved.
-fn publish_lifecycle(state: &HostState, topic: &str, payload: IpcPayload, principal: &PrincipalId) {
+fn publish_lifecycle(
+    state: &HostState,
+    topic: Topic,
+    payload: IpcPayload,
+    principal: &PrincipalId,
+) {
     let message = InternalIpcMessage::new(topic, payload, state.capsule_uuid)
         .with_principal(principal.as_str());
     state.event_bus.publish(AstridEvent::Ipc {

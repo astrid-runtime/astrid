@@ -32,15 +32,17 @@ fn agent_principal() -> PrincipalId {
 }
 
 fn admin_profile() -> PrincipalProfile {
-    let mut p = PrincipalProfile::default();
-    p.groups = vec!["admin".to_string()];
-    p
+    PrincipalProfile {
+        groups: vec!["admin".to_string()],
+        ..Default::default()
+    }
 }
 
 fn agent_profile() -> PrincipalProfile {
-    let mut p = PrincipalProfile::default();
-    p.groups = vec!["agent".to_string()];
-    p
+    PrincipalProfile {
+        groups: vec!["agent".to_string()],
+        ..Default::default()
+    }
 }
 
 fn all_requests() -> Vec<KernelRequest> {
@@ -138,8 +140,10 @@ fn agent_group_allows_self_scoped_capsule_surface() {
 #[test]
 fn restricted_group_denies_everything_without_explicit_grants() {
     let groups = GroupConfig::builtin_only();
-    let mut profile = PrincipalProfile::default();
-    profile.groups = vec!["restricted".to_string()];
+    let profile = PrincipalProfile {
+        groups: vec!["restricted".to_string()],
+        ..Default::default()
+    };
     let caller = PrincipalId::new("restricted_user").unwrap();
 
     for req in all_requests() {
@@ -185,9 +189,11 @@ fn revoke_overrides_admin_for_shutdown_only() {
 #[test]
 fn grant_elevates_restricted_principal_for_specific_surface() {
     let groups = GroupConfig::builtin_only();
-    let mut profile = PrincipalProfile::default();
-    profile.groups = vec!["restricted".to_string()];
-    profile.grants = vec!["system:status".to_string()];
+    let profile = PrincipalProfile {
+        groups: vec!["restricted".to_string()],
+        grants: vec!["system:status".to_string()],
+        ..Default::default()
+    };
     let caller = PrincipalId::new("ops_user").unwrap();
 
     authorize(&profile, &groups, &caller, &KernelRequest::GetStatus).unwrap();
@@ -206,8 +212,10 @@ fn grant_elevates_restricted_principal_for_specific_surface() {
 #[test]
 fn nonexistent_group_name_fails_closed() {
     let groups = GroupConfig::builtin_only();
-    let mut profile = PrincipalProfile::default();
-    profile.groups = vec!["typo-group".to_string()];
+    let profile = PrincipalProfile {
+        groups: vec!["typo-group".to_string()],
+        ..Default::default()
+    };
     let caller = PrincipalId::new("typo_user").unwrap();
 
     // No fallback to any group's capabilities — fails closed.
@@ -234,8 +242,10 @@ fn custom_group_capabilities_gate_admin_surface() {
     )
     .unwrap();
 
-    let mut profile = PrincipalProfile::default();
-    profile.groups = vec!["ops".to_string()];
+    let mut profile = PrincipalProfile {
+        groups: vec!["ops".to_string()],
+        ..Default::default()
+    };
     let caller = PrincipalId::new("ops_user").unwrap();
 
     // Ops group gets cross-agent capsule:install but not self:capsule:install
@@ -298,9 +308,11 @@ fn admin_vs_agent_cross_tenant_matrix() {
 fn groupconfig_rejects_shell_metachars_in_grants_via_profile_validation() {
     // Parallel to the GroupConfig validation tests: per-principal grants
     // also pass through the capability grammar.
-    let mut profile = PrincipalProfile::default();
-    profile.groups = vec!["admin".to_string()];
-    profile.grants = vec!["system:shutdown;rm".to_string()];
+    let profile = PrincipalProfile {
+        groups: vec!["admin".to_string()],
+        grants: vec!["system:shutdown;rm".to_string()],
+        ..Default::default()
+    };
     assert!(profile.validate().is_err());
 }
 
@@ -330,8 +342,10 @@ fn groupconfig_accepts_custom_star_with_unsafe_admin_opt_in() {
     )
     .unwrap();
 
-    let mut profile = PrincipalProfile::default();
-    profile.groups = vec!["privileged".to_string()];
+    let profile = PrincipalProfile {
+        groups: vec!["privileged".to_string()],
+        ..Default::default()
+    };
     let caller = PrincipalId::new("priv_user").unwrap();
 
     // privileged now has universal, so every variant goes through.
@@ -360,8 +374,10 @@ fn missing_principal_falls_back_to_default_admin_after_bootstrap() {
     // Simulate post-bootstrap state: the default principal has groups = ["admin"]
     // and the IPC message had no `principal` field set (pre-#658 socket traffic).
     let groups = GroupConfig::builtin_only();
-    let mut default_profile = PrincipalProfile::default();
-    default_profile.groups = vec!["admin".to_string()];
+    let default_profile = PrincipalProfile {
+        groups: vec!["admin".to_string()],
+        ..Default::default()
+    };
     let default_principal = PrincipalId::default();
 
     for req in all_requests() {

@@ -176,14 +176,17 @@ async fn resolve_commands() -> Result<Vec<CommandInfo>> {
     let req = astrid_core::kernel_api::KernelRequest::GetCommands;
     let val = serde_json::to_value(req)?;
     let msg = astrid_types::ipc::IpcMessage::new(
-        "astrid.v1.request.get_commands",
+        astrid_types::Topic::kernel_request("get_commands"),
         astrid_types::ipc::IpcPayload::RawJson(val),
         source_id,
     )
     .with_principal(caller.to_string());
     client.send_message(msg).await?;
     let raw = client
-        .read_until_topic("astrid.v1.response.get_commands", Duration::from_secs(10))
+        .read_until_topic(
+            astrid_types::Topic::kernel_response("get_commands").as_str(),
+            Duration::from_secs(10),
+        )
         .await?;
     match SocketClient::extract_kernel_response(&raw) {
         Some(astrid_core::kernel_api::KernelResponse::Commands(cmds)) => Ok(cmds),
@@ -221,8 +224,8 @@ async fn execute(provider: &str, verb: &str, args: &[String]) -> Result<ExitCode
         "command": verb,
         "args": args,
     });
-    let run_topic = format!("cli.v1.command.run.{provider}");
-    let result_topic = format!("cli.v1.command.result.{req_id}");
+    let run_topic = astrid_types::Topic::cli_command_run(provider);
+    let result_topic = astrid_types::Topic::cli_command_result(&req_id);
 
     let msg = astrid_types::ipc::IpcMessage::new(
         run_topic,
@@ -238,7 +241,10 @@ async fn execute(provider: &str, verb: &str, args: &[String]) -> Result<ExitCode
         return Ok(ExitCode::from(1));
     }
 
-    let Ok(raw) = client.read_until_topic(&result_topic, RESULT_TIMEOUT).await else {
+    let Ok(raw) = client
+        .read_until_topic(result_topic.as_str(), RESULT_TIMEOUT)
+        .await
+    else {
         eprintln!(
             "{}",
             Theme::error(&format!("Capsule '{provider}' did not respond within 30s."))

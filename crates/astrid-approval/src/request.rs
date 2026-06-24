@@ -369,6 +369,7 @@ mod tests {
     #[test]
     fn test_approval_request_serialization() {
         let action = SensitiveAction::NetworkRequest {
+            capsule_id: "react".to_string(),
             host: "api.example.com".to_string(),
             port: 443,
         };

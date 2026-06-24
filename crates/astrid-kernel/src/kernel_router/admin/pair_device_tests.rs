@@ -10,7 +10,7 @@
 //! * a scoped issuer is denied minting a `Full` token (full-mint gate) and the
 //!   stored child scope inherits the issuer's denies (monotonic narrowing);
 //! * list/revoke round-trip, and a revoked device fails closed at the gate;
-//! * audit params carry the scope / key_id but never a raw key or token.
+//! * audit params carry the scope / `key_id` but never a raw key or token.
 //!
 //! The HTTP-bearer half of the cross-transport guarantees lives in the gateway
 //! crate's `tests/router.rs`; the socket/kernel half is here plus the existing
@@ -42,9 +42,11 @@ fn pid(name: &str) -> PrincipalId {
 
 /// Seed `principal` holding `grants`, enabled, with the supplied device keys.
 fn seed(kernel: &Arc<Kernel>, principal: &PrincipalId, grants: &[&str], devices: Vec<DeviceKey>) {
-    let mut profile = PrincipalProfile::default();
-    profile.grants = grants.iter().map(|g| (*g).to_string()).collect();
-    profile.enabled = true;
+    let mut profile = PrincipalProfile {
+        grants: grants.iter().map(|g| (*g).to_string()).collect(),
+        enabled: true,
+        ..Default::default()
+    };
     if !devices.is_empty() {
         profile.auth.methods.push(AuthMethod::Keypair);
         profile.auth.public_keys = devices;

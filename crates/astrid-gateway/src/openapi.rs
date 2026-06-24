@@ -116,6 +116,8 @@ use crate::state::GatewayState;
         routes::sessions::update_session,
         routes::sessions::delete_session,
         routes::sessions::get_session_messages,
+        // Agent elicitation reply
+        routes::agent::post_elicit_response,
         // Models (active-LLM selection)
         routes::models::list_models,
         routes::models::get_active_model,
@@ -189,6 +191,8 @@ use crate::state::GatewayState;
             routes::sessions::DeleteResponse,
             routes::sessions::SearchResult,
             routes::sessions::SearchResponse,
+            // Agent elicitation reply
+            routes::agent::ElicitResponseRequest,
             // Models
             routes::models::SetActiveModelRequest,
             // Env

@@ -113,7 +113,7 @@ async fn test_lifecycle_install_with_elicit() {
     let responder_bus = event_bus.clone();
     let responder = tokio::spawn(async move {
         use astrid_events::AstridEvent;
-        use astrid_events::ipc::{IpcMessage, IpcPayload};
+        use astrid_events::ipc::{IpcMessage, IpcPayload, Topic};
 
         while let Some(event) = elicit_receiver.recv().await {
             let AstridEvent::Ipc { message, .. } = &*event else {
@@ -127,7 +127,7 @@ async fn test_lifecycle_install_with_elicit() {
             };
 
             let request_id = *request_id;
-            let response_topic = format!("astrid.v1.elicit.response.{request_id}");
+            let response_topic = Topic::elicit_response(request_id);
 
             let (value, values) = match &field.field_type {
                 astrid_events::ipc::OnboardingFieldType::Secret => {

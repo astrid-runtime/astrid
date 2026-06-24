@@ -17,6 +17,7 @@ use astrid_core::SessionId;
 use astrid_core::session_token::{
     HandshakeRequest, HandshakeResponse, PROTOCOL_VERSION, SessionToken,
 };
+use astrid_types::Topic;
 use astrid_types::ipc::{IpcMessage, IpcPayload};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
@@ -407,7 +408,7 @@ impl SocketClient {
             context: None,
         };
 
-        let msg = IpcMessage::new("user.v1.prompt", payload, self.session_id.0);
+        let msg = IpcMessage::new(Topic::user_prompt(), payload, self.session_id.0);
 
         self.send_message(msg).await
     }

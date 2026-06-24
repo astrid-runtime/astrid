@@ -1415,6 +1415,7 @@ impl ExecutionEngine for WasmEngine {
                 // framed read.
                 ingress_principal: None,
                 ingress_device_key_id: None,
+                ingress_origin: None,
                 // Run-loop epoch-interrupt state. `recv_yielded` is set true by
                 // the ipc `recv` host fn each time the guest blocks on recv;
                 // the bound run-loop's epoch callback reads + clears it to
@@ -2454,6 +2455,7 @@ pub async fn run_lifecycle(
         // or authenticating device.
         ingress_principal: None,
         ingress_device_key_id: None,
+        ingress_origin: None,
         // Lifecycle hooks are not run loops; the epoch-interrupt run-loop
         // state is inert here but initialised for completeness.
         recv_yielded: false,
@@ -2691,6 +2693,7 @@ fn wasm_exports_contain(name: &str, wasm_bytes: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use astrid_events::ipc::Topic;
 
     // ── Layer 3 enabled-gate tests (issue #672) ──────────────────────
 
@@ -3386,7 +3389,7 @@ mod tests {
         let mut state = minimal_host_state(tokio::runtime::Handle::current());
         state.interceptor_active = true;
         state.caller_context = Some(astrid_events::ipc::IpcMessage::new(
-            "x",
+            Topic::from_raw("x"),
             astrid_events::ipc::IpcPayload::Custom {
                 data: serde_json::json!({}),
             },
@@ -3423,7 +3426,7 @@ mod tests {
         // Seed a baseline that we expect to be preserved across the
         // cancelled wait.
         let baseline_caller = astrid_events::ipc::IpcMessage::new(
-            "baseline",
+            Topic::from_raw("baseline"),
             astrid_events::ipc::IpcPayload::Custom {
                 data: serde_json::json!({}),
             },
@@ -3449,7 +3452,7 @@ mod tests {
 
         // Baseline preserved.
         assert_eq!(
-            state.caller_context.as_ref().map(|m| m.topic.clone()),
+            state.caller_context.as_ref().map(|m| m.topic.to_string()),
             Some("baseline".to_string()),
             "cancelled recv future must not overwrite caller_context"
         );

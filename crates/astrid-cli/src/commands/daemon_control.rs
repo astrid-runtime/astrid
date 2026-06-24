@@ -314,20 +314,20 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("system.pid");
         std::fs::write(&path, "424242").unwrap();
-        assert_eq!(read_pid_file(&path), Some((424242, None)));
+        assert_eq!(read_pid_file(&path), Some((424_242, None)));
     }
 
     #[test]
     fn parse_pid_file_two_line_keeps_exe() {
         let (pid, exe) = parse_pid_file("424242\n/opt/astrid/astrid-daemon\n").unwrap();
-        assert_eq!(pid, 424242);
+        assert_eq!(pid, 424_242);
         assert_eq!(exe, Some(PathBuf::from("/opt/astrid/astrid-daemon")));
     }
 
     #[test]
     fn parse_pid_file_one_line_has_no_exe() {
-        assert_eq!(parse_pid_file("424242\n"), Some((424242, None)));
-        assert_eq!(parse_pid_file("424242\n   \n"), Some((424242, None)));
+        assert_eq!(parse_pid_file("424242\n"), Some((424_242, None)));
+        assert_eq!(parse_pid_file("424242\n   \n"), Some((424_242, None)));
     }
 
     #[test]

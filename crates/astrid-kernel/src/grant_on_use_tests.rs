@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 use astrid_core::dirs::AstridHome;
 use astrid_core::principal::PrincipalId;
 use astrid_core::profile::PrincipalProfile;
-use astrid_events::ipc::{IpcMessage, IpcPayload};
+use astrid_events::ipc::{IpcMessage, IpcPayload, Topic};
 use astrid_events::{AstridEvent, EventMetadata};
 
 use super::is_approved;
@@ -62,7 +62,7 @@ fn publish_grant_required(kernel: &Kernel, request_id: &str, principal: &str, ca
         principal: principal.to_string(),
         capsule_id: capsule_id.to_string(),
     };
-    let message = IpcMessage::new("astrid.v1.approval", payload, uuid::Uuid::nil());
+    let message = IpcMessage::new(Topic::approval_request(), payload, uuid::Uuid::nil());
     kernel.event_bus.publish(AstridEvent::Ipc {
         message,
         metadata: EventMetadata::new("test-dispatcher"),
@@ -72,7 +72,7 @@ fn publish_grant_required(kernel: &Kernel, request_id: &str, principal: &str, ca
 /// Publish a consent response on the per-request response topic (the
 /// ACL-authorized path the broker/uplink uses).
 fn publish_response(kernel: &Kernel, request_id: &str, decision: &str) {
-    let topic = format!("astrid.v1.approval.response.{request_id}");
+    let topic = Topic::approval_response(request_id);
     let payload = IpcPayload::ApprovalResponse {
         request_id: request_id.to_string(),
         decision: decision.to_string(),
@@ -88,7 +88,9 @@ fn publish_response(kernel: &Kernel, request_id: &str, decision: &str) {
 /// Poll the on-disk grant set until it contains `capsule` or the deadline
 /// elapses. Returns whether the capsule landed.
 async fn wait_for_grant(home: &AstridHome, principal: &str, capsule: &str) -> bool {
-    let deadline = Instant::now() + Duration::from_secs(2);
+    let deadline = Instant::now()
+        .checked_add(Duration::from_secs(2))
+        .expect("deadline overflow");
     while Instant::now() < deadline {
         if on_disk_capsules(home, principal)
             .iter()
@@ -163,13 +165,13 @@ async fn approve_grants_capsule_end_to_end() {
     );
 
     // And the access resolver now allows the principal/capsule pair.
-    let resolver = astrid_capsule::CapsuleAccessResolver::new(
+    let access_resolver = astrid_capsule::CapsuleAccessResolver::new(
         Arc::clone(&kernel.profile_cache),
         Arc::clone(&kernel.groups),
     );
     let capsule_id = astrid_capsule::capsule::CapsuleId::new("cap").expect("capsule id");
     assert!(
-        resolver.is_capsule_allowed(Some("x"), &capsule_id),
+        access_resolver.is_capsule_allowed(Some("x"), &capsule_id),
         "is_capsule_allowed must be true for the freshly granted capsule"
     );
 }
@@ -289,7 +291,7 @@ async fn response_on_wrong_topic_does_not_grant() {
         decision: "approve".to_string(),
         reason: None,
     };
-    let message = IpcMessage::new("astrid.v1.approval", payload, uuid::Uuid::nil());
+    let message = IpcMessage::new(Topic::approval_request(), payload, uuid::Uuid::nil());
     kernel.event_bus.publish(AstridEvent::Ipc {
         message,
         metadata: EventMetadata::new("test-forger"),
@@ -310,7 +312,7 @@ async fn non_approval_payload_on_response_topic_does_not_grant() {
     settle().await;
 
     // Right topic, wrong payload type — must not be honoured as consent.
-    let topic = format!("astrid.v1.approval.response.{rid}");
+    let topic = Topic::approval_response(rid);
     let payload = IpcPayload::Custom {
         data: serde_json::json!({ "decision": "approve" }),
     };
@@ -343,7 +345,7 @@ async fn grant_required_from_non_kernel_source_does_not_grant() {
         capsule_id: "cap".to_string(),
     };
     let message = IpcMessage::new(
-        "astrid.v1.approval",
+        Topic::approval_request(),
         payload,
         uuid::Uuid::from_u128(0x1234_5678),
     );

@@ -35,15 +35,11 @@ use std::time::Duration;
 use anyhow::{Context, Result, anyhow};
 use astrid_core::PrincipalId;
 use astrid_core::kernel_api::{KernelRequest, KernelResponse};
+use astrid_types::Topic;
 use astrid_types::ipc::{IpcMessage, IpcPayload};
 use uuid::Uuid;
 
 use crate::socket_client::SocketClient;
-
-/// Topic prefix for kernel-management requests.
-const REQUEST_PREFIX: &str = "astrid.v1.request.";
-/// Topic prefix for kernel-management responses.
-const RESPONSE_PREFIX: &str = "astrid.v1.response.";
 
 /// Default response timeout. Generous because some kernel ops
 /// (capsule reload, status under load) can take a few seconds.
@@ -102,11 +98,11 @@ fn build_request_message(
     caller: &PrincipalId,
     device_key_id: Option<&str>,
     req: &KernelRequest,
-) -> Result<(IpcMessage, String)> {
+) -> Result<(IpcMessage, Topic)> {
     let correlation = Uuid::new_v4().simple().to_string();
     let suffix = format!("{}.{correlation}", topic_suffix(req));
-    let request_topic = format!("{REQUEST_PREFIX}{suffix}");
-    let want_response = format!("{RESPONSE_PREFIX}{suffix}");
+    let request_topic = Topic::kernel_request(&suffix);
+    let want_response = Topic::kernel_response(&suffix);
 
     let payload = serde_json::to_value(req).context("serialise KernelRequest")?;
     let mut msg = IpcMessage::new(request_topic, IpcPayload::RawJson(payload), Uuid::nil())
@@ -169,7 +165,7 @@ impl KernelClient {
 
         let raw = self
             .inner
-            .read_until_topic(&want_response, self.timeout)
+            .read_until_topic(want_response.as_str(), self.timeout)
             .await
             .with_context(|| format!("waiting on {want_response}"))?;
 
@@ -245,7 +241,7 @@ mod tests {
             "device key id must reach the kernel cap-gate"
         );
         // Response topic carries the request suffix so the reply is correlated.
-        assert!(want.starts_with(RESPONSE_PREFIX));
+        assert!(want.starts_with("astrid.v1.response."));
         assert!(want.contains("agent_readiness"));
     }
 

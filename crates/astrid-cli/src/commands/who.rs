@@ -64,14 +64,14 @@ pub(crate) async fn run(args: WhoArgs) -> Result<ExitCode> {
     let req = astrid_core::kernel_api::KernelRequest::GetStatus;
     let val = serde_json::to_value(req)?;
     let msg = astrid_types::ipc::IpcMessage::new(
-        "astrid.v1.request.status",
+        astrid_types::Topic::kernel_request("status"),
         astrid_types::ipc::IpcPayload::RawJson(val),
         Uuid::nil(),
     );
     client.send_message(msg).await?;
     let raw = client
         .read_until_topic(
-            "astrid.v1.response.status",
+            astrid_types::Topic::kernel_response("status").as_str(),
             std::time::Duration::from_secs(10),
         )
         .await?;

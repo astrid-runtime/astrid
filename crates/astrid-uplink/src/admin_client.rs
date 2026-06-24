@@ -25,16 +25,12 @@ use astrid_core::PrincipalId;
 use astrid_core::kernel_api::{
     AdminKernelRequest, AdminKernelResponse, AdminRequestKind, AdminResponseBody,
 };
+use astrid_types::Topic;
 use astrid_types::ipc::{IpcMessage, IpcPayload};
 use serde_json::Value;
 use uuid::Uuid;
 
 use crate::socket_client::SocketClient;
-
-/// Topic prefix for admin requests sent by uplinks.
-const ADMIN_INPUT_PREFIX: &str = "astrid.v1.admin.";
-/// Topic prefix for admin responses from the kernel.
-const ADMIN_RESPONSE_PREFIX: &str = "astrid.v1.admin.response.";
 
 /// Default timeout for the response read loop. Generous because admin
 /// writes can block on the kernel write lock.
@@ -80,14 +76,14 @@ pub const fn topic_suffix(req: &AdminRequestKind) -> &'static str {
 
 /// Build the request topic for an [`AdminRequestKind`].
 #[must_use]
-pub fn request_topic(req: &AdminRequestKind) -> String {
-    format!("{ADMIN_INPUT_PREFIX}{}", topic_suffix(req))
+pub fn request_topic(req: &AdminRequestKind) -> Topic {
+    Topic::admin_request(topic_suffix(req))
 }
 
 /// Build the response topic for an [`AdminRequestKind`].
 #[must_use]
-pub fn response_topic(req: &AdminRequestKind) -> String {
-    format!("{ADMIN_RESPONSE_PREFIX}{}", topic_suffix(req))
+pub fn response_topic(req: &AdminRequestKind) -> Topic {
+    Topic::admin_response(topic_suffix(req))
 }
 
 /// A connected admin client. Sends [`AdminRequestKind`] requests and

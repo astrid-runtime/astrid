@@ -37,7 +37,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use astrid_events::AstridEvent;
-use astrid_events::ipc::{IpcMessage, IpcPayload};
+use astrid_events::ipc::{IpcMessage, IpcPayload, Topic};
 use axum::Json;
 use axum::extract::State;
 use axum::http::Request;
@@ -210,8 +210,15 @@ async fn registry_round_trip(
     // client-originated request as the system session. Reply correlation is
     // unaffected: replies are matched by the principal-scoped routed
     // subscription, not by this source id.
-    let msg = IpcMessage::new(request_topic, IpcPayload::RawJson(payload), Uuid::new_v4())
-        .with_principal(principal);
+    let msg = IpcMessage::new(
+        Topic::from_raw(request_topic),
+        IpcPayload::RawJson(payload),
+        Uuid::new_v4(),
+    )
+    .with_principal(principal)
+    // Host-stamp the gateway transport origin (a remote API caller), so no
+    // gateway-published message inherits the `System` default.
+    .with_origin(astrid_events::ipc::MessageOrigin::RemoteGateway);
     bus.publish(AstridEvent::Ipc {
         metadata: astrid_events::EventMetadata::new("gateway::models"),
         message: msg,

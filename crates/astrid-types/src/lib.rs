@@ -22,9 +22,11 @@
 
 pub mod ipc;
 pub mod llm;
+pub mod topic;
 
 pub use ipc::{IpcMessage, IpcPayload, OnboardingField, OnboardingFieldType, SelectionOption};
 pub use llm::{
     ContentPart, LlmResponse, LlmToolDefinition, Message, MessageContent, MessageRole, StopReason,
     StreamEvent, ToolCall, ToolCallResult, Usage,
 };
+pub use topic::Topic;

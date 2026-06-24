@@ -12,6 +12,7 @@ use std::io::{self, Stdout, Write as _};
 use std::time::{Duration, Instant};
 
 use astrid_core::SessionId;
+use astrid_types::Topic;
 use astrid_types::ipc::IpcMessage;
 use crossterm::{
     event::{
@@ -101,7 +102,7 @@ pub(crate) async fn run(
     let req = astrid_core::kernel_api::KernelRequest::GetCommands;
     if let Ok(val) = serde_json::to_value(req) {
         let msg = astrid_types::ipc::IpcMessage::new(
-            "astrid.v1.request.get_commands",
+            Topic::kernel_request("get_commands"),
             astrid_types::ipc::IpcPayload::RawJson(val),
             session_id.0,
         );
@@ -195,7 +196,7 @@ async fn run_loop(
             // If the proxy doesn't forward it, the secondary signal
             // (bus subscriber_count drop) still handles idle detection.
             let msg = astrid_types::ipc::IpcMessage::new(
-                "client.v1.disconnect",
+                Topic::client_disconnect(),
                 astrid_types::ipc::IpcPayload::Disconnect {
                     reason: Some("quit".to_string()),
                 },
@@ -324,7 +325,7 @@ pub(crate) fn handle_daemon_event(app: &mut App, message: &IpcMessage) {
                     options: options.clone(),
                     selected: 0,
                     scroll_offset: 0,
-                    callback_topic: callback_topic.clone(),
+                    callback_topic: callback_topic.to_string(),
                     request_id: request_id.clone(),
                 };
             }
@@ -509,7 +510,7 @@ async fn handle_pending_actions(
                     state::ApprovalDecisionKind::Session => "approve_session",
                     state::ApprovalDecisionKind::Always => "approve_always",
                 };
-                let response_topic = format!("astrid.v1.approval.response.{request_id}");
+                let response_topic = Topic::approval_response(&request_id);
                 let response = astrid_types::ipc::IpcPayload::ApprovalResponse {
                     request_id,
                     decision: decision_str.into(),
@@ -525,7 +526,7 @@ async fn handle_pending_actions(
                 }
             },
             PendingAction::Deny { request_id, reason } => {
-                let response_topic = format!("astrid.v1.approval.response.{request_id}");
+                let response_topic = Topic::approval_response(&request_id);
                 let response = astrid_types::ipc::IpcPayload::ApprovalResponse {
                     request_id,
                     decision: "deny".into(),
@@ -549,7 +550,7 @@ async fn handle_pending_actions(
                     context: Some(serde_json::json!({"action": "cancel_turn"})),
                 };
                 let msg = astrid_types::ipc::IpcMessage::new(
-                    "user.v1.prompt",
+                    Topic::user_prompt(),
                     cancel_payload,
                     session_id.0,
                 );
@@ -592,7 +593,7 @@ async fn handle_pending_actions(
             } => {
                 app.push_notice(&format!("Selected: {selected_label}"));
                 let msg = astrid_types::ipc::IpcMessage::new(
-                    callback_topic,
+                    Topic::from_raw(callback_topic),
                     astrid_types::ipc::IpcPayload::Custom {
                         data: serde_json::json!({
                             "request_id": request_id,
@@ -607,7 +608,7 @@ async fn handle_pending_actions(
                 let req = astrid_core::kernel_api::KernelRequest::GetCommands;
                 if let Ok(val) = serde_json::to_value(req) {
                     let msg = astrid_types::ipc::IpcMessage::new(
-                        "astrid.v1.request.get_commands",
+                        Topic::kernel_request("get_commands"),
                         astrid_types::ipc::IpcPayload::RawJson(val),
                         session_id.0,
                     );
@@ -633,7 +634,7 @@ async fn handle_pending_actions(
                             let req = astrid_core::kernel_api::KernelRequest::ReloadCapsules;
                             if let Ok(val) = serde_json::to_value(req) {
                                 let ipc_msg = astrid_types::ipc::IpcMessage::new(
-                                    "astrid.v1.request.reload_capsules",
+                                    Topic::kernel_request("reload_capsules"),
                                     astrid_types::ipc::IpcPayload::RawJson(val),
                                     session_id.0,
                                 );
@@ -648,7 +649,7 @@ async fn handle_pending_actions(
                 value,
                 values,
             } => {
-                let response_topic = format!("astrid.v1.elicit.response.{request_id}");
+                let response_topic = Topic::elicit_response(request_id);
                 let response = astrid_types::ipc::IpcPayload::ElicitResponse {
                     request_id,
                     value,
@@ -661,14 +662,14 @@ async fn handle_pending_actions(
             },
             PendingAction::HydrateSession => {
                 let correlation_id = uuid::Uuid::new_v4().to_string();
-                let reply_topic = format!("session.v1.response.get_messages.{correlation_id}");
+                let reply_topic = Topic::session_response("get_messages", &correlation_id);
                 app.hydration_reply_topic = Some(reply_topic);
                 let hydration_req = serde_json::json!({
                     "session_id": session_id.0.to_string(),
                     "correlation_id": correlation_id,
                 });
                 let msg = astrid_types::ipc::IpcMessage::new(
-                    "session.v1.request.get_messages",
+                    Topic::from_raw("session.v1.request.get_messages"),
                     astrid_types::ipc::IpcPayload::RawJson(hydration_req),
                     session_id.0,
                 );
@@ -727,7 +728,7 @@ async fn handle_slash_command(
                         let req = astrid_core::kernel_api::KernelRequest::ReloadCapsules;
                         if let Ok(val) = serde_json::to_value(req) {
                             let msg = astrid_types::ipc::IpcMessage::new(
-                                "astrid.v1.request.reload_capsules",
+                                Topic::kernel_request("reload_capsules"),
                                 astrid_types::ipc::IpcPayload::RawJson(val),
                                 session_id.0,
                             );
@@ -739,7 +740,7 @@ async fn handle_slash_command(
                         let req = astrid_core::kernel_api::KernelRequest::GetCommands;
                         if let Ok(val) = serde_json::to_value(req) {
                             let msg = astrid_types::ipc::IpcMessage::new(
-                                "astrid.v1.request.get_commands",
+                                Topic::kernel_request("get_commands"),
                                 astrid_types::ipc::IpcPayload::RawJson(val),
                                 session_id.0,
                             );
@@ -758,7 +759,7 @@ async fn handle_slash_command(
             let req = astrid_core::kernel_api::KernelRequest::ReloadCapsules;
             if let Ok(val) = serde_json::to_value(req) {
                 let msg = astrid_types::ipc::IpcMessage::new(
-                    "astrid.v1.request.reload_capsules",
+                    Topic::kernel_request("reload_capsules"),
                     astrid_types::ipc::IpcPayload::RawJson(val),
                     session_id.0,
                 );
@@ -769,7 +770,7 @@ async fn handle_slash_command(
             let req = astrid_core::kernel_api::KernelRequest::GetCommands;
             if let Ok(val) = serde_json::to_value(req) {
                 let msg = astrid_types::ipc::IpcMessage::new(
-                    "astrid.v1.request.get_commands",
+                    Topic::kernel_request("get_commands"),
                     astrid_types::ipc::IpcPayload::RawJson(val),
                     session_id.0,
                 );
@@ -793,7 +794,7 @@ async fn handle_slash_command(
             let req = astrid_core::kernel_api::KernelRequest::GetCommands;
             if let Ok(val) = serde_json::to_value(req) {
                 let msg = astrid_types::ipc::IpcMessage::new(
-                    "astrid.v1.request.get_commands",
+                    Topic::kernel_request("get_commands"),
                     astrid_types::ipc::IpcPayload::RawJson(val),
                     session_id.0,
                 );
@@ -803,7 +804,7 @@ async fn handle_slash_command(
         _ => {
             // It's a custom command! Route it to the Event Bus for capsules to handle.
             let msg = astrid_types::ipc::IpcMessage::new(
-                "cli.v1.command.execute",
+                Topic::cli_command_execute(),
                 astrid_types::ipc::IpcPayload::UserInput {
                     text: cmd.to_string(),
                     session_id: session_id.0.to_string(),

@@ -192,7 +192,7 @@ async fn auto_deny_approval(
     );
     client
         .send_message(astrid_types::ipc::IpcMessage::new(
-            format!("astrid.v1.approval.response.{request_id}"),
+            astrid_types::Topic::approval_response(request_id),
             astrid_types::ipc::IpcPayload::ApprovalResponse {
                 request_id: request_id.to_owned(),
                 decision: "deny".into(),
@@ -233,7 +233,7 @@ async fn auto_skip_selection(
     }
     client
         .send_message(astrid_types::ipc::IpcMessage::new(
-            callback_topic.to_owned(),
+            astrid_types::Topic::from_raw(callback_topic),
             astrid_types::ipc::IpcPayload::Custom {
                 data: serde_json::json!({
                     "request_id": request_id,
@@ -270,7 +270,7 @@ async fn auto_skip_elicit(
     );
     client
         .send_message(astrid_types::ipc::IpcMessage::new(
-            format!("astrid.v1.elicit.response.{request_id}"),
+            astrid_types::Topic::elicit_response(request_id),
             astrid_types::ipc::IpcPayload::ElicitResponse {
                 request_id,
                 value: None,

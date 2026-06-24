@@ -9,8 +9,12 @@
 //!    `unicity-astrid/wit`) with per-domain packages under `host/`. wasmtime's
 //!    bindgen expects a single root WIT directory with one package per
 //!    `deps/<name>/` subdir, so we copy each `host/<pkg>@<ver>.wit` into
-//!    `wit-staging/deps/astrid-<pkg>/<pkg>@<ver>.wit`. The synthetic kernel
-//!    world is supplied via the `inline:` option in `bindings.rs`.
+//!    `wit-staging/deps/astrid-<pkg>@<ver>/<pkg>@<ver>.wit`. Keying the dest
+//!    dir by the full `<pkg>@<ver>` stem (not just the package name) keeps two
+//!    versions of the same package (e.g. `http@1.0.0` and `http@1.1.0`) in
+//!    separate `deps/` dirs — wasmtime errors if one dir holds two package
+//!    declarations. The synthetic kernel world is supplied via the `inline:`
+//!    option in `bindings.rs`.
 //!
 //! No external WIT packages are vendored — the host ABI is fully
 //! Astrid-owned (`astrid:*` only, no `wasi:*` dependency).
@@ -89,9 +93,12 @@ fn stage_wit() {
             continue;
         }
         let stem = file_name.trim_end_matches(".wit");
-        let pkg_name = stem.split('@').next().unwrap();
-        let dst_dir = deps.join(format!("astrid-{pkg_name}"));
-        fs::create_dir_all(&dst_dir).expect("mkdir deps/astrid-<pkg>");
+        // Key the dest dir by the FULL `<pkg>@<ver>` stem, not just the package
+        // name. Two versions of one package (`http@1.0.0`, `http@1.1.0`) must
+        // land in separate `deps/` dirs — wasmtime's WIT resolver rejects a dir
+        // that contains two distinct package declarations.
+        let dst_dir = deps.join(format!("astrid-{stem}"));
+        fs::create_dir_all(&dst_dir).expect("mkdir deps/astrid-<pkg>@<ver>");
         let dst = dst_dir.join(file_name);
         fs::copy(&path, &dst).expect("copy host wit");
         println!("cargo:rerun-if-changed={}", path.display());

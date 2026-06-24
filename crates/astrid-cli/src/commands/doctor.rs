@@ -142,13 +142,16 @@ async fn daemon_roundtrip() -> Result<()> {
     let req = astrid_core::kernel_api::KernelRequest::GetStatus;
     let val = serde_json::to_value(req)?;
     let msg = astrid_types::ipc::IpcMessage::new(
-        "astrid.v1.request.status",
+        astrid_types::Topic::kernel_request("status"),
         astrid_types::ipc::IpcPayload::RawJson(val),
         Uuid::nil(),
     );
     client.send_message(msg).await?;
     let _raw = client
-        .read_until_topic("astrid.v1.response.status", Duration::from_secs(5))
+        .read_until_topic(
+            astrid_types::Topic::kernel_response("status").as_str(),
+            Duration::from_secs(5),
+        )
         .await?;
     Ok(())
 }
@@ -167,13 +170,16 @@ async fn agent_readiness() -> Result<astrid_core::kernel_api::AgentLoopReadiness
     let req = astrid_core::kernel_api::KernelRequest::GetAgentReadiness;
     let val = serde_json::to_value(req)?;
     let msg = astrid_types::ipc::IpcMessage::new(
-        "astrid.v1.request.agent_readiness",
+        astrid_types::Topic::kernel_request("agent_readiness"),
         astrid_types::ipc::IpcPayload::RawJson(val),
         Uuid::nil(),
     );
     client.send_message(msg).await?;
     let raw = client
-        .read_until_topic("astrid.v1.response.agent_readiness", Duration::from_secs(5))
+        .read_until_topic(
+            astrid_types::Topic::kernel_response("agent_readiness").as_str(),
+            Duration::from_secs(5),
+        )
         .await?;
     match SocketClient::extract_kernel_response(&raw) {
         Some(astrid_core::kernel_api::KernelResponse::AgentReadiness(r)) => Ok(r),

@@ -847,7 +847,7 @@ impl Kernel {
         let payload = capsules_loaded::build_capsules_loaded_payload(with_meta);
 
         let msg = astrid_events::ipc::IpcMessage::new(
-            "astrid.v1.capsules_loaded",
+            astrid_events::ipc::Topic::from_raw("astrid.v1.capsules_loaded"),
             astrid_events::ipc::IpcPayload::RawJson(payload),
             self.session_id.0,
         );
@@ -1316,7 +1316,7 @@ pub(crate) async fn test_kernel_with_home(home: astrid_core::dirs::AstridHome) -
 
     // Persistent KV backing capabilities + identity store.
     let kv = Arc::new(
-        astrid_storage::SurrealKvStore::open(&home.state_db_path()).expect("test kernel: open kv"),
+        astrid_storage::SurrealKvStore::open(home.state_db_path()).expect("test kernel: open kv"),
     );
     let capabilities = Arc::new(
         CapabilityStore::with_kv_store(Arc::clone(&kv) as Arc<dyn astrid_storage::KvStore>)
@@ -1801,7 +1801,7 @@ fn spawn_capsule_health_monitor(kernel: Arc<Kernel>) -> tokio::task::JoinHandle<
                     tracing::error!(capsule_id = %id_str, reason = %reason, "Capsule health check failed");
 
                     let msg = astrid_events::ipc::IpcMessage::new(
-                        "astrid.v1.health.failed",
+                        astrid_events::ipc::Topic::from_raw("astrid.v1.health.failed"),
                         astrid_events::ipc::IpcPayload::Custom {
                             data: serde_json::json!({
                                 "capsule_id": &id_str,
@@ -1877,7 +1877,7 @@ fn spawn_react_watchdog(event_bus: Arc<EventBus>) -> tokio::task::JoinHandle<()>
                 .increment(1);
 
             let msg = astrid_events::ipc::IpcMessage::new(
-                "astrid.v1.watchdog.tick",
+                astrid_events::ipc::Topic::from_raw("astrid.v1.watchdog.tick"),
                 astrid_events::ipc::IpcPayload::Custom {
                     data: serde_json::json!({}),
                 },
@@ -1889,497 +1889,6 @@ fn spawn_react_watchdog(event_bus: Arc<EventBus>) -> tokio::task::JoinHandle<()>
             });
         }
     })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_load_or_generate_creates_new_key() {
-        let dir = tempfile::tempdir().unwrap();
-        let keys_dir = dir.path().join("keys");
-
-        let keypair = load_or_generate_runtime_key(&keys_dir).unwrap();
-        let key_path = keys_dir.join("runtime.key");
-
-        // Key file should exist with 32 bytes.
-        assert!(key_path.exists());
-        let bytes = std::fs::read(&key_path).unwrap();
-        assert_eq!(bytes.len(), 32);
-
-        // The written bytes should reconstruct the same public key.
-        let reloaded = KeyPair::from_secret_key(&bytes).unwrap();
-        assert_eq!(
-            keypair.public_key_bytes(),
-            reloaded.public_key_bytes(),
-            "reloaded key should match generated key"
-        );
-    }
-
-    #[test]
-    fn test_load_or_generate_is_idempotent() {
-        let dir = tempfile::tempdir().unwrap();
-        let keys_dir = dir.path().join("keys");
-
-        let first = load_or_generate_runtime_key(&keys_dir).unwrap();
-        let second = load_or_generate_runtime_key(&keys_dir).unwrap();
-
-        assert_eq!(
-            first.public_key_bytes(),
-            second.public_key_bytes(),
-            "loading the same key file should produce the same keypair"
-        );
-    }
-
-    #[test]
-    fn test_load_or_generate_rejects_bad_key_length() {
-        let dir = tempfile::tempdir().unwrap();
-        let keys_dir = dir.path().join("keys");
-        std::fs::create_dir_all(&keys_dir).unwrap();
-
-        // Write a key file with wrong length.
-        std::fs::write(keys_dir.join("runtime.key"), [0u8; 16]).unwrap();
-
-        let result = load_or_generate_runtime_key(&keys_dir);
-        assert!(result.is_err());
-        let err = result.unwrap_err().to_string();
-        assert!(
-            err.contains("invalid runtime key"),
-            "expected 'invalid runtime key' error, got: {err}"
-        );
-    }
-
-    #[test]
-    fn test_connection_counter_increment_decrement() {
-        let counter = AtomicUsize::new(0);
-
-        // Simulate connection_opened (fetch_add)
-        counter.fetch_add(1, Ordering::Relaxed);
-        counter.fetch_add(1, Ordering::Relaxed);
-        assert_eq!(counter.load(Ordering::Relaxed), 2);
-
-        // Simulate connection_closed using the same fetch_update logic
-        // as the real implementation to exercise the actual code path.
-        for expected in [1, 0] {
-            let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
-                if n == 0 {
-                    None
-                } else {
-                    Some(n.saturating_sub(1))
-                }
-            });
-            assert_eq!(counter.load(Ordering::Relaxed), expected);
-        }
-    }
-
-    #[test]
-    fn test_connection_counter_underflow_guard() {
-        // Test the saturating behavior: decrementing from 0 should stay at 0.
-        // Mirrors the fetch_update logic in connection_closed().
-        let counter = AtomicUsize::new(0);
-
-        let result = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
-            if n == 0 { None } else { Some(n - 1) }
-        });
-        // fetch_update returns Err(0) when the closure returns None (no-op).
-        assert!(result.is_err());
-        assert_eq!(counter.load(Ordering::Relaxed), 0);
-    }
-
-    /// Mirrors the `connection_closed(&principal)` logic: only `Ok(1)`
-    /// (previous value 1, now 0) triggers `clear_session_allowances` for
-    /// that principal. Update this test if `connection_closed()` is
-    /// refactored.
-    #[test]
-    fn test_last_disconnect_clears_session_allowances_scoped() {
-        use astrid_approval::AllowanceStore;
-        use astrid_approval::allowance::{Allowance, AllowanceId, AllowancePattern};
-        use astrid_core::principal::PrincipalId;
-        use astrid_core::types::Timestamp;
-        use astrid_crypto::KeyPair;
-
-        let store = AllowanceStore::new();
-        let keypair = KeyPair::generate();
-        let alice = PrincipalId::new("alice").unwrap();
-        let bob = PrincipalId::new("bob").unwrap();
-
-        // Alice: session + persistent.
-        store
-            .add_allowance(Allowance {
-                id: AllowanceId::new(),
-                principal: alice.clone(),
-                action_pattern: AllowancePattern::ServerTools {
-                    server: "alice-session".to_string(),
-                },
-                created_at: Timestamp::now(),
-                expires_at: None,
-                max_uses: None,
-                uses_remaining: None,
-                session_only: true,
-                workspace_root: None,
-                signature: keypair.sign(b"test"),
-            })
-            .unwrap();
-        store
-            .add_allowance(Allowance {
-                id: AllowanceId::new(),
-                principal: alice.clone(),
-                action_pattern: AllowancePattern::ServerTools {
-                    server: "alice-persistent".to_string(),
-                },
-                created_at: Timestamp::now(),
-                expires_at: None,
-                max_uses: None,
-                uses_remaining: None,
-                session_only: false,
-                workspace_root: None,
-                signature: keypair.sign(b"test"),
-            })
-            .unwrap();
-        // Bob: session (must NOT be cleared by alice disconnecting).
-        store
-            .add_allowance(Allowance {
-                id: AllowanceId::new(),
-                principal: bob.clone(),
-                action_pattern: AllowancePattern::ServerTools {
-                    server: "bob-session".to_string(),
-                },
-                created_at: Timestamp::now(),
-                expires_at: None,
-                max_uses: None,
-                uses_remaining: None,
-                session_only: true,
-                workspace_root: None,
-                signature: keypair.sign(b"test"),
-            })
-            .unwrap();
-        assert_eq!(store.count(), 3);
-
-        let alice_counter = AtomicUsize::new(1);
-        let simulate_alice_disconnect = || {
-            let result = alice_counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
-                if n == 0 {
-                    None
-                } else {
-                    Some(n.saturating_sub(1))
-                }
-            });
-            if result == Ok(1) {
-                store.clear_session_allowances(&alice);
-            }
-        };
-
-        simulate_alice_disconnect();
-        // Alice's session gone; alice's persistent + bob's session remain.
-        assert_eq!(store.count(), 2);
-        assert_eq!(store.count_for(&alice), 1);
-        assert_eq!(store.count_for(&bob), 1);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn test_load_or_generate_sets_secure_permissions() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let dir = tempfile::tempdir().unwrap();
-        let keys_dir = dir.path().join("keys");
-
-        let _ = load_or_generate_runtime_key(&keys_dir).unwrap();
-
-        let key_path = keys_dir.join("runtime.key");
-        let mode = std::fs::metadata(&key_path).unwrap().permissions().mode();
-        assert_eq!(
-            mode & 0o777,
-            0o600,
-            "key file should have 0o600 permissions, got {mode:#o}"
-        );
-    }
-
-    #[test]
-    fn restart_tracker_initial_state() {
-        let tracker = RestartTracker::new();
-        assert!(!tracker.exhausted());
-        // Should not restart immediately (backoff hasn't elapsed).
-        assert!(!tracker.should_restart());
-    }
-
-    #[test]
-    fn restart_tracker_allows_restart_after_backoff() {
-        let mut tracker = RestartTracker::new();
-        // Simulate time passing by setting last_attempt in the past.
-        tracker.last_attempt = std::time::Instant::now()
-            - RestartTracker::INITIAL_BACKOFF
-            - std::time::Duration::from_millis(1);
-        assert!(tracker.should_restart());
-    }
-
-    #[test]
-    fn restart_tracker_doubles_backoff() {
-        let mut tracker = RestartTracker::new();
-        assert_eq!(tracker.backoff, RestartTracker::INITIAL_BACKOFF);
-
-        tracker.record_attempt();
-        assert_eq!(
-            tracker.backoff,
-            RestartTracker::INITIAL_BACKOFF.saturating_mul(2)
-        );
-        assert_eq!(tracker.attempts, 1);
-
-        tracker.record_attempt();
-        assert_eq!(
-            tracker.backoff,
-            RestartTracker::INITIAL_BACKOFF.saturating_mul(4)
-        );
-        assert_eq!(tracker.attempts, 2);
-    }
-
-    #[test]
-    fn restart_tracker_backoff_caps_at_max() {
-        let mut tracker = RestartTracker::new();
-        for _ in 0..20 {
-            tracker.record_attempt();
-        }
-        assert_eq!(tracker.backoff, RestartTracker::MAX_BACKOFF);
-    }
-
-    #[test]
-    fn restart_tracker_exhausted_at_max_attempts() {
-        let mut tracker = RestartTracker::new();
-        for _ in 0..RestartTracker::MAX_ATTEMPTS {
-            assert!(!tracker.exhausted());
-            tracker.record_attempt();
-        }
-        assert!(tracker.exhausted());
-    }
-
-    #[test]
-    fn restart_tracker_should_restart_false_when_exhausted() {
-        let mut tracker = RestartTracker::new();
-        for _ in 0..RestartTracker::MAX_ATTEMPTS {
-            tracker.record_attempt();
-        }
-        // Even if backoff has elapsed, exhausted tracker should not restart.
-        tracker.last_attempt = std::time::Instant::now() - RestartTracker::MAX_BACKOFF;
-        assert!(!tracker.should_restart());
-    }
-
-    // ── Bootstrap admin-group seeding (issue #670) ───────────────────
-
-    fn scratch_home() -> (tempfile::TempDir, astrid_core::dirs::AstridHome) {
-        let dir = tempfile::tempdir().unwrap();
-        let home = astrid_core::dirs::AstridHome::from_path(dir.path());
-        (dir, home)
-    }
-
-    #[test]
-    fn seed_admin_writes_fresh_profile_when_missing() {
-        let (_d, home) = scratch_home();
-        let default = astrid_core::PrincipalId::default();
-        let path = astrid_core::PrincipalProfile::path_for(&home, &default);
-        assert!(!path.exists());
-
-        seed_default_principal_admin_profile(&home).unwrap();
-
-        let profile = astrid_core::PrincipalProfile::load_from_path(&path).unwrap();
-        assert_eq!(profile.groups, vec!["admin".to_string()]);
-        assert!(profile.grants.is_empty());
-        assert!(profile.revokes.is_empty());
-
-        // Default now carries a per-principal ed25519 key + the Keypair
-        // method, and the private key is on disk 0600 (issue #45/#852).
-        assert!(
-            !profile.auth.public_keys.is_empty(),
-            "default must have an ed25519 key registered"
-        );
-        assert!(
-            profile
-                .auth
-                .public_keys
-                .iter()
-                .all(|k| matches!(k.scope, astrid_core::profile::DeviceScope::Full)),
-            "bootstrap key must be Full-scope"
-        );
-        assert!(
-            profile
-                .auth
-                .methods
-                .contains(&astrid_core::profile::AuthMethod::Keypair),
-            "default must record the Keypair auth method"
-        );
-        let key_path = home.keys_dir().join("default.key");
-        assert!(key_path.exists(), "default.key must be written to disk");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mode = std::fs::metadata(&key_path).unwrap().permissions().mode();
-            assert_eq!(mode & 0o777, 0o600, "default.key must be owner-only");
-        }
-    }
-
-    #[test]
-    fn seed_admin_keypair_is_idempotent() {
-        // A second seed must NOT mint a fresh key — the registered key and the
-        // on-disk private key are stable across reboots so an operator who has
-        // started signing with it keeps working (issue #45/#852).
-        let (_d, home) = scratch_home();
-        let default = astrid_core::PrincipalId::default();
-        let path = astrid_core::PrincipalProfile::path_for(&home, &default);
-
-        seed_default_principal_admin_profile(&home).unwrap();
-        let first = astrid_core::PrincipalProfile::load_from_path(&path).unwrap();
-        let first_keys = first.auth.public_keys.clone();
-        let first_bytes = std::fs::read(home.keys_dir().join("default.key")).unwrap();
-
-        seed_default_principal_admin_profile(&home).unwrap();
-        let second = astrid_core::PrincipalProfile::load_from_path(&path).unwrap();
-        let second_bytes = std::fs::read(home.keys_dir().join("default.key")).unwrap();
-
-        assert_eq!(
-            first_keys, second.auth.public_keys,
-            "key must not be re-minted"
-        );
-        assert_eq!(
-            first_bytes, second_bytes,
-            "private key bytes must be stable"
-        );
-        assert_eq!(
-            second.auth.public_keys.len(),
-            1,
-            "exactly one ed25519 key — no duplication across reboots"
-        );
-    }
-
-    #[test]
-    fn seed_admin_is_idempotent_across_reboots() {
-        let (_d, home) = scratch_home();
-        let default = astrid_core::PrincipalId::default();
-
-        seed_default_principal_admin_profile(&home).unwrap();
-        seed_default_principal_admin_profile(&home).unwrap();
-        seed_default_principal_admin_profile(&home).unwrap();
-
-        let path = astrid_core::PrincipalProfile::path_for(&home, &default);
-        let profile = astrid_core::PrincipalProfile::load_from_path(&path).unwrap();
-        // Still exactly one `admin` entry — no duplication.
-        assert_eq!(profile.groups, vec!["admin".to_string()]);
-    }
-
-    #[test]
-    fn seed_admin_leaves_operator_configured_groups_intact() {
-        let (_d, home) = scratch_home();
-        let default = astrid_core::PrincipalId::default();
-
-        // Operator wrote their own config pre-bootstrap.
-        let mut existing = astrid_core::PrincipalProfile::default();
-        existing.groups = vec!["agent".to_string()];
-        let path = astrid_core::PrincipalProfile::path_for(&home, &default);
-        std::fs::create_dir_all(home.profiles_dir()).unwrap();
-        existing.save_to_path(&path).unwrap();
-
-        seed_default_principal_admin_profile(&home).unwrap();
-
-        let profile = astrid_core::PrincipalProfile::load_from_path(&path).unwrap();
-        assert_eq!(profile.groups, vec!["agent".to_string()]);
-    }
-
-    #[test]
-    fn seed_admin_leaves_operator_configured_grants_intact() {
-        let (_d, home) = scratch_home();
-        let default = astrid_core::PrincipalId::default();
-
-        let mut existing = astrid_core::PrincipalProfile::default();
-        existing.grants = vec!["system:status".to_string()];
-        let path = astrid_core::PrincipalProfile::path_for(&home, &default);
-        std::fs::create_dir_all(home.profiles_dir()).unwrap();
-        existing.save_to_path(&path).unwrap();
-
-        seed_default_principal_admin_profile(&home).unwrap();
-
-        let profile = astrid_core::PrincipalProfile::load_from_path(&path).unwrap();
-        // admin not auto-added because grants are non-empty.
-        assert!(profile.groups.is_empty());
-        assert_eq!(profile.grants, vec!["system:status".to_string()]);
-    }
-
-    #[test]
-    fn seed_admin_leaves_operator_configured_revokes_intact() {
-        let (_d, home) = scratch_home();
-        let default = astrid_core::PrincipalId::default();
-
-        let mut existing = astrid_core::PrincipalProfile::default();
-        existing.revokes = vec!["system:shutdown".to_string()];
-        let path = astrid_core::PrincipalProfile::path_for(&home, &default);
-        std::fs::create_dir_all(home.profiles_dir()).unwrap();
-        existing.save_to_path(&path).unwrap();
-
-        seed_default_principal_admin_profile(&home).unwrap();
-
-        let profile = astrid_core::PrincipalProfile::load_from_path(&path).unwrap();
-        assert!(profile.groups.is_empty());
-        assert_eq!(profile.revokes, vec!["system:shutdown".to_string()]);
-    }
-
-    // ── Legacy profile path migration (issue #672) ──────────────────
-
-    #[test]
-    fn migrate_legacy_profile_relocates_to_etc() {
-        // Pre-#672 deployments wrote profile.toml under
-        // home/{principal}/.config/. The migration moves it to
-        // etc/profiles/{principal}.toml on first boot.
-        let (_d, home) = scratch_home();
-        let default = astrid_core::PrincipalId::default();
-        let legacy_path = home
-            .principal_home(&default)
-            .config_dir()
-            .join("profile.toml");
-        std::fs::create_dir_all(legacy_path.parent().unwrap()).unwrap();
-        let mut existing = astrid_core::PrincipalProfile::default();
-        existing.groups = vec!["operator-configured".to_string()];
-        existing.save_to_path(&legacy_path).unwrap();
-
-        seed_default_principal_admin_profile(&home).unwrap();
-
-        // Legacy path gone, new path holds the migrated content.
-        assert!(!legacy_path.exists());
-        let new_path = astrid_core::PrincipalProfile::path_for(&home, &default);
-        let migrated = astrid_core::PrincipalProfile::load_from_path(&new_path).unwrap();
-        assert_eq!(migrated.groups, vec!["operator-configured".to_string()]);
-    }
-
-    #[test]
-    fn migrate_legacy_profile_drops_stale_legacy_when_new_already_exists() {
-        // Operator already migrated by hand (or a prior boot did) —
-        // the new path holds the canonical config. Don't clobber it
-        // with the legacy file; just remove the legacy so capsules
-        // can't reach it through home://.
-        let (_d, home) = scratch_home();
-        let default = astrid_core::PrincipalId::default();
-
-        // Stale legacy with operator-stale content.
-        let legacy_path = home
-            .principal_home(&default)
-            .config_dir()
-            .join("profile.toml");
-        std::fs::create_dir_all(legacy_path.parent().unwrap()).unwrap();
-        let mut stale = astrid_core::PrincipalProfile::default();
-        stale.groups = vec!["stale".to_string()];
-        stale.save_to_path(&legacy_path).unwrap();
-
-        // Fresh new-path content (migrated already).
-        let new_path = astrid_core::PrincipalProfile::path_for(&home, &default);
-        std::fs::create_dir_all(new_path.parent().unwrap()).unwrap();
-        let mut canonical = astrid_core::PrincipalProfile::default();
-        canonical.groups = vec!["canonical".to_string()];
-        canonical.save_to_path(&new_path).unwrap();
-
-        seed_default_principal_admin_profile(&home).unwrap();
-
-        // Legacy removed, canonical preserved.
-        assert!(!legacy_path.exists());
-        let result = astrid_core::PrincipalProfile::load_from_path(&new_path).unwrap();
-        assert_eq!(result.groups, vec!["canonical".to_string()]);
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2678,9 +2187,11 @@ fn seed_default_principal_admin_profile(
     // 1. Admin-group seeding. Only on a truly fresh default (no groups,
     // grants, or revokes) — an operator-configured profile is left intact.
     if profile.groups.is_empty() && profile.grants.is_empty() && profile.revokes.is_empty() {
-        profile
-            .groups
-            .push(astrid_core::groups::BUILTIN_ADMIN.to_string());
+        let admin_group =
+            astrid_core::GroupName::new(astrid_core::groups::BUILTIN_ADMIN).map_err(|e| {
+                astrid_core::ProfileError::Invalid(format!("built-in admin group rejected: {e}"))
+            })?;
+        profile.groups.push(admin_group.as_str().to_string());
         mutated = true;
         tracing::info!(
             principal = %default_principal,
@@ -2878,4 +2389,511 @@ async fn apply_single_identity_link(
     );
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_load_or_generate_creates_new_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let keys_dir = dir.path().join("keys");
+
+        let keypair = load_or_generate_runtime_key(&keys_dir).unwrap();
+        let key_path = keys_dir.join("runtime.key");
+
+        // Key file should exist with 32 bytes.
+        assert!(key_path.exists());
+        let bytes = std::fs::read(&key_path).unwrap();
+        assert_eq!(bytes.len(), 32);
+
+        // The written bytes should reconstruct the same public key.
+        let reloaded = KeyPair::from_secret_key(&bytes).unwrap();
+        assert_eq!(
+            keypair.public_key_bytes(),
+            reloaded.public_key_bytes(),
+            "reloaded key should match generated key"
+        );
+    }
+
+    #[test]
+    fn test_load_or_generate_is_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let keys_dir = dir.path().join("keys");
+
+        let first = load_or_generate_runtime_key(&keys_dir).unwrap();
+        let second = load_or_generate_runtime_key(&keys_dir).unwrap();
+
+        assert_eq!(
+            first.public_key_bytes(),
+            second.public_key_bytes(),
+            "loading the same key file should produce the same keypair"
+        );
+    }
+
+    #[test]
+    fn test_load_or_generate_rejects_bad_key_length() {
+        let dir = tempfile::tempdir().unwrap();
+        let keys_dir = dir.path().join("keys");
+        std::fs::create_dir_all(&keys_dir).unwrap();
+
+        // Write a key file with wrong length.
+        std::fs::write(keys_dir.join("runtime.key"), [0u8; 16]).unwrap();
+
+        let result = load_or_generate_runtime_key(&keys_dir);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("invalid runtime key"),
+            "expected 'invalid runtime key' error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_connection_counter_increment_decrement() {
+        let counter = AtomicUsize::new(0);
+
+        // Simulate connection_opened (fetch_add)
+        counter.fetch_add(1, Ordering::Relaxed);
+        counter.fetch_add(1, Ordering::Relaxed);
+        assert_eq!(counter.load(Ordering::Relaxed), 2);
+
+        // Simulate connection_closed using the same fetch_update logic
+        // as the real implementation to exercise the actual code path.
+        for expected in [1, 0] {
+            let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+                if n == 0 {
+                    None
+                } else {
+                    Some(n.saturating_sub(1))
+                }
+            });
+            assert_eq!(counter.load(Ordering::Relaxed), expected);
+        }
+    }
+
+    #[test]
+    fn test_connection_counter_underflow_guard() {
+        // Test the saturating behavior: decrementing from 0 should stay at 0.
+        // Mirrors the fetch_update logic in connection_closed().
+        let counter = AtomicUsize::new(0);
+
+        let result = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+            if n == 0 { None } else { Some(n - 1) }
+        });
+        // fetch_update returns Err(0) when the closure returns None (no-op).
+        assert!(result.is_err());
+        assert_eq!(counter.load(Ordering::Relaxed), 0);
+    }
+
+    /// Mirrors the `connection_closed(&principal)` logic: only `Ok(1)`
+    /// (previous value 1, now 0) triggers `clear_session_allowances` for
+    /// that principal. Update this test if `connection_closed()` is
+    /// refactored.
+    #[test]
+    fn test_last_disconnect_clears_session_allowances_scoped() {
+        use astrid_approval::AllowanceStore;
+        use astrid_approval::allowance::{Allowance, AllowanceId, AllowancePattern};
+        use astrid_core::principal::PrincipalId;
+        use astrid_core::types::Timestamp;
+        use astrid_crypto::KeyPair;
+
+        let store = AllowanceStore::new();
+        let keypair = KeyPair::generate();
+        let alice = PrincipalId::new("alice").unwrap();
+        let bob = PrincipalId::new("bob").unwrap();
+
+        // Alice: session + persistent.
+        store
+            .add_allowance(Allowance {
+                id: AllowanceId::new(),
+                principal: alice.clone(),
+                action_pattern: AllowancePattern::ServerTools {
+                    server: "alice-session".to_string(),
+                },
+                created_at: Timestamp::now(),
+                expires_at: None,
+                max_uses: None,
+                uses_remaining: None,
+                session_only: true,
+                workspace_root: None,
+                signature: keypair.sign(b"test"),
+            })
+            .unwrap();
+        store
+            .add_allowance(Allowance {
+                id: AllowanceId::new(),
+                principal: alice.clone(),
+                action_pattern: AllowancePattern::ServerTools {
+                    server: "alice-persistent".to_string(),
+                },
+                created_at: Timestamp::now(),
+                expires_at: None,
+                max_uses: None,
+                uses_remaining: None,
+                session_only: false,
+                workspace_root: None,
+                signature: keypair.sign(b"test"),
+            })
+            .unwrap();
+        // Bob: session (must NOT be cleared by alice disconnecting).
+        store
+            .add_allowance(Allowance {
+                id: AllowanceId::new(),
+                principal: bob.clone(),
+                action_pattern: AllowancePattern::ServerTools {
+                    server: "bob-session".to_string(),
+                },
+                created_at: Timestamp::now(),
+                expires_at: None,
+                max_uses: None,
+                uses_remaining: None,
+                session_only: true,
+                workspace_root: None,
+                signature: keypair.sign(b"test"),
+            })
+            .unwrap();
+        assert_eq!(store.count(), 3);
+
+        let alice_counter = AtomicUsize::new(1);
+        let simulate_alice_disconnect = || {
+            let result = alice_counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+                if n == 0 {
+                    None
+                } else {
+                    Some(n.saturating_sub(1))
+                }
+            });
+            if result == Ok(1) {
+                store.clear_session_allowances(&alice);
+            }
+        };
+
+        simulate_alice_disconnect();
+        // Alice's session gone; alice's persistent + bob's session remain.
+        assert_eq!(store.count(), 2);
+        assert_eq!(store.count_for(&alice), 1);
+        assert_eq!(store.count_for(&bob), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_load_or_generate_sets_secure_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let keys_dir = dir.path().join("keys");
+
+        let _ = load_or_generate_runtime_key(&keys_dir).unwrap();
+
+        let key_path = keys_dir.join("runtime.key");
+        let mode = std::fs::metadata(&key_path).unwrap().permissions().mode();
+        assert_eq!(
+            mode & 0o777,
+            0o600,
+            "key file should have 0o600 permissions, got {mode:#o}"
+        );
+    }
+
+    #[test]
+    fn restart_tracker_initial_state() {
+        let tracker = RestartTracker::new();
+        assert!(!tracker.exhausted());
+        // Should not restart immediately (backoff hasn't elapsed).
+        assert!(!tracker.should_restart());
+    }
+
+    #[test]
+    fn restart_tracker_allows_restart_after_backoff() {
+        let mut tracker = RestartTracker::new();
+        // Simulate time passing by setting last_attempt in the past.
+        tracker.last_attempt = std::time::Instant::now()
+            .checked_sub(RestartTracker::INITIAL_BACKOFF)
+            .unwrap()
+            .checked_sub(std::time::Duration::from_millis(1))
+            .unwrap();
+        assert!(tracker.should_restart());
+    }
+
+    #[test]
+    fn restart_tracker_doubles_backoff() {
+        let mut tracker = RestartTracker::new();
+        assert_eq!(tracker.backoff, RestartTracker::INITIAL_BACKOFF);
+
+        tracker.record_attempt();
+        assert_eq!(
+            tracker.backoff,
+            RestartTracker::INITIAL_BACKOFF.saturating_mul(2)
+        );
+        assert_eq!(tracker.attempts, 1);
+
+        tracker.record_attempt();
+        assert_eq!(
+            tracker.backoff,
+            RestartTracker::INITIAL_BACKOFF.saturating_mul(4)
+        );
+        assert_eq!(tracker.attempts, 2);
+    }
+
+    #[test]
+    fn restart_tracker_backoff_caps_at_max() {
+        let mut tracker = RestartTracker::new();
+        for _ in 0..20 {
+            tracker.record_attempt();
+        }
+        assert_eq!(tracker.backoff, RestartTracker::MAX_BACKOFF);
+    }
+
+    #[test]
+    fn restart_tracker_exhausted_at_max_attempts() {
+        let mut tracker = RestartTracker::new();
+        for _ in 0..RestartTracker::MAX_ATTEMPTS {
+            assert!(!tracker.exhausted());
+            tracker.record_attempt();
+        }
+        assert!(tracker.exhausted());
+    }
+
+    #[test]
+    fn restart_tracker_should_restart_false_when_exhausted() {
+        let mut tracker = RestartTracker::new();
+        for _ in 0..RestartTracker::MAX_ATTEMPTS {
+            tracker.record_attempt();
+        }
+        // Even if backoff has elapsed, exhausted tracker should not restart.
+        tracker.last_attempt = std::time::Instant::now()
+            .checked_sub(RestartTracker::MAX_BACKOFF)
+            .unwrap();
+        assert!(!tracker.should_restart());
+    }
+
+    // ── Bootstrap admin-group seeding (issue #670) ───────────────────
+
+    fn scratch_home() -> (tempfile::TempDir, astrid_core::dirs::AstridHome) {
+        let dir = tempfile::tempdir().unwrap();
+        let home = astrid_core::dirs::AstridHome::from_path(dir.path());
+        (dir, home)
+    }
+
+    #[test]
+    fn seed_admin_writes_fresh_profile_when_missing() {
+        let (_d, home) = scratch_home();
+        let default = astrid_core::PrincipalId::default();
+        let path = astrid_core::PrincipalProfile::path_for(&home, &default);
+        assert!(!path.exists());
+
+        seed_default_principal_admin_profile(&home).unwrap();
+
+        let profile = astrid_core::PrincipalProfile::load_from_path(&path).unwrap();
+        assert_eq!(profile.groups, vec!["admin".to_string()]);
+        assert!(profile.grants.is_empty());
+        assert!(profile.revokes.is_empty());
+
+        // Default now carries a per-principal ed25519 key + the Keypair
+        // method, and the private key is on disk 0600 (issue #45/#852).
+        assert!(
+            !profile.auth.public_keys.is_empty(),
+            "default must have an ed25519 key registered"
+        );
+        assert!(
+            profile
+                .auth
+                .public_keys
+                .iter()
+                .all(|k| matches!(k.scope, astrid_core::profile::DeviceScope::Full)),
+            "bootstrap key must be Full-scope"
+        );
+        assert!(
+            profile
+                .auth
+                .methods
+                .contains(&astrid_core::profile::AuthMethod::Keypair),
+            "default must record the Keypair auth method"
+        );
+        let key_path = home.keys_dir().join("default.key");
+        assert!(key_path.exists(), "default.key must be written to disk");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&key_path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600, "default.key must be owner-only");
+        }
+    }
+
+    #[test]
+    fn seed_admin_keypair_is_idempotent() {
+        // A second seed must NOT mint a fresh key — the registered key and the
+        // on-disk private key are stable across reboots so an operator who has
+        // started signing with it keeps working (issue #45/#852).
+        let (_d, home) = scratch_home();
+        let default = astrid_core::PrincipalId::default();
+        let path = astrid_core::PrincipalProfile::path_for(&home, &default);
+
+        seed_default_principal_admin_profile(&home).unwrap();
+        let first = astrid_core::PrincipalProfile::load_from_path(&path).unwrap();
+        let first_keys = first.auth.public_keys.clone();
+        let first_bytes = std::fs::read(home.keys_dir().join("default.key")).unwrap();
+
+        seed_default_principal_admin_profile(&home).unwrap();
+        let second = astrid_core::PrincipalProfile::load_from_path(&path).unwrap();
+        let second_bytes = std::fs::read(home.keys_dir().join("default.key")).unwrap();
+
+        assert_eq!(
+            first_keys, second.auth.public_keys,
+            "key must not be re-minted"
+        );
+        assert_eq!(
+            first_bytes, second_bytes,
+            "private key bytes must be stable"
+        );
+        assert_eq!(
+            second.auth.public_keys.len(),
+            1,
+            "exactly one ed25519 key — no duplication across reboots"
+        );
+    }
+
+    #[test]
+    fn seed_admin_is_idempotent_across_reboots() {
+        let (_d, home) = scratch_home();
+        let default = astrid_core::PrincipalId::default();
+
+        seed_default_principal_admin_profile(&home).unwrap();
+        seed_default_principal_admin_profile(&home).unwrap();
+        seed_default_principal_admin_profile(&home).unwrap();
+
+        let path = astrid_core::PrincipalProfile::path_for(&home, &default);
+        let profile = astrid_core::PrincipalProfile::load_from_path(&path).unwrap();
+        // Still exactly one `admin` entry — no duplication.
+        assert_eq!(profile.groups, vec!["admin".to_string()]);
+    }
+
+    #[test]
+    fn seed_admin_leaves_operator_configured_groups_intact() {
+        let (_d, home) = scratch_home();
+        let default = astrid_core::PrincipalId::default();
+
+        // Operator wrote their own config pre-bootstrap.
+        let existing = astrid_core::PrincipalProfile {
+            groups: vec!["agent".to_string()],
+            ..Default::default()
+        };
+        let path = astrid_core::PrincipalProfile::path_for(&home, &default);
+        std::fs::create_dir_all(home.profiles_dir()).unwrap();
+        existing.save_to_path(&path).unwrap();
+
+        seed_default_principal_admin_profile(&home).unwrap();
+
+        let profile = astrid_core::PrincipalProfile::load_from_path(&path).unwrap();
+        assert_eq!(profile.groups, vec!["agent".to_string()]);
+    }
+
+    #[test]
+    fn seed_admin_leaves_operator_configured_grants_intact() {
+        let (_d, home) = scratch_home();
+        let default = astrid_core::PrincipalId::default();
+
+        let existing = astrid_core::PrincipalProfile {
+            grants: vec!["system:status".to_string()],
+            ..Default::default()
+        };
+        let path = astrid_core::PrincipalProfile::path_for(&home, &default);
+        std::fs::create_dir_all(home.profiles_dir()).unwrap();
+        existing.save_to_path(&path).unwrap();
+
+        seed_default_principal_admin_profile(&home).unwrap();
+
+        let profile = astrid_core::PrincipalProfile::load_from_path(&path).unwrap();
+        // admin not auto-added because grants are non-empty.
+        assert!(profile.groups.is_empty());
+        assert_eq!(profile.grants, vec!["system:status".to_string()]);
+    }
+
+    #[test]
+    fn seed_admin_leaves_operator_configured_revokes_intact() {
+        let (_d, home) = scratch_home();
+        let default = astrid_core::PrincipalId::default();
+
+        let existing = astrid_core::PrincipalProfile {
+            revokes: vec!["system:shutdown".to_string()],
+            ..Default::default()
+        };
+        let path = astrid_core::PrincipalProfile::path_for(&home, &default);
+        std::fs::create_dir_all(home.profiles_dir()).unwrap();
+        existing.save_to_path(&path).unwrap();
+
+        seed_default_principal_admin_profile(&home).unwrap();
+
+        let profile = astrid_core::PrincipalProfile::load_from_path(&path).unwrap();
+        assert!(profile.groups.is_empty());
+        assert_eq!(profile.revokes, vec!["system:shutdown".to_string()]);
+    }
+
+    // ── Legacy profile path migration (issue #672) ──────────────────
+
+    #[test]
+    fn migrate_legacy_profile_relocates_to_etc() {
+        // Pre-#672 deployments wrote profile.toml under
+        // home/{principal}/.config/. The migration moves it to
+        // etc/profiles/{principal}.toml on first boot.
+        let (_d, home) = scratch_home();
+        let default = astrid_core::PrincipalId::default();
+        let legacy_path = home
+            .principal_home(&default)
+            .config_dir()
+            .join("profile.toml");
+        std::fs::create_dir_all(legacy_path.parent().unwrap()).unwrap();
+        let existing = astrid_core::PrincipalProfile {
+            groups: vec!["operator-configured".to_string()],
+            ..Default::default()
+        };
+        existing.save_to_path(&legacy_path).unwrap();
+
+        seed_default_principal_admin_profile(&home).unwrap();
+
+        // Legacy path gone, new path holds the migrated content.
+        assert!(!legacy_path.exists());
+        let new_path = astrid_core::PrincipalProfile::path_for(&home, &default);
+        let migrated = astrid_core::PrincipalProfile::load_from_path(&new_path).unwrap();
+        assert_eq!(migrated.groups, vec!["operator-configured".to_string()]);
+    }
+
+    #[test]
+    fn migrate_legacy_profile_drops_stale_legacy_when_new_already_exists() {
+        // Operator already migrated by hand (or a prior boot did) —
+        // the new path holds the canonical config. Don't clobber it
+        // with the legacy file; just remove the legacy so capsules
+        // can't reach it through home://.
+        let (_d, home) = scratch_home();
+        let default = astrid_core::PrincipalId::default();
+
+        // Stale legacy with operator-stale content.
+        let legacy_path = home
+            .principal_home(&default)
+            .config_dir()
+            .join("profile.toml");
+        std::fs::create_dir_all(legacy_path.parent().unwrap()).unwrap();
+        let stale = astrid_core::PrincipalProfile {
+            groups: vec!["stale".to_string()],
+            ..Default::default()
+        };
+        stale.save_to_path(&legacy_path).unwrap();
+
+        // Fresh new-path content (migrated already).
+        let new_path = astrid_core::PrincipalProfile::path_for(&home, &default);
+        std::fs::create_dir_all(new_path.parent().unwrap()).unwrap();
+        let canonical = astrid_core::PrincipalProfile {
+            groups: vec!["canonical".to_string()],
+            ..Default::default()
+        };
+        canonical.save_to_path(&new_path).unwrap();
+
+        seed_default_principal_admin_profile(&home).unwrap();
+
+        // Legacy removed, canonical preserved.
+        assert!(!legacy_path.exists());
+        let result = astrid_core::PrincipalProfile::load_from_path(&new_path).unwrap();
+        assert_eq!(result.groups, vec!["canonical".to_string()]);
+    }
 }

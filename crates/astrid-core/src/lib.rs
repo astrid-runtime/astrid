@@ -23,6 +23,7 @@ pub mod env_policy;
 pub mod groups;
 pub mod identity;
 pub mod kernel_api;
+pub mod net;
 pub mod principal;
 pub mod profile;
 pub mod retry;
@@ -41,15 +42,17 @@ pub use elicitation::{
 };
 pub use groups::{
     BUILTIN_ADMIN, BUILTIN_AGENT, BUILTIN_RESTRICTED, Group, GroupConfig, GroupConfigError,
-    GroupConfigResult,
+    GroupConfigResult, ValidatedGroup, ValidatedGroupConfig,
 };
 pub use principal::{PrincipalId, PrincipalIdError};
 pub use profile::{
     AuthConfig, AuthMethod, BACKGROUND_PROCESSES_UPPER_BOUND, CURRENT_PROFILE_VERSION,
-    DEFAULT_MAX_BACKGROUND_PROCESSES, DEFAULT_MAX_IPC_THROUGHPUT_BYTES, DEFAULT_MAX_MEMORY_BYTES,
-    DEFAULT_MAX_STORAGE_BYTES, DEFAULT_MAX_TIMEOUT_SECS, DEVICE_KEY_ID_HEX_LEN, DeviceKey,
-    DeviceScope, MAX_GROUP_NAME_LEN, NetworkConfig, PrincipalProfile, ProcessConfig, ProfileError,
-    ProfileResult, Quotas, TIMEOUT_SECS_UPPER_BOUND, device_key_id_fingerprint,
+    CapabilityPattern, CapsuleGrant, DEFAULT_MAX_BACKGROUND_PROCESSES,
+    DEFAULT_MAX_IPC_THROUGHPUT_BYTES, DEFAULT_MAX_MEMORY_BYTES, DEFAULT_MAX_STORAGE_BYTES,
+    DEFAULT_MAX_TIMEOUT_SECS, DEVICE_KEY_ID_HEX_LEN, DeviceKey, DeviceScope, GroupName,
+    MAX_GROUP_NAME_LEN, NetworkConfig, PrincipalProfile, ProcessConfig, ProfileError,
+    ProfileFieldError, ProfileResult, Quotas, TIMEOUT_SECS_UPPER_BOUND, ValidatedProfileFields,
+    device_key_id_fingerprint,
 };
 pub use retry::RetryConfig;
 pub use types::{

@@ -300,7 +300,7 @@ impl RouteEntry {
         };
 
         let evicted_topic = match &*evicted {
-            AstridEvent::Ipc { message, .. } => message.topic.clone(),
+            AstridEvent::Ipc { message, .. } => message.topic.to_string(),
             other => other.event_type().to_string(),
         };
         let class = principal_class_label(victim_key.as_deref());
@@ -477,12 +477,16 @@ impl SubscriptionRepAllocator {
 mod tests {
     use super::*;
     use crate::event::EventMetadata;
-    use crate::ipc::{IpcMessage, IpcPayload};
+    use crate::ipc::{IpcMessage, IpcPayload, Topic};
     use serde_json::json;
     use uuid::Uuid;
 
     fn ipc(topic: &str, principal: Option<&str>) -> Arc<AstridEvent> {
-        let mut msg = IpcMessage::new(topic, IpcPayload::RawJson(json!({})), Uuid::nil());
+        let mut msg = IpcMessage::new(
+            Topic::from_raw(topic),
+            IpcPayload::RawJson(json!({})),
+            Uuid::nil(),
+        );
         msg.principal = principal.map(String::from);
         Arc::new(AstridEvent::Ipc {
             metadata: EventMetadata::new("test"),
@@ -493,7 +497,7 @@ mod tests {
     fn ipc_sized(topic: &str, principal: Option<&str>, payload_bytes: usize) -> Arc<AstridEvent> {
         let blob = "x".repeat(payload_bytes);
         let mut msg = IpcMessage::new(
-            topic,
+            Topic::from_raw(topic),
             IpcPayload::RawJson(json!({ "p": blob })),
             Uuid::nil(),
         );

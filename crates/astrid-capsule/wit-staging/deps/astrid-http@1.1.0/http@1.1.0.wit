@@ -1,0 +1,284 @@
+/// HTTP client operations with SSRF protection — version 1.1.0.
+///
+/// Additive successor to `astrid:http@1.0.0`. The @1.0.0 request shape and the
+/// `http-request` / `http-stream-start` signatures are preserved, so porting is
+/// mechanical; @1.1.0 then EXTENDS the surface: the buffered `http-response-data`
+/// gains a `meta` field, `http-stream` gains `trailers`, `error-code` gains arms
+/// for the new failure modes, and new functions add caller-set per-request
+/// control (timeouts, redirect policy, size / decompression caps, scheme
+/// restriction, subresource integrity) plus a streaming request body (upload).
+/// An empty `request-options` reproduces @1.0.0 behaviour exactly, so the host
+/// backs both versions from one implementation with the @1.0.0 entrypoints
+/// delegating to the @1.1.0 path with defaulted options.
+///
+/// SSRF discipline (unchanged from @1.0.0, strengthened here): DNS resolution
+/// blocks private, loopback, link-local, multicast, and unspecified IP
+/// addresses (IPv4-mapped / IPv4-compatible IPv6 included); the security gate
+/// enforces per-capsule allow-lists and rate limits. When redirects are
+/// followed, every hop is re-validated through the same airlock and
+/// `Authorization` / `Cookie` are stripped on a cross-origin hop. The host —
+/// never the capsule — owns DNS resolution and the connect path: no option here
+/// lets a guest choose a resolver, a pre-resolved address, a proxy, a source
+/// interface, or relax TLS verification.
+///
+/// Frozen per the ABI evolution discipline (RFC: host_abi). Shape changes
+/// ship as a new file at a new version path; never edit this file.
+
+package astrid:http@1.1.0;
+
+interface host {
+    use astrid:io/poll@1.0.0.{pollable};
+    use astrid:io/streams@1.0.0.{input-stream, output-stream};
+
+    /// Typed error returned from every fallible http operation. Carries the
+    /// @1.0.0 arms plus @1.1.0 additions for the new control surface.
+    variant error-code {
+        /// Capsule lacks the `net` capability.
+        capability-denied,
+        /// Hostname failed validation (NUL bytes, control chars, etc.)
+        /// or URL doesn't parse.
+        invalid-request,
+        /// DNS could not resolve the hostname.
+        dns-error,
+        /// All resolved IPs were SSRF-blocked (private/loopback/etc).
+        airlock-rejected,
+        /// TLS handshake / certificate problem.
+        tls-error,
+        /// Request or per-chunk read exceeded its timeout.
+        timeout,
+        /// Connection refused or reset by peer.
+        connection-error,
+        /// Response body exceeded the caller's `max-response-bytes`, or the
+        /// host's 10 MB default on buffered requests (use a stream for larger).
+        body-too-large,
+        /// Stream handle has been closed.
+        closed,
+        /// Server-side resource quota exhausted (4 concurrent streams).
+        quota,
+        /// A redirect was encountered under `redirect-policy.error`, or a
+        /// redirect target failed the SSRF airlock. New in @1.1.0.
+        redirect-blocked,
+        /// Redirect chain exceeded `max-redirects` (or the host ceiling).
+        /// New in @1.1.0.
+        too-many-redirects,
+        /// Response bytes did not match the `integrity` digest. New in @1.1.0.
+        integrity-mismatch,
+        /// URL scheme was rejected by `https-only` or the host scheme
+        /// allow-list. New in @1.1.0.
+        scheme-denied,
+        /// Decompressed body exceeded `max-decompressed-bytes` (decompression
+        /// bomb defence). New in @1.1.0.
+        decompression-bomb,
+        /// Unspecific HTTP-protocol-level error from the host.
+        protocol(string),
+        /// Unspecific I/O error from the host; detail is best-effort.
+        unknown(string),
+    }
+
+    /// HTTP request method. Matches `wasi:http/types.method`. `other`
+    /// carries non-standard methods (PROPFIND, etc.) by name.
+    variant http-method {
+        get,
+        head,
+        post,
+        put,
+        %delete,
+        connect,
+        options,
+        trace,
+        patch,
+        other(string),
+    }
+
+    /// A key-value pair used for typed header lists.
+    record key-value-pair {
+        key: string,
+        value: string,
+    }
+
+    /// HTTP request sent by a capsule to the host. Unchanged in shape from
+    /// @1.0.0; per-request behaviour is tuned via `request-options`.
+    record http-request-data {
+        /// Target URL.
+        url: string,
+        /// HTTP method.
+        method: http-method,
+        /// Request headers as key-value pairs. Duplicates allowed
+        /// (e.g. multiple `Cookie` lines).
+        headers: list<key-value-pair>,
+        /// Optional request body as raw bytes. JSON/text callers encode their
+        /// payload to UTF-8 bytes; binary uploads pass their bytes directly.
+        /// For bodies too large to hold in guest memory, leave this `none` and
+        /// stream the body via `http-upload-start`.
+        body: option<list<u8>>,
+    }
+
+    /// Caller-set deadlines, each capped by a host ceiling. `none` per field
+    /// selects the host default for that phase. The four phases are
+    /// independent: a short connect deadline fails a dead host fast while a long
+    /// total deadline still allows a big download.
+    record timeout-config {
+        /// TCP + TLS establishment.
+        connect-ms: option<u64>,
+        /// Request fully sent -> first response byte (catches accept-then-hang).
+        first-byte-ms: option<u64>,
+        /// Maximum idle gap between successive body chunks (streaming path).
+        between-bytes-ms: option<u64>,
+        /// Whole-request hard deadline (connect + send + receive).
+        total-ms: option<u64>,
+    }
+
+    /// How the host treats a 3xx response.
+    enum redirect-policy {
+        /// Follow, re-validating every hop through the SSRF airlock and
+        /// stripping `Authorization` / `Cookie` on a cross-origin hop. Bounded
+        /// by `max-redirects`.
+        follow,
+        /// Do not follow; return `redirect-blocked`.
+        error,
+        /// Do not follow; return the 3xx response to the caller as-is.
+        manual,
+    }
+
+    /// Per-request controls. Every field is optional; an empty value reproduces
+    /// `astrid:http@1.0.0` behaviour exactly. Threaded through the `*-opts`
+    /// functions and `http-upload-start`.
+    record request-options {
+        /// Caller deadlines (see `timeout-config`).
+        timeouts: option<timeout-config>,
+        /// Redirect handling. The host default for an untrusted capsule is
+        /// `error` — never a silent follow.
+        redirect: option<redirect-policy>,
+        /// Hop limit when `redirect-policy.follow`. `none` => host default.
+        max-redirects: option<u32>,
+        /// Cap on the buffered response body in bytes. `none` => host 10 MB
+        /// default. The host enforces a hard ceiling above which
+        /// `body-too-large` is returned regardless of this value.
+        max-response-bytes: option<u64>,
+        /// Cap on DECOMPRESSED body bytes — decompression-bomb defence.
+        /// `none` => host default ceiling.
+        max-decompressed-bytes: option<u64>,
+        /// Automatically decompress gzip / brotli / deflate / zstd responses
+        /// (default true). `false` delivers the raw wire bytes — required for
+        /// binary or already-compressed downloads.
+        auto-decompress: option<bool>,
+        /// Refuse any non-`https` scheme with `scheme-denied`.
+        https-only: option<bool>,
+        /// Subresource integrity, formatted `sha256-<base64>` (also sha384 /
+        /// sha512). The host verifies the response body against the digest and
+        /// returns `integrity-mismatch` on failure.
+        integrity: option<string>,
+    }
+
+    /// Response metadata the @1.0.0 `{status, headers, body}` shape could not
+    /// carry. New in @1.1.0; populated on every buffered response.
+    record response-meta {
+        /// Final URL after any redirects (equals the request URL if none).
+        final-url: string,
+        /// Number of redirect hops followed.
+        redirect-count: u32,
+        /// Wall-clock duration of the request, milliseconds (best-effort).
+        elapsed-ms: u64,
+        /// Bytes received on the wire, before decompression (best-effort).
+        wire-bytes: u64,
+    }
+
+    /// Buffered HTTP response. Carries the @1.0.0 fields plus `meta`.
+    record http-response-data {
+        /// HTTP status code.
+        status: u16,
+        /// Response headers.
+        headers: list<key-value-pair>,
+        /// Response body as raw bytes.
+        body: list<u8>,
+        /// Post-request metadata. New in @1.1.0.
+        meta: response-meta,
+    }
+
+    /// HTTP streaming response handle. The kernel buffers chunks server-side;
+    /// the capsule reads them via `read-chunk` until EOF or `close`. The
+    /// per-chunk timeout defaults to 120s and is overridable via
+    /// `timeout-config.between-bytes-ms`.
+    ///
+    /// Per-capsule cap: 4 concurrent HTTP streams. Drop is automatic — capsules
+    /// don't need to call close explicitly.
+    resource http-stream {
+        /// HTTP status code returned at stream start.
+        status: func() -> u16;
+
+        /// Response headers from the initial response.
+        headers: func() -> list<key-value-pair>;
+
+        /// Read the next chunk. Returns an empty list at EOF; callers loop
+        /// until the list is empty.
+        read-chunk: func() -> result<list<u8>, error-code>;
+
+        /// Close the stream explicitly. Idempotent. Equivalent to dropping
+        /// the resource.
+        close: func() -> result<_, error-code>;
+
+        /// Pollable that fires when the next chunk is ready to read (or EOF has
+        /// arrived). Compose with other pollables for multiplexed I/O — e.g. a
+        /// capsule streaming an HTTP response while also handling IPC requests.
+        subscribe-readable: func() -> pollable;
+
+        /// The response body as an `input-stream`. Use this instead of
+        /// `read-chunk` when forwarding the body to another sink (e.g. a TCP
+        /// stream via `output-stream.splice`) — the splice path moves bytes
+        /// host-side without crossing the WASM boundary per chunk.
+        ///
+        /// `body-stream` and `read-chunk` share the underlying response cursor;
+        /// the kernel serializes access. Pick one.
+        body-stream: func() -> input-stream;
+
+        /// Response trailers (e.g. gRPC-web `grpc-status` / `grpc-message`).
+        /// Available only after the body has been fully read (EOF); `none` if
+        /// the response carried no trailers. New in @1.1.0.
+        trailers: func() -> result<option<list<key-value-pair>>, error-code>;
+    }
+
+    /// Streaming request body (upload). @1.0.0 forces the whole body into guest
+    /// memory via `http-request-data.body`; this lets the caller stream it. The
+    /// caller writes the body to `body-sink` (an `output-stream`), then `finish`
+    /// seals it and yields the response stream. Mirrors the `wasi:http`
+    /// outgoing-body pattern.
+    ///
+    /// Shares the per-capsule 4 concurrent-stream budget. New in @1.1.0.
+    resource http-upload {
+        /// The request-body sink. Write chunks here; the host streams them
+        /// upstream without buffering the whole payload in guest memory.
+        body-sink: func() -> output-stream;
+
+        /// Pollable that fires when the sink can accept more bytes
+        /// (backpressure-aware composition).
+        subscribe-writable: func() -> pollable;
+
+        /// Seal the request body and obtain the response stream (status,
+        /// headers, chunks, trailers). Consumes the upload handle.
+        finish: func() -> result<http-stream, error-code>;
+    }
+
+    /// Buffered HTTP request with default options (full response in memory).
+    /// Equivalent to `http-request-opts` with an empty `request-options`.
+    /// Host default timeout 30s, max response body 10 MB.
+    /// Audit: recorded (URL host + method + status; body bytes not logged).
+    http-request: func(request: http-request-data) -> result<http-response-data, error-code>;
+
+    /// Buffered HTTP request with caller-set options.
+    /// Audit: recorded (as `http-request`).
+    http-request-opts: func(request: http-request-data, options: request-options) -> result<http-response-data, error-code>;
+
+    /// Start a streaming HTTP request with default options (headers on the
+    /// resource; body streamed via `read-chunk`).
+    /// Audit: recorded (start + close).
+    http-stream-start: func(request: http-request-data) -> result<http-stream, error-code>;
+
+    /// Start a streaming HTTP request with caller-set options.
+    http-stream-start-opts: func(request: http-request-data, options: request-options) -> result<http-stream, error-code>;
+
+    /// Start a streaming-upload request: write the body incrementally via the
+    /// returned `http-upload`, then `finish` to obtain the response stream. The
+    /// `body` field of `request` is ignored (the body comes from the sink).
+    /// Audit: recorded (start + finish).
+    http-upload-start: func(request: http-request-data, options: request-options) -> result<http-upload, error-code>;
+}

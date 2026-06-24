@@ -36,7 +36,7 @@ use crate::engine::wasm::host_state::HostState;
 use astrid_events::AstridEvent;
 use astrid_events::EventMetadata;
 use astrid_events::RoutedEventReceiver;
-use astrid_events::ipc::{IpcMessage as InternalIpcMessage, IpcPayload};
+use astrid_events::ipc::{IpcMessage as InternalIpcMessage, IpcPayload, Topic};
 
 /// Per-call payload cap. Matches the IPC bus message-size ceiling.
 const MAX_PAYLOAD_BYTES: usize = 1024 * 1024;
@@ -88,7 +88,7 @@ fn pattern_covers_audit(pattern: &str) -> bool {
     let synthetic = AstridEvent::Ipc {
         metadata: EventMetadata::new("audit_scope_probe"),
         message: InternalIpcMessage::new(
-            AUDIT_TOPIC,
+            Topic::from_raw(AUDIT_TOPIC),
             IpcPayload::RawJson(serde_json::Value::Null),
             uuid::Uuid::nil(),
         ),
@@ -138,7 +138,8 @@ fn to_wit_message(msg: &InternalIpcMessage) -> WitIpcMessage {
         .map(|b| String::from_utf8_lossy(&b).into_owned())
         .unwrap_or_default();
     WitIpcMessage {
-        topic: msg.topic.clone(),
+        // Bindgen boundary OUT: the guest ABI carries the topic as `string`.
+        topic: msg.topic.to_string(),
         payload,
         source_id: msg.source_id.to_string(),
         principal: map_principal(msg),
@@ -217,12 +218,23 @@ fn check_subscribe_acl(state: &HostState, topic_pattern: &str) -> Result<(), Err
 /// device's scope. `None` for a capsule's own-principal `publish` (its own
 /// host calls are never device-scoped) and for an unauthenticated forward;
 /// `publish_as` passes the connection's in-flight `ingress_device_key_id`.
+///
+/// `origin` is the host-stamped transport [`MessageOrigin`] of the ORIGINATING
+/// request. It is ALWAYS taken from host-populated state (the in-flight
+/// `caller_context` for a guest `publish`, or `ingress_origin` for a
+/// `publish-as` forward), NEVER from a guest argument and NEVER reset to a
+/// per-publish default — so a `RemoteGateway` request flowing through a fan-out
+/// capsule (react → openai-compat) stays `RemoteGateway` and cannot be elevated
+/// to `LocalSocket`. The freshly built `InternalIpcMessage` would otherwise
+/// reset origin to its `System` default, dropping the provenance the egress
+/// gate depends on.
 fn publish_inner(
     state: &mut HostState,
     topic: String,
     payload: String,
     principal_str: String,
     device_key_id: Option<&str>,
+    origin: astrid_events::ipc::MessageOrigin,
 ) -> Result<(), ErrorCode> {
     if topic.len() > 256 {
         return Err(ErrorCode::InvalidInput);
@@ -269,8 +281,17 @@ fn publish_inner(
         Err(_) => return Err(ErrorCode::InvalidInput),
     };
 
-    let mut message = InternalIpcMessage::new(topic, ipc_payload, state.capsule_uuid)
-        .with_principal(principal_str);
+    // Bindgen boundary IN: the guest supplies the topic as `string`; wrap it
+    // explicitly (validation already ran above on the raw `&str`).
+    let mut message = InternalIpcMessage::new(Topic::from_raw(topic), ipc_payload, state.capsule_uuid)
+            .with_principal(principal_str)
+            // Carry the host-stamped transport origin of the originating request.
+            // A fresh `InternalIpcMessage` defaults to `System`; stamping it here
+            // preserves `RemoteGateway` / `LocalSocket` provenance across a
+            // guest-publish fan-out hop so a downstream egress gate sees the true
+            // origin. `origin` is host-populated by the caller (caller_context for
+            // `publish`, ingress_origin for `publish-as`), never guest-supplied.
+            .with_origin(origin);
     // Stamp the host-derived authenticating-device fingerprint so the kernel
     // cap-gate can apply the device's scope as an attenuation floor. Only the
     // `publish_as` forward path carries one; a capsule's own `publish` passes
@@ -295,9 +316,20 @@ impl ipc::Host for HostState {
             .unwrap_or_else(|| self.principal.to_string());
         let bytes = payload.len() as u64;
         let topic_for_audit = topic.clone();
+        // Inherit the originating request's transport origin from the in-flight
+        // caller context (host-populated by the dispatcher), so a fan-out
+        // capsule re-publishing on behalf of a `RemoteGateway` / `LocalSocket`
+        // request preserves that provenance downstream. A run-loop publish with
+        // no caller context (load-time, self-triggered) is `System`. A guest
+        // can never name this origin — it only ever inherits its caller's.
+        let origin = self
+            .caller_context
+            .as_ref()
+            .map(|m| m.origin)
+            .unwrap_or(astrid_events::ipc::MessageOrigin::System);
         // A capsule's own host calls are never device-scoped: the owner acts at
         // full principal authority, so no device_key_id is stamped here.
-        let result = publish_inner(self, topic, payload, principal_str, None);
+        let result = publish_inner(self, topic, payload, principal_str, None, origin);
         audit_ipc(
             self,
             "astrid:ipc/host.publish",
@@ -336,9 +368,26 @@ impl ipc::Host for HostState {
         // `None` for an unbound (unauthenticated) connection — the anonymous
         // stamp already fails closed on every capability check.
         let device_key_id = self.ingress_device_key_id.clone();
+        // The transport origin is host-derived from the SAME in-flight
+        // connection (recorded by the framed read that pulled this frame),
+        // parallel to `ingress_principal` / `ingress_device_key_id`. A BOUND
+        // local connection forwards `LocalSocket`; an unbound connection has
+        // `ingress_origin = None`, which is `System` (fail-closed, non-local) —
+        // an unauthenticated local forward earns no local-operator privilege.
+        // The capsule cannot supply or elevate this.
+        let origin = self
+            .ingress_origin
+            .unwrap_or(astrid_events::ipc::MessageOrigin::System);
         let bytes = payload.len() as u64;
         let topic_for_audit = topic.clone();
-        let result = publish_inner(self, topic, payload, effective, device_key_id.as_deref());
+        let result = publish_inner(
+            self,
+            topic,
+            payload,
+            effective,
+            device_key_id.as_deref(),
+            origin,
+        );
         audit_ipc(
             self,
             "astrid:ipc/host.publish-as",

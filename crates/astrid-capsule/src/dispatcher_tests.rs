@@ -18,6 +18,7 @@ use crate::context::CapsuleContext;
 use crate::error::CapsuleResult;
 use crate::manifest::{CapabilitiesDef, CapsuleManifest, PackageDef, SubscribeDef};
 use astrid_events::ipc::IpcPayload;
+use astrid_events::ipc::Topic;
 
 /// A minimal mock capsule for dispatch tests.
 struct MockCapsule {
@@ -157,7 +158,7 @@ impl Capsule for MockCapsule {
 /// Helper: publish an IPC event on the bus.
 fn publish_ipc(bus: &EventBus, topic: &str) {
     let msg = astrid_events::ipc::IpcMessage::new(
-        topic,
+        Topic::from_raw(topic),
         IpcPayload::Custom {
             data: serde_json::json!({}),
         },
@@ -172,7 +173,7 @@ fn publish_ipc(bus: &EventBus, topic: &str) {
 /// Helper: publish an IPC event tagged with a principal.
 fn publish_ipc_as(bus: &EventBus, topic: &str, principal: &str) {
     let msg = astrid_events::ipc::IpcMessage::new(
-        topic,
+        Topic::from_raw(topic),
         IpcPayload::Custom {
             data: serde_json::json!({}),
         },

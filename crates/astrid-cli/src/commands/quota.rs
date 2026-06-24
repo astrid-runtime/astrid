@@ -546,8 +546,8 @@ mod tests {
     fn parses_simple_durations() {
         assert_eq!(parse_duration("30").unwrap(), Duration::from_secs(30));
         assert_eq!(parse_duration("30s").unwrap(), Duration::from_secs(30));
-        assert_eq!(parse_duration("5m").unwrap(), Duration::from_secs(300));
-        assert_eq!(parse_duration("1h").unwrap(), Duration::from_secs(3600));
+        assert_eq!(parse_duration("5m").unwrap(), Duration::from_mins(5));
+        assert_eq!(parse_duration("1h").unwrap(), Duration::from_hours(1));
         assert_eq!(parse_duration("500ms").unwrap(), Duration::from_millis(500));
     }
 

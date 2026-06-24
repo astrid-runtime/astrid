@@ -224,7 +224,7 @@ mod tests {
     use std::time::Duration;
 
     use astrid_events::EventBus;
-    use astrid_events::ipc::IpcMessage;
+    use astrid_events::ipc::{IpcMessage, Topic};
     use astrid_events::{AstridEvent, EventMetadata};
     use uuid::Uuid;
 
@@ -232,8 +232,12 @@ mod tests {
 
     /// Build a principal-stamped IPC event on `topic` carrying `body`.
     fn ipc_event(topic: &str, principal: &str, body: serde_json::Value) -> AstridEvent {
-        let msg = IpcMessage::new(topic.to_string(), IpcPayload::RawJson(body), Uuid::nil())
-            .with_principal(principal.to_string());
+        let msg = IpcMessage::new(
+            Topic::from_raw(topic),
+            IpcPayload::RawJson(body),
+            Uuid::nil(),
+        )
+        .with_principal(principal.to_string());
         AstridEvent::Ipc {
             metadata: EventMetadata::new("test::publisher"),
             message: msg,
