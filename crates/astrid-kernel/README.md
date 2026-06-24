@@ -28,9 +28,9 @@ Requires a multi-threaded tokio runtime. The constructor asserts this at the top
 
 ## Management API
 
-The kernel router listens on `astrid.v1.request.*` and handles `ListCapsules`, `GetCommands`, `GetCapsuleMetadata`, and `ReloadCapsules`. Mutating operations are rate-limited with a sliding-window limiter (e.g. `ReloadCapsules` capped at 5/min). Read-only operations are unlimited.
+The kernel router listens on `astrid.v1.request.*` and handles requests like `ListCapsules`, `GetCommands`, `GetCapsuleMetadata`, `ReloadCapsules`, and `InstallCapsule`. Mutating operations are rate-limited with a sliding-window limiter (e.g. `ReloadCapsules` capped at 5/min). Read-only operations are unlimited.
 
-`InstallCapsule` and `ApproveCapability` are defined in the protocol but not yet implemented. They return errors.
+`ApproveCapability` is defined in the protocol but not yet implemented (it returns an error).
 
 ## Idle auto-shutdown
 
