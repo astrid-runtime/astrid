@@ -23,12 +23,18 @@
 //! for the host packages it imports — no toolchain-stubbed exports show
 //! up at runtime.
 //!
-//! Note: every package is pinned at `@1.0.0`. When a new frozen version
-//! ships (e.g. `host/ipc@1.1.0.wit`), add it here as an additional import
-//! AND register a second `add_to_linker` call — the wasmtime Component
-//! Model linker enforces exact `(package, version)` matches, so multiple
-//! versions must be registered explicitly to allow old and new capsules
-//! to coexist.
+//! Multi-version coexistence: most packages are pinned at `@1.0.0`, but a
+//! frozen package can ship a successor version that lives alongside the old
+//! one (e.g. `astrid:http@1.0.0` and `astrid:http@1.1.0`). To register both,
+//! add ONE `import astrid:<pkg>/host@<ver>;` line to the `world kernel` below
+//! for each version. The single `bindings::Kernel::add_to_linker` call in
+//! `engine/wasm/mod.rs` then auto-wires every version in the world — there is
+//! NO second `add_to_linker` call to add. `build.rs` stages each version into
+//! its own `deps/astrid-<pkg>@<ver>/` dir so the WIT resolver sees them as
+//! distinct packages. The wasmtime Component Model linker enforces exact
+//! `(package, version)` matches, so an old capsule binds `@1.0.0` and a new
+//! one binds `@1.1.0` off the same linker. The host trait impls for both
+//! versions live on `HostState` (see `engine/wasm/host/http.rs`).
 
 wasmtime::component::bindgen!({
     inline: "
@@ -52,6 +58,7 @@ wasmtime::component::bindgen!({
             import astrid:kv/host@1.0.0;
             import astrid:net/host@1.0.0;
             import astrid:http/host@1.0.0;
+            import astrid:http/host@1.1.0;
             import astrid:sys/host@1.0.0;
             import astrid:process/host@1.0.0;
             import astrid:uplink/host@1.0.0;
@@ -128,5 +135,18 @@ wasmtime::component::bindgen!({
         "astrid:http/host.http-request": async,
         "astrid:http/host.http-stream-start": async,
         "astrid:http/host.[method]http-stream.read-chunk": async,
+        // `astrid:http@1.1.0` mirrors the @1.0.0 async set: the buffered/
+        // streaming entrypoints and the per-chunk read all wait on the
+        // network, so they `.await` reqwest directly rather than pinning a
+        // worker (issue #816). Selectors are package-qualified, so the
+        // @1.0.0 and @1.1.0 forms are distinct keys. `http-upload-start`'s
+        // body comes from a guest-written sink and the actual send happens
+        // in `http-upload.finish`, so that method is the async one for the
+        // upload path. The bindgen macro resolves these against whichever
+        // version declares the function.
+        "astrid:http/host@1.1.0.http-request-opts": async,
+        "astrid:http/host@1.1.0.http-stream-start-opts": async,
+        "astrid:http/host@1.1.0.[method]http-stream.read-chunk": async,
+        "astrid:http/host@1.1.0.[method]http-upload.finish": async,
     },
 });

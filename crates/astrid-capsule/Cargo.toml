@@ -22,6 +22,7 @@ astrid-workspace = { workspace = true }
 anyhow = { workspace = true }
 arc-swap = { workspace = true }
 async-trait = { workspace = true }
+base64 = { workspace = true }
 blake3 = { workspace = true }
 bytes = "1"
 dashmap = { workspace = true }
@@ -30,10 +31,15 @@ metrics = { workspace = true }
 notify = "7"
 parking_lot = { workspace = true }
 rand = { workspace = true }
-reqwest = { workspace = true }
+# `astrid:http@1.1.0` `auto-decompress` toggles gzip/brotli/deflate/zstd per
+# request; those builder methods are feature-gated in reqwest. Enabled here so
+# the host can honour (and disable) decompression. The workspace base dep stays
+# minimal; Cargo unions these features in for the capsule crate's build.
+reqwest = { workspace = true, features = ["gzip", "brotli", "deflate", "zstd"] }
 semver = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+sha2 = { workspace = true }
 socket2 = "0.6"
 tempfile = { workspace = true }
 thiserror = { workspace = true }

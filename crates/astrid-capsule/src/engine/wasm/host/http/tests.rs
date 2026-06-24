@@ -1,8 +1,17 @@
 //! Unit tests for the `astrid:http` host implementation (SSRF airlock,
 //! local-egress allowlist, redirect policy). Split out via `#[path]` to keep
-//! `http.rs` under the file-size cap.
+//! the module files under the file-size cap.
 
-use super::*;
+use std::net::{IpAddr, SocketAddr};
+use std::str::FromStr;
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+
+use super::ErrorCode;
+use super::ssrf::{
+    MAX_HTTP_REDIRECTS, RedirectAction, build_redirect_policy, classify_redirect, egress_allowed,
+    egress_decision, filter_safe_addrs, is_safe_ip, literal_ip,
+};
 
 fn ip(s: &str) -> IpAddr {
     IpAddr::from_str(s).unwrap()
@@ -423,4 +432,228 @@ async fn exempt_request_does_not_follow_redirects() {
     );
 
     let _ = server.await;
+}
+
+// ── @1.1.0 request-options ─────────────────────────────────────────────
+
+mod v11 {
+    use std::time::Duration;
+
+    use reqwest::header::{HeaderMap, HeaderValue};
+
+    use super::super::options::{
+        HTTP_DEFAULT_TOTAL_TIMEOUT, ResolvedOptions, check_scheme, same_origin, strip_credentials,
+        verify_integrity,
+    };
+    use super::super::{ErrorCode, RedirectPolicy, RequestOptions, TimeoutConfig};
+
+    fn empty_options() -> RequestOptions {
+        RequestOptions {
+            timeouts: None,
+            redirect: None,
+            max_redirects: None,
+            max_response_bytes: None,
+            max_decompressed_bytes: None,
+            auto_decompress: None,
+            https_only: None,
+            integrity: None,
+        }
+    }
+
+    /// An empty `request-options` must resolve to exactly the @1.0.0 defaults:
+    /// follow redirects ≤10, 30s total timeout, 10 MB body cap, decompress on,
+    /// no https-only, no SRI. This is the contract guarantee that backs the
+    /// @1.0.0 shim delegating to the @1.1.0 backend.
+    #[test]
+    fn empty_options_reproduce_v10_defaults() {
+        let resolved = ResolvedOptions::from_options(empty_options());
+        let defaults = ResolvedOptions::v10_defaults();
+
+        assert_eq!(resolved.total_timeout, Some(HTTP_DEFAULT_TOTAL_TIMEOUT));
+        assert_eq!(resolved.connect_timeout, None);
+        assert_eq!(resolved.between_bytes_timeout, None);
+        assert!(matches!(resolved.redirect, RedirectPolicy::Follow));
+        assert_eq!(resolved.max_redirects, defaults.max_redirects);
+        assert_eq!(resolved.max_response_bytes, defaults.max_response_bytes);
+        assert!(resolved.auto_decompress);
+        assert!(!resolved.https_only);
+        assert!(resolved.integrity.is_none());
+        assert!(resolved.total_was_default());
+    }
+
+    /// Caller-set option fields override the host defaults; the buffered body
+    /// cap is clamped to the hard `MAX_GUEST_PAYLOAD_LEN` ceiling and never
+    /// raised above it.
+    #[test]
+    fn options_override_and_clamp() {
+        let opts = RequestOptions {
+            timeouts: Some(TimeoutConfig {
+                connect_ms: Some(1_000),
+                first_byte_ms: Some(2_000),
+                between_bytes_ms: Some(3_000),
+                total_ms: Some(60_000),
+            }),
+            redirect: Some(RedirectPolicy::Error),
+            max_redirects: Some(2),
+            // Above the 10 MB hard ceiling: must clamp down, not raise.
+            max_response_bytes: Some(u64::MAX),
+            max_decompressed_bytes: Some(4096),
+            auto_decompress: Some(false),
+            https_only: Some(true),
+            integrity: Some("sha256-abc".to_string()),
+        };
+        let r = ResolvedOptions::from_options(opts);
+        assert_eq!(r.connect_timeout, Some(Duration::from_millis(1_000)));
+        assert_eq!(r.first_byte_timeout, Some(Duration::from_millis(2_000)));
+        assert_eq!(r.between_bytes_timeout, Some(Duration::from_millis(3_000)));
+        assert_eq!(r.total_timeout, Some(Duration::from_millis(60_000)));
+        assert!(matches!(r.redirect, RedirectPolicy::Error));
+        assert_eq!(r.max_redirects, 2);
+        assert_eq!(
+            r.max_response_bytes,
+            crate::engine::wasm::host::util::MAX_GUEST_PAYLOAD_LEN,
+            "caller cannot raise the buffered cap above the host ceiling"
+        );
+        assert_eq!(r.max_decompressed_bytes, Some(4096));
+        assert!(!r.auto_decompress);
+        assert!(r.https_only);
+        assert_eq!(r.integrity.as_deref(), Some("sha256-abc"));
+        assert!(!r.total_was_default());
+    }
+
+    /// `https-only` rejects an http URL with `SchemeDenied` before connecting;
+    /// any non-http(s) scheme is denied unconditionally.
+    #[test]
+    fn scheme_enforcement() {
+        // https always allowed.
+        assert!(check_scheme("https://api.example.com/x", true).is_ok());
+        assert!(check_scheme("https://api.example.com/x", false).is_ok());
+        // http allowed only when https-only is off.
+        assert!(check_scheme("http://api.example.com/x", false).is_ok());
+        assert!(matches!(
+            check_scheme("http://api.example.com/x", true),
+            Err(ErrorCode::SchemeDenied)
+        ));
+        // Non-http(s) schemes are always denied.
+        for url in ["ftp://h/x", "file:///etc/passwd", "ws://h/x", "data:,hi"] {
+            assert!(
+                matches!(check_scheme(url, false), Err(ErrorCode::SchemeDenied)),
+                "scheme must be denied: {url}"
+            );
+        }
+        // Unparseable URL → InvalidRequest, not SchemeDenied.
+        assert!(matches!(
+            check_scheme("not a url", false),
+            Err(ErrorCode::InvalidRequest)
+        ));
+    }
+
+    /// Subresource-integrity: a correct digest passes; a wrong one is detected;
+    /// a malformed SRI string is an invalid request.
+    #[test]
+    fn integrity_verification() {
+        use base64::Engine as _;
+        use sha2::{Digest, Sha256};
+
+        let body = b"hello world";
+        let digest = Sha256::digest(body);
+        let b64 = base64::engine::general_purpose::STANDARD.encode(digest);
+        let sri = format!("sha256-{b64}");
+
+        // Correct digest → Ok.
+        assert!(verify_integrity(&sri, body).is_ok());
+        // Wrong body → IntegrityMismatch.
+        assert!(matches!(
+            verify_integrity(&sri, b"tampered"),
+            Err(ErrorCode::IntegrityMismatch)
+        ));
+        // Unknown algorithm → InvalidRequest.
+        assert!(matches!(
+            verify_integrity(&format!("md5-{b64}"), body),
+            Err(ErrorCode::InvalidRequest)
+        ));
+        // No dash separator → InvalidRequest.
+        assert!(matches!(
+            verify_integrity("sha256deadbeef", body),
+            Err(ErrorCode::InvalidRequest)
+        ));
+        // Non-base64 payload → InvalidRequest.
+        assert!(matches!(
+            verify_integrity("sha256-!!!notb64!!!", body),
+            Err(ErrorCode::InvalidRequest)
+        ));
+    }
+
+    /// Cross-origin detection drives credential stripping on a redirect hop.
+    #[test]
+    fn same_origin_and_credential_stripping() {
+        let a = reqwest::Url::parse("https://api.example.com/v1").unwrap();
+        let same = reqwest::Url::parse("https://api.example.com/v2").unwrap();
+        let other_host = reqwest::Url::parse("https://evil.example.com/").unwrap();
+        let other_port = reqwest::Url::parse("https://api.example.com:8443/").unwrap();
+        let other_scheme = reqwest::Url::parse("http://api.example.com/").unwrap();
+
+        assert!(same_origin(&a, &same));
+        assert!(!same_origin(&a, &other_host));
+        assert!(!same_origin(&a, &other_port));
+        assert!(!same_origin(&a, &other_scheme));
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            reqwest::header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer secret"),
+        );
+        headers.insert(
+            reqwest::header::COOKIE,
+            HeaderValue::from_static("session=abc"),
+        );
+        headers.insert("x-keep", HeaderValue::from_static("yes"));
+        strip_credentials(&mut headers);
+        assert!(!headers.contains_key(reqwest::header::AUTHORIZATION));
+        assert!(!headers.contains_key(reqwest::header::COOKIE));
+        assert!(
+            headers.contains_key("x-keep"),
+            "non-credential headers must survive a cross-origin hop"
+        );
+    }
+}
+
+/// The @1.1.0 → @1.0.0 error map: every @1.0.0 arm round-trips and the
+/// @1.1.0-only arms fold to the nearest @1.0.0 arm. A blocked redirect hop
+/// becomes `AirlockRejected` (the @1.0.0 way a redirect SSRF surfaced); a
+/// too-long chain becomes a protocol error (no @1.0.0 arm exists).
+#[test]
+fn v11_error_maps_to_v10_arm_set() {
+    use crate::engine::wasm::bindings::astrid::http1_0_0::host::ErrorCode as V10;
+
+    use super::v11_error_to_v10;
+
+    assert!(matches!(
+        v11_error_to_v10(ErrorCode::AirlockRejected),
+        V10::AirlockRejected
+    ));
+    assert!(matches!(
+        v11_error_to_v10(ErrorCode::RedirectBlocked),
+        V10::AirlockRejected
+    ));
+    assert!(matches!(
+        v11_error_to_v10(ErrorCode::TooManyRedirects),
+        V10::Protocol(_)
+    ));
+    assert!(matches!(
+        v11_error_to_v10(ErrorCode::BodyTooLarge),
+        V10::BodyTooLarge
+    ));
+    assert!(matches!(
+        v11_error_to_v10(ErrorCode::DecompressionBomb),
+        V10::BodyTooLarge
+    ));
+    assert!(matches!(
+        v11_error_to_v10(ErrorCode::SchemeDenied),
+        V10::InvalidRequest
+    ));
+    assert!(matches!(
+        v11_error_to_v10(ErrorCode::Unknown("x".into())),
+        V10::Unknown(_)
+    ));
 }
