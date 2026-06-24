@@ -4,13 +4,11 @@
 
 use std::net::{IpAddr, SocketAddr};
 use std::str::FromStr;
-use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
 
 use super::ErrorCode;
 use super::ssrf::{
-    MAX_HTTP_REDIRECTS, RedirectAction, build_redirect_policy, classify_redirect, egress_allowed,
-    egress_decision, filter_safe_addrs, is_safe_ip, literal_ip,
+    MAX_HTTP_REDIRECTS, RedirectAction, classify_redirect, egress_allowed, egress_decision,
+    filter_safe_addrs, is_safe_ip, literal_ip,
 };
 
 fn ip(s: &str) -> IpAddr {
@@ -373,65 +371,230 @@ async fn consent_grant_yields_exempt_host() {
     );
 }
 
-/// An operator-allowlisted (exempt) request must NOT follow redirects:
-/// `build_redirect_policy(true, …)` yields `Policy::none()`, so a `30x` from
-/// an allowlisted endpoint can't escape the port-scoped exemption onto a
-/// different port/host. `reqwest::redirect::Policy` is opaque, so this is a
-/// behavioural test against a loopback server that returns a redirect.
-///
-/// Binding a loopback listener is blocked in some sandboxes — skip gracefully
-/// there (mirrors the gateway e2e tests); it runs in CI where loopback binds.
-#[tokio::test]
-async fn exempt_request_does_not_follow_redirects() {
+// ── End-to-end redirect / per-hop-gate tests (unified manual-follow) ───────
+//
+// These drive the real `http_request_backend` / `http_stream_backend` against
+// a loopback test server, exercising the production manual-follow loop (no
+// reqwest redirect policy). Binding a loopback listener is blocked in some
+// sandboxes — skip gracefully there (mirrors the gateway e2e tests); CI binds.
+
+mod e2e {
+    use std::sync::Arc;
+
+    use async_trait::async_trait;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
-    let listener = match TcpListener::bind("127.0.0.1:0").await {
-        Ok(l) => l,
-        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
-            eprintln!("skipping: sandbox blocks loopback bind: {e}");
-            return;
-        },
-        Err(e) => panic!("loopback bind failed: {e}"),
-    };
-    let addr = listener.local_addr().unwrap();
+    use crate::engine::wasm::host::http::tests::ErrorCode;
+    use crate::engine::wasm::test_fixtures::minimal_host_state;
+    use crate::security::{AllowAllGate, CapsuleSecurityGate, IdentityOperation};
 
-    // One-shot server: reply 302 redirecting to a *different* port. A client
-    // that follows would try 127.0.0.1:1 (nothing there); one that does not
-    // returns this 302 verbatim.
-    let server = tokio::spawn(async move {
-        if let Ok((mut sock, _)) = listener.accept().await {
-            let mut buf = [0u8; 1024];
-            let _ = sock.read(&mut buf).await;
-            let resp =
-                b"HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:1/\r\nContent-Length: 0\r\n\r\n";
-            let _ = sock.write_all(resp).await;
-            let _ = sock.flush().await;
+    use super::super::{HttpMethod, HttpRequestData, RedirectPolicy, RequestOptions};
+
+    /// A gate that denies any HTTP request whose URL contains `needle`, and
+    /// permits everything else. Used to prove the async `check_http_request`
+    /// gate runs on a per-hop URL inside the follow loop.
+    #[derive(Debug)]
+    struct HostDenyGate {
+        needle: String,
+    }
+
+    #[async_trait]
+    impl CapsuleSecurityGate for HostDenyGate {
+        async fn check_http_request(
+            &self,
+            capsule_id: &str,
+            method: &str,
+            url: &str,
+        ) -> Result<(), String> {
+            if url.contains(&self.needle) {
+                Err(format!(
+                    "capsule '{capsule_id}' denied: {method} {url} (HostDenyGate)"
+                ))
+            } else {
+                Ok(())
+            }
         }
-    });
 
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(5))
-        .redirect(build_redirect_policy(
-            true,
-            Arc::new(AtomicBool::new(false)),
-        ))
-        .build()
-        .unwrap();
+        async fn check_file_read(
+            &self,
+            _capsule_id: &str,
+            _path: &str,
+            _principal_home: Option<&std::path::Path>,
+        ) -> Result<(), String> {
+            Ok(())
+        }
 
-    let resp = client
-        .get(format!("http://{addr}/"))
-        .send()
+        async fn check_file_write(
+            &self,
+            _capsule_id: &str,
+            _path: &str,
+            _principal_home: Option<&std::path::Path>,
+        ) -> Result<(), String> {
+            Ok(())
+        }
+
+        async fn check_host_process(
+            &self,
+            _capsule_id: &str,
+            _command: &str,
+        ) -> Result<(), String> {
+            Ok(())
+        }
+
+        async fn check_identity(
+            &self,
+            _capsule_id: &str,
+            _operation: IdentityOperation,
+        ) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    /// Spawn a one-shot loopback server returning `response` verbatim. Returns
+    /// `None` (test should skip) if the sandbox blocks the loopback bind.
+    async fn one_shot_server(
+        response: &'static [u8],
+    ) -> Option<(std::net::SocketAddr, tokio::task::JoinHandle<()>)> {
+        let listener = match TcpListener::bind("127.0.0.1:0").await {
+            Ok(l) => l,
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                eprintln!("skipping: sandbox blocks loopback bind: {e}");
+                return None;
+            },
+            Err(e) => panic!("loopback bind failed: {e}"),
+        };
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            if let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = [0u8; 1024];
+                let _ = sock.read(&mut buf).await;
+                let _ = sock.write_all(response).await;
+                let _ = sock.flush().await;
+            }
+        });
+        Some((addr, handle))
+    }
+
+    fn get_request(url: String) -> HttpRequestData {
+        HttpRequestData {
+            url,
+            method: HttpMethod::Get,
+            headers: Vec::new(),
+            body: None,
+        }
+    }
+
+    fn follow_opts() -> RequestOptions {
+        RequestOptions {
+            timeouts: None,
+            redirect: Some(RedirectPolicy::Follow),
+            max_redirects: None,
+            max_response_bytes: None,
+            max_decompressed_bytes: None,
+            auto_decompress: None,
+            https_only: None,
+            integrity: None,
+        }
+    }
+
+    /// EXEMPT-NO-FOLLOW on the unified BUFFERED path: an operator-allowlisted
+    /// loopback endpoint that returns a 302 is NOT followed — the 302 is the
+    /// terminal response. Following would let a `30x` escape the port-scoped
+    /// allowlist onto another port/host. `redirect = Follow` is set explicitly
+    /// to prove the exempt rule overrides the follow policy.
+    #[tokio::test]
+    async fn exempt_request_does_not_follow_redirects_buffered() {
+        let Some((addr, server)) = one_shot_server(
+            b"HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:1/\r\nContent-Length: 0\r\n\r\n",
+        )
         .await
-        .expect("exempt request should return the 302 itself, not follow it");
+        else {
+            return;
+        };
 
-    assert_eq!(
-        resp.status().as_u16(),
-        302,
-        "exempt request must not follow redirects (would widen the port-scoped allowlist)"
-    );
+        let rt = tokio::runtime::Handle::current();
+        let mut state = minimal_host_state(rt);
+        state.security = Some(Arc::new(AllowAllGate));
+        state.local_egress = vec![format!("127.0.0.1:{}", addr.port())];
 
-    let _ = server.await;
+        let resp = state
+            .http_request_backend(
+                get_request(format!("http://{addr}/")),
+                super::super::options::ResolvedOptions::from_options(follow_opts()),
+            )
+            .await
+            .expect("exempt 302 should be returned, not followed");
+
+        assert_eq!(
+            resp.status, 302,
+            "exempt request must not follow redirects (would widen the port-scoped allowlist)"
+        );
+        let _ = server.await;
+    }
+
+    /// EXEMPT-NO-FOLLOW on the unified STREAMING path: same rule via
+    /// `http_stream_backend` — the stream resource carries the 302 status, the
+    /// redirect is not followed.
+    #[tokio::test]
+    async fn exempt_stream_does_not_follow_redirects() {
+        let Some((addr, server)) = one_shot_server(
+            b"HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:1/\r\nContent-Length: 0\r\n\r\n",
+        )
+        .await
+        else {
+            return;
+        };
+
+        let rt = tokio::runtime::Handle::current();
+        let mut state = minimal_host_state(rt);
+        state.security = Some(Arc::new(AllowAllGate));
+        state.local_egress = vec![format!("127.0.0.1:{}", addr.port())];
+
+        let resource = state
+            .http_stream_backend(
+                get_request(format!("http://{addr}/")),
+                super::super::options::ResolvedOptions::from_options(follow_opts()),
+            )
+            .await
+            .expect("exempt streaming 302 should open a stream, not follow");
+
+        assert_eq!(
+            super::super::backend::stream_status(&mut state, resource.rep()),
+            302,
+            "exempt streaming request must not follow redirects"
+        );
+        let _ = server.await;
+    }
+
+    /// THE GAP CLOSED: the STREAMING follow path now re-runs the async
+    /// `check_http_request` gate on every hop via the shared manual-follow
+    /// loop (`follow_redirects` → `send_one_hop`). This test denies the
+    /// request URL at the gate and confirms `http_stream_backend` rejects with
+    /// `CapabilityDenied` — the gate runs in `send_one_hop`, the exact per-hop
+    /// call the redirect loop makes for the redirect TARGET on every hop. No
+    /// network is reached (the gate denies before connect), so it is hermetic.
+    #[tokio::test]
+    async fn streaming_request_runs_async_gate_per_hop() {
+        let rt = tokio::runtime::Handle::current();
+        let mut state = minimal_host_state(rt);
+        state.security = Some(Arc::new(HostDenyGate {
+            needle: "denied.example".to_string(),
+        }));
+
+        let err = state
+            .http_stream_backend(
+                get_request("https://denied.example.invalid/v1/stream".to_string()),
+                super::super::options::ResolvedOptions::from_options(follow_opts()),
+            )
+            .await
+            .expect_err("the gate must deny this host on the streaming path");
+
+        assert!(
+            matches!(err, ErrorCode::CapabilityDenied),
+            "streaming path must route through the async gate (got {err:?})"
+        );
+    }
 }
 
 // ── @1.1.0 request-options ─────────────────────────────────────────────

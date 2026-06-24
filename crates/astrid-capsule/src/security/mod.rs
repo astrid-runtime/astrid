@@ -12,6 +12,8 @@ mod manifest_gate;
 mod test_gates;
 
 pub(crate) use manifest_gate::{ManifestSecurityGate, net_connect_pattern_matches};
+#[cfg(test)]
+pub(crate) use test_gates::AllowAllGate;
 
 /// Identity operations that can be gated by the security gate.
 ///

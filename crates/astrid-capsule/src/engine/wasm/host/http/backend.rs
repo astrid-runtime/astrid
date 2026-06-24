@@ -1,9 +1,13 @@
-//! Shared HTTP backend behind both `astrid:http@1.0.0` and `@1.1.0`. The
-//! buffered path follows redirects manually, re-running the async security gate
-//! and SSRF airlock on every hop and stripping credentials cross-origin; the
-//! streaming path delegates per-hop airlocking to reqwest's redirect policy.
-//! Stream-resource method bodies are shared here too, keyed by the resource
-//! table `rep` so both versions' marker types index one `ActiveHttpStream`.
+//! Shared HTTP backend behind both `astrid:http@1.0.0` and `@1.1.0`. BOTH the
+//! buffered and streaming paths follow redirects manually through one driver
+//! (`follow_redirects` over `send_one_hop`), so every hop — initial or redirect
+//! target — re-runs the full airlock: scheme check, the async `check_http_request`
+//! gate, and the egress airlock, plus cross-origin credential stripping. reqwest
+//! never follows redirects on either path. The only divergence is the terminal
+//! action: buffer the body (buffered) or hand the unread response to a stream
+//! resource (streaming). Stream-resource method bodies are shared here too,
+//! keyed by the resource table `rep` so both versions' marker types index one
+//! `ActiveHttpStream`.
 
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -18,9 +22,7 @@ use crate::engine::wasm::host_state::HostState;
 use super::options::{
     ResolvedOptions, check_scheme, same_origin, strip_credentials, verify_integrity,
 };
-use super::ssrf::{
-    RedirectAction, SafeDnsResolver, airlock_or, classify_redirect, streaming_redirect_policy,
-};
+use super::ssrf::{RedirectAction, SafeDnsResolver, airlock_or, classify_redirect};
 use super::{
     ErrorCode, HttpMethod, HttpRequestData, HttpResponseData, HttpStream, KeyValuePair,
     RedirectPolicy, ResponseMeta,
@@ -42,22 +44,6 @@ pub(super) fn map_method(m: &HttpMethod) -> Result<reqwest::Method, ErrorCode> {
             reqwest::Method::from_bytes(s.as_bytes()).map_err(|_| ErrorCode::InvalidRequest)?
         },
     })
-}
-
-/// Method name as a header-safe string for security-gate checks.
-pub(super) fn method_name(m: &HttpMethod) -> &str {
-    match m {
-        HttpMethod::Get => "GET",
-        HttpMethod::Head => "HEAD",
-        HttpMethod::Post => "POST",
-        HttpMethod::Put => "PUT",
-        HttpMethod::Delete => "DELETE",
-        HttpMethod::Connect => "CONNECT",
-        HttpMethod::Options => "OPTIONS",
-        HttpMethod::Trace => "TRACE",
-        HttpMethod::Patch => "PATCH",
-        HttpMethod::Other(s) => s.as_str(),
-    }
 }
 
 fn build_headers(raw: &[KeyValuePair]) -> Result<HeaderMap, ErrorCode> {
@@ -119,19 +105,29 @@ const HTTP_STREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 /// point. Overridable per request via `timeout-config.between-bytes-ms`.
 const HTTP_STREAM_READ_TIMEOUT: Duration = Duration::from_secs(120);
 
-/// Outcome of one wire request: the response plus the wire-byte count
-/// (content-length when present; otherwise filled in after buffering).
+/// Outcome of one wire request: the response, the wire-byte count
+/// (content-length when present; otherwise filled in after buffering), and
+/// whether this hop's endpoint was operator-exempt (pre-blessed / consent-
+/// granted local egress). The exempt flag drives the exempt-no-follow rule:
+/// an exempt endpoint must not follow redirects, because the resolver
+/// exemption is host-only and a `30x` to a different port/host would escape
+/// the port-scoped allowlist.
 struct WireResponse {
     response: reqwest::Response,
     /// Best-effort bytes-on-wire before decompression (content-length header).
     content_length: Option<u64>,
+    /// True if the request endpoint matched the operator local-egress
+    /// allowlist (or a runtime consent grant) — i.e. `egress_decision_*`
+    /// returned an exempt host.
+    exempt: bool,
 }
 
 impl HostState {
-    /// Build a reqwest client for ONE hop. Redirects are always `Policy::none()`
-    /// on the buffered path — the host follows manually so every hop re-runs
-    /// the async security gate and the airlock. The streaming path passes its
-    /// own redirect policy via `redirect_policy`.
+    /// Build a reqwest client for ONE hop. The caller always passes
+    /// `Policy::none()` (both the buffered and streaming paths follow manually),
+    /// so reqwest never follows a redirect on its own and every hop re-enters
+    /// `send_one_hop` for a full airlock re-check. `redirect_policy` is a
+    /// parameter only to keep the client builder generic.
     fn build_http_client(
         &self,
         opts: &ResolvedOptions,
@@ -175,10 +171,11 @@ impl HostState {
             .map_err(|e| ErrorCode::Unknown(format!("client: {e}")))
     }
 
-    /// Send ONE request hop: enforce scheme, run the security gate, pre-flight
-    /// egress, build a per-hop client, and send (no body read). Shared by the
-    /// buffered manual-redirect loop. `exempt_host` is re-evaluated per hop, so
-    /// a redirect to a different host re-runs the full airlock.
+    /// Send ONE request hop: enforce scheme, run the async security gate,
+    /// pre-flight egress, build a per-hop client, and send (no body read).
+    /// Shared by the unified manual-redirect loop on BOTH the buffered and
+    /// streaming paths. The egress decision is re-evaluated per hop, so a
+    /// redirect to a different host re-runs the full airlock.
     async fn send_one_hop(
         &mut self,
         url: &str,
@@ -195,9 +192,12 @@ impl HostState {
         check_http_security(&security, capsule_id, url, method.as_str(), &io_semaphore).await?;
 
         let exempt_host = self.egress_decision_with_consent(url)?;
+        let exempt = exempt_host.is_some();
 
         let tripped = Arc::new(AtomicBool::new(false));
-        // Manual redirect following: reqwest must NOT follow on its own.
+        // Manual redirect following on BOTH the buffered and streaming paths:
+        // reqwest must NEVER follow on its own, so every hop re-enters this fn
+        // and re-runs the full airlock (scheme + async gate + egress).
         let client = self.build_http_client(
             opts,
             exempt_host,
@@ -219,19 +219,37 @@ impl HostState {
         Ok(WireResponse {
             response,
             content_length,
+            exempt,
         })
     }
 
-    /// The shared buffered backend behind `@1.0.0 http_request` and
-    /// `@1.1.0 http_request_opts`. Follows redirects MANUALLY per `opts`
-    /// (re-validating each hop), buffers the body under the response cap,
-    /// verifies integrity, and returns the `@1.1.0` response with metadata.
-    pub(super) async fn http_request_backend(
+    /// Shared manual redirect-follow driver for BOTH the buffered and streaming
+    /// backends. Sends the first hop, then follows redirects per `opts`,
+    /// re-running the full airlock on every hop via [`send_one_hop`] (scheme +
+    /// async `check_http_request` gate + egress airlock). reqwest never follows
+    /// on either path.
+    ///
+    /// Returns the UNREAD terminal [`WireResponse`] plus the redirect-hop count
+    /// and the final URL. The caller decides the terminal action: buffer the
+    /// body (buffered) or hand the live response to a stream resource
+    /// (streaming).
+    ///
+    /// Redirect semantics:
+    /// - `Manual` → return the first 3xx as the terminal response.
+    /// - `Error` → a 3xx-with-Location is `RedirectBlocked`.
+    /// - `Follow` → bounded by `max_redirects` (`TooManyRedirects` on exceed);
+    ///   each `Location` is resolved relative→absolute, IP-literal targets are
+    ///   airlock-blocked (`RedirectBlocked`), `Authorization`/`Cookie` are
+    ///   stripped cross-origin, and the method is downgraded per RFC 7231 on
+    ///   301/302/303.
+    /// - EXEMPT-NO-FOLLOW (both paths): if the hop that produced the 3xx was
+    ///   operator-exempt, the response is returned as terminal without
+    ///   following — the port-scoped allowlist must not widen via a redirect.
+    async fn follow_redirects(
         &mut self,
-        request: HttpRequestData,
-        opts: ResolvedOptions,
-    ) -> Result<HttpResponseData, ErrorCode> {
-        let started = Instant::now();
+        request: &HttpRequestData,
+        opts: &ResolvedOptions,
+    ) -> Result<(WireResponse, u32, reqwest::Url), ErrorCode> {
         let mut method = map_method(&request.method)?;
         let mut headers = build_headers(&request.headers)?;
         let mut current_url =
@@ -239,7 +257,7 @@ impl HostState {
         // The body is forwarded across redirect hops that preserve the method
         // (307/308). On 301/302/303 the method is downgraded to GET and the
         // body dropped — the RFC 7231 behaviour reqwest's default policy
-        // already implemented, preserved here in the manual loop.
+        // implemented, preserved here in the manual loop.
         let mut body = request.body.clone();
         let mut redirect_count: u32 = 0;
 
@@ -250,25 +268,31 @@ impl HostState {
                     &method,
                     &headers,
                     body.as_deref(),
-                    &opts,
+                    opts,
                 )
                 .await?;
             let status = wire.response.status();
 
             // A 3xx WITH a Location is a redirect; anything else (or a 3xx with
-            // no Location) is the final response.
+            // no Location) is the terminal response.
             if status.is_redirection()
                 && let Some(location) = wire.response.headers().get(reqwest::header::LOCATION)
             {
                 match opts.redirect {
                     // Return the 3xx as-is.
-                    RedirectPolicy::Manual => {
-                        return self
-                            .finalize_buffered(wire, &opts, started, &current_url, redirect_count)
-                            .await;
-                    },
+                    RedirectPolicy::Manual => return Ok((wire, redirect_count, current_url)),
                     RedirectPolicy::Error => return Err(ErrorCode::RedirectBlocked),
                     RedirectPolicy::Follow => {
+                        // Exempt-no-follow: an operator-blessed (allowlisted /
+                        // consent-granted) endpoint must not redirect past its
+                        // port-scoped allowlist — the resolver exemption is
+                        // host-only, so a 30x to a different port/host would
+                        // widen it. Return the 3xx as the terminal response
+                        // instead of following. (Only `Follow` is affected;
+                        // `Error`/`Manual` already encode the caller's intent.)
+                        if wire.exempt {
+                            return Ok((wire, redirect_count, current_url));
+                        }
                         if redirect_count as usize >= opts.max_redirects {
                             return Err(ErrorCode::TooManyRedirects);
                         }
@@ -315,11 +339,25 @@ impl HostState {
                 }
             }
 
-            // Terminal response.
-            return self
-                .finalize_buffered(wire, &opts, started, &current_url, redirect_count)
-                .await;
+            // Terminal (non-redirect) response.
+            return Ok((wire, redirect_count, current_url));
         }
+    }
+
+    /// The shared buffered backend behind `@1.0.0 http_request` and
+    /// `@1.1.0 http_request_opts`. Follows redirects MANUALLY via
+    /// [`follow_redirects`](Self::follow_redirects) (re-validating each hop
+    /// through the full airlock), buffers the terminal body under the response
+    /// cap, verifies integrity, and returns the `@1.1.0` response with metadata.
+    pub(super) async fn http_request_backend(
+        &mut self,
+        request: HttpRequestData,
+        opts: ResolvedOptions,
+    ) -> Result<HttpResponseData, ErrorCode> {
+        let started = Instant::now();
+        let (wire, redirect_count, final_url) = self.follow_redirects(&request, &opts).await?;
+        self.finalize_buffered(wire, &opts, started, &final_url, redirect_count)
+            .await
     }
 
     /// Buffer the body of a terminal response under the caps, verify integrity,
@@ -335,6 +373,7 @@ impl HostState {
         let WireResponse {
             response,
             content_length,
+            exempt: _,
         } = wire;
         let status = response.status().as_u16();
 
@@ -396,10 +435,12 @@ impl HostState {
     }
 
     /// Shared streaming backend behind `@1.0.0 http_stream_start` and
-    /// `@1.1.0 http_stream_start_opts`. Redirects on the streaming path are
-    /// handled by reqwest's airlock policy (the body cannot be buffered to
-    /// re-issue, so the per-hop resolver airlock + literal block is the
-    /// enforcement point — same posture as `@1.0.0`).
+    /// `@1.1.0 http_stream_start_opts`. Redirects are followed MANUALLY via the
+    /// same [`follow_redirects`](Self::follow_redirects) driver as the buffered
+    /// path, so EVERY streaming redirect hop re-runs the full airlock (scheme +
+    /// async `check_http_request` gate + egress). The only divergence is the
+    /// terminal action: the unread response is handed to a stream resource
+    /// instead of being buffered.
     pub(super) async fn http_stream_backend(
         &mut self,
         request: HttpRequestData,
@@ -417,70 +458,28 @@ impl HostState {
             return Err(ErrorCode::Quota);
         }
 
-        check_scheme(&request.url, opts.https_only)?;
-
-        let capsule_id = self.capsule_id.as_str().to_owned();
-        let security = self.security.clone();
-        let io_semaphore = self.io_semaphore.clone();
-        check_http_security(
-            &security,
-            capsule_id,
-            &request.url,
-            method_name(&request.method),
-            &io_semaphore,
-        )
-        .await?;
-
-        let exempt_host = self.egress_decision_with_consent(&request.url)?;
-
-        let tripped = Arc::new(AtomicBool::new(false));
-        // Streaming redirect policy: `error`/`manual` refuse to follow (return
-        // the first response); `follow` uses the per-hop airlock policy bounded
-        // by the caller's max-redirects. An exempt endpoint never follows
-        // (port-scoped allowlist must not widen).
-        let redirect_policy = match opts.redirect {
-            RedirectPolicy::Error | RedirectPolicy::Manual => reqwest::redirect::Policy::none(),
-            RedirectPolicy::Follow if exempt_host.is_some() => reqwest::redirect::Policy::none(),
-            RedirectPolicy::Follow => {
-                streaming_redirect_policy(tripped.clone(), opts.max_redirects)
-            },
-        };
-
-        // Connect timeout: caller override, else the streaming default.
+        // Streaming timeout shape: a per-chunk read loop, not a whole-request
+        // deadline. Apply the streaming connect default when the caller set
+        // none, and clear the DEFAULT total so a long-lived stream isn't cut at
+        // 30s (an explicit caller `total-ms` is honoured). The per-chunk read
+        // timeout comes from `between-bytes-ms`, else the streaming default.
         let mut stream_opts = opts.clone();
         if stream_opts.connect_timeout.is_none() {
             stream_opts.connect_timeout = Some(HTTP_STREAM_CONNECT_TIMEOUT);
         }
-        // The streaming path uses a per-chunk read loop, not a whole-request
-        // timeout — clear the DEFAULT total so a long stream isn't cut at 30s.
-        // An explicit caller `total-ms` is honoured.
         if opts.total_was_default() {
             stream_opts.total_timeout = None;
         }
+        let read_timeout = opts
+            .between_bytes_timeout
+            .unwrap_or(HTTP_STREAM_READ_TIMEOUT);
 
-        let client =
-            self.build_http_client(&stream_opts, exempt_host, tripped.clone(), redirect_policy)?;
+        // Manual follow with `stream_opts` so connect/total timeouts apply to
+        // every hop. The terminal response is returned UNREAD.
+        let (wire, _redirect_count, _final_url) =
+            self.follow_redirects(&request, &stream_opts).await?;
 
-        let method = map_method(&request.method)?;
-        let headers = build_headers(&request.headers)?;
-        let mut request_builder = client.request(method, &request.url).headers(headers);
-        if let Some(body) = request.body {
-            request_builder = request_builder.body(body);
-        }
-
-        let response =
-            util::bounded_await(&io_semaphore, async move { request_builder.send().await })
-                .await
-                .map_err(|e| airlock_or(&tripped, &e))?;
-
-        // `error` policy: a 3xx that wasn't followed is a blocked redirect.
-        if matches!(opts.redirect, RedirectPolicy::Error)
-            && response.status().is_redirection()
-            && response.headers().contains_key(reqwest::header::LOCATION)
-        {
-            return Err(ErrorCode::RedirectBlocked);
-        }
-
+        let response = wire.response;
         let status = response.status().as_u16();
         let mut resp_headers = Vec::new();
         for (k, v) in response.headers() {
@@ -491,10 +490,6 @@ impl HostState {
                 });
             }
         }
-
-        let read_timeout = opts
-            .between_bytes_timeout
-            .unwrap_or(HTTP_STREAM_READ_TIMEOUT);
 
         let active = ActiveHttpStream {
             response: Arc::new(tokio::sync::Mutex::new(response)),
