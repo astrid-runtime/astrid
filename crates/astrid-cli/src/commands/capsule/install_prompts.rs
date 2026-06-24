@@ -279,6 +279,11 @@ pub(crate) async fn cli_elicit_handler(mut receiver: EventReceiver, event_bus: E
         };
 
         let request_id = *request_id;
+        // The host waiter authorizes the reply against the principal it stamped
+        // on the request — echo it back so the same-principal check accepts our
+        // answer (a missing principal would be rejected as a cross-principal
+        // reply and the install would hang out the elicit timeout).
+        let request_principal = message.principal.clone();
         let prompt = field.description.as_ref().map_or_else(
             || format!("[{capsule_id}] {}", field.key),
             |d| format!("[{capsule_id}] {d}"),
@@ -287,18 +292,40 @@ pub(crate) async fn cli_elicit_handler(mut receiver: EventReceiver, event_bus: E
         let (value, values) =
             prompt_stdin_field(prompt, field.field_type.clone(), field.default.clone()).await;
 
-        let response_topic = format!("astrid.v1.elicit.response.{request_id}");
-        let response = IpcPayload::ElicitResponse {
-            request_id,
-            value,
-            values,
-        };
-        let msg = IpcMessage::new(response_topic, response, uuid::Uuid::nil());
+        let msg =
+            build_elicit_response_msg(request_id, request_principal.as_deref(), value, values);
         event_bus.publish(AstridEvent::Ipc {
             message: msg,
             metadata: EventMetadata::default(),
         });
     }
+}
+
+/// Build the `ElicitResponse` IPC message for the in-process install answerer,
+/// echoing the originating `request_principal` so the host waiter's
+/// same-principal check accepts it.
+///
+/// Extracted as a pure function so the principal-echo invariant is testable
+/// without driving the stdin-blocking [`cli_elicit_handler`] loop. A `None`
+/// principal yields an unstamped message — which the host now rejects — so the
+/// echo here is load-bearing for the in-process lifecycle-install flow.
+fn build_elicit_response_msg(
+    request_id: uuid::Uuid,
+    request_principal: Option<&str>,
+    value: Option<String>,
+    values: Option<Vec<String>>,
+) -> IpcMessage {
+    let response_topic = format!("astrid.v1.elicit.response.{request_id}");
+    let response = IpcPayload::ElicitResponse {
+        request_id,
+        value,
+        values,
+    };
+    let mut msg = IpcMessage::new(response_topic, response, uuid::Uuid::nil());
+    if let Some(p) = request_principal {
+        msg = msg.with_principal(p);
+    }
+    msg
 }
 
 /// Prompt the user on stdin for a single elicit field (runs in a blocking thread).
@@ -546,5 +573,47 @@ type = "text"
         let pos = |k: &str| order.iter().position(|x| x == k).unwrap();
         assert!(pos("a") < pos("b"));
         assert!(pos("b") < pos("c"));
+    }
+
+    /// REGRESSION: the in-process install answerer must echo the request's
+    /// principal onto its reply. The host elicit waiter now rejects any reply
+    /// whose principal differs from the one it stamped on the request, so a
+    /// dropped principal would hang `astrid capsule install` for the full
+    /// elicit timeout. Fails if `build_elicit_response_msg` stops stamping.
+    #[test]
+    fn elicit_reply_echoes_request_principal() {
+        let request_id = uuid::Uuid::new_v4();
+        let msg = build_elicit_response_msg(
+            request_id,
+            Some("default"),
+            Some("answer".to_string()),
+            None,
+        );
+        assert_eq!(
+            msg.principal.as_deref(),
+            Some("default"),
+            "reply must carry the originating principal for the host's same-principal check"
+        );
+        assert_eq!(msg.topic, format!("astrid.v1.elicit.response.{request_id}"));
+        match msg.payload {
+            IpcPayload::ElicitResponse {
+                request_id: got,
+                value,
+                values,
+            } => {
+                assert_eq!(got, request_id);
+                assert_eq!(value.as_deref(), Some("answer"));
+                assert!(values.is_none());
+            },
+            other => panic!("expected ElicitResponse, got {other:?}"),
+        }
+    }
+
+    /// A request with no principal (system-originated) yields an unstamped
+    /// reply — the helper must not fabricate one.
+    #[test]
+    fn elicit_reply_unstamped_when_request_has_no_principal() {
+        let msg = build_elicit_response_msg(uuid::Uuid::new_v4(), None, None, None);
+        assert!(msg.principal.is_none());
     }
 }
