@@ -253,9 +253,10 @@ pub struct GatewayState {
     /// `GetCapsuleMetadata`. `Some` when co-located with the kernel
     /// (daemon-spawned); `None` for standalone / test constructors, in which
     /// case routes that use it skip the degradation gate and fall through to
-    /// the bus. `GET /api/agent/sessions` uses it to answer `501` when no
-    /// loaded session capsule implements the 1.1 `list` verb, instead of
-    /// waiting out the bus timeout.
+    /// the bus. The session thread-management routes (`list` / `get_meta` /
+    /// `update` / `delete` / `search`) use it to answer `501` when no loaded
+    /// session capsule implements the 1.1 verbs, instead of waiting out the
+    /// bus timeout.
     pub topic_probe: Option<astrid_core::kernel_api::CapsuleTopicProbe>,
     /// Optional override for the registry round-trip wait budget. `None`
     /// in production, where the model routes fall back to their built-in

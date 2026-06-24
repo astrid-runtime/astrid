@@ -72,7 +72,7 @@ const CAPSULE_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Request topic the gateway publishes a session-list request on. Its
 /// presence in a loaded capsule's interceptor events is also the
-/// capability probe for [`ensure_list_supported`] — a session capsule
+/// capability probe for [`ensure_session_mgmt_supported`] — a session capsule
 /// that implements the 1.1 `list` verb subscribes to exactly this topic;
 /// a 1.0 (transcript-only) capsule does not.
 const TOPIC_LIST_REQUEST: &str = "session.v1.request.list";
@@ -90,7 +90,7 @@ const TOPIC_MESSAGES_REQUEST: &str = "session.v1.request.get_messages";
 const TOPIC_MESSAGES_RESPONSE_PREFIX: &str = "session.v1.response.get_messages";
 
 /// Request topic for one thread's metadata. 1.1 verb (its presence in a
-/// loaded capsule is implied by [`ensure_list_supported`]'s `list` probe —
+/// loaded capsule is implied by [`ensure_session_mgmt_supported`]'s `list` probe —
 /// a 1.1 session capsule that handles `list` also handles `get_meta`).
 const TOPIC_GET_META_REQUEST: &str = "session.v1.request.get_meta";
 /// Response-topic prefix for a `get_meta` reply.
@@ -328,7 +328,7 @@ pub async fn list_sessions(
     // with an honest 501 rather than hanging to the bus timeout on a verb
     // nobody handles. The transcript route needs no such gate — its verb
     // exists in 1.0.
-    ensure_list_supported(&state).await?;
+    ensure_session_mgmt_supported(&state).await?;
     let correlation_id = Uuid::new_v4().to_string();
     let payload = build_list_payload(
         &correlation_id,
@@ -448,7 +448,7 @@ pub async fn get_session(
     // `get_meta` is a 1.1 verb, so gate it like update/delete/search: a
     // pre-1.1 capsule answers an honest 501 rather than hanging to the bus
     // timeout. (The transcript route needs no gate — `get_messages` is 1.0.)
-    ensure_list_supported(&state).await?;
+    ensure_session_mgmt_supported(&state).await?;
     let bus = require_bus(&state)?;
     let correlation_id = Uuid::new_v4().to_string();
     let payload = serde_json::json!({
@@ -479,7 +479,7 @@ pub async fn get_session(
 /// forwarded to the capsule, so an absent key leaves the field unchanged,
 /// a present key sets it, and `""` clears it (the capsule owns that
 /// semantics; the gateway only decides *which keys to forward*). Gated on
-/// a 1.1 session capsule via [`ensure_list_supported`]. A `null` `session`
+/// a 1.1 session capsule via [`ensure_session_mgmt_supported`]. A `null` `session`
 /// in the reply (thread not in the caller's namespace) is a **404**.
 #[utoipa::path(
     patch,
@@ -512,7 +512,7 @@ pub async fn update_session(
     metrics::counter!("astrid_gateway_agent_sessions_update_total").increment(1);
 
     validate_session_id(&id)?;
-    ensure_list_supported(&state).await?;
+    ensure_session_mgmt_supported(&state).await?;
     let bus = require_bus(&state)?;
 
     // Read the body as a raw JSON object so we can forward ONLY the keys
@@ -570,7 +570,7 @@ pub async fn delete_session(
     metrics::counter!("astrid_gateway_agent_sessions_delete_total").increment(1);
 
     validate_session_id(&id)?;
-    ensure_list_supported(&state).await?;
+    ensure_session_mgmt_supported(&state).await?;
     let bus = require_bus(&state)?;
     let correlation_id = Uuid::new_v4().to_string();
     let payload = serde_json::json!({
@@ -628,7 +628,7 @@ pub async fn search_sessions(
 
     let q = validate_search_query(&query.q)?;
     let limit = resolve_search_limit(query.limit)?;
-    ensure_list_supported(&state).await?;
+    ensure_session_mgmt_supported(&state).await?;
     let bus = require_bus(&state)?;
     let correlation_id = Uuid::new_v4().to_string();
     let payload = build_search_payload(
@@ -668,9 +668,11 @@ fn require_bus(state: &GatewayState) -> GatewayResult<Arc<EventBus>> {
 
 /// Gate the list route on the session `list` capability being present in
 /// the loaded capsule set, so a mixed 1.0/1.1 fleet behaves honestly: a
-/// pre-1.1 session capsule (which has no `list` handler) yields an
-/// immediate `NotImplemented` (501) instead of waiting out the bus
-/// timeout on a verb nobody handles.
+/// pre-1.1 session capsule yields an immediate `NotImplemented` (501) on the
+/// 1.1 thread-management routes (`list` / `get_meta` / `update` / `delete` /
+/// `search`) instead of waiting out the bus timeout on a verb nobody handles.
+/// It probes the `list` verb specifically as a proxy — the whole 1.1 verb set
+/// ships in one capsule, so a `list` handler implies all of them.
 ///
 /// Uses the in-process [`CapsuleTopicProbe`] — a cap-free read of the live
 /// registry, the same approach `POST /api/agent/prompt` takes for its
@@ -680,13 +682,13 @@ fn require_bus(state: &GatewayState) -> GatewayResult<Arc<EventBus>> {
 /// caller and leak the capsule inventory). When the probe is absent (a
 /// standalone gateway with no kernel), the gate is skipped and the bus
 /// round-trip governs the outcome.
-async fn ensure_list_supported(state: &GatewayState) -> GatewayResult<()> {
+async fn ensure_session_mgmt_supported(state: &GatewayState) -> GatewayResult<()> {
     if let Some(probe) = &state.topic_probe
         && !probe.is_subscribed(TOPIC_LIST_REQUEST).await
     {
         return Err(GatewayError::NotImplemented(
-            "session listing requires a session capsule that implements the 1.1 \
-             `list` verb; none is loaded"
+            "no loaded session capsule implements the 1.1 conversation-management \
+             verbs (list / get_meta / update / delete / search)"
                 .into(),
         ));
     }
