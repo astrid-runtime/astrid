@@ -54,6 +54,11 @@ pub(crate) fn remove_capsule(
     std::fs::remove_dir_all(&target_dir)
         .with_context(|| format!("failed to remove {}", target_dir.display()))?;
 
+    // Clear the install-time capability approval (#995) so a removed capsule's
+    // approval cannot silently carry over to a different capsule later
+    // reinstalled under the same id.
+    clear_capsule_approval(&home, name);
+
     // Only delete user configuration (API keys, env vars) with --purge.
     // By default, env.json is preserved so reinstall skips prompting.
     if purge {
@@ -77,6 +82,28 @@ pub(crate) fn remove_capsule(
     }
 
     Ok(())
+}
+
+/// Best-effort removal of the install-time capability approval record for
+/// `name` under the install principal (#995).
+///
+/// Called on every uninstall so a removed capsule's approval does not silently
+/// carry over to a different capsule later reinstalled under the same id. A
+/// failure is logged, never propagated: a stale record is non-fatal (the
+/// load-time fingerprint check rejects a different capability surface anyway),
+/// and the capsule directory is already gone.
+fn clear_capsule_approval(home: &AstridHome, name: &str) {
+    if let Err(e) = astrid_capsule::security::approval::remove(
+        home,
+        astrid_capsule_install::install_principal(),
+        name,
+    ) {
+        tracing::warn!(
+            capsule = %name,
+            error = %e,
+            "failed to remove capability approval record during uninstall"
+        );
+    }
 }
 
 /// A blocked removal: the target capsule is the sole provider of a capability
@@ -361,6 +388,37 @@ mod tests {
             !env_path.exists(),
             "env.json should be deleted when purge=true"
         );
+    }
+
+    #[test]
+    fn clear_capsule_approval_removes_record_on_uninstall() {
+        use astrid_capsule::security::approval;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let home = AstridHome::from_path(tmp.path());
+        let principal = astrid_capsule_install::install_principal();
+        let fp = approval::CapabilityFingerprint::new("deadbeef");
+
+        // Approve, confirm it sticks, then run the uninstall cleanup.
+        approval::approve(&home, &principal, "gone", &fp).unwrap();
+        assert!(approval::is_approved(&home, &principal, "gone", &fp));
+
+        clear_capsule_approval(&home, "gone");
+
+        // The approval must NOT survive uninstall: a different capsule later
+        // reinstalled as "gone" must not inherit the old trust.
+        assert!(
+            !approval::is_approved(&home, &principal, "gone", &fp),
+            "uninstall must clear the capability approval record"
+        );
+    }
+
+    #[test]
+    fn clear_capsule_approval_is_noop_when_absent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = AstridHome::from_path(tmp.path());
+        // No record present — must not panic or error.
+        clear_capsule_approval(&home, "never-approved");
     }
 
     #[test]

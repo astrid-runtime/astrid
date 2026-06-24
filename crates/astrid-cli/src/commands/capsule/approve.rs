@@ -84,6 +84,7 @@ pub(crate) fn record_install_approval(
 /// Returns an error if the capsule is not installed, its manifest cannot be
 /// read, or the approval record cannot be written.
 pub(crate) async fn run(name: &str, workspace: bool) -> anyhow::Result<()> {
+    ensure_valid_capsule_name(name)?;
     let home = AstridHome::resolve()?;
     let target_dir = super::install::resolve_target_dir(&home, name, workspace)?;
     let manifest_path = target_dir.join("Capsule.toml");
@@ -155,6 +156,9 @@ fn describe_declared_capabilities(manifest: &CapsuleManifest) -> Vec<String> {
     if !caps.identity.is_empty() {
         lines.push(format!("identity ops: {}", caps.identity.join(", ")));
     }
+    if !caps.kv.is_empty() {
+        lines.push(format!("KV store scopes: {}", caps.kv.join(", ")));
+    }
     if caps.uplink {
         lines.push("uplink (binds a socket, may publish as other principals)".to_string());
     }
@@ -186,4 +190,39 @@ fn prompt_yes_no(question: &str) -> bool {
         return false;
     }
     matches!(input.trim().to_ascii_lowercase().as_str(), "y" | "yes")
+}
+
+/// Reject a malformed capsule name before it is used as a path component in the
+/// capsule directory or the approval store (#995).
+///
+/// Enforces the same identifier rules as install ([`astrid_capsule::capsule::CapsuleId`]):
+/// lowercase alphanumeric and hyphens only. Without this, an operator typo like
+/// `astrid capsule approve ../../evil` would write an approval record outside the
+/// approvals directory.
+fn ensure_valid_capsule_name(name: &str) -> anyhow::Result<()> {
+    astrid_capsule::capsule::CapsuleId::new(name)
+        .map(|_| ())
+        .map_err(|e| anyhow::anyhow!("invalid capsule name '{name}': {e}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn valid_capsule_names_accepted() {
+        assert!(ensure_valid_capsule_name("react").is_ok());
+        assert!(ensure_valid_capsule_name("openai-compat").is_ok());
+        assert!(ensure_valid_capsule_name("a1").is_ok());
+    }
+
+    #[test]
+    fn path_traversal_names_rejected() {
+        // The security-critical cases: a name that would escape the approvals dir.
+        assert!(ensure_valid_capsule_name("../../evil").is_err());
+        assert!(ensure_valid_capsule_name("foo/bar").is_err());
+        assert!(ensure_valid_capsule_name("..").is_err());
+        assert!(ensure_valid_capsule_name("a/../../b").is_err());
+        assert!(ensure_valid_capsule_name("").is_err());
+    }
 }

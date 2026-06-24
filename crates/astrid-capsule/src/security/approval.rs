@@ -269,9 +269,12 @@ pub fn remove(
 /// `etc/profiles/*.toml` principal, scans each principal's `capsules_dir()`, and
 /// approves each discovered capsule at the fingerprint of its on-disk manifest.
 ///
-/// Best-effort and non-fatal: a single unreadable manifest or unwritable record
-/// is logged and skipped; the marker is only written if the sweep completed, so
-/// a hard directory failure simply retries next boot (re-approval is idempotent).
+/// Best-effort and non-fatal: a single unreadable manifest or unwritable
+/// approval record is logged and skipped — that one capsule stays inert until
+/// approved manually, but the sweep continues. The marker is written after the
+/// sweep regardless of per-capsule failures; only a failure to create `etc/` or
+/// to write the marker itself leaves it absent, in which case the whole
+/// migration simply retries next boot (re-approval is idempotent).
 pub fn migrate_grandfather_approvals(home: &AstridHome) {
     let marker = home.etc_dir().join(".capability-approvals-migrated");
     if marker.exists() {
