@@ -364,6 +364,16 @@ pub(crate) enum CapsuleCommands {
         #[arg(short, long)]
         verbose: bool,
     },
+    /// Approve an installed capsule's declared capabilities so it can
+    /// activate. A manually-installed capsule is INERT (no host-fn access)
+    /// until approved (#995).
+    Approve {
+        /// Capsule name to approve
+        name: String,
+        /// Approve a workspace-installed capsule instead of user-level
+        #[arg(long)]
+        workspace: bool,
+    },
     /// Remove an installed capsule
     Remove {
         /// Capsule name to remove

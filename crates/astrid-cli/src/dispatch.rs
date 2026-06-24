@@ -306,6 +306,10 @@ async fn dispatch_capsule(command: crate::cli::CapsuleCommands) -> Result<ExitCo
             commands::capsule::list::list_capsules(verbose)?;
             Ok(ExitCode::SUCCESS)
         },
+        CapsuleCommands::Approve { name, workspace } => {
+            commands::capsule::approve::run(&name, workspace).await?;
+            Ok(ExitCode::SUCCESS)
+        },
         CapsuleCommands::Remove {
             name,
             workspace,

@@ -852,10 +852,10 @@ fn finish_install(output: &InstallOutput, home: &AstridHome) -> anyhow::Result<S
     let manifest = astrid_capsule::discovery::load_manifest(&manifest_path)
         .context("re-reading manifest for post-install diagnostics")?;
 
-    // Visibility (no approval gate in this phase): if the capsule declares
-    // any `kind = "cli"` commands, list the new top-level `astrid capsule
-    // <verb>` verbs it adds so the operator knows what just became
-    // invocable. Printed adjacent to the other manifest-derived notices.
+    // Visibility: if the capsule declares any `kind = "cli"` commands, list
+    // the new top-level `astrid capsule <verb>` verbs it adds so the operator
+    // knows what just became invocable. Printed adjacent to the other
+    // manifest-derived notices.
     let capsule_id = output.target_dir.file_name().map_or_else(
         || "capsule".to_string(),
         |n| n.to_string_lossy().into_owned(),
@@ -907,6 +907,14 @@ fn finish_install(output: &InstallOutput, home: &AstridHome) -> anyhow::Result<S
             "Shared export — both capsules will be active"
         );
     }
+
+    // Install-time capability approval (#995). A capsule's declared
+    // capabilities are inert until an operator approves them for the install
+    // principal. In batch / non-interactive mode (`astrid init`, offline
+    // distro install) we auto-approve — the distro is the operator's chosen
+    // baseline. Interactively we display the declared surface and prompt; a
+    // decline leaves the capsule inert until `astrid capsule approve <id>`.
+    super::approve::record_install_approval(home, &capsule_id, &manifest, batch)?;
 
     Ok(capsule_id)
 }
