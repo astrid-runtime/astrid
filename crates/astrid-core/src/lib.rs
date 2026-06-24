@@ -23,6 +23,7 @@ pub mod env_policy;
 pub mod groups;
 pub mod identity;
 pub mod kernel_api;
+pub mod net;
 pub mod principal;
 pub mod profile;
 pub mod retry;

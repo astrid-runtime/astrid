@@ -24,7 +24,7 @@
 //! airlock, which only blocks IP literals at pre-flight and `localhost` at the
 //! resolver).
 
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::net::IpAddr;
 use std::path::Path;
 
 use anyhow::{Context, Result};
@@ -38,8 +38,10 @@ use anyhow::{Context, Result};
 ///   1918 private (`10/8`, `172.16/12`, `192.168/16`), link-local
 ///   (`169.254/16`), CGNAT (`100.64/10`).
 /// - `IPv6` literals (bracketed `[::1]` or bare): loopback (`::1`), unspecified
-///   (`::`), ULA (`fc00::/7`), link-local (`fe80::/10`); `IPv4`-mapped forms are
-///   normalised and re-checked.
+///   (`::`), ULA (`fc00::/7`), link-local (`fe80::/10`), deprecated site-local
+///   (`fec0::/10`), and transition addresses (NAT64 `64:ff9b::/96`, 6to4
+///   `2002::/16`, Teredo `2001:0::/32`) embedding a local `IPv4`; `IPv4`-mapped
+///   forms are normalised and re-checked.
 /// - The `localhost` hostname family (`localhost`, `*.localhost`).
 ///
 /// Everything else — a public IP, a real DNS name — returns `false` (treated as
@@ -71,41 +73,17 @@ pub(crate) fn is_local_address(host: &str) -> bool {
     }
 }
 
-/// True if a parsed IP is in a loopback/private/link-local/CGNAT range. Mirrors
-/// the host airlock's block set (`astrid-capsule` `http::is_safe_ip`) so the CLI
-/// offers a pre-bless for exactly the endpoints the runtime would otherwise
-/// block.
+/// True if a parsed IP is in the host airlock's block set — loopback, private,
+/// link-local, CGNAT, deprecated site-local (`fec0::/10`), or a transition
+/// address (NAT64 `64:ff9b::/96`, 6to4 `2002::/16`, Teredo `2001:0::/32`)
+/// embedding such an `IPv4`.
+///
+/// This delegates to the SAME predicate the runtime airlock uses
+/// ([`astrid_core::net::ip_is_blocked`]; consumed by `astrid-capsule`
+/// `http::is_safe_ip`), so the CLI offers a pre-bless for exactly the endpoints
+/// the runtime would otherwise block — no drift between the two block sets.
 fn ip_is_local(ip: IpAddr) -> bool {
-    match ip {
-        IpAddr::V4(v4) => ipv4_is_local(v4),
-        IpAddr::V6(v6) => {
-            if let Some(mapped) = v6.to_ipv4_mapped() {
-                return ipv4_is_local(mapped);
-            }
-            ipv6_is_local(v6)
-        },
-    }
-}
-
-fn ipv4_is_local(ip: Ipv4Addr) -> bool {
-    if ip.is_loopback() || ip.is_unspecified() {
-        return true;
-    }
-    let o = ip.octets();
-    o[0] == 10
-        || (o[0] == 172 && (16..=31).contains(&o[1]))
-        || (o[0] == 192 && o[1] == 168)
-        || (o[0] == 169 && o[1] == 254)
-        || (o[0] == 100 && (64..=127).contains(&o[1]))
-}
-
-fn ipv6_is_local(ip: Ipv6Addr) -> bool {
-    if ip.is_loopback() || ip.is_unspecified() {
-        return true;
-    }
-    let s = ip.segments();
-    // ULA fc00::/7, link-local fe80::/10.
-    (s[0] & 0xfe00) == 0xfc00 || (s[0] & 0xffc0) == 0xfe80
+    astrid_core::net::ip_is_blocked(ip)
 }
 
 /// Parse a provider endpoint string (`base_url`) into the `host:port` an
@@ -190,25 +168,96 @@ pub(crate) fn record_local_egress(config_path: &Path, capsule_id: &str, entry: &
     if let Some(parent) = config_path.parent() {
         std::fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
     }
-    std::fs::write(config_path, doc.to_string())
-        .with_context(|| format!("write {}", config_path.display()))?;
+    write_atomic(config_path, doc.to_string().as_bytes())
+        .with_context(|| format!("write {}", config_path.display()))
+}
+
+/// Atomically write `data` to `path`: a same-directory temp sibling is written,
+/// fsync'd, then `rename`d over `path`. An interrupted write therefore never
+/// leaves a half-written / truncated operator config that the daemon would fail
+/// to load — the rename either fully succeeds or `path` keeps its prior
+/// contents.
+///
+/// On Unix the temp file is created mode `0o600` (the operator config may carry
+/// security-sensitive settings) and the perms ride through the rename, so there
+/// is no world-readable window.
+fn write_atomic(path: &Path, data: &[u8]) -> std::io::Result<()> {
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(config_path, std::fs::Permissions::from_mode(0o600));
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+
+        // Same-filesystem temp sibling so `rename` is atomic. PID disambiguates
+        // concurrent CLI invocations sharing the directory.
+        let tmp_path = path.with_extension(format!("toml.tmp.{}", std::process::id()));
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&tmp_path)?;
+        f.write_all(data)?;
+        f.sync_all()?;
+        drop(f);
+
+        if let Err(e) = std::fs::rename(&tmp_path, path) {
+            // Don't leave a config-adjacent temp file behind on failure.
+            let _ = std::fs::remove_file(&tmp_path);
+            return Err(e);
+        }
+        Ok(())
     }
-    Ok(())
+
+    // Non-Unix fallback: no atomic rename, no explicit permissions. Astrid's
+    // supported platforms are Unix; this exists only to keep the crate
+    // buildable on Windows.
+    #[cfg(not(unix))]
+    {
+        std::fs::write(path, data)
+    }
 }
 
 /// If `value` (the value just entered for a capsule env field) is a local
 /// endpoint, prompt the operator on stdin to add the SSRF-airlock exemption and,
 /// on yes, write it to the operator config.
 ///
-/// A no / EOF / non-local / unparseable value is a silent skip — the capsule
-/// install is never blocked on this. Best-effort: a config write failure is
-/// reported to stderr but does not fail the install (the operator can still
-/// hand-edit).
+/// **Non-interactive guard:** when stdin is NOT a terminal (a scripted
+/// `astrid capsule config --set ...`, a piped install, CI), the prompt is
+/// skipped entirely — no stdin is read (so we never block waiting for input or
+/// consume the caller's piped data) and no exemption is written. The operator
+/// can add the `[security.capsule_local_egress]` entry explicitly.
+///
+/// A no / EOF / non-local / unparseable value is also a silent skip — the
+/// capsule install is never blocked on this. Best-effort: a config write
+/// failure is reported to stderr but does not fail the install (the operator can
+/// still hand-edit).
 pub(crate) fn maybe_prompt_local_egress(capsule_id: &str, value: &str, config_path: &Path) {
+    use std::io::IsTerminal;
+
+    // Only a TTY is a real operator at a prompt. A non-interactive stdin
+    // (script / pipe / CI) must not be read — reading would block waiting for
+    // input or steal the caller's piped data — and must not auto-write the
+    // exemption. Decline before touching stdin or the config.
+    if !std::io::stdin().is_terminal() {
+        return;
+    }
+
+    prompt_and_record(capsule_id, value, config_path, || {
+        let mut input = String::new();
+        std::io::stdin().read_line(&mut input).ok()?;
+        Some(input)
+    });
+}
+
+/// Testable core of [`maybe_prompt_local_egress`], with stdin abstracted behind
+/// `read_answer` (called only when an answer is actually needed). The non-local
+/// early-return means `read_answer` is never invoked for a non-local value.
+fn prompt_and_record(
+    capsule_id: &str,
+    value: &str,
+    config_path: &Path,
+    read_answer: impl FnOnce() -> Option<String>,
+) {
     let Some(entry) = local_egress_entry(value) else {
         return;
     };
@@ -219,10 +268,9 @@ pub(crate) fn maybe_prompt_local_egress(capsule_id: &str, value: &str, config_pa
     eprint!("  Allow '{capsule_id}' to reach {entry}? [y/N]: ");
     let _ = std::io::Write::flush(&mut std::io::stderr());
 
-    let mut input = String::new();
-    if std::io::stdin().read_line(&mut input).is_err() {
+    let Some(input) = read_answer() else {
         return;
-    }
+    };
     let answer = input.trim().to_ascii_lowercase();
     if answer != "y" && answer != "yes" {
         eprintln!("  Skipped. The capsule will be blocked from {entry} until you add it.");

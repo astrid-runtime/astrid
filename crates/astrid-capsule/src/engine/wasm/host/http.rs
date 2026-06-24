@@ -4,7 +4,7 @@
 //! implemented; the `http_stream` resource is scaffolded but its
 //! per-method bodies are stubbed pending the resource-table integration.
 
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::net::{IpAddr, SocketAddr};
 use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -168,97 +168,21 @@ static SSRF_BYPASS: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
     false
 });
 
-/// Build an [`Ipv4Addr`] from two big-endian IPv6 segments (the low 32
-/// bits of an address).
-fn v4_from_segments(hi: u16, lo: u16) -> Ipv4Addr {
-    Ipv4Addr::from((u32::from(hi) << 16) | u32::from(lo))
-}
-
-/// True if an IPv4 address must never be reached by a capsule: loopback,
-/// unspecified, multicast/broadcast, RFC 1918 private, link-local
-/// (169.254/16), CGNAT (100.64/10), or the `0.0.0.0/8` / `127.0.0.0/8`
-/// blocks.
-fn ipv4_blocked(ip: Ipv4Addr) -> bool {
-    if ip.is_loopback() || ip.is_unspecified() || ip.is_multicast() {
-        return true;
-    }
-    let o = ip.octets();
-    o[0] == 10
-        || o[0] == 0
-        || o[0] == 255
-        || (o[0] == 172 && (16..=31).contains(&o[1]))
-        || (o[0] == 192 && o[1] == 168)
-        || (o[0] == 169 && o[1] == 254)
-        || (o[0] == 100 && (64..=127).contains(&o[1]))
-        || o[0] == 127
-}
-
-/// True if an IPv6 address is loopback, unspecified, multicast, ULA
-/// (`fc00::/7`), link-local (`fe80::/10`), or deprecated site-local
-/// (`fec0::/10`).
-fn ipv6_blocked(ip: Ipv6Addr) -> bool {
-    if ip.is_loopback() || ip.is_unspecified() || ip.is_multicast() {
-        return true;
-    }
-    let s = ip.segments();
-    (s[0] & 0xfe00) == 0xfc00 || (s[0] & 0xffc0) == 0xfe80 || (s[0] & 0xffc0) == 0xfec0
-}
-
-/// Extract every IPv4 address embedded in an IPv6 transition/translation
-/// address. A NAT64, 6to4, or Teredo gateway would translate these
-/// straight to the embedded IPv4, so an embedded private/loopback address
-/// is as dangerous as a bare one and must be airlocked. Covers the NAT64
-/// well-known prefix (`64:ff9b::/96`, RFC 6052), 6to4 (`2002::/16`, RFC
-/// 3056), and Teredo (`2001:0::/32`, RFC 4380 — server plus the
-/// bitwise-NOT-obfuscated client).
-fn embedded_ipv4s(segs: [u16; 8]) -> Vec<Ipv4Addr> {
-    let mut out = Vec::new();
-    if segs[0] == 0x0064 && segs[1] == 0xff9b && segs[2..6].iter().all(|&s| s == 0) {
-        out.push(v4_from_segments(segs[6], segs[7]));
-    }
-    if segs[0] == 0x2002 {
-        out.push(v4_from_segments(segs[1], segs[2]));
-    }
-    if segs[0] == 0x2001 && segs[1] == 0x0000 {
-        out.push(v4_from_segments(segs[2], segs[3]));
-        out.push(v4_from_segments(!segs[6], !segs[7]));
-    }
-    out
-}
-
-pub(super) fn is_safe_ip(mut ip: IpAddr) -> bool {
+/// True if a capsule may reach `ip` over the network — i.e. it is NOT in the
+/// SSRF block set (loopback / private / link-local / CGNAT / site-local /
+/// transition-embedded private).
+///
+/// The block-set predicate lives in [`astrid_core::net::ip_is_blocked`] so the
+/// airlock and the CLI guided pre-bless (`astrid-cli` `local_egress`) share one
+/// source of truth and cannot drift. The `ASTRID_ALLOW_LOCAL_IPS` deprecated
+/// escape hatch is layered here, on the airlock side only — the pure shared
+/// predicate has no env-var bypass, so the CLI bless prompt is never suppressed
+/// by a test/CI env var.
+pub(super) fn is_safe_ip(ip: IpAddr) -> bool {
     if *SSRF_BYPASS {
         return true;
     }
-
-    // Normalize IPv4-mapped (`::ffff:a.b.c.d`) and IPv4-compatible
-    // (`::a.b.c.d`) IPv6 forms to their IPv4 address so the encoding can't
-    // slip a private address past the IPv4 checks.
-    if let IpAddr::V6(ipv6) = ip {
-        if let Some(ipv4) = ipv6.to_ipv4_mapped() {
-            ip = IpAddr::V4(ipv4);
-        } else {
-            let segs = ipv6.segments();
-            if segs[..6].iter().all(|&s| s == 0) {
-                ip = IpAddr::V4(v4_from_segments(segs[6], segs[7]));
-            }
-        }
-    }
-
-    match ip {
-        IpAddr::V4(ipv4) => !ipv4_blocked(ipv4),
-        IpAddr::V6(ipv6) => {
-            // A transition address embedding a private/loopback IPv4 is
-            // reachable via a NAT64/6to4/Teredo gateway — reject it.
-            if embedded_ipv4s(ipv6.segments())
-                .into_iter()
-                .any(ipv4_blocked)
-            {
-                return false;
-            }
-            !ipv6_blocked(ipv6)
-        },
-    }
+    !astrid_core::net::ip_is_blocked(ip)
 }
 
 /// Parse a URL host string into an IP literal, if it is one.
