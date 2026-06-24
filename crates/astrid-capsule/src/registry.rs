@@ -175,6 +175,33 @@ impl CapsuleRegistry {
         self.capsules.is_empty()
     }
 
+    /// A stable hash over the loaded capsule set — the sorted list of
+    /// `(capsule_id, package_version)` pairs.
+    ///
+    /// Moves iff a capsule is added, removed, or version-bumped (a live
+    /// upgrade), and is independent of insertion order (the pairs are sorted
+    /// first). Unlike a monotonic counter it carries no process state, so an
+    /// unchanged set hashes identically across daemon restarts. That lets a
+    /// consumer persist this epoch beside a cache and re-validate cheaply on
+    /// its own next turn — the mechanism the per-principal tool-schema cache
+    /// uses to self-heal after a runtime capsule install without the kernel
+    /// fanning an invalidation out to every principal.
+    ///
+    /// Not a cryptographic digest: `DefaultHasher` is a fixed-key SipHash,
+    /// deterministic for a given build. A `std` upgrade could change the
+    /// algorithm, costing at most one spurious cache refresh after a daemon
+    /// binary upgrade — harmless and self-correcting.
+    #[must_use]
+    pub fn set_epoch(&self) -> u64 {
+        let mut pairs: Vec<(&str, &str)> = self
+            .capsules
+            .iter()
+            .map(|(id, capsule)| (id.as_str(), capsule.manifest().package.version.as_str()))
+            .collect();
+        pairs.sort_unstable();
+        hash_capsule_set(&pairs)
+    }
+
     // -----------------------------------------------------------------
     // Uplink management
     // -----------------------------------------------------------------
@@ -271,6 +298,21 @@ impl std::fmt::Debug for CapsuleRegistry {
             .finish()
     }
 }
+
+/// Order-sensitive hash of pre-sorted `(id, version)` pairs, split out from
+/// [`CapsuleRegistry::set_epoch`] so the hashing is unit-testable without a
+/// registry. Callers MUST pass a sorted slice; the count is folded in to frame
+/// the set, and `str`'s `Hash` is prefix-safe, so distinct sets do not alias.
+fn hash_capsule_set(sorted_pairs: &[(&str, &str)]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    sorted_pairs.len().hash(&mut hasher);
+    for (id, version) in sorted_pairs {
+        id.hash(&mut hasher);
+        version.hash(&mut hasher);
+    }
+    hasher.finish()
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -292,12 +334,16 @@ mod tests {
 
     impl MockCapsule {
         fn new(name: &str) -> Self {
+            Self::with_version(name, "0.0.1")
+        }
+
+        fn with_version(name: &str, version: &str) -> Self {
             Self {
                 id: CapsuleId::from_static(name),
                 manifest: CapsuleManifest {
                     package: PackageDef {
                         name: name.to_string(),
-                        version: "0.0.1".to_string(),
+                        version: version.to_string(),
                         description: None,
                         authors: Vec::new(),
                         repository: None,
@@ -437,5 +483,103 @@ mod tests {
 
         let _ = registry.drain();
         assert!(registry.find_by_uuid(&uuid).is_none());
+    }
+
+    // -----------------------------------------------------------------
+    // Capsule-set epoch (backs the prompt-builder tool-cache self-heal)
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn set_epoch_moves_when_a_capsule_is_installed() {
+        // The bug behind #982: a runtime install must produce an observable
+        // change so a cached consumer knows to re-describe.
+        let mut registry = CapsuleRegistry::new();
+        registry
+            .register(Box::new(MockCapsule::new("alpha")))
+            .expect("register alpha");
+        let before = registry.set_epoch();
+
+        registry
+            .register(Box::new(MockCapsule::new("beta")))
+            .expect("register beta");
+        let after = registry.set_epoch();
+
+        assert_ne!(before, after, "installing a capsule must move the epoch");
+    }
+
+    #[test]
+    fn set_epoch_is_restart_stable_for_an_unchanged_set() {
+        // Same set => same epoch, with no process state. This is what lets the
+        // persistent per-principal cache survive a daemon restart without a
+        // spurious re-fan-out. Adding then removing returns to the prior value.
+        let mut registry = CapsuleRegistry::new();
+        registry
+            .register(Box::new(MockCapsule::new("alpha")))
+            .expect("register alpha");
+        let one = registry.set_epoch();
+
+        registry
+            .register(Box::new(MockCapsule::new("beta")))
+            .expect("register beta");
+        registry
+            .unregister(&CapsuleId::from_static("beta"))
+            .expect("unregister beta");
+        let back = registry.set_epoch();
+
+        assert_eq!(
+            one, back,
+            "removing the added capsule must restore the epoch"
+        );
+    }
+
+    #[test]
+    fn set_epoch_ignores_insertion_order() {
+        let mut a = CapsuleRegistry::new();
+        a.register(Box::new(MockCapsule::new("alpha")))
+            .expect("register alpha");
+        a.register(Box::new(MockCapsule::new("beta")))
+            .expect("register beta");
+
+        let mut b = CapsuleRegistry::new();
+        b.register(Box::new(MockCapsule::new("beta")))
+            .expect("register beta");
+        b.register(Box::new(MockCapsule::new("alpha")))
+            .expect("register alpha");
+
+        assert_eq!(
+            a.set_epoch(),
+            b.set_epoch(),
+            "epoch must not depend on load order"
+        );
+    }
+
+    #[test]
+    fn set_epoch_moves_on_version_bump() {
+        // A live upgrade keeps the id but changes the version; the tool surface
+        // may change with it, so the epoch must move.
+        let mut before = CapsuleRegistry::new();
+        before
+            .register(Box::new(MockCapsule::with_version("alpha", "1.0.0")))
+            .expect("register alpha 1.0.0");
+
+        let mut after = CapsuleRegistry::new();
+        after
+            .register(Box::new(MockCapsule::with_version("alpha", "1.0.1")))
+            .expect("register alpha 1.0.1");
+
+        assert_ne!(
+            before.set_epoch(),
+            after.set_epoch(),
+            "a version bump must move the epoch"
+        );
+    }
+
+    #[test]
+    fn set_epoch_empty_registry_is_deterministic() {
+        assert_eq!(
+            CapsuleRegistry::new().set_epoch(),
+            CapsuleRegistry::new().set_epoch(),
+            "the empty set must hash deterministically and not panic"
+        );
     }
 }
