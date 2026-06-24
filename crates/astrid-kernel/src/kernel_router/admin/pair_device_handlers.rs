@@ -25,7 +25,7 @@ use astrid_core::kernel_api::{
     AdminResponseBody, DeviceKeyInfo, PairScopeArg, PairTokenIssued, PairTokenRedeemed,
 };
 use astrid_core::profile::{
-    AuthMethod, DeviceKey, DeviceScope, PrincipalProfile, device_key_id_fingerprint,
+    AuthMethod, DeviceKey, DeviceKeyId, DevicePubkey, DeviceScope, PrincipalProfile,
 };
 use tracing::{info, warn};
 
@@ -233,7 +233,7 @@ pub(crate) async fn pair_device_redeem(
     // Validate the key shape first so a malformed key takes the
     // same time as a valid one — no key-shape oracle on the token
     // comparison.
-    let normalised_key = match normalise_public_key(&public_key) {
+    let normalised_key = match DevicePubkey::normalize(&public_key) {
         Ok(k) => k,
         Err(e) => return err_bad_input(e),
     };
@@ -285,9 +285,13 @@ pub(crate) async fn pair_device_redeem(
     // + validated at issue time, with the issuer's denies already folded in),
     // so the paired device is attenuated to exactly that scope on every
     // transport — not hard-coded to Full.
-    if profile.auth.device_by_pubkey(&normalised_key).is_none() {
+    if profile
+        .auth
+        .device_by_typed_pubkey(&normalised_key)
+        .is_none()
+    {
         profile.auth.public_keys.push(DeviceKey::new(
-            normalised_key.clone(),
+            normalised_key.as_str().to_string(),
             chosen.scope.clone(),
             chosen.label.clone(),
             i64::try_from(now).unwrap_or(0),
@@ -318,11 +322,7 @@ pub(crate) async fn pair_device_redeem(
 
     let fingerprint =
         super::invite_handlers::fingerprint_public_key(&format!("ed25519:{normalised_key}"));
-    // Deterministic device handle from the canonical pubkey — the stable
-    // key_id the registered DeviceKey carries and that a device-scoped bearer
-    // binds to. Computed over the same normalised key the device was
-    // registered under, so a re-redeem of the same key yields the same id.
-    let key_id = device_key_id_fingerprint(&normalised_key);
+    let key_id = DeviceKeyId::for_pubkey(&normalised_key);
     info!(
         principal = %chosen.principal,
         public_key_fingerprint = %fingerprint,
@@ -334,7 +334,7 @@ pub(crate) async fn pair_device_redeem(
     AdminResponseBody::PairTokenRedeemed(PairTokenRedeemed {
         principal: chosen.principal,
         public_key_fingerprint: fingerprint,
-        key_id,
+        key_id: key_id.into_inner(),
     })
 }
 
@@ -390,6 +390,10 @@ pub(crate) async fn pair_device_revoke(
     principal: &PrincipalId,
     key_id: &str,
 ) -> AdminResponseBody {
+    let key_id = match DeviceKeyId::new(key_id) {
+        Ok(key_id) => key_id,
+        Err(e) => return err_bad_input(e),
+    };
     let _guard = kernel.admin_write_lock.lock().await;
     let profile_path = kernel.astrid_home.profile_path(principal);
     if !profile_path.exists() {
@@ -403,7 +407,10 @@ pub(crate) async fn pair_device_revoke(
     };
 
     let before = profile.auth.public_keys.len();
-    profile.auth.public_keys.retain(|k| k.key_id != key_id);
+    profile
+        .auth
+        .public_keys
+        .retain(|k| k.key_id != key_id.as_str());
     if profile.auth.public_keys.len() == before {
         return err_bad_input(format!(
             "no paired device with key_id {key_id} on principal {principal}"
@@ -435,24 +442,6 @@ pub(crate) async fn pair_device_revoke(
     AdminResponseBody::PairDeviceRevoked {
         key_id: key_id.to_string(),
     }
-}
-
-fn normalise_public_key(raw: &str) -> Result<String, String> {
-    let candidate = raw
-        .strip_prefix("ed25519:")
-        .unwrap_or(raw)
-        .trim()
-        .to_ascii_lowercase();
-    if candidate.len() != 64 {
-        return Err(format!(
-            "public_key must be 32 bytes hex-encoded (64 hex chars); got {} chars",
-            candidate.len()
-        ));
-    }
-    if !candidate.chars().all(|c| c.is_ascii_hexdigit()) {
-        return Err("public_key contains non-hex characters".into());
-    }
-    Ok(candidate)
 }
 
 fn err_bad_input(msg: String) -> AdminResponseBody {

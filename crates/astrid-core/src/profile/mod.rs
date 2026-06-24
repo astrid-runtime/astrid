@@ -41,7 +41,10 @@ mod field;
 mod io_impl;
 mod validation;
 
-pub use device::{DEVICE_KEY_ID_HEX_LEN, DeviceKey, DeviceScope, device_key_id_fingerprint};
+pub use device::{
+    DEVICE_KEY_ID_HEX_LEN, DeviceKey, DeviceKeyId, DevicePubkey, DeviceScope,
+    device_key_id_fingerprint,
+};
 pub use field::{
     CapabilityPattern, CapsuleGrant, GroupName, ProfileFieldError, ValidatedProfileFields,
 };
@@ -231,15 +234,35 @@ impl AuthConfig {
     /// Look up a registered device by its deterministic `key_id`.
     #[must_use]
     pub fn device_by_key_id(&self, key_id: &str) -> Option<&DeviceKey> {
-        self.public_keys.iter().find(|k| k.key_id == key_id)
+        self.device_by_typed_key_id(&DeviceKeyId::new(key_id).ok()?)
+    }
+
+    /// Look up a registered device by a typed deterministic `key_id`.
+    #[must_use]
+    pub fn device_by_typed_key_id<S: AsRef<str>>(
+        &self,
+        key_id: &DeviceKeyId<S>,
+    ) -> Option<&DeviceKey> {
+        self.public_keys
+            .iter()
+            .find(|k| k.key_id == key_id.as_str())
     }
 
     /// Look up a registered device by its canonical lowercase-hex pubkey.
     #[must_use]
     pub fn device_by_pubkey(&self, hex_lower: &str) -> Option<&DeviceKey> {
+        self.device_by_typed_pubkey(&DevicePubkey::from_canonical(hex_lower).ok()?)
+    }
+
+    /// Look up a registered device by a typed canonical lowercase-hex pubkey.
+    #[must_use]
+    pub fn device_by_typed_pubkey<S: AsRef<str>>(
+        &self,
+        pubkey: &DevicePubkey<S>,
+    ) -> Option<&DeviceKey> {
         self.public_keys
             .iter()
-            .find(|k| k.matches_pubkey(hex_lower))
+            .find(|k| k.matches_pubkey(pubkey.as_str()))
     }
 }
 
