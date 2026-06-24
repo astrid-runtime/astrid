@@ -1,4 +1,5 @@
-//! `astrid:sys@1.0.0` host implementation.
+//! `astrid:sys@1.0.0` host implementation, plus the additive
+//! `astrid:sys@1.1.0` companion (one call, `capsule-set-epoch`).
 //!
 //! `trigger_hook` was removed from the kernel ABI when the
 //! `astrid:capsule@0.1.0` world was split into per-domain packages —
@@ -7,10 +8,11 @@
 //! need to dispatch hooks now publish `hook.trigger.v1` and aggregate
 //! responses via subscriptions.
 
-use crate::engine::wasm::bindings::astrid::sys::host::{
+use crate::engine::wasm::bindings::astrid::sys1_0_0::host::{
     self as sys, CallerContext, CapabilityCheckRequest, CapabilityCheckResponse, ErrorCode,
     LogLevel,
 };
+use crate::engine::wasm::bindings::astrid::sys1_1_0::host as sys_v11;
 use crate::engine::wasm::host::util;
 use crate::engine::wasm::host_state::HostState;
 
@@ -245,6 +247,25 @@ impl sys::Host for HostState {
     }
 }
 
+impl sys_v11::Host for HostState {
+    fn capsule_set_epoch(&mut self) -> u64 {
+        // Mirror `check_capsule_capability`'s registry access: clone the handle,
+        // then read it inside a bounded blocking section (the registry guards an
+        // async `RwLock`). Read-only and infallible at the WIT boundary — if the
+        // registry is unavailable we return 0, a value that cannot match any
+        // populated cache's stored epoch and so biases the consumer toward a safe
+        // refresh rather than stale reuse.
+        let Some(registry) = self.capsule_registry.clone() else {
+            return 0;
+        };
+        let rt_handle = self.runtime_handle.clone();
+        let blocking_semaphore = self.blocking_semaphore.clone();
+        util::bounded_block_on(&rt_handle, &blocking_semaphore, async move {
+            registry.read().await.set_epoch()
+        })
+    }
+}
+
 /// Resolve a secret-typed env value through the file-per-secret store.
 ///
 /// Precedence (operator-controlled at `astrid secret set --scope` time;
@@ -313,7 +334,7 @@ mod log_chain_tests {
     use std::sync::Arc;
 
     use super::*;
-    use crate::engine::wasm::bindings::astrid::sys::host::Host as SysHost;
+    use crate::engine::wasm::bindings::astrid::sys1_0_0::host::Host as SysHost;
     use crate::engine::wasm::test_fixtures::{minimal_host_state, open_log};
 
     fn make_host_state() -> crate::engine::wasm::host_state::HostState {
@@ -416,7 +437,7 @@ mod log_chain_tests {
 
 #[cfg(test)]
 mod capability_introspection_tests {
-    use crate::engine::wasm::bindings::astrid::sys::host::Host as SysHost;
+    use crate::engine::wasm::bindings::astrid::sys1_0_0::host::Host as SysHost;
     use crate::engine::wasm::test_fixtures::minimal_host_state;
 
     /// `enumerate-capabilities` returns the load-time snapshot and never
@@ -440,10 +461,51 @@ mod capability_introspection_tests {
 }
 
 #[cfg(test)]
+mod capsule_set_epoch_tests {
+    use std::sync::Arc;
+
+    use tokio::sync::RwLock;
+
+    use crate::engine::wasm::bindings::astrid::sys1_1_0::host::Host as SysEpochHost;
+    use crate::engine::wasm::test_fixtures::minimal_host_state;
+    use crate::registry::CapsuleRegistry;
+
+    // `bounded_block_on` runs inside `block_in_place`, which requires a
+    // multi-threaded runtime.
+
+    /// Fail-safe: with no registry handle the host returns 0 — a value that
+    /// cannot match any populated cache's stored epoch, so the consumer
+    /// re-describes rather than serving a stale tool list.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn returns_zero_when_registry_unavailable() {
+        let mut state = minimal_host_state(tokio::runtime::Handle::current());
+        assert!(
+            state.capsule_registry.is_none(),
+            "fixture starts without a registry handle"
+        );
+        assert_eq!(state.capsule_set_epoch(), 0);
+    }
+
+    /// The host call delegates to the live registry's `set_epoch`, so the two
+    /// agree for the same loaded set (the hashing itself is covered by the
+    /// registry unit tests).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn delegates_to_the_registry_epoch() {
+        let registry = CapsuleRegistry::new();
+        let expected = registry.set_epoch();
+
+        let mut state = minimal_host_state(tokio::runtime::Handle::current());
+        state.capsule_registry = Some(Arc::new(RwLock::new(registry)));
+
+        assert_eq!(state.capsule_set_epoch(), expected);
+    }
+}
+
+#[cfg(test)]
 mod get_config_tests {
     use std::collections::HashMap;
 
-    use crate::engine::wasm::bindings::astrid::sys::host::Host as SysHost;
+    use crate::engine::wasm::bindings::astrid::sys1_0_0::host::Host as SysHost;
     use crate::engine::wasm::test_fixtures::minimal_host_state;
 
     fn make_host_state() -> crate::engine::wasm::host_state::HostState {

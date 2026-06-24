@@ -1,0 +1,41 @@
+/// System-level runtime introspection — version 1.1.0.
+///
+/// Additive companion to `astrid:sys@1.0.0`, NOT a superset. @1.0.0 mutates
+/// nothing and remains the home of the full system surface (logging, config,
+/// time, entropy, sleep, capability introspection); a guest keeps importing it
+/// for all of that. This package adds a single orthogonal introspection
+/// function — `capsule-set-epoch` — with no shared types, so a guest imports
+/// @1.1.0 ALONGSIDE @1.0.0 solely to reach the new call. (Contrast
+/// `astrid:http@1.1.0`, which is a full superset precisely because it changed
+/// existing @1.0.0 record / variant shapes; nothing here does.)
+///
+/// Astrid does not expose any `wasi:*` interfaces to capsules. The host ABI is
+/// fully Astrid-owned: every call is gated, principal-scoped, audited, and
+/// dispatched through the kernel's capability layer.
+///
+/// Frozen per the ABI evolution discipline (RFC: host_abi). Shape changes
+/// ship as a new file at a new version path; never edit this file.
+
+package astrid:sys@1.1.0;
+
+interface host {
+    /// Return a stable hash of the currently-loaded capsule set — the sorted
+    /// `(capsule-id, package-version)` pairs across every registered capsule.
+    ///
+    /// The value MOVES when a capsule is installed, removed, or version-bumped
+    /// (a live upgrade), and is independent of load order. It carries no
+    /// process state: an unchanged set hashes identically across daemon
+    /// restarts, so a consumer can persist it beside a cache keyed on the
+    /// loaded set (e.g. a per-principal tool-schema cache) and re-validate
+    /// cheaply on its own next turn — picking up a runtime install without the
+    /// kernel fanning an invalidation out to every principal.
+    ///
+    /// Ungated, read-only introspection like `astrid:sys@1.0.0`'s
+    /// `enumerate-capabilities`: the loaded-set fingerprint is structural
+    /// metadata, not a secret, and conveys no ability. Infallible by design —
+    /// there is no `result` wrapper; if the registry is momentarily
+    /// unavailable the host returns `0`, a value that will not match any
+    /// populated cache's stored epoch and so biases the consumer toward a
+    /// (safe) refresh rather than stale reuse. Audit: not recorded (read-only).
+    capsule-set-epoch: func() -> u64;
+}
