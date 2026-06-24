@@ -599,3 +599,46 @@ async fn check_net_connect_matches_allowlist_entry() {
     );
     assert!(gate.check_net_connect("c", "evil.com", 443).await.is_err());
 }
+
+/// Regression for #995: a capsule's **self-declared** capabilities take effect
+/// verbatim at runtime with NO operator approval and NO install-source / trust
+/// input.
+///
+/// [`ManifestSecurityGate::new`] takes only `(manifest, workspace_root,
+/// home_root)` — there is no "approved capability set" and no "blessed source"
+/// parameter. So a capsule installed from any source can name an arbitrary
+/// egress host and a broad write scope and the gate honours both: the manifest
+/// is trusted verbatim and nothing upstream gates which declared capabilities
+/// become effective (`install_from_local_path` performs no approval, and the
+/// kernel install handler never emits `KernelResponse::ApprovalRequired`).
+///
+/// When the install-time approval / trust gate lands, the gate must be built
+/// from the APPROVED set and an un-approved (non-blessed, manually installed)
+/// capsule's declared capabilities must be denied — flip this test then.
+#[tokio::test]
+async fn regression_995_declared_capabilities_effective_without_approval() {
+    // A hostile, self-declared capability set — never approved by an operator,
+    // never checked against an install source.
+    let manifest = make_manifest(
+        vec!["attacker.example.com"], // arbitrary egress host
+        vec![],
+        vec!["*"], // broad write (confined to the workspace root)
+    );
+    let gate = ManifestSecurityGate::new(manifest, workspace_root(), None);
+
+    // Self-declared egress to an attacker-named host is honoured: no approval.
+    assert!(
+        gate.check_http_request("evil", "POST", "https://attacker.example.com/exfil")
+            .await
+            .is_ok(),
+        "#995: declared net egress is effective with no approval/source gate",
+    );
+
+    // Self-declared write is honoured: no approval.
+    assert!(
+        gate.check_file_write("evil", "/workspace/anything", None)
+            .await
+            .is_ok(),
+        "#995: declared fs_write is effective with no approval/source gate",
+    );
+}

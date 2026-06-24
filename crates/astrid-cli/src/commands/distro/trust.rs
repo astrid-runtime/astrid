@@ -353,4 +353,31 @@ mod tests {
         .unwrap_err();
         assert!(err.to_string().contains("invalid"), "got: {err}");
     }
+
+    /// Regression for #995: there is no compiled-in **blessed trust root**.
+    ///
+    /// "Distro-blessed" capability acceptance needs a verifiable anchor or it
+    /// becomes an approval-bypass primitive. Today [`OFFICIAL_KEYS`] is empty by
+    /// deliberate decision (not part of #964's spec), so no install source is
+    /// treated as blessed: `is_official` returns false for every key and even
+    /// official distros take the TOFU path like any third party.
+    ///
+    /// When a real official key is populated, `is_official` must return true for
+    /// it — update this test to assert that instead of emptiness, and wire the
+    /// blessed-set check into install-time capability acceptance.
+    #[test]
+    fn regression_995_no_compiled_in_blessed_trust_root() {
+        assert!(
+            OFFICIAL_KEYS.is_empty(),
+            "#995: a blessed trust root is now populated — wire the blessed-set \
+             check into install-time capability acceptance and update this test",
+        );
+        // A well-formed key is NOT recognised as official: nothing is blessed.
+        let kp = KeyPair::generate();
+        let key = sign::pubkey_to_wire(&kp.export_public_key());
+        assert!(
+            !is_official(&key),
+            "no key can be official while OFFICIAL_KEYS is empty",
+        );
+    }
 }
