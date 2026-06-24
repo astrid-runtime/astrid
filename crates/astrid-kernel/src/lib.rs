@@ -777,11 +777,15 @@ impl Kernel {
             let registry = Arc::clone(&registry);
             Box::pin(async move {
                 let reg = registry.read().await;
-                let manifests: Vec<&astrid_capsule::manifest::CapsuleManifest> = reg
-                    .values()
-                    .map(astrid_capsule::capsule::Capsule::manifest)
-                    .collect();
-                !astrid_capsule::readiness::topic_subscribers(&manifests, &topic).is_empty()
+                // Short-circuit on the first loaded capsule that subscribes the
+                // topic — no need to materialise the manifest list or the full
+                // subscriber set just to answer a boolean.
+                reg.values().any(|c| {
+                    astrid_capsule::readiness::manifest_subscribes_topic(
+                        astrid_capsule::capsule::Capsule::manifest(c),
+                        &topic,
+                    )
+                })
             })
         })
     }

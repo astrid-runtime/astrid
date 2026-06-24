@@ -130,6 +130,10 @@ pub struct SessionListQuery {
     /// dashboards.
     #[serde(default)]
     pub cursor: Option<String>,
+    /// Include archived threads in the page. Absent/`false` returns only
+    /// active threads; the capsule applies the filter.
+    #[serde(default)]
+    pub include_archived: Option<bool>,
 }
 
 /// One conversation thread's metadata, as rendered for the JSON wire.
@@ -183,6 +187,11 @@ pub struct SessionListResponse {
     pub sessions: Vec<SessionSummary>,
     /// Opaque cursor for the next page, or `null` on the last page.
     pub next_cursor: Option<String>,
+    /// Total thread count for the principal when the capsule can compute it
+    /// cheaply, else `null` (e.g. the namespace is too large to count in one
+    /// pass). A client uses it for a count badge; absence is not an error.
+    #[serde(default)]
+    pub total: Option<u32>,
 }
 
 /// Response shape for `GET /api/agent/sessions/{id}/messages`.
@@ -293,9 +302,10 @@ pub struct SearchResponse {
     params(
         ("limit" = Option<u32>, Query, description = "Page size; default 50, max 200. `0`/absent → default."),
         ("cursor" = Option<String>, Query, description = "Opaque cursor from a previous page."),
+        ("include_archived" = Option<bool>, Query, description = "Include archived threads; default false."),
     ),
     responses(
-        (status = 200, body = SessionListResponse, description = "Page of the caller's own conversation threads, ordered by session key; each carries `updated_at` for client-side recency sorting."),
+        (status = 200, body = SessionListResponse, description = "Page of the caller's own conversation threads, ordered by session key; each carries `updated_at` for client-side recency sorting. `total` is the principal's thread count when cheaply known."),
         (status = 400, body = ErrorBody, description = "Bad query params (e.g. limit > 200)."),
         (status = 401, body = ErrorBody, description = "Missing / invalid bearer."),
         (status = 500, body = ErrorBody, description = "Gateway not wired to a live event bus."),
@@ -320,7 +330,12 @@ pub async fn list_sessions(
     // exists in 1.0.
     ensure_list_supported(&state).await?;
     let correlation_id = Uuid::new_v4().to_string();
-    let payload = build_list_payload(&correlation_id, query.cursor.as_deref(), limit);
+    let payload = build_list_payload(
+        &correlation_id,
+        query.cursor.as_deref(),
+        limit,
+        query.include_archived.unwrap_or(false),
+    );
     let response_topic = format!("{TOPIC_LIST_RESPONSE_PREFIX}.{correlation_id}");
 
     let value = request_capsule(
@@ -716,11 +731,17 @@ fn validate_session_id(id: &str) -> GatewayResult<()> {
 
 /// Build the `session.v1.request.list` request payload to the frozen
 /// contract. `cursor` and `limit` are both nullable.
-fn build_list_payload(correlation_id: &str, cursor: Option<&str>, limit: u32) -> Value {
+fn build_list_payload(
+    correlation_id: &str,
+    cursor: Option<&str>,
+    limit: u32,
+    include_archived: bool,
+) -> Value {
     serde_json::json!({
         "correlation_id": correlation_id,
         "cursor": cursor,
         "limit": limit,
+        "include_archived": include_archived,
     })
 }
 
@@ -921,7 +942,7 @@ async fn request_capsule(
     loop {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() {
-            return Err(capsule_timeout(response_topic));
+            return Err(capsule_timeout(response_topic, timeout));
         }
         let event = match tokio::time::timeout(remaining, receiver.recv()).await {
             Ok(Some(ev)) => ev,
@@ -930,7 +951,7 @@ async fn request_capsule(
                     "event bus closed before a session capsule reply on {response_topic}"
                 )));
             },
-            Err(_) => return Err(capsule_timeout(response_topic)),
+            Err(_) => return Err(capsule_timeout(response_topic, timeout)),
         };
 
         let AstridEvent::Ipc { message, .. } = &*event else {
@@ -959,10 +980,10 @@ async fn request_capsule(
 /// dedicated `504 Gateway Timeout` variant; the closest honest fit is
 /// `Kernel`, which maps to `502 Bad Gateway` (an upstream that didn't
 /// answer). The message names the timeout explicitly.
-fn capsule_timeout(response_topic: &str) -> GatewayError {
+fn capsule_timeout(response_topic: &str, timeout: Duration) -> GatewayError {
     GatewayError::Kernel(format!(
         "session capsule did not reply within {}s on {response_topic}",
-        CAPSULE_TIMEOUT.as_secs()
+        timeout.as_secs()
     ))
 }
 
@@ -1027,20 +1048,23 @@ mod tests {
 
     #[test]
     fn build_list_payload_matches_frozen_contract() {
-        // With both cursor and limit present.
-        let p = build_list_payload("corr-1", Some("opaque-cursor"), 50);
+        // With cursor, limit, and include_archived present.
+        let p = build_list_payload("corr-1", Some("opaque-cursor"), 50, true);
         assert_eq!(p["correlation_id"], "corr-1");
         assert_eq!(p["cursor"], "opaque-cursor");
         assert_eq!(p["limit"], 50);
+        assert_eq!(p["include_archived"], true);
         // Absent cursor serializes as JSON null, not omitted — the frozen
-        // contract is `"cursor": <string> | null`.
-        let p = build_list_payload("corr-2", None, 10);
+        // contract is `"cursor": <string> | null`. include_archived defaults
+        // to false at the handler.
+        let p = build_list_payload("corr-2", None, 10, false);
         assert_eq!(p["cursor"], Value::Null);
         assert!(
             p.get("cursor").is_some(),
             "cursor key must be present as null"
         );
         assert_eq!(p["limit"], 10);
+        assert_eq!(p["include_archived"], false);
     }
 
     #[test]
@@ -1081,11 +1105,17 @@ mod tests {
                     "preview": null
                 }
             ],
-            "next_cursor": "page-2"
+            "next_cursor": "page-2",
+            "total": 2
         });
         let parsed = parse_list_response(body).expect("frozen list shape must deserialize");
         assert_eq!(parsed.sessions.len(), 2);
         assert_eq!(parsed.next_cursor.as_deref(), Some("page-2"));
+        assert_eq!(
+            parsed.total,
+            Some(2),
+            "total is surfaced from the capsule reply"
+        );
 
         let first = &parsed.sessions[0];
         assert_eq!(first.session_id, "default");
@@ -1208,7 +1238,7 @@ mod tests {
             });
         });
 
-        let payload = build_list_payload(correlation_id, None, DEFAULT_LIMIT);
+        let payload = build_list_payload(correlation_id, None, DEFAULT_LIMIT, false);
         let value = request_capsule(
             &bus,
             TOPIC_LIST_REQUEST,
@@ -1593,7 +1623,7 @@ mod tests {
             });
         });
 
-        let payload = build_list_payload(correlation_id, None, DEFAULT_LIMIT);
+        let payload = build_list_payload(correlation_id, None, DEFAULT_LIMIT, false);
         let err = request_capsule(
             &bus,
             TOPIC_LIST_REQUEST,
