@@ -2740,8 +2740,10 @@ mod tests {
         let default = astrid_core::PrincipalId::default();
 
         // Operator wrote their own config pre-bootstrap.
-        let mut existing = astrid_core::PrincipalProfile::default();
-        existing.groups = vec!["agent".to_string()];
+        let existing = astrid_core::PrincipalProfile {
+            groups: vec!["agent".to_string()],
+            ..Default::default()
+        };
         let path = astrid_core::PrincipalProfile::path_for(&home, &default);
         std::fs::create_dir_all(home.profiles_dir()).unwrap();
         existing.save_to_path(&path).unwrap();
@@ -2757,8 +2759,10 @@ mod tests {
         let (_d, home) = scratch_home();
         let default = astrid_core::PrincipalId::default();
 
-        let mut existing = astrid_core::PrincipalProfile::default();
-        existing.grants = vec!["system:status".to_string()];
+        let existing = astrid_core::PrincipalProfile {
+            grants: vec!["system:status".to_string()],
+            ..Default::default()
+        };
         let path = astrid_core::PrincipalProfile::path_for(&home, &default);
         std::fs::create_dir_all(home.profiles_dir()).unwrap();
         existing.save_to_path(&path).unwrap();
@@ -2776,8 +2780,10 @@ mod tests {
         let (_d, home) = scratch_home();
         let default = astrid_core::PrincipalId::default();
 
-        let mut existing = astrid_core::PrincipalProfile::default();
-        existing.revokes = vec!["system:shutdown".to_string()];
+        let existing = astrid_core::PrincipalProfile {
+            revokes: vec!["system:shutdown".to_string()],
+            ..Default::default()
+        };
         let path = astrid_core::PrincipalProfile::path_for(&home, &default);
         std::fs::create_dir_all(home.profiles_dir()).unwrap();
         existing.save_to_path(&path).unwrap();
@@ -2803,8 +2809,10 @@ mod tests {
             .config_dir()
             .join("profile.toml");
         std::fs::create_dir_all(legacy_path.parent().unwrap()).unwrap();
-        let mut existing = astrid_core::PrincipalProfile::default();
-        existing.groups = vec!["operator-configured".to_string()];
+        let existing = astrid_core::PrincipalProfile {
+            groups: vec!["operator-configured".to_string()],
+            ..Default::default()
+        };
         existing.save_to_path(&legacy_path).unwrap();
 
         seed_default_principal_admin_profile(&home).unwrap();
@@ -2831,15 +2839,19 @@ mod tests {
             .config_dir()
             .join("profile.toml");
         std::fs::create_dir_all(legacy_path.parent().unwrap()).unwrap();
-        let mut stale = astrid_core::PrincipalProfile::default();
-        stale.groups = vec!["stale".to_string()];
+        let stale = astrid_core::PrincipalProfile {
+            groups: vec!["stale".to_string()],
+            ..Default::default()
+        };
         stale.save_to_path(&legacy_path).unwrap();
 
         // Fresh new-path content (migrated already).
         let new_path = astrid_core::PrincipalProfile::path_for(&home, &default);
         std::fs::create_dir_all(new_path.parent().unwrap()).unwrap();
-        let mut canonical = astrid_core::PrincipalProfile::default();
-        canonical.groups = vec!["canonical".to_string()];
+        let canonical = astrid_core::PrincipalProfile {
+            groups: vec!["canonical".to_string()],
+            ..Default::default()
+        };
         canonical.save_to_path(&new_path).unwrap();
 
         seed_default_principal_admin_profile(&home).unwrap();

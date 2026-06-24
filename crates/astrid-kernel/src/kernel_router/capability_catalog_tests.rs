@@ -64,10 +64,9 @@ fn known_capabilities_covers_every_kernel_request_cap() {
     }
 }
 
-#[test]
-fn known_capabilities_covers_every_admin_request_cap() {
+fn all_admin_request_variants() -> Vec<AdminRequestKind> {
     let p = PrincipalId::default();
-    let admin_variants: Vec<AdminRequestKind> = vec![
+    vec![
         AdminRequestKind::AgentCreate {
             name: "alice".into(),
             groups: vec![],
@@ -161,13 +160,16 @@ fn known_capabilities_covers_every_admin_request_cap() {
             principal: p.clone(),
         },
         AdminRequestKind::PairDeviceRevoke {
-            principal: p.clone(),
+            principal: p,
             key_id: "k".into(),
         },
-    ];
+    ]
+}
 
+#[test]
+fn known_capabilities_covers_every_admin_request_cap() {
     let scopes = [AuthorityScope::Self_, AuthorityScope::Global];
-    for req in &admin_variants {
+    for req in &all_admin_request_variants() {
         for scope in scopes {
             let cap = required_capability_for_admin_request(req, scope);
             assert!(

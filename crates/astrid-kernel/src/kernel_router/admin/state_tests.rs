@@ -715,8 +715,10 @@ async fn quota_set_rejects_zero_memory() {
     )
     .await;
 
-    let mut q = Quotas::default();
-    q.max_memory_bytes = 0;
+    let q = Quotas {
+        max_memory_bytes: 0,
+        ..Default::default()
+    };
     let res = handlers::dispatch(
         &kernel,
         &astrid_core::PrincipalId::default(),
@@ -747,8 +749,10 @@ async fn quota_set_updates_profile_and_invalidates_cache() {
     .await;
     let _warm = kernel.profile_cache.resolve(&pid("eve")).unwrap();
 
-    let mut q = Quotas::default();
-    q.max_memory_bytes = 8 * 1024 * 1024;
+    let q = Quotas {
+        max_memory_bytes: 8 * 1024 * 1024,
+        ..Default::default()
+    };
     handlers::dispatch(
         &kernel,
         &astrid_core::PrincipalId::default(),
@@ -884,6 +888,7 @@ async fn group_list_returns_every_group_marked_correctly() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn group_delete_reference_from_profile_does_not_elevate_privileges() {
+    use astrid_capabilities::CapabilityCheck;
     // Adversarial: a principal's profile references a custom group; we
     // delete that group. The principal must NOT be silently elevated
     // via any other group. Layer 5 fails closed on unknown group refs.
@@ -926,7 +931,6 @@ async fn group_delete_reference_from_profile_does_not_elevate_privileges() {
     // Re-resolve Frank's profile via cache. `ops` in groups vec, but
     // GroupConfig no longer contains it — fail-closed: `capsule:install`
     // must NOT be authorized.
-    use astrid_capabilities::CapabilityCheck;
     let profile = kernel.profile_cache.resolve(&pid("frank")).unwrap();
     let groups = kernel.groups.load_full();
     let check = CapabilityCheck::new(profile.as_ref(), groups.as_ref(), pid("frank"));
