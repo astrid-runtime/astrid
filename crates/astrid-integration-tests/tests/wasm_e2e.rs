@@ -1,3 +1,4 @@
+#![allow(clippy::too_many_lines)]
 use std::path::PathBuf;
 use std::sync::Arc;
 

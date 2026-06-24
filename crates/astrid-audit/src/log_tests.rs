@@ -66,7 +66,7 @@ fn test_audit_builder() {
     let log = AuditLog::in_memory(keypair);
     let session_id = SessionId::new();
 
-    let entry_id = AuditBuilder::new(&log, session_id)
+    let entry_id = AuditBuilder::new(&log, session_id.clone())
         .action(AuditAction::SessionStarted {
             user_id,
             platform: "cli".to_string(),
@@ -78,6 +78,19 @@ fn test_audit_builder() {
         .unwrap();
 
     assert!(log.get(&entry_id).unwrap().is_some());
+
+    // Also verify success_with and failure builders to prevent dead code.
+    let entry_id2 = AuditBuilder::new(&log, session_id.clone())
+        .action(AuditAction::ConfigReloaded)
+        .success_with("custom-details")
+        .unwrap();
+    assert!(log.get(&entry_id2).unwrap().is_some());
+
+    let entry_id3 = AuditBuilder::new(&log, session_id)
+        .action(AuditAction::ConfigReloaded)
+        .failure("custom-error")
+        .unwrap();
+    assert!(log.get(&entry_id3).unwrap().is_some());
 }
 
 #[test]

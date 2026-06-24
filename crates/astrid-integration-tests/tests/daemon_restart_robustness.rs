@@ -54,6 +54,7 @@
 // `#[ignore]`-gated so it never runs concurrently with other tests in the
 // shared process. Mirrors `gateway_e2e.rs`.
 #![allow(unsafe_code)]
+#![allow(clippy::disallowed_methods)]
 
 use astrid_core::dirs::AstridHome;
 
@@ -190,7 +191,7 @@ fn killing_lock_holder_frees_the_lock() {
     drop(contender);
 
     // SIGKILL the holder — the OS releases its flock on death.
-    let pid = nix::unistd::Pid::from_raw(child.id() as i32);
+    let pid = nix::unistd::Pid::from_raw(i32::try_from(child.id()).unwrap());
     nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGKILL).expect("kill child");
     let _ = child.wait();
 

@@ -3,10 +3,10 @@
 //! Each test builds a [`test_kernel_with_home`](crate::test_kernel_with_home)
 //! rooted in a private tempdir and invokes [`super::handlers::dispatch`]
 //! directly, bypassing the IPC dispatch but keeping the write-lock / cache /
-//! ArcSwap semantics identical to the production path.
+//! `ArcSwap` semantics identical to the production path.
 //!
 //! These tests cover the Layer 6 behavioural invariants: post-conditions
-//! on disk, cache invalidation, ArcSwap hot-reload, adversarial
+//! on disk, cache invalidation, `ArcSwap` hot-reload, adversarial
 //! sequences (grant-after-revoke, quota=0 rejection, built-in protection,
 //! concurrent writes).
 

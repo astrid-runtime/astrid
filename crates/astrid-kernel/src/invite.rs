@@ -344,7 +344,7 @@ mod tests {
             issued_at_epoch: now,
             metadata: Some("alice".into()),
         };
-        store.save(&[invite.clone()]).unwrap();
+        store.save(std::slice::from_ref(&invite)).unwrap();
         let loaded = store.load().unwrap();
         assert_eq!(loaded, vec![invite]);
     }

@@ -57,6 +57,7 @@
 // test binary before any other thread reads it, so the soundness
 // hazard doesn't apply here.
 #![allow(unsafe_code)]
+#![allow(clippy::disallowed_methods, clippy::too_many_lines, clippy::items_after_statements)]
 
 use std::sync::Arc;
 

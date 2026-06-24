@@ -313,9 +313,10 @@ mod tests {
     }
 
     fn profile_in(groups: &[&str]) -> PrincipalProfile {
-        let mut p = PrincipalProfile::default();
-        p.groups = groups.iter().map(|s| (*s).to_string()).collect();
-        p
+        PrincipalProfile {
+            groups: groups.iter().map(|s| (*s).to_string()).collect(),
+            ..Default::default()
+        }
     }
 
     fn pid() -> PrincipalId {

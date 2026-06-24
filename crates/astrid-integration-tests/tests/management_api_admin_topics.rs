@@ -12,7 +12,7 @@
 //! - The pure mapping functions from
 //!   [`astrid_kernel::kernel_router::admin`]
 //!
-//! Stateful handler behaviour (write-lock serialization, ArcSwap
+//! Stateful handler behaviour (write-lock serialization, `ArcSwap`
 //! hot-reload, atomic `groups.toml` / `profile.toml` writes) is covered
 //! by the in-crate tests under
 //! `crates/astrid-kernel/src/kernel_router/admin/state_tests.rs`, which
@@ -20,7 +20,7 @@
 //! wire-format / decision-matrix contract visible from outside the
 //! kernel crate.
 
-#![allow(clippy::arithmetic_side_effects)]
+#![allow(clippy::arithmetic_side_effects, clippy::field_reassign_with_default)]
 
 use astrid_capabilities::{CapabilityCheck, PermissionError};
 use astrid_core::kernel_api::{

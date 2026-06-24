@@ -413,23 +413,23 @@ mod tests {
 
     // --- bwrap probe interpretation tests ---
 
-    fn mock_output(code: i32, stderr: &str) -> io::Result<std::process::Output> {
+    fn mock_output(code: i32, stderr: &str) -> std::process::Output {
         use std::os::unix::process::ExitStatusExt;
-        Ok(std::process::Output {
+        std::process::Output {
             status: std::process::ExitStatus::from_raw(code << 8),
             stdout: Vec::new(),
             stderr: stderr.as_bytes().to_vec(),
-        })
+        }
     }
 
     #[test]
     fn test_bwrap_probe_success() {
-        assert!(interpret_bwrap_probe(mock_output(0, "")));
+        assert!(interpret_bwrap_probe(Ok(mock_output(0, ""))));
     }
 
     #[test]
     fn test_bwrap_probe_namespace_denied() {
-        let result = mock_output(1, "bwrap: setting up uid map: Permission denied\n");
+        let result = Ok(mock_output(1, "bwrap: setting up uid map: Permission denied\n"));
         assert!(!interpret_bwrap_probe(result));
     }
 

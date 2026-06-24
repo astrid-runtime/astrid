@@ -15,7 +15,7 @@
 //! process side effects. If the kernel ever changes the enforcement
 //! contract, this test will break compile-wise and flag it.
 
-#![allow(clippy::arithmetic_side_effects)]
+#![allow(clippy::arithmetic_side_effects, clippy::field_reassign_with_default)]
 
 use astrid_capabilities::{CapabilityCheck, PermissionError};
 use astrid_core::kernel_api::KernelRequest;

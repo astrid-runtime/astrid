@@ -395,6 +395,9 @@ mod tests {
             .add("mcp://test:read", Permission::Invoke)
             .add("mcp://test:write", Permission::Invoke);
 
+        let checked = check.check_all(&default_principal(), &validator);
+        assert_eq!(checked.len(), 2);
+
         assert!(!check.all_authorized(&default_principal(), &validator));
 
         let needs = check.needs_approval(&default_principal(), &validator);

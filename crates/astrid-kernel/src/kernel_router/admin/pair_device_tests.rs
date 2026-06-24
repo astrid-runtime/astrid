@@ -10,7 +10,7 @@
 //! * a scoped issuer is denied minting a `Full` token (full-mint gate) and the
 //!   stored child scope inherits the issuer's denies (monotonic narrowing);
 //! * list/revoke round-trip, and a revoked device fails closed at the gate;
-//! * audit params carry the scope / key_id but never a raw key or token.
+//! * audit params carry the scope / `key_id` but never a raw key or token.
 //!
 //! The HTTP-bearer half of the cross-transport guarantees lives in the gateway
 //! crate's `tests/router.rs`; the socket/kernel half is here plus the existing

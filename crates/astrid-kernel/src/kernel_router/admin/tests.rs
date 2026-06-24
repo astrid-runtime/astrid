@@ -8,7 +8,7 @@
 //! 2. **Composition tests** — reassemble the same pieces the runtime
 //!    uses ([`GroupConfig`] + [`PrincipalProfile`] +
 //!    [`CapabilityCheck`]) and assert the post-condition invariants
-//!    (cross-tenant deny for `agent`, ArcSwap hot-reload observed by the
+//!    (cross-tenant deny for `agent`, `ArcSwap` hot-reload observed by the
 //!    next check, cache invalidation reflects on-disk writes,
 //!    revoke-precedence preserved across a subsequent grant).
 

@@ -5,13 +5,14 @@
 //! shell script can grep the output.
 //!
 //! Run via:
-//!     cargo run --example sandbox_probe -- [WRITABLE_ROOT]
+//!     cargo run --example `sandbox_probe` -- [`WRITABLE_ROOT`]
 //!
 //! Reads `ASTRID_SANDBOX_POLICY` from the env to exercise both the
 //! default (`Required`) path and the explicit `off` override.
 
 use astrid_workspace::ProcessSandboxConfig;
 
+#[allow(clippy::unnecessary_debug_formatting)]
 fn main() {
     let writable = std::env::args()
         .nth(1)

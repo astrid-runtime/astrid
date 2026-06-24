@@ -130,8 +130,7 @@ async fn gateway_terminates_tls_for_openapi_endpoint() {
 
     let response = response.unwrap_or_else(|| {
         panic!(
-            "TLS gateway never responded at {url}; last error: {:?}",
-            last_err
+            "TLS gateway never responded at {url}; last error: {last_err:?}"
         )
     });
     assert!(

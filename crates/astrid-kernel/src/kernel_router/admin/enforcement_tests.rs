@@ -67,7 +67,9 @@ async fn send_admin(
     // Wait briefly for the response. The admin router is spawned at
     // kernel construction time so this should fire on the next tokio
     // tick; a 2-second timeout keeps misbehaving tests from hanging CI.
-    let response = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+    
+
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
         loop {
             let event = rx.recv().await.expect("response event");
             if let astrid_events::AstridEvent::Ipc { message, .. } = &*event
@@ -78,9 +80,7 @@ async fn send_admin(
         }
     })
     .await
-    .expect("admin response within 2s");
-
-    response
+    .expect("admin response within 2s")
 }
 
 // ── enabled-flag enforcement (Layer 5 preamble + Layer 6 admin) ──
