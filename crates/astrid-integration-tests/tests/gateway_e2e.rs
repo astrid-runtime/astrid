@@ -226,6 +226,7 @@ async fn kernel_and_gateway_boot_against_shared_home() {
         workspace.clone(),
         astrid_capsule::CapsuleRuntimeLimits::default(),
         std::collections::HashMap::new(),
+        astrid_capsule::HttpLimits::default(),
     )
     .await
     {

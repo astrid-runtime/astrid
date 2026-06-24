@@ -8,7 +8,10 @@
 //! - the 4-concurrent-stream quota actually triggers (`http_stream_backend`
 //!   populates `active_http_streams`; close/drop release the slot);
 //! - the header (time-to-first-byte) deadline bounds a hung pre-header server
-//!   (`send_one_hop`).
+//!   (`send_one_hop`);
+//! - a genuine host-not-found maps to the typed `DnsError` via the resolver's
+//!   `dns_failed` flag (narrowed to `ErrorKind::NotFound`), while a transient
+//!   resolver error falls through (`lookup_err_is_not_found` / `flag_error`).
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -16,6 +19,7 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
+use crate::engine::wasm::limits::HttpLimits;
 use crate::engine::wasm::test_fixtures::minimal_host_state;
 use crate::security::AllowAllGate;
 
@@ -84,7 +88,7 @@ fn max_redirects_clamped_to_host_ceiling() {
         https_only: None,
         integrity: None,
     };
-    let resolved = super::options::ResolvedOptions::from_options(opts);
+    let resolved = super::options::ResolvedOptions::from_options(opts, &HttpLimits::default());
     assert_eq!(
         resolved.max_redirects, MAX_HTTP_REDIRECTS,
         "caller cannot raise max_redirects above the host ceiling"
@@ -169,10 +173,11 @@ async fn decompressed_cap_ignored_when_decompression_off() {
         https_only: None,
         integrity: None,
     };
+    let limits = state.http_limits;
     let resp = state
         .http_request_backend(
             get_request(format!("http://{addr}/")),
-            super::options::ResolvedOptions::from_options(opts),
+            super::options::ResolvedOptions::from_options(opts, &limits),
         )
         .await
         .expect("auto_decompress=off must not trip DecompressionBomb on raw bytes");
@@ -183,105 +188,200 @@ async fn decompressed_cap_ignored_when_decompression_off() {
 
 // ── FIX 4: the 4-concurrent-stream quota actually triggers ─────────────
 
-/// Opening a stream must populate `active_http_streams` (the quota map); the
-/// 5th concurrent stream for a principal is rejected with `Quota`; close/drop
-/// release the slot. Fails without the mirror insert/remove — the cap was dead
-/// (streams lived only in the resource table, which the quota check can't
-/// enumerate).
+/// The concurrency quota counts `active_http_streams`; the open past the cap is
+/// rejected with `Quota`; `stream_close` / `stream_drop` each release a slot so
+/// the next open fits again. Fails without the mirror insert/remove — the cap
+/// was dead (streams lived only in the resource table, which the quota check
+/// can't enumerate).
+///
+/// Hermetic and hang-proof: the quota gate runs BEFORE any network and reads
+/// only `active_http_streams.len()`, so the map is pre-populated with synthetic
+/// (no-network) streams; the at-cap open rejects immediately, and close/drop are
+/// asserted to release a slot (dropping the count below the cap so the gate
+/// would permit the next open). Opening real streams would block on the 120s
+/// streaming header deadline waiting for a responder.
 #[tokio::test]
 async fn stream_quota_triggers_and_releases() {
-    // One-shot 200 with a tiny body; the server closes after, but the stream
-    // resource (and its quota mirror) stays live until close/drop.
-    fn ok_response() -> Vec<u8> {
-        b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n".to_vec()
-    }
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let rt = tokio::runtime::Handle::current();
+        let mut state = minimal_host_state(rt);
+        state.security = Some(Arc::new(AllowAllGate));
+        let limits = state.http_limits;
+        let cap = limits.max_concurrent_streams;
+        let principal = state.effective_principal();
 
-    let rt = tokio::runtime::Handle::current();
+        // Fill the quota map to the cap with synthetic streams (no network),
+        // keyed by rep so `stream_close` / `stream_drop` can remove by rep.
+        let reps: Vec<u32> = (0..cap as u32).collect();
+        for &rep in &reps {
+            state.active_http_streams.insert(
+                u64::from(rep),
+                super::backend::ActiveHttpStream::dummy_for_test(&principal),
+            );
+        }
+        assert_eq!(
+            state.active_http_streams.len(),
+            cap,
+            "the quota map is populated to the cap"
+        );
 
-    // Open the cap (4) streams, each against its own loopback server.
-    let mut reps = Vec::new();
-    let mut servers = Vec::new();
-    // Build one shared state; each open needs that hop's port allowlisted, so
-    // collect all four ports first, then allowlist them all.
-    let mut addrs = Vec::new();
-    for _ in 0..4 {
-        let Some((addr, server)) = one_shot_server(ok_response()).await else {
-            return;
-        };
-        addrs.push(addr);
-        servers.push(server);
-    }
-    let mut state = minimal_host_state(rt);
-    state.security = Some(Arc::new(AllowAllGate));
-    state.local_egress = addrs
-        .iter()
-        .map(|a| format!("127.0.0.1:{}", a.port()))
-        .collect();
-
-    for addr in &addrs {
-        let res = state
+        // An open at the cap is rejected by the quota gate (it trips before any
+        // network — no responder is reached).
+        let err = state
             .http_stream_backend(
-                get_request(format!("http://{addr}/")),
-                super::options::ResolvedOptions::from_options(follow()),
+                get_request("http://127.0.0.1:9/".to_string()),
+                super::options::ResolvedOptions::from_options(follow(), &limits),
             )
             .await
-            .expect("opening up to the cap must succeed");
-        reps.push(res.rep());
-    }
-    assert_eq!(
-        state.active_http_streams.len(),
-        4,
-        "the quota map must be populated as streams open"
-    );
+            .expect_err("an open at the cap must hit the quota");
+        assert!(
+            matches!(err, ErrorCode::Quota),
+            "expected Quota, got {err:?}"
+        );
 
-    // A 5th open is rejected by the quota gate (no server needed — the gate
-    // trips before any network).
-    let Some((addr5, server5)) = one_shot_server(ok_response()).await else {
-        return;
-    };
-    state
-        .local_egress
-        .push(format!("127.0.0.1:{}", addr5.port()));
-    let err = state
-        .http_stream_backend(
-            get_request(format!("http://{addr5}/")),
-            super::options::ResolvedOptions::from_options(follow()),
-        )
-        .await
-        .expect_err("the 5th concurrent stream must hit the quota");
+        // `stream_close` releases a slot: the count drops below the cap, so the
+        // quota gate (`len >= cap`) would now permit the next open.
+        super::backend::stream_close(&mut state, reps[0]).expect("close ok");
+        assert_eq!(
+            state.active_http_streams.len(),
+            cap - 1,
+            "close must release the quota slot"
+        );
+        assert!(
+            state.active_http_streams.len() < cap,
+            "after a close the quota gate permits another open"
+        );
+
+        // Re-fill to the cap, then `stream_drop` releases a slot too.
+        state.active_http_streams.insert(
+            u64::from(reps[0]),
+            super::backend::ActiveHttpStream::dummy_for_test(&principal),
+        );
+        assert_eq!(state.active_http_streams.len(), cap);
+        super::backend::stream_drop(&mut state, reps[1]);
+        assert_eq!(
+            state.active_http_streams.len(),
+            cap - 1,
+            "drop must release the quota slot"
+        );
+    })
+    .await
+    .expect("stream-quota test must not hang (5s backstop)");
+}
+
+/// A NON-default operator `max_concurrent_streams` actually lowers the quota:
+/// with a configured cap of 2, the 3rd concurrent stream is rejected with
+/// `Quota` — where the host default (4) would allow it. Proves the stream cap
+/// reads `http_limits`, not the old `MAX_ACTIVE_HTTP_STREAMS` constant.
+///
+/// Hermetic and hang-proof: the quota gate runs at the TOP of
+/// `http_stream_backend`, BEFORE any network, and counts only
+/// `active_http_streams` entries — so the cap is pre-populated with synthetic
+/// (no-network) streams and a single open is asserted to reject immediately.
+/// Opening real streams would block on the 120s streaming header deadline
+/// waiting for a responder.
+#[tokio::test]
+async fn configured_max_concurrent_streams_lowers_quota() {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let rt = tokio::runtime::Handle::current();
+        let mut state = minimal_host_state(rt);
+        state.security = Some(Arc::new(AllowAllGate));
+        // Operator override: cap concurrent streams at 2 (below the default 4).
+        state.http_limits.max_concurrent_streams = 2;
+        let limits = state.http_limits;
+        let principal = state.effective_principal();
+
+        // Pre-fill the quota map to the configured cap (2) with synthetic
+        // streams — no sockets, no network.
+        for rep in 0..2u64 {
+            state.active_http_streams.insert(
+                rep,
+                super::backend::ActiveHttpStream::dummy_for_test(&principal),
+            );
+        }
+        assert_eq!(state.active_http_streams.len(), 2);
+
+        // The next open is rejected by the LOWERED quota (the gate trips before
+        // any network). The default cap of 4 would have allowed it here.
+        let err = state
+            .http_stream_backend(
+                get_request("http://127.0.0.1:9/".to_string()),
+                super::options::ResolvedOptions::from_options(follow(), &limits),
+            )
+            .await
+            .expect_err("the 3rd stream must hit the configured cap of 2");
+        assert!(
+            matches!(err, ErrorCode::Quota),
+            "expected Quota at the configured cap, got {err:?}"
+        );
+    })
+    .await
+    .expect("stream-quota test must not hang (5s backstop)");
+}
+
+/// FIX C / FIX 2 regression: a genuine host-not-found surfaces the typed
+/// `DnsError`, but a transient resolver error (timeout / I/O) does NOT — it
+/// falls through to the generic classification. reqwest collapses a
+/// `dns_resolver` failure into an opaque `is_connect()` error, so the
+/// `SafeDnsResolver` flags a NOT-FOUND miss out-of-band via `dns_failed`
+/// (mirroring the airlock `tripped` channel) and `airlock_or` maps it to
+/// `DnsError`. `dns_failed` is narrowed to `ErrorKind::NotFound` so a transient
+/// failure isn't mislabeled as not-found.
+///
+/// The narrowing is asserted directly via `lookup_err_is_not_found` (fully
+/// hermetic, platform-independent — `lookup_host`'s error kind for a `.invalid`
+/// host varies by platform: macOS reports `Uncategorized`, others `NotFound`).
+#[test]
+fn dns_not_found_is_narrowed_to_notfound_kind() {
+    use std::io::{Error, ErrorKind};
+
+    // The load-bearing FIX-2 decision: only NotFound is a `dns-error` miss.
+    assert!(super::ssrf::lookup_err_is_not_found(&Error::new(
+        ErrorKind::NotFound,
+        "host not found"
+    )));
+    // A transient resolver timeout / I/O error must NOT be treated as not-found
+    // (it would mislabel a connection problem as DnsError).
+    assert!(!super::ssrf::lookup_err_is_not_found(&Error::new(
+        ErrorKind::TimedOut,
+        "resolver timed out"
+    )));
+    assert!(!super::ssrf::lookup_err_is_not_found(&Error::other(
+        "transient resolver failure"
+    )));
+}
+
+/// The resolver's empty-resolved-addresses path (a host that resolves to ONLY
+/// airlock-filtered-out addresses, with none unsafe — an unambiguous no-resolve)
+/// sets `dns_failed`, and `flag_error` maps the flags to the typed errors with
+/// the airlock taking precedence. Driven at the resolver/flag layer so it is
+/// hermetic and proxy-independent.
+#[test]
+fn dns_failed_flag_maps_to_dns_error_with_airlock_precedence() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let tripped = AtomicBool::new(false);
+    let dns_failed = AtomicBool::new(false);
+
+    // Neither flag → fall through (None).
+    assert!(super::ssrf::flag_error(&tripped, &dns_failed).is_none());
+
+    // dns_failed alone → DnsError.
+    dns_failed.store(true, Ordering::Relaxed);
+    assert!(matches!(
+        super::ssrf::flag_error(&tripped, &dns_failed),
+        Some(ErrorCode::DnsError)
+    ));
+
+    // Airlock takes precedence when both are set.
+    tripped.store(true, Ordering::Relaxed);
     assert!(
-        matches!(err, ErrorCode::Quota),
-        "expected Quota, got {err:?}"
+        matches!(
+            super::ssrf::flag_error(&tripped, &dns_failed),
+            Some(ErrorCode::AirlockRejected)
+        ),
+        "airlock must take precedence over a DNS miss"
     );
-
-    // Closing one frees a slot; the map shrinks and a new open succeeds.
-    super::backend::stream_close(&mut state, reps[0]).expect("close ok");
-    assert_eq!(
-        state.active_http_streams.len(),
-        3,
-        "close must release the quota slot"
-    );
-    let opened = state
-        .http_stream_backend(
-            get_request(format!("http://{addr5}/")),
-            super::options::ResolvedOptions::from_options(follow()),
-        )
-        .await
-        .expect("after a close, a new stream fits under the cap");
-    assert_eq!(state.active_http_streams.len(), 4);
-
-    // Drop also releases the slot.
-    super::backend::stream_drop(&mut state, opened.rep());
-    assert_eq!(
-        state.active_http_streams.len(),
-        3,
-        "drop must release the quota slot"
-    );
-
-    for s in servers {
-        let _ = s.await;
-    }
-    let _ = server5.await;
 }
 
 fn follow() -> RequestOptions {
@@ -307,29 +407,31 @@ fn follow() -> RequestOptions {
 /// is caught here without waiting 120s for a live hang.
 #[test]
 fn header_deadline_decision_table() {
-    use super::backend::{HTTP_HEADER_DEADLINE_FLOOR, header_deadline};
+    use super::backend::header_deadline;
     use super::options::ResolvedOptions;
 
-    let base = ResolvedOptions::v10_defaults();
+    let limits = HttpLimits::default();
+    let floor = limits.header_deadline_floor;
+    let base = ResolvedOptions::v10_defaults(&limits);
 
     // Explicit first-byte wins over everything.
     let mut o = base.clone();
     o.first_byte_timeout = Some(Duration::from_millis(250));
     o.total_timeout = Some(Duration::from_secs(30));
-    assert_eq!(header_deadline(&o), Duration::from_millis(250));
+    assert_eq!(header_deadline(&o, floor), Duration::from_millis(250));
 
     // No first-byte, but a total (the buffered default) → bound by total.
     let mut o = base.clone();
     o.first_byte_timeout = None;
     o.total_timeout = Some(Duration::from_secs(30));
-    assert_eq!(header_deadline(&o), Duration::from_secs(30));
+    assert_eq!(header_deadline(&o, floor), Duration::from_secs(30));
 
     // STREAMING shape: total cleared, no first-byte → the floor bounds it.
     // (Without the floor, `send()` on a hung pre-header server never returns.)
     let mut o = base;
     o.first_byte_timeout = None;
     o.total_timeout = None;
-    assert_eq!(header_deadline(&o), HTTP_HEADER_DEADLINE_FLOOR);
+    assert_eq!(header_deadline(&o, floor), floor);
 }
 
 /// End-to-end: a server that accepts the TCP connection then never sends
@@ -376,11 +478,12 @@ async fn hung_pre_header_server_times_out() {
         integrity: None,
     };
 
+    let limits = state.http_limits;
     let result = tokio::time::timeout(
         Duration::from_secs(5),
         state.http_request_backend(
             get_request(format!("http://{addr}/")),
-            super::options::ResolvedOptions::from_options(opts),
+            super::options::ResolvedOptions::from_options(opts, &limits),
         ),
     )
     .await

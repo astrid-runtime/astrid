@@ -41,6 +41,33 @@ struct HookAbiResult {
     data: Option<String>,
 }
 
+/// Resolve operator `astrid:http` host policy from the global `[http]` config
+/// into the typed [`HttpLimits`](astrid_capsule::HttpLimits) applied to every
+/// hook `HostState`. `[http]` is operator-only global policy, so the global
+/// config layer is the source; an absent section / failed load yields the host's
+/// historical constants (`HttpLimits::default`).
+fn resolve_http_limits() -> astrid_capsule::HttpLimits {
+    let http = match astrid_config::Config::load(None) {
+        Ok(resolved) => resolved.config.http,
+        Err(e) => {
+            // Fail safe to host defaults, but NOT silently: a malformed global
+            // config would otherwise diverge hook HTTP policy from the
+            // operator's intent with no signal.
+            warn!(error = %e, "failed to load global [http] config for hook HTTP limits; using host defaults");
+            astrid_config::HttpSection::default()
+        },
+    };
+    astrid_capsule::HttpLimits::from_config_values(
+        http.default_timeout_secs,
+        http.stream_connect_timeout_secs,
+        http.stream_read_timeout_secs,
+        http.header_deadline_secs,
+        http.max_redirects,
+        http.max_concurrent_streams,
+        http.max_response_bytes,
+    )
+}
+
 /// Handler for WASM components.
 ///
 /// Lazily compiles the WASM component on first invocation and caches the
@@ -60,6 +87,12 @@ pub(crate) struct WasmHandler {
     /// Epoch ticker stop signal + thread handle (cleaned up on drop).
     epoch_stop: Arc<std::sync::atomic::AtomicBool>,
     epoch_handle: Option<std::thread::JoinHandle<()>>,
+    /// Resolved operator `astrid:http` host policy, applied to every hook
+    /// `HostState` so a WASM hook's HTTP calls honour the same `[http]` operator
+    /// limits as the live runtime. Resolved once at construction from the global
+    /// config (operator-only global policy); defaults to the host's historical
+    /// constants when no config is present.
+    http_limits: astrid_capsule::HttpLimits,
 }
 
 impl WasmHandler {
@@ -92,6 +125,7 @@ impl WasmHandler {
             cached_components: Mutex::new(HashMap::new()),
             config: WasmConfig::default(),
             kv: None,
+            http_limits: resolve_http_limits(),
             workspace_root,
             epoch_stop,
             epoch_handle: Some(epoch_handle),
@@ -345,6 +379,11 @@ impl WasmHandler {
             // capabilities and no local-egress exemptions (both fail-closed).
             capability_names: Vec::new(),
             local_egress: Vec::new(),
+            // Operator `astrid:http` host policy, resolved from the global
+            // `[http]` config at handler construction, so a WASM hook's HTTP
+            // calls honour the same limits as the live runtime (default = the
+            // host's historical constants when no config is present).
+            http_limits: self.http_limits,
             // Transient hook execution never subscribes to the audit feed;
             // fail-secure to scoped.
             audit_firehose: false,
@@ -532,5 +571,31 @@ mod tests {
             .await;
 
         assert!(result.is_err());
+    }
+
+    /// FIX 2 regression: the operator `[http]` host policy reaches the hook
+    /// `HostState`. A non-default `http_limits` on the handler must be reflected
+    /// on the built `HostState` (it previously hardcoded `HttpLimits::default()`,
+    /// so a configured limit never reached a WASM hook's HTTP calls).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_hook_host_state_reflects_configured_http_limits() {
+        let configured = astrid_capsule::HttpLimits {
+            max_concurrent_streams: 2,
+            default_total_timeout: Duration::from_secs(7),
+            ..astrid_capsule::HttpLimits::default()
+        };
+        let mut handler = WasmHandler::new(PathBuf::from("/tmp"));
+        handler.http_limits = configured;
+
+        let host_state = handler
+            .build_host_state("hook-test")
+            .expect("build_host_state");
+
+        assert_eq!(host_state.http_limits.max_concurrent_streams, 2);
+        assert_eq!(
+            host_state.http_limits.default_total_timeout,
+            Duration::from_secs(7),
+            "the configured [http] limit must reach the hook HostState, not default()"
+        );
     }
 }

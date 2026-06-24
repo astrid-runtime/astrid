@@ -58,6 +58,9 @@ nix = { workspace = true }
 [dev-dependencies]
 astrid-crypto = { workspace = true }
 astrid-mcp = { workspace = true, features = ["test-support"] }
+# Test-only: build a synthetic `reqwest::Response` (via `reqwest::Response::from`)
+# for hermetic stream-quota tests, with no network.
+http = "1"
 wasm-encoder = { workspace = true }
 
 [lints.rust]

@@ -29,6 +29,33 @@ use astrid_capsule::engine::wasm::host_state::LifecyclePhase;
 use astrid_capsule::manifest::CapsuleManifest;
 use astrid_events::EventBus;
 
+/// Resolve operator `astrid:http` host policy from the global `[http]` config
+/// section into the typed [`HttpLimits`](astrid_capsule::HttpLimits) for the
+/// lifecycle hook's `HostState`. `[http]` is operator-only global policy, so the
+/// global layer is the right source; an absent section / failed load yields the
+/// host's historical constants (`HttpLimits::default`).
+fn resolve_http_limits() -> astrid_capsule::HttpLimits {
+    let http = match astrid_config::Config::load(None) {
+        Ok(resolved) => resolved.config.http,
+        Err(e) => {
+            // Fail safe to host defaults, but NOT silently: a malformed global
+            // config would otherwise diverge lifecycle HTTP policy from the
+            // operator's intent with no signal.
+            tracing::warn!(error = %e, "failed to load global [http] config for lifecycle HTTP limits; using host defaults");
+            astrid_config::HttpSection::default()
+        },
+    };
+    astrid_capsule::HttpLimits::from_config_values(
+        http.default_timeout_secs,
+        http.stream_connect_timeout_secs,
+        http.stream_read_timeout_secs,
+        http.header_deadline_secs,
+        http.max_redirects,
+        http.max_concurrent_streams,
+        http.max_response_bytes,
+    )
+}
+
 /// Run the capsule's lifecycle hook. No-op for non-WASM capsules.
 ///
 /// * `target_dir` — the installed capsule's directory. Passed to the
@@ -93,6 +120,11 @@ pub fn run_lifecycle(
         event_bus: event_bus.clone(),
         config: std::collections::HashMap::new(),
         secret_store,
+        // Resolve operator `[http]` host policy so a lifecycle hook's HTTP calls
+        // honour the same limits as the live runtime. `[http]` is operator-only
+        // global policy, so the global config layer is the right (and only)
+        // source here; an absent section yields the host's historical constants.
+        http_limits: resolve_http_limits(),
     };
 
     // `engine::wasm::run_lifecycle` is async — async wasmtime requires

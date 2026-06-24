@@ -92,6 +92,15 @@ pub fn enforce_restrictions(
         "security.capsule_local_egress",
     );
 
+    // http: operator-only host HTTP ceilings (timeouts, redirect/stream caps,
+    // buffered-body limit). These are widening controls — a workspace/project
+    // layer raising any of them would let untrusted project config relax the
+    // host's outbound HTTP limits. Revert the WHOLE section to the operator
+    // baseline if a workspace layer touches it (the table is reverted as a unit,
+    // so a workspace cannot override even a single key). Only the operator's
+    // global config can set `[http]`.
+    block_workspace_override(merged, baseline, workspace_layer, &["http"], "http");
+
     // workspace.auto_allow_read: cannot expand beyond baseline.
     block_workspace_expansion(
         merged,

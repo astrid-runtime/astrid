@@ -16,6 +16,7 @@ path = "src/lib.rs"
 anyhow = { workspace = true }
 astrid-build = { workspace = true }
 astrid-capsule = { workspace = true }
+astrid-config = { workspace = true }
 astrid-core = { workspace = true }
 astrid-events = { workspace = true }
 astrid-storage = { workspace = true }

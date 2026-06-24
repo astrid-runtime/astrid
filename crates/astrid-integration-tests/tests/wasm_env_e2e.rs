@@ -114,6 +114,7 @@ async fn test_wasm_capsule_e2e_env_config_injection() {
         astrid_capsule::FuelRateLimiter::default(),
         astrid_capsule::MemoryLedger::default(),
         astrid_capsule::CapsuleRuntimeLimits::default(),
+        astrid_capsule::HttpLimits::default(),
     );
     let mut capsule = loader
         .create_capsule(manifest, fixture_path.parent().unwrap().to_path_buf())

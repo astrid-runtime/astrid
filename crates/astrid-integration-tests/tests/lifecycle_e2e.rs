@@ -48,6 +48,7 @@ fn make_lifecycle_config(wasm_bytes: Vec<u8>) -> (LifecycleConfig, ScopedKvStore
         event_bus,
         config: std::collections::HashMap::new(),
         secret_store,
+        http_limits: astrid_capsule::HttpLimits::default(),
     };
     (cfg, kv)
 }

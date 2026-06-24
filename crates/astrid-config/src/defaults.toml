@@ -94,6 +94,52 @@ approval_timeout_secs = 300
 # "astrid-capsule-openai-compat" = ["127.0.0.1:1234", "192.168.1.50:11434"]
 
 # ============================================================================
+# HTTP Host Limits
+# ============================================================================
+# Operator HTTP host policy for the astrid:http host (the SSRF-airlocked outbound
+# HTTP surface every capsule shares). As the trust root the operator MAY raise or
+# lower these soft limits. The four timeout values are per-request DEFAULTS: a
+# caller that sets the matching *-ms OVERRIDES them and may pick a LARGER value
+# (e.g. a longer total-ms for a big download) — they are not ceilings.
+# max_redirects and max_concurrent_streams ARE caller ceilings (a caller may
+# request fewer, never more). max_response_bytes is a default and caller ceiling,
+# itself hard-clamped to the host's absolute payload limit (the one hard cap).
+# The values shown are the defaults — an absent [http] section reproduces the
+# host's historical behaviour exactly.
+#
+# Operator config ONLY: like [security.capsule_local_egress], a project/workspace
+# config layer cannot set or widen these — only the operator sets host HTTP policy.
+#
+# [http]
+# Default whole-request timeout (seconds) for the buffered path when the caller
+# sets no total-ms. A per-request total-ms overrides it (and may be longer).
+# default_timeout_secs = 30
+#
+# Connect timeout (seconds) for the streaming path when no connect-ms is set.
+# stream_connect_timeout_secs = 30
+#
+# Per-chunk read timeout (seconds) for streaming responses when no
+# between-bytes-ms is set.
+# stream_read_timeout_secs = 120
+#
+# Time-to-first-byte (header) deadline floor (seconds) for the streaming path
+# when neither first-byte-ms nor a total timeout is set.
+# header_deadline_secs = 120
+#
+# Maximum redirect hops the host will follow. A per-request max-redirects may
+# request fewer, never more (clamped to this ceiling).
+# max_redirects = 10
+#
+# Per-capsule ceiling on concurrent HTTP streaming responses.
+# max_concurrent_streams = 4
+#
+# Default and caller ceiling (bytes) on a buffered response body. A per-request
+# max-response-bytes may request a smaller cap, never larger. Hard-clamped by the
+# request path to the host's absolute payload limit (the one hard cap the
+# operator cannot exceed). 10 MiB.
+# max_response_bytes = 10485760
+
+# ============================================================================
 # Budget Configuration
 # ============================================================================
 # Controls spending limits for LLM API calls to prevent runaway costs.

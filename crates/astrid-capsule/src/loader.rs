@@ -3,7 +3,7 @@
 use std::path::PathBuf;
 
 use crate::capsule::{Capsule, CompositeCapsule};
-use crate::engine::wasm::limits::CapsuleRuntimeLimits;
+use crate::engine::wasm::limits::{CapsuleRuntimeLimits, HttpLimits};
 use crate::error::CapsuleResult;
 use crate::fuel_ledger::{FuelLedger, FuelRateLimiter};
 use crate::manifest::CapsuleManifest;
@@ -32,6 +32,11 @@ pub struct CapsuleLoader {
     /// semaphores. A plain `Copy` value, not a shared handle. See
     /// [`CapsuleRuntimeLimits`].
     runtime_limits: CapsuleRuntimeLimits,
+    /// Resolved `astrid:http` host ceilings (timeouts, redirect/stream caps,
+    /// buffered-body limit), resolved once by the daemon from the `[http]`
+    /// config section and handed to every `WasmEngine`. A global `Copy` value.
+    /// See [`HttpLimits`].
+    http_limits: HttpLimits,
 }
 
 impl CapsuleLoader {
@@ -44,6 +49,8 @@ impl CapsuleLoader {
     /// `FuelRateLimiter::default()` in tests that don't exercise enforcement.
     /// `runtime_limits` is the resolved per-host concurrency ceiling pair; pass
     /// [`CapsuleRuntimeLimits::default()`] for all-host-derived sizing in tests.
+    /// `http_limits` is the resolved `astrid:http` host ceilings; pass
+    /// [`HttpLimits::default()`] for the host's historical constants in tests.
     #[must_use]
     pub fn new(
         mcp_client: SecureMcpClient,
@@ -51,6 +58,7 @@ impl CapsuleLoader {
         fuel_rate: FuelRateLimiter,
         memory_ledger: MemoryLedger,
         runtime_limits: CapsuleRuntimeLimits,
+        http_limits: HttpLimits,
     ) -> Self {
         Self {
             mcp_client,
@@ -58,6 +66,7 @@ impl CapsuleLoader {
             fuel_rate,
             memory_ledger,
             runtime_limits,
+            http_limits,
         }
     }
 
@@ -86,6 +95,7 @@ impl CapsuleLoader {
                 self.fuel_rate.clone(),
                 self.memory_ledger.clone(),
                 self.runtime_limits,
+                self.http_limits,
             )));
         }
 

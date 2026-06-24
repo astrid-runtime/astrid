@@ -28,6 +28,9 @@ pub struct Config {
     pub runtime: RuntimeSection,
     /// Signature requirements and approval timeout.
     pub security: SecurityConfig,
+    /// Operator ceilings for the `astrid:http` host (timeouts, redirect/stream
+    /// caps, buffered-body limit).
+    pub http: HttpSection,
     /// Budget limits for sessions and individual actions.
     pub budget: BudgetSection,
     /// Rate-limiting knobs for elicitation and pending requests.
@@ -230,6 +233,84 @@ impl Default for SecurityConfig {
             require_signatures: false,
             approval_timeout_secs: 300,
             capsule_local_egress: HashMap::new(),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// HttpSection
+// ---------------------------------------------------------------------------
+
+/// Operator HTTP host policy for `astrid:http` (the SSRF-airlocked outbound HTTP
+/// surface every capsule shares).
+///
+/// This is **operator policy**, set by the trust root: the operator MAY raise or
+/// lower the soft limits (timeouts, redirect/stream caps) — raising them is
+/// legitimate, not a violation. The fields play three distinct roles for a
+/// per-request `request-options` value:
+/// - the four **timeout fields** are per-request DEFAULTS, applied only when the
+///   caller sets no corresponding `*-ms`; an explicit caller value OVERRIDES the
+///   default and MAY be LARGER (e.g. a longer `total-ms` for a big download) —
+///   they are not ceilings;
+/// - `max_redirects` and `max_concurrent_streams` ARE caller ceilings — a caller
+///   is clamped to them (may request fewer, never more);
+/// - `max_response_bytes` is both a default and a caller ceiling, and is itself
+///   hard-clamped by the request path to the absolute `MAX_GUEST_PAYLOAD_LEN`
+///   payload limit — the one hard cap that even the operator cannot exceed.
+///
+/// The defaults reproduce the host's historical hardcoded constants exactly, so
+/// an absent `[http]` section changes nothing.
+///
+/// **Operator config only.** Like `[security.capsule_local_egress]`, a
+/// project/workspace config layer cannot set or widen these (enforced in
+/// `merge::restrict`) — only the operator (the trust root) sets host HTTP policy.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct HttpSection {
+    /// Default whole-request timeout (seconds) for the buffered path when the
+    /// caller sets no `total-ms`. A per-request `total-ms` overrides it (and
+    /// may be longer, for large downloads). Default: 30.
+    pub default_timeout_secs: u64,
+    /// Connect timeout (seconds) applied to the streaming path when the caller
+    /// sets no `connect-ms`. Default: 30.
+    pub stream_connect_timeout_secs: u64,
+    /// Per-chunk read timeout (seconds) for streaming responses when the caller
+    /// sets no `between-bytes-ms`. Default: 120.
+    pub stream_read_timeout_secs: u64,
+    /// Time-to-first-byte (header) deadline floor (seconds), applied on the
+    /// streaming path when the caller set neither `first-byte-ms` nor a total
+    /// timeout — bounds a server that accepts then hangs before sending
+    /// headers, without cutting a slow-TTFT LLM stream. Default: 120.
+    pub header_deadline_secs: u64,
+    /// Maximum redirect hops the host will follow. A per-request
+    /// `max-redirects` may request fewer, never more (it is clamped to this
+    /// ceiling). Default: 10.
+    pub max_redirects: u32,
+    /// Per-capsule ceiling on concurrent HTTP streaming responses. The
+    /// `max-active-http-streams` quota is checked per principal and globally
+    /// against this value. Default: 4.
+    pub max_concurrent_streams: u32,
+    /// Default and caller ceiling (bytes) on a buffered response body. A
+    /// per-request `max-response-bytes` may request a smaller cap, never a
+    /// larger one. This operator value is itself hard-clamped by the request
+    /// path to the host's absolute `MAX_GUEST_PAYLOAD_LEN` payload limit — the
+    /// one hard cap the operator cannot exceed (raising this above it has no
+    /// effect). Default: `10485760` (10 mebibytes).
+    pub max_response_bytes: u64,
+}
+
+impl Default for HttpSection {
+    /// The host's historical hardcoded constants — an absent `[http]` section
+    /// reproduces today's behaviour exactly.
+    fn default() -> Self {
+        Self {
+            default_timeout_secs: 30,
+            stream_connect_timeout_secs: 30,
+            stream_read_timeout_secs: 120,
+            header_deadline_secs: 120,
+            max_redirects: 10,
+            max_concurrent_streams: 4,
+            max_response_bytes: 10 * 1024 * 1024,
         }
     }
 }
@@ -1049,5 +1130,38 @@ astrid_user = "alice"
 "#;
         let cfg: Config = toml::from_str(toml).unwrap();
         assert_eq!(cfg.identity.links[0].method, "admin");
+    }
+
+    #[test]
+    fn test_http_section_defaults_match_host_constants() {
+        // An absent [http] section must reproduce the host's historical
+        // hardcoded constants exactly (defaults change nothing).
+        let cfg: Config = toml::from_str("[model]\nprovider = \"claude\"\n").unwrap();
+        let h = &cfg.http;
+        assert_eq!(h.default_timeout_secs, 30);
+        assert_eq!(h.stream_connect_timeout_secs, 30);
+        assert_eq!(h.stream_read_timeout_secs, 120);
+        assert_eq!(h.header_deadline_secs, 120);
+        assert_eq!(h.max_redirects, 10);
+        assert_eq!(h.max_concurrent_streams, 4);
+        assert_eq!(h.max_response_bytes, 10 * 1024 * 1024);
+        // The struct Default and the serde(default) for an absent section agree.
+        let d = HttpSection::default();
+        assert_eq!(d.default_timeout_secs, h.default_timeout_secs);
+        assert_eq!(d.max_response_bytes, h.max_response_bytes);
+    }
+
+    #[test]
+    fn test_http_section_parses_operator_overrides() {
+        let toml = "[http]\ndefault_timeout_secs = 5\nmax_redirects = 3\n\
+                    max_concurrent_streams = 2\nmax_response_bytes = 4096\n";
+        let cfg: Config = toml::from_str(toml).unwrap();
+        assert_eq!(cfg.http.default_timeout_secs, 5);
+        assert_eq!(cfg.http.max_redirects, 3);
+        assert_eq!(cfg.http.max_concurrent_streams, 2);
+        assert_eq!(cfg.http.max_response_bytes, 4096);
+        // Unset fields keep their defaults (partial [http] section).
+        assert_eq!(cfg.http.stream_read_timeout_secs, 120);
+        assert_eq!(cfg.http.header_deadline_secs, 120);
     }
 }

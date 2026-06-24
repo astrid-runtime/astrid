@@ -22,7 +22,7 @@ use crate::engine::wasm::host_state::HostState;
 use super::options::{
     ResolvedOptions, check_scheme, same_origin, strip_credentials, verify_integrity,
 };
-use super::ssrf::{RedirectAction, SafeDnsResolver, airlock_or, classify_redirect};
+use super::ssrf::{SafeDnsResolver, airlock_or, redirect_target_blocked};
 use super::{
     ErrorCode, HttpMethod, HttpRequestData, HttpResponseData, HttpStream, KeyValuePair,
     RedirectPolicy, ResponseMeta,
@@ -87,9 +87,6 @@ async fn check_http_security(
     Ok(())
 }
 
-/// Per-capsule hard ceiling on concurrent HTTP streaming responses.
-pub(crate) const MAX_ACTIVE_HTTP_STREAMS: usize = 4;
-
 /// A live HTTP streaming response pinned to the principal that opened it.
 #[derive(Debug, Clone)]
 pub struct ActiveHttpStream {
@@ -98,35 +95,48 @@ pub struct ActiveHttpStream {
     pub status: u16,
     pub headers: Vec<KeyValuePair>,
     /// Per-chunk read timeout. Caller-overridable via
-    /// `timeout-config.between-bytes-ms`; defaults to
-    /// [`HTTP_STREAM_READ_TIMEOUT`].
+    /// `timeout-config.between-bytes-ms`; defaults to the host
+    /// [`HttpLimits::stream_read_timeout`](crate::engine::wasm::limits::HttpLimits::stream_read_timeout).
     pub read_timeout: Duration,
 }
 
-const HTTP_STREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
-
-/// Fallback time-to-first-byte (header) deadline applied in [`HostState::send_one_hop`]
-/// when the caller set neither `first-byte-ms` nor a total timeout (the
-/// streaming case, where the total deadline is cleared). Generous enough not to
-/// cut a slow-TTFT LLM stream, but finite so a server that accepts then hangs
-/// before sending headers can never block the executor indefinitely.
-pub(super) const HTTP_HEADER_DEADLINE_FLOOR: Duration = Duration::from_secs(120);
-
-/// The deadline for `send()` to produce response HEADERS. An explicit caller
-/// `first-byte-ms` wins; else the (buffered) total deadline; else the
-/// [`HTTP_HEADER_DEADLINE_FLOOR`] — so the streaming path (total cleared, no
-/// first-byte) is still bounded and a hung pre-header server can't block the
-/// executor forever, while a legitimately slow-TTFT LLM stream is not cut.
-pub(super) fn header_deadline(opts: &ResolvedOptions) -> Duration {
-    opts.first_byte_timeout
-        .or(opts.total_timeout)
-        .unwrap_or(HTTP_HEADER_DEADLINE_FLOOR)
+impl ActiveHttpStream {
+    /// Build a quota-counting placeholder stream WITHOUT any network. The
+    /// streaming concurrency quota in [`HostState::http_stream_backend`] only
+    /// counts `active_http_streams` entries — it never reads the `response` — so
+    /// tests can pre-populate the map to the cap and assert the next open is
+    /// rejected with `Quota` immediately, instead of opening real streams (which
+    /// would block on the streaming header deadline waiting for a responder).
+    /// The `response` is a synthetic empty-body `200` made from an
+    /// `http::Response`, never an over-the-wire one.
+    #[cfg(test)]
+    pub(crate) fn dummy_for_test(creator: &astrid_core::principal::PrincipalId) -> Self {
+        let http_resp = http::Response::builder()
+            .status(200)
+            .body(reqwest::Body::from(Vec::<u8>::new()))
+            .expect("build synthetic http::Response");
+        Self {
+            response: Arc::new(tokio::sync::Mutex::new(reqwest::Response::from(http_resp))),
+            creator: creator.clone(),
+            status: 200,
+            headers: Vec::new(),
+            read_timeout: Duration::from_secs(120),
+        }
+    }
 }
 
-/// Per-chunk read timeout for streaming HTTP responses. Kept as a
-/// named constant so per-principal timeout tuning has a single edit
-/// point. Overridable per request via `timeout-config.between-bytes-ms`.
-const HTTP_STREAM_READ_TIMEOUT: Duration = Duration::from_secs(120);
+/// The deadline for `send()` to produce response HEADERS. An explicit caller
+/// `first-byte-ms` wins; else the (buffered) total deadline; else the host
+/// `header_deadline_floor` — so the streaming path (total cleared, no
+/// first-byte) is still bounded and a hung pre-header server can't block the
+/// executor forever, while a legitimately slow-TTFT LLM stream is not cut. The
+/// floor comes from the resolved [`HttpLimits`](crate::engine::wasm::limits::HttpLimits)
+/// (operator-configurable; default 120s).
+pub(super) fn header_deadline(opts: &ResolvedOptions, floor: Duration) -> Duration {
+    opts.first_byte_timeout
+        .or(opts.total_timeout)
+        .unwrap_or(floor)
+}
 
 /// Outcome of one wire request: the response, the wire-byte count
 /// (content-length when present; otherwise filled in after buffering), and
@@ -156,12 +166,14 @@ impl HostState {
         opts: &ResolvedOptions,
         exempt_host: Option<Arc<str>>,
         tripped: Arc<AtomicBool>,
+        dns_failed: Arc<AtomicBool>,
         redirect_policy: reqwest::redirect::Policy,
     ) -> Result<reqwest::Client, ErrorCode> {
         let mut builder = reqwest::Client::builder()
             .redirect(redirect_policy)
             .dns_resolver(Arc::new(SafeDnsResolver {
                 tripped,
+                dns_failed,
                 exempt_host,
             }));
 
@@ -218,6 +230,10 @@ impl HostState {
         let exempt = exempt_host.is_some();
 
         let tripped = Arc::new(AtomicBool::new(false));
+        // Out-of-band DNS-miss flag: reqwest collapses a `dns_resolver` failure
+        // into an opaque connect error, so the resolver flags a genuine
+        // NXDOMAIN/no-address miss here for `airlock_or` to map to `dns-error`.
+        let dns_failed = Arc::new(AtomicBool::new(false));
         // Manual redirect following on BOTH the buffered and streaming paths:
         // reqwest must NEVER follow on its own, so every hop re-enters this fn
         // and re-runs the full airlock (scheme + async gate + egress).
@@ -225,6 +241,7 @@ impl HostState {
             opts,
             exempt_host,
             tripped.clone(),
+            dns_failed.clone(),
             reqwest::redirect::Policy::none(),
         )?;
 
@@ -239,10 +256,10 @@ impl HostState {
         // so without this bound a server that accepts the TCP connection then
         // hangs before sending headers would block this future forever
         // (executor starvation).
-        let header_deadline = header_deadline(opts);
+        let header_deadline = header_deadline(opts, self.http_limits.header_deadline_floor);
         let response = util::bounded_await(&io_semaphore, async move {
             match tokio::time::timeout(header_deadline, request_builder.send()).await {
-                Ok(result) => result.map_err(|e| airlock_or(&tripped, &e)),
+                Ok(result) => result.map_err(|e| airlock_or(&tripped, &dns_failed, &e)),
                 Err(_elapsed) => Err(ErrorCode::Timeout),
             }
         })
@@ -338,10 +355,9 @@ impl HostState {
                             .map_err(|_| ErrorCode::Protocol("invalid redirect target".into()))?;
                         // Per-hop SSRF re-validation on an IP-literal target
                         // (hostnames are airlocked at resolution by the next
-                        // hop's `send_one_hop`).
-                        if classify_redirect(next_url.host_str(), redirect_count as usize)
-                            == RedirectAction::Block
-                        {
+                        // hop's `send_one_hop`). The hop ceiling is already
+                        // enforced above via `opts.max_redirects`.
+                        if redirect_target_blocked(next_url.host_str()) {
                             return Err(ErrorCode::RedirectBlocked);
                         }
                         // Strip credentials on a cross-origin hop.
@@ -489,14 +505,13 @@ impl HostState {
         opts: ResolvedOptions,
     ) -> Result<Resource<HttpStream>, ErrorCode> {
         let principal = self.effective_principal();
-        let per_principal_count = self
-            .active_http_streams
-            .values()
-            .filter(|s| s.creator == principal)
-            .count();
-        if per_principal_count >= MAX_ACTIVE_HTTP_STREAMS
-            || self.active_http_streams.len() >= MAX_ACTIVE_HTTP_STREAMS
-        {
+        let max_streams = self.http_limits.max_concurrent_streams;
+        // Per-capsule concurrency cap (matches the `max_concurrent_streams` field
+        // doc). `active_http_streams` holds this capsule's live streams, so its
+        // length is the per-capsule count. A separate, SMALLER per-principal
+        // limit would be needed for true per-principal isolation (one principal
+        // not starving others within the capsule) — out of scope here.
+        if self.active_http_streams.len() >= max_streams {
             return Err(ErrorCode::Quota);
         }
 
@@ -507,14 +522,19 @@ impl HostState {
         // timeout comes from `between-bytes-ms`, else the streaming default.
         let mut stream_opts = opts.clone();
         if stream_opts.connect_timeout.is_none() {
-            stream_opts.connect_timeout = Some(HTTP_STREAM_CONNECT_TIMEOUT);
+            stream_opts.connect_timeout = Some(self.http_limits.stream_connect_timeout);
         }
-        if opts.total_was_default() {
+        // Clear the total ONLY when it is the host default (the caller did NOT
+        // explicitly set `total-ms`). An explicit caller total is honoured even
+        // if it happens to equal the configured host default — keyed on
+        // explicitness, not value, so a configured default can't silently clear
+        // a caller's matching deadline.
+        if !opts.total_explicit {
             stream_opts.total_timeout = None;
         }
         let read_timeout = opts
             .between_bytes_timeout
-            .unwrap_or(HTTP_STREAM_READ_TIMEOUT);
+            .unwrap_or(self.http_limits.stream_read_timeout);
 
         // Manual follow with `stream_opts` so connect/total timeouts apply to
         // every hop. The terminal response is returned UNREAD.
@@ -545,12 +565,12 @@ impl HostState {
             .push(active.clone())
             .map_err(|e| ErrorCode::Unknown(format!("resource table: {e}")))?;
         // Mirror the stream into `active_http_streams`, keyed by the resource
-        // rep, so the per-principal + global concurrency quota (checked at the
-        // top of this fn) actually counts live streams. Without this the cap was
-        // dead — the resource table is not enumerable by principal. The mirror
-        // shares the same `Arc<Mutex<Response>>`, so `read_chunk` via the
-        // resource table stays consistent; this copy is purely for counting and
-        // is removed in `stream_close` / `stream_drop`.
+        // rep, so the per-capsule concurrency quota (checked at the top of this
+        // fn) actually counts live streams. Without this the cap was dead — the
+        // resource table is not enumerable. The mirror shares the same
+        // `Arc<Mutex<Response>>`, so `read_chunk` via the resource table stays
+        // consistent; this copy is purely for counting and is removed in
+        // `stream_close` / `stream_drop`.
         self.active_http_streams
             .insert(u64::from(resource.rep()), active);
         Ok(Resource::new_own(resource.rep()))
@@ -645,6 +665,21 @@ pub(super) fn stream_drop(state: &mut HostState, rep: u32) {
 }
 
 /// Classify a reqwest error into the typed `http::ErrorCode`.
+///
+/// `dns-error` is NOT recovered here — reqwest collapses a `dns_resolver`
+/// failure into an opaque `is_connect()` error, so a genuine resolution miss is
+/// distinguished out-of-band via the resolver's `dns_failed` flag in
+/// [`airlock_or`](super::ssrf::airlock_or), which runs before this on the send
+/// path.
+///
+// TODO(http): map TLS handshake / certificate failures to the contract's
+// `tls-error` arm. reqwest collapses them into `is_connect()` (→
+// `ConnectionError`). The TLS backend is `rustls`, a *transitive* dependency
+// (via hyper-rustls), so there is no stable typed error to `downcast` to
+// without adding rustls as a direct dependency and version-coupling to it;
+// walking `source()` and matching rustls' `Display` strings / type names is
+// brittle (not a stable API across rustls versions). Deferred rather than
+// shipping a fragile string matcher — the reliable `dns-error` half ships now.
 pub(super) fn map_reqwest_err(e: &reqwest::Error) -> ErrorCode {
     if e.is_timeout() {
         ErrorCode::Timeout

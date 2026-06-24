@@ -21,7 +21,10 @@
 
 mod backend;
 mod options;
-mod ssrf;
+// `pub(crate)` so the redirect-default const (`ssrf::MAX_HTTP_REDIRECTS`) can be
+// the single source of truth read by `HttpLimits::default`. The module's items
+// stay `pub(super)`; only the path is reachable crate-internally.
+pub(crate) mod ssrf;
 
 use wasmtime::component::Resource;
 
@@ -108,8 +111,9 @@ impl http_v10::Host for HostState {
         // Delegate to the @1.1.0 backend with @1.0.0-equivalent options, then
         // drop the `meta` field the @1.0.0 record lacks and convert types.
         let v11_request = v10_request_to_v11(request);
+        let limits = self.http_limits;
         let resp = self
-            .http_request_backend(v11_request, ResolvedOptions::v10_defaults())
+            .http_request_backend(v11_request, ResolvedOptions::v10_defaults(&limits))
             .await
             .map_err(v11_error_to_v10)?;
         Ok(http_v10::HttpResponseData {
@@ -124,8 +128,9 @@ impl http_v10::Host for HostState {
         request: http_v10::HttpRequestData,
     ) -> Result<Resource<http_v10::HttpStream>, http_v10::ErrorCode> {
         let v11_request = v10_request_to_v11(request);
+        let limits = self.http_limits;
         let res = self
-            .http_stream_backend(v11_request, ResolvedOptions::v10_defaults())
+            .http_stream_backend(v11_request, ResolvedOptions::v10_defaults(&limits))
             .await
             .map_err(v11_error_to_v10)?;
         // `HttpStream` is a zero-sized bindgen marker; both versions index the
@@ -217,7 +222,8 @@ impl http_v11::Host for HostState {
         // The bare `http-request` on @1.1.0 == `http-request-opts` with empty
         // options (the contract says an empty `request-options` reproduces
         // @1.0.0 behaviour).
-        self.http_request_backend(request, ResolvedOptions::v10_defaults())
+        let limits = self.http_limits;
+        self.http_request_backend(request, ResolvedOptions::v10_defaults(&limits))
             .await
     }
 
@@ -226,7 +232,8 @@ impl http_v11::Host for HostState {
         request: HttpRequestData,
         options: RequestOptions,
     ) -> Result<HttpResponseData, ErrorCode> {
-        self.http_request_backend(request, ResolvedOptions::from_options(options))
+        let limits = self.http_limits;
+        self.http_request_backend(request, ResolvedOptions::from_options(options, &limits))
             .await
     }
 
@@ -234,7 +241,8 @@ impl http_v11::Host for HostState {
         &mut self,
         request: HttpRequestData,
     ) -> Result<Resource<HttpStream>, ErrorCode> {
-        self.http_stream_backend(request, ResolvedOptions::v10_defaults())
+        let limits = self.http_limits;
+        self.http_stream_backend(request, ResolvedOptions::v10_defaults(&limits))
             .await
     }
 
@@ -243,7 +251,8 @@ impl http_v11::Host for HostState {
         request: HttpRequestData,
         options: RequestOptions,
     ) -> Result<Resource<HttpStream>, ErrorCode> {
-        self.http_stream_backend(request, ResolvedOptions::from_options(options))
+        let limits = self.http_limits;
+        self.http_stream_backend(request, ResolvedOptions::from_options(options, &limits))
             .await
     }
 

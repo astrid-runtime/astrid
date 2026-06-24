@@ -365,6 +365,15 @@ pub struct HostState {
     /// per principal or per invocation); the pool reset must NOT clear it.
     /// Empty = no exemptions (fail-closed).
     pub local_egress: Vec<String>,
+    /// Resolved operator ceilings for the `astrid:http` host (timeouts,
+    /// redirect/stream caps, buffered-body limit), from the `[http]` config
+    /// section. A GLOBAL value — the same for every capsule (unlike the
+    /// per-capsule [`local_egress`](Self::local_egress)); resolved once by the
+    /// daemon and snapshotted onto every pooled instance at load. The request
+    /// path reads its defaults and ceilings off this instead of module
+    /// constants. [`HttpLimits::default`](super::limits::HttpLimits::default)
+    /// reproduces the host's historical hardcoded constants.
+    pub http_limits: super::limits::HttpLimits,
     /// Whether this capsule's OWNER principal holds `audit:read_all`,
     /// resolved at LOAD the PRIVILEGED way (against the profile cache +
     /// live group config — **not** the manifest, unlike
@@ -747,6 +756,7 @@ impl std::fmt::Debug for HostState {
             .field("cancel_token_cancelled", &self.cancel_token.is_cancelled())
             .field("has_identity_store", &self.identity_store.is_some())
             .field("active_http_streams", &self.active_http_streams.len())
+            .field("http_limits", &self.http_limits)
             .field("process_tracker", &self.process_tracker)
             .field("persistent_processes", &self.persistent_processes)
             .finish_non_exhaustive()

@@ -114,6 +114,7 @@ pub(crate) fn minimal_host_state(rt: tokio::runtime::Handle) -> HostState {
         has_uplink_capability: false,
         capability_names: Vec::new(),
         local_egress: Vec::new(),
+        http_limits: super::limits::HttpLimits::default(),
         audit_firehose: false,
         inbound_tx: None,
         registered_uplinks: Vec::new(),

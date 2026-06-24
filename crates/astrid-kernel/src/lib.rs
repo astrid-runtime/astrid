@@ -146,6 +146,13 @@ pub struct Kernel {
     /// exempt operator-sanctioned loopback/private endpoints. Empty = no
     /// exemptions (fail-closed).
     local_egress: std::collections::HashMap<String, Vec<String>>,
+    /// Resolved `astrid:http` host ceilings (timeouts, redirect/stream caps,
+    /// buffered-body limit) from the `[http]` config section. A GLOBAL value —
+    /// the same for every capsule (unlike `local_egress`). Resolved once from
+    /// config by the daemon; the kernel only stores it and forwards it,
+    /// unmodified, to every capsule's `WasmEngine` via the loader. See
+    /// [`HttpLimits`](astrid_capsule::HttpLimits).
+    http_limits: astrid_capsule::HttpLimits,
     /// Ephemeral mode: shut down immediately when the last client disconnects.
     pub ephemeral: AtomicBool,
     /// Instant when the kernel was booted (for uptime calculation).
@@ -212,6 +219,11 @@ impl Kernel {
     /// every capsule's `WasmEngine`. In tests, pass
     /// [`CapsuleRuntimeLimits::default()`](astrid_capsule::CapsuleRuntimeLimits::default).
     ///
+    /// `http_limits` is the resolved `astrid:http` host ceilings (a global
+    /// value, the same for every capsule), likewise resolved by the daemon from
+    /// the `[http]` config section and forwarded unmodified. In tests, pass
+    /// [`HttpLimits::default()`](astrid_capsule::HttpLimits::default).
+    ///
     /// # Panics
     ///
     /// Panics if called on a single-threaded tokio runtime. The capsule
@@ -229,6 +241,7 @@ impl Kernel {
         workspace_root: PathBuf,
         runtime_limits: astrid_capsule::CapsuleRuntimeLimits,
         local_egress: std::collections::HashMap<String, Vec<String>>,
+        http_limits: astrid_capsule::HttpLimits,
     ) -> Result<Arc<Self>, std::io::Error> {
         use astrid_core::dirs::AstridHome;
 
@@ -384,6 +397,7 @@ impl Kernel {
             memory_ledger: astrid_capsule::MemoryLedger::default(),
             runtime_limits,
             local_egress,
+            http_limits,
             ephemeral: AtomicBool::new(false),
             boot_time: std::time::Instant::now(),
             shutdown_tx: tokio::sync::watch::channel(false).0,
@@ -468,6 +482,7 @@ impl Kernel {
             self.fuel_rate.clone(),
             self.memory_ledger.clone(),
             self.runtime_limits,
+            self.http_limits,
         );
         let mut capsule = loader.create_capsule(manifest, dir.clone())?;
 
@@ -1367,6 +1382,7 @@ pub(crate) async fn test_kernel_with_home(home: astrid_core::dirs::AstridHome) -
         memory_ledger: astrid_capsule::MemoryLedger::default(),
         runtime_limits: astrid_capsule::CapsuleRuntimeLimits::default(),
         local_egress: std::collections::HashMap::new(),
+        http_limits: astrid_capsule::HttpLimits::default(),
         ephemeral: AtomicBool::new(false),
         boot_time: std::time::Instant::now(),
         shutdown_tx: tokio::sync::watch::channel(false).0,
