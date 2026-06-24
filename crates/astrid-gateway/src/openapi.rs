@@ -107,6 +107,9 @@ use crate::state::GatewayState;
         routes::env::write_env,
         // Agent invocation
         routes::agent::post_prompt,
+        // Conversation threads (proxied to capsule-session)
+        routes::sessions::list_sessions,
+        routes::sessions::get_session_messages,
         // Models (active-LLM selection)
         routes::models::list_models,
         routes::models::get_active_model,
@@ -170,6 +173,10 @@ use crate::state::GatewayState;
             // Agent
             routes::agent::PromptRequest,
             routes::agent::PromptReady,
+            // Conversation threads
+            routes::sessions::SessionSummary,
+            routes::sessions::SessionListResponse,
+            routes::sessions::TranscriptResponse,
             // Models
             routes::models::SetActiveModelRequest,
             // Env

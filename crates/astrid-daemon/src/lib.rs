@@ -296,12 +296,14 @@ fn spawn_gateway(
     let audit_log = std::sync::Arc::clone(&kernel.audit_log);
     let session_id = kernel.session_id.clone();
     let readiness_probe = kernel.agent_readiness_probe();
+    let topic_probe = kernel.capsule_topic_probe();
     let state = astrid_gateway::GatewayState::new(
         cfg,
         Some(bus),
         Some(audit_log),
         Some(session_id),
         Some(readiness_probe),
+        Some(topic_probe),
     )
     .context("build gateway state")?;
     let notify = std::sync::Arc::new(tokio::sync::Notify::new());

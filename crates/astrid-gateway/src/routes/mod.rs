@@ -26,6 +26,7 @@ pub mod models;
 pub mod observability;
 pub mod principals;
 pub mod quotas;
+pub mod sessions;
 pub mod system;
 
 /// Build the gateway's HTTP router.
@@ -134,6 +135,12 @@ pub fn build(state: Arc<GatewayState>) -> Router {
         .route("/api/sys/audit", get(audit::get_audit))
         // ── Agent invocation (SSE) ──
         .route("/api/agent/prompt", post(agent::post_prompt))
+        // ── Conversation threads (proxied to capsule-session) ──
+        .route("/api/agent/sessions", get(sessions::list_sessions))
+        .route(
+            "/api/agent/sessions/:id/messages",
+            get(sessions::get_session_messages),
+        )
         // ── Models (active-LLM selection) ──
         .route("/api/models", get(models::list_models))
         .route("/api/models/active", get(models::get_active_model))
