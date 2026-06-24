@@ -1,5 +1,7 @@
-//! `astrid:sys@1.0.0` host implementation, plus the additive
-//! `astrid:sys@1.1.0` companion (one call, `capsule-set-epoch`).
+//! `astrid:sys@1.0.0` host implementation, plus the `astrid:sys@1.1.0`
+//! superset. The @1.1.0 trait carries every @1.0.0 function (delegating to
+//! the real @1.0.0 body across the bindgen type boundary) and adds one new
+//! call, `capsule-set-epoch`.
 //!
 //! `trigger_hook` was removed from the kernel ABI when the
 //! `astrid:capsule@0.1.0` world was split into per-domain packages —
@@ -247,7 +249,116 @@ impl sys::Host for HostState {
     }
 }
 
+// ── @1.0.0 ⇄ @1.1.0 type bridging ──────────────────────────────────────
+//
+// `astrid:sys@1.1.0` is a full SUPERSET of `@1.0.0`: bindgen emits a distinct
+// copy of every shared type (`error-code`, `log-level`, `caller-context`,
+// `capability-check-request`, `capability-check-response`) under
+// `sys1_1_0::host`. The real logic lives in the `@1.0.0` impl above; the
+// `@1.1.0` carry-over methods delegate to it, converting at the boundary. The
+// conversions are field-for-field / arm-for-arm identical and exhaustive (no
+// catch-all `_`), so a future shape divergence fails to compile here.
+
+// All carry-over methods delegate `@1.1.0` -> `@1.0.0`, so the only error
+// conversion needed is on the RETURN path (`@1.0.0` -> `@1.1.0`); a reverse
+// `v11_error_to_v10` would have no caller, so it is omitted.
+
+/// Map a `@1.0.0` `error-code` to the `@1.1.0` arm set (identical shape).
+fn v10_error_to_v11(e: ErrorCode) -> sys_v11::ErrorCode {
+    use sys_v11::ErrorCode as V11;
+    match e {
+        ErrorCode::CapabilityDenied => V11::CapabilityDenied,
+        ErrorCode::ConfigKeyReserved => V11::ConfigKeyReserved,
+        ErrorCode::TooLarge => V11::TooLarge,
+        ErrorCode::RegistryUnavailable => V11::RegistryUnavailable,
+        ErrorCode::Cancelled => V11::Cancelled,
+        ErrorCode::Unknown(s) => V11::Unknown(s),
+    }
+}
+
+/// Map a `@1.1.0` `log-level` to the `@1.0.0` one (identical arms).
+fn v11_log_level_to_v10(level: sys_v11::LogLevel) -> LogLevel {
+    use sys_v11::LogLevel as V11;
+    match level {
+        V11::Trace => LogLevel::Trace,
+        V11::Debug => LogLevel::Debug,
+        V11::Info => LogLevel::Info,
+        V11::Warn => LogLevel::Warn,
+        V11::Error => LogLevel::Error,
+    }
+}
+
+/// Map a `@1.0.0` `caller-context` to the `@1.1.0` one (identical fields).
+fn v10_caller_to_v11(c: CallerContext) -> sys_v11::CallerContext {
+    sys_v11::CallerContext {
+        principal: c.principal,
+        source_id: c.source_id,
+        timestamp: c.timestamp,
+    }
+}
+
+/// Map a `@1.1.0` `capability-check-request` to the `@1.0.0` one.
+fn v11_cap_request_to_v10(r: sys_v11::CapabilityCheckRequest) -> CapabilityCheckRequest {
+    CapabilityCheckRequest {
+        source_uuid: r.source_uuid,
+        capability: r.capability,
+    }
+}
+
+/// Map a `@1.0.0` `capability-check-response` to the `@1.1.0` one.
+fn v10_cap_response_to_v11(r: CapabilityCheckResponse) -> sys_v11::CapabilityCheckResponse {
+    sys_v11::CapabilityCheckResponse { allowed: r.allowed }
+}
+
+// @1.1.0: carry-over methods delegate to the @1.0.0 impl; identical behaviour.
 impl sys_v11::Host for HostState {
+    fn get_config(&mut self, key: String) -> Result<Option<String>, sys_v11::ErrorCode> {
+        <Self as sys::Host>::get_config(self, key).map_err(v10_error_to_v11)
+    }
+
+    fn get_caller(&mut self) -> Result<sys_v11::CallerContext, sys_v11::ErrorCode> {
+        <Self as sys::Host>::get_caller(self)
+            .map(v10_caller_to_v11)
+            .map_err(v10_error_to_v11)
+    }
+
+    fn log(&mut self, level: sys_v11::LogLevel, message: String) {
+        <Self as sys::Host>::log(self, v11_log_level_to_v10(level), message);
+    }
+
+    fn signal_ready(&mut self) {
+        <Self as sys::Host>::signal_ready(self);
+    }
+
+    fn clock_ms(&mut self) -> u64 {
+        <Self as sys::Host>::clock_ms(self)
+    }
+
+    fn clock_monotonic_ns(&mut self) -> u64 {
+        <Self as sys::Host>::clock_monotonic_ns(self)
+    }
+
+    fn sleep_ns(&mut self, duration_ns: u64) -> Result<(), sys_v11::ErrorCode> {
+        <Self as sys::Host>::sleep_ns(self, duration_ns).map_err(v10_error_to_v11)
+    }
+
+    fn random_bytes(&mut self, length: u64) -> Result<Vec<u8>, sys_v11::ErrorCode> {
+        <Self as sys::Host>::random_bytes(self, length).map_err(v10_error_to_v11)
+    }
+
+    fn check_capsule_capability(
+        &mut self,
+        request: sys_v11::CapabilityCheckRequest,
+    ) -> Result<sys_v11::CapabilityCheckResponse, sys_v11::ErrorCode> {
+        <Self as sys::Host>::check_capsule_capability(self, v11_cap_request_to_v10(request))
+            .map(v10_cap_response_to_v11)
+            .map_err(v10_error_to_v11)
+    }
+
+    fn enumerate_capabilities(&mut self) -> Vec<String> {
+        <Self as sys::Host>::enumerate_capabilities(self)
+    }
+
     fn capsule_set_epoch(&mut self) -> u64 {
         // Mirror `check_capsule_capability`'s registry access: clone the handle,
         // then read it inside a bounded blocking section (the registry guards an
@@ -569,5 +680,34 @@ mod get_config_tests {
 
         let value = state.get_config("model".into()).expect("host call");
         assert_eq!(value.as_deref(), Some("gpt-5.4"));
+    }
+}
+
+#[cfg(test)]
+mod sys_v11_delegation_tests {
+    use crate::engine::wasm::bindings::astrid::sys1_0_0::host::Host as SysHost;
+    use crate::engine::wasm::bindings::astrid::sys1_1_0::host::Host as SysV11Host;
+    use crate::engine::wasm::test_fixtures::minimal_host_state;
+
+    /// The `@1.1.0` superset carries every `@1.0.0` function by delegating to
+    /// the real `@1.0.0` body across the bindgen type boundary. Proof: a
+    /// delegated `get_config` on the `@1.1.0` trait returns the same value the
+    /// `@1.0.0` trait does for the same loaded state. `get_config` is a pure
+    /// in-memory lookup, so a single-threaded runtime suffices.
+    #[tokio::test]
+    async fn v11_get_config_agrees_with_v10() {
+        let mut state = minimal_host_state(tokio::runtime::Handle::current());
+        state.config.insert(
+            "base_url".into(),
+            serde_json::Value::String("https://api.openai.com".into()),
+        );
+
+        let v10 = <_ as SysHost>::get_config(&mut state, "base_url".into()).expect("v10 host call");
+        let v11 =
+            <_ as SysV11Host>::get_config(&mut state, "base_url".into()).expect("v11 host call");
+
+        assert_eq!(v10.as_deref(), Some("https://api.openai.com"));
+        assert_eq!(v11.as_deref(), Some("https://api.openai.com"));
+        assert_eq!(v10, v11, "v11 delegation must agree with the v10 path");
     }
 }

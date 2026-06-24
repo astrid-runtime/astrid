@@ -1,17 +1,29 @@
-/// System-level runtime introspection — version 1.1.0.
+/// System-level runtime functions: logging, config, time, caller context,
+/// entropy, sleep, capability introspection — version 1.1.0.
 ///
-/// Additive companion to `astrid:sys@1.0.0`, NOT a superset. @1.0.0 mutates
-/// nothing and remains the home of the full system surface (logging, config,
-/// time, entropy, sleep, capability introspection); a guest keeps importing it
-/// for all of that. This package adds a single orthogonal introspection
-/// function — `capsule-set-epoch` — with no shared types, so a guest imports
-/// @1.1.0 ALONGSIDE @1.0.0 solely to reach the new call. (Contrast
-/// `astrid:http@1.1.0`, which is a full superset precisely because it changed
-/// existing @1.0.0 record / variant shapes; nothing here does.)
+/// Additive superset successor to `astrid:sys@1.0.0`. Every @1.0.0 type
+/// (`error-code`, `log-level`, `caller-context`, `capability-check-request`,
+/// `capability-check-response`) and every @1.0.0 function (`get-config`,
+/// `get-caller`, `log`, `signal-ready`, `clock-ms`, `clock-monotonic-ns`,
+/// `sleep-ns`, `random-bytes`, `check-capsule-capability`,
+/// `enumerate-capabilities`) is preserved verbatim, so a guest can bind only
+/// this version and still reach the whole system surface; @1.1.0 then adds one
+/// orthogonal introspection function — `capsule-set-epoch` — at the end. The
+/// host backs both versions from one implementation: the @1.1.0 carry-over
+/// functions delegate to the @1.0.0 path, identical in behaviour.
 ///
 /// Astrid does not expose any `wasi:*` interfaces to capsules. The host ABI is
 /// fully Astrid-owned: every call is gated, principal-scoped, audited, and
-/// dispatched through the kernel's capability layer.
+/// dispatched through the kernel's capability layer. Readiness multiplexing is
+/// provided by Astrid's own `astrid:io/poll@1.0.0` interface; primitives
+/// capsules need (random bytes, monotonic clock, sleep) live in this `sys`
+/// package for the same reason: a single audit/principal layer covering every
+/// host call.
+///
+/// This namespace ownership matters for the unikernel target as well — when
+/// Astrid ships on hermit-rs, the WIT contract is unchanged and the kernel-side
+/// impls dispatch to unikernel syscalls instead of wasmtime-wasi-backed
+/// futures.
 ///
 /// Frozen per the ABI evolution discipline (RFC: host_abi). Shape changes
 /// ship as a new file at a new version path; never edit this file.
@@ -19,23 +31,162 @@
 package astrid:sys@1.1.0;
 
 interface host {
+    /// Typed error returned from every fallible sys operation.
+    variant error-code {
+        /// Capsule lacks the required capability.
+        capability-denied,
+        /// Config key is reserved and cannot be read (e.g. internal
+        /// kernel-only entries).
+        config-key-reserved,
+        /// Random-bytes / sleep length exceeded the server-side cap.
+        too-large,
+        /// Capsule registry is temporarily unavailable for capability
+        /// checks (fail-closed: returns this rather than allowed:false).
+        registry-unavailable,
+        /// Sleep was interrupted because the capsule is unloading.
+        cancelled,
+        /// Unspecific host error; detail is best-effort.
+        unknown(string),
+    }
+
+    /// Log severity level for structured capsule logging.
+    enum log-level {
+        trace,
+        debug,
+        info,
+        warn,
+        error,
+    }
+
+    /// Caller context returned by `get-caller`.
+    record caller-context {
+        /// The acting principal for this invocation.
+        principal: option<string>,
+        /// UUID of the capsule that originated the IPC message.
+        source-id: string,
+        /// ISO 8601 timestamp of the originating message.
+        timestamp: string,
+    }
+
+    /// Request to check a capsule's capability.
+    record capability-check-request {
+        /// UUID of the capsule to check.
+        source-uuid: string,
+        /// Capability name to check.
+        capability: string,
+    }
+
+    /// Response from a capability check.
+    record capability-check-response {
+        /// Whether the capability is allowed.
+        allowed: bool,
+    }
+
+    /// Read a configuration value from the capsule's manifest `[config]`.
+    ///
+    /// Returns the raw config value, or `none` if the key is not set in
+    /// the manifest. String values are returned without JSON-encoding
+    /// (no extra quotes); the empty string is a valid value distinct
+    /// from `none`. Audit: not recorded (read-only manifest access).
+    get-config: func(key: string) -> result<option<string>, error-code>;
+
+    /// Get the caller context for the current invocation.
+    ///
+    /// Returns the acting principal, originating capsule UUID, and message
+    /// timestamp. Returns an empty context if no caller is available.
+    /// Audit: not recorded.
+    get-caller: func() -> result<caller-context, error-code>;
+
+    /// Emit a structured log message attributed to the calling capsule.
+    ///
+    /// Logs are routed to the current principal's log directory with
+    /// daily rotation. Cross-principal invocations write to the target
+    /// principal's log directory.
+    /// Audit: every log call recorded as a structured audit entry.
+    log: func(level: log-level, message: string);
+
+    /// Signal that the capsule's run loop is ready.
+    ///
+    /// Called by the WASM guest after setting up IPC subscriptions.
+    /// Notifies the kernel to proceed with loading dependent capsules.
+    /// No-op if no readiness channel is configured.
+    signal-ready: func();
+
+    /// Get the current wall-clock time as milliseconds since UNIX epoch.
+    /// Infallible (matches `Instant::now` style; pre-1970 clocks are a
+    /// host misconfiguration, not a capsule concern).
+    clock-ms: func() -> u64;
+
+    /// Get the current monotonic clock reading in nanoseconds.
+    ///
+    /// Suitable for measuring elapsed time within a process. Does not
+    /// jump with NTP adjustments. The absolute value is meaningless
+    /// across processes or capsule reloads — only differences are.
+    /// Infallible.
+    clock-monotonic-ns: func() -> u64;
+
+    /// Block the calling guest task for the given duration in nanoseconds.
+    ///
+    /// Capped server-side at 60 seconds per call (callers needing longer
+    /// waits loop on shorter sleeps and check for cancellation between
+    /// iterations). Returns when the duration has elapsed; returns
+    /// `cancelled` if the capsule is unloading mid-sleep.
+    sleep-ns: func(duration-ns: u64) -> result<_, error-code>;
+
+    /// Fill the caller's requested length with cryptographically secure
+    /// random bytes from the host's OS-level CSPRNG. Length matches
+    /// WASI random-bytes (`u64`).
+    ///
+    /// `length` is capped at 4096 bytes per call (cryptographic use
+    /// cases fit comfortably; bulk entropy callers loop). Larger
+    /// requests return `too-large`.
+    /// Audit: not recorded (read-only, no side effects).
+    random-bytes: func(length: u64) -> result<list<u8>, error-code>;
+
+    /// Check whether a capsule has a specific manifest capability — self or
+    /// any other capsule (by UUID). The per-name dual of
+    /// `enumerate-capabilities`.
+    ///
+    /// Fail-closed: returns `allowed: false` for unknown UUIDs and
+    /// unknown capabilities. Returns `registry-unavailable` when the
+    /// registry itself can't be consulted. Ungated: capability posture is
+    /// structural metadata, not a secret (enforce-don't-conceal) — knowing a
+    /// capability conveys no ability to use it. Audit: not recorded.
+    check-capsule-capability: func(request: capability-check-request) -> result<capability-check-response, error-code>;
+
+    /// Enumerate the CALLING capsule's OWN held capability NAMES — the
+    /// categories the kernel enforces at host-call time (e.g. `host_process`,
+    /// `net_connect`, `fs_read`), NOT the scoped arguments within them (a
+    /// `host_process` allowlist, `host:port`, paths). It is the list dual of
+    /// `check-capsule-capability`: the set of names for which a self-`check`
+    /// returns true.
+    ///
+    /// Argument-free — the kernel already knows the caller. The set is the
+    /// capsule's manifest-declared capabilities as the kernel registered them;
+    /// capsule capabilities are not revoked at runtime (the grant/revoke model
+    /// is principal-scoped, a separate axis), so "what I declared" and "what I
+    /// can do" coincide at the capsule level.
+    ///
+    /// Ungated, like `check-capsule-capability`: a capsule grounds its
+    /// behaviour in what it can actually do — a reusable supervisor binary
+    /// deployed under different manifests reads its real set instead of
+    /// hard-coding it; any capsule avoids code-vs-manifest drift by grounding
+    /// on the registered set. Audit: not recorded (read-only self-
+    /// introspection). See RFC: host_abi ("Capability introspection").
+    ///
+    /// Infallible: the kernel always knows the caller's own registered set, so
+    /// there is no failure mode (an empty list is the valid "no capabilities"
+    /// answer) — like `clock-ms` / `clock-monotonic-ns`, no `result` wrapper.
+    enumerate-capabilities: func() -> list<string>;
+
     /// Return a stable hash of the currently-loaded capsule set — the sorted
-    /// `(capsule-id, package-version)` pairs across every registered capsule.
-    ///
-    /// The value MOVES when a capsule is installed, removed, or version-bumped
-    /// (a live upgrade), and is independent of load order. It carries no
-    /// process state: an unchanged set hashes identically across daemon
-    /// restarts, so a consumer can persist it beside a cache keyed on the
-    /// loaded set (e.g. a per-principal tool-schema cache) and re-validate
-    /// cheaply on its own next turn — picking up a runtime install without the
-    /// kernel fanning an invalidation out to every principal.
-    ///
-    /// Ungated, read-only introspection like `astrid:sys@1.0.0`'s
-    /// `enumerate-capabilities`: the loaded-set fingerprint is structural
-    /// metadata, not a secret, and conveys no ability. Infallible by design —
-    /// there is no `result` wrapper; if the registry is momentarily
-    /// unavailable the host returns `0`, a value that will not match any
-    /// populated cache's stored epoch and so biases the consumer toward a
-    /// (safe) refresh rather than stale reuse. Audit: not recorded (read-only).
+    /// (capsule-id, package-version) pairs across every registered capsule. The
+    /// value MOVES on install / removal / version-bump, is load-order
+    /// independent, and is restart-stable (no process state), so a consumer
+    /// keyed on the loaded set (e.g. a per-principal tool-schema cache) can
+    /// re-validate cheaply on its own next turn. Ungated, read-only
+    /// introspection like enumerate-capabilities. Infallible — returns 0 if the
+    /// registry is momentarily unavailable (a value that won't match a
+    /// populated cache's stored epoch, biasing toward a safe refresh).
     capsule-set-epoch: func() -> u64;
 }
