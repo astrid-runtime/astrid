@@ -288,6 +288,7 @@ fn regenerate_distro_lock(home: &AstridHome) -> anyhow::Result<()> {
                 version,
                 source,
                 hash,
+                resolved_ref: c.meta.as_ref().and_then(|m| m.resolved_ref.clone()),
             }
         })
         .collect();
@@ -301,6 +302,9 @@ fn regenerate_distro_lock(home: &AstridHome) -> anyhow::Result<()> {
             resolved_at: chrono::Utc::now().to_rfc3339(),
         },
         capsules,
+        // Preserve the manifest hash from the prior lock — a capsule
+        // update doesn't change the manifest the lock was sealed from.
+        manifest_hash: existing.manifest_hash,
     };
 
     write_lock(&lock_path, &lock)?;

@@ -104,6 +104,12 @@ pub(crate) async fn dispatch(cli: Cli) -> Result<ExitCode> {
     dispatch_subcommand(cli.command, output_format).await
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "top-level subcommand dispatch is one linear match over every CLI verb; \
+              each arm already delegates to a dispatch_* helper, so splitting further \
+              would scatter the routing without reducing complexity"
+)]
 async fn dispatch_subcommand(
     command: Option<Commands>,
     output_format: OutputFormat,
@@ -159,8 +165,22 @@ async fn dispatch_subcommand(
                 from_mcp_json.as_deref(),
             )
         },
-        Some(Commands::Init { distro }) => {
-            commands::init::run_init(&distro).await?;
+        Some(Commands::Init {
+            distro,
+            yes,
+            offline,
+            allow_unsigned,
+            accept_new_key,
+            vars,
+        }) => {
+            let opts = commands::init::InitOpts {
+                yes,
+                offline,
+                allow_unsigned,
+                accept_new_key,
+                vars: commands::init::parse_cli_vars(&vars)?,
+            };
+            commands::init::run_init(&distro, &opts).await?;
             commands::self_update::ensure_path_setup()?;
             Ok(ExitCode::SUCCESS)
         },
@@ -334,7 +354,15 @@ async fn dispatch_mcp(command: McpCommands) -> Result<ExitCode> {
 
 async fn dispatch_distro(command: DistroCommands) -> Result<ExitCode> {
     match command {
-        DistroCommands::Apply { name, agent } => {
+        DistroCommands::Apply {
+            name,
+            agent,
+            yes,
+            offline,
+            allow_unsigned,
+            accept_new_key,
+            vars,
+        } => {
             if agent.is_some() {
                 return Ok(commands::stub::deferred(
                     "distro apply -a <agent>",
@@ -342,7 +370,14 @@ async fn dispatch_distro(command: DistroCommands) -> Result<ExitCode> {
                 ));
             }
             let distro = name.unwrap_or_else(|| "astralis".to_string());
-            commands::init::run_init(&distro).await?;
+            let opts = commands::init::InitOpts {
+                yes,
+                offline,
+                allow_unsigned,
+                accept_new_key,
+                vars: commands::init::parse_cli_vars(&vars)?,
+            };
+            commands::init::run_init(&distro, &opts).await?;
             Ok(ExitCode::SUCCESS)
         },
         DistroCommands::Show { agent } => {
@@ -360,13 +395,14 @@ async fn dispatch_distro(command: DistroCommands) -> Result<ExitCode> {
             );
             Ok(ExitCode::from(2))
         },
-        DistroCommands::Update { agent } => {
+        DistroCommands::Update { agent, force } => {
             if agent.is_some() {
                 return Ok(commands::stub::deferred(
                     "distro update -a <agent>",
                     &[tracker_657()],
                 ));
             }
+            let _ = force; // wired for downgrade protection; update is still a stub.
             eprintln!(
                 "{}",
                 theme::Theme::info(
@@ -374,6 +410,14 @@ async fn dispatch_distro(command: DistroCommands) -> Result<ExitCode> {
                 )
             );
             Ok(ExitCode::from(2))
+        },
+        DistroCommands::Seal {
+            distro,
+            output,
+            key,
+        } => {
+            commands::distro::seal::run_seal(&distro, &output, &key).await?;
+            Ok(ExitCode::SUCCESS)
         },
     }
 }

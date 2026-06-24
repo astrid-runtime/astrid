@@ -69,6 +69,11 @@ fn extract_variable_refs(template: &str) -> Vec<&str> {
 /// - At least one capsule with role = "uplink"
 /// - Variable references in capsule env resolve to defined variables
 /// - Requires version strings are valid semver requirements
+#[allow(
+    clippy::too_many_lines,
+    reason = "flat sequence of independent validation checks; \
+              inlining keeps the full ruleset auditable in one place"
+)]
 pub(crate) fn validate_manifest(manifest: &DistroManifest) -> anyhow::Result<()> {
     // Schema version.
     if manifest.schema_version != SCHEMA_VERSION {
@@ -117,11 +122,35 @@ pub(crate) fn validate_manifest(manifest: &DistroManifest) -> anyhow::Result<()>
         anyhow::bail!("distro must contain at least one capsule");
     }
 
-    // No duplicate capsule names.
+    // No duplicate capsule names, and each name must be a valid
+    // identifier. Names become path components in the `.shuttle` layout
+    // (`capsules/<name>.capsule`) and on disk under the capsule store;
+    // constraining them to `^[a-z][a-z0-9-]*$` keeps a manifest from
+    // introducing `/`, `..`, or other path-hostile characters there.
     let mut seen_names = HashSet::new();
     for cap in &manifest.capsules {
+        if !is_valid_id(&cap.name) {
+            anyhow::bail!(
+                "capsule name '{}' is invalid (must match ^[a-z][a-z0-9-]*$)",
+                cap.name,
+            );
+        }
         if !seen_names.insert(&cap.name) {
             anyhow::bail!("duplicate capsule name '{}'", cap.name);
+        }
+        // Distros compose *released* capsules. `branch`/`rev` selectors
+        // can only be honored by compiling from a git ref — the exact
+        // toolchain dependency offline/headless distro seeding exists to
+        // remove. Reject them: a distro must pin a released `version` or
+        // `tag`. (Git-ref installs remain available via the standalone
+        // `astrid capsule install` command.)
+        if cap.branch.is_some() || cap.rev.is_some() {
+            anyhow::bail!(
+                "capsule '{}': branch/rev require building from source and are not allowed in a \
+                 distro manifest — pin a released `version` or `tag` (git-ref installs are \
+                 available via `astrid capsule install`).",
+                cap.name,
+            );
         }
     }
 
@@ -411,6 +440,99 @@ issuers = ["admin"]
             err.to_string().contains("default-group is unset"),
             "got: {err}"
         );
+    }
+
+    #[test]
+    fn rejects_path_hostile_capsule_name() {
+        let toml_src = r#"
+schema-version = 1
+
+[distro]
+id = "test"
+name = "Test"
+version = "0.1.0"
+
+[[capsule]]
+name = "evil/../escape"
+source = "@org/cli"
+version = "0.1.0"
+role = "uplink"
+"#;
+        let manifest: DistroManifest = toml::from_str(toml_src).unwrap();
+        let err = validate_manifest(&manifest).expect_err("slash name must be rejected");
+        assert!(err.to_string().contains("capsule name"), "got: {err}");
+    }
+
+    #[test]
+    fn rejects_branch_selector_in_distro() {
+        let toml_src = r#"
+schema-version = 1
+
+[distro]
+id = "test"
+name = "Test"
+version = "0.1.0"
+
+[[capsule]]
+name = "astrid-capsule-cli"
+source = "@org/cli"
+version = "0.1.0"
+branch = "main"
+role = "uplink"
+"#;
+        let manifest: DistroManifest = toml::from_str(toml_src).unwrap();
+        let err = validate_manifest(&manifest).expect_err("branch must be rejected");
+        let msg = err.to_string();
+        assert!(msg.contains("branch/rev"), "got: {msg}");
+        assert!(msg.contains("astrid-capsule-cli"), "got: {msg}");
+    }
+
+    #[test]
+    fn rejects_rev_selector_in_distro() {
+        let toml_src = r#"
+schema-version = 1
+
+[distro]
+id = "test"
+name = "Test"
+version = "0.1.0"
+
+[[capsule]]
+name = "astrid-capsule-cli"
+source = "@org/cli"
+version = "0.1.0"
+rev = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
+role = "uplink"
+"#;
+        let manifest: DistroManifest = toml::from_str(toml_src).unwrap();
+        let err = validate_manifest(&manifest).expect_err("rev must be rejected");
+        assert!(err.to_string().contains("branch/rev"), "got: {err}");
+    }
+
+    #[test]
+    fn accepts_version_and_tag_release_selectors() {
+        let toml_src = r#"
+schema-version = 1
+
+[distro]
+id = "test"
+name = "Test"
+version = "0.1.0"
+
+[[capsule]]
+name = "astrid-capsule-cli"
+source = "@org/cli"
+version = "0.1.0"
+role = "uplink"
+
+[[capsule]]
+name = "astrid-capsule-a"
+source = "@org/a"
+version = "0.2.0"
+tag = "v0.2.0-rc1"
+"#;
+        let manifest: DistroManifest = toml::from_str(toml_src).unwrap();
+        validate_manifest(&manifest).expect("version/tag release selectors are allowed");
     }
 
     #[test]

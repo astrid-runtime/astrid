@@ -21,6 +21,12 @@ pub(crate) struct DistroLock {
     /// Resolved capsule entries.
     #[serde(default, rename = "capsule")]
     pub(crate) capsules: Vec<LockedCapsule>,
+    /// BLAKE3 hash of the canonical `Distro.toml` bytes this lock was
+    /// resolved from (`blake3:{hex}`). Lets `.shuttle` consumers detect
+    /// a manifest that was tampered with after sealing. `None` for
+    /// locks generated before this field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) manifest_hash: Option<String>,
 }
 
 /// Distro identity in the lockfile.
@@ -46,6 +52,12 @@ pub(crate) struct LockedCapsule {
     pub(crate) source: String,
     /// BLAKE3 hash of the installed WASM binary (`blake3:{hex}`).
     pub(crate) hash: String,
+    /// The concrete ref this capsule resolved to (e.g. `v0.3.2`, a
+    /// branch name, or a commit SHA). Distinct from `version` because
+    /// the manifest may pin a tag/branch/rev that doesn't equal the
+    /// semver string. `None` for legacy locks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) resolved_ref: Option<String>,
 }
 
 /// Load a lockfile from disk. Returns `Ok(None)` if the file does not exist.
@@ -91,7 +103,19 @@ pub(crate) fn create_lock(manifest: &DistroManifest, capsules: Vec<LockedCapsule
             resolved_at: chrono::Utc::now().to_rfc3339(),
         },
         capsules,
+        manifest_hash: None,
     }
+}
+
+/// Compute the canonical BLAKE3 hash of a raw `Distro.toml` byte stream,
+/// formatted as `blake3:{hex}`.
+///
+/// "Canonical" here means the exact bytes the manifest was sealed from —
+/// no re-serialization. Re-emitting TOML would not round-trip
+/// deterministically (key ordering, comments, whitespace), so the seal
+/// pipeline and the consumer both hash the original file bytes.
+pub(crate) fn manifest_hash(toml_bytes: &[u8]) -> String {
+    format!("blake3:{}", blake3::hash(toml_bytes).to_hex())
 }
 
 #[cfg(test)]
@@ -115,7 +139,9 @@ mod tests {
                 version: "0.1.0".into(),
                 source: "@unicity-astrid/capsule-cli".into(),
                 hash: "blake3:abc123".into(),
+                resolved_ref: Some("v0.1.0".into()),
             }],
+            manifest_hash: Some("blake3:deadbeef".into()),
         };
 
         write_lock(&path, &lock).unwrap();
@@ -126,6 +152,19 @@ mod tests {
         assert_eq!(loaded.distro.version, "0.1.0");
         assert_eq!(loaded.capsules.len(), 1);
         assert_eq!(loaded.capsules[0].hash, "blake3:abc123");
+        assert_eq!(loaded.capsules[0].resolved_ref.as_deref(), Some("v0.1.0"));
+        assert_eq!(loaded.manifest_hash.as_deref(), Some("blake3:deadbeef"));
+    }
+
+    #[test]
+    fn manifest_hash_is_stable_and_prefixed() {
+        let bytes = b"schema-version = 1\n";
+        let h1 = manifest_hash(bytes);
+        let h2 = manifest_hash(bytes);
+        assert_eq!(h1, h2);
+        assert!(h1.starts_with("blake3:"));
+        // Differs for different bytes.
+        assert_ne!(manifest_hash(bytes), manifest_hash(b"different"));
     }
 
     #[test]
@@ -163,6 +202,7 @@ role = "uplink"
                 resolved_at: "2026-01-01T00:00:00Z".into(),
             },
             capsules: vec![],
+            manifest_hash: None,
         };
         assert!(is_lock_fresh(&lock, &manifest));
     }
@@ -195,6 +235,7 @@ role = "uplink"
                 resolved_at: "2026-01-01T00:00:00Z".into(),
             },
             capsules: vec![],
+            manifest_hash: None,
         };
         assert!(!is_lock_fresh(&lock, &manifest));
     }

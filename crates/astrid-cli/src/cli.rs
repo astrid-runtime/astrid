@@ -5,6 +5,8 @@
 //! definitions. Subcommand variants here are wired to handler modules
 //! in [`crate::commands`] by [`crate::dispatch`].
 
+use std::path::PathBuf;
+
 use clap::{Parser, Subcommand};
 
 use crate::commands::{
@@ -218,9 +220,24 @@ pub(crate) enum Commands {
 
     /// Initialize a workspace and install a distro
     Init {
-        /// Distro to install (name, @org/repo, or path to Distro.toml)
+        /// Distro to install (name, @org/repo, path to Distro.toml, or .shuttle)
         #[arg(long, default_value = "astralis")]
         distro: String,
+        /// Non-interactive: accept all defaults.
+        #[arg(short = 'y', long = "yes")]
+        yes: bool,
+        /// Forbid all network access (offline mode).
+        #[arg(long)]
+        offline: bool,
+        /// Allow installing unsigned distros.
+        #[arg(long)]
+        allow_unsigned: bool,
+        /// Re-pin a changed signing key.
+        #[arg(long)]
+        accept_new_key: bool,
+        /// Set a variable (repeatable): KEY=VALUE.
+        #[arg(long = "var", value_name = "KEY=VALUE")]
+        vars: Vec<String>,
     },
 
     /// View resolved configuration, edit it in `$EDITOR`, or print paths.
@@ -482,11 +499,26 @@ pub(crate) enum SessionCommands {
 pub(crate) enum DistroCommands {
     /// Apply a distro to the active or specified agent.
     Apply {
-        /// Distro identifier (name, `@org/repo`, or path).
+        /// Distro identifier (name, `@org/repo`, path, or .shuttle).
         name: Option<String>,
         /// Target agent (defaults to active context).
         #[arg(short, long)]
         agent: Option<String>,
+        /// Non-interactive: accept all defaults.
+        #[arg(short = 'y', long = "yes")]
+        yes: bool,
+        /// Forbid all network access (offline mode).
+        #[arg(long)]
+        offline: bool,
+        /// Allow installing unsigned distros.
+        #[arg(long)]
+        allow_unsigned: bool,
+        /// Re-pin a changed signing key.
+        #[arg(long)]
+        accept_new_key: bool,
+        /// Set a variable (repeatable): KEY=VALUE.
+        #[arg(long = "var", value_name = "KEY=VALUE")]
+        vars: Vec<String>,
     },
     /// Show the currently-applied distro and its lockfile.
     Show {
@@ -499,6 +531,20 @@ pub(crate) enum DistroCommands {
         /// Target agent (defaults to active context).
         #[arg(short, long)]
         agent: Option<String>,
+        /// Allow downgrading to an older distro version.
+        #[arg(long)]
+        force: bool,
+    },
+    /// Seal a distro into a signed, offline-installable `.shuttle` archive.
+    Seal {
+        /// Path to `Distro.toml` (or a directory containing one).
+        distro: String,
+        /// Output path for the `.shuttle` archive.
+        #[arg(short, long)]
+        output: PathBuf,
+        /// Path to the ed25519 private key (32 raw bytes).
+        #[arg(short, long)]
+        key: PathBuf,
     },
 }
 
