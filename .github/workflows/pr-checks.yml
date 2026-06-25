@@ -5,6 +5,9 @@ on:
     branches: [main]
     types: [opened, edited, reopened, labeled, synchronize]
 
+permissions:
+  contents: read
+
 jobs:
   template:
     name: PR template filled in
@@ -64,9 +67,13 @@ jobs:
   contributor-gate:
     name: Contributor tier check
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: read
+      pull-requests: read
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
       - name: Check contributor tier and scope
         env:
@@ -162,9 +169,13 @@ jobs:
   file-size:
     name: File size check
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: read
+      pull-requests: read
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           fetch-depth: 0
 

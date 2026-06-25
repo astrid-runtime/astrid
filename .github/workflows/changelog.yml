@@ -9,16 +9,19 @@ on:
       - "**/Cargo.toml"
       - "Cargo.lock"
 
+permissions:
+  contents: read
+
 jobs:
   check:
     name: Changelog updated
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           fetch-depth: 0
 
-      - uses: dangoslen/changelog-enforcer@v3
+      - uses: dangoslen/changelog-enforcer@204e7d3ef26579f4cd0fd759c57032656fdf23c7 # v3
         with:
           changeLogPath: CHANGELOG.md
           skipLabels: "skip-changelog"
