@@ -272,6 +272,49 @@ jobs:
 
           echo "All changed files within limits."
 
+  workflow-security:
+    name: Workflow security policy
+    runs-on: ubuntu-latest
+    steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
+        with:
+          egress-policy: audit
+
+      - name: Checkout
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+
+      - name: Enforce workflow hardening policy
+        run: |
+          set -eu
+
+          failed=0
+
+          if grep -RInE '^[[:space:]]+pull_request_target:' .github/workflows; then
+            echo "::error::pull_request_target is not allowed; it can expose privileged tokens to untrusted PR content."
+            failed=1
+          fi
+
+          while IFS= read -r workflow; do
+            if grep -qE '^[[:space:]]+pull_request:' "$workflow" && grep -q '\${{[[:space:]]*secrets\.' "$workflow"; then
+              echo "::error file=$workflow::PR-triggered workflows must not reference repository secrets."
+              failed=1
+            fi
+          done < <(find .github/workflows -type f \( -name '*.yml' -o -name '*.yaml' \) | sort)
+
+          while IFS= read -r line; do
+            ref=$(printf '%s\n' "$line" | sed -E 's/^[^@]+@([^ #]+).*$/\1/')
+            case "$line" in
+              *"uses: ./"*) continue ;;
+            esac
+            if ! printf '%s\n' "$ref" | grep -Eq '^[0-9a-f]{40}$'; then
+              echo "::error::Action reference must be pinned to a full commit SHA: $line"
+              failed=1
+            fi
+          done < <(grep -RInE '^[[:space:]]*-[[:space:]]+uses:[[:space:]]*[^[:space:]]+@[^[:space:]#]+' .github/workflows)
+
+          exit "$failed"
+
   linked-issue:
     name: Linked issue required
     runs-on: ubuntu-latest
