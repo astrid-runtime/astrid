@@ -166,7 +166,7 @@ jobs:
         run: |
           git diff --name-only "$BASE_SHA"...HEAD | tee changed-files.txt
 
-          if grep -Eq '(^Cargo\.toml$|^crates/[^/]+/Cargo\.toml$|^crates/.*\.rs$|^crates/[^/]+/build\.rs$|^crates/[^/]+/wit/|^wit/)' changed-files.txt; then
+          if grep -Eq '(^Cargo\.toml$|^crates/[^/]+/Cargo\.toml$|^crates/[^/]+/src/.*\.rs$|^crates/[^/]+/build\.rs$|^crates/[^/]+/wit/|^wit/)' changed-files.txt; then
             echo "run=true" >> "$GITHUB_OUTPUT"
             echo "Public API inputs changed; running cargo-semver-checks."
           else
@@ -214,7 +214,7 @@ jobs:
         run: |
           git diff --name-only "$BASE_SHA"...HEAD | tee changed-files.txt
 
-          if grep -Eq '(^Cargo\.toml$|^crates/[^/]+/Cargo\.toml$|^crates/.*\.rs$|^crates/[^/]+/build\.rs$|^crates/[^/]+/wit/|^wit/)' changed-files.txt; then
+          if grep -Eq '(^Cargo\.toml$|^crates/[^/]+/Cargo\.toml$|^crates/[^/]+/src/.*\.rs$|^crates/[^/]+/build\.rs$|^crates/[^/]+/wit/|^wit/)' changed-files.txt; then
             echo "run=true" >> "$GITHUB_OUTPUT"
             echo "Public API inputs changed; running cargo-public-api."
           else
@@ -274,6 +274,75 @@ jobs:
               "$BASE_SHA..HEAD"
             echo "::endgroup::"
           done
+
+  gateway-openapi-contract:
+    name: Gateway OpenAPI contract
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          fetch-depth: 0
+          submodules: recursive
+
+      - name: Detect gateway contract inputs
+        id: gateway-inputs
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          git diff --name-only "$BASE_SHA"...HEAD | tee changed-files.txt
+
+          if grep -Eq '(^Cargo\.toml$|^Cargo\.lock$|^crates/astrid-gateway/Cargo\.toml$|^crates/astrid-gateway/src/|^crates/astrid-gateway/examples/print-openapi\.rs$)' changed-files.txt; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+            echo "Gateway contract inputs changed; diffing OpenAPI specs."
+          else
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "No gateway contract inputs changed; skipping OpenAPI diff."
+          fi
+
+      - name: Install Rust toolchain
+        if: steps.gateway-inputs.outputs.run == 'true'
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          toolchain: "1.95"
+
+      - name: Cache Rust artifacts
+        if: steps.gateway-inputs.outputs.run == 'true'
+        uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
+        with:
+          key: ${{ runner.os }}-${{ github.job }}
+          cache-on-failure: true
+
+      - name: Diff generated OpenAPI spec
+        if: steps.gateway-inputs.outputs.run == 'true'
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          mkdir -p /tmp/astrid-openapi
+          cp crates/astrid-gateway/examples/print-openapi.rs /tmp/astrid-openapi/print-openapi.rs
+          cp Cargo.lock /tmp/astrid-openapi/Cargo.lock
+
+          generate_spec() {
+            local ref="$1"
+            local out="$2"
+
+            git reset --hard
+            git clean -fd
+            git checkout "$ref"
+            mkdir -p crates/astrid-gateway/examples
+            cp /tmp/astrid-openapi/print-openapi.rs crates/astrid-gateway/examples/print-openapi.rs
+            if [ ! -f Cargo.lock ]; then
+              cp /tmp/astrid-openapi/Cargo.lock Cargo.lock
+            fi
+
+            cargo run --locked -p astrid-gateway --example print-openapi > "$out"
+          }
+
+          generate_spec "$BASE_SHA" /tmp/astrid-openapi/base.json
+          generate_spec "$HEAD_SHA" /tmp/astrid-openapi/head.json
+
+          diff -u /tmp/astrid-openapi/base.json /tmp/astrid-openapi/head.json
 
   audit:
     name: Security Audit
