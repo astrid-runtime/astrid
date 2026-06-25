@@ -97,6 +97,7 @@ jobs:
     permissions:
       contents: write
       id-token: write
+      attestations: write
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
@@ -156,6 +157,13 @@ jobs:
           cd artifacts
           sha256sum *.tar.gz > SHA256SUMS.txt
           cat SHA256SUMS.txt
+
+      - name: Attest release provenance
+        uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32 # v4.1.0
+        with:
+          subject-path: |
+            artifacts/*.tar.gz
+            artifacts/SHA256SUMS.txt
 
       - name: Install cosign
         uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac # v3

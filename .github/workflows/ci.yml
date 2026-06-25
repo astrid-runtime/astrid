@@ -164,6 +164,43 @@ jobs:
       - name: Check MSRV compiles
         run: cargo check --workspace --locked
 
+  api-compatibility:
+    name: Public API compatibility
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          fetch-depth: 0
+          submodules: recursive
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          toolchain: "1.95"
+
+      - name: Cache semver checker
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5
+        with:
+          path: ~/.cargo/bin/cargo-semver-checks
+          key: ${{ runner.os }}-cargo-semver-checks-0.48.0
+
+      - name: Install semver checker
+        run: |
+          if ! command -v cargo-semver-checks >/dev/null; then
+            cargo install cargo-semver-checks --version 0.48.0 --locked
+          fi
+
+      - name: Check public API compatibility
+        env:
+          BASELINE_REV: ${{ github.event.pull_request.base.sha }}
+        run: |
+          cargo semver-checks \
+            --manifest-path Cargo.toml \
+            --workspace \
+            --baseline-rev "$BASELINE_REV" \
+            --all-features
+
   audit:
     name: Security Audit
     runs-on: ubuntu-latest
