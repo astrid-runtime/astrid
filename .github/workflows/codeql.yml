@@ -4,14 +4,14 @@ on:
   push:
     branches: [main, stream-*]
     paths:
-      - "**.rs"
+      - "**/*.rs"
       - "**/Cargo.toml"
       - "Cargo.lock"
       - ".github/workflows/codeql.yml"
   pull_request:
     branches: [main]
     paths:
-      - "**.rs"
+      - "**/*.rs"
       - "**/Cargo.toml"
       - "Cargo.lock"
       - ".github/workflows/codeql.yml"
