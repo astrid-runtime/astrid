@@ -35,6 +35,7 @@ terminate_pid() {
 }
 
 cleanup() {
+  local status=$?
   trap - EXIT INT TERM
   terminate_pid "$DAEMON_PID"
   terminate_pid "$FAKE_PID"
@@ -43,11 +44,12 @@ cleanup() {
   elif [[ -n "$POISON_HOME" ]]; then
     printf 'kept poisoned HOME=%s\n' "$POISON_HOME"
   fi
-  if [[ -z "${ASTRID_E2E_KEEP_HOME:-}" ]]; then
+  if [[ -z "${ASTRID_E2E_KEEP_HOME:-}" && "$status" -eq 0 ]]; then
     rm -rf "$ASTRID_HOME"
   else
     printf 'kept ASTRID_HOME=%s\n' "$ASTRID_HOME"
   fi
+  return "$status"
 }
 trap cleanup EXIT INT TERM
 
@@ -61,6 +63,14 @@ run_cli() {
     2> >(tee -a "$ARTIFACTS/cli-transcript.log" >&2)
 }
 
+run_principal_cli() {
+  local principal=$1; shift
+  printf '$ astrid --principal %s %s\n' "$principal" "$*" >> "$ARTIFACTS/cli-transcript.log"
+  "$CORE_DIR/target/debug/astrid" --principal "$principal" "$@" \
+    > >(tee -a "$ARTIFACTS/cli-transcript.log") \
+    2> >(tee -a "$ARTIFACTS/cli-transcript.log" >&2)
+}
+
 http_status() {
   local method=$1
   local path=$2
@@ -69,7 +79,7 @@ http_status() {
   local out=$5
   local args=(
     --connect-timeout 2
-    --max-time 10
+    --max-time 25
     -sS
     -o "$out"
     -w "%{http_code}"
@@ -163,6 +173,104 @@ if isinstance(data, dict) and isinstance(data.get("data"), list):
 ids = [entry.get("id") for entry in data if isinstance(entry, dict)]
 if expected not in ids:
     raise SystemExit(f"expected {expected!r} in model ids {ids!r}")
+PY
+}
+
+json_assert_session_list_scope() {
+  local file=$1 expected=$2 forbidden=$3
+  "$PYTHON" - "$file" "$expected" "$forbidden" <<'PY'
+import json
+import sys
+
+data = json.load(open(sys.argv[1], encoding="utf-8"))
+expected = sys.argv[2]
+forbidden = sys.argv[3]
+sessions = data.get("sessions", [])
+ids = [entry.get("session_id") for entry in sessions if isinstance(entry, dict)]
+if expected not in ids:
+    raise SystemExit(f"expected session {expected!r} in {ids!r}")
+if forbidden in ids:
+    raise SystemExit(f"forbidden cross-principal session {forbidden!r} appeared in {ids!r}")
+PY
+}
+
+json_assert_session_summary() {
+  local file=$1 expected_id=$2 expected_title=$3
+  "$PYTHON" - "$file" "$expected_id" "$expected_title" <<'PY'
+import json
+import sys
+
+data = json.load(open(sys.argv[1], encoding="utf-8"))
+expected_id = sys.argv[2]
+expected_title = None if sys.argv[3] == "null" else sys.argv[3]
+if data.get("session_id") != expected_id:
+    raise SystemExit(f"expected session id {expected_id!r}, got {data!r}")
+if data.get("title") != expected_title:
+    raise SystemExit(f"expected title {expected_title!r}, got {data!r}")
+PY
+}
+
+json_assert_session_messages_contains() {
+  local file=$1 expected_id=$2 expected_text=$3
+  "$PYTHON" - "$file" "$expected_id" "$expected_text" <<'PY'
+import json
+import sys
+
+data = json.load(open(sys.argv[1], encoding="utf-8"))
+expected_id = sys.argv[2]
+expected_text = sys.argv[3]
+if data.get("session_id") != expected_id:
+    raise SystemExit(f"expected transcript id {expected_id!r}, got {data!r}")
+blob = json.dumps(data.get("messages", []), sort_keys=True)
+if expected_text not in blob:
+    raise SystemExit(f"expected transcript text {expected_text!r} not found in {blob!r}")
+PY
+}
+
+json_assert_session_messages_empty() {
+  local file=$1 expected_id=$2
+  "$PYTHON" - "$file" "$expected_id" <<'PY'
+import json
+import sys
+
+data = json.load(open(sys.argv[1], encoding="utf-8"))
+expected_id = sys.argv[2]
+if data.get("session_id") != expected_id:
+    raise SystemExit(f"expected transcript id {expected_id!r}, got {data!r}")
+messages = data.get("messages")
+if messages != []:
+    raise SystemExit(f"expected empty cross-principal transcript, got {messages!r}")
+PY
+}
+
+json_assert_session_search_scope() {
+  local file=$1 expected=$2 forbidden=$3
+  "$PYTHON" - "$file" "$expected" "$forbidden" <<'PY'
+import json
+import sys
+
+data = json.load(open(sys.argv[1], encoding="utf-8"))
+expected = sys.argv[2]
+forbidden = sys.argv[3]
+results = data.get("results", [])
+ids = [entry.get("session_id") for entry in results if isinstance(entry, dict)]
+if expected != "-" and expected not in ids:
+    raise SystemExit(f"expected search hit {expected!r} in {ids!r}")
+if forbidden in ids:
+    raise SystemExit(f"forbidden cross-principal search hit {forbidden!r} appeared in {ids!r}")
+PY
+}
+
+json_assert_deleted_flag() {
+  local file=$1 expected=$2
+  "$PYTHON" - "$file" "$expected" <<'PY'
+import json
+import sys
+
+data = json.load(open(sys.argv[1], encoding="utf-8"))
+expected = sys.argv[2].lower() == "true"
+if data.get("deleted") is not expected:
+    raise SystemExit(f"expected deleted={expected!r}, got {data!r}")
 PY
 }
 
@@ -322,16 +430,16 @@ redeem_invite() {
   local display_name=$2
   local out=$3
   local pubkey
-  pubkey="$("$PYTHON" - <<'PY'
-import secrets
-print(secrets.token_hex(32))
-PY
-)"
+  run_cli keypair generate --name "$display_name" --force --raw > "$ARTIFACTS/$display_name-pubkey.hex"
+  pubkey="$(<"$ARTIFACTS/$display_name-pubkey.hex")"
   local status
   status="$(http_status POST /api/auth/redeem "" \
     "{\"token\":\"$invite\",\"public_key\":\"$pubkey\",\"display_name\":\"$display_name\"}" \
     "$out")"
   assert_status "$display_name redeem" "$status" 200
+  mkdir -p "$ASTRID_HOME/keys"
+  install -m 600 "$ASTRID_HOME/keys/local/$display_name.ed25519" \
+    "$ASTRID_HOME/keys/$(json_field "$out" principal).key"
 }
 
 wait_for_http() {
@@ -513,6 +621,19 @@ EOF
   user_group="$(json_field "$ARTIFACTS/agent-redeem.json" group)"
   [[ "$user_group" == "agent" ]] || fail "regular-user redeemed into $user_group, expected agent"
 
+  note "assigning prompt capsule set to isolated principals"
+  local prompt_capsules=(
+    --add-capsule astrid-capsule-cli \
+    --add-capsule astrid-capsule-registry \
+    --add-capsule astrid-capsule-session \
+    --add-capsule astrid-capsule-identity \
+    --add-capsule astrid-capsule-prompt-builder \
+    --add-capsule astrid-capsule-react \
+    --add-capsule astrid-capsule-openai-compat
+  )
+  run_cli agent modify "$user_principal" "${prompt_capsules[@]}"
+  run_cli agent modify "$ops_principal" "${prompt_capsules[@]}"
+
   status="$(http_status POST /api/auth/pair-device "$user_bearer" \
     '{"expires_secs":120,"label":"regular-user phone"}' \
     "$ARTIFACTS/agent-pair-device.json")"
@@ -624,6 +745,12 @@ PY
   status="$(http_status GET /api/capsules/astrid-capsule-openai-compat/env "$user_bearer" "" \
     "$ARTIFACTS/agent-openai-env-schema.json")"
   assert_status "agent env schema read" "$status" 200
+  status="$(http_status POST /api/capsules/astrid-capsule-openai-compat/env/base_url "$user_bearer" \
+    "{\"value\":\"$fake_base_url\"}" "$ARTIFACTS/agent-openai-base-url-write.json")"
+  assert_status "agent env base_url write" "$status" 204
+  status="$(http_status POST /api/capsules/astrid-capsule-openai-compat/env/base_url "$ops_bearer" \
+    "{\"value\":\"$fake_base_url\"}" "$ARTIFACTS/operator-openai-base-url-write.json")"
+  assert_status "operator env base_url write" "$status" 204
   status="$(http_status POST /api/capsules/astrid-capsule-openai-compat/env/model "$user_bearer" \
     '{"value":"fake-slow"}' \
     "$ARTIFACTS/agent-openai-env-write.json")"
@@ -721,6 +848,67 @@ PY
   assert_status "agent active model body spoof ignored" "$status" 200
   json_assert_model_id "$ARTIFACTS/agent-set-active-model-body-spoof.json" "openai-compat:fake-slow"
 
+  note "checking per-principal session isolation"
+  local user_session ops_session
+  user_session="$("$PYTHON" -c 'import uuid; print(uuid.uuid4())')"
+  ops_session="$("$PYTHON" -c 'import uuid; print(uuid.uuid4())')"
+  local user_session_text="ASTRID_E2E_USER_SESSION_DO_NOT_LEAK_$RANDOM$RANDOM"
+  local ops_session_text="ASTRID_E2E_OPS_SESSION_DO_NOT_LEAK_$RANDOM$RANDOM"
+  local user_session_title="regular user e2e session"
+  run_principal_cli "$user_principal" run --format json --session "$user_session" \
+    "$user_session_text" > "$ARTIFACTS/agent-session-run.json"
+  run_principal_cli "$ops_principal" run --format json --session "$ops_session" \
+    "$ops_session_text" > "$ARTIFACTS/operator-session-run.json"
+
+  status="$(http_status GET "/api/agent/sessions?include_archived=true&limit=20" "$user_bearer" "" \
+    "$ARTIFACTS/agent-sessions.json")"
+  assert_status "agent session list" "$status" 200
+  json_assert_session_list_scope "$ARTIFACTS/agent-sessions.json" "$user_session" "$ops_session"
+  status="$(http_status GET "/api/agent/sessions?include_archived=true&limit=20" "$ops_bearer" "" \
+    "$ARTIFACTS/operator-sessions.json")"
+  assert_status "operator session list" "$status" 200
+  json_assert_session_list_scope "$ARTIFACTS/operator-sessions.json" "$ops_session" "$user_session"
+  status="$(http_status GET "/api/agent/sessions/$user_session/messages" "$user_bearer" "" \
+    "$ARTIFACTS/agent-session-messages.json")"
+  assert_status "agent session transcript" "$status" 200
+  json_assert_session_messages_contains "$ARTIFACTS/agent-session-messages.json" "$user_session" "$user_session_text"
+  status="$(http_status GET "/api/agent/sessions/$ops_session/messages" "$ops_bearer" "" \
+    "$ARTIFACTS/operator-session-messages.json")"
+  assert_status "operator session transcript" "$status" 200
+  json_assert_session_messages_contains "$ARTIFACTS/operator-session-messages.json" "$ops_session" "$ops_session_text"
+  status="$(http_status GET "/api/agent/sessions/$ops_session" "$user_bearer" "" \
+    "$ARTIFACTS/agent-cross-session-get-hidden.json")"
+  assert_status "agent cross-principal session get hidden" "$status" 404
+  status="$(http_status GET "/api/agent/sessions/$ops_session/messages" "$user_bearer" "" \
+    "$ARTIFACTS/agent-cross-session-messages-empty.json")"
+  assert_status "agent cross-principal session transcript empty" "$status" 200
+  json_assert_session_messages_empty "$ARTIFACTS/agent-cross-session-messages-empty.json" "$ops_session"
+  status="$(http_status GET "/api/agent/sessions/search?q=$user_session_text&include_archived=true" "$user_bearer" "" \
+    "$ARTIFACTS/agent-session-search-own.json")"
+  assert_status "agent session search own" "$status" 200
+  json_assert_session_search_scope "$ARTIFACTS/agent-session-search-own.json" "$user_session" "$ops_session"
+  status="$(http_status GET "/api/agent/sessions/search?q=$ops_session_text&include_archived=true" "$user_bearer" "" \
+    "$ARTIFACTS/agent-session-search-cross-hidden.json")"
+  assert_status "agent session search cross-principal hidden" "$status" 200
+  json_assert_session_search_scope "$ARTIFACTS/agent-session-search-cross-hidden.json" "-" "$ops_session"
+  status="$(http_status PATCH "/api/agent/sessions/$user_session" "$user_bearer" \
+    "{\"title\":\"$user_session_title\",\"session_id\":\"$ops_session\"}" \
+    "$ARTIFACTS/agent-session-update.json")"
+  assert_status "agent session update own" "$status" 200
+  json_assert_session_summary "$ARTIFACTS/agent-session-update.json" "$user_session" "$user_session_title"
+  status="$(http_status PATCH "/api/agent/sessions/$ops_session" "$user_bearer" \
+    '{"title":"cross principal spoofed title"}' \
+    "$ARTIFACTS/agent-cross-session-update-hidden.json")"
+  assert_status "agent cross-principal session update hidden" "$status" 404
+  status="$(http_status DELETE "/api/agent/sessions/$ops_session" "$user_bearer" "" \
+    "$ARTIFACTS/agent-cross-session-delete-false.json")"
+  assert_status "agent cross-principal session delete false" "$status" 200
+  json_assert_deleted_flag "$ARTIFACTS/agent-cross-session-delete-false.json" false
+  status="$(http_status GET "/api/agent/sessions/$ops_session" "$ops_bearer" "" \
+    "$ARTIFACTS/operator-session-after-cross-attempts.json")"
+  assert_status "operator session survived cross-principal attempts" "$status" 200
+  json_assert_session_summary "$ARTIFACTS/operator-session-after-cross-attempts.json" "$ops_session" null
+
   note "checking prompt path through fake LLM"
   local run_out="$ARTIFACTS/run-output.txt"
   run_cli run --format json "say the word ping" > "$run_out"
@@ -730,13 +918,6 @@ PY
   }
 
   note "checking gateway prompt SSE opens for isolated regular principal"
-  run_cli agent modify "$user_principal" \
-    --add-capsule astrid-capsule-registry \
-    --add-capsule astrid-capsule-session \
-    --add-capsule astrid-capsule-identity \
-    --add-capsule astrid-capsule-prompt-builder \
-    --add-capsule astrid-capsule-react \
-    --add-capsule astrid-capsule-openai-compat
   curl -sN --max-time 5 \
     -X POST "$GATEWAY/api/agent/prompt" \
     -H "Authorization: Bearer $user_bearer" \
@@ -786,6 +967,26 @@ PY
   run_cli secret list --agent "$user_principal" --format json > "$ARTIFACTS/restart-agent-secret-list.json"
   json_assert_secret_list_metadata "$ARTIFACTS/restart-agent-secret-list.json" \
     astrid-capsule-openai-compat api_key
+  status="$(http_status GET "/api/agent/sessions?include_archived=true&limit=20" "$restart_user_bearer" "" \
+    "$ARTIFACTS/restart-agent-sessions.json")"
+  assert_status "restart agent session list" "$status" 200
+  json_assert_session_list_scope "$ARTIFACTS/restart-agent-sessions.json" "$user_session" "$ops_session"
+  status="$(http_status GET "/api/agent/sessions/$user_session" "$restart_user_bearer" "" \
+    "$ARTIFACTS/restart-agent-session.json")"
+  assert_status "restart agent session get" "$status" 200
+  json_assert_session_summary "$ARTIFACTS/restart-agent-session.json" "$user_session" "$user_session_title"
+  status="$(http_status GET "/api/agent/sessions/$user_session/messages" "$restart_user_bearer" "" \
+    "$ARTIFACTS/restart-agent-session-messages.json")"
+  assert_status "restart agent session transcript" "$status" 200
+  json_assert_session_messages_contains "$ARTIFACTS/restart-agent-session-messages.json" \
+    "$user_session" "$user_session_text"
+  status="$(http_status GET "/api/agent/sessions/$ops_session" "$restart_user_bearer" "" \
+    "$ARTIFACTS/restart-agent-cross-session-get-hidden.json")"
+  assert_status "restart agent cross-principal session get hidden" "$status" 404
+  status="$(http_status GET "/api/agent/sessions/$ops_session/messages" "$restart_user_bearer" "" \
+    "$ARTIFACTS/restart-agent-cross-session-messages-empty.json")"
+  assert_status "restart agent cross-principal session transcript empty" "$status" 200
+  json_assert_session_messages_empty "$ARTIFACTS/restart-agent-cross-session-messages-empty.json" "$ops_session"
 
   redaction_check "$sentinel"
   redaction_check "$user_secret"

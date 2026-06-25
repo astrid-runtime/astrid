@@ -205,32 +205,32 @@ auth = "bearer"
 
 [routes."GET /api/agent/sessions"]
 scenario = "session_lifecycle"
-status = "mapped"
+status = "covered"
 auth = "bearer"
 
 [routes."GET /api/agent/sessions/search"]
 scenario = "session_lifecycle"
-status = "mapped"
+status = "covered"
 auth = "bearer"
 
 [routes."GET /api/agent/sessions/{id}"]
 scenario = "session_lifecycle"
-status = "mapped"
+status = "covered"
 auth = "bearer"
 
 [routes."PATCH /api/agent/sessions/{id}"]
 scenario = "session_lifecycle"
-status = "mapped"
+status = "covered"
 auth = "bearer"
 
 [routes."DELETE /api/agent/sessions/{id}"]
 scenario = "session_lifecycle"
-status = "mapped"
+status = "covered"
 auth = "bearer"
 
 [routes."GET /api/agent/sessions/{id}/messages"]
 scenario = "session_lifecycle"
-status = "mapped"
+status = "covered"
 auth = "bearer"
 
 [routes."POST /api/agent/elicit-response"]
