@@ -294,6 +294,59 @@ impl CapsuleRegistry {
         self.instances.get(hash).map(|e| Arc::clone(&e.capsule))
     }
 
+    /// Whether an instance with this content hash is already loaded.
+    ///
+    /// Lets the kernel's per-principal load path DEDUP (#1069): if the hash is
+    /// already loaded, the capsule binary need not be compiled again — the
+    /// kernel can add it to a principal's view via [`Self::register_existing`]
+    /// (or call [`Self::register`] with a freshly-built instance, which also
+    /// dedups). Lookup is O(1).
+    #[must_use]
+    pub fn contains_hash(&self, hash: &WasmHash) -> bool {
+        self.instances.contains_key(hash)
+    }
+
+    /// Add an ALREADY-LOADED instance (by hash) to `principal`'s view, bumping
+    /// its refcount — without supplying a second `Box<dyn Capsule>`.
+    ///
+    /// The dedup fast path for the per-principal load (#1069): when
+    /// [`Self::contains_hash`] is true, the kernel skips compiling the capsule
+    /// entirely and calls this to extend the principal's view onto the existing
+    /// instance. Uplinks were registered when the instance was first loaded, so
+    /// they are NOT re-registered.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CapsuleError::NotFound`] if no instance with `hash` is loaded
+    /// (caller must check [`Self::contains_hash`] first), or
+    /// [`CapsuleError::UnsupportedEntryPoint`] if `principal`'s view already maps
+    /// `id` (a duplicate add).
+    pub fn register_existing(
+        &mut self,
+        id: &CapsuleId,
+        hash: &WasmHash,
+        principal: &PrincipalId,
+    ) -> CapsuleResult<()> {
+        if let Some(view) = self.views.get(principal)
+            && view.contains_key(id)
+        {
+            return Err(CapsuleError::UnsupportedEntryPoint(format!(
+                "Already registered: {id}"
+            )));
+        }
+        let entry = self
+            .instances
+            .get_mut(hash)
+            .ok_or_else(|| CapsuleError::NotFound(format!("no loaded instance for hash {hash}")))?;
+        entry.refcount += 1;
+        self.views
+            .entry(principal.clone())
+            .or_default()
+            .insert(id.clone(), hash.clone());
+        info!(capsule_id = %id, principal = %principal, "Registered capsule (deduped onto existing instance)");
+        Ok(())
+    }
+
     /// Get a capsule instance visible to `principal`, by capsule ID.
     ///
     /// Resolves through `principal`'s view (name → hash → instance). Returns a
@@ -321,6 +374,23 @@ impl CapsuleRegistry {
             }
         }
         None
+    }
+
+    /// Return the first principal whose view maps `id`, if any.
+    ///
+    /// For daemon-wide, principal-agnostic operations (e.g. the health-monitor
+    /// auto-restart) that hold a capsule ID resolved from `all_instances` and
+    /// need SOME principal whose view to operate the per-principal
+    /// load/unload/restart machinery against. Map iteration order is arbitrary,
+    /// so the choice among multiple referencing principals is unspecified — fine
+    /// for these global operations, where the underlying instance is shared and
+    /// restarting it re-reads the same content-addressed bytes regardless.
+    #[must_use]
+    pub fn any_principal_with(&self, id: &CapsuleId) -> Option<PrincipalId> {
+        self.views
+            .iter()
+            .find(|(_, view)| view.contains_key(id))
+            .map(|(principal, _)| principal.clone())
     }
 
     /// List the capsule IDs visible to `principal` (its view keys).
@@ -720,6 +790,50 @@ mod tests {
         registry.unregister(&b, &id).expect("unregister b");
         assert_eq!(registry.len(), 0);
         assert!(registry.get(&b, &id).is_none());
+    }
+
+    #[test]
+    fn register_existing_dedups_onto_loaded_instance() {
+        // The kernel's per-principal load fast path: A loads `shared` (compiles
+        // it once), then B reuses the SAME hash via `register_existing` without
+        // a second compile. One instance, refcount 2; both views resolve it.
+        let mut registry = CapsuleRegistry::new();
+        let a = PrincipalId::new("alice").unwrap();
+        let b = PrincipalId::new("bob").unwrap();
+        let hash = test_hash("shared");
+        let id = CapsuleId::from_static("shared");
+
+        assert!(!registry.contains_hash(&hash), "not loaded yet");
+        registry
+            .register(Box::new(MockCapsule::new("shared")), hash.clone(), &a)
+            .expect("register a");
+        assert!(registry.contains_hash(&hash), "loaded after first register");
+
+        // B dedups onto the existing instance — no second Box<dyn Capsule>.
+        registry
+            .register_existing(&id, &hash, &b)
+            .expect("register_existing b");
+        assert_eq!(registry.len(), 1, "still one instance");
+        assert!(registry.get(&a, &id).is_some());
+        assert!(registry.get(&b, &id).is_some());
+
+        // Unregistering one keeps it alive; both gone drops it.
+        registry.unregister(&a, &id).expect("unregister a");
+        assert_eq!(registry.len(), 1);
+        registry.unregister(&b, &id).expect("unregister b");
+        assert_eq!(registry.len(), 0);
+    }
+
+    #[test]
+    fn register_existing_missing_hash_is_not_found() {
+        let mut registry = CapsuleRegistry::new();
+        let p = PrincipalId::new("alice").unwrap();
+        let id = CapsuleId::from_static("ghost");
+        let hash = test_hash("ghost");
+        match registry.register_existing(&id, &hash, &p) {
+            Err(CapsuleError::NotFound(_)) => {},
+            other => panic!("expected NotFound, got {other:?}"),
+        }
     }
 
     #[test]

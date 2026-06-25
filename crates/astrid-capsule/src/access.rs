@@ -59,6 +59,40 @@ const TOOL_EXECUTE_PREFIX: &str = "tool.v1.execute.";
 /// The user-invocable **CLI command execute** topic. Matched exactly.
 const CLI_COMMAND_EXECUTE_TOPIC: &str = "cli.v1.command.execute";
 
+/// The tool-surface **describe request** topic. Matched exactly. A requester
+/// publishes this to learn which tools exist; every tool-providing capsule
+/// fans out a response. It is **view-scoped** (a principal must only learn the
+/// existence of capsules in its own view) but NOT grant-gated — enumeration is
+/// read-only and a merely-ungranted-but-in-view capsule must not emit a
+/// grant-on-first-use signal just for being listed. See
+/// [`is_view_scoped_surface`] vs [`is_user_invocable_surface`].
+const TOOL_DESCRIBE_REQUEST_TOPIC: &str = "tool.v1.request.describe";
+
+/// Is `topic` part of the **per-principal view-scoped surface** (issue #1069)?
+///
+/// On these topics the dispatcher iterates ONLY the caller's per-principal
+/// registry view (`registry.list(caller)` + `get(caller, id)`) instead of the
+/// global instance set. A capsule absent from the caller's view is invisible,
+/// full stop — the fail-closed floor. There is no fallback to any other
+/// principal's view (a silent default fallback would be the cross-tenant break
+/// this whole change closes).
+///
+/// This is a **superset** of [`is_user_invocable_surface`]: it adds the
+/// tool-surface `tool.v1.request.describe` enumeration topic. Describe is
+/// view-scoped (don't leak the names of out-of-view capsules) but is NOT
+/// grant-gated (read-only enumeration emits no grant-on-first-use signal).
+/// Invocation (`tool.v1.execute.<name>`, `cli.v1.command.execute`) is BOTH
+/// view-scoped and grant-gated.
+///
+/// Every topic NOT in this set — the internal orchestration mesh (`session.*`,
+/// `spark.*`, `registry.*`, `prompt_builder.*`, `context_engine.*`, llm
+/// streams, lifecycle/hooks) AND tool-result delivery — must keep dispatching
+/// over the GLOBAL instance set, or the runtime wedges (the mesh stays global).
+#[must_use]
+pub(crate) fn is_view_scoped_surface(topic: &str) -> bool {
+    topic == TOOL_DESCRIBE_REQUEST_TOPIC || is_user_invocable_surface(topic)
+}
+
 /// Is `topic` part of the **user-invocable surface** that the per-principal
 /// capsule-access filter gates? Co-located with the resolver because it
 /// defines *which* topics the grant set applies to.

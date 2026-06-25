@@ -22,17 +22,30 @@ use astrid_core::PrincipalId;
 use astrid_events::ipc::IpcPayload;
 use astrid_events::ipc::Topic;
 
-/// Register a mock capsule into the default principal's view (Phase 1, #1069).
+/// Register a mock capsule into the default principal's view (#1069).
 ///
-/// The dispatcher iterates `default`'s view, which in Phase 1 holds the whole
-/// loaded set — so these tests exercise the exact dispatch path production uses.
-/// The instance hash is synthesized per capsule id so each occupies its own
-/// instance slot.
+/// The non-view-scoped integration tests here publish on mesh topics (no
+/// principal, or a non-tool topic), which the dispatcher routes over the GLOBAL
+/// instance set (`all_instances`) — so a capsule in ANY view is reachable.
+/// `default` is the natural home. The instance hash is synthesized per capsule
+/// id so each occupies its own instance slot.
 fn register_mock(registry: &mut CapsuleRegistry, capsule: Box<dyn Capsule>) {
+    register_mock_for(registry, capsule, &PrincipalId::default());
+}
+
+/// Register a mock capsule into a SPECIFIC principal's view (#1069). Used by the
+/// view-scope / access tests, which publish on the view-scoped surface
+/// (`tool.v1.execute.*`, `cli.v1.command.execute`, `tool.v1.request.describe`)
+/// where the dispatcher iterates ONLY the caller's view — so the capsule must be
+/// in the CALLER's view to be a candidate at all (the fail-closed floor that
+/// precedes the grant gate).
+fn register_mock_for(
+    registry: &mut CapsuleRegistry,
+    capsule: Box<dyn Capsule>,
+    principal: &PrincipalId,
+) {
     let hash = WasmHash::synthetic(capsule.id().as_str(), "0.0.1");
-    registry
-        .register(capsule, hash, &PrincipalId::default())
-        .unwrap();
+    registry.register(capsule, hash, principal).unwrap();
 }
 
 /// A minimal mock capsule for dispatch tests.
@@ -792,190 +805,13 @@ async fn dispatch_does_not_drop_under_burst_to_single_principal() {
     handle.abort();
 }
 
-#[tokio::test]
-async fn dispatcher_idle_evicts_per_principal_consumers_after_grace() {
-    // Publish for alice — spawns a consumer. After the (collapsed)
-    // grace passes, the consumer self-evicts. A second publish must
-    // still be delivered: the dispatcher's `get_or_spawn_consumer`
-    // re-spawns through the same queue map entry.
-    //
-    // The `set_idle_consumer_grace_for_test` hook collapses the 60s
-    // production grace to a short interval so this test runs in real
-    // time without needing tokio's `test-util` feature.
-    super::set_idle_consumer_grace_for_test(100);
-    // Restore on test exit so sibling tests aren't affected by the
-    // override. Tests share a process; the next sibling sees the
-    // production default.
-    struct ResetGrace;
-    impl Drop for ResetGrace {
-        fn drop(&mut self) {
-            super::set_idle_consumer_grace_for_test(super::DEFAULT_IDLE_CONSUMER_GRACE_MS);
-        }
-    }
-    let _reset = ResetGrace;
-
-    let counter = Arc::new(AtomicUsize::new(0));
-    let (mut capsule, _) = MockCapsule::new("evict-cap", "evict.topic");
-    capsule.invoke_counter = Some(Arc::clone(&counter));
-
-    let mut registry = CapsuleRegistry::new();
-    register_mock(&mut registry, Box::new(capsule));
-    let registry = Arc::new(RwLock::new(registry));
-
-    let bus = Arc::new(EventBus::with_capacity(64));
-    let dispatcher = EventDispatcher::new(Arc::clone(&registry), Arc::clone(&bus));
-    let handle = tokio::spawn(dispatcher.run());
-
-    // Let dispatcher subscribe.
-    tokio::task::yield_now().await;
-
-    publish_ipc_as(&bus, "evict.topic", "alice");
-
-    let deadline = std::time::Instant::now() + Duration::from_secs(2);
-    while counter.load(Ordering::SeqCst) < 1 && std::time::Instant::now() < deadline {
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-    assert_eq!(
-        counter.load(Ordering::SeqCst),
-        1,
-        "first alice event should land"
-    );
-
-    // Sleep past the (collapsed) grace so the consumer idle-evicts.
-    tokio::time::sleep(Duration::from_millis(400)).await;
-
-    // Publish again — must re-spawn the consumer through
-    // `or_insert_with` and deliver the second event.
-    publish_ipc_as(&bus, "evict.topic", "alice");
-
-    let deadline = std::time::Instant::now() + Duration::from_secs(2);
-    while counter.load(Ordering::SeqCst) < 2 && std::time::Instant::now() < deadline {
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-    assert_eq!(
-        counter.load(Ordering::SeqCst),
-        2,
-        "second alice event must re-spawn the consumer and land"
-    );
-
-    handle.abort();
-}
-
-#[tokio::test]
-async fn dispatch_respawns_when_mapped_consumer_is_closed() {
-    // Regression for the burst-induced `user.v1.prompt` stall: a stale CLOSED
-    // sender left in the queue map (its consumer gone — idle-evict race or an
-    // abnormally-ended task) must NOT make every later dispatch fail `Closed`
-    // and drop forever. `get_or_spawn_consumer` skips a closed entry and
-    // re-spawns; the event is delivered, not dropped.
-    let counter = Arc::new(AtomicUsize::new(0));
-    let (mut capsule, _) = MockCapsule::new("respawn-cap", "respawn.topic");
-    capsule.invoke_counter = Some(Arc::clone(&counter));
-    let capsule: Arc<dyn Capsule> = Arc::new(capsule);
-
-    // Pre-seed the queue map with a CLOSED sender for the key (receiver dropped).
-    let queues: CapsuleQueues = Arc::new(parking_lot::Mutex::new(HashMap::new()));
-    let key = (capsule.id().clone(), Some("alice".to_string()));
-    let (dead_tx, dead_rx) = mpsc::channel::<InterceptorWork>(CAPSULE_EVENT_QUEUE_CAPACITY);
-    drop(dead_rx);
-    assert!(
-        dead_tx.is_closed(),
-        "precondition: the seeded sender is closed"
-    );
-    queues.lock().insert(key.clone(), dead_tx);
-
-    // Dispatch through the closed entry — must re-spawn a live consumer and
-    // deliver rather than hand back the dead sender and drop.
-    dispatch_single(
-        &queues,
-        Arc::clone(&capsule),
-        "test_action".to_string(),
-        Arc::new("respawn.topic".to_string()),
-        Arc::new(Vec::new()),
-        None,
-        Some("alice".to_string()),
-    );
-
-    let deadline = std::time::Instant::now() + Duration::from_secs(2);
-    while counter.load(Ordering::SeqCst) < 1 && std::time::Instant::now() < deadline {
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-    assert_eq!(
-        counter.load(Ordering::SeqCst),
-        1,
-        "a dispatch through a closed mapped sender must re-spawn and deliver, not drop"
-    );
-}
-
-// ── Chain-lock map bounding (#828) ──────────────────────────────
-
-#[tokio::test]
-async fn chain_lock_prunes_entry_when_last_referrer_drops() {
-    // Each distinct (capsule, principal) chain key inserts a mutex on
-    // first use. Without RAII pruning the map grows one entry per
-    // principal forever (ephemeral sub-agent churn). Acquire+drop a lock
-    // for many distinct principals and assert the map sheds every entry.
-    let chain_locks: ChainLocks = Arc::new(parking_lot::RwLock::new(HashMap::new()));
-    let cap = CapsuleId::from_static("chainmap-cap");
-
-    for i in 0..256 {
-        let key = (cap.clone(), Some(format!("user-{i}")));
-        let guard = acquire_chain_lock(&chain_locks, key).await;
-        // While the guard is alive the entry exists.
-        assert_eq!(chain_locks.read().len(), 1, "entry present while held");
-        drop(guard);
-        // Dropping the sole referrer prunes it.
-        assert!(
-            chain_locks.read().is_empty(),
-            "map must shed the entry once the last referrer drops"
-        );
-    }
-
-    assert!(
-        chain_locks.read().is_empty(),
-        "chain_locks must not retain one entry per principal"
-    );
-}
-
-#[tokio::test]
-async fn chain_lock_retained_while_another_holder_exists() {
-    // Two acquirers of the SAME key share one map entry; the entry
-    // survives until BOTH guards drop. This proves the prune only fires
-    // for the last referrer — a held sibling chain is never stranded
-    // without its serialization mutex.
-    let chain_locks: ChainLocks = Arc::new(parking_lot::RwLock::new(HashMap::new()));
-    let cap = CapsuleId::from_static("shared-cap");
-    let key = (cap.clone(), Some("alice".to_string()));
-
-    let g1 = acquire_chain_lock(&chain_locks, key.clone()).await;
-    assert_eq!(chain_locks.read().len(), 1);
-
-    // A second acquirer for the same key blocks on the mutex (g1 holds
-    // it). Acquire it on a task; it shares the same map Arc, so the
-    // entry must NOT be pruned while g1 lives.
-    let cl = Arc::clone(&chain_locks);
-    let k2 = key.clone();
-    let task = tokio::spawn(async move {
-        let g2 = acquire_chain_lock(&cl, k2).await;
-        tokio::task::yield_now().await;
-        drop(g2);
-    });
-
-    // g1 still alive → entry present regardless of the racing acquirer.
-    assert_eq!(
-        chain_locks.read().len(),
-        1,
-        "entry must persist while g1 holds it"
-    );
-    drop(g1);
-    task.await.unwrap();
-
-    // Both guards gone → entry pruned.
-    assert!(
-        chain_locks.read().is_empty(),
-        "entry pruned once both holders drop"
-    );
-}
+// NOTE: queue-machinery tests that exercise the per-(capsule, principal)
+// consumer lifecycle and chain-lock map directly (idle-eviction,
+// closed-sender re-spawn, chain-lock pruning) live with the code they test, in
+// `dispatcher_queues_tests.rs` attached to the `queues` module — they need its
+// private internals (`dispatch_single`, `InterceptorWork`, `acquire_chain_lock`,
+// the idle-grace override). The tests in THIS file drive the dispatcher through
+// its public surface (matching, view scoping, the grant gate).
 
 // ── Per-principal capsule-access enforcement (#992) ──────────────────
 //
@@ -1032,16 +868,26 @@ mod access_enforcement {
     }
 
     /// Spawn a dispatcher wired with the resolver over a registry holding
-    /// one capsule whose interceptor binds `interceptor_event`. Returns the
-    /// invoked flag, the bus, and the task handle.
+    /// one capsule whose interceptor binds `interceptor_event`, registered into
+    /// `caller`'s per-principal view. Returns the invoked flag, the bus, and the
+    /// task handle.
+    ///
+    /// The capsule is placed in the CALLER's view (#1069) so the view floor does
+    /// not drop it before the grant gate can run — these tests isolate the GRANT
+    /// dimension (is the in-view capsule granted?), and the separate
+    /// view-isolation tests cover the floor itself. For orchestration-topic
+    /// tests the caller is irrelevant (the mesh is global), but registering into
+    /// the caller's view is harmless there.
     fn spawn_with_capsule(
         resolver: CapsuleAccessResolver,
         capsule_name: &str,
         interceptor_event: &str,
+        caller: &str,
     ) -> (Arc<AtomicBool>, Arc<EventBus>, tokio::task::JoinHandle<()>) {
         let (capsule, invoked) = MockCapsule::new(capsule_name, interceptor_event);
         let mut registry = CapsuleRegistry::new();
-        register_mock(&mut registry, Box::new(capsule));
+        let caller_pid = PrincipalId::new(caller).expect("valid caller principal");
+        register_mock_for(&mut registry, Box::new(capsule), &caller_pid);
         let registry = Arc::new(RwLock::new(registry));
         let bus = Arc::new(EventBus::with_capacity(64));
         let dispatcher = EventDispatcher::new(Arc::clone(&registry), Arc::clone(&bus))
@@ -1055,11 +901,12 @@ mod access_enforcement {
     #[tokio::test]
     async fn ungranted_principal_denied_tool_dispatch() {
         let (_dir, home, resolver) = resolver_fixture();
-        // `bob` exists but is granted no capsules.
+        // `bob` exists but is granted no capsules. The capsule IS in bob's view
+        // (so the view floor passes) — the GRANT gate is what denies him here.
         write_profile(&home, "bob", &agent_with_capsules(&[]));
 
         let (invoked, bus, handle) =
-            spawn_with_capsule(resolver, "secret-tool", "tool.v1.execute.do_thing");
+            spawn_with_capsule(resolver, "secret-tool", "tool.v1.execute.do_thing", "bob");
         tokio::task::yield_now().await;
         publish_ipc_as(&bus, "tool.v1.execute.do_thing", "bob");
         tokio::time::sleep(Duration::from_millis(200)).await;
@@ -1078,7 +925,7 @@ mod access_enforcement {
         write_profile(&home, "alice", &agent_with_capsules(&["secret-tool"]));
 
         let (invoked, bus, handle) =
-            spawn_with_capsule(resolver, "secret-tool", "tool.v1.execute.do_thing");
+            spawn_with_capsule(resolver, "secret-tool", "tool.v1.execute.do_thing", "alice");
         tokio::task::yield_now().await;
         publish_ipc_as(&bus, "tool.v1.execute.do_thing", "alice");
         tokio::time::sleep(Duration::from_millis(200)).await;
@@ -1099,7 +946,7 @@ mod access_enforcement {
         write_profile(&home, "root", &admin_profile());
 
         let (invoked, bus, handle) =
-            spawn_with_capsule(resolver, "secret-tool", "tool.v1.execute.do_thing");
+            spawn_with_capsule(resolver, "secret-tool", "tool.v1.execute.do_thing", "root");
         tokio::task::yield_now().await;
         publish_ipc_as(&bus, "tool.v1.execute.do_thing", "root");
         tokio::time::sleep(Duration::from_millis(200)).await;
@@ -1111,13 +958,20 @@ mod access_enforcement {
         handle.abort();
     }
 
-    /// (d) `anonymous` caller → no tool capsules visible (fail-closed).
+    /// (d) `anonymous` caller → no tool capsules visible (fail-closed). The
+    /// capsule is registered into `default`'s view; `anonymous` resolves to an
+    /// EMPTY candidate set at the view floor, so it is dropped before the grant
+    /// gate — there is no fallback to `default`'s view.
     #[tokio::test]
     async fn anonymous_caller_denied() {
         let (_dir, _home, resolver) = resolver_fixture();
 
-        let (invoked, bus, handle) =
-            spawn_with_capsule(resolver, "secret-tool", "tool.v1.execute.do_thing");
+        let (invoked, bus, handle) = spawn_with_capsule(
+            resolver,
+            "secret-tool",
+            "tool.v1.execute.do_thing",
+            "default",
+        );
         tokio::task::yield_now().await;
         publish_ipc_as(&bus, "tool.v1.execute.do_thing", "anonymous");
         tokio::time::sleep(Duration::from_millis(200)).await;
@@ -1162,7 +1016,7 @@ mod access_enforcement {
         write_profile(&home, "bob", &agent_with_capsules(&[]));
 
         let (_invoked, bus, handle) =
-            spawn_with_capsule(resolver, "secret-tool", "tool.v1.execute.do_thing");
+            spawn_with_capsule(resolver, "secret-tool", "tool.v1.execute.do_thing", "bob");
         let mut approval = bus.subscribe_topic("astrid.v1.approval");
         tokio::task::yield_now().await;
         publish_ipc_as(&bus, "tool.v1.execute.do_thing", "bob");
@@ -1188,8 +1042,12 @@ mod access_enforcement {
     async fn anonymous_gate_miss_emits_no_grant_required() {
         let (_dir, _home, resolver) = resolver_fixture();
 
-        let (_invoked, bus, handle) =
-            spawn_with_capsule(resolver, "secret-tool", "tool.v1.execute.do_thing");
+        let (_invoked, bus, handle) = spawn_with_capsule(
+            resolver,
+            "secret-tool",
+            "tool.v1.execute.do_thing",
+            "default",
+        );
         let mut approval = bus.subscribe_topic("astrid.v1.approval");
         tokio::task::yield_now().await;
         publish_ipc_as(&bus, "tool.v1.execute.do_thing", "anonymous");
@@ -1209,7 +1067,7 @@ mod access_enforcement {
         write_profile(&home, "root", &admin_profile());
 
         let (_invoked, bus, handle) =
-            spawn_with_capsule(resolver, "secret-tool", "tool.v1.execute.do_thing");
+            spawn_with_capsule(resolver, "secret-tool", "tool.v1.execute.do_thing", "root");
         let mut approval = bus.subscribe_topic("astrid.v1.approval");
         tokio::task::yield_now().await;
         publish_ipc_as(&bus, "tool.v1.execute.do_thing", "root");
@@ -1221,14 +1079,21 @@ mod access_enforcement {
         handle.abort();
     }
 
-    /// (d') An unknown principal (no profile on disk → default, no grants)
-    /// is likewise denied — fail-closed default.
+    /// (d') An unknown principal (no profile on disk → default, no grants) is
+    /// likewise denied — fail-closed default. The capsule IS in `nobody`'s view
+    /// here, so this isolates the GRANT gate (no grants → deny); the empty-view
+    /// floor for a truly-unprovisioned principal is covered by a dedicated
+    /// view-isolation test.
     #[tokio::test]
     async fn unknown_principal_denied() {
         let (_dir, _home, resolver) = resolver_fixture();
 
-        let (invoked, bus, handle) =
-            spawn_with_capsule(resolver, "secret-tool", "tool.v1.execute.do_thing");
+        let (invoked, bus, handle) = spawn_with_capsule(
+            resolver,
+            "secret-tool",
+            "tool.v1.execute.do_thing",
+            "nobody",
+        );
         tokio::task::yield_now().await;
         publish_ipc_as(&bus, "tool.v1.execute.do_thing", "nobody");
         tokio::time::sleep(Duration::from_millis(200)).await;
@@ -1252,8 +1117,12 @@ mod access_enforcement {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, "profile_version = 9999\n").unwrap();
 
-        let (invoked, bus, handle) =
-            spawn_with_capsule(resolver, "secret-tool", "tool.v1.execute.do_thing");
+        let (invoked, bus, handle) = spawn_with_capsule(
+            resolver,
+            "secret-tool",
+            "tool.v1.execute.do_thing",
+            "broken",
+        );
         tokio::task::yield_now().await;
         publish_ipc_as(&bus, "tool.v1.execute.do_thing", "broken");
         tokio::time::sleep(Duration::from_millis(200)).await;
@@ -1270,11 +1139,13 @@ mod access_enforcement {
     #[tokio::test]
     async fn orchestration_topic_ungated() {
         let (_dir, home, resolver) = resolver_fixture();
-        // `bob` has NO capsule grants — yet orchestration must still flow.
+        // `bob` has NO capsule grants — yet orchestration must still flow. The
+        // session topic is NOT view-scoped, so the capsule is reached over the
+        // GLOBAL instance set regardless of bob's (empty) view.
         write_profile(&home, "bob", &agent_with_capsules(&[]));
 
         let (invoked, bus, handle) =
-            spawn_with_capsule(resolver, "session-capsule", "session.v1.append");
+            spawn_with_capsule(resolver, "session-capsule", "session.v1.append", "default");
         tokio::task::yield_now().await;
         publish_ipc_as(&bus, "session.v1.append", "bob");
         tokio::time::sleep(Duration::from_millis(200)).await;
@@ -1294,7 +1165,7 @@ mod access_enforcement {
         write_profile(&home, "bob", &agent_with_capsules(&[]));
 
         let (invoked, bus, handle) =
-            spawn_with_capsule(resolver, "cli-capsule", "cli.v1.command.execute");
+            spawn_with_capsule(resolver, "cli-capsule", "cli.v1.command.execute", "bob");
         tokio::task::yield_now().await;
         publish_ipc_as(&bus, "cli.v1.command.execute", "bob");
         tokio::time::sleep(Duration::from_millis(200)).await;
@@ -1319,11 +1190,18 @@ mod access_enforcement {
         // second registry entry with the orchestration topic, both named
         // the same dual-role capsule but we test via two capsules sharing
         // the ungranted principal to isolate the topic dimension.
+        //
+        // The tool capsule goes into BOB's view so the view floor passes and the
+        // GRANT gate is what denies the tool topic (proving the gate is
+        // topic-scoped, not a side effect of the view floor). The orchestration
+        // capsule goes into `default`'s view — `spark.v1.request.build` is NOT
+        // view-scoped, so it is reached over the global instance set.
+        let bob_pid = PrincipalId::new("bob").expect("valid principal");
         let (tool_cap, tool_invoked) =
             MockCapsule::new("identity", "tool.v1.execute.save_identity");
         let (orch_cap, orch_invoked) = MockCapsule::new("identity-orch", "spark.v1.request.build");
         let mut registry = CapsuleRegistry::new();
-        register_mock(&mut registry, Box::new(tool_cap));
+        register_mock_for(&mut registry, Box::new(tool_cap), &bob_pid);
         register_mock(&mut registry, Box::new(orch_cap));
         let registry = Arc::new(RwLock::new(registry));
         let bus = Arc::new(EventBus::with_capacity(64));
@@ -1347,14 +1225,18 @@ mod access_enforcement {
         handle.abort();
     }
 
-    /// With no resolver wired (legacy path), the surface is ungated — a
-    /// dispatcher built without `with_access_resolver` dispatches tools to
-    /// any principal, proving the gate is opt-in via injection.
+    /// With no resolver wired (legacy path), the GRANT gate is off — a
+    /// dispatcher built without `with_access_resolver` does not filter tools by
+    /// grant, proving the grant gate is opt-in via injection. The per-principal
+    /// VIEW floor (#1069) is independent of the resolver, so the capsule must be
+    /// in the caller's view to be reached; with it in `bob`'s view and the grant
+    /// gate off, bob is served.
     #[tokio::test]
-    async fn no_resolver_means_ungated() {
+    async fn no_resolver_means_grant_gate_off() {
+        let bob_pid = PrincipalId::new("bob").expect("valid principal");
         let (tool_cap, invoked) = MockCapsule::new("secret-tool", "tool.v1.execute.do_thing");
         let mut registry = CapsuleRegistry::new();
-        register_mock(&mut registry, Box::new(tool_cap));
+        register_mock_for(&mut registry, Box::new(tool_cap), &bob_pid);
         let registry = Arc::new(RwLock::new(registry));
         let bus = Arc::new(EventBus::with_capacity(64));
         // No `.with_access_resolver(..)`.
@@ -1367,7 +1249,7 @@ mod access_enforcement {
 
         assert!(
             invoked.load(Ordering::SeqCst),
-            "without a resolver the surface is ungated (legacy/test path)"
+            "without a resolver the grant gate is off; an in-view capsule is served"
         );
         handle.abort();
     }
@@ -1384,8 +1266,12 @@ mod access_enforcement {
         let (_dir, home, resolver) = resolver_fixture();
         write_profile(&home, "bob", &agent_with_capsules(&[]));
 
-        let (invoked, bus, handle) =
-            spawn_with_capsule(resolver, "router-like", "tool.v1.execute.*.result");
+        let (invoked, bus, handle) = spawn_with_capsule(
+            resolver,
+            "router-like",
+            "tool.v1.execute.*.result",
+            "default",
+        );
         tokio::task::yield_now().await;
         publish_ipc_as(&bus, "tool.v1.execute.do_thing.result", "bob");
         tokio::time::sleep(Duration::from_millis(200)).await;
@@ -1406,7 +1292,7 @@ mod access_enforcement {
         write_profile(&home, "bob", &agent_with_capsules(&[]));
 
         let (invoked, bus, handle) =
-            spawn_with_capsule(resolver, "react-like", "tool.v1.execute.result");
+            spawn_with_capsule(resolver, "react-like", "tool.v1.execute.result", "default");
         tokio::task::yield_now().await;
         publish_ipc_as(&bus, "tool.v1.execute.result", "bob");
         tokio::time::sleep(Duration::from_millis(200)).await;
@@ -1431,5 +1317,198 @@ mod access_enforcement {
         assert!(!gated("tool.v1.execute."));
         assert!(!gated("session.v1.append"));
         assert!(!gated("tool.v1.response.describe.foo"));
+        // Describe is NOT grant-gated (read-only enumeration emits no
+        // grant-on-first-use); it is only view-scoped (see `is_view_scoped`).
+        assert!(!gated("tool.v1.request.describe"));
+    }
+
+    /// Unit cover for the view-scoped predicate (#1069): describe joins the
+    /// grant-gated surface as a VIEW-scoped topic; the mesh stays global.
+    #[test]
+    fn view_scoped_surface_is_grant_surface_plus_describe() {
+        use crate::access::is_view_scoped_surface as view_scoped;
+        // Superset of the grant-gated surface.
+        assert!(view_scoped("tool.v1.execute.save_identity"));
+        assert!(view_scoped("cli.v1.command.execute"));
+        // Plus the describe enumeration topic.
+        assert!(view_scoped("tool.v1.request.describe"));
+        // Mesh / result-delivery topics are NOT view-scoped (stay global).
+        assert!(!view_scoped("session.v1.append"));
+        assert!(!view_scoped("spark.v1.request.build"));
+        assert!(!view_scoped("tool.v1.execute.save_identity.result"));
+        assert!(!view_scoped("tool.v1.execute.result"));
+        assert!(!view_scoped("registry.v1.discover"));
+    }
+}
+
+// ── Per-principal VIEW isolation (#1069) ─────────────────────────────
+//
+// These tests prove the cross-tenant FLOOR: on the view-scoped surface the
+// dispatcher iterates ONLY the caller's per-principal view. A capsule outside
+// the caller's view is never matched, described, or dispatched — and there is
+// NO fallback to any other principal's view (the cross-tenant break this whole
+// change closes). The mesh stays global. The grant gate is OFF in these tests
+// (no resolver wired) so the view floor is isolated as the thing under test.
+
+mod view_isolation {
+    use super::*;
+
+    /// Spawn a dispatcher (NO resolver — isolating the VIEW floor) over a
+    /// registry the caller pre-populates. Returns the bus + handle.
+    fn spawn_view_only(registry: CapsuleRegistry) -> (Arc<EventBus>, tokio::task::JoinHandle<()>) {
+        let registry = Arc::new(RwLock::new(registry));
+        let bus = Arc::new(EventBus::with_capacity(64));
+        let dispatcher = EventDispatcher::new(Arc::clone(&registry), Arc::clone(&bus));
+        let handle = tokio::spawn(dispatcher.run());
+        (bus, handle)
+    }
+
+    /// (a) Isolation: A's view = {foo}, B's view = {bar}. A executing `foo` is
+    /// served; A executing `bar` sees nothing (bar is not in A's view), and
+    /// B's `bar` capsule is never invoked by A's call — no cross-tenant leak.
+    #[tokio::test]
+    async fn views_are_isolated_no_cross_tenant_reach() {
+        let a = PrincipalId::new("alice").unwrap();
+        let b = PrincipalId::new("bob").unwrap();
+
+        let (foo, foo_invoked) = MockCapsule::new("foo", "tool.v1.execute.foo");
+        let (bar, bar_invoked) = MockCapsule::new("bar", "tool.v1.execute.bar");
+        let mut registry = CapsuleRegistry::new();
+        register_mock_for(&mut registry, Box::new(foo), &a);
+        register_mock_for(&mut registry, Box::new(bar), &b);
+        let (bus, handle) = spawn_view_only(registry);
+        tokio::task::yield_now().await;
+
+        // alice executes foo (in her view) → served.
+        publish_ipc_as(&bus, "tool.v1.execute.foo", "alice");
+        // alice executes bar (NOT in her view; it's bob's) → must be dropped.
+        publish_ipc_as(&bus, "tool.v1.execute.bar", "alice");
+        tokio::time::sleep(Duration::from_millis(250)).await;
+
+        assert!(
+            foo_invoked.load(Ordering::SeqCst),
+            "alice's in-view capsule `foo` must be served"
+        );
+        assert!(
+            !bar_invoked.load(Ordering::SeqCst),
+            "bob's capsule `bar` must be INVISIBLE to alice — no cross-tenant reach"
+        );
+        handle.abort();
+    }
+
+    /// (e) Fail-closed unknown principal: a capsule lives in `default`'s view;
+    /// an unknown/unprovisioned principal (empty view) executing it sees
+    /// NOTHING — there is no fallback to `default`'s view.
+    #[tokio::test]
+    async fn unknown_principal_empty_view_no_default_fallback() {
+        let (foo, foo_invoked) = MockCapsule::new("foo", "tool.v1.execute.foo");
+        let mut registry = CapsuleRegistry::new();
+        // Registered ONLY into default's view.
+        register_mock(&mut registry, Box::new(foo));
+        let (bus, handle) = spawn_view_only(registry);
+        tokio::task::yield_now().await;
+
+        // `ghost` is unknown — has no view entry → empty candidate set.
+        publish_ipc_as(&bus, "tool.v1.execute.foo", "ghost");
+        tokio::time::sleep(Duration::from_millis(250)).await;
+
+        assert!(
+            !foo_invoked.load(Ordering::SeqCst),
+            "an unknown principal must resolve to an EMPTY view — never a fallback to default's view"
+        );
+        handle.abort();
+    }
+
+    /// (b) Per-principal versions: A's `foo` → hash1 and B's `foo` → hash2 are
+    /// distinct instances loaded concurrently and isolated — A's execute hits
+    /// A's instance, B's hits B's. Proven by per-instance invocation flags.
+    #[tokio::test]
+    async fn per_principal_versions_are_isolated() {
+        let a = PrincipalId::new("alice").unwrap();
+        let b = PrincipalId::new("bob").unwrap();
+
+        // Two DIFFERENT binaries of the same capsule name `foo`. Distinct hashes
+        // ⇒ distinct instances. Each carries its own invocation flag.
+        let (foo_v1, v1_invoked) = MockCapsule::new("foo", "tool.v1.execute.foo");
+        let (foo_v2, v2_invoked) = MockCapsule::new("foo", "tool.v1.execute.foo");
+        let mut registry = CapsuleRegistry::new();
+        registry
+            .register(Box::new(foo_v1), WasmHash::from_raw("hash1"), &a)
+            .unwrap();
+        registry
+            .register(Box::new(foo_v2), WasmHash::from_raw("hash2"), &b)
+            .unwrap();
+        // Two distinct instances despite the shared name.
+        assert_eq!(registry.len(), 2, "distinct hashes ⇒ distinct instances");
+
+        let (bus, handle) = spawn_view_only(registry);
+        tokio::task::yield_now().await;
+
+        publish_ipc_as(&bus, "tool.v1.execute.foo", "alice");
+        tokio::time::sleep(Duration::from_millis(250)).await;
+
+        assert!(
+            v1_invoked.load(Ordering::SeqCst),
+            "alice's execute must hit alice's instance (hash1)"
+        );
+        assert!(
+            !v2_invoked.load(Ordering::SeqCst),
+            "bob's instance (hash2) must NOT be hit by alice's execute"
+        );
+        handle.abort();
+    }
+
+    /// Describe is VIEW-SCOPED: a principal's `tool.v1.request.describe` reaches
+    /// only the capsules in its own view, never another principal's — so it
+    /// cannot enumerate the existence of out-of-view capsules.
+    #[tokio::test]
+    async fn describe_is_view_scoped() {
+        let a = PrincipalId::new("alice").unwrap();
+        let b = PrincipalId::new("bob").unwrap();
+
+        let (foo, foo_described) = MockCapsule::new("foo", "tool.v1.request.describe");
+        let (bar, bar_described) = MockCapsule::new("bar", "tool.v1.request.describe");
+        let mut registry = CapsuleRegistry::new();
+        register_mock_for(&mut registry, Box::new(foo), &a);
+        register_mock_for(&mut registry, Box::new(bar), &b);
+        let (bus, handle) = spawn_view_only(registry);
+        tokio::task::yield_now().await;
+
+        // alice asks "what tools exist?" → only her view (foo) responds.
+        publish_ipc_as(&bus, "tool.v1.request.describe", "alice");
+        tokio::time::sleep(Duration::from_millis(250)).await;
+
+        assert!(
+            foo_described.load(Ordering::SeqCst),
+            "alice's describe must reach her in-view capsule `foo`"
+        );
+        assert!(
+            !bar_described.load(Ordering::SeqCst),
+            "alice's describe must NOT reach bob's `bar` — describe is view-scoped"
+        );
+        handle.abort();
+    }
+
+    /// (f) Mesh stays global: an orchestration topic reaches a capsule in
+    /// ANOTHER principal's view (here `default`'s), regardless of the caller —
+    /// no view scoping on the internal mesh, or routing wedges.
+    #[tokio::test]
+    async fn mesh_topic_reaches_all_instances_regardless_of_caller() {
+        // Capsule lives ONLY in default's view; an orchestration call from a
+        // DIFFERENT principal (alice, empty view) must still reach it.
+        let (sess, sess_invoked) = MockCapsule::new("session-cap", "session.v1.append");
+        let mut registry = CapsuleRegistry::new();
+        register_mock(&mut registry, Box::new(sess));
+        let (bus, handle) = spawn_view_only(registry);
+        tokio::task::yield_now().await;
+
+        publish_ipc_as(&bus, "session.v1.append", "alice");
+        tokio::time::sleep(Duration::from_millis(250)).await;
+
+        assert!(
+            sess_invoked.load(Ordering::SeqCst),
+            "mesh/orchestration topics must reach the global instance set, not a per-principal view"
+        );
+        handle.abort();
     }
 }
