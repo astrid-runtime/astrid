@@ -20,9 +20,9 @@ deny = ["non-admin bearer is rejected before shutdown"]
 
 [capabilities."system:status"]
 scenario = "system_status"
-status = "mapped"
+status = "covered"
 allow = ["authorized operator can read daemon status"]
-deny = ["unauthenticated caller is rejected"]
+deny = ["regular agent is rejected before grant and after revoke"]
 
 [capabilities."capsule:install"]
 scenario = "core_capsule_install"

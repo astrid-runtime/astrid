@@ -162,13 +162,13 @@ principal = "admin_and_agent"
 
 [commands."caps grant"]
 scenario = "capability_grants"
-status = "mapped"
+status = "covered"
 mode = "mutating"
 principal = "admin"
 
 [commands."caps revoke"]
 scenario = "capability_grants"
-status = "mapped"
+status = "covered"
 mode = "mutating"
 principal = "admin"
 

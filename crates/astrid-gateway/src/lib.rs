@@ -43,6 +43,7 @@
 
 pub mod auth;
 pub mod bus_admin;
+pub mod bus_kernel;
 pub mod config;
 pub mod error;
 pub mod metrics;

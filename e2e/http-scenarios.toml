@@ -255,7 +255,7 @@ auth = "bearer"
 
 [routes."GET /api/sys/status"]
 scenario = "system_status"
-status = "mapped"
+status = "covered"
 auth = "bearer"
 
 [routes."GET /api/sys/readiness"]

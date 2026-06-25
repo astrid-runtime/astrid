@@ -38,7 +38,6 @@ use std::time::Duration;
 
 use astrid_capsule_install::github_source;
 use astrid_core::kernel_api::{CapsuleMetadataEntry, KernelRequest, KernelResponse};
-use astrid_uplink::KernelClient;
 use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::Request;
@@ -110,14 +109,11 @@ pub struct InstallRequest {
     )
 )]
 pub async fn list_capsules(
-    State(_state): State<Arc<GatewayState>>,
+    State(state): State<Arc<GatewayState>>,
     req: Request<axum::body::Body>,
 ) -> GatewayResult<Json<CapsuleListResponse>> {
     let caller = caller_from(&req)?.clone();
-    let mut client = KernelClient::connect(caller.principal.clone())
-        .await
-        .map_err(daemon_internal)?
-        .with_device_key_id(caller.device_key_id.clone());
+    let client = state.kernel_client_for(&caller)?;
     let resp = client
         .request(KernelRequest::ListCapsules)
         .await
@@ -170,7 +166,7 @@ pub async fn list_capsules(
     )
 )]
 pub async fn install_capsule(
-    State(_state): State<Arc<GatewayState>>,
+    State(state): State<Arc<GatewayState>>,
     req: Request<axum::body::Body>,
 ) -> GatewayResult<Json<serde_json::Value>> {
     let caller = caller_from(&req)?.clone();
@@ -196,10 +192,7 @@ pub async fn install_capsule(
             (body.source, body.workspace, None)
         };
 
-    let mut client = KernelClient::connect(caller.principal.clone())
-        .await
-        .map_err(daemon_internal)?
-        .with_device_key_id(caller.device_key_id.clone());
+    let client = state.kernel_client_for(&caller)?;
     let resp = client
         .request(KernelRequest::InstallCapsule { source, workspace })
         .await
@@ -388,15 +381,12 @@ async fn stage_capsule_archive(asset_name: &str, bytes: Vec<u8>) -> GatewayResul
     )
 )]
 pub async fn get_capsule(
-    State(_state): State<Arc<GatewayState>>,
+    State(state): State<Arc<GatewayState>>,
     Path(id): Path<String>,
     req: Request<axum::body::Body>,
 ) -> GatewayResult<Json<CapsuleDetail>> {
     let caller = caller_from(&req)?.clone();
-    let mut client = KernelClient::connect(caller.principal.clone())
-        .await
-        .map_err(daemon_internal)?
-        .with_device_key_id(caller.device_key_id.clone());
+    let client = state.kernel_client_for(&caller)?;
     let resp = client
         .request(KernelRequest::GetCapsuleMetadata)
         .await

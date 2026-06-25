@@ -8,7 +8,6 @@
 use std::sync::Arc;
 
 use astrid_core::kernel_api::{AgentLoopReadiness, DaemonStatus, KernelRequest, KernelResponse};
-use astrid_uplink::KernelClient;
 use axum::Json;
 use axum::extract::State;
 use axum::http::{Request, StatusCode};
@@ -28,14 +27,11 @@ use crate::state::GatewayState;
     )
 )]
 pub async fn get_status(
-    State(_state): State<Arc<GatewayState>>,
+    State(state): State<Arc<GatewayState>>,
     req: Request<axum::body::Body>,
 ) -> GatewayResult<Json<DaemonStatus>> {
     let caller = caller_from(&req)?.clone();
-    let mut client = KernelClient::connect(caller.principal.clone())
-        .await
-        .map_err(daemon_internal)?
-        .with_device_key_id(caller.device_key_id.clone());
+    let client = state.kernel_client_for(&caller)?;
     let resp = client
         .request(KernelRequest::GetStatus)
         .await
@@ -60,14 +56,11 @@ pub async fn get_status(
     )
 )]
 pub async fn get_readiness(
-    State(_state): State<Arc<GatewayState>>,
+    State(state): State<Arc<GatewayState>>,
     req: Request<axum::body::Body>,
 ) -> GatewayResult<Json<AgentLoopReadiness>> {
     let caller = caller_from(&req)?.clone();
-    let mut client = KernelClient::connect(caller.principal.clone())
-        .await
-        .map_err(daemon_internal)?
-        .with_device_key_id(caller.device_key_id.clone());
+    let client = state.kernel_client_for(&caller)?;
     let resp = client
         .request(KernelRequest::GetAgentReadiness)
         .await
@@ -92,14 +85,11 @@ pub async fn get_readiness(
     )
 )]
 pub async fn reload_capsules(
-    State(_state): State<Arc<GatewayState>>,
+    State(state): State<Arc<GatewayState>>,
     req: Request<axum::body::Body>,
 ) -> GatewayResult<StatusCode> {
     let caller = caller_from(&req)?.clone();
-    let mut client = KernelClient::connect(caller.principal.clone())
-        .await
-        .map_err(daemon_internal)?
-        .with_device_key_id(caller.device_key_id.clone());
+    let client = state.kernel_client_for(&caller)?;
     let resp = client
         .request(KernelRequest::ReloadCapsules)
         .await

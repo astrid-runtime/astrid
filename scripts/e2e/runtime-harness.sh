@@ -595,6 +595,16 @@ PY
   refresh_principal="$(json_field "$ARTIFACTS/agent-refresh.json" principal)"
   [[ "$refresh_principal" == "$user_principal" ]] || fail "refresh principal $refresh_principal did not match $user_principal"
 
+  note "checking live capability grant and revoke"
+  status="$(http_status GET /api/sys/status "$user_bearer" "" "$ARTIFACTS/agent-status-before-grant.json")"
+  assert_status "agent status denied before grant" "$status" 403
+  run_cli caps grant "$user_principal" system:status
+  status="$(http_status GET /api/sys/status "$user_bearer" "" "$ARTIFACTS/agent-status-after-grant.json")"
+  assert_status "agent status allowed after grant" "$status" 200
+  run_cli caps revoke "$user_principal" system:status
+  status="$(http_status GET /api/sys/status "$user_bearer" "" "$ARTIFACTS/agent-status-after-revoke.json")"
+  assert_status "agent status denied after revoke" "$status" 403
+
   run_cli quota set --agent "$user_principal" --processes 4 --ipc-rate "1MB/s"
   status="$(http_status GET "/api/sys/principals/$user_principal/quotas" "$user_bearer" "" \
     "$ARTIFACTS/agent-quotas.json")"
