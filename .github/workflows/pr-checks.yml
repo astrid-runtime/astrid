@@ -3,7 +3,7 @@ name: PR Checks
 on:
   pull_request:
     branches: [main]
-    types: [opened, edited, reopened, labeled, synchronize]
+    types: [opened, edited, reopened, labeled, unlabeled, synchronize]
 
 permissions:
   contents: read
@@ -16,6 +16,7 @@ jobs:
       - name: Validate PR body
         env:
           PR_BODY: ${{ github.event.pull_request.body }}
+          PR_LABELS: ${{ join(github.event.pull_request.labels.*.name, '\n') }}
         run: |
           ERRORS=""
 
@@ -49,9 +50,22 @@ jobs:
           check_section "Changes"
           check_section_any "Verification" "Test Plan"
 
-          # Check that Linked Issue has an actual issue number, not just the placeholder
+          has_traceability_exception_label() {
+            printf '%s\n' "$PR_LABELS" | grep -qiE '^(no-issue|maintenance|docs-only|release|deps|dependencies)$'
+          }
+
+          LINKED_ISSUE_SECTION="$(section_content "Linked Issue")"
+
+          # Check that Linked Issue has an actual issue number, unless a narrowly
+          # labeled exception explains why no issue exists.
           if ! echo "$PR_BODY" | grep -qE '#[0-9]+'; then
-            ERRORS="${ERRORS}Linked Issue must reference an issue number (#N)\n"
+            if has_traceability_exception_label; then
+              if ! printf '%s\n' "$LINKED_ISSUE_SECTION" | grep -qiE '(no issue|no tracked issue|not linked|maintenance|docs|release|dependenc|traceability)'; then
+                ERRORS="${ERRORS}Linked Issue must explain the no-issue exception when using no-issue, maintenance, docs-only, release, deps, or dependencies labels\n"
+              fi
+            else
+              ERRORS="${ERRORS}Linked Issue must reference an issue number (#N) or use a documented traceability exception label\n"
+            fi
           fi
 
           if [ -n "$ERRORS" ]; then
@@ -251,6 +265,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           PR_BODY: ${{ github.event.pull_request.body }}
+          PR_LABELS: ${{ join(github.event.pull_request.labels.*.name, '\n') }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
           REPO: ${{ github.repository }}
         run: |
@@ -275,7 +290,23 @@ jobs:
             exit 0
           fi
 
-          echo "::error::Every PR must be linked to an issue. Use 'Closes #N' in the PR body or link via the GitHub sidebar."
+          has_traceability_exception_label() {
+            printf '%s\n' "$PR_LABELS" | grep -qiE '^(no-issue|maintenance|docs-only|release|deps|dependencies)$'
+          }
+
+          LINKED_ISSUE_SECTION=$(echo "$PR_BODY" | sed -n '/^## Linked Issue/,/^## /p' | sed '1d' | sed '/^## /d' | sed '/^<!--.*-->$/d' | sed '/^\s*$/d')
+
+          if has_traceability_exception_label; then
+            if printf '%s\n' "$LINKED_ISSUE_SECTION" | grep -qiE '(no issue|no tracked issue|not linked|maintenance|docs|release|dependenc|traceability)'; then
+              echo "PR has a documented traceability exception."
+              exit 0
+            fi
+
+            echo "::error::Traceability exception labels require a short explanation in the PR body's '## Linked Issue' section."
+            exit 1
+          fi
+
+          echo "::error::Every PR must be linked to an issue, unless a documented traceability exception applies. Use 'Closes #N' in the PR body, link an issue via the GitHub sidebar, or add one of: no-issue, maintenance, docs-only, release, deps, dependencies."
           exit 1
 
   account-age:
