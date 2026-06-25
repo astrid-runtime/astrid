@@ -13,6 +13,11 @@ jobs:
     name: PR template filled in
     runs-on: ubuntu-latest
     steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
+        with:
+          egress-policy: audit
+
       - name: Validate PR body
         env:
           PR_BODY: ${{ github.event.pull_request.body }}
@@ -86,6 +91,11 @@ jobs:
       issues: read
       pull-requests: read
     steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
+        with:
+          egress-policy: audit
+
       - name: Checkout
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
 
@@ -188,6 +198,11 @@ jobs:
       issues: read
       pull-requests: read
     steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
+        with:
+          egress-policy: audit
+
       - name: Checkout
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
@@ -261,6 +276,11 @@ jobs:
     name: Linked issue required
     runs-on: ubuntu-latest
     steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
+        with:
+          egress-policy: audit
+
       - name: Check for linked issue
         env:
           GH_TOKEN: ${{ github.token }}
@@ -314,6 +334,11 @@ jobs:
     runs-on: ubuntu-latest
     if: github.event.pull_request.author_association == 'NONE' || github.event.pull_request.author_association == 'FIRST_TIMER' || github.event.pull_request.author_association == 'FIRST_TIME_CONTRIBUTOR'
     steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
+        with:
+          egress-policy: audit
+
       - name: Check account age and activity
         env:
           GH_TOKEN: ${{ github.token }}
