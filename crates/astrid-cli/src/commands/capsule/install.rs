@@ -740,6 +740,9 @@ pub(crate) fn install_from_local_path(
         original_source: original_source.map(String::from),
         skip_import_check: BATCH_MODE.load(Ordering::Relaxed),
         lifecycle_bus: None,
+        // CLI installs target the default principal (#1069). Picked up via
+        // `Default` so the CLI install path is unchanged.
+        ..Default::default()
     };
     let output = run_with_elicit(opts, |opts, bus| {
         astrid_capsule_install::install_from_local_path(
@@ -803,6 +806,9 @@ fn unpack_via_lib(
         original_source: original_source.map(String::from),
         skip_import_check: BATCH_MODE.load(Ordering::Relaxed),
         lifecycle_bus: None,
+        // CLI installs target the default principal (#1069). Picked up via
+        // `Default` so the CLI install path is unchanged.
+        ..Default::default()
     };
     let output = run_with_elicit(opts, |opts, bus| {
         astrid_capsule_install::unpack_and_install(

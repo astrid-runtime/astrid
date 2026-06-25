@@ -34,6 +34,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, bail};
 use astrid_capsule::discovery::load_manifest;
 use astrid_capsule::engine::wasm::host_state::LifecyclePhase;
+use astrid_core::PrincipalId;
 use astrid_core::dirs::AstridHome;
 use astrid_events::EventBus;
 
@@ -43,7 +44,7 @@ use crate::manifest_check::{
     ExportConflict, MissingImport, check_export_conflicts, validate_imports,
 };
 use crate::meta::{CapsuleMeta, read_meta, write_meta};
-use crate::paths::{resolve_env_path, resolve_target_dir, restore_env_from_backup};
+use crate::paths::{resolve_env_path_for, resolve_target_dir_for, restore_env_from_backup_for};
 use crate::wasm::{WasmAddressed, content_address_wasm};
 use crate::wit::{content_address_wit, materialize_wit_mirror, version_map_to_strings};
 
@@ -68,6 +69,15 @@ pub struct InstallOptions {
     /// kernel-side handler passes `None` — no human at the daemon end
     /// to answer prompts.
     pub lifecycle_bus: Option<EventBus>,
+    /// The principal whose home receives this install (#1069). The capsule
+    /// dir, env config, and `home://wit/` mirror all land in this principal's
+    /// home. Defaults via `Default` to [`PrincipalId::default()`], so the CLI
+    /// — which builds `InstallOptions` inline and never sets this — is
+    /// unchanged. The kernel install handler sets it to the real CALLER so a
+    /// principal installs into its OWN view, not a global one. Ignored for
+    /// `workspace` installs (those belong to the working directory, not a
+    /// principal).
+    pub target_principal: PrincipalId,
 }
 
 /// What an install produced.
@@ -154,9 +164,14 @@ pub fn install_from_local_path(
     // Pre-flight checks — pure reads, no target mutation.
     let export_conflicts = check_export_conflicts(&manifest)?;
 
+    // The principal whose home receives this install (#1069). Workspace
+    // installs ignore it (they belong to the CWD). Defaults to the install
+    // principal so the CLI path is unchanged.
+    let target_principal = options.target_principal.clone();
+
     // Resolve target. The parent must exist before we attempt the
     // backup-rename later; create it now.
-    let target_dir = resolve_target_dir(home, &id, options.workspace)?;
+    let target_dir = resolve_target_dir_for(home, &target_principal, &id, options.workspace)?;
     let parent = target_dir.parent().context("target dir has no parent")?;
     std::fs::create_dir_all(parent)
         .with_context(|| format!("failed to create {}", parent.display()))?;
@@ -205,7 +220,7 @@ pub fn install_from_local_path(
 
     // Preserve existing .env.json (user configuration survives reinstall).
     if let Some(ref backup) = backup_dir {
-        restore_env_from_backup(home, backup, &id);
+        restore_env_from_backup_for(home, &target_principal, backup, &id);
     }
 
     // Lifecycle hook — bytes from the content store, not the target.
@@ -255,9 +270,7 @@ pub fn install_from_local_path(
     // any VFS scheme a capsule can reach. Best-effort: the capsule is
     // already installed and committed, so a mirror failure must not roll
     // it back. It degrades introspection visibility, not the install.
-    if let Err(e) =
-        materialize_wit_mirror(home, &crate::paths::install_principal(), &meta.wit_files)
-    {
+    if let Err(e) = materialize_wit_mirror(home, &target_principal, &meta.wit_files) {
         tracing::warn!(
             capsule = %id,
             error = %format!("{e:#}"),
@@ -266,7 +279,7 @@ pub fn install_from_local_path(
     }
 
     // Determine env-prompt signal for the caller.
-    let env_path = resolve_env_path(home, &id)?;
+    let env_path = resolve_env_path_for(home, &target_principal, &id)?;
     let env_needs_prompt = !manifest.env.is_empty() && !env_path.exists();
 
     let missing_imports = if options.skip_import_check {

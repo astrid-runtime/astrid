@@ -27,14 +27,22 @@
 use std::sync::Arc;
 
 use astrid_capsule_install::{InstallOptions, InstallOutput, InstallPhase};
+use astrid_core::PrincipalId;
 use astrid_events::kernel_api::KernelResponse;
 
 /// Handle `KernelRequest::InstallCapsule` by delegating to the shared
 /// install library.
+///
+/// Per-principal (#1069): the install lands in the CALLER's home (its
+/// `.local/capsules/`, env config, and `home://wit/` mirror) and is then loaded
+/// into the CALLER's view — not a global `load_all_capsules`. The shared
+/// content store (`bin/<hash>.wasm`) is still global and deduped; only the
+/// per-principal `meta.json` registry and view are caller-scoped.
 pub(super) async fn handle_install_capsule(
     kernel: &Arc<crate::Kernel>,
     source: &str,
     workspace: bool,
+    caller: &PrincipalId,
 ) -> KernelResponse {
     if workspace {
         return KernelResponse::Error(
@@ -80,6 +88,8 @@ pub(super) async fn handle_install_capsule(
         // on install-time elicit must be configured via env before
         // being installed through this path.
         lifecycle_bus: None,
+        // Land the install in the CALLER's home + meta.json (#1069).
+        target_principal: caller.clone(),
     };
 
     let is_archive = path.is_file()
@@ -115,9 +125,12 @@ pub(super) async fn handle_install_capsule(
         Err(e) => return KernelResponse::Error(format!("install task panicked: {e}")),
     };
 
-    // Pick up the new capsule without a daemon restart. The loader
-    // is idempotent on already-registered IDs.
-    kernel.load_all_capsules().await;
+    // Pick up the new capsule into the CALLER's view without a daemon restart
+    // (#1069) — not a global reload. The loader is idempotent on capsules
+    // already in the caller's view and dedups a shared binary. Publish the
+    // "set changed" pulse so consumers re-enumerate (view-scoped).
+    kernel.ensure_principal_loaded(caller).await;
+    kernel.publish_capsules_loaded().await;
 
     KernelResponse::Success(install_output_json(&output))
 }

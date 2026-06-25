@@ -125,10 +125,19 @@ pub(super) async fn provision_new_principal(
         ));
     }
 
-    // Mirror the read-only introspection furniture so this fresh principal's
-    // `system_status` / `list_interfaces` reflect the globally-loaded capsule
-    // set instead of an empty home. Best-effort (see helper docs).
+    // Seed the read-only introspection furniture so this fresh principal's
+    // `.local/capsules/` + `home://wit/` reflect the loaded capsule set instead
+    // of an empty home (one-time GRANULAR seed of default's whole meta.json set;
+    // see `furniture.rs`). Best-effort (see helper docs).
     sync_principal_furniture(kernel, &principal).await;
+
+    // Build the new principal's registry VIEW from the just-seeded set (#1069),
+    // deduping against already-loaded instances. Without this the principal's
+    // view is empty until the next boot, so its first describe/execute would
+    // fail-closed to nothing even though the furniture is on disk. Best-effort:
+    // a load failure degrades this principal's first-turn reachability, not the
+    // create.
+    kernel.ensure_principal_loaded(&principal).await;
 
     // State inheritance is OPT-IN. By default the new principal inherits
     // NOTHING — least privilege, and no silent leak of `default`'s env

@@ -44,10 +44,12 @@ pub(super) async fn inherit_from_principal(
         Vec<astrid_capsule::capsule::CapsuleId>,
         Vec<(astrid_capsule::capsule::CapsuleId, Vec<String>)>,
     ) = {
-        // Phase 1 (#1069): snapshot the whole loaded set (daemon-wide,
-        // principal-agnostic). Scoping to `source`'s view is Phase 2.
+        // Per-principal (#1069): inherit KV/secret namespaces ONLY for the
+        // capsules in the SOURCE principal's view — copying namespaces for a
+        // capsule the source never had would be meaningless (and could create
+        // empty slots for capsules outside the source's world).
         let registry = kernel.capsules.read().await;
-        let instances = registry.all_instances();
+        let instances = registry.cloned_values(source);
         let ids: Vec<_> = instances.iter().map(|c| c.id().clone()).collect();
         let mut secrets: Vec<(astrid_capsule::capsule::CapsuleId, Vec<String>)> = Vec::new();
         for capsule in &instances {

@@ -268,8 +268,8 @@ async fn handle_request(
 
     let res = match req {
         KernelRequest::InstallCapsule { source, workspace } => {
-            info!(source = %source, workspace, "Kernel received install request");
-            install::handle_install_capsule(kernel, &source, workspace).await
+            info!(source = %source, workspace, principal = %caller, "Kernel received install request");
+            install::handle_install_capsule(kernel, &source, workspace, &caller).await
         },
         KernelRequest::ApproveCapability {
             request_id,
@@ -279,21 +279,26 @@ async fn handle_request(
             KernelResponse::Error("Approval logic not yet implemented in kernel router".to_string())
         },
         KernelRequest::ListCapsules => {
-            // Phase 1 (#1069): default's view holds the whole loaded set, so
-            // this lists every loaded capsule exactly as before. Scoping to the
-            // caller's view is Phase 2.
-            let principal = PrincipalId::default();
+            // Per-principal (#1069): list ONLY the capsules in the CALLER's view.
+            // Listing the global set would leak the names of capsules another
+            // principal installed.
             let reg = kernel.capsules.read().await;
             let mut list = Vec::new();
-            for c in reg.list(&principal) {
+            for c in reg.list(&caller) {
                 list.push(c.to_string());
             }
             KernelResponse::Success(serde_json::json!(list))
         },
         KernelRequest::GetCommands => {
+            // Per-principal (#1069): commands come ONLY from capsules in the
+            // CALLER's view — a command provided by another principal's capsule
+            // must not surface here.
             let reg = kernel.capsules.read().await;
             let mut commands = Vec::new();
-            for c in reg.values() {
+            for id in reg.list(&caller) {
+                let Some(c) = reg.get(&caller, id) else {
+                    continue;
+                };
                 for cmd in &c.manifest().commands {
                     commands.push(astrid_events::kernel_api::CommandInfo {
                         name: cmd.name.clone(),
@@ -308,25 +313,24 @@ async fn handle_request(
             }
             info!(
                 count = commands.len(),
-                capsules = reg.len(),
-                "GetCommands: returning {} commands from {} capsules",
+                principal = %caller,
+                "GetCommands: returning {} commands for caller's view",
                 commands.len(),
-                reg.len()
             );
             KernelResponse::Commands(commands)
         },
         KernelRequest::ReloadCapsules => {
-            // Unregister capsules in a Failed state so they can be re-loaded
-            // with fresh configuration (e.g. after onboarding writes .env.json).
-            // Phase 1 (#1069): operate on default's view (the whole loaded set).
+            // Unregister the CALLER's Failed capsules so they re-load with fresh
+            // configuration (e.g. after onboarding writes .env.json), then
+            // rebuild the caller's view (#1069). Scoped to the caller — a
+            // principal's reload must not touch another principal's view.
             {
-                let principal = PrincipalId::default();
                 let reg = kernel.capsules.read().await;
                 let failed_ids: Vec<_> = reg
-                    .list(&principal)
+                    .list(&caller)
                     .into_iter()
                     .filter(|id| {
-                        reg.get(&principal, id).is_some_and(|c| {
+                        reg.get(&caller, id).is_some_and(|c| {
                             matches!(c.state(), astrid_capsule::capsule::CapsuleState::Failed(_))
                         })
                     })
@@ -336,11 +340,12 @@ async fn handle_request(
 
                 let mut reg = kernel.capsules.write().await;
                 for id in failed_ids {
-                    let _ = reg.unregister(&principal, &id);
+                    let _ = reg.unregister(&caller, &id);
                 }
             }
 
-            kernel.load_all_capsules().await;
+            kernel.ensure_principal_loaded(&caller).await;
+            kernel.publish_capsules_loaded().await;
             KernelResponse::Success(serde_json::json!({"status": "reloaded"}))
         },
         KernelRequest::ReloadCapsule { id } => {
@@ -350,7 +355,8 @@ async fn handle_request(
             // validate it (CapsuleId::new rejects unsafe ids) before using it as
             // a registry key — never construct it unchecked from untrusted input.
             match astrid_capsule::capsule::CapsuleId::new(id.clone()) {
-                Ok(cap_id) => match kernel.reload_one_capsule(&cap_id).await {
+                // Reload into the CALLER's view (#1069) — a per-principal hot-swap.
+                Ok(cap_id) => match kernel.reload_one_capsule(&cap_id, &caller).await {
                     Ok(()) => KernelResponse::Success(
                         serde_json::json!({"status": "reloaded", "capsule": id}),
                     ),
@@ -369,7 +375,9 @@ async fn handle_request(
             // (CapsuleId::new rejects unsafe ids) before using it as a registry
             // key — never construct it unchecked from untrusted input.
             match astrid_capsule::capsule::CapsuleId::new(id.clone()) {
-                Ok(cap_id) => match kernel.unload_one_capsule(&cap_id).await {
+                // Unload from the CALLER's view (#1069) — refcounted instance
+                // survives if another principal still references the binary.
+                Ok(cap_id) => match kernel.unload_one_capsule(&cap_id, &caller).await {
                     Ok(true) => KernelResponse::Success(
                         serde_json::json!({"status": "unloaded", "capsule": id}),
                     ),
@@ -401,14 +409,11 @@ async fn handle_request(
         },
         KernelRequest::GetStatus => {
             let uptime = kernel.boot_time.elapsed().as_secs();
-            // Phase 1 (#1069): default's view = the whole loaded set.
-            let principal = PrincipalId::default();
+            // Per-principal (#1069): the caller sees the capsules in ITS OWN
+            // view, not the global loaded set. The connection counts below stay
+            // daemon-wide (they are global health, not per-principal state).
             let reg = kernel.capsules.read().await;
-            let loaded: Vec<String> = reg
-                .list(&principal)
-                .iter()
-                .map(ToString::to_string)
-                .collect();
+            let loaded: Vec<String> = reg.list(&caller).iter().map(ToString::to_string).collect();
             let by_principal = kernel
                 .connections_by_principal()
                 .into_iter()
@@ -432,9 +437,15 @@ async fn handle_request(
             KernelResponse::Status(status)
         },
         KernelRequest::GetCapsuleMetadata => {
+            // Per-principal (#1069): metadata ONLY for capsules in the CALLER's
+            // view — interceptor-event names of another principal's capsules
+            // must not leak.
             let reg = kernel.capsules.read().await;
             let mut entries = Vec::new();
-            for capsule in reg.values() {
+            for id in reg.list(&caller) {
+                let Some(capsule) = reg.get(&caller, id) else {
+                    continue;
+                };
                 let manifest = capsule.manifest();
                 entries.push(astrid_events::kernel_api::CapsuleMetadataEntry {
                     name: manifest.package.name.clone(),
