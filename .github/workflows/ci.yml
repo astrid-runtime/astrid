@@ -197,6 +197,84 @@ jobs:
           rust-toolchain: manual
           github-token: ${{ github.token }}
 
+  public-rust-api-diff:
+    name: Public Rust API diff
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          fetch-depth: 0
+          submodules: recursive
+
+      - name: Detect public API inputs
+        id: api-inputs
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          git diff --name-only "$BASE_SHA"...HEAD | tee changed-files.txt
+
+          if grep -Eq '(^Cargo\.toml$|^crates/[^/]+/Cargo\.toml$|^crates/.*\.rs$|^crates/[^/]+/build\.rs$|^crates/[^/]+/wit/|^wit/)' changed-files.txt; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+            echo "Public API inputs changed; running cargo-public-api."
+          else
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "No public API inputs changed; skipping cargo-public-api."
+          fi
+
+      - name: Install Rust toolchains
+        if: steps.api-inputs.outputs.run == 'true'
+        uses: dtolnay/rust-toolchain@5b842231ba77f5c045dba54ac5560fed2db780e2 # nightly
+        with:
+          toolchain: nightly
+
+      - name: Cache Rust artifacts
+        if: steps.api-inputs.outputs.run == 'true'
+        uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
+        with:
+          key: ${{ runner.os }}-${{ github.job }}
+          cache-on-failure: true
+
+      - name: Install cargo-public-api
+        if: steps.api-inputs.outputs.run == 'true'
+        uses: taiki-e/install-action@682e7d9e49c5e653d371fc6adbda67653461378a # v2
+        with:
+          tool: cargo-public-api
+
+      - name: Check public Rust item diff
+        if: steps.api-inputs.outputs.run == 'true'
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          if git log --format=%B "$BASE_SHA..$HEAD_SHA" \
+            | grep -Eq '(^[A-Za-z0-9_-]+(\([^)]*\))?!:|^BREAKING[ -]CHANGE:)'; then
+            DENY=""
+            echo "Breaking-change marker found; reporting public API diff without denying changes."
+          else
+            DENY="--deny changed --deny removed"
+            echo "No breaking-change marker found; denying changed or removed public API items."
+          fi
+
+          packages=$(cargo metadata --locked --format-version 1 --no-deps \
+            | jq -r '.packages[]
+              | select(.publish == null)
+              | select(any(.targets[]; any(.kind[]; . == "lib")))
+              | .name')
+
+          for package in $packages; do
+            echo "::group::cargo public-api $package"
+            cargo public-api \
+              --package "$package" \
+              --all-features \
+              -ss \
+              diff \
+              $DENY \
+              --force \
+              "$BASE_SHA..HEAD"
+            echo "::endgroup::"
+          done
+
   audit:
     name: Security Audit
     runs-on: ubuntu-latest
