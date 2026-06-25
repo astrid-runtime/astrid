@@ -48,6 +48,10 @@ pub struct SessionToken([u8; 32]);
 
 impl SessionToken {
     /// Generate a new random session token from the OS CSPRNG.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the OS CSPRNG is unavailable.
     #[must_use]
     pub fn generate() -> Self {
         let mut bytes = [0u8; 32];

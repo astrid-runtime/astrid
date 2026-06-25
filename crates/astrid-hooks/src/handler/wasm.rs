@@ -14,7 +14,6 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use astrid_capsule::capsule::CapsuleId;
-use astrid_capsule::engine::wasm::bindings;
 use astrid_capsule::engine::wasm::host_state::HostState;
 use astrid_storage::kv::ScopedKvStore;
 use tracing::{debug, warn};
@@ -221,23 +220,16 @@ impl WasmHandler {
             HandlerError::WasmFailed(format!("failed to instantiate WASM component: {e}"))
         })?;
 
-        // Call `astrid-hook-trigger` via typed func lookup.
+        // Call `astrid-hook-trigger` via the astrid-capsule wrapper so the
+        // generated WIT bindings stay private to the runtime crate.
         let capsule_result = tokio::task::block_in_place(|| {
-            let func = instance
-                .get_typed_func::<(String, Vec<u8>), (bindings::astrid::guest::lifecycle::CapsuleResult,)>(
-                    &mut store,
-                    "astrid-hook-trigger",
-                )
-                .map_err(|e| {
-                    HandlerError::WasmFailed(format!(
-                        "capsule does not export `astrid-hook-trigger`: {e}"
-                    ))
-                })?;
-            func.call(&mut store, (function.clone(), input_bytes.clone()))
-                .map(|(cr,)| cr)
-                .map_err(|e| {
-                    HandlerError::WasmFailed(format!("astrid-hook-trigger call failed: {e}"))
-                })
+            astrid_capsule::engine::wasm::call_hook_trigger(
+                &instance,
+                &mut store,
+                function,
+                input_bytes,
+            )
+            .map_err(|e| HandlerError::WasmFailed(e.to_string()))
         })?;
 
         // Map the typed CapsuleResult to HookResult.

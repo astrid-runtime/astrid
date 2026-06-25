@@ -199,6 +199,10 @@ struct PersistedFile {
 }
 
 /// Generate a random URL-safe-base64 token. Uses the OS CSPRNG.
+///
+/// # Panics
+///
+/// Panics if the OS CSPRNG is unavailable.
 #[must_use]
 pub fn generate_token() -> String {
     use rand::{TryRng, rngs::SysRng};

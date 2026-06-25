@@ -24,6 +24,10 @@ pub struct KeyPair {
 
 impl KeyPair {
     /// Generate a new random key pair.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the OS CSPRNG is unavailable.
     #[must_use]
     pub fn generate() -> Self {
         let mut secret = [0u8; 32];

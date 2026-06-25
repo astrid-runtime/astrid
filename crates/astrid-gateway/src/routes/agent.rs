@@ -58,7 +58,7 @@ use axum::extract::State;
 use axum::http::{Request, StatusCode};
 use axum::response::IntoResponse;
 use axum::response::Sse;
-use axum::response::sse::{Event, KeepAlive};
+use axum::response::sse::{Event, KeepAlive, KeepAliveStream};
 use futures::Stream;
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
@@ -421,7 +421,7 @@ fn publish_elicit_response(
 /// return the same concrete `Sse` type (the handler's `impl Stream`).
 fn sse_with_keepalive(
     stream: futures::stream::BoxStream<'static, Result<Event, Infallible>>,
-) -> Sse<futures::stream::BoxStream<'static, Result<Event, Infallible>>> {
+) -> Sse<KeepAliveStream<futures::stream::BoxStream<'static, Result<Event, Infallible>>>> {
     Sse::new(stream).keep_alive(
         KeepAlive::new()
             .interval(Duration::from_secs(15))
@@ -434,7 +434,7 @@ fn sse_with_keepalive(
 /// wait against a loop that can never reply.
 fn unready_stream(
     report: &AgentLoopReadiness,
-) -> Sse<futures::stream::BoxStream<'static, Result<Event, Infallible>>> {
+) -> Sse<KeepAliveStream<futures::stream::BoxStream<'static, Result<Event, Infallible>>>> {
     sse_with_keepalive(unready_event_stream(report))
 }
 

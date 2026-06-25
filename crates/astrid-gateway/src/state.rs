@@ -44,6 +44,10 @@ pub struct SigningMaterial {
 impl SigningMaterial {
     /// Generate a fresh signing keypair from the OS CSPRNG. Used by
     /// tests and by the load path when the on-disk key is missing.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the OS CSPRNG is unavailable.
     #[must_use]
     pub fn fresh() -> Self {
         let mut secret = [0u8; 32];

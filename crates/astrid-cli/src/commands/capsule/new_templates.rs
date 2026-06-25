@@ -444,7 +444,7 @@ mod tests {
         assert!(toml.contains(r#"edition = "2024""#));
         assert!(toml.contains("panic = \"abort\""));
         // Must parse as TOML.
-        toml.parse::<toml::Value>().expect("Cargo.toml must parse");
+        toml::from_str::<toml::Value>(&toml).expect("Cargo.toml must parse");
     }
 
     #[test]
@@ -462,7 +462,7 @@ mod tests {
     #[test]
     fn capsule_toml_parses_and_has_tool_acl() {
         let manifest = capsule_toml("hello-cap", "hello_cap");
-        let value: toml::Value = manifest.parse().expect("Capsule.toml must parse");
+        let value: toml::Value = toml::from_str(&manifest).expect("Capsule.toml must parse");
 
         // Package block.
         assert_eq!(value["package"]["name"].as_str(), Some("hello-cap"));

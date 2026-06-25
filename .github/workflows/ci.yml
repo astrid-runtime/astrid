@@ -217,8 +217,24 @@ jobs:
           key: ${{ runner.os }}-${{ github.job }}
           cache-on-failure: true
 
-      - name: Check public API compatibility
+      - name: Detect breaking-change marker
         if: steps.api-inputs.outputs.run == 'true'
+        id: breaking-change
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          if git log --format=%B "$BASE_SHA..$HEAD_SHA" \
+            | grep -Eq '(^[A-Za-z0-9_-]+(\([^)]*\))?!:|^BREAKING[ -]CHANGE:)'; then
+            echo "found=true" >> "$GITHUB_OUTPUT"
+            echo "Breaking-change marker found; cargo-semver-checks is skipped."
+          else
+            echo "found=false" >> "$GITHUB_OUTPUT"
+            echo "No breaking-change marker found; running cargo-semver-checks."
+          fi
+
+      - name: Check public API compatibility
+        if: steps.api-inputs.outputs.run == 'true' && steps.breaking-change.outputs.found != 'true'
         uses: obi1kenobi/cargo-semver-checks-action@6b69fcf40e9b5fb17adeb57e4b6ecd020649a239 # v2
         with:
           manifest-path: Cargo.toml

@@ -146,6 +146,17 @@ jobs:
           echo "Author: $PR_AUTHOR"
           echo "Tier: $TIER"
 
+          LABELS=$(gh api "repos/$REPO/issues/$PR_NUMBER/labels" --jq '.[].name' 2>/dev/null || echo "")
+
+          has_dependency_label() {
+            printf '%s\n' "$LABELS" | grep -qiE '^(deps|dependencies)$'
+          }
+
+          if [ "$PR_AUTHOR" = "dependabot[bot]" ] && has_dependency_label; then
+            echo "Dependabot dependency PR detected; contributor path gate passed."
+            exit 0
+          fi
+
           # Maintainers pass all checks
           if [ "$TIER" = "maintainer" ]; then
             echo "Maintainer - all paths allowed."
@@ -173,7 +184,6 @@ jobs:
 
           # New contributors: require approval label
           if [ "$TIER" = "new" ]; then
-            LABELS=$(gh api "repos/$REPO/issues/$PR_NUMBER/labels" --jq '.[].name' 2>/dev/null || echo "")
             if echo "$LABELS" | grep -q "newcomer-approved"; then
               echo "New contributor approved by a maintainer."
             else

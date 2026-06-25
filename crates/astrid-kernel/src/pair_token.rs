@@ -201,6 +201,10 @@ struct PersistedFile {
 }
 
 /// Generate a random URL-safe-base64 token from the OS CSPRNG.
+///
+/// # Panics
+///
+/// Panics if the OS CSPRNG is unavailable.
 #[must_use]
 pub fn generate_token() -> String {
     let mut bytes = [0u8; TOKEN_RAW_LEN];

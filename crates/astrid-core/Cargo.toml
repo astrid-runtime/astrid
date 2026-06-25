@@ -20,7 +20,10 @@ sha2 = { workspace = true }
 subtle = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["time", "sync"] }
-toml = { workspace = true }
+# astrid-core exposes toml error types in its public error enums. Keep this
+# crate on the current public dependency until a breaking release can change
+# that API deliberately.
+toml = "0.8.23"
 uuid = { workspace = true }
 
 [dev-dependencies]

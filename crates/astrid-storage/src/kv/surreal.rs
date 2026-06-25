@@ -7,6 +7,7 @@
 //! than overwriting a value the caller didn't expect.
 
 use async_trait::async_trait;
+use surrealkv::LSMIterator;
 
 use super::{
     KvStore, composite_key, namespace_range_end, namespace_range_start, prefix_range_end,
@@ -178,7 +179,7 @@ impl KvStore for SurrealKvStore {
 
         let mut keys = Vec::new();
         while iter.valid() {
-            let raw_key = iter.key();
+            let raw_key = iter.key().user_key();
             if raw_key.len() > prefix_len
                 && let Ok(key_str) = std::str::from_utf8(&raw_key[prefix_len..])
             {
@@ -208,7 +209,7 @@ impl KvStore for SurrealKvStore {
 
         let mut keys = Vec::new();
         while iter.valid() {
-            let raw_key = iter.key();
+            let raw_key = iter.key().user_key();
             if raw_key.len() > prefix_len
                 && let Ok(key_str) = std::str::from_utf8(&raw_key[prefix_len..])
             {
@@ -266,7 +267,7 @@ impl KvStore for SurrealKvStore {
             iter.seek_first().map_err(|ref e| map_kv_err(e))?;
             let mut keys = Vec::new();
             while iter.valid() {
-                keys.push(iter.key());
+                keys.push(iter.key().user_key().to_vec());
                 iter.next().map_err(|ref e| map_kv_err(e))?;
             }
             keys
@@ -296,7 +297,7 @@ impl KvStore for SurrealKvStore {
             iter.seek_first().map_err(|ref e| map_kv_err(e))?;
             let mut keys = Vec::new();
             while iter.valid() {
-                keys.push(iter.key());
+                keys.push(iter.key().user_key().to_vec());
                 iter.next().map_err(|ref e| map_kv_err(e))?;
             }
             keys
