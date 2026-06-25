@@ -13,7 +13,7 @@ use astrid_storage::ScopedKvStore;
 use astrid_core::session_token::SessionToken;
 
 use crate::profile_cache::PrincipalProfileCache;
-use crate::registry::CapsuleRegistry;
+use crate::registry::{CapsuleRegistry, WasmHash};
 use crate::schema_catalog::SchemaCatalog;
 
 /// Context provided to a capsule during lifecycle operations (load/unload).
@@ -86,6 +86,14 @@ pub struct CapsuleContext {
     /// only. Empty = no exemptions (fail-closed). Operator config — never
     /// settable by the capsule's own (untrusted) manifest.
     pub local_egress: Vec<String>,
+    /// Content hash addressing this capsule's instance in the registry
+    /// (issue #1069). Resolved by the kernel from the capsule's `meta.json`
+    /// `wasm_hash` (or synthesized from `name + version` for non-WASM capsules),
+    /// then threaded here so the load path registers the UUID→instance mapping
+    /// under the same hash the kernel registers the instance under. `None` in
+    /// tests / single-tenant boots that did not thread it — the engine then
+    /// synthesizes a per-capsule key from the manifest.
+    pub wasm_hash: Option<WasmHash>,
 }
 
 impl CapsuleContext {
@@ -114,6 +122,7 @@ impl CapsuleContext {
             overlay_registry: None,
             group_config: None,
             local_egress: Vec::new(),
+            wasm_hash: None,
         }
     }
 
@@ -174,6 +183,15 @@ impl CapsuleContext {
     #[must_use]
     pub fn with_local_egress(mut self, allowlist: Vec<String>) -> Self {
         self.local_egress = allowlist;
+        self
+    }
+
+    /// Set the content hash addressing this capsule's registry instance
+    /// (issue #1069). The load path uses it to register the UUID→instance
+    /// mapping under the same hash the kernel registers the instance under.
+    #[must_use]
+    pub fn with_wasm_hash(mut self, hash: WasmHash) -> Self {
+        self.wasm_hash = Some(hash);
         self
     }
 }

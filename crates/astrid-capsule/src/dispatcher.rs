@@ -896,16 +896,16 @@ fn dispatch_single(
 /// When `topic` is in the **user-invocable surface** (`tool.v1.execute.*`,
 /// `cli.v1.command.execute`) **and** an `access_resolver` is wired, a
 /// matched capsule is kept only if `caller_principal` is granted it (or is
-/// an admin holding `*`). The filter is keyed on the **topic**, so a
-/// dual-role capsule's orchestration interceptors (on non-tool topics) are
-/// never filtered — they fall through the surface check unchanged. For all
-/// other topics the filter is a no-op and dispatch is identical to before.
+/// an admin holding `*`). The filter is keyed on the **topic**, so a dual-role
+/// capsule's orchestration interceptors (on non-tool topics) are never filtered
+/// — they fall through the surface check unchanged. For all other topics the
+/// filter is a no-op and dispatch is identical to before.
 /// For an **authenticated, non-admin** caller a denied match is no longer a
 /// pure silent drop: before dropping, a [`IpcPayload::GrantRequired`] signal is
 /// published on `astrid.v1.approval` (grant-on-first-use, #998) so a broker/shim
 /// can elicit consent and, on approve, the kernel grants the capsule. The match
 /// is still dropped for THIS call (the capsule never sees the ungranted call);
-/// the caller's request simply finds no tool, exactly as if the capsule were not
+/// the caller's request simply finds no tool, as if the capsule were not
 /// installed. A `None`/empty/`anonymous` caller (no authenticated principal to
 /// grant to) is still a pure silent drop with no signal.
 async fn find_matching_interceptors(
@@ -915,20 +915,20 @@ async fn find_matching_interceptors(
     access_resolver: Option<&CapsuleAccessResolver>,
     event_bus: &EventBus,
 ) -> Vec<(Arc<dyn crate::capsule::Capsule>, String, u32)> {
-    // Compute the gate once per event, not per capsule. The filter only
-    // engages for the user-invocable surface with a resolver present;
-    // otherwise every topic dispatches unchanged (orchestration mesh).
+    // Compute the gate once per event, not per capsule. The filter engages only
+    // for the user-invocable surface with a resolver present; every other topic
+    // dispatches unchanged (orchestration mesh).
     let gate_surface = crate::access::is_user_invocable_surface(topic);
     let registry = registry.read().await;
+    // Phase 1 (#1069): default's view holds the whole loaded set; scoping by
+    // `caller_principal` (byte-identical today, divergent later) is Phase 2.
+    let view_principal = astrid_core::PrincipalId::default();
     let mut matches: Vec<(Arc<dyn crate::capsule::Capsule>, String, u32)> = Vec::new();
-    // Dedup grant-on-use signals within a single dispatch pass (principal is
-    // fixed per call, so key on `capsule_id`). A `Vec<&str>` borrowing the
-    // registry-held ids beats a `HashSet<String>` for this tiny, gate-miss-only
-    // set — linear `contains`, no per-check allocation, a `String` built only on
-    // emit.
+    // Dedup grant-on-use signals within one dispatch pass (principal is fixed
+    // per call, so key on `capsule_id`). `Vec<&str>` of registry-held ids.
     let mut grant_signalled: Vec<&str> = Vec::new();
-    for capsule_id in registry.list() {
-        if let Some(capsule) = registry.get(capsule_id) {
+    for capsule_id in registry.list(&view_principal) {
+        if let Some(capsule) = registry.get(&view_principal, capsule_id) {
             if !matches!(capsule.state(), crate::capsule::CapsuleState::Ready) {
                 continue;
             }

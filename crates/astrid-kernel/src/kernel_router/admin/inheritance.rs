@@ -44,21 +44,22 @@ pub(super) async fn inherit_from_principal(
         Vec<astrid_capsule::capsule::CapsuleId>,
         Vec<(astrid_capsule::capsule::CapsuleId, Vec<String>)>,
     ) = {
+        // Phase 1 (#1069): snapshot the whole loaded set (daemon-wide,
+        // principal-agnostic). Scoping to `source`'s view is Phase 2.
         let registry = kernel.capsules.read().await;
-        let ids: Vec<_> = registry.list().into_iter().cloned().collect();
+        let instances = registry.all_instances();
+        let ids: Vec<_> = instances.iter().map(|c| c.id().clone()).collect();
         let mut secrets: Vec<(astrid_capsule::capsule::CapsuleId, Vec<String>)> = Vec::new();
-        for id in &ids {
-            if let Some(capsule) = registry.get(id) {
-                let keys: Vec<String> = capsule
-                    .manifest()
-                    .env
-                    .iter()
-                    .filter(|(_, def)| def.env_type == "secret")
-                    .map(|(k, _)| k.clone())
-                    .collect();
-                if !keys.is_empty() {
-                    secrets.push((id.clone(), keys));
-                }
+        for capsule in &instances {
+            let keys: Vec<String> = capsule
+                .manifest()
+                .env
+                .iter()
+                .filter(|(_, def)| def.env_type == "secret")
+                .map(|(k, _)| k.clone())
+                .collect();
+            if !keys.is_empty() {
+                secrets.push((capsule.id().clone(), keys));
             }
         }
         (ids, secrets)

@@ -205,10 +205,13 @@ pub async fn run() -> Result<()> {
     // has no accept loop and CLI connections will always time out.
     {
         let reg = kernel.capsules.read().await;
+        // Daemon-wide "is the CLI proxy loaded" check, principal-agnostic
+        // (#1069).
         let has_cli_proxy = reg
-            .list()
-            .iter()
-            .any(|id| id.as_str() == "astrid-capsule-cli");
+            .get_any(&astrid_capsule::capsule::CapsuleId::from_static(
+                "astrid-capsule-cli",
+            ))
+            .is_some();
         if !has_cli_proxy {
             tracing::error!(
                 "CLI proxy capsule (astrid-capsule-cli) not found - \

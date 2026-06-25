@@ -217,10 +217,11 @@ impl sys::Host for HostState {
 
         let allowed = util::bounded_block_on(&rt_handle, &blocking_semaphore, async {
             let reg = registry.read().await;
-            let Some(capsule_id) = reg.find_by_uuid(&source_uuid) else {
-                return false;
-            };
-            let Some(capsule) = reg.get(capsule_id) else {
+            // Resolve uuid → hash → instance directly. This is principal-
+            // invariant (the capability check is about the capsule's own
+            // declared manifest, not who invoked it), so it sidesteps the
+            // per-principal view entirely (#1069).
+            let Some(capsule) = reg.find_instance_by_uuid(&source_uuid) else {
                 return false;
             };
             // The full capability namespace, not just `allow_prompt_injection`:

@@ -466,15 +466,36 @@ impl Kernel {
         let manifest = astrid_capsule::discovery::load_manifest(&manifest_path)
             .map_err(|e| anyhow::anyhow!(e))?;
 
+        // Phase 1 (#1069): single global view keyed by the default principal.
+        // load_capsule still targets `default`'s view exactly as before; real
+        // per-principal threading is Phase 2.
+        let principal = astrid_core::PrincipalId::default();
+
         // Skip if already registered (prevents double-load from overlapping
         // discovery paths like principal home + workspace capsules).
         {
             let registry = self.capsules.read().await;
             let id = astrid_capsule::capsule::CapsuleId::from_static(&manifest.package.name);
-            if registry.get(&id).is_some() {
+            if registry.get(&principal, &id).is_some() {
                 return Ok(());
             }
         }
+
+        // Resolve the content hash that addresses this capsule's instance in
+        // the registry. Prefer the `wasm_hash` recorded in `meta.json`; fall
+        // back to a synthetic `name + version` key for non-WASM (MCP) capsules
+        // whose `meta.json` has no `wasm_hash`.
+        let wasm_hash = astrid_capsule_install::meta::read_meta(&dir)
+            .and_then(|m| m.wasm_hash)
+            .map_or_else(
+                || {
+                    astrid_capsule::registry::WasmHash::synthetic(
+                        &manifest.package.name,
+                        &manifest.package.version,
+                    )
+                },
+                astrid_capsule::registry::WasmHash::from_raw,
+            );
 
         let loader = astrid_capsule::loader::CapsuleLoader::new(
             self.mcp.clone(),
@@ -488,7 +509,6 @@ impl Kernel {
 
         // Build the context — use the shared kernel KV so capsules can
         // communicate state through overlapping KV namespaces.
-        let principal = astrid_core::PrincipalId::default();
         let kv = astrid_storage::ScopedKvStore::new(
             Arc::clone(&self.kv) as Arc<dyn astrid_storage::KvStore>,
             format!("{principal}:capsule:{}", capsule.id()),
@@ -539,13 +559,16 @@ impl Kernel {
         // Hand this capsule its operator-approved local-egress allowlist (if
         // any) so the SSRF airlock can exempt sanctioned loopback/private
         // endpoints for it. Absent entry = empty = no exemptions.
-        .with_local_egress(self.local_egress.get(&capsule_name).cloned().unwrap_or_default());
+        .with_local_egress(self.local_egress.get(&capsule_name).cloned().unwrap_or_default())
+        // Thread the instance hash so the engine registers the UUID→instance
+        // mapping under the same key the kernel registers the instance under.
+        .with_wasm_hash(wasm_hash.clone());
 
         capsule.load(&ctx).await?;
 
         let mut registry = self.capsules.write().await;
         registry
-            .register(capsule)
+            .register(capsule, wasm_hash, &principal)
             .map_err(|e| anyhow::anyhow!("Failed to register capsule: {e}"))?;
 
         Ok(())
@@ -561,11 +584,14 @@ impl Kernel {
         &self,
         id: &astrid_capsule::capsule::CapsuleId,
     ) -> Result<(), anyhow::Error> {
+        // Phase 1 (#1069): single global view keyed by the default principal.
+        let principal = astrid_core::PrincipalId::default();
+
         // Get source directory before unregistering.
         let source_dir = {
             let registry = self.capsules.read().await;
             let capsule = registry
-                .get(id)
+                .get(&principal, id)
                 .ok_or_else(|| anyhow::anyhow!("capsule '{id}' not found in registry"))?;
             capsule
                 .source_dir()
@@ -579,7 +605,7 @@ impl Kernel {
         let old_capsule = {
             let mut registry = self.capsules.write().await;
             registry
-                .unregister(id)
+                .unregister(&principal, id)
                 .map_err(|e| anyhow::anyhow!("failed to unregister capsule '{id}': {e}"))?
         };
         // Explicitly unload the old capsule. There is no Drop impl that
@@ -617,7 +643,7 @@ impl Kernel {
         // and starves registry writers (health monitor, capsule loading).
         let capsule = {
             let registry = self.capsules.read().await;
-            registry.get(id)
+            registry.get(&principal, id)
         };
         if let Some(capsule) = capsule
             && let Err(e) = capsule
@@ -828,7 +854,9 @@ impl Kernel {
         // `block_in_place` and must never run while holding the registry lock).
         let capsules = {
             let reg = self.capsules.read().await;
-            reg.cloned_values()
+            // Global "set changed" pulse over the whole loaded set (daemon-wide,
+            // principal-agnostic). In Phase 1 this equals `default`'s view.
+            reg.all_instances()
         };
 
         let mut with_meta: Vec<(String, Option<serde_json::Value>)> =
@@ -885,7 +913,7 @@ impl Kernel {
         &self,
         id: &astrid_capsule::capsule::CapsuleId,
     ) -> Result<(), anyhow::Error> {
-        let registered = { self.capsules.read().await.get(id).is_some() };
+        let registered = { self.capsules.read().await.get_any(id).is_some() };
         if registered {
             self.restart_capsule(id).await?;
             self.publish_capsules_loaded().await;
@@ -896,7 +924,7 @@ impl Kernel {
             // capsule actually registered — otherwise the caller would report a
             // false success for a capsule that failed to load or isn't on disk.
             self.load_all_capsules().await;
-            if self.capsules.read().await.get(id).is_none() {
+            if self.capsules.read().await.get_any(id).is_none() {
                 return Err(anyhow::anyhow!(
                     "capsule '{id}' was not found in the install directories or failed to load"
                 ));
@@ -927,13 +955,15 @@ impl Kernel {
         &self,
         id: &astrid_capsule::capsule::CapsuleId,
     ) -> Result<bool, anyhow::Error> {
+        // Phase 1 (#1069): single global view keyed by the default principal.
+        let principal = astrid_core::PrincipalId::default();
         // Unregister under the write lock. A NotFound means the capsule was
         // never loaded here (e.g. the daemon started after it was removed, or
         // it failed to load) — that is a benign no-op for an unload, so report
         // it as "not loaded" rather than an error.
         let old_capsule = {
             let mut registry = self.capsules.write().await;
-            match registry.unregister(id) {
+            match registry.unregister(&principal, id) {
                 Ok(capsule) => capsule,
                 Err(astrid_capsule::error::CapsuleError::NotFound(_)) => return Ok(false),
                 Err(e) => {
@@ -1261,7 +1291,7 @@ impl Kernel {
                 .iter()
                 .filter_map(
                     |name| match astrid_capsule::capsule::CapsuleId::new(name.clone()) {
-                        Ok(capsule_id) => registry.get(&capsule_id).map(|c| (name.clone(), c)),
+                        Ok(capsule_id) => registry.get_any(&capsule_id).map(|c| (name.clone(), c)),
                         Err(e) => {
                             tracing::warn!(
                                 capsule = %name,
@@ -1790,18 +1820,15 @@ fn spawn_capsule_health_monitor(kernel: Arc<Kernel>) -> tokio::task::JoinHandle<
 
             // Collect ready capsules under a brief read lock, then drop
             // the lock before calling check_health() or publishing events.
+            // Daemon-wide health sweep — operates on the whole loaded set,
+            // principal-agnostic (#1069).
             let ready_capsules: Vec<std::sync::Arc<dyn astrid_capsule::capsule::Capsule>> = {
                 let registry = kernel.capsules.read().await;
                 registry
-                    .list()
+                    .all_instances()
                     .into_iter()
-                    .filter_map(|id| {
-                        let capsule = registry.get(id)?;
-                        if capsule.state() == astrid_capsule::capsule::CapsuleState::Ready {
-                            Some(capsule)
-                        } else {
-                            None
-                        }
+                    .filter(|capsule| {
+                        capsule.state() == astrid_capsule::capsule::CapsuleState::Ready
                     })
                     .collect()
             };

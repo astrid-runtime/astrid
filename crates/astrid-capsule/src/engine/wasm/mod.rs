@@ -1724,10 +1724,18 @@ impl ExecutionEngine for WasmEngine {
             .map_err(|e| CapsuleError::UnsupportedEntryPoint(e.to_string()))?;
 
         if let Some(registry) = &ctx.capsule_registry {
-            registry
-                .write()
-                .await
-                .register_uuid(capsule_uuid, capsule_id.clone());
+            // Map the UUID to the SAME instance hash the kernel registers the
+            // instance under (issue #1069). Prefer the kernel-threaded hash;
+            // fall back to a synthetic per-capsule key (name+version) so the
+            // engine remains self-sufficient in tests / single-tenant boots
+            // that did not thread `ctx.wasm_hash`.
+            let hash = ctx.wasm_hash.clone().unwrap_or_else(|| {
+                crate::registry::WasmHash::synthetic(
+                    &self.manifest.package.name,
+                    &self.manifest.package.version,
+                )
+            });
+            registry.write().await.register_uuid(capsule_uuid, hash);
         }
 
         // Register topic schemas unconditionally — schema_catalog is always

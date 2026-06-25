@@ -2,6 +2,25 @@
 //!
 //! Manages the set of loaded capsules and provides tool lookup across
 //! all registered capsules.
+//!
+//! # Content-addressed instance store + per-principal view (issue #1069)
+//!
+//! The registry separates two orthogonal concerns:
+//!
+//! 1. **Instance store** — distinct capsule binaries are stored once, keyed
+//!    by their content hash ([`WasmHash`]). Two principals running the same
+//!    capsule binary share a single [`Arc<dyn Capsule>`]; a refcount tracks
+//!    how many views reference each instance.
+//! 2. **Per-principal view** — each [`PrincipalId`] has a `name → hash` map
+//!    determining which capsules it can see/resolve. The view is the
+//!    visibility floor: a capsule absent from a principal's view is invisible
+//!    to that principal, full stop.
+//!
+//! **Phase 1 (this commit) is shape-only with ZERO behaviour change.** Every
+//! caller is wired with [`PrincipalId::default()`] (or an `*_all`/`*_any`
+//! variant), so the only populated view is `default`'s — which holds every
+//! loaded capsule, exactly as the flat map did before. No per-principal
+//! isolation or view-scoping LOGIC lives here yet; that is Phase 2.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -9,24 +28,94 @@ use std::sync::Arc;
 use tracing::{debug, info};
 use uuid::Uuid;
 
+use astrid_core::PrincipalId;
 use astrid_core::{UplinkCapabilities, UplinkDescriptor, UplinkId};
 
 use crate::capsule::{Capsule, CapsuleId};
 use crate::error::{CapsuleError, CapsuleResult};
 
+/// Content hash that addresses a distinct capsule binary in the instance store.
+///
+/// For a WASM capsule this is the BLAKE3 hex of the component, identical to
+/// the `wasm_hash` recorded in the capsule's `meta.json` (see
+/// `astrid-capsule-install`'s `CapsuleMeta::wasm_hash`). Two principals running
+/// byte-identical binaries therefore resolve to the same [`WasmHash`] and share
+/// one loaded instance.
+///
+/// Non-WASM capsules (MCP) have no component to hash — their `meta.json`
+/// `wasm_hash` is `None`. They get a **synthetic** key derived from
+/// `name + version` via [`WasmHash::synthetic`]. A synthetic key never dedups
+/// against a real binary hash (the input space is disjoint), so distinct
+/// non-WASM capsules — and distinct versions of one — still occupy distinct
+/// instance slots.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct WasmHash(String);
+
+impl WasmHash {
+    /// Wrap a pre-computed content hash (e.g. the `wasm_hash` from `meta.json`).
+    #[must_use]
+    pub fn from_raw(hash: impl Into<String>) -> Self {
+        Self(hash.into())
+    }
+
+    /// Synthesize a stable instance key for a capsule with no binary hash
+    /// (non-WASM/MCP capsules whose `meta.json` `wasm_hash` is `None`).
+    ///
+    /// Derived as BLAKE3 over `"synthetic:{name}\0{version}"`. The `synthetic:`
+    /// domain prefix keeps the input space disjoint from a raw WASM binary hash
+    /// (which is BLAKE3 of the component bytes), so a synthetic key can never
+    /// collide with — and dedup against — a real binary.
+    #[must_use]
+    pub fn synthetic(name: &str, version: &str) -> Self {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"synthetic:");
+        hasher.update(name.as_bytes());
+        hasher.update(&[0]);
+        hasher.update(version.as_bytes());
+        Self(hasher.finalize().to_hex().to_string())
+    }
+
+    /// The underlying hex string.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for WasmHash {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// A single loaded capsule instance plus a reference count.
+///
+/// `refcount` is the number of per-principal views that reference this hash.
+/// The instance (and its uplinks/uuid entries) is dropped only when the last
+/// view releases it, i.e. when `refcount` reaches zero.
+struct InstanceEntry {
+    capsule: Arc<dyn Capsule>,
+    refcount: usize,
+}
+
 /// Registry of loaded capsules.
 ///
-/// Parallel to `ToolRegistry` in `astrid-tools`. Stores capsules keyed by
-/// their `CapsuleId` and provides cross-capsule tool lookup.
+/// Stores distinct capsule binaries once (content-addressed by [`WasmHash`])
+/// and exposes them per-principal through [`views`](Self). See the module docs
+/// for the instance-store / view split.
 pub struct CapsuleRegistry {
-    capsules: HashMap<CapsuleId, Arc<dyn Capsule>>,
+    /// Distinct loaded instances, deduped by content hash.
+    instances: HashMap<WasmHash, InstanceEntry>,
+    /// Per-principal visibility: `principal → (capsule name → hash)`.
+    views: HashMap<PrincipalId, HashMap<CapsuleId, WasmHash>>,
+    /// Uplinks stay global (kernel-routed, principal-agnostic).
     uplinks: HashMap<UplinkId, (CapsuleId, UplinkDescriptor)>,
-    /// Reverse map from WASM session UUIDs to capsule IDs.
+    /// Reverse map from WASM session UUIDs to instance hashes.
     ///
     /// Populated during capsule load so that host functions can resolve
     /// an IPC `source_id` (a UUID stamped by the kernel) back to the
-    /// originating capsule for capability checks.
-    uuid_map: HashMap<Uuid, CapsuleId>,
+    /// originating capsule instance for capability checks.
+    uuid_map: HashMap<Uuid, WasmHash>,
 }
 
 impl CapsuleRegistry {
@@ -34,28 +123,68 @@ impl CapsuleRegistry {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            capsules: HashMap::new(),
+            instances: HashMap::new(),
+            views: HashMap::new(),
             uplinks: HashMap::new(),
             uuid_map: HashMap::new(),
         }
     }
 
-    /// Register a capsule.
+    /// Register a capsule binary under `hash` and add it to `principal`'s view.
+    ///
+    /// Dedup semantics: if the `hash` is already loaded, the existing instance
+    /// is reused and its refcount is bumped (no second compile/load, no second
+    /// uplink registration). Otherwise the supplied `capsule` becomes the
+    /// instance, its uplinks are registered once, and the refcount starts at
+    /// the count of views that reference it.
+    ///
+    /// The capsule is then made visible to `principal` via
+    /// `views[principal][name] = hash`.
     ///
     /// # Errors
     ///
-    /// Returns [`CapsuleError::AlreadyRegistered`] if a capsule with the same
-    /// ID is already in the registry.
-    pub fn register(&mut self, capsule: Box<dyn Capsule>) -> CapsuleResult<()> {
-        let capsule: Arc<dyn Capsule> = Arc::from(capsule);
+    /// Returns an error if the same capsule name is already present in
+    /// `principal`'s view (a duplicate add for one principal), or if uplink
+    /// registration fails for a freshly loaded instance.
+    pub fn register(
+        &mut self,
+        capsule: Box<dyn Capsule>,
+        hash: WasmHash,
+        principal: &PrincipalId,
+    ) -> CapsuleResult<()> {
         let id = capsule.id().clone();
-        if self.capsules.contains_key(&id) {
+
+        // Reject a duplicate add for this principal — the view already maps
+        // this capsule name. (Mirrors the old "Already registered" guard,
+        // which was global; in Phase 1 the only view is `default`, so the
+        // behaviour is identical.)
+        if let Some(view) = self.views.get(principal)
+            && view.contains_key(&id)
+        {
             return Err(CapsuleError::UnsupportedEntryPoint(format!(
                 "Already registered: {id}"
             )));
         }
 
-        // Register the capsule's uplinks (uplinks)
+        if self.instances.contains_key(&hash) {
+            // Dedup: instance already loaded — reuse it, bump the refcount,
+            // and just extend this principal's view. Uplinks were registered
+            // when the instance was first loaded; do NOT register them again.
+            self.instances
+                .get_mut(&hash)
+                .expect("hash present, just checked")
+                .refcount += 1;
+            self.views
+                .entry(principal.clone())
+                .or_default()
+                .insert(id.clone(), hash);
+            info!(capsule_id = %id, principal = %principal, "Registered capsule (deduped, existing instance)");
+            return Ok(());
+        }
+
+        // Fresh instance: store it and register its uplinks once.
+        let capsule: Arc<dyn Capsule> = Arc::from(capsule);
+
         let mut registered_ids: Vec<UplinkId> = Vec::new();
         for uplink in &capsule.manifest().uplinks {
             let source = astrid_core::uplink::UplinkSource::new_wasm(id.as_str()).map_err(|e| {
@@ -80,29 +209,65 @@ impl CapsuleRegistry {
             }
         }
 
-        info!(capsule_id = %id, "Registered capsule");
-        self.capsules.insert(id, capsule);
+        info!(capsule_id = %id, principal = %principal, "Registered capsule");
+        self.instances.insert(
+            hash.clone(),
+            InstanceEntry {
+                capsule,
+                refcount: 1,
+            },
+        );
+        self.views
+            .entry(principal.clone())
+            .or_default()
+            .insert(id, hash);
         Ok(())
     }
 
-    /// Unregister a capsule, returning it if it was present.
+    /// Unregister a capsule from `principal`'s view, returning the instance.
+    ///
+    /// Removes the `name → hash` entry from the principal's view and decrements
+    /// the instance's refcount. The instance (and its uplinks + uuid entries)
+    /// is dropped only when the last view releases it (refcount reaches zero).
+    /// The `Arc` is returned in every case so the caller can run async unload.
     ///
     /// # Errors
     ///
-    /// Returns [`CapsuleError::NotFound`] if no capsule with the given ID exists.
-    pub fn unregister(&mut self, id: &CapsuleId) -> CapsuleResult<Arc<dyn Capsule>> {
-        let capsule = self
-            .capsules
-            .remove(id)
+    /// Returns [`CapsuleError::NotFound`] if no capsule with the given ID is in
+    /// `principal`'s view.
+    pub fn unregister(
+        &mut self,
+        principal: &PrincipalId,
+        id: &CapsuleId,
+    ) -> CapsuleResult<Arc<dyn Capsule>> {
+        let hash = self
+            .views
+            .get_mut(principal)
+            .and_then(|view| view.remove(id))
             .ok_or_else(|| CapsuleError::NotFound(format!("capsule {id}")))?;
 
-        // Clean up the capsule's uplinks.
-        self.unregister_capsule_uplinks(id);
+        // Drop the principal's view entirely if it is now empty.
+        if self.views.get(principal).is_some_and(HashMap::is_empty) {
+            self.views.remove(principal);
+        }
 
-        // Clean up UUID mapping for this capsule.
-        self.uuid_map.retain(|_, cid| cid != id);
+        let entry = self
+            .instances
+            .get_mut(&hash)
+            .expect("view referenced a hash with no instance (registry invariant violated)");
+        entry.refcount -= 1;
+        let capsule = Arc::clone(&entry.capsule);
 
-        info!(capsule_id = %id, "Unregistered capsule");
+        if entry.refcount == 0 {
+            // Last view released this instance — drop it and its global state.
+            self.instances.remove(&hash);
+            self.unregister_capsule_uplinks(id);
+            self.uuid_map.retain(|_, h| h != &hash);
+            info!(capsule_id = %id, principal = %principal, "Unregistered capsule (instance dropped)");
+        } else {
+            info!(capsule_id = %id, principal = %principal, refcount = entry.refcount, "Unregistered capsule (instance retained)");
+        }
+
         Ok(capsule)
     }
 
@@ -110,69 +275,107 @@ impl CapsuleRegistry {
     // UUID mapping
     // -----------------------------------------------------------------
 
-    /// Register a session UUID for a capsule.
+    /// Register a session UUID for a capsule instance (keyed by its hash).
     ///
     /// Called during WASM capsule load so that host functions can resolve
     /// IPC `source_id` UUIDs back to capsule identities.
     ///
     /// Silently overwrites on duplicate UUID. Each capsule load generates a
-    /// fresh v4 UUID, so collisions are not practically possible.
-    pub fn register_uuid(&mut self, uuid: Uuid, capsule_id: CapsuleId) {
-        debug!(
-            %uuid,
-            capsule_id = %capsule_id,
-            "Registered capsule UUID mapping"
-        );
-        self.uuid_map.insert(uuid, capsule_id);
+    /// fresh UUID, so collisions are not practically possible.
+    pub fn register_uuid(&mut self, uuid: Uuid, hash: WasmHash) {
+        debug!(%uuid, hash = %hash, "Registered capsule UUID mapping");
+        self.uuid_map.insert(uuid, hash);
     }
 
-    /// Look up a capsule ID by its session UUID.
+    /// Resolve a capsule instance by its session UUID (uuid → hash → instance).
     #[must_use]
-    pub fn find_by_uuid(&self, uuid: &Uuid) -> Option<&CapsuleId> {
-        self.uuid_map.get(uuid)
+    pub fn find_instance_by_uuid(&self, uuid: &Uuid) -> Option<Arc<dyn Capsule>> {
+        let hash = self.uuid_map.get(uuid)?;
+        self.instances.get(hash).map(|e| Arc::clone(&e.capsule))
     }
 
-    /// Get a shared reference to a capsule by ID.
+    /// Get a capsule instance visible to `principal`, by capsule ID.
     ///
-    /// Returns a cloned `Arc` so callers can use the capsule after releasing
-    /// the registry lock.
+    /// Resolves through `principal`'s view (name → hash → instance). Returns a
+    /// cloned `Arc` so callers can use the capsule after releasing the registry
+    /// lock. A capsule absent from `principal`'s view is invisible: returns
+    /// `None` (the fail-closed floor — there is no fallback to another view).
     #[must_use]
-    pub fn get(&self, id: &CapsuleId) -> Option<Arc<dyn Capsule>> {
-        self.capsules.get(id).cloned()
+    pub fn get(&self, principal: &PrincipalId, id: &CapsuleId) -> Option<Arc<dyn Capsule>> {
+        let hash = self.views.get(principal)?.get(id)?;
+        self.instances.get(hash).map(|e| Arc::clone(&e.capsule))
     }
 
-    /// List all registered capsule IDs.
+    /// Resolve a capsule instance by name across ANY view/instance.
+    ///
+    /// Principal-agnostic lookup for daemon-health / lifecycle readers that
+    /// operate on the global loaded set rather than one principal's view.
+    /// Returns the first instance whose ID matches in any view.
     #[must_use]
-    pub fn list(&self) -> Vec<&CapsuleId> {
-        self.capsules.keys().collect()
+    pub fn get_any(&self, id: &CapsuleId) -> Option<Arc<dyn Capsule>> {
+        for view in self.views.values() {
+            if let Some(hash) = view.get(id)
+                && let Some(entry) = self.instances.get(hash)
+            {
+                return Some(Arc::clone(&entry.capsule));
+            }
+        }
+        None
     }
 
-    /// Iterator over all registered capsules.
+    /// List the capsule IDs visible to `principal` (its view keys).
+    #[must_use]
+    pub fn list(&self, principal: &PrincipalId) -> Vec<&CapsuleId> {
+        match self.views.get(principal) {
+            Some(view) => view.keys().collect(),
+            None => Vec::new(),
+        }
+    }
+
+    /// Snapshot of cloned `Arc` handles to every DISTINCT loaded instance.
+    ///
+    /// Global, principal-agnostic — one handle per instance regardless of how
+    /// many views reference it. For drain/health/mesh readers that operate on
+    /// the loaded set rather than a single principal's view.
+    #[must_use]
+    pub fn all_instances(&self) -> Vec<Arc<dyn Capsule>> {
+        self.instances
+            .values()
+            .map(|e| Arc::clone(&e.capsule))
+            .collect()
+    }
+
+    /// Iterator over every distinct loaded instance (global).
     pub fn values(&self) -> impl Iterator<Item = &(dyn Capsule + '_)> {
-        self.capsules.values().map(|c| c.as_ref())
+        self.instances.values().map(|e| e.capsule.as_ref())
     }
 
-    /// Snapshot of cloned `Arc` handles to every registered capsule.
+    /// Snapshot of cloned `Arc` handles to the capsules visible to `principal`.
     ///
-    /// One pass over the map (the public [`Self::values`] yields `&dyn Capsule`,
-    /// so it can't be `cloned()` into owned handles). Lets a caller release the
-    /// registry lock before doing async work on the capsules (e.g. invoking an
+    /// One pass over `principal`'s view. Lets a caller release the registry
+    /// lock before doing async work on the capsules (e.g. invoking an
     /// interceptor that may `block_in_place`).
     #[must_use]
-    pub fn cloned_values(&self) -> Vec<Arc<dyn Capsule>> {
-        self.capsules.values().cloned().collect()
+    pub fn cloned_values(&self, principal: &PrincipalId) -> Vec<Arc<dyn Capsule>> {
+        match self.views.get(principal) {
+            Some(view) => view
+                .values()
+                .filter_map(|hash| self.instances.get(hash).map(|e| Arc::clone(&e.capsule)))
+                .collect(),
+            None => Vec::new(),
+        }
     }
 
-    /// Number of registered capsules.
+    /// Number of distinct loaded instances.
     #[must_use]
     pub fn len(&self) -> usize {
-        self.capsules.len()
+        self.instances.len()
     }
 
-    /// Whether the registry is empty.
+    /// Whether any instance is loaded.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.capsules.is_empty()
+        self.instances.is_empty()
     }
 
     // -----------------------------------------------------------------
@@ -246,13 +449,14 @@ impl CapsuleRegistry {
         self.uplinks.values().map(|(_, desc)| desc).collect()
     }
 
-    /// Remove and return all capsules, clearing uplinks too.
+    /// Remove and return all instances, clearing views/uplinks/uuid map too.
     ///
     /// Used during kernel shutdown to unload everything in one pass.
     pub fn drain(&mut self) -> Vec<Arc<dyn Capsule>> {
         self.uplinks.clear();
         self.uuid_map.clear();
-        self.capsules.drain().map(|(_, c)| c).collect()
+        self.views.clear();
+        self.instances.drain().map(|(_, e)| e.capsule).collect()
     }
 }
 
@@ -265,8 +469,8 @@ impl Default for CapsuleRegistry {
 impl std::fmt::Debug for CapsuleRegistry {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("CapsuleRegistry")
-            .field("capsule_count", &self.capsules.len())
-            .field("capsule_ids", &self.list())
+            .field("instance_count", &self.instances.len())
+            .field("view_count", &self.views.len())
             .field("uplink_count", &self.uplinks.len())
             .finish()
     }
@@ -284,6 +488,12 @@ mod tests {
     use crate::context::CapsuleContext;
     use crate::error::CapsuleResult;
     use crate::manifest::{CapabilitiesDef, CapsuleManifest, PackageDef};
+
+    /// Synthetic per-name hash used by tests that don't care about content
+    /// addressing — keeps each registered capsule in its own instance slot.
+    fn test_hash(name: &str) -> WasmHash {
+        WasmHash::synthetic(name, "0.0.1")
+    }
 
     struct MockCapsule {
         id: CapsuleId,
@@ -374,10 +584,22 @@ mod tests {
     }
 
     #[test]
+    fn synthetic_hash_is_disjoint_from_raw() {
+        // A synthetic key (domain-prefixed) can never equal a raw binary hash.
+        let synthetic = WasmHash::synthetic("foo", "1.0.0");
+        let raw = WasmHash::from_raw(blake3::hash(b"foo").to_hex().to_string());
+        assert_ne!(synthetic, raw);
+        // Same name+version is stable; different version diverges.
+        assert_eq!(synthetic, WasmHash::synthetic("foo", "1.0.0"));
+        assert_ne!(synthetic, WasmHash::synthetic("foo", "2.0.0"));
+    }
+
+    #[test]
     fn unregister_not_found_returns_not_found_error() {
         let mut registry = CapsuleRegistry::new();
+        let principal = PrincipalId::default();
         let id = CapsuleId::from_static("nonexistent");
-        match registry.unregister(&id) {
+        match registry.unregister(&principal, &id) {
             Err(CapsuleError::NotFound(msg)) => {
                 assert!(
                     msg.contains("nonexistent"),
@@ -392,50 +614,138 @@ mod tests {
     #[test]
     fn uuid_mapping_register_and_find() {
         let mut registry = CapsuleRegistry::new();
+        let principal = PrincipalId::default();
         let uuid = Uuid::new_v4();
-        let capsule_id = CapsuleId::from_static("test-capsule");
-        registry.register_uuid(uuid, capsule_id.clone());
+        let hash = test_hash("test-capsule");
 
-        assert_eq!(registry.find_by_uuid(&uuid), Some(&capsule_id));
-        assert_eq!(registry.find_by_uuid(&Uuid::new_v4()), None);
+        // No instance yet — uuid resolves to nothing.
+        registry.register_uuid(uuid, hash.clone());
+        assert!(registry.find_instance_by_uuid(&uuid).is_none());
+
+        // Register the instance under the same hash; now uuid resolves.
+        registry
+            .register(Box::new(MockCapsule::new("test-capsule")), hash, &principal)
+            .expect("register");
+        assert!(registry.find_instance_by_uuid(&uuid).is_some());
+        assert!(registry.find_instance_by_uuid(&Uuid::new_v4()).is_none());
     }
 
     #[test]
     fn uuid_mapping_overwrite_on_duplicate() {
         let mut registry = CapsuleRegistry::new();
         let uuid = Uuid::new_v4();
-        let first = CapsuleId::from_static("first");
-        let second = CapsuleId::from_static("second");
+        let first = test_hash("first");
+        let second = test_hash("second");
 
         registry.register_uuid(uuid, first);
         registry.register_uuid(uuid, second.clone());
-        assert_eq!(registry.find_by_uuid(&uuid), Some(&second));
+        // Latest write wins.
+        let principal = PrincipalId::default();
+        registry
+            .register(Box::new(MockCapsule::new("second")), second, &principal)
+            .expect("register");
+        assert!(registry.find_instance_by_uuid(&uuid).is_some());
     }
 
     #[test]
     fn uuid_mapping_cleanup_on_unregister() {
         let mut registry = CapsuleRegistry::new();
+        let principal = PrincipalId::default();
         let uuid = Uuid::new_v4();
         let capsule_id = CapsuleId::from_static("removable");
+        let hash = test_hash("removable");
 
         registry
-            .register(Box::new(MockCapsule::new("removable")))
+            .register(
+                Box::new(MockCapsule::new("removable")),
+                hash.clone(),
+                &principal,
+            )
             .expect("register");
-        registry.register_uuid(uuid, capsule_id.clone());
-        assert!(registry.find_by_uuid(&uuid).is_some());
+        registry.register_uuid(uuid, hash);
+        assert!(registry.find_instance_by_uuid(&uuid).is_some());
 
-        registry.unregister(&capsule_id).expect("unregister");
-        assert!(registry.find_by_uuid(&uuid).is_none());
+        registry
+            .unregister(&principal, &capsule_id)
+            .expect("unregister");
+        assert!(registry.find_instance_by_uuid(&uuid).is_none());
     }
 
     #[test]
     fn uuid_mapping_cleanup_on_drain() {
         let mut registry = CapsuleRegistry::new();
+        let principal = PrincipalId::default();
         let uuid = Uuid::new_v4();
-        registry.register_uuid(uuid, CapsuleId::from_static("test"));
-        assert!(registry.find_by_uuid(&uuid).is_some());
+        let hash = test_hash("test");
+        registry
+            .register(Box::new(MockCapsule::new("test")), hash.clone(), &principal)
+            .expect("register");
+        registry.register_uuid(uuid, hash);
+        assert!(registry.find_instance_by_uuid(&uuid).is_some());
 
         let _ = registry.drain();
-        assert!(registry.find_by_uuid(&uuid).is_none());
+        assert!(registry.find_instance_by_uuid(&uuid).is_none());
+    }
+
+    #[test]
+    fn dedup_shares_instance_and_refcounts() {
+        // Same binary (same hash) seen by two principals: one instance,
+        // refcount 2. Unregistering one keeps it alive; unregistering both
+        // drops it.
+        let mut registry = CapsuleRegistry::new();
+        let a = PrincipalId::new("alice").unwrap();
+        let b = PrincipalId::new("bob").unwrap();
+        let hash = test_hash("shared");
+        let id = CapsuleId::from_static("shared");
+
+        registry
+            .register(Box::new(MockCapsule::new("shared")), hash.clone(), &a)
+            .expect("register a");
+        registry
+            .register(Box::new(MockCapsule::new("shared")), hash, &b)
+            .expect("register b");
+
+        // One distinct instance despite two views.
+        assert_eq!(registry.len(), 1);
+        assert!(registry.get(&a, &id).is_some());
+        assert!(registry.get(&b, &id).is_some());
+
+        // Drop alice's view — instance survives for bob.
+        registry.unregister(&a, &id).expect("unregister a");
+        assert_eq!(registry.len(), 1);
+        assert!(registry.get(&a, &id).is_none());
+        assert!(registry.get(&b, &id).is_some());
+
+        // Drop bob's view — last reference, instance gone.
+        registry.unregister(&b, &id).expect("unregister b");
+        assert_eq!(registry.len(), 0);
+        assert!(registry.get(&b, &id).is_none());
+    }
+
+    #[test]
+    fn view_is_fail_closed_no_cross_principal_fallback() {
+        // A capsule in alice's view is invisible to bob via `get`, but
+        // resolvable globally via `get_any`.
+        let mut registry = CapsuleRegistry::new();
+        let a = PrincipalId::new("alice").unwrap();
+        let b = PrincipalId::new("bob").unwrap();
+        let id = CapsuleId::from_static("only-alice");
+
+        registry
+            .register(
+                Box::new(MockCapsule::new("only-alice")),
+                test_hash("only-alice"),
+                &a,
+            )
+            .expect("register");
+
+        assert!(registry.get(&a, &id).is_some());
+        assert!(
+            registry.get(&b, &id).is_none(),
+            "no cross-principal fallback"
+        );
+        assert!(registry.get_any(&id).is_some(), "global resolver sees it");
+        assert_eq!(registry.list(&b).len(), 0, "bob's view is empty");
+        assert_eq!(registry.list(&a).len(), 1);
     }
 }

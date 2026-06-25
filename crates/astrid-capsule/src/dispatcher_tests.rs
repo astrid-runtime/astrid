@@ -17,8 +17,23 @@ use crate::capsule::{Capsule, CapsuleId, CapsuleState, InterceptResult};
 use crate::context::CapsuleContext;
 use crate::error::CapsuleResult;
 use crate::manifest::{CapabilitiesDef, CapsuleManifest, PackageDef, SubscribeDef};
+use crate::registry::WasmHash;
+use astrid_core::PrincipalId;
 use astrid_events::ipc::IpcPayload;
 use astrid_events::ipc::Topic;
+
+/// Register a mock capsule into the default principal's view (Phase 1, #1069).
+///
+/// The dispatcher iterates `default`'s view, which in Phase 1 holds the whole
+/// loaded set — so these tests exercise the exact dispatch path production uses.
+/// The instance hash is synthesized per capsule id so each occupies its own
+/// instance slot.
+fn register_mock(registry: &mut CapsuleRegistry, capsule: Box<dyn Capsule>) {
+    let hash = WasmHash::synthetic(capsule.id().as_str(), "0.0.1");
+    registry
+        .register(capsule, hash, &PrincipalId::default())
+        .unwrap();
+}
 
 /// A minimal mock capsule for dispatch tests.
 struct MockCapsule {
@@ -191,7 +206,7 @@ async fn dispatch_routes_to_matching_interceptor() {
     let (capsule, invoked) = MockCapsule::new("test-capsule", "test.topic");
 
     let mut registry = CapsuleRegistry::new();
-    registry.register(Box::new(capsule)).unwrap();
+    register_mock(&mut registry, Box::new(capsule));
     let registry = Arc::new(RwLock::new(registry));
 
     let bus = Arc::new(EventBus::with_capacity(64));
@@ -219,7 +234,7 @@ async fn dispatch_skips_non_matching_topic() {
     let (capsule, invoked) = MockCapsule::new("test-capsule-skip", "specific.topic");
 
     let mut registry = CapsuleRegistry::new();
-    registry.register(Box::new(capsule)).unwrap();
+    register_mock(&mut registry, Box::new(capsule));
     let registry = Arc::new(RwLock::new(registry));
 
     let bus = Arc::new(EventBus::with_capacity(64));
@@ -249,8 +264,8 @@ async fn dispatch_concurrent_does_not_block() {
     let (cap_b, invoked_b) = MockCapsule::new("capsule-b", "topic.b");
 
     let mut registry = CapsuleRegistry::new();
-    registry.register(Box::new(cap_a)).unwrap();
-    registry.register(Box::new(cap_b)).unwrap();
+    register_mock(&mut registry, Box::new(cap_a));
+    register_mock(&mut registry, Box::new(cap_b));
     let registry = Arc::new(RwLock::new(registry));
 
     let bus = Arc::new(EventBus::with_capacity(64));
@@ -283,7 +298,7 @@ async fn dispatch_routes_lifecycle_events() {
         MockCapsule::new("lifecycle-capsule", "astrid.v1.lifecycle.tool_call_started");
 
     let mut registry = CapsuleRegistry::new();
-    registry.register(Box::new(capsule)).unwrap();
+    register_mock(&mut registry, Box::new(capsule));
     let registry = Arc::new(RwLock::new(registry));
 
     let bus = Arc::new(EventBus::with_capacity(64));
@@ -320,7 +335,7 @@ async fn dispatch_publishes_lag_event_on_overflow() {
         MockCapsule::new("lag-listener", "astrid.v1.event_bus.lagged");
 
     let mut registry = CapsuleRegistry::new();
-    registry.register(Box::new(lag_capsule)).unwrap();
+    register_mock(&mut registry, Box::new(lag_capsule));
     let registry = Arc::new(RwLock::new(registry));
 
     let dispatcher = EventDispatcher::new(Arc::clone(&registry), Arc::clone(&bus));
@@ -367,9 +382,9 @@ async fn dispatch_respects_interceptor_priority_order() {
 
     let mut registry = CapsuleRegistry::new();
     // Register in non-priority order to prove sorting works.
-    registry.register(Box::new(handler)).unwrap();
-    registry.register(Box::new(guard)).unwrap();
-    registry.register(Box::new(transform)).unwrap();
+    register_mock(&mut registry, Box::new(handler));
+    register_mock(&mut registry, Box::new(guard));
+    register_mock(&mut registry, Box::new(transform));
     let registry = Arc::new(RwLock::new(registry));
 
     let bus = Arc::new(EventBus::with_capacity(64));
@@ -400,9 +415,9 @@ async fn find_matching_interceptors_sorts_by_priority() {
     let (mid, _) = MockCapsule::with_priority("mid-pri", "test.event", 50, None);
 
     let mut registry = CapsuleRegistry::new();
-    registry.register(Box::new(high)).unwrap();
-    registry.register(Box::new(low)).unwrap();
-    registry.register(Box::new(mid)).unwrap();
+    register_mock(&mut registry, Box::new(high));
+    register_mock(&mut registry, Box::new(low));
+    register_mock(&mut registry, Box::new(mid));
     let registry = Arc::new(RwLock::new(registry));
     let bus = EventBus::with_capacity(64);
 
@@ -429,9 +444,9 @@ async fn find_matching_interceptors_tiebreaks_equal_priority_by_id() {
 
     let mut registry = CapsuleRegistry::new();
     // Register in an order that does NOT match the expected sort.
-    registry.register(Box::new(z_tie)).unwrap();
-    registry.register(Box::new(guard)).unwrap();
-    registry.register(Box::new(a_tie)).unwrap();
+    register_mock(&mut registry, Box::new(z_tie));
+    register_mock(&mut registry, Box::new(guard));
+    register_mock(&mut registry, Box::new(a_tie));
     let registry = Arc::new(RwLock::new(registry));
     let bus = EventBus::with_capacity(64);
 
@@ -459,8 +474,8 @@ async fn deny_interceptor_short_circuits_chain() {
         MockCapsule::with_priority("handler", "shared.topic", 100, Some(Arc::clone(&order)));
 
     let mut registry = CapsuleRegistry::new();
-    registry.register(Box::new(handler)).unwrap();
-    registry.register(Box::new(guard)).unwrap();
+    register_mock(&mut registry, Box::new(handler));
+    register_mock(&mut registry, Box::new(guard));
     let registry = Arc::new(RwLock::new(registry));
 
     let bus = Arc::new(EventBus::with_capacity(64));
@@ -500,8 +515,8 @@ async fn final_interceptor_short_circuits_chain() {
         MockCapsule::with_priority("core", "shared.topic", 100, Some(Arc::clone(&order)));
 
     let mut registry = CapsuleRegistry::new();
-    registry.register(Box::new(core)).unwrap();
-    registry.register(Box::new(cache)).unwrap();
+    register_mock(&mut registry, Box::new(core));
+    register_mock(&mut registry, Box::new(cache));
     let registry = Arc::new(RwLock::new(registry));
 
     let bus = Arc::new(EventBus::with_capacity(64));
@@ -549,10 +564,10 @@ async fn equal_priority_matches_fan_out_without_cross_suppression() {
     let mut registry = CapsuleRegistry::new();
     // Register the denier first — under the old chain it could sort ahead of the
     // responders and short-circuit them; the fan-out path fires every match.
-    registry.register(Box::new(denier)).unwrap();
-    registry.register(Box::new(resp_a)).unwrap();
-    registry.register(Box::new(resp_b)).unwrap();
-    registry.register(Box::new(resp_c)).unwrap();
+    register_mock(&mut registry, Box::new(denier));
+    register_mock(&mut registry, Box::new(resp_a));
+    register_mock(&mut registry, Box::new(resp_b));
+    register_mock(&mut registry, Box::new(resp_c));
     let registry = Arc::new(RwLock::new(registry));
 
     let bus = Arc::new(EventBus::with_capacity(64));
@@ -614,7 +629,7 @@ async fn single_match_does_not_block_across_principal_keys() {
     capsule.principal_log = Some(Arc::clone(&principal_log));
 
     let mut registry = CapsuleRegistry::new();
-    registry.register(Box::new(capsule)).unwrap();
+    register_mock(&mut registry, Box::new(capsule));
     let registry = Arc::new(RwLock::new(registry));
 
     let bus = Arc::new(EventBus::with_capacity(64));
@@ -657,8 +672,8 @@ async fn chain_serializes_per_principal_key_on_same_capsule() {
         MockCapsule::with_priority("ser-b", "chain.topic", 100, Some(Arc::clone(&order)));
 
     let mut registry = CapsuleRegistry::new();
-    registry.register(Box::new(cap_a)).unwrap();
-    registry.register(Box::new(cap_b)).unwrap();
+    register_mock(&mut registry, Box::new(cap_a));
+    register_mock(&mut registry, Box::new(cap_b));
     let registry = Arc::new(RwLock::new(registry));
 
     let bus = Arc::new(EventBus::with_capacity(64));
@@ -699,7 +714,7 @@ async fn dispatch_isolates_per_principal_under_n1000_fanin() {
     capsule.principal_log = Some(Arc::clone(&principals));
 
     let mut registry = CapsuleRegistry::new();
-    registry.register(Box::new(capsule)).unwrap();
+    register_mock(&mut registry, Box::new(capsule));
     let registry = Arc::new(RwLock::new(registry));
 
     // Bus with generous capacity so the broadcast subscriber doesn't
@@ -753,7 +768,7 @@ async fn dispatch_does_not_drop_under_burst_to_single_principal() {
     capsule.invoke_counter = Some(Arc::clone(&counter));
 
     let mut registry = CapsuleRegistry::new();
-    registry.register(Box::new(capsule)).unwrap();
+    register_mock(&mut registry, Box::new(capsule));
     let registry = Arc::new(RwLock::new(registry));
 
     let bus = Arc::new(EventBus::with_capacity(256));
@@ -804,7 +819,7 @@ async fn dispatcher_idle_evicts_per_principal_consumers_after_grace() {
     capsule.invoke_counter = Some(Arc::clone(&counter));
 
     let mut registry = CapsuleRegistry::new();
-    registry.register(Box::new(capsule)).unwrap();
+    register_mock(&mut registry, Box::new(capsule));
     let registry = Arc::new(RwLock::new(registry));
 
     let bus = Arc::new(EventBus::with_capacity(64));
@@ -1026,7 +1041,7 @@ mod access_enforcement {
     ) -> (Arc<AtomicBool>, Arc<EventBus>, tokio::task::JoinHandle<()>) {
         let (capsule, invoked) = MockCapsule::new(capsule_name, interceptor_event);
         let mut registry = CapsuleRegistry::new();
-        registry.register(Box::new(capsule)).unwrap();
+        register_mock(&mut registry, Box::new(capsule));
         let registry = Arc::new(RwLock::new(registry));
         let bus = Arc::new(EventBus::with_capacity(64));
         let dispatcher = EventDispatcher::new(Arc::clone(&registry), Arc::clone(&bus))
@@ -1308,8 +1323,8 @@ mod access_enforcement {
             MockCapsule::new("identity", "tool.v1.execute.save_identity");
         let (orch_cap, orch_invoked) = MockCapsule::new("identity-orch", "spark.v1.request.build");
         let mut registry = CapsuleRegistry::new();
-        registry.register(Box::new(tool_cap)).unwrap();
-        registry.register(Box::new(orch_cap)).unwrap();
+        register_mock(&mut registry, Box::new(tool_cap));
+        register_mock(&mut registry, Box::new(orch_cap));
         let registry = Arc::new(RwLock::new(registry));
         let bus = Arc::new(EventBus::with_capacity(64));
         let dispatcher = EventDispatcher::new(Arc::clone(&registry), Arc::clone(&bus))
@@ -1339,7 +1354,7 @@ mod access_enforcement {
     async fn no_resolver_means_ungated() {
         let (tool_cap, invoked) = MockCapsule::new("secret-tool", "tool.v1.execute.do_thing");
         let mut registry = CapsuleRegistry::new();
-        registry.register(Box::new(tool_cap)).unwrap();
+        register_mock(&mut registry, Box::new(tool_cap));
         let registry = Arc::new(RwLock::new(registry));
         let bus = Arc::new(EventBus::with_capacity(64));
         // No `.with_access_resolver(..)`.

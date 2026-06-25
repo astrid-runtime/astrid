@@ -279,9 +279,13 @@ async fn handle_request(
             KernelResponse::Error("Approval logic not yet implemented in kernel router".to_string())
         },
         KernelRequest::ListCapsules => {
+            // Phase 1 (#1069): default's view holds the whole loaded set, so
+            // this lists every loaded capsule exactly as before. Scoping to the
+            // caller's view is Phase 2.
+            let principal = PrincipalId::default();
             let reg = kernel.capsules.read().await;
             let mut list = Vec::new();
-            for c in reg.list() {
+            for c in reg.list(&principal) {
                 list.push(c.to_string());
             }
             KernelResponse::Success(serde_json::json!(list))
@@ -314,13 +318,15 @@ async fn handle_request(
         KernelRequest::ReloadCapsules => {
             // Unregister capsules in a Failed state so they can be re-loaded
             // with fresh configuration (e.g. after onboarding writes .env.json).
+            // Phase 1 (#1069): operate on default's view (the whole loaded set).
             {
+                let principal = PrincipalId::default();
                 let reg = kernel.capsules.read().await;
                 let failed_ids: Vec<_> = reg
-                    .list()
+                    .list(&principal)
                     .into_iter()
                     .filter(|id| {
-                        reg.get(id).is_some_and(|c| {
+                        reg.get(&principal, id).is_some_and(|c| {
                             matches!(c.state(), astrid_capsule::capsule::CapsuleState::Failed(_))
                         })
                     })
@@ -330,7 +336,7 @@ async fn handle_request(
 
                 let mut reg = kernel.capsules.write().await;
                 for id in failed_ids {
-                    let _ = reg.unregister(&id);
+                    let _ = reg.unregister(&principal, &id);
                 }
             }
 
@@ -395,8 +401,14 @@ async fn handle_request(
         },
         KernelRequest::GetStatus => {
             let uptime = kernel.boot_time.elapsed().as_secs();
+            // Phase 1 (#1069): default's view = the whole loaded set.
+            let principal = PrincipalId::default();
             let reg = kernel.capsules.read().await;
-            let loaded: Vec<String> = reg.list().iter().map(ToString::to_string).collect();
+            let loaded: Vec<String> = reg
+                .list(&principal)
+                .iter()
+                .map(ToString::to_string)
+                .collect();
             let by_principal = kernel
                 .connections_by_principal()
                 .into_iter()
