@@ -376,7 +376,6 @@ jobs:
   account-age:
     name: Contributor account check
     runs-on: ubuntu-latest
-    if: github.event.pull_request.author_association == 'NONE' || github.event.pull_request.author_association == 'FIRST_TIMER' || github.event.pull_request.author_association == 'FIRST_TIME_CONTRIBUTOR'
     steps:
       - name: Harden Runner
         uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
@@ -387,7 +386,16 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+          PR_AUTHOR_ASSOCIATION: ${{ github.event.pull_request.author_association }}
         run: |
+          case "$PR_AUTHOR_ASSOCIATION" in
+            NONE|FIRST_TIMER|FIRST_TIME_CONTRIBUTOR) ;;
+            *)
+              echo "Contributor account check does not apply to $PR_AUTHOR_ASSOCIATION contributors."
+              exit 0
+              ;;
+          esac
+
           if [ "$PR_AUTHOR" = "Copilot" ]; then
             echo "Bypassing contributor account check for Copilot."
             exit 0
