@@ -179,27 +179,14 @@ jobs:
         with:
           toolchain: "1.95"
 
-      - name: Cache semver checker
-        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5
-        with:
-          path: ~/.cargo/bin/cargo-semver-checks
-          key: ${{ runner.os }}-cargo-semver-checks-0.48.0
-
-      - name: Install semver checker
-        run: |
-          if ! command -v cargo-semver-checks >/dev/null; then
-            cargo install cargo-semver-checks --version 0.48.0 --locked
-          fi
-
       - name: Check public API compatibility
-        env:
-          BASELINE_REV: ${{ github.event.pull_request.base.sha }}
-        run: |
-          cargo semver-checks \
-            --manifest-path Cargo.toml \
-            --workspace \
-            --baseline-rev "$BASELINE_REV" \
-            --all-features
+        uses: obi1kenobi/cargo-semver-checks-action@6b69fcf40e9b5fb17adeb57e4b6ecd020649a239 # v2
+        with:
+          manifest-path: Cargo.toml
+          baseline-rev: ${{ github.event.pull_request.base.sha }}
+          feature-group: all-features
+          rust-toolchain: manual
+          github-token: ${{ github.token }}
 
   audit:
     name: Security Audit
