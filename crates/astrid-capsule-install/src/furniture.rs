@@ -65,7 +65,71 @@ pub fn materialize_principal_furniture(
     mirror_subtree(&src.root().join("wit"), &dst.root().join("wit"))
         .context("failed to mirror wit/ into principal home")?;
 
+    // Furniture = the blessed introspection set. The mirror copies the capsule
+    // DIRECTORY but never the approval store (which lives under `.config/`, the
+    // hard-excluded secret boundary), so a freshly-seeded principal would see
+    // every furniture capsule as unapproved → inert (#995). Auto-approve each
+    // seeded capsule for the target principal at its current fingerprint, so a
+    // new principal's introspection tools work exactly as the install
+    // principal's do. Best-effort per capsule: a single unreadable manifest is
+    // skipped, never failing the whole sync.
+    approve_furniture_capsules(home, target, &dst.capsules_dir());
+
     Ok(())
+}
+
+/// Approve every capsule under `capsules_dir` for `target` at its current
+/// capability fingerprint. Used to bless the furniture set after it is mirrored
+/// into a new principal's home (#995).
+fn approve_furniture_capsules(home: &AstridHome, target: &PrincipalId, capsules_dir: &Path) {
+    let entries = match std::fs::read_dir(capsules_dir) {
+        Ok(entries) => entries,
+        // No capsules mirrored (fresh system) → nothing to approve.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+        Err(e) => {
+            tracing::warn!(
+                dir = %capsules_dir.display(),
+                error = %e,
+                "furniture approval: failed to enumerate mirrored capsules"
+            );
+            return;
+        },
+    };
+    for entry in entries.flatten() {
+        if !entry.file_type().is_ok_and(|t| t.is_dir()) {
+            continue;
+        }
+        let capsule_id = entry.file_name().to_string_lossy().into_owned();
+        let manifest_path = entry.path().join("Capsule.toml");
+        let manifest = match astrid_capsule::discovery::load_manifest(&manifest_path) {
+            Ok(m) => m,
+            Err(e) => {
+                tracing::warn!(
+                    capsule = %capsule_id,
+                    %target,
+                    error = %e,
+                    "furniture approval: skipping capsule with unreadable manifest"
+                );
+                continue;
+            },
+        };
+        let fingerprint = astrid_capsule::security::approval::capability_fingerprint(&manifest);
+        // Key on the manifest's package name — the id the engine consults at
+        // load — not the on-disk directory name, so they can never diverge.
+        if let Err(e) = astrid_capsule::security::approval::approve(
+            home,
+            target,
+            &manifest.package.name,
+            fingerprint,
+        ) {
+            tracing::warn!(
+                capsule = %capsule_id,
+                %target,
+                error = %e,
+                "furniture approval: failed to write approval; capsule will load inert for this principal"
+            );
+        }
+    }
 }
 
 /// Replace `dst` with a fresh recursive copy of `src`.
@@ -275,6 +339,41 @@ mod tests {
         // Mirror reflects the shrink — `bravo` is gone, `alpha` remains.
         assert!(target_home.capsules_dir().join("alpha").exists());
         assert!(!target_home.capsules_dir().join("bravo").exists());
+    }
+
+    #[test]
+    fn seeded_furniture_capsule_is_approved_for_target_principal() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = AstridHome::from_path(tmp.path());
+
+        // The install principal has a capsule with a real manifest (a furniture
+        // capsule declaring a capability) plus its content.
+        let install = home.principal_home(&crate::paths::install_principal());
+        write_file(
+            &install.capsules_dir().join("furn").join("Capsule.toml"),
+            "[package]\nname = \"furn\"\nversion = \"0.1.0\"\n\n[capabilities]\nnet = [\"example.com\"]\n",
+        );
+
+        let target = PrincipalId::new("claude-code").expect("principal id");
+        materialize_principal_furniture(&home, &target).expect("materialize");
+
+        // The mirrored capsule is now APPROVED for the target principal at the
+        // fingerprint of its manifest — so it loads with its capabilities, not
+        // inert. Without this write, a furniture-seeded capsule would be inert
+        // (the approval store lives under .config/, which is never mirrored).
+        let manifest = astrid_capsule::discovery::load_manifest(
+            &home
+                .principal_home(&target)
+                .capsules_dir()
+                .join("furn")
+                .join("Capsule.toml"),
+        )
+        .expect("load mirrored manifest");
+        let fp = astrid_capsule::security::approval::capability_fingerprint(&manifest);
+        assert!(
+            astrid_capsule::security::approval::is_approved(&home, &target, "furn", &fp),
+            "a furniture-seeded capsule must be auto-approved for the target principal"
+        );
     }
 
     #[test]

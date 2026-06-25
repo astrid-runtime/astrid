@@ -164,6 +164,59 @@ async fn test_manifest_security_gate_fs() {
     );
 }
 
+/// Defense in depth for #995: even an APPROVED capsule that declared a broad
+/// `home://` write/read scope cannot reach the operator-only approval store
+/// (`<home>/.config/approvals/`). The hard-deny fires regardless of the
+/// manifest allowlist, so a capsule cannot forge or escalate its own approval.
+#[tokio::test]
+async fn approval_store_is_hard_denied_even_with_home_write_scope() {
+    let home = home_root();
+    // A maximally-broad home scope: read AND write all of home://.
+    let manifest = make_manifest(vec![], vec!["home://"], vec!["home://"]);
+    let gate = ManifestSecurityGate::new(manifest, workspace_root(), Some(home.clone()));
+
+    let approval = home.join(".config").join("approvals").join("evil.json");
+    let approval_str = approval.to_string_lossy();
+
+    // A normal home path under the declared scope is allowed...
+    let ok_path = home.join(".local").join("skills").join("x.md");
+    assert!(
+        gate.check_file_write("evil", &ok_path.to_string_lossy(), None)
+            .await
+            .is_ok(),
+        "a non-approval home path under the declared scope is allowed",
+    );
+
+    // ...but the approval store is hard-denied for both write and read.
+    assert!(
+        gate.check_file_write("evil", &approval_str, None)
+            .await
+            .is_err(),
+        "#995: a capsule must never be able to WRITE its own approval record",
+    );
+    assert!(
+        gate.check_file_read("evil", &approval_str, None)
+            .await
+            .is_err(),
+        "#995: the approval store is operator-only — guest reads are denied too",
+    );
+
+    // Also denied when the home root is supplied per-invocation rather than at
+    // construction (the cross-principal serving path).
+    let gate_no_default = ManifestSecurityGate::new(
+        make_manifest(vec![], vec![], vec!["home://"]),
+        workspace_root(),
+        None,
+    );
+    assert!(
+        gate_no_default
+            .check_file_write("evil", &approval_str, Some(&home))
+            .await
+            .is_err(),
+        "#995: hard-deny applies to the per-invocation principal_home too",
+    );
+}
+
 #[tokio::test]
 async fn test_scheme_resolution_workspace() {
     let manifest = make_manifest(vec![], vec!["cwd://"], vec![]);
@@ -598,4 +651,71 @@ async fn check_net_connect_matches_allowlist_entry() {
             .is_err()
     );
     assert!(gate.check_net_connect("c", "evil.com", 443).await.is_err());
+}
+
+/// #995 contract: [`ManifestSecurityGate`] honours **exactly** the capability
+/// set it is constructed from — it is the enforcement *mechanism*, not the
+/// *policy*. The install-time approval decision lives UPSTREAM of the gate.
+///
+/// [`ManifestSecurityGate::new`] takes `(manifest, workspace_root, home_root)`:
+/// the manifest it receives is authoritative for this gate. That is by design.
+/// The #995 fix is in the engine load path
+/// (`engine::wasm::WasmEngine::load`): before building the gate it consults the
+/// per-principal approval store and, for an UNAPPROVED capsule, zeroes
+/// `manifest.capabilities` to [`CapabilitiesDef::default`] via
+/// [`crate::security::approval::effective_capabilities`]. So the gate an
+/// unapproved capsule gets is built from the EMPTY set and denies everything;
+/// an approved capsule's gate is built from its declared set, as asserted here.
+///
+/// This test therefore pins the gate's "honours what it is handed" contract —
+/// the pure, daemon-free enforcement decision is covered by
+/// [`crate::security::approval`]'s `effective_capabilities` tests, which assert
+/// that an unapproved manifest collapses to the empty set BEFORE it ever
+/// reaches this constructor.
+#[tokio::test]
+async fn regression_995_gate_honours_exactly_the_capability_set_it_is_built_from() {
+    // The APPROVED case: a gate built from a declared set honours that set.
+    // (The unapproved case never reaches here — the engine zeroes the caps
+    // first, so the gate would be built from `CapabilitiesDef::default`.)
+    let manifest = make_manifest(
+        vec!["attacker.example.com"], // arbitrary egress host
+        vec![],
+        vec!["*"], // broad write (confined to the workspace root)
+    );
+    let gate = ManifestSecurityGate::new(manifest, workspace_root(), None);
+
+    assert!(
+        gate.check_http_request("evil", "POST", "https://attacker.example.com/exfil")
+            .await
+            .is_ok(),
+        "#995: a gate built from an approved declared set honours it",
+    );
+    assert!(
+        gate.check_file_write("evil", "/workspace/anything", None)
+            .await
+            .is_ok(),
+        "#995: a gate built from an approved declared set honours it",
+    );
+
+    // The fix proper: an unapproved manifest collapses to the empty set
+    // BEFORE gate construction, so the resulting gate denies everything.
+    let empty = make_manifest(vec!["attacker.example.com"], vec![], vec!["*"]);
+    let inert = crate::security::approval::effective_capabilities(&empty.capabilities, false);
+    let mut inert_manifest = empty;
+    inert_manifest.capabilities = inert;
+    let inert_gate = ManifestSecurityGate::new(inert_manifest, workspace_root(), None);
+    assert!(
+        inert_gate
+            .check_http_request("evil", "POST", "https://attacker.example.com/exfil")
+            .await
+            .is_err(),
+        "#995: an unapproved (inert) capsule's gate denies declared egress",
+    );
+    assert!(
+        inert_gate
+            .check_file_write("evil", "/workspace/anything", None)
+            .await
+            .is_err(),
+        "#995: an unapproved (inert) capsule's gate denies declared write",
+    );
 }

@@ -646,6 +646,31 @@ impl Kernel {
         use astrid_capsule::toposort::toposort_manifests;
         use astrid_core::dirs::AstridHome;
 
+        // One-time grandfather migration (#995): approve every already-installed
+        // capsule at its current fingerprint BEFORE the load loop, so upgrading
+        // to the install-time capability gate does not strip capabilities from
+        // existing setups (no approval records exist yet). Guarded by a marker
+        // file under `etc/`, so this is a cheap no-op stat after the first boot.
+        // Offloaded to the blocking pool (synchronous directory scans) and
+        // awaited so the grandfather records exist before any capsule loads and
+        // consults them. Runs ahead of discovery deliberately.
+        if let Ok(home) = AstridHome::resolve() {
+            let home_for_migration = home.clone();
+            if let Err(e) = tokio::task::spawn_blocking(move || {
+                astrid_capsule::security::approval::migrate_grandfather_approvals(
+                    &home_for_migration,
+                );
+            })
+            .await
+            {
+                tracing::warn!(
+                    error = %e,
+                    "grandfather approval migration task panicked; pre-existing \
+                     capsules may load inert until approved"
+                );
+            }
+        }
+
         // Discovery paths in priority order: principal > workspace.
         let mut paths = Vec::new();
         if let Ok(home) = AstridHome::resolve() {

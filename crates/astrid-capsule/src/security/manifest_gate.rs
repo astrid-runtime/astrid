@@ -141,6 +141,23 @@ impl ManifestSecurityGate {
             return false;
         }
 
+        // Defense in depth (#995): the install-time capability-approval store
+        // lives at `<principal_home>/.config/approvals/`, which is technically
+        // within the `home://` VFS mount. Hard-deny ANY guest read/write that
+        // lands there, regardless of the manifest allowlist — the store is
+        // operator-only, and a capsule that could write it could forge or
+        // escalate its own (or another capsule's) approval. Checked against
+        // both the per-invocation `principal_home` and the construction-time
+        // `default_home_root`, whichever apply.
+        for home in [principal_home, self.default_home_root.as_deref()]
+            .into_iter()
+            .flatten()
+        {
+            if crate::security::approval::path_is_in_approval_store(path_obj, home) {
+                return false;
+            }
+        }
+
         if statics.iter().any(|p| {
             if p == "*" {
                 path_obj.starts_with(&self.workspace_root_path)

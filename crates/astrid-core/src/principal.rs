@@ -130,6 +130,15 @@ impl From<PrincipalId> for String {
     }
 }
 
+impl From<&PrincipalId> for PrincipalId {
+    /// Clone a borrowed `PrincipalId`. Lets generic `impl Into<PrincipalId>`
+    /// parameters accept a `&PrincipalId` (which most call sites hold) without
+    /// the caller writing `.clone()`.
+    fn from(id: &PrincipalId) -> Self {
+        id.clone()
+    }
+}
+
 impl TryFrom<String> for PrincipalId {
     type Error = PrincipalIdError;
 

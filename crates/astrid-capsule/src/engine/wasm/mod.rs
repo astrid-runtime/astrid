@@ -979,7 +979,12 @@ impl ExecutionEngine for WasmEngine {
         let workspace_root = ctx.workspace_root.clone();
         let kv = ctx.kv.clone();
         let event_bus = astrid_events::EventBus::clone(&ctx.event_bus);
-        let manifest = self.manifest.clone();
+        // Owned, mutable: the install-time capability-approval consult (#995)
+        // zeroes `manifest.capabilities` in place for an unapproved capsule
+        // BEFORE the security gate and every other capability derivation reads
+        // it, so an unapproved capsule loads inert. See the consult just above
+        // `ManifestSecurityGate::new`.
+        let mut manifest = self.manifest.clone();
 
         let mut wasm_config = std::collections::HashMap::new();
 
@@ -1143,6 +1148,77 @@ impl ExecutionEngine for WasmEngine {
                 Box::new(lower_vfs),
                 Box::new(upper_vfs),
             ));
+
+            // ── Install-time capability-approval consult (#995) ─────────────
+            //
+            // A capsule's manifest is UNTRUSTED INPUT; its declared
+            // `[capabilities]` must not become effective without an operator
+            // approval recorded out-of-band. We consult the per-principal
+            // approval store (under `.config/approvals/`, capsule-unreachable)
+            // for THIS capsule at the fingerprint of its current declared set.
+            // If the fingerprint is not approved, we zero `manifest.capabilities`
+            // IN PLACE so every downstream derivation below — the security gate,
+            // `capability_names`, `has_uplink`, the net_bind socket listener —
+            // sees the empty, fail-closed set and the capsule loads INERT:
+            // present and discoverable, but with zero host-fn access.
+            //
+            // Fail-secure: a home that cannot be resolved is treated as "no
+            // approval" (inert), never as approved. Only `capabilities` is
+            // zeroed; the IPC publish/subscribe patterns are intentionally left
+            // intact for an inert capsule — gating those for inert capsules is a
+            // v1 limitation tracked as a follow-up (the host-fn capability
+            // surface is the load-bearing boundary and IS gated here).
+            let capability_fp = crate::security::approval::capability_fingerprint(&manifest);
+            let approved = match astrid_core::dirs::AstridHome::resolve() {
+                Ok(approval_home) => {
+                    // The approval record is a small one-shot disk read, but
+                    // `std::fs` is blocking — run it off the async executor so a
+                    // load never starves a worker thread.
+                    let principal = ctx.principal.clone();
+                    let capsule_name = manifest.package.name.clone();
+                    let fp = capability_fp.clone();
+                    tokio::task::spawn_blocking(move || {
+                        crate::security::approval::is_approved(
+                            &approval_home,
+                            &principal,
+                            &capsule_name,
+                            &fp,
+                        )
+                    })
+                    .await
+                    .unwrap_or_else(|e| {
+                        tracing::warn!(
+                            error = %e,
+                            "capability-approval check task failed; loading capsule inert (fail-secure)"
+                        );
+                        false
+                    })
+                },
+                Err(e) => {
+                    tracing::warn!(
+                        capsule = %manifest.package.name,
+                        principal = %ctx.principal,
+                        error = %e,
+                        "could not resolve home to check capability approval; \
+                         loading capsule inert (fail-secure)"
+                    );
+                    false
+                },
+            };
+            if !approved {
+                tracing::warn!(
+                    target: "astrid.audit.capsule.approval",
+                    capsule = %manifest.package.name,
+                    principal = %ctx.principal,
+                    fingerprint = %capability_fp,
+                    "capsule loaded INERT: declared capabilities are not approved for \
+                     this principal — run `astrid capsule approve` to activate (#995)"
+                );
+            }
+            manifest.capabilities = crate::security::approval::effective_capabilities(
+                &manifest.capabilities,
+                approved,
+            );
 
             // Only resolve home:// in the gate if we actually mounted the VFS.
             // Otherwise the gate would approve paths the VFS can't serve.
