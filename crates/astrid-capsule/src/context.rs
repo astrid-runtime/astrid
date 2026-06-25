@@ -5,6 +5,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use arc_swap::ArcSwap;
 use astrid_core::GroupConfig;
 use astrid_core::principal::PrincipalId;
 use astrid_events::EventBus;
@@ -65,19 +66,17 @@ pub struct CapsuleContext {
     /// never reach Agent B's view of the same tree. Tests and single-tenant
     /// deployments may leave this `None`.
     pub overlay_registry: Option<Arc<astrid_vfs::OverlayVfsRegistry>>,
-    /// Live group → capability mapping, snapshotted from the kernel's
-    /// `ArcSwap<GroupConfig>` at capsule-load time.
+    /// Live group → capability mapping from the kernel's `ArcSwap<GroupConfig>`.
     ///
     /// The capsule load path resolves the owner principal's
     /// [`CAP_RESOURCES_UNBOUNDED`](astrid_core::CAP_RESOURCES_UNBOUNDED)
     /// capability against this config (groups → grants/revokes → capability
     /// set) to decide whether the capsule's run-loop is exempt from the
-    /// per-principal CPU + memory bound. **Fail-secure**: `None` (tests,
-    /// single-tenant boot that did not thread it, or an unthreaded call site)
-    /// means *not exempt* — the run-loop is bounded. A snapshot, not the live
-    /// `ArcSwap`: runtime group mutations re-evaluate only on capsule reload,
-    /// matching the profile-cache invalidation model.
-    pub group_config: Option<Arc<GroupConfig>>,
+    /// per-principal CPU + memory bound. Per-invocation checks load from the
+    /// same live handle so runtime group mutations are observed without
+    /// reloading capsules. **Fail-secure**: `None` (tests, single-tenant boot
+    /// that did not thread it, or an unthreaded call site) means *not exempt*.
+    pub group_config: Option<Arc<ArcSwap<GroupConfig>>>,
     /// Operator-approved local-egress allowlist for THIS capsule, as
     /// `host:port` / `host:*` patterns. Resolved by the kernel from
     /// `[security.capsule_local_egress]` keyed by capsule id and snapshotted
@@ -159,11 +158,10 @@ impl CapsuleContext {
         self
     }
 
-    /// Set the live group → capability config used to resolve the run-loop
-    /// resource-exemption capability ([`CAP_RESOURCES_UNBOUNDED`](
-    /// astrid_core::CAP_RESOURCES_UNBOUNDED)) at load time.
+    /// Set the live group → capability config used to resolve capability-driven
+    /// resource exemptions.
     #[must_use]
-    pub fn with_group_config(mut self, groups: Arc<GroupConfig>) -> Self {
+    pub fn with_group_config(mut self, groups: Arc<ArcSwap<GroupConfig>>) -> Self {
         self.group_config = Some(groups);
         self
     }

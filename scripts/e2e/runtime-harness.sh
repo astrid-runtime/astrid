@@ -39,6 +39,10 @@ cleanup() {
   trap - EXIT INT TERM
   terminate_pid "$DAEMON_PID"
   terminate_pid "$FAKE_PID"
+  if [[ "$status" -ne 0 && -d "$ASTRID_HOME/log" ]]; then
+    mkdir -p "$ARTIFACTS/astrid-log"
+    cp -a "$ASTRID_HOME/log/." "$ARTIFACTS/astrid-log/" 2>/dev/null || true
+  fi
   if [[ -n "$POISON_HOME" && -z "${ASTRID_E2E_KEEP_HOME:-}" ]]; then
     rm -rf "$POISON_HOME"
   elif [[ -n "$POISON_HOME" ]]; then
@@ -537,6 +541,14 @@ session-lifetime-secs = 3600
 redeem-rate-limit-secs = 0
 EOF
   cat > "$ASTRID_HOME/config.toml" <<EOF
+[logging]
+directives = [
+  "astrid_capsule::dispatcher=debug",
+  "astrid_gateway::routes::sessions=debug",
+  "astrid_capsule::engine::wasm::host::kv=debug",
+  "astrid_events=debug",
+]
+
 [security.capsule_local_egress]
 "astrid-capsule-openai-compat" = ["127.0.0.1:$fake_port"]
 "openai-compat" = ["127.0.0.1:$fake_port"]

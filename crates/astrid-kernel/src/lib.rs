@@ -532,10 +532,10 @@ impl Kernel {
         .with_identity_store(Arc::clone(&self.identity_store))
         .with_profile_cache(Arc::clone(&self.profile_cache))
         .with_overlay_registry(Arc::clone(&self.overlay_registry))
-        // Snapshot the live group config so the capsule load path can resolve
-        // the run-loop resource-exemption capability (CAP_RESOURCES_UNBOUNDED)
-        // against the owner principal's groups/grants/revokes.
-        .with_group_config(self.groups.load_full())
+        // Thread the live group config so capsule invocation checks observe
+        // runtime group mutations without requiring capsule reloads. Load-time
+        // run-loop decisions take their own explicit snapshot.
+        .with_group_config(Arc::clone(&self.groups))
         // Hand this capsule its operator-approved local-egress allowlist (if
         // any) so the SSRF airlock can exempt sanctioned loopback/private
         // endpoints for it. Absent entry = empty = no exemptions.

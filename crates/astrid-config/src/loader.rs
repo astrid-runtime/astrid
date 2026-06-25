@@ -3,7 +3,7 @@
 //! Implements the `Config::load()` algorithm:
 //! 1. Parse `defaults.toml` → base
 //! 2. Merge `/etc/astrid/config.toml` (system)
-//! 3. Merge `~/.astrid/config.toml` (user)
+//! 3. Merge `$ASTRID_HOME/config.toml` or `~/.astrid/config.toml` (user)
 //! 4. Merge `{workspace}/.astrid/config.toml` (workspace) + restriction enforcement
 //! 5. Apply env var fallbacks for unset fields
 //! 6. Deserialize merged tree → `Config`
@@ -84,25 +84,7 @@ pub fn load(
         let path = h.join("config.toml");
         try_load_file(&path)?.map(|overlay| (overlay, path))
     } else {
-        // Standard discovery: ~/.astrid/config.toml then ASTRID_HOME/config.toml
-        let user_path = home_dir.join(".astrid").join("config.toml");
-        if let Some(overlay) = try_load_file(&user_path)? {
-            Some((overlay, user_path))
-        } else if let Some(astrid_home) = env_vars.get("ASTRID_HOME") {
-            let validated = validate_astrid_home(astrid_home, &home_dir);
-            if let Some(canonical) = validated {
-                let alt_path = canonical.join("config.toml");
-                try_load_file(&alt_path)?.map(|overlay| (overlay, alt_path))
-            } else {
-                tracing::warn!(
-                    path = astrid_home,
-                    "ASTRID_HOME is not a valid directory owned by current user; ignoring"
-                );
-                None
-            }
-        } else {
-            None
-        }
+        discover_user_config(&home_dir, env_vars.get("ASTRID_HOME").map(String::as_str))?
     };
 
     if let Some((overlay, path)) = user_config {
@@ -252,6 +234,29 @@ fn try_load_file(path: &Path) -> ConfigResult<Option<toml::Value>> {
     Ok(Some(value))
 }
 
+fn discover_user_config(
+    home_dir: &Path,
+    astrid_home: Option<&str>,
+) -> ConfigResult<Option<(toml::Value, PathBuf)>> {
+    if let Some(astrid_home) = astrid_home {
+        let validated = validate_astrid_home(astrid_home, home_dir);
+        if let Some(canonical) = validated {
+            let path = canonical.join("config.toml");
+            if let Some(overlay) = try_load_file(&path)? {
+                return Ok(Some((overlay, path)));
+            }
+        } else {
+            tracing::warn!(
+                path = astrid_home,
+                "ASTRID_HOME is not a valid directory owned by current user; ignoring"
+            );
+        }
+    }
+
+    let user_path = home_dir.join(".astrid").join("config.toml");
+    try_load_file(&user_path).map(|overlay| overlay.map(|overlay| (overlay, user_path)))
+}
+
 /// Validate that an `ASTRID_HOME` path is a real directory owned by the
 /// same user who owns `home_dir`. Returns the canonicalized path on success.
 fn validate_astrid_home(raw_path: &str, home_dir: &Path) -> Option<PathBuf> {
@@ -342,6 +347,37 @@ mod tests {
     fn test_try_load_file_missing() {
         let result = try_load_file(Path::new("/nonexistent/config.toml")).unwrap();
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_astrid_home_config_precedes_home_config() {
+        let home = tempfile::tempdir().unwrap();
+        let astrid_home = tempfile::tempdir().unwrap();
+        let home_astrid = home.path().join(".astrid");
+        std::fs::create_dir_all(&home_astrid).unwrap();
+        std::fs::write(
+            home_astrid.join("config.toml"),
+            r#"
+            [model]
+            provider = "home"
+            "#,
+        )
+        .unwrap();
+        std::fs::write(
+            astrid_home.path().join("config.toml"),
+            r#"
+            [model]
+            provider = "astrid-home"
+            "#,
+        )
+        .unwrap();
+
+        let (_overlay, path) =
+            discover_user_config(home.path(), Some(astrid_home.path().to_str().unwrap()))
+                .unwrap()
+                .expect("ASTRID_HOME config should be discovered");
+
+        assert_eq!(path, astrid_home.path().join("config.toml"));
     }
 
     #[test]
