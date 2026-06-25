@@ -377,7 +377,14 @@ mod tests {
                 .unwrap()
                 .expect("ASTRID_HOME config should be discovered");
 
-        assert_eq!(path, astrid_home.path().join("config.toml"));
+        assert_eq!(
+            path.canonicalize().unwrap(),
+            astrid_home
+                .path()
+                .join("config.toml")
+                .canonicalize()
+                .unwrap()
+        );
     }
 
     #[test]

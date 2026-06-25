@@ -535,7 +535,7 @@ impl Kernel {
         // Thread the live group config so capsule invocation checks observe
         // runtime group mutations without requiring capsule reloads. Load-time
         // run-loop decisions take their own explicit snapshot.
-        .with_group_config(Arc::clone(&self.groups))
+        .with_live_group_config(Arc::clone(&self.groups))
         // Hand this capsule its operator-approved local-egress allowlist (if
         // any) so the SSRF airlock can exempt sanctioned loopback/private
         // endpoints for it. Absent entry = empty = no exemptions.

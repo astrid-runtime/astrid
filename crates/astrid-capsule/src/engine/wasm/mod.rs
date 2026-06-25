@@ -1315,7 +1315,10 @@ impl ExecutionEngine for WasmEngine {
                         })
                         .ok()
                 });
-            let load_group_config = ctx.group_config.as_ref().map(|groups| groups.load_full());
+            let load_group_config =
+                crate::context::live_group_config_for(&ctx.group_config)
+                    .map(|groups| groups.load_full())
+                    .or_else(|| ctx.group_config.clone());
             let run_budget = resolve_run_loop_budget(
                 owner_profile.as_deref(),
                 load_group_config.as_ref().map(Arc::as_ref),
@@ -1899,7 +1902,12 @@ impl ExecutionEngine for WasmEngine {
         // resolve the invoking principal's exemption against runtime group
         // mutations. `None` in tests / single-tenant => no exemption resolvable
         // => the principal is bounded (fail-secure).
-        self.group_config = ctx.group_config.clone();
+        self.group_config =
+            crate::context::live_group_config_for(&ctx.group_config).or_else(|| {
+                ctx.group_config
+                    .as_ref()
+                    .map(|groups| Arc::new(ArcSwap::from(Arc::clone(groups))))
+            });
 
         Ok(())
     }

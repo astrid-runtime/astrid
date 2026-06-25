@@ -232,6 +232,8 @@ async fn request_capsule_round_trips_scoped_reply() {
         // The stand-in capsule sees the request principal-stamped.
         if let AstridEvent::Ipc { message, .. } = &*event {
             assert_eq!(message.principal.as_deref(), Some("alice"));
+            assert_ne!(message.source_id, Uuid::nil());
+            assert_eq!(message.origin, MessageOrigin::RemoteGateway);
         } else {
             panic!("expected an IPC request event");
         }
@@ -240,11 +242,16 @@ async fn request_capsule_round_trips_scoped_reply() {
             "sessions": [],
             "next_cursor": null
         });
-        let msg = IpcMessage::new(
+        let mut msg = IpcMessage::new(
             Topic::from_raw(resp_topic.clone()),
             IpcPayload::RawJson(reply),
             Uuid::nil(),
         );
+        if let AstridEvent::Ipc { message, .. } = &*event {
+            if let Some(principal) = &message.principal {
+                msg = msg.with_principal(principal.clone());
+            }
+        }
         bus_capsule.publish(AstridEvent::Ipc {
             metadata: EventMetadata::new("test::capsule"),
             message: msg,
@@ -561,6 +568,8 @@ async fn request_capsule_round_trips_update_reply() {
         };
         // Principal-stamped, and the patch carries only the sent key.
         assert_eq!(message.principal.as_deref(), Some("alice"));
+        assert_ne!(message.source_id, Uuid::nil());
+        assert_eq!(message.origin, MessageOrigin::RemoteGateway);
         if let IpcPayload::RawJson(v) = &message.payload {
             assert_eq!(v["title"], "renamed");
             assert!(v.get("archived").is_none(), "absent key not forwarded");
@@ -576,11 +585,14 @@ async fn request_capsule_round_trips_update_reply() {
                 "archived": false
             }
         });
-        let msg = IpcMessage::new(
+        let mut msg = IpcMessage::new(
             Topic::from_raw(resp_topic),
             IpcPayload::RawJson(reply),
             Uuid::nil(),
         );
+        if let Some(principal) = &message.principal {
+            msg = msg.with_principal(principal.clone());
+        }
         bus_capsule.publish(AstridEvent::Ipc {
             metadata: EventMetadata::new("test::capsule"),
             message: msg,
@@ -610,6 +622,53 @@ async fn request_capsule_round_trips_update_reply() {
     assert_eq!(summary.title.as_deref(), Some("renamed"));
 }
 
+/// A reply stamped for a different principal is dropped by the routed
+/// subscription before the correlation check can see it. This protects a
+/// same-topic reply from satisfying another caller's request.
+#[tokio::test]
+async fn request_capsule_ignores_wrong_principal_reply() {
+    let bus = Arc::new(EventBus::new());
+    let principal = PrincipalId::new("alice").expect("valid principal");
+    let correlation_id = "corr-want-principal";
+    let response_topic = format!("{TOPIC_LIST_RESPONSE_PREFIX}.{correlation_id}");
+
+    let bus_bg = Arc::clone(&bus);
+    let resp_topic = response_topic.clone();
+    tokio::spawn(async move {
+        tokio::task::yield_now().await;
+        let reply = serde_json::json!({
+            "correlation_id": "corr-want-principal",
+            "sessions": [],
+            "next_cursor": null
+        });
+        let msg = IpcMessage::new(
+            Topic::from_raw(resp_topic),
+            IpcPayload::RawJson(reply),
+            Uuid::nil(),
+        )
+        .with_principal("mallory".to_string());
+        bus_bg.publish(AstridEvent::Ipc {
+            metadata: EventMetadata::new("test::foreign"),
+            message: msg,
+        });
+    });
+
+    let payload = build_list_payload(correlation_id, None, DEFAULT_LIMIT, false);
+    let err = request_capsule(
+        &bus,
+        TOPIC_LIST_REQUEST,
+        &response_topic,
+        payload,
+        correlation_id,
+        &principal,
+        None,
+        Duration::from_millis(150),
+    )
+    .await
+    .expect_err("foreign-principal reply must not satisfy the request");
+    assert!(matches!(err, GatewayError::Kernel(_)));
+}
+
 /// A reply whose `correlation_id` does NOT match is skipped; the
 /// helper keeps waiting and ultimately times out rather than
 /// returning a foreign body. Proves the defensive correlation check.
@@ -636,7 +695,8 @@ async fn request_capsule_ignores_mismatched_correlation() {
             Topic::from_raw(resp_topic),
             IpcPayload::RawJson(reply),
             Uuid::nil(),
-        );
+        )
+        .with_principal("alice".to_string());
         bus_bg.publish(AstridEvent::Ipc {
             metadata: EventMetadata::new("test::foreign"),
             message: msg,

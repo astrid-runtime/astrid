@@ -9,7 +9,7 @@
 //! topics instead. The gateway:
 //!
 //! 1. Generates a fresh `correlation_id` (UUID v4).
-//! 2. Subscribes to a **per-correlation scoped** response topic
+//! 2. Subscribes to a **per-correlation, principal-scoped** response topic
 //!    (`session.v1.response.<verb>.<correlation_id>`) FIRST — before
 //!    publishing — so a fast capsule reply can't land before the
 //!    subscription is open.
@@ -36,7 +36,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use astrid_core::PrincipalId;
-use astrid_events::ipc::{IpcMessage, IpcPayload, Topic};
+use astrid_events::ipc::{IpcMessage, IpcPayload, MessageOrigin, Topic};
 use astrid_events::{AstridEvent, EventBus, EventMetadata};
 use axum::Json;
 use axum::extract::{Path, Query, State};
@@ -921,14 +921,24 @@ async fn request_capsule(
 ) -> GatewayResult<Value> {
     // Subscribe FIRST. A fast capsule can publish the reply on the same
     // task that processed the request — subscribing afterwards races it.
-    let mut receiver = bus.subscribe_topic(response_topic.to_string());
+    // Scope the reply route to the caller principal so a foreign principal's
+    // response on the same topic never enters this receiver's queue.
+    let principal = principal.to_string();
+    let mut receiver = bus.subscribe_topic_routed_scoped(
+        Uuid::new_v4(),
+        response_topic,
+        "gateway",
+        "gateway::sessions",
+        Some(Some(principal.clone())),
+    );
 
     let mut msg = IpcMessage::new(
         Topic::from_raw(request_topic),
         IpcPayload::RawJson(payload),
-        Uuid::nil(),
+        Uuid::new_v4(),
     )
-    .with_principal(principal.to_string());
+    .with_principal(principal)
+    .with_origin(MessageOrigin::RemoteGateway);
     if let Some(key_id) = device_key_id {
         msg = msg.with_device_key_id(key_id.to_string());
     }
@@ -946,15 +956,10 @@ async fn request_capsule(
         if remaining.is_zero() {
             return Err(capsule_timeout(response_topic, timeout));
         }
-        let event = match tokio::time::timeout(remaining, receiver.recv()).await {
-            Ok(Some(ev)) => ev,
-            Ok(None) => {
-                return Err(GatewayError::Internal(anyhow::anyhow!(
-                    "event bus closed before a session capsule reply on {response_topic}"
-                )));
-            },
-            Err(_) => return Err(capsule_timeout(response_topic, timeout)),
-        };
+        let event = receiver
+            .recv(Some(remaining))
+            .await
+            .ok_or_else(|| capsule_timeout(response_topic, timeout))?;
 
         let AstridEvent::Ipc { message, .. } = &*event else {
             continue;

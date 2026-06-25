@@ -3,7 +3,7 @@
 //! Provides the execution context for capsule lifecycle and tool invocations.
 
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock, Mutex, Weak};
 
 use arc_swap::ArcSwap;
 use astrid_core::GroupConfig;
@@ -16,6 +16,40 @@ use astrid_core::session_token::SessionToken;
 use crate::profile_cache::PrincipalProfileCache;
 use crate::registry::CapsuleRegistry;
 use crate::schema_catalog::SchemaCatalog;
+
+static LIVE_GROUP_CONFIGS: LazyLock<Mutex<Vec<LiveGroupConfigEntry>>> =
+    LazyLock::new(|| Mutex::new(Vec::new()));
+
+struct LiveGroupConfigEntry {
+    snapshot: Weak<GroupConfig>,
+    live: Weak<ArcSwap<GroupConfig>>,
+}
+
+pub(crate) fn live_group_config_for(
+    snapshot: &Option<Arc<GroupConfig>>,
+) -> Option<Arc<ArcSwap<GroupConfig>>> {
+    let snapshot = snapshot.as_ref()?;
+    let mut entries = LIVE_GROUP_CONFIGS.lock().ok()?;
+    entries.retain(|entry| entry.snapshot.strong_count() > 0 && entry.live.strong_count() > 0);
+    entries.iter().find_map(|entry| {
+        let registered_snapshot = entry.snapshot.upgrade()?;
+        if Arc::ptr_eq(&registered_snapshot, snapshot) {
+            entry.live.upgrade()
+        } else {
+            None
+        }
+    })
+}
+
+fn register_live_group_config(snapshot: &Arc<GroupConfig>, live: &Arc<ArcSwap<GroupConfig>>) {
+    if let Ok(mut entries) = LIVE_GROUP_CONFIGS.lock() {
+        entries.retain(|entry| entry.snapshot.strong_count() > 0 && entry.live.strong_count() > 0);
+        entries.push(LiveGroupConfigEntry {
+            snapshot: Arc::downgrade(snapshot),
+            live: Arc::downgrade(live),
+        });
+    }
+}
 
 /// Context provided to a capsule during lifecycle operations (load/unload).
 ///
@@ -66,17 +100,12 @@ pub struct CapsuleContext {
     /// never reach Agent B's view of the same tree. Tests and single-tenant
     /// deployments may leave this `None`.
     pub overlay_registry: Option<Arc<astrid_vfs::OverlayVfsRegistry>>,
-    /// Live group → capability mapping from the kernel's `ArcSwap<GroupConfig>`.
+    /// Snapshot group → capability mapping.
     ///
-    /// The capsule load path resolves the owner principal's
-    /// [`CAP_RESOURCES_UNBOUNDED`](astrid_core::CAP_RESOURCES_UNBOUNDED)
-    /// capability against this config (groups → grants/revokes → capability
-    /// set) to decide whether the capsule's run-loop is exempt from the
-    /// per-principal CPU + memory bound. Per-invocation checks load from the
-    /// same live handle so runtime group mutations are observed without
-    /// reloading capsules. **Fail-secure**: `None` (tests, single-tenant boot
-    /// that did not thread it, or an unthreaded call site) means *not exempt*.
-    pub group_config: Option<Arc<ArcSwap<GroupConfig>>>,
+    /// This field remains the public compatibility surface for callers that
+    /// construct capsule contexts outside the kernel. The kernel threads live
+    /// updates through `with_live_group_config`.
+    pub group_config: Option<Arc<GroupConfig>>,
     /// Operator-approved local-egress allowlist for THIS capsule, as
     /// `host:port` / `host:*` patterns. Resolved by the kernel from
     /// `[security.capsule_local_egress]` keyed by capsule id and snapshotted
@@ -158,11 +187,21 @@ impl CapsuleContext {
         self
     }
 
+    /// Set a snapshot group → capability config used to resolve
+    /// capability-driven resource exemptions.
+    #[must_use]
+    pub fn with_group_config(mut self, groups: Arc<GroupConfig>) -> Self {
+        self.group_config = Some(groups);
+        self
+    }
+
     /// Set the live group → capability config used to resolve capability-driven
     /// resource exemptions.
     #[must_use]
-    pub fn with_group_config(mut self, groups: Arc<ArcSwap<GroupConfig>>) -> Self {
-        self.group_config = Some(groups);
+    pub fn with_live_group_config(mut self, groups: Arc<ArcSwap<GroupConfig>>) -> Self {
+        let snapshot = groups.load_full();
+        register_live_group_config(&snapshot, &groups);
+        self.group_config = Some(snapshot);
         self
     }
 
