@@ -40,7 +40,7 @@ pub(crate) fn record_install_approval(
     let fingerprint = approval::capability_fingerprint(manifest);
 
     if batch {
-        approval::approve(home, &principal, capsule_id, fingerprint)
+        approval::approve(home, &principal, &manifest.package.name, fingerprint)
             .with_context(|| format!("recording auto-approval for '{capsule_id}'"))?;
         return Ok(());
     }
@@ -50,7 +50,7 @@ pub(crate) fn record_install_approval(
     // fingerprint is pinned and `capsule list` shows it as approved.
     let declared = describe_declared_capabilities(manifest);
     if declared.is_empty() {
-        approval::approve(home, &principal, capsule_id, fingerprint)
+        approval::approve(home, &principal, &manifest.package.name, fingerprint)
             .with_context(|| format!("recording approval for '{capsule_id}'"))?;
         return Ok(());
     }
@@ -63,7 +63,7 @@ pub(crate) fn record_install_approval(
     eprintln!();
 
     if prompt_yes_no(&format!("Approve and activate '{capsule_id}'?")) {
-        approval::approve(home, &principal, capsule_id, fingerprint)
+        approval::approve(home, &principal, &manifest.package.name, fingerprint)
             .with_context(|| format!("recording approval for '{capsule_id}'"))?;
         eprintln!("Approved. '{capsule_id}' will be active when the daemon loads it.");
     } else {
@@ -110,13 +110,14 @@ pub(crate) async fn run(name: &str, workspace: bool) -> anyhow::Result<()> {
         }
     }
 
-    approval::approve(&home, &principal, name, fingerprint)
+    approval::approve(&home, &principal, &manifest.package.name, fingerprint)
         .with_context(|| format!("recording approval for '{name}'"))?;
     eprintln!("Approved '{name}'.");
 
     // Best-effort: if a daemon is running, hot-reload so the now-approved
     // capabilities take effect without a restart. Silent when no daemon is up.
-    super::live_load::nudge_daemon_reload(std::slice::from_ref(&name.to_string())).await;
+    let reload = [name.to_string()];
+    super::live_load::nudge_daemon_reload(&reload).await;
     Ok(())
 }
 

@@ -358,9 +358,10 @@ mod tests {
     ///
     /// "Distro-blessed" capability acceptance needs a verifiable anchor or it
     /// becomes an approval-bypass primitive. Today [`OFFICIAL_KEYS`] is empty by
-    /// deliberate decision (not part of #964's spec), so no install source is
-    /// treated as blessed: `is_official` returns false for every key and even
-    /// official distros take the TOFU path like any third party.
+    /// deliberate decision (the cryptographic blessed-trust-root is tracked on
+    /// #995/#991), so no install source is treated as blessed: `is_official`
+    /// returns false for every key and even official distros take the TOFU path
+    /// like any third party.
     ///
     /// When a real official key is populated, `is_official` must return true for
     /// it — update this test to assert that instead of emptiness, and wire the

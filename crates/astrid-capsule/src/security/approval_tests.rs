@@ -369,3 +369,50 @@ fn migration_is_idempotent_and_does_not_reapprove_after_change() {
         "idempotent migration must not auto-approve a post-migration escalation"
     );
 }
+
+// ── Capsule-id validation (path-traversal defense in depth) ──────────────
+
+#[test]
+fn approve_rejects_traversal_capsule_id() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = AstridHome::from_path(tmp.path());
+    let principal = PrincipalId::default();
+    let fp = CapabilityFingerprint::new("deadbeef");
+
+    // A traversal id must never be turned into a write path outside the store.
+    for bad in ["../../evil", "foo/bar", "..", "a/../b"] {
+        let err = approve(&home, &principal, bad, &fp)
+            .expect_err("traversal id must be rejected by approve");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput, "id {bad:?}");
+    }
+    // No file escaped the approvals dir into the principal's .config.
+    assert!(
+        !home
+            .principal_home(&principal)
+            .root()
+            .join(".config")
+            .join("evil.json")
+            .exists()
+    );
+}
+
+#[test]
+fn is_approved_false_for_invalid_capsule_id() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = AstridHome::from_path(tmp.path());
+    let principal = PrincipalId::default();
+    let fp = CapabilityFingerprint::new("deadbeef");
+    // Fail-secure: an invalid id is unapproved and never builds a read path.
+    assert!(!is_approved(&home, &principal, "../../evil", &fp));
+    assert!(!is_approved(&home, &principal, "foo/bar", &fp));
+}
+
+#[test]
+fn remove_rejects_traversal_capsule_id() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = AstridHome::from_path(tmp.path());
+    let principal = PrincipalId::default();
+    let err = remove(&home, &principal, "../../evil")
+        .expect_err("traversal id must be rejected by remove");
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+}

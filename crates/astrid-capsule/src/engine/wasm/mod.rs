@@ -1170,12 +1170,30 @@ impl ExecutionEngine for WasmEngine {
             // surface is the load-bearing boundary and IS gated here).
             let capability_fp = crate::security::approval::capability_fingerprint(&manifest);
             let approved = match astrid_core::dirs::AstridHome::resolve() {
-                Ok(approval_home) => crate::security::approval::is_approved(
-                    &approval_home,
-                    &ctx.principal,
-                    &manifest.package.name,
-                    &capability_fp,
-                ),
+                Ok(approval_home) => {
+                    // The approval record is a small one-shot disk read, but
+                    // `std::fs` is blocking — run it off the async executor so a
+                    // load never starves a worker thread.
+                    let principal = ctx.principal.clone();
+                    let capsule_name = manifest.package.name.clone();
+                    let fp = capability_fp.clone();
+                    tokio::task::spawn_blocking(move || {
+                        crate::security::approval::is_approved(
+                            &approval_home,
+                            &principal,
+                            &capsule_name,
+                            &fp,
+                        )
+                    })
+                    .await
+                    .unwrap_or_else(|e| {
+                        tracing::warn!(
+                            error = %e,
+                            "capability-approval check task failed; loading capsule inert (fail-secure)"
+                        );
+                        false
+                    })
+                },
                 Err(e) => {
                     tracing::warn!(
                         capsule = %manifest.package.name,

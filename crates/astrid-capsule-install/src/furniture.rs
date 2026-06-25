@@ -114,9 +114,14 @@ fn approve_furniture_capsules(home: &AstridHome, target: &PrincipalId, capsules_
             },
         };
         let fingerprint = astrid_capsule::security::approval::capability_fingerprint(&manifest);
-        if let Err(e) =
-            astrid_capsule::security::approval::approve(home, target, &capsule_id, fingerprint)
-        {
+        // Key on the manifest's package name — the id the engine consults at
+        // load — not the on-disk directory name, so they can never diverge.
+        if let Err(e) = astrid_capsule::security::approval::approve(
+            home,
+            target,
+            &manifest.package.name,
+            fingerprint,
+        ) {
             tracing::warn!(
                 capsule = %capsule_id,
                 %target,

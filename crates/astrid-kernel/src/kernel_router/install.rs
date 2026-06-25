@@ -120,8 +120,19 @@ pub(super) async fn handle_install_capsule(
     // declared capabilities (#995). Without this the freshly-installed capsule
     // would load inert on the `load_all_capsules` call below. Best-effort: a
     // failure here only means the capsule loads inert until an operator runs
-    // `astrid capsule approve`, which is the fail-secure direction.
-    auto_approve_admin_install(&home, &output.target_dir);
+    // `astrid capsule approve`, which is the fail-secure direction. Off the
+    // async executor — it re-reads the manifest and writes the record (blocking
+    // `std::fs`), the same way the install above runs in `spawn_blocking`.
+    {
+        let home = home.clone();
+        let target_dir = output.target_dir.clone();
+        if let Err(e) =
+            tokio::task::spawn_blocking(move || auto_approve_admin_install(&home, &target_dir))
+                .await
+        {
+            tracing::warn!(error = %e, "admin install: auto-approve task failed");
+        }
+    }
 
     // Pick up the new capsule without a daemon restart. The loader
     // is idempotent on already-registered IDs.
@@ -156,9 +167,14 @@ fn auto_approve_admin_install(home: &astrid_core::dirs::AstridHome, target_dir: 
     };
     let fingerprint = astrid_capsule::security::approval::capability_fingerprint(&manifest);
     let principal = astrid_capsule_install::install_principal();
-    if let Err(e) =
-        astrid_capsule::security::approval::approve(home, &principal, &capsule_id, fingerprint)
-    {
+    // Key on the manifest's package name — the exact id the engine consults at
+    // load — not the on-disk directory name, so they can never diverge.
+    if let Err(e) = astrid_capsule::security::approval::approve(
+        home,
+        &principal,
+        &manifest.package.name,
+        fingerprint,
+    ) {
         tracing::warn!(
             capsule = %capsule_id,
             %principal,

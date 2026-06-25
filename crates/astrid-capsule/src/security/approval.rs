@@ -165,6 +165,19 @@ fn record_path(home: &AstridHome, principal: &PrincipalId, capsule_id: &str) -> 
         .join(format!("{capsule_id}.json"))
 }
 
+/// Whether `capsule_id` is a syntactically valid capsule id, and therefore safe
+/// to use as a single path component under the approvals directory.
+///
+/// Every store function validates its `capsule_id` before building a path:
+/// `is_approved`/`approve`/`remove` are reachable with an id that has NOT yet
+/// passed [`CapsuleId`](crate::capsule::CapsuleId) validation (the engine load
+/// path consults `is_approved(manifest.package.name)` before validating the
+/// name), so a traversal string like `../../evil` must never reach
+/// `std::fs`. Invalid ids are rejected here, fail-secure.
+fn is_valid_capsule_id(capsule_id: &str) -> bool {
+    crate::capsule::CapsuleId::new(capsule_id).is_ok()
+}
+
 /// Record an operator approval of `fingerprint` for `capsule_id` under
 /// `principal`.
 ///
@@ -185,6 +198,12 @@ pub fn approve(
 ) -> std::io::Result<()> {
     let principal = principal.into();
     let capsule_id = capsule_id.as_ref();
+    if !is_valid_capsule_id(capsule_id) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("invalid capsule id '{capsule_id}': cannot record approval"),
+        ));
+    }
     let dir = home.principal_home(&principal).approvals_dir();
     std::fs::create_dir_all(&dir)?;
     let path = dir.join(format!("{capsule_id}.json"));
@@ -217,9 +236,27 @@ pub fn is_approved(
 ) -> bool {
     let principal = principal.into();
     let fingerprint = fingerprint.into();
-    let path = record_path(home, &principal, capsule_id.as_ref());
-    let Ok(bytes) = std::fs::read(&path) else {
+    let capsule_id = capsule_id.as_ref();
+    // An invalid id can never have been written by an install path (those
+    // validate before writing) and must never build a traversal read path.
+    if !is_valid_capsule_id(capsule_id) {
         return false;
+    }
+    let path = record_path(home, &principal, capsule_id);
+    let bytes = match std::fs::read(&path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return false,
+        Err(e) => {
+            // Fail-secure (unapproved), but a non-NotFound error (permissions,
+            // I/O) is unexpected — surface it so an operator can diagnose why a
+            // capsule loads inert.
+            tracing::warn!(
+                path = %path.display(),
+                error = %e,
+                "failed to read capsule approval record; treating as unapproved"
+            );
+            return false;
+        },
     };
     let Ok(record) = serde_json::from_slice::<ApprovalRecord>(&bytes) else {
         tracing::warn!(
@@ -246,7 +283,14 @@ pub fn remove(
     capsule_id: impl AsRef<str>,
 ) -> std::io::Result<()> {
     let principal = principal.into();
-    let path = record_path(home, &principal, capsule_id.as_ref());
+    let capsule_id = capsule_id.as_ref();
+    if !is_valid_capsule_id(capsule_id) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("invalid capsule id '{capsule_id}': refusing to remove"),
+        ));
+    }
+    let path = record_path(home, &principal, capsule_id);
     match std::fs::remove_file(&path) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -372,7 +416,10 @@ fn grandfather_principal(home: &AstridHome, principal: &PrincipalId) -> usize {
             },
         };
         let fingerprint = capability_fingerprint(&manifest);
-        if let Err(e) = approve(home, principal, &capsule_id, fingerprint) {
+        // Key the approval on the manifest's package name — the exact key the
+        // engine consults at load — not the on-disk directory name, so the two
+        // can never diverge.
+        if let Err(e) = approve(home, principal, &manifest.package.name, fingerprint) {
             tracing::warn!(
                 capsule = %capsule_id,
                 %principal,
@@ -394,6 +441,13 @@ fn grandfather_principal(home: &AstridHome, principal: &PrincipalId) -> usize {
 /// in and forge or escalate another capsule's approval. The security gate calls
 /// this to HARD-DENY any guest read/write that lands in the approvals tree,
 /// regardless of the manifest allowlist — the store is operator-only.
+///
+/// Precondition: `path` must be free of `..` components. The match is lexical
+/// (`Path::starts_with` does not resolve `..`), so a traversal path such as
+/// `…/capsules/../.config/approvals/x` would not be recognised. The sole caller,
+/// `ManifestSecurityGate::check_fs_permission`, rejects any path containing a
+/// `ParentDir` component *before* reaching this check, so the precondition holds
+/// there; a future caller must uphold it (or normalize first).
 #[must_use]
 pub fn path_is_in_approval_store(
     path: impl AsRef<Path>,

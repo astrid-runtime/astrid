@@ -656,12 +656,19 @@ impl Kernel {
         // consults them. Runs ahead of discovery deliberately.
         if let Ok(home) = AstridHome::resolve() {
             let home_for_migration = home.clone();
-            let _ = tokio::task::spawn_blocking(move || {
+            if let Err(e) = tokio::task::spawn_blocking(move || {
                 astrid_capsule::security::approval::migrate_grandfather_approvals(
                     &home_for_migration,
                 );
             })
-            .await;
+            .await
+            {
+                tracing::warn!(
+                    error = %e,
+                    "grandfather approval migration task panicked; pre-existing \
+                     capsules may load inert until approved"
+                );
+            }
         }
 
         // Discovery paths in priority order: principal > workspace.
