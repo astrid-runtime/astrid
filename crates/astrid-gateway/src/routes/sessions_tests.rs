@@ -247,10 +247,10 @@ async fn request_capsule_round_trips_scoped_reply() {
             IpcPayload::RawJson(reply),
             Uuid::nil(),
         );
-        if let AstridEvent::Ipc { message, .. } = &*event {
-            if let Some(principal) = &message.principal {
-                msg = msg.with_principal(principal.clone());
-            }
+        if let AstridEvent::Ipc { message, .. } = &*event
+            && let Some(principal) = &message.principal
+        {
+            msg = msg.with_principal(principal.clone());
         }
         bus_capsule.publish(AstridEvent::Ipc {
             metadata: EventMetadata::new("test::capsule"),
