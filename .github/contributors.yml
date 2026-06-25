@@ -16,4 +16,6 @@ maintainers:
 
 core: []
 
-astrinauts: []
+astrinauts:
+  - username: dependabot[bot]
+    since: 2026-06-25

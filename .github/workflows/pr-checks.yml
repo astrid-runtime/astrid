@@ -20,10 +20,20 @@ jobs:
 
       - name: Validate PR body
         env:
+          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
           PR_BODY: ${{ github.event.pull_request.body }}
           PR_LABELS: ${{ join(github.event.pull_request.labels.*.name, '\n') }}
         run: |
           ERRORS=""
+
+          has_dependency_label() {
+            printf '%s\n' "$PR_LABELS" | grep -qiE '^(deps|dependencies)$'
+          }
+
+          if [ "$PR_AUTHOR" = "dependabot[bot]" ] && has_dependency_label; then
+            echo "Dependabot dependency PR detected; skipping human-authored PR template requirements."
+            exit 0
+          fi
 
           # Check required sections exist and have content beyond the template placeholder
           section_content() {
@@ -332,6 +342,7 @@ jobs:
       - name: Check for linked issue
         env:
           GH_TOKEN: ${{ github.token }}
+          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
           PR_BODY: ${{ github.event.pull_request.body }}
           PR_LABELS: ${{ join(github.event.pull_request.labels.*.name, '\n') }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
@@ -361,6 +372,11 @@ jobs:
           has_traceability_exception_label() {
             printf '%s\n' "$PR_LABELS" | grep -qiE '^(no-issue|maintenance|docs-only|release|deps|dependencies)$'
           }
+
+          if [ "$PR_AUTHOR" = "dependabot[bot]" ] && has_traceability_exception_label; then
+            echo "Dependabot dependency PR detected; using dependency automation traceability exception."
+            exit 0
+          fi
 
           LINKED_ISSUE_SECTION=$(echo "$PR_BODY" | sed -n '/^## Linked Issue/,/^## /p' | sed '1d' | sed '/^## /d' | sed '/^<!--.*-->$/d' | sed '/^\s*$/d')
 
