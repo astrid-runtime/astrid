@@ -20,10 +20,23 @@ jobs:
 
       - name: Validate PR body
         env:
+          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
           PR_BODY: ${{ github.event.pull_request.body }}
           PR_LABELS: ${{ join(github.event.pull_request.labels.*.name, '\n') }}
         run: |
           ERRORS=""
+
+          has_dependency_label() {
+            case "$PR_LABELS" in
+              *deps*|*dependencies*) return 0 ;;
+              *) return 1 ;;
+            esac
+          }
+
+          if [ "$PR_AUTHOR" = "dependabot[bot]" ] && has_dependency_label; then
+            echo "Dependabot dependency PR detected; skipping human-authored PR template requirements."
+            exit 0
+          fi
 
           # Check required sections exist and have content beyond the template placeholder
           section_content() {
@@ -97,7 +110,7 @@ jobs:
           egress-policy: audit
 
       - name: Checkout
-        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
       - name: Check contributor tier and scope
         env:
@@ -124,7 +137,7 @@ jobs:
               core:*) CURRENT_SECTION="core" ;;
               astrinauts:*) CURRENT_SECTION="astrinaut" ;;
             esac
-            if echo "$line" | grep -q "username: $PR_AUTHOR"; then
+            if echo "$line" | grep -Fq "username: $PR_AUTHOR"; then
               TIER="$CURRENT_SECTION"
               break
             fi
@@ -204,7 +217,7 @@ jobs:
           egress-policy: audit
 
       - name: Checkout
-        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           fetch-depth: 0
 
@@ -282,7 +295,7 @@ jobs:
           egress-policy: audit
 
       - name: Checkout
-        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
       - name: Enforce workflow hardening policy
         run: |
@@ -332,6 +345,7 @@ jobs:
       - name: Check for linked issue
         env:
           GH_TOKEN: ${{ github.token }}
+          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
           PR_BODY: ${{ github.event.pull_request.body }}
           PR_LABELS: ${{ join(github.event.pull_request.labels.*.name, '\n') }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
@@ -359,8 +373,16 @@ jobs:
           fi
 
           has_traceability_exception_label() {
-            printf '%s\n' "$PR_LABELS" | grep -qiE '^(no-issue|maintenance|docs-only|release|deps|dependencies)$'
+            case "$PR_LABELS" in
+              *no-issue*|*maintenance*|*docs-only*|*release*|*deps*|*dependencies*) return 0 ;;
+              *) return 1 ;;
+            esac
           }
+
+          if [ "$PR_AUTHOR" = "dependabot[bot]" ] && has_traceability_exception_label; then
+            echo "Dependabot dependency PR detected; using dependency automation traceability exception."
+            exit 0
+          fi
 
           LINKED_ISSUE_SECTION=$(echo "$PR_BODY" | sed -n '/^## Linked Issue/,/^## /p' | sed '1d' | sed '/^## /d' | sed '/^<!--.*-->$/d' | sed '/^\s*$/d')
 
