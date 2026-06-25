@@ -38,5 +38,9 @@ crates/astrid-integration-tests/tests/fixtures/
 .gemini/*
 !.gemini/config.yaml
 !.gemini/styleguide.md
+# Per-developer AI assistant instruction files — never committed
+CLAUDE.md
+GEMINI.md
+AGENTS.md
 .mcp.json
 .docker-target/
