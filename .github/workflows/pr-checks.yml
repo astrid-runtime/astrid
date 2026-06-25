@@ -289,6 +289,7 @@ jobs:
           set -eu
 
           failed=0
+          secret_context="secrets"
 
           if grep -RInE '^[[:space:]]+pull_request_target:' .github/workflows; then
             echo "::error::pull_request_target is not allowed; it can expose privileged tokens to untrusted PR content."
@@ -296,8 +297,8 @@ jobs:
           fi
 
           while IFS= read -r workflow; do
-            if grep -qE '^[[:space:]]+pull_request:' "$workflow" && grep -q '\${{[[:space:]]*secrets\.' "$workflow"; then
-              echo "::error file=$workflow::PR-triggered workflows must not reference repository secrets."
+            if grep -qE '^[[:space:]]+pull_request:' "$workflow" && grep -q "${secret_context}\\." "$workflow"; then
+              echo "::error file=$workflow::PR-triggered workflows must not reference repository secret contexts."
               failed=1
             fi
           done < <(find .github/workflows -type f \( -name '*.yml' -o -name '*.yaml' \) | sort)
