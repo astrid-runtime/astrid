@@ -1,0 +1,257 @@
+# Static capability runtime coverage manifest.
+#
+# crates/astrid-core/src/capability_grammar.rs compares this file to
+# CAPABILITY_CATALOG. Adding a new static capability id must also add a row
+# here with either:
+#
+# - status = "covered": the current runtime harness asserts allow/deny behavior
+# - status = "mapped": assigned to a concrete planned allow/deny scenario
+# - status = "waived": not a meaningful grant gate; waiver explains why
+#
+# Each non-waived row must name both allow and deny expectations. This is not
+# yet the full semantic sweep from #1068, but it prevents new capability ids
+# from landing without an explicit test plan.
+
+[capabilities."system:shutdown"]
+scenario = "system_lifecycle"
+status = "mapped"
+allow = ["admin can request daemon shutdown in a bounded temp home"]
+deny = ["non-admin bearer is rejected before shutdown"]
+
+[capabilities."system:status"]
+scenario = "system_status"
+status = "mapped"
+allow = ["authorized operator can read daemon status"]
+deny = ["unauthenticated caller is rejected"]
+
+[capabilities."capsule:install"]
+scenario = "core_capsule_install"
+status = "covered"
+allow = ["default/admin installs the core capsule set into the temp home"]
+deny = ["regular agent cannot install capsules without grant"]
+
+[capabilities."self:capsule:install"]
+scenario = "self_capsule_workspace"
+status = "mapped"
+allow = ["self-scoped device can install only into its allowed workspace"]
+deny = ["self-scoped device cannot install system-wide capsules"]
+
+[capabilities."capsule:reload"]
+scenario = "capsule_live_load_lifecycle"
+status = "mapped"
+allow = ["authorized operator can reload all capsules"]
+deny = ["regular agent cannot reload all capsules"]
+
+[capabilities."self:capsule:reload"]
+scenario = "capsule_live_load_lifecycle"
+status = "mapped"
+allow = ["self-scoped principal can refresh its allowed capsule surface"]
+deny = ["self-scoped principal cannot reload another principal's surface"]
+
+[capabilities."capsule:remove"]
+scenario = "capsule_live_load_lifecycle"
+status = "mapped"
+allow = ["authorized operator can remove a temp test capsule"]
+deny = ["regular agent cannot remove daemon-wide capsules"]
+
+[capabilities."self:capsule:remove"]
+scenario = "capsule_live_load_lifecycle"
+status = "mapped"
+allow = ["self-scoped principal can remove only its own test capsule"]
+deny = ["self-scoped principal cannot remove a shared capsule"]
+
+[capabilities."capsule:list"]
+scenario = "capsule_metadata"
+status = "mapped"
+allow = ["authorized operator can list installed capsules"]
+deny = ["regular agent without global capsule:list gets only its effective surface"]
+
+[capabilities."self:capsule:list"]
+scenario = "capsule_metadata"
+status = "mapped"
+allow = ["regular agent can list its own effective capsule surface"]
+deny = ["regular agent cannot use self:list to enumerate hidden global metadata"]
+
+[capabilities."agent:create"]
+scenario = "principal_crud"
+status = "mapped"
+allow = ["admin can create a temp principal"]
+deny = ["regular agent cannot create principals"]
+
+[capabilities."agent:delete"]
+scenario = "principal_crud"
+status = "covered"
+allow = ["authorized admin/operator can delete a non-default temp principal"]
+deny = ["operator without agent:delete cannot delete default"]
+
+[capabilities."agent:enable"]
+scenario = "principal_lifecycle"
+status = "mapped"
+allow = ["admin can enable a disabled temp principal"]
+deny = ["regular agent cannot enable another principal"]
+
+[capabilities."agent:disable"]
+scenario = "principal_lifecycle"
+status = "mapped"
+allow = ["admin can disable a temp principal"]
+deny = ["regular agent cannot disable another principal"]
+
+[capabilities."agent:modify"]
+scenario = "principal_crud"
+status = "mapped"
+allow = ["admin can modify a temp principal's groups and capsule grants"]
+deny = ["regular agent cannot modify another principal"]
+
+[capabilities."agent:list"]
+scenario = "principal_visibility"
+status = "mapped"
+allow = ["admin can list all principals"]
+deny = ["regular agent cannot list default or other principals through global visibility"]
+
+[capabilities."self:agent:list"]
+scenario = "principal_visibility"
+status = "covered"
+allow = ["regular agent can see its own principal row"]
+deny = ["regular agent cannot see another principal row using self visibility"]
+
+[capabilities."quota:set"]
+scenario = "quota_scope"
+status = "covered"
+allow = ["admin can set regular-user quota in the temp home"]
+deny = ["regular agent cannot set another principal's quota"]
+
+[capabilities."self:quota:set"]
+scenario = "quota_scope"
+status = "mapped"
+allow = ["self-scoped principal can set only its own quota when granted"]
+deny = ["self-scoped principal cannot set another principal's quota"]
+
+[capabilities."quota:get"]
+scenario = "quota_scope"
+status = "mapped"
+allow = ["authorized operator can read another principal's quota"]
+deny = ["regular agent without global quota:get cannot read another principal's quota"]
+
+[capabilities."self:quota:get"]
+scenario = "quota_scope"
+status = "covered"
+allow = ["regular agent can read its own quota"]
+deny = ["regular agent cannot read operator quota with only self quota read"]
+
+[capabilities."group:create"]
+scenario = "group_crud"
+status = "covered"
+allow = ["admin creates the ops-team group"]
+deny = ["regular agent cannot create groups"]
+
+[capabilities."group:delete"]
+scenario = "group_crud"
+status = "mapped"
+allow = ["admin can delete a temp custom group"]
+deny = ["regular agent cannot delete groups"]
+
+[capabilities."group:modify"]
+scenario = "group_crud"
+status = "mapped"
+allow = ["admin can modify a temp custom group"]
+deny = ["regular agent cannot modify groups"]
+
+[capabilities."group:list"]
+scenario = "group_crud"
+status = "mapped"
+allow = ["admin can list all groups"]
+deny = ["regular agent cannot list groups beyond its self-visible membership"]
+
+[capabilities."self:group:list"]
+scenario = "group_crud"
+status = "mapped"
+allow = ["regular agent can resolve its own group membership"]
+deny = ["regular agent cannot enumerate unrelated custom groups using self visibility"]
+
+[capabilities."caps:grant"]
+scenario = "capability_grants"
+status = "mapped"
+allow = ["admin can grant a temp capability to a temp principal"]
+deny = ["regular agent cannot grant capabilities"]
+
+[capabilities."caps:revoke"]
+scenario = "capability_grants"
+status = "mapped"
+allow = ["admin can revoke a temp capability from a temp principal"]
+deny = ["regular agent cannot revoke capabilities"]
+
+[capabilities."caps:token:mint"]
+scenario = "capability_tokens"
+status = "mapped"
+allow = ["authorized operator can mint a temp capability token"]
+deny = ["regular agent cannot mint capability tokens"]
+
+[capabilities."caps:token:revoke"]
+scenario = "capability_tokens"
+status = "mapped"
+allow = ["authorized operator can revoke a temp capability token"]
+deny = ["regular agent cannot revoke capability tokens"]
+
+[capabilities."caps:token:list"]
+scenario = "capability_tokens"
+status = "mapped"
+allow = ["authorized operator can list temp capability tokens"]
+deny = ["regular agent cannot list another principal's capability tokens"]
+
+[capabilities."invite:issue"]
+scenario = "invite_lifecycle"
+status = "covered"
+allow = ["operator with invite:issue can issue an agent invite"]
+deny = ["regular agent cannot issue invites"]
+
+[capabilities."invite:redeem"]
+scenario = "invite_lifecycle"
+status = "waived"
+waiver = "invite redemption is token-authenticated and intentionally bypasses the static capability check; token reuse denial is covered separately"
+
+[capabilities."invite:list"]
+scenario = "invite_lifecycle"
+status = "mapped"
+allow = ["operator with invite:list can list invite fingerprints"]
+deny = ["regular agent cannot list outstanding invites"]
+
+[capabilities."invite:revoke"]
+scenario = "invite_lifecycle"
+status = "mapped"
+allow = ["authorized operator can revoke a temp invite"]
+deny = ["regular agent cannot revoke invites"]
+
+[capabilities."audit:read_all"]
+scenario = "audit_history"
+status = "mapped"
+allow = ["admin can read cross-principal audit history"]
+deny = ["regular agent sees only own audit entries"]
+
+[capabilities."self:approval:respond"]
+scenario = "approval_flow"
+status = "mapped"
+allow = ["principal can answer its own approval request"]
+deny = ["different principal cannot answer or cancel the request"]
+
+[capabilities."self:auth:pair"]
+scenario = "pair_device_lifecycle"
+status = "covered"
+allow = ["regular agent can issue and redeem a paired-device token for itself"]
+deny = ["operator without self:auth:pair cannot issue a paired-device token"]
+
+[capabilities."self:auth:pair:admin"]
+scenario = "pair_device_lifecycle"
+status = "mapped"
+allow = ["full-scope device can mint an unattenuated pair-device token"]
+deny = ["attenuated device cannot widen itself through pair-device issuance"]
+
+[capabilities."auth:pair:redeem"]
+scenario = "pair_device_lifecycle"
+status = "waived"
+waiver = "pair-device redemption is token-authenticated and intentionally bypasses the static capability check; token reuse and device scope are covered separately"
+
+[capabilities."auth:pair"]
+scenario = "pair_device_lifecycle"
+status = "mapped"
+allow = ["admin can list and revoke another principal's paired devices"]
+deny = ["regular agent cannot list another principal's devices"]

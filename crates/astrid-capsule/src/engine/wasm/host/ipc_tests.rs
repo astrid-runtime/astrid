@@ -64,7 +64,7 @@ fn publish_audit(bus: &astrid_events::EventBus, principal: &str) {
 
 /// Drain the subscription's delivered messages and collect the
 /// `Verified` principal strings.
-fn drained_principals(state: &mut HostState, sub: &Resource<Subscription>) -> Vec<String> {
+fn polled_principals_once(state: &mut HostState, sub: &Resource<Subscription>) -> Vec<String> {
     let envelope = HostSubscription::poll(state, Resource::new_borrow(sub.rep()))
         .expect("poll should succeed");
     envelope
@@ -75,6 +75,18 @@ fn drained_principals(state: &mut HostState, sub: &Resource<Subscription>) -> Ve
             PrincipalAttribution::System => "<system>".to_string(),
         })
         .collect()
+}
+
+fn drained_principals(state: &mut HostState, sub: &Resource<Subscription>) -> Vec<String> {
+    let mut principals = Vec::new();
+    loop {
+        let next = polled_principals_once(state, sub);
+        if next.is_empty() {
+            break;
+        }
+        principals.extend(next);
+    }
+    principals
 }
 
 fn host_state_for(
@@ -188,6 +200,49 @@ async fn subscribe_non_audit_topic_unaffected() {
     assert_eq!(got.len(), 2, "non-audit fan-in delivers all principals");
     assert!(got.iter().any(|p| p == "alice"));
     assert!(got.iter().any(|p| p == "bob"));
+}
+
+#[tokio::test]
+async fn subscription_poll_returns_single_principal_envelope() {
+    // HostState installs one invocation context per returned envelope. If a
+    // single poll batches messages from different principals, the later
+    // message executes under the first message's KV/env/secret/publish context.
+    let rt = tokio::runtime::Handle::current();
+    let mut state = host_state_for(rt, "alice", false, &["astrid.v1.session.*"]);
+    let bus = state.event_bus.clone();
+
+    let sub = IpcHost::subscribe(&mut state, "astrid.v1.session.*".to_string())
+        .expect("subscribe should be allowed by the ACL");
+
+    for who in ["alice", "bob"] {
+        let msg = InternalIpcMessage::new(
+            Topic::from_raw("astrid.v1.session.update"),
+            IpcPayload::RawJson(serde_json::json!({})),
+            uuid::Uuid::nil(),
+        )
+        .with_principal(who.to_string());
+        bus.publish(AstridEvent::Ipc {
+            metadata: EventMetadata::new("test"),
+            message: msg,
+        });
+    }
+
+    let first = polled_principals_once(&mut state, &sub);
+    assert_eq!(
+        first.len(),
+        1,
+        "one poll envelope must not mix principal contexts"
+    );
+    let second = polled_principals_once(&mut state, &sub);
+    assert_eq!(
+        second.len(),
+        1,
+        "the next principal remains available through a subsequent poll"
+    );
+    assert_ne!(
+        first[0], second[0],
+        "the test setup should exercise cross-principal fan-in"
+    );
 }
 
 #[tokio::test]

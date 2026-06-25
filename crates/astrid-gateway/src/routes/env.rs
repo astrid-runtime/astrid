@@ -272,11 +272,7 @@ fn load_env_schema(capsule_id: &str) -> GatewayResult<HashMap<String, EnvFieldSc
         // can declare extra keys, and we don't want to fail the
         // whole load on one weird field).
         let Some(tbl) = val.as_table() else { continue };
-        let env_type = tbl
-            .get("env_type")
-            .and_then(toml::Value::as_str)
-            .unwrap_or("text")
-            .to_string();
+        let env_type = env_type_from_manifest_table(tbl);
         fields.insert(
             name,
             EnvFieldSchema {
@@ -309,6 +305,21 @@ fn load_env_schema(capsule_id: &str) -> GatewayResult<HashMap<String, EnvFieldSc
         );
     }
     Ok(fields)
+}
+
+fn env_type_from_manifest_table(tbl: &toml::map::Map<String, toml::Value>) -> String {
+    let raw = tbl
+        .get("env_type")
+        .or_else(|| tbl.get("type"))
+        .and_then(toml::Value::as_str)
+        .unwrap_or("text")
+        .to_ascii_lowercase();
+
+    match raw.as_str() {
+        "secret" | "select" | "array" => raw,
+        "text" | "string" | "integer" | "number" | "boolean" => "text".to_string(),
+        other => other.to_string(),
+    }
 }
 
 /// Validate a capsule id or env field name. Same shape as principal
@@ -455,5 +466,32 @@ mod tests {
         assert_eq!(a, b);
         assert_ne!(a, c);
         assert_eq!(a.len(), 64);
+    }
+
+    #[test]
+    fn env_type_reads_manifest_type_and_preserves_secret() {
+        let parsed: toml::Value = toml::from_str(
+            r#"
+            [env]
+            api_key = { type = "secret" }
+            model = { type = "select" }
+            context_window = { type = "integer" }
+            legacy = { env_type = "array" }
+            "#,
+        )
+        .unwrap();
+        let env = parsed.get("env").and_then(toml::Value::as_table).unwrap();
+
+        let field_type = |name: &str| {
+            env.get(name)
+                .and_then(toml::Value::as_table)
+                .map(env_type_from_manifest_table)
+                .unwrap()
+        };
+
+        assert_eq!(field_type("api_key"), "secret");
+        assert_eq!(field_type("model"), "select");
+        assert_eq!(field_type("context_window"), "text");
+        assert_eq!(field_type("legacy"), "array");
     }
 }

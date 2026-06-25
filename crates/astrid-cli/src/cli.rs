@@ -552,6 +552,7 @@ pub(crate) enum DistroCommands {
 mod tests {
     use super::{CapsuleCommands, Cli, Commands};
     use clap::{CommandFactory, Parser, Subcommand};
+    use std::collections::BTreeSet;
 
     /// Every built-in `astrid capsule` subcommand name must appear in
     /// [`astrid_core::kernel_api::RESERVED_CAPSULE_VERBS`]. The reserved
@@ -643,5 +644,96 @@ mod tests {
             !names.iter().any(String::is_empty),
             "harvested built-in names must not include the empty External placeholder"
         );
+    }
+
+    #[test]
+    fn e2e_manifest_covers_every_visible_builtin_leaf_command() {
+        let command = Cli::command();
+        let actual = visible_leaf_commands(&command);
+        let manifest = parse_manifest_commands(include_str!("../../../e2e/cli-scenarios.toml"));
+
+        let missing: Vec<&String> = actual.difference(&manifest).collect();
+        assert!(
+            missing.is_empty(),
+            "new built-in CLI command has no e2e scenario: {}",
+            missing
+                .iter()
+                .map(|s| s.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+
+        let stale: Vec<&String> = manifest.difference(&actual).collect();
+        assert!(
+            stale.is_empty(),
+            "CLI e2e manifest references commands that are no longer built in: {}",
+            stale
+                .iter()
+                .map(|s| s.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+
+    fn visible_leaf_commands(command: &clap::Command) -> BTreeSet<String> {
+        let mut leaves = BTreeSet::new();
+        collect_visible_leaves(&mut leaves, &[], command);
+        leaves
+    }
+
+    fn collect_visible_leaves(
+        leaves: &mut BTreeSet<String>,
+        prefix: &[String],
+        command: &clap::Command,
+    ) {
+        let visible_children: Vec<&clap::Command> = command
+            .get_subcommands()
+            .filter(|child| !child.get_name().is_empty() && !child.is_hide_set())
+            .collect();
+
+        if visible_children.is_empty() {
+            if !prefix.is_empty() {
+                leaves.insert(prefix.join(" "));
+            }
+            return;
+        }
+
+        for child in visible_children {
+            let mut next = prefix.to_owned();
+            next.push(child.get_name().to_string());
+            collect_visible_leaves(leaves, &next, child);
+        }
+    }
+
+    fn parse_manifest_commands(src: &str) -> BTreeSet<String> {
+        let parsed: toml::Value = toml::from_str(src).expect("cli-scenarios.toml parses");
+        let commands = parsed
+            .get("commands")
+            .and_then(toml::Value::as_table)
+            .expect("cli-scenarios.toml must contain a [commands] table");
+
+        commands
+            .iter()
+            .map(|(name, entry)| {
+                let table = entry
+                    .as_table()
+                    .unwrap_or_else(|| panic!("manifest entry for {name:?} must be a table"));
+                for field in ["scenario", "status", "mode", "principal"] {
+                    assert!(
+                        table.contains_key(field),
+                        "manifest entry for {name:?} is missing required field {field:?}"
+                    );
+                }
+                let status = table
+                    .get("status")
+                    .and_then(toml::Value::as_str)
+                    .unwrap_or_else(|| panic!("manifest entry for {name:?} has non-string status"));
+                assert!(
+                    matches!(status, "mapped" | "covered" | "waived" | "future"),
+                    "manifest entry for {name:?} has invalid status {status:?}"
+                );
+                name.clone()
+            })
+            .collect()
     }
 }

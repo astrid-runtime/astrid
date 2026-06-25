@@ -1,0 +1,601 @@
+# Built-in CLI runtime coverage manifest.
+#
+# The drift gate in crates/astrid-cli/src/cli.rs compares this file to the
+# Clap leaf-command inventory. Add a row when adding a built-in command. Dynamic
+# capsule verbs are covered separately by first-party-capsule-scenarios.toml.
+#
+# status = "mapped" means the command is assigned to a planned scenario family.
+# status = "covered" means the current runtime harness executes an assertion for
+# that command path. This file is not yet the full semantic sweep from #1068.
+
+[commands."chat"]
+scenario = "prompt_fake_openai_compat"
+status = "mapped"
+mode = "interactive"
+principal = "agent"
+
+[commands."run"]
+scenario = "prompt_fake_openai_compat"
+status = "covered"
+mode = "prompt"
+principal = "agent"
+
+[commands."agent create"]
+scenario = "principal_crud"
+status = "mapped"
+mode = "mutating"
+principal = "admin"
+
+[commands."agent list"]
+scenario = "principal_visibility"
+status = "mapped"
+mode = "read"
+principal = "admin_and_agent"
+
+[commands."agent current"]
+scenario = "active_context"
+status = "mapped"
+mode = "read"
+principal = "local_cli"
+
+[commands."agent switch"]
+scenario = "active_context"
+status = "mapped"
+mode = "mutating"
+principal = "local_cli"
+
+[commands."agent show"]
+scenario = "principal_crud"
+status = "mapped"
+mode = "read"
+principal = "admin_and_agent"
+
+[commands."agent delete"]
+scenario = "principal_crud"
+status = "mapped"
+mode = "mutating"
+principal = "admin"
+
+[commands."agent enable"]
+scenario = "principal_lifecycle"
+status = "mapped"
+mode = "mutating"
+principal = "admin"
+
+[commands."agent disable"]
+scenario = "principal_lifecycle"
+status = "mapped"
+mode = "mutating"
+principal = "admin"
+
+[commands."agent modify"]
+scenario = "principal_crud"
+status = "covered"
+mode = "mutating"
+principal = "admin"
+
+[commands."agent link"]
+scenario = "platform_identity_binding"
+status = "waived"
+mode = "deferred"
+principal = "admin"
+reason = "Parsed surface is present, but platform identity providers are not live in the runtime harness yet."
+
+[commands."agent unlink"]
+scenario = "platform_identity_binding"
+status = "waived"
+mode = "deferred"
+principal = "admin"
+reason = "Parsed surface is present, but platform identity providers are not live in the runtime harness yet."
+
+[commands."agent discover"]
+scenario = "remote_agent_stub"
+status = "mapped"
+mode = "deferred"
+principal = "admin"
+
+[commands."agent add"]
+scenario = "remote_agent_stub"
+status = "mapped"
+mode = "deferred"
+principal = "admin"
+
+[commands."agent card"]
+scenario = "remote_agent_stub"
+status = "mapped"
+mode = "deferred"
+principal = "admin"
+
+[commands."agent export"]
+scenario = "remote_agent_stub"
+status = "mapped"
+mode = "deferred"
+principal = "admin"
+
+[commands."agent import"]
+scenario = "remote_agent_stub"
+status = "mapped"
+mode = "deferred"
+principal = "admin"
+
+[commands."agent delegate"]
+scenario = "delegation_stub"
+status = "mapped"
+mode = "deferred"
+principal = "admin"
+
+[commands."group create"]
+scenario = "group_crud"
+status = "covered"
+mode = "mutating"
+principal = "admin"
+
+[commands."group show"]
+scenario = "group_crud"
+status = "mapped"
+mode = "read"
+principal = "admin"
+
+[commands."group list"]
+scenario = "group_crud"
+status = "mapped"
+mode = "read"
+principal = "admin_and_agent"
+
+[commands."group delete"]
+scenario = "group_crud"
+status = "mapped"
+mode = "mutating"
+principal = "admin"
+
+[commands."group modify"]
+scenario = "group_crud"
+status = "mapped"
+mode = "mutating"
+principal = "admin"
+
+[commands."caps show"]
+scenario = "capability_grants"
+status = "mapped"
+mode = "read"
+principal = "admin_and_agent"
+
+[commands."caps grant"]
+scenario = "capability_grants"
+status = "mapped"
+mode = "mutating"
+principal = "admin"
+
+[commands."caps revoke"]
+scenario = "capability_grants"
+status = "mapped"
+mode = "mutating"
+principal = "admin"
+
+[commands."caps check"]
+scenario = "capability_grants"
+status = "mapped"
+mode = "read"
+principal = "admin_and_agent"
+
+[commands."caps token mint"]
+scenario = "capability_token_stub"
+status = "waived"
+mode = "deferred"
+principal = "admin"
+reason = "Token lifecycle is parsed but kernel token issuance is not live yet."
+
+[commands."caps token revoke"]
+scenario = "capability_token_stub"
+status = "waived"
+mode = "deferred"
+principal = "admin"
+reason = "Token lifecycle is parsed but kernel token revocation is not live yet."
+
+[commands."caps token list"]
+scenario = "capability_token_stub"
+status = "waived"
+mode = "deferred"
+principal = "admin"
+reason = "Token lifecycle is parsed but kernel token listing is not live yet."
+
+[commands."quota show"]
+scenario = "quota_scope"
+status = "mapped"
+mode = "read"
+principal = "admin_and_agent"
+
+[commands."quota set"]
+scenario = "quota_scope"
+status = "covered"
+mode = "mutating"
+principal = "admin"
+
+[commands."invite issue"]
+scenario = "invite_lifecycle"
+status = "covered"
+mode = "mutating"
+principal = "admin_and_ops"
+
+[commands."invite redeem"]
+scenario = "invite_lifecycle"
+status = "mapped"
+mode = "mutating"
+principal = "new_principal"
+
+[commands."invite list"]
+scenario = "invite_lifecycle"
+status = "mapped"
+mode = "read"
+principal = "admin_and_ops"
+
+[commands."invite revoke"]
+scenario = "invite_lifecycle"
+status = "mapped"
+mode = "mutating"
+principal = "admin"
+
+[commands."keypair generate"]
+scenario = "keypair_lifecycle"
+status = "mapped"
+mode = "mutating"
+principal = "local_cli"
+
+[commands."keypair list"]
+scenario = "keypair_lifecycle"
+status = "mapped"
+mode = "read"
+principal = "local_cli"
+
+[commands."keypair show"]
+scenario = "keypair_lifecycle"
+status = "mapped"
+mode = "read"
+principal = "local_cli"
+
+[commands."keypair pubkey"]
+scenario = "keypair_lifecycle"
+status = "mapped"
+mode = "read"
+principal = "local_cli"
+
+[commands."keypair delete"]
+scenario = "keypair_lifecycle"
+status = "mapped"
+mode = "mutating"
+principal = "local_cli"
+
+[commands."pair-device issue"]
+scenario = "pair_device_lifecycle"
+status = "mapped"
+mode = "mutating"
+principal = "agent"
+
+[commands."pair-device list"]
+scenario = "pair_device_lifecycle"
+status = "mapped"
+mode = "read"
+principal = "agent_and_admin"
+
+[commands."pair-device revoke"]
+scenario = "pair_device_lifecycle"
+status = "mapped"
+mode = "mutating"
+principal = "agent_and_admin"
+
+[commands."secret set"]
+scenario = "secret_redaction"
+status = "covered"
+mode = "mutating"
+principal = "agent"
+
+[commands."secret list"]
+scenario = "secret_redaction"
+status = "mapped"
+mode = "read"
+principal = "agent"
+
+[commands."secret delete"]
+scenario = "secret_redaction"
+status = "mapped"
+mode = "mutating"
+principal = "agent"
+
+[commands."voucher create"]
+scenario = "voucher_stub"
+status = "mapped"
+mode = "deferred"
+principal = "admin"
+
+[commands."voucher list"]
+scenario = "voucher_stub"
+status = "mapped"
+mode = "deferred"
+principal = "admin"
+
+[commands."voucher show"]
+scenario = "voucher_stub"
+status = "mapped"
+mode = "deferred"
+principal = "admin"
+
+[commands."voucher revoke"]
+scenario = "voucher_stub"
+status = "mapped"
+mode = "deferred"
+principal = "admin"
+
+[commands."voucher history"]
+scenario = "voucher_stub"
+status = "mapped"
+mode = "deferred"
+principal = "admin"
+
+[commands."trust add"]
+scenario = "trust_stub"
+status = "mapped"
+mode = "deferred"
+principal = "admin"
+
+[commands."trust list"]
+scenario = "trust_stub"
+status = "mapped"
+mode = "deferred"
+principal = "admin"
+
+[commands."trust remove"]
+scenario = "trust_stub"
+status = "mapped"
+mode = "deferred"
+principal = "admin"
+
+[commands."audit"]
+scenario = "audit_history"
+status = "mapped"
+mode = "read"
+principal = "admin"
+
+[commands."budget show"]
+scenario = "budget_core_transitional"
+status = "mapped"
+mode = "deferred"
+principal = "admin"
+
+[commands."budget set"]
+scenario = "budget_core_transitional"
+status = "mapped"
+mode = "deferred"
+principal = "admin"
+
+[commands."budget transfer"]
+scenario = "budget_core_transitional"
+status = "mapped"
+mode = "deferred"
+principal = "admin"
+
+[commands."budget history"]
+scenario = "budget_core_transitional"
+status = "mapped"
+mode = "deferred"
+principal = "admin"
+
+[commands."session list"]
+scenario = "session_lifecycle"
+status = "mapped"
+mode = "read"
+principal = "agent"
+
+[commands."session delete"]
+scenario = "session_lifecycle"
+status = "mapped"
+mode = "mutating"
+principal = "agent"
+
+[commands."session show"]
+scenario = "session_lifecycle"
+status = "mapped"
+mode = "read"
+principal = "agent"
+
+[commands."capsule new"]
+scenario = "capsule_authoring_smoke"
+status = "mapped"
+mode = "filesystem"
+principal = "local_cli"
+
+[commands."capsule install"]
+scenario = "capsule_installability"
+status = "covered"
+mode = "mutating"
+principal = "admin"
+
+[commands."capsule update"]
+scenario = "capsule_live_load_lifecycle"
+status = "mapped"
+mode = "mutating"
+principal = "admin"
+
+[commands."capsule list"]
+scenario = "capsule_live_load_lifecycle"
+status = "mapped"
+mode = "read"
+principal = "admin_and_agent"
+
+[commands."capsule remove"]
+scenario = "capsule_live_load_lifecycle"
+status = "mapped"
+mode = "mutating"
+principal = "admin"
+
+[commands."capsule tree"]
+scenario = "capsule_metadata"
+status = "mapped"
+mode = "read"
+principal = "admin"
+
+[commands."capsule build"]
+scenario = "capsule_installability"
+status = "mapped"
+mode = "filesystem"
+principal = "local_cli"
+
+[commands."capsule config"]
+scenario = "capsule_env_config"
+status = "covered"
+mode = "mutating"
+principal = "agent"
+
+[commands."capsule show"]
+scenario = "capsule_metadata"
+status = "mapped"
+mode = "read"
+principal = "admin_and_agent"
+
+[commands."capsule run"]
+scenario = "first_party_capsule_commands"
+status = "covered"
+mode = "capsule_dynamic"
+principal = "agent"
+
+[commands."mcp serve"]
+scenario = "mcp_bounded_smoke"
+status = "mapped"
+mode = "long_running"
+principal = "agent"
+
+[commands."distro apply"]
+scenario = "distro_lifecycle"
+status = "waived"
+mode = "network_or_local"
+principal = "admin"
+reason = "Full hosted distro apply may fetch network content; CI covers offline/local validation and installable capsule paths."
+
+[commands."distro show"]
+scenario = "distro_lifecycle"
+status = "mapped"
+mode = "read"
+principal = "admin"
+
+[commands."distro update"]
+scenario = "distro_lifecycle"
+status = "waived"
+mode = "network"
+principal = "admin"
+reason = "Remote distro update requires network release state; CI covers local lock/seal mechanics."
+
+[commands."distro seal"]
+scenario = "distro_lifecycle"
+status = "mapped"
+mode = "filesystem"
+principal = "local_cli"
+
+[commands."init"]
+scenario = "distro_onboarding"
+status = "mapped"
+mode = "filesystem"
+principal = "local_cli"
+
+[commands."config show"]
+scenario = "config_surface"
+status = "mapped"
+mode = "read"
+principal = "local_cli"
+
+[commands."config edit"]
+scenario = "config_surface"
+status = "waived"
+mode = "interactive_editor"
+principal = "local_cli"
+reason = "EDITOR launch is host-mutating and not deterministic in headless CI; path/show cover config resolution."
+
+[commands."config path"]
+scenario = "config_surface"
+status = "mapped"
+mode = "read"
+principal = "local_cli"
+
+[commands."gc"]
+scenario = "content_store_gc"
+status = "mapped"
+mode = "filesystem"
+principal = "local_cli"
+
+[commands."start"]
+scenario = "daemon_lifecycle"
+status = "mapped"
+mode = "process"
+principal = "local_cli"
+
+[commands."status"]
+scenario = "daemon_lifecycle"
+status = "mapped"
+mode = "read"
+principal = "local_cli"
+
+[commands."stop"]
+scenario = "daemon_lifecycle"
+status = "mapped"
+mode = "process"
+principal = "local_cli"
+
+[commands."restart"]
+scenario = "daemon_lifecycle"
+status = "mapped"
+mode = "process"
+principal = "local_cli"
+
+[commands."logs"]
+scenario = "observability_logs"
+status = "mapped"
+mode = "read"
+principal = "local_cli"
+
+[commands."ps"]
+scenario = "observability_runtime"
+status = "mapped"
+mode = "read"
+principal = "local_cli"
+
+[commands."top"]
+scenario = "observability_runtime"
+status = "mapped"
+mode = "read"
+principal = "local_cli"
+
+[commands."who"]
+scenario = "observability_runtime"
+status = "mapped"
+mode = "read"
+principal = "local_cli"
+
+[commands."doctor"]
+scenario = "health_check"
+status = "mapped"
+mode = "read"
+principal = "local_cli"
+
+[commands."setup"]
+scenario = "host_setup_dry_run"
+status = "waived"
+mode = "host_mutating"
+principal = "local_cli"
+reason = "The apply path changes host OS settings; CI may only assert dry-run/help behavior."
+
+[commands."version"]
+scenario = "version_surface"
+status = "mapped"
+mode = "read"
+principal = "local_cli"
+
+[commands."completions"]
+scenario = "shell_completion_generation"
+status = "mapped"
+mode = "read"
+principal = "local_cli"
+
+[commands."update"]
+scenario = "self_update_check"
+status = "waived"
+mode = "network"
+principal = "local_cli"
+reason = "Install path mutates the runner and depends on GitHub release state; CI covers check/dry-run shape only."

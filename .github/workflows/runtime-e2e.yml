@@ -1,0 +1,128 @@
+name: Runtime E2E
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/runtime-e2e.yml'
+      - 'crates/astrid-cli/**'
+      - 'crates/astrid-daemon/**'
+      - 'crates/astrid-gateway/**'
+      - 'crates/astrid-kernel/**'
+      - 'crates/astrid-capsule*/**'
+      - 'crates/astrid-build/**'
+      - 'e2e/**'
+      - 'scripts/e2e/**'
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/runtime-e2e.yml'
+      - 'crates/astrid-cli/**'
+      - 'crates/astrid-daemon/**'
+      - 'crates/astrid-gateway/**'
+      - 'crates/astrid-kernel/**'
+      - 'crates/astrid-capsule*/**'
+      - 'crates/astrid-build/**'
+      - 'e2e/**'
+      - 'scripts/e2e/**'
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  CARGO_PROFILE_DEV_DEBUG: "0"
+  CARGO_PROFILE_TEST_DEBUG: "0"
+
+jobs:
+  runtime-e2e:
+    name: Runtime CLI + HTTP sweep
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout core
+        uses: actions/checkout@v5
+
+      - name: Checkout capsule-cli
+        uses: actions/checkout@v5
+        with:
+          repository: unicity-astrid/capsule-cli
+          path: capsules/astrid-capsule-cli
+
+      - name: Checkout capsule-registry
+        uses: actions/checkout@v5
+        with:
+          repository: unicity-astrid/capsule-registry
+          path: capsules/astrid-capsule-registry
+
+      - name: Checkout capsule-session
+        uses: actions/checkout@v5
+        with:
+          repository: unicity-astrid/capsule-session
+          path: capsules/astrid-capsule-session
+
+      - name: Checkout capsule-identity
+        uses: actions/checkout@v5
+        with:
+          repository: unicity-astrid/capsule-identity
+          path: capsules/astrid-capsule-identity
+
+      - name: Checkout capsule-prompt-builder
+        uses: actions/checkout@v5
+        with:
+          repository: unicity-astrid/capsule-prompt-builder
+          path: capsules/astrid-capsule-prompt-builder
+
+      - name: Checkout capsule-react
+        uses: actions/checkout@v5
+        with:
+          repository: unicity-astrid/capsule-react
+          path: capsules/astrid-capsule-react
+
+      - name: Checkout capsule-openai-compat
+        uses: actions/checkout@v5
+        with:
+          repository: unicity-astrid/capsule-openai-compat
+          path: capsules/astrid-capsule-openai-compat
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.95"
+          targets: wasm32-unknown-unknown
+
+      - name: Cache cargo registry
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+            capsules/*/target
+          key: ${{ runner.os }}-runtime-e2e-${{ hashFiles('**/Cargo.lock', 'capsules/**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-runtime-e2e-
+            ${{ runner.os }}-cargo-
+
+      - name: Stage capsule checkouts outside core workspace
+        run: |
+          rm -rf "$RUNNER_TEMP/astrid-runtime-capsules"
+          mkdir -p "$RUNNER_TEMP/astrid-runtime-capsules"
+          cp -a capsules/. "$RUNNER_TEMP/astrid-runtime-capsules/"
+
+      - name: Check CLI inventory coverage
+        run: cargo test -p astrid e2e_manifest_covers_every_visible_builtin_leaf_command
+
+      - name: Check HTTP route coverage
+        run: cargo test -p astrid-gateway openapi_lists_every_router_route
+
+      - name: Run real runtime harness
+        env:
+          ASTRID_E2E_CAPSULES_DIR: ${{ runner.temp }}/astrid-runtime-capsules
+        run: scripts/e2e/runtime-harness.sh
+
+      - name: Upload runtime artifacts
+        if: failure()
+        uses: actions/upload-artifact@v6
+        with:
+          name: runtime-e2e-artifacts
+          path: /tmp/astrid-runtime-e2e.*/artifacts
+          if-no-files-found: ignore

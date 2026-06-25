@@ -39,6 +39,18 @@ impl std::fmt::Debug for RoutedEventReceiver {
 }
 
 impl RoutedEventReceiver {
+    /// Non-blocking receive of one event from the next DRR round.
+    ///
+    /// This is the host-boundary counterpart to [`recv`](Self::recv): WASM
+    /// subscription envelopes install one principal context for the whole
+    /// envelope, so the host must hand back at most one routed IPC event at a
+    /// time. Bulk diagnostic drains remain available through
+    /// [`try_drain`](Self::try_drain).
+    pub fn try_recv_one(&mut self) -> Option<Arc<AstridEvent>> {
+        let mut entry = self.route_entry.lock();
+        entry.drr_pop_one()
+    }
+
     /// Receive one event, optionally bounded by `timeout`. Returns the
     /// first event from the next DRR round.
     pub async fn recv(&mut self, timeout: Option<std::time::Duration>) -> Option<Arc<AstridEvent>> {

@@ -6,6 +6,7 @@ mod tests {
     use crate::manifest::{CapabilitiesDef, CapsuleManifest, McpServerDef, PackageDef};
     use std::collections::HashMap;
     use std::fs;
+    use std::path::Path;
     use tempfile::tempdir;
 
     use astrid_mcp::testing::test_secure_mcp_client;
@@ -63,6 +64,18 @@ mod tests {
             subscribes: ::std::collections::HashMap::new(),
             tools: ::std::vec::Vec::new(),
         }
+    }
+
+    #[cfg(unix)]
+    fn write_exiting_test_binary(path: &Path) {
+        let src = ["/usr/bin/false", "/bin/false"]
+            .into_iter()
+            .find(|candidate| Path::new(candidate).is_file())
+            .expect("test host has false binary");
+        fs::copy(src, path).expect("copy false binary");
+
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
     }
 
     #[tokio::test]
@@ -132,13 +145,8 @@ mod tests {
         // 2. Create the exact architectural slice for this machine
         let host_triple = env!("TARGET");
         let arch_slice = bin_dir.join(host_triple);
-        fs::write(&arch_slice, "#!/bin/sh\necho 'hello'").unwrap();
-
         #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&arch_slice, fs::Permissions::from_mode(0o755)).unwrap();
-        }
+        write_exiting_test_binary(&arch_slice);
 
         // The user granted capability for "bin/my-tool"
         let manifest = dummy_manifest("bin/my-tool", vec!["bin/my-tool"]);
@@ -179,6 +187,7 @@ mod tests {
         };
 
         let result = engine.load(&ctx).await;
+        let _ = engine.unload().await;
 
         // It should attempt the connection and fail at the handshake step (meaning it successfully found and spawned the fat binary slice)
         assert!(result.is_err(), "Test failed: {:?}", result.err());

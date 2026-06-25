@@ -139,6 +139,14 @@ enum SetActiveOutcome {
     Malformed,
 }
 
+fn registry_reply_payload_json(payload: &IpcPayload) -> GatewayResult<serde_json::Value> {
+    let bytes = payload
+        .to_guest_bytes()
+        .map_err(|e| GatewayError::Internal(anyhow::anyhow!("registry reply not JSON: {e}")))?;
+    serde_json::from_slice(&bytes)
+        .map_err(|e| GatewayError::Internal(anyhow::anyhow!("registry reply not JSON: {e}")))
+}
+
 /// Classify a `set_active_model` registry reply into the response the handler
 /// returns.
 ///
@@ -262,15 +270,11 @@ async fn registry_round_trip(
                 "registry reply was not an IPC message"
             )));
         };
-        // Extract the reply payload exactly as agent.rs does: a `RawJson`
-        // body is the bare inner value; any other payload shape is serialized
-        // structurally.
-        let value = match &message.payload {
-            IpcPayload::RawJson(v) => v.clone(),
-            other => serde_json::to_value(other).map_err(|e| {
-                GatewayError::Internal(anyhow::anyhow!("registry reply not JSON: {e}"))
-            })?,
-        };
+        // Extract the guest-facing payload. Capsule `publish_json` arrives as
+        // `Custom { data }` when the JSON has no known IPC `type`; using the
+        // guest bytes unwraps that data instead of exposing the internal tagged
+        // wrapper to the HTTP API.
+        let value = registry_reply_payload_json(&message.payload)?;
         // Skip a reply that belongs to a different concurrent same-principal
         // SET (foreign `corr_id`); keep waiting within the remaining budget.
         if reply_satisfies_corr_id(&value, corr_id) {
@@ -411,7 +415,11 @@ pub async fn set_active_model(
 
 #[cfg(test)]
 mod tests {
-    use super::{SetActiveOutcome, classify_set_active_reply, reply_satisfies_corr_id};
+    use super::{
+        SetActiveOutcome, classify_set_active_reply, registry_reply_payload_json,
+        reply_satisfies_corr_id,
+    };
+    use astrid_events::ipc::IpcPayload;
     use serde_json::json;
 
     #[test]
@@ -457,6 +465,31 @@ mod tests {
         assert!(matches!(
             classify_set_active_reply(&json!({ "status": "ok" })),
             SetActiveOutcome::Malformed
+        ));
+    }
+
+    #[test]
+    fn registry_reply_payload_unwraps_custom_guest_json() {
+        let payload = IpcPayload::Custom {
+            data: json!({
+                "status": "ok",
+                "active_model": { "id": "openai-compat:fake-slow" },
+                "corr_id": "abc",
+            }),
+        };
+
+        let decoded = registry_reply_payload_json(&payload).expect("custom payload decodes");
+        assert_eq!(
+            decoded,
+            json!({
+                "status": "ok",
+                "active_model": { "id": "openai-compat:fake-slow" },
+                "corr_id": "abc",
+            })
+        );
+        assert!(matches!(
+            classify_set_active_reply(&decoded),
+            SetActiveOutcome::Bound(_)
         ));
     }
 
