@@ -9,16 +9,24 @@ on:
       - "**/Cargo.toml"
       - "Cargo.lock"
 
+permissions:
+  contents: read
+
 jobs:
   check:
     name: Changelog updated
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - name: Harden Runner
+        uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
           fetch-depth: 0
 
-      - uses: dangoslen/changelog-enforcer@v3
+      - uses: dangoslen/changelog-enforcer@204e7d3ef26579f4cd0fd759c57032656fdf23c7 # v3
         with:
           changeLogPath: CHANGELOG.md
           skipLabels: "skip-changelog"

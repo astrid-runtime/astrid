@@ -3,16 +3,25 @@ name: PR Checks
 on:
   pull_request:
     branches: [main]
-    types: [opened, edited, reopened, labeled, synchronize]
+    types: [opened, edited, reopened, labeled, unlabeled, synchronize]
+
+permissions:
+  contents: read
 
 jobs:
   template:
     name: PR template filled in
     runs-on: ubuntu-latest
     steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
+        with:
+          egress-policy: audit
+
       - name: Validate PR body
         env:
           PR_BODY: ${{ github.event.pull_request.body }}
+          PR_LABELS: ${{ join(github.event.pull_request.labels.*.name, '\n') }}
         run: |
           ERRORS=""
 
@@ -46,9 +55,22 @@ jobs:
           check_section "Changes"
           check_section_any "Verification" "Test Plan"
 
-          # Check that Linked Issue has an actual issue number, not just the placeholder
+          has_traceability_exception_label() {
+            printf '%s\n' "$PR_LABELS" | grep -qiE '^(no-issue|maintenance|docs-only|release|deps|dependencies)$'
+          }
+
+          LINKED_ISSUE_SECTION="$(section_content "Linked Issue")"
+
+          # Check that Linked Issue has an actual issue number, unless a narrowly
+          # labeled exception explains why no issue exists.
           if ! echo "$PR_BODY" | grep -qE '#[0-9]+'; then
-            ERRORS="${ERRORS}Linked Issue must reference an issue number (#N)\n"
+            if has_traceability_exception_label; then
+              if ! printf '%s\n' "$LINKED_ISSUE_SECTION" | grep -qiE '(no issue|no tracked issue|not linked|maintenance|docs|release|dependenc|traceability)'; then
+                ERRORS="${ERRORS}Linked Issue must explain the no-issue exception when using no-issue, maintenance, docs-only, release, deps, or dependencies labels\n"
+              fi
+            else
+              ERRORS="${ERRORS}Linked Issue must reference an issue number (#N) or use a documented traceability exception label\n"
+            fi
           fi
 
           if [ -n "$ERRORS" ]; then
@@ -64,9 +86,18 @@ jobs:
   contributor-gate:
     name: Contributor tier check
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: read
+      pull-requests: read
     steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
+        with:
+          egress-policy: audit
+
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
 
       - name: Check contributor tier and scope
         env:
@@ -162,9 +193,18 @@ jobs:
   file-size:
     name: File size check
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: read
+      pull-requests: read
     steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
+        with:
+          egress-policy: audit
+
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
           fetch-depth: 0
 
@@ -232,14 +272,68 @@ jobs:
 
           echo "All changed files within limits."
 
+  workflow-security:
+    name: Workflow security policy
+    runs-on: ubuntu-latest
+    steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
+        with:
+          egress-policy: audit
+
+      - name: Checkout
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+
+      - name: Enforce workflow hardening policy
+        run: |
+          set -eu
+
+          failed=0
+          secret_context="secrets"
+
+          if grep -RInE '^[[:space:]]+pull_request_target:' .github/workflows; then
+            echo "::error::pull_request_target is not allowed; it can expose privileged tokens to untrusted PR content."
+            failed=1
+          fi
+
+          while IFS= read -r workflow; do
+            if grep -qE '^[[:space:]]+pull_request:' "$workflow" && grep -q "${secret_context}\\." "$workflow"; then
+              echo "::error file=$workflow::PR-triggered workflows must not reference repository secret contexts."
+              failed=1
+            fi
+          done < <(find .github/workflows -type f \( -name '*.yml' -o -name '*.yaml' \) | sort)
+
+          while IFS= read -r line; do
+            ref=$(printf '%s\n' "$line" | sed -E 's/^[^@]+@([^ #]+).*$/\1/')
+            case "$line" in
+              *"uses: ./"*) continue ;;
+            esac
+            if ! printf '%s\n' "$ref" | grep -Eq '^[0-9a-f]{40}$'; then
+              echo "::error::Action reference must be pinned to a full commit SHA: $line"
+              failed=1
+            fi
+          done < <(grep -RInE '^[[:space:]]*-[[:space:]]+uses:[[:space:]]*[^[:space:]]+@[^[:space:]#]+' .github/workflows)
+
+          exit "$failed"
+
   linked-issue:
     name: Linked issue required
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: read
+      pull-requests: read
     steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
+        with:
+          egress-policy: audit
+
       - name: Check for linked issue
         env:
           GH_TOKEN: ${{ github.token }}
           PR_BODY: ${{ github.event.pull_request.body }}
+          PR_LABELS: ${{ join(github.event.pull_request.labels.*.name, '\n') }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
           REPO: ${{ github.repository }}
         run: |
@@ -264,19 +358,48 @@ jobs:
             exit 0
           fi
 
-          echo "::error::Every PR must be linked to an issue. Use 'Closes #N' in the PR body or link via the GitHub sidebar."
+          has_traceability_exception_label() {
+            printf '%s\n' "$PR_LABELS" | grep -qiE '^(no-issue|maintenance|docs-only|release|deps|dependencies)$'
+          }
+
+          LINKED_ISSUE_SECTION=$(echo "$PR_BODY" | sed -n '/^## Linked Issue/,/^## /p' | sed '1d' | sed '/^## /d' | sed '/^<!--.*-->$/d' | sed '/^\s*$/d')
+
+          if has_traceability_exception_label; then
+            if printf '%s\n' "$LINKED_ISSUE_SECTION" | grep -qiE '(no issue|no tracked issue|not linked|maintenance|docs|release|dependenc|traceability)'; then
+              echo "PR has a documented traceability exception."
+              exit 0
+            fi
+
+            echo "::error::Traceability exception labels require a short explanation in the PR body's '## Linked Issue' section."
+            exit 1
+          fi
+
+          echo "::error::Every PR must be linked to an issue, unless a documented traceability exception applies. Use 'Closes #N' in the PR body, link an issue via the GitHub sidebar, or add one of: no-issue, maintenance, docs-only, release, deps, dependencies."
           exit 1
 
   account-age:
     name: Contributor account check
     runs-on: ubuntu-latest
-    if: github.event.pull_request.author_association == 'NONE' || github.event.pull_request.author_association == 'FIRST_TIMER' || github.event.pull_request.author_association == 'FIRST_TIME_CONTRIBUTOR'
     steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
+        with:
+          egress-policy: audit
+
       - name: Check account age and activity
         env:
           GH_TOKEN: ${{ github.token }}
           PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+          PR_AUTHOR_ASSOCIATION: ${{ github.event.pull_request.author_association }}
         run: |
+          case "$PR_AUTHOR_ASSOCIATION" in
+            NONE|FIRST_TIMER|FIRST_TIME_CONTRIBUTOR) ;;
+            *)
+              echo "Contributor account check does not apply to $PR_AUTHOR_ASSOCIATION contributors."
+              exit 0
+              ;;
+          esac
+
           if [ "$PR_AUTHOR" = "Copilot" ]; then
             echo "Bypassing contributor account check for Copilot."
             exit 0

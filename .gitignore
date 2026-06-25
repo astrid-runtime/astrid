@@ -1,7 +1,6 @@
 # Build
 /target
 **/target
-Cargo.lock
 # Ignore build artifacts under dist/, but keep tracked source assets
 # (AppArmor profile, distro/packager files) re-included below.
 dist/*

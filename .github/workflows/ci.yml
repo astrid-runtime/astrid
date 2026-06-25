@@ -16,6 +16,9 @@ on:
       - '**/Cargo.lock'
       - '.github/workflows/**'
 
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
@@ -25,39 +28,44 @@ jobs:
     name: Check
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - name: Harden Runner
+        uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
           submodules: recursive
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
         with:
           toolchain: "1.95"
 
-      - name: Cache cargo registry
-        uses: actions/cache@v4
+      - name: Cache Rust artifacts
+        uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-
+          key: ${{ runner.os }}-${{ github.job }}
+          cache-on-failure: true
 
       - name: Run cargo check
-        run: cargo check --workspace --all-features
+        run: cargo check --workspace --all-features --locked
 
   fmt:
     name: Format
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - name: Harden Runner
+        uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
           submodules: recursive
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
         with:
           toolchain: "1.95"
           components: rustfmt
@@ -69,29 +77,29 @@ jobs:
     name: Clippy
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - name: Harden Runner
+        uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
           submodules: recursive
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
         with:
           toolchain: "1.95"
           components: clippy
 
-      - name: Cache cargo registry
-        uses: actions/cache@v4
+      - name: Cache Rust artifacts
+        uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-
+          key: ${{ runner.os }}-${{ github.job }}
+          cache-on-failure: true
 
       - name: Run clippy
-        run: cargo clippy --workspace --all-features --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-features --all-targets --locked -- -D warnings
 
   test:
     name: Test
@@ -110,66 +118,286 @@ jobs:
       CARGO_PROFILE_DEV_DEBUG: "0"
       CARGO_PROFILE_TEST_DEBUG: "0"
     steps:
-      - uses: actions/checkout@v4
+      - name: Harden Runner
+        uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
           submodules: recursive
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
         with:
           toolchain: "1.95"
           targets: wasm32-unknown-unknown
 
-      - name: Cache cargo registry
-        uses: actions/cache@v4
+      - name: Cache Rust artifacts
+        uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-
+          key: ${{ runner.os }}-${{ github.job }}
+          cache-on-failure: true
 
       - name: Run tests
-        run: cargo test --workspace
+        if: matrix.os != 'macos-latest'
+        run: cargo test --workspace --locked
+
+      - name: Run tests (macOS serial)
+        if: matrix.os == 'macos-latest'
+        run: cargo test --workspace --locked -- --test-threads=1
 
   msrv:
     name: MSRV
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - name: Harden Runner
+        uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
           submodules: recursive
 
       - name: Install MSRV toolchain
-        uses: dtolnay/rust-toolchain@master
+        uses: dtolnay/rust-toolchain@67ef31d5b988238dd797d409d6f9574278e20537 # master
         with:
           toolchain: "1.95"
 
-      - name: Cache cargo registry
-        uses: actions/cache@v4
+      - name: Cache Rust artifacts
+        uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-msrv-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-msrv-
+          key: ${{ runner.os }}-${{ github.job }}
+          cache-on-failure: true
 
       - name: Check MSRV compiles
-        run: cargo check --workspace
+        run: cargo check --workspace --locked
+
+  api-compatibility:
+    name: Public API compatibility
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          fetch-depth: 0
+          submodules: recursive
+
+      - name: Detect public API inputs
+        id: api-inputs
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          git diff --name-only "$BASE_SHA"...HEAD | tee changed-files.txt
+
+          if grep -Eq '(^Cargo\.toml$|^crates/[^/]+/Cargo\.toml$|^crates/[^/]+/src/.*\.rs$|^crates/[^/]+/build\.rs$|^crates/[^/]+/wit/|^wit/)' changed-files.txt; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+            echo "Public API inputs changed; running cargo-semver-checks."
+          else
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "No public API inputs changed; skipping cargo-semver-checks."
+          fi
+
+      - name: Install Rust toolchain
+        if: steps.api-inputs.outputs.run == 'true'
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          toolchain: "1.95"
+
+      - name: Cache Rust artifacts
+        if: steps.api-inputs.outputs.run == 'true'
+        uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
+        with:
+          key: ${{ runner.os }}-${{ github.job }}
+          cache-on-failure: true
+
+      - name: Check public API compatibility
+        if: steps.api-inputs.outputs.run == 'true'
+        uses: obi1kenobi/cargo-semver-checks-action@6b69fcf40e9b5fb17adeb57e4b6ecd020649a239 # v2
+        with:
+          manifest-path: Cargo.toml
+          baseline-rev: ${{ github.event.pull_request.base.sha }}
+          feature-group: all-features
+          rust-toolchain: manual
+          github-token: ${{ github.token }}
+
+  public-rust-api-diff:
+    name: Public Rust API diff
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          fetch-depth: 0
+          submodules: recursive
+
+      - name: Detect public API inputs
+        id: api-inputs
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          git diff --name-only "$BASE_SHA"...HEAD | tee changed-files.txt
+
+          if grep -Eq '(^Cargo\.toml$|^crates/[^/]+/Cargo\.toml$|^crates/[^/]+/src/.*\.rs$|^crates/[^/]+/build\.rs$|^crates/[^/]+/wit/|^wit/)' changed-files.txt; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+            echo "Public API inputs changed; running cargo-public-api."
+          else
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "No public API inputs changed; skipping cargo-public-api."
+          fi
+
+      - name: Install Rust toolchains
+        if: steps.api-inputs.outputs.run == 'true'
+        uses: dtolnay/rust-toolchain@5b842231ba77f5c045dba54ac5560fed2db780e2 # nightly
+        with:
+          toolchain: nightly
+
+      - name: Cache Rust artifacts
+        if: steps.api-inputs.outputs.run == 'true'
+        uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
+        with:
+          key: ${{ runner.os }}-${{ github.job }}
+          cache-on-failure: true
+
+      - name: Install cargo-public-api
+        if: steps.api-inputs.outputs.run == 'true'
+        uses: taiki-e/install-action@682e7d9e49c5e653d371fc6adbda67653461378a # v2
+        with:
+          tool: cargo-public-api
+
+      - name: Check public Rust item diff
+        if: steps.api-inputs.outputs.run == 'true'
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          if git log --format=%B "$BASE_SHA..$HEAD_SHA" \
+            | grep -Eq '(^[A-Za-z0-9_-]+(\([^)]*\))?!:|^BREAKING[ -]CHANGE:)'; then
+            DENY=""
+            echo "Breaking-change marker found; reporting public API diff without denying changes."
+          else
+            DENY="--deny changed --deny removed"
+            echo "No breaking-change marker found; denying changed or removed public API items."
+          fi
+
+          packages=$(cargo metadata --locked --format-version 1 --no-deps \
+            | jq -r '.packages[]
+              | select(.publish == null)
+              | select(any(.targets[]; any(.kind[]; . == "lib")))
+              | .name')
+
+          for package in $packages; do
+            echo "::group::cargo public-api $package"
+            cargo public-api \
+              --package "$package" \
+              --all-features \
+              -ss \
+              diff \
+              $DENY \
+              --force \
+              "$BASE_SHA..HEAD"
+            echo "::endgroup::"
+          done
+
+  gateway-openapi-contract:
+    name: Gateway OpenAPI contract
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          fetch-depth: 0
+          submodules: recursive
+
+      - name: Detect gateway contract inputs
+        id: gateway-inputs
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          git diff --name-only "$BASE_SHA"...HEAD | tee changed-files.txt
+
+          if grep -Eq '(^Cargo\.toml$|^Cargo\.lock$|^crates/astrid-gateway/Cargo\.toml$|^crates/astrid-gateway/src/|^crates/astrid-gateway/examples/print-openapi\.rs$)' changed-files.txt; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+            echo "Gateway contract inputs changed; diffing OpenAPI specs."
+          else
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "No gateway contract inputs changed; skipping OpenAPI diff."
+          fi
+
+      - name: Install Rust toolchain
+        if: steps.gateway-inputs.outputs.run == 'true'
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          toolchain: "1.95"
+
+      - name: Cache Rust artifacts
+        if: steps.gateway-inputs.outputs.run == 'true'
+        uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
+        with:
+          key: ${{ runner.os }}-${{ github.job }}
+          cache-on-failure: true
+
+      - name: Diff generated OpenAPI spec
+        if: steps.gateway-inputs.outputs.run == 'true'
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          mkdir -p /tmp/astrid-openapi
+          cp crates/astrid-gateway/examples/print-openapi.rs /tmp/astrid-openapi/print-openapi.rs
+          cp Cargo.lock /tmp/astrid-openapi/Cargo.lock
+
+          generate_spec() {
+            local ref="$1"
+            local out="$2"
+
+            git reset --hard
+            git clean -fd
+            git checkout "$ref"
+            mkdir -p crates/astrid-gateway/examples
+            cp /tmp/astrid-openapi/print-openapi.rs crates/astrid-gateway/examples/print-openapi.rs
+            if [ ! -f Cargo.lock ]; then
+              cp /tmp/astrid-openapi/Cargo.lock Cargo.lock
+            fi
+
+            cargo run --locked -p astrid-gateway --example print-openapi > "$out"
+          }
+
+          generate_spec "$BASE_SHA" /tmp/astrid-openapi/base.json
+          generate_spec "$HEAD_SHA" /tmp/astrid-openapi/head.json
+
+          diff -u /tmp/astrid-openapi/base.json /tmp/astrid-openapi/head.json
 
   audit:
     name: Security Audit
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-
-      - name: Generate lockfile
-        run: cargo generate-lockfile
-
-      - uses: rustsec/audit-check@v2
+      - name: Harden Runner
+        uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
         with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+          egress-policy: audit
+
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+
+      - name: Verify lockfile
+        run: cargo metadata --locked --no-deps > /dev/null
+
+      - uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2.0.0
+        with:
+          token: ${{ github.token }}

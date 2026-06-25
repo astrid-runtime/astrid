@@ -6,7 +6,7 @@ on:
       - 'v[0-9]+.*'
 
 permissions:
-  contents: write
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
@@ -33,7 +33,12 @@ jobs:
             os: ubuntu-latest
             archive: tar.gz
     steps:
-      - uses: actions/checkout@v4
+      - name: Harden Runner
+        uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
           # astrid-capsule's build.rs stages WIT files from the
           # `wit/` submodule (unicity-astrid/wit) before bindgen
@@ -43,7 +48,7 @@ jobs:
           submodules: recursive
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
         with:
           # MUST match rust-toolchain.toml's channel EXACTLY (incl. patch).
           # rustup treats "1.95" and "1.95.0" as distinct toolchains: the
@@ -61,14 +66,14 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y gcc-aarch64-linux-gnu
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           key: ${{ matrix.target }}
 
       - name: Build release binaries
         env:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
-        run: cargo build --release --target ${{ matrix.target }} -p astrid
+        run: cargo build --release --target ${{ matrix.target }} -p astrid --locked
 
       - name: Package binaries
         run: |
@@ -84,7 +89,7 @@ jobs:
           echo "ASSET=${DIR}.tar.gz" >> "$GITHUB_ENV"
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
         with:
           name: binary-${{ matrix.target }}
           path: ${{ env.ASSET }}
@@ -94,13 +99,23 @@ jobs:
     name: GitHub Release
     needs: build
     runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
     steps:
-      - uses: actions/checkout@v4
+      - name: Harden Runner
+        uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
           fetch-depth: 0
 
       - name: Download all binary artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6
         with:
           path: artifacts
           pattern: binary-*
@@ -154,12 +169,32 @@ jobs:
           sha256sum *.tar.gz > SHA256SUMS.txt
           cat SHA256SUMS.txt
 
+      - name: Attest release provenance
+        uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32 # v4.1.0
+        with:
+          subject-path: |
+            artifacts/*.tar.gz
+            artifacts/SHA256SUMS.txt
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac # v3
+
+      - name: Sign release assets
+        env:
+          COSIGN_YES: "true"
+        run: |
+          cd artifacts
+          for asset in *.tar.gz SHA256SUMS.txt; do
+            cosign sign-blob --yes --bundle "${asset}.sigstore.json" "$asset"
+          done
+
       - name: Create release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           files: |
             artifacts/*.tar.gz
             artifacts/SHA256SUMS.txt
+            artifacts/*.sigstore.json
           body: |
             ${{ steps.changelog.outputs.body }}
 
