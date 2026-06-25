@@ -120,7 +120,12 @@ jobs:
           cache-on-failure: true
 
       - name: Run tests
+        if: matrix.os != 'macos-latest'
         run: cargo test --workspace --locked
+
+      - name: Run tests (macOS serial)
+        if: matrix.os == 'macos-latest'
+        run: cargo test --workspace --locked -- --test-threads=1
 
   msrv:
     name: MSRV
