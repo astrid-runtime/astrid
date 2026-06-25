@@ -5,8 +5,7 @@
 //! (`[a-z0-9._-]+`), so the id doubles as a `watch` topic suffix without
 //! sanitisation. Treat the wire form as an opaque secret.
 
-use rand::RngCore;
-use rand::rngs::OsRng;
+use rand::{TryRng, rngs::SysRng};
 
 const B32: &[u8; 32] = b"abcdefghijklmnopqrstuvwxyz234567";
 
@@ -14,7 +13,9 @@ const B32: &[u8; 32] = b"abcdefghijklmnopqrstuvwxyz234567";
 /// base32.
 pub(super) fn mint_id() -> String {
     let mut bytes = [0u8; 32];
-    OsRng.fill_bytes(&mut bytes);
+    SysRng
+        .try_fill_bytes(&mut bytes)
+        .expect("OS CSPRNG unavailable while minting process id");
     base32_lower(&bytes)
 }
 

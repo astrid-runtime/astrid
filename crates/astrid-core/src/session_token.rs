@@ -12,7 +12,7 @@ use std::fmt;
 use std::io;
 use std::path::Path;
 
-use rand::RngCore;
+use rand::{TryRng, rngs::SysRng};
 use serde::{Deserialize, Serialize};
 use subtle::ConstantTimeEq;
 
@@ -51,7 +51,9 @@ impl SessionToken {
     #[must_use]
     pub fn generate() -> Self {
         let mut bytes = [0u8; 32];
-        rand::rngs::OsRng.fill_bytes(&mut bytes);
+        SysRng
+            .try_fill_bytes(&mut bytes)
+            .expect("OS CSPRNG unavailable while generating session token");
         Self(bytes)
     }
 

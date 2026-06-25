@@ -55,8 +55,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use astrid_core::principal::PrincipalId;
-use rand::RngCore;
-use rand::rngs::OsRng;
+use rand::{TryRng, rngs::SysRng};
 use tokio::io::AsyncWriteExt;
 use tokio::sync::watch;
 
@@ -136,7 +135,9 @@ impl PersistentProcessRegistry {
     #[must_use]
     pub fn new(runtime: tokio::runtime::Handle) -> Self {
         let mut hash_key = [0u8; 32];
-        OsRng.fill_bytes(&mut hash_key);
+        SysRng
+            .try_fill_bytes(&mut hash_key)
+            .expect("OS CSPRNG unavailable while creating process registry hash key");
         Self {
             entries: Mutex::new(HashMap::new()),
             hash_key,

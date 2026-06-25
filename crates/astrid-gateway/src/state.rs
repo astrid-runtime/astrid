@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 use anyhow::Context;
 use astrid_core::PrincipalId;
 use ed25519_dalek::{SigningKey, VerifyingKey};
-use rand::RngCore;
+use rand::{TryRng, rngs::SysRng};
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
@@ -47,7 +47,9 @@ impl SigningMaterial {
     #[must_use]
     pub fn fresh() -> Self {
         let mut secret = [0u8; 32];
-        rand::rngs::OsRng.fill_bytes(&mut secret);
+        SysRng
+            .try_fill_bytes(&mut secret)
+            .expect("OS CSPRNG unavailable while generating gateway signing key");
         let signer = SigningKey::from_bytes(&secret);
         let verifier = signer.verifying_key();
         Self { signer, verifier }

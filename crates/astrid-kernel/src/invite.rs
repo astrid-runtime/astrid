@@ -201,9 +201,11 @@ struct PersistedFile {
 /// Generate a random URL-safe-base64 token. Uses the OS CSPRNG.
 #[must_use]
 pub fn generate_token() -> String {
-    use rand::RngCore;
+    use rand::{TryRng, rngs::SysRng};
     let mut bytes = [0u8; TOKEN_RAW_LEN];
-    rand::rngs::OsRng.fill_bytes(&mut bytes);
+    SysRng
+        .try_fill_bytes(&mut bytes)
+        .expect("OS CSPRNG unavailable while generating invite token");
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
 }
 
