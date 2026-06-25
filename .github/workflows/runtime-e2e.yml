@@ -38,69 +38,67 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
+        with:
+          egress-policy: audit
+
       - name: Checkout core
-        uses: actions/checkout@v5
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
 
       - name: Checkout capsule-cli
-        uses: actions/checkout@v5
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
           repository: unicity-astrid/capsule-cli
           path: capsules/astrid-capsule-cli
 
       - name: Checkout capsule-registry
-        uses: actions/checkout@v5
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
           repository: unicity-astrid/capsule-registry
           path: capsules/astrid-capsule-registry
 
       - name: Checkout capsule-session
-        uses: actions/checkout@v5
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
           repository: unicity-astrid/capsule-session
           path: capsules/astrid-capsule-session
 
       - name: Checkout capsule-identity
-        uses: actions/checkout@v5
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
           repository: unicity-astrid/capsule-identity
           path: capsules/astrid-capsule-identity
 
       - name: Checkout capsule-prompt-builder
-        uses: actions/checkout@v5
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
           repository: unicity-astrid/capsule-prompt-builder
           path: capsules/astrid-capsule-prompt-builder
 
       - name: Checkout capsule-react
-        uses: actions/checkout@v5
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
           repository: unicity-astrid/capsule-react
           path: capsules/astrid-capsule-react
 
       - name: Checkout capsule-openai-compat
-        uses: actions/checkout@v5
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
           repository: unicity-astrid/capsule-openai-compat
           path: capsules/astrid-capsule-openai-compat
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
         with:
           toolchain: "1.95"
           targets: wasm32-unknown-unknown
 
-      - name: Cache cargo registry
-        uses: actions/cache@v5
+      - name: Cache Rust artifacts
+        uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-            capsules/*/target
           key: ${{ runner.os }}-runtime-e2e-${{ hashFiles('**/Cargo.lock', 'capsules/**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-runtime-e2e-
-            ${{ runner.os }}-cargo-
+          cache-on-failure: true
 
       - name: Stage capsule checkouts outside core workspace
         run: |
@@ -121,7 +119,7 @@ jobs:
 
       - name: Upload runtime artifacts
         if: failure()
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
         with:
           name: runtime-e2e-artifacts
           path: /tmp/astrid-runtime-e2e.*/artifacts
