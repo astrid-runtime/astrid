@@ -103,6 +103,7 @@ use crate::state::GatewayState;
         routes::capsules::install_capsule,
         routes::capsules::get_capsule,
         routes::capsules::list_capsule_topics,
+        routes::capsules::run_capsule_command,
         routes::env::get_env_schema,
         routes::env::write_env,
         // Agent invocation
@@ -178,6 +179,8 @@ use crate::state::GatewayState;
             routes::capsules::CapsuleTopic,
             routes::capsules::CapsuleTopicsResponse,
             routes::capsules::InstallRequest,
+            routes::capsules::RunCommandRequest,
+            routes::capsules::RunCommandResponse,
             // Agent
             routes::agent::PromptRequest,
             routes::agent::PromptReady,

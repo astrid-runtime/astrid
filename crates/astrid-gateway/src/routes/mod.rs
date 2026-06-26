@@ -172,6 +172,10 @@ fn build_authed_router(state: &Arc<GatewayState>) -> Router<Arc<GatewayState>> {
             "/api/capsules/{id}/topics",
             get(capsules::list_capsule_topics),
         )
+        .route(
+            "/api/capsules/{id}/commands/{verb}/run",
+            post(capsules::run_capsule_command),
+        )
         .route("/api/capsules/{id}/env", get(env::get_env_schema))
         .route("/api/capsules/{id}/env/{field}", post(env::write_env))
         // ── Audit stream ──

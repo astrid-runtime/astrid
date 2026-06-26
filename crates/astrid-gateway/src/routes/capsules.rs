@@ -37,13 +37,18 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use astrid_capsule_install::github_source;
-use astrid_core::kernel_api::{CapsuleMetadataEntry, KernelRequest, KernelResponse};
+use astrid_core::kernel_api::{
+    CapsuleMetadataEntry, CommandInfo, CommandKind, KernelRequest, KernelResponse,
+};
+use astrid_events::ipc::{IpcMessage, IpcPayload};
+use astrid_events::{AstridEvent, EventMetadata, EventReceiver};
 use astrid_uplink::KernelClient;
 use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::Request;
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
+use uuid::Uuid;
 
 use crate::error::{ErrorBody, GatewayError, GatewayResult};
 use crate::routes::principals::caller_from;
@@ -246,6 +251,8 @@ struct ResolvedArchive {
 
 /// Hard cap on a downloaded `.capsule` archive (mirrors the CLI).
 const MAX_CAPSULE_BYTES: usize = 50 * 1024 * 1024;
+/// Wall-clock budget for a capsule CLI command result.
+const COMMAND_RESULT_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Resolve a GitHub `(org, repo)` to a locally-staged `.capsule` archive.
 ///
@@ -447,6 +454,115 @@ pub async fn list_capsule_topics(
     Ok(Json(CapsuleTopicsResponse { topics: vec![] }))
 }
 
+#[derive(Debug, Clone, Deserialize, ToSchema)]
+pub struct RunCommandRequest {
+    /// Arguments forwarded verbatim to the capsule CLI verb.
+    #[serde(default)]
+    pub args: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct RunCommandResponse {
+    /// Provider capsule id.
+    pub provider: String,
+    /// Capsule-declared CLI verb.
+    pub command: String,
+    /// Process-style exit code returned by the capsule.
+    pub exit_code: i32,
+    /// Standard output text.
+    pub output: String,
+    /// Standard error text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CliCommandResultPayload {
+    exit_code: i32,
+    #[serde(default)]
+    output: String,
+    #[serde(default)]
+    error: Option<String>,
+}
+
+/// `POST /api/capsules/{id}/commands/{verb}/run` - run a capsule-declared
+/// CLI command over the same capsule-space contract as `astrid capsule <verb>`.
+#[utoipa::path(
+    post,
+    path = "/api/capsules/{id}/commands/{verb}/run",
+    tag = "capsules",
+    params(
+        ("id" = String, Path, description = "Provider capsule id"),
+        ("verb" = String, Path, description = "Capsule-declared CLI verb")
+    ),
+    request_body = RunCommandRequest,
+    responses(
+        (status = 200, body = RunCommandResponse, description = "Capsule CLI command result."),
+        (status = 400, body = ErrorBody, description = "The capsule does not declare the CLI verb, or the result payload is malformed."),
+        (status = 401, body = ErrorBody),
+        (status = 403, body = ErrorBody),
+        (status = 404, body = ErrorBody),
+    )
+)]
+pub async fn run_capsule_command(
+    State(state): State<Arc<GatewayState>>,
+    Path((id, verb)): Path<(String, String)>,
+    req: Request<axum::body::Body>,
+) -> GatewayResult<Json<RunCommandResponse>> {
+    let caller = caller_from(&req)?.clone();
+    let body: RunCommandRequest = crate::routes::principals::read_json_body(req).await?;
+
+    let mut client = KernelClient::connect(caller.principal.clone())
+        .await
+        .map_err(daemon_internal)?
+        .with_device_key_id(caller.device_key_id.clone());
+    let resp = client
+        .request(KernelRequest::GetCommands)
+        .await
+        .map_err(daemon_internal)?;
+    let commands = match resp {
+        KernelResponse::Commands(commands) => commands,
+        KernelResponse::Error(msg) => return Err(GatewayError::Forbidden { reason: msg }),
+        other => {
+            return Err(internal(format!(
+                "unexpected response shape for GetCommands: {other:?}"
+            )));
+        },
+    };
+    ensure_cli_command_declared(&id, &verb, &commands)?;
+
+    let bus = state.event_bus.clone().ok_or_else(|| {
+        GatewayError::Internal(anyhow::anyhow!(
+            "gateway is not attached to the kernel event bus"
+        ))
+    })?;
+    let req_id = Uuid::new_v4().simple().to_string();
+    let run_topic = format!("cli.v1.command.run.{id}");
+    let result_topic = format!("cli.v1.command.result.{req_id}");
+    let mut receiver = bus.subscribe_topic(result_topic.to_string());
+
+    let payload = serde_json::json!({
+        "req_id": req_id,
+        "command": verb,
+        "args": body.args,
+    });
+    let msg = IpcMessage::new(run_topic, IpcPayload::RawJson(payload), Uuid::nil())
+        .with_principal(caller.principal.to_string());
+    bus.publish(AstridEvent::Ipc {
+        metadata: EventMetadata::new("astrid-gateway::capsule-command"),
+        message: msg,
+    });
+
+    let result = read_cli_command_result(&mut receiver, &result_topic).await?;
+    Ok(Json(RunCommandResponse {
+        provider: id,
+        command: verb,
+        exit_code: result.exit_code,
+        output: result.output,
+        error: result.error,
+    }))
+}
+
 // ── helpers (kernel client error mapping) ────────────────────────
 
 #[allow(
@@ -459,6 +575,71 @@ fn daemon_internal(e: anyhow::Error) -> GatewayError {
 
 fn internal(msg: String) -> GatewayError {
     GatewayError::Internal(anyhow::anyhow!(msg))
+}
+
+fn ensure_cli_command_declared(
+    provider: &str,
+    verb: &str,
+    commands: &[CommandInfo],
+) -> GatewayResult<()> {
+    let provider_exists = commands
+        .iter()
+        .any(|c| c.provider_capsule == provider && c.kind == CommandKind::Cli);
+    let command_exists = commands
+        .iter()
+        .any(|c| c.provider_capsule == provider && c.name == verb && c.kind == CommandKind::Cli);
+
+    if command_exists {
+        Ok(())
+    } else if provider_exists {
+        Err(GatewayError::BadRequest(format!(
+            "capsule {provider:?} does not declare CLI command {verb:?}"
+        )))
+    } else {
+        Err(GatewayError::NotFound)
+    }
+}
+
+async fn read_cli_command_result(
+    receiver: &mut EventReceiver,
+    result_topic: &str,
+) -> GatewayResult<CliCommandResultPayload> {
+    let deadline = tokio::time::Instant::now()
+        .checked_add(COMMAND_RESULT_TIMEOUT)
+        .unwrap_or_else(tokio::time::Instant::now);
+
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(GatewayError::BadRequest(format!(
+                "capsule command did not respond within {}s",
+                COMMAND_RESULT_TIMEOUT.as_secs()
+            )));
+        }
+
+        let event = tokio::time::timeout(remaining, receiver.recv())
+            .await
+            .map_err(|_| {
+                GatewayError::BadRequest(format!(
+                    "capsule command did not respond within {}s",
+                    COMMAND_RESULT_TIMEOUT.as_secs()
+                ))
+            })?
+            .ok_or_else(|| internal("capsule command result subscription closed".into()))?;
+        let AstridEvent::Ipc { message, .. } = &*event else {
+            continue;
+        };
+        if message.topic != result_topic {
+            continue;
+        }
+        let value = match &message.payload {
+            IpcPayload::RawJson(value) => value.clone(),
+            other => serde_json::to_value(other)
+                .map_err(|e| internal(format!("serialize command result payload: {e}")))?,
+        };
+        return serde_json::from_value(value)
+            .map_err(|e| GatewayError::BadRequest(format!("malformed command result: {e}")));
+    }
 }
 
 /// Map a non-success GitHub HTTP status to a gateway error. A `404` is a
@@ -594,5 +775,47 @@ mod tests {
             path.starts_with(resolved.guard.path()),
             "sanitized archive must not escape the temp dir",
         );
+    }
+
+    fn command(name: &str, provider: &str, kind: CommandKind) -> CommandInfo {
+        CommandInfo {
+            name: name.into(),
+            description: String::new(),
+            provider_capsule: provider.into(),
+            kind,
+        }
+    }
+
+    #[test]
+    fn ensure_cli_command_declared_requires_provider_verb_and_cli_kind() {
+        let commands = vec![
+            command(
+                "concierge",
+                "astrid-capsule-concierge-identity",
+                CommandKind::Cli,
+            ),
+            command("concierge", "other", CommandKind::Slash),
+        ];
+
+        assert!(
+            ensure_cli_command_declared(
+                "astrid-capsule-concierge-identity",
+                "concierge",
+                &commands,
+            )
+            .is_ok()
+        );
+        assert!(matches!(
+            ensure_cli_command_declared("other", "concierge", &commands),
+            Err(GatewayError::NotFound)
+        ));
+        assert!(matches!(
+            ensure_cli_command_declared(
+                "astrid-capsule-concierge-identity",
+                "identity-show",
+                &commands,
+            ),
+            Err(GatewayError::BadRequest(_))
+        ));
     }
 }

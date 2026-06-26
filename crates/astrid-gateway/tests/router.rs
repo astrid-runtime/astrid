@@ -318,6 +318,7 @@ async fn openapi_route_serves_valid_spec_unauthenticated() {
         "/api/sys/principals/{id}/devices/{key_id}",
         "/api/sys/capabilities",
         "/api/capsules",
+        "/api/capsules/{id}/commands/{verb}/run",
         "/api/events",
         "/healthz",
         "/metrics",
