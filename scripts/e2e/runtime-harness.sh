@@ -242,6 +242,11 @@ EOF
   cat > "$ASTRID_HOME/config.toml" <<EOF
 [logging]
 directives = ["astrid_capsule::dispatcher=debug", "astrid_gateway::routes::sessions=debug", "astrid_capsule::engine::wasm::host::kv=debug", "astrid_events=debug"]
+[http]
+default_timeout_secs = 5
+stream_connect_timeout_secs = 5
+stream_read_timeout_secs = 3
+header_deadline_secs = 5
 [security.capsule_local_egress]
 "astrid-capsule-openai-compat" = ["127.0.0.1:$fake_port"]
 "openai-compat" = ["127.0.0.1:$fake_port"]
@@ -565,7 +570,7 @@ PY
     "$ARTIFACTS/agent-set-active-model-body-spoof.json")"
   assert_status "agent active model body spoof ignored" "$status" 200
   json_assert_model_id "$ARTIFACTS/agent-set-active-model-body-spoof.json" "openai-compat:fake-slow"
-  run_llm_provider_smoke "$user_bearer" "$user_principal" "$ARTIFACTS/agent-models.json"
+  run_llm_provider_smoke "$user_bearer" "$user_principal" "$ARTIFACTS/agent-models.json" "$fake_base_url"
 
   run_multi_home_smoke "$fake_base_url" "$user_bearer" "$user_principal"
 

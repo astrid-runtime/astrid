@@ -61,6 +61,42 @@ if found != expected_count:
 PY
 }
 
+run_empty_model_catalog_smoke() {
+  local fake_base_url=$1
+  local invite bearer principal status
+
+  note "checking empty fake LLM model catalog fallback"
+  invite="$("$CORE_DIR/target/debug/astrid" invite issue --group agent --max-uses 1 --expires-secs 600 --raw \
+    2>> "$ARTIFACTS/cli-transcript.log")"
+  printf '$ astrid invite issue --group agent --max-uses 1 --expires-secs 600 --raw\n<redacted invite token>\n' \
+    >> "$ARTIFACTS/cli-transcript.log"
+  redeem_invite "$invite" empty-model-user "$ARTIFACTS/empty-model-redeem.json"
+  bearer="$(json_field "$ARTIFACTS/empty-model-redeem.json" session_token)"
+  principal="$(json_field "$ARTIFACTS/empty-model-redeem.json" principal)"
+
+  run_cli agent modify "$principal" \
+    --add-capsule astrid-capsule-registry \
+    --add-capsule astrid-capsule-openai-compat
+
+  status="$(http_status POST /api/capsules/astrid-capsule-openai-compat/env/base_url "$bearer" \
+    "{\"value\":\"$fake_base_url/empty-models\"}" \
+    "$ARTIFACTS/empty-model-base-url-write.json")"
+  assert_status "empty-model env base_url write" "$status" 204
+  status="$(http_status POST /api/capsules/astrid-capsule-openai-compat/env/model "$bearer" \
+    '{"value":"fake-empty-fallback"}' \
+    "$ARTIFACTS/empty-model-fallback-write.json")"
+  assert_status "empty-model env fallback write" "$status" 204
+
+  status="$(http_status GET /api/models "$bearer" "" "$ARTIFACTS/empty-model-catalog-models.json")"
+  assert_status "empty-model catalog fallback model list" "$status" 200
+  json_assert_model_list_contains "$ARTIFACTS/empty-model-catalog-models.json" \
+    "openai-compat:fake-empty-fallback"
+  assert_model_list_count "$ARTIFACTS/empty-model-catalog-models.json" \
+    "openai-compat:fake-empty-fallback" 1
+  assert_model_list_count "$ARTIFACTS/empty-model-catalog-models.json" \
+    "openai-compat:fake-echo" 0
+}
+
 assert_bounded_llm_error_surface() {
   local principal=$1
   local model_id=$2
@@ -133,12 +169,16 @@ run_llm_provider_smoke() {
   local bearer=$1
   local principal=$2
   local models_file=$3
+  local fake_base_url=$4
   local status
 
   note "checking fake LLM provider failure handling"
   json_assert_model_list_contains "$models_file" "openai-compat:fake-error"
   json_assert_model_list_contains "$models_file" "openai-compat:fake-malformed"
+  json_assert_model_list_contains "$models_file" "openai-compat:fake-timeout"
   assert_model_list_count "$models_file" "openai-compat:duplicate-name" 1
+
+  run_empty_model_catalog_smoke "$fake_base_url"
 
   status="$(http_status PUT /api/models/active "$bearer" \
     '{"id":"openai-compat:fake-error"}' \
@@ -155,6 +195,14 @@ run_llm_provider_smoke() {
   json_assert_model_id "$ARTIFACTS/agent-set-active-model-fake-malformed.json" "openai-compat:fake-malformed"
   assert_bounded_llm_error_surface "$principal" "openai-compat:fake-malformed" "fake-malformed" \
     'malformed\|invalid\|json\|error'
+
+  status="$(http_status PUT /api/models/active "$bearer" \
+    '{"id":"openai-compat:fake-timeout"}' \
+    "$ARTIFACTS/agent-set-active-model-fake-timeout.json")"
+  assert_status "agent set fake-timeout active model" "$status" 200
+  json_assert_model_id "$ARTIFACTS/agent-set-active-model-fake-timeout.json" "openai-compat:fake-timeout"
+  assert_bounded_llm_error_surface "$principal" "openai-compat:fake-timeout" "fake-timeout" \
+    'timeout\|timed out\|deadline\|error'
 
   status="$(http_status PUT /api/models/active "$bearer" \
     '{"id":"openai-compat:fake-slow"}' \

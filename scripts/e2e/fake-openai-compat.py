@@ -27,6 +27,7 @@ from typing import Any
 MODELS = [
     {"id": "fake-echo", "object": "model", "owned_by": "astrid-e2e"},
     {"id": "fake-slow", "object": "model", "owned_by": "astrid-e2e"},
+    {"id": "fake-timeout", "object": "model", "owned_by": "astrid-e2e"},
     {"id": "fake-error", "object": "model", "owned_by": "astrid-e2e"},
     {"id": "fake-malformed", "object": "model", "owned_by": "astrid-e2e"},
     {"id": "fake-toolish", "object": "model", "owned_by": "astrid-e2e"},
@@ -69,17 +70,23 @@ class Handler(BaseHTTPRequestHandler):
         sys.stderr.write("fake-openai: " + fmt % args + "\n")
 
     def do_GET(self) -> None:
-        if self.path != "/v1/models":
+        if self.path == "/v1/models":
+            models = MODELS
+        elif self.path == "/empty-models/v1/models":
+            models = []
+        else:
             self.send_error(404, "not found")
             return
+
         self.state.log(
             {
                 "method": "GET",
                 "path": self.path,
                 "headers": redact_headers(self),
+                "model_count": len(models),
             }
         )
-        self.send_json({"object": "list", "data": MODELS})
+        self.send_json({"object": "list", "data": models})
 
     def do_POST(self) -> None:
         if self.path != "/v1/chat/completions":
@@ -114,6 +121,13 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(b"data: {not-json}\n\n")
             self.wfile.flush()
+            return
+        if model == "fake-timeout":
+            self.send_response(200)
+            self.send_header("content-type", "text/event-stream")
+            self.send_header("cache-control", "no-cache")
+            self.end_headers()
+            time.sleep(6)
             return
 
         if bool(body.get("stream")):
