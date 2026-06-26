@@ -330,6 +330,8 @@ jobs:
     name: Gateway OpenAPI contract
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
+    env:
+      CARGO_TARGET_DIR: .openapi-target
     steps:
       - name: Harden Runner
         uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
@@ -367,6 +369,8 @@ jobs:
         uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
         with:
           key: ${{ runner.os }}-${{ github.job }}
+          workspaces: |
+            . -> .openapi-target
           cache-on-failure: true
 
       - name: Diff generated OpenAPI spec
@@ -384,7 +388,7 @@ jobs:
             local out="$2"
 
             git reset --hard
-            git clean -fd
+            git clean -fd -e .openapi-target
             git checkout "$ref"
             mkdir -p crates/astrid-gateway/examples
             cp /tmp/astrid-openapi/print-openapi.rs crates/astrid-gateway/examples/print-openapi.rs
