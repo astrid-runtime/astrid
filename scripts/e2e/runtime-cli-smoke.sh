@@ -1,0 +1,186 @@
+#!/usr/bin/env bash
+
+run_cli_semantic_smoke() {
+  local user_principal=$1 ops_principal=$2
+  note "checking built-in CLI semantic read paths"
+
+  run_cli agent list --format json > "$ARTIFACTS/cli-agent-list.json"
+  json_assert_cli_agent_list "$ARTIFACTS/cli-agent-list.json" "$user_principal" "$ops_principal"
+  run_cli agent show "$user_principal" --format json > "$ARTIFACTS/cli-agent-show-user.json"
+  json_assert_cli_agent_show "$ARTIFACTS/cli-agent-show-user.json" "$user_principal" agent
+  run_cli agent show "$ops_principal" --format json > "$ARTIFACTS/cli-agent-show-ops.json"
+  json_assert_cli_agent_show "$ARTIFACTS/cli-agent-show-ops.json" "$ops_principal" ops-team
+  run_cli agent switch "$user_principal" > "$ARTIFACTS/cli-agent-switch-user.txt"
+  run_cli agent current > "$ARTIFACTS/cli-agent-current-user.txt"
+  grep -qx "$user_principal" "$ARTIFACTS/cli-agent-current-user.txt" || fail "agent current did not reflect switch"
+  run_cli agent switch default > "$ARTIFACTS/cli-agent-switch-default.txt"
+
+  run_cli group list --format json > "$ARTIFACTS/cli-group-list.json"
+  json_assert_cli_group "$ARTIFACTS/cli-group-list.json" ops-team invite:issue
+  run_cli group show ops-team --format json > "$ARTIFACTS/cli-group-show-ops.json"
+  json_assert_cli_group "$ARTIFACTS/cli-group-show-ops.json" ops-team capsule:install
+
+  run_cli caps show "$user_principal" --format json > "$ARTIFACTS/cli-caps-show-user.json"
+  json_assert_cli_caps_show "$ARTIFACTS/cli-caps-show-user.json" "$user_principal" agent
+  run_cli caps check "$ops_principal" invite:issue > "$ARTIFACTS/cli-caps-check-ops.txt"
+  grep -q "allowed" "$ARTIFACTS/cli-caps-check-ops.txt" || fail "caps check did not allow ops invite:issue"
+
+  run_cli quota show --agent "$user_principal" --format json > "$ARTIFACTS/cli-quota-show-user.json"
+  json_assert_cli_quota "$ARTIFACTS/cli-quota-show-user.json" "$user_principal" 4
+  run_cli secret list --agent "$user_principal" --format json > "$ARTIFACTS/cli-secret-list-user.json"
+  json_assert_secret_list_metadata "$ARTIFACTS/cli-secret-list-user.json" astrid-capsule-openai-compat api_key
+
+  run_cli capsule show astrid-capsule-openai-compat --format json \
+    > "$ARTIFACTS/cli-capsule-show-openai-user.json"
+  json_assert_cli_capsule_show "$ARTIFACTS/cli-capsule-show-openai-user.json" astrid-capsule-openai-compat
+  run_cli capsule list > "$ARTIFACTS/cli-capsule-list.txt"
+  grep -q "astrid-capsule-openai-compat" "$ARTIFACTS/cli-capsule-list.txt" || fail "capsule list missed openai-compat"
+  run_cli capsule config astrid-capsule-openai-compat --agent "$user_principal" --show --format json \
+    > "$ARTIFACTS/cli-capsule-config-openai-user.json"
+  json_assert_cli_capsule_config "$ARTIFACTS/cli-capsule-config-openai-user.json" fake-slow
+
+  run_cli version --format json > "$ARTIFACTS/cli-version.json"
+  json_assert_cli_version "$ARTIFACTS/cli-version.json"
+  run_cli config show --format json > "$ARTIFACTS/cli-config-show.json"
+  json_assert_cli_config_show "$ARTIFACTS/cli-config-show.json"
+  run_cli config path > "$ARTIFACTS/cli-config-path.txt"
+  grep -q "$ASTRID_HOME" "$ARTIFACTS/cli-config-path.txt" || fail "config path did not include ASTRID_HOME"
+  run_cli status > "$ARTIFACTS/cli-status.txt"
+  grep -q "Astrid daemon" "$ARTIFACTS/cli-status.txt" || fail "status did not report running daemon"
+  printf '$ astrid doctor\n' >> "$ARTIFACTS/cli-transcript.log"
+  "$CORE_DIR/target/debug/astrid" doctor > "$ARTIFACTS/cli-doctor.txt" \
+    2> >(tee -a "$ARTIFACTS/cli-transcript.log" >&2) || true
+  sed -n '1,120p' "$ARTIFACTS/cli-doctor.txt" >> "$ARTIFACTS/cli-transcript.log"
+  grep -q "ASTRID_HOME" "$ARTIFACTS/cli-doctor.txt" || fail "doctor did not inspect ASTRID_HOME"
+}
+
+json_assert_cli_agent_list() {
+  local file=$1 user=$2 ops=$3
+  "$PYTHON" - "$file" "$user" "$ops" <<'PY'
+import json
+import sys
+
+data = json.load(open(sys.argv[1], encoding="utf-8"))
+principals = {entry.get("principal"): entry for entry in data}
+for principal in sys.argv[2:]:
+    entry = principals.get(principal)
+    if not entry:
+        raise SystemExit(f"missing principal {principal!r}: {list(principals)}")
+    if entry.get("enabled") is not True:
+        raise SystemExit(f"principal {principal!r} not enabled: {entry!r}")
+PY
+}
+
+json_assert_cli_agent_show() {
+  local file=$1 principal=$2 group=$3
+  "$PYTHON" - "$file" "$principal" "$group" <<'PY'
+import json
+import sys
+
+data = json.load(open(sys.argv[1], encoding="utf-8"))
+if data.get("principal") != sys.argv[2]:
+    raise SystemExit(f"unexpected principal: {data!r}")
+if sys.argv[3] not in data.get("groups", []):
+    raise SystemExit(f"missing expected group {sys.argv[3]!r}: {data!r}")
+PY
+}
+
+json_assert_cli_group() {
+  local file=$1 name=$2 cap=$3
+  "$PYTHON" - "$file" "$name" "$cap" <<'PY'
+import json
+import sys
+
+data = json.load(open(sys.argv[1], encoding="utf-8"))
+if isinstance(data, list):
+    data = next((entry for entry in data if entry.get("name") == sys.argv[2]), None)
+if not data or data.get("name") != sys.argv[2]:
+    raise SystemExit(f"group {sys.argv[2]!r} missing: {data!r}")
+if sys.argv[3] not in data.get("capabilities", []):
+    raise SystemExit(f"group missing capability {sys.argv[3]!r}: {data!r}")
+PY
+}
+
+json_assert_cli_caps_show() {
+  local file=$1 principal=$2 group=$3
+  "$PYTHON" - "$file" "$principal" "$group" <<'PY'
+import json
+import sys
+
+data = json.load(open(sys.argv[1], encoding="utf-8"))
+if data.get("principal") != sys.argv[2]:
+    raise SystemExit(f"unexpected caps principal: {data!r}")
+if sys.argv[3] not in data.get("groups", []):
+    raise SystemExit(f"missing caps group {sys.argv[3]!r}: {data!r}")
+PY
+}
+
+json_assert_cli_quota() {
+  local file=$1 principal=$2 processes=$3
+  "$PYTHON" - "$file" "$principal" "$processes" <<'PY'
+import json
+import sys
+
+data = json.load(open(sys.argv[1], encoding="utf-8"))
+if data.get("principal") != sys.argv[2]:
+    raise SystemExit(f"unexpected quota principal: {data!r}")
+if data.get("max_background_processes") != int(sys.argv[3]):
+    raise SystemExit(f"unexpected process quota: {data!r}")
+PY
+}
+
+json_assert_cli_capsule_show() {
+  local file=$1 name=$2
+  "$PYTHON" - "$file" "$name" <<'PY'
+import json
+import sys
+
+data = json.load(open(sys.argv[1], encoding="utf-8"))
+if data.get("name") != sys.argv[2]:
+    raise SystemExit(f"unexpected capsule: {data!r}")
+manifest = data.get("manifest", "")
+if 'name = "astrid-capsule-openai-compat"' not in manifest:
+    raise SystemExit("capsule manifest body missing package identity")
+PY
+}
+
+json_assert_cli_capsule_config() {
+  local file=$1 model=$2
+  "$PYTHON" - "$file" "$model" <<'PY'
+import json
+import sys
+
+data = json.load(open(sys.argv[1], encoding="utf-8"))
+if data.get("model") != sys.argv[2]:
+    raise SystemExit(f"unexpected capsule model config: {data!r}")
+if "api_key" in data:
+    raise SystemExit(f"capsule config leaked secret key metadata/value: {data!r}")
+PY
+}
+
+json_assert_cli_version() {
+  local file=$1
+  "$PYTHON" - "$file" <<'PY'
+import json
+import sys
+
+data = json.load(open(sys.argv[1], encoding="utf-8"))
+for key in ("version", "commit", "target"):
+    if not data.get(key):
+        raise SystemExit(f"version output missing {key}: {data!r}")
+PY
+}
+
+json_assert_cli_config_show() {
+  local file=$1
+  "$PYTHON" - "$file" <<'PY'
+import json
+import sys
+
+data = json.load(open(sys.argv[1], encoding="utf-8"))
+if not isinstance(data, dict):
+    raise SystemExit(f"config output is not an object: {data!r}")
+if "security" not in data:
+    raise SystemExit(f"config output missing security section: {data!r}")
+PY
+}

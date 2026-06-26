@@ -79,8 +79,13 @@ pub(crate) fn show_paths() -> Result<()> {
     let workspace = std::env::current_dir()
         .ok()
         .map(|p| p.to_string_lossy().to_string());
+    let astrid_home = std::env::var("ASTRID_HOME").ok();
 
-    let paths = ResolvedConfig::config_paths(home.as_deref(), workspace.as_deref());
+    let paths = ResolvedConfig::config_paths_with_astrid_home(
+        home.as_deref(),
+        astrid_home.as_deref(),
+        workspace.as_deref(),
+    );
 
     println!("Configuration files checked (in precedence order):\n");
     for (i, path) in paths.iter().enumerate() {

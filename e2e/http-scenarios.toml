@@ -10,12 +10,12 @@
 
 [routes."GET /api/distribution"]
 scenario = "public_distribution"
-status = "mapped"
+status = "covered"
 auth = "public"
 
 [routes."GET /api/distribution/onboarding"]
 scenario = "public_distribution"
-status = "mapped"
+status = "covered"
 auth = "public"
 
 [routes."POST /api/auth/redeem"]
@@ -260,12 +260,12 @@ auth = "bearer"
 
 [routes."GET /api/sys/readiness"]
 scenario = "system_readiness"
-status = "mapped"
+status = "covered"
 auth = "bearer"
 
 [routes."POST /api/sys/capsules/reload"]
 scenario = "capsule_live_load_lifecycle"
-status = "mapped"
+status = "covered"
 auth = "bearer"
 
 [routes."GET /healthz"]
@@ -275,10 +275,10 @@ auth = "public"
 
 [routes."GET /metrics"]
 scenario = "ops_metrics"
-status = "mapped"
+status = "covered"
 auth = "public"
 
 [routes."GET /api/openapi.json"]
 scenario = "openapi_contract"
-status = "mapped"
+status = "covered"
 auth = "public"

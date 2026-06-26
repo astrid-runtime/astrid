@@ -120,11 +120,23 @@ impl ResolvedConfig {
     /// List all config file paths that are checked during loading.
     #[must_use]
     pub fn config_paths(home_dir: Option<&str>, workspace_root: Option<&str>) -> Vec<String> {
+        Self::config_paths_with_astrid_home(home_dir, None, workspace_root)
+    }
+
+    /// List config file paths, preserving an explicit `ASTRID_HOME` user layer.
+    #[must_use]
+    pub fn config_paths_with_astrid_home(
+        home_dir: Option<&str>,
+        astrid_home: Option<&str>,
+        workspace_root: Option<&str>,
+    ) -> Vec<String> {
         let mut paths = Vec::new();
 
         paths.push("/etc/astrid/config.toml".to_owned());
 
-        if let Some(home) = home_dir {
+        if let Some(home) = astrid_home {
+            paths.push(format!("{home}/config.toml"));
+        } else if let Some(home) = home_dir {
             paths.push(format!("{home}/.astrid/config.toml"));
         } else {
             paths.push("~/.astrid/config.toml".to_owned());
@@ -210,5 +222,16 @@ mod tests {
         assert!(paths[0].contains("/etc/astrid"));
         assert!(paths[1].contains("/home/user/.astrid"));
         assert!(paths[2].contains("/home/user/project/.astrid"));
+    }
+
+    #[test]
+    fn config_paths_prefer_explicit_astrid_home() {
+        let paths = ResolvedConfig::config_paths_with_astrid_home(
+            Some("/home/user"),
+            Some("/tmp/astrid-home"),
+            Some("/home/user/project"),
+        );
+        assert_eq!(paths[1], "/tmp/astrid-home/config.toml");
+        assert!(!paths[1].contains("/home/user/.astrid"));
     }
 }

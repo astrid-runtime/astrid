@@ -1,13 +1,5 @@
 #!/usr/bin/env bash
-# Full-runtime Astrid smoke harness for CI.
-#
-# This script owns a temp ASTRID_HOME, builds real binaries, installs real
-# capsule artifacts from local checkouts, points openai-compat at the local
-# fake OpenAI-compatible server, and exercises the model/prompt path through
-# the CLI plus gateway.
-
 set -euo pipefail
-
 CORE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 SCRIPT_DIR="$CORE_DIR/scripts/e2e"
 CAPSULES_DIR="${ASTRID_E2E_CAPSULES_DIR:-$CORE_DIR/../capsules}"
@@ -17,28 +9,39 @@ GATEWAY_HOST="${ASTRID_E2E_GATEWAY_HOST:-127.0.0.1}"
 GATEWAY_PORT="${ASTRID_E2E_GATEWAY_PORT:-38756}"
 GATEWAY="http://$GATEWAY_HOST:$GATEWAY_PORT"
 PYTHON="${PYTHON:-python3}"
-
-# Keep this list explicit. Adding a shipped capsule to the core prompt/model
-# story should be an intentional CI contract change.
 CORE_CAPSULES="${ASTRID_E2E_CORE_CAPSULES:-astrid-capsule-cli astrid-capsule-registry astrid-capsule-session astrid-capsule-identity astrid-capsule-prompt-builder astrid-capsule-react astrid-capsule-openai-compat}"
-
 DAEMON_PID=""
+SECONDARY_DAEMON_PID=""
+SECONDARY_HOME=""
 FAKE_PID=""
 POISON_HOME=""
-
+LAST_HTTP_OUT=""
 terminate_pid() {
   local pid=$1
   if [[ -n "$pid" ]]; then
     kill "$pid" 2>/dev/null || true
+    for _ in {1..50}; do
+      if ! kill -0 "$pid" 2>/dev/null; then
+        wait "$pid" 2>/dev/null || true
+        return
+      fi
+      sleep 0.1
+    done
+    kill -KILL "$pid" 2>/dev/null || true
     wait "$pid" 2>/dev/null || true
   fi
 }
-
 cleanup() {
   local status=$?
   trap - EXIT INT TERM
   terminate_pid "$DAEMON_PID"
+  terminate_pid "$SECONDARY_DAEMON_PID"
   terminate_pid "$FAKE_PID"
+  if [[ -n "$SECONDARY_HOME" && -z "${ASTRID_E2E_KEEP_HOME:-}" && "$status" -eq 0 ]]; then
+    rm -rf "$SECONDARY_HOME"
+  elif [[ -n "$SECONDARY_HOME" ]]; then
+    printf 'kept secondary ASTRID_HOME=%s\n' "$SECONDARY_HOME"
+  fi
   if [[ "$status" -ne 0 && -d "$ASTRID_HOME/log" ]]; then mkdir -p "$ARTIFACTS/astrid-log" && cp -a "$ASTRID_HOME/log/." "$ARTIFACTS/astrid-log/" 2>/dev/null || true; fi
   if [[ -n "$POISON_HOME" && -z "${ASTRID_E2E_KEEP_HOME:-}" ]]; then
     rm -rf "$POISON_HOME"
@@ -53,17 +56,19 @@ cleanup() {
   return "$status"
 }
 trap cleanup EXIT INT TERM
-
+. "$SCRIPT_DIR/runtime-json-asserts.sh"
+. "$SCRIPT_DIR/runtime-gateway-smoke.sh"
+. "$SCRIPT_DIR/runtime-cli-smoke.sh"
+. "$SCRIPT_DIR/runtime-multi-home-smoke.sh"
+. "$SCRIPT_DIR/runtime-llm-smoke.sh"
 note() { printf '\n==> %s\n' "$*"; }
 fail() { printf 'error: %s\n' "$*" >&2; exit 1; }
-
 run_cli() {
   printf '$ astrid %s\n' "$*" >> "$ARTIFACTS/cli-transcript.log"
   "$CORE_DIR/target/debug/astrid" "$@" \
     > >(tee -a "$ARTIFACTS/cli-transcript.log") \
     2> >(tee -a "$ARTIFACTS/cli-transcript.log" >&2)
 }
-
 run_principal_cli() {
   local principal=$1; shift
   printf '$ astrid --principal %s %s\n' "$principal" "$*" >> "$ARTIFACTS/cli-transcript.log"
@@ -71,7 +76,6 @@ run_principal_cli() {
     > >(tee -a "$ARTIFACTS/cli-transcript.log") \
     2> >(tee -a "$ARTIFACTS/cli-transcript.log" >&2)
 }
-
 http_status() {
   local method=$1
   local path=$2
@@ -93,337 +97,20 @@ http_status() {
   if [[ -n "$body" ]]; then
     args+=(-H "Content-Type: application/json" -d "$body")
   fi
+  LAST_HTTP_OUT="$out"
   curl "${args[@]}"
 }
-
 assert_status() {
   local label=$1
   local got=$2
   local want=$3
   if [[ "$got" != "$want" ]]; then
+    if [[ -n "${LAST_HTTP_OUT:-}" && -f "$LAST_HTTP_OUT" ]]; then
+      printf 'response body (%s):\n' "$LAST_HTTP_OUT" >&2
+      sed -n '1,80p' "$LAST_HTTP_OUT" >&2 || true
+    fi
     fail "$label expected HTTP $want, got $got"
   fi
-}
-
-json_field() {
-  local file=$1
-  local field=$2
-  "$PYTHON" - "$file" "$field" <<'PY'
-import json
-import sys
-
-value = json.load(open(sys.argv[1], encoding="utf-8"))
-for part in sys.argv[2].split("."):
-    value = value[part]
-print(value)
-PY
-}
-
-json_assert_principal_list_is_self_only() {
-  local file=$1
-  local principal=$2
-  "$PYTHON" - "$file" "$principal" <<'PY'
-import json
-import sys
-
-data = json.load(open(sys.argv[1], encoding="utf-8"))
-principal = sys.argv[2]
-principals = [entry["principal"] for entry in data.get("principals", [])]
-if principal not in principals:
-    raise SystemExit(f"{principal} missing from principal list: {principals}")
-if "default" in principals and principal != "default":
-    raise SystemExit(f"non-admin principal saw default in principal list: {principals}")
-PY
-}
-
-json_assert_field_equals() {
-  local file=$1
-  local field=$2
-  local expected=$3
-  local found
-  found="$(json_field "$file" "$field")"
-  [[ "$found" == "$expected" ]] || fail "$field in $file was $found, expected $expected"
-}
-
-json_assert_model_id() {
-  local file=$1
-  local expected=$2
-  "$PYTHON" - "$file" "$expected" <<'PY'
-import json
-import sys
-
-data = json.load(open(sys.argv[1], encoding="utf-8"))
-expected = sys.argv[2]
-found = data.get("id") if isinstance(data, dict) else None
-if found != expected:
-    raise SystemExit(f"expected model id {expected!r}, got {found!r}: {data!r}")
-PY
-}
-
-json_assert_model_list_contains() {
-  local file=$1
-  local expected=$2
-  "$PYTHON" - "$file" "$expected" <<'PY'
-import json
-import sys
-
-data = json.load(open(sys.argv[1], encoding="utf-8"))
-expected = sys.argv[2]
-if isinstance(data, dict) and isinstance(data.get("data"), list):
-    data = data["data"]
-ids = [entry.get("id") for entry in data if isinstance(entry, dict)]
-if expected not in ids:
-    raise SystemExit(f"expected {expected!r} in model ids {ids!r}")
-PY
-}
-
-json_assert_session_list_scope() {
-  local file=$1 expected=$2 forbidden=$3
-  "$PYTHON" - "$file" "$expected" "$forbidden" <<'PY'
-import json
-import sys
-
-data = json.load(open(sys.argv[1], encoding="utf-8"))
-expected = sys.argv[2]
-forbidden = sys.argv[3]
-sessions = data.get("sessions", [])
-ids = [entry.get("session_id") for entry in sessions if isinstance(entry, dict)]
-if expected not in ids:
-    raise SystemExit(f"expected session {expected!r} in {ids!r}")
-if forbidden in ids:
-    raise SystemExit(f"forbidden cross-principal session {forbidden!r} appeared in {ids!r}")
-PY
-}
-
-json_assert_session_summary() {
-  local file=$1 expected_id=$2 expected_title=$3
-  "$PYTHON" - "$file" "$expected_id" "$expected_title" <<'PY'
-import json
-import sys
-
-data = json.load(open(sys.argv[1], encoding="utf-8"))
-expected_id = sys.argv[2]
-expected_title = None if sys.argv[3] == "null" else sys.argv[3]
-if data.get("session_id") != expected_id:
-    raise SystemExit(f"expected session id {expected_id!r}, got {data!r}")
-if data.get("title") != expected_title:
-    raise SystemExit(f"expected title {expected_title!r}, got {data!r}")
-PY
-}
-
-json_assert_session_messages_contains() {
-  local file=$1 expected_id=$2 expected_text=$3
-  "$PYTHON" - "$file" "$expected_id" "$expected_text" <<'PY'
-import json
-import sys
-
-data = json.load(open(sys.argv[1], encoding="utf-8"))
-expected_id = sys.argv[2]
-expected_text = sys.argv[3]
-if data.get("session_id") != expected_id:
-    raise SystemExit(f"expected transcript id {expected_id!r}, got {data!r}")
-blob = json.dumps(data.get("messages", []), sort_keys=True)
-if expected_text not in blob:
-    raise SystemExit(f"expected transcript text {expected_text!r} not found in {blob!r}")
-PY
-}
-
-json_assert_session_messages_empty() {
-  local file=$1 expected_id=$2
-  "$PYTHON" - "$file" "$expected_id" <<'PY'
-import json
-import sys
-
-data = json.load(open(sys.argv[1], encoding="utf-8"))
-expected_id = sys.argv[2]
-if data.get("session_id") != expected_id:
-    raise SystemExit(f"expected transcript id {expected_id!r}, got {data!r}")
-messages = data.get("messages")
-if messages != []:
-    raise SystemExit(f"expected empty cross-principal transcript, got {messages!r}")
-PY
-}
-
-json_assert_session_search_scope() {
-  local file=$1 expected=$2 forbidden=$3
-  "$PYTHON" - "$file" "$expected" "$forbidden" <<'PY'
-import json
-import sys
-
-data = json.load(open(sys.argv[1], encoding="utf-8"))
-expected = sys.argv[2]
-forbidden = sys.argv[3]
-results = data.get("results", [])
-ids = [entry.get("session_id") for entry in results if isinstance(entry, dict)]
-if expected != "-" and expected not in ids:
-    raise SystemExit(f"expected search hit {expected!r} in {ids!r}")
-if forbidden in ids:
-    raise SystemExit(f"forbidden cross-principal search hit {forbidden!r} appeared in {ids!r}")
-PY
-}
-
-json_assert_deleted_flag() {
-  local file=$1 expected=$2
-  "$PYTHON" - "$file" "$expected" <<'PY'
-import json
-import sys
-
-data = json.load(open(sys.argv[1], encoding="utf-8"))
-expected = sys.argv[2].lower() == "true"
-if data.get("deleted") is not expected:
-    raise SystemExit(f"expected deleted={expected!r}, got {data!r}")
-PY
-}
-
-json_assert_capsule_env_models() {
-  local home=$1
-  local capsule=$2
-  local default_principal=$3
-  local user_principal=$4
-  local ops_principal=$5
-  local default_model=$6
-  local user_model=$7
-  local ops_model=$8
-  "$PYTHON" - "$home" "$capsule" "$default_principal" "$user_principal" "$ops_principal" "$default_model" "$user_model" "$ops_model" <<'PY'
-import json
-import sys
-from pathlib import Path
-
-home = Path(sys.argv[1])
-capsule = sys.argv[2]
-default_principal = sys.argv[3]
-user_principal = sys.argv[4]
-ops_principal = sys.argv[5]
-default_model = sys.argv[6]
-user_model = sys.argv[7]
-ops_model = sys.argv[8]
-
-def read_env(principal: str) -> dict:
-    path = home / "home" / principal / ".config" / "env" / f"{capsule}.env.json"
-    if not path.exists():
-        raise SystemExit(f"missing env file for {principal}: {path}")
-    return json.loads(path.read_text(encoding="utf-8"))
-
-default_env = read_env(default_principal)
-user_env = read_env(user_principal)
-ops_env = read_env(ops_principal)
-
-if default_env.get("model") != default_model:
-    raise SystemExit(f"default model drifted: {default_env!r}")
-if user_env.get("model") != user_model:
-    raise SystemExit(f"user model write missed or leaked: {user_env!r}")
-if ops_env.get("model") != ops_model:
-    raise SystemExit(f"ops model write missed or leaked: {ops_env!r}")
-if user_env.get("model") == ops_env.get("model"):
-    raise SystemExit(f"user and ops env models unexpectedly match: {user_env!r} / {ops_env!r}")
-PY
-}
-
-json_assert_secret_list_metadata() {
-  local file=$1
-  local capsule=$2
-  local key=$3
-  "$PYTHON" - "$file" "$capsule" "$key" <<'PY'
-import json
-import sys
-
-data = json.load(open(sys.argv[1], encoding="utf-8"))
-capsule = sys.argv[2]
-key = sys.argv[3]
-matches = [
-    entry for entry in data
-    if entry.get("capsule") == capsule and entry.get("key") == key
-]
-if len(matches) != 1:
-    raise SystemExit(f"expected one secret metadata entry for {capsule}/{key}, got {matches!r}")
-entry = matches[0]
-if entry.get("storage") != "file":
-    raise SystemExit(f"secret metadata did not report file storage: {entry!r}")
-if entry.get("scope") != "agent":
-    raise SystemExit(f"secret metadata did not report agent scope: {entry!r}")
-for forbidden in ("value", "secret"):
-    if forbidden in entry:
-        raise SystemExit(f"secret metadata leaked {forbidden!r}: {entry!r}")
-PY
-}
-
-json_assert_secret_files_isolated() {
-  local home=$1
-  local capsule=$2
-  local default_secret=$3
-  local user_principal=$4
-  local user_secret=$5
-  local ops_principal=$6
-  local ops_secret=$7
-  "$PYTHON" - "$home" "$capsule" "$default_secret" "$user_principal" "$user_secret" "$ops_principal" "$ops_secret" <<'PY'
-import os
-import stat
-import sys
-from pathlib import Path
-
-home = Path(sys.argv[1])
-capsule = sys.argv[2]
-default_secret = sys.argv[3]
-user_principal = sys.argv[4]
-user_secret = sys.argv[5]
-ops_principal = sys.argv[6]
-ops_secret = sys.argv[7]
-
-expected = {
-    "default": default_secret,
-    user_principal: user_secret,
-    ops_principal: ops_secret,
-}
-
-for principal, value in expected.items():
-    path = home / "secrets" / principal / capsule / "api_key"
-    if not path.exists():
-        raise SystemExit(f"missing secret file for {principal}: {path}")
-    found = path.read_text(encoding="utf-8")
-    if found != value:
-        raise SystemExit(f"secret value for {principal} did not match its own sentinel")
-    mode = stat.S_IMODE(path.stat().st_mode)
-    if mode != 0o600:
-        raise SystemExit(f"secret file for {principal} has mode {mode:o}, expected 600")
-
-if len(set(expected.values())) != len(expected):
-    raise SystemExit("test sentinels must be distinct")
-PY
-}
-
-json_assert_device_list_contains() {
-  local file=$1
-  local key_id=$2
-  "$PYTHON" - "$file" "$key_id" <<'PY'
-import json
-import sys
-
-data = json.load(open(sys.argv[1], encoding="utf-8"))
-key_id = sys.argv[2]
-devices = data.get("devices", [])
-ids = [device.get("key_id") for device in devices if isinstance(device, dict)]
-if key_id not in ids:
-    raise SystemExit(f"expected device {key_id!r} in {ids!r}")
-PY
-}
-
-assert_poison_home_unused() {
-  local home=$1
-  local astrid_dir="$home/.astrid"
-  local forbidden=(
-    "$astrid_dir/run/system.sock"
-    "$astrid_dir/run/system.token"
-    "$astrid_dir/keys/gateway.ed25519"
-    "$astrid_dir/home/regular-user"
-    "$astrid_dir/home/operator-1"
-    "$astrid_dir/secrets"
-  )
-  local path
-  for path in "${forbidden[@]}"; do
-    if [[ -e "$path" ]]; then
-      fail "poisoned HOME was used unexpectedly: $path exists"
-    fi
-  done
 }
 
 redeem_invite() {
@@ -499,9 +186,25 @@ require_capsules() {
 
 redaction_check() {
   local sentinel=$1
-  if grep -R --fixed-strings "$sentinel" "$ARTIFACTS" >/dev/null 2>&1; then
-    fail "sentinel secret leaked into runtime e2e artifacts"
-  fi
+  local targets=("$ARTIFACTS")
+  local target
+  local log_dir
+
+  for target in "$ASTRID_HOME" "$SECONDARY_HOME"; do
+    [[ -n "$target" ]] || continue
+    [[ -d "$target/log" ]] && targets+=("$target/log")
+    if [[ -d "$target/home" ]]; then
+      while IFS= read -r -d '' log_dir; do
+        targets+=("$log_dir")
+      done < <(find "$target/home" -path '*/.local/log' -type d -print0 2>/dev/null)
+    fi
+  done
+
+  for target in "${targets[@]}"; do
+    if grep -R --fixed-strings "$sentinel" "$target" >/dev/null 2>&1; then
+      fail "sentinel secret leaked into runtime e2e logs/artifacts under $target"
+    fi
+  done
 }
 
 main() {
@@ -578,9 +281,10 @@ EOF
 
   export HOME="$POISON_HOME"
   start_daemon "starting daemon"
+  run_gateway_public_surface_smoke
 
   note "checking principal and capability isolation"
-  run_cli group create ops-team --caps "capsule:install,invite:issue,invite:list"
+  run_cli group create ops-team --caps "capsule:install,invite:issue,invite:list,self:capsule:list"
 
   local ops_invite
   ops_invite="$("$CORE_DIR/target/debug/astrid" invite issue --group ops-team --max-uses 1 --expires-secs 600 --raw \
@@ -625,7 +329,6 @@ EOF
 
   note "assigning prompt capsule set to isolated principals"
   local prompt_capsules=(
-    --add-capsule astrid-capsule-cli \
     --add-capsule astrid-capsule-registry \
     --add-capsule astrid-capsule-session \
     --add-capsule astrid-capsule-identity \
@@ -636,6 +339,18 @@ EOF
   run_cli agent modify "$user_principal" "${prompt_capsules[@]}"
   run_cli agent modify "$ops_principal" "${prompt_capsules[@]}"
 
+  note "checking default-only capsule surface isolation"
+  local label bearer
+  for pair in "agent:$user_bearer" "operator:$ops_bearer"; do
+    label="${pair%%:*}"; bearer="${pair#*:}"
+    status="$(http_status GET /api/capsules "$bearer" "" "$ARTIFACTS/$label-capsules.json")"; assert_status "$label capsule list" "$status" 200
+    grep -q '"astrid-capsule-registry"' "$ARTIFACTS/$label-capsules.json" || fail "$label capsule list missed granted registry capsule"; ! grep -q '"astrid-capsule-cli"' "$ARTIFACTS/$label-capsules.json" || fail "$label saw default-only cli capsule"
+    status="$(http_status GET /api/capsules/astrid-capsule-cli "$bearer" "" "$ARTIFACTS/$label-default-only-capsule.json")"; assert_status "$label default-only capsule detail hidden" "$status" 404
+    status="$(http_status GET /api/capsules/astrid-capsule-cli/env "$bearer" "" "$ARTIFACTS/$label-default-only-env.json")"; assert_status "$label default-only capsule env hidden" "$status" 404
+    status="$(http_status POST /api/capsules/astrid-capsule-cli/env/unused "$bearer" '{"value":"should-not-write"}' "$ARTIFACTS/$label-default-only-env-write.json")"; assert_status "$label default-only capsule env write hidden" "$status" 404
+  done
+  run_gateway_principal_surface_smoke agent "$user_bearer" 204
+  run_gateway_principal_surface_smoke operator "$ops_bearer" 403
   status="$(http_status POST /api/auth/pair-device "$user_bearer" \
     '{"expires_secs":120,"label":"regular-user phone"}' \
     "$ARTIFACTS/agent-pair-device.json")"
@@ -796,6 +511,7 @@ PY
     astrid-capsule-openai-compat api_key
   json_assert_secret_list_metadata "$ARTIFACTS/operator-secret-list.json" \
     astrid-capsule-openai-compat api_key
+  run_cli_semantic_smoke "$user_principal" "$ops_principal"
 
   curl -sN --max-time 3 \
     -H "Authorization: Bearer $user_bearer" \
@@ -849,6 +565,9 @@ PY
     "$ARTIFACTS/agent-set-active-model-body-spoof.json")"
   assert_status "agent active model body spoof ignored" "$status" 200
   json_assert_model_id "$ARTIFACTS/agent-set-active-model-body-spoof.json" "openai-compat:fake-slow"
+  run_llm_provider_smoke "$user_bearer" "$user_principal" "$ARTIFACTS/agent-models.json"
+
+  run_multi_home_smoke "$fake_base_url" "$user_bearer" "$user_principal"
 
   note "checking per-principal session isolation"
   local user_session ops_session
@@ -861,6 +580,7 @@ PY
     "$user_session_text" > "$ARTIFACTS/agent-session-run.json"
   run_principal_cli "$ops_principal" run --format json --session "$ops_session" \
     "$ops_session_text" > "$ARTIFACTS/operator-session-run.json"
+  assert_principal_llm_attribution "$user_session_text" "$ops_session_text"
 
   status="$(http_status GET "/api/agent/sessions?include_archived=true&limit=20" "$user_bearer" "" \
     "$ARTIFACTS/agent-sessions.json")"

@@ -745,6 +745,7 @@ dependencies = [
  "astrid-mcp",
  "astrid-storage",
  "astrid-vfs",
+ "async-trait",
  "base64",
  "chrono",
  "dashmap",

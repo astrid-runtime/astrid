@@ -278,6 +278,63 @@ async fn request_capsule_round_trips_scoped_reply() {
     assert!(parsed.next_cursor.is_none());
 }
 
+/// Real WASM capsule `publish_json` replies arrive at the gateway as
+/// `IpcPayload::Custom { data }`. The gateway must unwrap the guest-visible
+/// JSON body before checking correlation, not inspect the enum wrapper.
+#[tokio::test]
+async fn request_capsule_round_trips_custom_json_reply() {
+    let bus = Arc::new(EventBus::new());
+    let principal = PrincipalId::new("alice").expect("valid principal");
+    let correlation_id = "corr-custom-1";
+    let response_topic = format!("{TOPIC_LIST_RESPONSE_PREFIX}.{correlation_id}");
+
+    let mut req_rx = bus.subscribe_topic(TOPIC_LIST_REQUEST.to_string());
+    let bus_capsule = Arc::clone(&bus);
+    let resp_topic = response_topic.clone();
+    let cid = correlation_id.to_string();
+    let capsule = tokio::spawn(async move {
+        let event = req_rx.recv().await.expect("request arrives");
+        let reply = serde_json::json!({
+            "correlation_id": cid,
+            "sessions": [],
+            "next_cursor": null
+        });
+        let mut msg = IpcMessage::new(
+            Topic::from_raw(resp_topic.clone()),
+            IpcPayload::Custom { data: reply },
+            Uuid::nil(),
+        );
+        if let AstridEvent::Ipc { message, .. } = &*event
+            && let Some(principal) = &message.principal
+        {
+            msg = msg.with_principal(principal.clone());
+        }
+        bus_capsule.publish(AstridEvent::Ipc {
+            metadata: EventMetadata::new("test::capsule"),
+            message: msg,
+        });
+    });
+
+    let payload = build_list_payload(correlation_id, None, DEFAULT_LIMIT, false);
+    let value = request_capsule(
+        &bus,
+        TOPIC_LIST_REQUEST,
+        &response_topic,
+        payload,
+        correlation_id,
+        &principal,
+        None,
+        CAPSULE_TIMEOUT,
+    )
+    .await
+    .expect("helper returns the capsule publish_json reply");
+
+    capsule.await.expect("stand-in capsule task joins");
+    let parsed = parse_list_response(value).expect("reply deserializes");
+    assert!(parsed.sessions.is_empty());
+    assert!(parsed.next_cursor.is_none());
+}
+
 #[test]
 fn resolve_search_limit_defaults_and_caps() {
     assert_eq!(resolve_search_limit(None).unwrap(), DEFAULT_SEARCH_LIMIT);
@@ -622,8 +679,7 @@ async fn request_capsule_round_trips_update_reply() {
     assert_eq!(summary.title.as_deref(), Some("renamed"));
 }
 
-/// A reply stamped for a different principal is dropped by the routed
-/// subscription before the correlation check can see it. This protects a
+/// A reply stamped for a different principal is ignored. This protects a
 /// same-topic reply from satisfying another caller's request.
 #[tokio::test]
 async fn request_capsule_ignores_wrong_principal_reply() {

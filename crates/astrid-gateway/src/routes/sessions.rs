@@ -1,22 +1,15 @@
-//! `GET /api/agent/sessions` (+ `/{id}`, `/{id}/messages`),
-//! `PATCH`/`DELETE /api/agent/sessions/{id}`, and
-//! `GET /api/agent/sessions/search` — expose and manage a principal's
-//! conversation threads over HTTP.
+//! Principal-scoped session HTTP routes backed by the session capsule.
 //!
 //! Every route proxies to the `capsule-session` capsule over the
-//! in-process event bus, mirroring the request/reply-over-bus shape
-//! `bus_admin.rs` uses for kernel admin ops but targeting capsule
-//! topics instead. The gateway:
+//! in-process event bus. The gateway:
 //!
 //! 1. Generates a fresh `correlation_id` (UUID v4).
-//! 2. Subscribes to a **per-correlation, principal-scoped** response topic
-//!    (`session.v1.response.<verb>.<correlation_id>`) FIRST — before
-//!    publishing — so a fast capsule reply can't land before the
-//!    subscription is open.
+//! 2. Subscribes to `session.v1.response.<verb>.<correlation_id>` before
+//!    publishing so a fast reply cannot race the subscription.
 //! 3. Publishes the request, principal-stamped, on the verb's request
 //!    topic.
-//! 4. Awaits one reply on the scoped topic (verifying `correlation_id`
-//!    defensively), with a 15s timeout.
+//! 4. Awaits one reply on a route scoped to the caller principal, then
+//!    verifies the body correlation.
 //!
 //! ## Trust boundary
 //!
@@ -921,8 +914,9 @@ async fn request_capsule(
 ) -> GatewayResult<Value> {
     // Subscribe FIRST. A fast capsule can publish the reply on the same
     // task that processed the request — subscribing afterwards races it.
-    // Scope the reply route to the caller principal so a foreign principal's
-    // response on the same topic never enters this receiver's queue.
+    // The response topic includes a fresh correlation id. We still validate
+    // the body correlation before returning. The routed scope rejects
+    // replies stamped for any other principal, including owner/default.
     let principal = principal.to_string();
     let mut receiver = bus.subscribe_topic_routed_scoped(
         Uuid::new_v4(),
@@ -937,7 +931,7 @@ async fn request_capsule(
         IpcPayload::RawJson(payload),
         Uuid::new_v4(),
     )
-    .with_principal(principal)
+    .with_principal(principal.clone())
     .with_origin(MessageOrigin::RemoteGateway);
     if let Some(key_id) = device_key_id {
         msg = msg.with_device_key_id(key_id.to_string());
@@ -964,29 +958,23 @@ async fn request_capsule(
         let AstridEvent::Ipc { message, .. } = &*event else {
             continue;
         };
-        let value: Value = match &message.payload {
-            IpcPayload::RawJson(v) => v.clone(),
-            other => match serde_json::to_value(other) {
-                Ok(v) => v,
-                Err(_) => continue,
-            },
+        let Ok(value) = session_reply_payload_json(&message.payload) else {
+            continue;
         };
-        // Defensive correlation check. The scoped topic already isolates
-        // this request's reply, but a capsule bug (or a foreign publisher
-        // on the same topic) must not slip a mismatched body through. A
-        // mismatch falls through to the next loop iteration (keep waiting).
         if value.get("correlation_id").and_then(Value::as_str) == Some(correlation_id) {
             return Ok(value);
         }
     }
 }
 
-/// Build the timeout error. A slow/absent session capsule should be
-/// distinguishable from a gateway fault, so we surface it as an
-/// **upstream** error rather than a blanket `500`. `GatewayError` has no
-/// dedicated `504 Gateway Timeout` variant; the closest honest fit is
-/// `Kernel`, which maps to `502 Bad Gateway` (an upstream that didn't
-/// answer). The message names the timeout explicitly.
+fn session_reply_payload_json(payload: &IpcPayload) -> GatewayResult<Value> {
+    let bytes = payload
+        .to_guest_bytes()
+        .map_err(|e| GatewayError::Kernel(format!("session capsule returned invalid JSON: {e}")))?;
+    serde_json::from_slice(&bytes)
+        .map_err(|e| GatewayError::Kernel(format!("session capsule returned invalid JSON: {e}")))
+}
+
 fn capsule_timeout(response_topic: &str, timeout: Duration) -> GatewayError {
     GatewayError::Kernel(format!(
         "session capsule did not reply within {}s on {response_topic}",

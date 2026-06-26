@@ -3,6 +3,77 @@
 
 use super::*;
 
+use astrid_capsule::capsule::{Capsule, CapsuleId, CapsuleState};
+use astrid_capsule::context::CapsuleContext;
+use astrid_capsule::error::CapsuleResult;
+use astrid_capsule::manifest::{CapsuleManifest, CommandDef, PackageDef};
+use astrid_core::kernel_api::CommandKind;
+use astrid_core::profile::PrincipalProfile;
+
+struct InventoryCapsule {
+    id: CapsuleId,
+    manifest: CapsuleManifest,
+}
+
+impl InventoryCapsule {
+    fn new(name: &str, command: &str) -> Self {
+        Self {
+            id: CapsuleId::new(name).expect("valid capsule id"),
+            manifest: CapsuleManifest {
+                package: PackageDef {
+                    name: name.to_string(),
+                    version: "0.0.1".to_string(),
+                    description: None,
+                    authors: Vec::new(),
+                    repository: None,
+                    homepage: None,
+                    documentation: None,
+                    license: None,
+                    license_file: None,
+                    readme: None,
+                    keywords: Vec::new(),
+                    categories: Vec::new(),
+                    astrid_version: None,
+                    publish: None,
+                    include: None,
+                    exclude: None,
+                    metadata: None,
+                },
+                commands: vec![CommandDef {
+                    name: command.to_string(),
+                    description: Some(format!("{name} command")),
+                    file: None,
+                    kind: CommandKind::default(),
+                }],
+                ..Default::default()
+            },
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl Capsule for InventoryCapsule {
+    fn id(&self) -> &CapsuleId {
+        &self.id
+    }
+
+    fn manifest(&self) -> &CapsuleManifest {
+        &self.manifest
+    }
+
+    fn state(&self) -> CapsuleState {
+        CapsuleState::Ready
+    }
+
+    async fn load(&mut self, _ctx: &CapsuleContext) -> CapsuleResult<()> {
+        Ok(())
+    }
+
+    async fn unload(&mut self) -> CapsuleResult<()> {
+        Ok(())
+    }
+}
+
 #[test]
 fn response_topic_for_maps_request_to_response() {
     // A kernel request topic maps to the correlated response topic so a reply
@@ -382,6 +453,167 @@ async fn get_agent_readiness_returns_readiness_response() {
         },
         other => panic!("expected AgentReadiness, got {other:?}"),
     }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn capsule_inventory_requests_are_filtered_to_callers_grants() {
+    let (_dir, kernel) = kernel_with_inventory_capsules().await;
+
+    let caller = PrincipalId::new("alice").expect("valid principal");
+    seed_capsule_inventory_profile(&kernel, &caller, &["allowed"]);
+    assert_capsule_inventory_surface(
+        &kernel,
+        &caller,
+        "granted",
+        &["allowed"],
+        &["allowed-cmd"],
+        &["allowed"],
+        &["allowed"],
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn ungranted_capsule_inventory_requests_do_not_inherit_default_surface() {
+    let (_dir, kernel) = kernel_with_inventory_capsules().await;
+    let ungranted = PrincipalId::new("bob").expect("valid principal");
+    seed_capsule_inventory_profile(&kernel, &ungranted, &[]);
+    assert_capsule_inventory_surface(&kernel, &ungranted, "ungranted", &[], &[], &[], &[]).await;
+}
+
+async fn kernel_with_inventory_capsules() -> (tempfile::TempDir, Arc<crate::Kernel>) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let home = astrid_core::dirs::AstridHome::from_path(dir.path());
+    let kernel = crate::test_kernel_with_home(home).await;
+
+    {
+        let mut reg = kernel.capsules.write().await;
+        reg.register(Box::new(InventoryCapsule::new("allowed", "allowed-cmd")))
+            .expect("register allowed capsule");
+        reg.register(Box::new(InventoryCapsule::new(
+            "default-only",
+            "default-only-cmd",
+        )))
+        .expect("register default-only capsule");
+    }
+
+    drop(spawn_kernel_router(Arc::clone(&kernel)));
+    (dir, kernel)
+}
+
+fn seed_capsule_inventory_profile(
+    kernel: &Arc<crate::Kernel>,
+    principal: &PrincipalId,
+    capsules: &[&str],
+) {
+    let profile = PrincipalProfile {
+        grants: vec!["self:capsule:list".to_string()],
+        capsules: capsules
+            .iter()
+            .map(|capsule| (*capsule).to_string())
+            .collect(),
+        ..Default::default()
+    };
+    let path = PrincipalProfile::path_for(&kernel.astrid_home, principal);
+    profile.save_to_path(&path).expect("seed profile");
+    kernel.profile_cache.invalidate(principal);
+}
+
+async fn assert_capsule_inventory_surface(
+    kernel: &Arc<crate::Kernel>,
+    caller: &PrincipalId,
+    label: &str,
+    expected_capsules: &[&str],
+    expected_commands: &[&str],
+    expected_metadata: &[&str],
+    expected_readiness: &[&str],
+) {
+    let list = request_kernel(
+        kernel,
+        caller,
+        &format!("{label}_list_capsules"),
+        KernelRequest::ListCapsules,
+    )
+    .await;
+    let KernelResponse::Success(value) = list else {
+        panic!("expected {label} capsule list success, got {list:?}");
+    };
+    let capsules: Vec<String> = serde_json::from_value(value).expect("capsule list shape");
+    assert_eq!(capsules, expected_capsules);
+
+    let commands = request_kernel(
+        kernel,
+        caller,
+        &format!("{label}_commands"),
+        KernelRequest::GetCommands,
+    )
+    .await;
+    let KernelResponse::Commands(commands) = commands else {
+        panic!("expected {label} commands response, got {commands:?}");
+    };
+    let command_names: Vec<_> = commands.iter().map(|cmd| cmd.name.as_str()).collect();
+    assert_eq!(command_names, expected_commands);
+
+    let metadata = request_kernel(
+        kernel,
+        caller,
+        &format!("{label}_metadata"),
+        KernelRequest::GetCapsuleMetadata,
+    )
+    .await;
+    let KernelResponse::CapsuleMetadata(metadata) = metadata else {
+        panic!("expected {label} metadata response, got {metadata:?}");
+    };
+    let metadata_names: Vec<_> = metadata.iter().map(|entry| entry.name.as_str()).collect();
+    assert_eq!(metadata_names, expected_metadata);
+
+    let readiness = request_kernel(
+        kernel,
+        caller,
+        &format!("{label}_readiness"),
+        KernelRequest::GetAgentReadiness,
+    )
+    .await;
+    let KernelResponse::AgentReadiness(readiness) = readiness else {
+        panic!("expected {label} readiness response, got {readiness:?}");
+    };
+    assert_eq!(readiness.loaded_capsules, expected_readiness);
+}
+
+async fn request_kernel(
+    kernel: &Arc<crate::Kernel>,
+    caller: &PrincipalId,
+    suffix: &str,
+    request: KernelRequest,
+) -> KernelResponse {
+    let request_topic = Topic::kernel_request(format!("{suffix}.{}", uuid::Uuid::new_v4()));
+    let response_topic = response_topic_for(request_topic.as_str());
+    let mut rx = kernel.event_bus.subscribe_topic(response_topic.as_str());
+    let payload = serde_json::to_value(request).expect("serialize request");
+    let mut msg = IpcMessage::new(
+        request_topic,
+        IpcPayload::RawJson(payload),
+        kernel.session_id.0,
+    );
+    msg.principal = Some(caller.as_str().to_string());
+    let _ = kernel.event_bus.publish(astrid_events::AstridEvent::Ipc {
+        metadata: astrid_events::EventMetadata::new("test"),
+        message: msg,
+    });
+
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            let event = rx.recv().await.expect("response event");
+            if let astrid_events::AstridEvent::Ipc { message, .. } = &*event
+                && let IpcPayload::RawJson(val) = &message.payload
+            {
+                return serde_json::from_value(val.clone())
+                    .expect("response deserializes as KernelResponse");
+            }
+        }
+    })
+    .await
+    .expect("kernel response within 2s")
 }
 
 /// The in-process readiness probe the gateway uses for the prompt fail-fast

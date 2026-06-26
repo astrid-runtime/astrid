@@ -282,7 +282,9 @@ async fn handle_request(
             let reg = kernel.capsules.read().await;
             let mut list = Vec::new();
             for c in reg.list() {
-                list.push(c.to_string());
+                if capsule_visible_to(kernel, &caller, c) {
+                    list.push(c.to_string());
+                }
             }
             KernelResponse::Success(serde_json::json!(list))
         },
@@ -290,6 +292,9 @@ async fn handle_request(
             let reg = kernel.capsules.read().await;
             let mut commands = Vec::new();
             for c in reg.values() {
+                if !capsule_visible_to(kernel, &caller, c.id()) {
+                    continue;
+                }
                 for cmd in &c.manifest().commands {
                     commands.push(astrid_events::kernel_api::CommandInfo {
                         name: cmd.name.clone(),
@@ -423,6 +428,9 @@ async fn handle_request(
             let reg = kernel.capsules.read().await;
             let mut entries = Vec::new();
             for capsule in reg.values() {
+                if !capsule_visible_to(kernel, &caller, capsule.id()) {
+                    continue;
+                }
                 let manifest = capsule.manifest();
                 entries.push(astrid_events::kernel_api::CapsuleMetadataEntry {
                     name: manifest.package.name.clone(),
@@ -440,6 +448,7 @@ async fn handle_request(
             let reg = kernel.capsules.read().await;
             let manifests: Vec<&astrid_capsule::manifest::CapsuleManifest> = reg
                 .values()
+                .filter(|capsule| capsule_visible_to(kernel, &caller, capsule.id()))
                 .map(astrid_capsule::capsule::Capsule::manifest)
                 .collect();
             let readiness = astrid_capsule::readiness::agent_loop_readiness(&manifests);
@@ -448,6 +457,18 @@ async fn handle_request(
     };
 
     publish_response(kernel, response_topic, res);
+}
+
+fn capsule_visible_to(
+    kernel: &crate::Kernel,
+    caller: &PrincipalId,
+    capsule_id: &astrid_capsule::capsule::CapsuleId,
+) -> bool {
+    let resolver = astrid_capsule::CapsuleAccessResolver::new(
+        Arc::clone(&kernel.profile_cache),
+        Arc::clone(&kernel.groups),
+    );
+    resolver.is_capsule_allowed(Some(caller.as_str()), capsule_id)
 }
 
 fn publish_response<R: Serialize>(kernel: &Arc<crate::Kernel>, response_topic: Topic, res: R) {

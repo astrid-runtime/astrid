@@ -28,25 +28,25 @@ principal = "admin"
 
 [commands."agent list"]
 scenario = "principal_visibility"
-status = "mapped"
+status = "covered"
 mode = "read"
 principal = "admin_and_agent"
 
 [commands."agent current"]
 scenario = "active_context"
-status = "mapped"
+status = "covered"
 mode = "read"
 principal = "local_cli"
 
 [commands."agent switch"]
 scenario = "active_context"
-status = "mapped"
+status = "covered"
 mode = "mutating"
 principal = "local_cli"
 
 [commands."agent show"]
 scenario = "principal_crud"
-status = "mapped"
+status = "covered"
 mode = "read"
 principal = "admin_and_agent"
 
@@ -132,13 +132,13 @@ principal = "admin"
 
 [commands."group show"]
 scenario = "group_crud"
-status = "mapped"
+status = "covered"
 mode = "read"
 principal = "admin"
 
 [commands."group list"]
 scenario = "group_crud"
-status = "mapped"
+status = "covered"
 mode = "read"
 principal = "admin_and_agent"
 
@@ -156,7 +156,7 @@ principal = "admin"
 
 [commands."caps show"]
 scenario = "capability_grants"
-status = "mapped"
+status = "covered"
 mode = "read"
 principal = "admin_and_agent"
 
@@ -174,7 +174,7 @@ principal = "admin"
 
 [commands."caps check"]
 scenario = "capability_grants"
-status = "mapped"
+status = "covered"
 mode = "read"
 principal = "admin_and_agent"
 
@@ -201,7 +201,7 @@ reason = "Token lifecycle is parsed but kernel token listing is not live yet."
 
 [commands."quota show"]
 scenario = "quota_scope"
-status = "mapped"
+status = "covered"
 mode = "read"
 principal = "admin_and_agent"
 
@@ -291,7 +291,7 @@ principal = "agent"
 
 [commands."secret list"]
 scenario = "secret_redaction"
-status = "mapped"
+status = "covered"
 mode = "read"
 principal = "agent"
 
@@ -417,7 +417,7 @@ principal = "admin"
 
 [commands."capsule list"]
 scenario = "capsule_live_load_lifecycle"
-status = "mapped"
+status = "covered"
 mode = "read"
 principal = "admin_and_agent"
 
@@ -447,7 +447,7 @@ principal = "agent"
 
 [commands."capsule show"]
 scenario = "capsule_metadata"
-status = "mapped"
+status = "covered"
 mode = "read"
 principal = "admin_and_agent"
 
@@ -497,7 +497,7 @@ principal = "local_cli"
 
 [commands."config show"]
 scenario = "config_surface"
-status = "mapped"
+status = "covered"
 mode = "read"
 principal = "local_cli"
 
@@ -510,7 +510,7 @@ reason = "EDITOR launch is host-mutating and not deterministic in headless CI; p
 
 [commands."config path"]
 scenario = "config_surface"
-status = "mapped"
+status = "covered"
 mode = "read"
 principal = "local_cli"
 
@@ -528,7 +528,7 @@ principal = "local_cli"
 
 [commands."status"]
 scenario = "daemon_lifecycle"
-status = "mapped"
+status = "covered"
 mode = "read"
 principal = "local_cli"
 
@@ -570,7 +570,7 @@ principal = "local_cli"
 
 [commands."doctor"]
 scenario = "health_check"
-status = "mapped"
+status = "covered"
 mode = "read"
 principal = "local_cli"
 
@@ -583,7 +583,7 @@ reason = "The apply path changes host OS settings; CI may only assert dry-run/he
 
 [commands."version"]
 scenario = "version_surface"
-status = "mapped"
+status = "covered"
 mode = "read"
 principal = "local_cli"
 

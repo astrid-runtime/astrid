@@ -42,6 +42,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use astrid_core::dirs::AstridHome;
+use astrid_core::kernel_api::{KernelRequest, KernelResponse};
 use astrid_storage::{FileSecretStore, SecretStore};
 use axum::Json;
 use axum::extract::{Path, State};
@@ -102,11 +103,12 @@ pub struct EnvWriteRequest {
     )
 )]
 pub async fn get_env_schema(
-    State(_state): State<Arc<GatewayState>>,
+    State(state): State<Arc<GatewayState>>,
     Path(capsule_id): Path<String>,
     req: Request<axum::body::Body>,
 ) -> GatewayResult<Json<EnvSchemaResponse>> {
-    let _caller = caller_from(&req)?;
+    let caller = caller_from(&req)?.clone();
+    ensure_capsule_visible(&state, &caller, &capsule_id).await?;
     let schema = load_env_schema(&capsule_id)?;
     Ok(Json(EnvSchemaResponse {
         capsule_id,
@@ -133,11 +135,12 @@ pub async fn get_env_schema(
     )
 )]
 pub async fn write_env(
-    State(_state): State<Arc<GatewayState>>,
+    State(state): State<Arc<GatewayState>>,
     Path((capsule_id, field)): Path<(String, String)>,
     req: Request<axum::body::Body>,
 ) -> GatewayResult<StatusCode> {
     let caller = caller_from(&req)?.clone();
+    ensure_capsule_visible(&state, &caller, &capsule_id).await?;
     if !is_safe_field_name(&field) {
         return Err(GatewayError::BadRequest(format!(
             "invalid env field name {field:?}"
@@ -218,6 +221,29 @@ pub async fn write_env(
 }
 
 // ── helpers ──────────────────────────────────────────────────────
+
+async fn ensure_capsule_visible(
+    state: &GatewayState,
+    caller: &crate::auth::CallerContext,
+    capsule_id: &str,
+) -> GatewayResult<()> {
+    let client = state.kernel_client_for(caller)?;
+    let resp = client
+        .request(KernelRequest::GetCapsuleMetadata)
+        .await
+        .map_err(|e| GatewayError::Internal(anyhow::anyhow!("daemon kernel-request: {e}")))?;
+    match resp {
+        KernelResponse::CapsuleMetadata(entries) => entries
+            .iter()
+            .any(|entry| entry.name == capsule_id)
+            .then_some(())
+            .ok_or(GatewayError::NotFound),
+        KernelResponse::Error(msg) => Err(GatewayError::Forbidden { reason: msg }),
+        other => Err(GatewayError::Internal(anyhow::anyhow!(
+            "unexpected response shape for GetCapsuleMetadata: {other:?}"
+        ))),
+    }
+}
 
 /// Parse `[env]` from `$ASTRID_HOME/capsules/<id>/Capsule.toml`.
 ///
