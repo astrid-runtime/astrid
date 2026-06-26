@@ -113,6 +113,7 @@ EOF
     2> "$secondary_artifacts/openai-config.err"
 
   local secondary_default_secret="ASTRID_E2E_SECONDARY_DEFAULT_SECRET_DO_NOT_LEAK_$RANDOM$RANDOM"
+  register_redaction_sentinel "$secondary_default_secret"
   printf '$ ASTRID_HOME=%s astrid secret set api_key <redacted> --capsule astrid-capsule-openai-compat\n' \
     "$secondary_home" >> "$secondary_artifacts/cli-transcript.log"
   env ASTRID_HOME="$secondary_home" HOME="$POISON_HOME" \
@@ -172,6 +173,7 @@ EOF
   json_assert_field_equals "$ARTIFACTS/primary-quota-after-secondary.json" max_background_processes 4
 
   local secondary_user_secret="ASTRID_E2E_SECONDARY_USER_SECRET_DO_NOT_LEAK_$RANDOM$RANDOM"
+  register_redaction_sentinel "$secondary_user_secret"
   status="$(multi_http_status "$secondary_gateway" POST \
     /api/capsules/astrid-capsule-openai-compat/env/base_url "$secondary_bearer" \
     "{\"value\":\"$fake_base_url\"}" "$secondary_artifacts/secondary-openai-base-url-write.json")"

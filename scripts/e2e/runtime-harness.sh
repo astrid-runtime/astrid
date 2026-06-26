@@ -5,6 +5,7 @@ SCRIPT_DIR="$CORE_DIR/scripts/e2e"
 CAPSULES_DIR="${ASTRID_E2E_CAPSULES_DIR:-$CORE_DIR/../capsules}"
 ASTRID_HOME="${ASTRID_E2E_HOME:-$(mktemp -d "${TMPDIR:-/tmp}/astrid-runtime-e2e.XXXXXX")}"
 ARTIFACTS="$ASTRID_HOME/artifacts"
+REDACTED_UPLOAD="$ARTIFACTS/redacted-upload"
 GATEWAY_HOST="${ASTRID_E2E_GATEWAY_HOST:-127.0.0.1}"
 GATEWAY_PORT="${ASTRID_E2E_GATEWAY_PORT:-38756}"
 GATEWAY="http://$GATEWAY_HOST:$GATEWAY_PORT"
@@ -16,6 +17,7 @@ SECONDARY_HOME=""
 FAKE_PID=""
 POISON_HOME=""
 LAST_HTTP_OUT=""
+REDACTION_SENTINELS=()
 terminate_pid() {
   local pid=$1
   if [[ -n "$pid" ]]; then
@@ -43,6 +45,9 @@ cleanup() {
     printf 'kept secondary ASTRID_HOME=%s\n' "$SECONDARY_HOME"
   fi
   if [[ "$status" -ne 0 && -d "$ASTRID_HOME/log" ]]; then mkdir -p "$ARTIFACTS/astrid-log" && cp -a "$ASTRID_HOME/log/." "$ARTIFACTS/astrid-log/" 2>/dev/null || true; fi
+  if [[ "$status" -ne 0 ]]; then
+    stage_redacted_upload || true
+  fi
   if [[ -n "$POISON_HOME" && -z "${ASTRID_E2E_KEEP_HOME:-}" ]]; then
     rm -rf "$POISON_HOME"
   elif [[ -n "$POISON_HOME" ]]; then
@@ -184,6 +189,118 @@ require_capsules() {
   fi
 }
 
+register_redaction_sentinel() {
+  local sentinel=$1
+  [[ -n "$sentinel" ]] || return 0
+  REDACTION_SENTINELS+=("$sentinel")
+}
+
+copy_dir_contents_if_exists() {
+  local src=$1
+  local dst=$2
+  [[ -d "$src" ]] || return 0
+  rm -rf "$dst"
+  mkdir -p "$dst"
+  cp -a "$src/." "$dst/" 2>/dev/null || true
+}
+
+stage_home_logs() {
+  local home=$1
+  local label=$2
+  local log_dir
+  local principal
+  [[ -n "$home" ]] || return 0
+
+  copy_dir_contents_if_exists "$home/log" "$REDACTED_UPLOAD/$label/daemon-log"
+  [[ -d "$home/home" ]] || return 0
+  while IFS= read -r -d '' log_dir; do
+    principal="$(basename "$(dirname "$(dirname "$log_dir")")")"
+    copy_dir_contents_if_exists "$log_dir" "$REDACTED_UPLOAD/$label/principal-logs/$principal"
+  done < <(find "$home/home" -path '*/.local/log' -type d -print0 2>/dev/null)
+}
+
+redact_staged_upload() {
+  [[ -d "$REDACTED_UPLOAD" ]] || return 0
+  "$PYTHON" - "$REDACTED_UPLOAD" "${REDACTION_SENTINELS[@]}" <<'PY'
+import os
+import re
+import sys
+
+root = sys.argv[1]
+sentinels = [s.encode() for s in sys.argv[2:] if s]
+text_patterns = [
+    (re.compile(r'ASTRID_E2E_[A-Z0-9_]*DO_NOT_LEAK_[A-Za-z0-9_]+'), r'<redacted-e2e-sentinel>'),
+    (re.compile(r'("session_token"\s*:\s*")[^"]+(")'), r'\1<redacted-token>\2'),
+    (re.compile(r'("token"\s*:\s*")[^"]+(")'), r'\1<redacted-token>\2'),
+    (re.compile(r'(Authorization:\s*Bearer\s+)[A-Za-z0-9._~+/=-]+'), r'\1<redacted-token>'),
+]
+
+for dirpath, _, filenames in os.walk(root):
+    for name in filenames:
+        path = os.path.join(dirpath, name)
+        try:
+            with open(path, "rb") as handle:
+                data = handle.read()
+        except OSError:
+            continue
+
+        changed = False
+        for sentinel in sentinels:
+            if sentinel in data:
+                data = data.replace(sentinel, b"<redacted-e2e-secret>")
+                changed = True
+
+        try:
+            text = data.decode("utf-8")
+        except UnicodeDecodeError:
+            if changed:
+                with open(path, "wb") as handle:
+                    handle.write(data)
+            continue
+
+        redacted = text
+        for pattern, replacement in text_patterns:
+            redacted = pattern.sub(replacement, redacted)
+        if changed or redacted != text:
+            with open(path, "wb") as handle:
+                handle.write(redacted.encode("utf-8"))
+PY
+}
+
+scan_redacted_upload() {
+  local sentinel
+  [[ -d "$REDACTED_UPLOAD" ]] || return 0
+  if grep -R --fixed-strings --binary-files=without-match -- "DO_NOT_LEAK" "$REDACTED_UPLOAD" >/dev/null 2>&1; then
+    fail "sentinel marker leaked into redacted runtime artifact upload"
+  fi
+  for sentinel in "${REDACTION_SENTINELS[@]}"; do
+    [[ -n "$sentinel" ]] || continue
+    if grep -R --fixed-strings --binary-files=without-match -- "$sentinel" "$REDACTED_UPLOAD" >/dev/null 2>&1; then
+      fail "sentinel secret leaked into redacted runtime artifact upload"
+    fi
+  done
+}
+
+stage_redacted_upload() {
+  local entry
+  local name
+
+  [[ -d "$ARTIFACTS" ]] || return 0
+  rm -rf "$REDACTED_UPLOAD"
+  mkdir -p "$REDACTED_UPLOAD/artifacts"
+
+  while IFS= read -r -d '' entry; do
+    name="$(basename "$entry")"
+    [[ "$name" == "redacted-upload" ]] && continue
+    cp -a "$entry" "$REDACTED_UPLOAD/artifacts/"
+  done < <(find "$ARTIFACTS" -mindepth 1 -maxdepth 1 -print0 2>/dev/null)
+
+  stage_home_logs "$ASTRID_HOME" primary
+  stage_home_logs "$SECONDARY_HOME" secondary
+  redact_staged_upload
+  scan_redacted_upload
+}
+
 redaction_check() {
   local sentinel=$1
   local targets=("$ARTIFACTS")
@@ -201,10 +318,21 @@ redaction_check() {
   done
 
   for target in "${targets[@]}"; do
-    if grep -R --fixed-strings "$sentinel" "$target" >/dev/null 2>&1; then
+    if grep -R --fixed-strings --binary-files=without-match -- "$sentinel" "$target" >/dev/null 2>&1; then
       fail "sentinel secret leaked into runtime e2e logs/artifacts under $target"
     fi
   done
+}
+
+collect_audit_artifacts() {
+  local user_bearer=$1
+  local ops_bearer=$2
+  local status
+
+  status="$(http_status GET "/api/sys/audit?limit=1000" "$user_bearer" "" "$ARTIFACTS/agent-audit.json")"
+  assert_status "agent scoped audit export" "$status" 200
+  status="$(http_status GET "/api/sys/audit?limit=1000" "$ops_bearer" "" "$ARTIFACTS/operator-audit.json")"
+  assert_status "operator scoped audit export" "$status" 200
 }
 
 main() {
@@ -267,6 +395,7 @@ EOF
 
   note "configuring openai-compat for fake endpoint"
   local sentinel="ASTRID_E2E_SECRET_DO_NOT_LEAK_$RANDOM$RANDOM"
+  register_redaction_sentinel "$sentinel"
   printf '$ astrid capsule config astrid-capsule-openai-compat --set base_url=<fake> --set model=fake-echo\n' \
     >> "$ARTIFACTS/cli-transcript.log"
   printf 'y\n' | "$CORE_DIR/target/debug/astrid" capsule config astrid-capsule-openai-compat \
@@ -500,6 +629,8 @@ PY
   note "checking per-principal secret isolation"
   local user_secret="ASTRID_E2E_USER_SECRET_DO_NOT_LEAK_$RANDOM$RANDOM"
   local ops_secret="ASTRID_E2E_OPS_SECRET_DO_NOT_LEAK_$RANDOM$RANDOM"
+  register_redaction_sentinel "$user_secret"
+  register_redaction_sentinel "$ops_secret"
   status="$(http_status POST /api/capsules/astrid-capsule-openai-compat/env/api_key "$user_bearer" \
     "{\"value\":\"$user_secret\",\"principal\":\"default\"}" \
     "$ARTIFACTS/agent-openai-secret-spoofed-principal-write.json")"
@@ -715,9 +846,13 @@ PY
   assert_status "restart agent cross-principal session transcript empty" "$status" 200
   json_assert_session_messages_empty "$ARTIFACTS/restart-agent-cross-session-messages-empty.json" "$ops_session"
 
+  note "collecting scoped audit artifacts"
+  collect_audit_artifacts "$restart_user_bearer" "$ops_bearer"
+
   redaction_check "$sentinel"
   redaction_check "$user_secret"
   redaction_check "$ops_secret"
+  stage_redacted_upload
   assert_poison_home_unused "$POISON_HOME"
   note "runtime e2e passed; artifacts at $ARTIFACTS"
 }
