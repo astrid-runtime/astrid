@@ -426,9 +426,11 @@ fn slugify_principal(input: &str) -> String {
 }
 
 fn random_suffix() -> String {
-    use rand::RngCore;
+    use rand::{TryRng, rngs::SysRng};
     let mut bytes = [0u8; 4];
-    rand::rngs::OsRng.fill_bytes(&mut bytes);
+    SysRng
+        .try_fill_bytes(&mut bytes)
+        .expect("OS CSPRNG unavailable while generating invite suffix");
     hex::encode(bytes)
 }
 

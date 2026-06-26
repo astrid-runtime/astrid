@@ -55,8 +55,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use astrid_core::principal::PrincipalId;
-use rand::RngCore;
-use rand::rngs::OsRng;
+use rand::{TryRng, rngs::SysRng};
 use tokio::io::AsyncWriteExt;
 use tokio::sync::watch;
 
@@ -136,7 +135,9 @@ impl PersistentProcessRegistry {
     #[must_use]
     pub fn new(runtime: tokio::runtime::Handle) -> Self {
         let mut hash_key = [0u8; 32];
-        OsRng.fill_bytes(&mut hash_key);
+        SysRng
+            .try_fill_bytes(&mut hash_key)
+            .expect("OS CSPRNG unavailable while creating process registry hash key");
         Self {
             entries: Mutex::new(HashMap::new()),
             hash_key,
@@ -183,15 +184,10 @@ impl PersistentProcessRegistry {
         &self,
         p: SpawnParams,
     ) -> Result<String, ErrorCode> {
-        let label = clamp_label(p.label, &p.command);
-        let log_ring = clamp_log_ring(p.log_ring_bytes);
-        let overflow = overflow_from_wit(p.overflow);
-        let (max_lifetime, idle_timeout, exit_retention) =
-            resolve_ttls(p.max_lifetime_ms, p.idle_timeout_ms, p.exit_retention_ms);
-
         let mut map = self.lock();
         if map.len() >= MAX_REGISTRY_ENTRIES {
-            return Err(ErrorCode::RegistryFull);
+            drop(map);
+            return reject_spawn(p, ErrorCode::RegistryFull);
         }
         let (mut live, mut retained) = (0usize, 0usize);
         for e in map.values() {
@@ -203,11 +199,19 @@ impl PersistentProcessRegistry {
             }
         }
         if retained >= MAX_RETAINED_PER_PRINCIPAL {
-            return Err(ErrorCode::RegistryFull);
+            drop(map);
+            return reject_spawn(p, ErrorCode::RegistryFull);
         }
         if live >= p.concurrent_cap {
-            return Err(ErrorCode::Quota);
+            drop(map);
+            return reject_spawn(p, ErrorCode::Quota);
         }
+
+        let label = clamp_label(p.label, &p.command);
+        let log_ring = clamp_log_ring(p.log_ring_bytes);
+        let overflow = overflow_from_wit(p.overflow);
+        let (max_lifetime, idle_timeout, exit_retention) =
+            resolve_ttls(p.max_lifetime_ms, p.idle_timeout_ms, p.exit_retention_ms);
 
         let core = Arc::new(Mutex::new(ProcessCore {
             phase: Phase::Running,
@@ -589,4 +593,11 @@ impl PersistentProcessRegistry {
             reap_entry(entry);
         }
     }
+}
+
+fn reject_spawn(mut p: SpawnParams, err: ErrorCode) -> Result<String, ErrorCode> {
+    let _ = entry::send_signal(p.os_pid, nix::sys::signal::Signal::SIGKILL);
+    let _ = p.child.start_kill();
+    let _ = p.child.try_wait();
+    Err(err)
 }

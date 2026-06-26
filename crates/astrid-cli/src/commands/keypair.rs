@@ -40,7 +40,7 @@ use astrid_core::dirs::AstridHome;
 use clap::{Args, Subcommand};
 use colored::Colorize;
 use ed25519_dalek::SigningKey;
-use rand::RngCore;
+use rand::{TryRng, rngs::SysRng};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -228,7 +228,9 @@ fn run_generate(args: GenerateArgs) -> Result<ExitCode> {
     // glue runs when `signing` falls out of scope, clearing the
     // secret bytes from RAM.
     let mut secret_bytes = [0u8; 32];
-    rand::rngs::OsRng.fill_bytes(&mut secret_bytes);
+    SysRng
+        .try_fill_bytes(&mut secret_bytes)
+        .context("OS CSPRNG unavailable while generating keypair")?;
     let signing = SigningKey::from_bytes(&secret_bytes);
     secret_bytes = [0u8; 32]; // belt-and-suspenders; the SigningKey owns its own zeroizing copy
     let _ = secret_bytes;
@@ -556,9 +558,10 @@ fn validate_name(name: &str) -> Result<()> {
 }
 
 fn default_name() -> String {
-    use rand::RngCore;
     let mut bytes = [0u8; 4];
-    rand::rngs::OsRng.fill_bytes(&mut bytes);
+    SysRng
+        .try_fill_bytes(&mut bytes)
+        .expect("OS CSPRNG unavailable while generating default keypair name");
     format!("key-{}", hex::encode(bytes))
 }
 

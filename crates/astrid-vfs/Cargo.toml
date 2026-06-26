@@ -12,7 +12,7 @@ description = "Virtual File System and Capability sandbox for Astrid agent runti
 astrid-capabilities = { workspace = true }
 astrid-core = { workspace = true }
 async-trait = { workspace = true }
-cap-std = "3.4.1"
+cap-std = "4.0.2"
 dashmap = { workspace = true }
 ignore = { workspace = true }
 serde = { workspace = true, features = ["derive"] }

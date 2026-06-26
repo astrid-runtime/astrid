@@ -77,12 +77,12 @@ async-trait = "0.1"
 # (`:id` → `{id}`) and we rely on the matching tower stack
 # (`tower-http` 0.6, `utoipa-axum` 0.5). `default-features = false`
 # strips the multipart / `original-uri` / `ws` extractors we don't use.
-axum = { version = "0.7", default-features = false, features = ["http1", "json", "query", "tokio", "tracing", "matched-path"] }
+axum = { version = "0.8", default-features = false, features = ["http1", "json", "query", "tokio", "tracing", "matched-path"] }
 # Wraps the axum router with native TLS via rustls. Used by the
 # gateway's optional `[tls]` block; without it the gateway speaks
 # plain HTTP and TLS is delegated to an upstream proxy. `tls-rustls`
 # is the only TLS backend we ship — no openssl in the workspace.
-axum-server = { version = "0.7", features = ["tls-rustls"] }
+axum-server = { version = "0.8", features = ["tls-rustls"] }
 # Bridges `tokio::sync::broadcast::Receiver` → `futures::Stream` so
 # axum's `Sse` responder can consume the kernel event bus directly.
 # The `sync` feature is the only thing that does it; not on by default.
@@ -99,11 +99,11 @@ blake3 = "1.5"
 chrono = { version = "0.4", default-features = false, features = ["serde"] }
 clap = { version = "4.5", features = ["derive", "env"] }
 clap_complete = "4.5"
-colored = "2.1"
-crossterm = "0.28"
+colored = "3.1"
+crossterm = "0.29"
 dashmap = "6.1.0"
 dialoguer = "0.11"
-directories = "5.0"
+directories = "6.0"
 ed25519-dalek = { version = "2.1", features = ["rand_core", "zeroize", "serde"] }
 flate2 = "1.0"
 fs2 = "0.4"
@@ -111,7 +111,7 @@ futures = "0.3"
 globset = "0.4"
 hex = "0.4"
 ignore = "0.4"
-indicatif = "0.17"
+indicatif = "0.18"
 insta = { version = "1.40", features = ["yaml", "json"] }
 jsonrpsee = { version = "0.24", features = ["server", "client", "macros"] }
 # Enable platform-native backends for every supported OS. Without
@@ -129,7 +129,7 @@ keyring = { version = "3", features = [
 ] }
 landlock = "0.4"
 libc = "0.2"
-nix = { version = "0.29", features = ["process", "signal", "user", "fs", "resource"] }
+nix = { version = "0.31", features = ["process", "signal", "user", "fs", "resource"] }
 # Metric recording facade + Prometheus exporter. The facade decouples
 # recording (`counter!()`, `histogram!()` macros) from export format,
 # so we can swap to OTLP later without touching the call sites. Lives
@@ -138,13 +138,13 @@ nix = { version = "0.29", features = ["process", "signal", "user", "fs", "resour
 # Prometheus integration is intended to go deep into Astrid, not stay
 # at the HTTP surface.
 metrics = "0.24"
-metrics-exporter-prometheus = { version = "0.17", default-features = false }
+metrics-exporter-prometheus = { version = "0.18", default-features = false }
 # Pull-based process collector (`process_cpu_seconds_total`, resident
 # memory, threads, fds, start time) feeding the same recorder. Supports
 # Linux/macOS/Windows/FreeBSD; `collect()` is called per scrape, no
 # background thread.
 metrics-process = "2.4"
-notify = "7"
+notify = "8"
 # `parking_lot::RwLock`/`Mutex` are used in the event-bus per-(capsule,
 # topic, principal) routing demux so the synchronous `EventBus::publish`
 # path can take a read-lock without forcing an async boundary into every
@@ -152,12 +152,12 @@ notify = "7"
 # path). No poisoning + fewer kernel calls than `std::sync` under
 # contention.
 parking_lot = "0.12"
-rand = "0.8"
-ratatui = { version = "0.29", features = ["unstable-rendered-line-info"] }
+rand = "0.10"
+ratatui = { version = "0.30", features = ["unstable-rendered-line-info"] }
 # Self-signed certificate generation for gateway TLS integration
 # tests. Test-only (dev-dependency in the gateway integration crate);
 # we don't ship cert-mint logic in production code.
-rcgen = "0.13"
+rcgen = "0.14"
 # Direct dep on rustls (also pulled in transitively via axum-server)
 # so the gateway can call `CryptoProvider::install_default()` at boot.
 # rustls 0.23 requires that explicit pick when more than one provider
@@ -173,14 +173,14 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 # (1.x) let CI silently resolve the breaking minor. Pinning to the patch range
 # allows bug and security fixes while preventing automatic upgrades to future breaking minors.
 rmcp = { version = "~1.8.0", features = ["server", "client", "transport-io", "transport-child-process", "elicitation", "macros", "schemars"] }
-rustyline = { version = "15", features = ["derive"] }
+rustyline = { version = "17", features = ["derive"] }
 semver = "1"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 serde_yaml = "0.9"
-sha2 = "0.10"
+sha2 = "0.11"
 subtle = "2"
-surrealkv = "0.18"
+surrealkv = "0.21"
 surrealdb = { version = "3.0.0-beta.3", default-features = false, features = ["kv-surrealkv", "kv-mem"] }
 syntect = { version = "5", default-features = false, features = ["default-fancy"] }
 tar = "0.4"
@@ -189,13 +189,13 @@ tempfile = "3"
 thiserror = "2.0"
 tokio = { version = "1.49", features = ["sync", "macros", "time", "rt", "rt-multi-thread", "net", "io-util", "signal"] }
 tokio-util = "0.7"
-toml = "0.8"
+toml = "0.9"
 # Middleware substrate axum is built on (`Service` trait composition,
 # request-id, trace, CORS, body-size limit, response-header injection).
 # Dropping `tower-http` means re-implementing each middleware by hand;
 # nothing else in the workspace provides it.
 tower = { version = "0.5", features = ["util"] }
-tower-http = { version = "0.6", features = ["cors", "trace", "limit", "set-header"] }
+tower-http = { version = "0.7", features = ["cors", "trace", "limit", "set-header"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 url = "2"
@@ -211,14 +211,14 @@ url = "2"
 utoipa = { version = "5", features = ["axum_extras"] }
 uuid = { version = "1.0", default-features = false, features = ["v4", "v5", "serde", "rng-getrandom"] }
 walkdir = "2.5"
-wasm-encoder = "0.227"
-wasmparser = "0.227"
-wit-component = "0.227"
-wit-parser = "0.227"
-wasmtime = { version = "45", features = ["component-model", "cranelift"] }
-wasmtime-wasi = "45"
+wasm-encoder = "0.252"
+wasmparser = "0.252"
+wit-component = "0.252"
+wit-parser = "0.252"
+wasmtime = { version = "46", features = ["component-model", "cranelift"] }
+wasmtime-wasi = "46"
 unicode-width = "0.2"
-which = "7"
+which = "8"
 zeroize = { version = "1.8", features = ["derive"] }
 
 [workspace.lints.rust]

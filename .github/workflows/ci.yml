@@ -217,8 +217,24 @@ jobs:
           key: ${{ runner.os }}-${{ github.job }}
           cache-on-failure: true
 
-      - name: Check public API compatibility
+      - name: Detect breaking-change marker
         if: steps.api-inputs.outputs.run == 'true'
+        id: breaking-change
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          if git log --format=%B "$BASE_SHA..$HEAD_SHA" \
+            | grep -Eq '(^[A-Za-z0-9_-]+(\([^)]*\))?!:|^BREAKING[ -]CHANGE:)'; then
+            echo "found=true" >> "$GITHUB_OUTPUT"
+            echo "Breaking-change marker found; cargo-semver-checks is skipped."
+          else
+            echo "found=false" >> "$GITHUB_OUTPUT"
+            echo "No breaking-change marker found; running cargo-semver-checks."
+          fi
+
+      - name: Check public API compatibility
+        if: steps.api-inputs.outputs.run == 'true' && steps.breaking-change.outputs.found != 'true'
         uses: obi1kenobi/cargo-semver-checks-action@6b69fcf40e9b5fb17adeb57e4b6ecd020649a239 # v2
         with:
           manifest-path: Cargo.toml
@@ -314,6 +330,8 @@ jobs:
     name: Gateway OpenAPI contract
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
+    env:
+      CARGO_TARGET_DIR: .openapi-target
     steps:
       - name: Harden Runner
         uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
@@ -351,6 +369,8 @@ jobs:
         uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
         with:
           key: ${{ runner.os }}-${{ github.job }}
+          workspaces: |
+            . -> .openapi-target
           cache-on-failure: true
 
       - name: Diff generated OpenAPI spec
@@ -368,7 +388,7 @@ jobs:
             local out="$2"
 
             git reset --hard
-            git clean -fd
+            git clean -fd -e .openapi-target
             git checkout "$ref"
             mkdir -p crates/astrid-gateway/examples
             cp /tmp/astrid-openapi/print-openapi.rs crates/astrid-gateway/examples/print-openapi.rs

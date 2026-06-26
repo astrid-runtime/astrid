@@ -117,49 +117,49 @@ fn build_authed_router(state: &Arc<GatewayState>) -> Router<Arc<GatewayState>> {
         // ── Principals (agents) ──
         .route("/api/sys/principals", get(principals::list_principals))
         .route("/api/sys/principals", post(principals::create_principal))
-        .route("/api/sys/principals/:id", get(principals::get_principal))
+        .route("/api/sys/principals/{id}", get(principals::get_principal))
         .route(
-            "/api/sys/principals/:id",
+            "/api/sys/principals/{id}",
             patch(principals::modify_principal),
         )
         .route(
-            "/api/sys/principals/:id",
+            "/api/sys/principals/{id}",
             delete(principals::delete_principal),
         )
         .route(
-            "/api/sys/principals/:id/enable",
+            "/api/sys/principals/{id}/enable",
             post(principals::enable_principal),
         )
         .route(
-            "/api/sys/principals/:id/disable",
+            "/api/sys/principals/{id}/disable",
             post(principals::disable_principal),
         )
         // ── Caps ──
-        .route("/api/sys/principals/:id/caps", post(caps::grant_caps))
-        .route("/api/sys/principals/:id/caps", delete(caps::revoke_caps))
+        .route("/api/sys/principals/{id}/caps", post(caps::grant_caps))
+        .route("/api/sys/principals/{id}/caps", delete(caps::revoke_caps))
         // ── Quotas ──
-        .route("/api/sys/principals/:id/quotas", get(quotas::get_quotas))
-        .route("/api/sys/principals/:id/quotas", put(quotas::set_quotas))
-        .route("/api/sys/principals/:id/usage", get(quotas::get_usage))
+        .route("/api/sys/principals/{id}/quotas", get(quotas::get_quotas))
+        .route("/api/sys/principals/{id}/quotas", put(quotas::set_quotas))
+        .route("/api/sys/principals/{id}/usage", get(quotas::get_usage))
         // ── Devices (paired keys) ──
         .route(
-            "/api/sys/principals/:id/devices",
+            "/api/sys/principals/{id}/devices",
             get(principals::list_principal_devices),
         )
         .route(
-            "/api/sys/principals/:id/devices/:key_id",
+            "/api/sys/principals/{id}/devices/{key_id}",
             delete(principals::delete_principal_device),
         )
         // ── Groups ──
         .route("/api/sys/groups", get(groups::list_groups))
         .route("/api/sys/groups", post(groups::create_group))
-        .route("/api/sys/groups/:name", patch(groups::modify_group))
-        .route("/api/sys/groups/:name", delete(groups::delete_group))
+        .route("/api/sys/groups/{name}", patch(groups::modify_group))
+        .route("/api/sys/groups/{name}", delete(groups::delete_group))
         // ── Invites ──
         .route("/api/sys/invites", post(invites::issue_invite))
         .route("/api/sys/invites", get(invites::list_invites))
         .route(
-            "/api/sys/invites/:fingerprint",
+            "/api/sys/invites/{fingerprint}",
             delete(invites::revoke_invite),
         )
         // ── Capabilities catalog ──
@@ -167,13 +167,13 @@ fn build_authed_router(state: &Arc<GatewayState>) -> Router<Arc<GatewayState>> {
         // ── Capsules ──
         .route("/api/capsules", get(capsules::list_capsules))
         .route("/api/capsules", post(capsules::install_capsule))
-        .route("/api/capsules/:id", get(capsules::get_capsule))
+        .route("/api/capsules/{id}", get(capsules::get_capsule))
         .route(
-            "/api/capsules/:id/topics",
+            "/api/capsules/{id}/topics",
             get(capsules::list_capsule_topics),
         )
-        .route("/api/capsules/:id/env", get(env::get_env_schema))
-        .route("/api/capsules/:id/env/:field", post(env::write_env))
+        .route("/api/capsules/{id}/env", get(env::get_env_schema))
+        .route("/api/capsules/{id}/env/{field}", post(env::write_env))
         // ── Audit stream ──
         .route("/api/events", get(events::get_events))
         // ── Audit history (paginated) ──
@@ -189,13 +189,13 @@ fn build_authed_router(state: &Arc<GatewayState>) -> Router<Arc<GatewayState>> {
         // collides with `/sessions/:id`.
         .route("/api/agent/sessions/search", get(sessions::search_sessions))
         .route(
-            "/api/agent/sessions/:id",
+            "/api/agent/sessions/{id}",
             get(sessions::get_session)
                 .patch(sessions::update_session)
                 .delete(sessions::delete_session),
         )
         .route(
-            "/api/agent/sessions/:id/messages",
+            "/api/agent/sessions/{id}/messages",
             get(sessions::get_session_messages),
         )
         // ── Agent elicitation reply ──

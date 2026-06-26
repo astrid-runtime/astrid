@@ -37,7 +37,7 @@ fn mint_self_signed(dir: &std::path::Path) -> (PathBuf, PathBuf) {
     let cert_path = dir.join("cert.pem");
     let key_path = dir.join("key.pem");
     std::fs::write(&cert_path, cert.cert.pem()).expect("write cert");
-    std::fs::write(&key_path, cert.key_pair.serialize_pem()).expect("write key");
+    std::fs::write(&key_path, cert.signing_key.serialize_pem()).expect("write key");
     (cert_path, key_path)
 }
 

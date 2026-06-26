@@ -37,7 +37,7 @@ use astrid_core::DeviceScope;
 use astrid_core::PrincipalId;
 use astrid_core::dirs::AstridHome;
 use base64::Engine;
-use rand::RngCore;
+use rand::{TryRng, rngs::SysRng};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
@@ -201,10 +201,16 @@ struct PersistedFile {
 }
 
 /// Generate a random URL-safe-base64 token from the OS CSPRNG.
+///
+/// # Panics
+///
+/// Panics if the OS CSPRNG is unavailable.
 #[must_use]
 pub fn generate_token() -> String {
     let mut bytes = [0u8; TOKEN_RAW_LEN];
-    rand::rngs::OsRng.fill_bytes(&mut bytes);
+    SysRng
+        .try_fill_bytes(&mut bytes)
+        .expect("OS CSPRNG unavailable while generating pair token");
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
 }
 

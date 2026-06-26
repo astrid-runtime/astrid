@@ -286,9 +286,9 @@ fn verify_signature_against_keys(
 
 /// Generate a fresh hex-encoded challenge nonce from the OS CSPRNG.
 fn generate_nonce_hex() -> Result<String, String> {
-    use rand::RngCore;
+    use rand::{TryRng, rngs::SysRng};
     let mut nonce = [0u8; PRINCIPAL_AUTH_NONCE_LEN];
-    rand::rngs::OsRng
+    SysRng
         .try_fill_bytes(&mut nonce)
         .map_err(|e| format!("entropy source unavailable: {e}"))?;
     Ok(hex::encode(nonce))

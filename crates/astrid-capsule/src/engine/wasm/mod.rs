@@ -14,7 +14,8 @@ use crate::engine::wasm::host_state::{
 use crate::error::{CapsuleError, CapsuleResult};
 use crate::manifest::CapsuleManifest;
 
-pub mod bindings;
+#[allow(unreachable_pub)]
+pub(crate) mod bindings;
 pub mod host;
 pub mod host_state;
 pub mod limits;
@@ -368,6 +369,52 @@ pub fn configure_kernel_linker(
         linker,
         |state| state,
     )
+}
+
+/// Result returned by a guest `astrid-hook-trigger` export.
+///
+/// This is the Astrid-owned public wrapper around the generated
+/// `astrid:guest/lifecycle.capsule-result` binding. The generated binding stays
+/// private so Wasmtime bindgen changes do not become `astrid-capsule` API.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HookTriggerOutput {
+    /// Hook action returned by the capsule.
+    pub action: String,
+    /// Optional hook payload returned by the capsule.
+    pub data: Option<String>,
+}
+
+/// Call a component's `astrid-hook-trigger` export using the private generated
+/// lifecycle binding.
+///
+/// # Errors
+///
+/// Returns an error if the export is missing or the guest call traps/fails.
+pub fn call_hook_trigger(
+    instance: &wasmtime::component::Instance,
+    store: &mut wasmtime::Store<HostState>,
+    function: &str,
+    input_bytes: Vec<u8>,
+) -> CapsuleResult<HookTriggerOutput> {
+    type HookTriggerResult = bindings::astrid::guest::lifecycle::CapsuleResult;
+
+    let func = instance
+        .get_typed_func::<(String, Vec<u8>), (HookTriggerResult,)>(
+            &mut *store,
+            "astrid-hook-trigger",
+        )
+        .map_err(|e| {
+            CapsuleError::UnsupportedEntryPoint(format!(
+                "capsule does not export `astrid-hook-trigger`: {e}"
+            ))
+        })?;
+
+    func.call(store, (function.to_owned(), input_bytes))
+        .map(|(cr,)| HookTriggerOutput {
+            action: cr.action,
+            data: cr.data,
+        })
+        .map_err(|e| CapsuleError::WasmError(format!("astrid-hook-trigger call failed: {e}")))
 }
 
 fn build_wasmtime_engine() -> CapsuleResult<wasmtime::Engine> {
@@ -2697,10 +2744,10 @@ fn wasm_exports_contain(name: &str, wasm_bytes: &[u8]) -> bool {
                     if e.kind != wasmparser::ComponentExternalKind::Func {
                         continue;
                     }
-                    if e.name.0 == name {
+                    if e.name.name == name {
                         name_present = true;
                     }
-                    if let Some(pos) = trio_position(e.name.0) {
+                    if let Some(pos) = trio_position(e.name.name) {
                         trio[pos] = Some(e.index);
                     }
                 }

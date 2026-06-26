@@ -5,7 +5,7 @@
 //! - User identity verification (optional user signing keys)
 
 use ed25519_dalek::{Signer, SigningKey, VerifyingKey};
-use rand::rngs::OsRng;
+use rand::{TryRng, rngs::SysRng};
 use serde::{Deserialize, Serialize};
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
@@ -24,10 +24,19 @@ pub struct KeyPair {
 
 impl KeyPair {
     /// Generate a new random key pair.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the OS CSPRNG is unavailable.
     #[must_use]
     pub fn generate() -> Self {
-        let signing_key = SigningKey::generate(&mut OsRng);
+        let mut secret = [0u8; 32];
+        SysRng
+            .try_fill_bytes(&mut secret)
+            .expect("OS CSPRNG unavailable while generating key pair");
+        let signing_key = SigningKey::from_bytes(&secret);
         let verifying_key = signing_key.verifying_key();
+        secret.zeroize();
         Self {
             verifying_key,
             signing_key,

@@ -28,7 +28,7 @@ bytes = "1"
 dashmap = { workspace = true }
 hex = { workspace = true }
 metrics = { workspace = true }
-notify = "7"
+notify = "8"
 parking_lot = { workspace = true }
 rand = { workspace = true }
 # `astrid:http@1.1.0` `auto-decompress` toggles gzip/brotli/deflate/zstd per
