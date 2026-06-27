@@ -564,6 +564,25 @@ run_adversarial_principal_smoke() {
   local admin_bearer status
   admin_bearer="$(mint_admin_bearer)"
 
+  note "checking regular principal cannot mutate foreign principal lifecycle"
+  status="$(http_status PATCH /api/sys/principals/e2e-plain-created "$user_bearer" \
+    '{"add_groups":["ops-team"],"remove_groups":[],"add_capsules":["astrid-capsule-registry"],"remove_capsules":[]}' \
+    "$ARTIFACTS/adversarial-foreign-principal-patch-denied.json")"
+  assert_status "regular principal foreign patch denied" "$status" 403
+  status="$(http_status POST /api/sys/principals/e2e-plain-created/disable "$user_bearer" "" \
+    "$ARTIFACTS/adversarial-foreign-principal-disable-denied.json")"
+  assert_status "regular principal foreign disable denied" "$status" 403
+  status="$(http_status DELETE /api/sys/principals/e2e-plain-created "$user_bearer" "" \
+    "$ARTIFACTS/adversarial-foreign-principal-delete-denied.json")"
+  assert_status "regular principal foreign delete denied" "$status" 403
+  status="$(http_status GET /api/sys/principals/e2e-plain-created "$admin_bearer" "" \
+    "$ARTIFACTS/adversarial-foreign-principal-after-denials.json")"
+  assert_status "foreign principal survived denied lifecycle mutations" "$status" 200
+  json_assert_cli_agent_enabled "$ARTIFACTS/adversarial-foreign-principal-after-denials.json" \
+    e2e-plain-created true
+  json_assert_principal_lacks_group "$ARTIFACTS/adversarial-foreign-principal-after-denials.json" \
+    e2e-plain-created ops-team
+
   status="$(http_status POST /api/sys/invites "$admin_bearer" \
     '{"group":"agent","max_uses":1,"expires_secs":600,"metadata":"e2e-http-revoke"}' \
     "$ARTIFACTS/http-invite-revoke-issue.json")"
@@ -738,6 +757,20 @@ names = sorted(item.get("name") for item in data.get("groups", []))
 want = sorted(sys.argv[2:])
 if names != want:
     raise SystemExit(f"unexpected group visibility {names!r}, want {want!r}: {data!r}")
+PY
+}
+
+json_assert_principal_lacks_group() {
+  local file=$1 principal=$2 forbidden_group=$3
+  "$PYTHON" - "$file" "$principal" "$forbidden_group" <<'PY'
+import json
+import sys
+
+data = json.load(open(sys.argv[1], encoding="utf-8"))
+if data.get("principal") != sys.argv[2]:
+    raise SystemExit(f"unexpected principal: {data!r}")
+if sys.argv[3] in data.get("groups", []):
+    raise SystemExit(f"forbidden group {sys.argv[3]!r} present: {data!r}")
 PY
 }
 
