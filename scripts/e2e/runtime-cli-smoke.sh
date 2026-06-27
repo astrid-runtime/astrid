@@ -405,22 +405,35 @@ assert_cli_exit_contains() {
 }
 
 assert_principal_cli_failure() {
-  local principal=$1 label=$2 stdout stderr status
+  local principal=$1 label=$2 stdout stderr
   shift 2
   stdout="$ARTIFACTS/$label.out"
   stderr="$ARTIFACTS/$label.err"
   printf '$ astrid --principal %s %s\n' "$principal" "$*" >> "$ARTIFACTS/cli-transcript.log"
-  set +e
-  "$CORE_DIR/target/debug/astrid" --principal "$principal" "$@" >"$stdout" 2>"$stderr"
-  status=$?
-  tee -a "$ARTIFACTS/cli-transcript.log" < "$stdout"
-  tee -a "$ARTIFACTS/cli-transcript.log" < "$stderr" >&2
-  if [[ "$status" -eq 0 ]]; then
-    set -e
+  if ! "$PYTHON" - "$stdout" "$stderr" "$CORE_DIR/target/debug/astrid" "$principal" "$@" <<'PY'
+import os
+import subprocess
+import sys
+
+stdout_path, stderr_path, binary, principal, *args = sys.argv[1:]
+with open(stdout_path, "wb") as stdout, open(stderr_path, "wb") as stderr:
+    proc = subprocess.run(
+        [binary, "--principal", principal, *args],
+        stdin=subprocess.DEVNULL,
+        stdout=stdout,
+        stderr=stderr,
+        env=os.environ.copy(),
+        check=False,
+    )
+raise SystemExit(0 if proc.returncode != 0 else 1)
+PY
+  then
+    tee -a "$ARTIFACTS/cli-transcript.log" < "$stdout"
+    tee -a "$ARTIFACTS/cli-transcript.log" < "$stderr" >&2
     fail "$label unexpectedly succeeded"
   fi
-  set -e
-  return 0
+  tee -a "$ARTIFACTS/cli-transcript.log" < "$stdout"
+  tee -a "$ARTIFACTS/cli-transcript.log" < "$stderr" >&2
 }
 
 json_assert_cli_agent_list() {
