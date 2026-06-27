@@ -44,7 +44,7 @@ deny = ["regular agent cannot reload all capsules"]
 
 [capabilities."self:capsule:reload"]
 scenario = "capsule_live_load_lifecycle"
-status = "mapped"
+status = "covered"
 allow = ["self-scoped principal can refresh its allowed capsule surface"]
 deny = ["self-scoped principal cannot reload another principal's surface"]
 
@@ -68,7 +68,7 @@ deny = ["regular agent without global capsule:list gets only its effective surfa
 
 [capabilities."self:capsule:list"]
 scenario = "capsule_metadata"
-status = "mapped"
+status = "covered"
 allow = ["regular agent can list its own effective capsule surface"]
 deny = ["regular agent cannot use self:list to enumerate hidden default-principal metadata"]
 
@@ -98,25 +98,25 @@ deny = ["operator without agent:delete cannot delete default"]
 
 [capabilities."agent:enable"]
 scenario = "principal_lifecycle"
-status = "mapped"
+status = "covered"
 allow = ["admin can enable a disabled temp principal"]
 deny = ["regular agent cannot enable another principal"]
 
 [capabilities."agent:disable"]
 scenario = "principal_lifecycle"
-status = "mapped"
+status = "covered"
 allow = ["admin can disable a temp principal"]
 deny = ["regular agent cannot disable another principal"]
 
 [capabilities."agent:modify"]
 scenario = "principal_crud"
-status = "mapped"
+status = "covered"
 allow = ["admin can modify a temp principal's groups and capsule grants"]
 deny = ["regular agent cannot modify another principal"]
 
 [capabilities."agent:list"]
 scenario = "principal_visibility"
-status = "mapped"
+status = "covered"
 allow = ["admin can list all principals"]
 deny = ["regular agent cannot list default or other principals through global visibility"]
 
@@ -140,7 +140,7 @@ deny = ["self-scoped principal cannot set another principal's quota"]
 
 [capabilities."quota:get"]
 scenario = "quota_scope"
-status = "mapped"
+status = "covered"
 allow = ["authorized operator can read another principal's quota"]
 deny = ["regular agent without global quota:get cannot read another principal's quota"]
 
@@ -164,7 +164,7 @@ deny = ["regular agent cannot delete groups"]
 
 [capabilities."group:modify"]
 scenario = "group_crud"
-status = "mapped"
+status = "covered"
 allow = ["admin can modify a temp custom group"]
 deny = ["regular agent cannot modify groups"]
 
@@ -235,13 +235,13 @@ deny = ["regular agent cannot revoke invites"]
 
 [capabilities."audit:read_all"]
 scenario = "audit_history"
-status = "mapped"
+status = "covered"
 allow = ["admin can read cross-principal audit history"]
 deny = ["regular agent sees only own audit entries"]
 
 [capabilities."self:approval:respond"]
 scenario = "approval_flow"
-status = "mapped"
+status = "covered"
 allow = ["principal can answer its own approval request"]
 deny = ["different principal cannot answer or cancel the request"]
 
@@ -253,7 +253,7 @@ deny = ["operator without self:auth:pair cannot issue a paired-device token"]
 
 [capabilities."self:auth:pair:admin"]
 scenario = "pair_device_lifecycle"
-status = "mapped"
+status = "covered"
 allow = ["full-scope device can mint an unattenuated pair-device token"]
 deny = ["attenuated device cannot widen itself through pair-device issuance"]
 

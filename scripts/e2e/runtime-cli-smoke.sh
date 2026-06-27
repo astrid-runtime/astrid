@@ -187,6 +187,20 @@ PY
     2> >(tee -a "$ARTIFACTS/cli-transcript.log" >&2) || true
   sed -n '1,120p' "$ARTIFACTS/cli-doctor.txt" >> "$ARTIFACTS/cli-transcript.log"
   grep -q "ASTRID_HOME" "$ARTIFACTS/cli-doctor.txt" || fail "doctor did not inspect ASTRID_HOME"
+  printf '$ ASTRID_HOME=relative-home astrid doctor --no-daemon\n' >> "$ARTIFACTS/cli-transcript.log"
+  set +e
+  env ASTRID_HOME=relative-home HOME="$POISON_HOME" "$CORE_DIR/target/debug/astrid" doctor --no-daemon \
+    > "$ARTIFACTS/cli-doctor-relative-home.out" \
+    2> "$ARTIFACTS/cli-doctor-relative-home.err"
+  status=$?
+  set -e
+  tee -a "$ARTIFACTS/cli-transcript.log" < "$ARTIFACTS/cli-doctor-relative-home.out"
+  tee -a "$ARTIFACTS/cli-transcript.log" < "$ARTIFACTS/cli-doctor-relative-home.err" >&2
+  [[ "$status" -eq 1 ]] || fail "doctor relative ASTRID_HOME expected exit 1, got $status"
+  grep -Fq "ASTRID_HOME must be an absolute path" \
+    "$ARTIFACTS/cli-doctor-relative-home.out" \
+    "$ARTIFACTS/cli-doctor-relative-home.err" \
+    || fail "doctor relative ASTRID_HOME missed bounded diagnostic"
   run_cli_stdin_timeout "cli-chat-eof" 20 --format json chat
   grep -q "Goodbye" "$ARTIFACTS/cli-chat-eof.out" || fail "chat EOF path did not exit cleanly"
   run_cli_stdin_timeout "cli-mcp-serve-eof" 20 mcp serve --principal anonymous

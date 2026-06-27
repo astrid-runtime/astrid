@@ -706,6 +706,8 @@ PY
     || fail "agent stream did not emit ready event"
   grep -q "\"principal\":\"$user_principal\"" "$ARTIFACTS/agent-stream.sse" \
     || fail "agent stream ready event did not carry caller principal"
+  status="$(http_status GET /api/agent/stream "" "" "$ARTIFACTS/agent-stream-unauth.json")"
+  assert_status "unauthenticated agent stream denied" "$status" 401
 
   run_agent_request_http_guardrails "$user_bearer" "$user_principal"
 
