@@ -219,19 +219,19 @@ principal = "admin_and_ops"
 
 [commands."invite redeem"]
 scenario = "invite_lifecycle"
-status = "mapped"
+status = "covered"
 mode = "mutating"
 principal = "new_principal"
 
 [commands."invite list"]
 scenario = "invite_lifecycle"
-status = "mapped"
+status = "covered"
 mode = "read"
 principal = "admin_and_ops"
 
 [commands."invite revoke"]
 scenario = "invite_lifecycle"
-status = "mapped"
+status = "covered"
 mode = "mutating"
 principal = "admin"
 
@@ -267,19 +267,19 @@ principal = "local_cli"
 
 [commands."pair-device issue"]
 scenario = "pair_device_lifecycle"
-status = "mapped"
+status = "covered"
 mode = "mutating"
 principal = "agent"
 
 [commands."pair-device list"]
 scenario = "pair_device_lifecycle"
-status = "mapped"
+status = "covered"
 mode = "read"
 principal = "agent_and_admin"
 
 [commands."pair-device revoke"]
 scenario = "pair_device_lifecycle"
-status = "mapped"
+status = "covered"
 mode = "mutating"
 principal = "agent_and_admin"
 
@@ -297,7 +297,7 @@ principal = "agent"
 
 [commands."secret delete"]
 scenario = "secret_redaction"
-status = "mapped"
+status = "covered"
 mode = "mutating"
 principal = "agent"
 

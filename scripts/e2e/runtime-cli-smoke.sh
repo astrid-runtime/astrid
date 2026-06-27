@@ -42,10 +42,44 @@ run_cli_semantic_smoke() {
   run_cli caps check "$ops_principal" invite:issue > "$ARTIFACTS/cli-caps-check-ops.txt"
   grep -q "allowed" "$ARTIFACTS/cli-caps-check-ops.txt" || fail "caps check did not allow ops invite:issue"
 
+  local invite_token redeem_key pair_token pair_pubkey pair_key_id
+  invite_token="$("$CORE_DIR/target/debug/astrid" invite issue --group agent --max-uses 1 \
+    --expires-secs 600 --metadata e2e-cli-revoke --raw 2>> "$ARTIFACTS/cli-transcript.log")"
+  printf '$ astrid invite issue --group agent --max-uses 1 --expires-secs 600 --metadata e2e-cli-revoke --raw\n<redacted invite token>\n' \
+    >> "$ARTIFACTS/cli-transcript.log"
+  run_cli invite list --json > "$ARTIFACTS/cli-invite-list-before-revoke.json"
+  json_assert_invite_metadata "$ARTIFACTS/cli-invite-list-before-revoke.json" e2e-cli-revoke present
+  printf '$ astrid invite revoke <redacted invite token>\n' >> "$ARTIFACTS/cli-transcript.log"
+  "$CORE_DIR/target/debug/astrid" invite revoke "$invite_token" \
+    > "$ARTIFACTS/cli-invite-revoke.txt" 2>> "$ARTIFACTS/cli-transcript.log"
+  run_cli invite list --json > "$ARTIFACTS/cli-invite-list-after-revoke.json"
+  json_assert_invite_metadata "$ARTIFACTS/cli-invite-list-after-revoke.json" e2e-cli-revoke absent
+  run_cli keypair generate --name e2e-cli-redeem-key --force --raw \
+    > "$ARTIFACTS/cli-invite-redeem-key.pub"
+  redeem_key="$("$CORE_DIR/target/debug/astrid" invite issue --group agent --max-uses 1 \
+    --expires-secs 600 --metadata e2e-cli-redeem --raw 2>> "$ARTIFACTS/cli-transcript.log")"
+  printf '$ astrid invite issue --group agent --max-uses 1 --expires-secs 600 --metadata e2e-cli-redeem --raw\n<redacted invite token>\n' \
+    >> "$ARTIFACTS/cli-transcript.log"
+  printf '$ astrid invite redeem <redacted invite token> --keypair e2e-cli-redeem-key --display-name e2e-cli-redeemed\n' \
+    >> "$ARTIFACTS/cli-transcript.log"
+  "$CORE_DIR/target/debug/astrid" invite redeem "$redeem_key" --keypair e2e-cli-redeem-key \
+    --display-name e2e-cli-redeemed > "$ARTIFACTS/cli-invite-redeem.txt" \
+    2>> "$ARTIFACTS/cli-transcript.log"
+  run_cli agent show e2e-cli-redeemed --format json > "$ARTIFACTS/cli-invite-redeemed-agent.json"
+  json_assert_cli_agent_show "$ARTIFACTS/cli-invite-redeemed-agent.json" e2e-cli-redeemed agent
+  run_cli agent delete e2e-cli-redeemed -y
+  run_cli keypair delete e2e-cli-redeem-key --yes
+
   run_cli quota show --agent "$user_principal" --format json > "$ARTIFACTS/cli-quota-show-user.json"
   json_assert_cli_quota "$ARTIFACTS/cli-quota-show-user.json" "$user_principal" 4
   run_cli secret list --agent "$user_principal" --format json > "$ARTIFACTS/cli-secret-list-user.json"
   json_assert_secret_list_metadata "$ARTIFACTS/cli-secret-list-user.json" astrid-capsule-openai-compat api_key
+  run_cli secret set e2e_cli_delete_marker e2e-value --agent "$user_principal"
+  run_cli secret list --agent "$user_principal" --format json > "$ARTIFACTS/cli-secret-list-with-delete-marker.json"
+  json_assert_secret_present "$ARTIFACTS/cli-secret-list-with-delete-marker.json" default e2e_cli_delete_marker
+  run_cli secret delete e2e_cli_delete_marker --agent "$user_principal"
+  run_cli secret list --agent "$user_principal" --format json > "$ARTIFACTS/cli-secret-list-after-delete.json"
+  json_assert_secret_absent "$ARTIFACTS/cli-secret-list-after-delete.json" default e2e_cli_delete_marker
   run_cli keypair generate --name e2e-cli-key --force --raw > "$ARTIFACTS/cli-keypair-generated.pub"
   run_cli keypair list --json > "$ARTIFACTS/cli-keypair-list.json"
   json_assert_cli_keypair_list "$ARTIFACTS/cli-keypair-list.json" e2e-cli-key
@@ -57,6 +91,25 @@ run_cli_semantic_smoke() {
   if run_cli keypair show e2e-cli-key > "$ARTIFACTS/cli-keypair-show-after-delete.txt"; then
     fail "deleted keypair e2e-cli-key remained visible"
   fi
+  pair_token="$("$CORE_DIR/target/debug/astrid" pair-device issue --scope use-only \
+    --label e2e-cli-pair --expires-secs 120 --raw 2>> "$ARTIFACTS/cli-transcript.log")"
+  printf '$ astrid pair-device issue --scope use-only --label e2e-cli-pair --expires-secs 120 --raw\n<redacted pair token>\n' \
+    >> "$ARTIFACTS/cli-transcript.log"
+  pair_pubkey="$("$PYTHON" - <<'PY'
+import secrets
+print(secrets.token_hex(32))
+PY
+)"
+  status="$(http_status POST /api/auth/pair-device/redeem "" \
+    "{\"token\":\"$pair_token\",\"public_key\":\"$pair_pubkey\"}" \
+    "$ARTIFACTS/cli-pair-device-redeem.json")"
+  assert_status "CLI-issued pair token redeem" "$status" 200
+  pair_key_id="$(json_field "$ARTIFACTS/cli-pair-device-redeem.json" key_id)"
+  run_cli pair-device list --principal default --json > "$ARTIFACTS/cli-pair-device-list.json"
+  json_assert_pair_device_list "$ARTIFACTS/cli-pair-device-list.json" "$pair_key_id" present
+  run_cli pair-device revoke "$pair_key_id" --principal default
+  run_cli pair-device list --principal default --json > "$ARTIFACTS/cli-pair-device-list-after-revoke.json"
+  json_assert_pair_device_list "$ARTIFACTS/cli-pair-device-list-after-revoke.json" "$pair_key_id" absent
 
   run_cli capsule show astrid-capsule-openai-compat --format json \
     > "$ARTIFACTS/cli-capsule-show-openai-user.json"
@@ -160,6 +213,20 @@ if sys.argv[3] in data.get("capabilities", []):
 PY
 }
 
+json_assert_invite_metadata() {
+  local file=$1 metadata=$2 expected=$3
+  "$PYTHON" - "$file" "$metadata" "$expected" <<'PY'
+import json
+import sys
+
+data = json.load(open(sys.argv[1], encoding="utf-8"))
+found = any(item.get("metadata") == sys.argv[2] for item in data)
+want = sys.argv[3] == "present"
+if found is not want:
+    raise SystemExit(f"invite metadata {sys.argv[2]!r} presence {found}, want {want}: {data!r}")
+PY
+}
+
 json_assert_cli_caps_show() {
   local file=$1 principal=$2 group=$3
   "$PYTHON" - "$file" "$principal" "$group" <<'PY'
@@ -171,6 +238,31 @@ if data.get("principal") != sys.argv[2]:
     raise SystemExit(f"unexpected caps principal: {data!r}")
 if sys.argv[3] not in data.get("groups", []):
     raise SystemExit(f"missing caps group {sys.argv[3]!r}: {data!r}")
+PY
+}
+
+json_assert_secret_absent() {
+  local file=$1 capsule=$2 key=$3
+  "$PYTHON" - "$file" "$capsule" "$key" <<'PY'
+import json
+import sys
+
+data = json.load(open(sys.argv[1], encoding="utf-8"))
+for item in data:
+    if item.get("capsule") == sys.argv[2] and item.get("key") == sys.argv[3]:
+        raise SystemExit(f"secret was not deleted: {item!r}")
+PY
+}
+
+json_assert_secret_present() {
+  local file=$1 capsule=$2 key=$3
+  "$PYTHON" - "$file" "$capsule" "$key" <<'PY'
+import json
+import sys
+
+data = json.load(open(sys.argv[1], encoding="utf-8"))
+if not any(item.get("capsule") == sys.argv[2] and item.get("key") == sys.argv[3] for item in data):
+    raise SystemExit(f"secret metadata entry missing for {sys.argv[2]!r}/{sys.argv[3]!r}: {data!r}")
 PY
 }
 
@@ -188,6 +280,20 @@ if entry.get("backend") != "file":
     raise SystemExit(f"unexpected keypair backend: {entry!r}")
 if not entry.get("fingerprint"):
     raise SystemExit(f"keypair list missed fingerprint: {entry!r}")
+PY
+}
+
+json_assert_pair_device_list() {
+  local file=$1 key_id=$2 expected=$3
+  "$PYTHON" - "$file" "$key_id" "$expected" <<'PY'
+import json
+import sys
+
+data = json.load(open(sys.argv[1], encoding="utf-8"))
+found = any(item.get("key_id") == sys.argv[2] for item in data)
+want = sys.argv[3] == "present"
+if found is not want:
+    raise SystemExit(f"pair device {sys.argv[2]!r} presence {found}, want {want}: {data!r}")
 PY
 }
 
