@@ -805,7 +805,7 @@ run_adversarial_principal_smoke() {
 
   status="$(http_status GET /api/sys/principals/InvalidPrincipalId "$user_bearer" "" \
     "$ARTIFACTS/adversarial-principal-invalid-id.json")"
-  assert_status "invalid principal id rejected with bounded error" "$status" 400
+  assert_status "invalid principal id hidden with bounded error" "$status" 404
 }
 
 json_assert_http_group() {
