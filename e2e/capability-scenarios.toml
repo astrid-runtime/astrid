@@ -194,20 +194,20 @@ deny = ["regular agent cannot revoke capabilities"]
 
 [capabilities."caps:token:mint"]
 scenario = "capability_tokens"
-status = "mapped"
-allow = ["authorized operator can mint a temp capability token"]
+status = "covered"
+allow = ["authorized admin/operator can mint a temp capability token"]
 deny = ["regular agent cannot mint capability tokens"]
 
 [capabilities."caps:token:revoke"]
 scenario = "capability_tokens"
-status = "mapped"
-allow = ["authorized operator can revoke a temp capability token"]
+status = "covered"
+allow = ["authorized admin/operator can revoke a temp capability token"]
 deny = ["regular agent cannot revoke capability tokens"]
 
 [capabilities."caps:token:list"]
 scenario = "capability_tokens"
-status = "mapped"
-allow = ["authorized operator can list temp capability tokens"]
+status = "covered"
+allow = ["authorized admin/operator can list temp capability tokens"]
 deny = ["regular agent cannot list another principal's capability tokens"]
 
 [capabilities."invite:issue"]

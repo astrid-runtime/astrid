@@ -88,24 +88,14 @@ denial = ["regular agent cannot grant or revoke capabilities"]
 state = ["principal grant/revoke set changes only for the target principal"]
 evidence = ["caps CLI output and before/after HTTP status artifacts"]
 
-[scenarios.capability_token_stub]
-status = "waived"
-surfaces = ["cli"]
-auth = ["admin"]
-success = ["not asserted until token lifecycle is live"]
-denial = ["not asserted until token lifecycle is live"]
-state = ["no token store mutation is expected"]
-evidence = ["waiver reason on each token command"]
-waiver = "Capability token CLI parses today, but token lifecycle is not live in the harness."
-
 [scenarios.capability_tokens]
-status = "mapped"
-surfaces = ["capability"]
-auth = ["operator with caps:token:* authority"]
-success = ["authorized operator can mint, list, and revoke a temp token"]
+status = "covered"
+surfaces = ["cli", "capability"]
+auth = ["admin/operator with caps:token:* authority"]
+success = ["authorized admin/operator can mint, list, and revoke a temp token"]
 denial = ["regular agent cannot mint, list, or revoke capability tokens"]
 state = ["token store contains only expected temp token transitions"]
-evidence = ["token list output and audit entries"]
+evidence = ["CLI token mint/list/revoke transcript and denial artifacts"]
 
 [scenarios.capsule_authoring_smoke]
 status = "covered"

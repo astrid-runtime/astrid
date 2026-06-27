@@ -52,6 +52,37 @@ run_cli_semantic_smoke() {
   json_assert_cli_caps_show "$ARTIFACTS/cli-caps-show-user.json" "$user_principal" agent
   run_cli caps check "$ops_principal" invite:issue > "$ARTIFACTS/cli-caps-check-ops.txt"
   grep -q "allowed" "$ARTIFACTS/cli-caps-check-ops.txt" || fail "caps check did not allow ops invite:issue"
+  run_cli caps token list "$user_principal" > "$ARTIFACTS/cli-caps-token-list-before.txt"
+  grep -q "no tokens" "$ARTIFACTS/cli-caps-token-list-before.txt" || fail "initial token list was not empty"
+  local token_resource token_id token_ids
+  token_resource="mcp://astrid-e2e:capability-token"
+  run_cli caps token mint "$user_principal" "$token_resource" --ttl 5m \
+    > "$ARTIFACTS/cli-caps-token-mint.txt"
+  token_ids="$(grep -Eo '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}' \
+    "$ARTIFACTS/cli-caps-token-mint.txt")"
+  token_id="${token_ids%%$'\n'*}"
+  [[ -n "$token_id" ]] || fail "caps token mint did not print a token id"
+  run_cli caps token list "$user_principal" > "$ARTIFACTS/cli-caps-token-list-after-mint.txt"
+  grep -Fq "$token_id" "$ARTIFACTS/cli-caps-token-list-after-mint.txt" || fail "token list missed minted token id"
+  grep -Fq "$token_resource" "$ARTIFACTS/cli-caps-token-list-after-mint.txt" || fail "token list missed minted token resource"
+  if run_principal_cli "$user_principal" caps token mint "$user_principal" "$token_resource" \
+    > "$ARTIFACTS/cli-caps-token-user-mint-denied.txt"; then
+    fail "regular principal minted a capability token"
+  fi
+  if run_principal_cli "$user_principal" caps token list "$user_principal" \
+    > "$ARTIFACTS/cli-caps-token-user-list-denied.txt"; then
+    fail "regular principal listed capability tokens"
+  fi
+  if run_principal_cli "$user_principal" caps token revoke "$token_id" \
+    > "$ARTIFACTS/cli-caps-token-user-revoke-denied.txt"; then
+    fail "regular principal revoked a capability token"
+  fi
+  run_cli caps token revoke "$token_id" > "$ARTIFACTS/cli-caps-token-revoke.txt"
+  grep -Fq "$token_id" "$ARTIFACTS/cli-caps-token-revoke.txt" || fail "token revoke output missed token id"
+  run_cli caps token list "$user_principal" > "$ARTIFACTS/cli-caps-token-list-after-revoke.txt"
+  if grep -Fq "$token_id" "$ARTIFACTS/cli-caps-token-list-after-revoke.txt"; then
+    fail "revoked token remained visible in token list"
+  fi
   assert_cli_deferred "cli-agent-discover" "remote agent / Agent Card management" agent discover example.invalid
   assert_cli_deferred "cli-agent-add" "remote agent / Agent Card management" agent add example.invalid
   assert_cli_deferred "cli-agent-card" "remote agent / Agent Card management" agent card example.invalid

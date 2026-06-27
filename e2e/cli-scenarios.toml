@@ -179,25 +179,22 @@ mode = "read"
 principal = "admin_and_agent"
 
 [commands."caps token mint"]
-scenario = "capability_token_stub"
-status = "waived"
-mode = "deferred"
-principal = "admin"
-reason = "Token lifecycle is parsed but kernel token issuance is not live yet."
+scenario = "capability_tokens"
+status = "covered"
+mode = "mutating"
+principal = "admin_and_agent"
 
 [commands."caps token revoke"]
-scenario = "capability_token_stub"
-status = "waived"
-mode = "deferred"
-principal = "admin"
-reason = "Token lifecycle is parsed but kernel token revocation is not live yet."
+scenario = "capability_tokens"
+status = "covered"
+mode = "mutating"
+principal = "admin_and_agent"
 
 [commands."caps token list"]
-scenario = "capability_token_stub"
-status = "waived"
-mode = "deferred"
-principal = "admin"
-reason = "Token lifecycle is parsed but kernel token listing is not live yet."
+scenario = "capability_tokens"
+status = "covered"
+mode = "read"
+principal = "admin_and_agent"
 
 [commands."quota show"]
 scenario = "quota_scope"
