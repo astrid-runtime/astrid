@@ -52,6 +52,17 @@ run_gateway_quota_write_smoke() {
     "$ARTIFACTS/http-quota-after-write.json")"
   assert_status "agent quota read after HTTP write" "$status" 200
   json_assert_field_equals "$ARTIFACTS/http-quota-after-write.json" max_background_processes 5
+  body="$(quota_request_body "$ARTIFACTS/http-quota-after-write.json" 6)"
+  status="$(http_status PUT "/api/sys/principals/$user_principal/quotas" "$user_bearer" "$body" \
+    "$ARTIFACTS/http-quota-self-write.json")"
+  assert_status "agent quota self-write" "$status" 200
+  status="$(http_status GET "/api/sys/principals/$user_principal/quotas" "$user_bearer" "" \
+    "$ARTIFACTS/http-quota-after-self-write.json")"
+  assert_status "agent quota read after self-write" "$status" 200
+  json_assert_field_equals "$ARTIFACTS/http-quota-after-self-write.json" max_background_processes 6
+  status="$(http_status PUT "/api/sys/principals/$ops_principal/quotas" "$user_bearer" "$body" \
+    "$ARTIFACTS/http-quota-cross-principal-write-denied.json")"
+  assert_status "agent cross-principal quota write denied" "$status" 403
   status="$(http_status GET "/api/sys/principals/$user_principal/usage" "$user_bearer" "" \
     "$ARTIFACTS/http-usage-self.json")"
   assert_status "agent usage self-read" "$status" 200

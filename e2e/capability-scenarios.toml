@@ -134,7 +134,7 @@ deny = ["regular agent cannot set another principal's quota"]
 
 [capabilities."self:quota:set"]
 scenario = "quota_scope"
-status = "mapped"
+status = "covered"
 allow = ["self-scoped principal can set only its own quota when granted"]
 deny = ["self-scoped principal cannot set another principal's quota"]
 
