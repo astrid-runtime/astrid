@@ -139,6 +139,47 @@ run_mid_capsule_command_crash_smoke() {
   fi
 }
 
+run_mid_approval_wait_crash_smoke() {
+  local principal=$1
+  local bearer=$2
+  local sse="$ARTIFACTS/crash-approval-requests.sse"
+  local out="$ARTIFACTS/crash-approval-command.txt"
+  local rc=0
+
+  note "checking crash recovery while an approval request is waiting"
+  curl -sN --max-time 20 \
+    -H "Authorization: Bearer $bearer" \
+    "$GATEWAY/api/agent/requests" \
+    > "$sse" 2>&1 &
+  local stream_pid=$!
+  wait_for_sse_ready "$sse" || {
+    terminate_pid "$stream_pid"
+    cat "$sse" >&2 2>/dev/null || true
+    fail "approval crash request stream did not become ready"
+  }
+  bounded_principal_cli "$principal" 12 "$out" \
+    capsule run astrid-capsule-adversarial adversarial-approval &
+  local run_pid=$!
+  wait_for_approval_request_id "$sse" > "$ARTIFACTS/crash-approval-request-id.txt" || {
+    terminate_pid "$run_pid"
+    terminate_pid "$stream_pid"
+    cat "$sse" >&2 2>/dev/null || true
+    fail "approval request was not forwarded before crash deadline"
+  }
+
+  crash_daemon_process
+  terminate_pid "$stream_pid"
+  wait "$run_pid" || rc=$?
+  if [[ "$rc" -eq 0 ]]; then
+    cat "$out" >&2
+    fail "in-flight approval command unexpectedly succeeded after daemon crash"
+  fi
+  if [[ "$rc" -eq 124 ]]; then
+    cat "$out" >&2
+    fail "in-flight approval command hung until timeout after daemon crash"
+  fi
+}
+
 run_post_admin_mutation_crash_smoke() {
   local principal="e2e-crash-created"
 
@@ -166,6 +207,8 @@ run_crash_recovery_smoke() {
   start_daemon "restarting daemon after abrupt process death"
   run_mid_capsule_command_crash_smoke "$user_principal"
   start_daemon "restarting daemon after capsule command crash"
+  run_mid_approval_wait_crash_smoke "$user_principal" "$user_bearer"
+  start_daemon "restarting daemon after approval wait crash"
   run_post_admin_mutation_crash_smoke
 
   local status
