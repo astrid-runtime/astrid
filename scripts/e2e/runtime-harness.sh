@@ -970,7 +970,9 @@ PY
     astrid-capsule-registry absent
 
   note "collecting scoped audit artifacts"
-  collect_audit_artifacts "$restart_user_bearer" "$ops_bearer" "$user_principal" "$ops_principal"
+  collect_audit_artifacts "$restart_user_bearer" "$ops_bearer" "$user_principal" "$ops_principal" \
+    "$paired_key_id" "$user_bearer" "$ops_bearer" "$paired_bearer" "$refreshed_paired_bearer" \
+    "$restart_user_bearer" "$agent_invite" "$pair_token"
   status="$(http_status GET /metrics "" "" "$ARTIFACTS/final-metrics.txt")"
   assert_status "final metrics scrape" "$status" 200
   json_assert_metrics_contract "$ARTIFACTS/final-metrics.txt" \
