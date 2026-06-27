@@ -35,7 +35,15 @@ env:
 jobs:
   runtime-e2e:
     name: Runtime CLI + HTTP sweep
+    # Platform policy: the full installed-runtime sweep is required on Linux,
+    # where the capsule sandbox and GitHub runner environment are deterministic
+    # enough for the long fake-provider story. macOS runtime confidence comes
+    # from the regular workspace test matrix in ci.yml plus focused diagnostics;
+    # it is not a silent skip of this job.
     runs-on: ubuntu-latest
+    # Runtime budget: the harness has bounded daemon startup, curl/SSE, fake LLM,
+    # cleanup, and child-process waits. The job-level cap catches any missed
+    # product hang and keeps this workflow eligible for PR gating.
     timeout-minutes: 45
     steps:
       - name: Harden Runner
