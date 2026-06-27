@@ -139,6 +139,22 @@ run_mid_capsule_command_crash_smoke() {
   fi
 }
 
+run_post_admin_mutation_crash_smoke() {
+  local principal="e2e-crash-created"
+
+  note "checking crash recovery immediately after a mutating admin operation"
+  run_cli agent create "$principal" --group agent -y
+  [[ -f "$ASTRID_HOME/etc/profiles/$principal.toml" ]] \
+    || fail "admin mutation did not write profile before crash: $principal"
+
+  crash_daemon_process
+  start_daemon "restarting daemon after post-admin-mutation crash"
+
+  run_cli agent show "$principal" --format json > "$ARTIFACTS/crash-admin-created-agent.json"
+  json_assert_cli_agent_show "$ARTIFACTS/crash-admin-created-agent.json" "$principal" agent
+  json_assert_cli_agent_enabled "$ARTIFACTS/crash-admin-created-agent.json" "$principal" true
+}
+
 run_crash_recovery_smoke() {
   local user_bearer=$1
   local ops_bearer=$2
@@ -150,6 +166,7 @@ run_crash_recovery_smoke() {
   start_daemon "restarting daemon after abrupt process death"
   run_mid_capsule_command_crash_smoke "$user_principal"
   start_daemon "restarting daemon after capsule command crash"
+  run_post_admin_mutation_crash_smoke
 
   local status
   status="$(http_status GET /api/auth/me "$user_bearer" "" "$ARTIFACTS/crash-restart-agent-me.json")"
