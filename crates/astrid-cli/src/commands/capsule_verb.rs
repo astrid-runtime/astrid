@@ -10,7 +10,7 @@
 //! 3. **Match** — resolve `(verb, providers)` to exactly one provider, or
 //!    report an actionable error (zero/ambiguous).
 //! 4. **Execute** — publish `cli.v1.command.run.<provider>` and await
-//!    `cli.v1.command.result.<req_id>` with a 30s budget.
+//!    `cli.v1.command.result.<req_id>` with a bounded result budget.
 //! 5. **Render** — print `output`/`error` and exit with the capsule's
 //!    `exit_code`.
 //!
@@ -30,7 +30,8 @@ use crate::socket_client::SocketClient;
 use crate::theme::Theme;
 
 /// Wall-clock budget for a capsule to respond on the result topic.
-const RESULT_TIMEOUT: Duration = Duration::from_secs(30);
+const RESULT_TIMEOUT_SECS: u64 = 70;
+const RESULT_TIMEOUT: Duration = Duration::from_secs(RESULT_TIMEOUT_SECS);
 
 /// Outcome of resolving a verb against the daemon's command registry.
 ///
@@ -247,7 +248,9 @@ async fn execute(provider: &str, verb: &str, args: &[String]) -> Result<ExitCode
     else {
         eprintln!(
             "{}",
-            Theme::error(&format!("Capsule '{provider}' did not respond within 30s."))
+            Theme::error(&format!(
+                "Capsule '{provider}' did not respond within {RESULT_TIMEOUT_SECS}s."
+            ))
         );
         return Ok(ExitCode::from(1));
     };
