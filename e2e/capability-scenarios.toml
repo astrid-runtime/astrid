@@ -50,12 +50,12 @@ deny = ["self-scoped principal cannot reload the daemon-wide capsule set"]
 
 [capabilities."capsule:remove"]
 scenario = "capsule_live_load_lifecycle"
-status = "mapped"
-allow = ["authorized operator can remove a temp test capsule"]
-deny = ["regular agent cannot remove daemon-wide capsules"]
+status = "covered"
+allow = ["authorized operator can remove a daemon-wide test capsule"]
+deny = ["regular agent cannot remove daemon-wide capsules and disk state remains installed"]
 
 [capabilities."self:capsule:remove"]
-scenario = "capsule_live_load_lifecycle"
+scenario = "self_capsule_workspace"
 status = "mapped"
 allow = ["self-scoped principal can remove only its own test capsule"]
 deny = ["self-scoped principal cannot remove a shared capsule"]

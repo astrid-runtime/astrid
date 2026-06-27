@@ -457,7 +457,7 @@ EOF
   run_gateway_public_surface_smoke
 
   note "checking principal and capability isolation"
-  run_cli group create ops-team --caps "capsule:install,capsule:reload,invite:issue,invite:list,self:capsule:list"
+  run_cli group create ops-team --caps "capsule:install,capsule:reload,capsule:remove,invite:issue,invite:list,self:capsule:list"
 
   local ops_invite
   ops_invite="$("$CORE_DIR/target/debug/astrid" invite issue --group ops-team --max-uses 1 --expires-secs 600 --raw \
@@ -911,7 +911,14 @@ PY
   run_live_approval_cancel_smoke "$restart_user_bearer" "$user_principal"
 
   note "checking .capsule artifact lifecycle"
-  run_cli capsule remove astrid-capsule-registry --force
+  if run_principal_cli "$user_principal" capsule remove astrid-capsule-registry --force; then
+    fail "regular agent unexpectedly removed daemon-wide capsule"
+  fi
+  status="$(http_status GET /api/capsules "$restart_user_bearer" "" "$ARTIFACTS/artifact-lifecycle-after-denied-remove-capsules.json")"
+  assert_status "artifact lifecycle list after denied remove" "$status" 200
+  json_assert_capsule_list_state "$ARTIFACTS/artifact-lifecycle-after-denied-remove-capsules.json" astrid-capsule-registry present
+
+  run_principal_cli "$ops_principal" capsule remove astrid-capsule-registry --force
   status="$(http_status GET /api/capsules "$restart_user_bearer" "" \
     "$ARTIFACTS/artifact-lifecycle-after-remove-capsules.json")"
   assert_status "artifact lifecycle list after remove" "$status" 200
@@ -954,7 +961,7 @@ PY
   json_assert_capsule_list_state "$ARTIFACTS/artifact-lifecycle-after-update-capsules.json" \
     astrid-capsule-registry present
 
-  run_cli capsule remove astrid-capsule-registry --force
+  run_principal_cli "$ops_principal" capsule remove astrid-capsule-registry --force
   status="$(http_status GET /api/capsules "$restart_user_bearer" "" \
     "$ARTIFACTS/artifact-lifecycle-final-remove-capsules.json")"
   assert_status "artifact lifecycle final live remove" "$status" 200

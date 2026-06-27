@@ -125,7 +125,7 @@ state = ["installed capsule registry contains the artifact once"]
 evidence = ["capsule build/install transcript and metadata artifacts"]
 
 [scenarios.capsule_live_load_lifecycle]
-status = "mapped"
+status = "covered"
 surfaces = ["cli", "http", "capability"]
 auth = ["admin/operator with capsule lifecycle caps"]
 success = ["install, reload, upgrade/reinstall, remove, and restart converge on expected capsule surface"]

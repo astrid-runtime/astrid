@@ -23,27 +23,10 @@ pub(crate) fn remove_capsule(
     force: bool,
     purge: bool,
 ) -> anyhow::Result<()> {
+    validate_capsule_removal(name, workspace, force)?;
+
     let home = AstridHome::resolve()?;
     let target_dir = super::install::resolve_target_dir(&home, name, workspace)?;
-
-    if !target_dir.exists() {
-        bail!("Capsule '{name}' is not installed.");
-    }
-
-    let target_meta = super::meta::read_meta(&target_dir);
-
-    // Scan once, reuse for both dependency check and binary cleanup
-    let all_capsules = scan_installed_capsules()?;
-
-    // Dependency safety check (skip with --force)
-    if !force && let Some(block) = check_removal_safety(name, target_meta.as_ref(), &all_capsules) {
-        bail!(
-            "Cannot remove '{name}': it is the sole provider of '{}' \
-             which is required by '{}'. Use --force to override.",
-            block.capability,
-            block.dependent,
-        );
-    }
 
     // Content-addressed artifacts in bin/ and wit/ are NEVER deleted.
     // They are the audit trail — the BLAKE3 hash in audit entries must always
@@ -74,6 +57,40 @@ pub(crate) fn remove_capsule(
         eprintln!("Removed '{name}' (forced).");
     } else {
         eprintln!("Removed '{name}'.");
+    }
+
+    Ok(())
+}
+
+/// Validate that `name` exists and passes dependency safety checks.
+///
+/// Split from [`remove_capsule`] so the async dispatch path can perform the
+/// daemon-side authorization/unload before deleting the on-disk capsule.
+pub(crate) fn validate_capsule_removal(
+    name: &str,
+    workspace: bool,
+    force: bool,
+) -> anyhow::Result<()> {
+    let home = AstridHome::resolve()?;
+    let target_dir = super::install::resolve_target_dir(&home, name, workspace)?;
+
+    if !target_dir.exists() {
+        bail!("Capsule '{name}' is not installed.");
+    }
+
+    let target_meta = super::meta::read_meta(&target_dir);
+
+    // Scan once, reuse for both dependency check and binary cleanup
+    let all_capsules = scan_installed_capsules()?;
+
+    // Dependency safety check (skip with --force)
+    if !force && let Some(block) = check_removal_safety(name, target_meta.as_ref(), &all_capsules) {
+        bail!(
+            "Cannot remove '{name}': it is the sole provider of '{}' \
+             which is required by '{}'. Use --force to override.",
+            block.capability,
+            block.dependent,
+        );
     }
 
     Ok(())

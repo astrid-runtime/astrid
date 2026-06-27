@@ -97,52 +97,38 @@ pub(crate) async fn nudge_daemon_reload(capsule_ids: &[String]) {
     }
 }
 
-/// After a manual `astrid capsule remove`, ask a running daemon to unload the
-/// just-removed capsule so it leaves the live tool surface WITHOUT a restart.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum LiveUnload {
+    NoDaemon,
+    NotLoaded,
+    Unloaded,
+}
+
+/// Ask a running daemon to unload `capsule_id`.
 ///
-/// Sends `KernelRequest::UnloadCapsule { id }`, which unregisters the capsule
-/// from the running daemon and publishes `astrid.v1.capsules_loaded`; the
-/// `astrid mcp serve` shim turns that into an MCP `notifications/tools/list_changed`,
-/// so a connected agent sees the capsule's tools disappear live.
-///
-/// Best-effort and non-fatal by design, mirroring [`nudge_daemon_reload`]. The
-/// on-disk removal is authoritative and already done (and dependency-checked),
-/// so a missing/unreachable daemon is silent, a capsule that was never loaded
-/// live is a quiet no-op, and a declined/timed-out unload only prints a note.
-/// Never changes the remove's exit status.
-pub(crate) async fn nudge_daemon_unload(capsule_id: &str) {
+/// Missing or unreachable daemon sockets return [`LiveUnload::NoDaemon`] so
+/// offline local removal still works. Once connected, the daemon must
+/// authorize and confirm the unload before the caller can delete disk state.
+pub(crate) async fn try_daemon_unload(capsule_id: &str) -> anyhow::Result<LiveUnload> {
+    use anyhow::{Context, bail};
     use astrid_core::kernel_api::{KernelRequest, KernelResponse};
 
-    if capsule_id.is_empty() {
-        return;
-    }
-    // No socket file => no daemon to nudge. Stay silent: the standalone remove
-    // already reported success and there is no live instance to unload.
-    if !crate::socket_client::proxy_socket_path().exists() {
-        return;
+    if capsule_id.is_empty() || !crate::socket_client::proxy_socket_path().exists() {
+        return Ok(LiveUnload::NoDaemon);
     }
 
-    // One fresh session UUID, used for BOTH the connection's SessionId and the
-    // message source_id, so this request is attributed to a real client session
-    // — never the reserved nil UUID, which is SYSTEM_SESSION_UUID.
     let session_uuid = uuid::Uuid::new_v4();
     let session = astrid_core::SessionId::from_uuid(session_uuid);
     let Ok(mut client) =
         crate::socket_client::SocketClient::connect(session, crate::principal::current()).await
     else {
-        // Socket present but unreachable (e.g. a hung/stale daemon). Leave the
-        // remove standalone rather than failing it.
-        return;
+        return Ok(LiveUnload::NoDaemon);
     };
 
-    let Ok(val) = serde_json::to_value(KernelRequest::UnloadCapsule {
+    let val = serde_json::to_value(KernelRequest::UnloadCapsule {
         id: capsule_id.to_string(),
-    }) else {
-        return;
-    };
-    // Per-request correlation suffix: the kernel router mirrors the request-topic
-    // suffix onto the response topic, so a slow or timed-out unload's late
-    // response can't be mis-read as some other request's response.
+    })
+    .context("failed to encode live capsule unload request")?;
     let correlation = uuid::Uuid::new_v4().simple().to_string();
     let request_topic =
         astrid_types::Topic::kernel_request(format!("unload_capsule.{correlation}"));
@@ -153,41 +139,28 @@ pub(crate) async fn nudge_daemon_unload(capsule_id: &str) {
         astrid_types::ipc::IpcPayload::RawJson(val),
         session_uuid,
     );
-    if client.send_message(msg).await.is_err() {
-        return;
-    }
+    client
+        .send_message(msg)
+        .await
+        .context("failed to send live capsule unload request")?;
 
-    // Confirm the daemon processed the unload (it replies only after the unload
-    // completes), so the line we print is truthful. A timeout is non-fatal.
-    let Ok(raw) = client
+    let raw = client
         .read_until_topic(response_topic.as_str(), std::time::Duration::from_secs(15))
         .await
-    else {
-        eprintln!(
-            "Note: removed '{capsule_id}' from disk, but the running daemon didn't confirm a live unload in time — restart it to drop the capsule from the live tool surface."
-        );
-        return;
-    };
+        .context("running daemon did not confirm live capsule unload")?;
 
     match crate::socket_client::SocketClient::extract_kernel_response(&raw) {
         Some(KernelResponse::Success(data)) => {
-            // The daemon distinguishes a real unload ("unloaded") from a no-op
-            // ("not_loaded": removed from disk but never loaded live). Only the
-            // former changed live state, so only announce that one — a no-op
-            // needs no line.
-            if data.get("status").and_then(serde_json::Value::as_str) == Some("unloaded") {
-                eprintln!("Live: the running daemon unloaded '{capsule_id}' — no restart needed.");
+            match data.get("status").and_then(serde_json::Value::as_str) {
+                Some("unloaded") => Ok(LiveUnload::Unloaded),
+                Some("not_loaded") => Ok(LiveUnload::NotLoaded),
+                Some(other) => bail!("running daemon returned unknown unload status {other:?}"),
+                None => bail!("running daemon returned unload success without a status"),
             }
         },
         Some(KernelResponse::Error(reason)) => {
-            eprintln!(
-                "Note: removed '{capsule_id}' from disk, but the daemon declined a live unload ({reason}); restart it to drop the capsule from the live tool surface."
-            );
+            bail!("running daemon declined live capsule unload: {reason}")
         },
-        _ => {
-            eprintln!(
-                "Note: removed '{capsule_id}' from disk, but couldn't confirm a live unload; restart it to drop the capsule from the live tool surface."
-            );
-        },
+        _ => bail!("running daemon returned a malformed live capsule unload response"),
     }
 }
