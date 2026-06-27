@@ -11,8 +11,11 @@ use std::sync::Arc;
 use astrid_capsule::capsule::CapsuleId;
 use astrid_capsule::engine::wasm::host_state::LifecyclePhase;
 use astrid_capsule::engine::wasm::{LifecycleConfig, run_lifecycle};
+use astrid_events::AstridEvent;
 use astrid_events::EventBus;
+use astrid_events::ipc::{IpcMessage, IpcPayload, OnboardingFieldType, Topic};
 use astrid_storage::{MemoryKvStore, ScopedKvStore};
+use uuid::Uuid;
 
 fn fixture_path() -> Option<PathBuf> {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -51,6 +54,85 @@ fn make_lifecycle_config(wasm_bytes: Vec<u8>) -> (LifecycleConfig, ScopedKvStore
         http_limits: astrid_capsule::HttpLimits::default(),
     };
     (cfg, kv)
+}
+
+fn lifecycle_answer_for(field_type: &OnboardingFieldType) -> (Option<String>, Option<Vec<String>>) {
+    match field_type {
+        OnboardingFieldType::Secret => (Some("test-secret-value".to_string()), None),
+        OnboardingFieldType::Array => (None, Some(vec!["item1".into(), "item2".into()])),
+        _ => (Some("test-value".to_string()), None),
+    }
+}
+
+fn publish_lifecycle_response(
+    bus: &EventBus,
+    request_id: Uuid,
+    principal: Option<&str>,
+    value: Option<String>,
+    values: Option<Vec<String>>,
+) {
+    let response = IpcPayload::ElicitResponse {
+        request_id,
+        value,
+        values,
+    };
+    let mut msg = IpcMessage::new(
+        Topic::elicit_response(request_id),
+        response,
+        uuid::Uuid::nil(),
+    );
+    if let Some(principal) = principal {
+        msg = msg.with_principal(principal);
+    }
+    bus.publish(AstridEvent::Ipc {
+        message: msg,
+        metadata: astrid_events::EventMetadata::default(),
+    });
+}
+
+fn publish_lifecycle_noise(bus: &EventBus, request_id: Uuid) {
+    publish_lifecycle_response(
+        bus,
+        Uuid::new_v4(),
+        Some("agent-alice"),
+        Some("stale-unknown".to_string()),
+        None,
+    );
+    publish_lifecycle_response(
+        bus,
+        request_id,
+        Some("agent-bob"),
+        Some("wrong-principal".to_string()),
+        None,
+    );
+}
+
+async fn answer_lifecycle_elicit_requests(
+    mut receiver: astrid_events::EventReceiver,
+    bus: EventBus,
+) {
+    while let Some(event) = receiver.recv().await {
+        let AstridEvent::Ipc { message, .. } = &*event else {
+            continue;
+        };
+        let IpcPayload::ElicitRequest {
+            request_id, field, ..
+        } = &message.payload
+        else {
+            continue;
+        };
+        let request_id = *request_id;
+        publish_lifecycle_noise(&bus, request_id);
+
+        let (value, values) = lifecycle_answer_for(&field.field_type);
+        publish_lifecycle_response(
+            &bus,
+            request_id,
+            message.principal.as_deref(),
+            value,
+            values,
+        );
+    }
 }
 
 /// When the WASM binary does not export `astrid_install`, `run_lifecycle` should
@@ -109,51 +191,10 @@ async fn test_lifecycle_install_with_elicit() {
     let (cfg, kv) = make_lifecycle_config(wasm_bytes);
     let event_bus = cfg.event_bus.clone();
 
-    // Spawn a responder that answers elicit requests automatically
-    let mut elicit_receiver = event_bus.subscribe_topic("astrid.v1.elicit");
+    let elicit_receiver = event_bus.subscribe_topic("astrid.v1.elicit");
     let responder_bus = event_bus.clone();
     let responder = tokio::spawn(async move {
-        use astrid_events::AstridEvent;
-        use astrid_events::ipc::{IpcMessage, IpcPayload, Topic};
-
-        while let Some(event) = elicit_receiver.recv().await {
-            let AstridEvent::Ipc { message, .. } = &*event else {
-                continue;
-            };
-            let IpcPayload::ElicitRequest {
-                request_id, field, ..
-            } = &message.payload
-            else {
-                continue;
-            };
-
-            let request_id = *request_id;
-            let response_topic = Topic::elicit_response(request_id);
-
-            let (value, values) = match &field.field_type {
-                astrid_events::ipc::OnboardingFieldType::Secret => {
-                    (Some("test-secret-value".to_string()), None)
-                },
-                astrid_events::ipc::OnboardingFieldType::Array => {
-                    (None, Some(vec!["item1".into(), "item2".into()]))
-                },
-                _ => (Some("test-value".to_string()), None),
-            };
-
-            let response = IpcPayload::ElicitResponse {
-                request_id,
-                value,
-                values,
-            };
-            let mut msg = IpcMessage::new(response_topic, response, uuid::Uuid::nil());
-            if let Some(principal) = message.principal.as_deref() {
-                msg = msg.with_principal(principal);
-            }
-            responder_bus.publish(AstridEvent::Ipc {
-                message: msg,
-                metadata: astrid_events::EventMetadata::default(),
-            });
-        }
+        answer_lifecycle_elicit_requests(elicit_receiver, responder_bus).await;
     });
 
     let result = run_lifecycle(cfg, LifecyclePhase::Install, None).await;
