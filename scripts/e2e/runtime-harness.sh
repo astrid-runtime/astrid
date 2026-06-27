@@ -67,6 +67,7 @@ trap cleanup EXIT INT TERM
 . "$SCRIPT_DIR/runtime-multi-home-smoke.sh"
 . "$SCRIPT_DIR/runtime-llm-smoke.sh"
 . "$SCRIPT_DIR/runtime-adversarial-smoke.sh"
+. "$SCRIPT_DIR/runtime-audit-smoke.sh"
 note() { printf '\n==> %s\n' "$*"; }
 fail() { printf 'error: %s\n' "$*" >&2; exit 1; }
 run_cli() {
@@ -355,17 +356,6 @@ redaction_check() {
       fail "sentinel secret leaked into runtime e2e logs/artifacts under $target"
     fi
   done
-}
-
-collect_audit_artifacts() {
-  local user_bearer=$1
-  local ops_bearer=$2
-  local status
-
-  status="$(http_status GET "/api/sys/audit?limit=1000" "$user_bearer" "" "$ARTIFACTS/agent-audit.json")"
-  assert_status "agent scoped audit export" "$status" 200
-  status="$(http_status GET "/api/sys/audit?limit=1000" "$ops_bearer" "" "$ARTIFACTS/operator-audit.json")"
-  assert_status "operator scoped audit export" "$status" 200
 }
 
 main() {
@@ -970,7 +960,7 @@ PY
     astrid-capsule-registry absent
 
   note "collecting scoped audit artifacts"
-  collect_audit_artifacts "$restart_user_bearer" "$ops_bearer"
+  collect_audit_artifacts "$restart_user_bearer" "$ops_bearer" "$user_principal" "$ops_principal"
 
   redaction_check "$sentinel"
   redaction_check "$user_secret"

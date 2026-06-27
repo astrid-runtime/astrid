@@ -139,6 +139,52 @@ if f'name = "{capsule}"' not in manifest:
 PY
 }
 
+json_assert_audit_scope_and_events() {
+  local file=$1
+  local principal=$2
+  shift 2
+  "$PYTHON" - "$file" "$principal" "$@" <<'PY'
+import json
+import sys
+
+path = sys.argv[1]
+principal = sys.argv[2]
+expected = sys.argv[3:]
+data = json.load(open(path, encoding="utf-8"))
+entries = data.get("entries", [])
+if not isinstance(entries, list) or not entries:
+    raise SystemExit(f"audit response has no entries: {data!r}")
+
+for entry in entries:
+    seen = entry.get("principal")
+    if seen != principal:
+        raise SystemExit(f"audit entry leaked cross-principal row for {principal!r}: {entry!r}")
+    if entry.get("outcome") not in ("success", "failure"):
+        raise SystemExit(f"audit entry has invalid outcome: {entry!r}")
+    if not entry.get("method"):
+        raise SystemExit(f"audit entry missed method: {entry!r}")
+    if not entry.get("required_capability"):
+        raise SystemExit(f"audit entry missed required_capability: {entry!r}")
+
+def matches(spec: str, entry: dict) -> bool:
+    method, outcome = spec.split(":", 1)
+    return entry.get("method") == method and entry.get("outcome") == outcome
+
+missing = [spec for spec in expected if not any(matches(spec, entry) for entry in entries)]
+if missing:
+    summary = [
+        {
+            "method": entry.get("method"),
+            "outcome": entry.get("outcome"),
+            "principal": entry.get("principal"),
+            "required_capability": entry.get("required_capability"),
+        }
+        for entry in entries
+    ]
+    raise SystemExit(f"audit response missed expected events {missing!r}; saw {summary!r}")
+PY
+}
+
 json_assert_session_list_scope() {
   local file=$1 expected=$2 forbidden=$3
   "$PYTHON" - "$file" "$expected" "$forbidden" <<'PY'
