@@ -457,7 +457,7 @@ EOF
   run_gateway_public_surface_smoke
 
   note "checking principal and capability isolation"
-  run_cli group create ops-team --caps "capsule:install,invite:issue,invite:list,self:capsule:list"
+  run_cli group create ops-team --caps "capsule:install,capsule:reload,invite:issue,invite:list,self:capsule:list"
 
   local ops_invite
   ops_invite="$("$CORE_DIR/target/debug/astrid" invite issue --group ops-team --max-uses 1 --expires-secs 600 --raw \
@@ -528,8 +528,8 @@ EOF
   status="$(http_status GET /api/capsules "$admin_bearer" "" "$ARTIFACTS/admin-capsules.json")"
   assert_status "admin global capsule list" "$status" 200
   json_assert_capsule_list_state "$ARTIFACTS/admin-capsules.json" astrid-capsule-cli present
-  run_gateway_principal_surface_smoke agent "$user_bearer" 204
-  run_gateway_principal_surface_smoke operator "$ops_bearer" 403
+  run_gateway_principal_surface_smoke agent "$user_bearer" 403
+  run_gateway_principal_surface_smoke operator "$ops_bearer" 204
   status="$(http_status POST /api/auth/pair-device "$user_bearer" \
     '{"expires_secs":120,"label":"regular-user phone","scope":"use-only"}' \
     "$ARTIFACTS/agent-pair-device.json")"
