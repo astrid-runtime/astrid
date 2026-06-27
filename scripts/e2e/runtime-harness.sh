@@ -523,6 +523,11 @@ EOF
     status="$(http_status GET /api/capsules/astrid-capsule-cli/env "$bearer" "" "$ARTIFACTS/$label-default-only-env.json")"; assert_status "$label default-only capsule env hidden" "$status" 404
     status="$(http_status POST /api/capsules/astrid-capsule-cli/env/unused "$bearer" '{"value":"should-not-write"}' "$ARTIFACTS/$label-default-only-env-write.json")"; assert_status "$label default-only capsule env write hidden" "$status" 404
   done
+  local admin_bearer
+  admin_bearer="$(mint_admin_bearer)"
+  status="$(http_status GET /api/capsules "$admin_bearer" "" "$ARTIFACTS/admin-capsules.json")"
+  assert_status "admin global capsule list" "$status" 200
+  json_assert_capsule_list_state "$ARTIFACTS/admin-capsules.json" astrid-capsule-cli present
   run_gateway_principal_surface_smoke agent "$user_bearer" 204
   run_gateway_principal_surface_smoke operator "$ops_bearer" 403
   status="$(http_status POST /api/auth/pair-device "$user_bearer" \
@@ -631,8 +636,8 @@ PY
   status="$(http_status GET "/api/sys/principals/$ops_principal/devices" "$user_bearer" "" \
     "$ARTIFACTS/agent-devices-cross-principal-denied.json")"
   assert_status "agent cross-principal devices read denied" "$status" 403
-  run_gateway_quota_write_smoke "$user_principal" "$ops_principal" "$user_bearer" "$(mint_admin_bearer)"
-  run_admin_pair_device_cross_principal_smoke "$user_bearer" "$user_principal" "$(mint_admin_bearer)"
+  run_gateway_quota_write_smoke "$user_principal" "$ops_principal" "$user_bearer" "$admin_bearer"
+  run_admin_pair_device_cross_principal_smoke "$user_bearer" "$user_principal" "$admin_bearer"
 
   note "checking per-principal capsule env isolation"
   status="$(http_status POST /api/capsules/astrid-capsule-openai-compat/env/model "" \

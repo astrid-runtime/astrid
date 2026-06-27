@@ -62,8 +62,8 @@ deny = ["self-scoped principal cannot remove a shared capsule"]
 
 [capabilities."capsule:list"]
 scenario = "capsule_metadata"
-status = "mapped"
-allow = ["authorized operator can list installed capsules"]
+status = "covered"
+allow = ["authorized admin/default can list installed daemon capsules, including default-only capsules"]
 deny = ["regular agent without global capsule:list gets only its effective surface"]
 
 [capabilities."self:capsule:list"]
