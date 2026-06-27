@@ -1,0 +1,7 @@
+profile_version = 1
+enabled = true
+groups = ["agent"]
+
+[quotas]
+max_memory_bytes = 1048576
+

@@ -1,0 +1,11 @@
+profile_version = 1
+enabled = true
+groups = ["agent"]
+
+[auth]
+methods = ["keypair"]
+public_keys = [
+  "ed25519:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+]
+
