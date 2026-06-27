@@ -149,11 +149,12 @@ pub(super) async fn provision_new_principal(
 /// Build the [`PrincipalProfile`] for a new agent.
 ///
 /// With `clone_from`, the result is a full replica of that source's
-/// capability and resource profile (groups, grants, revokes, network, process,
-/// quotas). Deliberately NOT copied: the source's `auth` (each principal keeps
-/// its own keys / authenticators — cloning is profile+state, never
-/// credentials) and `enabled` flag (a fresh clone is enabled even if the
-/// source was disabled); both fall back to [`PrincipalProfile::default`].
+/// capability and resource profile (groups, grants, revokes, capsule grants,
+/// network, process, quotas). Deliberately NOT copied: the source's `auth`
+/// (each principal keeps its own keys / authenticators — cloning is
+/// profile+state, never credentials) and `enabled` flag (a fresh clone is
+/// enabled even if the source was disabled); both fall back to
+/// [`PrincipalProfile::default`].
 /// Without `clone_from`, a fresh profile from the supplied `groups`/`grants`
 /// (empty groups yields the built-in `agent` group).
 ///
@@ -240,6 +241,7 @@ fn build_create_profile(
         groups: source_profile.groups,
         grants: source_profile.grants,
         revokes: source_profile.revokes,
+        capsules: source_profile.capsules,
         network: source_profile.network,
         process: source_profile.process,
         quotas: source_profile.quotas,

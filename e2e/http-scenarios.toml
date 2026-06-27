@@ -50,7 +50,7 @@ auth = "bearer"
 
 [routes."POST /api/sys/principals"]
 scenario = "principal_crud"
-status = "mapped"
+status = "covered"
 auth = "bearer"
 
 [routes."GET /api/sys/principals/{id}"]
@@ -80,12 +80,12 @@ auth = "bearer"
 
 [routes."POST /api/sys/principals/{id}/caps"]
 scenario = "capability_grants"
-status = "mapped"
+status = "covered"
 auth = "bearer"
 
 [routes."DELETE /api/sys/principals/{id}/caps"]
 scenario = "capability_grants"
-status = "mapped"
+status = "covered"
 auth = "bearer"
 
 [routes."GET /api/sys/principals/{id}/quotas"]
@@ -120,7 +120,7 @@ auth = "bearer"
 
 [routes."POST /api/sys/groups"]
 scenario = "group_crud"
-status = "mapped"
+status = "covered"
 auth = "bearer"
 
 [routes."PATCH /api/sys/groups/{name}"]
@@ -130,7 +130,7 @@ auth = "bearer"
 
 [routes."DELETE /api/sys/groups/{name}"]
 scenario = "group_crud"
-status = "mapped"
+status = "covered"
 auth = "bearer"
 
 [routes."POST /api/sys/invites"]

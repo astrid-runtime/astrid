@@ -362,7 +362,7 @@ evidence = ["waiver reason on link/unlink commands"]
 waiver = "Platform identity providers are not live in the runtime harness yet."
 
 [scenarios.principal_crud]
-status = "mapped"
+status = "covered"
 surfaces = ["cli", "http", "capability"]
 auth = ["admin/default"]
 success = ["authorized caller creates, reads, modifies, or deletes only the target temp principal"]
@@ -371,7 +371,7 @@ state = ["principal profile, group, and capsule grants change only for target"]
 evidence = ["agent/principal HTTP artifacts and CLI transcript"]
 
 [scenarios.principal_inheritance]
-status = "mapped"
+status = "covered"
 surfaces = ["cli", "http", "capability"]
 auth = ["operator with explicit agent:create:inherit or agent:create:clone authority"]
 success = ["authorized caller can create a new owned principal from an explicit source principal"]

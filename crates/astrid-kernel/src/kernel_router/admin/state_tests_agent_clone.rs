@@ -5,11 +5,11 @@
 //! are re-defined locally so each test file is self-contained.
 //!
 //! `clone_from` is a full replica of a source principal: its capability +
-//! resource profile (groups, grants, revokes, network, process, quotas) AND
-//! its state (the same env/KV/secret copy `inherit_from` performs). It does
-//! NOT copy the source's `auth` (each principal keeps its own identity) or
-//! `enabled` flag (a fresh clone is enabled). Cloning a source that confers
-//! admin (`*`) is refused without an explicit acknowledgement.
+//! resource profile (groups, grants, revokes, capsule grants, network,
+//! process, quotas) AND its state (the same env/KV/secret copy `inherit_from`
+//! performs). It does NOT copy the source's `auth` (each principal keeps its
+//! own identity) or `enabled` flag (a fresh clone is enabled). Cloning a source
+//! that confers admin (`*`) is refused without an explicit acknowledgement.
 
 use std::sync::Arc;
 
@@ -67,8 +67,9 @@ fn assert_error_contains(res: &AdminResponseBody, needle: &str) {
 }
 
 /// `clone_from` copies the source's capability + resource profile (groups,
-/// grants, revokes, quotas) into the new principal, but NOT its `auth` or
-/// `enabled` state — a fresh clone is enabled and keeps its own identity.
+/// grants, revokes, capsule grants, quotas) into the new principal, but NOT
+/// its `auth` or `enabled` state — a fresh clone is enabled and keeps its own
+/// identity.
 #[tokio::test(flavor = "multi_thread")]
 async fn agent_create_clone_copies_capability_profile() {
     let (_dir, kernel) = fixture().await;
@@ -78,6 +79,10 @@ async fn agent_create_clone_copies_capability_profile() {
         groups: vec![BUILTIN_RESTRICTED.to_string()],
         grants: vec!["self:capsule:list".to_string()],
         revokes: vec!["self:quota:set".to_string()],
+        capsules: vec![
+            "astrid-capsule-registry".to_string(),
+            "astrid-capsule-openai-compat".to_string(),
+        ],
         enabled: false, // must NOT carry to the clone
         ..PrincipalProfile::default()
     };
@@ -112,6 +117,13 @@ async fn agent_create_clone_copies_capability_profile() {
     assert_eq!(twin.groups, vec![BUILTIN_RESTRICTED.to_string()]);
     assert_eq!(twin.grants, vec!["self:capsule:list".to_string()]);
     assert_eq!(twin.revokes, vec!["self:quota:set".to_string()]);
+    assert_eq!(
+        twin.capsules,
+        vec![
+            "astrid-capsule-registry".to_string(),
+            "astrid-capsule-openai-compat".to_string()
+        ]
+    );
     assert_eq!(twin.quotas.max_background_processes, 7);
     // A fresh clone is enabled even though the source was disabled.
     assert!(twin.enabled, "clone must be enabled regardless of source");

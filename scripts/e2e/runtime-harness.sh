@@ -66,6 +66,7 @@ trap cleanup EXIT INT TERM
 . "$SCRIPT_DIR/runtime-cli-smoke.sh"
 . "$SCRIPT_DIR/runtime-multi-home-smoke.sh"
 . "$SCRIPT_DIR/runtime-llm-smoke.sh"
+. "$SCRIPT_DIR/runtime-adversarial-smoke.sh"
 note() { printf '\n==> %s\n' "$*"; }
 fail() { printf 'error: %s\n' "$*" >&2; exit 1; }
 run_cli() {
@@ -686,6 +687,8 @@ PY
     astrid-capsule-openai-compat api_key
   json_assert_secret_list_metadata "$ARTIFACTS/operator-secret-list.json" \
     astrid-capsule-openai-compat api_key
+  run_adversarial_principal_smoke "$user_bearer" "$user_principal" \
+    "$ops_bearer" "$ops_principal" "$user_secret"
   run_cli_semantic_smoke "$user_principal" "$ops_principal"
 
   curl -sN --max-time 3 \

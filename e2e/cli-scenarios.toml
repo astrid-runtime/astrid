@@ -22,7 +22,7 @@ principal = "agent"
 
 [commands."agent create"]
 scenario = "principal_crud"
-status = "mapped"
+status = "covered"
 mode = "mutating"
 principal = "admin"
 
@@ -144,7 +144,7 @@ principal = "admin_and_agent"
 
 [commands."group delete"]
 scenario = "group_crud"
-status = "mapped"
+status = "covered"
 mode = "mutating"
 principal = "admin"
 
