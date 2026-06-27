@@ -255,6 +255,42 @@ run_concurrent_http_prompt_correlation_smoke() {
   assert_status "operator concurrent session update" "$status" 200
   json_assert_session_summary "$user_update_out" "$user_session" "$user_title"
   json_assert_session_summary "$ops_update_out" "$ops_session" "$ops_title"
+
+  note "checking concurrent cross-principal session mutation is hidden"
+  local forbidden_title="forbidden concurrent session title"
+  local ops_final_title="operator concurrent session owner title"
+  local cross_update_out="$ARTIFACTS/concurrent-session-cross-update.json"
+  local cross_update_status="$ARTIFACTS/concurrent-session-cross-update.status"
+  local ops_final_update_out="$ARTIFACTS/concurrent-session-ops-final-update.json"
+  local ops_final_update_status="$ARTIFACTS/concurrent-session-ops-final-update.status"
+  concurrent_session_title_update "$user_bearer" "$ops_session" "$forbidden_title" \
+    "$cross_update_out" "$cross_update_status" &
+  user_pid=$!
+  concurrent_session_title_update "$ops_bearer" "$ops_session" "$ops_final_title" \
+    "$ops_final_update_out" "$ops_final_update_status" &
+  ops_pid=$!
+
+  user_wait=0
+  ops_wait=0
+  wait "$user_pid" || user_wait=$?
+  wait "$ops_pid" || ops_wait=$?
+  [[ "$user_wait" -eq 0 ]] || {
+    cat "$cross_update_out" >&2 || true
+    fail "agent cross-principal concurrent session update failed before HTTP status"
+  }
+  [[ "$ops_wait" -eq 0 ]] || {
+    cat "$ops_final_update_out" >&2 || true
+    fail "operator owner concurrent session update failed before HTTP status"
+  }
+
+  status="$(<"$cross_update_status")"
+  LAST_HTTP_OUT="$cross_update_out"
+  assert_status "agent cross-principal concurrent session update hidden" "$status" 404
+  assert_artifact_lacks_text "$cross_update_out" "$ops_session"
+  status="$(<"$ops_final_update_status")"
+  LAST_HTTP_OUT="$ops_final_update_out"
+  assert_status "operator owner concurrent session update" "$status" 200
+  json_assert_session_summary "$ops_final_update_out" "$ops_session" "$ops_final_title"
 }
 
 run_concurrent_model_write_smoke() {
