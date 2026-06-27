@@ -26,6 +26,57 @@ concurrent_principal_prompt() {
   bounded_principal_run "$principal" 30 "$out" --format json --session "$session" "$prompt"
 }
 
+run_concurrent_cli_control_mutation_smoke() {
+  local user_principal=$1 ops_principal=$2
+
+  note "checking concurrent CLI capability mutations stay scoped"
+
+  local user_pid ops_pid user_wait=0 ops_wait=0
+  run_cli caps grant "$user_principal" system:status \
+    > "$ARTIFACTS/concurrent-cli-user-grant.txt" &
+  user_pid=$!
+  run_cli caps grant "$ops_principal" system:status \
+    > "$ARTIFACTS/concurrent-cli-ops-grant.txt" &
+  ops_pid=$!
+
+  wait "$user_pid" || user_wait=$?
+  wait "$ops_pid" || ops_wait=$?
+  [[ "$user_wait" -eq 0 ]] || fail "concurrent user caps grant failed"
+  [[ "$ops_wait" -eq 0 ]] || fail "concurrent operator caps grant failed"
+
+  run_cli caps check "$user_principal" system:status \
+    > "$ARTIFACTS/concurrent-cli-user-check-granted.txt"
+  grep -q "allowed" "$ARTIFACTS/concurrent-cli-user-check-granted.txt" \
+    || fail "concurrent user caps grant was not effective"
+  run_cli caps check "$ops_principal" system:status \
+    > "$ARTIFACTS/concurrent-cli-ops-check-granted.txt"
+  grep -q "allowed" "$ARTIFACTS/concurrent-cli-ops-check-granted.txt" \
+    || fail "concurrent operator caps grant was not effective"
+
+  run_cli caps revoke "$user_principal" system:status \
+    > "$ARTIFACTS/concurrent-cli-user-revoke.txt" &
+  user_pid=$!
+  run_cli caps revoke "$ops_principal" system:status \
+    > "$ARTIFACTS/concurrent-cli-ops-revoke.txt" &
+  ops_pid=$!
+
+  user_wait=0
+  ops_wait=0
+  wait "$user_pid" || user_wait=$?
+  wait "$ops_pid" || ops_wait=$?
+  [[ "$user_wait" -eq 0 ]] || fail "concurrent user caps revoke failed"
+  [[ "$ops_wait" -eq 0 ]] || fail "concurrent operator caps revoke failed"
+
+  run_cli caps check "$user_principal" system:status \
+    > "$ARTIFACTS/concurrent-cli-user-check-revoked.txt"
+  grep -q "denied" "$ARTIFACTS/concurrent-cli-user-check-revoked.txt" \
+    || fail "concurrent user caps revoke was not effective"
+  run_cli caps check "$ops_principal" system:status \
+    > "$ARTIFACTS/concurrent-cli-ops-check-revoked.txt"
+  grep -q "denied" "$ARTIFACTS/concurrent-cli-ops-check-revoked.txt" \
+    || fail "concurrent operator caps revoke was not effective"
+}
+
 run_concurrent_prompt_correlation_smoke() {
   local user_principal=$1 ops_principal=$2
 
@@ -92,6 +143,8 @@ run_concurrent_model_write_smoke() {
     "openai-compat:fake-echo" "$ARTIFACTS/concurrent-model-user-active.json"
   assert_active_model_for_bearer "operator active model after concurrent write" "$ops_bearer" \
     "openai-compat:fake-slow" "$ARTIFACTS/concurrent-model-ops-active.json"
+
+  run_concurrent_cli_control_mutation_smoke "$user_principal" "$ops_principal"
 
   local status
   status="$(http_status PUT /api/models/active "$user_bearer" \
