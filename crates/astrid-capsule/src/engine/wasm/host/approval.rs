@@ -189,6 +189,49 @@ fn decision_from_str(decision: &str) -> ApprovalDecision {
     }
 }
 
+fn event_principal(event: &AstridEvent) -> Option<&str> {
+    match event {
+        AstridEvent::Ipc { message, .. } => message.principal.as_deref(),
+        _ => None,
+    }
+}
+
+fn response_principal_matches(expected: &str, event: &AstridEvent) -> bool {
+    event_principal(event) == Some(expected)
+}
+
+async fn await_matching_approval_response(
+    receiver: &mut astrid_events::EventReceiver,
+    expected_principal: &str,
+    capsule_id: &str,
+    request_id: &str,
+    timeout: std::time::Duration,
+) -> Option<std::sync::Arc<AstridEvent>> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return None;
+        }
+        let Ok(Some(event)) = tokio::time::timeout(remaining, receiver.recv()).await else {
+            return None;
+        };
+        if response_principal_matches(expected_principal, &event) {
+            return Some(event);
+        }
+        let got = event_principal(&event);
+        tracing::warn!(
+            target: "astrid.audit.approval",
+            security_event = true,
+            capsule_id = %capsule_id,
+            request_id = %request_id,
+            expected_principal = %expected_principal,
+            got_principal = got.unwrap_or("<none>"),
+            "approval: rejected cross-principal response; continuing to wait",
+        );
+    }
+}
+
 impl approval::Host for HostState {
     /// Host function: `request_approval(request) -> ApprovalResponse`
     ///
@@ -259,7 +302,8 @@ impl approval::Host for HostState {
             Topic::approval_request(),
             request_payload,
             Uuid::nil(), // Kernel-originated
-        );
+        )
+        .with_principal(principal.to_string());
         event_bus.publish(AstridEvent::Ipc {
             message,
             metadata: astrid_events::EventMetadata::default(),
@@ -279,13 +323,14 @@ impl approval::Host for HostState {
             &blocking_semaphore,
             &cancel_token,
             async {
-                tokio::time::timeout(
+                await_matching_approval_response(
+                    &mut receiver,
+                    principal.as_str(),
+                    &capsule_id,
+                    &request_id,
                     std::time::Duration::from_millis(MAX_APPROVAL_TIMEOUT_MS),
-                    receiver.recv(),
                 )
                 .await
-                .ok()
-                .flatten()
             },
         )
         .flatten();
@@ -600,6 +645,148 @@ mod tests {
             "git push origin main",
             None
         ));
+    }
+
+    fn approval_response_event(
+        request_id: &str,
+        principal: Option<&str>,
+        decision: &str,
+    ) -> AstridEvent {
+        let topic = Topic::approval_response(request_id);
+        let mut message = IpcMessage::new(
+            topic,
+            IpcPayload::ApprovalResponse {
+                request_id: request_id.to_string(),
+                decision: decision.to_string(),
+                reason: None,
+            },
+            Uuid::nil(),
+        );
+        if let Some(principal) = principal {
+            message = message.with_principal(principal);
+        }
+        AstridEvent::Ipc {
+            message,
+            metadata: astrid_events::EventMetadata::default(),
+        }
+    }
+
+    #[test]
+    fn approval_response_principal_match_is_exact() {
+        let request_id = "approval-principal-match";
+        let same = approval_response_event(request_id, Some("agent-alice"), "approve");
+        let other = approval_response_event(request_id, Some("agent-bob"), "approve");
+        let none = approval_response_event(request_id, None, "approve");
+
+        assert!(response_principal_matches("agent-alice", &same));
+        assert!(!response_principal_matches("agent-alice", &other));
+        assert!(!response_principal_matches("agent-alice", &none));
+    }
+
+    fn publish_approval_reply(
+        bus: &astrid_events::EventBus,
+        request_id: &str,
+        principal: Option<&str>,
+        decision: &str,
+    ) {
+        bus.publish(approval_response_event(request_id, principal, decision));
+    }
+
+    #[tokio::test]
+    async fn approval_wait_times_out_after_wrong_principal_reply() {
+        let bus = astrid_events::EventBus::with_capacity(64);
+        let request_id = "approval-wrong-principal-timeout";
+        let mut rx = bus.subscribe_topic(Topic::approval_response(request_id).as_str());
+        publish_approval_reply(&bus, request_id, Some("agent-bob"), "approve");
+
+        let result = await_matching_approval_response(
+            &mut rx,
+            "agent-alice",
+            "test",
+            request_id,
+            std::time::Duration::from_millis(100),
+        )
+        .await;
+
+        assert!(
+            result.is_none(),
+            "wrong-principal reply must not satisfy approval wait"
+        );
+    }
+
+    #[tokio::test]
+    async fn approval_wait_ignores_wrong_principal_then_accepts_matching_reply() {
+        let bus = astrid_events::EventBus::with_capacity(64);
+        let request_id = "approval-wrong-then-right";
+        let mut rx = bus.subscribe_topic(Topic::approval_response(request_id).as_str());
+        publish_approval_reply(&bus, request_id, Some("agent-bob"), "approve");
+        publish_approval_reply(&bus, request_id, Some("agent-alice"), "approve");
+
+        let event = await_matching_approval_response(
+            &mut rx,
+            "agent-alice",
+            "test",
+            request_id,
+            std::time::Duration::from_secs(1),
+        )
+        .await
+        .expect("matching approval reply should be accepted");
+
+        assert!(response_principal_matches("agent-alice", &event));
+    }
+
+    fn approval_request(action: &str, resource: &str) -> ApprovalRequest {
+        ApprovalRequest {
+            action: action.to_string(),
+            target_resource: resource.to_string(),
+        }
+    }
+
+    async fn await_approval_request(
+        mut rx: astrid_events::EventReceiver,
+    ) -> (String, Option<String>) {
+        let event = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+            .await
+            .expect("approval request observed")
+            .expect("bus open");
+        let AstridEvent::Ipc { message, .. } = &*event else {
+            panic!("expected IPC approval request");
+        };
+        let IpcPayload::ApprovalRequired { request_id, .. } = &message.payload else {
+            panic!("expected ApprovalRequired payload");
+        };
+        (request_id.clone(), message.principal.clone())
+    }
+
+    #[tokio::test]
+    async fn request_approval_stamps_principal_and_ignores_wrong_responder() {
+        use crate::engine::wasm::test_fixtures::minimal_host_state;
+
+        let mut state = minimal_host_state(tokio::runtime::Handle::current());
+        let bus = state.event_bus.clone();
+        let request_rx = bus.subscribe_topic(Topic::approval_request().as_str());
+
+        let approval_handle = tokio::task::spawn_blocking(move || {
+            let result = <HostState as approval::Host>::request_approval(
+                &mut state,
+                approval_request("run", "run payment"),
+            );
+            (result, state)
+        });
+
+        let (request_id, request_principal) = await_approval_request(request_rx).await;
+        assert_eq!(
+            request_principal.as_deref(),
+            Some("default"),
+            "approval request must be stamped with the originating principal"
+        );
+
+        publish_approval_reply(&bus, &request_id, Some("agent-bob"), "approve");
+        publish_approval_reply(&bus, &request_id, Some("default"), "approve");
+
+        let (result, _state) = approval_handle.await.expect("approval thread joined");
+        let response = result.expect("matching approval response should be accepted");
+        assert_eq!(response.decision, ApprovalDecision::Approved);
     }
 
     // --- sanitize_action_for_pattern tests ---

@@ -31,7 +31,8 @@ fn set_caller(state: &mut HostState, origin: MessageOrigin, principal: &str) {
 
 /// Spawn a one-shot responder: subscribe to `astrid.v1.approval`, wait for the
 /// `ApprovalRequired`, then publish the given `decision` on the per-request
-/// response topic. Mirrors what an uplink/broker does for the operator.
+/// response topic, echoing the request principal. Mirrors what an uplink/broker
+/// does for the operator.
 fn spawn_responder(bus: astrid_events::EventBus, decision: &'static str) {
     let mut req_rx = bus.subscribe_topic("astrid.v1.approval");
     tokio::spawn(async move {
@@ -48,12 +49,43 @@ fn spawn_responder(bus: astrid_events::EventBus, decision: &'static str) {
                 decision: decision.to_string(),
                 reason: None,
             };
+            let mut response = IpcMessage::new(response_topic, payload, uuid::Uuid::nil());
+            if let Some(principal) = message.principal.as_deref() {
+                response = response.with_principal(principal);
+            }
             bus.publish(AstridEvent::Ipc {
-                message: IpcMessage::new(response_topic, payload, uuid::Uuid::nil()),
+                message: response,
                 metadata: astrid_events::EventMetadata::default(),
             });
             return;
         }
+    });
+}
+
+/// Publish a consent reply with an explicit response principal. `None` models a
+/// stale/unprincipaled response that must not satisfy the consent waiter.
+fn publish_consent_reply(
+    bus: &astrid_events::EventBus,
+    request_id: &str,
+    principal: Option<&str>,
+    decision: &str,
+) {
+    let payload = IpcPayload::ApprovalResponse {
+        request_id: request_id.to_string(),
+        decision: decision.to_string(),
+        reason: None,
+    };
+    let mut message = IpcMessage::new(
+        Topic::approval_response(request_id),
+        payload,
+        uuid::Uuid::nil(),
+    );
+    if let Some(principal) = principal {
+        message = message.with_principal(principal);
+    }
+    bus.publish(AstridEvent::Ipc {
+        message,
+        metadata: astrid_events::EventMetadata::default(),
     });
 }
 
@@ -235,6 +267,49 @@ async fn local_socket_approve_session_permits_and_caches_grant() {
     // present this time, so if it tried to elicit it would time out (deny).
     let again = tokio::task::block_in_place(|| state.consent_local_egress("127.0.0.1", 1234));
     assert!(again, "a cached grant short-circuits the prompt on repeat");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn local_socket_consent_ignores_cross_principal_and_unstamped_responses() {
+    let rt = tokio::runtime::Handle::current();
+    let mut state = minimal_host_state(rt);
+    let store = Arc::new(AllowanceStore::new());
+    state.allowance_store = Some(store.clone());
+    set_caller(&mut state, MessageOrigin::LocalSocket, "alice");
+
+    let bus = state.event_bus.clone();
+    let mut req_rx = bus.subscribe_topic("astrid.v1.approval");
+    tokio::spawn(async move {
+        while let Some(event) = req_rx.recv().await {
+            let AstridEvent::Ipc { message, .. } = &*event else {
+                continue;
+            };
+            let IpcPayload::ApprovalRequired { request_id, .. } = &message.payload else {
+                continue;
+            };
+            publish_consent_reply(&bus, request_id, Some("bob"), "approve_session");
+            publish_consent_reply(&bus, request_id, None, "approve_session");
+            publish_consent_reply(&bus, request_id, Some("alice"), "approve_session");
+            return;
+        }
+    });
+
+    let permitted = tokio::task::block_in_place(|| state.consent_local_egress("127.0.0.1", 1234));
+    assert!(
+        permitted,
+        "matching-principal consent response should eventually permit"
+    );
+
+    let alice = PrincipalId::new("alice").unwrap();
+    let bob = PrincipalId::new("bob").unwrap();
+    assert!(
+        has_runtime_grant(&store, &alice, "test", "127.0.0.1", 1234),
+        "only the matching-principal approval should cache alice's grant"
+    );
+    assert!(
+        !has_runtime_grant(&store, &bob, "test", "127.0.0.1", 1234),
+        "wrong-principal response must not cache bob's grant"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
