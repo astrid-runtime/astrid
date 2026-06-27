@@ -68,6 +68,7 @@ trap cleanup EXIT INT TERM
 . "$SCRIPT_DIR/runtime-llm-smoke.sh"
 . "$SCRIPT_DIR/runtime-adversarial-smoke.sh"
 . "$SCRIPT_DIR/runtime-audit-smoke.sh"
+. "$SCRIPT_DIR/runtime-concurrency-smoke.sh"
 note() { printf '\n==> %s\n' "$*"; }
 fail() { printf 'error: %s\n' "$*" >&2; exit 1; }
 run_cli() {
@@ -760,6 +761,7 @@ PY
     "$ARTIFACTS/agent-set-active-model-body-spoof.json")"
   assert_status "agent active model body spoof ignored" "$status" 200
   json_assert_model_id "$ARTIFACTS/agent-set-active-model-body-spoof.json" "openai-compat:fake-slow"
+  run_concurrent_model_write_smoke "$user_bearer" "$ops_bearer"
   run_llm_provider_smoke "$user_bearer" "$user_principal" "$ARTIFACTS/agent-models.json" "$fake_base_url"
 
   run_multi_home_smoke "$fake_base_url" "$user_bearer" "$user_principal"
