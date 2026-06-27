@@ -637,7 +637,8 @@ PY
     "$ARTIFACTS/agent-devices-cross-principal-denied.json")"
   assert_status "agent cross-principal devices read denied" "$status" 403
   run_gateway_quota_write_smoke "$user_principal" "$ops_principal" "$user_bearer" "$admin_bearer"
-  run_admin_pair_device_cross_principal_smoke "$user_bearer" "$user_principal" "$admin_bearer"
+  run_admin_pair_device_cross_principal_smoke "$user_bearer" "$user_principal" \
+    "$ops_principal" "$admin_bearer"
 
   note "checking per-principal capsule env isolation"
   status="$(http_status POST /api/capsules/astrid-capsule-openai-compat/env/model "" \

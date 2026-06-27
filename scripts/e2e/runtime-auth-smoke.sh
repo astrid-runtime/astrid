@@ -3,7 +3,8 @@
 run_admin_pair_device_cross_principal_smoke() {
   local user_bearer=$1
   local user_principal=$2
-  local admin_bearer=$3
+  local ops_principal=$3
+  local admin_bearer=$4
   local status token pubkey key_id paired_bearer
 
   note "checking admin cross-principal pair-device list/revoke"
@@ -23,6 +24,16 @@ PY
   assert_status "admin revoke target pair-token redeem" "$status" 200
   key_id="$(json_field "$ARTIFACTS/admin-pair-device-target-redeem.json" key_id)"
   paired_bearer="$(json_field "$ARTIFACTS/admin-pair-device-target-redeem.json" session_token)"
+
+  status="$(http_status GET "/api/sys/principals/$ops_principal/devices?principal=$user_principal" \
+    "$user_bearer" "" "$ARTIFACTS/adversarial-device-query-spoof-denied.json")"
+  assert_status "regular device list query spoof denied" "$status" 403
+  assert_artifact_lacks_text "$ARTIFACTS/adversarial-device-query-spoof-denied.json" \
+    "$ops_principal"
+  status="$(http_status DELETE "/api/sys/principals/$ops_principal/devices/$key_id?principal=$user_principal" \
+    "$user_bearer" "{\"principal\":\"$user_principal\"}" \
+    "$ARTIFACTS/adversarial-device-revoke-spoof-denied.json")"
+  assert_status "regular device revoke body/query spoof denied" "$status" 403
 
   status="$(http_status GET "/api/sys/principals/$user_principal/devices" "$admin_bearer" "" \
     "$ARTIFACTS/admin-cross-principal-devices.json")"
