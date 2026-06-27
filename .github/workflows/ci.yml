@@ -416,11 +416,28 @@ jobs:
             . -> .openapi-target
           cache-on-failure: true
 
+      - name: Detect OpenAPI contract-change marker
+        if: steps.gateway-inputs.outputs.run == 'true'
+        id: openapi-contract-change
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          if git log --format=%B "$BASE_SHA..$HEAD_SHA" \
+            | grep -Eq '^(OPENAPI|API)[ -]CONTRACT[ -]CHANGE:'; then
+            echo "found=true" >> "$GITHUB_OUTPUT"
+            echo "OpenAPI contract-change marker found; generated diff will be reported without denying the PR."
+          else
+            echo "found=false" >> "$GITHUB_OUTPUT"
+            echo "No OpenAPI contract-change marker found; generated diff will deny the PR."
+          fi
+
       - name: Diff generated OpenAPI spec
         if: steps.gateway-inputs.outputs.run == 'true'
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          OPENAPI_CONTRACT_CHANGE: ${{ steps.openapi-contract-change.outputs.found }}
         run: |
           mkdir -p /tmp/astrid-openapi
           cp crates/astrid-gateway/examples/print-openapi.rs /tmp/astrid-openapi/print-openapi.rs
@@ -445,7 +462,15 @@ jobs:
           generate_spec "$BASE_SHA" /tmp/astrid-openapi/base.json
           generate_spec "$HEAD_SHA" /tmp/astrid-openapi/head.json
 
-          diff -u /tmp/astrid-openapi/base.json /tmp/astrid-openapi/head.json
+          if diff -u /tmp/astrid-openapi/base.json /tmp/astrid-openapi/head.json; then
+            exit 0
+          fi
+          if [ "$OPENAPI_CONTRACT_CHANGE" = "true" ]; then
+            echo "OpenAPI contract changed and was acknowledged by commit marker."
+            exit 0
+          fi
+          echo "::error::OpenAPI contract changed without an API-CONTRACT-CHANGE: marker in a commit message."
+          exit 1
 
   audit:
     name: Security Audit
