@@ -116,7 +116,8 @@ pub(crate) fn emit_grant_required(
         astrid_events::ipc::Topic::approval_request(),
         payload,
         uuid::Uuid::nil(), // Kernel-originated; the grant handler requires nil source.
-    );
+    )
+    .with_principal(principal.to_string());
     event_bus.publish(astrid_events::AstridEvent::Ipc {
         message,
         metadata: astrid_events::EventMetadata::new("dispatcher"),

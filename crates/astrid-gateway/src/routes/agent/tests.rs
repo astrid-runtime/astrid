@@ -291,10 +291,54 @@ fn control_request_stream_filters_to_caller_principal() {
         )
         .with_principal("agent-alice"),
     });
+    let grant_request = Arc::new(AstridEvent::Ipc {
+        metadata: EventMetadata::default(),
+        message: IpcMessage::new(
+            Topic::approval_request(),
+            IpcPayload::GrantRequired {
+                request_id: "grant-1".to_string(),
+                principal: "agent-alice".to_string(),
+                capsule_id: "astrid-capsule-extra".to_string(),
+            },
+            Uuid::nil(),
+        )
+        .with_principal("agent-alice"),
+    });
+    let forged_grant_request = Arc::new(AstridEvent::Ipc {
+        metadata: EventMetadata::default(),
+        message: IpcMessage::new(
+            Topic::approval_request(),
+            IpcPayload::GrantRequired {
+                request_id: "grant-2".to_string(),
+                principal: "agent-alice".to_string(),
+                capsule_id: "astrid-capsule-extra".to_string(),
+            },
+            Uuid::new_v4(),
+        )
+        .with_principal("agent-alice"),
+    });
+    let mismatched_grant_request = Arc::new(AstridEvent::Ipc {
+        metadata: EventMetadata::default(),
+        message: IpcMessage::new(
+            Topic::approval_request(),
+            IpcPayload::GrantRequired {
+                request_id: "grant-3".to_string(),
+                principal: "agent-bob".to_string(),
+                capsule_id: "astrid-capsule-extra".to_string(),
+            },
+            Uuid::nil(),
+        )
+        .with_principal("agent-alice"),
+    });
 
     assert!(forward_control_request(&own_request, "agent-alice", "approval").is_some());
     assert!(forward_control_request(&peer_request, "agent-alice", "approval").is_none());
     assert!(forward_control_request(&response_event, "agent-alice", "approval").is_none());
+    assert!(forward_control_request(&grant_request, "agent-alice", "approval").is_some());
+    assert!(forward_control_request(&forged_grant_request, "agent-alice", "approval").is_none());
+    assert!(
+        forward_control_request(&mismatched_grant_request, "agent-alice", "approval").is_none()
+    );
 }
 
 /// The fail-fast stream emits exactly one `error` event and then closes.

@@ -67,6 +67,7 @@ trap cleanup EXIT INT TERM
 . "$SCRIPT_DIR/runtime-multi-home-smoke.sh"
 . "$SCRIPT_DIR/runtime-llm-smoke.sh"
 . "$SCRIPT_DIR/runtime-adversarial-smoke.sh"
+. "$SCRIPT_DIR/runtime-grant-smoke.sh"
 . "$SCRIPT_DIR/runtime-audit-smoke.sh"
 . "$SCRIPT_DIR/runtime-concurrency-smoke.sh"
 . "$SCRIPT_DIR/runtime-crash-smoke.sh"
@@ -694,6 +695,7 @@ PY
     "$ops_bearer" "$ops_principal" "$user_secret"
   run_adversarial_capsule_smoke "$user_bearer" "$user_principal" \
     "$ops_bearer" "$ops_principal"
+  run_grant_on_use_smoke "$user_bearer" "$user_principal"
   run_cli_semantic_smoke "$user_principal" "$ops_principal"
 
   curl -sN --max-time 3 \

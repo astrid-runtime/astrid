@@ -364,13 +364,15 @@ pub async fn post_prompt(
     Ok(sse_with_keepalive(stream.boxed()))
 }
 
-/// `GET /api/agent/requests` — stream pending approval and elicit requests.
+/// `GET /api/agent/requests` — stream pending approval, grant, and elicit requests.
 ///
 /// This is the standalone control-plane companion to `POST /api/agent/prompt`'s
 /// in-band elicit forwarding. Lifecycle hooks and other non-prompt capsule work
 /// can request human input without an agent prompt SSE connection being open, so
 /// clients need one authenticated request stream. Only requests stamped with the
-/// caller's verified principal are forwarded.
+/// caller's verified principal are forwarded. Grant-on-use requests are
+/// forwarded only when kernel-originated (`source_id == nil`) so a capsule
+/// cannot spoof a grant prompt into a user's stream.
 #[utoipa::path(
     get,
     path = "/api/agent/requests",
@@ -474,13 +476,14 @@ pub async fn post_elicit_response(
     Ok(StatusCode::ACCEPTED)
 }
 
-/// `POST /api/agent/approval-response` — answer an in-flight approval request.
+/// `POST /api/agent/approval-response` — answer an in-flight approval or grant request.
 ///
 /// Fire-and-forget: the gateway publishes the decision onto
 /// `astrid.v1.approval.response.{request_id}` and stamps it with the caller's
-/// verified principal. The capsule host waiter accepts only same-principal
-/// replies, so a caller who learns another principal's request id cannot answer,
-/// deny, or cancel it.
+/// verified principal. Capsule host waiters accept only same-principal replies,
+/// and grant-on-use captures the target from the kernel-origin request, so a
+/// caller who learns another principal's request id cannot answer, deny, cancel,
+/// or redirect it.
 #[utoipa::path(
     post,
     path = "/api/agent/approval-response",
@@ -669,6 +672,18 @@ fn forward_control_request(
     }
     let value = match &message.payload {
         IpcPayload::ApprovalRequired { .. } | IpcPayload::ElicitRequest { .. } => {
+            if message.principal.as_deref() != Some(principal) {
+                return None;
+            }
+            serde_json::to_value(&message.payload).ok()?
+        },
+        IpcPayload::GrantRequired {
+            principal: request_principal,
+            ..
+        } => {
+            if message.source_id != Uuid::nil() || request_principal != principal {
+                return None;
+            }
             serde_json::to_value(&message.payload).ok()?
         },
         _ => return None,
