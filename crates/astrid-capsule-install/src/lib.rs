@@ -59,6 +59,7 @@
 pub mod archive;
 pub mod capsule_metadata_mirror;
 pub mod copy;
+pub mod furniture;
 pub mod github_source;
 pub mod lifecycle;
 pub mod local;
@@ -71,6 +72,7 @@ pub mod wit;
 pub use archive::unpack_and_install;
 pub use capsule_metadata_mirror::mirror_capsule_metadata_from_install_principal;
 pub use copy::copy_capsule_dir;
+pub use furniture::materialize_principal_furniture;
 pub use local::{InstallOptions, InstallOutput, InstallPhase, install_from_local_path};
 pub use manifest_check::{ExportConflict, MissingImport, check_export_conflicts, validate_imports};
 pub use meta::{
