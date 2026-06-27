@@ -188,6 +188,8 @@ fn e2e_capability_manifest_covers_catalog() {
     let manifest: toml::Value =
         toml::from_str(include_str!("../../../../e2e/capability-scenarios.toml"))
             .expect("capability e2e manifest parses");
+    let specs =
+        parse_runtime_scenario_specs(include_str!("../../../../e2e/runtime-scenario-specs.toml"));
     let capabilities = manifest
         .get("capabilities")
         .and_then(toml::Value::as_table)
@@ -219,6 +221,7 @@ fn e2e_capability_manifest_covers_catalog() {
             .and_then(toml::Value::as_str)
             .unwrap_or("");
         assert!(!scenario.is_empty(), "capability {id} needs a scenario");
+        assert_scenario_contract(id, scenario, &specs, "capability");
 
         let status = table
             .get("status")
@@ -248,5 +251,70 @@ fn e2e_capability_manifest_covers_catalog() {
                 "capability {id} has invalid status {other:?}; use covered, mapped, or waived"
             ),
         }
+    }
+}
+
+fn parse_runtime_scenario_specs(src: &str) -> toml::Value {
+    let parsed: toml::Value = toml::from_str(src).expect("runtime-scenario-specs.toml parses");
+    let scenarios = parsed
+        .get("scenarios")
+        .and_then(toml::Value::as_table)
+        .expect("runtime-scenario-specs.toml must contain a [scenarios] table");
+
+    for (name, entry) in scenarios {
+        let table = entry
+            .as_table()
+            .unwrap_or_else(|| panic!("runtime scenario {name:?} must be a table"));
+        for field in [
+            "status", "surfaces", "auth", "success", "denial", "state", "evidence",
+        ] {
+            assert!(
+                non_empty_field(table, field),
+                "runtime scenario {name:?} is missing non-empty field {field:?}"
+            );
+        }
+        let status = table
+            .get("status")
+            .and_then(toml::Value::as_str)
+            .unwrap_or_else(|| panic!("runtime scenario {name:?} has non-string status"));
+        assert!(
+            matches!(status, "mapped" | "covered" | "waived" | "future"),
+            "runtime scenario {name:?} has invalid status {status:?}"
+        );
+        if status == "waived" {
+            assert!(
+                non_empty_field(table, "waiver"),
+                "waived runtime scenario {name:?} needs a waiver"
+            );
+        }
+    }
+
+    parsed
+}
+
+fn assert_scenario_contract(id: &str, scenario: &str, specs: &toml::Value, surface: &str) {
+    let scenarios = specs
+        .get("scenarios")
+        .and_then(toml::Value::as_table)
+        .expect("runtime specs already validated");
+    let spec = scenarios
+        .get(scenario)
+        .and_then(toml::Value::as_table)
+        .unwrap_or_else(|| panic!("capability {id} references unknown scenario {scenario:?}"));
+    let surfaces = spec
+        .get("surfaces")
+        .and_then(toml::Value::as_array)
+        .expect("runtime specs already validated");
+    assert!(
+        surfaces.iter().any(|v| v.as_str() == Some(surface)),
+        "capability {id} references scenario {scenario:?}, which does not declare surface {surface:?}"
+    );
+}
+
+fn non_empty_field(table: &toml::value::Table, field: &str) -> bool {
+    match table.get(field) {
+        Some(toml::Value::String(s)) => !s.trim().is_empty(),
+        Some(toml::Value::Array(items)) => !items.is_empty(),
+        _ => false,
     }
 }

@@ -357,27 +357,31 @@ principal = "admin"
 
 [commands."budget show"]
 scenario = "budget_core_transitional"
-status = "mapped"
+status = "waived"
 mode = "deferred"
 principal = "admin"
+reason = "Budget ownership is intentionally deferred until it is clear whether the surface stays in core or moves to a capsule."
 
 [commands."budget set"]
 scenario = "budget_core_transitional"
-status = "mapped"
+status = "waived"
 mode = "deferred"
 principal = "admin"
+reason = "Budget ownership is intentionally deferred until it is clear whether the surface stays in core or moves to a capsule."
 
 [commands."budget transfer"]
 scenario = "budget_core_transitional"
-status = "mapped"
+status = "waived"
 mode = "deferred"
 principal = "admin"
+reason = "Budget ownership is intentionally deferred until it is clear whether the surface stays in core or moves to a capsule."
 
 [commands."budget history"]
 scenario = "budget_core_transitional"
-status = "mapped"
+status = "waived"
 mode = "deferred"
 principal = "admin"
+reason = "Budget ownership is intentionally deferred until it is clear whether the surface stays in core or moves to a capsule."
 
 [commands."session list"]
 scenario = "session_lifecycle"

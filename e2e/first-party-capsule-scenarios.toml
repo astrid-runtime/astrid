@@ -21,6 +21,6 @@ reason = "Provider route is exercised through the fake OpenAI-compatible server 
 
 [capsule_commands."budget"]
 scenario = "budget_core_transitional"
-status = "future"
+status = "waived"
 provider = "unassigned"
-reason = "Keep a manifest slot ready for moving budget out of core without losing coverage."
+reason = "Budget ownership is intentionally deferred until it is clear whether the surface stays in core or moves to a capsule."

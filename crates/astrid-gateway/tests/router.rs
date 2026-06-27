@@ -510,7 +510,10 @@ fn openapi_lists_every_router_route() {
         .map(|(method, path)| format!("{method} {path}"))
         .collect();
     let spec = openapi_methods(ApiDoc::openapi());
-    let manifest = parse_http_manifest(include_str!("../../../e2e/http-scenarios.toml"));
+    let manifest = parse_http_manifest(
+        include_str!("../../../e2e/http-scenarios.toml"),
+        include_str!("../../../e2e/runtime-scenario-specs.toml"),
+    );
 
     let missing_from_spec: Vec<&String> = router.difference(&spec).collect();
     assert!(
@@ -575,8 +578,9 @@ fn openapi_methods(doc: utoipa::openapi::OpenApi) -> std::collections::BTreeSet<
         .collect()
 }
 
-fn parse_http_manifest(src: &str) -> std::collections::BTreeSet<String> {
+fn parse_http_manifest(src: &str, specs_src: &str) -> std::collections::BTreeSet<String> {
     let parsed: toml::Value = toml::from_str(src).expect("http-scenarios.toml parses");
+    let specs = parse_runtime_scenario_specs(specs_src);
     let routes = parsed
         .get("routes")
         .and_then(toml::Value::as_table)
@@ -602,9 +606,96 @@ fn parse_http_manifest(src: &str) -> std::collections::BTreeSet<String> {
                 matches!(status, "mapped" | "covered" | "waived" | "future"),
                 "manifest entry for {name:?} has invalid status {status:?}"
             );
+            assert_status_reason(name, table, status);
+            assert_scenario_contract(name, table, &specs, "http");
             name.clone()
         })
         .collect()
+}
+
+fn parse_runtime_scenario_specs(src: &str) -> toml::Value {
+    let parsed: toml::Value = toml::from_str(src).expect("runtime-scenario-specs.toml parses");
+    let scenarios = parsed
+        .get("scenarios")
+        .and_then(toml::Value::as_table)
+        .expect("runtime-scenario-specs.toml must contain a [scenarios] table");
+
+    for (name, entry) in scenarios {
+        let table = entry
+            .as_table()
+            .unwrap_or_else(|| panic!("runtime scenario {name:?} must be a table"));
+        for field in [
+            "status", "surfaces", "auth", "success", "denial", "state", "evidence",
+        ] {
+            assert!(
+                non_empty_field(table, field),
+                "runtime scenario {name:?} is missing non-empty field {field:?}"
+            );
+        }
+        let status = table
+            .get("status")
+            .and_then(toml::Value::as_str)
+            .unwrap_or_else(|| panic!("runtime scenario {name:?} has non-string status"));
+        assert!(
+            matches!(status, "mapped" | "covered" | "waived" | "future"),
+            "runtime scenario {name:?} has invalid status {status:?}"
+        );
+        if status == "waived" {
+            assert!(
+                non_empty_field(table, "waiver"),
+                "waived runtime scenario {name:?} needs a waiver"
+            );
+        }
+    }
+
+    parsed
+}
+
+fn assert_status_reason(name: &str, table: &toml::value::Table, status: &str) {
+    if matches!(status, "waived" | "future") {
+        assert!(
+            non_empty_field(table, "reason"),
+            "manifest entry for {name:?} with status {status:?} needs a reason"
+        );
+    }
+}
+
+fn assert_scenario_contract(
+    name: &str,
+    table: &toml::value::Table,
+    specs: &toml::Value,
+    surface: &str,
+) {
+    let scenario = table
+        .get("scenario")
+        .and_then(toml::Value::as_str)
+        .unwrap_or_else(|| panic!("manifest entry for {name:?} has non-string scenario"));
+    let scenarios = specs
+        .get("scenarios")
+        .and_then(toml::Value::as_table)
+        .expect("runtime specs already validated");
+    let spec = scenarios
+        .get(scenario)
+        .and_then(toml::Value::as_table)
+        .unwrap_or_else(|| {
+            panic!("manifest entry for {name:?} references unknown scenario {scenario:?}")
+        });
+    let surfaces = spec
+        .get("surfaces")
+        .and_then(toml::Value::as_array)
+        .expect("runtime specs already validated");
+    assert!(
+        surfaces.iter().any(|v| v.as_str() == Some(surface)),
+        "manifest entry for {name:?} references scenario {scenario:?}, which does not declare surface {surface:?}"
+    );
+}
+
+fn non_empty_field(table: &toml::value::Table, field: &str) -> bool {
+    match table.get(field) {
+        Some(toml::Value::String(s)) => !s.trim().is_empty(),
+        Some(toml::Value::Array(items)) => !items.is_empty(),
+        _ => false,
+    }
 }
 
 #[tokio::test]

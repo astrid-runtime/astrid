@@ -107,7 +107,12 @@ jobs:
           cp -a capsules/. "$RUNNER_TEMP/astrid-runtime-capsules/"
 
       - name: Check CLI inventory coverage
-        run: cargo test -p astrid e2e_manifest_covers_every_visible_builtin_leaf_command
+        run: |
+          cargo test -p astrid e2e_manifest_covers_every_visible_builtin_leaf_command
+          cargo test -p astrid first_party_capsule_manifest_has_executable_scenarios
+
+      - name: Check capability scenario coverage
+        run: cargo test -p astrid-kernel e2e_capability_manifest_covers_catalog
 
       - name: Check HTTP route coverage
         run: cargo test -p astrid-gateway openapi_lists_every_router_route
