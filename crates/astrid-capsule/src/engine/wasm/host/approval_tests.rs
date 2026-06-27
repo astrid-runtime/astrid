@@ -368,6 +368,40 @@ async fn approval_wait_ignores_wrong_principal_then_accepts_matching_reply() {
     assert!(response_principal_matches("agent-alice", &event));
 }
 
+#[tokio::test]
+async fn concurrent_approval_waiters_keep_correlation_and_principal_scopes() {
+    let bus = astrid_events::EventBus::with_capacity(128);
+    let mut rx_alice = bus.subscribe_topic(Topic::approval_response("approval-alice").as_str());
+    let mut rx_bob = bus.subscribe_topic(Topic::approval_response("approval-bob").as_str());
+
+    let alice = await_matching_approval_response(
+        &mut rx_alice,
+        "agent-alice",
+        "test",
+        "approval-alice",
+        std::time::Duration::from_secs(1),
+    );
+    let bob = await_matching_approval_response(
+        &mut rx_bob,
+        "agent-bob",
+        "test",
+        "approval-bob",
+        std::time::Duration::from_secs(1),
+    );
+
+    publish_approval_reply(&bus, "approval-alice", Some("agent-bob"), "approve");
+    publish_approval_reply(&bus, "approval-bob", Some("agent-alice"), "approve");
+    publish_approval_reply(&bus, "approval-alice", Some("agent-alice"), "approve");
+    publish_approval_reply(&bus, "approval-bob", Some("agent-bob"), "deny");
+
+    let (alice, bob) = tokio::join!(alice, bob);
+    let alice = alice.expect("alice approval should resolve");
+    let bob = bob.expect("bob approval should resolve");
+
+    assert!(response_principal_matches("agent-alice", &alice));
+    assert!(response_principal_matches("agent-bob", &bob));
+}
+
 fn approval_request(action: &str, resource: &str) -> ApprovalRequest {
     ApprovalRequest {
         action: action.to_string(),

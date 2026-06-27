@@ -584,6 +584,42 @@ mod tests {
             other => panic!("expected ElicitResponse, got {other:?}"),
         }
     }
+
+    #[tokio::test]
+    async fn concurrent_waiters_keep_correlation_and_principal_scopes() {
+        let bus = astrid_events::EventBus::with_capacity(256);
+        let alice_id = Uuid::new_v4();
+        let bob_id = Uuid::new_v4();
+        let mut rx_alice = bus.subscribe_topic(Topic::elicit_response(alice_id).as_str());
+        let mut rx_bob = bus.subscribe_topic(Topic::elicit_response(bob_id).as_str());
+
+        let alice = await_matching_elicit_response(
+            &mut rx_alice,
+            "agent-alice",
+            "test",
+            alice_id,
+            std::time::Duration::from_secs(1),
+        );
+        let bob = await_matching_elicit_response(
+            &mut rx_bob,
+            "agent-bob",
+            "test",
+            bob_id,
+            std::time::Duration::from_secs(1),
+        );
+
+        publish_reply(&bus, alice_id, Some("agent-bob"), "wrong-alice");
+        publish_reply(&bus, bob_id, Some("agent-alice"), "wrong-bob");
+        publish_reply(&bus, alice_id, Some("agent-alice"), "alice");
+        publish_reply(&bus, bob_id, Some("agent-bob"), "bob");
+
+        let (alice, bob) = tokio::join!(alice, bob);
+        let alice = alice.expect("alice elicit should resolve");
+        let bob = bob.expect("bob elicit should resolve");
+
+        assert!(response_principal_matches("agent-alice", &alice));
+        assert!(response_principal_matches("agent-bob", &bob));
+    }
 }
 
 // ---------------------------------------------------------------------------
