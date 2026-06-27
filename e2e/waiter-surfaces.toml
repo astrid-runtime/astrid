@@ -45,13 +45,13 @@ runtime_coverage = [
   "HTTP elicit-response cancel sentinel accepted",
 ]
 unit_coverage = [
+  "normal runtime elicit fails before publishing a request",
   "wrong-principal response ignored",
   "unknown request id ignored",
   "mismatch flood does not extend deadline",
   "concurrent request ids and principals do not cross",
 ]
 remaining = [
-  "normal capsule commands cannot legally invoke elicit today because the host import is lifecycle-only",
   "mid-elicit daemon crash and live command-path elicit overlap require a lifecycle-specific test hook or non-lifecycle elicitation primitive",
 ]
 

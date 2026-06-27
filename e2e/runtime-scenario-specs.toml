@@ -213,7 +213,7 @@ success = ["same-principal elicit response resumes the waiting prompt"]
 denial = ["cross-principal, stale, or unknown request id is rejected or ignored"]
 state = ["elicit waiter is consumed once"]
 evidence = ["prompt SSE and elicit response artifacts"]
-remaining = ["normal capsule commands cannot invoke the lifecycle-only elicit host import today; broader live elicit overlap/crash paths need product support"]
+remaining = ["mid-elicit daemon crash and live command-path overlap need a lifecycle-specific test hook or non-lifecycle elicitation primitive"]
 
 [scenarios.first_party_capsule_commands]
 status = "covered"
