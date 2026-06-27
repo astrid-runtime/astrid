@@ -157,6 +157,65 @@ assert_no_adversarial_session_poison() {
   fi
 }
 
+wait_for_sse_ready() {
+  local path=$1
+  local deadline=$((SECONDS + 10))
+  until grep -q '^event: ready' "$path" 2>/dev/null; do
+    if (( SECONDS >= deadline )); then
+      return 1
+    fi
+    sleep 0.1
+  done
+}
+
+wait_for_approval_request_id() {
+  local path=$1
+  local deadline=$((SECONDS + 10))
+  local python_bin="${PYTHON:-python3}"
+  local request_id
+  until request_id="$("$python_bin" - "$path" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+if not path.exists():
+    raise SystemExit(1)
+
+text = path.read_text(encoding="utf-8", errors="replace")
+for block in text.split("\n\n"):
+    event = None
+    data_lines = []
+    for line in block.splitlines():
+        if line.startswith("event:"):
+            event = line.split(":", 1)[1].strip()
+        elif line.startswith("data:"):
+            data_lines.append(line.split(":", 1)[1].strip())
+    if event != "approval" or not data_lines:
+        continue
+    try:
+        payload = json.loads("\n".join(data_lines))
+    except json.JSONDecodeError:
+        continue
+    if payload.get("type") != "approval_required":
+        continue
+    if payload.get("action") != "runtime-e2e-approval":
+        continue
+    request_id = payload.get("request_id")
+    if request_id:
+        print(request_id)
+        raise SystemExit(0)
+raise SystemExit(1)
+PY
+  )"; do
+    if (( SECONDS >= deadline )); then
+      return 1
+    fi
+    sleep 0.1
+  done
+  printf '%s\n' "$request_id"
+}
+
 assert_artifact_lacks_text() {
   local path=$1
   local text=$2
@@ -169,6 +228,7 @@ assert_artifact_lacks_text() {
 run_adversarial_capsule_smoke() {
   local user_bearer=$1
   local user_principal=$2
+  local ops_bearer=$3
   local status
 
   note "checking adversarial capsule host-call denial and response spoofing"
@@ -181,6 +241,61 @@ run_adversarial_capsule_smoke() {
     "$ARTIFACTS/adversarial-capsule-session-list.json")"
   assert_status "adversarial capsule session poison ignored" "$status" 200
   assert_no_adversarial_session_poison "$ARTIFACTS/adversarial-capsule-session-list.json"
+
+  note "checking live approval responder principal isolation"
+  local approval_sse="$ARTIFACTS/adversarial-approval-requests.sse"
+  local approval_out="$ARTIFACTS/adversarial-approval-cli.txt"
+  curl -sN --max-time 20 \
+    -H "Authorization: Bearer $user_bearer" \
+    "$GATEWAY/api/agent/requests" \
+    > "$approval_sse" 2>&1 &
+  local stream_pid=$!
+  wait_for_sse_ready "$approval_sse" || {
+    terminate_pid "$stream_pid"
+    cat "$approval_sse" >&2 2>/dev/null || true
+    fail "approval request stream did not become ready"
+  }
+  grep -q "\"principal\":\"$user_principal\"" "$approval_sse" || {
+    terminate_pid "$stream_pid"
+    fail "approval request stream ready event did not carry caller principal"
+  }
+
+  bounded_principal_cli "$user_principal" 20 "$approval_out" \
+    capsule run astrid-capsule-adversarial adversarial-approval &
+  local cli_pid=$!
+  local approval_request_id
+  approval_request_id="$(wait_for_approval_request_id "$approval_sse")" || {
+    terminate_pid "$cli_pid"
+    terminate_pid "$stream_pid"
+    cat "$approval_sse" >&2 2>/dev/null || true
+    fail "approval request stream did not forward adversarial approval request"
+  }
+
+  status="$(http_status POST /api/agent/approval-response "$ops_bearer" \
+    "{\"request_id\":\"$approval_request_id\",\"decision\":\"approve\",\"reason\":\"wrong principal must not satisfy\"}" \
+    "$ARTIFACTS/adversarial-approval-wrong-principal.json")"
+  assert_status "wrong-principal approval response accepted but ignored by waiter" "$status" 202
+  sleep 0.5
+  if ! kill -0 "$cli_pid" 2>/dev/null; then
+    wait "$cli_pid" || true
+    terminate_pid "$stream_pid"
+    cat "$approval_out" >&2 2>/dev/null || true
+    fail "wrong-principal approval response satisfied the capsule approval waiter"
+  fi
+
+  status="$(http_status POST /api/agent/approval-response "$user_bearer" \
+    "{\"request_id\":\"$approval_request_id\",\"decision\":\"approve\",\"reason\":\"runtime e2e approve\"}" \
+    "$ARTIFACTS/adversarial-approval-user.json")"
+  assert_status "same-principal approval response accepted" "$status" 202
+  local approval_rc=0
+  wait "$cli_pid" || approval_rc=$?
+  terminate_pid "$stream_pid"
+  if [[ "$approval_rc" -ne 0 ]]; then
+    cat "$approval_out" >&2 2>/dev/null || true
+    fail "adversarial approval command failed after same-principal response"
+  fi
+  grep -q '"approved":true' "$approval_out" \
+    || fail "adversarial approval command did not report approved decision"
 }
 
 run_adversarial_principal_smoke() {

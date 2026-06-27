@@ -11,6 +11,7 @@ const SESSION_LIST_REQUEST_TOPIC: &str = "session.v1.request.list";
 const SESSION_LIST_RESPONSE_PREFIX: &str = "session.v1.response.list.";
 const CLI_RUN_COMMAND: &str = "adversarial";
 const CLI_SLOW_COMMAND: &str = "adversarial-slow";
+const CLI_APPROVAL_COMMAND: &str = "adversarial-approval";
 const MAX_REQ_ID_LEN: usize = 64;
 const POISON_SESSION_ID: &str = "ASTRID_ADVERSARIAL_POISON_SESSION";
 const LIFECYCLE_EXPECTED_ANSWER: &str = "runtime-lifecycle-ok";
@@ -76,6 +77,7 @@ fn dispatch_cli_runs(result: &ipc::PollResult) {
         match payload.get("command").and_then(|v| v.as_str()) {
             Some(CLI_RUN_COMMAND) => publish_probe_report(req_id),
             Some(CLI_SLOW_COMMAND) => run_slow_command(req_id),
+            Some(CLI_APPROVAL_COMMAND) => run_approval_command(req_id),
             _ => {},
         }
     }
@@ -109,6 +111,34 @@ fn run_slow_command(req_id: &str) {
             "exit_code": 0,
             "output": "adversarial slow command completed",
             "error": "",
+        }),
+    );
+}
+
+fn run_approval_command(req_id: &str) {
+    let result = approval::request_decision(
+        "runtime-e2e-approval",
+        &format!("adversarial approval probe {req_id}"),
+    );
+    let (exit_code, output, error) = match result {
+        Ok(decision) => (
+            if decision.is_approved() { 0 } else { 2 },
+            serde_json::json!({
+                "decision": format!("{decision:?}"),
+                "approved": decision.is_approved(),
+            })
+            .to_string(),
+            String::new(),
+        ),
+        Err(err) => (1, String::new(), err.to_string()),
+    };
+    let topic = format!("{CLI_RESULT_TOPIC_PREFIX}{req_id}");
+    let _ = ipc::publish_json(
+        &topic,
+        &serde_json::json!({
+            "exit_code": exit_code,
+            "output": output,
+            "error": error,
         }),
     );
 }
