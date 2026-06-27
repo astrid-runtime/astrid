@@ -23,6 +23,15 @@ collect_audit_artifacts() {
     admin.agent.delete:failure \
     admin.auth.pair.issue:failure \
     admin.caps.grant:failure
+
+  local admin_bearer
+  admin_bearer="$(mint_admin_bearer)"
+  status="$(http_status GET "/api/sys/audit?limit=1000" "$admin_bearer" "" "$ARTIFACTS/admin-audit.json")"
+  assert_status "admin firehose audit export" "$status" 200
+  json_assert_audit_firehose_contains_principals \
+    "$ARTIFACTS/admin-audit.json" "$user_principal" "$ops_principal"
+  json_assert_audit_token_evidence_and_redaction \
+    "$ARTIFACTS/admin-audit.json" "$paired_key_id" "$@" "$admin_bearer"
 }
 
 json_assert_audit_token_evidence_and_redaction() {
@@ -78,5 +87,24 @@ if not any(
         "audit response missed paired-device token-authenticated denial "
         f"for key {paired_key_id!r}; saw {summary!r}"
     )
+PY
+}
+
+json_assert_audit_firehose_contains_principals() {
+  local file=$1
+  shift
+  "$PYTHON" - "$file" "$@" <<'PY'
+import json
+import sys
+
+path = sys.argv[1]
+expected = set(sys.argv[2:])
+data = json.load(open(path, encoding="utf-8"))
+entries = data.get("entries", [])
+seen = {entry.get("principal") for entry in entries if entry.get("principal")}
+missing = sorted(expected - seen)
+if missing:
+    summary = sorted(str(item) for item in seen)
+    raise SystemExit(f"admin audit firehose missed principals {missing!r}; saw {summary!r}")
 PY
 }
