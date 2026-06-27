@@ -116,12 +116,14 @@ fn agent_group_allows_self_scoped_capsule_surface() {
     let profile = agent_profile();
     let caller = agent_principal();
 
-    // Self-scoped: agent can drive their own capsule lifecycle.
+    // Self-scoped: agent can drive their own capsule lifecycle. The daemon
+    // currently rejects workspace installs later because it has no meaningful
+    // CWD, but the authz surface remains self-scoped for that future shape.
     for req in [
         KernelRequest::ReloadCapsules,
         KernelRequest::InstallCapsule {
             source: String::new(),
-            workspace: false,
+            workspace: true,
         },
         KernelRequest::ListCapsules,
         KernelRequest::GetCommands,
@@ -135,6 +137,20 @@ fn agent_group_allows_self_scoped_capsule_surface() {
         authorize(&profile, &groups, &caller, &req)
             .unwrap_or_else(|e| panic!("agent should be allowed {method}: {e}"));
     }
+
+    assert!(
+        authorize(
+            &profile,
+            &groups,
+            &caller,
+            &KernelRequest::InstallCapsule {
+                source: String::new(),
+                workspace: false,
+            }
+        )
+        .is_err(),
+        "agent self:* must not authorize daemon-wide capsule install",
+    );
 }
 
 #[test]
@@ -248,24 +264,7 @@ fn custom_group_capabilities_gate_admin_surface() {
     };
     let caller = PrincipalId::new("ops_user").unwrap();
 
-    // Ops group gets cross-agent capsule:install but not self:capsule:install
-    // because today's scope defaults to Self_. Still denied until they also
-    // belong to agent (self:*) or grant self:capsule:install directly.
-    assert!(
-        authorize(
-            &profile,
-            &groups,
-            &caller,
-            &KernelRequest::InstallCapsule {
-                source: String::new(),
-                workspace: false
-            }
-        )
-        .is_err()
-    );
-
-    // Grant the self:* equivalent and the install goes through.
-    profile.grants.push("self:capsule:install".into());
+    // Ops group gets daemon-wide capsule:install, so shared installs pass.
     authorize(
         &profile,
         &groups,
@@ -273,6 +272,32 @@ fn custom_group_capabilities_gate_admin_surface() {
         &KernelRequest::InstallCapsule {
             source: String::new(),
             workspace: false,
+        },
+    )
+    .unwrap();
+
+    // It still does not get the self-scoped workspace variant until that exact
+    // authority is granted.
+    assert!(
+        authorize(
+            &profile,
+            &groups,
+            &caller,
+            &KernelRequest::InstallCapsule {
+                source: String::new(),
+                workspace: true
+            }
+        )
+        .is_err()
+    );
+    profile.grants.push("self:capsule:install".into());
+    authorize(
+        &profile,
+        &groups,
+        &caller,
+        &KernelRequest::InstallCapsule {
+            source: String::new(),
+            workspace: true,
         },
     )
     .unwrap();
@@ -289,12 +314,17 @@ fn admin_vs_agent_cross_tenant_matrix() {
         authorize(&admin, &groups, &admin_principal(), &req).unwrap();
     }
 
-    // Agent self:* covers capsule lifecycle; system:* stays denied.
+    // Agent self:* covers self-scoped capsule lifecycle; system:* and
+    // daemon-wide shared capsule install stay denied.
     for req in all_requests() {
         let method = kernel_request_method(&req);
         let result = authorize(&agent, &groups, &agent_principal(), &req);
         match req {
-            KernelRequest::Shutdown { .. } | KernelRequest::GetStatus => {
+            KernelRequest::Shutdown { .. }
+            | KernelRequest::GetStatus
+            | KernelRequest::InstallCapsule {
+                workspace: false, ..
+            } => {
                 assert!(result.is_err(), "{method} should be denied for agent");
             },
             _ => {
