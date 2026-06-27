@@ -85,10 +85,9 @@ pub struct InstallRequest {
     /// forwarded verbatim and rejected kernel-side; the daemon never
     /// fetches URLs.
     pub source: String,
-    /// `true` to install into the workspace-local capsules slot
-    /// instead of the system-wide one. Always rejected kernel-side
-    /// when called via this route — the daemon has no meaningful
-    /// CWD. Ignored (forced `false`) for gateway-resolved GitHub
+    /// `true` to install into the caller's CWD/workspace-local capsule slot.
+    /// Always rejected kernel-side when called via this route — the daemon has
+    /// no meaningful CWD. Ignored (forced `false`) for gateway-resolved GitHub
     /// sources.
     #[serde(default)]
     pub workspace: bool,

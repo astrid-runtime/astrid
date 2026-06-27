@@ -7,13 +7,12 @@ use astrid_core::dirs::AstridHome;
 
 /// The principal a non-workspace install targets.
 ///
-/// All user installs land in the default principal's home today, and so
-/// must everything keyed off that home: the capsule directory, the env
-/// config, and the `home://wit/` interface mirror. This is the single
-/// source of truth — per-principal installs would thread a real id
-/// through here (and `InstallOptions`) so those locations can never
-/// drift apart. Resolving the principal in one place keeps the mirror
-/// honest instead of re-hardcoding `PrincipalId::default()` per call site.
+/// Non-workspace installs currently land in the local bootstrap principal's
+/// home. That does not make `default` shared: visibility and execution are
+/// still controlled by each caller's principal profile, and env/secrets are
+/// stored under the caller principal. Future caller-scoped installs should
+/// thread an explicit principal through `InstallOptions` instead of reusing
+/// this legacy resolver.
 #[must_use]
 pub fn install_principal() -> astrid_core::PrincipalId {
     astrid_core::PrincipalId::default()

@@ -370,6 +370,15 @@ denial = ["regular or restricted caller cannot mutate or inspect hidden principa
 state = ["principal profile, group, and capsule grants change only for target"]
 evidence = ["agent/principal HTTP artifacts and CLI transcript"]
 
+[scenarios.principal_inheritance]
+status = "mapped"
+surfaces = ["cli", "http", "capability"]
+auth = ["operator with explicit agent:create:inherit or agent:create:clone authority"]
+success = ["authorized caller can create a new owned principal from an explicit source principal"]
+denial = ["agent:create alone cannot copy source env, KV, secrets, capsule grants, or capability profile"]
+state = ["state/profile copies occur only from the named source to the new target principal"]
+evidence = ["agent.create inheritance/clone response, source/target state assertions, and audit row"]
+
 [scenarios.principal_lifecycle]
 status = "mapped"
 surfaces = ["cli", "http", "capability"]
@@ -438,7 +447,7 @@ status = "mapped"
 surfaces = ["capability"]
 auth = ["self-scoped capsule workspace principal"]
 success = ["self-scoped install applies only to caller workspace"]
-denial = ["self-scoped caller cannot install system-wide capsule state"]
+denial = ["self-scoped caller cannot mutate daemon install-target capsule state"]
 state = ["workspace capsule metadata remains caller-scoped"]
 evidence = ["workspace install/list artifacts and denial response"]
 

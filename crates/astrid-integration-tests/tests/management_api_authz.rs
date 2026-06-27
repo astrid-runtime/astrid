@@ -149,7 +149,7 @@ fn agent_group_allows_self_scoped_capsule_surface() {
             }
         )
         .is_err(),
-        "agent self:* must not authorize daemon-wide capsule install",
+        "agent self:* must not authorize daemon install-target mutation",
     );
 }
 

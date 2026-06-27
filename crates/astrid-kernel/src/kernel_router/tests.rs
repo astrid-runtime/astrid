@@ -332,7 +332,7 @@ fn required_capability_mapping_global_scope() {
 }
 
 #[test]
-fn resolve_scope_defaults_to_self_except_shared_capsule_install() {
+fn resolve_scope_defaults_to_self_except_daemon_capsule_install() {
     let caller = PrincipalId::new("alice").unwrap();
     for req in all_request_variants() {
         if matches!(
@@ -353,7 +353,7 @@ fn resolve_scope_defaults_to_self_except_shared_capsule_install() {
 }
 
 #[test]
-fn resolve_scope_treats_daemon_wide_capsule_install_as_global() {
+fn resolve_scope_treats_daemon_capsule_install_as_global() {
     let caller = PrincipalId::new("alice").unwrap();
     assert_eq!(
         resolve_scope(

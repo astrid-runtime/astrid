@@ -334,12 +334,10 @@ pub(crate) enum CapsuleCommands {
     New(crate::commands::capsule::new::NewArgs),
     /// Install a capsule from a local path or registry.
     ///
-    /// Capsules are deployed once and shared across every principal —
-    /// per-invocation isolation comes from the kernel's caller-context
-    /// scoping (KV namespace, home, secrets, log, quotas), not from
-    /// duplicating the WASM. There is intentionally no per-agent
-    /// install: an agent says "I use capsule X" and the kernel routes
-    /// their invocations into the already-loaded instance.
+    /// Capsule artifact bytes are content-addressed under the Astrid home, but
+    /// principal access is not shared. A principal can only see or invoke
+    /// capsules explicitly listed on its profile, and env/secrets/KV remain
+    /// caller-scoped.
     Install {
         /// Capsule source (local path or package name)
         source: String,

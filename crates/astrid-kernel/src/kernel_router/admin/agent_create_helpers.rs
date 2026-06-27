@@ -22,7 +22,7 @@ use tracing::info;
 
 use super::handlers::{
     AGENT_IDENTITY_PLATFORM, err_bad_input, err_internal, err_profile, principal_profile_path,
-    require_principal_exists, success_json, sync_principal_furniture,
+    require_principal_exists, success_json,
 };
 
 /// Build, register, and provision a genuinely-new principal.
@@ -105,8 +105,6 @@ pub(super) async fn provision_new_principal(
 
     // Provision the per-principal home tree so per-invocation KV, log,
     // tmp, secrets, audit, and capability tokens have a place to land.
-    // Capsule WASM stays shared (loaded once from the system/default
-    // location); only the principal-scoped data namespaces live here.
     //
     // Fail-closed: if the home tree cannot be created, downstream
     // per-invocation lookups silently fall back to the `default`
@@ -124,11 +122,6 @@ pub(super) async fn provision_new_principal(
             "principal home tree provisioning failed (rolled back): {e}"
         ));
     }
-
-    // Mirror the read-only introspection furniture so this fresh principal's
-    // `system_status` / `list_interfaces` reflect the globally-loaded capsule
-    // set instead of an empty home. Best-effort (see helper docs).
-    sync_principal_furniture(kernel, &principal).await;
 
     // State inheritance is OPT-IN. By default the new principal inherits
     // NOTHING — least privilege, and no silent leak of `default`'s env

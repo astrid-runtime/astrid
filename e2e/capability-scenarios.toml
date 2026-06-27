@@ -34,7 +34,7 @@ deny = ["regular agent cannot install capsules without grant"]
 scenario = "self_capsule_workspace"
 status = "mapped"
 allow = ["self-scoped device can install only into its allowed workspace"]
-deny = ["self-scoped device cannot install system-wide capsules"]
+deny = ["self-scoped device cannot mutate the daemon install target"]
 
 [capabilities."capsule:reload"]
 scenario = "capsule_live_load_lifecycle"
@@ -70,13 +70,25 @@ deny = ["regular agent without global capsule:list gets only its effective surfa
 scenario = "capsule_metadata"
 status = "mapped"
 allow = ["regular agent can list its own effective capsule surface"]
-deny = ["regular agent cannot use self:list to enumerate hidden global metadata"]
+deny = ["regular agent cannot use self:list to enumerate hidden default-principal metadata"]
 
 [capabilities."agent:create"]
 scenario = "principal_crud"
 status = "mapped"
 allow = ["admin can create a temp principal"]
 deny = ["regular agent cannot create principals"]
+
+[capabilities."agent:create:inherit"]
+scenario = "principal_inheritance"
+status = "mapped"
+allow = ["operator with agent:create:inherit can create a new owned principal from an explicit source principal's state"]
+deny = ["operator with only agent:create cannot copy source principal env, KV, or secret state"]
+
+[capabilities."agent:create:clone"]
+scenario = "principal_inheritance"
+status = "mapped"
+allow = ["operator with agent:create:clone can create a new owned principal from an explicit source principal's profile and state"]
+deny = ["operator with only agent:create cannot clone another principal's profile or state"]
 
 [capabilities."agent:delete"]
 scenario = "principal_crud"

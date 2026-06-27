@@ -213,6 +213,20 @@ pub fn required_capability_for_admin_request(
     scope: AuthorityScope,
 ) -> &'static str {
     match (req, scope) {
+        (
+            AdminRequestKind::AgentCreate {
+                clone_from: Some(_),
+                ..
+            },
+            _,
+        ) => "agent:create:clone",
+        (
+            AdminRequestKind::AgentCreate {
+                inherit_from: Some(_),
+                ..
+            },
+            _,
+        ) => "agent:create:inherit",
         (AdminRequestKind::AgentCreate { .. }, _) => "agent:create",
         (AdminRequestKind::AgentDelete { .. }, _) => "agent:delete",
         (AdminRequestKind::AgentEnable { .. }, _) => "agent:enable",

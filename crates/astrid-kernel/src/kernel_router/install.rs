@@ -39,7 +39,7 @@ pub(super) async fn handle_install_capsule(
     if workspace {
         return KernelResponse::Error(
             "workspace installs are CLI-only — the daemon has no meaningful CWD; \
-             use a system install (drop the --workspace flag) instead"
+             use a daemon install (drop the --workspace flag) instead"
                 .to_string(),
         );
     }

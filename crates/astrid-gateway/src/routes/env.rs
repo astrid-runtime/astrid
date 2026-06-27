@@ -258,13 +258,11 @@ fn load_env_schema(capsule_id: &str) -> GatewayResult<HashMap<String, EnvFieldSc
     }
     let home = AstridHome::resolve()
         .map_err(|e| GatewayError::Internal(anyhow::anyhow!("resolve ASTRID_HOME: {e}")))?;
-    // Installed capsules live under the principal's home, not
-    // `$ASTRID_HOME/capsules/` (that path doesn't exist on disk).
-    // Before this, every env schema lookup 404'd for any
-    // user-installed capsule. Capsules today are globally installed
-    // under the default principal — see
-    // `astrid_capsule_install::resolve_target_dir` for the
-    // canonical path resolver. We mirror its non-workspace branch.
+    // Installed capsule manifests live under the local install target, not
+    // `$ASTRID_HOME/capsules/` (that path doesn't exist on disk). This reads
+    // the manifest only after `ensure_capsule_visible` has confirmed the
+    // caller's principal is allowed to see the capsule; it does not grant
+    // visibility to default's capsule set.
     let principal = astrid_core::PrincipalId::default();
     let manifest_path = home
         .principal_home(&principal)

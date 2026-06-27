@@ -569,10 +569,11 @@ pub enum AuthorityScope {
 
 /// Return the authority scope the caller is exercising for `req`.
 ///
-/// A daemon-side capsule install with `workspace = false` mutates the shared
-/// default capsule store, so it is global even though the request has no
-/// explicit target principal. Workspace installs remain self-scoped; the daemon
-/// rejects them later because it has no meaningful current workspace.
+/// A daemon-side capsule install with `workspace = false` mutates the daemon's
+/// configured install target, so it requires the global install capability even
+/// though it does not grant any principal visibility by itself. Workspace
+/// installs remain self-scoped; the daemon rejects them later because it has no
+/// meaningful current workspace.
 #[must_use]
 pub fn resolve_scope(req: &KernelRequest, _caller: &PrincipalId) -> AuthorityScope {
     match req {

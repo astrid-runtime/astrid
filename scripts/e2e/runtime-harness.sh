@@ -69,17 +69,34 @@ trap cleanup EXIT INT TERM
 note() { printf '\n==> %s\n' "$*"; }
 fail() { printf 'error: %s\n' "$*" >&2; exit 1; }
 run_cli() {
+  local stdout stderr status
+  stdout="$(mktemp "$ARTIFACTS/cli-stdout.XXXXXX")"
+  stderr="$(mktemp "$ARTIFACTS/cli-stderr.XXXXXX")"
   printf '$ astrid %s\n' "$*" >> "$ARTIFACTS/cli-transcript.log"
-  "$CORE_DIR/target/debug/astrid" "$@" \
-    > >(tee -a "$ARTIFACTS/cli-transcript.log") \
-    2> >(tee -a "$ARTIFACTS/cli-transcript.log" >&2)
+  set +e
+  "$CORE_DIR/target/debug/astrid" "$@" >"$stdout" 2>"$stderr"
+  status=$?
+  set -e
+  tee -a "$ARTIFACTS/cli-transcript.log" < "$stdout"
+  tee -a "$ARTIFACTS/cli-transcript.log" < "$stderr" >&2
+  rm -f "$stdout" "$stderr"
+  return "$status"
 }
 run_principal_cli() {
-  local principal=$1; shift
+  local principal=$1
+  local stdout stderr status
+  shift
+  stdout="$(mktemp "$ARTIFACTS/cli-stdout.XXXXXX")"
+  stderr="$(mktemp "$ARTIFACTS/cli-stderr.XXXXXX")"
   printf '$ astrid --principal %s %s\n' "$principal" "$*" >> "$ARTIFACTS/cli-transcript.log"
-  "$CORE_DIR/target/debug/astrid" --principal "$principal" "$@" \
-    > >(tee -a "$ARTIFACTS/cli-transcript.log") \
-    2> >(tee -a "$ARTIFACTS/cli-transcript.log" >&2)
+  set +e
+  "$CORE_DIR/target/debug/astrid" --principal "$principal" "$@" >"$stdout" 2>"$stderr"
+  status=$?
+  set -e
+  tee -a "$ARTIFACTS/cli-transcript.log" < "$stdout"
+  tee -a "$ARTIFACTS/cli-transcript.log" < "$stderr" >&2
+  rm -f "$stdout" "$stderr"
+  return "$status"
 }
 http_status() {
   local method=$1
@@ -286,12 +303,14 @@ scan_redacted_upload() {
   if grep -R --fixed-strings --binary-files=without-match -- "DO_NOT_LEAK" "$REDACTED_UPLOAD" >/dev/null 2>&1; then
     fail "sentinel marker leaked into redacted runtime artifact upload"
   fi
-  for sentinel in "${REDACTION_SENTINELS[@]}"; do
-    [[ -n "$sentinel" ]] || continue
-    if grep -R --fixed-strings --binary-files=without-match -- "$sentinel" "$REDACTED_UPLOAD" >/dev/null 2>&1; then
-      fail "sentinel secret leaked into redacted runtime artifact upload"
-    fi
-  done
+  if ((${#REDACTION_SENTINELS[@]} > 0)); then
+    for sentinel in "${REDACTION_SENTINELS[@]}"; do
+      [[ -n "$sentinel" ]] || continue
+      if grep -R --fixed-strings --binary-files=without-match -- "$sentinel" "$REDACTED_UPLOAD" >/dev/null 2>&1; then
+        fail "sentinel secret leaked into redacted runtime artifact upload"
+      fi
+    done
+  fi
 }
 
 stage_redacted_upload() {
