@@ -264,6 +264,6 @@ waiver = "pair-device redemption is token-authenticated and intentionally bypass
 
 [capabilities."auth:pair"]
 scenario = "pair_device_lifecycle"
-status = "mapped"
+status = "covered"
 allow = ["admin can list and revoke another principal's paired devices"]
 deny = ["regular agent cannot list another principal's devices"]

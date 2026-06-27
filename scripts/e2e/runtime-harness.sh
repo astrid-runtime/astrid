@@ -68,6 +68,7 @@ trap cleanup EXIT INT TERM
 . "$SCRIPT_DIR/runtime-llm-smoke.sh"
 . "$SCRIPT_DIR/runtime-adversarial-smoke.sh"
 . "$SCRIPT_DIR/runtime-grant-smoke.sh"
+. "$SCRIPT_DIR/runtime-auth-smoke.sh"
 . "$SCRIPT_DIR/runtime-audit-smoke.sh"
 . "$SCRIPT_DIR/runtime-concurrency-smoke.sh"
 . "$SCRIPT_DIR/runtime-crash-smoke.sh"
@@ -631,6 +632,7 @@ PY
     "$ARTIFACTS/agent-devices-cross-principal-denied.json")"
   assert_status "agent cross-principal devices read denied" "$status" 403
   run_gateway_quota_write_smoke "$user_principal" "$ops_principal" "$user_bearer" "$(mint_admin_bearer)"
+  run_admin_pair_device_cross_principal_smoke "$user_bearer" "$user_principal" "$(mint_admin_bearer)"
 
   note "checking per-principal capsule env isolation"
   status="$(http_status POST /api/capsules/astrid-capsule-openai-compat/env/model "" \
