@@ -384,6 +384,43 @@ run_adversarial_capsule_smoke() {
   grep -q '"approved":false' "$denial_out" \
     || fail "adversarial approval command did not report denied decision"
 
+  note "checking live approval timeout path"
+  local timeout_sse="$ARTIFACTS/adversarial-approval-timeout-requests.sse"
+  local timeout_out="$ARTIFACTS/adversarial-approval-timeout-cli.txt"
+  curl -sN --max-time 75 \
+    -H "Authorization: Bearer $user_bearer" \
+    "$GATEWAY/api/agent/requests" \
+    > "$timeout_sse" 2>&1 &
+  local timeout_stream_pid=$!
+  wait_for_sse_ready "$timeout_sse" || {
+    terminate_pid "$timeout_stream_pid"
+    cat "$timeout_sse" >&2 2>/dev/null || true
+    fail "approval timeout request stream did not become ready"
+  }
+  bounded_principal_cli "$user_principal" 75 "$timeout_out" \
+    capsule run astrid-capsule-adversarial adversarial-approval &
+  local timeout_cli_pid=$!
+  wait_for_approval_request_id "$timeout_sse" \
+    > "$ARTIFACTS/adversarial-approval-timeout-request-id.txt" || {
+    terminate_pid "$timeout_cli_pid"
+    terminate_pid "$timeout_stream_pid"
+    cat "$timeout_sse" >&2 2>/dev/null || true
+    fail "approval timeout request stream did not forward adversarial approval request"
+  }
+  local timeout_rc=0
+  wait "$timeout_cli_pid" || timeout_rc=$?
+  terminate_pid "$timeout_stream_pid"
+  if [[ "$timeout_rc" -eq 0 ]]; then
+    cat "$timeout_out" >&2 2>/dev/null || true
+    fail "adversarial approval command succeeded without a response"
+  fi
+  if [[ "$timeout_rc" -eq 124 ]]; then
+    cat "$timeout_out" >&2 2>/dev/null || true
+    fail "adversarial approval command exceeded the bounded timeout"
+  fi
+  grep -qi 'timeout' "$timeout_out" \
+    || fail "adversarial approval command did not report a timeout"
+
   note "checking concurrent approval responder correlation"
   local user_race_sse="$ARTIFACTS/adversarial-approval-race-user.sse"
   local ops_race_sse="$ARTIFACTS/adversarial-approval-race-ops.sse"
