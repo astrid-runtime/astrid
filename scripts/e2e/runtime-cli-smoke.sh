@@ -108,7 +108,7 @@ run_cli_semantic_smoke() {
   json_assert_secret_absent "$ARTIFACTS/cli-secret-list-after-delete.json" default e2e_cli_delete_marker
   local capsule_new_parent="$ARTIFACTS/capsule-new"
   mkdir -p "$capsule_new_parent"
-  run_cli capsule new e2e-capsule-smoke --path "$capsule_new_parent"
+  run_cli capsule new e2e-capsule-smoke --path "$capsule_new_parent" < /dev/null
   [[ -f "$capsule_new_parent/e2e-capsule-smoke/Capsule.toml" ]] \
     || fail "capsule new did not write Capsule.toml"
   [[ -f "$capsule_new_parent/e2e-capsule-smoke/src/lib.rs" ]] \
@@ -187,6 +187,136 @@ PY
     2> >(tee -a "$ARTIFACTS/cli-transcript.log" >&2) || true
   sed -n '1,120p' "$ARTIFACTS/cli-doctor.txt" >> "$ARTIFACTS/cli-transcript.log"
   grep -q "ASTRID_HOME" "$ARTIFACTS/cli-doctor.txt" || fail "doctor did not inspect ASTRID_HOME"
+  run_cli_stdin_timeout "cli-chat-eof" 20 --format json chat
+  grep -q "Goodbye" "$ARTIFACTS/cli-chat-eof.out" || fail "chat EOF path did not exit cleanly"
+  run_cli_stdin_timeout "cli-mcp-serve-eof" 20 mcp serve --principal anonymous
+  run_cli_daemon_lifecycle_smoke
+}
+
+run_cli_offline_init_smoke() {
+  local registry_archive=$1
+  local home="$ARTIFACTS/cli-init-home"
+  local cwd="$ARTIFACTS/cli-init-cwd"
+  local distro="$ARTIFACTS/cli-init-distro.toml"
+  mkdir -p "$home/etc" "$cwd"
+  cat > "$distro" <<EOF
+schema-version = 1
+
+[distro]
+id = "e2e"
+name = "E2E"
+version = "0.1.0"
+
+[[capsule]]
+name = "astrid-capsule-registry"
+source = "$registry_archive"
+version = "0.8.0"
+role = "uplink"
+EOF
+  run_isolated_cli "$home" "$cwd" init --distro "$distro" --offline --yes --allow-unsigned \
+    > "$ARTIFACTS/cli-init-offline.txt"
+  grep -q "Installation complete" "$ARTIFACTS/cli-init-offline.txt" \
+    || fail "offline init did not complete"
+  [[ -f "$home/home/default/.config/distro.lock" ]] || fail "offline init did not write Distro.lock"
+  [[ -f "$home/home/default/.local/capsules/astrid-capsule-registry/meta.json" ]] \
+    || fail "offline init did not install registry capsule metadata"
+}
+
+run_cli_distro_seal_smoke() {
+  local registry_archive=$1
+  local distro_dir="$ARTIFACTS/cli-distro-seal"
+  local key="$distro_dir/signing.key"
+  mkdir -p "$distro_dir"
+  cat > "$distro_dir/Distro.toml" <<EOF
+schema-version = 1
+
+[distro]
+id = "e2e-seal"
+name = "E2E Seal"
+version = "0.1.0"
+
+[[capsule]]
+name = "astrid-capsule-registry"
+source = "$registry_archive"
+version = "0.8.0"
+role = "uplink"
+EOF
+  "$PYTHON" - "$key" <<'PY'
+import sys
+open(sys.argv[1], "wb").write(bytes(range(32)))
+PY
+  assert_cli_exit_contains "cli-distro-seal-local-source" 1 \
+    "seal can only resolve GitHub-backed capsule sources" \
+    distro seal "$distro_dir/Distro.toml" --output "$distro_dir/e2e.shuttle" --key "$key"
+}
+
+run_cli_daemon_lifecycle_smoke() {
+  local home="$ARTIFACTS/cli-daemon-home"
+  local cwd="$ARTIFACTS/cli-daemon-cwd"
+  mkdir -p "$home/etc" "$cwd"
+  run_isolated_cli "$home" "$cwd" start > "$ARTIFACTS/cli-daemon-start.txt"
+  grep -Eq "started|already running" "$ARTIFACTS/cli-daemon-start.txt" \
+    || fail "isolated daemon start did not report running state"
+  run_isolated_cli "$home" "$cwd" status > "$ARTIFACTS/cli-daemon-status.txt"
+  grep -q "Astrid daemon" "$ARTIFACTS/cli-daemon-status.txt" \
+    || fail "isolated daemon status missed running daemon"
+  run_isolated_cli "$home" "$cwd" restart > "$ARTIFACTS/cli-daemon-restart.txt"
+  run_isolated_cli "$home" "$cwd" status > "$ARTIFACTS/cli-daemon-status-after-restart.txt"
+  grep -q "Astrid daemon" "$ARTIFACTS/cli-daemon-status-after-restart.txt" \
+    || fail "isolated daemon restart did not leave daemon running"
+  run_isolated_cli "$home" "$cwd" stop > "$ARTIFACTS/cli-daemon-stop.txt"
+  local stopped=0
+  for _ in {1..20}; do
+    run_isolated_cli "$home" "$cwd" status > "$ARTIFACTS/cli-daemon-status-stopped.txt"
+    if grep -q "No Astrid daemon is running" "$ARTIFACTS/cli-daemon-status-stopped.txt"; then
+      stopped=1
+      break
+    fi
+    sleep 0.25
+  done
+  [[ "$stopped" -eq 1 ]] || fail "isolated daemon stop did not clear running status"
+}
+
+run_isolated_cli() {
+  local home=$1 cwd=$2
+  shift 2
+  printf '$ ASTRID_HOME=%s astrid %s\n' "$home" "$*" >> "$ARTIFACTS/cli-transcript.log"
+  (
+    cd "$cwd"
+    env ASTRID_HOME="$home" HOME="$POISON_HOME" "$CORE_DIR/target/debug/astrid" "$@" < /dev/null
+  ) > >(tee -a "$ARTIFACTS/cli-transcript.log") \
+    2> >(tee -a "$ARTIFACTS/cli-transcript.log" >&2)
+}
+
+run_cli_stdin_timeout() {
+  local label=$1 timeout=$2
+  shift 2
+  printf '$ astrid %s < /dev/null\n' "$*" >> "$ARTIFACTS/cli-transcript.log"
+  "$PYTHON" - "$CORE_DIR/target/debug/astrid" "$ARTIFACTS/$label.out" \
+    "$ARTIFACTS/$label.err" "$timeout" "$@" <<'PY'
+import os
+import subprocess
+import sys
+
+binary, stdout_path, stderr_path, timeout_s, *args = sys.argv[1:]
+with open(stdout_path, "wb") as stdout, open(stderr_path, "wb") as stderr:
+    try:
+        proc = subprocess.run(
+            [binary, *args],
+            input=b"",
+            stdout=stdout,
+            stderr=stderr,
+            timeout=float(timeout_s),
+            env=os.environ.copy(),
+            check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise SystemExit(f"command timed out after {timeout_s}s: {args!r}") from exc
+if proc.returncode != 0:
+    raise SystemExit(f"command returned {proc.returncode}: {args!r}")
+PY
+  tee -a "$ARTIFACTS/cli-transcript.log" < "$ARTIFACTS/$label.out"
+  tee -a "$ARTIFACTS/cli-transcript.log" < "$ARTIFACTS/$label.err" >&2
 }
 
 assert_cli_deferred() {

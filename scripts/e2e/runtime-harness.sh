@@ -378,6 +378,8 @@ main() {
   run_cli capsule build "$CAPSULES_DIR/astrid-capsule-registry" --output "$capsule_dist"
   local registry_archive="$capsule_dist/astrid-capsule-registry.capsule"
   [[ -f "$registry_archive" ]] || fail "registry .capsule artifact was not built at $registry_archive"
+  run_cli_offline_init_smoke "$registry_archive"
+  run_cli_distro_seal_smoke "$registry_archive"
 
   note "starting fake OpenAI-compatible server"
   local fake_port_file="$ARTIFACTS/fake-openai.port"

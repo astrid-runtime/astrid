@@ -10,7 +10,7 @@
 
 [commands."chat"]
 scenario = "prompt_fake_openai_compat"
-status = "mapped"
+status = "covered"
 mode = "interactive"
 principal = "agent"
 
@@ -463,7 +463,7 @@ principal = "agent"
 
 [commands."mcp serve"]
 scenario = "mcp_bounded_smoke"
-status = "mapped"
+status = "covered"
 mode = "long_running"
 principal = "agent"
 
@@ -489,13 +489,14 @@ reason = "Remote distro update requires network release state; CI covers local l
 
 [commands."distro seal"]
 scenario = "distro_lifecycle"
-status = "mapped"
-mode = "filesystem"
+status = "covered"
+mode = "bounded_failure"
 principal = "local_cli"
+reason = "The current seal resolver only accepts GitHub-backed capsule sources; the harness asserts that local archive sources fail before any network fetch."
 
 [commands."init"]
 scenario = "distro_onboarding"
-status = "mapped"
+status = "covered"
 mode = "filesystem"
 principal = "local_cli"
 
@@ -526,7 +527,7 @@ principal = "local_cli"
 
 [commands."start"]
 scenario = "daemon_lifecycle"
-status = "mapped"
+status = "covered"
 mode = "process"
 principal = "local_cli"
 
@@ -538,13 +539,13 @@ principal = "local_cli"
 
 [commands."stop"]
 scenario = "daemon_lifecycle"
-status = "mapped"
+status = "covered"
 mode = "process"
 principal = "local_cli"
 
 [commands."restart"]
 scenario = "daemon_lifecycle"
-status = "mapped"
+status = "covered"
 mode = "process"
 principal = "local_cli"
 
