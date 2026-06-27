@@ -420,6 +420,65 @@ async fn request_approval_stamps_principal_and_ignores_wrong_responder() {
     assert_eq!(response.decision, ApprovalDecision::Approved);
 }
 
+#[tokio::test]
+async fn request_approval_accepts_same_principal_deny() {
+    use crate::engine::wasm::test_fixtures::minimal_host_state;
+
+    let mut state = minimal_host_state(tokio::runtime::Handle::current());
+    let bus = state.event_bus.clone();
+    let request_rx = bus.subscribe_topic(Topic::approval_request().as_str());
+
+    let approval_handle = tokio::task::spawn_blocking(move || {
+        let result = <HostState as approval::Host>::request_approval(
+            &mut state,
+            approval_request("delete", "delete workspace"),
+        );
+        (result, state)
+    });
+
+    let (request_id, request_principal) = await_approval_request(request_rx).await;
+    publish_approval_reply(&bus, &request_id, request_principal.as_deref(), "deny");
+
+    let (result, _state) = approval_handle.await.expect("approval thread joined");
+    let response = result.expect("matching deny response should be accepted");
+    assert_eq!(response.decision, ApprovalDecision::Denied);
+}
+
+#[tokio::test]
+async fn request_approval_cancel_token_unblocks_wait() {
+    use crate::engine::wasm::test_fixtures::minimal_host_state;
+
+    let mut state = minimal_host_state(tokio::runtime::Handle::current());
+    let cancel = state.cancel_token.clone();
+    let request_rx = state
+        .event_bus
+        .subscribe_topic(Topic::approval_request().as_str());
+
+    let approval_handle = tokio::task::spawn_blocking(move || {
+        let result = <HostState as approval::Host>::request_approval(
+            &mut state,
+            approval_request("delete", "delete workspace"),
+        );
+        (result, state)
+    });
+
+    let (_request_id, request_principal) = await_approval_request(request_rx).await;
+    assert_eq!(request_principal.as_deref(), Some("default"));
+
+    let start = std::time::Instant::now();
+    cancel.cancel();
+    let (result, _state) = approval_handle.await.expect("approval thread joined");
+
+    assert!(
+        matches!(result, Err(ErrorCode::Timeout)),
+        "expected timeout after cancellation, got {result:?}"
+    );
+    assert!(
+        start.elapsed() < std::time::Duration::from_secs(5),
+        "cancellation should unblock approval promptly"
+    );
+}
+
 // --- sanitize_action_for_pattern tests ---
 
 #[test]
