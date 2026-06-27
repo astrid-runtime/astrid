@@ -413,12 +413,14 @@ assert_principal_cli_failure() {
   set +e
   "$CORE_DIR/target/debug/astrid" --principal "$principal" "$@" >"$stdout" 2>"$stderr"
   status=$?
-  set -e
   tee -a "$ARTIFACTS/cli-transcript.log" < "$stdout"
   tee -a "$ARTIFACTS/cli-transcript.log" < "$stderr" >&2
   if [[ "$status" -eq 0 ]]; then
+    set -e
     fail "$label unexpectedly succeeded"
   fi
+  set -e
+  return 0
 }
 
 json_assert_cli_agent_list() {
