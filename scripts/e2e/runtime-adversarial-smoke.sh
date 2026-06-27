@@ -520,6 +520,55 @@ run_adversarial_capsule_smoke() {
     || fail "operator concurrent approval command did not report denied decision"
 }
 
+run_live_approval_cancel_smoke() {
+  local user_bearer=$1
+  local user_principal=$2
+  local status
+  local sse="$ARTIFACTS/adversarial-approval-cancel-requests.sse"
+  local out="$ARTIFACTS/adversarial-approval-cancel-cli.txt"
+
+  note "checking live approval cancellation on capsule unload"
+  curl -sN --max-time 20 \
+    -H "Authorization: Bearer $user_bearer" \
+    "$GATEWAY/api/agent/requests" \
+    > "$sse" 2>&1 &
+  local stream_pid=$!
+  wait_for_sse_ready "$sse" || {
+    terminate_pid "$stream_pid"
+    cat "$sse" >&2 2>/dev/null || true
+    fail "approval cancel request stream did not become ready"
+  }
+  bounded_principal_cli "$user_principal" 12 "$out" \
+    capsule run astrid-capsule-adversarial adversarial-approval &
+  local cli_pid=$!
+  wait_for_approval_request_id "$sse" > "$ARTIFACTS/adversarial-approval-cancel-request-id.txt" || {
+    terminate_pid "$cli_pid"
+    terminate_pid "$stream_pid"
+    cat "$sse" >&2 2>/dev/null || true
+    fail "approval cancel request stream did not forward adversarial approval request"
+  }
+
+  run_cli capsule remove astrid-capsule-adversarial --force
+  terminate_pid "$stream_pid"
+
+  local cancel_rc=0
+  wait "$cli_pid" || cancel_rc=$?
+  if [[ "$cancel_rc" -eq 0 ]]; then
+    cat "$out" >&2 2>/dev/null || true
+    fail "adversarial approval command succeeded after capsule unload cancellation"
+  fi
+  if [[ "$cancel_rc" -eq 124 ]]; then
+    cat "$out" >&2 2>/dev/null || true
+    fail "adversarial approval command hung after capsule unload cancellation"
+  fi
+
+  status="$(http_status GET /api/capsules "$user_bearer" "" \
+    "$ARTIFACTS/adversarial-approval-cancel-capsules.json")"
+  assert_status "adversarial capsule list after live cancel remove" "$status" 200
+  json_assert_capsule_list_state "$ARTIFACTS/adversarial-approval-cancel-capsules.json" \
+    astrid-capsule-adversarial absent
+}
+
 run_adversarial_principal_smoke() {
   local user_bearer=$1
   local user_principal=$2

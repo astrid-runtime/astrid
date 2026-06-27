@@ -588,17 +588,28 @@ impl Kernel {
         // Arc::get_mut requires exclusive ownership (strong_count == 1).
         {
             let mut old = old_capsule;
-            if let Some(capsule) = std::sync::Arc::get_mut(&mut old) {
-                if let Err(e) = capsule.unload().await {
-                    tracing::warn!(
-                        capsule_id = %id,
-                        error = %e,
-                        "Capsule unload failed during restart"
-                    );
+            old.request_cancel();
+            let mut unloaded = false;
+            for retry in 0..20_u32 {
+                if let Some(capsule) = std::sync::Arc::get_mut(&mut old) {
+                    if let Err(e) = capsule.unload().await {
+                        tracing::warn!(
+                            capsule_id = %id,
+                            error = %e,
+                            "Capsule unload failed during restart"
+                        );
+                    }
+                    unloaded = true;
+                    break;
                 }
-            } else {
+                if retry < 19 {
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                }
+            }
+            if !unloaded {
                 tracing::warn!(
                     capsule_id = %id,
+                    strong_count = std::sync::Arc::strong_count(&old),
                     "Cannot call unload during restart - Arc still held by in-flight task"
                 );
             }
@@ -944,17 +955,28 @@ impl Kernel {
         // exclusive ownership (strong_count == 1).
         {
             let mut old = old_capsule;
-            if let Some(capsule) = std::sync::Arc::get_mut(&mut old) {
-                if let Err(e) = capsule.unload().await {
-                    tracing::warn!(
-                        capsule_id = %id,
-                        error = %e,
-                        "Capsule unload failed during unload request"
-                    );
+            old.request_cancel();
+            let mut unloaded = false;
+            for retry in 0..20_u32 {
+                if let Some(capsule) = std::sync::Arc::get_mut(&mut old) {
+                    if let Err(e) = capsule.unload().await {
+                        tracing::warn!(
+                            capsule_id = %id,
+                            error = %e,
+                            "Capsule unload failed during unload request"
+                        );
+                    }
+                    unloaded = true;
+                    break;
                 }
-            } else {
+                if retry < 19 {
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                }
+            }
+            if !unloaded {
                 tracing::warn!(
                     capsule_id = %id,
+                    strong_count = std::sync::Arc::strong_count(&old),
                     "Cannot call unload - Arc still held by in-flight task"
                 );
             }
@@ -1120,6 +1142,7 @@ impl Kernel {
             let id = arc.id().clone();
             let mut unloaded = false;
 
+            arc.request_cancel();
             for retry in 0..20_u32 {
                 if let Some(capsule) = Arc::get_mut(&mut arc) {
                     if let Err(e) = capsule.unload().await {
@@ -2336,6 +2359,95 @@ async fn apply_single_identity_link(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::Ordering;
+
+    use astrid_capsule::capsule::{Capsule, CapsuleId, CapsuleState};
+    use astrid_capsule::context::CapsuleContext;
+    use astrid_capsule::error::CapsuleResult;
+    use astrid_capsule::manifest::CapsuleManifest;
+
+    struct CancellableTestCapsule {
+        id: CapsuleId,
+        manifest: CapsuleManifest,
+        cancelled: Arc<AtomicBool>,
+        unloaded: Arc<AtomicBool>,
+    }
+
+    #[async_trait::async_trait]
+    impl Capsule for CancellableTestCapsule {
+        fn id(&self) -> &CapsuleId {
+            &self.id
+        }
+
+        fn manifest(&self) -> &CapsuleManifest {
+            &self.manifest
+        }
+
+        fn state(&self) -> CapsuleState {
+            CapsuleState::Ready
+        }
+
+        async fn load(&mut self, _ctx: &CapsuleContext) -> CapsuleResult<()> {
+            Ok(())
+        }
+
+        async fn unload(&mut self) -> CapsuleResult<()> {
+            self.unloaded.store(true, Ordering::Relaxed);
+            Ok(())
+        }
+
+        fn request_cancel(&self) {
+            self.cancelled.store(true, Ordering::Relaxed);
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn unload_requests_cancel_before_waiting_for_exclusive_capsule() {
+        let (_d, home) = scratch_home();
+        let kernel = test_kernel_with_home(home).await;
+        let id = CapsuleId::new("cancellable-test").unwrap();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let unloaded = Arc::new(AtomicBool::new(false));
+
+        {
+            let mut registry = kernel.capsules.write().await;
+            registry
+                .register(Box::new(CancellableTestCapsule {
+                    id: id.clone(),
+                    manifest: CapsuleManifest::default(),
+                    cancelled: Arc::clone(&cancelled),
+                    unloaded: Arc::clone(&unloaded),
+                }))
+                .unwrap();
+        }
+
+        let held = {
+            let registry = kernel.capsules.read().await;
+            registry.get(&id).expect("registered capsule")
+        };
+        let release_after_cancel = {
+            let cancelled = Arc::clone(&cancelled);
+            tokio::spawn(async move {
+                while !cancelled.load(Ordering::Relaxed) {
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                }
+                drop(held);
+            })
+        };
+
+        let removed = kernel.unload_one_capsule(&id).await.unwrap();
+        release_after_cancel.await.unwrap();
+
+        assert!(removed);
+        assert!(
+            cancelled.load(Ordering::Relaxed),
+            "unload must request cancellation before exclusive unload is available"
+        );
+        assert!(
+            unloaded.load(Ordering::Relaxed),
+            "unload should complete once the in-flight holder releases its Arc"
+        );
+    }
 
     #[test]
     fn test_load_or_generate_creates_new_key() {

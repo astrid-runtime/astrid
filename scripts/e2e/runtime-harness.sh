@@ -897,6 +897,7 @@ PY
   json_assert_session_messages_empty "$ARTIFACTS/restart-agent-cross-session-messages-empty.json" "$ops_session"
   run_crash_recovery_smoke "$restart_user_bearer" "$ops_bearer" "$user_principal" \
     "$user_session" "$ops_session"
+  run_live_approval_cancel_smoke "$restart_user_bearer" "$user_principal"
 
   note "checking .capsule artifact lifecycle"
   run_cli capsule remove astrid-capsule-registry --force

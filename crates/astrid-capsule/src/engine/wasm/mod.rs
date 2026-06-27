@@ -1936,6 +1936,12 @@ impl ExecutionEngine for WasmEngine {
         Ok(())
     }
 
+    fn request_cancel(&self) {
+        if let Some(token) = &self.cancel_token {
+            token.cancel();
+        }
+    }
+
     async fn wait_ready(&self, timeout: std::time::Duration) -> crate::capsule::ReadyStatus {
         use crate::capsule::ReadyStatus;
 

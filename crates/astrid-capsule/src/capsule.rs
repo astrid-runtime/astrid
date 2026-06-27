@@ -183,6 +183,14 @@ pub trait Capsule: Send + Sync {
     /// Unload the capsule, terminating all of its execution engines.
     async fn unload(&mut self) -> CapsuleResult<()>;
 
+    /// Request cooperative cancellation before exclusive unload is available.
+    ///
+    /// In-flight dispatcher tasks can hold `Arc<dyn Capsule>` clones, which
+    /// prevents callers from obtaining `&mut self` for `unload`. This hook lets
+    /// engines interrupt blocking host calls first so those tasks can release
+    /// their references and the normal unload path can finish.
+    fn request_cancel(&self) {}
+
     /// Extract the inbound receiver for uplink messages.
     /// This is typically called exactly once by the OS router after loading.
     fn take_inbound_rx(
@@ -315,6 +323,12 @@ impl Capsule for CompositeCapsule {
         }
         self.state = CapsuleState::Unloaded;
         Ok(())
+    }
+
+    fn request_cancel(&self) {
+        for engine in &self.engines {
+            engine.request_cancel();
+        }
     }
 
     async fn wait_ready(&self, timeout: std::time::Duration) -> ReadyStatus {
