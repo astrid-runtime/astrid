@@ -99,24 +99,25 @@ remaining = []
 
 [waiters.grant_on_use]
 owner = "kernel grant-on-use handler"
-status = "covered"
+status = "mapped"
 request = "kernel-origin grant_required approval request"
 response = "IpcPayload::ApprovalResponse on astrid.v1.approval.response.{request_id}"
 correlation = ["request_id", "principal captured from kernel-origin request", "capsule id captured from kernel-origin request"]
 timeout = "same approval timeout budget as host approval"
 cancel = "short-lived awaiter task releases its in-flight permit on response, timeout, or panic"
-runtime_coverage = [
-  "gate miss forwards grant_required on the principal-scoped request stream",
-  "same-principal deny leaves the capsule hidden",
-  "same-principal approve grants the capsule and a follow-up command executes",
-]
+runtime_coverage = []
 unit_coverage = [
+  "dispatcher gate miss emits kernel-origin grant_required for authenticated ungranted non-admin calls",
+  "admin and anonymous gate misses do not emit grant_required",
+  "gateway forwards only principal-matched nil-source grant_required requests",
   "non-kernel grant_required ignored",
   "deny and timeout do not grant",
   "unknown request id does not grant",
   "response cannot supply or spoof grant target",
 ]
-remaining = []
+remaining = [
+  "public CLI hidden-command path fails closed during command discovery before dispatch, so the current runtime harness has no live public trigger for grant_required request-stream deny/approve",
+]
 
 [waiters.local_egress_consent]
 owner = "capsule local egress consent"
