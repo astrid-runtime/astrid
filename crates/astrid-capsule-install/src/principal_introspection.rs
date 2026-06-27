@@ -1,14 +1,14 @@
-//! Explicit helper for mirroring read-only capsule metadata between homes.
+//! Explicit helper for materializing a principal's capsule introspection view.
 //!
-//! This module is retained for callers that explicitly need to copy public
-//! capsule metadata from the install principal's home into another home. The
-//! kernel does not call it during boot or principal creation: `default` is a
-//! principal, not a shared tenant, and fresh principals must not implicitly
-//! receive a copy of its installed-capsule registry.
+//! This module is for callers that explicitly need to expose public capsule
+//! introspection metadata from the install principal's home to another
+//! principal. The kernel does not call it during boot or principal creation:
+//! `default` is a principal, not a shared tenant, and fresh principals must
+//! not implicitly receive a copy of its installed-capsule registry.
 //!
-//! [`mirror_capsule_metadata_from_install_principal`] copies the two read-only mirror
-//! subdirectories from the install principal's home into a target principal's
-//! home when invoked deliberately.
+//! [`materialize_principal_introspection`] copies the two read-only
+//! introspection subdirectories from the install principal's home into a
+//! target principal's home when invoked deliberately.
 //!
 //! ## Security
 //!
@@ -35,7 +35,7 @@ use astrid_core::dirs::AstridHome;
 /// per-principal secrets (API keys) that must never cross principal
 /// boundaries. Idempotent. No-op when `target` is the install principal
 /// (that home is authoritative, not a mirror).
-pub fn mirror_capsule_metadata_from_install_principal(
+pub fn materialize_principal_introspection(
     home: &AstridHome,
     target: &PrincipalId,
 ) -> anyhow::Result<()> {
@@ -161,7 +161,7 @@ mod tests {
         let secret_path = target_home.env_dir().join("secret.env.json");
         write_file(&secret_path, r#"{"API_KEY":"top-secret"}"#);
 
-        mirror_capsule_metadata_from_install_principal(&home, &target).expect("materialize");
+        materialize_principal_introspection(&home, &target).expect("materialize");
 
         // Registry entries mirrored.
         assert_eq!(
@@ -205,7 +205,7 @@ mod tests {
                 .expect("alpha meta before");
 
         // No-op: returns Ok, does not error, does not duplicate or disturb.
-        mirror_capsule_metadata_from_install_principal(&home, &install).expect("noop");
+        materialize_principal_introspection(&home, &install).expect("noop");
 
         let after =
             std::fs::read_to_string(install_home.capsules_dir().join("alpha").join("meta.json"))
@@ -228,8 +228,8 @@ mod tests {
         let target = PrincipalId::new("claude-code").expect("principal id");
         let target_home = home.principal_home(&target);
 
-        mirror_capsule_metadata_from_install_principal(&home, &target).expect("first");
-        mirror_capsule_metadata_from_install_principal(&home, &target).expect("second");
+        materialize_principal_introspection(&home, &target).expect("first");
+        materialize_principal_introspection(&home, &target).expect("second");
 
         // Same end state after two runs: exactly the two seeded entries and
         // the single WIT file.
@@ -253,7 +253,7 @@ mod tests {
         let target = PrincipalId::new("claude-code").expect("principal id");
         let target_home = home.principal_home(&target);
 
-        mirror_capsule_metadata_from_install_principal(&home, &target).expect("first");
+        materialize_principal_introspection(&home, &target).expect("first");
 
         // Authoritative set shrinks: drop `bravo`.
         std::fs::remove_dir_all(
@@ -263,7 +263,7 @@ mod tests {
         )
         .expect("remove bravo");
 
-        mirror_capsule_metadata_from_install_principal(&home, &target).expect("re-mirror");
+        materialize_principal_introspection(&home, &target).expect("re-mirror");
 
         // Mirror reflects the shrink — `bravo` is gone, `alpha` remains.
         assert!(target_home.capsules_dir().join("alpha").exists());
@@ -280,7 +280,7 @@ mod tests {
         let target_home = home.principal_home(&target);
 
         // Must not error even though the source mirror dirs don't exist.
-        mirror_capsule_metadata_from_install_principal(&home, &target).expect("empty ok");
+        materialize_principal_introspection(&home, &target).expect("empty ok");
 
         assert!(!target_home.capsules_dir().exists());
         assert!(!target_home.root().join("wit").exists());
