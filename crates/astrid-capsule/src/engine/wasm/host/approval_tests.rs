@@ -315,6 +315,38 @@ async fn approval_wait_times_out_after_wrong_principal_reply() {
     );
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn approval_wait_mismatch_flood_does_not_extend_deadline() {
+    let bus = astrid_events::EventBus::with_capacity(128);
+    let request_id = "approval-mismatch-flood";
+    let mut rx = bus.subscribe_topic(Topic::approval_response(request_id).as_str());
+
+    let pub_bus = bus.clone();
+    let publisher = tokio::spawn(async move {
+        for _ in 0..50 {
+            publish_approval_reply(&pub_bus, request_id, Some("agent-bob"), "approve");
+            tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+        }
+    });
+
+    let budget = std::time::Duration::from_millis(150);
+    let start = std::time::Instant::now();
+    let result =
+        await_matching_approval_response(&mut rx, "agent-alice", "test", request_id, budget).await;
+    let elapsed = start.elapsed();
+
+    publisher.abort();
+
+    assert!(
+        result.is_none(),
+        "wrong-principal approval flood must not satisfy the waiter"
+    );
+    assert!(
+        elapsed < budget * 5,
+        "wrong-principal approval flood must not extend the deadline; took {elapsed:?}"
+    );
+}
+
 #[tokio::test]
 async fn approval_wait_ignores_wrong_principal_then_accepts_matching_reply() {
     let bus = astrid_events::EventBus::with_capacity(64);
