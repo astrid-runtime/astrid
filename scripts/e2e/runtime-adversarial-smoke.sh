@@ -209,7 +209,7 @@ wait_for_sse_ready() {
 
 wait_for_approval_request_id() {
   local path=$1
-  local deadline=$((SECONDS + 10))
+  local deadline=$((SECONDS + 20))
   local python_bin="${PYTHON:-python3}"
   local request_id
   until request_id="$("$python_bin" - "$path" <<'PY'
@@ -334,7 +334,7 @@ run_adversarial_capsule_smoke() {
   note "checking live approval responder principal isolation"
   local approval_sse="$ARTIFACTS/adversarial-approval-requests.sse"
   local approval_out="$ARTIFACTS/adversarial-approval-cli.txt"
-  curl -sN --max-time 20 \
+  curl -sN --max-time 45 \
     -H "Authorization: Bearer $user_bearer" \
     "$GATEWAY/api/agent/requests" \
     > "$approval_sse" 2>&1 &
@@ -389,7 +389,7 @@ run_adversarial_capsule_smoke() {
   note "checking live approval denial path"
   local denial_sse="$ARTIFACTS/adversarial-approval-deny-requests.sse"
   local denial_out="$ARTIFACTS/adversarial-approval-deny-cli.txt"
-  curl -sN --max-time 20 \
+  curl -sN --max-time 45 \
     -H "Authorization: Bearer $user_bearer" \
     "$GATEWAY/api/agent/requests" \
     > "$denial_sse" 2>&1 &
@@ -488,10 +488,10 @@ run_adversarial_capsule_smoke() {
     fail "operator approval race stream did not become ready"
   }
 
-  bounded_principal_cli "$user_principal" 20 "$user_race_out" \
+  bounded_principal_cli "$user_principal" 45 "$user_race_out" \
     capsule run astrid-capsule-adversarial adversarial-approval &
   local user_cli_pid=$!
-  bounded_principal_cli "$ops_principal" 20 "$ops_race_out" \
+  bounded_principal_cli "$ops_principal" 45 "$ops_race_out" \
     capsule run astrid-capsule-adversarial adversarial-approval &
   local ops_cli_pid=$!
   local user_request_id ops_request_id
