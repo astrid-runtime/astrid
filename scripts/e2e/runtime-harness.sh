@@ -432,6 +432,7 @@ EOF
   for capsule in $CORE_CAPSULES; do
     run_cli capsule install "$CAPSULES_DIR/$capsule"
   done
+  run_cli capsule install "$CORE_DIR/e2e/fixtures/astrid-capsule-adversarial"
 
   note "configuring openai-compat for fake endpoint"
   local sentinel="ASTRID_E2E_SECRET_DO_NOT_LEAK_$RANDOM$RANDOM"
@@ -508,7 +509,8 @@ EOF
     --add-capsule astrid-capsule-identity \
     --add-capsule astrid-capsule-prompt-builder \
     --add-capsule astrid-capsule-react \
-    --add-capsule astrid-capsule-openai-compat
+    --add-capsule astrid-capsule-openai-compat \
+    --add-capsule astrid-capsule-adversarial
   )
   run_cli agent modify "$user_principal" "${prompt_capsules[@]}"
   run_cli agent modify "$ops_principal" "${prompt_capsules[@]}"
@@ -689,6 +691,7 @@ PY
     astrid-capsule-openai-compat api_key
   run_adversarial_principal_smoke "$user_bearer" "$user_principal" \
     "$ops_bearer" "$ops_principal" "$user_secret"
+  run_adversarial_capsule_smoke "$user_bearer" "$user_principal"
   run_cli_semantic_smoke "$user_principal" "$ops_principal"
 
   curl -sN --max-time 3 \

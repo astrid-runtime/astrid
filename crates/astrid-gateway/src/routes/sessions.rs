@@ -9,21 +9,23 @@
 //! 3. Publishes the request, principal-stamped, on the verb's request
 //!    topic.
 //! 4. Awaits one reply on a route scoped to the caller principal, then
-//!    verifies the body correlation.
+//!    verifies the responder source and body correlation.
 //!
 //! ## Trust boundary
 //!
-//! The principal stamp is the *only* authority. The kernel scopes
+//! The principal stamp is the caller authority. The kernel scopes
 //! capsule-session's KV reads to the stamped principal's namespace, so
-//! a caller only ever sees their own threads. We stamp
-//! `caller.principal` (and `caller.device_key_id` when the bearer is
-//! device-scoped, exactly as `bus_admin.rs` does) on every outbound
-//! request. The path `{id}` and every query param are payload data —
-//! they NEVER substitute for the principal and NEVER reach a topic
-//! segment (the response topic is keyed on the gateway-generated
-//! `correlation_id`, not on caller input), so a malicious `id` cannot
-//! cross into another principal's namespace or hijack another request's
-//! reply.
+//! a caller only ever sees their own threads. The response authority is
+//! the kernel-stamped capsule `source_id`: a different capsule may
+//! declare the same response topic, but its reply is ignored unless it
+//! came from `astrid-capsule-session`. We stamp `caller.principal` (and
+//! `caller.device_key_id` when the bearer is device-scoped, exactly as
+//! `bus_admin.rs` does) on every outbound request. The path `{id}` and
+//! every query param are payload data — they NEVER substitute for the
+//! principal and never reach a topic segment (the response topic is
+//! keyed on the gateway-generated `correlation_id`, not on caller
+//! input), so a malicious `id` cannot cross into another principal's
+//! namespace or hijack another request's reply.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -62,6 +64,14 @@ const MAX_SESSION_ID_LEN: usize = 256;
 /// `bus_admin.rs`'s default so the operator sees consistent behaviour
 /// across bus-proxied endpoints.
 const CAPSULE_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Capsule package that owns the session request/reply contract.
+const SESSION_CAPSULE_ID: &str = "astrid-capsule-session";
+
+/// Stable namespace used by the WASM engine to derive kernel-stamped capsule
+/// source UUIDs from package names. Keep in sync with
+/// `astrid-capsule::engine::wasm`.
+const CAPSULE_ID_NAMESPACE: Uuid = Uuid::from_u128(0x310714d5_9c6d_4c94_8187_75258f393bb6);
 
 /// Request topic the gateway publishes a session-list request on. Its
 /// presence in a loaded capsule's interceptor events is also the
@@ -889,14 +899,19 @@ fn parse_search_response(value: Value) -> GatewayResult<SearchResponse> {
     })
 }
 
+fn session_capsule_source_id() -> Uuid {
+    Uuid::new_v5(&CAPSULE_ID_NAMESPACE, SESSION_CAPSULE_ID.as_bytes())
+}
+
 /// Reusable capsule request/reply-over-bus primitive.
 ///
 /// Subscribes to `response_topic` FIRST (a per-correlation scoped topic,
 /// so no request-id filtering at the subscription layer is needed),
 /// publishes the principal-stamped request on `request_topic`, and
-/// awaits exactly one reply — defensively verifying the reply's
-/// `correlation_id` matches before returning it. Maps a timeout to a
-/// `502`-class (upstream) error and a closed bus to a `500`-class error.
+/// awaits exactly one reply from the session capsule — defensively verifying
+/// the kernel-stamped `source_id` and body `correlation_id` before returning
+/// it. Maps a timeout to a `502`-class (upstream) error and a closed bus to a
+/// `500`-class error.
 ///
 /// `device_key_id` is stamped when present, exactly as `bus_admin.rs`
 /// does, so a device-scoped bearer carries its attenuation floor to the
@@ -944,6 +959,7 @@ async fn request_capsule(
     let deadline = tokio::time::Instant::now()
         .checked_add(timeout)
         .unwrap_or_else(tokio::time::Instant::now);
+    let expected_source_id = session_capsule_source_id();
 
     loop {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
@@ -958,6 +974,9 @@ async fn request_capsule(
         let AstridEvent::Ipc { message, .. } = &*event else {
             continue;
         };
+        if message.source_id != expected_source_id {
+            continue;
+        }
         let Ok(value) = session_reply_payload_json(&message.payload) else {
             continue;
         };

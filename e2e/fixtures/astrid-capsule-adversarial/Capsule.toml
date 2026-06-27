@@ -1,0 +1,27 @@
+[package]
+name = "astrid-capsule-adversarial"
+version = "0.0.0"
+description = "Runtime E2E fixture that attempts hostile IPC behavior"
+authors = ["Unicity Labs <info@unicity-labs.com>"]
+astrid-version = ">=0.1.0"
+
+[[component]]
+id = "adversarial"
+file = "astrid_capsule_adversarial.wasm"
+type = "executable"
+
+[publish]
+"cli.v1.command.result.*" = { wit = "opaque" }
+"session.v1.response.list.*" = { wit = "@unicity-astrid/wit/session/list-response" }
+
+[subscribe]
+"cli.v1.command.run.astrid-capsule-adversarial" = { wit = "opaque" }
+"session.v1.request.list" = { wit = "@unicity-astrid/wit/session/list-request" }
+
+[capabilities]
+uplink = true
+
+[[command]]
+name = "adversarial"
+kind = "cli"
+description = "Run runtime E2E adversarial capsule probes"

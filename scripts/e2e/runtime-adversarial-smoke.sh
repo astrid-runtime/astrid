@@ -130,6 +130,50 @@ for principal in (inherited, cloned):
 PY
 }
 
+json_assert_adversarial_probe_report() {
+  local path=$1
+  "$PYTHON" - "$path" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+data = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+expected = {
+    "undeclared_publish_denied": True,
+    "undeclared_subscribe_denied": True,
+    "invalid_subscribe_denied": True,
+}
+for key, value in expected.items():
+    if data.get(key) is not value:
+        raise SystemExit(f"adversarial probe {key}={data.get(key)!r}, expected {value!r}: {data!r}")
+PY
+}
+
+assert_no_adversarial_session_poison() {
+  local path=$1
+  if grep -q "ASTRID_ADVERSARIAL_POISON_SESSION" "$path"; then
+    cat "$path" >&2 || true
+    fail "adversarial capsule poisoned session list response"
+  fi
+}
+
+run_adversarial_capsule_smoke() {
+  local user_bearer=$1
+  local user_principal=$2
+  local status
+
+  note "checking adversarial capsule host-call denial and response spoofing"
+
+  run_principal_cli "$user_principal" capsule run astrid-capsule-adversarial adversarial \
+    > "$ARTIFACTS/adversarial-capsule-probe.json"
+  json_assert_adversarial_probe_report "$ARTIFACTS/adversarial-capsule-probe.json"
+
+  status="$(http_status GET "/api/agent/sessions?include_archived=true&limit=20" "$user_bearer" "" \
+    "$ARTIFACTS/adversarial-capsule-session-list.json")"
+  assert_status "adversarial capsule session poison ignored" "$status" 200
+  assert_no_adversarial_session_poison "$ARTIFACTS/adversarial-capsule-session-list.json"
+}
+
 run_adversarial_principal_smoke() {
   local user_bearer=$1
   local user_principal=$2

@@ -245,7 +245,7 @@ async fn request_capsule_round_trips_scoped_reply() {
         let mut msg = IpcMessage::new(
             Topic::from_raw(resp_topic.clone()),
             IpcPayload::RawJson(reply),
-            Uuid::nil(),
+            session_capsule_source_id(),
         );
         if let AstridEvent::Ipc { message, .. } = &*event
             && let Some(principal) = &message.principal
@@ -302,7 +302,7 @@ async fn request_capsule_round_trips_custom_json_reply() {
         let mut msg = IpcMessage::new(
             Topic::from_raw(resp_topic.clone()),
             IpcPayload::Custom { data: reply },
-            Uuid::nil(),
+            session_capsule_source_id(),
         );
         if let AstridEvent::Ipc { message, .. } = &*event
             && let Some(principal) = &message.principal
@@ -645,7 +645,7 @@ async fn request_capsule_round_trips_update_reply() {
         let mut msg = IpcMessage::new(
             Topic::from_raw(resp_topic),
             IpcPayload::RawJson(reply),
-            Uuid::nil(),
+            session_capsule_source_id(),
         );
         if let Some(principal) = &message.principal {
             msg = msg.with_principal(principal.clone());
@@ -700,7 +700,7 @@ async fn request_capsule_ignores_wrong_principal_reply() {
         let msg = IpcMessage::new(
             Topic::from_raw(resp_topic),
             IpcPayload::RawJson(reply),
-            Uuid::nil(),
+            session_capsule_source_id(),
         )
         .with_principal("mallory".to_string());
         bus_bg.publish(AstridEvent::Ipc {
@@ -722,6 +722,57 @@ async fn request_capsule_ignores_wrong_principal_reply() {
     )
     .await
     .expect_err("foreign-principal reply must not satisfy the request");
+    assert!(matches!(err, GatewayError::Kernel(_)));
+}
+
+/// A same-principal, same-correlation reply from another capsule is ignored.
+/// Principal and correlation are necessary but not sufficient: the response
+/// must also come from the session capsule's kernel-stamped source id.
+#[tokio::test]
+async fn request_capsule_ignores_wrong_capsule_source_reply() {
+    let bus = Arc::new(EventBus::new());
+    let principal = PrincipalId::new("alice").expect("valid principal");
+    let correlation_id = "corr-want-source";
+    let response_topic = format!("{TOPIC_LIST_RESPONSE_PREFIX}.{correlation_id}");
+
+    let bus_bg = Arc::clone(&bus);
+    let resp_topic = response_topic.clone();
+    tokio::spawn(async move {
+        tokio::task::yield_now().await;
+        let reply = serde_json::json!({
+            "correlation_id": "corr-want-source",
+            "sessions": [{
+                "session_id": "ASTRID_ADVERSARIAL_POISON_SESSION",
+                "message_count": 1
+            }],
+            "next_cursor": null
+        });
+        let wrong_source = Uuid::new_v5(&CAPSULE_ID_NAMESPACE, b"astrid-capsule-adversarial");
+        let msg = IpcMessage::new(
+            Topic::from_raw(resp_topic),
+            IpcPayload::RawJson(reply),
+            wrong_source,
+        )
+        .with_principal("alice".to_string());
+        bus_bg.publish(AstridEvent::Ipc {
+            metadata: EventMetadata::new("test::adversarial-capsule"),
+            message: msg,
+        });
+    });
+
+    let payload = build_list_payload(correlation_id, None, DEFAULT_LIMIT, false);
+    let err = request_capsule(
+        &bus,
+        TOPIC_LIST_REQUEST,
+        &response_topic,
+        payload,
+        correlation_id,
+        &principal,
+        None,
+        Duration::from_millis(150),
+    )
+    .await
+    .expect_err("wrong-source reply must not satisfy the request");
     assert!(matches!(err, GatewayError::Kernel(_)));
 }
 
@@ -750,7 +801,7 @@ async fn request_capsule_ignores_mismatched_correlation() {
         let msg = IpcMessage::new(
             Topic::from_raw(resp_topic),
             IpcPayload::RawJson(reply),
-            Uuid::nil(),
+            session_capsule_source_id(),
         )
         .with_principal("alice".to_string());
         bus_bg.publish(AstridEvent::Ipc {
