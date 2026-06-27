@@ -45,6 +45,12 @@ use crate::error::{ErrorBody, GatewayError, GatewayResult};
 use crate::routes::principals::caller_from;
 use crate::state::GatewayState;
 
+#[path = "sessions_bus.rs"]
+mod sessions_bus;
+use sessions_bus::request_capsule;
+#[cfg(test)]
+use sessions_bus::session_capsule_source_id;
+
 /// Default page size for the session-list endpoint when the caller
 /// omits `limit` (or passes `0`). Bounds the response body for casual
 /// scraping while still covering a typical user's recent threads.
@@ -897,108 +903,6 @@ fn parse_search_response(value: Value) -> GatewayResult<SearchResponse> {
             "session capsule returned an unexpected search shape: {e}"
         ))
     })
-}
-
-fn session_capsule_source_id() -> Uuid {
-    Uuid::new_v5(&CAPSULE_ID_NAMESPACE, SESSION_CAPSULE_ID.as_bytes())
-}
-
-/// Reusable capsule request/reply-over-bus primitive.
-///
-/// Subscribes to `response_topic` FIRST (a per-correlation scoped topic,
-/// so no request-id filtering at the subscription layer is needed),
-/// publishes the principal-stamped request on `request_topic`, and
-/// awaits exactly one reply from the session capsule — defensively verifying
-/// the kernel-stamped `source_id` and body `correlation_id` before returning
-/// it. Maps a timeout to a `502`-class (upstream) error and a closed bus to a
-/// `500`-class error.
-///
-/// `device_key_id` is stamped when present, exactly as `bus_admin.rs`
-/// does, so a device-scoped bearer carries its attenuation floor to the
-/// kernel cap-gate on the way to the capsule.
-#[allow(clippy::too_many_arguments)]
-async fn request_capsule(
-    bus: &EventBus,
-    request_topic: &str,
-    response_topic: &str,
-    payload: Value,
-    correlation_id: &str,
-    principal: &PrincipalId,
-    device_key_id: Option<&str>,
-    timeout: Duration,
-) -> GatewayResult<Value> {
-    // Subscribe FIRST. A fast capsule can publish the reply on the same
-    // task that processed the request — subscribing afterwards races it.
-    // The response topic includes a fresh correlation id. We still validate
-    // the body correlation before returning. The routed scope rejects
-    // replies stamped for any other principal, including owner/default.
-    let principal = principal.to_string();
-    let mut receiver = bus.subscribe_topic_routed_scoped(
-        Uuid::new_v4(),
-        response_topic,
-        "gateway",
-        "gateway::sessions",
-        Some(Some(principal.clone())),
-    );
-
-    let mut msg = IpcMessage::new(
-        Topic::from_raw(request_topic),
-        IpcPayload::RawJson(payload),
-        Uuid::new_v4(),
-    )
-    .with_principal(principal.clone())
-    .with_origin(MessageOrigin::RemoteGateway);
-    if let Some(key_id) = device_key_id {
-        msg = msg.with_device_key_id(key_id.to_string());
-    }
-    bus.publish(AstridEvent::Ipc {
-        metadata: EventMetadata::new("astrid-gateway::sessions"),
-        message: msg,
-    });
-
-    let deadline = tokio::time::Instant::now()
-        .checked_add(timeout)
-        .unwrap_or_else(tokio::time::Instant::now);
-    let expected_source_id = session_capsule_source_id();
-
-    loop {
-        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-        if remaining.is_zero() {
-            return Err(capsule_timeout(response_topic, timeout));
-        }
-        let event = receiver
-            .recv(Some(remaining))
-            .await
-            .ok_or_else(|| capsule_timeout(response_topic, timeout))?;
-
-        let AstridEvent::Ipc { message, .. } = &*event else {
-            continue;
-        };
-        if message.source_id != expected_source_id {
-            continue;
-        }
-        let Ok(value) = session_reply_payload_json(&message.payload) else {
-            continue;
-        };
-        if value.get("correlation_id").and_then(Value::as_str) == Some(correlation_id) {
-            return Ok(value);
-        }
-    }
-}
-
-fn session_reply_payload_json(payload: &IpcPayload) -> GatewayResult<Value> {
-    let bytes = payload
-        .to_guest_bytes()
-        .map_err(|e| GatewayError::Kernel(format!("session capsule returned invalid JSON: {e}")))?;
-    serde_json::from_slice(&bytes)
-        .map_err(|e| GatewayError::Kernel(format!("session capsule returned invalid JSON: {e}")))
-}
-
-fn capsule_timeout(response_topic: &str, timeout: Duration) -> GatewayError {
-    GatewayError::Kernel(format!(
-        "session capsule did not reply within {}s on {response_topic}",
-        timeout.as_secs()
-    ))
 }
 
 #[cfg(test)]
