@@ -758,6 +758,10 @@ run_adversarial_principal_smoke() {
   assert_status "admin group list after patch" "$status" 200
   json_assert_http_group "$ARTIFACTS/adversarial-admin-group-list-after-patch.json" \
     wildcard-e2e system:status
+  status="$(http_status GET /api/sys/groups "$user_bearer" "" \
+    "$ARTIFACTS/adversarial-user-group-list-filtered.json")"
+  assert_status "regular principal group list filtered" "$status" 200
+  json_assert_http_group_names "$ARTIFACTS/adversarial-user-group-list-filtered.json" agent
 
   status="$(http_status POST "/api/sys/principals/$user_principal/caps" "$ops_bearer" \
     '{"capabilities":["system:status"],"unsafe_admin":false}' \
@@ -816,6 +820,21 @@ if not group:
     raise SystemExit(f"group {sys.argv[2]!r} missing: {data!r}")
 if sys.argv[3] not in group.get("capabilities", []):
     raise SystemExit(f"group missing capability {sys.argv[3]!r}: {group!r}")
+PY
+}
+
+json_assert_http_group_names() {
+  local file=$1
+  shift
+  "$PYTHON" - "$file" "$@" <<'PY'
+import json
+import sys
+
+data = json.load(open(sys.argv[1], encoding="utf-8"))
+names = sorted(item.get("name") for item in data.get("groups", []))
+want = sorted(sys.argv[2:])
+if names != want:
+    raise SystemExit(f"unexpected group visibility {names!r}, want {want!r}: {data!r}")
 PY
 }
 

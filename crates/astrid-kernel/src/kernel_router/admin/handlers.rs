@@ -111,7 +111,7 @@ pub(super) async fn dispatch_with_device(
         } => {
             super::group::group_modify(kernel, name, capabilities, description, unsafe_admin).await
         },
-        AdminRequestKind::GroupList => super::group::group_list(kernel),
+        AdminRequestKind::GroupList => super::group::group_list(kernel, caller),
         AdminRequestKind::CapsGrant {
             principal,
             capabilities,

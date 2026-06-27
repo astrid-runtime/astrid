@@ -170,13 +170,13 @@ deny = ["regular agent cannot modify groups"]
 
 [capabilities."group:list"]
 scenario = "group_crud"
-status = "mapped"
+status = "covered"
 allow = ["admin can list all groups"]
 deny = ["regular agent cannot list groups beyond its self-visible membership"]
 
 [capabilities."self:group:list"]
 scenario = "group_crud"
-status = "mapped"
+status = "covered"
 allow = ["regular agent can resolve its own group membership"]
 deny = ["regular agent cannot enumerate unrelated custom groups using self visibility"]
 
