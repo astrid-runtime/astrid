@@ -26,6 +26,49 @@ concurrent_principal_prompt() {
   bounded_principal_run "$principal" 30 "$out" --format json --session "$session" "$prompt"
 }
 
+concurrent_http_prompt() {
+  local bearer=$1 session=$2 prompt=$3 out=$4 status_file=$5
+  local body
+  body="$("$PYTHON" - "$session" "$prompt" <<'PY'
+import json
+import sys
+
+print(json.dumps({"session_id": sys.argv[1], "text": sys.argv[2]}))
+PY
+)"
+  curl --connect-timeout 2 \
+    --max-time 30 \
+    -sS \
+    -N \
+    -o "$out" \
+    -w "%{http_code}" \
+    -X POST \
+    -H "Authorization: Bearer $bearer" \
+    -H "Content-Type: application/json" \
+    -d "$body" \
+    "$GATEWAY/api/agent/prompt" \
+    > "$status_file"
+}
+
+assert_http_prompt_stream() {
+  local label=$1 out=$2 status_file=$3 principal=$4 expected_text=$5 forbidden_text=$6
+  local status
+  status="$(<"$status_file")"
+  LAST_HTTP_OUT="$out"
+  assert_status "$label HTTP prompt" "$status" 200
+  grep -q '^event: ready' "$out" || fail "$label HTTP prompt missed ready event"
+  grep -q "\"principal\":\"$principal\"" "$out" \
+    || fail "$label HTTP prompt ready event missed principal"
+  grep -q '^event: response' "$out" || fail "$label HTTP prompt missed response event"
+  if [[ "$expected_text" != "-" ]]; then
+    grep -Fq "$expected_text" "$out" || fail "$label HTTP prompt missed expected text"
+  fi
+  if grep -Fq "$forbidden_text" "$out"; then
+    cat "$out" >&2 || true
+    fail "$label HTTP prompt leaked peer prompt text"
+  fi
+}
+
 run_concurrent_cli_control_mutation_smoke() {
   local user_principal=$1 ops_principal=$2
 
@@ -111,6 +154,49 @@ run_concurrent_prompt_correlation_smoke() {
   assert_fake_llm_request_model "$ARTIFACTS/fake-openai.jsonl" "$ops_prompt" "fake-toolish"
 }
 
+run_concurrent_http_prompt_correlation_smoke() {
+  local user_bearer=$1 ops_bearer=$2 user_principal=$3 ops_principal=$4
+
+  note "checking concurrent HTTP prompt streams stay principal-scoped"
+
+  local user_session ops_session user_prompt ops_prompt
+  user_session="$("$PYTHON" -c 'import uuid; print(uuid.uuid4())')"
+  ops_session="$("$PYTHON" -c 'import uuid; print(uuid.uuid4())')"
+  user_prompt="ASTRID_E2E_HTTP_USER_PROMPT_$RANDOM$RANDOM"
+  ops_prompt="ASTRID_E2E_HTTP_OPS_PROMPT_$RANDOM$RANDOM"
+
+  local user_out="$ARTIFACTS/concurrent-http-prompt-user.sse"
+  local ops_out="$ARTIFACTS/concurrent-http-prompt-ops.sse"
+  local user_status="$ARTIFACTS/concurrent-http-prompt-user.status"
+  local ops_status="$ARTIFACTS/concurrent-http-prompt-ops.status"
+  local user_pid ops_pid user_wait=0 ops_wait=0
+
+  concurrent_http_prompt "$user_bearer" "$user_session" "$user_prompt" \
+    "$user_out" "$user_status" &
+  user_pid=$!
+  concurrent_http_prompt "$ops_bearer" "$ops_session" "$ops_prompt" \
+    "$ops_out" "$ops_status" &
+  ops_pid=$!
+
+  wait "$user_pid" || user_wait=$?
+  wait "$ops_pid" || ops_wait=$?
+  [[ "$user_wait" -eq 0 ]] || {
+    cat "$user_out" >&2 || true
+    fail "agent concurrent HTTP prompt failed before HTTP status"
+  }
+  [[ "$ops_wait" -eq 0 ]] || {
+    cat "$ops_out" >&2 || true
+    fail "operator concurrent HTTP prompt failed before HTTP status"
+  }
+
+  assert_http_prompt_stream agent "$user_out" "$user_status" "$user_principal" \
+    "$user_prompt" "$ops_prompt"
+  assert_http_prompt_stream operator "$ops_out" "$ops_status" "$ops_principal" \
+    "-" "$user_prompt"
+  assert_fake_llm_request_model "$ARTIFACTS/fake-openai.jsonl" "$user_prompt" "fake-slow"
+  assert_fake_llm_request_model "$ARTIFACTS/fake-openai.jsonl" "$ops_prompt" "fake-toolish"
+}
+
 run_concurrent_model_write_smoke() {
   local user_bearer=$1 ops_bearer=$2 user_principal=$3 ops_principal=$4
 
@@ -160,4 +246,6 @@ run_concurrent_model_write_smoke() {
   json_assert_model_id "$ARTIFACTS/concurrent-model-ops-restore.json" "openai-compat:fake-toolish"
 
   run_concurrent_prompt_correlation_smoke "$user_principal" "$ops_principal"
+  run_concurrent_http_prompt_correlation_smoke "$user_bearer" "$ops_bearer" \
+    "$user_principal" "$ops_principal"
 }
