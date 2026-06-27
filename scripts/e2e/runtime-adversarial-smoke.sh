@@ -236,6 +236,27 @@ run_adversarial_principal_smoke() {
   local admin_bearer status
   admin_bearer="$(mint_admin_bearer)"
 
+  status="$(http_status POST /api/sys/invites "$admin_bearer" \
+    '{"group":"agent","max_uses":1,"expires_secs":600,"metadata":"e2e-http-revoke"}' \
+    "$ARTIFACTS/http-invite-revoke-issue.json")"
+  assert_status "admin HTTP invite issue for revoke" "$status" 200
+  status="$(http_status GET /api/sys/invites "$admin_bearer" "" \
+    "$ARTIFACTS/http-invite-list-before-revoke.json")"
+  assert_status "admin HTTP invite list" "$status" 200
+  json_assert_http_invite_metadata "$ARTIFACTS/http-invite-list-before-revoke.json" \
+    e2e-http-revoke present
+  local invite_fingerprint
+  invite_fingerprint="$(invite_fingerprint_by_metadata "$ARTIFACTS/http-invite-list-before-revoke.json" \
+    e2e-http-revoke)"
+  status="$(http_status DELETE "/api/sys/invites/$invite_fingerprint" "$admin_bearer" "" \
+    "$ARTIFACTS/http-invite-revoke.json")"
+  assert_status "admin HTTP invite revoke" "$status" 204
+  status="$(http_status GET /api/sys/invites "$admin_bearer" "" \
+    "$ARTIFACTS/http-invite-list-after-revoke.json")"
+  assert_status "admin HTTP invite list after revoke" "$status" 200
+  json_assert_http_invite_metadata "$ARTIFACTS/http-invite-list-after-revoke.json" \
+    e2e-http-revoke absent
+
   status="$(http_status POST /api/sys/principals "$admin_bearer" \
     '{"name":"e2e-http-lifecycle","groups":["agent"],"grants":[]}' \
     "$ARTIFACTS/http-principal-lifecycle-create.json")"
@@ -348,5 +369,34 @@ if not group:
     raise SystemExit(f"group {sys.argv[2]!r} missing: {data!r}")
 if sys.argv[3] not in group.get("capabilities", []):
     raise SystemExit(f"group missing capability {sys.argv[3]!r}: {group!r}")
+PY
+}
+
+json_assert_http_invite_metadata() {
+  local file=$1 metadata=$2 expected=$3
+  "$PYTHON" - "$file" "$metadata" "$expected" <<'PY'
+import json
+import sys
+
+data = json.load(open(sys.argv[1], encoding="utf-8"))
+found = any(item.get("metadata") == sys.argv[2] for item in data.get("invites", []))
+want = sys.argv[3] == "present"
+if found is not want:
+    raise SystemExit(f"invite metadata {sys.argv[2]!r} presence {found}, want {want}: {data!r}")
+PY
+}
+
+invite_fingerprint_by_metadata() {
+  local file=$1 metadata=$2
+  "$PYTHON" - "$file" "$metadata" <<'PY'
+import json
+import sys
+
+data = json.load(open(sys.argv[1], encoding="utf-8"))
+for item in data.get("invites", []):
+    if item.get("metadata") == sys.argv[2]:
+        print(item["token_fingerprint"])
+        raise SystemExit(0)
+raise SystemExit(f"invite metadata {sys.argv[2]!r} missing: {data!r}")
 PY
 }

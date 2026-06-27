@@ -140,12 +140,12 @@ auth = "bearer"
 
 [routes."GET /api/sys/invites"]
 scenario = "invite_lifecycle"
-status = "mapped"
+status = "covered"
 auth = "bearer"
 
 [routes."DELETE /api/sys/invites/{fingerprint}"]
 scenario = "invite_lifecycle"
-status = "mapped"
+status = "covered"
 auth = "bearer"
 
 [routes."GET /api/sys/capabilities"]
