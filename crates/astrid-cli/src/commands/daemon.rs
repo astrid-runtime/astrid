@@ -296,7 +296,26 @@ pub(crate) async fn handle_stop() -> Result<()> {
                 uuid::Uuid::nil(),
             );
             client.send_message(msg).await?;
-            println!("{}", theme::Theme::success("Astrid daemon stopped."));
+            let raw = client
+                .read_until_topic(
+                    astrid_types::Topic::kernel_response("shutdown").as_str(),
+                    std::time::Duration::from_secs(10),
+                )
+                .await?;
+            match crate::socket_client::SocketClient::extract_kernel_response(&raw) {
+                Some(astrid_core::kernel_api::KernelResponse::Success(_)) => {
+                    println!("{}", theme::Theme::success("Astrid daemon stopped."));
+                },
+                Some(astrid_core::kernel_api::KernelResponse::Error(reason)) => {
+                    anyhow::bail!("daemon rejected shutdown: {reason}");
+                },
+                Some(other) => {
+                    anyhow::bail!("unexpected response from daemon shutdown: {other:?}");
+                },
+                None => {
+                    anyhow::bail!("daemon shutdown response did not deserialize");
+                },
+            }
         }
         // The daemon removes its own PID file on graceful shutdown; clean up
         // best-effort here too in case the shutdown raced or the file was

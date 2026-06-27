@@ -471,13 +471,13 @@ state = ["completion generation is side-effect free"]
 evidence = ["completion transcript"]
 
 [scenarios.system_lifecycle]
-status = "mapped"
-surfaces = ["capability"]
+status = "covered"
+surfaces = ["cli", "capability"]
 auth = ["admin/default"]
 success = ["authorized caller can request bounded daemon lifecycle operation"]
 denial = ["non-admin bearer is rejected before lifecycle action"]
 state = ["daemon state changes only in temp runtime"]
-evidence = ["daemon log and lifecycle response artifact"]
+evidence = ["isolated daemon stop transcript and live regular-principal stop denial artifact"]
 
 [scenarios.system_readiness]
 status = "covered"

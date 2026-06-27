@@ -83,6 +83,12 @@ run_cli_semantic_smoke() {
   if grep -Fq "$token_id" "$ARTIFACTS/cli-caps-token-list-after-revoke.txt"; then
     fail "revoked token remained visible in token list"
   fi
+  if run_principal_cli "$user_principal" stop > "$ARTIFACTS/cli-daemon-stop-user-denied.txt"; then
+    fail "regular principal stopped the daemon"
+  fi
+  run_cli status > "$ARTIFACTS/cli-daemon-status-after-user-stop-denied.txt"
+  grep -q "Astrid daemon" "$ARTIFACTS/cli-daemon-status-after-user-stop-denied.txt" \
+    || fail "daemon did not remain running after denied regular stop"
   assert_cli_deferred "cli-agent-discover" "remote agent / Agent Card management" agent discover example.invalid
   assert_cli_deferred "cli-agent-add" "remote agent / Agent Card management" agent add example.invalid
   assert_cli_deferred "cli-agent-card" "remote agent / Agent Card management" agent card example.invalid

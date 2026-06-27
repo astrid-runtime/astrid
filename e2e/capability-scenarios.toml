@@ -14,7 +14,7 @@
 
 [capabilities."system:shutdown"]
 scenario = "system_lifecycle"
-status = "mapped"
+status = "covered"
 allow = ["admin can request daemon shutdown in a bounded temp home"]
 deny = ["non-admin bearer is rejected before shutdown"]
 
