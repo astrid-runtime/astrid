@@ -50,6 +50,29 @@ PY
     > "$status_file"
 }
 
+concurrent_session_title_update() {
+  local bearer=$1 session=$2 title=$3 out=$4 status_file=$5
+  local body
+  body="$("$PYTHON" - "$title" <<'PY'
+import json
+import sys
+
+print(json.dumps({"title": sys.argv[1]}))
+PY
+)"
+  curl --connect-timeout 2 \
+    --max-time 10 \
+    -sS \
+    -o "$out" \
+    -w "%{http_code}" \
+    -X PATCH \
+    -H "Authorization: Bearer $bearer" \
+    -H "Content-Type: application/json" \
+    -d "$body" \
+    "$GATEWAY/api/agent/sessions/$session" \
+    > "$status_file"
+}
+
 assert_http_prompt_stream() {
   local label=$1 out=$2 status_file=$3 principal=$4 expected_text=$5 forbidden_text=$6
   local status
@@ -195,6 +218,43 @@ run_concurrent_http_prompt_correlation_smoke() {
     "-" "$user_prompt"
   assert_fake_llm_request_model "$ARTIFACTS/fake-openai.jsonl" "$user_prompt" "fake-slow"
   assert_fake_llm_request_model "$ARTIFACTS/fake-openai.jsonl" "$ops_prompt" "fake-toolish"
+
+  note "checking concurrent HTTP session mutations stay principal-scoped"
+  local user_title="regular concurrent session title"
+  local ops_title="operator concurrent session title"
+  local user_update_out="$ARTIFACTS/concurrent-session-user-update.json"
+  local ops_update_out="$ARTIFACTS/concurrent-session-ops-update.json"
+  local user_update_status="$ARTIFACTS/concurrent-session-user-update.status"
+  local ops_update_status="$ARTIFACTS/concurrent-session-ops-update.status"
+  local status
+  concurrent_session_title_update "$user_bearer" "$user_session" "$user_title" \
+    "$user_update_out" "$user_update_status" &
+  user_pid=$!
+  concurrent_session_title_update "$ops_bearer" "$ops_session" "$ops_title" \
+    "$ops_update_out" "$ops_update_status" &
+  ops_pid=$!
+
+  user_wait=0
+  ops_wait=0
+  wait "$user_pid" || user_wait=$?
+  wait "$ops_pid" || ops_wait=$?
+  [[ "$user_wait" -eq 0 ]] || {
+    cat "$user_update_out" >&2 || true
+    fail "agent concurrent session update failed before HTTP status"
+  }
+  [[ "$ops_wait" -eq 0 ]] || {
+    cat "$ops_update_out" >&2 || true
+    fail "operator concurrent session update failed before HTTP status"
+  }
+
+  status="$(<"$user_update_status")"
+  LAST_HTTP_OUT="$user_update_out"
+  assert_status "agent concurrent session update" "$status" 200
+  status="$(<"$ops_update_status")"
+  LAST_HTTP_OUT="$ops_update_out"
+  assert_status "operator concurrent session update" "$status" 200
+  json_assert_session_summary "$user_update_out" "$user_session" "$user_title"
+  json_assert_session_summary "$ops_update_out" "$ops_session" "$ops_title"
 }
 
 run_concurrent_model_write_smoke() {
