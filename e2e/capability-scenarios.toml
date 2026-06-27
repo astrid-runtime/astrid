@@ -223,13 +223,13 @@ waiver = "invite redemption is token-authenticated and intentionally bypasses th
 
 [capabilities."invite:list"]
 scenario = "invite_lifecycle"
-status = "mapped"
+status = "covered"
 allow = ["operator with invite:list can list invite fingerprints"]
 deny = ["regular agent cannot list outstanding invites"]
 
 [capabilities."invite:revoke"]
 scenario = "invite_lifecycle"
-status = "mapped"
+status = "covered"
 allow = ["authorized operator can revoke a temp invite"]
 deny = ["regular agent cannot revoke invites"]
 

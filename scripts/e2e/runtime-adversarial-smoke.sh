@@ -673,6 +673,12 @@ run_adversarial_principal_smoke() {
   local invite_fingerprint
   invite_fingerprint="$(invite_fingerprint_by_metadata "$ARTIFACTS/http-invite-list-before-revoke.json" \
     e2e-http-revoke)"
+  status="$(http_status GET /api/sys/invites "$user_bearer" "" \
+    "$ARTIFACTS/adversarial-user-invite-list-denied.json")"
+  assert_status "regular principal invite list denied" "$status" 403
+  status="$(http_status DELETE "/api/sys/invites/$invite_fingerprint" "$user_bearer" "" \
+    "$ARTIFACTS/adversarial-user-invite-revoke-denied.json")"
+  assert_status "regular principal invite revoke denied" "$status" 403
   status="$(http_status DELETE "/api/sys/invites/$invite_fingerprint" "$admin_bearer" "" \
     "$ARTIFACTS/http-invite-revoke.json")"
   assert_status "admin HTTP invite revoke" "$status" 204
