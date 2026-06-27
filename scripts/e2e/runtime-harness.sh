@@ -105,6 +105,15 @@ http_status() {
   LAST_HTTP_OUT="$out"
   curl "${args[@]}"
 }
+capsule_install_body() {
+  local source=$1
+  "$PYTHON" - "$source" <<'PY'
+import json
+import sys
+
+print(json.dumps({"source": sys.argv[1]}))
+PY
+}
 assert_status() {
   local label=$1
   local got=$2
@@ -221,7 +230,11 @@ stage_home_logs() {
 
 redact_staged_upload() {
   [[ -d "$REDACTED_UPLOAD" ]] || return 0
-  "$PYTHON" - "$REDACTED_UPLOAD" "${REDACTION_SENTINELS[@]}" <<'PY'
+  local args=("$REDACTED_UPLOAD")
+  if ((${#REDACTION_SENTINELS[@]} > 0)); then
+    args+=("${REDACTION_SENTINELS[@]}")
+  fi
+  "$PYTHON" - "${args[@]}" <<'PY'
 import os
 import re
 import sys
@@ -345,6 +358,13 @@ main() {
   fi
 
   require_capsules
+
+  note "building .capsule artifact for lifecycle coverage"
+  local capsule_dist="$ARTIFACTS/capsule-dist"
+  mkdir -p "$capsule_dist"
+  run_cli capsule build "$CAPSULES_DIR/astrid-capsule-registry" --output "$capsule_dist"
+  local registry_archive="$capsule_dist/astrid-capsule-registry.capsule"
+  [[ -f "$registry_archive" ]] || fail "registry .capsule artifact was not built at $registry_archive"
 
   note "starting fake OpenAI-compatible server"
   local fake_port_file="$ARTIFACTS/fake-openai.port"
@@ -845,6 +865,64 @@ PY
     "$ARTIFACTS/restart-agent-cross-session-messages-empty.json")"
   assert_status "restart agent cross-principal session transcript empty" "$status" 200
   json_assert_session_messages_empty "$ARTIFACTS/restart-agent-cross-session-messages-empty.json" "$ops_session"
+
+  note "checking .capsule artifact lifecycle"
+  run_cli capsule remove astrid-capsule-registry --force
+  status="$(http_status GET /api/capsules "$restart_user_bearer" "" \
+    "$ARTIFACTS/artifact-lifecycle-after-remove-capsules.json")"
+  assert_status "artifact lifecycle list after remove" "$status" 200
+  json_assert_capsule_list_state "$ARTIFACTS/artifact-lifecycle-after-remove-capsules.json" \
+    astrid-capsule-registry absent
+  status="$(http_status GET /api/capsules/astrid-capsule-registry "$restart_user_bearer" "" \
+    "$ARTIFACTS/artifact-lifecycle-after-remove-detail.json")"
+  assert_status "artifact lifecycle detail after remove hidden" "$status" 404
+
+  local registry_install_body
+  registry_install_body="$(capsule_install_body "$registry_archive")"
+  status="$(http_status POST /api/capsules "$restart_user_bearer" "$registry_install_body" \
+    "$ARTIFACTS/artifact-lifecycle-agent-install-denied.json")"
+  assert_status "regular agent .capsule install denied" "$status" 403
+  status="$(http_status POST /api/capsules "$ops_bearer" "$registry_install_body" \
+    "$ARTIFACTS/artifact-lifecycle-operator-install.json")"
+  assert_status "operator .capsule install" "$status" 200
+  json_assert_capsule_install_output "$ARTIFACTS/artifact-lifecycle-operator-install.json" install
+  status="$(http_status GET /api/capsules "$restart_user_bearer" "" \
+    "$ARTIFACTS/artifact-lifecycle-after-install-capsules.json")"
+  assert_status "artifact lifecycle list after install" "$status" 200
+  json_assert_capsule_list_state "$ARTIFACTS/artifact-lifecycle-after-install-capsules.json" \
+    astrid-capsule-registry present
+  status="$(http_status GET /api/capsules/astrid-capsule-registry "$restart_user_bearer" "" \
+    "$ARTIFACTS/artifact-lifecycle-after-install-detail.json")"
+  assert_status "artifact lifecycle detail after install" "$status" 200
+  run_cli capsule show astrid-capsule-registry --format json \
+    > "$ARTIFACTS/artifact-lifecycle-show.json"
+  json_assert_capsule_show_archive_source "$ARTIFACTS/artifact-lifecycle-show.json" \
+    astrid-capsule-registry "$registry_archive"
+
+  run_cli capsule update astrid-capsule-registry
+  run_cli capsule show astrid-capsule-registry --format json \
+    > "$ARTIFACTS/artifact-lifecycle-show-after-update.json"
+  json_assert_capsule_show_archive_source "$ARTIFACTS/artifact-lifecycle-show-after-update.json" \
+    astrid-capsule-registry "$registry_archive"
+  status="$(http_status GET /api/capsules "$restart_user_bearer" "" \
+    "$ARTIFACTS/artifact-lifecycle-after-update-capsules.json")"
+  assert_status "artifact lifecycle list after update" "$status" 200
+  json_assert_capsule_list_state "$ARTIFACTS/artifact-lifecycle-after-update-capsules.json" \
+    astrid-capsule-registry present
+
+  run_cli capsule remove astrid-capsule-registry --force
+  status="$(http_status GET /api/capsules "$restart_user_bearer" "" \
+    "$ARTIFACTS/artifact-lifecycle-final-remove-capsules.json")"
+  assert_status "artifact lifecycle final live remove" "$status" 200
+  json_assert_capsule_list_state "$ARTIFACTS/artifact-lifecycle-final-remove-capsules.json" \
+    astrid-capsule-registry absent
+  stop_daemon
+  start_daemon "restarting daemon after .capsule artifact removal"
+  status="$(http_status GET /api/capsules "$restart_user_bearer" "" \
+    "$ARTIFACTS/artifact-lifecycle-restart-capsules.json")"
+  assert_status "artifact lifecycle removal persisted after restart" "$status" 200
+  json_assert_capsule_list_state "$ARTIFACTS/artifact-lifecycle-restart-capsules.json" \
+    astrid-capsule-registry absent
 
   note "collecting scoped audit artifacts"
   collect_audit_artifacts "$restart_user_bearer" "$ops_bearer"

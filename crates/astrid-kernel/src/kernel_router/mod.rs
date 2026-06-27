@@ -569,11 +569,18 @@ pub enum AuthorityScope {
 
 /// Return the authority scope the caller is exercising for `req`.
 ///
-/// Currently always returns [`AuthorityScope::Self_`] because no
-/// `KernelRequest` variant carries a `target_principal` field yet.
+/// A daemon-side capsule install with `workspace = false` mutates the shared
+/// default capsule store, so it is global even though the request has no
+/// explicit target principal. Workspace installs remain self-scoped; the daemon
+/// rejects them later because it has no meaningful current workspace.
 #[must_use]
-pub fn resolve_scope(_req: &KernelRequest, _caller: &PrincipalId) -> AuthorityScope {
-    AuthorityScope::Self_
+pub fn resolve_scope(req: &KernelRequest, _caller: &PrincipalId) -> AuthorityScope {
+    match req {
+        KernelRequest::InstallCapsule {
+            workspace: false, ..
+        } => AuthorityScope::Global,
+        _ => AuthorityScope::Self_,
+    }
 }
 
 /// Return the static capability string required to satisfy `req` under

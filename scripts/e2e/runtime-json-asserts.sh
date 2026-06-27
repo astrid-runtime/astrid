@@ -72,6 +72,73 @@ if expected not in ids:
 PY
 }
 
+json_assert_capsule_list_state() {
+  local file=$1
+  local capsule=$2
+  local expected=$3
+  "$PYTHON" - "$file" "$capsule" "$expected" <<'PY'
+import json
+import sys
+
+data = json.load(open(sys.argv[1], encoding="utf-8"))
+capsule = sys.argv[2]
+expected = sys.argv[3]
+if isinstance(data, dict):
+    capsules = data.get("capsules", [])
+else:
+    capsules = data
+if not isinstance(capsules, list):
+    raise SystemExit(f"expected capsule list, got {data!r}")
+present = capsule in capsules
+if expected == "present" and not present:
+    raise SystemExit(f"expected {capsule!r} in capsule list {capsules!r}")
+if expected == "absent" and present:
+    raise SystemExit(f"expected {capsule!r} absent from capsule list {capsules!r}")
+PY
+}
+
+json_assert_capsule_install_output() {
+  local file=$1
+  local phase=$2
+  "$PYTHON" - "$file" "$phase" <<'PY'
+import json
+import sys
+
+data = json.load(open(sys.argv[1], encoding="utf-8"))
+expected_phase = sys.argv[2]
+if data.get("phase") != expected_phase:
+    raise SystemExit(f"expected install phase {expected_phase!r}, got {data!r}")
+for field in ("target_dir", "installed_version", "wasm_hash", "env_path"):
+    if not data.get(field):
+        raise SystemExit(f"install output missed {field!r}: {data!r}")
+if not str(data.get("target_dir", "")).endswith("/astrid-capsule-registry"):
+    raise SystemExit(f"install target was not registry capsule: {data!r}")
+PY
+}
+
+json_assert_capsule_show_archive_source() {
+  local file=$1
+  local capsule=$2
+  local archive=$3
+  "$PYTHON" - "$file" "$capsule" "$archive" <<'PY'
+import json
+import sys
+
+data = json.load(open(sys.argv[1], encoding="utf-8"))
+capsule = sys.argv[2]
+archive = sys.argv[3]
+if data.get("name") != capsule:
+    raise SystemExit(f"expected capsule {capsule!r}, got {data!r}")
+if data.get("source") != archive:
+    raise SystemExit(f"expected source {archive!r}, got {data!r}")
+if not data.get("wasm_hash"):
+    raise SystemExit(f"capsule show missed wasm_hash: {data!r}")
+manifest = data.get("manifest", "")
+if f'name = "{capsule}"' not in manifest:
+    raise SystemExit(f"capsule manifest did not name {capsule!r}: {manifest!r}")
+PY
+}
+
 json_assert_session_list_scope() {
   local file=$1 expected=$2 forbidden=$3
   "$PYTHON" - "$file" "$expected" "$forbidden" <<'PY'

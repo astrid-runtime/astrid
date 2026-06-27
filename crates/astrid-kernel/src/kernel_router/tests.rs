@@ -332,15 +332,49 @@ fn required_capability_mapping_global_scope() {
 }
 
 #[test]
-fn resolve_scope_defaults_to_self() {
+fn resolve_scope_defaults_to_self_except_shared_capsule_install() {
     let caller = PrincipalId::new("alice").unwrap();
     for req in all_request_variants() {
+        if matches!(
+            req,
+            KernelRequest::InstallCapsule {
+                workspace: false,
+                ..
+            }
+        ) {
+            continue;
+        }
         assert_eq!(
             resolve_scope(&req, &caller),
             AuthorityScope::Self_,
-            "scope should default to Self_ for today's variants"
+            "scope should default to Self_ for {req:?}"
         );
     }
+}
+
+#[test]
+fn resolve_scope_treats_daemon_wide_capsule_install_as_global() {
+    let caller = PrincipalId::new("alice").unwrap();
+    assert_eq!(
+        resolve_scope(
+            &KernelRequest::InstallCapsule {
+                source: "/tmp/demo.capsule".to_string(),
+                workspace: false,
+            },
+            &caller,
+        ),
+        AuthorityScope::Global
+    );
+    assert_eq!(
+        resolve_scope(
+            &KernelRequest::InstallCapsule {
+                source: "/tmp/demo.capsule".to_string(),
+                workspace: true,
+            },
+            &caller,
+        ),
+        AuthorityScope::Self_
+    );
 }
 
 // ── Caller resolution ────────────────────────────────────────────
