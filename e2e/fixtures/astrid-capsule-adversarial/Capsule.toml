@@ -25,3 +25,8 @@ uplink = true
 name = "adversarial"
 kind = "cli"
 description = "Run runtime E2E adversarial capsule probes"
+
+[[command]]
+name = "adversarial-slow"
+kind = "cli"
+description = "Run a bounded slow command for runtime crash-recovery probes"

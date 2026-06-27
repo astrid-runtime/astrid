@@ -38,6 +38,51 @@ PY
   done
 }
 
+wait_for_daemon_log() {
+  local needle=$1
+  local deadline=$((SECONDS + 10))
+  until grep -Fq "$needle" "$ARTIFACTS/daemon.log" 2>/dev/null; do
+    if (( SECONDS >= deadline )); then
+      return 1
+    fi
+    sleep 0.1
+  done
+}
+
+bounded_principal_cli() {
+  local principal=$1
+  local timeout_secs=$2
+  local out=$3
+  shift 3
+  "$PYTHON" - "$CORE_DIR/target/debug/astrid" "$principal" "$timeout_secs" "$out" "$@" <<'PY'
+import subprocess
+import sys
+from pathlib import Path
+
+binary = sys.argv[1]
+principal = sys.argv[2]
+timeout_secs = float(sys.argv[3])
+out_path = Path(sys.argv[4])
+args = sys.argv[5:]
+
+try:
+    proc = subprocess.run(
+        [binary, "--principal", principal, *args],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        timeout=timeout_secs,
+        check=False,
+    )
+except subprocess.TimeoutExpired as exc:
+    out_path.write_text(exc.stdout or "", encoding="utf-8")
+    raise SystemExit(124) from exc
+
+out_path.write_text(proc.stdout, encoding="utf-8")
+raise SystemExit(proc.returncode)
+PY
+}
+
 run_inflight_prompt_crash_smoke() {
   local principal=$1
   local session=$2
@@ -67,6 +112,33 @@ run_inflight_prompt_crash_smoke() {
   assert_fake_llm_request_model "$ARTIFACTS/fake-openai.jsonl" "$prompt" "fake-slow"
 }
 
+run_mid_capsule_command_crash_smoke() {
+  local principal=$1
+  local out="$ARTIFACTS/crash-capsule-command.txt"
+  local rc=0
+
+  note "checking crash recovery while a capsule command is in flight"
+  bounded_principal_cli "$principal" 12 "$out" \
+    capsule run astrid-capsule-adversarial adversarial-slow &
+  local run_pid=$!
+  wait_for_daemon_log "adversarial slow command started" || {
+    terminate_pid "$run_pid"
+    cat "$out" >&2 2>/dev/null || true
+    fail "slow adversarial capsule command did not start before deadline"
+  }
+
+  crash_daemon_process
+  wait "$run_pid" || rc=$?
+  if [[ "$rc" -eq 0 ]]; then
+    cat "$out" >&2
+    fail "in-flight capsule command unexpectedly succeeded after daemon crash"
+  fi
+  if [[ "$rc" -eq 124 ]]; then
+    cat "$out" >&2
+    fail "in-flight capsule command hung until timeout after daemon crash"
+  fi
+}
+
 run_crash_recovery_smoke() {
   local user_bearer=$1
   local ops_bearer=$2
@@ -76,6 +148,8 @@ run_crash_recovery_smoke() {
 
   run_inflight_prompt_crash_smoke "$user_principal" "$user_session"
   start_daemon "restarting daemon after abrupt process death"
+  run_mid_capsule_command_crash_smoke "$user_principal"
+  start_daemon "restarting daemon after capsule command crash"
 
   local status
   status="$(http_status GET /api/auth/me "$user_bearer" "" "$ARTIFACTS/crash-restart-agent-me.json")"
