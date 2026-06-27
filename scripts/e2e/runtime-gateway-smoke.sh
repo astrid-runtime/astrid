@@ -15,6 +15,7 @@ run_gateway_public_surface_smoke() {
     "$ARTIFACTS/public-onboarding.json" \
     "$ARTIFACTS/public-openapi.json" \
     "$ARTIFACTS/public-metrics.txt"
+  json_assert_metrics_contract "$ARTIFACTS/public-metrics.txt"
 }
 
 run_gateway_principal_surface_smoke() {
@@ -77,5 +78,42 @@ if "astrid-capsule-registry" not in loaded:
     raise SystemExit(f"readiness missed granted registry capsule: {loaded!r}")
 if "astrid-capsule-cli" in loaded:
     raise SystemExit(f"readiness leaked default-only cli capsule: {loaded!r}")
+PY
+}
+
+json_assert_metrics_contract() {
+  local metrics=$1
+  shift
+  "$PYTHON" - "$metrics" "$@" <<'PY'
+import re
+import sys
+
+metrics = open(sys.argv[1], encoding="utf-8").read()
+for needle in (
+    "astrid_build_info",
+    "astrid_gateway_requests_total",
+    "astrid_gateway_request_duration_seconds",
+):
+    if needle not in metrics:
+        raise SystemExit(f"metrics scrape missing {needle!r}")
+
+for forbidden in [s for s in sys.argv[2:] if s]:
+    if forbidden in metrics:
+        raise SystemExit(f"metrics scrape leaked dynamic identifier {forbidden!r}")
+
+if "DO_NOT_LEAK" in metrics or "Authorization" in metrics or "session_token" in metrics:
+    raise SystemExit("metrics scrape leaked sensitive marker or auth material")
+
+uuidish = re.compile(
+    r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
+)
+routes = set(re.findall(r'route="([^"]+)"', metrics))
+for route in routes:
+    if "?" in route:
+        raise SystemExit(f"metrics route label includes query string: {route!r}")
+    if uuidish.search(route):
+        raise SystemExit(f"metrics route label includes concrete UUID: {route!r}")
+    if route and not (route.startswith("/") or route.startswith("<")):
+        raise SystemExit(f"metrics route label is not a route template: {route!r}")
 PY
 }

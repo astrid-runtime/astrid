@@ -965,6 +965,10 @@ PY
 
   note "collecting scoped audit artifacts"
   collect_audit_artifacts "$restart_user_bearer" "$ops_bearer" "$user_principal" "$ops_principal"
+  status="$(http_status GET /metrics "" "" "$ARTIFACTS/final-metrics.txt")"
+  assert_status "final metrics scrape" "$status" 200
+  json_assert_metrics_contract "$ARTIFACTS/final-metrics.txt" \
+    "$user_principal" "$ops_principal" "$user_session" "$ops_session" "$paired_key_id"
 
   redaction_check "$sentinel"
   redaction_check "$user_secret"
