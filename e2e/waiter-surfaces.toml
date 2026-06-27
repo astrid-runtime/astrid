@@ -1,0 +1,135 @@
+# Runtime waiter and correlation surface inventory.
+#
+# This is deliberately narrower than every async wait in the codebase. It tracks
+# request/response surfaces where a stale, wrong-principal, wrong-source, or
+# orphaned response could cross tenant boundaries or strand an operation.
+
+[waiters.approval_host]
+owner = "astrid-capsule host approval import"
+status = "covered"
+request = "IpcPayload::ApprovalRequired on the public request stream"
+response = "IpcPayload::ApprovalResponse on astrid.v1.approval.response.{request_id}"
+correlation = ["request_id", "originating principal"]
+timeout = "fixed host approval timeout"
+cancel = "WASM engine cancellation token; kernel unload/restart/shutdown call request_cancel before exclusive unload"
+runtime_coverage = [
+  "same-principal approve",
+  "same-principal deny",
+  "wrong-principal response ignored",
+  "concurrent crossed responses ignored",
+  "fixed timeout surfaces bounded failure",
+  "daemon crash while waiting fails bounded",
+  "capsule unload cancels waiter",
+]
+unit_coverage = [
+  "wrong-principal response ignored",
+  "mismatch flood does not extend deadline",
+  "concurrent request ids and principals do not cross",
+  "cancel-token timeout unblocks waiter",
+]
+remaining = []
+
+[waiters.elicit_lifecycle]
+owner = "astrid-capsule host elicit import"
+status = "mapped"
+request = "IpcPayload::ElicitRequest on the public request stream during lifecycle hooks"
+response = "IpcPayload::ElicitResponse on astrid.v1.elicit.response.{request_id}"
+correlation = ["request_id", "originating principal"]
+timeout = "fixed lifecycle elicit timeout"
+cancel = "WASM engine cancellation token"
+runtime_coverage = [
+  "install lifecycle prompt/resume through adversarial capsule fixture",
+  "HTTP elicit-response unauthenticated denial",
+  "HTTP elicit-response ambiguous body rejection",
+  "HTTP elicit-response body principal spoof ignored",
+  "HTTP elicit-response cancel sentinel accepted",
+]
+unit_coverage = [
+  "wrong-principal response ignored",
+  "unknown request id ignored",
+  "mismatch flood does not extend deadline",
+  "concurrent request ids and principals do not cross",
+]
+remaining = [
+  "normal capsule commands cannot legally invoke elicit today because the host import is lifecycle-only",
+  "mid-elicit daemon crash and live command-path elicit overlap require a lifecycle-specific test hook or non-lifecycle elicitation primitive",
+]
+
+[waiters.session_gateway_bus]
+owner = "gateway session routes"
+status = "covered"
+request = "session.v1.request.* topics stamped with authenticated caller principal"
+response = "session.v1.response.*.{correlation_id}"
+correlation = ["gateway-generated correlation_id", "caller principal", "deterministic astrid-capsule-session source id"]
+timeout = "absolute per-route capsule timeout deadline"
+cancel = "route future cancellation drops the response subscription"
+runtime_coverage = [
+  "per-principal session list/transcript/update/delete/search isolation",
+  "cross-principal session metadata hidden",
+  "wrong-principal same-correlation replies ignored by gateway tests",
+  "wrong capsule source same-correlation replies ignored by gateway tests",
+]
+unit_coverage = [
+  "accepted caller-scoped reply",
+  "foreign-principal reply rejected before delivery",
+  "foreign-source reply rejected before delivery",
+  "timeout after mismatched replies is bounded",
+]
+remaining = []
+
+[waiters.model_registry_bus]
+owner = "gateway model routes"
+status = "covered"
+request = "registry/model request topics stamped with authenticated caller principal"
+response = "registry/model response topics carrying request correlation"
+correlation = ["request id or uncorrelated fallback", "caller principal"]
+timeout = "absolute registry timeout deadline"
+cancel = "route future cancellation drops the response subscription"
+runtime_coverage = [
+  "per-principal model list/get-active/set-active isolation",
+  "body/query principal spoof ignored",
+  "concurrent active-model writes remain scoped",
+  "fake LLM attribution follows each principal active model",
+]
+unit_coverage = [
+  "mismatched registry replies skip to bounded timeout",
+  "guest JSON replies decode through IpcPayload::to_guest_bytes",
+]
+remaining = []
+
+[waiters.grant_on_use]
+owner = "kernel grant-on-use handler"
+status = "mapped"
+request = "kernel-origin grant_required approval request"
+response = "IpcPayload::ApprovalResponse on astrid.v1.approval.response.{request_id}"
+correlation = ["request_id", "principal captured from kernel-origin request", "capsule id captured from kernel-origin request"]
+timeout = "same approval timeout budget as host approval"
+cancel = "short-lived awaiter task releases its in-flight permit on response, timeout, or panic"
+runtime_coverage = []
+unit_coverage = [
+  "non-kernel grant_required ignored",
+  "deny and timeout do not grant",
+  "unknown request id does not grant",
+  "response cannot supply or spoof grant target",
+]
+remaining = [
+  "no runtime harness story currently drives grant-on-use consent end to end",
+]
+
+[waiters.local_egress_consent]
+owner = "capsule local egress consent"
+status = "covered"
+request = "approval-style local egress consent request"
+response = "IpcPayload::ApprovalResponse on astrid.v1.approval.response.{request_id}"
+correlation = ["request_id", "originating principal", "capsule id", "endpoint"]
+timeout = "fixed local egress consent timeout"
+cancel = "WASM engine cancellation token"
+runtime_coverage = [
+  "local egress allowlist controls fake OpenAI-compatible loopback access",
+]
+unit_coverage = [
+  "wrong-principal consent ignored",
+  "unstamped consent ignored",
+  "same-principal consent accepted",
+]
+remaining = []
