@@ -70,6 +70,7 @@ trap cleanup EXIT INT TERM
 . "$SCRIPT_DIR/runtime-audit-smoke.sh"
 . "$SCRIPT_DIR/runtime-concurrency-smoke.sh"
 . "$SCRIPT_DIR/runtime-crash-smoke.sh"
+. "$SCRIPT_DIR/runtime-observability-smoke.sh"
 note() { printf '\n==> %s\n' "$*"; }
 fail() { printf 'error: %s\n' "$*" >&2; exit 1; }
 run_cli() {
@@ -974,6 +975,9 @@ PY
   assert_status "final metrics scrape" "$status" 200
   json_assert_metrics_contract "$ARTIFACTS/final-metrics.txt" \
     "$user_principal" "$ops_principal" "$user_session" "$ops_session" "$paired_key_id"
+  assert_runtime_log_contract "$ARTIFACTS/daemon.log" \
+    "$user_bearer" "$ops_bearer" "$paired_bearer" "$refreshed_paired_bearer" \
+    "$restart_user_bearer" "$agent_invite" "$pair_token"
 
   redaction_check "$sentinel"
   redaction_check "$user_secret"
