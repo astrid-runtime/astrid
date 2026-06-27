@@ -145,7 +145,10 @@ async fn test_lifecycle_install_with_elicit() {
                 value,
                 values,
             };
-            let msg = IpcMessage::new(response_topic, response, uuid::Uuid::nil());
+            let mut msg = IpcMessage::new(response_topic, response, uuid::Uuid::nil());
+            if let Some(principal) = message.principal.as_deref() {
+                msg = msg.with_principal(principal);
+            }
             responder_bus.publish(AstridEvent::Ipc {
                 message: msg,
                 metadata: astrid_events::EventMetadata::default(),

@@ -703,6 +703,26 @@ PY
   grep -q "\"principal\":\"$user_principal\"" "$ARTIFACTS/agent-stream.sse" \
     || fail "agent stream ready event did not carry caller principal"
 
+  note "checking elicit-response HTTP guardrails"
+  local elicit_request_id
+  elicit_request_id="$("$PYTHON" -c 'import uuid; print(uuid.uuid4())')"
+  status="$(http_status POST /api/agent/elicit-response "" \
+    "{\"request_id\":\"$elicit_request_id\",\"value\":\"unauth\"}" \
+    "$ARTIFACTS/elicit-response-unauth.json")"
+  assert_status "unauthenticated elicit response denied" "$status" 401
+  status="$(http_status POST /api/agent/elicit-response "$user_bearer" \
+    "{\"request_id\":\"$elicit_request_id\",\"value\":\"scalar\",\"values\":[\"array\"]}" \
+    "$ARTIFACTS/elicit-response-ambiguous.json")"
+  assert_status "ambiguous elicit response rejected" "$status" 400
+  status="$(http_status POST /api/agent/elicit-response "$user_bearer" \
+    "{\"request_id\":\"$elicit_request_id\",\"value\":\"answered\",\"principal\":\"default\"}" \
+    "$ARTIFACTS/elicit-response-spoofed-principal.json")"
+  assert_status "elicit response body principal ignored" "$status" 202
+  status="$(http_status POST /api/agent/elicit-response "$user_bearer" \
+    "{\"request_id\":\"$elicit_request_id\"}" \
+    "$ARTIFACTS/elicit-response-cancel.json")"
+  assert_status "elicit response cancel sentinel accepted" "$status" 202
+
   note "checking model discovery through registry capsule"
   local models_out="$ARTIFACTS/models-list.json"
   local deadline=$((SECONDS + 45))

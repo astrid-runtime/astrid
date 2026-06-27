@@ -235,7 +235,7 @@ auth = "bearer"
 
 [routes."POST /api/agent/elicit-response"]
 scenario = "elicitation_flow"
-status = "mapped"
+status = "covered"
 auth = "bearer"
 
 [routes."GET /api/models"]
