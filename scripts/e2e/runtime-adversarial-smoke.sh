@@ -236,6 +236,39 @@ run_adversarial_principal_smoke() {
   local admin_bearer status
   admin_bearer="$(mint_admin_bearer)"
 
+  status="$(http_status POST /api/sys/principals "$admin_bearer" \
+    '{"name":"e2e-http-lifecycle","groups":["agent"],"grants":[]}' \
+    "$ARTIFACTS/http-principal-lifecycle-create.json")"
+  assert_status "admin HTTP principal create" "$status" 200
+  status="$(http_status PATCH /api/sys/principals/e2e-http-lifecycle "$admin_bearer" \
+    '{"add_groups":["ops-team"],"remove_groups":[],"add_capsules":[],"remove_capsules":[]}' \
+    "$ARTIFACTS/http-principal-lifecycle-patch.json")"
+  assert_status "admin HTTP principal patch" "$status" 200
+  status="$(http_status POST /api/sys/principals/e2e-http-lifecycle/disable "$admin_bearer" "" \
+    "$ARTIFACTS/http-principal-lifecycle-disable.json")"
+  assert_status "admin HTTP principal disable" "$status" 200
+  status="$(http_status GET /api/sys/principals/e2e-http-lifecycle "$admin_bearer" "" \
+    "$ARTIFACTS/http-principal-lifecycle-disabled-show.json")"
+  assert_status "admin HTTP principal disabled show" "$status" 200
+  json_assert_cli_agent_enabled "$ARTIFACTS/http-principal-lifecycle-disabled-show.json" \
+    e2e-http-lifecycle false
+  json_assert_cli_agent_show "$ARTIFACTS/http-principal-lifecycle-disabled-show.json" \
+    e2e-http-lifecycle ops-team
+  status="$(http_status POST /api/sys/principals/e2e-http-lifecycle/enable "$admin_bearer" "" \
+    "$ARTIFACTS/http-principal-lifecycle-enable.json")"
+  assert_status "admin HTTP principal enable" "$status" 200
+  status="$(http_status GET /api/sys/principals/e2e-http-lifecycle "$admin_bearer" "" \
+    "$ARTIFACTS/http-principal-lifecycle-enabled-show.json")"
+  assert_status "admin HTTP principal enabled show" "$status" 200
+  json_assert_cli_agent_enabled "$ARTIFACTS/http-principal-lifecycle-enabled-show.json" \
+    e2e-http-lifecycle true
+  status="$(http_status DELETE /api/sys/principals/e2e-http-lifecycle "$admin_bearer" "" \
+    "$ARTIFACTS/http-principal-lifecycle-delete.json")"
+  assert_status "admin HTTP principal delete" "$status" 204
+  status="$(http_status GET /api/sys/principals/e2e-http-lifecycle "$admin_bearer" "" \
+    "$ARTIFACTS/http-principal-lifecycle-deleted-show.json")"
+  assert_status "deleted HTTP principal hidden" "$status" 404
+
   status="$(http_status POST /api/sys/groups "$user_bearer" \
     '{"name":"regular-group-create-denied","capabilities":["system:status"]}' \
     "$ARTIFACTS/adversarial-regular-group-create-denied.json")"
@@ -250,6 +283,19 @@ run_adversarial_principal_smoke() {
     '{"name":"wildcard-e2e","capabilities":["*"],"unsafe_admin":true}' \
     "$ARTIFACTS/adversarial-wildcard-group-allowed.json")"
   assert_status "admin wildcard group create with unsafe allowed" "$status" 200
+  status="$(http_status GET /api/sys/groups "$admin_bearer" "" \
+    "$ARTIFACTS/adversarial-admin-group-list.json")"
+  assert_status "admin group list" "$status" 200
+  json_assert_http_group "$ARTIFACTS/adversarial-admin-group-list.json" wildcard-e2e '*'
+  status="$(http_status PATCH /api/sys/groups/wildcard-e2e "$admin_bearer" \
+    '{"capabilities":["system:status"],"description":"patched by runtime e2e","unsafe_admin":false}' \
+    "$ARTIFACTS/adversarial-wildcard-group-patch.json")"
+  assert_status "admin group patch" "$status" 200
+  status="$(http_status GET /api/sys/groups "$admin_bearer" "" \
+    "$ARTIFACTS/adversarial-admin-group-list-after-patch.json")"
+  assert_status "admin group list after patch" "$status" 200
+  json_assert_http_group "$ARTIFACTS/adversarial-admin-group-list-after-patch.json" \
+    wildcard-e2e system:status
 
   status="$(http_status POST "/api/sys/principals/$user_principal/caps" "$ops_bearer" \
     '{"capabilities":["system:status"],"unsafe_admin":false}' \
@@ -288,4 +334,19 @@ run_adversarial_principal_smoke() {
   status="$(http_status GET /api/sys/principals/InvalidPrincipalId "$user_bearer" "" \
     "$ARTIFACTS/adversarial-principal-invalid-id.json")"
   assert_status "invalid principal id rejected with bounded error" "$status" 400
+}
+
+json_assert_http_group() {
+  local file=$1 name=$2 cap=$3
+  "$PYTHON" - "$file" "$name" "$cap" <<'PY'
+import json
+import sys
+
+data = json.load(open(sys.argv[1], encoding="utf-8"))
+group = next((item for item in data.get("groups", []) if item.get("name") == sys.argv[2]), None)
+if not group:
+    raise SystemExit(f"group {sys.argv[2]!r} missing: {data!r}")
+if sys.argv[3] not in group.get("capabilities", []):
+    raise SystemExit(f"group missing capability {sys.argv[3]!r}: {group!r}")
+PY
 }

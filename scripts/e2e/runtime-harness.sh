@@ -626,6 +626,7 @@ PY
   status="$(http_status GET "/api/sys/principals/$ops_principal/devices" "$user_bearer" "" \
     "$ARTIFACTS/agent-devices-cross-principal-denied.json")"
   assert_status "agent cross-principal devices read denied" "$status" 403
+  run_gateway_quota_write_smoke "$user_principal" "$ops_principal" "$user_bearer" "$(mint_admin_bearer)"
 
   note "checking per-principal capsule env isolation"
   status="$(http_status POST /api/capsules/astrid-capsule-openai-compat/env/model "" \

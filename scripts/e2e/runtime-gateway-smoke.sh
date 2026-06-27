@@ -27,6 +27,42 @@ run_gateway_principal_surface_smoke() {
   assert_status "unauthenticated readiness denied" "$status" 401
   status="$(http_status POST /api/sys/capsules/reload "$bearer" "" "$ARTIFACTS/$label-reload-denied.json")"
   assert_status "$label reload" "$status" "$reload_status"
+  status="$(http_status GET /api/sys/capabilities "$bearer" "" "$ARTIFACTS/$label-capabilities.json")"
+  assert_status "$label capability catalog" "$status" 200
+  json_assert_capability_catalog "$ARTIFACTS/$label-capabilities.json"
+  status="$(http_status GET /api/capsules/astrid-capsule-registry/topics "$bearer" "" \
+    "$ARTIFACTS/$label-registry-topics.json")"
+  assert_status "$label capsule topics" "$status" 200
+  json_assert_capsule_topics_shape "$ARTIFACTS/$label-registry-topics.json"
+  status="$(http_status GET /api/events "" "" "$ARTIFACTS/unauth-events.json")"
+  assert_status "unauthenticated events denied" "$status" 401
+  assert_events_ready "$label" "$bearer"
+}
+
+run_gateway_quota_write_smoke() {
+  local user_principal=$1 ops_principal=$2 user_bearer=$3 admin_bearer=$4 status body
+  status="$(http_status GET "/api/sys/principals/$user_principal/quotas" "$admin_bearer" "" \
+    "$ARTIFACTS/http-quota-before-write.json")"
+  assert_status "admin quota read before write" "$status" 200
+  body="$(quota_request_body "$ARTIFACTS/http-quota-before-write.json" 5)"
+  status="$(http_status PUT "/api/sys/principals/$user_principal/quotas" "$admin_bearer" "$body" \
+    "$ARTIFACTS/http-quota-write.json")"
+  assert_status "admin quota write" "$status" 200
+  status="$(http_status GET "/api/sys/principals/$user_principal/quotas" "$user_bearer" "" \
+    "$ARTIFACTS/http-quota-after-write.json")"
+  assert_status "agent quota read after HTTP write" "$status" 200
+  json_assert_field_equals "$ARTIFACTS/http-quota-after-write.json" max_background_processes 5
+  status="$(http_status GET "/api/sys/principals/$user_principal/usage" "$user_bearer" "" \
+    "$ARTIFACTS/http-usage-self.json")"
+  assert_status "agent usage self-read" "$status" 200
+  json_assert_usage_principal "$ARTIFACTS/http-usage-self.json" "$user_principal"
+  status="$(http_status GET "/api/sys/principals/$ops_principal/usage" "$user_bearer" "" \
+    "$ARTIFACTS/http-usage-cross-principal-denied.json")"
+  assert_status "agent cross-principal usage denied" "$status" 403
+  body="$(quota_request_body "$ARTIFACTS/http-quota-after-write.json" 4)"
+  status="$(http_status PUT "/api/sys/principals/$user_principal/quotas" "$admin_bearer" "$body" \
+    "$ARTIFACTS/http-quota-restore.json")"
+  assert_status "admin quota restore" "$status" 200
 }
 
 json_assert_public_gateway_surface() {
@@ -79,6 +115,78 @@ if "astrid-capsule-registry" not in loaded:
 if "astrid-capsule-cli" in loaded:
     raise SystemExit(f"readiness leaked default-only cli capsule: {loaded!r}")
 PY
+}
+
+json_assert_capability_catalog() {
+  local file=$1
+  "$PYTHON" - "$file" <<'PY'
+import json
+import sys
+
+data = json.load(open(sys.argv[1], encoding="utf-8"))
+ids = {entry.get("id") for entry in data.get("capabilities", [])}
+for capability in ("system:status", "capsule:install", "self:capsule:list"):
+    if capability not in ids:
+        raise SystemExit(f"capability catalog missing {capability!r}: {sorted(ids)!r}")
+for category in ("agent", "capsule", "system"):
+    if category not in data.get("categories", []):
+        raise SystemExit(f"capability categories missing {category!r}: {data!r}")
+PY
+}
+
+json_assert_capsule_topics_shape() {
+  local file=$1
+  "$PYTHON" - "$file" <<'PY'
+import json
+import sys
+
+data = json.load(open(sys.argv[1], encoding="utf-8"))
+topics = data.get("topics")
+if not isinstance(topics, list):
+    raise SystemExit(f"capsule topics response missed topics array: {data!r}")
+PY
+}
+
+json_assert_usage_principal() {
+  local file=$1 principal=$2
+  "$PYTHON" - "$file" "$principal" <<'PY'
+import json
+import sys
+
+data = json.load(open(sys.argv[1], encoding="utf-8"))
+if data.get("principal") != sys.argv[2]:
+    raise SystemExit(f"unexpected usage principal: {data!r}")
+for key in ("cpu_fuel_consumed_total", "cpu_fuel_per_sec_limit", "exempt"):
+    if key not in data:
+        raise SystemExit(f"usage response missed {key}: {data!r}")
+PY
+}
+
+quota_request_body() {
+  local file=$1 processes=$2
+  "$PYTHON" - "$file" "$processes" <<'PY'
+import json
+import sys
+
+quotas = json.load(open(sys.argv[1], encoding="utf-8"))
+quotas["max_background_processes"] = int(sys.argv[2])
+print(json.dumps({"quotas": quotas}, separators=(",", ":")))
+PY
+}
+
+assert_events_ready() {
+  local label=$1 bearer=$2 status curl_status headers out
+  headers="$ARTIFACTS/$label-events.headers"
+  out="$ARTIFACTS/$label-events.sse"
+  set +e
+  status="$(curl --connect-timeout 2 --max-time 3 -sS -N -D "$headers" -o "$out" \
+    -w "%{http_code}" -H "Authorization: Bearer $bearer" "$GATEWAY/api/events")"
+  curl_status=$?
+  set -e
+  [[ "$status" == "200" ]] || fail "$label events expected HTTP 200, got $status"
+  [[ "$curl_status" -eq 0 || "$curl_status" -eq 28 ]] \
+    || fail "$label events curl exited $curl_status"
+  grep -q '^event: ready' "$out" || fail "$label events stream missed ready event"
 }
 
 json_assert_metrics_contract() {

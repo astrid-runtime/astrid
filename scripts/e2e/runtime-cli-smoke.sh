@@ -10,6 +10,17 @@ run_cli_semantic_smoke() {
   json_assert_cli_agent_show "$ARTIFACTS/cli-agent-show-user.json" "$user_principal" agent
   run_cli agent show "$ops_principal" --format json > "$ARTIFACTS/cli-agent-show-ops.json"
   json_assert_cli_agent_show "$ARTIFACTS/cli-agent-show-ops.json" "$ops_principal" ops-team
+  run_cli agent create e2e-cli-lifecycle -y
+  run_cli agent disable e2e-cli-lifecycle
+  run_cli agent show e2e-cli-lifecycle --format json > "$ARTIFACTS/cli-agent-lifecycle-disabled.json"
+  json_assert_cli_agent_enabled "$ARTIFACTS/cli-agent-lifecycle-disabled.json" e2e-cli-lifecycle false
+  run_cli agent enable e2e-cli-lifecycle
+  run_cli agent show e2e-cli-lifecycle --format json > "$ARTIFACTS/cli-agent-lifecycle-enabled.json"
+  json_assert_cli_agent_enabled "$ARTIFACTS/cli-agent-lifecycle-enabled.json" e2e-cli-lifecycle true
+  run_cli agent delete e2e-cli-lifecycle -y
+  if run_cli agent show e2e-cli-lifecycle --format json > "$ARTIFACTS/cli-agent-lifecycle-deleted.json"; then
+    fail "deleted agent e2e-cli-lifecycle remained visible"
+  fi
   run_cli agent switch "$user_principal" > "$ARTIFACTS/cli-agent-switch-user.txt"
   run_cli agent current > "$ARTIFACTS/cli-agent-current-user.txt"
   grep -qx "$user_principal" "$ARTIFACTS/cli-agent-current-user.txt" || fail "agent current did not reflect switch"
@@ -19,6 +30,12 @@ run_cli_semantic_smoke() {
   json_assert_cli_group "$ARTIFACTS/cli-group-list.json" ops-team invite:issue
   run_cli group show ops-team --format json > "$ARTIFACTS/cli-group-show-ops.json"
   json_assert_cli_group "$ARTIFACTS/cli-group-show-ops.json" ops-team capsule:install
+  run_cli group modify ops-team --add-caps system:status
+  run_cli group show ops-team --format json > "$ARTIFACTS/cli-group-show-ops-after-add.json"
+  json_assert_cli_group "$ARTIFACTS/cli-group-show-ops-after-add.json" ops-team system:status
+  run_cli group modify ops-team --remove-caps system:status
+  run_cli group show ops-team --format json > "$ARTIFACTS/cli-group-show-ops-after-remove.json"
+  json_assert_cli_group_lacks_cap "$ARTIFACTS/cli-group-show-ops-after-remove.json" ops-team system:status
 
   run_cli caps show "$user_principal" --format json > "$ARTIFACTS/cli-caps-show-user.json"
   json_assert_cli_caps_show "$ARTIFACTS/cli-caps-show-user.json" "$user_principal" agent
@@ -29,6 +46,17 @@ run_cli_semantic_smoke() {
   json_assert_cli_quota "$ARTIFACTS/cli-quota-show-user.json" "$user_principal" 4
   run_cli secret list --agent "$user_principal" --format json > "$ARTIFACTS/cli-secret-list-user.json"
   json_assert_secret_list_metadata "$ARTIFACTS/cli-secret-list-user.json" astrid-capsule-openai-compat api_key
+  run_cli keypair generate --name e2e-cli-key --force --raw > "$ARTIFACTS/cli-keypair-generated.pub"
+  run_cli keypair list --json > "$ARTIFACTS/cli-keypair-list.json"
+  json_assert_cli_keypair_list "$ARTIFACTS/cli-keypair-list.json" e2e-cli-key
+  run_cli keypair show e2e-cli-key > "$ARTIFACTS/cli-keypair-show.txt"
+  grep -q "public key (hex):" "$ARTIFACTS/cli-keypair-show.txt" || fail "keypair show missed public key"
+  run_cli keypair pubkey e2e-cli-key > "$ARTIFACTS/cli-keypair-pubkey.txt"
+  json_assert_cli_keypair_pubkey "$ARTIFACTS/cli-keypair-pubkey.txt"
+  run_cli keypair delete e2e-cli-key --yes
+  if run_cli keypair show e2e-cli-key > "$ARTIFACTS/cli-keypair-show-after-delete.txt"; then
+    fail "deleted keypair e2e-cli-key remained visible"
+  fi
 
   run_cli capsule show astrid-capsule-openai-compat --format json \
     > "$ARTIFACTS/cli-capsule-show-openai-user.json"
@@ -85,6 +113,21 @@ if sys.argv[3] not in data.get("groups", []):
 PY
 }
 
+json_assert_cli_agent_enabled() {
+  local file=$1 principal=$2 enabled=$3
+  "$PYTHON" - "$file" "$principal" "$enabled" <<'PY'
+import json
+import sys
+
+data = json.load(open(sys.argv[1], encoding="utf-8"))
+want = sys.argv[3].lower() == "true"
+if data.get("principal") != sys.argv[2]:
+    raise SystemExit(f"unexpected principal: {data!r}")
+if data.get("enabled") is not want:
+    raise SystemExit(f"unexpected enabled state: {data!r}")
+PY
+}
+
 json_assert_cli_group() {
   local file=$1 name=$2 cap=$3
   "$PYTHON" - "$file" "$name" "$cap" <<'PY'
@@ -101,6 +144,22 @@ if sys.argv[3] not in data.get("capabilities", []):
 PY
 }
 
+json_assert_cli_group_lacks_cap() {
+  local file=$1 name=$2 cap=$3
+  "$PYTHON" - "$file" "$name" "$cap" <<'PY'
+import json
+import sys
+
+data = json.load(open(sys.argv[1], encoding="utf-8"))
+if isinstance(data, list):
+    data = next((entry for entry in data if entry.get("name") == sys.argv[2]), None)
+if not data or data.get("name") != sys.argv[2]:
+    raise SystemExit(f"group {sys.argv[2]!r} missing: {data!r}")
+if sys.argv[3] in data.get("capabilities", []):
+    raise SystemExit(f"group still has capability {sys.argv[3]!r}: {data!r}")
+PY
+}
+
 json_assert_cli_caps_show() {
   local file=$1 principal=$2 group=$3
   "$PYTHON" - "$file" "$principal" "$group" <<'PY'
@@ -112,6 +171,35 @@ if data.get("principal") != sys.argv[2]:
     raise SystemExit(f"unexpected caps principal: {data!r}")
 if sys.argv[3] not in data.get("groups", []):
     raise SystemExit(f"missing caps group {sys.argv[3]!r}: {data!r}")
+PY
+}
+
+json_assert_cli_keypair_list() {
+  local file=$1 name=$2
+  "$PYTHON" - "$file" "$name" <<'PY'
+import json
+import sys
+
+data = json.load(open(sys.argv[1], encoding="utf-8"))
+entry = next((item for item in data if item.get("name") == sys.argv[2]), None)
+if not entry:
+    raise SystemExit(f"keypair {sys.argv[2]!r} missing from list: {data!r}")
+if entry.get("backend") != "file":
+    raise SystemExit(f"unexpected keypair backend: {entry!r}")
+if not entry.get("fingerprint"):
+    raise SystemExit(f"keypair list missed fingerprint: {entry!r}")
+PY
+}
+
+json_assert_cli_keypair_pubkey() {
+  local file=$1
+  "$PYTHON" - "$file" <<'PY'
+import re
+import sys
+
+text = open(sys.argv[1], encoding="utf-8").read().strip()
+if not re.fullmatch(r"[0-9a-f]{64}", text):
+    raise SystemExit(f"unexpected keypair public key output: {text!r}")
 PY
 }
 

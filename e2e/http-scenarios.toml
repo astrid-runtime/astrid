@@ -55,12 +55,12 @@ auth = "bearer"
 
 [routes."GET /api/sys/principals/{id}"]
 scenario = "principal_crud"
-status = "mapped"
+status = "covered"
 auth = "bearer"
 
 [routes."PATCH /api/sys/principals/{id}"]
 scenario = "principal_crud"
-status = "mapped"
+status = "covered"
 auth = "bearer"
 
 [routes."DELETE /api/sys/principals/{id}"]
@@ -70,12 +70,12 @@ auth = "bearer"
 
 [routes."POST /api/sys/principals/{id}/enable"]
 scenario = "principal_lifecycle"
-status = "mapped"
+status = "covered"
 auth = "bearer"
 
 [routes."POST /api/sys/principals/{id}/disable"]
 scenario = "principal_lifecycle"
-status = "mapped"
+status = "covered"
 auth = "bearer"
 
 [routes."POST /api/sys/principals/{id}/caps"]
@@ -95,12 +95,12 @@ auth = "bearer"
 
 [routes."PUT /api/sys/principals/{id}/quotas"]
 scenario = "quota_scope"
-status = "mapped"
+status = "covered"
 auth = "bearer"
 
 [routes."GET /api/sys/principals/{id}/usage"]
 scenario = "quota_scope"
-status = "mapped"
+status = "covered"
 auth = "bearer"
 
 [routes."GET /api/sys/principals/{id}/devices"]
@@ -115,7 +115,7 @@ auth = "bearer"
 
 [routes."GET /api/sys/groups"]
 scenario = "group_crud"
-status = "mapped"
+status = "covered"
 auth = "bearer"
 
 [routes."POST /api/sys/groups"]
@@ -125,7 +125,7 @@ auth = "bearer"
 
 [routes."PATCH /api/sys/groups/{name}"]
 scenario = "group_crud"
-status = "mapped"
+status = "covered"
 auth = "bearer"
 
 [routes."DELETE /api/sys/groups/{name}"]
@@ -150,27 +150,27 @@ auth = "bearer"
 
 [routes."GET /api/sys/capabilities"]
 scenario = "capability_catalog"
-status = "mapped"
+status = "covered"
 auth = "bearer"
 
 [routes."GET /api/capsules"]
 scenario = "capsule_live_load_lifecycle"
-status = "mapped"
+status = "covered"
 auth = "bearer"
 
 [routes."POST /api/capsules"]
 scenario = "capsule_installability"
-status = "mapped"
+status = "covered"
 auth = "bearer"
 
 [routes."GET /api/capsules/{id}"]
 scenario = "capsule_metadata"
-status = "mapped"
+status = "covered"
 auth = "bearer"
 
 [routes."GET /api/capsules/{id}/topics"]
 scenario = "capsule_metadata"
-status = "mapped"
+status = "covered"
 auth = "bearer"
 
 [routes."GET /api/capsules/{id}/env"]
@@ -185,12 +185,12 @@ auth = "bearer"
 
 [routes."GET /api/events"]
 scenario = "audit_event_stream"
-status = "mapped"
+status = "covered"
 auth = "bearer"
 
 [routes."GET /api/sys/audit"]
 scenario = "audit_history"
-status = "mapped"
+status = "covered"
 auth = "bearer"
 
 [routes."POST /api/agent/prompt"]

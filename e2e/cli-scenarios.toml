@@ -52,19 +52,19 @@ principal = "admin_and_agent"
 
 [commands."agent delete"]
 scenario = "principal_crud"
-status = "mapped"
+status = "covered"
 mode = "mutating"
 principal = "admin"
 
 [commands."agent enable"]
 scenario = "principal_lifecycle"
-status = "mapped"
+status = "covered"
 mode = "mutating"
 principal = "admin"
 
 [commands."agent disable"]
 scenario = "principal_lifecycle"
-status = "mapped"
+status = "covered"
 mode = "mutating"
 principal = "admin"
 
@@ -150,7 +150,7 @@ principal = "admin"
 
 [commands."group modify"]
 scenario = "group_crud"
-status = "mapped"
+status = "covered"
 mode = "mutating"
 principal = "admin"
 
@@ -237,31 +237,31 @@ principal = "admin"
 
 [commands."keypair generate"]
 scenario = "keypair_lifecycle"
-status = "mapped"
+status = "covered"
 mode = "mutating"
 principal = "local_cli"
 
 [commands."keypair list"]
 scenario = "keypair_lifecycle"
-status = "mapped"
+status = "covered"
 mode = "read"
 principal = "local_cli"
 
 [commands."keypair show"]
 scenario = "keypair_lifecycle"
-status = "mapped"
+status = "covered"
 mode = "read"
 principal = "local_cli"
 
 [commands."keypair pubkey"]
 scenario = "keypair_lifecycle"
-status = "mapped"
+status = "covered"
 mode = "read"
 principal = "local_cli"
 
 [commands."keypair delete"]
 scenario = "keypair_lifecycle"
-status = "mapped"
+status = "covered"
 mode = "mutating"
 principal = "local_cli"
 
