@@ -69,6 +69,7 @@ trap cleanup EXIT INT TERM
 . "$SCRIPT_DIR/runtime-adversarial-smoke.sh"
 . "$SCRIPT_DIR/runtime-audit-smoke.sh"
 . "$SCRIPT_DIR/runtime-concurrency-smoke.sh"
+. "$SCRIPT_DIR/runtime-crash-smoke.sh"
 note() { printf '\n==> %s\n' "$*"; }
 fail() { printf 'error: %s\n' "$*" >&2; exit 1; }
 run_cli() {
@@ -906,6 +907,8 @@ PY
     "$ARTIFACTS/restart-agent-cross-session-messages-empty.json")"
   assert_status "restart agent cross-principal session transcript empty" "$status" 200
   json_assert_session_messages_empty "$ARTIFACTS/restart-agent-cross-session-messages-empty.json" "$ops_session"
+  run_crash_recovery_smoke "$restart_user_bearer" "$ops_bearer" "$user_principal" \
+    "$user_session" "$ops_session"
 
   note "checking .capsule artifact lifecycle"
   run_cli capsule remove astrid-capsule-registry --force
