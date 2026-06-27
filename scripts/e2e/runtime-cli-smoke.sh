@@ -265,8 +265,8 @@ version = "0.8.0"
 role = "uplink"
 EOF
   run_isolated_cli "$home" "$cwd" init --distro "$distro" --offline --yes --allow-unsigned \
-    > "$ARTIFACTS/cli-init-offline.txt"
-  grep -q "Installation complete" "$ARTIFACTS/cli-init-offline.txt" \
+    > "$ARTIFACTS/cli-init-offline.txt" 2>&1
+  grep -Eq "Installation complete|Installed [0-9]+ capsule" "$ARTIFACTS/cli-init-offline.txt" \
     || fail "offline init did not complete"
   [[ -f "$home/home/default/.config/distro.lock" ]] || fail "offline init did not write Distro.lock"
   [[ -f "$home/home/default/.local/capsules/astrid-capsule-registry/meta.json" ]] \
