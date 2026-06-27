@@ -13,6 +13,7 @@ collect_audit_artifacts() {
   assert_status "operator scoped audit export" "$status" 200
   json_assert_audit_scope_and_events "$ARTIFACTS/agent-audit.json" "$user_principal" \
     admin.auth.pair.issue:success \
+    admin.auth.pair.issue:failure \
     admin.invite.issue:failure
   json_assert_audit_scope_and_events "$ARTIFACTS/operator-audit.json" "$ops_principal" \
     admin.invite.issue:success \

@@ -518,7 +518,7 @@ EOF
   run_gateway_principal_surface_smoke agent "$user_bearer" 204
   run_gateway_principal_surface_smoke operator "$ops_bearer" 403
   status="$(http_status POST /api/auth/pair-device "$user_bearer" \
-    '{"expires_secs":120,"label":"regular-user phone"}' \
+    '{"expires_secs":120,"label":"regular-user phone","scope":"use-only"}' \
     "$ARTIFACTS/agent-pair-device.json")"
   assert_status "agent pair-device issue" "$status" 200
   local pair_token
@@ -559,6 +559,10 @@ PY
   assert_status "paired refresh auth/me" "$status" 200
   json_assert_field_equals "$ARTIFACTS/paired-refresh-me.json" principal "$user_principal"
   json_assert_field_equals "$ARTIFACTS/paired-refresh-me.json" device_key_id "$paired_key_id"
+  status="$(http_status POST /api/auth/pair-device "$paired_bearer" \
+    '{"expires_secs":120,"label":"paired-device escalation attempt","scope":"full"}' \
+    "$ARTIFACTS/paired-device-full-mint-denied.json")"
+  assert_status "attenuated paired device cannot mint full child device" "$status" 403
   status="$(http_status GET "/api/sys/principals/$user_principal/devices" "$user_bearer" "" \
     "$ARTIFACTS/agent-devices.json")"
   assert_status "agent device list" "$status" 200
