@@ -12,6 +12,7 @@ const SESSION_LIST_RESPONSE_PREFIX: &str = "session.v1.response.list.";
 const CLI_RUN_COMMAND: &str = "adversarial";
 const MAX_REQ_ID_LEN: usize = 64;
 const POISON_SESSION_ID: &str = "ASTRID_ADVERSARIAL_POISON_SESSION";
+const LIFECYCLE_EXPECTED_ANSWER: &str = "runtime-lifecycle-ok";
 
 static POISON_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -27,6 +28,22 @@ struct ProbeReport {
 
 #[capsule]
 impl Adversarial {
+    #[astrid::install]
+    fn install(&self) -> Result<(), SysError> {
+        let answer = elicit::text_with_default(
+            "adversarial_lifecycle_probe",
+            "Enter the runtime E2E lifecycle probe value",
+            "runtime-lifecycle-default",
+        )?;
+        if answer != LIFECYCLE_EXPECTED_ANSWER {
+            return Err(SysError::ApiError(
+                "unexpected adversarial lifecycle probe answer".into(),
+            ));
+        }
+        log::info("adversarial lifecycle install elicit completed");
+        Ok(())
+    }
+
     #[astrid::run]
     fn run(&self) -> Result<(), SysError> {
         let run_sub = ipc::subscribe(CLI_RUN_TOPIC)?;

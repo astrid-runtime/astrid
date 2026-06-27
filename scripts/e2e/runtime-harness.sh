@@ -70,6 +70,7 @@ trap cleanup EXIT INT TERM
 . "$SCRIPT_DIR/runtime-audit-smoke.sh"
 . "$SCRIPT_DIR/runtime-concurrency-smoke.sh"
 . "$SCRIPT_DIR/runtime-crash-smoke.sh"
+. "$SCRIPT_DIR/runtime-lifecycle-smoke.sh"
 . "$SCRIPT_DIR/runtime-observability-smoke.sh"
 note() { printf '\n==> %s\n' "$*"; }
 fail() { printf 'error: %s\n' "$*" >&2; exit 1; }
@@ -427,7 +428,7 @@ EOF
   for capsule in $CORE_CAPSULES; do
     run_cli capsule install "$CAPSULES_DIR/$capsule"
   done
-  run_cli capsule install "$CORE_DIR/e2e/fixtures/astrid-capsule-adversarial"
+  install_adversarial_capsule_with_lifecycle_elicit
 
   note "configuring openai-compat for fake endpoint"
   local sentinel="ASTRID_E2E_SECRET_DO_NOT_LEAK_$RANDOM$RANDOM"
