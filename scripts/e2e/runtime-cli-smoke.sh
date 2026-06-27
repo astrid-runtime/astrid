@@ -66,27 +66,19 @@ run_cli_semantic_smoke() {
   run_cli caps token list "$user_principal" > "$ARTIFACTS/cli-caps-token-list-after-mint.txt"
   grep -Fq "$token_id" "$ARTIFACTS/cli-caps-token-list-after-mint.txt" || fail "token list missed minted token id"
   grep -Fq "$token_resource" "$ARTIFACTS/cli-caps-token-list-after-mint.txt" || fail "token list missed minted token resource"
-  if run_principal_cli "$user_principal" caps token mint "$user_principal" "$token_resource" \
-    > "$ARTIFACTS/cli-caps-token-user-mint-denied.txt"; then
-    fail "regular principal minted a capability token"
-  fi
-  if run_principal_cli "$user_principal" caps token list "$user_principal" \
-    > "$ARTIFACTS/cli-caps-token-user-list-denied.txt"; then
-    fail "regular principal listed capability tokens"
-  fi
-  if run_principal_cli "$user_principal" caps token revoke "$token_id" \
-    > "$ARTIFACTS/cli-caps-token-user-revoke-denied.txt"; then
-    fail "regular principal revoked a capability token"
-  fi
+  assert_principal_cli_failure "$user_principal" "cli-caps-token-user-mint-denied" \
+    caps token mint "$user_principal" "$token_resource"
+  assert_principal_cli_failure "$user_principal" "cli-caps-token-user-list-denied" \
+    caps token list "$user_principal"
+  assert_principal_cli_failure "$user_principal" "cli-caps-token-user-revoke-denied" \
+    caps token revoke "$token_id"
   run_cli caps token revoke "$token_id" > "$ARTIFACTS/cli-caps-token-revoke.txt"
   grep -Fq "$token_id" "$ARTIFACTS/cli-caps-token-revoke.txt" || fail "token revoke output missed token id"
   run_cli caps token list "$user_principal" > "$ARTIFACTS/cli-caps-token-list-after-revoke.txt"
   if grep -Fq "$token_id" "$ARTIFACTS/cli-caps-token-list-after-revoke.txt"; then
     fail "revoked token remained visible in token list"
   fi
-  if run_principal_cli "$user_principal" stop > "$ARTIFACTS/cli-daemon-stop-user-denied.txt"; then
-    fail "regular principal stopped the daemon"
-  fi
+  assert_principal_cli_failure "$user_principal" "cli-daemon-stop-user-denied" stop
   run_cli status > "$ARTIFACTS/cli-daemon-status-after-user-stop-denied.txt"
   grep -q "Astrid daemon" "$ARTIFACTS/cli-daemon-status-after-user-stop-denied.txt" \
     || fail "daemon did not remain running after denied regular stop"
@@ -409,6 +401,23 @@ assert_cli_exit_contains() {
   fi
   if ! grep -Fq "$needle" "$stdout" "$stderr"; then
     fail "$label missed expected output: $needle"
+  fi
+}
+
+assert_principal_cli_failure() {
+  local principal=$1 label=$2 stdout stderr status
+  shift 2
+  stdout="$ARTIFACTS/$label.out"
+  stderr="$ARTIFACTS/$label.err"
+  printf '$ astrid --principal %s %s\n' "$principal" "$*" >> "$ARTIFACTS/cli-transcript.log"
+  set +e
+  "$CORE_DIR/target/debug/astrid" --principal "$principal" "$@" >"$stdout" 2>"$stderr"
+  status=$?
+  set -e
+  tee -a "$ARTIFACTS/cli-transcript.log" < "$stdout"
+  tee -a "$ARTIFACTS/cli-transcript.log" < "$stderr" >&2
+  if [[ "$status" -eq 0 ]]; then
+    fail "$label unexpectedly succeeded"
   fi
 }
 
