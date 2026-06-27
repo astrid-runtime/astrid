@@ -16,7 +16,10 @@ collect_audit_artifacts() {
   json_assert_audit_scope_and_events "$ARTIFACTS/agent-audit.json" "$user_principal" \
     admin.auth.pair.issue:success \
     admin.auth.pair.issue:failure \
-    admin.invite.issue:failure
+    admin.invite.issue:failure \
+    admin.agent.create:failure \
+    admin.group.create:failure \
+    admin.quota.get:failure
   json_assert_audit_token_evidence_and_redaction "$ARTIFACTS/agent-audit.json" "$paired_key_id" "$@"
   json_assert_audit_scope_and_events "$ARTIFACTS/operator-audit.json" "$ops_principal" \
     admin.invite.issue:success \
@@ -30,6 +33,9 @@ collect_audit_artifacts() {
   assert_status "admin firehose audit export" "$status" 200
   json_assert_audit_firehose_contains_principals \
     "$ARTIFACTS/admin-audit.json" "$user_principal" "$ops_principal"
+  json_assert_audit_firehose_events "$ARTIFACTS/admin-audit.json" default \
+    admin.group.create:failure \
+    admin.caps.grant:failure
   json_assert_audit_token_evidence_and_redaction \
     "$ARTIFACTS/admin-audit.json" "$paired_key_id" "$@" "$admin_bearer"
 }
@@ -106,5 +112,44 @@ missing = sorted(expected - seen)
 if missing:
     summary = sorted(str(item) for item in seen)
     raise SystemExit(f"admin audit firehose missed principals {missing!r}; saw {summary!r}")
+PY
+}
+
+json_assert_audit_firehose_events() {
+  local file=$1 principal=$2
+  shift 2
+  "$PYTHON" - "$file" "$principal" "$@" <<'PY'
+import json
+import sys
+
+path = sys.argv[1]
+principal = sys.argv[2]
+expected = sys.argv[3:]
+data = json.load(open(path, encoding="utf-8"))
+entries = data.get("entries", [])
+
+def matches(spec: str, entry: dict) -> bool:
+    method, outcome = spec.split(":", 1)
+    return (
+        entry.get("principal") == principal
+        and entry.get("method") == method
+        and entry.get("outcome") == outcome
+    )
+
+missing = [spec for spec in expected if not any(matches(spec, entry) for entry in entries)]
+if missing:
+    summary = [
+        {
+            "principal": entry.get("principal"),
+            "method": entry.get("method"),
+            "outcome": entry.get("outcome"),
+            "required_capability": entry.get("required_capability"),
+        }
+        for entry in entries
+    ]
+    raise SystemExit(
+        f"admin audit firehose missed expected events for {principal!r}: "
+        f"{missing!r}; saw {summary!r}"
+    )
 PY
 }
