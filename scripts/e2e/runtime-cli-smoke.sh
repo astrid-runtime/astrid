@@ -27,11 +27,12 @@ run_cli_semantic_smoke() {
   run_cli agent switch default > "$ARTIFACTS/cli-agent-switch-default.txt"
   local cli_session_id
   cli_session_id="$("$PYTHON" -c 'import uuid; print(uuid.uuid4())')"
+  local cli_session_display_id="${cli_session_id:0:8}"
   mkdir -p "$ASTRID_HOME/run/$cli_session_id"
   run_cli session list > "$ARTIFACTS/cli-session-list.txt"
-  grep -q "$cli_session_id" "$ARTIFACTS/cli-session-list.txt" || fail "session list missed test session"
+  grep -q "$cli_session_display_id" "$ARTIFACTS/cli-session-list.txt" || fail "session list missed test session"
   run_cli session show "$cli_session_id" > "$ARTIFACTS/cli-session-show.txt"
-  grep -q "$cli_session_id" "$ARTIFACTS/cli-session-show.txt" || fail "session show missed test session"
+  grep -q "$cli_session_display_id" "$ARTIFACTS/cli-session-show.txt" || fail "session show missed test session"
   run_cli session delete "$cli_session_id"
   if [[ -d "$ASTRID_HOME/run/$cli_session_id" ]]; then
     fail "session delete left test session directory behind"
