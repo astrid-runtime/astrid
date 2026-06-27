@@ -90,37 +90,37 @@ reason = "Parsed surface is present, but platform identity providers are not liv
 
 [commands."agent discover"]
 scenario = "remote_agent_stub"
-status = "mapped"
+status = "covered"
 mode = "deferred"
 principal = "admin"
 
 [commands."agent add"]
 scenario = "remote_agent_stub"
-status = "mapped"
+status = "covered"
 mode = "deferred"
 principal = "admin"
 
 [commands."agent card"]
 scenario = "remote_agent_stub"
-status = "mapped"
+status = "covered"
 mode = "deferred"
 principal = "admin"
 
 [commands."agent export"]
 scenario = "remote_agent_stub"
-status = "mapped"
+status = "covered"
 mode = "deferred"
 principal = "admin"
 
 [commands."agent import"]
 scenario = "remote_agent_stub"
-status = "mapped"
+status = "covered"
 mode = "deferred"
 principal = "admin"
 
 [commands."agent delegate"]
 scenario = "delegation_stub"
-status = "mapped"
+status = "covered"
 mode = "deferred"
 principal = "admin"
 
@@ -303,56 +303,56 @@ principal = "agent"
 
 [commands."voucher create"]
 scenario = "voucher_stub"
-status = "mapped"
+status = "covered"
 mode = "deferred"
 principal = "admin"
 
 [commands."voucher list"]
 scenario = "voucher_stub"
-status = "mapped"
+status = "covered"
 mode = "deferred"
 principal = "admin"
 
 [commands."voucher show"]
 scenario = "voucher_stub"
-status = "mapped"
+status = "covered"
 mode = "deferred"
 principal = "admin"
 
 [commands."voucher revoke"]
 scenario = "voucher_stub"
-status = "mapped"
+status = "covered"
 mode = "deferred"
 principal = "admin"
 
 [commands."voucher history"]
 scenario = "voucher_stub"
-status = "mapped"
+status = "covered"
 mode = "deferred"
 principal = "admin"
 
 [commands."trust add"]
 scenario = "trust_stub"
-status = "mapped"
+status = "covered"
 mode = "deferred"
 principal = "admin"
 
 [commands."trust list"]
 scenario = "trust_stub"
-status = "mapped"
+status = "covered"
 mode = "deferred"
 principal = "admin"
 
 [commands."trust remove"]
 scenario = "trust_stub"
-status = "mapped"
+status = "covered"
 mode = "deferred"
 principal = "admin"
 
 [commands."audit"]
 scenario = "audit_history"
-status = "mapped"
-mode = "read"
+status = "covered"
+mode = "deferred"
 principal = "admin"
 
 [commands."budget show"]
@@ -385,25 +385,25 @@ reason = "Budget ownership is intentionally deferred until it is clear whether t
 
 [commands."session list"]
 scenario = "session_lifecycle"
-status = "mapped"
+status = "covered"
 mode = "read"
 principal = "agent"
 
 [commands."session delete"]
 scenario = "session_lifecycle"
-status = "mapped"
+status = "covered"
 mode = "mutating"
 principal = "agent"
 
 [commands."session show"]
 scenario = "session_lifecycle"
-status = "mapped"
+status = "covered"
 mode = "read"
 principal = "agent"
 
 [commands."capsule new"]
 scenario = "capsule_authoring_smoke"
-status = "mapped"
+status = "covered"
 mode = "filesystem"
 principal = "local_cli"
 
@@ -415,7 +415,7 @@ principal = "admin"
 
 [commands."capsule update"]
 scenario = "capsule_live_load_lifecycle"
-status = "mapped"
+status = "covered"
 mode = "mutating"
 principal = "admin"
 
@@ -427,19 +427,19 @@ principal = "admin_and_agent"
 
 [commands."capsule remove"]
 scenario = "capsule_live_load_lifecycle"
-status = "mapped"
+status = "covered"
 mode = "mutating"
 principal = "admin"
 
 [commands."capsule tree"]
 scenario = "capsule_metadata"
-status = "mapped"
+status = "covered"
 mode = "read"
 principal = "admin"
 
 [commands."capsule build"]
 scenario = "capsule_installability"
-status = "mapped"
+status = "covered"
 mode = "filesystem"
 principal = "local_cli"
 
@@ -476,7 +476,7 @@ reason = "Full hosted distro apply may fetch network content; CI covers offline/
 
 [commands."distro show"]
 scenario = "distro_lifecycle"
-status = "mapped"
+status = "covered"
 mode = "read"
 principal = "admin"
 
@@ -520,7 +520,7 @@ principal = "local_cli"
 
 [commands."gc"]
 scenario = "content_store_gc"
-status = "mapped"
+status = "covered"
 mode = "filesystem"
 principal = "local_cli"
 
@@ -550,25 +550,25 @@ principal = "local_cli"
 
 [commands."logs"]
 scenario = "observability_logs"
-status = "mapped"
+status = "covered"
 mode = "read"
 principal = "local_cli"
 
 [commands."ps"]
 scenario = "observability_runtime"
-status = "mapped"
+status = "covered"
 mode = "read"
 principal = "local_cli"
 
 [commands."top"]
 scenario = "observability_runtime"
-status = "mapped"
+status = "covered"
 mode = "read"
 principal = "local_cli"
 
 [commands."who"]
 scenario = "observability_runtime"
-status = "mapped"
+status = "covered"
 mode = "read"
 principal = "local_cli"
 
@@ -593,7 +593,7 @@ principal = "local_cli"
 
 [commands."completions"]
 scenario = "shell_completion_generation"
-status = "mapped"
+status = "covered"
 mode = "read"
 principal = "local_cli"
 

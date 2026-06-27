@@ -25,6 +25,17 @@ run_cli_semantic_smoke() {
   run_cli agent current > "$ARTIFACTS/cli-agent-current-user.txt"
   grep -qx "$user_principal" "$ARTIFACTS/cli-agent-current-user.txt" || fail "agent current did not reflect switch"
   run_cli agent switch default > "$ARTIFACTS/cli-agent-switch-default.txt"
+  local cli_session_id
+  cli_session_id="$("$PYTHON" -c 'import uuid; print(uuid.uuid4())')"
+  mkdir -p "$ASTRID_HOME/run/$cli_session_id"
+  run_cli session list > "$ARTIFACTS/cli-session-list.txt"
+  grep -q "$cli_session_id" "$ARTIFACTS/cli-session-list.txt" || fail "session list missed test session"
+  run_cli session show "$cli_session_id" > "$ARTIFACTS/cli-session-show.txt"
+  grep -q "$cli_session_id" "$ARTIFACTS/cli-session-show.txt" || fail "session show missed test session"
+  run_cli session delete "$cli_session_id"
+  if [[ -d "$ASTRID_HOME/run/$cli_session_id" ]]; then
+    fail "session delete left test session directory behind"
+  fi
 
   run_cli group list --format json > "$ARTIFACTS/cli-group-list.json"
   json_assert_cli_group "$ARTIFACTS/cli-group-list.json" ops-team invite:issue
@@ -41,6 +52,21 @@ run_cli_semantic_smoke() {
   json_assert_cli_caps_show "$ARTIFACTS/cli-caps-show-user.json" "$user_principal" agent
   run_cli caps check "$ops_principal" invite:issue > "$ARTIFACTS/cli-caps-check-ops.txt"
   grep -q "allowed" "$ARTIFACTS/cli-caps-check-ops.txt" || fail "caps check did not allow ops invite:issue"
+  assert_cli_deferred "cli-agent-discover" "remote agent / Agent Card management" agent discover example.invalid
+  assert_cli_deferred "cli-agent-add" "remote agent / Agent Card management" agent add example.invalid
+  assert_cli_deferred "cli-agent-card" "remote agent / Agent Card management" agent card example.invalid
+  assert_cli_deferred "cli-agent-export" "remote agent / Agent Card management" agent export example.invalid
+  assert_cli_deferred "cli-agent-import" "remote agent / Agent Card management" agent import example.invalid
+  assert_cli_deferred "cli-agent-delegate" "agent delegation" agent delegate example.invalid
+  assert_cli_deferred "cli-voucher-create" "capability voucher management" voucher create example --future-flag
+  assert_cli_deferred "cli-voucher-list" "capability voucher management" voucher list --future-flag
+  assert_cli_deferred "cli-voucher-show" "capability voucher management" voucher show example --future-flag
+  assert_cli_deferred "cli-voucher-revoke" "capability voucher management" voucher revoke example --future-flag
+  assert_cli_deferred "cli-voucher-history" "capability voucher management" voucher history --future-flag
+  assert_cli_deferred "cli-trust-add" "cross-host trust management" trust add example.invalid --future-flag
+  assert_cli_deferred "cli-trust-list" "cross-host trust management" trust list --future-flag
+  assert_cli_deferred "cli-trust-remove" "cross-host trust management" trust remove example.invalid --future-flag
+  assert_cli_deferred "cli-audit" "audit trail inspection" audit "$user_principal" --future-filter
 
   local invite_token redeem_key pair_token pair_pubkey pair_key_id
   invite_token="$("$CORE_DIR/target/debug/astrid" invite issue --group agent --max-uses 1 \
@@ -80,6 +106,26 @@ run_cli_semantic_smoke() {
   run_cli secret delete e2e_cli_delete_marker --agent "$user_principal"
   run_cli secret list --agent "$user_principal" --format json > "$ARTIFACTS/cli-secret-list-after-delete.json"
   json_assert_secret_absent "$ARTIFACTS/cli-secret-list-after-delete.json" default e2e_cli_delete_marker
+  local capsule_new_parent="$ARTIFACTS/capsule-new"
+  mkdir -p "$capsule_new_parent"
+  run_cli capsule new e2e-capsule-smoke --path "$capsule_new_parent"
+  [[ -f "$capsule_new_parent/e2e-capsule-smoke/Capsule.toml" ]] \
+    || fail "capsule new did not write Capsule.toml"
+  [[ -f "$capsule_new_parent/e2e-capsule-smoke/src/lib.rs" ]] \
+    || fail "capsule new did not write src/lib.rs"
+  run_cli capsule tree > "$ARTIFACTS/cli-capsule-tree.txt"
+  grep -q "astrid-capsule-openai-compat" "$ARTIFACTS/cli-capsule-tree.txt" \
+    || fail "capsule tree missed installed openai-compat capsule"
+  mkdir -p "$ASTRID_HOME/wit"
+  printf 'orphan wit fixture\n' > "$ASTRID_HOME/wit/e2e-orphan.wit"
+  run_cli gc > "$ARTIFACTS/cli-gc-dry-run.txt"
+  grep -q "e2e-orphan.wit" "$ARTIFACTS/cli-gc-dry-run.txt" || fail "gc dry-run missed orphaned WIT blob"
+  [[ -f "$ASTRID_HOME/wit/e2e-orphan.wit" ]] || fail "gc dry-run deleted orphaned WIT blob"
+  run_cli gc --force > "$ARTIFACTS/cli-gc-force.txt"
+  [[ ! -f "$ASTRID_HOME/wit/e2e-orphan.wit" ]] || fail "gc --force kept orphaned WIT blob"
+  assert_cli_exit_contains "cli-distro-show" 2 "is not yet wired" distro show
+  run_cli completions bash > "$ARTIFACTS/cli-completions-bash.txt"
+  grep -q "_astrid" "$ARTIFACTS/cli-completions-bash.txt" || fail "bash completions missed _astrid function"
   run_cli keypair generate --name e2e-cli-key --force --raw > "$ARTIFACTS/cli-keypair-generated.pub"
   run_cli keypair list --json > "$ARTIFACTS/cli-keypair-list.json"
   json_assert_cli_keypair_list "$ARTIFACTS/cli-keypair-list.json" e2e-cli-key
@@ -119,6 +165,14 @@ PY
   run_cli capsule config astrid-capsule-openai-compat --agent "$user_principal" --show --format json \
     > "$ARTIFACTS/cli-capsule-config-openai-user.json"
   json_assert_cli_capsule_config "$ARTIFACTS/cli-capsule-config-openai-user.json" fake-slow
+  run_cli logs --lines 1 > "$ARTIFACTS/cli-logs.txt"
+  [[ -s "$ARTIFACTS/cli-logs.txt" ]] || fail "logs did not emit daemon log tail"
+  run_cli ps --format json > "$ARTIFACTS/cli-ps.json"
+  json_assert_cli_capsule_rows "$ARTIFACTS/cli-ps.json" astrid-capsule-openai-compat
+  run_cli who --format json > "$ARTIFACTS/cli-who.json"
+  json_assert_cli_connections "$ARTIFACTS/cli-who.json"
+  run_cli top > "$ARTIFACTS/cli-top.txt"
+  grep -q "one-shot snapshot" "$ARTIFACTS/cli-top.txt" || fail "top did not emit bounded snapshot header"
 
   run_cli version --format json > "$ARTIFACTS/cli-version.json"
   json_assert_cli_version "$ARTIFACTS/cli-version.json"
@@ -133,6 +187,47 @@ PY
     2> >(tee -a "$ARTIFACTS/cli-transcript.log" >&2) || true
   sed -n '1,120p' "$ARTIFACTS/cli-doctor.txt" >> "$ARTIFACTS/cli-transcript.log"
   grep -q "ASTRID_HOME" "$ARTIFACTS/cli-doctor.txt" || fail "doctor did not inspect ASTRID_HOME"
+}
+
+assert_cli_deferred() {
+  local label=$1 feature=$2 stdout stderr status
+  shift 2
+  stdout="$ARTIFACTS/$label.out"
+  stderr="$ARTIFACTS/$label.err"
+  printf '$ astrid %s\n' "$*" >> "$ARTIFACTS/cli-transcript.log"
+  set +e
+  "$CORE_DIR/target/debug/astrid" "$@" >"$stdout" 2>"$stderr"
+  status=$?
+  set -e
+  tee -a "$ARTIFACTS/cli-transcript.log" < "$stdout"
+  tee -a "$ARTIFACTS/cli-transcript.log" < "$stderr" >&2
+  if [[ "$status" -ne 2 ]]; then
+    fail "$label expected deferred exit 2, got $status"
+  fi
+  grep -Fq "astrid: $feature is not available in this release." "$stderr" \
+    || fail "$label missed deferred feature message"
+  grep -Fq "Tracking issue" "$stderr" \
+    || fail "$label missed tracking issue reference"
+}
+
+assert_cli_exit_contains() {
+  local label=$1 want=$2 needle=$3 stdout stderr status
+  shift 3
+  stdout="$ARTIFACTS/$label.out"
+  stderr="$ARTIFACTS/$label.err"
+  printf '$ astrid %s\n' "$*" >> "$ARTIFACTS/cli-transcript.log"
+  set +e
+  "$CORE_DIR/target/debug/astrid" "$@" >"$stdout" 2>"$stderr"
+  status=$?
+  set -e
+  tee -a "$ARTIFACTS/cli-transcript.log" < "$stdout"
+  tee -a "$ARTIFACTS/cli-transcript.log" < "$stderr" >&2
+  if [[ "$status" -ne "$want" ]]; then
+    fail "$label expected exit $want, got $status"
+  fi
+  if ! grep -Fq "$needle" "$stdout" "$stderr"; then
+    fail "$label missed expected output: $needle"
+  fi
 }
 
 json_assert_cli_agent_list() {
@@ -349,6 +444,38 @@ if data.get("model") != sys.argv[2]:
     raise SystemExit(f"unexpected capsule model config: {data!r}")
 if "api_key" in data:
     raise SystemExit(f"capsule config leaked secret key metadata/value: {data!r}")
+PY
+}
+
+json_assert_cli_capsule_rows() {
+  local file=$1 capsule=$2
+  "$PYTHON" - "$file" "$capsule" <<'PY'
+import json
+import sys
+
+data = json.load(open(sys.argv[1], encoding="utf-8"))
+entry = next((item for item in data if item.get("capsule") == sys.argv[2]), None)
+if not entry:
+    raise SystemExit(f"capsule {sys.argv[2]!r} missing from ps rows: {data!r}")
+if entry.get("state") != "ready":
+    raise SystemExit(f"capsule row not ready: {entry!r}")
+PY
+}
+
+json_assert_cli_connections() {
+  local file=$1
+  "$PYTHON" - "$file" <<'PY'
+import json
+import sys
+
+data = json.load(open(sys.argv[1], encoding="utf-8"))
+if not isinstance(data, list):
+    raise SystemExit(f"who output is not a list: {data!r}")
+if not data:
+    raise SystemExit("who output had no live CLI connection rows")
+for item in data:
+    if not item.get("agent") or item.get("platform") != "cli":
+        raise SystemExit(f"unexpected who row: {item!r}")
 PY
 }
 
