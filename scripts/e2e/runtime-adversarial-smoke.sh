@@ -130,6 +130,45 @@ for principal in (inherited, cloned):
 PY
 }
 
+json_assert_http_create_did_not_inherit_or_clone() {
+  local home=$1
+  local created=$2
+  local capsule=$3
+  "$PYTHON" - "$home" "$created" "$capsule" <<'PY'
+import re
+import sys
+from pathlib import Path
+
+home = Path(sys.argv[1])
+created = sys.argv[2]
+capsule = sys.argv[3]
+profile_path = home / "etc" / "profiles" / f"{created}.toml"
+if not profile_path.exists():
+    raise SystemExit(f"missing created profile: {profile_path}")
+
+def profile_array(key: str) -> list[str]:
+    text = profile_path.read_text(encoding="utf-8")
+    match = re.search(rf"(?ms)^\s*{re.escape(key)}\s*=\s*\[(.*?)\]", text)
+    if not match:
+        return []
+    return re.findall(r'"([^"]*)"', match.group(1))
+
+groups = profile_array("groups")
+if groups != ["agent"]:
+    raise SystemExit(f"HTTP create clone/inherit smuggling changed groups: {groups!r}")
+capsules = profile_array("capsules")
+if capsules:
+    raise SystemExit(f"HTTP create clone/inherit smuggling copied capsules: {capsules!r}")
+
+env_path = home / "home" / created / ".config" / "env" / f"{capsule}.env.json"
+if env_path.exists():
+    raise SystemExit(f"HTTP create clone/inherit smuggling copied env: {env_path}")
+secret_path = home / "secrets" / created / capsule / "api_key"
+if secret_path.exists():
+    raise SystemExit(f"HTTP create clone/inherit smuggling copied secret: {secret_path}")
+PY
+}
+
 json_assert_adversarial_probe_report() {
   local path=$1
   "$PYTHON" - "$path" <<'PY'
@@ -676,6 +715,16 @@ run_adversarial_principal_smoke() {
     "$ARTIFACTS/http-principal-lifecycle-deleted-show.json")"
   assert_status "deleted HTTP principal hidden" "$status" 404
 
+  status="$(http_status POST /api/sys/principals "$admin_bearer" \
+    "{\"name\":\"e2e-http-smuggle-clone\",\"groups\":[\"agent\"],\"grants\":[],\"inherit_from\":\"$user_principal\",\"clone_from\":\"$user_principal\",\"allow_admin_clone\":true}" \
+    "$ARTIFACTS/http-principal-clone-smuggle-create.json")"
+  assert_status "admin HTTP create ignores clone and inherit smuggling fields" "$status" 200
+  json_assert_http_create_did_not_inherit_or_clone "$ASTRID_HOME" \
+    e2e-http-smuggle-clone astrid-capsule-openai-compat
+  status="$(http_status DELETE /api/sys/principals/e2e-http-smuggle-clone "$admin_bearer" "" \
+    "$ARTIFACTS/http-principal-clone-smuggle-delete.json")"
+  assert_status "admin HTTP clone smuggling cleanup" "$status" 204
+
   status="$(http_status POST /api/sys/groups "$user_bearer" \
     '{"name":"regular-group-create-denied","capabilities":["system:status"]}' \
     "$ARTIFACTS/adversarial-regular-group-create-denied.json")"
@@ -733,10 +782,16 @@ run_adversarial_principal_smoke() {
   assert_status "principal query spoof does not widen visibility" "$status" 404
   assert_artifact_lacks_text "$ARTIFACTS/adversarial-principal-query-spoof-hidden.json" \
     "$ops_principal"
+  assert_artifact_lacks_text "$ARTIFACTS/adversarial-principal-query-spoof-hidden.json" \
+    "$user_principal"
 
   status="$(http_status GET "/api/sys/principals/e2e-unknown-principal?principal=$ops_principal" \
     "$user_bearer" "" "$ARTIFACTS/adversarial-principal-unknown-hidden.json")"
   assert_status "unknown principal remains hidden under query spoof" "$status" 404
+  assert_artifact_lacks_text "$ARTIFACTS/adversarial-principal-unknown-hidden.json" \
+    e2e-unknown-principal
+  assert_artifact_lacks_text "$ARTIFACTS/adversarial-principal-unknown-hidden.json" \
+    "$ops_principal"
 
   status="$(http_status GET /api/sys/principals/InvalidPrincipalId "$user_bearer" "" \
     "$ARTIFACTS/adversarial-principal-invalid-id.json")"
