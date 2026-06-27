@@ -278,6 +278,7 @@ run_adversarial_capsule_smoke() {
   local user_bearer=$1
   local user_principal=$2
   local ops_bearer=$3
+  local ops_principal=$4
   local status
 
   note "checking adversarial capsule host-call denial and response spoofing"
@@ -345,6 +346,141 @@ run_adversarial_capsule_smoke() {
   fi
   grep -q '"approved":true' "$approval_out" \
     || fail "adversarial approval command did not report approved decision"
+
+  note "checking live approval denial path"
+  local denial_sse="$ARTIFACTS/adversarial-approval-deny-requests.sse"
+  local denial_out="$ARTIFACTS/adversarial-approval-deny-cli.txt"
+  curl -sN --max-time 20 \
+    -H "Authorization: Bearer $user_bearer" \
+    "$GATEWAY/api/agent/requests" \
+    > "$denial_sse" 2>&1 &
+  local denial_stream_pid=$!
+  wait_for_sse_ready "$denial_sse" || {
+    terminate_pid "$denial_stream_pid"
+    cat "$denial_sse" >&2 2>/dev/null || true
+    fail "approval deny request stream did not become ready"
+  }
+  bounded_principal_cli "$user_principal" 20 "$denial_out" \
+    capsule run astrid-capsule-adversarial adversarial-approval &
+  local denial_cli_pid=$!
+  local denial_request_id
+  denial_request_id="$(wait_for_approval_request_id "$denial_sse")" || {
+    terminate_pid "$denial_cli_pid"
+    terminate_pid "$denial_stream_pid"
+    cat "$denial_sse" >&2 2>/dev/null || true
+    fail "approval deny request stream did not forward adversarial approval request"
+  }
+  status="$(http_status POST /api/agent/approval-response "$user_bearer" \
+    "{\"request_id\":\"$denial_request_id\",\"decision\":\"deny\",\"reason\":\"runtime e2e deny\"}" \
+    "$ARTIFACTS/adversarial-approval-deny-user.json")"
+  assert_status "same-principal approval denial response accepted" "$status" 202
+  local denial_rc=0
+  wait "$denial_cli_pid" || denial_rc=$?
+  terminate_pid "$denial_stream_pid"
+  if [[ "$denial_rc" -eq 0 ]]; then
+    cat "$denial_out" >&2 2>/dev/null || true
+    fail "adversarial approval command succeeded after same-principal deny"
+  fi
+  grep -q '"approved":false' "$denial_out" \
+    || fail "adversarial approval command did not report denied decision"
+
+  note "checking concurrent approval responder correlation"
+  local user_race_sse="$ARTIFACTS/adversarial-approval-race-user.sse"
+  local ops_race_sse="$ARTIFACTS/adversarial-approval-race-ops.sse"
+  local user_race_out="$ARTIFACTS/adversarial-approval-race-user-cli.txt"
+  local ops_race_out="$ARTIFACTS/adversarial-approval-race-ops-cli.txt"
+  curl -sN --max-time 20 \
+    -H "Authorization: Bearer $user_bearer" \
+    "$GATEWAY/api/agent/requests" \
+    > "$user_race_sse" 2>&1 &
+  local user_stream_pid=$!
+  curl -sN --max-time 20 \
+    -H "Authorization: Bearer $ops_bearer" \
+    "$GATEWAY/api/agent/requests" \
+    > "$ops_race_sse" 2>&1 &
+  local ops_stream_pid=$!
+  wait_for_sse_ready "$user_race_sse" || {
+    terminate_pid "$user_stream_pid"
+    terminate_pid "$ops_stream_pid"
+    cat "$user_race_sse" >&2 2>/dev/null || true
+    fail "user approval race stream did not become ready"
+  }
+  wait_for_sse_ready "$ops_race_sse" || {
+    terminate_pid "$user_stream_pid"
+    terminate_pid "$ops_stream_pid"
+    cat "$ops_race_sse" >&2 2>/dev/null || true
+    fail "operator approval race stream did not become ready"
+  }
+
+  bounded_principal_cli "$user_principal" 20 "$user_race_out" \
+    capsule run astrid-capsule-adversarial adversarial-approval &
+  local user_cli_pid=$!
+  bounded_principal_cli "$ops_principal" 20 "$ops_race_out" \
+    capsule run astrid-capsule-adversarial adversarial-approval &
+  local ops_cli_pid=$!
+  local user_request_id ops_request_id
+  user_request_id="$(wait_for_approval_request_id "$user_race_sse")" || {
+    terminate_pid "$user_cli_pid"
+    terminate_pid "$ops_cli_pid"
+    terminate_pid "$user_stream_pid"
+    terminate_pid "$ops_stream_pid"
+    cat "$user_race_sse" >&2 2>/dev/null || true
+    fail "user approval race request was not forwarded"
+  }
+  ops_request_id="$(wait_for_approval_request_id "$ops_race_sse")" || {
+    terminate_pid "$user_cli_pid"
+    terminate_pid "$ops_cli_pid"
+    terminate_pid "$user_stream_pid"
+    terminate_pid "$ops_stream_pid"
+    cat "$ops_race_sse" >&2 2>/dev/null || true
+    fail "operator approval race request was not forwarded"
+  }
+
+  status="$(http_status POST /api/agent/approval-response "$ops_bearer" \
+    "{\"request_id\":\"$user_request_id\",\"decision\":\"approve\",\"reason\":\"crossed operator response must not satisfy\"}" \
+    "$ARTIFACTS/adversarial-approval-race-user-wrong.json")"
+  assert_status "operator crossed approval response accepted but ignored" "$status" 202
+  status="$(http_status POST /api/agent/approval-response "$user_bearer" \
+    "{\"request_id\":\"$ops_request_id\",\"decision\":\"approve\",\"reason\":\"crossed user response must not satisfy\"}" \
+    "$ARTIFACTS/adversarial-approval-race-ops-wrong.json")"
+  assert_status "user crossed approval response accepted but ignored" "$status" 202
+  sleep 0.5
+  if ! kill -0 "$user_cli_pid" 2>/dev/null || ! kill -0 "$ops_cli_pid" 2>/dev/null; then
+    wait "$user_cli_pid" || true
+    wait "$ops_cli_pid" || true
+    terminate_pid "$user_stream_pid"
+    terminate_pid "$ops_stream_pid"
+    cat "$user_race_out" >&2 2>/dev/null || true
+    cat "$ops_race_out" >&2 2>/dev/null || true
+    fail "crossed approval response satisfied a concurrent waiter"
+  fi
+
+  status="$(http_status POST /api/agent/approval-response "$user_bearer" \
+    "{\"request_id\":\"$user_request_id\",\"decision\":\"approve\",\"reason\":\"runtime e2e race approve\"}" \
+    "$ARTIFACTS/adversarial-approval-race-user-final.json")"
+  assert_status "user concurrent approval response accepted" "$status" 202
+  status="$(http_status POST /api/agent/approval-response "$ops_bearer" \
+    "{\"request_id\":\"$ops_request_id\",\"decision\":\"deny\",\"reason\":\"runtime e2e race deny\"}" \
+    "$ARTIFACTS/adversarial-approval-race-ops-final.json")"
+  assert_status "operator concurrent approval denial accepted" "$status" 202
+
+  local user_race_rc=0 ops_race_rc=0
+  wait "$user_cli_pid" || user_race_rc=$?
+  wait "$ops_cli_pid" || ops_race_rc=$?
+  terminate_pid "$user_stream_pid"
+  terminate_pid "$ops_stream_pid"
+  if [[ "$user_race_rc" -ne 0 ]]; then
+    cat "$user_race_out" >&2 2>/dev/null || true
+    fail "user concurrent approval command failed after same-principal approve"
+  fi
+  if [[ "$ops_race_rc" -eq 0 ]]; then
+    cat "$ops_race_out" >&2 2>/dev/null || true
+    fail "operator concurrent approval command succeeded after same-principal deny"
+  fi
+  grep -q '"approved":true' "$user_race_out" \
+    || fail "user concurrent approval command did not report approved decision"
+  grep -q '"approved":false' "$ops_race_out" \
+    || fail "operator concurrent approval command did not report denied decision"
 }
 
 run_adversarial_principal_smoke() {

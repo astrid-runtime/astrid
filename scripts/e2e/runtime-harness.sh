@@ -692,7 +692,8 @@ PY
     astrid-capsule-openai-compat api_key
   run_adversarial_principal_smoke "$user_bearer" "$user_principal" \
     "$ops_bearer" "$ops_principal" "$user_secret"
-  run_adversarial_capsule_smoke "$user_bearer" "$user_principal" "$ops_bearer"
+  run_adversarial_capsule_smoke "$user_bearer" "$user_principal" \
+    "$ops_bearer" "$ops_principal"
   run_cli_semantic_smoke "$user_principal" "$ops_principal"
 
   curl -sN --max-time 3 \
