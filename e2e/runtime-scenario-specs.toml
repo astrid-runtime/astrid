@@ -26,12 +26,12 @@ evidence = ["gateway-prompt.sse and HTTP status artifacts"]
 
 [scenarios.approval_flow]
 status = "mapped"
-surfaces = ["capability"]
+surfaces = ["capability", "http"]
 auth = ["principal-scoped approval responder"]
 success = ["same-principal response resolves the pending approval"]
 denial = ["different principal cannot answer, deny, or cancel another principal's approval"]
 state = ["approval waiter is removed after accept, deny, timeout, or cancel"]
-evidence = ["approval result artifact and audit outcome"]
+evidence = ["approval result artifact, HTTP responder guardrails, and audit outcome"]
 
 [scenarios.audit_event_stream]
 status = "mapped"

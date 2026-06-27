@@ -180,6 +180,8 @@ fn build_authed_router(state: &Arc<GatewayState>) -> Router<Arc<GatewayState>> {
         .route("/api/sys/audit", get(audit::get_audit))
         // ── Agent invocation (SSE) ──
         .route("/api/agent/prompt", post(agent::post_prompt))
+        // ── Pending approval/elicit requests (SSE) ──
+        .route("/api/agent/requests", get(agent::get_requests))
         // ── Per-principal live conversation feed (SSE, #973) ──
         .route("/api/agent/stream", get(stream::get_stream))
         // ── Conversation threads (proxied to capsule-session) ──
@@ -202,6 +204,10 @@ fn build_authed_router(state: &Arc<GatewayState>) -> Router<Arc<GatewayState>> {
         .route(
             "/api/agent/elicit-response",
             post(agent::post_elicit_response),
+        )
+        .route(
+            "/api/agent/approval-response",
+            post(agent::post_approval_response),
         )
         // ── Models (active-LLM selection) ──
         .route("/api/models", get(models::list_models))

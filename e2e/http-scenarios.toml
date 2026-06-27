@@ -198,6 +198,11 @@ scenario = "prompt_fake_openai_compat"
 status = "covered"
 auth = "bearer"
 
+[routes."GET /api/agent/requests"]
+scenario = "approval_flow"
+status = "covered"
+auth = "bearer"
+
 [routes."GET /api/agent/stream"]
 scenario = "agent_stream"
 status = "covered"
@@ -235,6 +240,11 @@ auth = "bearer"
 
 [routes."POST /api/agent/elicit-response"]
 scenario = "elicitation_flow"
+status = "covered"
+auth = "bearer"
+
+[routes."POST /api/agent/approval-response"]
+scenario = "approval_flow"
 status = "covered"
 auth = "bearer"
 
