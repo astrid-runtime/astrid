@@ -157,6 +157,15 @@ assert_no_adversarial_session_poison() {
   fi
 }
 
+assert_artifact_lacks_text() {
+  local path=$1
+  local text=$2
+  if grep -Fq "$text" "$path"; then
+    cat "$path" >&2 || true
+    fail "artifact $path leaked forbidden text: $text"
+  fi
+}
+
 run_adversarial_capsule_smoke() {
   local user_bearer=$1
   local user_principal=$2
@@ -269,4 +278,14 @@ run_adversarial_principal_smoke() {
   status="$(http_status GET "/api/sys/principals/$ops_principal?principal=$user_principal" \
     "$user_bearer" "" "$ARTIFACTS/adversarial-principal-query-spoof-hidden.json")"
   assert_status "principal query spoof does not widen visibility" "$status" 404
+  assert_artifact_lacks_text "$ARTIFACTS/adversarial-principal-query-spoof-hidden.json" \
+    "$ops_principal"
+
+  status="$(http_status GET "/api/sys/principals/e2e-unknown-principal?principal=$ops_principal" \
+    "$user_bearer" "" "$ARTIFACTS/adversarial-principal-unknown-hidden.json")"
+  assert_status "unknown principal remains hidden under query spoof" "$status" 404
+
+  status="$(http_status GET /api/sys/principals/InvalidPrincipalId "$user_bearer" "" \
+    "$ARTIFACTS/adversarial-principal-invalid-id.json")"
+  assert_status "invalid principal id rejected with bounded error" "$status" 400
 }
