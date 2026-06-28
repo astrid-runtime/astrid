@@ -166,6 +166,17 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("cache-control", "no-cache")
         self.end_headers()
 
+        if "ASTRID_E2E_INFLIGHT_CRASH_" in json.dumps(
+            body.get("messages", []), sort_keys=True
+        ):
+            self.wfile.write(
+                b'data: {"id":"chatcmpl-fake","object":"chat.completion.chunk",'
+                b'"model":"fake-crash-hold","choices":[{"index":0,'
+                b'"delta":{"content":"still "},"finish_reason":null}]}\n\n'
+            )
+            self.wfile.flush()
+            time.sleep(30)
+            return
         if model == "fake-slow":
             time.sleep(2)
 
