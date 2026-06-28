@@ -79,12 +79,23 @@ assert_http_prompt_stream() {
   status="$(<"$status_file")"
   LAST_HTTP_OUT="$out"
   assert_status "$label HTTP prompt" "$status" 200
-  grep -q '^event: ready' "$out" || fail "$label HTTP prompt missed ready event"
-  grep -q "\"principal\":\"$principal\"" "$out" \
-    || fail "$label HTTP prompt ready event missed principal"
-  grep -q '^event: response' "$out" || fail "$label HTTP prompt missed response event"
+  grep -q '^event: ready' "$out" || {
+    cat "$out" >&2 || true
+    fail "$label HTTP prompt missed ready event"
+  }
+  grep -q "\"principal\":\"$principal\"" "$out" || {
+    cat "$out" >&2 || true
+    fail "$label HTTP prompt ready event missed principal"
+  }
+  grep -q '^event: response' "$out" || {
+    cat "$out" >&2 || true
+    fail "$label HTTP prompt missed response event"
+  }
   if [[ "$expected_text" != "-" ]]; then
-    grep -Fq "$expected_text" "$out" || fail "$label HTTP prompt missed expected text"
+    grep -Fq "$expected_text" "$out" || {
+      cat "$out" >&2 || true
+      fail "$label HTTP prompt missed expected text"
+    }
   fi
   if grep -Fq "$forbidden_text" "$out"; then
     cat "$out" >&2 || true
@@ -97,32 +108,35 @@ run_concurrent_cli_control_mutation_smoke() {
 
   note "checking concurrent CLI capability mutations stay scoped"
 
+  local capability="e2e:concurrent:cli-control"
   local user_pid ops_pid user_wait=0 ops_wait=0
-  run_cli caps grant "$user_principal" system:status \
+  run_cli caps grant "$user_principal" "$capability" \
     > "$ARTIFACTS/concurrent-cli-user-grant.txt" &
   user_pid=$!
-  run_cli caps grant "$ops_principal" system:status \
+  run_cli caps grant "$ops_principal" "$capability" \
     > "$ARTIFACTS/concurrent-cli-ops-grant.txt" &
   ops_pid=$!
 
   wait "$user_pid" || user_wait=$?
   wait "$ops_pid" || ops_wait=$?
-  [[ "$user_wait" -eq 0 ]] || fail "concurrent user caps grant failed"
-  [[ "$ops_wait" -eq 0 ]] || fail "concurrent operator caps grant failed"
+  [[ "$user_wait" -eq 0 ]] || {
+    cat "$ARTIFACTS/concurrent-cli-user-grant.txt" >&2 || true
+    fail "concurrent user caps grant failed"
+  }
+  [[ "$ops_wait" -eq 0 ]] || {
+    cat "$ARTIFACTS/concurrent-cli-ops-grant.txt" >&2 || true
+    fail "concurrent operator caps grant failed"
+  }
 
-  run_cli caps check "$user_principal" system:status \
-    > "$ARTIFACTS/concurrent-cli-user-check-granted.txt"
-  grep -q "allowed" "$ARTIFACTS/concurrent-cli-user-check-granted.txt" \
-    || fail "concurrent user caps grant was not effective"
-  run_cli caps check "$ops_principal" system:status \
-    > "$ARTIFACTS/concurrent-cli-ops-check-granted.txt"
-  grep -q "allowed" "$ARTIFACTS/concurrent-cli-ops-check-granted.txt" \
-    || fail "concurrent operator caps grant was not effective"
+  assert_cli_exit_contains "concurrent-cli-user-check-granted" 0 "allowed" \
+    caps check "$user_principal" "$capability"
+  assert_cli_exit_contains "concurrent-cli-ops-check-granted" 0 "allowed" \
+    caps check "$ops_principal" "$capability"
 
-  run_cli caps revoke "$user_principal" system:status \
+  run_cli caps revoke "$user_principal" "$capability" \
     > "$ARTIFACTS/concurrent-cli-user-revoke.txt" &
   user_pid=$!
-  run_cli caps revoke "$ops_principal" system:status \
+  run_cli caps revoke "$ops_principal" "$capability" \
     > "$ARTIFACTS/concurrent-cli-ops-revoke.txt" &
   ops_pid=$!
 
@@ -130,17 +144,19 @@ run_concurrent_cli_control_mutation_smoke() {
   ops_wait=0
   wait "$user_pid" || user_wait=$?
   wait "$ops_pid" || ops_wait=$?
-  [[ "$user_wait" -eq 0 ]] || fail "concurrent user caps revoke failed"
-  [[ "$ops_wait" -eq 0 ]] || fail "concurrent operator caps revoke failed"
+  [[ "$user_wait" -eq 0 ]] || {
+    cat "$ARTIFACTS/concurrent-cli-user-revoke.txt" >&2 || true
+    fail "concurrent user caps revoke failed"
+  }
+  [[ "$ops_wait" -eq 0 ]] || {
+    cat "$ARTIFACTS/concurrent-cli-ops-revoke.txt" >&2 || true
+    fail "concurrent operator caps revoke failed"
+  }
 
-  run_cli caps check "$user_principal" system:status \
-    > "$ARTIFACTS/concurrent-cli-user-check-revoked.txt"
-  grep -q "denied" "$ARTIFACTS/concurrent-cli-user-check-revoked.txt" \
-    || fail "concurrent user caps revoke was not effective"
-  run_cli caps check "$ops_principal" system:status \
-    > "$ARTIFACTS/concurrent-cli-ops-check-revoked.txt"
-  grep -q "denied" "$ARTIFACTS/concurrent-cli-ops-check-revoked.txt" \
-    || fail "concurrent operator caps revoke was not effective"
+  assert_cli_exit_contains "concurrent-cli-user-check-revoked" 1 "denied" \
+    caps check "$user_principal" "$capability"
+  assert_cli_exit_contains "concurrent-cli-ops-check-revoked" 1 "denied" \
+    caps check "$ops_principal" "$capability"
 }
 
 run_concurrent_prompt_correlation_smoke() {
