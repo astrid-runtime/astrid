@@ -302,7 +302,9 @@ PY
 run_cli_daemon_lifecycle_smoke() {
   local home="$ARTIFACTS/cli-daemon-home"
   local cwd="$ARTIFACTS/cli-daemon-cwd"
-  mkdir -p "$home/etc" "$cwd"
+  mkdir -p "$home/etc" "$home/home/default/.config" "$cwd"
+  # This smoke covers daemon process lifecycle, not first-run distro install.
+  printf 'schema-version = 1\n' > "$home/home/default/.config/distro.lock"
   run_isolated_cli "$home" "$cwd" start > "$ARTIFACTS/cli-daemon-start.txt"
   grep -Eq "started|already running" "$ARTIFACTS/cli-daemon-start.txt" \
     || fail "isolated daemon start did not report running state"
