@@ -437,16 +437,7 @@ pub(crate) enum McpCommands {
     /// Long-running: serves on stdin/stdout until the client closes the
     /// stream (EOF) or the process is killed. Stdout carries the MCP
     /// JSON-RPC protocol only — all diagnostics go to stderr.
-    Serve {
-        /// Principal to act as for this MCP server. Overrides the
-        /// process-wide principal (the global `--principal` /
-        /// `ASTRID_PRINCIPAL`); when omitted, falls back to it (which
-        /// itself defaults to the active CLI agent, then `default`).
-        /// Stamped onto every IPC message so the kernel scopes tool
-        /// execution to this identity.
-        #[arg(long)]
-        principal: Option<String>,
-    },
+    Serve,
 }
 
 #[derive(Subcommand)]
@@ -642,6 +633,11 @@ mod tests {
         ])
         .expect("global --principal should parse before nested subcommands");
         assert_eq!(cli.principal.as_deref(), Some("operator-1"));
+    }
+
+    #[test]
+    fn clap_command_tree_debug_asserts() {
+        Cli::command().debug_assert();
     }
 
     /// The built-in name list fed to the typo guard (harvested from

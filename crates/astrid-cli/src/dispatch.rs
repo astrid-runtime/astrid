@@ -348,7 +348,7 @@ async fn dispatch_capsule(command: crate::cli::CapsuleCommands) -> Result<ExitCo
 
 async fn dispatch_mcp(command: McpCommands) -> Result<ExitCode> {
     match command {
-        McpCommands::Serve { principal } => commands::mcp::serve(principal.as_deref()).await,
+        McpCommands::Serve => commands::mcp::serve(None).await,
     }
 }
 

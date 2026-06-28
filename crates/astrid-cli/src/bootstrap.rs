@@ -79,7 +79,7 @@ pub(crate) fn init_logging(cli: &Cli) {
     if matches!(
         cli.command,
         Some(crate::cli::Commands::Mcp {
-            command: crate::cli::McpCommands::Serve { .. }
+            command: crate::cli::McpCommands::Serve
         })
     ) && matches!(log_config.target, astrid_telemetry::LogTarget::Stdout)
     {

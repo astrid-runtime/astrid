@@ -186,10 +186,10 @@ PY
     "$ARTIFACTS/cli-pair-device-redeem.json")"
   assert_status "CLI-issued pair token redeem" "$status" 200
   pair_key_id="$(json_field "$ARTIFACTS/cli-pair-device-redeem.json" key_id)"
-  run_cli pair-device list --principal default --json > "$ARTIFACTS/cli-pair-device-list.json"
+  run_cli pair-device list --agent default --json > "$ARTIFACTS/cli-pair-device-list.json"
   json_assert_pair_device_list "$ARTIFACTS/cli-pair-device-list.json" "$pair_key_id" present
-  run_cli pair-device revoke "$pair_key_id" --principal default
-  run_cli pair-device list --principal default --json > "$ARTIFACTS/cli-pair-device-list-after-revoke.json"
+  run_cli pair-device revoke "$pair_key_id" --agent default
+  run_cli pair-device list --agent default --json > "$ARTIFACTS/cli-pair-device-list-after-revoke.json"
   json_assert_pair_device_list "$ARTIFACTS/cli-pair-device-list-after-revoke.json" "$pair_key_id" absent
 
   run_cli capsule show astrid-capsule-openai-compat --format json \
@@ -238,7 +238,7 @@ PY
     || fail "doctor relative ASTRID_HOME missed bounded diagnostic"
   run_cli_stdin_timeout "cli-chat-eof" 20 --format json chat
   grep -q "Goodbye" "$ARTIFACTS/cli-chat-eof.out" || fail "chat EOF path did not exit cleanly"
-  run_cli_stdin_timeout "cli-mcp-serve-eof" 20 mcp serve --principal anonymous
+  run_cli_stdin_timeout "cli-mcp-serve-eof" 20 --principal anonymous mcp serve
   run_cli_daemon_lifecycle_smoke
 }
 

@@ -75,9 +75,9 @@ pub(crate) struct IssueArgs {
 
 #[derive(Args, Debug, Clone)]
 pub(crate) struct ListArgs {
-    /// Principal whose devices to list. Defaults to the active context.
-    /// Listing another principal's devices needs the global `auth:pair`.
-    #[arg(long)]
+    /// Agent whose devices to list. Defaults to the active context.
+    /// Listing another agent's devices needs the global `auth:pair`.
+    #[arg(long = "agent")]
     pub principal: Option<String>,
     /// Emit the response as JSON. Default emits a table.
     #[arg(long)]
@@ -88,9 +88,9 @@ pub(crate) struct ListArgs {
 pub(crate) struct RevokeArgs {
     /// The `key_id` of the device to revoke (from `pair-device list`).
     pub key_id: String,
-    /// Principal whose device to revoke. Defaults to the active context.
-    /// Revoking another principal's device needs the global `auth:pair`.
-    #[arg(long)]
+    /// Agent whose device to revoke. Defaults to the active context.
+    /// Revoking another agent's device needs the global `auth:pair`.
+    #[arg(long = "agent")]
     pub principal: Option<String>,
 }
 
