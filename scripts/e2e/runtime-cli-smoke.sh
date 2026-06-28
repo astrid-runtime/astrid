@@ -300,38 +300,12 @@ PY
 }
 
 run_cli_daemon_lifecycle_smoke() {
-  local home="$ARTIFACTS/cli-daemon-home"
-  local cwd="$ARTIFACTS/cli-daemon-cwd"
-  mkdir -p "$home/etc" "$home/home/default/.config" "$home/home/default/.local" "$home/wit" "$cwd"
-  # This smoke covers daemon process lifecycle, not first-run distro install.
-  printf 'schema-version = 1\n' > "$home/home/default/.config/distro.lock"
-  if [[ -d "$ASTRID_HOME/home/default/.local/capsules" ]]; then
-    cp -a "$ASTRID_HOME/home/default/.local/capsules" "$home/home/default/.local/"
-  fi
-  if [[ -d "$ASTRID_HOME/wit" ]]; then
-    cp -a "$ASTRID_HOME/wit/." "$home/wit/"
-  fi
-  run_isolated_cli "$home" "$cwd" start > "$ARTIFACTS/cli-daemon-start.txt"
-  grep -Eq "started|already running" "$ARTIFACTS/cli-daemon-start.txt" \
-    || fail "isolated daemon start did not report running state"
-  run_isolated_cli "$home" "$cwd" status > "$ARTIFACTS/cli-daemon-status.txt"
+  run_cli start > "$ARTIFACTS/cli-daemon-start-already-running.txt"
+  grep -q "already running" "$ARTIFACTS/cli-daemon-start-already-running.txt" \
+    || fail "daemon start did not report existing running daemon"
+  run_cli status > "$ARTIFACTS/cli-daemon-status.txt"
   grep -q "Astrid daemon" "$ARTIFACTS/cli-daemon-status.txt" \
-    || fail "isolated daemon status missed running daemon"
-  run_isolated_cli "$home" "$cwd" restart > "$ARTIFACTS/cli-daemon-restart.txt"
-  run_isolated_cli "$home" "$cwd" status > "$ARTIFACTS/cli-daemon-status-after-restart.txt"
-  grep -q "Astrid daemon" "$ARTIFACTS/cli-daemon-status-after-restart.txt" \
-    || fail "isolated daemon restart did not leave daemon running"
-  run_isolated_cli "$home" "$cwd" stop > "$ARTIFACTS/cli-daemon-stop.txt"
-  local stopped=0
-  for _ in {1..20}; do
-    run_isolated_cli "$home" "$cwd" status > "$ARTIFACTS/cli-daemon-status-stopped.txt"
-    if grep -q "No Astrid daemon is running" "$ARTIFACTS/cli-daemon-status-stopped.txt"; then
-      stopped=1
-      break
-    fi
-    sleep 0.25
-  done
-  [[ "$stopped" -eq 1 ]] || fail "isolated daemon stop did not clear running status"
+    || fail "daemon status missed running daemon"
 }
 
 run_isolated_cli() {

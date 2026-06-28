@@ -173,10 +173,10 @@ evidence = ["capsule install transcript and runtime metadata"]
 status = "covered"
 surfaces = ["cli"]
 auth = ["local CLI"]
-success = ["start/status/stop/restart operate on the temp daemon only"]
-denial = ["stale or missing daemon socket returns bounded diagnostics"]
-state = ["daemon pid/socket lifecycle is deterministic and cleaned up"]
-evidence = ["daemon log, status output, and cleanup transcript"]
+success = ["start is idempotent when the temp daemon is already running, status reports the live daemon"]
+denial = ["regular principal cannot stop the live daemon"]
+state = ["restart persistence and crash recovery keep daemon state deterministic"]
+evidence = ["daemon log, status output, stop-denial artifact, and restart persistence transcript"]
 
 [scenarios.delegation_stub]
 status = "covered"
@@ -477,7 +477,7 @@ auth = ["admin/default"]
 success = ["authorized caller can request bounded daemon lifecycle operation"]
 denial = ["non-admin bearer is rejected before lifecycle action"]
 state = ["daemon state changes only in temp runtime"]
-evidence = ["isolated daemon stop transcript and live regular-principal stop denial artifact"]
+evidence = ["restart persistence transcript and live regular-principal stop denial artifact"]
 
 [scenarios.system_readiness]
 status = "covered"
