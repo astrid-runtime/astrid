@@ -92,7 +92,7 @@ async fn check_http_security(
         )
         .await;
         match gated {
-            Ok(check) if check.is_ok() => {}
+            Ok(check) if check.is_ok() => {},
             Ok(_) => return Err(ErrorCode::CapabilityDenied),
             Err(_elapsed) => return Err(ErrorCode::Timeout),
         }
