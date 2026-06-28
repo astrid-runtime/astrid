@@ -68,6 +68,7 @@ async fn check_http_security(
     url: &str,
     method: &str,
     io_semaphore: &Arc<tokio::sync::Semaphore>,
+    deadline: Duration,
 ) -> Result<(), ErrorCode> {
     if let Some(gate) = security {
         let url_obj = reqwest::Url::parse(url).map_err(|_| ErrorCode::InvalidRequest)?;
@@ -76,12 +77,24 @@ async fn check_http_security(
         let full_url = url.to_string();
         let m = method.to_string();
         let gate = gate.clone();
-        let check = util::bounded_await(io_semaphore, async move {
-            gate.check_http_request(&capsule_id, &m, &full_url).await
-        })
+        // Bound the egress authorization the SAME way the send is bounded. The
+        // gate is an IPC round-trip (capability authorization); without a
+        // deadline a gate that never replies — or a saturated `io_semaphore` —
+        // hangs the whole request indefinitely, stalling the agent turn until
+        // the consumer's tool-stall watchdog fires (astrid#1078). The timeout
+        // wraps `bounded_await` so it covers BOTH permit acquisition and the
+        // gate call. Fail closed on elapse.
+        let gated = tokio::time::timeout(
+            deadline,
+            util::bounded_await(io_semaphore, async move {
+                gate.check_http_request(&capsule_id, &m, &full_url).await
+            }),
+        )
         .await;
-        if check.is_err() {
-            return Err(ErrorCode::CapabilityDenied);
+        match gated {
+            Ok(check) if check.is_ok() => {}
+            Ok(_) => return Err(ErrorCode::CapabilityDenied),
+            Err(_elapsed) => return Err(ErrorCode::Timeout),
         }
     }
     Ok(())
@@ -224,7 +237,19 @@ impl HostState {
         let capsule_id = self.capsule_id.as_str().to_owned();
         let security = self.security.clone();
         let io_semaphore = self.io_semaphore.clone();
-        check_http_security(&security, capsule_id, url, method.as_str(), &io_semaphore).await?;
+        // The egress-authorization gate may not exceed the request's own
+        // deadline (header deadline = caller first-byte/total, else the host
+        // floor) — see [`check_http_security`].
+        let gate_deadline = header_deadline(opts, self.http_limits.header_deadline_floor);
+        check_http_security(
+            &security,
+            capsule_id,
+            url,
+            method.as_str(),
+            &io_semaphore,
+            gate_deadline,
+        )
+        .await?;
 
         let exempt_host = self.egress_decision_with_consent(url)?;
         let exempt = exempt_host.is_some();
