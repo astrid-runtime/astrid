@@ -39,7 +39,12 @@ pub(crate) struct Cli {
     /// chars of `[a-zA-Z0-9_-]`. The uplink proxy pins the first
     /// principal it sees on a connection and drops any message stamped
     /// with a different one, so this is fixed for the whole process.
-    #[arg(long, global = true, env = "ASTRID_PRINCIPAL")]
+    #[arg(
+        id = "process-principal",
+        long = "principal",
+        global = true,
+        env = "ASTRID_PRINCIPAL"
+    )]
     pub principal: Option<String>,
 
     /// Non-interactive prompt. Sends the prompt, prints the response, and exits.
@@ -622,6 +627,21 @@ mod tests {
             matches!(cli.command, Some(Commands::Status)),
             "`status` must parse to the built-in, never External"
         );
+    }
+
+    #[test]
+    fn global_principal_parses_before_nested_subcommand() {
+        let cli = Cli::try_parse_from([
+            "astrid",
+            "--principal",
+            "operator-1",
+            "caps",
+            "token",
+            "list",
+            "regular-user",
+        ])
+        .expect("global --principal should parse before nested subcommands");
+        assert_eq!(cli.principal.as_deref(), Some("operator-1"));
     }
 
     /// The built-in name list fed to the typo guard (harvested from
