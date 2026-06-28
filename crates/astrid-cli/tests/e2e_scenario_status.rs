@@ -1,4 +1,11 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+
+const REQUIRED_SCENARIO_FIELDS: &[&str] = &[
+    "status", "surfaces", "auth", "success", "denial", "state", "evidence",
+];
+
+const VALID_SCENARIO_STATUSES: &[&str] = &["covered", "mapped", "waived"];
+const VALID_SURFACES: &[&str] = &["capability", "capsule", "cli", "http"];
 
 #[test]
 fn mapped_runtime_scenarios_have_mapped_surface_work() {
@@ -69,6 +76,92 @@ fn mapped_runtime_scenarios_have_mapped_surface_work() {
     );
 }
 
+#[test]
+fn runtime_scenarios_are_executable_contracts() {
+    let scenario_src = include_str!("../../../e2e/runtime-scenario-specs.toml");
+    let parsed: toml::Value =
+        toml::from_str(scenario_src).expect("runtime-scenario-specs.toml parses");
+    let scenarios = runtime_scenarios(&parsed);
+
+    let duplicate_keys = duplicate_scenario_keys(scenario_src);
+    assert!(
+        duplicate_keys.is_empty(),
+        "runtime scenario specs contain duplicate keys:\n{}",
+        duplicate_keys.join("\n")
+    );
+
+    for (scenario, entry) in scenarios {
+        let table = entry
+            .as_table()
+            .unwrap_or_else(|| panic!("runtime scenario {scenario:?} must be a table"));
+        for field in REQUIRED_SCENARIO_FIELDS {
+            assert!(
+                non_empty_field(table, field),
+                "runtime scenario {scenario:?} needs non-empty {field:?}"
+            );
+        }
+
+        let status = string_field(table, "status", scenario);
+        assert!(
+            VALID_SCENARIO_STATUSES.contains(&status),
+            "runtime scenario {scenario:?} has invalid status {status:?}"
+        );
+
+        let surfaces = string_array_field(table, "surfaces", scenario);
+        for surface in surfaces {
+            assert!(
+                VALID_SURFACES.contains(&surface),
+                "runtime scenario {scenario:?} has invalid surface {surface:?}"
+            );
+        }
+
+        match status {
+            "covered" => {
+                assert!(
+                    !non_empty_field(table, "remaining"),
+                    "covered runtime scenario {scenario:?} must not carry remaining work"
+                );
+            }
+            "mapped" => {
+                assert!(
+                    non_empty_field(table, "remaining"),
+                    "mapped runtime scenario {scenario:?} needs explicit remaining work"
+                );
+            }
+            "waived" => {
+                assert!(
+                    non_empty_field(table, "waiver"),
+                    "waived runtime scenario {scenario:?} needs an explicit waiver"
+                );
+            }
+            _ => unreachable!(),
+        }
+    }
+}
+
+#[test]
+fn surface_manifests_reference_declared_runtime_scenarios() {
+    let scenario_src = include_str!("../../../e2e/runtime-scenario-specs.toml");
+    let parsed: toml::Value =
+        toml::from_str(scenario_src).expect("runtime-scenario-specs.toml parses");
+    let declared: BTreeSet<_> = runtime_scenarios(&parsed).keys().cloned().collect();
+    let mut references = BTreeMap::<String, Vec<ScenarioReference>>::new();
+
+    collect_all_references(&mut references);
+
+    let missing: Vec<_> = references
+        .iter()
+        .filter(|(scenario, _)| !declared.contains(*scenario))
+        .map(|(scenario, refs)| format!("{scenario}: {}", format_references(refs)))
+        .collect();
+
+    assert!(
+        missing.is_empty(),
+        "surface manifests reference undeclared runtime scenarios:\n{}",
+        missing.join("\n")
+    );
+}
+
 #[derive(Debug)]
 struct ScenarioReference {
     manifest: &'static str,
@@ -113,6 +206,33 @@ fn collect_references(
     }
 }
 
+fn collect_all_references(references: &mut BTreeMap<String, Vec<ScenarioReference>>) {
+    collect_references(
+        references,
+        include_str!("../../../e2e/cli-scenarios.toml"),
+        "commands",
+        "cli-scenarios.toml",
+    );
+    collect_references(
+        references,
+        include_str!("../../../e2e/http-scenarios.toml"),
+        "routes",
+        "http-scenarios.toml",
+    );
+    collect_references(
+        references,
+        include_str!("../../../e2e/first-party-capsule-scenarios.toml"),
+        "capsule_commands",
+        "first-party-capsule-scenarios.toml",
+    );
+    collect_references(
+        references,
+        include_str!("../../../e2e/capability-scenarios.toml"),
+        "capabilities",
+        "capability-scenarios.toml",
+    );
+}
+
 fn format_references(refs: &[ScenarioReference]) -> String {
     refs.iter()
         .map(|reference| {
@@ -125,10 +245,86 @@ fn format_references(refs: &[ScenarioReference]) -> String {
         .join(", ")
 }
 
+fn runtime_scenarios(parsed: &toml::Value) -> &toml::value::Table {
+    parsed
+        .get("scenarios")
+        .and_then(toml::Value::as_table)
+        .expect("runtime-scenario-specs.toml must contain [scenarios]")
+}
+
+fn string_field<'a>(
+    table: &'a toml::value::Table,
+    field: &str,
+    scenario: &str,
+) -> &'a str {
+    table
+        .get(field)
+        .and_then(toml::Value::as_str)
+        .unwrap_or_else(|| panic!("runtime scenario {scenario:?} needs string {field:?}"))
+}
+
+fn string_array_field<'a>(
+    table: &'a toml::value::Table,
+    field: &str,
+    scenario: &str,
+) -> Vec<&'a str> {
+    table
+        .get(field)
+        .and_then(toml::Value::as_array)
+        .unwrap_or_else(|| panic!("runtime scenario {scenario:?} needs array {field:?}"))
+        .iter()
+        .map(|value| {
+            value
+                .as_str()
+                .unwrap_or_else(|| panic!("runtime scenario {scenario:?} has non-string {field:?}"))
+        })
+        .collect()
+}
+
 fn non_empty_field(table: &toml::value::Table, field: &str) -> bool {
     match table.get(field) {
         Some(toml::Value::String(value)) => !value.trim().is_empty(),
-        Some(toml::Value::Array(items)) => !items.is_empty(),
+        Some(toml::Value::Array(items)) => items.iter().any(|item| match item {
+            toml::Value::String(value) => !value.trim().is_empty(),
+            _ => true,
+        }),
         _ => false,
     }
+}
+
+fn duplicate_scenario_keys(src: &str) -> Vec<String> {
+    let mut table = String::new();
+    let mut seen = BTreeMap::<String, BTreeSet<String>>::new();
+    let mut duplicates = Vec::new();
+
+    for (index, raw_line) in src.lines().enumerate() {
+        let line = raw_line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+
+        if let Some(name) = line
+            .strip_prefix("[scenarios.")
+            .and_then(|rest| rest.strip_suffix(']'))
+        {
+            table = name.to_string();
+            continue;
+        }
+
+        if table.is_empty() || line.starts_with('[') {
+            continue;
+        }
+
+        let Some((key, _)) = line.split_once('=') else {
+            continue;
+        };
+        let key = key.trim().to_string();
+        let inserted = seen.entry(table.clone()).or_default().insert(key.clone());
+        if !inserted {
+            let line_number = index.checked_add(1).expect("line number does not overflow");
+            duplicates.push(format!("line {line_number}: scenarios.{table}.{key}"));
+        }
+    }
+
+    duplicates
 }

@@ -441,6 +441,7 @@ success = ["future caller-workspace install/reload/remove applies only to that c
 denial = ["self-scoped caller cannot mutate daemon install-target or daemon-wide loaded capsule state"]
 state = ["workspace capsule metadata remains caller-scoped"]
 evidence = ["workspace install/reload/remove artifacts and denial responses"]
+remaining = ["caller-workspace capsule lifecycle needs a first-class workspace target; daemon workspace install/reload/remove is intentionally global or rejected today"]
 
 [scenarios.self_update_check]
 status = "waived"
