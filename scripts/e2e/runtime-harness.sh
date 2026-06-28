@@ -982,7 +982,7 @@ PY
   assert_status "final metrics scrape" "$status" 200
   json_assert_metrics_contract "$ARTIFACTS/final-metrics.txt" \
     "$user_principal" "$ops_principal" "$user_session" "$ops_session" "$paired_key_id"
-  assert_runtime_log_contract "$ARTIFACTS/daemon.log" \
+  assert_runtime_log_contract "$ARTIFACTS/daemon.log" "$ASTRID_HOME/log" -- \
     "$user_bearer" "$ops_bearer" "$paired_bearer" "$refreshed_paired_bearer" \
     "$restart_user_bearer" "$agent_invite" "$pair_token"
 
