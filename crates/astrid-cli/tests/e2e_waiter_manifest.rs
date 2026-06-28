@@ -62,6 +62,14 @@ fn e2e_waiter_manifest_documents_correlation_and_recovery_contracts() {
                 && non_empty_string(table, "cancel"),
             "waiter {name:?} must describe owner/request/response/timeout/cancel"
         );
+        for field in [
+            "correlation",
+            "runtime_coverage",
+            "unit_coverage",
+            "remaining",
+        ] {
+            assert_string_array(name, table, field);
+        }
         assert!(
             non_empty_array(table, "correlation"),
             "waiter {name:?} must name its correlation keys"
@@ -109,5 +117,25 @@ fn non_empty_array(table: &toml::value::Table, field: &str) -> bool {
     table
         .get(field)
         .and_then(Value::as_array)
-        .is_some_and(|items| !items.is_empty())
+        .is_some_and(|items| {
+            items
+                .iter()
+                .any(|item| item.as_str().is_some_and(|value| !value.trim().is_empty()))
+        })
+}
+
+fn assert_string_array(name: &str, table: &toml::value::Table, field: &str) {
+    let values = table
+        .get(field)
+        .and_then(Value::as_array)
+        .unwrap_or_else(|| panic!("waiter {name:?} must have array field {field:?}"));
+    for value in values {
+        let Some(item) = value.as_str() else {
+            panic!("waiter {name:?} has non-string {field:?} item");
+        };
+        assert!(
+            !item.trim().is_empty(),
+            "waiter {name:?} has empty {field:?} item"
+        );
+    }
 }
