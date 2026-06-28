@@ -29,7 +29,7 @@ pub(crate) struct Cli {
     pub verbose: bool,
 
     /// Output format: pretty (default), json, or stream-json
-    #[arg(long, global = true, default_value = "pretty")]
+    #[arg(id = "global-format", long = "format", default_value = "pretty")]
     pub format: String,
 
     /// Principal this CLI process acts as. Stamped on every IPC message
@@ -633,6 +633,13 @@ mod tests {
         ])
         .expect("global --principal should parse before nested subcommands");
         assert_eq!(cli.principal.as_deref(), Some("operator-1"));
+    }
+
+    #[test]
+    fn global_format_does_not_collide_with_nested_format_enum() {
+        let cli = Cli::try_parse_from(["astrid", "keypair", "pubkey", "e2e-cli-key"])
+            .expect("nested command-local format enum should not collide with global format");
+        assert_eq!(cli.format, "pretty");
     }
 
     #[test]
