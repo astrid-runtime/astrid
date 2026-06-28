@@ -238,7 +238,7 @@ PY
     || fail "doctor relative ASTRID_HOME missed bounded diagnostic"
   run_cli_stdin_timeout "cli-chat-eof" 20 --format json chat
   grep -q "Goodbye" "$ARTIFACTS/cli-chat-eof.out" || fail "chat EOF path did not exit cleanly"
-  run_cli_stdin_timeout "cli-mcp-serve-eof" 20 --principal anonymous mcp serve
+  run_cli_mcp_stdio_smoke "cli-mcp-serve-handshake" 20 --principal anonymous mcp serve
   run_cli_daemon_lifecycle_smoke
 }
 
@@ -363,6 +363,66 @@ with open(stdout_path, "wb") as stdout, open(stderr_path, "wb") as stderr:
         raise SystemExit(f"command timed out after {timeout_s}s: {args!r}") from exc
 if proc.returncode != 0:
     raise SystemExit(f"command returned {proc.returncode}: {args!r}")
+PY
+  tee -a "$ARTIFACTS/cli-transcript.log" < "$ARTIFACTS/$label.out"
+  tee -a "$ARTIFACTS/cli-transcript.log" < "$ARTIFACTS/$label.err" >&2
+}
+
+run_cli_mcp_stdio_smoke() {
+  local label=$1 timeout=$2
+  shift 2
+  printf '$ astrid %s < fake MCP initialize/initialized\n' "$*" >> "$ARTIFACTS/cli-transcript.log"
+  "$PYTHON" - "$CORE_DIR/target/debug/astrid" "$ARTIFACTS/$label.out" \
+    "$ARTIFACTS/$label.err" "$timeout" "$@" <<'PY'
+import json
+import os
+import subprocess
+import sys
+
+binary, stdout_path, stderr_path, timeout_s, *args = sys.argv[1:]
+frames = [
+    {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": "2025-06-18",
+            "capabilities": {},
+            "clientInfo": {"name": "astrid-runtime-e2e", "version": "0"},
+        },
+    },
+    {"jsonrpc": "2.0", "method": "notifications/initialized"},
+]
+stdin = "".join(json.dumps(frame, separators=(",", ":")) + "\n" for frame in frames)
+try:
+    proc = subprocess.run(
+        [binary, *args],
+        input=stdin.encode("utf-8"),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=float(timeout_s),
+        env=os.environ.copy(),
+        check=False,
+    )
+except subprocess.TimeoutExpired as exc:
+    raise SystemExit(f"command timed out after {timeout_s}s: {args!r}") from exc
+
+open(stdout_path, "wb").write(proc.stdout)
+open(stderr_path, "wb").write(proc.stderr)
+
+if proc.returncode != 0:
+    raise SystemExit(f"command returned {proc.returncode}: {args!r}")
+
+messages = []
+for raw in proc.stdout.splitlines():
+    if raw.strip():
+        messages.append(json.loads(raw))
+init = next((msg for msg in messages if msg.get("id") == 1), None)
+if not init or "result" not in init:
+    raise SystemExit(f"MCP initialize response missing from stdout: {messages!r}")
+tools = init["result"].get("capabilities", {}).get("tools")
+if not isinstance(tools, dict):
+    raise SystemExit(f"MCP initialize response missing tools capability: {init!r}")
 PY
   tee -a "$ARTIFACTS/cli-transcript.log" < "$ARTIFACTS/$label.out"
   tee -a "$ARTIFACTS/cli-transcript.log" < "$ARTIFACTS/$label.err" >&2
