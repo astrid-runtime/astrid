@@ -25,6 +25,7 @@ run_cli_semantic_smoke() {
   run_cli agent current > "$ARTIFACTS/cli-agent-current-user.txt"
   grep -qx "$user_principal" "$ARTIFACTS/cli-agent-current-user.txt" || fail "agent current did not reflect switch"
   run_cli agent switch default > "$ARTIFACTS/cli-agent-switch-default.txt"
+  export ASTRID_PRINCIPAL=default
   local cli_session_id
   cli_session_id="$("$PYTHON" -c 'import uuid; print(uuid.uuid4())')"
   local cli_session_display_id="${cli_session_id:0:8}"
