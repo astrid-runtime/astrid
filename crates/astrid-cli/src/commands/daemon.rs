@@ -1,10 +1,16 @@
 //! Daemon lifecycle commands: start, stop, status, and spawn helpers.
 
+use std::time::Duration;
+
 use anyhow::{Context, Result};
 
 use crate::bootstrap::find_companion_binary;
 use crate::commands::daemon_control;
 use crate::{socket_client, theme};
+
+const DAEMON_READY_TIMEOUT_SECS: u64 = 60;
+const DAEMON_READY_POLL: Duration = Duration::from_millis(50);
+const DAEMON_READY_ATTEMPTS: usize = 1_200;
 
 /// Build a hint string pointing the user to the daemon log directory.
 fn log_hint() -> String {
@@ -46,7 +52,7 @@ fn boot_log_stderr() -> Option<std::process::Stdio> {
 ///
 /// # Errors
 /// Returns an error if the daemon binary is not found, fails to spawn, or
-/// doesn't become ready within 10 seconds.
+/// doesn't become ready within the bounded startup window.
 pub(crate) async fn spawn_daemon(ready_path: &std::path::Path) -> Result<std::process::Child> {
     println!("{}", theme::Theme::info("Booting Astrid daemon..."));
     let ws = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
@@ -81,14 +87,14 @@ pub(crate) async fn spawn_daemon(ready_path: &std::path::Path) -> Result<std::pr
     // completes (including await_capsule_readiness()), so the accept
     // loop is guaranteed to be running by the time we connect.
     let mut ready = false;
-    for _ in 0..200 {
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    for _ in 0..DAEMON_READY_ATTEMPTS {
+        tokio::time::sleep(DAEMON_READY_POLL).await;
         if ready_path.exists() {
             ready = true;
             break;
         }
         // If the daemon has already exited, stop polling immediately
-        // instead of waiting the full 10 seconds.
+        // instead of waiting the full readiness timeout.
         if let Ok(Some(status)) = child.try_wait() {
             anyhow::bail!("Daemon exited prematurely ({status}).{}", log_hint());
         }
@@ -99,7 +105,8 @@ pub(crate) async fn spawn_daemon(ready_path: &std::path::Path) -> Result<std::pr
         let _ = child.kill();
         let _ = child.wait();
         anyhow::bail!(
-            "Daemon failed to become ready within 10 seconds.{}",
+            "Daemon failed to become ready within {} seconds.{}",
+            DAEMON_READY_TIMEOUT_SECS,
             log_hint()
         );
     }
@@ -163,8 +170,8 @@ pub(crate) async fn spawn_persistent_daemon() -> Result<()> {
     let mut child = cmd.spawn().context("Failed to spawn Astrid daemon")?;
 
     let mut ready = false;
-    for _ in 0..200 {
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    for _ in 0..DAEMON_READY_ATTEMPTS {
+        tokio::time::sleep(DAEMON_READY_POLL).await;
         if ready_path.exists() {
             ready = true;
             break;
@@ -177,7 +184,8 @@ pub(crate) async fn spawn_persistent_daemon() -> Result<()> {
         let _ = child.kill();
         let _ = child.wait();
         anyhow::bail!(
-            "Daemon failed to become ready within 10 seconds.{}",
+            "Daemon failed to become ready within {} seconds.{}",
+            DAEMON_READY_TIMEOUT_SECS,
             log_hint()
         );
     }
