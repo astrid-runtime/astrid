@@ -435,6 +435,8 @@ PY
   fi
   tee -a "$ARTIFACTS/cli-transcript.log" < "$stdout"
   tee -a "$ARTIFACTS/cli-transcript.log" < "$stderr" >&2
+  printf '✓ Expected CLI denial: %s\n' "$label" >> "$ARTIFACTS/cli-transcript.log"
+  return 0
 }
 
 json_assert_cli_agent_list() {
