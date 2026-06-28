@@ -419,12 +419,14 @@ import sys
 
 stdout_path, stderr_path, binary, principal, *args = sys.argv[1:]
 with open(stdout_path, "wb") as stdout, open(stderr_path, "wb") as stderr:
+    env = os.environ.copy()
+    env["ASTRID_PRINCIPAL"] = principal
     proc = subprocess.run(
         [binary, "--principal", principal, *args],
         stdin=subprocess.DEVNULL,
         stdout=stdout,
         stderr=stderr,
-        env=os.environ.copy(),
+        env=env,
         check=False,
     )
 raise SystemExit(0 if proc.returncode != 0 else 1)
@@ -436,7 +438,7 @@ PY
   fi
   tee -a "$ARTIFACTS/cli-transcript.log" < "$stdout"
   tee -a "$ARTIFACTS/cli-transcript.log" < "$stderr" >&2
-  printf '✓ Expected CLI denial: %s\n' "$label" >> "$ARTIFACTS/cli-transcript.log"
+  printf '✓ Expected CLI denial: %s\n' "$label" | tee -a "$ARTIFACTS/cli-transcript.log"
   return 0
 }
 

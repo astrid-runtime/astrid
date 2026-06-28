@@ -97,7 +97,7 @@ run_principal_cli() {
   stderr="$(mktemp "$ARTIFACTS/cli-stderr.XXXXXX")"
   printf '$ astrid --principal %s %s\n' "$principal" "$*" >> "$ARTIFACTS/cli-transcript.log"
   set +e
-  "$CORE_DIR/target/debug/astrid" --principal "$principal" "$@" >"$stdout" 2>"$stderr"
+  ASTRID_PRINCIPAL="$principal" "$CORE_DIR/target/debug/astrid" --principal "$principal" "$@" >"$stdout" 2>"$stderr"
   status=$?
   set -e
   tee -a "$ARTIFACTS/cli-transcript.log" < "$stdout"
