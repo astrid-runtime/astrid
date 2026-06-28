@@ -9,19 +9,24 @@
 //!   populates `active_http_streams`; close/drop release the slot);
 //! - the header (time-to-first-byte) deadline bounds a hung pre-header server
 //!   (`send_one_hop`);
+//! - the egress security gate and its shared I/O permit acquisition are bounded
+//!   by the request deadline, and a gate denial returns `CapabilityDenied`
+//!   instead of hanging the caller;
 //! - a genuine host-not-found maps to the typed `DnsError` via the resolver's
 //!   `dns_failed` flag (narrowed to `ErrorKind::NotFound`), while a transient
 //!   resolver error falls through (`lookup_err_is_not_found` / `flag_error`).
 
+use async_trait::async_trait;
 use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
+use tokio::sync::Semaphore;
 
 use crate::engine::wasm::limits::HttpLimits;
 use crate::engine::wasm::test_fixtures::minimal_host_state;
-use crate::security::AllowAllGate;
+use crate::security::{AllowAllGate, CapsuleSecurityGate};
 
 use super::ssrf::MAX_HTTP_REDIRECTS;
 use super::{ErrorCode, HttpMethod, HttpRequestData, KeyValuePair, RedirectPolicy, RequestOptions};
@@ -139,6 +144,179 @@ fn get_request(url: String) -> HttpRequestData {
         headers: Vec::new(),
         body: None,
     }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct NeverHttpGate;
+
+#[async_trait]
+impl CapsuleSecurityGate for NeverHttpGate {
+    async fn check_http_request(
+        &self,
+        _capsule_id: &str,
+        _method: &str,
+        _url: &str,
+    ) -> Result<(), String> {
+        std::future::pending().await
+    }
+
+    async fn check_file_read(
+        &self,
+        _capsule_id: &str,
+        _path: &str,
+        _principal_home: Option<&std::path::Path>,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+
+    async fn check_file_write(
+        &self,
+        _capsule_id: &str,
+        _path: &str,
+        _principal_home: Option<&std::path::Path>,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+
+    async fn check_host_process(&self, _capsule_id: &str, _command: &str) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct DenyHttpGate;
+
+#[async_trait]
+impl CapsuleSecurityGate for DenyHttpGate {
+    async fn check_http_request(
+        &self,
+        capsule_id: &str,
+        method: &str,
+        url: &str,
+    ) -> Result<(), String> {
+        Err(format!("capsule '{capsule_id}' denied: {method} {url}"))
+    }
+
+    async fn check_file_read(
+        &self,
+        _capsule_id: &str,
+        _path: &str,
+        _principal_home: Option<&std::path::Path>,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+
+    async fn check_file_write(
+        &self,
+        _capsule_id: &str,
+        _path: &str,
+        _principal_home: Option<&std::path::Path>,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+
+    async fn check_host_process(&self, _capsule_id: &str, _command: &str) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+fn short_first_byte_options(first_byte_ms: u64) -> RequestOptions {
+    RequestOptions {
+        timeouts: Some(super::TimeoutConfig {
+            connect_ms: None,
+            first_byte_ms: Some(first_byte_ms),
+            between_bytes_ms: None,
+            total_ms: None,
+        }),
+        redirect: Some(RedirectPolicy::Follow),
+        max_redirects: None,
+        max_response_bytes: None,
+        max_decompressed_bytes: None,
+        auto_decompress: None,
+        https_only: None,
+        integrity: None,
+    }
+}
+
+// ── FIX 6: egress security gate is bounded and fail-closed ─────────────
+
+/// Reproduces astrid#1078 without live network: the egress gate never replies,
+/// so old code waits forever before `send()` and never reaches the request's
+/// HTTP deadlines. The fix wraps the gate itself and returns `Timeout`.
+#[tokio::test]
+async fn http_security_gate_stall_is_bounded_by_request_deadline() {
+    let rt = tokio::runtime::Handle::current();
+    let mut state = minimal_host_state(rt);
+    state.security = Some(Arc::new(NeverHttpGate));
+
+    let limits = state.http_limits;
+    let result = tokio::time::timeout(
+        Duration::from_secs(2),
+        state.http_request_backend(
+            get_request("https://example.com/".to_string()),
+            super::options::ResolvedOptions::from_options(short_first_byte_options(200), &limits),
+        ),
+    )
+    .await
+    .expect("stalled egress gate must be bounded by the request deadline");
+
+    assert!(
+        matches!(result, Err(ErrorCode::Timeout)),
+        "a stalled egress gate must surface Timeout, got {result:?}"
+    );
+}
+
+/// The gate is run through the shared host I/O semaphore. If all permits are
+/// exhausted, old code waits forever before even calling the gate. The timeout
+/// must cover permit acquisition too, not only the policy future.
+#[tokio::test]
+async fn http_security_gate_permit_wait_is_bounded_by_request_deadline() {
+    let rt = tokio::runtime::Handle::current();
+    let mut state = minimal_host_state(rt);
+    state.security = Some(Arc::new(AllowAllGate));
+    state.io_semaphore = Arc::new(Semaphore::new(0));
+
+    let limits = state.http_limits;
+    let result = tokio::time::timeout(
+        Duration::from_secs(2),
+        state.http_request_backend(
+            get_request("https://example.com/".to_string()),
+            super::options::ResolvedOptions::from_options(short_first_byte_options(200), &limits),
+        ),
+    )
+    .await
+    .expect("egress gate permit wait must be bounded by the request deadline");
+
+    assert!(
+        matches!(result, Err(ErrorCode::Timeout)),
+        "an exhausted gate semaphore must surface Timeout, got {result:?}"
+    );
+}
+
+/// Missing manifest egress permission is a normal authorization denial. It must
+/// fail closed with a typed `CapabilityDenied` error before any network attempt,
+/// which gives the caller a visible failure instead of a silent tool hang.
+#[tokio::test]
+async fn http_security_gate_denial_surfaces_capability_denied() {
+    let rt = tokio::runtime::Handle::current();
+    let mut state = minimal_host_state(rt);
+    state.security = Some(Arc::new(DenyHttpGate));
+
+    let limits = state.http_limits;
+    let result = tokio::time::timeout(
+        Duration::from_secs(2),
+        state.http_request_backend(
+            get_request("https://example.com/".to_string()),
+            super::options::ResolvedOptions::from_options(short_first_byte_options(200), &limits),
+        ),
+    )
+    .await
+    .expect("egress gate denial must return promptly");
+
+    assert!(
+        matches!(result, Err(ErrorCode::CapabilityDenied)),
+        "egress gate denial must surface CapabilityDenied, got {result:?}"
+    );
 }
 
 // ── FIX 5: decompressed cap is a no-op when decompression is off ────────

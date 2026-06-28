@@ -72,18 +72,24 @@ async fn check_http_security(
 ) -> Result<(), ErrorCode> {
     if let Some(gate) = security {
         let url_obj = reqwest::Url::parse(url).map_err(|_| ErrorCode::InvalidRequest)?;
-        let _ = url_obj.host_str().ok_or(ErrorCode::InvalidRequest)?;
+        let host = url_obj
+            .host_str()
+            .ok_or(ErrorCode::InvalidRequest)?
+            .to_string();
+        let scheme = url_obj.scheme().to_string();
+        let port = url_obj.port_or_known_default();
 
         let full_url = url.to_string();
         let m = method.to_string();
         let gate = gate.clone();
         // Bound the egress authorization the SAME way the send is bounded. The
-        // gate is an IPC round-trip (capability authorization); without a
-        // deadline a gate that never replies — or a saturated `io_semaphore` —
-        // hangs the whole request indefinitely, stalling the agent turn until
-        // the consumer's tool-stall watchdog fires (astrid#1078). The timeout
-        // wraps `bounded_await` so it covers BOTH permit acquisition and the
-        // gate call. Fail closed on elapse.
+        // production gate is normally an in-memory manifest check, but it still
+        // sits behind shared async host infrastructure and may be replaced by
+        // async policy. Without a deadline, a gate that never replies — or a
+        // saturated `io_semaphore` — hangs the whole request indefinitely,
+        // stalling the agent turn until the consumer's tool-stall watchdog
+        // fires (astrid#1078). The timeout wraps `bounded_await` so it covers
+        // BOTH permit acquisition and the gate call. Fail closed on elapse.
         let gated = tokio::time::timeout(
             deadline,
             util::bounded_await(io_semaphore, async move {
@@ -92,9 +98,33 @@ async fn check_http_security(
         )
         .await;
         match gated {
-            Ok(check) if check.is_ok() => {},
-            Ok(_) => return Err(ErrorCode::CapabilityDenied),
-            Err(_elapsed) => return Err(ErrorCode::Timeout),
+            Ok(Ok(())) => {},
+            Ok(Err(reason)) => {
+                tracing::warn!(
+                    target: "astrid.audit.http",
+                    security_event = true,
+                    method = %method,
+                    scheme = %scheme,
+                    host = %host,
+                    port = ?port,
+                    reason = %reason,
+                    "http egress denied by capsule security gate"
+                );
+                return Err(ErrorCode::CapabilityDenied);
+            },
+            Err(_elapsed) => {
+                tracing::warn!(
+                    target: "astrid.audit.http",
+                    security_event = true,
+                    method = %method,
+                    scheme = %scheme,
+                    host = %host,
+                    port = ?port,
+                    timeout_ms = deadline.as_millis() as u64,
+                    "http egress security gate timed out"
+                );
+                return Err(ErrorCode::Timeout);
+            },
         }
     }
     Ok(())

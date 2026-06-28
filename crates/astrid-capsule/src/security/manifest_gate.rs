@@ -186,7 +186,7 @@ impl CapsuleSecurityGate for ManifestSecurityGate {
             Ok(())
         } else {
             Err(format!(
-                "capsule '{capsule_id}' denied: network access to '{url}' not declared in manifest"
+                "capsule '{capsule_id}' denied: network access to host '{host_str}' not declared in manifest"
             ))
         }
     }
