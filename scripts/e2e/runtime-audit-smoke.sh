@@ -33,8 +33,9 @@ collect_audit_artifacts() {
   assert_status "admin firehose audit export" "$status" 200
   json_assert_audit_firehose_contains_principals \
     "$ARTIFACTS/admin-audit.json" "$user_principal" "$ops_principal"
-  json_assert_audit_firehose_events "$ARTIFACTS/admin-audit.json" default \
-    admin.group.create:failure \
+  json_assert_audit_firehose_events "$ARTIFACTS/admin-audit.json" "$user_principal" \
+    admin.group.create:failure
+  json_assert_audit_firehose_events "$ARTIFACTS/admin-audit.json" "$ops_principal" \
     admin.caps.grant:failure
   json_assert_audit_token_evidence_and_redaction \
     "$ARTIFACTS/admin-audit.json" "$paired_key_id" "$@" "$admin_bearer"
