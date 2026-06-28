@@ -121,19 +121,19 @@ fn runtime_scenarios_are_executable_contracts() {
                     !non_empty_field(table, "remaining"),
                     "covered runtime scenario {scenario:?} must not carry remaining work"
                 );
-            }
+            },
             "mapped" => {
                 assert!(
                     non_empty_field(table, "remaining"),
                     "mapped runtime scenario {scenario:?} needs explicit remaining work"
                 );
-            }
+            },
             "waived" => {
                 assert!(
                     non_empty_field(table, "waiver"),
                     "waived runtime scenario {scenario:?} needs an explicit waiver"
                 );
-            }
+            },
             _ => unreachable!(),
         }
     }
@@ -252,11 +252,7 @@ fn runtime_scenarios(parsed: &toml::Value) -> &toml::value::Table {
         .expect("runtime-scenario-specs.toml must contain [scenarios]")
 }
 
-fn string_field<'a>(
-    table: &'a toml::value::Table,
-    field: &str,
-    scenario: &str,
-) -> &'a str {
+fn string_field<'a>(table: &'a toml::value::Table, field: &str, scenario: &str) -> &'a str {
     table
         .get(field)
         .and_then(toml::Value::as_str)
