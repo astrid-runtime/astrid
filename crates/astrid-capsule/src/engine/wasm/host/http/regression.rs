@@ -31,8 +31,6 @@ use crate::security::{AllowAllGate, CapsuleSecurityGate};
 use super::ssrf::MAX_HTTP_REDIRECTS;
 use super::{ErrorCode, HttpMethod, HttpRequestData, KeyValuePair, RedirectPolicy, RequestOptions};
 
-// ── FIX 1: duplicate headers + non-ASCII header values ─────────────────
-
 /// The WIT contract allows duplicate request headers (e.g. multiple `Cookie`
 /// lines). `HeaderMap::insert` is last-write-wins and would drop the first;
 /// `append` keeps both. Fails without the `insert`→`append` change.
@@ -77,8 +75,6 @@ fn build_headers_accepts_non_ascii_value() {
     );
 }
 
-// ── FIX 3: max_redirects clamped to the host ceiling ───────────────────
-
 /// A caller-requested `max_redirects` above the host ceiling must clamp down
 /// to `MAX_HTTP_REDIRECTS`, never raise it. Fails without the `.min(...)`.
 #[test]
@@ -99,8 +95,6 @@ fn max_redirects_clamped_to_host_ceiling() {
         "caller cannot raise max_redirects above the host ceiling"
     );
 }
-
-// ── Loopback test-server helpers (replicated; kept module-local) ────────
 
 /// Spawn a one-shot loopback server returning `response` verbatim then closing.
 /// Returns `None` (skip) if the sandbox blocks the loopback bind.
@@ -238,8 +232,6 @@ fn short_first_byte_options(first_byte_ms: u64) -> RequestOptions {
     }
 }
 
-// ── FIX 6: egress security gate is bounded and fail-closed ─────────────
-
 /// Reproduces astrid#1078 without live network: the egress gate never replies,
 /// so old code waits forever before `send()` and never reaches the request's
 /// HTTP deadlines. The fix wraps the gate itself and returns `Timeout`.
@@ -319,8 +311,6 @@ async fn http_security_gate_denial_surfaces_capability_denied() {
     );
 }
 
-// ── FIX 5: decompressed cap is a no-op when decompression is off ────────
-
 /// A body larger than `max_decompressed_bytes` but under `max_response_bytes`,
 /// fetched with `auto_decompress = false`, must NOT trip `DecompressionBomb` —
 /// the raw wire bytes aren't decompressed, so the bomb cap doesn't apply. Fails
@@ -363,8 +353,6 @@ async fn decompressed_cap_ignored_when_decompression_off() {
     assert_eq!(resp.body.len(), 2048);
     let _ = server.await;
 }
-
-// ── FIX 4: the 4-concurrent-stream quota actually triggers ─────────────
 
 /// The concurrency quota counts `active_http_streams`; the open past the cap is
 /// rejected with `Quota`; `stream_close` / `stream_drop` each release a slot so
@@ -497,9 +485,9 @@ async fn configured_max_concurrent_streams_lowers_quota() {
     .expect("stream-quota test must not hang (5s backstop)");
 }
 
-/// FIX C / FIX 2 regression: a genuine host-not-found surfaces the typed
-/// `DnsError`, but a transient resolver error (timeout / I/O) does NOT — it
-/// falls through to the generic classification. reqwest collapses a
+/// A genuine host-not-found surfaces the typed `DnsError`, but a transient
+/// resolver error (timeout / I/O) does NOT — it falls through to the generic
+/// classification. reqwest collapses a
 /// `dns_resolver` failure into an opaque `is_connect()` error, so the
 /// `SafeDnsResolver` flags a NOT-FOUND miss out-of-band via `dns_failed`
 /// (mirroring the airlock `tripped` channel) and `airlock_or` maps it to
@@ -513,7 +501,7 @@ async fn configured_max_concurrent_streams_lowers_quota() {
 fn dns_not_found_is_narrowed_to_notfound_kind() {
     use std::io::{Error, ErrorKind};
 
-    // The load-bearing FIX-2 decision: only NotFound is a `dns-error` miss.
+    // Only NotFound is a `dns-error` miss.
     assert!(super::ssrf::lookup_err_is_not_found(&Error::new(
         ErrorKind::NotFound,
         "host not found"
@@ -575,12 +563,9 @@ fn follow() -> RequestOptions {
     }
 }
 
-// ── FIX 2: header (time-to-first-byte) deadline bounds a hung server ────
-
-/// The header-deadline decision table — the load-bearing logic of the fix.
-/// This is the path that strictly REQUIRES the new code: the STREAMING case
-/// (total cleared, no first-byte / between-bytes) has NO reqwest read-timeout
-/// or total-timeout, so only `header_deadline`'s floor bounds `send()`. A
+/// The header-deadline decision table. The streaming case (total cleared, no
+/// first-byte / between-bytes) has no reqwest read-timeout or total-timeout, so
+/// only `header_deadline`'s floor bounds `send()`. A
 /// regression that drops the floor (e.g. `unwrap_or` → `None` then no timeout)
 /// is caught here without waiting 120s for a live hang.
 #[test]

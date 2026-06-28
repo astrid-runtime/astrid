@@ -19,3 +19,5 @@ core: []
 astrinauts:
   - username: dependabot[bot]
     since: 2026-06-25
+  - username: vrogojin
+    since: 2026-06-28
