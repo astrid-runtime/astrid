@@ -461,18 +461,29 @@ impl Kernel {
     /// # Errors
     ///
     /// Returns an error if the manifest cannot be loaded, the capsule cannot be created, or registration fails.
-    async fn load_capsule(&self, dir: PathBuf) -> Result<(), anyhow::Error> {
+    async fn load_capsule(
+        &self,
+        dir: PathBuf,
+        principal: &PrincipalId,
+    ) -> Result<(), anyhow::Error> {
         let manifest_path = dir.join("Capsule.toml");
         let manifest = astrid_capsule::discovery::load_manifest(&manifest_path)
             .map_err(|e| anyhow::anyhow!(e))?;
+        let id = astrid_capsule::capsule::CapsuleId::from_static(&manifest.package.name);
+        let wasm_hash = capsule_instance_hash(&manifest, &dir);
 
-        // Skip if already registered (prevents double-load from overlapping
-        // discovery paths like principal home + workspace capsules).
+        // Skip only if this principal already has the capsule in its view.
+        // If another principal has the same hash, reuse that instance instead
+        // of compiling/loading a second engine.
         {
-            let registry = self.capsules.read().await;
-            let id = astrid_capsule::capsule::CapsuleId::from_static(&manifest.package.name);
-            if registry.get(&id).is_some() {
+            let mut registry = self.capsules.write().await;
+            if registry.get_for(principal, &id).is_some() {
                 return Ok(());
+            }
+            if registry.contains_hash(&wasm_hash) {
+                return registry
+                    .register_existing(&id, &wasm_hash, principal)
+                    .map_err(|e| anyhow::anyhow!("Failed to register shared capsule view: {e}"));
             }
         }
 
@@ -488,7 +499,6 @@ impl Kernel {
 
         // Build the context — use the shared kernel KV so capsules can
         // communicate state through overlapping KV namespaces.
-        let principal = astrid_core::PrincipalId::default();
         let kv = astrid_storage::ScopedKvStore::new(
             Arc::clone(&self.kv) as Arc<dyn astrid_storage::KvStore>,
             format!("{principal}:capsule:{}", capsule.id()),
@@ -498,7 +508,7 @@ impl Kernel {
         // Check principal config first, fall back to capsule dir's .env.json.
         let capsule_name = capsule.id().to_string();
         let env_path = if let Ok(home) = astrid_core::dirs::AstridHome::resolve() {
-            let ph = home.principal_home(&principal);
+            let ph = home.principal_home(principal);
             let principal_env = ph.env_dir().join(format!("{capsule_name}.env.json"));
             if principal_env.exists() {
                 principal_env
@@ -539,13 +549,14 @@ impl Kernel {
         // Hand this capsule its operator-approved local-egress allowlist (if
         // any) so the SSRF airlock can exempt sanctioned loopback/private
         // endpoints for it. Absent entry = empty = no exemptions.
-        .with_local_egress(self.local_egress.get(&capsule_name).cloned().unwrap_or_default());
+        .with_local_egress(self.local_egress.get(&capsule_name).cloned().unwrap_or_default())
+        .with_wasm_hash(wasm_hash.clone());
 
         capsule.load(&ctx).await?;
 
         let mut registry = self.capsules.write().await;
         registry
-            .register(capsule)
+            .register_for(capsule, wasm_hash, principal)
             .map_err(|e| anyhow::anyhow!("Failed to register capsule: {e}"))?;
 
         Ok(())
@@ -560,12 +571,13 @@ impl Kernel {
     async fn restart_capsule(
         &self,
         id: &astrid_capsule::capsule::CapsuleId,
+        principal: &PrincipalId,
     ) -> Result<(), anyhow::Error> {
         // Get source directory before unregistering.
         let source_dir = {
             let registry = self.capsules.read().await;
             let capsule = registry
-                .get(id)
+                .get_for(principal, id)
                 .ok_or_else(|| anyhow::anyhow!("capsule '{id}' not found in registry"))?;
             capsule
                 .source_dir()
@@ -576,11 +588,13 @@ impl Kernel {
         // Unregister and explicitly unload. There is no Drop impl that
         // calls unload() (it's async), so we must do it here to avoid
         // leaking MCP subprocesses and other engine resources.
-        let old_capsule = {
+        let (old_capsule, retained_by_view) = {
             let mut registry = self.capsules.write().await;
-            registry
-                .unregister(id)
-                .map_err(|e| anyhow::anyhow!("failed to unregister capsule '{id}': {e}"))?
+            let old = registry
+                .unregister_for(principal, id)
+                .map_err(|e| anyhow::anyhow!("failed to unregister capsule '{id}': {e}"))?;
+            let retained = registry.any_principal_with(id).is_some();
+            (old, retained)
         };
         // Explicitly unload the old capsule. There is no Drop impl that
         // calls unload() (it's async), so we must do it here to avoid
@@ -588,35 +602,42 @@ impl Kernel {
         // Arc::get_mut requires exclusive ownership (strong_count == 1).
         {
             let mut old = old_capsule;
-            old.request_cancel();
-            let mut unloaded = false;
-            for retry in 0..20_u32 {
-                if let Some(capsule) = std::sync::Arc::get_mut(&mut old) {
-                    if let Err(e) = capsule.unload().await {
-                        tracing::warn!(
-                            capsule_id = %id,
-                            error = %e,
-                            "Capsule unload failed during restart"
-                        );
-                    }
-                    unloaded = true;
-                    break;
-                }
-                if retry < 19 {
-                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                }
-            }
-            if !unloaded {
-                tracing::warn!(
+            if retained_by_view {
+                tracing::debug!(
                     capsule_id = %id,
-                    strong_count = std::sync::Arc::strong_count(&old),
-                    "Cannot call unload during restart - Arc still held by in-flight task"
+                    "Capsule instance retained during restart — still referenced by another principal's view"
                 );
+            } else {
+                old.request_cancel();
+                let mut unloaded = false;
+                for retry in 0..20_u32 {
+                    if let Some(capsule) = std::sync::Arc::get_mut(&mut old) {
+                        if let Err(e) = capsule.unload().await {
+                            tracing::warn!(
+                                capsule_id = %id,
+                                error = %e,
+                                "Capsule unload failed during restart"
+                            );
+                        }
+                        unloaded = true;
+                        break;
+                    }
+                    if retry < 19 {
+                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    }
+                }
+                if !unloaded {
+                    tracing::warn!(
+                        capsule_id = %id,
+                        strong_count = std::sync::Arc::strong_count(&old),
+                        "Cannot call unload during restart - Arc still held by in-flight task"
+                    );
+                }
             }
         }
 
         // Re-load from disk.
-        self.load_capsule(source_dir).await?;
+        self.load_capsule(source_dir, principal).await?;
 
         // Signal the newly loaded capsule to clean up ephemeral state
         // from the previous incarnation. Capsules that don't implement
@@ -628,7 +649,7 @@ impl Kernel {
         // and starves registry writers (health monitor, capsule loading).
         let capsule = {
             let registry = self.capsules.read().await;
-            registry.get(id)
+            registry.get_for(principal, id)
         };
         if let Some(capsule) = capsule
             && let Err(e) = capsule
@@ -645,95 +666,19 @@ impl Kernel {
         Ok(())
     }
 
-    /// Auto-discover and load all capsules from the standard directories:
-    /// the default principal install dir and the daemon workspace's
-    /// `.astrid/capsules` dir.
+    /// Auto-discover and load capsule views for known principals.
     ///
-    /// Capsules are loaded in dependency order (topological sort) with
-    /// uplink/daemon capsules loaded first. Each uplink must signal
-    /// readiness before non-uplink capsules are loaded.
-    ///
-    /// After all capsules are loaded, tool schemas are injected into every
-    /// capsule's KV namespace and the `astrid.v1.capsules_loaded` event is published.
+    /// The default principal is loaded eagerly, then every principal with a
+    /// profile on disk gets its own view. Content-identical capsules dedupe to
+    /// one runtime instance; default's capsule set is never copied into another
+    /// principal's view.
     pub async fn load_all_capsules(&self) {
-        use astrid_capsule::toposort::toposort_manifests;
-
-        let paths = capsule_discovery_paths(&self.astrid_home, &self.workspace_root);
-
-        let discovered = astrid_capsule::discovery::discover_manifests(Some(&paths));
-
-        // Topological sort ALL capsules together so cross-partition
-        // requirements (e.g. a non-uplink requiring an uplink's capability)
-        // resolve correctly without spurious "not provided" warnings.
-        let sorted = match toposort_manifests(discovered) {
-            Ok(sorted) => sorted,
-            Err((e, original)) => {
-                tracing::error!(
-                    cycle = %e,
-                    "Dependency cycle in capsules, falling back to discovery order"
-                );
-                original
-            },
-        };
-
-        // Defence-in-depth: manifest validation in discovery.rs rejects
-        // uplinks with [imports], but warn here in case a manifest bypasses
-        // the normal load path.
-        for (manifest, _) in &sorted {
-            if manifest.capabilities.uplink && manifest.has_imports() {
-                tracing::warn!(
-                    capsule = %manifest.package.name,
-                    "Uplink capsule has [imports] - \
-                     this should have been rejected at manifest load time"
-                );
+        self.ensure_principal_loaded(&PrincipalId::default()).await;
+        for principal in self.enumerate_profile_principals() {
+            if principal != PrincipalId::default() {
+                self.ensure_principal_loaded(&principal).await;
             }
         }
-
-        // Validate imports/exports: every required import must have a matching export.
-        validate_imports_exports(&sorted);
-
-        // Partition after sorting: uplinks first, then the rest.
-        // The relative order within each partition is preserved from the
-        // toposort, so dependency edges are still respected. Cross-partition
-        // edges (non-uplink requiring an uplink) are satisfied by construction
-        // since all uplinks load first. The inverse (uplink requiring a
-        // non-uplink) is rejected above.
-        let (uplinks, others): (Vec<_>, Vec<_>) =
-            sorted.into_iter().partition(|(m, _)| m.capabilities.uplink);
-
-        // Load uplinks first so their event bus subscriptions are ready.
-        let uplink_names: Vec<String> = uplinks
-            .iter()
-            .map(|(m, _)| m.package.name.clone())
-            .collect();
-        for (manifest, dir) in &uplinks {
-            if let Err(e) = self.load_capsule(dir.clone()).await {
-                tracing::warn!(
-                    capsule = %manifest.package.name,
-                    error = %e,
-                    "Failed to load uplink capsule during discovery"
-                );
-            }
-        }
-
-        // Wait for uplink capsules to signal readiness before loading
-        // non-uplink capsules. This ensures IPC subscriptions are active.
-        self.await_capsule_readiness(&uplink_names).await;
-
-        for (manifest, dir) in &others {
-            if let Err(e) = self.load_capsule(dir.clone()).await {
-                tracing::warn!(
-                    capsule = %manifest.package.name,
-                    error = %e,
-                    "Failed to load capsule during discovery"
-                );
-            }
-        }
-
-        // Wait for non-uplink run-loop capsules too, so any future
-        // dependency edges between them are respected.
-        let other_names: Vec<String> = others.iter().map(|(m, _)| m.package.name.clone()).collect();
-        self.await_capsule_readiness(&other_names).await;
 
         // Warn loudly if the loaded set can't actually serve an agent chat
         // turn. Computed from the live registry *after* load completes (not the
@@ -754,6 +699,87 @@ impl Kernel {
         // (like the registry) can proceed with discovery instead of
         // polling with arbitrary timeouts.
         self.publish_capsules_loaded().await;
+    }
+
+    /// Build or refresh one principal's capsule view from its own install set.
+    pub async fn ensure_principal_loaded(&self, principal: &PrincipalId) {
+        use astrid_capsule::toposort::toposort_manifests;
+
+        let paths = capsule_discovery_paths_for(&self.astrid_home, &self.workspace_root, principal);
+        let discovered = astrid_capsule::discovery::discover_manifests(Some(&paths));
+        let sorted = match toposort_manifests(discovered) {
+            Ok(sorted) => sorted,
+            Err((e, original)) => {
+                tracing::error!(
+                    %principal,
+                    cycle = %e,
+                    "Dependency cycle in capsules, falling back to discovery order"
+                );
+                original
+            },
+        };
+
+        for (manifest, _) in &sorted {
+            if manifest.capabilities.uplink && manifest.has_imports() {
+                tracing::warn!(
+                    %principal,
+                    capsule = %manifest.package.name,
+                    "Uplink capsule has [imports] - this should have been rejected at manifest load time"
+                );
+            }
+        }
+        validate_imports_exports(&sorted);
+
+        let (uplinks, others): (Vec<_>, Vec<_>) =
+            sorted.into_iter().partition(|(m, _)| m.capabilities.uplink);
+        let uplink_names: Vec<String> = uplinks
+            .iter()
+            .map(|(m, _)| m.package.name.clone())
+            .collect();
+        for (manifest, dir) in &uplinks {
+            if let Err(e) = self.load_capsule(dir.clone(), principal).await {
+                tracing::warn!(
+                    %principal,
+                    capsule = %manifest.package.name,
+                    error = %e,
+                    "Failed to load uplink capsule during discovery"
+                );
+            }
+        }
+        self.await_capsule_readiness_for(principal, &uplink_names)
+            .await;
+
+        for (manifest, dir) in &others {
+            if let Err(e) = self.load_capsule(dir.clone(), principal).await {
+                tracing::warn!(
+                    %principal,
+                    capsule = %manifest.package.name,
+                    error = %e,
+                    "Failed to load capsule during discovery"
+                );
+            }
+        }
+        let other_names: Vec<String> = others.iter().map(|(m, _)| m.package.name.clone()).collect();
+        self.await_capsule_readiness_for(principal, &other_names)
+            .await;
+    }
+
+    fn enumerate_profile_principals(&self) -> Vec<PrincipalId> {
+        let profiles_dir = self.astrid_home.profiles_dir();
+        let Ok(entries) = std::fs::read_dir(profiles_dir) else {
+            return Vec::new();
+        };
+        entries
+            .flatten()
+            .filter_map(|entry| {
+                if !entry.file_type().is_ok_and(|ty| ty.is_file()) {
+                    return None;
+                }
+                let name = entry.file_name();
+                let stem = name.to_str()?.strip_suffix(".toml")?;
+                PrincipalId::new(stem).ok()
+            })
+            .collect()
     }
 
     /// Build an in-process agent-loop readiness probe over the live registry.
@@ -887,23 +913,21 @@ impl Kernel {
     pub(crate) async fn reload_one_capsule(
         &self,
         id: &astrid_capsule::capsule::CapsuleId,
+        principal: &PrincipalId,
     ) -> Result<(), anyhow::Error> {
-        let registered = { self.capsules.read().await.get(id).is_some() };
+        let registered = { self.capsules.read().await.get_for(principal, id).is_some() };
         if registered {
-            self.restart_capsule(id).await?;
+            self.restart_capsule(id, principal).await?;
             self.publish_capsules_loaded().await;
         } else {
-            // load_all_capsules discovers + loads the new capsule (existing ones
-            // are skipped) and publishes capsules_loaded itself. It logs-and-
-            // continues on a per-capsule load failure, so confirm the requested
-            // capsule actually registered — otherwise the caller would report a
-            // false success for a capsule that failed to load or isn't on disk.
-            self.load_all_capsules().await;
-            if self.capsules.read().await.get(id).is_none() {
+            // Build or refresh this principal's view from its installed set.
+            self.ensure_principal_loaded(principal).await;
+            if self.capsules.read().await.get_for(principal, id).is_none() {
                 return Err(anyhow::anyhow!(
                     "capsule '{id}' was not found in the install directories or failed to load"
                 ));
             }
+            self.publish_capsules_loaded().await;
         }
         Ok(())
     }
@@ -929,15 +953,17 @@ impl Kernel {
     pub(crate) async fn unload_one_capsule(
         &self,
         id: &astrid_capsule::capsule::CapsuleId,
+        principal: &PrincipalId,
     ) -> Result<bool, anyhow::Error> {
-        // Unregister under the write lock. A NotFound means the capsule was
-        // never loaded here (e.g. the daemon started after it was removed, or
-        // it failed to load) — that is a benign no-op for an unload, so report
-        // it as "not loaded" rather than an error.
-        let old_capsule = {
+        // Unregister only from this principal's view. The content-addressed
+        // instance remains loaded while any other principal still references it.
+        let (old_capsule, retained_by_view) = {
             let mut registry = self.capsules.write().await;
-            match registry.unregister(id) {
-                Ok(capsule) => capsule,
+            match registry.unregister_for(principal, id) {
+                Ok(capsule) => {
+                    let retained = registry.any_principal_with(id).is_some();
+                    (capsule, retained)
+                },
                 Err(astrid_capsule::error::CapsuleError::NotFound(_)) => return Ok(false),
                 Err(e) => {
                     return Err(anyhow::anyhow!("failed to unregister capsule '{id}': {e}"));
@@ -951,30 +977,37 @@ impl Kernel {
         // exclusive ownership (strong_count == 1).
         {
             let mut old = old_capsule;
-            old.request_cancel();
-            let mut unloaded = false;
-            for retry in 0..20_u32 {
-                if let Some(capsule) = std::sync::Arc::get_mut(&mut old) {
-                    if let Err(e) = capsule.unload().await {
-                        tracing::warn!(
-                            capsule_id = %id,
-                            error = %e,
-                            "Capsule unload failed during unload request"
-                        );
-                    }
-                    unloaded = true;
-                    break;
-                }
-                if retry < 19 {
-                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                }
-            }
-            if !unloaded {
-                tracing::warn!(
+            if retained_by_view {
+                tracing::debug!(
                     capsule_id = %id,
-                    strong_count = std::sync::Arc::strong_count(&old),
-                    "Cannot call unload - Arc still held by in-flight task"
+                    "Capsule instance retained — still referenced by another principal's view"
                 );
+            } else {
+                old.request_cancel();
+                let mut unloaded = false;
+                for retry in 0..20_u32 {
+                    if let Some(capsule) = std::sync::Arc::get_mut(&mut old) {
+                        if let Err(e) = capsule.unload().await {
+                            tracing::warn!(
+                                capsule_id = %id,
+                                error = %e,
+                                "Capsule unload failed during unload request"
+                            );
+                        }
+                        unloaded = true;
+                        break;
+                    }
+                    if retry < 19 {
+                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    }
+                }
+                if !unloaded {
+                    tracing::warn!(
+                        capsule_id = %id,
+                        strong_count = std::sync::Arc::strong_count(&old),
+                        "Cannot call unload - Arc still held by in-flight task"
+                    );
+                }
             }
         }
 
@@ -1192,7 +1225,7 @@ impl Kernel {
     /// Collects `Arc<dyn Capsule>` handles under a short-lived read lock,
     /// then drops the lock before awaiting. Capsules without a run loop
     /// return `Ready` immediately and don't contribute to wait time.
-    async fn await_capsule_readiness(&self, names: &[String]) {
+    async fn await_capsule_readiness_for(&self, principal: &PrincipalId, names: &[String]) {
         use astrid_capsule::capsule::ReadyStatus;
 
         if names.is_empty() {
@@ -1206,7 +1239,9 @@ impl Kernel {
                 .iter()
                 .filter_map(
                     |name| match astrid_capsule::capsule::CapsuleId::new(name.clone()) {
-                        Ok(capsule_id) => registry.get(&capsule_id).map(|c| (name.clone(), c)),
+                        Ok(capsule_id) => registry
+                            .get_for(principal, &capsule_id)
+                            .map(|c| (name.clone(), c)),
                         Err(e) => {
                             tracing::warn!(
                                 capsule = %name,
@@ -1696,7 +1731,17 @@ async fn attempt_capsule_restart(
     );
 
     let capsule_id = astrid_capsule::capsule::CapsuleId::from_static(id_str);
-    match kernel.restart_capsule(&capsule_id).await {
+    let Some(principal) = ({
+        let registry = kernel.capsules.read().await;
+        registry.any_principal_with(&capsule_id)
+    }) else {
+        tracing::debug!(
+            capsule_id = %id_str,
+            "Skipping capsule restart; no principal view references this capsule"
+        );
+        return true;
+    };
+    match kernel.restart_capsule(&capsule_id, &principal).await {
         Ok(()) => {
             tracing::info!(capsule_id = %id_str, attempt, "Capsule restarted successfully");
             true
@@ -1852,16 +1897,41 @@ fn spawn_react_watchdog(event_bus: Arc<EventBus>) -> tokio::task::JoinHandle<()>
     })
 }
 
+#[cfg(test)]
 fn capsule_discovery_paths(
     home: &astrid_core::dirs::AstridHome,
     workspace_root: &Path,
 ) -> Vec<PathBuf> {
-    let principal = PrincipalId::default();
+    capsule_discovery_paths_for(home, workspace_root, &PrincipalId::default())
+}
+
+fn capsule_discovery_paths_for(
+    home: &astrid_core::dirs::AstridHome,
+    workspace_root: &Path,
+    principal: &PrincipalId,
+) -> Vec<PathBuf> {
     let workspace = astrid_core::dirs::WorkspaceDir::from_path(workspace_root);
     vec![
-        home.principal_home(&principal).capsules_dir(),
+        home.principal_home(principal).capsules_dir(),
         workspace.capsules_dir(),
     ]
+}
+
+fn capsule_instance_hash(
+    manifest: &astrid_capsule::manifest::CapsuleManifest,
+    dir: &Path,
+) -> astrid_capsule::registry::WasmHash {
+    astrid_capsule_install::read_meta(dir)
+        .and_then(|meta| meta.wasm_hash)
+        .map_or_else(
+            || {
+                astrid_capsule::registry::WasmHash::synthetic(
+                    &manifest.package.name,
+                    &manifest.package.version,
+                )
+            },
+            astrid_capsule::registry::WasmHash::from_raw,
+        )
 }
 
 // ---------------------------------------------------------------------------
@@ -2460,7 +2530,10 @@ mod tests {
             })
         };
 
-        let removed = kernel.unload_one_capsule(&id).await.unwrap();
+        let removed = kernel
+            .unload_one_capsule(&id, &PrincipalId::default())
+            .await
+            .unwrap();
         release_after_cancel.await.unwrap();
 
         assert!(removed);
@@ -2471,6 +2544,56 @@ mod tests {
         assert!(
             unloaded.load(Ordering::Relaxed),
             "unload should complete once the in-flight holder releases its Arc"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn unload_one_principal_retains_shared_capsule_instance() {
+        let (_d, home) = scratch_home();
+        let kernel = test_kernel_with_home(home).await;
+        let id = CapsuleId::new("shared-test").unwrap();
+        let alice = PrincipalId::new("alice").unwrap();
+        let bob = PrincipalId::new("bob").unwrap();
+        let hash = astrid_capsule::registry::WasmHash::from_raw("shared-test-hash");
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let unloaded = Arc::new(AtomicBool::new(false));
+
+        {
+            let mut registry = kernel.capsules.write().await;
+            registry
+                .register_for(
+                    Box::new(CancellableTestCapsule {
+                        id: id.clone(),
+                        manifest: CapsuleManifest::default(),
+                        cancelled: Arc::clone(&cancelled),
+                        unloaded: Arc::clone(&unloaded),
+                    }),
+                    hash.clone(),
+                    &alice,
+                )
+                .unwrap();
+            registry.register_existing(&id, &hash, &bob).unwrap();
+        }
+
+        let removed = kernel.unload_one_capsule(&id, &alice).await.unwrap();
+        assert!(removed);
+        assert!(
+            !cancelled.load(Ordering::Relaxed),
+            "removing one view must not cancel a shared instance"
+        );
+        assert!(
+            !unloaded.load(Ordering::Relaxed),
+            "removing one view must not unload a shared instance"
+        );
+
+        let registry = kernel.capsules.read().await;
+        assert!(
+            registry.get_for(&alice, &id).is_none(),
+            "alice's view should no longer contain the capsule"
+        );
+        assert!(
+            registry.get_for(&bob, &id).is_some(),
+            "bob's view should retain the shared instance"
         );
     }
 

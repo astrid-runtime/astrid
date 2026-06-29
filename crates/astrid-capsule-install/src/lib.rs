@@ -75,6 +75,9 @@ pub use manifest_check::{ExportConflict, MissingImport, check_export_conflicts, 
 pub use meta::{
     CapsuleLocation, CapsuleMeta, InstalledCapsule, read_meta, scan_installed_capsules, write_meta,
 };
-pub use paths::{resolve_env_path, resolve_target_dir, restore_env_from_backup};
+pub use paths::{
+    resolve_env_path, resolve_env_path_for, resolve_target_dir, resolve_target_dir_for,
+    restore_env_from_backup, restore_env_from_backup_for,
+};
 pub use principal_introspection::materialize_principal_introspection;
 pub use wit::{content_address_wit, materialize_wit_mirror};

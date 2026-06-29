@@ -740,6 +740,7 @@ pub(crate) fn install_from_local_path(
         original_source: original_source.map(String::from),
         skip_import_check: BATCH_MODE.load(Ordering::Relaxed),
         lifecycle_bus: None,
+        target_principal: None,
     };
     let output = run_with_elicit(opts, |opts, bus| {
         astrid_capsule_install::install_from_local_path(
@@ -803,6 +804,7 @@ fn unpack_via_lib(
         original_source: original_source.map(String::from),
         skip_import_check: BATCH_MODE.load(Ordering::Relaxed),
         lifecycle_bus: None,
+        target_principal: None,
     };
     let output = run_with_elicit(opts, |opts, bus| {
         astrid_capsule_install::unpack_and_install(

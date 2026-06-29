@@ -33,6 +33,7 @@ use astrid_events::kernel_api::KernelResponse;
 /// install library.
 pub(super) async fn handle_install_capsule(
     kernel: &Arc<crate::Kernel>,
+    caller: &astrid_core::principal::PrincipalId,
     source: &str,
     workspace: bool,
 ) -> KernelResponse {
@@ -80,6 +81,7 @@ pub(super) async fn handle_install_capsule(
         // on install-time elicit must be configured via env before
         // being installed through this path.
         lifecycle_bus: None,
+        target_principal: Some(caller.clone()),
     };
 
     let is_archive = path.is_file()
@@ -117,7 +119,8 @@ pub(super) async fn handle_install_capsule(
 
     // Pick up the new capsule without a daemon restart. The loader
     // is idempotent on already-registered IDs.
-    kernel.load_all_capsules().await;
+    kernel.ensure_principal_loaded(caller).await;
+    kernel.publish_capsules_loaded().await;
 
     KernelResponse::Success(install_output_json(&output))
 }

@@ -919,6 +919,8 @@ async fn find_matching_interceptors(
     // engages for the user-invocable surface with a resolver present;
     // otherwise every topic dispatches unchanged (orchestration mesh).
     let gate_surface = crate::access::is_user_invocable_surface(topic);
+    let view_scoped_surface =
+        access_resolver.is_some() && (gate_surface || topic == "tool.v1.request.describe");
     let registry = registry.read().await;
     let mut matches: Vec<(Arc<dyn crate::capsule::Capsule>, String, u32)> = Vec::new();
     // Dedup grant-on-use signals within a single dispatch pass (principal is
@@ -927,8 +929,26 @@ async fn find_matching_interceptors(
     // set — linear `contains`, no per-check allocation, a `String` built only on
     // emit.
     let mut grant_signalled: Vec<&str> = Vec::new();
-    for capsule_id in registry.list() {
-        if let Some(capsule) = registry.get(capsule_id) {
+    let caller_pid = caller_principal.and_then(|p| astrid_core::PrincipalId::new(p).ok());
+    let view_scoped_admin = view_scoped_surface
+        && access_resolver.is_some_and(|resolver| resolver.is_admin(caller_principal));
+    let candidate_ids = if view_scoped_surface && !view_scoped_admin {
+        caller_pid
+            .as_ref()
+            .map_or_else(Vec::new, |principal| registry.list_for(principal))
+    } else {
+        registry.list_any()
+    };
+
+    for capsule_id in candidate_ids {
+        let capsule = if view_scoped_surface && !view_scoped_admin {
+            caller_pid
+                .as_ref()
+                .and_then(|principal| registry.get_for(principal, capsule_id))
+        } else {
+            registry.get_any(capsule_id)
+        };
+        if let Some(capsule) = capsule {
             if !matches!(capsule.state(), crate::capsule::CapsuleState::Ready) {
                 continue;
             }

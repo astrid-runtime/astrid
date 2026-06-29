@@ -225,6 +225,25 @@ impl CapsuleAccessResolver {
             .iter()
             .any(|granted| granted == capsule.as_str())
     }
+
+    /// Return true when the caller may bypass principal-view narrowing.
+    #[must_use]
+    pub fn is_admin(&self, principal: Option<&str>) -> bool {
+        let Some(principal_str) = principal else {
+            return false;
+        };
+        if principal_str.is_empty() || principal_str == "anonymous" {
+            return false;
+        }
+        let Ok(pid) = PrincipalId::new(principal_str) else {
+            return false;
+        };
+        let Ok(profile) = self.profile_cache.resolve(&pid) else {
+            return false;
+        };
+        let groups = self.groups.load();
+        CapabilityCheck::new(profile.as_ref(), groups.as_ref(), pid).has("*")
+    }
 }
 
 #[cfg(test)]

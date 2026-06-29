@@ -511,7 +511,7 @@ async fn capsule_inventory_requests_are_filtered_to_callers_grants() {
     let (_dir, kernel) = kernel_with_inventory_capsules().await;
 
     let caller = PrincipalId::new("alice").expect("valid principal");
-    seed_capsule_inventory_profile(&kernel, &caller, &["allowed"]);
+    seed_capsule_inventory_profile(&kernel, &caller, &["allowed"]).await;
     assert_capsule_inventory_surface(
         &kernel,
         &caller,
@@ -528,7 +528,7 @@ async fn capsule_inventory_requests_are_filtered_to_callers_grants() {
 async fn ungranted_capsule_inventory_requests_do_not_inherit_default_surface() {
     let (_dir, kernel) = kernel_with_inventory_capsules().await;
     let ungranted = PrincipalId::new("bob").expect("valid principal");
-    seed_capsule_inventory_profile(&kernel, &ungranted, &[]);
+    seed_capsule_inventory_profile(&kernel, &ungranted, &[]).await;
     assert_capsule_inventory_surface(&kernel, &ungranted, "ungranted", &[], &[], &[], &[]).await;
 }
 
@@ -600,7 +600,7 @@ async fn kernel_with_inventory_capsules() -> (tempfile::TempDir, Arc<crate::Kern
     (dir, kernel)
 }
 
-fn seed_capsule_inventory_profile(
+async fn seed_capsule_inventory_profile(
     kernel: &Arc<crate::Kernel>,
     principal: &PrincipalId,
     capsules: &[&str],
@@ -614,6 +614,15 @@ fn seed_capsule_inventory_profile(
         ..Default::default()
     };
     seed_profile(kernel, principal, &profile);
+    let mut reg = kernel.capsules.write().await;
+    for capsule in capsules {
+        let id = CapsuleId::new(*capsule).expect("valid capsule id");
+        let hash = astrid_capsule::registry::WasmHash::synthetic(capsule, "0.0.1");
+        if reg.get_for(principal, &id).is_none() {
+            reg.register_existing(&id, &hash, principal)
+                .expect("seed capsule view");
+        }
+    }
 }
 
 fn seed_profile(kernel: &Arc<crate::Kernel>, principal: &PrincipalId, profile: &PrincipalProfile) {

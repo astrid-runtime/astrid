@@ -269,7 +269,7 @@ async fn handle_request(
     let res = match req {
         KernelRequest::InstallCapsule { source, workspace } => {
             info!(source = %source, workspace, "Kernel received install request");
-            install::handle_install_capsule(kernel, &source, workspace).await
+            install::handle_install_capsule(kernel, &caller, &source, workspace).await
         },
         KernelRequest::ApproveCapability {
             request_id,
@@ -282,7 +282,7 @@ async fn handle_request(
             let visibility = CapsuleVisibility::new(kernel, &caller);
             let reg = kernel.capsules.read().await;
             let mut list = Vec::new();
-            for c in reg.list() {
+            for c in visibility.ids(&reg) {
                 if visibility.allows(c) {
                     list.push(c.to_string());
                 }
@@ -293,7 +293,7 @@ async fn handle_request(
             let visibility = CapsuleVisibility::new(kernel, &caller);
             let reg = kernel.capsules.read().await;
             let mut commands = Vec::new();
-            for c in reg.values() {
+            for c in visibility.capsules(&reg) {
                 if !visibility.allows(c.id()) {
                     continue;
                 }
@@ -351,7 +351,7 @@ async fn handle_request(
             // validate it (CapsuleId::new rejects unsafe ids) before using it as
             // a registry key — never construct it unchecked from untrusted input.
             match astrid_capsule::capsule::CapsuleId::new(id.clone()) {
-                Ok(cap_id) => match kernel.reload_one_capsule(&cap_id).await {
+                Ok(cap_id) => match kernel.reload_one_capsule(&cap_id, &caller).await {
                     Ok(()) => KernelResponse::Success(
                         serde_json::json!({"status": "reloaded", "capsule": id}),
                     ),
@@ -370,7 +370,7 @@ async fn handle_request(
             // (CapsuleId::new rejects unsafe ids) before using it as a registry
             // key — never construct it unchecked from untrusted input.
             match astrid_capsule::capsule::CapsuleId::new(id.clone()) {
-                Ok(cap_id) => match kernel.unload_one_capsule(&cap_id).await {
+                Ok(cap_id) => match kernel.unload_one_capsule(&cap_id, &caller).await {
                     Ok(true) => KernelResponse::Success(
                         serde_json::json!({"status": "unloaded", "capsule": id}),
                     ),
@@ -403,7 +403,7 @@ async fn handle_request(
         KernelRequest::GetStatus => {
             let uptime = kernel.boot_time.elapsed().as_secs();
             let reg = kernel.capsules.read().await;
-            let loaded: Vec<String> = reg.list().iter().map(ToString::to_string).collect();
+            let loaded: Vec<String> = reg.list_any().iter().map(ToString::to_string).collect();
             let by_principal = kernel
                 .connections_by_principal()
                 .into_iter()
@@ -430,7 +430,7 @@ async fn handle_request(
             let visibility = CapsuleVisibility::new(kernel, &caller);
             let reg = kernel.capsules.read().await;
             let mut entries = Vec::new();
-            for capsule in reg.values() {
+            for capsule in visibility.capsules(&reg) {
                 if !visibility.allows(capsule.id()) {
                     continue;
                 }
@@ -450,11 +450,9 @@ async fn handle_request(
         KernelRequest::GetAgentReadiness => {
             let visibility = CapsuleVisibility::new(kernel, &caller);
             let reg = kernel.capsules.read().await;
-            let manifests: Vec<&astrid_capsule::manifest::CapsuleManifest> = reg
-                .values()
-                .filter(|capsule| visibility.allows(capsule.id()))
-                .map(astrid_capsule::capsule::Capsule::manifest)
-                .collect();
+            let capsules = visibility.capsules(&reg);
+            let manifests: Vec<&astrid_capsule::manifest::CapsuleManifest> =
+                capsules.iter().map(|capsule| capsule.manifest()).collect();
             let readiness = astrid_capsule::readiness::agent_loop_readiness(&manifests);
             KernelResponse::AgentReadiness(readiness)
         },
@@ -464,6 +462,7 @@ async fn handle_request(
 }
 
 struct CapsuleVisibility {
+    principal: PrincipalId,
     is_admin: bool,
     capsule_grants: BTreeSet<String>,
 }
@@ -488,6 +487,7 @@ impl CapsuleVisibility {
         };
         let Some(profile) = profile else {
             return Self {
+                principal: caller.clone(),
                 is_admin: false,
                 capsule_grants: BTreeSet::new(),
             };
@@ -497,6 +497,7 @@ impl CapsuleVisibility {
         let check = CapabilityCheck::new(profile.as_ref(), groups.as_ref(), caller.clone());
 
         Self {
+            principal: caller.clone(),
             is_admin: check.has("*") || check.has("capsule:list"),
             capsule_grants: profile.capsules.iter().cloned().collect(),
         }
@@ -504,6 +505,28 @@ impl CapsuleVisibility {
 
     fn allows(&self, capsule_id: &astrid_capsule::capsule::CapsuleId) -> bool {
         self.is_admin || self.capsule_grants.contains(capsule_id.as_str())
+    }
+
+    fn ids<'a>(
+        &self,
+        registry: &'a astrid_capsule::registry::CapsuleRegistry,
+    ) -> Vec<&'a astrid_capsule::capsule::CapsuleId> {
+        if self.is_admin {
+            registry.list_any()
+        } else {
+            registry.list_for(&self.principal)
+        }
+    }
+
+    fn capsules(
+        &self,
+        registry: &astrid_capsule::registry::CapsuleRegistry,
+    ) -> Vec<Arc<dyn astrid_capsule::capsule::Capsule>> {
+        if self.is_admin {
+            registry.cloned_values()
+        } else {
+            registry.cloned_values_for(&self.principal)
+        }
     }
 }
 

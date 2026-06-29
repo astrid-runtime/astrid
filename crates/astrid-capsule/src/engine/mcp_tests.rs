@@ -123,6 +123,7 @@ mod tests {
             overlay_registry: None,
             group_config: None,
             local_egress: Vec::new(),
+            wasm_hash: None,
         };
 
         let result = engine.load(&ctx).await;
@@ -184,6 +185,7 @@ mod tests {
             overlay_registry: None,
             group_config: None,
             local_egress: Vec::new(),
+            wasm_hash: None,
         };
 
         let result = engine.load(&ctx).await;
@@ -248,6 +250,7 @@ mod tests {
             overlay_registry: None,
             group_config: None,
             local_egress: Vec::new(),
+            wasm_hash: None,
         };
 
         let result = engine.load(&ctx).await;

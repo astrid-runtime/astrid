@@ -3,6 +3,7 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::Context;
+use astrid_core::PrincipalId;
 use astrid_core::dirs::AstridHome;
 
 /// The principal a non-workspace install targets.
@@ -24,11 +25,21 @@ pub fn install_principal() -> astrid_core::PrincipalId {
 /// under `capsules/<id>/`, for the [`install_principal`]. Workspace
 /// installs go to `<cwd>/.astrid/capsules/<id>/`.
 pub fn resolve_target_dir(home: &AstridHome, id: &str, workspace: bool) -> anyhow::Result<PathBuf> {
+    resolve_target_dir_for(home, &install_principal(), id, workspace)
+}
+
+/// Resolve the directory a capsule should be installed into for `principal`.
+pub fn resolve_target_dir_for(
+    home: &AstridHome,
+    principal: &PrincipalId,
+    id: &str,
+    workspace: bool,
+) -> anyhow::Result<PathBuf> {
     if workspace {
         let root = std::env::current_dir().context("could not determine current directory")?;
         Ok(root.join(".astrid").join("capsules").join(id))
     } else {
-        let ph = home.principal_home(&install_principal());
+        let ph = home.principal_home(principal);
         Ok(ph.capsules_dir().join(id))
     }
 }
@@ -37,7 +48,16 @@ pub fn resolve_target_dir(home: &AstridHome, id: &str, workspace: bool) -> anyho
 ///
 /// Returns `home/{principal}/.config/env/{capsule}.env.json`.
 pub fn resolve_env_path(home: &AstridHome, capsule_name: &str) -> anyhow::Result<PathBuf> {
-    let ph = home.principal_home(&install_principal());
+    resolve_env_path_for(home, &install_principal(), capsule_name)
+}
+
+/// Resolve the path to a capsule's env config file for `principal`.
+pub fn resolve_env_path_for(
+    home: &AstridHome,
+    principal: &PrincipalId,
+    capsule_name: &str,
+) -> anyhow::Result<PathBuf> {
+    let ph = home.principal_home(principal);
     let env_dir = ph.env_dir();
     std::fs::create_dir_all(&env_dir)?;
     Ok(env_dir.join(format!("{capsule_name}.env.json")))
@@ -47,9 +67,19 @@ pub fn resolve_env_path(home: &AstridHome, capsule_name: &str) -> anyhow::Result
 ///
 /// Called after a reinstall to ensure user-configured environment variables survive.
 pub fn restore_env_from_backup(home: &AstridHome, backup_dir: &Path, capsule_name: &str) {
+    restore_env_from_backup_for(home, &install_principal(), backup_dir, capsule_name);
+}
+
+/// Copy `.env.json` from a backup directory to `principal`'s env path if it exists.
+pub fn restore_env_from_backup_for(
+    home: &AstridHome,
+    principal: &PrincipalId,
+    backup_dir: &Path,
+    capsule_name: &str,
+) {
     let old_env = backup_dir.join(".env.json");
     if old_env.exists()
-        && let Ok(env_path) = resolve_env_path(home, capsule_name)
+        && let Ok(env_path) = resolve_env_path_for(home, principal, capsule_name)
     {
         let _ = std::fs::copy(&old_env, env_path);
     }
