@@ -513,10 +513,6 @@ async fn agent_modify_from_req(
         return err_profile(&principal, &e);
     }
     kernel.profile_cache.invalidate(&principal);
-    if capsules_changed {
-        kernel.ensure_principal_loaded(&principal).await;
-        kernel.publish_capsules_loaded().await;
-    }
 
     info!(
         %principal,

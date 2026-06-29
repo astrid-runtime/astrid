@@ -279,6 +279,7 @@ async fn handle_request(
             KernelResponse::Error("Approval logic not yet implemented in kernel router".to_string())
         },
         KernelRequest::ListCapsules => {
+            refresh_inventory_view(kernel, &caller).await;
             let visibility = CapsuleVisibility::new(kernel, &caller);
             let reg = kernel.capsules.read().await;
             let mut list = Vec::new();
@@ -290,6 +291,7 @@ async fn handle_request(
             KernelResponse::Success(serde_json::json!(list))
         },
         KernelRequest::GetCommands => {
+            refresh_inventory_view(kernel, &caller).await;
             let visibility = CapsuleVisibility::new(kernel, &caller);
             let reg = kernel.capsules.read().await;
             let mut commands = Vec::new();
@@ -427,6 +429,7 @@ async fn handle_request(
             KernelResponse::Status(status)
         },
         KernelRequest::GetCapsuleMetadata => {
+            refresh_inventory_view(kernel, &caller).await;
             let visibility = CapsuleVisibility::new(kernel, &caller);
             let reg = kernel.capsules.read().await;
             let mut entries = Vec::new();
@@ -448,6 +451,7 @@ async fn handle_request(
             KernelResponse::CapsuleMetadata(entries)
         },
         KernelRequest::GetAgentReadiness => {
+            refresh_inventory_view(kernel, &caller).await;
             let visibility = CapsuleVisibility::new(kernel, &caller);
             let reg = kernel.capsules.read().await;
             let capsules = visibility.capsules(&reg);
@@ -459,6 +463,12 @@ async fn handle_request(
     };
 
     publish_response(kernel, response_topic, res);
+}
+
+async fn refresh_inventory_view(kernel: &crate::Kernel, caller: &PrincipalId) {
+    if caller.as_str() != "anonymous" {
+        kernel.ensure_principal_loaded(caller).await;
+    }
 }
 
 struct CapsuleVisibility {
