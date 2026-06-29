@@ -170,10 +170,12 @@ mod tests {
         let client = BusKernelClient::new(Arc::clone(&bus), caller, expected_source)
             .with_timeout(Duration::from_millis(150));
 
-        let mut request_rx = bus.subscribe_topic_as("astrid.v1.kernel.request.status.*", "test");
+        let mut request_rx = bus.subscribe_topic_as("astrid.v1.request.status.*", "test");
         let bus_bg = Arc::clone(&bus);
+        let (saw_request_tx, saw_request_rx) = tokio::sync::oneshot::channel();
         tokio::spawn(async move {
             let event = request_rx.recv().await.expect("request published");
+            let _ = saw_request_tx.send(());
             let AstridEvent::Ipc { message, .. } = &*event else {
                 panic!("expected IPC request");
             };
@@ -181,7 +183,7 @@ mod tests {
                 message
                     .topic
                     .as_str()
-                    .strip_prefix("astrid.v1.kernel.request.")
+                    .strip_prefix("astrid.v1.request.")
                     .expect("kernel request topic suffix"),
             );
             let payload = serde_json::to_value(KernelResponse::Success(serde_json::json!({
@@ -207,6 +209,10 @@ mod tests {
             err.to_string().contains("timed out"),
             "unexpected error: {err:#}"
         );
+        tokio::time::timeout(Duration::from_millis(250), saw_request_rx)
+            .await
+            .expect("wrong-source regression must observe the real request topic")
+            .expect("request observer task dropped");
     }
 
     #[test]

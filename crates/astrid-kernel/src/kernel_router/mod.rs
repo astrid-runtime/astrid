@@ -497,7 +497,7 @@ impl CapsuleVisibility {
         let check = CapabilityCheck::new(profile.as_ref(), groups.as_ref(), caller.clone());
 
         Self {
-            is_admin: check.has("*"),
+            is_admin: check.has("*") || check.has("capsule:list"),
             capsule_grants: profile.capsules.iter().cloned().collect(),
         }
     }

@@ -536,12 +536,22 @@ async fn ungranted_capsule_inventory_requests_do_not_inherit_default_surface() {
 async fn capsule_visibility_precomputes_admin_and_capsule_grants() {
     let (_dir, kernel) = kernel_with_inventory_capsules().await;
     let admin = PrincipalId::new("capsule-admin").expect("valid principal");
+    let global_lister = PrincipalId::new("capsule-lister").expect("valid principal");
     let limited = PrincipalId::new("capsule-limited").expect("valid principal");
     seed_profile(
         &kernel,
         &admin,
         &PrincipalProfile {
             grants: vec!["*".to_string()],
+            capsules: Vec::new(),
+            ..Default::default()
+        },
+    );
+    seed_profile(
+        &kernel,
+        &global_lister,
+        &PrincipalProfile {
+            grants: vec!["capsule:list".to_string()],
             capsules: Vec::new(),
             ..Default::default()
         },
@@ -559,10 +569,13 @@ async fn capsule_visibility_precomputes_admin_and_capsule_grants() {
     let allowed = CapsuleId::new("allowed").expect("valid capsule id");
     let default_only = CapsuleId::new("default-only").expect("valid capsule id");
     let admin_visibility = CapsuleVisibility::new(&kernel, &admin);
+    let global_lister_visibility = CapsuleVisibility::new(&kernel, &global_lister);
     let limited_visibility = CapsuleVisibility::new(&kernel, &limited);
 
     assert!(admin_visibility.allows(&allowed));
     assert!(admin_visibility.allows(&default_only));
+    assert!(global_lister_visibility.allows(&allowed));
+    assert!(global_lister_visibility.allows(&default_only));
     assert!(limited_visibility.allows(&allowed));
     assert!(!limited_visibility.allows(&default_only));
 }
