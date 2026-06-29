@@ -145,7 +145,50 @@ jobs:
 
       - name: Run tests (macOS serial)
         if: matrix.os == 'macos-latest'
-        run: cargo test --workspace --locked -- --test-threads=1
+        shell: bash
+        env:
+          RUST_BACKTRACE: full
+        run: |
+          set -o pipefail
+
+          cargo test --workspace --locked -- --test-threads=1
+          status=$?
+
+          if [[ $status -ne 0 ]]; then
+            echo "::group::macOS failure diagnostics"
+            echo "exit_status=$status"
+            uname -a || true
+            sw_vers || true
+            sysctl -n hw.optional.arm64 hw.memsize hw.ncpu || true
+            ulimit -a || true
+
+            echo "::group::Recent relevant processes"
+            ps -axo pid,ppid,pgid,stat,comm,args \
+              | grep -E 'astrid_capsule|cargo|rustc|sleep| sh ' \
+              | grep -v grep || true
+            echo "::endgroup::"
+
+            echo "::group::Recent macOS abort/crash log entries"
+            log show --last 10m --style compact --info --debug \
+              --predicate 'eventMessage CONTAINS[c] "SIGABRT" OR eventMessage CONTAINS[c] "abort" OR eventMessage CONTAINS[c] "crash" OR eventMessage CONTAINS[c] "killed" OR eventMessage CONTAINS[c] "terminated" OR process CONTAINS[c] "astrid_capsule" OR process CONTAINS[c] "sleep"' \
+              || true
+            echo "::endgroup::"
+
+            echo "::group::Diagnostic reports"
+            for dir in "$HOME/Library/Logs/DiagnosticReports" "/Library/Logs/DiagnosticReports"; do
+              [[ -d "$dir" ]] || continue
+              echo "Reports in $dir"
+              find "$dir" -maxdepth 1 -type f \( -name '*astrid*' -o -name '*cargo*' -o -name '*rustc*' -o -name '*sleep*' \) -print \
+                | while read -r report; do
+                    echo "--- $report"
+                    sed -n '1,220p' "$report" || true
+                  done
+            done
+            echo "::endgroup::"
+            echo "::endgroup::"
+          fi
+
+          exit "$status"
 
   msrv:
     name: MSRV
@@ -373,11 +416,28 @@ jobs:
             . -> .openapi-target
           cache-on-failure: true
 
+      - name: Detect OpenAPI contract-change marker
+        if: steps.gateway-inputs.outputs.run == 'true'
+        id: openapi-contract-change
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          if git log --format=%B "$BASE_SHA..$HEAD_SHA" \
+            | grep -Eq '^(OPENAPI|API)[ -]CONTRACT[ -]CHANGE:'; then
+            echo "found=true" >> "$GITHUB_OUTPUT"
+            echo "OpenAPI contract-change marker found; generated diff will be reported without denying the PR."
+          else
+            echo "found=false" >> "$GITHUB_OUTPUT"
+            echo "No OpenAPI contract-change marker found; generated diff will deny the PR."
+          fi
+
       - name: Diff generated OpenAPI spec
         if: steps.gateway-inputs.outputs.run == 'true'
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          OPENAPI_CONTRACT_CHANGE: ${{ steps.openapi-contract-change.outputs.found }}
         run: |
           mkdir -p /tmp/astrid-openapi
           cp crates/astrid-gateway/examples/print-openapi.rs /tmp/astrid-openapi/print-openapi.rs
@@ -402,7 +462,15 @@ jobs:
           generate_spec "$BASE_SHA" /tmp/astrid-openapi/base.json
           generate_spec "$HEAD_SHA" /tmp/astrid-openapi/head.json
 
-          diff -u /tmp/astrid-openapi/base.json /tmp/astrid-openapi/head.json
+          if diff -u /tmp/astrid-openapi/base.json /tmp/astrid-openapi/head.json; then
+            exit 0
+          fi
+          if [ "$OPENAPI_CONTRACT_CHANGE" = "true" ]; then
+            echo "OpenAPI contract changed and was acknowledged by commit marker."
+            exit 0
+          fi
+          echo "::error::OpenAPI contract changed without an API-CONTRACT-CHANGE: marker in a commit message."
+          exit 1
 
   audit:
     name: Security Audit

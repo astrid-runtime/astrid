@@ -1,19 +1,14 @@
-//! Mirror the read-only introspection "furniture" into every principal's home.
+//! Explicit helper for materializing a principal's capsule introspection view.
 //!
-//! Capsules are deployed once and shared across the daemon, but the
-//! read-only *view* of that set — the installed-capsule registry under
-//! `home://.local/capsules/` and the human-named WIT mirror under
-//! `home://wit/` — is materialized only into the authoritative
-//! [`crate::paths::install_principal`]'s home (see [`crate::local`] /
-//! [`crate::wit::materialize_wit_mirror`]). A freshly-provisioned
-//! principal (e.g. `claude-code`) therefore gets an *empty* home, so the
-//! system capsule's `system_status` reports `capsule_count: 0` and
-//! `list_interfaces` reports "WIT directory not found" even though the
-//! kernel has every capsule loaded globally.
+//! This module is for callers that explicitly need to expose public capsule
+//! introspection metadata from the install principal's home to another
+//! principal. The kernel does not call it during boot or principal creation:
+//! `default` is a principal, not a shared tenant, and fresh principals must
+//! not implicitly receive a copy of its installed-capsule registry.
 //!
-//! [`materialize_principal_furniture`] closes that gap by copying the two
-//! read-only mirror subdirectories from the install principal's home into a
-//! target principal's home.
+//! [`materialize_principal_introspection`] copies the two read-only
+//! introspection subdirectories from the install principal's home into a
+//! target principal's home when invoked deliberately.
 //!
 //! ## Security
 //!
@@ -33,16 +28,14 @@ use astrid_core::PrincipalId;
 use astrid_core::dirs::AstridHome;
 
 /// Mirror the read-only introspection view (installed-capsule registry +
-/// `home://wit/`) from the authoritative install principal's home into
-/// `target`'s home, so a non-install principal's `system_status` /
-/// `list_interfaces` reflect the globally-loaded capsule set.
+/// `home://wit/`) from the install principal's home into `target`'s home.
 ///
 /// SECURITY: copies ONLY public capsule metadata (manifests, meta.json) and
 /// WIT interface definitions. It MUST NOT copy `.config/env/` — that holds
 /// per-principal secrets (API keys) that must never cross principal
 /// boundaries. Idempotent. No-op when `target` is the install principal
 /// (that home is authoritative, not a mirror).
-pub fn materialize_principal_furniture(
+pub fn materialize_principal_introspection(
     home: &AstridHome,
     target: &PrincipalId,
 ) -> anyhow::Result<()> {
@@ -56,7 +49,7 @@ pub fn materialize_principal_furniture(
     let dst = home.principal_home(target);
 
     // `.local/capsules/` — the installed-capsule registry (per-capsule
-    // dirs + meta.json) the system capsule's `system_status` counts.
+    // dirs + meta.json) that explicit metadata mirrors expose to the target.
     mirror_subtree(&src.capsules_dir(), &dst.capsules_dir())
         .context("failed to mirror .local/capsules into principal home")?;
 
@@ -168,7 +161,7 @@ mod tests {
         let secret_path = target_home.env_dir().join("secret.env.json");
         write_file(&secret_path, r#"{"API_KEY":"top-secret"}"#);
 
-        materialize_principal_furniture(&home, &target).expect("materialize");
+        materialize_principal_introspection(&home, &target).expect("materialize");
 
         // Registry entries mirrored.
         assert_eq!(
@@ -212,7 +205,7 @@ mod tests {
                 .expect("alpha meta before");
 
         // No-op: returns Ok, does not error, does not duplicate or disturb.
-        materialize_principal_furniture(&home, &install).expect("noop");
+        materialize_principal_introspection(&home, &install).expect("noop");
 
         let after =
             std::fs::read_to_string(install_home.capsules_dir().join("alpha").join("meta.json"))
@@ -235,8 +228,8 @@ mod tests {
         let target = PrincipalId::new("claude-code").expect("principal id");
         let target_home = home.principal_home(&target);
 
-        materialize_principal_furniture(&home, &target).expect("first");
-        materialize_principal_furniture(&home, &target).expect("second");
+        materialize_principal_introspection(&home, &target).expect("first");
+        materialize_principal_introspection(&home, &target).expect("second");
 
         // Same end state after two runs: exactly the two seeded entries and
         // the single WIT file.
@@ -260,7 +253,7 @@ mod tests {
         let target = PrincipalId::new("claude-code").expect("principal id");
         let target_home = home.principal_home(&target);
 
-        materialize_principal_furniture(&home, &target).expect("first");
+        materialize_principal_introspection(&home, &target).expect("first");
 
         // Authoritative set shrinks: drop `bravo`.
         std::fs::remove_dir_all(
@@ -270,7 +263,7 @@ mod tests {
         )
         .expect("remove bravo");
 
-        materialize_principal_furniture(&home, &target).expect("re-mirror");
+        materialize_principal_introspection(&home, &target).expect("re-mirror");
 
         // Mirror reflects the shrink — `bravo` is gone, `alpha` remains.
         assert!(target_home.capsules_dir().join("alpha").exists());
@@ -287,7 +280,7 @@ mod tests {
         let target_home = home.principal_home(&target);
 
         // Must not error even though the source mirror dirs don't exist.
-        materialize_principal_furniture(&home, &target).expect("empty ok");
+        materialize_principal_introspection(&home, &target).expect("empty ok");
 
         assert!(!target_home.capsules_dir().exists());
         assert!(!target_home.root().join("wit").exists());

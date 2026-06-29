@@ -174,28 +174,53 @@ async fn await_and_grant(
     principal: &str,
     capsule_id: &str,
 ) {
-    // Timed out (`Err`) or the bus closed (`Ok(None)`) → no consent, no grant.
-    let Ok(Some(event)) = tokio::time::timeout(GRANT_RESPONSE_TIMEOUT, receiver.recv()).await
-    else {
-        warn!(
-            security_event = true,
-            principal = %principal,
-            capsule = %capsule_id,
-            "grant-on-use: no consent response before timeout; no grant (fail-closed)"
-        );
-        return;
+    let deadline = tokio::time::Instant::now()
+        .checked_add(GRANT_RESPONSE_TIMEOUT)
+        .unwrap_or_else(tokio::time::Instant::now);
+    let decision = loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            warn!(
+                security_event = true,
+                principal = %principal,
+                capsule = %capsule_id,
+                "grant-on-use: no consent response before timeout; no grant (fail-closed)"
+            );
+            return;
+        }
+
+        let Ok(Some(event)) = tokio::time::timeout(remaining, receiver.recv()).await else {
+            warn!(
+                security_event = true,
+                principal = %principal,
+                capsule = %capsule_id,
+                "grant-on-use: no consent response before timeout; no grant (fail-closed)"
+            );
+            return;
+        };
+
+        let AstridEvent::Ipc { message, .. } = &*event else {
+            continue;
+        };
+        if message.principal.as_deref() != Some(principal) {
+            warn!(
+                security_event = true,
+                expected_principal = %principal,
+                got_principal = message.principal.as_deref().unwrap_or("<none>"),
+                capsule = %capsule_id,
+                "grant-on-use: rejected cross-principal approval response; continuing to wait"
+            );
+            continue;
+        }
+        // SECURITY: read ONLY `decision`. The target is the already-captured
+        // (principal, capsule_id); the response carries no target to honour.
+        let IpcPayload::ApprovalResponse { decision, .. } = &message.payload else {
+            continue;
+        };
+        break decision.clone();
     };
 
-    let AstridEvent::Ipc { message, .. } = &*event else {
-        return;
-    };
-    // SECURITY: read ONLY `decision`. The target is the already-captured
-    // (principal, capsule_id); the response carries no target to honour.
-    let IpcPayload::ApprovalResponse { decision, .. } = &message.payload else {
-        return;
-    };
-
-    if !is_approved(decision) {
+    if !is_approved(&decision) {
         warn!(
             security_event = true,
             principal = %principal,

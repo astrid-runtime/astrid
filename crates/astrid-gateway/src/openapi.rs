@@ -107,6 +107,7 @@ use crate::state::GatewayState;
         routes::env::write_env,
         // Agent invocation
         routes::agent::post_prompt,
+        routes::agent::get_requests,
         // Per-principal live conversation feed (SSE, #973)
         routes::stream::get_stream,
         // Conversation threads (proxied to capsule-session)
@@ -118,6 +119,7 @@ use crate::state::GatewayState;
         routes::sessions::get_session_messages,
         // Agent elicitation reply
         routes::agent::post_elicit_response,
+        routes::agent::post_approval_response,
         // Models (active-LLM selection)
         routes::models::list_models,
         routes::models::get_active_model,
@@ -181,6 +183,7 @@ use crate::state::GatewayState;
             // Agent
             routes::agent::PromptRequest,
             routes::agent::PromptReady,
+            routes::agent::ApprovalResponseRequest,
             // Per-principal live conversation feed
             routes::stream::FeedReady,
             // Conversation threads

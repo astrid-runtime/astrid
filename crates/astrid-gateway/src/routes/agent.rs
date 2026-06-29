@@ -31,12 +31,12 @@
 //!
 //! ## Filtering
 //!
-//! Each SSE subscription opens a routed receiver via
-//! [`astrid_events::EventBus::subscribe_topic_routed`]; per-(topic,
-//! principal) DRR fairness and publish-side byte-budget eviction are
-//! enforced by the bus's routing demux. The `session_id` post-receive
-//! filter handles cross-session de-multiplexing within a principal's
-//! stream — session is a payload concern, not a routing concern.
+//! Each SSE subscription opens a principal-scoped routed receiver via
+//! [`astrid_events::EventBus::subscribe_topic_routed_scoped`]; per-(topic,
+//! principal) DRR fairness and publish-side byte-budget eviction are enforced
+//! by the bus's routing demux. The `session_id` post-receive filter handles
+//! cross-session de-multiplexing within a principal's stream — session is a
+//! payload concern, not a routing concern.
 //!
 //! ## Termination
 //!
@@ -118,6 +118,18 @@ pub struct ElicitResponseRequest {
     pub values: Option<Vec<String>>,
 }
 
+/// Inbound body for `POST /api/agent/approval-response`.
+#[derive(Debug, Clone, Deserialize, ToSchema)]
+pub struct ApprovalResponseRequest {
+    /// Correlates with the `request_id` from a forwarded `approval` SSE event.
+    pub request_id: String,
+    /// One of `approve`, `approve_session`, `approve_always`, or `deny`.
+    pub decision: String,
+    /// Optional human-readable reason for the decision.
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
 impl ElicitResponseRequest {
     /// Reject the ambiguous body where both a scalar `value` and an array
     /// `values` are supplied. The elicit contract treats them as mutually
@@ -132,6 +144,19 @@ impl ElicitResponseRequest {
             );
         }
         Ok(())
+    }
+}
+
+impl ApprovalResponseRequest {
+    /// Reject malformed decisions before publishing onto the approval reply topic.
+    fn validate(&self) -> Result<(), &'static str> {
+        if self.request_id.trim().is_empty() {
+            return Err("`request_id` must not be empty");
+        }
+        match self.decision.as_str() {
+            "approve" | "approve_session" | "approve_always" | "deny" => Ok(()),
+            _ => Err("`decision` must be one of approve, approve_session, approve_always, or deny"),
+        }
     }
 }
 
@@ -227,14 +252,21 @@ pub async fn post_prompt(
     // with a fresh `subscription_rep` (monotonic allocator), so the
     // resulting `RouteKey` is distinct per call even when the
     // `capsule_uuid` argument is shared. Each connection therefore drains
-    // its own routed queue and sees every response (forwarding only its
-    // own, filtered by session_id) regardless of what UUID is passed
+    // its own principal-scoped routed queue and forwards only events that
+    // also match its session_id where the payload carries one, regardless of
+    // what UUID is passed
     // here. A per-connection `Uuid::new_v4()` only relabels this
     // connection's routes; the audit-firehose route (`events.rs`) shares
     // the single `state.gateway_route_uuid` and is just as isolated.
     let conn_route_uuid = Uuid::new_v4();
     let subscribe = |topic: &'static str| {
-        bus.subscribe_topic_routed(conn_route_uuid, topic, "gateway", "gateway::agent_sse")
+        bus.subscribe_topic_routed_scoped(
+            conn_route_uuid,
+            topic,
+            "gateway",
+            "gateway::agent_sse",
+            Some(Some(caller.principal.to_string())),
+        )
     };
     let mut response_rx = subscribe("agent.v1.response");
     let mut delta_rx = subscribe("agent.v1.stream.delta");
@@ -268,7 +300,7 @@ pub async fn post_prompt(
         // without having to peek into the first payload.
         let ready = PromptReady {
             session_id: session_id_for_stream.clone(),
-            principal: principal_str,
+            principal: principal_str.clone(),
         };
         yield Ok::<Event, Infallible>(
             Event::default()
@@ -294,7 +326,7 @@ pub async fn post_prompt(
                 () = tokio::time::sleep(remaining) => break,
                 event = response_rx.recv(None) => {
                     let Some(event) = event else { break };
-                    if let Some(ev) = forward_event(&event, &session_id_for_stream, "response") {
+                    if let Some(ev) = forward_event(&event, &principal_str, &session_id_for_stream, "response") {
                         yield Ok(ev);
                         // `agent.v1.response` is terminal — but only for
                         // OUR session. Close once we've forwarded our own
@@ -309,26 +341,92 @@ pub async fn post_prompt(
                 }
                 event = delta_rx.recv(None) => {
                     let Some(event) = event else { break };
-                    if let Some(ev) = forward_event(&event, &session_id_for_stream, "delta") {
+                    if let Some(ev) = forward_event(&event, &principal_str, &session_id_for_stream, "delta") {
                         yield Ok(ev);
                     }
                 }
                 event = session_rx.recv(None) => {
                     let Some(event) = event else { break };
-                    if let Some(ev) = forward_event(&event, &session_id_for_stream, "session_changed") {
+                    if let Some(ev) = forward_event(&event, &principal_str, &session_id_for_stream, "session_changed") {
                         yield Ok(ev);
                     }
                 }
                 event = elicit_rx.recv(None) => {
                     let Some(event) = event else { break };
-                    // Elicit events don't carry session_id in the
-                    // same shape — forward unconditionally and let
-                    // the client filter. The caller replies out-of-band
-                    // by POSTing the answer (carrying the forwarded
-                    // request_id) to /api/agent/elicit-response; the
-                    // agent's continuation then streams back over this
-                    // same connection.
-                    if let Some(ev) = forward_event(&event, "", "elicit") {
+                    // Elicit events don't carry session_id in the same
+                    // shape, so forwarding is principal-only here. The
+                    // caller replies out-of-band by POSTing the answer
+                    // (carrying the forwarded request_id) to
+                    // /api/agent/elicit-response; the agent's continuation
+                    // then streams back over this same connection.
+                    if let Some(ev) = forward_event(&event, &principal_str, "", "elicit") {
+                        yield Ok(ev);
+                    }
+                }
+            }
+        }
+    };
+
+    Ok(sse_with_keepalive(stream.boxed()))
+}
+
+/// `GET /api/agent/requests` — stream pending approval, grant, and elicit requests.
+///
+/// This is the standalone control-plane companion to `POST /api/agent/prompt`'s
+/// in-band elicit forwarding. Lifecycle hooks and other non-prompt capsule work
+/// can request human input without an agent prompt SSE connection being open, so
+/// clients need one authenticated request stream. Only requests stamped with the
+/// caller's verified principal are forwarded. Grant-on-use requests are
+/// forwarded only when kernel-originated (`source_id == nil`) so a capsule
+/// cannot spoof a grant prompt into a user's stream.
+#[utoipa::path(
+    get,
+    path = "/api/agent/requests",
+    tag = "agent",
+    responses(
+        (status = 200, description = "Server-Sent Events stream of pending `approval` and `elicit` requests scoped to the authenticated principal. Starts with `event: ready`.", content_type = "text/event-stream"),
+        (status = 401, body = ErrorBody, description = "Missing / invalid bearer."),
+        (status = 500, body = ErrorBody, description = "Gateway not wired to a live event bus."),
+    )
+)]
+pub async fn get_requests(
+    State(state): State<Arc<GatewayState>>,
+    req: Request<axum::body::Body>,
+) -> GatewayResult<Sse<impl Stream<Item = Result<Event, Infallible>>>> {
+    let caller = caller_from(&req)?.clone();
+
+    let Some(bus) = state.event_bus.clone() else {
+        return Err(GatewayError::Internal(anyhow::anyhow!(
+            "gateway is not wired to a live event bus; agent request stream unavailable"
+        )));
+    };
+
+    let conn_route_uuid = Uuid::new_v4();
+    let subscribe = |topic: &'static str| {
+        bus.subscribe_topic_routed(conn_route_uuid, topic, "gateway", "gateway::agent_requests")
+    };
+    let mut approval_rx = subscribe("astrid.v1.approval");
+    let mut elicit_rx = subscribe("astrid.v1.elicit");
+    let principal = caller.principal.to_string();
+
+    let stream = async_stream::stream! {
+        yield Ok::<Event, Infallible>(
+            Event::default()
+                .event("ready")
+                .data(serde_json::json!({ "principal": principal }).to_string())
+        );
+
+        loop {
+            tokio::select! {
+                event = approval_rx.recv(None) => {
+                    let Some(event) = event else { break };
+                    if let Some(ev) = forward_control_request(&event, &principal, "approval") {
+                        yield Ok(ev);
+                    }
+                }
+                event = elicit_rx.recv(None) => {
+                    let Some(event) = event else { break };
+                    if let Some(ev) = forward_control_request(&event, &principal, "elicit") {
                         yield Ok(ev);
                     }
                 }
@@ -384,6 +482,47 @@ pub async fn post_elicit_response(
     Ok(StatusCode::ACCEPTED)
 }
 
+/// `POST /api/agent/approval-response` — answer an in-flight approval or grant request.
+///
+/// Fire-and-forget: the gateway publishes the decision onto
+/// `astrid.v1.approval.response.{request_id}` and stamps it with the caller's
+/// verified principal. Capsule host waiters accept only same-principal replies,
+/// and grant-on-use captures the target from the kernel-origin request, so a
+/// caller who learns another principal's request id cannot answer, deny, cancel,
+/// or redirect it.
+#[utoipa::path(
+    post,
+    path = "/api/agent/approval-response",
+    tag = "agent",
+    request_body = ApprovalResponseRequest,
+    responses(
+        (status = 202, description = "Approval decision accepted and published onto the approval reply topic."),
+        (status = 400, body = ErrorBody, description = "Malformed request id or unsupported decision."),
+        (status = 401, body = ErrorBody, description = "Missing / invalid bearer."),
+        (status = 500, body = ErrorBody, description = "Gateway not wired to a live event bus."),
+    )
+)]
+pub async fn post_approval_response(
+    State(state): State<Arc<GatewayState>>,
+    req: Request<axum::body::Body>,
+) -> GatewayResult<impl IntoResponse> {
+    let caller = caller_from(&req)?.clone();
+
+    let Some(bus) = state.event_bus.clone() else {
+        return Err(GatewayError::Internal(anyhow::anyhow!(
+            "gateway is not wired to a live event bus; agent approval unavailable"
+        )));
+    };
+
+    let body: ApprovalResponseRequest = crate::routes::principals::read_json_body(req).await?;
+    body.validate()
+        .map_err(|m| GatewayError::BadRequest(m.to_string()))?;
+
+    publish_approval_response(&bus, caller.principal.as_str(), body);
+
+    Ok(StatusCode::ACCEPTED)
+}
+
 /// Publish an elicit answer onto the per-request reply topic the host lifecycle
 /// waiter is blocked on (`astrid.v1.elicit.response.{request_id}`), stamped with
 /// the caller's verified `principal`.
@@ -412,6 +551,25 @@ fn publish_elicit_response(
     .with_principal(principal);
     bus.publish(AstridEvent::Ipc {
         metadata: astrid_events::EventMetadata::new("gateway::agent.elicit_response"),
+        message: msg,
+    });
+}
+
+fn publish_approval_response(
+    bus: &astrid_events::EventBus,
+    principal: &str,
+    body: ApprovalResponseRequest,
+) {
+    let request_id = body.request_id;
+    let payload = IpcPayload::ApprovalResponse {
+        request_id: request_id.clone(),
+        decision: body.decision,
+        reason: body.reason,
+    };
+    let msg = IpcMessage::new(Topic::approval_response(&request_id), payload, Uuid::nil())
+        .with_principal(principal);
+    bus.publish(AstridEvent::Ipc {
+        metadata: astrid_events::EventMetadata::new("gateway::agent.approval_response"),
         message: msg,
     });
 }
@@ -479,18 +637,22 @@ fn unready_payload(report: &AgentLoopReadiness) -> serde_json::Value {
 }
 
 /// Convert an in-bus `AstridEvent::Ipc` into an SSE `Event`, filtering by
-/// `session_id` when the payload carries one. Returns `None` for events
-/// that don't match this session (silent drop — the bus is shared
-/// across every prompt in flight) or events with non-JSON payloads
+/// principal and by `session_id` when the payload carries one. Returns `None`
+/// for events that don't match this caller/session (silent drop — the bus is
+/// shared across every prompt in flight) or events with non-JSON payloads
 /// (defensive).
 fn forward_event(
     event: &Arc<AstridEvent>,
+    principal_filter: &str,
     session_filter: &str,
     sse_name: &'static str,
 ) -> Option<Event> {
     let AstridEvent::Ipc { message, .. } = &**event else {
         return None;
     };
+    if message.principal.as_deref() != Some(principal_filter) {
+        return None;
+    }
     let value = match &message.payload {
         IpcPayload::RawJson(v) => v.clone(),
         _ => serde_json::to_value(&message.payload).ok()?,
@@ -507,222 +669,38 @@ fn forward_event(
     Some(Event::default().event(sse_name).data(body))
 }
 
-#[cfg(test)]
-mod tests {
-    use astrid_core::kernel_api::MissingImport;
-
-    use super::*;
-
-    /// The fail-fast `error` payload must name exactly which piece of the
-    /// loop is missing — a not-ready report with no prompt subscriber and an
-    /// unsatisfied import must say so, so the client gets an actionable
-    /// signal instead of a 5-minute silent wait.
-    #[test]
-    fn unready_payload_names_missing_pieces() {
-        let report = AgentLoopReadiness {
-            ready: false,
-            prompt_subscribers: vec![],
-            response_publishers: vec!["loop".to_string()],
-            unsatisfied_required_imports: vec![MissingImport {
-                capsule: "loop".to_string(),
-                namespace: "astrid".to_string(),
-                interface: "llm".to_string(),
-                requirement: "^1.0".to_string(),
-            }],
-            loaded_capsules: vec!["loop".to_string()],
-        };
-        let payload = unready_payload(&report);
-        assert_eq!(payload["error"], "agent loop not ready");
-        assert_eq!(payload["missing"]["prompt_subscriber"], true);
-        assert_eq!(payload["missing"]["response_publisher"], false);
-        let imports = payload["missing"]["unsatisfied_imports"]
-            .as_array()
-            .expect("unsatisfied_imports is an array");
-        assert_eq!(imports.len(), 1);
-        assert_eq!(imports[0], "astrid:llm (^1.0)");
+fn forward_control_request(
+    event: &Arc<AstridEvent>,
+    principal: &str,
+    sse_name: &'static str,
+) -> Option<Event> {
+    let AstridEvent::Ipc { message, .. } = &**event else {
+        return None;
+    };
+    if message.principal.as_deref() != Some(principal) {
+        return None;
     }
-
-    /// A ready report still serializes (defensive — `unready_payload` is only
-    /// called on the not-ready path, but it must not panic on a ready one).
-    #[test]
-    fn unready_payload_ready_report_reports_no_missing() {
-        let report = AgentLoopReadiness {
-            ready: true,
-            prompt_subscribers: vec!["loop".to_string()],
-            response_publishers: vec!["loop".to_string()],
-            unsatisfied_required_imports: vec![],
-            loaded_capsules: vec!["loop".to_string()],
-        };
-        let payload = unready_payload(&report);
-        assert_eq!(payload["missing"]["prompt_subscriber"], false);
-        assert_eq!(payload["missing"]["response_publisher"], false);
-        assert!(
-            payload["missing"]["unsatisfied_imports"]
-                .as_array()
-                .unwrap()
-                .is_empty()
-        );
-    }
-
-    /// `publish_elicit_response` must publish an `ElicitResponse` onto the
-    /// per-request reply topic carrying the `request_id`, the value/values, AND
-    /// the caller's principal. That principal stamp is the security hinge: the
-    /// host waiter only accepts a reply whose principal matches the elicit's
-    /// originating principal, so a missing/wrong stamp would silently fail to
-    /// answer (or, worse, be the vector this endpoint must NOT open).
-    #[tokio::test]
-    async fn elicit_response_publishes_stamped_reply_on_topic() {
-        use astrid_events::ipc::IpcPayload as BusIpcPayload;
-
-        let bus = astrid_events::EventBus::with_capacity(64);
-        let request_id = Uuid::new_v4();
-        let topic = Topic::elicit_response(request_id);
-
-        // Subscribe BEFORE publishing — same ordering the host waiter uses.
-        let mut rx = bus.subscribe_topic(topic.as_str());
-
-        publish_elicit_response(
-            &bus,
-            "agent-alice",
-            ElicitResponseRequest {
-                request_id,
-                value: Some("hello".to_string()),
-                values: None,
-            },
-        );
-
-        let event = tokio::time::timeout(Duration::from_secs(5), rx.recv())
-            .await
-            .expect("reply observed within timeout")
-            .expect("bus open");
-        let AstridEvent::Ipc { message, .. } = &*event else {
-            panic!("expected an IPC event");
-        };
-        assert_eq!(
-            message.principal.as_deref(),
-            Some("agent-alice"),
-            "reply must carry the caller's verified principal"
-        );
-        match &message.payload {
-            BusIpcPayload::ElicitResponse {
-                request_id: got_id,
-                value,
-                values,
-            } => {
-                assert_eq!(*got_id, request_id, "request_id must round-trip");
-                assert_eq!(value.as_deref(), Some("hello"));
-                assert!(values.is_none());
-            },
-            other => panic!("expected ElicitResponse, got {other:?}"),
-        }
-    }
-
-    /// A cancellation (both `value` and `values` `None`) round-trips as the
-    /// host's cancel sentinel — the endpoint must be able to express it.
-    #[tokio::test]
-    async fn elicit_response_cancellation_round_trips() {
-        use astrid_events::ipc::IpcPayload as BusIpcPayload;
-
-        let bus = astrid_events::EventBus::with_capacity(64);
-        let request_id = Uuid::new_v4();
-        let mut rx = bus.subscribe_topic(Topic::elicit_response(request_id).as_str());
-
-        publish_elicit_response(
-            &bus,
-            "agent-alice",
-            ElicitResponseRequest {
-                request_id,
-                value: None,
-                values: None,
-            },
-        );
-
-        let event = tokio::time::timeout(Duration::from_secs(5), rx.recv())
-            .await
-            .expect("reply observed")
-            .expect("bus open");
-        let AstridEvent::Ipc { message, .. } = &*event else {
-            panic!("expected IPC event");
-        };
-        match &message.payload {
-            BusIpcPayload::ElicitResponse { value, values, .. } => {
-                assert!(
-                    value.is_none() && values.is_none(),
-                    "cancellation = both None (host cancel sentinel)"
-                );
-            },
-            other => panic!("expected ElicitResponse, got {other:?}"),
-        }
-    }
-
-    /// REGRESSION: `value` and `values` are mutually exclusive. A body carrying
-    /// BOTH must be rejected by `validate()` (the handler maps that to a `400`),
-    /// so an ambiguous answer can't reach the bus where the host would silently
-    /// honour one side and drop the other. The cancel sentinel (both `None`) and
-    /// either single-sided answer stay valid.
-    #[test]
-    fn elicit_response_rejects_both_value_and_values() {
-        let request_id = Uuid::new_v4();
-        let both = ElicitResponseRequest {
-            request_id,
-            value: Some("scalar".to_string()),
-            values: Some(vec!["array".to_string()]),
-        };
-        assert!(both.validate().is_err(), "both set must be rejected");
-
-        // Each valid shape passes.
-        assert!(
-            ElicitResponseRequest {
-                request_id,
-                value: Some("v".into()),
-                values: None
+    let value = match &message.payload {
+        IpcPayload::ApprovalRequired { .. } | IpcPayload::ElicitRequest { .. } => {
+            if message.principal.as_deref() != Some(principal) {
+                return None;
             }
-            .validate()
-            .is_ok(),
-            "scalar answer is valid"
-        );
-        assert!(
-            ElicitResponseRequest {
-                request_id,
-                value: None,
-                values: Some(vec!["a".into()])
+            serde_json::to_value(&message.payload).ok()?
+        },
+        IpcPayload::GrantRequired {
+            principal: request_principal,
+            ..
+        } => {
+            if message.source_id != Uuid::nil() || request_principal != principal {
+                return None;
             }
-            .validate()
-            .is_ok(),
-            "array answer is valid"
-        );
-        assert!(
-            ElicitResponseRequest {
-                request_id,
-                value: None,
-                values: None
-            }
-            .validate()
-            .is_ok(),
-            "cancel sentinel (both None) is valid"
-        );
-    }
-
-    /// The fail-fast stream emits exactly one `error` event and then closes —
-    /// it does NOT wait out the 5-minute timeout against a loop that can never
-    /// reply. Drive the inner stream and assert single-event termination.
-    #[tokio::test]
-    async fn unready_stream_emits_single_event_then_closes() {
-        let report = AgentLoopReadiness {
-            ready: false,
-            prompt_subscribers: vec![],
-            response_publishers: vec![],
-            unsatisfied_required_imports: vec![],
-            loaded_capsules: vec![],
-        };
-        let mut stream = unready_event_stream(&report);
-        // Exactly one event, then end-of-stream — the load-bearing property:
-        // the fail-fast path closes immediately rather than waiting out the
-        // 5-minute timeout against a loop that can never reply.
-        let _first = stream.next().await.expect("one event").expect("infallible");
-        assert!(
-            stream.next().await.is_none(),
-            "fail-fast stream must close after one event, not wait the timeout"
-        );
-    }
+            serde_json::to_value(&message.payload).ok()?
+        },
+        _ => return None,
+    };
+    let body = serde_json::to_string(&value).ok()?;
+    Some(Event::default().event(sse_name).data(body))
 }
+
+#[cfg(test)]
+mod tests;

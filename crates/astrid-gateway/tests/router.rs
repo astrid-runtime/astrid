@@ -430,75 +430,273 @@ fn openapi_types_kernel_payloads_instead_of_opaque_json() {
     );
 }
 
+// Every concrete method/path the router exposes. Keep this table next to the
+// router drift test and update it with any route registration change; it is the
+// only maintained inventory because axum does not expose one after build.
+const ROUTER_METHODS: &[(&str, &str)] = &[
+    // Public
+    ("GET", "/api/distribution"),
+    ("GET", "/api/distribution/onboarding"),
+    ("POST", "/api/auth/redeem"),
+    ("POST", "/api/auth/pair-device/redeem"),
+    ("GET", "/api/openapi.json"),
+    ("GET", "/healthz"),
+    ("GET", "/metrics"),
+    // Authed
+    ("GET", "/api/auth/me"),
+    ("POST", "/api/auth/refresh"),
+    ("POST", "/api/auth/pair-device"),
+    ("GET", "/api/sys/principals"),
+    ("POST", "/api/sys/principals"),
+    ("GET", "/api/sys/principals/{id}"),
+    ("PATCH", "/api/sys/principals/{id}"),
+    ("DELETE", "/api/sys/principals/{id}"),
+    ("POST", "/api/sys/principals/{id}/enable"),
+    ("POST", "/api/sys/principals/{id}/disable"),
+    ("POST", "/api/sys/principals/{id}/caps"),
+    ("DELETE", "/api/sys/principals/{id}/caps"),
+    ("GET", "/api/sys/principals/{id}/quotas"),
+    ("PUT", "/api/sys/principals/{id}/quotas"),
+    ("GET", "/api/sys/principals/{id}/usage"),
+    ("GET", "/api/sys/principals/{id}/devices"),
+    ("DELETE", "/api/sys/principals/{id}/devices/{key_id}"),
+    ("GET", "/api/sys/groups"),
+    ("POST", "/api/sys/groups"),
+    ("PATCH", "/api/sys/groups/{name}"),
+    ("DELETE", "/api/sys/groups/{name}"),
+    ("POST", "/api/sys/invites"),
+    ("GET", "/api/sys/invites"),
+    ("DELETE", "/api/sys/invites/{fingerprint}"),
+    ("GET", "/api/sys/capabilities"),
+    ("GET", "/api/capsules"),
+    ("POST", "/api/capsules"),
+    ("GET", "/api/capsules/{id}"),
+    ("GET", "/api/capsules/{id}/topics"),
+    ("GET", "/api/capsules/{id}/env"),
+    ("POST", "/api/capsules/{id}/env/{field}"),
+    ("GET", "/api/events"),
+    ("GET", "/api/sys/audit"),
+    ("POST", "/api/agent/prompt"),
+    ("GET", "/api/agent/requests"),
+    ("GET", "/api/agent/stream"),
+    ("GET", "/api/agent/sessions"),
+    ("GET", "/api/agent/sessions/search"),
+    ("GET", "/api/agent/sessions/{id}"),
+    ("PATCH", "/api/agent/sessions/{id}"),
+    ("DELETE", "/api/agent/sessions/{id}"),
+    ("GET", "/api/agent/sessions/{id}/messages"),
+    ("POST", "/api/agent/elicit-response"),
+    ("POST", "/api/agent/approval-response"),
+    ("GET", "/api/models"),
+    ("GET", "/api/models/active"),
+    ("PUT", "/api/models/active"),
+    ("GET", "/api/sys/status"),
+    ("GET", "/api/sys/readiness"),
+    ("POST", "/api/sys/capsules/reload"),
+];
+
 #[test]
 fn openapi_lists_every_router_route() {
     // Drift-check: the route registered in `routes::build` and the
-    // path annotated with `#[utoipa::path(...)]` must agree. If
-    // someone wires a new route into the router but forgets the
-    // utoipa annotation (or forgets to add it under `paths(...)` in
-    // the `ApiDoc` macro), this test catches it before review.
+    // method/path annotated with `#[utoipa::path(...)]` must agree. If
+    // someone wires a new route into the router but forgets the utoipa
+    // annotation (or forgets to add it under `paths(...)` in the `ApiDoc`
+    // macro), this test catches it before review. The same method/path must
+    // also have a runtime scenario or explicit waiver in e2e/http-scenarios.toml.
     use astrid_gateway::openapi::ApiDoc;
+    use std::collections::BTreeSet;
     use utoipa::OpenApi;
 
-    // Every concrete `/api` route the router exposes. Update this
-    // list when you add a route; the spec must contain a matching
-    // entry under each.
-    const ROUTER_PATHS: &[&str] = &[
-        // Public
-        "/api/distribution",
-        "/api/distribution/onboarding",
-        "/api/auth/redeem",
-        "/api/auth/pair-device/redeem",
-        "/api/openapi.json",
-        "/healthz",
-        "/metrics",
-        // Authed
-        "/api/auth/me",
-        "/api/auth/refresh",
-        "/api/auth/pair-device",
-        "/api/sys/principals",
-        "/api/sys/principals/{id}",
-        "/api/sys/principals/{id}/enable",
-        "/api/sys/principals/{id}/disable",
-        "/api/sys/principals/{id}/caps",
-        "/api/sys/principals/{id}/quotas",
-        "/api/sys/principals/{id}/usage",
-        "/api/sys/principals/{id}/devices",
-        "/api/sys/principals/{id}/devices/{key_id}",
-        "/api/sys/groups",
-        "/api/sys/groups/{name}",
-        "/api/sys/invites",
-        "/api/sys/invites/{fingerprint}",
-        "/api/sys/capabilities",
-        "/api/capsules",
-        "/api/capsules/{id}",
-        "/api/capsules/{id}/topics",
-        "/api/capsules/{id}/env",
-        "/api/capsules/{id}/env/{field}",
-        "/api/events",
-        "/api/sys/audit",
-        "/api/agent/prompt",
-        "/api/agent/stream",
-        "/api/agent/sessions",
-        "/api/agent/sessions/search",
-        "/api/agent/sessions/{id}",
-        "/api/agent/sessions/{id}/messages",
-        "/api/models",
-        "/api/models/active",
-        "/api/sys/status",
-        "/api/sys/readiness",
-        "/api/sys/capsules/reload",
-    ];
+    let router: BTreeSet<String> = ROUTER_METHODS
+        .iter()
+        .map(|(method, path)| format!("{method} {path}"))
+        .collect();
+    let spec = openapi_methods(ApiDoc::openapi());
+    let manifest = parse_http_manifest(
+        include_str!("../../../e2e/http-scenarios.toml"),
+        include_str!("../../../e2e/runtime-scenario-specs.toml"),
+    );
 
-    let doc = ApiDoc::openapi();
-    let spec_paths: std::collections::HashSet<&str> =
-        doc.paths.paths.keys().map(String::as_str).collect();
+    let missing_from_spec: Vec<&String> = router.difference(&spec).collect();
+    assert!(
+        missing_from_spec.is_empty(),
+        "router method/path is not in OpenAPI: {}",
+        missing_from_spec
+            .iter()
+            .map(|s| s.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
 
-    for p in ROUTER_PATHS {
+    let openapi_only: Vec<&String> = spec.difference(&router).collect();
+    assert!(
+        openapi_only.is_empty(),
+        "OpenAPI documents method/path not registered in router: {}",
+        openapi_only
+            .iter()
+            .map(|s| s.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+
+    let missing_scenarios: Vec<&String> = router.difference(&manifest).collect();
+    assert!(
+        missing_scenarios.is_empty(),
+        "new HTTP route has no e2e scenario: {}",
+        missing_scenarios
+            .iter()
+            .map(|s| s.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+
+    let stale_scenarios: Vec<&String> = manifest.difference(&router).collect();
+    assert!(
+        stale_scenarios.is_empty(),
+        "HTTP e2e manifest references routes that are no longer registered: {}",
+        stale_scenarios
+            .iter()
+            .map(|s| s.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+}
+
+fn openapi_methods(doc: utoipa::openapi::OpenApi) -> std::collections::BTreeSet<String> {
+    doc.paths
+        .paths
+        .into_iter()
+        .flat_map(|(path, item)| {
+            [
+                item.get.map(|_| format!("GET {path}")),
+                item.post.map(|_| format!("POST {path}")),
+                item.put.map(|_| format!("PUT {path}")),
+                item.patch.map(|_| format!("PATCH {path}")),
+                item.delete.map(|_| format!("DELETE {path}")),
+            ]
+            .into_iter()
+            .flatten()
+        })
+        .collect()
+}
+
+fn parse_http_manifest(src: &str, specs_src: &str) -> std::collections::BTreeSet<String> {
+    let parsed: toml::Value = toml::from_str(src).expect("http-scenarios.toml parses");
+    let specs = parse_runtime_scenario_specs(specs_src);
+    let routes = parsed
+        .get("routes")
+        .and_then(toml::Value::as_table)
+        .expect("http-scenarios.toml must contain a [routes] table");
+
+    routes
+        .iter()
+        .map(|(name, entry)| {
+            let table = entry
+                .as_table()
+                .unwrap_or_else(|| panic!("manifest entry for {name:?} must be a table"));
+            for field in ["scenario", "status", "auth"] {
+                assert!(
+                    table.contains_key(field),
+                    "manifest entry for {name:?} is missing required field {field:?}"
+                );
+            }
+            let status = table
+                .get("status")
+                .and_then(toml::Value::as_str)
+                .unwrap_or_else(|| panic!("manifest entry for {name:?} has non-string status"));
+            assert!(
+                matches!(status, "mapped" | "covered" | "waived" | "future"),
+                "manifest entry for {name:?} has invalid status {status:?}"
+            );
+            assert_status_reason(name, table, status);
+            assert_scenario_contract(name, table, &specs, "http");
+            name.clone()
+        })
+        .collect()
+}
+
+fn parse_runtime_scenario_specs(src: &str) -> toml::Value {
+    let parsed: toml::Value = toml::from_str(src).expect("runtime-scenario-specs.toml parses");
+    let scenarios = parsed
+        .get("scenarios")
+        .and_then(toml::Value::as_table)
+        .expect("runtime-scenario-specs.toml must contain a [scenarios] table");
+
+    for (name, entry) in scenarios {
+        let table = entry
+            .as_table()
+            .unwrap_or_else(|| panic!("runtime scenario {name:?} must be a table"));
+        for field in [
+            "status", "surfaces", "auth", "success", "denial", "state", "evidence",
+        ] {
+            assert!(
+                non_empty_field(table, field),
+                "runtime scenario {name:?} is missing non-empty field {field:?}"
+            );
+        }
+        let status = table
+            .get("status")
+            .and_then(toml::Value::as_str)
+            .unwrap_or_else(|| panic!("runtime scenario {name:?} has non-string status"));
         assert!(
-            spec_paths.contains(p),
-            "router path {p} is not in the OpenAPI spec — annotate the handler with #[utoipa::path(...)] and list it under paths(...) in ApiDoc"
+            matches!(status, "mapped" | "covered" | "waived" | "future"),
+            "runtime scenario {name:?} has invalid status {status:?}"
         );
+        if status == "waived" {
+            assert!(
+                non_empty_field(table, "waiver"),
+                "waived runtime scenario {name:?} needs a waiver"
+            );
+        }
+    }
+
+    parsed
+}
+
+fn assert_status_reason(name: &str, table: &toml::value::Table, status: &str) {
+    if matches!(status, "waived" | "future") {
+        assert!(
+            non_empty_field(table, "reason"),
+            "manifest entry for {name:?} with status {status:?} needs a reason"
+        );
+    }
+}
+
+fn assert_scenario_contract(
+    name: &str,
+    table: &toml::value::Table,
+    specs: &toml::Value,
+    surface: &str,
+) {
+    let scenario = table
+        .get("scenario")
+        .and_then(toml::Value::as_str)
+        .unwrap_or_else(|| panic!("manifest entry for {name:?} has non-string scenario"));
+    let scenarios = specs
+        .get("scenarios")
+        .and_then(toml::Value::as_table)
+        .expect("runtime specs already validated");
+    let spec = scenarios
+        .get(scenario)
+        .and_then(toml::Value::as_table)
+        .unwrap_or_else(|| {
+            panic!("manifest entry for {name:?} references unknown scenario {scenario:?}")
+        });
+    let surfaces = spec
+        .get("surfaces")
+        .and_then(toml::Value::as_array)
+        .expect("runtime specs already validated");
+    assert!(
+        surfaces.iter().any(|v| v.as_str() == Some(surface)),
+        "manifest entry for {name:?} references scenario {scenario:?}, which does not declare surface {surface:?}"
+    );
+}
+
+fn non_empty_field(table: &toml::value::Table, field: &str) -> bool {
+    match table.get(field) {
+        Some(toml::Value::String(s)) => !s.trim().is_empty(),
+        Some(toml::Value::Array(items)) => !items.is_empty(),
+        _ => false,
     }
 }
 

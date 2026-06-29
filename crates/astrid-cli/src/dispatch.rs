@@ -312,12 +312,12 @@ async fn dispatch_capsule(command: crate::cli::CapsuleCommands) -> Result<ExitCo
             force,
             purge,
         } => {
+            commands::capsule::remove::validate_capsule_removal(&name, workspace, force)?;
+            let live_unload = commands::capsule::live_load::try_daemon_unload(&name).await?;
             commands::capsule::remove::remove_capsule(&name, workspace, force, purge)?;
-            // The disk removal above is authoritative; this best-effort nudge
-            // mirrors it into a running daemon so the capsule's tools leave the
-            // live surface without a restart. Non-fatal: never affects the exit
-            // status of a successful removal.
-            commands::capsule::live_load::nudge_daemon_unload(&name).await;
+            if live_unload == commands::capsule::live_load::LiveUnload::Unloaded {
+                eprintln!("Live: the running daemon unloaded '{name}' — no restart needed.");
+            }
             Ok(ExitCode::SUCCESS)
         },
         CapsuleCommands::Tree | CapsuleCommands::Deps => {
@@ -348,7 +348,7 @@ async fn dispatch_capsule(command: crate::cli::CapsuleCommands) -> Result<ExitCo
 
 async fn dispatch_mcp(command: McpCommands) -> Result<ExitCode> {
     match command {
-        McpCommands::Serve { principal } => commands::mcp::serve(principal.as_deref()).await,
+        McpCommands::Serve => commands::mcp::serve(None).await,
     }
 }
 

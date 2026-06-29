@@ -55,14 +55,14 @@ use server::AstridMcpServer;
 /// Refuse to serve the MCP bridge silently as the no-capability `anonymous`
 /// identity.
 ///
-/// `astrid mcp serve --principal X` connects, but if `X` has no keypair the
+/// `astrid --principal X mcp serve` connects, but if `X` has no keypair the
 /// handshake falls to the legacy single-frame path and the daemon stamps the
 /// connection `anonymous`. The bridge would then come up "successfully" yet
 /// every `tools/call` fails the ingress-trust and capability checks — to a
 /// client it just hangs/times out, with no hint why. This turns that silent,
 /// confusing failure into a loud, actionable error at startup.
 ///
-/// Requesting `anonymous` explicitly (`--principal anonymous`) is allowed:
+/// Requesting `anonymous` explicitly (`astrid --principal anonymous mcp serve`) is allowed:
 /// serving unauthenticated is then a deliberate choice, not an accident.
 fn require_authenticated_unless_anonymous(
     caller: &astrid_core::PrincipalId,
@@ -79,7 +79,7 @@ fn require_authenticated_unless_anonymous(
          hang. Refusing to serve the MCP bridge as `anonymous`.\n\n\
          Fix: run `astrid agent create {caller}` to mint its keypair (or \
          back-fill an existing keyless principal's), then retry. To serve \
-         unauthenticated on purpose, pass `--principal anonymous`."
+         unauthenticated on purpose, pass `--principal anonymous` before `mcp serve`."
     );
 }
 

@@ -352,7 +352,16 @@ impl GatewayState {
                 "gateway is not wired to a live event bus; admin operations unavailable"
             ))
         })?;
-        Ok(crate::bus_admin::BusAdminClient::new(bus, caller))
+        let session_id = self.session_id.as_ref().ok_or_else(|| {
+            crate::error::GatewayError::Internal(anyhow::anyhow!(
+                "gateway is not wired to a live kernel session; admin operations unavailable"
+            ))
+        })?;
+        Ok(crate::bus_admin::BusAdminClient::new(
+            bus,
+            caller,
+            session_id.0,
+        ))
     }
 
     /// Build a bus-direct admin client for an authenticated caller, carrying
@@ -375,6 +384,36 @@ impl GatewayState {
         Ok(self
             .admin_client(caller.principal.clone())?
             .with_device_key_id(caller.device_key_id.clone()))
+    }
+
+    /// Build a bus-direct kernel client bound to an authenticated caller.
+    ///
+    /// HTTP routes have already verified the bearer token and resolved the
+    /// caller/device scope. They should not re-enter the external socket
+    /// handshake, because the gateway intentionally does not possess arbitrary
+    /// agent private keys and would be downgraded to `anonymous`.
+    ///
+    /// # Errors
+    /// Returns an internal error if the state was built without a live event
+    /// bus (the standalone tests-only constructor).
+    pub fn kernel_client_for(
+        &self,
+        caller: &crate::auth::CallerContext,
+    ) -> Result<crate::bus_kernel::BusKernelClient, crate::error::GatewayError> {
+        let bus = self.event_bus.clone().ok_or_else(|| {
+            crate::error::GatewayError::Internal(anyhow::anyhow!(
+                "gateway is not wired to a live event bus; kernel requests unavailable"
+            ))
+        })?;
+        let session_id = self.session_id.as_ref().ok_or_else(|| {
+            crate::error::GatewayError::Internal(anyhow::anyhow!(
+                "gateway is not wired to a live kernel session; kernel requests unavailable"
+            ))
+        })?;
+        Ok(
+            crate::bus_kernel::BusKernelClient::new(bus, caller.principal.clone(), session_id.0)
+                .with_device_key_id(caller.device_key_id.clone()),
+        )
     }
 }
 

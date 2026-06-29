@@ -10,13 +10,14 @@ use std::collections::HashSet;
 use anyhow::{Context, bail};
 use astrid_core::dirs::AstridHome;
 
-use super::meta::{CapsuleMeta, scan_installed_capsules};
+use super::meta::CapsuleMeta;
 
 /// Remove an installed capsule by name.
 ///
-/// Checks the provides/requires dependency graph before removal. If the target
-/// capsule is the sole provider of a capability required by another capsule,
-/// removal is blocked unless `force` is `true`.
+/// The caller must run [`validate_capsule_removal`] before any live unload and
+/// this on-disk deletion. Keeping deletion validation-free avoids a second
+/// dependency scan after daemon unload and prevents a stale second snapshot
+/// from disagreeing with the already-authorized operation.
 pub(crate) fn remove_capsule(
     name: &str,
     workspace: bool,
@@ -24,26 +25,17 @@ pub(crate) fn remove_capsule(
     purge: bool,
 ) -> anyhow::Result<()> {
     let home = AstridHome::resolve()?;
-    let target_dir = super::install::resolve_target_dir(&home, name, workspace)?;
+    remove_capsule_from_home(&home, name, workspace, force, purge)
+}
 
-    if !target_dir.exists() {
-        bail!("Capsule '{name}' is not installed.");
-    }
-
-    let target_meta = super::meta::read_meta(&target_dir);
-
-    // Scan once, reuse for both dependency check and binary cleanup
-    let all_capsules = scan_installed_capsules()?;
-
-    // Dependency safety check (skip with --force)
-    if !force && let Some(block) = check_removal_safety(name, target_meta.as_ref(), &all_capsules) {
-        bail!(
-            "Cannot remove '{name}': it is the sole provider of '{}' \
-             which is required by '{}'. Use --force to override.",
-            block.capability,
-            block.dependent,
-        );
-    }
+fn remove_capsule_from_home(
+    home: &AstridHome,
+    name: &str,
+    workspace: bool,
+    force: bool,
+    purge: bool,
+) -> anyhow::Result<()> {
+    let target_dir = super::install::resolve_target_dir(home, name, workspace)?;
 
     // Content-addressed artifacts in bin/ and wit/ are NEVER deleted.
     // They are the audit trail — the BLAKE3 hash in audit entries must always
@@ -74,6 +66,49 @@ pub(crate) fn remove_capsule(
         eprintln!("Removed '{name}' (forced).");
     } else {
         eprintln!("Removed '{name}'.");
+    }
+
+    Ok(())
+}
+
+/// Validate that `name` exists and passes dependency safety checks.
+///
+/// Split from [`remove_capsule`] so the async dispatch path can perform the
+/// daemon-side authorization/unload before deleting the on-disk capsule.
+pub(crate) fn validate_capsule_removal(
+    name: &str,
+    workspace: bool,
+    force: bool,
+) -> anyhow::Result<()> {
+    let home = AstridHome::resolve()?;
+    validate_capsule_removal_from_home(&home, name, workspace, force)
+}
+
+fn validate_capsule_removal_from_home(
+    home: &AstridHome,
+    name: &str,
+    workspace: bool,
+    force: bool,
+) -> anyhow::Result<()> {
+    let target_dir = super::install::resolve_target_dir(home, name, workspace)?;
+
+    if !target_dir.exists() {
+        bail!("Capsule '{name}' is not installed.");
+    }
+
+    let target_meta = super::meta::read_meta(&target_dir);
+
+    // Scan once, reuse for both dependency check and binary cleanup
+    let all_capsules = super::meta::scan_installed_capsules_in_home(home)?;
+
+    // Dependency safety check (skip with --force)
+    if !force && let Some(block) = check_removal_safety(name, target_meta.as_ref(), &all_capsules) {
+        bail!(
+            "Cannot remove '{name}': it is the sole provider of '{}' \
+             which is required by '{}'. Use --force to override.",
+            block.capability,
+            block.dependent,
+        );
     }
 
     Ok(())
@@ -154,6 +189,7 @@ fn check_removal_safety(
 mod tests {
     use super::super::meta::{CapsuleLocation, CapsuleMeta, InstalledCapsule};
     use super::*;
+    use crate::commands::capsule::meta::write_meta;
 
     fn meta_ie(
         exports: &[(&str, &str, &str)],
@@ -285,14 +321,14 @@ mod tests {
     }
 
     #[test]
-    fn remove_nonexistent_capsule_fails() {
+    fn validate_nonexistent_capsule_fails() {
         let home_dir = tempfile::tempdir().unwrap();
         let home = AstridHome::from_path(home_dir.path());
         let target_dir =
             super::super::install::resolve_target_dir(&home, "nonexistent", false).unwrap();
         assert!(!target_dir.exists());
-        // Direct test: the bail should fire
-        let err = remove_capsule("nonexistent", false, false, false);
+
+        let err = validate_capsule_removal_from_home(&home, "nonexistent", false, false);
         assert!(err.is_err());
         let msg = format!("{}", err.unwrap_err());
         assert!(msg.contains("not installed"), "got: {msg}");
@@ -318,11 +354,41 @@ mod tests {
             super::super::install::resolve_target_dir(&home, "remove-test", false).unwrap();
         assert!(target.exists());
 
-        // Remove it (force to skip dep check which scans real fs)
-        remove_capsule("remove-test", false, true, false).unwrap_or_else(|_| {
-            // If home resolution differs, clean up manually
-            std::fs::remove_dir_all(&target).unwrap();
-        });
+        remove_capsule_from_home(&home, "remove-test", false, true, false).unwrap();
+        assert!(!target.exists());
+    }
+
+    #[test]
+    fn remove_capsule_does_not_repeat_dependency_validation() {
+        let home_dir = tempfile::tempdir().unwrap();
+        let home = AstridHome::from_path(home_dir.path());
+        let capsules_dir = home
+            .principal_home(&astrid_capsule_install::paths::install_principal())
+            .capsules_dir();
+
+        let target = capsules_dir.join("target");
+        let dependent = capsules_dir.join("dependent");
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::create_dir_all(&dependent).unwrap();
+        write_meta(&target, &meta_ie(&[("astrid", "llm", "1.0.0")], &[], None)).unwrap();
+        write_meta(
+            &dependent,
+            &meta_ie(&[], &[("astrid", "llm", "^1.0")], None),
+        )
+        .unwrap();
+
+        let validation_err = validate_capsule_removal_from_home(&home, "target", false, false)
+            .expect_err("fixture should make preflight validation fail");
+        assert!(
+            validation_err
+                .to_string()
+                .contains("it is the sole provider"),
+            "got: {validation_err}"
+        );
+
+        remove_capsule_from_home(&home, "target", false, false, false)
+            .expect("delete path must trust the caller's single preflight validation");
+        assert!(!target.exists());
     }
 
     #[test]

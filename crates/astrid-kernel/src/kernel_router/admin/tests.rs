@@ -163,6 +163,52 @@ fn agent_list_maps_self_to_self_prefix() {
 }
 
 #[test]
+fn agent_create_mapping_uses_granular_clone_and_inherit_caps() {
+    assert_eq!(
+        required_capability_for_admin_request(
+            &AdminRequestKind::AgentCreate {
+                name: "fresh".into(),
+                groups: Vec::new(),
+                grants: Vec::new(),
+                inherit_from: None,
+                clone_from: None,
+                allow_admin_clone: false,
+            },
+            AuthorityScope::Global,
+        ),
+        "agent:create"
+    );
+    assert_eq!(
+        required_capability_for_admin_request(
+            &AdminRequestKind::AgentCreate {
+                name: "inherited".into(),
+                groups: Vec::new(),
+                grants: Vec::new(),
+                inherit_from: Some(pid("source")),
+                clone_from: None,
+                allow_admin_clone: false,
+            },
+            AuthorityScope::Global,
+        ),
+        "agent:create:inherit"
+    );
+    assert_eq!(
+        required_capability_for_admin_request(
+            &AdminRequestKind::AgentCreate {
+                name: "cloned".into(),
+                groups: Vec::new(),
+                grants: Vec::new(),
+                inherit_from: None,
+                clone_from: Some(pid("source")),
+                allow_admin_clone: false,
+            },
+            AuthorityScope::Global,
+        ),
+        "agent:create:clone"
+    );
+}
+
+#[test]
 fn every_variant_has_a_method_label() {
     for req in all_admin_variants() {
         let m = admin_request_method(&req);

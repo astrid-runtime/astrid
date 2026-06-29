@@ -5,7 +5,7 @@ pub mod admin;
 /// disk through the same code path.
 mod install;
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -279,17 +279,24 @@ async fn handle_request(
             KernelResponse::Error("Approval logic not yet implemented in kernel router".to_string())
         },
         KernelRequest::ListCapsules => {
+            let visibility = CapsuleVisibility::new(kernel, &caller);
             let reg = kernel.capsules.read().await;
             let mut list = Vec::new();
             for c in reg.list() {
-                list.push(c.to_string());
+                if visibility.allows(c) {
+                    list.push(c.to_string());
+                }
             }
             KernelResponse::Success(serde_json::json!(list))
         },
         KernelRequest::GetCommands => {
+            let visibility = CapsuleVisibility::new(kernel, &caller);
             let reg = kernel.capsules.read().await;
             let mut commands = Vec::new();
             for c in reg.values() {
+                if !visibility.allows(c.id()) {
+                    continue;
+                }
                 for cmd in &c.manifest().commands {
                     commands.push(astrid_events::kernel_api::CommandInfo {
                         name: cmd.name.clone(),
@@ -420,9 +427,13 @@ async fn handle_request(
             KernelResponse::Status(status)
         },
         KernelRequest::GetCapsuleMetadata => {
+            let visibility = CapsuleVisibility::new(kernel, &caller);
             let reg = kernel.capsules.read().await;
             let mut entries = Vec::new();
             for capsule in reg.values() {
+                if !visibility.allows(capsule.id()) {
+                    continue;
+                }
                 let manifest = capsule.manifest();
                 entries.push(astrid_events::kernel_api::CapsuleMetadataEntry {
                     name: manifest.package.name.clone(),
@@ -437,9 +448,11 @@ async fn handle_request(
             KernelResponse::CapsuleMetadata(entries)
         },
         KernelRequest::GetAgentReadiness => {
+            let visibility = CapsuleVisibility::new(kernel, &caller);
             let reg = kernel.capsules.read().await;
             let manifests: Vec<&astrid_capsule::manifest::CapsuleManifest> = reg
                 .values()
+                .filter(|capsule| visibility.allows(capsule.id()))
                 .map(astrid_capsule::capsule::Capsule::manifest)
                 .collect();
             let readiness = astrid_capsule::readiness::agent_loop_readiness(&manifests);
@@ -448,6 +461,50 @@ async fn handle_request(
     };
 
     publish_response(kernel, response_topic, res);
+}
+
+struct CapsuleVisibility {
+    is_admin: bool,
+    capsule_grants: BTreeSet<String>,
+}
+
+impl CapsuleVisibility {
+    fn new(kernel: &crate::Kernel, caller: &PrincipalId) -> Self {
+        let profile = if caller.as_str() == "anonymous" {
+            None
+        } else {
+            match kernel.profile_cache.resolve(caller) {
+                Ok(profile) => Some(profile),
+                Err(e) => {
+                    warn!(
+                        security_event = true,
+                        principal = %caller,
+                        error = %e,
+                        "Capsule inventory visibility check: profile resolution failed — deny"
+                    );
+                    None
+                },
+            }
+        };
+        let Some(profile) = profile else {
+            return Self {
+                is_admin: false,
+                capsule_grants: BTreeSet::new(),
+            };
+        };
+
+        let groups = kernel.groups.load_full();
+        let check = CapabilityCheck::new(profile.as_ref(), groups.as_ref(), caller.clone());
+
+        Self {
+            is_admin: check.has("*") || check.has("capsule:list"),
+            capsule_grants: profile.capsules.iter().cloned().collect(),
+        }
+    }
+
+    fn allows(&self, capsule_id: &astrid_capsule::capsule::CapsuleId) -> bool {
+        self.is_admin || self.capsule_grants.contains(capsule_id.as_str())
+    }
 }
 
 fn publish_response<R: Serialize>(kernel: &Arc<crate::Kernel>, response_topic: Topic, res: R) {
@@ -535,9 +592,11 @@ fn rate_limit_max(req: &KernelRequest) -> Option<u32> {
 
 /// The authority surface a given [`KernelRequest`] operates over.
 ///
-/// Today's `KernelRequest` variants carry no target-principal field, so
-/// [`resolve_scope`] always returns [`AuthorityScope::Self_`] — the
-/// request operates on the caller's own home.
+/// Most `KernelRequest` variants carry no target-principal field, so
+/// [`resolve_scope`] treats read-only inventory/status requests as
+/// [`AuthorityScope::Self_`]. Capsule lifecycle mutations that operate on the
+/// daemon's loaded capsule set are global until a request carries a real
+/// caller-workspace target.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AuthorityScope {
     /// Request operates on the caller's own principal.
@@ -548,11 +607,22 @@ pub enum AuthorityScope {
 
 /// Return the authority scope the caller is exercising for `req`.
 ///
-/// Currently always returns [`AuthorityScope::Self_`] because no
-/// `KernelRequest` variant carries a `target_principal` field yet.
+/// A daemon-side capsule install with `workspace = false` mutates the daemon's
+/// configured install target, so it requires the global install capability even
+/// though it does not grant any principal visibility by itself. Workspace
+/// installs remain self-scoped; the daemon rejects them later because it has no
+/// meaningful current workspace.
 #[must_use]
-pub fn resolve_scope(_req: &KernelRequest, _caller: &PrincipalId) -> AuthorityScope {
-    AuthorityScope::Self_
+pub fn resolve_scope(req: &KernelRequest, _caller: &PrincipalId) -> AuthorityScope {
+    match req {
+        KernelRequest::ReloadCapsules
+        | KernelRequest::ReloadCapsule { .. }
+        | KernelRequest::UnloadCapsule { .. }
+        | KernelRequest::InstallCapsule {
+            workspace: false, ..
+        } => AuthorityScope::Global,
+        _ => AuthorityScope::Self_,
+    }
 }
 
 /// Return the static capability string required to satisfy `req` under

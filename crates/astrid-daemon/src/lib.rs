@@ -147,14 +147,19 @@ fn resolve_http_limits(cfg: Option<&astrid_config::Config>) -> astrid_capsule::H
 )]
 pub async fn run() -> Result<()> {
     let args = Args::parse();
+    let astrid_home =
+        astrid_core::dirs::AstridHome::resolve().context("Failed to resolve Astrid home")?;
 
     // Load the unified config once: it drives both logging and the capsule
     // runtime concurrency ceilings below. Loaded against the current dir (as
     // logging always did), independent of `--workspace`.
     let workspace_root_for_cfg = std::env::current_dir().ok();
-    let unified_cfg = astrid_config::Config::load(workspace_root_for_cfg.as_deref())
-        .ok()
-        .map(|r| r.config);
+    let unified_cfg = astrid_config::Config::load_with_home(
+        workspace_root_for_cfg.as_deref(),
+        astrid_home.root(),
+    )
+    .ok()
+    .map(|r| r.config);
 
     init_logging(args.verbose, unified_cfg.as_ref());
 

@@ -8,7 +8,10 @@
 //! and the metric is always populated.
 
 use std::path::PathBuf;
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
+
+const PROVENANCE_TIMEOUT: Duration = Duration::from_secs(2);
 
 fn main() {
     let git_sha = run(Command::new("git").args(["rev-parse", "--short=12", "HEAD"]));
@@ -45,12 +48,40 @@ fn main() {
 }
 
 /// Run a command and return its trimmed stdout, or `"unknown"` if it
-/// fails to spawn, exits non-zero, or produces empty/non-UTF-8 output.
+/// fails to spawn, exits non-zero, times out, or produces empty/non-UTF-8
+/// output.
 fn run(cmd: &mut Command) -> String {
-    cmd.output()
+    let Ok(mut child) = cmd.stdout(Stdio::piped()).stderr(Stdio::null()).spawn() else {
+        return "unknown".to_string();
+    };
+    let deadline = Instant::now()
+        .checked_add(PROVENANCE_TIMEOUT)
+        .unwrap_or_else(Instant::now);
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(10));
+            },
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return "unknown".to_string();
+            },
+            Err(_) => return "unknown".to_string(),
+        }
+    };
+    if !status.success() {
+        return "unknown".to_string();
+    }
+
+    let mut stdout = Vec::new();
+    if let Some(mut pipe) = child.stdout.take() {
+        use std::io::Read as _;
+        let _ = pipe.read_to_end(&mut stdout);
+    }
+    String::from_utf8(stdout)
         .ok()
-        .filter(|o| o.status.success())
-        .and_then(|o| String::from_utf8(o.stdout).ok())
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "unknown".to_string())

@@ -11,7 +11,7 @@
 pub(crate) mod approval;
 /// Runtime operator-consent for local-egress (transport-origin gated).
 pub(crate) mod consent_egress;
-/// Elicit lifecycle API (install/upgrade user input collection).
+/// Elicit API (interactive user input collection).
 pub(crate) mod elicit;
 /// File system operations for plugins.
 pub(crate) mod fs;

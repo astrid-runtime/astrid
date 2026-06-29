@@ -32,6 +32,9 @@
 //!    This is sound because the registry's reply genuinely carries the
 //!    requester's principal (the host resolves the outgoing principal from
 //!    the inbound caller-context, not the registry's own identity).
+//! 4. The reply must also be stamped with the registry capsule's deterministic
+//!    source id. Principal scope is not enough: another capsule running as the
+//!    same principal must not be able to satisfy the gateway's registry awaiter.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -67,6 +70,12 @@ const GET_ACTIVE_REQUEST: &str = "registry.v1.get_active_model";
 const GET_ACTIVE_RESPONSE: &str = "registry.v1.response.get_active_model";
 const SET_ACTIVE_REQUEST: &str = "registry.v1.set_active_model";
 const SET_ACTIVE_RESPONSE: &str = "registry.v1.response.set_active_model";
+const CAPSULE_ID_NAMESPACE: Uuid = Uuid::from_u128(0x310714d5_9c6d_4c94_8187_75258f393bb6);
+const REGISTRY_CAPSULE_ID: &str = "astrid-capsule-registry";
+
+fn registry_capsule_source_id() -> Uuid {
+    Uuid::new_v5(&CAPSULE_ID_NAMESPACE, REGISTRY_CAPSULE_ID.as_bytes())
+}
 
 /// Body for `PUT /api/models/active`.
 #[derive(Debug, Clone, Deserialize, ToSchema)]
@@ -87,7 +96,8 @@ pub struct SetActiveModelRequest {
 /// "no id" case so it cannot break legacy paths:
 ///
 /// * `expected == None` — GET paths, which are not correlated. Every reply
-///   is accepted; concurrent same-principal reads are idempotent and benign.
+///   that passed the trusted-source check is accepted; concurrent
+///   same-principal reads are idempotent and benign.
 /// * `expected == Some(ours)` — a SET reply is accepted iff it carries our
 ///   `corr_id` **or** carries no `corr_id` field at all. A reply whose
 ///   `corr_id` is *present and different* is some other concurrent
@@ -139,6 +149,14 @@ enum SetActiveOutcome {
     Malformed,
 }
 
+fn registry_reply_payload_json(payload: &IpcPayload) -> GatewayResult<serde_json::Value> {
+    let bytes = payload
+        .to_guest_bytes()
+        .map_err(|e| GatewayError::Internal(anyhow::anyhow!("registry reply not JSON: {e}")))?;
+    serde_json::from_slice(&bytes)
+        .map_err(|e| GatewayError::Internal(anyhow::anyhow!("registry reply not JSON: {e}")))
+}
+
 /// Classify a `set_active_model` registry reply into the response the handler
 /// returns.
 ///
@@ -169,7 +187,7 @@ fn classify_set_active_reply(reply: &serde_json::Value) -> SetActiveOutcome {
 /// belongs to another concurrent same-principal SET — and keeps receiving
 /// (within the same overall timeout budget) until a matching / un-correlated
 /// reply arrives or the budget is spent. When `None` (the GET paths) the
-/// first reply on the scoped route is taken unconditionally.
+/// first trusted-source reply on the scoped route is taken.
 async fn registry_round_trip(
     state: &GatewayState,
     principal_id: &PrincipalId,
@@ -262,15 +280,14 @@ async fn registry_round_trip(
                 "registry reply was not an IPC message"
             )));
         };
-        // Extract the reply payload exactly as agent.rs does: a `RawJson`
-        // body is the bare inner value; any other payload shape is serialized
-        // structurally.
-        let value = match &message.payload {
-            IpcPayload::RawJson(v) => v.clone(),
-            other => serde_json::to_value(other).map_err(|e| {
-                GatewayError::Internal(anyhow::anyhow!("registry reply not JSON: {e}"))
-            })?,
-        };
+        if message.source_id != registry_capsule_source_id() {
+            continue;
+        }
+        // Extract the guest-facing payload. Capsule `publish_json` arrives as
+        // `Custom { data }` when the JSON has no known IPC `type`; using the
+        // guest bytes unwraps that data instead of exposing the internal tagged
+        // wrapper to the HTTP API.
+        let value = registry_reply_payload_json(&message.payload)?;
         // Skip a reply that belongs to a different concurrent same-principal
         // SET (foreign `corr_id`); keep waiting within the remaining budget.
         if reply_satisfies_corr_id(&value, corr_id) {
@@ -411,8 +428,21 @@ pub async fn set_active_model(
 
 #[cfg(test)]
 mod tests {
-    use super::{SetActiveOutcome, classify_set_active_reply, reply_satisfies_corr_id};
+    use super::{
+        CAPSULE_ID_NAMESPACE, GET_ACTIVE_REQUEST, GET_ACTIVE_RESPONSE, SetActiveOutcome,
+        classify_set_active_reply, registry_reply_payload_json, registry_round_trip,
+        reply_satisfies_corr_id,
+    };
+    use std::sync::Arc;
+
+    use crate::error::GatewayError;
+    use crate::state::{GatewayState, SigningMaterial};
+    use astrid_core::PrincipalId;
+    use astrid_events::ipc::{IpcMessage, IpcPayload, Topic};
+    use astrid_events::{AstridEvent, EventBus, EventMetadata};
     use serde_json::json;
+    use tokio::sync::Mutex;
+    use uuid::Uuid;
 
     #[test]
     fn set_reply_with_entry_binds() {
@@ -458,6 +488,87 @@ mod tests {
             classify_set_active_reply(&json!({ "status": "ok" })),
             SetActiveOutcome::Malformed
         ));
+    }
+
+    #[test]
+    fn registry_reply_payload_unwraps_custom_guest_json() {
+        let payload = IpcPayload::Custom {
+            data: json!({
+                "status": "ok",
+                "active_model": { "id": "openai-compat:fake-slow" },
+                "corr_id": "abc",
+            }),
+        };
+
+        let decoded = registry_reply_payload_json(&payload).expect("custom payload decodes");
+        assert_eq!(
+            decoded,
+            json!({
+                "status": "ok",
+                "active_model": { "id": "openai-compat:fake-slow" },
+                "corr_id": "abc",
+            })
+        );
+        assert!(matches!(
+            classify_set_active_reply(&decoded),
+            SetActiveOutcome::Bound(_)
+        ));
+    }
+
+    fn model_test_state(bus: Arc<EventBus>) -> GatewayState {
+        GatewayState {
+            config: crate::config::GatewayConfig::default(),
+            signing: SigningMaterial::fresh(),
+            event_bus: Some(bus),
+            distribution: Arc::new(crate::routes::distribution::DistributionInfo::single_tenant()),
+            onboarding: Arc::new(crate::routes::distribution::OnboardingFields::default()),
+            redeem_limiter: Mutex::default(),
+            metrics_handle: crate::metrics::install_recorder().expect("recorder"),
+            revoked_at: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
+            revoked_key_ids: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
+            audit_log: None,
+            session_id: None,
+            gateway_route_uuid: Uuid::new_v4(),
+            readiness_probe: None,
+            topic_probe: None,
+            registry_timeout: Some(std::time::Duration::from_millis(150)),
+        }
+    }
+
+    #[tokio::test]
+    async fn registry_round_trip_ignores_wrong_capsule_source_reply() {
+        let bus = Arc::new(EventBus::new());
+        let state = model_test_state(Arc::clone(&bus));
+        let principal = PrincipalId::new("alice").expect("valid principal");
+
+        let bus_bg = Arc::clone(&bus);
+        tokio::spawn(async move {
+            tokio::task::yield_now().await;
+            let msg = IpcMessage::new(
+                Topic::from_raw(GET_ACTIVE_RESPONSE),
+                IpcPayload::RawJson(json!({
+                    "active_model": { "id": "openai-compat:forged" }
+                })),
+                Uuid::new_v5(&CAPSULE_ID_NAMESPACE, b"astrid-capsule-adversarial"),
+            )
+            .with_principal("alice".to_string());
+            bus_bg.publish(AstridEvent::Ipc {
+                metadata: EventMetadata::new("test::forged-registry"),
+                message: msg,
+            });
+        });
+
+        let err = registry_round_trip(
+            &state,
+            &principal,
+            GET_ACTIVE_REQUEST,
+            GET_ACTIVE_RESPONSE,
+            json!({}),
+            None,
+        )
+        .await
+        .expect_err("wrong-source registry reply must be ignored");
+        assert!(matches!(err, GatewayError::Internal(_)));
     }
 
     #[test]

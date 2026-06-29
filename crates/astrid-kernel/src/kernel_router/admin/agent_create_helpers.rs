@@ -22,7 +22,7 @@ use tracing::info;
 
 use super::handlers::{
     AGENT_IDENTITY_PLATFORM, err_bad_input, err_internal, err_profile, principal_profile_path,
-    require_principal_exists, success_json, sync_principal_furniture,
+    require_principal_exists, success_json,
 };
 
 /// Build, register, and provision a genuinely-new principal.
@@ -105,8 +105,6 @@ pub(super) async fn provision_new_principal(
 
     // Provision the per-principal home tree so per-invocation KV, log,
     // tmp, secrets, audit, and capability tokens have a place to land.
-    // Capsule WASM stays shared (loaded once from the system/default
-    // location); only the principal-scoped data namespaces live here.
     //
     // Fail-closed: if the home tree cannot be created, downstream
     // per-invocation lookups silently fall back to the `default`
@@ -124,11 +122,6 @@ pub(super) async fn provision_new_principal(
             "principal home tree provisioning failed (rolled back): {e}"
         ));
     }
-
-    // Mirror the read-only introspection furniture so this fresh principal's
-    // `system_status` / `list_interfaces` reflect the globally-loaded capsule
-    // set instead of an empty home. Best-effort (see helper docs).
-    sync_principal_furniture(kernel, &principal).await;
 
     // State inheritance is OPT-IN. By default the new principal inherits
     // NOTHING — least privilege, and no silent leak of `default`'s env
@@ -156,11 +149,12 @@ pub(super) async fn provision_new_principal(
 /// Build the [`PrincipalProfile`] for a new agent.
 ///
 /// With `clone_from`, the result is a full replica of that source's
-/// capability and resource profile (groups, grants, revokes, network, process,
-/// quotas). Deliberately NOT copied: the source's `auth` (each principal keeps
-/// its own keys / authenticators — cloning is profile+state, never
-/// credentials) and `enabled` flag (a fresh clone is enabled even if the
-/// source was disabled); both fall back to [`PrincipalProfile::default`].
+/// capability and resource profile (groups, grants, revokes, capsule grants,
+/// network, process, quotas). Deliberately NOT copied: the source's `auth`
+/// (each principal keeps its own keys / authenticators — cloning is
+/// profile+state, never credentials) and `enabled` flag (a fresh clone is
+/// enabled even if the source was disabled); both fall back to
+/// [`PrincipalProfile::default`].
 /// Without `clone_from`, a fresh profile from the supplied `groups`/`grants`
 /// (empty groups yields the built-in `agent` group).
 ///
@@ -247,6 +241,7 @@ fn build_create_profile(
         groups: source_profile.groups,
         grants: source_profile.grants,
         revokes: source_profile.revokes,
+        capsules: source_profile.capsules,
         network: source_profile.network,
         process: source_profile.process,
         quotas: source_profile.quotas,

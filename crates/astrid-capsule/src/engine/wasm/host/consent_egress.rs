@@ -250,6 +250,49 @@ fn classify_decision(decision: &str) -> Decision {
     }
 }
 
+fn event_principal(event: &AstridEvent) -> Option<&str> {
+    match event {
+        AstridEvent::Ipc { message, .. } => message.principal.as_deref(),
+        _ => None,
+    }
+}
+
+fn response_principal_matches(expected: &str, event: &AstridEvent) -> bool {
+    event_principal(event) == Some(expected)
+}
+
+async fn await_matching_consent_response(
+    receiver: &mut astrid_events::EventReceiver,
+    expected_principal: &str,
+    capsule_id: &str,
+    request_id: &str,
+    timeout: std::time::Duration,
+) -> Option<std::sync::Arc<AstridEvent>> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return None;
+        }
+        let Ok(Some(event)) = tokio::time::timeout(remaining, receiver.recv()).await else {
+            return None;
+        };
+        if response_principal_matches(expected_principal, &event) {
+            return Some(event);
+        }
+        let got = event_principal(&event);
+        tracing::warn!(
+            target: "astrid.audit.http",
+            security_event = true,
+            capsule_id = %capsule_id,
+            request_id = %request_id,
+            expected_principal = %expected_principal,
+            got_principal = got.unwrap_or("<none>"),
+            "local-egress consent: rejected cross-principal response; continuing to wait",
+        );
+    }
+}
+
 impl HostState {
     /// Decide whether to permit a local-egress request to `host:port` that the
     /// SSRF airlock rejected, by eliciting one-shot operator consent.
@@ -438,7 +481,7 @@ impl HostState {
     /// capsule so the operator knows who is asking. Subscribe-before-publish
     /// avoids a response race, exactly like `host/approval.rs::request_approval`.
     ///
-    /// # Response-topic isolation (documented residual, PR #1029 FIX 2)
+    /// # Response principal isolation
     ///
     /// Egress consent reuses the shared `astrid.v1.approval[.response.*]`
     /// channel rather than a structurally distinct `astrid.v1.egress.response.*`
@@ -453,35 +496,23 @@ impl HostState {
     /// until those out-of-repo manifests were extended in lockstep — an ACL
     /// spread across repos this change must not require.
     ///
-    /// The residual is therefore: a surface already holding response-topic
-    /// publish rights AND subscribed to `astrid.v1.approval` (where the
-    /// `request_id` is broadcast for the operator to render) could in principle
-    /// answer an egress consent. This is LOW severity and non-escalating:
-    /// - those rights belong only to TRUSTED operator/broker surfaces — an
-    ///   arbitrary untrusted tool capsule does not declare (and cannot obtain)
-    ///   publish on `astrid.v1.approval.response.*`, which the subtree publish
-    ///   ACL enforces — so this is not a capsule-forgeable approve;
-    /// - the consent is already origin-gated upstream
-    ///   ([`consent_local_egress`](Self::consent_local_egress) only reaches here
-    ///   for a verified `LocalSocket` operator), so a remote caller can never
-    ///   trigger one to be answered at all; and
-    /// - the `request_id` is an unguessable v4 UUID, so a surface NOT subscribed
-    ///   to `astrid.v1.approval` cannot blind-guess the response topic.
-    ///
-    /// Closing it fully (a distinct egress namespace) is deferred to a paired
-    /// change that also extends the operator-surface publish ACL in `capsule-cli`.
+    /// Because the topic is shared, the request is stamped with the originating
+    /// principal and the response waiter accepts only replies stamped with that
+    /// same principal. A surface with response-topic publish rights but the
+    /// wrong principal can no longer satisfy another principal's consent prompt,
+    /// and unstamped replies fail closed by timing out.
     fn elicit_egress_consent(&self, principal: &PrincipalId, endpoint: &str) -> String {
         let event_bus = self.event_bus.clone();
         let runtime_handle = self.runtime_handle.clone();
         let cancel_token = self.cancel_token.clone();
         let blocking_semaphore = self.blocking_semaphore.clone();
         let capsule_id = self.capsule_id.to_string();
+        let principal_name = principal.to_string();
 
         let request_id = Uuid::new_v4().to_string();
-        // Shared approval response channel — see the "Response-topic isolation"
-        // residual in this method's doc comment for why a distinct
-        // `astrid.v1.egress.response.*` namespace is deferred (out-of-repo
-        // operator-surface ACL spread).
+        // Shared approval response channel — see the "Response principal
+        // isolation" note above for the same-principal response check that
+        // makes this safe without a separate egress namespace.
         let response_topic = Topic::approval_response(&request_id);
         // Subscribe BEFORE publishing to prevent a publish/subscribe race.
         let mut receiver = event_bus.subscribe_topic(response_topic.as_str());
@@ -497,7 +528,8 @@ impl HostState {
         };
         // Kernel-originated (nil source_id): the host is asking on the operator's
         // behalf, not a capsule forging an approval request.
-        let message = IpcMessage::new(Topic::approval_request(), payload, Uuid::nil());
+        let message = IpcMessage::new(Topic::approval_request(), payload, Uuid::nil())
+            .with_principal(principal.to_string());
         event_bus.publish(AstridEvent::Ipc {
             message,
             metadata: astrid_events::EventMetadata::default(),
@@ -508,13 +540,14 @@ impl HostState {
             &blocking_semaphore,
             &cancel_token,
             async {
-                tokio::time::timeout(
+                await_matching_consent_response(
+                    &mut receiver,
+                    &principal_name,
+                    &capsule_id,
+                    &request_id,
                     std::time::Duration::from_millis(CONSENT_TIMEOUT_MS),
-                    receiver.recv(),
                 )
                 .await
-                .ok()
-                .flatten()
             },
         )
         .flatten();

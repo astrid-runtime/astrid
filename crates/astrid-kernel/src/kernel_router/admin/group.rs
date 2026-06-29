@@ -6,9 +6,11 @@
 //! shared helpers live in [`super::handlers`] and are re-used here via
 //! `pub(super)`.
 
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use astrid_core::groups::{Group, GroupConfig};
+use astrid_core::principal::PrincipalId;
 use astrid_events::kernel_api::{AdminResponseBody, GroupSummary};
 
 use super::handlers::{err_bad_input, err_internal, success_json};
@@ -66,10 +68,20 @@ pub(super) async fn group_modify(
     commit_group_config(kernel, next)
 }
 
-pub(super) fn group_list(kernel: &Arc<crate::Kernel>) -> AdminResponseBody {
+pub(super) fn group_list(kernel: &Arc<crate::Kernel>, caller: &PrincipalId) -> AdminResponseBody {
     let cfg = kernel.groups.load_full();
+    let visible_groups = if caller_has_global_group_list(kernel, caller) {
+        None
+    } else {
+        Some(caller_group_names(kernel, caller))
+    };
     let mut summaries: Vec<GroupSummary> = cfg
         .iter()
+        .filter(|(name, _)| {
+            visible_groups
+                .as_ref()
+                .is_none_or(|groups| groups.contains(*name))
+        })
         .map(|(name, group)| GroupSummary {
             name: name.clone(),
             capabilities: group.capabilities.clone(),
@@ -80,6 +92,23 @@ pub(super) fn group_list(kernel: &Arc<crate::Kernel>) -> AdminResponseBody {
         .collect();
     summaries.sort_by(|a, b| a.name.cmp(&b.name));
     AdminResponseBody::GroupList(summaries)
+}
+
+fn caller_has_global_group_list(kernel: &Arc<crate::Kernel>, caller: &PrincipalId) -> bool {
+    let Ok(profile) = kernel.profile_cache.resolve(caller) else {
+        return false;
+    };
+    let groups = kernel.groups.load_full();
+    astrid_capabilities::CapabilityCheck::new(profile.as_ref(), groups.as_ref(), caller.clone())
+        .has("group:list")
+}
+
+fn caller_group_names(kernel: &Arc<crate::Kernel>, caller: &PrincipalId) -> BTreeSet<String> {
+    kernel
+        .profile_cache
+        .resolve(caller)
+        .map(|profile| profile.groups.iter().cloned().collect())
+        .unwrap_or_default()
 }
 
 /// Commit a new [`GroupConfig`] to disk and the

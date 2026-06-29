@@ -1,42 +1,37 @@
-//! `GET /api/agent/sessions` (+ `/{id}`, `/{id}/messages`),
-//! `PATCH`/`DELETE /api/agent/sessions/{id}`, and
-//! `GET /api/agent/sessions/search` — expose and manage a principal's
-//! conversation threads over HTTP.
+//! Principal-scoped session HTTP routes backed by the session capsule.
 //!
 //! Every route proxies to the `capsule-session` capsule over the
-//! in-process event bus, mirroring the request/reply-over-bus shape
-//! `bus_admin.rs` uses for kernel admin ops but targeting capsule
-//! topics instead. The gateway:
+//! in-process event bus. The gateway:
 //!
 //! 1. Generates a fresh `correlation_id` (UUID v4).
-//! 2. Subscribes to a **per-correlation scoped** response topic
-//!    (`session.v1.response.<verb>.<correlation_id>`) FIRST — before
-//!    publishing — so a fast capsule reply can't land before the
-//!    subscription is open.
+//! 2. Subscribes to `session.v1.response.<verb>.<correlation_id>` before
+//!    publishing so a fast reply cannot race the subscription.
 //! 3. Publishes the request, principal-stamped, on the verb's request
 //!    topic.
-//! 4. Awaits one reply on the scoped topic (verifying `correlation_id`
-//!    defensively), with a 15s timeout.
+//! 4. Awaits one reply on a route scoped to the caller principal, then
+//!    verifies the responder source and body correlation.
 //!
 //! ## Trust boundary
 //!
-//! The principal stamp is the *only* authority. The kernel scopes
+//! The principal stamp is the caller authority. The kernel scopes
 //! capsule-session's KV reads to the stamped principal's namespace, so
-//! a caller only ever sees their own threads. We stamp
-//! `caller.principal` (and `caller.device_key_id` when the bearer is
-//! device-scoped, exactly as `bus_admin.rs` does) on every outbound
-//! request. The path `{id}` and every query param are payload data —
-//! they NEVER substitute for the principal and NEVER reach a topic
-//! segment (the response topic is keyed on the gateway-generated
-//! `correlation_id`, not on caller input), so a malicious `id` cannot
-//! cross into another principal's namespace or hijack another request's
-//! reply.
+//! a caller only ever sees their own threads. The response authority is
+//! the kernel-stamped capsule `source_id`: a different capsule may
+//! declare the same response topic, but its reply is ignored unless it
+//! came from `astrid-capsule-session`. We stamp `caller.principal` (and
+//! `caller.device_key_id` when the bearer is device-scoped, exactly as
+//! `bus_admin.rs` does) on every outbound request. The path `{id}` and
+//! every query param are payload data — they NEVER substitute for the
+//! principal and never reach a topic segment (the response topic is
+//! keyed on the gateway-generated `correlation_id`, not on caller
+//! input), so a malicious `id` cannot cross into another principal's
+//! namespace or hijack another request's reply.
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use astrid_core::PrincipalId;
-use astrid_events::ipc::{IpcMessage, IpcPayload, Topic};
+use astrid_events::ipc::{IpcMessage, IpcPayload, MessageOrigin, Topic};
 use astrid_events::{AstridEvent, EventBus, EventMetadata};
 use axum::Json;
 use axum::extract::{Path, Query, State};
@@ -49,6 +44,12 @@ use uuid::Uuid;
 use crate::error::{ErrorBody, GatewayError, GatewayResult};
 use crate::routes::principals::caller_from;
 use crate::state::GatewayState;
+
+#[path = "sessions_bus.rs"]
+mod sessions_bus;
+use sessions_bus::request_capsule;
+#[cfg(test)]
+use sessions_bus::session_capsule_source_id;
 
 /// Default page size for the session-list endpoint when the caller
 /// omits `limit` (or passes `0`). Bounds the response body for casual
@@ -69,6 +70,14 @@ const MAX_SESSION_ID_LEN: usize = 256;
 /// `bus_admin.rs`'s default so the operator sees consistent behaviour
 /// across bus-proxied endpoints.
 const CAPSULE_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Capsule package that owns the session request/reply contract.
+const SESSION_CAPSULE_ID: &str = "astrid-capsule-session";
+
+/// Stable namespace used by the WASM engine to derive kernel-stamped capsule
+/// source UUIDs from package names. Keep in sync with
+/// `astrid-capsule::engine::wasm`.
+const CAPSULE_ID_NAMESPACE: Uuid = Uuid::from_u128(0x310714d5_9c6d_4c94_8187_75258f393bb6);
 
 /// Request topic the gateway publishes a session-list request on. Its
 /// presence in a loaded capsule's interceptor events is also the
@@ -894,99 +903,6 @@ fn parse_search_response(value: Value) -> GatewayResult<SearchResponse> {
             "session capsule returned an unexpected search shape: {e}"
         ))
     })
-}
-
-/// Reusable capsule request/reply-over-bus primitive.
-///
-/// Subscribes to `response_topic` FIRST (a per-correlation scoped topic,
-/// so no request-id filtering at the subscription layer is needed),
-/// publishes the principal-stamped request on `request_topic`, and
-/// awaits exactly one reply — defensively verifying the reply's
-/// `correlation_id` matches before returning it. Maps a timeout to a
-/// `502`-class (upstream) error and a closed bus to a `500`-class error.
-///
-/// `device_key_id` is stamped when present, exactly as `bus_admin.rs`
-/// does, so a device-scoped bearer carries its attenuation floor to the
-/// kernel cap-gate on the way to the capsule.
-#[allow(clippy::too_many_arguments)]
-async fn request_capsule(
-    bus: &EventBus,
-    request_topic: &str,
-    response_topic: &str,
-    payload: Value,
-    correlation_id: &str,
-    principal: &PrincipalId,
-    device_key_id: Option<&str>,
-    timeout: Duration,
-) -> GatewayResult<Value> {
-    // Subscribe FIRST. A fast capsule can publish the reply on the same
-    // task that processed the request — subscribing afterwards races it.
-    let mut receiver = bus.subscribe_topic(response_topic.to_string());
-
-    let mut msg = IpcMessage::new(
-        Topic::from_raw(request_topic),
-        IpcPayload::RawJson(payload),
-        Uuid::nil(),
-    )
-    .with_principal(principal.to_string());
-    if let Some(key_id) = device_key_id {
-        msg = msg.with_device_key_id(key_id.to_string());
-    }
-    bus.publish(AstridEvent::Ipc {
-        metadata: EventMetadata::new("astrid-gateway::sessions"),
-        message: msg,
-    });
-
-    let deadline = tokio::time::Instant::now()
-        .checked_add(timeout)
-        .unwrap_or_else(tokio::time::Instant::now);
-
-    loop {
-        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-        if remaining.is_zero() {
-            return Err(capsule_timeout(response_topic, timeout));
-        }
-        let event = match tokio::time::timeout(remaining, receiver.recv()).await {
-            Ok(Some(ev)) => ev,
-            Ok(None) => {
-                return Err(GatewayError::Internal(anyhow::anyhow!(
-                    "event bus closed before a session capsule reply on {response_topic}"
-                )));
-            },
-            Err(_) => return Err(capsule_timeout(response_topic, timeout)),
-        };
-
-        let AstridEvent::Ipc { message, .. } = &*event else {
-            continue;
-        };
-        let value: Value = match &message.payload {
-            IpcPayload::RawJson(v) => v.clone(),
-            other => match serde_json::to_value(other) {
-                Ok(v) => v,
-                Err(_) => continue,
-            },
-        };
-        // Defensive correlation check. The scoped topic already isolates
-        // this request's reply, but a capsule bug (or a foreign publisher
-        // on the same topic) must not slip a mismatched body through. A
-        // mismatch falls through to the next loop iteration (keep waiting).
-        if value.get("correlation_id").and_then(Value::as_str) == Some(correlation_id) {
-            return Ok(value);
-        }
-    }
-}
-
-/// Build the timeout error. A slow/absent session capsule should be
-/// distinguishable from a gateway fault, so we surface it as an
-/// **upstream** error rather than a blanket `500`. `GatewayError` has no
-/// dedicated `504 Gateway Timeout` variant; the closest honest fit is
-/// `Kernel`, which maps to `502 Bad Gateway` (an upstream that didn't
-/// answer). The message names the timeout explicitly.
-fn capsule_timeout(response_topic: &str, timeout: Duration) -> GatewayError {
-    GatewayError::Kernel(format!(
-        "session capsule did not reply within {}s on {response_topic}",
-        timeout.as_secs()
-    ))
 }
 
 #[cfg(test)]

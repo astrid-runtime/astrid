@@ -1,10 +1,25 @@
 //! Daemon lifecycle commands: start, stop, status, and spawn helpers.
 
+use std::time::Duration;
+
 use anyhow::{Context, Result};
 
 use crate::bootstrap::find_companion_binary;
 use crate::commands::daemon_control;
 use crate::{socket_client, theme};
+
+const DAEMON_READY_TIMEOUT_SECS: u64 = 60;
+const DAEMON_READY_POLL_MILLIS: u64 = 50;
+const DAEMON_READY_POLL: Duration = Duration::from_millis(DAEMON_READY_POLL_MILLIS);
+const DAEMON_READY_ATTEMPTS: u64 =
+    readiness_attempts(DAEMON_READY_TIMEOUT_SECS, DAEMON_READY_POLL_MILLIS);
+
+const fn readiness_attempts(timeout_secs: u64, poll_millis: u64) -> u64 {
+    let Some(timeout_millis) = timeout_secs.checked_mul(1_000) else {
+        panic!("daemon readiness timeout overflow")
+    };
+    timeout_millis.div_ceil(poll_millis)
+}
 
 /// Build a hint string pointing the user to the daemon log directory.
 fn log_hint() -> String {
@@ -46,7 +61,7 @@ fn boot_log_stderr() -> Option<std::process::Stdio> {
 ///
 /// # Errors
 /// Returns an error if the daemon binary is not found, fails to spawn, or
-/// doesn't become ready within 10 seconds.
+/// doesn't become ready within the bounded startup window.
 pub(crate) async fn spawn_daemon(ready_path: &std::path::Path) -> Result<std::process::Child> {
     println!("{}", theme::Theme::info("Booting Astrid daemon..."));
     let ws = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
@@ -81,14 +96,14 @@ pub(crate) async fn spawn_daemon(ready_path: &std::path::Path) -> Result<std::pr
     // completes (including await_capsule_readiness()), so the accept
     // loop is guaranteed to be running by the time we connect.
     let mut ready = false;
-    for _ in 0..200 {
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    for _ in 0..DAEMON_READY_ATTEMPTS {
+        tokio::time::sleep(DAEMON_READY_POLL).await;
         if ready_path.exists() {
             ready = true;
             break;
         }
         // If the daemon has already exited, stop polling immediately
-        // instead of waiting the full 10 seconds.
+        // instead of waiting the full readiness timeout.
         if let Ok(Some(status)) = child.try_wait() {
             anyhow::bail!("Daemon exited prematurely ({status}).{}", log_hint());
         }
@@ -99,7 +114,8 @@ pub(crate) async fn spawn_daemon(ready_path: &std::path::Path) -> Result<std::pr
         let _ = child.kill();
         let _ = child.wait();
         anyhow::bail!(
-            "Daemon failed to become ready within 10 seconds.{}",
+            "Daemon failed to become ready within {} seconds.{}",
+            DAEMON_READY_TIMEOUT_SECS,
             log_hint()
         );
     }
@@ -163,8 +179,8 @@ pub(crate) async fn spawn_persistent_daemon() -> Result<()> {
     let mut child = cmd.spawn().context("Failed to spawn Astrid daemon")?;
 
     let mut ready = false;
-    for _ in 0..200 {
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    for _ in 0..DAEMON_READY_ATTEMPTS {
+        tokio::time::sleep(DAEMON_READY_POLL).await;
         if ready_path.exists() {
             ready = true;
             break;
@@ -177,7 +193,8 @@ pub(crate) async fn spawn_persistent_daemon() -> Result<()> {
         let _ = child.kill();
         let _ = child.wait();
         anyhow::bail!(
-            "Daemon failed to become ready within 10 seconds.{}",
+            "Daemon failed to become ready within {} seconds.{}",
+            DAEMON_READY_TIMEOUT_SECS,
             log_hint()
         );
     }
@@ -296,7 +313,26 @@ pub(crate) async fn handle_stop() -> Result<()> {
                 uuid::Uuid::nil(),
             );
             client.send_message(msg).await?;
-            println!("{}", theme::Theme::success("Astrid daemon stopped."));
+            let raw = client
+                .read_until_topic(
+                    astrid_types::Topic::kernel_response("shutdown").as_str(),
+                    std::time::Duration::from_secs(10),
+                )
+                .await?;
+            match crate::socket_client::SocketClient::extract_kernel_response(&raw) {
+                Some(astrid_core::kernel_api::KernelResponse::Success(_)) => {
+                    println!("{}", theme::Theme::success("Astrid daemon stopped."));
+                },
+                Some(astrid_core::kernel_api::KernelResponse::Error(reason)) => {
+                    anyhow::bail!("daemon rejected shutdown: {reason}");
+                },
+                Some(other) => {
+                    anyhow::bail!("unexpected response from daemon shutdown: {other:?}");
+                },
+                None => {
+                    anyhow::bail!("daemon shutdown response did not deserialize");
+                },
+            }
         }
         // The daemon removes its own PID file on graceful shutdown; clean up
         // best-effort here too in case the shutdown raced or the file was
@@ -358,5 +394,24 @@ pub(crate) fn format_uptime(secs: u64) -> String {
         format!("{minutes}m{seconds:02}s")
     } else {
         format!("{seconds}s")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn daemon_ready_attempts_match_timeout_window() {
+        assert_eq!(
+            DAEMON_READY_ATTEMPTS,
+            readiness_attempts(DAEMON_READY_TIMEOUT_SECS, DAEMON_READY_POLL_MILLIS)
+        );
+        assert_eq!(
+            DAEMON_READY_ATTEMPTS
+                .checked_mul(DAEMON_READY_POLL_MILLIS)
+                .expect("readiness window fits"),
+            60_000
+        );
     }
 }

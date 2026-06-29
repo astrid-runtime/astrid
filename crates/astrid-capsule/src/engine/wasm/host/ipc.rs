@@ -41,10 +41,6 @@ use astrid_events::ipc::{IpcMessage as InternalIpcMessage, IpcPayload, Topic};
 /// Per-call payload cap. Matches the IPC bus message-size ceiling.
 const MAX_PAYLOAD_BYTES: usize = 1024 * 1024;
 
-/// Per-call drain cap so a runaway publisher can't blow guest memory on a
-/// single recv/poll.
-const MAX_DRAIN_BYTES: usize = MAX_PAYLOAD_BYTES;
-
 /// Per-capsule subscription cap. Defense-in-depth on top of the per-principal
 /// profile quota.
 const MAX_SUBSCRIPTIONS: usize = 128;
@@ -537,16 +533,20 @@ impl HostSubscription for HostState {
         let topic_for_audit = entry.topic_pattern.clone();
         let receiver_arc = Arc::clone(&entry.receiver);
 
-        // Drain the routed sub via DRR. The bus's per-route DRR
-        // guarantees fairness; we just budget the byte total per call.
-        let drained = {
+        // Pop at most one routed event per host envelope. The host installs
+        // one invocation context for the envelope below; returning multiple
+        // messages would let a later message from another principal execute
+        // under the first message's KV/env/secret/publish context.
+        let messages: Vec<InternalIpcMessage> = {
             let mut receiver = receiver_arc
                 .try_lock()
                 .expect("Subscription receiver Arc accessed across threads");
-            receiver.try_drain(MAX_DRAIN_BYTES)
+            receiver
+                .try_recv_one()
+                .iter()
+                .filter_map(extract_message)
+                .collect()
         };
-        let messages: Vec<InternalIpcMessage> =
-            drained.iter().filter_map(extract_message).collect();
         let lagged = {
             let mut receiver = receiver_arc
                 .try_lock()
@@ -608,12 +608,13 @@ impl HostSubscription for HostState {
             (Arc::clone(&entry.receiver), entry.topic_pattern.clone())
         };
 
-        // Wait for at least one event up to `timeout_ms`, then drain
-        // additional events without further blocking. This is an `async`
+        // Wait for at most one event up to `timeout_ms`. This is an `async`
         // host fn (see the bindgen async selector), so we `.await` the
         // wait directly via `bounded_await_cancellable` — the tokio worker
         // is freed while the receiver is idle rather than pinned via
-        // `block_in_place` (issue #816).
+        // `block_in_place` (issue #816). Deliberately do not drain an
+        // additional batch here: the envelope has a single installed
+        // invocation context, so it must carry a single principal's message.
         let cancel_token = self.cancel_token.clone();
         let io_semaphore = self.io_semaphore.clone();
         let receiver_for_wait = Arc::clone(&receiver_arc);
@@ -627,29 +628,10 @@ impl HostSubscription for HostState {
         .flatten();
 
         let mut messages: Vec<InternalIpcMessage> = Vec::new();
-        let mut consumed = 0usize;
         if let Some(event) = first
             && let Some(msg) = extract_message(&event)
         {
-            consumed = msg
-                .payload
-                .to_guest_bytes()
-                .map(|v| v.len())
-                .unwrap_or(0)
-                .saturating_add(msg.topic.len());
             messages.push(msg);
-        }
-
-        let drained = {
-            let mut receiver = receiver_arc
-                .try_lock()
-                .expect("Subscription receiver Arc accessed across threads");
-            receiver.try_drain(MAX_DRAIN_BYTES.saturating_sub(consumed))
-        };
-        for event in &drained {
-            if let Some(msg) = extract_message(event) {
-                messages.push(msg);
-            }
         }
 
         let lagged = {

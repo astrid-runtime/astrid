@@ -532,10 +532,10 @@ impl Kernel {
         .with_identity_store(Arc::clone(&self.identity_store))
         .with_profile_cache(Arc::clone(&self.profile_cache))
         .with_overlay_registry(Arc::clone(&self.overlay_registry))
-        // Snapshot the live group config so the capsule load path can resolve
-        // the run-loop resource-exemption capability (CAP_RESOURCES_UNBOUNDED)
-        // against the owner principal's groups/grants/revokes.
-        .with_group_config(self.groups.load_full())
+        // Thread the live group config so capsule invocation checks observe
+        // runtime group mutations without requiring capsule reloads. Load-time
+        // run-loop decisions take their own explicit snapshot.
+        .with_live_group_config(Arc::clone(&self.groups))
         // Hand this capsule its operator-approved local-egress allowlist (if
         // any) so the SSRF airlock can exempt sanctioned loopback/private
         // endpoints for it. Absent entry = empty = no exemptions.
@@ -588,17 +588,28 @@ impl Kernel {
         // Arc::get_mut requires exclusive ownership (strong_count == 1).
         {
             let mut old = old_capsule;
-            if let Some(capsule) = std::sync::Arc::get_mut(&mut old) {
-                if let Err(e) = capsule.unload().await {
-                    tracing::warn!(
-                        capsule_id = %id,
-                        error = %e,
-                        "Capsule unload failed during restart"
-                    );
+            old.request_cancel();
+            let mut unloaded = false;
+            for retry in 0..20_u32 {
+                if let Some(capsule) = std::sync::Arc::get_mut(&mut old) {
+                    if let Err(e) = capsule.unload().await {
+                        tracing::warn!(
+                            capsule_id = %id,
+                            error = %e,
+                            "Capsule unload failed during restart"
+                        );
+                    }
+                    unloaded = true;
+                    break;
                 }
-            } else {
+                if retry < 19 {
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                }
+            }
+            if !unloaded {
                 tracing::warn!(
                     capsule_id = %id,
+                    strong_count = std::sync::Arc::strong_count(&old),
                     "Cannot call unload during restart - Arc still held by in-flight task"
                 );
             }
@@ -634,7 +645,9 @@ impl Kernel {
         Ok(())
     }
 
-    /// Auto-discover and load all capsules from the standard directories (`~/.astrid/capsules` and `.astrid/capsules`).
+    /// Auto-discover and load all capsules from the standard directories:
+    /// the default principal install dir and the daemon workspace's
+    /// `.astrid/capsules` dir.
     ///
     /// Capsules are loaded in dependency order (topological sort) with
     /// uplink/daemon capsules loaded first. Each uplink must signal
@@ -644,14 +657,8 @@ impl Kernel {
     /// capsule's KV namespace and the `astrid.v1.capsules_loaded` event is published.
     pub async fn load_all_capsules(&self) {
         use astrid_capsule::toposort::toposort_manifests;
-        use astrid_core::dirs::AstridHome;
 
-        // Discovery paths in priority order: principal > workspace.
-        let mut paths = Vec::new();
-        if let Ok(home) = AstridHome::resolve() {
-            let principal = astrid_core::PrincipalId::default();
-            paths.push(home.principal_home(&principal).capsules_dir());
-        }
+        let paths = capsule_discovery_paths(&self.astrid_home, &self.workspace_root);
 
         let discovered = astrid_capsule::discovery::discover_manifests(Some(&paths));
 
@@ -742,10 +749,6 @@ impl Kernel {
                 .collect();
             warn_agent_loop_readiness(&loaded);
         }
-
-        // Mirror the read-only introspection furniture into every principal's
-        // home so non-install principals see the globally-loaded capsule set.
-        self.sync_all_principal_furniture().await;
 
         // Signal that all capsules have been loaded so uplink capsules
         // (like the registry) can proceed with discovery instead of
@@ -948,17 +951,28 @@ impl Kernel {
         // exclusive ownership (strong_count == 1).
         {
             let mut old = old_capsule;
-            if let Some(capsule) = std::sync::Arc::get_mut(&mut old) {
-                if let Err(e) = capsule.unload().await {
-                    tracing::warn!(
-                        capsule_id = %id,
-                        error = %e,
-                        "Capsule unload failed during unload request"
-                    );
+            old.request_cancel();
+            let mut unloaded = false;
+            for retry in 0..20_u32 {
+                if let Some(capsule) = std::sync::Arc::get_mut(&mut old) {
+                    if let Err(e) = capsule.unload().await {
+                        tracing::warn!(
+                            capsule_id = %id,
+                            error = %e,
+                            "Capsule unload failed during unload request"
+                        );
+                    }
+                    unloaded = true;
+                    break;
                 }
-            } else {
+                if retry < 19 {
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                }
+            }
+            if !unloaded {
                 tracing::warn!(
                     capsule_id = %id,
+                    strong_count = std::sync::Arc::strong_count(&old),
                     "Cannot call unload - Arc still held by in-flight task"
                 );
             }
@@ -966,76 +980,6 @@ impl Kernel {
 
         self.publish_capsules_loaded().await;
         Ok(true)
-    }
-
-    /// Mirror the read-only introspection furniture (installed-capsule
-    /// registry + `home://wit/`) into every principal's home.
-    ///
-    /// Capsules are deployed once and shared globally, but the read-only
-    /// *view* of that set is materialized only into the install principal's
-    /// home at install time — so a non-install principal (e.g. `claude-code`)
-    /// would see `system_status` `capsule_count: 0` and `list_interfaces`
-    /// "WIT directory not found". Run on boot (and after install, since
-    /// [`Self::load_all_capsules`] also runs post-install) to rebuild the
-    /// mirror for every principal enumerated from `etc/profiles/*.toml`.
-    ///
-    /// Best-effort: a per-principal sync failure logs a warning and continues
-    /// — it degrades that principal's introspection visibility, never boot.
-    /// Env config (`.config/env/`) is excluded for secret isolation (enforced
-    /// inside [`astrid_capsule_install::materialize_principal_furniture`]).
-    async fn sync_all_principal_furniture(&self) {
-        // The sweep enumerates `etc/profiles/*.toml` and does synchronous
-        // recursive directory copies per principal. Offload the whole loop to
-        // the blocking pool so it never pins a tokio worker, and `.await` it so
-        // boot ordering is preserved (the `capsules_loaded` signal must not fire
-        // before the mirrors exist). `AstridHome` is `Clone` and cheap to move.
-        let home = self.astrid_home.clone();
-        let result = tokio::task::spawn_blocking(move || {
-            let profiles_dir = home.profiles_dir();
-            let entries = match std::fs::read_dir(&profiles_dir) {
-                Ok(entries) => entries,
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
-                Err(e) => {
-                    tracing::warn!(
-                        dir = %profiles_dir.display(),
-                        error = %e,
-                        "failed to enumerate principals for home-furniture sync"
-                    );
-                    return;
-                },
-            };
-
-            for entry in entries.flatten() {
-                if !entry.file_type().is_ok_and(|t| t.is_file()) {
-                    continue;
-                }
-                let file_name = entry.file_name();
-                let Some(stem) = file_name.to_str().and_then(|n| n.strip_suffix(".toml")) else {
-                    continue;
-                };
-                let Ok(principal) = PrincipalId::new(stem) else {
-                    continue;
-                };
-                if let Err(e) =
-                    astrid_capsule_install::materialize_principal_furniture(&home, &principal)
-                {
-                    tracing::warn!(
-                        %principal,
-                        error = %format!("{e:#}"),
-                        "failed to materialize per-principal home furniture; \
-                         this principal's introspection tools may not see the loaded capsule set"
-                    );
-                }
-            }
-        })
-        .await;
-        if let Err(join_err) = result {
-            tracing::warn!(
-                error = %join_err,
-                "per-principal home-furniture sweep task panicked; \
-                 some principals' introspection tools may not see the loaded capsule set"
-            );
-        }
     }
 
     /// Record that a new client connection for `principal` has been established.
@@ -1194,6 +1138,7 @@ impl Kernel {
             let id = arc.id().clone();
             let mut unloaded = false;
 
+            arc.request_cancel();
             for retry in 0..20_u32 {
                 if let Some(capsule) = Arc::get_mut(&mut arc) {
                     if let Err(e) = capsule.unload().await {
@@ -1907,6 +1852,18 @@ fn spawn_react_watchdog(event_bus: Arc<EventBus>) -> tokio::task::JoinHandle<()>
     })
 }
 
+fn capsule_discovery_paths(
+    home: &astrid_core::dirs::AstridHome,
+    workspace_root: &Path,
+) -> Vec<PathBuf> {
+    let principal = PrincipalId::default();
+    let workspace = astrid_core::dirs::WorkspaceDir::from_path(workspace_root);
+    vec![
+        home.principal_home(&principal).capsules_dir(),
+        workspace.capsules_dir(),
+    ]
+}
+
 // ---------------------------------------------------------------------------
 // Boot validation
 // ---------------------------------------------------------------------------
@@ -2410,6 +2367,112 @@ async fn apply_single_identity_link(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::Ordering;
+
+    use astrid_capsule::capsule::{Capsule, CapsuleId, CapsuleState};
+    use astrid_capsule::context::CapsuleContext;
+    use astrid_capsule::error::CapsuleResult;
+    use astrid_capsule::manifest::CapsuleManifest;
+
+    struct CancellableTestCapsule {
+        id: CapsuleId,
+        manifest: CapsuleManifest,
+        cancelled: Arc<AtomicBool>,
+        unloaded: Arc<AtomicBool>,
+    }
+
+    #[async_trait::async_trait]
+    impl Capsule for CancellableTestCapsule {
+        fn id(&self) -> &CapsuleId {
+            &self.id
+        }
+
+        fn manifest(&self) -> &CapsuleManifest {
+            &self.manifest
+        }
+
+        fn state(&self) -> CapsuleState {
+            CapsuleState::Ready
+        }
+
+        async fn load(&mut self, _ctx: &CapsuleContext) -> CapsuleResult<()> {
+            Ok(())
+        }
+
+        async fn unload(&mut self) -> CapsuleResult<()> {
+            self.unloaded.store(true, Ordering::Relaxed);
+            Ok(())
+        }
+
+        fn request_cancel(&self) {
+            self.cancelled.store(true, Ordering::Relaxed);
+        }
+    }
+
+    #[test]
+    fn capsule_discovery_paths_include_workspace_capsules() {
+        let (_d, home) = scratch_home();
+        let workspace = tempfile::tempdir().unwrap();
+        let paths = capsule_discovery_paths(&home, workspace.path());
+        let default = astrid_core::PrincipalId::default();
+
+        assert_eq!(
+            paths,
+            vec![
+                home.principal_home(&default).capsules_dir(),
+                workspace.path().join(".astrid").join("capsules"),
+            ],
+            "daemon discovery must scan the default install dir and the configured workspace"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn unload_requests_cancel_before_waiting_for_exclusive_capsule() {
+        let (_d, home) = scratch_home();
+        let kernel = test_kernel_with_home(home).await;
+        let id = CapsuleId::new("cancellable-test").unwrap();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let unloaded = Arc::new(AtomicBool::new(false));
+
+        {
+            let mut registry = kernel.capsules.write().await;
+            registry
+                .register(Box::new(CancellableTestCapsule {
+                    id: id.clone(),
+                    manifest: CapsuleManifest::default(),
+                    cancelled: Arc::clone(&cancelled),
+                    unloaded: Arc::clone(&unloaded),
+                }))
+                .unwrap();
+        }
+
+        let held = {
+            let registry = kernel.capsules.read().await;
+            registry.get(&id).expect("registered capsule")
+        };
+        let release_after_cancel = {
+            let cancelled = Arc::clone(&cancelled);
+            tokio::spawn(async move {
+                while !cancelled.load(Ordering::Relaxed) {
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                }
+                drop(held);
+            })
+        };
+
+        let removed = kernel.unload_one_capsule(&id).await.unwrap();
+        release_after_cancel.await.unwrap();
+
+        assert!(removed);
+        assert!(
+            cancelled.load(Ordering::Relaxed),
+            "unload must request cancellation before exclusive unload is available"
+        );
+        assert!(
+            unloaded.load(Ordering::Relaxed),
+            "unload should complete once the in-flight holder releases its Arc"
+        );
+    }
 
     #[test]
     fn test_load_or_generate_creates_new_key() {

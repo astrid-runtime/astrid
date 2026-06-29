@@ -189,6 +189,49 @@ fn decision_from_str(decision: &str) -> ApprovalDecision {
     }
 }
 
+fn event_principal(event: &AstridEvent) -> Option<&str> {
+    match event {
+        AstridEvent::Ipc { message, .. } => message.principal.as_deref(),
+        _ => None,
+    }
+}
+
+fn response_principal_matches(expected: &str, event: &AstridEvent) -> bool {
+    event_principal(event) == Some(expected)
+}
+
+async fn await_matching_approval_response(
+    receiver: &mut astrid_events::EventReceiver,
+    expected_principal: &str,
+    capsule_id: &str,
+    request_id: &str,
+    timeout: std::time::Duration,
+) -> Option<std::sync::Arc<AstridEvent>> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return None;
+        }
+        let Ok(Some(event)) = tokio::time::timeout(remaining, receiver.recv()).await else {
+            return None;
+        };
+        if response_principal_matches(expected_principal, &event) {
+            return Some(event);
+        }
+        let got = event_principal(&event);
+        tracing::warn!(
+            target: "astrid.audit.approval",
+            security_event = true,
+            capsule_id = %capsule_id,
+            request_id = %request_id,
+            expected_principal = %expected_principal,
+            got_principal = got.unwrap_or("<none>"),
+            "approval: rejected cross-principal response; continuing to wait",
+        );
+    }
+}
+
 impl approval::Host for HostState {
     /// Host function: `request_approval(request) -> ApprovalResponse`
     ///
@@ -259,7 +302,8 @@ impl approval::Host for HostState {
             Topic::approval_request(),
             request_payload,
             Uuid::nil(), // Kernel-originated
-        );
+        )
+        .with_principal(principal.to_string());
         event_bus.publish(AstridEvent::Ipc {
             message,
             metadata: astrid_events::EventMetadata::default(),
@@ -279,13 +323,14 @@ impl approval::Host for HostState {
             &blocking_semaphore,
             &cancel_token,
             async {
-                tokio::time::timeout(
+                await_matching_approval_response(
+                    &mut receiver,
+                    principal.as_str(),
+                    &capsule_id,
+                    &request_id,
                     std::time::Duration::from_millis(MAX_APPROVAL_TIMEOUT_MS),
-                    receiver.recv(),
                 )
                 .await
-                .ok()
-                .flatten()
             },
         )
         .flatten();
@@ -351,473 +396,5 @@ impl approval::Host for HostState {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn check_allowance_matches_command_pattern() {
-        let store = AllowanceStore::new();
-        let keypair = KeyPair::generate();
-        let allowance = Allowance {
-            id: AllowanceId::new(),
-            principal: PrincipalId::default(),
-            action_pattern: AllowancePattern::CommandPattern {
-                command: "git push *".into(),
-            },
-            created_at: Timestamp::now(),
-            expires_at: None,
-            max_uses: None,
-            uses_remaining: None,
-            session_only: true,
-            workspace_root: None,
-            signature: keypair.sign(b"test"),
-        };
-        store.add_allowance(allowance).unwrap();
-
-        assert!(check_allowance(
-            &store,
-            &PrincipalId::default(),
-            "git push origin main",
-            None
-        ));
-        assert!(!check_allowance(
-            &store,
-            &PrincipalId::default(),
-            "git status",
-            None
-        ));
-    }
-
-    #[test]
-    fn check_allowance_returns_false_on_empty_store() {
-        let store = AllowanceStore::new();
-        assert!(!check_allowance(
-            &store,
-            &PrincipalId::default(),
-            "git push origin main",
-            None
-        ));
-    }
-
-    #[test]
-    fn create_allowance_approve_session() {
-        let store = AllowanceStore::new();
-        create_allowance_from_decision(
-            &store,
-            &PrincipalId::default(),
-            "git push",
-            "approve_session",
-            None,
-            "test",
-        );
-        assert_eq!(store.count(), 1);
-        assert!(check_allowance(
-            &store,
-            &PrincipalId::default(),
-            "git push origin main",
-            None
-        ));
-    }
-
-    #[test]
-    fn create_allowance_approve_always() {
-        let store = AllowanceStore::new();
-        create_allowance_from_decision(
-            &store,
-            &PrincipalId::default(),
-            "docker run",
-            "approve_always",
-            None,
-            "test",
-        );
-        assert_eq!(store.count(), 1);
-        assert!(check_allowance(
-            &store,
-            &PrincipalId::default(),
-            "docker run my-image",
-            None
-        ));
-    }
-
-    #[test]
-    fn create_allowance_simple_approve_does_nothing() {
-        let store = AllowanceStore::new();
-        create_allowance_from_decision(
-            &store,
-            &PrincipalId::default(),
-            "git push",
-            "approve",
-            None,
-            "test",
-        );
-        assert_eq!(store.count(), 0);
-    }
-
-    #[test]
-    fn create_allowance_deny_does_nothing() {
-        let store = AllowanceStore::new();
-        create_allowance_from_decision(
-            &store,
-            &PrincipalId::default(),
-            "git push",
-            "deny",
-            None,
-            "test",
-        );
-        assert_eq!(store.count(), 0);
-    }
-
-    #[test]
-    fn create_allowance_garbage_decision_does_nothing() {
-        let store = AllowanceStore::new();
-        create_allowance_from_decision(
-            &store,
-            &PrincipalId::default(),
-            "git push",
-            "garbage",
-            None,
-            "test",
-        );
-        assert_eq!(store.count(), 0);
-        create_allowance_from_decision(
-            &store,
-            &PrincipalId::default(),
-            "git push",
-            "",
-            None,
-            "test",
-        );
-        assert_eq!(store.count(), 0);
-    }
-
-    #[test]
-    fn check_allowance_with_special_characters() {
-        let store = AllowanceStore::new();
-        let keypair = KeyPair::generate();
-        let allowance = Allowance {
-            id: AllowanceId::new(),
-            principal: PrincipalId::default(),
-            action_pattern: AllowancePattern::CommandPattern {
-                command: "git push *".into(),
-            },
-            created_at: Timestamp::now(),
-            expires_at: None,
-            max_uses: None,
-            uses_remaining: None,
-            session_only: true,
-            workspace_root: None,
-            signature: keypair.sign(b"test"),
-        };
-        store.add_allowance(allowance).unwrap();
-
-        assert!(!check_allowance(
-            &store,
-            &PrincipalId::default(),
-            "git status; rm -rf /",
-            None
-        ));
-        assert!(check_allowance(
-            &store,
-            &PrincipalId::default(),
-            "git push --force origin main",
-            None
-        ));
-    }
-
-    #[test]
-    fn escape_glob_metacharacters_preserves_normal_chars() {
-        assert_eq!(escape_glob_metacharacters("git push"), "git push");
-        assert_eq!(
-            escape_glob_metacharacters("npm install @types/react"),
-            "npm install @types/react"
-        );
-        assert_eq!(escape_glob_metacharacters("my-tool_v2.0"), "my-tool_v2.0");
-    }
-
-    #[test]
-    fn escape_glob_metacharacters_escapes_wildcards() {
-        assert_eq!(escape_glob_metacharacters("*"), "\\*");
-        assert_eq!(escape_glob_metacharacters("git *"), "git \\*");
-        assert_eq!(escape_glob_metacharacters("git[status]"), "git\\[status\\]");
-        assert_eq!(escape_glob_metacharacters("cmd?"), "cmd\\?");
-    }
-
-    #[test]
-    fn create_allowance_with_wildcard_in_action_is_not_overly_broad() {
-        let store = AllowanceStore::new();
-        create_allowance_from_decision(
-            &store,
-            &PrincipalId::default(),
-            "*",
-            "approve_session",
-            None,
-            "test",
-        );
-        assert_eq!(store.count(), 1);
-        assert!(!check_allowance(
-            &store,
-            &PrincipalId::default(),
-            "git push origin main",
-            None
-        ));
-    }
-
-    #[test]
-    fn create_allowance_empty_action() {
-        let store = AllowanceStore::new();
-        create_allowance_from_decision(
-            &store,
-            &PrincipalId::default(),
-            "",
-            "approve_session",
-            None,
-            "test",
-        );
-        assert_eq!(store.count(), 0);
-        assert!(!check_allowance(
-            &store,
-            &PrincipalId::default(),
-            "git push",
-            None
-        ));
-    }
-
-    #[test]
-    fn approve_once_does_not_create_allowance() {
-        let store = AllowanceStore::new();
-        create_allowance_from_decision(
-            &store,
-            &PrincipalId::default(),
-            "git push",
-            "approve",
-            None,
-            "test",
-        );
-        assert_eq!(store.count(), 0);
-        assert!(!check_allowance(
-            &store,
-            &PrincipalId::default(),
-            "git push origin main",
-            None
-        ));
-    }
-
-    // --- sanitize_action_for_pattern tests ---
-
-    #[test]
-    fn sanitize_action_preserves_shell_fragments() {
-        assert_eq!(
-            sanitize_action_for_pattern("python -c 'print(\"hello\")'", "test"),
-            "python -c 'print(\"hello\")'"
-        );
-        assert_eq!(
-            sanitize_action_for_pattern("awk '{print $1}' file.txt", "test"),
-            "awk '{print $1}' file.txt"
-        );
-        assert_eq!(
-            sanitize_action_for_pattern("bash -c 'echo $HOME'", "test"),
-            "bash -c 'echo $HOME'"
-        );
-        assert_eq!(
-            sanitize_action_for_pattern("g++ main.cpp", "test"),
-            "g++ main.cpp"
-        );
-        assert_eq!(
-            sanitize_action_for_pattern("npm install @types/react", "test"),
-            "npm install @types/react"
-        );
-        assert_eq!(
-            sanitize_action_for_pattern("docker run ubuntu:latest", "test"),
-            "docker run ubuntu:latest"
-        );
-    }
-
-    #[test]
-    fn sanitize_action_preserves_glob_chars_for_escaping() {
-        assert_eq!(sanitize_action_for_pattern("*", "test"), "*");
-        assert_eq!(sanitize_action_for_pattern("git *", "test"), "git *");
-        assert_eq!(sanitize_action_for_pattern("cmd?", "test"), "cmd?");
-        assert_eq!(
-            sanitize_action_for_pattern("git[status]", "test"),
-            "git[status]"
-        );
-    }
-
-    #[test]
-    fn sanitize_action_strips_control_characters() {
-        assert_eq!(sanitize_action_for_pattern("git\0push", "test"), "gitpush");
-        assert_eq!(sanitize_action_for_pattern("git\rpush", "test"), "gitpush");
-        assert_eq!(
-            sanitize_action_for_pattern("git\x1b[31mpush", "test"),
-            "git[31mpush"
-        );
-        assert_eq!(sanitize_action_for_pattern("git\tpush", "test"), "gitpush");
-        assert_eq!(sanitize_action_for_pattern("git\npush", "test"), "gitpush");
-    }
-
-    #[test]
-    fn sanitize_action_truncates_long_strings() {
-        let long_action = "a".repeat(500);
-        let sanitized = sanitize_action_for_pattern(&long_action, "test");
-        assert_eq!(sanitized.chars().count(), MAX_ACTION_LEN);
-    }
-
-    #[test]
-    fn sanitize_action_exact_limit_no_change() {
-        let action = "a".repeat(MAX_ACTION_LEN);
-        let sanitized = sanitize_action_for_pattern(&action, "test");
-        assert_eq!(sanitized, action);
-        assert_eq!(sanitized.chars().count(), MAX_ACTION_LEN);
-    }
-
-    #[test]
-    fn sanitize_action_truncates_multibyte_chars() {
-        let action = "a".repeat(200) + &"\u{0100}".repeat(100);
-        assert_eq!(action.chars().count(), 300);
-        let sanitized = sanitize_action_for_pattern(&action, "test");
-        assert_eq!(sanitized.chars().count(), MAX_ACTION_LEN);
-        assert!(sanitized.starts_with(&"a".repeat(200)));
-    }
-
-    #[test]
-    fn sanitize_action_trims_whitespace() {
-        assert_eq!(
-            sanitize_action_for_pattern("  git push  ", "test"),
-            "git push"
-        );
-    }
-
-    #[test]
-    fn create_allowance_whitespace_padded_action() {
-        let store = AllowanceStore::new();
-        create_allowance_from_decision(
-            &store,
-            &PrincipalId::default(),
-            "  git push  ",
-            "approve_session",
-            None,
-            "test",
-        );
-        assert_eq!(store.count(), 1);
-        assert!(check_allowance(
-            &store,
-            &PrincipalId::default(),
-            "git push origin main",
-            None
-        ));
-        assert!(!check_allowance(
-            &store,
-            &PrincipalId::default(),
-            "git status",
-            None
-        ));
-    }
-
-    #[test]
-    fn create_allowance_combined_attack() {
-        let store = AllowanceStore::new();
-        let attack = "git\0 *\x1b[31m";
-        create_allowance_from_decision(
-            &store,
-            &PrincipalId::default(),
-            attack,
-            "approve_session",
-            None,
-            "test",
-        );
-        assert_eq!(store.count(), 1);
-        assert!(!check_allowance(
-            &store,
-            &PrincipalId::default(),
-            "git push origin main",
-            None
-        ));
-        assert!(!check_allowance(
-            &store,
-            &PrincipalId::default(),
-            "git status",
-            None
-        ));
-    }
-
-    #[test]
-    fn create_allowance_null_byte_attack() {
-        let store = AllowanceStore::new();
-        create_allowance_from_decision(
-            &store,
-            &PrincipalId::default(),
-            "git\0push",
-            "approve_session",
-            None,
-            "test",
-        );
-        assert_eq!(store.count(), 1);
-        assert!(!check_allowance(
-            &store,
-            &PrincipalId::default(),
-            "git push origin main",
-            None
-        ));
-        assert!(check_allowance(
-            &store,
-            &PrincipalId::default(),
-            "gitpush something",
-            None
-        ));
-    }
-
-    // --- sanitize_guest_field tests ---
-
-    #[test]
-    fn sanitize_guest_field_strips_control_chars() {
-        let mut s = "git push\x1b[31m origin".to_string();
-        sanitize_guest_field(&mut s, MAX_RESOURCE_LEN, "resource", "test");
-        assert_eq!(s, "git push[31m origin");
-    }
-
-    #[test]
-    fn sanitize_guest_field_truncates_resource() {
-        let mut s = "a".repeat(2000);
-        sanitize_guest_field(&mut s, MAX_RESOURCE_LEN, "resource", "test");
-        assert_eq!(s.chars().count(), MAX_RESOURCE_LEN);
-    }
-
-    #[test]
-    fn sanitize_guest_field_resource_exact_limit() {
-        let original = "a".repeat(MAX_RESOURCE_LEN);
-        let mut s = original.clone();
-        sanitize_guest_field(&mut s, MAX_RESOURCE_LEN, "resource", "test");
-        assert_eq!(s, original);
-    }
-
-    #[test]
-    fn sanitize_guest_field_truncates_multibyte() {
-        let mut s = "a".repeat(500) + &"\u{0100}".repeat(600);
-        assert_eq!(s.chars().count(), 1100);
-        sanitize_guest_field(&mut s, MAX_RESOURCE_LEN, "resource", "test");
-        assert_eq!(s.chars().count(), MAX_RESOURCE_LEN);
-        assert!(s.starts_with(&"a".repeat(500)));
-    }
-
-    #[test]
-    fn sanitize_guest_field_trims_whitespace() {
-        let mut s = "  git push origin  ".to_string();
-        sanitize_guest_field(&mut s, MAX_RESOURCE_LEN, "resource", "test");
-        assert_eq!(s, "git push origin");
-    }
-
-    #[test]
-    fn sanitize_guest_field_combined_attack() {
-        let mut s = format!("{}\x1b[31m{}", "A".repeat(1000), "B".repeat(1000));
-        sanitize_guest_field(&mut s, MAX_RESOURCE_LEN, "resource", "test");
-        assert_eq!(s.chars().count(), MAX_RESOURCE_LEN);
-        assert!(s.chars().all(|c| !c.is_control()));
-    }
-
-    #[test]
-    fn sanitize_guest_field_empty_string() {
-        let mut s = String::new();
-        sanitize_guest_field(&mut s, MAX_RESOURCE_LEN, "resource", "test");
-        assert!(s.is_empty());
-    }
-}
+#[path = "approval_tests.rs"]
+mod tests;

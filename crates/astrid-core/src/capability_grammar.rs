@@ -331,7 +331,7 @@ pub const CAPABILITY_CATALOG: &[CapabilityInfo] = {
         CapabilityInfo {
             id: "capsule:install",
             label: "Install capsules",
-            description: "Install a new capsule into the system-wide capsule directory. Affects every principal on the host.",
+            description: "Install a new capsule into the daemon's configured install target. Does not grant any principal access by itself.",
             category: Capsule,
             scope: Global,
             danger: Extreme,
@@ -339,7 +339,7 @@ pub const CAPABILITY_CATALOG: &[CapabilityInfo] = {
         CapabilityInfo {
             id: "self:capsule:install",
             label: "Install capsules (own workspace)",
-            description: "Install a capsule into the caller's own workspace. Future kernel work; see also: capsule:install.",
+            description: "Install a capsule into the caller's own CWD/workspace capsule slot. Future kernel work; see also: capsule:install.",
             category: Capsule,
             scope: Self_,
             danger: Elevated,
@@ -363,7 +363,7 @@ pub const CAPABILITY_CATALOG: &[CapabilityInfo] = {
         CapabilityInfo {
             id: "capsule:remove",
             label: "Remove capsules",
-            description: "Remove an installed capsule from the system-wide capsule directory and unload it from the running daemon. Affects every principal on the host; reversible by reinstalling.",
+            description: "Remove an installed capsule from the daemon's configured install target and unload it from the running daemon. Principal grants are unchanged; reversible by reinstalling.",
             category: Capsule,
             scope: Global,
             danger: Elevated,
@@ -400,6 +400,22 @@ pub const CAPABILITY_CATALOG: &[CapabilityInfo] = {
             category: Agent,
             scope: Global,
             danger: Normal,
+        },
+        CapabilityInfo {
+            id: "agent:create:inherit",
+            label: "Create agents from inherited state",
+            description: "Provision a new agent principal by copying env, KV, and secret state from an existing source principal. Does not copy the source profile.",
+            category: Agent,
+            scope: Global,
+            danger: Extreme,
+        },
+        CapabilityInfo {
+            id: "agent:create:clone",
+            label: "Clone agents",
+            description: "Provision a new agent principal by copying another principal's capability/resource profile plus env, KV, and secret state. Does not copy auth keys.",
+            category: Agent,
+            scope: Global,
+            danger: Extreme,
         },
         CapabilityInfo {
             id: "agent:delete",
@@ -675,7 +691,7 @@ pub fn known_capabilities_list() -> &'static [&'static str] {
 /// in the same commit that adds a new capability so a kernel
 /// addition without updating the catalog fails the consuming
 /// crate's tests.
-pub const KNOWN_CAPABILITIES_COUNT: usize = 41;
+pub const KNOWN_CAPABILITIES_COUNT: usize = 43;
 
 const _: () = assert!(
     CAPABILITY_CATALOG.len() == KNOWN_CAPABILITIES_COUNT,

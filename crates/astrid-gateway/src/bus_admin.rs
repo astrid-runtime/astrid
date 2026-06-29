@@ -31,11 +31,13 @@
 //!
 //! ## Trust
 //!
-//! Identical to `AdminClient`. The gateway has already
-//! cryptographically verified the inbound bearer and resolved
-//! `caller: PrincipalId`. We stamp that on the outgoing message;
-//! the kernel's `resolve_caller` reads the IPC envelope's
-//! `principal` field for cap-gating.
+//! The gateway has already cryptographically verified the inbound bearer and
+//! resolved `caller: PrincipalId`. We stamp that on the outgoing message; the
+//! kernel's `resolve_caller` reads the IPC envelope's `principal` field for
+//! cap-gating. On the response side, request-id correlation is not enough:
+//! responses are accepted only when `source_id` matches the live kernel session
+//! id captured by [`GatewayState`](crate::state::GatewayState), so another
+//! publisher cannot satisfy an admin route with a forged same-correlation reply.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -59,6 +61,7 @@ const DEFAULT_TIMEOUT: Duration = Duration::from_secs(15);
 pub struct BusAdminClient {
     bus: Arc<EventBus>,
     caller: PrincipalId,
+    expected_source_id: Uuid,
     /// The device `key_id` the inbound bearer was scoped to, if any. Stamped
     /// onto every outbound admin request so the kernel cap-gate can apply this
     /// device's scope as an attenuation floor on `caller`'s authority. `None`
@@ -75,10 +78,11 @@ impl BusAdminClient {
     /// [`with_device_key_id`](Self::with_device_key_id) for a request that must
     /// carry a scoped caller's device id to the kernel cap-gate.
     #[must_use]
-    pub fn new(bus: Arc<EventBus>, caller: PrincipalId) -> Self {
+    pub fn new(bus: Arc<EventBus>, caller: PrincipalId, expected_source_id: Uuid) -> Self {
         Self {
             bus,
             caller,
+            expected_source_id,
             device_key_id: None,
             timeout: DEFAULT_TIMEOUT,
         }
@@ -165,6 +169,9 @@ impl BusAdminClient {
             let AstridEvent::Ipc { message, .. } = &*event else {
                 continue;
             };
+            if message.source_id != self.expected_source_id {
+                continue;
+            }
             // The kernel's `publish_response` wraps the
             // `AdminKernelResponse` in `IpcPayload::RawJson`, with
             // an explicit `request_id` for correlation.
@@ -191,5 +198,60 @@ impl BusAdminClient {
             };
             return Ok(resp.body);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn request_ignores_wrong_source_admin_response() {
+        let bus = Arc::new(EventBus::new());
+        let expected_source = Uuid::from_u128(0x1111);
+        let caller = PrincipalId::new("alice").expect("valid principal");
+        let client = BusAdminClient::new(Arc::clone(&bus), caller, expected_source)
+            .with_timeout(Duration::from_millis(150));
+
+        let mut request_rx = bus.subscribe_topic_as("astrid.v1.admin.agent.list", "test");
+        let bus_bg = Arc::clone(&bus);
+        tokio::spawn(async move {
+            let event = request_rx.recv().await.expect("request published");
+            let AstridEvent::Ipc { message, .. } = &*event else {
+                panic!("expected IPC request");
+            };
+            let value: Value = match &message.payload {
+                IpcPayload::RawJson(v) => v.clone(),
+                other => serde_json::to_value(other).expect("request payload serializes"),
+            };
+            let request_id = value
+                .get("request_id")
+                .and_then(Value::as_str)
+                .expect("gateway stamps admin request id")
+                .to_string();
+            let forged_body = AdminKernelResponse::for_request(
+                Some(request_id),
+                AdminResponseBody::AgentList(Vec::new()),
+            );
+            let payload = serde_json::to_value(forged_body).expect("response serializes");
+            let forged = IpcMessage::new(
+                response_topic(&AdminRequestKind::AgentList),
+                IpcPayload::RawJson(payload),
+                Uuid::from_u128(0x2222),
+            );
+            bus_bg.publish(AstridEvent::Ipc {
+                metadata: EventMetadata::new("test::forged-admin"),
+                message: forged,
+            });
+        });
+
+        let err = client
+            .request(AdminRequestKind::AgentList)
+            .await
+            .expect_err("wrong-source admin response must be ignored");
+        assert!(
+            err.to_string().contains("timed out"),
+            "unexpected error: {err:#}"
+        );
     }
 }

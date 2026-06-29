@@ -232,6 +232,8 @@ async fn request_capsule_round_trips_scoped_reply() {
         // The stand-in capsule sees the request principal-stamped.
         if let AstridEvent::Ipc { message, .. } = &*event {
             assert_eq!(message.principal.as_deref(), Some("alice"));
+            assert_ne!(message.source_id, Uuid::nil());
+            assert_eq!(message.origin, MessageOrigin::RemoteGateway);
         } else {
             panic!("expected an IPC request event");
         }
@@ -240,11 +242,16 @@ async fn request_capsule_round_trips_scoped_reply() {
             "sessions": [],
             "next_cursor": null
         });
-        let msg = IpcMessage::new(
+        let mut msg = IpcMessage::new(
             Topic::from_raw(resp_topic.clone()),
             IpcPayload::RawJson(reply),
-            Uuid::nil(),
+            session_capsule_source_id(),
         );
+        if let AstridEvent::Ipc { message, .. } = &*event
+            && let Some(principal) = &message.principal
+        {
+            msg = msg.with_principal(principal.clone());
+        }
         bus_capsule.publish(AstridEvent::Ipc {
             metadata: EventMetadata::new("test::capsule"),
             message: msg,
@@ -264,6 +271,63 @@ async fn request_capsule_round_trips_scoped_reply() {
     )
     .await
     .expect("helper returns the scoped reply");
+
+    capsule.await.expect("stand-in capsule task joins");
+    let parsed = parse_list_response(value).expect("reply deserializes");
+    assert!(parsed.sessions.is_empty());
+    assert!(parsed.next_cursor.is_none());
+}
+
+/// Real WASM capsule `publish_json` replies arrive at the gateway as
+/// `IpcPayload::Custom { data }`. The gateway must unwrap the guest-visible
+/// JSON body before checking correlation, not inspect the enum wrapper.
+#[tokio::test]
+async fn request_capsule_round_trips_custom_json_reply() {
+    let bus = Arc::new(EventBus::new());
+    let principal = PrincipalId::new("alice").expect("valid principal");
+    let correlation_id = "corr-custom-1";
+    let response_topic = format!("{TOPIC_LIST_RESPONSE_PREFIX}.{correlation_id}");
+
+    let mut req_rx = bus.subscribe_topic(TOPIC_LIST_REQUEST.to_string());
+    let bus_capsule = Arc::clone(&bus);
+    let resp_topic = response_topic.clone();
+    let cid = correlation_id.to_string();
+    let capsule = tokio::spawn(async move {
+        let event = req_rx.recv().await.expect("request arrives");
+        let reply = serde_json::json!({
+            "correlation_id": cid,
+            "sessions": [],
+            "next_cursor": null
+        });
+        let mut msg = IpcMessage::new(
+            Topic::from_raw(resp_topic.clone()),
+            IpcPayload::Custom { data: reply },
+            session_capsule_source_id(),
+        );
+        if let AstridEvent::Ipc { message, .. } = &*event
+            && let Some(principal) = &message.principal
+        {
+            msg = msg.with_principal(principal.clone());
+        }
+        bus_capsule.publish(AstridEvent::Ipc {
+            metadata: EventMetadata::new("test::capsule"),
+            message: msg,
+        });
+    });
+
+    let payload = build_list_payload(correlation_id, None, DEFAULT_LIMIT, false);
+    let value = request_capsule(
+        &bus,
+        TOPIC_LIST_REQUEST,
+        &response_topic,
+        payload,
+        correlation_id,
+        &principal,
+        None,
+        CAPSULE_TIMEOUT,
+    )
+    .await
+    .expect("helper returns the capsule publish_json reply");
 
     capsule.await.expect("stand-in capsule task joins");
     let parsed = parse_list_response(value).expect("reply deserializes");
@@ -561,6 +625,8 @@ async fn request_capsule_round_trips_update_reply() {
         };
         // Principal-stamped, and the patch carries only the sent key.
         assert_eq!(message.principal.as_deref(), Some("alice"));
+        assert_ne!(message.source_id, Uuid::nil());
+        assert_eq!(message.origin, MessageOrigin::RemoteGateway);
         if let IpcPayload::RawJson(v) = &message.payload {
             assert_eq!(v["title"], "renamed");
             assert!(v.get("archived").is_none(), "absent key not forwarded");
@@ -576,11 +642,14 @@ async fn request_capsule_round_trips_update_reply() {
                 "archived": false
             }
         });
-        let msg = IpcMessage::new(
+        let mut msg = IpcMessage::new(
             Topic::from_raw(resp_topic),
             IpcPayload::RawJson(reply),
-            Uuid::nil(),
+            session_capsule_source_id(),
         );
+        if let Some(principal) = &message.principal {
+            msg = msg.with_principal(principal.clone());
+        }
         bus_capsule.publish(AstridEvent::Ipc {
             metadata: EventMetadata::new("test::capsule"),
             message: msg,
@@ -610,6 +679,103 @@ async fn request_capsule_round_trips_update_reply() {
     assert_eq!(summary.title.as_deref(), Some("renamed"));
 }
 
+/// A reply stamped for a different principal is ignored. This protects a
+/// same-topic reply from satisfying another caller's request.
+#[tokio::test]
+async fn request_capsule_ignores_wrong_principal_reply() {
+    let bus = Arc::new(EventBus::new());
+    let principal = PrincipalId::new("alice").expect("valid principal");
+    let correlation_id = "corr-want-principal";
+    let response_topic = format!("{TOPIC_LIST_RESPONSE_PREFIX}.{correlation_id}");
+
+    let bus_bg = Arc::clone(&bus);
+    let resp_topic = response_topic.clone();
+    tokio::spawn(async move {
+        tokio::task::yield_now().await;
+        let reply = serde_json::json!({
+            "correlation_id": "corr-want-principal",
+            "sessions": [],
+            "next_cursor": null
+        });
+        let msg = IpcMessage::new(
+            Topic::from_raw(resp_topic),
+            IpcPayload::RawJson(reply),
+            session_capsule_source_id(),
+        )
+        .with_principal("mallory".to_string());
+        bus_bg.publish(AstridEvent::Ipc {
+            metadata: EventMetadata::new("test::foreign"),
+            message: msg,
+        });
+    });
+
+    let payload = build_list_payload(correlation_id, None, DEFAULT_LIMIT, false);
+    let err = request_capsule(
+        &bus,
+        TOPIC_LIST_REQUEST,
+        &response_topic,
+        payload,
+        correlation_id,
+        &principal,
+        None,
+        Duration::from_millis(150),
+    )
+    .await
+    .expect_err("foreign-principal reply must not satisfy the request");
+    assert!(matches!(err, GatewayError::Kernel(_)));
+}
+
+/// A same-principal, same-correlation reply from another capsule is ignored.
+/// Principal and correlation are necessary but not sufficient: the response
+/// must also come from the session capsule's kernel-stamped source id.
+#[tokio::test]
+async fn request_capsule_ignores_wrong_capsule_source_reply() {
+    let bus = Arc::new(EventBus::new());
+    let principal = PrincipalId::new("alice").expect("valid principal");
+    let correlation_id = "corr-want-source";
+    let response_topic = format!("{TOPIC_LIST_RESPONSE_PREFIX}.{correlation_id}");
+
+    let bus_bg = Arc::clone(&bus);
+    let resp_topic = response_topic.clone();
+    tokio::spawn(async move {
+        tokio::task::yield_now().await;
+        let reply = serde_json::json!({
+            "correlation_id": "corr-want-source",
+            "sessions": [{
+                "session_id": "ASTRID_ADVERSARIAL_POISON_SESSION",
+                "message_count": 1
+            }],
+            "next_cursor": null
+        });
+        let wrong_source = Uuid::new_v5(&CAPSULE_ID_NAMESPACE, b"astrid-capsule-adversarial");
+        let msg = IpcMessage::new(
+            Topic::from_raw(resp_topic),
+            IpcPayload::RawJson(reply),
+            wrong_source,
+        )
+        .with_principal("alice".to_string());
+        bus_bg.publish(AstridEvent::Ipc {
+            metadata: EventMetadata::new("test::adversarial-capsule"),
+            message: msg,
+        });
+    });
+
+    let payload = build_list_payload(correlation_id, None, DEFAULT_LIMIT, false);
+    let err = request_capsule(
+        &bus,
+        TOPIC_LIST_REQUEST,
+        &response_topic,
+        payload,
+        correlation_id,
+        &principal,
+        None,
+        Duration::from_millis(150),
+    )
+    .await
+    .expect_err("wrong-source reply must not satisfy the request");
+    assert!(matches!(err, GatewayError::Kernel(_)));
+}
+
 /// A reply whose `correlation_id` does NOT match is skipped; the
 /// helper keeps waiting and ultimately times out rather than
 /// returning a foreign body. Proves the defensive correlation check.
@@ -635,8 +801,9 @@ async fn request_capsule_ignores_mismatched_correlation() {
         let msg = IpcMessage::new(
             Topic::from_raw(resp_topic),
             IpcPayload::RawJson(reply),
-            Uuid::nil(),
-        );
+            session_capsule_source_id(),
+        )
+        .with_principal("alice".to_string());
         bus_bg.publish(AstridEvent::Ipc {
             metadata: EventMetadata::new("test::foreign"),
             message: msg,

@@ -1,0 +1,44 @@
+# First-party capsule command coverage manifest.
+#
+# This is intentionally separate from the built-in CLI manifest. Arbitrary
+# third-party capsule verbs are runtime user content; only shipped first-party
+# capsule verbs belong in core CI.
+#
+# status = "mapped" means the command/provider is assigned to a planned scenario
+# family. status = "covered" means the current runtime harness executes it.
+
+[capsule_commands."astrid-capsule-registry models"]
+scenario = "model_principal_isolation"
+status = "covered"
+provider = "astrid-capsule-registry"
+reason = "Registry owns dynamic model listing/binding commands used by chat and HTTP model routes."
+
+[capsule_commands."astrid-capsule-session session"]
+scenario = "first_party_capsule_commands"
+status = "mapped"
+provider = "astrid-capsule-session"
+reason = "Session semantics are covered through CLI/HTTP session scenarios; direct capsule-command invocation remains represented here."
+
+[capsule_commands."astrid-capsule-identity identity-export"]
+scenario = "first_party_capsule_commands"
+status = "future"
+provider = "astrid-capsule-identity"
+reason = "Identity import/export command execution is not yet in the runtime harness."
+
+[capsule_commands."astrid-capsule-identity identity-import"]
+scenario = "first_party_capsule_commands"
+status = "future"
+provider = "astrid-capsule-identity"
+reason = "Identity import/export command execution is not yet in the runtime harness."
+
+[capsule_commands."astrid-capsule-openai-compat provider"]
+scenario = "prompt_fake_openai_compat"
+status = "covered"
+provider = "astrid-capsule-openai-compat"
+reason = "Provider route is exercised through the fake OpenAI-compatible server rather than as a direct CLI verb."
+
+[capsule_commands."budget"]
+scenario = "budget_core_transitional"
+status = "waived"
+provider = "unassigned"
+reason = "Budget ownership is intentionally deferred until it is clear whether the surface stays in core or moves to a capsule."

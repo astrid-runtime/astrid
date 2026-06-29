@@ -1,0 +1,526 @@
+# Runtime e2e scenario contracts.
+#
+# The surface manifests map commands, routes, capsule commands, and capability
+# ids to these scenario families. A scenario is executable only when it names the
+# auth shape, success expectation, denial expectation, state transition, and
+# evidence the harness must assert. Drift tests reject mappings to scenarios
+# missing these fields.
+
+[scenarios.active_context]
+status = "covered"
+surfaces = ["cli"]
+auth = ["local CLI context only"]
+success = ["agent current/switch reflects the active principal"]
+denial = ["missing or deleted active principal is surfaced as a bounded diagnostic"]
+state = ["active principal context changes only in the temp ASTRID_HOME"]
+evidence = ["CLI output and config-path artifacts"]
+
+[scenarios.agent_stream]
+status = "covered"
+surfaces = ["http"]
+auth = ["bearer"]
+success = ["SSE stream opens with a ready event or a bounded readiness error"]
+denial = ["missing bearer is rejected before stream setup"]
+state = ["no cross-principal stream state is persisted"]
+evidence = ["gateway-prompt.sse and HTTP status artifacts"]
+
+[scenarios.approval_flow]
+status = "covered"
+surfaces = ["http"]
+auth = ["bearer plus same-principal waiter enforcement"]
+success = ["same-principal response resolves the pending approval"]
+denial = ["different principal cannot answer, deny, or cancel another principal's approval"]
+state = ["approval waiter is removed after accept, deny, timeout, or cancel"]
+evidence = ["approval result artifact and HTTP responder guardrails"]
+
+[scenarios.audit_event_stream]
+status = "covered"
+surfaces = ["http"]
+auth = ["bearer"]
+success = ["authorized caller receives scoped audit SSE events"]
+denial = ["unauthenticated caller is rejected"]
+state = ["stream does not mutate runtime state"]
+evidence = ["bounded SSE transcript with principal-scoped entries"]
+
+[scenarios.audit_history]
+status = "covered"
+surfaces = ["cli", "http", "capability"]
+auth = ["bearer or admin CLI"]
+success = ["authorized caller reads its permitted audit history"]
+denial = ["regular caller cannot read cross-principal firehose entries"]
+state = ["audit log remains append-only"]
+evidence = ["agent-audit.json and operator-audit.json artifacts"]
+
+[scenarios.bearer_session]
+status = "covered"
+surfaces = ["http"]
+auth = ["bearer"]
+success = ["auth/me and refresh preserve the verified principal"]
+denial = ["missing, malformed, revoked, or cross-home bearer is rejected"]
+state = ["refresh mints a replacement bearer without changing principal"]
+evidence = ["auth/me, refresh, revoke, and cross-home response artifacts"]
+
+[scenarios.budget_core_transitional]
+status = "waived"
+surfaces = ["cli", "capsule"]
+auth = ["deferred"]
+success = ["not asserted while budget ownership remains undecided"]
+denial = ["not asserted while budget ownership remains undecided"]
+state = ["no budget runtime state is introduced by this PR"]
+evidence = ["waiver reason in surface manifests"]
+waiver = "Budget is intentionally deferred until core-vs-capsule ownership is decided."
+
+[scenarios.capability_catalog]
+status = "covered"
+surfaces = ["http"]
+auth = ["bearer"]
+success = ["authorized caller can read the static capability catalog"]
+denial = ["unauthenticated caller is rejected"]
+state = ["catalog read is side-effect free"]
+evidence = ["HTTP response shape and catalog drift gate"]
+
+[scenarios.capability_grants]
+status = "covered"
+surfaces = ["cli", "http", "capability"]
+auth = ["admin or operator with grant/revoke authority"]
+success = ["capability grant enables the target behavior and revoke removes it"]
+denial = ["regular agent cannot grant or revoke capabilities"]
+state = ["principal grant/revoke set changes only for the target principal"]
+evidence = ["caps CLI output and before/after HTTP status artifacts"]
+
+[scenarios.capability_tokens]
+status = "covered"
+surfaces = ["cli", "capability"]
+auth = ["admin/operator with caps:token:* authority"]
+success = ["authorized admin/operator can mint, list, and revoke a temp token"]
+denial = ["regular agent cannot mint, list, or revoke capability tokens"]
+state = ["token store contains only expected temp token transitions"]
+evidence = ["CLI token mint/list/revoke transcript and denial artifacts"]
+
+[scenarios.capsule_authoring_smoke]
+status = "covered"
+surfaces = ["cli"]
+auth = ["local CLI"]
+success = ["capsule new creates a bounded fixture project in temp storage"]
+denial = ["invalid target path or existing project fails with a bounded error"]
+state = ["only temp fixture filesystem paths are written"]
+evidence = ["created manifest and command transcript"]
+
+[scenarios.capsule_env_config]
+status = "covered"
+surfaces = ["cli", "http"]
+auth = ["principal with effective capsule grant"]
+success = ["caller can read schema and write scoped env/secret fields"]
+denial = ["caller cannot read or write env for a hidden/default-only capsule"]
+state = ["env and secret values are scoped to the caller principal"]
+evidence = ["env schema/write artifacts and secret redaction scan"]
+
+[scenarios.capsule_installability]
+status = "covered"
+surfaces = ["cli", "http"]
+auth = ["admin for install, local CLI for build"]
+success = ["dist/*.capsule artifact builds and installs with manifest metadata intact"]
+denial = ["regular agent cannot install daemon-wide capsules"]
+state = ["installed capsule registry contains the artifact once"]
+evidence = ["capsule build/install transcript and metadata artifacts"]
+
+[scenarios.capsule_live_load_lifecycle]
+status = "covered"
+surfaces = ["cli", "http", "capability"]
+auth = ["admin/operator with capsule lifecycle caps"]
+success = ["install, reload, upgrade/reinstall, remove, and restart converge on expected capsule surface"]
+denial = ["regular agent cannot reload/remove daemon-wide capsules"]
+state = ["commands, routes, topics, env schema, and metadata appear/disappear exactly once"]
+evidence = ["capsule list/show/topics/readiness artifacts before and after each transition"]
+
+[scenarios.capsule_metadata]
+status = "covered"
+surfaces = ["cli", "http", "capability"]
+auth = ["principal with effective capsule grant"]
+success = ["caller sees only permitted capsule metadata, commands, topics, and readiness"]
+denial = ["default-only capsule metadata is hidden from ungranted principals"]
+state = ["metadata reads are side-effect free"]
+evidence = ["capsule list/show/topics/env artifacts"]
+
+[scenarios.config_surface]
+status = "covered"
+surfaces = ["cli"]
+auth = ["local CLI"]
+success = ["config show/path reflect explicit ASTRID_HOME"]
+denial = ["poisoned ambient HOME config is ignored"]
+state = ["config read does not mutate runtime state"]
+evidence = ["config show/path artifacts and poisoned HOME assertion"]
+
+[scenarios.content_store_gc]
+status = "covered"
+surfaces = ["cli"]
+auth = ["local CLI"]
+success = ["gc reports/removes only temp-home content eligible for collection"]
+denial = ["invalid or inaccessible temp content path fails safely"]
+state = ["content store remains internally consistent"]
+evidence = ["gc transcript and post-gc content listing"]
+
+[scenarios.core_capsule_install]
+status = "covered"
+surfaces = ["capability"]
+auth = ["admin/default"]
+success = ["default/admin installs the core capsule set"]
+denial = ["regular agent cannot install capsules without grant"]
+state = ["core capsule artifacts load in isolated ASTRID_HOME"]
+evidence = ["capsule install transcript and runtime metadata"]
+
+[scenarios.daemon_lifecycle]
+status = "covered"
+surfaces = ["cli"]
+auth = ["local CLI"]
+success = ["start is idempotent when the temp daemon is already running, status reports the live daemon"]
+denial = ["regular principal cannot stop the live daemon"]
+state = ["restart persistence and crash recovery keep daemon state deterministic with no stale approval/elicit requests"]
+evidence = ["daemon log, status output, stop-denial artifact, request-stream probe, and restart persistence transcript"]
+
+[scenarios.delegation_stub]
+status = "covered"
+surfaces = ["cli"]
+auth = ["admin"]
+success = ["delegation command parses and reports current unsupported/runtime behavior"]
+denial = ["invalid target principal is rejected"]
+state = ["no delegation state mutates until feature is live"]
+evidence = ["CLI transcript and explicit TODO/waiver if still unsupported"]
+
+[scenarios.distro_lifecycle]
+status = "covered"
+surfaces = ["cli"]
+auth = ["admin/local CLI"]
+success = ["offline distro show/seal/apply fixture validates capsule source metadata"]
+denial = ["network or host-mutating paths are waived or dry-run only"]
+state = ["only temp distro lock/seal files are written"]
+evidence = ["distro transcript, seal artifact, and waiver reasons"]
+
+[scenarios.distro_onboarding]
+status = "covered"
+surfaces = ["cli"]
+auth = ["local CLI"]
+success = ["init writes a complete temp Astrid home or dry-run plan"]
+denial = ["existing incompatible home fails with clear diagnostics"]
+state = ["temp home contains expected config and onboarding files"]
+evidence = ["init transcript and config path assertions"]
+
+[scenarios.elicitation_flow]
+status = "covered"
+surfaces = ["http"]
+auth = ["bearer"]
+success = ["same-principal elicit response resumes the waiting prompt"]
+denial = ["cross-principal, stale, or unknown request id is rejected or ignored"]
+state = ["elicit waiter is consumed once"]
+evidence = ["prompt SSE and elicit response artifacts"]
+
+[scenarios.first_party_capsule_commands]
+status = "mapped"
+surfaces = ["cli", "capsule"]
+auth = ["principal with first-party capsule grant"]
+success = ["runtime-discovered first-party capsule command executes through the real capsule"]
+denial = ["ungranted principal cannot see or invoke hidden capsule command surface"]
+state = ["command output reflects caller principal context"]
+evidence = ["capsule command transcript and capsule metadata artifacts"]
+remaining = ["session command direct capsule invocation is mapped but not executed; identity import/export command execution is future work"]
+
+[scenarios.group_crud]
+status = "covered"
+surfaces = ["cli", "http", "capability"]
+auth = ["admin/default"]
+success = ["authorized caller creates, lists, reads, modifies, or deletes temp custom groups"]
+denial = ["regular agent cannot mutate or enumerate unrelated groups"]
+state = ["group config mutates only expected temp group entries"]
+evidence = ["group CLI/HTTP artifacts and capability denial responses"]
+
+[scenarios.health_check]
+status = "covered"
+surfaces = ["cli"]
+auth = ["local CLI"]
+success = ["doctor reports bounded health diagnostics for the temp home"]
+denial = ["misconfigured temp home surfaces clear diagnostics"]
+state = ["health check is side-effect free"]
+evidence = ["doctor transcript"]
+
+[scenarios.host_setup_dry_run]
+status = "waived"
+surfaces = ["cli"]
+auth = ["local CLI"]
+success = ["dry-run/help shape can be asserted"]
+denial = ["apply path is not executed in CI"]
+state = ["host OS settings are not mutated"]
+evidence = ["waiver reason and dry-run/help transcript"]
+waiver = "Host-mutating setup apply is unsafe for GitHub-hosted CI."
+
+[scenarios.invite_lifecycle]
+status = "covered"
+surfaces = ["cli", "http", "capability"]
+auth = ["admin/operator or public token redeem"]
+success = ["authorized issuer creates invite and valid token redeems once"]
+denial = ["regular agent cannot issue/list/revoke invites and reused token is rejected"]
+state = ["invite remaining-use/fingerprint state transitions exactly once"]
+evidence = ["invite, redeem, reuse, and audit artifacts"]
+
+[scenarios.keypair_lifecycle]
+status = "covered"
+surfaces = ["cli"]
+auth = ["local CLI"]
+success = ["generate/list/show/pubkey/delete operate on temp-home key files"]
+denial = ["missing key and duplicate key cases produce bounded errors"]
+state = ["only expected temp key files are created or removed"]
+evidence = ["keypair transcript and key directory listing"]
+
+[scenarios.mcp_bounded_smoke]
+status = "covered"
+surfaces = ["cli"]
+auth = ["agent"]
+success = ["mcp serve starts with a fake bounded client and exits cleanly"]
+denial = ["invalid client request or missing caps is rejected"]
+state = ["MCP server process is terminated deterministically"]
+evidence = ["MCP transcript and process cleanup artifact"]
+
+[scenarios.model_principal_isolation]
+status = "covered"
+surfaces = ["cli", "http", "capsule"]
+auth = ["bearer/principal with model capsule grants"]
+success = ["models list/get-active/set-active are scoped by principal"]
+denial = ["body/query principal spoofing cannot change another principal's model"]
+state = ["active model differs per principal and survives restart"]
+evidence = ["model artifacts and fake-server request attribution log"]
+
+[scenarios.observability_logs]
+status = "covered"
+surfaces = ["cli"]
+auth = ["local CLI"]
+success = ["logs command reads bounded daemon/capsule logs from temp home"]
+denial = ["missing log directory reports a bounded diagnostic"]
+state = ["log reads are side-effect free"]
+evidence = ["logs transcript and redaction scan"]
+
+[scenarios.observability_runtime]
+status = "covered"
+surfaces = ["cli"]
+auth = ["local CLI"]
+success = ["ps/top/who report temp runtime processes/principals with bounded output"]
+denial = ["missing daemon reports bounded diagnostics"]
+state = ["runtime observation is side-effect free"]
+evidence = ["ps/top/who transcripts"]
+
+[scenarios.openapi_contract]
+status = "covered"
+surfaces = ["http"]
+auth = ["public"]
+success = ["OpenAPI document lists every live router method/path"]
+denial = ["not applicable for public read"]
+state = ["OpenAPI read is side-effect free"]
+evidence = ["OpenAPI/router drift test and public-openapi artifact"]
+
+[scenarios.ops_health]
+status = "covered"
+surfaces = ["http"]
+auth = ["public"]
+success = ["healthz returns healthy for a booted daemon"]
+denial = ["not applicable for public health read"]
+state = ["health read is side-effect free"]
+evidence = ["healthz request artifact"]
+
+[scenarios.ops_metrics]
+status = "covered"
+surfaces = ["http"]
+auth = ["public"]
+success = ["metrics expose bounded route/status labels and latency buckets"]
+denial = ["not applicable for public metrics read"]
+state = ["metrics scrape is side-effect free"]
+evidence = ["metrics endpoint test and runtime metrics artifact"]
+
+[scenarios.pair_device_lifecycle]
+status = "covered"
+surfaces = ["cli", "http", "capability"]
+auth = ["self-scoped bearer or public pair token redeem"]
+success = ["principal issues/redeems/revokes a paired-device token for itself"]
+denial = ["operator without pair cap and reused/revoked tokens are rejected"]
+state = ["device key is added, bearer works, then revocation invalidates it"]
+evidence = ["pair-device HTTP artifacts and device list/revoke assertions"]
+
+[scenarios.platform_identity_binding]
+status = "waived"
+surfaces = ["cli"]
+auth = ["admin"]
+success = ["not asserted until platform identity providers are live"]
+denial = ["not asserted until platform identity providers are live"]
+state = ["no platform binding state mutates in this harness"]
+evidence = ["waiver reason on link/unlink commands"]
+waiver = "Platform identity providers are not live in the runtime harness yet."
+
+[scenarios.principal_crud]
+status = "covered"
+surfaces = ["cli", "http", "capability"]
+auth = ["admin/default"]
+success = ["authorized caller creates, reads, modifies, or deletes only the target temp principal"]
+denial = ["regular or restricted caller cannot mutate or inspect hidden principals"]
+state = ["principal profile, group, and capsule grants change only for target"]
+evidence = ["agent/principal HTTP artifacts and CLI transcript"]
+
+[scenarios.principal_inheritance]
+status = "covered"
+surfaces = ["cli", "http", "capability"]
+auth = ["operator with explicit agent:create:inherit or agent:create:clone authority"]
+success = ["authorized caller can create a new owned principal from an explicit source principal"]
+denial = ["agent:create alone cannot copy source env, KV, secrets, capsule grants, or capability profile"]
+state = ["state/profile copies occur only from the named source to the new target principal"]
+evidence = ["agent.create inheritance/clone response, source/target state assertions, and audit row"]
+
+[scenarios.principal_lifecycle]
+status = "covered"
+surfaces = ["cli", "http", "capability"]
+auth = ["admin/default"]
+success = ["authorized caller disables and re-enables a temp principal"]
+denial = ["regular caller cannot enable/disable another principal"]
+state = ["enabled flag changes only for the target principal"]
+evidence = ["principal lifecycle response and audit artifacts"]
+
+[scenarios.principal_visibility]
+status = "covered"
+surfaces = ["cli", "http", "capability"]
+auth = ["admin/global list or self-scoped principal"]
+success = ["admin sees all principals and regular agent sees only itself"]
+denial = ["regular agent cannot see default or another principal"]
+state = ["visibility reads are side-effect free"]
+evidence = ["principal list/show artifacts and self-only JSON assertion"]
+
+[scenarios.prompt_fake_openai_compat]
+status = "covered"
+surfaces = ["cli", "http", "capsule"]
+auth = ["agent principal with provider capsule grant"]
+success = ["prompt/chat reaches fake OpenAI-compatible streaming path"]
+denial = ["upstream error, malformed SSE, timeout, missing readiness, and same-session peer streams surface bounded or hidden results"]
+state = ["session transcript and fake provider attribution are principal-scoped even when session ids collide"]
+evidence = ["run output, gateway SSE, same-session collision transcripts, and fake-openai request log"]
+
+[scenarios.public_distribution]
+status = "covered"
+surfaces = ["http"]
+auth = ["public"]
+success = ["distribution and onboarding endpoints return configured public metadata"]
+denial = ["not applicable for public discovery reads"]
+state = ["discovery reads are side-effect free"]
+evidence = ["distribution/onboarding artifacts and router tests"]
+
+[scenarios.quota_scope]
+status = "covered"
+surfaces = ["cli", "http", "capability"]
+auth = ["admin/global quota caps or self-scoped quota read"]
+success = ["authorized caller sets/reads expected quota for target principal"]
+denial = ["regular agent cannot read or write another principal's quota"]
+state = ["quota state is principal-scoped and does not cross homes"]
+evidence = ["quota CLI/HTTP artifacts and secondary-home isolation assertions"]
+
+[scenarios.remote_agent_stub]
+status = "covered"
+surfaces = ["cli"]
+auth = ["admin"]
+success = ["remote-agent command parses and reports bounded unsupported/runtime behavior"]
+denial = ["invalid remote identity or missing config is rejected"]
+state = ["no remote-agent state mutates unless feature is live"]
+evidence = ["CLI transcript and explicit TODO/waiver if still unsupported"]
+
+[scenarios.secret_redaction]
+status = "covered"
+surfaces = ["cli"]
+auth = ["principal with effective capsule grant"]
+success = ["secret set/list/delete expose metadata but never secret values"]
+denial = ["caller cannot read or mutate another principal's secret values"]
+state = ["secret value is scoped to principal/capsule and redacted from artifacts"]
+evidence = ["secret list artifacts and redaction scan"]
+
+[scenarios.self_capsule_workspace]
+status = "mapped"
+surfaces = ["capability"]
+auth = ["self-scoped capsule workspace principal"]
+success = ["daemon startup/reload discovers capsules installed in its configured workspace root"]
+denial = ["self-scoped caller cannot mutate daemon install-target or daemon-wide loaded capsule state"]
+state = ["workspace capsule metadata lives under <workspace>/.astrid/capsules"]
+evidence = ["kernel discovery-path regression and daemon lifecycle denial responses"]
+remaining = ["caller-workspace install/reload/remove still needs a first-class workspace target; daemon workspace lifecycle mutation is intentionally global or rejected today"]
+
+[scenarios.self_update_check]
+status = "waived"
+surfaces = ["cli"]
+auth = ["local CLI"]
+success = ["check/dry-run behavior can be asserted"]
+denial = ["install/update apply path is not executed in CI"]
+state = ["runner installation is not mutated"]
+evidence = ["waiver reason and check/dry-run transcript"]
+waiver = "Self-update depends on release network state and mutates the runner."
+
+[scenarios.session_lifecycle]
+status = "covered"
+surfaces = ["cli", "http"]
+auth = ["agent bearer/principal"]
+success = ["list/search/get/update/delete/messages operate only on caller sessions"]
+denial = ["cross-principal same-correlation/session attempts are hidden or ignored"]
+state = ["session metadata/messages are principal-scoped and survive restart"]
+evidence = ["session HTTP artifacts and fake LLM attribution"]
+
+[scenarios.shell_completion_generation]
+status = "covered"
+surfaces = ["cli"]
+auth = ["local CLI"]
+success = ["completion generation emits shell-specific completion text"]
+denial = ["unsupported shell is rejected by clap/value parser"]
+state = ["completion generation is side-effect free"]
+evidence = ["completion transcript"]
+
+[scenarios.system_lifecycle]
+status = "covered"
+surfaces = ["cli", "capability"]
+auth = ["admin/default"]
+success = ["authorized caller can request bounded daemon lifecycle operation"]
+denial = ["non-admin bearer is rejected before lifecycle action"]
+state = ["daemon state changes only in temp runtime"]
+evidence = ["restart persistence transcript and live regular-principal stop denial artifact"]
+
+[scenarios.system_readiness]
+status = "covered"
+surfaces = ["http"]
+auth = ["bearer"]
+success = ["readiness output is filtered by caller's effective capsule surface"]
+denial = ["unauthenticated caller is rejected"]
+state = ["readiness read is side-effect free"]
+evidence = ["readiness artifacts for agent and operator"]
+
+[scenarios.system_status]
+status = "covered"
+surfaces = ["http", "capability"]
+auth = ["bearer with system:status"]
+success = ["grant permits status read"]
+denial = ["regular agent is rejected before grant and after revoke"]
+state = ["status read is side-effect free"]
+evidence = ["status before/after grant/revoke artifacts"]
+
+[scenarios.trust_stub]
+status = "covered"
+surfaces = ["cli"]
+auth = ["admin"]
+success = ["trust command parses and reports bounded unsupported/runtime behavior"]
+denial = ["invalid trust target is rejected"]
+state = ["no trust state mutates unless feature is live"]
+evidence = ["CLI transcript and explicit TODO/waiver if still unsupported"]
+
+[scenarios.version_surface]
+status = "covered"
+surfaces = ["cli"]
+auth = ["local CLI"]
+success = ["version emits stable machine-readable build/version fields"]
+denial = ["not applicable for local version read"]
+state = ["version read is side-effect free"]
+evidence = ["version JSON artifact"]
+
+[scenarios.voucher_stub]
+status = "covered"
+surfaces = ["cli"]
+auth = ["admin"]
+success = ["voucher command parses and reports bounded unsupported/runtime behavior"]
+denial = ["invalid voucher id or missing authority is rejected"]
+state = ["no voucher state mutates unless feature is live"]
+evidence = ["CLI transcript and explicit TODO/waiver if still unsupported"]

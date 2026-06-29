@@ -196,6 +196,7 @@ impl KvStore for SurrealKvStore {
         prefix: &str,
     ) -> StorageResult<Vec<String>> {
         validate_namespace(namespace)?;
+        validate_prefix(prefix)?;
         let start = composite_key(namespace, prefix);
         let end = prefix_range_end(namespace, prefix);
         let prefix_len = namespace.len().saturating_add(1); // namespace + \0
@@ -385,6 +386,46 @@ mod tests {
         store.set("ns1", "b", b"2".to_vec()).await.unwrap();
         store.set("ns2", "c", b"3".to_vec()).await.unwrap();
         let mut keys = store.list_keys("ns1").await.unwrap();
+        keys.sort();
+        assert_eq!(keys, vec!["a", "b"]);
+    }
+
+    #[tokio::test]
+    async fn test_surreal_list_keys_with_prefix() {
+        let (store, _dir) = make_store();
+        store
+            .set("ns1", "session.data.a", b"1".to_vec())
+            .await
+            .unwrap();
+        store
+            .set("ns1", "session.data.b", b"2".to_vec())
+            .await
+            .unwrap();
+        store
+            .set("ns1", "session.meta.c", b"3".to_vec())
+            .await
+            .unwrap();
+        store
+            .set("ns2", "session.data.d", b"4".to_vec())
+            .await
+            .unwrap();
+
+        let mut keys = store
+            .list_keys_with_prefix("ns1", "session.data.")
+            .await
+            .unwrap();
+        keys.sort();
+        assert_eq!(keys, vec!["session.data.a", "session.data.b"]);
+    }
+
+    #[tokio::test]
+    async fn test_surreal_list_keys_with_empty_prefix_lists_namespace() {
+        let (store, _dir) = make_store();
+        store.set("ns1", "a", b"1".to_vec()).await.unwrap();
+        store.set("ns1", "b", b"2".to_vec()).await.unwrap();
+        store.set("ns2", "c", b"3".to_vec()).await.unwrap();
+
+        let mut keys = store.list_keys_with_prefix("ns1", "").await.unwrap();
         keys.sort();
         assert_eq!(keys, vec!["a", "b"]);
     }

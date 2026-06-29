@@ -34,6 +34,13 @@ pub(crate) trait ExecutionEngine: Send + Sync {
     /// Unload the engine (e.g., drop WASM memory or SIGTERM the child process).
     async fn unload(&mut self) -> CapsuleResult<()>;
 
+    /// Request cooperative cancellation of blocking work before exclusive unload.
+    ///
+    /// This is intentionally synchronous and `&self`: callers may still have
+    /// in-flight `Arc` clones that prevent `unload(&mut self)`, but those same
+    /// in-flight tasks need a cancellation signal so they can release the Arc.
+    fn request_cancel(&self) {}
+
     /// Extract the inbound receiver if this engine provides one.
     fn take_inbound_rx(
         &mut self,

@@ -1,0 +1,174 @@
+name: Runtime E2E
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/runtime-e2e.yml'
+      - 'Cargo.lock'
+      - 'Cargo.toml'
+      - 'rust-toolchain.toml'
+      - 'crates/astrid-cli/**'
+      - 'crates/astrid-config/**'
+      - 'crates/astrid-core/**'
+      - 'crates/astrid-daemon/**'
+      - 'crates/astrid-events/**'
+      - 'crates/astrid-gateway/**'
+      - 'crates/astrid-kernel/**'
+      - 'crates/astrid-capsule*/**'
+      - 'crates/astrid-build/**'
+      - 'crates/astrid-storage/**'
+      - 'crates/astrid-types/**'
+      - 'crates/astrid-uplink/**'
+      - 'e2e/**'
+      - 'scripts/e2e/**'
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/runtime-e2e.yml'
+      - 'Cargo.lock'
+      - 'Cargo.toml'
+      - 'rust-toolchain.toml'
+      - 'crates/astrid-cli/**'
+      - 'crates/astrid-config/**'
+      - 'crates/astrid-core/**'
+      - 'crates/astrid-daemon/**'
+      - 'crates/astrid-events/**'
+      - 'crates/astrid-gateway/**'
+      - 'crates/astrid-kernel/**'
+      - 'crates/astrid-capsule*/**'
+      - 'crates/astrid-build/**'
+      - 'crates/astrid-storage/**'
+      - 'crates/astrid-types/**'
+      - 'crates/astrid-uplink/**'
+      - 'e2e/**'
+      - 'scripts/e2e/**'
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  CARGO_PROFILE_DEV_DEBUG: "0"
+  CARGO_PROFILE_TEST_DEBUG: "0"
+
+jobs:
+  runtime-e2e:
+    name: Runtime CLI + HTTP sweep
+    # Platform policy: the full installed-runtime sweep is required on Linux,
+    # where the capsule sandbox and GitHub runner environment are deterministic
+    # enough for the long fake-provider story. macOS runtime confidence comes
+    # from the regular workspace test matrix in ci.yml plus focused diagnostics;
+    # it is not a silent skip of this job.
+    runs-on: ubuntu-latest
+    # Runtime budget: the harness has bounded daemon startup, curl/SSE, fake LLM,
+    # cleanup, and child-process waits. The job-level cap catches any missed
+    # product hang and keeps this workflow eligible for PR gating.
+    timeout-minutes: 45
+    steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
+        with:
+          egress-policy: audit
+
+      - name: Checkout core
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+
+      - name: Checkout capsule-cli
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          repository: unicity-astrid/capsule-cli
+          path: capsules/astrid-capsule-cli
+          ref: a8778156bd301aca646371a463dc8f2dec4b69b6
+
+      - name: Checkout capsule-registry
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          repository: unicity-astrid/capsule-registry
+          path: capsules/astrid-capsule-registry
+          ref: b4e19431bacf94bc2ddbeaaaa1e88f0b95852956
+
+      - name: Checkout capsule-session
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          repository: unicity-astrid/capsule-session
+          path: capsules/astrid-capsule-session
+          ref: 9de9a6e753dc67195250d06b4d96104e56271f23
+
+      - name: Checkout capsule-identity
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          repository: unicity-astrid/capsule-identity
+          path: capsules/astrid-capsule-identity
+          ref: f671b2903c18f9f0a87f535a660d62705b182576
+
+      - name: Checkout capsule-prompt-builder
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          repository: unicity-astrid/capsule-prompt-builder
+          path: capsules/astrid-capsule-prompt-builder
+          ref: 3849cfc22256e7c9f0822ad568352dbda8430020
+
+      - name: Checkout capsule-react
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          repository: unicity-astrid/capsule-react
+          path: capsules/astrid-capsule-react
+          ref: a11af90b4e362f9acec1924e95d0e2af627a5b55
+
+      - name: Checkout capsule-openai-compat
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          repository: unicity-astrid/capsule-openai-compat
+          path: capsules/astrid-capsule-openai-compat
+          ref: 52f2e4bbbb910052d396c319ad59ed6d5ca7f322
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          # MUST match rust-toolchain.toml's channel exactly. rustup treats
+          # "1.95" and "1.95.0" as distinct toolchains, and the target std
+          # must be installed on the toolchain cargo will actually use.
+          toolchain: "1.95.0"
+          targets: wasm32-unknown-unknown
+
+      - name: Cache Rust artifacts
+        uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
+        with:
+          key: ${{ runner.os }}-runtime-e2e-${{ hashFiles('**/Cargo.lock', 'capsules/**/Cargo.lock') }}
+          cache-on-failure: true
+
+      - name: Check first-party capsule command inventory
+        run: |
+          python3 scripts/e2e/check-first-party-capsule-commands.py --self-test
+          python3 scripts/e2e/check-first-party-capsule-commands.py --capsules-dir capsules
+
+      - name: Stage capsule checkouts outside core workspace
+        run: |
+          rm -rf "$RUNNER_TEMP/astrid-runtime-capsules"
+          mkdir -p "$RUNNER_TEMP/astrid-runtime-capsules"
+          cp -a capsules/. "$RUNNER_TEMP/astrid-runtime-capsules/"
+
+      - name: Check CLI inventory coverage
+        run: |
+          cargo test -p astrid e2e_manifest_covers_every_visible_builtin_leaf_command
+          cargo test -p astrid first_party_capsule_manifest_has_executable_scenarios
+
+      - name: Check capability scenario coverage
+        run: cargo test -p astrid-kernel e2e_capability_manifest_covers_catalog
+
+      - name: Check HTTP route coverage
+        run: cargo test -p astrid-gateway openapi_lists_every_router_route
+
+      - name: Run real runtime harness
+        env:
+          ASTRID_E2E_CAPSULES_DIR: ${{ runner.temp }}/astrid-runtime-capsules
+        run: scripts/e2e/runtime-harness.sh
+
+      - name: Upload runtime artifacts
+        if: failure()
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
+        with:
+          name: runtime-e2e-artifacts
+          path: |
+            /tmp/astrid-runtime-e2e.*/artifacts/redacted-upload
+            ${{ runner.temp }}/astrid-runtime-e2e.*/artifacts/redacted-upload
+          if-no-files-found: ignore

@@ -1,3 +1,4 @@
+use arc_swap::ArcSwap;
 use async_trait::async_trait;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -221,15 +222,13 @@ pub struct WasmEngine {
     /// Fail-OPEN on the window math (non-poisoning `parking_lot` + saturating
     /// arithmetic); the orthogonal exemption decision fails CLOSED.
     fuel_rate: crate::FuelRateLimiter,
-    /// Live group config, cached from [`CapsuleContext`] at load time (same
-    /// snapshot the run-loop budget resolution uses).
+    /// Live group config from [`CapsuleContext`].
     ///
-    /// `invoke_interceptor` passes this to [`resolve_exemption`] so the CPU-rate
-    /// deny gate exempts the same capability holders (unbounded / net_bind /
-    /// uplink; admin via `*`) the run-loop bound exempts. `None` in tests /
+    /// `invoke_interceptor` loads this for [`resolve_exemption`] so the CPU-rate
+    /// deny gate observes runtime group mutations. `None` in tests /
     /// single-tenant => no exemption resolvable => the invoking principal is
     /// bounded (fail-secure), but still under the generous default budget.
-    group_config: Option<Arc<astrid_core::GroupConfig>>,
+    group_config: Option<Arc<ArcSwap<astrid_core::GroupConfig>>>,
     /// Host-derived (operator-overridable) concurrency ceilings for this
     /// capsule's host calls. Resolved once by the daemon and handed down the
     /// loader chain like the fuel handles; sizes the per-instance
@@ -1316,9 +1315,13 @@ impl ExecutionEngine for WasmEngine {
                         })
                         .ok()
                 });
+            let load_group_config =
+                crate::context::live_group_config_for(&ctx.group_config)
+                    .map(|groups| groups.load_full())
+                    .or_else(|| ctx.group_config.clone());
             let run_budget = resolve_run_loop_budget(
                 owner_profile.as_deref(),
-                ctx.group_config.as_deref(),
+                load_group_config.as_ref().map(Arc::as_ref),
                 &ctx.principal,
                 has_run_export,
             );
@@ -1355,7 +1358,7 @@ impl ExecutionEngine for WasmEngine {
             // owner principal. See [`resolve_audit_firehose`].
             let audit_firehose = resolve_audit_firehose(
                 owner_profile.as_deref(),
-                ctx.group_config.as_deref(),
+                load_group_config.as_ref().map(Arc::as_ref),
                 &ctx.principal,
             );
 
@@ -1895,11 +1898,16 @@ impl ExecutionEngine for WasmEngine {
         self.profile_cache = ctx.profile_cache.clone();
         self.overlay_registry = ctx.overlay_registry.clone();
         self.owner_principal = Some(ctx.principal.clone());
-        // Cache the live group config so the CPU-rate deny gate can resolve the
-        // invoking principal's exemption (same snapshot the run-loop budget
-        // uses). `None` in tests / single-tenant => no exemption resolvable =>
-        // the principal is bounded (fail-secure).
-        self.group_config = ctx.group_config.clone();
+        // Cache the live group config handle so the CPU-rate deny gate can
+        // resolve the invoking principal's exemption against runtime group
+        // mutations. `None` in tests / single-tenant => no exemption resolvable
+        // => the principal is bounded (fail-secure).
+        self.group_config =
+            crate::context::live_group_config_for(&ctx.group_config).or_else(|| {
+                ctx.group_config
+                    .as_ref()
+                    .map(|groups| Arc::new(ArcSwap::from(Arc::clone(groups))))
+            });
 
         Ok(())
     }
@@ -1926,6 +1934,12 @@ impl ExecutionEngine for WasmEngine {
         self.wasmtime_engine = None;
         self.ready_rx = None; // Prevent stale channel observation post-unload
         Ok(())
+    }
+
+    fn request_cancel(&self) {
+        if let Some(token) = &self.cancel_token {
+            token.cancel();
+        }
     }
 
     async fn wait_ready(&self, timeout: std::time::Duration) -> crate::capsule::ReadyStatus {
@@ -2046,10 +2060,11 @@ impl ExecutionEngine for WasmEngine {
         // see dispatcher.rs). An `Err`-based deny would therefore be a SILENT
         // enforcement BYPASS — the chain would carry on as if nothing happened.
         let now = std::time::Instant::now();
+        let live_group_config = self.group_config.as_ref().map(|groups| groups.load_full());
         if let Some(reason) = cpu_rate_deny(
             &self.fuel_rate,
             invocation_profile.as_deref(),
-            self.group_config.as_deref(),
+            live_group_config.as_ref().map(Arc::as_ref),
             &invoking_principal,
             now,
         ) {
@@ -3200,6 +3215,39 @@ mod tests {
         assert!(
             cpu_rate_deny(&rl, Some(&prof), None, &p, now).is_some(),
             "missing group_config must fail-secure: admin becomes bounded and is denied over budget"
+        );
+    }
+
+    #[test]
+    fn rate_gate_reads_latest_group_config_snapshot() {
+        let live_groups = Arc::new(ArcSwap::from_pointee(builtin_groups()));
+        let rl = crate::FuelRateLimiter::default();
+        let now = std::time::Instant::now();
+        let principal = pid("operator-1");
+        let prof = budgeted_profile(&["ops-team"], &[]);
+        saturate(&rl, &principal, now);
+
+        let before = live_groups.load_full();
+        assert!(
+            cpu_rate_deny(&rl, Some(&prof), Some(before.as_ref()), &principal, now).is_some(),
+            "before the group exists, an over-budget custom-group principal fails closed"
+        );
+
+        let mut updated = builtin_groups();
+        updated.groups.insert(
+            "ops-team".to_owned(),
+            astrid_core::Group {
+                capabilities: vec![astrid_core::CAP_RESOURCES_UNBOUNDED.to_owned()],
+                description: Some("runtime-created ops group".to_owned()),
+                unsafe_admin: false,
+            },
+        );
+        live_groups.store(Arc::new(updated));
+
+        let after = live_groups.load_full();
+        assert!(
+            cpu_rate_deny(&rl, Some(&prof), Some(after.as_ref()), &principal, now).is_none(),
+            "later invocations must observe runtime group config updates"
         );
     }
 
