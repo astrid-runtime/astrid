@@ -64,7 +64,10 @@ try:
         check=False,
     )
 except subprocess.TimeoutExpired as exc:
-    out_path.write_text(exc.stdout or "", encoding="utf-8")
+    stdout = exc.stdout or ""
+    if isinstance(stdout, bytes):
+        stdout = stdout.decode("utf-8", errors="replace")
+    out_path.write_text(stdout, encoding="utf-8")
     raise SystemExit(124) from exc
 
 out_path.write_text(proc.stdout, encoding="utf-8")

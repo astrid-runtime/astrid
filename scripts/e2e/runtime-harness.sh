@@ -71,6 +71,7 @@ trap cleanup EXIT INT TERM
 . "$SCRIPT_DIR/runtime-audit-smoke.sh"
 . "$SCRIPT_DIR/runtime-concurrency-smoke.sh"
 . "$SCRIPT_DIR/runtime-crash-smoke.sh"
+. "$SCRIPT_DIR/runtime-hostcall-cancel-smoke.sh"
 . "$SCRIPT_DIR/runtime-lifecycle-smoke.sh"
 . "$SCRIPT_DIR/runtime-observability-smoke.sh"
 note() { printf '\n==> %s\n' "$*"; }
@@ -134,7 +135,6 @@ capsule_install_body() {
   "$PYTHON" - "$source" <<'PY'
 import json
 import sys
-
 print(json.dumps({"source": sys.argv[1]}))
 PY
 }
@@ -907,7 +907,10 @@ PY
   json_assert_session_messages_empty "$ARTIFACTS/restart-agent-cross-session-messages-empty.json" "$ops_session"
   run_crash_recovery_smoke "$restart_user_bearer" "$ops_bearer" "$user_principal" \
     "$user_session" "$ops_session"
+  backup_adversarial_capsule_install
   run_live_approval_cancel_smoke "$restart_user_bearer" "$user_principal"
+  restore_adversarial_capsule_install "$ops_bearer" "$restart_user_bearer"
+  run_live_elicit_cancel_smoke "$restart_user_bearer" "$user_principal"
 
   note "checking .capsule artifact lifecycle"
   if run_principal_cli "$user_principal" capsule remove astrid-capsule-registry --force; then
