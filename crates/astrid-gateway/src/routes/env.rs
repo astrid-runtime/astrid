@@ -232,13 +232,30 @@ async fn ensure_capsule_visible(
         .request(KernelRequest::GetCapsuleMetadata)
         .await
         .map_err(|e| GatewayError::Internal(anyhow::anyhow!("daemon kernel-request: {e}")))?;
+    ensure_capsule_visible_from_response(resp, caller.principal.as_str(), capsule_id)
+}
+
+fn ensure_capsule_visible_from_response(
+    resp: KernelResponse,
+    caller: &str,
+    capsule_id: &str,
+) -> GatewayResult<()> {
     match resp {
         KernelResponse::CapsuleMetadata(entries) => entries
             .iter()
             .any(|entry| entry.name == capsule_id)
             .then_some(())
             .ok_or(GatewayError::NotFound),
-        KernelResponse::Error(msg) => Err(GatewayError::Forbidden { reason: msg }),
+        KernelResponse::Error(msg) => {
+            tracing::warn!(
+                security_event = true,
+                principal = %caller,
+                capsule = %capsule_id,
+                reason = %msg,
+                "capsule env visibility probe denied; returning hidden not-found"
+            );
+            Err(GatewayError::NotFound)
+        },
         other => Err(GatewayError::Internal(anyhow::anyhow!(
             "unexpected response shape for GetCapsuleMetadata: {other:?}"
         ))),
@@ -517,5 +534,17 @@ mod tests {
         assert_eq!(field_type("model"), "select");
         assert_eq!(field_type("context_window"), "text");
         assert_eq!(field_type("legacy"), "array");
+    }
+
+    #[test]
+    fn denied_capsule_visibility_probe_is_hidden_as_not_found() {
+        let err = ensure_capsule_visible_from_response(
+            KernelResponse::Error("missing self:capsule:list".to_string()),
+            "regular-user",
+            "astrid-capsule-cli",
+        )
+        .expect_err("denied visibility probe should be hidden");
+
+        assert!(matches!(err, GatewayError::NotFound));
     }
 }

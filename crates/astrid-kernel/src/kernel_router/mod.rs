@@ -280,9 +280,10 @@ async fn handle_request(
         },
         KernelRequest::ListCapsules => {
             let reg = kernel.capsules.read().await;
+            let visibility = CapsuleVisibility::new(kernel, &caller);
             let mut list = Vec::new();
             for c in reg.list() {
-                if capsule_visible_to(kernel, &caller, c) {
+                if visibility.allows(c) {
                     list.push(c.to_string());
                 }
             }
@@ -290,9 +291,10 @@ async fn handle_request(
         },
         KernelRequest::GetCommands => {
             let reg = kernel.capsules.read().await;
+            let visibility = CapsuleVisibility::new(kernel, &caller);
             let mut commands = Vec::new();
             for c in reg.values() {
-                if !capsule_visible_to(kernel, &caller, c.id()) {
+                if !visibility.allows(c.id()) {
                     continue;
                 }
                 for cmd in &c.manifest().commands {
@@ -426,9 +428,10 @@ async fn handle_request(
         },
         KernelRequest::GetCapsuleMetadata => {
             let reg = kernel.capsules.read().await;
+            let visibility = CapsuleVisibility::new(kernel, &caller);
             let mut entries = Vec::new();
             for capsule in reg.values() {
-                if !capsule_visible_to(kernel, &caller, capsule.id()) {
+                if !visibility.allows(capsule.id()) {
                     continue;
                 }
                 let manifest = capsule.manifest();
@@ -446,9 +449,10 @@ async fn handle_request(
         },
         KernelRequest::GetAgentReadiness => {
             let reg = kernel.capsules.read().await;
+            let visibility = CapsuleVisibility::new(kernel, &caller);
             let manifests: Vec<&astrid_capsule::manifest::CapsuleManifest> = reg
                 .values()
-                .filter(|capsule| capsule_visible_to(kernel, &caller, capsule.id()))
+                .filter(|capsule| visibility.allows(capsule.id()))
                 .map(astrid_capsule::capsule::Capsule::manifest)
                 .collect();
             let readiness = astrid_capsule::readiness::agent_loop_readiness(&manifests);
@@ -459,16 +463,54 @@ async fn handle_request(
     publish_response(kernel, response_topic, res);
 }
 
-fn capsule_visible_to(
-    kernel: &crate::Kernel,
-    caller: &PrincipalId,
-    capsule_id: &astrid_capsule::capsule::CapsuleId,
-) -> bool {
-    let resolver = astrid_capsule::CapsuleAccessResolver::new(
-        Arc::clone(&kernel.profile_cache),
-        Arc::clone(&kernel.groups),
-    );
-    resolver.is_capsule_allowed(Some(caller.as_str()), capsule_id)
+struct CapsuleVisibility {
+    caller: PrincipalId,
+    profile: Option<Arc<astrid_core::profile::PrincipalProfile>>,
+    groups: Arc<astrid_core::groups::GroupConfig>,
+}
+
+impl CapsuleVisibility {
+    fn new(kernel: &crate::Kernel, caller: &PrincipalId) -> Self {
+        let profile = if caller.as_str() == "anonymous" {
+            None
+        } else {
+            match kernel.profile_cache.resolve(caller) {
+                Ok(profile) => Some(profile),
+                Err(e) => {
+                    warn!(
+                        security_event = true,
+                        principal = %caller,
+                        error = %e,
+                        "Capsule inventory visibility check: profile resolution failed — deny"
+                    );
+                    None
+                },
+            }
+        };
+
+        Self {
+            caller: caller.clone(),
+            profile,
+            groups: kernel.groups.load_full(),
+        }
+    }
+
+    fn allows(&self, capsule_id: &astrid_capsule::capsule::CapsuleId) -> bool {
+        let Some(profile) = &self.profile else {
+            return false;
+        };
+
+        let check =
+            CapabilityCheck::new(profile.as_ref(), self.groups.as_ref(), self.caller.clone());
+        if check.has("*") {
+            return true;
+        }
+
+        profile
+            .capsules
+            .iter()
+            .any(|granted| granted == capsule_id.as_str())
+    }
 }
 
 fn publish_response<R: Serialize>(kernel: &Arc<crate::Kernel>, response_topic: Topic, res: R) {
