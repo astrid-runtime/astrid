@@ -148,7 +148,7 @@ impl elicit::Host for HostState {
         // could answer or cancel another principal's elicit. The kernel
         // enforces (kernel-is-dumb); the answering uplink only stamps the
         // verified principal it already proved.
-        let originating_principal = self.principal.to_string();
+        let originating_principal = self.effective_principal().to_string();
 
         // Subscribe to the response topic BEFORE publishing the request
         // to prevent a race where the response arrives before we're listening.
@@ -157,7 +157,6 @@ impl elicit::Host for HostState {
         let runtime_handle = self.runtime_handle.clone();
         let event_bus = self.event_bus.clone();
         let capsule_id = self.capsule_id.to_string();
-        let secret_store = self.effective_secret_store().clone();
         let cancel_token = self.cancel_token.clone();
         let blocking_semaphore = self.blocking_semaphore.clone();
 
@@ -253,7 +252,7 @@ impl elicit::Host for HostState {
                                 if secret_val.is_empty() {
                                     return Err(ErrorCode::InvalidInput);
                                 }
-                                secret_store
+                                self.effective_secret_store()
                                     .set(&request.key, &secret_val)
                                     .map_err(|_| ErrorCode::StoreUnavailable)?;
                                 ElicitResponse::SecretStored

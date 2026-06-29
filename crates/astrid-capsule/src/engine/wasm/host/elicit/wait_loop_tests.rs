@@ -107,6 +107,46 @@ async fn normal_runtime_cross_principal_reply_does_not_unblock_matching_does() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn runtime_text_elicit_does_not_require_invocation_secret_store() {
+    let rt = tokio::runtime::Handle::current();
+    let mut state = minimal_host_state(rt);
+    state.principal = astrid_core::PrincipalId::default();
+    state.caller_context = Some(
+        IpcMessage::new(
+            Topic::from_raw("cli.v1.command.run.test"),
+            IpcPayload::Connect,
+            Uuid::nil(),
+        )
+        .with_principal("agent-alice"),
+    );
+    state.invocation_secret_store = None;
+    assert!(
+        state.lifecycle_phase.is_none(),
+        "fixture starts outside a lifecycle hook"
+    );
+
+    let bus = state.event_bus.clone();
+    let req_rx = bus.subscribe_topic("astrid.v1.elicit");
+
+    let elicit_handle =
+        tokio::task::spawn_blocking(move || (state.elicit(text_request("api_url")), state));
+
+    let (request_id, req_principal) = await_request(req_rx).await;
+    assert_eq!(
+        req_principal.as_deref(),
+        Some("agent-alice"),
+        "runtime request must be attributed to the invoking principal"
+    );
+    publish_response(&bus, request_id, "agent-alice", "value");
+
+    let (result, _state) = elicit_handle.await.expect("elicit thread joined");
+    assert!(
+        matches!(result, Ok(ElicitResponse::Value(ref v)) if v == "value"),
+        "text elicit should not touch secret storage, got {result:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cancel_token_unblocks_elicit_wait() {
     let rt = tokio::runtime::Handle::current();
     let mut state = minimal_host_state(rt);
