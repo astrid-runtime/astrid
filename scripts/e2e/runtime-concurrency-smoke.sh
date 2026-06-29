@@ -235,6 +235,9 @@ run_concurrent_http_prompt_correlation_smoke() {
   assert_fake_llm_request_model "$ARTIFACTS/fake-openai.jsonl" "$user_prompt" "fake-slow"
   assert_fake_llm_request_model "$ARTIFACTS/fake-openai.jsonl" "$ops_prompt" "fake-toolish"
 
+  run_same_session_http_prompt_collision_smoke "$user_bearer" "$ops_bearer" \
+    "$user_principal" "$ops_principal"
+
   note "checking concurrent HTTP session mutations stay principal-scoped"
   local user_title="regular concurrent session title"
   local ops_title="operator concurrent session title"
@@ -307,6 +310,65 @@ run_concurrent_http_prompt_correlation_smoke() {
   LAST_HTTP_OUT="$ops_final_update_out"
   assert_status "operator owner concurrent session update" "$status" 200
   json_assert_session_summary "$ops_final_update_out" "$ops_session" "$ops_final_title"
+}
+
+run_same_session_http_prompt_collision_smoke() {
+  local user_bearer=$1 ops_bearer=$2 user_principal=$3 ops_principal=$4
+
+  note "checking same-session concurrent HTTP prompt streams stay principal-scoped"
+
+  local shared_session user_prompt ops_prompt
+  shared_session="$("$PYTHON" -c 'import uuid; print(uuid.uuid4())')"
+  user_prompt="ASTRID_E2E_HTTP_SHARED_SESSION_USER_$RANDOM$RANDOM"
+  ops_prompt="ASTRID_E2E_HTTP_SHARED_SESSION_OPS_$RANDOM$RANDOM"
+
+  local user_out="$ARTIFACTS/concurrent-http-shared-session-user.sse"
+  local ops_out="$ARTIFACTS/concurrent-http-shared-session-ops.sse"
+  local user_status="$ARTIFACTS/concurrent-http-shared-session-user.status"
+  local ops_status="$ARTIFACTS/concurrent-http-shared-session-ops.status"
+  local user_pid ops_pid user_wait=0 ops_wait=0
+
+  concurrent_http_prompt "$user_bearer" "$shared_session" "$user_prompt" \
+    "$user_out" "$user_status" &
+  user_pid=$!
+  concurrent_http_prompt "$ops_bearer" "$shared_session" "$ops_prompt" \
+    "$ops_out" "$ops_status" &
+  ops_pid=$!
+
+  wait "$user_pid" || user_wait=$?
+  wait "$ops_pid" || ops_wait=$?
+  [[ "$user_wait" -eq 0 ]] || {
+    cat "$user_out" >&2 || true
+    fail "agent same-session HTTP prompt failed before HTTP status"
+  }
+  [[ "$ops_wait" -eq 0 ]] || {
+    cat "$ops_out" >&2 || true
+    fail "operator same-session HTTP prompt failed before HTTP status"
+  }
+
+  assert_http_prompt_stream agent-same-session "$user_out" "$user_status" "$user_principal" \
+    "$user_prompt" "$ops_prompt"
+  assert_http_prompt_stream operator-same-session "$ops_out" "$ops_status" "$ops_principal" \
+    "-" "$user_prompt"
+  assert_fake_llm_request_model "$ARTIFACTS/fake-openai.jsonl" "$user_prompt" "fake-slow"
+  assert_fake_llm_request_model "$ARTIFACTS/fake-openai.jsonl" "$ops_prompt" "fake-toolish"
+
+  local status
+  status="$(http_status GET "/api/agent/sessions/$shared_session/messages" "$user_bearer" "" \
+    "$ARTIFACTS/concurrent-http-shared-session-user-messages.json")"
+  assert_status "agent same-session transcript" "$status" 200
+  json_assert_session_messages_contains \
+    "$ARTIFACTS/concurrent-http-shared-session-user-messages.json" "$shared_session" "$user_prompt"
+  assert_artifact_lacks_text "$ARTIFACTS/concurrent-http-shared-session-user-messages.json" \
+    "$ops_prompt"
+
+  status="$(http_status GET "/api/agent/sessions/$shared_session/messages" "$ops_bearer" "" \
+    "$ARTIFACTS/concurrent-http-shared-session-ops-messages.json")"
+  assert_status "operator same-session transcript" "$status" 200
+  json_assert_session_messages_contains \
+    "$ARTIFACTS/concurrent-http-shared-session-ops-messages.json" "$shared_session" "$ops_prompt"
+  assert_artifact_lacks_text "$ARTIFACTS/concurrent-http-shared-session-ops-messages.json" \
+    "$user_prompt"
 }
 
 run_concurrent_model_write_smoke() {

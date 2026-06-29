@@ -175,8 +175,8 @@ surfaces = ["cli"]
 auth = ["local CLI"]
 success = ["start is idempotent when the temp daemon is already running, status reports the live daemon"]
 denial = ["regular principal cannot stop the live daemon"]
-state = ["restart persistence and crash recovery keep daemon state deterministic"]
-evidence = ["daemon log, status output, stop-denial artifact, and restart persistence transcript"]
+state = ["restart persistence and crash recovery keep daemon state deterministic with no stale approval/elicit requests"]
+evidence = ["daemon log, status output, stop-denial artifact, request-stream probe, and restart persistence transcript"]
 
 [scenarios.delegation_stub]
 status = "covered"
@@ -392,9 +392,9 @@ status = "covered"
 surfaces = ["cli", "http", "capsule"]
 auth = ["agent principal with provider capsule grant"]
 success = ["prompt/chat reaches fake OpenAI-compatible streaming path"]
-denial = ["upstream error, malformed SSE, timeout, and missing readiness surface bounded errors"]
-state = ["session transcript and fake provider attribution are principal-scoped"]
-evidence = ["run output, gateway SSE, and fake-openai request log"]
+denial = ["upstream error, malformed SSE, timeout, missing readiness, and same-session peer streams surface bounded or hidden results"]
+state = ["session transcript and fake provider attribution are principal-scoped even when session ids collide"]
+evidence = ["run output, gateway SSE, same-session collision transcripts, and fake-openai request log"]
 
 [scenarios.public_distribution]
 status = "covered"

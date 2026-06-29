@@ -225,6 +225,28 @@ run_post_admin_mutation_crash_smoke() {
   json_assert_cli_agent_enabled "$ARTIFACTS/crash-admin-created-agent.json" "$principal" true
 }
 
+assert_no_stale_control_requests_after_crashes() {
+  local bearer=$1
+  local sse="$ARTIFACTS/crash-restart-agent-requests.sse"
+
+  note "checking crash restart has no stale approval or elicit requests"
+  curl --connect-timeout 2 \
+    --max-time 3 \
+    -sS \
+    -N \
+    -H "Authorization: Bearer $bearer" \
+    "$GATEWAY/api/agent/requests" \
+    > "$sse" 2>&1 || true
+  grep -q '^event: ready' "$sse" || {
+    cat "$sse" >&2 || true
+    fail "crash restart request stream did not emit ready event"
+  }
+  if grep -Eq '^event: (approval|elicit)$' "$sse"; then
+    cat "$sse" >&2 || true
+    fail "crash restart exposed stale approval/elicit request"
+  fi
+}
+
 run_crash_recovery_smoke() {
   local user_bearer=$1
   local ops_bearer=$2
@@ -265,4 +287,6 @@ run_crash_recovery_smoke() {
   status="$(http_status GET "/api/agent/sessions/$ops_session" "$user_bearer" "" \
     "$ARTIFACTS/crash-restart-agent-cross-session-get-hidden.json")"
   assert_status "crash restart cross-principal session get hidden" "$status" 404
+
+  assert_no_stale_control_requests_after_crashes "$user_bearer"
 }
