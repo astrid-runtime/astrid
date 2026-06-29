@@ -69,20 +69,26 @@ fn publish_grant_required(kernel: &Kernel, request_id: &str, principal: &str, ca
     });
 }
 
-/// Publish a consent response on the per-request response topic (the
-/// ACL-authorized path the broker/uplink uses).
-fn publish_response(kernel: &Kernel, request_id: &str, decision: &str) {
+/// Publish a consent response on the per-request response topic as a specific
+/// principal (the ACL-authorized path the broker/uplink uses).
+fn publish_response_as(kernel: &Kernel, request_id: &str, principal: &str, decision: &str) {
     let topic = Topic::approval_response(request_id);
     let payload = IpcPayload::ApprovalResponse {
         request_id: request_id.to_string(),
         decision: decision.to_string(),
         reason: None,
     };
-    let message = IpcMessage::new(topic, payload, uuid::Uuid::nil());
+    let message =
+        IpcMessage::new(topic, payload, uuid::Uuid::nil()).with_principal(principal.to_string());
     kernel.event_bus.publish(AstridEvent::Ipc {
         message,
         metadata: EventMetadata::new("test-broker"),
     });
+}
+
+/// Publish a consent response for the common principal used by most tests.
+fn publish_response(kernel: &Kernel, request_id: &str, decision: &str) {
+    publish_response_as(kernel, request_id, "x", decision);
 }
 
 /// Poll the on-disk grant set until it contains `capsule` or the deadline
@@ -266,6 +272,21 @@ async fn grant_lands_on_correlated_principal_only() {
     );
 }
 
+/// SECURITY: a response stamped for a different principal is ignored even if
+/// it has the right request id and an approving decision.
+#[tokio::test]
+async fn cross_principal_response_does_not_grant() {
+    let (_dir, home, kernel) = fixture().await;
+    seed_profile(&home, "x", &[]);
+
+    let rid = "rid-cross-principal";
+    publish_grant_required(&kernel, rid, "x", "cap");
+    settle().await;
+    publish_response_as(&kernel, rid, "y", "approve");
+
+    assert_no_grant(&home, "x", "cap").await;
+}
+
 /// Test #5: SECURITY — the handler reacts ONLY to a correctly-topic'd
 /// `ApprovalResponse` on `astrid.v1.approval.response.<rid>`. A "response"
 /// delivered to a DIFFERENT topic, or a non-`ApprovalResponse` payload on the
@@ -371,7 +392,7 @@ async fn approve_for_nonexistent_principal_does_not_create() {
     let rid = "rid-ghost";
     publish_grant_required(&kernel, rid, "ghost", "cap");
     settle().await;
-    publish_response(&kernel, rid, "approve");
+    publish_response_as(&kernel, rid, "ghost", "approve");
 
     tokio::time::sleep(Duration::from_millis(400)).await;
     let pid = PrincipalId::new("ghost").unwrap();

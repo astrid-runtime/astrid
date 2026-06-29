@@ -31,12 +31,12 @@
 //!
 //! ## Filtering
 //!
-//! Each SSE subscription opens a routed receiver via
-//! [`astrid_events::EventBus::subscribe_topic_routed`]; per-(topic,
-//! principal) DRR fairness and publish-side byte-budget eviction are
-//! enforced by the bus's routing demux. The `session_id` post-receive
-//! filter handles cross-session de-multiplexing within a principal's
-//! stream — session is a payload concern, not a routing concern.
+//! Each SSE subscription opens a principal-scoped routed receiver via
+//! [`astrid_events::EventBus::subscribe_topic_routed_scoped`]; per-(topic,
+//! principal) DRR fairness and publish-side byte-budget eviction are enforced
+//! by the bus's routing demux. The `session_id` post-receive filter handles
+//! cross-session de-multiplexing within a principal's stream — session is a
+//! payload concern, not a routing concern.
 //!
 //! ## Termination
 //!
@@ -252,14 +252,21 @@ pub async fn post_prompt(
     // with a fresh `subscription_rep` (monotonic allocator), so the
     // resulting `RouteKey` is distinct per call even when the
     // `capsule_uuid` argument is shared. Each connection therefore drains
-    // its own routed queue and sees every response (forwarding only its
-    // own, filtered by session_id) regardless of what UUID is passed
+    // its own principal-scoped routed queue and forwards only events that
+    // also match its session_id where the payload carries one, regardless of
+    // what UUID is passed
     // here. A per-connection `Uuid::new_v4()` only relabels this
     // connection's routes; the audit-firehose route (`events.rs`) shares
     // the single `state.gateway_route_uuid` and is just as isolated.
     let conn_route_uuid = Uuid::new_v4();
     let subscribe = |topic: &'static str| {
-        bus.subscribe_topic_routed(conn_route_uuid, topic, "gateway", "gateway::agent_sse")
+        bus.subscribe_topic_routed_scoped(
+            conn_route_uuid,
+            topic,
+            "gateway",
+            "gateway::agent_sse",
+            Some(Some(caller.principal.to_string())),
+        )
     };
     let mut response_rx = subscribe("agent.v1.response");
     let mut delta_rx = subscribe("agent.v1.stream.delta");
@@ -293,7 +300,7 @@ pub async fn post_prompt(
         // without having to peek into the first payload.
         let ready = PromptReady {
             session_id: session_id_for_stream.clone(),
-            principal: principal_str,
+            principal: principal_str.clone(),
         };
         yield Ok::<Event, Infallible>(
             Event::default()
@@ -319,7 +326,7 @@ pub async fn post_prompt(
                 () = tokio::time::sleep(remaining) => break,
                 event = response_rx.recv(None) => {
                     let Some(event) = event else { break };
-                    if let Some(ev) = forward_event(&event, &session_id_for_stream, "response") {
+                    if let Some(ev) = forward_event(&event, &principal_str, &session_id_for_stream, "response") {
                         yield Ok(ev);
                         // `agent.v1.response` is terminal — but only for
                         // OUR session. Close once we've forwarded our own
@@ -334,26 +341,25 @@ pub async fn post_prompt(
                 }
                 event = delta_rx.recv(None) => {
                     let Some(event) = event else { break };
-                    if let Some(ev) = forward_event(&event, &session_id_for_stream, "delta") {
+                    if let Some(ev) = forward_event(&event, &principal_str, &session_id_for_stream, "delta") {
                         yield Ok(ev);
                     }
                 }
                 event = session_rx.recv(None) => {
                     let Some(event) = event else { break };
-                    if let Some(ev) = forward_event(&event, &session_id_for_stream, "session_changed") {
+                    if let Some(ev) = forward_event(&event, &principal_str, &session_id_for_stream, "session_changed") {
                         yield Ok(ev);
                     }
                 }
                 event = elicit_rx.recv(None) => {
                     let Some(event) = event else { break };
-                    // Elicit events don't carry session_id in the
-                    // same shape — forward unconditionally and let
-                    // the client filter. The caller replies out-of-band
-                    // by POSTing the answer (carrying the forwarded
-                    // request_id) to /api/agent/elicit-response; the
-                    // agent's continuation then streams back over this
-                    // same connection.
-                    if let Some(ev) = forward_event(&event, "", "elicit") {
+                    // Elicit events don't carry session_id in the same
+                    // shape, so forwarding is principal-only here. The
+                    // caller replies out-of-band by POSTing the answer
+                    // (carrying the forwarded request_id) to
+                    // /api/agent/elicit-response; the agent's continuation
+                    // then streams back over this same connection.
+                    if let Some(ev) = forward_event(&event, &principal_str, "", "elicit") {
                         yield Ok(ev);
                     }
                 }
@@ -631,18 +637,22 @@ fn unready_payload(report: &AgentLoopReadiness) -> serde_json::Value {
 }
 
 /// Convert an in-bus `AstridEvent::Ipc` into an SSE `Event`, filtering by
-/// `session_id` when the payload carries one. Returns `None` for events
-/// that don't match this session (silent drop — the bus is shared
-/// across every prompt in flight) or events with non-JSON payloads
+/// principal and by `session_id` when the payload carries one. Returns `None`
+/// for events that don't match this caller/session (silent drop — the bus is
+/// shared across every prompt in flight) or events with non-JSON payloads
 /// (defensive).
 fn forward_event(
     event: &Arc<AstridEvent>,
+    principal_filter: &str,
     session_filter: &str,
     sse_name: &'static str,
 ) -> Option<Event> {
     let AstridEvent::Ipc { message, .. } = &**event else {
         return None;
     };
+    if message.principal.as_deref() != Some(principal_filter) {
+        return None;
+    }
     let value = match &message.payload {
         IpcPayload::RawJson(v) => v.clone(),
         _ => serde_json::to_value(&message.payload).ok()?,

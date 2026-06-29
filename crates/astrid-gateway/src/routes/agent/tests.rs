@@ -60,6 +60,73 @@ fn unready_payload_ready_report_reports_no_missing() {
     );
 }
 
+fn ipc_event_for_forwarding(
+    topic: &'static str,
+    principal: &str,
+    payload: serde_json::Value,
+) -> Arc<AstridEvent> {
+    Arc::new(AstridEvent::Ipc {
+        metadata: EventMetadata::new("test::agent-forward"),
+        message: IpcMessage::new(
+            Topic::from_raw(topic),
+            IpcPayload::RawJson(payload),
+            Uuid::nil(),
+        )
+        .with_principal(principal.to_string()),
+    })
+}
+
+#[test]
+fn forward_event_rejects_same_session_wrong_principal() {
+    let event = ipc_event_for_forwarding(
+        "agent.v1.response",
+        "bob",
+        serde_json::json!({
+            "session_id": "session-1",
+            "text": "not alice's response",
+        }),
+    );
+
+    assert!(
+        forward_event(&event, "alice", "session-1", "response").is_none(),
+        "same-session events from a different principal must not be streamed"
+    );
+}
+
+#[test]
+fn forward_event_rejects_wrong_principal_elicit_without_session_filter() {
+    let event = ipc_event_for_forwarding(
+        "astrid.v1.elicit",
+        "bob",
+        serde_json::json!({
+            "request_id": "rid-1",
+            "prompt": "secret question",
+        }),
+    );
+
+    assert!(
+        forward_event(&event, "alice", "", "elicit").is_none(),
+        "elicit events without a session id still need principal isolation"
+    );
+}
+
+#[test]
+fn forward_event_accepts_matching_principal_and_session() {
+    let event = ipc_event_for_forwarding(
+        "agent.v1.stream.delta",
+        "alice",
+        serde_json::json!({
+            "session_id": "session-1",
+            "delta": "hello",
+        }),
+    );
+
+    assert!(
+        forward_event(&event, "alice", "session-1", "delta").is_some(),
+        "matching principal and session events should still stream"
+    );
+}
+
 /// `publish_elicit_response` must publish an `ElicitResponse` onto the
 /// per-request reply topic carrying the `request_id`, the value/values, and
 /// the caller's principal.

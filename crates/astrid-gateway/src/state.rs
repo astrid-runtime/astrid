@@ -396,8 +396,13 @@ impl GatewayState {
                 "gateway is not wired to a live event bus; kernel requests unavailable"
             ))
         })?;
+        let session_id = self.session_id.as_ref().ok_or_else(|| {
+            crate::error::GatewayError::Internal(anyhow::anyhow!(
+                "gateway is not wired to a live kernel session; kernel requests unavailable"
+            ))
+        })?;
         Ok(
-            crate::bus_kernel::BusKernelClient::new(bus, caller.principal.clone())
+            crate::bus_kernel::BusKernelClient::new(bus, caller.principal.clone(), session_id.0)
                 .with_device_key_id(caller.device_key_id.clone()),
         )
     }

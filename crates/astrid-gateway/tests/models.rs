@@ -6,7 +6,7 @@
 //! that replies on the `registry.v1.response.*` topics stamped with the
 //! requesting principal.
 //!
-//! The load-bearing test is `models_principal_isolation`: it proves that a
+//! The key isolation test is `models_principal_isolation`: it proves that a
 //! reply stamped for principal B is NOT observed by a handler invoked as
 //! principal A, because the handler subscribes scoped to
 //! `Some(Some(caller.principal))`. A regression to an unscoped subscription
@@ -29,6 +29,13 @@ use axum::body::{Body, to_bytes};
 use axum::http::{Request, StatusCode, header};
 use tower::ServiceExt;
 use uuid::Uuid;
+
+const REGISTRY_CAPSULE_NAMESPACE: Uuid = Uuid::from_u128(0x310714d5_9c6d_4c94_8187_75258f393bb6);
+const REGISTRY_CAPSULE_ID: &str = "astrid-capsule-registry";
+
+fn registry_source_id() -> Uuid {
+    Uuid::new_v5(&REGISTRY_CAPSULE_NAMESPACE, REGISTRY_CAPSULE_ID.as_bytes())
+}
 
 /// Build a gateway state, optionally wired to a live event bus. The
 /// registry round-trip uses the production `REGISTRY_TIMEOUT` (10s).
@@ -92,7 +99,7 @@ fn spawn_stub_responder(
             let mut resp = IpcMessage::new(
                 Topic::from_raw(response_topic),
                 IpcPayload::RawJson(reply),
-                Uuid::nil(),
+                registry_source_id(),
             );
             // Reply stamped with the requester's principal, as the real
             // registry's own-principal `publish` does for a request whose
@@ -355,7 +362,7 @@ async fn set_active_model_skips_foreign_corr_id_reply() {
                 let mut resp = IpcMessage::new(
                     Topic::from_raw("registry.v1.response.set_active_model"),
                     IpcPayload::RawJson(body),
-                    Uuid::nil(),
+                    registry_source_id(),
                 );
                 if let Some(p) = principal.clone() {
                     resp = resp.with_principal(p);
@@ -539,7 +546,7 @@ async fn models_principal_isolation() {
                 let resp = IpcMessage::new(
                     Topic::from_raw("registry.v1.response.get_active_model"),
                     IpcPayload::RawJson(serde_json::json!({ "id": "bob-only:secret" })),
-                    Uuid::nil(),
+                    registry_source_id(),
                 )
                 .with_principal("bob".to_string());
                 bus.publish(AstridEvent::Ipc {

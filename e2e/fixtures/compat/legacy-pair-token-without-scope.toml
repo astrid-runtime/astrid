@@ -4,4 +4,3 @@ principal = "compat-user"
 expires_at_epoch = 9999999999
 issued_at_epoch = 1
 label = "legacy phone"
-

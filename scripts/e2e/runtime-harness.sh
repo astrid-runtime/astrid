@@ -3,7 +3,7 @@ set -euo pipefail
 CORE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 SCRIPT_DIR="$CORE_DIR/scripts/e2e"
 CAPSULES_DIR="${ASTRID_E2E_CAPSULES_DIR:-$CORE_DIR/../capsules}"
-ASTRID_HOME="${ASTRID_E2E_HOME:-$(mktemp -d "${TMPDIR:-/tmp}/astrid-runtime-e2e.XXXXXX")}"
+ASTRID_HOME_GENERATED=0; if [[ -n "${ASTRID_E2E_HOME:-}" ]]; then ASTRID_HOME="$ASTRID_E2E_HOME"; else ASTRID_HOME="$(mktemp -d "${TMPDIR:-/tmp}/astrid-runtime-e2e.XXXXXX")"; ASTRID_HOME_GENERATED=1; fi
 ARTIFACTS="$ASTRID_HOME/artifacts"
 REDACTED_UPLOAD="$ARTIFACTS/redacted-upload"
 GATEWAY_HOST="${ASTRID_E2E_GATEWAY_HOST:-127.0.0.1}"
@@ -53,7 +53,7 @@ cleanup() {
   elif [[ -n "$POISON_HOME" ]]; then
     printf 'kept poisoned HOME=%s\n' "$POISON_HOME"
   fi
-  if [[ -z "${ASTRID_E2E_KEEP_HOME:-}" && "$status" -eq 0 ]]; then
+  if [[ "$ASTRID_HOME_GENERATED" -eq 1 && -z "${ASTRID_E2E_KEEP_HOME:-}" && "$status" -eq 0 ]]; then
     rm -rf "$ASTRID_HOME"
   else
     printf 'kept ASTRID_HOME=%s\n' "$ASTRID_HOME"

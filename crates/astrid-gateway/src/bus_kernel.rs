@@ -31,17 +31,19 @@ pub struct BusKernelClient {
     bus: Arc<EventBus>,
     caller: PrincipalId,
     device_key_id: Option<String>,
+    expected_source_id: Uuid,
     timeout: Duration,
 }
 
 impl BusKernelClient {
     /// Build a client bound to `caller`.
     #[must_use]
-    pub fn new(bus: Arc<EventBus>, caller: PrincipalId) -> Self {
+    pub fn new(bus: Arc<EventBus>, caller: PrincipalId, expected_source_id: Uuid) -> Self {
         Self {
             bus,
             caller,
             device_key_id: None,
+            expected_source_id,
             timeout: DEFAULT_TIMEOUT,
         }
     }
@@ -110,6 +112,9 @@ impl BusKernelClient {
             if message.topic != want_response {
                 continue;
             }
+            if message.source_id != self.expected_source_id {
+                continue;
+            }
             if let Some(resp) = extract_kernel_response(&message.payload) {
                 return Ok(resp);
             }
@@ -156,6 +161,53 @@ fn extract_kernel_response(payload: &IpcPayload) -> Option<KernelResponse> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn request_ignores_wrong_source_kernel_response() {
+        let bus = Arc::new(EventBus::new());
+        let expected_source = Uuid::from_u128(0x1111);
+        let caller = PrincipalId::new("alice").expect("valid principal");
+        let client = BusKernelClient::new(Arc::clone(&bus), caller, expected_source)
+            .with_timeout(Duration::from_millis(150));
+
+        let mut request_rx = bus.subscribe_topic_as("astrid.v1.kernel.request.status.*", "test");
+        let bus_bg = Arc::clone(&bus);
+        tokio::spawn(async move {
+            let event = request_rx.recv().await.expect("request published");
+            let AstridEvent::Ipc { message, .. } = &*event else {
+                panic!("expected IPC request");
+            };
+            let response_topic = Topic::kernel_response(
+                message
+                    .topic
+                    .as_str()
+                    .strip_prefix("astrid.v1.kernel.request.")
+                    .expect("kernel request topic suffix"),
+            );
+            let payload = serde_json::to_value(KernelResponse::Success(serde_json::json!({
+                "forged": true,
+            })))
+            .expect("response serializes");
+            let forged = IpcMessage::new(
+                response_topic,
+                IpcPayload::RawJson(payload),
+                Uuid::from_u128(0x2222),
+            );
+            bus_bg.publish(AstridEvent::Ipc {
+                metadata: EventMetadata::new("test::forged-kernel"),
+                message: forged,
+            });
+        });
+
+        let err = client
+            .request(KernelRequest::GetStatus)
+            .await
+            .expect_err("wrong-source kernel response must be ignored");
+        assert!(
+            err.to_string().contains("timed out"),
+            "unexpected error: {err:#}"
+        );
+    }
 
     #[test]
     fn request_message_stamps_gateway_origin_principal_and_device_key() {

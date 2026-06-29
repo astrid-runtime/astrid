@@ -24,10 +24,8 @@ import sys
 data = json.load(open(sys.argv[1], encoding="utf-8"))
 principal = sys.argv[2]
 principals = [entry["principal"] for entry in data.get("principals", [])]
-if principal not in principals:
-    raise SystemExit(f"{principal} missing from principal list: {principals}")
-if "default" in principals and principal != "default":
-    raise SystemExit(f"non-admin principal saw default in principal list: {principals}")
+if principals != [principal]:
+    raise SystemExit(f"expected only {principal!r} in principal list, got {principals!r}")
 PY
 }
 

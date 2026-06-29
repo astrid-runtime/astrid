@@ -5,24 +5,42 @@ on:
     branches: [main]
     paths:
       - '.github/workflows/runtime-e2e.yml'
+      - 'Cargo.lock'
+      - 'Cargo.toml'
+      - 'rust-toolchain.toml'
       - 'crates/astrid-cli/**'
+      - 'crates/astrid-config/**'
+      - 'crates/astrid-core/**'
       - 'crates/astrid-daemon/**'
+      - 'crates/astrid-events/**'
       - 'crates/astrid-gateway/**'
       - 'crates/astrid-kernel/**'
       - 'crates/astrid-capsule*/**'
       - 'crates/astrid-build/**'
+      - 'crates/astrid-storage/**'
+      - 'crates/astrid-types/**'
+      - 'crates/astrid-uplink/**'
       - 'e2e/**'
       - 'scripts/e2e/**'
   pull_request:
     branches: [main]
     paths:
       - '.github/workflows/runtime-e2e.yml'
+      - 'Cargo.lock'
+      - 'Cargo.toml'
+      - 'rust-toolchain.toml'
       - 'crates/astrid-cli/**'
+      - 'crates/astrid-config/**'
+      - 'crates/astrid-core/**'
       - 'crates/astrid-daemon/**'
+      - 'crates/astrid-events/**'
       - 'crates/astrid-gateway/**'
       - 'crates/astrid-kernel/**'
       - 'crates/astrid-capsule*/**'
       - 'crates/astrid-build/**'
+      - 'crates/astrid-storage/**'
+      - 'crates/astrid-types/**'
+      - 'crates/astrid-uplink/**'
       - 'e2e/**'
       - 'scripts/e2e/**'
 
@@ -59,42 +77,49 @@ jobs:
         with:
           repository: unicity-astrid/capsule-cli
           path: capsules/astrid-capsule-cli
+          ref: a8778156bd301aca646371a463dc8f2dec4b69b6
 
       - name: Checkout capsule-registry
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
           repository: unicity-astrid/capsule-registry
           path: capsules/astrid-capsule-registry
+          ref: b4e19431bacf94bc2ddbeaaaa1e88f0b95852956
 
       - name: Checkout capsule-session
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
           repository: unicity-astrid/capsule-session
           path: capsules/astrid-capsule-session
+          ref: 9de9a6e753dc67195250d06b4d96104e56271f23
 
       - name: Checkout capsule-identity
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
           repository: unicity-astrid/capsule-identity
           path: capsules/astrid-capsule-identity
+          ref: f671b2903c18f9f0a87f535a660d62705b182576
 
       - name: Checkout capsule-prompt-builder
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
           repository: unicity-astrid/capsule-prompt-builder
           path: capsules/astrid-capsule-prompt-builder
+          ref: 3849cfc22256e7c9f0822ad568352dbda8430020
 
       - name: Checkout capsule-react
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
           repository: unicity-astrid/capsule-react
           path: capsules/astrid-capsule-react
+          ref: a11af90b4e362f9acec1924e95d0e2af627a5b55
 
       - name: Checkout capsule-openai-compat
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
           repository: unicity-astrid/capsule-openai-compat
           path: capsules/astrid-capsule-openai-compat
+          ref: 52f2e4bbbb910052d396c319ad59ed6d5ca7f322
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
@@ -110,6 +135,9 @@ jobs:
         with:
           key: ${{ runner.os }}-runtime-e2e-${{ hashFiles('**/Cargo.lock', 'capsules/**/Cargo.lock') }}
           cache-on-failure: true
+
+      - name: Check first-party capsule command inventory
+        run: python3 scripts/e2e/check-first-party-capsule-commands.py --capsules-dir capsules
 
       - name: Stage capsule checkouts outside core workspace
         run: |
