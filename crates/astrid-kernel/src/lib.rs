@@ -645,7 +645,9 @@ impl Kernel {
         Ok(())
     }
 
-    /// Auto-discover and load all capsules from the standard directories (`~/.astrid/capsules` and `.astrid/capsules`).
+    /// Auto-discover and load all capsules from the standard directories:
+    /// the default principal install dir and the daemon workspace's
+    /// `.astrid/capsules` dir.
     ///
     /// Capsules are loaded in dependency order (topological sort) with
     /// uplink/daemon capsules loaded first. Each uplink must signal
@@ -655,14 +657,8 @@ impl Kernel {
     /// capsule's KV namespace and the `astrid.v1.capsules_loaded` event is published.
     pub async fn load_all_capsules(&self) {
         use astrid_capsule::toposort::toposort_manifests;
-        use astrid_core::dirs::AstridHome;
 
-        // Discovery paths in priority order: principal > workspace.
-        let mut paths = Vec::new();
-        if let Ok(home) = AstridHome::resolve() {
-            let principal = astrid_core::PrincipalId::default();
-            paths.push(home.principal_home(&principal).capsules_dir());
-        }
+        let paths = capsule_discovery_paths(&self.astrid_home, &self.workspace_root);
 
         let discovered = astrid_capsule::discovery::discover_manifests(Some(&paths));
 
@@ -1856,6 +1852,18 @@ fn spawn_react_watchdog(event_bus: Arc<EventBus>) -> tokio::task::JoinHandle<()>
     })
 }
 
+fn capsule_discovery_paths(
+    home: &astrid_core::dirs::AstridHome,
+    workspace_root: &Path,
+) -> Vec<PathBuf> {
+    let principal = PrincipalId::default();
+    let workspace = astrid_core::dirs::WorkspaceDir::from_path(workspace_root);
+    vec![
+        home.principal_home(&principal).capsules_dir(),
+        workspace.capsules_dir(),
+    ]
+}
+
 // ---------------------------------------------------------------------------
 // Boot validation
 // ---------------------------------------------------------------------------
@@ -2399,6 +2407,23 @@ mod tests {
         fn request_cancel(&self) {
             self.cancelled.store(true, Ordering::Relaxed);
         }
+    }
+
+    #[test]
+    fn capsule_discovery_paths_include_workspace_capsules() {
+        let (_d, home) = scratch_home();
+        let workspace = tempfile::tempdir().unwrap();
+        let paths = capsule_discovery_paths(&home, workspace.path());
+        let default = astrid_core::PrincipalId::default();
+
+        assert_eq!(
+            paths,
+            vec![
+                home.principal_home(&default).capsules_dir(),
+                workspace.path().join(".astrid").join("capsules"),
+            ],
+            "daemon discovery must scan the default install dir and the configured workspace"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]

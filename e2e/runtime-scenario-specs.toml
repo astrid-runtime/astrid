@@ -436,11 +436,11 @@ evidence = ["secret list artifacts and redaction scan"]
 status = "mapped"
 surfaces = ["capability"]
 auth = ["self-scoped capsule workspace principal"]
-success = ["future caller-workspace install/reload/remove applies only to that caller workspace"]
+success = ["daemon startup/reload discovers capsules installed in its configured workspace root"]
 denial = ["self-scoped caller cannot mutate daemon install-target or daemon-wide loaded capsule state"]
-state = ["workspace capsule metadata remains caller-scoped"]
-evidence = ["workspace install/reload/remove artifacts and denial responses"]
-remaining = ["caller-workspace capsule lifecycle needs a first-class workspace target; daemon workspace install/reload/remove is intentionally global or rejected today"]
+state = ["workspace capsule metadata lives under <workspace>/.astrid/capsules"]
+evidence = ["kernel discovery-path regression and daemon lifecycle denial responses"]
+remaining = ["caller-workspace install/reload/remove still needs a first-class workspace target; daemon workspace lifecycle mutation is intentionally global or rejected today"]
 
 [scenarios.self_update_check]
 status = "waived"
