@@ -620,7 +620,7 @@ async fn seed_capsule_inventory_profile(
         let hash = astrid_capsule::registry::WasmHash::synthetic(capsule, "0.0.1");
         if reg.get_for(principal, &id).is_none() {
             reg.register_for(
-                Box::new(InventoryCapsule::new(capsule, "test-command")),
+                Box::new(InventoryCapsule::new(capsule, &format!("{capsule}-cmd"))),
                 hash,
                 principal,
             )
