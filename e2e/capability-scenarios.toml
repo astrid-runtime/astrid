@@ -241,9 +241,8 @@ deny = ["regular agent sees only own audit entries"]
 
 [capabilities."self:approval:respond"]
 scenario = "approval_flow"
-status = "covered"
-allow = ["principal can answer its own approval request"]
-deny = ["different principal cannot answer or cancel the request"]
+status = "waived"
+waiver = "HTTP approval/elicit response routes are bearer-authenticated and same-principal waiter-enforced, not static capability gates; the legacy kernel ApproveCapability mapping is covered by unit tests"
 
 [capabilities."self:auth:pair"]
 scenario = "pair_device_lifecycle"

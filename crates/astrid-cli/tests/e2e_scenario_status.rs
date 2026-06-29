@@ -207,6 +207,49 @@ fn surface_manifests_reference_declared_runtime_scenarios() {
     );
 }
 
+#[test]
+fn bearer_only_approval_responses_do_not_claim_static_capability_coverage() {
+    let http_src = include_str!("../../../e2e/http-scenarios.toml");
+    let http: toml::Value = toml::from_str(http_src).expect("http-scenarios.toml parses");
+    let routes = http
+        .get("routes")
+        .and_then(toml::Value::as_table)
+        .expect("http-scenarios.toml must contain [routes]");
+
+    for route in [
+        "POST /api/agent/approval-response",
+        "POST /api/agent/elicit-response",
+    ] {
+        let auth = routes
+            .get(route)
+            .and_then(toml::Value::as_table)
+            .and_then(|table| table.get("auth"))
+            .and_then(toml::Value::as_str)
+            .unwrap_or_else(|| panic!("HTTP route {route:?} needs auth"));
+        assert_eq!(
+            auth, "bearer",
+            "HTTP route {route:?} changed auth; revisit self:approval:respond coverage"
+        );
+    }
+
+    let capabilities_src = include_str!("../../../e2e/capability-scenarios.toml");
+    let capabilities: toml::Value =
+        toml::from_str(capabilities_src).expect("capability-scenarios.toml parses");
+    let status = capabilities
+        .get("capabilities")
+        .and_then(toml::Value::as_table)
+        .and_then(|capabilities| capabilities.get("self:approval:respond"))
+        .and_then(toml::Value::as_table)
+        .and_then(|table| table.get("status"))
+        .and_then(toml::Value::as_str)
+        .expect("self:approval:respond capability row needs status");
+
+    assert_eq!(
+        status, "waived",
+        "bearer-only approval response routes must not be counted as static self:approval:respond coverage"
+    );
+}
+
 #[derive(Debug)]
 struct ScenarioReference {
     manifest: &'static str,
