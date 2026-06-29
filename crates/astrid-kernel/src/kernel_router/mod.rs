@@ -279,8 +279,8 @@ async fn handle_request(
             KernelResponse::Error("Approval logic not yet implemented in kernel router".to_string())
         },
         KernelRequest::ListCapsules => {
-            let reg = kernel.capsules.read().await;
             let visibility = CapsuleVisibility::new(kernel, &caller);
+            let reg = kernel.capsules.read().await;
             let mut list = Vec::new();
             for c in reg.list() {
                 if visibility.allows(c) {
@@ -290,8 +290,8 @@ async fn handle_request(
             KernelResponse::Success(serde_json::json!(list))
         },
         KernelRequest::GetCommands => {
-            let reg = kernel.capsules.read().await;
             let visibility = CapsuleVisibility::new(kernel, &caller);
+            let reg = kernel.capsules.read().await;
             let mut commands = Vec::new();
             for c in reg.values() {
                 if !visibility.allows(c.id()) {
@@ -427,8 +427,8 @@ async fn handle_request(
             KernelResponse::Status(status)
         },
         KernelRequest::GetCapsuleMetadata => {
-            let reg = kernel.capsules.read().await;
             let visibility = CapsuleVisibility::new(kernel, &caller);
+            let reg = kernel.capsules.read().await;
             let mut entries = Vec::new();
             for capsule in reg.values() {
                 if !visibility.allows(capsule.id()) {
@@ -448,8 +448,8 @@ async fn handle_request(
             KernelResponse::CapsuleMetadata(entries)
         },
         KernelRequest::GetAgentReadiness => {
-            let reg = kernel.capsules.read().await;
             let visibility = CapsuleVisibility::new(kernel, &caller);
+            let reg = kernel.capsules.read().await;
             let manifests: Vec<&astrid_capsule::manifest::CapsuleManifest> = reg
                 .values()
                 .filter(|capsule| visibility.allows(capsule.id()))
