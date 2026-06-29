@@ -106,6 +106,7 @@ pub struct InstallRequest {
     responses(
         (status = 200, body = CapsuleListResponse, description = "Loaded capsule ids."),
         (status = 401, body = ErrorBody),
+        (status = 403, body = ErrorBody, description = "Kernel denied capsule inventory listing."),
     )
 )]
 pub async fn list_capsules(
@@ -402,7 +403,7 @@ pub async fn get_capsule(
                 })
             })
             .ok_or(GatewayError::NotFound),
-        KernelResponse::Error(msg) => Err(GatewayError::Forbidden { reason: msg }),
+        KernelResponse::Error(msg) => hidden_capsule_detail_denial(&caller.principal, &id, &msg),
         other => Err(internal(format!(
             "unexpected response shape for GetCapsuleMetadata: {other:?}"
         ))),
@@ -451,6 +452,21 @@ fn internal(msg: String) -> GatewayError {
     GatewayError::Internal(anyhow::anyhow!(msg))
 }
 
+fn hidden_capsule_detail_denial(
+    caller: &astrid_core::PrincipalId,
+    capsule_id: &str,
+    reason: &str,
+) -> GatewayResult<Json<CapsuleDetail>> {
+    tracing::warn!(
+        security_event = true,
+        principal = %caller,
+        capsule = %capsule_id,
+        reason = %reason,
+        "capsule detail visibility probe denied; returning hidden not-found"
+    );
+    Err(GatewayError::NotFound)
+}
+
 /// Map a non-success GitHub HTTP status to a gateway error. A `404` is a
 /// genuine "not found" (no release for the repo, or the asset vanished
 /// between listing and download); anything else is an upstream failure
@@ -495,6 +511,19 @@ mod tests {
             github_http_error(reqwest::StatusCode::INTERNAL_SERVER_ERROR, "x"),
             GatewayError::Internal(_)
         ));
+    }
+
+    #[test]
+    fn denied_capsule_detail_probe_is_hidden_as_not_found() {
+        let caller = astrid_core::PrincipalId::new("regular-user").unwrap();
+        let err = hidden_capsule_detail_denial(
+            &caller,
+            "astrid-capsule-cli",
+            "missing self:capsule:list",
+        )
+        .expect_err("denied detail probe should be hidden");
+
+        assert!(matches!(err, GatewayError::NotFound));
     }
 
     /// Only `https://github.com/…` asset URLs are fetched; any other
