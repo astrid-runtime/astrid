@@ -473,17 +473,13 @@ impl Kernel {
         let wasm_hash = capsule_instance_hash(&manifest, &dir);
 
         // Skip only if this principal already has the capsule in its view.
-        // If another principal has the same hash, reuse that instance instead
-        // of compiling/loading a second engine.
+        // The installed artifact is content-addressed by hash on disk, but the
+        // loaded runtime owns principal-bound env/KV host state and must not be
+        // shared across principal views.
         {
-            let mut registry = self.capsules.write().await;
+            let registry = self.capsules.read().await;
             if registry.get_for(principal, &id).is_some() {
                 return Ok(());
-            }
-            if registry.contains_hash(&wasm_hash) {
-                return registry
-                    .register_existing(&id, &wasm_hash, principal)
-                    .map_err(|e| anyhow::anyhow!("Failed to register shared capsule view: {e}"));
             }
         }
 
@@ -549,15 +545,29 @@ impl Kernel {
         // Hand this capsule its operator-approved local-egress allowlist (if
         // any) so the SSRF airlock can exempt sanctioned loopback/private
         // endpoints for it. Absent entry = empty = no exemptions.
-        .with_local_egress(self.local_egress.get(&capsule_name).cloned().unwrap_or_default())
-        .with_wasm_hash(wasm_hash.clone());
+        .with_local_egress(self.local_egress.get(&capsule_name).cloned().unwrap_or_default());
 
         capsule.load(&ctx).await?;
 
-        let mut registry = self.capsules.write().await;
-        registry
-            .register_for(capsule, wasm_hash, principal)
-            .map_err(|e| anyhow::anyhow!("Failed to register capsule: {e}"))?;
+        {
+            let mut registry = self.capsules.write().await;
+            if registry.get_for(principal, &id).is_some() {
+                drop(registry);
+                capsule.request_cancel();
+                if let Err(e) = capsule.unload().await {
+                    tracing::warn!(
+                        capsule_id = %id,
+                        principal = %principal,
+                        error = %e,
+                        "Redundant capsule unload failed after concurrent load"
+                    );
+                }
+                return Ok(());
+            }
+            registry
+                .register_for(capsule, wasm_hash, principal)
+                .map_err(|e| anyhow::anyhow!("Failed to register capsule: {e}"))?;
+        }
 
         Ok(())
     }
@@ -588,13 +598,11 @@ impl Kernel {
         // Unregister and explicitly unload. There is no Drop impl that
         // calls unload() (it's async), so we must do it here to avoid
         // leaking MCP subprocesses and other engine resources.
-        let (old_capsule, retained_by_view) = {
+        let old_capsule = {
             let mut registry = self.capsules.write().await;
-            let old = registry
+            registry
                 .unregister_for(principal, id)
-                .map_err(|e| anyhow::anyhow!("failed to unregister capsule '{id}': {e}"))?;
-            let retained = registry.any_principal_with(id).is_some();
-            (old, retained)
+                .map_err(|e| anyhow::anyhow!("failed to unregister capsule '{id}': {e}"))?
         };
         // Explicitly unload the old capsule. There is no Drop impl that
         // calls unload() (it's async), so we must do it here to avoid
@@ -602,37 +610,30 @@ impl Kernel {
         // Arc::get_mut requires exclusive ownership (strong_count == 1).
         {
             let mut old = old_capsule;
-            if retained_by_view {
-                tracing::debug!(
+            old.request_cancel();
+            let mut unloaded = false;
+            for retry in 0..20_u32 {
+                if let Some(capsule) = std::sync::Arc::get_mut(&mut old) {
+                    if let Err(e) = capsule.unload().await {
+                        tracing::warn!(
+                            capsule_id = %id,
+                            error = %e,
+                            "Capsule unload failed during restart"
+                        );
+                    }
+                    unloaded = true;
+                    break;
+                }
+                if retry < 19 {
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                }
+            }
+            if !unloaded {
+                tracing::warn!(
                     capsule_id = %id,
-                    "Capsule instance retained during restart — still referenced by another principal's view"
+                    strong_count = std::sync::Arc::strong_count(&old),
+                    "Cannot call unload during restart - Arc still held by in-flight task"
                 );
-            } else {
-                old.request_cancel();
-                let mut unloaded = false;
-                for retry in 0..20_u32 {
-                    if let Some(capsule) = std::sync::Arc::get_mut(&mut old) {
-                        if let Err(e) = capsule.unload().await {
-                            tracing::warn!(
-                                capsule_id = %id,
-                                error = %e,
-                                "Capsule unload failed during restart"
-                            );
-                        }
-                        unloaded = true;
-                        break;
-                    }
-                    if retry < 19 {
-                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                    }
-                }
-                if !unloaded {
-                    tracing::warn!(
-                        capsule_id = %id,
-                        strong_count = std::sync::Arc::strong_count(&old),
-                        "Cannot call unload during restart - Arc still held by in-flight task"
-                    );
-                }
             }
         }
 
@@ -669,8 +670,9 @@ impl Kernel {
     /// Auto-discover and load capsule views for known principals.
     ///
     /// The default principal is loaded eagerly, then every principal with a
-    /// profile on disk gets its own view. Content-identical capsules dedupe to
-    /// one runtime instance; default's capsule set is never copied into another
+    /// profile on disk gets its own view. Content-identical capsules reuse the
+    /// same installed artifact on disk, but loaded runtime instances remain
+    /// principal-scoped; default's capsule set is never copied into another
     /// principal's view.
     pub async fn load_all_capsules(&self) {
         self.ensure_principal_loaded(&PrincipalId::default()).await;
@@ -956,14 +958,13 @@ impl Kernel {
         principal: &PrincipalId,
     ) -> Result<bool, anyhow::Error> {
         // Unregister only from this principal's view. The content-addressed
-        // instance remains loaded while any other principal still references it.
-        let (old_capsule, retained_by_view) = {
+        // artifact may be installed for other principals, but loaded runtime
+        // instances own principal-bound env/KV state and are unloaded per
+        // principal.
+        let old_capsule = {
             let mut registry = self.capsules.write().await;
             match registry.unregister_for(principal, id) {
-                Ok(capsule) => {
-                    let retained = registry.any_principal_with(id).is_some();
-                    (capsule, retained)
-                },
+                Ok(capsule) => capsule,
                 Err(astrid_capsule::error::CapsuleError::NotFound(_)) => return Ok(false),
                 Err(e) => {
                     return Err(anyhow::anyhow!("failed to unregister capsule '{id}': {e}"));
@@ -977,37 +978,30 @@ impl Kernel {
         // exclusive ownership (strong_count == 1).
         {
             let mut old = old_capsule;
-            if retained_by_view {
-                tracing::debug!(
+            old.request_cancel();
+            let mut unloaded = false;
+            for retry in 0..20_u32 {
+                if let Some(capsule) = std::sync::Arc::get_mut(&mut old) {
+                    if let Err(e) = capsule.unload().await {
+                        tracing::warn!(
+                            capsule_id = %id,
+                            error = %e,
+                            "Capsule unload failed during unload request"
+                        );
+                    }
+                    unloaded = true;
+                    break;
+                }
+                if retry < 19 {
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                }
+            }
+            if !unloaded {
+                tracing::warn!(
                     capsule_id = %id,
-                    "Capsule instance retained — still referenced by another principal's view"
+                    strong_count = std::sync::Arc::strong_count(&old),
+                    "Cannot call unload - Arc still held by in-flight task"
                 );
-            } else {
-                old.request_cancel();
-                let mut unloaded = false;
-                for retry in 0..20_u32 {
-                    if let Some(capsule) = std::sync::Arc::get_mut(&mut old) {
-                        if let Err(e) = capsule.unload().await {
-                            tracing::warn!(
-                                capsule_id = %id,
-                                error = %e,
-                                "Capsule unload failed during unload request"
-                            );
-                        }
-                        unloaded = true;
-                        break;
-                    }
-                    if retry < 19 {
-                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                    }
-                }
-                if !unloaded {
-                    tracing::warn!(
-                        capsule_id = %id,
-                        strong_count = std::sync::Arc::strong_count(&old),
-                        "Cannot call unload - Arc still held by in-flight task"
-                    );
-                }
             }
         }
 
@@ -2548,15 +2542,17 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn unload_one_principal_retains_shared_capsule_instance() {
+    async fn unload_one_principal_retains_other_principal_runtime() {
         let (_d, home) = scratch_home();
         let kernel = test_kernel_with_home(home).await;
         let id = CapsuleId::new("shared-test").unwrap();
         let alice = PrincipalId::new("alice").unwrap();
         let bob = PrincipalId::new("bob").unwrap();
         let hash = astrid_capsule::registry::WasmHash::from_raw("shared-test-hash");
-        let cancelled = Arc::new(AtomicBool::new(false));
-        let unloaded = Arc::new(AtomicBool::new(false));
+        let alice_cancelled = Arc::new(AtomicBool::new(false));
+        let alice_unloaded = Arc::new(AtomicBool::new(false));
+        let bob_cancelled = Arc::new(AtomicBool::new(false));
+        let bob_unloaded = Arc::new(AtomicBool::new(false));
 
         {
             let mut registry = kernel.capsules.write().await;
@@ -2565,25 +2561,44 @@ mod tests {
                     Box::new(CancellableTestCapsule {
                         id: id.clone(),
                         manifest: CapsuleManifest::default(),
-                        cancelled: Arc::clone(&cancelled),
-                        unloaded: Arc::clone(&unloaded),
+                        cancelled: Arc::clone(&alice_cancelled),
+                        unloaded: Arc::clone(&alice_unloaded),
                     }),
                     hash.clone(),
                     &alice,
                 )
                 .unwrap();
-            registry.register_existing(&id, &hash, &bob).unwrap();
+            registry
+                .register_for(
+                    Box::new(CancellableTestCapsule {
+                        id: id.clone(),
+                        manifest: CapsuleManifest::default(),
+                        cancelled: Arc::clone(&bob_cancelled),
+                        unloaded: Arc::clone(&bob_unloaded),
+                    }),
+                    hash,
+                    &bob,
+                )
+                .unwrap();
         }
 
         let removed = kernel.unload_one_capsule(&id, &alice).await.unwrap();
         assert!(removed);
         assert!(
-            !cancelled.load(Ordering::Relaxed),
-            "removing one view must not cancel a shared instance"
+            alice_cancelled.load(Ordering::Relaxed),
+            "removing one principal's runtime must request cancellation for that runtime"
         );
         assert!(
-            !unloaded.load(Ordering::Relaxed),
-            "removing one view must not unload a shared instance"
+            alice_unloaded.load(Ordering::Relaxed),
+            "removing one principal's runtime must unload that runtime"
+        );
+        assert!(
+            !bob_cancelled.load(Ordering::Relaxed),
+            "removing Alice's runtime must not cancel Bob's runtime"
+        );
+        assert!(
+            !bob_unloaded.load(Ordering::Relaxed),
+            "removing Alice's runtime must not unload Bob's runtime"
         );
 
         let registry = kernel.capsules.read().await;
@@ -2593,7 +2608,7 @@ mod tests {
         );
         assert!(
             registry.get_for(&bob, &id).is_some(),
-            "bob's view should retain the shared instance"
+            "bob's view should retain its own runtime"
         );
     }
 

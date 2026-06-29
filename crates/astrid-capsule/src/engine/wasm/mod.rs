@@ -1046,20 +1046,21 @@ impl ExecutionEngine for WasmEngine {
             wasm_config.insert(key, serde_json::Value::String(val));
         }
 
-        let wasm_hash = ctx.wasm_hash.clone().unwrap_or_else(|| {
-            crate::registry::WasmHash::synthetic(
-                &self.manifest.package.name,
-                &self.manifest.package.version,
-            )
-        });
+        let wasm_hash = read_expected_wasm_hash(&self._capsule_dir)
+            .map(crate::registry::WasmHash::from_raw)
+            .unwrap_or_else(|| {
+                crate::registry::WasmHash::synthetic(
+                    &self.manifest.package.name,
+                    &self.manifest.package.version,
+                )
+            });
 
         // Capsule identity, used as the IPC `source_id` (kernel-stamped, never
         // guest-settable) and the per-(capsule, topic, principal) route key.
-        // DETERMINISTIC (uuid v5 from capsule name + content hash) so it is
-        // STABLE across daemon restarts and shared by principals that point at
-        // the same instance. The hash segment is critical: two principals may
-        // run different versions of the same package name, and those instances
-        // must not collide in source provenance.
+        // DETERMINISTIC (uuid v5 from principal + capsule name + content hash)
+        // so it is STABLE across daemon restarts. The principal segment is
+        // critical because the loaded runtime owns principal-bound env/KV host
+        // state even when the installed artifact hash is identical.
         //
         // Namespace is a dedicated, fixed Astrid value — NOT `Uuid::NAMESPACE_OID`
         // (reserved for ISO OIDs), so a capsule-name-derived id can never
@@ -1068,7 +1069,12 @@ impl ExecutionEngine for WasmEngine {
         // it must never change.
         const CAPSULE_ID_NAMESPACE: uuid::Uuid =
             uuid::Uuid::from_u128(0x310714d5_9c6d_4c94_8187_75258f393bb6);
-        let capsule_uuid_seed = format!("{}\0{}", self.manifest.package.name, wasm_hash.as_str());
+        let capsule_uuid_seed = format!(
+            "{}\0{}\0{}",
+            ctx.principal,
+            self.manifest.package.name,
+            wasm_hash.as_str()
+        );
         let capsule_uuid = uuid::Uuid::new_v5(&CAPSULE_ID_NAMESPACE, capsule_uuid_seed.as_bytes());
 
         // Create shared concurrency controls before entering the blocking
@@ -1780,7 +1786,7 @@ impl ExecutionEngine for WasmEngine {
             registry
                 .write()
                 .await
-                .register_uuid(capsule_uuid, wasm_hash);
+                .register_uuid_for(capsule_uuid, wasm_hash, &ctx.principal);
         }
 
         // Register topic schemas unconditionally — schema_catalog is always

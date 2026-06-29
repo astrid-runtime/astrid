@@ -619,8 +619,12 @@ async fn seed_capsule_inventory_profile(
         let id = CapsuleId::new(*capsule).expect("valid capsule id");
         let hash = astrid_capsule::registry::WasmHash::synthetic(capsule, "0.0.1");
         if reg.get_for(principal, &id).is_none() {
-            reg.register_existing(&id, &hash, principal)
-                .expect("seed capsule view");
+            reg.register_for(
+                Box::new(InventoryCapsule::new(capsule, "test-command")),
+                hash,
+                principal,
+            )
+            .expect("seed capsule view");
         }
     }
 }

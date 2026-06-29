@@ -2,11 +2,10 @@
 //!
 //! Manages loaded capsule instances and principal-scoped capsule views.
 //!
-//! Instances are content-addressed: one loaded [`Capsule`] is stored for a
-//! given WASM hash, and any number of principals may point their local
-//! `capsule-id -> hash` view at that same instance. Visibility and dispatch
-//! decisions resolve through the caller's view; RAM-heavy runtime state is
-//! still shared when the underlying bytes are identical.
+//! Runtime instances are principal-scoped. The installed artifact remains
+//! content-addressed by WASM hash on disk, but a loaded [`Capsule`] owns
+//! principal-bound host state such as KV and resolved env, so it cannot be
+//! shared across principal views.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -64,20 +63,36 @@ struct InstanceEntry {
     refcount: usize,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct InstanceKey {
+    principal: PrincipalId,
+    hash: WasmHash,
+}
+
+impl InstanceKey {
+    fn new(principal: &PrincipalId, hash: &WasmHash) -> Self {
+        Self {
+            principal: principal.clone(),
+            hash: hash.clone(),
+        }
+    }
+}
+
 /// Registry of loaded capsules.
 ///
-/// Stores distinct capsule binaries by content hash and exposes per-principal
-/// views of those instances. A principal can only resolve capsules present in
-/// its view; daemon-health operations can still inspect the global instance set.
+/// Stores principal-bound runtime instances by `(principal, content hash)` and
+/// exposes per-principal views of those instances. A principal can only resolve
+/// capsules present in its view; daemon-health operations can still inspect the
+/// global instance set.
 pub struct CapsuleRegistry {
-    instances: HashMap<WasmHash, InstanceEntry>,
+    instances: HashMap<InstanceKey, InstanceEntry>,
     views: HashMap<PrincipalId, HashMap<CapsuleId, WasmHash>>,
     uplinks: HashMap<UplinkId, (CapsuleId, UplinkDescriptor)>,
-    /// Reverse map from WASM session UUIDs to instance hashes.
+    /// Reverse map from WASM session UUIDs to runtime instance keys.
     ///
     /// Populated during capsule load so that host functions can resolve
     /// an IPC `source_id` back to the originating loaded instance.
-    uuid_map: HashMap<Uuid, WasmHash>,
+    uuid_map: HashMap<Uuid, InstanceKey>,
 }
 
 impl CapsuleRegistry {
@@ -127,13 +142,20 @@ impl CapsuleRegistry {
             )));
         }
 
-        if let Some(entry) = self.instances.get_mut(&hash) {
+        let key = InstanceKey::new(principal, &hash);
+        if let Some(entry) = self.instances.get_mut(&key) {
+            if entry.capsule.id() != &id {
+                return Err(CapsuleError::UnsupportedEntryPoint(format!(
+                    "Content hash {hash} is already registered for capsule {}",
+                    entry.capsule.id()
+                )));
+            }
             entry.refcount += 1;
             self.views
                 .entry(principal.clone())
                 .or_default()
                 .insert(id.clone(), hash);
-            info!(capsule_id = %id, principal = %principal, "Registered capsule view (shared instance)");
+            info!(capsule_id = %id, principal = %principal, "Registered capsule view (existing principal instance)");
             return Ok(());
         }
 
@@ -164,7 +186,7 @@ impl CapsuleRegistry {
 
         info!(capsule_id = %id, principal = %principal, hash = %hash, "Registered capsule instance");
         self.instances.insert(
-            hash.clone(),
+            key,
             InstanceEntry {
                 capsule,
                 refcount: 1,
@@ -198,10 +220,17 @@ impl CapsuleRegistry {
                 "Already registered: {id}"
             )));
         }
+        let key = InstanceKey::new(principal, hash);
         let entry = self
             .instances
-            .get_mut(hash)
+            .get_mut(&key)
             .ok_or_else(|| CapsuleError::NotFound(format!("instance {hash}")))?;
+        if entry.capsule.id() != id {
+            return Err(CapsuleError::UnsupportedEntryPoint(format!(
+                "Content hash {hash} is registered for capsule {}",
+                entry.capsule.id()
+            )));
+        }
         entry.refcount += 1;
         self.views
             .entry(principal.clone())
@@ -237,18 +266,20 @@ impl CapsuleRegistry {
             self.views.remove(principal);
         }
 
+        let key = InstanceKey::new(principal, &hash);
         let entry = self
             .instances
-            .get_mut(&hash)
+            .get_mut(&key)
             .expect("principal view referenced missing capsule instance");
         entry.refcount = entry.refcount.saturating_sub(1);
         let capsule = Arc::clone(&entry.capsule);
 
         if entry.refcount == 0 {
-            self.instances.remove(&hash);
-            self.unregister_capsule_uplinks(id);
-            self.uuid_map
-                .retain(|_, instance_hash| instance_hash != &hash);
+            self.instances.remove(&key);
+            if self.any_principal_with(id).is_none() {
+                self.unregister_capsule_uplinks(id);
+            }
+            self.uuid_map.retain(|_, instance_key| instance_key != &key);
             info!(capsule_id = %id, principal = %principal, hash = %hash, "Unregistered capsule instance");
         } else {
             info!(capsule_id = %id, principal = %principal, hash = %hash, refcount = entry.refcount, "Unregistered capsule view");
@@ -269,27 +300,40 @@ impl CapsuleRegistry {
     /// Silently overwrites on duplicate UUID. Each capsule load generates a
     /// fresh v4 UUID, so collisions are not practically possible.
     pub fn register_uuid(&mut self, uuid: Uuid, hash: WasmHash) {
+        self.register_uuid_for(uuid, hash, &PrincipalId::default());
+    }
+
+    /// Register a session UUID for a principal-scoped capsule runtime instance.
+    pub fn register_uuid_for(&mut self, uuid: Uuid, hash: WasmHash, principal: &PrincipalId) {
         debug!(
             %uuid,
             hash = %hash,
+            principal = %principal,
             "Registered capsule UUID mapping"
         );
-        self.uuid_map.insert(uuid, hash);
+        self.uuid_map
+            .insert(uuid, InstanceKey::new(principal, &hash));
     }
 
     /// Look up a capsule instance by its session UUID.
     #[must_use]
     pub fn find_instance_by_uuid(&self, uuid: &Uuid) -> Option<Arc<dyn Capsule>> {
-        let hash = self.uuid_map.get(uuid)?;
+        let key = self.uuid_map.get(uuid)?;
         self.instances
-            .get(hash)
+            .get(key)
             .map(|entry| Arc::clone(&entry.capsule))
+    }
+
+    /// Look up a capsule instance by its session UUID.
+    #[must_use]
+    pub fn find_by_uuid(&self, uuid: &Uuid) -> Option<Arc<dyn Capsule>> {
+        self.find_instance_by_uuid(uuid)
     }
 
     /// Whether this content-addressed instance is already loaded.
     #[must_use]
     pub fn contains_hash(&self, hash: &WasmHash) -> bool {
-        self.instances.contains_key(hash)
+        self.instances.keys().any(|key| &key.hash == hash)
     }
 
     /// Get a shared reference to a capsule by ID.
@@ -308,18 +352,20 @@ impl CapsuleRegistry {
     #[must_use]
     pub fn get_for(&self, principal: &PrincipalId, id: &CapsuleId) -> Option<Arc<dyn Capsule>> {
         let hash = self.views.get(principal)?.get(id)?;
+        let key = InstanceKey::new(principal, hash);
         self.instances
-            .get(hash)
+            .get(&key)
             .map(|entry| Arc::clone(&entry.capsule))
     }
 
     /// Get a capsule from any principal view.
     #[must_use]
     pub fn get_any(&self, id: &CapsuleId) -> Option<Arc<dyn Capsule>> {
-        self.views.values().find_map(|view| {
+        self.views.iter().find_map(|(principal, view)| {
             let hash = view.get(id)?;
+            let key = InstanceKey::new(principal, hash);
             self.instances
-                .get(hash)
+                .get(&key)
                 .map(|entry| Arc::clone(&entry.capsule))
         })
     }
@@ -386,8 +432,9 @@ impl CapsuleRegistry {
         self.views.get(principal).map_or_else(Vec::new, |view| {
             view.values()
                 .filter_map(|hash| {
+                    let key = InstanceKey::new(principal, hash);
                     self.instances
-                        .get(hash)
+                        .get(&key)
                         .map(|entry| Arc::clone(&entry.capsule))
                 })
                 .collect()
@@ -409,7 +456,13 @@ impl CapsuleRegistry {
     /// Number of principal views that reference `hash`.
     #[must_use]
     pub fn refcount_for_hash(&self, hash: &WasmHash) -> Option<usize> {
-        self.instances.get(hash).map(|entry| entry.refcount)
+        let count = self
+            .instances
+            .iter()
+            .filter(|(key, _)| &key.hash == hash)
+            .map(|(_, entry)| entry.refcount)
+            .sum();
+        (count > 0).then_some(count)
     }
 
     // -----------------------------------------------------------------
@@ -736,7 +789,7 @@ mod tests {
     }
 
     #[test]
-    fn same_hash_shared_across_principal_views() {
+    fn same_hash_reuses_artifact_but_isolates_runtime_instances() {
         let mut registry = CapsuleRegistry::new();
         let hash = test_hash("same-wasm-hash");
         let id = CapsuleId::from_static("shared-capsule");
@@ -751,17 +804,21 @@ mod tests {
             )
             .expect("register alice");
         registry
-            .register_existing(&id, &hash, &bob)
-            .expect("register bob view");
+            .register_for(
+                Box::new(MockCapsule::new("shared-capsule")),
+                hash.clone(),
+                &bob,
+            )
+            .expect("register bob");
 
         let alice_capsule = registry.get_for(&alice, &id).expect("alice sees capsule");
         let bob_capsule = registry.get_for(&bob, &id).expect("bob sees capsule");
         assert!(
-            Arc::ptr_eq(&alice_capsule, &bob_capsule),
-            "same content hash must reuse one loaded capsule instance"
+            !Arc::ptr_eq(&alice_capsule, &bob_capsule),
+            "same content hash must not share principal-bound runtime state"
         );
         assert_eq!(registry.refcount_for_hash(&hash), Some(2));
-        assert_eq!(registry.len(), 1, "one runtime instance for one hash");
+        assert_eq!(registry.len(), 2, "one runtime instance per principal");
     }
 
     #[test]
@@ -780,7 +837,11 @@ mod tests {
             )
             .expect("register alice");
         registry
-            .register_existing(&id, &hash, &bob)
+            .register_for(
+                Box::new(MockCapsule::new("shared-capsule")),
+                hash.clone(),
+                &bob,
+            )
             .expect("register bob");
 
         let removed = registry
@@ -793,7 +854,7 @@ mod tests {
         );
         assert!(
             registry.get_for(&bob, &id).is_some(),
-            "bob's view still references the shared instance"
+            "bob's view still references its own runtime instance"
         );
         assert_eq!(registry.refcount_for_hash(&hash), Some(1));
     }

@@ -36,9 +36,12 @@ use tracing::{debug, warn};
 
 use crate::access::CapsuleAccessResolver;
 use crate::capsule::{Capsule, CapsuleId};
+use crate::dispatcher::locks::{ChainLocks, acquire_chain_lock};
 use crate::registry::CapsuleRegistry;
 use astrid_events::PrincipalKey;
 use astrid_events::{AstridEvent, EventBus, EventReceiver};
+
+mod locks;
 
 /// Capacity of each per-(capsule, principal) event dispatch queue.
 ///
@@ -85,88 +88,6 @@ fn idle_consumer_grace() -> Duration {
 #[cfg(test)]
 pub(crate) fn set_idle_consumer_grace_for_test(ms: u64) {
     IDLE_CONSUMER_GRACE_MS.store(ms, std::sync::atomic::Ordering::Relaxed);
-}
-
-/// Shared map of per-(capsule, principal) chain mutexes. One
-/// `Arc<tokio::sync::Mutex<()>>` per `(CapsuleId, PrincipalKey)` so
-/// chain dispatches for the same key serialize FIFO while distinct
-/// keys (including distinct principals within the same class) run
-/// concurrently. Held across the chain task's lifetime in
-/// `dispatch_to_capsule_queues`.
-type ChainLocks =
-    Arc<parking_lot::RwLock<HashMap<(CapsuleId, PrincipalKey), Arc<tokio::sync::Mutex<()>>>>>;
-
-/// RAII chain-lock lease that prunes its `ChainLocks` map entry on drop
-/// when it was the last referrer.
-///
-/// Without this, the map gains an entry per `(capsule, principal)` on first
-/// use and never sheds it — ephemeral recursive sub-agents (high principal
-/// churn) would grow it unboundedly, unlike `capsule_queues` which idle-evicts
-/// (Gemini #828). The acquire path stays race-safe: a concurrent acquirer that
-/// raced the removal simply re-inserts via `or_insert_with`, so a pruned-then-
-/// reused key costs one extra allocation, never a correctness loss.
-struct ChainLockGuard {
-    /// The held mutex guard. Dropped FIRST in [`Drop`] so the mutex is free
-    /// before we inspect the Arc's strong count.
-    ///
-    /// `Option` so `drop` can take it and release the lock explicitly before
-    /// taking the map's write lock.
-    guard: Option<tokio::sync::OwnedMutexGuard<()>>,
-    /// Our own clone of the per-key mutex `Arc`. With `guard` dropped, this is
-    /// the only referrer outside the map, so `strong_count == 2` (map + this)
-    /// proves no other chain task holds the lock and the entry can be pruned.
-    mutex: Arc<tokio::sync::Mutex<()>>,
-    chain_locks: ChainLocks,
-    key: (CapsuleId, PrincipalKey),
-}
-
-impl Drop for ChainLockGuard {
-    fn drop(&mut self) {
-        // Release the lock first so the strong-count check below sees only
-        // map + `self.mutex` referrers (the `OwnedMutexGuard` holds its own
-        // internal `Arc` clone, which must be gone before we count).
-        self.guard.take();
-        let mut write = self.chain_locks.write();
-        // Re-fetch under the write lock: a concurrent acquirer may have
-        // replaced the entry after a previous prune, so only remove the
-        // exact Arc we hold, and only when we are its last non-map referrer.
-        if let Some(entry) = write.get(&self.key)
-            && Arc::ptr_eq(entry, &self.mutex)
-            && Arc::strong_count(entry) == 2
-        {
-            write.remove(&self.key);
-        }
-    }
-}
-
-/// Acquire the per-(capsule, principal) chain lock, returning a guard that
-/// prunes the map entry on drop. Read-fast / write-on-miss: the common case
-/// is a hit on an existing lock.
-async fn acquire_chain_lock(
-    chain_locks: &ChainLocks,
-    key: (CapsuleId, PrincipalKey),
-) -> ChainLockGuard {
-    let mutex = {
-        let read = chain_locks.read();
-        if let Some(m) = read.get(&key) {
-            Arc::clone(m)
-        } else {
-            drop(read);
-            let mut write = chain_locks.write();
-            Arc::clone(
-                write
-                    .entry(key.clone())
-                    .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))),
-            )
-        }
-    };
-    let guard = Arc::clone(&mutex).lock_owned().await;
-    ChainLockGuard {
-        guard: Some(guard),
-        mutex,
-        chain_locks: Arc::clone(chain_locks),
-        key,
-    }
 }
 
 /// Shared map of per-(capsule, principal) dispatcher mpsc senders.

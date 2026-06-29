@@ -68,9 +68,12 @@ pub mod principal_introspection;
 pub mod wasm;
 pub mod wit;
 
-pub use archive::unpack_and_install;
+pub use archive::{unpack_and_install, unpack_and_install_for_principal};
 pub use copy::copy_capsule_dir;
-pub use local::{InstallOptions, InstallOutput, InstallPhase, install_from_local_path};
+pub use local::{
+    InstallOptions, InstallOutput, InstallPhase, install_from_local_path,
+    install_from_local_path_for_principal,
+};
 pub use manifest_check::{ExportConflict, MissingImport, check_export_conflicts, validate_imports};
 pub use meta::{
     CapsuleLocation, CapsuleMeta, InstalledCapsule, read_meta, scan_installed_capsules, write_meta,

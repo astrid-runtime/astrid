@@ -14,7 +14,7 @@ use astrid_storage::ScopedKvStore;
 use astrid_core::session_token::SessionToken;
 
 use crate::profile_cache::PrincipalProfileCache;
-use crate::registry::{CapsuleRegistry, WasmHash};
+use crate::registry::CapsuleRegistry;
 use crate::schema_catalog::SchemaCatalog;
 
 static LIVE_GROUP_CONFIGS: LazyLock<Mutex<Vec<LiveGroupConfigEntry>>> =
@@ -114,14 +114,6 @@ pub struct CapsuleContext {
     /// only. Empty = no exemptions (fail-closed). Operator config — never
     /// settable by the capsule's own (untrusted) manifest.
     pub local_egress: Vec<String>,
-    /// Content hash for this loaded instance.
-    ///
-    /// The kernel resolves this from installed `meta.json` and threads it into
-    /// load so UUID provenance can resolve to the same content-addressed
-    /// instance key used by the registry view. Tests and compatibility callers
-    /// may leave it unset; the engine synthesizes a stable key from package
-    /// name/version in that case.
-    pub wasm_hash: Option<WasmHash>,
 }
 
 impl CapsuleContext {
@@ -150,7 +142,6 @@ impl CapsuleContext {
             overlay_registry: None,
             group_config: None,
             local_egress: Vec::new(),
-            wasm_hash: None,
         }
     }
 
@@ -220,13 +211,6 @@ impl CapsuleContext {
     #[must_use]
     pub fn with_local_egress(mut self, allowlist: Vec<String>) -> Self {
         self.local_egress = allowlist;
-        self
-    }
-
-    /// Set the content hash for this capsule instance.
-    #[must_use]
-    pub fn with_wasm_hash(mut self, hash: WasmHash) -> Self {
-        self.wasm_hash = Some(hash);
         self
     }
 }

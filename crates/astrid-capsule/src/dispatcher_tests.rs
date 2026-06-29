@@ -1042,10 +1042,12 @@ mod access_enforcement {
         registry
             .register_for(Box::new(capsule), hash.clone(), &first_pid)
             .unwrap();
-        let id = CapsuleId::from_static(capsule_name);
         for principal in &principals[1..] {
             let pid = PrincipalId::new(*principal).expect("valid principal");
-            registry.register_existing(&id, &hash, &pid).unwrap();
+            let (capsule, _) = MockCapsule::new(capsule_name, interceptor_event);
+            registry
+                .register_for(Box::new(capsule), hash.clone(), &pid)
+                .unwrap();
         }
         let registry = Arc::new(RwLock::new(registry));
         let bus = Arc::new(EventBus::with_capacity(64));

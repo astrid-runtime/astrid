@@ -81,7 +81,6 @@ pub(super) async fn handle_install_capsule(
         // on install-time elicit must be configured via env before
         // being installed through this path.
         lifecycle_bus: None,
-        target_principal: Some(caller.clone()),
     };
 
     let is_archive = path.is_file()
@@ -93,15 +92,17 @@ pub(super) async fn handle_install_capsule(
     let install_result = if is_archive {
         let p = path.clone();
         let h = home.clone();
+        let principal = caller.clone();
         tokio::task::spawn_blocking(move || {
-            astrid_capsule_install::unpack_and_install(&p, &h, opts)
+            astrid_capsule_install::unpack_and_install_for_principal(&p, &h, opts, &principal)
         })
         .await
     } else if path.is_dir() {
         let p = path.clone();
         let h = home.clone();
+        let principal = caller.clone();
         tokio::task::spawn_blocking(move || {
-            astrid_capsule_install::install_from_local_path(&p, &h, opts)
+            astrid_capsule_install::install_from_local_path_for_principal(&p, &h, opts, &principal)
         })
         .await
     } else {

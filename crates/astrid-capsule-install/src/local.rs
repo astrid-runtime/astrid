@@ -69,11 +69,6 @@ pub struct InstallOptions {
     /// kernel-side handler passes `None` — no human at the daemon end
     /// to answer prompts.
     pub lifecycle_bus: Option<EventBus>,
-    /// Principal whose home receives the install when `workspace = false`.
-    ///
-    /// `None` preserves CLI compatibility by targeting the default install
-    /// principal. Kernel-side installs pass the authenticated caller.
-    pub target_principal: Option<PrincipalId>,
 }
 
 /// What an install produced.
@@ -149,6 +144,22 @@ pub fn install_from_local_path(
     home: &AstridHome,
     options: InstallOptions,
 ) -> anyhow::Result<InstallOutput> {
+    install_from_local_path_for_principal(
+        source_dir,
+        home,
+        options,
+        &crate::paths::install_principal(),
+    )
+}
+
+/// Install a capsule for an explicit principal.
+#[allow(clippy::needless_pass_by_value, clippy::too_many_lines)]
+pub fn install_from_local_path_for_principal(
+    source_dir: &Path,
+    home: &AstridHome,
+    options: InstallOptions,
+    target_principal: &PrincipalId,
+) -> anyhow::Result<InstallOutput> {
     let manifest_path = source_dir.join("Capsule.toml");
     if !manifest_path.exists() {
         bail!("No Capsule.toml found in {}", source_dir.display());
@@ -156,17 +167,13 @@ pub fn install_from_local_path(
     let manifest = load_manifest(&manifest_path).context("failed to load Capsule manifest")?;
     let id = manifest.package.name.clone();
     let installed_version = manifest.package.version.clone();
-    let target_principal = options
-        .target_principal
-        .clone()
-        .unwrap_or_else(crate::paths::install_principal);
 
     // Pre-flight checks — pure reads, no target mutation.
     let export_conflicts = check_export_conflicts(&manifest)?;
 
     // Resolve target. The parent must exist before we attempt the
     // backup-rename later; create it now.
-    let target_dir = resolve_target_dir_for(home, &target_principal, &id, options.workspace)?;
+    let target_dir = resolve_target_dir_for(home, target_principal, &id, options.workspace)?;
     let parent = target_dir.parent().context("target dir has no parent")?;
     std::fs::create_dir_all(parent)
         .with_context(|| format!("failed to create {}", parent.display()))?;
@@ -215,7 +222,7 @@ pub fn install_from_local_path(
 
     // Preserve existing .env.json (user configuration survives reinstall).
     if let Some(ref backup) = backup_dir {
-        restore_env_from_backup_for(home, &target_principal, backup, &id);
+        restore_env_from_backup_for(home, target_principal, backup, &id);
     }
 
     // Lifecycle hook — bytes from the content store, not the target.
@@ -265,7 +272,7 @@ pub fn install_from_local_path(
     // any VFS scheme a capsule can reach. Best-effort: the capsule is
     // already installed and committed, so a mirror failure must not roll
     // it back. It degrades introspection visibility, not the install.
-    if let Err(e) = materialize_wit_mirror(home, &target_principal, &meta.wit_files) {
+    if let Err(e) = materialize_wit_mirror(home, target_principal, &meta.wit_files) {
         tracing::warn!(
             capsule = %id,
             error = %format!("{e:#}"),
@@ -274,7 +281,7 @@ pub fn install_from_local_path(
     }
 
     // Determine env-prompt signal for the caller.
-    let env_path = resolve_env_path_for(home, &target_principal, &id)?;
+    let env_path = resolve_env_path_for(home, target_principal, &id)?;
     let env_needs_prompt = !manifest.env.is_empty() && !env_path.exists();
 
     let missing_imports = if options.skip_import_check {
