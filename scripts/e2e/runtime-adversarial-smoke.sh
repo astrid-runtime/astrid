@@ -188,6 +188,18 @@ for key, value in expected.items():
 PY
 }
 
+quota_request_body_with_principal() {
+  local file=$1 processes=$2 principal=$3
+  "$PYTHON" - "$file" "$processes" "$principal" <<'PY'
+import json
+import sys
+
+quotas = json.load(open(sys.argv[1], encoding="utf-8"))
+quotas["max_background_processes"] = int(sys.argv[2])
+print(json.dumps({"quotas": quotas, "principal": sys.argv[3]}, separators=(",", ":")))
+PY
+}
+
 assert_no_adversarial_session_poison() {
   local path=$1
   if grep -q "ASTRID_ADVERSARIAL_POISON_SESSION" "$path"; then
@@ -784,6 +796,65 @@ run_adversarial_principal_smoke() {
   status="$(http_status GET /api/sys/principals/InvalidPrincipalId "$user_bearer" "" \
     "$ARTIFACTS/adversarial-principal-invalid-id.json")"
   assert_status "invalid principal id hidden with bounded error" "$status" 404
+
+  run_adversarial_principal_postcondition_smoke "$user_bearer" "$user_principal" \
+    "$ops_principal" "$admin_bearer"
+}
+
+run_adversarial_principal_postcondition_smoke() {
+  local user_bearer=$1
+  local user_principal=$2
+  local ops_principal=$3
+  local admin_bearer=$4
+  local status body
+
+  note "checking spoofed principal fields cannot mutate foreign env or quota state"
+
+  status="$(http_status POST "/api/capsules/astrid-capsule-openai-compat/env/model?principal=$ops_principal" \
+    "$user_bearer" \
+    "{\"value\":\"fake-spoof-query\",\"principal\":\"$ops_principal\"}" \
+    "$ARTIFACTS/adversarial-env-query-body-spoof.json")"
+  assert_status "agent env query and body principal spoof ignored" "$status" 204
+  json_assert_capsule_env_models "$ASTRID_HOME" astrid-capsule-openai-compat default \
+    "$user_principal" "$ops_principal" fake-echo fake-spoof-query fake-toolish
+  status="$(http_status POST /api/capsules/astrid-capsule-openai-compat/env/model "$user_bearer" \
+    '{"value":"fake-slow"}' \
+    "$ARTIFACTS/adversarial-env-query-body-spoof-restore.json")"
+  assert_status "agent env restore after query and body spoof" "$status" 204
+  json_assert_capsule_env_models "$ASTRID_HOME" astrid-capsule-openai-compat default \
+    "$user_principal" "$ops_principal" fake-echo fake-slow fake-toolish
+
+  status="$(http_status GET "/api/sys/principals/$ops_principal/quotas" "$admin_bearer" "" \
+    "$ARTIFACTS/adversarial-ops-quota-before-spoof.json")"
+  assert_status "operator quota read before spoof" "$status" 200
+  body="$(quota_request_body "$ARTIFACTS/adversarial-ops-quota-before-spoof.json" 8)"
+  status="$(http_status PUT "/api/sys/principals/$ops_principal/quotas" "$admin_bearer" "$body" \
+    "$ARTIFACTS/adversarial-ops-quota-prime.json")"
+  assert_status "admin primes operator quota before spoof" "$status" 200
+  status="$(http_status GET "/api/sys/principals/$user_principal/quotas" "$user_bearer" "" \
+    "$ARTIFACTS/adversarial-user-quota-before-spoof.json")"
+  assert_status "agent quota read before spoof" "$status" 200
+  body="$(quota_request_body_with_principal "$ARTIFACTS/adversarial-user-quota-before-spoof.json" 7 "$ops_principal")"
+  status="$(http_status PUT "/api/sys/principals/$user_principal/quotas?principal=$ops_principal" \
+    "$user_bearer" "$body" "$ARTIFACTS/adversarial-quota-query-body-spoof.json")"
+  assert_status "agent quota query and body principal spoof only touches caller path" "$status" 200
+  status="$(http_status GET "/api/sys/principals/$user_principal/quotas" "$user_bearer" "" \
+    "$ARTIFACTS/adversarial-user-quota-after-spoof.json")"
+  assert_status "agent quota read after spoof" "$status" 200
+  json_assert_field_equals "$ARTIFACTS/adversarial-user-quota-after-spoof.json" max_background_processes 7
+  status="$(http_status GET "/api/sys/principals/$ops_principal/quotas" "$admin_bearer" "" \
+    "$ARTIFACTS/adversarial-ops-quota-after-spoof.json")"
+  assert_status "operator quota read after spoof" "$status" 200
+  json_assert_field_equals "$ARTIFACTS/adversarial-ops-quota-after-spoof.json" max_background_processes 8
+  body="$(quota_request_body "$ARTIFACTS/adversarial-user-quota-before-spoof.json" 4)"
+  status="$(http_status PUT "/api/sys/principals/$user_principal/quotas" "$user_bearer" "$body" \
+    "$ARTIFACTS/adversarial-user-quota-spoof-restore.json")"
+  assert_status "agent quota restore after spoof" "$status" 200
+  body="$(quota_request_body "$ARTIFACTS/adversarial-ops-quota-before-spoof.json" \
+    "$(json_field "$ARTIFACTS/adversarial-ops-quota-before-spoof.json" max_background_processes)")"
+  status="$(http_status PUT "/api/sys/principals/$ops_principal/quotas" "$admin_bearer" "$body" \
+    "$ARTIFACTS/adversarial-ops-quota-spoof-restore.json")"
+  assert_status "operator quota restore after spoof" "$status" 200
 }
 
 json_assert_http_group() {
