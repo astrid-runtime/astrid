@@ -221,7 +221,7 @@ fn e2e_capability_manifest_covers_catalog() {
             .and_then(toml::Value::as_str)
             .unwrap_or("");
         assert!(!scenario.is_empty(), "capability {id} needs a scenario");
-        assert_scenario_contract(id, scenario, &specs, "capability");
+        assert_scenario_declared(id, scenario, &specs);
 
         let status = table
             .get("status")
@@ -229,6 +229,7 @@ fn e2e_capability_manifest_covers_catalog() {
             .unwrap_or("");
         match status {
             "covered" | "mapped" => {
+                assert_scenario_contract(id, scenario, &specs, "capability");
                 let allow = table.get("allow").and_then(toml::Value::as_array);
                 let deny = table.get("deny").and_then(toml::Value::as_array);
                 assert!(
@@ -292,15 +293,27 @@ fn parse_runtime_scenario_specs(src: &str) -> toml::Value {
     parsed
 }
 
-fn assert_scenario_contract(id: &str, scenario: &str, specs: &toml::Value, surface: &str) {
+fn scenario_contract<'a>(
+    id: &str,
+    scenario: &str,
+    specs: &'a toml::Value,
+) -> &'a toml::value::Table {
     let scenarios = specs
         .get("scenarios")
         .and_then(toml::Value::as_table)
         .expect("runtime specs already validated");
-    let spec = scenarios
+    scenarios
         .get(scenario)
         .and_then(toml::Value::as_table)
-        .unwrap_or_else(|| panic!("capability {id} references unknown scenario {scenario:?}"));
+        .unwrap_or_else(|| panic!("capability {id} references unknown scenario {scenario:?}"))
+}
+
+fn assert_scenario_declared(id: &str, scenario: &str, specs: &toml::Value) {
+    scenario_contract(id, scenario, specs);
+}
+
+fn assert_scenario_contract(id: &str, scenario: &str, specs: &toml::Value, surface: &str) {
+    let spec = scenario_contract(id, scenario, specs);
     let surfaces = spec
         .get("surfaces")
         .and_then(toml::Value::as_array)
