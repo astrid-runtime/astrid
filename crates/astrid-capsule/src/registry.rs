@@ -88,6 +88,8 @@ pub struct CapsuleRegistry {
     instances: HashMap<InstanceKey, InstanceEntry>,
     views: HashMap<PrincipalId, HashMap<CapsuleId, WasmHash>>,
     uplinks: HashMap<UplinkId, (CapsuleId, UplinkDescriptor)>,
+    /// Legacy reverse map from WASM session UUIDs to capsule IDs.
+    uuid_id_map: HashMap<Uuid, CapsuleId>,
     /// Reverse map from WASM session UUIDs to runtime instance keys.
     ///
     /// Populated during capsule load so that host functions can resolve
@@ -103,6 +105,7 @@ impl CapsuleRegistry {
             instances: HashMap::new(),
             views: HashMap::new(),
             uplinks: HashMap::new(),
+            uuid_id_map: HashMap::new(),
             uuid_map: HashMap::new(),
         }
     }
@@ -280,6 +283,8 @@ impl CapsuleRegistry {
                 self.unregister_capsule_uplinks(id);
             }
             self.uuid_map.retain(|_, instance_key| instance_key != &key);
+            self.uuid_id_map
+                .retain(|_, mapped_capsule_id| mapped_capsule_id != id);
             info!(capsule_id = %id, principal = %principal, hash = %hash, "Unregistered capsule instance");
         } else {
             info!(capsule_id = %id, principal = %principal, hash = %hash, refcount = entry.refcount, "Unregistered capsule view");
@@ -292,19 +297,24 @@ impl CapsuleRegistry {
     // UUID mapping
     // -----------------------------------------------------------------
 
-    /// Register a session UUID for a capsule instance.
+    /// Register a session UUID for a capsule ID.
     ///
     /// Called during WASM capsule load so that host functions can resolve
     /// IPC `source_id` UUIDs back to capsule identities.
     ///
     /// Silently overwrites on duplicate UUID. Each capsule load generates a
     /// fresh v4 UUID, so collisions are not practically possible.
-    pub fn register_uuid(&mut self, uuid: Uuid, hash: WasmHash) {
-        self.register_uuid_for(uuid, hash, &PrincipalId::default());
+    pub fn register_uuid(&mut self, uuid: Uuid, capsule_id: CapsuleId) {
+        debug!(
+            %uuid,
+            capsule_id = %capsule_id,
+            "Registered capsule UUID ID mapping"
+        );
+        self.uuid_id_map.insert(uuid, capsule_id);
     }
 
     /// Register a session UUID for a principal-scoped capsule runtime instance.
-    pub fn register_uuid_for(&mut self, uuid: Uuid, hash: WasmHash, principal: &PrincipalId) {
+    pub fn register_instance_uuid(&mut self, uuid: Uuid, hash: WasmHash, principal: &PrincipalId) {
         debug!(
             %uuid,
             hash = %hash,
@@ -324,10 +334,10 @@ impl CapsuleRegistry {
             .map(|entry| Arc::clone(&entry.capsule))
     }
 
-    /// Look up a capsule instance by its session UUID.
+    /// Look up a capsule ID by its session UUID.
     #[must_use]
-    pub fn find_by_uuid(&self, uuid: &Uuid) -> Option<Arc<dyn Capsule>> {
-        self.find_instance_by_uuid(uuid)
+    pub fn find_by_uuid(&self, uuid: &Uuid) -> Option<&CapsuleId> {
+        self.uuid_id_map.get(uuid)
     }
 
     /// Whether this content-addressed instance is already loaded.
@@ -541,6 +551,7 @@ impl CapsuleRegistry {
     /// Used during kernel shutdown to unload everything in one pass.
     pub fn drain(&mut self) -> Vec<Arc<dyn Capsule>> {
         self.uplinks.clear();
+        self.uuid_id_map.clear();
         self.uuid_map.clear();
         self.views.clear();
         self.instances
@@ -704,11 +715,19 @@ mod tests {
                 &pid("alice"),
             )
             .expect("register");
-        registry.register_uuid(uuid, hash);
+        registry.register_uuid(uuid, CapsuleId::from_static("test-capsule"));
+        registry.register_instance_uuid(uuid, hash, &pid("alice"));
 
         assert!(
             registry.find_instance_by_uuid(&uuid).is_some(),
             "uuid should resolve to the loaded capsule instance"
+        );
+        assert_eq!(
+            registry
+                .find_by_uuid(&uuid)
+                .expect("legacy uuid mapped")
+                .as_str(),
+            "test-capsule"
         );
         assert!(registry.find_instance_by_uuid(&Uuid::new_v4()).is_none());
     }
@@ -734,8 +753,8 @@ mod tests {
                 &pid("alice"),
             )
             .expect("register second");
-        registry.register_uuid(uuid, first);
-        registry.register_uuid(uuid, second);
+        registry.register_instance_uuid(uuid, first, &pid("alice"));
+        registry.register_instance_uuid(uuid, second, &pid("alice"));
         assert_eq!(
             registry
                 .find_instance_by_uuid(&uuid)
@@ -760,7 +779,7 @@ mod tests {
                 &pid("alice"),
             )
             .expect("register");
-        registry.register_uuid(uuid, hash);
+        registry.register_instance_uuid(uuid, hash, &pid("alice"));
         assert!(registry.find_instance_by_uuid(&uuid).is_some());
 
         registry
@@ -781,7 +800,7 @@ mod tests {
                 &pid("alice"),
             )
             .expect("register");
-        registry.register_uuid(uuid, hash);
+        registry.register_instance_uuid(uuid, hash, &pid("alice"));
         assert!(registry.find_instance_by_uuid(&uuid).is_some());
 
         let _ = registry.drain();

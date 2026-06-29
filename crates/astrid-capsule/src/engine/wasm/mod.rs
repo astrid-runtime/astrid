@@ -1783,10 +1783,9 @@ impl ExecutionEngine for WasmEngine {
         let capsule_id = crate::capsule::CapsuleId::new(&self.manifest.package.name)
             .map_err(|e| CapsuleError::UnsupportedEntryPoint(e.to_string()))?;
         if let Some(registry) = &ctx.capsule_registry {
-            registry
-                .write()
-                .await
-                .register_uuid_for(capsule_uuid, wasm_hash, &ctx.principal);
+            let mut registry = registry.write().await;
+            registry.register_uuid(capsule_uuid, capsule_id.clone());
+            registry.register_instance_uuid(capsule_uuid, wasm_hash, &ctx.principal);
         }
 
         // Register topic schemas unconditionally — schema_catalog is always
