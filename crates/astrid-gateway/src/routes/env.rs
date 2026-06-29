@@ -262,7 +262,7 @@ fn ensure_capsule_visible_from_response(
     }
 }
 
-/// Parse `[env]` from `$ASTRID_HOME/capsules/<id>/Capsule.toml`.
+/// Parse `[env]` from the local install target's `Capsule.toml`.
 ///
 /// The gateway intentionally does NOT take a dep on
 /// `astrid-capsule` (which would drag in wasmtime); a minimal TOML
@@ -275,12 +275,19 @@ fn load_env_schema(capsule_id: &str) -> GatewayResult<HashMap<String, EnvFieldSc
     }
     let home = AstridHome::resolve()
         .map_err(|e| GatewayError::Internal(anyhow::anyhow!("resolve ASTRID_HOME: {e}")))?;
+    load_env_schema_from_home(&home, capsule_id)
+}
+
+fn load_env_schema_from_home(
+    home: &AstridHome,
+    capsule_id: &str,
+) -> GatewayResult<HashMap<String, EnvFieldSchema>> {
     // Installed capsule manifests live under the local install target, not
     // `$ASTRID_HOME/capsules/` (that path doesn't exist on disk). This reads
     // the manifest only after `ensure_capsule_visible` has confirmed the
     // caller's principal is allowed to see the capsule; it does not grant
     // visibility to default's capsule set.
-    let principal = astrid_core::PrincipalId::default();
+    let principal = astrid_capsule_install::paths::install_principal();
     let manifest_path = home
         .principal_home(&principal)
         .capsules_dir()
@@ -546,5 +553,36 @@ mod tests {
         .expect_err("denied visibility probe should be hidden");
 
         assert!(matches!(err, GatewayError::NotFound));
+    }
+
+    #[test]
+    fn env_schema_loads_from_install_principal_capsule_manifest() {
+        let home_dir = tempfile::tempdir().unwrap();
+        let home = AstridHome::from_path(home_dir.path());
+        let manifest_dir = home
+            .principal_home(&astrid_capsule_install::paths::install_principal())
+            .capsules_dir()
+            .join("astrid-capsule-test");
+        std::fs::create_dir_all(&manifest_dir).unwrap();
+        std::fs::write(
+            manifest_dir.join("Capsule.toml"),
+            r#"
+            [package]
+            name = "astrid-capsule-test"
+            version = "1.0.0"
+
+            [env]
+            api_key = { type = "secret", description = "API key" }
+            region = { type = "select", enum_values = ["us", "eu"] }
+            "#,
+        )
+        .unwrap();
+
+        let schema = load_env_schema_from_home(&home, "astrid-capsule-test").unwrap();
+
+        assert_eq!(schema["api_key"].env_type, "secret");
+        assert_eq!(schema["api_key"].description.as_deref(), Some("API key"));
+        assert_eq!(schema["region"].env_type, "select");
+        assert_eq!(schema["region"].enum_values, ["us", "eu"]);
     }
 }
