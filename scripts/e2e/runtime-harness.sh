@@ -20,6 +20,7 @@ LAST_HTTP_OUT=""
 REDACTION_SENTINELS=()
 terminate_pid() {
   local pid=$1
+  [[ -n "$pid" ]] || return 0
   if [[ -n "$pid" ]]; then
     kill "$pid" 2>/dev/null || true
     for _ in {1..50}; do
@@ -32,6 +33,7 @@ terminate_pid() {
     kill -KILL "$pid" 2>/dev/null || true
     wait "$pid" 2>/dev/null || true
   fi
+  return 0
 }
 cleanup() {
   local status=$?
@@ -179,6 +181,17 @@ wait_for_http() {
   done
 }
 
+tail_daemon_diagnostics() {
+  local log_file
+  printf '\nrecent daemon stdout/stderr:\n' >&2
+  tail -n 200 "$ARTIFACTS/daemon.log" >&2 || true
+  for log_file in "$ASTRID_HOME"/log/* "$ASTRID_HOME"/home/*/.local/log/*; do
+    [[ -f "$log_file" ]] || continue
+    printf '\nrecent runtime log (%s):\n' "$log_file" >&2
+    tail -n 120 "$log_file" >&2 || true
+  done
+}
+
 start_daemon() {
   local label=$1
   note "$label"
@@ -186,7 +199,11 @@ start_daemon() {
   "$CORE_DIR/target/debug/astrid-daemon" >> "$ARTIFACTS/daemon.log" 2>&1 &
   DAEMON_PID=$!
   wait_for_http "$GATEWAY/healthz" || {
-    tail -n 200 "$ARTIFACTS/daemon.log" >&2 || true
+    if ! kill -0 "$DAEMON_PID" 2>/dev/null; then
+      wait "$DAEMON_PID" 2>/dev/null || true
+      DAEMON_PID=""
+    fi
+    tail_daemon_diagnostics
     fail "daemon did not become healthy"
   }
 }
