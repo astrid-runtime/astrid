@@ -215,13 +215,14 @@ state = ["elicit waiter is consumed once"]
 evidence = ["prompt SSE and elicit response artifacts"]
 
 [scenarios.first_party_capsule_commands]
-status = "covered"
+status = "mapped"
 surfaces = ["cli", "capsule"]
 auth = ["principal with first-party capsule grant"]
 success = ["runtime-discovered first-party capsule command executes through the real capsule"]
 denial = ["ungranted principal cannot see or invoke hidden capsule command surface"]
 state = ["command output reflects caller principal context"]
 evidence = ["capsule command transcript and capsule metadata artifacts"]
+remaining = ["session command direct capsule invocation is mapped but not executed; identity import/export command execution is future work"]
 
 [scenarios.group_crud]
 status = "covered"

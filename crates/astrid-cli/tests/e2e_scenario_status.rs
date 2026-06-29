@@ -77,6 +77,51 @@ fn mapped_runtime_scenarios_have_mapped_surface_work() {
 }
 
 #[test]
+fn covered_runtime_scenarios_have_only_covered_surface_rows() {
+    let scenario_src = include_str!("../../../e2e/runtime-scenario-specs.toml");
+    let mut references = BTreeMap::<String, Vec<ScenarioReference>>::new();
+    collect_all_references(&mut references);
+
+    let parsed: toml::Value =
+        toml::from_str(scenario_src).expect("runtime-scenario-specs.toml parses");
+    let scenarios = runtime_scenarios(&parsed);
+
+    let overstated: Vec<_> = scenarios
+        .iter()
+        .filter_map(|(scenario, entry)| {
+            let table = entry
+                .as_table()
+                .unwrap_or_else(|| panic!("runtime scenario {scenario:?} must be a table"));
+            let status = table
+                .get("status")
+                .and_then(toml::Value::as_str)
+                .unwrap_or("");
+            if status != "covered" {
+                return None;
+            }
+            let refs = references.get(scenario)?;
+            let unfinished: Vec<_> = refs
+                .iter()
+                .filter(|reference| matches!(reference.status.as_str(), "mapped" | "future"))
+                .collect();
+            if unfinished.is_empty() {
+                return None;
+            }
+            Some(format!(
+                "{scenario}: {}",
+                format_references_refs(&unfinished)
+            ))
+        })
+        .collect();
+
+    assert!(
+        overstated.is_empty(),
+        "runtime scenarios marked covered but referenced by mapped/future surface rows:\n{}",
+        overstated.join("\n")
+    );
+}
+
+#[test]
 fn runtime_scenarios_are_executable_contracts() {
     let scenario_src = include_str!("../../../e2e/runtime-scenario-specs.toml");
     let parsed: toml::Value =
@@ -234,6 +279,10 @@ fn collect_all_references(references: &mut BTreeMap<String, Vec<ScenarioReferenc
 }
 
 fn format_references(refs: &[ScenarioReference]) -> String {
+    format_references_refs(&refs.iter().collect::<Vec<_>>())
+}
+
+fn format_references_refs(refs: &[&ScenarioReference]) -> String {
     refs.iter()
         .map(|reference| {
             format!(

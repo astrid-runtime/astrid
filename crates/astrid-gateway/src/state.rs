@@ -352,7 +352,16 @@ impl GatewayState {
                 "gateway is not wired to a live event bus; admin operations unavailable"
             ))
         })?;
-        Ok(crate::bus_admin::BusAdminClient::new(bus, caller))
+        let session_id = self.session_id.as_ref().ok_or_else(|| {
+            crate::error::GatewayError::Internal(anyhow::anyhow!(
+                "gateway is not wired to a live kernel session; admin operations unavailable"
+            ))
+        })?;
+        Ok(crate::bus_admin::BusAdminClient::new(
+            bus,
+            caller,
+            session_id.0,
+        ))
     }
 
     /// Build a bus-direct admin client for an authenticated caller, carrying
