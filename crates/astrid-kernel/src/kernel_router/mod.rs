@@ -5,7 +5,7 @@ pub mod admin;
 /// disk through the same code path.
 mod install;
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -464,9 +464,8 @@ async fn handle_request(
 }
 
 struct CapsuleVisibility {
-    caller: PrincipalId,
-    profile: Option<Arc<astrid_core::profile::PrincipalProfile>>,
-    groups: Arc<astrid_core::groups::GroupConfig>,
+    is_admin: bool,
+    capsule_grants: BTreeSet<String>,
 }
 
 impl CapsuleVisibility {
@@ -487,29 +486,24 @@ impl CapsuleVisibility {
                 },
             }
         };
+        let Some(profile) = profile else {
+            return Self {
+                is_admin: false,
+                capsule_grants: BTreeSet::new(),
+            };
+        };
+
+        let groups = kernel.groups.load_full();
+        let check = CapabilityCheck::new(profile.as_ref(), groups.as_ref(), caller.clone());
 
         Self {
-            caller: caller.clone(),
-            profile,
-            groups: kernel.groups.load_full(),
+            is_admin: check.has("*"),
+            capsule_grants: profile.capsules.iter().cloned().collect(),
         }
     }
 
     fn allows(&self, capsule_id: &astrid_capsule::capsule::CapsuleId) -> bool {
-        let Some(profile) = &self.profile else {
-            return false;
-        };
-
-        let check =
-            CapabilityCheck::new(profile.as_ref(), self.groups.as_ref(), self.caller.clone());
-        if check.has("*") {
-            return true;
-        }
-
-        profile
-            .capsules
-            .iter()
-            .any(|granted| granted == capsule_id.as_str())
+        self.is_admin || self.capsule_grants.contains(capsule_id.as_str())
     }
 }
 

@@ -532,6 +532,41 @@ async fn ungranted_capsule_inventory_requests_do_not_inherit_default_surface() {
     assert_capsule_inventory_surface(&kernel, &ungranted, "ungranted", &[], &[], &[], &[]).await;
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn capsule_visibility_precomputes_admin_and_capsule_grants() {
+    let (_dir, kernel) = kernel_with_inventory_capsules().await;
+    let admin = PrincipalId::new("capsule-admin").expect("valid principal");
+    let limited = PrincipalId::new("capsule-limited").expect("valid principal");
+    seed_profile(
+        &kernel,
+        &admin,
+        &PrincipalProfile {
+            grants: vec!["*".to_string()],
+            capsules: Vec::new(),
+            ..Default::default()
+        },
+    );
+    seed_profile(
+        &kernel,
+        &limited,
+        &PrincipalProfile {
+            grants: vec!["self:capsule:list".to_string()],
+            capsules: vec!["allowed".to_string()],
+            ..Default::default()
+        },
+    );
+
+    let allowed = CapsuleId::new("allowed").expect("valid capsule id");
+    let default_only = CapsuleId::new("default-only").expect("valid capsule id");
+    let admin_visibility = CapsuleVisibility::new(&kernel, &admin);
+    let limited_visibility = CapsuleVisibility::new(&kernel, &limited);
+
+    assert!(admin_visibility.allows(&allowed));
+    assert!(admin_visibility.allows(&default_only));
+    assert!(limited_visibility.allows(&allowed));
+    assert!(!limited_visibility.allows(&default_only));
+}
+
 async fn kernel_with_inventory_capsules() -> (tempfile::TempDir, Arc<crate::Kernel>) {
     let dir = tempfile::tempdir().expect("tempdir");
     let home = astrid_core::dirs::AstridHome::from_path(dir.path());
@@ -565,6 +600,10 @@ fn seed_capsule_inventory_profile(
             .collect(),
         ..Default::default()
     };
+    seed_profile(kernel, principal, &profile);
+}
+
+fn seed_profile(kernel: &Arc<crate::Kernel>, principal: &PrincipalId, profile: &PrincipalProfile) {
     let path = PrincipalProfile::path_for(&kernel.astrid_home, principal);
     profile.save_to_path(&path).expect("seed profile");
     kernel.profile_cache.invalidate(principal);

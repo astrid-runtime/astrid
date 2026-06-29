@@ -8,6 +8,12 @@ import os
 from pathlib import Path
 import re
 import sys
+import tempfile
+
+try:
+    import tomllib
+except ModuleNotFoundError:  # pragma: no cover - Python < 3.11 fallback.
+    import tomli as tomllib  # type: ignore[no-redef]
 
 
 DEFAULT_CAPSULES = (
@@ -27,32 +33,22 @@ def selected_capsules() -> list[str]:
 
 
 def capsule_package_and_commands(manifest_path: Path) -> tuple[str, set[str]]:
-    package_name: str | None = None
-    commands: set[str] = set()
-    in_package = False
-    in_command = False
-    for raw_line in manifest_path.read_text(encoding="utf-8").splitlines():
-        line = raw_line.split("#", 1)[0].strip()
-        if not line:
-            continue
-        if line == "[package]":
-            in_package = True
-            in_command = False
-            continue
-        if line.startswith("["):
-            in_package = False
-            in_command = line == "[[command]]"
-            continue
-        key, sep, value = line.partition("=")
-        if sep != "=":
-            continue
-        value = value.strip().strip('"')
-        if in_package and key.strip() == "name":
-            package_name = value
-        elif in_command and key.strip() == "name":
-            commands.add(value)
-    if not package_name:
+    data = tomllib.loads(manifest_path.read_text(encoding="utf-8"))
+    package = data.get("package", {})
+    package_name = package.get("name") if isinstance(package, dict) else None
+    if not isinstance(package_name, str) or not package_name:
         raise SystemExit(f"{manifest_path} is missing package.name")
+
+    commands: set[str] = set()
+    command_entries = data.get("command", [])
+    if not isinstance(command_entries, list):
+        raise SystemExit(f"{manifest_path} has invalid [[command]] shape")
+    for command in command_entries:
+        if not isinstance(command, dict):
+            raise SystemExit(f"{manifest_path} has invalid [[command]] entry")
+        name = command.get("name")
+        if isinstance(name, str) and name:
+            commands.add(name)
     return package_name, commands
 
 
@@ -81,6 +77,34 @@ def inventoried_commands(core_dir: Path) -> set[str]:
     return found
 
 
+def run_self_test() -> int:
+    with tempfile.TemporaryDirectory() as tmp:
+        manifest_path = Path(tmp) / "Capsule.toml"
+        manifest_path.write_text(
+            '''
+            [package]
+            description = "literal # is not a comment"
+            name = "astrid-capsule-hash"
+            version = "1.0.0"
+
+            [[command]]
+            description = """
+            multiline # content is still TOML string data
+            """
+            name = "run-hash"
+
+            [[command]]
+            name = "inspect"
+            ''',
+            encoding="utf-8",
+        )
+        package, commands = capsule_package_and_commands(manifest_path)
+    assert package == "astrid-capsule-hash", package
+    assert commands == {"run-hash", "inspect"}, commands
+    print("self-test passed")
+    return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -88,7 +112,11 @@ def main() -> int:
         type=Path,
         default=Path(os.environ.get("ASTRID_E2E_CAPSULES_DIR", "../capsules")),
     )
+    parser.add_argument("--self-test", action="store_true")
     args = parser.parse_args()
+
+    if args.self_test:
+        return run_self_test()
 
     core_dir = Path(__file__).resolve().parents[2]
     actual = discovered_commands(args.capsules_dir)

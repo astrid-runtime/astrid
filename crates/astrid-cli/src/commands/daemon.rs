@@ -9,8 +9,17 @@ use crate::commands::daemon_control;
 use crate::{socket_client, theme};
 
 const DAEMON_READY_TIMEOUT_SECS: u64 = 60;
-const DAEMON_READY_POLL: Duration = Duration::from_millis(50);
-const DAEMON_READY_ATTEMPTS: usize = 1_200;
+const DAEMON_READY_POLL_MILLIS: u64 = 50;
+const DAEMON_READY_POLL: Duration = Duration::from_millis(DAEMON_READY_POLL_MILLIS);
+const DAEMON_READY_ATTEMPTS: u64 =
+    readiness_attempts(DAEMON_READY_TIMEOUT_SECS, DAEMON_READY_POLL_MILLIS);
+
+const fn readiness_attempts(timeout_secs: u64, poll_millis: u64) -> u64 {
+    let Some(timeout_millis) = timeout_secs.checked_mul(1_000) else {
+        panic!("daemon readiness timeout overflow")
+    };
+    timeout_millis.div_ceil(poll_millis)
+}
 
 /// Build a hint string pointing the user to the daemon log directory.
 fn log_hint() -> String {
@@ -385,5 +394,24 @@ pub(crate) fn format_uptime(secs: u64) -> String {
         format!("{minutes}m{seconds:02}s")
     } else {
         format!("{seconds}s")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn daemon_ready_attempts_match_timeout_window() {
+        assert_eq!(
+            DAEMON_READY_ATTEMPTS,
+            readiness_attempts(DAEMON_READY_TIMEOUT_SECS, DAEMON_READY_POLL_MILLIS)
+        );
+        assert_eq!(
+            DAEMON_READY_ATTEMPTS
+                .checked_mul(DAEMON_READY_POLL_MILLIS)
+                .expect("readiness window fits"),
+            60_000
+        );
     }
 }

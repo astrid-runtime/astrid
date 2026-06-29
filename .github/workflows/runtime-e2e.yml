@@ -137,7 +137,9 @@ jobs:
           cache-on-failure: true
 
       - name: Check first-party capsule command inventory
-        run: python3 scripts/e2e/check-first-party-capsule-commands.py --capsules-dir capsules
+        run: |
+          python3 scripts/e2e/check-first-party-capsule-commands.py --self-test
+          python3 scripts/e2e/check-first-party-capsule-commands.py --capsules-dir capsules
 
       - name: Stage capsule checkouts outside core workspace
         run: |
