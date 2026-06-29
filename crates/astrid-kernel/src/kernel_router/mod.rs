@@ -5,7 +5,7 @@ pub mod admin;
 /// disk through the same code path.
 mod install;
 
-use std::collections::{BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -279,34 +279,28 @@ async fn handle_request(
             KernelResponse::Error("Approval logic not yet implemented in kernel router".to_string())
         },
         KernelRequest::ListCapsules => {
-            refresh_inventory_view(kernel, &caller).await;
             let visibility = CapsuleVisibility::new(kernel, &caller);
             let reg = kernel.capsules.read().await;
-            let mut list = Vec::new();
-            for c in visibility.ids(&reg) {
-                if visibility.allows(c) {
-                    list.push(c.to_string());
-                }
-            }
+            let list: Vec<_> = visible_inventory_manifests(kernel, &visibility, &reg)
+                .into_iter()
+                .map(|manifest| manifest.package.name)
+                .collect();
             KernelResponse::Success(serde_json::json!(list))
         },
         KernelRequest::GetCommands => {
-            refresh_inventory_view(kernel, &caller).await;
             let visibility = CapsuleVisibility::new(kernel, &caller);
             let reg = kernel.capsules.read().await;
             let mut commands = Vec::new();
-            for c in visibility.capsules(&reg) {
-                if !visibility.allows(c.id()) {
-                    continue;
-                }
-                for cmd in &c.manifest().commands {
+            let manifests = visible_inventory_manifests(kernel, &visibility, &reg);
+            for manifest in &manifests {
+                for cmd in &manifest.commands {
                     commands.push(astrid_events::kernel_api::CommandInfo {
                         name: cmd.name.clone(),
                         description: cmd
                             .description
                             .clone()
                             .unwrap_or_else(|| "No description".to_string()),
-                        provider_capsule: c.id().to_string(),
+                        provider_capsule: manifest.package.name.clone(),
                         kind: cmd.kind,
                     });
                 }
@@ -429,15 +423,10 @@ async fn handle_request(
             KernelResponse::Status(status)
         },
         KernelRequest::GetCapsuleMetadata => {
-            refresh_inventory_view(kernel, &caller).await;
             let visibility = CapsuleVisibility::new(kernel, &caller);
             let reg = kernel.capsules.read().await;
             let mut entries = Vec::new();
-            for capsule in visibility.capsules(&reg) {
-                if !visibility.allows(capsule.id()) {
-                    continue;
-                }
-                let manifest = capsule.manifest();
+            for manifest in visible_inventory_manifests(kernel, &visibility, &reg) {
                 entries.push(astrid_events::kernel_api::CapsuleMetadataEntry {
                     name: manifest.package.name.clone(),
                     interceptor_events: manifest
@@ -451,12 +440,9 @@ async fn handle_request(
             KernelResponse::CapsuleMetadata(entries)
         },
         KernelRequest::GetAgentReadiness => {
-            refresh_inventory_view(kernel, &caller).await;
             let visibility = CapsuleVisibility::new(kernel, &caller);
             let reg = kernel.capsules.read().await;
-            let capsules = visibility.capsules(&reg);
-            let manifests: Vec<&astrid_capsule::manifest::CapsuleManifest> =
-                capsules.iter().map(|capsule| capsule.manifest()).collect();
+            let manifests = visible_inventory_manifests(kernel, &visibility, &reg);
             let readiness = astrid_capsule::readiness::agent_loop_readiness(&manifests);
             KernelResponse::AgentReadiness(readiness)
         },
@@ -465,10 +451,38 @@ async fn handle_request(
     publish_response(kernel, response_topic, res);
 }
 
-async fn refresh_inventory_view(kernel: &crate::Kernel, caller: &PrincipalId) {
-    if caller.as_str() != "anonymous" {
-        kernel.ensure_principal_loaded(caller).await;
+fn inventory_manifest_map(
+    kernel: &crate::Kernel,
+    visibility: &CapsuleVisibility,
+) -> BTreeMap<String, astrid_capsule::manifest::CapsuleManifest> {
+    let paths = crate::capsule_discovery_paths_for(
+        &kernel.astrid_home,
+        &kernel.workspace_root,
+        &visibility.principal,
+    );
+    astrid_capsule::discovery::discover_manifests(Some(&paths))
+        .into_iter()
+        .filter_map(|(manifest, _)| {
+            let id = astrid_capsule::capsule::CapsuleId::new(manifest.package.name.clone()).ok()?;
+            visibility.allows(&id).then_some((id.to_string(), manifest))
+        })
+        .collect()
+}
+
+fn visible_inventory_manifests(
+    kernel: &crate::Kernel,
+    visibility: &CapsuleVisibility,
+    registry: &astrid_capsule::registry::CapsuleRegistry,
+) -> Vec<astrid_capsule::manifest::CapsuleManifest> {
+    let mut manifests = inventory_manifest_map(kernel, visibility);
+    for capsule in visibility.capsules(registry) {
+        if visibility.allows(capsule.id()) {
+            manifests
+                .entry(capsule.id().to_string())
+                .or_insert_with(|| capsule.manifest().clone());
+        }
     }
+    manifests.into_values().collect()
 }
 
 struct CapsuleVisibility {
@@ -515,17 +529,6 @@ impl CapsuleVisibility {
 
     fn allows(&self, capsule_id: &astrid_capsule::capsule::CapsuleId) -> bool {
         self.is_admin || self.capsule_grants.contains(capsule_id.as_str())
-    }
-
-    fn ids<'a>(
-        &self,
-        registry: &'a astrid_capsule::registry::CapsuleRegistry,
-    ) -> Vec<&'a astrid_capsule::capsule::CapsuleId> {
-        if self.is_admin {
-            registry.list_any()
-        } else {
-            registry.list_for(&self.principal)
-        }
     }
 
     fn capsules(

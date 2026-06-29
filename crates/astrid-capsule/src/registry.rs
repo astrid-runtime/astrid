@@ -436,6 +436,15 @@ impl CapsuleRegistry {
             .collect()
     }
 
+    /// Snapshot of cloned `Arc` handles to every loaded principal instance.
+    #[must_use]
+    pub fn cloned_values_with_principal(&self) -> Vec<(PrincipalId, Arc<dyn Capsule>)> {
+        self.instances
+            .iter()
+            .map(|(key, entry)| (key.principal.clone(), Arc::clone(&entry.capsule)))
+            .collect()
+    }
+
     /// Snapshot of cloned `Arc` handles visible to `principal`.
     #[must_use]
     pub fn cloned_values_for(&self, principal: &PrincipalId) -> Vec<Arc<dyn Capsule>> {
@@ -835,6 +844,19 @@ mod tests {
         assert!(
             !Arc::ptr_eq(&alice_capsule, &bob_capsule),
             "same content hash must not share principal-bound runtime state"
+        );
+        let mut owners: Vec<_> = registry
+            .cloned_values_with_principal()
+            .into_iter()
+            .map(|(principal, capsule)| (principal.to_string(), capsule.id().to_string()))
+            .collect();
+        owners.sort();
+        assert_eq!(
+            owners,
+            vec![
+                ("alice".to_string(), "shared-capsule".to_string()),
+                ("bob".to_string(), "shared-capsule".to_string()),
+            ]
         );
         assert_eq!(registry.refcount_for_hash(&hash), Some(2));
         assert_eq!(registry.len(), 2, "one runtime instance per principal");

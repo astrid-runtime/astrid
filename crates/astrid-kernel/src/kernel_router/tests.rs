@@ -525,6 +525,43 @@ async fn capsule_inventory_requests_are_filtered_to_callers_grants() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn list_capsules_uses_materialized_inventory_without_runtime_load() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let home = astrid_core::dirs::AstridHome::from_path(dir.path());
+    let kernel = crate::test_kernel_with_home(home).await;
+    drop(spawn_kernel_router(Arc::clone(&kernel)));
+
+    let caller = PrincipalId::new("alice").expect("valid principal");
+    seed_profile(
+        &kernel,
+        &caller,
+        &PrincipalProfile {
+            grants: vec!["self:capsule:list".to_string()],
+            capsules: vec!["installed-only".to_string()],
+            ..Default::default()
+        },
+    );
+    write_inventory_manifest(&kernel, &caller, "installed-only", "installed-only-cmd");
+
+    let response = request_kernel(
+        &kernel,
+        &caller,
+        "materialized_inventory_list_capsules",
+        KernelRequest::ListCapsules,
+    )
+    .await;
+    let KernelResponse::Success(value) = response else {
+        panic!("expected materialized inventory list success, got {response:?}");
+    };
+    let capsules: Vec<String> = serde_json::from_value(value).expect("capsule list shape");
+    assert_eq!(capsules, ["installed-only"]);
+    assert!(
+        kernel.capsules.read().await.list_for(&caller).is_empty(),
+        "listing materialized inventory must not synchronously load capsule runtimes"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn ungranted_capsule_inventory_requests_do_not_inherit_default_surface() {
     let (_dir, kernel) = kernel_with_inventory_capsules().await;
     let ungranted = PrincipalId::new("bob").expect("valid principal");
@@ -633,6 +670,39 @@ fn seed_profile(kernel: &Arc<crate::Kernel>, principal: &PrincipalId, profile: &
     let path = PrincipalProfile::path_for(&kernel.astrid_home, principal);
     profile.save_to_path(&path).expect("seed profile");
     kernel.profile_cache.invalidate(principal);
+}
+
+fn write_inventory_manifest(
+    kernel: &Arc<crate::Kernel>,
+    principal: &PrincipalId,
+    capsule: &str,
+    command: &str,
+) {
+    let dir = kernel
+        .astrid_home
+        .principal_home(principal)
+        .capsules_dir()
+        .join(capsule);
+    std::fs::create_dir_all(&dir).expect("create capsule dir");
+    std::fs::write(
+        dir.join("Capsule.toml"),
+        format!(
+            r#"[package]
+name = "{capsule}"
+version = "0.0.1"
+
+[[component]]
+id = "main"
+file = "{capsule}.wasm"
+
+[[command]]
+name = "{command}"
+kind = "cli"
+description = "{capsule} command"
+"#
+        ),
+    )
+    .expect("write capsule manifest");
 }
 
 async fn assert_capsule_inventory_surface(

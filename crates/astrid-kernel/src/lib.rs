@@ -853,7 +853,7 @@ impl Kernel {
     /// falls back to its fan-out). The legacy `status: "ready"` field is
     /// retained so bare-signal subscribers (the shim, the TUI) keep working; the
     /// `capsules` field is additive.
-    async fn publish_capsules_loaded(&self) {
+    pub(crate) async fn publish_capsules_loaded(&self) {
         // Clone the loaded-capsule handles under a brief read lock, then release
         // it before any filesystem I/O or `tool_describe` invocation (which can
         // `block_in_place` and must never run while holding the registry lock).
@@ -1699,6 +1699,7 @@ impl RestartTracker {
 async fn attempt_capsule_restart(
     kernel: &Kernel,
     id_str: &str,
+    principal: &PrincipalId,
     tracker: &mut RestartTracker,
 ) -> bool {
     if tracker.exhausted() {
@@ -1719,32 +1720,35 @@ async fn attempt_capsule_restart(
 
     tracing::warn!(
         capsule_id = %id_str,
+        principal = %principal,
         attempt,
         max_attempts = RestartTracker::MAX_ATTEMPTS,
         "Attempting capsule restart"
     );
 
     let capsule_id = astrid_capsule::capsule::CapsuleId::from_static(id_str);
-    let Some(principal) = ({
-        let registry = kernel.capsules.read().await;
-        registry.any_principal_with(&capsule_id)
-    }) else {
-        tracing::debug!(
-            capsule_id = %id_str,
-            "Skipping capsule restart; no principal view references this capsule"
-        );
-        return true;
-    };
-    match kernel.restart_capsule(&capsule_id, &principal).await {
+    match kernel.restart_capsule(&capsule_id, principal).await {
         Ok(()) => {
-            tracing::info!(capsule_id = %id_str, attempt, "Capsule restarted successfully");
+            tracing::info!(
+                capsule_id = %id_str,
+                principal = %principal,
+                attempt,
+                "Capsule restarted successfully"
+            );
             true
         },
         Err(e) => {
-            tracing::error!(capsule_id = %id_str, attempt, error = %e, "Capsule restart failed");
+            tracing::error!(
+                capsule_id = %id_str,
+                principal = %principal,
+                attempt,
+                error = %e,
+                "Capsule restart failed"
+            );
             if tracker.exhausted() {
                 tracing::error!(
                     capsule_id = %id_str,
+                    principal = %principal,
                     "All restart attempts exhausted - capsule will remain down"
                 );
             }
@@ -1774,15 +1778,17 @@ fn spawn_capsule_health_monitor(kernel: Arc<Kernel>) -> tokio::task::JoinHandle<
 
             // Collect ready capsules under a brief read lock, then drop
             // the lock before calling check_health() or publishing events.
-            let ready_capsules: Vec<std::sync::Arc<dyn astrid_capsule::capsule::Capsule>> = {
+            let ready_capsules: Vec<(
+                PrincipalId,
+                std::sync::Arc<dyn astrid_capsule::capsule::Capsule>,
+            )> = {
                 let registry = kernel.capsules.read().await;
                 registry
-                    .list()
+                    .cloned_values_with_principal()
                     .into_iter()
-                    .filter_map(|id| {
-                        let capsule = registry.get(id)?;
+                    .filter_map(|(principal, capsule)| {
                         if capsule.state() == astrid_capsule::capsule::CapsuleState::Ready {
-                            Some(capsule)
+                            Some((principal, capsule))
                         } else {
                             None
                         }
@@ -1793,18 +1799,24 @@ fn spawn_capsule_health_monitor(kernel: Arc<Kernel>) -> tokio::task::JoinHandle<
             // Probe health once per capsule, collect failures, then drop
             // the Arc Vec before restarting. This ensures restart_capsule's
             // Arc::get_mut can succeed (no other strong references held).
-            let mut failures: Vec<(String, String)> = Vec::new();
-            for capsule in &ready_capsules {
+            let mut failures: Vec<(PrincipalId, String, String)> = Vec::new();
+            for (principal, capsule) in &ready_capsules {
                 let health = capsule.check_health();
                 if let astrid_capsule::capsule::CapsuleState::Failed(reason) = health {
                     let id_str = capsule.id().to_string();
-                    tracing::error!(capsule_id = %id_str, reason = %reason, "Capsule health check failed");
+                    tracing::error!(
+                        capsule_id = %id_str,
+                        principal = %principal,
+                        reason = %reason,
+                        "Capsule health check failed"
+                    );
 
                     let msg = astrid_events::ipc::IpcMessage::new(
                         astrid_events::ipc::Topic::from_raw("astrid.v1.health.failed"),
                         astrid_events::ipc::IpcPayload::Custom {
                             data: serde_json::json!({
                                 "capsule_id": &id_str,
+                                "principal": principal.as_str(),
                                 "reason": &reason,
                             }),
                         },
@@ -1814,7 +1826,7 @@ fn spawn_capsule_health_monitor(kernel: Arc<Kernel>) -> tokio::task::JoinHandle<
                         metadata: astrid_events::EventMetadata::new("kernel"),
                         message: msg,
                     });
-                    failures.push((id_str, reason));
+                    failures.push((principal.clone(), id_str, reason));
                 }
             }
 
@@ -1822,17 +1834,20 @@ fn spawn_capsule_health_monitor(kernel: Arc<Kernel>) -> tokio::task::JoinHandle<
             // obtain exclusive access for calling unload().
             drop(ready_capsules);
 
-            let failed_this_tick: std::collections::HashSet<&str> =
-                failures.iter().map(|(id, _)| id.as_str()).collect();
+            let failed_this_tick: std::collections::HashSet<String> = failures
+                .iter()
+                .map(|(principal, id, _)| restart_tracker_key(principal, id))
+                .collect();
 
             let mut restarted = Vec::new();
-            for (id_str, _reason) in &failures {
+            for (principal, id_str, _reason) in &failures {
+                let tracker_key = restart_tracker_key(principal, id_str);
                 let tracker = restart_trackers
-                    .entry(id_str.clone())
+                    .entry(tracker_key.clone())
                     .or_insert_with(RestartTracker::new);
 
-                if attempt_capsule_restart(&kernel, id_str, tracker).await {
-                    restarted.push(id_str.clone());
+                if attempt_capsule_restart(&kernel, id_str, principal, tracker).await {
+                    restarted.push(tracker_key);
                 }
             }
 
@@ -1845,7 +1860,7 @@ fn spawn_capsule_health_monitor(kernel: Arc<Kernel>) -> tokio::task::JoinHandle<
             // Keep exhausted trackers and trackers still in their backoff
             // window (capsule may have been unregistered by a failed restart
             // attempt and won't appear in ready_capsules next tick).
-            restart_trackers.retain(|id, tracker| {
+            restart_trackers.retain(|tracker_key, tracker| {
                 if tracker.exhausted() {
                     return true;
                 }
@@ -1854,10 +1869,14 @@ fn spawn_capsule_health_monitor(kernel: Arc<Kernel>) -> tokio::task::JoinHandle<
                 if tracker.last_attempt.elapsed() < tracker.backoff {
                     return true;
                 }
-                failed_this_tick.contains(id.as_str())
+                failed_this_tick.contains(tracker_key)
             });
         }
     })
+}
+
+fn restart_tracker_key(principal: &PrincipalId, capsule_id: &str) -> String {
+    format!("{principal}/{capsule_id}")
 }
 
 /// Spawns a periodic watchdog that publishes `astrid.v1.watchdog.tick` events every 5 seconds.

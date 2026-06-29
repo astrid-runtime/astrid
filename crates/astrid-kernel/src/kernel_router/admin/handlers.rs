@@ -513,6 +513,9 @@ async fn agent_modify_from_req(
         return err_profile(&principal, &e);
     }
     kernel.profile_cache.invalidate(&principal);
+    if capsules_changed {
+        warm_principal_capsules(kernel, principal.clone());
+    }
 
     info!(
         %principal,
@@ -525,6 +528,14 @@ async fn agent_modify_from_req(
         "Layer 6 agent.modify"
     );
     modify_response(&principal, &profile, true)
+}
+
+fn warm_principal_capsules(kernel: &Arc<crate::Kernel>, principal: PrincipalId) {
+    let kernel = Arc::clone(kernel);
+    tokio::spawn(async move {
+        kernel.ensure_principal_loaded(&principal).await;
+        kernel.publish_capsules_loaded().await;
+    });
 }
 
 fn materialize_added_capsule_installs(
