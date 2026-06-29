@@ -9,6 +9,10 @@ rust-version.workspace = true
 description = "Core runtime management for User-Space Capsules in Astrid OS"
 build = "build.rs"
 
+[features]
+default = []
+fuzzing = []
+
 [dependencies]
 astrid-approval = { workspace = true }
 astrid-capabilities = { workspace = true }

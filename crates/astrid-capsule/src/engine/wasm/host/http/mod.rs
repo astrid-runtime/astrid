@@ -25,6 +25,40 @@ mod options;
 // the single source of truth read by `HttpLimits::default`. The module's items
 // stay `pub(super)`; only the path is reachable crate-internally.
 pub(crate) mod ssrf;
+#[cfg(feature = "fuzzing")]
+pub mod fuzzing {
+    //! Fuzz-only accessors for pure HTTP host security predicates.
+    //!
+    //! These wrappers intentionally expose only deterministic helper behavior
+    //! needed by `core/fuzz`; production code continues to use the private
+    //! `ssrf` module directly.
+
+    use std::net::IpAddr;
+
+    /// Return whether a parsed IP is accepted by the HTTP host airlock.
+    #[must_use]
+    pub fn is_safe_ip(ip: IpAddr) -> bool {
+        super::ssrf::is_safe_ip(ip)
+    }
+
+    /// Parse a URL host string as an IP literal using the HTTP host rules.
+    #[must_use]
+    pub fn literal_ip(host: &str) -> Option<IpAddr> {
+        super::ssrf::literal_ip(host)
+    }
+
+    /// Return whether an allowlist entry permits `host:port`.
+    #[must_use]
+    pub fn egress_allowed(allowlist: &[String], host: &str, port: u16) -> bool {
+        super::ssrf::egress_allowed(allowlist, host, port)
+    }
+
+    /// Return whether an IP-literal redirect target is blocked.
+    #[must_use]
+    pub fn redirect_target_blocked(host: Option<&str>) -> bool {
+        super::ssrf::redirect_target_blocked(host)
+    }
+}
 
 use wasmtime::component::Resource;
 

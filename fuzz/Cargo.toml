@@ -1,0 +1,67 @@
+[package]
+name = "astrid-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[workspace]
+
+[dependencies]
+arbitrary = { version = "1", features = ["derive"] }
+astrid-capabilities = { path = "../crates/astrid-capabilities", optional = true }
+astrid-capsule = { path = "../crates/astrid-capsule", features = ["fuzzing"], optional = true }
+astrid-core = { path = "../crates/astrid-core", optional = true }
+astrid-crypto = { path = "../crates/astrid-crypto", optional = true }
+astrid-events = { path = "../crates/astrid-events", optional = true }
+libfuzzer-sys = "0.4"
+
+[features]
+default = ["core-target", "crypto-target", "events-target"]
+capabilities-target = ["dep:astrid-capabilities"]
+core-target = ["dep:astrid-core"]
+crypto-target = ["dep:astrid-crypto"]
+events-target = ["dep:astrid-events"]
+ssrf-target = ["core-target", "dep:astrid-capsule"]
+
+[[bin]]
+name = "capability_patterns"
+path = "fuzz_targets/capability_patterns.rs"
+test = false
+doc = false
+bench = false
+required-features = ["capabilities-target"]
+
+[[bin]]
+name = "crypto_wire"
+path = "fuzz_targets/crypto_wire.rs"
+test = false
+doc = false
+bench = false
+required-features = ["crypto-target"]
+
+[[bin]]
+name = "ip_blockset"
+path = "fuzz_targets/ip_blockset.rs"
+test = false
+doc = false
+bench = false
+required-features = ["core-target"]
+
+[[bin]]
+name = "ssrf_helpers"
+path = "fuzz_targets/ssrf_helpers.rs"
+test = false
+doc = false
+bench = false
+required-features = ["ssrf-target"]
+
+[[bin]]
+name = "topic_patterns"
+path = "fuzz_targets/topic_patterns.rs"
+test = false
+doc = false
+bench = false
+required-features = ["events-target"]
