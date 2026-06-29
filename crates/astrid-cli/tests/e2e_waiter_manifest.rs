@@ -11,7 +11,7 @@ fn e2e_waiter_manifest_documents_correlation_and_recovery_contracts() {
 
     for required in [
         "approval_host",
-        "elicit_lifecycle",
+        "elicit_host",
         "session_gateway_bus",
         "model_registry_bus",
         "grant_on_use",

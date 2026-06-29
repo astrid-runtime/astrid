@@ -55,31 +55,6 @@ fn publish_cancel(bus: &astrid_events::EventBus, request_id: Uuid, principal: &s
     });
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn normal_runtime_elicit_fails_before_publishing_request() {
-    let rt = tokio::runtime::Handle::current();
-    let mut state = minimal_host_state(rt);
-    state.principal = astrid_core::PrincipalId::new("agent-alice").unwrap();
-    assert!(
-        state.lifecycle_phase.is_none(),
-        "fixture starts outside a lifecycle hook"
-    );
-
-    let mut req_rx = state.event_bus.subscribe_topic("astrid.v1.elicit");
-
-    let result = state.elicit(text_request("api_url"));
-    assert!(
-        matches!(result, Err(ErrorCode::NotInLifecycle)),
-        "normal runtime elicit must fail closed, got {result:?}"
-    );
-
-    let published = tokio::time::timeout(Duration::from_millis(100), req_rx.recv()).await;
-    assert!(
-        published.is_err(),
-        "not-in-lifecycle elicit must not publish a request"
-    );
-}
-
 async fn await_request(mut req_rx: astrid_events::EventReceiver) -> (Uuid, Option<String>) {
     loop {
         let ev = tokio::time::timeout(Duration::from_secs(5), req_rx.recv())
@@ -95,11 +70,14 @@ async fn await_request(mut req_rx: astrid_events::EventReceiver) -> (Uuid, Optio
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn cross_principal_reply_does_not_unblock_matching_does() {
+async fn normal_runtime_cross_principal_reply_does_not_unblock_matching_does() {
     let rt = tokio::runtime::Handle::current();
     let mut state = minimal_host_state(rt);
     state.principal = astrid_core::PrincipalId::new("agent-alice").unwrap();
-    state.lifecycle_phase = Some(LifecyclePhase::Install);
+    assert!(
+        state.lifecycle_phase.is_none(),
+        "fixture starts outside a lifecycle hook"
+    );
 
     let bus = state.event_bus.clone();
     let req_rx = bus.subscribe_topic("astrid.v1.elicit");

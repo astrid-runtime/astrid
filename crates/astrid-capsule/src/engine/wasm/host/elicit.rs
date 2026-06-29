@@ -1,7 +1,7 @@
-//! Host function implementations for the `elicit` lifecycle API.
+//! Host function implementations for the `elicit` API.
 //!
-//! These functions are called by WASM guests during `#[install]` or `#[upgrade]`
-//! hooks to interactively collect user input (secrets, text, selections, arrays).
+//! These functions are called by WASM guests to interactively collect user input
+//! (secrets, text, selections, arrays).
 
 use crate::engine::wasm::bindings::astrid::elicit::host::{
     self as elicit, ElicitRequest, ElicitResponse, ElicitType, ErrorCode,
@@ -136,14 +136,7 @@ impl elicit::Host for HostState {
     /// Blocks the WASM thread until the frontend (TUI or CLI) collects user input
     /// and publishes an `ElicitResponse` on the response topic.
     ///
-    /// Only callable during a lifecycle phase (install/upgrade). Returns
-    /// `not-in-lifecycle` if called during normal runtime.
     fn elicit(&mut self, request: ElicitRequest) -> Result<ElicitResponse, ErrorCode> {
-        // Gate: elicit is only allowed during lifecycle hooks
-        if self.lifecycle_phase.is_none() {
-            return Err(ErrorCode::NotInLifecycle);
-        }
-
         let field = map_to_onboarding_field(&request)?;
         let request_id = Uuid::new_v4();
         let response_topic = Topic::elicit_response(request_id);

@@ -255,6 +255,55 @@ PY
   printf '%s\n' "$request_id"
 }
 
+wait_for_elicit_request_id() {
+  local path=$1
+  local deadline=$((SECONDS + 20))
+  local python_bin="${PYTHON:-python3}"
+  local request_id
+  until request_id="$("$python_bin" - "$path" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+if not path.exists():
+    raise SystemExit(1)
+
+text = path.read_text(encoding="utf-8", errors="replace")
+for block in text.split("\n\n"):
+    event = None
+    data_lines = []
+    for line in block.splitlines():
+        if line.startswith("event:"):
+            event = line.split(":", 1)[1].strip()
+        elif line.startswith("data:"):
+            data_lines.append(line.split(":", 1)[1].strip())
+    if event != "elicit" or not data_lines:
+        continue
+    try:
+        payload = json.loads("\n".join(data_lines))
+    except json.JSONDecodeError:
+        continue
+    if payload.get("type") != "elicit_request":
+        continue
+    field = payload.get("field") or {}
+    if field.get("key") != "runtime_e2e_command_elicit":
+        continue
+    request_id = payload.get("request_id")
+    if request_id:
+        print(request_id)
+        raise SystemExit(0)
+raise SystemExit(1)
+PY
+  )"; do
+    if (( SECONDS >= deadline )); then
+      return 1
+    fi
+    sleep 0.1
+  done
+  printf '%s\n' "$request_id"
+}
+
 run_agent_request_http_guardrails() {
   local user_bearer=$1
   local user_principal=$2
@@ -385,6 +434,62 @@ run_adversarial_capsule_smoke() {
   fi
   grep -q '"approved":true' "$approval_out" \
     || fail "adversarial approval command did not report approved decision"
+
+  note "checking live runtime elicit responder principal isolation"
+  local elicit_sse="$ARTIFACTS/adversarial-elicit-requests.sse"
+  local elicit_out="$ARTIFACTS/adversarial-elicit-cli.txt"
+  local elicit_answer="runtime-command-answer-$RANDOM$RANDOM"
+  curl -sN --max-time 45 \
+    -H "Authorization: Bearer $user_bearer" \
+    "$GATEWAY/api/agent/requests" \
+    > "$elicit_sse" 2>&1 &
+  local elicit_stream_pid=$!
+  wait_for_sse_ready "$elicit_sse" || {
+    terminate_pid "$elicit_stream_pid"
+    cat "$elicit_sse" >&2 2>/dev/null || true
+    fail "elicit request stream did not become ready"
+  }
+  grep -q "\"principal\":\"$user_principal\"" "$elicit_sse" || {
+    terminate_pid "$elicit_stream_pid"
+    fail "elicit request stream ready event did not carry caller principal"
+  }
+
+  bounded_principal_cli "$user_principal" 20 "$elicit_out" \
+    capsule run astrid-capsule-adversarial adversarial-elicit &
+  local elicit_cli_pid=$!
+  local elicit_request_id
+  elicit_request_id="$(wait_for_elicit_request_id "$elicit_sse")" || {
+    terminate_pid "$elicit_cli_pid"
+    terminate_pid "$elicit_stream_pid"
+    cat "$elicit_sse" >&2 2>/dev/null || true
+    fail "elicit request stream did not forward adversarial elicit request"
+  }
+
+  status="$(http_status POST /api/agent/elicit-response "$ops_bearer" \
+    "{\"request_id\":\"$elicit_request_id\",\"value\":\"wrong principal must not satisfy\"}" \
+    "$ARTIFACTS/adversarial-elicit-wrong-principal.json")"
+  assert_status "wrong-principal elicit response accepted but ignored by waiter" "$status" 202
+  sleep 0.5
+  if ! kill -0 "$elicit_cli_pid" 2>/dev/null; then
+    wait "$elicit_cli_pid" || true
+    terminate_pid "$elicit_stream_pid"
+    cat "$elicit_out" >&2 2>/dev/null || true
+    fail "wrong-principal elicit response satisfied the capsule elicit waiter"
+  fi
+
+  status="$(http_status POST /api/agent/elicit-response "$user_bearer" \
+    "{\"request_id\":\"$elicit_request_id\",\"value\":\"$elicit_answer\"}" \
+    "$ARTIFACTS/adversarial-elicit-user.json")"
+  assert_status "same-principal elicit response accepted" "$status" 202
+  local elicit_rc=0
+  wait "$elicit_cli_pid" || elicit_rc=$?
+  terminate_pid "$elicit_stream_pid"
+  if [[ "$elicit_rc" -ne 0 ]]; then
+    cat "$elicit_out" >&2 2>/dev/null || true
+    fail "adversarial elicit command failed after same-principal response"
+  fi
+  grep -q "\"value\":\"$elicit_answer\"" "$elicit_out" \
+    || fail "adversarial elicit command did not report same-principal answer"
 
   note "checking live approval denial path"
   local denial_sse="$ARTIFACTS/adversarial-approval-deny-requests.sse"

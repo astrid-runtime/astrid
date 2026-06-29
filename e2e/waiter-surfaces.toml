@@ -29,31 +29,31 @@ unit_coverage = [
 ]
 remaining = []
 
-[waiters.elicit_lifecycle]
+[waiters.elicit_host]
 owner = "astrid-capsule host elicit import"
-status = "mapped"
-request = "IpcPayload::ElicitRequest on the public request stream during lifecycle hooks"
+status = "covered"
+request = "IpcPayload::ElicitRequest on the public request stream"
 response = "IpcPayload::ElicitResponse on astrid.v1.elicit.response.{request_id}"
 correlation = ["request_id", "originating principal"]
-timeout = "fixed lifecycle elicit timeout"
+timeout = "fixed host elicit timeout"
 cancel = "WASM engine cancellation token"
 runtime_coverage = [
   "install lifecycle prompt/resume through adversarial capsule fixture",
+  "normal runtime command prompt/resume through adversarial capsule fixture",
+  "normal runtime wrong-principal response ignored before same-principal answer",
   "HTTP elicit-response unauthenticated denial",
   "HTTP elicit-response ambiguous body rejection",
   "HTTP elicit-response body principal spoof ignored",
   "HTTP elicit-response cancel sentinel accepted",
 ]
 unit_coverage = [
-  "normal runtime elicit fails before publishing a request",
+  "normal runtime elicit publishes a principal-stamped request",
   "wrong-principal response ignored",
   "unknown request id ignored",
   "mismatch flood does not extend deadline",
   "concurrent request ids and principals do not cross",
 ]
-remaining = [
-  "mid-elicit daemon crash and live command-path elicit overlap require a lifecycle-specific test hook or non-lifecycle elicitation primitive",
-]
+remaining = []
 
 [waiters.session_gateway_bus]
 owner = "gateway session routes"

@@ -35,3 +35,8 @@ description = "Run a bounded slow command for runtime crash-recovery probes"
 name = "adversarial-approval"
 kind = "cli"
 description = "Request approval for runtime E2E approval responder probes"
+
+[[command]]
+name = "adversarial-elicit"
+kind = "cli"
+description = "Request user input for runtime E2E elicit responder probes"

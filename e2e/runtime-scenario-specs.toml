@@ -206,14 +206,13 @@ state = ["temp home contains expected config and onboarding files"]
 evidence = ["init transcript and config path assertions"]
 
 [scenarios.elicitation_flow]
-status = "mapped"
+status = "covered"
 surfaces = ["http"]
 auth = ["bearer"]
 success = ["same-principal elicit response resumes the waiting prompt"]
 denial = ["cross-principal, stale, or unknown request id is rejected or ignored"]
 state = ["elicit waiter is consumed once"]
 evidence = ["prompt SSE and elicit response artifacts"]
-remaining = ["mid-elicit daemon crash and live command-path overlap need a lifecycle-specific test hook or non-lifecycle elicitation primitive"]
 
 [scenarios.first_party_capsule_commands]
 status = "covered"
