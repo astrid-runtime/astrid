@@ -35,6 +35,7 @@ use wasmtime::component::Resource;
 use crate::engine::wasm::bindings::astrid::net::host::{
     self as net, ErrorCode, TcpListener, TcpStream, UdpSocket, UnixListener,
 };
+use crate::engine::wasm::host::audit_sink::{HostAuditEvent, HostAuditOutcome};
 use crate::engine::wasm::host::http::is_safe_ip;
 use crate::engine::wasm::host::util;
 use crate::engine::wasm::host_state::{HostState, NetStream, TcpStreamSlot};
@@ -130,6 +131,66 @@ pub(super) fn audit_net<T, E: std::fmt::Debug>(
     }
 }
 
+/// Audit an outbound TCP connect, carrying the destination host + port.
+///
+/// Wraps the generic [`audit_net`] tracing line and additionally reports a
+/// typed [`NetConnect`](crate::engine::wasm::host::audit_sink::HostAuditEvent::NetConnect)
+/// event to the per-action audit sink so a connect lands on the signed
+/// audit chain (not just the off-by-default observability target). Use this
+/// for `connect-tcp` instead of the bare [`audit_net`].
+pub(crate) fn audit_net_connect<T, E: std::fmt::Debug>(
+    state: &HostState,
+    host: &str,
+    port: u16,
+    result: &Result<T, E>,
+) {
+    audit_net(state, "astrid:net/host.connect-tcp", 0, result);
+    let Some(sink) = state.audit_sink.as_ref() else {
+        return;
+    };
+    let err_buf;
+    let outcome = match result {
+        Ok(_) => HostAuditOutcome::Allowed,
+        Err(e) => {
+            err_buf = format!("{e:?}");
+            HostAuditOutcome::Failed(&err_buf)
+        },
+    };
+    sink.record(
+        &state.effective_principal(),
+        HostAuditEvent::NetConnect { host, port },
+        outcome,
+    );
+}
+
+/// Report a denied net operation to the per-action audit sink. The connect
+/// gate rejects before any socket effect and early-returns, so this is the
+/// only audit report a denied connect makes (exactly-once recording).
+pub(crate) fn record_net_denied(state: &HostState, event: HostAuditEvent<'_>, reason: &str) {
+    if let Some(sink) = state.audit_sink.as_ref() {
+        sink.record(
+            &state.effective_principal(),
+            event,
+            HostAuditOutcome::Denied(reason),
+        );
+    }
+}
+
+/// Report a Unix-socket bind outcome (allowed or failed) to the per-action
+/// audit sink. The bind path has no host:port, so it carries a fixed
+/// descriptor for the pre-provisioned listener. Mirrors [`audit_net_connect`]
+/// for the listener side; a gate denial uses [`record_net_denied`] instead
+/// (it rejects before any effect, exactly-once).
+pub(crate) fn audit_net_bind(state: &HostState, addr: &str, outcome: HostAuditOutcome<'_>) {
+    if let Some(sink) = state.audit_sink.as_ref() {
+        sink.record(
+            &state.effective_principal(),
+            HostAuditEvent::NetBind { addr },
+            outcome,
+        );
+    }
+}
+
 /// Borrow the `NetStream` stored at `rep` in the resource table.
 pub(super) fn net_stream(
     table: &wasmtime::component::ResourceTable,
@@ -190,6 +251,10 @@ where
 
 impl net::Host for HostState {
     fn bind_unix(&mut self) -> Result<Resource<UnixListener>, ErrorCode> {
+        // Stable descriptor for the pre-provisioned CLI control socket — a
+        // Unix-domain listener has no host:port, so this names the bind on
+        // the audit chain.
+        let bind_addr = "unix:cli-socket";
         if let Some(ref gate) = self.security {
             let capsule_id = self.capsule_id.as_str().to_owned();
             let gate = gate.clone();
@@ -198,21 +263,31 @@ impl net::Host for HostState {
             let check = util::bounded_block_on(&handle, &semaphore, async move {
                 gate.check_net_bind(&capsule_id).await
             });
-            if check.is_err() {
+            if let Err(reason) = check {
+                // Deny path: record before the early return — the success
+                // report below is never reached (exactly-once recording).
+                record_net_denied(self, HostAuditEvent::NetBind { addr: bind_addr }, &reason);
                 return Err(ErrorCode::CapabilityDenied);
             }
         }
 
         if self.cli_socket_listener.is_none() {
-            return Err(ErrorCode::Unknown(
-                "no pre-bound Unix listener configured".to_string(),
-            ));
+            let reason = "no pre-bound Unix listener configured";
+            audit_net_bind(self, bind_addr, HostAuditOutcome::Failed(reason));
+            return Err(ErrorCode::Unknown(reason.to_string()));
         }
 
-        let res = self
-            .resource_table
-            .push(UnixListenerSlot)
-            .map_err(|e| ErrorCode::Unknown(format!("resource table: {e}")))?;
+        let res = match self.resource_table.push(UnixListenerSlot) {
+            Ok(res) => res,
+            Err(e) => {
+                let reason = format!("resource table: {e}");
+                audit_net_bind(self, bind_addr, HostAuditOutcome::Failed(&reason));
+                return Err(ErrorCode::Unknown(reason));
+            },
+        };
+        // Success: the capsule bound its listener — land it on the signed
+        // audit chain alongside the failed/denied paths above.
+        audit_net_bind(self, bind_addr, HostAuditOutcome::Allowed);
         Ok(Resource::new_own(res.rep()))
     }
 
@@ -237,13 +312,22 @@ impl net::Host for HostState {
                 gate.check_net_connect(&capsule_id, &host_for_check, port)
                     .await
             });
-            if check.is_err() {
+            if let Err(reason) = check {
+                // Deny path: record before the early return — the
+                // success-path audit below is never reached (exactly-once).
+                record_net_denied(
+                    self,
+                    HostAuditEvent::NetConnect { host: &host, port },
+                    &reason,
+                );
                 return Err(ErrorCode::CapabilityDenied);
             }
         }
 
         if self.net_stream_count >= MAX_ACTIVE_STREAMS {
-            return Err(ErrorCode::Quota);
+            let result: Result<Resource<TcpStream>, ErrorCode> = Err(ErrorCode::Quota);
+            audit_net_connect(self, &host, port, &result);
+            return result;
         }
 
         let rt_handle = self.runtime_handle.clone();
@@ -281,13 +365,23 @@ impl net::Host for HostState {
 
         let stream = match connect_result {
             Some(Ok(s)) => s,
-            Some(Err(e)) => return Err(e),
-            None => return Err(ErrorCode::Closed),
+            Some(Err(e)) => {
+                let result: Result<Resource<TcpStream>, ErrorCode> = Err(e);
+                audit_net_connect(self, &host, port, &result);
+                return result;
+            },
+            None => {
+                let result: Result<Resource<TcpStream>, ErrorCode> = Err(ErrorCode::Closed);
+                audit_net_connect(self, &host, port, &result);
+                return result;
+            },
         };
 
         if self.net_stream_count >= MAX_ACTIVE_STREAMS {
             drop(stream);
-            return Err(ErrorCode::Quota);
+            let result: Result<Resource<TcpStream>, ErrorCode> = Err(ErrorCode::Quota);
+            audit_net_connect(self, &host, port, &result);
+            return result;
         }
 
         let net_stream = NetStream::Tcp(TcpStreamSlot {
@@ -301,7 +395,7 @@ impl net::Host for HostState {
             .map_err(|e| ErrorCode::Unknown(format!("resource table: {e}")))?;
         self.net_stream_count += 1;
         let result: Result<Resource<TcpStream>, ErrorCode> = Ok(Resource::new_own(res.rep()));
-        audit_net(self, "astrid:net/host.connect-tcp", 0, &result);
+        audit_net_connect(self, &host, port, &result);
         result
     }
 

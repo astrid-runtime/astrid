@@ -17,6 +17,7 @@
 //! `HostState.background_processes` is gone — the wasmtime resource
 //! table is the canonical storage for `ManagedProcess`.
 
+mod audit;
 mod handle;
 mod inject;
 mod managed;
@@ -39,6 +40,9 @@ use crate::engine::wasm::host::util;
 use crate::engine::wasm::host_state::HostState;
 use managed::{ManagedProcess, attach_pipes, configure_piped, prepare_sandboxed_command};
 
+pub(crate) use audit::{
+    audit_process, audit_process_id, audit_process_injections, record_process_denied,
+};
 pub use persistent::PersistentProcessRegistry;
 pub use tracker::ProcessTracker;
 // Public so other crates (engine/init, hooks) can reference the type
@@ -51,112 +55,6 @@ pub(crate) const MAX_BACKGROUND_PROCESSES: usize = 8;
 /// Per-spawn stdin prelude cap (the WIT: `spawn-request.stdin` "Capped at
 /// 4 MiB per spawn"). Oversized preludes are rejected with `too-large`.
 const MAX_SPAWN_STDIN_BYTES: usize = 4 * 1024 * 1024;
-
-/// Audit a process host fn invocation.
-fn audit_process<T, E: std::fmt::Debug>(
-    state: &HostState,
-    op: &'static str,
-    cmd: &str,
-    result: &Result<T, E>,
-) {
-    let capsule_id = state.capsule_id.as_str();
-    let principal = state.effective_principal();
-    match result {
-        Ok(_) => tracing::debug!(
-            target: "astrid.audit.process",
-            %capsule_id,
-            %principal,
-            fn = op,
-            cmd,
-            "audit",
-        ),
-        Err(e) => tracing::debug!(
-            target: "astrid.audit.process",
-            %capsule_id,
-            %principal,
-            fn = op,
-            cmd,
-            error = ?e,
-            "audit",
-        ),
-    }
-}
-
-/// Audit a spawn that carried read-only file injections. Emits the same
-/// `astrid.audit.process` line as [`audit_process`] plus an `injections` field
-/// = a formatted `"<target>=<blake3hex>"` list. Only the target paths and
-/// content hashes are logged — never the source path's parent, the bytes, or
-/// any token (consistent with the existing audit discipline).
-fn audit_process_injections<T, E: std::fmt::Debug>(
-    state: &HostState,
-    op: &'static str,
-    cmd: &str,
-    audit: &[(String, String)],
-    result: &Result<T, E>,
-) {
-    let injections = audit
-        .iter()
-        .map(|(target, hash)| format!("{target}={hash}"))
-        .collect::<Vec<_>>()
-        .join(",");
-    let capsule_id = state.capsule_id.as_str();
-    let principal = state.effective_principal();
-    match result {
-        Ok(_) => tracing::debug!(
-            target: "astrid.audit.process",
-            %capsule_id,
-            %principal,
-            fn = op,
-            cmd,
-            injections = %injections,
-            "audit",
-        ),
-        Err(e) => tracing::debug!(
-            target: "astrid.audit.process",
-            %capsule_id,
-            %principal,
-            fn = op,
-            cmd,
-            injections = %injections,
-            error = ?e,
-            "audit",
-        ),
-    }
-}
-
-/// Audit an id-keyed persistent-process op. Logs a short, non-reversible
-/// hash of the `process-id` — never the raw token, per the WIT ("never the
-/// raw id") — plus the op, principal, and capsule.
-fn audit_process_id<T, E: std::fmt::Debug>(
-    state: &HostState,
-    op: &'static str,
-    id: &str,
-    result: &Result<T, E>,
-) {
-    let id_hash = blake3::hash(id.as_bytes()).to_hex();
-    let id = &id_hash[..16];
-    let capsule_id = state.capsule_id.as_str();
-    let principal = state.effective_principal();
-    match result {
-        Ok(_) => tracing::debug!(
-            target: "astrid.audit.process",
-            %capsule_id,
-            %principal,
-            fn = op,
-            id,
-            "audit",
-        ),
-        Err(e) => tracing::debug!(
-            target: "astrid.audit.process",
-            %capsule_id,
-            %principal,
-            fn = op,
-            id,
-            error = ?e,
-            "audit",
-        ),
-    }
-}
 
 /// Extract the call_id from the caller's IPC context if it carried a
 /// `ToolExecuteRequest` payload.
@@ -244,15 +142,21 @@ impl process::Host for HostState {
             let check = util::bounded_block_on(&handle, &semaphore, async move {
                 sec.check_host_process(&capsule_id, &cmd).await
             });
-            if check.is_err() {
-                let result: Result<ProcessResult, ErrorCode> = Err(ErrorCode::CapabilityDenied);
-                audit_process(self, "astrid:process/host.spawn", &cmd_for_audit, &result);
-                return result;
+            if let Err(reason) = check {
+                // Gate-denied spawn: record the denial as `Denied` (exactly
+                // once) and fail closed before any exec.
+                record_process_denied(self, "astrid:process/host.spawn", &cmd_for_audit, &reason);
+                return Err(ErrorCode::CapabilityDenied);
             }
         } else {
-            let result: Result<ProcessResult, ErrorCode> = Err(ErrorCode::CapabilityDenied);
-            audit_process(self, "astrid:process/host.spawn", &cmd_for_audit, &result);
-            return result;
+            // No security gate configured → spawn is denied fail-closed.
+            record_process_denied(
+                self,
+                "astrid:process/host.spawn",
+                &cmd_for_audit,
+                "no security gate configured",
+            );
+            return Err(ErrorCode::CapabilityDenied);
         }
 
         // Snapshot + verify any read-only file injections before building the
@@ -374,10 +278,22 @@ impl process::Host for HostState {
             let check = util::bounded_block_on(&handle, &semaphore, async move {
                 sec.check_host_process(&capsule_id, &cmd).await
             });
-            if check.is_err() {
+            if let Err(reason) = check {
+                record_process_denied(
+                    self,
+                    "astrid:process/host.spawn-background",
+                    &cmd_for_audit,
+                    &reason,
+                );
                 return Err(ErrorCode::CapabilityDenied);
             }
         } else {
+            record_process_denied(
+                self,
+                "astrid:process/host.spawn-background",
+                &cmd_for_audit,
+                "no security gate configured",
+            );
             return Err(ErrorCode::CapabilityDenied);
         }
 
@@ -519,14 +435,13 @@ impl process::Host for HostState {
         // scope would observe `persist-unsupported` instead of the capability
         // error.
         let Some(sec) = self.security.clone() else {
-            let result: Result<String, ErrorCode> = Err(ErrorCode::CapabilityDenied);
-            audit_process(
+            record_process_denied(
                 self,
                 "astrid:process/host.spawn-persistent",
                 &cmd_for_audit,
-                &result,
+                "no security gate configured",
             );
-            return result;
+            return Err(ErrorCode::CapabilityDenied);
         };
         {
             let cmd = request.cmd.to_string();
@@ -534,15 +449,14 @@ impl process::Host for HostState {
             let check = util::bounded_block_on(&handle, &semaphore, async move {
                 sec.check_host_process(&cid, &cmd).await
             });
-            if check.is_err() {
-                let result: Result<String, ErrorCode> = Err(ErrorCode::CapabilityDenied);
-                audit_process(
+            if let Err(reason) = check {
+                record_process_denied(
                     self,
                     "astrid:process/host.spawn-persistent",
                     &cmd_for_audit,
-                    &result,
+                    &reason,
                 );
-                return result;
+                return Err(ErrorCode::CapabilityDenied);
             }
         }
 
@@ -556,14 +470,13 @@ impl process::Host for HostState {
             .iter()
             .any(|c| c == "allow_persistent")
         {
-            let result: Result<String, ErrorCode> = Err(ErrorCode::CapabilityDenied);
-            audit_process(
+            record_process_denied(
                 self,
                 "astrid:process/host.spawn-persistent",
                 &cmd_for_audit,
-                &result,
+                "persistent exec requires the allow_persistent capability",
             );
-            return result;
+            return Err(ErrorCode::CapabilityDenied);
         }
 
         // Persistence feasibility: refuse the owner-fallback principal — a

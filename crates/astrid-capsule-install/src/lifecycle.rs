@@ -125,6 +125,9 @@ pub fn run_lifecycle(
         // global policy, so the global config layer is the right (and only)
         // source here; an absent section yields the host's historical constants.
         http_limits: resolve_http_limits(),
+        // The standalone install path has no kernel audit log in scope;
+        // sensitive lifecycle host calls fall back to observability tracing.
+        audit_sink: None,
     };
 
     // `engine::wasm::run_lifecycle` is async — async wasmtime requires

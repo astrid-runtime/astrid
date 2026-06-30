@@ -30,6 +30,7 @@ pub mod toposort;
 pub(crate) mod watcher;
 
 pub use access::CapsuleAccessResolver;
+pub use engine::wasm::host::audit_sink::{HostAuditEvent, HostAuditOutcome, HostAuditSink};
 pub use engine::wasm::limits::{CapsuleRuntimeLimits, HttpLimits};
 pub use fuel_ledger::{FuelLedger, FuelRateLimiter};
 pub use memory_ledger::{MemoryLedger, StoreMemoryMeter};

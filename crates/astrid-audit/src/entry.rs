@@ -187,6 +187,7 @@ impl AuditEntry {
 /// Actions that can be audited.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum AuditAction {
     /// MCP tool was called.
     McpToolCall {
@@ -266,6 +267,34 @@ pub enum AuditAction {
     FileDelete {
         /// File path.
         path: String,
+    },
+
+    /// Outbound network connection attempt by a capsule host call.
+    ///
+    /// Recorded for every `astrid:net` connect — allowed, failed, or denied
+    /// by the per-principal security gate — so a sensitive egress lands on
+    /// the signed audit chain. Pair with [`AuthorizationProof::Denied`] +
+    /// [`AuditOutcome::failure`] on the deny path.
+    NetConnect {
+        /// Destination host (as supplied to the connect call).
+        host: String,
+        /// Destination port.
+        port: u16,
+    },
+
+    /// Socket bind by a capsule host call (`astrid:net` bind).
+    NetBind {
+        /// Bind address.
+        addr: String,
+    },
+
+    /// Child-process spawn by a capsule host call (`astrid:process` spawn).
+    ///
+    /// Recorded for every spawn attempt — allowed, failed, or denied — so a
+    /// sensitive exec lands on the signed audit chain.
+    ProcessSpawn {
+        /// Command being executed.
+        command: String,
     },
 
     /// Capability token was created.
@@ -439,10 +468,12 @@ pub enum AuditAction {
 }
 
 impl AuditAction {
-    /// Get a human-readable description of the action.
-    #[must_use]
-    pub fn description(&self) -> String {
-        match self {
+    /// Describe the MCP-prefixed actions (tool/capsule call, resource,
+    /// prompt, elicitation, sampling). Returns `None` for non-MCP actions so
+    /// [`description`](Self::description) can fall through. Factored out to
+    /// keep `description` under the function-length lint.
+    fn describe_mcp(&self) -> Option<String> {
+        let s = match self {
             Self::McpToolCall { server, tool, .. } => {
                 format!("Called tool {server}:{tool}")
             },
@@ -468,6 +499,30 @@ impl AuditAction {
             Self::McpSampling { model, .. } => {
                 format!("Sampling request to {model}")
             },
+            _ => return None,
+        };
+        Some(s)
+    }
+
+    /// Get a human-readable description of the action.
+    ///
+    /// MCP-prefixed actions are described by [`describe_mcp`](Self::describe_mcp);
+    /// everything else falls through to the match below. Split this way to stay
+    /// under the function-length lint.
+    #[must_use]
+    pub fn description(&self) -> String {
+        match self {
+            // MCP-prefixed actions: delegate to the dedicated helper. The
+            // helper returns `Some` for exactly these variants, so the
+            // fallback is never taken — it keeps the call total instead of
+            // panicking.
+            Self::McpToolCall { .. }
+            | Self::CapsuleToolCall { .. }
+            | Self::McpResourceRead { .. }
+            | Self::McpPromptGet { .. }
+            | Self::McpElicitation { .. }
+            | Self::McpUrlElicitation { .. }
+            | Self::McpSampling { .. } => self.describe_mcp().unwrap_or_default(),
             Self::FileRead { path } => {
                 format!("Read file {path}")
             },
@@ -476,6 +531,15 @@ impl AuditAction {
             },
             Self::FileDelete { path } => {
                 format!("Deleted file {path}")
+            },
+            Self::NetConnect { host, port } => {
+                format!("Connected to {host}:{port}")
+            },
+            Self::NetBind { addr } => {
+                format!("Bound socket {addr}")
+            },
+            Self::ProcessSpawn { command } => {
+                format!("Spawned process {command}")
             },
             Self::CapabilityCreated { resource, .. } => {
                 format!("Created capability for {resource}")

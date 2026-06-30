@@ -1524,6 +1524,7 @@ impl ExecutionEngine for WasmEngine {
             let st_allowance_store = ctx.allowance_store.clone();
             let st_identity_store = ctx.identity_store.clone();
             let st_profile_cache = ctx.profile_cache.clone();
+            let st_audit_sink = ctx.audit_sink.clone();
             // Shared across the whole pool so a verified per-connection
             // principal (issue #45/#852) bound on the accepting instance is
             // visible to whichever pooled instance later serves that
@@ -1643,6 +1644,10 @@ impl ExecutionEngine for WasmEngine {
                 // `no_yield_windows` counts consecutive windows with no recv.
                 recv_yielded: false,
                 no_yield_windows: 0,
+                // Synchronous per-action audit sink (fs/net/process). Shared
+                // kernel handle threaded through `ctx`; `None` in tests /
+                // single-tenant boot that did not wire it.
+                audit_sink: st_audit_sink.clone(),
             });
 
             // Initial epoch deadline applied to every freshly-instantiated
@@ -2516,6 +2521,12 @@ pub struct LifecycleConfig {
     /// runtime. [`HttpLimits::default`](limits::HttpLimits::default) reproduces
     /// the host's historical constants when no config is available.
     pub http_limits: limits::HttpLimits,
+    /// Optional synchronous per-action audit sink (fs/net/process). The
+    /// kernel-driven install/upgrade path can thread its signed audit sink
+    /// here; the standalone install CLI leaves it `None` (no audit log in
+    /// scope). When `None`, sensitive lifecycle host calls still emit the
+    /// observability `tracing` lines but land no chain entry.
+    pub audit_sink: Option<std::sync::Arc<dyn host::audit_sink::HostAuditSink>>,
 }
 
 /// Run a capsule's lifecycle hook (install or upgrade).
@@ -2685,6 +2696,10 @@ pub async fn run_lifecycle(
         // state is inert here but initialised for completeness.
         recv_yielded: false,
         no_yield_windows: 0,
+        // Per-action audit sink (fs/net/process). The install/upgrade path
+        // may thread the kernel sink in; `None` for the standalone install
+        // CLI, which has no audit log in scope.
+        audit_sink: cfg.audit_sink,
     };
 
     // Build wasmtime engine and store for lifecycle execution.

@@ -55,6 +55,10 @@ impl HostState {
             // run-loop CPU cooperative-yield state is inert here.
             recv_yielded: false,
             no_yield_windows: 0,
+            // Hooks do not exercise the per-action fs/net/process audit seam;
+            // no sink is threaded into a transient hook's HostState (fail-secure
+            // to "no per-action audit" — the report is a no-op).
+            audit_sink: None,
             invocation_kv: None,
             capsule_log: None,
             capsule_id,

@@ -156,5 +156,6 @@ pub(crate) fn minimal_host_state(rt: tokio::runtime::Handle) -> HostState {
         ingress_origin: None,
         recv_yielded: false,
         no_yield_windows: 0,
+        audit_sink: None,
     }
 }

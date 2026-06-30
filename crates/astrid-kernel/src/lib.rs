@@ -11,6 +11,8 @@
 //! is to instantiate `astrid_events::EventBus`, load `.capsule` files into
 //! the Extism sandbox, and route IPC bytes between them.
 
+/// Kernel implementation of the capsule per-action host-audit sink.
+pub mod audit_sink;
 /// Passive event-bus storm diagnostics (publish-rate monitor).
 mod bus_monitor;
 /// `astrid.v1.capsules_loaded` payload assembly (opaque per-capsule metadata).
@@ -660,7 +662,15 @@ impl Kernel {
         // Hand this capsule its operator-approved local-egress allowlist (if
         // any) so the SSRF airlock can exempt sanctioned loopback/private
         // endpoints for it. Absent entry = empty = no exemptions.
-        .with_local_egress(self.local_egress.get(&capsule_name).cloned().unwrap_or_default());
+        .with_local_egress(self.local_egress.get(&capsule_name).cloned().unwrap_or_default())
+        // Hand the engine the signed per-action audit sink so sensitive
+        // fs/net/process host calls (allowed, failed, OR denied) land on the
+        // kernel's durable, hash-chained audit log — not just the
+        // off-by-default observability tracing targets.
+        .with_audit_sink(crate::audit_sink::KernelAuditSink::new(
+            Arc::clone(&self.audit_log),
+            self.session_id.clone(),
+        ));
 
         capsule.load(&ctx).await?;
         Ok(capsule)
