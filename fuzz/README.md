@@ -1,6 +1,6 @@
 # Astrid fuzz targets
 
-This package holds coverage-guided fuzz targets for `core`. It is intentionally
+This package holds coverage-guided fuzz targets for Astrid. It is intentionally
 excluded from the root Cargo workspace so normal workspace builds do not compile
 `libfuzzer-sys`.
 
@@ -10,7 +10,7 @@ tooling dependencies when fuzz targets are run.
 
 ## Running
 
-Install `cargo-fuzz`, then run targets from `core/`:
+Install `cargo-fuzz`, then run targets from the repository root:
 
 ```sh
 cargo fuzz run ip_blockset

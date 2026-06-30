@@ -30,7 +30,7 @@ pub mod fuzzing {
     //! Fuzz-only accessors for pure HTTP host security predicates.
     //!
     //! These wrappers intentionally expose only deterministic helper behavior
-    //! needed by `core/fuzz`; production code continues to use the private
+    //! needed by `fuzz/`; production code continues to use the private
     //! `ssrf` module directly.
 
     use std::net::IpAddr;
