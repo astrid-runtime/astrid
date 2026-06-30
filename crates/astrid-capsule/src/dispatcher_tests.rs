@@ -1351,7 +1351,7 @@ mod access_enforcement {
         write_profile(&home, "bob", &agent_with_capsules(&[]));
 
         let (invoked, bus, handle) =
-            spawn_with_capsule(resolver, "session-capsule", "session.v1.append");
+            spawn_with_capsule_in_views(resolver, "session-capsule", "session.v1.append", &["bob"]);
         tokio::task::yield_now().await;
         publish_ipc_as(&bus, "session.v1.append", "bob");
         tokio::time::sleep(Duration::from_millis(200)).await;
@@ -1391,17 +1391,25 @@ mod access_enforcement {
         let (_dir, home, resolver) = resolver_fixture();
         write_profile(&home, "bob", &agent_with_capsules(&[]));
 
-        // One capsule that intercepts BOTH a tool topic and an
-        // orchestration topic. Register it with the tool topic, then a
-        // second registry entry with the orchestration topic, both named
-        // the same dual-role capsule but we test via two capsules sharing
-        // the ungranted principal to isolate the topic dimension.
         let (tool_cap, tool_invoked) =
             MockCapsule::new("identity", "tool.v1.execute.save_identity");
         let (orch_cap, orch_invoked) = MockCapsule::new("identity-orch", "spark.v1.request.build");
         let mut registry = CapsuleRegistry::new();
-        registry.register(Box::new(tool_cap)).unwrap();
-        registry.register(Box::new(orch_cap)).unwrap();
+        let bob = PrincipalId::new("bob").expect("valid principal");
+        registry
+            .register_for(
+                Box::new(tool_cap),
+                crate::registry::WasmHash::synthetic("identity", "0.0.1"),
+                &bob,
+            )
+            .unwrap();
+        registry
+            .register_for(
+                Box::new(orch_cap),
+                crate::registry::WasmHash::synthetic("identity-orch", "0.0.1"),
+                &bob,
+            )
+            .unwrap();
         let registry = Arc::new(RwLock::new(registry));
         let bus = Arc::new(EventBus::with_capacity(64));
         let dispatcher = EventDispatcher::new(Arc::clone(&registry), Arc::clone(&bus))
@@ -1420,6 +1428,52 @@ mod access_enforcement {
         assert!(
             orch_invoked.load(Ordering::SeqCst),
             "ungranted principal: orchestration topic must still dispatch"
+        );
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn principal_stamped_orchestration_uses_caller_view() {
+        let (_dir, home, resolver) = resolver_fixture();
+        write_profile(&home, "bob", &agent_with_capsules(&[]));
+
+        let (default_cap, default_invoked) =
+            MockCapsule::new("default-session", "session.v1.request.list");
+        let (bob_cap, bob_invoked) = MockCapsule::new("bob-session", "session.v1.request.list");
+        let mut registry = CapsuleRegistry::new();
+        registry
+            .register_for(
+                Box::new(default_cap),
+                crate::registry::WasmHash::synthetic("default-session", "0.0.1"),
+                &PrincipalId::default(),
+            )
+            .unwrap();
+        let bob = PrincipalId::new("bob").expect("valid principal");
+        registry
+            .register_for(
+                Box::new(bob_cap),
+                crate::registry::WasmHash::synthetic("bob-session", "0.0.1"),
+                &bob,
+            )
+            .unwrap();
+
+        let registry = Arc::new(RwLock::new(registry));
+        let bus = Arc::new(EventBus::with_capacity(64));
+        let dispatcher = EventDispatcher::new(Arc::clone(&registry), Arc::clone(&bus))
+            .with_access_resolver(resolver);
+        let handle = tokio::spawn(dispatcher.run());
+        tokio::task::yield_now().await;
+
+        publish_ipc_as(&bus, "session.v1.request.list", "bob");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        assert!(
+            !default_invoked.load(Ordering::SeqCst),
+            "principal-stamped orchestration must not dispatch to the default view"
+        );
+        assert!(
+            bob_invoked.load(Ordering::SeqCst),
+            "principal-stamped orchestration should dispatch to the caller's view"
         );
         handle.abort();
     }
@@ -1461,8 +1515,12 @@ mod access_enforcement {
         let (_dir, home, resolver) = resolver_fixture();
         write_profile(&home, "bob", &agent_with_capsules(&[]));
 
-        let (invoked, bus, handle) =
-            spawn_with_capsule(resolver, "router-like", "tool.v1.execute.*.result");
+        let (invoked, bus, handle) = spawn_with_capsule_in_views(
+            resolver,
+            "router-like",
+            "tool.v1.execute.*.result",
+            &["bob"],
+        );
         tokio::task::yield_now().await;
         publish_ipc_as(&bus, "tool.v1.execute.do_thing.result", "bob");
         tokio::time::sleep(Duration::from_millis(200)).await;
@@ -1483,7 +1541,7 @@ mod access_enforcement {
         write_profile(&home, "bob", &agent_with_capsules(&[]));
 
         let (invoked, bus, handle) =
-            spawn_with_capsule(resolver, "react-like", "tool.v1.execute.result");
+            spawn_with_capsule_in_views(resolver, "react-like", "tool.v1.execute.result", &["bob"]);
         tokio::task::yield_now().await;
         publish_ipc_as(&bus, "tool.v1.execute.result", "bob");
         tokio::time::sleep(Duration::from_millis(200)).await;

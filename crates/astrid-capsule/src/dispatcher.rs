@@ -844,76 +844,60 @@ async fn find_matching_interceptors(
         access_resolver.is_some() && (gate_surface || topic == "tool.v1.request.describe");
     let registry = registry.read().await;
     let mut matches: Vec<(Arc<dyn crate::capsule::Capsule>, String, u32)> = Vec::new();
-    // Dedup grant-on-use signals within a single dispatch pass (principal is
-    // fixed per call, so key on `capsule_id`). A `Vec<&str>` borrowing the
-    // registry-held ids beats a `HashSet<String>` for this tiny, gate-miss-only
-    // set — linear `contains`, no per-check allocation, a `String` built only on
-    // emit.
-    let mut grant_signalled: Vec<&str> = Vec::new();
+    // Dedup grant-on-use signals within a single dispatch pass. This stays
+    // tiny in practice, so a Vec keeps the gate path simple.
+    let mut grant_signalled: Vec<String> = Vec::new();
     let caller_pid = caller_principal.and_then(|p| astrid_core::PrincipalId::new(p).ok());
     let view_scoped_admin = view_scoped_surface
         && access_resolver.is_some_and(|resolver| resolver.is_admin(caller_principal));
-    let candidate_ids = if view_scoped_surface && !view_scoped_admin {
-        caller_pid
-            .as_ref()
-            .map_or_else(Vec::new, |principal| registry.list_for(principal))
-    } else {
-        registry.list_any()
-    };
+    let candidate_capsules = candidate_capsules_for_dispatch(
+        &registry,
+        caller_pid.as_ref(),
+        access_resolver.is_some(),
+        view_scoped_surface,
+        view_scoped_admin,
+    );
 
-    for capsule_id in candidate_ids {
-        let capsule = if view_scoped_surface && !view_scoped_admin {
-            caller_pid
-                .as_ref()
-                .and_then(|principal| registry.get_for(principal, capsule_id))
-        } else {
-            registry.get_any(capsule_id)
-        };
-        if let Some(capsule) = capsule {
-            if !matches!(capsule.state(), crate::capsule::CapsuleState::Ready) {
-                continue;
-            }
-            // Per-principal access gate for the user-invocable surface.
-            // Fail-closed: with the gate engaged and a resolver wired, an
-            // ungranted (or unknown/anonymous) caller drops this capsule's
-            // tool interceptors entirely.
-            if gate_surface
-                && let Some(resolver) = access_resolver
-                && !resolver.is_capsule_allowed(caller_principal, capsule.id())
+    for capsule in candidate_capsules {
+        if !matches!(capsule.state(), crate::capsule::CapsuleState::Ready) {
+            continue;
+        }
+        // Per-principal access gate for the user-invocable surface.
+        // Fail-closed: with the gate engaged and a resolver wired, an
+        // ungranted (or unknown/anonymous) caller drops this capsule's
+        // tool interceptors entirely.
+        if gate_surface
+            && let Some(resolver) = access_resolver
+            && !resolver.is_capsule_allowed(caller_principal, capsule.id())
+        {
+            // Grant-on-first-use (#998): for an authenticated non-admin
+            // caller, emit a `GrantRequired` signal before dropping. The
+            // grant TARGET is the kernel-stamped caller + this capsule —
+            // never any caller-supplied claim. Skip a `None`/empty/
+            // `anonymous` principal (no authenticated principal to grant).
+            if let Some(principal) = caller_principal
+                && !principal.is_empty()
+                && principal != "anonymous"
             {
-                // Grant-on-first-use (#998): for an authenticated non-admin
-                // caller, emit a `GrantRequired` signal before dropping. The
-                // grant TARGET is the kernel-stamped caller + this capsule —
-                // never any caller-supplied claim. Skip a `None`/empty/
-                // `anonymous` principal (no authenticated principal to grant).
-                if let Some(principal) = caller_principal
-                    && !principal.is_empty()
-                    && principal != "anonymous"
-                {
-                    let capsule_key = capsule_id.as_str();
-                    if !grant_signalled.contains(&capsule_key) {
-                        grant_signalled.push(capsule_key);
-                        crate::access::emit_grant_required(
-                            event_bus,
-                            principal,
-                            capsule_key.to_string(),
-                        );
-                    }
+                let capsule_key = capsule.id().to_string();
+                if !grant_signalled.contains(&capsule_key) {
+                    grant_signalled.push(capsule_key.clone());
+                    crate::access::emit_grant_required(event_bus, principal, capsule_key);
                 }
-                continue;
             }
-            // RFC cargo-like-manifest: read effective interceptors
-            // — [subscribe].handler entries merged with legacy
-            // [[interceptor]] blocks. Legacy entries keep their declared
-            // priority; new-form entries get the default (100).
-            for interceptor in capsule.manifest().effective_interceptors() {
-                if crate::topic::topic_matches(topic, &interceptor.event) {
-                    matches.push((
-                        Arc::clone(&capsule),
-                        interceptor.action,
-                        interceptor.priority,
-                    ));
-                }
+            continue;
+        }
+        // RFC cargo-like-manifest: read effective interceptors
+        // — [subscribe].handler entries merged with legacy
+        // [[interceptor]] blocks. Legacy entries keep their declared
+        // priority; new-form entries get the default (100).
+        for interceptor in capsule.manifest().effective_interceptors() {
+            if crate::topic::topic_matches(topic, &interceptor.event) {
+                matches.push((
+                    Arc::clone(&capsule),
+                    interceptor.action,
+                    interceptor.priority,
+                ));
             }
         }
     }
@@ -934,6 +918,31 @@ async fn find_matching_interceptors(
             .then_with(|| a_act.cmp(b_act))
     });
     matches
+}
+
+fn candidate_capsules_for_dispatch(
+    registry: &CapsuleRegistry,
+    caller_pid: Option<&astrid_core::PrincipalId>,
+    has_access_resolver: bool,
+    view_scoped_surface: bool,
+    view_scoped_admin: bool,
+) -> Vec<Arc<dyn crate::capsule::Capsule>> {
+    if view_scoped_surface && !view_scoped_admin {
+        return caller_pid.map_or_else(Vec::new, |principal| registry.cloned_values_for(principal));
+    }
+
+    if has_access_resolver
+        && !view_scoped_admin
+        && let Some(principal) = caller_pid
+    {
+        return registry.cloned_values_for(principal);
+    }
+
+    registry
+        .list_any()
+        .into_iter()
+        .filter_map(|id| registry.get_any(id))
+        .collect()
 }
 
 #[cfg(test)]
