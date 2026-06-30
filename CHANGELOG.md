@@ -11,6 +11,7 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
 
 ### Added
 
+- Added a standalone `core/fuzz` package with initial structured fuzz targets for Tier 1 security predicates: IP block-set behavior, topic wildcard semantics, crypto wire encodings, capability resource patterns, and SSRF/local-egress helper predicates. The storage-heavy capability target and Wasmtime-heavy SSRF target are feature-gated so normal workspace builds stay unchanged. Closes #1084.
 - Runtime capsule commands can now use the existing `elicit()` host API, not only install/upgrade lifecycle hooks. The same host-generated request id, principal-stamped request stream, same-principal response filter, bounded timeout, and cancellation path apply. Runtime E2E now proves a normal capsule command elicit ignores a wrong-principal response before accepting the caller's answer, and crash recovery now kills the daemon while an elicit waiter is in flight to prove the command fails bounded instead of hanging. Closes #1068.
 - Daemon capsule discovery now includes the configured workspace root's `.astrid/capsules` directory in addition to the default principal install directory, so capsules installed by local workspace flows are picked up when the daemon starts or reloads from that workspace. Closes #1068.
 - Added runtime e2e coverage gates for the built-in CLI, gateway HTTP routes, and first-party capsule commands, plus a dedicated fake OpenAI-compatible runtime harness and CI workflow that installs current capsule artifacts in an isolated `ASTRID_HOME`. Closes #1068.
