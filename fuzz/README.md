@@ -4,6 +4,10 @@ This package holds coverage-guided fuzz targets for `core`. It is intentionally
 excluded from the root Cargo workspace so normal workspace builds do not compile
 `libfuzzer-sys`.
 
+`fuzz/Cargo.lock` is intentionally untracked. The root workspace lockfile stays
+the release/audit lockfile; the standalone fuzz package resolves its own
+tooling dependencies when fuzz targets are run.
+
 ## Running
 
 Install `cargo-fuzz`, then run targets from `core/`:
