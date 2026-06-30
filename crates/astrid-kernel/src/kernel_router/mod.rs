@@ -315,30 +315,8 @@ async fn handle_request(
             KernelResponse::Commands(commands)
         },
         KernelRequest::ReloadCapsules => {
-            // Unregister capsules in a Failed state so they can be re-loaded
-            // with fresh configuration (e.g. after onboarding writes .env.json).
-            {
-                let reg = kernel.capsules.read().await;
-                let failed_ids: Vec<_> = reg
-                    .list()
-                    .into_iter()
-                    .filter(|id| {
-                        reg.get(id).is_some_and(|c| {
-                            matches!(c.state(), astrid_capsule::capsule::CapsuleState::Failed(_))
-                        })
-                    })
-                    .cloned()
-                    .collect();
-                drop(reg);
-
-                let mut reg = kernel.capsules.write().await;
-                for id in failed_ids {
-                    let _ = reg.unregister(&id);
-                }
-            }
-
-            kernel.load_all_capsules().await;
-            KernelResponse::Success(serde_json::json!({"status": "reloaded"}))
+            schedule_reload_capsules(Arc::clone(kernel));
+            KernelResponse::Success(serde_json::json!({"status": "reload_started"}))
         },
         KernelRequest::ReloadCapsule { id } => {
             // Hot-swap a single capsule (or add it if not yet loaded) without a
@@ -483,6 +461,34 @@ fn visible_inventory_manifests(
         }
     }
     manifests.into_values().collect()
+}
+
+fn schedule_reload_capsules(kernel: Arc<crate::Kernel>) {
+    tokio::spawn(async move {
+        unregister_failed_capsules(&kernel).await;
+        kernel.load_all_capsules().await;
+    });
+}
+
+async fn unregister_failed_capsules(kernel: &crate::Kernel) {
+    let failed: Vec<_> = {
+        let reg = kernel.capsules.read().await;
+        reg.cloned_values_with_principal()
+            .into_iter()
+            .filter_map(|(principal, capsule)| {
+                matches!(
+                    capsule.state(),
+                    astrid_capsule::capsule::CapsuleState::Failed(_)
+                )
+                .then(|| (principal, capsule.id().clone()))
+            })
+            .collect()
+    };
+
+    let mut reg = kernel.capsules.write().await;
+    for (principal, id) in failed {
+        let _ = reg.unregister_for(&principal, &id);
+    }
 }
 
 struct CapsuleVisibility {
