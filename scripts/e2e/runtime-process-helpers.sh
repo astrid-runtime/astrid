@@ -18,7 +18,8 @@ terminate_pid() {
 
 wait_for_http() {
   local url=$1
-  local deadline=$((SECONDS + 30))
+  local timeout_secs=${2:-${ASTRID_E2E_HTTP_WAIT_SECS:-90}}
+  local deadline=$((SECONDS + timeout_secs))
   until curl --connect-timeout 2 --max-time 5 -fsS "$url" >/dev/null 2>&1; do
     if (( SECONDS >= deadline )); then
       return 1

@@ -356,8 +356,6 @@ fn resolve_scope_defaults_to_self_except_daemon_capsule_lifecycle() {
         if matches!(
             req,
             KernelRequest::ReloadCapsules
-                | KernelRequest::ReloadCapsule { .. }
-                | KernelRequest::UnloadCapsule { .. }
                 | KernelRequest::InstallCapsule {
                     workspace: false,
                     ..
@@ -378,12 +376,6 @@ fn resolve_scope_treats_daemon_capsule_lifecycle_as_global() {
     let caller = PrincipalId::new("alice").unwrap();
     for req in [
         KernelRequest::ReloadCapsules,
-        KernelRequest::ReloadCapsule {
-            id: "demo".to_string(),
-        },
-        KernelRequest::UnloadCapsule {
-            id: "demo".to_string(),
-        },
         KernelRequest::InstallCapsule {
             source: "/tmp/demo.capsule".to_string(),
             workspace: false,
@@ -392,7 +384,26 @@ fn resolve_scope_treats_daemon_capsule_lifecycle_as_global() {
         assert_eq!(
             resolve_scope(&req, &caller),
             AuthorityScope::Global,
-            "daemon capsule lifecycle should be global for {req:?}"
+            "full-daemon lifecycle should be global for {req:?}"
+        );
+    }
+}
+
+#[test]
+fn resolve_scope_treats_single_capsule_reload_and_unload_as_self() {
+    let caller = PrincipalId::new("alice").unwrap();
+    for req in [
+        KernelRequest::ReloadCapsule {
+            id: "demo".to_string(),
+        },
+        KernelRequest::UnloadCapsule {
+            id: "demo".to_string(),
+        },
+    ] {
+        assert_eq!(
+            resolve_scope(&req, &caller),
+            AuthorityScope::Self_,
+            "single-capsule lifecycle should target caller view for {req:?}"
         );
     }
 }

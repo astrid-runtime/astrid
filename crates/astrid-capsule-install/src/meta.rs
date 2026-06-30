@@ -143,10 +143,20 @@ pub fn scan_installed_capsules() -> anyhow::Result<Vec<InstalledCapsule>> {
 /// Scan user-level and workspace capsule directories for an explicit Astrid
 /// home, returning all installed capsules sorted alphabetically by name.
 pub fn scan_installed_capsules_in_home(home: &AstridHome) -> anyhow::Result<Vec<InstalledCapsule>> {
+    let principal = crate::paths::install_principal();
+    scan_installed_capsules_in_home_for(home, &principal)
+}
+
+/// Scan user-level capsule directories for `principal` and workspace capsule
+/// directories for an explicit Astrid home, returning all installed capsules
+/// sorted alphabetically by name.
+pub fn scan_installed_capsules_in_home_for(
+    home: &AstridHome,
+    principal: &astrid_core::PrincipalId,
+) -> anyhow::Result<Vec<InstalledCapsule>> {
     let mut capsules = Vec::new();
 
-    let principal = crate::paths::install_principal();
-    let principal_dir = home.principal_home(&principal).capsules_dir();
+    let principal_dir = home.principal_home(principal).capsules_dir();
     if principal_dir.is_dir() {
         scan_dir(&principal_dir, CapsuleLocation::User, &mut capsules)?;
     }

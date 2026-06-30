@@ -122,13 +122,19 @@ fn agent_group_allows_self_scoped_capsule_surface() {
     let profile = agent_profile();
     let caller = agent_principal();
 
-    // Self-scoped: agent can inspect their own capsule surface and request a
-    // future caller-workspace install target. Daemon-wide lifecycle remains
-    // global because it mutates the loaded capsule set for every caller.
+    // Self-scoped: agent can inspect and mutate their own capsule surface and
+    // request a future caller-workspace install target. Daemon-wide lifecycle
+    // remains global because it mutates the loaded capsule set for every caller.
     for req in [
         KernelRequest::InstallCapsule {
             source: String::new(),
             workspace: true,
+        },
+        KernelRequest::ReloadCapsule {
+            id: "astrid-capsule-registry".to_string(),
+        },
+        KernelRequest::UnloadCapsule {
+            id: "astrid-capsule-registry".to_string(),
         },
         KernelRequest::ListCapsules,
         KernelRequest::GetCommands,
@@ -156,21 +162,12 @@ fn agent_group_allows_self_scoped_capsule_surface() {
         .is_err(),
         "agent self:* must not authorize daemon install-target mutation",
     );
-    for req in [
-        KernelRequest::ReloadCapsules,
-        KernelRequest::ReloadCapsule {
-            id: "astrid-capsule-registry".to_string(),
-        },
-        KernelRequest::UnloadCapsule {
-            id: "astrid-capsule-registry".to_string(),
-        },
-    ] {
-        let method = kernel_request_method(&req);
-        assert!(
-            authorize(&profile, &groups, &caller, &req).is_err(),
-            "agent self:* must not authorize daemon-wide {method}",
-        );
-    }
+    let req = KernelRequest::ReloadCapsules;
+    let method = kernel_request_method(&req);
+    assert!(
+        authorize(&profile, &groups, &caller, &req).is_err(),
+        "agent self:* must not authorize daemon-wide {method}",
+    );
 }
 
 #[test]
@@ -334,8 +331,8 @@ fn admin_vs_agent_cross_tenant_matrix() {
         authorize(&admin, &groups, &admin_principal(), &req).unwrap();
     }
 
-    // Agent self:* covers inventory and future caller-workspace install; system:*
-    // and daemon-wide lifecycle stay denied.
+    // Agent self:* covers caller capsule inventory/lifecycle and future
+    // caller-workspace install; system:* and daemon-wide lifecycle stay denied.
     for req in all_requests() {
         let method = kernel_request_method(&req);
         let result = authorize(&agent, &groups, &agent_principal(), &req);
@@ -343,8 +340,6 @@ fn admin_vs_agent_cross_tenant_matrix() {
             KernelRequest::Shutdown { .. }
             | KernelRequest::GetStatus
             | KernelRequest::ReloadCapsules
-            | KernelRequest::ReloadCapsule { .. }
-            | KernelRequest::UnloadCapsule { .. }
             | KernelRequest::InstallCapsule {
                 workspace: false, ..
             } => {

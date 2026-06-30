@@ -2217,6 +2217,8 @@ impl ExecutionEngine for WasmEngine {
                     invoking_principal.clone(),
                 );
                 state.invocation_profile = invocation_profile.clone();
+                state.invocation_env_overlay =
+                    load_invocation_env_overlay(&invoking_principal, state.capsule_id.as_str());
 
                 let invocation_principal: Option<astrid_core::PrincipalId> = caller
                     .and_then(|msg| msg.principal.as_deref())
@@ -2244,20 +2246,6 @@ impl ExecutionEngine for WasmEngine {
                     state.invocation_tmp = bundle.tmp;
                     state.invocation_capsule_log =
                         open_capsule_log(p, state.capsule_id.as_str(), false);
-
-                    // Per-invocation env overlay: reads
-                    // `<home>/.config/env/<capsule>.env.json` so
-                    // `env::var(...)` calls inside this interceptor
-                    // see the invoking principal's operator-written
-                    // overrides instead of the load-time manifest
-                    // defaults. None on missing/malformed file — the
-                    // host falls back to `self.config` (the manifest
-                    // values loaded at capsule boot under the
-                    // load-time principal). See `host_state`'s
-                    // `invocation_env_overlay` doc + `host::sys::get_config`
-                    // for the read path.
-                    state.invocation_env_overlay =
-                        load_invocation_env_overlay(p, state.capsule_id.as_str());
 
                     // Per-invocation secret store: built against the
                     // invocation KV scope so both KV and keychain backends

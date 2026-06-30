@@ -76,7 +76,8 @@ pub use local::{
 };
 pub use manifest_check::{ExportConflict, MissingImport, check_export_conflicts, validate_imports};
 pub use meta::{
-    CapsuleLocation, CapsuleMeta, InstalledCapsule, read_meta, scan_installed_capsules, write_meta,
+    CapsuleLocation, CapsuleMeta, InstalledCapsule, read_meta, scan_installed_capsules,
+    scan_installed_capsules_in_home_for, write_meta,
 };
 pub use paths::{
     resolve_env_path, resolve_env_path_for, resolve_target_dir, resolve_target_dir_for,

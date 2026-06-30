@@ -84,7 +84,7 @@ jobs:
         with:
           repository: unicity-astrid/capsule-registry
           path: capsules/astrid-capsule-registry
-          ref: b4e19431bacf94bc2ddbeaaaa1e88f0b95852956
+          ref: 9058229f0c1f1bc634c52c62dc7a258050413072
 
       - name: Checkout capsule-session
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5

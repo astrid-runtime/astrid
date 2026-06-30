@@ -171,9 +171,10 @@ impl EventDispatcher {
     ///
     /// Once set, dispatch of the user-invocable surface
     /// (`tool.v1.execute.*`, `cli.v1.command.execute`) is filtered to the
-    /// caller's granted capsules (admins bypass; fail-closed for unknown
-    /// callers). Wired by the kernel at boot, mirroring how the fuel and
-    /// memory ledgers are cloned in from the kernel.
+    /// caller's granted capsules; describe fan-outs are narrowed to the
+    /// caller's capsule view. Admins bypass; unknown callers fail closed.
+    /// Wired by the kernel at boot, mirroring how the fuel and memory ledgers
+    /// are cloned in from the kernel.
     #[must_use]
     pub fn with_access_resolver(mut self, resolver: CapsuleAccessResolver) -> Self {
         self.access_resolver = Some(resolver);
@@ -840,8 +841,10 @@ async fn find_matching_interceptors(
     // engages for the user-invocable surface with a resolver present;
     // otherwise every topic dispatches unchanged (orchestration mesh).
     let gate_surface = crate::access::is_user_invocable_surface(topic);
-    let view_scoped_surface =
-        access_resolver.is_some() && (gate_surface || topic == "tool.v1.request.describe");
+    let view_scoped_surface = access_resolver.is_some()
+        && (gate_surface
+            || topic == "tool.v1.request.describe"
+            || topic == "llm.v1.request.describe");
     let registry = registry.read().await;
     let mut matches: Vec<(Arc<dyn crate::capsule::Capsule>, String, u32)> = Vec::new();
     // Dedup grant-on-use signals within a single dispatch pass. This stays

@@ -1259,6 +1259,55 @@ mod access_enforcement {
         handle.abort();
     }
 
+    #[tokio::test]
+    async fn llm_describe_request_is_scoped_to_principal_view() {
+        let (_dir, home, resolver) = resolver_fixture();
+        write_profile(&home, "bob", &agent_with_capsules(&[]));
+
+        let (out_of_view, bus, handle) =
+            spawn_with_capsule(resolver.clone(), "llm-provider", "llm.v1.request.describe");
+        tokio::task::yield_now().await;
+        publish_ipc_as(&bus, "llm.v1.request.describe", "bob");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            !out_of_view.load(Ordering::SeqCst),
+            "LLM describe must not fan out to providers outside the caller's view"
+        );
+        handle.abort();
+
+        let (in_view, bus, handle) = spawn_with_capsule_in_views(
+            resolver,
+            "llm-provider",
+            "llm.v1.request.describe",
+            &["bob"],
+        );
+        tokio::task::yield_now().await;
+        publish_ipc_as(&bus, "llm.v1.request.describe", "bob");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            in_view.load(Ordering::SeqCst),
+            "LLM describe should reach providers in the caller's view"
+        );
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn llm_describe_without_principal_fails_closed() {
+        let (_dir, _home, resolver) = resolver_fixture();
+        let (invoked, bus, handle) =
+            spawn_with_capsule(resolver, "llm-provider", "llm.v1.request.describe");
+
+        tokio::task::yield_now().await;
+        publish_ipc(&bus, "llm.v1.request.describe");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        assert!(
+            !invoked.load(Ordering::SeqCst),
+            "unprincipaled LLM discovery must not fall back to all loaded providers"
+        );
+        handle.abort();
+    }
+
     /// A `None`/`anonymous` caller has no authenticated principal to grant to,
     /// so the gate-miss is a pure silent drop — NO `GrantRequired` is emitted.
     #[tokio::test]

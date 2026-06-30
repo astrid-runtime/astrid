@@ -272,8 +272,7 @@ pub struct HostState {
     ///
     /// Loaded from
     /// `$ASTRID_HOME/home/{principal}/.config/env/{capsule_id}.env.json`
-    /// when the dispatcher establishes a per-invocation context whose
-    /// principal differs from the capsule's load-time principal.
+    /// when the dispatcher or recv path establishes a per-invocation context.
     /// `get_config` checks this overlay before falling back to
     /// [`config`](Self::config) (the manifest defaults loaded at
     /// capsule boot).
@@ -281,9 +280,9 @@ pub struct HostState {
     /// Without this overlay, the gateway's
     /// `POST /api/capsules/{id}/env/{field}` route — which writes to
     /// the per-principal path above — was effectively write-only for
-    /// every principal other than `default`: the capsule's
-    /// `env::var(...)` reads still returned the manifest's
-    /// load-time default. Most visibly, an operator setting
+    /// already-loaded capsules: the capsule's `env::var(...)` reads still
+    /// returned the manifest's load-time default. Most visibly, an operator
+    /// setting
     /// `base_url = http://localhost:1234` on the openai-compat
     /// capsule for a gateway-minted bearer would see their LLM
     /// request still hit `api.openai.com` (the manifest default).

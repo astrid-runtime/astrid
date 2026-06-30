@@ -552,6 +552,12 @@ impl Kernel {
 
         capsule.load(&ctx).await?;
 
+        if !manifest_path.exists() {
+            unload_loaded_capsule_after_source_disappeared(capsule, &id, principal, &manifest_path)
+                .await;
+            return Ok(());
+        }
+
         {
             let mut registry = self.capsules.write().await;
             if registry.get_for(principal, &id).is_some() {
@@ -1320,6 +1326,30 @@ impl Kernel {
             }
         }
     }
+}
+
+async fn unload_loaded_capsule_after_source_disappeared(
+    mut capsule: Box<dyn astrid_capsule::capsule::Capsule>,
+    id: &astrid_capsule::capsule::CapsuleId,
+    principal: &PrincipalId,
+    manifest_path: &Path,
+) {
+    capsule.request_cancel();
+    if let Err(e) = capsule.unload().await {
+        tracing::warn!(
+            capsule_id = %id,
+            principal = %principal,
+            path = %manifest_path.display(),
+            error = %e,
+            "Capsule unload failed after source disappeared before registration"
+        );
+    }
+    tracing::warn!(
+        capsule_id = %id,
+        principal = %principal,
+        path = %manifest_path.display(),
+        "Skipping capsule registration because the source disappeared during load"
+    );
 }
 
 /// Test-only lightweight constructor (issue #672) that builds a

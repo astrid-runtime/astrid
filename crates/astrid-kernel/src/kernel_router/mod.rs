@@ -635,10 +635,8 @@ fn rate_limit_max(req: &KernelRequest) -> Option<u32> {
 /// The authority surface a given [`KernelRequest`] operates over.
 ///
 /// Most `KernelRequest` variants carry no target-principal field, so
-/// [`resolve_scope`] treats read-only inventory/status requests as
-/// [`AuthorityScope::Self_`]. Capsule lifecycle mutations that operate on the
-/// daemon's loaded capsule set are global until a request carries a real
-/// caller-workspace target.
+/// [`resolve_scope`] treats caller-scoped requests as [`AuthorityScope::Self_`].
+/// Full-daemon mutations stay global.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AuthorityScope {
     /// Request operates on the caller's own principal.
@@ -658,8 +656,6 @@ pub enum AuthorityScope {
 pub fn resolve_scope(req: &KernelRequest, _caller: &PrincipalId) -> AuthorityScope {
     match req {
         KernelRequest::ReloadCapsules
-        | KernelRequest::ReloadCapsule { .. }
-        | KernelRequest::UnloadCapsule { .. }
         | KernelRequest::InstallCapsule {
             workspace: false, ..
         } => AuthorityScope::Global,
