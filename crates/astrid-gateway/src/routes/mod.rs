@@ -16,6 +16,7 @@ pub mod agent;
 pub mod audit;
 pub mod auth;
 pub mod caps;
+mod capsule_sources;
 pub mod capsules;
 pub mod distribution;
 pub mod env;

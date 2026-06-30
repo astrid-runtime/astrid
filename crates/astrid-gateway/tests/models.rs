@@ -66,7 +66,6 @@ fn state_with_bus_timeout(
         gateway_route_uuid: Uuid::new_v4(),
         readiness_probe: None,
         topic_probe: None,
-        capsule_source_probe: None,
         registry_timeout,
     })
 }

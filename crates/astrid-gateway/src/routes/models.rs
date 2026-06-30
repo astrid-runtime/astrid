@@ -52,6 +52,7 @@ use uuid::Uuid;
 use astrid_core::PrincipalId;
 
 use crate::error::{ErrorBody, GatewayError, GatewayResult};
+use crate::routes::capsule_sources::{legacy_capsule_source_id, trusted_capsule_source_ids};
 use crate::routes::principals::caller_from;
 use crate::state::GatewayState;
 
@@ -70,11 +71,10 @@ const GET_ACTIVE_REQUEST: &str = "registry.v1.get_active_model";
 const GET_ACTIVE_RESPONSE: &str = "registry.v1.response.get_active_model";
 const SET_ACTIVE_REQUEST: &str = "registry.v1.set_active_model";
 const SET_ACTIVE_RESPONSE: &str = "registry.v1.response.set_active_model";
-const CAPSULE_ID_NAMESPACE: Uuid = Uuid::from_u128(0x310714d5_9c6d_4c94_8187_75258f393bb6);
 const REGISTRY_CAPSULE_ID: &str = "astrid-capsule-registry";
 
 fn registry_capsule_source_id() -> Uuid {
-    Uuid::new_v5(&CAPSULE_ID_NAMESPACE, REGISTRY_CAPSULE_ID.as_bytes())
+    legacy_capsule_source_id(REGISTRY_CAPSULE_ID)
 }
 
 /// Body for `PUT /api/models/active`.
@@ -253,6 +253,12 @@ async fn registry_round_trip(
     // `recv` is bounded by the time REMAINING, so a stream of skipped foreign
     // replies can never extend the total wait past the original budget.
     let timeout = state.registry_timeout.unwrap_or(REGISTRY_TIMEOUT);
+    let expected_source_ids = trusted_capsule_source_ids(REGISTRY_CAPSULE_ID, principal_id);
+    let expected_source_ids = if expected_source_ids.is_empty() {
+        vec![registry_capsule_source_id()]
+    } else {
+        expected_source_ids
+    };
     // `checked_add` over the bare `+` so an absurd timeout can't panic on
     // overflow; saturating to `now` (a zero remaining budget) on overflow is
     // a harmless immediate timeout that the production budget never hits.
@@ -280,7 +286,7 @@ async fn registry_round_trip(
                 "registry reply was not an IPC message"
             )));
         };
-        if message.source_id != registry_capsule_source_id() {
+        if !expected_source_ids.contains(&message.source_id) {
             continue;
         }
         // Extract the guest-facing payload. Capsule `publish_json` arrives as
@@ -429,13 +435,13 @@ pub async fn set_active_model(
 #[cfg(test)]
 mod tests {
     use super::{
-        CAPSULE_ID_NAMESPACE, GET_ACTIVE_REQUEST, GET_ACTIVE_RESPONSE, SetActiveOutcome,
-        classify_set_active_reply, registry_reply_payload_json, registry_round_trip,
-        reply_satisfies_corr_id,
+        GET_ACTIVE_REQUEST, GET_ACTIVE_RESPONSE, SetActiveOutcome, classify_set_active_reply,
+        registry_reply_payload_json, registry_round_trip, reply_satisfies_corr_id,
     };
     use std::sync::Arc;
 
     use crate::error::GatewayError;
+    use crate::routes::capsule_sources::legacy_capsule_source_id;
     use crate::state::{GatewayState, SigningMaterial};
     use astrid_core::PrincipalId;
     use astrid_events::ipc::{IpcMessage, IpcPayload, Topic};
@@ -531,7 +537,6 @@ mod tests {
             gateway_route_uuid: Uuid::new_v4(),
             readiness_probe: None,
             topic_probe: None,
-            capsule_source_probe: None,
             registry_timeout: Some(std::time::Duration::from_millis(150)),
         }
     }
@@ -550,7 +555,7 @@ mod tests {
                 IpcPayload::RawJson(json!({
                     "active_model": { "id": "openai-compat:forged" }
                 })),
-                Uuid::new_v5(&CAPSULE_ID_NAMESPACE, b"astrid-capsule-adversarial"),
+                legacy_capsule_source_id("astrid-capsule-adversarial"),
             )
             .with_principal("alice".to_string());
             bus_bg.publish(AstridEvent::Ipc {

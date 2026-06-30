@@ -1,11 +1,10 @@
 use super::{
-    AstridEvent, CAPSULE_ID_NAMESPACE, Duration, EventBus, EventMetadata, GatewayError,
-    GatewayResult, IpcMessage, IpcPayload, MessageOrigin, PrincipalId, SESSION_CAPSULE_ID, Topic,
-    Uuid, Value,
+    AstridEvent, Duration, EventBus, EventMetadata, GatewayError, GatewayResult, IpcMessage,
+    IpcPayload, MessageOrigin, PrincipalId, SESSION_CAPSULE_ID, Topic, Uuid, Value,
 };
 
 pub(super) fn session_capsule_source_id() -> Uuid {
-    Uuid::new_v5(&CAPSULE_ID_NAMESPACE, SESSION_CAPSULE_ID.as_bytes())
+    crate::routes::capsule_sources::legacy_capsule_source_id(SESSION_CAPSULE_ID)
 }
 
 /// Reusable capsule request/reply-over-bus primitive.

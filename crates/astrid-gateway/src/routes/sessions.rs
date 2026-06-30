@@ -42,6 +42,7 @@ use utoipa::ToSchema;
 use uuid::Uuid;
 
 use crate::error::{ErrorBody, GatewayError, GatewayResult};
+use crate::routes::capsule_sources::trusted_capsule_source_ids;
 use crate::routes::principals::caller_from;
 use crate::state::GatewayState;
 
@@ -73,11 +74,6 @@ const CAPSULE_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Capsule package that owns the session request/reply contract.
 const SESSION_CAPSULE_ID: &str = "astrid-capsule-session";
-
-/// Stable namespace used by the WASM engine to derive kernel-stamped capsule
-/// source UUIDs from package names. Keep in sync with
-/// `astrid-capsule::engine::wasm`.
-const CAPSULE_ID_NAMESPACE: Uuid = Uuid::from_u128(0x310714d5_9c6d_4c94_8187_75258f393bb6);
 
 /// Request topic the gateway publishes a session-list request on. Its
 /// presence in a loaded capsule's interceptor events is also the
@@ -346,7 +342,7 @@ pub async fn list_sessions(
         query.include_archived.unwrap_or(false),
     );
     let response_topic = format!("{TOPIC_LIST_RESPONSE_PREFIX}.{correlation_id}");
-    let expected_sources = session_capsule_source_ids(&state).await;
+    let expected_sources = session_capsule_source_ids(&caller.principal);
 
     let value = request_capsule(
         &bus,
@@ -402,7 +398,7 @@ pub async fn get_session_messages(
     let correlation_id = Uuid::new_v4().to_string();
     let payload = build_messages_payload(&id, &correlation_id);
     let response_topic = format!("{TOPIC_MESSAGES_RESPONSE_PREFIX}.{correlation_id}");
-    let expected_sources = session_capsule_source_ids(&state).await;
+    let expected_sources = session_capsule_source_ids(&caller.principal);
 
     let value = request_capsule(
         &bus,
@@ -469,7 +465,7 @@ pub async fn get_session(
         "session_id": id,
     });
     let response_topic = format!("{TOPIC_GET_META_RESPONSE_PREFIX}.{correlation_id}");
-    let expected_sources = session_capsule_source_ids(&state).await;
+    let expected_sources = session_capsule_source_ids(&caller.principal);
 
     let value = request_capsule(
         &bus,
@@ -537,7 +533,7 @@ pub async fn update_session(
     let correlation_id = Uuid::new_v4().to_string();
     let payload = build_update_payload(&correlation_id, &id, &body)?;
     let response_topic = format!("{TOPIC_UPDATE_RESPONSE_PREFIX}.{correlation_id}");
-    let expected_sources = session_capsule_source_ids(&state).await;
+    let expected_sources = session_capsule_source_ids(&principal);
 
     let value = request_capsule(
         &bus,
@@ -595,7 +591,7 @@ pub async fn delete_session(
         "session_id": id,
     });
     let response_topic = format!("{TOPIC_DELETE_RESPONSE_PREFIX}.{correlation_id}");
-    let expected_sources = session_capsule_source_ids(&state).await;
+    let expected_sources = session_capsule_source_ids(&caller.principal);
 
     let value = request_capsule(
         &bus,
@@ -658,7 +654,7 @@ pub async fn search_sessions(
         query.include_archived.unwrap_or(false),
     );
     let response_topic = format!("{TOPIC_SEARCH_RESPONSE_PREFIX}.{correlation_id}");
-    let expected_sources = session_capsule_source_ids(&state).await;
+    let expected_sources = session_capsule_source_ids(&caller.principal);
 
     let value = request_capsule(
         &bus,
@@ -716,11 +712,8 @@ async fn ensure_session_mgmt_supported(state: &GatewayState) -> GatewayResult<()
     Ok(())
 }
 
-async fn session_capsule_source_ids(state: &GatewayState) -> Vec<Uuid> {
-    match &state.capsule_source_probe {
-        Some(probe) => probe.source_ids(SESSION_CAPSULE_ID).await,
-        None => Vec::new(),
-    }
+fn session_capsule_source_ids(principal: &PrincipalId) -> Vec<Uuid> {
+    trusted_capsule_source_ids(SESSION_CAPSULE_ID, principal)
 }
 
 /// Resolve the effective page size: reject anything over [`MAX_LIMIT`]

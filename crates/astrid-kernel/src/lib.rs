@@ -836,27 +836,6 @@ impl Kernel {
         })
     }
 
-    /// In-process probe for live runtime source UUIDs by capsule package ID.
-    ///
-    /// Gateway request/reply routes use this to verify capsule response
-    /// provenance against the same registry the dispatcher uses, instead of
-    /// hardcoding legacy package-name UUIDs that drift under per-principal
-    /// content-addressed loading.
-    #[must_use]
-    pub fn capsule_source_probe(&self) -> astrid_core::kernel_api::CapsuleSourceProbe {
-        let registry = Arc::clone(&self.capsules);
-        astrid_core::kernel_api::CapsuleSourceProbe::new(move |capsule_id: String| {
-            let registry = Arc::clone(&registry);
-            Box::pin(async move {
-                let Ok(id) = astrid_capsule::capsule::CapsuleId::new(capsule_id) else {
-                    return Vec::new();
-                };
-                let reg = registry.read().await;
-                reg.source_ids_for(&id)
-            })
-        })
-    }
-
     /// Publish `astrid.v1.capsules_loaded` so subscribers re-read the current
     /// capsule/tool set after the loaded set changes — the registry, and the
     /// `astrid mcp serve` shim, which turns this into an MCP

@@ -807,7 +807,8 @@ async fn request_capsule_ignores_wrong_capsule_source_reply() {
             }],
             "next_cursor": null
         });
-        let wrong_source = Uuid::new_v5(&CAPSULE_ID_NAMESPACE, b"astrid-capsule-adversarial");
+        let wrong_source =
+            crate::routes::capsule_sources::legacy_capsule_source_id("astrid-capsule-adversarial");
         let msg = IpcMessage::new(
             Topic::from_raw(resp_topic),
             IpcPayload::RawJson(reply),

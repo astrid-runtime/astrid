@@ -10,7 +10,6 @@
 //! only the wire shape is defined here.
 
 use serde::{Deserialize, Serialize};
-use uuid::Uuid;
 
 /// Whether the loaded capsule set can serve an agent chat turn. Name-agnostic
 /// (no capsule name hardcoded): the prompt topic needs a subscriber, the reply
@@ -124,48 +123,6 @@ impl CapsuleTopicProbe {
 impl std::fmt::Debug for CapsuleTopicProbe {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("CapsuleTopicProbe(..)")
-    }
-}
-
-/// In-process probe returning the kernel-stamped IPC source UUIDs for a loaded
-/// capsule package.
-///
-/// Source UUIDs are runtime-instance identifiers, not package-name constants:
-/// per-principal/content-addressed loading includes the owning principal and
-/// artifact hash in the UUID seed. Gateway routes that trust capsule replies
-/// use this probe to follow the live registry across reloads while still
-/// rejecting same-topic responses from unrelated capsules.
-#[derive(Clone)]
-pub struct CapsuleSourceProbe(
-    #[allow(clippy::type_complexity)]
-    std::sync::Arc<
-        dyn Fn(String) -> std::pin::Pin<Box<dyn std::future::Future<Output = Vec<Uuid>> + Send>>
-            + Send
-            + Sync,
-    >,
-);
-
-impl CapsuleSourceProbe {
-    /// Wrap a closure that returns the currently loaded source UUIDs for
-    /// `capsule_id`.
-    pub fn new(
-        f: impl Fn(String) -> std::pin::Pin<Box<dyn std::future::Future<Output = Vec<Uuid>> + Send>>
-        + Send
-        + Sync
-        + 'static,
-    ) -> Self {
-        Self(std::sync::Arc::new(f))
-    }
-
-    /// Return every loaded runtime source UUID for `capsule_id`.
-    pub async fn source_ids(&self, capsule_id: &str) -> Vec<Uuid> {
-        (self.0)(capsule_id.to_string()).await
-    }
-}
-
-impl std::fmt::Debug for CapsuleSourceProbe {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("CapsuleSourceProbe(..)")
     }
 }
 

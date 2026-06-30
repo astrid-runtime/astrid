@@ -264,8 +264,6 @@ pub struct GatewayState {
     /// session capsule implements the 1.1 verbs, instead of waiting out the
     /// bus timeout.
     pub topic_probe: Option<astrid_core::kernel_api::CapsuleTopicProbe>,
-    /// In-process probe for live capsule response source UUIDs.
-    pub capsule_source_probe: Option<astrid_core::kernel_api::CapsuleSourceProbe>,
     /// Optional override for the registry round-trip wait budget. `None`
     /// in production, where the model routes fall back to their built-in
     /// default of 10 seconds. Tests that assert a *negative* round-trip
@@ -288,7 +286,6 @@ impl GatewayState {
         session_id: Option<astrid_core::SessionId>,
         readiness_probe: Option<astrid_core::kernel_api::AgentReadinessProbe>,
         topic_probe: Option<astrid_core::kernel_api::CapsuleTopicProbe>,
-        capsule_source_probe: Option<astrid_core::kernel_api::CapsuleSourceProbe>,
     ) -> anyhow::Result<Arc<Self>> {
         let (distribution, onboarding) = match &config.distro_path {
             Some(p) => {
@@ -332,7 +329,6 @@ impl GatewayState {
             gateway_route_uuid: Uuid::new_v4(),
             readiness_probe,
             topic_probe,
-            capsule_source_probe,
             registry_timeout: None,
         }))
     }
