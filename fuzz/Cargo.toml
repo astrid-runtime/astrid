@@ -13,18 +13,41 @@ cargo-fuzz = true
 arbitrary = { version = "1", features = ["derive"] }
 astrid-capabilities = { path = "../crates/astrid-capabilities", optional = true }
 astrid-capsule = { path = "../crates/astrid-capsule", features = ["fuzzing"], optional = true }
+astrid-config = { path = "../crates/astrid-config", optional = true }
 astrid-core = { path = "../crates/astrid-core", optional = true }
 astrid-crypto = { path = "../crates/astrid-crypto", optional = true }
 astrid-events = { path = "../crates/astrid-events", optional = true }
+astrid-gateway = { path = "../crates/astrid-gateway", optional = true }
 libfuzzer-sys = "0.4"
+serde = { version = "1", optional = true }
+serde_json = { version = "1", optional = true }
+toml = { version = "0.9", optional = true }
 
 [features]
-default = ["core-target", "crypto-target", "events-target"]
+default = [
+    "admin-json-target",
+    "config-target",
+    "core-target",
+    "crypto-target",
+    "events-target",
+]
+admin-json-target = ["core-target", "dep:serde", "dep:serde_json"]
 capabilities-target = ["dep:astrid-capabilities"]
+capsule-target = ["dep:astrid-capsule", "dep:toml"]
+config-target = ["dep:astrid-config", "dep:toml"]
 core-target = ["dep:astrid-core"]
 crypto-target = ["dep:astrid-crypto"]
 events-target = ["dep:astrid-events"]
-ssrf-target = ["core-target", "dep:astrid-capsule"]
+gateway-target = ["dep:astrid-gateway", "dep:serde", "dep:serde_json"]
+ssrf-target = ["core-target", "capsule-target"]
+
+[[bin]]
+name = "admin_json"
+path = "fuzz_targets/admin_json.rs"
+test = false
+doc = false
+bench = false
+required-features = ["admin-json-target"]
 
 [[bin]]
 name = "capability_patterns"
@@ -43,12 +66,36 @@ bench = false
 required-features = ["crypto-target"]
 
 [[bin]]
+name = "config_toml"
+path = "fuzz_targets/config_toml.rs"
+test = false
+doc = false
+bench = false
+required-features = ["config-target"]
+
+[[bin]]
+name = "gateway_request_json"
+path = "fuzz_targets/gateway_request_json.rs"
+test = false
+doc = false
+bench = false
+required-features = ["gateway-target"]
+
+[[bin]]
 name = "ip_blockset"
 path = "fuzz_targets/ip_blockset.rs"
 test = false
 doc = false
 bench = false
 required-features = ["core-target"]
+
+[[bin]]
+name = "manifest_toml"
+path = "fuzz_targets/manifest_toml.rs"
+test = false
+doc = false
+bench = false
+required-features = ["capsule-target"]
 
 [[bin]]
 name = "ssrf_helpers"
