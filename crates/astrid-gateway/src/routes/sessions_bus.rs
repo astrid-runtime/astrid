@@ -28,6 +28,7 @@ pub(super) async fn request_capsule(
     correlation_id: &str,
     principal: &PrincipalId,
     device_key_id: Option<&str>,
+    expected_source_ids: &[Uuid],
     timeout: Duration,
 ) -> GatewayResult<Value> {
     // Subscribe before publish so a fast capsule cannot race the waiter.
@@ -58,7 +59,11 @@ pub(super) async fn request_capsule(
     let deadline = tokio::time::Instant::now()
         .checked_add(timeout)
         .unwrap_or_else(tokio::time::Instant::now);
-    let expected_source_id = session_capsule_source_id();
+    let expected_source_ids = if expected_source_ids.is_empty() {
+        vec![session_capsule_source_id()]
+    } else {
+        expected_source_ids.to_vec()
+    };
 
     loop {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
@@ -73,7 +78,7 @@ pub(super) async fn request_capsule(
         let AstridEvent::Ipc { message, .. } = &*event else {
             continue;
         };
-        if message.source_id != expected_source_id {
+        if !expected_source_ids.contains(&message.source_id) {
             continue;
         }
         let Ok(value) = session_reply_payload_json(&message.payload) else {

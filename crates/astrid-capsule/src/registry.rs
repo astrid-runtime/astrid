@@ -340,6 +340,15 @@ impl CapsuleRegistry {
         self.uuid_id_map.get(uuid)
     }
 
+    /// Return all loaded runtime source UUIDs for a capsule ID.
+    #[must_use]
+    pub fn source_ids_for(&self, id: &CapsuleId) -> Vec<Uuid> {
+        self.uuid_id_map
+            .iter()
+            .filter_map(|(uuid, mapped_id)| (mapped_id == id).then_some(*uuid))
+            .collect()
+    }
+
     /// Whether this content-addressed instance is already loaded.
     #[must_use]
     pub fn contains_hash(&self, hash: &WasmHash) -> bool {

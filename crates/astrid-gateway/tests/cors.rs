@@ -50,6 +50,7 @@ fn state_with_origins(origins: Vec<&str>) -> Arc<GatewayState> {
         gateway_route_uuid: uuid::Uuid::new_v4(),
         readiness_probe: None,
         topic_probe: None,
+        capsule_source_probe: None,
         registry_timeout: None,
     })
 }

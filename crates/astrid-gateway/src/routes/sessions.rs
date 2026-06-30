@@ -346,6 +346,7 @@ pub async fn list_sessions(
         query.include_archived.unwrap_or(false),
     );
     let response_topic = format!("{TOPIC_LIST_RESPONSE_PREFIX}.{correlation_id}");
+    let expected_sources = session_capsule_source_ids(&state).await;
 
     let value = request_capsule(
         &bus,
@@ -355,6 +356,7 @@ pub async fn list_sessions(
         &correlation_id,
         &caller.principal,
         caller.device_key_id.as_deref(),
+        &expected_sources,
         CAPSULE_TIMEOUT,
     )
     .await?;
@@ -400,6 +402,7 @@ pub async fn get_session_messages(
     let correlation_id = Uuid::new_v4().to_string();
     let payload = build_messages_payload(&id, &correlation_id);
     let response_topic = format!("{TOPIC_MESSAGES_RESPONSE_PREFIX}.{correlation_id}");
+    let expected_sources = session_capsule_source_ids(&state).await;
 
     let value = request_capsule(
         &bus,
@@ -409,6 +412,7 @@ pub async fn get_session_messages(
         &correlation_id,
         &caller.principal,
         caller.device_key_id.as_deref(),
+        &expected_sources,
         CAPSULE_TIMEOUT,
     )
     .await?;
@@ -465,6 +469,7 @@ pub async fn get_session(
         "session_id": id,
     });
     let response_topic = format!("{TOPIC_GET_META_RESPONSE_PREFIX}.{correlation_id}");
+    let expected_sources = session_capsule_source_ids(&state).await;
 
     let value = request_capsule(
         &bus,
@@ -474,6 +479,7 @@ pub async fn get_session(
         &correlation_id,
         &caller.principal,
         caller.device_key_id.as_deref(),
+        &expected_sources,
         CAPSULE_TIMEOUT,
     )
     .await?;
@@ -531,6 +537,7 @@ pub async fn update_session(
     let correlation_id = Uuid::new_v4().to_string();
     let payload = build_update_payload(&correlation_id, &id, &body)?;
     let response_topic = format!("{TOPIC_UPDATE_RESPONSE_PREFIX}.{correlation_id}");
+    let expected_sources = session_capsule_source_ids(&state).await;
 
     let value = request_capsule(
         &bus,
@@ -540,6 +547,7 @@ pub async fn update_session(
         &correlation_id,
         &principal,
         device_key_id.as_deref(),
+        &expected_sources,
         CAPSULE_TIMEOUT,
     )
     .await?;
@@ -587,6 +595,7 @@ pub async fn delete_session(
         "session_id": id,
     });
     let response_topic = format!("{TOPIC_DELETE_RESPONSE_PREFIX}.{correlation_id}");
+    let expected_sources = session_capsule_source_ids(&state).await;
 
     let value = request_capsule(
         &bus,
@@ -596,6 +605,7 @@ pub async fn delete_session(
         &correlation_id,
         &caller.principal,
         caller.device_key_id.as_deref(),
+        &expected_sources,
         CAPSULE_TIMEOUT,
     )
     .await?;
@@ -648,6 +658,7 @@ pub async fn search_sessions(
         query.include_archived.unwrap_or(false),
     );
     let response_topic = format!("{TOPIC_SEARCH_RESPONSE_PREFIX}.{correlation_id}");
+    let expected_sources = session_capsule_source_ids(&state).await;
 
     let value = request_capsule(
         &bus,
@@ -657,6 +668,7 @@ pub async fn search_sessions(
         &correlation_id,
         &caller.principal,
         caller.device_key_id.as_deref(),
+        &expected_sources,
         CAPSULE_TIMEOUT,
     )
     .await?;
@@ -702,6 +714,13 @@ async fn ensure_session_mgmt_supported(state: &GatewayState) -> GatewayResult<()
         ));
     }
     Ok(())
+}
+
+async fn session_capsule_source_ids(state: &GatewayState) -> Vec<Uuid> {
+    match &state.capsule_source_probe {
+        Some(probe) => probe.source_ids(SESSION_CAPSULE_ID).await,
+        None => Vec::new(),
+    }
 }
 
 /// Resolve the effective page size: reject anything over [`MAX_LIMIT`]

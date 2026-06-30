@@ -531,6 +531,7 @@ mod tests {
             gateway_route_uuid: Uuid::new_v4(),
             readiness_probe: None,
             topic_probe: None,
+            capsule_source_probe: None,
             registry_timeout: Some(std::time::Duration::from_millis(150)),
         }
     }

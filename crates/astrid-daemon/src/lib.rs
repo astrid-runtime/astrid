@@ -338,6 +338,7 @@ fn spawn_gateway(
     let session_id = kernel.session_id.clone();
     let readiness_probe = kernel.agent_readiness_probe();
     let topic_probe = kernel.capsule_topic_probe();
+    let capsule_source_probe = kernel.capsule_source_probe();
     let state = astrid_gateway::GatewayState::new(
         cfg,
         Some(bus),
@@ -345,6 +346,7 @@ fn spawn_gateway(
         Some(session_id),
         Some(readiness_probe),
         Some(topic_probe),
+        Some(capsule_source_probe),
     )
     .context("build gateway state")?;
     let notify = std::sync::Arc::new(tokio::sync::Notify::new());

@@ -267,6 +267,7 @@ async fn request_capsule_round_trips_scoped_reply() {
         correlation_id,
         &principal,
         None,
+        &[],
         CAPSULE_TIMEOUT,
     )
     .await
@@ -324,6 +325,7 @@ async fn request_capsule_round_trips_custom_json_reply() {
         correlation_id,
         &principal,
         None,
+        &[],
         CAPSULE_TIMEOUT,
     )
     .await
@@ -333,6 +335,62 @@ async fn request_capsule_round_trips_custom_json_reply() {
     let parsed = parse_list_response(value).expect("reply deserializes");
     assert!(parsed.sessions.is_empty());
     assert!(parsed.next_cursor.is_none());
+}
+
+#[tokio::test]
+async fn request_capsule_accepts_live_registry_source_id() {
+    let bus = Arc::new(EventBus::new());
+    let principal = PrincipalId::new("alice").expect("valid principal");
+    let correlation_id = "corr-live-source-1";
+    let response_topic = format!("{TOPIC_LIST_RESPONSE_PREFIX}.{correlation_id}");
+    let live_source = Uuid::new_v4();
+    assert_ne!(live_source, session_capsule_source_id());
+
+    let mut req_rx = bus.subscribe_topic(TOPIC_LIST_REQUEST.to_string());
+    let bus_capsule = Arc::clone(&bus);
+    let resp_topic = response_topic.clone();
+    let cid = correlation_id.to_string();
+    let capsule = tokio::spawn(async move {
+        let event = req_rx.recv().await.expect("request arrives");
+        let reply = serde_json::json!({
+            "correlation_id": cid,
+            "sessions": [],
+            "next_cursor": null
+        });
+        let mut msg = IpcMessage::new(
+            Topic::from_raw(resp_topic.clone()),
+            IpcPayload::RawJson(reply),
+            live_source,
+        );
+        if let AstridEvent::Ipc { message, .. } = &*event
+            && let Some(principal) = &message.principal
+        {
+            msg = msg.with_principal(principal.clone());
+        }
+        bus_capsule.publish(AstridEvent::Ipc {
+            metadata: EventMetadata::new("test::live-session-source"),
+            message: msg,
+        });
+    });
+
+    let payload = build_list_payload(correlation_id, None, DEFAULT_LIMIT, false);
+    let value = request_capsule(
+        &bus,
+        TOPIC_LIST_REQUEST,
+        &response_topic,
+        payload,
+        correlation_id,
+        &principal,
+        None,
+        &[live_source],
+        CAPSULE_TIMEOUT,
+    )
+    .await
+    .expect("helper accepts the registry-provided source id");
+
+    capsule.await.expect("stand-in capsule task joins");
+    let parsed = parse_list_response(value).expect("reply deserializes");
+    assert!(parsed.sessions.is_empty());
 }
 
 #[test]
@@ -666,6 +724,7 @@ async fn request_capsule_round_trips_update_reply() {
         correlation_id,
         &principal,
         None,
+        &[],
         CAPSULE_TIMEOUT,
     )
     .await
@@ -718,6 +777,7 @@ async fn request_capsule_ignores_wrong_principal_reply() {
         correlation_id,
         &principal,
         None,
+        &[],
         Duration::from_millis(150),
     )
     .await
@@ -769,6 +829,7 @@ async fn request_capsule_ignores_wrong_capsule_source_reply() {
         correlation_id,
         &principal,
         None,
+        &[],
         Duration::from_millis(150),
     )
     .await
@@ -819,6 +880,7 @@ async fn request_capsule_ignores_mismatched_correlation() {
         correlation_id,
         &principal,
         None,
+        &[],
         // Short timeout — we expect the mismatched reply to be skipped
         // and the call to time out rather than return a foreign body.
         Duration::from_millis(150),
