@@ -29,6 +29,7 @@ pub mod socket;
 use arc_swap::ArcSwap;
 use astrid_audit::AuditLog;
 use astrid_capabilities::{CapabilityStore, DirHandle};
+use astrid_capsule::capsule::CapsuleId;
 use astrid_capsule::profile_cache::PrincipalProfileCache;
 use astrid_capsule::registry::CapsuleRegistry;
 use astrid_core::SessionId;
@@ -826,9 +827,18 @@ impl Kernel {
             let any_registry = Arc::clone(&any_registry);
             let principal_registry = Arc::clone(&principal_registry);
             Box::pin(async move {
-                if let Some((principal, scoped_topic)) = Self::split_scoped_topic_probe_key(&topic)
+                if let Some((principal, capsule_id, scoped_topic)) =
+                    Self::split_scoped_topic_probe_key(&topic)
                 {
                     let reg = principal_registry.read().await;
+                    if let Some(capsule_id) = capsule_id {
+                        return reg.get_for(&principal, &capsule_id).is_some_and(|capsule| {
+                            astrid_capsule::readiness::manifest_subscribes_topic(
+                                capsule.manifest(),
+                                &scoped_topic,
+                            )
+                        });
+                    }
                     return reg.cloned_values_for(&principal).iter().any(|capsule| {
                         astrid_capsule::readiness::manifest_subscribes_topic(
                             capsule.manifest(),
@@ -851,11 +861,20 @@ impl Kernel {
         })
     }
 
-    fn split_scoped_topic_probe_key(raw: &str) -> Option<(PrincipalId, String)> {
+    fn split_scoped_topic_probe_key(raw: &str) -> Option<(PrincipalId, Option<CapsuleId>, String)> {
         let rest = raw.strip_prefix(SCOPED_TOPIC_PROBE_SENTINEL)?;
-        let (principal, topic) = rest.split_once('\0')?;
+        let mut parts = rest.splitn(3, '\0');
+        let principal = parts.next()?;
+        let second = parts.next()?;
+        let third = parts.next();
         let principal = PrincipalId::new(principal).ok()?;
-        Some((principal, topic.to_string()))
+        match third {
+            Some(topic) => {
+                let capsule_id = CapsuleId::new(second).ok()?;
+                Some((principal, Some(capsule_id), topic.to_string()))
+            },
+            None => Some((principal, None, second.to_string())),
+        }
     }
 
     /// Publish `astrid.v1.capsules_loaded` so subscribers re-read the current

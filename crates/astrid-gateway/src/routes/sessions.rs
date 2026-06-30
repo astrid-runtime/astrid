@@ -719,7 +719,11 @@ async fn ensure_session_mgmt_supported(
     let started = tokio::time::Instant::now();
     loop {
         if probe
-            .is_subscribed(&scoped_topic_probe_key(principal, TOPIC_LIST_REQUEST))
+            .is_subscribed(&scoped_topic_probe_key(
+                principal,
+                SESSION_CAPSULE_ID,
+                TOPIC_LIST_REQUEST,
+            ))
             .await
         {
             return Ok(());
@@ -739,8 +743,8 @@ fn session_capsule_source_ids(principal: &PrincipalId) -> Vec<Uuid> {
     trusted_capsule_source_ids(SESSION_CAPSULE_ID, principal)
 }
 
-fn scoped_topic_probe_key(principal: &PrincipalId, topic: &str) -> String {
-    format!("{SCOPED_TOPIC_PROBE_SENTINEL}{principal}\0{topic}")
+fn scoped_topic_probe_key(principal: &PrincipalId, capsule_id: &str, topic: &str) -> String {
+    format!("{SCOPED_TOPIC_PROBE_SENTINEL}{principal}\0{capsule_id}\0{topic}")
 }
 
 /// Resolve the effective page size: reject anything over [`MAX_LIMIT`]

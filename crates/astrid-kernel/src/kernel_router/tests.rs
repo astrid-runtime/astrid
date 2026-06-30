@@ -6,7 +6,8 @@ use super::*;
 use astrid_capsule::capsule::{Capsule, CapsuleId, CapsuleState};
 use astrid_capsule::context::CapsuleContext;
 use astrid_capsule::error::CapsuleResult;
-use astrid_capsule::manifest::{CapsuleManifest, CommandDef, PackageDef};
+use astrid_capsule::manifest::{CapsuleManifest, CommandDef, PackageDef, SubscribeDef};
+use astrid_capsule::registry::WasmHash;
 use astrid_core::kernel_api::CommandKind;
 use astrid_core::profile::PrincipalProfile;
 
@@ -48,6 +49,23 @@ impl InventoryCapsule {
                 ..Default::default()
             },
         }
+    }
+
+    fn with_subscribe(mut self, topic: &str) -> Self {
+        self.manifest.subscribes.insert(
+            topic.to_string(),
+            SubscribeDef {
+                wit: "opaque".to_string(),
+                version: None,
+                tag: None,
+                rev: None,
+                branch: None,
+                path: None,
+                handler: Some("handle".to_string()),
+                priority: None,
+            },
+        );
+        self
     }
 }
 
@@ -841,5 +859,52 @@ async fn capsule_topic_probe_reflects_loaded_registry_without_capability() {
     assert!(
         !probe.is_subscribed("session.v1.request.list").await,
         "empty registry must have no subscriber for the session list verb"
+    );
+}
+
+#[tokio::test]
+async fn capsule_topic_probe_can_target_exact_capsule_in_principal_view() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let home = astrid_core::dirs::AstridHome::from_path(dir.path());
+    let kernel = crate::test_kernel_with_home(home).await;
+    let principal = PrincipalId::new("regular-user").expect("valid principal");
+    let topic = "session.v1.request.list";
+
+    {
+        let mut registry = kernel.capsules.write().await;
+        let hostile = InventoryCapsule::new("astrid-capsule-adversarial", "adversarial")
+            .with_subscribe(topic);
+        registry
+            .register_for(
+                Box::new(hostile),
+                WasmHash::synthetic("astrid-capsule-adversarial", "0.0.1"),
+                &principal,
+            )
+            .expect("register hostile fixture");
+    }
+
+    let probe = kernel.capsule_topic_probe();
+    let hostile_key = format!(
+        "{}{}\0{}\0{}",
+        crate::SCOPED_TOPIC_PROBE_SENTINEL,
+        principal,
+        "astrid-capsule-adversarial",
+        topic
+    );
+    let session_key = format!(
+        "{}{}\0{}\0{}",
+        crate::SCOPED_TOPIC_PROBE_SENTINEL,
+        principal,
+        "astrid-capsule-session",
+        topic
+    );
+
+    assert!(
+        probe.is_subscribed(&hostile_key).await,
+        "exact hostile capsule probe should see the hostile subscriber"
+    );
+    assert!(
+        !probe.is_subscribed(&session_key).await,
+        "session readiness must not be satisfied by a different capsule with the same topic"
     );
 }
