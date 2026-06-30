@@ -44,6 +44,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use tokio::sync::{Mutex, RwLock};
 
+const SCOPED_TOPIC_PROBE_SENTINEL: &str = "\0astrid.scoped-topic\0";
+
 /// The core Operating System Kernel.
 pub struct Kernel {
     /// The unique identifier for this kernel session.
@@ -813,16 +815,29 @@ impl Kernel {
     /// computed from the live registry without a capability check. Mirrors
     /// [`Self::agent_readiness_probe`]; the co-located gateway uses it to
     /// gracefully degrade a route whose backing verb a pre-upgrade capsule
-    /// may not handle (e.g. answer `501` instead of waiting out a bus
-    /// timeout), for every authenticated caller — capsule serviceability is
-    /// global daemon health, not per-principal authorization.
+    /// may not handle (e.g. answer `501` instead of waiting out a bus timeout),
+    /// and lets routes wait for a caller's async-warmed capsule view without
+    /// going through capability-gated inventory APIs.
     #[must_use]
     pub fn capsule_topic_probe(&self) -> astrid_core::kernel_api::CapsuleTopicProbe {
-        let registry = Arc::clone(&self.capsules);
+        let any_registry = Arc::clone(&self.capsules);
+        let principal_registry = Arc::clone(&self.capsules);
         astrid_core::kernel_api::CapsuleTopicProbe::new(move |topic: String| {
-            let registry = Arc::clone(&registry);
+            let any_registry = Arc::clone(&any_registry);
+            let principal_registry = Arc::clone(&principal_registry);
             Box::pin(async move {
-                let reg = registry.read().await;
+                if let Some((principal, scoped_topic)) = Self::split_scoped_topic_probe_key(&topic)
+                {
+                    let reg = principal_registry.read().await;
+                    return reg.cloned_values_for(&principal).iter().any(|capsule| {
+                        astrid_capsule::readiness::manifest_subscribes_topic(
+                            capsule.manifest(),
+                            &scoped_topic,
+                        )
+                    });
+                }
+
+                let reg = any_registry.read().await;
                 // Short-circuit on the first loaded capsule that subscribes the
                 // topic — no need to materialise the manifest list or the full
                 // subscriber set just to answer a boolean.
@@ -834,6 +849,13 @@ impl Kernel {
                 })
             })
         })
+    }
+
+    fn split_scoped_topic_probe_key(raw: &str) -> Option<(PrincipalId, String)> {
+        let rest = raw.strip_prefix(SCOPED_TOPIC_PROBE_SENTINEL)?;
+        let (principal, topic) = rest.split_once('\0')?;
+        let principal = PrincipalId::new(principal).ok()?;
+        Some((principal, topic.to_string()))
     }
 
     /// Publish `astrid.v1.capsules_loaded` so subscribers re-read the current

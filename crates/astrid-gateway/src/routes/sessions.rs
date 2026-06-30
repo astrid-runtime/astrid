@@ -72,6 +72,16 @@ const MAX_SESSION_ID_LEN: usize = 256;
 /// across bus-proxied endpoints.
 const CAPSULE_TIMEOUT: Duration = Duration::from_secs(15);
 
+/// Poll cadence while waiting for the caller's session capsule runtime to
+/// finish async warm-up before publishing a request that would otherwise be
+/// dropped.
+const CAPSULE_PROBE_INTERVAL: Duration = Duration::from_millis(100);
+
+/// Internal topic-probe sentinel understood by the co-located kernel probe.
+/// This is deliberately not an IPC topic: it only travels through the
+/// in-process [`CapsuleTopicProbe`] closure.
+const SCOPED_TOPIC_PROBE_SENTINEL: &str = "\0astrid.scoped-topic\0";
+
 /// Capsule package that owns the session request/reply contract.
 const SESSION_CAPSULE_ID: &str = "astrid-capsule-session";
 
@@ -333,7 +343,7 @@ pub async fn list_sessions(
     // with an honest 501 rather than hanging to the bus timeout on a verb
     // nobody handles. The transcript route needs no such gate — its verb
     // exists in 1.0.
-    ensure_session_mgmt_supported(&state).await?;
+    ensure_session_mgmt_supported(&state, &caller.principal).await?;
     let correlation_id = Uuid::new_v4().to_string();
     let payload = build_list_payload(
         &correlation_id,
@@ -457,7 +467,7 @@ pub async fn get_session(
     // `get_meta` is a 1.1 verb, so gate it like update/delete/search: a
     // pre-1.1 capsule answers an honest 501 rather than hanging to the bus
     // timeout. (The transcript route needs no gate — `get_messages` is 1.0.)
-    ensure_session_mgmt_supported(&state).await?;
+    ensure_session_mgmt_supported(&state, &caller.principal).await?;
     let bus = require_bus(&state)?;
     let correlation_id = Uuid::new_v4().to_string();
     let payload = serde_json::json!({
@@ -523,7 +533,7 @@ pub async fn update_session(
     metrics::counter!("astrid_gateway_agent_sessions_update_total").increment(1);
 
     validate_session_id(&id)?;
-    ensure_session_mgmt_supported(&state).await?;
+    ensure_session_mgmt_supported(&state, &caller.principal).await?;
     let bus = require_bus(&state)?;
 
     // Read the body as a raw JSON object so we can forward ONLY the keys
@@ -583,7 +593,7 @@ pub async fn delete_session(
     metrics::counter!("astrid_gateway_agent_sessions_delete_total").increment(1);
 
     validate_session_id(&id)?;
-    ensure_session_mgmt_supported(&state).await?;
+    ensure_session_mgmt_supported(&state, &caller.principal).await?;
     let bus = require_bus(&state)?;
     let correlation_id = Uuid::new_v4().to_string();
     let payload = serde_json::json!({
@@ -643,7 +653,7 @@ pub async fn search_sessions(
 
     let q = validate_search_query(&query.q)?;
     let limit = resolve_search_limit(query.limit)?;
-    ensure_session_mgmt_supported(&state).await?;
+    ensure_session_mgmt_supported(&state, &caller.principal).await?;
     let bus = require_bus(&state)?;
     let correlation_id = Uuid::new_v4().to_string();
     let payload = build_search_payload(
@@ -683,9 +693,9 @@ fn require_bus(state: &GatewayState) -> GatewayResult<Arc<EventBus>> {
     })
 }
 
-/// Gate the list route on the session `list` capability being present in
-/// the loaded capsule set, so a mixed 1.0/1.1 fleet behaves honestly: a
-/// pre-1.1 session capsule yields an immediate `NotImplemented` (501) on the
+/// Gate the list route on the session `list` capability being present in the
+/// caller principal's loaded capsule view, so a mixed 1.0/1.1 fleet behaves
+/// honestly: a pre-1.1 session capsule yields `NotImplemented` (501) on the
 /// 1.1 thread-management routes (`list` / `get_meta` / `update` / `delete` /
 /// `search`) instead of waiting out the bus timeout on a verb nobody handles.
 /// It probes the `list` verb specifically as a proxy — the whole 1.1 verb set
@@ -693,27 +703,44 @@ fn require_bus(state: &GatewayState) -> GatewayResult<Arc<EventBus>> {
 ///
 /// Uses the in-process [`CapsuleTopicProbe`] — a cap-free read of the live
 /// registry, the same approach `POST /api/agent/prompt` takes for its
-/// fail-fast. Capsule serviceability is global daemon health, not
-/// per-principal authorization, so this must NOT route through the
-/// capability-gated `GetCapsuleMetadata` (which would 403 an ordinary
-/// caller and leak the capsule inventory). When the probe is absent (a
-/// standalone gateway with no kernel), the gate is skipped and the bus
+/// fail-fast. The check is principal-scoped because default is not a shared
+/// fallback: a loaded default session capsule says nothing about whether the
+/// caller's own runtime has finished async warm-up. When the probe is absent
+/// (a standalone gateway with no kernel), the gate is skipped and the bus
 /// round-trip governs the outcome.
-async fn ensure_session_mgmt_supported(state: &GatewayState) -> GatewayResult<()> {
-    if let Some(probe) = &state.topic_probe
-        && !probe.is_subscribed(TOPIC_LIST_REQUEST).await
-    {
-        return Err(GatewayError::NotImplemented(
-            "no loaded session capsule implements the 1.1 conversation-management \
-             verbs (list / get_meta / update / delete / search)"
-                .into(),
-        ));
+async fn ensure_session_mgmt_supported(
+    state: &GatewayState,
+    principal: &PrincipalId,
+) -> GatewayResult<()> {
+    let Some(probe) = &state.topic_probe else {
+        return Ok(());
+    };
+
+    let started = tokio::time::Instant::now();
+    loop {
+        if probe
+            .is_subscribed(&scoped_topic_probe_key(principal, TOPIC_LIST_REQUEST))
+            .await
+        {
+            return Ok(());
+        }
+        if started.elapsed() >= CAPSULE_TIMEOUT {
+            return Err(GatewayError::NotImplemented(
+                "no loaded session capsule implements the 1.1 conversation-management \
+                 verbs (list / get_meta / update / delete / search)"
+                    .into(),
+            ));
+        }
+        tokio::time::sleep(CAPSULE_PROBE_INTERVAL).await;
     }
-    Ok(())
 }
 
 fn session_capsule_source_ids(principal: &PrincipalId) -> Vec<Uuid> {
     trusted_capsule_source_ids(SESSION_CAPSULE_ID, principal)
+}
+
+fn scoped_topic_probe_key(principal: &PrincipalId, topic: &str) -> String {
+    format!("{SCOPED_TOPIC_PROBE_SENTINEL}{principal}\0{topic}")
 }
 
 /// Resolve the effective page size: reject anything over [`MAX_LIMIT`]
