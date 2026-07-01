@@ -837,9 +837,9 @@ async fn find_matching_interceptors(
     access_resolver: Option<&CapsuleAccessResolver>,
     event_bus: &EventBus,
 ) -> Vec<(Arc<dyn crate::capsule::Capsule>, String, u32)> {
-    // Compute the gate once per event, not per capsule. The filter only
-    // engages for the user-invocable surface with a resolver present;
-    // otherwise every topic dispatches unchanged (orchestration mesh).
+    // Compute the gate once per event, not per capsule. Principal-stamped
+    // dispatch is view-scoped when a resolver is present; grant-on-use only
+    // engages for the narrower user-invocable surface.
     let gate_surface = crate::access::is_user_invocable_surface(topic);
     let view_scoped_surface = access_resolver.is_some()
         && (gate_surface

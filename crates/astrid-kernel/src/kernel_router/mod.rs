@@ -280,8 +280,8 @@ async fn handle_request(
         },
         KernelRequest::ListCapsules => {
             let visibility = CapsuleVisibility::new(kernel, &caller);
-            let reg = kernel.capsules.read().await;
-            let list: Vec<_> = visible_inventory_manifests(kernel, &visibility, &reg)
+            let list: Vec<_> = visible_inventory_manifests(kernel, &visibility)
+                .await
                 .into_iter()
                 .map(|manifest| manifest.package.name)
                 .collect();
@@ -289,9 +289,8 @@ async fn handle_request(
         },
         KernelRequest::GetCommands => {
             let visibility = CapsuleVisibility::new(kernel, &caller);
-            let reg = kernel.capsules.read().await;
             let mut commands = Vec::new();
-            let manifests = visible_inventory_manifests(kernel, &visibility, &reg);
+            let manifests = visible_inventory_manifests(kernel, &visibility).await;
             for manifest in &manifests {
                 for cmd in &manifest.commands {
                     commands.push(astrid_events::kernel_api::CommandInfo {
@@ -307,10 +306,10 @@ async fn handle_request(
             }
             info!(
                 count = commands.len(),
-                capsules = reg.len(),
+                capsules = manifests.len(),
                 "GetCommands: returning {} commands from {} capsules",
                 commands.len(),
-                reg.len()
+                manifests.len()
             );
             KernelResponse::Commands(commands)
         },
@@ -402,9 +401,8 @@ async fn handle_request(
         },
         KernelRequest::GetCapsuleMetadata => {
             let visibility = CapsuleVisibility::new(kernel, &caller);
-            let reg = kernel.capsules.read().await;
             let mut entries = Vec::new();
-            for manifest in visible_inventory_manifests(kernel, &visibility, &reg) {
+            for manifest in visible_inventory_manifests(kernel, &visibility).await {
                 entries.push(astrid_events::kernel_api::CapsuleMetadataEntry {
                     name: manifest.package.name.clone(),
                     interceptor_events: manifest
@@ -419,8 +417,7 @@ async fn handle_request(
         },
         KernelRequest::GetAgentReadiness => {
             let visibility = CapsuleVisibility::new(kernel, &caller);
-            let reg = kernel.capsules.read().await;
-            let manifests = visible_inventory_manifests(kernel, &visibility, &reg);
+            let manifests = visible_inventory_manifests(kernel, &visibility).await;
             let readiness = astrid_capsule::readiness::agent_loop_readiness(&manifests);
             KernelResponse::AgentReadiness(readiness)
         },
@@ -429,7 +426,7 @@ async fn handle_request(
     publish_response(kernel, response_topic, res);
 }
 
-fn inventory_manifest_map(
+async fn inventory_manifest_map(
     kernel: &crate::Kernel,
     visibility: &CapsuleVisibility,
 ) -> BTreeMap<String, astrid_capsule::manifest::CapsuleManifest> {
@@ -438,7 +435,19 @@ fn inventory_manifest_map(
         &kernel.workspace_root,
         &visibility.principal,
     );
-    astrid_capsule::discovery::discover_manifests(Some(&paths))
+    let discovered = match tokio::task::spawn_blocking(move || {
+        astrid_capsule::discovery::discover_manifests(Some(&paths))
+    })
+    .await
+    {
+        Ok(discovered) => discovered,
+        Err(err) => {
+            warn!(error = %err, "Capsule inventory discovery task failed");
+            Vec::new()
+        },
+    };
+
+    discovered
         .into_iter()
         .filter_map(|(manifest, _)| {
             let id = astrid_capsule::capsule::CapsuleId::new(manifest.package.name.clone()).ok()?;
@@ -447,13 +456,13 @@ fn inventory_manifest_map(
         .collect()
 }
 
-fn visible_inventory_manifests(
+async fn visible_inventory_manifests(
     kernel: &crate::Kernel,
     visibility: &CapsuleVisibility,
-    registry: &astrid_capsule::registry::CapsuleRegistry,
 ) -> Vec<astrid_capsule::manifest::CapsuleManifest> {
-    let mut manifests = inventory_manifest_map(kernel, visibility);
-    for capsule in visibility.capsules(registry) {
+    let mut manifests = inventory_manifest_map(kernel, visibility).await;
+    let registry = kernel.capsules.read().await;
+    for capsule in visibility.capsules(&registry) {
         if visibility.allows(capsule.id()) {
             manifests
                 .entry(capsule.id().to_string())
