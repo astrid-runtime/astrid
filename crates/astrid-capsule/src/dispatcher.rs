@@ -815,13 +815,13 @@ fn dispatch_single(
 ///
 /// # Per-principal capsule-access filter
 ///
-/// When `topic` is in the **user-invocable surface** (`tool.v1.execute.*`,
-/// `cli.v1.command.execute`) **and** an `access_resolver` is wired, a
-/// matched capsule is kept only if `caller_principal` is granted it (or is
-/// an admin holding `*`). The filter is keyed on the **topic**, so a
+/// When an `access_resolver` is wired, principal-stamped non-admin dispatch is
+/// first narrowed to the caller's capsule view. When `topic` is also in the
+/// **user-invocable surface** (`tool.v1.execute.*`, `cli.v1.command.execute`),
+/// a matched capsule is kept only if `caller_principal` is granted it (or is an
+/// admin holding `*`). The grant-on-use filter is keyed on the **topic**, so a
 /// dual-role capsule's orchestration interceptors (on non-tool topics) are
-/// never filtered — they fall through the surface check unchanged. For all
-/// other topics the filter is a no-op and dispatch is identical to before.
+/// view-scoped but not grant-gated.
 /// For an **authenticated, non-admin** caller a denied match is no longer a
 /// pure silent drop: before dropping, a [`IpcPayload::GrantRequired`] signal is
 /// published on `astrid.v1.approval` (grant-on-first-use, #998) so a broker/shim
