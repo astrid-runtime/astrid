@@ -156,6 +156,9 @@ pub struct Kernel {
     /// unmodified, to every capsule's `WasmEngine` via the loader. See
     /// [`HttpLimits`](astrid_capsule::HttpLimits).
     http_limits: astrid_capsule::HttpLimits,
+    /// Coalesces full capsule reload requests so the router cannot spawn
+    /// overlapping all-principal discovery/load sweeps.
+    full_reload_in_flight: AtomicBool,
     /// Ephemeral mode: shut down immediately when the last client disconnects.
     pub ephemeral: AtomicBool,
     /// Instant when the kernel was booted (for uptime calculation).
@@ -401,6 +404,7 @@ impl Kernel {
             runtime_limits,
             local_egress,
             http_limits,
+            full_reload_in_flight: AtomicBool::new(false),
             ephemeral: AtomicBool::new(false),
             boot_time: std::time::Instant::now(),
             shutdown_tx: tokio::sync::watch::channel(false).0,
@@ -899,19 +903,24 @@ impl Kernel {
     /// failure leaves `tools` absent for that capsule this cycle (the consumer
     /// falls back to its fan-out). The legacy `status: "ready"` field is
     /// retained so bare-signal subscribers (the shim, the TUI) keep working; the
-    /// `capsules` field is additive.
+    /// `capsules` field is additive. The signal is emitted once per principal
+    /// and bus-stamped with that principal so socket consumers only receive
+    /// their own inventory view.
     pub(crate) async fn publish_capsules_loaded(&self) {
         // Clone the loaded-capsule handles under a brief read lock, then release
         // it before any filesystem I/O or `tool_describe` invocation (which can
         // `block_in_place` and must never run while holding the registry lock).
         let capsules = {
             let reg = self.capsules.read().await;
-            reg.cloned_values()
+            reg.cloned_values_with_principal()
         };
 
-        let mut with_meta: Vec<(String, Option<serde_json::Value>)> =
-            Vec::with_capacity(capsules.len());
-        for capsule in &capsules {
+        let mut by_principal = std::collections::BTreeMap::<
+            String,
+            Vec<(String, String, Option<serde_json::Value>)>,
+        >::new();
+        for (principal, capsule) in &capsules {
+            let principal = principal.to_string();
             let name = capsule.id().to_string();
             let mut meta = capsule
                 .source_dir()
@@ -935,19 +944,29 @@ impl Kernel {
                     "live tool_describe failed; capsule left uncaptured this cycle"
                 ),
             }
-            with_meta.push((name, meta));
+            by_principal
+                .entry(principal.clone())
+                .or_default()
+                .push((principal, name, meta));
         }
-        let payload = capsules_loaded::build_capsules_loaded_payload(with_meta);
+        if by_principal.is_empty() {
+            by_principal.insert(PrincipalId::default().to_string(), Vec::new());
+        }
 
-        let msg = astrid_events::ipc::IpcMessage::new(
-            astrid_events::ipc::Topic::from_raw("astrid.v1.capsules_loaded"),
-            astrid_events::ipc::IpcPayload::RawJson(payload),
-            self.session_id.0,
-        );
-        let _ = self.event_bus.publish(astrid_events::AstridEvent::Ipc {
-            metadata: astrid_events::EventMetadata::new("kernel"),
-            message: msg,
-        });
+        for (principal, entries) in by_principal {
+            let payload = capsules_loaded::build_capsules_loaded_payload(entries);
+
+            let msg = astrid_events::ipc::IpcMessage::new(
+                astrid_events::ipc::Topic::from_raw("astrid.v1.capsules_loaded"),
+                astrid_events::ipc::IpcPayload::RawJson(payload),
+                self.session_id.0,
+            )
+            .with_principal(principal);
+            let _ = self.event_bus.publish(astrid_events::AstridEvent::Ipc {
+                metadata: astrid_events::EventMetadata::new("kernel"),
+                message: msg,
+            });
+        }
     }
 
     /// Reload a single capsule by id without a daemon restart.
@@ -1455,6 +1474,7 @@ pub(crate) async fn test_kernel_with_home(home: astrid_core::dirs::AstridHome) -
         runtime_limits: astrid_capsule::CapsuleRuntimeLimits::default(),
         local_egress: std::collections::HashMap::new(),
         http_limits: astrid_capsule::HttpLimits::default(),
+        full_reload_in_flight: AtomicBool::new(false),
         ephemeral: AtomicBool::new(false),
         boot_time: std::time::Instant::now(),
         shutdown_tx: tokio::sync::watch::channel(false).0,

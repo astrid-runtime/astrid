@@ -10,6 +10,7 @@ use astrid_capsule::manifest::{CapsuleManifest, CommandDef, PackageDef, Subscrib
 use astrid_capsule::registry::WasmHash;
 use astrid_core::kernel_api::CommandKind;
 use astrid_core::profile::PrincipalProfile;
+use std::sync::atomic::AtomicBool;
 
 struct InventoryCapsule {
     id: CapsuleId,
@@ -143,6 +144,23 @@ fn rate_limiter_independent_buckets() {
 
     // InstallCapsule should still be allowed
     assert!(limiter.check("InstallCapsule", 10));
+}
+
+#[test]
+fn full_reload_guard_coalesces_until_finished() {
+    let in_flight = AtomicBool::new(false);
+
+    assert!(try_start_full_reload(&in_flight));
+    assert!(
+        !try_start_full_reload(&in_flight),
+        "second full reload should be coalesced while first is in flight"
+    );
+
+    drop(FullReloadGuard(&in_flight));
+    assert!(
+        try_start_full_reload(&in_flight),
+        "new full reload may start after the previous reload finishes"
+    );
 }
 
 #[test]

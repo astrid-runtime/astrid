@@ -49,15 +49,22 @@ pub(crate) fn inject_tools(meta: Option<Value>, tools: Value) -> Value {
 }
 
 /// Build the `astrid.v1.capsules_loaded` payload from per-capsule
-/// `(name, opaque meta)` pairs.
+/// `(principal, name, opaque meta)` tuples.
 ///
 /// Retains the legacy `status: "ready"` field so subscribers that treat the
 /// event as a bare signal (the `astrid mcp serve` shim, the TUI) keep working;
-/// `capsules` is additive. Each `meta` value is forwarded verbatim.
-pub(crate) fn build_capsules_loaded_payload(entries: Vec<(String, Option<Value>)>) -> Value {
+/// `capsules` is additive. Each `meta` value is forwarded verbatim. The
+/// per-entry `principal` field lets newer clients verify the payload belongs
+/// to their principal view while preserving the old `name`/`meta` shape for
+/// compatibility.
+pub(crate) fn build_capsules_loaded_payload(
+    entries: Vec<(String, String, Option<Value>)>,
+) -> Value {
     let capsules: Vec<Value> = entries
         .into_iter()
-        .map(|(name, meta)| json!({ "name": name, "meta": meta }))
+        .map(
+            |(principal, name, meta)| json!({ "principal": principal, "name": name, "meta": meta }),
+        )
         .collect();
     json!({ "status": "ready", "capsules": capsules })
 }
@@ -91,17 +98,23 @@ mod tests {
     fn payload_retains_status_and_lists_capsules() {
         let meta = json!({ "version": "1.0.0", "tools": [{ "name": "read_file" }] });
         let payload = build_capsules_loaded_payload(vec![
-            ("astrid-capsule-fs".to_string(), Some(meta.clone())),
-            ("no-meta".to_string(), None),
+            (
+                "alice".to_string(),
+                "astrid-capsule-fs".to_string(),
+                Some(meta.clone()),
+            ),
+            ("bob".to_string(), "no-meta".to_string(), None),
         ]);
         // Legacy bare-signal field is preserved for existing subscribers.
         assert_eq!(payload["status"], "ready");
         let caps = payload["capsules"].as_array().expect("capsules array");
         assert_eq!(caps.len(), 2);
+        assert_eq!(caps[0]["principal"], "alice");
         assert_eq!(caps[0]["name"], "astrid-capsule-fs");
         // Meta is forwarded verbatim (the consumer extracts `tools`).
         assert_eq!(caps[0]["meta"], meta);
         // A capsule with no readable meta carries an explicit null.
+        assert_eq!(caps[1]["principal"], "bob");
         assert_eq!(caps[1]["name"], "no-meta");
         assert!(caps[1]["meta"].is_null());
     }

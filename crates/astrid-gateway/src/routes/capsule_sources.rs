@@ -26,7 +26,7 @@ pub(super) fn trusted_capsule_source_ids(capsule_id: &str, caller: &PrincipalId)
         return Vec::new();
     };
 
-    let principals = principal_candidates(caller);
+    let principals = vec![caller.clone()];
     let mut dirs = Vec::new();
     for principal in &principals {
         dirs.push(
@@ -40,15 +40,6 @@ pub(super) fn trusted_capsule_source_ids(capsule_id: &str, caller: &PrincipalId)
     }
 
     trusted_capsule_source_ids_from_dirs(capsule_id, &principals, dirs)
-}
-
-fn principal_candidates(caller: &PrincipalId) -> Vec<PrincipalId> {
-    let default = PrincipalId::default();
-    if caller == &default {
-        vec![default]
-    } else {
-        vec![default, caller.clone()]
-    }
 }
 
 fn trusted_capsule_source_ids_from_dirs(
@@ -174,7 +165,7 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn derives_source_ids_from_installed_wasm_hash_for_principal_candidates() {
+    fn derives_source_ids_from_installed_wasm_hash_for_caller_only() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let capsule_dir = tmp.path().join("astrid-capsule-session");
         std::fs::create_dir_all(&capsule_dir).expect("capsule dir");
@@ -194,17 +185,23 @@ mod tests {
         let alice = PrincipalId::new("alice").expect("valid principal");
         let ids = trusted_capsule_source_ids_from_dirs(
             "astrid-capsule-session",
-            &[default.clone(), alice.clone()],
+            std::slice::from_ref(&alice),
             [capsule_dir],
         );
 
         assert_eq!(
             ids,
-            vec![
-                capsule_source_id_v1(&default, "astrid-capsule-session", "abc123"),
-                capsule_source_id_v1(&alice, "astrid-capsule-session", "abc123"),
-            ]
+            vec![capsule_source_id_v1(
+                &alice,
+                "astrid-capsule-session",
+                "abc123"
+            )]
         );
+        assert!(!ids.contains(&capsule_source_id_v1(
+            &default,
+            "astrid-capsule-session",
+            "abc123"
+        )));
     }
 
     #[test]

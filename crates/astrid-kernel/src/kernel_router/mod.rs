@@ -7,6 +7,7 @@ mod install;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 use astrid_audit::{AuditAction, AuditOutcome, AuthorizationProof};
@@ -314,8 +315,12 @@ async fn handle_request(
             KernelResponse::Commands(commands)
         },
         KernelRequest::ReloadCapsules => {
-            schedule_reload_capsules(Arc::clone(kernel));
-            KernelResponse::Success(serde_json::json!({"status": "reload_started"}))
+            let status = if schedule_reload_capsules(Arc::clone(kernel)) {
+                "reload_started"
+            } else {
+                "reload_already_running"
+            };
+            KernelResponse::Success(serde_json::json!({ "status": status }))
         },
         KernelRequest::ReloadCapsule { id } => {
             // Hot-swap a single capsule (or add it if not yet loaded) without a
@@ -472,11 +477,29 @@ async fn visible_inventory_manifests(
     manifests.into_values().collect()
 }
 
-fn schedule_reload_capsules(kernel: Arc<crate::Kernel>) {
+fn schedule_reload_capsules(kernel: Arc<crate::Kernel>) -> bool {
+    if !try_start_full_reload(&kernel.full_reload_in_flight) {
+        debug!("ReloadCapsules request coalesced; full reload already in flight");
+        return false;
+    }
     tokio::spawn(async move {
+        let _guard = FullReloadGuard(&kernel.full_reload_in_flight);
         unregister_failed_capsules(&kernel).await;
         kernel.load_all_capsules().await;
     });
+    true
+}
+
+fn try_start_full_reload(in_flight: &AtomicBool) -> bool {
+    !in_flight.swap(true, Ordering::AcqRel)
+}
+
+struct FullReloadGuard<'a>(&'a AtomicBool);
+
+impl Drop for FullReloadGuard<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
 }
 
 async fn unregister_failed_capsules(kernel: &crate::Kernel) {

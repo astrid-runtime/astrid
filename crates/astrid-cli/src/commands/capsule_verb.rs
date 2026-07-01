@@ -243,8 +243,14 @@ async fn execute(provider: &str, verb: &str, args: &[String]) -> Result<ExitCode
         return Ok(ExitCode::from(1));
     }
 
-    match wait_for_command_result(&mut client, result_topic.as_str(), provider, RESULT_TIMEOUT)
-        .await
+    match wait_for_command_result(
+        &mut client,
+        result_topic.as_str(),
+        provider,
+        caller.as_str(),
+        RESULT_TIMEOUT,
+    )
+    .await
     {
         Ok(CommandWait::Result(raw)) => Ok(render_result(provider, &raw)),
         Ok(CommandWait::ProviderUnloaded) => {
@@ -277,6 +283,7 @@ async fn wait_for_command_result(
     client: &mut SocketClient,
     result_topic: &str,
     provider: &str,
+    principal: &str,
     timeout: Duration,
 ) -> Result<CommandWait> {
     let deadline = tokio::time::Instant::now()
@@ -302,23 +309,48 @@ async fn wait_for_command_result(
         if topic == Some(result_topic) {
             return Ok(CommandWait::Result(raw));
         }
-        if topic == Some(CAPSULES_LOADED_TOPIC) && capsules_loaded_missing_provider(&raw, provider)
+        if topic == Some(CAPSULES_LOADED_TOPIC)
+            && capsules_loaded_missing_provider(&raw, provider, principal)
         {
             return Ok(CommandWait::ProviderUnloaded);
         }
     }
 }
 
-fn capsules_loaded_missing_provider(raw: &serde_json::Value, provider: &str) -> bool {
+fn capsules_loaded_missing_provider(
+    raw: &serde_json::Value,
+    provider: &str,
+    principal: &str,
+) -> bool {
+    if raw_frame_principal(raw).is_some_and(|frame_principal| frame_principal != principal) {
+        return false;
+    }
     let Some(capsules) = capsules_loaded_capsules(raw) else {
         return false;
     };
-    !capsules.iter().any(|capsule| {
-        capsule
-            .get("name")
-            .and_then(serde_json::Value::as_str)
-            .is_some_and(|name| name == provider)
-    })
+    let principal_aware = capsules
+        .iter()
+        .any(|capsule| capsule_entry_principal(capsule).is_some());
+    !capsules
+        .iter()
+        .filter(|capsule| !principal_aware || capsule_entry_matches_principal(capsule, principal))
+        .any(|capsule| capsule_entry_name(capsule).is_some_and(|name| name == provider))
+}
+
+fn raw_frame_principal(raw: &serde_json::Value) -> Option<&str> {
+    raw.get("principal").and_then(serde_json::Value::as_str)
+}
+
+fn capsule_entry_principal(capsule: &serde_json::Value) -> Option<&str> {
+    capsule.get("principal").and_then(serde_json::Value::as_str)
+}
+
+fn capsule_entry_name(capsule: &serde_json::Value) -> Option<&str> {
+    capsule.get("name").and_then(serde_json::Value::as_str)
+}
+
+fn capsule_entry_matches_principal(capsule: &serde_json::Value, principal: &str) -> bool {
+    capsule_entry_principal(capsule).is_some_and(|entry_principal| entry_principal == principal)
 }
 
 fn capsules_loaded_capsules(raw: &serde_json::Value) -> Option<&Vec<serde_json::Value>> {
@@ -499,11 +531,13 @@ mod tests {
         });
         assert!(capsules_loaded_missing_provider(
             &raw,
-            "astrid-capsule-adversarial"
+            "astrid-capsule-adversarial",
+            "alice"
         ));
         assert!(!capsules_loaded_missing_provider(
             &raw,
-            "astrid-capsule-session"
+            "astrid-capsule-session",
+            "alice"
         ));
     }
 
@@ -519,7 +553,7 @@ mod tests {
                 }
             }
         });
-        assert!(capsules_loaded_missing_provider(&raw, "provider"));
+        assert!(capsules_loaded_missing_provider(&raw, "provider", "alice"));
     }
 
     #[test]
@@ -528,6 +562,78 @@ mod tests {
             "topic": "astrid.v1.capsules_loaded",
             "payload": { "status": "ready" }
         });
-        assert!(!capsules_loaded_missing_provider(&raw, "provider"));
+        assert!(!capsules_loaded_missing_provider(&raw, "provider", "alice"));
+    }
+
+    #[test]
+    fn capsules_loaded_missing_provider_filters_by_principal() {
+        let raw = serde_json::json!({
+            "topic": "astrid.v1.capsules_loaded",
+            "payload": {
+                "status": "ready",
+                "capsules": [
+                    {
+                        "principal": "bob",
+                        "name": "astrid-capsule-adversarial",
+                        "meta": null
+                    }
+                ]
+            }
+        });
+
+        assert!(
+            capsules_loaded_missing_provider(&raw, "astrid-capsule-adversarial", "alice"),
+            "alice's command should cancel when only bob still has the provider loaded"
+        );
+        assert!(
+            !capsules_loaded_missing_provider(&raw, "astrid-capsule-adversarial", "bob"),
+            "bob's command should not cancel while bob's provider remains loaded"
+        );
+    }
+
+    #[test]
+    fn capsules_loaded_missing_provider_ignores_other_frame_principal() {
+        let raw = serde_json::json!({
+            "topic": "astrid.v1.capsules_loaded",
+            "principal": "bob",
+            "payload": {
+                "status": "ready",
+                "capsules": []
+            }
+        });
+
+        assert!(
+            !capsules_loaded_missing_provider(&raw, "astrid-capsule-adversarial", "alice"),
+            "alice must not cancel on another principal's capsules_loaded frame"
+        );
+    }
+
+    #[test]
+    fn capsules_loaded_missing_provider_detects_current_principal_entry() {
+        let raw = serde_json::json!({
+            "topic": "astrid.v1.capsules_loaded",
+            "principal": "alice",
+            "payload": {
+                "status": "ready",
+                "capsules": [
+                    {
+                        "principal": "alice",
+                        "name": "astrid-capsule-adversarial",
+                        "meta": null
+                    },
+                    {
+                        "principal": "bob",
+                        "name": "astrid-capsule-session",
+                        "meta": null
+                    }
+                ]
+            }
+        });
+
+        assert!(!capsules_loaded_missing_provider(
+            &raw,
+            "astrid-capsule-adversarial",
+            "alice"
+        ));
     }
 }
