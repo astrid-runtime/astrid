@@ -14,7 +14,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use astrid_capsule::capsule::CapsuleId;
-use astrid_capsule::engine::wasm::host_state::HostState;
+use astrid_capsule::engine::wasm::host_state::{HookHostStateParams, HostState};
 use astrid_storage::kv::ScopedKvStore;
 use tracing::{debug, warn};
 use wasmtime::Store;
@@ -318,9 +318,12 @@ impl WasmHandler {
         let rt = tokio::runtime::Handle::current();
         let secret_store = astrid_storage::build_secret_store(&hook_identity, kv.clone(), rt);
 
-        Ok(HostState {
-            wasi_ctx: wasmtime_wasi::WasiCtxBuilder::new().build(),
-            resource_table: wasmtime::component::ResourceTable::new(),
+        // `HostState` is `#[non_exhaustive]`; build it through the crate's
+        // `for_hook` constructor, which fills every fail-closed hook default
+        // (no home/tmp, no security gate, no overlays, no held capabilities,
+        // `hook.v1.result.*` as the sole publish pattern) so this crate never
+        // has to name every field. We supply only what a hook varies.
+        Ok(HostState::for_hook(HookHostStateParams {
             // Hook execution memory is not part of per-principal usage; a
             // throwaway ledger is fine — the cap is still enforced.
             store_meter: astrid_capsule::StoreMemoryMeter::new(
@@ -328,104 +331,31 @@ impl WasmHandler {
                 astrid_core::PrincipalId::default(),
                 astrid_capsule::MemoryLedger::default(),
             ),
-            principal: astrid_core::PrincipalId::default(),
-            capsule_uuid: uuid::Uuid::new_v4(),
-            caller_context: None,
-            interceptor_active: false,
-            // Hooks run as a transient one-shot, not a bound run loop, so the
-            // run-loop CPU cooperative-yield state is inert here.
-            recv_yielded: false,
-            no_yield_windows: 0,
-            invocation_kv: None,
-            capsule_log: None,
             capsule_id: CapsuleId::from_static(&hook_identity),
             workspace_root: self.workspace_root.clone(),
             vfs: Arc::new(vfs),
             vfs_root_handle: root_handle,
-            // Hooks intentionally do not support home:// or /tmp access — they run
-            // outside the full capsule manifest/security-gate lifecycle.
-            home: None,
-            tmp: None,
-            invocation_home: None,
-            invocation_tmp: None,
-            invocation_secret_store: None,
-            invocation_capsule_log: None,
-            invocation_profile: None,
-            profile_cache: None,
-            invocation_env_overlay: None,
-            overlay_vfs: None,
-            upper_dir: None,
             // Hooks run a transient, single-principal one-shot (scoped to
             // `hook_identity`), NOT a shared runtime — so `kv` legitimately IS
             // this hook's own store, and no per-invocation overlays are
             // installed. `kv_backend` mirrors it for API completeness.
             kv_backend: kv.backend(),
             kv,
-            event_bus: astrid_events::EventBus::with_capacity(128),
-            ipc_limiter: Arc::new(astrid_events::ipc::IpcRateLimiter::new()),
-            config: HashMap::new(),
-            secret_env: std::collections::HashSet::new(),
-            ipc_publish_patterns: vec!["hook.v1.result.*".into()],
-            ipc_subscribe_patterns: Vec::new(),
-            security: None,
-            hook_manager: None,
-            capsule_registry: None,
-            runtime_handle: tokio::runtime::Handle::current(),
-            has_uplink_capability: false,
-            // Hooks run outside the manifest/security-gate lifecycle: no held
-            // capabilities and no local-egress exemptions (both fail-closed).
-            capability_names: Vec::new(),
-            local_egress: Vec::new(),
+            secret_store,
             // Operator `astrid:http` host policy, resolved from the global
             // `[http]` config at handler construction, so a WASM hook's HTTP
             // calls honour the same limits as the live runtime (default = the
             // host's historical constants when no config is present).
             http_limits: self.http_limits,
-            // Transient hook execution never subscribes to the audit feed;
-            // fail-secure to scoped.
-            audit_firehose: false,
-            inbound_tx: None,
-            registered_uplinks: Vec::new(),
-            cli_socket_listener: None,
-            active_http_streams: HashMap::new(),
-            next_http_stream_id: 1,
-            lifecycle_phase: None,
-            secret_store,
-            ready_tx: None,
-            blocking_semaphore: HostState::default_blocking_semaphore(),
-            io_semaphore: HostState::default_io_semaphore(),
-            cancel_token: tokio_util::sync::CancellationToken::new(),
-            session_token: None,
-            interceptor_handles: Vec::new(),
-            allowance_store: None,
-            // Hooks have no kernel-managed security gate, so no identity store.
-            identity_store: None,
+            event_bus: astrid_events::EventBus::with_capacity(128),
+            runtime_handle: tokio::runtime::Handle::current(),
             process_tracker: Arc::new(ProcessTracker::new()),
             // Hooks never spawn persistent processes; a throwaway registry
             // satisfies the field (reaped when this state drops).
             persistent_processes: Arc::new(PersistentProcessRegistry::new(
                 tokio::runtime::Handle::current(),
             )),
-            net_stream_count: 0,
-            subscription_count: 0,
-            process_count_total: 0,
-            process_count_by_principal: HashMap::new(),
-            // Transient hook execution never accepts socket connections; a
-            // throwaway registry satisfies the field (issue #45/#852).
-            connection_principals: HostState::new_connection_principals(),
-            // Hooks never accept inbound uplink connections, so no client
-            // lifecycle events are ever emitted; a throwaway registry satisfies
-            // the field. Keyed by the verified principal directly (distinct
-            // from the device-aware `connection_principals` registry).
-            client_connections: HostState::new_client_connections(),
-            // No client frame in flight; hooks never forward over publish-as,
-            // so neither the ingress principal nor its device id is ever set.
-            ingress_principal: None,
-            ingress_device_key_id: None,
-            // A hook handler is never the local-socket uplink, so it never
-            // earns a local transport origin (fail-closed, non-local).
-            ingress_origin: None,
-        })
+        }))
     }
 }
 

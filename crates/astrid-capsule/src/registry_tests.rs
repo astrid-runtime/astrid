@@ -494,3 +494,73 @@ fn principals_viewing_returns_all_views_of_shared_runtime() {
             .is_empty()
     );
 }
+
+#[test]
+fn hash_for_and_principals_viewing_hash_separate_two_versions_of_one_id() {
+    // One capsule id can be loaded at TWO distinct content hashes at once
+    // (per-principal installs of different versions). `hash_for` must resolve the
+    // SPECIFIC hash each principal views, and `principals_viewing_hash` must
+    // partition viewers by hash so a per-`(id, hash)` restart only rebuilds the
+    // views of the failed hash — never a viewer of the other, healthy version.
+    let mut registry = CapsuleRegistry::new();
+    let id = CapsuleId::from_static("two-versions");
+    let hash_v1 = test_hash("two-versions-v1");
+    let hash_v2 = test_hash("two-versions-v2");
+    let default_p = PrincipalId::default();
+    let alice = pid("alice");
+    let bob = pid("bob");
+
+    // default + bob on v1; alice on v2.
+    registry
+        .register_owned_by_default(
+            Box::new(MockCapsule::new("two-versions")),
+            hash_v1.clone(),
+            &default_p,
+        )
+        .expect("register default v1");
+    registry
+        .register_existing(&id, &hash_v1, &bob)
+        .expect("bob v1 view");
+    registry
+        .register_owned_by_default(
+            Box::new(MockCapsule::new("two-versions")),
+            hash_v2.clone(),
+            &alice,
+        )
+        .expect("register alice v2");
+
+    // hash_for resolves each principal's specific version.
+    assert_eq!(registry.hash_for(&default_p, &id), Some(hash_v1.clone()));
+    assert_eq!(registry.hash_for(&bob, &id), Some(hash_v1.clone()));
+    assert_eq!(registry.hash_for(&alice, &id), Some(hash_v2.clone()));
+    assert_eq!(registry.hash_for(&pid("nobody"), &id), None);
+
+    // principals_viewing_hash partitions viewers by hash.
+    let mut v1_viewers: Vec<String> = registry
+        .principals_viewing_hash(&id, &hash_v1)
+        .into_iter()
+        .map(|p| p.to_string())
+        .collect();
+    v1_viewers.sort();
+    assert_eq!(
+        v1_viewers,
+        vec!["bob".to_string(), "default".to_string()],
+        "only v1 viewers, not alice on v2"
+    );
+    assert_eq!(
+        registry
+            .principals_viewing_hash(&id, &hash_v2)
+            .into_iter()
+            .map(|p| p.to_string())
+            .collect::<Vec<_>>(),
+        vec!["alice".to_string()],
+        "only the v2 viewer"
+    );
+
+    // Two distinct runtimes are actually loaded.
+    assert_eq!(
+        registry.len(),
+        2,
+        "two distinct hashes → two runtime instances"
+    );
+}

@@ -11,12 +11,15 @@
 //! instances by `(principal, hash)` and built one runtime per principal).
 //!
 //! Cross-principal host-state isolation does **not** come from duplicating the
-//! runtime. A shared instance is loaded under [`PrincipalId::default()`] (the
-//! system scope), and every non-owner invocation installs per-invocation
-//! `invocation_*` overlays (KV / secret store / home / tmp / log) scoped to the
-//! *invoking* principal, resolved through the `effective_*` accessors. A
-//! principal-less system/lifecycle event falls back to the load-owner, which is
-//! the system/default scope and never a specific principal's private state.
+//! runtime. A shared instance is loaded under [`PrincipalId::default()`], but its
+//! load-time host state (`kv` / `secret_store` / `home`) is a NEUTRAL,
+//! fail-closed placeholder that holds no real principal's data — not `default`'s.
+//! EVERY invocation that carries a principal — the owner/`default` included —
+//! installs per-invocation `invocation_*` overlays (KV / secret store / home /
+//! tmp / log) scoped to the *invoking* principal, resolved through the
+//! `effective_*` accessors. A principal-less system/lifecycle event reaches only
+//! the neutral placeholder, which denies rather than exposing any principal's
+//! private state.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -75,12 +78,13 @@ impl std::fmt::Display for WasmHash {
 /// number of principal views that reference this hash; the runtime is torn down
 /// only when the last view releases it.
 ///
-/// The runtime's load-time owner (its `HostState.principal`, which the
-/// `effective_*` accessors fall back to for principal-less invocations) is a
-/// property of the built [`Capsule`] itself, not tracked here. Kernel-loaded
-/// shared instances are always built under [`PrincipalId::default()`] (see
-/// [`CapsuleRegistry::register_owned_by_default`]) so that fallback resolves to
-/// the system scope, never a specific principal's private state.
+/// The runtime's load-time owner (its `HostState.principal`) is a property of
+/// the built [`Capsule`] itself, not tracked here. Kernel-loaded shared instances
+/// are always built under [`PrincipalId::default()`] (see
+/// [`CapsuleRegistry::register_owned_by_default`]), but the load-time host-state
+/// fields the `effective_*` accessors fall back to for principal-less invocations
+/// are NEUTRAL, fail-closed placeholders (not `default`'s real KV/secrets/home),
+/// so that fallback exposes no principal's private state.
 struct InstanceEntry {
     capsule: Arc<dyn Capsule>,
     refcount: usize,
@@ -102,6 +106,7 @@ struct InstanceEntry {
 /// it — only the caller that observes `torn_down == true` (the last release) may
 /// drive `request_cancel()` / `unload()`. Callers that unconditionally unload
 /// the returned handle would break every other principal sharing the instance.
+#[non_exhaustive]
 pub struct Unregistered {
     /// A handle to the (possibly still-shared) runtime.
     pub capsule: Arc<dyn Capsule>,
@@ -126,6 +131,7 @@ impl std::fmt::Debug for Unregistered {
 /// capsules present in its view; daemon-health operations can still inspect the
 /// global instance set. Two principals whose views point at the same hash share
 /// one runtime.
+#[non_exhaustive]
 pub struct CapsuleRegistry {
     instances: HashMap<WasmHash, InstanceEntry>,
     views: HashMap<PrincipalId, HashMap<CapsuleId, WasmHash>>,
@@ -533,6 +539,16 @@ impl CapsuleRegistry {
         ids
     }
 
+    /// The content [`WasmHash`] that `principal`'s view resolves `id` to, if any.
+    ///
+    /// Two principals can resolve the same id to DIFFERENT hashes (per-principal
+    /// installs of different versions), so a restart must pin the specific hash
+    /// the requesting principal views rather than assume one hash per id.
+    #[must_use]
+    pub fn hash_for(&self, principal: &PrincipalId, id: &CapsuleId) -> Option<WasmHash> {
+        self.views.get(principal)?.get(id).cloned()
+    }
+
     /// Return an arbitrary principal whose view contains `id`.
     #[must_use]
     pub fn any_principal_with(&self, id: &CapsuleId) -> Option<PrincipalId> {
@@ -594,6 +610,48 @@ impl CapsuleRegistry {
             }
         }
         out
+    }
+
+    /// Snapshot of `(viewing principal, content hash, capsule)` for every view.
+    ///
+    /// Like [`cloned_values_with_principal`](Self::cloned_values_with_principal)
+    /// but also carries the [`WasmHash`] each view resolves to. A capsule id can
+    /// legitimately map to TWO distinct hashes at once — e.g. `default` on
+    /// `foo@1.0` and `alice` on `foo@2.0`, since installs are per-principal
+    /// (`~/.astrid/home/{principal}/.local/capsules/{id}`) and each derives its
+    /// own content hash. The health monitor keys dedup and restart by
+    /// `(id, hash)` off this snapshot so two distinct runtimes for one id are each
+    /// probed and restarted independently rather than collapsed to one.
+    #[must_use]
+    pub fn cloned_values_with_principal_and_hash(
+        &self,
+    ) -> Vec<(PrincipalId, WasmHash, Arc<dyn Capsule>)> {
+        let mut out = Vec::new();
+        for (principal, view) in &self.views {
+            for hash in view.values() {
+                if let Some(entry) = self.instances.get(hash) {
+                    out.push((principal.clone(), hash.clone(), Arc::clone(&entry.capsule)));
+                }
+            }
+        }
+        out
+    }
+
+    /// Every principal whose view resolves `id` to the specific `hash`.
+    ///
+    /// Distinct from [`principals_viewing`](Self::principals_viewing), which
+    /// returns every viewer of the id regardless of which hash they point at.
+    /// A per-`(id, hash)` restart must rebuild ONLY the views pointing at the
+    /// failed runtime's exact hash — rebuilding a viewer that points at a
+    /// *different* hash of the same id would wrongly re-home it onto the
+    /// restarted version. Order is unspecified (`HashMap` iteration).
+    #[must_use]
+    pub fn principals_viewing_hash(&self, id: &CapsuleId, hash: &WasmHash) -> Vec<PrincipalId> {
+        self.views
+            .iter()
+            .filter(|(_, view)| view.get(id) == Some(hash))
+            .map(|(principal, _)| principal.clone())
+            .collect()
     }
 
     /// Snapshot of cloned `Arc` handles visible to `principal`.

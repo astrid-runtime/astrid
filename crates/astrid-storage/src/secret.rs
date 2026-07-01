@@ -22,6 +22,7 @@ use crate::kv::ScopedKvStore;
 
 /// Errors from secret storage operations.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum SecretStoreError {
     /// The platform keychain is not accessible (headless, locked, no daemon).
     #[error("keychain not accessible: {0}")]
@@ -174,6 +175,7 @@ impl SecretStore for DenySecretStore {
 ///
 /// Less secure than the OS keychain (secrets at rest in the KV database
 /// without OS-level encryption) but functional everywhere.
+#[non_exhaustive]
 pub struct KvSecretStore {
     kv: ScopedKvStore,
     runtime_handle: tokio::runtime::Handle,
@@ -276,6 +278,7 @@ impl SecretStore for KvSecretStore {
 /// - **Permissions enforced on write** — `0o600` on the file,
 ///   `0o700` on the parent (set when creating). Existing files
 ///   created with looser perms get re-stamped on next `set`.
+#[non_exhaustive]
 pub struct FileSecretStore {
     /// The directory all keys for this `(scope, capsule)` live in.
     root: PathBuf,
@@ -485,6 +488,7 @@ mod keychain_impl {
     /// This provides per-capsule isolation at the OS level. Different capsules
     /// use different service names and cannot read each other's secrets.
     #[derive(Debug)]
+    #[non_exhaustive]
     pub struct KeychainSecretStore {
         /// The keyring service name, typically `"astrid:{capsule_id}"`.
         service: String,
@@ -617,6 +621,7 @@ mod fallback_impl {
     /// This avoids split-brain: if the keychain is unavailable at construction,
     /// all operations go to KV. If available, all go to keychain. No per-operation
     /// fallback that could scatter secrets across both backends.
+    #[non_exhaustive]
     pub struct FallbackSecretStore {
         keychain: KeychainSecretStore,
         kv: KvSecretStore,

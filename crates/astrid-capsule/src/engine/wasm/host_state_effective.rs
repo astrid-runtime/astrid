@@ -44,6 +44,31 @@ impl HostState {
         self.invocation_kv.as_ref().unwrap_or(&self.kv)
     }
 
+    /// The current invocation's capsule KV namespace,
+    /// `{effective_principal}:capsule:{capsule_id}`.
+    ///
+    /// Retained only for backward compatibility; superseded by
+    /// [`effective_kv`](Self::effective_kv). This returns just a namespace
+    /// STRING, so — unlike `effective_kv` — it cannot express the fail-closed,
+    /// physically-isolated NEUTRAL placeholder that a shared content-addressed
+    /// runtime (issue #1069) falls back to for a principal-less / load-time
+    /// context; it can only ever name a `{principal}:capsule:{id}` namespace.
+    ///
+    /// The body anchors [`effective_principal`](Self::effective_principal) (the
+    /// INVOKING principal, falling back to the load owner only when no caller is
+    /// in scope), NOT the raw load owner, so a stray caller gets the current
+    /// principal's namespace rather than the misleading owner-only value the
+    /// shared-runtime model made incorrect. Prefer `effective_kv()`, which builds
+    /// the correctly-scoped, fail-closed store directly.
+    #[deprecated(
+        since = "0.8.0",
+        note = "use `effective_kv()` for the current invocation's per-principal store; this returns only a namespace string and cannot express the fail-closed/neutral fallback"
+    )]
+    #[must_use]
+    pub fn principal_kv_namespace(&self) -> String {
+        format!("{}:capsule:{}", self.effective_principal(), self.capsule_id)
+    }
+
     /// Return the effective home mount for the current invocation.
     ///
     /// Prefers `invocation_home` (installed for the invoking principal) over the

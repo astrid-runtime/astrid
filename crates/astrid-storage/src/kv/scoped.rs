@@ -32,6 +32,7 @@ use crate::error::{StorageError, StorageResult};
 /// let val = scoped.get("config").await?;
 /// ```
 #[derive(Clone)]
+#[non_exhaustive]
 pub struct ScopedKvStore {
     inner: Arc<dyn KvStore>,
     namespace: String,

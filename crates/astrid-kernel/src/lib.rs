@@ -567,17 +567,25 @@ impl Kernel {
     /// Build and load ONE shared capsule runtime under the DEFAULT (system)
     /// principal.
     ///
-    /// Loading under `default` makes the runtime's load-time owner the system
-    /// scope, so a principal-less invocation (watchdog tick, `capsules_loaded`,
-    /// etc.) falls back to the system store rather than a specific principal's
-    /// private state. Every non-default caller gets per-invocation `invocation_*`
-    /// overlays scoped to its own principal, so per-principal env/KV/secrets/home
-    /// isolation is preserved without a per-principal runtime. Per-principal
-    /// config is NOT baked here: it is resolved per invocation via the
-    /// `invocation_env_overlay` (read from the invoking principal's
-    /// `.config/env/{capsule}.env.json`), so loading under `default` loses no
-    /// per-principal configuration. This load-time KV pre-load and `self.config`
-    /// are the hash-identical system defaults.
+    /// A content-addressed runtime is SHARED across every principal that views
+    /// the same WASM hash, so it is loaded under no real principal's identity.
+    /// The runtime's load-time host state is therefore a NEUTRAL, fail-closed
+    /// placeholder: its `kv` is a physically-isolated in-memory store and its
+    /// `secret_store` is deny-all — NEVER `default`'s (or anyone's) real KV,
+    /// secrets, or home. That placeholder is reached only by principal-less
+    /// load-time contexts (e.g. a watchdog tick or `capsules_loaded`), where it
+    /// denies rather than exposing any principal's private state.
+    ///
+    /// EVERY invocation that carries a principal — the owner/`default`
+    /// included — installs per-invocation `invocation_*` overlays scoped to the
+    /// *invoking* principal (KV / secret store / home / tmp / log), so
+    /// per-principal isolation is preserved without a per-principal runtime.
+    /// Per-principal config is likewise NOT baked here: it is resolved per
+    /// invocation via the `invocation_env_overlay` (read from the invoking
+    /// principal's `.config/env/{capsule}.env.json`). The `default` env config
+    /// this method pre-loads and `self.config` seed only the real shared KV
+    /// backend (`kv_backend`) used to CONSTRUCT overlays and the hash-identical
+    /// manifest defaults — never the neutral load-time `kv` fallback.
     ///
     /// # Errors
     ///
@@ -658,17 +666,24 @@ impl Kernel {
         Ok(capsule)
     }
 
-    /// Restart a capsule by fully tearing down its shared runtime and re-loading
-    /// it from source for EVERY principal that was viewing it.
+    /// Restart a capsule by fully tearing down ONE distinct shared runtime and
+    /// re-loading it from source for every principal that was viewing THAT hash.
     ///
     /// A content-addressed runtime is SHARED across principals (issue #1069): a
-    /// failed runtime is one instance behind N principal views. A restart must
-    /// rebuild that ONE instance so that no view is left pointing at a dead
-    /// runtime — releasing only the requesting principal's view would decrement
-    /// the refcount, leave the still-failed runtime alive, and (because the hash
-    /// is still loaded) merely re-attach the requester's view to the failed
-    /// instance via `register_existing`. So here we capture all views, tear the
-    /// runtime down unconditionally, then reload it and re-attach every view.
+    /// failed runtime is one instance behind N principal views of the SAME hash.
+    /// A restart must rebuild that ONE instance so that no view is left pointing
+    /// at a dead runtime — releasing only the requesting principal's view would
+    /// decrement the refcount, leave the still-failed runtime alive, and (because
+    /// the hash is still loaded) merely re-attach the requester's view to the
+    /// failed instance via `register_existing`.
+    ///
+    /// The restart is scoped to the SPECIFIC hash the requesting `principal`
+    /// views. A capsule id can have TWO distinct hashes loaded at once
+    /// (per-principal installs of different versions); rebuilding *every* view of
+    /// the id — including a viewer pointing at a different, healthy hash — would
+    /// wrongly re-home that viewer onto the restarted version. So we resolve the
+    /// requester's hash, capture only the views pointing at it, tear that runtime
+    /// down, then reload it from its own source and re-attach exactly those views.
     ///
     /// # Errors
     ///
@@ -679,13 +694,16 @@ impl Kernel {
         id: &astrid_capsule::capsule::CapsuleId,
         principal: &PrincipalId,
     ) -> Result<(), anyhow::Error> {
-        // Capture the source directory AND every principal viewing the shared
-        // runtime before we tear it down. The requesting `principal` is restored
-        // first so its `handle_lifecycle_restart` fires below.
+        // Capture the failed runtime's own source directory AND every principal
+        // viewing THAT hash before we tear it down. The requesting `principal` is
+        // restored first so its `handle_lifecycle_restart` fires below.
         let (source_dir, view_principals) = {
             let registry = self.capsules.read().await;
             let capsule = registry
                 .get_for(principal, id)
+                .ok_or_else(|| anyhow::anyhow!("capsule '{id}' not found in registry"))?;
+            let hash = registry
+                .hash_for(principal, id)
                 .ok_or_else(|| anyhow::anyhow!("capsule '{id}' not found in registry"))?;
             let source_dir = capsule
                 .source_dir()
@@ -693,8 +711,10 @@ impl Kernel {
                 .ok_or_else(|| anyhow::anyhow!("capsule '{id}' has no source directory"))?;
             // Requesting principal first, then the rest (dedup), so reload order
             // is deterministic and the requester's lifecycle-restart hook fires.
+            // Scoped to the requester's HASH so a viewer of a different hash of
+            // the same id is left untouched.
             let mut principals = vec![principal.clone()];
-            for p in registry.principals_viewing(id) {
+            for p in registry.principals_viewing_hash(id, &hash) {
                 if p != *principal {
                     principals.push(p);
                 }
@@ -2100,15 +2120,16 @@ fn spawn_capsule_health_monitor(kernel: Arc<Kernel>) -> tokio::task::JoinHandle<
             // the lock before calling check_health() or publishing events.
             let ready_capsules: Vec<(
                 PrincipalId,
+                astrid_capsule::registry::WasmHash,
                 std::sync::Arc<dyn astrid_capsule::capsule::Capsule>,
             )> = {
                 let registry = kernel.capsules.read().await;
                 registry
-                    .cloned_values_with_principal()
+                    .cloned_values_with_principal_and_hash()
                     .into_iter()
-                    .filter_map(|(principal, capsule)| {
+                    .filter_map(|(principal, hash, capsule)| {
                         if capsule.state() == astrid_capsule::capsule::CapsuleState::Ready {
-                            Some((principal, capsule))
+                            Some((principal, hash, capsule))
                         } else {
                             None
                         }
@@ -2116,19 +2137,21 @@ fn spawn_capsule_health_monitor(kernel: Arc<Kernel>) -> tokio::task::JoinHandle<
                     .collect()
             };
 
-            // Probe health once per SHARED runtime, collect failures, then drop
+            // Probe health once per DISTINCT runtime, collect failures, then drop
             // the Arc Vec before restarting. This ensures restart_capsule's
             // Arc::get_mut can succeed (no other strong references held).
             //
             // A content-addressed runtime is SHARED across principals (issue
-            // #1069): `cloned_values_with_principal()` yields one `(principal,
-            // Arc)` pair PER VIEW, so a failed runtime with N views appears N
-            // times, all sharing one `Arc` and reporting the same `check_health`.
-            // `collect_failed_runtimes_deduped` DEDUPS by capsule id so a shared
-            // failed runtime is restarted exactly ONCE. `restart_capsule` itself
-            // rebuilds every view.
+            // #1069): `cloned_values_with_principal_and_hash()` yields one
+            // `(principal, hash, Arc)` triple PER VIEW, so a runtime referenced by
+            // N views of the same hash appears N times, all sharing one `Arc` and
+            // reporting the same `check_health`. `collect_failed_runtimes_deduped`
+            // DEDUPS by `(id, hash)` so that runtime is restarted exactly ONCE —
+            // yet a capsule id with two DISTINCT loaded hashes (per-principal
+            // installs of different versions) yields two entries, each restarted
+            // independently. `restart_capsule` rebuilds every view of that hash.
             let failures = collect_failed_runtimes_deduped(&ready_capsules);
-            for (principal, id_str, reason) in &failures {
+            for (principal, id_str, _hash, reason) in &failures {
                 tracing::error!(
                     capsule_id = %id_str,
                     principal = %principal,
@@ -2158,12 +2181,12 @@ fn spawn_capsule_health_monitor(kernel: Arc<Kernel>) -> tokio::task::JoinHandle<
 
             let failed_this_tick: std::collections::HashSet<String> = failures
                 .iter()
-                .map(|(_principal, id, _)| restart_tracker_key(id))
+                .map(|(_principal, id, hash, _)| restart_tracker_key(id, hash))
                 .collect();
 
             let mut restarted = Vec::new();
-            for (principal, id_str, _reason) in &failures {
-                let tracker_key = restart_tracker_key(id_str);
+            for (principal, id_str, hash, _reason) in &failures {
+                let tracker_key = restart_tracker_key(id_str, hash);
                 let tracker = restart_trackers
                     .entry(tracker_key.clone())
                     .or_insert_with(RestartTracker::new);
@@ -2197,50 +2220,64 @@ fn spawn_capsule_health_monitor(kernel: Arc<Kernel>) -> tokio::task::JoinHandle<
     })
 }
 
-/// Restart-tracker key for a SHARED runtime: the capsule id ALONE.
+/// Restart-tracker key for a DISTINCT shared runtime: `(capsule id, content
+/// hash)`.
 ///
 /// A content-addressed runtime is shared across principals (issue #1069) — one
-/// instance behind N views. Keying by capsule id (not `principal/capsule_id`)
-/// makes the health monitor track ONE restart budget per shared runtime, so a
-/// failed shared instance is not restarted N times (once per viewing principal).
-fn restart_tracker_key(capsule_id: &str) -> String {
-    capsule_id.to_string()
+/// instance behind N views of the SAME hash. Including the hash (not the capsule
+/// id alone, and not `principal/capsule_id`) makes the health monitor track ONE
+/// restart budget per DISTINCT runtime: a failed shared instance is not restarted
+/// N times (once per viewing principal), yet two distinct hashes of one capsule
+/// id (per-principal installs of different versions) get INDEPENDENT budgets so a
+/// crash-looping v1 cannot exhaust v2's restart allowance or vice versa.
+fn restart_tracker_key(capsule_id: &str, hash: &astrid_capsule::registry::WasmHash) -> String {
+    format!("{capsule_id}\0{hash}")
 }
 
 /// Collect the FAILED runtimes from the health-monitor's view snapshot,
-/// deduplicated by capsule id.
+/// deduplicated by `(capsule id, content hash)`.
 ///
-/// `cloned_values_with_principal()` yields one `(principal, Arc)` pair PER VIEW,
-/// so a SHARED failed runtime (issue #1069) with N views appears N times — all
-/// sharing one `Arc` and reporting the same `check_health`. This dedups by
-/// capsule id so a shared failed runtime yields exactly ONE failure entry (and
-/// therefore exactly one restart). The retained entry keeps the first-seen
-/// viewing principal as the restart requester; `restart_capsule` rebuilds every
-/// view regardless of which principal requests it.
+/// `cloned_values_with_principal_and_hash()` yields one `(principal, hash, Arc)`
+/// triple PER VIEW, so a SHARED failed runtime (issue #1069) referenced by N
+/// views of the SAME hash appears N times — all sharing one `Arc` and reporting
+/// the same `check_health`. This dedups by `(id, hash)` so that shared runtime
+/// yields exactly ONE failure entry (and therefore exactly one restart), while
+/// still surfacing TWO entries when one capsule id has two DISTINCT hashes loaded
+/// at once (e.g. `default` on `foo@1.0` and `alice` on `foo@2.0` — installs are
+/// per-principal, so each derives its own content hash). Each distinct runtime is
+/// then restarted independently rather than one being collapsed into the other.
 ///
-/// Dedup key is the capsule id. This is correct while at most one content hash
-/// is loaded per capsule name at a time — the case today, since every principal
-/// shares one install source path (loaded under `default`) and derives the same
-/// hash. If per-principal multi-version installs ever land (two hashes for one
-/// capsule id), this must dedup by `(capsule_id, hash)` so each distinct failed
-/// runtime is restarted.
+/// The retained entry keeps the first-seen viewing principal as the restart
+/// requester; `restart_capsule` rebuilds every view pointing at that exact hash.
 ///
-/// Returns `(requesting principal, capsule id, failure reason)` tuples.
+/// Returns `(requesting principal, capsule id, content hash, failure reason)`.
 fn collect_failed_runtimes_deduped(
     ready_capsules: &[(
         PrincipalId,
+        astrid_capsule::registry::WasmHash,
         std::sync::Arc<dyn astrid_capsule::capsule::Capsule>,
     )],
-) -> Vec<(PrincipalId, String, String)> {
-    let mut failures: Vec<(PrincipalId, String, String)> = Vec::new();
-    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-    for (principal, capsule) in ready_capsules {
+) -> Vec<(
+    PrincipalId,
+    String,
+    astrid_capsule::registry::WasmHash,
+    String,
+)> {
+    let mut failures = Vec::new();
+    let mut seen: std::collections::HashSet<(String, astrid_capsule::registry::WasmHash)> =
+        std::collections::HashSet::new();
+    for (principal, hash, capsule) in ready_capsules {
+        // Probe health FIRST — it borrows and does not allocate, and the common
+        // case (a healthy runtime) short-circuits before any `String` / key
+        // allocation. Only an actually-failed runtime pays for the `(id, hash)`
+        // dedup key; `HashSet::insert` returning `false` means this exact
+        // `(id, hash)` was already recorded this tick, so we skip the duplicate.
+        let astrid_capsule::capsule::CapsuleState::Failed(reason) = capsule.check_health() else {
+            continue;
+        };
         let id_str = capsule.id().to_string();
-        if !seen.contains(&id_str)
-            && let astrid_capsule::capsule::CapsuleState::Failed(reason) = capsule.check_health()
-        {
-            seen.insert(id_str.clone());
-            failures.push((principal.clone(), id_str, reason));
+        if seen.insert((id_str.clone(), hash.clone())) {
+            failures.push((principal.clone(), id_str, hash.clone(), reason));
         }
     }
     failures
@@ -3076,13 +3113,13 @@ mod tests {
 
         let ready = {
             let registry = kernel.capsules.read().await;
-            registry.cloned_values_with_principal()
+            registry.cloned_values_with_principal_and_hash()
         };
-        // Three views of one shared runtime → three pairs.
+        // Three views of one shared runtime → three triples.
         assert_eq!(
             ready.len(),
             3,
-            "three views must produce three (principal, Arc) pairs (shared runtime)"
+            "three views must produce three (principal, hash, Arc) triples (shared runtime)"
         );
 
         let failures = collect_failed_runtimes_deduped(&ready);
@@ -3093,9 +3130,76 @@ mod tests {
             failures.len()
         );
         assert_eq!(failures[0].1, id.as_str());
-        // The tracker key is the capsule id alone — one budget for the shared
+        assert_eq!(failures[0].2, hash);
+        // The tracker key is `(id, hash)` — one budget for the DISTINCT shared
         // runtime, not one per principal.
-        assert_eq!(restart_tracker_key(&failures[0].1), id.as_str());
+        assert_eq!(
+            restart_tracker_key(&failures[0].1, &failures[0].2),
+            restart_tracker_key(id.as_str(), &hash)
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn health_monitor_keeps_two_distinct_hashes_of_one_id_separate() {
+        // Two principals on DIFFERENT versions of the same capsule id resolve to
+        // two DISTINCT content hashes (per-principal installs). Dedup is by
+        // `(id, hash)`, so two failed runtimes for one id must surface as TWO
+        // failures (two independent restarts), never collapsed into one.
+        let (_d, home) = scratch_home();
+        let kernel = test_kernel_with_home(home).await;
+        let id = CapsuleId::new("two-versions").unwrap();
+        let default_p = PrincipalId::default();
+        let alice = PrincipalId::new("alice").unwrap();
+        let hash_v1 = astrid_capsule::registry::WasmHash::from_raw("two-versions-v1");
+        let hash_v2 = astrid_capsule::registry::WasmHash::from_raw("two-versions-v2");
+
+        {
+            let mut registry = kernel.capsules.write().await;
+            // `default` on v1, `alice` on v2 — two distinct runtimes, one id.
+            registry
+                .register_owned_by_default(
+                    Box::new(FailingTestCapsule {
+                        id: id.clone(),
+                        manifest: CapsuleManifest::default(),
+                    }),
+                    hash_v1.clone(),
+                    &default_p,
+                )
+                .unwrap();
+            registry
+                .register_owned_by_default(
+                    Box::new(FailingTestCapsule {
+                        id: id.clone(),
+                        manifest: CapsuleManifest::default(),
+                    }),
+                    hash_v2.clone(),
+                    &alice,
+                )
+                .unwrap();
+        }
+
+        let ready = {
+            let registry = kernel.capsules.read().await;
+            registry.cloned_values_with_principal_and_hash()
+        };
+        assert_eq!(ready.len(), 2, "two distinct hashes → two view triples");
+
+        let failures = collect_failed_runtimes_deduped(&ready);
+        assert_eq!(
+            failures.len(),
+            2,
+            "two distinct failed hashes for one id must NOT be collapsed; got {}",
+            failures.len()
+        );
+        let mut seen_hashes: Vec<_> = failures.iter().map(|(_, _, h, _)| h.clone()).collect();
+        seen_hashes.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+        assert_eq!(seen_hashes, vec![hash_v1.clone(), hash_v2.clone()]);
+        // Distinct tracker keys → independent restart budgets per version.
+        assert_ne!(
+            restart_tracker_key(id.as_str(), &hash_v1),
+            restart_tracker_key(id.as_str(), &hash_v2),
+            "each distinct runtime must get its own restart budget"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]

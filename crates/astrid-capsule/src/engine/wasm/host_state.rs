@@ -24,6 +24,7 @@ use astrid_storage::secret::SecretStore;
 /// [`tokio::io::AsyncRead`] / [`tokio::io::AsyncWrite`], so the inner
 /// framing logic is shared.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub enum NetStream {
     /// Inbound Unix-domain socket accepted from the kernel's listener.
     Unix(Arc<tokio::sync::Mutex<tokio::net::UnixStream>>),
@@ -40,6 +41,7 @@ pub enum NetStream {
 /// here; they live on the underlying socket and are read back via
 /// `TcpStream::nodelay()` / `ttl()` on demand.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct TcpStreamSlot {
     /// The connected TCP socket. Shared via `Arc<Mutex<…>>` so the
     /// existing `net-read` / `net-write` dispatchers can clone the
@@ -84,6 +86,7 @@ pub enum LifecyclePhase {
 /// back into a `Resource<Subscription>` and the kernel does not key
 /// any storage on it.
 #[derive(Debug, Clone, serde::Serialize)]
+#[non_exhaustive]
 pub struct InterceptorHandle {
     /// Enumeration index; informational only under the new ABI.
     pub handle_id: u64,
@@ -108,6 +111,7 @@ use crate::security::CapsuleSecurityGate;
 /// capsule's N pooled instances — all fields (`PathBuf`, `Arc<dyn Vfs>`,
 /// `DirHandle`) share or copy cheaply (issue #816).
 #[derive(Clone)]
+#[non_exhaustive]
 pub struct PrincipalMount {
     /// Canonical physical directory this mount is rooted at.
     pub root: PathBuf,
@@ -142,6 +146,7 @@ impl std::fmt::Debug for PrincipalMount {
 /// keeps the field honest for any future principal binding that is not
 /// device-scoped.
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub struct ConnectionIdentity {
     /// The handshake-verified principal this connection authenticated as.
     pub principal: astrid_core::principal::PrincipalId,
@@ -150,7 +155,47 @@ pub struct ConnectionIdentity {
     pub device_key_id: Option<String>,
 }
 
+/// Caller-supplied inputs for [`HostState::for_hook`].
+///
+/// Carries only the pieces a transient WASM hook invocation genuinely varies —
+/// identity, VFS, KV, secret store, HTTP limits, runtime handle, and the process
+/// registries. Every other [`HostState`] field is the fail-closed hook default
+/// filled in by [`HostState::for_hook`]. Grouping these in one struct keeps the
+/// hook crate off the giant field-by-field literal, so [`HostState`] can gain
+/// fields (`#[non_exhaustive]`) without breaking `astrid-hooks`.
+pub struct HookHostStateParams {
+    /// Per-Store memory meter (throwaway ledger; the cap is still enforced).
+    pub store_meter: crate::memory_ledger::StoreMemoryMeter,
+    /// Per-module hook identity (`hook:{module_stem}`).
+    pub capsule_id: CapsuleId,
+    /// Workspace root; file operations are confined here.
+    pub workspace_root: PathBuf,
+    /// VFS confining the hook to `workspace_root`.
+    pub vfs: Arc<dyn astrid_vfs::Vfs>,
+    /// Root capability handle for the VFS.
+    pub vfs_root_handle: astrid_capabilities::DirHandle,
+    /// The hook's own KV store (a single-principal one-shot, not a shared
+    /// runtime, so this legitimately IS the hook's store — no overlays).
+    pub kv: ScopedKvStore,
+    /// Backing KV handle, mirroring [`kv`](Self::kv) for API completeness.
+    pub kv_backend: Arc<dyn astrid_storage::KvStore>,
+    /// Per-module secret store (scoped to the hook identity).
+    pub secret_store: Arc<dyn SecretStore>,
+    /// Operator `astrid:http` host policy applied to the hook's HTTP calls.
+    pub http_limits: super::limits::HttpLimits,
+    /// Event bus for IPC publish/subscribe.
+    pub event_bus: astrid_events::EventBus,
+    /// Tokio runtime handle for bridging async in sync host fns.
+    pub runtime_handle: tokio::runtime::Handle,
+    /// Child-process tracker (throwaway; reaped on drop).
+    pub process_tracker: Arc<ProcessTracker>,
+    /// Persistent-process registry (throwaway; hooks never spawn persistent
+    /// children).
+    pub persistent_processes: Arc<crate::engine::wasm::host::process::PersistentProcessRegistry>,
+}
+
 /// Shared state accessible to all host functions via `Store<HostState>`.
+#[non_exhaustive]
 pub struct HostState {
     /// WASI context for Component Model WASI imports (clocks, random, etc.).
     pub wasi_ctx: wasmtime_wasi::WasiCtx,
@@ -807,6 +852,8 @@ impl HostState {
 mod connection;
 #[path = "host_state_effective.rs"]
 mod effective;
+#[path = "host_state_hook.rs"]
+mod hook;
 #[path = "host_state_invocation.rs"]
 mod invocation;
 
