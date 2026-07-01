@@ -84,6 +84,15 @@ impl std::fmt::Display for WasmHash {
 struct InstanceEntry {
     capsule: Arc<dyn Capsule>,
     refcount: usize,
+    /// The principal the runtime was built under (its `HostState.principal`, the
+    /// `effective_*` load-time fallback owner). Tracked so [`register_for`] can
+    /// REJECT sharing an instance across a different owner — forcing callers onto
+    /// [`register_existing`] and guaranteeing no code path ever creates a shared
+    /// instance owned by a real non-default principal whose load-time fields
+    /// would become a cross-principal fallback. Kernel loads use
+    /// [`register_owned_by_default`], so a shared instance's owner is always
+    /// [`PrincipalId::default()`].
+    owner: PrincipalId,
 }
 
 /// Outcome of removing one principal's view of a shared instance.
@@ -156,19 +165,26 @@ impl CapsuleRegistry {
         self.register_for(capsule, hash, &PrincipalId::default())
     }
 
-    /// Register a capsule under `hash` in `principal`'s view.
+    /// Register a capsule under `hash` in `principal`'s view, owned by
+    /// `principal`.
     ///
     /// The instance is owned by (loaded under) `principal`. When a runtime for
     /// `hash` already exists this shares it — bumping the refcount and adding
-    /// `principal`'s view — rather than building a second runtime. This is the
-    /// single-owner / same-principal path used by tests and by the default
-    /// principal's own boot loads. The kernel builds shared instances under the
-    /// default principal via [`Self::register_owned_by_default`].
+    /// `principal`'s view — but ONLY when the existing runtime's owner is also
+    /// `principal`; sharing a hash already owned by a DIFFERENT principal is
+    /// REJECTED (use [`Self::register_existing`] to add a view without asserting
+    /// ownership). This guarantees no code path can create a shared instance
+    /// owned by a real non-default principal whose load-time host-state fields
+    /// would become a cross-principal fallback. This is the single-owner /
+    /// same-principal path used by tests and by the default principal's own boot
+    /// loads. The kernel builds shared instances under the default principal via
+    /// [`Self::register_owned_by_default`].
     ///
     /// # Errors
     ///
     /// Returns an error when the principal already has a capsule with that ID,
-    /// or when uplink registration fails for a new instance.
+    /// when `hash` is already loaded under a DIFFERENT owner, or when uplink
+    /// registration fails for a new instance.
     pub fn register_for(
         &mut self,
         capsule: Box<dyn Capsule>,
@@ -220,9 +236,26 @@ impl CapsuleRegistry {
             )));
         }
 
-        // Cross-principal share path: a runtime for this hash is already loaded.
-        // Add the view and bump the refcount instead of building a second one.
-        if self.instances.contains_key(&hash) {
+        // A runtime for this hash is already loaded. Sharing it is allowed ONLY
+        // when the existing owner matches the owner this call would use — which
+        // for `register_for` is `owner == view_principal`, and for
+        // `register_owned_by_default` is `owner == default`. Sharing across a
+        // DIFFERENT real owner would leave the instance's load-time
+        // `kv`/`secret_store`/`home` fields (the owner's) reachable as a
+        // cross-principal fallback for the other viewer. Reject and force the
+        // caller onto `register_existing`, which adds a view without implying a
+        // new owner. (In practice the kernel always loads via
+        // `register_owned_by_default`, so a shared instance's owner is always
+        // `default`; this guard makes that structurally unbreakable.)
+        if let Some(existing) = self.instances.get(&hash) {
+            if existing.owner != *owner {
+                return Err(CapsuleError::UnsupportedEntryPoint(format!(
+                    "content hash {hash} is already loaded under owner '{}'; refusing to \
+                     re-register under '{owner}'. Use register_existing to add a view over \
+                     the shared instance.",
+                    existing.owner
+                )));
+            }
             return self.add_view(&id, &hash, view_principal);
         }
 
@@ -257,6 +290,7 @@ impl CapsuleRegistry {
             InstanceEntry {
                 capsule,
                 refcount: 1,
+                owner: owner.clone(),
             },
         );
         self.views
@@ -506,6 +540,21 @@ impl CapsuleRegistry {
             .iter()
             .find(|(_, view)| view.contains_key(id))
             .map(|(principal, _)| principal.clone())
+    }
+
+    /// Every principal whose view contains `id`.
+    ///
+    /// A shared runtime (issue #1069) is referenced by N principal views; this
+    /// returns all of them so a restart of a shared FAILED runtime can rebuild it
+    /// for every view rather than leaving non-requesting principals with a dead
+    /// view. Order is unspecified (`HashMap` iteration).
+    #[must_use]
+    pub fn principals_viewing(&self, id: &CapsuleId) -> Vec<PrincipalId> {
+        self.views
+            .iter()
+            .filter(|(_, view)| view.contains_key(id))
+            .map(|(principal, _)| principal.clone())
+            .collect()
     }
 
     /// Iterator over all distinct loaded capsule instances.

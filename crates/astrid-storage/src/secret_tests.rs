@@ -4,10 +4,31 @@
 use std::sync::Arc;
 
 use super::{
-    FileSecretStore, KvSecretStore, ScopedKvStore, SecretStore, SecretStoreError,
+    DenySecretStore, FileSecretStore, KvSecretStore, ScopedKvStore, SecretStore, SecretStoreError,
     build_secret_store,
 };
 use crate::MemoryKvStore;
+
+#[test]
+fn deny_secret_store_holds_nothing_and_denies_writes() {
+    // The neutral fail-closed placeholder used as a shared runtime's load-time
+    // secret store (#1069): exposes NOTHING and grants NOTHING.
+    let store = DenySecretStore::new();
+    // Reads report "no such secret" — never another principal's data.
+    assert!(!store.exists("api_key").unwrap());
+    assert_eq!(store.get("api_key").unwrap(), None);
+    // Writes and deletes are rejected outright.
+    assert!(matches!(
+        store.set("api_key", "sk-secret"),
+        Err(SecretStoreError::NoAccess(_))
+    ));
+    assert!(matches!(
+        store.delete("api_key"),
+        Err(SecretStoreError::NoAccess(_))
+    ));
+    // Still nothing after the rejected write.
+    assert!(!store.exists("api_key").unwrap());
+}
 
 /// Build a `KvSecretStore` backed by an in-memory KV. Returns a dedicated
 /// tokio runtime that the store uses internally for `block_on`.

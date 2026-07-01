@@ -1039,14 +1039,17 @@ mod access_enforcement {
             crate::registry::WasmHash::synthetic(capsule_name, &capsule.manifest.package.version);
         let first = principals.first().copied().unwrap_or("default");
         let first_pid = PrincipalId::new(first).expect("valid principal");
+        let capsule_id = capsule.id().clone();
         registry
             .register_for(Box::new(capsule), hash.clone(), &first_pid)
             .unwrap();
+        // Additional principals SHARE the one runtime via `register_existing`
+        // (the production view-add path) — not a second `register_for` under a
+        // different owner, which the registry now rejects.
         for principal in &principals[1..] {
             let pid = PrincipalId::new(*principal).expect("valid principal");
-            let (capsule, _) = MockCapsule::new(capsule_name, interceptor_event);
             registry
-                .register_for(Box::new(capsule), hash.clone(), &pid)
+                .register_existing(&capsule_id, &hash, &pid)
                 .unwrap();
         }
         let registry = Arc::new(RwLock::new(registry));

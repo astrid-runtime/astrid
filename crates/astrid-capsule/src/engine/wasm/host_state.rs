@@ -204,14 +204,39 @@ pub struct HostState {
     pub overlay_vfs: Option<Arc<astrid_vfs::OverlayVfs>>,
     /// Reference to the ephemeral upper directory to keep it alive for the session.
     pub upper_dir: Option<Arc<tempfile::TempDir>>,
-    /// Plugin-scoped KV store (`plugin:{capsule_id}` namespace).
-    pub kv: ScopedKvStore,
-    /// Per-invocation KV store scoped to a different principal.
+    /// Load-time KV fallback: a NEUTRAL, physically-isolated store that holds
+    /// **no real principal's data**.
     ///
-    /// Set by `WasmEngine::invoke_interceptor` when the IPC message's
-    /// principal differs from `self.principal`. Host functions use
-    /// `invocation_kv.as_ref().unwrap_or(&kv)` to transparently scope
-    /// reads/writes to the calling principal.
+    /// A content-addressed runtime is SHARED across every principal that views
+    /// the same WASM hash (issue #1069) and is loaded under no real principal's
+    /// identity. Every invocation that carries a principal installs an
+    /// [`invocation_kv`](Self::invocation_kv) overlay scoped to the *invoking*
+    /// principal (the owner/`default` included). This field is therefore only
+    /// ever reached by principal-less / load-time contexts — and it must resolve
+    /// to a namespace that maps to no real principal's namespace, NEVER to
+    /// `default`'s (or anyone's) real capsule KV.
+    ///
+    /// Backed by a fresh in-memory store (see
+    /// [`HostState::neutral_kv`](Self::neutral_kv)), so a stray read is empty and
+    /// a stray write cannot reach any persistent principal namespace. Real
+    /// per-invocation overlays are built from
+    /// [`kv_backend`](Self::kv_backend), never from this field.
+    pub kv: ScopedKvStore,
+    /// The real, shared KV backend used to CONSTRUCT per-invocation overlays.
+    ///
+    /// Separated from [`kv`](Self::kv) (the neutral fallback) so that overlay
+    /// construction (`{principal}:capsule:{capsule_id}`) targets the persistent
+    /// backend while the fallback stays neutral/fail-closed. Never used as a
+    /// fallback itself.
+    pub kv_backend: Arc<dyn astrid_storage::KvStore>,
+    /// Per-invocation KV store scoped to the calling principal.
+    ///
+    /// Set by `WasmEngine::invoke_interceptor` (and the `ipc::recv` path) for
+    /// EVERY invocation that carries a principal — the owner/`default` included.
+    /// Host functions use [`effective_kv`](Self::effective_kv) which returns this
+    /// overlay when set and the neutral [`kv`](Self::kv) fallback otherwise, so a
+    /// caller's reads/writes always land in its own principal namespace and never
+    /// bleed into another principal's.
     pub invocation_kv: Option<ScopedKvStore>,
     /// Per-invocation home mount for the calling principal.
     ///
@@ -401,7 +426,16 @@ pub struct HostState {
     /// Set to `Some(Install)` or `Some(Upgrade)` during lifecycle dispatch.
     /// Gates the `astrid_elicit` host function.
     pub lifecycle_phase: Option<LifecyclePhase>,
-    /// Secret store for capsule credentials (keychain with KV fallback).
+    /// Load-time secret-store fallback: a NEUTRAL, deny-all placeholder
+    /// ([`astrid_storage::DenySecretStore`]) that holds and grants nothing.
+    ///
+    /// Same rationale as [`kv`](Self::kv): a shared content-addressed runtime
+    /// (issue #1069) is loaded under no real principal, so every principal-
+    /// carrying invocation installs an
+    /// [`invocation_secret_store`](Self::invocation_secret_store) scoped to the
+    /// invoking principal. This fallback is reached only by principal-less /
+    /// load-time contexts and MUST fail closed — never expose `default`'s (or
+    /// anyone's) real secrets.
     pub secret_store: Arc<dyn SecretStore>,
     /// Readiness signal sender for run-loop capsules.
     ///
@@ -620,6 +654,44 @@ impl wasmtime_wasi::WasiView for HostState {
 }
 
 impl HostState {
+    /// Namespace of the neutral, fail-closed KV fallback.
+    ///
+    /// A real per-principal namespace is `{principal}:capsule:{capsule_id}` and a
+    /// [`PrincipalId`](astrid_core::PrincipalId) is restricted to `[a-zA-Z0-9_-]`.
+    /// The `.` in `neutral.fail-closed` therefore cannot appear in any real
+    /// principal segment, so this namespace can never collide with a principal's
+    /// namespace even by construction. Belt-and-braces: the neutral store is also
+    /// backed by a *separate* in-memory store (see [`Self::neutral_kv`]), so it is
+    /// physically isolated from the persistent backend regardless of namespace.
+    pub const NEUTRAL_KV_NAMESPACE: &'static str = "neutral.fail-closed:capsule";
+
+    /// Build the NEUTRAL, physically-isolated KV fallback store.
+    ///
+    /// Backed by a fresh [`MemoryKvStore`](astrid_storage::MemoryKvStore) — NOT
+    /// the shared persistent backend — so a stray read is empty and a stray write
+    /// cannot reach any principal's persistent namespace. This is the store a
+    /// shared runtime falls back to for principal-less / load-time contexts; a
+    /// real invocation always installs a per-principal `invocation_kv` overlay
+    /// built from [`kv_backend`](Self::kv_backend).
+    #[must_use]
+    pub fn neutral_kv() -> ScopedKvStore {
+        ScopedKvStore::new(
+            Arc::new(astrid_storage::MemoryKvStore::new()),
+            Self::NEUTRAL_KV_NAMESPACE,
+        )
+        .expect("neutral KV namespace is a valid, non-empty, null-free constant")
+    }
+
+    /// Build the NEUTRAL, deny-all secret-store fallback.
+    ///
+    /// See [`astrid_storage::DenySecretStore`]. Reached only by principal-less /
+    /// load-time contexts on a shared runtime; every principal-carrying
+    /// invocation installs an `invocation_secret_store` scoped to the caller.
+    #[must_use]
+    pub fn neutral_secret_store() -> Arc<dyn SecretStore> {
+        Arc::new(astrid_storage::DenySecretStore::new())
+    }
+
     /// Register a uplink descriptor (called from the host function).
     ///
     /// # Errors
@@ -678,53 +750,54 @@ impl HostState {
         self.inbound_tx = Some(tx);
     }
 
-    /// Debug-only consistency check: when the caller's principal differs from
-    /// the capsule owner's, the corresponding `invocation_*` field **must** be
-    /// populated. Otherwise the accessor silently returns the owner's resource
-    /// and the invoking principal's reads/writes leak to the owner's scope.
+    /// Debug-only consistency check: when a caller with a present, parseable
+    /// principal is in scope, the corresponding `invocation_*` field **must** be
+    /// populated. Otherwise the accessor silently returns the NEUTRAL
+    /// fail-closed placeholder and the caller's reads/writes are denied/empty
+    /// when they should have hit the caller's own scope.
     ///
-    /// This matters most for SHARED runtimes (issue #1069): a single runtime is
+    /// This matters for SHARED runtimes (issue #1069): a single runtime is
     /// shared across every principal that views the same content hash, loaded
-    /// under [`PrincipalId::default()`](astrid_core::PrincipalId). The owner is
-    /// therefore the system/default scope, and a non-default caller MUST get an
-    /// `invocation_*` overlay — otherwise its reads/writes would land in the
-    /// system scope. The setup in [`WasmEngine::invoke_interceptor`] guarantees
-    /// `invocation_kv` and `invocation_secret_store` are populated whenever the
-    /// principal mismatches (the only failure path is
-    /// `ScopedKvStore::with_namespace` rejecting an empty/null-byte namespace,
-    /// which our format string never produces). This assertion catches any
-    /// regression that breaks that invariant in debug builds.
+    /// under [`PrincipalId::default()`](astrid_core::PrincipalId). `default` is
+    /// an ORDINARY principal, so the load-time `kv`/`secret_store` fields are
+    /// NEUTRAL placeholders (not `default`'s namespace); EVERY caller — the
+    /// owner/`default` included — must get an `invocation_*` overlay scoped to
+    /// itself. The setup in [`WasmEngine::invoke_interceptor`] and the recv path
+    /// (both via `install_principal_overlays*`) guarantee `invocation_kv` and
+    /// `invocation_secret_store` are populated whenever a caller principal is
+    /// present (the only failure path is `ScopedKvStore::new` rejecting an
+    /// empty/null-byte namespace, which our format string never produces, and
+    /// which itself fails closed). This assertion catches any regression that
+    /// breaks that invariant in debug builds.
     ///
-    /// Deliberately scoped to a *present, parseable* caller principal that
-    /// differs from the owner. A caller whose principal is **absent/unparseable**
-    /// is intentionally NOT asserted: principal-less system and lifecycle events
-    /// (e.g. capsule-react's `astrid.v1.watchdog.tick`, capsule-registry's
-    /// `astrid.v1.capsules_loaded`) are legitimately dispatched with no caller
-    /// principal and fall back to the owner store. Because shared instances are
-    /// owned by `default`, that fallback is the system/default scope — never a
-    /// specific principal's private state — so a blanket assert on the absent
-    /// case would fire on sound paths. Principal-scoped capsules
-    /// (capsule-session) additionally rely on the producer-side invariant that
-    /// every principal-scoped topic carries an authenticated principal — pinned
-    /// by the `effective_kv_*` tests, not by this assert. Relates to #977, #1069.
+    /// Deliberately scoped to a *present, parseable* caller principal (owner
+    /// included — no longer excused when the caller equals the owner, since the
+    /// fallback is neutral, not the owner's data). A caller whose principal is
+    /// **absent/unparseable** is intentionally NOT asserted: principal-less
+    /// system and lifecycle events (e.g. capsule-react's
+    /// `astrid.v1.watchdog.tick`, capsule-registry's `astrid.v1.capsules_loaded`)
+    /// are legitimately dispatched with no caller principal and fall back to the
+    /// neutral placeholder — never a specific principal's private state — so a
+    /// blanket assert on the absent case would fire on sound paths. Relates to
+    /// #977, #1069.
     ///
     /// Not applied to `invocation_home` / `invocation_tmp` / `invocation_capsule_log`:
-    /// those legitimately stay `None` for unregistered principals (the VFS
-    /// bundle registration gate and log-open registration gate).
+    /// those legitimately stay `None` for unregistered principals and on the sync
+    /// recv path (the VFS bundle registration gate and log-open registration
+    /// gate); the neutral fallback denies rather than exposing another principal.
     #[cfg(debug_assertions)]
     fn debug_assert_invocation_field_set(&self, is_set: bool, field_name: &str) {
-        let principal_mismatches = self
+        let caller_has_principal = self
             .caller_context
             .as_ref()
             .and_then(|m| m.principal.as_deref())
             .and_then(|p| astrid_core::PrincipalId::new(p).ok())
-            .is_some_and(|p| p != self.principal);
-        if principal_mismatches && !is_set {
+            .is_some();
+        if caller_has_principal && !is_set {
             debug_assert!(
                 false,
-                "invocation principal differs from capsule owner ({owner}) but {field_name} is None — \
-                 effective_* accessor would fall back to the owner's resource, leaking reads/writes",
-                owner = self.principal,
+                "a caller principal is in scope but {field_name} is None — the effective_* accessor \
+                 would fall back to the NEUTRAL placeholder, denying the caller its own scope",
             );
         }
     }

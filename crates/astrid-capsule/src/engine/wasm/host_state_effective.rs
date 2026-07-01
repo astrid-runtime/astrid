@@ -16,36 +16,37 @@ impl HostState {
 
     /// Return the effective KV store for the current invocation.
     ///
-    /// Per-principal isolation lives HERE, not in capsule keys. Every store is
-    /// namespaced `{principal}:capsule:{capsule_id}`, so two principals writing
-    /// the *same* logical key — e.g. capsule-session's principal-less
+    /// Per-principal isolation lives HERE, not in capsule keys. Every real store
+    /// is namespaced `{principal}:capsule:{capsule_id}`, so two principals
+    /// writing the *same* logical key — e.g. capsule-session's principal-less
     /// `session.data.{id}` — resolve to different backing namespaces and never
     /// collide. A capsule therefore must not (and need not) fold the principal
     /// into its own keys.
     ///
-    /// Resolution: `invocation_kv` (the per-call store installed when the caller
-    /// differs from the load-time owner) wins; otherwise the owner `kv`.
+    /// Resolution: `invocation_kv` (the per-call store installed for the invoking
+    /// principal) wins; otherwise the NEUTRAL fail-closed
+    /// [`kv`](HostState::kv) placeholder.
     ///
     /// Runtimes are SHARED by content hash across principals (issue #1069) and
     /// the kernel loads them under [`PrincipalId::default()`](astrid_core::PrincipalId::default),
-    /// so the load-time owner — and therefore the owner-`kv` fallback — is the
-    /// **system/default scope**, never a specific principal's private state.
-    /// A non-default caller always gets an `invocation_kv` overlay scoped to its
-    /// own principal (installed by `invoke_interceptor` /
-    /// `install_recv_invocation_context` whenever the caller differs from the
-    /// owner), so the fallback is reached only for:
+    /// but `default` is an ORDINARY principal — reading its namespace from
+    /// another principal would be a cross-principal bleed. So the load-time `kv`
+    /// fallback is NOT `default`'s namespace: it is a neutral, physically-
+    /// isolated placeholder holding no real principal's data (see the field doc).
+    /// EVERY caller carrying a principal — the owner/`default` included — gets an
+    /// `invocation_kv` overlay scoped to its own principal (installed by
+    /// `invoke_interceptor` / `install_recv_invocation_context`), so the fallback
+    /// is reached ONLY by principal-less contexts:
     ///
-    /// - no caller in scope (load-time, a run-loop's own work, tests),
-    /// - the caller IS the owner (`default` serving itself), or
+    /// - no caller in scope (load-time, a run-loop's own work, tests), or
     /// - a principal-less system/lifecycle event (watchdog tick,
     ///   `capsules_loaded`).
     ///
-    /// In every one of those the fallback namespace is the system/default
-    /// scope, so a non-owner invocation can never reach another principal's KV
-    /// through the fallback. The degrade path (invocation-KV construction
-    /// failing and leaving `invocation_kv = None`) also falls back to the
-    /// system/default scope, not to a victim principal. Pinned by the
-    /// `effective_kv_*` / `scoped_kv_*` tests. Relates to #977, #1069.
+    /// In every one of those the fallback is the neutral placeholder, so no
+    /// invocation can EVER reach another principal's KV — nor `default`'s — via
+    /// the fallback. The degrade path (invocation-KV construction failing and
+    /// leaving `invocation_kv = None`) also falls back to the neutral placeholder.
+    /// Pinned by the `effective_kv_*` / `scoped_kv_*` tests. Relates to #977, #1069.
     #[must_use]
     pub fn effective_kv(&self) -> &ScopedKvStore {
         #[cfg(debug_assertions)]

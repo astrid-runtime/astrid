@@ -703,12 +703,21 @@ async fn seed_capsule_inventory_profile(
         let id = CapsuleId::new(*capsule).expect("valid capsule id");
         let hash = astrid_capsule::registry::WasmHash::synthetic(capsule, "0.0.1");
         if reg.get_for(principal, &id).is_none() {
-            reg.register_for(
-                Box::new(InventoryCapsule::new(capsule, &format!("{capsule}-cmd"))),
-                hash,
-                principal,
-            )
-            .expect("seed capsule view");
+            // Mirror the production load path: if a runtime for this hash already
+            // exists (e.g. registered under `default`), add THIS principal's view
+            // via `register_existing` rather than a cross-owner `register_for`,
+            // which the registry now rejects (#1069 host-state isolation).
+            if reg.contains_hash(&hash) {
+                reg.register_existing(&id, &hash, principal)
+                    .expect("seed capsule view (shared)");
+            } else {
+                reg.register_for(
+                    Box::new(InventoryCapsule::new(capsule, &format!("{capsule}-cmd"))),
+                    hash,
+                    principal,
+                )
+                .expect("seed capsule view");
+            }
         }
     }
 }

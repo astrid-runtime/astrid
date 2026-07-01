@@ -38,12 +38,23 @@ impl HostState {
     ///   this path too; falls back to the process-global default on a missing
     ///   cache or failed load.
     ///
+    /// - [`invocation_secret_store`](Self::invocation_secret_store) — installed
+    ///   for the publisher (owner included) via the shared
+    ///   [`install_principal_overlays_sync`](crate::engine::wasm::install_principal_overlays_sync),
+    ///   so a non-owner publisher's `has_secret` / secret writes resolve to ITS
+    ///   OWN store, never the neutral load-time fallback and never `default`'s.
+    ///
     /// Skipped vs the interceptor path (each is independently
     /// recoverable; documenting the gaps so the omissions are
     /// auditable):
-    /// - `invocation_home` / `invocation_tmp` / `invocation_secret_store` —
-    ///   none of the current run+recv capsules touch home/tmp paths
-    ///   or secrets from the recv loop. Add when one starts to.
+    /// - `invocation_home` / `invocation_tmp` — these MOUNT a VFS (async), but
+    ///   `ipc::poll` is a synchronous bindgen fn, so they are not installed on
+    ///   this path. Run+recv capsules do not touch `home://` / `/tmp` paths, and
+    ///   the load-time `home` / `tmp` fields are NEUTRAL (`None`) fail-closed
+    ///   placeholders — so leaving them unset denies rather than exposing the
+    ///   load-owner's mount. Install them (via the async
+    ///   [`install_principal_overlays`](crate::engine::wasm::install_principal_overlays))
+    ///   if a recv-driven capsule ever needs per-principal `home://`.
     /// - `store_meter` — the per-invocation linear-memory ceiling stays the
     ///   capsule owner's; the recv path does not re-target it per publisher
     ///   the way `invoke_interceptor` does. Acceptable because the run+recv
@@ -107,10 +118,16 @@ impl HostState {
         //     single-tenant case and only bites once an operator configures
         //     the owner principal.)
         //
-        //   • KV / log overrides — installed only when the publisher DIFFERS
-        //     from the load-time owner. The load-time `kv` / `capsule_log`
-        //     are already the owner's, so an owner-published message clears
-        //     them back to the load-time values.
+        //   • KV / secret-store / log overlays — installed for EVERY publisher
+        //     that carries a present, parseable principal, the load-owner
+        //     (`default`) INCLUDED, via the shared
+        //     [`install_principal_overlays_sync`]. A shared content-addressed
+        //     runtime (issue #1069) is loaded under no real principal, so the
+        //     load-time `kv` / `secret_store` / `capsule_log` are NEUTRAL
+        //     fail-closed placeholders; every real publisher must get its OWN
+        //     scope explicitly. A principal-less system/lifecycle event (no
+        //     parseable principal) clears the overlays and resolves to the
+        //     neutral floor — never another principal's data.
         //
         //   • Env overrides — refreshed for the effective publisher, owner
         //     included. Env files can be written after capsule load via the
@@ -146,29 +163,14 @@ impl HostState {
             self.capsule_id.as_str(),
         );
 
-        // KV / log scoping overrides only kick in for a non-owner publisher;
-        // an owner-published message clears them back to the load-time
-        // (owner) values.
-        let Some(p) = publisher.filter(|p| *p != self.principal) else {
-            self.invocation_kv = None;
-            self.invocation_capsule_log = None;
-            return;
-        };
-
-        let ns = format!("{}:capsule:{}", p, self.capsule_id);
-        self.invocation_kv = match self.kv.with_namespace(&ns) {
-            Ok(kv) => Some(kv),
-            Err(e) => {
-                tracing::warn!(
-                    principal = %p,
-                    error = %e,
-                    "Failed to create invocation KV scope on ipc::recv path"
-                );
-                None
-            },
-        };
-
-        self.invocation_capsule_log =
-            crate::engine::wasm::open_capsule_log(&p, self.capsule_id.as_str(), false);
+        // Install the KV / secret-store / capsule-log overlays for the publisher
+        // (owner included), or clear them to the neutral floor for a
+        // principal-less event. `home` / `tmp` are NOT installed here: they mount
+        // a VFS (async) and `ipc::poll` is a sync bindgen fn; run+recv capsules
+        // do not touch `home://` / `/tmp`, and the neutral `None` fallback is
+        // fail-closed (never the load-owner), so leaving them unset is correct.
+        // This closes the recv-path secret bleed: a non-owner publisher now
+        // resolves `effective_secret_store` to ITS OWN store, not `default`'s.
+        crate::engine::wasm::install_principal_overlays_sync(self, publisher.as_ref());
     }
 }

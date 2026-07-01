@@ -806,6 +806,109 @@ pub(crate) async fn build_principal_vfs_bundle(
     build_principal_vfs_bundle_at(&astrid_home.principal_home(principal)).await
 }
 
+/// Install (or clear) the per-invocation host-state overlays for the caller.
+///
+/// THE single source of truth for scoping a shared runtime's KV / secret store /
+/// home / tmp / capsule log to the invoking principal. Used by BOTH the
+/// dispatcher-driven interceptor path and the guest-pulled `ipc::recv` path so
+/// the two can never drift.
+///
+/// Semantics enforce the isolation invariant for a content-addressed shared
+/// runtime (issue #1069), whose load-time `kv`/`secret_store`/`home`/`tmp`/
+/// `capsule_log` fields are NEUTRAL fail-closed placeholders holding no real
+/// principal's data:
+///
+/// - `Some(p)` — install `p`-scoped overlays for EVERY caller carrying a present,
+///   parseable principal, the load-owner (`default`) INCLUDED. The KV overlay is
+///   built from [`kv_backend`](HostState::kv_backend) (the real shared backend),
+///   NOT from the neutral `kv` fallback. The secret store is built over that KV
+///   overlay so both backends are principal-isolated.
+/// - `None` — principal-less system / lifecycle events (watchdog tick,
+///   capsules_loaded): clear every overlay so resolution falls back to the
+///   NEUTRAL placeholders. This is the fail-closed floor — never another
+///   principal's data.
+///
+/// Degrade path: if the KV overlay cannot be constructed (a `with_namespace`
+/// failure, which the `{principal}:capsule:{id}` format never produces), ALL
+/// overlays are cleared to `None` so resolution fails closed to the neutral
+/// placeholder — it never falls back to the load-owner's real store.
+async fn install_principal_overlays(
+    state: &mut HostState,
+    principal: Option<&astrid_core::PrincipalId>,
+) {
+    // KV + secret store + capsule log are installed synchronously (shared with
+    // the recv path). `Ok(true)` means a real principal scope was installed;
+    // `Ok(false)` / any clear means the neutral fail-closed floor is in effect,
+    // in which case the async VFS bundle must NOT be built.
+    if !install_principal_overlays_sync(state, principal) {
+        state.invocation_home = None;
+        state.invocation_tmp = None;
+        return;
+    }
+    // Safe to unwrap: `install_principal_overlays_sync` returned `true` only for
+    // a present, parseable principal.
+    let p = principal.expect("overlays installed only for a present principal");
+    let bundle = build_principal_vfs_bundle(p).await;
+    state.invocation_home = bundle.home;
+    state.invocation_tmp = bundle.tmp;
+}
+
+/// Synchronous core of [`install_principal_overlays`]: install the KV, secret
+/// store, and capsule-log overlays scoped to `principal` (or clear them to the
+/// neutral fail-closed floor when `principal` is `None` or KV construction
+/// fails). Returns `true` iff a real per-principal scope was installed.
+///
+/// Split out so the sync `ipc::poll` / `recv` recv path can install the
+/// security-critical KV + secret overlays without an async VFS mount. `home` /
+/// `tmp` are async (they mount a VFS) and are installed only by the async
+/// [`install_principal_overlays`]; on the recv path they stay `None` and resolve
+/// to the neutral placeholder (fail-closed, never the load-owner), which is
+/// correct because run+recv capsules do not touch `home://` / `/tmp` paths.
+fn install_principal_overlays_sync(
+    state: &mut HostState,
+    principal: Option<&astrid_core::PrincipalId>,
+) -> bool {
+    let Some(p) = principal else {
+        // Principal-less / load-time context: neutral fail-closed fallback.
+        state.invocation_kv = None;
+        state.invocation_secret_store = None;
+        state.invocation_capsule_log = None;
+        return false;
+    };
+
+    let ns = format!("{}:capsule:{}", p, state.capsule_id);
+    let kv = match astrid_storage::ScopedKvStore::new(state.kv_backend.clone(), &ns) {
+        Ok(kv) => kv,
+        Err(e) => {
+            // FAIL CLOSED: a construction failure for principal `p` must NEVER
+            // expose the load-owner's (or anyone's) store. Clear every overlay so
+            // resolution falls back to the neutral placeholder, then bail.
+            tracing::warn!(
+                principal = %p,
+                error = %e,
+                "Failed to create invocation KV scope; failing closed to the neutral store"
+            );
+            state.invocation_kv = None;
+            state.invocation_secret_store = None;
+            state.invocation_capsule_log = None;
+            return false;
+        },
+    };
+
+    // Per-invocation secret store, built over the invocation KV scope so both KV
+    // and keychain backends are principal-isolated. The keychain service name
+    // combines capsule id + principal so keychain entries stay scoped when the
+    // same capsule serves multiple principals.
+    state.invocation_secret_store = Some(astrid_storage::build_secret_store(
+        &format!("{}:{}", state.capsule_id, p),
+        kv.clone(),
+        state.runtime_handle.clone(),
+    ));
+    state.invocation_kv = Some(kv);
+    state.invocation_capsule_log = open_capsule_log(p, state.capsule_id.as_str(), false);
+    true
+}
+
 /// Open (creating the log dir if needed) the daily-rotated log file for
 /// `capsule_name` under `principal`'s home. Returns `None` if the astrid home
 /// can't be resolved, the principal's home directory doesn't exist, or the
@@ -1153,7 +1256,6 @@ impl ExecutionEngine for WasmEngine {
             let lower_vfs = astrid_vfs::HostVfs::new();
             let upper_vfs = astrid_vfs::HostVfs::new();
             let root_handle = astrid_capabilities::DirHandle::new();
-            let home_root = ctx.home_root.clone();
 
             // Upper layer uses a per-capsule temporary directory so writes
             // are sandboxed until explicitly committed. The TempDir is kept
@@ -1180,63 +1282,29 @@ impl ExecutionEngine for WasmEngine {
                 ))
             })?;
 
-            // Set up the per-principal home mount. Writes go directly to
-            // disk — no OverlayVfs CoW layer here, unlike the workspace
-            // VFS. Only mount if the directory exists to avoid failing
-            // capsule load on fresh installs; `mount_dir` returns `None`
-            // for a missing root.
-            let home_mount: Option<PrincipalMount> = match home_root.as_deref() {
-                Some(g_root) if !g_root.exists() => {
-                    tracing::warn!(
-                        home_root = %g_root.display(),
-                        "home:// VFS not mounted: directory does not exist. \
-                         Capsules requesting home:// paths will receive errors \
-                         until the directory is created and the kernel is restarted."
-                    );
-                    None
-                },
-                Some(g_root) => mount_dir(g_root).await,
-                None => None,
-            };
-
+            // The per-principal home mount is NOT built at load time. A shared
+            // content-addressed runtime (issue #1069) is loaded under no real
+            // principal; `home://` is served by the per-invocation
+            // `invocation_home` overlay, mounted for the INVOKING principal on
+            // each call (see `invoke_interceptor` / the recv path). The load-time
+            // `home`/`tmp` fields stay neutral (`None`), never the load-owner's.
             let overlay_vfs = Arc::new(astrid_vfs::OverlayVfs::new(
                 Box::new(lower_vfs),
                 Box::new(upper_vfs),
             ));
 
-            // Only resolve home:// in the gate if we actually mounted the VFS.
-            // Otherwise the gate would approve paths the VFS can't serve.
-            let gate_home_root = home_mount.as_ref().map(|m| m.root.clone());
+            // NEUTRAL gate default: the gate must NOT carry a load-owner
+            // (`default`) home as its fallback. Every real `home://` access
+            // resolves through `effective_home()` and passes the INVOKING
+            // principal's home to the gate as `principal_home`, which supersedes
+            // this default. Leaving the default `None` makes the gate fail closed
+            // for principal-less / load-time contexts instead of authorizing
+            // `default`'s files.
             let security_gate = Arc::new(crate::security::ManifestSecurityGate::new(
                 manifest.clone(),
                 workspace_root.clone(),
-                gate_home_root,
+                None,
             ));
-
-            // Set up /tmp mount backed by the principal's .local/tmp/ directory.
-            let tmp_mount: Option<PrincipalMount> = match astrid_core::dirs::AstridHome::resolve() {
-                Ok(astrid_home) => {
-                    let dir = astrid_home.principal_home(&ctx.principal).tmp_dir();
-                    if dir.exists() || std::fs::create_dir_all(&dir).is_ok() {
-                        mount_dir(&dir).await
-                    } else {
-                        None
-                    }
-                },
-                Err(_) => None,
-            };
-
-            // Open per-capsule daily log file at .local/log/{capsule}/{date}.log.
-            // Prunes logs older than 7 days on each capsule load — load is
-            // one-shot so the O(N) scan is fine here. Per-invocation re-opens
-            // (see `invoke_interceptor`) do NOT prune — hot path.
-            let capsule_log = open_capsule_log(&ctx.principal, &manifest.package.name, true);
-
-            let secret_store = astrid_storage::build_secret_store(
-                &manifest.package.name,
-                kv.clone(),
-                tokio::runtime::Handle::current(),
-            );
 
             // Manifest-derived data + shared services, built once and cloned
             // into each pooled Store's HostState by `make_state` below.
@@ -1436,13 +1504,20 @@ impl ExecutionEngine for WasmEngine {
                 caller_context: None,
                 interceptor_active: false,
                 invocation_kv: None,
-                capsule_log: capsule_log.clone(),
+                // NEUTRAL fail-closed fallback. A shared content-addressed
+                // runtime (issue #1069) is loaded under no real principal, so
+                // the per-principal host-state FALLBACKS must hold no real
+                // principal's data — never the load-owner's (`default`'s). Every
+                // principal-carrying invocation installs its own `invocation_*`
+                // overlay (built from `kv_backend` for KV); this fallback is
+                // reached only by principal-less / load-time contexts and denies.
+                capsule_log: None,
                 capsule_id: capsule_id_val.clone(),
                 workspace_root: workspace_root.clone(),
                 vfs: Arc::clone(&overlay_vfs) as Arc<dyn astrid_vfs::Vfs>,
                 vfs_root_handle: root_handle.clone(),
-                home: home_mount.clone(),
-                tmp: tmp_mount.clone(),
+                home: None,
+                tmp: None,
                 invocation_home: None,
                 invocation_tmp: None,
                 invocation_secret_store: None,
@@ -1452,7 +1527,10 @@ impl ExecutionEngine for WasmEngine {
                 invocation_env_overlay: None,
                 overlay_vfs: Some(Arc::clone(&overlay_vfs)),
                 upper_dir: Some(Arc::clone(&upper_dir_arc)),
-                kv: kv.clone(),
+                // Neutral, physically-isolated KV fallback (see the `kv` field
+                // doc). Real per-invocation overlays are built from `kv_backend`.
+                kv: HostState::neutral_kv(),
+                kv_backend: kv.backend(),
                 event_bus: event_bus.clone(),
                 ipc_limiter: Arc::clone(&ipc_limiter),
                 config: wasm_config.clone(),
@@ -1476,7 +1554,11 @@ impl ExecutionEngine for WasmEngine {
                 inbound_tx: tx.clone(),
                 registered_uplinks: Vec::new(),
                 lifecycle_phase: None,
-                secret_store: secret_store.clone(),
+                // NEUTRAL deny-all fallback (see the `secret_store` field doc):
+                // reached only by principal-less / load-time contexts on a shared
+                // runtime; every principal-carrying invocation installs an
+                // `invocation_secret_store` scoped to the caller.
+                secret_store: HostState::neutral_secret_store(),
                 ready_tx: None,
                 blocking_semaphore: blocking_semaphore.clone(),
                 io_semaphore: io_semaphore.clone(),
@@ -2225,51 +2307,25 @@ impl ExecutionEngine for WasmEngine {
                 state.invocation_env_overlay =
                     load_invocation_env_overlay(&invoking_principal, state.capsule_id.as_str());
 
+                // Install per-invocation host-state overlays for EVERY caller
+                // that carries a present, parseable principal — the load-owner
+                // (`default`) INCLUDED. A shared content-addressed runtime (issue
+                // #1069) is loaded under no real principal, so the load-time
+                // `kv`/`secret_store`/`home`/`tmp`/`capsule_log` fields are
+                // NEUTRAL fail-closed placeholders. Every real caller must
+                // therefore get its OWN scope explicitly here; the neutral
+                // fallback is reached only by principal-less / load-time contexts
+                // and NEVER exposes another principal's data.
+                //
+                // A caller with no parseable principal (principal-less system /
+                // lifecycle events: watchdog tick, capsules_loaded) installs NO
+                // overlay and resolves to the neutral placeholder — the correct
+                // fail-closed floor.
                 let invocation_principal: Option<astrid_core::PrincipalId> = caller
                     .and_then(|msg| msg.principal.as_deref())
-                    .and_then(|p| astrid_core::PrincipalId::new(p).ok())
-                    .filter(|p| *p != state.principal);
+                    .and_then(|p| astrid_core::PrincipalId::new(p).ok());
 
-                state.invocation_kv = invocation_principal.as_ref().and_then(|p| {
-                    let ns = format!("{}:capsule:{}", p, state.capsule_id);
-                    match state.kv.with_namespace(&ns) {
-                        Ok(kv) => Some(kv),
-                        Err(e) => {
-                            tracing::warn!(
-                                principal = %p,
-                                error = %e,
-                                "Failed to create invocation KV scope"
-                            );
-                            None
-                        },
-                    }
-                });
-
-                if let Some(ref p) = invocation_principal {
-                    let bundle = build_principal_vfs_bundle(p).await;
-                    state.invocation_home = bundle.home;
-                    state.invocation_tmp = bundle.tmp;
-                    state.invocation_capsule_log =
-                        open_capsule_log(p, state.capsule_id.as_str(), false);
-
-                    // Per-invocation secret store: built against the
-                    // invocation KV scope so both KV and keychain backends
-                    // are principal-isolated. `build_secret_store`'s
-                    // capsule_id is the keychain service name; combining it
-                    // with the principal keeps keychain entries scoped even
-                    // when the same capsule serves multiple principals.
-                    // If the invocation KV scope couldn't be built we leave
-                    // this as `None`, which causes `effective_secret_store`
-                    // to fall back to the load-time store — same
-                    // degrade-safely behavior as the KV scoping above.
-                    state.invocation_secret_store = state.invocation_kv.as_ref().map(|kv| {
-                        astrid_storage::build_secret_store(
-                            &format!("{}:{}", state.capsule_id, p),
-                            kv.clone(),
-                            state.runtime_handle.clone(),
-                        )
-                    });
-                }
+                install_principal_overlays(state, invocation_principal.as_ref()).await;
             }
 
             // ── Phase 2: CALL ─────────────────────────────────────
@@ -2487,6 +2543,14 @@ pub async fn run_lifecycle(
         invocation_env_overlay: None,
         overlay_vfs: None,
         upper_dir: None,
+        // Lifecycle hooks (install/upgrade) run a ONE-SHOT, single-principal,
+        // NON-shared instance: `cfg.kv` / `cfg.secret_store` are already scoped to
+        // the specific principal the operator is installing for, no other
+        // principal ever touches this throwaway instance, and no per-invocation
+        // overlays are installed. So the load-time `kv` legitimately IS this
+        // principal's real store (not the shared-runtime neutral placeholder).
+        // `kv_backend` mirrors it for API completeness; overlays are never built.
+        kv_backend: cfg.kv.backend(),
         kv: cfg.kv,
         event_bus: cfg.event_bus,
         ipc_limiter: Arc::new(astrid_events::ipc::IpcRateLimiter::new()),

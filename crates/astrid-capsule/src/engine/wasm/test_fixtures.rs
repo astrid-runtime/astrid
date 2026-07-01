@@ -67,9 +67,16 @@ pub(crate) fn open_log(path: &std::path::Path) -> Arc<std::sync::Mutex<std::fs::
 /// can run inside a `#[tokio::test]` or own their own `Builder`-created
 /// runtime (sync `#[test]`s do the latter).
 pub(crate) fn minimal_host_state(rt: tokio::runtime::Handle) -> HostState {
-    let kv = mem_kv("capsule:test");
-    let secret_store: Arc<dyn SecretStore> =
-        Arc::new(astrid_storage::KvSecretStore::new(kv.clone(), rt.clone()));
+    // Model the PRODUCTION shape of a shared, `default`-owned content-addressed
+    // instance (issue #1069): the load-time `kv` / `secret_store` fallbacks are
+    // NEUTRAL fail-closed placeholders holding no real principal's data, and a
+    // separate `kv_backend` handle carries the real backend used to build
+    // per-invocation overlays. Tests that want a real per-principal scope install
+    // an `invocation_kv` / `invocation_secret_store` overlay explicitly.
+    let kv_backend: Arc<dyn astrid_storage::KvStore> =
+        Arc::new(astrid_storage::MemoryKvStore::new());
+    let kv = HostState::neutral_kv();
+    let secret_store: Arc<dyn SecretStore> = HostState::neutral_secret_store();
 
     HostState {
         wasi_ctx: wasmtime_wasi::WasiCtxBuilder::new().build(),
@@ -101,6 +108,7 @@ pub(crate) fn minimal_host_state(rt: tokio::runtime::Handle) -> HostState {
         overlay_vfs: None,
         upper_dir: None,
         kv,
+        kv_backend,
         event_bus: astrid_events::EventBus::with_capacity(128),
         ipc_limiter: Arc::new(astrid_events::ipc::IpcRateLimiter::new()),
         config: HashMap::new(),

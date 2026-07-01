@@ -355,6 +355,11 @@ impl WasmHandler {
             invocation_env_overlay: None,
             overlay_vfs: None,
             upper_dir: None,
+            // Hooks run a transient, single-principal one-shot (scoped to
+            // `hook_identity`), NOT a shared runtime — so `kv` legitimately IS
+            // this hook's own store, and no per-invocation overlays are
+            // installed. `kv_backend` mirrors it for API completeness.
+            kv_backend: kv.backend(),
             kv,
             event_bus: astrid_events::EventBus::with_capacity(128),
             ipc_limiter: Arc::new(astrid_events::ipc::IpcRateLimiter::new()),

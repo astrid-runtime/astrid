@@ -233,9 +233,12 @@ fn uuid_mapping_cleanup_on_drain() {
 
 #[test]
 fn same_hash_shared_across_principals_single_instance() {
-    // INTENDED behaviour (#1069): two principals registering the SAME
-    // content hash share ONE runtime instance. Flips the pre-#1069 model
-    // (which asserted one instance per principal) to the shared model.
+    // INTENDED behaviour (#1069): two principals viewing the SAME content hash
+    // share ONE runtime instance. The share is added via `register_existing`
+    // (the production path), NOT a second `register_for` under a different owner
+    // — which is now REJECTED so a shared instance can never be owned by a real
+    // non-default principal whose load-time fields would be a cross-principal
+    // fallback (#1069 host-state isolation).
     let mut registry = CapsuleRegistry::new();
     let hash = test_hash("same-wasm-hash");
     let id = CapsuleId::from_static("shared-capsule");
@@ -249,14 +252,21 @@ fn same_hash_shared_across_principals_single_instance() {
             &alice,
         )
         .expect("register alice");
-    // Second principal, same hash: shares the existing runtime, no rebuild.
+    // A second `register_for` under a DIFFERENT owner is rejected: the guard
+    // forces callers onto `register_existing` for cross-principal shares.
+    let cross_owner = registry.register_for(
+        Box::new(MockCapsule::new("shared-capsule")),
+        hash.clone(),
+        &bob,
+    );
+    assert!(
+        cross_owner.is_err(),
+        "register_for must reject sharing a hash already owned by a different principal"
+    );
+    // Bob shares the SAME runtime via the production view-add path, no rebuild.
     registry
-        .register_for(
-            Box::new(MockCapsule::new("shared-capsule")),
-            hash.clone(),
-            &bob,
-        )
-        .expect("register bob");
+        .register_existing(&id, &hash, &bob)
+        .expect("register bob's view");
 
     let alice_capsule = registry.get_for(&alice, &id).expect("alice sees capsule");
     let bob_capsule = registry.get_for(&bob, &id).expect("bob sees capsule");
@@ -375,12 +385,8 @@ fn unregister_one_principal_retains_shared_instance() {
         )
         .expect("register alice");
     registry
-        .register_for(
-            Box::new(MockCapsule::new("shared-capsule")),
-            hash.clone(),
-            &bob,
-        )
-        .expect("register bob");
+        .register_existing(&id, &hash, &bob)
+        .expect("register bob's view");
 
     let removed = registry
         .unregister_for(&alice, &id)
@@ -441,4 +447,50 @@ fn shared_instance_torn_down_only_when_last_view_releases() {
     assert_eq!(registry.refcount_for_hash(&hash), None);
     assert_eq!(registry.len(), 0);
     assert!(registry.is_empty());
+}
+
+#[test]
+fn principals_viewing_returns_all_views_of_shared_runtime() {
+    // Bleed #4 mechanism: `restart_capsule` rebuilds EVERY view of a shared
+    // failed runtime, and it discovers those views via `principals_viewing`.
+    // Pin that it returns all N viewing principals (not just one).
+    let mut registry = CapsuleRegistry::new();
+    let hash = test_hash("multi-view-hash");
+    let id = CapsuleId::from_static("multi-view");
+    let alice = pid("alice");
+    let bob = pid("bob");
+    let carol = pid("carol");
+
+    registry
+        .register_for(
+            Box::new(MockCapsule::new("multi-view")),
+            hash.clone(),
+            &alice,
+        )
+        .expect("register alice");
+    registry
+        .register_existing(&id, &hash, &bob)
+        .expect("bob view");
+    registry
+        .register_existing(&id, &hash, &carol)
+        .expect("carol view");
+
+    let mut viewing: Vec<String> = registry
+        .principals_viewing(&id)
+        .into_iter()
+        .map(|p| p.to_string())
+        .collect();
+    viewing.sort();
+    assert_eq!(
+        viewing,
+        vec!["alice".to_string(), "bob".to_string(), "carol".to_string()],
+        "principals_viewing must return every view of the shared runtime"
+    );
+
+    // An absent capsule has no viewers.
+    assert!(
+        registry
+            .principals_viewing(&CapsuleId::from_static("absent"))
+            .is_empty()
+    );
 }

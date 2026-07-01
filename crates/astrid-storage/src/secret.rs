@@ -110,6 +110,58 @@ fn validate_value(value: &str) -> Result<(), SecretStoreError> {
 }
 
 // ---------------------------------------------------------------------------
+// Neutral fail-closed implementation
+// ---------------------------------------------------------------------------
+
+/// A secret store that holds no data and denies every operation.
+///
+/// This is the **neutral, fail-closed placeholder** used as the load-time
+/// secret store of a content-addressed capsule runtime that is SHARED across
+/// principals (issue #1069). Such a runtime is loaded under no real principal's
+/// identity; a per-invocation [`SecretStore`] scoped to the *invoking* principal
+/// is installed on every call that carries a principal. This placeholder is
+/// therefore only ever reached by principal-less / load-time contexts (system
+/// and lifecycle events, load-time host calls). It must expose **nothing** and
+/// grant **nothing** — never another principal's secrets.
+///
+/// `exists` and `get` report "no such secret" (`false` / `None`); `set` and
+/// `delete` are rejected outright. A capsule that reaches this store on a real
+/// invocation is a bug — the correct behaviour is to deny, not to silently fall
+/// back to some principal's real secrets.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct DenySecretStore;
+
+impl DenySecretStore {
+    /// Construct the neutral, deny-all secret store.
+    #[must_use]
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl SecretStore for DenySecretStore {
+    fn set(&self, _key: &str, _value: &str) -> Result<(), SecretStoreError> {
+        Err(SecretStoreError::NoAccess(
+            "no principal in scope: secret writes are denied on the neutral store".into(),
+        ))
+    }
+
+    fn exists(&self, _key: &str) -> Result<bool, SecretStoreError> {
+        Ok(false)
+    }
+
+    fn get(&self, _key: &str) -> Result<Option<String>, SecretStoreError> {
+        Ok(None)
+    }
+
+    fn delete(&self, _key: &str) -> Result<bool, SecretStoreError> {
+        Err(SecretStoreError::NoAccess(
+            "no principal in scope: secret deletes are denied on the neutral store".into(),
+        ))
+    }
+}
+
+// ---------------------------------------------------------------------------
 // KV-backed implementation (always available)
 // ---------------------------------------------------------------------------
 
