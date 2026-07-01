@@ -487,16 +487,108 @@ impl Kernel {
         let id = astrid_capsule::capsule::CapsuleId::from_static(&manifest.package.name);
         let wasm_hash = capsule_instance_hash(&manifest, &dir);
 
-        // Skip only if this principal already has the capsule in its view.
-        // The installed artifact is content-addressed by hash on disk, but the
-        // loaded runtime owns principal-bound env/KV host state and must not be
-        // shared across principal views.
+        // Dedup by content hash (issue #1069). Runtime instances are shared by
+        // hash across principals: a hash referenced by N principals loads ONCE.
+        //
+        // - Already in THIS principal's view → nothing to do.
+        // - A runtime for this hash already exists (loaded by another
+        //   principal) → add this principal's VIEW over the shared instance;
+        //   no runtime is built.
+        //
+        // Only when the hash is not yet loaded do we build a runtime (below).
         {
-            let registry = self.capsules.read().await;
+            let mut registry = self.capsules.write().await;
             if registry.get_for(principal, &id).is_some() {
                 return Ok(());
             }
+            if registry.contains_hash(&wasm_hash) {
+                registry
+                    .register_existing(&id, &wasm_hash, principal)
+                    .map_err(|e| anyhow::anyhow!("Failed to add capsule view: {e}"))?;
+                return Ok(());
+            }
         }
+
+        // First load of this content hash: build ONE shared runtime under the
+        // DEFAULT (system) principal (see `build_shared_capsule`). The installing
+        // `principal` receives the dispatch view via `register_owned_by_default`.
+        let mut capsule = self.build_shared_capsule(manifest, &dir).await?;
+
+        if !manifest_path.exists() {
+            unload_loaded_capsule_after_source_disappeared(capsule, &id, principal, &manifest_path)
+                .await;
+            return Ok(());
+        }
+
+        {
+            let mut registry = self.capsules.write().await;
+            // A concurrent load may have won the race: either this principal
+            // already has a view, or another principal built the shared runtime
+            // for this hash while we were loading. In both cases discard the
+            // runtime we just built. If the hash now exists but this principal
+            // lacks a view, add the view over the winner and drop ours.
+            let already_in_view = registry.get_for(principal, &id).is_some();
+            let hash_now_loaded = registry.contains_hash(&wasm_hash);
+            if already_in_view || hash_now_loaded {
+                if hash_now_loaded && !already_in_view {
+                    // Attach this principal's view to the runtime that won.
+                    if let Err(e) = registry.register_existing(&id, &wasm_hash, principal) {
+                        tracing::warn!(
+                            capsule_id = %id,
+                            principal = %principal,
+                            error = %e,
+                            "Failed to add view after concurrent shared load"
+                        );
+                    }
+                }
+                drop(registry);
+                capsule.request_cancel();
+                if let Err(e) = capsule.unload().await {
+                    tracing::warn!(
+                        capsule_id = %id,
+                        principal = %principal,
+                        error = %e,
+                        "Redundant capsule unload failed after concurrent load"
+                    );
+                }
+                return Ok(());
+            }
+            // First loader of this hash: register the shared runtime (owned by
+            // the default/system principal) and give the installing principal
+            // its dispatch view.
+            registry
+                .register_owned_by_default(capsule, wasm_hash, principal)
+                .map_err(|e| anyhow::anyhow!("Failed to register capsule: {e}"))?;
+        }
+
+        Ok(())
+    }
+
+    /// Build and load ONE shared capsule runtime under the DEFAULT (system)
+    /// principal.
+    ///
+    /// Loading under `default` makes the runtime's load-time owner the system
+    /// scope, so a principal-less invocation (watchdog tick, `capsules_loaded`,
+    /// etc.) falls back to the system store rather than a specific principal's
+    /// private state. Every non-default caller gets per-invocation `invocation_*`
+    /// overlays scoped to its own principal, so per-principal env/KV/secrets/home
+    /// isolation is preserved without a per-principal runtime. Per-principal
+    /// config is NOT baked here: it is resolved per invocation via the
+    /// `invocation_env_overlay` (read from the invoking principal's
+    /// `.config/env/{capsule}.env.json`), so loading under `default` loses no
+    /// per-principal configuration. This load-time KV pre-load and `self.config`
+    /// are the hash-identical system defaults.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the capsule cannot be created, the KV scope cannot be
+    /// built, or `capsule.load` fails.
+    async fn build_shared_capsule(
+        &self,
+        manifest: astrid_capsule::manifest::CapsuleManifest,
+        dir: &std::path::Path,
+    ) -> Result<Box<dyn astrid_capsule::capsule::Capsule>, anyhow::Error> {
+        let load_principal = PrincipalId::default();
 
         let loader = astrid_capsule::loader::CapsuleLoader::new(
             self.mcp.clone(),
@@ -506,20 +598,20 @@ impl Kernel {
             self.runtime_limits,
             self.http_limits,
         );
-        let mut capsule = loader.create_capsule(manifest, dir.clone())?;
+        let mut capsule = loader.create_capsule(manifest, dir.to_path_buf())?;
 
-        // Build the context — use the shared kernel KV so capsules can
-        // communicate state through overlapping KV namespaces.
         let kv = astrid_storage::ScopedKvStore::new(
             Arc::clone(&self.kv) as Arc<dyn astrid_storage::KvStore>,
-            format!("{principal}:capsule:{}", capsule.id()),
+            format!("{load_principal}:capsule:{}", capsule.id()),
         )?;
 
-        // Pre-load env config into the KV store.
-        // Check principal config first, fall back to capsule dir's .env.json.
+        // Pre-load default/system env config into the KV store. Check the
+        // default principal's config first, fall back to the capsule dir's
+        // .env.json. (Per-principal overrides come from the per-invocation
+        // overlay, not this load-time pre-load.)
         let capsule_name = capsule.id().to_string();
         let env_path = if let Ok(home) = astrid_core::dirs::AstridHome::resolve() {
-            let ph = home.principal_home(principal);
+            let ph = home.principal_home(&load_principal);
             let principal_env = ph.env_dir().join(format!("{capsule_name}.env.json"));
             if principal_env.exists() {
                 principal_env
@@ -540,7 +632,7 @@ impl Kernel {
         }
 
         let ctx = astrid_capsule::context::CapsuleContext::new(
-            principal.clone(),
+            load_principal,
             self.workspace_root.clone(),
             self.home_root.clone(),
             kv,
@@ -563,34 +655,7 @@ impl Kernel {
         .with_local_egress(self.local_egress.get(&capsule_name).cloned().unwrap_or_default());
 
         capsule.load(&ctx).await?;
-
-        if !manifest_path.exists() {
-            unload_loaded_capsule_after_source_disappeared(capsule, &id, principal, &manifest_path)
-                .await;
-            return Ok(());
-        }
-
-        {
-            let mut registry = self.capsules.write().await;
-            if registry.get_for(principal, &id).is_some() {
-                drop(registry);
-                capsule.request_cancel();
-                if let Err(e) = capsule.unload().await {
-                    tracing::warn!(
-                        capsule_id = %id,
-                        principal = %principal,
-                        error = %e,
-                        "Redundant capsule unload failed after concurrent load"
-                    );
-                }
-                return Ok(());
-            }
-            registry
-                .register_for(capsule, wasm_hash, principal)
-                .map_err(|e| anyhow::anyhow!("Failed to register capsule: {e}"))?;
-        }
-
-        Ok(())
+        Ok(capsule)
     }
 
     /// Restart a capsule by unloading it and re-loading from its source directory.
@@ -616,21 +681,23 @@ impl Kernel {
                 .ok_or_else(|| anyhow::anyhow!("capsule '{id}' has no source directory"))?
         };
 
-        // Unregister and explicitly unload. There is no Drop impl that
-        // calls unload() (it's async), so we must do it here to avoid
-        // leaking MCP subprocesses and other engine resources.
-        let old_capsule = {
+        // Unregister this principal's view. The runtime is shared by content
+        // hash across principals: `unregister_for` decrements the refcount and
+        // reports whether this was the LAST view. Only then may we cancel and
+        // unload the runtime — doing so while other principals still reference
+        // the shared instance would break them.
+        let removed = {
             let mut registry = self.capsules.write().await;
             registry
                 .unregister_for(principal, id)
                 .map_err(|e| anyhow::anyhow!("failed to unregister capsule '{id}': {e}"))?
         };
-        // Explicitly unload the old capsule. There is no Drop impl that
-        // calls unload() (it's async), so we must do it here to avoid
-        // leaking MCP subprocesses and other engine resources.
-        // Arc::get_mut requires exclusive ownership (strong_count == 1).
-        {
-            let mut old = old_capsule;
+        // Explicitly unload only when this was the last view (there is no Drop
+        // impl that calls unload() — it's async — so we must do it here to avoid
+        // leaking MCP subprocesses and other engine resources). Arc::get_mut
+        // requires exclusive ownership (strong_count == 1).
+        if removed.torn_down {
+            let mut old = removed.capsule;
             old.request_cancel();
             let mut unloaded = false;
             for retry in 0..20_u32 {
@@ -656,6 +723,13 @@ impl Kernel {
                     "Cannot call unload during restart - Arc still held by in-flight task"
                 );
             }
+        } else {
+            tracing::debug!(
+                capsule_id = %id,
+                principal = %principal,
+                "Restart released one view of a shared runtime; other principals \
+                 still reference it, so the runtime is left running"
+            );
         }
 
         // Re-load from disk.
@@ -1137,14 +1211,15 @@ impl Kernel {
         id: &astrid_capsule::capsule::CapsuleId,
         principal: &PrincipalId,
     ) -> Result<bool, anyhow::Error> {
-        // Unregister only from this principal's view. The content-addressed
-        // artifact may be installed for other principals, but loaded runtime
-        // instances own principal-bound env/KV state and are unloaded per
-        // principal.
-        let old_capsule = {
+        // Unregister only this principal's view. The runtime is shared by
+        // content hash across principals; `unregister_for` decrements the
+        // refcount and reports whether this was the last view. The runtime is
+        // cancelled/unloaded ONLY on the last release — tearing it down while
+        // other principals still reference the shared instance would break them.
+        let removed = {
             let mut registry = self.capsules.write().await;
             match registry.unregister_for(principal, id) {
-                Ok(capsule) => capsule,
+                Ok(removed) => removed,
                 Err(astrid_capsule::error::CapsuleError::NotFound(_)) => return Ok(false),
                 Err(e) => {
                     return Err(anyhow::anyhow!("failed to unregister capsule '{id}': {e}"));
@@ -1152,12 +1227,12 @@ impl Kernel {
             }
         };
 
-        // Explicitly unload the old capsule. There is no Drop impl that calls
-        // unload() (it's async), so we must do it here to avoid leaking MCP
-        // subprocesses and other engine resources. Arc::get_mut requires
-        // exclusive ownership (strong_count == 1).
-        {
-            let mut old = old_capsule;
+        // Explicitly unload the old capsule only when this was the last view.
+        // There is no Drop impl that calls unload() (it's async), so we must do
+        // it here to avoid leaking MCP subprocesses and other engine resources.
+        // Arc::get_mut requires exclusive ownership (strong_count == 1).
+        if removed.torn_down {
+            let mut old = removed.capsule;
             old.request_cancel();
             let mut unloaded = false;
             for retry in 0..20_u32 {
@@ -1183,6 +1258,13 @@ impl Kernel {
                     "Cannot call unload - Arc still held by in-flight task"
                 );
             }
+        } else {
+            tracing::debug!(
+                capsule_id = %id,
+                principal = %principal,
+                "Unloaded one view of a shared runtime; other principals still \
+                 reference it, so the runtime is left running"
+            );
         }
 
         self.publish_capsules_loaded().await;
@@ -2786,63 +2868,49 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn unload_one_principal_retains_other_principal_runtime() {
+    async fn unload_one_principal_retains_shared_runtime_for_others() {
+        // Shared-by-hash (#1069): alice and bob view ONE runtime for the same
+        // content hash. Unloading alice's view must NOT cancel or unload the
+        // shared runtime while bob still references it — the runtime survives
+        // and bob's view is intact. (The pre-#1069 model built one runtime per
+        // principal; this asserts the shared model.)
         let (_d, home) = scratch_home();
         let kernel = test_kernel_with_home(home).await;
         let id = CapsuleId::new("shared-test").unwrap();
         let alice = PrincipalId::new("alice").unwrap();
         let bob = PrincipalId::new("bob").unwrap();
         let hash = astrid_capsule::registry::WasmHash::from_raw("shared-test-hash");
-        let alice_cancelled = Arc::new(AtomicBool::new(false));
-        let alice_unloaded = Arc::new(AtomicBool::new(false));
-        let bob_cancelled = Arc::new(AtomicBool::new(false));
-        let bob_unloaded = Arc::new(AtomicBool::new(false));
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let unloaded = Arc::new(AtomicBool::new(false));
 
         {
             let mut registry = kernel.capsules.write().await;
+            // First loader builds the shared runtime.
             registry
                 .register_for(
                     Box::new(CancellableTestCapsule {
                         id: id.clone(),
                         manifest: CapsuleManifest::default(),
-                        cancelled: Arc::clone(&alice_cancelled),
-                        unloaded: Arc::clone(&alice_unloaded),
+                        cancelled: Arc::clone(&cancelled),
+                        unloaded: Arc::clone(&unloaded),
                     }),
                     hash.clone(),
                     &alice,
                 )
                 .unwrap();
-            registry
-                .register_for(
-                    Box::new(CancellableTestCapsule {
-                        id: id.clone(),
-                        manifest: CapsuleManifest::default(),
-                        cancelled: Arc::clone(&bob_cancelled),
-                        unloaded: Arc::clone(&bob_unloaded),
-                    }),
-                    hash,
-                    &bob,
-                )
-                .unwrap();
+            // Bob shares the SAME runtime (no second build).
+            registry.register_existing(&id, &hash, &bob).unwrap();
         }
 
         let removed = kernel.unload_one_capsule(&id, &alice).await.unwrap();
         assert!(removed);
         assert!(
-            alice_cancelled.load(Ordering::Relaxed),
-            "removing one principal's runtime must request cancellation for that runtime"
+            !cancelled.load(Ordering::Relaxed),
+            "releasing one view of a shared runtime must NOT cancel it while bob references it"
         );
         assert!(
-            alice_unloaded.load(Ordering::Relaxed),
-            "removing one principal's runtime must unload that runtime"
-        );
-        assert!(
-            !bob_cancelled.load(Ordering::Relaxed),
-            "removing Alice's runtime must not cancel Bob's runtime"
-        );
-        assert!(
-            !bob_unloaded.load(Ordering::Relaxed),
-            "removing Alice's runtime must not unload Bob's runtime"
+            !unloaded.load(Ordering::Relaxed),
+            "releasing one view of a shared runtime must NOT unload it while bob references it"
         );
 
         let registry = kernel.capsules.read().await;
@@ -2852,7 +2920,12 @@ mod tests {
         );
         assert!(
             registry.get_for(&bob, &id).is_some(),
-            "bob's view should retain its own runtime"
+            "bob's view should retain the shared runtime"
+        );
+        assert_eq!(
+            registry.refcount_for_hash(&hash),
+            Some(1),
+            "shared runtime refcount drops to bob's single remaining view"
         );
     }
 

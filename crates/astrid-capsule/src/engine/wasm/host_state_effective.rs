@@ -24,19 +24,28 @@ impl HostState {
     /// into its own keys.
     ///
     /// Resolution: `invocation_kv` (the per-call store installed when the caller
-    /// differs from the load-time owner) wins; otherwise the owner `kv`. The
-    /// owner fallback is correct in exactly two cases — no caller in scope
-    /// (load-time, a run-loop's own work, tests) or the caller IS the owner.
-    /// The case it does NOT defend against is a caller whose principal is
-    /// absent/unparseable while `invocation_kv` is unset: a principal-scoped
-    /// capsule would then silently touch the owner's namespace. That cannot
-    /// happen today because every producer of a principal-scoped topic stamps
-    /// an authenticated principal (`publish_inner` → `with_principal`; uplink
-    /// ingress → verified `ingress_principal`). The invariant is emergent, so it
-    /// is pinned by the `effective_kv_*` / `scoped_kv_*` tests rather than a
-    /// host-wide assert — see `debug_assert_invocation_field_set` for why a
-    /// blanket fail-closed assert on the absent-principal case is unsound.
-    /// Relates to #977.
+    /// differs from the load-time owner) wins; otherwise the owner `kv`.
+    ///
+    /// Runtimes are SHARED by content hash across principals (issue #1069) and
+    /// the kernel loads them under [`PrincipalId::default()`](astrid_core::PrincipalId::default),
+    /// so the load-time owner — and therefore the owner-`kv` fallback — is the
+    /// **system/default scope**, never a specific principal's private state.
+    /// A non-default caller always gets an `invocation_kv` overlay scoped to its
+    /// own principal (installed by `invoke_interceptor` /
+    /// `install_recv_invocation_context` whenever the caller differs from the
+    /// owner), so the fallback is reached only for:
+    ///
+    /// - no caller in scope (load-time, a run-loop's own work, tests),
+    /// - the caller IS the owner (`default` serving itself), or
+    /// - a principal-less system/lifecycle event (watchdog tick,
+    ///   `capsules_loaded`).
+    ///
+    /// In every one of those the fallback namespace is the system/default
+    /// scope, so a non-owner invocation can never reach another principal's KV
+    /// through the fallback. The degrade path (invocation-KV construction
+    /// failing and leaving `invocation_kv = None`) also falls back to the
+    /// system/default scope, not to a victim principal. Pinned by the
+    /// `effective_kv_*` / `scoped_kv_*` tests. Relates to #977, #1069.
     #[must_use]
     pub fn effective_kv(&self) -> &ScopedKvStore {
         #[cfg(debug_assertions)]

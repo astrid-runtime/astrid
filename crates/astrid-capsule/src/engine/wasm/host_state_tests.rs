@@ -582,6 +582,86 @@ fn scoped_kv_namespacing_isolates_identical_session_keys_across_principals() {
 }
 
 #[test]
+fn shared_instance_isolates_kv_and_secrets_per_invocation() {
+    // No-cross-principal-host-state-bleed regression for SHARED instances
+    // (#1069). The runtime is owned by `default` (the system scope); a
+    // non-owner invocation stamped for `bob` reads/writes BOB's KV + secret
+    // namespaces, and owner / principal-less invocations resolve to the
+    // system/default scope — never a specific principal's private state.
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap();
+    let mut state = minimal_host_state(rt.handle().clone());
+    // Confirm the fixture models a default-owned shared instance.
+    assert_eq!(state.principal, astrid_core::PrincipalId::default());
+    let owner_kv_ns = state.kv.namespace().to_string();
+    let owner_secret_ptr = Arc::as_ptr(&state.secret_store);
+
+    // Owner (default) invocation, no overlays → system/default scope.
+    assert_eq!(
+        state.effective_kv().namespace(),
+        owner_kv_ns.as_str(),
+        "owner/default invocation resolves to the system KV scope"
+    );
+    assert!(
+        std::ptr::eq(
+            Arc::as_ptr(state.effective_secret_store()),
+            owner_secret_ptr
+        ),
+        "owner/default invocation resolves to the system secret store"
+    );
+
+    // Non-owner (bob) invocation: the interceptor installs bob-scoped
+    // overlays. `effective_*` MUST resolve to bob's scope, not the owner's.
+    state.invocation_kv = Some(super::super::test_fixtures::mem_kv("bob:capsule:test"));
+    state.invocation_secret_store = Some(super::super::test_fixtures::mem_secret_store(
+        "bob:secret:test",
+        rt.handle().clone(),
+    ));
+    let bob_secret_ptr = Arc::as_ptr(state.invocation_secret_store.as_ref().unwrap());
+
+    assert_eq!(
+        state.effective_kv().namespace(),
+        "bob:capsule:test",
+        "bob's invocation reads/writes BOB's KV namespace on the shared instance"
+    );
+    assert_ne!(
+        state.effective_kv().namespace(),
+        owner_kv_ns.as_str(),
+        "bob's invocation must not touch the owner/default KV namespace"
+    );
+    assert!(
+        std::ptr::eq(Arc::as_ptr(state.effective_secret_store()), bob_secret_ptr),
+        "bob's invocation resolves to BOB's secret store on the shared instance"
+    );
+    assert!(
+        !std::ptr::eq(
+            Arc::as_ptr(state.effective_secret_store()),
+            owner_secret_ptr
+        ),
+        "bob's invocation must not resolve to the owner/default secret store"
+    );
+
+    // Principal-less system/lifecycle event (watchdog tick, capsules_loaded):
+    // overlays cleared → falls back to the system/default scope, NOT a victim
+    // principal's private scope.
+    state.invocation_kv = None;
+    state.invocation_secret_store = None;
+    assert_eq!(
+        state.effective_kv().namespace(),
+        owner_kv_ns.as_str(),
+        "a principal-less event on a shared instance stays in the system/default KV scope"
+    );
+    assert!(
+        std::ptr::eq(
+            Arc::as_ptr(state.effective_secret_store()),
+            owner_secret_ptr
+        ),
+        "a principal-less event on a shared instance stays in the system/default secret store"
+    );
+}
+
+#[test]
 fn effective_kv_falls_back_to_owner_for_principalless_message() {
     // The documented contamination edge (#977): a message IS in scope but
     // carries no parseable principal, and no invocation store is installed —

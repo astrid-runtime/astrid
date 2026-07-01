@@ -683,9 +683,14 @@ impl HostState {
     /// populated. Otherwise the accessor silently returns the owner's resource
     /// and the invoking principal's reads/writes leak to the owner's scope.
     ///
-    /// In practice the setup in [`WasmEngine::invoke_interceptor`] guarantees
-    /// `invocation_kv` and `invocation_secret_store` are populated whenever
-    /// the principal mismatches (the only failure path is
+    /// This matters most for SHARED runtimes (issue #1069): a single runtime is
+    /// shared across every principal that views the same content hash, loaded
+    /// under [`PrincipalId::default()`](astrid_core::PrincipalId). The owner is
+    /// therefore the system/default scope, and a non-default caller MUST get an
+    /// `invocation_*` overlay — otherwise its reads/writes would land in the
+    /// system scope. The setup in [`WasmEngine::invoke_interceptor`] guarantees
+    /// `invocation_kv` and `invocation_secret_store` are populated whenever the
+    /// principal mismatches (the only failure path is
     /// `ScopedKvStore::with_namespace` rejecting an empty/null-byte namespace,
     /// which our format string never produces). This assertion catches any
     /// regression that breaks that invariant in debug builds.
@@ -695,12 +700,13 @@ impl HostState {
     /// is intentionally NOT asserted: principal-less system and lifecycle events
     /// (e.g. capsule-react's `astrid.v1.watchdog.tick`, capsule-registry's
     /// `astrid.v1.capsules_loaded`) are legitimately dispatched with no caller
-    /// principal and correctly fall back to the owner/global store, so a
-    /// blanket assert on the absent case would fire on sound paths. Principal-
-    /// scoped capsules (capsule-session) instead rely on the producer-side
-    /// invariant that every principal-scoped topic carries an authenticated
-    /// principal — pinned by the `effective_kv_*` tests, not by this assert.
-    /// Relates to #977.
+    /// principal and fall back to the owner store. Because shared instances are
+    /// owned by `default`, that fallback is the system/default scope — never a
+    /// specific principal's private state — so a blanket assert on the absent
+    /// case would fire on sound paths. Principal-scoped capsules
+    /// (capsule-session) additionally rely on the producer-side invariant that
+    /// every principal-scoped topic carries an authenticated principal — pinned
+    /// by the `effective_kv_*` tests, not by this assert. Relates to #977, #1069.
     ///
     /// Not applied to `invocation_home` / `invocation_tmp` / `invocation_capsule_log`:
     /// those legitimately stay `None` for unregistered principals (the VFS
