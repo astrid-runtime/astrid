@@ -64,7 +64,6 @@ pub mod local;
 pub mod manifest_check;
 pub mod meta;
 pub mod paths;
-pub mod principal_introspection;
 pub mod wasm;
 pub mod wit;
 
@@ -83,5 +82,4 @@ pub use paths::{
     resolve_env_path, resolve_env_path_for, resolve_target_dir, resolve_target_dir_for,
     restore_env_from_backup, restore_env_from_backup_for,
 };
-pub use principal_introspection::materialize_principal_introspection;
 pub use wit::{content_address_wit, materialize_wit_mirror};

@@ -92,6 +92,26 @@ async fn agent_create_clone_copies_capability_profile() {
         &pid("src"),
     ))
     .unwrap();
+    let source_capsules = kernel
+        .astrid_home
+        .principal_home(&pid("src"))
+        .capsules_dir();
+    let source_registry = source_capsules.join("astrid-capsule-registry");
+    let source_openai = source_capsules.join("astrid-capsule-openai-compat");
+    std::fs::create_dir_all(&source_registry).expect("source registry capsule dir");
+    std::fs::create_dir_all(&source_openai).expect("source openai capsule dir");
+    std::fs::write(
+        source_registry.join("Capsule.toml"),
+        "[package]\nname = \"astrid-capsule-registry\"\nversion = \"0.1.0\"\n",
+    )
+    .expect("seed registry manifest");
+    std::fs::write(
+        source_openai.join("Capsule.toml"),
+        "[package]\nname = \"astrid-capsule-openai-compat\"\nversion = \"0.1.0\"\n",
+    )
+    .expect("seed openai manifest");
+    std::fs::write(source_openai.join(".env.json"), br#"{"api_key":"src"}"#)
+        .expect("seed env that must not cross clone boundary");
     kernel.profile_cache.invalidate(&pid("src"));
 
     let res = handlers::dispatch(
@@ -127,6 +147,32 @@ async fn agent_create_clone_copies_capability_profile() {
     assert_eq!(twin.quotas.max_background_processes, 7);
     // A fresh clone is enabled even though the source was disabled.
     assert!(twin.enabled, "clone must be enabled regardless of source");
+
+    let target_capsules = kernel
+        .astrid_home
+        .principal_home(&pid("twin"))
+        .capsules_dir();
+    assert!(
+        target_capsules
+            .join("astrid-capsule-registry")
+            .join("Capsule.toml")
+            .exists(),
+        "clone copied capsule grant but did not materialize registry install"
+    );
+    assert!(
+        target_capsules
+            .join("astrid-capsule-openai-compat")
+            .join("Capsule.toml")
+            .exists(),
+        "clone copied capsule grant but did not materialize openai install"
+    );
+    assert!(
+        !target_capsules
+            .join("astrid-capsule-openai-compat")
+            .join(".env.json")
+            .exists(),
+        "clone must not copy per-principal capsule env"
+    );
 }
 
 /// Cloning a source that confers admin (`default`, seeded into the `admin`
