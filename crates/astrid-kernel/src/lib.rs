@@ -159,6 +159,13 @@ pub struct Kernel {
     /// Coalesces full capsule reload requests so the router cannot spawn
     /// overlapping all-principal discovery/load sweeps.
     full_reload_in_flight: AtomicBool,
+    /// Serializes per-principal capsule load/warm operations.
+    ///
+    /// WASM component construction is CPU-heavy and can involve synchronous
+    /// host setup. Principal loads are not part of the gateway request fast
+    /// path, so queue them instead of letting admin-driven warms stampede the
+    /// daemon and starve unrelated HTTP/auth routes.
+    capsule_load_lock: Mutex<()>,
     /// Ephemeral mode: shut down immediately when the last client disconnects.
     pub ephemeral: AtomicBool,
     /// Instant when the kernel was booted (for uptime calculation).
@@ -405,6 +412,7 @@ impl Kernel {
             local_egress,
             http_limits,
             full_reload_in_flight: AtomicBool::new(false),
+            capsule_load_lock: Mutex::new(()),
             ephemeral: AtomicBool::new(false),
             boot_time: std::time::Instant::now(),
             shutdown_tx: tokio::sync::watch::channel(false).0,
@@ -720,6 +728,7 @@ impl Kernel {
     pub async fn ensure_principal_loaded(&self, principal: &PrincipalId) {
         use astrid_capsule::toposort::toposort_manifests;
 
+        let _load_guard = self.capsule_load_lock.lock().await;
         let paths = capsule_discovery_paths_for(&self.astrid_home, &self.workspace_root, principal);
         let discovered = astrid_capsule::discovery::discover_manifests(Some(&paths));
         let sorted = match toposort_manifests(discovered) {
@@ -1475,6 +1484,7 @@ pub(crate) async fn test_kernel_with_home(home: astrid_core::dirs::AstridHome) -
         local_egress: std::collections::HashMap::new(),
         http_limits: astrid_capsule::HttpLimits::default(),
         full_reload_in_flight: AtomicBool::new(false),
+        capsule_load_lock: Mutex::new(()),
         ephemeral: AtomicBool::new(false),
         boot_time: std::time::Instant::now(),
         shutdown_tx: tokio::sync::watch::channel(false).0,
