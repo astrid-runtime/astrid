@@ -52,7 +52,7 @@ use uuid::Uuid;
 use astrid_core::PrincipalId;
 
 use crate::error::{ErrorBody, GatewayError, GatewayResult};
-use crate::routes::capsule_sources::{legacy_capsule_source_id, trusted_capsule_source_ids};
+use crate::routes::capsule_sources::{capsule_source_id_v0, trusted_capsule_source_ids};
 use crate::routes::principals::caller_from;
 use crate::state::GatewayState;
 
@@ -73,8 +73,8 @@ const SET_ACTIVE_REQUEST: &str = "registry.v1.set_active_model";
 const SET_ACTIVE_RESPONSE: &str = "registry.v1.response.set_active_model";
 const REGISTRY_CAPSULE_ID: &str = "astrid-capsule-registry";
 
-fn registry_capsule_source_id() -> Uuid {
-    legacy_capsule_source_id(REGISTRY_CAPSULE_ID)
+fn registry_capsule_source_id_v0() -> Uuid {
+    capsule_source_id_v0(REGISTRY_CAPSULE_ID)
 }
 
 /// Body for `PUT /api/models/active`.
@@ -93,7 +93,7 @@ pub struct SetActiveModelRequest {
 /// The set-model path stamps each request with a fresh per-request
 /// `corr_id` and threads it here as `expected`. The rule (the gateway side
 /// of the shared correlation contract) is deliberately permissive on the
-/// "no id" case so it cannot break legacy paths:
+/// "no id" case so it cannot break older paths:
 ///
 /// * `expected == None` — GET paths, which are not correlated. Every reply
 ///   that passed the trusted-source check is accepted; concurrent
@@ -121,7 +121,7 @@ fn reply_satisfies_corr_id(reply: &serde_json::Value, expected: Option<&str>) ->
         return true;
     };
     match reply.get("corr_id") {
-        // No `corr_id` field on the reply → accept (legacy registry / GET
+        // No `corr_id` field on the reply → accept (older registry / GET
         // reply that hasn't started echoing the id).
         None => true,
         // Present as a string → accept only an exact match; a foreign id is
@@ -255,7 +255,11 @@ async fn registry_round_trip(
     let timeout = state.registry_timeout.unwrap_or(REGISTRY_TIMEOUT);
     let expected_source_ids = trusted_capsule_source_ids(REGISTRY_CAPSULE_ID, principal_id);
     let expected_source_ids = if expected_source_ids.is_empty() {
-        vec![registry_capsule_source_id()]
+        tracing::warn!(
+            capsule_id = REGISTRY_CAPSULE_ID,
+            "falling back to v0 package-only capsule source id"
+        );
+        vec![registry_capsule_source_id_v0()]
     } else {
         expected_source_ids
     };
@@ -441,7 +445,7 @@ mod tests {
     use std::sync::Arc;
 
     use crate::error::GatewayError;
-    use crate::routes::capsule_sources::legacy_capsule_source_id;
+    use crate::routes::capsule_sources::capsule_source_id_v0;
     use crate::state::{GatewayState, SigningMaterial};
     use astrid_core::PrincipalId;
     use astrid_events::ipc::{IpcMessage, IpcPayload, Topic};
@@ -555,7 +559,7 @@ mod tests {
                 IpcPayload::RawJson(json!({
                     "active_model": { "id": "openai-compat:forged" }
                 })),
-                legacy_capsule_source_id("astrid-capsule-adversarial"),
+                capsule_source_id_v0("astrid-capsule-adversarial"),
             )
             .with_principal("alice".to_string());
             bus_bg.publish(AstridEvent::Ipc {
@@ -618,7 +622,7 @@ mod tests {
 
     #[test]
     fn set_accepts_reply_without_corr_id() {
-        // Back-compat: a reply with NO `corr_id` field (legacy registry that
+        // Back-compat: a reply with NO `corr_id` field (older registry that
         // hasn't started echoing it, or a GET reply racing onto the route) is
         // accepted even when a `corr_id` was expected.
         assert!(reply_satisfies_corr_id(

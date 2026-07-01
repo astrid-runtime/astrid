@@ -3,8 +3,8 @@ use super::{
     IpcPayload, MessageOrigin, PrincipalId, SESSION_CAPSULE_ID, Topic, Uuid, Value,
 };
 
-pub(super) fn session_capsule_source_id() -> Uuid {
-    crate::routes::capsule_sources::legacy_capsule_source_id(SESSION_CAPSULE_ID)
+pub(super) fn session_capsule_source_id_v0() -> Uuid {
+    crate::routes::capsule_sources::capsule_source_id_v0(SESSION_CAPSULE_ID)
 }
 
 /// Reusable capsule request/reply-over-bus primitive.
@@ -59,7 +59,11 @@ pub(super) async fn request_capsule(
         .checked_add(timeout)
         .unwrap_or_else(tokio::time::Instant::now);
     let expected_source_ids = if expected_source_ids.is_empty() {
-        vec![session_capsule_source_id()]
+        tracing::warn!(
+            capsule_id = SESSION_CAPSULE_ID,
+            "falling back to v0 package-only capsule source id"
+        );
+        vec![session_capsule_source_id_v0()]
     } else {
         expected_source_ids.to_vec()
     };

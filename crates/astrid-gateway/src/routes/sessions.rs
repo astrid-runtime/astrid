@@ -50,7 +50,7 @@ use crate::state::GatewayState;
 mod sessions_bus;
 use sessions_bus::request_capsule;
 #[cfg(test)]
-use sessions_bus::session_capsule_source_id;
+use sessions_bus::session_capsule_source_id_v0;
 
 /// Default page size for the session-list endpoint when the caller
 /// omits `limit` (or passes `0`). Bounds the response body for casual

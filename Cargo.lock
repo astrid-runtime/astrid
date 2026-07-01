@@ -633,6 +633,7 @@ dependencies = [
  "axum",
  "axum-server",
  "base64",
+ "blake3",
  "chrono",
  "ed25519-dalek",
  "futures",

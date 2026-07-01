@@ -245,7 +245,7 @@ async fn request_capsule_round_trips_scoped_reply() {
         let mut msg = IpcMessage::new(
             Topic::from_raw(resp_topic.clone()),
             IpcPayload::RawJson(reply),
-            session_capsule_source_id(),
+            session_capsule_source_id_v0(),
         );
         if let AstridEvent::Ipc { message, .. } = &*event
             && let Some(principal) = &message.principal
@@ -303,7 +303,7 @@ async fn request_capsule_round_trips_custom_json_reply() {
         let mut msg = IpcMessage::new(
             Topic::from_raw(resp_topic.clone()),
             IpcPayload::Custom { data: reply },
-            session_capsule_source_id(),
+            session_capsule_source_id_v0(),
         );
         if let AstridEvent::Ipc { message, .. } = &*event
             && let Some(principal) = &message.principal
@@ -344,7 +344,7 @@ async fn request_capsule_accepts_live_registry_source_id() {
     let correlation_id = "corr-live-source-1";
     let response_topic = format!("{TOPIC_LIST_RESPONSE_PREFIX}.{correlation_id}");
     let live_source = Uuid::new_v4();
-    assert_ne!(live_source, session_capsule_source_id());
+    assert_ne!(live_source, session_capsule_source_id_v0());
 
     let mut req_rx = bus.subscribe_topic(TOPIC_LIST_REQUEST.to_string());
     let bus_capsule = Arc::clone(&bus);
@@ -703,7 +703,7 @@ async fn request_capsule_round_trips_update_reply() {
         let mut msg = IpcMessage::new(
             Topic::from_raw(resp_topic),
             IpcPayload::RawJson(reply),
-            session_capsule_source_id(),
+            session_capsule_source_id_v0(),
         );
         if let Some(principal) = &message.principal {
             msg = msg.with_principal(principal.clone());
@@ -759,7 +759,7 @@ async fn request_capsule_ignores_wrong_principal_reply() {
         let msg = IpcMessage::new(
             Topic::from_raw(resp_topic),
             IpcPayload::RawJson(reply),
-            session_capsule_source_id(),
+            session_capsule_source_id_v0(),
         )
         .with_principal("mallory".to_string());
         bus_bg.publish(AstridEvent::Ipc {
@@ -808,7 +808,7 @@ async fn request_capsule_ignores_wrong_capsule_source_reply() {
             "next_cursor": null
         });
         let wrong_source =
-            crate::routes::capsule_sources::legacy_capsule_source_id("astrid-capsule-adversarial");
+            crate::routes::capsule_sources::capsule_source_id_v0("astrid-capsule-adversarial");
         let msg = IpcMessage::new(
             Topic::from_raw(resp_topic),
             IpcPayload::RawJson(reply),
@@ -863,7 +863,7 @@ async fn request_capsule_ignores_mismatched_correlation() {
         let msg = IpcMessage::new(
             Topic::from_raw(resp_topic),
             IpcPayload::RawJson(reply),
-            session_capsule_source_id(),
+            session_capsule_source_id_v0(),
         )
         .with_principal("alice".to_string());
         bus_bg.publish(AstridEvent::Ipc {
