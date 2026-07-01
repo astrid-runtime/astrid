@@ -707,7 +707,18 @@ impl Kernel {
     pub fn schedule_profile_principal_warm(self: &Arc<Self>) {
         let kernel = Arc::clone(self);
         tokio::spawn(async move {
-            for principal in kernel.enumerate_profile_principals() {
+            let principals: Vec<_> = kernel
+                .enumerate_profile_principals()
+                .into_iter()
+                .filter(|principal| *principal != PrincipalId::default())
+                .collect();
+
+            for principal in &principals {
+                kernel.ensure_principal_uplinks_loaded(principal).await;
+                kernel.publish_capsules_loaded().await;
+            }
+
+            for principal in principals {
                 if principal != PrincipalId::default() {
                     kernel.ensure_principal_loaded(&principal).await;
                     kernel.publish_capsules_loaded().await;
@@ -758,33 +769,9 @@ impl Kernel {
 
     /// Build or refresh one principal's capsule view from its own install set.
     pub async fn ensure_principal_loaded(&self, principal: &PrincipalId) {
-        use astrid_capsule::toposort::toposort_manifests;
-
         let _load_guard = self.capsule_load_lock.lock().await;
-        let paths = capsule_discovery_paths_for(&self.astrid_home, &self.workspace_root, principal);
-        let discovered = astrid_capsule::discovery::discover_manifests(Some(&paths));
-        let sorted = match toposort_manifests(discovered) {
-            Ok(sorted) => sorted,
-            Err((e, original)) => {
-                tracing::error!(
-                    %principal,
-                    cycle = %e,
-                    "Dependency cycle in capsules, falling back to discovery order"
-                );
-                original
-            },
-        };
-
-        for (manifest, _) in &sorted {
-            if manifest.capabilities.uplink && manifest.has_imports() {
-                tracing::warn!(
-                    %principal,
-                    capsule = %manifest.package.name,
-                    "Uplink capsule has [imports] - this should have been rejected at manifest load time"
-                );
-            }
-        }
-        validate_imports_exports(&sorted);
+        let sorted = self.sorted_principal_capsules(principal);
+        validate_principal_capsules(principal, &sorted);
 
         let (uplinks, others): (Vec<_>, Vec<_>) =
             sorted.into_iter().partition(|(m, _)| m.capabilities.uplink);
@@ -818,6 +805,54 @@ impl Kernel {
         let other_names: Vec<String> = others.iter().map(|(m, _)| m.package.name.clone()).collect();
         self.await_capsule_readiness_for(principal, &other_names)
             .await;
+    }
+
+    async fn ensure_principal_uplinks_loaded(&self, principal: &PrincipalId) {
+        let _load_guard = self.capsule_load_lock.lock().await;
+        let sorted = self.sorted_principal_capsules(principal);
+        validate_principal_capsules(principal, &sorted);
+
+        let uplinks: Vec<_> = sorted
+            .into_iter()
+            .filter(|(manifest, _)| manifest.capabilities.uplink)
+            .collect();
+        let uplink_names: Vec<String> = uplinks
+            .iter()
+            .map(|(manifest, _)| manifest.package.name.clone())
+            .collect();
+        for (manifest, dir) in &uplinks {
+            if let Err(e) = self.load_capsule(dir.clone(), principal).await {
+                tracing::warn!(
+                    %principal,
+                    capsule = %manifest.package.name,
+                    error = %e,
+                    "Failed to load uplink capsule during background warm"
+                );
+            }
+        }
+        self.await_capsule_readiness_for(principal, &uplink_names)
+            .await;
+    }
+
+    fn sorted_principal_capsules(
+        &self,
+        principal: &PrincipalId,
+    ) -> Vec<(astrid_capsule::manifest::CapsuleManifest, PathBuf)> {
+        use astrid_capsule::toposort::toposort_manifests;
+
+        let paths = capsule_discovery_paths_for(&self.astrid_home, &self.workspace_root, principal);
+        let discovered = astrid_capsule::discovery::discover_manifests(Some(&paths));
+        match toposort_manifests(discovered) {
+            Ok(sorted) => sorted,
+            Err((e, original)) => {
+                tracing::error!(
+                    %principal,
+                    cycle = %e,
+                    "Dependency cycle in capsules, falling back to discovery order"
+                );
+                original
+            },
+        }
     }
 
     fn enumerate_profile_principals(&self) -> Vec<PrincipalId> {
@@ -2083,6 +2118,25 @@ fn capsule_instance_hash(
 // ---------------------------------------------------------------------------
 // Boot validation
 // ---------------------------------------------------------------------------
+
+fn validate_principal_capsules(
+    principal: &PrincipalId,
+    sorted: &[(
+        astrid_capsule::manifest::CapsuleManifest,
+        std::path::PathBuf,
+    )],
+) {
+    for (manifest, _) in sorted {
+        if manifest.capabilities.uplink && manifest.has_imports() {
+            tracing::warn!(
+                %principal,
+                capsule = %manifest.package.name,
+                "Uplink capsule has [imports] - this should have been rejected at manifest load time"
+            );
+        }
+    }
+    validate_imports_exports(sorted);
+}
 
 /// Validate that every capsule's required imports have a matching export
 /// from another loaded capsule. Logs errors for unsatisfied required imports
