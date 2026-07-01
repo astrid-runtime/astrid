@@ -203,8 +203,10 @@ pub async fn run() -> Result<()> {
         kernel.set_ephemeral(true);
     }
 
-    // Load all capsules (auto-discovery)
-    kernel.load_all_capsules().await;
+    // Load the boot-critical default view. Non-default profile principals warm
+    // after readiness so a large tenant set cannot make daemon restart health
+    // wait on every agent's capsule view.
+    kernel.load_boot_capsules().await;
 
     // Verify the CLI proxy capsule loaded. Without it, the daemon
     // has no accept loop and CLI connections will always time out.
@@ -226,8 +228,8 @@ pub async fn run() -> Result<()> {
         }
     }
 
-    // Signal readiness AFTER all capsules are loaded and accepting
-    // connections. The CLI polls for this file to avoid connecting
+    // Signal readiness AFTER the default CLI/system view is loaded and
+    // accepting connections. The CLI polls for this file to avoid connecting
     // before the handshake accept loop is running.
     astrid_kernel::socket::write_readiness_file().map_err(|e| {
         anyhow::anyhow!(
@@ -257,6 +259,8 @@ pub async fn run() -> Result<()> {
             None
         },
     };
+
+    kernel.schedule_profile_principal_warm();
 
     // Wait for a termination signal or API shutdown request.
     let mut shutdown_rx = kernel.shutdown_tx.subscribe();

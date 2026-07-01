@@ -688,6 +688,34 @@ impl Kernel {
         Ok(())
     }
 
+    /// Auto-discover and load the default principal's boot-critical view.
+    ///
+    /// Daemon readiness depends on the default view because it owns system
+    /// service capsules such as the CLI proxy. Other profile principals are
+    /// warmed after boot so persisted tenant state cannot make restart
+    /// health depend on loading every agent's tool set.
+    pub async fn load_boot_capsules(&self) {
+        self.load_default_capsule_view().await;
+        self.publish_capsules_loaded().await;
+    }
+
+    /// Schedule background warm-up for known non-default profile principals.
+    ///
+    /// The actual load work is serialized by
+    /// [`Kernel::capsule_load_lock`], so this can run behind a ready daemon
+    /// without racing other admin-driven warm/reload paths.
+    pub fn schedule_profile_principal_warm(self: &Arc<Self>) {
+        let kernel = Arc::clone(self);
+        tokio::spawn(async move {
+            for principal in kernel.enumerate_profile_principals() {
+                if principal != PrincipalId::default() {
+                    kernel.ensure_principal_loaded(&principal).await;
+                    kernel.publish_capsules_loaded().await;
+                }
+            }
+        });
+    }
+
     /// Auto-discover and load capsule views for known principals.
     ///
     /// The default principal is loaded eagerly, then every principal with a
@@ -696,12 +724,21 @@ impl Kernel {
     /// principal-scoped; default's capsule set is never copied into another
     /// principal's view.
     pub async fn load_all_capsules(&self) {
-        self.ensure_principal_loaded(&PrincipalId::default()).await;
+        self.load_default_capsule_view().await;
         for principal in self.enumerate_profile_principals() {
             if principal != PrincipalId::default() {
                 self.ensure_principal_loaded(&principal).await;
             }
         }
+
+        // Signal that all capsules have been loaded so uplink capsules
+        // (like the registry) can proceed with discovery instead of
+        // polling with arbitrary timeouts.
+        self.publish_capsules_loaded().await;
+    }
+
+    async fn load_default_capsule_view(&self) {
+        self.ensure_principal_loaded(&PrincipalId::default()).await;
 
         // Warn loudly if the loaded set can't actually serve an agent chat
         // turn. Computed from the live registry *after* load completes (not the
@@ -717,11 +754,6 @@ impl Kernel {
                 .collect();
             warn_agent_loop_readiness(&loaded);
         }
-
-        // Signal that all capsules have been loaded so uplink capsules
-        // (like the registry) can proceed with discovery instead of
-        // polling with arbitrary timeouts.
-        self.publish_capsules_loaded().await;
     }
 
     /// Build or refresh one principal's capsule view from its own install set.
