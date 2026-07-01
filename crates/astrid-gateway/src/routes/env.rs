@@ -52,6 +52,7 @@ use sha2::{Digest, Sha256};
 use utoipa::ToSchema;
 
 use crate::error::{ErrorBody, GatewayError, GatewayResult};
+use crate::routes::daemon_kernel_error;
 use crate::routes::principals::caller_from;
 use crate::state::GatewayState;
 
@@ -231,7 +232,7 @@ async fn ensure_capsule_visible(
     let resp = client
         .request(KernelRequest::GetCapsuleMetadata)
         .await
-        .map_err(|e| GatewayError::Internal(anyhow::anyhow!("daemon kernel-request: {e}")))?;
+        .map_err(daemon_kernel_error)?;
     ensure_capsule_visible_from_response(resp, caller.principal.as_str(), capsule_id)
 }
 

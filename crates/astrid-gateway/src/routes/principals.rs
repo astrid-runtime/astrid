@@ -560,6 +560,11 @@ pub(crate) fn caller_from(req: &Request<axum::body::Body>) -> GatewayResult<&Cal
 // usable as a one-line closure replacement throughout the routes —
 // the by-reference shape would force every call site to write
 // `map_err(|e| daemon_internal(&e))`.
+// The admin-client request path still surfaces `anyhow::Error` (it is not part
+// of this change's typed-error migration — a follow-up); every failure here maps
+// to 500. The bus-direct kernel-request path uses the typed
+// [`daemon_kernel_error`](crate::routes::daemon_kernel_error) instead, which can
+// distinguish a 504 timeout.
 #[allow(clippy::needless_pass_by_value)]
 pub(crate) fn daemon_internal(e: anyhow::Error) -> GatewayError {
     GatewayError::Internal(anyhow::anyhow!("daemon request: {e}"))

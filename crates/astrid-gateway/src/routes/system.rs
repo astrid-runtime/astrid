@@ -13,6 +13,7 @@ use axum::extract::State;
 use axum::http::{Request, StatusCode};
 
 use crate::error::{ErrorBody, GatewayError, GatewayResult};
+use crate::routes::daemon_kernel_error;
 use crate::routes::principals::caller_from;
 use crate::state::GatewayState;
 
@@ -35,7 +36,7 @@ pub async fn get_status(
     let resp = client
         .request(KernelRequest::GetStatus)
         .await
-        .map_err(daemon_internal)?;
+        .map_err(daemon_kernel_error)?;
     match resp {
         KernelResponse::Status(s) => Ok(Json(s)),
         KernelResponse::Error(msg) => Err(GatewayError::Forbidden { reason: msg }),
@@ -64,7 +65,7 @@ pub async fn get_readiness(
     let resp = client
         .request(KernelRequest::GetAgentReadiness)
         .await
-        .map_err(daemon_internal)?;
+        .map_err(daemon_kernel_error)?;
     match resp {
         KernelResponse::AgentReadiness(r) => Ok(Json(r)),
         KernelResponse::Error(msg) => Err(GatewayError::Forbidden { reason: msg }),
@@ -93,7 +94,7 @@ pub async fn reload_capsules(
     let resp = client
         .request(KernelRequest::ReloadCapsules)
         .await
-        .map_err(daemon_internal)?;
+        .map_err(daemon_kernel_error)?;
     match resp {
         KernelResponse::Success(_) => Ok(StatusCode::NO_CONTENT),
         KernelResponse::Error(msg) => Err(GatewayError::Forbidden { reason: msg }),
@@ -101,12 +102,4 @@ pub async fn reload_capsules(
             "unexpected response for ReloadCapsules: {other:?}"
         ))),
     }
-}
-
-#[allow(
-    clippy::needless_pass_by_value,
-    reason = "consumed by Display formatting"
-)]
-fn daemon_internal(e: anyhow::Error) -> GatewayError {
-    GatewayError::Internal(anyhow::anyhow!("daemon kernel-request: {e}"))
 }

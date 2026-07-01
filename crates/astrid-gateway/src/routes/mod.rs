@@ -10,7 +10,31 @@ use std::sync::Arc;
 use axum::Router;
 use axum::routing::{delete, get, patch, post, put};
 
+use astrid_uplink::KernelClientError;
+
+use crate::error::GatewayError;
 use crate::state::GatewayState;
+
+/// Map a bus-direct / socket kernel-request failure ([`KernelClientError`]) to a
+/// [`GatewayError`]. Single-sourced so every `kernel_client_for(...).request()`
+/// call site maps consistently.
+///
+/// A [`Timeout`](KernelClientError::Timeout) — the daemon was slow / wedged, not
+/// a transport fault — maps to **504** so callers can distinguish "still
+/// processing, retry" (e.g. a heavy `InstallCapsule` under load) from a genuine
+/// 500. Connection loss, bus shutdown, build, and decode failures all map to
+/// **500**. A kernel-side rejection is a `KernelResponse::Error` handled at the
+/// call site (→ 403), never reaching this path.
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "consumed by Display formatting"
+)]
+pub(crate) fn daemon_kernel_error(e: KernelClientError) -> GatewayError {
+    if e.is_timeout() {
+        return GatewayError::Timeout(format!("daemon kernel-request: {e}"));
+    }
+    GatewayError::Internal(anyhow::anyhow!("daemon kernel-request: {e}"))
+}
 
 pub mod agent;
 pub mod audit;
@@ -396,4 +420,45 @@ fn intern_route(s: &str) -> &'static str {
     let leaked: &'static str = Box::leak(s.to_string().into_boxed_str());
     guard.insert(leaked);
     leaked
+}
+
+#[cfg(test)]
+mod tests {
+    use astrid_uplink::{KernelClientError, TimeoutKind};
+
+    use super::daemon_kernel_error;
+    use crate::error::GatewayError;
+
+    /// The shared kernel-request error mapper turns a typed `Timeout` into a 504
+    /// `GatewayError::Timeout` (retryable — the daemon was slow/wedged, e.g. a
+    /// heavy `InstallCapsule`), while every other typed failure maps to a 500
+    /// `Internal`. Kernel-side rejections are `KernelResponse::Error` handled at
+    /// the call site (→ 403) and never reach this path.
+    #[test]
+    fn daemon_kernel_error_maps_timeout_to_504_others_to_500() {
+        let timed_out = KernelClientError::Timeout {
+            topic: "astrid.v1.response.install_capsule.abc".to_string(),
+            kind: TimeoutKind::Ceiling,
+        };
+        assert!(
+            matches!(daemon_kernel_error(timed_out), GatewayError::Timeout(_)),
+            "a typed Timeout must map to 504",
+        );
+
+        let bus_closed = KernelClientError::BusClosed {
+            topic: "astrid.v1.response.status.abc".to_string(),
+        };
+        assert!(
+            matches!(daemon_kernel_error(bus_closed), GatewayError::Internal(_)),
+            "a non-timeout transport failure must stay 500",
+        );
+
+        let deserialize = KernelClientError::Deserialize {
+            topic: "astrid.v1.response.status.abc".to_string(),
+        };
+        assert!(
+            matches!(daemon_kernel_error(deserialize), GatewayError::Internal(_)),
+            "a decode failure must stay 500",
+        );
+    }
 }

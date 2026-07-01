@@ -25,11 +25,11 @@ use utoipa::ToSchema;
 pub struct ErrorBody {
     /// Machine-readable error tag. One of: `unauthorized`,
     /// `forbidden`, `bad_request`, `not_found`, `rate_limited`,
-    /// `kernel`, `not_implemented`, `internal`.
+    /// `kernel`, `not_implemented`, `timeout`, `internal`.
     #[schema(example = "forbidden")]
     pub error: String,
     /// Human-readable reason. Present on `forbidden`, `bad_request`,
-    /// `kernel`, `not_implemented`. Absent on `unauthorized`,
+    /// `kernel`, `not_implemented`, `timeout`. Absent on `unauthorized`,
     /// `not_found`, `internal`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
@@ -75,6 +75,13 @@ pub enum GatewayError {
     /// capsule set.
     #[error("not implemented: {0}")]
     NotImplemented(String),
+    /// The upstream kernel request did not complete in time — the daemon was
+    /// still processing (or wedged) when the inactivity / overall ceiling
+    /// elapsed. Distinct from [`Internal`](Self::Internal): the request may
+    /// still be in flight kernel-side, and the client may retry. Maps to
+    /// `504 Gateway Timeout`, not `500`.
+    #[error("gateway timeout: {0}")]
+    Timeout(String),
     /// Anything else — exposed as a 500 with a stable message.
     #[error("internal error")]
     Internal(#[from] anyhow::Error),
@@ -105,6 +112,10 @@ impl IntoResponse for GatewayError {
                 StatusCode::NOT_IMPLEMENTED,
                 json!({"error": "not_implemented", "reason": msg}),
             ),
+            Self::Timeout(msg) => (
+                StatusCode::GATEWAY_TIMEOUT,
+                json!({"error": "timeout", "reason": msg}),
+            ),
             Self::Internal(e) => {
                 tracing::warn!(error = %e, "gateway internal error");
                 (
@@ -127,3 +138,39 @@ impl From<serde_json::Error> for GatewayError {
 
 /// Result alias used by handlers.
 pub type GatewayResult<T> = Result<T, GatewayError>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The timeout variant maps to 504 — distinct from the 500 `Internal` and
+    /// the 403 `Forbidden` — so a transient kernel-request timeout is
+    /// distinguishable from a transport fault and from a real authz/install
+    /// failure. Pins every status mapping this fix touches at once.
+    #[test]
+    fn status_code_mappings_are_stable() {
+        let cases = [
+            (
+                GatewayError::Timeout("slow".into()),
+                StatusCode::GATEWAY_TIMEOUT,
+            ),
+            (
+                GatewayError::Forbidden {
+                    reason: "denied".into(),
+                },
+                StatusCode::FORBIDDEN,
+            ),
+            (
+                GatewayError::Internal(anyhow::anyhow!("boom")),
+                StatusCode::INTERNAL_SERVER_ERROR,
+            ),
+            (
+                GatewayError::Kernel("upstream".into()),
+                StatusCode::BAD_GATEWAY,
+            ),
+        ];
+        for (err, want) in cases {
+            assert_eq!(err.into_response().status(), want);
+        }
+    }
+}

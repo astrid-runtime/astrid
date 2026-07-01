@@ -37,13 +37,121 @@ use astrid_core::PrincipalId;
 use astrid_core::kernel_api::{KernelRequest, KernelResponse};
 use astrid_types::Topic;
 use astrid_types::ipc::{IpcMessage, IpcPayload};
+use tokio::time::Instant;
 use uuid::Uuid;
 
-use crate::socket_client::SocketClient;
+use crate::socket_client::{ReadError, SocketClient};
 
-/// Default response timeout. Generous because some kernel ops
-/// (capsule reload, status under load) can take a few seconds.
+/// Default **inactivity** timeout: the maximum silence permitted *between*
+/// frames on a request's response channel, NOT a total deadline on the whole
+/// request.
+///
+/// The kernel emits a [`KernelResponse::Working`] keepalive every 5s while a
+/// slow handler (chiefly `InstallCapsule`, which loads + runs the capsule's
+/// `#[install]` hook) is still in flight; each such frame resets this window.
+/// So the total wait is unbounded as long as the kernel keeps pinging within
+/// this interval — an install that legitimately runs 30s under load no longer
+/// trips a 15s *total* deadline the way the old blanket timeout did. Runaway
+/// guest execution is bounded elsewhere (fuel ledger, epoch-interrupt deadline,
+/// memory ledgers), so this timeout was never the forever-loop guard.
+///
+/// Sized at ~3x the 5s keepalive interval so a couple of missed pings (bus lag,
+/// a briefly-saturated worker) don't cause a spurious timeout. A hard overall
+/// ceiling ([`MAX_TOTAL`]) still bounds a kernel that pings forever.
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Absolute backstop on the total wait for one request, across all inactivity
+/// windows. Even a kernel that keeps emitting [`KernelResponse::Working`]
+/// keepalives forever (wedged handler, buggy pinger) cannot hang a client past
+/// this — exceeding it returns a [`KernelClientError::Timeout`] with
+/// [`TimeoutKind::Ceiling`]. Generous (10 min) so it never fires for a
+/// legitimately slow install, only for a genuinely stuck one.
+const MAX_TOTAL: Duration = Duration::from_mins(10);
+
+/// Which deadline elapsed on a [`KernelClientError::Timeout`].
+///
+/// Both map to a 504 at the gateway; the distinction is diagnostic — an
+/// [`Inactivity`](Self::Inactivity) timeout means no frame arrived within the
+/// per-frame silence budget, a [`Ceiling`](Self::Ceiling) timeout means the
+/// overall [`MAX_TOTAL`] wait was exceeded even though the kernel kept signalling
+/// liveness.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TimeoutKind {
+    /// No frame arrived within the inactivity window ([`DEFAULT_TIMEOUT`]).
+    Inactivity,
+    /// The overall [`MAX_TOTAL`] ceiling elapsed across all inactivity windows.
+    Ceiling,
+}
+
+impl std::fmt::Display for TimeoutKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Inactivity => f.write_str("inactivity"),
+            Self::Ceiling => f.write_str("overall ceiling"),
+        }
+    }
+}
+
+/// Typed failure of [`KernelClient::request`] / `BusKernelClient::request`.
+///
+/// The request paths return this instead of `anyhow::Error` so an uplink (the
+/// HTTP gateway) can branch on the *kind* of failure — chiefly mapping a
+/// [`Timeout`](Self::Timeout) to a 504 while connection loss and other transport
+/// faults stay 500 — without matching on message text. `#[source]` carries the
+/// underlying transport error where one exists, so the full cause chain is
+/// preserved for logging rather than flattened to a string.
+#[derive(Debug, thiserror::Error)]
+pub enum KernelClientError {
+    /// The wait for a response frame timed out — either the inactivity window or
+    /// the overall ceiling. `topic` is the response channel awaited. Maps to 504.
+    #[error("kernel request timed out ({kind}) waiting on {topic}")]
+    Timeout {
+        /// The response topic the client was awaiting.
+        topic: String,
+        /// Which deadline elapsed (diagnostic; both map to 504).
+        kind: TimeoutKind,
+    },
+    /// The socket reached EOF or a read failed (peer closed / reset / broken
+    /// pipe) before a terminal response. The connection is unusable. Maps to 500.
+    #[error("connection lost waiting on {topic}")]
+    ConnectionLost {
+        /// The response topic the client was awaiting.
+        topic: String,
+        /// The underlying socket read error.
+        #[source]
+        source: ReadError,
+    },
+    /// The event bus closed before a terminal response arrived (bus-direct
+    /// client only). Maps to 500.
+    #[error("event bus closed before response on {topic}")]
+    BusClosed {
+        /// The response topic the client was awaiting.
+        topic: String,
+    },
+    /// Building or serialising the outbound request failed. Maps to 500.
+    #[error("failed to build kernel request")]
+    Build {
+        /// The underlying serialisation / message-construction error.
+        #[source]
+        source: anyhow::Error,
+    },
+    /// A frame arrived on the response topic but did not deserialise as a
+    /// [`KernelResponse`]. Maps to 500.
+    #[error("kernel response on {topic} did not deserialize as KernelResponse")]
+    Deserialize {
+        /// The response topic the malformed frame arrived on.
+        topic: String,
+    },
+}
+
+impl KernelClientError {
+    /// Whether this is a request timeout (inactivity or ceiling). The gateway
+    /// maps a timeout to 504 and every other variant to 500.
+    #[must_use]
+    pub const fn is_timeout(&self) -> bool {
+        matches!(self, Self::Timeout { .. })
+    }
+}
 
 /// Stable wire-name component of the topic suffix for a
 /// [`KernelRequest`] variant.
@@ -152,32 +260,132 @@ impl KernelClient {
         self
     }
 
-    /// Send a [`KernelRequest`] and await the matching
-    /// [`KernelResponse`].
+    /// Send a [`KernelRequest`] and await the matching terminal
+    /// [`KernelResponse`], tolerating any number of intervening
+    /// [`KernelResponse::Working`] keepalive frames.
+    ///
+    /// The read is an **inactivity** loop: each iteration waits up to
+    /// [`self.timeout`](Self::with_timeout) for the *next* frame. A `Working`
+    /// keepalive is swallowed and the loop continues with a fresh window, so a
+    /// slow-but-live kernel (an `InstallCapsule` running its `#[install]` hook
+    /// under load) never trips a total-deadline timeout. Any other variant is
+    /// the terminal response and is returned. An overall [`MAX_TOTAL`] ceiling
+    /// bounds a kernel that keeps pinging forever; each read is additionally
+    /// capped to the ceiling's remaining budget so the ceiling can't be
+    /// overshot by up to a full inactivity window.
     ///
     /// # Errors
-    /// Returns an error on serialization failure, send failure, or
-    /// timeout / connection drop before a matching response arrives.
-    pub async fn request(&mut self, req: KernelRequest) -> Result<KernelResponse> {
+    /// Returns [`KernelClientError`]: `Timeout` on the inactivity window or the
+    /// overall [`MAX_TOTAL`] ceiling (the gateway maps this to 504),
+    /// `ConnectionLost` on a dead socket, `Build` on serialise/send failure, and
+    /// `Deserialize` on a frame that is not a [`KernelResponse`] — all 500.
+    pub async fn request(
+        &mut self,
+        req: KernelRequest,
+    ) -> std::result::Result<KernelResponse, KernelClientError> {
+        self.request_with_ceiling(req, MAX_TOTAL).await
+    }
+
+    /// [`request`](Self::request) with an explicit overall ceiling.
+    ///
+    /// The public entrypoint passes [`MAX_TOTAL`]; a test passes a short ceiling
+    /// so the "unending keepalives are bounded" path is exercisable without
+    /// waiting ten minutes. Production behaviour is unchanged.
+    async fn request_with_ceiling(
+        &mut self,
+        req: KernelRequest,
+        max_total: Duration,
+    ) -> std::result::Result<KernelResponse, KernelClientError> {
         let (msg, want_response) =
-            build_request_message(&self.caller, self.device_key_id.as_deref(), &req)?;
-        self.inner.send_message(msg).await?;
-
-        let raw = self
-            .inner
-            .read_until_topic(want_response.as_str(), self.timeout)
+            build_request_message(&self.caller, self.device_key_id.as_deref(), &req)
+                .map_err(|source| KernelClientError::Build { source })?;
+        self.inner
+            .send_message(msg)
             .await
-            .with_context(|| format!("waiting on {want_response}"))?;
+            .map_err(|source| KernelClientError::Build { source })?;
 
-        SocketClient::extract_kernel_response(&raw).ok_or_else(|| {
-            anyhow!("kernel response on {want_response} did not deserialize as KernelResponse")
-        })
+        let topic = want_response.as_str();
+        let started = Instant::now();
+        loop {
+            // Remaining budget under the absolute ceiling. Zero → the overall
+            // wait has been exhausted even though the kernel may still be pinging.
+            let Some(ceiling_left) = max_total.checked_sub(started.elapsed()) else {
+                return Err(KernelClientError::Timeout {
+                    topic: topic.to_string(),
+                    kind: TimeoutKind::Ceiling,
+                });
+            };
+            if ceiling_left.is_zero() {
+                return Err(KernelClientError::Timeout {
+                    topic: topic.to_string(),
+                    kind: TimeoutKind::Ceiling,
+                });
+            }
+
+            // Cap each read at min(inactivity window, ceiling remaining) so the
+            // ceiling can't be overshot by up to a full `self.timeout`. When the
+            // ceiling clamps the wait, a read timeout is a Ceiling timeout;
+            // otherwise it is the inactivity window elapsing.
+            let read_budget = self.timeout.min(ceiling_left);
+            let capped_by_ceiling = ceiling_left < self.timeout;
+
+            // Each read is a FRESH inactivity window: a `Working` keepalive
+            // resets the max-silence-between-frames budget, so total wait is
+            // unbounded as long as the kernel pings within `self.timeout`.
+            let raw = match self.inner.read_until_topic_typed(topic, read_budget).await {
+                Ok(raw) => raw,
+                Err(ReadError::Timeout) => {
+                    return Err(KernelClientError::Timeout {
+                        topic: topic.to_string(),
+                        kind: if capped_by_ceiling {
+                            TimeoutKind::Ceiling
+                        } else {
+                            TimeoutKind::Inactivity
+                        },
+                    });
+                },
+                Err(source @ ReadError::ConnectionLost(_)) => {
+                    return Err(KernelClientError::ConnectionLost {
+                        topic: topic.to_string(),
+                        source,
+                    });
+                },
+            };
+
+            let resp = SocketClient::extract_kernel_response(&raw).ok_or_else(|| {
+                KernelClientError::Deserialize {
+                    topic: topic.to_string(),
+                }
+            })?;
+
+            // A `Working` keepalive means the handler is still alive: swallow it
+            // (it never reaches an HTTP client) and loop for a fresh inactivity
+            // window. A stray late `Working` racing out after the terminal is
+            // harmless — this loops past it. Any other variant is terminal.
+            if !matches!(resp, KernelResponse::Working) {
+                return Ok(resp);
+            }
+        }
     }
 
     /// Borrow the principal this client stamps on outbound messages.
     #[must_use]
     pub const fn caller(&self) -> &PrincipalId {
         &self.caller
+    }
+
+    /// Build a `KernelClient` over an already-constructed [`SocketClient`] with
+    /// an explicit inactivity `timeout`. Test-only: lets the crate's tests drive
+    /// [`request`](Self::request) over a loopback socket pair with a short
+    /// timeout, no live daemon.
+    #[cfg(test)]
+    fn from_socket_for_test(inner: SocketClient, caller: PrincipalId, timeout: Duration) -> Self {
+        Self {
+            inner,
+            caller,
+            timeout,
+            device_key_id: None,
+        }
     }
 }
 
@@ -262,5 +470,251 @@ mod tests {
         let res = into_result(err);
         assert!(res.is_err());
         assert!(res.unwrap_err().to_string().contains("not allowed"));
+    }
+
+    // ── inactivity / keepalive `request()` loop ──────────────────────────────
+    //
+    // These drive `KernelClient::request` over a loopback `UnixStream` pair. The
+    // client side is a real `KernelClient`; the "kernel" side is the raw server
+    // half, onto which the test writes framed IPC responses (a length-prefixed
+    // JSON `IpcMessage` carrying a `RawJson(KernelResponse)` payload) on the
+    // request's correlated response topic — exactly the shape the daemon emits.
+
+    use std::io::Result as IoResult;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::UnixStream;
+    use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
+
+    /// Read one length-prefixed frame off the server half and return the
+    /// `IpcMessage`-shaped JSON so the test can learn the request's response
+    /// topic (the correlated `astrid.v1.response.<suffix>` the client awaits).
+    async fn read_request_frame(read: &mut OwnedReadHalf) -> serde_json::Value {
+        let mut len_buf = [0u8; 4];
+        read.read_exact(&mut len_buf)
+            .await
+            .expect("read len prefix");
+        let len = u32::from_be_bytes(len_buf) as usize;
+        let mut buf = vec![0u8; len];
+        read.read_exact(&mut buf).await.expect("read frame body");
+        serde_json::from_slice(&buf).expect("request frame is JSON")
+    }
+
+    /// Write a `KernelResponse` on `response_topic` as the daemon would: a
+    /// length-prefixed `IpcMessage` with a `RawJson` payload.
+    async fn write_response(
+        write: &mut OwnedWriteHalf,
+        response_topic: &str,
+        resp: &KernelResponse,
+    ) -> IoResult<()> {
+        let payload = serde_json::to_value(resp).unwrap();
+        let msg = IpcMessage::new(
+            Topic::from_raw(response_topic),
+            IpcPayload::RawJson(payload),
+            Uuid::nil(),
+        );
+        let bytes = serde_json::to_vec(&msg).unwrap();
+        let len = u32::try_from(bytes.len()).unwrap();
+        write.write_all(&len.to_be_bytes()).await?;
+        write.write_all(&bytes).await?;
+        write.flush().await
+    }
+
+    /// Derive the response topic a client awaits from the request frame it sent.
+    fn response_topic_of(req_frame: &serde_json::Value) -> String {
+        let request_topic = req_frame
+            .get("topic")
+            .and_then(|t| t.as_str())
+            .expect("request frame has a topic");
+        let suffix = request_topic
+            .strip_prefix("astrid.v1.request.")
+            .expect("kernel request topic prefix");
+        format!("astrid.v1.response.{suffix}")
+    }
+
+    fn test_client(client_stream: UnixStream, timeout: Duration) -> KernelClient {
+        let caller = PrincipalId::new("alice").unwrap();
+        let inner = SocketClient::from_stream_for_test(
+            client_stream,
+            astrid_core::SessionId::from_uuid(Uuid::new_v4()),
+            caller.clone(),
+        );
+        KernelClient::from_socket_for_test(inner, caller, timeout)
+    }
+
+    /// (a) N `Working` keepalives followed by a terminal `Success` → `request()`
+    /// returns the `Success`, proving `Working` is non-terminal and resets the
+    /// window rather than being surfaced.
+    #[tokio::test]
+    async fn working_frames_are_swallowed_then_terminal_returned() {
+        let (client_stream, server_stream) = UnixStream::pair().unwrap();
+        let (mut srv_read, mut srv_write) = server_stream.into_split();
+
+        let server = tokio::spawn(async move {
+            let req = read_request_frame(&mut srv_read).await;
+            let topic = response_topic_of(&req);
+            // Three keepalives, then the real answer.
+            for _ in 0..3 {
+                write_response(&mut srv_write, &topic, &KernelResponse::Working)
+                    .await
+                    .unwrap();
+            }
+            write_response(
+                &mut srv_write,
+                &topic,
+                &KernelResponse::Success(serde_json::json!({ "ok": true })),
+            )
+            .await
+            .unwrap();
+        });
+
+        let mut client = test_client(client_stream, Duration::from_secs(5));
+        let resp = client.request(KernelRequest::GetStatus).await.unwrap();
+        assert!(
+            matches!(resp, KernelResponse::Success(v) if v == serde_json::json!({ "ok": true })),
+            "terminal Success must be returned, keepalives swallowed",
+        );
+        server.await.unwrap();
+    }
+
+    /// (b) `Working` frames spaced under the timeout for a span LONGER than the
+    /// timeout itself → still succeeds. Proves the window is per-frame
+    /// inactivity, not a total deadline: with a 120ms inactivity timeout we keep
+    /// the request alive for ~300ms via 40ms-spaced pings, which a total 120ms
+    /// deadline would have failed.
+    #[tokio::test]
+    async fn keepalives_extend_beyond_total_inactivity_timeout() {
+        let (client_stream, server_stream) = UnixStream::pair().unwrap();
+        let (mut srv_read, mut srv_write) = server_stream.into_split();
+
+        let server = tokio::spawn(async move {
+            let req = read_request_frame(&mut srv_read).await;
+            let topic = response_topic_of(&req);
+            // ~300ms of pings at 40ms spacing — well past the 120ms window,
+            // but each ping resets it, so no gap ever reaches 120ms.
+            for _ in 0..7 {
+                tokio::time::sleep(Duration::from_millis(40)).await;
+                write_response(&mut srv_write, &topic, &KernelResponse::Working)
+                    .await
+                    .unwrap();
+            }
+            write_response(
+                &mut srv_write,
+                &topic,
+                &KernelResponse::Success(serde_json::json!("done")),
+            )
+            .await
+            .unwrap();
+        });
+
+        let mut client = test_client(client_stream, Duration::from_millis(120));
+        let resp = client.request(KernelRequest::GetStatus).await.unwrap();
+        assert!(matches!(resp, KernelResponse::Success(_)));
+        server.await.unwrap();
+    }
+
+    /// (c) Total silence for longer than the inactivity timeout → a typed
+    /// [`KernelClientError::Timeout`] with [`TimeoutKind::Inactivity`] (the
+    /// gateway maps this to 504).
+    #[tokio::test]
+    async fn silence_past_timeout_yields_typed_timeout() {
+        let (client_stream, server_stream) = UnixStream::pair().unwrap();
+        // Hold the server half open but silent so the client sees inactivity,
+        // not a connection loss (EOF).
+        let _held = server_stream;
+
+        let mut client = test_client(client_stream, Duration::from_millis(80));
+        let err = client
+            .request(KernelRequest::GetStatus)
+            .await
+            .expect_err("silence past the inactivity window must time out");
+        assert!(
+            matches!(
+                err,
+                KernelClientError::Timeout {
+                    kind: TimeoutKind::Inactivity,
+                    ..
+                }
+            ),
+            "a silence timeout must be a typed inactivity Timeout: {err:?}"
+        );
+    }
+
+    /// (d) Exceeding `MAX_TOTAL` → a typed [`KernelClientError::Timeout`] with
+    /// [`TimeoutKind::Ceiling`], even though the kernel keeps pinging within the
+    /// inactivity window forever. Uses a short-lived override of the ceiling via
+    /// a dedicated helper so the test doesn't wait 10 minutes.
+    #[tokio::test]
+    async fn unending_keepalives_are_bounded_by_max_total() {
+        let (client_stream, server_stream) = UnixStream::pair().unwrap();
+        let (mut srv_read, mut srv_write) = server_stream.into_split();
+
+        // Ping forever, faster than the inactivity window, so only MAX_TOTAL can
+        // stop the wait.
+        let server = tokio::spawn(async move {
+            let req = read_request_frame(&mut srv_read).await;
+            let topic = response_topic_of(&req);
+            loop {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                if write_response(&mut srv_write, &topic, &KernelResponse::Working)
+                    .await
+                    .is_err()
+                {
+                    break; // client gave up; socket closed.
+                }
+            }
+        });
+
+        // A short overall ceiling for the test; the inactivity timeout is longer
+        // than the ping spacing so inactivity never fires — only the ceiling can.
+        let mut client = test_client(client_stream, Duration::from_millis(200));
+        let err = client
+            .request_with_ceiling(KernelRequest::GetStatus, Duration::from_millis(120))
+            .await
+            .expect_err("unending keepalives must be bounded by the overall ceiling");
+        assert!(
+            matches!(
+                err,
+                KernelClientError::Timeout {
+                    kind: TimeoutKind::Ceiling,
+                    ..
+                }
+            ),
+            "the ceiling timeout must be a typed ceiling Timeout: {err:?}"
+        );
+        server.abort();
+    }
+
+    /// `ConnectionLost` preserves its underlying [`ReadError`] as a `#[source]`
+    /// — after the request is sent, the peer closing yields an EOF the socket
+    /// reader reports as `ConnectionLost`, and the typed error keeps that cause
+    /// in the chain rather than flattening it to a string.
+    #[tokio::test]
+    async fn connection_loss_preserves_source() {
+        let (client_stream, server_stream) = UnixStream::pair().unwrap();
+        let (mut srv_read, srv_write) = server_stream.into_split();
+
+        // Read (and thus accept) the request so the client's send succeeds, then
+        // drop BOTH server halves so the client's next read hits EOF.
+        let server = tokio::spawn(async move {
+            let _req = read_request_frame(&mut srv_read).await;
+            drop(srv_write);
+            drop(srv_read);
+        });
+
+        let mut client = test_client(client_stream, Duration::from_secs(5));
+        let err = client
+            .request(KernelRequest::GetStatus)
+            .await
+            .expect_err("a closed peer must surface a connection-loss error");
+        assert!(
+            matches!(err, KernelClientError::ConnectionLost { .. }),
+            "a closed peer must be ConnectionLost, got: {err:?}"
+        );
+        // The underlying transport error is preserved as a source, not stringified.
+        assert!(
+            std::error::Error::source(&err).is_some(),
+            "ConnectionLost must carry its ReadError source: {err:?}"
+        );
+        server.await.unwrap();
     }
 }

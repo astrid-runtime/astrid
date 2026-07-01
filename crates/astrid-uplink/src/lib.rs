@@ -31,5 +31,5 @@ pub mod kernel_client;
 pub mod socket_client;
 
 pub use admin_client::{AdminClient, into_result, request_topic, response_topic, topic_suffix};
-pub use kernel_client::KernelClient;
+pub use kernel_client::{KernelClient, KernelClientError, TimeoutKind};
 pub use socket_client::{SocketClient, proxy_socket_path, readiness_path, token_path};
