@@ -2218,6 +2218,13 @@ fn restart_tracker_key(capsule_id: &str) -> String {
 /// viewing principal as the restart requester; `restart_capsule` rebuilds every
 /// view regardless of which principal requests it.
 ///
+/// Dedup key is the capsule id. This is correct while at most one content hash
+/// is loaded per capsule name at a time — the case today, since every principal
+/// shares one install source path (loaded under `default`) and derives the same
+/// hash. If per-principal multi-version installs ever land (two hashes for one
+/// capsule id), this must dedup by `(capsule_id, hash)` so each distinct failed
+/// runtime is restarted.
+///
 /// Returns `(requesting principal, capsule id, failure reason)` tuples.
 fn collect_failed_runtimes_deduped(
     ready_capsules: &[(

@@ -4,16 +4,6 @@
 use super::*;
 
 impl HostState {
-    /// Return the KV namespace for this capsule scoped to its principal.
-    ///
-    /// Format: `{principal}:capsule:{capsule_id}`. This is the same namespace
-    /// used when the `ScopedKvStore` was created, but exposed here for cases
-    /// where host functions need to construct the namespace dynamically.
-    #[must_use]
-    pub fn principal_kv_namespace(&self) -> String {
-        format!("{}:capsule:{}", self.principal, self.capsule_id)
-    }
-
     /// Return the effective KV store for the current invocation.
     ///
     /// Per-principal isolation lives HERE, not in capsule keys. Every real store
@@ -56,15 +46,20 @@ impl HostState {
 
     /// Return the effective home mount for the current invocation.
     ///
-    /// Prefers `invocation_home` (set when serving a different principal)
-    /// over `home` (set at capsule load for the owning principal).
+    /// Prefers `invocation_home` (installed for the invoking principal) over the
+    /// load-time `home`. On a SHARED runtime (issue #1069) `home` is `None`, so
+    /// this fallback is neutral/fail-closed — it can NEVER be another principal's
+    /// (nor `default`'s) home. `home` is set to a real principal's mount only on
+    /// the single-principal lifecycle/hook paths, which no other principal can
+    /// reach, so there is no cross-principal home fallback anywhere.
     #[must_use]
     pub fn effective_home(&self) -> Option<&PrincipalMount> {
         self.invocation_home.as_ref().or(self.home.as_ref())
     }
 
     /// Return the effective tmp mount for the current invocation. Same
-    /// precedence as [`effective_home`](Self::effective_home).
+    /// precedence and same neutral-`None`-on-shared-runtime safety as
+    /// [`effective_home`](Self::effective_home).
     #[must_use]
     pub fn effective_tmp(&self) -> Option<&PrincipalMount> {
         self.invocation_tmp.as_ref().or(self.tmp.as_ref())
