@@ -4,7 +4,7 @@
 //! any principal could invoke any installed capsule's tools because
 //! dispatch matched on topic alone. Access is now **per-principal**, gated
 //! by the kernel at dispatch on the user-invocable surface only
-//! (`tool.v1.execute.*`, `cli.v1.command.execute`); see
+//! (`tool.v1.execute.*`, `cli.v1.command.run.*`); see
 //! [`crate::dispatcher`].
 //!
 //! # The grant set
@@ -56,15 +56,16 @@ use crate::profile_cache::PrincipalProfileCache;
 /// deliberately NOT gated; see [`is_user_invocable_surface`].
 const TOOL_EXECUTE_PREFIX: &str = "tool.v1.execute.";
 
-/// The user-invocable **CLI command execute** topic. Matched exactly.
-const CLI_COMMAND_EXECUTE_TOPIC: &str = "cli.v1.command.execute";
+/// Topic prefix for the user-invocable **CLI command run** surface.
+/// A capsule command invocation is `cli.v1.command.run.<provider>`.
+const CLI_COMMAND_RUN_PREFIX: &str = "cli.v1.command.run.";
 
 /// Is `topic` part of the **user-invocable surface** that the per-principal
 /// capsule-access filter gates? Co-located with the resolver because it
 /// defines *which* topics the grant set applies to.
 ///
 /// CRITICAL SCOPING: only `tool.v1.execute.<name>` and
-/// `cli.v1.command.execute` are gated. Every other topic — the internal
+/// `cli.v1.command.run.<provider>` are gated. Every other topic — the internal
 /// orchestration mesh (`session.*`, `spark.*`, `registry.*`,
 /// `prompt_builder.*`, `context_engine.*`, lifecycle/hooks, llm streams) AND
 /// tool-result delivery (`tool.v1.execute.<name>.result`, react's bare
@@ -75,7 +76,10 @@ const CLI_COMMAND_EXECUTE_TOPIC: &str = "cli.v1.command.execute";
 /// **topic**, not the capsule.
 #[must_use]
 pub(crate) fn is_user_invocable_surface(topic: &str) -> bool {
-    if topic == CLI_COMMAND_EXECUTE_TOPIC {
+    if topic
+        .strip_prefix(CLI_COMMAND_RUN_PREFIX)
+        .is_some_and(|provider| !provider.is_empty() && !provider.contains('.'))
+    {
         return true;
     }
     // A tool INVOCATION is exactly `tool.v1.execute.<name>` — a single

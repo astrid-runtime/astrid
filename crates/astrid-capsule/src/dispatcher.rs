@@ -135,7 +135,7 @@ pub struct EventDispatcher {
     chain_locks: ChainLocks,
     /// Per-principal capsule-access resolver. When set, dispatch of the
     /// **user-invocable surface** (`tool.v1.execute.*`,
-    /// `cli.v1.command.execute`) is filtered to capsules the caller is
+    /// `cli.v1.command.run.*`) is filtered to capsules the caller is
     /// granted; admins (`*`) bypass. When `None` (e.g. legacy tests),
     /// the surface is ungated — the kernel always wires the resolver in
     /// production so the security boundary is present at runtime.
@@ -170,7 +170,7 @@ impl EventDispatcher {
     /// Set the per-principal capsule-access resolver.
     ///
     /// Once set, dispatch of the user-invocable surface
-    /// (`tool.v1.execute.*`, `cli.v1.command.execute`) is filtered to the
+    /// (`tool.v1.execute.*`, `cli.v1.command.run.*`) is filtered to the
     /// caller's granted capsules; describe fan-outs are narrowed to the
     /// caller's capsule view. Admins bypass; unknown callers fail closed.
     /// Wired by the kernel at boot, mirroring how the fuel and memory ledgers
@@ -817,7 +817,7 @@ fn dispatch_single(
 ///
 /// When an `access_resolver` is wired, principal-stamped non-admin dispatch is
 /// first narrowed to the caller's capsule view. When `topic` is also in the
-/// **user-invocable surface** (`tool.v1.execute.*`, `cli.v1.command.execute`),
+/// **user-invocable surface** (`tool.v1.execute.*`, `cli.v1.command.run.*`),
 /// a matched capsule is kept only if `caller_principal` is granted it (or is an
 /// admin holding `*`). The grant-on-use filter is keyed on the **topic**, so a
 /// dual-role capsule's orchestration interceptors (on non-tool topics) are

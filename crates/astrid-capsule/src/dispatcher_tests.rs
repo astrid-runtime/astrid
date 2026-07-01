@@ -966,7 +966,7 @@ async fn chain_lock_retained_while_another_holder_exists() {
 //
 // These tests prove the kernel-side, topic-scoped, fail-closed grant
 // filter on the user-invocable surface (`tool.v1.execute.*`,
-// `cli.v1.command.execute`), with admin (`*`) bypass and orchestration
+// `cli.v1.command.run.*`), with admin (`*`) bypass and orchestration
 // topics left ungated.
 
 mod access_enforcement {
@@ -1412,22 +1412,26 @@ mod access_enforcement {
         handle.abort();
     }
 
-    /// (a') The CLI command-execute topic is gated like the tool surface:
+    /// (a') The CLI command-run topic is gated like the tool surface:
     /// an ungranted principal is denied.
     #[tokio::test]
-    async fn cli_command_execute_gated() {
+    async fn cli_command_run_gated() {
         let (_dir, home, resolver) = resolver_fixture();
         write_profile(&home, "bob", &agent_with_capsules(&[]));
 
-        let (invoked, bus, handle) =
-            spawn_with_capsule(resolver, "cli-capsule", "cli.v1.command.execute");
+        let (invoked, bus, handle) = spawn_with_capsule_in_views(
+            resolver,
+            "cli-capsule",
+            "cli.v1.command.run.cli-capsule",
+            &["bob"],
+        );
         tokio::task::yield_now().await;
-        publish_ipc_as(&bus, "cli.v1.command.execute", "bob");
+        publish_ipc_as(&bus, "cli.v1.command.run.cli-capsule", "bob");
         tokio::time::sleep(Duration::from_millis(200)).await;
 
         assert!(
             !invoked.load(Ordering::SeqCst),
-            "ungranted principal must be denied the CLI execute surface"
+            "ungranted principal must be denied the CLI run surface"
         );
         handle.abort();
     }
@@ -1609,7 +1613,9 @@ mod access_enforcement {
     fn surface_predicate_gates_only_bare_invocation() {
         use crate::access::is_user_invocable_surface as gated;
         assert!(gated("tool.v1.execute.save_identity"));
-        assert!(gated("cli.v1.command.execute"));
+        assert!(gated("cli.v1.command.run.astrid-capsule-adversarial"));
+        assert!(!gated("cli.v1.command.run."));
+        assert!(!gated("cli.v1.command.run.nested.provider"));
         assert!(!gated("tool.v1.execute.save_identity.result"));
         assert!(!gated("tool.v1.execute.result"));
         assert!(!gated("tool.v1.execute."));

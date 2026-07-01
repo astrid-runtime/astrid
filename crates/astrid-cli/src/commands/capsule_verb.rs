@@ -32,6 +32,7 @@ use crate::theme::Theme;
 /// Wall-clock budget for a capsule to respond on the result topic.
 const RESULT_TIMEOUT_SECS: u64 = 70;
 const RESULT_TIMEOUT: Duration = Duration::from_secs(RESULT_TIMEOUT_SECS);
+const CAPSULES_LOADED_TOPIC: &str = "astrid.v1.capsules_loaded";
 
 /// Outcome of resolving a verb against the daemon's command registry.
 ///
@@ -242,20 +243,95 @@ async fn execute(provider: &str, verb: &str, args: &[String]) -> Result<ExitCode
         return Ok(ExitCode::from(1));
     }
 
-    let Ok(raw) = client
-        .read_until_topic(result_topic.as_str(), RESULT_TIMEOUT)
+    match wait_for_command_result(&mut client, result_topic.as_str(), provider, RESULT_TIMEOUT)
         .await
-    else {
-        eprintln!(
-            "{}",
-            Theme::error(&format!(
-                "Capsule '{provider}' did not respond within {RESULT_TIMEOUT_SECS}s."
-            ))
-        );
-        return Ok(ExitCode::from(1));
-    };
+    {
+        Ok(CommandWait::Result(raw)) => Ok(render_result(provider, &raw)),
+        Ok(CommandWait::ProviderUnloaded) => {
+            eprintln!(
+                "{}",
+                Theme::error(&format!(
+                    "Capsule '{provider}' unloaded before command completed; command cancelled."
+                ))
+            );
+            Ok(ExitCode::from(1))
+        },
+        Err(_) => {
+            eprintln!(
+                "{}",
+                Theme::error(&format!(
+                    "Capsule '{provider}' did not respond within {RESULT_TIMEOUT_SECS}s."
+                ))
+            );
+            Ok(ExitCode::from(1))
+        },
+    }
+}
 
-    Ok(render_result(provider, &raw))
+enum CommandWait {
+    Result(serde_json::Value),
+    ProviderUnloaded,
+}
+
+async fn wait_for_command_result(
+    client: &mut SocketClient,
+    result_topic: &str,
+    provider: &str,
+    timeout: Duration,
+) -> Result<CommandWait> {
+    let deadline = tokio::time::Instant::now()
+        .checked_add(timeout)
+        .unwrap_or_else(tokio::time::Instant::now);
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            anyhow::bail!("timed out waiting for capsule command result");
+        }
+
+        let read = tokio::time::timeout(remaining, client.read_raw_frame()).await;
+        let frame = match read {
+            Ok(Ok(Some(bytes))) => bytes,
+            Ok(Ok(None)) => anyhow::bail!("daemon connection closed before command result"),
+            Ok(Err(err)) => return Err(err),
+            Err(_) => anyhow::bail!("timed out waiting for capsule command result"),
+        };
+        let Ok(raw) = serde_json::from_slice::<serde_json::Value>(&frame) else {
+            continue;
+        };
+        let topic = raw.get("topic").and_then(serde_json::Value::as_str);
+        if topic == Some(result_topic) {
+            return Ok(CommandWait::Result(raw));
+        }
+        if topic == Some(CAPSULES_LOADED_TOPIC) && capsules_loaded_missing_provider(&raw, provider)
+        {
+            return Ok(CommandWait::ProviderUnloaded);
+        }
+    }
+}
+
+fn capsules_loaded_missing_provider(raw: &serde_json::Value, provider: &str) -> bool {
+    let Some(capsules) = capsules_loaded_capsules(raw) else {
+        return false;
+    };
+    !capsules.iter().any(|capsule| {
+        capsule
+            .get("name")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|name| name == provider)
+    })
+}
+
+fn capsules_loaded_capsules(raw: &serde_json::Value) -> Option<&Vec<serde_json::Value>> {
+    let payload = raw.get("payload")?;
+    payload
+        .get("capsules")
+        .and_then(serde_json::Value::as_array)
+        .or_else(|| {
+            payload
+                .get("value")
+                .and_then(|value| value.get("capsules"))
+                .and_then(serde_json::Value::as_array)
+        })
 }
 
 /// Parse and render a `cli.v1.command.result.*` frame.
@@ -408,5 +484,50 @@ mod tests {
 
         let no_payload = serde_json::json!({ "topic": "x" });
         let _ = render_result("p", &no_payload);
+    }
+
+    #[test]
+    fn capsules_loaded_missing_provider_detects_unload() {
+        let raw = serde_json::json!({
+            "topic": "astrid.v1.capsules_loaded",
+            "payload": {
+                "status": "ready",
+                "capsules": [
+                    { "name": "astrid-capsule-session", "meta": null }
+                ]
+            }
+        });
+        assert!(capsules_loaded_missing_provider(
+            &raw,
+            "astrid-capsule-adversarial"
+        ));
+        assert!(!capsules_loaded_missing_provider(
+            &raw,
+            "astrid-capsule-session"
+        ));
+    }
+
+    #[test]
+    fn capsules_loaded_missing_provider_accepts_wrapped_raw_json() {
+        let raw = serde_json::json!({
+            "topic": "astrid.v1.capsules_loaded",
+            "payload": {
+                "type": "raw_json",
+                "value": {
+                    "status": "ready",
+                    "capsules": []
+                }
+            }
+        });
+        assert!(capsules_loaded_missing_provider(&raw, "provider"));
+    }
+
+    #[test]
+    fn capsules_loaded_missing_provider_ignores_unparseable_payload() {
+        let raw = serde_json::json!({
+            "topic": "astrid.v1.capsules_loaded",
+            "payload": { "status": "ready" }
+        });
+        assert!(!capsules_loaded_missing_provider(&raw, "provider"));
     }
 }
