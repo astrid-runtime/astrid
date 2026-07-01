@@ -907,43 +907,81 @@ impl Kernel {
     /// going through capability-gated inventory APIs.
     #[must_use]
     pub fn capsule_topic_probe(&self) -> astrid_core::kernel_api::CapsuleTopicProbe {
-        let any_registry = Arc::clone(&self.capsules);
-        let principal_registry = Arc::clone(&self.capsules);
+        let registry = Arc::clone(&self.capsules);
         astrid_core::kernel_api::CapsuleTopicProbe::new(move |topic: String| {
-            let any_registry = Arc::clone(&any_registry);
-            let principal_registry = Arc::clone(&principal_registry);
-            Box::pin(async move {
-                if let Some((principal, capsule_id, scoped_topic)) =
-                    Self::split_scoped_topic_probe_key(&topic)
-                {
-                    let reg = principal_registry.read().await;
-                    if let Some(capsule_id) = capsule_id {
-                        return reg.get_for(&principal, &capsule_id).is_some_and(|capsule| {
-                            astrid_capsule::readiness::manifest_subscribes_topic(
-                                capsule.manifest(),
-                                &scoped_topic,
-                            )
-                        });
-                    }
-                    return reg.cloned_values_for(&principal).iter().any(|capsule| {
-                        astrid_capsule::readiness::manifest_subscribes_topic(
-                            capsule.manifest(),
-                            &scoped_topic,
-                        )
-                    });
-                }
+            let registry = Arc::clone(&registry);
+            Box::pin(async move { Self::topic_has_subscriber(registry, topic).await })
+        })
+    }
 
-                let reg = any_registry.read().await;
-                // Short-circuit on the first loaded capsule that subscribes the
-                // topic — no need to materialise the manifest list or the full
-                // subscriber set just to answer a boolean.
-                reg.values().any(|c| {
-                    astrid_capsule::readiness::manifest_subscribes_topic(
-                        astrid_capsule::capsule::Capsule::manifest(c),
-                        &topic,
-                    )
+    /// Build a topic probe that can actively warm the caller's uplink capsules
+    /// before answering a scoped readiness read.
+    ///
+    /// The daemon-spawned gateway uses this for registry-backed model routes:
+    /// after restart, the route must not publish request IPC until the caller's
+    /// registry subscription exists. The plain [`Self::capsule_topic_probe`]
+    /// remains passive for compatibility with existing callers.
+    #[must_use]
+    pub fn capsule_topic_probe_with_warm(
+        self: &Arc<Self>,
+    ) -> astrid_core::kernel_api::CapsuleTopicProbe {
+        let passive = self.capsule_topic_probe();
+        let warm_kernel = Arc::clone(self);
+        astrid_core::kernel_api::CapsuleTopicProbe::new_with_ensure(
+            move |topic: String| {
+                let passive = passive.clone();
+                Box::pin(async move { passive.is_subscribed(&topic).await })
+            },
+            move |topic: String| {
+                let kernel = Arc::clone(&warm_kernel);
+                Box::pin(async move {
+                    if let Some((principal, _, _)) = Self::split_scoped_topic_probe_key(&topic) {
+                        kernel.ensure_principal_uplinks_loaded(&principal).await;
+                        kernel.publish_capsules_loaded().await;
+                        if Self::topic_has_subscriber(Arc::clone(&kernel.capsules), topic.clone())
+                            .await
+                        {
+                            return true;
+                        }
+                        kernel.ensure_principal_loaded(&principal).await;
+                        kernel.publish_capsules_loaded().await;
+                    }
+                    Self::topic_has_subscriber(Arc::clone(&kernel.capsules), topic).await
                 })
-            })
+            },
+        )
+    }
+
+    async fn topic_has_subscriber(registry: Arc<RwLock<CapsuleRegistry>>, topic: String) -> bool {
+        if let Some((principal, capsule_id, scoped_topic)) =
+            Self::split_scoped_topic_probe_key(&topic)
+        {
+            let reg = registry.read().await;
+            if let Some(capsule_id) = capsule_id {
+                return reg.get_for(&principal, &capsule_id).is_some_and(|capsule| {
+                    astrid_capsule::readiness::manifest_subscribes_topic(
+                        capsule.manifest(),
+                        &scoped_topic,
+                    )
+                });
+            }
+            return reg.cloned_values_for(&principal).iter().any(|capsule| {
+                astrid_capsule::readiness::manifest_subscribes_topic(
+                    capsule.manifest(),
+                    &scoped_topic,
+                )
+            });
+        }
+
+        let reg = registry.read().await;
+        // Short-circuit on the first loaded capsule that subscribes the
+        // topic — no need to materialise the manifest list or the full
+        // subscriber set just to answer a boolean.
+        reg.values().any(|c| {
+            astrid_capsule::readiness::manifest_subscribes_topic(
+                astrid_capsule::capsule::Capsule::manifest(c),
+                &topic,
+            )
         })
     }
 

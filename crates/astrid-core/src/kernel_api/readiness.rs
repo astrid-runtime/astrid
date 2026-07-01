@@ -92,14 +92,19 @@ impl std::fmt::Debug for AgentReadinessProbe {
 /// is built in `astrid-kernel` (which owns the registry) and merely invoked
 /// here; spelled with `std` types so `astrid-core` needs no `futures` dep.
 #[derive(Clone)]
-pub struct CapsuleTopicProbe(
-    #[allow(clippy::type_complexity)]
-    std::sync::Arc<
-        dyn Fn(String) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send>>
-            + Send
-            + Sync,
-    >,
-);
+pub struct CapsuleTopicProbe(std::sync::Arc<CapsuleTopicProbeFns>);
+
+struct CapsuleTopicProbeFns {
+    is_subscribed: CapsuleTopicProbeFn,
+    ensure_subscribed: CapsuleTopicProbeFn,
+}
+
+#[allow(clippy::type_complexity)]
+type CapsuleTopicProbeFn = std::sync::Arc<
+    dyn Fn(String) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send>>
+        + Send
+        + Sync,
+>;
 
 impl CapsuleTopicProbe {
     /// Wrap a closure that answers whether `topic` has a loaded-capsule
@@ -111,12 +116,53 @@ impl CapsuleTopicProbe {
         + Sync
         + 'static,
     ) -> Self {
-        Self(std::sync::Arc::new(f))
+        let f = std::sync::Arc::new(f);
+        let is_subscribed = {
+            let f = std::sync::Arc::clone(&f);
+            std::sync::Arc::new(move |topic: String| f(topic))
+        };
+        let ensure_subscribed = std::sync::Arc::new(move |topic: String| f(topic));
+        Self(std::sync::Arc::new(CapsuleTopicProbeFns {
+            is_subscribed,
+            ensure_subscribed,
+        }))
+    }
+
+    /// Wrap a closure pair: one passive readiness read, and one active
+    /// best-effort warm/read for routes that must not publish into an unloaded
+    /// caller view after restart.
+    pub fn new_with_ensure(
+        is_subscribed: impl Fn(
+            String,
+        )
+            -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send>>
+        + Send
+        + Sync
+        + 'static,
+        ensure_subscribed: impl Fn(
+            String,
+        )
+            -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send>>
+        + Send
+        + Sync
+        + 'static,
+    ) -> Self {
+        Self(std::sync::Arc::new(CapsuleTopicProbeFns {
+            is_subscribed: std::sync::Arc::new(is_subscribed),
+            ensure_subscribed: std::sync::Arc::new(ensure_subscribed),
+        }))
     }
 
     /// True if some loaded capsule's `[subscribe]` matches `topic`.
     pub async fn is_subscribed(&self, topic: &str) -> bool {
-        (self.0)(topic.to_string()).await
+        (self.0.is_subscribed)(topic.to_string()).await
+    }
+
+    /// Best-effort warm-up for `topic`, then answer whether a subscriber is
+    /// present. Probes built with [`Self::new`] are passive and simply mirror
+    /// [`Self::is_subscribed`].
+    pub async fn ensure_subscribed(&self, topic: &str) -> bool {
+        (self.0.ensure_subscribed)(topic.to_string()).await
     }
 }
 

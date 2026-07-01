@@ -716,16 +716,14 @@ async fn ensure_session_mgmt_supported(
         return Ok(());
     };
 
+    let key = scoped_topic_probe_key(principal, SESSION_CAPSULE_ID, TOPIC_LIST_REQUEST);
+    if probe.is_subscribed(&key).await || probe.ensure_subscribed(&key).await {
+        return Ok(());
+    }
+
     let started = tokio::time::Instant::now();
     loop {
-        if probe
-            .is_subscribed(&scoped_topic_probe_key(
-                principal,
-                SESSION_CAPSULE_ID,
-                TOPIC_LIST_REQUEST,
-            ))
-            .await
-        {
+        if probe.is_subscribed(&key).await {
             return Ok(());
         }
         if started.elapsed() >= CAPSULE_TIMEOUT {

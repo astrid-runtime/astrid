@@ -341,7 +341,7 @@ fn spawn_gateway(
     let audit_log = std::sync::Arc::clone(&kernel.audit_log);
     let session_id = kernel.session_id.clone();
     let readiness_probe = kernel.agent_readiness_probe();
-    let topic_probe = kernel.capsule_topic_probe();
+    let topic_probe = kernel.capsule_topic_probe_with_warm();
     let state = astrid_gateway::GatewayState::new(
         cfg,
         Some(bus),

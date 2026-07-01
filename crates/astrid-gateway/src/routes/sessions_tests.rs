@@ -1,4 +1,8 @@
 use super::*;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+use crate::state::SigningMaterial;
+use astrid_core::kernel_api::CapsuleTopicProbe;
 
 #[test]
 fn resolve_limit_defaults_and_caps() {
@@ -277,6 +281,47 @@ async fn request_capsule_round_trips_scoped_reply() {
     let parsed = parse_list_response(value).expect("reply deserializes");
     assert!(parsed.sessions.is_empty());
     assert!(parsed.next_cursor.is_none());
+}
+
+#[tokio::test]
+async fn session_mgmt_gate_warms_caller_session_before_501() {
+    let principal = PrincipalId::new("alice").expect("valid principal");
+    let warmed = Arc::new(AtomicBool::new(false));
+    let warmed_probe = Arc::clone(&warmed);
+    let state = GatewayState {
+        config: crate::config::GatewayConfig::default(),
+        signing: SigningMaterial::fresh(),
+        distribution: Arc::new(crate::routes::distribution::DistributionInfo::single_tenant()),
+        onboarding: Arc::new(crate::routes::distribution::OnboardingFields::default()),
+        redeem_limiter: tokio::sync::Mutex::default(),
+        metrics_handle: crate::metrics::install_recorder().expect("recorder"),
+        event_bus: None,
+        revoked_at: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
+        revoked_key_ids: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
+        audit_log: None,
+        session_id: None,
+        gateway_route_uuid: Uuid::new_v4(),
+        readiness_probe: None,
+        topic_probe: Some(CapsuleTopicProbe::new_with_ensure(
+            |_topic| Box::pin(async { false }),
+            move |topic| {
+                assert!(topic.contains("alice"));
+                assert!(topic.contains(SESSION_CAPSULE_ID));
+                assert!(topic.contains(TOPIC_LIST_REQUEST));
+                warmed_probe.store(true, Ordering::SeqCst);
+                Box::pin(async { true })
+            },
+        )),
+        registry_timeout: None,
+    };
+
+    ensure_session_mgmt_supported(&state, &principal)
+        .await
+        .expect("warm-capable probe makes session management available");
+    assert!(
+        warmed.load(Ordering::SeqCst),
+        "session gate must actively warm before returning 501"
+    );
 }
 
 /// Real WASM capsule `publish_json` replies arrive at the gateway as
