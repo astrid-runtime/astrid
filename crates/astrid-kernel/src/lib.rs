@@ -29,6 +29,7 @@ pub mod socket;
 use arc_swap::ArcSwap;
 use astrid_audit::AuditLog;
 use astrid_capabilities::{CapabilityStore, DirHandle};
+use astrid_capsule::capsule::CapsuleId;
 use astrid_capsule::profile_cache::PrincipalProfileCache;
 use astrid_capsule::registry::CapsuleRegistry;
 use astrid_core::SessionId;
@@ -43,6 +44,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use tokio::sync::{Mutex, RwLock};
+
+const SCOPED_TOPIC_PROBE_SENTINEL: &str = "\0astrid.scoped-topic\0";
 
 /// The core Operating System Kernel.
 pub struct Kernel {
@@ -153,6 +156,16 @@ pub struct Kernel {
     /// unmodified, to every capsule's `WasmEngine` via the loader. See
     /// [`HttpLimits`](astrid_capsule::HttpLimits).
     http_limits: astrid_capsule::HttpLimits,
+    /// Coalesces full capsule reload requests so the router cannot spawn
+    /// overlapping all-principal discovery/load sweeps.
+    full_reload_in_flight: AtomicBool,
+    /// Serializes per-principal capsule load/warm operations.
+    ///
+    /// WASM component construction is CPU-heavy and can involve synchronous
+    /// host setup. Principal loads are not part of the gateway request fast
+    /// path, so queue them instead of letting admin-driven warms stampede the
+    /// daemon and starve unrelated HTTP/auth routes.
+    capsule_load_lock: Mutex<()>,
     /// Ephemeral mode: shut down immediately when the last client disconnects.
     pub ephemeral: AtomicBool,
     /// Instant when the kernel was booted (for uptime calculation).
@@ -398,6 +411,8 @@ impl Kernel {
             runtime_limits,
             local_egress,
             http_limits,
+            full_reload_in_flight: AtomicBool::new(false),
+            capsule_load_lock: Mutex::new(()),
             ephemeral: AtomicBool::new(false),
             boot_time: std::time::Instant::now(),
             shutdown_tx: tokio::sync::watch::channel(false).0,
@@ -461,17 +476,24 @@ impl Kernel {
     /// # Errors
     ///
     /// Returns an error if the manifest cannot be loaded, the capsule cannot be created, or registration fails.
-    async fn load_capsule(&self, dir: PathBuf) -> Result<(), anyhow::Error> {
+    async fn load_capsule(
+        &self,
+        dir: PathBuf,
+        principal: &PrincipalId,
+    ) -> Result<(), anyhow::Error> {
         let manifest_path = dir.join("Capsule.toml");
         let manifest = astrid_capsule::discovery::load_manifest(&manifest_path)
             .map_err(|e| anyhow::anyhow!(e))?;
+        let id = astrid_capsule::capsule::CapsuleId::from_static(&manifest.package.name);
+        let wasm_hash = capsule_instance_hash(&manifest, &dir);
 
-        // Skip if already registered (prevents double-load from overlapping
-        // discovery paths like principal home + workspace capsules).
+        // Skip only if this principal already has the capsule in its view.
+        // The installed artifact is content-addressed by hash on disk, but the
+        // loaded runtime owns principal-bound env/KV host state and must not be
+        // shared across principal views.
         {
             let registry = self.capsules.read().await;
-            let id = astrid_capsule::capsule::CapsuleId::from_static(&manifest.package.name);
-            if registry.get(&id).is_some() {
+            if registry.get_for(principal, &id).is_some() {
                 return Ok(());
             }
         }
@@ -488,7 +510,6 @@ impl Kernel {
 
         // Build the context — use the shared kernel KV so capsules can
         // communicate state through overlapping KV namespaces.
-        let principal = astrid_core::PrincipalId::default();
         let kv = astrid_storage::ScopedKvStore::new(
             Arc::clone(&self.kv) as Arc<dyn astrid_storage::KvStore>,
             format!("{principal}:capsule:{}", capsule.id()),
@@ -498,7 +519,7 @@ impl Kernel {
         // Check principal config first, fall back to capsule dir's .env.json.
         let capsule_name = capsule.id().to_string();
         let env_path = if let Ok(home) = astrid_core::dirs::AstridHome::resolve() {
-            let ph = home.principal_home(&principal);
+            let ph = home.principal_home(principal);
             let principal_env = ph.env_dir().join(format!("{capsule_name}.env.json"));
             if principal_env.exists() {
                 principal_env
@@ -543,10 +564,31 @@ impl Kernel {
 
         capsule.load(&ctx).await?;
 
-        let mut registry = self.capsules.write().await;
-        registry
-            .register(capsule)
-            .map_err(|e| anyhow::anyhow!("Failed to register capsule: {e}"))?;
+        if !manifest_path.exists() {
+            unload_loaded_capsule_after_source_disappeared(capsule, &id, principal, &manifest_path)
+                .await;
+            return Ok(());
+        }
+
+        {
+            let mut registry = self.capsules.write().await;
+            if registry.get_for(principal, &id).is_some() {
+                drop(registry);
+                capsule.request_cancel();
+                if let Err(e) = capsule.unload().await {
+                    tracing::warn!(
+                        capsule_id = %id,
+                        principal = %principal,
+                        error = %e,
+                        "Redundant capsule unload failed after concurrent load"
+                    );
+                }
+                return Ok(());
+            }
+            registry
+                .register_for(capsule, wasm_hash, principal)
+                .map_err(|e| anyhow::anyhow!("Failed to register capsule: {e}"))?;
+        }
 
         Ok(())
     }
@@ -560,12 +602,13 @@ impl Kernel {
     async fn restart_capsule(
         &self,
         id: &astrid_capsule::capsule::CapsuleId,
+        principal: &PrincipalId,
     ) -> Result<(), anyhow::Error> {
         // Get source directory before unregistering.
         let source_dir = {
             let registry = self.capsules.read().await;
             let capsule = registry
-                .get(id)
+                .get_for(principal, id)
                 .ok_or_else(|| anyhow::anyhow!("capsule '{id}' not found in registry"))?;
             capsule
                 .source_dir()
@@ -579,7 +622,7 @@ impl Kernel {
         let old_capsule = {
             let mut registry = self.capsules.write().await;
             registry
-                .unregister(id)
+                .unregister_for(principal, id)
                 .map_err(|e| anyhow::anyhow!("failed to unregister capsule '{id}': {e}"))?
         };
         // Explicitly unload the old capsule. There is no Drop impl that
@@ -616,7 +659,7 @@ impl Kernel {
         }
 
         // Re-load from disk.
-        self.load_capsule(source_dir).await?;
+        self.load_capsule(source_dir, principal).await?;
 
         // Signal the newly loaded capsule to clean up ephemeral state
         // from the previous incarnation. Capsules that don't implement
@@ -628,7 +671,7 @@ impl Kernel {
         // and starves registry writers (health monitor, capsule loading).
         let capsule = {
             let registry = self.capsules.read().await;
-            registry.get(id)
+            registry.get_for(principal, id)
         };
         if let Some(capsule) = capsule
             && let Err(e) = capsule
@@ -645,95 +688,68 @@ impl Kernel {
         Ok(())
     }
 
-    /// Auto-discover and load all capsules from the standard directories:
-    /// the default principal install dir and the daemon workspace's
-    /// `.astrid/capsules` dir.
+    /// Auto-discover and load the default principal's boot-critical view.
     ///
-    /// Capsules are loaded in dependency order (topological sort) with
-    /// uplink/daemon capsules loaded first. Each uplink must signal
-    /// readiness before non-uplink capsules are loaded.
+    /// Daemon readiness depends on the default view because it owns system
+    /// service capsules such as the CLI proxy. Other profile principals are
+    /// warmed after boot so persisted tenant state cannot make restart
+    /// health depend on loading every agent's tool set.
+    pub async fn load_boot_capsules(&self) {
+        self.load_default_capsule_view().await;
+        self.publish_capsules_loaded().await;
+    }
+
+    /// Schedule background warm-up for known non-default profile principals.
     ///
-    /// After all capsules are loaded, tool schemas are injected into every
-    /// capsule's KV namespace and the `astrid.v1.capsules_loaded` event is published.
+    /// The actual load work is serialized by
+    /// [`Kernel::capsule_load_lock`], so this can run behind a ready daemon
+    /// without racing other admin-driven warm/reload paths.
+    pub fn schedule_profile_principal_warm(self: &Arc<Self>) {
+        let kernel = Arc::clone(self);
+        tokio::spawn(async move {
+            let principals: Vec<_> = kernel
+                .enumerate_profile_principals()
+                .into_iter()
+                .filter(|principal| *principal != PrincipalId::default())
+                .collect();
+
+            for principal in &principals {
+                kernel.ensure_principal_uplinks_loaded(principal).await;
+                kernel.publish_capsules_loaded().await;
+            }
+
+            for principal in principals {
+                if principal != PrincipalId::default() {
+                    kernel.ensure_principal_loaded(&principal).await;
+                    kernel.publish_capsules_loaded().await;
+                }
+            }
+        });
+    }
+
+    /// Auto-discover and load capsule views for known principals.
+    ///
+    /// The default principal is loaded eagerly, then every principal with a
+    /// profile on disk gets its own view. Content-identical capsules reuse the
+    /// same installed artifact on disk, but loaded runtime instances remain
+    /// principal-scoped; default's capsule set is never copied into another
+    /// principal's view.
     pub async fn load_all_capsules(&self) {
-        use astrid_capsule::toposort::toposort_manifests;
-
-        let paths = capsule_discovery_paths(&self.astrid_home, &self.workspace_root);
-
-        let discovered = astrid_capsule::discovery::discover_manifests(Some(&paths));
-
-        // Topological sort ALL capsules together so cross-partition
-        // requirements (e.g. a non-uplink requiring an uplink's capability)
-        // resolve correctly without spurious "not provided" warnings.
-        let sorted = match toposort_manifests(discovered) {
-            Ok(sorted) => sorted,
-            Err((e, original)) => {
-                tracing::error!(
-                    cycle = %e,
-                    "Dependency cycle in capsules, falling back to discovery order"
-                );
-                original
-            },
-        };
-
-        // Defence-in-depth: manifest validation in discovery.rs rejects
-        // uplinks with [imports], but warn here in case a manifest bypasses
-        // the normal load path.
-        for (manifest, _) in &sorted {
-            if manifest.capabilities.uplink && manifest.has_imports() {
-                tracing::warn!(
-                    capsule = %manifest.package.name,
-                    "Uplink capsule has [imports] - \
-                     this should have been rejected at manifest load time"
-                );
+        self.load_default_capsule_view().await;
+        for principal in self.enumerate_profile_principals() {
+            if principal != PrincipalId::default() {
+                self.ensure_principal_loaded(&principal).await;
             }
         }
 
-        // Validate imports/exports: every required import must have a matching export.
-        validate_imports_exports(&sorted);
+        // Signal that all capsules have been loaded so uplink capsules
+        // (like the registry) can proceed with discovery instead of
+        // polling with arbitrary timeouts.
+        self.publish_capsules_loaded().await;
+    }
 
-        // Partition after sorting: uplinks first, then the rest.
-        // The relative order within each partition is preserved from the
-        // toposort, so dependency edges are still respected. Cross-partition
-        // edges (non-uplink requiring an uplink) are satisfied by construction
-        // since all uplinks load first. The inverse (uplink requiring a
-        // non-uplink) is rejected above.
-        let (uplinks, others): (Vec<_>, Vec<_>) =
-            sorted.into_iter().partition(|(m, _)| m.capabilities.uplink);
-
-        // Load uplinks first so their event bus subscriptions are ready.
-        let uplink_names: Vec<String> = uplinks
-            .iter()
-            .map(|(m, _)| m.package.name.clone())
-            .collect();
-        for (manifest, dir) in &uplinks {
-            if let Err(e) = self.load_capsule(dir.clone()).await {
-                tracing::warn!(
-                    capsule = %manifest.package.name,
-                    error = %e,
-                    "Failed to load uplink capsule during discovery"
-                );
-            }
-        }
-
-        // Wait for uplink capsules to signal readiness before loading
-        // non-uplink capsules. This ensures IPC subscriptions are active.
-        self.await_capsule_readiness(&uplink_names).await;
-
-        for (manifest, dir) in &others {
-            if let Err(e) = self.load_capsule(dir.clone()).await {
-                tracing::warn!(
-                    capsule = %manifest.package.name,
-                    error = %e,
-                    "Failed to load capsule during discovery"
-                );
-            }
-        }
-
-        // Wait for non-uplink run-loop capsules too, so any future
-        // dependency edges between them are respected.
-        let other_names: Vec<String> = others.iter().map(|(m, _)| m.package.name.clone()).collect();
-        self.await_capsule_readiness(&other_names).await;
+    async fn load_default_capsule_view(&self) {
+        self.ensure_principal_loaded(&PrincipalId::default()).await;
 
         // Warn loudly if the loaded set can't actually serve an agent chat
         // turn. Computed from the live registry *after* load completes (not the
@@ -749,11 +765,112 @@ impl Kernel {
                 .collect();
             warn_agent_loop_readiness(&loaded);
         }
+    }
 
-        // Signal that all capsules have been loaded so uplink capsules
-        // (like the registry) can proceed with discovery instead of
-        // polling with arbitrary timeouts.
-        self.publish_capsules_loaded().await;
+    /// Build or refresh one principal's capsule view from its own install set.
+    pub async fn ensure_principal_loaded(&self, principal: &PrincipalId) {
+        let _load_guard = self.capsule_load_lock.lock().await;
+        let sorted = self.sorted_principal_capsules(principal);
+        validate_principal_capsules(principal, &sorted);
+
+        let (uplinks, others): (Vec<_>, Vec<_>) =
+            sorted.into_iter().partition(|(m, _)| m.capabilities.uplink);
+        let uplink_names: Vec<String> = uplinks
+            .iter()
+            .map(|(m, _)| m.package.name.clone())
+            .collect();
+        for (manifest, dir) in &uplinks {
+            if let Err(e) = self.load_capsule(dir.clone(), principal).await {
+                tracing::warn!(
+                    %principal,
+                    capsule = %manifest.package.name,
+                    error = %e,
+                    "Failed to load uplink capsule during discovery"
+                );
+            }
+        }
+        self.await_capsule_readiness_for(principal, &uplink_names)
+            .await;
+
+        for (manifest, dir) in &others {
+            if let Err(e) = self.load_capsule(dir.clone(), principal).await {
+                tracing::warn!(
+                    %principal,
+                    capsule = %manifest.package.name,
+                    error = %e,
+                    "Failed to load capsule during discovery"
+                );
+            }
+        }
+        let other_names: Vec<String> = others.iter().map(|(m, _)| m.package.name.clone()).collect();
+        self.await_capsule_readiness_for(principal, &other_names)
+            .await;
+    }
+
+    async fn ensure_principal_uplinks_loaded(&self, principal: &PrincipalId) {
+        let _load_guard = self.capsule_load_lock.lock().await;
+        let sorted = self.sorted_principal_capsules(principal);
+        validate_principal_capsules(principal, &sorted);
+
+        let uplinks: Vec<_> = sorted
+            .into_iter()
+            .filter(|(manifest, _)| manifest.capabilities.uplink)
+            .collect();
+        let uplink_names: Vec<String> = uplinks
+            .iter()
+            .map(|(manifest, _)| manifest.package.name.clone())
+            .collect();
+        for (manifest, dir) in &uplinks {
+            if let Err(e) = self.load_capsule(dir.clone(), principal).await {
+                tracing::warn!(
+                    %principal,
+                    capsule = %manifest.package.name,
+                    error = %e,
+                    "Failed to load uplink capsule during background warm"
+                );
+            }
+        }
+        self.await_capsule_readiness_for(principal, &uplink_names)
+            .await;
+    }
+
+    fn sorted_principal_capsules(
+        &self,
+        principal: &PrincipalId,
+    ) -> Vec<(astrid_capsule::manifest::CapsuleManifest, PathBuf)> {
+        use astrid_capsule::toposort::toposort_manifests;
+
+        let paths = capsule_discovery_paths_for(&self.astrid_home, &self.workspace_root, principal);
+        let discovered = astrid_capsule::discovery::discover_manifests(Some(&paths));
+        match toposort_manifests(discovered) {
+            Ok(sorted) => sorted,
+            Err((e, original)) => {
+                tracing::error!(
+                    %principal,
+                    cycle = %e,
+                    "Dependency cycle in capsules, falling back to discovery order"
+                );
+                original
+            },
+        }
+    }
+
+    fn enumerate_profile_principals(&self) -> Vec<PrincipalId> {
+        let profiles_dir = self.astrid_home.profiles_dir();
+        let Ok(entries) = std::fs::read_dir(profiles_dir) else {
+            return Vec::new();
+        };
+        entries
+            .flatten()
+            .filter_map(|entry| {
+                if !entry.file_type().is_ok_and(|ty| ty.is_file()) {
+                    return None;
+                }
+                let name = entry.file_name();
+                let stem = name.to_str()?.strip_suffix(".toml")?;
+                PrincipalId::new(stem).ok()
+            })
+            .collect()
     }
 
     /// Build an in-process agent-loop readiness probe over the live registry.
@@ -785,27 +902,103 @@ impl Kernel {
     /// computed from the live registry without a capability check. Mirrors
     /// [`Self::agent_readiness_probe`]; the co-located gateway uses it to
     /// gracefully degrade a route whose backing verb a pre-upgrade capsule
-    /// may not handle (e.g. answer `501` instead of waiting out a bus
-    /// timeout), for every authenticated caller — capsule serviceability is
-    /// global daemon health, not per-principal authorization.
+    /// may not handle (e.g. answer `501` instead of waiting out a bus timeout),
+    /// and lets routes wait for a caller's async-warmed capsule view without
+    /// going through capability-gated inventory APIs.
     #[must_use]
     pub fn capsule_topic_probe(&self) -> astrid_core::kernel_api::CapsuleTopicProbe {
         let registry = Arc::clone(&self.capsules);
         astrid_core::kernel_api::CapsuleTopicProbe::new(move |topic: String| {
             let registry = Arc::clone(&registry);
-            Box::pin(async move {
-                let reg = registry.read().await;
-                // Short-circuit on the first loaded capsule that subscribes the
-                // topic — no need to materialise the manifest list or the full
-                // subscriber set just to answer a boolean.
-                reg.values().any(|c| {
-                    astrid_capsule::readiness::manifest_subscribes_topic(
-                        astrid_capsule::capsule::Capsule::manifest(c),
-                        &topic,
-                    )
-                })
-            })
+            Box::pin(async move { Self::topic_has_subscriber(registry, topic).await })
         })
+    }
+
+    /// Build a topic probe that can actively warm the caller's uplink capsules
+    /// before answering a scoped readiness read.
+    ///
+    /// The daemon-spawned gateway uses this for registry-backed model routes:
+    /// after restart, the route must not publish request IPC until the caller's
+    /// registry subscription exists. The plain [`Self::capsule_topic_probe`]
+    /// remains passive for compatibility with existing callers.
+    #[must_use]
+    pub fn capsule_topic_probe_with_warm(
+        self: &Arc<Self>,
+    ) -> astrid_core::kernel_api::CapsuleTopicProbe {
+        let passive = self.capsule_topic_probe();
+        let warm_kernel = Arc::clone(self);
+        astrid_core::kernel_api::CapsuleTopicProbe::new_with_ensure(
+            move |topic: String| {
+                let passive = passive.clone();
+                Box::pin(async move { passive.is_subscribed(&topic).await })
+            },
+            move |topic: String| {
+                let kernel = Arc::clone(&warm_kernel);
+                Box::pin(async move {
+                    if let Some((principal, _, _)) = Self::split_scoped_topic_probe_key(&topic) {
+                        kernel.ensure_principal_uplinks_loaded(&principal).await;
+                        kernel.publish_capsules_loaded().await;
+                        if Self::topic_has_subscriber(Arc::clone(&kernel.capsules), topic.clone())
+                            .await
+                        {
+                            return true;
+                        }
+                        kernel.ensure_principal_loaded(&principal).await;
+                        kernel.publish_capsules_loaded().await;
+                    }
+                    Self::topic_has_subscriber(Arc::clone(&kernel.capsules), topic).await
+                })
+            },
+        )
+    }
+
+    async fn topic_has_subscriber(registry: Arc<RwLock<CapsuleRegistry>>, topic: String) -> bool {
+        if let Some((principal, capsule_id, scoped_topic)) =
+            Self::split_scoped_topic_probe_key(&topic)
+        {
+            let reg = registry.read().await;
+            if let Some(capsule_id) = capsule_id {
+                return reg.get_for(&principal, &capsule_id).is_some_and(|capsule| {
+                    astrid_capsule::readiness::manifest_subscribes_topic(
+                        capsule.manifest(),
+                        &scoped_topic,
+                    )
+                });
+            }
+            return reg.cloned_values_for(&principal).iter().any(|capsule| {
+                astrid_capsule::readiness::manifest_subscribes_topic(
+                    capsule.manifest(),
+                    &scoped_topic,
+                )
+            });
+        }
+
+        let reg = registry.read().await;
+        // Short-circuit on the first loaded capsule that subscribes the
+        // topic — no need to materialise the manifest list or the full
+        // subscriber set just to answer a boolean.
+        reg.values().any(|c| {
+            astrid_capsule::readiness::manifest_subscribes_topic(
+                astrid_capsule::capsule::Capsule::manifest(c),
+                &topic,
+            )
+        })
+    }
+
+    fn split_scoped_topic_probe_key(raw: &str) -> Option<(PrincipalId, Option<CapsuleId>, String)> {
+        let rest = raw.strip_prefix(SCOPED_TOPIC_PROBE_SENTINEL)?;
+        let mut parts = rest.splitn(3, '\0');
+        let principal = parts.next()?;
+        let second = parts.next()?;
+        let third = parts.next();
+        let principal = PrincipalId::new(principal).ok()?;
+        match third {
+            Some(topic) => {
+                let capsule_id = CapsuleId::new(second).ok()?;
+                Some((principal, Some(capsule_id), topic.to_string()))
+            },
+            None => Some((principal, None, second.to_string())),
+        }
     }
 
     /// Publish `astrid.v1.capsules_loaded` so subscribers re-read the current
@@ -824,19 +1017,24 @@ impl Kernel {
     /// failure leaves `tools` absent for that capsule this cycle (the consumer
     /// falls back to its fan-out). The legacy `status: "ready"` field is
     /// retained so bare-signal subscribers (the shim, the TUI) keep working; the
-    /// `capsules` field is additive.
-    async fn publish_capsules_loaded(&self) {
+    /// `capsules` field is additive. The signal is emitted once per principal
+    /// and bus-stamped with that principal so socket consumers only receive
+    /// their own inventory view.
+    pub(crate) async fn publish_capsules_loaded(&self) {
         // Clone the loaded-capsule handles under a brief read lock, then release
         // it before any filesystem I/O or `tool_describe` invocation (which can
         // `block_in_place` and must never run while holding the registry lock).
         let capsules = {
             let reg = self.capsules.read().await;
-            reg.cloned_values()
+            reg.cloned_values_with_principal()
         };
 
-        let mut with_meta: Vec<(String, Option<serde_json::Value>)> =
-            Vec::with_capacity(capsules.len());
-        for capsule in &capsules {
+        let mut by_principal = std::collections::BTreeMap::<
+            String,
+            Vec<(String, String, Option<serde_json::Value>)>,
+        >::new();
+        for (principal, capsule) in &capsules {
+            let principal = principal.to_string();
             let name = capsule.id().to_string();
             let mut meta = capsule
                 .source_dir()
@@ -860,19 +1058,29 @@ impl Kernel {
                     "live tool_describe failed; capsule left uncaptured this cycle"
                 ),
             }
-            with_meta.push((name, meta));
+            by_principal
+                .entry(principal.clone())
+                .or_default()
+                .push((principal, name, meta));
         }
-        let payload = capsules_loaded::build_capsules_loaded_payload(with_meta);
+        if by_principal.is_empty() {
+            by_principal.insert(PrincipalId::default().to_string(), Vec::new());
+        }
 
-        let msg = astrid_events::ipc::IpcMessage::new(
-            astrid_events::ipc::Topic::from_raw("astrid.v1.capsules_loaded"),
-            astrid_events::ipc::IpcPayload::RawJson(payload),
-            self.session_id.0,
-        );
-        let _ = self.event_bus.publish(astrid_events::AstridEvent::Ipc {
-            metadata: astrid_events::EventMetadata::new("kernel"),
-            message: msg,
-        });
+        for (principal, entries) in by_principal {
+            let payload = capsules_loaded::build_capsules_loaded_payload(entries);
+
+            let msg = astrid_events::ipc::IpcMessage::new(
+                astrid_events::ipc::Topic::from_raw("astrid.v1.capsules_loaded"),
+                astrid_events::ipc::IpcPayload::RawJson(payload),
+                self.session_id.0,
+            )
+            .with_principal(principal);
+            let _ = self.event_bus.publish(astrid_events::AstridEvent::Ipc {
+                metadata: astrid_events::EventMetadata::new("kernel"),
+                message: msg,
+            });
+        }
     }
 
     /// Reload a single capsule by id without a daemon restart.
@@ -887,23 +1095,21 @@ impl Kernel {
     pub(crate) async fn reload_one_capsule(
         &self,
         id: &astrid_capsule::capsule::CapsuleId,
+        principal: &PrincipalId,
     ) -> Result<(), anyhow::Error> {
-        let registered = { self.capsules.read().await.get(id).is_some() };
+        let registered = { self.capsules.read().await.get_for(principal, id).is_some() };
         if registered {
-            self.restart_capsule(id).await?;
+            self.restart_capsule(id, principal).await?;
             self.publish_capsules_loaded().await;
         } else {
-            // load_all_capsules discovers + loads the new capsule (existing ones
-            // are skipped) and publishes capsules_loaded itself. It logs-and-
-            // continues on a per-capsule load failure, so confirm the requested
-            // capsule actually registered — otherwise the caller would report a
-            // false success for a capsule that failed to load or isn't on disk.
-            self.load_all_capsules().await;
-            if self.capsules.read().await.get(id).is_none() {
+            // Build or refresh this principal's view from its installed set.
+            self.ensure_principal_loaded(principal).await;
+            if self.capsules.read().await.get_for(principal, id).is_none() {
                 return Err(anyhow::anyhow!(
                     "capsule '{id}' was not found in the install directories or failed to load"
                 ));
             }
+            self.publish_capsules_loaded().await;
         }
         Ok(())
     }
@@ -929,14 +1135,15 @@ impl Kernel {
     pub(crate) async fn unload_one_capsule(
         &self,
         id: &astrid_capsule::capsule::CapsuleId,
+        principal: &PrincipalId,
     ) -> Result<bool, anyhow::Error> {
-        // Unregister under the write lock. A NotFound means the capsule was
-        // never loaded here (e.g. the daemon started after it was removed, or
-        // it failed to load) — that is a benign no-op for an unload, so report
-        // it as "not loaded" rather than an error.
+        // Unregister only from this principal's view. The content-addressed
+        // artifact may be installed for other principals, but loaded runtime
+        // instances own principal-bound env/KV state and are unloaded per
+        // principal.
         let old_capsule = {
             let mut registry = self.capsules.write().await;
-            match registry.unregister(id) {
+            match registry.unregister_for(principal, id) {
                 Ok(capsule) => capsule,
                 Err(astrid_capsule::error::CapsuleError::NotFound(_)) => return Ok(false),
                 Err(e) => {
@@ -1192,7 +1399,7 @@ impl Kernel {
     /// Collects `Arc<dyn Capsule>` handles under a short-lived read lock,
     /// then drops the lock before awaiting. Capsules without a run loop
     /// return `Ready` immediately and don't contribute to wait time.
-    async fn await_capsule_readiness(&self, names: &[String]) {
+    async fn await_capsule_readiness_for(&self, principal: &PrincipalId, names: &[String]) {
         use astrid_capsule::capsule::ReadyStatus;
 
         if names.is_empty() {
@@ -1206,7 +1413,9 @@ impl Kernel {
                 .iter()
                 .filter_map(
                     |name| match astrid_capsule::capsule::CapsuleId::new(name.clone()) {
-                        Ok(capsule_id) => registry.get(&capsule_id).map(|c| (name.clone(), c)),
+                        Ok(capsule_id) => registry
+                            .get_for(principal, &capsule_id)
+                            .map(|c| (name.clone(), c)),
                         Err(e) => {
                             tracing::warn!(
                                 capsule = %name,
@@ -1250,6 +1459,30 @@ impl Kernel {
             }
         }
     }
+}
+
+async fn unload_loaded_capsule_after_source_disappeared(
+    mut capsule: Box<dyn astrid_capsule::capsule::Capsule>,
+    id: &astrid_capsule::capsule::CapsuleId,
+    principal: &PrincipalId,
+    manifest_path: &Path,
+) {
+    capsule.request_cancel();
+    if let Err(e) = capsule.unload().await {
+        tracing::warn!(
+            capsule_id = %id,
+            principal = %principal,
+            path = %manifest_path.display(),
+            error = %e,
+            "Capsule unload failed after source disappeared before registration"
+        );
+    }
+    tracing::warn!(
+        capsule_id = %id,
+        principal = %principal,
+        path = %manifest_path.display(),
+        "Skipping capsule registration because the source disappeared during load"
+    );
 }
 
 /// Test-only lightweight constructor (issue #672) that builds a
@@ -1355,6 +1588,8 @@ pub(crate) async fn test_kernel_with_home(home: astrid_core::dirs::AstridHome) -
         runtime_limits: astrid_capsule::CapsuleRuntimeLimits::default(),
         local_egress: std::collections::HashMap::new(),
         http_limits: astrid_capsule::HttpLimits::default(),
+        full_reload_in_flight: AtomicBool::new(false),
+        capsule_load_lock: Mutex::new(()),
         ephemeral: AtomicBool::new(false),
         boot_time: std::time::Instant::now(),
         shutdown_tx: tokio::sync::watch::channel(false).0,
@@ -1670,6 +1905,7 @@ impl RestartTracker {
 async fn attempt_capsule_restart(
     kernel: &Kernel,
     id_str: &str,
+    principal: &PrincipalId,
     tracker: &mut RestartTracker,
 ) -> bool {
     if tracker.exhausted() {
@@ -1690,22 +1926,35 @@ async fn attempt_capsule_restart(
 
     tracing::warn!(
         capsule_id = %id_str,
+        principal = %principal,
         attempt,
         max_attempts = RestartTracker::MAX_ATTEMPTS,
         "Attempting capsule restart"
     );
 
     let capsule_id = astrid_capsule::capsule::CapsuleId::from_static(id_str);
-    match kernel.restart_capsule(&capsule_id).await {
+    match kernel.restart_capsule(&capsule_id, principal).await {
         Ok(()) => {
-            tracing::info!(capsule_id = %id_str, attempt, "Capsule restarted successfully");
+            tracing::info!(
+                capsule_id = %id_str,
+                principal = %principal,
+                attempt,
+                "Capsule restarted successfully"
+            );
             true
         },
         Err(e) => {
-            tracing::error!(capsule_id = %id_str, attempt, error = %e, "Capsule restart failed");
+            tracing::error!(
+                capsule_id = %id_str,
+                principal = %principal,
+                attempt,
+                error = %e,
+                "Capsule restart failed"
+            );
             if tracker.exhausted() {
                 tracing::error!(
                     capsule_id = %id_str,
+                    principal = %principal,
                     "All restart attempts exhausted - capsule will remain down"
                 );
             }
@@ -1735,15 +1984,17 @@ fn spawn_capsule_health_monitor(kernel: Arc<Kernel>) -> tokio::task::JoinHandle<
 
             // Collect ready capsules under a brief read lock, then drop
             // the lock before calling check_health() or publishing events.
-            let ready_capsules: Vec<std::sync::Arc<dyn astrid_capsule::capsule::Capsule>> = {
+            let ready_capsules: Vec<(
+                PrincipalId,
+                std::sync::Arc<dyn astrid_capsule::capsule::Capsule>,
+            )> = {
                 let registry = kernel.capsules.read().await;
                 registry
-                    .list()
+                    .cloned_values_with_principal()
                     .into_iter()
-                    .filter_map(|id| {
-                        let capsule = registry.get(id)?;
+                    .filter_map(|(principal, capsule)| {
                         if capsule.state() == astrid_capsule::capsule::CapsuleState::Ready {
-                            Some(capsule)
+                            Some((principal, capsule))
                         } else {
                             None
                         }
@@ -1754,18 +2005,24 @@ fn spawn_capsule_health_monitor(kernel: Arc<Kernel>) -> tokio::task::JoinHandle<
             // Probe health once per capsule, collect failures, then drop
             // the Arc Vec before restarting. This ensures restart_capsule's
             // Arc::get_mut can succeed (no other strong references held).
-            let mut failures: Vec<(String, String)> = Vec::new();
-            for capsule in &ready_capsules {
+            let mut failures: Vec<(PrincipalId, String, String)> = Vec::new();
+            for (principal, capsule) in &ready_capsules {
                 let health = capsule.check_health();
                 if let astrid_capsule::capsule::CapsuleState::Failed(reason) = health {
                     let id_str = capsule.id().to_string();
-                    tracing::error!(capsule_id = %id_str, reason = %reason, "Capsule health check failed");
+                    tracing::error!(
+                        capsule_id = %id_str,
+                        principal = %principal,
+                        reason = %reason,
+                        "Capsule health check failed"
+                    );
 
                     let msg = astrid_events::ipc::IpcMessage::new(
                         astrid_events::ipc::Topic::from_raw("astrid.v1.health.failed"),
                         astrid_events::ipc::IpcPayload::Custom {
                             data: serde_json::json!({
                                 "capsule_id": &id_str,
+                                "principal": principal.as_str(),
                                 "reason": &reason,
                             }),
                         },
@@ -1775,7 +2032,7 @@ fn spawn_capsule_health_monitor(kernel: Arc<Kernel>) -> tokio::task::JoinHandle<
                         metadata: astrid_events::EventMetadata::new("kernel"),
                         message: msg,
                     });
-                    failures.push((id_str, reason));
+                    failures.push((principal.clone(), id_str, reason));
                 }
             }
 
@@ -1783,17 +2040,20 @@ fn spawn_capsule_health_monitor(kernel: Arc<Kernel>) -> tokio::task::JoinHandle<
             // obtain exclusive access for calling unload().
             drop(ready_capsules);
 
-            let failed_this_tick: std::collections::HashSet<&str> =
-                failures.iter().map(|(id, _)| id.as_str()).collect();
+            let failed_this_tick: std::collections::HashSet<String> = failures
+                .iter()
+                .map(|(principal, id, _)| restart_tracker_key(principal, id))
+                .collect();
 
             let mut restarted = Vec::new();
-            for (id_str, _reason) in &failures {
+            for (principal, id_str, _reason) in &failures {
+                let tracker_key = restart_tracker_key(principal, id_str);
                 let tracker = restart_trackers
-                    .entry(id_str.clone())
+                    .entry(tracker_key.clone())
                     .or_insert_with(RestartTracker::new);
 
-                if attempt_capsule_restart(&kernel, id_str, tracker).await {
-                    restarted.push(id_str.clone());
+                if attempt_capsule_restart(&kernel, id_str, principal, tracker).await {
+                    restarted.push(tracker_key);
                 }
             }
 
@@ -1806,7 +2066,7 @@ fn spawn_capsule_health_monitor(kernel: Arc<Kernel>) -> tokio::task::JoinHandle<
             // Keep exhausted trackers and trackers still in their backoff
             // window (capsule may have been unregistered by a failed restart
             // attempt and won't appear in ready_capsules next tick).
-            restart_trackers.retain(|id, tracker| {
+            restart_trackers.retain(|tracker_key, tracker| {
                 if tracker.exhausted() {
                     return true;
                 }
@@ -1815,10 +2075,14 @@ fn spawn_capsule_health_monitor(kernel: Arc<Kernel>) -> tokio::task::JoinHandle<
                 if tracker.last_attempt.elapsed() < tracker.backoff {
                     return true;
                 }
-                failed_this_tick.contains(id.as_str())
+                failed_this_tick.contains(tracker_key)
             });
         }
     })
+}
+
+fn restart_tracker_key(principal: &PrincipalId, capsule_id: &str) -> String {
+    format!("{principal}/{capsule_id}")
 }
 
 /// Spawns a periodic watchdog that publishes `astrid.v1.watchdog.tick` events every 5 seconds.
@@ -1852,21 +2116,65 @@ fn spawn_react_watchdog(event_bus: Arc<EventBus>) -> tokio::task::JoinHandle<()>
     })
 }
 
+#[cfg(test)]
 fn capsule_discovery_paths(
     home: &astrid_core::dirs::AstridHome,
     workspace_root: &Path,
 ) -> Vec<PathBuf> {
-    let principal = PrincipalId::default();
+    capsule_discovery_paths_for(home, workspace_root, &PrincipalId::default())
+}
+
+fn capsule_discovery_paths_for(
+    home: &astrid_core::dirs::AstridHome,
+    workspace_root: &Path,
+    principal: &PrincipalId,
+) -> Vec<PathBuf> {
     let workspace = astrid_core::dirs::WorkspaceDir::from_path(workspace_root);
     vec![
-        home.principal_home(&principal).capsules_dir(),
+        home.principal_home(principal).capsules_dir(),
         workspace.capsules_dir(),
     ]
+}
+
+fn capsule_instance_hash(
+    manifest: &astrid_capsule::manifest::CapsuleManifest,
+    dir: &Path,
+) -> astrid_capsule::registry::WasmHash {
+    astrid_capsule_install::read_meta(dir)
+        .and_then(|meta| meta.wasm_hash)
+        .map_or_else(
+            || {
+                astrid_capsule::registry::WasmHash::synthetic(
+                    &manifest.package.name,
+                    &manifest.package.version,
+                )
+            },
+            astrid_capsule::registry::WasmHash::from_raw,
+        )
 }
 
 // ---------------------------------------------------------------------------
 // Boot validation
 // ---------------------------------------------------------------------------
+
+fn validate_principal_capsules(
+    principal: &PrincipalId,
+    sorted: &[(
+        astrid_capsule::manifest::CapsuleManifest,
+        std::path::PathBuf,
+    )],
+) {
+    for (manifest, _) in sorted {
+        if manifest.capabilities.uplink && manifest.has_imports() {
+            tracing::warn!(
+                %principal,
+                capsule = %manifest.package.name,
+                "Uplink capsule has [imports] - this should have been rejected at manifest load time"
+            );
+        }
+    }
+    validate_imports_exports(sorted);
+}
 
 /// Validate that every capsule's required imports have a matching export
 /// from another loaded capsule. Logs errors for unsatisfied required imports
@@ -2460,7 +2768,10 @@ mod tests {
             })
         };
 
-        let removed = kernel.unload_one_capsule(&id).await.unwrap();
+        let removed = kernel
+            .unload_one_capsule(&id, &PrincipalId::default())
+            .await
+            .unwrap();
         release_after_cancel.await.unwrap();
 
         assert!(removed);
@@ -2471,6 +2782,77 @@ mod tests {
         assert!(
             unloaded.load(Ordering::Relaxed),
             "unload should complete once the in-flight holder releases its Arc"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn unload_one_principal_retains_other_principal_runtime() {
+        let (_d, home) = scratch_home();
+        let kernel = test_kernel_with_home(home).await;
+        let id = CapsuleId::new("shared-test").unwrap();
+        let alice = PrincipalId::new("alice").unwrap();
+        let bob = PrincipalId::new("bob").unwrap();
+        let hash = astrid_capsule::registry::WasmHash::from_raw("shared-test-hash");
+        let alice_cancelled = Arc::new(AtomicBool::new(false));
+        let alice_unloaded = Arc::new(AtomicBool::new(false));
+        let bob_cancelled = Arc::new(AtomicBool::new(false));
+        let bob_unloaded = Arc::new(AtomicBool::new(false));
+
+        {
+            let mut registry = kernel.capsules.write().await;
+            registry
+                .register_for(
+                    Box::new(CancellableTestCapsule {
+                        id: id.clone(),
+                        manifest: CapsuleManifest::default(),
+                        cancelled: Arc::clone(&alice_cancelled),
+                        unloaded: Arc::clone(&alice_unloaded),
+                    }),
+                    hash.clone(),
+                    &alice,
+                )
+                .unwrap();
+            registry
+                .register_for(
+                    Box::new(CancellableTestCapsule {
+                        id: id.clone(),
+                        manifest: CapsuleManifest::default(),
+                        cancelled: Arc::clone(&bob_cancelled),
+                        unloaded: Arc::clone(&bob_unloaded),
+                    }),
+                    hash,
+                    &bob,
+                )
+                .unwrap();
+        }
+
+        let removed = kernel.unload_one_capsule(&id, &alice).await.unwrap();
+        assert!(removed);
+        assert!(
+            alice_cancelled.load(Ordering::Relaxed),
+            "removing one principal's runtime must request cancellation for that runtime"
+        );
+        assert!(
+            alice_unloaded.load(Ordering::Relaxed),
+            "removing one principal's runtime must unload that runtime"
+        );
+        assert!(
+            !bob_cancelled.load(Ordering::Relaxed),
+            "removing Alice's runtime must not cancel Bob's runtime"
+        );
+        assert!(
+            !bob_unloaded.load(Ordering::Relaxed),
+            "removing Alice's runtime must not unload Bob's runtime"
+        );
+
+        let registry = kernel.capsules.read().await;
+        assert!(
+            registry.get_for(&alice, &id).is_none(),
+            "alice's view should no longer contain the capsule"
+        );
+        assert!(
+            registry.get_for(&bob, &id).is_some(),
+            "bob's view should retain its own runtime"
         );
     }
 

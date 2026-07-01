@@ -12,5 +12,5 @@
 #[allow(unused_imports)]
 pub(crate) use astrid_capsule_install::meta::{
     CapsuleLocation, CapsuleMeta, InstalledCapsule, read_meta, scan_installed_capsules,
-    scan_installed_capsules_in_home, write_meta,
+    scan_installed_capsules_in_home, scan_installed_capsules_in_home_for, write_meta,
 };

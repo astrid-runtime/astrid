@@ -1,4 +1,8 @@
 use super::*;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+use crate::state::SigningMaterial;
+use astrid_core::kernel_api::CapsuleTopicProbe;
 
 #[test]
 fn resolve_limit_defaults_and_caps() {
@@ -245,7 +249,7 @@ async fn request_capsule_round_trips_scoped_reply() {
         let mut msg = IpcMessage::new(
             Topic::from_raw(resp_topic.clone()),
             IpcPayload::RawJson(reply),
-            session_capsule_source_id(),
+            session_capsule_source_id_v0(),
         );
         if let AstridEvent::Ipc { message, .. } = &*event
             && let Some(principal) = &message.principal
@@ -267,6 +271,7 @@ async fn request_capsule_round_trips_scoped_reply() {
         correlation_id,
         &principal,
         None,
+        &[],
         CAPSULE_TIMEOUT,
     )
     .await
@@ -276,6 +281,47 @@ async fn request_capsule_round_trips_scoped_reply() {
     let parsed = parse_list_response(value).expect("reply deserializes");
     assert!(parsed.sessions.is_empty());
     assert!(parsed.next_cursor.is_none());
+}
+
+#[tokio::test]
+async fn session_mgmt_gate_warms_caller_session_before_501() {
+    let principal = PrincipalId::new("alice").expect("valid principal");
+    let warmed = Arc::new(AtomicBool::new(false));
+    let warmed_probe = Arc::clone(&warmed);
+    let state = GatewayState {
+        config: crate::config::GatewayConfig::default(),
+        signing: SigningMaterial::fresh(),
+        distribution: Arc::new(crate::routes::distribution::DistributionInfo::single_tenant()),
+        onboarding: Arc::new(crate::routes::distribution::OnboardingFields::default()),
+        redeem_limiter: tokio::sync::Mutex::default(),
+        metrics_handle: crate::metrics::install_recorder().expect("recorder"),
+        event_bus: None,
+        revoked_at: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
+        revoked_key_ids: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
+        audit_log: None,
+        session_id: None,
+        gateway_route_uuid: Uuid::new_v4(),
+        readiness_probe: None,
+        topic_probe: Some(CapsuleTopicProbe::new_with_ensure(
+            |_topic| Box::pin(async { false }),
+            move |topic| {
+                assert!(topic.contains("alice"));
+                assert!(topic.contains(SESSION_CAPSULE_ID));
+                assert!(topic.contains(TOPIC_LIST_REQUEST));
+                warmed_probe.store(true, Ordering::SeqCst);
+                Box::pin(async { true })
+            },
+        )),
+        registry_timeout: None,
+    };
+
+    ensure_session_mgmt_supported(&state, &principal)
+        .await
+        .expect("warm-capable probe makes session management available");
+    assert!(
+        warmed.load(Ordering::SeqCst),
+        "session gate must actively warm before returning 501"
+    );
 }
 
 /// Real WASM capsule `publish_json` replies arrive at the gateway as
@@ -302,7 +348,7 @@ async fn request_capsule_round_trips_custom_json_reply() {
         let mut msg = IpcMessage::new(
             Topic::from_raw(resp_topic.clone()),
             IpcPayload::Custom { data: reply },
-            session_capsule_source_id(),
+            session_capsule_source_id_v0(),
         );
         if let AstridEvent::Ipc { message, .. } = &*event
             && let Some(principal) = &message.principal
@@ -324,6 +370,7 @@ async fn request_capsule_round_trips_custom_json_reply() {
         correlation_id,
         &principal,
         None,
+        &[],
         CAPSULE_TIMEOUT,
     )
     .await
@@ -333,6 +380,62 @@ async fn request_capsule_round_trips_custom_json_reply() {
     let parsed = parse_list_response(value).expect("reply deserializes");
     assert!(parsed.sessions.is_empty());
     assert!(parsed.next_cursor.is_none());
+}
+
+#[tokio::test]
+async fn request_capsule_accepts_live_registry_source_id() {
+    let bus = Arc::new(EventBus::new());
+    let principal = PrincipalId::new("alice").expect("valid principal");
+    let correlation_id = "corr-live-source-1";
+    let response_topic = format!("{TOPIC_LIST_RESPONSE_PREFIX}.{correlation_id}");
+    let live_source = Uuid::new_v4();
+    assert_ne!(live_source, session_capsule_source_id_v0());
+
+    let mut req_rx = bus.subscribe_topic(TOPIC_LIST_REQUEST.to_string());
+    let bus_capsule = Arc::clone(&bus);
+    let resp_topic = response_topic.clone();
+    let cid = correlation_id.to_string();
+    let capsule = tokio::spawn(async move {
+        let event = req_rx.recv().await.expect("request arrives");
+        let reply = serde_json::json!({
+            "correlation_id": cid,
+            "sessions": [],
+            "next_cursor": null
+        });
+        let mut msg = IpcMessage::new(
+            Topic::from_raw(resp_topic.clone()),
+            IpcPayload::RawJson(reply),
+            live_source,
+        );
+        if let AstridEvent::Ipc { message, .. } = &*event
+            && let Some(principal) = &message.principal
+        {
+            msg = msg.with_principal(principal.clone());
+        }
+        bus_capsule.publish(AstridEvent::Ipc {
+            metadata: EventMetadata::new("test::live-session-source"),
+            message: msg,
+        });
+    });
+
+    let payload = build_list_payload(correlation_id, None, DEFAULT_LIMIT, false);
+    let value = request_capsule(
+        &bus,
+        TOPIC_LIST_REQUEST,
+        &response_topic,
+        payload,
+        correlation_id,
+        &principal,
+        None,
+        &[live_source],
+        CAPSULE_TIMEOUT,
+    )
+    .await
+    .expect("helper accepts the registry-provided source id");
+
+    capsule.await.expect("stand-in capsule task joins");
+    let parsed = parse_list_response(value).expect("reply deserializes");
+    assert!(parsed.sessions.is_empty());
 }
 
 #[test]
@@ -645,7 +748,7 @@ async fn request_capsule_round_trips_update_reply() {
         let mut msg = IpcMessage::new(
             Topic::from_raw(resp_topic),
             IpcPayload::RawJson(reply),
-            session_capsule_source_id(),
+            session_capsule_source_id_v0(),
         );
         if let Some(principal) = &message.principal {
             msg = msg.with_principal(principal.clone());
@@ -666,6 +769,7 @@ async fn request_capsule_round_trips_update_reply() {
         correlation_id,
         &principal,
         None,
+        &[],
         CAPSULE_TIMEOUT,
     )
     .await
@@ -700,7 +804,7 @@ async fn request_capsule_ignores_wrong_principal_reply() {
         let msg = IpcMessage::new(
             Topic::from_raw(resp_topic),
             IpcPayload::RawJson(reply),
-            session_capsule_source_id(),
+            session_capsule_source_id_v0(),
         )
         .with_principal("mallory".to_string());
         bus_bg.publish(AstridEvent::Ipc {
@@ -718,6 +822,7 @@ async fn request_capsule_ignores_wrong_principal_reply() {
         correlation_id,
         &principal,
         None,
+        &[],
         Duration::from_millis(150),
     )
     .await
@@ -747,7 +852,8 @@ async fn request_capsule_ignores_wrong_capsule_source_reply() {
             }],
             "next_cursor": null
         });
-        let wrong_source = Uuid::new_v5(&CAPSULE_ID_NAMESPACE, b"astrid-capsule-adversarial");
+        let wrong_source =
+            crate::routes::capsule_sources::capsule_source_id_v0("astrid-capsule-adversarial");
         let msg = IpcMessage::new(
             Topic::from_raw(resp_topic),
             IpcPayload::RawJson(reply),
@@ -769,6 +875,7 @@ async fn request_capsule_ignores_wrong_capsule_source_reply() {
         correlation_id,
         &principal,
         None,
+        &[],
         Duration::from_millis(150),
     )
     .await
@@ -801,7 +908,7 @@ async fn request_capsule_ignores_mismatched_correlation() {
         let msg = IpcMessage::new(
             Topic::from_raw(resp_topic),
             IpcPayload::RawJson(reply),
-            session_capsule_source_id(),
+            session_capsule_source_id_v0(),
         )
         .with_principal("alice".to_string());
         bus_bg.publish(AstridEvent::Ipc {
@@ -819,6 +926,7 @@ async fn request_capsule_ignores_mismatched_correlation() {
         correlation_id,
         &principal,
         None,
+        &[],
         // Short timeout — we expect the mismatched reply to be skipped
         // and the call to time out rather than return a foreign body.
         Duration::from_millis(150),

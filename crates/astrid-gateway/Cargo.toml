@@ -54,6 +54,7 @@ astrid-uplink = { workspace = true }
 axum = { workspace = true }
 axum-server = { workspace = true }
 base64 = { workspace = true }
+blake3 = { workspace = true }
 chrono = { workspace = true, features = ["clock"] }
 ed25519-dalek = { workspace = true }
 futures = { workspace = true }

@@ -33,6 +33,7 @@ use astrid_events::kernel_api::KernelResponse;
 /// install library.
 pub(super) async fn handle_install_capsule(
     kernel: &Arc<crate::Kernel>,
+    caller: &astrid_core::principal::PrincipalId,
     source: &str,
     workspace: bool,
 ) -> KernelResponse {
@@ -91,15 +92,17 @@ pub(super) async fn handle_install_capsule(
     let install_result = if is_archive {
         let p = path.clone();
         let h = home.clone();
+        let principal = caller.clone();
         tokio::task::spawn_blocking(move || {
-            astrid_capsule_install::unpack_and_install(&p, &h, opts)
+            astrid_capsule_install::unpack_and_install_for_principal(&p, &h, opts, &principal)
         })
         .await
     } else if path.is_dir() {
         let p = path.clone();
         let h = home.clone();
+        let principal = caller.clone();
         tokio::task::spawn_blocking(move || {
-            astrid_capsule_install::install_from_local_path(&p, &h, opts)
+            astrid_capsule_install::install_from_local_path_for_principal(&p, &h, opts, &principal)
         })
         .await
     } else {
@@ -117,7 +120,8 @@ pub(super) async fn handle_install_capsule(
 
     // Pick up the new capsule without a daemon restart. The loader
     // is idempotent on already-registered IDs.
-    kernel.load_all_capsules().await;
+    kernel.ensure_principal_loaded(caller).await;
+    kernel.publish_capsules_loaded().await;
 
     KernelResponse::Success(install_output_json(&output))
 }

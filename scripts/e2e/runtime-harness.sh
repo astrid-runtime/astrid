@@ -403,7 +403,7 @@ EOF
   run_gateway_public_surface_smoke
 
   note "checking principal and capability isolation"
-  run_cli group create ops-team --caps "capsule:install,capsule:reload,capsule:remove,invite:issue,invite:list,self:capsule:list"
+  run_cli group create ops-team --caps "capsule:install,capsule:reload,capsule:remove,invite:issue,invite:list,self:capsule:list,self:capsule:reload,self:capsule:remove"
 
   local ops_invite
   ops_invite="$("$CORE_DIR/target/debug/astrid" invite issue --group ops-team --max-uses 1 --expires-secs 600 --raw \
@@ -476,6 +476,22 @@ EOF
   json_assert_capsule_list_state "$ARTIFACTS/admin-capsules.json" astrid-capsule-cli present
   run_gateway_principal_surface_smoke agent "$user_bearer" 403
   run_gateway_principal_surface_smoke operator "$ops_bearer" 204
+  wait_for_readiness_capsules agent-post-reload "$user_bearer" \
+    astrid-capsule-registry \
+    astrid-capsule-session \
+    astrid-capsule-identity \
+    astrid-capsule-prompt-builder \
+    astrid-capsule-react \
+    astrid-capsule-openai-compat \
+    astrid-capsule-adversarial
+  wait_for_readiness_capsules operator-post-reload "$ops_bearer" \
+    astrid-capsule-registry \
+    astrid-capsule-session \
+    astrid-capsule-identity \
+    astrid-capsule-prompt-builder \
+    astrid-capsule-react \
+    astrid-capsule-openai-compat \
+    astrid-capsule-adversarial
   status="$(http_status POST /api/auth/pair-device "$user_bearer" \
     '{"expires_secs":120,"label":"regular-user phone","scope":"use-only"}' \
     "$ARTIFACTS/agent-pair-device.json")"
@@ -856,26 +872,31 @@ PY
     "$user_session" "$ops_session"
   backup_adversarial_capsule_install
   run_live_approval_cancel_smoke "$restart_user_bearer" "$user_principal"
-  restore_adversarial_capsule_install "$ops_bearer" "$restart_user_bearer"
+  restore_adversarial_capsule_install "$ops_bearer" "$restart_user_bearer" "$user_principal"
   run_live_elicit_cancel_smoke "$restart_user_bearer" "$user_principal"
 
   note "checking .capsule artifact lifecycle"
-  if run_principal_cli "$user_principal" capsule remove astrid-capsule-registry --force; then
-    fail "regular agent unexpectedly removed daemon-wide capsule"
+  if run_principal_cli "$user_principal" capsule remove astrid-capsule-cli --force; then
+    fail "regular agent unexpectedly removed default-only capsule"
   fi
   status="$(http_status GET /api/capsules "$restart_user_bearer" "" "$ARTIFACTS/artifact-lifecycle-after-denied-remove-capsules.json")"
   assert_status "artifact lifecycle list after denied remove" "$status" 200
   json_assert_capsule_list_state "$ARTIFACTS/artifact-lifecycle-after-denied-remove-capsules.json" astrid-capsule-registry present
 
   run_principal_cli "$ops_principal" capsule remove astrid-capsule-registry --force
-  status="$(http_status GET /api/capsules "$restart_user_bearer" "" \
-    "$ARTIFACTS/artifact-lifecycle-after-remove-capsules.json")"
-  assert_status "artifact lifecycle list after remove" "$status" 200
-  json_assert_capsule_list_state "$ARTIFACTS/artifact-lifecycle-after-remove-capsules.json" \
+  status="$(http_status GET /api/capsules "$ops_bearer" "" \
+    "$ARTIFACTS/artifact-lifecycle-operator-after-remove-capsules.json")"
+  assert_status "artifact lifecycle operator list after remove" "$status" 200
+  json_assert_capsule_list_state "$ARTIFACTS/artifact-lifecycle-operator-after-remove-capsules.json" \
     astrid-capsule-registry absent
-  status="$(http_status GET /api/capsules/astrid-capsule-registry "$restart_user_bearer" "" \
-    "$ARTIFACTS/artifact-lifecycle-after-remove-detail.json")"
-  assert_status "artifact lifecycle detail after remove hidden" "$status" 404
+  status="$(http_status GET /api/capsules/astrid-capsule-registry "$ops_bearer" "" \
+    "$ARTIFACTS/artifact-lifecycle-operator-after-remove-detail.json")"
+  assert_status "artifact lifecycle operator detail after remove hidden" "$status" 404
+  status="$(http_status GET /api/capsules "$restart_user_bearer" "" \
+    "$ARTIFACTS/artifact-lifecycle-agent-after-operator-remove-capsules.json")"
+  assert_status "artifact lifecycle agent list after operator remove" "$status" 200
+  json_assert_capsule_list_state "$ARTIFACTS/artifact-lifecycle-agent-after-operator-remove-capsules.json" \
+    astrid-capsule-registry present
 
   local registry_install_body
   registry_install_body="$(capsule_install_body "$registry_archive")"
@@ -886,42 +907,42 @@ PY
     "$ARTIFACTS/artifact-lifecycle-operator-install.json")"
   assert_status "operator .capsule install" "$status" 200
   json_assert_capsule_install_output "$ARTIFACTS/artifact-lifecycle-operator-install.json" install
-  status="$(http_status GET /api/capsules "$restart_user_bearer" "" \
-    "$ARTIFACTS/artifact-lifecycle-after-install-capsules.json")"
-  assert_status "artifact lifecycle list after install" "$status" 200
-  json_assert_capsule_list_state "$ARTIFACTS/artifact-lifecycle-after-install-capsules.json" \
+  status="$(http_status GET /api/capsules "$ops_bearer" "" \
+    "$ARTIFACTS/artifact-lifecycle-operator-after-install-capsules.json")"
+  assert_status "artifact lifecycle operator list after install" "$status" 200
+  json_assert_capsule_list_state "$ARTIFACTS/artifact-lifecycle-operator-after-install-capsules.json" \
     astrid-capsule-registry present
-  status="$(http_status GET /api/capsules/astrid-capsule-registry "$restart_user_bearer" "" \
-    "$ARTIFACTS/artifact-lifecycle-after-install-detail.json")"
-  assert_status "artifact lifecycle detail after install" "$status" 200
-  run_cli capsule show astrid-capsule-registry --format json \
+  status="$(http_status GET /api/capsules/astrid-capsule-registry "$ops_bearer" "" \
+    "$ARTIFACTS/artifact-lifecycle-operator-after-install-detail.json")"
+  assert_status "artifact lifecycle operator detail after install" "$status" 200
+  run_principal_cli "$ops_principal" capsule show astrid-capsule-registry --agent "$ops_principal" --format json \
     > "$ARTIFACTS/artifact-lifecycle-show.json"
   json_assert_capsule_show_archive_source "$ARTIFACTS/artifact-lifecycle-show.json" \
     astrid-capsule-registry "$registry_archive"
 
-  run_cli capsule update astrid-capsule-registry
-  run_cli capsule show astrid-capsule-registry --format json \
+  run_principal_cli "$ops_principal" capsule update astrid-capsule-registry
+  run_principal_cli "$ops_principal" capsule show astrid-capsule-registry --agent "$ops_principal" --format json \
     > "$ARTIFACTS/artifact-lifecycle-show-after-update.json"
   json_assert_capsule_show_archive_source "$ARTIFACTS/artifact-lifecycle-show-after-update.json" \
     astrid-capsule-registry "$registry_archive"
-  status="$(http_status GET /api/capsules "$restart_user_bearer" "" \
-    "$ARTIFACTS/artifact-lifecycle-after-update-capsules.json")"
-  assert_status "artifact lifecycle list after update" "$status" 200
-  json_assert_capsule_list_state "$ARTIFACTS/artifact-lifecycle-after-update-capsules.json" \
+  status="$(http_status GET /api/capsules "$ops_bearer" "" \
+    "$ARTIFACTS/artifact-lifecycle-operator-after-update-capsules.json")"
+  assert_status "artifact lifecycle operator list after update" "$status" 200
+  json_assert_capsule_list_state "$ARTIFACTS/artifact-lifecycle-operator-after-update-capsules.json" \
     astrid-capsule-registry present
 
   run_principal_cli "$ops_principal" capsule remove astrid-capsule-registry --force
-  status="$(http_status GET /api/capsules "$restart_user_bearer" "" \
-    "$ARTIFACTS/artifact-lifecycle-final-remove-capsules.json")"
-  assert_status "artifact lifecycle final live remove" "$status" 200
-  json_assert_capsule_list_state "$ARTIFACTS/artifact-lifecycle-final-remove-capsules.json" \
+  status="$(http_status GET /api/capsules "$ops_bearer" "" \
+    "$ARTIFACTS/artifact-lifecycle-operator-final-remove-capsules.json")"
+  assert_status "artifact lifecycle operator final live remove" "$status" 200
+  json_assert_capsule_list_state "$ARTIFACTS/artifact-lifecycle-operator-final-remove-capsules.json" \
     astrid-capsule-registry absent
   stop_daemon
   start_daemon "restarting daemon after .capsule artifact removal"
-  status="$(http_status GET /api/capsules "$restart_user_bearer" "" \
-    "$ARTIFACTS/artifact-lifecycle-restart-capsules.json")"
-  assert_status "artifact lifecycle removal persisted after restart" "$status" 200
-  json_assert_capsule_list_state "$ARTIFACTS/artifact-lifecycle-restart-capsules.json" \
+  status="$(http_status GET /api/capsules "$ops_bearer" "" \
+    "$ARTIFACTS/artifact-lifecycle-operator-restart-capsules.json")"
+  assert_status "artifact lifecycle operator removal persisted after restart" "$status" 200
+  json_assert_capsule_list_state "$ARTIFACTS/artifact-lifecycle-operator-restart-capsules.json" \
     astrid-capsule-registry absent
 
   note "collecting scoped audit artifacts"

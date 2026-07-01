@@ -741,14 +741,16 @@ pub(crate) fn install_from_local_path(
         skip_import_check: BATCH_MODE.load(Ordering::Relaxed),
         lifecycle_bus: None,
     };
+    let principal = crate::principal::current();
     let output = run_with_elicit(opts, |opts, bus| {
-        astrid_capsule_install::install_from_local_path(
+        astrid_capsule_install::install_from_local_path_for_principal(
             source_dir,
             home,
             InstallOptions {
                 lifecycle_bus: Some(bus),
                 ..opts
             },
+            &principal,
         )
     })?;
     finish_install(&output, home)
@@ -804,14 +806,16 @@ fn unpack_via_lib(
         skip_import_check: BATCH_MODE.load(Ordering::Relaxed),
         lifecycle_bus: None,
     };
+    let principal = crate::principal::current();
     let output = run_with_elicit(opts, |opts, bus| {
-        astrid_capsule_install::unpack_and_install(
+        astrid_capsule_install::unpack_and_install_for_principal(
             archive,
             home,
             InstallOptions {
                 lifecycle_bus: Some(bus),
                 ..opts
             },
+            &principal,
         )
     })?;
     finish_install(&output, home)

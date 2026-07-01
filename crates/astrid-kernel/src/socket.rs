@@ -224,10 +224,9 @@ pub fn readiness_path() -> PathBuf {
 /// Write the readiness sentinel file to signal that the daemon is fully
 /// initialized and accepting connections.
 ///
-/// This must be called **after** `load_all_capsules()` completes (which
-/// includes `await_capsule_readiness()`). The CLI polls for this file
-/// instead of the socket file to avoid connecting before the accept loop
-/// is running.
+/// This must be called **after** the boot-critical default capsule view has
+/// loaded and completed readiness checks. The CLI polls for this file instead
+/// of the socket file to avoid connecting before the accept loop is running.
 ///
 /// # Errors
 /// Returns an error if the file cannot be written. The caller should treat

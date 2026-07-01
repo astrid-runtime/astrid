@@ -966,7 +966,7 @@ async fn chain_lock_retained_while_another_holder_exists() {
 //
 // These tests prove the kernel-side, topic-scoped, fail-closed grant
 // filter on the user-invocable surface (`tool.v1.execute.*`,
-// `cli.v1.command.execute`), with admin (`*`) bypass and orchestration
+// `cli.v1.command.run.*`), with admin (`*`) bypass and orchestration
 // topics left ungated.
 
 mod access_enforcement {
@@ -1024,9 +1024,31 @@ mod access_enforcement {
         capsule_name: &str,
         interceptor_event: &str,
     ) -> (Arc<AtomicBool>, Arc<EventBus>, tokio::task::JoinHandle<()>) {
+        spawn_with_capsule_in_views(resolver, capsule_name, interceptor_event, &["default"])
+    }
+
+    fn spawn_with_capsule_in_views(
+        resolver: CapsuleAccessResolver,
+        capsule_name: &str,
+        interceptor_event: &str,
+        principals: &[&str],
+    ) -> (Arc<AtomicBool>, Arc<EventBus>, tokio::task::JoinHandle<()>) {
         let (capsule, invoked) = MockCapsule::new(capsule_name, interceptor_event);
         let mut registry = CapsuleRegistry::new();
-        registry.register(Box::new(capsule)).unwrap();
+        let hash =
+            crate::registry::WasmHash::synthetic(capsule_name, &capsule.manifest.package.version);
+        let first = principals.first().copied().unwrap_or("default");
+        let first_pid = PrincipalId::new(first).expect("valid principal");
+        registry
+            .register_for(Box::new(capsule), hash.clone(), &first_pid)
+            .unwrap();
+        for principal in &principals[1..] {
+            let pid = PrincipalId::new(*principal).expect("valid principal");
+            let (capsule, _) = MockCapsule::new(capsule_name, interceptor_event);
+            registry
+                .register_for(Box::new(capsule), hash.clone(), &pid)
+                .unwrap();
+        }
         let registry = Arc::new(RwLock::new(registry));
         let bus = Arc::new(EventBus::with_capacity(64));
         let dispatcher = EventDispatcher::new(Arc::clone(&registry), Arc::clone(&bus))
@@ -1043,8 +1065,12 @@ mod access_enforcement {
         // `bob` exists but is granted no capsules.
         write_profile(&home, "bob", &agent_with_capsules(&[]));
 
-        let (invoked, bus, handle) =
-            spawn_with_capsule(resolver, "secret-tool", "tool.v1.execute.do_thing");
+        let (invoked, bus, handle) = spawn_with_capsule_in_views(
+            resolver,
+            "secret-tool",
+            "tool.v1.execute.do_thing",
+            &["bob"],
+        );
         tokio::task::yield_now().await;
         publish_ipc_as(&bus, "tool.v1.execute.do_thing", "bob");
         tokio::time::sleep(Duration::from_millis(200)).await;
@@ -1062,8 +1088,12 @@ mod access_enforcement {
         let (_dir, home, resolver) = resolver_fixture();
         write_profile(&home, "alice", &agent_with_capsules(&["secret-tool"]));
 
-        let (invoked, bus, handle) =
-            spawn_with_capsule(resolver, "secret-tool", "tool.v1.execute.do_thing");
+        let (invoked, bus, handle) = spawn_with_capsule_in_views(
+            resolver,
+            "secret-tool",
+            "tool.v1.execute.do_thing",
+            &["alice"],
+        );
         tokio::task::yield_now().await;
         publish_ipc_as(&bus, "tool.v1.execute.do_thing", "alice");
         tokio::time::sleep(Duration::from_millis(200)).await;
@@ -1146,8 +1176,12 @@ mod access_enforcement {
         let (_dir, home, resolver) = resolver_fixture();
         write_profile(&home, "bob", &agent_with_capsules(&[]));
 
-        let (_invoked, bus, handle) =
-            spawn_with_capsule(resolver, "secret-tool", "tool.v1.execute.do_thing");
+        let (_invoked, bus, handle) = spawn_with_capsule_in_views(
+            resolver,
+            "secret-tool",
+            "tool.v1.execute.do_thing",
+            &["bob"],
+        );
         let mut approval = bus.subscribe_topic("astrid.v1.approval");
         tokio::task::yield_now().await;
         publish_ipc_as(&bus, "tool.v1.execute.do_thing", "bob");
@@ -1163,6 +1197,113 @@ mod access_enforcement {
         assert!(
             uuid::Uuid::parse_str(&request_id).is_ok() && !request_id.is_empty(),
             "request_id must be a non-empty UUID, got {request_id:?}"
+        );
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn out_of_view_tool_miss_emits_no_grant_required() {
+        let (_dir, home, resolver) = resolver_fixture();
+        write_profile(&home, "bob", &agent_with_capsules(&[]));
+
+        let (invoked, bus, handle) =
+            spawn_with_capsule(resolver, "secret-tool", "tool.v1.execute.do_thing");
+        let mut approval = bus.subscribe_topic("astrid.v1.approval");
+        tokio::task::yield_now().await;
+        publish_ipc_as(&bus, "tool.v1.execute.do_thing", "bob");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        assert!(
+            !invoked.load(Ordering::SeqCst),
+            "out-of-view capsule must not be dispatched"
+        );
+        assert!(
+            recv_grant_required(&mut approval).await.is_none(),
+            "out-of-view capsule must not emit GrantRequired; there is no view entry to grant"
+        );
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn describe_request_is_scoped_to_principal_view() {
+        let (_dir, home, resolver) = resolver_fixture();
+        write_profile(&home, "bob", &agent_with_capsules(&[]));
+
+        let (out_of_view, bus, handle) = spawn_with_capsule(
+            resolver.clone(),
+            "describe-tool",
+            "tool.v1.request.describe",
+        );
+        tokio::task::yield_now().await;
+        publish_ipc_as(&bus, "tool.v1.request.describe", "bob");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            !out_of_view.load(Ordering::SeqCst),
+            "describe must not fan out to capsules outside the caller's view"
+        );
+        handle.abort();
+
+        let (in_view, bus, handle) = spawn_with_capsule_in_views(
+            resolver,
+            "describe-tool",
+            "tool.v1.request.describe",
+            &["bob"],
+        );
+        tokio::task::yield_now().await;
+        publish_ipc_as(&bus, "tool.v1.request.describe", "bob");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            in_view.load(Ordering::SeqCst),
+            "describe should reach capsules in the caller's view without needing a tool grant"
+        );
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn llm_describe_request_is_scoped_to_principal_view() {
+        let (_dir, home, resolver) = resolver_fixture();
+        write_profile(&home, "bob", &agent_with_capsules(&[]));
+
+        let (out_of_view, bus, handle) =
+            spawn_with_capsule(resolver.clone(), "llm-provider", "llm.v1.request.describe");
+        tokio::task::yield_now().await;
+        publish_ipc_as(&bus, "llm.v1.request.describe", "bob");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            !out_of_view.load(Ordering::SeqCst),
+            "LLM describe must not fan out to providers outside the caller's view"
+        );
+        handle.abort();
+
+        let (in_view, bus, handle) = spawn_with_capsule_in_views(
+            resolver,
+            "llm-provider",
+            "llm.v1.request.describe",
+            &["bob"],
+        );
+        tokio::task::yield_now().await;
+        publish_ipc_as(&bus, "llm.v1.request.describe", "bob");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            in_view.load(Ordering::SeqCst),
+            "LLM describe should reach providers in the caller's view"
+        );
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn llm_describe_without_principal_fails_closed() {
+        let (_dir, _home, resolver) = resolver_fixture();
+        let (invoked, bus, handle) =
+            spawn_with_capsule(resolver, "llm-provider", "llm.v1.request.describe");
+
+        tokio::task::yield_now().await;
+        publish_ipc(&bus, "llm.v1.request.describe");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        assert!(
+            !invoked.load(Ordering::SeqCst),
+            "unprincipaled LLM discovery must not fall back to all loaded providers"
         );
         handle.abort();
     }
@@ -1259,7 +1400,7 @@ mod access_enforcement {
         write_profile(&home, "bob", &agent_with_capsules(&[]));
 
         let (invoked, bus, handle) =
-            spawn_with_capsule(resolver, "session-capsule", "session.v1.append");
+            spawn_with_capsule_in_views(resolver, "session-capsule", "session.v1.append", &["bob"]);
         tokio::task::yield_now().await;
         publish_ipc_as(&bus, "session.v1.append", "bob");
         tokio::time::sleep(Duration::from_millis(200)).await;
@@ -1271,22 +1412,26 @@ mod access_enforcement {
         handle.abort();
     }
 
-    /// (a') The CLI command-execute topic is gated like the tool surface:
+    /// (a') The CLI command-run topic is gated like the tool surface:
     /// an ungranted principal is denied.
     #[tokio::test]
-    async fn cli_command_execute_gated() {
+    async fn cli_command_run_gated() {
         let (_dir, home, resolver) = resolver_fixture();
         write_profile(&home, "bob", &agent_with_capsules(&[]));
 
-        let (invoked, bus, handle) =
-            spawn_with_capsule(resolver, "cli-capsule", "cli.v1.command.execute");
+        let (invoked, bus, handle) = spawn_with_capsule_in_views(
+            resolver,
+            "cli-capsule",
+            "cli.v1.command.run.cli-capsule",
+            &["bob"],
+        );
         tokio::task::yield_now().await;
-        publish_ipc_as(&bus, "cli.v1.command.execute", "bob");
+        publish_ipc_as(&bus, "cli.v1.command.run.cli-capsule", "bob");
         tokio::time::sleep(Duration::from_millis(200)).await;
 
         assert!(
             !invoked.load(Ordering::SeqCst),
-            "ungranted principal must be denied the CLI execute surface"
+            "ungranted principal must be denied the CLI run surface"
         );
         handle.abort();
     }
@@ -1299,17 +1444,25 @@ mod access_enforcement {
         let (_dir, home, resolver) = resolver_fixture();
         write_profile(&home, "bob", &agent_with_capsules(&[]));
 
-        // One capsule that intercepts BOTH a tool topic and an
-        // orchestration topic. Register it with the tool topic, then a
-        // second registry entry with the orchestration topic, both named
-        // the same dual-role capsule but we test via two capsules sharing
-        // the ungranted principal to isolate the topic dimension.
         let (tool_cap, tool_invoked) =
             MockCapsule::new("identity", "tool.v1.execute.save_identity");
         let (orch_cap, orch_invoked) = MockCapsule::new("identity-orch", "spark.v1.request.build");
         let mut registry = CapsuleRegistry::new();
-        registry.register(Box::new(tool_cap)).unwrap();
-        registry.register(Box::new(orch_cap)).unwrap();
+        let bob = PrincipalId::new("bob").expect("valid principal");
+        registry
+            .register_for(
+                Box::new(tool_cap),
+                crate::registry::WasmHash::synthetic("identity", "0.0.1"),
+                &bob,
+            )
+            .unwrap();
+        registry
+            .register_for(
+                Box::new(orch_cap),
+                crate::registry::WasmHash::synthetic("identity-orch", "0.0.1"),
+                &bob,
+            )
+            .unwrap();
         let registry = Arc::new(RwLock::new(registry));
         let bus = Arc::new(EventBus::with_capacity(64));
         let dispatcher = EventDispatcher::new(Arc::clone(&registry), Arc::clone(&bus))
@@ -1328,6 +1481,52 @@ mod access_enforcement {
         assert!(
             orch_invoked.load(Ordering::SeqCst),
             "ungranted principal: orchestration topic must still dispatch"
+        );
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn principal_stamped_orchestration_uses_caller_view() {
+        let (_dir, home, resolver) = resolver_fixture();
+        write_profile(&home, "bob", &agent_with_capsules(&[]));
+
+        let (default_cap, default_invoked) =
+            MockCapsule::new("default-session", "session.v1.request.list");
+        let (bob_cap, bob_invoked) = MockCapsule::new("bob-session", "session.v1.request.list");
+        let mut registry = CapsuleRegistry::new();
+        registry
+            .register_for(
+                Box::new(default_cap),
+                crate::registry::WasmHash::synthetic("default-session", "0.0.1"),
+                &PrincipalId::default(),
+            )
+            .unwrap();
+        let bob = PrincipalId::new("bob").expect("valid principal");
+        registry
+            .register_for(
+                Box::new(bob_cap),
+                crate::registry::WasmHash::synthetic("bob-session", "0.0.1"),
+                &bob,
+            )
+            .unwrap();
+
+        let registry = Arc::new(RwLock::new(registry));
+        let bus = Arc::new(EventBus::with_capacity(64));
+        let dispatcher = EventDispatcher::new(Arc::clone(&registry), Arc::clone(&bus))
+            .with_access_resolver(resolver);
+        let handle = tokio::spawn(dispatcher.run());
+        tokio::task::yield_now().await;
+
+        publish_ipc_as(&bus, "session.v1.request.list", "bob");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        assert!(
+            !default_invoked.load(Ordering::SeqCst),
+            "principal-stamped orchestration must not dispatch to the default view"
+        );
+        assert!(
+            bob_invoked.load(Ordering::SeqCst),
+            "principal-stamped orchestration should dispatch to the caller's view"
         );
         handle.abort();
     }
@@ -1369,8 +1568,12 @@ mod access_enforcement {
         let (_dir, home, resolver) = resolver_fixture();
         write_profile(&home, "bob", &agent_with_capsules(&[]));
 
-        let (invoked, bus, handle) =
-            spawn_with_capsule(resolver, "router-like", "tool.v1.execute.*.result");
+        let (invoked, bus, handle) = spawn_with_capsule_in_views(
+            resolver,
+            "router-like",
+            "tool.v1.execute.*.result",
+            &["bob"],
+        );
         tokio::task::yield_now().await;
         publish_ipc_as(&bus, "tool.v1.execute.do_thing.result", "bob");
         tokio::time::sleep(Duration::from_millis(200)).await;
@@ -1391,7 +1594,7 @@ mod access_enforcement {
         write_profile(&home, "bob", &agent_with_capsules(&[]));
 
         let (invoked, bus, handle) =
-            spawn_with_capsule(resolver, "react-like", "tool.v1.execute.result");
+            spawn_with_capsule_in_views(resolver, "react-like", "tool.v1.execute.result", &["bob"]);
         tokio::task::yield_now().await;
         publish_ipc_as(&bus, "tool.v1.execute.result", "bob");
         tokio::time::sleep(Duration::from_millis(200)).await;
@@ -1410,7 +1613,9 @@ mod access_enforcement {
     fn surface_predicate_gates_only_bare_invocation() {
         use crate::access::is_user_invocable_surface as gated;
         assert!(gated("tool.v1.execute.save_identity"));
-        assert!(gated("cli.v1.command.execute"));
+        assert!(gated("cli.v1.command.run.astrid-capsule-adversarial"));
+        assert!(!gated("cli.v1.command.run."));
+        assert!(!gated("cli.v1.command.run.nested.provider"));
         assert!(!gated("tool.v1.execute.save_identity.result"));
         assert!(!gated("tool.v1.execute.result"));
         assert!(!gated("tool.v1.execute."));

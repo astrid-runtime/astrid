@@ -39,12 +39,11 @@ impl sys::Host for HostState {
         // Per-invocation env overlay: operator-written values for the
         // invoking principal, sourced from
         // `<home>/.config/env/<capsule>.env.json`. Installed by
-        // `WasmEngine::invoke_interceptor` (and the recv-context
-        // installer) when the invoking principal differs from the
-        // capsule's load-time principal. Wins over `self.config`
-        // (manifest defaults) so the gateway's
-        // `POST /api/capsules/{id}/env/{field}` route is no longer
-        // write-only for non-default principals.
+        // `WasmEngine::invoke_interceptor` and the recv-context installer
+        // for owner and non-owner invocations. Wins over `self.config`
+        // (manifest/load-time defaults) so the gateway's
+        // `POST /api/capsules/{id}/env/{field}` route takes effect without
+        // requiring a capsule reload.
         if let Some(overlay) = self.invocation_env_overlay.as_ref()
             && let Some(value) = overlay.get(&key)
         {
@@ -217,10 +216,7 @@ impl sys::Host for HostState {
 
         let allowed = util::bounded_block_on(&rt_handle, &blocking_semaphore, async {
             let reg = registry.read().await;
-            let Some(capsule_id) = reg.find_by_uuid(&source_uuid) else {
-                return false;
-            };
-            let Some(capsule) = reg.get(capsule_id) else {
+            let Some(capsule) = reg.find_instance_by_uuid(&source_uuid) else {
                 return false;
             };
             // The full capability namespace, not just `allow_prompt_injection`:

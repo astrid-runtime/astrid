@@ -52,6 +52,7 @@ use uuid::Uuid;
 use astrid_core::PrincipalId;
 
 use crate::error::{ErrorBody, GatewayError, GatewayResult};
+use crate::routes::capsule_sources::{capsule_source_id_v0, trusted_capsule_source_ids};
 use crate::routes::principals::caller_from;
 use crate::state::GatewayState;
 
@@ -60,6 +61,8 @@ use crate::state::GatewayState;
 /// (`capsule_verb.rs`); long enough for a cold capsule, short enough that
 /// an unresponsive registry doesn't tie a request up indefinitely.
 const REGISTRY_TIMEOUT: Duration = Duration::from_secs(10);
+const CAPSULE_PROBE_INTERVAL: Duration = Duration::from_millis(100);
+const SCOPED_TOPIC_PROBE_SENTINEL: &str = "\0astrid.scoped-topic\0";
 
 /// Registry request/response topic pairs. Kept as `&'static str` so the
 /// `id` a client supplies can never reshape the topic namespace (no
@@ -70,11 +73,10 @@ const GET_ACTIVE_REQUEST: &str = "registry.v1.get_active_model";
 const GET_ACTIVE_RESPONSE: &str = "registry.v1.response.get_active_model";
 const SET_ACTIVE_REQUEST: &str = "registry.v1.set_active_model";
 const SET_ACTIVE_RESPONSE: &str = "registry.v1.response.set_active_model";
-const CAPSULE_ID_NAMESPACE: Uuid = Uuid::from_u128(0x310714d5_9c6d_4c94_8187_75258f393bb6);
 const REGISTRY_CAPSULE_ID: &str = "astrid-capsule-registry";
 
-fn registry_capsule_source_id() -> Uuid {
-    Uuid::new_v5(&CAPSULE_ID_NAMESPACE, REGISTRY_CAPSULE_ID.as_bytes())
+fn registry_capsule_source_id_v0() -> Uuid {
+    capsule_source_id_v0(REGISTRY_CAPSULE_ID)
 }
 
 /// Body for `PUT /api/models/active`.
@@ -93,7 +95,7 @@ pub struct SetActiveModelRequest {
 /// The set-model path stamps each request with a fresh per-request
 /// `corr_id` and threads it here as `expected`. The rule (the gateway side
 /// of the shared correlation contract) is deliberately permissive on the
-/// "no id" case so it cannot break legacy paths:
+/// "no id" case so it cannot break older paths:
 ///
 /// * `expected == None` — GET paths, which are not correlated. Every reply
 ///   that passed the trusted-source check is accepted; concurrent
@@ -121,7 +123,7 @@ fn reply_satisfies_corr_id(reply: &serde_json::Value, expected: Option<&str>) ->
         return true;
     };
     match reply.get("corr_id") {
-        // No `corr_id` field on the reply → accept (legacy registry / GET
+        // No `corr_id` field on the reply → accept (older registry / GET
         // reply that hasn't started echoing the id).
         None => true,
         // Present as a string → accept only an exact match; a foreign id is
@@ -203,6 +205,7 @@ async fn registry_round_trip(
     };
 
     let principal = principal_id.to_string();
+    ensure_registry_request_subscribed(state, principal_id, request_topic).await?;
 
     // Subscribe FIRST, then publish. Reverse order would race a fast
     // registry reply — the reply could land before subscribe returns and
@@ -253,6 +256,16 @@ async fn registry_round_trip(
     // `recv` is bounded by the time REMAINING, so a stream of skipped foreign
     // replies can never extend the total wait past the original budget.
     let timeout = state.registry_timeout.unwrap_or(REGISTRY_TIMEOUT);
+    let expected_source_ids = trusted_capsule_source_ids(REGISTRY_CAPSULE_ID, principal_id);
+    let expected_source_ids = if expected_source_ids.is_empty() {
+        tracing::warn!(
+            capsule_id = REGISTRY_CAPSULE_ID,
+            "falling back to v0 package-only capsule source id"
+        );
+        vec![registry_capsule_source_id_v0()]
+    } else {
+        expected_source_ids
+    };
     // `checked_add` over the bare `+` so an absurd timeout can't panic on
     // overflow; saturating to `now` (a zero remaining budget) on overflow is
     // a harmless immediate timeout that the production budget never hits.
@@ -280,7 +293,7 @@ async fn registry_round_trip(
                 "registry reply was not an IPC message"
             )));
         };
-        if message.source_id != registry_capsule_source_id() {
+        if !expected_source_ids.contains(&message.source_id) {
             continue;
         }
         // Extract the guest-facing payload. Capsule `publish_json` arrives as
@@ -294,6 +307,38 @@ async fn registry_round_trip(
             return Ok(value);
         }
     }
+}
+
+async fn ensure_registry_request_subscribed(
+    state: &GatewayState,
+    principal: &PrincipalId,
+    request_topic: &str,
+) -> GatewayResult<()> {
+    let Some(probe) = &state.topic_probe else {
+        return Ok(());
+    };
+    let key = scoped_topic_probe_key(principal, REGISTRY_CAPSULE_ID, request_topic);
+    if probe.is_subscribed(&key).await || probe.ensure_subscribed(&key).await {
+        return Ok(());
+    }
+
+    let timeout = state.registry_timeout.unwrap_or(REGISTRY_TIMEOUT);
+    let started = tokio::time::Instant::now();
+    loop {
+        if probe.is_subscribed(&key).await {
+            return Ok(());
+        }
+        if started.elapsed() >= timeout {
+            return Err(GatewayError::Internal(anyhow::anyhow!(
+                "registry capsule is not loaded for caller"
+            )));
+        }
+        tokio::time::sleep(CAPSULE_PROBE_INTERVAL).await;
+    }
+}
+
+fn scoped_topic_probe_key(principal: &PrincipalId, capsule_id: &str, topic: &str) -> String {
+    format!("{SCOPED_TOPIC_PROBE_SENTINEL}{principal}\0{capsule_id}\0{topic}")
 }
 
 /// `GET /api/models` — list the caller's available provider-entries.
@@ -429,15 +474,18 @@ pub async fn set_active_model(
 #[cfg(test)]
 mod tests {
     use super::{
-        CAPSULE_ID_NAMESPACE, GET_ACTIVE_REQUEST, GET_ACTIVE_RESPONSE, SetActiveOutcome,
+        GET_ACTIVE_REQUEST, GET_ACTIVE_RESPONSE, REGISTRY_CAPSULE_ID, SetActiveOutcome,
         classify_set_active_reply, registry_reply_payload_json, registry_round_trip,
         reply_satisfies_corr_id,
     };
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     use crate::error::GatewayError;
+    use crate::routes::capsule_sources::capsule_source_id_v0;
     use crate::state::{GatewayState, SigningMaterial};
     use astrid_core::PrincipalId;
+    use astrid_core::kernel_api::CapsuleTopicProbe;
     use astrid_events::ipc::{IpcMessage, IpcPayload, Topic};
     use astrid_events::{AstridEvent, EventBus, EventMetadata};
     use serde_json::json;
@@ -549,7 +597,7 @@ mod tests {
                 IpcPayload::RawJson(json!({
                     "active_model": { "id": "openai-compat:forged" }
                 })),
-                Uuid::new_v5(&CAPSULE_ID_NAMESPACE, b"astrid-capsule-adversarial"),
+                capsule_source_id_v0("astrid-capsule-adversarial"),
             )
             .with_principal("alice".to_string());
             bus_bg.publish(AstridEvent::Ipc {
@@ -569,6 +617,70 @@ mod tests {
         .await
         .expect_err("wrong-source registry reply must be ignored");
         assert!(matches!(err, GatewayError::Internal(_)));
+    }
+
+    #[tokio::test]
+    async fn registry_round_trip_warms_caller_registry_before_publish() {
+        let bus = Arc::new(EventBus::new());
+        let mut state = model_test_state(Arc::clone(&bus));
+        let principal = PrincipalId::new("alice").expect("valid principal");
+        let warmed = Arc::new(AtomicBool::new(false));
+
+        let warmed_probe = Arc::clone(&warmed);
+        state.topic_probe = Some(CapsuleTopicProbe::new_with_ensure(
+            |_topic| Box::pin(async { false }),
+            move |topic| {
+                assert!(topic.contains("alice"));
+                assert!(topic.contains(GET_ACTIVE_REQUEST));
+                warmed_probe.store(true, Ordering::SeqCst);
+                Box::pin(async { true })
+            },
+        ));
+
+        let mut req_rx = bus.subscribe_topic(GET_ACTIVE_REQUEST.to_string());
+        let bus_bg = Arc::clone(&bus);
+        let warmed_bg = Arc::clone(&warmed);
+        let responder = tokio::spawn(async move {
+            let event = req_rx.recv().await.expect("request arrives");
+            assert!(
+                warmed_bg.load(Ordering::SeqCst),
+                "registry request was published before caller-scoped warm-up"
+            );
+            if let AstridEvent::Ipc { message, .. } = &*event {
+                assert_eq!(message.principal.as_deref(), Some("alice"));
+            } else {
+                panic!("expected an IPC request event");
+            }
+            let msg = IpcMessage::new(
+                Topic::from_raw(GET_ACTIVE_RESPONSE),
+                IpcPayload::RawJson(json!({
+                    "active_model": { "id": "openai-compat:fake-slow" }
+                })),
+                capsule_source_id_v0(REGISTRY_CAPSULE_ID),
+            )
+            .with_principal("alice".to_string());
+            bus_bg.publish(AstridEvent::Ipc {
+                metadata: EventMetadata::new("test::registry"),
+                message: msg,
+            });
+        });
+
+        let reply = registry_round_trip(
+            &state,
+            &principal,
+            GET_ACTIVE_REQUEST,
+            GET_ACTIVE_RESPONSE,
+            json!({}),
+            None,
+        )
+        .await
+        .expect("warmed registry reply arrives");
+        responder.await.expect("responder task completes");
+
+        assert_eq!(
+            reply,
+            json!({ "active_model": { "id": "openai-compat:fake-slow" } })
+        );
     }
 
     #[test]
@@ -612,7 +724,7 @@ mod tests {
 
     #[test]
     fn set_accepts_reply_without_corr_id() {
-        // Back-compat: a reply with NO `corr_id` field (legacy registry that
+        // Back-compat: a reply with NO `corr_id` field (older registry that
         // hasn't started echoing it, or a GET reply racing onto the route) is
         // accepted even when a `corr_id` was expected.
         assert!(reply_satisfies_corr_id(

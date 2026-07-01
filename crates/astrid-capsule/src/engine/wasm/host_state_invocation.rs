@@ -68,6 +68,10 @@ impl HostState {
             return;
         }
 
+        let publisher: Option<astrid_core::PrincipalId> = msg
+            .principal
+            .as_deref()
+            .and_then(|p| astrid_core::PrincipalId::new(p).ok());
         let new_principal = msg.principal.clone();
         let existing_principal = self
             .caller_context
@@ -75,8 +79,16 @@ impl HostState {
             .and_then(|c| c.principal.clone());
         if new_principal == existing_principal {
             // Refresh the caller context so e.g. topic name / payload
-            // tracking stays current, but skip the expensive resets.
+            // tracking stays current. Also refresh the env overlay: dashboard
+            // onboarding can write config after a capsule is already loaded,
+            // and a same-principal recv loop must observe the new file on the
+            // next message without requiring a capsule reload.
             self.caller_context = Some(msg.clone());
+            let env_principal = publisher.as_ref().unwrap_or(&self.principal);
+            self.invocation_env_overlay = crate::engine::wasm::load_invocation_env_overlay(
+                env_principal,
+                self.capsule_id.as_str(),
+            );
             return;
         }
 
@@ -95,15 +107,15 @@ impl HostState {
         //     single-tenant case and only bites once an operator configures
         //     the owner principal.)
         //
-        //   • KV / log / env overrides — installed only when the publisher
-        //     DIFFERS from the load-time owner. The load-time `kv` /
-        //     `capsule_log` / `config` are already the owner's, so an
-        //     owner-published message has nothing to override and these are
-        //     cleared back to the load-time values.
-        let publisher: Option<astrid_core::PrincipalId> = msg
-            .principal
-            .as_deref()
-            .and_then(|p| astrid_core::PrincipalId::new(p).ok());
+        //   • KV / log overrides — installed only when the publisher DIFFERS
+        //     from the load-time owner. The load-time `kv` / `capsule_log`
+        //     are already the owner's, so an owner-published message clears
+        //     them back to the load-time values.
+        //
+        //   • Env overrides — refreshed for the effective publisher, owner
+        //     included. Env files can be written after capsule load via the
+        //     gateway onboarding route, so load-time `config` is only a
+        //     fallback, not the whole source of truth.
 
         // Resolve the publisher's quota profile (owner included) so
         // per-principal ceilings (background-process count, IPC throughput,
@@ -129,13 +141,17 @@ impl HostState {
             }
         });
 
-        // KV / log / env scoping overrides only kick in for a non-owner
-        // publisher; an owner-published message clears them back to the
-        // load-time (owner) values.
+        self.invocation_env_overlay = crate::engine::wasm::load_invocation_env_overlay(
+            &profile_principal,
+            self.capsule_id.as_str(),
+        );
+
+        // KV / log scoping overrides only kick in for a non-owner publisher;
+        // an owner-published message clears them back to the load-time
+        // (owner) values.
         let Some(p) = publisher.filter(|p| *p != self.principal) else {
             self.invocation_kv = None;
             self.invocation_capsule_log = None;
-            self.invocation_env_overlay = None;
             return;
         };
 
@@ -154,7 +170,5 @@ impl HostState {
 
         self.invocation_capsule_log =
             crate::engine::wasm::open_capsule_log(&p, self.capsule_id.as_str(), false);
-        self.invocation_env_overlay =
-            crate::engine::wasm::load_invocation_env_overlay(&p, self.capsule_id.as_str());
     }
 }

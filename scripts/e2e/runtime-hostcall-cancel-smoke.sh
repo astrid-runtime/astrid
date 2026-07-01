@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 
 adversarial_capsule_install_dir() {
-  printf '%s/home/default/.local/capsules/astrid-capsule-adversarial\n' "$ASTRID_HOME"
+  local principal=${1:-default}
+  printf '%s/home/%s/.local/capsules/astrid-capsule-adversarial\n' "$ASTRID_HOME" "$principal"
 }
 
 adversarial_capsule_backup_dir() {
@@ -21,6 +22,7 @@ backup_adversarial_capsule_install() {
 restore_adversarial_capsule_install() {
   local ops_bearer=$1
   local user_bearer=$2
+  local user_principal=${3:-}
   local target_dir
   local backup_dir
   local status
@@ -30,10 +32,20 @@ restore_adversarial_capsule_install() {
   rm -rf "$target_dir"
   mkdir -p "$(dirname "$target_dir")"
   cp -R "$backup_dir" "$target_dir"
+  if [[ -n "$user_principal" ]]; then
+    target_dir="$(adversarial_capsule_install_dir "$user_principal")"
+    rm -rf "$target_dir"
+    mkdir -p "$(dirname "$target_dir")"
+    cp -R "$backup_dir" "$target_dir"
+  fi
 
   status="$(http_status POST /api/sys/capsules/reload "$ops_bearer" "" \
     "$ARTIFACTS/adversarial-capsule-restore-reload.json")"
   assert_status "adversarial capsule restore reload" "$status" 204
+  if [[ -n "$user_principal" ]]; then
+    wait_for_readiness_capsules adversarial-capsule-restore "$user_bearer" \
+      astrid-capsule-adversarial
+  fi
   status="$(http_status GET /api/capsules "$user_bearer" "" \
     "$ARTIFACTS/adversarial-capsule-restore-capsules.json")"
   assert_status "adversarial capsule list after restore" "$status" 200
@@ -69,7 +81,7 @@ run_live_approval_cancel_smoke() {
     fail "approval cancel request stream did not forward adversarial approval request"
   }
 
-  run_cli capsule remove astrid-capsule-adversarial --force
+  run_principal_cli "$user_principal" capsule remove astrid-capsule-adversarial --force
   terminate_pid "$stream_pid"
 
   local cancel_rc=0
@@ -118,7 +130,7 @@ run_live_elicit_cancel_smoke() {
     fail "elicit cancel request stream did not forward adversarial elicit request"
   }
 
-  run_cli capsule remove astrid-capsule-adversarial --force
+  run_principal_cli "$user_principal" capsule remove astrid-capsule-adversarial --force
   terminate_pid "$stream_pid"
 
   local cancel_rc=0

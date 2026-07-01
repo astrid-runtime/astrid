@@ -1046,17 +1046,21 @@ impl ExecutionEngine for WasmEngine {
             wasm_config.insert(key, serde_json::Value::String(val));
         }
 
+        let wasm_hash = read_expected_wasm_hash(&self._capsule_dir)
+            .map(crate::registry::WasmHash::from_raw)
+            .unwrap_or_else(|| {
+                crate::registry::WasmHash::synthetic(
+                    &self.manifest.package.name,
+                    &self.manifest.package.version,
+                )
+            });
+
         // Capsule identity, used as the IPC `source_id` (kernel-stamped, never
         // guest-settable) and the per-(capsule, topic, principal) route key.
-        // DETERMINISTIC (uuid v5 from the capsule name) so it is STABLE across
-        // daemon restarts. A per-boot random v4 made confused-deputy allow-sets
-        // that pin a capsule's source_id — e.g. sage-mcp's `trusted_ingress_ids`
-        // — impossible to configure: the value changed every boot and was
-        // surfaced by no command, so MCP tool calls were permanently denied.
-        // Determinism does not weaken the gate: `source_id` is stamped by the
-        // kernel from the real publishing capsule, so a predictable value still
-        // cannot be forged by a guest. One instance per capsule per daemon, so
-        // the name is a unique, stable key.
+        // DETERMINISTIC (uuid v5 from principal + capsule name + content hash)
+        // so it is STABLE across daemon restarts. The principal segment is
+        // critical because the loaded runtime owns principal-bound env/KV host
+        // state even when the installed artifact hash is identical.
         //
         // Namespace is a dedicated, fixed Astrid value — NOT `Uuid::NAMESPACE_OID`
         // (reserved for ISO OIDs), so a capsule-name-derived id can never
@@ -1065,8 +1069,13 @@ impl ExecutionEngine for WasmEngine {
         // it must never change.
         const CAPSULE_ID_NAMESPACE: uuid::Uuid =
             uuid::Uuid::from_u128(0x310714d5_9c6d_4c94_8187_75258f393bb6);
-        let capsule_uuid =
-            uuid::Uuid::new_v5(&CAPSULE_ID_NAMESPACE, self.manifest.package.name.as_bytes());
+        let capsule_uuid_seed = format!(
+            "{}\0{}\0{}",
+            ctx.principal,
+            self.manifest.package.name,
+            wasm_hash.as_str()
+        );
+        let capsule_uuid = uuid::Uuid::new_v5(&CAPSULE_ID_NAMESPACE, capsule_uuid_seed.as_bytes());
 
         // Create shared concurrency controls before entering the blocking
         // plugin build. The blocking semaphore (cores-2-ish) gates host calls
@@ -1761,23 +1770,22 @@ impl ExecutionEngine for WasmEngine {
         }
         .await?;
 
-        // Register UUID-to-CapsuleId mapping so host functions can resolve
-        // IPC source UUIDs back to capsule identities for capability checks.
+        // Register UUID-to-instance mapping so host functions can resolve IPC
+        // source UUIDs back to the exact content-addressed capsule instance
+        // that published a response.
         //
         // Ordering: this runs before the kernel's `registry.register(capsule)`.
-        // During the gap, `find_by_uuid` returns `Some(id)` but `get(id)`
-        // returns `None`, causing capability checks to deny (fail-closed).
+        // During the gap, the hash may resolve before the kernel has finished
+        // registering the instance; capability checks deny (fail-closed).
         // This is safe because the capsule cannot publish IPC (and thus
         // cannot appear as a hook response `source_id`) until it is fully
         // loaded and running.
         let capsule_id = crate::capsule::CapsuleId::new(&self.manifest.package.name)
             .map_err(|e| CapsuleError::UnsupportedEntryPoint(e.to_string()))?;
-
         if let Some(registry) = &ctx.capsule_registry {
-            registry
-                .write()
-                .await
-                .register_uuid(capsule_uuid, capsule_id.clone());
+            let mut registry = registry.write().await;
+            registry.register_uuid(capsule_uuid, capsule_id.clone());
+            registry.register_instance_uuid(capsule_uuid, wasm_hash, &ctx.principal);
         }
 
         // Register topic schemas unconditionally — schema_catalog is always
@@ -2209,6 +2217,8 @@ impl ExecutionEngine for WasmEngine {
                     invoking_principal.clone(),
                 );
                 state.invocation_profile = invocation_profile.clone();
+                state.invocation_env_overlay =
+                    load_invocation_env_overlay(&invoking_principal, state.capsule_id.as_str());
 
                 let invocation_principal: Option<astrid_core::PrincipalId> = caller
                     .and_then(|msg| msg.principal.as_deref())
@@ -2236,20 +2246,6 @@ impl ExecutionEngine for WasmEngine {
                     state.invocation_tmp = bundle.tmp;
                     state.invocation_capsule_log =
                         open_capsule_log(p, state.capsule_id.as_str(), false);
-
-                    // Per-invocation env overlay: reads
-                    // `<home>/.config/env/<capsule>.env.json` so
-                    // `env::var(...)` calls inside this interceptor
-                    // see the invoking principal's operator-written
-                    // overrides instead of the load-time manifest
-                    // defaults. None on missing/malformed file — the
-                    // host falls back to `self.config` (the manifest
-                    // values loaded at capsule boot under the
-                    // load-time principal). See `host_state`'s
-                    // `invocation_env_overlay` doc + `host::sys::get_config`
-                    // for the read path.
-                    state.invocation_env_overlay =
-                        load_invocation_env_overlay(p, state.capsule_id.as_str());
 
                     // Per-invocation secret store: built against the
                     // invocation KV scope so both KV and keychain backends

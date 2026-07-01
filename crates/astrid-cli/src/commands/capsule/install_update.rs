@@ -12,7 +12,7 @@
 
 use anyhow::{Context, bail};
 use astrid_capsule_install::github_source::{parse_github_source, strip_version_prefix};
-use astrid_capsule_install::scan_installed_capsules;
+use astrid_capsule_install::scan_installed_capsules_in_home_for;
 use astrid_core::dirs::AstridHome;
 
 use super::install::install_capsule;
@@ -112,9 +112,11 @@ pub(super) async fn check_remote_version(
 /// strictly newer (semver comparison).
 pub(crate) async fn update_capsule(target: Option<&str>, workspace: bool) -> anyhow::Result<()> {
     let home = AstridHome::resolve()?;
+    let principal = crate::principal::current();
 
     if let Some(name) = target {
-        let target_dir = astrid_capsule_install::resolve_target_dir(&home, name, workspace)?;
+        let target_dir =
+            astrid_capsule_install::resolve_target_dir_for(&home, &principal, name, workspace)?;
         if !target_dir.exists() {
             bail!("Capsule '{name}' is not installed.");
         }
@@ -140,29 +142,21 @@ pub(crate) async fn update_capsule(target: Option<&str>, workspace: bool) -> any
         // capsule the release contains.
         install_capsule(&source, Some(name), workspace).await
     } else {
-        update_all_capsules(&home, workspace).await
+        update_all_capsules(&home, &principal, workspace).await
     }
 }
 
 /// Check all installed capsules for updates and install those with newer versions.
-async fn update_all_capsules(home: &AstridHome, workspace: bool) -> anyhow::Result<()> {
-    let principal = astrid_core::PrincipalId::default();
-    let capsules_dir = home.principal_home(&principal).capsules_dir();
-    if !capsules_dir.exists() {
-        eprintln!("No capsules installed.");
-        return Ok(());
-    }
-
-    let mut capsules: Vec<(String, Option<CapsuleMeta>)> = Vec::new();
-    for entry in std::fs::read_dir(&capsules_dir)? {
-        let entry = entry?;
-        if !entry.file_type()?.is_dir() {
-            continue;
-        }
-        let name = entry.file_name().to_string_lossy().to_string();
-        let meta = read_meta(&entry.path());
-        capsules.push((name, meta));
-    }
+async fn update_all_capsules(
+    home: &AstridHome,
+    principal: &astrid_core::PrincipalId,
+    workspace: bool,
+) -> anyhow::Result<()> {
+    let capsules: Vec<(String, Option<CapsuleMeta>)> =
+        scan_installed_capsules_in_home_for(home, principal)?
+            .into_iter()
+            .map(|capsule| (capsule.name, capsule.meta))
+            .collect();
 
     if capsules.is_empty() {
         eprintln!("No capsules installed.");
@@ -236,7 +230,7 @@ async fn update_all_capsules(home: &AstridHome, workspace: bool) -> anyhow::Resu
     );
 
     if updated > 0 {
-        regenerate_distro_lock(home)?;
+        regenerate_distro_lock(home, principal)?;
     }
 
     Ok(())
@@ -247,12 +241,14 @@ async fn update_all_capsules(home: &AstridHome, workspace: bool) -> anyhow::Resu
 /// Scans all installed capsules, reads their `meta.json`, and writes
 /// a new lockfile with current versions and BLAKE3 hashes. Called
 /// after `update` to keep the lock in sync.
-fn regenerate_distro_lock(home: &AstridHome) -> anyhow::Result<()> {
+fn regenerate_distro_lock(
+    home: &AstridHome,
+    principal: &astrid_core::PrincipalId,
+) -> anyhow::Result<()> {
     use crate::commands::distro::lock::{DistroLock, DistroLockMeta, LockedCapsule, write_lock};
 
-    let principal = astrid_core::PrincipalId::default();
     let lock_path = home
-        .principal_home(&principal)
+        .principal_home(principal)
         .config_dir()
         .join("distro.lock");
 
@@ -260,7 +256,7 @@ fn regenerate_distro_lock(home: &AstridHome) -> anyhow::Result<()> {
         return Ok(());
     };
 
-    let all = scan_installed_capsules()?;
+    let all = scan_installed_capsules_in_home_for(home, principal)?;
     let capsules: Vec<LockedCapsule> = all
         .iter()
         .map(|c| {

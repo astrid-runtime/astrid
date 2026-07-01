@@ -5,8 +5,9 @@ pub mod admin;
 /// disk through the same code path.
 mod install;
 
-use std::collections::{BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 use astrid_audit::{AuditAction, AuditOutcome, AuthorizationProof};
@@ -269,7 +270,7 @@ async fn handle_request(
     let res = match req {
         KernelRequest::InstallCapsule { source, workspace } => {
             info!(source = %source, workspace, "Kernel received install request");
-            install::handle_install_capsule(kernel, &source, workspace).await
+            install::handle_install_capsule(kernel, &caller, &source, workspace).await
         },
         KernelRequest::ApproveCapability {
             request_id,
@@ -280,69 +281,46 @@ async fn handle_request(
         },
         KernelRequest::ListCapsules => {
             let visibility = CapsuleVisibility::new(kernel, &caller);
-            let reg = kernel.capsules.read().await;
-            let mut list = Vec::new();
-            for c in reg.list() {
-                if visibility.allows(c) {
-                    list.push(c.to_string());
-                }
-            }
+            let list: Vec<_> = visible_inventory_manifests(kernel, &visibility)
+                .await
+                .into_iter()
+                .map(|manifest| manifest.package.name)
+                .collect();
             KernelResponse::Success(serde_json::json!(list))
         },
         KernelRequest::GetCommands => {
             let visibility = CapsuleVisibility::new(kernel, &caller);
-            let reg = kernel.capsules.read().await;
             let mut commands = Vec::new();
-            for c in reg.values() {
-                if !visibility.allows(c.id()) {
-                    continue;
-                }
-                for cmd in &c.manifest().commands {
+            let manifests = visible_inventory_manifests(kernel, &visibility).await;
+            for manifest in &manifests {
+                for cmd in &manifest.commands {
                     commands.push(astrid_events::kernel_api::CommandInfo {
                         name: cmd.name.clone(),
                         description: cmd
                             .description
                             .clone()
                             .unwrap_or_else(|| "No description".to_string()),
-                        provider_capsule: c.id().to_string(),
+                        provider_capsule: manifest.package.name.clone(),
                         kind: cmd.kind,
                     });
                 }
             }
             info!(
                 count = commands.len(),
-                capsules = reg.len(),
+                capsules = manifests.len(),
                 "GetCommands: returning {} commands from {} capsules",
                 commands.len(),
-                reg.len()
+                manifests.len()
             );
             KernelResponse::Commands(commands)
         },
         KernelRequest::ReloadCapsules => {
-            // Unregister capsules in a Failed state so they can be re-loaded
-            // with fresh configuration (e.g. after onboarding writes .env.json).
-            {
-                let reg = kernel.capsules.read().await;
-                let failed_ids: Vec<_> = reg
-                    .list()
-                    .into_iter()
-                    .filter(|id| {
-                        reg.get(id).is_some_and(|c| {
-                            matches!(c.state(), astrid_capsule::capsule::CapsuleState::Failed(_))
-                        })
-                    })
-                    .cloned()
-                    .collect();
-                drop(reg);
-
-                let mut reg = kernel.capsules.write().await;
-                for id in failed_ids {
-                    let _ = reg.unregister(&id);
-                }
-            }
-
-            kernel.load_all_capsules().await;
-            KernelResponse::Success(serde_json::json!({"status": "reloaded"}))
+            let status = if schedule_reload_capsules(Arc::clone(kernel)) {
+                "reload_started"
+            } else {
+                "reload_already_running"
+            };
+            KernelResponse::Success(serde_json::json!({ "status": status }))
         },
         KernelRequest::ReloadCapsule { id } => {
             // Hot-swap a single capsule (or add it if not yet loaded) without a
@@ -351,7 +329,7 @@ async fn handle_request(
             // validate it (CapsuleId::new rejects unsafe ids) before using it as
             // a registry key — never construct it unchecked from untrusted input.
             match astrid_capsule::capsule::CapsuleId::new(id.clone()) {
-                Ok(cap_id) => match kernel.reload_one_capsule(&cap_id).await {
+                Ok(cap_id) => match kernel.reload_one_capsule(&cap_id, &caller).await {
                     Ok(()) => KernelResponse::Success(
                         serde_json::json!({"status": "reloaded", "capsule": id}),
                     ),
@@ -370,7 +348,7 @@ async fn handle_request(
             // (CapsuleId::new rejects unsafe ids) before using it as a registry
             // key — never construct it unchecked from untrusted input.
             match astrid_capsule::capsule::CapsuleId::new(id.clone()) {
-                Ok(cap_id) => match kernel.unload_one_capsule(&cap_id).await {
+                Ok(cap_id) => match kernel.unload_one_capsule(&cap_id, &caller).await {
                     Ok(true) => KernelResponse::Success(
                         serde_json::json!({"status": "unloaded", "capsule": id}),
                     ),
@@ -403,7 +381,7 @@ async fn handle_request(
         KernelRequest::GetStatus => {
             let uptime = kernel.boot_time.elapsed().as_secs();
             let reg = kernel.capsules.read().await;
-            let loaded: Vec<String> = reg.list().iter().map(ToString::to_string).collect();
+            let loaded: Vec<String> = reg.list_any().iter().map(ToString::to_string).collect();
             let by_principal = kernel
                 .connections_by_principal()
                 .into_iter()
@@ -428,13 +406,8 @@ async fn handle_request(
         },
         KernelRequest::GetCapsuleMetadata => {
             let visibility = CapsuleVisibility::new(kernel, &caller);
-            let reg = kernel.capsules.read().await;
             let mut entries = Vec::new();
-            for capsule in reg.values() {
-                if !visibility.allows(capsule.id()) {
-                    continue;
-                }
-                let manifest = capsule.manifest();
+            for manifest in visible_inventory_manifests(kernel, &visibility).await {
                 entries.push(astrid_events::kernel_api::CapsuleMetadataEntry {
                     name: manifest.package.name.clone(),
                     interceptor_events: manifest
@@ -449,12 +422,7 @@ async fn handle_request(
         },
         KernelRequest::GetAgentReadiness => {
             let visibility = CapsuleVisibility::new(kernel, &caller);
-            let reg = kernel.capsules.read().await;
-            let manifests: Vec<&astrid_capsule::manifest::CapsuleManifest> = reg
-                .values()
-                .filter(|capsule| visibility.allows(capsule.id()))
-                .map(astrid_capsule::capsule::Capsule::manifest)
-                .collect();
+            let manifests = visible_inventory_manifests(kernel, &visibility).await;
             let readiness = astrid_capsule::readiness::agent_loop_readiness(&manifests);
             KernelResponse::AgentReadiness(readiness)
         },
@@ -463,7 +431,100 @@ async fn handle_request(
     publish_response(kernel, response_topic, res);
 }
 
+async fn inventory_manifest_map(
+    kernel: &crate::Kernel,
+    visibility: &CapsuleVisibility,
+) -> BTreeMap<String, astrid_capsule::manifest::CapsuleManifest> {
+    let paths = crate::capsule_discovery_paths_for(
+        &kernel.astrid_home,
+        &kernel.workspace_root,
+        &visibility.principal,
+    );
+    let discovered = match tokio::task::spawn_blocking(move || {
+        astrid_capsule::discovery::discover_manifests(Some(&paths))
+    })
+    .await
+    {
+        Ok(discovered) => discovered,
+        Err(err) => {
+            warn!(error = %err, "Capsule inventory discovery task failed");
+            Vec::new()
+        },
+    };
+
+    discovered
+        .into_iter()
+        .filter_map(|(manifest, _)| {
+            let id = astrid_capsule::capsule::CapsuleId::new(manifest.package.name.clone()).ok()?;
+            visibility.allows(&id).then_some((id.to_string(), manifest))
+        })
+        .collect()
+}
+
+async fn visible_inventory_manifests(
+    kernel: &crate::Kernel,
+    visibility: &CapsuleVisibility,
+) -> Vec<astrid_capsule::manifest::CapsuleManifest> {
+    let mut manifests = inventory_manifest_map(kernel, visibility).await;
+    let registry = kernel.capsules.read().await;
+    for capsule in visibility.capsules(&registry) {
+        if visibility.allows(capsule.id()) {
+            manifests
+                .entry(capsule.id().to_string())
+                .or_insert_with(|| capsule.manifest().clone());
+        }
+    }
+    manifests.into_values().collect()
+}
+
+fn schedule_reload_capsules(kernel: Arc<crate::Kernel>) -> bool {
+    if !try_start_full_reload(&kernel.full_reload_in_flight) {
+        debug!("ReloadCapsules request coalesced; full reload already in flight");
+        return false;
+    }
+    tokio::spawn(async move {
+        let _guard = FullReloadGuard(&kernel.full_reload_in_flight);
+        unregister_failed_capsules(&kernel).await;
+        kernel.load_all_capsules().await;
+    });
+    true
+}
+
+fn try_start_full_reload(in_flight: &AtomicBool) -> bool {
+    !in_flight.swap(true, Ordering::AcqRel)
+}
+
+struct FullReloadGuard<'a>(&'a AtomicBool);
+
+impl Drop for FullReloadGuard<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
+async fn unregister_failed_capsules(kernel: &crate::Kernel) {
+    let failed: Vec<_> = {
+        let reg = kernel.capsules.read().await;
+        reg.cloned_values_with_principal()
+            .into_iter()
+            .filter_map(|(principal, capsule)| {
+                matches!(
+                    capsule.state(),
+                    astrid_capsule::capsule::CapsuleState::Failed(_)
+                )
+                .then(|| (principal, capsule.id().clone()))
+            })
+            .collect()
+    };
+
+    let mut reg = kernel.capsules.write().await;
+    for (principal, id) in failed {
+        let _ = reg.unregister_for(&principal, &id);
+    }
+}
+
 struct CapsuleVisibility {
+    principal: PrincipalId,
     is_admin: bool,
     capsule_grants: BTreeSet<String>,
 }
@@ -488,6 +549,7 @@ impl CapsuleVisibility {
         };
         let Some(profile) = profile else {
             return Self {
+                principal: caller.clone(),
                 is_admin: false,
                 capsule_grants: BTreeSet::new(),
             };
@@ -497,6 +559,7 @@ impl CapsuleVisibility {
         let check = CapabilityCheck::new(profile.as_ref(), groups.as_ref(), caller.clone());
 
         Self {
+            principal: caller.clone(),
             is_admin: check.has("*") || check.has("capsule:list"),
             capsule_grants: profile.capsules.iter().cloned().collect(),
         }
@@ -504,6 +567,17 @@ impl CapsuleVisibility {
 
     fn allows(&self, capsule_id: &astrid_capsule::capsule::CapsuleId) -> bool {
         self.is_admin || self.capsule_grants.contains(capsule_id.as_str())
+    }
+
+    fn capsules(
+        &self,
+        registry: &astrid_capsule::registry::CapsuleRegistry,
+    ) -> Vec<Arc<dyn astrid_capsule::capsule::Capsule>> {
+        if self.is_admin {
+            registry.cloned_values()
+        } else {
+            registry.cloned_values_for(&self.principal)
+        }
     }
 }
 
@@ -593,10 +667,8 @@ fn rate_limit_max(req: &KernelRequest) -> Option<u32> {
 /// The authority surface a given [`KernelRequest`] operates over.
 ///
 /// Most `KernelRequest` variants carry no target-principal field, so
-/// [`resolve_scope`] treats read-only inventory/status requests as
-/// [`AuthorityScope::Self_`]. Capsule lifecycle mutations that operate on the
-/// daemon's loaded capsule set are global until a request carries a real
-/// caller-workspace target.
+/// [`resolve_scope`] treats caller-scoped requests as [`AuthorityScope::Self_`].
+/// Full-daemon mutations stay global.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AuthorityScope {
     /// Request operates on the caller's own principal.
@@ -616,8 +688,6 @@ pub enum AuthorityScope {
 pub fn resolve_scope(req: &KernelRequest, _caller: &PrincipalId) -> AuthorityScope {
     match req {
         KernelRequest::ReloadCapsules
-        | KernelRequest::ReloadCapsule { .. }
-        | KernelRequest::UnloadCapsule { .. }
         | KernelRequest::InstallCapsule {
             workspace: false, ..
         } => AuthorityScope::Global,

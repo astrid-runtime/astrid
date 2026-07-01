@@ -151,8 +151,10 @@ jobs:
         run: |
           set -o pipefail
 
+          set +e
           cargo test --workspace --locked -- --test-threads=1
           status=$?
+          set -e
 
           if [[ $status -ne 0 ]]; then
             echo "::group::macOS failure diagnostics"
@@ -320,7 +322,7 @@ jobs:
         if: steps.api-inputs.outputs.run == 'true'
         uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # nightly
         with:
-          toolchain: nightly
+          toolchain: nightly-2026-06-29
 
       - name: Cache Rust artifacts
         if: steps.api-inputs.outputs.run == 'true'
@@ -358,7 +360,7 @@ jobs:
 
           for package in $packages; do
             echo "::group::cargo public-api $package"
-            cargo public-api \
+            cargo +nightly-2026-06-29 public-api \
               --package "$package" \
               --all-features \
               -ss \

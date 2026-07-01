@@ -86,8 +86,17 @@ run_empty_model_catalog_smoke() {
     '{"value":"fake-empty-fallback"}' \
     "$ARTIFACTS/empty-model-fallback-write.json")"
   assert_status "empty-model env fallback write" "$status" 204
-
-  status="$(http_status GET /api/models "$bearer" "" "$ARTIFACTS/empty-model-catalog-models.json")"
+  local deadline=$((SECONDS + 45))
+  until status="$(http_status GET /api/models "$bearer" "" "$ARTIFACTS/empty-model-catalog-models.json")" \
+    && [[ "$status" == "200" ]] \
+    && json_assert_model_list_contains "$ARTIFACTS/empty-model-catalog-models.json" \
+      "openai-compat:fake-empty-fallback"; do
+    if (( SECONDS >= deadline )); then
+      cat "$ARTIFACTS/empty-model-catalog-models.json" >&2 2>/dev/null || true
+      fail "empty-model catalog did not discover fallback model"
+    fi
+    sleep 1
+  done
   assert_status "empty-model catalog fallback model list" "$status" 200
   json_assert_model_list_contains "$ARTIFACTS/empty-model-catalog-models.json" \
     "openai-compat:fake-empty-fallback"

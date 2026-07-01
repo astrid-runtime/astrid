@@ -12,7 +12,9 @@ use std::path::Path;
 use anyhow::{Context, bail};
 use astrid_core::dirs::AstridHome;
 
-use crate::local::{InstallOptions, InstallOutput, install_from_local_path};
+use astrid_core::PrincipalId;
+
+use crate::local::{InstallOptions, InstallOutput, install_from_local_path_for_principal};
 
 /// Unpack `archive_path` (a gzipped tar) into a tempdir, then install
 /// from there.
@@ -28,6 +30,21 @@ pub fn unpack_and_install(
     archive_path: &Path,
     home: &AstridHome,
     options: InstallOptions,
+) -> anyhow::Result<InstallOutput> {
+    unpack_and_install_for_principal(
+        archive_path,
+        home,
+        options,
+        &crate::paths::install_principal(),
+    )
+}
+
+/// Unpack and install a `.capsule` archive for an explicit principal.
+pub fn unpack_and_install_for_principal(
+    archive_path: &Path,
+    home: &AstridHome,
+    options: InstallOptions,
+    target_principal: &PrincipalId,
 ) -> anyhow::Result<InstallOutput> {
     let tmp_dir = tempfile::tempdir().context("failed to create temp dir for unpacking")?;
     let unpack_dir = tmp_dir.path();
@@ -73,5 +90,5 @@ pub fn unpack_and_install(
             .with_context(|| format!("Failed to unpack file: {}", out_path.display()))?;
     }
 
-    install_from_local_path(unpack_dir, home, options)
+    install_from_local_path_for_principal(unpack_dir, home, options, target_principal)
 }

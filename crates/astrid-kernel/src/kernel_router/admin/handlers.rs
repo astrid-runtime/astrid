@@ -504,10 +504,18 @@ async fn agent_modify_from_req(
     if let Err(e) = profile.validate() {
         return err_bad_input(format!("profile rejected: {e}"));
     }
+    if capsules_changed
+        && let Err(e) = materialize_added_capsule_installs(kernel, &principal, &add_capsules)
+    {
+        return err_bad_input(e);
+    }
     if let Err(e) = profile.save_to_path(&path) {
         return err_profile(&principal, &e);
     }
     kernel.profile_cache.invalidate(&principal);
+    if capsules_changed {
+        warm_principal_capsules(kernel, principal.clone());
+    }
 
     info!(
         %principal,
@@ -520,6 +528,51 @@ async fn agent_modify_from_req(
         "Layer 6 agent.modify"
     );
     modify_response(&principal, &profile, true)
+}
+
+fn warm_principal_capsules(kernel: &Arc<crate::Kernel>, principal: PrincipalId) {
+    let kernel = Arc::clone(kernel);
+    tokio::spawn(async move {
+        kernel.ensure_principal_loaded(&principal).await;
+        kernel.publish_capsules_loaded().await;
+    });
+}
+
+fn materialize_added_capsule_installs(
+    kernel: &crate::Kernel,
+    principal: &PrincipalId,
+    add_capsules: &[String],
+) -> Result<(), String> {
+    let default = PrincipalId::default();
+    let default_capsules = kernel.astrid_home.principal_home(&default).capsules_dir();
+    let target_capsules = kernel.astrid_home.principal_home(principal).capsules_dir();
+
+    for capsule in add_capsules {
+        let source = default_capsules.join(capsule);
+        let target = target_capsules.join(capsule);
+        if target.exists() {
+            continue;
+        }
+        if !source.exists() {
+            continue;
+        }
+        if let Some(parent) = target.parent()
+            && let Err(e) = std::fs::create_dir_all(parent)
+        {
+            return Err(format!("create capsule install parent: {e}"));
+        }
+        astrid_capsule_install::copy_capsule_dir(&source, &target)
+            .map_err(|e| format!("materialize capsule '{capsule}' for {principal}: {e:#}"))?;
+        let target_env = target.join(".env.json");
+        if target_env.exists()
+            && let Err(e) = std::fs::remove_file(&target_env)
+        {
+            return Err(format!(
+                "remove copied capsule env for '{capsule}' under {principal}: {e}"
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Build the `agent.modify` success body reporting the principal's

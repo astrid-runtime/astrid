@@ -6,9 +6,11 @@ use super::*;
 use astrid_capsule::capsule::{Capsule, CapsuleId, CapsuleState};
 use astrid_capsule::context::CapsuleContext;
 use astrid_capsule::error::CapsuleResult;
-use astrid_capsule::manifest::{CapsuleManifest, CommandDef, PackageDef};
+use astrid_capsule::manifest::{CapsuleManifest, CommandDef, PackageDef, SubscribeDef};
+use astrid_capsule::registry::WasmHash;
 use astrid_core::kernel_api::CommandKind;
 use astrid_core::profile::PrincipalProfile;
+use std::sync::atomic::AtomicBool;
 
 struct InventoryCapsule {
     id: CapsuleId,
@@ -48,6 +50,23 @@ impl InventoryCapsule {
                 ..Default::default()
             },
         }
+    }
+
+    fn with_subscribe(mut self, topic: &str) -> Self {
+        self.manifest.subscribes.insert(
+            topic.to_string(),
+            SubscribeDef {
+                wit: "opaque".to_string(),
+                version: None,
+                tag: None,
+                rev: None,
+                branch: None,
+                path: None,
+                handler: Some("handle".to_string()),
+                priority: None,
+            },
+        );
+        self
     }
 }
 
@@ -125,6 +144,23 @@ fn rate_limiter_independent_buckets() {
 
     // InstallCapsule should still be allowed
     assert!(limiter.check("InstallCapsule", 10));
+}
+
+#[test]
+fn full_reload_guard_coalesces_until_finished() {
+    let in_flight = AtomicBool::new(false);
+
+    assert!(try_start_full_reload(&in_flight));
+    assert!(
+        !try_start_full_reload(&in_flight),
+        "second full reload should be coalesced while first is in flight"
+    );
+
+    drop(FullReloadGuard(&in_flight));
+    assert!(
+        try_start_full_reload(&in_flight),
+        "new full reload may start after the previous reload finishes"
+    );
 }
 
 #[test]
@@ -338,8 +374,6 @@ fn resolve_scope_defaults_to_self_except_daemon_capsule_lifecycle() {
         if matches!(
             req,
             KernelRequest::ReloadCapsules
-                | KernelRequest::ReloadCapsule { .. }
-                | KernelRequest::UnloadCapsule { .. }
                 | KernelRequest::InstallCapsule {
                     workspace: false,
                     ..
@@ -360,12 +394,6 @@ fn resolve_scope_treats_daemon_capsule_lifecycle_as_global() {
     let caller = PrincipalId::new("alice").unwrap();
     for req in [
         KernelRequest::ReloadCapsules,
-        KernelRequest::ReloadCapsule {
-            id: "demo".to_string(),
-        },
-        KernelRequest::UnloadCapsule {
-            id: "demo".to_string(),
-        },
         KernelRequest::InstallCapsule {
             source: "/tmp/demo.capsule".to_string(),
             workspace: false,
@@ -374,7 +402,26 @@ fn resolve_scope_treats_daemon_capsule_lifecycle_as_global() {
         assert_eq!(
             resolve_scope(&req, &caller),
             AuthorityScope::Global,
-            "daemon capsule lifecycle should be global for {req:?}"
+            "full-daemon lifecycle should be global for {req:?}"
+        );
+    }
+}
+
+#[test]
+fn resolve_scope_treats_single_capsule_reload_and_unload_as_self() {
+    let caller = PrincipalId::new("alice").unwrap();
+    for req in [
+        KernelRequest::ReloadCapsule {
+            id: "demo".to_string(),
+        },
+        KernelRequest::UnloadCapsule {
+            id: "demo".to_string(),
+        },
+    ] {
+        assert_eq!(
+            resolve_scope(&req, &caller),
+            AuthorityScope::Self_,
+            "single-capsule lifecycle should target caller view for {req:?}"
         );
     }
 }
@@ -511,7 +558,7 @@ async fn capsule_inventory_requests_are_filtered_to_callers_grants() {
     let (_dir, kernel) = kernel_with_inventory_capsules().await;
 
     let caller = PrincipalId::new("alice").expect("valid principal");
-    seed_capsule_inventory_profile(&kernel, &caller, &["allowed"]);
+    seed_capsule_inventory_profile(&kernel, &caller, &["allowed"]).await;
     assert_capsule_inventory_surface(
         &kernel,
         &caller,
@@ -525,10 +572,47 @@ async fn capsule_inventory_requests_are_filtered_to_callers_grants() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn list_capsules_uses_materialized_inventory_without_runtime_load() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let home = astrid_core::dirs::AstridHome::from_path(dir.path());
+    let kernel = crate::test_kernel_with_home(home).await;
+    drop(spawn_kernel_router(Arc::clone(&kernel)));
+
+    let caller = PrincipalId::new("alice").expect("valid principal");
+    seed_profile(
+        &kernel,
+        &caller,
+        &PrincipalProfile {
+            grants: vec!["self:capsule:list".to_string()],
+            capsules: vec!["installed-only".to_string()],
+            ..Default::default()
+        },
+    );
+    write_inventory_manifest(&kernel, &caller, "installed-only", "installed-only-cmd");
+
+    let response = request_kernel(
+        &kernel,
+        &caller,
+        "materialized_inventory_list_capsules",
+        KernelRequest::ListCapsules,
+    )
+    .await;
+    let KernelResponse::Success(value) = response else {
+        panic!("expected materialized inventory list success, got {response:?}");
+    };
+    let capsules: Vec<String> = serde_json::from_value(value).expect("capsule list shape");
+    assert_eq!(capsules, ["installed-only"]);
+    assert!(
+        kernel.capsules.read().await.list_for(&caller).is_empty(),
+        "listing materialized inventory must not synchronously load capsule runtimes"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn ungranted_capsule_inventory_requests_do_not_inherit_default_surface() {
     let (_dir, kernel) = kernel_with_inventory_capsules().await;
     let ungranted = PrincipalId::new("bob").expect("valid principal");
-    seed_capsule_inventory_profile(&kernel, &ungranted, &[]);
+    seed_capsule_inventory_profile(&kernel, &ungranted, &[]).await;
     assert_capsule_inventory_surface(&kernel, &ungranted, "ungranted", &[], &[], &[], &[]).await;
 }
 
@@ -600,7 +684,7 @@ async fn kernel_with_inventory_capsules() -> (tempfile::TempDir, Arc<crate::Kern
     (dir, kernel)
 }
 
-fn seed_capsule_inventory_profile(
+async fn seed_capsule_inventory_profile(
     kernel: &Arc<crate::Kernel>,
     principal: &PrincipalId,
     capsules: &[&str],
@@ -614,12 +698,58 @@ fn seed_capsule_inventory_profile(
         ..Default::default()
     };
     seed_profile(kernel, principal, &profile);
+    let mut reg = kernel.capsules.write().await;
+    for capsule in capsules {
+        let id = CapsuleId::new(*capsule).expect("valid capsule id");
+        let hash = astrid_capsule::registry::WasmHash::synthetic(capsule, "0.0.1");
+        if reg.get_for(principal, &id).is_none() {
+            reg.register_for(
+                Box::new(InventoryCapsule::new(capsule, &format!("{capsule}-cmd"))),
+                hash,
+                principal,
+            )
+            .expect("seed capsule view");
+        }
+    }
 }
 
 fn seed_profile(kernel: &Arc<crate::Kernel>, principal: &PrincipalId, profile: &PrincipalProfile) {
     let path = PrincipalProfile::path_for(&kernel.astrid_home, principal);
     profile.save_to_path(&path).expect("seed profile");
     kernel.profile_cache.invalidate(principal);
+}
+
+fn write_inventory_manifest(
+    kernel: &Arc<crate::Kernel>,
+    principal: &PrincipalId,
+    capsule: &str,
+    command: &str,
+) {
+    let dir = kernel
+        .astrid_home
+        .principal_home(principal)
+        .capsules_dir()
+        .join(capsule);
+    std::fs::create_dir_all(&dir).expect("create capsule dir");
+    std::fs::write(
+        dir.join("Capsule.toml"),
+        format!(
+            r#"[package]
+name = "{capsule}"
+version = "0.0.1"
+
+[[component]]
+id = "main"
+file = "{capsule}.wasm"
+
+[[command]]
+name = "{command}"
+kind = "cli"
+description = "{capsule} command"
+"#
+        ),
+    )
+    .expect("write capsule manifest");
 }
 
 async fn assert_capsule_inventory_surface(
@@ -758,5 +888,52 @@ async fn capsule_topic_probe_reflects_loaded_registry_without_capability() {
     assert!(
         !probe.is_subscribed("session.v1.request.list").await,
         "empty registry must have no subscriber for the session list verb"
+    );
+}
+
+#[tokio::test]
+async fn capsule_topic_probe_can_target_exact_capsule_in_principal_view() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let home = astrid_core::dirs::AstridHome::from_path(dir.path());
+    let kernel = crate::test_kernel_with_home(home).await;
+    let principal = PrincipalId::new("regular-user").expect("valid principal");
+    let topic = "session.v1.request.list";
+
+    {
+        let mut registry = kernel.capsules.write().await;
+        let hostile = InventoryCapsule::new("astrid-capsule-adversarial", "adversarial")
+            .with_subscribe(topic);
+        registry
+            .register_for(
+                Box::new(hostile),
+                WasmHash::synthetic("astrid-capsule-adversarial", "0.0.1"),
+                &principal,
+            )
+            .expect("register hostile fixture");
+    }
+
+    let probe = kernel.capsule_topic_probe();
+    let hostile_key = format!(
+        "{}{}\0{}\0{}",
+        crate::SCOPED_TOPIC_PROBE_SENTINEL,
+        principal,
+        "astrid-capsule-adversarial",
+        topic
+    );
+    let session_key = format!(
+        "{}{}\0{}\0{}",
+        crate::SCOPED_TOPIC_PROBE_SENTINEL,
+        principal,
+        "astrid-capsule-session",
+        topic
+    );
+
+    assert!(
+        probe.is_subscribed(&hostile_key).await,
+        "exact hostile capsule probe should see the hostile subscriber"
+    );
+    assert!(
+        !probe.is_subscribed(&session_key).await,
+        "session readiness must not be satisfied by a different capsule with the same topic"
     );
 }

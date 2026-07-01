@@ -1,11 +1,10 @@
 use super::{
-    AstridEvent, CAPSULE_ID_NAMESPACE, Duration, EventBus, EventMetadata, GatewayError,
-    GatewayResult, IpcMessage, IpcPayload, MessageOrigin, PrincipalId, SESSION_CAPSULE_ID, Topic,
-    Uuid, Value,
+    AstridEvent, Duration, EventBus, EventMetadata, GatewayError, GatewayResult, IpcMessage,
+    IpcPayload, MessageOrigin, PrincipalId, SESSION_CAPSULE_ID, Topic, Uuid, Value,
 };
 
-pub(super) fn session_capsule_source_id() -> Uuid {
-    Uuid::new_v5(&CAPSULE_ID_NAMESPACE, SESSION_CAPSULE_ID.as_bytes())
+pub(super) fn session_capsule_source_id_v0() -> Uuid {
+    crate::routes::capsule_sources::capsule_source_id_v0(SESSION_CAPSULE_ID)
 }
 
 /// Reusable capsule request/reply-over-bus primitive.
@@ -28,6 +27,7 @@ pub(super) async fn request_capsule(
     correlation_id: &str,
     principal: &PrincipalId,
     device_key_id: Option<&str>,
+    expected_source_ids: &[Uuid],
     timeout: Duration,
 ) -> GatewayResult<Value> {
     // Subscribe before publish so a fast capsule cannot race the waiter.
@@ -58,7 +58,15 @@ pub(super) async fn request_capsule(
     let deadline = tokio::time::Instant::now()
         .checked_add(timeout)
         .unwrap_or_else(tokio::time::Instant::now);
-    let expected_source_id = session_capsule_source_id();
+    let expected_source_ids = if expected_source_ids.is_empty() {
+        tracing::warn!(
+            capsule_id = SESSION_CAPSULE_ID,
+            "falling back to v0 package-only capsule source id"
+        );
+        vec![session_capsule_source_id_v0()]
+    } else {
+        expected_source_ids.to_vec()
+    };
 
     loop {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
@@ -73,7 +81,7 @@ pub(super) async fn request_capsule(
         let AstridEvent::Ipc { message, .. } = &*event else {
             continue;
         };
-        if message.source_id != expected_source_id {
+        if !expected_source_ids.contains(&message.source_id) {
             continue;
         }
         let Ok(value) = session_reply_payload_json(&message.payload) else {

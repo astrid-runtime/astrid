@@ -8,6 +8,7 @@
 use std::collections::HashSet;
 
 use anyhow::{Context, bail};
+use astrid_core::PrincipalId;
 use astrid_core::dirs::AstridHome;
 
 use super::meta::CapsuleMeta;
@@ -25,7 +26,8 @@ pub(crate) fn remove_capsule(
     purge: bool,
 ) -> anyhow::Result<()> {
     let home = AstridHome::resolve()?;
-    remove_capsule_from_home(&home, name, workspace, force, purge)
+    let principal = crate::principal::current();
+    remove_capsule_from_home_for(&home, &principal, name, workspace, force, purge)
 }
 
 fn remove_capsule_from_home(
@@ -35,7 +37,20 @@ fn remove_capsule_from_home(
     force: bool,
     purge: bool,
 ) -> anyhow::Result<()> {
-    let target_dir = super::install::resolve_target_dir(home, name, workspace)?;
+    let principal = astrid_capsule_install::paths::install_principal();
+    remove_capsule_from_home_for(home, &principal, name, workspace, force, purge)
+}
+
+fn remove_capsule_from_home_for(
+    home: &AstridHome,
+    principal: &PrincipalId,
+    name: &str,
+    workspace: bool,
+    force: bool,
+    purge: bool,
+) -> anyhow::Result<()> {
+    let target_dir =
+        astrid_capsule_install::resolve_target_dir_for(home, principal, name, workspace)?;
 
     // Content-addressed artifacts in bin/ and wit/ are NEVER deleted.
     // They are the audit trail — the BLAKE3 hash in audit entries must always
@@ -49,9 +64,8 @@ fn remove_capsule_from_home(
     // Only delete user configuration (API keys, env vars) with --purge.
     // By default, env.json is preserved so reinstall skips prompting.
     if purge {
-        let principal = astrid_core::PrincipalId::default();
         let env_path = home
-            .principal_home(&principal)
+            .principal_home(principal)
             .env_dir()
             .join(format!("{name}.env.json"));
         if env_path.exists() {
@@ -81,7 +95,8 @@ pub(crate) fn validate_capsule_removal(
     force: bool,
 ) -> anyhow::Result<()> {
     let home = AstridHome::resolve()?;
-    validate_capsule_removal_from_home(&home, name, workspace, force)
+    let principal = crate::principal::current();
+    validate_capsule_removal_from_home_for(&home, &principal, name, workspace, force)
 }
 
 fn validate_capsule_removal_from_home(
@@ -90,7 +105,19 @@ fn validate_capsule_removal_from_home(
     workspace: bool,
     force: bool,
 ) -> anyhow::Result<()> {
-    let target_dir = super::install::resolve_target_dir(home, name, workspace)?;
+    let principal = astrid_capsule_install::paths::install_principal();
+    validate_capsule_removal_from_home_for(home, &principal, name, workspace, force)
+}
+
+fn validate_capsule_removal_from_home_for(
+    home: &AstridHome,
+    principal: &PrincipalId,
+    name: &str,
+    workspace: bool,
+    force: bool,
+) -> anyhow::Result<()> {
+    let target_dir =
+        astrid_capsule_install::resolve_target_dir_for(home, principal, name, workspace)?;
 
     if !target_dir.exists() {
         bail!("Capsule '{name}' is not installed.");
@@ -99,7 +126,7 @@ fn validate_capsule_removal_from_home(
     let target_meta = super::meta::read_meta(&target_dir);
 
     // Scan once, reuse for both dependency check and binary cleanup
-    let all_capsules = super::meta::scan_installed_capsules_in_home(home)?;
+    let all_capsules = super::meta::scan_installed_capsules_in_home_for(home, principal)?;
 
     // Dependency safety check (skip with --force)
     if !force && let Some(block) = check_removal_safety(name, target_meta.as_ref(), &all_capsules) {
@@ -356,6 +383,29 @@ mod tests {
 
         remove_capsule_from_home(&home, "remove-test", false, true, false).unwrap();
         assert!(!target.exists());
+    }
+
+    #[test]
+    fn remove_capsule_from_home_for_targets_principal_install() {
+        let home_dir = tempfile::tempdir().unwrap();
+        let home = AstridHome::from_path(home_dir.path());
+        let default = astrid_capsule_install::paths::install_principal();
+        let user = PrincipalId::new("regular-user").unwrap();
+        let default_target =
+            astrid_capsule_install::resolve_target_dir_for(&home, &default, "shared", false)
+                .unwrap();
+        let user_target =
+            astrid_capsule_install::resolve_target_dir_for(&home, &user, "shared", false).unwrap();
+
+        std::fs::create_dir_all(&default_target).unwrap();
+        std::fs::create_dir_all(&user_target).unwrap();
+
+        remove_capsule_from_home_for(&home, &user, "shared", false, true, false).unwrap();
+        assert!(
+            default_target.exists(),
+            "default install must not be removed by a principal-scoped remove"
+        );
+        assert!(!user_target.exists(), "principal install should be removed");
     }
 
     #[test]

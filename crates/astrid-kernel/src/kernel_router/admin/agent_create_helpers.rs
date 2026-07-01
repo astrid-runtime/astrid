@@ -123,6 +123,20 @@ pub(super) async fn provision_new_principal(
         ));
     }
 
+    if let Some(source) = clone_from.as_ref()
+        && let Err(e) =
+            materialize_cloned_capsule_installs(kernel, source, &principal, &profile.capsules)
+    {
+        let _ = kernel
+            .identity_store
+            .unlink(AGENT_IDENTITY_PLATFORM, principal.as_str())
+            .await;
+        let _ = kernel.identity_store.delete_user(user.id).await;
+        let _ = std::fs::remove_file(&profile_path);
+        let _ = std::fs::remove_dir_all(kernel.astrid_home.principal_home(&principal).root());
+        return err_internal(format!("capsule install clone failed (rolled back): {e}"));
+    }
+
     // State inheritance is OPT-IN. By default the new principal inherits
     // NOTHING — least privilege, and no silent leak of `default`'s env
     // JSON, KV namespaces, or (critically) secret files / API keys into
@@ -139,11 +153,67 @@ pub(super) async fn provision_new_principal(
         super::inheritance::inherit_from_principal(kernel, source, &principal).await;
     }
 
+    warm_created_principal(kernel, principal.clone());
+
     info!(%principal, user_id = %user.id, "Layer 6 agent.create");
     success_json(serde_json::json!({
         "principal": principal.as_str(),
         "astrid_user_id": user.id,
     }))
+}
+
+fn warm_created_principal(kernel: &Arc<crate::Kernel>, principal: PrincipalId) {
+    let kernel = Arc::clone(kernel);
+    tokio::spawn(async move {
+        kernel.ensure_principal_loaded(&principal).await;
+        kernel.publish_capsules_loaded().await;
+    });
+}
+
+fn materialize_cloned_capsule_installs(
+    kernel: &crate::Kernel,
+    source: &PrincipalId,
+    target: &PrincipalId,
+    capsules: &[String],
+) -> Result<(), String> {
+    let source_capsules = kernel.astrid_home.principal_home(source).capsules_dir();
+    let target_capsules = kernel.astrid_home.principal_home(target).capsules_dir();
+
+    for capsule in capsules {
+        let source = source_capsules.join(capsule);
+        let target = target_capsules.join(capsule);
+        if target.exists() {
+            continue;
+        }
+        if !source.exists() {
+            return Err(format!(
+                "source capsule install '{}' is missing at {}",
+                capsule,
+                source.display()
+            ));
+        }
+        if let Some(parent) = target.parent()
+            && let Err(e) = std::fs::create_dir_all(parent)
+        {
+            return Err(format!("create capsule install parent: {e}"));
+        }
+        astrid_capsule_install::copy_capsule_dir(&source, &target).map_err(|e| {
+            format!(
+                "materialize capsule '{capsule}' for {}: {e:#}",
+                target.display()
+            )
+        })?;
+        let target_env = target.join(".env.json");
+        if target_env.exists()
+            && let Err(e) = std::fs::remove_file(&target_env)
+        {
+            return Err(format!(
+                "remove copied capsule env for '{capsule}' under {}: {e}",
+                target.display()
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Build the [`PrincipalProfile`] for a new agent.

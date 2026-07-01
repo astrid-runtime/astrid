@@ -200,6 +200,40 @@ assert_events_ready() {
   grep -q '^event: ready' "$out" || fail "$label events stream missed ready event"
 }
 
+wait_for_readiness_capsules() {
+  local label=$1 bearer=$2
+  shift 2
+  local out="$ARTIFACTS/$label-readiness-wait.json"
+  local status curl_status deadline
+  deadline=$((SECONDS + 90))
+  while (( SECONDS < deadline )); do
+    set +e
+    status="$(curl --connect-timeout 2 --max-time 5 -sS \
+      -o "$out" \
+      -w "%{http_code}" \
+      -H "Authorization: Bearer $bearer" \
+      "$GATEWAY/api/sys/readiness")"
+    curl_status=$?
+    set -e
+    if [[ "$curl_status" -eq 0 && "$status" == "200" ]] \
+      && "$PYTHON" - "$out" "$@" <<'PY'
+import json
+import sys
+
+data = json.load(open(sys.argv[1], encoding="utf-8"))
+loaded = set(data.get("loaded_capsules", []))
+missing = [capsule for capsule in sys.argv[2:] if capsule not in loaded]
+if missing:
+    raise SystemExit(1)
+PY
+    then
+      return 0
+    fi
+    sleep 1
+  done
+  fail "$label readiness did not include expected capsules: $*"
+}
+
 json_assert_metrics_contract() {
   local metrics=$1
   shift

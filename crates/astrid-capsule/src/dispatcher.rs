@@ -36,9 +36,12 @@ use tracing::{debug, warn};
 
 use crate::access::CapsuleAccessResolver;
 use crate::capsule::{Capsule, CapsuleId};
+use crate::dispatcher::locks::{ChainLocks, acquire_chain_lock};
 use crate::registry::CapsuleRegistry;
 use astrid_events::PrincipalKey;
 use astrid_events::{AstridEvent, EventBus, EventReceiver};
+
+mod locks;
 
 /// Capacity of each per-(capsule, principal) event dispatch queue.
 ///
@@ -87,88 +90,6 @@ pub(crate) fn set_idle_consumer_grace_for_test(ms: u64) {
     IDLE_CONSUMER_GRACE_MS.store(ms, std::sync::atomic::Ordering::Relaxed);
 }
 
-/// Shared map of per-(capsule, principal) chain mutexes. One
-/// `Arc<tokio::sync::Mutex<()>>` per `(CapsuleId, PrincipalKey)` so
-/// chain dispatches for the same key serialize FIFO while distinct
-/// keys (including distinct principals within the same class) run
-/// concurrently. Held across the chain task's lifetime in
-/// `dispatch_to_capsule_queues`.
-type ChainLocks =
-    Arc<parking_lot::RwLock<HashMap<(CapsuleId, PrincipalKey), Arc<tokio::sync::Mutex<()>>>>>;
-
-/// RAII chain-lock lease that prunes its `ChainLocks` map entry on drop
-/// when it was the last referrer.
-///
-/// Without this, the map gains an entry per `(capsule, principal)` on first
-/// use and never sheds it — ephemeral recursive sub-agents (high principal
-/// churn) would grow it unboundedly, unlike `capsule_queues` which idle-evicts
-/// (Gemini #828). The acquire path stays race-safe: a concurrent acquirer that
-/// raced the removal simply re-inserts via `or_insert_with`, so a pruned-then-
-/// reused key costs one extra allocation, never a correctness loss.
-struct ChainLockGuard {
-    /// The held mutex guard. Dropped FIRST in [`Drop`] so the mutex is free
-    /// before we inspect the Arc's strong count.
-    ///
-    /// `Option` so `drop` can take it and release the lock explicitly before
-    /// taking the map's write lock.
-    guard: Option<tokio::sync::OwnedMutexGuard<()>>,
-    /// Our own clone of the per-key mutex `Arc`. With `guard` dropped, this is
-    /// the only referrer outside the map, so `strong_count == 2` (map + this)
-    /// proves no other chain task holds the lock and the entry can be pruned.
-    mutex: Arc<tokio::sync::Mutex<()>>,
-    chain_locks: ChainLocks,
-    key: (CapsuleId, PrincipalKey),
-}
-
-impl Drop for ChainLockGuard {
-    fn drop(&mut self) {
-        // Release the lock first so the strong-count check below sees only
-        // map + `self.mutex` referrers (the `OwnedMutexGuard` holds its own
-        // internal `Arc` clone, which must be gone before we count).
-        self.guard.take();
-        let mut write = self.chain_locks.write();
-        // Re-fetch under the write lock: a concurrent acquirer may have
-        // replaced the entry after a previous prune, so only remove the
-        // exact Arc we hold, and only when we are its last non-map referrer.
-        if let Some(entry) = write.get(&self.key)
-            && Arc::ptr_eq(entry, &self.mutex)
-            && Arc::strong_count(entry) == 2
-        {
-            write.remove(&self.key);
-        }
-    }
-}
-
-/// Acquire the per-(capsule, principal) chain lock, returning a guard that
-/// prunes the map entry on drop. Read-fast / write-on-miss: the common case
-/// is a hit on an existing lock.
-async fn acquire_chain_lock(
-    chain_locks: &ChainLocks,
-    key: (CapsuleId, PrincipalKey),
-) -> ChainLockGuard {
-    let mutex = {
-        let read = chain_locks.read();
-        if let Some(m) = read.get(&key) {
-            Arc::clone(m)
-        } else {
-            drop(read);
-            let mut write = chain_locks.write();
-            Arc::clone(
-                write
-                    .entry(key.clone())
-                    .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))),
-            )
-        }
-    };
-    let guard = Arc::clone(&mutex).lock_owned().await;
-    ChainLockGuard {
-        guard: Some(guard),
-        mutex,
-        chain_locks: Arc::clone(chain_locks),
-        key,
-    }
-}
-
 /// Shared map of per-(capsule, principal) dispatcher mpsc senders.
 /// Wrapped in `parking_lot::Mutex` so the consumer task can remove its
 /// own entry under the same lock that admits new principals — this
@@ -214,7 +135,7 @@ pub struct EventDispatcher {
     chain_locks: ChainLocks,
     /// Per-principal capsule-access resolver. When set, dispatch of the
     /// **user-invocable surface** (`tool.v1.execute.*`,
-    /// `cli.v1.command.execute`) is filtered to capsules the caller is
+    /// `cli.v1.command.run.*`) is filtered to capsules the caller is
     /// granted; admins (`*`) bypass. When `None` (e.g. legacy tests),
     /// the surface is ungated — the kernel always wires the resolver in
     /// production so the security boundary is present at runtime.
@@ -249,10 +170,11 @@ impl EventDispatcher {
     /// Set the per-principal capsule-access resolver.
     ///
     /// Once set, dispatch of the user-invocable surface
-    /// (`tool.v1.execute.*`, `cli.v1.command.execute`) is filtered to the
-    /// caller's granted capsules (admins bypass; fail-closed for unknown
-    /// callers). Wired by the kernel at boot, mirroring how the fuel and
-    /// memory ledgers are cloned in from the kernel.
+    /// (`tool.v1.execute.*`, `cli.v1.command.run.*`) is filtered to the
+    /// caller's granted capsules; describe fan-outs are narrowed to the
+    /// caller's capsule view. Admins bypass; unknown callers fail closed.
+    /// Wired by the kernel at boot, mirroring how the fuel and memory ledgers
+    /// are cloned in from the kernel.
     #[must_use]
     pub fn with_access_resolver(mut self, resolver: CapsuleAccessResolver) -> Self {
         self.access_resolver = Some(resolver);
@@ -893,13 +815,13 @@ fn dispatch_single(
 ///
 /// # Per-principal capsule-access filter
 ///
-/// When `topic` is in the **user-invocable surface** (`tool.v1.execute.*`,
-/// `cli.v1.command.execute`) **and** an `access_resolver` is wired, a
-/// matched capsule is kept only if `caller_principal` is granted it (or is
-/// an admin holding `*`). The filter is keyed on the **topic**, so a
+/// When an `access_resolver` is wired, principal-stamped non-admin dispatch is
+/// first narrowed to the caller's capsule view. When `topic` is also in the
+/// **user-invocable surface** (`tool.v1.execute.*`, `cli.v1.command.run.*`),
+/// a matched capsule is kept only if `caller_principal` is granted it (or is an
+/// admin holding `*`). The grant-on-use filter is keyed on the **topic**, so a
 /// dual-role capsule's orchestration interceptors (on non-tool topics) are
-/// never filtered — they fall through the surface check unchanged. For all
-/// other topics the filter is a no-op and dispatch is identical to before.
+/// view-scoped but not grant-gated.
 /// For an **authenticated, non-admin** caller a denied match is no longer a
 /// pure silent drop: before dropping, a [`IpcPayload::GrantRequired`] signal is
 /// published on `astrid.v1.approval` (grant-on-first-use, #998) so a broker/shim
@@ -915,64 +837,70 @@ async fn find_matching_interceptors(
     access_resolver: Option<&CapsuleAccessResolver>,
     event_bus: &EventBus,
 ) -> Vec<(Arc<dyn crate::capsule::Capsule>, String, u32)> {
-    // Compute the gate once per event, not per capsule. The filter only
-    // engages for the user-invocable surface with a resolver present;
-    // otherwise every topic dispatches unchanged (orchestration mesh).
+    // Compute the gate once per event, not per capsule. Principal-stamped
+    // dispatch is view-scoped when a resolver is present; grant-on-use only
+    // engages for the narrower user-invocable surface.
     let gate_surface = crate::access::is_user_invocable_surface(topic);
+    let view_scoped_surface = access_resolver.is_some()
+        && (gate_surface
+            || topic == "tool.v1.request.describe"
+            || topic == "llm.v1.request.describe");
     let registry = registry.read().await;
     let mut matches: Vec<(Arc<dyn crate::capsule::Capsule>, String, u32)> = Vec::new();
-    // Dedup grant-on-use signals within a single dispatch pass (principal is
-    // fixed per call, so key on `capsule_id`). A `Vec<&str>` borrowing the
-    // registry-held ids beats a `HashSet<String>` for this tiny, gate-miss-only
-    // set — linear `contains`, no per-check allocation, a `String` built only on
-    // emit.
-    let mut grant_signalled: Vec<&str> = Vec::new();
-    for capsule_id in registry.list() {
-        if let Some(capsule) = registry.get(capsule_id) {
-            if !matches!(capsule.state(), crate::capsule::CapsuleState::Ready) {
-                continue;
-            }
-            // Per-principal access gate for the user-invocable surface.
-            // Fail-closed: with the gate engaged and a resolver wired, an
-            // ungranted (or unknown/anonymous) caller drops this capsule's
-            // tool interceptors entirely.
-            if gate_surface
-                && let Some(resolver) = access_resolver
-                && !resolver.is_capsule_allowed(caller_principal, capsule.id())
+    // Dedup grant-on-use signals within a single dispatch pass. This stays
+    // tiny in practice, so a Vec keeps the gate path simple.
+    let mut grant_signalled: Vec<String> = Vec::new();
+    let caller_pid = caller_principal.and_then(|p| astrid_core::PrincipalId::new(p).ok());
+    let view_scoped_admin = view_scoped_surface
+        && access_resolver.is_some_and(|resolver| resolver.is_admin(caller_principal));
+    let candidate_capsules = candidate_capsules_for_dispatch(
+        &registry,
+        caller_pid.as_ref(),
+        access_resolver.is_some(),
+        view_scoped_surface,
+        view_scoped_admin,
+    );
+
+    for capsule in candidate_capsules {
+        if !matches!(capsule.state(), crate::capsule::CapsuleState::Ready) {
+            continue;
+        }
+        // Per-principal access gate for the user-invocable surface.
+        // Fail-closed: with the gate engaged and a resolver wired, an
+        // ungranted (or unknown/anonymous) caller drops this capsule's
+        // tool interceptors entirely.
+        if gate_surface
+            && let Some(resolver) = access_resolver
+            && !resolver.is_capsule_allowed(caller_principal, capsule.id())
+        {
+            // Grant-on-first-use (#998): for an authenticated non-admin
+            // caller, emit a `GrantRequired` signal before dropping. The
+            // grant TARGET is the kernel-stamped caller + this capsule —
+            // never any caller-supplied claim. Skip a `None`/empty/
+            // `anonymous` principal (no authenticated principal to grant).
+            if let Some(principal) = caller_principal
+                && !principal.is_empty()
+                && principal != "anonymous"
             {
-                // Grant-on-first-use (#998): for an authenticated non-admin
-                // caller, emit a `GrantRequired` signal before dropping. The
-                // grant TARGET is the kernel-stamped caller + this capsule —
-                // never any caller-supplied claim. Skip a `None`/empty/
-                // `anonymous` principal (no authenticated principal to grant).
-                if let Some(principal) = caller_principal
-                    && !principal.is_empty()
-                    && principal != "anonymous"
-                {
-                    let capsule_key = capsule_id.as_str();
-                    if !grant_signalled.contains(&capsule_key) {
-                        grant_signalled.push(capsule_key);
-                        crate::access::emit_grant_required(
-                            event_bus,
-                            principal,
-                            capsule_key.to_string(),
-                        );
-                    }
+                let capsule_key = capsule.id().to_string();
+                if !grant_signalled.contains(&capsule_key) {
+                    grant_signalled.push(capsule_key.clone());
+                    crate::access::emit_grant_required(event_bus, principal, capsule_key);
                 }
-                continue;
             }
-            // RFC cargo-like-manifest: read effective interceptors
-            // — [subscribe].handler entries merged with legacy
-            // [[interceptor]] blocks. Legacy entries keep their declared
-            // priority; new-form entries get the default (100).
-            for interceptor in capsule.manifest().effective_interceptors() {
-                if crate::topic::topic_matches(topic, &interceptor.event) {
-                    matches.push((
-                        Arc::clone(&capsule),
-                        interceptor.action,
-                        interceptor.priority,
-                    ));
-                }
+            continue;
+        }
+        // RFC cargo-like-manifest: read effective interceptors
+        // — [subscribe].handler entries merged with legacy
+        // [[interceptor]] blocks. Legacy entries keep their declared
+        // priority; new-form entries get the default (100).
+        for interceptor in capsule.manifest().effective_interceptors() {
+            if crate::topic::topic_matches(topic, &interceptor.event) {
+                matches.push((
+                    Arc::clone(&capsule),
+                    interceptor.action,
+                    interceptor.priority,
+                ));
             }
         }
     }
@@ -993,6 +921,31 @@ async fn find_matching_interceptors(
             .then_with(|| a_act.cmp(b_act))
     });
     matches
+}
+
+fn candidate_capsules_for_dispatch(
+    registry: &CapsuleRegistry,
+    caller_pid: Option<&astrid_core::PrincipalId>,
+    has_access_resolver: bool,
+    view_scoped_surface: bool,
+    view_scoped_admin: bool,
+) -> Vec<Arc<dyn crate::capsule::Capsule>> {
+    if view_scoped_surface && !view_scoped_admin {
+        return caller_pid.map_or_else(Vec::new, |principal| registry.cloned_values_for(principal));
+    }
+
+    if has_access_resolver
+        && !view_scoped_admin
+        && let Some(principal) = caller_pid
+    {
+        return registry.cloned_values_for(principal);
+    }
+
+    registry
+        .list_any()
+        .into_iter()
+        .filter_map(|id| registry.get_any(id))
+        .collect()
 }
 
 #[cfg(test)]
