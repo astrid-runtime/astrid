@@ -133,7 +133,10 @@ jobs:
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
           NOTES=release-notes.md
-          awk "/^## \\[$VERSION\\]/{found=1; next} /^## \\[/{if(found) exit} found" CHANGELOG.md > "$NOTES"
+          # Exact-prefix match on the version header — the version goes in as a
+          # string, never a regex, so dots (or any metacharacter in a tag name)
+          # cannot widen the match.
+          awk -v ver="$VERSION" 'index($0, "## [" ver "]") == 1 {found=1; next} /^## \[/{if(found) exit} found' CHANGELOG.md > "$NOTES"
           if [ ! -s "$NOTES" ]; then
             echo "See [CHANGELOG.md](https://github.com/unicity-astrid/astrid/blob/${GITHUB_REF_NAME}/CHANGELOG.md) for details." > "$NOTES"
           fi
@@ -174,7 +177,8 @@ jobs:
             # leak whatever stdout produced (the v0.9.0 run interpolated a raw
             # 422 error JSON as a contributor) — accept only a well-formed
             # GitHub login.
-            if printf '%s' "$USERNAME" | grep -qE '^[A-Za-z0-9]([A-Za-z0-9-]{0,38})?$'; then
+            if printf '%s' "$USERNAME" | grep -qE '^[A-Za-z0-9]([A-Za-z0-9-]{0,37}[A-Za-z0-9])?$' \
+               && ! printf '%s' "$USERNAME" | grep -q -- '--'; then
               echo "- @${USERNAME}" >> "$NOTES"
             else
               echo "- ${name}" >> "$NOTES"
