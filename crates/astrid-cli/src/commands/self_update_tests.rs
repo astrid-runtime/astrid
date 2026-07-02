@@ -84,6 +84,25 @@ fn rc_path_guard_ignores_commented_lines() {
 }
 
 #[test]
+fn rc_path_guard_ignores_commented_exact_block() {
+    let bin = "/home/jb/.astrid/bin";
+    let export = format!("export PATH=\"{bin}:$PATH\"");
+
+    // Our EXACT block, but commented out, is inert — the fast path must NOT
+    // treat it as configured (else the real PATH setup is silently skipped).
+    let commented_exact = format!("# {export}\n");
+    assert!(!rc_configures_path(&commented_exact, bin, &export));
+
+    // The same block ACTIVE (uncommented) IS configured via the fast path.
+    let active_exact = format!("{export}\n");
+    assert!(rc_configures_path(&active_exact, bin, &export));
+
+    // A commented exact block followed by an active one is configured.
+    let both_exact = format!("# {export}\n{export}\n");
+    assert!(rc_configures_path(&both_exact, bin, &export));
+}
+
+#[test]
 fn homebrew_path_is_detected() {
     assert!(is_homebrew_managed(Path::new(
         "/opt/homebrew/Cellar/astrid/0.8.0/bin/astrid"

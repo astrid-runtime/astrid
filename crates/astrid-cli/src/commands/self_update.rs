@@ -668,6 +668,18 @@ fn detect_shell_rc() -> Option<PathBuf> {
     }
 }
 
+/// True if the match starting at byte `start` sits on a `#`-commented
+/// (inert) rc line — a `#` appears between the line start and the match.
+///
+/// A commented line is a no-op in the shell, so treating a match inside one
+/// as "already configured" would silently skip the real PATH setup. Both
+/// match paths in [`rc_configures_path`] consult this so a commented block or
+/// token never counts.
+fn match_is_commented(rc: &str, start: usize) -> bool {
+    let line_start = rc[..start].rfind('\n').map_or(0, |nl| nl.saturating_add(1));
+    rc[line_start..start].contains('#')
+}
+
 /// Whether `rc_contents` already puts the bin dir on PATH, so a second run
 /// must not append a duplicate block.
 ///
@@ -677,13 +689,17 @@ fn detect_shell_rc() -> Option<PathBuf> {
 /// component: bounded on both sides by a shell PATH-list separator. A bare
 /// substring match must NOT count: an rc containing `.astrid/bin_backup` or
 /// `.astrid/bin/sub` would otherwise make the guard skip the real
-/// `.astrid/bin` setup and silently leave astrid off PATH. When unsure we err
-/// toward ADDING the block — a duplicate PATH entry is harmless; a silent skip
-/// is not. Pure over its inputs so the guarantee is unit-testable without a
-/// real shell rc.
+/// `.astrid/bin` setup and silently leave astrid off PATH. A match on a
+/// `#`-commented (inert) line is likewise NOT a match, on both paths. When
+/// unsure we err toward ADDING the block — a duplicate PATH entry is harmless;
+/// a silent skip is not. Pure over its inputs so the guarantee is
+/// unit-testable without a real shell rc.
 fn rc_configures_path(rc_contents: &str, bin_str: &str, export_line: &str) -> bool {
-    // Our exact block is the authoritative "already done" marker.
-    if rc_contents.contains(export_line) {
+    // Our exact block is the authoritative "already done" marker — unless it
+    // is commented out, in which case it is inert and we must add a live one.
+    if let Some(start) = rc_contents.find(export_line)
+        && !match_is_commented(rc_contents, start)
+    {
         return true;
     }
     if bin_str.is_empty() {
@@ -702,16 +718,9 @@ fn rc_configures_path(rc_contents: &str, bin_str: &str, export_line: &str) -> bo
         let start = from.saturating_add(rel);
         let end = start.saturating_add(bin_str.len());
 
-        // A `#` anywhere between the line start and the match means this
-        // occurrence sits inside a commented-out (inert) line, e.g.
-        // `# export PATH="…/.astrid/bin:$PATH"`. Treating that as configured
-        // would silently skip the real PATH setup, so skip this match and
-        // keep scanning. Errs toward ADDING the block: a literal `#` in a
-        // real path is vanishingly rare and only yields a harmless duplicate.
-        let line_start = rc_contents[..start]
-            .rfind('\n')
-            .map_or(0, |nl| nl.saturating_add(1));
-        if rc_contents[line_start..start].contains('#') {
+        // Skip a match inside a commented-out line, e.g.
+        // `# export PATH="…/.astrid/bin:$PATH"`, and keep scanning.
+        if match_is_commented(rc_contents, start) {
             from = end;
             continue;
         }
