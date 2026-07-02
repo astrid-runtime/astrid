@@ -264,17 +264,50 @@ fn write_env_files_targets_the_given_principal() {
     );
 }
 
-/// A `Distro.lock` is written only when at least one capsule installed (or
-/// the selection was empty). A wholly-failed run writes no lock so a re-run
-/// isn't wedged by a fresh-but-empty lock.
+/// A `Distro.lock` is written ONLY on a full success (or an empty
+/// selection). A partial or wholly-failed run writes no lock so a re-run
+/// re-attempts the missing capsules instead of short-circuiting at the
+/// freshness gate (`is_lock_fresh` can't diff the capsule set).
 #[test]
 fn should_write_lock_gates_on_success() {
-    // At least one success → write.
-    assert!(should_write_lock(9, 9));
-    assert!(should_write_lock(9, 1));
+    // Full success → write.
+    assert!(should_write_lock(5, 5));
     // Empty selection is not a failure → write (marks the run done).
     assert!(should_write_lock(0, 0));
-    // Every install failed → do NOT write (would wedge re-runs).
-    assert!(!should_write_lock(9, 0));
+    // Partial success → do NOT write: a version-matched lock would make the
+    // next `init` short-circuit and never retry the failures.
+    assert!(!should_write_lock(5, 3));
+    // Every install failed → do NOT write.
+    assert!(!should_write_lock(5, 0));
     assert!(!should_write_lock(1, 0));
+}
+
+/// Regression: a PARTIAL run must leave no `Distro.lock` on disk, so a
+/// later `run_init` reloads nothing at the freshness gate and re-provisions
+/// the missing capsules. Before the fix (which wrote a lock whenever
+/// `succeeded > 0`), a partial run persisted a version-matched lock and the
+/// retry was silently wedged. Exercised through `persist_lock_if_earned`,
+/// the exact seam `run_init` uses to decide.
+#[test]
+fn partial_run_leaves_no_lock_for_retry() {
+    let dir = tempfile::tempdir().unwrap();
+    let lock_path = dir.path().join("distro.lock");
+    let lock = create_lock_from_parts(1, "astralis", "1.0.0", Vec::new());
+
+    // Partial (3 of 5): no lock written, returns false.
+    let wrote = persist_lock_if_earned(&lock_path, 5, 3, &lock).unwrap();
+    assert!(!wrote, "partial run must not write a lock");
+    assert!(
+        load_lock(&lock_path).unwrap().is_none(),
+        "partial run must leave no Distro.lock on disk, else the retry is wedged"
+    );
+
+    // Full (5 of 5): lock written, returns true — a re-run then correctly
+    // short-circuits at the freshness gate.
+    let wrote = persist_lock_if_earned(&lock_path, 5, 5, &lock).unwrap();
+    assert!(wrote, "full success must write the lock");
+    assert!(
+        load_lock(&lock_path).unwrap().is_some(),
+        "full success must persist the lock"
+    );
 }

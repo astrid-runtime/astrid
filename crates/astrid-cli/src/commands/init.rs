@@ -158,44 +158,49 @@ pub(crate) async fn run_init(distro_source: &str, opts: &InitOpts) -> anyhow::Re
 
     // Provisioning honesty: a run where every selected install FAILED must
     // not claim success, must not persist a Distro.lock, and must exit
-    // non-zero. Writing a lock on a wholly-failed run would wedge recovery —
-    // the next `init` would see a fresh lock, judge itself already
-    // provisioned, and skip. An empty selection (nothing to install) is not
-    // a failure.
-    if !should_write_lock(total, succeeded) {
+    // non-zero. Writing a lock here would wedge recovery — the next `init`
+    // would see a version-matched lock, pass the freshness gate above, and
+    // short-circuit. An empty selection (nothing to install) is not a
+    // failure.
+    if total > 0 && succeeded == 0 {
         bail!(
             "all {total} capsule install(s) failed — not writing Distro.lock. \
              Fix the errors above and re-run `astrid init`."
         );
     }
 
-    // Per-provider onboarding: for each selected llm-group capsule, run its
-    // own `[env]` schema prompt so capsule-specific fields (api_key,
-    // base_url) and the dynamic `model` select resolve from the installed
-    // manifest — not just the shared free-text `[variables]`. Shared values
-    // already written above are preserved (the prompt skips set keys).
-    onboard_llm_providers(&home, &principal, &selected);
+    // Per-provider onboarding runs only on a FULL success — a partial run
+    // isn't finalized, and its re-run will onboard once it converges. For
+    // each selected llm-group capsule this runs its own `[env]` schema
+    // prompt so capsule-specific fields (api_key, base_url) and the dynamic
+    // `model` select resolve from the installed manifest — not just the
+    // shared free-text `[variables]`. Shared values already written above
+    // are preserved (the prompt skips set keys).
+    if should_write_lock(total, succeeded) {
+        onboard_llm_providers(&home, &principal, &selected);
+    }
 
-    // Write Distro.lock. Reached only when at least one capsule installed
-    // (or the selection was empty): a partial provision still records what
-    // landed so a later run doesn't redo it, while a wholly-failed run
-    // bailed above without persisting a misleading lock.
+    // Persist Distro.lock iff the run earned it (full success or empty
+    // selection). A partial run deliberately writes NO lock so a re-run
+    // actually retries the missing capsules instead of short-circuiting at
+    // the freshness gate (`is_lock_fresh` diffs only distro id+version, not
+    // the capsule set) — see `should_write_lock`.
     let lock = create_lock_from_parts(schema_version, &distro_id, &distro_version, locked);
-    write_lock(&lock_path, &lock)?;
+    let wrote_lock = persist_lock_if_earned(&lock_path, total, succeeded, &lock)?;
 
     eprintln!();
-    if succeeded == total {
+    if wrote_lock {
         eprintln!("{}", Theme::success("Installation complete."));
+        eprintln!("  Run {} to start.", Theme::prompt("astrid"));
     } else {
         eprintln!(
             "{}",
             Theme::warning(&format!(
-                "Installation partially complete: {succeeded}/{total} capsule(s) installed. \
-                 Re-run `astrid init` to retry the rest."
+                "Installation incomplete: {succeeded}/{total} capsule(s) installed — \
+                 re-run `astrid init` to retry the rest."
             ))
         );
     }
-    eprintln!("  Run {} to start.", Theme::prompt("astrid"));
 
     Ok(())
 }
@@ -528,15 +533,36 @@ fn collect_variables_headless(
 
 /// Whether a provision run should persist a `Distro.lock`.
 ///
-/// A run that installed at least one capsule records a lock so a later
-/// `init` sees a fresh lock and skips the capsules that already landed. A
-/// run where every selected capsule FAILED (`succeeded == 0` with a
-/// non-empty selection) writes no lock: persisting one would let the next
-/// `init` believe provisioning is complete and skip it, wedging recovery.
-/// An empty selection (`total == 0`) is not a failure — there is simply
-/// nothing to install — so the lock is written to mark the run done.
+/// Only a FULL success (`succeeded == total`) or an empty selection
+/// (`total == 0`, nothing to install) writes a lock. A PARTIAL run writes
+/// NO lock, and this is the crux of the correctness contract: the freshness
+/// gate (`is_lock_fresh`) compares only the distro id + version, NOT which
+/// capsules landed. A partial lock would match on version, so the next
+/// `astrid init` would judge itself already provisioned and short-circuit —
+/// the capsules that failed would never retry. Because `install_capsule_batch`
+/// reinstalls idempotently, withholding the lock lets a re-run re-attempt
+/// every capsule and converge to a full success, which then writes the lock.
+/// A wholly-failed run also writes no lock (and additionally bails non-zero).
 fn should_write_lock(total: usize, succeeded: usize) -> bool {
-    total == 0 || succeeded > 0
+    total == 0 || succeeded == total
+}
+
+/// Persist `lock` at `lock_path` iff the run earned it (see
+/// [`should_write_lock`]). Returns whether the lock was written, so the
+/// caller can pick the honest completion message. Kept as a small helper so
+/// the "partial run leaves no lock on disk" invariant is unit-testable
+/// without a network install.
+fn persist_lock_if_earned(
+    lock_path: &std::path::Path,
+    total: usize,
+    succeeded: usize,
+    lock: &DistroLock,
+) -> anyhow::Result<bool> {
+    if should_write_lock(total, succeeded) {
+        write_lock(lock_path, lock)?;
+        return Ok(true);
+    }
+    Ok(false)
 }
 
 /// Create a lockfile from resolved parts (avoids borrowing the full manifest).
