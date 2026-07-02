@@ -65,6 +65,15 @@ pub(crate) async fn run_init(distro_source: &str, opts: &InitOpts) -> anyhow::Re
     let home = AstridHome::resolve()?;
     home.ensure()?;
 
+    // The process-wide principal resolved from the global `--principal` flag
+    // (falling back to ASTRID_PRINCIPAL / active-agent context / `default`).
+    // Every install target below — capsule files, per-capsule env config, and
+    // the Distro.lock — is scoped to THIS principal so `astrid init --principal
+    // <x>` provisions <x>'s home rather than always landing under `default`.
+    // This is the same source `astrid capsule install` reads, so init and the
+    // manual installer agree on where a principal's capsules live.
+    let principal = crate::principal::current();
+
     // Workspace init (existing behaviour).
     init_workspace()?;
 
@@ -73,8 +82,10 @@ pub(crate) async fn run_init(distro_source: &str, opts: &InitOpts) -> anyhow::Re
         return run_init_from_shuttle(distro_source, opts);
     }
 
-    // Check lockfile — if fresh, we're already initialized.
-    let principal = astrid_core::PrincipalId::default();
+    // Check lockfile — if fresh, we're already initialized. The lock lives
+    // under the resolved principal's home, matching bootstrap's auto-init
+    // freshness check (`should_auto_init`) so a scoped principal isn't
+    // re-provisioned on every run.
     let lock_path = home
         .principal_home(&principal)
         .config_dir()
@@ -135,27 +146,63 @@ pub(crate) async fn run_init(distro_source: &str, opts: &InitOpts) -> anyhow::Re
     // Write per-capsule env files BEFORE installing capsules so that
     // install_capsule's onboarding check finds existing values and
     // doesn't re-prompt for fields the distro already configured.
-    write_env_files(&home, &selected, &vars)?;
+    write_env_files(&home, &principal, &selected, &vars)?;
 
-    // Install each capsule with progress.
-    let locked = install_capsules(&selected, opts.offline).await?;
+    // Install each capsule with progress. `install_capsules` writes the
+    // capsule files under `principal`'s home and returns one LockedCapsule
+    // per capsule that actually installed — failures are reported and
+    // dropped, so `locked.len()` is the true success count.
+    let total = selected.len();
+    let locked = install_capsules(&selected, opts.offline, &principal).await?;
+    let succeeded = locked.len();
 
-    // Per-provider onboarding: for each selected llm-group capsule, run its
-    // own `[env]` schema prompt so capsule-specific fields (api_key,
-    // base_url) and the dynamic `model` select resolve from the installed
-    // manifest — not just the shared free-text `[variables]`. Shared values
-    // already written above are preserved (the prompt skips set keys).
-    onboard_llm_providers(&home, &selected);
+    // Provisioning honesty: a run where every selected install FAILED must
+    // not claim success, must not persist a Distro.lock, and must exit
+    // non-zero. Writing a lock here would wedge recovery — the next `init`
+    // would see a version-matched lock, pass the freshness gate above, and
+    // short-circuit. An empty selection (nothing to install) is not a
+    // failure.
+    if total > 0 && succeeded == 0 {
+        bail!(
+            "all {total} capsule install(s) failed — not writing Distro.lock. \
+             Fix the errors above and re-run `astrid init`."
+        );
+    }
 
-    // Write Distro.lock.
+    // Per-provider onboarding runs only on a FULL success — a partial run
+    // isn't finalized, and its re-run will onboard once it converges. For
+    // each selected llm-group capsule this runs its own `[env]` schema
+    // prompt so capsule-specific fields (api_key, base_url) and the dynamic
+    // `model` select resolve from the installed manifest — not just the
+    // shared free-text `[variables]`. Shared values already written above
+    // are preserved (the prompt skips set keys).
+    if should_write_lock(total, succeeded) {
+        onboard_llm_providers(&home, &principal, &selected);
+    }
+
+    // Persist Distro.lock iff the run earned it (full success or empty
+    // selection). A partial run deliberately writes NO lock so a re-run
+    // actually retries the missing capsules instead of short-circuiting at
+    // the freshness gate (`is_lock_fresh` diffs only distro id+version, not
+    // the capsule set) — see `should_write_lock`.
     let lock = create_lock_from_parts(schema_version, &distro_id, &distro_version, locked);
-    write_lock(&lock_path, &lock)?;
+    let wrote_lock = persist_lock_if_earned(&lock_path, total, succeeded, &lock)?;
 
     eprintln!();
-    eprintln!("{}", Theme::success("Installation complete."));
-    eprintln!("  Run {} to start.", Theme::prompt("astrid"));
-
-    Ok(())
+    if wrote_lock {
+        eprintln!("{}", Theme::success("Installation complete."));
+        eprintln!("  Run {} to start.", Theme::prompt("astrid"));
+        Ok(())
+    } else {
+        // Partial provision (0 < succeeded < total): no lock was written, so
+        // a re-run retries the rest. Exit NON-ZERO so automation and the
+        // in-conversation flow don't read a partial install as success —
+        // `astrid init` exits 0 IFF the distro is fully provisioned.
+        bail!(
+            "Installation incomplete: {succeeded}/{total} capsule(s) installed — \
+             re-run `astrid init` to retry the rest."
+        )
+    }
 }
 
 /// Install a distro from a signed, self-contained `.shuttle` archive.
@@ -484,6 +531,40 @@ fn collect_variables_headless(
     Ok(vars)
 }
 
+/// Whether a provision run should persist a `Distro.lock`.
+///
+/// Only a FULL success (`succeeded == total`) or an empty selection
+/// (`total == 0`, nothing to install) writes a lock. A PARTIAL run writes
+/// NO lock, and this is the crux of the correctness contract: the freshness
+/// gate (`is_lock_fresh`) compares only the distro id + version, NOT which
+/// capsules landed. A partial lock would match on version, so the next
+/// `astrid init` would judge itself already provisioned and short-circuit —
+/// the capsules that failed would never retry. Because `install_capsule_batch`
+/// reinstalls idempotently, withholding the lock lets a re-run re-attempt
+/// every capsule and converge to a full success, which then writes the lock.
+/// A wholly-failed run also writes no lock (and additionally bails non-zero).
+fn should_write_lock(total: usize, succeeded: usize) -> bool {
+    total == 0 || succeeded == total
+}
+
+/// Persist `lock` at `lock_path` iff the run earned it (see
+/// [`should_write_lock`]). Returns whether the lock was written, so the
+/// caller can pick the honest completion message. Kept as a small helper so
+/// the "partial run leaves no lock on disk" invariant is unit-testable
+/// without a network install.
+fn persist_lock_if_earned(
+    lock_path: &std::path::Path,
+    total: usize,
+    succeeded: usize,
+    lock: &DistroLock,
+) -> anyhow::Result<bool> {
+    if should_write_lock(total, succeeded) {
+        write_lock(lock_path, lock)?;
+        return Ok(true);
+    }
+    Ok(false)
+}
+
 /// Create a lockfile from resolved parts (avoids borrowing the full manifest).
 fn create_lock_from_parts(
     schema_version: u32,
@@ -550,6 +631,7 @@ fn is_network_capsule_source(source: &str) -> bool {
 async fn install_capsules(
     selected: &[DistroCapsule],
     offline: bool,
+    principal: &astrid_core::PrincipalId,
 ) -> anyhow::Result<Vec<LockedCapsule>> {
     if offline {
         for cap in selected {
@@ -604,8 +686,13 @@ async fn install_capsules(
             },
         };
 
-        // Read the installed meta to get the wasm_hash for the lock.
-        let target_dir = super::capsule::install::resolve_target_dir(&home, &cap.name, false)?;
+        // Read the installed meta to get the wasm_hash for the lock. The
+        // capsule was installed under `principal`'s home (via the
+        // `*_for_principal` install lib), so read it back from there — not
+        // from the legacy `default`-principal resolver, which would miss a
+        // scoped principal's install and record an empty hash.
+        let target_dir =
+            super::capsule::install::resolve_target_dir_for(&home, principal, &cap.name, false)?;
         let meta = super::capsule::meta::read_meta(&target_dir);
 
         locked.push(LockedCapsule {
@@ -641,11 +728,11 @@ async fn install_capsules(
 /// Write per-capsule .env.json files with resolved variable templates.
 pub(crate) fn write_env_files(
     home: &AstridHome,
+    principal: &astrid_core::PrincipalId,
     selected: &[DistroCapsule],
     vars: &HashMap<String, String>,
 ) -> anyhow::Result<()> {
-    let principal = astrid_core::PrincipalId::default();
-    let env_dir = home.principal_home(&principal).env_dir();
+    let env_dir = home.principal_home(principal).env_dir();
     std::fs::create_dir_all(&env_dir)?;
 
     for cap in selected {
@@ -695,16 +782,21 @@ pub(crate) fn write_env_files(
 /// (declared via `options-from`) resolve their option list live at this
 /// point. A missing manifest or env error for one provider is reported and
 /// skipped — it never aborts the whole install.
-fn onboard_llm_providers(home: &AstridHome, selected: &[DistroCapsule]) {
-    let principal = astrid_core::PrincipalId::default();
-    let env_dir = home.principal_home(&principal).env_dir();
+fn onboard_llm_providers(
+    home: &AstridHome,
+    principal: &astrid_core::PrincipalId,
+    selected: &[DistroCapsule],
+) {
+    let env_dir = home.principal_home(principal).env_dir();
 
     for cap in selected {
         if cap.group.as_deref() != Some("llm") {
             continue;
         }
 
-        let target_dir = match super::capsule::install::resolve_target_dir(home, &cap.name, false) {
+        let target_dir = match super::capsule::install::resolve_target_dir_for(
+            home, principal, &cap.name, false,
+        ) {
             Ok(dir) => dir,
             Err(e) => {
                 eprintln!("  Skipping {} onboarding: {e}", cap.name);
@@ -739,231 +831,5 @@ fn onboard_llm_providers(home: &AstridHome, selected: &[DistroCapsule]) {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn provider_selection_parses_multi_select() {
-        assert_eq!(parse_provider_selection("1,2", 3), vec![1, 2]);
-        assert_eq!(parse_provider_selection(" 2 , 3 ", 3), vec![2, 3]);
-        assert_eq!(parse_provider_selection("1", 3), vec![1]);
-    }
-
-    #[test]
-    fn provider_selection_drops_out_of_range_and_garbage() {
-        assert_eq!(parse_provider_selection("0,4,2,abc", 3), vec![2]);
-        assert!(parse_provider_selection("", 3).is_empty());
-        assert!(parse_provider_selection("9,10", 3).is_empty());
-    }
-
-    #[test]
-    fn provider_selection_dedupes_preserving_order() {
-        assert_eq!(parse_provider_selection("2,1,2,1", 3), vec![2, 1]);
-    }
-
-    #[test]
-    fn provider_selection_preserves_entry_order() {
-        // User order is honoured (3 then 1), not numeric-sorted.
-        assert_eq!(parse_provider_selection("3,1", 3), vec![3, 1]);
-    }
-
-    #[test]
-    fn extract_var_refs_finds_all() {
-        assert_eq!(extract_var_refs("{{ foo }}"), vec!["foo"]);
-        assert_eq!(extract_var_refs("{{ a }}-{{ b }}"), vec!["a", "b"],);
-        assert!(extract_var_refs("no vars").is_empty());
-    }
-
-    #[test]
-    fn resolve_template_replaces_vars() {
-        let mut vars = HashMap::new();
-        vars.insert("key".to_string(), "secret123".to_string());
-        vars.insert("url".to_string(), "https://api.example.com".to_string());
-
-        assert_eq!(resolve_template("{{ key }}", &vars), "secret123",);
-        assert_eq!(
-            resolve_template("prefix-{{ url }}-suffix", &vars),
-            "prefix-https://api.example.com-suffix",
-        );
-    }
-
-    #[test]
-    fn resolve_template_handles_missing_var() {
-        let vars = HashMap::new();
-        // Unresolved template stays as-is.
-        assert_eq!(resolve_template("{{ missing }}", &vars), "{{ missing }}",);
-    }
-
-    #[test]
-    fn distro_source_resolution_bare_name() {
-        assert_eq!(
-            resolve_distro_url("astralis"),
-            "https://raw.githubusercontent.com/unicity-astrid/astralis/main/Distro.toml",
-        );
-    }
-
-    #[test]
-    fn distro_source_resolution_at_prefix() {
-        assert_eq!(
-            resolve_distro_url("@myorg/mydistro"),
-            "https://raw.githubusercontent.com/myorg/mydistro/main/Distro.toml",
-        );
-    }
-
-    #[test]
-    fn distro_source_resolution_full_url() {
-        let url = "https://example.com/Distro.toml";
-        assert_eq!(resolve_distro_url(url), url);
-    }
-
-    // ---- Part A: headless selection / variable resolution ----
-
-    use super::super::distro::manifest::{DistroCapsule, VariableDef};
-
-    fn cap(name: &str, group: Option<&str>, default: bool) -> DistroCapsule {
-        DistroCapsule {
-            name: name.to_string(),
-            source: format!("@org/{name}"),
-            version: "0.1.0".to_string(),
-            tag: None,
-            branch: None,
-            rev: None,
-            default,
-            group: group.map(String::from),
-            role: None,
-            env: HashMap::new(),
-        }
-    }
-
-    #[test]
-    fn parse_cli_vars_splits_first_equals() {
-        let raw = vec!["A=1".to_string(), "URL=https://x?y=z".to_string()];
-        let map = parse_cli_vars(&raw).unwrap();
-        assert_eq!(map["A"], "1");
-        assert_eq!(map["URL"], "https://x?y=z");
-    }
-
-    #[test]
-    fn parse_cli_vars_rejects_no_equals() {
-        assert!(parse_cli_vars(&["NOEQ".to_string()]).is_err());
-        assert!(parse_cli_vars(&["=value".to_string()]).is_err());
-    }
-
-    #[test]
-    fn headless_select_takes_defaults_and_ungrouped() {
-        let caps = vec![
-            cap("cli", None, false),
-            cap("openai", Some("llm"), true),
-            cap("anthropic", Some("llm"), false),
-        ];
-        let selected = select_capsules(caps, true).unwrap();
-        let names: std::collections::HashSet<&str> =
-            selected.iter().map(|c| c.name.as_str()).collect();
-        assert!(names.contains("cli"), "ungrouped always selected");
-        assert!(names.contains("openai"), "group default selected");
-        assert!(!names.contains("anthropic"), "non-default not selected");
-    }
-
-    #[test]
-    fn headless_select_falls_back_to_first_when_no_default() {
-        let caps = vec![
-            cap("cli", None, false),
-            cap("alpha", Some("llm"), false),
-            cap("beta", Some("llm"), false),
-        ];
-        let selected = select_capsules(caps, true).unwrap();
-        let names: std::collections::HashSet<&str> =
-            selected.iter().map(|c| c.name.as_str()).collect();
-        // First in manifest order within the group is "alpha".
-        assert!(names.contains("alpha"));
-        assert!(!names.contains("beta"));
-    }
-
-    fn var(secret: bool, default: Option<&str>) -> VariableDef {
-        VariableDef {
-            secret,
-            description: None,
-            default: default.map(String::from),
-        }
-    }
-
-    fn cap_with_env(name: &str, key: &str, template: &str) -> DistroCapsule {
-        let mut c = cap(name, None, false);
-        c.env.insert(key.to_string(), template.to_string());
-        c
-    }
-
-    #[test]
-    fn headless_collect_uses_cli_var_override() {
-        let mut variables = HashMap::new();
-        variables.insert("api_key".to_string(), var(true, Some("from-default")));
-        let selected = vec![cap_with_env("llm", "API_KEY", "{{ api_key }}")];
-        let mut cli = HashMap::new();
-        cli.insert("api_key".to_string(), "from-cli".to_string());
-
-        let vars = collect_variables(&variables, &selected, true, &cli).unwrap();
-        assert_eq!(vars["api_key"], "from-cli");
-    }
-
-    #[test]
-    fn headless_collect_uses_env_then_default() {
-        let mut variables = HashMap::new();
-        variables.insert("base_url".to_string(), var(false, Some("https://default")));
-        let mut needed = std::collections::HashSet::new();
-        needed.insert("base_url".to_string());
-
-        // No CLI var, no env → default.
-        let vars =
-            collect_variables_headless(&variables, &needed, &HashMap::new(), |_| None).unwrap();
-        assert_eq!(vars["base_url"], "https://default");
-
-        // Env (ASTRID_VAR_BASE_URL) beats default — injected lookup, no
-        // process-global state.
-        let vars = collect_variables_headless(&variables, &needed, &HashMap::new(), |k| {
-            (k == "ASTRID_VAR_BASE_URL").then(|| "https://from-env".to_string())
-        })
-        .unwrap();
-        assert_eq!(vars["base_url"], "https://from-env");
-    }
-
-    #[tokio::test]
-    async fn offline_refuses_remote_capsule_source() {
-        // A local Distro.toml with a remote @org/repo capsule must not
-        // silently fetch under --offline.
-        let selected = vec![cap("llm", None, false)]; // source "@org/llm"
-        let err = install_capsules(&selected, true).await.unwrap_err();
-        assert!(err.to_string().contains("--offline"), "got: {err}");
-        assert!(err.to_string().contains("network/GitHub"), "got: {err}");
-    }
-
-    #[test]
-    fn offline_guard_blocks_only_github_sources() {
-        // GitHub-backed shapes are network sources (rejected under --offline).
-        assert!(is_network_capsule_source("@org/repo"));
-        assert!(is_network_capsule_source("@org/repo@1.2.0"));
-        assert!(is_network_capsule_source("github.com/org/repo"));
-        assert!(is_network_capsule_source("https://github.com/org/repo"));
-
-        // Local paths are NOT network sources — including a bare relative
-        // path like `capsules/cli.capsule`, which the old guard wrongly
-        // rejected because it didn't start with `.` or `/`.
-        assert!(!is_network_capsule_source("capsules/cli.capsule"));
-        assert!(!is_network_capsule_source("./capsules/cli.capsule"));
-        assert!(!is_network_capsule_source("/abs/path/cli.capsule"));
-        assert!(!is_network_capsule_source("cli.capsule"));
-    }
-
-    #[test]
-    fn headless_collect_errors_on_missing_required_var() {
-        let mut variables = HashMap::new();
-        variables.insert("api_key".to_string(), var(true, None)); // no default
-        let mut needed = std::collections::HashSet::new();
-        needed.insert("api_key".to_string());
-
-        let err =
-            collect_variables_headless(&variables, &needed, &HashMap::new(), |_| None).unwrap_err();
-        let msg = err.to_string();
-        assert!(msg.contains("api_key"), "got: {msg}");
-        assert!(msg.contains("ASTRID_VAR_API_KEY"), "got: {msg}");
-    }
-}
+#[path = "init_tests.rs"]
+mod tests;

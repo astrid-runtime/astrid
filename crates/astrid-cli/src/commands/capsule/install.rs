@@ -37,9 +37,12 @@ use astrid_events::EventBus;
 
 use super::install_prompts::{cli_elicit_handler, prompt_env_fields};
 
-/// Re-exported so sibling CLI modules (`init.rs`, `remove.rs`) keep the
-/// `super::install::resolve_target_dir` import path.
-pub(crate) use astrid_capsule_install::resolve_target_dir;
+/// Re-exported so sibling CLI modules (`init.rs`, `shuttle_install.rs`)
+/// keep the `super::install::resolve_target_dir_for` import path. The
+/// `_for` variant scopes the target to a specific principal — the
+/// init/distro path uses it to read back a capsule it installed under a
+/// non-`default` principal's home.
+pub(crate) use astrid_capsule_install::resolve_target_dir_for;
 
 /// Re-exported so the `update` subcommand in [`super::install_update`]
 /// can drive a refresh through the same dispatcher as a fresh install.
@@ -218,6 +221,59 @@ async fn install_capsule_inner(
 // GitHub installs — release-artifact download with clone-and-build fallback.
 // ---------------------------------------------------------------------------
 
+/// A GitHub token from the environment, if present.
+///
+/// Checks `GH_TOKEN` then `GITHUB_TOKEN` — the conventions the `gh` CLI and
+/// CI both honour. An empty or whitespace value counts as absent.
+fn github_token() -> Option<String> {
+    ["GH_TOKEN", "GITHUB_TOKEN"].into_iter().find_map(|key| {
+        std::env::var(key)
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+    })
+}
+
+/// Build an HTTP client for GitHub release/source resolution, authenticated
+/// when a token is available.
+///
+/// Anonymous GitHub API access is capped at 60 requests/hour, which a full
+/// distro (~9 capsules, each costing one or more release-resolution calls)
+/// can exhaust mid-provision. A token lifts the ceiling to 5000/hour. The
+/// token is attached as a default `Authorization` header; reqwest strips
+/// sensitive headers on cross-host redirects, so it never leaks to the
+/// release-asset CDN the API redirects downloads to. Absence of a token is
+/// NOT an error — resolution simply proceeds anonymously.
+fn github_api_client() -> anyhow::Result<reqwest::Client> {
+    let mut headers = reqwest::header::HeaderMap::new();
+    if let Some(token) = github_token() {
+        match reqwest::header::HeaderValue::from_str(&format!("Bearer {token}")) {
+            Ok(mut value) => {
+                value.set_sensitive(true);
+                headers.insert(reqwest::header::AUTHORIZATION, value);
+            },
+            // A PRESENT-but-malformed token is surfaced rather than silently
+            // dropped, but does NOT hard-fail: anonymous access still works
+            // for public repos, and aborting init over an unrelated bad env
+            // var is worse than the 60/hr ceiling. The token value is never
+            // echoed. An ABSENT token stays silent — the normal case.
+            Err(_) => {
+                eprintln!(
+                    "warning: ignoring malformed GH_TOKEN/GITHUB_TOKEN \
+                     (not a valid HTTP header value); proceeding with \
+                     anonymous GitHub API access"
+                );
+            },
+        }
+    }
+    reqwest::Client::builder()
+        .user_agent("astrid-cli")
+        .timeout(std::time::Duration::from_secs(30))
+        .default_headers(headers)
+        .build()
+        .context("failed to build GitHub HTTP client")
+}
+
 /// Build the GitHub "release by tag" API URL with the tag as a single,
 /// percent-encoded path segment.
 ///
@@ -352,10 +408,10 @@ async fn install_from_github(
     version: Option<&str>,
     tag: Option<&str>,
 ) -> anyhow::Result<(Vec<String>, Option<String>)> {
-    let client = reqwest::Client::builder()
-        .user_agent("astrid-cli")
-        .timeout(std::time::Duration::from_secs(30))
-        .build()?;
+    // Authenticated when a token is present so release resolution isn't
+    // throttled at the anonymous 60/hr limit mid-distro (see
+    // `github_api_client`).
+    let client = github_api_client()?;
 
     let (org, repo) = extract_github_org_repo(url).ok_or_else(|| {
         anyhow::anyhow!("Invalid GitHub URL format. Expected github.com/org/repo or @org/repo")
@@ -480,10 +536,8 @@ pub(crate) async fn resolve_capsule_to_file(
         )
     })?;
 
-    let client = reqwest::Client::builder()
-        .user_agent("astrid-cli")
-        .timeout(std::time::Duration::from_secs(30))
-        .build()?;
+    // Authenticated when a token is present (see `github_api_client`).
+    let client = github_api_client()?;
 
     let resolved_ref = resolve_github_ref(&client, &org, &repo, version, tag).await?;
 
@@ -778,8 +832,11 @@ pub(crate) fn install_offline_capsule(
     BATCH_MODE.store(true, Ordering::Relaxed);
     let result = (|| {
         unpack_via_lib(archive, false, home, Some(original_source))?;
-        // Post-stamp provenance into the freshly-written meta.json.
-        let target_dir = resolve_target_dir(home, name, false)?;
+        // Post-stamp provenance into the freshly-written meta.json. The
+        // unpack above installs under the process principal's home, so read
+        // it back from there rather than the legacy `default` resolver — a
+        // scoped principal's offline install would otherwise not be found.
+        let target_dir = resolve_target_dir_for(home, &crate::principal::current(), name, false)?;
         if let Some(mut meta) = super::meta::read_meta(&target_dir) {
             meta.resolved_ref = resolved_ref.map(String::from);
             meta.signer = signer.map(String::from);

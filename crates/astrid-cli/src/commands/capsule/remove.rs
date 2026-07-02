@@ -352,7 +352,7 @@ mod tests {
         let home_dir = tempfile::tempdir().unwrap();
         let home = AstridHome::from_path(home_dir.path());
         let target_dir =
-            super::super::install::resolve_target_dir(&home, "nonexistent", false).unwrap();
+            astrid_capsule_install::resolve_target_dir(&home, "nonexistent", false).unwrap();
         assert!(!target_dir.exists());
 
         let err = validate_capsule_removal_from_home(&home, "nonexistent", false, false);
@@ -378,7 +378,7 @@ mod tests {
             .expect("install should succeed");
 
         let target =
-            super::super::install::resolve_target_dir(&home, "remove-test", false).unwrap();
+            astrid_capsule_install::resolve_target_dir(&home, "remove-test", false).unwrap();
         assert!(target.exists());
 
         remove_capsule_from_home(&home, "remove-test", false, true, false).unwrap();
