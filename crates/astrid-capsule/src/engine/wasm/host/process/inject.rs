@@ -40,7 +40,7 @@ use std::path::PathBuf;
 
 use astrid_crypto::ContentHash;
 
-use crate::engine::wasm::bindings::astrid::process::host::{
+use crate::engine::wasm::bindings::astrid::process1_1_0::host::{
     ErrorCode, FileInjection, InjectionPlacement,
 };
 

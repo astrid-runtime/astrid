@@ -6,7 +6,7 @@
 
 use std::collections::VecDeque;
 
-use crate::engine::wasm::bindings::astrid::process::host::{ErrorCode, LogCursor};
+use crate::engine::wasm::bindings::astrid::process1_1_0::host::{ErrorCode, LogCursor};
 
 /// Ring overflow behaviour for one stream.
 #[derive(Clone, Copy)]

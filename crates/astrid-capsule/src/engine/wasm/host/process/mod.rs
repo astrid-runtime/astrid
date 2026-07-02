@@ -1,4 +1,11 @@
-//! `astrid:process@1.0.0` host implementation.
+//! `astrid:process@1.1.0` host implementation (the `@1.0.0` shims live in
+//! `compat.rs`).
+//!
+//! Both frozen contract versions are served off one implementation. This
+//! module implements the `@1.1.0` `Host` / `HostProcessHandle` traits — the
+//! SUPERSET, carrying the per-spawn read-only `file-injection` surface. The
+//! `@1.0.0` traits are thin delegating shims in `compat.rs` that spawn with an
+//! empty injection list; see that module for the version-bridging rationale.
 //!
 //! Desktop-only package (the WIT header explicitly notes hermit-rs
 //! unikernel targets do not provide it). The kernel here:
@@ -18,6 +25,7 @@
 //! table is the canonical storage for `ManagedProcess`.
 
 mod audit;
+mod compat;
 mod handle;
 mod inject;
 mod managed;
@@ -32,7 +40,7 @@ use tokio::process::Command as TokioCommand;
 use tracing::warn;
 use wasmtime::component::Resource;
 
-use crate::engine::wasm::bindings::astrid::process::host::{
+use crate::engine::wasm::bindings::astrid::process1_1_0::host::{
     self as process, EnvVar, ErrorCode, ExitInfo, LogChunk, LogCursor, LogStream, ProcessHandle,
     ProcessInfo, ProcessResult, ProcessSignal, ReadLogsResult, SpawnRequest,
 };

@@ -9,6 +9,14 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
 
 ## [Unreleased]
 
+### Added
+
+- **`astrid:process@1.1.0` host interface.** Additive successor to the frozen `astrid:process@1.0.0`, carrying the host-verified, read-only per-spawn file-injection surface (the `file-injection` record, the `injection-placement` variant, and the `spawn-request.file-injections` field). The kernel serves both versions off one implementation; capsules opt into injection by importing `@1.1.0`, while `@1.0.0` behaves as spawn-with-no-injections. Refs #1107, wit#19, #881.
+
+### Fixed
+
+- **Shipped capsules that import `astrid:process@1.0.0` instantiate again — no rebuild required.** The per-spawn file-injection extension originally landed in-place on the frozen `astrid:process@1.0.0` WIT (wit#15), changing the shape of `spawn-request`. The component-model linker matches host imports structurally by package version, so every capsule compiled against the published pre-extension contract (all shipped capsules, built on astrid-sys 0.7.x) failed to instantiate on 0.9.0 with `component imports instance astrid:process/host@1.0.0, but a matching implementation was not found in the linker` — the sage supervisor could not `astrid init` and `astrid-capsule-shell` v0.2.0 failed to load. The kernel now restores `@1.0.0` to its published shape and serves it alongside the additive `@1.1.0` (dual-version host, mirroring the `astrid:http@1.0.0`/`@1.1.0` precedent), so existing capsules load unchanged. Refs #1107, wit#19, #881, #890.
+
 ## [0.9.0] - 2026-07-02
 
 ### Breaking
