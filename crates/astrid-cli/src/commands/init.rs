@@ -192,17 +192,17 @@ pub(crate) async fn run_init(distro_source: &str, opts: &InitOpts) -> anyhow::Re
     if wrote_lock {
         eprintln!("{}", Theme::success("Installation complete."));
         eprintln!("  Run {} to start.", Theme::prompt("astrid"));
+        Ok(())
     } else {
-        eprintln!(
-            "{}",
-            Theme::warning(&format!(
-                "Installation incomplete: {succeeded}/{total} capsule(s) installed — \
-                 re-run `astrid init` to retry the rest."
-            ))
-        );
+        // Partial provision (0 < succeeded < total): no lock was written, so
+        // a re-run retries the rest. Exit NON-ZERO so automation and the
+        // in-conversation flow don't read a partial install as success —
+        // `astrid init` exits 0 IFF the distro is fully provisioned.
+        bail!(
+            "Installation incomplete: {succeeded}/{total} capsule(s) installed — \
+             re-run `astrid init` to retry the rest."
+        )
     }
-
-    Ok(())
 }
 
 /// Install a distro from a signed, self-contained `.shuttle` archive.

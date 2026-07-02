@@ -246,11 +246,25 @@ fn github_token() -> Option<String> {
 /// NOT an error — resolution simply proceeds anonymously.
 fn github_api_client() -> anyhow::Result<reqwest::Client> {
     let mut headers = reqwest::header::HeaderMap::new();
-    if let Some(token) = github_token()
-        && let Ok(mut value) = reqwest::header::HeaderValue::from_str(&format!("Bearer {token}"))
-    {
-        value.set_sensitive(true);
-        headers.insert(reqwest::header::AUTHORIZATION, value);
+    if let Some(token) = github_token() {
+        match reqwest::header::HeaderValue::from_str(&format!("Bearer {token}")) {
+            Ok(mut value) => {
+                value.set_sensitive(true);
+                headers.insert(reqwest::header::AUTHORIZATION, value);
+            },
+            // A PRESENT-but-malformed token is surfaced rather than silently
+            // dropped, but does NOT hard-fail: anonymous access still works
+            // for public repos, and aborting init over an unrelated bad env
+            // var is worse than the 60/hr ceiling. The token value is never
+            // echoed. An ABSENT token stays silent — the normal case.
+            Err(_) => {
+                eprintln!(
+                    "warning: ignoring malformed GH_TOKEN/GITHUB_TOKEN \
+                     (not a valid HTTP header value); proceeding with \
+                     anonymous GitHub API access"
+                );
+            },
+        }
     }
     reqwest::Client::builder()
         .user_agent("astrid-cli")
