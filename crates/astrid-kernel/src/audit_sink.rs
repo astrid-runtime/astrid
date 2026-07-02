@@ -50,11 +50,12 @@ fn truncate_guest_str(s: &str) -> String {
         return s.to_owned();
     }
     // Snap down to the largest char boundary at or below the cap so slicing
-    // never splits a multi-byte code point (which would panic).
-    let mut end = MAX_AUDIT_STR_BYTES;
-    while end > 0 && !s.is_char_boundary(end) {
-        end -= 1;
-    }
+    // never splits a multi-byte code point (which would panic). Index 0 is
+    // always a boundary, so the search always yields.
+    let end = (0..=MAX_AUDIT_STR_BYTES)
+        .rev()
+        .find(|&i| s.is_char_boundary(i))
+        .unwrap_or(0);
     s[..end].to_owned()
 }
 
