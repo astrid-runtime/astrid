@@ -18,7 +18,9 @@ ignore = [
     # no cargo-update path until plist releases a 0.41 bump.
     # Mitigation: quick-xml only parses syntect's bundled .tmTheme themes for CLI
     # syntax highlighting — local, trusted assets; no untrusted XML reaches this path.
-    # Remove both when plist > 1.9.0 is out (tracked in #1101).
+    # Remove both once our resolved plist requires quick-xml >= 0.41 — a newer
+    # plist alone is not sufficient (a patch release could still pin ^0.39).
+    # Tracked in #1101.
     "RUSTSEC-2026-0194",
     "RUSTSEC-2026-0195",
 ]
