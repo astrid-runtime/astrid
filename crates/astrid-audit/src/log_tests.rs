@@ -466,3 +466,79 @@ fn test_mixed_session_verify_chain_passes() {
     assert!(result.valid, "mixed chain: {:?}", result.issues);
     assert_eq!(result.entries_verified, 4);
 }
+
+/// Concurrent appends to the SAME `(session, principal)` chain must not fork it.
+///
+/// Regression for the pre-fix `append_inner`, which read the chain head under a
+/// short read lock, released it, then signed + stored + advanced the head as
+/// separate steps. Two appends racing on the same chain both read the same
+/// parent hash before either stored, then signed two entries claiming the same
+/// predecessor — forking the signed chain so that `verify_chain` reported
+/// `valid = false` (`BrokenLink` / duplicate genesis) under nothing more than
+/// ordinary concurrent host-call load.
+///
+/// A `Barrier` aligns every thread on its first append to force the race, and
+/// each thread appends several entries to widen the collision window. The atomic
+/// per-chain critical section (the whole append under the `chain_heads` write
+/// lock) must make the chain verify cleanly with every entry present. This test
+/// fails on the pre-fix code.
+#[test]
+fn test_concurrent_same_chain_appends_do_not_fork() {
+    const THREADS: usize = 8;
+    const PER_THREAD: usize = 16;
+    const TOTAL: usize = THREADS * PER_THREAD;
+
+    let keypair = KeyPair::generate();
+    let log = std::sync::Arc::new(AuditLog::in_memory(keypair));
+    let session_id = SessionId::new();
+    let principal = astrid_core::PrincipalId::new("alice").unwrap();
+
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(THREADS));
+
+    let handles: Vec<_> = (0..THREADS)
+        .map(|t| {
+            let log = std::sync::Arc::clone(&log);
+            let barrier = std::sync::Arc::clone(&barrier);
+            let session_id = session_id.clone();
+            let principal = principal.clone();
+            std::thread::spawn(move || {
+                // Align every thread on the first append to force the race.
+                barrier.wait();
+                for i in 0..PER_THREAD {
+                    log.append_with_principal(
+                        session_id.clone(),
+                        principal.clone(),
+                        AuditAction::FileRead {
+                            path: format!("t{t}-{i}.txt"),
+                        },
+                        AuthorizationProof::NotRequired {
+                            reason: "race".into(),
+                        },
+                        AuditOutcome::success(),
+                    )
+                    .expect("append must succeed");
+                }
+            })
+        })
+        .collect();
+
+    for h in handles {
+        h.join().expect("append thread panicked");
+    }
+
+    // Every append landed...
+    assert_eq!(
+        log.count_session(&session_id).unwrap(),
+        TOTAL,
+        "every concurrent append must be persisted"
+    );
+
+    // ...and the single principal chain is intact — no fork.
+    let result = log.verify_chain(&session_id).unwrap();
+    assert!(
+        result.valid,
+        "concurrent same-chain appends forked the signed chain: {:?}",
+        result.issues
+    );
+    assert_eq!(result.entries_verified, TOTAL);
+}

@@ -24,6 +24,40 @@ use tracing::warn;
 /// effect (there is no per-call user/capability token at this seam).
 const MANIFEST_GATED_REASON: &str = "manifest-gated host call";
 
+/// Byte cap applied to every guest-controlled string (path / host / addr /
+/// command) before it is signed and persisted onto the audit chain.
+///
+/// # Amplification threat
+///
+/// These strings are chosen by the guest and are otherwise unbounded. Every
+/// sensitive host call records one entry — INCLUDING gate-denied calls from a
+/// zero-capability capsule, which pay nothing to be denied. A capsule can
+/// therefore drive unbounded disk growth and per-append signing/hashing CPU by
+/// passing multi-megabyte paths/hosts/commands to host fns it isn't even
+/// allowed to use. Capping each field at a small constant removes that
+/// amplification while preserving enough of the value to be forensically
+/// useful.
+const MAX_AUDIT_STR_BYTES: usize = 1024;
+
+/// Truncate a guest-controlled string to at most [`MAX_AUDIT_STR_BYTES`],
+/// snapping to a UTF-8 char boundary so the stored value is always valid UTF-8.
+///
+/// See the [`MAX_AUDIT_STR_BYTES`] amplification threat: guest strings are
+/// unbounded and are signed+persisted per call, so they must be bounded at this
+/// sink boundary before `to_owned`.
+fn truncate_guest_str(s: &str) -> String {
+    if s.len() <= MAX_AUDIT_STR_BYTES {
+        return s.to_owned();
+    }
+    // Snap down to the largest char boundary at or below the cap so slicing
+    // never splits a multi-byte code point (which would panic).
+    let mut end = MAX_AUDIT_STR_BYTES;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    s[..end].to_owned()
+}
+
 /// Persists capsule per-action host calls onto the kernel's signed audit
 /// chain.
 ///
@@ -58,27 +92,30 @@ impl KernelAuditSink {
     /// zero hash is recorded as a documented placeholder pending a
     /// content-addressed follow-up.
     fn to_action(event: HostAuditEvent<'_>) -> AuditAction {
+        // Every guest-controlled string is bounded here (see
+        // `truncate_guest_str` / `MAX_AUDIT_STR_BYTES`) before it is signed and
+        // persisted, closing the disk/CPU amplification path.
         match event {
             HostAuditEvent::FileRead { path } => AuditAction::FileRead {
-                path: path.to_owned(),
+                path: truncate_guest_str(path),
             },
             HostAuditEvent::FileWrite { path } => AuditAction::FileWrite {
-                path: path.to_owned(),
+                path: truncate_guest_str(path),
                 // Content hash not captured at the per-action seam yet.
                 content_hash: ContentHash::zero(),
             },
             HostAuditEvent::FileDelete { path } => AuditAction::FileDelete {
-                path: path.to_owned(),
+                path: truncate_guest_str(path),
             },
             HostAuditEvent::NetConnect { host, port } => AuditAction::NetConnect {
-                host: host.to_owned(),
+                host: truncate_guest_str(host),
                 port,
             },
             HostAuditEvent::NetBind { addr } => AuditAction::NetBind {
-                addr: addr.to_owned(),
+                addr: truncate_guest_str(addr),
             },
             HostAuditEvent::ProcessSpawn { command } => AuditAction::ProcessSpawn {
-                command: command.to_owned(),
+                command: truncate_guest_str(command),
             },
         }
     }
@@ -248,5 +285,80 @@ mod tests {
             verification.valid,
             "chain must remain valid: {verification:?}"
         );
+    }
+
+    /// A multi-megabyte guest string is capped to [`MAX_AUDIT_STR_BYTES`] before
+    /// it is signed and persisted, and the stored form is still valid UTF-8.
+    #[test]
+    fn oversized_guest_strings_are_truncated_at_the_sink() {
+        let log = Arc::new(AuditLog::in_memory(KeyPair::generate()));
+        let session = SessionId::from_uuid(uuid::Uuid::from_u128(0x0995));
+        let sink = KernelAuditSink::new(Arc::clone(&log), session.clone());
+        let p = principal();
+
+        // 4 MiB of a multi-byte code point: exercises both the size cap and the
+        // char-boundary snap (the naive byte cut could land mid-'é').
+        let huge = "é".repeat(4 * 1024 * 1024);
+        assert!(huge.len() > MAX_AUDIT_STR_BYTES);
+
+        sink.record(
+            &p,
+            HostAuditEvent::ProcessSpawn { command: &huge },
+            // Even a denied call from a zero-capability capsule must not persist
+            // the unbounded string — that is the amplification vector.
+            HostAuditOutcome::Denied("not in host_process allowlist"),
+        );
+        sink.record(
+            &p,
+            HostAuditEvent::FileRead { path: &huge },
+            HostAuditOutcome::Allowed,
+        );
+
+        let entries = log
+            .get_principal_entries(&session, Some(&p))
+            .expect("read principal entries");
+        assert_eq!(entries.len(), 2);
+
+        for e in &entries {
+            let stored = match &e.action {
+                AuditAction::ProcessSpawn { command } => command,
+                AuditAction::FileRead { path } => path,
+                other => panic!("unexpected action: {other:?}"),
+            };
+            assert!(
+                stored.len() <= MAX_AUDIT_STR_BYTES,
+                "stored string must be capped: {} bytes",
+                stored.len()
+            );
+            // `str` is UTF-8 by construction; assert the snap preserved whole
+            // code points (no trailing partial 'é').
+            assert!(
+                stored.chars().all(|c| c == 'é'),
+                "truncation must not split a multi-byte code point"
+            );
+        }
+
+        // Bounding the field must not break the signed chain.
+        let verification = log.verify_chain(&session).expect("verify chain");
+        assert!(
+            verification.valid,
+            "chain must remain valid: {verification:?}"
+        );
+    }
+
+    /// The truncation helper snaps to a char boundary and is a no-op under the
+    /// cap.
+    #[test]
+    fn truncate_guest_str_snaps_to_char_boundary() {
+        // Under the cap: identity.
+        assert_eq!(truncate_guest_str("hello"), "hello");
+
+        // 'é' is 2 bytes; a string that ends exactly one byte past the cap must
+        // snap DOWN to the last whole code point, never mid-'é'.
+        let s = "é".repeat(MAX_AUDIT_STR_BYTES); // 2 * cap bytes
+        let out = truncate_guest_str(&s);
+        assert!(out.len() <= MAX_AUDIT_STR_BYTES);
+        assert!(out.is_char_boundary(out.len()));
+        assert!(out.chars().all(|c| c == 'é'));
     }
 }

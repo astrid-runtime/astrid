@@ -389,10 +389,19 @@ impl net::Host for HostState {
             read_timeout: None,
             write_timeout: None,
         });
-        let res = self
-            .resource_table
-            .push(net_stream)
-            .map_err(|e| ErrorCode::Unknown(format!("resource table: {e}")))?;
+        let res = match self.resource_table.push(net_stream) {
+            Ok(res) => res,
+            Err(e) => {
+                // The TCP connect ALREADY SUCCEEDED (the socket is open); the
+                // push consumes and drops the stream here, aborting the
+                // connection. Record the connect as having happened with a
+                // Failed outcome rather than returning silently via `?`.
+                let result: Result<Resource<TcpStream>, ErrorCode> =
+                    Err(ErrorCode::Unknown(format!("resource table: {e}")));
+                audit_net_connect(self, &host, port, &result);
+                return result;
+            },
+        };
         self.net_stream_count += 1;
         let result: Result<Resource<TcpStream>, ErrorCode> = Ok(Resource::new_own(res.rep()));
         audit_net_connect(self, &host, port, &result);

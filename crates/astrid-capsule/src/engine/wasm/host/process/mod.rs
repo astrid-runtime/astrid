@@ -41,7 +41,8 @@ use crate::engine::wasm::host_state::HostState;
 use managed::{ManagedProcess, attach_pipes, configure_piped, prepare_sandboxed_command};
 
 pub(crate) use audit::{
-    audit_process, audit_process_id, audit_process_injections, record_process_denied,
+    audit_process, audit_process_id, audit_process_injections, audit_spawn_result,
+    record_process_denied,
 };
 pub use persistent::PersistentProcessRegistry;
 pub use tracker::ProcessTracker;
@@ -175,20 +176,48 @@ impl process::Host for HostState {
         let injection_env = prepared.env;
         let _injection_guard = prepared.guard;
 
-        let mut sandboxed_cmd = prepare_sandboxed_command(
+        let mut sandboxed_cmd = match prepare_sandboxed_command(
             &request.cmd,
             &request.args,
             &workspace_root,
             &prepared.sandbox,
             &injection_env,
-        )
-        .map_err(|_| ErrorCode::InvalidInput)?;
+        ) {
+            Ok(cmd) => cmd,
+            Err(_) => {
+                // Sandbox construction failed before exec — audit the attempt as
+                // Failed instead of returning silently via `?`.
+                let result: Result<ProcessResult, ErrorCode> = Err(ErrorCode::InvalidInput);
+                audit_spawn_result(
+                    self,
+                    "astrid:process/host.spawn",
+                    &cmd_for_audit,
+                    &injection_audit,
+                    &result,
+                );
+                return result;
+            },
+        };
         sandboxed_cmd.stdout(Stdio::piped());
         sandboxed_cmd.stderr(Stdio::piped());
 
-        let child = sandboxed_cmd
-            .spawn()
-            .map_err(|e| ErrorCode::Unknown(format!("spawn failed: {e}")))?;
+        let child = match sandboxed_cmd.spawn() {
+            Ok(child) => child,
+            Err(e) => {
+                // Fork/exec failed — audit the attempt as Failed before
+                // returning.
+                let result: Result<ProcessResult, ErrorCode> =
+                    Err(ErrorCode::Unknown(format!("spawn failed: {e}")));
+                audit_spawn_result(
+                    self,
+                    "astrid:process/host.spawn",
+                    &cmd_for_audit,
+                    &injection_audit,
+                    &result,
+                );
+                return result;
+            },
+        };
         let pid = child.id();
         process_tracker.register(pid, call_id);
 
@@ -229,17 +258,13 @@ impl process::Host for HostState {
                 Err(ErrorCode::Cancelled)
             },
         };
-        if injection_audit.is_empty() {
-            audit_process(self, "astrid:process/host.spawn", &cmd_for_audit, &result);
-        } else {
-            audit_process_injections(
-                self,
-                "astrid:process/host.spawn",
-                &cmd_for_audit,
-                &injection_audit,
-                &result,
-            );
-        }
+        audit_spawn_result(
+            self,
+            "astrid:process/host.spawn",
+            &cmd_for_audit,
+            &injection_audit,
+            &result,
+        );
         result
     }
 
@@ -326,14 +351,29 @@ impl process::Host for HostState {
         let injection_audit = prepared.audit;
         let injection_env = prepared.env;
 
-        let mut sandboxed_cmd = prepare_sandboxed_command(
+        let mut sandboxed_cmd = match prepare_sandboxed_command(
             &request.cmd,
             &request.args,
             &workspace_root,
             &prepared.sandbox,
             &injection_env,
-        )
-        .map_err(|_| ErrorCode::InvalidInput)?;
+        ) {
+            Ok(cmd) => cmd,
+            Err(_) => {
+                // Sandbox construction failed before exec — audit the attempt as
+                // Failed instead of returning silently via `?`.
+                let result: Result<Resource<ProcessHandle>, ErrorCode> =
+                    Err(ErrorCode::InvalidInput);
+                audit_spawn_result(
+                    self,
+                    "astrid:process/host.spawn-background",
+                    &cmd_for_audit,
+                    &injection_audit,
+                    &result,
+                );
+                return result;
+            },
+        };
         configure_piped(&mut sandboxed_cmd);
 
         // Convert the prepared std::Command into a tokio::Command so the
@@ -346,9 +386,23 @@ impl process::Host for HostState {
         tokio_cmd.kill_on_drop(true);
 
         let command_str = format!("{} {}", request.cmd, request.args.join(" "));
-        let child = tokio_cmd
-            .spawn()
-            .map_err(|e| ErrorCode::Unknown(format!("spawn-background failed: {e}")))?;
+        let child = match tokio_cmd.spawn() {
+            Ok(child) => child,
+            Err(e) => {
+                // Fork/exec failed — audit the attempt as Failed before
+                // returning.
+                let result: Result<Resource<ProcessHandle>, ErrorCode> =
+                    Err(ErrorCode::Unknown(format!("spawn-background failed: {e}")));
+                audit_spawn_result(
+                    self,
+                    "astrid:process/host.spawn-background",
+                    &cmd_for_audit,
+                    &injection_audit,
+                    &result,
+                );
+                return result;
+            },
+        };
 
         let stdout_buf: Arc<Mutex<VecDeque<u8>>> = Arc::new(Mutex::new(VecDeque::new()));
         let stderr_buf: Arc<Mutex<VecDeque<u8>>> = Arc::new(Mutex::new(VecDeque::new()));
@@ -377,32 +431,38 @@ impl process::Host for HostState {
         // `cancel_by_call_ids` (cancelled by any matching event).
         self.process_tracker.register(pid, None);
 
-        let res = self
-            .resource_table
-            .push(managed)
-            .map_err(|e| ErrorCode::Unknown(format!("resource table: {e}")))?;
+        let res = match self.resource_table.push(managed) {
+            Ok(res) => res,
+            Err(e) => {
+                // The child has ALREADY forked (and is registered/kill-on-drop
+                // via `managed`, which drops here). The spawn genuinely happened,
+                // so audit it as a Failed spawn rather than returning with no
+                // trace of the exec.
+                let result: Result<Resource<ProcessHandle>, ErrorCode> =
+                    Err(ErrorCode::Unknown(format!("resource table: {e}")));
+                audit_spawn_result(
+                    self,
+                    "astrid:process/host.spawn-background",
+                    &cmd_for_audit,
+                    &injection_audit,
+                    &result,
+                );
+                return result;
+            },
+        };
         self.process_count_total += 1;
         *self
             .process_count_by_principal
             .entry(principal)
             .or_insert(0) += 1;
         let result: Result<Resource<ProcessHandle>, ErrorCode> = Ok(Resource::new_own(res.rep()));
-        if injection_audit.is_empty() {
-            audit_process(
-                self,
-                "astrid:process/host.spawn-background",
-                &cmd_for_audit,
-                &result,
-            );
-        } else {
-            audit_process_injections(
-                self,
-                "astrid:process/host.spawn-background",
-                &cmd_for_audit,
-                &injection_audit,
-                &result,
-            );
-        }
+        audit_spawn_result(
+            self,
+            "astrid:process/host.spawn-background",
+            &cmd_for_audit,
+            &injection_audit,
+            &result,
+        );
         result
     }
 

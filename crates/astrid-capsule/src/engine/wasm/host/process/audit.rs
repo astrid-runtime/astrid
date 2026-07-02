@@ -145,6 +145,28 @@ pub(crate) fn audit_process_injections<T, E: std::fmt::Debug>(
     }
 }
 
+/// Audit a spawn RESULT, routing through the injection-aware envelope when the
+/// spawn carried read-only file injections and the plain envelope otherwise.
+///
+/// Used by BOTH the success path and the early-return error arms (a failed
+/// `prepare_sandboxed_command`, a failed `spawn`, or a `resource_table` push
+/// failure after a child has already forked) so that every exit from a spawn
+/// host fn lands exactly one chain entry — the `?`-shortcut arms used to return
+/// before any audit, leaving a fork or a fork-failure with no trace.
+pub(crate) fn audit_spawn_result<T, E: std::fmt::Debug>(
+    state: &HostState,
+    op: &'static str,
+    cmd: &str,
+    injections: &[(String, String)],
+    result: &Result<T, E>,
+) {
+    if injections.is_empty() {
+        audit_process(state, op, cmd, result);
+    } else {
+        audit_process_injections(state, op, cmd, injections, result);
+    }
+}
+
 /// Emit the `astrid.audit.process` tracing line for a denied spawn AND
 /// report the typed `ProcessSpawn` + `Denied` event to the per-action audit
 /// sink. Used on the spawn gate-denial branches in place of the success-path

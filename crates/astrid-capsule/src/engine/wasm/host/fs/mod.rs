@@ -18,7 +18,10 @@
 //!   fs-remove-dir-all, fs-canonicalize, fs-read-link, fs-hard-link
 //!
 //! Audit: every path-based op emits `astrid.audit.fs` per call
-//! (capsule + principal + op + path).
+//! (capsule + principal + op + path). Both the allowed and the denied paths
+//! record the RESOLVED PHYSICAL path (the exact path the security gate
+//! evaluated), not the guest-supplied logical path — so a `home://x` allow and
+//! a `home://x` deny name the same on-disk target on the chain.
 
 mod file_handle;
 mod resolve;
@@ -299,7 +302,12 @@ impl fs::Host for HostState {
             })
             .unwrap_or(false);
         let result: Result<bool, ErrorCode> = Ok(exists);
-        audit_fs(self, "astrid:fs/host.fs-exists", &path, &result);
+        audit_fs(
+            self,
+            "astrid:fs/host.fs-exists",
+            &resolved.physical.to_string_lossy(),
+            &result,
+        );
         result
     }
 
@@ -330,7 +338,12 @@ impl fs::Host for HostState {
                 .unwrap_or(false);
             if !parent_exists {
                 let result: Result<(), ErrorCode> = Err(ErrorCode::NotFound);
-                audit_fs(self, "astrid:fs/host.fs-mkdir", &path, &result);
+                audit_fs(
+                    self,
+                    "astrid:fs/host.fs-mkdir",
+                    &resolved.physical.to_string_lossy(),
+                    &result,
+                );
                 return result;
             }
         }
@@ -340,7 +353,12 @@ impl fs::Host for HostState {
                 vfs_path.vfs.mkdir(&vfs_path.handle, &relative).await
             })
             .map_err(map_vfs_err);
-        audit_fs(self, "astrid:fs/host.fs-mkdir", &path, &result);
+        audit_fs(
+            self,
+            "astrid:fs/host.fs-mkdir",
+            &resolved.physical.to_string_lossy(),
+            &result,
+        );
         result
     }
 
@@ -368,7 +386,12 @@ impl fs::Host for HostState {
                     .await
             })
             .map_err(map_vfs_err);
-        audit_fs(self, "astrid:fs/host.fs-mkdir-all", &path, &result);
+        audit_fs(
+            self,
+            "astrid:fs/host.fs-mkdir-all",
+            &resolved.physical.to_string_lossy(),
+            &result,
+        );
         result
     }
 
@@ -388,7 +411,12 @@ impl fs::Host for HostState {
             })
             .map(|entries| entries.into_iter().map(|e| e.name).collect::<Vec<_>>())
             .map_err(map_vfs_err);
-        audit_fs(self, "astrid:fs/host.fs-readdir", &path, &result);
+        audit_fs(
+            self,
+            "astrid:fs/host.fs-readdir",
+            &resolved.physical.to_string_lossy(),
+            &result,
+        );
         result
     }
 
@@ -408,7 +436,12 @@ impl fs::Host for HostState {
             })
             .map(|m| to_file_stat(&m))
             .map_err(map_vfs_err);
-        audit_fs(self, "astrid:fs/host.fs-stat", &path, &result);
+        audit_fs(
+            self,
+            "astrid:fs/host.fs-stat",
+            &resolved.physical.to_string_lossy(),
+            &result,
+        );
         result
     }
 
@@ -433,7 +466,12 @@ impl fs::Host for HostState {
                     .await
             })
             .map_err(map_vfs_err);
-        audit_fs(self, "astrid:fs/host.fs-unlink", &path, &result);
+        audit_fs(
+            self,
+            "astrid:fs/host.fs-unlink",
+            &resolved.physical.to_string_lossy(),
+            &result,
+        );
         result
     }
 
@@ -496,7 +534,12 @@ impl fs::Host for HostState {
                 Ok(data)
             }
         });
-        audit_fs(self, "astrid:fs/host.read-file", &path, &result);
+        audit_fs(
+            self,
+            "astrid:fs/host.read-file",
+            &resolved.physical.to_string_lossy(),
+            &result,
+        );
         result
     }
 
@@ -523,7 +566,12 @@ impl fs::Host for HostState {
                 res
             })
             .map_err(map_vfs_err);
-        audit_fs(self, "astrid:fs/host.write-file", &path, &result);
+        audit_fs(
+            self,
+            "astrid:fs/host.write-file",
+            &resolved.physical.to_string_lossy(),
+            &result,
+        );
         result
     }
 

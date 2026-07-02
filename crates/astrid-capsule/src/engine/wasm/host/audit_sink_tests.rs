@@ -283,3 +283,48 @@ async fn audit_fs_reports_denied() {
         records[0].2
     );
 }
+
+/// End-to-end through a PUBLIC host fn: a denying capability checker must make
+/// `connect-tcp` fail closed AND land a `Denied` `NetConnect` on the sink.
+///
+/// The other tests call the `record_*` producers directly; this one drives the
+/// whole `net::Host::connect_tcp` gate path (validate → gate deny → record →
+/// early return) to prove the denial audit is actually wired into the host fn,
+/// not just reachable in isolation. A denied connect never touches the network
+/// (the gate rejects before any socket effect), so no real TCP is attempted.
+///
+/// `multi_thread` flavour: `connect_tcp` resolves its gate check through
+/// `bounded_block_on`, which uses `block_in_place` + `block_on` and therefore
+/// requires a multi-threaded runtime.
+#[tokio::test(flavor = "multi_thread")]
+async fn connect_tcp_denial_lands_on_the_chain() {
+    use crate::engine::wasm::bindings::astrid::net::host::Host as _;
+    use std::sync::Arc as StdArc;
+
+    let (mut state, sink) = state_with_sink(tokio::runtime::Handle::current());
+    state.security = Some(StdArc::new(crate::security::DenyAllGate));
+    let alice = PrincipalId::new("alice").unwrap();
+
+    let result = state.connect_tcp("example.com".to_string(), 443);
+    assert!(
+        result.is_err(),
+        "a gate-denied connect must fail closed, got {result:?}"
+    );
+
+    let records = sink.snapshot();
+    assert_eq!(
+        records.len(),
+        1,
+        "denied connect via the host fn must record exactly once"
+    );
+    assert_eq!(records[0].0, alice);
+    assert_eq!(
+        records[0].1,
+        CapturedEvent::NetConnect("example.com".into(), 443)
+    );
+    assert!(
+        matches!(records[0].2, CapturedOutcome::Denied(_)),
+        "gate-denied connect must report Denied, got {:?}",
+        records[0].2
+    );
+}
