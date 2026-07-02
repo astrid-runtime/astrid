@@ -56,6 +56,34 @@ fn rc_path_guard_rejects_substring_false_positives() {
 }
 
 #[test]
+fn rc_path_guard_ignores_commented_lines() {
+    // These cases probe the bounded-component SCAN, so they use a manual
+    // PATH line rather than the exact `export_line` (which the fast path
+    // catches before the scan runs).
+    let bin = "/home/jb/.astrid/bin";
+    let export = format!("export PATH=\"{bin}:$PATH\"");
+
+    // A commented-out line is inert: its bounded `bin_str` must NOT count as
+    // configured, or the real PATH setup is silently skipped.
+    let commented = "# PATH=/home/jb/.astrid/bin\n";
+    assert!(!rc_configures_path(commented, bin, &export));
+
+    // An inline comment after other content on the same line is still a
+    // comment for this occurrence.
+    let inline = "echo hi  # note: /home/jb/.astrid/bin\n";
+    assert!(!rc_configures_path(inline, bin, &export));
+
+    // The same bounded token on an ACTIVE (uncommented) line IS configured.
+    let active = "PATH=/home/jb/.astrid/bin\n";
+    assert!(rc_configures_path(active, bin, &export));
+
+    // A commented occurrence followed by a real active one is configured
+    // (the scan skips the comment and finds the live token).
+    let both = "# PATH=/home/jb/.astrid/bin\nPATH=/home/jb/.astrid/bin\n";
+    assert!(rc_configures_path(both, bin, &export));
+}
+
+#[test]
 fn homebrew_path_is_detected() {
     assert!(is_homebrew_managed(Path::new(
         "/opt/homebrew/Cellar/astrid/0.8.0/bin/astrid"

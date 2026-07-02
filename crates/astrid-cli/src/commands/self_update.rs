@@ -701,6 +701,21 @@ fn rc_configures_path(rc_contents: &str, bin_str: &str, export_line: &str) -> bo
     while let Some(rel) = rc_contents[from..].find(bin_str) {
         let start = from.saturating_add(rel);
         let end = start.saturating_add(bin_str.len());
+
+        // A `#` anywhere between the line start and the match means this
+        // occurrence sits inside a commented-out (inert) line, e.g.
+        // `# export PATH="…/.astrid/bin:$PATH"`. Treating that as configured
+        // would silently skip the real PATH setup, so skip this match and
+        // keep scanning. Errs toward ADDING the block: a literal `#` in a
+        // real path is vanishingly rare and only yields a harmless duplicate.
+        let line_start = rc_contents[..start]
+            .rfind('\n')
+            .map_or(0, |nl| nl.saturating_add(1));
+        if rc_contents[line_start..start].contains('#') {
+            from = end;
+            continue;
+        }
+
         let lead_ok = start == 0
             || rc_contents[..start]
                 .chars()
