@@ -12,6 +12,15 @@ ignore = [
     # Mitigation: Astrid uses ed25519 for all auth/signing (astrid-crypto). RSA is only
     # used internally by SurrealDB for JWT in embedded mode, not exposed to network attackers.
     "RUSTSEC-2023-0071",
+    # quick-xml DoS pair (CPU-quadratic duplicate-attribute check / unbounded NsReader
+    # namespace allocation), fixed in quick-xml >= 0.41. Transitive via
+    # astrid-cli -> syntect -> plist 1.9.0, which still requires quick-xml ^0.39 —
+    # no cargo-update path until plist releases a 0.41 bump.
+    # Mitigation: quick-xml only parses syntect's bundled .tmTheme themes for CLI
+    # syntax highlighting — local, trusted assets; no untrusted XML reaches this path.
+    # Remove both when plist > 1.9.0 is out (tracked in #1101).
+    "RUSTSEC-2026-0194",
+    "RUSTSEC-2026-0195",
 ]
 informational_warnings = []
 
