@@ -4,6 +4,10 @@ pub mod admin;
 /// `astrid-capsule-install` library so the daemon and the CLI reach
 /// disk through the same code path.
 mod install;
+/// Kernel-response publishing envelope + the long-request keepalive pinger.
+mod response;
+
+pub(crate) use response::{KeepalivePinger, publish_response};
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::sync::Arc;
@@ -15,7 +19,6 @@ use astrid_capabilities::{CapabilityCheck, PermissionError};
 use astrid_core::principal::PrincipalId;
 use astrid_events::ipc::{IpcMessage, IpcPayload, Topic};
 use astrid_events::kernel_api::{KernelRequest, KernelResponse};
-use serde::Serialize;
 use tracing::{debug, info, warn};
 
 #[cfg(test)]
@@ -267,6 +270,17 @@ async fn handle_request(
         },
     }
 
+    // Keepalive pinger: from here until the terminal response is published, emit
+    // a `KernelResponse::Working` frame every `KEEPALIVE_INTERVAL` so a waiting
+    // uplink treats a slow-but-live handler (chiefly `InstallCapsule`, which
+    // loads + runs the capsule's `#[install]` hook) as an *inactivity* window it
+    // keeps resetting, rather than tripping a total-deadline timeout. A fast
+    // handler finishes before the first interval and emits zero pings. Uniform
+    // across every request — no per-endpoint config. Dropped before each
+    // terminal publish below so the terminal frame is never preceded by a late
+    // redundant ping.
+    let pinger = KeepalivePinger::spawn(kernel, response_topic.clone());
+
     let res = match req {
         KernelRequest::InstallCapsule { source, workspace } => {
             info!(source = %source, workspace, "Kernel received install request");
@@ -367,6 +381,9 @@ async fn handle_request(
                 reason = reason.as_deref().unwrap_or("none"),
                 "Kernel received shutdown request via management API"
             );
+            // Stop the keepalive before the terminal frame so a late `Working`
+            // can't trail the shutdown confirmation.
+            drop(pinger);
             // Publish response before signaling shutdown so the client gets confirmation.
             publish_response(
                 kernel,
@@ -428,6 +445,9 @@ async fn handle_request(
         },
     };
 
+    // Stop the keepalive before the terminal frame so it isn't preceded by a
+    // late redundant `Working`.
+    drop(pinger);
     publish_response(kernel, response_topic, res);
 }
 
@@ -578,20 +598,6 @@ impl CapsuleVisibility {
         } else {
             registry.cloned_values_for(&self.principal)
         }
-    }
-}
-
-fn publish_response<R: Serialize>(kernel: &Arc<crate::Kernel>, response_topic: Topic, res: R) {
-    if let Ok(val) = serde_json::to_value(res) {
-        let msg = IpcMessage::new(
-            response_topic,
-            IpcPayload::RawJson(val),
-            kernel.session_id.0,
-        );
-        let _ = kernel.event_bus.publish(astrid_events::AstridEvent::Ipc {
-            metadata: astrid_events::EventMetadata::new("kernel_router"),
-            message: msg,
-        });
     }
 }
 

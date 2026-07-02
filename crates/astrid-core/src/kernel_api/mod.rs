@@ -103,6 +103,19 @@ pub enum KernelResponse {
         /// The specific capabilities required (e.g. `["host_process", "fs_write"]`).
         capabilities: Vec<String>,
     },
+    /// Liveness / keepalive signal that a long-running request is still being
+    /// processed. Serializes as `{"status":"Working"}` (the enum uses
+    /// `PascalCase` variant names on the wire, matching `Success` / `Error`).
+    ///
+    /// The kernel emits this periodically on a request's response topic while a
+    /// slow handler (chiefly `InstallCapsule`, which loads and runs a capsule's
+    /// `#[install]` hook) is still in flight. It is **never** a terminal
+    /// response: an uplink that receives it resets its inactivity window and
+    /// keeps waiting for the real response, and it never reaches an HTTP client
+    /// — the uplink swallows it (see `astrid-uplink`'s `KernelClient::request`).
+    /// A stray late `Working` that races out after the terminal response is
+    /// harmless: the uplink skips it and returns the already-received terminal.
+    Working,
 }
 
 /// Daemon runtime status information.
@@ -943,49 +956,4 @@ pub struct GroupSummary {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::{CommandInfo, CommandKind};
-
-    #[test]
-    fn command_info_kind_defaults_to_slash_on_wire() {
-        // A frame from a daemon that predates the `kind` field has no
-        // `kind` key; it must deserialize to the Slash default so an older
-        // daemon's commands keep listing as slash commands.
-        let json = serde_json::json!({
-            "name": "git",
-            "description": "git ops",
-            "provider_capsule": "git-capsule",
-        });
-        let info: CommandInfo = serde_json::from_value(json).unwrap();
-        assert_eq!(info.kind, CommandKind::Slash);
-    }
-
-    #[test]
-    fn command_info_kind_roundtrips_cli() {
-        let info = CommandInfo {
-            name: "deploy".into(),
-            description: "deploy it".into(),
-            provider_capsule: "ops".into(),
-            kind: CommandKind::Cli,
-        };
-        let json = serde_json::to_value(&info).unwrap();
-        // `cli` is not the default, so it is serialized.
-        assert_eq!(json.get("kind").and_then(|k| k.as_str()), Some("cli"));
-        let back: CommandInfo = serde_json::from_value(json).unwrap();
-        assert_eq!(back.kind, CommandKind::Cli);
-    }
-
-    #[test]
-    fn command_info_default_kind_omitted_from_wire() {
-        let info = CommandInfo {
-            name: "git".into(),
-            description: "git ops".into(),
-            provider_capsule: "git-capsule".into(),
-            kind: CommandKind::Slash,
-        };
-        let json = serde_json::to_value(&info).unwrap();
-        // Default kind is skipped so the wire shape is byte-compatible with
-        // pre-field consumers.
-        assert!(json.get("kind").is_none());
-    }
-}
+mod tests;

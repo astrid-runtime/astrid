@@ -187,6 +187,26 @@ impl SocketClient {
         })
     }
 
+    /// Build a `SocketClient` directly over a connected [`tokio::net::UnixStream`],
+    /// bypassing the token handshake. Test-only: lets the crate's own tests drive
+    /// the framed read/write path over a `UnixStream::pair()` loopback without a
+    /// live daemon.
+    #[cfg(test)]
+    pub(crate) fn from_stream_for_test(
+        stream: tokio::net::UnixStream,
+        session_id: SessionId,
+        principal: PrincipalId,
+    ) -> Self {
+        let (read_half, write_half) = stream.into_split();
+        Self {
+            read_half,
+            write_half,
+            session_id,
+            principal,
+            authenticated: true,
+        }
+    }
+
     /// Whether the handshake bound this connection to its requested
     /// [`principal`](Self::principal) via the signed challenge. `false` means
     /// the connection took the legacy single-frame path and the daemon stamped

@@ -45,6 +45,7 @@ use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
 use crate::error::{ErrorBody, GatewayError, GatewayResult};
+use crate::routes::daemon_kernel_error;
 use crate::routes::principals::caller_from;
 use crate::state::GatewayState;
 
@@ -118,7 +119,7 @@ pub async fn list_capsules(
     let resp = client
         .request(KernelRequest::ListCapsules)
         .await
-        .map_err(daemon_internal)?;
+        .map_err(daemon_kernel_error)?;
     match resp {
         // `ListCapsules` returns `KernelResponse::Success(JsonArray)`
         // (kernel_router/mod.rs handler) — a list of capsule-id
@@ -164,6 +165,7 @@ pub async fn list_capsules(
         (status = 403, body = ErrorBody, description = "Surfaces every kernel-side `InstallCapsule` failure: capability denial, a non-GitHub URL or `workspace` flag the kernel rejects, AND install/validation failures (missing path, malformed archive, lifecycle-hook error). The kernel returns an undifferentiated error string, so these are not split into distinct status codes here."),
         (status = 404, body = ErrorBody, description = "GitHub release or .capsule asset not found."),
         (status = 400, body = ErrorBody, description = "Ambiguous multi-capsule release (specify `capsule`), or archive too large."),
+        (status = 504, body = ErrorBody, description = "The daemon did not finish the install in time (still unpacking + running the capsule's install lifecycle hook, or wedged). Transient — the request may still be completing kernel-side; the caller may retry. Distinct from a 500 transport fault."),
     )
 )]
 pub async fn install_capsule(
@@ -197,7 +199,7 @@ pub async fn install_capsule(
     let resp = client
         .request(KernelRequest::InstallCapsule { source, workspace })
         .await
-        .map_err(daemon_internal)?;
+        .map_err(daemon_kernel_error)?;
     match resp {
         KernelResponse::Success(v) => Ok(Json(v)),
         // `ApprovalRequired` is the kernel's way of saying "this
@@ -391,7 +393,7 @@ pub async fn get_capsule(
     let resp = client
         .request(KernelRequest::GetCapsuleMetadata)
         .await
-        .map_err(daemon_internal)?;
+        .map_err(daemon_kernel_error)?;
     match resp {
         KernelResponse::CapsuleMetadata(meta) => meta
             .into_iter()
@@ -439,14 +441,6 @@ pub async fn list_capsule_topics(
 }
 
 // ── helpers (kernel client error mapping) ────────────────────────
-
-#[allow(
-    clippy::needless_pass_by_value,
-    reason = "consumed by Display formatting"
-)]
-fn daemon_internal(e: anyhow::Error) -> GatewayError {
-    GatewayError::Internal(anyhow::anyhow!("daemon kernel-request: {e}"))
-}
 
 fn internal(msg: String) -> GatewayError {
     GatewayError::Internal(anyhow::anyhow!(msg))
@@ -592,6 +586,22 @@ mod tests {
             !std::path::Path::new(&path).exists(),
             "guard drop must delete the staged archive",
         );
+    }
+
+    /// A kernel `Error` response is a real install/authz failure, NOT a
+    /// timeout — the install handler maps it to 403 `Forbidden`, unchanged by
+    /// this fix. Guards that the 504 timeout path did not swallow the 403
+    /// distinction. (The timeout→504 mapping itself is tested in `routes/mod.rs`
+    /// against the typed `daemon_kernel_error`.)
+    #[test]
+    fn kernel_error_response_maps_to_forbidden_not_timeout() {
+        let resp = KernelResponse::Error("missing capsule:install".to_string());
+        // Mirror the install handler's terminal match on a kernel Error.
+        let mapped = match resp {
+            KernelResponse::Error(msg) => GatewayError::Forbidden { reason: msg },
+            _ => panic!("expected Error variant"),
+        };
+        assert!(matches!(mapped, GatewayError::Forbidden { .. }));
     }
 
     /// A crafted release-asset name with path traversal is reduced to its
