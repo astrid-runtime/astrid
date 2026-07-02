@@ -121,47 +121,69 @@ jobs:
           pattern: binary-*
           merge-multiple: true
 
-      - name: Extract changelog for this version
-        id: changelog
-        run: |
-          VERSION="${GITHUB_REF_NAME#v}"
-          BODY=$(awk "/^## \\[$VERSION\\]/{found=1; next} /^## \\[/{if(found) exit} found" CHANGELOG.md)
-          if [ -z "$BODY" ]; then
-            BODY="See [CHANGELOG.md](https://github.com/unicity-astrid/astrid/blob/${GITHUB_REF_NAME}/CHANGELOG.md) for details."
-          fi
-          {
-            echo "body<<EOF"
-            echo "$BODY"
-            echo "EOF"
-          } >> "$GITHUB_OUTPUT"
-
-      - name: Compile Astrinauts for this release
-        id: contributors
+      # The whole notes document is assembled into a FILE and handed to the
+      # release action via `body_path`. An inline `body:` input reaches the
+      # action as an environment variable on its node process, and a large
+      # changelog section blows past the kernel's per-string env/arg ceiling
+      # (E2BIG, "Argument list too long") before the step can even start —
+      # exactly what killed the v0.9.0 release (#1105).
+      - name: Compose release notes
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          NOTES=release-notes.md
+          # Exact-prefix match on the version header — the version goes in as a
+          # string, never a regex, so dots (or any metacharacter in a tag name)
+          # cannot widen the match.
+          awk -v ver="$VERSION" 'index($0, "## [" ver "]") == 1 {found=1; next} /^## \[/{if(found) exit} found' CHANGELOG.md > "$NOTES"
+          if [ ! -s "$NOTES" ]; then
+            echo "See [CHANGELOG.md](https://github.com/unicity-astrid/astrid/blob/${GITHUB_REF_NAME}/CHANGELOG.md) for details." > "$NOTES"
+          fi
+          cat >> "$NOTES" <<'INSTALL'
+
+          ## Install
+
+          **From source (requires Rust 1.95+):**
+          ```
+          cargo install astrid
+          ```
+
+          **Pre-built binaries:**
+          Download the archive for your platform, extract, and add to PATH:
+          ```
+          tar xzf astrid-*-$(uname -m)-*.tar.gz
+          sudo mv astrid-*/astrid astrid-*/astrid-daemon astrid-*/astrid-build astrid-*/astrid-emit /usr/local/bin/
+          ```
+
+          Then run `astrid init` to set up capsules.
+
+          ---
+
+          **With many thanks from the following Astrinauts** 🚀
+
+          INSTALL
           PREV_TAG=$(git tag --sort=-v:refname | sed -n '2p')
           if [ -z "$PREV_TAG" ]; then
             AUTHORS=$(git log --format='%aN' | sort -u)
           else
             AUTHORS=$(git log --format='%aN' "$PREV_TAG"..HEAD | sort -u)
           fi
-          ASTRINAUTS=""
           while IFS= read -r name; do
             [ -z "$name" ] && continue
             EMAIL=$(git log --format='%aE' --author="$name" -1)
             USERNAME=$(gh api "search/users?q=$EMAIL+in:email" --jq '.items[0].login // empty' 2>/dev/null || true)
-            if [ -n "$USERNAME" ]; then
-              ASTRINAUTS="${ASTRINAUTS}\n- @${USERNAME}"
+            # A failed lookup must fall back to the plain author name, never
+            # leak whatever stdout produced (the v0.9.0 run interpolated a raw
+            # 422 error JSON as a contributor) — accept only a well-formed
+            # GitHub login.
+            if printf '%s' "$USERNAME" | grep -qE '^[A-Za-z0-9]([A-Za-z0-9-]{0,37}[A-Za-z0-9])?$' \
+               && ! printf '%s' "$USERNAME" | grep -q -- '--'; then
+              echo "- @${USERNAME}" >> "$NOTES"
             else
-              ASTRINAUTS="${ASTRINAUTS}\n- ${name}"
+              echo "- ${name}" >> "$NOTES"
             fi
           done <<< "$AUTHORS"
-          {
-            echo "list<<EOF"
-            echo -e "$ASTRINAUTS"
-            echo "EOF"
-          } >> "$GITHUB_OUTPUT"
 
       - name: Generate checksums
         run: |
@@ -195,29 +217,7 @@ jobs:
             artifacts/*.tar.gz
             artifacts/SHA256SUMS.txt
             artifacts/*.sigstore.json
-          body: |
-            ${{ steps.changelog.outputs.body }}
-
-            ## Install
-
-            **From source (requires Rust 1.95+):**
-            ```
-            cargo install astrid
-            ```
-
-            **Pre-built binaries:**
-            Download the archive for your platform, extract, and add to PATH:
-            ```
-            tar xzf astrid-*-$(uname -m)-*.tar.gz
-            sudo mv astrid-*/astrid astrid-*/astrid-daemon astrid-*/astrid-build astrid-*/astrid-emit /usr/local/bin/
-            ```
-
-            Then run `astrid init` to set up capsules.
-
-            ---
-
-            **With many thanks from the following Astrinauts** 🚀
-            ${{ steps.contributors.outputs.list }}
+          body_path: release-notes.md
 
       - name: Notify Homebrew tap
         env:
