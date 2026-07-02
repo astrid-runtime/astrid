@@ -9,6 +9,8 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-07-02
+
 ### Breaking
 
 - **`astrid-uplink`'s kernel-request client API is now typed instead of `anyhow`.** `KernelClient::request` and `BusKernelClient::request` return `Result<KernelResponse, KernelClientError>` instead of `anyhow::Result`; the public `is_timeout()` / `RequestTimeout` marker items are removed, and `KernelClientError` / `TimeoutKind` are added. Semver-major for this internal crate, but there are no external consumers and every in-workspace call site is updated (the gateway matches `KernelClientError::Timeout` directly for the new `504`). No version bump ships here — releases bump versions separately. This underpins the gateway↔kernel timeout change described under Changed (#1092).
