@@ -668,6 +668,18 @@ fn detect_shell_rc() -> Option<PathBuf> {
     }
 }
 
+/// Whether `rc_contents` already puts the bin dir on PATH, so a second run
+/// must not append a duplicate block.
+///
+/// Matches either the bin dir path appearing anywhere (covers a
+/// manually-added line or a previously-written block, even if the exact
+/// export syntax differs) or the precise export line we emit. Pure over its
+/// inputs so the idempotency guarantee is unit-testable without touching a
+/// real shell rc.
+fn rc_configures_path(rc_contents: &str, bin_str: &str, export_line: &str) -> bool {
+    rc_contents.contains(bin_str) || rc_contents.contains(export_line)
+}
+
 /// Ensure `~/.astrid/bin` is in PATH. Prompts user if interactive.
 ///
 /// Called by `astrid init` after capsule installation.
@@ -694,9 +706,12 @@ pub(crate) fn ensure_path_setup() -> anyhow::Result<()> {
         format!("export PATH=\"{bin_str}:$PATH\"")
     };
 
-    // Check if already in the RC file
+    // Idempotency: if the rc file already wires the bin dir onto PATH, do
+    // NOT append a second block. `astrid init` (and the first-run auto-init)
+    // calls this on every run, so an unguarded append would accumulate a
+    // duplicate `# Astrid OS` block per invocation.
     if let Ok(contents) = std::fs::read_to_string(&rc_file)
-        && contents.contains(&*bin_str)
+        && rc_configures_path(&contents, &bin_str, &export_line)
     {
         return Ok(()); // Already configured, just not sourced yet
     }
@@ -745,6 +760,31 @@ pub(crate) fn ensure_path_setup() -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rc_path_guard_is_idempotent() {
+        let bin = "/home/jb/.astrid/bin";
+        let export = format!("export PATH=\"{bin}:$PATH\"");
+
+        // Empty rc: nothing wired yet — must append.
+        assert!(!rc_configures_path("", bin, &export));
+
+        // After the block was written once, a second run must be a no-op.
+        let after_first_write = format!("# existing\n\n# Astrid OS\n{export}\n");
+        assert!(rc_configures_path(&after_first_write, bin, &export));
+
+        // A manually-added line with different syntax but the same bin dir
+        // is also recognised (guard on the path, not just our exact line).
+        let manual = format!("export PATH=$PATH:{bin}\n");
+        assert!(rc_configures_path(&manual, bin, &export));
+
+        // An unrelated rc must NOT be treated as configured.
+        assert!(!rc_configures_path(
+            "export PATH=\"/usr/bin:$PATH\"\n",
+            bin,
+            &export
+        ));
+    }
 
     #[test]
     fn homebrew_path_is_detected() {

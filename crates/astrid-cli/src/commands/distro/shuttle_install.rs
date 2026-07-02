@@ -133,12 +133,17 @@ pub(crate) fn install_from_shuttle(shuttle_path: &Path, opts: &InitOpts) -> anyh
     // any install side effect.
     verify_capsule_hashes(mirror, &lock)?;
 
+    // The process-wide principal (global `--principal` flag). The offline
+    // install scopes env config, capsule files, and the Distro.lock to this
+    // principal's home, matching the online `astrid init` path.
+    let principal = crate::principal::current();
+
     // 5. Select capsules + collect variables (headless-aware).
     let variables = manifest.variables.clone();
     let selected = crate::commands::init::select_capsules(manifest.capsules.clone(), opts.yes)?;
     let vars =
         crate::commands::init::collect_variables(&variables, &selected, opts.yes, &opts.vars)?;
-    crate::commands::init::write_env_files(&home, &selected, &vars)?;
+    crate::commands::init::write_env_files(&home, &principal, &selected, &vars)?;
 
     // 6. Install each selected capsule from the verified mirror. The
     //    sealed lock IS the resolved truth offline — no resolution
@@ -151,6 +156,7 @@ pub(crate) fn install_from_shuttle(shuttle_path: &Path, opts: &InitOpts) -> anyh
         lock.capsules.iter().map(|c| (c.name.as_str(), c)).collect();
     let locked = install_selected_capsules(
         &home,
+        &principal,
         mirror,
         &selected,
         &sealed_capsules,
@@ -159,7 +165,6 @@ pub(crate) fn install_from_shuttle(shuttle_path: &Path, opts: &InitOpts) -> anyh
     )?;
 
     // 7. Write the user's Distro.lock, carrying the sealed manifest hash.
-    let principal = astrid_core::PrincipalId::default();
     let lock_path = home
         .principal_home(&principal)
         .config_dir()
@@ -191,6 +196,7 @@ pub(crate) fn install_from_shuttle(shuttle_path: &Path, opts: &InitOpts) -> anyh
 /// sealed lock's already-verified blake3 if meta is absent.
 fn install_selected_capsules(
     home: &AstridHome,
+    principal: &astrid_core::PrincipalId,
     mirror: &Path,
     selected: &[super::manifest::DistroCapsule],
     sealed_capsules: &std::collections::HashMap<&str, &LockedCapsule>,
@@ -226,8 +232,11 @@ fn install_selected_capsules(
         // Record the installed content-addressed WASM hash from meta,
         // falling back to the sealed lock's already-verified archive blake3
         // (no re-read: `verify_capsule_hashes` proved file bytes == this).
-        let target_dir =
-            crate::commands::capsule::install::resolve_target_dir(home, &cap.name, false)?;
+        // Read back from the scoped principal's home — the offline install
+        // (via `install_offline_capsule`) wrote it there.
+        let target_dir = crate::commands::capsule::install::resolve_target_dir_for(
+            home, principal, &cap.name, false,
+        )?;
         let installed_hash = crate::commands::capsule::meta::read_meta(&target_dir)
             .and_then(|m| m.wasm_hash)
             .map_or_else(
