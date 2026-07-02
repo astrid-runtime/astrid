@@ -171,7 +171,7 @@ where
     let stream = net_stream(&state.resource_table, rep)?;
     let rt = state.runtime_handle.clone();
     let sem = state.blocking_semaphore.clone();
-    let tok = state.cancel_token.clone();
+    let tok = state.effective_cancel_token();
     match stream {
         NetStream::Tcp(slot) => {
             let result = util::bounded_block_on_cancellable(&rt, &sem, &tok, async move {
@@ -248,7 +248,7 @@ impl net::Host for HostState {
 
         let rt_handle = self.runtime_handle.clone();
         let blocking_semaphore = self.blocking_semaphore.clone();
-        let cancel_token = self.cancel_token.clone();
+        let cancel_token = self.effective_cancel_token();
 
         let connect_result = util::bounded_block_on_cancellable(
             &rt_handle,

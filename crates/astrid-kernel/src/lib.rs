@@ -1311,11 +1311,27 @@ impl Kernel {
                 );
             }
         } else {
+            // The shared runtime survives — but the DEPARTING principal's
+            // in-flight blocking host calls (approval/elicit waits, net/io/ipc
+            // waits) would otherwise keep running inside it with nothing left
+            // to answer them, wedging the shared instance for every remaining
+            // principal. Cancel exactly that principal's waits; everyone
+            // else's work is untouched (per-principal child tokens, not the
+            // instance-wide `request_cancel`).
+            //
+            // Accepted race: an invocation dispatched before the unregister
+            // above but installing its per-principal context after this cancel
+            // mints a fresh token and survives until its own timeout. New
+            // invocations cannot dispatch (the view is gone), so the window is
+            // bounded; closing it would take cross-component locking between
+            // the registry and every engine, which is not worth it.
+            removed.capsule.request_cancel_for(principal);
             tracing::debug!(
                 capsule_id = %id,
                 principal = %principal,
                 "Unloaded one view of a shared runtime; other principals still \
-                 reference it, so the runtime is left running"
+                 reference it, so the runtime is left running and only the \
+                 departing principal's in-flight host calls were cancelled"
             );
         }
 
@@ -2885,6 +2901,10 @@ mod tests {
         manifest: CapsuleManifest,
         cancelled: Arc<AtomicBool>,
         unloaded: Arc<AtomicBool>,
+        /// Records every `request_cancel_for` call, in order, so tests can
+        /// assert the per-principal cancel fires for exactly the releasing
+        /// principal (and never as a substitute for the full instance cancel).
+        cancelled_for: Arc<std::sync::Mutex<Vec<PrincipalId>>>,
     }
 
     #[async_trait::async_trait]
@@ -2912,6 +2932,13 @@ mod tests {
 
         fn request_cancel(&self) {
             self.cancelled.store(true, Ordering::Relaxed);
+        }
+
+        fn request_cancel_for(&self, principal: &PrincipalId) {
+            self.cancelled_for
+                .lock()
+                .expect("cancelled_for mutex")
+                .push(principal.clone());
         }
     }
 
@@ -2948,6 +2975,7 @@ mod tests {
                     manifest: CapsuleManifest::default(),
                     cancelled: Arc::clone(&cancelled),
                     unloaded: Arc::clone(&unloaded),
+                    cancelled_for: Arc::default(),
                 }))
                 .unwrap();
         }
@@ -2998,6 +3026,7 @@ mod tests {
         let hash = astrid_capsule::registry::WasmHash::from_raw("shared-test-hash");
         let cancelled = Arc::new(AtomicBool::new(false));
         let unloaded = Arc::new(AtomicBool::new(false));
+        let cancelled_for: Arc<std::sync::Mutex<Vec<PrincipalId>>> = Arc::default();
 
         {
             let mut registry = kernel.capsules.write().await;
@@ -3014,6 +3043,7 @@ mod tests {
                         manifest: CapsuleManifest::default(),
                         cancelled: Arc::clone(&cancelled),
                         unloaded: Arc::clone(&unloaded),
+                        cancelled_for: Arc::clone(&cancelled_for),
                     }),
                     hash.clone(),
                     &alice,
@@ -3033,20 +3063,48 @@ mod tests {
             !unloaded.load(Ordering::Relaxed),
             "releasing one view of a shared runtime must NOT unload it while bob references it"
         );
+        assert_eq!(
+            cancelled_for.lock().expect("cancelled_for mutex").clone(),
+            vec![alice.clone()],
+            "the non-last release must cancel exactly the releasing principal's \
+             in-flight host calls — no one else's"
+        );
 
-        let registry = kernel.capsules.read().await;
+        {
+            let registry = kernel.capsules.read().await;
+            assert!(
+                registry.get_for(&alice, &id).is_none(),
+                "alice's view should no longer contain the capsule"
+            );
+            assert!(
+                registry.get_for(&bob, &id).is_some(),
+                "bob's view should retain the shared runtime"
+            );
+            assert_eq!(
+                registry.refcount_for_hash(&hash),
+                Some(1),
+                "shared runtime refcount drops to bob's single remaining view"
+            );
+        }
+
+        // Bob's release is the LAST view: the full instance-scoped
+        // `request_cancel` + `unload` path runs, and no additional
+        // per-principal cancel substitutes for it.
+        let removed = kernel.unload_one_capsule(&id, &bob).await.unwrap();
+        assert!(removed);
         assert!(
-            registry.get_for(&alice, &id).is_none(),
-            "alice's view should no longer contain the capsule"
+            cancelled.load(Ordering::Relaxed),
+            "the last release must use the full instance-scoped request_cancel"
         );
         assert!(
-            registry.get_for(&bob, &id).is_some(),
-            "bob's view should retain the shared runtime"
+            unloaded.load(Ordering::Relaxed),
+            "the last release must unload the runtime"
         );
         assert_eq!(
-            registry.refcount_for_hash(&hash),
-            Some(1),
-            "shared runtime refcount drops to bob's single remaining view"
+            cancelled_for.lock().expect("cancelled_for mutex").clone(),
+            vec![alice],
+            "the last release goes through the instance-scoped path, not \
+             request_cancel_for"
         );
     }
 
@@ -3222,6 +3280,7 @@ mod tests {
                     manifest: CapsuleManifest::default(),
                     cancelled: Arc::new(AtomicBool::new(false)),
                     unloaded: Arc::new(AtomicBool::new(false)),
+                    cancelled_for: Arc::default(),
                 }),
                 hash.clone(),
                 &PrincipalId::default(),
@@ -3235,6 +3294,7 @@ mod tests {
                 manifest: CapsuleManifest::default(),
                 cancelled: Arc::new(AtomicBool::new(false)),
                 unloaded: Arc::new(AtomicBool::new(false)),
+                cancelled_for: Arc::default(),
             }),
             hash.clone(),
             &alice,

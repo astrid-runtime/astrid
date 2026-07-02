@@ -605,7 +605,7 @@ pub(super) async fn stream_read_chunk(
         .map_err(|_| ErrorCode::Closed)?;
     let response_arc = stream.response.clone();
     let read_timeout = stream.read_timeout;
-    let cancel = state.cancel_token.clone();
+    let cancel = state.effective_cancel_token();
     let sem = state.io_semaphore.clone();
     let started = Instant::now();
     let result = util::bounded_await_cancellable(&sem, &cancel, async {

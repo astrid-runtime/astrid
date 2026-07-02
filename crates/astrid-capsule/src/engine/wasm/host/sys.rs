@@ -166,7 +166,7 @@ impl sys::Host for HostState {
         if duration_ns > SLEEP_NS_CAP {
             return Err(ErrorCode::TooLarge);
         }
-        let cancel = self.cancel_token.clone();
+        let cancel = self.effective_cancel_token();
         let rt = self.runtime_handle.clone();
         let sem = self.blocking_semaphore.clone();
         let duration = std::time::Duration::from_nanos(duration_ns);

@@ -504,7 +504,7 @@ impl HostState {
     fn elicit_egress_consent(&self, principal: &PrincipalId, endpoint: &str) -> String {
         let event_bus = self.event_bus.clone();
         let runtime_handle = self.runtime_handle.clone();
-        let cancel_token = self.cancel_token.clone();
+        let cancel_token = self.effective_cancel_token();
         let blocking_semaphore = self.blocking_semaphore.clone();
         let capsule_id = self.capsule_id.to_string();
         let principal_name = principal.to_string();

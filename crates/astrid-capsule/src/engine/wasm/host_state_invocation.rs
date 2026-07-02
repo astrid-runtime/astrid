@@ -4,6 +4,84 @@
 use super::*;
 
 impl HostState {
+    /// Build a fresh, empty per-principal cancellation-token map.
+    ///
+    /// Out-of-pool constructors (lifecycle hooks, the hook handler, tests) use
+    /// this so they do not have to name the map type. The pooled path instead
+    /// clones one shared map into every instance, exactly like
+    /// [`new_connection_principals`](Self::new_connection_principals).
+    #[must_use]
+    pub fn new_principal_cancel_tokens() -> PrincipalCancelTokens {
+        Arc::new(std::sync::Mutex::new(HashMap::new()))
+    }
+
+    /// Install (or clear) the per-invocation cancellation token, mirroring the
+    /// lifecycle of the other `invocation_*` overlays.
+    ///
+    /// `Some(p)` looks up `p`'s entry in the shared
+    /// [`principal_cancel_tokens`](Self::principal_cancel_tokens) map, lazily
+    /// minting a fresh [`child_token`](CancellationToken::child_token) of the
+    /// instance [`cancel_token`](Self::cancel_token) if absent — so a
+    /// full-instance cancel still cascades, and a principal whose token was
+    /// cancelled + removed on view release gets a FRESH, uncancelled token when
+    /// it re-registers and invokes again. `None` (principal-less context)
+    /// clears the overlay so waits fall back to the instance token.
+    ///
+    /// The map mutex is only ever held for this entry-or-clone, so a poisoned
+    /// lock (a panic while holding it) is recovered rather than propagated —
+    /// wedging every principal's cancellation over a torn map would trade a
+    /// liveness mechanism for a liveness bug.
+    pub(crate) fn install_invocation_cancel_token(
+        &mut self,
+        principal: Option<&astrid_core::PrincipalId>,
+    ) {
+        match principal {
+            Some(p) => {
+                let token = {
+                    let mut map = self
+                        .principal_cancel_tokens
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    map.entry(p.clone())
+                        .or_insert_with(|| self.cancel_token.child_token())
+                        .clone()
+                };
+                self.invocation_cancel_token = Some(token);
+            },
+            None => self.invocation_cancel_token = None,
+        }
+    }
+
+    /// Re-arm the wait context when a DEPARTED principal's cancelled token is
+    /// still installed: clear the stale overlay so the next wait falls back to
+    /// the (alive) instance token.
+    ///
+    /// The dedicated run-loop Store keeps its `invocation_*` overlays between
+    /// messages (deliberately, for publish stamping), so after a per-principal
+    /// cancel fires, that principal's cancelled token would otherwise poison
+    /// the shared event pump forever: `ipc::recv` short-circuits before
+    /// draining, starving every OTHER principal's messages — re-creating the
+    /// cross-principal wedge the per-principal tokens exist to prevent. Called
+    /// at the top of `ipc::recv` only — the pump anchor, where the
+    /// cancellation has already delivered its wake. Pooled instances never
+    /// need it (overlays clear on lease return), and it must NOT be called
+    /// from mid-invocation wait sites (approval/elicit/io), where a cancelled
+    /// invocation token is exactly the signal being delivered.
+    ///
+    /// When the INSTANCE token is cancelled too (full unload), the overlay is
+    /// left in place: everything is being torn down and the short-circuit is
+    /// the desired behaviour.
+    pub(crate) fn clear_stale_invocation_cancel_token(&mut self) {
+        if !self.cancel_token.is_cancelled()
+            && self
+                .invocation_cancel_token
+                .as_ref()
+                .is_some_and(CancellationToken::is_cancelled)
+        {
+            self.invocation_cancel_token = None;
+        }
+    }
+
     /// Install per-invocation context from an inbound IPC message picked
     /// up via [`ipc::Host::ipc_recv`](crate::engine::wasm::host::ipc) /
     /// [`ipc::Host::ipc_poll`].
@@ -100,6 +178,14 @@ impl HostState {
                 env_principal,
                 self.capsule_id.as_str(),
             );
+            // Refresh the cancellation token from the shared map too (the map
+            // is the source of truth; this field is a cache). Without this, a
+            // publisher whose token was cancelled + removed on view release —
+            // and who then re-registered — would keep the STALE cancelled
+            // token on this persistent run-loop context, so its approval/
+            // elicit waits during message processing would short-circuit
+            // instead of waiting under a fresh per-principal token.
+            self.install_invocation_cancel_token(publisher.as_ref());
             return;
         }
 

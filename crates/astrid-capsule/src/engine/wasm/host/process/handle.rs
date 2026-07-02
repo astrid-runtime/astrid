@@ -160,7 +160,7 @@ impl HostProcessHandle for HostState {
     ) -> Result<ExitInfo, ErrorCode> {
         let rt = self.runtime_handle.clone();
         let sem = self.blocking_semaphore.clone();
-        let tok = self.cancel_token.clone();
+        let tok = self.effective_cancel_token();
         // Borrow the child from the resource table directly — no
         // `take()`. `tokio::process::Child::wait` is `&mut self`, so
         // we race it against the timeout without ever transferring

@@ -99,6 +99,22 @@ pub struct InterceptorHandle {
 use crate::engine::wasm::host::process::ProcessTracker;
 use crate::security::CapsuleSecurityGate;
 
+/// Shared map of per-principal cancellation tokens for one capsule runtime.
+///
+/// A content-addressed runtime is SHARED across every principal that views the
+/// same WASM hash (issue #1069), but the instance-wide
+/// [`cancel_token`](HostState::cancel_token) can only cancel EVERYONE's
+/// blocking host calls at once. This map gives cancellation the same
+/// granularity as the other per-principal overlays: each entry is a
+/// [`child_token`](CancellationToken::child_token) of the instance token (so a
+/// full-instance cancel still cascades to every principal), minted lazily by
+/// the per-invocation overlay installer and cancelled + removed when that
+/// principal's view of the runtime is released. One map per engine, cloned
+/// into every pooled `HostState`, so a per-principal cancel reaches waits on
+/// any pooled instance.
+pub type PrincipalCancelTokens =
+    Arc<std::sync::Mutex<HashMap<astrid_core::principal::PrincipalId, CancellationToken>>>;
+
 /// A principal-scoped filesystem mount: physical root, VFS, and capability handle.
 ///
 /// The three are bound together — the [`DirHandle`](astrid_capabilities::DirHandle)
@@ -517,6 +533,24 @@ pub struct HostState {
     /// short-circuit with `Closed` when this fires; pollables
     /// short-circuit with `Cancelled`.
     pub cancel_token: CancellationToken,
+    /// Shared per-principal cancellation-token map (see
+    /// [`PrincipalCancelTokens`]). Cloned into every pooled `HostState` like
+    /// [`process_tracker`](Self::process_tracker), so cancelling one
+    /// principal's token reaches its waits on any pooled instance. Entries are
+    /// minted lazily (as children of [`cancel_token`](Self::cancel_token)) by
+    /// [`install_invocation_cancel_token`](Self::install_invocation_cancel_token).
+    pub principal_cancel_tokens: PrincipalCancelTokens,
+    /// Per-invocation cancellation token scoped to the invoking principal.
+    ///
+    /// Installed alongside the other `invocation_*` overlays for every caller
+    /// that carries a present, parseable principal; `None` for principal-less
+    /// contexts. Blocking host calls wait on
+    /// [`effective_cancel_token`](Self::effective_cancel_token) — this overlay
+    /// when set, else the instance [`cancel_token`](Self::cancel_token) — so
+    /// releasing ONE principal's view of a shared runtime can interrupt that
+    /// principal's in-flight approval/elicit/net/io/ipc waits without killing
+    /// the other principals' work.
+    pub invocation_cancel_token: Option<CancellationToken>,
     /// Session token for authenticating CLI socket connections. Only set for
     /// the CLI proxy capsule (which has `net_bind` capability).
     pub session_token: Option<std::sync::Arc<astrid_core::session_token::SessionToken>>,
@@ -891,3 +925,7 @@ impl std::fmt::Debug for HostState {
 #[cfg(test)]
 #[path = "host_state_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "host_state_cancel_tests.rs"]
+mod cancel_tests;

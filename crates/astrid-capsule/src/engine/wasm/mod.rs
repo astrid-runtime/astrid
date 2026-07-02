@@ -10,7 +10,7 @@ use wasmtime::component::{Component, Linker};
 use crate::context::CapsuleContext;
 use crate::engine::ExecutionEngine;
 use crate::engine::wasm::host_state::{
-    ConnectionIdentity, HostState, LifecyclePhase, PrincipalMount,
+    ConnectionIdentity, HostState, LifecyclePhase, PrincipalCancelTokens, PrincipalMount,
 };
 use crate::error::{CapsuleError, CapsuleResult};
 use crate::manifest::CapsuleManifest;
@@ -152,6 +152,13 @@ pub struct WasmEngine {
     /// Cancellation token for cooperative shutdown of blocking host functions.
     /// Triggered during `unload()` before aborting the run handle.
     cancel_token: Option<tokio_util::sync::CancellationToken>,
+    /// Shared per-principal cancellation-token map (children of
+    /// [`cancel_token`](Self::cancel_token)), created at load alongside it and
+    /// cloned into every pooled `HostState`. `request_cancel_for` cancels and
+    /// removes ONE principal's entry so releasing that principal's view of a
+    /// shared runtime interrupts its in-flight blocking host calls without
+    /// touching the other principals' work.
+    principal_cancel_tokens: Option<PrincipalCancelTokens>,
     /// RAII guard that stops the epoch ticker thread on drop.
     epoch_ticker: Option<EpochTickerGuard>,
     /// Shared per-principal profile cache (Layer 3, issue #666).
@@ -283,6 +290,7 @@ impl WasmEngine {
             run_handle: None,
             ready_rx: None,
             cancel_token: None,
+            principal_cancel_tokens: None,
             epoch_ticker: None,
             profile_cache: None,
             owner_principal: None,
@@ -868,6 +876,18 @@ fn install_principal_overlays_sync(
     state: &mut HostState,
     principal: Option<&astrid_core::PrincipalId>,
 ) -> bool {
+    // The cancellation-token overlay follows the same lifecycle as the data
+    // overlays below: installed for every present, parseable principal (lazily
+    // minted as a child of the instance token) and cleared for principal-less
+    // contexts. Unlike the data overlays its cleared-state fallback is the
+    // INSTANCE token, not a neutral deny — see
+    // [`HostState::effective_cancel_token`]. Installed unconditionally (even
+    // when KV construction fails below) because it carries no data access:
+    // it only decides which teardown signal this invocation's waits listen to,
+    // and a principal-scoped cancel must still be able to unwedge a caller
+    // whose data overlays degraded to the neutral floor.
+    state.install_invocation_cancel_token(principal);
+
     let Some(p) = principal else {
         // Principal-less / load-time context: neutral fail-closed fallback.
         state.invocation_kv = None;
@@ -907,6 +927,32 @@ fn install_principal_overlays_sync(
     state.invocation_kv = Some(kv);
     state.invocation_capsule_log = open_capsule_log(p, state.capsule_id.as_str(), false);
     true
+}
+
+/// Cancel and REMOVE `principal`'s per-principal cancellation token.
+///
+/// The core of [`ExecutionEngine::request_cancel_for`] for the WASM engine,
+/// split out so the mechanism is unit-testable without loading a component.
+/// Removal (not just cancellation) matters: a principal that releases its view
+/// of a shared runtime and later re-registers one (remove → reinstall) must
+/// lazily receive a FRESH, uncancelled child token from the overlay installer,
+/// not the insta-cancelled leftover. A principal with no entry (never invoked,
+/// or already removed) is a no-op. The map mutex is held only for the removal;
+/// a poisoned lock is recovered rather than propagated — cancellation is a
+/// liveness mechanism and must not itself wedge.
+fn cancel_principal_token(
+    tokens: &PrincipalCancelTokens,
+    principal: &astrid_core::principal::PrincipalId,
+) {
+    let token = {
+        let mut map = tokens
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        map.remove(principal)
+    };
+    if let Some(token) = token {
+        token.cancel();
+    }
 }
 
 /// Open (creating the log dir if needed) the daily-rotated log file for
@@ -1196,6 +1242,12 @@ impl ExecutionEngine for WasmEngine {
         let io_semaphore = self.runtime_limits.io_semaphore();
         let cancel_token = tokio_util::sync::CancellationToken::new();
         let cancel_token_for_state = cancel_token.clone();
+        // Per-principal cancellation tokens: one shared map for the whole
+        // instance pool (entries are children of `cancel_token`, minted
+        // lazily by the per-invocation overlay installer), so cancelling one
+        // principal's entry reaches its waits on any pooled instance.
+        let principal_cancel_tokens = HostState::new_principal_cancel_tokens();
+        let principal_cancel_tokens_for_state = principal_cancel_tokens.clone();
         let process_tracker = Arc::new(crate::engine::wasm::host::process::ProcessTracker::new());
         let process_tracker_for_listener = process_tracker.clone();
         // Host-owned persistent-process registry — one per engine, cloned
@@ -1463,6 +1515,7 @@ impl ExecutionEngine for WasmEngine {
             let blocking_semaphore = blocking_semaphore.clone();
             let io_semaphore = io_semaphore.clone();
             let cancel_token_for_state = cancel_token_for_state.clone();
+            let principal_cancel_tokens_for_state = principal_cancel_tokens_for_state.clone();
             let process_tracker = process_tracker.clone();
             let persistent_registry = persistent_registry.clone();
             let memory_ledger = memory_ledger.clone();
@@ -1563,6 +1616,8 @@ impl ExecutionEngine for WasmEngine {
                 blocking_semaphore: blocking_semaphore.clone(),
                 io_semaphore: io_semaphore.clone(),
                 cancel_token: cancel_token_for_state.clone(),
+                principal_cancel_tokens: principal_cancel_tokens_for_state.clone(),
+                invocation_cancel_token: None,
                 session_token: session_tok.clone(),
                 interceptor_handles: Vec::new(),
                 allowance_store: st_allowance_store.clone(),
@@ -1883,6 +1938,7 @@ impl ExecutionEngine for WasmEngine {
             .await;
 
         self.cancel_token = Some(cancel_token.clone());
+        self.principal_cancel_tokens = Some(principal_cancel_tokens);
         self.wasmtime_engine = Some(wt_engine.clone());
 
         // Start the epoch ticker for timeout enforcement.
@@ -2034,6 +2090,12 @@ impl ExecutionEngine for WasmEngine {
     fn request_cancel(&self) {
         if let Some(token) = &self.cancel_token {
             token.cancel();
+        }
+    }
+
+    fn request_cancel_for(&self, principal: &astrid_core::principal::PrincipalId) {
+        if let Some(tokens) = &self.principal_cancel_tokens {
+            cancel_principal_token(tokens, principal);
         }
     }
 
@@ -2589,6 +2651,11 @@ pub async fn run_lifecycle(
         blocking_semaphore: HostState::default_blocking_semaphore(),
         io_semaphore: HostState::default_io_semaphore(),
         cancel_token: tokio_util::sync::CancellationToken::new(),
+        // Lifecycle hooks run a ONE-SHOT, single-principal instance: no
+        // per-principal overlays are ever installed, so the token map stays
+        // empty and every wait uses the instance token above.
+        principal_cancel_tokens: HostState::new_principal_cancel_tokens(),
+        invocation_cancel_token: None,
         session_token: None,
         interceptor_handles: Vec::new(),
         allowance_store: None,
@@ -3575,6 +3642,7 @@ mod tests {
             state.invocation_capsule_log = None;
             state.invocation_profile = None;
             state.invocation_env_overlay = None;
+            state.invocation_cancel_token = None;
         }
 
         let mut state = minimal_host_state(tokio::runtime::Handle::current());
@@ -3586,6 +3654,7 @@ mod tests {
             },
             uuid::Uuid::nil(),
         ));
+        state.invocation_cancel_token = Some(tokio_util::sync::CancellationToken::new());
 
         clear(&mut state);
 
@@ -3598,6 +3667,7 @@ mod tests {
         assert!(state.invocation_capsule_log.is_none());
         assert!(state.invocation_profile.is_none());
         assert!(state.invocation_env_overlay.is_none());
+        assert!(state.invocation_cancel_token.is_none());
     }
 
     /// Cancellation safety on the ipc `recv` path: the routed receiver

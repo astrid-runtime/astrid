@@ -164,6 +164,29 @@ impl HostState {
             .unwrap_or(astrid_events::ipc::MessageOrigin::System)
     }
 
+    /// Return the effective cancellation token for the current invocation's
+    /// blocking host calls: the per-principal
+    /// [`invocation_cancel_token`](Self::invocation_cancel_token) overlay when
+    /// installed, else the instance [`cancel_token`](Self::cancel_token).
+    ///
+    /// DELIBERATELY unlike the KV/secret overlays, the fallback here is the
+    /// INSTANCE token, not a neutral deny: cancellation is a liveness concern,
+    /// not data isolation. A principal-less context (load-time work, a
+    /// run-loop's self-triggered work, lifecycle hooks, tests) should have its
+    /// waits interrupted only by a full-instance cancel (unload/replace/
+    /// shutdown) — exactly today's behaviour. There is nothing fail-open about
+    /// the fallback: it grants no data access, it only decides which teardown
+    /// signal a wait listens to.
+    ///
+    /// Returns an owned clone — every wait site immediately cloned the token
+    /// anyway to move it into the blocking future.
+    #[must_use]
+    pub fn effective_cancel_token(&self) -> CancellationToken {
+        self.invocation_cancel_token
+            .clone()
+            .unwrap_or_else(|| self.cancel_token.clone())
+    }
+
     /// Return the effective quota profile for the current invocation.
     ///
     /// Prefers `invocation_profile` (set by

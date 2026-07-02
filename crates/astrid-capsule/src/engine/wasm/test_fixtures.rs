@@ -135,6 +135,8 @@ pub(crate) fn minimal_host_state(rt: tokio::runtime::Handle) -> HostState {
         blocking_semaphore: Arc::new(Semaphore::new(2)),
         io_semaphore: Arc::new(Semaphore::new(2)),
         cancel_token: CancellationToken::new(),
+        principal_cancel_tokens: HostState::new_principal_cancel_tokens(),
+        invocation_cancel_token: None,
         session_token: None,
         interceptor_handles: Vec::new(),
         allowance_store: None,

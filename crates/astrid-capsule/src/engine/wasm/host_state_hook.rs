@@ -106,6 +106,11 @@ impl HostState {
             blocking_semaphore: Self::default_blocking_semaphore(),
             io_semaphore: Self::default_io_semaphore(),
             cancel_token: CancellationToken::new(),
+            // Hooks are single-principal one-shots: no per-principal overlays
+            // are installed, the map stays empty, and every wait uses the
+            // instance token above.
+            principal_cancel_tokens: Self::new_principal_cancel_tokens(),
+            invocation_cancel_token: None,
             session_token: None,
             interceptor_handles: Vec::new(),
             allowance_store: None,

@@ -177,6 +177,64 @@ async fn cancel_token_unblocks_elicit_wait() {
     );
 }
 
+/// Per-principal cancellation on a SHARED runtime (issue #1069): releasing
+/// ONE principal's view cancels that principal's per-principal token, which
+/// must unblock its live elicit wait promptly — while the instance token
+/// (and with it every other principal's work) stays uncancelled. This is the
+/// unit-level pin for the "capsule remove while an elicit/approval is
+/// pending must not wedge the shared instance" e2e scenario.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn principal_scoped_cancel_unblocks_elicit_wait_without_instance_cancel() {
+    let rt = tokio::runtime::Handle::current();
+    let mut state = minimal_host_state(rt);
+    let alice = astrid_core::PrincipalId::new("agent-alice").unwrap();
+    state.caller_context = Some(
+        IpcMessage::new(
+            Topic::from_raw("cli.v1.command.run.test"),
+            IpcPayload::Connect,
+            Uuid::nil(),
+        )
+        .with_principal("agent-alice"),
+    );
+    assert!(crate::engine::wasm::install_principal_overlays_sync(
+        &mut state,
+        Some(&alice)
+    ));
+    let tokens = state.principal_cancel_tokens.clone();
+    let instance_token = state.cancel_token.clone();
+
+    let bus = state.event_bus.clone();
+    let req_rx = bus.subscribe_topic("astrid.v1.elicit");
+
+    let start = std::time::Instant::now();
+    let elicit_handle =
+        tokio::task::spawn_blocking(move || (state.elicit(text_request("api_url")), state));
+
+    let (_request_id, _principal) = await_request(req_rx).await;
+    // The view-release path: cancel + remove exactly alice's token.
+    crate::engine::wasm::cancel_principal_token(&tokens, &alice);
+
+    let (result, state) = elicit_handle.await.expect("elicit thread joined");
+    let elapsed = start.elapsed();
+
+    assert!(
+        matches!(result, Err(ErrorCode::Timeout)),
+        "cancelled wait must return Timeout, got {result:?}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "per-principal cancel must unblock promptly, took {elapsed:?}"
+    );
+    assert!(
+        !instance_token.is_cancelled(),
+        "the instance token must stay uncancelled — the shared runtime survives"
+    );
+    assert!(
+        !state.cancel_token.is_cancelled(),
+        "the instance token on the state must stay uncancelled too"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn matching_cancel_sentinel_returns_cancelled() {
     let rt = tokio::runtime::Handle::current();

@@ -419,6 +419,10 @@ fn clear_on_return(state: &mut HostState, reset_resources: bool) {
     state.invocation_capsule_log = None;
     state.invocation_profile = None;
     state.invocation_env_overlay = None;
+    // A leftover per-principal cancellation token (possibly already cancelled
+    // by a view release) must not decide which teardown signal the NEXT
+    // lease's waits listen to; the next invocation installs its own.
+    state.invocation_cancel_token = None;
     // The in-flight verified ingress principal AND its authenticating device
     // key_id are per-frame state; a fresh lease must not inherit a stale one
     // (issue #45/#852).
@@ -499,6 +503,7 @@ mod tests {
             .process_count_by_principal
             .insert(astrid_core::PrincipalId::default(), 1);
         state.interceptor_active = true;
+        state.invocation_cancel_token = Some(state.cancel_token.child_token());
 
         clear_on_return(&mut state, true);
 
@@ -522,6 +527,10 @@ mod tests {
         assert!(state.process_count_by_principal.is_empty());
         // Per-invocation scoping fields cleared too.
         assert!(!state.interceptor_active);
+        assert!(
+            state.invocation_cancel_token.is_none(),
+            "a leftover per-principal cancel token must not survive into the next lease"
+        );
     }
 
     /// The `host_process` carve-out (`reset_resources = false`) deliberately
