@@ -215,10 +215,11 @@ secrets, home directory, quotas, and audit chain. New principals inherit nothing
 ```bash
 astrid agent create ci-bot                     # clean-slate, least-privilege agent
 astrid agent create staging --clone production # full profile + state replica
-astrid agent modify ci-bot --add-capsule fs    # grant access to a capsule's tools
-astrid caps list                               # inspect capability grants
+astrid agent modify ci-bot \
+  --add-capsule astrid-capsule-fs              # grant access to a capsule's tools
+astrid caps show ci-bot                        # inspect capability grants
 astrid quota set -a ci-bot --memory 128MB      # per-principal resource limits
-astrid pair-device issue --scope-to caps:read  # scope a device token to a subset
+astrid pair-device issue --scope use-only      # scope a device token to a subset
 ```
 
 Capsule access is enforced kernel-side at dispatch. A principal can only invoke capsules explicitly
