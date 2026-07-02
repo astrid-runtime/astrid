@@ -445,6 +445,157 @@ fn install_recv_invocation_context_resolves_invoking_principal_profile() {
     );
 }
 
+/// Bleed #1 regression: on the guest-pulled `ipc::recv` path a non-`default`
+/// publisher must resolve `effective_secret_store` to ITS OWN store — NOT the
+/// neutral load-time fallback, and specifically NOT `default`'s. Before the fix
+/// the recv path never set `invocation_secret_store`, so a non-owner publisher
+/// fell through to `self.secret_store` = the load-owner's (`default`'s) secrets.
+#[test]
+fn recv_path_installs_publisher_secret_store_not_neutral() {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap();
+    let mut state = minimal_host_state(rt.handle().clone());
+    // Shared instance owned by default; the load-time secret store is neutral.
+    assert_eq!(state.principal, astrid_core::PrincipalId::default());
+    let neutral_secret_ptr = Arc::as_ptr(&state.secret_store);
+    // Seed a secret in the NEUTRAL store's would-be namespace to prove the
+    // publisher does NOT read it (the neutral store denies regardless).
+    assert!(!state.effective_secret_store().exists("token").unwrap());
+
+    // A recv message published by a non-owner principal (alice) installs alice's
+    // KV + secret overlays.
+    let alice = astrid_core::PrincipalId::new("alice").expect("valid alice");
+    let msg = astrid_events::ipc::IpcMessage::new(
+        Topic::from_raw("some.v1.event"),
+        astrid_events::ipc::IpcPayload::RawJson(serde_json::json!({})),
+        uuid::Uuid::new_v4(),
+    )
+    .with_principal(alice.to_string());
+    state.install_recv_invocation_context(&msg);
+
+    // effective_secret_store now resolves to alice's OWN store, not the neutral.
+    assert!(
+        state.invocation_secret_store.is_some(),
+        "recv path must install the publisher's secret store (bleed #1)"
+    );
+    assert!(
+        !std::ptr::eq(
+            Arc::as_ptr(state.effective_secret_store()),
+            neutral_secret_ptr
+        ),
+        "a non-default publisher must NOT resolve to the neutral/load-time secret store"
+    );
+    // And the KV overlay is alice's own namespace, off the real backend.
+    assert_eq!(
+        state.effective_kv().namespace(),
+        format!("alice:capsule:{}", state.capsule_id),
+        "recv path scopes KV to the publisher's own namespace"
+    );
+
+    // A subsequent principal-less recv (system/lifecycle event) clears the
+    // overlays → falls back to the NEUTRAL store, never alice's or default's.
+    let sys_msg = astrid_events::ipc::IpcMessage::new(
+        Topic::from_raw("astrid.v1.capsules_loaded"),
+        astrid_events::ipc::IpcPayload::RawJson(serde_json::json!({})),
+        uuid::Uuid::new_v4(),
+    );
+    assert!(sys_msg.principal.is_none());
+    state.install_recv_invocation_context(&sys_msg);
+    assert!(state.invocation_secret_store.is_none());
+    assert_eq!(
+        state.effective_kv().namespace(),
+        HostState::NEUTRAL_KV_NAMESPACE
+    );
+    assert!(std::ptr::eq(
+        Arc::as_ptr(state.effective_secret_store()),
+        neutral_secret_ptr
+    ));
+}
+
+/// Every caller — the owner/`default` INCLUDED — resolves its OWN explicit scope
+/// via an installed overlay, never through a fallback. On a shared instance the
+/// load-time fields are neutral, so even `default` serving itself must get a
+/// `default:capsule:{id}` overlay rather than reading the neutral placeholder.
+#[test]
+fn recv_path_owner_gets_own_overlay_not_fallback() {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap();
+    let mut state = minimal_host_state(rt.handle().clone());
+    let owner = state.principal.clone();
+    assert_eq!(owner, astrid_core::PrincipalId::default());
+
+    let msg = astrid_events::ipc::IpcMessage::new(
+        Topic::from_raw("some.v1.event"),
+        astrid_events::ipc::IpcPayload::RawJson(serde_json::json!({})),
+        uuid::Uuid::new_v4(),
+    )
+    .with_principal(owner.to_string());
+    state.install_recv_invocation_context(&msg);
+
+    assert!(
+        state.invocation_kv.is_some(),
+        "the owner/default caller must get its OWN overlay, not the neutral fallback"
+    );
+    assert_eq!(
+        state.effective_kv().namespace(),
+        format!("{owner}:capsule:{}", state.capsule_id),
+        "owner resolves its own explicit default:capsule:{{id}} scope"
+    );
+    assert_ne!(
+        state.effective_kv().namespace(),
+        HostState::NEUTRAL_KV_NAMESPACE,
+        "owner must not fall through to the neutral placeholder"
+    );
+    assert!(
+        state.invocation_secret_store.is_some(),
+        "the owner/default caller must get its own secret store overlay"
+    );
+}
+
+/// The KV overlay a caller receives is backed by the SHARED real backend
+/// (`kv_backend`), so writes persist to the principal's real namespace — the
+/// neutral fallback store is a SEPARATE physical store and must not be involved.
+#[test]
+fn overlay_kv_uses_real_backend_not_neutral_store() {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap();
+    let mut state = minimal_host_state(rt.handle().clone());
+
+    let alice = astrid_core::PrincipalId::new("alice").expect("valid alice");
+    let msg = astrid_events::ipc::IpcMessage::new(
+        Topic::from_raw("some.v1.event"),
+        astrid_events::ipc::IpcPayload::RawJson(serde_json::json!({})),
+        uuid::Uuid::new_v4(),
+    )
+    .with_principal(alice.to_string());
+    state.install_recv_invocation_context(&msg);
+
+    let overlay = state.effective_kv().clone();
+    let backend_view = astrid_storage::ScopedKvStore::new(
+        state.kv_backend.clone(),
+        format!("alice:capsule:{}", state.capsule_id),
+    )
+    .unwrap();
+    rt.block_on(async {
+        overlay.set("k", b"v".to_vec()).await.unwrap();
+        // The same value is visible through the shared real backend at alice's
+        // namespace — proving the overlay is NOT on the neutral throwaway store.
+        assert_eq!(
+            backend_view.get("k").await.unwrap(),
+            Some(b"v".to_vec()),
+            "overlay writes must land on the shared real backend, not the neutral store"
+        );
+        // And the neutral fallback store sees nothing.
+        assert!(
+            state.kv.get("k").await.unwrap().is_none(),
+            "the neutral placeholder store holds no real data"
+        );
+    });
+}
+
 #[test]
 fn connection_principal_registry_round_trip() {
     let rt = tokio::runtime::Builder::new_current_thread()
@@ -582,21 +733,110 @@ fn scoped_kv_namespacing_isolates_identical_session_keys_across_principals() {
 }
 
 #[test]
-fn effective_kv_falls_back_to_owner_for_principalless_message() {
-    // The documented contamination edge (#977): a message IS in scope but
-    // carries no parseable principal, and no invocation store is installed —
-    // `effective_kv` falls back to the OWNER store. This pins the current,
-    // intentional behaviour. The host cannot fail closed here because
-    // principal-less system handlers (watchdog ticks, capsules_loaded) rely on
-    // the same fallback; capsule-session is protected instead by the
-    // producer-side invariant that session topics always carry an authenticated
-    // principal. If this assertion ever needs to change, the isolation contract
-    // is changing — make that deliberate.
+fn shared_instance_isolates_kv_and_secrets_per_invocation() {
+    // No-cross-principal-host-state-bleed regression for SHARED instances
+    // (#1069). The runtime is loaded under `default` but the load-time fallbacks
+    // are NEUTRAL — `default` is an ordinary principal and reading its namespace
+    // from another principal is a bleed. A non-owner invocation stamped for `bob`
+    // reads/writes BOB's KV + secret namespaces; owner and principal-less
+    // invocations resolve to the NEUTRAL placeholder, never `default`'s (or
+    // anyone's) real store.
     let rt = tokio::runtime::Builder::new_current_thread()
         .build()
         .unwrap();
     let mut state = minimal_host_state(rt.handle().clone());
-    state.principal = astrid_core::PrincipalId::new("owner").expect("valid owner");
+    // Confirm the fixture models a default-owned shared instance.
+    assert_eq!(state.principal, astrid_core::PrincipalId::default());
+    // The load-time fallback is the NEUTRAL placeholder, NOT `default`'s real
+    // namespace, and NOT any principal's `{p}:capsule:{id}`.
+    let neutral_kv_ns = state.kv.namespace().to_string();
+    assert_eq!(neutral_kv_ns, HostState::NEUTRAL_KV_NAMESPACE);
+    assert_ne!(
+        neutral_kv_ns, "default:capsule:test",
+        "the neutral namespace must never be default's real capsule namespace"
+    );
+    let neutral_secret_ptr = Arc::as_ptr(&state.secret_store);
+    // The neutral secret store DENIES — exists is false, set is an error.
+    assert!(!state.effective_secret_store().exists("k").unwrap());
+    assert!(state.effective_secret_store().set("k", "v").is_err());
+
+    // Owner (default) invocation, no overlays → NEUTRAL scope (fail-closed),
+    // NOT `default:capsule:test`.
+    assert_eq!(
+        state.effective_kv().namespace(),
+        neutral_kv_ns.as_str(),
+        "owner/default invocation with no overlay resolves to the NEUTRAL KV scope"
+    );
+    assert_ne!(
+        state.effective_kv().namespace(),
+        "default:capsule:test",
+        "the fallback must NOT be default's real capsule namespace"
+    );
+
+    // Non-owner (bob) invocation: the interceptor installs bob-scoped
+    // overlays. `effective_*` MUST resolve to bob's scope, not the neutral one.
+    state.invocation_kv = Some(super::super::test_fixtures::mem_kv("bob:capsule:test"));
+    state.invocation_secret_store = Some(super::super::test_fixtures::mem_secret_store(
+        "bob:secret:test",
+        rt.handle().clone(),
+    ));
+    let bob_secret_ptr = Arc::as_ptr(state.invocation_secret_store.as_ref().unwrap());
+
+    assert_eq!(
+        state.effective_kv().namespace(),
+        "bob:capsule:test",
+        "bob's invocation reads/writes BOB's KV namespace on the shared instance"
+    );
+    assert_ne!(
+        state.effective_kv().namespace(),
+        neutral_kv_ns.as_str(),
+        "bob's invocation must not touch the neutral fallback KV namespace"
+    );
+    assert!(
+        std::ptr::eq(Arc::as_ptr(state.effective_secret_store()), bob_secret_ptr),
+        "bob's invocation resolves to BOB's secret store on the shared instance"
+    );
+    assert!(
+        !std::ptr::eq(
+            Arc::as_ptr(state.effective_secret_store()),
+            neutral_secret_ptr
+        ),
+        "bob's invocation must not resolve to the neutral secret store"
+    );
+
+    // Principal-less system/lifecycle event (watchdog tick, capsules_loaded):
+    // overlays cleared → falls back to the NEUTRAL scope, NEVER `default`'s or a
+    // victim principal's private scope.
+    state.invocation_kv = None;
+    state.invocation_secret_store = None;
+    assert_eq!(
+        state.effective_kv().namespace(),
+        neutral_kv_ns.as_str(),
+        "a principal-less event on a shared instance stays in the NEUTRAL KV scope"
+    );
+    assert!(
+        std::ptr::eq(
+            Arc::as_ptr(state.effective_secret_store()),
+            neutral_secret_ptr
+        ),
+        "a principal-less event on a shared instance stays in the NEUTRAL secret store"
+    );
+}
+
+#[test]
+fn effective_kv_falls_back_to_neutral_for_principalless_message() {
+    // THE ABSOLUTE RULE, degrade edge: a message IS in scope but carries no
+    // parseable principal, and no invocation store is installed. `effective_kv`
+    // must fall back to the NEUTRAL placeholder — NEVER the load-owner
+    // (`default`) namespace. Principal-less system handlers (watchdog ticks,
+    // capsules_loaded) legitimately reach this path and must fail closed to an
+    // empty/isolated store, not read `default`'s data.
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap();
+    let mut state = minimal_host_state(rt.handle().clone());
+    // Shared instance owned by default; the fallback is neutral.
+    assert_eq!(state.principal, astrid_core::PrincipalId::default());
 
     let msg = astrid_events::ipc::IpcMessage::new(
         Topic::from_raw("session.v1.append"),
@@ -610,8 +850,15 @@ fn effective_kv_falls_back_to_owner_for_principalless_message() {
     state.caller_context = Some(msg);
     // invocation_kv intentionally left None.
 
-    assert!(
-        std::ptr::eq(state.effective_kv(), &state.kv),
-        "a principal-less in-scope message falls back to the owner store (the #977 edge)"
+    assert_eq!(
+        state.effective_kv().namespace(),
+        HostState::NEUTRAL_KV_NAMESPACE,
+        "a principal-less in-scope message falls back to the NEUTRAL store, not default's"
     );
+    assert_ne!(
+        state.effective_kv().namespace(),
+        "default:capsule:test",
+        "the fallback must NEVER be default's real capsule namespace"
+    );
+    assert!(std::ptr::eq(state.effective_kv(), &state.kv));
 }

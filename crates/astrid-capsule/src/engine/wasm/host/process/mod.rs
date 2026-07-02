@@ -232,7 +232,7 @@ impl process::Host for HostState {
         let capsule_id = self.capsule_id.as_str().to_owned();
         let handle = self.runtime_handle.clone();
         let semaphore = self.blocking_semaphore.clone();
-        let cancel_token = self.cancel_token.clone();
+        let cancel_token = self.effective_cancel_token();
         let process_tracker = self.process_tracker.clone();
         let call_id = extract_call_id(self);
 
@@ -387,7 +387,7 @@ impl process::Host for HostState {
         // non-zero — surfacing Cancelled here avoids fork+exec
         // immediately followed by tracker-less orphaning if the
         // capsule is being torn down right now.
-        if self.cancel_token.is_cancelled() {
+        if self.effective_cancel_token().is_cancelled() {
             return Err(ErrorCode::Cancelled);
         }
 
@@ -577,7 +577,7 @@ impl process::Host for HostState {
         if request.idle_timeout_ms == Some(0) {
             return Err(ErrorCode::InvalidInput);
         }
-        if self.cancel_token.is_cancelled() {
+        if self.effective_cancel_token().is_cancelled() {
             return Err(ErrorCode::Cancelled);
         }
 
@@ -876,7 +876,7 @@ impl process::Host for HostState {
         let capsule_id = self.capsule_id.as_str().to_owned();
         let handle = self.runtime_handle.clone();
         let semaphore = self.blocking_semaphore.clone();
-        let cancel = self.cancel_token.clone();
+        let cancel = self.effective_cancel_token();
         let registry = self.persistent_processes.clone();
         let timeout = std::time::Duration::from_millis(timeout_ms);
         let id_for_audit = id.clone();
@@ -893,7 +893,7 @@ impl process::Host for HostState {
         let capsule_id = self.capsule_id.as_str().to_owned();
         let handle = self.runtime_handle.clone();
         let semaphore = self.blocking_semaphore.clone();
-        let cancel = self.cancel_token.clone();
+        let cancel = self.effective_cancel_token();
         let registry = self.persistent_processes.clone();
         let grace = grace_ms.map(std::time::Duration::from_millis);
         let id_for_audit = id.clone();

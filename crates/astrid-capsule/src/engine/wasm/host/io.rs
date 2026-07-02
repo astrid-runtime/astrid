@@ -59,7 +59,7 @@ impl astrid_poll::Host for HostState {
         // correct executor. We delegate to it AFTER racing against the
         // cancel token so capsule unload always wins over a stuck
         // future.
-        let cancel = self.cancel_token.clone();
+        let cancel = self.effective_cancel_token();
         let result = if cancel.is_cancelled() {
             Err(ErrorCode::Cancelled)
         } else {
@@ -106,7 +106,7 @@ impl astrid_poll::HostPollable for HostState {
         let principal = self.effective_principal();
         let started = Instant::now();
 
-        let cancel = self.cancel_token.clone();
+        let cancel = self.effective_cancel_token();
         let result = if cancel.is_cancelled() {
             Err(ErrorCode::Cancelled)
         } else {
@@ -229,7 +229,7 @@ mod astrid_streams_impl {
     /// `Closed` carries the "no more bytes will be produced /
     /// accepted" semantic that matches.
     fn cancel_guard(state: &HostState) -> Result<(), RtStreamError> {
-        if state.cancel_token.is_cancelled() {
+        if state.effective_cancel_token().is_cancelled() {
             Err(RtStreamError::Closed)
         } else {
             Ok(())

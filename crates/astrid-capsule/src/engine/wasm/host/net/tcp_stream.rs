@@ -37,7 +37,7 @@ impl HostTcpStream for HostState {
         let stream = net_stream(&self.resource_table, self_.rep())?;
         let rt = self.runtime_handle.clone();
         let sem = self.blocking_semaphore.clone();
-        let tok = self.cancel_token.clone();
+        let tok = self.effective_cancel_token();
         let status = util::bounded_block_on_cancellable(&rt, &sem, &tok, async {
             match stream {
                 NetStream::Unix(arc) => {
@@ -131,7 +131,7 @@ impl HostTcpStream for HostState {
         let stream = net_stream(&self.resource_table, self_.rep())?;
         let rt = self.runtime_handle.clone();
         let sem = self.blocking_semaphore.clone();
-        let tok = self.cancel_token.clone();
+        let tok = self.effective_cancel_token();
         let result = util::bounded_block_on_cancellable(&rt, &sem, &tok, async {
             match stream {
                 NetStream::Unix(arc) => {
@@ -170,7 +170,7 @@ impl HostTcpStream for HostState {
         let stream = net_stream(&self.resource_table, self_.rep())?;
         let rt = self.runtime_handle.clone();
         let sem = self.blocking_semaphore.clone();
-        let tok = self.cancel_token.clone();
+        let tok = self.effective_cancel_token();
         let max = (max_bytes as usize).min(MAX_BYTES_PER_CALL);
         let result = util::bounded_block_on_cancellable(&rt, &sem, &tok, async {
             match stream {
@@ -213,7 +213,7 @@ impl HostTcpStream for HostState {
         let stream = net_stream(&self.resource_table, self_.rep())?;
         let rt = self.runtime_handle.clone();
         let sem = self.blocking_semaphore.clone();
-        let tok = self.cancel_token.clone();
+        let tok = self.effective_cancel_token();
         let result = util::bounded_block_on_cancellable(&rt, &sem, &tok, async {
             match stream {
                 NetStream::Unix(arc) => {
@@ -247,7 +247,7 @@ impl HostTcpStream for HostState {
         let stream = net_stream(&self.resource_table, self_.rep())?;
         let rt = self.runtime_handle.clone();
         let sem = self.blocking_semaphore.clone();
-        let tok = self.cancel_token.clone();
+        let tok = self.effective_cancel_token();
         let max = (max_bytes as usize).min(MAX_BYTES_PER_CALL);
         let result: Result<Vec<u8>, ErrorCode> = match stream {
             NetStream::Tcp(slot) => {
@@ -284,7 +284,7 @@ impl HostTcpStream for HostState {
         let stream = net_stream(&self.resource_table, self_.rep())?;
         let rt = self.runtime_handle.clone();
         let sem = self.blocking_semaphore.clone();
-        let tok = self.cancel_token.clone();
+        let tok = self.effective_cancel_token();
         let std_how = match how {
             ShutdownHow::Receive => std::net::Shutdown::Read,
             ShutdownHow::Send => std::net::Shutdown::Write,

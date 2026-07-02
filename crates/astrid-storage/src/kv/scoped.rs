@@ -32,6 +32,7 @@ use crate::error::{StorageError, StorageResult};
 /// let val = scoped.get("config").await?;
 /// ```
 #[derive(Clone)]
+#[non_exhaustive]
 pub struct ScopedKvStore {
     inner: Arc<dyn KvStore>,
     namespace: String,
@@ -76,6 +77,19 @@ impl ScopedKvStore {
     /// or contains null bytes.
     pub fn with_namespace(&self, namespace: impl Into<String>) -> StorageResult<Self> {
         Self::new(Arc::clone(&self.inner), namespace)
+    }
+
+    /// The underlying, namespace-agnostic backing store.
+    ///
+    /// Lets a caller retain a handle to the real backend independent of any
+    /// particular namespace view — e.g. to construct per-invocation
+    /// principal-scoped views while keeping this `ScopedKvStore` pointed at a
+    /// neutral, physically-isolated namespace. Prefer
+    /// [`with_namespace`](Self::with_namespace) when you only need another view
+    /// over the SAME backend.
+    #[must_use]
+    pub fn backend(&self) -> Arc<dyn KvStore> {
+        Arc::clone(&self.inner)
     }
 
     /// Get a raw byte value by key.
@@ -237,6 +251,25 @@ mod tests {
             scoped.get("greeting").await.unwrap(),
             Some(b"hello".to_vec())
         );
+    }
+
+    #[tokio::test]
+    async fn backend_returns_the_shared_underlying_store() {
+        // `backend()` hands back the real, namespace-agnostic store so a caller
+        // can build per-principal views over it while keeping one `ScopedKvStore`
+        // pointed at a neutral namespace (#1069 host-state isolation).
+        let store: Arc<dyn KvStore> = Arc::new(MemoryKvStore::new());
+        let neutral = ScopedKvStore::new(Arc::clone(&store), "neutral:capsule").unwrap();
+
+        // A view built from the backend shares the same physical store.
+        let alice = ScopedKvStore::new(neutral.backend(), "alice:capsule:x").unwrap();
+        alice.set("k", b"v".to_vec()).await.unwrap();
+
+        // Visible through an independent view over the same backend...
+        let alice2 = ScopedKvStore::new(Arc::clone(&store), "alice:capsule:x").unwrap();
+        assert_eq!(alice2.get("k").await.unwrap(), Some(b"v".to_vec()));
+        // ...but NOT through the neutral namespace.
+        assert_eq!(neutral.get("k").await.unwrap(), None);
     }
 
     #[tokio::test]

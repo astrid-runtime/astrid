@@ -191,6 +191,22 @@ pub trait Capsule: Send + Sync {
     /// their references and the normal unload path can finish.
     fn request_cancel(&self) {}
 
+    /// Request cooperative cancellation of ONE principal's in-flight blocking
+    /// work, leaving every other principal's work running.
+    ///
+    /// A shared-by-hash runtime survives a single principal's view release
+    /// (issue #1069) — but that principal's blocked host calls (approval/
+    /// elicit waits, net/io/ipc waits) would otherwise keep running inside the
+    /// shared instance with nothing left to answer them, wedging it for every
+    /// remaining principal. The kernel calls this on the non-last view release
+    /// so exactly the departing principal's waits are interrupted.
+    ///
+    /// Default no-op — fail-safe: a capsule implementation without
+    /// per-principal wait tracking keeps today's instance-scoped semantics
+    /// (its waits end only on a full [`request_cancel`](Self::request_cancel))
+    /// rather than risking cancellation of another principal's work.
+    fn request_cancel_for(&self, _principal: &astrid_core::principal::PrincipalId) {}
+
     /// Extract the inbound receiver for uplink messages.
     /// This is typically called exactly once by the OS router after loading.
     fn take_inbound_rx(
@@ -328,6 +344,12 @@ impl Capsule for CompositeCapsule {
     fn request_cancel(&self) {
         for engine in &self.engines {
             engine.request_cancel();
+        }
+    }
+
+    fn request_cancel_for(&self, principal: &astrid_core::principal::PrincipalId) {
+        for engine in &self.engines {
+            engine.request_cancel_for(principal);
         }
     }
 

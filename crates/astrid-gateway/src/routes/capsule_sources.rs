@@ -12,12 +12,18 @@ pub(super) fn capsule_source_id_v0(capsule_id: &str) -> Uuid {
     Uuid::new_v5(&CAPSULE_ID_NAMESPACE, capsule_id.as_bytes())
 }
 
-pub(super) fn capsule_source_id_v1(
-    principal: &PrincipalId,
-    capsule_id: &str,
-    content_hash: &str,
-) -> Uuid {
-    let seed = format!("{principal}\0{capsule_id}\0{content_hash}");
+/// Derive the trusted `source_id` a shared capsule runtime stamps on its IPC
+/// replies.
+///
+/// MUST stay byte-identical to the WASM engine's `capsule_uuid` seed in
+/// `astrid-capsule/src/engine/wasm/mod.rs` (`{capsule_id}\0{content_hash}`, same
+/// namespace). One runtime is shared by every principal that views the same
+/// content hash (issue #1069), so the seed carries NO principal segment. Reply
+/// routing to the requesting principal is handled by the principal-scoped routed
+/// subscription plus the body correlation id; this id is only an authenticity
+/// gate, so it needs only to match the runtime's stamped id.
+pub(super) fn capsule_source_id_v1(capsule_id: &str, content_hash: &str) -> Uuid {
+    let seed = format!("{capsule_id}\0{content_hash}");
     Uuid::new_v5(&CAPSULE_ID_NAMESPACE, seed.as_bytes())
 }
 
@@ -26,25 +32,21 @@ pub(super) fn trusted_capsule_source_ids(capsule_id: &str, caller: &PrincipalId)
         return Vec::new();
     };
 
-    let principals = vec![caller.clone()];
+    // The `caller` selects WHICH install set to read the content hash from (a
+    // principal may have its own installed version); it no longer contributes to
+    // the derived source id, which is content-addressed and shared across
+    // principals (issue #1069).
     let mut dirs = Vec::new();
-    for principal in &principals {
-        dirs.push(
-            home.principal_home(principal)
-                .capsules_dir()
-                .join(capsule_id),
-        );
-    }
+    dirs.push(home.principal_home(caller).capsules_dir().join(capsule_id));
     if let Ok(cwd) = std::env::current_dir() {
         dirs.push(cwd.join(".astrid").join("capsules").join(capsule_id));
     }
 
-    trusted_capsule_source_ids_from_dirs(capsule_id, &principals, dirs)
+    trusted_capsule_source_ids_from_dirs(capsule_id, dirs)
 }
 
 fn trusted_capsule_source_ids_from_dirs(
     capsule_id: &str,
-    principals: &[PrincipalId],
     dirs: impl IntoIterator<Item = PathBuf>,
 ) -> Vec<Uuid> {
     let mut seen_hashes = HashSet::new();
@@ -58,11 +60,9 @@ fn trusted_capsule_source_ids_from_dirs(
         if !seen_hashes.insert(content_hash.clone()) {
             continue;
         }
-        for principal in principals {
-            let source_id = capsule_source_id_v1(principal, capsule_id, &content_hash);
-            if seen_ids.insert(source_id) {
-                ids.push(source_id);
-            }
+        let source_id = capsule_source_id_v1(capsule_id, &content_hash);
+        if seen_ids.insert(source_id) {
+            ids.push(source_id);
         }
     }
 
@@ -161,11 +161,11 @@ mod tests {
     use super::{
         capsule_source_id_v1, synthetic_content_hash, trusted_capsule_source_ids_from_dirs,
     };
-    use astrid_core::PrincipalId;
     use serde_json::json;
+    use uuid::Uuid;
 
     #[test]
-    fn derives_source_ids_from_installed_wasm_hash_for_caller_only() {
+    fn derives_content_addressed_source_id_from_installed_wasm_hash() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let capsule_dir = tmp.path().join("astrid-capsule-session");
         std::fs::create_dir_all(&capsule_dir).expect("capsule dir");
@@ -181,27 +181,49 @@ mod tests {
         )
         .expect("meta");
 
-        let default = PrincipalId::default();
-        let alice = PrincipalId::new("alice").expect("valid principal");
-        let ids = trusted_capsule_source_ids_from_dirs(
-            "astrid-capsule-session",
-            std::slice::from_ref(&alice),
-            [capsule_dir],
-        );
+        let ids = trusted_capsule_source_ids_from_dirs("astrid-capsule-session", [capsule_dir]);
 
+        // Content-addressed: one id per hash, principal-independent (#1069).
         assert_eq!(
             ids,
-            vec![capsule_source_id_v1(
-                &alice,
-                "astrid-capsule-session",
-                "abc123"
-            )]
+            vec![capsule_source_id_v1("astrid-capsule-session", "abc123")]
         );
-        assert!(!ids.contains(&capsule_source_id_v1(
-            &default,
-            "astrid-capsule-session",
-            "abc123"
-        )));
+    }
+
+    #[test]
+    fn source_id_lockstep_with_wasm_engine_seed() {
+        // The gateway's trusted source-id derivation MUST stay byte-identical to
+        // the WASM engine's `capsule_uuid` seed in
+        // `astrid-capsule/src/engine/wasm/mod.rs`, else the gateway would reject
+        // every genuine reply from a shared capsule runtime. This reproduces the
+        // engine's exact derivation (same fixed namespace, same
+        // `{capsule_id}\0{content_hash}` seed, NO principal segment) and asserts
+        // equality. If this fails, the two seeds have drifted — fix BOTH.
+        const ENGINE_NAMESPACE: Uuid = Uuid::from_u128(0x310714d5_9c6d_4c94_8187_75258f393bb6);
+        let capsule_id = "astrid-capsule-session";
+        let content_hash = "abc123";
+        let engine_seed = format!("{capsule_id}\0{content_hash}");
+        let engine_uuid = Uuid::new_v5(&ENGINE_NAMESPACE, engine_seed.as_bytes());
+
+        assert_eq!(
+            capsule_source_id_v1(capsule_id, content_hash),
+            engine_uuid,
+            "gateway source-id derivation drifted from the WASM engine capsule_uuid seed"
+        );
+    }
+
+    #[test]
+    fn source_id_is_principal_independent() {
+        // The shared-runtime seed must not depend on any principal: the same
+        // content hash yields the same source id regardless of which caller's
+        // install set it was read from.
+        let hash = "deadbeef";
+        let id = capsule_source_id_v1("astrid-capsule-session", hash);
+        assert_ne!(id, Uuid::nil());
+        // Re-deriving from the same inputs is stable.
+        assert_eq!(id, capsule_source_id_v1("astrid-capsule-session", hash));
+        // A different hash yields a different id.
+        assert_ne!(id, capsule_source_id_v1("astrid-capsule-session", "cafe"));
     }
 
     #[test]
@@ -225,18 +247,12 @@ mod tests {
         )
         .expect("manifest");
 
-        let alice = PrincipalId::new("alice").expect("valid principal");
-        let ids = trusted_capsule_source_ids_from_dirs(
-            "astrid-capsule-session",
-            std::slice::from_ref(&alice),
-            [capsule_dir],
-        );
+        let ids = trusted_capsule_source_ids_from_dirs("astrid-capsule-session", [capsule_dir]);
         let content_hash = synthetic_content_hash("astrid-capsule-session", "1.0.0");
 
         assert_eq!(
             ids,
             vec![capsule_source_id_v1(
-                &alice,
                 "astrid-capsule-session",
                 &content_hash
             )]
@@ -259,20 +275,11 @@ mod tests {
         )
         .expect("manifest");
 
-        let alice = PrincipalId::new("alice").expect("valid principal");
-        let ids = trusted_capsule_source_ids_from_dirs(
-            "astrid-capsule-session",
-            std::slice::from_ref(&alice),
-            [capsule_dir],
-        );
+        let ids = trusted_capsule_source_ids_from_dirs("astrid-capsule-session", [capsule_dir]);
 
         assert_eq!(
             ids,
-            vec![capsule_source_id_v1(
-                &alice,
-                "astrid-capsule-session",
-                "real-hash"
-            )]
+            vec![capsule_source_id_v1("astrid-capsule-session", "real-hash")]
         );
     }
 
@@ -287,12 +294,7 @@ mod tests {
         )
         .expect("manifest");
 
-        let alice = PrincipalId::new("alice").expect("valid principal");
-        let ids = trusted_capsule_source_ids_from_dirs(
-            "astrid-capsule-session",
-            std::slice::from_ref(&alice),
-            [capsule_dir],
-        );
+        let ids = trusted_capsule_source_ids_from_dirs("astrid-capsule-session", [capsule_dir]);
 
         assert!(ids.is_empty());
     }

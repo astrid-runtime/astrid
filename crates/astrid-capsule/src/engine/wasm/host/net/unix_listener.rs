@@ -28,7 +28,7 @@ impl HostUnixListener for HostState {
 
         let listener_arc = self.cli_socket_listener.clone().ok_or(ErrorCode::Closed)?;
         let rt_handle = self.runtime_handle.clone();
-        let cancel_token = self.cancel_token.clone();
+        let cancel_token = self.effective_cancel_token();
         let session_token = self.session_token.clone();
         let blocking_semaphore = self.blocking_semaphore.clone();
 
@@ -162,7 +162,7 @@ impl HostUnixListener for HostState {
     ) -> Result<Option<Resource<TcpStream>>, ErrorCode> {
         let listener_arc = self.cli_socket_listener.clone().ok_or(ErrorCode::Closed)?;
         let rt_handle = self.runtime_handle.clone();
-        let cancel_token = self.cancel_token.clone();
+        let cancel_token = self.effective_cancel_token();
         let session_token = self.session_token.clone();
         let blocking_semaphore = self.blocking_semaphore.clone();
 

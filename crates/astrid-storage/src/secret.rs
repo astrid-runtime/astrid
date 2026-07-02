@@ -22,6 +22,7 @@ use crate::kv::ScopedKvStore;
 
 /// Errors from secret storage operations.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum SecretStoreError {
     /// The platform keychain is not accessible (headless, locked, no daemon).
     #[error("keychain not accessible: {0}")]
@@ -110,6 +111,58 @@ fn validate_value(value: &str) -> Result<(), SecretStoreError> {
 }
 
 // ---------------------------------------------------------------------------
+// Neutral fail-closed implementation
+// ---------------------------------------------------------------------------
+
+/// A secret store that holds no data and denies every operation.
+///
+/// This is the **neutral, fail-closed placeholder** used as the load-time
+/// secret store of a content-addressed capsule runtime that is SHARED across
+/// principals (issue #1069). Such a runtime is loaded under no real principal's
+/// identity; a per-invocation [`SecretStore`] scoped to the *invoking* principal
+/// is installed on every call that carries a principal. This placeholder is
+/// therefore only ever reached by principal-less / load-time contexts (system
+/// and lifecycle events, load-time host calls). It must expose **nothing** and
+/// grant **nothing** — never another principal's secrets.
+///
+/// `exists` and `get` report "no such secret" (`false` / `None`); `set` and
+/// `delete` are rejected outright. A capsule that reaches this store on a real
+/// invocation is a bug — the correct behaviour is to deny, not to silently fall
+/// back to some principal's real secrets.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct DenySecretStore;
+
+impl DenySecretStore {
+    /// Construct the neutral, deny-all secret store.
+    #[must_use]
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl SecretStore for DenySecretStore {
+    fn set(&self, _key: &str, _value: &str) -> Result<(), SecretStoreError> {
+        Err(SecretStoreError::NoAccess(
+            "no principal in scope: secret writes are denied on the neutral store".into(),
+        ))
+    }
+
+    fn exists(&self, _key: &str) -> Result<bool, SecretStoreError> {
+        Ok(false)
+    }
+
+    fn get(&self, _key: &str) -> Result<Option<String>, SecretStoreError> {
+        Ok(None)
+    }
+
+    fn delete(&self, _key: &str) -> Result<bool, SecretStoreError> {
+        Err(SecretStoreError::NoAccess(
+            "no principal in scope: secret deletes are denied on the neutral store".into(),
+        ))
+    }
+}
+
+// ---------------------------------------------------------------------------
 // KV-backed implementation (always available)
 // ---------------------------------------------------------------------------
 
@@ -122,6 +175,7 @@ fn validate_value(value: &str) -> Result<(), SecretStoreError> {
 ///
 /// Less secure than the OS keychain (secrets at rest in the KV database
 /// without OS-level encryption) but functional everywhere.
+#[non_exhaustive]
 pub struct KvSecretStore {
     kv: ScopedKvStore,
     runtime_handle: tokio::runtime::Handle,
@@ -224,6 +278,7 @@ impl SecretStore for KvSecretStore {
 /// - **Permissions enforced on write** — `0o600` on the file,
 ///   `0o700` on the parent (set when creating). Existing files
 ///   created with looser perms get re-stamped on next `set`.
+#[non_exhaustive]
 pub struct FileSecretStore {
     /// The directory all keys for this `(scope, capsule)` live in.
     root: PathBuf,
@@ -433,6 +488,7 @@ mod keychain_impl {
     /// This provides per-capsule isolation at the OS level. Different capsules
     /// use different service names and cannot read each other's secrets.
     #[derive(Debug)]
+    #[non_exhaustive]
     pub struct KeychainSecretStore {
         /// The keyring service name, typically `"astrid:{capsule_id}"`.
         service: String,
@@ -565,6 +621,7 @@ mod fallback_impl {
     /// This avoids split-brain: if the keychain is unavailable at construction,
     /// all operations go to KV. If available, all go to keychain. No per-operation
     /// fallback that could scatter secrets across both backends.
+    #[non_exhaustive]
     pub struct FallbackSecretStore {
         keychain: KeychainSecretStore,
         kv: KvSecretStore,

@@ -10,7 +10,7 @@ use wasmtime::component::{Component, Linker};
 use crate::context::CapsuleContext;
 use crate::engine::ExecutionEngine;
 use crate::engine::wasm::host_state::{
-    ConnectionIdentity, HostState, LifecyclePhase, PrincipalMount,
+    ConnectionIdentity, HostState, LifecyclePhase, PrincipalCancelTokens, PrincipalMount,
 };
 use crate::error::{CapsuleError, CapsuleResult};
 use crate::manifest::CapsuleManifest;
@@ -152,6 +152,13 @@ pub struct WasmEngine {
     /// Cancellation token for cooperative shutdown of blocking host functions.
     /// Triggered during `unload()` before aborting the run handle.
     cancel_token: Option<tokio_util::sync::CancellationToken>,
+    /// Shared per-principal cancellation-token map (children of
+    /// [`cancel_token`](Self::cancel_token)), created at load alongside it and
+    /// cloned into every pooled `HostState`. `request_cancel_for` cancels and
+    /// removes ONE principal's entry so releasing that principal's view of a
+    /// shared runtime interrupts its in-flight blocking host calls without
+    /// touching the other principals' work.
+    principal_cancel_tokens: Option<PrincipalCancelTokens>,
     /// RAII guard that stops the epoch ticker thread on drop.
     epoch_ticker: Option<EpochTickerGuard>,
     /// Shared per-principal profile cache (Layer 3, issue #666).
@@ -283,6 +290,7 @@ impl WasmEngine {
             run_handle: None,
             ready_rx: None,
             cancel_token: None,
+            principal_cancel_tokens: None,
             epoch_ticker: None,
             profile_cache: None,
             owner_principal: None,
@@ -806,6 +814,147 @@ pub(crate) async fn build_principal_vfs_bundle(
     build_principal_vfs_bundle_at(&astrid_home.principal_home(principal)).await
 }
 
+/// Install (or clear) the per-invocation host-state overlays for the caller.
+///
+/// THE single source of truth for scoping a shared runtime's KV / secret store /
+/// home / tmp / capsule log to the invoking principal. Used by BOTH the
+/// dispatcher-driven interceptor path and the guest-pulled `ipc::recv` path so
+/// the two can never drift.
+///
+/// Semantics enforce the isolation invariant for a content-addressed shared
+/// runtime (issue #1069), whose load-time `kv`/`secret_store`/`home`/`tmp`/
+/// `capsule_log` fields are NEUTRAL fail-closed placeholders holding no real
+/// principal's data:
+///
+/// - `Some(p)` — install `p`-scoped overlays for EVERY caller carrying a present,
+///   parseable principal, the load-owner (`default`) INCLUDED. The KV overlay is
+///   built from [`kv_backend`](HostState::kv_backend) (the real shared backend),
+///   NOT from the neutral `kv` fallback. The secret store is built over that KV
+///   overlay so both backends are principal-isolated.
+/// - `None` — principal-less system / lifecycle events (watchdog tick,
+///   capsules_loaded): clear every overlay so resolution falls back to the
+///   NEUTRAL placeholders. This is the fail-closed floor — never another
+///   principal's data.
+///
+/// Degrade path: if the KV overlay cannot be constructed (a `with_namespace`
+/// failure, which the `{principal}:capsule:{id}` format never produces), ALL
+/// overlays are cleared to `None` so resolution fails closed to the neutral
+/// placeholder — it never falls back to the load-owner's real store.
+async fn install_principal_overlays(
+    state: &mut HostState,
+    principal: Option<&astrid_core::PrincipalId>,
+) {
+    // KV + secret store + capsule log are installed synchronously (shared with
+    // the recv path). `Ok(true)` means a real principal scope was installed;
+    // `Ok(false)` / any clear means the neutral fail-closed floor is in effect,
+    // in which case the async VFS bundle must NOT be built.
+    if !install_principal_overlays_sync(state, principal) {
+        state.invocation_home = None;
+        state.invocation_tmp = None;
+        return;
+    }
+    // Safe to unwrap: `install_principal_overlays_sync` returned `true` only for
+    // a present, parseable principal.
+    let p = principal.expect("overlays installed only for a present principal");
+    let bundle = build_principal_vfs_bundle(p).await;
+    state.invocation_home = bundle.home;
+    state.invocation_tmp = bundle.tmp;
+}
+
+/// Synchronous core of [`install_principal_overlays`]: install the KV, secret
+/// store, and capsule-log overlays scoped to `principal` (or clear them to the
+/// neutral fail-closed floor when `principal` is `None` or KV construction
+/// fails). Returns `true` iff a real per-principal scope was installed.
+///
+/// Split out so the sync `ipc::poll` / `recv` recv path can install the
+/// security-critical KV + secret overlays without an async VFS mount. `home` /
+/// `tmp` are async (they mount a VFS) and are installed only by the async
+/// [`install_principal_overlays`]; on the recv path they stay `None` and resolve
+/// to the neutral placeholder (fail-closed, never the load-owner), which is
+/// correct because run+recv capsules do not touch `home://` / `/tmp` paths.
+fn install_principal_overlays_sync(
+    state: &mut HostState,
+    principal: Option<&astrid_core::PrincipalId>,
+) -> bool {
+    // The cancellation-token overlay follows the same lifecycle as the data
+    // overlays below: installed for every present, parseable principal (lazily
+    // minted as a child of the instance token) and cleared for principal-less
+    // contexts. Unlike the data overlays its cleared-state fallback is the
+    // INSTANCE token, not a neutral deny — see
+    // [`HostState::effective_cancel_token`]. Installed unconditionally (even
+    // when KV construction fails below) because it carries no data access:
+    // it only decides which teardown signal this invocation's waits listen to,
+    // and a principal-scoped cancel must still be able to unwedge a caller
+    // whose data overlays degraded to the neutral floor.
+    state.install_invocation_cancel_token(principal);
+
+    let Some(p) = principal else {
+        // Principal-less / load-time context: neutral fail-closed fallback.
+        state.invocation_kv = None;
+        state.invocation_secret_store = None;
+        state.invocation_capsule_log = None;
+        return false;
+    };
+
+    let ns = format!("{}:capsule:{}", p, state.capsule_id);
+    let kv = match astrid_storage::ScopedKvStore::new(state.kv_backend.clone(), &ns) {
+        Ok(kv) => kv,
+        Err(e) => {
+            // FAIL CLOSED: a construction failure for principal `p` must NEVER
+            // expose the load-owner's (or anyone's) store. Clear every overlay so
+            // resolution falls back to the neutral placeholder, then bail.
+            tracing::warn!(
+                principal = %p,
+                error = %e,
+                "Failed to create invocation KV scope; failing closed to the neutral store"
+            );
+            state.invocation_kv = None;
+            state.invocation_secret_store = None;
+            state.invocation_capsule_log = None;
+            return false;
+        },
+    };
+
+    // Per-invocation secret store, built over the invocation KV scope so both KV
+    // and keychain backends are principal-isolated. The keychain service name
+    // combines capsule id + principal so keychain entries stay scoped when the
+    // same capsule serves multiple principals.
+    state.invocation_secret_store = Some(astrid_storage::build_secret_store(
+        &format!("{}:{}", state.capsule_id, p),
+        kv.clone(),
+        state.runtime_handle.clone(),
+    ));
+    state.invocation_kv = Some(kv);
+    state.invocation_capsule_log = open_capsule_log(p, state.capsule_id.as_str(), false);
+    true
+}
+
+/// Cancel and REMOVE `principal`'s per-principal cancellation token.
+///
+/// The core of [`ExecutionEngine::request_cancel_for`] for the WASM engine,
+/// split out so the mechanism is unit-testable without loading a component.
+/// Removal (not just cancellation) matters: a principal that releases its view
+/// of a shared runtime and later re-registers one (remove → reinstall) must
+/// lazily receive a FRESH, uncancelled child token from the overlay installer,
+/// not the insta-cancelled leftover. A principal with no entry (never invoked,
+/// or already removed) is a no-op. The map mutex is held only for the removal;
+/// a poisoned lock is recovered rather than propagated — cancellation is a
+/// liveness mechanism and must not itself wedge.
+fn cancel_principal_token(
+    tokens: &PrincipalCancelTokens,
+    principal: &astrid_core::principal::PrincipalId,
+) {
+    let token = {
+        let mut map = tokens
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        map.remove(principal)
+    };
+    if let Some(token) = token {
+        token.cancel();
+    }
+}
+
 /// Open (creating the log dir if needed) the daily-rotated log file for
 /// `capsule_name` under `principal`'s home. Returns `None` if the astrid home
 /// can't be resolved, the principal's home directory doesn't exist, or the
@@ -1056,11 +1205,21 @@ impl ExecutionEngine for WasmEngine {
             });
 
         // Capsule identity, used as the IPC `source_id` (kernel-stamped, never
-        // guest-settable) and the per-(capsule, topic, principal) route key.
-        // DETERMINISTIC (uuid v5 from principal + capsule name + content hash)
-        // so it is STABLE across daemon restarts. The principal segment is
-        // critical because the loaded runtime owns principal-bound env/KV host
-        // state even when the installed artifact hash is identical.
+        // guest-settable) and the per-(capsule, topic) route key.
+        // DETERMINISTIC (uuid v5 from capsule name + content hash) so it is
+        // STABLE across daemon restarts. The seed is content-addressed and
+        // deliberately carries NO principal segment: one runtime is shared by
+        // every principal that views the same content hash (issue #1069), so it
+        // must present a single stable identity to all of them. Per-principal
+        // host state (KV / secrets / home / env) is isolated per invocation via
+        // the `invocation_*` overlays, not by minting a distinct source id per
+        // principal. Cross-principal reply routing does not depend on this id:
+        // the gateway matches replies by the principal-scoped routed
+        // subscription plus the body correlation id (see
+        // `astrid-gateway/src/routes/sessions_bus.rs` and `models.rs`); the
+        // source id is only a defensive authenticity gate, so the gateway must
+        // derive it identically — see `capsule_source_id_v1` in
+        // `astrid-gateway/src/routes/capsule_sources.rs` (kept byte-identical).
         //
         // Namespace is a dedicated, fixed Astrid value — NOT `Uuid::NAMESPACE_OID`
         // (reserved for ISO OIDs), so a capsule-name-derived id can never
@@ -1069,12 +1228,7 @@ impl ExecutionEngine for WasmEngine {
         // it must never change.
         const CAPSULE_ID_NAMESPACE: uuid::Uuid =
             uuid::Uuid::from_u128(0x310714d5_9c6d_4c94_8187_75258f393bb6);
-        let capsule_uuid_seed = format!(
-            "{}\0{}\0{}",
-            ctx.principal,
-            self.manifest.package.name,
-            wasm_hash.as_str()
-        );
+        let capsule_uuid_seed = format!("{}\0{}", self.manifest.package.name, wasm_hash.as_str());
         let capsule_uuid = uuid::Uuid::new_v5(&CAPSULE_ID_NAMESPACE, capsule_uuid_seed.as_bytes());
 
         // Create shared concurrency controls before entering the blocking
@@ -1088,6 +1242,12 @@ impl ExecutionEngine for WasmEngine {
         let io_semaphore = self.runtime_limits.io_semaphore();
         let cancel_token = tokio_util::sync::CancellationToken::new();
         let cancel_token_for_state = cancel_token.clone();
+        // Per-principal cancellation tokens: one shared map for the whole
+        // instance pool (entries are children of `cancel_token`, minted
+        // lazily by the per-invocation overlay installer), so cancelling one
+        // principal's entry reaches its waits on any pooled instance.
+        let principal_cancel_tokens = HostState::new_principal_cancel_tokens();
+        let principal_cancel_tokens_for_state = principal_cancel_tokens.clone();
         let process_tracker = Arc::new(crate::engine::wasm::host::process::ProcessTracker::new());
         let process_tracker_for_listener = process_tracker.clone();
         // Host-owned persistent-process registry — one per engine, cloned
@@ -1148,7 +1308,6 @@ impl ExecutionEngine for WasmEngine {
             let lower_vfs = astrid_vfs::HostVfs::new();
             let upper_vfs = astrid_vfs::HostVfs::new();
             let root_handle = astrid_capabilities::DirHandle::new();
-            let home_root = ctx.home_root.clone();
 
             // Upper layer uses a per-capsule temporary directory so writes
             // are sandboxed until explicitly committed. The TempDir is kept
@@ -1175,63 +1334,29 @@ impl ExecutionEngine for WasmEngine {
                 ))
             })?;
 
-            // Set up the per-principal home mount. Writes go directly to
-            // disk — no OverlayVfs CoW layer here, unlike the workspace
-            // VFS. Only mount if the directory exists to avoid failing
-            // capsule load on fresh installs; `mount_dir` returns `None`
-            // for a missing root.
-            let home_mount: Option<PrincipalMount> = match home_root.as_deref() {
-                Some(g_root) if !g_root.exists() => {
-                    tracing::warn!(
-                        home_root = %g_root.display(),
-                        "home:// VFS not mounted: directory does not exist. \
-                         Capsules requesting home:// paths will receive errors \
-                         until the directory is created and the kernel is restarted."
-                    );
-                    None
-                },
-                Some(g_root) => mount_dir(g_root).await,
-                None => None,
-            };
-
+            // The per-principal home mount is NOT built at load time. A shared
+            // content-addressed runtime (issue #1069) is loaded under no real
+            // principal; `home://` is served by the per-invocation
+            // `invocation_home` overlay, mounted for the INVOKING principal on
+            // each call (see `invoke_interceptor` / the recv path). The load-time
+            // `home`/`tmp` fields stay neutral (`None`), never the load-owner's.
             let overlay_vfs = Arc::new(astrid_vfs::OverlayVfs::new(
                 Box::new(lower_vfs),
                 Box::new(upper_vfs),
             ));
 
-            // Only resolve home:// in the gate if we actually mounted the VFS.
-            // Otherwise the gate would approve paths the VFS can't serve.
-            let gate_home_root = home_mount.as_ref().map(|m| m.root.clone());
+            // NEUTRAL gate default: the gate must NOT carry a load-owner
+            // (`default`) home as its fallback. Every real `home://` access
+            // resolves through `effective_home()` and passes the INVOKING
+            // principal's home to the gate as `principal_home`, which supersedes
+            // this default. Leaving the default `None` makes the gate fail closed
+            // for principal-less / load-time contexts instead of authorizing
+            // `default`'s files.
             let security_gate = Arc::new(crate::security::ManifestSecurityGate::new(
                 manifest.clone(),
                 workspace_root.clone(),
-                gate_home_root,
+                None,
             ));
-
-            // Set up /tmp mount backed by the principal's .local/tmp/ directory.
-            let tmp_mount: Option<PrincipalMount> = match astrid_core::dirs::AstridHome::resolve() {
-                Ok(astrid_home) => {
-                    let dir = astrid_home.principal_home(&ctx.principal).tmp_dir();
-                    if dir.exists() || std::fs::create_dir_all(&dir).is_ok() {
-                        mount_dir(&dir).await
-                    } else {
-                        None
-                    }
-                },
-                Err(_) => None,
-            };
-
-            // Open per-capsule daily log file at .local/log/{capsule}/{date}.log.
-            // Prunes logs older than 7 days on each capsule load — load is
-            // one-shot so the O(N) scan is fine here. Per-invocation re-opens
-            // (see `invoke_interceptor`) do NOT prune — hot path.
-            let capsule_log = open_capsule_log(&ctx.principal, &manifest.package.name, true);
-
-            let secret_store = astrid_storage::build_secret_store(
-                &manifest.package.name,
-                kv.clone(),
-                tokio::runtime::Handle::current(),
-            );
 
             // Manifest-derived data + shared services, built once and cloned
             // into each pooled Store's HostState by `make_state` below.
@@ -1390,6 +1515,7 @@ impl ExecutionEngine for WasmEngine {
             let blocking_semaphore = blocking_semaphore.clone();
             let io_semaphore = io_semaphore.clone();
             let cancel_token_for_state = cancel_token_for_state.clone();
+            let principal_cancel_tokens_for_state = principal_cancel_tokens_for_state.clone();
             let process_tracker = process_tracker.clone();
             let persistent_registry = persistent_registry.clone();
             let memory_ledger = memory_ledger.clone();
@@ -1431,13 +1557,20 @@ impl ExecutionEngine for WasmEngine {
                 caller_context: None,
                 interceptor_active: false,
                 invocation_kv: None,
-                capsule_log: capsule_log.clone(),
+                // NEUTRAL fail-closed fallback. A shared content-addressed
+                // runtime (issue #1069) is loaded under no real principal, so
+                // the per-principal host-state FALLBACKS must hold no real
+                // principal's data — never the load-owner's (`default`'s). Every
+                // principal-carrying invocation installs its own `invocation_*`
+                // overlay (built from `kv_backend` for KV); this fallback is
+                // reached only by principal-less / load-time contexts and denies.
+                capsule_log: None,
                 capsule_id: capsule_id_val.clone(),
                 workspace_root: workspace_root.clone(),
                 vfs: Arc::clone(&overlay_vfs) as Arc<dyn astrid_vfs::Vfs>,
                 vfs_root_handle: root_handle.clone(),
-                home: home_mount.clone(),
-                tmp: tmp_mount.clone(),
+                home: None,
+                tmp: None,
                 invocation_home: None,
                 invocation_tmp: None,
                 invocation_secret_store: None,
@@ -1447,7 +1580,10 @@ impl ExecutionEngine for WasmEngine {
                 invocation_env_overlay: None,
                 overlay_vfs: Some(Arc::clone(&overlay_vfs)),
                 upper_dir: Some(Arc::clone(&upper_dir_arc)),
-                kv: kv.clone(),
+                // Neutral, physically-isolated KV fallback (see the `kv` field
+                // doc). Real per-invocation overlays are built from `kv_backend`.
+                kv: HostState::neutral_kv(),
+                kv_backend: kv.backend(),
                 event_bus: event_bus.clone(),
                 ipc_limiter: Arc::clone(&ipc_limiter),
                 config: wasm_config.clone(),
@@ -1471,11 +1607,17 @@ impl ExecutionEngine for WasmEngine {
                 inbound_tx: tx.clone(),
                 registered_uplinks: Vec::new(),
                 lifecycle_phase: None,
-                secret_store: secret_store.clone(),
+                // NEUTRAL deny-all fallback (see the `secret_store` field doc):
+                // reached only by principal-less / load-time contexts on a shared
+                // runtime; every principal-carrying invocation installs an
+                // `invocation_secret_store` scoped to the caller.
+                secret_store: HostState::neutral_secret_store(),
                 ready_tx: None,
                 blocking_semaphore: blocking_semaphore.clone(),
                 io_semaphore: io_semaphore.clone(),
                 cancel_token: cancel_token_for_state.clone(),
+                principal_cancel_tokens: principal_cancel_tokens_for_state.clone(),
+                invocation_cancel_token: None,
                 session_token: session_tok.clone(),
                 interceptor_handles: Vec::new(),
                 allowance_store: st_allowance_store.clone(),
@@ -1785,7 +1927,7 @@ impl ExecutionEngine for WasmEngine {
         if let Some(registry) = &ctx.capsule_registry {
             let mut registry = registry.write().await;
             registry.register_uuid(capsule_uuid, capsule_id.clone());
-            registry.register_instance_uuid(capsule_uuid, wasm_hash, &ctx.principal);
+            registry.register_instance_uuid(capsule_uuid, wasm_hash);
         }
 
         // Register topic schemas unconditionally — schema_catalog is always
@@ -1796,6 +1938,7 @@ impl ExecutionEngine for WasmEngine {
             .await;
 
         self.cancel_token = Some(cancel_token.clone());
+        self.principal_cancel_tokens = Some(principal_cancel_tokens);
         self.wasmtime_engine = Some(wt_engine.clone());
 
         // Start the epoch ticker for timeout enforcement.
@@ -1947,6 +2090,12 @@ impl ExecutionEngine for WasmEngine {
     fn request_cancel(&self) {
         if let Some(token) = &self.cancel_token {
             token.cancel();
+        }
+    }
+
+    fn request_cancel_for(&self, principal: &astrid_core::principal::PrincipalId) {
+        if let Some(tokens) = &self.principal_cancel_tokens {
+            cancel_principal_token(tokens, principal);
         }
     }
 
@@ -2220,51 +2369,25 @@ impl ExecutionEngine for WasmEngine {
                 state.invocation_env_overlay =
                     load_invocation_env_overlay(&invoking_principal, state.capsule_id.as_str());
 
+                // Install per-invocation host-state overlays for EVERY caller
+                // that carries a present, parseable principal — the load-owner
+                // (`default`) INCLUDED. A shared content-addressed runtime (issue
+                // #1069) is loaded under no real principal, so the load-time
+                // `kv`/`secret_store`/`home`/`tmp`/`capsule_log` fields are
+                // NEUTRAL fail-closed placeholders. Every real caller must
+                // therefore get its OWN scope explicitly here; the neutral
+                // fallback is reached only by principal-less / load-time contexts
+                // and NEVER exposes another principal's data.
+                //
+                // A caller with no parseable principal (principal-less system /
+                // lifecycle events: watchdog tick, capsules_loaded) installs NO
+                // overlay and resolves to the neutral placeholder — the correct
+                // fail-closed floor.
                 let invocation_principal: Option<astrid_core::PrincipalId> = caller
                     .and_then(|msg| msg.principal.as_deref())
-                    .and_then(|p| astrid_core::PrincipalId::new(p).ok())
-                    .filter(|p| *p != state.principal);
+                    .and_then(|p| astrid_core::PrincipalId::new(p).ok());
 
-                state.invocation_kv = invocation_principal.as_ref().and_then(|p| {
-                    let ns = format!("{}:capsule:{}", p, state.capsule_id);
-                    match state.kv.with_namespace(&ns) {
-                        Ok(kv) => Some(kv),
-                        Err(e) => {
-                            tracing::warn!(
-                                principal = %p,
-                                error = %e,
-                                "Failed to create invocation KV scope"
-                            );
-                            None
-                        },
-                    }
-                });
-
-                if let Some(ref p) = invocation_principal {
-                    let bundle = build_principal_vfs_bundle(p).await;
-                    state.invocation_home = bundle.home;
-                    state.invocation_tmp = bundle.tmp;
-                    state.invocation_capsule_log =
-                        open_capsule_log(p, state.capsule_id.as_str(), false);
-
-                    // Per-invocation secret store: built against the
-                    // invocation KV scope so both KV and keychain backends
-                    // are principal-isolated. `build_secret_store`'s
-                    // capsule_id is the keychain service name; combining it
-                    // with the principal keeps keychain entries scoped even
-                    // when the same capsule serves multiple principals.
-                    // If the invocation KV scope couldn't be built we leave
-                    // this as `None`, which causes `effective_secret_store`
-                    // to fall back to the load-time store — same
-                    // degrade-safely behavior as the KV scoping above.
-                    state.invocation_secret_store = state.invocation_kv.as_ref().map(|kv| {
-                        astrid_storage::build_secret_store(
-                            &format!("{}:{}", state.capsule_id, p),
-                            kv.clone(),
-                            state.runtime_handle.clone(),
-                        )
-                    });
-                }
+                install_principal_overlays(state, invocation_principal.as_ref()).await;
             }
 
             // ── Phase 2: CALL ─────────────────────────────────────
@@ -2482,6 +2605,14 @@ pub async fn run_lifecycle(
         invocation_env_overlay: None,
         overlay_vfs: None,
         upper_dir: None,
+        // Lifecycle hooks (install/upgrade) run a ONE-SHOT, single-principal,
+        // NON-shared instance: `cfg.kv` / `cfg.secret_store` are already scoped to
+        // the specific principal the operator is installing for, no other
+        // principal ever touches this throwaway instance, and no per-invocation
+        // overlays are installed. So the load-time `kv` legitimately IS this
+        // principal's real store (not the shared-runtime neutral placeholder).
+        // `kv_backend` mirrors it for API completeness; overlays are never built.
+        kv_backend: cfg.kv.backend(),
         kv: cfg.kv,
         event_bus: cfg.event_bus,
         ipc_limiter: Arc::new(astrid_events::ipc::IpcRateLimiter::new()),
@@ -2520,6 +2651,11 @@ pub async fn run_lifecycle(
         blocking_semaphore: HostState::default_blocking_semaphore(),
         io_semaphore: HostState::default_io_semaphore(),
         cancel_token: tokio_util::sync::CancellationToken::new(),
+        // Lifecycle hooks run a ONE-SHOT, single-principal instance: no
+        // per-principal overlays are ever installed, so the token map stays
+        // empty and every wait uses the instance token above.
+        principal_cancel_tokens: HostState::new_principal_cancel_tokens(),
+        invocation_cancel_token: None,
         session_token: None,
         interceptor_handles: Vec::new(),
         allowance_store: None,
@@ -3506,6 +3642,7 @@ mod tests {
             state.invocation_capsule_log = None;
             state.invocation_profile = None;
             state.invocation_env_overlay = None;
+            state.invocation_cancel_token = None;
         }
 
         let mut state = minimal_host_state(tokio::runtime::Handle::current());
@@ -3517,6 +3654,7 @@ mod tests {
             },
             uuid::Uuid::nil(),
         ));
+        state.invocation_cancel_token = Some(tokio_util::sync::CancellationToken::new());
 
         clear(&mut state);
 
@@ -3529,6 +3667,7 @@ mod tests {
         assert!(state.invocation_capsule_log.is_none());
         assert!(state.invocation_profile.is_none());
         assert!(state.invocation_env_overlay.is_none());
+        assert!(state.invocation_cancel_token.is_none());
     }
 
     /// Cancellation safety on the ipc `recv` path: the routed receiver

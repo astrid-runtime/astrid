@@ -157,7 +157,7 @@ impl elicit::Host for HostState {
         let runtime_handle = self.runtime_handle.clone();
         let event_bus = self.event_bus.clone();
         let capsule_id = self.capsule_id.to_string();
-        let cancel_token = self.cancel_token.clone();
+        let cancel_token = self.effective_cancel_token();
         let blocking_semaphore = self.blocking_semaphore.clone();
 
         // Publish the elicit request to the event bus, stamped with the

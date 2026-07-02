@@ -41,6 +41,21 @@ pub(crate) trait ExecutionEngine: Send + Sync {
     /// in-flight tasks need a cancellation signal so they can release the Arc.
     fn request_cancel(&self) {}
 
+    /// Request cooperative cancellation of ONE principal's in-flight blocking
+    /// work, leaving every other principal's work running.
+    ///
+    /// Called when a principal releases its view of a runtime that other
+    /// principals still share: the runtime must survive, but the departing
+    /// principal's blocked host calls (approval/elicit waits, net/io/ipc
+    /// waits) must not wedge the shared instance for everyone else.
+    ///
+    /// Default no-op — fail-safe: an engine without per-principal wait
+    /// tracking keeps today's instance-scoped semantics (its waits end only
+    /// on a full [`request_cancel`](Self::request_cancel)), which merely
+    /// leaves the pre-existing wedge window open rather than cancelling work
+    /// that belongs to someone else.
+    fn request_cancel_for(&self, _principal: &astrid_core::principal::PrincipalId) {}
+
     /// Extract the inbound receiver if this engine provides one.
     fn take_inbound_rx(
         &mut self,

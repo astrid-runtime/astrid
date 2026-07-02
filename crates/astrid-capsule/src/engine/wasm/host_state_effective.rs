@@ -4,39 +4,39 @@
 use super::*;
 
 impl HostState {
-    /// Return the KV namespace for this capsule scoped to its principal.
-    ///
-    /// Format: `{principal}:capsule:{capsule_id}`. This is the same namespace
-    /// used when the `ScopedKvStore` was created, but exposed here for cases
-    /// where host functions need to construct the namespace dynamically.
-    #[must_use]
-    pub fn principal_kv_namespace(&self) -> String {
-        format!("{}:capsule:{}", self.principal, self.capsule_id)
-    }
-
     /// Return the effective KV store for the current invocation.
     ///
-    /// Per-principal isolation lives HERE, not in capsule keys. Every store is
-    /// namespaced `{principal}:capsule:{capsule_id}`, so two principals writing
-    /// the *same* logical key — e.g. capsule-session's principal-less
+    /// Per-principal isolation lives HERE, not in capsule keys. Every real store
+    /// is namespaced `{principal}:capsule:{capsule_id}`, so two principals
+    /// writing the *same* logical key — e.g. capsule-session's principal-less
     /// `session.data.{id}` — resolve to different backing namespaces and never
     /// collide. A capsule therefore must not (and need not) fold the principal
     /// into its own keys.
     ///
-    /// Resolution: `invocation_kv` (the per-call store installed when the caller
-    /// differs from the load-time owner) wins; otherwise the owner `kv`. The
-    /// owner fallback is correct in exactly two cases — no caller in scope
-    /// (load-time, a run-loop's own work, tests) or the caller IS the owner.
-    /// The case it does NOT defend against is a caller whose principal is
-    /// absent/unparseable while `invocation_kv` is unset: a principal-scoped
-    /// capsule would then silently touch the owner's namespace. That cannot
-    /// happen today because every producer of a principal-scoped topic stamps
-    /// an authenticated principal (`publish_inner` → `with_principal`; uplink
-    /// ingress → verified `ingress_principal`). The invariant is emergent, so it
-    /// is pinned by the `effective_kv_*` / `scoped_kv_*` tests rather than a
-    /// host-wide assert — see `debug_assert_invocation_field_set` for why a
-    /// blanket fail-closed assert on the absent-principal case is unsound.
-    /// Relates to #977.
+    /// Resolution: `invocation_kv` (the per-call store installed for the invoking
+    /// principal) wins; otherwise the NEUTRAL fail-closed
+    /// [`kv`](HostState::kv) placeholder.
+    ///
+    /// Runtimes are SHARED by content hash across principals (issue #1069) and
+    /// the kernel loads them under [`PrincipalId::default()`](astrid_core::PrincipalId::default),
+    /// but `default` is an ORDINARY principal — reading its namespace from
+    /// another principal would be a cross-principal bleed. So the load-time `kv`
+    /// fallback is NOT `default`'s namespace: it is a neutral, physically-
+    /// isolated placeholder holding no real principal's data (see the field doc).
+    /// EVERY caller carrying a principal — the owner/`default` included — gets an
+    /// `invocation_kv` overlay scoped to its own principal (installed by
+    /// `invoke_interceptor` / `install_recv_invocation_context`), so the fallback
+    /// is reached ONLY by principal-less contexts:
+    ///
+    /// - no caller in scope (load-time, a run-loop's own work, tests), or
+    /// - a principal-less system/lifecycle event (watchdog tick,
+    ///   `capsules_loaded`).
+    ///
+    /// In every one of those the fallback is the neutral placeholder, so no
+    /// invocation can EVER reach another principal's KV — nor `default`'s — via
+    /// the fallback. The degrade path (invocation-KV construction failing and
+    /// leaving `invocation_kv = None`) also falls back to the neutral placeholder.
+    /// Pinned by the `effective_kv_*` / `scoped_kv_*` tests. Relates to #977, #1069.
     #[must_use]
     pub fn effective_kv(&self) -> &ScopedKvStore {
         #[cfg(debug_assertions)]
@@ -44,17 +44,47 @@ impl HostState {
         self.invocation_kv.as_ref().unwrap_or(&self.kv)
     }
 
+    /// The current invocation's capsule KV namespace,
+    /// `{effective_principal}:capsule:{capsule_id}`.
+    ///
+    /// Retained only for backward compatibility; superseded by
+    /// [`effective_kv`](Self::effective_kv). This returns just a namespace
+    /// STRING, so — unlike `effective_kv` — it cannot express the fail-closed,
+    /// physically-isolated NEUTRAL placeholder that a shared content-addressed
+    /// runtime (issue #1069) falls back to for a principal-less / load-time
+    /// context; it can only ever name a `{principal}:capsule:{id}` namespace.
+    ///
+    /// The body anchors [`effective_principal`](Self::effective_principal) (the
+    /// INVOKING principal, falling back to the load owner only when no caller is
+    /// in scope), NOT the raw load owner, so a stray caller gets the current
+    /// principal's namespace rather than the misleading owner-only value the
+    /// shared-runtime model made incorrect. Prefer `effective_kv()`, which builds
+    /// the correctly-scoped, fail-closed store directly.
+    #[deprecated(
+        since = "0.8.0",
+        note = "use `effective_kv()` for the current invocation's per-principal store; this returns only a namespace string and cannot express the fail-closed/neutral fallback"
+    )]
+    #[must_use]
+    pub fn principal_kv_namespace(&self) -> String {
+        format!("{}:capsule:{}", self.effective_principal(), self.capsule_id)
+    }
+
     /// Return the effective home mount for the current invocation.
     ///
-    /// Prefers `invocation_home` (set when serving a different principal)
-    /// over `home` (set at capsule load for the owning principal).
+    /// Prefers `invocation_home` (installed for the invoking principal) over the
+    /// load-time `home`. On a SHARED runtime (issue #1069) `home` is `None`, so
+    /// this fallback is neutral/fail-closed — it can NEVER be another principal's
+    /// (nor `default`'s) home. `home` is set to a real principal's mount only on
+    /// the single-principal lifecycle/hook paths, which no other principal can
+    /// reach, so there is no cross-principal home fallback anywhere.
     #[must_use]
     pub fn effective_home(&self) -> Option<&PrincipalMount> {
         self.invocation_home.as_ref().or(self.home.as_ref())
     }
 
     /// Return the effective tmp mount for the current invocation. Same
-    /// precedence as [`effective_home`](Self::effective_home).
+    /// precedence and same neutral-`None`-on-shared-runtime safety as
+    /// [`effective_home`](Self::effective_home).
     #[must_use]
     pub fn effective_tmp(&self) -> Option<&PrincipalMount> {
         self.invocation_tmp.as_ref().or(self.tmp.as_ref())
@@ -132,6 +162,29 @@ impl HostState {
             .as_ref()
             .map(|m| m.origin)
             .unwrap_or(astrid_events::ipc::MessageOrigin::System)
+    }
+
+    /// Return the effective cancellation token for the current invocation's
+    /// blocking host calls: the per-principal
+    /// [`invocation_cancel_token`](Self::invocation_cancel_token) overlay when
+    /// installed, else the instance [`cancel_token`](Self::cancel_token).
+    ///
+    /// DELIBERATELY unlike the KV/secret overlays, the fallback here is the
+    /// INSTANCE token, not a neutral deny: cancellation is a liveness concern,
+    /// not data isolation. A principal-less context (load-time work, a
+    /// run-loop's self-triggered work, lifecycle hooks, tests) should have its
+    /// waits interrupted only by a full-instance cancel (unload/replace/
+    /// shutdown) — exactly today's behaviour. There is nothing fail-open about
+    /// the fallback: it grants no data access, it only decides which teardown
+    /// signal a wait listens to.
+    ///
+    /// Returns an owned clone — every wait site immediately cloned the token
+    /// anyway to move it into the blocking future.
+    #[must_use]
+    pub fn effective_cancel_token(&self) -> CancellationToken {
+        self.invocation_cancel_token
+            .clone()
+            .unwrap_or_else(|| self.cancel_token.clone())
     }
 
     /// Return the effective quota profile for the current invocation.

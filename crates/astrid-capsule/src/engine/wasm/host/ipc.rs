@@ -615,7 +615,15 @@ impl HostSubscription for HostState {
         // `block_in_place` (issue #816). Deliberately do not drain an
         // additional batch here: the envelope has a single installed
         // invocation context, so it must carry a single principal's message.
-        let cancel_token = self.cancel_token.clone();
+        //
+        // Recv is the shared event pump, so re-arm the wait context first: a
+        // departed principal's cancelled per-principal token (persisted on
+        // the run-loop Store's invocation context between messages) has
+        // already delivered its wake and must not keep short-circuiting this
+        // wait, or every OTHER principal's messages would starve unread. See
+        // `clear_stale_invocation_cancel_token` for the full rationale.
+        self.clear_stale_invocation_cancel_token();
+        let cancel_token = self.effective_cancel_token();
         let io_semaphore = self.io_semaphore.clone();
         let receiver_for_wait = Arc::clone(&receiver_arc);
         let first = util::bounded_await_cancellable(&io_semaphore, &cancel_token, async move {

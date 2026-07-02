@@ -4,6 +4,84 @@
 use super::*;
 
 impl HostState {
+    /// Build a fresh, empty per-principal cancellation-token map.
+    ///
+    /// Out-of-pool constructors (lifecycle hooks, the hook handler, tests) use
+    /// this so they do not have to name the map type. The pooled path instead
+    /// clones one shared map into every instance, exactly like
+    /// [`new_connection_principals`](Self::new_connection_principals).
+    #[must_use]
+    pub fn new_principal_cancel_tokens() -> PrincipalCancelTokens {
+        Arc::new(std::sync::Mutex::new(HashMap::new()))
+    }
+
+    /// Install (or clear) the per-invocation cancellation token, mirroring the
+    /// lifecycle of the other `invocation_*` overlays.
+    ///
+    /// `Some(p)` looks up `p`'s entry in the shared
+    /// [`principal_cancel_tokens`](Self::principal_cancel_tokens) map, lazily
+    /// minting a fresh [`child_token`](CancellationToken::child_token) of the
+    /// instance [`cancel_token`](Self::cancel_token) if absent — so a
+    /// full-instance cancel still cascades, and a principal whose token was
+    /// cancelled + removed on view release gets a FRESH, uncancelled token when
+    /// it re-registers and invokes again. `None` (principal-less context)
+    /// clears the overlay so waits fall back to the instance token.
+    ///
+    /// The map mutex is only ever held for this entry-or-clone, so a poisoned
+    /// lock (a panic while holding it) is recovered rather than propagated —
+    /// wedging every principal's cancellation over a torn map would trade a
+    /// liveness mechanism for a liveness bug.
+    pub(crate) fn install_invocation_cancel_token(
+        &mut self,
+        principal: Option<&astrid_core::PrincipalId>,
+    ) {
+        match principal {
+            Some(p) => {
+                let token = {
+                    let mut map = self
+                        .principal_cancel_tokens
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    map.entry(p.clone())
+                        .or_insert_with(|| self.cancel_token.child_token())
+                        .clone()
+                };
+                self.invocation_cancel_token = Some(token);
+            },
+            None => self.invocation_cancel_token = None,
+        }
+    }
+
+    /// Re-arm the wait context when a DEPARTED principal's cancelled token is
+    /// still installed: clear the stale overlay so the next wait falls back to
+    /// the (alive) instance token.
+    ///
+    /// The dedicated run-loop Store keeps its `invocation_*` overlays between
+    /// messages (deliberately, for publish stamping), so after a per-principal
+    /// cancel fires, that principal's cancelled token would otherwise poison
+    /// the shared event pump forever: `ipc::recv` short-circuits before
+    /// draining, starving every OTHER principal's messages — re-creating the
+    /// cross-principal wedge the per-principal tokens exist to prevent. Called
+    /// at the top of `ipc::recv` only — the pump anchor, where the
+    /// cancellation has already delivered its wake. Pooled instances never
+    /// need it (overlays clear on lease return), and it must NOT be called
+    /// from mid-invocation wait sites (approval/elicit/io), where a cancelled
+    /// invocation token is exactly the signal being delivered.
+    ///
+    /// When the INSTANCE token is cancelled too (full unload), the overlay is
+    /// left in place: everything is being torn down and the short-circuit is
+    /// the desired behaviour.
+    pub(crate) fn clear_stale_invocation_cancel_token(&mut self) {
+        if !self.cancel_token.is_cancelled()
+            && self
+                .invocation_cancel_token
+                .as_ref()
+                .is_some_and(CancellationToken::is_cancelled)
+        {
+            self.invocation_cancel_token = None;
+        }
+    }
+
     /// Install per-invocation context from an inbound IPC message picked
     /// up via [`ipc::Host::ipc_recv`](crate::engine::wasm::host::ipc) /
     /// [`ipc::Host::ipc_poll`].
@@ -38,12 +116,23 @@ impl HostState {
     ///   this path too; falls back to the process-global default on a missing
     ///   cache or failed load.
     ///
+    /// - [`invocation_secret_store`](Self::invocation_secret_store) — installed
+    ///   for the publisher (owner included) via the shared
+    ///   [`install_principal_overlays_sync`](crate::engine::wasm::install_principal_overlays_sync),
+    ///   so a non-owner publisher's `has_secret` / secret writes resolve to ITS
+    ///   OWN store, never the neutral load-time fallback and never `default`'s.
+    ///
     /// Skipped vs the interceptor path (each is independently
     /// recoverable; documenting the gaps so the omissions are
     /// auditable):
-    /// - `invocation_home` / `invocation_tmp` / `invocation_secret_store` —
-    ///   none of the current run+recv capsules touch home/tmp paths
-    ///   or secrets from the recv loop. Add when one starts to.
+    /// - `invocation_home` / `invocation_tmp` — these MOUNT a VFS (async), but
+    ///   `ipc::poll` is a synchronous bindgen fn, so they are not installed on
+    ///   this path. Run+recv capsules do not touch `home://` / `/tmp` paths, and
+    ///   the load-time `home` / `tmp` fields are NEUTRAL (`None`) fail-closed
+    ///   placeholders — so leaving them unset denies rather than exposing the
+    ///   load-owner's mount. Install them (via the async
+    ///   [`install_principal_overlays`](crate::engine::wasm::install_principal_overlays))
+    ///   if a recv-driven capsule ever needs per-principal `home://`.
     /// - `store_meter` — the per-invocation linear-memory ceiling stays the
     ///   capsule owner's; the recv path does not re-target it per publisher
     ///   the way `invoke_interceptor` does. Acceptable because the run+recv
@@ -89,6 +178,14 @@ impl HostState {
                 env_principal,
                 self.capsule_id.as_str(),
             );
+            // Refresh the cancellation token from the shared map too (the map
+            // is the source of truth; this field is a cache). Without this, a
+            // publisher whose token was cancelled + removed on view release —
+            // and who then re-registered — would keep the STALE cancelled
+            // token on this persistent run-loop context, so its approval/
+            // elicit waits during message processing would short-circuit
+            // instead of waiting under a fresh per-principal token.
+            self.install_invocation_cancel_token(publisher.as_ref());
             return;
         }
 
@@ -107,10 +204,16 @@ impl HostState {
         //     single-tenant case and only bites once an operator configures
         //     the owner principal.)
         //
-        //   • KV / log overrides — installed only when the publisher DIFFERS
-        //     from the load-time owner. The load-time `kv` / `capsule_log`
-        //     are already the owner's, so an owner-published message clears
-        //     them back to the load-time values.
+        //   • KV / secret-store / log overlays — installed for EVERY publisher
+        //     that carries a present, parseable principal, the load-owner
+        //     (`default`) INCLUDED, via the shared
+        //     [`install_principal_overlays_sync`]. A shared content-addressed
+        //     runtime (issue #1069) is loaded under no real principal, so the
+        //     load-time `kv` / `secret_store` / `capsule_log` are NEUTRAL
+        //     fail-closed placeholders; every real publisher must get its OWN
+        //     scope explicitly. A principal-less system/lifecycle event (no
+        //     parseable principal) clears the overlays and resolves to the
+        //     neutral floor — never another principal's data.
         //
         //   • Env overrides — refreshed for the effective publisher, owner
         //     included. Env files can be written after capsule load via the
@@ -146,29 +249,14 @@ impl HostState {
             self.capsule_id.as_str(),
         );
 
-        // KV / log scoping overrides only kick in for a non-owner publisher;
-        // an owner-published message clears them back to the load-time
-        // (owner) values.
-        let Some(p) = publisher.filter(|p| *p != self.principal) else {
-            self.invocation_kv = None;
-            self.invocation_capsule_log = None;
-            return;
-        };
-
-        let ns = format!("{}:capsule:{}", p, self.capsule_id);
-        self.invocation_kv = match self.kv.with_namespace(&ns) {
-            Ok(kv) => Some(kv),
-            Err(e) => {
-                tracing::warn!(
-                    principal = %p,
-                    error = %e,
-                    "Failed to create invocation KV scope on ipc::recv path"
-                );
-                None
-            },
-        };
-
-        self.invocation_capsule_log =
-            crate::engine::wasm::open_capsule_log(&p, self.capsule_id.as_str(), false);
+        // Install the KV / secret-store / capsule-log overlays for the publisher
+        // (owner included), or clear them to the neutral floor for a
+        // principal-less event. `home` / `tmp` are NOT installed here: they mount
+        // a VFS (async) and `ipc::poll` is a sync bindgen fn; run+recv capsules
+        // do not touch `home://` / `/tmp`, and the neutral `None` fallback is
+        // fail-closed (never the load-owner), so leaving them unset is correct.
+        // This closes the recv-path secret bleed: a non-owner publisher now
+        // resolves `effective_secret_store` to ITS OWN store, not `default`'s.
+        crate::engine::wasm::install_principal_overlays_sync(self, publisher.as_ref());
     }
 }
