@@ -19,7 +19,7 @@ use wasmtime::component::Resource;
 use wasmtime_wasi::p2::DynPollable;
 
 use super::managed::{ManagedProcess, drain_buffer, kill_and_reap};
-use crate::engine::wasm::bindings::astrid::process::host::{
+use crate::engine::wasm::bindings::astrid::process1_1_0::host::{
     ErrorCode, ExitInfo, HostProcessHandle, KillResult, ProcessHandle, ProcessResult,
     ProcessSignal, ReadLogsResult,
 };

@@ -195,7 +195,7 @@ async fn concurrent_cap_enforced_and_stop_reaps() {
     assert!(
         matches!(
             err,
-            crate::engine::wasm::bindings::astrid::process::host::ErrorCode::Quota
+            crate::engine::wasm::bindings::astrid::process1_1_0::host::ErrorCode::Quota
         ),
         "expected Quota, got {err:?}"
     );
@@ -216,7 +216,7 @@ async fn concurrent_cap_enforced_and_stop_reaps() {
 
 #[tokio::test]
 async fn read_since_is_non_draining_with_cursor() {
-    use crate::engine::wasm::bindings::astrid::process::host::{LogCursor, LogStream};
+    use crate::engine::wasm::bindings::astrid::process1_1_0::host::{LogCursor, LogStream};
 
     let reg = PersistentProcessRegistry::new(tokio::runtime::Handle::current());
     let p = PrincipalId::new("alice").unwrap();
@@ -268,7 +268,7 @@ async fn read_since_is_non_draining_with_cursor() {
 
 #[tokio::test]
 async fn write_stdin_delivers_survives_reset_and_close_eofs() {
-    use crate::engine::wasm::bindings::astrid::process::host::ErrorCode;
+    use crate::engine::wasm::bindings::astrid::process1_1_0::host::ErrorCode;
 
     let reg = PersistentProcessRegistry::new(tokio::runtime::Handle::current());
     let alice = PrincipalId::new("alice").unwrap();

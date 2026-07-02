@@ -59,7 +59,7 @@ use rand::{TryRng, rngs::SysRng};
 use tokio::io::AsyncWriteExt;
 use tokio::sync::watch;
 
-use crate::engine::wasm::bindings::astrid::process::host::{
+use crate::engine::wasm::bindings::astrid::process1_1_0::host::{
     ErrorCode, ExitInfo, LogChunk, LogCursor, LogStream, OverflowPolicy, ProcessInfo,
     ProcessSignal, ReadLogsResult,
 };

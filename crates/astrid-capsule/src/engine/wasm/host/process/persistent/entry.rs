@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 use astrid_core::principal::PrincipalId;
 use tokio::sync::watch;
 
-use crate::engine::wasm::bindings::astrid::process::host::{
+use crate::engine::wasm::bindings::astrid::process1_1_0::host::{
     ErrorCode, ExitInfo, ProcessInfo, ProcessPhase, ProcessSignal,
 };
 

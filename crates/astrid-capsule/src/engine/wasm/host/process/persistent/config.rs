@@ -5,7 +5,7 @@
 
 use std::time::Duration;
 
-use crate::engine::wasm::bindings::astrid::process::host::OverflowPolicy;
+use crate::engine::wasm::bindings::astrid::process1_1_0::host::OverflowPolicy;
 
 use super::ring::Overflow;
 
