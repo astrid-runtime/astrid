@@ -17,6 +17,7 @@
 //! `HostState.background_processes` is gone — the wasmtime resource
 //! table is the canonical storage for `ManagedProcess`.
 
+mod audit;
 mod handle;
 mod inject;
 mod managed;
@@ -39,6 +40,10 @@ use crate::engine::wasm::host::util;
 use crate::engine::wasm::host_state::HostState;
 use managed::{ManagedProcess, attach_pipes, configure_piped, prepare_sandboxed_command};
 
+pub(crate) use audit::{
+    audit_process, audit_process_id, audit_process_injections, audit_spawn_result,
+    record_process_denied,
+};
 pub use persistent::PersistentProcessRegistry;
 pub use tracker::ProcessTracker;
 // Public so other crates (engine/init, hooks) can reference the type
@@ -51,112 +56,6 @@ pub(crate) const MAX_BACKGROUND_PROCESSES: usize = 8;
 /// Per-spawn stdin prelude cap (the WIT: `spawn-request.stdin` "Capped at
 /// 4 MiB per spawn"). Oversized preludes are rejected with `too-large`.
 const MAX_SPAWN_STDIN_BYTES: usize = 4 * 1024 * 1024;
-
-/// Audit a process host fn invocation.
-fn audit_process<T, E: std::fmt::Debug>(
-    state: &HostState,
-    op: &'static str,
-    cmd: &str,
-    result: &Result<T, E>,
-) {
-    let capsule_id = state.capsule_id.as_str();
-    let principal = state.effective_principal();
-    match result {
-        Ok(_) => tracing::debug!(
-            target: "astrid.audit.process",
-            %capsule_id,
-            %principal,
-            fn = op,
-            cmd,
-            "audit",
-        ),
-        Err(e) => tracing::debug!(
-            target: "astrid.audit.process",
-            %capsule_id,
-            %principal,
-            fn = op,
-            cmd,
-            error = ?e,
-            "audit",
-        ),
-    }
-}
-
-/// Audit a spawn that carried read-only file injections. Emits the same
-/// `astrid.audit.process` line as [`audit_process`] plus an `injections` field
-/// = a formatted `"<target>=<blake3hex>"` list. Only the target paths and
-/// content hashes are logged — never the source path's parent, the bytes, or
-/// any token (consistent with the existing audit discipline).
-fn audit_process_injections<T, E: std::fmt::Debug>(
-    state: &HostState,
-    op: &'static str,
-    cmd: &str,
-    audit: &[(String, String)],
-    result: &Result<T, E>,
-) {
-    let injections = audit
-        .iter()
-        .map(|(target, hash)| format!("{target}={hash}"))
-        .collect::<Vec<_>>()
-        .join(",");
-    let capsule_id = state.capsule_id.as_str();
-    let principal = state.effective_principal();
-    match result {
-        Ok(_) => tracing::debug!(
-            target: "astrid.audit.process",
-            %capsule_id,
-            %principal,
-            fn = op,
-            cmd,
-            injections = %injections,
-            "audit",
-        ),
-        Err(e) => tracing::debug!(
-            target: "astrid.audit.process",
-            %capsule_id,
-            %principal,
-            fn = op,
-            cmd,
-            injections = %injections,
-            error = ?e,
-            "audit",
-        ),
-    }
-}
-
-/// Audit an id-keyed persistent-process op. Logs a short, non-reversible
-/// hash of the `process-id` — never the raw token, per the WIT ("never the
-/// raw id") — plus the op, principal, and capsule.
-fn audit_process_id<T, E: std::fmt::Debug>(
-    state: &HostState,
-    op: &'static str,
-    id: &str,
-    result: &Result<T, E>,
-) {
-    let id_hash = blake3::hash(id.as_bytes()).to_hex();
-    let id = &id_hash[..16];
-    let capsule_id = state.capsule_id.as_str();
-    let principal = state.effective_principal();
-    match result {
-        Ok(_) => tracing::debug!(
-            target: "astrid.audit.process",
-            %capsule_id,
-            %principal,
-            fn = op,
-            id,
-            "audit",
-        ),
-        Err(e) => tracing::debug!(
-            target: "astrid.audit.process",
-            %capsule_id,
-            %principal,
-            fn = op,
-            id,
-            error = ?e,
-            "audit",
-        ),
-    }
-}
 
 /// Extract the call_id from the caller's IPC context if it carried a
 /// `ToolExecuteRequest` payload.
@@ -244,15 +143,21 @@ impl process::Host for HostState {
             let check = util::bounded_block_on(&handle, &semaphore, async move {
                 sec.check_host_process(&capsule_id, &cmd).await
             });
-            if check.is_err() {
-                let result: Result<ProcessResult, ErrorCode> = Err(ErrorCode::CapabilityDenied);
-                audit_process(self, "astrid:process/host.spawn", &cmd_for_audit, &result);
-                return result;
+            if let Err(reason) = check {
+                // Gate-denied spawn: record the denial as `Denied` (exactly
+                // once) and fail closed before any exec.
+                record_process_denied(self, "astrid:process/host.spawn", &cmd_for_audit, &reason);
+                return Err(ErrorCode::CapabilityDenied);
             }
         } else {
-            let result: Result<ProcessResult, ErrorCode> = Err(ErrorCode::CapabilityDenied);
-            audit_process(self, "astrid:process/host.spawn", &cmd_for_audit, &result);
-            return result;
+            // No security gate configured → spawn is denied fail-closed.
+            record_process_denied(
+                self,
+                "astrid:process/host.spawn",
+                &cmd_for_audit,
+                "no security gate configured",
+            );
+            return Err(ErrorCode::CapabilityDenied);
         }
 
         // Snapshot + verify any read-only file injections before building the
@@ -271,20 +176,48 @@ impl process::Host for HostState {
         let injection_env = prepared.env;
         let _injection_guard = prepared.guard;
 
-        let mut sandboxed_cmd = prepare_sandboxed_command(
+        let mut sandboxed_cmd = match prepare_sandboxed_command(
             &request.cmd,
             &request.args,
             &workspace_root,
             &prepared.sandbox,
             &injection_env,
-        )
-        .map_err(|_| ErrorCode::InvalidInput)?;
+        ) {
+            Ok(cmd) => cmd,
+            Err(_) => {
+                // Sandbox construction failed before exec — audit the attempt as
+                // Failed instead of returning silently via `?`.
+                let result: Result<ProcessResult, ErrorCode> = Err(ErrorCode::InvalidInput);
+                audit_spawn_result(
+                    self,
+                    "astrid:process/host.spawn",
+                    &cmd_for_audit,
+                    &injection_audit,
+                    &result,
+                );
+                return result;
+            },
+        };
         sandboxed_cmd.stdout(Stdio::piped());
         sandboxed_cmd.stderr(Stdio::piped());
 
-        let child = sandboxed_cmd
-            .spawn()
-            .map_err(|e| ErrorCode::Unknown(format!("spawn failed: {e}")))?;
+        let child = match sandboxed_cmd.spawn() {
+            Ok(child) => child,
+            Err(e) => {
+                // Fork/exec failed — audit the attempt as Failed before
+                // returning.
+                let result: Result<ProcessResult, ErrorCode> =
+                    Err(ErrorCode::Unknown(format!("spawn failed: {e}")));
+                audit_spawn_result(
+                    self,
+                    "astrid:process/host.spawn",
+                    &cmd_for_audit,
+                    &injection_audit,
+                    &result,
+                );
+                return result;
+            },
+        };
         let pid = child.id();
         process_tracker.register(pid, call_id);
 
@@ -325,17 +258,13 @@ impl process::Host for HostState {
                 Err(ErrorCode::Cancelled)
             },
         };
-        if injection_audit.is_empty() {
-            audit_process(self, "astrid:process/host.spawn", &cmd_for_audit, &result);
-        } else {
-            audit_process_injections(
-                self,
-                "astrid:process/host.spawn",
-                &cmd_for_audit,
-                &injection_audit,
-                &result,
-            );
-        }
+        audit_spawn_result(
+            self,
+            "astrid:process/host.spawn",
+            &cmd_for_audit,
+            &injection_audit,
+            &result,
+        );
         result
     }
 
@@ -374,10 +303,22 @@ impl process::Host for HostState {
             let check = util::bounded_block_on(&handle, &semaphore, async move {
                 sec.check_host_process(&capsule_id, &cmd).await
             });
-            if check.is_err() {
+            if let Err(reason) = check {
+                record_process_denied(
+                    self,
+                    "astrid:process/host.spawn-background",
+                    &cmd_for_audit,
+                    &reason,
+                );
                 return Err(ErrorCode::CapabilityDenied);
             }
         } else {
+            record_process_denied(
+                self,
+                "astrid:process/host.spawn-background",
+                &cmd_for_audit,
+                "no security gate configured",
+            );
             return Err(ErrorCode::CapabilityDenied);
         }
 
@@ -410,14 +351,29 @@ impl process::Host for HostState {
         let injection_audit = prepared.audit;
         let injection_env = prepared.env;
 
-        let mut sandboxed_cmd = prepare_sandboxed_command(
+        let mut sandboxed_cmd = match prepare_sandboxed_command(
             &request.cmd,
             &request.args,
             &workspace_root,
             &prepared.sandbox,
             &injection_env,
-        )
-        .map_err(|_| ErrorCode::InvalidInput)?;
+        ) {
+            Ok(cmd) => cmd,
+            Err(_) => {
+                // Sandbox construction failed before exec — audit the attempt as
+                // Failed instead of returning silently via `?`.
+                let result: Result<Resource<ProcessHandle>, ErrorCode> =
+                    Err(ErrorCode::InvalidInput);
+                audit_spawn_result(
+                    self,
+                    "astrid:process/host.spawn-background",
+                    &cmd_for_audit,
+                    &injection_audit,
+                    &result,
+                );
+                return result;
+            },
+        };
         configure_piped(&mut sandboxed_cmd);
 
         // Convert the prepared std::Command into a tokio::Command so the
@@ -430,9 +386,23 @@ impl process::Host for HostState {
         tokio_cmd.kill_on_drop(true);
 
         let command_str = format!("{} {}", request.cmd, request.args.join(" "));
-        let child = tokio_cmd
-            .spawn()
-            .map_err(|e| ErrorCode::Unknown(format!("spawn-background failed: {e}")))?;
+        let child = match tokio_cmd.spawn() {
+            Ok(child) => child,
+            Err(e) => {
+                // Fork/exec failed — audit the attempt as Failed before
+                // returning.
+                let result: Result<Resource<ProcessHandle>, ErrorCode> =
+                    Err(ErrorCode::Unknown(format!("spawn-background failed: {e}")));
+                audit_spawn_result(
+                    self,
+                    "astrid:process/host.spawn-background",
+                    &cmd_for_audit,
+                    &injection_audit,
+                    &result,
+                );
+                return result;
+            },
+        };
 
         let stdout_buf: Arc<Mutex<VecDeque<u8>>> = Arc::new(Mutex::new(VecDeque::new()));
         let stderr_buf: Arc<Mutex<VecDeque<u8>>> = Arc::new(Mutex::new(VecDeque::new()));
@@ -461,32 +431,38 @@ impl process::Host for HostState {
         // `cancel_by_call_ids` (cancelled by any matching event).
         self.process_tracker.register(pid, None);
 
-        let res = self
-            .resource_table
-            .push(managed)
-            .map_err(|e| ErrorCode::Unknown(format!("resource table: {e}")))?;
+        let res = match self.resource_table.push(managed) {
+            Ok(res) => res,
+            Err(e) => {
+                // The child has ALREADY forked (and is registered/kill-on-drop
+                // via `managed`, which drops here). The spawn genuinely happened,
+                // so audit it as a Failed spawn rather than returning with no
+                // trace of the exec.
+                let result: Result<Resource<ProcessHandle>, ErrorCode> =
+                    Err(ErrorCode::Unknown(format!("resource table: {e}")));
+                audit_spawn_result(
+                    self,
+                    "astrid:process/host.spawn-background",
+                    &cmd_for_audit,
+                    &injection_audit,
+                    &result,
+                );
+                return result;
+            },
+        };
         self.process_count_total += 1;
         *self
             .process_count_by_principal
             .entry(principal)
             .or_insert(0) += 1;
         let result: Result<Resource<ProcessHandle>, ErrorCode> = Ok(Resource::new_own(res.rep()));
-        if injection_audit.is_empty() {
-            audit_process(
-                self,
-                "astrid:process/host.spawn-background",
-                &cmd_for_audit,
-                &result,
-            );
-        } else {
-            audit_process_injections(
-                self,
-                "astrid:process/host.spawn-background",
-                &cmd_for_audit,
-                &injection_audit,
-                &result,
-            );
-        }
+        audit_spawn_result(
+            self,
+            "astrid:process/host.spawn-background",
+            &cmd_for_audit,
+            &injection_audit,
+            &result,
+        );
         result
     }
 
@@ -519,14 +495,13 @@ impl process::Host for HostState {
         // scope would observe `persist-unsupported` instead of the capability
         // error.
         let Some(sec) = self.security.clone() else {
-            let result: Result<String, ErrorCode> = Err(ErrorCode::CapabilityDenied);
-            audit_process(
+            record_process_denied(
                 self,
                 "astrid:process/host.spawn-persistent",
                 &cmd_for_audit,
-                &result,
+                "no security gate configured",
             );
-            return result;
+            return Err(ErrorCode::CapabilityDenied);
         };
         {
             let cmd = request.cmd.to_string();
@@ -534,15 +509,14 @@ impl process::Host for HostState {
             let check = util::bounded_block_on(&handle, &semaphore, async move {
                 sec.check_host_process(&cid, &cmd).await
             });
-            if check.is_err() {
-                let result: Result<String, ErrorCode> = Err(ErrorCode::CapabilityDenied);
-                audit_process(
+            if let Err(reason) = check {
+                record_process_denied(
                     self,
                     "astrid:process/host.spawn-persistent",
                     &cmd_for_audit,
-                    &result,
+                    &reason,
                 );
-                return result;
+                return Err(ErrorCode::CapabilityDenied);
             }
         }
 
@@ -556,14 +530,13 @@ impl process::Host for HostState {
             .iter()
             .any(|c| c == "allow_persistent")
         {
-            let result: Result<String, ErrorCode> = Err(ErrorCode::CapabilityDenied);
-            audit_process(
+            record_process_denied(
                 self,
                 "astrid:process/host.spawn-persistent",
                 &cmd_for_audit,
-                &result,
+                "persistent exec requires the allow_persistent capability",
             );
-            return result;
+            return Err(ErrorCode::CapabilityDenied);
         }
 
         // Persistence feasibility: refuse the owner-fallback principal — a

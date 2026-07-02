@@ -721,6 +721,17 @@ pub struct HostState {
     /// and traps the guest once it reaches `MAX_NO_YIELD_WINDOWS`; a recv
     /// resets it to 0. Inert for pooled/lifecycle Stores.
     pub no_yield_windows: u32,
+    /// Synchronous sink for sensitive per-action host calls (fs read/write/
+    /// delete, net connect/bind, process spawn). When `Some`, the fs/net/
+    /// process host fns report every allowed, failed, OR denied call to it,
+    /// stamped with [`effective_principal`](Self::effective_principal); the
+    /// kernel implementation appends a signed, hash-chained audit entry
+    /// synchronously. `None` in tests / any context with no audit log
+    /// (the report is then a no-op — observability `tracing` lines still
+    /// fire). Snapshotted onto every pooled instance at load like the other
+    /// shared kernel handles; never cleared by the pool reset.
+    pub audit_sink:
+        Option<std::sync::Arc<dyn crate::engine::wasm::host::audit_sink::HostAuditSink>>,
 }
 
 impl wasmtime_wasi::WasiView for HostState {

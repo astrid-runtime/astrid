@@ -107,6 +107,27 @@ impl AuditLog {
     }
 
     /// Shared implementation for `append` and `append_with_principal`.
+    ///
+    /// # Locking contract
+    ///
+    /// The entire append critical section — resolving the chain's current head,
+    /// creating and signing the entry against that head, persisting it, and then
+    /// advancing the cached head — runs while holding the `chain_heads` **write**
+    /// lock. This serializes appends to the same `(session, principal)` chain so
+    /// that `previous_hash` and the head move together atomically.
+    ///
+    /// Without this, two concurrent appends to the same chain both read the same
+    /// parent hash before either stores, then sign two entries that claim the
+    /// same predecessor — FORKING the signed chain. `verify_chain` then reports
+    /// `valid = false` (`BrokenLink` / duplicate genesis) under nothing more than
+    /// normal concurrent host-call load.
+    ///
+    /// Signing happens inside the lock. That serializes same-chain appends, which
+    /// is intentional and correct: a hash chain is inherently ordered, so a
+    /// well-defined append order IS the product. The lock spans every chain in
+    /// this log (one `RwLock`), so it also serializes appends across chains; that
+    /// is a stronger guarantee than required and is acceptable — audit append is
+    /// not a hot path relative to the signed-ordering invariant it protects.
     fn append_inner(
         &self,
         session_id: SessionId,
@@ -115,9 +136,20 @@ impl AuditLog {
         authorization: AuthorizationProof,
         outcome: AuditOutcome,
     ) -> AuditResult<AuditEntryId> {
-        // Get the previous hash for this entry's chain (system or principal).
         let chain_key: ChainKey = (session_id.clone(), principal.clone());
-        let previous_hash = self.get_previous_hash(&chain_key)?;
+
+        // Hold the write lock across read-prev-hash -> create+sign -> store ->
+        // head update so the whole append is atomic per chain (see the locking
+        // contract above).
+        let mut heads = self
+            .chain_heads
+            .write()
+            .map_err(|e| AuditError::StorageError(e.to_string()))?;
+
+        // Resolve the parent hash from the head cache we already hold (falling
+        // back to storage), NOT via a fresh lock — re-locking would reopen the
+        // fork window between the read and the head advance below.
+        let previous_hash = self.previous_hash_locked(&chain_key, &heads)?;
 
         // Create and sign the entry. session_id is moved into create,
         // chain_key retains the clone for the cache update below.
@@ -151,35 +183,35 @@ impl AuditLog {
             "Appending audit entry"
         );
 
-        // Store the entry
+        // Store the entry, then advance the head. Both happen under the lock, so
+        // a concurrent same-chain append cannot observe the stored entry without
+        // also observing the advanced head. On a store failure we return without
+        // touching the head — nothing was persisted, so the chain is unchanged.
         self.storage.store(&entry)?;
-
-        // Update cached chain head for this entry's chain.
-        {
-            let mut heads = self
-                .chain_heads
-                .write()
-                .map_err(|e| AuditError::StorageError(e.to_string()))?;
-            heads.insert(chain_key, entry_hash);
-        }
+        heads.insert(chain_key, entry_hash);
 
         Ok(entry_id)
     }
 
-    /// Get the previous hash for a chain (session + optional principal).
-    fn get_previous_hash(&self, chain_key: &ChainKey) -> AuditResult<ContentHash> {
-        // Check cache first
-        {
-            let heads = self
-                .chain_heads
-                .read()
-                .map_err(|e| AuditError::StorageError(e.to_string()))?;
-            if let Some(hash) = heads.get(chain_key) {
-                return Ok(*hash);
-            }
+    /// Resolve a chain's parent hash from the caller-held head cache, falling
+    /// back to storage, then to genesis (`ContentHash::zero()`).
+    ///
+    /// `heads` MUST be the live `chain_heads` map the caller already holds the
+    /// write lock on. This method deliberately does NOT lock: reading the parent
+    /// hash and advancing the head must stay inside one critical section (see the
+    /// locking contract on [`append_inner`]). Taking a fresh lock here would
+    /// reopen the fork window this design closes.
+    fn previous_hash_locked(
+        &self,
+        chain_key: &ChainKey,
+        heads: &std::collections::HashMap<ChainKey, ContentHash>,
+    ) -> AuditResult<ContentHash> {
+        // Check the in-memory head cache first.
+        if let Some(hash) = heads.get(chain_key) {
+            return Ok(*hash);
         }
 
-        // Check storage
+        // Fall back to storage (first append after a restart / cache miss).
         if let Some(head_id) = self
             .storage
             .get_chain_head(&chain_key.0, chain_key.1.as_ref())?
@@ -188,7 +220,7 @@ impl AuditLog {
             return Ok(entry.content_hash());
         }
 
-        // Genesis - no previous entry for this chain
+        // Genesis - no previous entry for this chain.
         Ok(ContentHash::zero())
     }
 

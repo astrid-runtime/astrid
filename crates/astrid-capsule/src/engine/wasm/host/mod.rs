@@ -9,6 +9,11 @@
 
 /// Capsule-level approval requests.
 pub(crate) mod approval;
+/// Synchronous host-audit sink: routes sensitive per-action host calls
+/// (fs/net/process) to the kernel's signed, hash-chained audit log.
+pub mod audit_sink;
+#[cfg(test)]
+mod audit_sink_tests;
 /// Runtime operator-consent for local-egress (transport-origin gated).
 pub(crate) mod consent_egress;
 /// Elicit API (interactive user input collection).

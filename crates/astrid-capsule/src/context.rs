@@ -114,6 +114,14 @@ pub struct CapsuleContext {
     /// only. Empty = no exemptions (fail-closed). Operator config — never
     /// settable by the capsule's own (untrusted) manifest.
     pub local_egress: Vec<String>,
+    /// Synchronous per-action audit sink for sensitive host calls (fs
+    /// read/write/delete, net connect/bind, process spawn). One instance per
+    /// kernel boot, holding the kernel's signed audit log + session id. The
+    /// engine snapshots it onto every pooled `HostState` at load; the fs/net/
+    /// process host fns report every allowed, failed, OR denied call to it.
+    /// `None` in tests / single-tenant boot that did not thread it — the host
+    /// fns then only emit the observability `tracing` lines.
+    pub audit_sink: Option<Arc<dyn crate::engine::wasm::host::audit_sink::HostAuditSink>>,
 }
 
 impl CapsuleContext {
@@ -142,6 +150,7 @@ impl CapsuleContext {
             overlay_registry: None,
             group_config: None,
             local_egress: Vec::new(),
+            audit_sink: None,
         }
     }
 
@@ -211,6 +220,23 @@ impl CapsuleContext {
     #[must_use]
     pub fn with_local_egress(mut self, allowlist: Vec<String>) -> Self {
         self.local_egress = allowlist;
+        self
+    }
+
+    /// Set the synchronous per-action audit sink (fs/net/process). The
+    /// kernel passes its signed audit sink so sensitive host calls land on
+    /// the durable, hash-chained audit log.
+    ///
+    /// Generic over the concrete sink type so callers hand over an owned
+    /// implementation without wrapping it in an `Arc<dyn …>` themselves; the
+    /// builder erases it to the trait object the engine stores.
+    #[must_use]
+    pub fn with_audit_sink<S>(mut self, sink: S) -> Self
+    where
+        S: crate::engine::wasm::host::audit_sink::HostAuditSink + 'static,
+    {
+        let sink: Arc<dyn crate::engine::wasm::host::audit_sink::HostAuditSink> = Arc::new(sink);
+        self.audit_sink = Some(sink);
         self
     }
 }
