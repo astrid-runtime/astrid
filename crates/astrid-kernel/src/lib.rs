@@ -170,8 +170,11 @@ pub struct Kernel {
     capsule_load_lock: Mutex<()>,
     /// Ephemeral mode: shut down immediately when the last client disconnects.
     pub ephemeral: AtomicBool,
-    /// Instant when the kernel was booted (for uptime calculation).
-    pub boot_time: astrid_runtime::time::Instant,
+    /// Instant when the kernel was booted (for uptime calculation). Crate-
+    /// private: the only reader is the router's uptime report, and keeping it
+    /// out of the public surface leaves the facade free to swap the concrete
+    /// `Instant` type per target.
+    pub(crate) boot_time: astrid_runtime::time::Instant,
     /// Sender for the API-initiated shutdown signal. The daemon's main loop
     /// selects on the receiver to exit gracefully without `process::exit`.
     pub shutdown_tx: tokio::sync::watch::Sender<bool>,
