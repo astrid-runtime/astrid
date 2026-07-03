@@ -51,7 +51,7 @@ use uuid::Uuid;
 
 use crate::socket_client::SocketClient;
 
-use super::server::{TOOLS_LIST_TOPIC, new_req_id, unwrap_reply_payload};
+use super::server::{TOOLS_LIST_TOPIC, new_req_id, unwrap_reply_payload, unwrap_reply_payload_ref};
 
 /// Kernel broadcast emitted once every capsule (re)load completes.
 const CAPSULES_LOADED_TOPIC: &str = "astrid.v1.capsules_loaded";
@@ -160,7 +160,7 @@ pub(super) async fn run(peer: Peer<RoleServer>, principal: String) {
         debug!(
             "MCP hot-reload watcher: capsules_loaded received; reading tool surface from payload"
         );
-        let names = tool_names_from_capsules_loaded(&unwrap_reply_payload(&raw), &principal);
+        let names = tool_names_from_capsules_loaded(unwrap_reply_payload_ref(&raw), &principal);
 
         if names == last_known {
             debug!("MCP hot-reload watcher: tool set unchanged; suppressing notification");
