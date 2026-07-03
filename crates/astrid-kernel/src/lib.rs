@@ -258,8 +258,10 @@ pub struct KernelResources {
     /// (and test kernels) that do not service a real socket.
     pub cli_socket_listener: Option<Arc<tokio::sync::Mutex<tokio::net::UnixListener>>>,
     /// Exclusive advisory lock enforcing a single kernel instance, held for the
-    /// process lifetime; its `Drop` releases the lock. `None` when no socket is
-    /// bound.
+    /// process lifetime; its `Drop` releases the lock. Independent of
+    /// `cli_socket_listener` — the kernel never reads either field, so a host
+    /// supplies whichever facilities it actually has (the native daemon: both;
+    /// test kernels and hosts with no real socket: neither).
     pub singleton_lock: Option<std::fs::File>,
 }
 
@@ -311,7 +313,11 @@ impl Kernel {
     ///
     /// # Errors
     ///
-    /// Returns an error if the VFS mount paths cannot be registered.
+    /// Returns an error if any native resource cannot be acquired — the Astrid
+    /// home cannot be resolved, the KV store, runtime key, or audit log cannot
+    /// be opened, the Unix socket cannot be bound (or the singleton lock is
+    /// already held), or the session token cannot be generated — or if the
+    /// portable wiring in [`Kernel::with_resources`] fails.
     pub async fn new(
         session_id: SessionId,
         workspace_root: PathBuf,
@@ -346,7 +352,7 @@ impl Kernel {
         // `kernel.runtime_key` mint tokens the approval interceptor's validator
         // trusts as issuer.
         let runtime_key = Arc::new(load_or_generate_runtime_key(&home.keys_dir())?);
-        let audit_log = open_audit_log(Arc::clone(&runtime_key))?;
+        let audit_log = open_audit_log(&home, Arc::clone(&runtime_key))?;
 
         // Bind the secure Unix socket and generate the session token. The
         // socket is bound here, but not yet listened on. The token is generated
@@ -416,7 +422,10 @@ impl Kernel {
     ///
     /// # Errors
     ///
-    /// Returns an error if the VFS mount paths cannot be registered.
+    /// Returns an error if any portable wiring step fails: the VFS mount paths
+    /// cannot be registered, the capability store cannot be initialized over
+    /// the injected KV, the group configuration cannot be loaded, or the CLI
+    /// root identity cannot be bootstrapped.
     #[expect(
         clippy::too_many_lines,
         reason = "boot sequence: sequential setup that does not benefit from splitting"
@@ -1948,11 +1957,14 @@ pub(crate) async fn test_kernel_with_home(home: astrid_core::dirs::AstridHome) -
 /// `~/.astrid/audit.db` and runs `verify_all()` to detect any tampering of
 /// historical entries. Verification failures are logged at `error!` level but
 /// do not block boot (fail-open for availability, loud alert for integrity).
-fn open_audit_log(runtime_key: Arc<astrid_crypto::KeyPair>) -> std::io::Result<Arc<AuditLog>> {
-    use astrid_core::dirs::AstridHome;
-
-    let home = AstridHome::resolve()
-        .map_err(|e| std::io::Error::other(format!("cannot resolve Astrid home: {e}")))?;
+/// Takes the caller's already-resolved [`AstridHome`](astrid_core::dirs::AstridHome)
+/// so every resource acquired by the native composition root is rooted in the
+/// same home — re-resolving from the environment here could split the audit
+/// log from the KV/socket paths if `$ASTRID_HOME` changed between calls.
+fn open_audit_log(
+    home: &astrid_core::dirs::AstridHome,
+    runtime_key: Arc<astrid_crypto::KeyPair>,
+) -> std::io::Result<Arc<AuditLog>> {
     home.ensure()
         .map_err(|e| std::io::Error::other(format!("cannot create Astrid home dirs: {e}")))?;
 
