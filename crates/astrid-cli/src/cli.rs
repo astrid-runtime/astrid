@@ -400,6 +400,16 @@ pub(crate) enum CapsuleCommands {
         #[arg(long)]
         from_mcp_json: Option<String>,
     },
+    /// Statically lint a capsule project's tool wiring (CI-friendly).
+    ///
+    /// Cross-checks `#[astrid::tool]` annotations against the `Capsule.toml`
+    /// `[subscribe]`/`[publish]` tables and reports wiring mistakes that would
+    /// otherwise fail silently at runtime. No build, no daemon; non-zero exit on
+    /// any finding.
+    Check {
+        /// Optional path to the capsule project (defaults to current directory).
+        path: Option<String>,
+    },
     /// View or edit a capsule's env configuration without reinstalling.
     Config(CapsuleConfigArgs),
     /// Show manifest, interfaces, source for an installed capsule.

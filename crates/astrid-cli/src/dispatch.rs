@@ -335,6 +335,7 @@ async fn dispatch_capsule(command: crate::cli::CapsuleCommands) -> Result<ExitCo
             project_type.as_deref(),
             from_mcp_json.as_deref(),
         ),
+        CapsuleCommands::Check { path } => commands::capsule::check::run(path.as_deref()),
         CapsuleCommands::Config(args) => commands::capsule::config::run(&args),
         CapsuleCommands::Show(args) => commands::capsule::show::run(&args),
         CapsuleCommands::Run {
