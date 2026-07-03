@@ -730,8 +730,7 @@ pub struct HostState {
     /// (the report is then a no-op — observability `tracing` lines still
     /// fire). Snapshotted onto every pooled instance at load like the other
     /// shared kernel handles; never cleared by the pool reset.
-    pub audit_sink:
-        Option<std::sync::Arc<dyn crate::engine::wasm::host::audit_sink::HostAuditSink>>,
+    pub audit_sink: Option<std::sync::Arc<dyn crate::audit_sink::HostAuditSink>>,
 }
 
 impl wasmtime_wasi::WasiView for HostState {

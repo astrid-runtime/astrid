@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex};
 
 use astrid_core::PrincipalId;
 
-use crate::engine::wasm::host::audit_sink::{HostAuditEvent, HostAuditOutcome, HostAuditSink};
+use crate::audit_sink::{HostAuditEvent, HostAuditOutcome, HostAuditSink};
 use crate::engine::wasm::host_state::HostState;
 use crate::engine::wasm::test_fixtures::minimal_host_state;
 

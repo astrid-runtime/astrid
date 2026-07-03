@@ -28,10 +28,10 @@ mod resolve;
 
 use wasmtime::component::Resource;
 
+use crate::audit_sink::{HostAuditEvent, HostAuditOutcome};
 use crate::engine::wasm::bindings::astrid::fs::host::{
     self as fs, Datetime, ErrorCode, FileHandle, FileStat, FileType, OpenMode,
 };
-use crate::engine::wasm::host::audit_sink::{HostAuditEvent, HostAuditOutcome};
 use crate::engine::wasm::host::util;
 use crate::engine::wasm::host_state::HostState;
 use resolve::{resolve_path, resolve_vfs};
@@ -39,7 +39,7 @@ use resolve::{resolve_path, resolve_vfs};
 /// Audit envelope for path-based fs operations.
 ///
 /// Emits the off-by-default `astrid.audit.fs` observability line AND, when a
-/// per-action [`HostAuditSink`](crate::engine::wasm::host::audit_sink::HostAuditSink)
+/// per-action [`HostAuditSink`](crate::audit_sink::HostAuditSink)
 /// is installed, reports a typed event onto the kernel's signed audit chain.
 /// The op string maps to an event class: content/metadata reads →
 /// [`FileRead`], mutations → [`FileWrite`], removals → [`FileDelete`]. Ops
@@ -122,7 +122,7 @@ fn fs_event_for_op<'a>(op: &str, path: &'a str) -> Option<HostAuditEvent<'a>> {
 /// gate's rejection reason.
 pub(crate) fn record_fs_denied(
     state: &HostState,
-    event: crate::engine::wasm::host::audit_sink::HostAuditEvent<'_>,
+    event: crate::audit_sink::HostAuditEvent<'_>,
     reason: &str,
 ) {
     if let Some(sink) = state.audit_sink.as_ref() {

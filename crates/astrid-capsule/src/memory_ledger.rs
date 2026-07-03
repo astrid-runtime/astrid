@@ -7,6 +7,7 @@
 //! records each invoking principal's peak into that ledger, so it stays in the
 //! Wasmtime engine crate.
 
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 use astrid_core::PrincipalId;
 
 pub use astrid_capsule_types::MemoryLedger;
@@ -18,6 +19,7 @@ pub use astrid_capsule_types::MemoryLedger;
 /// pooled Store is leased by different principals, so the ceiling and the
 /// attributee are re-targeted per invocation via [`set`](Self::set); for a
 /// run-loop's dedicated Store they are set once to the owner at build.
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 pub struct StoreMemoryMeter {
     /// Linear-memory byte ceiling for the current invocation (the principal's
     /// `max_memory_bytes` quota). A grow beyond it is denied — the same cap the
@@ -30,6 +32,7 @@ pub struct StoreMemoryMeter {
     ledger: MemoryLedger,
 }
 
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 impl StoreMemoryMeter {
     /// Build a meter capped at `max_memory_bytes`, attributing growth to
     /// `principal`, recording into `ledger`.
@@ -51,6 +54,7 @@ impl StoreMemoryMeter {
     }
 }
 
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 impl wasmtime::ResourceLimiter for StoreMemoryMeter {
     fn memory_growing(
         &mut self,
@@ -85,7 +89,7 @@ impl wasmtime::ResourceLimiter for StoreMemoryMeter {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(all(target_arch = "wasm32", target_os = "unknown"))))]
 mod tests {
     use super::*;
 

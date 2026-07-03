@@ -89,7 +89,7 @@ pub struct Kernel {
     /// `Option` for compatibility with `CapsuleContext` and test fixtures.
     pub home_root: Option<PathBuf>,
     /// The natively bound Unix Socket for the CLI proxy.
-    pub cli_socket_listener: Option<Arc<tokio::sync::Mutex<tokio::net::UnixListener>>>,
+    pub cli_socket_listener: Option<astrid_capsule::context::UplinkListener>,
     /// Exclusive advisory lock enforcing a single kernel instance, held for
     /// the daemon's lifetime (see [`socket::bind_session_socket`]). `None` for
     /// test kernels that don't bind a real socket. Never read — the point is
@@ -259,7 +259,7 @@ pub struct KernelResources {
     pub token_path: PathBuf,
     /// The natively bound Unix listener for the CLI uplink, or `None` for hosts
     /// (and test kernels) that do not service a real socket.
-    pub cli_socket_listener: Option<Arc<tokio::sync::Mutex<tokio::net::UnixListener>>>,
+    pub cli_socket_listener: Option<astrid_capsule::context::UplinkListener>,
     /// Exclusive advisory lock enforcing a single kernel instance, held for the
     /// process lifetime; its `Drop` releases the lock. Independent of
     /// `cli_socket_listener` — the kernel never reads either field, so a host
@@ -279,7 +279,7 @@ impl KernelResources {
         runtime_key: Arc<astrid_crypto::KeyPair>,
         session_token: Arc<astrid_core::session_token::SessionToken>,
         token_path: PathBuf,
-        cli_socket_listener: Option<Arc<tokio::sync::Mutex<tokio::net::UnixListener>>>,
+        cli_socket_listener: Option<astrid_capsule::context::UplinkListener>,
         singleton_lock: Option<std::fs::File>,
     ) -> Self {
         Self {

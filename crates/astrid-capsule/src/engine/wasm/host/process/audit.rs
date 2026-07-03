@@ -4,10 +4,10 @@
 //! audit instrumentation stay legible as separate concerns. Every helper
 //! emits the off-by-default `astrid.audit.process` observability line; the
 //! spawn helpers additionally report a typed
-//! [`ProcessSpawn`](crate::engine::wasm::host::audit_sink::HostAuditEvent::ProcessSpawn)
+//! [`ProcessSpawn`](crate::audit_sink::HostAuditEvent::ProcessSpawn)
 //! onto the kernel's signed audit chain (the sensitive exec seam).
 
-use crate::engine::wasm::host::audit_sink::{HostAuditEvent, HostAuditOutcome};
+use crate::audit_sink::{HostAuditEvent, HostAuditOutcome};
 use crate::engine::wasm::host_state::HostState;
 
 /// True for the sensitive exec seams — `spawn`, `spawn-background`,

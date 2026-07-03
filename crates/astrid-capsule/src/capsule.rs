@@ -296,9 +296,10 @@ impl Capsule for CompositeCapsule {
     }
 
     async fn wait_ready(&self, timeout: std::time::Duration) -> ReadyStatus {
-        let deadline = tokio::time::Instant::now() + timeout;
+        let deadline = astrid_runtime::time::Instant::now() + timeout;
         for engine in &self.engines {
-            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            let remaining =
+                deadline.saturating_duration_since(astrid_runtime::time::Instant::now());
             if remaining.is_zero() {
                 return ReadyStatus::Timeout;
             }

@@ -17,6 +17,30 @@ use crate::profile_cache::PrincipalProfileCache;
 use crate::registry::CapsuleRegistry;
 use crate::schema_catalog::SchemaCatalog;
 
+/// Handle to the kernel-bound uplink (CLI) Unix socket listener.
+///
+/// On native this is exactly the concrete type the kernel binds and hands into
+/// the capsule execution context.
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+pub type UplinkListener = std::sync::Arc<tokio::sync::Mutex<tokio::net::UnixListener>>;
+/// No uplink socket exists on the browser target; this uninhabited type
+/// makes `Option<UplinkListener>` necessarily `None` there.
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+pub enum UplinkListener {}
+
+/// Handle to the per-principal overlay VFS registry (Layer 4, issue #668).
+///
+/// On native this is exactly the concrete `astrid-vfs` registry the kernel
+/// threads through the capsule context. `astrid-vfs` is native-only (it uses
+/// `cap-std` and `tokio`'s filesystem surface), so on the browser target the
+/// alias is an uninhabited type — an alternate host resolves per-principal
+/// overlays by other means, and `Option<OverlayRegistry>` is necessarily
+/// `None` there.
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+pub type OverlayRegistry = std::sync::Arc<astrid_vfs::OverlayVfsRegistry>;
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+pub enum OverlayRegistry {}
+
 static LIVE_GROUP_CONFIGS: LazyLock<Mutex<Vec<LiveGroupConfigEntry>>> =
     LazyLock::new(|| Mutex::new(Vec::new()));
 
@@ -68,7 +92,7 @@ pub struct CapsuleContext {
     pub home_root: Option<PathBuf>,
     pub kv: ScopedKvStore,
     pub event_bus: Arc<EventBus>,
-    pub cli_socket_listener: Option<Arc<tokio::sync::Mutex<tokio::net::UnixListener>>>,
+    pub cli_socket_listener: Option<UplinkListener>,
     /// Shared capsule registry for `hooks::trigger` fan-out.
     ///
     /// When set, WASM capsules can dispatch hooks to other capsules via
@@ -99,7 +123,7 @@ pub struct CapsuleContext {
     /// principal's overlay on each invocation so Agent A's workspace writes
     /// never reach Agent B's view of the same tree. Tests and single-tenant
     /// deployments may leave this `None`.
-    pub overlay_registry: Option<Arc<astrid_vfs::OverlayVfsRegistry>>,
+    pub overlay_registry: Option<OverlayRegistry>,
     /// Snapshot group → capability mapping.
     ///
     /// This field remains the public compatibility surface for callers that
@@ -121,7 +145,7 @@ pub struct CapsuleContext {
     /// process host fns report every allowed, failed, OR denied call to it.
     /// `None` in tests / single-tenant boot that did not thread it — the host
     /// fns then only emit the observability `tracing` lines.
-    pub audit_sink: Option<Arc<dyn crate::engine::wasm::host::audit_sink::HostAuditSink>>,
+    pub audit_sink: Option<Arc<dyn crate::audit_sink::HostAuditSink>>,
 }
 
 impl CapsuleContext {
@@ -132,7 +156,7 @@ impl CapsuleContext {
         home_root: Option<PathBuf>,
         kv: ScopedKvStore,
         event_bus: Arc<EventBus>,
-        cli_socket_listener: Option<Arc<tokio::sync::Mutex<tokio::net::UnixListener>>>,
+        cli_socket_listener: Option<UplinkListener>,
     ) -> Self {
         Self {
             principal,
@@ -190,6 +214,11 @@ impl CapsuleContext {
     }
 
     /// Set the shared per-principal overlay VFS registry (Layer 4, issue #668).
+    ///
+    /// Native-only: `astrid-vfs` (its `OverlayVfsRegistry`) does not compile for
+    /// the browser target, so this builder is absent there. On native the
+    /// parameter type is exactly [`OverlayRegistry`].
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
     #[must_use]
     pub fn with_overlay_registry(mut self, registry: Arc<astrid_vfs::OverlayVfsRegistry>) -> Self {
         self.overlay_registry = Some(registry);
@@ -233,9 +262,9 @@ impl CapsuleContext {
     #[must_use]
     pub fn with_audit_sink<S>(mut self, sink: S) -> Self
     where
-        S: crate::engine::wasm::host::audit_sink::HostAuditSink + 'static,
+        S: crate::audit_sink::HostAuditSink + 'static,
     {
-        let sink: Arc<dyn crate::engine::wasm::host::audit_sink::HostAuditSink> = Arc::new(sink);
+        let sink: Arc<dyn crate::audit_sink::HostAuditSink> = Arc::new(sink);
         self.audit_sink = Some(sink);
         self
     }

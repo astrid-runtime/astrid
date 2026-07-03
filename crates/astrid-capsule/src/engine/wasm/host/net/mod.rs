@@ -32,10 +32,10 @@ use std::sync::Arc;
 
 use wasmtime::component::Resource;
 
+use crate::audit_sink::{HostAuditEvent, HostAuditOutcome};
 use crate::engine::wasm::bindings::astrid::net::host::{
     self as net, ErrorCode, TcpListener, TcpStream, UdpSocket, UnixListener,
 };
-use crate::engine::wasm::host::audit_sink::{HostAuditEvent, HostAuditOutcome};
 use crate::engine::wasm::host::http::is_safe_ip;
 use crate::engine::wasm::host::util;
 use crate::engine::wasm::host_state::{HostState, NetStream, TcpStreamSlot};
@@ -134,7 +134,7 @@ pub(super) fn audit_net<T, E: std::fmt::Debug>(
 /// Audit an outbound TCP connect, carrying the destination host + port.
 ///
 /// Wraps the generic [`audit_net`] tracing line and additionally reports a
-/// typed [`NetConnect`](crate::engine::wasm::host::audit_sink::HostAuditEvent::NetConnect)
+/// typed [`NetConnect`](crate::audit_sink::HostAuditEvent::NetConnect)
 /// event to the per-action audit sink so a connect lands on the signed
 /// audit chain (not just the off-by-default observability target). Use this
 /// for `connect-tcp` instead of the bare [`audit_net`].
