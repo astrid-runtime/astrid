@@ -22,6 +22,13 @@
 //! resolve its own path), the live exe is unreadable, or the two differ, we
 //! refuse to signal ([`KillOutcome::Unverified`]) — a stuck lock is recoverable;
 //! killing the wrong process is not.
+//!
+//! The identity check is also robust to an in-place upgrade replacing the
+//! running binary: `brew upgrade`/`astrid update` unlinks the old file, but the
+//! kernel keeps reporting the ORIGINAL exec path for the live process, so it
+//! still matches what the daemon recorded at boot ([`exe_matches`]). Without
+//! this, a wedged old daemon left behind by an upgrade could never be reaped —
+//! exactly the case that motivated it.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -103,15 +110,37 @@ pub(crate) fn is_process_alive(_pid: u32) -> bool {
     false
 }
 
-/// Resolve the canonicalized executable path of the live process `pid`.
+/// Strip the trailing `" (deleted)"` marker the Linux kernel appends to
+/// `/proc/<pid>/exe` when the running binary has been unlinked (an in-place
+/// upgrade). The remaining path is the original exec path, which still equals
+/// what the daemon recorded at boot.
+#[cfg(target_os = "linux")]
+fn strip_deleted_marker(path: PathBuf) -> PathBuf {
+    const MARKER: &str = " (deleted)";
+    match path.to_str() {
+        Some(s) => match s.strip_suffix(MARKER) {
+            Some(base) => PathBuf::from(base),
+            None => path,
+        },
+        None => path,
+    }
+}
+
+/// Resolve the executable path of the live process `pid` for identity comparison.
 ///
-/// Returns `None` when it can't be determined — the process is gone, we lack
-/// permission, or the platform is unsupported. The caller treats `None` as
-/// "cannot confirm identity" and refuses to signal (fail-secure).
+/// Returns the kernel's stored exec path (NOT canonicalized). Canonicalizing
+/// here would fail with `ENOENT` the moment an in-place upgrade unlinks the
+/// running binary — precisely when we most need to identify (and reap) the stale
+/// daemon. The kernel keeps reporting the original path for a live process, so
+/// returning it raw lets [`exe_matches`] still match it; that function
+/// canonicalizes only when the file survives. Returns `None` when the path can't
+/// be determined — the process is gone, we lack permission, or the platform is
+/// unsupported — which the caller treats as "cannot confirm identity" and
+/// refuses to signal (fail-secure).
 #[cfg(target_os = "linux")]
 fn exe_path_of_pid(pid: u32) -> Option<PathBuf> {
     let raw = std::fs::read_link(format!("/proc/{pid}/exe")).ok()?;
-    std::fs::canonicalize(raw).ok()
+    Some(strip_deleted_marker(raw))
 }
 
 // Single vetted FFI exception in an otherwise `#![deny(unsafe_code)]` crate:
@@ -135,7 +164,11 @@ fn exe_path_of_pid(pid: u32) -> Option<PathBuf> {
     }
     let len = usize::try_from(n).ok()?;
     let path = std::str::from_utf8(buf.get(..len)?).ok()?;
-    std::fs::canonicalize(path).ok()
+    // Raw path, NOT canonicalized: `proc_pidpath` keeps reporting the original
+    // exec path after an in-place upgrade replaces the binary, whereas
+    // canonicalize would fail once the file is gone. [`exe_matches`]
+    // canonicalizes only when the file still exists.
+    Some(PathBuf::from(path))
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
@@ -145,12 +178,23 @@ fn exe_path_of_pid(_pid: u32) -> Option<PathBuf> {
 
 /// Whether a live process's executable matches the daemon's recorded one.
 ///
-/// Fail-secure: `true` ONLY when both the recorded path (from the PID file) and
-/// the live path (from the OS) are present AND equal. A missing either side is
-/// "cannot confirm" → `false` → do not signal. Both paths are canonicalized at
-/// their source (write time / read time), so a plain equality compare is exact.
+/// Fail-secure: `true` ONLY when both the recorded path (canonicalized by the
+/// daemon at boot) and the live path (the kernel's stored exec path) are present
+/// AND identify the same binary. A missing either side is "cannot confirm" →
+/// `false` → do not signal.
+///
+/// The match is exact-string first — which is what makes it survive an in-place
+/// upgrade: after `brew cleanup`/`astrid update` unlinks or replaces the running
+/// binary, the live path still equals the recorded one even though the file no
+/// longer exists on disk. When the file DOES still exist, a second attempt
+/// canonicalizes the live path so a symlinked-prefix normalisation between boot
+/// and now (e.g. macOS `/var` → `/private/var`) still matches. A recycled PID
+/// running a different binary reports a different path and matches neither.
 fn exe_matches(recorded: Option<&Path>, live: Option<&Path>) -> bool {
-    matches!((recorded, live), (Some(r), Some(l)) if r == l)
+    let (Some(recorded), Some(live)) = (recorded, live) else {
+        return false;
+    };
+    recorded == live || std::fs::canonicalize(live).is_ok_and(|c| c == *recorded)
 }
 
 /// Send a signal to `pid`, mapping the outcome to a bool.
@@ -212,6 +256,25 @@ pub(crate) async fn terminate_orphan(pid_path: &Path) -> KillOutcome {
     let Some((pid, recorded_exe)) = read_pid_file(pid_path) else {
         return KillOutcome::NotRunning;
     };
+    terminate_known(pid, recorded_exe.as_deref()).await
+}
+
+/// Terminate a daemon whose PID and recorded exe are ALREADY in hand — the
+/// identity-gated `SIGTERM` → `SIGKILL` core shared by two callers:
+///
+/// - [`terminate_orphan`], the socket-unreachable path, which reads them from
+///   the PID file, and
+/// - `astrid stop`'s graceful path, which captures them from the PID file
+///   BEFORE requesting shutdown. A shutdown ACK means "shutting down", not
+///   "exited"; a daemon that wedges AFTER acknowledging would otherwise leak the
+///   state-db lock with no handle left to signal it (the daemon deletes its own
+///   PID file only on a clean exit). Capturing PID+exe up front keeps the handle
+///   alive so the graceful path can escalate here.
+///
+/// Steps: confirm the PID is a live, identity-matched daemon; `SIGTERM` and poll
+/// up to [`GRACE`]; if still alive, re-verify identity (grace-window PID-reuse
+/// guard) and escalate to `SIGKILL`, polling up to [`GRACE`] again.
+pub(crate) async fn terminate_known(pid: u32, recorded_exe: Option<&Path>) -> KillOutcome {
     if !is_process_alive(pid) {
         return KillOutcome::NotRunning;
     }
@@ -221,7 +284,7 @@ pub(crate) async fn terminate_orphan(pid_path: &Path) -> KillOutcome {
     // process's executable provably matches the daemon's recorded one. Anything
     // unconfirmable → leave it alone.
     let live_exe = exe_path_of_pid(pid);
-    if !exe_matches(recorded_exe.as_deref(), live_exe.as_deref()) {
+    if !exe_matches(recorded_exe, live_exe.as_deref()) {
         return KillOutcome::Unverified(pid);
     }
 
@@ -240,7 +303,7 @@ pub(crate) async fn terminate_orphan(pid_path: &Path) -> KillOutcome {
     // would kill an innocent process. Recompute the live exe and refuse to
     // signal unless it still provably matches the recorded daemon exe.
     let live_exe = exe_path_of_pid(pid);
-    if !exe_matches(recorded_exe.as_deref(), live_exe.as_deref()) {
+    if !exe_matches(recorded_exe, live_exe.as_deref()) {
         return KillOutcome::Unverified(pid);
     }
 
@@ -258,7 +321,11 @@ pub(crate) async fn terminate_orphan(pid_path: &Path) -> KillOutcome {
 
 /// Poll until `pid` is no longer alive or `budget` elapses. Returns `true` if
 /// the process exited within the budget.
-async fn wait_for_exit(pid: u32, budget: Duration) -> bool {
+///
+/// Exposed to the crate so `astrid stop`'s graceful path can wait for the daemon
+/// to ACTUALLY exit after it acknowledges a shutdown request, before declaring
+/// success (or escalating).
+pub(crate) async fn wait_for_exit(pid: u32, budget: Duration) -> bool {
     let deadline = Instant::now()
         .checked_add(budget)
         .unwrap_or_else(Instant::now);
@@ -345,6 +412,68 @@ mod tests {
         assert!(!exe_matches(None, Some(&a))); // no recorded exe → unconfirmable
         assert!(!exe_matches(Some(&a), None)); // live exe unreadable → unconfirmable
         assert!(!exe_matches(None, None));
+    }
+
+    /// REGRESSION (#1120, in-place upgrade): after `brew cleanup`/`astrid update`
+    /// unlinks the running binary, the kernel still reports its original exec
+    /// path, which equals what the daemon recorded at boot — even though that
+    /// path no longer exists on disk. The exact-string branch must match so the
+    /// wedged old daemon can still be reaped. A DIFFERENT non-existent path (a
+    /// recycled PID) must NOT match: canonicalize fails, exact compare differs.
+    #[test]
+    fn exe_matches_survives_deleted_binary() {
+        // A path that does not exist on any test host, standing in for a binary
+        // that an upgrade has already unlinked.
+        let gone = PathBuf::from("/opt/homebrew/Cellar/astrid/0.9.1/bin/astrid-daemon");
+        assert!(!gone.exists(), "test precondition: path must not exist");
+        // Recorded == live (both the original exec path) → confirmed our daemon.
+        assert!(exe_matches(Some(&gone), Some(&gone)));
+        // A different (also non-existent) path → cannot confirm, do not signal.
+        let other = PathBuf::from("/opt/homebrew/Cellar/other/1.0.0/bin/other-daemon");
+        assert!(!exe_matches(Some(&gone), Some(&other)));
+    }
+
+    /// When the binary still exists, a live path that only differs by a
+    /// symlinked prefix (the daemon canonicalized at boot; the kernel may report
+    /// the pre-canonical path) is absorbed by the canonicalize fallback.
+    #[cfg(unix)]
+    #[test]
+    fn exe_matches_canonicalizes_live_when_file_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("astrid-daemon");
+        std::fs::write(&real, b"#!/bin/true\n").unwrap();
+        let recorded = std::fs::canonicalize(&real).unwrap();
+
+        let link = dir.path().join("astrid-daemon-link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        // The live path (symlink) is a different STRING from the recorded
+        // (canonical) path, but resolves to it — the fallback must match.
+        assert_ne!(link, recorded);
+        assert!(exe_matches(Some(&recorded), Some(&link)));
+
+        // A live path resolving to a DIFFERENT real file must not match.
+        let other = dir.path().join("unrelated");
+        std::fs::write(&other, b"x").unwrap();
+        assert!(!exe_matches(Some(&recorded), Some(&other)));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn strip_deleted_marker_removes_only_the_suffix() {
+        assert_eq!(
+            strip_deleted_marker(PathBuf::from("/opt/astrid/astrid-daemon (deleted)")),
+            PathBuf::from("/opt/astrid/astrid-daemon")
+        );
+        // No marker → unchanged, including a path that merely contains the word.
+        assert_eq!(
+            strip_deleted_marker(PathBuf::from("/opt/astrid/astrid-daemon")),
+            PathBuf::from("/opt/astrid/astrid-daemon")
+        );
+        assert_eq!(
+            strip_deleted_marker(PathBuf::from("/opt/deleted/astrid-daemon")),
+            PathBuf::from("/opt/deleted/astrid-daemon")
+        );
     }
 
     /// REGRESSION (PID reuse): a pidfile whose PID is a real LIVE process (the

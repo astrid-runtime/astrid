@@ -1,5 +1,6 @@
 //! Daemon lifecycle commands: start, stop, status, and spawn helpers.
 
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -292,16 +293,42 @@ pub(crate) async fn handle_status() -> Result<()> {
 }
 
 /// Handle `astrid stop`.
+///
+/// A shutdown request over the socket only earns an ACK ("shutting down"), not a
+/// guarantee the process exited and released the singleton/state-db lock. So we
+/// capture the recorded PID BEFORE asking, then confirm the process actually
+/// exits — escalating with a signal if it wedges mid-shutdown — before reporting
+/// success. Runtime files (socket, readiness, PID) are removed only once the
+/// daemon is confirmed gone; if a kill can't confirm exit, they are LEFT so
+/// `astrid start`/`restart` still see the recorded PID and give an actionable
+/// message instead of failing on the held lock with a raw DB error.
 pub(crate) async fn handle_stop() -> Result<()> {
     let socket_path = socket_client::proxy_socket_path();
-    if !socket_path.exists() {
+    let pid_path = socket_client::pid_path();
+
+    // Capture the daemon's identity up front: it deletes its own PID file only
+    // on a CLEAN exit, so reading it before shutdown is the only reliable way to
+    // keep a handle for confirming exit / signalling a wedged shutdown.
+    let recorded = daemon_control::read_pid_file(&pid_path);
+    let socket_present = socket_path.exists();
+
+    // Genuinely nothing running: no socket AND no live recorded process.
+    let recorded_alive = recorded
+        .as_ref()
+        .is_some_and(|(pid, _)| daemon_control::is_process_alive(*pid));
+    if !socket_present && !recorded_alive {
         println!("{}", theme::Theme::info("No Astrid daemon is running."));
+        let _ = std::fs::remove_file(&pid_path); // tidy a stale dead-PID file
         return Ok(());
     }
 
-    let session_id = astrid_core::SessionId::from_uuid(uuid::Uuid::new_v4());
-    if let Ok(mut client) =
-        socket_client::SocketClient::connect(session_id, crate::principal::current()).await
+    // Graceful path: the socket is present and serviceable.
+    if socket_present
+        && let Ok(mut client) = socket_client::SocketClient::connect(
+            astrid_core::SessionId::from_uuid(uuid::Uuid::new_v4()),
+            crate::principal::current(),
+        )
+        .await
     {
         let req = astrid_core::kernel_api::KernelRequest::Shutdown {
             reason: Some("astrid stop".to_string()),
@@ -316,12 +343,14 @@ pub(crate) async fn handle_stop() -> Result<()> {
             let raw = client
                 .read_until_topic(
                     astrid_types::Topic::kernel_response("shutdown").as_str(),
-                    std::time::Duration::from_secs(10),
+                    Duration::from_secs(10),
                 )
                 .await?;
             match crate::socket_client::SocketClient::extract_kernel_response(&raw) {
                 Some(astrid_core::kernel_api::KernelResponse::Success(_)) => {
-                    println!("{}", theme::Theme::success("Astrid daemon stopped."));
+                    // ACK only — confirm the process actually exits before
+                    // declaring success, and escalate if it wedged.
+                    confirm_graceful_stop(recorded, &pid_path, &socket_path).await;
                 },
                 Some(astrid_core::kernel_api::KernelResponse::Error(reason)) => {
                     anyhow::bail!("daemon rejected shutdown: {reason}");
@@ -334,53 +363,129 @@ pub(crate) async fn handle_stop() -> Result<()> {
                 },
             }
         }
-        // The daemon removes its own PID file on graceful shutdown; clean up
-        // best-effort here too in case the shutdown raced or the file was
-        // left behind by an earlier wedged run.
-        let _ = std::fs::remove_file(socket_client::pid_path());
-    } else {
-        // Socket exists but the handshake failed — the daemon is hung or
-        // half-dead. Deleting the socket alone is NOT enough: the orphaned
-        // process keeps holding the singleton/state-db lock, so the next
-        // `astrid start` would die with "Database … is already locked". Read
-        // the PID it recorded at boot and signal it (SIGTERM, then SIGKILL)
-        // before cleaning up, so the lock is actually released.
-        let pid_path = socket_client::pid_path();
-        match daemon_control::terminate_orphan(&pid_path).await {
-            daemon_control::KillOutcome::NotRunning => {
-                println!("{}", theme::Theme::info("Cleaned up stale daemon socket."));
-            },
-            daemon_control::KillOutcome::TermExited | daemon_control::KillOutcome::KilledExited => {
-                println!(
-                    "{}",
-                    theme::Theme::success("Stopped an unresponsive Astrid daemon.")
-                );
-            },
-            daemon_control::KillOutcome::StillAlive => {
-                eprintln!(
-                    "{}",
-                    theme::Theme::error(
-                        "An unresponsive Astrid daemon did not exit even after SIGKILL; \
-                         the state-db lock may still be held."
-                    )
-                );
-            },
-            daemon_control::KillOutcome::Unverified(pid) => {
-                eprintln!(
-                    "{}",
-                    theme::Theme::warning(&format!(
-                        "A process (PID {pid}) holds the recorded daemon PID but I can't \
-                         confirm it's the Astrid daemon (possible PID reuse) — not killing it. \
-                         If the daemon is genuinely stuck, inspect PID {pid} and stop it manually."
-                    ))
-                );
-            },
-        }
-        let _ = std::fs::remove_file(&socket_path);
-        let _ = std::fs::remove_file(socket_client::readiness_path());
-        let _ = std::fs::remove_file(&pid_path);
+        return Ok(());
     }
+
+    // Orphan path: the socket is present but unreachable (hung/half-dead
+    // daemon), OR the socket is already gone but a live recorded daemon is still
+    // holding the lock. A clean shutdown request is impossible either way, so
+    // signal the recorded PID (identity-gated) and clean up. Using the PID we
+    // captured up front — not a re-read — closes the window where the daemon
+    // deletes its own PID file mid-wedge.
+    let outcome = match &recorded {
+        Some((pid, exe)) => daemon_control::terminate_known(*pid, exe.as_deref()).await,
+        None => daemon_control::KillOutcome::NotRunning,
+    };
+    report_orphan_stop(outcome, socket_present, &pid_path, &socket_path);
     Ok(())
+}
+
+/// After a graceful shutdown ACK, confirm the daemon process actually exited —
+/// an ACK is "shutting down", not "exited and released the lock". Wait for the
+/// recorded PID to die; if it wedges past the grace window it is still holding
+/// the lock, so escalate through the same identity-gated signal path as an
+/// unreachable orphan. Runtime files are cleaned only once the process is gone.
+async fn confirm_graceful_stop(
+    recorded: Option<(u32, Option<PathBuf>)>,
+    pid_path: &Path,
+    socket_path: &Path,
+) {
+    let Some((pid, exe)) = recorded else {
+        // Legacy pidless daemon (or an unresolved PID): we can't confirm exit,
+        // so trust the ACK. The daemon cleans up its own socket on a clean exit;
+        // remove the PID file best-effort in case one was left behind.
+        println!("{}", theme::Theme::success("Astrid daemon stopped."));
+        let _ = std::fs::remove_file(pid_path);
+        return;
+    };
+
+    if daemon_control::wait_for_exit(pid, daemon_control::GRACE).await {
+        println!("{}", theme::Theme::success("Astrid daemon stopped."));
+        let _ = std::fs::remove_file(pid_path);
+        return;
+    }
+
+    // Acknowledged but still alive past the grace window → wedged mid-shutdown,
+    // still holding the lock. Escalate with a signal (identity-gated).
+    eprintln!(
+        "{}",
+        theme::Theme::warning(
+            "Daemon acknowledged shutdown but is still running; escalating with a signal so the \
+             state-db lock is released."
+        )
+    );
+    let outcome = daemon_control::terminate_known(pid, exe.as_deref()).await;
+    report_orphan_stop(outcome, true, pid_path, socket_path);
+}
+
+/// Report a signal-based stop outcome and clean up runtime files ONLY when the
+/// daemon is confirmed gone. When a kill can't confirm exit (`StillAlive` /
+/// `Unverified`), the socket/PID files are LEFT in place so `astrid start` /
+/// `astrid restart` still see the recorded PID and can print an actionable
+/// message rather than failing on the held lock with a raw DB error.
+fn report_orphan_stop(
+    outcome: daemon_control::KillOutcome,
+    socket_present: bool,
+    pid_path: &Path,
+    socket_path: &Path,
+) {
+    match &outcome {
+        daemon_control::KillOutcome::NotRunning => {
+            if socket_present {
+                println!("{}", theme::Theme::info("Cleaned up stale daemon socket."));
+            } else {
+                println!("{}", theme::Theme::info("No Astrid daemon is running."));
+            }
+        },
+        daemon_control::KillOutcome::TermExited | daemon_control::KillOutcome::KilledExited => {
+            println!(
+                "{}",
+                theme::Theme::success("Stopped an unresponsive Astrid daemon.")
+            );
+        },
+        daemon_control::KillOutcome::StillAlive => {
+            eprintln!(
+                "{}",
+                theme::Theme::error(
+                    "An unresponsive Astrid daemon did not exit even after SIGKILL; the \
+                     state-db lock may still be held. Inspect the process before retrying."
+                )
+            );
+        },
+        daemon_control::KillOutcome::Unverified(pid) => {
+            eprintln!(
+                "{}",
+                theme::Theme::warning(&format!(
+                    "A process (PID {pid}) holds the recorded daemon PID but I can't confirm \
+                     it's the Astrid daemon (possible PID reuse) — not killing it. If the daemon \
+                     is genuinely stuck, inspect PID {pid} and stop it manually."
+                ))
+            );
+        },
+    }
+    if stop_confirmed_gone(outcome) {
+        let _ = std::fs::remove_file(socket_path);
+        let _ = std::fs::remove_file(socket_client::readiness_path());
+        let _ = std::fs::remove_file(pid_path);
+    }
+}
+
+/// Whether a stop outcome CONFIRMS the daemon is gone — the only condition under
+/// which runtime files (socket, readiness, PID) may be removed.
+///
+/// This is the crux of the wedge fix (#1120): `StillAlive`/`Unverified` mean a
+/// process may still hold the state-db lock, so the files are kept, leaving the
+/// recorded PID for `astrid start`/`restart` to find and act on rather than
+/// racing a fresh daemon onto a held lock (which surfaces as a raw "Database …
+/// is already locked" error). Pure over its input so the invariant is testable
+/// without a live daemon. Takes the `Copy` outcome by value (trivially small).
+fn stop_confirmed_gone(outcome: daemon_control::KillOutcome) -> bool {
+    matches!(
+        outcome,
+        daemon_control::KillOutcome::NotRunning
+            | daemon_control::KillOutcome::TermExited
+            | daemon_control::KillOutcome::KilledExited
+    )
 }
 
 /// Format seconds into a human-readable uptime string.
@@ -413,5 +518,22 @@ mod tests {
                 .expect("readiness window fits"),
             60_000
         );
+    }
+
+    /// REGRESSION (#1120): `astrid stop` must remove the socket/PID files ONLY
+    /// when the daemon is confirmed gone. Before the fix, stop reported success
+    /// and deleted the PID file on the shutdown ACK alone; a daemon that then
+    /// wedged mid-shutdown leaked the lock with no PID handle left, and the next
+    /// `start` died on it. `StillAlive`/`Unverified` must NOT trigger cleanup.
+    #[test]
+    fn stop_cleans_up_only_when_confirmed_gone() {
+        use daemon_control::KillOutcome;
+        assert!(stop_confirmed_gone(KillOutcome::NotRunning));
+        assert!(stop_confirmed_gone(KillOutcome::TermExited));
+        assert!(stop_confirmed_gone(KillOutcome::KilledExited));
+        // A process that may still hold the lock → keep the files so restart/
+        // start can find the recorded PID and act on it.
+        assert!(!stop_confirmed_gone(KillOutcome::StillAlive));
+        assert!(!stop_confirmed_gone(KillOutcome::Unverified(4242)));
     }
 }
