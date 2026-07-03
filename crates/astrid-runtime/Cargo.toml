@@ -13,7 +13,7 @@ description = "Target-selected facade over task spawning and time for the Astrid
 # Native host: the facade is pure tokio/std re-exports (zero cost, zero
 # behaviour change). `rt` backs `spawn`/`JoinHandle`/`JoinError`; `time` backs
 # the `time` module. Both are already in the workspace base feature set.
-[target.'cfg(not(target_family = "wasm"))'.dependencies]
+[target.'cfg(not(all(target_arch = "wasm32", target_os = "unknown")))'.dependencies]
 tokio = { workspace = true }
 
 # Browser host: no tokio runtime, no OS threads, no `std::time` clock. The
@@ -24,7 +24,7 @@ tokio = { workspace = true }
 # Literal versions match the in-crate wasm-dep convention already used by
 # astrid-types/core/crypto/storage (their wasm `getrandom` is declared the
 # same way, not via `[workspace.dependencies]`).
-[target.'cfg(target_family = "wasm")'.dependencies]
+[target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]
 futures = { workspace = true }
 wasm-bindgen-futures = "0.4.76"
 wasmtimer = "0.4.3"

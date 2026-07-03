@@ -762,6 +762,7 @@ dependencies = [
  "astrid-crypto",
  "astrid-events",
  "astrid-mcp",
+ "astrid-runtime",
  "astrid-storage",
  "astrid-vfs",
  "async-trait",
@@ -818,6 +819,17 @@ dependencies = [
  "astrid-mcp",
  "astrid-telemetry",
  "astrid-workspace",
+]
+
+[[package]]
+name = "astrid-runtime"
+version = "0.9.2"
+dependencies = [
+ "futures",
+ "tokio",
+ "wasm-bindgen-futures",
+ "wasmtimer",
+ "web-time",
 ]
 
 [[package]]
@@ -9144,6 +9156,7 @@ dependencies = [
  "js-sys",
  "parking_lot",
  "pin-utils",
+ "slab",
  "wasm-bindgen",
 ]
 

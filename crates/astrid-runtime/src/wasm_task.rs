@@ -51,9 +51,16 @@ impl std::error::Error for JoinError {}
 /// `Err(JoinError)` if it was [aborted](Self::abort) first. Dropping the handle
 /// does *not* cancel the task (matching tokio) — the task keeps running on the
 /// microtask queue; only [`abort`](Self::abort) stops it.
+#[must_use = "dropping a JoinHandle detaches the task; call .abort() to cancel it"]
 pub struct JoinHandle<T> {
     rx: oneshot::Receiver<T>,
     abort: AbortHandle,
+}
+
+impl<T> std::fmt::Debug for JoinHandle<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("JoinHandle").finish_non_exhaustive()
+    }
 }
 
 impl<T> JoinHandle<T> {

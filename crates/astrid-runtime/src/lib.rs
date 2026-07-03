@@ -9,10 +9,11 @@
 //! clock), so routing them all through this one crate gives a portable host
 //! profile a single seam where the runtime surface is selected per target:
 //!
-//! - **Native** (`cfg(not(target_family = "wasm"))`): pure `tokio`/`std`
+//! - **Native** (everything except `wasm32-unknown-unknown`): pure `tokio`/`std`
 //!   re-exports. Every item resolves to the exact same tokio/std type it
 //!   replaced, so the facade is zero-cost and changes no behaviour.
-//! - **Wasm** (`cfg(target_family = "wasm")`): the task surface maps to the JS
+//! - **Browser wasm** (`wasm32-unknown-unknown` only — WASI targets take the
+//!   native arm, since these deps are browser-specific): the task surface maps to the JS
 //!   microtask queue (`wasm-bindgen-futures`), the timer surface to JS timers
 //!   (`wasmtimer`), and the wall clock to the browser time bridge
 //!   (`web-time`). See each item's docs for the accepted semantic differences
@@ -43,19 +44,19 @@
 // used before the facade existed; no wrappers, no behaviour change.
 // ===========================================================================
 
-#[cfg(not(target_family = "wasm"))]
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 pub use tokio::spawn;
-#[cfg(not(target_family = "wasm"))]
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 pub use tokio::task::{JoinError, JoinHandle};
 
 /// Timer surface. Native = `tokio::time`; wasm = `wasmtimer`.
-#[cfg(not(target_family = "wasm"))]
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 pub mod time {
     pub use tokio::time::{Instant, MissedTickBehavior, interval, sleep, timeout};
 }
 
 /// Wall-clock reads.
-#[cfg(not(target_family = "wasm"))]
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 pub mod clock {
     /// Current wall-clock as whole seconds since the Unix epoch, saturating to
     /// `0` on the (impossible) pre-1970 case so the returned `u64` never wraps.
@@ -75,9 +76,9 @@ pub mod clock {
 // it here, that lives in the browser host build.
 // ===========================================================================
 
-#[cfg(target_family = "wasm")]
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
 mod wasm_task;
-#[cfg(target_family = "wasm")]
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
 pub use wasm_task::{JoinError, JoinHandle, spawn};
 
 /// Timer surface. Native = `tokio::time`; wasm = `wasmtimer`.
@@ -90,14 +91,14 @@ pub use wasm_task::{JoinError, JoinHandle, spawn};
 /// `Performance` timer). Every kernel use reads `Instant::now`, adds/subtracts
 /// `Duration`, and compares — arithmetic both types share — so the swap is
 /// behaviour-preserving on either target.
-#[cfg(target_family = "wasm")]
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
 pub mod time {
     pub use wasmtimer::std::Instant;
     pub use wasmtimer::tokio::{MissedTickBehavior, interval, sleep, timeout};
 }
 
 /// Wall-clock reads.
-#[cfg(target_family = "wasm")]
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
 pub mod clock {
     /// Current wall-clock as whole seconds since the Unix epoch, saturating to
     /// `0` on the (impossible) pre-1970 case so the returned `u64` never wraps.
