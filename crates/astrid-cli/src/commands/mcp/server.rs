@@ -67,6 +67,36 @@ const TOOL_CALL_TOPIC: &str = "astrid.v1.request.mcp.tool.call";
 /// surfaces as a broker-side `isError` reply rather than a shim timeout.
 const REQUEST_DEADLINE: Duration = Duration::from_secs(55);
 
+/// Upper bound on grant-on-use resolutions the shim will drive within a
+/// SINGLE `tools/call` before failing the call with a terminal error.
+///
+/// A fresh principal can be missing several view capsules at once (#1113): each
+/// re-sent call trips the access gate on the NEXT ungranted capsule, so one
+/// user-issued call may legitimately require a short sequence of grant prompts.
+/// This bounds that sequence so a broker that keeps replying `grant_required`
+/// (a bug, or an adversarial surface) can never spin the shim forever. Each
+/// prompt still requires an explicit user accept, so the bound is a backstop,
+/// not the consent mechanism. Sized for a whole distro's worth of capsules
+/// resolving on one call; exceeding it yields an honest `isError`
+/// ([`GRANT_BOUND_EXCEEDED_MESSAGE`]), never a fabricated empty success.
+const MAX_GRANT_RESOLUTIONS: usize = 8;
+
+/// Terminal error text when a `grant_required` signal is present but
+/// unanswerable (malformed shape / missing routing token). Kept as a constant
+/// so the loop and its unit tests stay in lockstep.
+const MALFORMED_GRANT_MESSAGE: &str =
+    "Astrid returned a malformed capsule-grant signal; the tool call was dropped.";
+
+/// Terminal error text when a grant was surfaced but not granted (user
+/// declined, or the broker did not persist the grant).
+const GRANT_DENIED_MESSAGE: &str = "Capsule access was not granted for this tool.";
+
+/// Terminal error text when a single `tools/call` needed more grant
+/// resolutions than [`MAX_GRANT_RESOLUTIONS`]. The call is dropped rather than
+/// returned as an empty success; re-running resumes granting the remainder.
+const GRANT_BOUND_EXCEEDED_MESSAGE: &str = "Astrid needed to resolve more capsule grants than a single tool call allows; the tool call \
+     was dropped. Re-run the tool to continue granting the remaining capsules.";
+
 /// MCP server shim bridging a stdio client to the daemon tool broker.
 pub(crate) struct AstridMcpServer {
     /// The single long-lived uplink, shared across `&self` handlers.
@@ -274,6 +304,47 @@ fn is_request_retriable(request_topic: &str) -> bool {
     }
 }
 
+/// One decision of the bounded grant-on-use loop, computed purely from the
+/// current broker reply and how many grants have already been resolved on this
+/// `tools/call`. Extracted from [`AstridMcpServer::call_tool`] so the loop's
+/// control logic — in particular the resolution bound and the invariant that a
+/// `grant_required` reply is NEVER treated as terminal — is unit-testable
+/// without a live broker or MCP peer (#1117).
+enum GrantStep {
+    /// No grant signal — the reply is terminal with respect to grants; hand it
+    /// to the approval/terminal path.
+    Terminal,
+    /// A well-formed grant to resolve (then re-send the original call).
+    Resolve(grant::GrantRequest),
+    /// Fail the `tools/call` with a terminal error carrying this text — a
+    /// malformed signal, or the per-call resolution bound was exceeded. The
+    /// reply itself is NEVER returned as a result.
+    Fail(&'static str),
+}
+
+/// Decide the next grant-loop action for `reply`, given how many grants have
+/// already been resolved on this call.
+///
+/// Crucially, a present grant signal never yields [`GrantStep::Terminal`]: an
+/// ungranted `grant_required` reply must not masquerade as an empty success
+/// (the #1117 bug). Once [`MAX_GRANT_RESOLUTIONS`] grants have been resolved, a
+/// still-present signal fails the call rather than resolving unboundedly.
+fn next_grant_step(reply: &Value, grants_resolved: usize) -> GrantStep {
+    match grant::GrantRequest::classify(reply) {
+        // Absent (or explicit null): already-granted / no gate. Terminal.
+        grant::GrantSignal::Absent => GrantStep::Terminal,
+        // Present but unanswerable: fail loudly, never as an empty success.
+        grant::GrantSignal::Malformed => GrantStep::Fail(MALFORMED_GRANT_MESSAGE),
+        grant::GrantSignal::Present(grant) => {
+            if grants_resolved >= MAX_GRANT_RESOLUTIONS {
+                GrantStep::Fail(GRANT_BOUND_EXCEEDED_MESSAGE)
+            } else {
+                GrantStep::Resolve(grant)
+            }
+        },
+    }
+}
+
 impl ServerHandler for AstridMcpServer {
     fn get_info(&self) -> ServerInfo {
         // Tools-only server. `listChanged = true` tells the client the
@@ -371,30 +442,41 @@ impl ServerHandler for AstridMcpServer {
         // approval block, so a re-sent call still flows into the approval gate:
         // a tool that is both ungranted and capability-gated resolves in
         // sequence.
-        let reply = match grant::GrantRequest::classify(&reply) {
-            // No grant signal (or an explicit null) — the common already-granted
-            // path. Carry the reply through unchanged.
-            grant::GrantSignal::Absent => reply,
-            // A grant signal was present but unanswerable. The call was DROPPED
-            // at the access gate, so the (empty) reply is NOT a result — surface
-            // a terminal error rather than letting it masquerade as success.
-            grant::GrantSignal::Malformed => {
-                return Ok(CallToolResult::error(vec![Content::text(
-                    "Astrid returned a malformed capsule-grant signal; the tool call was dropped.",
-                )]));
-            },
-            grant::GrantSignal::Present(grant) => {
-                let granted = self.resolve_grant(&context.peer, &grant).await?;
-                if !granted {
-                    return Ok(CallToolResult::error(vec![Content::text(
-                        "Capsule access was not granted for this tool.",
-                    )]));
-                }
-                // Re-send the original call now that the capsule is granted.
-                let retry_id = new_req_id();
-                self.round_trip(TOOL_CALL_TOPIC, &retry_id, call_body(&retry_id))
-                    .await?
-            },
+        //
+        // LOOP, do not resolve once (#1117): a fresh principal can be missing
+        // SEVERAL view capsules, and each re-sent call trips the access gate on
+        // the NEXT ungranted capsule. Resolve-and-re-send until the reply is
+        // grant-free, bounded by `MAX_GRANT_RESOLUTIONS` so a broker that keeps
+        // replying `grant_required` cannot spin the shim. The invariant that
+        // keeps an ungranted call from masquerading as an empty success lives
+        // in `next_grant_step`: a present grant signal is never `Terminal`, so
+        // the only ways out of this loop are a grant-free reply (`break`) or a
+        // terminal error (malformed / denied / bound exceeded).
+        let mut reply = reply;
+        let mut grants_resolved = 0usize;
+        let reply = loop {
+            match next_grant_step(&reply, grants_resolved) {
+                GrantStep::Terminal => break reply,
+                GrantStep::Fail(message) => {
+                    return Ok(CallToolResult::error(vec![Content::text(message)]));
+                },
+                GrantStep::Resolve(grant) => {
+                    let granted = self.resolve_grant(&context.peer, &grant).await?;
+                    if !granted {
+                        return Ok(CallToolResult::error(vec![Content::text(
+                            GRANT_DENIED_MESSAGE,
+                        )]));
+                    }
+                    grants_resolved = grants_resolved.saturating_add(1);
+                    // Re-send the original call now that this capsule is
+                    // granted; the next reply may itself carry a further
+                    // `grant_required` for the NEXT ungranted view capsule.
+                    let retry_id = new_req_id();
+                    reply = self
+                        .round_trip(TOOL_CALL_TOPIC, &retry_id, call_body(&retry_id))
+                        .await?;
+                },
+            }
         };
 
         // If the routed tool parked on a capability approval, the broker
@@ -673,5 +755,95 @@ mod tests {
     fn unknown_topic_is_not_retriable() {
         assert!(!is_request_retriable("astrid.v1.request.mcp.something.new"));
         assert!(!is_request_retriable(""));
+    }
+
+    // ── Bounded grant-on-use loop (#1117) ───────────────────────────
+
+    /// A well-formed, still-present `grant_required` signal.
+    fn grant_reply(capsule: &str) -> Value {
+        json!({
+            "kind": "tool.call",
+            "content": [],
+            "isError": false,
+            "grant_required": {
+                "request_id": format!("grant-{capsule}"),
+                "capsule_id": capsule,
+                "principal": "claude-code",
+                "tool_name": "some.tool",
+                "call_id": "call-1"
+            }
+        })
+    }
+
+    /// A grant-free reply — the terminal / already-granted shape.
+    fn terminal_reply() -> Value {
+        json!({ "kind": "tool.call", "content": [], "isError": false })
+    }
+
+    /// No grant signal → `Terminal`: proceed to the approval/terminal path.
+    #[test]
+    fn grant_step_terminal_when_no_signal() {
+        assert!(matches!(
+            next_grant_step(&terminal_reply(), 0),
+            GrantStep::Terminal
+        ));
+    }
+
+    /// A well-formed grant under the bound → `Resolve` (elicit + re-send).
+    #[test]
+    fn grant_step_resolves_present_signal_under_bound() {
+        assert!(matches!(
+            next_grant_step(&grant_reply("shell"), 0),
+            GrantStep::Resolve(_)
+        ));
+        // Still resolvable right up to the last permitted resolution.
+        assert!(matches!(
+            next_grant_step(&grant_reply("shell"), MAX_GRANT_RESOLUTIONS - 1),
+            GrantStep::Resolve(_)
+        ));
+    }
+
+    /// At or above the bound, a still-present grant signal must `Fail` with the
+    /// bound-exceeded message — never resolve again, never go `Terminal`.
+    #[test]
+    fn grant_step_fails_when_bound_exceeded() {
+        let GrantStep::Fail(message) =
+            next_grant_step(&grant_reply("shell"), MAX_GRANT_RESOLUTIONS)
+        else {
+            panic!("a present grant signal at the bound must Fail, not Resolve/Terminal");
+        };
+        assert_eq!(message, GRANT_BOUND_EXCEEDED_MESSAGE);
+        // Well above the bound too.
+        assert!(matches!(
+            next_grant_step(&grant_reply("shell"), MAX_GRANT_RESOLUTIONS + 5),
+            GrantStep::Fail(_)
+        ));
+    }
+
+    /// A present-but-unanswerable (malformed) signal fails with the malformed
+    /// message — it is never returned as an empty success.
+    #[test]
+    fn grant_step_fails_on_malformed_signal() {
+        let malformed = json!({ "grant_required": { "request_id": "" } });
+        let GrantStep::Fail(message) = next_grant_step(&malformed, 0) else {
+            panic!("a malformed grant signal must Fail");
+        };
+        assert_eq!(message, MALFORMED_GRANT_MESSAGE);
+    }
+
+    /// The core #1117 invariant: as long as a grant signal is present, NO
+    /// resolved-count ever yields `Terminal`. If it did, the loop would hand a
+    /// `grant_required` reply to `call_tool_result_from_reply`, which would
+    /// reshape it into an empty `isError:false` success — the phantom result
+    /// the bug produced.
+    #[test]
+    fn grant_step_never_terminal_while_grant_present() {
+        let reply = grant_reply("shell");
+        for resolved in 0..=(MAX_GRANT_RESOLUTIONS + 2) {
+            assert!(
+                !matches!(next_grant_step(&reply, resolved), GrantStep::Terminal),
+                "a present grant signal must never classify as Terminal (resolved={resolved})"
+            );
+        }
     }
 }
