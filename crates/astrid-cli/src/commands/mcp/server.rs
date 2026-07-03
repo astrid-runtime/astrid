@@ -46,7 +46,7 @@ use rmcp::model::{
     PaginatedRequestParams, ProtocolVersion, ServerCapabilities, ServerInfo, Tool,
 };
 use rmcp::service::{RequestContext, RoleServer};
-use serde_json::{Map, Value, json};
+use serde_json::{Value, json};
 use tokio::sync::Mutex;
 use tracing::{debug, warn};
 use uuid::Uuid;
@@ -660,19 +660,32 @@ pub(super) fn new_req_id() -> String {
 /// the shape is unexpected, so a malformed frame degrades to an empty
 /// reply rather than panicking.
 pub(super) fn unwrap_reply_payload(raw: &Value) -> Value {
+    unwrap_reply_payload_ref(raw).clone()
+}
+
+/// Borrowing form of [`unwrap_reply_payload`]: returns the inner reply value by
+/// reference, without cloning.
+///
+/// A `capsules_loaded` payload carries every reloaded capsule's full `meta`
+/// (including tool schemas), so a consumer that only needs to *read* a few
+/// fields off it — e.g. the hot-reload watcher extracting tool names — must
+/// borrow rather than clone the whole tree on every broadcast. A missing
+/// `payload` degrades to a borrowed `Null` (which reads as "no fields present"
+/// everywhere downstream) rather than an allocated empty object.
+pub(super) fn unwrap_reply_payload_ref(raw: &Value) -> &Value {
+    // A shared `Null` to hand back when there is no payload — lets this return
+    // a borrow in every branch without allocating.
+    static NULL_PAYLOAD: Value = Value::Null;
     let Some(payload) = raw.get("payload") else {
-        return Value::Object(Map::new());
+        return &NULL_PAYLOAD;
     };
     if payload
         .as_object()
         .is_some_and(|m| m.contains_key("type") && m.contains_key("value"))
     {
-        return payload
-            .get("value")
-            .cloned()
-            .unwrap_or_else(|| payload.clone());
+        return payload.get("value").unwrap_or(payload);
     }
-    payload.clone()
+    payload
 }
 
 /// Translate one broker MCP descriptor
