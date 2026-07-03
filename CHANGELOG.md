@@ -9,6 +9,8 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
 
 ## [Unreleased]
 
+## [0.9.2] - 2026-07-03
+
 ### Fixed
 
 - **First-run consent no longer storms a `GrantRequired` for every ungranted capsule in the caller's view.** The dispatch access gate ran the grant-on-use check — and emitted a `GrantRequired` signal — for every ungranted capsule in the caller's view *before* checking whether the capsule's subscription matched the dispatched topic. A single `tools/call` on a fresh principal therefore fired a grant prompt for every ungranted view capsule, including all the capsules the call never touched, making first-run consent effectively unconvergeable. The gate now evaluates the cheap, manifest-local interceptor topic-match first (using the same `crate::topic::topic_matches` the delivery push uses) and engages the per-principal access gate only for a capsule that actually provides an interceptor for the requested topic; a non-matching capsule never reaches the gate. A matching ungranted capsule still fail-closed drops and signals exactly once, and behaviour for granted capsules, interceptor ordering, and non-tool topics is unchanged. Closes #1113.
