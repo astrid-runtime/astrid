@@ -120,6 +120,87 @@ fn homebrew_path_is_detected() {
 }
 
 #[test]
+fn install_method_is_detected_per_path() {
+    use InstallMethod::{Cargo, Homebrew, SelfManaged};
+    assert_eq!(
+        InstallMethod::detect(Path::new("/opt/homebrew/Cellar/astrid/0.9.2/bin/astrid")),
+        Homebrew
+    );
+    assert_eq!(
+        InstallMethod::detect(Path::new("/home/jb/.cargo/bin/astrid")),
+        Cargo
+    );
+    assert_eq!(
+        InstallMethod::detect(Path::new("/Users/jb/.astrid/bin/astrid")),
+        SelfManaged
+    );
+    assert_eq!(
+        InstallMethod::detect(Path::new("/usr/local/bin/astrid")),
+        SelfManaged
+    );
+    // `.cargo` without an adjacent `bin` is NOT a cargo install (a stray dir
+    // named `.cargo` elsewhere in the path must not misclassify).
+    assert_eq!(
+        InstallMethod::detect(Path::new("/home/jb/.cargo/registry/astrid")),
+        SelfManaged
+    );
+}
+
+/// REGRESSION (#1121): `--check` must report an available update for EVERY
+/// install method — Homebrew and cargo included, not just self-managed. Before
+/// the fix the Homebrew branch returned before the version check, so the nudge
+/// never fired for brew installs. Applying (not checking) still defers external
+/// managers and swaps self-managed installs in place.
+#[test]
+fn check_reports_update_for_all_install_methods() {
+    use InstallMethod::{Cargo, Homebrew, SelfManaged};
+    let older = semver::Version::parse("0.9.1").unwrap();
+    let newer = semver::Version::parse("0.9.2").unwrap();
+
+    for method in [Homebrew, Cargo, SelfManaged] {
+        // `--check`: availability is reported for every method, with that
+        // method's own upgrade command — never UpToDate, never a deferral.
+        assert_eq!(
+            plan_update(method, &older, &newer, true),
+            UpdatePlan::Available {
+                how: method.upgrade_command()
+            },
+            "check must report availability for {method:?}"
+        );
+        // Up to date is up to date for every method.
+        assert_eq!(
+            plan_update(method, &newer, &newer, true),
+            UpdatePlan::UpToDate
+        );
+        assert_eq!(
+            plan_update(method, &newer, &older, false),
+            UpdatePlan::UpToDate
+        );
+    }
+
+    // Applying an update (not --check): external managers defer, self-managed
+    // swaps in place.
+    assert_eq!(
+        plan_update(Homebrew, &older, &newer, false),
+        UpdatePlan::DeferToManager {
+            manager: "Homebrew",
+            how: "brew upgrade astrid"
+        }
+    );
+    assert_eq!(
+        plan_update(Cargo, &older, &newer, false),
+        UpdatePlan::DeferToManager {
+            manager: "cargo",
+            how: "cargo install astrid --force"
+        }
+    );
+    assert_eq!(
+        plan_update(SelfManaged, &older, &newer, false),
+        UpdatePlan::ApplyInPlace
+    );
+}
+
+#[test]
 fn resolve_repo_precedence_and_validation() {
     // An explicit `--source` wins over env/default and parses owner/repo.
     // (The `None` path falls through to ASTRID_UPDATE_REPO then the default

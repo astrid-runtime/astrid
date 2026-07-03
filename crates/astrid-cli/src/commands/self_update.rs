@@ -3,10 +3,13 @@
 //! Discovers the latest GitHub release for `unicity-astrid/astrid`, compares it
 //! to the running binary, and — for self-managed installs — verifies, stages,
 //! and atomically swaps the new binary IN PLACE with a backup for rollback.
-//! Homebrew installs are deferred to `brew upgrade` (we never shadow them with a
-//! second copy). The release source can be overridden (`--source owner/repo` /
-//! `ASTRID_UPDATE_REPO` / `ASTRID_UPDATE_API`) so the whole flow can be
-//! rehearsed against a fork, pre-release, or local mock.
+//! Installs owned by a package manager (Homebrew, `cargo install`) are deferred
+//! to that manager rather than shadowed with a second copy. The version CHECK,
+//! however, is method-independent: `astrid update --check` reports availability
+//! for every install method on both macOS and Linux, so the session-start nudge
+//! fires regardless of how Astrid was installed. The release source can be
+//! overridden (`--source owner/repo` / `ASTRID_UPDATE_REPO` / `ASTRID_UPDATE_API`)
+//! so the whole flow can be rehearsed against a fork, pre-release, or local mock.
 //!
 //! Also provides PATH setup helpers for `astrid init`.
 
@@ -96,6 +99,119 @@ fn is_homebrew_managed(exe: &Path) -> bool {
     })
 }
 
+/// Whether `exe` is a `cargo install`-managed binary. Cargo installs land in
+/// `$CARGO_HOME/bin` (default `~/.cargo/bin`), so the resolved path contains a
+/// `.cargo` directory component immediately followed by `bin`. Such installs
+/// update via `cargo install`, not an in-place binary swap. A non-default
+/// `CARGO_HOME` outside `.cargo/bin` simply falls through to `SelfManaged`,
+/// which still updates correctly (it swaps the binary in whatever dir it lives).
+fn is_cargo_managed(exe: &Path) -> bool {
+    let comps: Vec<&str> = exe
+        .components()
+        .filter_map(|c| c.as_os_str().to_str())
+        .collect();
+    comps.windows(2).any(|w| w[0] == ".cargo" && w[1] == "bin")
+}
+
+/// How the running `astrid` binary is managed. Determines how an update is
+/// APPLIED (and the instruction shown); the version CHECK itself is
+/// install-method-independent — always the GitHub release, on macOS and Linux.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InstallMethod {
+    /// Homebrew (`…/Cellar/astrid/…`) — updates via `brew upgrade`.
+    Homebrew,
+    /// `cargo install` (`…/.cargo/bin/astrid`) — updates via `cargo install`.
+    Cargo,
+    /// A self-managed binary (`~/.astrid/bin`, a direct download, …) — updated
+    /// in place by downloading the release and atomically swapping the binary.
+    SelfManaged,
+}
+
+impl InstallMethod {
+    /// Classify the running binary from its resolved path.
+    fn detect(exe: &Path) -> Self {
+        if is_homebrew_managed(exe) {
+            Self::Homebrew
+        } else if is_cargo_managed(exe) {
+            Self::Cargo
+        } else {
+            Self::SelfManaged
+        }
+    }
+
+    /// The command a user runs to upgrade this install.
+    fn upgrade_command(self) -> &'static str {
+        match self {
+            Self::Homebrew => "brew upgrade astrid",
+            Self::Cargo => "cargo install astrid --force",
+            Self::SelfManaged => "astrid update",
+        }
+    }
+
+    /// Human-readable name of the manager, for the "installed via …" message.
+    fn label(self) -> &'static str {
+        match self {
+            Self::Homebrew => "Homebrew",
+            Self::Cargo => "cargo",
+            Self::SelfManaged => "a self-managed install",
+        }
+    }
+
+    /// Whether an external package manager owns the binary, so `astrid update`
+    /// must defer to it rather than swapping the binary in place (which would
+    /// leave the manager's metadata pointing at a version it no longer controls).
+    fn manages_own_binary(self) -> bool {
+        matches!(self, Self::Homebrew | Self::Cargo)
+    }
+}
+
+/// What `astrid update` / `astrid update --check` should do, decided purely from
+/// the install method and version comparison. Factored out so the guarantee that
+/// a `--check` reports availability for EVERY install method (#1121 — the
+/// session-start nudge relies on it) is unit-testable without a network round
+/// trip. Before this, the Homebrew branch returned before the check ran, so the
+/// nudge never fired for brew installs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum UpdatePlan {
+    /// Running version is already >= latest.
+    UpToDate,
+    /// An update exists; report it and how to get it (any method; `--check`).
+    Available { how: &'static str },
+    /// An update exists but an external manager owns the binary — defer to it.
+    DeferToManager {
+        manager: &'static str,
+        how: &'static str,
+    },
+    /// An update exists and we manage the binary — download and swap in place.
+    ApplyInPlace,
+}
+
+/// Decide the update plan. Pure over its inputs.
+fn plan_update(
+    method: InstallMethod,
+    current: &semver::Version,
+    latest: &semver::Version,
+    is_check: bool,
+) -> UpdatePlan {
+    if latest <= current {
+        return UpdatePlan::UpToDate;
+    }
+    // A `--check` always REPORTS, regardless of install method — the version
+    // check is method-independent, and only reporting (not applying) is asked.
+    if is_check {
+        return UpdatePlan::Available {
+            how: method.upgrade_command(),
+        };
+    }
+    if method.manages_own_binary() {
+        return UpdatePlan::DeferToManager {
+            manager: method.label(),
+            how: method.upgrade_command(),
+        };
+    }
+    UpdatePlan::ApplyInPlace
+}
+
 /// Cached update check result.
 #[derive(serde::Serialize, serde::Deserialize)]
 struct UpdateCache {
@@ -168,8 +284,8 @@ pub(crate) async fn print_update_banner() {
         return;
     };
     let how = match running_binary() {
-        Ok(exe) if is_homebrew_managed(&exe) => "brew upgrade astrid",
-        _ => "astrid update",
+        Ok(exe) => InstallMethod::detect(&exe).upgrade_command(),
+        Err(_) => "astrid update",
     };
     eprintln!(
         "{}",
@@ -384,18 +500,8 @@ fn confirm(prompt: &str, assume_yes: bool) -> anyhow::Result<bool> {
 pub(crate) async fn run_self_update(args: UpdateArgs) -> anyhow::Result<()> {
     let target = platform_target()?;
     let (owner, repo) = resolve_repo(args.source.as_deref())?;
-
-    // Homebrew installs update via brew — never shadow them with a second copy.
     let exe = running_binary()?;
-    if is_homebrew_managed(&exe) {
-        println!(
-            "{}",
-            Theme::info(
-                "Astrid was installed via Homebrew. Update it with:\n  brew upgrade astrid"
-            )
-        );
-        return Ok(());
-    }
+    let method = InstallMethod::detect(&exe);
 
     println!(
         "{}",
@@ -409,27 +515,43 @@ pub(crate) async fn run_self_update(args: UpdateArgs) -> anyhow::Result<()> {
         .timeout(std::time::Duration::from_secs(30))
         .build()?;
 
+    // Check the release FIRST, for every install method. Homebrew/cargo installs
+    // are checked the same as self-managed ones — only how the update is APPLIED
+    // differs — so `--check` reports availability everywhere (the session-start
+    // nudge depends on it). Previously the Homebrew branch returned before this
+    // ran, so brew installs never learned an update existed (#1121).
     let (version_str, release) = fetch_latest_release(&client, &owner, &repo).await?;
     let current = semver::Version::parse(CURRENT_VERSION)?;
     let latest = semver::Version::parse(&version_str)?;
     write_cache(&version_str);
 
-    if latest <= current {
-        println!(
-            "{}",
-            Theme::success(&format!("Already up to date (v{CURRENT_VERSION})."))
-        );
-        return Ok(());
-    }
-
-    if args.check {
-        println!(
-            "{}",
-            Theme::info(&format!(
-                "Update available: v{CURRENT_VERSION} → v{version_str}. Run `astrid update` to install."
-            ))
-        );
-        return Ok(());
+    match plan_update(method, &current, &latest, args.check) {
+        UpdatePlan::UpToDate => {
+            println!(
+                "{}",
+                Theme::success(&format!("Already up to date (v{CURRENT_VERSION})."))
+            );
+            return Ok(());
+        },
+        UpdatePlan::Available { how } => {
+            println!(
+                "{}",
+                Theme::info(&format!(
+                    "Update available: v{CURRENT_VERSION} → v{version_str}. Run `{how}` to upgrade."
+                ))
+            );
+            return Ok(());
+        },
+        UpdatePlan::DeferToManager { manager, how } => {
+            println!(
+                "{}",
+                Theme::info(&format!(
+                    "Astrid was installed via {manager}. Update it with:\n  {how}"
+                ))
+            );
+            return Ok(());
+        },
+        UpdatePlan::ApplyInPlace => {},
     }
 
     // Update IN PLACE at the directory of the running binary, so there is exactly
