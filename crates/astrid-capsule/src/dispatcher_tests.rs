@@ -1748,6 +1748,8 @@ async fn dispatch_with_injected_home_provisions_principal_under_it() {
 
     let dir = tempfile::tempdir().unwrap();
     let home = astrid_core::dirs::AstridHome::from_path(dir.path());
+    let prov_user = astrid_core::PrincipalId::new("prov-user").unwrap();
+    let expected = home.principal_home(&prov_user).root().to_path_buf();
 
     let bus = Arc::new(EventBus::with_capacity(64));
     let dispatcher = EventDispatcher::new(Arc::clone(&registry), Arc::clone(&bus)).with_home(home);
@@ -1762,20 +1764,21 @@ async fn dispatch_with_injected_home_provisions_principal_under_it() {
         "the event must dispatch normally alongside provisioning"
     );
     assert!(
-        dir.path().join("home").join("prov-user").is_dir(),
+        expected.is_dir(),
         "the unknown principal's home must be auto-provisioned under the injected tempdir home"
     );
 
     handle.abort();
 }
 
-/// With NO injected home, the same event still dispatches successfully and
-/// the dispatcher creates nothing anywhere: provisioning is fail-closed
-/// disabled, and the dispatch path never consults `$ASTRID_HOME`/`$HOME`
-/// (the `AstridHome::resolve()` call is gone — see
-/// `dispatcher::provision`). Guards the #1145 regression where unit tests
-/// wrote a thousand fixture principals into the developer's real
-/// `~/.astrid`.
+/// With NO injected home, the same event still dispatches successfully
+/// while auto-provisioning stays disabled: a tempdir standing where an
+/// injected home would be remains untouched. The full fail-closed
+/// contract — no filesystem writes and no `$ASTRID_HOME`/`$HOME`
+/// resolution without an injected home — is proven at the unit level in
+/// `dispatcher::provision::tests::no_injected_home_never_provisions`;
+/// the `AstridHome::resolve()` call is deleted from the dispatch path
+/// (#1145).
 #[tokio::test]
 async fn dispatch_without_home_creates_nothing_and_still_dispatches() {
     let (capsule, invoked) = MockCapsule::new("nohome-capsule", "nohome.topic");
@@ -1784,9 +1787,9 @@ async fn dispatch_without_home_creates_nothing_and_still_dispatches() {
     registry.register(Box::new(capsule)).unwrap();
     let registry = Arc::new(RwLock::new(registry));
 
-    // A canary home that would be the provisioning root IF the dispatcher
-    // (wrongly) had one — it is deliberately never injected.
-    let canary = tempfile::tempdir().unwrap();
+    // A tempdir that is deliberately never injected — it stands where an
+    // injected home would be, so it must remain empty throughout.
+    let never_injected = tempfile::tempdir().unwrap();
 
     let bus = Arc::new(EventBus::with_capacity(64));
     let dispatcher = EventDispatcher::new(Arc::clone(&registry), Arc::clone(&bus));
@@ -1801,8 +1804,11 @@ async fn dispatch_without_home_creates_nothing_and_still_dispatches() {
         "dispatch must succeed for an unknown principal even with provisioning disabled"
     );
     assert!(
-        std::fs::read_dir(canary.path()).unwrap().next().is_none(),
-        "no filesystem writes may happen when no home is injected"
+        std::fs::read_dir(never_injected.path())
+            .unwrap()
+            .next()
+            .is_none(),
+        "the never-injected tempdir must stay empty — provisioning is disabled without an injected home"
     );
 
     handle.abort();

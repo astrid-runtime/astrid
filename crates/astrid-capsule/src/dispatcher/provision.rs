@@ -131,10 +131,12 @@ mod tests {
     fn injected_home_provisions_under_it() {
         let dir = tempfile::tempdir().unwrap();
         let home = AstridHome::from_path(dir.path());
+        let alice = astrid_core::PrincipalId::new("alice").unwrap();
+        let alice_home = home.principal_home(&alice).root().to_path_buf();
         let mut p = PrincipalProvisioner::new(Some(home), false);
         p.observe(Some("alice"));
         assert!(
-            dir.path().join("home").join("alice").is_dir(),
+            alice_home.is_dir(),
             "alice's principal home must be created under the injected root"
         );
         assert!(p.known.contains("alice"), "cached after success");
@@ -145,10 +147,12 @@ mod tests {
     fn identity_gate_restricts_to_default() {
         let dir = tempfile::tempdir().unwrap();
         let home = AstridHome::from_path(dir.path());
+        let alice = astrid_core::PrincipalId::new("alice").unwrap();
+        let alice_home = home.principal_home(&alice).root().to_path_buf();
         let mut p = PrincipalProvisioner::new(Some(home), true);
         p.observe(Some("alice"));
         assert!(
-            !dir.path().join("home").join("alice").exists(),
+            !alice_home.exists(),
             "non-default principals are not auto-provisioned when gated"
         );
     }
@@ -158,10 +162,11 @@ mod tests {
     fn invalid_principal_is_ignored() {
         let dir = tempfile::tempdir().unwrap();
         let home = AstridHome::from_path(dir.path());
+        let home_dir = home.home_dir();
         let mut p = PrincipalProvisioner::new(Some(home), false);
         p.observe(Some("../escape"));
         assert!(
-            !dir.path().join("home").exists(),
+            !home_dir.exists(),
             "an invalid principal must provision nothing"
         );
     }
