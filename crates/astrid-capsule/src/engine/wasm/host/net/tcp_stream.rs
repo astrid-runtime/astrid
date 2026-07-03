@@ -23,6 +23,28 @@ fn map_write_frame_err(e: &std::io::Error) -> ErrorCode {
         ErrorCode::Unknown(format!("write: {e}"))
     }
 }
+
+/// Effective deadline for a host framed / byte-stream write.
+///
+/// An unbounded `write_all` awaits forever when a connected client stops
+/// draining its socket and the kernel send buffer fills. Because the
+/// capsule-cli guest services every uplink from a single run loop, one such
+/// stalled write freezes accepts, binds, and forwards for the whole uplink
+/// surface while the daemon otherwise stays healthy (issue #1144). Bounding
+/// the write turns a non-draining peer into a prompt write error, which the
+/// guest proxy already handles by evicting the client.
+///
+/// Honours an explicit `write_timeout` on a Tcp slot when one is set;
+/// otherwise falls back to a ceiling scaled by payload size, mirroring the
+/// `read_frame` payload-read bound (`5000 + len/1024` ms). The Unix arm has no
+/// per-slot timeout field, so it always uses the default ceiling.
+fn write_deadline(stream: &NetStream, data_len: usize) -> Duration {
+    let default_ceiling = Duration::from_millis(5000 + (data_len as u64 / 1024));
+    match stream {
+        NetStream::Tcp(slot) => slot.write_timeout.unwrap_or(default_ceiling),
+        NetStream::Unix(_) => default_ceiling,
+    }
+}
 use super::{
     HostState, NetStream, audit_net, map_io_err, net_stream, with_tcp_slot_mut, with_tcp_stream,
 };
@@ -132,30 +154,43 @@ impl HostTcpStream for HostState {
         let rt = self.runtime_handle.clone();
         let sem = self.blocking_semaphore.clone();
         let tok = self.effective_cancel_token();
+        // Bound the whole write — lock acquisition included, since a stuck
+        // write holds the per-stream mutex and a second write would otherwise
+        // block unbounded on the lock itself — so a peer that stops draining
+        // its socket becomes a write error within a deadline instead of
+        // freezing the single-threaded proxy run loop forever (issue #1144).
+        // The cancel token still races ahead of the deadline so a capsule
+        // teardown aborts the write promptly.
+        let deadline = write_deadline(&stream, data.len());
         let result = util::bounded_block_on_cancellable(&rt, &sem, &tok, async {
-            match stream {
-                NetStream::Unix(arc) => {
-                    let mut s = arc.lock().await;
-                    write_frame(&mut *s, &data).await
-                },
-                NetStream::Tcp(slot) => {
-                    let mut s = slot.stream.lock().await;
-                    write_frame(&mut *s, &data).await
-                },
+            let write_fut = async {
+                match stream {
+                    NetStream::Unix(arc) => {
+                        let mut s = arc.lock().await;
+                        write_frame(&mut *s, &data).await
+                    },
+                    NetStream::Tcp(slot) => {
+                        let mut s = slot.stream.lock().await;
+                        write_frame(&mut *s, &data).await
+                    },
+                }
+            };
+            match tokio::time::timeout(deadline, write_fut).await {
+                // Surface any write failure to the guest. The legacy
+                // implementation silently swallowed peer-disconnect errors
+                // here on the theory "the capsule will see it on the next
+                // read" — but the WIT contract for `write` is fallible, and
+                // capsules using it for request-response semantics need to
+                // know writes failed.
+                Ok(res) => res.map_err(|e| map_write_frame_err(&e)),
+                Err(_elapsed) => Err(ErrorCode::Unknown(
+                    "write timed out: peer not draining".to_string(),
+                )),
             }
         });
         let result = match result {
-            Some(Ok(())) => Ok(()),
-            Some(Err(e)) => {
-                // Surface the failure to the guest. The legacy
-                // implementation silently swallowed peer-disconnect
-                // errors here on the theory "the capsule will see it
-                // on the next read" — but the WIT contract for
-                // `write` is fallible, and capsules using it for
-                // request-response semantics need to know writes
-                // failed.
-                Err(map_write_frame_err(&e))
-            },
+            Some(inner) => inner,
+            // Cancellation (capsule teardown) collapses to `Closed`.
             None => Err(ErrorCode::Closed),
         };
         audit_net(self, "astrid:net/host.tcp-stream.write", bytes, &result);
@@ -214,17 +249,34 @@ impl HostTcpStream for HostState {
         let rt = self.runtime_handle.clone();
         let sem = self.blocking_semaphore.clone();
         let tok = self.effective_cancel_token();
+        // Same unbounded-write hazard as framed `write` (issue #1144): bound
+        // the whole call — lock acquisition included — so a non-draining peer
+        // yields `WouldBlock` within a deadline rather than pinning the host
+        // worker. The deadline subsumes the per-call timeout previously
+        // applied only inside `write_bytes_inner` (Tcp arm only, and only
+        // around the write, not the lock), so pass `None` there and let the
+        // outer bound own the duration for both transport arms.
+        let deadline = write_deadline(&stream, data.len());
         let result = util::bounded_block_on_cancellable(&rt, &sem, &tok, async {
-            match stream {
-                NetStream::Unix(arc) => {
-                    let mut s = arc.lock().await;
-                    write_bytes_inner(&mut *s, &data, None).await
-                },
-                NetStream::Tcp(slot) => {
-                    let timeout = slot.write_timeout;
-                    let mut s = slot.stream.lock().await;
-                    write_bytes_inner(&mut *s, &data, timeout).await
-                },
+            let write_fut = async {
+                match stream {
+                    NetStream::Unix(arc) => {
+                        let mut s = arc.lock().await;
+                        write_bytes_inner(&mut *s, &data, None).await
+                    },
+                    NetStream::Tcp(slot) => {
+                        let mut s = slot.stream.lock().await;
+                        write_bytes_inner(&mut *s, &data, None).await
+                    },
+                }
+            };
+            match tokio::time::timeout(deadline, write_fut).await {
+                Ok(res) => res,
+                // A byte-stream write that makes no progress before the
+                // deadline is a `WouldBlock` — matching the retry semantics
+                // `write_bytes_inner` already surfaces on its own timeout — so
+                // the capsule can back off rather than treat it as fatal.
+                Err(_elapsed) => Err("write would block".to_string()),
             }
         });
         let result = match result {
@@ -487,247 +539,5 @@ impl HostTcpStream for HostState {
 }
 
 #[cfg(test)]
-mod tests {
-    //! Regression tests for the PR #752 `write` fix.
-    //!
-    //! The legacy implementation silently swallowed peer-disconnect
-    //! errors as `Ok(())` on the theory "the capsule will see it on
-    //! the next read". Capsules using TcpStream for request/response
-    //! could not detect a half-closed connection. We now surface
-    //! `ConnectionReset` for any peer-disconnect IO kind and
-    //! `Unknown` for everything else.
-    use super::*;
-    use std::io;
-
-    #[test]
-    fn write_frame_err_brokenpipe_maps_to_connection_reset() {
-        let e = io::Error::new(io::ErrorKind::BrokenPipe, "peer gone");
-        assert!(matches!(
-            map_write_frame_err(&e),
-            ErrorCode::ConnectionReset
-        ));
-    }
-
-    #[test]
-    fn write_frame_err_connection_reset_maps_to_connection_reset() {
-        let e = io::Error::new(io::ErrorKind::ConnectionReset, "rst");
-        assert!(matches!(
-            map_write_frame_err(&e),
-            ErrorCode::ConnectionReset
-        ));
-    }
-
-    #[test]
-    fn write_frame_err_connection_aborted_maps_to_connection_reset() {
-        let e = io::Error::new(io::ErrorKind::ConnectionAborted, "abort");
-        assert!(matches!(
-            map_write_frame_err(&e),
-            ErrorCode::ConnectionReset
-        ));
-    }
-
-    #[test]
-    fn write_frame_err_unexpected_eof_maps_to_connection_reset() {
-        let e = io::Error::new(io::ErrorKind::UnexpectedEof, "eof");
-        assert!(matches!(
-            map_write_frame_err(&e),
-            ErrorCode::ConnectionReset
-        ));
-    }
-
-    #[test]
-    fn write_frame_err_other_maps_to_unknown() {
-        let e = io::Error::other("weird");
-        assert!(matches!(map_write_frame_err(&e), ErrorCode::Unknown(_)));
-    }
-
-    #[test]
-    fn write_frame_err_timed_out_maps_to_unknown() {
-        // Timeouts are NOT peer disconnect — capsule can retry.
-        let e = io::Error::new(io::ErrorKind::TimedOut, "slow");
-        assert!(matches!(map_write_frame_err(&e), ErrorCode::Unknown(_)));
-    }
-
-    /// ENFORCEMENT wiring for the per-connection principal registry
-    /// (issue #45/#852): a framed read off a kernel-bound connection must
-    /// record that connection's verified principal in
-    /// [`HostState::ingress_principal`], and a non-data read must clear it.
-    ///
-    /// This guards the link DIRECTLY rather than via a manually-set field: the
-    /// `publish-as` override in `host/ipc.rs` consumes `ingress_principal`, so
-    /// if this read never populated it the override would silently fall back to
-    /// the capsule-supplied (forgeable) name and the self-stamp hole would
-    /// reopen — with `publish-as`-level tests still green. A socketpair stands
-    /// in for an accepted client connection; it binds no filesystem path, so it
-    /// works under the sandbox (unlike a named Unix socket).
-    #[tokio::test(flavor = "multi_thread")]
-    async fn framed_read_records_then_clears_verified_ingress_principal() {
-        use tokio::io::AsyncWriteExt;
-
-        use crate::engine::wasm::host_state::NetStream;
-        use crate::engine::wasm::test_fixtures::minimal_host_state;
-
-        let rt = tokio::runtime::Handle::current();
-        let mut state = minimal_host_state(rt);
-        // Only the uplink records ingress principals (and only its accept path
-        // ever binds an entry).
-        state.has_uplink_capability = true;
-
-        let (host_end, mut peer) = tokio::net::UnixStream::pair().expect("socketpair");
-        let net = NetStream::Unix(std::sync::Arc::new(tokio::sync::Mutex::new(host_end)));
-        let rep = state.resource_table.push(net).expect("push stream").rep();
-
-        // The handshake bound this connection to `claude` (Path 2 crypto, or a
-        // Path 1 daemon spawn-binding), with the matched device key_id so the
-        // cap-gate can scope it.
-        let claude = astrid_core::PrincipalId::new("claude").unwrap();
-        state.bind_connection_principal(rep, claude.clone(), Some("dev-abc123".to_string()));
-
-        // Peer sends one length-prefixed frame (4-byte BE length + payload).
-        let payload = br#"{"topic":"client.v1.connect","payload":{}}"#;
-        peer.write_all(&(payload.len() as u32).to_be_bytes())
-            .await
-            .unwrap();
-        peer.write_all(payload).await.unwrap();
-        peer.flush().await.unwrap();
-
-        // A data read records the connection's verified principal AND the
-        // device key_id that authenticated it.
-        let status = HostTcpStream::read(&mut state, Resource::new_borrow(rep))
-            .expect("read should succeed");
-        assert!(
-            matches!(status, NetReadStatus::Data(_)),
-            "expected a data frame, got {status:?}"
-        );
-        assert_eq!(
-            state.ingress_principal,
-            Some(claude),
-            "a data read on a kernel-bound connection must record its verified principal"
-        );
-        assert_eq!(
-            state.ingress_device_key_id.as_deref(),
-            Some("dev-abc123"),
-            "a data read must record the connection's authenticating device key_id"
-        );
-        assert_eq!(
-            state.ingress_origin,
-            Some(astrid_events::ipc::MessageOrigin::LocalSocket),
-            "a data read on a kernel-BOUND connection must stamp LocalSocket origin"
-        );
-
-        // A subsequent non-data read (no more frames → pending) clears BOTH, so
-        // a stale principal or device id can never leak onto a later forward.
-        let status = HostTcpStream::read(&mut state, Resource::new_borrow(rep))
-            .expect("read should succeed");
-        assert!(
-            matches!(status, NetReadStatus::Pending),
-            "expected pending, got {status:?}"
-        );
-        assert_eq!(
-            state.ingress_principal, None,
-            "a non-data read must clear the in-flight ingress principal"
-        );
-        assert_eq!(
-            state.ingress_device_key_id, None,
-            "a non-data read must clear the in-flight ingress device key_id"
-        );
-        assert_eq!(
-            state.ingress_origin, None,
-            "a non-data read must clear the in-flight LocalSocket origin so a \
-             stale local origin can never leak onto a later forward"
-        );
-    }
-
-    /// A non-uplink capsule never records an ingress principal even when it
-    /// reads a (hypothetically) bound stream — the gate keeps the registry
-    /// lookup off every non-uplink framed read and prevents any cross-capsule
-    /// principal bleed through `ingress_principal`.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn framed_read_is_inert_without_uplink_capability() {
-        use tokio::io::AsyncWriteExt;
-
-        use crate::engine::wasm::host_state::NetStream;
-        use crate::engine::wasm::test_fixtures::minimal_host_state;
-
-        let rt = tokio::runtime::Handle::current();
-        let mut state = minimal_host_state(rt);
-        // No uplink capability — the default.
-        assert!(!state.has_uplink_capability);
-
-        let (host_end, mut peer) = tokio::net::UnixStream::pair().expect("socketpair");
-        let net = NetStream::Unix(std::sync::Arc::new(tokio::sync::Mutex::new(host_end)));
-        let rep = state.resource_table.push(net).expect("push stream").rep();
-        state.bind_connection_principal(
-            rep,
-            astrid_core::PrincipalId::new("claude").unwrap(),
-            Some("dev-abc123".to_string()),
-        );
-
-        let payload = br#"{"topic":"x","payload":{}}"#;
-        peer.write_all(&(payload.len() as u32).to_be_bytes())
-            .await
-            .unwrap();
-        peer.write_all(payload).await.unwrap();
-        peer.flush().await.unwrap();
-
-        let status = HostTcpStream::read(&mut state, Resource::new_borrow(rep))
-            .expect("read should succeed");
-        assert!(matches!(status, NetReadStatus::Data(_)));
-        assert_eq!(
-            state.ingress_principal, None,
-            "a non-uplink read must not populate the ingress principal"
-        );
-        assert_eq!(
-            state.ingress_device_key_id, None,
-            "a non-uplink read must not populate the ingress device key_id"
-        );
-        assert_eq!(
-            state.ingress_origin, None,
-            "a non-uplink read must not stamp a transport origin"
-        );
-    }
-
-    /// A framed read off an UNBOUND connection (no `ConnectionIdentity`) must
-    /// NOT earn `LocalSocket` — it stays `None` (= `System`, fail-closed,
-    /// non-local), parallel to the `anonymous` principal an unbound forward
-    /// earns. This is the security floor that stops a peer-cred-trusted-but-
-    /// unauthenticated local connection from claiming local-operator privilege.
-    #[tokio::test(flavor = "multi_thread")]
-    async fn framed_read_unbound_connection_does_not_earn_local_origin() {
-        use tokio::io::AsyncWriteExt;
-
-        use crate::engine::wasm::host_state::NetStream;
-        use crate::engine::wasm::test_fixtures::minimal_host_state;
-
-        let rt = tokio::runtime::Handle::current();
-        let mut state = minimal_host_state(rt);
-        // Uplink capability is set (so the registry lookup runs), but the
-        // connection is never bound — no `bind_connection_principal` call.
-        state.has_uplink_capability = true;
-
-        let (host_end, mut peer) = tokio::net::UnixStream::pair().expect("socketpair");
-        let net = NetStream::Unix(std::sync::Arc::new(tokio::sync::Mutex::new(host_end)));
-        let rep = state.resource_table.push(net).expect("push stream").rep();
-        // Deliberately NO bind: this is an unbound (unauthenticated) connection.
-
-        let payload = br#"{"topic":"x","payload":{}}"#;
-        peer.write_all(&(payload.len() as u32).to_be_bytes())
-            .await
-            .unwrap();
-        peer.write_all(payload).await.unwrap();
-        peer.flush().await.unwrap();
-
-        let status = HostTcpStream::read(&mut state, Resource::new_borrow(rep))
-            .expect("read should succeed");
-        assert!(matches!(status, NetReadStatus::Data(_)));
-        assert_eq!(
-            state.ingress_principal, None,
-            "an unbound connection stamps no verified principal"
-        );
-        assert_eq!(
-            state.ingress_origin, None,
-            "an unbound connection must NOT earn LocalSocket — it stays System \
-             (fail-closed, non-local)"
-        );
-    }
-}
+#[path = "tcp_stream_tests.rs"]
+mod tests;
