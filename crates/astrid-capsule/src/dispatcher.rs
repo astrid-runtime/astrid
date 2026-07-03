@@ -191,9 +191,9 @@ impl EventDispatcher {
     /// IPC events when messages are dropped, rate-limited to at most once per
     /// 10 seconds to avoid feedback loops.
     pub async fn run(mut self) {
-        let mut last_lag_notification = std::time::Instant::now()
+        let mut last_lag_notification = astrid_runtime::time::Instant::now()
             .checked_sub(std::time::Duration::from_secs(10))
-            .unwrap_or_else(std::time::Instant::now);
+            .unwrap_or_else(astrid_runtime::time::Instant::now);
         // Per-(capsule, principal) ordered queue. Per-principal keying
         // means the dispatcher's worst case at N distinct principals
         // is N independent FIFO consumers, not a single class-keyed
@@ -217,7 +217,7 @@ impl EventDispatcher {
                     lagged_count = lagged,
                     "Event bus broadcast channel lagged - {lagged} messages dropped"
                 );
-                last_lag_notification = std::time::Instant::now();
+                last_lag_notification = astrid_runtime::time::Instant::now();
 
                 // Publish a lag notification so capsules can react.
                 // Note: This notification is published onto the same bus that just
@@ -425,7 +425,7 @@ fn dispatch_to_capsule_queues(
     let topic_clone = Arc::clone(&topic);
     let ipc_clone = ipc_message.clone();
     let chain_locks_clone = Arc::clone(chain_locks);
-    tokio::task::spawn(async move {
+    astrid_runtime::spawn(async move {
         let mut current_payload = (*payload_bytes).clone();
 
         for (capsule, action) in &matches_owned {
@@ -586,7 +586,7 @@ fn get_or_spawn_consumer(
     let capsule_arc = Arc::clone(capsule);
     let queues_arc = Arc::clone(queues);
     let cleanup_key = effective_key.clone();
-    tokio::task::spawn(async move {
+    astrid_runtime::spawn(async move {
         run_consumer(rx, capsule_arc, queues_arc, cleanup_key).await;
     });
     tx
@@ -604,7 +604,7 @@ async fn run_consumer(
     key: (CapsuleId, PrincipalKey),
 ) {
     loop {
-        match tokio::time::timeout(idle_consumer_grace(), rx.recv()).await {
+        match astrid_runtime::time::timeout(idle_consumer_grace(), rx.recv()).await {
             Ok(Some(work)) => {
                 debug!(
                     capsule_id = %capsule.id(),

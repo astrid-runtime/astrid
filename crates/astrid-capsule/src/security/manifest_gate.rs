@@ -173,7 +173,7 @@ impl CapsuleSecurityGate for ManifestSecurityGate {
         _method: &str,
         url: &str,
     ) -> Result<(), String> {
-        let parsed_url = reqwest::Url::parse(url).map_err(|e| format!("Invalid URL: {e}"))?;
+        let parsed_url = url::Url::parse(url).map_err(|e| format!("Invalid URL: {e}"))?;
         let host_str = parsed_url.host_str().unwrap_or("");
 
         if self

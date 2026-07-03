@@ -2527,7 +2527,7 @@ pub struct LifecycleConfig {
     /// here; the standalone install CLI leaves it `None` (no audit log in
     /// scope). When `None`, sensitive lifecycle host calls still emit the
     /// observability `tracing` lines but land no chain entry.
-    pub audit_sink: Option<std::sync::Arc<dyn host::audit_sink::HostAuditSink>>,
+    pub audit_sink: Option<std::sync::Arc<dyn crate::audit_sink::HostAuditSink>>,
 }
 
 /// Run a capsule's lifecycle hook (install or upgrade).

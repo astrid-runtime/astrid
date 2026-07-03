@@ -5,14 +5,21 @@
 //! an additive "Composite" architecture. The capsule iterates over its
 //! registered engines to handle lifecycle events.
 
+// The MCP host engine spawns OS processes via `astrid-mcp`; native-only.
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 pub mod mcp;
-#[cfg(test)]
+#[cfg(all(test, not(all(target_arch = "wasm32", target_os = "unknown"))))]
 mod mcp_tests;
 mod static_engine;
+// The Wasmtime execution engine and its host functions are native-only; an
+// alternate host supplies its own `ExecutionEngine` behind the same trait.
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 pub mod wasm;
 
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 pub(crate) use mcp::McpHostEngine;
 pub(crate) use static_engine::StaticEngine;
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 pub(crate) use wasm::WasmEngine;
 
 use std::collections::HashMap;
