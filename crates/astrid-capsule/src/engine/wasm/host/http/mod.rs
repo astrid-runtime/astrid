@@ -21,10 +21,10 @@
 
 mod backend;
 mod options;
-// `pub(crate)` so the redirect-default const (`ssrf::MAX_HTTP_REDIRECTS`) can be
-// the single source of truth read by `HttpLimits::default`. The module's items
-// stay `pub(super)`; only the path is reachable crate-internally.
-pub(crate) mod ssrf;
+// The SSRF host airlock. Private: every consumer is an `http` descendant that
+// reaches it via `super::ssrf`. (The redirect-default const it once exposed to
+// `HttpLimits::default` now lives with `HttpLimits` in `astrid-capsule-types`.)
+mod ssrf;
 #[cfg(feature = "fuzzing")]
 pub mod fuzzing {
     //! Fuzz-only accessors for pure HTTP host security predicates.

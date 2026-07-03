@@ -42,17 +42,6 @@ pub const AGENT_PROMPT_TOPIC: &str = "user.v1.prompt";
 /// publishes a pattern matching this topic can produce a final response.
 pub const AGENT_RESPONSE_TOPIC: &str = "agent.v1.response";
 
-/// Reflexive `AsRef` so the readiness functions' `M: AsRef<CapsuleManifest>`
-/// bound accepts both owned slices (`&[CapsuleManifest]`, used by tests) and
-/// borrowed slices (`&[&CapsuleManifest]`, used by the kernel handler and the
-/// boot path that read the live registry) — without cloning every manifest on
-/// each prompt probe or boot check.
-impl AsRef<CapsuleManifest> for CapsuleManifest {
-    fn as_ref(&self) -> &CapsuleManifest {
-        self
-    }
-}
-
 /// True if `manifest`'s `[subscribe]` patterns match `topic`.
 ///
 /// The short-circuiting, allocation-free predicate behind

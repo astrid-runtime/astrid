@@ -94,6 +94,17 @@ pub struct CapsuleManifest {
     pub uplinks: Vec<UplinkDef>,
 }
 
+/// Reflexive `AsRef` so the readiness functions' `M: AsRef<CapsuleManifest>`
+/// bound accepts both owned slices (`&[CapsuleManifest]`, used by tests) and
+/// borrowed slices (`&[&CapsuleManifest]`, used by the kernel handler and the
+/// boot path that read the live registry) — without cloning every manifest on
+/// each prompt probe or boot check.
+impl AsRef<CapsuleManifest> for CapsuleManifest {
+    fn as_ref(&self) -> &CapsuleManifest {
+        self
+    }
+}
+
 impl CapsuleManifest {
     /// Returns `true` if this capsule declares any imports.
     #[must_use]
@@ -576,8 +587,8 @@ pub struct CommandDef {
     /// provider-targeted-topic security rationale, and the fact that the
     /// kernel does not interpret the payloads) see [`CommandKind`].
     ///
-    /// `kind = "cli"` names are validated at manifest parse time (see
-    /// [`load_manifest`](crate::discovery::load_manifest)): they must
+    /// `kind = "cli"` names are validated at manifest parse time (by the
+    /// capsule discovery loader): they must
     /// match `[a-z][a-z0-9-]*`, be 1-32 chars, and must not collide with a
     /// built-in `astrid capsule` subcommand
     /// ([`RESERVED_CAPSULE_VERBS`]). Slash commands are not subject to this

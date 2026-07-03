@@ -16,6 +16,7 @@ fuzzing = []
 [dependencies]
 astrid-approval = { workspace = true }
 astrid-capabilities = { workspace = true }
+astrid-capsule-types = { workspace = true }
 astrid-core = { workspace = true }
 astrid-crypto = { workspace = true }
 astrid-events = { workspace = true }

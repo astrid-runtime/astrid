@@ -13,11 +13,15 @@ pub mod context;
 pub mod discovery;
 pub mod dispatcher;
 pub mod engine;
-pub mod error;
-pub mod fuel_ledger;
 pub mod loader;
-pub mod manifest;
 pub mod memory_ledger;
+
+// Engine-agnostic capsule types live in `astrid-capsule-types` so the browser
+// WebAssembly host can share them without pulling Wasmtime. Re-exported here at
+// their original paths so kernel and every other consumer compile unchanged.
+pub use astrid_capsule_types::error;
+pub use astrid_capsule_types::fuel_ledger;
+pub use astrid_capsule_types::manifest;
 pub mod principal_class;
 pub mod profile_cache;
 pub mod readiness;
