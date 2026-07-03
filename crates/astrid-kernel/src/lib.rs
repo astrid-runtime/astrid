@@ -31,9 +31,9 @@ pub mod socket;
 use arc_swap::ArcSwap;
 use astrid_audit::AuditLog;
 use astrid_capabilities::{CapabilityStore, DirHandle};
-use astrid_capsule::capsule::CapsuleId;
 use astrid_capsule::profile_cache::PrincipalProfileCache;
 use astrid_capsule::registry::CapsuleRegistry;
+use astrid_capsule_types::CapsuleId;
 use astrid_core::SessionId;
 use astrid_core::groups::GroupConfig;
 use astrid_core::principal::PrincipalId;
@@ -124,26 +124,26 @@ pub struct Kernel {
     /// `WasmEngine` (via the loader) so a principal's interceptor CPU is summed
     /// across all capsules into one per-principal total. Telemetry today; the
     /// substrate for a per-principal CPU budget. See
-    /// [`FuelLedger`](astrid_capsule::FuelLedger).
-    fuel_ledger: astrid_capsule::FuelLedger,
+    /// [`FuelLedger`](astrid_capsule_types::FuelLedger).
+    fuel_ledger: astrid_capsule_types::FuelLedger,
     /// Shared per-principal CPU-rate limiter (the deny side of the budget),
     /// cloned into every capsule's `WasmEngine` (via the loader) alongside
     /// `fuel_ledger`. A principal over its `max_cpu_fuel_per_sec` in the rolling
     /// 1-second window is denied at interceptor entry, cross-capsule. See
-    /// [`FuelRateLimiter`](astrid_capsule::FuelRateLimiter).
-    fuel_rate: astrid_capsule::FuelRateLimiter,
+    /// [`FuelRateLimiter`](astrid_capsule_types::FuelRateLimiter).
+    fuel_rate: astrid_capsule_types::FuelRateLimiter,
     /// Shared per-principal peak-memory ledger, the RAM analogue of
     /// `fuel_ledger`: cloned into every capsule's `WasmEngine` (via the loader)
     /// so a principal's linear-memory high-water mark is the max across all
     /// capsules. Telemetry today; fills `ResourceUsage::memory_bytes_peak_total`.
-    /// See [`MemoryLedger`](astrid_capsule::MemoryLedger).
-    memory_ledger: astrid_capsule::MemoryLedger,
+    /// See [`MemoryLedger`](astrid_capsule_types::MemoryLedger).
+    memory_ledger: astrid_capsule_types::MemoryLedger,
     /// Host-derived (operator-overridable) concurrency ceilings for capsule
     /// host calls, resolved once by the daemon and forwarded to every
     /// `WasmEngine` via the loader. The kernel only stores and forwards this
     /// `Copy` value — no resolution logic lives here. See
-    /// [`CapsuleRuntimeLimits`](astrid_capsule::CapsuleRuntimeLimits).
-    runtime_limits: astrid_capsule::CapsuleRuntimeLimits,
+    /// [`CapsuleRuntimeLimits`](astrid_capsule_types::CapsuleRuntimeLimits).
+    runtime_limits: astrid_capsule_types::CapsuleRuntimeLimits,
     /// Operator-approved per-capsule local-egress allowlist
     /// (`[security.capsule_local_egress]`), keyed by capsule id. Resolved
     /// once from config by the daemon; the kernel only stores it and hands
@@ -156,8 +156,8 @@ pub struct Kernel {
     /// the same for every capsule (unlike `local_egress`). Resolved once from
     /// config by the daemon; the kernel only stores it and forwards it,
     /// unmodified, to every capsule's `WasmEngine` via the loader. See
-    /// [`HttpLimits`](astrid_capsule::HttpLimits).
-    http_limits: astrid_capsule::HttpLimits,
+    /// [`HttpLimits`](astrid_capsule_types::HttpLimits).
+    http_limits: astrid_capsule_types::HttpLimits,
     /// Coalesces full capsule reload requests so the router cannot spawn
     /// overlapping all-principal discovery/load sweeps.
     full_reload_in_flight: AtomicBool,
@@ -225,6 +225,73 @@ pub struct Kernel {
     pub(crate) admin_write_lock: Mutex<()>,
 }
 
+/// Host resources injected into [`Kernel::with_resources`].
+///
+/// Every field here is a facility whose acquisition is platform-specific — the
+/// products of the native side-effects that [`Kernel::new`] performs (resolving
+/// the Astrid home, opening the KV/audit stores, loading the runtime key,
+/// binding the singleton Unix socket, generating the session token). Bundling
+/// them into one value inverts resource acquisition out of the constructor: a
+/// native host calls [`Kernel::new`] (which builds this and delegates), while an
+/// alternate host (e.g. a browser WebAssembly build) can supply its own
+/// resources and call [`Kernel::with_resources`] directly.
+pub struct KernelResources {
+    /// Resolved Astrid home (FHS layout). Source of the KV/audit/key paths,
+    /// the `home://` VFS scheme root, and group/profile config locations.
+    pub home: astrid_core::dirs::AstridHome,
+    /// Persistent KV store backing the capability store, identity store, and
+    /// kernel state. Concrete `SurrealKvStore` (not a trait object) because the
+    /// kernel's shutdown flush calls its inherent [`close`](astrid_storage::SurrealKvStore::close).
+    pub kv: Arc<astrid_storage::SurrealKvStore>,
+    /// Chain-linked cryptographic audit log, opened over the runtime key.
+    pub audit_log: Arc<AuditLog>,
+    /// The runtime ed25519 signing key (issue #929) — shared with `audit_log`
+    /// and the admin token-mint path; never loaded from disk twice.
+    pub runtime_key: Arc<astrid_crypto::KeyPair>,
+    /// Session token for socket authentication, generated at boot and written
+    /// to `~/.astrid/run/system.token`. The CLI presents it as its first message.
+    pub session_token: Arc<astrid_core::session_token::SessionToken>,
+    /// Path the session token was written to, retained so shutdown reuses the
+    /// exact same path (avoids a fallback mismatch if the environment changes).
+    pub token_path: PathBuf,
+    /// The natively bound Unix listener for the CLI uplink, or `None` for hosts
+    /// (and test kernels) that do not service a real socket.
+    pub cli_socket_listener: Option<Arc<tokio::sync::Mutex<tokio::net::UnixListener>>>,
+    /// Exclusive advisory lock enforcing a single kernel instance, held for the
+    /// process lifetime; its `Drop` releases the lock. Independent of
+    /// `cli_socket_listener` — the kernel never reads either field, so a host
+    /// supplies whichever facilities it actually has (the native daemon: both;
+    /// test kernels and hosts with no real socket: neither).
+    pub singleton_lock: Option<std::fs::File>,
+}
+
+impl KernelResources {
+    /// Bundle already-acquired host resources for [`Kernel::with_resources`].
+    #[must_use]
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        home: astrid_core::dirs::AstridHome,
+        kv: Arc<astrid_storage::SurrealKvStore>,
+        audit_log: Arc<AuditLog>,
+        runtime_key: Arc<astrid_crypto::KeyPair>,
+        session_token: Arc<astrid_core::session_token::SessionToken>,
+        token_path: PathBuf,
+        cli_socket_listener: Option<Arc<tokio::sync::Mutex<tokio::net::UnixListener>>>,
+        singleton_lock: Option<std::fs::File>,
+    ) -> Self {
+        Self {
+            home,
+            kv,
+            audit_log,
+            runtime_key,
+            session_token,
+            token_path,
+            cli_socket_listener,
+            singleton_lock,
+        }
+    }
+}
+
 impl Kernel {
     /// Boot a new Kernel instance mounted at the specified directory.
     ///
@@ -232,12 +299,12 @@ impl Kernel {
     /// pair (blocking vs async-I/O host calls); the daemon resolves it from
     /// config + CLI + host defaults and the kernel forwards it, unmodified, to
     /// every capsule's `WasmEngine`. In tests, pass
-    /// [`CapsuleRuntimeLimits::default()`](astrid_capsule::CapsuleRuntimeLimits::default).
+    /// [`CapsuleRuntimeLimits::default()`](astrid_capsule_types::CapsuleRuntimeLimits::default).
     ///
     /// `http_limits` is the resolved `astrid:http` host ceilings (a global
     /// value, the same for every capsule), likewise resolved by the daemon from
     /// the `[http]` config section and forwarded unmodified. In tests, pass
-    /// [`HttpLimits::default()`](astrid_capsule::HttpLimits::default).
+    /// [`HttpLimits::default()`](astrid_capsule_types::HttpLimits::default).
     ///
     /// # Panics
     ///
@@ -246,29 +313,19 @@ impl Kernel {
     ///
     /// # Errors
     ///
-    /// Returns an error if the VFS mount paths cannot be registered.
-    #[expect(
-        clippy::too_many_lines,
-        reason = "boot sequence: sequential setup that does not benefit from splitting"
-    )]
+    /// Returns an error if any native resource cannot be acquired — the Astrid
+    /// home cannot be resolved, the KV store, runtime key, or audit log cannot
+    /// be opened, the Unix socket cannot be bound (or the singleton lock is
+    /// already held), or the session token cannot be generated — or if the
+    /// portable wiring in [`Kernel::with_resources`] fails.
     pub async fn new(
         session_id: SessionId,
         workspace_root: PathBuf,
-        runtime_limits: astrid_capsule::CapsuleRuntimeLimits,
+        runtime_limits: astrid_capsule_types::CapsuleRuntimeLimits,
         local_egress: std::collections::HashMap<String, Vec<String>>,
-        http_limits: astrid_capsule::HttpLimits,
+        http_limits: astrid_capsule_types::HttpLimits,
     ) -> Result<Arc<Self>, std::io::Error> {
         use astrid_core::dirs::AstridHome;
-
-        assert!(
-            tokio::runtime::Handle::current().runtime_flavor()
-                == tokio::runtime::RuntimeFlavor::MultiThread,
-            "Kernel requires a multi-threaded tokio runtime (block_in_place panics on \
-             single-threaded). Use #[tokio::main] or Runtime::new() instead of current_thread."
-        );
-
-        let event_bus = Arc::new(EventBus::new());
-        let capsules = Arc::new(RwLock::new(CapsuleRegistry::new()));
 
         // Resolve the Astrid home directory. Required for persistent KV store
         // and audit log. Fails boot if neither $ASTRID_HOME nor $HOME is set.
@@ -278,14 +335,7 @@ impl Kernel {
             ))
         })?;
 
-        // Resolve the home directory for the `home://` VFS scheme.
-        // Points to `~/.astrid/home/{principal}/` — NOT the full `~/.astrid/`
-        // root — so capsules cannot access keys, databases, or config.
-        let default_principal = astrid_core::PrincipalId::default();
-        let principal_home = home.principal_home(&default_principal);
-        let home_root = Some(principal_home.root().to_path_buf());
-
-        // 1. Open the persistent KV store (needed by capability store below).
+        // Open the persistent KV store (needed by the capability store).
         let kv_path = home.state_db_path();
         let kv = Arc::new(
             astrid_storage::SurrealKvStore::open(&kv_path)
@@ -294,60 +344,20 @@ impl Kernel {
         // TODO: clear ephemeral keys (e: prefix) on boot when the key
         // lifecycle tier convention is established.
 
-        // 2. Initialize MCP process manager with security layer.
-        //    Set workspace_root so sandboxed MCP servers have a writable directory.
-        let mcp_config = ServersConfig::load_default().unwrap_or_default();
-        let mcp_manager = ServerManager::new(mcp_config)
-            .with_workspace_root(workspace_root.clone())
-            .with_capsule_log_dir(principal_home.log_dir());
-        let mcp_client = McpClient::new(mcp_manager);
-
-        // 3. Bootstrap capability store (persistent) and audit log.
-        //    Key rotation invalidates persisted tokens (fail-secure by design).
-        let capabilities = Arc::new(
-            CapabilityStore::with_kv_store(Arc::clone(&kv) as Arc<dyn astrid_storage::KvStore>)
-                .map_err(|e| {
-                    std::io::Error::other(format!("Failed to init capability store: {e}"))
-                })?,
-        );
-        // Load the runtime signing key ONCE and share it (issue #929):
-        // the audit log signs chain entries with it, and the admin
-        // token-mint path signs capability tokens with the same key. Never
-        // load it from disk twice — a second load would still yield the same
-        // persisted bytes, but routing one `Arc` makes the single-source-of-
-        // truth explicit and lets `kernel.runtime_key` mint tokens the
-        // approval interceptor's validator trusts as issuer.
+        // Load the runtime signing key ONCE and share it (issue #929): the
+        // audit log signs chain entries with it, and the admin token-mint path
+        // signs capability tokens with the same key. Never load it from disk
+        // twice — a second load would still yield the same persisted bytes, but
+        // routing one `Arc` makes the single-source-of-truth explicit and lets
+        // `kernel.runtime_key` mint tokens the approval interceptor's validator
+        // trusts as issuer.
         let runtime_key = Arc::new(load_or_generate_runtime_key(&home.keys_dir())?);
-        let audit_log = open_audit_log(Arc::clone(&runtime_key))?;
-        let mcp = SecureMcpClient::new(
-            mcp_client,
-            Arc::clone(&capabilities),
-            Arc::clone(&audit_log),
-            session_id.clone(),
-        );
+        let audit_log = open_audit_log(&home, Arc::clone(&runtime_key))?;
 
-        // 4. Establish the physical security boundary (sandbox handle)
-        let root_handle = DirHandle::new();
-
-        // 5. Principal-scoped overlay registry: each invoking principal
-        //    gets a fresh OverlayVfs on first use (Layer 4, issue #668).
-        //    The kernel-internal `vfs` field keeps pointing at a plain
-        //    HostVfs over the workspace for paths that don't yet know a
-        //    principal (discovery, capsule load scan).
-        let kernel_host_vfs = HostVfs::new();
-        kernel_host_vfs
-            .register_dir(root_handle.clone(), workspace_root.clone())
-            .await
-            .map_err(|_| std::io::Error::other("Failed to register kernel workspace vfs"))?;
-        let overlay_registry = Arc::new(OverlayVfsRegistry::new(
-            workspace_root.clone(),
-            root_handle.clone(),
-        ));
-
-        // 6. Bind the secure Unix socket and generate session token.
-        // The socket is bound here, but not yet listened on. The token is
-        // generated before any capsule can accept connections, preventing
-        // a race where a client connects before the token file exists.
+        // Bind the secure Unix socket and generate the session token. The
+        // socket is bound here, but not yet listened on. The token is generated
+        // before any capsule can accept connections, preventing a race where a
+        // client connects before the token file exists.
         let (listener, singleton_lock) = socket::bind_session_socket(&home)?;
         // Record our PID immediately after acquiring the singleton lock, so the
         // PID on disk always belongs to the process that holds the state-db
@@ -359,6 +369,143 @@ impl Kernel {
             tracing::warn!(error = %e, "Failed to write daemon PID file; stop/restart will fall back to socket-only cleanup");
         }
         let (session_token, token_path) = socket::generate_session_token()?;
+
+        let resources = KernelResources::new(
+            home,
+            kv,
+            audit_log,
+            runtime_key,
+            Arc::new(session_token),
+            token_path,
+            Some(Arc::new(tokio::sync::Mutex::new(listener))),
+            Some(singleton_lock),
+        );
+
+        Self::with_resources(
+            session_id,
+            workspace_root,
+            runtime_limits,
+            local_egress,
+            http_limits,
+            resources,
+        )
+        .await
+    }
+
+    /// Construct a Kernel from already-acquired host resources.
+    ///
+    /// This is the **portable composition root**: it performs the entire
+    /// kernel wiring (event bus, registries, capability store, VFS/overlay,
+    /// identity/group config, monitors, dispatcher) but performs **no native
+    /// side-effects** — every platform-specific facility is injected via
+    /// [`KernelResources`]. [`Kernel::new`] is the native composition root that
+    /// acquires those resources (resolving the home, opening the KV/audit
+    /// stores, loading the runtime key, binding the socket, generating the
+    /// token) and delegates here. An alternate host can build its own
+    /// [`KernelResources`] and call this directly.
+    ///
+    /// `runtime_limits` is the resolved per-host capsule concurrency ceiling
+    /// pair (blocking vs async-I/O host calls); the daemon resolves it from
+    /// config + CLI + host defaults and the kernel forwards it, unmodified, to
+    /// every capsule's `WasmEngine`. In tests, pass
+    /// [`CapsuleRuntimeLimits::default()`](astrid_capsule_types::CapsuleRuntimeLimits::default).
+    ///
+    /// `http_limits` is the resolved `astrid:http` host ceilings (a global
+    /// value, the same for every capsule), likewise resolved by the daemon from
+    /// the `[http]` config section and forwarded unmodified. In tests, pass
+    /// [`HttpLimits::default()`](astrid_capsule_types::HttpLimits::default).
+    ///
+    /// # Panics
+    ///
+    /// Panics if called on a single-threaded tokio runtime. The capsule
+    /// system uses `block_in_place` which requires a multi-threaded runtime.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any portable wiring step fails: the VFS mount paths
+    /// cannot be registered, the capability store cannot be initialized over
+    /// the injected KV, the group configuration cannot be loaded, or the CLI
+    /// root identity cannot be bootstrapped.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "boot sequence: sequential setup that does not benefit from splitting"
+    )]
+    pub async fn with_resources(
+        session_id: SessionId,
+        workspace_root: PathBuf,
+        runtime_limits: astrid_capsule_types::CapsuleRuntimeLimits,
+        local_egress: std::collections::HashMap<String, Vec<String>>,
+        http_limits: astrid_capsule_types::HttpLimits,
+        resources: KernelResources,
+    ) -> Result<Arc<Self>, std::io::Error> {
+        assert!(
+            tokio::runtime::Handle::current().runtime_flavor()
+                == tokio::runtime::RuntimeFlavor::MultiThread,
+            "Kernel requires a multi-threaded tokio runtime (block_in_place panics on \
+             single-threaded). Use #[tokio::main] or Runtime::new() instead of current_thread."
+        );
+
+        let KernelResources {
+            home,
+            kv,
+            audit_log,
+            runtime_key,
+            session_token,
+            token_path,
+            cli_socket_listener,
+            singleton_lock,
+        } = resources;
+
+        let event_bus = Arc::new(EventBus::new());
+        let capsules = Arc::new(RwLock::new(CapsuleRegistry::new()));
+
+        // Resolve the home directory for the `home://` VFS scheme.
+        // Points to `~/.astrid/home/{principal}/` — NOT the full `~/.astrid/`
+        // root — so capsules cannot access keys, databases, or config.
+        let default_principal = astrid_core::PrincipalId::default();
+        let principal_home = home.principal_home(&default_principal);
+        let home_root = Some(principal_home.root().to_path_buf());
+
+        // Initialize MCP process manager with security layer.
+        // Set workspace_root so sandboxed MCP servers have a writable directory.
+        let mcp_config = ServersConfig::load_default().unwrap_or_default();
+        let mcp_manager = ServerManager::new(mcp_config)
+            .with_workspace_root(workspace_root.clone())
+            .with_capsule_log_dir(principal_home.log_dir());
+        let mcp_client = McpClient::new(mcp_manager);
+
+        // Bootstrap the capability store (persistent) over the injected KV.
+        // Key rotation invalidates persisted tokens (fail-secure by design).
+        let capabilities = Arc::new(
+            CapabilityStore::with_kv_store(Arc::clone(&kv) as Arc<dyn astrid_storage::KvStore>)
+                .map_err(|e| {
+                    std::io::Error::other(format!("Failed to init capability store: {e}"))
+                })?,
+        );
+        let mcp = SecureMcpClient::new(
+            mcp_client,
+            Arc::clone(&capabilities),
+            Arc::clone(&audit_log),
+            session_id.clone(),
+        );
+
+        // Establish the physical security boundary (sandbox handle)
+        let root_handle = DirHandle::new();
+
+        // Principal-scoped overlay registry: each invoking principal
+        // gets a fresh OverlayVfs on first use (Layer 4, issue #668).
+        // The kernel-internal `vfs` field keeps pointing at a plain
+        // HostVfs over the workspace for paths that don't yet know a
+        // principal (discovery, capsule load scan).
+        let kernel_host_vfs = HostVfs::new();
+        kernel_host_vfs
+            .register_dir(root_handle.clone(), workspace_root.clone())
+            .await
+            .map_err(|_| std::io::Error::other("Failed to register kernel workspace vfs"))?;
+        let overlay_registry = Arc::new(OverlayVfsRegistry::new(
+            workspace_root.clone(),
+            root_handle.clone(),
+        ));
 
         let allowance_store = Arc::new(astrid_approval::AllowanceStore::new());
         // Create system-wide identity store backed by the shared KV.
@@ -401,15 +548,15 @@ impl Kernel {
             vfs_root_handle: root_handle,
             workspace_root,
             home_root,
-            cli_socket_listener: Some(Arc::new(tokio::sync::Mutex::new(listener))),
-            singleton_lock: Some(singleton_lock),
+            cli_socket_listener,
+            singleton_lock,
             kv,
             audit_log,
             runtime_key,
             active_connections: DashMap::new(),
-            fuel_ledger: astrid_capsule::FuelLedger::default(),
-            fuel_rate: astrid_capsule::FuelRateLimiter::default(),
-            memory_ledger: astrid_capsule::MemoryLedger::default(),
+            fuel_ledger: astrid_capsule_types::FuelLedger::default(),
+            fuel_rate: astrid_capsule_types::FuelRateLimiter::default(),
+            memory_ledger: astrid_capsule_types::MemoryLedger::default(),
             runtime_limits,
             local_egress,
             http_limits,
@@ -418,7 +565,7 @@ impl Kernel {
             ephemeral: AtomicBool::new(false),
             boot_time: std::time::Instant::now(),
             shutdown_tx: tokio::sync::watch::channel(false).0,
-            session_token: Arc::new(session_token),
+            session_token,
             token_path,
             allowance_store,
             identity_store,
@@ -486,7 +633,7 @@ impl Kernel {
         let manifest_path = dir.join("Capsule.toml");
         let manifest = astrid_capsule::discovery::load_manifest(&manifest_path)
             .map_err(|e| anyhow::anyhow!(e))?;
-        let id = astrid_capsule::capsule::CapsuleId::from_static(&manifest.package.name);
+        let id = astrid_capsule_types::CapsuleId::from_static(&manifest.package.name);
         let wasm_hash = capsule_instance_hash(&manifest, &dir);
 
         // Dedup by content hash (issue #1069). Runtime instances are shared by
@@ -595,7 +742,7 @@ impl Kernel {
     /// built, or `capsule.load` fails.
     async fn build_shared_capsule(
         &self,
-        manifest: astrid_capsule::manifest::CapsuleManifest,
+        manifest: astrid_capsule_types::manifest::CapsuleManifest,
         dir: &std::path::Path,
     ) -> Result<Box<dyn astrid_capsule::capsule::Capsule>, anyhow::Error> {
         let load_principal = PrincipalId::default();
@@ -701,7 +848,7 @@ impl Kernel {
     /// unregistered, or fails to reload.
     async fn restart_capsule(
         &self,
-        id: &astrid_capsule::capsule::CapsuleId,
+        id: &astrid_capsule_types::CapsuleId,
         principal: &PrincipalId,
     ) -> Result<(), anyhow::Error> {
         // Capture the failed runtime's own source directory AND every principal
@@ -747,7 +894,7 @@ impl Kernel {
                             torn_down_runtime = Some(removed.capsule);
                         }
                     },
-                    Err(astrid_capsule::error::CapsuleError::NotFound(_)) => {
+                    Err(astrid_capsule_types::error::CapsuleError::NotFound(_)) => {
                         // A concurrent unload already released this view; fine.
                     },
                     Err(e) => {
@@ -895,7 +1042,7 @@ impl Kernel {
         // name-agnostic introspection turns that into one actionable warning.
         {
             let reg = self.capsules.read().await;
-            let loaded: Vec<&astrid_capsule::manifest::CapsuleManifest> = reg
+            let loaded: Vec<&astrid_capsule_types::manifest::CapsuleManifest> = reg
                 .values()
                 .map(astrid_capsule::capsule::Capsule::manifest)
                 .collect();
@@ -973,7 +1120,7 @@ impl Kernel {
     fn sorted_principal_capsules(
         &self,
         principal: &PrincipalId,
-    ) -> Vec<(astrid_capsule::manifest::CapsuleManifest, PathBuf)> {
+    ) -> Vec<(astrid_capsule_types::manifest::CapsuleManifest, PathBuf)> {
         use astrid_capsule::toposort::toposort_manifests;
 
         let paths = capsule_discovery_paths_for(&self.astrid_home, &self.workspace_root, principal);
@@ -1025,7 +1172,7 @@ impl Kernel {
             let registry = Arc::clone(&registry);
             Box::pin(async move {
                 let reg = registry.read().await;
-                let manifests: Vec<&astrid_capsule::manifest::CapsuleManifest> = reg
+                let manifests: Vec<&astrid_capsule_types::manifest::CapsuleManifest> = reg
                     .values()
                     .map(astrid_capsule::capsule::Capsule::manifest)
                     .collect();
@@ -1257,7 +1404,7 @@ impl Kernel {
     /// refreshes. Backs [`astrid_core::kernel_api::KernelRequest::ReloadCapsule`].
     pub(crate) async fn reload_one_capsule(
         &self,
-        id: &astrid_capsule::capsule::CapsuleId,
+        id: &astrid_capsule_types::CapsuleId,
         principal: &PrincipalId,
     ) -> Result<(), anyhow::Error> {
         let registered = { self.capsules.read().await.get_for(principal, id).is_some() };
@@ -1297,7 +1444,7 @@ impl Kernel {
     /// reported as present.
     pub(crate) async fn unload_one_capsule(
         &self,
-        id: &astrid_capsule::capsule::CapsuleId,
+        id: &astrid_capsule_types::CapsuleId,
         principal: &PrincipalId,
     ) -> Result<bool, anyhow::Error> {
         // Unregister only this principal's view. The runtime is shared by
@@ -1309,7 +1456,7 @@ impl Kernel {
             let mut registry = self.capsules.write().await;
             match registry.unregister_for(principal, id) {
                 Ok(removed) => removed,
-                Err(astrid_capsule::error::CapsuleError::NotFound(_)) => return Ok(false),
+                Err(astrid_capsule_types::error::CapsuleError::NotFound(_)) => return Ok(false),
                 Err(e) => {
                     return Err(anyhow::anyhow!("failed to unregister capsule '{id}': {e}"));
                 },
@@ -1599,7 +1746,7 @@ impl Kernel {
             names
                 .iter()
                 .filter_map(
-                    |name| match astrid_capsule::capsule::CapsuleId::new(name.clone()) {
+                    |name| match astrid_capsule_types::CapsuleId::new(name.clone()) {
                         Ok(capsule_id) => registry
                             .get_for(principal, &capsule_id)
                             .map(|c| (name.clone(), c)),
@@ -1650,7 +1797,7 @@ impl Kernel {
 
 async fn unload_loaded_capsule_after_source_disappeared(
     mut capsule: Box<dyn astrid_capsule::capsule::Capsule>,
-    id: &astrid_capsule::capsule::CapsuleId,
+    id: &astrid_capsule_types::CapsuleId,
     principal: &PrincipalId,
     manifest_path: &Path,
 ) {
@@ -1679,6 +1826,12 @@ async fn unload_loaded_capsule_after_source_disappeared(
 /// the shared allowance / capability / kv store handles. Skips the
 /// heavy boot bits (socket bind, MCP init, token generation, capsule
 /// discovery) that aren't load-bearing for admin-topic tests.
+///
+/// It deliberately does **not** route through [`Kernel::with_resources`]: that
+/// path asserts a multi-threaded tokio runtime (it wires the `block_in_place`
+/// dispatcher and the full monitor set), whereas these admin-topic tests run on
+/// the default current-thread `#[tokio::test]` runtime and only need the admin
+/// router. It fakes the native bits directly (`None` socket listener + lock).
 ///
 /// The `home` argument is used verbatim — tests pass a tempdir-rooted
 /// [`astrid_core::dirs::AstridHome`] so every call is fully isolated
@@ -1769,12 +1922,12 @@ pub(crate) async fn test_kernel_with_home(home: astrid_core::dirs::AstridHome) -
         audit_log,
         runtime_key,
         active_connections: DashMap::new(),
-        fuel_ledger: astrid_capsule::FuelLedger::default(),
-        fuel_rate: astrid_capsule::FuelRateLimiter::default(),
-        memory_ledger: astrid_capsule::MemoryLedger::default(),
-        runtime_limits: astrid_capsule::CapsuleRuntimeLimits::default(),
+        fuel_ledger: astrid_capsule_types::FuelLedger::default(),
+        fuel_rate: astrid_capsule_types::FuelRateLimiter::default(),
+        memory_ledger: astrid_capsule_types::MemoryLedger::default(),
+        runtime_limits: astrid_capsule_types::CapsuleRuntimeLimits::default(),
         local_egress: std::collections::HashMap::new(),
-        http_limits: astrid_capsule::HttpLimits::default(),
+        http_limits: astrid_capsule_types::HttpLimits::default(),
         full_reload_in_flight: AtomicBool::new(false),
         capsule_load_lock: Mutex::new(()),
         ephemeral: AtomicBool::new(false),
@@ -1804,11 +1957,14 @@ pub(crate) async fn test_kernel_with_home(home: astrid_core::dirs::AstridHome) -
 /// `~/.astrid/audit.db` and runs `verify_all()` to detect any tampering of
 /// historical entries. Verification failures are logged at `error!` level but
 /// do not block boot (fail-open for availability, loud alert for integrity).
-fn open_audit_log(runtime_key: Arc<astrid_crypto::KeyPair>) -> std::io::Result<Arc<AuditLog>> {
-    use astrid_core::dirs::AstridHome;
-
-    let home = AstridHome::resolve()
-        .map_err(|e| std::io::Error::other(format!("cannot resolve Astrid home: {e}")))?;
+/// Takes the caller's already-resolved [`AstridHome`](astrid_core::dirs::AstridHome)
+/// so every resource acquired by the native composition root is rooted in the
+/// same home — re-resolving from the environment here could split the audit
+/// log from the KV/socket paths if `$ASTRID_HOME` changed between calls.
+fn open_audit_log(
+    home: &astrid_core::dirs::AstridHome,
+    runtime_key: Arc<astrid_crypto::KeyPair>,
+) -> std::io::Result<Arc<AuditLog>> {
     home.ensure()
         .map_err(|e| std::io::Error::other(format!("cannot create Astrid home dirs: {e}")))?;
 
@@ -2119,7 +2275,7 @@ async fn attempt_capsule_restart(
         "Attempting capsule restart"
     );
 
-    let capsule_id = astrid_capsule::capsule::CapsuleId::from_static(id_str);
+    let capsule_id = astrid_capsule_types::CapsuleId::from_static(id_str);
     match kernel.restart_capsule(&capsule_id, principal).await {
         Ok(()) => {
             tracing::info!(
@@ -2388,7 +2544,7 @@ fn capsule_discovery_paths_for(
 }
 
 fn capsule_instance_hash(
-    manifest: &astrid_capsule::manifest::CapsuleManifest,
+    manifest: &astrid_capsule_types::manifest::CapsuleManifest,
     dir: &Path,
 ) -> astrid_capsule::registry::WasmHash {
     astrid_capsule_install::read_meta(dir)
@@ -2411,7 +2567,7 @@ fn capsule_instance_hash(
 fn validate_principal_capsules(
     principal: &PrincipalId,
     sorted: &[(
-        astrid_capsule::manifest::CapsuleManifest,
+        astrid_capsule_types::manifest::CapsuleManifest,
         std::path::PathBuf,
     )],
 ) {
@@ -2440,7 +2596,7 @@ fn validate_principal_capsules(
 /// stay local since the shared fn only covers required imports.
 fn validate_imports_exports(
     manifests: &[(
-        astrid_capsule::manifest::CapsuleManifest,
+        astrid_capsule_types::manifest::CapsuleManifest,
         std::path::PathBuf,
     )],
 ) {
@@ -2479,7 +2635,7 @@ fn validate_imports_exports(
     // own import). Keying on (capsule, namespace, interface) lets the per-import
     // loop below decide each branch by membership, so the required-error and
     // optional-info diagnostics can never disagree on what "satisfied" means.
-    let plain: Vec<&astrid_capsule::manifest::CapsuleManifest> =
+    let plain: Vec<&astrid_capsule_types::manifest::CapsuleManifest> =
         manifests.iter().map(|(m, _)| m).collect();
     let key_set = |missing: Vec<astrid_core::kernel_api::MissingImport>| {
         missing
@@ -2546,7 +2702,7 @@ fn validate_imports_exports(
 /// the live registry after load completes), not the pre-load discovered set —
 /// a manifest can be discovered but fail to load (missing env, WASM error), so
 /// only the loaded registry reflects what can really serve a turn.
-fn warn_agent_loop_readiness(manifests: &[&astrid_capsule::manifest::CapsuleManifest]) {
+fn warn_agent_loop_readiness(manifests: &[&astrid_capsule_types::manifest::CapsuleManifest]) {
     let readiness = astrid_capsule::readiness::agent_loop_readiness(manifests);
     if readiness.ready {
         tracing::info!(
@@ -2928,10 +3084,11 @@ mod tests {
     use super::*;
     use std::sync::atomic::Ordering;
 
-    use astrid_capsule::capsule::{Capsule, CapsuleId, CapsuleState};
+    use astrid_capsule::capsule::{Capsule, CapsuleState};
     use astrid_capsule::context::CapsuleContext;
-    use astrid_capsule::error::CapsuleResult;
-    use astrid_capsule::manifest::CapsuleManifest;
+    use astrid_capsule_types::CapsuleId;
+    use astrid_capsule_types::error::CapsuleResult;
+    use astrid_capsule_types::manifest::CapsuleManifest;
 
     struct CancellableTestCapsule {
         id: CapsuleId,
