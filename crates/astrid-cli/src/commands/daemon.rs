@@ -400,8 +400,12 @@ async fn confirm_graceful_stop(
     };
 
     if daemon_control::wait_for_exit(pid, daemon_control::GRACE).await {
+        // Confirmed gone — clear ALL runtime files. A clean daemon removes its
+        // own socket/readiness, but one that wedged briefly before finally
+        // exiting may not have, so remove them here too rather than leave a
+        // stale socket for the next `status`/`start` to trip on.
         println!("{}", theme::Theme::success("Astrid daemon stopped."));
-        let _ = std::fs::remove_file(pid_path);
+        remove_runtime_files(pid_path, socket_path);
         return;
     }
 
@@ -464,10 +468,17 @@ fn report_orphan_stop(
         },
     }
     if stop_confirmed_gone(outcome) {
-        let _ = std::fs::remove_file(socket_path);
-        let _ = std::fs::remove_file(socket_client::readiness_path());
-        let _ = std::fs::remove_file(pid_path);
+        remove_runtime_files(pid_path, socket_path);
     }
+}
+
+/// Remove the daemon's runtime files (socket, readiness, PID), best-effort.
+/// Called only once the daemon is confirmed gone — a dead daemon owns none of
+/// them, so clearing them leaves a clean slate for the next `start`.
+fn remove_runtime_files(pid_path: &Path, socket_path: &Path) {
+    let _ = std::fs::remove_file(socket_path);
+    let _ = std::fs::remove_file(socket_client::readiness_path());
+    let _ = std::fs::remove_file(pid_path);
 }
 
 /// Whether a stop outcome CONFIRMS the daemon is gone — the only condition under

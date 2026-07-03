@@ -114,14 +114,16 @@ pub(crate) fn is_process_alive(_pid: u32) -> bool {
 /// `/proc/<pid>/exe` when the running binary has been unlinked (an in-place
 /// upgrade). The remaining path is the original exec path, which still equals
 /// what the daemon recorded at boot.
+///
+/// Works on the raw path bytes, not a UTF-8 view: a non-UTF-8 exe path (rare but
+/// legal on Linux) must still have its marker stripped, and `to_str()` would
+/// drop the whole path to `None` and silently skip the strip.
 #[cfg(target_os = "linux")]
 fn strip_deleted_marker(path: PathBuf) -> PathBuf {
-    const MARKER: &str = " (deleted)";
-    match path.to_str() {
-        Some(s) => match s.strip_suffix(MARKER) {
-            Some(base) => PathBuf::from(base),
-            None => path,
-        },
+    use std::os::unix::ffi::{OsStrExt, OsStringExt};
+    const MARKER: &[u8] = b" (deleted)";
+    match path.as_os_str().as_bytes().strip_suffix(MARKER) {
+        Some(base) => PathBuf::from(std::ffi::OsString::from_vec(base.to_vec())),
         None => path,
     }
 }
@@ -422,14 +424,16 @@ mod tests {
     /// recycled PID) must NOT match: canonicalize fails, exact compare differs.
     #[test]
     fn exe_matches_survives_deleted_binary() {
-        // A path that does not exist on any test host, standing in for a binary
-        // that an upgrade has already unlinked.
-        let gone = PathBuf::from("/opt/homebrew/Cellar/astrid/0.9.1/bin/astrid-daemon");
+        // A guaranteed-nonexistent path under a fresh tempdir (never created),
+        // standing in for a binary that an upgrade has already unlinked — a
+        // unique temp path can't collide with a real install on the test host.
+        let dir = tempfile::tempdir().unwrap();
+        let gone = dir.path().join("astrid-daemon");
         assert!(!gone.exists(), "test precondition: path must not exist");
         // Recorded == live (both the original exec path) → confirmed our daemon.
         assert!(exe_matches(Some(&gone), Some(&gone)));
         // A different (also non-existent) path → cannot confirm, do not signal.
-        let other = PathBuf::from("/opt/homebrew/Cellar/other/1.0.0/bin/other-daemon");
+        let other = dir.path().join("other-daemon");
         assert!(!exe_matches(Some(&gone), Some(&other)));
     }
 
