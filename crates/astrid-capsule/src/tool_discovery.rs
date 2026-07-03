@@ -91,6 +91,41 @@ fn parse_tool_descriptors(payload: &[u8]) -> anyhow::Result<Vec<ToolDescriptor>>
     Ok(parsed.tools)
 }
 
+/// Names of advertised tools that no interceptor route will ever deliver an
+/// execute call to.
+///
+/// A tool is advertised straight from its `#[astrid::tool]` annotation (the
+/// describe path bypasses the subscribe ACL), but the dispatcher routes execute
+/// calls *solely* from the manifest's `[subscribe]` handlers. So a tool whose
+/// `Capsule.toml` is missing (or has a mistyped) `tool.v1.execute.<name>`
+/// subscription appears in `tools/list` yet silently never runs — no dispatch,
+/// no log, no error. This returns those tool names so the caller can warn.
+///
+/// Matching uses the SAME [`crate::topic::topic_matches`] the dispatcher uses,
+/// so a wildcard subscription (e.g. `tool.v1.execute.*`) correctly counts as a
+/// route and is NOT reported. Pure over its inputs.
+#[must_use]
+pub fn tools_missing_execute_route<'a>(
+    tools: &'a [ToolDescriptor],
+    interceptors: &[crate::manifest::InterceptorDef],
+) -> Vec<&'a str> {
+    // No interceptors at all → no tool can be routed; every advertised tool is
+    // missing its route. Short-circuit before per-tool topic formatting.
+    if interceptors.is_empty() {
+        return tools.iter().map(|tool| tool.name.as_str()).collect();
+    }
+    tools
+        .iter()
+        .filter(|tool| {
+            let topic = format!("{}{}", crate::topic::TOOL_EXECUTE_PREFIX, tool.name);
+            !interceptors
+                .iter()
+                .any(|def| crate::topic::topic_matches(&topic, &def.event))
+        })
+        .map(|tool| tool.name.as_str())
+        .collect()
+}
+
 /// Whether a capsule error signals "this interceptor action is not
 /// implemented" (a capsule with no tools), as opposed to a real
 /// failure. The WASM engine returns `NotSupported` for an unknown
@@ -178,6 +213,70 @@ mod tests {
         let payload = serde_json::json!({ "tools": [ { "name": 42 } ] });
         let bytes = serde_json::to_vec(&payload).expect("serialize");
         assert!(parse_tool_descriptors(&bytes).is_err());
+    }
+
+    fn tool(name: &str) -> ToolDescriptor {
+        ToolDescriptor {
+            name: name.into(),
+            description: String::new(),
+            input_schema: serde_json::json!({ "type": "object" }),
+        }
+    }
+
+    fn intercept(event: &str) -> crate::manifest::InterceptorDef {
+        crate::manifest::InterceptorDef {
+            event: event.into(),
+            action: "tool_execute_x".into(),
+            priority: 100,
+        }
+    }
+
+    #[test]
+    fn missing_execute_route_flags_only_the_unrouted_tool() {
+        // `upcase` is subscribed; `reverse_text` is advertised but has no
+        // `tool.v1.execute.reverse_text` route — it will never execute.
+        let tools = [tool("reverse_text"), tool("upcase")];
+        let subs = [intercept("tool.v1.execute.upcase")];
+        assert_eq!(
+            tools_missing_execute_route(&tools, &subs),
+            vec!["reverse_text"]
+        );
+    }
+
+    #[test]
+    fn missing_execute_route_exact_subscription_is_routed() {
+        let tools = [tool("reverse_text")];
+        let subs = [intercept("tool.v1.execute.reverse_text")];
+        assert!(tools_missing_execute_route(&tools, &subs).is_empty());
+    }
+
+    #[test]
+    fn missing_execute_route_wildcard_subscription_routes_all() {
+        // A single-segment wildcard covers every tool — must NOT be flagged
+        // (mirrors the dispatcher's own matcher).
+        let tools = [tool("reverse_text"), tool("upcase")];
+        let subs = [intercept("tool.v1.execute.*")];
+        assert!(tools_missing_execute_route(&tools, &subs).is_empty());
+    }
+
+    #[test]
+    fn missing_execute_route_no_subscriptions_flags_every_tool() {
+        let tools = [tool("a"), tool("b")];
+        assert_eq!(tools_missing_execute_route(&tools, &[]), vec!["a", "b"]);
+    }
+
+    #[test]
+    fn missing_execute_route_ignores_unrelated_subscriptions() {
+        // A subscription to a different topic family doesn't route the tool.
+        let tools = [tool("reverse_text")];
+        let subs = [
+            intercept("session.v1.event.*"),
+            intercept("tool.v1.execute.other_tool"),
+        ];
+        assert_eq!(
+            tools_missing_execute_route(&tools, &subs),
+            vec!["reverse_text"]
+        );
     }
 
     #[test]

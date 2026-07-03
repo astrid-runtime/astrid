@@ -1180,14 +1180,41 @@ impl Kernel {
             // effort: a describe (or serialize) failure leaves `tools` absent
             // and the consumer falls back to its fan-out for this cycle.
             match astrid_capsule::describe_loaded_capsule(capsule.as_ref()).await {
-                Ok(tools) => match serde_json::to_value(&tools) {
-                    Ok(tools_json) => {
-                        meta = Some(capsules_loaded::inject_tools(meta, tools_json));
-                    },
-                    Err(e) => tracing::debug!(
-                        capsule_id = %name, error = %e,
-                        "failed to serialize live-described tools; capsule left uncaptured this cycle"
-                    ),
+                Ok(tools) => {
+                    // A tool advertises straight from its `#[astrid::tool]`
+                    // annotation, but only EXECUTES if the manifest `[subscribe]`s
+                    // its `tool.v1.execute.<name>` topic (the dispatcher routes
+                    // solely from `[subscribe]` handlers). When they drift the tool
+                    // appears in tools/list yet silently never runs — no dispatch,
+                    // no capsule log, no error. Surface that at load, naming the
+                    // exact missing line, so authors don't lose hours to it.
+                    // Skip the manifest lookup entirely for a capsule with no
+                    // tools (most non-tool capsules) — nothing to cross-check.
+                    if !tools.is_empty() {
+                        let interceptors = capsule.manifest().effective_interceptors();
+                        for tool in
+                            astrid_capsule::tools_missing_execute_route(&tools, &interceptors)
+                        {
+                            tracing::warn!(
+                                capsule_id = %name,
+                                "capsule advertises tool '{tool}' but no `tool.v1.execute.{tool}` \
+                                 subscription routes it — it appears in tools/list but will never \
+                                 execute. Add to Capsule.toml: [subscribe] \
+                                 \"tool.v1.execute.{tool}\" = {{ wit = \
+                                 \"@unicity-astrid/wit/types/tool-call\", handler = \
+                                 \"tool_execute_{tool}\" }}"
+                            );
+                        }
+                    }
+                    match serde_json::to_value(&tools) {
+                        Ok(tools_json) => {
+                            meta = Some(capsules_loaded::inject_tools(meta, tools_json));
+                        },
+                        Err(e) => tracing::debug!(
+                            capsule_id = %name, error = %e,
+                            "failed to serialize live-described tools; capsule left uncaptured this cycle"
+                        ),
+                    }
                 },
                 Err(e) => tracing::debug!(
                     capsule_id = %name, error = %e,

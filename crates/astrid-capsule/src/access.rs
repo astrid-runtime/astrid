@@ -53,8 +53,9 @@ use crate::profile_cache::PrincipalProfileCache;
 /// Topic prefix for the user-invocable **tool execute** surface. A tool
 /// invocation is `tool.v1.execute.<name>` — a single segment after this
 /// prefix. Result-delivery sub-topics (`...<name>.result`, `...result`) are
-/// deliberately NOT gated; see [`is_user_invocable_surface`].
-const TOOL_EXECUTE_PREFIX: &str = "tool.v1.execute.";
+/// deliberately NOT gated; see [`is_user_invocable_surface`]. Shared with the
+/// load-time route check via [`crate::topic`].
+use crate::topic::TOOL_EXECUTE_PREFIX;
 
 /// Topic prefix for the user-invocable **CLI command run** surface.
 /// A capsule command invocation is `cli.v1.command.run.<provider>`.

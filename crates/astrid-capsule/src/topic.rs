@@ -1,5 +1,10 @@
 //! IPC topic matching for interceptor event patterns.
 
+/// Topic prefix for a tool invocation: `tool.v1.execute.<name>`. Defined here so
+/// the ACL scoping ([`crate::access`]) and the load-time route check
+/// ([`crate::tool_discovery`]) share one source of truth for the topic scheme.
+pub(crate) const TOOL_EXECUTE_PREFIX: &str = "tool.v1.execute.";
+
 /// Returns `true` if `s` has no empty segments — i.e. no leading/trailing dots
 /// and no consecutive dots. An empty string is also rejected.
 ///

@@ -34,4 +34,4 @@ pub use engine::wasm::host::audit_sink::{HostAuditEvent, HostAuditOutcome, HostA
 pub use engine::wasm::limits::{CapsuleRuntimeLimits, HttpLimits};
 pub use fuel_ledger::{FuelLedger, FuelRateLimiter};
 pub use memory_ledger::{MemoryLedger, StoreMemoryMeter};
-pub use tool_discovery::{ToolDescriptor, describe_loaded_capsule};
+pub use tool_discovery::{ToolDescriptor, describe_loaded_capsule, tools_missing_execute_route};
