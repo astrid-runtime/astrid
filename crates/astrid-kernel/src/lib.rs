@@ -171,7 +171,7 @@ pub struct Kernel {
     /// Ephemeral mode: shut down immediately when the last client disconnects.
     pub ephemeral: AtomicBool,
     /// Instant when the kernel was booted (for uptime calculation).
-    pub boot_time: std::time::Instant,
+    pub boot_time: astrid_runtime::time::Instant,
     /// Sender for the API-initiated shutdown signal. The daemon's main loop
     /// selects on the receiver to exit gracefully without `process::exit`.
     pub shutdown_tx: tokio::sync::watch::Sender<bool>,
@@ -563,7 +563,7 @@ impl Kernel {
             full_reload_in_flight: AtomicBool::new(false),
             capsule_load_lock: Mutex::new(()),
             ephemeral: AtomicBool::new(false),
-            boot_time: std::time::Instant::now(),
+            boot_time: astrid_runtime::time::Instant::now(),
             shutdown_tx: tokio::sync::watch::channel(false).0,
             session_token,
             token_path,
@@ -609,7 +609,7 @@ impl Kernel {
         )
         .with_identity_store(Arc::clone(&kernel.identity_store))
         .with_access_resolver(access_resolver);
-        tokio::spawn(dispatcher.run());
+        astrid_runtime::spawn(dispatcher.run());
 
         debug_assert_eq!(
             kernel.event_bus.subscriber_count(),
@@ -925,7 +925,7 @@ impl Kernel {
                     break;
                 }
                 if retry < 19 {
-                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    astrid_runtime::time::sleep(std::time::Duration::from_millis(50)).await;
                 }
             }
             if !unloaded {
@@ -989,7 +989,7 @@ impl Kernel {
     /// without racing other admin-driven warm/reload paths.
     pub fn schedule_profile_principal_warm(self: &Arc<Self>) {
         let kernel = Arc::clone(self);
-        tokio::spawn(async move {
+        astrid_runtime::spawn(async move {
             let principals: Vec<_> = kernel
                 .enumerate_profile_principals()
                 .into_iter()
@@ -1484,7 +1484,7 @@ impl Kernel {
                     break;
                 }
                 if retry < 19 {
-                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    astrid_runtime::time::sleep(std::time::Duration::from_millis(50)).await;
                 }
             }
             if !unloaded {
@@ -1693,7 +1693,7 @@ impl Kernel {
                     break;
                 }
                 if retry < 19 {
-                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    astrid_runtime::time::sleep(std::time::Duration::from_millis(50)).await;
                 }
             }
 
@@ -1931,7 +1931,7 @@ pub(crate) async fn test_kernel_with_home(home: astrid_core::dirs::AstridHome) -
         full_reload_in_flight: AtomicBool::new(false),
         capsule_load_lock: Mutex::new(()),
         ephemeral: AtomicBool::new(false),
-        boot_time: std::time::Instant::now(),
+        boot_time: astrid_runtime::time::Instant::now(),
         shutdown_tx: tokio::sync::watch::channel(false).0,
         session_token: Arc::new(astrid_core::session_token::SessionToken::generate()),
         token_path: home.token_path(),
@@ -2098,11 +2098,11 @@ const IDLE_NON_EPHEMERAL_GRACE: std::time::Duration = std::time::Duration::from_
 const IDLE_EPHEMERAL_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
 /// How often the idle monitor polls when running in persistent mode.
 const IDLE_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(15);
-fn spawn_idle_monitor(kernel: Arc<Kernel>) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
+fn spawn_idle_monitor(kernel: Arc<Kernel>) -> astrid_runtime::JoinHandle<()> {
+    astrid_runtime::spawn(async move {
         // Initial grace period — wait for capsules to boot and first client
         // to connect before checking idle status.
-        tokio::time::sleep(IDLE_INITIAL_GRACE).await;
+        astrid_runtime::time::sleep(IDLE_INITIAL_GRACE).await;
 
         // Read ephemeral flag after grace period (set by daemon after boot).
         let ephemeral = kernel.ephemeral.load(Ordering::Relaxed);
@@ -2148,12 +2148,12 @@ fn spawn_idle_monitor(kernel: Arc<Kernel>) -> tokio::task::JoinHandle<()> {
 
         // Non-ephemeral: additional grace to let capsules fully initialize.
         if !ephemeral {
-            tokio::time::sleep(IDLE_NON_EPHEMERAL_GRACE).await;
+            astrid_runtime::time::sleep(IDLE_NON_EPHEMERAL_GRACE).await;
         }
-        let mut idle_since: Option<tokio::time::Instant> = None;
+        let mut idle_since: Option<astrid_runtime::time::Instant> = None;
 
         loop {
-            tokio::time::sleep(check_interval).await;
+            astrid_runtime::time::sleep(check_interval).await;
             metrics::counter!(METRIC_BACKGROUND_TICKS_TOTAL, "loop" => "idle").increment(1);
 
             let connections = kernel.total_connection_count();
@@ -2174,7 +2174,7 @@ fn spawn_idle_monitor(kernel: Arc<Kernel>) -> tokio::task::JoinHandle<()> {
             };
 
             if effective_connections == 0 && !has_daemons {
-                let now = tokio::time::Instant::now();
+                let now = astrid_runtime::time::Instant::now();
                 let start = *idle_since.get_or_insert(now);
                 let elapsed = now.duration_since(start);
 
@@ -2207,7 +2207,7 @@ fn spawn_idle_monitor(kernel: Arc<Kernel>) -> tokio::task::JoinHandle<()> {
 /// Tracks restart attempts for a single capsule with exponential backoff.
 struct RestartTracker {
     attempts: u32,
-    last_attempt: std::time::Instant,
+    last_attempt: astrid_runtime::time::Instant,
     backoff: std::time::Duration,
 }
 
@@ -2219,7 +2219,7 @@ impl RestartTracker {
     fn new() -> Self {
         Self {
             attempts: 0,
-            last_attempt: std::time::Instant::now(),
+            last_attempt: astrid_runtime::time::Instant::now(),
             backoff: Self::INITIAL_BACKOFF,
         }
     }
@@ -2232,7 +2232,7 @@ impl RestartTracker {
     /// Record a restart attempt and advance the backoff.
     fn record_attempt(&mut self) {
         self.attempts = self.attempts.saturating_add(1);
-        self.last_attempt = std::time::Instant::now();
+        self.last_attempt = astrid_runtime::time::Instant::now();
         self.backoff = self.backoff.saturating_mul(2).min(Self::MAX_BACKOFF);
     }
 
@@ -2312,9 +2312,9 @@ async fn attempt_capsule_restart(
 /// each capsule that is currently in `Ready` state. If a capsule reports
 /// `Failed`, attempts to restart it with exponential backoff (max 5 attempts).
 /// Publishes `astrid.v1.health.failed` IPC events for each detected failure.
-fn spawn_capsule_health_monitor(kernel: Arc<Kernel>) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        let mut interval = tokio::time::interval(std::time::Duration::from_secs(10));
+fn spawn_capsule_health_monitor(kernel: Arc<Kernel>) -> astrid_runtime::JoinHandle<()> {
+    astrid_runtime::spawn(async move {
+        let mut interval = astrid_runtime::time::interval(std::time::Duration::from_secs(10));
         interval.tick().await; // Skip the first immediate tick.
 
         let mut restart_trackers: std::collections::HashMap<String, RestartTracker> =
@@ -2497,9 +2497,9 @@ fn collect_failed_runtimes_deduped(
 /// The `ReAct` capsule (WASM guest) cannot use async timers, so this kernel-side task
 /// drives timeout enforcement by waking the capsule on a fixed interval. Each tick
 /// causes the capsule's `handle_watchdog_tick` interceptor to run `check_phase_timeout`.
-fn spawn_react_watchdog(event_bus: Arc<EventBus>) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
+fn spawn_react_watchdog(event_bus: Arc<EventBus>) -> astrid_runtime::JoinHandle<()> {
+    astrid_runtime::spawn(async move {
+        let mut interval = astrid_runtime::time::interval(std::time::Duration::from_secs(5));
         // The first tick fires immediately - skip it to give capsules time to load.
         interval.tick().await;
 
@@ -3180,9 +3180,9 @@ mod tests {
         };
         let release_after_cancel = {
             let cancelled = Arc::clone(&cancelled);
-            tokio::spawn(async move {
+            astrid_runtime::spawn(async move {
                 while !cancelled.load(Ordering::Relaxed) {
-                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                    astrid_runtime::time::sleep(std::time::Duration::from_millis(5)).await;
                 }
                 drop(held);
             })
@@ -3715,7 +3715,7 @@ mod tests {
     fn restart_tracker_allows_restart_after_backoff() {
         let mut tracker = RestartTracker::new();
         // Simulate time passing by setting last_attempt in the past.
-        tracker.last_attempt = std::time::Instant::now()
+        tracker.last_attempt = astrid_runtime::time::Instant::now()
             .checked_sub(RestartTracker::INITIAL_BACKOFF)
             .unwrap()
             .checked_sub(std::time::Duration::from_millis(1))
@@ -3769,7 +3769,7 @@ mod tests {
             tracker.record_attempt();
         }
         // Even if backoff has elapsed, exhausted tracker should not restart.
-        tracker.last_attempt = std::time::Instant::now()
+        tracker.last_attempt = astrid_runtime::time::Instant::now()
             .checked_sub(RestartTracker::MAX_BACKOFF)
             .unwrap();
         assert!(!tracker.should_restart());

@@ -40,7 +40,6 @@
 //!   constant-time comparison on the hash bytes.
 
 use std::path::PathBuf;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use astrid_core::dirs::AstridHome;
 use base64::Engine;
@@ -236,9 +235,7 @@ pub fn ct_hash_eq(a: &str, b: &str) -> bool {
 /// (impossible) pre-1970 case so the returned `u64` never wraps.
 #[must_use]
 pub fn now_epoch() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs())
+    astrid_runtime::clock::now_epoch_secs()
 }
 
 /// Borrow-checked helper: prune the in-place list, returning the count

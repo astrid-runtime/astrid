@@ -22,6 +22,7 @@ astrid-core = { workspace = true }
 astrid-crypto = { workspace = true }
 astrid-events = { workspace = true }
 astrid-mcp = { workspace = true }
+astrid-runtime = { workspace = true }
 astrid-storage = { workspace = true, features = ["kv"] }
 astrid-vfs = { workspace = true }
 base64 = { workspace = true }

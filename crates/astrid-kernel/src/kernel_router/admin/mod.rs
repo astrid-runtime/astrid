@@ -76,12 +76,12 @@ const ADMIN_RESPONSE_PREFIX: &str = "astrid.v1.admin.response.";
 /// Spawn the admin dispatcher task. Mirrors [`super::spawn_kernel_router`]
 /// but listens on `astrid.v1.admin.*` and parses
 /// [`AdminKernelRequest`] payloads.
-pub(crate) fn spawn_admin_router(kernel: Arc<crate::Kernel>) -> tokio::task::JoinHandle<()> {
+pub(crate) fn spawn_admin_router(kernel: Arc<crate::Kernel>) -> astrid_runtime::JoinHandle<()> {
     let mut receiver = kernel
         .event_bus
         .subscribe_topic_as("astrid.v1.admin.*", "admin_router");
 
-    tokio::spawn(async move {
+    astrid_runtime::spawn(async move {
         while let Some(event) = receiver.recv().await {
             let astrid_events::AstridEvent::Ipc { message, .. } = &*event else {
                 continue;
@@ -113,7 +113,7 @@ pub(crate) fn spawn_admin_router(kernel: Arc<crate::Kernel>) -> tokio::task::Joi
                     let topic = message.topic.clone();
                     let caller = resolve_caller(message);
                     let device_key_id = resolve_device_key_id(message);
-                    tokio::spawn(async move {
+                    astrid_runtime::spawn(async move {
                         handle_admin_request(&kernel, topic, caller, device_key_id, req).await;
                     });
                 },

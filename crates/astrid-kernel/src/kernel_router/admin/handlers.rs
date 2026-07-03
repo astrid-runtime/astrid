@@ -532,7 +532,7 @@ async fn agent_modify_from_req(
 
 fn warm_principal_capsules(kernel: &Arc<crate::Kernel>, principal: PrincipalId) {
     let kernel = Arc::clone(kernel);
-    tokio::spawn(async move {
+    astrid_runtime::spawn(async move {
         kernel.ensure_principal_loaded(&principal).await;
         kernel.publish_capsules_loaded().await;
     });

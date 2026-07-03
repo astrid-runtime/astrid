@@ -396,7 +396,7 @@ async fn concurrent_caps_grants_serialized_by_admin_write_lock() {
 
     let k1 = Arc::clone(&kernel);
     let k2 = Arc::clone(&kernel);
-    let t1 = tokio::spawn(async move {
+    let t1 = astrid_runtime::spawn(async move {
         handlers::dispatch(
             &k1,
             &astrid_core::PrincipalId::default(),
@@ -408,7 +408,7 @@ async fn concurrent_caps_grants_serialized_by_admin_write_lock() {
         )
         .await
     });
-    let t2 = tokio::spawn(async move {
+    let t2 = astrid_runtime::spawn(async move {
         handlers::dispatch(
             &k2,
             &astrid_core::PrincipalId::default(),

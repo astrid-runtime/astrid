@@ -70,7 +70,7 @@ pub(crate) const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(5);
 /// terminal frame is not preceded by a redundant late ping. A `Working` that
 /// still races out after the terminal is harmless — the uplink skips it.
 pub(crate) struct KeepalivePinger {
-    handle: tokio::task::JoinHandle<()>,
+    handle: astrid_runtime::JoinHandle<()>,
 }
 
 impl KeepalivePinger {
@@ -90,9 +90,9 @@ impl KeepalivePinger {
         interval: Duration,
     ) -> Self {
         let kernel = Arc::clone(kernel);
-        let handle = tokio::spawn(async move {
+        let handle = astrid_runtime::spawn(async move {
             loop {
-                tokio::time::sleep(interval).await;
+                astrid_runtime::time::sleep(interval).await;
                 let Ok(val) = serde_json::to_value(KernelResponse::Working) else {
                     return;
                 };
@@ -135,14 +135,15 @@ mod tests {
             KeepalivePinger::spawn_with_interval(&kernel, response_topic.clone(), interval);
 
         // Count Working frames over ~5 intervals while the guard is alive.
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(220);
+        let deadline = astrid_runtime::time::Instant::now() + std::time::Duration::from_millis(220);
         let mut working_seen = 0u32;
         loop {
-            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            let remaining =
+                deadline.saturating_duration_since(astrid_runtime::time::Instant::now());
             if remaining.is_zero() {
                 break;
             }
-            match tokio::time::timeout(remaining, rx.recv()).await {
+            match astrid_runtime::time::timeout(remaining, rx.recv()).await {
                 Ok(Some(event)) => {
                     if let astrid_events::AstridEvent::Ipc { message, .. } = &*event
                         && let IpcPayload::RawJson(val) = &message.payload
@@ -166,19 +167,23 @@ mod tests {
         // straggler and drain it, then assert the stream goes SILENT: no fresh ping
         // arrives across several further intervals, proving the loop task stopped.
         drop(pinger);
-        let grace_deadline = tokio::time::Instant::now() + interval * 2;
+        let grace_deadline = astrid_runtime::time::Instant::now() + interval * 2;
         loop {
-            let remaining = grace_deadline.saturating_duration_since(tokio::time::Instant::now());
+            let remaining =
+                grace_deadline.saturating_duration_since(astrid_runtime::time::Instant::now());
             if remaining.is_zero() {
                 break;
             }
             // Drain stragglers during the grace window; stop early on silence.
-            if tokio::time::timeout(remaining, rx.recv()).await.is_err() {
+            if astrid_runtime::time::timeout(remaining, rx.recv())
+                .await
+                .is_err()
+            {
                 break;
             }
         }
 
-        let after = tokio::time::timeout(interval * 4, rx.recv()).await;
+        let after = astrid_runtime::time::timeout(interval * 4, rx.recv()).await;
         assert!(
             after.is_err(),
             "no Working frame may arrive after the pinger guard is dropped, got {after:?}"

@@ -1,0 +1,34 @@
+[package]
+name = "astrid-runtime"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Target-selected facade over task spawning and time for the Astrid kernel"
+
+[dependencies]
+
+# Native host: the facade is pure tokio/std re-exports (zero cost, zero
+# behaviour change). `rt` backs `spawn`/`JoinHandle`/`JoinError`; `time` backs
+# the `time` module. Both are already in the workspace base feature set.
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+tokio = { workspace = true }
+
+# Browser host: no tokio runtime, no OS threads, no `std::time` clock. The
+# task surface maps to the JS microtask queue (`wasm-bindgen-futures`), the
+# timer surface to JS timers (`wasmtimer`), and the wall clock to the
+# `Performance`/`Date` bridge (`web-time`). `futures` supplies the oneshot
+# channel and abort primitives the minimal `JoinHandle` is built from.
+# Literal versions match the in-crate wasm-dep convention already used by
+# astrid-types/core/crypto/storage (their wasm `getrandom` is declared the
+# same way, not via `[workspace.dependencies]`).
+[target.'cfg(target_family = "wasm")'.dependencies]
+futures = { workspace = true }
+wasm-bindgen-futures = "0.4.76"
+wasmtimer = "0.4.3"
+web-time = "1.1.0"
+
+[lints]
+workspace = true

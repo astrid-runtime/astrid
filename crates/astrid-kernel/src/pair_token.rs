@@ -31,7 +31,6 @@
 //! (different principal) instead.
 
 use std::path::PathBuf;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use astrid_core::DeviceScope;
 use astrid_core::PrincipalId;
@@ -234,9 +233,7 @@ pub fn ct_hash_eq(a: &str, b: &str) -> bool {
 /// Current wall-clock seconds since Unix epoch.
 #[must_use]
 pub fn now_epoch() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs())
+    astrid_runtime::clock::now_epoch_secs()
 }
 
 /// Prune expired pair-tokens in place. Returns the count removed.

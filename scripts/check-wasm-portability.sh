@@ -27,6 +27,7 @@ CRATES=(
   astrid-config
   astrid-approval
   astrid-capsule-types
+  astrid-runtime
 )
 
 if ! rustup target list --installed 2>/dev/null | grep -qx "$TARGET"; then

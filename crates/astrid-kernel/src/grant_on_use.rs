@@ -79,7 +79,7 @@ fn is_approved(decision: &str) -> bool {
 /// subscribes to the per-request response topic, waits (bounded) for an
 /// [`IpcPayload::ApprovalResponse`], and grants on approve. The response's own
 /// fields are never read for the target.
-pub(crate) fn spawn_grant_on_use_handler(kernel: Arc<Kernel>) -> tokio::task::JoinHandle<()> {
+pub(crate) fn spawn_grant_on_use_handler(kernel: Arc<Kernel>) -> astrid_runtime::JoinHandle<()> {
     // Subscribe to the exact topic synchronously, BEFORE returning, so this
     // counts as the one permanent boot subscriber and never misses a signal
     // published right after boot. The literal (non-wildcard) topic matches only
@@ -92,7 +92,7 @@ pub(crate) fn spawn_grant_on_use_handler(kernel: Arc<Kernel>) -> tokio::task::Jo
     // Bound concurrent in-flight grants. Cheap to clone (Arc inside).
     let inflight = Arc::new(tokio::sync::Semaphore::new(MAX_INFLIGHT_GRANTS));
 
-    tokio::spawn(async move {
+    astrid_runtime::spawn(async move {
         while let Some(event) = observer.recv().await {
             let AstridEvent::Ipc { message, .. } = &*event else {
                 continue;
@@ -155,7 +155,7 @@ pub(crate) fn spawn_grant_on_use_handler(kernel: Arc<Kernel>) -> tokio::task::Jo
                 .subscribe_topic_as(response_topic.as_str(), AWAITER_SUBSCRIBER);
 
             let kernel = Arc::clone(&kernel);
-            tokio::spawn(async move {
+            astrid_runtime::spawn(async move {
                 // The permit lives for the awaiter's whole lifetime, releasing
                 // the in-flight slot on drop (response, timeout, or panic).
                 let _permit = permit;
@@ -174,11 +174,11 @@ async fn await_and_grant(
     principal: &str,
     capsule_id: &str,
 ) {
-    let deadline = tokio::time::Instant::now()
+    let deadline = astrid_runtime::time::Instant::now()
         .checked_add(GRANT_RESPONSE_TIMEOUT)
-        .unwrap_or_else(tokio::time::Instant::now);
+        .unwrap_or_else(astrid_runtime::time::Instant::now);
     let decision = loop {
-        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let remaining = deadline.saturating_duration_since(astrid_runtime::time::Instant::now());
         if remaining.is_zero() {
             warn!(
                 security_event = true,
@@ -189,7 +189,8 @@ async fn await_and_grant(
             return;
         }
 
-        let Ok(Some(event)) = tokio::time::timeout(remaining, receiver.recv()).await else {
+        let Ok(Some(event)) = astrid_runtime::time::timeout(remaining, receiver.recv()).await
+        else {
             warn!(
                 security_event = true,
                 principal = %principal,

@@ -149,7 +149,7 @@ async fn wait_until(mut cond: impl FnMut() -> bool) -> bool {
             return true;
         }
         tokio::task::yield_now().await;
-        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        astrid_runtime::time::sleep(std::time::Duration::from_millis(1)).await;
     }
     cond()
 }

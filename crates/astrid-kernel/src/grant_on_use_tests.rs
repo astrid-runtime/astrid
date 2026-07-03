@@ -104,7 +104,7 @@ async fn wait_for_grant(home: &AstridHome, principal: &str, capsule: &str) -> bo
         {
             return true;
         }
-        tokio::time::sleep(Duration::from_millis(20)).await;
+        astrid_runtime::time::sleep(Duration::from_millis(20)).await;
     }
     false
 }
@@ -114,7 +114,7 @@ async fn wait_for_grant(home: &AstridHome, principal: &str, capsule: &str) -> bo
 /// race the handler is designed around).
 async fn settle() {
     tokio::task::yield_now().await;
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    astrid_runtime::time::sleep(Duration::from_millis(100)).await;
 }
 
 /// Assert the grant does NOT land within a bounded window — for deny / timeout /
@@ -122,7 +122,7 @@ async fn settle() {
 async fn assert_no_grant(home: &AstridHome, principal: &str, capsule: &str) {
     // Long enough that an erroneous grant would have flushed to disk, far short
     // of the 60s response timeout so the test stays fast.
-    tokio::time::sleep(Duration::from_millis(400)).await;
+    astrid_runtime::time::sleep(Duration::from_millis(400)).await;
     assert!(
         !on_disk_capsules(home, principal)
             .iter()
@@ -394,7 +394,7 @@ async fn approve_for_nonexistent_principal_does_not_create() {
     settle().await;
     publish_response_as(&kernel, rid, "ghost", "approve");
 
-    tokio::time::sleep(Duration::from_millis(400)).await;
+    astrid_runtime::time::sleep(Duration::from_millis(400)).await;
     let pid = PrincipalId::new("ghost").unwrap();
     let path = PrincipalProfile::path_for(&home, &pid);
     assert!(
@@ -415,7 +415,7 @@ async fn approve_already_granted_is_idempotent() {
     settle().await;
     publish_response(&kernel, rid, "approve");
 
-    tokio::time::sleep(Duration::from_millis(400)).await;
+    astrid_runtime::time::sleep(Duration::from_millis(400)).await;
     let caps = on_disk_capsules(&home, "x");
     assert_eq!(
         caps.iter().filter(|c| c.as_str() == "cap").count(),

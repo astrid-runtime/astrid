@@ -9,10 +9,10 @@ mod response;
 
 pub(crate) use response::{KeepalivePinger, publish_response};
 
+use astrid_runtime::time::Instant;
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Instant;
 
 use astrid_audit::{AuditAction, AuditOutcome, AuthorizationProof};
 use astrid_capabilities::{CapabilityCheck, PermissionError};
@@ -39,7 +39,7 @@ mod connection_tracker_tests;
 /// keys off the **topic** as well as the typed `IpcPayload::Connect` /
 /// `Disconnect` that native producers emit — see [`connection_signal`].
 #[must_use]
-pub(crate) fn spawn_kernel_router(kernel: Arc<crate::Kernel>) -> tokio::task::JoinHandle<()> {
+pub(crate) fn spawn_kernel_router(kernel: Arc<crate::Kernel>) -> astrid_runtime::JoinHandle<()> {
     // Spawn the connection tracker as a sibling task.
     drop(spawn_connection_tracker(Arc::clone(&kernel)));
     // Spawn the Layer 6 admin dispatcher as a sibling task (issue #672).
@@ -54,7 +54,7 @@ pub(crate) fn spawn_kernel_router(kernel: Arc<crate::Kernel>) -> tokio::task::Jo
         .event_bus
         .subscribe_topic_as("astrid.v1.request.*", "kernel_router");
 
-    tokio::spawn(async move {
+    astrid_runtime::spawn(async move {
         let mut rate_limiter = ManagementRateLimiter::new();
 
         while let Some(event) = receiver.recv().await {
@@ -160,14 +160,14 @@ fn connection_signal(topic: &str, payload: &IpcPayload) -> Option<ConnectionSign
 ///
 /// Listens on `client.v1.*` topics and adjusts the per-principal connection
 /// count via [`connection_signal`] (typed payload or topic).
-fn spawn_connection_tracker(kernel: Arc<crate::Kernel>) -> tokio::task::JoinHandle<()> {
+fn spawn_connection_tracker(kernel: Arc<crate::Kernel>) -> astrid_runtime::JoinHandle<()> {
     // Broadcast-path subscriber. See `spawn_kernel_router` for the
     // rationale on staying on the untargeted subscribe path.
     let mut receiver = kernel
         .event_bus
         .subscribe_topic_as("client.v1.*", "connection_tracker");
 
-    tokio::spawn(async move {
+    astrid_runtime::spawn(async move {
         while let Some(event) = receiver.recv().await {
             let astrid_events::AstridEvent::Ipc { message, .. } = &*event else {
                 continue;
@@ -502,7 +502,7 @@ fn schedule_reload_capsules(kernel: Arc<crate::Kernel>) -> bool {
         debug!("ReloadCapsules request coalesced; full reload already in flight");
         return false;
     }
-    tokio::spawn(async move {
+    astrid_runtime::spawn(async move {
         let _guard = FullReloadGuard(&kernel.full_reload_in_flight);
         unregister_failed_capsules(&kernel).await;
         kernel.load_all_capsules().await;
@@ -959,9 +959,7 @@ fn record_admin_audit(kernel: &crate::Kernel, entry: AdminAuditEntry<'_>) {
     // The payload is intentionally a flat JSON shape so SSE
     // consumers don't have to reify the kernel-side enum types.
     let event = serde_json::json!({
-        "ts_epoch": std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |d| d.as_secs()),
+        "ts_epoch": astrid_runtime::clock::now_epoch_secs(),
         "method": method,
         "required_capability": required_cap,
         "principal": caller.to_string(),

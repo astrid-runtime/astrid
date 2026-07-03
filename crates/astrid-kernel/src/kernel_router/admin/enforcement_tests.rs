@@ -68,7 +68,7 @@ async fn send_admin(
     // kernel construction time so this should fire on the next tokio
     // tick; a 2-second timeout keeps misbehaving tests from hanging CI.
 
-    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+    astrid_runtime::time::timeout(std::time::Duration::from_secs(2), async {
         loop {
             let event = rx.recv().await.expect("response event");
             if let astrid_events::AstridEvent::Ipc { message, .. } = &*event
@@ -308,7 +308,7 @@ async fn send_admin_scoped(
         message: msg,
     });
 
-    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+    astrid_runtime::time::timeout(std::time::Duration::from_secs(2), async {
         loop {
             let event = rx.recv().await.expect("response event");
             if let astrid_events::AstridEvent::Ipc { message, .. } = &*event

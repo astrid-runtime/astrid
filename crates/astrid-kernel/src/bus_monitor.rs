@@ -112,18 +112,18 @@ fn bump(counts: &mut HashMap<String, u64>, topic: &str, n: u64) {
 /// it is counted in
 /// [`INTERNAL_SUBSCRIBER_COUNT`](crate::INTERNAL_SUBSCRIBER_COUNT) by the time
 /// `Kernel::new`'s debug-assert runs — mirroring `EventDispatcher::new`.
-pub(crate) fn spawn_bus_activity_monitor(event_bus: &EventBus) -> tokio::task::JoinHandle<()> {
+pub(crate) fn spawn_bus_activity_monitor(event_bus: &EventBus) -> astrid_runtime::JoinHandle<()> {
     let mut receiver = event_bus.subscribe_as("bus_monitor");
 
-    tokio::spawn(async move {
+    astrid_runtime::spawn(async move {
         let mut counts: HashMap<String, u64> = HashMap::new();
-        let mut window_start = tokio::time::Instant::now();
+        let mut window_start = astrid_runtime::time::Instant::now();
 
-        let mut tick = tokio::time::interval(BUS_ACTIVITY_WINDOW);
+        let mut tick = astrid_runtime::time::interval(BUS_ACTIVITY_WINDOW);
         // Don't burst-fire missed ticks: under a storm the recv arm starves
         // the tick, and a catch-up burst would flush tiny sub-windows and
         // under-report the rate. Delaying preserves a full window each flush.
-        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        tick.set_missed_tick_behavior(astrid_runtime::time::MissedTickBehavior::Delay);
         // The first tick is immediate — skip it so window one is a full span.
         tick.tick().await;
 
@@ -171,7 +171,7 @@ pub(crate) fn spawn_bus_activity_monitor(event_bus: &EventBus) -> tokio::task::J
                         );
                     }
                     counts.clear();
-                    window_start = tokio::time::Instant::now();
+                    window_start = astrid_runtime::time::Instant::now();
                 },
             }
         }
