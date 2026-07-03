@@ -29,7 +29,9 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 tar = { workspace = true }
 tempfile = { workspace = true }
-tokio = { workspace = true }
+# `rt-multi-thread`: builds a multi-thread runtime in `lifecycle`; native-only,
+# not in the workspace tokio base.
+tokio = { workspace = true, features = ["rt-multi-thread"] }
 tracing = { workspace = true }
 uuid = { workspace = true }
 

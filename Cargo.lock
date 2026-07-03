@@ -535,6 +535,7 @@ dependencies = [
  "async-trait",
  "base64",
  "chrono",
+ "getrandom 0.4.3",
  "hex",
  "rand 0.10.1",
  "serde",
@@ -555,6 +556,7 @@ dependencies = [
  "base64",
  "blake3",
  "ed25519-dalek",
+ "getrandom 0.4.3",
  "hex",
  "rand 0.10.1",
  "serde",
@@ -808,6 +810,7 @@ dependencies = [
  "astrid-core",
  "async-trait",
  "chrono",
+ "getrandom 0.3.4",
  "keyring",
  "serde",
  "serde_json",
@@ -855,6 +858,7 @@ name = "astrid-types"
 version = "0.9.2"
 dependencies = [
  "chrono",
+ "getrandom 0.4.3",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
@@ -3434,9 +3438,11 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "300e883d756b2e4ec94e02791f39b04b522276138852cfc41d9fb7e904106099"
 dependencies = [
  "cfg-if",
+ "js-sys",
  "libc",
  "r-efi 6.0.0",
  "rand_core 0.10.1",
+ "wasm-bindgen",
 ]
 
 [[package]]

@@ -110,24 +110,28 @@ where
 {
     match tokio::runtime::Handle::try_current() {
         Ok(handle) => {
+            // Multi-threaded runtime (production): block_in_place yields the
+            // worker thread to the runtime scheduler instead of spawning a new
+            // OS thread per storage operation. Nested block_in_place calls
+            // (e.g. WASM host -> interceptor -> audit append) are safe: tokio
+            // detects the thread is already in a blocking context and skips
+            // worker-thread migration, running the closure directly.
+            // `block_in_place` requires the `rt-multi-thread` feature, which is
+            // native-only (no multi-threaded runtime exists on wasm), so this
+            // branch is compiled out on wasm — where the flavor is never
+            // MultiThread anyway.
+            #[cfg(not(target_family = "wasm"))]
             if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread {
-                // Multi-threaded runtime (production): block_in_place yields
-                // the worker thread to the runtime scheduler instead of
-                // spawning a new OS thread per storage operation.
-                // Nested block_in_place calls (e.g. WASM host -> interceptor
-                // -> audit append) are safe: tokio detects the thread is
-                // already in a blocking context and skips worker-thread
-                // migration, running the closure directly.
-                tokio::task::block_in_place(|| handle.block_on(f))
-            } else {
-                // Single-threaded runtime (tests): block_in_place panics on
-                // current_thread runtimes, so fall back to a scoped thread.
-                std::thread::scope(|s| {
-                    s.spawn(|| handle.block_on(f))
-                        .join()
-                        .expect("async thread panicked")
-                })
+                return tokio::task::block_in_place(|| handle.block_on(f));
             }
+            // Single-threaded runtime (tests), and every wasm target:
+            // block_in_place panics on current_thread runtimes, so fall back to
+            // a scoped thread.
+            std::thread::scope(|s| {
+                s.spawn(|| handle.block_on(f))
+                    .join()
+                    .expect("async thread panicked")
+            })
         },
         Err(_) => {
             // No runtime (sync tests) - create a temporary one.

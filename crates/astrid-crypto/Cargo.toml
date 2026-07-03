@@ -22,5 +22,13 @@ zeroize = { workspace = true }
 serde_json = { workspace = true }
 tempfile = { workspace = true }
 
+# rand 0.10 (and ed25519-dalek's rand_core path) pull getrandom 0.4, which
+# refuses to build for wasm32-unknown-unknown unless its `wasm_js` backend is
+# enabled. wasm-only; native builds are unaffected. Requires the build to be
+# run with RUSTFLAGS='--cfg getrandom_backend="wasm_js"'
+# (see scripts/check-wasm-portability.sh).
+[target.'cfg(target_family = "wasm")'.dependencies]
+getrandom = { version = "0.4", features = ["wasm_js"] }
+
 [lints]
 workspace = true

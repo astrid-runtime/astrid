@@ -187,7 +187,19 @@ tar = "0.4"
 teloxide = { version = "0.13", default-features = false, features = ["macros", "rustls", "ctrlc_handler"] }
 tempfile = "3"
 thiserror = "2.0"
-tokio = { version = "1.49", features = ["sync", "macros", "time", "rt", "rt-multi-thread", "net", "io-util", "signal"] }
+# Base feature set is restricted to the portable subset that compiles on
+# every supported target, including `wasm32-unknown-unknown` (browser host
+# profile groundwork). `[workspace.dependencies]` features are ADDITIVE with
+# each consumer's own `features = [...]`, so any native-only feature listed
+# here is force-enabled on every `workspace = true` consumer — even leaf
+# semantics crates that only want `sync`/`time`. `net` and `signal` pull in
+# `mio`, and `rt-multi-thread` needs OS threads; all three `compile_error!`
+# (or fail to link) on wasm. They are declared locally by the crates that
+# actually need them (uplink/cli/kernel/gateway/capsule for `net`,
+# daemon/kernel for `signal`, and
+# daemon/emit/cli/capsule-install/capsule/hooks/kernel/gateway for
+# `rt-multi-thread`).
+tokio = { version = "1.49", features = ["sync", "macros", "time", "rt", "io-util"] }
 tokio-util = "0.7"
 toml = "0.9"
 # Middleware substrate axum is built on (`Service` trait composition,

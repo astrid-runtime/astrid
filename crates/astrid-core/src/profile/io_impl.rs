@@ -12,6 +12,8 @@
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+// Only used by the `#[cfg(unix)]` atomic-write path below.
+#[cfg(unix)]
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::{PrincipalProfile, ProfileError, ProfileResult};
@@ -92,6 +94,7 @@ impl PrincipalProfile {
 /// Per-process monotonic counter disambiguating concurrent tmp filenames.
 /// PID alone is not enough — two threads in the same daemon calling `save`
 /// would race on the same tmp path and corrupt each other's writes.
+#[cfg(unix)]
 static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 fn write_atomic(path: &Path, data: &[u8]) -> ProfileResult<()> {

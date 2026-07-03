@@ -71,7 +71,9 @@ syntect = { workspace = true }
 tar = { workspace = true }
 tempfile = { workspace = true }
 thiserror = { workspace = true }
-tokio = { workspace = true }
+# `net` (socket/TCP clients), `rt-multi-thread` (`#[tokio::main]`): native-only,
+# no longer in the workspace tokio base.
+tokio = { workspace = true, features = ["net", "rt-multi-thread"] }
 toml = { workspace = true }
 toml_edit = "0.25.3"
 tracing = { workspace = true }

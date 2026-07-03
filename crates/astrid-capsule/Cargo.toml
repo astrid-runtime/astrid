@@ -47,7 +47,9 @@ sha2 = { workspace = true }
 socket2 = "0.6"
 tempfile = { workspace = true }
 thiserror = { workspace = true }
-tokio = { workspace = true }
+# `net` (host net fns + socket handshake) and `rt-multi-thread`
+# (`block_in_place` host bridges): native-only, no longer in the tokio base.
+tokio = { workspace = true, features = ["net", "rt-multi-thread"] }
 tokio-util = { workspace = true }
 toml = { workspace = true }
 tracing = { workspace = true }

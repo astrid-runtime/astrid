@@ -9,6 +9,8 @@ use std::collections::HashMap;
 use std::fs;
 use std::io;
 use std::path::Path;
+// Only used by the `#[cfg(unix)]` atomic-write path below.
+#[cfg(unix)]
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::Serialize;
@@ -66,6 +68,7 @@ impl GroupConfig {
     }
 }
 
+#[cfg(unix)]
 static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 fn write_atomic(path: &Path, data: &[u8]) -> GroupConfigResult<()> {

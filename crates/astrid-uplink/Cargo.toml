@@ -16,7 +16,8 @@ astrid-types = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
-tokio = { workspace = true }
+# `net`: Unix-socket/TCP client transport; native-only, not in the tokio base.
+tokio = { workspace = true, features = ["net"] }
 tracing = { workspace = true }
 uuid = { workspace = true }
 
