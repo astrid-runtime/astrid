@@ -1,6 +1,7 @@
 //! Capsule management commands - install, list, and inspect capsules.
 
 pub(crate) mod build;
+pub(crate) mod check;
 pub(crate) mod config;
 pub(crate) mod deps;
 pub(crate) mod install;

@@ -224,8 +224,8 @@ impl CommandKind {
 /// `CapsuleCommands` variant's clap name appears here; if you add a
 /// built-in `astrid capsule` subcommand, add its name here too.
 pub const RESERVED_CAPSULE_VERBS: &[&str] = &[
-    "new", "install", "update", "list", "remove", "tree", "deps", "build", "config", "show", "run",
-    "help",
+    "new", "install", "update", "list", "remove", "tree", "deps", "build", "check", "config",
+    "show", "run", "help",
 ];
 
 /// Information about a registered capsule command.
