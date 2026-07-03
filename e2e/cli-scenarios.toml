@@ -442,9 +442,10 @@ principal = "local_cli"
 
 [commands."capsule check"]
 scenario = "capsule_authoring_smoke"
-status = "mapped"
+status = "waived"
 mode = "filesystem"
 principal = "local_cli"
+reason = "Static, offline linter with no runtime or daemon surface; its behaviour is fully covered by unit tests (check_tests.rs), so it is intentionally not wired into the runtime harness."
 
 [commands."capsule config"]
 scenario = "capsule_env_config"
