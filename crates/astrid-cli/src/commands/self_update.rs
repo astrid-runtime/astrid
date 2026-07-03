@@ -99,18 +99,48 @@ fn is_homebrew_managed(exe: &Path) -> bool {
     })
 }
 
+/// The cargo install-bin directories to test a binary against: `$CARGO_HOME/bin`
+/// (if set) and the default `~/.cargo/bin`, each canonicalized where possible so
+/// a symlinked cargo home still matches the canonicalized running-binary path.
+fn cargo_bin_dirs() -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    let mut push = |base: PathBuf| {
+        let bin = base.join("bin");
+        // Canonicalize so a symlinked cargo home resolves to the same real path
+        // `running_binary()` produced; fall back to the raw join if it can't.
+        dirs.push(bin.canonicalize().unwrap_or(bin));
+    };
+    if let Some(home) = std::env::var_os("CARGO_HOME") {
+        push(PathBuf::from(home));
+    }
+    if let Some(base) = directories::BaseDirs::new() {
+        push(base.home_dir().join(".cargo"));
+    }
+    dirs
+}
+
 /// Whether `exe` is a `cargo install`-managed binary. Cargo installs land in
-/// `$CARGO_HOME/bin` (default `~/.cargo/bin`), so the resolved path contains a
-/// `.cargo` directory component immediately followed by `bin`. Such installs
-/// update via `cargo install`, not an in-place binary swap. A non-default
-/// `CARGO_HOME` outside `.cargo/bin` simply falls through to `SelfManaged`,
-/// which still updates correctly (it swaps the binary in whatever dir it lives).
+/// `$CARGO_HOME/bin` (default `~/.cargo/bin`). Such installs update via
+/// `cargo install`, not an in-place binary swap. Detection tries the resolved
+/// cargo-bin directories first (honouring a custom `CARGO_HOME` and resolving
+/// symlinks), then falls back to a structural check — a `.cargo` path component
+/// immediately followed by `bin`, compared as `OsStr` so a non-UTF-8 component
+/// neither drops out nor misaligns the pair. A cargo install we still fail to
+/// recognise simply classifies as `SelfManaged` and updates in place, which
+/// works (it swaps the binary wherever it lives) — only the shown upgrade hint
+/// differs.
 fn is_cargo_managed(exe: &Path) -> bool {
-    let comps: Vec<&str> = exe
+    use std::ffi::OsStr;
+    if cargo_bin_dirs().iter().any(|dir| exe.starts_with(dir)) {
+        return true;
+    }
+    let comps: Vec<&OsStr> = exe
         .components()
-        .filter_map(|c| c.as_os_str().to_str())
+        .map(std::path::Component::as_os_str)
         .collect();
-    comps.windows(2).any(|w| w[0] == ".cargo" && w[1] == "bin")
+    comps
+        .windows(2)
+        .any(|w| w[0] == OsStr::new(".cargo") && w[1] == OsStr::new("bin"))
 }
 
 /// How the running `astrid` binary is managed. Determines how an update is
@@ -277,8 +307,10 @@ pub(crate) async fn check_for_update_cached() -> Option<String> {
     (latest > current).then(|| version_str.to_string())
 }
 
-/// Print an install-aware update banner if a newer version is available.
-/// Homebrew installs are told to `brew upgrade`; everyone else `astrid update`.
+/// Print an install-aware update banner if a newer version is available. The
+/// upgrade command matches the install method ([`InstallMethod::upgrade_command`]):
+/// Homebrew → `brew upgrade astrid`, cargo → `cargo install astrid --force`,
+/// self-managed → `astrid update`.
 pub(crate) async fn print_update_banner() {
     let Some(latest) = check_for_update_cached().await else {
         return;
