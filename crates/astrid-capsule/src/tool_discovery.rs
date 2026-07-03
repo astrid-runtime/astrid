@@ -91,9 +91,6 @@ fn parse_tool_descriptors(payload: &[u8]) -> anyhow::Result<Vec<ToolDescriptor>>
     Ok(parsed.tools)
 }
 
-/// The topic prefix an execute call for tool `<name>` is dispatched on.
-const TOOL_EXECUTE_PREFIX: &str = "tool.v1.execute.";
-
 /// Names of advertised tools that no interceptor route will ever deliver an
 /// execute call to.
 ///
@@ -112,10 +109,15 @@ pub fn tools_missing_execute_route<'a>(
     tools: &'a [ToolDescriptor],
     interceptors: &[crate::manifest::InterceptorDef],
 ) -> Vec<&'a str> {
+    // No interceptors at all → no tool can be routed; every advertised tool is
+    // missing its route. Short-circuit before per-tool topic formatting.
+    if interceptors.is_empty() {
+        return tools.iter().map(|tool| tool.name.as_str()).collect();
+    }
     tools
         .iter()
         .filter(|tool| {
-            let topic = format!("{TOOL_EXECUTE_PREFIX}{}", tool.name);
+            let topic = format!("{}{}", crate::topic::TOOL_EXECUTE_PREFIX, tool.name);
             !interceptors
                 .iter()
                 .any(|def| crate::topic::topic_matches(&topic, &def.event))
