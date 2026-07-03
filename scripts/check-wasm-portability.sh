@@ -33,7 +33,7 @@ if ! rustup target list --installed 2>/dev/null | grep -qx "$TARGET"; then
   exit 1
 fi
 
-export RUSTFLAGS='--cfg getrandom_backend="wasm_js"'
+export RUSTFLAGS="${RUSTFLAGS:-} --cfg getrandom_backend=\"wasm_js\""
 
 for crate in "${CRATES[@]}"; do
   echo "==> cargo check --target $TARGET -p $crate"
