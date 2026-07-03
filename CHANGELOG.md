@@ -9,6 +9,11 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
 
 ## [Unreleased]
 
+### Fixed
+
+- **First-run consent no longer storms a `GrantRequired` for every ungranted capsule in the caller's view.** The dispatch access gate ran the grant-on-use check — and emitted a `GrantRequired` signal — for every ungranted capsule in the caller's view *before* checking whether the capsule's subscription matched the dispatched topic. A single `tools/call` on a fresh principal therefore fired a grant prompt for every ungranted view capsule, including all the capsules the call never touched, making first-run consent effectively unconvergeable. The gate now evaluates the cheap, manifest-local interceptor topic-match first (using the same `crate::topic::topic_matches` the delivery push uses) and engages the per-principal access gate only for a capsule that actually provides an interceptor for the requested topic; a non-matching capsule never reaches the gate. A matching ungranted capsule still fail-closed drops and signals exactly once, and behaviour for granted capsules, interceptor ordering, and non-tool topics is unchanged. Closes #1113.
+- **The MCP shim now resolves every grant a single `tools/call` needs, instead of only the first.** The shim resolved exactly one `grant_required` per call — it elicited consent, re-sent the call once, and passed the re-send's reply straight to the result reshaper — so when the re-sent call tripped the access gate on a *different* ungranted capsule, that second `grant_required` reply was returned to the client as the tool result (empty content, `isError: false`): a phantom empty success, while the broker kept a pending marker for a prompt that never surfaced. The shim now loops resolve→re-send→re-classify until the reply is grant-free or a bound (`MAX_GRANT_RESOLUTIONS = 8`, a distro's worth) trips; a present grant signal is never classified as terminal, so the only exits are a grant-free reply or an honest `isError` (malformed / denied / bound exceeded) — never a fabricated empty success. Ingress, approval-elicitation, grant dedup/marker, and fail-secure deny paths are preserved. Closes #1117.
+
 ## [0.9.1] - 2026-07-02
 
 ### Added
