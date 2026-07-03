@@ -6,7 +6,7 @@
 //! enforces this at the parser; the tests below pin the contract so a
 //! refactor can't quietly regress it.
 
-use astrid_capsule::manifest::{EnvDef, EnvScope};
+use astrid_capsule_types::manifest::{EnvDef, EnvScope};
 
 #[test]
 fn env_def_scope_is_not_deserialized_from_manifest() {
