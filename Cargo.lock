@@ -756,6 +756,7 @@ dependencies = [
  "astrid-capabilities",
  "astrid-capsule",
  "astrid-capsule-install",
+ "astrid-capsule-types",
  "astrid-config",
  "astrid-core",
  "astrid-crypto",
