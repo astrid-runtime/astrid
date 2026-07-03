@@ -12,6 +12,7 @@ use crate::engine::ExecutionEngine;
 use crate::engine::wasm::host_state::{
     ConnectionIdentity, HostState, LifecyclePhase, PrincipalCancelTokens, PrincipalMount,
 };
+use crate::engine::wasm::limits::CapsuleRuntimeLimitsExt;
 use crate::error::{CapsuleError, CapsuleResult};
 use crate::manifest::CapsuleManifest;
 

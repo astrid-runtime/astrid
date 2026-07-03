@@ -1,0 +1,28 @@
+[package]
+name = "astrid-capsule-types"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Engine-agnostic capsule types shared by all Astrid capsule engines"
+
+[dependencies]
+astrid-core = { workspace = true }
+dashmap = { workspace = true }
+parking_lot = { workspace = true }
+semver = { workspace = true, features = ["serde"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+toml = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+nix = { workspace = true }
+
+[lints.rust]
+unsafe_code = "deny"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }

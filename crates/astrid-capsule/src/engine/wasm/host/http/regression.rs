@@ -23,8 +23,8 @@ use crate::engine::wasm::limits::HttpLimits;
 use crate::engine::wasm::test_fixtures::minimal_host_state;
 use crate::security::AllowAllGate;
 
-use super::ssrf::MAX_HTTP_REDIRECTS;
 use super::{ErrorCode, HttpMethod, HttpRequestData, KeyValuePair, RedirectPolicy, RequestOptions};
+use astrid_capsule_types::limits::MAX_HTTP_REDIRECTS;
 
 // ── FIX 1: duplicate headers + non-ASCII header values ─────────────────
 

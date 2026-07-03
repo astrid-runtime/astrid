@@ -13,17 +13,6 @@ use crate::security::net_connect_pattern_matches;
 
 use super::ErrorCode;
 
-/// DEFAULT maximum redirect hops. The single source of truth for the redirect
-/// default: [`HttpLimits::default`](crate::engine::wasm::limits::HttpLimits::default)
-/// reads this, and the `[http]` config `max_redirects` default mirrors it.
-/// Matches reqwest's historical default. The hop ceiling actually enforced in
-/// the request path is the resolved
-/// [`HttpLimits::max_redirects`](crate::engine::wasm::limits::HttpLimits::max_redirects)
-/// (operator-configurable), enforced by the manual-follow loop in
-/// `follow_redirects`; each redirect target is independently airlocked per hop
-/// via [`redirect_target_blocked`].
-pub(crate) const MAX_HTTP_REDIRECTS: usize = 10;
-
 /// A DNS resolver that prevents SSRF by blocking resolution to local,
 /// private, or multicast IP addresses.
 ///

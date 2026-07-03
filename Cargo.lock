@@ -452,6 +452,7 @@ dependencies = [
  "arc-swap",
  "astrid-approval",
  "astrid-capabilities",
+ "astrid-capsule-types",
  "astrid-core",
  "astrid-crypto",
  "astrid-events",
@@ -513,6 +514,21 @@ dependencies = [
  "tokio",
  "tracing",
  "uuid",
+]
+
+[[package]]
+name = "astrid-capsule-types"
+version = "0.9.2"
+dependencies = [
+ "astrid-core",
+ "dashmap",
+ "nix 0.31.3",
+ "parking_lot",
+ "semver",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "toml 0.9.12+spec-1.1.0",
 ]
 
 [[package]]
