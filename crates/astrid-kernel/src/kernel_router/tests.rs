@@ -526,7 +526,7 @@ async fn get_agent_readiness_returns_readiness_response() {
         message: msg,
     });
 
-    let value = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+    let value = astrid_runtime::time::timeout(std::time::Duration::from_secs(2), async {
         loop {
             let event = rx.recv().await.expect("response event");
             if let astrid_events::AstridEvent::Ipc { message, .. } = &*event
@@ -843,7 +843,7 @@ async fn request_kernel(
         message: msg,
     });
 
-    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+    astrid_runtime::time::timeout(std::time::Duration::from_secs(2), async {
         loop {
             let event = rx.recv().await.expect("response event");
             if let astrid_events::AstridEvent::Ipc { message, .. } = &*event

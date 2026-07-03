@@ -164,7 +164,7 @@ pub(super) async fn provision_new_principal(
 
 fn warm_created_principal(kernel: &Arc<crate::Kernel>, principal: PrincipalId) {
     let kernel = Arc::clone(kernel);
-    tokio::spawn(async move {
+    astrid_runtime::spawn(async move {
         kernel.ensure_principal_loaded(&principal).await;
         kernel.publish_capsules_loaded().await;
     });
