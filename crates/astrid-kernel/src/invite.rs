@@ -107,7 +107,7 @@ impl InviteStore {
     /// # Errors
     /// Returns an error if the file exists but is unreadable or malformed.
     pub fn load(&self) -> Result<Vec<Invite>, InviteStoreError> {
-        // Pairing persistence is native-only; the browser store is in-memory
+        // Invite persistence is native-only; the browser store is in-memory
         // (always empty) and never reads disk.
         #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
         {
@@ -145,7 +145,7 @@ impl InviteStore {
     /// # Errors
     /// Returns an error if the file cannot be written.
     pub fn save(&self, invites: &[Invite]) -> Result<(), InviteStoreError> {
-        // Pairing persistence is native-only; the browser store is in-memory
+        // Invite persistence is native-only; the browser store is in-memory
         // and silently drops writes rather than touching disk.
         #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
         {

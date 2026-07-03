@@ -98,7 +98,10 @@ pub struct Kernel {
     /// visible to Agent B. Native-only (`astrid-vfs` / `cap-std`).
     #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
     pub overlay_registry: Arc<OverlayVfsRegistry>,
-    /// The global physical root handle (cap-std) for the VFS.
+    /// The global physical root handle for the VFS. On native hosts the
+    /// composition root registers it as the cap-std workspace root; the
+    /// browser profile keeps the handle (it is engine-agnostic) but gates
+    /// out the cap-std-backed `astrid-vfs` machinery behind it.
     pub vfs_root_handle: DirHandle,
     /// The physical path the VFS is mounted to.
     pub workspace_root: PathBuf,
@@ -569,22 +572,37 @@ impl Kernel {
         // Load group config (issue #670). Boot-loaded once, then swapped
         // atomically by Layer 6 admin topics (issue #672). Missing file
         // → built-ins only; malformed TOML is a hard boot failure
-        // (fail-closed).
+        // (fail-closed). Native-only: `etc/groups.toml` is disk state, and
+        // on `wasm32-unknown-unknown` `std::fs` reads fail with
+        // `ErrorKind::Unsupported` — which is NOT the `NotFound` the loader
+        // maps to built-ins, so an ungated load would hard-fail every
+        // browser boot through the fail-closed arm.
+        #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
         let groups_loaded = GroupConfig::load(&home)
             .map_err(|e| std::io::Error::other(format!("Failed to load groups config: {e}")))?;
+        #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+        let groups_loaded = GroupConfig::builtin_only();
         let groups = Arc::new(ArcSwap::from_pointee(groups_loaded));
 
-        // Bootstrap the CLI root user (idempotent). Also seeds the
-        // default principal's profile with `groups = ["admin"]` so
-        // single-tenant deployments get full management-API access.
-        bootstrap_cli_root_user(&identity_store, &home)
-            .await
-            .map_err(|e| {
-                std::io::Error::other(format!("Failed to bootstrap CLI root user: {e}"))
-            })?;
+        // Bootstrap the CLI root user and apply config-file identity links.
+        // Native-only: both are CLI/disk concepts (the root-user seed writes
+        // the default principal's profile under `etc/`, and identity links
+        // come from on-disk config); the browser host establishes identity
+        // through its own uplink instead.
+        #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+        {
+            // Bootstrap the CLI root user (idempotent). Also seeds the
+            // default principal's profile with `groups = ["admin"]` so
+            // single-tenant deployments get full management-API access.
+            bootstrap_cli_root_user(&identity_store, &home)
+                .await
+                .map_err(|e| {
+                    std::io::Error::other(format!("Failed to bootstrap CLI root user: {e}"))
+                })?;
 
-        // Apply pre-configured identity links from config.
-        apply_identity_config(&identity_store, &workspace_root).await;
+            // Apply pre-configured identity links from config.
+            apply_identity_config(&identity_store, &workspace_root).await;
+        }
 
         let kernel = Arc::new(Self {
             session_id,
