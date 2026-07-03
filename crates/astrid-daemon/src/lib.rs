@@ -269,12 +269,23 @@ pub async fn run() -> Result<()> {
     {
         let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
             .context("failed to register SIGTERM handler")?;
+        // The daemon detaches into its own session at startup (`setsid`), so it
+        // has no controlling terminal to send it a SIGHUP on close. But an
+        // explicit `kill -HUP` (or a SIGHUP that raced the detach) would
+        // otherwise hit the default disposition — terminate WITHOUT running the
+        // graceful shutdown below, leaking stale run files. Handle it on the
+        // same clean path as SIGTERM.
+        let mut sighup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())
+            .context("failed to register SIGHUP handler")?;
         tokio::select! {
             _ = tokio::signal::ctrl_c() => {
                 tracing::info!("Received SIGINT, shutting down");
             }
             _ = sigterm.recv() => {
                 tracing::info!("Received SIGTERM, shutting down");
+            }
+            _ = sighup.recv() => {
+                tracing::info!("Received SIGHUP, shutting down");
             }
             _ = shutdown_rx.wait_for(|v| *v) => {
                 tracing::info!("Received API shutdown request, shutting down");

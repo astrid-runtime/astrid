@@ -210,25 +210,124 @@ pub(crate) async fn spawn_persistent_daemon() -> Result<()> {
     Ok(())
 }
 
+/// What `astrid start` should do, decided from two cheap probes: whether the
+/// daemon answered on its socket, and whether a recorded daemon PID is still
+/// alive. Kept pure so the branching is unit-testable without a live daemon.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StartAction {
+    /// A daemon answered on the socket — it is already running, leave it (and
+    /// its live run files) untouched.
+    AlreadyRunning,
+    /// The socket is unreachable but a recorded daemon PID is still alive — the
+    /// daemon is present but not yet (or no longer) serving: mid-boot, mid-
+    /// shutdown, wedged, or a PID that has been recycled by an unrelated
+    /// process. `start` must NOT clobber it — killing a booting daemon or an
+    /// innocent recycled PID is a serious fail-open — so it reports and defers
+    /// to `astrid restart` (which owns the identity-gated force-recycle). No
+    /// sentinels are touched.
+    RunningButUnreachable,
+    /// No daemon answered and no recorded process is alive — a clean slate or a
+    /// crashed daemon's stale run files. Clear any stale sentinels and spawn.
+    HealAndSpawn,
+}
+
+/// Decide the start action from the two liveness probes. Pure over its inputs so
+/// the "already running vs defer-to-restart vs self-heal" split is testable
+/// without spawning a daemon.
+///
+/// The ordering is what keeps `start` from ever killing or clobbering a live
+/// daemon: a reachable daemon is `AlreadyRunning`; a live-but-unreachable one
+/// (which includes a daemon still binding its socket during boot) is
+/// `RunningButUnreachable` and left strictly alone; only a *dead* recorded PID
+/// reaches `HealAndSpawn`, where clearing the stale sentinels is safe because
+/// nothing live owns them.
+fn decide_start_action(socket_reachable: bool, recorded_pid_alive: bool) -> StartAction {
+    if socket_reachable {
+        StartAction::AlreadyRunning
+    } else if recorded_pid_alive {
+        StartAction::RunningButUnreachable
+    } else {
+        StartAction::HealAndSpawn
+    }
+}
+
+/// Whether a start action proceeds to clear stale sentinels and spawn a fresh
+/// daemon. Only [`StartAction::HealAndSpawn`] does — a dead recorded PID means
+/// no live daemon owns the run files, so clearing them is safe. A reachable
+/// daemon ([`StartAction::AlreadyRunning`]) and a live-but-unreachable one
+/// ([`StartAction::RunningButUnreachable`]) both leave every sentinel intact.
+/// Pure predicate so the "dead recorded PID → sentinels cleared; any live daemon
+/// → left intact" invariant is testable.
+fn start_clears_sentinels(action: StartAction) -> bool {
+    matches!(action, StartAction::HealAndSpawn)
+}
+
 /// Handle `astrid start`.
+///
+/// Fast path: a daemon answering on the socket is already running — do nothing.
+///
+/// Otherwise the socket is absent or unreachable. Two cases, split on whether a
+/// recorded daemon PID is still alive:
+///
+/// - **Alive** (booting, mid-shutdown, wedged, or a recycled PID): the daemon is
+///   present but not serving. `start` refuses to touch it — killing a daemon
+///   that is merely still binding its socket, or an innocent process that
+///   recycled the PID, is a fail-open — and points the operator at
+///   `astrid restart`, which owns the identity-gated force-recycle. No sentinels
+///   are removed.
+/// - **Dead/absent**: a crashed daemon left stale run files
+///   (`run/system.{sock,pid,ready}`) behind. Clear ALL of them and spawn onto a
+///   clean run-dir, so a crashed daemon transparently recovers on the next
+///   `astrid start`, not only on `restart`. Clearing is safe precisely because
+///   no live process owns those files.
+///
+/// This never removes a live daemon's socket or signals a live process — the
+/// only mutation happens when the recorded daemon is provably gone.
 pub(crate) async fn handle_start() -> Result<()> {
     let socket_path = socket_client::proxy_socket_path();
+    let ready_path = socket_client::readiness_path();
+    let pid_path = socket_client::pid_path();
 
-    // Check if daemon is already running
-    if socket_path.exists() {
-        if let Ok(_stream) = tokio::net::UnixStream::connect(&socket_path).await {
+    let socket_reachable =
+        socket_path.exists() && tokio::net::UnixStream::connect(&socket_path).await.is_ok();
+    let recorded_pid_alive = daemon_control::read_pid_file(&pid_path)
+        .is_some_and(|(pid, _)| daemon_control::is_process_alive(pid));
+
+    match decide_start_action(socket_reachable, recorded_pid_alive) {
+        StartAction::AlreadyRunning => {
             println!(
                 "{}",
                 theme::Theme::warning("Astrid daemon is already running.")
             );
-            return Ok(());
-        }
-        // Stale socket — clean up
-        let _ = std::fs::remove_file(&socket_path);
-        let _ = std::fs::remove_file(socket_client::readiness_path());
+            Ok(())
+        },
+        StartAction::RunningButUnreachable => {
+            // A recorded daemon PID is alive but the socket isn't answering. The
+            // daemon may still be binding its socket (boot), shutting down, or
+            // wedged — or the PID may have been recycled by an unrelated process.
+            // `start` does not force-recycle: it must not kill a booting daemon
+            // or an innocent recycled PID, so it defers to `astrid restart`,
+            // which does the identity-gated SIGTERM→SIGKILL. Leave every sentinel
+            // in place.
+            println!(
+                "{}",
+                theme::Theme::warning(
+                    "An Astrid daemon appears to be running but its socket is not reachable yet \
+                     (it may be starting up). If it stays unreachable, run `astrid restart`.",
+                )
+            );
+            Ok(())
+        },
+        StartAction::HealAndSpawn => {
+            // Dead/absent recorded PID: a crashed daemon's stale run files. No
+            // live process owns them, so clear ALL stale sentinels (socket,
+            // readiness, PID) and spawn onto a clean run-dir.
+            let _ = std::fs::remove_file(&socket_path);
+            let _ = std::fs::remove_file(&ready_path);
+            let _ = std::fs::remove_file(&pid_path);
+            spawn_persistent_daemon().await
+        },
     }
-
-    spawn_persistent_daemon().await
 }
 
 /// Handle `astrid status`.
@@ -546,5 +645,42 @@ mod tests {
         // start can find the recorded PID and act on it.
         assert!(!stop_confirmed_gone(KillOutcome::StillAlive));
         assert!(!stop_confirmed_gone(KillOutcome::Unverified(4242)));
+    }
+
+    /// A reachable daemon is already running — regardless of whether a recorded
+    /// PID looks alive, `start` must take the fast path and leave the live run
+    /// files untouched (never clear sentinels).
+    #[test]
+    fn start_reachable_daemon_is_already_running() {
+        assert_eq!(
+            decide_start_action(true, false),
+            StartAction::AlreadyRunning
+        );
+        assert_eq!(decide_start_action(true, true), StartAction::AlreadyRunning);
+        assert!(!start_clears_sentinels(StartAction::AlreadyRunning));
+    }
+
+    /// REGRESSION (daemon-detach self-heal): a crashed daemon leaves stale run
+    /// files with a DEAD recorded PID. On the next `astrid start` the socket is
+    /// unreachable and the PID is dead → clear ALL stale sentinels and spawn,
+    /// so the stale run-dir recovers transparently (not only on `restart`).
+    #[test]
+    fn start_unreachable_with_dead_pid_heals_and_spawns() {
+        let action = decide_start_action(false, false);
+        assert_eq!(action, StartAction::HealAndSpawn);
+        assert!(start_clears_sentinels(action));
+    }
+
+    /// SAFETY INVARIANT: a recorded daemon PID that is still alive but whose
+    /// socket is unreachable (a daemon mid-boot still binding its socket, mid-
+    /// shutdown, wedged, or a recycled PID) must NEVER be killed or have its
+    /// sentinels cleared by `start` — that would clobber a booting daemon or an
+    /// innocent process. `start` defers to `restart`, leaving every sentinel
+    /// intact.
+    #[test]
+    fn start_unreachable_with_live_pid_defers_and_leaves_sentinels() {
+        let action = decide_start_action(false, true);
+        assert_eq!(action, StartAction::RunningButUnreachable);
+        assert!(!start_clears_sentinels(action));
     }
 }
