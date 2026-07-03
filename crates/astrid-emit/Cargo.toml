@@ -22,7 +22,8 @@ astrid-types = { workspace = true }
 astrid-uplink = { workspace = true }
 clap = { workspace = true }
 serde_json = { workspace = true }
-tokio = { workspace = true }
+# `rt-multi-thread`: `#[tokio::main]`; native-only, not in the tokio base.
+tokio = { workspace = true, features = ["rt-multi-thread"] }
 
 [lints]
 workspace = true

@@ -25,5 +25,12 @@ uuid = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 
+# `block_on`'s production path uses `tokio::task::block_in_place`, which is
+# gated behind `rt-multi-thread` — native-only (needs OS threads, absent on
+# wasm). The wasm build cfg-gates that branch out (see src/storage.rs), so the
+# feature is only needed off-wasm.
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread"] }
+
 [lints]
 workspace = true
