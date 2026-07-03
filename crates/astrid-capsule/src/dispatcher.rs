@@ -822,6 +822,15 @@ fn dispatch_single(
 /// admin holding `*`). The grant-on-use filter is keyed on the **topic**, so a
 /// dual-role capsule's orchestration interceptors (on non-tool topics) are
 /// view-scoped but not grant-gated.
+///
+/// The gate engages **only for capsules whose subscription actually matches the
+/// dispatched topic**. The cheap, manifest-local interceptor match is evaluated
+/// first (using the same [`crate::topic::topic_matches`] delivery uses), and a
+/// capsule that provides no interceptor for `topic` never reaches the access
+/// gate — so a single tool call cannot storm `GrantRequired` across every
+/// ungranted capsule in the view (#1113). Only a capsule that *would* be
+/// delivered the call is gated.
+///
 /// For an **authenticated, non-admin** caller a denied match is no longer a
 /// pure silent drop: before dropping, a [`IpcPayload::GrantRequired`] signal is
 /// published on `astrid.v1.approval` (grant-on-first-use, #998) so a broker/shim
@@ -865,10 +874,36 @@ async fn find_matching_interceptors(
         if !matches!(capsule.state(), crate::capsule::CapsuleState::Ready) {
             continue;
         }
-        // Per-principal access gate for the user-invocable surface.
-        // Fail-closed: with the gate engaged and a resolver wired, an
-        // ungranted (or unknown/anonymous) caller drops this capsule's
-        // tool interceptors entirely.
+        // Resolve the capsule's matching interceptors FIRST (#1113). The
+        // subscription match is cheap and manifest-local; evaluating it before
+        // the access gate means the grant-on-use gate — and its
+        // `GrantRequired` emit — engages only for a capsule that actually
+        // provides an interceptor for THIS topic. Without this ordering a
+        // single tool call storms `GrantRequired` across every ungranted
+        // capsule in the caller's view, regardless of what the call touched.
+        //
+        // RFC cargo-like-manifest: `effective_interceptors()` reads the
+        // `[subscribe].handler` bindings (new-form entries get the default
+        // priority, 100). The matcher is the SAME `crate::topic::topic_matches`
+        // the delivery push below uses — the gate and delivery must never
+        // diverge, or a matching capsule could be gated by one matcher and
+        // delivered by another.
+        let mut capsule_matches: Vec<(String, u32)> = Vec::new();
+        for interceptor in capsule.manifest().effective_interceptors() {
+            if crate::topic::topic_matches(topic, &interceptor.event) {
+                capsule_matches.push((interceptor.action, interceptor.priority));
+            }
+        }
+        // A capsule that provides no interceptor for this topic never reaches
+        // the gate: it simply does not match, exactly as before.
+        if capsule_matches.is_empty() {
+            continue;
+        }
+        // Per-principal access gate for the user-invocable surface, now scoped
+        // to capsules that DO match the topic. Fail-closed: with the gate
+        // engaged and a resolver wired, an ungranted (or unknown/anonymous)
+        // caller drops this capsule's matching interceptors entirely — the
+        // capsule never sees the ungranted call.
         if gate_surface
             && let Some(resolver) = access_resolver
             && !resolver.is_capsule_allowed(caller_principal, capsule.id())
@@ -890,18 +925,8 @@ async fn find_matching_interceptors(
             }
             continue;
         }
-        // RFC cargo-like-manifest: read effective interceptors
-        // — [subscribe].handler entries merged with legacy
-        // [[interceptor]] blocks. Legacy entries keep their declared
-        // priority; new-form entries get the default (100).
-        for interceptor in capsule.manifest().effective_interceptors() {
-            if crate::topic::topic_matches(topic, &interceptor.event) {
-                matches.push((
-                    Arc::clone(&capsule),
-                    interceptor.action,
-                    interceptor.priority,
-                ));
-            }
+        for (action, priority) in capsule_matches {
+            matches.push((Arc::clone(&capsule), action, priority));
         }
     }
     // Sort by priority (lower fires first), then by capsule id and action as a
