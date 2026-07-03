@@ -27,7 +27,7 @@
 //! - Single-segment wildcard: `tool.execute.*.result` matches
 //!   `tool.execute.search.result` but not `tool.execute.result`
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -42,6 +42,7 @@ use astrid_events::PrincipalKey;
 use astrid_events::{AstridEvent, EventBus, EventReceiver};
 
 mod locks;
+mod provision;
 
 /// Capacity of each per-(capsule, principal) event dispatch queue.
 ///
@@ -140,6 +141,15 @@ pub struct EventDispatcher {
     /// the surface is ungated — the kernel always wires the resolver in
     /// production so the security boundary is present at runtime.
     access_resolver: Option<CapsuleAccessResolver>,
+    /// The Astrid home under which new principals' home directories are
+    /// auto-provisioned. The kernel injects its already-booted home; tests
+    /// inject a tempdir home. When `None`, auto-provisioning is disabled
+    /// entirely (fail-closed): the dispatcher never resolves a home from
+    /// the process environment and never writes to the filesystem —
+    /// library dispatch code deciding filesystem roots from ambient env
+    /// is how `cargo test` once scaffolded a thousand fixture principals
+    /// into a developer's real `~/.astrid` (#1145).
+    home: Option<astrid_core::dirs::AstridHome>,
 }
 
 impl EventDispatcher {
@@ -157,6 +167,7 @@ impl EventDispatcher {
             identity_store: None,
             chain_locks: Arc::new(parking_lot::RwLock::new(HashMap::new())),
             access_resolver: None,
+            home: None,
         }
     }
 
@@ -164,6 +175,20 @@ impl EventDispatcher {
     #[must_use]
     pub fn with_identity_store(mut self, store: Arc<dyn astrid_storage::IdentityStore>) -> Self {
         self.identity_store = Some(store);
+        self
+    }
+
+    /// Set the Astrid home under which new principals' home directories
+    /// are auto-provisioned.
+    ///
+    /// The kernel passes its already-booted home at construction; tests
+    /// pass a tempdir home and get filesystem isolation for free. Without
+    /// this call, auto-provisioning is disabled entirely — the dispatcher
+    /// never consults the process environment and never writes to the
+    /// filesystem (fail-closed, #1145).
+    #[must_use]
+    pub fn with_home(mut self, home: astrid_core::dirs::AstridHome) -> Self {
+        self.home = Some(home);
         self
     }
 
@@ -199,14 +224,11 @@ impl EventDispatcher {
         // is N independent FIFO consumers, not a single class-keyed
         // queue collapsing the load (#813 Layer 3).
         let capsule_queues: CapsuleQueues = Arc::new(parking_lot::Mutex::new(HashMap::new()));
-        let mut known_principals: HashSet<String> = HashSet::new();
-        // The "default" principal is always provisioned by the kernel boot sequence.
-        known_principals.insert("default".to_string());
-        /// Maximum number of principals tracked before the set stops growing.
-        /// 10K principals = ~640KB of memory (64-byte strings). Beyond this,
-        /// new principals are still dispatched but not cached — they'll hit
-        /// the filesystem check on every event instead of the O(1) HashSet.
-        const MAX_KNOWN_PRINCIPALS: usize = 10_000;
+        // Auto-provisions home directories for newly seen principals under
+        // the injected home. With no injected home, provisioning is disabled
+        // entirely — no env resolution, no filesystem writes (#1145).
+        let mut provisioner =
+            provision::PrincipalProvisioner::new(self.home.clone(), self.identity_store.is_some());
         debug!("Event dispatcher started");
 
         while let Some(event) = self.receiver.recv().await {
@@ -262,54 +284,9 @@ impl EventDispatcher {
                 },
             };
 
-            // Auto-provision home directories for new principals.
-            // When an identity store is configured, only the "default"
-            // principal is auto-provisioned. Other principals must be
-            // explicitly created via the identity flow (uplink calls
-            // create_user → AstridUserId with principal → uplink sets
-            // principal on IPC). This prevents unauthenticated directory
-            // creation from arbitrary IPC principal strings.
-            if let Some(ref msg) = ipc_message
-                && let Some(ref principal_str) = msg.principal
-                && !known_principals.contains(principal_str)
-            {
-                if let Ok(pid) = astrid_core::PrincipalId::new(principal_str) {
-                    // Gate: if identity store is wired, only auto-provision
-                    // "default". Other principals are created by uplinks
-                    // which handle home provisioning after create_user.
-                    let should_provision =
-                        self.identity_store.is_none() || pid == astrid_core::PrincipalId::default();
-
-                    if should_provision && let Ok(home) = astrid_core::dirs::AstridHome::resolve() {
-                        let ph = home.principal_home(&pid);
-                        if let Err(e) = ph.ensure() {
-                            // Don't cache — allow retry on next event (#544).
-                            warn!(
-                                principal = %pid,
-                                error = %e,
-                                "Failed to auto-provision principal home"
-                            );
-                        } else {
-                            debug!(
-                                principal = %pid,
-                                "Auto-provisioned principal home directory"
-                            );
-                            // Only cache on success so transient failures
-                            // can retry on the next event (#544).
-                            if known_principals.len() < MAX_KNOWN_PRINCIPALS {
-                                known_principals.insert(principal_str.clone());
-                            }
-                        }
-                    }
-                    // If AstridHome::resolve() failed, don't cache — allow
-                    // retry when the home directory becomes available.
-                } else {
-                    warn!(
-                        principal = %principal_str,
-                        "IPC message has invalid principal string, ignoring"
-                    );
-                }
-            }
+            // Auto-provision home directories for new principals under the
+            // injected home (see `dispatcher::provision`).
+            provisioner.observe(ipc_message.as_deref().and_then(|m| m.principal.as_deref()));
 
             // Caller principal (kernel-stamped on the IPC message; `None`
             // for lifecycle events). Threaded into matching so the

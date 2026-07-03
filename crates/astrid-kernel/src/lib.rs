@@ -686,7 +686,11 @@ impl Kernel {
             Arc::clone(&kernel.event_bus),
         )
         .with_identity_store(Arc::clone(&kernel.identity_store))
-        .with_access_resolver(access_resolver);
+        .with_access_resolver(access_resolver)
+        // Inject the kernel's already-booted home so per-principal
+        // auto-provisioning happens under it — the dispatcher never
+        // resolves a home from the process environment (#1145).
+        .with_home(kernel.astrid_home.clone());
         drop(astrid_runtime::spawn(dispatcher.run()));
 
         debug_assert_eq!(
