@@ -25,10 +25,6 @@ astrid-kernel = { workspace = true }
 astrid-telemetry = { workspace = true, features = ["config"] }
 clap = { workspace = true }
 colored = { workspace = true }
-# `setsid` at startup detaches the daemon into its own session so a spawner
-# teardown / SIGHUP can't kill it before its graceful shutdown. Safe wrapper,
-# no `unsafe`.
-nix = { workspace = true }
 # `signal` (SIGTERM/SIGHUP/ctrl-c shutdown), `rt-multi-thread` (the
 # `Builder::new_multi_thread()` runtime): native-only, no longer in the
 # workspace tokio base.
@@ -36,6 +32,13 @@ tokio = { workspace = true, features = ["signal", "rt-multi-thread"] }
 toml = { workspace = true }
 tracing = { workspace = true }
 uuid = { workspace = true }
+
+# `nix` is a Unix-only crate. It is used solely for the startup `setsid` that
+# detaches the daemon into its own session (so a spawner teardown / SIGHUP can't
+# kill it before its graceful shutdown), which is itself `#[cfg(unix)]`-gated —
+# so gate the dependency the same way to keep the crate portable.
+[target.'cfg(unix)'.dependencies]
+nix = { workspace = true }
 
 [lints]
 workspace = true
