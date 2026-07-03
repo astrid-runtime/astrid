@@ -384,9 +384,17 @@ jobs:
             | jq -r '.packages[]
               | select(.publish == null)
               | select(any(.targets[]; any(.kind[]; . == "lib")))
-              | .name')
+              | [.name, .manifest_path] | @tsv')
 
-          for package in $packages; do
+          while IFS=$'\t' read -r package manifest_path; do
+            # A crate introduced by this PR has no manifest at the base SHA;
+            # cargo-public-api cannot diff against a baseline where the
+            # package does not exist, and the entire API is additive anyway.
+            rel_manifest="${manifest_path#"$GITHUB_WORKSPACE/"}"
+            if ! git cat-file -e "$BASE_SHA:$rel_manifest" 2>/dev/null; then
+              echo "$package is new in this PR (no baseline at $BASE_SHA); skipping diff."
+              continue
+            fi
             echo "::group::cargo public-api $package"
             cargo +nightly-2026-06-29 public-api \
               --package "$package" \
@@ -397,7 +405,7 @@ jobs:
               --force \
               "$BASE_SHA..HEAD"
             echo "::endgroup::"
-          done
+          done <<< "$packages"
 
   gateway-openapi-contract:
     name: Gateway OpenAPI contract
