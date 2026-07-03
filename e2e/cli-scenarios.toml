@@ -440,6 +440,12 @@ status = "covered"
 mode = "filesystem"
 principal = "local_cli"
 
+[commands."capsule check"]
+scenario = "capsule_authoring_smoke"
+status = "mapped"
+mode = "filesystem"
+principal = "local_cli"
+
 [commands."capsule config"]
 scenario = "capsule_env_config"
 status = "covered"
