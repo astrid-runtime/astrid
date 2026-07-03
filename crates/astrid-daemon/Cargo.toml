@@ -25,8 +25,13 @@ astrid-kernel = { workspace = true }
 astrid-telemetry = { workspace = true, features = ["config"] }
 clap = { workspace = true }
 colored = { workspace = true }
-# `signal` (SIGTERM/ctrl-c shutdown), `rt-multi-thread` (`#[tokio::main]`):
-# native-only, no longer in the workspace tokio base.
+# `setsid` at startup detaches the daemon into its own session so a spawner
+# teardown / SIGHUP can't kill it before its graceful shutdown. Safe wrapper,
+# no `unsafe`.
+nix = { workspace = true }
+# `signal` (SIGTERM/SIGHUP/ctrl-c shutdown), `rt-multi-thread` (the
+# `Builder::new_multi_thread()` runtime): native-only, no longer in the
+# workspace tokio base.
 tokio = { workspace = true, features = ["signal", "rt-multi-thread"] }
 toml = { workspace = true }
 tracing = { workspace = true }
