@@ -18,14 +18,25 @@ mod bus_monitor;
 /// `astrid.v1.capsules_loaded` payload assembly (opaque per-capsule metadata).
 mod capsules_loaded;
 /// Grant-on-first-use consent handler (issue #998).
+///
+/// Native-only: reuses the management-API admin grant machinery
+/// (`kernel_router::admin`), which is itself native.
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 mod grant_on_use;
 /// Persistent invite-token store (issue #756).
 pub mod invite;
 /// The Management API router listening to the `EventBus`.
+///
+/// Native-only: it drives the capsule lifecycle (Wasmtime load, disk install,
+/// discovery) and the MCP host client, none of which exist on the browser
+/// (`wasm32-unknown-unknown`) profile.
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 pub mod kernel_router;
 /// Persistent pair-device token store (issue #756).
 pub mod pair_token;
-/// The Unix Domain Socket manager.
+/// The Unix Domain Socket manager. Unix-only: binds the `UnixListener` and
+/// acquires the singleton advisory lock.
+#[cfg(unix)]
 pub mod socket;
 
 use arc_swap::ArcSwap;
@@ -39,7 +50,11 @@ use astrid_core::groups::GroupConfig;
 use astrid_core::principal::PrincipalId;
 use astrid_crypto::KeyPair;
 use astrid_events::EventBus;
+// MCP client + the cap-std VFS are native-only (the Wasmtime host surface);
+// gated out of the browser profile, which supplies its own engine and VFS.
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 use astrid_mcp::{McpClient, SecureMcpClient, ServerManager, ServersConfig};
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 use astrid_vfs::{HostVfs, OverlayVfsRegistry, Vfs};
 use dashmap::DashMap;
 use std::path::{Path, PathBuf};
@@ -57,7 +72,10 @@ pub struct Kernel {
     pub event_bus: Arc<EventBus>,
     /// The process manager (loaded WASM capsules).
     pub capsules: Arc<RwLock<CapsuleRegistry>>,
-    /// The secure MCP client with capability-based authorization and audit logging.
+    /// The secure MCP client with capability-based authorization and audit
+    /// logging. Native-only: the MCP host surface belongs to the Wasmtime
+    /// engine, absent on the browser profile.
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
     pub mcp: SecureMcpClient,
     /// The capability store for this session.
     pub capabilities: Arc<CapabilityStore>,
@@ -66,7 +84,10 @@ pub struct Kernel {
     /// Points at the unmodified workspace (no overlay). Principal-scoped
     /// overlays live in [`overlay_registry`](Self::overlay_registry) — this
     /// field is kept for kernel-internal paths that do not know a principal
-    /// (discovery, capsule load scan).
+    /// (discovery, capsule load scan). Native-only: `astrid-vfs` is built on
+    /// `cap-std`, which does not compile for the browser profile (that host
+    /// resolves paths by other means).
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
     pub vfs: Arc<dyn Vfs>,
     /// Per-principal overlay registry (Layer 4, issue #668).
     ///
@@ -74,9 +95,13 @@ pub struct Kernel {
     /// [`OverlayVfs`](astrid_vfs::OverlayVfs) from this registry on first
     /// use — lower layer is the shared workspace, upper layer is a
     /// principal-private tempdir. Agent A's uncommitted writes are never
-    /// visible to Agent B.
+    /// visible to Agent B. Native-only (`astrid-vfs` / `cap-std`).
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
     pub overlay_registry: Arc<OverlayVfsRegistry>,
-    /// The global physical root handle (cap-std) for the VFS.
+    /// The global physical root handle for the VFS. On native hosts the
+    /// composition root registers it as the cap-std workspace root; the
+    /// browser profile keeps the handle (it is engine-agnostic) but gates
+    /// out the cap-std-backed `astrid-vfs` machinery behind it.
     pub vfs_root_handle: DirHandle,
     /// The physical path the VFS is mounted to.
     pub workspace_root: PathBuf,
@@ -101,7 +126,11 @@ pub struct Kernel {
     )]
     singleton_lock: Option<std::fs::File>,
     /// Shared KV store backing all capsule-scoped stores and kernel state.
-    pub kv: Arc<astrid_storage::SurrealKvStore>,
+    ///
+    /// A trait object (`Arc<dyn KvStore>`) so a portable host can inject its
+    /// own backend; the shutdown flush goes through the trait's
+    /// [`close`](astrid_storage::KvStore::close).
+    pub kv: Arc<dyn astrid_storage::KvStore>,
     /// Chain-linked cryptographic audit log with persistent storage.
     pub audit_log: Arc<AuditLog>,
     /// The runtime ed25519 signing key (issue #929).
@@ -243,9 +272,10 @@ pub struct KernelResources {
     /// the `home://` VFS scheme root, and group/profile config locations.
     pub home: astrid_core::dirs::AstridHome,
     /// Persistent KV store backing the capability store, identity store, and
-    /// kernel state. Concrete `SurrealKvStore` (not a trait object) because the
-    /// kernel's shutdown flush calls its inherent [`close`](astrid_storage::SurrealKvStore::close).
-    pub kv: Arc<astrid_storage::SurrealKvStore>,
+    /// kernel state. A trait object (`Arc<dyn KvStore>`) so a portable host can
+    /// inject its own backend; the shutdown flush routes through the trait's
+    /// [`close`](astrid_storage::KvStore::close) rather than an inherent method.
+    pub kv: Arc<dyn astrid_storage::KvStore>,
     /// Chain-linked cryptographic audit log, opened over the runtime key.
     pub audit_log: Arc<AuditLog>,
     /// The runtime ed25519 signing key (issue #929) — shared with `audit_log`
@@ -274,7 +304,7 @@ impl KernelResources {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         home: astrid_core::dirs::AstridHome,
-        kv: Arc<astrid_storage::SurrealKvStore>,
+        kv: Arc<dyn astrid_storage::KvStore>,
         audit_log: Arc<AuditLog>,
         runtime_key: Arc<astrid_crypto::KeyPair>,
         session_token: Arc<astrid_core::session_token::SessionToken>,
@@ -297,6 +327,13 @@ impl KernelResources {
 
 impl Kernel {
     /// Boot a new Kernel instance mounted at the specified directory.
+    ///
+    /// The native composition root: resolves the Astrid home, opens the
+    /// `SurrealKV` store and audit log, loads the runtime key, binds the singleton
+    /// Unix socket, generates the session token, then delegates to the portable
+    /// [`Kernel::with_resources`]. Unix-only — the socket bind and singleton
+    /// flock have no browser-profile analogue; that host builds its own
+    /// [`KernelResources`] and calls `with_resources` directly.
     ///
     /// `runtime_limits` is the resolved per-host capsule concurrency ceiling
     /// pair (blocking vs async-I/O host calls); the daemon resolves it from
@@ -321,6 +358,7 @@ impl Kernel {
     /// be opened, the Unix socket cannot be bound (or the singleton lock is
     /// already held), or the session token cannot be generated — or if the
     /// portable wiring in [`Kernel::with_resources`] fails.
+    #[cfg(unix)]
     pub async fn new(
         session_id: SessionId,
         workspace_root: PathBuf,
@@ -340,7 +378,7 @@ impl Kernel {
 
         // Open the persistent KV store (needed by the capability store).
         let kv_path = home.state_db_path();
-        let kv = Arc::new(
+        let kv: Arc<dyn astrid_storage::KvStore> = Arc::new(
             astrid_storage::SurrealKvStore::open(&kv_path)
                 .map_err(|e| std::io::Error::other(format!("Failed to open KV store: {e}")))?,
         );
@@ -441,6 +479,10 @@ impl Kernel {
         http_limits: astrid_capsule_types::HttpLimits,
         resources: KernelResources,
     ) -> Result<Arc<Self>, std::io::Error> {
+        // The native capsule engine uses `block_in_place`, which requires a
+        // multi-thread runtime. The browser profile has no such runtime (and no
+        // `block_in_place`), so the assert is native-only.
+        #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
         assert!(
             tokio::runtime::Handle::current().runtime_flavor()
                 == tokio::runtime::RuntimeFlavor::MultiThread,
@@ -469,42 +511,52 @@ impl Kernel {
         let principal_home = home.principal_home(&default_principal);
         let home_root = Some(principal_home.root().to_path_buf());
 
-        // Initialize MCP process manager with security layer.
-        // Set workspace_root so sandboxed MCP servers have a writable directory.
-        let mcp_config = ServersConfig::load_default().unwrap_or_default();
-        let mcp_manager = ServerManager::new(mcp_config)
-            .with_workspace_root(workspace_root.clone())
-            .with_capsule_log_dir(principal_home.log_dir());
-        let mcp_client = McpClient::new(mcp_manager);
-
         // Bootstrap the capability store (persistent) over the injected KV.
         // Key rotation invalidates persisted tokens (fail-secure by design).
         let capabilities = Arc::new(
-            CapabilityStore::with_kv_store(Arc::clone(&kv) as Arc<dyn astrid_storage::KvStore>)
-                .map_err(|e| {
-                    std::io::Error::other(format!("Failed to init capability store: {e}"))
-                })?,
-        );
-        let mcp = SecureMcpClient::new(
-            mcp_client,
-            Arc::clone(&capabilities),
-            Arc::clone(&audit_log),
-            session_id.clone(),
+            CapabilityStore::with_kv_store(Arc::clone(&kv)).map_err(|e| {
+                std::io::Error::other(format!("Failed to init capability store: {e}"))
+            })?,
         );
 
-        // Establish the physical security boundary (sandbox handle)
+        // Initialize the MCP process manager with its security layer. Native
+        // only — the MCP host surface belongs to the Wasmtime engine, which the
+        // browser profile does not build. `workspace_root` is set so sandboxed
+        // MCP servers have a writable directory.
+        #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+        let mcp = {
+            let mcp_config = ServersConfig::load_default().unwrap_or_default();
+            let mcp_manager = ServerManager::new(mcp_config)
+                .with_workspace_root(workspace_root.clone())
+                .with_capsule_log_dir(principal_home.log_dir());
+            let mcp_client = McpClient::new(mcp_manager);
+            SecureMcpClient::new(
+                mcp_client,
+                Arc::clone(&capabilities),
+                Arc::clone(&audit_log),
+                session_id.clone(),
+            )
+        };
+
+        // Establish the physical security boundary (sandbox handle).
         let root_handle = DirHandle::new();
 
         // Principal-scoped overlay registry: each invoking principal
         // gets a fresh OverlayVfs on first use (Layer 4, issue #668).
         // The kernel-internal `vfs` field keeps pointing at a plain
         // HostVfs over the workspace for paths that don't yet know a
-        // principal (discovery, capsule load scan).
-        let kernel_host_vfs = HostVfs::new();
-        kernel_host_vfs
-            .register_dir(root_handle.clone(), workspace_root.clone())
-            .await
-            .map_err(|_| std::io::Error::other("Failed to register kernel workspace vfs"))?;
+        // principal (discovery, capsule load scan). Native only — `astrid-vfs`
+        // is built on `cap-std`, absent on the browser profile.
+        #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+        let vfs = {
+            let kernel_host_vfs = HostVfs::new();
+            kernel_host_vfs
+                .register_dir(root_handle.clone(), workspace_root.clone())
+                .await
+                .map_err(|_| std::io::Error::other("Failed to register kernel workspace vfs"))?;
+            Arc::new(kernel_host_vfs) as Arc<dyn Vfs>
+        };
+        #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
         let overlay_registry = Arc::new(OverlayVfsRegistry::new(
             workspace_root.clone(),
             root_handle.clone(),
@@ -512,41 +564,56 @@ impl Kernel {
 
         let allowance_store = Arc::new(astrid_approval::AllowanceStore::new());
         // Create system-wide identity store backed by the shared KV.
-        let identity_kv = astrid_storage::ScopedKvStore::new(
-            Arc::clone(&kv) as Arc<dyn astrid_storage::KvStore>,
-            "system:identity",
-        )
-        .map_err(|e| std::io::Error::other(format!("Failed to create identity KV: {e}")))?;
+        let identity_kv = astrid_storage::ScopedKvStore::new(Arc::clone(&kv), "system:identity")
+            .map_err(|e| std::io::Error::other(format!("Failed to create identity KV: {e}")))?;
         let identity_store: Arc<dyn astrid_storage::IdentityStore> =
             Arc::new(astrid_storage::KvIdentityStore::new(identity_kv));
 
         // Load group config (issue #670). Boot-loaded once, then swapped
         // atomically by Layer 6 admin topics (issue #672). Missing file
         // → built-ins only; malformed TOML is a hard boot failure
-        // (fail-closed).
+        // (fail-closed). Native-only: `etc/groups.toml` is disk state, and
+        // on `wasm32-unknown-unknown` `std::fs` reads fail with
+        // `ErrorKind::Unsupported` — which is NOT the `NotFound` the loader
+        // maps to built-ins, so an ungated load would hard-fail every
+        // browser boot through the fail-closed arm.
+        #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
         let groups_loaded = GroupConfig::load(&home)
             .map_err(|e| std::io::Error::other(format!("Failed to load groups config: {e}")))?;
+        #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+        let groups_loaded = GroupConfig::builtin_only();
         let groups = Arc::new(ArcSwap::from_pointee(groups_loaded));
 
-        // Bootstrap the CLI root user (idempotent). Also seeds the
-        // default principal's profile with `groups = ["admin"]` so
-        // single-tenant deployments get full management-API access.
-        bootstrap_cli_root_user(&identity_store, &home)
-            .await
-            .map_err(|e| {
-                std::io::Error::other(format!("Failed to bootstrap CLI root user: {e}"))
-            })?;
+        // Bootstrap the CLI root user and apply config-file identity links.
+        // Native-only: both are CLI/disk concepts (the root-user seed writes
+        // the default principal's profile under `etc/`, and identity links
+        // come from on-disk config); the browser host establishes identity
+        // through its own uplink instead.
+        #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+        {
+            // Bootstrap the CLI root user (idempotent). Also seeds the
+            // default principal's profile with `groups = ["admin"]` so
+            // single-tenant deployments get full management-API access.
+            bootstrap_cli_root_user(&identity_store, &home)
+                .await
+                .map_err(|e| {
+                    std::io::Error::other(format!("Failed to bootstrap CLI root user: {e}"))
+                })?;
 
-        // Apply pre-configured identity links from config.
-        apply_identity_config(&identity_store, &workspace_root).await;
+            // Apply pre-configured identity links from config.
+            apply_identity_config(&identity_store, &workspace_root).await;
+        }
 
         let kernel = Arc::new(Self {
             session_id,
             event_bus,
             capsules,
+            #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
             mcp,
             capabilities,
-            vfs: Arc::new(kernel_host_vfs) as Arc<dyn Vfs>,
+            #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+            vfs,
+            #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
             overlay_registry,
             vfs_root_handle: root_handle,
             workspace_root,
@@ -578,10 +645,16 @@ impl Kernel {
             admin_write_lock: Mutex::new(()),
         });
 
-        drop(kernel_router::spawn_kernel_router(Arc::clone(&kernel)));
-        drop(spawn_idle_monitor(Arc::clone(&kernel)));
-        drop(spawn_react_watchdog(Arc::clone(&kernel.event_bus)));
-        drop(spawn_capsule_health_monitor(Arc::clone(&kernel)));
+        // The management-API router, idle monitor, and capsule health/react
+        // monitors drive native-only machinery (capsule lifecycle, disk
+        // discovery, `process::exit`). The browser profile runs none of them.
+        #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+        {
+            drop(kernel_router::spawn_kernel_router(Arc::clone(&kernel)));
+            drop(spawn_idle_monitor(Arc::clone(&kernel)));
+            drop(spawn_react_watchdog(Arc::clone(&kernel.event_bus)));
+            drop(spawn_capsule_health_monitor(Arc::clone(&kernel)));
+        }
         // Passive storm diagnostics — subscribes synchronously inside the
         // call (before the debug-assert below) so it counts toward
         // `INTERNAL_SUBSCRIBER_COUNT`.
@@ -591,6 +664,8 @@ impl Kernel {
         // miss, and grant the capsule on an elicited APPROVE. Subscribes
         // synchronously (before the debug-assert below) so its one permanent
         // broadcast subscriber counts toward `INTERNAL_SUBSCRIBER_COUNT`.
+        // Native-only: the grant path drives the native admin machinery.
+        #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
         drop(grant_on_use::spawn_grant_on_use_handler(Arc::clone(
             &kernel,
         )));
@@ -612,7 +687,7 @@ impl Kernel {
         )
         .with_identity_store(Arc::clone(&kernel.identity_store))
         .with_access_resolver(access_resolver);
-        astrid_runtime::spawn(dispatcher.run());
+        drop(astrid_runtime::spawn(dispatcher.run()));
 
         debug_assert_eq!(
             kernel.event_bus.subscriber_count(),
@@ -628,6 +703,7 @@ impl Kernel {
     /// # Errors
     ///
     /// Returns an error if the manifest cannot be loaded, the capsule cannot be created, or registration fails.
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
     async fn load_capsule(
         &self,
         dir: PathBuf,
@@ -743,6 +819,7 @@ impl Kernel {
     ///
     /// Returns an error if the capsule cannot be created, the KV scope cannot be
     /// built, or `capsule.load` fails.
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
     async fn build_shared_capsule(
         &self,
         manifest: astrid_capsule_types::manifest::CapsuleManifest,
@@ -761,7 +838,7 @@ impl Kernel {
         let mut capsule = loader.create_capsule(manifest, dir.to_path_buf())?;
 
         let kv = astrid_storage::ScopedKvStore::new(
-            Arc::clone(&self.kv) as Arc<dyn astrid_storage::KvStore>,
+            Arc::clone(&self.kv),
             format!("{load_principal}:capsule:{}", capsule.id()),
         )?;
 
@@ -849,6 +926,7 @@ impl Kernel {
     ///
     /// Returns an error if the capsule has no source directory, cannot be
     /// unregistered, or fails to reload.
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
     async fn restart_capsule(
         &self,
         id: &astrid_capsule_types::CapsuleId,
@@ -980,6 +1058,7 @@ impl Kernel {
     /// service capsules such as the CLI proxy. Other profile principals are
     /// warmed after boot so persisted tenant state cannot make restart
     /// health depend on loading every agent's tool set.
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
     pub async fn load_boot_capsules(&self) {
         self.load_default_capsule_view().await;
         self.publish_capsules_loaded().await;
@@ -990,6 +1069,7 @@ impl Kernel {
     /// The actual load work is serialized by
     /// [`Kernel::capsule_load_lock`], so this can run behind a ready daemon
     /// without racing other admin-driven warm/reload paths.
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
     pub fn schedule_profile_principal_warm(self: &Arc<Self>) {
         let kernel = Arc::clone(self);
         astrid_runtime::spawn(async move {
@@ -1020,6 +1100,7 @@ impl Kernel {
     /// same installed artifact on disk, but loaded runtime instances remain
     /// principal-scoped; default's capsule set is never copied into another
     /// principal's view.
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
     pub async fn load_all_capsules(&self) {
         self.load_default_capsule_view().await;
         for principal in self.enumerate_profile_principals() {
@@ -1034,6 +1115,7 @@ impl Kernel {
         self.publish_capsules_loaded().await;
     }
 
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
     async fn load_default_capsule_view(&self) {
         self.ensure_principal_loaded(&PrincipalId::default()).await;
 
@@ -1054,6 +1136,7 @@ impl Kernel {
     }
 
     /// Build or refresh one principal's capsule view from its own install set.
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
     pub async fn ensure_principal_loaded(&self, principal: &PrincipalId) {
         let _load_guard = self.capsule_load_lock.lock().await;
         let sorted = self.sorted_principal_capsules(principal);
@@ -1093,6 +1176,7 @@ impl Kernel {
             .await;
     }
 
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
     async fn ensure_principal_uplinks_loaded(&self, principal: &PrincipalId) {
         let _load_guard = self.capsule_load_lock.lock().await;
         let sorted = self.sorted_principal_capsules(principal);
@@ -1120,6 +1204,7 @@ impl Kernel {
             .await;
     }
 
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
     fn sorted_principal_capsules(
         &self,
         principal: &PrincipalId,
@@ -1208,6 +1293,7 @@ impl Kernel {
     /// registry subscription exists. The plain [`Self::capsule_topic_probe`]
     /// remains passive for compatibility with existing callers.
     #[must_use]
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
     pub fn capsule_topic_probe_with_warm(
         self: &Arc<Self>,
     ) -> astrid_core::kernel_api::CapsuleTopicProbe {
@@ -1405,6 +1491,7 @@ impl Kernel {
     /// already-loaded capsules are skipped by `load_capsule`'s guard). Either
     /// way `astrid.v1.capsules_loaded` is published so the tool surface
     /// refreshes. Backs [`astrid_core::kernel_api::KernelRequest::ReloadCapsule`].
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
     pub(crate) async fn reload_one_capsule(
         &self,
         id: &astrid_capsule_types::CapsuleId,
@@ -1721,12 +1808,16 @@ impl Kernel {
         // This runs AFTER capsule unload, which is the correct order: MCP child
         // processes communicate via stdio pipes (not this Unix socket), so they
         // are already terminated by step 2. The socket is only used for
-        // CLI-to-kernel IPC.
-        let socket_path = crate::socket::kernel_socket_path();
-        let _ = std::fs::remove_file(&socket_path);
-        let _ = std::fs::remove_file(&self.token_path);
-        crate::socket::remove_readiness_file();
-        crate::socket::remove_pid_file();
+        // CLI-to-kernel IPC. Unix-only: the `socket` module (and the on-disk
+        // socket/PID/readiness files it manages) exist only on that profile.
+        #[cfg(unix)]
+        {
+            let socket_path = crate::socket::kernel_socket_path();
+            let _ = std::fs::remove_file(&socket_path);
+            let _ = std::fs::remove_file(&self.token_path);
+            crate::socket::remove_readiness_file();
+            crate::socket::remove_pid_file();
+        }
 
         tracing::info!("Kernel shutdown complete");
     }
@@ -1851,12 +1942,11 @@ pub(crate) async fn test_kernel_with_home(home: astrid_core::dirs::AstridHome) -
     let capsules = Arc::new(RwLock::new(CapsuleRegistry::new()));
 
     // Persistent KV backing capabilities + identity store.
-    let kv = Arc::new(
+    let kv: Arc<dyn astrid_storage::KvStore> = Arc::new(
         astrid_storage::SurrealKvStore::open(home.state_db_path()).expect("test kernel: open kv"),
     );
     let capabilities = Arc::new(
-        CapabilityStore::with_kv_store(Arc::clone(&kv) as Arc<dyn astrid_storage::KvStore>)
-            .expect("test kernel: capability store"),
+        CapabilityStore::with_kv_store(Arc::clone(&kv)).expect("test kernel: capability store"),
     );
 
     // Audit log at the tempdir — chain verification is trivially Ok on a
@@ -1896,11 +1986,8 @@ pub(crate) async fn test_kernel_with_home(home: astrid_core::dirs::AstridHome) -
     ));
 
     let allowance_store = Arc::new(astrid_approval::AllowanceStore::new());
-    let identity_kv = astrid_storage::ScopedKvStore::new(
-        Arc::clone(&kv) as Arc<dyn astrid_storage::KvStore>,
-        "system:identity",
-    )
-    .expect("test kernel: identity kv scope");
+    let identity_kv = astrid_storage::ScopedKvStore::new(Arc::clone(&kv), "system:identity")
+        .expect("test kernel: identity kv scope");
     let identity_store: Arc<dyn astrid_storage::IdentityStore> =
         Arc::new(astrid_storage::KvIdentityStore::new(identity_kv));
 
@@ -1964,6 +2051,7 @@ pub(crate) async fn test_kernel_with_home(home: astrid_core::dirs::AstridHome) -
 /// so every resource acquired by the native composition root is rooted in the
 /// same home — re-resolving from the environment here could split the audit
 /// log from the KV/socket paths if `$ASTRID_HOME` changed between calls.
+#[cfg(unix)]
 fn open_audit_log(
     home: &astrid_core::dirs::AstridHome,
     runtime_key: Arc<astrid_crypto::KeyPair>,
@@ -2101,6 +2189,7 @@ const IDLE_NON_EPHEMERAL_GRACE: std::time::Duration = std::time::Duration::from_
 const IDLE_EPHEMERAL_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
 /// How often the idle monitor polls when running in persistent mode.
 const IDLE_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(15);
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 fn spawn_idle_monitor(kernel: Arc<Kernel>) -> astrid_runtime::JoinHandle<()> {
     astrid_runtime::spawn(async move {
         // Initial grace period — wait for capsules to boot and first client
@@ -2248,6 +2337,7 @@ impl RestartTracker {
 /// Attempts to restart a failed capsule, respecting backoff and max retries.
 ///
 /// Returns `true` if the tracker should be removed (successful restart).
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 async fn attempt_capsule_restart(
     kernel: &Kernel,
     id_str: &str,
@@ -2315,6 +2405,7 @@ async fn attempt_capsule_restart(
 /// each capsule that is currently in `Ready` state. If a capsule reports
 /// `Failed`, attempts to restart it with exponential backoff (max 5 attempts).
 /// Publishes `astrid.v1.health.failed` IPC events for each detected failure.
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 fn spawn_capsule_health_monitor(kernel: Arc<Kernel>) -> astrid_runtime::JoinHandle<()> {
     astrid_runtime::spawn(async move {
         let mut interval = astrid_runtime::time::interval(std::time::Duration::from_secs(10));
@@ -2546,6 +2637,7 @@ fn capsule_discovery_paths_for(
     ]
 }
 
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 fn capsule_instance_hash(
     manifest: &astrid_capsule_types::manifest::CapsuleManifest,
     dir: &Path,

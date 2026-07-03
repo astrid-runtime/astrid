@@ -120,6 +120,12 @@ fn is_transaction_conflict(e: &surrealkv::Error) -> bool {
 
 #[async_trait]
 impl KvStore for SurrealKvStore {
+    /// Flush and close the store by delegating to the inherent
+    /// [`SurrealKvStore::close`], which closes the underlying tree.
+    async fn close(&self) -> StorageResult<()> {
+        SurrealKvStore::close(self).await
+    }
+
     async fn get(&self, namespace: &str, key: &str) -> StorageResult<Option<Vec<u8>>> {
         validate_namespace(namespace)?;
         validate_key(key)?;

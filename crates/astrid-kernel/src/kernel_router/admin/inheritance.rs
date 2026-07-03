@@ -112,7 +112,6 @@ async fn copy_kv_namespaces(
     principal: &PrincipalId,
     capsule_ids: &[astrid_capsule::capsule::CapsuleId],
 ) -> usize {
-    use astrid_storage::KvStore;
     let mut total_keys = 0usize;
     for capsule_id in capsule_ids {
         let src_ns = format!("{source}:capsule:{capsule_id}");

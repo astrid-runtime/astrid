@@ -46,6 +46,10 @@
 
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 pub use tokio::spawn;
+/// Run a blocking closure off the async runtime. Native = `tokio`'s dedicated
+/// blocking thread pool; wasm = inline on the current task (see the wasm arm).
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+pub use tokio::task::spawn_blocking;
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 pub use tokio::task::{JoinError, JoinHandle};
 
@@ -79,7 +83,7 @@ pub mod clock {
 #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
 mod wasm_task;
 #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
-pub use wasm_task::{JoinError, JoinHandle, spawn};
+pub use wasm_task::{JoinError, JoinHandle, spawn, spawn_blocking};
 
 /// Timer surface. Native = `tokio::time`; wasm = `wasmtimer`.
 ///
