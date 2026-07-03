@@ -190,6 +190,10 @@ fn check_capsule(
         }
     }
 
+    // Deterministic output: interceptor/publish tables are HashMap-backed and
+    // the source scan follows filesystem order, so sort by (rule, message)
+    // before returning — a CI gate must not emit findings in a flaky order.
+    findings.sort_by(|a, b| a.rule.cmp(b.rule).then_with(|| a.message.cmp(&b.message)));
     findings
 }
 
@@ -243,8 +247,13 @@ fn scan_tool_annotations(src_dir: &Path) -> Vec<String> {
     names
 }
 
-/// Recursively collect `.rs` file paths under `dir` (iterative, so a deep or
-/// symlinked tree can't blow the stack). A missing/unreadable dir yields none.
+/// Recursively collect `.rs` file paths under `dir` (iterative, so a deep tree
+/// can't blow the stack). A missing/unreadable dir yields none.
+///
+/// Uses `entry.file_type()` rather than `path.is_dir()`: `file_type` does NOT
+/// follow symlinks, so a symlinked directory is never recursed into — which also
+/// makes a symlink loop (a link pointing at an ancestor) impossible to follow, so
+/// the scan can't spin forever / OOM on a hostile or accidental link cycle.
 fn rs_files(dir: &Path) -> Vec<PathBuf> {
     let mut out = Vec::new();
     let mut stack = vec![dir.to_path_buf()];
@@ -253,10 +262,14 @@ fn rs_files(dir: &Path) -> Vec<PathBuf> {
             continue;
         };
         for entry in entries.flatten() {
+            // A file_type error (raced unlink, permissions) → skip this entry.
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
             let p = entry.path();
-            if p.is_dir() {
+            if file_type.is_dir() {
                 stack.push(p);
-            } else if p.extension().is_some_and(|ext| ext == "rs") {
+            } else if file_type.is_file() && p.extension().is_some_and(|ext| ext == "rs") {
                 out.push(p);
             }
         }

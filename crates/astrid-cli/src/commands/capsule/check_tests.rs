@@ -195,3 +195,26 @@ fn per_tool_result_topic_is_not_treated_as_a_tool() {
     );
     assert!(findings.is_empty(), "got {findings:?}");
 }
+
+#[test]
+fn findings_are_sorted_deterministically_by_rule() {
+    // A capsule tripping several rules at once: `alpha` is unrouted, both
+    // mandatory publishes are missing, and `ghost` is a dangling subscription.
+    // Regardless of the order the rules fire (HashMap-backed manifest tables +
+    // filesystem scan order), the output must be stable — sorted by rule so a
+    // CI gate never emits a flaky ordering.
+    let findings = check_capsule(
+        &names(&["alpha"]),
+        &[intercept("tool.v1.execute.ghost", "tool_execute_ghost")],
+        &[],
+    );
+    assert_eq!(
+        rules(&findings),
+        vec![
+            "dangling-subscription",
+            "missing-publish",
+            "missing-publish",
+            "unrouted-tool",
+        ]
+    );
+}
