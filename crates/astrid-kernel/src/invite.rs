@@ -107,6 +107,21 @@ impl InviteStore {
     /// # Errors
     /// Returns an error if the file exists but is unreadable or malformed.
     pub fn load(&self) -> Result<Vec<Invite>, InviteStoreError> {
+        // Pairing persistence is native-only; the browser store is in-memory
+        // (always empty) and never reads disk.
+        #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+        {
+            let _ = &self.path;
+            return Ok(Vec::new());
+        }
+        #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+        {
+            self.load_from_disk()
+        }
+    }
+
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    fn load_from_disk(&self) -> Result<Vec<Invite>, InviteStoreError> {
         let bytes = match std::fs::read(&self.path) {
             Ok(b) => b,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -130,6 +145,21 @@ impl InviteStore {
     /// # Errors
     /// Returns an error if the file cannot be written.
     pub fn save(&self, invites: &[Invite]) -> Result<(), InviteStoreError> {
+        // Pairing persistence is native-only; the browser store is in-memory
+        // and silently drops writes rather than touching disk.
+        #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+        {
+            let _ = (&self.path, invites);
+            return Ok(());
+        }
+        #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+        {
+            self.save_to_disk(invites)
+        }
+    }
+
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    fn save_to_disk(&self, invites: &[Invite]) -> Result<(), InviteStoreError> {
         if let Some(parent) = self.path.parent() {
             std::fs::create_dir_all(parent).map_err(InviteStoreError::Io)?;
         }

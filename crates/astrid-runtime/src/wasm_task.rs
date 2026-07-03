@@ -69,6 +69,18 @@ impl<T> JoinHandle<T> {
     pub fn abort(&self) {
         self.abort.abort();
     }
+
+    /// Build a handle over an already-produced value, so awaiting it resolves
+    /// to `Ok(value)` immediately. Used by [`spawn_blocking`], which runs its
+    /// closure inline on this target and has nothing to spawn.
+    fn ready(value: T) -> Self {
+        let (tx, rx) = oneshot::channel();
+        // The receiver is live and holds `value`, so the send always succeeds.
+        let _ = tx.send(value);
+        // No task backs this handle; the abort half is inert.
+        let (abort, _registration) = AbortHandle::new_pair();
+        JoinHandle { rx, abort }
+    }
 }
 
 impl<T> Future for JoinHandle<T> {
@@ -111,4 +123,20 @@ where
         }
     });
     JoinHandle { rx, abort }
+}
+
+/// Run a blocking closure, mirroring [`tokio::task::spawn_blocking`]'s shape.
+///
+/// This target has no dedicated blocking thread pool (no OS threads), so the
+/// closure runs **inline on the current task** and the returned handle is
+/// already complete. That means `f` blocks the single wasm thread for its whole
+/// duration — acceptable because the kernel's genuinely heavy blocking paths
+/// (capsule install, disk discovery) are native-gated and never reach this arm;
+/// the sites that do compile here wrap only short, non-blocking work.
+pub fn spawn_blocking<F, R>(f: F) -> JoinHandle<R>
+where
+    F: FnOnce() -> R + Send + 'static,
+    R: Send + 'static,
+{
+    JoinHandle::ready(f())
 }

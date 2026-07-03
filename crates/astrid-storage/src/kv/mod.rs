@@ -247,6 +247,12 @@ pub trait KvStore: Send + Sync {
         }
         Ok(count)
     }
+
+    /// Flush and close the store. Default is a no-op for backends
+    /// with nothing to flush.
+    async fn close(&self) -> StorageResult<()> {
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------
