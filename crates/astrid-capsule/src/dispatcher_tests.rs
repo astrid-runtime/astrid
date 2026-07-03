@@ -1227,6 +1227,105 @@ mod access_enforcement {
         handle.abort();
     }
 
+    /// Drain every `GrantRequired` on `astrid.v1.approval` within a bounded
+    /// window, returning the signalled capsule ids in arrival order. Unlike
+    /// [`recv_grant_required`] (first-only), this counts the whole storm so a
+    /// test can assert the gate fired for exactly the matching capsule (#1113).
+    async fn collect_grant_required(
+        receiver: &mut astrid_events::EventReceiver,
+        window: Duration,
+    ) -> Vec<String> {
+        let deadline = std::time::Instant::now() + window;
+        let mut ids = Vec::new();
+        while std::time::Instant::now() < deadline {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            match tokio::time::timeout(remaining, receiver.recv()).await {
+                Ok(Some(event)) => {
+                    if let AstridEvent::Ipc { message, .. } = &*event
+                        && let IpcPayload::GrantRequired { capsule_id, .. } = &message.payload
+                    {
+                        ids.push(capsule_id.clone());
+                    }
+                },
+                // Bus closed, or the window elapsed — stop draining.
+                Ok(None) | Err(_) => break,
+            }
+        }
+        ids
+    }
+
+    /// Spawn a dispatcher over a registry holding SEVERAL distinct capsules,
+    /// all in one principal's view, each binding a distinct interceptor topic.
+    /// Returns the bus + task handle; these tests assert on the emitted
+    /// `GrantRequired` set, so the per-capsule invoked flags are dropped.
+    fn spawn_with_capsules_in_view(
+        resolver: CapsuleAccessResolver,
+        principal: &str,
+        capsules: &[(&str, &str)],
+    ) -> (Arc<EventBus>, tokio::task::JoinHandle<()>) {
+        let pid = PrincipalId::new(principal).expect("valid principal");
+        let mut registry = CapsuleRegistry::new();
+        for (name, event) in capsules {
+            let (capsule, _invoked) = MockCapsule::new(name, event);
+            let hash =
+                crate::registry::WasmHash::synthetic(name, &capsule.manifest.package.version);
+            registry
+                .register_for(Box::new(capsule), hash, &pid)
+                .unwrap();
+        }
+        let registry = Arc::new(RwLock::new(registry));
+        let bus = Arc::new(EventBus::with_capacity(64));
+        let dispatcher = EventDispatcher::new(Arc::clone(&registry), Arc::clone(&bus))
+            .with_access_resolver(resolver);
+        let handle = tokio::spawn(dispatcher.run());
+        (bus, handle)
+    }
+
+    /// REGRESSION (#1113): a single ungranted tool call must raise grant-on-use
+    /// for ONLY the capsule that provides the called tool — not for every
+    /// ungranted capsule in the caller's view. Before the topic-match-first
+    /// reorder, the gate fired (and emitted `GrantRequired`) for every
+    /// candidate capsule BEFORE checking whether its subscription matched the
+    /// dispatched topic, so one `tool.v1.execute.do_thing` call stormed a
+    /// `GrantRequired` for all N view capsules — making first-run consent
+    /// unconvergeable. Now only the matching capsule's gate engages.
+    ///
+    /// On origin/main this drains three `GrantRequired` (one per view capsule)
+    /// and the length assertion fails; with the fix exactly one arrives.
+    #[tokio::test]
+    async fn grant_on_use_signals_only_the_matching_capsule() {
+        let (_dir, home, resolver) = resolver_fixture();
+        // `bob` is in the runtime but granted NOTHING — every view capsule is
+        // ungranted, the fresh-principal first-run condition.
+        write_profile(&home, "bob", &agent_with_capsules(&[]));
+
+        // Three ungranted tool capsules in bob's view; only `match-tool`
+        // subscribes the topic the call publishes. The other two are unrelated
+        // tools the call never touches — they must not be gated on this call.
+        let (bus, handle) = spawn_with_capsules_in_view(
+            resolver,
+            "bob",
+            &[
+                ("match-tool", "tool.v1.execute.do_thing"),
+                ("other-tool-a", "tool.v1.execute.other_a"),
+                ("other-tool-b", "tool.v1.execute.other_b"),
+            ],
+        );
+        let mut approval = bus.subscribe_topic("astrid.v1.approval");
+        tokio::task::yield_now().await;
+
+        publish_ipc_as(&bus, "tool.v1.execute.do_thing", "bob");
+
+        let signalled = collect_grant_required(&mut approval, Duration::from_millis(400)).await;
+        assert_eq!(
+            signalled,
+            vec!["match-tool".to_string()],
+            "exactly ONE GrantRequired — for the called tool's capsule only — must be emitted; \
+             got {signalled:?} (a storm across the ungranted view is #1113)"
+        );
+        handle.abort();
+    }
+
     #[tokio::test]
     async fn describe_request_is_scoped_to_principal_view() {
         let (_dir, home, resolver) = resolver_fixture();
