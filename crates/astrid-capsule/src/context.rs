@@ -220,7 +220,7 @@ impl CapsuleContext {
     /// parameter type is exactly [`OverlayRegistry`].
     #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
     #[must_use]
-    pub fn with_overlay_registry(mut self, registry: Arc<astrid_vfs::OverlayVfsRegistry>) -> Self {
+    pub fn with_overlay_registry(mut self, registry: OverlayRegistry) -> Self {
         self.overlay_registry = Some(registry);
         self
     }

@@ -57,6 +57,11 @@ uuid = { workspace = true }
 # process host functions, the MCP host engine, manifest discovery, and the
 # file-watch hot-reload path. Gated out of the `wasm32-unknown-unknown` browser
 # host profile, which supplies its own `ExecutionEngine`.
+# `nix` is Unix-only (process/socket plumbing for the native engine); scoping it
+# to cfg(unix) keeps non-Unix native targets from trying to build it.
+[target.'cfg(unix)'.dependencies]
+nix = { workspace = true }
+
 [target.'cfg(not(all(target_arch = "wasm32", target_os = "unknown")))'.dependencies]
 astrid-mcp = { workspace = true }
 # `astrid-vfs` is native-only (it uses `cap-std` and tokio's filesystem
@@ -65,7 +70,6 @@ astrid-mcp = { workspace = true }
 astrid-vfs = { workspace = true }
 astrid-workspace = { workspace = true }
 bytes = "1"
-nix = { workspace = true }
 notify = "8"
 # `astrid:http@1.1.0` `auto-decompress` toggles gzip/brotli/deflate/zstd per
 # request; those builder methods are feature-gated in reqwest. Enabled here so
