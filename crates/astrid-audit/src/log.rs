@@ -7,7 +7,7 @@ use astrid_core::SessionId;
 use astrid_crypto::{ContentHash, KeyPair};
 use std::path::Path;
 use std::sync::Arc;
-use tokio::sync::RwLock;
+use tokio::sync::Mutex;
 use tracing::{debug, error, warn};
 
 use crate::entry::{AuditAction, AuditEntry, AuditOutcome, AuthorizationProof};
@@ -36,12 +36,13 @@ pub struct AuditLog {
     /// Each principal maintains its own independent chain within a session.
     /// System entries (no principal) use `(session_id, None)`.
     ///
-    /// This is a [`tokio::sync::RwLock`] (not a `std` one) because
-    /// [`append_inner`](Self::append_inner) holds the **write** guard *across
-    /// the persistent `store().await`* to keep read-prev-hash → sign → persist →
+    /// This is a [`tokio::sync::Mutex`] (not a `std` one) because
+    /// [`append_inner`](Self::append_inner) holds the guard *across the
+    /// persistent `store().await`* to keep read-prev-hash → sign → persist →
     /// advance-head atomic per chain — a `std` guard cannot legally live across
-    /// an `.await`. See the locking contract on [`append_inner`].
-    chain_heads: RwLock<std::collections::HashMap<ChainKey, ContentHash>>,
+    /// an `.await`. Access is exclusive-only, so a plain mutex (not `RwLock`)
+    /// is the honest primitive. See the locking contract on [`append_inner`].
+    chain_heads: Mutex<std::collections::HashMap<ChainKey, ContentHash>>,
 }
 
 impl AuditLog {
@@ -61,7 +62,7 @@ impl AuditLog {
         Ok(Self {
             storage: Box::new(storage),
             runtime_key: runtime_key.into(),
-            chain_heads: RwLock::new(std::collections::HashMap::new()),
+            chain_heads: Mutex::new(std::collections::HashMap::new()),
         })
     }
 
@@ -74,7 +75,7 @@ impl AuditLog {
         Self {
             storage: Box::new(storage),
             runtime_key: runtime_key.into(),
-            chain_heads: RwLock::new(std::collections::HashMap::new()),
+            chain_heads: Mutex::new(std::collections::HashMap::new()),
         }
     }
 
@@ -121,8 +122,8 @@ impl AuditLog {
     ///
     /// The entire append critical section — resolving the chain's current head,
     /// creating and signing the entry against that head, persisting it, and then
-    /// advancing the cached head — runs while holding the `chain_heads` **write**
-    /// lock. This serializes appends to the same `(session, principal)` chain so
+    /// advancing the cached head — runs while holding the `chain_heads` mutex.
+    /// This serializes appends to the same `(session, principal)` chain so
     /// that `previous_hash` and the head move together atomically.
     ///
     /// Without this, two concurrent appends to the same chain both read the same
@@ -134,11 +135,11 @@ impl AuditLog {
     /// Signing happens inside the lock. That serializes same-chain appends, which
     /// is intentional and correct: a hash chain is inherently ordered, so a
     /// well-defined append order IS the product. The lock spans every chain in
-    /// this log (one `RwLock`), so it also serializes appends across chains; that
+    /// this log (one mutex), so it also serializes appends across chains; that
     /// is a stronger guarantee than required and is acceptable — audit append is
     /// not a hot path relative to the signed-ordering invariant it protects.
     ///
-    /// The lock is a [`tokio::sync::RwLock`]: the write guard is held *across the
+    /// The lock is a [`tokio::sync::Mutex`]: the guard is held *across the
     /// persistent `store().await`*, which a `std` guard cannot legally do. An
     /// async-aware lock is what lets the whole critical section stay atomic on
     /// the now-genuinely-async persist path.
@@ -152,10 +153,10 @@ impl AuditLog {
     ) -> AuditResult<AuditEntryId> {
         let chain_key: ChainKey = (session_id.clone(), principal.clone());
 
-        // Hold the write lock across read-prev-hash -> create+sign -> store ->
+        // Hold the lock across read-prev-hash -> create+sign -> store ->
         // head update so the whole append is atomic per chain (see the locking
         // contract above).
-        let mut heads = self.chain_heads.write().await;
+        let mut heads = self.chain_heads.lock().await;
 
         // Resolve the parent hash from the head cache we already hold (falling
         // back to storage), NOT via a fresh lock — re-locking would reopen the
