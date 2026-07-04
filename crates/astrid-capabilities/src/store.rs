@@ -160,7 +160,8 @@ impl CapabilityStore {
             .await
             .map_err(|e| CapabilityError::StorageError(e.to_string()))?;
 
-        let mut used = self.used_tokens.write().await;
+        // `&mut self` — exclusive access, no need to take the async lock.
+        let used = self.used_tokens.get_mut();
 
         for key in keys {
             if let Ok(uuid) = uuid::Uuid::parse_str(&key) {
