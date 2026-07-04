@@ -173,13 +173,10 @@ pub async fn get_audit(
     // disk is bounded by the operator's rotation policy; for a
     // routine workload (thousands of entries per day, not millions)
     // this is fine. Tracked as a perf follow-up if/when it bites.
-    let log_for_read = audit_log.clone();
-    let session_for_read = session_id.clone();
-    let all =
-        tokio::task::spawn_blocking(move || log_for_read.get_session_entries(&session_for_read))
-            .await
-            .map_err(|e| GatewayError::Internal(anyhow::anyhow!("audit read task panicked: {e}")))?
-            .map_err(|e| GatewayError::Internal(anyhow::anyhow!("audit read failed: {e}")))?;
+    let all = audit_log
+        .get_session_entries(&session_id)
+        .await
+        .map_err(|e| GatewayError::Internal(anyhow::anyhow!("audit read failed: {e}")))?;
 
     // Newest first. The storage backend already returns entries in
     // insertion order (oldest first), so a plain `reverse()` is both
@@ -380,8 +377,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn render_drops_non_admin_actions() {
+    #[tokio::test]
+    async fn render_drops_non_admin_actions() {
         // Non-admin entries (MCP tool calls, capsule events) belong
         // to a different audit feed; they must not surface in the
         // historical-admin view.
@@ -399,8 +396,9 @@ mod tests {
             },
             AuditOutcome::Success { details: None },
         )
+        .await
         .expect("append");
-        let entries = log.get_session_entries(&session).expect("read");
+        let entries = log.get_session_entries(&session).await.expect("read");
         assert_eq!(entries.len(), 1);
         assert!(
             render_entry(&entries[0]).is_none(),
@@ -408,8 +406,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn render_admin_request_round_trips() {
+    #[tokio::test]
+    async fn render_admin_request_round_trips() {
         let log = AuditLog::in_memory(KeyPair::generate());
         let session = SessionId::from_uuid(uuid::Uuid::nil());
         log.append_with_principal(
@@ -421,8 +419,9 @@ mod tests {
             },
             AuditOutcome::Success { details: None },
         )
+        .await
         .expect("append");
-        let entries = log.get_session_entries(&session).expect("read");
+        let entries = log.get_session_entries(&session).await.expect("read");
         let view = render_entry(&entries[0]).expect("admin entry must render");
         assert_eq!(view.method.as_deref(), Some("AgentDelete"));
         assert_eq!(view.principal.as_deref(), Some("admin"));

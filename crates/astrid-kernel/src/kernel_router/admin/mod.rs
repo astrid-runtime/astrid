@@ -536,7 +536,8 @@ async fn handle_admin_request(
                 authorization,
                 outcome,
             },
-        );
+        )
+        .await;
         publish_response(
             kernel,
             response_topic,
@@ -561,7 +562,8 @@ async fn handle_admin_request(
                     },
                     outcome: AuditOutcome::success(),
                 },
-            );
+            )
+            .await;
         },
         Err(e) => {
             warn!(
@@ -586,7 +588,8 @@ async fn handle_admin_request(
                     },
                     outcome: AuditOutcome::failure(e.to_string()),
                 },
-            );
+            )
+            .await;
             publish_response(
                 kernel,
                 response_topic,

@@ -16,6 +16,9 @@
 //!
 //! // Record an action
 //! let session_id = SessionId::new();
+//! // The read/write surface is async; drive it on a current-thread runtime.
+//! # let rt = tokio::runtime::Builder::new_current_thread().build().unwrap();
+//! # rt.block_on(async {
 //! let entry_id = log.append(
 //!     session_id.clone(),
 //!     AuditAction::SessionStarted {
@@ -26,11 +29,12 @@
 //!         reason: "session start".to_string(),
 //!     },
 //!     AuditOutcome::success(),
-//! ).unwrap();
+//! ).await.unwrap();
 //!
 //! // Verify chain integrity
-//! let result = log.verify_chain(&session_id).unwrap();
+//! let result = log.verify_chain(&session_id).await.unwrap();
 //! assert!(result.valid);
+//! # });
 //! ```
 
 // Errors

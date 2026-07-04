@@ -3,6 +3,7 @@
 use astrid_capabilities::AuditEntryId;
 use astrid_core::SessionId;
 use astrid_storage::{KvStore, MemoryKvStore, SurrealKvStore};
+use async_trait::async_trait;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -15,20 +16,28 @@ use crate::error::{AuditError, AuditResult};
 /// - Storing and retrieving individual entries
 /// - Session-scoped queries
 /// - Chain head tracking (latest entry per session)
+///
+/// The methods are genuinely `async` (bridged with [`async_trait`]): they
+/// `await` the underlying async [`KvStore`](astrid_storage::kv::KvStore)
+/// directly rather than driving it through a sync-over-async `block_on`. That
+/// bridge parked a temporary tokio runtime whose time driver reads
+/// [`std::time::Instant`] — an instant panic on `wasm32-unknown-unknown` — so
+/// the whole surface is async end-to-end to boot on the browser profile.
+#[async_trait]
 pub(crate) trait AuditStorage: Send + Sync {
     /// Store an audit entry.
     ///
     /// # Errors
     ///
     /// Returns an error if the entry cannot be persisted.
-    fn store(&self, entry: &AuditEntry) -> AuditResult<()>;
+    async fn store(&self, entry: &AuditEntry) -> AuditResult<()>;
 
     /// Get an entry by ID.
     ///
     /// # Errors
     ///
     /// Returns an error if retrieval or deserialization fails.
-    fn get(&self, id: &AuditEntryId) -> AuditResult<Option<AuditEntry>>;
+    async fn get(&self, id: &AuditEntryId) -> AuditResult<Option<AuditEntry>>;
 
     /// Get the chain head (latest entry ID) for a session+principal chain.
     ///
@@ -38,7 +47,7 @@ pub(crate) trait AuditStorage: Send + Sync {
     /// # Errors
     ///
     /// Returns an error if retrieval or parsing fails.
-    fn get_chain_head(
+    async fn get_chain_head(
         &self,
         session_id: &SessionId,
         principal: Option<&astrid_core::PrincipalId>,
@@ -49,35 +58,35 @@ pub(crate) trait AuditStorage: Send + Sync {
     /// # Errors
     ///
     /// Returns an error if retrieval or deserialization fails.
-    fn get_session_entries(&self, session_id: &SessionId) -> AuditResult<Vec<AuditEntry>>;
+    async fn get_session_entries(&self, session_id: &SessionId) -> AuditResult<Vec<AuditEntry>>;
 
     /// Count total entries.
     ///
     /// # Errors
     ///
     /// Returns an error if the storage backend fails.
-    fn count(&self) -> AuditResult<usize>;
+    async fn count(&self) -> AuditResult<usize>;
 
     /// Count entries for a session.
     ///
     /// # Errors
     ///
     /// Returns an error if retrieval or deserialization fails.
-    fn count_session(&self, session_id: &SessionId) -> AuditResult<usize>;
+    async fn count_session(&self, session_id: &SessionId) -> AuditResult<usize>;
 
     /// List all session IDs.
     ///
     /// # Errors
     ///
     /// Returns an error if retrieval or parsing fails.
-    fn list_sessions(&self) -> AuditResult<Vec<SessionId>>;
+    async fn list_sessions(&self) -> AuditResult<Vec<SessionId>>;
 
     /// Flush pending writes to durable storage.
     ///
     /// # Errors
     ///
     /// Returns an error if the storage backend fails to flush.
-    fn flush(&self) -> AuditResult<()>;
+    async fn flush(&self) -> AuditResult<()>;
 }
 
 // -- Namespace constants (crate-internal) --
@@ -85,64 +94,6 @@ pub(crate) trait AuditStorage: Send + Sync {
 const NS_ENTRIES: &str = "audit:entries";
 const NS_SESSION_INDEX: &str = "audit:session_index";
 const NS_CHAIN_HEADS: &str = "audit:chain_heads";
-
-/// Run an async future synchronously, bridging the sync [`AuditStorage`] trait
-/// to the async [`KvStore`](astrid_storage::kv::KvStore) trait.
-///
-/// `SurrealKV` operations are fast in-process (no network), so blocking is safe.
-///
-/// Handles three runtime contexts:
-/// - **Multi-threaded tokio runtime** (production): uses `block_in_place` to
-///   avoid O(N) OS thread churn when `verify_all()` or concurrent writes hit
-///   this path repeatedly.
-/// - **Single-threaded tokio runtime** (unit tests): uses a scoped thread
-///   because `block_in_place` panics on `current_thread` runtimes.
-/// - **No runtime** (sync `#[test]` functions): creates a temporary runtime.
-///
-/// # Panics
-///
-/// Panics if the temporary runtime cannot be created (no-runtime path) or if
-/// the scoped thread panics (single-threaded runtime path).
-fn block_on<F>(f: F) -> F::Output
-where
-    F: std::future::Future + Send,
-    F::Output: Send,
-{
-    match tokio::runtime::Handle::try_current() {
-        Ok(handle) => {
-            // Multi-threaded runtime (production): block_in_place yields the
-            // worker thread to the runtime scheduler instead of spawning a new
-            // OS thread per storage operation. Nested block_in_place calls
-            // (e.g. WASM host -> interceptor -> audit append) are safe: tokio
-            // detects the thread is already in a blocking context and skips
-            // worker-thread migration, running the closure directly.
-            // `block_in_place` requires the `rt-multi-thread` feature, which is
-            // native-only (no multi-threaded runtime exists on wasm), so this
-            // branch is compiled out on wasm — where the flavor is never
-            // MultiThread anyway.
-            #[cfg(not(target_family = "wasm"))]
-            if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread {
-                return tokio::task::block_in_place(|| handle.block_on(f));
-            }
-            // Single-threaded runtime (tests), and every wasm target:
-            // block_in_place panics on current_thread runtimes, so fall back to
-            // a scoped thread.
-            std::thread::scope(|s| {
-                s.spawn(|| handle.block_on(f))
-                    .join()
-                    .expect("async thread panicked")
-            })
-        },
-        Err(_) => {
-            // No runtime (sync tests) - create a temporary one.
-            tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .expect("failed to create tokio runtime")
-                .block_on(f)
-        },
-    }
-}
 
 /// Build the storage key for a chain head.
 ///
@@ -186,10 +137,16 @@ impl SurrealKvAuditStorage {
     }
 
     /// Get all entry IDs for a session (from the session index).
-    fn get_session_entry_ids(&self, session_id: &SessionId) -> AuditResult<Vec<AuditEntryId>> {
+    async fn get_session_entry_ids(
+        &self,
+        session_id: &SessionId,
+    ) -> AuditResult<Vec<AuditEntryId>> {
         let key = session_id.0.to_string();
 
-        let data = block_on(self.store.get(NS_SESSION_INDEX, &key))
+        let data = self
+            .store
+            .get(NS_SESSION_INDEX, &key)
+            .await
             .map_err(|e| AuditError::StorageError(e.to_string()))?;
 
         match data {
@@ -203,8 +160,9 @@ impl SurrealKvAuditStorage {
     }
 }
 
+#[async_trait]
 impl AuditStorage for SurrealKvAuditStorage {
-    fn store(&self, entry: &AuditEntry) -> AuditResult<()> {
+    async fn store(&self, entry: &AuditEntry) -> AuditResult<()> {
         let entry_key = entry.id.0.to_string();
         let session_key = entry.session_id.0.to_string();
 
@@ -213,32 +171,38 @@ impl AuditStorage for SurrealKvAuditStorage {
             serde_json::to_vec(entry).map_err(|e| AuditError::SerializationError(e.to_string()))?;
 
         // Store entry.
-        block_on(self.store.set(NS_ENTRIES, &entry_key, entry_data))
+        self.store
+            .set(NS_ENTRIES, &entry_key, entry_data)
+            .await
             .map_err(|e| AuditError::StorageError(e.to_string()))?;
 
         // Update session index (append entry ID to the list).
-        let mut entry_ids = self.get_session_entry_ids(&entry.session_id)?;
+        let mut entry_ids = self.get_session_entry_ids(&entry.session_id).await?;
         entry_ids.push(entry.id.clone());
         let index_data = serde_json::to_vec(&entry_ids)
             .map_err(|e| AuditError::SerializationError(e.to_string()))?;
-        block_on(self.store.set(NS_SESSION_INDEX, &session_key, index_data))
+        self.store
+            .set(NS_SESSION_INDEX, &session_key, index_data)
+            .await
             .map_err(|e| AuditError::StorageError(e.to_string()))?;
 
         // Update chain head for the entry's chain (system or principal).
         let chain_key = chain_head_key(&entry.session_id, entry.principal.as_ref());
-        block_on(
-            self.store
-                .set(NS_CHAIN_HEADS, &chain_key, entry_key.into_bytes()),
-        )
-        .map_err(|e| AuditError::StorageError(e.to_string()))?;
+        self.store
+            .set(NS_CHAIN_HEADS, &chain_key, entry_key.into_bytes())
+            .await
+            .map_err(|e| AuditError::StorageError(e.to_string()))?;
 
         Ok(())
     }
 
-    fn get(&self, id: &AuditEntryId) -> AuditResult<Option<AuditEntry>> {
+    async fn get(&self, id: &AuditEntryId) -> AuditResult<Option<AuditEntry>> {
         let key = id.0.to_string();
 
-        let data = block_on(self.store.get(NS_ENTRIES, &key))
+        let data = self
+            .store
+            .get(NS_ENTRIES, &key)
+            .await
             .map_err(|e| AuditError::StorageError(e.to_string()))?;
 
         match data {
@@ -251,14 +215,17 @@ impl AuditStorage for SurrealKvAuditStorage {
         }
     }
 
-    fn get_chain_head(
+    async fn get_chain_head(
         &self,
         session_id: &SessionId,
         principal: Option<&astrid_core::PrincipalId>,
     ) -> AuditResult<Option<AuditEntryId>> {
         let key = chain_head_key(session_id, principal);
 
-        let data = block_on(self.store.get(NS_CHAIN_HEADS, &key))
+        let data = self
+            .store
+            .get(NS_CHAIN_HEADS, &key)
+            .await
             .map_err(|e| AuditError::StorageError(e.to_string()))?;
 
         match data {
@@ -273,12 +240,12 @@ impl AuditStorage for SurrealKvAuditStorage {
         }
     }
 
-    fn get_session_entries(&self, session_id: &SessionId) -> AuditResult<Vec<AuditEntry>> {
-        let ids = self.get_session_entry_ids(session_id)?;
+    async fn get_session_entries(&self, session_id: &SessionId) -> AuditResult<Vec<AuditEntry>> {
+        let ids = self.get_session_entry_ids(session_id).await?;
         let mut entries = Vec::with_capacity(ids.len());
 
         for id in ids {
-            if let Some(entry) = self.get(&id)? {
+            if let Some(entry) = self.get(&id).await? {
                 entries.push(entry);
             }
         }
@@ -286,18 +253,24 @@ impl AuditStorage for SurrealKvAuditStorage {
         Ok(entries)
     }
 
-    fn count(&self) -> AuditResult<usize> {
-        let keys = block_on(self.store.list_keys(NS_ENTRIES))
+    async fn count(&self) -> AuditResult<usize> {
+        let keys = self
+            .store
+            .list_keys(NS_ENTRIES)
+            .await
             .map_err(|e| AuditError::StorageError(e.to_string()))?;
         Ok(keys.len())
     }
 
-    fn count_session(&self, session_id: &SessionId) -> AuditResult<usize> {
-        Ok(self.get_session_entry_ids(session_id)?.len())
+    async fn count_session(&self, session_id: &SessionId) -> AuditResult<usize> {
+        Ok(self.get_session_entry_ids(session_id).await?.len())
     }
 
-    fn list_sessions(&self) -> AuditResult<Vec<SessionId>> {
-        let keys = block_on(self.store.list_keys(NS_SESSION_INDEX))
+    async fn list_sessions(&self) -> AuditResult<Vec<SessionId>> {
+        let keys = self
+            .store
+            .list_keys(NS_SESSION_INDEX)
+            .await
             .map_err(|e| AuditError::StorageError(e.to_string()))?;
 
         let mut sessions = Vec::new();
@@ -310,7 +283,7 @@ impl AuditStorage for SurrealKvAuditStorage {
         Ok(sessions)
     }
 
-    fn flush(&self) -> AuditResult<()> {
+    async fn flush(&self) -> AuditResult<()> {
         // KvStore commits on every set(), no explicit flush needed.
         Ok(())
     }
@@ -355,9 +328,9 @@ mod tests {
 
         let entry_id = entry.id.clone();
 
-        storage.store(&entry).unwrap();
+        storage.store(&entry).await.unwrap();
 
-        let retrieved = storage.get(&entry_id).unwrap().unwrap();
+        let retrieved = storage.get(&entry_id).await.unwrap().unwrap();
         assert_eq!(retrieved.id, entry_id);
     }
 
@@ -385,10 +358,10 @@ mod tests {
                 &keypair,
             );
             prev_hash = entry.content_hash();
-            storage.store(&entry).unwrap();
+            storage.store(&entry).await.unwrap();
         }
 
-        let entries = storage.get_session_entries(&session_id).unwrap();
+        let entries = storage.get_session_entries(&session_id).await.unwrap();
         assert_eq!(entries.len(), 3);
     }
 
@@ -412,7 +385,7 @@ mod tests {
             &keypair,
         );
 
-        storage.store(&entry1).unwrap();
+        storage.store(&entry1).await.unwrap();
 
         let entry2 = AuditEntry::create(
             session_id.clone(),
@@ -428,9 +401,13 @@ mod tests {
             &keypair,
         );
 
-        storage.store(&entry2).unwrap();
+        storage.store(&entry2).await.unwrap();
 
-        let head = storage.get_chain_head(&session_id, None).unwrap().unwrap();
+        let head = storage
+            .get_chain_head(&session_id, None)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(head, entry2.id);
     }
 
@@ -457,21 +434,25 @@ mod tests {
         );
 
         let entry_id = entry.id.clone();
-        storage.store(&entry).unwrap();
+        storage.store(&entry).await.unwrap();
 
-        let retrieved = storage.get(&entry_id).unwrap().unwrap();
+        let retrieved = storage.get(&entry_id).await.unwrap().unwrap();
         assert_eq!(retrieved.id, entry_id);
 
-        // Also verify session queries work through block_in_place.
-        let entries = storage.get_session_entries(&session_id).unwrap();
+        // Also verify session queries work under a multi-threaded runtime.
+        let entries = storage.get_session_entries(&session_id).await.unwrap();
         assert_eq!(entries.len(), 1);
 
-        let head = storage.get_chain_head(&session_id, None).unwrap().unwrap();
+        let head = storage
+            .get_chain_head(&session_id, None)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(head, entry_id);
     }
 
     /// Concurrent stores from multiple tasks under a multi-threaded runtime.
-    /// Exercises the `block_in_place` path under the load pattern from #305.
+    /// Exercises the async persist path under the load pattern from #305.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_concurrent_stores_multi_thread() {
         let storage = std::sync::Arc::new(SurrealKvAuditStorage::in_memory());
@@ -495,18 +476,18 @@ mod tests {
                     ContentHash::zero(),
                     &keypair,
                 );
-                s.store(&entry).unwrap();
+                s.store(&entry).await.unwrap();
                 entry.id
             }));
         }
 
         for h in handles {
             let id = h.await.unwrap();
-            assert!(storage.get(&id).unwrap().is_some());
+            assert!(storage.get(&id).await.unwrap().is_some());
         }
 
         // All 8 sessions should be visible.
-        let sessions = storage.list_sessions().unwrap();
+        let sessions = storage.list_sessions().await.unwrap();
         assert_eq!(sessions.len(), 8);
     }
 }

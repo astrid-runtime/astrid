@@ -6,11 +6,12 @@ use astrid_capabilities::AuditEntryId;
 use astrid_core::SessionId;
 use astrid_crypto::{ContentHash, KeyPair};
 use std::path::Path;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
+use tokio::sync::Mutex;
 use tracing::{debug, error, warn};
 
 use crate::entry::{AuditAction, AuditEntry, AuditOutcome, AuthorizationProof};
-use crate::error::{AuditError, AuditResult};
+use crate::error::AuditResult;
 use crate::storage::{AuditStorage, SurrealKvAuditStorage};
 
 /// Key for the per-chain head cache: (session, optional principal).
@@ -34,7 +35,14 @@ pub struct AuditLog {
     ///
     /// Each principal maintains its own independent chain within a session.
     /// System entries (no principal) use `(session_id, None)`.
-    chain_heads: RwLock<std::collections::HashMap<ChainKey, ContentHash>>,
+    ///
+    /// This is a [`tokio::sync::Mutex`] (not a `std` one) because
+    /// [`append_inner`](Self::append_inner) holds the guard *across the
+    /// persistent `store().await`* to keep read-prev-hash → sign → persist →
+    /// advance-head atomic per chain — a `std` guard cannot legally live across
+    /// an `.await`. Access is exclusive-only, so a plain mutex (not `RwLock`)
+    /// is the honest primitive. See the locking contract on [`append_inner`].
+    chain_heads: Mutex<std::collections::HashMap<ChainKey, ContentHash>>,
 }
 
 impl AuditLog {
@@ -54,7 +62,7 @@ impl AuditLog {
         Ok(Self {
             storage: Box::new(storage),
             runtime_key: runtime_key.into(),
-            chain_heads: RwLock::new(std::collections::HashMap::new()),
+            chain_heads: Mutex::new(std::collections::HashMap::new()),
         })
     }
 
@@ -67,7 +75,7 @@ impl AuditLog {
         Self {
             storage: Box::new(storage),
             runtime_key: runtime_key.into(),
-            chain_heads: RwLock::new(std::collections::HashMap::new()),
+            chain_heads: Mutex::new(std::collections::HashMap::new()),
         }
     }
 
@@ -76,7 +84,7 @@ impl AuditLog {
     /// # Errors
     ///
     /// Returns an error if the entry cannot be stored or the chain head cannot be updated.
-    pub fn append(
+    pub async fn append(
         &self,
         session_id: SessionId,
         action: AuditAction,
@@ -84,6 +92,7 @@ impl AuditLog {
         outcome: AuditOutcome,
     ) -> AuditResult<AuditEntryId> {
         self.append_inner(session_id, None, action, authorization, outcome)
+            .await
     }
 
     /// Append a new audit entry tagged with the acting principal.
@@ -95,7 +104,7 @@ impl AuditLog {
     /// # Errors
     ///
     /// Returns an error if the entry cannot be stored or the chain head cannot be updated.
-    pub fn append_with_principal(
+    pub async fn append_with_principal(
         &self,
         session_id: SessionId,
         principal: astrid_core::PrincipalId,
@@ -104,6 +113,7 @@ impl AuditLog {
         outcome: AuditOutcome,
     ) -> AuditResult<AuditEntryId> {
         self.append_inner(session_id, Some(principal), action, authorization, outcome)
+            .await
     }
 
     /// Shared implementation for `append` and `append_with_principal`.
@@ -112,8 +122,8 @@ impl AuditLog {
     ///
     /// The entire append critical section — resolving the chain's current head,
     /// creating and signing the entry against that head, persisting it, and then
-    /// advancing the cached head — runs while holding the `chain_heads` **write**
-    /// lock. This serializes appends to the same `(session, principal)` chain so
+    /// advancing the cached head — runs while holding the `chain_heads` mutex.
+    /// This serializes appends to the same `(session, principal)` chain so
     /// that `previous_hash` and the head move together atomically.
     ///
     /// Without this, two concurrent appends to the same chain both read the same
@@ -125,10 +135,15 @@ impl AuditLog {
     /// Signing happens inside the lock. That serializes same-chain appends, which
     /// is intentional and correct: a hash chain is inherently ordered, so a
     /// well-defined append order IS the product. The lock spans every chain in
-    /// this log (one `RwLock`), so it also serializes appends across chains; that
+    /// this log (one mutex), so it also serializes appends across chains; that
     /// is a stronger guarantee than required and is acceptable — audit append is
     /// not a hot path relative to the signed-ordering invariant it protects.
-    fn append_inner(
+    ///
+    /// The lock is a [`tokio::sync::Mutex`]: the guard is held *across the
+    /// persistent `store().await`*, which a `std` guard cannot legally do. An
+    /// async-aware lock is what lets the whole critical section stay atomic on
+    /// the now-genuinely-async persist path.
+    async fn append_inner(
         &self,
         session_id: SessionId,
         principal: Option<astrid_core::PrincipalId>,
@@ -138,18 +153,15 @@ impl AuditLog {
     ) -> AuditResult<AuditEntryId> {
         let chain_key: ChainKey = (session_id.clone(), principal.clone());
 
-        // Hold the write lock across read-prev-hash -> create+sign -> store ->
+        // Hold the lock across read-prev-hash -> create+sign -> store ->
         // head update so the whole append is atomic per chain (see the locking
         // contract above).
-        let mut heads = self
-            .chain_heads
-            .write()
-            .map_err(|e| AuditError::StorageError(e.to_string()))?;
+        let mut heads = self.chain_heads.lock().await;
 
         // Resolve the parent hash from the head cache we already hold (falling
         // back to storage), NOT via a fresh lock — re-locking would reopen the
         // fork window between the read and the head advance below.
-        let previous_hash = self.previous_hash_locked(&chain_key, &heads)?;
+        let previous_hash = self.previous_hash_locked(&chain_key, &heads).await?;
 
         // Create and sign the entry. session_id is moved into create,
         // chain_key retains the clone for the cache update below.
@@ -187,7 +199,7 @@ impl AuditLog {
         // a concurrent same-chain append cannot observe the stored entry without
         // also observing the advanced head. On a store failure we return without
         // touching the head — nothing was persisted, so the chain is unchanged.
-        self.storage.store(&entry)?;
+        self.storage.store(&entry).await?;
         heads.insert(chain_key, entry_hash);
 
         Ok(entry_id)
@@ -201,7 +213,7 @@ impl AuditLog {
     /// hash and advancing the head must stay inside one critical section (see the
     /// locking contract on [`append_inner`]). Taking a fresh lock here would
     /// reopen the fork window this design closes.
-    fn previous_hash_locked(
+    async fn previous_hash_locked(
         &self,
         chain_key: &ChainKey,
         heads: &std::collections::HashMap<ChainKey, ContentHash>,
@@ -214,8 +226,9 @@ impl AuditLog {
         // Fall back to storage (first append after a restart / cache miss).
         if let Some(head_id) = self
             .storage
-            .get_chain_head(&chain_key.0, chain_key.1.as_ref())?
-            && let Some(entry) = self.storage.get(&head_id)?
+            .get_chain_head(&chain_key.0, chain_key.1.as_ref())
+            .await?
+            && let Some(entry) = self.storage.get(&head_id).await?
         {
             return Ok(entry.content_hash());
         }
@@ -229,8 +242,8 @@ impl AuditLog {
     /// # Errors
     ///
     /// Returns an error if the storage backend fails to retrieve the entry.
-    pub fn get(&self, id: &AuditEntryId) -> AuditResult<Option<AuditEntry>> {
-        self.storage.get(id)
+    pub async fn get(&self, id: &AuditEntryId) -> AuditResult<Option<AuditEntry>> {
+        self.storage.get(id).await
     }
 
     /// Get all entries for a session.
@@ -238,8 +251,11 @@ impl AuditLog {
     /// # Errors
     ///
     /// Returns an error if the storage backend fails to retrieve entries.
-    pub fn get_session_entries(&self, session_id: &SessionId) -> AuditResult<Vec<AuditEntry>> {
-        self.storage.get_session_entries(session_id)
+    pub async fn get_session_entries(
+        &self,
+        session_id: &SessionId,
+    ) -> AuditResult<Vec<AuditEntry>> {
+        self.storage.get_session_entries(session_id).await
     }
 
     /// Verify the integrity of all audit chains in a session.
@@ -251,8 +267,11 @@ impl AuditLog {
     /// # Errors
     ///
     /// Returns an error if entries cannot be retrieved from storage.
-    pub fn verify_chain(&self, session_id: &SessionId) -> AuditResult<ChainVerificationResult> {
-        let entries = self.storage.get_session_entries(session_id)?;
+    pub async fn verify_chain(
+        &self,
+        session_id: &SessionId,
+    ) -> AuditResult<ChainVerificationResult> {
+        let entries = self.storage.get_session_entries(session_id).await?;
 
         if entries.is_empty() {
             return Ok(ChainVerificationResult {
@@ -335,12 +354,12 @@ impl AuditLog {
     /// # Errors
     ///
     /// Returns an error if entries cannot be retrieved from storage.
-    pub fn verify_principal_chain(
+    pub async fn verify_principal_chain(
         &self,
         session_id: &SessionId,
         principal: Option<&astrid_core::PrincipalId>,
     ) -> AuditResult<ChainVerificationResult> {
-        let entries = self.get_principal_entries(session_id, principal)?;
+        let entries = self.get_principal_entries(session_id, principal).await?;
 
         if entries.is_empty() {
             return Ok(ChainVerificationResult {
@@ -400,12 +419,12 @@ impl AuditLog {
     /// # Errors
     ///
     /// Returns an error if entries cannot be retrieved from storage.
-    pub fn get_principal_entries(
+    pub async fn get_principal_entries(
         &self,
         session_id: &SessionId,
         principal: Option<&astrid_core::PrincipalId>,
     ) -> AuditResult<Vec<AuditEntry>> {
-        let all = self.storage.get_session_entries(session_id)?;
+        let all = self.storage.get_session_entries(session_id).await?;
         Ok(all
             .into_iter()
             .filter(|e| e.principal.as_ref() == principal)
@@ -417,12 +436,12 @@ impl AuditLog {
     /// # Errors
     ///
     /// Returns an error if sessions cannot be listed or verified.
-    pub fn verify_all(&self) -> AuditResult<Vec<(SessionId, ChainVerificationResult)>> {
-        let sessions = self.storage.list_sessions()?;
+    pub async fn verify_all(&self) -> AuditResult<Vec<(SessionId, ChainVerificationResult)>> {
+        let sessions = self.storage.list_sessions().await?;
         let mut results = Vec::new();
 
         for session_id in sessions {
-            let result = self.verify_chain(&session_id)?;
+            let result = self.verify_chain(&session_id).await?;
             results.push((session_id, result));
         }
 
@@ -434,8 +453,8 @@ impl AuditLog {
     /// # Errors
     ///
     /// Returns an error if the storage backend fails.
-    pub fn count(&self) -> AuditResult<usize> {
-        self.storage.count()
+    pub async fn count(&self) -> AuditResult<usize> {
+        self.storage.count().await
     }
 
     /// Count entries for a session.
@@ -443,8 +462,8 @@ impl AuditLog {
     /// # Errors
     ///
     /// Returns an error if the storage backend fails.
-    pub fn count_session(&self, session_id: &SessionId) -> AuditResult<usize> {
-        self.storage.count_session(session_id)
+    pub async fn count_session(&self, session_id: &SessionId) -> AuditResult<usize> {
+        self.storage.count_session(session_id).await
     }
 
     /// List all sessions.
@@ -452,8 +471,8 @@ impl AuditLog {
     /// # Errors
     ///
     /// Returns an error if the storage backend fails.
-    pub fn list_sessions(&self) -> AuditResult<Vec<SessionId>> {
-        self.storage.list_sessions()
+    pub async fn list_sessions(&self) -> AuditResult<Vec<SessionId>> {
+        self.storage.list_sessions().await
     }
 
     /// Flush pending writes.
@@ -461,8 +480,8 @@ impl AuditLog {
     /// # Errors
     ///
     /// Returns an error if the storage backend fails to flush.
-    pub fn flush(&self) -> AuditResult<()> {
-        self.storage.flush()
+    pub async fn flush(&self) -> AuditResult<()> {
+        self.storage.flush().await
     }
 
     /// Get the runtime public key.
@@ -575,16 +594,18 @@ impl<'a> AuditBuilder<'a> {
     /// # Errors
     ///
     /// Returns an error if the audit entry cannot be appended.
-    pub(crate) fn success(self) -> AuditResult<AuditEntryId> {
-        self.log.append(
-            self.session_id,
-            self.action.expect("action required"),
-            self.authorization
-                .unwrap_or(AuthorizationProof::NotRequired {
-                    reason: "unspecified".to_string(),
-                }),
-            AuditOutcome::success(),
-        )
+    pub(crate) async fn success(self) -> AuditResult<AuditEntryId> {
+        self.log
+            .append(
+                self.session_id,
+                self.action.expect("action required"),
+                self.authorization
+                    .unwrap_or(AuthorizationProof::NotRequired {
+                        reason: "unspecified".to_string(),
+                    }),
+                AuditOutcome::success(),
+            )
+            .await
     }
 
     /// Record success with details.
@@ -596,16 +617,21 @@ impl<'a> AuditBuilder<'a> {
     /// # Errors
     ///
     /// Returns an error if the audit entry cannot be appended.
-    pub(crate) fn success_with(self, details: impl Into<String>) -> AuditResult<AuditEntryId> {
-        self.log.append(
-            self.session_id,
-            self.action.expect("action required"),
-            self.authorization
-                .unwrap_or(AuthorizationProof::NotRequired {
-                    reason: "unspecified".to_string(),
-                }),
-            AuditOutcome::success_with(details),
-        )
+    pub(crate) async fn success_with(
+        self,
+        details: impl Into<String>,
+    ) -> AuditResult<AuditEntryId> {
+        self.log
+            .append(
+                self.session_id,
+                self.action.expect("action required"),
+                self.authorization
+                    .unwrap_or(AuthorizationProof::NotRequired {
+                        reason: "unspecified".to_string(),
+                    }),
+                AuditOutcome::success_with(details),
+            )
+            .await
     }
 
     /// Record failure.
@@ -617,16 +643,18 @@ impl<'a> AuditBuilder<'a> {
     /// # Errors
     ///
     /// Returns an error if the audit entry cannot be appended.
-    pub(crate) fn failure(self, error: impl Into<String>) -> AuditResult<AuditEntryId> {
-        self.log.append(
-            self.session_id,
-            self.action.expect("action required"),
-            self.authorization
-                .unwrap_or(AuthorizationProof::NotRequired {
-                    reason: "unspecified".to_string(),
-                }),
-            AuditOutcome::failure(error),
-        )
+    pub(crate) async fn failure(self, error: impl Into<String>) -> AuditResult<AuditEntryId> {
+        self.log
+            .append(
+                self.session_id,
+                self.action.expect("action required"),
+                self.authorization
+                    .unwrap_or(AuthorizationProof::NotRequired {
+                        reason: "unspecified".to_string(),
+                    }),
+                AuditOutcome::failure(error),
+            )
+            .await
     }
 }
 

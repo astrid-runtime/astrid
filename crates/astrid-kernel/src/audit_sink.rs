@@ -146,6 +146,52 @@ impl KernelAuditSink {
     }
 }
 
+/// Drive an audit-log future to completion synchronously from the host-fn
+/// blocking context.
+///
+/// This is the one remaining sync boundary onto the now-genuinely-async audit
+/// log (the storage layer no longer hides a `block_on`). It is sound and
+/// deliberately native-only:
+///
+/// - The host fn that reports here already runs inside the WASM engine's
+///   `bounded_block_on` blocking context (a pinned tokio worker on the
+///   multi-threaded runtime) — see the [`HostAuditSink`] "why synchronous"
+///   contract. So the common path is `block_in_place` + `block_on`, the same
+///   blocking concurrency class the surrounding gate already uses; it adds **no
+///   new** class (no extra semaphore permit) and spawns no OS thread.
+/// - A `current_thread` runtime (single-threaded tests) can't `block_in_place`,
+///   so it falls back to a scoped thread that owns the `block_on`.
+/// - With no ambient runtime at all it parks a temporary one.
+///
+/// The whole module is `#[cfg]`-gated off `wasm32-unknown-unknown`, so the
+/// temporary-runtime `enable_all()` (whose time driver reads
+/// `std::time::Instant`) is never reachable on the browser profile — that panic
+/// is exactly the disease this change cures on the async path.
+fn block_on_audit<F>(f: F) -> F::Output
+where
+    F: std::future::Future + Send,
+    F::Output: Send,
+{
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) => {
+            if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread {
+                tokio::task::block_in_place(|| handle.block_on(f))
+            } else {
+                std::thread::scope(|s| {
+                    s.spawn(|| handle.block_on(f))
+                        .join()
+                        .expect("audit sink thread panicked")
+                })
+            }
+        },
+        Err(_) => tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("failed to create tokio runtime for audit sink")
+            .block_on(f),
+    }
+}
+
 impl HostAuditSink for KernelAuditSink {
     fn record(
         &self,
@@ -155,13 +201,17 @@ impl HostAuditSink for KernelAuditSink {
     ) {
         let action = Self::to_action(event);
         let (proof, audit_outcome) = Self::to_proof_outcome(outcome);
-        if let Err(e) = self.audit_log.append_with_principal(
+        // Native-only sync bridge onto the async audit log; see
+        // [`block_on_audit`]. Persistence failure degrades to "continue +
+        // alert", never a panic or a blocked host call.
+        let result = block_on_audit(self.audit_log.append_with_principal(
             self.session_id.clone(),
             principal.clone(),
             action,
             proof,
             audit_outcome,
-        ) {
+        ));
+        if let Err(e) = result {
             warn!(
                 security_event = true,
                 %principal,
@@ -184,8 +234,8 @@ mod tests {
 
     /// Every event kind, including a denial, lands a principal-stamped,
     /// correctly-mapped entry, and the resulting chain still verifies.
-    #[test]
-    fn records_each_event_kind_onto_the_signed_chain() {
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn records_each_event_kind_onto_the_signed_chain() {
         let log = Arc::new(AuditLog::in_memory(KeyPair::generate()));
         // Fixed, non-nil session id (nil is reserved for system/daemon
         // messages); deterministic so the test stays reproducible.
@@ -231,6 +281,7 @@ mod tests {
 
         let entries = log
             .get_principal_entries(&session, Some(&p))
+            .await
             .expect("read principal entries");
         assert_eq!(entries.len(), 6, "all six events must persist");
 
@@ -281,7 +332,7 @@ mod tests {
 
         // The signed hash chain remains valid after the high-frequency
         // appends.
-        let verification = log.verify_chain(&session).expect("verify chain");
+        let verification = log.verify_chain(&session).await.expect("verify chain");
         assert!(
             verification.valid,
             "chain must remain valid: {verification:?}"
@@ -290,8 +341,8 @@ mod tests {
 
     /// A multi-megabyte guest string is capped to [`MAX_AUDIT_STR_BYTES`] before
     /// it is signed and persisted, and the stored form is still valid UTF-8.
-    #[test]
-    fn oversized_guest_strings_are_truncated_at_the_sink() {
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn oversized_guest_strings_are_truncated_at_the_sink() {
         let log = Arc::new(AuditLog::in_memory(KeyPair::generate()));
         let session = SessionId::from_uuid(uuid::Uuid::from_u128(0x0995));
         let sink = KernelAuditSink::new(Arc::clone(&log), session.clone());
@@ -317,6 +368,7 @@ mod tests {
 
         let entries = log
             .get_principal_entries(&session, Some(&p))
+            .await
             .expect("read principal entries");
         assert_eq!(entries.len(), 2);
 
@@ -340,7 +392,7 @@ mod tests {
         }
 
         // Bounding the field must not break the signed chain.
-        let verification = log.verify_chain(&session).expect("verify chain");
+        let verification = log.verify_chain(&session).await.expect("verify chain");
         assert!(
             verification.valid,
             "chain must remain valid: {verification:?}"

@@ -13,24 +13,23 @@ astrid-capabilities = { workspace = true }
 astrid-core = { workspace = true }
 astrid-crypto = { workspace = true }
 astrid-storage = { workspace = true, features = ["kv"] }
+async-trait = { workspace = true }
 chrono = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
-tokio = { workspace = true, features = ["rt"] }
+# `sync` only: the storage/log surface is genuinely async now (the old
+# sync-over-async `block_on` is gone), so all that remains is the
+# `tokio::sync::RwLock` that guards the chain heads across the persist await.
+tokio = { workspace = true, features = ["sync"] }
 tracing = { workspace = true }
 uuid = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+# `rt-multi-thread` drives the `#[tokio::test(flavor = "multi_thread")]`
+# concurrency regressions; `macros` for `#[tokio::test]`.
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
-
-# `block_on`'s production path uses `tokio::task::block_in_place`, which is
-# gated behind `rt-multi-thread` — native-only (needs OS threads, absent on
-# wasm). The wasm build cfg-gates that branch out (see src/storage.rs), so the
-# feature is only needed off-wasm.
-[target.'cfg(not(target_family = "wasm"))'.dependencies]
-tokio = { workspace = true, features = ["rt-multi-thread"] }
 
 [lints]
 workspace = true
