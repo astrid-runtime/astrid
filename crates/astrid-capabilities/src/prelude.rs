@@ -10,6 +10,8 @@
 //! use astrid_core::Permission;
 //! use astrid_core::principal::PrincipalId;
 //!
+//! # #[tokio::main(flavor = "current_thread")]
+//! # async fn main() {
 //! // Create a capability store
 //! let store = CapabilityStore::in_memory();
 //!
@@ -28,8 +30,13 @@
 //! );
 //!
 //! // Add and check capability (scoped by principal).
-//! store.add(token).unwrap();
-//! assert!(store.has_capability(&principal, "mcp://filesystem:read_file", Permission::Invoke));
+//! store.add(token).await.unwrap();
+//! assert!(
+//!     store
+//!         .has_capability(&principal, "mcp://filesystem:read_file", Permission::Invoke)
+//!         .await
+//! );
+//! # }
 //! ```
 
 // Errors

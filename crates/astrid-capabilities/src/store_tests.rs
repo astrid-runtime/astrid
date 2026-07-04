@@ -38,9 +38,13 @@ async fn test_in_memory_store() {
 
     let token_id = token.id.clone();
 
-    store.add(token).unwrap();
-    assert!(store.has_capability(&default_principal(), "mcp://test:tool", Permission::Invoke));
-    assert!(store.get(&token_id).unwrap().is_some());
+    store.add(token).await.unwrap();
+    assert!(
+        store
+            .has_capability(&default_principal(), "mcp://test:tool", Permission::Invoke)
+            .await
+    );
+    assert!(store.get(&token_id).await.unwrap().is_some());
 }
 
 #[tokio::test]
@@ -61,13 +65,21 @@ async fn test_revoke() {
 
     let token_id = token.id.clone();
 
-    store.add(token).unwrap();
-    assert!(store.has_capability(&default_principal(), "mcp://test:tool", Permission::Invoke));
+    store.add(token).await.unwrap();
+    assert!(
+        store
+            .has_capability(&default_principal(), "mcp://test:tool", Permission::Invoke)
+            .await
+    );
 
-    store.revoke(&token_id).unwrap();
-    assert!(!store.has_capability(&default_principal(), "mcp://test:tool", Permission::Invoke));
+    store.revoke(&token_id).await.unwrap();
+    assert!(
+        !store
+            .has_capability(&default_principal(), "mcp://test:tool", Permission::Invoke)
+            .await
+    );
     assert!(matches!(
-        store.get(&token_id),
+        store.get(&token_id).await,
         Err(CapabilityError::TokenRevoked { .. })
     ));
 }
@@ -88,11 +100,19 @@ async fn test_clear_session() {
         default_principal(),
     );
 
-    store.add(token).unwrap();
-    assert!(store.has_capability(&default_principal(), "mcp://test:tool", Permission::Invoke));
+    store.add(token).await.unwrap();
+    assert!(
+        store
+            .has_capability(&default_principal(), "mcp://test:tool", Permission::Invoke)
+            .await
+    );
 
     store.clear_session().unwrap();
-    assert!(!store.has_capability(&default_principal(), "mcp://test:tool", Permission::Invoke));
+    assert!(
+        !store
+            .has_capability(&default_principal(), "mcp://test:tool", Permission::Invoke)
+            .await
+    );
 }
 
 #[tokio::test]
@@ -111,20 +131,24 @@ async fn test_find_capability() {
         default_principal(),
     );
 
-    store.add(token).unwrap();
+    store.add(token).await.unwrap();
 
-    let found = store.find_capability(
-        &default_principal(),
-        "mcp://filesystem:read_file",
-        Permission::Invoke,
-    );
+    let found = store
+        .find_capability(
+            &default_principal(),
+            "mcp://filesystem:read_file",
+            Permission::Invoke,
+        )
+        .await;
     assert!(found.is_some());
 
-    let not_found = store.find_capability(
-        &default_principal(),
-        "mcp://memory:read",
-        Permission::Invoke,
-    );
+    let not_found = store
+        .find_capability(
+            &default_principal(),
+            "mcp://memory:read",
+            Permission::Invoke,
+        )
+        .await;
     assert!(not_found.is_none());
 }
 
@@ -145,19 +169,25 @@ async fn test_find_capability_cross_principal_rejection() {
         None,
         bob(),
     );
-    store.add(token).unwrap();
+    store.add(token).await.unwrap();
 
     assert!(
         store
             .find_capability(&bob(), "mcp://test:tool", Permission::Invoke)
+            .await
             .is_some()
     );
     assert!(
         store
             .find_capability(&alice(), "mcp://test:tool", Permission::Invoke)
+            .await
             .is_none()
     );
-    assert!(!store.has_capability(&alice(), "mcp://test:tool", Permission::Invoke));
+    assert!(
+        !store
+            .has_capability(&alice(), "mcp://test:tool", Permission::Invoke)
+            .await
+    );
 }
 
 #[tokio::test]
@@ -176,20 +206,30 @@ async fn test_clear_session_for_scoped_to_principal() {
             None,
             p,
         );
-        store.add(token).unwrap();
+        store.add(token).await.unwrap();
     }
 
     store.clear_session_for(&alice()).unwrap();
 
-    assert!(!store.has_capability(&alice(), "mcp://test:tool", Permission::Invoke));
-    assert!(store.has_capability(&bob(), "mcp://test:tool", Permission::Invoke));
+    assert!(
+        !store
+            .has_capability(&alice(), "mcp://test:tool", Permission::Invoke)
+            .await
+    );
+    assert!(
+        store
+            .has_capability(&bob(), "mcp://test:tool", Permission::Invoke)
+            .await
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_persistent_store() {
     // Use an in-memory KvStore for testing (avoids filesystem issues).
     let kv: Arc<dyn KvStore> = Arc::new(MemoryKvStore::new());
-    let store = CapabilityStore::with_kv_store(Arc::clone(&kv)).unwrap();
+    let store = CapabilityStore::with_kv_store(Arc::clone(&kv))
+        .await
+        .unwrap();
     let keypair = test_keypair();
 
     let token = CapabilityToken::create(
@@ -205,22 +245,25 @@ async fn test_persistent_store() {
 
     let token_id = token.id.clone();
 
-    store.add(token).unwrap();
+    store.add(token).await.unwrap();
 
     // Reload store to verify persistence (same backing store).
     drop(store);
-    let store2 = CapabilityStore::with_kv_store(kv).unwrap();
-    assert!(store2.get(&token_id).unwrap().is_some());
+    let store2 = CapabilityStore::with_kv_store(kv).await.unwrap();
+    assert!(store2.get(&token_id).await.unwrap().is_some());
     // Verify find_capability (the production lookup path) also works after reload.
     assert!(
         store2
             .find_capability(&default_principal(), "mcp://test:tool", Permission::Invoke)
+            .await
             .is_some()
     );
 
     // Also test disk-backed store can open and store/retrieve.
     let temp_dir = tempfile::tempdir().unwrap();
-    let disk_store = CapabilityStore::with_persistence(temp_dir.path().join("caps")).unwrap();
+    let disk_store = CapabilityStore::with_persistence(temp_dir.path().join("caps"))
+        .await
+        .unwrap();
     let token2 = CapabilityToken::create(
         ResourcePattern::exact("mcp://test:tool2").unwrap(),
         vec![Permission::Invoke],
@@ -232,14 +275,16 @@ async fn test_persistent_store() {
         default_principal(),
     );
     let other_token_id = token2.id.clone();
-    disk_store.add(token2).unwrap();
-    assert!(disk_store.get(&other_token_id).unwrap().is_some());
+    disk_store.add(token2).await.unwrap();
+    assert!(disk_store.get(&other_token_id).await.unwrap().is_some());
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_revocation_survives_restart() {
     let kv: Arc<dyn KvStore> = Arc::new(MemoryKvStore::new());
-    let store = CapabilityStore::with_kv_store(Arc::clone(&kv)).unwrap();
+    let store = CapabilityStore::with_kv_store(Arc::clone(&kv))
+        .await
+        .unwrap();
     let keypair = test_keypair();
 
     let token = CapabilityToken::create(
@@ -254,23 +299,29 @@ async fn test_revocation_survives_restart() {
     );
 
     let token_id = token.id.clone();
-    store.add(token).unwrap();
-    store.revoke(&token_id).unwrap();
+    store.add(token).await.unwrap();
+    store.revoke(&token_id).await.unwrap();
 
     // Reload - revocation must survive.
     drop(store);
-    let store2 = CapabilityStore::with_kv_store(kv).unwrap();
+    let store2 = CapabilityStore::with_kv_store(kv).await.unwrap();
     assert!(matches!(
-        store2.get(&token_id),
+        store2.get(&token_id).await,
         Err(CapabilityError::TokenRevoked { .. })
     ));
-    assert!(!store2.has_capability(&default_principal(), "mcp://test:tool", Permission::Invoke));
+    assert!(
+        !store2
+            .has_capability(&default_principal(), "mcp://test:tool", Permission::Invoke)
+            .await
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_mark_used_survives_restart() {
     let kv: Arc<dyn KvStore> = Arc::new(MemoryKvStore::new());
-    let store = CapabilityStore::with_kv_store(Arc::clone(&kv)).unwrap();
+    let store = CapabilityStore::with_kv_store(Arc::clone(&kv))
+        .await
+        .unwrap();
     let keypair = test_keypair();
 
     let token = CapabilityToken::create_with_options(
@@ -286,14 +337,18 @@ async fn test_mark_used_survives_restart() {
     );
 
     let token_id = token.id.clone();
-    store.add(token).unwrap();
-    store.mark_used(&token_id).unwrap();
+    store.add(token).await.unwrap();
+    store.mark_used(&token_id).await.unwrap();
 
     // Reload - used state must survive.
     drop(store);
-    let store2 = CapabilityStore::with_kv_store(kv).unwrap();
-    assert!(store2.is_used(&token_id));
-    assert!(!store2.has_capability(&default_principal(), "mcp://test:tool", Permission::Invoke));
+    let store2 = CapabilityStore::with_kv_store(kv).await.unwrap();
+    assert!(store2.is_used(&token_id).await);
+    assert!(
+        !store2
+            .has_capability(&default_principal(), "mcp://test:tool", Permission::Invoke)
+            .await
+    );
 }
 
 #[tokio::test]
@@ -314,26 +369,36 @@ async fn test_find_capability_excludes_used_single_use() {
     );
 
     let token_id = token.id.clone();
-    store.add(token).unwrap();
+    store.add(token).await.unwrap();
 
     // Before marking used: both find_capability and has_capability return the token
     assert!(
         store
             .find_capability(&default_principal(), "mcp://test:tool", Permission::Invoke)
+            .await
             .is_some()
     );
-    assert!(store.has_capability(&default_principal(), "mcp://test:tool", Permission::Invoke));
+    assert!(
+        store
+            .has_capability(&default_principal(), "mcp://test:tool", Permission::Invoke)
+            .await
+    );
 
     // Mark the single-use token as consumed
-    store.mark_used(&token_id).unwrap();
+    store.mark_used(&token_id).await.unwrap();
 
     // After marking used: both must exclude the consumed token
     assert!(
         store
             .find_capability(&default_principal(), "mcp://test:tool", Permission::Invoke)
+            .await
             .is_none()
     );
-    assert!(!store.has_capability(&default_principal(), "mcp://test:tool", Permission::Invoke));
+    assert!(
+        !store
+            .has_capability(&default_principal(), "mcp://test:tool", Permission::Invoke)
+            .await
+    );
 }
 
 /// Helper: create a valid persistent token, serialize it, tamper a field,
@@ -379,13 +444,15 @@ async fn inject_tampered_persistent_token(kv: &Arc<dyn KvStore>, keypair: &KeyPa
 #[tokio::test(flavor = "multi_thread")]
 async fn test_get_rejects_tampered_persistent_token() {
     let kv: Arc<dyn KvStore> = Arc::new(MemoryKvStore::new());
-    let store = CapabilityStore::with_kv_store(Arc::clone(&kv)).unwrap();
+    let store = CapabilityStore::with_kv_store(Arc::clone(&kv))
+        .await
+        .unwrap();
     let keypair = test_keypair();
 
     let token_id = inject_tampered_persistent_token(&kv, &keypair).await;
 
     // get() should return an error for tampered tokens
-    let result = store.get(&token_id);
+    let result = store.get(&token_id).await;
     assert!(
         matches!(result, Err(CapabilityError::InvalidSignature)),
         "expected InvalidSignature, got {result:?}"
@@ -395,7 +462,9 @@ async fn test_get_rejects_tampered_persistent_token() {
 #[tokio::test(flavor = "multi_thread")]
 async fn test_find_capability_skips_tampered_persistent_token() {
     let kv: Arc<dyn KvStore> = Arc::new(MemoryKvStore::new());
-    let store = CapabilityStore::with_kv_store(Arc::clone(&kv)).unwrap();
+    let store = CapabilityStore::with_kv_store(Arc::clone(&kv))
+        .await
+        .unwrap();
     let keypair = test_keypair();
 
     let _token_id = inject_tampered_persistent_token(&kv, &keypair).await;
@@ -407,6 +476,7 @@ async fn test_find_capability_skips_tampered_persistent_token() {
                 "mcp://tampered:tool",
                 Permission::Invoke
             )
+            .await
             .is_none()
     );
 }
@@ -414,22 +484,30 @@ async fn test_find_capability_skips_tampered_persistent_token() {
 #[tokio::test(flavor = "multi_thread")]
 async fn test_has_capability_skips_tampered_persistent_token() {
     let kv: Arc<dyn KvStore> = Arc::new(MemoryKvStore::new());
-    let store = CapabilityStore::with_kv_store(Arc::clone(&kv)).unwrap();
+    let store = CapabilityStore::with_kv_store(Arc::clone(&kv))
+        .await
+        .unwrap();
     let keypair = test_keypair();
 
     let _token_id = inject_tampered_persistent_token(&kv, &keypair).await;
 
-    assert!(!store.has_capability(
-        &default_principal(),
-        "mcp://tampered:tool",
-        Permission::Invoke
-    ));
+    assert!(
+        !store
+            .has_capability(
+                &default_principal(),
+                "mcp://tampered:tool",
+                Permission::Invoke
+            )
+            .await
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_find_capability_excludes_used_single_use_persistent() {
     let kv: Arc<dyn KvStore> = Arc::new(MemoryKvStore::new());
-    let store = CapabilityStore::with_kv_store(Arc::clone(&kv)).unwrap();
+    let store = CapabilityStore::with_kv_store(Arc::clone(&kv))
+        .await
+        .unwrap();
     let keypair = test_keypair();
 
     let token = CapabilityToken::create_with_options(
@@ -445,23 +523,33 @@ async fn test_find_capability_excludes_used_single_use_persistent() {
     );
 
     let token_id = token.id.clone();
-    store.add(token).unwrap();
+    store.add(token).await.unwrap();
 
     assert!(
         store
             .find_capability(&default_principal(), "mcp://test:tool", Permission::Invoke)
+            .await
             .is_some()
     );
-    assert!(store.has_capability(&default_principal(), "mcp://test:tool", Permission::Invoke));
+    assert!(
+        store
+            .has_capability(&default_principal(), "mcp://test:tool", Permission::Invoke)
+            .await
+    );
 
-    store.mark_used(&token_id).unwrap();
+    store.mark_used(&token_id).await.unwrap();
 
     assert!(
         store
             .find_capability(&default_principal(), "mcp://test:tool", Permission::Invoke)
+            .await
             .is_none()
     );
-    assert!(!store.has_capability(&default_principal(), "mcp://test:tool", Permission::Invoke));
+    assert!(
+        !store
+            .has_capability(&default_principal(), "mcp://test:tool", Permission::Invoke)
+            .await
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -470,7 +558,9 @@ async fn test_persistent_v1_token_rejected_after_upgrade() {
     // `caps:tokens/{id}` path (flat, pre-Layer-4). The v2 verifier must
     // refuse it with InvalidSignature — no silent upgrade.
     let kv: Arc<dyn KvStore> = Arc::new(MemoryKvStore::new());
-    let store = CapabilityStore::with_kv_store(Arc::clone(&kv)).unwrap();
+    let store = CapabilityStore::with_kv_store(Arc::clone(&kv))
+        .await
+        .unwrap();
     let keypair = test_keypair();
 
     // Build a token with a dummy principal, then re-sign it against the v1
@@ -496,7 +586,7 @@ async fn test_persistent_v1_token_rejected_after_upgrade() {
         .await
         .unwrap();
 
-    let result = store.get(&token.id);
+    let result = store.get(&token.id).await;
     assert!(
         matches!(result, Err(CapabilityError::InvalidSignature)),
         "v1 tokens must be rejected with InvalidSignature; got {result:?}"

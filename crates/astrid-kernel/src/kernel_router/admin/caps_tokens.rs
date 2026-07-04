@@ -45,8 +45,10 @@ pub(super) async fn dispatch(
             permission,
             ttl_secs,
         } => caps_token_mint(kernel, principal, resource, permission, ttl_secs).await,
-        AdminRequestKind::CapsTokenRevoke { token_id } => caps_token_revoke(kernel, &token_id),
-        AdminRequestKind::CapsTokenList { principal } => caps_token_list(kernel, &principal),
+        AdminRequestKind::CapsTokenRevoke { token_id } => {
+            caps_token_revoke(kernel, &token_id).await
+        },
+        AdminRequestKind::CapsTokenList { principal } => caps_token_list(kernel, &principal).await,
         other => err_internal(format!(
             "caps_tokens::dispatch received a non-token variant: {other:?}"
         )),
@@ -138,7 +140,7 @@ pub(super) async fn caps_token_mint(
     let token_id = token.id.0.to_string();
     let expires_at = token.expires_at.map(|t| t.to_string());
 
-    if let Err(e) = kernel.capabilities.add(token) {
+    if let Err(e) = kernel.capabilities.add(token).await {
         return err_internal(format!("failed to store capability token: {e}"));
     }
 
@@ -152,7 +154,10 @@ pub(super) async fn caps_token_mint(
 }
 
 /// Revoke a capability token by id. Global and final.
-pub(super) fn caps_token_revoke(kernel: &Arc<crate::Kernel>, token_id: &str) -> AdminResponseBody {
+pub(super) async fn caps_token_revoke(
+    kernel: &Arc<crate::Kernel>,
+    token_id: &str,
+) -> AdminResponseBody {
     let parsed = match uuid::Uuid::parse_str(token_id.trim()) {
         Ok(u) => TokenId::from_uuid(u),
         Err(e) => return err_bad_input(format!("invalid token id {token_id:?}: {e}")),
@@ -160,7 +165,7 @@ pub(super) fn caps_token_revoke(kernel: &Arc<crate::Kernel>, token_id: &str) -> 
     // `revoke` is idempotent: it writes the global revoked marker even for an
     // id with no live token (best-effort delete of the primary row). So an
     // error here is a genuine storage failure, not "unknown token".
-    if let Err(e) = kernel.capabilities.revoke(&parsed) {
+    if let Err(e) = kernel.capabilities.revoke(&parsed).await {
         return err_internal(format!("failed to revoke token {token_id:?}: {e}"));
     }
     success_json(serde_json::json!({
@@ -170,11 +175,11 @@ pub(super) fn caps_token_revoke(kernel: &Arc<crate::Kernel>, token_id: &str) -> 
 }
 
 /// List the (non-revoked, non-expired) tokens minted for `principal`.
-pub(super) fn caps_token_list(
+pub(super) async fn caps_token_list(
     kernel: &Arc<crate::Kernel>,
     principal: &PrincipalId,
 ) -> AdminResponseBody {
-    let all = match kernel.capabilities.list_tokens() {
+    let all = match kernel.capabilities.list_tokens().await {
         Ok(t) => t,
         Err(e) => return err_internal(format!("failed to list tokens: {e}")),
     };

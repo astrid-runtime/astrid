@@ -139,6 +139,7 @@ async fn mint_creates_permanent_token() {
     let token = kernel
         .capabilities
         .find_capability(&alice, "mcp://server:tool", Permission::Invoke)
+        .await
         .expect("minted token is findable for the minted principal");
     assert!(token.expires_at.is_none(), "token must be permanent");
     assert_eq!(token.principal, alice);
@@ -166,6 +167,7 @@ async fn mint_with_ttl_sets_expiry() {
     let token = kernel
         .capabilities
         .find_capability(&alice, "mcp://server:tool", Permission::Invoke)
+        .await
         .expect("ttl token findable");
     assert!(token.expires_at.is_some(), "token must have an expiry");
 }
@@ -187,6 +189,7 @@ async fn minted_token_is_principal_scoped() {
         kernel
             .capabilities
             .find_capability(&alice, "mcp://server:tool", Permission::Invoke)
+            .await
             .is_some(),
         "minted principal must be authorized"
     );
@@ -195,6 +198,7 @@ async fn minted_token_is_principal_scoped() {
         kernel
             .capabilities
             .find_capability(&bob, "mcp://server:tool", Permission::Invoke)
+            .await
             .is_none(),
         "cross-principal use must fail closed (issue #668)"
     );
@@ -214,6 +218,7 @@ async fn revoke_removes_authorization() {
         kernel
             .capabilities
             .find_capability(&alice, "mcp://server:tool", Permission::Invoke)
+            .await
             .is_some()
     );
 
@@ -231,6 +236,7 @@ async fn revoke_removes_authorization() {
         kernel
             .capabilities
             .find_capability(&alice, "mcp://server:tool", Permission::Invoke)
+            .await
             .is_none(),
         "revoked token must no longer authorize"
     );
@@ -295,6 +301,7 @@ async fn mint_rejects_unknown_principal() {
         kernel
             .capabilities
             .find_capability(&ghost, "mcp://server:tool", Permission::Invoke)
+            .await
             .is_none()
     );
 }
@@ -321,6 +328,7 @@ async fn mint_rejects_invalid_permission() {
         kernel
             .capabilities
             .find_capability(&alice, "mcp://server:tool", Permission::Invoke)
+            .await
             .is_none(),
         "no token should be minted on a bad permission"
     );
@@ -353,6 +361,7 @@ async fn mint_rejects_out_of_range_ttl() {
         kernel
             .capabilities
             .find_capability(&alice, "mcp://server:tool", Permission::Invoke)
+            .await
             .is_none(),
         "no token should be minted on an out-of-range ttl"
     );

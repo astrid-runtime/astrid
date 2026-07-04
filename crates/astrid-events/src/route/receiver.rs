@@ -73,7 +73,7 @@ impl RoutedEventReceiver {
             // Slow path: park until notified or timeout.
             match timeout {
                 Some(dur) => {
-                    if tokio::time::timeout(dur, self.notify.notified())
+                    if astrid_runtime::time::timeout(dur, self.notify.notified())
                         .await
                         .is_err()
                     {

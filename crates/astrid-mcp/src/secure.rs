@@ -80,7 +80,7 @@ impl SecureMcpClient {
     /// # Errors
     ///
     /// Returns an error if a single-use token cannot be consumed.
-    pub fn check_authorization(
+    pub async fn check_authorization(
         &self,
         principal: &astrid_core::principal::PrincipalId,
         server: &str,
@@ -94,12 +94,14 @@ impl SecureMcpClient {
         // Layer 4 (#668): tokens are filtered by principal before expiry
         // and signature checks. A token minted for Alice cannot authorize
         // Bob's tool call, even if the resource pattern matches.
-        let result = validator.check(principal, &resource, Permission::Invoke);
+        let result = validator
+            .check(principal, &resource, Permission::Invoke)
+            .await;
 
         if let Some(found_token) = result.token() {
             // Consume single-use tokens to prevent replay.
             // `use_token` validates + marks used atomically.
-            match self.capabilities.use_token(&found_token.id) {
+            match self.capabilities.use_token(&found_token.id).await {
                 Ok(token) => {
                     // Re-verify issuer on the token returned by use_token.
                     // `use_token` checks expiry and signature but not issuer
@@ -239,7 +241,7 @@ impl SecureMcpClient {
         tool: &str,
         args: Value,
     ) -> McpResult<Result<ToolResult, ToolAuthorization>> {
-        match self.check_authorization(principal, server, tool)? {
+        match self.check_authorization(principal, server, tool).await? {
             ToolAuthorization::Authorized { proof } => {
                 let result = self.call_tool(server, tool, args, proof).await?;
                 Ok(Ok(result))
@@ -553,7 +555,7 @@ mod tests {
 
     /// Mint a token signed by the runtime key (the trusted issuer) and add
     /// it to the capability store.
-    fn grant_capability(
+    async fn grant_capability(
         secure: &SecureMcpClient,
         resource: &str,
         single_use: bool,
@@ -570,7 +572,7 @@ mod tests {
             single_use,
             astrid_core::principal::PrincipalId::default(),
         );
-        secure.capabilities.add(token.clone()).unwrap();
+        secure.capabilities.add(token.clone()).await.unwrap();
         token
     }
 
@@ -619,6 +621,7 @@ mod tests {
         // No tokens in the store, so any tool check should require approval
         let auth = secure
             .check_authorization(&default_principal(), "test-server", "test-tool")
+            .await
             .unwrap();
         assert!(
             matches!(auth, ToolAuthorization::RequiresApproval { .. }),
@@ -629,10 +632,11 @@ mod tests {
     #[tokio::test]
     async fn test_authorized_token_produces_correct_proof() {
         let (secure, runtime_key) = make_secure_client_with_key();
-        let token = grant_capability(&secure, "mcp://my-server:my-tool", false, &runtime_key);
+        let token = grant_capability(&secure, "mcp://my-server:my-tool", false, &runtime_key).await;
 
         let auth = secure
             .check_authorization(&default_principal(), "my-server", "my-tool")
+            .await
             .unwrap();
 
         match auth {
@@ -659,11 +663,12 @@ mod tests {
     #[tokio::test]
     async fn test_single_use_token_cannot_be_replayed() {
         let (secure, runtime_key) = make_secure_client_with_key();
-        grant_capability(&secure, "mcp://replay-server:tool", true, &runtime_key);
+        grant_capability(&secure, "mcp://replay-server:tool", true, &runtime_key).await;
 
         // First check consumes the token
         let first = secure
             .check_authorization(&default_principal(), "replay-server", "tool")
+            .await
             .unwrap();
         assert!(
             matches!(first, ToolAuthorization::Authorized { .. }),
@@ -673,6 +678,7 @@ mod tests {
         // Second check must fail - token was consumed
         let second = secure
             .check_authorization(&default_principal(), "replay-server", "tool")
+            .await
             .unwrap();
         assert!(
             matches!(second, ToolAuthorization::RequiresApproval { .. }),
@@ -686,10 +692,11 @@ mod tests {
 
         // Mint a token signed by a DIFFERENT key (not the runtime key)
         let untrusted_key = KeyPair::generate();
-        grant_capability(&secure, "mcp://server:tool", false, &untrusted_key);
+        grant_capability(&secure, "mcp://server:tool", false, &untrusted_key).await;
 
         let auth = secure
             .check_authorization(&default_principal(), "server", "tool")
+            .await
             .unwrap();
         assert!(
             matches!(auth, ToolAuthorization::RequiresApproval { .. }),

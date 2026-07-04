@@ -38,7 +38,11 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Duration;
+// `web_time::Instant` IS `std::time::Instant` on native targets (pure
+// re-export, same type identity for callers); on wasm32-unknown-unknown it
+// reads the JS performance clock instead of panicking like `std`'s.
+use web_time::Instant;
 
 use astrid_core::PrincipalId;
 use dashmap::DashMap;

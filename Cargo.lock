@@ -531,6 +531,7 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.18",
  "toml 0.9.12+spec-1.1.0",
+ "web-time",
 ]
 
 [[package]]
@@ -622,6 +623,7 @@ name = "astrid-events"
 version = "0.9.2"
 dependencies = [
  "astrid-core",
+ "astrid-runtime",
  "astrid-types",
  "async-trait",
  "chrono",
@@ -635,6 +637,7 @@ dependencies = [
  "tokio",
  "tracing",
  "uuid",
+ "web-time",
 ]
 
 [[package]]

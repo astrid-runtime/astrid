@@ -9,6 +9,7 @@ rust-version.workspace = true
 description = "Engine-agnostic capsule types shared by all Astrid capsule engines"
 
 [dependencies]
+web-time = "1.1.0"
 astrid-core = { workspace = true }
 dashmap = { workspace = true }
 parking_lot = { workspace = true }
