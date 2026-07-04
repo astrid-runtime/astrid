@@ -29,8 +29,8 @@ pub const MAX_IPC_PAYLOAD_BYTES: usize = 5 * 1024 * 1024;
 /// it resets.
 #[derive(Debug)]
 pub struct IpcRateLimiter {
-    state: dashmap::DashMap<RateLimiterKey, (std::time::Instant, usize)>,
-    last_prune: std::sync::Mutex<std::time::Instant>,
+    state: dashmap::DashMap<RateLimiterKey, (web_time::Instant, usize)>,
+    last_prune: std::sync::Mutex<web_time::Instant>,
 }
 
 impl IpcRateLimiter {
@@ -39,7 +39,7 @@ impl IpcRateLimiter {
     pub fn new() -> Self {
         Self {
             state: dashmap::DashMap::new(),
-            last_prune: std::sync::Mutex::new(std::time::Instant::now()),
+            last_prune: std::sync::Mutex::new(web_time::Instant::now()),
         }
     }
 
@@ -66,7 +66,7 @@ impl IpcRateLimiter {
             return Err("Payload too large".to_string());
         }
 
-        let now = std::time::Instant::now();
+        let now = web_time::Instant::now();
 
         // Lazy prune stale entries to prevent memory leaks when shared globally.
         if self.state.len() > 1000 {

@@ -24,6 +24,8 @@
 //! use astrid_core::principal::PrincipalId;
 //! use astrid_crypto::KeyPair;
 //!
+//! # #[tokio::main(flavor = "current_thread")]
+//! # async fn main() {
 //! // Create a capability store
 //! let store = CapabilityStore::in_memory();
 //!
@@ -44,10 +46,15 @@
 //! );
 //!
 //! // Add to store
-//! store.add(token).unwrap();
+//! store.add(token).await.unwrap();
 //!
 //! // Check capability (scoped by principal)
-//! assert!(store.has_capability(&principal, "mcp://filesystem:read_file", Permission::Invoke));
+//! assert!(
+//!     store
+//!         .has_capability(&principal, "mcp://filesystem:read_file", Permission::Invoke)
+//!         .await
+//! );
+//! # }
 //! ```
 
 #![deny(unsafe_code)]

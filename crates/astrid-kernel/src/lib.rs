@@ -514,9 +514,11 @@ impl Kernel {
         // Bootstrap the capability store (persistent) over the injected KV.
         // Key rotation invalidates persisted tokens (fail-secure by design).
         let capabilities = Arc::new(
-            CapabilityStore::with_kv_store(Arc::clone(&kv)).map_err(|e| {
-                std::io::Error::other(format!("Failed to init capability store: {e}"))
-            })?,
+            CapabilityStore::with_kv_store(Arc::clone(&kv))
+                .await
+                .map_err(|e| {
+                    std::io::Error::other(format!("Failed to init capability store: {e}"))
+                })?,
         );
 
         // Initialize the MCP process manager with its security layer. Native
@@ -1950,7 +1952,9 @@ pub(crate) async fn test_kernel_with_home(home: astrid_core::dirs::AstridHome) -
         astrid_storage::SurrealKvStore::open(home.state_db_path()).expect("test kernel: open kv"),
     );
     let capabilities = Arc::new(
-        CapabilityStore::with_kv_store(Arc::clone(&kv)).expect("test kernel: capability store"),
+        CapabilityStore::with_kv_store(Arc::clone(&kv))
+            .await
+            .expect("test kernel: capability store"),
     );
 
     // Audit log at the tempdir — chain verification is trivially Ok on a
@@ -2168,7 +2172,13 @@ fn load_or_generate_runtime_key(keys_dir: &Path) -> std::io::Result<KeyPair> {
 /// storm diagnostics — see [`bus_monitor::spawn_bus_activity_monitor`]), and
 /// the grant-on-first-use observer (`astrid.v1.approval` — see
 /// [`grant_on_use::spawn_grant_on_use_handler`]).
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 const INTERNAL_SUBSCRIBER_COUNT: usize = 6;
+/// Browser-profile count: only the `EventDispatcher` and the bus activity
+/// monitor subscribe at boot — the router pair, `ConnectionTracker`, and
+/// the grant-on-first-use observer are native-gated machinery.
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+const INTERNAL_SUBSCRIBER_COUNT: usize = 2;
 
 /// Gauge: current active client connections (sum across principals).
 /// Mirrors [`Kernel::total_connection_count`]; lets a dashboard graph

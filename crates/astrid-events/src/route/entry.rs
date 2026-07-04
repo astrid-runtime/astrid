@@ -4,7 +4,9 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Instant;
+// `web_time::Instant` = `std::time::Instant` on native; JS performance
+// clock on wasm32-unknown-unknown (std's panics there at runtime).
+use web_time::Instant;
 
 use tokio::sync::Notify;
 use uuid::Uuid;
