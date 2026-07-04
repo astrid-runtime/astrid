@@ -12,6 +12,13 @@
 //! the Extism sandbox, and route IPC bytes between them.
 
 /// Kernel implementation of the capsule per-action host-audit sink.
+///
+/// Native-only: the [`HostAuditSink`](astrid_capsule::HostAuditSink) seam is
+/// driven exclusively by the wasmtime host engine, which is itself native-only
+/// (the WASM engine never runs on the browser profile). The sink is the last
+/// synchronous caller of the now-async audit log, so it carries a native-gated
+/// block-on bridge that must not exist on `wasm32-unknown-unknown`.
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 pub mod audit_sink;
 /// Passive event-bus storm diagnostics (publish-rate monitor).
 mod bus_monitor;
@@ -393,7 +400,7 @@ impl Kernel {
         // `kernel.runtime_key` mint tokens the approval interceptor's validator
         // trusts as issuer.
         let runtime_key = Arc::new(load_or_generate_runtime_key(&home.keys_dir())?);
-        let audit_log = open_audit_log(&home, Arc::clone(&runtime_key))?;
+        let audit_log = open_audit_log(&home, Arc::clone(&runtime_key)).await?;
 
         // Bind the secure Unix socket and generate the session token. The
         // socket is bound here, but not yet listened on. The token is generated
@@ -2060,7 +2067,7 @@ pub(crate) async fn test_kernel_with_home(home: astrid_core::dirs::AstridHome) -
 /// same home — re-resolving from the environment here could split the audit
 /// log from the KV/socket paths if `$ASTRID_HOME` changed between calls.
 #[cfg(unix)]
-fn open_audit_log(
+async fn open_audit_log(
     home: &astrid_core::dirs::AstridHome,
     runtime_key: Arc<astrid_crypto::KeyPair>,
 ) -> std::io::Result<Arc<AuditLog>> {
@@ -2079,7 +2086,7 @@ fn open_audit_log(
         .map_err(|e| std::io::Error::other(format!("cannot open audit log: {e}")))?;
 
     // Verify all historical chains on boot.
-    match audit_log.verify_all() {
+    match audit_log.verify_all().await {
         Ok(results) => {
             let total_sessions = results.len();
             let mut tampered_sessions: usize = 0;

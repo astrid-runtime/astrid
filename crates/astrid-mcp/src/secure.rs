@@ -183,16 +183,18 @@ impl SecureMcpClient {
 
         // Log the tool call
         let audit_result = {
-            self.audit.append(
-                self.session_id.clone(),
-                AuditAction::McpToolCall {
-                    server: server.to_string(),
-                    tool: tool.to_string(),
-                    args_hash,
-                },
-                authorization,
-                AuditOutcome::success_with("tool call started"),
-            )
+            self.audit
+                .append(
+                    self.session_id.clone(),
+                    AuditAction::McpToolCall {
+                        server: server.to_string(),
+                        tool: tool.to_string(),
+                        args_hash,
+                    },
+                    authorization,
+                    AuditOutcome::success_with("tool call started"),
+                )
+                .await
         };
 
         if let Err(e) = audit_result {
@@ -210,18 +212,22 @@ impl SecureMcpClient {
                 Err(e) => AuditOutcome::failure(e.to_string()),
             };
 
-            if let Err(e) = self.audit.append(
-                self.session_id.clone(),
-                AuditAction::McpToolCall {
-                    server: server.to_string(),
-                    tool: tool.to_string(),
-                    args_hash,
-                },
-                AuthorizationProof::System {
-                    reason: "result logging".to_string(),
-                },
-                outcome,
-            ) {
+            if let Err(e) = self
+                .audit
+                .append(
+                    self.session_id.clone(),
+                    AuditAction::McpToolCall {
+                        server: server.to_string(),
+                        tool: tool.to_string(),
+                        args_hash,
+                    },
+                    AuthorizationProof::System {
+                        reason: "result logging".to_string(),
+                    },
+                    outcome,
+                )
+                .await
+            {
                 warn!(error = %e, "Failed to log tool call result");
             }
         }
@@ -284,18 +290,22 @@ impl SecureMcpClient {
             .map_or_else(|| "unknown".to_string(), |c| c.transport.to_string());
 
         // Log server start
-        if let Err(e) = self.audit.append(
-            self.session_id.clone(),
-            AuditAction::ServerStarted {
-                name: server_name.to_string(),
-                transport,
-                binary_hash: None,
-            },
-            AuthorizationProof::System {
-                reason: "server connection".to_string(),
-            },
-            AuditOutcome::success(),
-        ) {
+        if let Err(e) = self
+            .audit
+            .append(
+                self.session_id.clone(),
+                AuditAction::ServerStarted {
+                    name: server_name.to_string(),
+                    transport,
+                    binary_hash: None,
+                },
+                AuthorizationProof::System {
+                    reason: "server connection".to_string(),
+                },
+                AuditOutcome::success(),
+            )
+            .await
+        {
             warn!(server = server_name, error = %e, "Failed to audit server connection");
         }
 
@@ -311,17 +321,21 @@ impl SecureMcpClient {
         self.client.disconnect(server_name).await?;
 
         // Log server stop
-        if let Err(e) = self.audit.append(
-            self.session_id.clone(),
-            AuditAction::ServerStopped {
-                name: server_name.to_string(),
-                reason: "user disconnect".to_string(),
-            },
-            AuthorizationProof::System {
-                reason: "server disconnection".to_string(),
-            },
-            AuditOutcome::success(),
-        ) {
+        if let Err(e) = self
+            .audit
+            .append(
+                self.session_id.clone(),
+                AuditAction::ServerStopped {
+                    name: server_name.to_string(),
+                    reason: "user disconnect".to_string(),
+                },
+                AuthorizationProof::System {
+                    reason: "server disconnection".to_string(),
+                },
+                AuditOutcome::success(),
+            )
+            .await
+        {
             warn!(server = server_name, error = %e, "Failed to audit server disconnection");
         }
 
@@ -346,18 +360,22 @@ impl SecureMcpClient {
         let transport = config.transport.to_string();
         self.client.connect_dynamic(name, config).await?;
 
-        if let Err(e) = self.audit.append(
-            self.session_id.clone(),
-            AuditAction::ServerStarted {
-                name: name.to_string(),
-                transport,
-                binary_hash: None,
-            },
-            AuthorizationProof::System {
-                reason: "dynamic server connection".to_string(),
-            },
-            AuditOutcome::success(),
-        ) {
+        if let Err(e) = self
+            .audit
+            .append(
+                self.session_id.clone(),
+                AuditAction::ServerStarted {
+                    name: name.to_string(),
+                    transport,
+                    binary_hash: None,
+                },
+                AuthorizationProof::System {
+                    reason: "dynamic server connection".to_string(),
+                },
+                AuditOutcome::success(),
+            )
+            .await
+        {
             warn!(server = name, error = %e, "Failed to audit dynamic server connection");
         }
 
@@ -377,17 +395,21 @@ impl SecureMcpClient {
         self.client.disconnect_all().await?;
 
         for name in running {
-            if let Err(e) = self.audit.append(
-                self.session_id.clone(),
-                AuditAction::ServerStopped {
-                    name: name.clone(),
-                    reason: "disconnect_all".to_string(),
-                },
-                AuthorizationProof::System {
-                    reason: "bulk disconnect".to_string(),
-                },
-                AuditOutcome::success(),
-            ) {
+            if let Err(e) = self
+                .audit
+                .append(
+                    self.session_id.clone(),
+                    AuditAction::ServerStopped {
+                        name: name.clone(),
+                        reason: "disconnect_all".to_string(),
+                    },
+                    AuthorizationProof::System {
+                        reason: "bulk disconnect".to_string(),
+                    },
+                    AuditOutcome::success(),
+                )
+                .await
+            {
                 warn!(server = %name, error = %e, "Failed to audit server stop during disconnect_all");
             }
         }
@@ -408,17 +430,21 @@ impl SecureMcpClient {
         self.client.shutdown().await?;
 
         for name in running {
-            if let Err(e) = self.audit.append(
-                self.session_id.clone(),
-                AuditAction::ServerStopped {
-                    name: name.clone(),
-                    reason: "shutdown".to_string(),
-                },
-                AuthorizationProof::System {
-                    reason: "client shutdown".to_string(),
-                },
-                AuditOutcome::success(),
-            ) {
+            if let Err(e) = self
+                .audit
+                .append(
+                    self.session_id.clone(),
+                    AuditAction::ServerStopped {
+                        name: name.clone(),
+                        reason: "shutdown".to_string(),
+                    },
+                    AuthorizationProof::System {
+                        reason: "client shutdown".to_string(),
+                    },
+                    AuditOutcome::success(),
+                )
+                .await
+            {
                 warn!(server = %name, error = %e, "Failed to audit server stop during shutdown");
             }
         }
@@ -457,18 +483,22 @@ impl SecureMcpClient {
                 .get_config(&name)
                 .map_or_else(|| "unknown".to_string(), |c| c.transport.to_string());
 
-            if let Err(e) = self.audit.append(
-                self.session_id.clone(),
-                AuditAction::ServerStarted {
-                    name: name.clone(),
-                    transport,
-                    binary_hash: None,
-                },
-                AuthorizationProof::System {
-                    reason: "auto-start server".to_string(),
-                },
-                AuditOutcome::success(),
-            ) {
+            if let Err(e) = self
+                .audit
+                .append(
+                    self.session_id.clone(),
+                    AuditAction::ServerStarted {
+                        name: name.clone(),
+                        transport,
+                        binary_hash: None,
+                    },
+                    AuthorizationProof::System {
+                        reason: "auto-start server".to_string(),
+                    },
+                    AuditOutcome::success(),
+                )
+                .await
+            {
                 warn!(server = %name, error = %e, "Failed to audit auto-start server");
             }
         }

@@ -217,6 +217,7 @@ async fn admin_request_audit_includes_params_payload() {
     let entries = kernel
         .audit_log
         .get_session_entries(&kernel.session_id)
+        .await
         .expect("read audit chain");
     let found = entries
         .iter()

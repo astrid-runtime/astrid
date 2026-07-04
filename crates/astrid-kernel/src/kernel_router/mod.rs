@@ -240,7 +240,8 @@ async fn handle_request(
                     },
                     outcome: AuditOutcome::success(),
                 },
-            );
+            )
+            .await;
         },
         Err(e) => {
             warn!(
@@ -264,7 +265,8 @@ async fn handle_request(
                     },
                     outcome: AuditOutcome::failure(e.to_string()),
                 },
-            );
+            )
+            .await;
             publish_response(kernel, response_topic, KernelResponse::Error(e.to_string()));
             return;
         },
@@ -920,7 +922,7 @@ pub const AUDIT_TOPIC: &str = "astrid.v1.audit.entry";
 /// [`AUDIT_TOPIC`]. Failures to persist are logged but do not abort
 /// the request — the audit log degrades to "continue + alert" by
 /// design. A bus-publish failure is similarly best-effort.
-fn record_admin_audit(kernel: &crate::Kernel, entry: AdminAuditEntry<'_>) {
+async fn record_admin_audit(kernel: &crate::Kernel, entry: AdminAuditEntry<'_>) {
     let AdminAuditEntry {
         caller,
         method,
@@ -938,13 +940,17 @@ fn record_admin_audit(kernel: &crate::Kernel, entry: AdminAuditEntry<'_>) {
         params: params.clone(),
         device_key_id: device_key_id.map(str::to_owned),
     };
-    if let Err(e) = kernel.audit_log.append_with_principal(
-        kernel.session_id.clone(),
-        caller.clone(),
-        action,
-        authorization.clone(),
-        outcome.clone(),
-    ) {
+    if let Err(e) = kernel
+        .audit_log
+        .append_with_principal(
+            kernel.session_id.clone(),
+            caller.clone(),
+            action,
+            authorization.clone(),
+            outcome.clone(),
+        )
+        .await
+    {
         warn!(
             security_event = true,
             principal = %caller,
