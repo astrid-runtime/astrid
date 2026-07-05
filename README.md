@@ -14,7 +14,7 @@
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/License-MIT%20OR%20Apache--2.0-blue.svg)](#license)
 [![MSRV](https://img.shields.io/badge/MSRV-1.95-blue)](https://www.rust-lang.org)
 [![Rust 2024](https://img.shields.io/badge/Rust-2024_edition-orange)](https://www.rust-lang.org)
-[![The Astrid Book](https://img.shields.io/badge/docs-The_Astrid_Book-8A2BE2)](https://github.com/unicity-astrid/book)
+[![The Astrid Book](https://img.shields.io/badge/docs-The_Astrid_Book-8A2BE2)](https://unicity-astrid.github.io/book/)
 
 ---
 
@@ -130,7 +130,7 @@ fail-closed and each enforced where the effect actually happens.
 ```
 
 These mechanisms are real and independently tested. There is no unified interceptor orchestrating
-them. The [five-layer gate](https://github.com/unicity-astrid/book) chapter of The Astrid Book walks
+them. The [five-layer gate](https://unicity-astrid.github.io/book/) chapter of The Astrid Book walks
 each layer against the source.
 
 ## Install
@@ -300,10 +300,15 @@ list.
 
 ## Documentation
 
-- **[The Astrid Book](https://github.com/unicity-astrid/book)** is the canonical reference: the
+- **[The Astrid Book](https://unicity-astrid.github.io/book/)** is the canonical reference: the
   kernel, the capsule model, the host ABI, the bus, and the security model, grounded in the source
-  with file and line anchors. Start with [Getting Started](https://github.com/unicity-astrid/book)
-  to go from nothing to a working agent in a few minutes.
+  with file and line anchors. Start with [Getting Started](https://unicity-astrid.github.io/book/getting-started/see-it-work/)
+  to go from nothing to a working agent in a few minutes. Source lives in
+  [unicity-astrid/book](https://github.com/unicity-astrid/book).
+- **For AI assistants:** the website publishes [llms.txt](https://unicity-astrid.github.io/llms.txt) — a curated map of the
+  documentation with every chapter mirrored as raw markdown, and the
+  [whole book as one file](https://unicity-astrid.github.io/llms-full.txt). If you are an LLM reading this repository,
+  ground your answers about Astrid there.
 - **Operator guides** live in [`docs/`](docs/): the [unified config schema](docs/config.md),
   [LLM model selection](docs/models.md), [distro signing](docs/distro-signing.md), the
   [gateway deployment runbook](docs/gateway-deployment.md), and
