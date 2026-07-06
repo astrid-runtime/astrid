@@ -9,6 +9,8 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
 
 ## [Unreleased]
 
+## [0.9.3] - 2026-07-06
+
 ### Added
 
 - **`astrid capsule check` — a static, CI-friendly linter for a capsule's tool wiring.** Several capsule-authoring mistakes fail *silently* at runtime: a `#[astrid::tool]` with no `[subscribe] "tool.v1.execute.<name>"` route advertises in `tools/list` but never executes (#1127); a tool capsule without the mandatory `[publish]` boilerplate can't return results or answer the describe fan-out; a `[subscribe]` handler that isn't `tool_execute_<name>` routes then gets denied. `astrid capsule check [PATH]` cross-checks the `#[astrid::tool("…")]` annotations in `src/` against the `Capsule.toml` `[subscribe]`/`[publish]` tables and reports each problem with the exact line to add, exiting non-zero on any finding so it drops straight into a CI job or pre-commit hook. It is deliberately **static** — it derives the advertised-tool set from source, not by instantiating the WASM component — so it needs no build, no daemon, no WASM runtime, and no `ASTRID_HOME`, making it fast and deterministic (`cargo check` for capsules). Check #1 reuses the same `tools_missing_execute_route` predicate as the kernel's load-time warning, so the CI gate and the runtime can never disagree; a `--deep` mode (ephemeral-load + the real `tool_describe`) is a documented later addition. Closes #1129.
@@ -726,7 +728,8 @@ Breaking changes to note: `Capsule.toml` moves to `[publish]` / `[subscribe]` ta
 Initial tracked release. See the [repository history](https://github.com/unicity-astrid/astrid/commits/v0.2.0)
 for changes included in this version.
 
-[Unreleased]: https://github.com/unicity-astrid/astrid/compare/v0.9.2...HEAD
+[Unreleased]: https://github.com/unicity-astrid/astrid/compare/v0.9.3...HEAD
+[0.9.3]: https://github.com/unicity-astrid/astrid/compare/v0.9.2...v0.9.3
 [0.9.2]: https://github.com/unicity-astrid/astrid/compare/v0.9.1...v0.9.2
 [0.9.1]: https://github.com/unicity-astrid/astrid/compare/v0.9.0...v0.9.1
 [0.9.0]: https://github.com/unicity-astrid/astrid/compare/v0.8.0...v0.9.0
