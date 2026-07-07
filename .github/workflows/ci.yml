@@ -361,7 +361,7 @@ jobs:
 
       - name: Install cargo-public-api
         if: steps.api-inputs.outputs.run == 'true'
-        uses: taiki-e/install-action@682e7d9e49c5e653d371fc6adbda67653461378a # v2
+        uses: taiki-e/install-action@16b05812d776ae1dfaabc8277e421fb6d2506419 # v2
         with:
           tool: cargo-public-api
 

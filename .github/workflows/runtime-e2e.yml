@@ -70,52 +70,52 @@ jobs:
           egress-policy: audit
 
       - name: Checkout core
-        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
       - name: Checkout capsule-cli
-        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           repository: unicity-astrid/capsule-cli
           path: capsules/astrid-capsule-cli
           ref: a8778156bd301aca646371a463dc8f2dec4b69b6
 
       - name: Checkout capsule-registry
-        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           repository: unicity-astrid/capsule-registry
           path: capsules/astrid-capsule-registry
           ref: 9058229f0c1f1bc634c52c62dc7a258050413072
 
       - name: Checkout capsule-session
-        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           repository: unicity-astrid/capsule-session
           path: capsules/astrid-capsule-session
           ref: 9de9a6e753dc67195250d06b4d96104e56271f23
 
       - name: Checkout capsule-identity
-        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           repository: unicity-astrid/capsule-identity
           path: capsules/astrid-capsule-identity
           ref: f671b2903c18f9f0a87f535a660d62705b182576
 
       - name: Checkout capsule-prompt-builder
-        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           repository: unicity-astrid/capsule-prompt-builder
           path: capsules/astrid-capsule-prompt-builder
           ref: 3849cfc22256e7c9f0822ad568352dbda8430020
 
       - name: Checkout capsule-react
-        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           repository: unicity-astrid/capsule-react
           path: capsules/astrid-capsule-react
           ref: a11af90b4e362f9acec1924e95d0e2af627a5b55
 
       - name: Checkout capsule-openai-compat
-        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           repository: unicity-astrid/capsule-openai-compat
           path: capsules/astrid-capsule-openai-compat
@@ -165,7 +165,7 @@ jobs:
 
       - name: Upload runtime artifacts
         if: failure()
-        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: runtime-e2e-artifacts
           path: |
