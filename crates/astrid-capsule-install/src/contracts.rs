@@ -60,15 +60,19 @@ pub fn canonical_contracts_path(home: &AstridHome) -> PathBuf {
 ///
 /// `wit_files` keys are paths relative to the capsule's `wit/` source
 /// (e.g. `deps/astrid-contracts/astrid-contracts.wit`); we match on the
-/// basename so the nested layout doesn't matter.
+/// basename so the nested layout doesn't matter. Should two entries ever
+/// share the basename, the lexicographically-smallest relative path wins —
+/// picking the first match from raw `HashMap` iteration would be
+/// nondeterministic and could flip skew classification between runs.
 #[must_use]
 pub fn contracts_pin<S: BuildHasher>(wit_files: &HashMap<String, String, S>) -> Option<&String> {
     wit_files
         .iter()
-        .find(|(rel, _)| {
+        .filter(|(rel, _)| {
             Path::new(rel.as_str()).file_name().and_then(|n| n.to_str())
                 == Some(CONTRACTS_WIT_BASENAME)
         })
+        .min_by(|a, b| a.0.cmp(b.0))
         .map(|(_, hash)| hash)
 }
 
@@ -209,8 +213,12 @@ pub fn seed_canonical_contracts_if_absent<S: BuildHasher>(
         "{CONTRACTS_WIT_BASENAME}.tmp.{}",
         uuid::Uuid::new_v4().simple()
     ));
-    std::fs::write(&tmp, &content)
-        .with_context(|| format!("failed to write canonical temp {}", tmp.display()))?;
+    if let Err(e) = std::fs::write(&tmp, &content) {
+        // Clean up the partial temp so a failed write doesn't leak an orphan
+        // into wit/ (mirrors the rename-failure path below).
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e).with_context(|| format!("failed to write canonical temp {}", tmp.display()));
+    }
     match std::fs::rename(&tmp, &canonical) {
         Ok(()) => Ok(()),
         // A racing install already created the canonical (rename-over-
@@ -269,6 +277,19 @@ mod tests {
     fn pin_absent_when_no_contracts_vendored() {
         let files = wit_files(&[("capsule.wit", "deadbeef")]);
         assert!(contracts_pin(&files).is_none());
+    }
+
+    #[test]
+    fn pin_is_deterministic_under_basename_collision() {
+        // Two entries share the astrid-contracts.wit basename under
+        // different dirs. The lexicographically-smallest relative path must
+        // win, so the result never depends on HashMap iteration order.
+        let files = wit_files(&[
+            ("deps/astrid-contracts/astrid-contracts.wit", "bbb"),
+            ("astrid-contracts.wit", "aaa"),
+        ]);
+        // "astrid-contracts.wit" < "deps/..." lexicographically -> "aaa".
+        assert_eq!(contracts_pin(&files).map(String::as_str), Some("aaa"));
     }
 
     #[test]

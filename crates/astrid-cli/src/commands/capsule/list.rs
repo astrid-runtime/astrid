@@ -51,7 +51,12 @@ pub(crate) fn list_capsules(verbose: bool) -> anyhow::Result<()> {
         println!(
             "{}",
             Theme::warning(&format!(
-                "Contracts skew: {} pin(s) astrid-contracts.wit differently than the daemon canonical.",
+                "Contracts skew: astrid-contracts.wit pin differs from the daemon canonical for {}: {}.",
+                if mismatched.len() == 1 {
+                    "capsule"
+                } else {
+                    "capsules"
+                },
                 mismatched.join(", ")
             ))
         );

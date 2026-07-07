@@ -154,6 +154,9 @@ fn persist_wit_blob(wit_store: &Path, hash: &str, content: &[u8]) {
     // share a pid and would race on the same temp name.
     let tmp = wit_store.join(format!("{hash}.tmp.{}", uuid::Uuid::new_v4().simple()));
     if let Err(e) = std::fs::write(&tmp, content) {
+        // Clean up the partial temp so a failed write doesn't leak an orphan
+        // into wit/store/ (mirrors the rename-failure path below).
+        let _ = std::fs::remove_file(&tmp);
         tracing::warn!(
             path = %tmp.display(),
             error = %e,
