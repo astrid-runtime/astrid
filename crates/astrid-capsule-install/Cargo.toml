@@ -36,6 +36,7 @@ tracing = { workspace = true }
 uuid = { workspace = true }
 
 [dev-dependencies]
+blake3 = { workspace = true }
 tempfile = { workspace = true }
 
 [lints]

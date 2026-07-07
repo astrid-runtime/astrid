@@ -2,9 +2,11 @@
 
 use std::collections::HashMap;
 
+use astrid_capsule_install::mismatching_contracts;
+use astrid_core::dirs::AstridHome;
 use colored::Colorize;
 
-use super::meta::scan_installed_capsules;
+use super::meta::scan_installed_capsules_in_home;
 use crate::theme::Theme;
 
 /// List all installed capsules with their provides/requires metadata.
@@ -13,7 +15,8 @@ use crate::theme::Theme;
 /// counts. With `--verbose`, expands each capsule to show the full capability
 /// list and install source.
 pub(crate) fn list_capsules(verbose: bool) -> anyhow::Result<()> {
-    let capsules = scan_installed_capsules()?;
+    let home = AstridHome::resolve()?;
+    let capsules = scan_installed_capsules_in_home(&home)?;
 
     if capsules.is_empty() {
         println!("{}", Theme::info("No capsules installed."));
@@ -28,7 +31,7 @@ pub(crate) fn list_capsules(verbose: bool) -> anyhow::Result<()> {
     println!("{}", Theme::separator());
 
     if verbose {
-        print_verbose(&capsules);
+        print_verbose(&home, &capsules);
     } else {
         print_compact(&capsules);
     }
@@ -37,6 +40,28 @@ pub(crate) fn list_capsules(verbose: bool) -> anyhow::Result<()> {
         "\n{} capsule(s) installed",
         capsules.len().to_string().bold()
     );
+
+    // Contracts skew — one summary line naming any capsule whose
+    // `astrid-contracts.wit` pin differs from the daemon canonical.
+    // Warn-only, and silent when there is no canonical to compare
+    // against. Detailed pins live in `--verbose` / `capsule show`.
+    let mismatched = mismatching_contracts(&home, &capsules);
+    if !mismatched.is_empty() {
+        println!();
+        println!(
+            "{}",
+            Theme::warning(&format!(
+                "Contracts skew: {} pin(s) astrid-contracts.wit differently than the daemon canonical.",
+                mismatched.join(", ")
+            ))
+        );
+        println!(
+            "{}",
+            Theme::dimmed(
+                "  Run `astrid capsule show <name>` (or `list --verbose`) for pins. Warning only."
+            )
+        );
+    }
     Ok(())
 }
 
@@ -77,7 +102,7 @@ fn print_compact(capsules: &[super::meta::InstalledCapsule]) {
 }
 
 /// Verbose: full details per capsule.
-fn print_verbose(capsules: &[super::meta::InstalledCapsule]) {
+fn print_verbose(home: &AstridHome, capsules: &[super::meta::InstalledCapsule]) {
     for (i, cap) in capsules.iter().enumerate() {
         if i > 0 {
             println!();
@@ -105,6 +130,13 @@ fn print_verbose(capsules: &[super::meta::InstalledCapsule]) {
 
         if let Some(src) = source {
             println!("  {}", Theme::kv("Source", src));
+        }
+
+        // Per-capsule contracts pin + skew marker. Rendered by the same
+        // helper `capsule show` uses; `None` when no contracts vendored.
+        let skew = astrid_capsule_install::contracts_skew(home, &meta.wit_files);
+        if let Some(line) = super::show::contracts_line(&skew) {
+            println!("  {}: {line}", "Contracts".bold());
         }
 
         print_interface_map("Exports", &meta.exports);

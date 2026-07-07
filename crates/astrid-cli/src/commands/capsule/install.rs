@@ -969,6 +969,14 @@ fn finish_install(output: &InstallOutput, home: &AstridHome) -> anyhow::Result<S
         );
     }
 
+    // Contracts skew — warn-only. Side-loading an ahead-of-daemon dev
+    // build is legitimate, so a differing `astrid-contracts.wit` pin is
+    // surfaced, never blocked. Silent for aligned pins and for a fresh
+    // home with no canonical to compare against.
+    if !batch {
+        super::show::print_install_skew_notice(&capsule_id, &output.contracts_skew);
+    }
+
     Ok(capsule_id)
 }
 

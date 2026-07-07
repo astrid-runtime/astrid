@@ -1,10 +1,12 @@
 //! Admin commands for the content-addressed WIT store.
 //!
-//! The WIT store at `~/.astrid/wit/{blake3}.wit` is append-only from the
-//! installer's perspective — `astrid capsule install` writes blobs but
-//! `astrid capsule remove` never deletes them. This preserves replay:
-//! historic capsule states can be reconstructed as long as their WIT blobs
-//! still exist.
+//! The WIT store at `~/.astrid/wit/store/{blake3}.wit` is append-only
+//! from the installer's perspective — `astrid capsule install` writes
+//! blobs but `astrid capsule remove` never deletes them. This preserves
+//! replay: historic capsule states can be reconstructed as long as their
+//! WIT blobs still exist. The store is a dedicated subdirectory so the
+//! sweep never touches the daemon's canonical named copies at the top of
+//! `wit/` (e.g. `wit/astrid-contracts.wit`).
 //!
 //! These admin commands let an operator explicitly prune unreferenced blobs
 //! when they're certain no pending replays need the content.
@@ -34,7 +36,7 @@ use crate::theme::Theme;
 /// With `force = true`, deletes unreferenced blobs and reports the count.
 pub(crate) fn gc(force: bool) -> anyhow::Result<()> {
     let home = AstridHome::resolve().context("failed to resolve Astrid home")?;
-    let wit_store = home.wit_dir();
+    let wit_store = home.wit_store_dir();
 
     if !wit_store.is_dir() {
         println!(

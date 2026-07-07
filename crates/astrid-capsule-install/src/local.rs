@@ -14,7 +14,7 @@
 //! 1. Parse manifest.
 //! 2. Check export conflicts (advisory).
 //! 3. Hash WASM at source → `bin/<hash>.wasm`.
-//! 4. Hash WIT at source → `wit/<hash>.wit`.
+//! 4. Hash WIT at source → `wit/store/<hash>.wit`.
 //!
 //! If any of those fail we haven't touched `target_dir` and the
 //! existing install is intact. Only then do we:
@@ -38,6 +38,7 @@ use astrid_core::PrincipalId;
 use astrid_core::dirs::AstridHome;
 use astrid_events::EventBus;
 
+use crate::contracts::{ContractsSkew, contracts_skew, seed_canonical_contracts_if_absent};
 use crate::copy::copy_capsule_dir;
 use crate::lifecycle::run_lifecycle;
 use crate::manifest_check::{
@@ -104,6 +105,10 @@ pub struct InstallOutput {
     /// capsule also exports. Informational only — coexistence is
     /// valid.
     pub export_conflicts: Vec<ExportConflict>,
+    /// Where this capsule's `astrid-contracts.wit` pin sits relative to
+    /// the daemon canonical. Warn-only: the CLI renders a notice on
+    /// [`ContractsSkew::is_mismatch`]; every other variant is silent.
+    pub contracts_skew: ContractsSkew,
 }
 
 /// Whether the install ran as a fresh install or upgraded an existing one.
@@ -280,6 +285,23 @@ pub fn install_from_local_path_for_principal(
         );
     }
 
+    // Seed the daemon canonical `astrid-contracts.wit` on the first
+    // install that vendors it (first-writer-wins; never overwritten).
+    // Best-effort: the capsule is already installed and committed, so a
+    // retention failure must not roll it back — it only means later skew
+    // checks have no baseline to compare against.
+    if let Err(e) = seed_canonical_contracts_if_absent(home, &meta.wit_files) {
+        tracing::warn!(
+            capsule = %id,
+            error = %format!("{e:#}"),
+            "failed to seed canonical astrid-contracts.wit; contracts skew checks may lack a baseline"
+        );
+    }
+
+    // Classify this capsule's contracts pin against the (now possibly
+    // just-seeded) canonical so the caller can surface skew warn-only.
+    let contracts_skew = contracts_skew(home, &meta.wit_files);
+
     // Determine env-prompt signal for the caller.
     let env_path = resolve_env_path_for(home, target_principal, &id)?;
     let env_needs_prompt = !manifest.env.is_empty() && !env_path.exists();
@@ -307,6 +329,7 @@ pub fn install_from_local_path_for_principal(
         env_needs_prompt,
         missing_imports,
         export_conflicts,
+        contracts_skew,
     })
 }
 
