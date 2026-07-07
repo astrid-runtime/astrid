@@ -261,6 +261,15 @@ pub fn refresh_canonical_contracts(home: &AstridHome) -> anyhow::Result<()> {
         .with_context(|| format!("failed to write canonical {}", canonical.display()))
 }
 
+/// True when `pin` is a well-formed BLAKE3 hex digest (exactly 64 lowercase
+/// hex chars) — the shape every real contracts pin has, since pins are
+/// `blake3::hash(..).to_hex()` outputs. Because pins are read back from
+/// untrusted `meta.json`, any other value (one containing `/`, `\0`, `.`, …)
+/// is malformed and must never reach a `wit/store/<pin>.wit` path join.
+fn is_blake3_pin(pin: &str) -> bool {
+    pin.len() == 64 && pin.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
 /// The contracts pin that the plurality of the daemon's own system fleet
 /// agrees on, or `None` when that fleet vendors no retained contracts.
 ///
@@ -308,6 +317,19 @@ fn daemon_fleet_contracts_pin(home: &AstridHome) -> Option<String> {
         let Some(pin) = contracts_pin(&meta.wit_files) else {
             continue;
         };
+        // `pin` is read back from untrusted on-disk `meta.json`. A genuine
+        // contracts pin is a BLAKE3 hex digest; reject anything else — notably
+        // a path-traversal sequence like `../../../../etc/passwd` — BEFORE it
+        // is used to build the `wit/store/<pin>.wit` lookup path below, so a
+        // tampered `meta.json` can't dereference a file outside the store into
+        // the canonical.
+        if !is_blake3_pin(pin) {
+            tracing::warn!(
+                capsule_dir = %entry.path().display(),
+                "ignoring non-content-address contracts pin in meta.json (possible tampering)"
+            );
+            continue;
+        }
         // Only a retained blob can source the canonical write.
         if store.join(format!("{pin}.wit")).is_file() {
             let count = counts.entry(pin.clone()).or_insert(0);
@@ -731,13 +753,40 @@ mod tests {
     fn boot_refresh_noop_when_fleet_has_no_retained_contracts() {
         let tmp = tempfile::tempdir().unwrap();
         let home = AstridHome::from_path(tmp.path());
-        // Fleet capsule pins contracts, but the blob was never retained
-        // (a pre-store install) — nothing to source the canonical from.
-        install_fleet_capsule(&home, "legacy", "deadbeefcafef00d");
+        // Fleet capsule pins a valid (well-formed) contracts hash, but the blob
+        // was never retained (a pre-store install) — nothing to source from.
+        let unretained = blake3::hash(b"unretained pin").to_hex().to_string();
+        install_fleet_capsule(&home, "legacy", &unretained);
         refresh_canonical_contracts(&home).unwrap();
         assert!(
             !canonical_contracts_path(&home).exists(),
             "no retained fleet contracts => no canonical written"
+        );
+    }
+
+    #[test]
+    fn boot_refresh_rejects_path_traversal_pin_even_if_target_exists() {
+        // `pin` comes from untrusted `meta.json`. A tampered pin with a
+        // traversal sequence must be rejected before it is dereferenced, even
+        // when the traversal resolves to a real file: otherwise the daemon
+        // would read an arbitrary `.wit` outside the store and write it into
+        // the canonical.
+        let tmp = tempfile::tempdir().unwrap();
+        let home = AstridHome::from_path(tmp.path());
+        std::fs::create_dir_all(home.wit_store_dir()).unwrap();
+        // Plant the traversal target: store/../evil.wit resolves to wit/evil.wit.
+        std::fs::write(home.wit_dir().join("evil.wit"), b"stolen contents\n").unwrap();
+        assert!(
+            home.wit_store_dir().join("../evil.wit").is_file(),
+            "precondition: the traversal path resolves to the planted file"
+        );
+
+        install_fleet_capsule(&home, "evil-cap", "../evil");
+        refresh_canonical_contracts(&home).unwrap();
+
+        assert!(
+            !canonical_contracts_path(&home).exists(),
+            "a path-traversal pin must be rejected, never dereferenced into the canonical"
         );
     }
 
