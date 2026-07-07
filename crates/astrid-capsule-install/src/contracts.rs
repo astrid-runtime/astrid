@@ -283,7 +283,22 @@ fn daemon_fleet_contracts_pin(home: &AstridHome) -> Option<String> {
     let store = home.wit_store_dir();
 
     let mut counts: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
-    for entry in std::fs::read_dir(&capsules_dir).ok()?.flatten() {
+    // A missing dir (fresh home / fleet never installed) is the normal no-op
+    // path -> `None`. Per-entry errors below are surfaced (debug) and skipped
+    // rather than silently dropped, so one unreadable entry can't abort the
+    // baseline scan.
+    for entry in std::fs::read_dir(&capsules_dir).ok()? {
+        let entry = match entry {
+            Ok(e) => e,
+            Err(e) => {
+                tracing::debug!(
+                    dir = %capsules_dir.display(),
+                    error = %e,
+                    "skipping unreadable entry during contracts baseline scan"
+                );
+                continue;
+            },
+        };
         if !entry.file_type().is_ok_and(|ft| ft.is_dir()) {
             continue;
         }
