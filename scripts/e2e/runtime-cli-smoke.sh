@@ -151,13 +151,17 @@ run_cli_semantic_smoke() {
   run_cli capsule tree > "$ARTIFACTS/cli-capsule-tree.txt"
   grep -q "astrid-capsule-openai-compat" "$ARTIFACTS/cli-capsule-tree.txt" \
     || fail "capsule tree missed installed openai-compat capsule"
-  mkdir -p "$ASTRID_HOME/wit"
-  printf 'orphan wit fixture\n' > "$ASTRID_HOME/wit/e2e-orphan.wit"
+  # The content-addressed WIT blob store lives at wit/store/ (canonical
+  # named copies like astrid-contracts.wit stay at the top of wit/, which
+  # `wit gc` deliberately never sweeps). The orphan fixture goes in the
+  # store so `wit gc` can see it.
+  mkdir -p "$ASTRID_HOME/wit/store"
+  printf 'orphan wit fixture\n' > "$ASTRID_HOME/wit/store/e2e-orphan.wit"
   run_cli gc > "$ARTIFACTS/cli-gc-dry-run.txt"
   grep -q "e2e-orphan.wit" "$ARTIFACTS/cli-gc-dry-run.txt" || fail "gc dry-run missed orphaned WIT blob"
-  [[ -f "$ASTRID_HOME/wit/e2e-orphan.wit" ]] || fail "gc dry-run deleted orphaned WIT blob"
+  [[ -f "$ASTRID_HOME/wit/store/e2e-orphan.wit" ]] || fail "gc dry-run deleted orphaned WIT blob"
   run_cli gc --force > "$ARTIFACTS/cli-gc-force.txt"
-  [[ ! -f "$ASTRID_HOME/wit/e2e-orphan.wit" ]] || fail "gc --force kept orphaned WIT blob"
+  [[ ! -f "$ASTRID_HOME/wit/store/e2e-orphan.wit" ]] || fail "gc --force kept orphaned WIT blob"
   assert_cli_exit_contains "cli-distro-show" 2 "is not yet wired" distro show
   run_cli completions bash > "$ARTIFACTS/cli-completions-bash.txt"
   grep -q "_astrid" "$ARTIFACTS/cli-completions-bash.txt" || fail "bash completions missed _astrid function"

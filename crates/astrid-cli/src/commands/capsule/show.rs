@@ -150,6 +150,26 @@ pub(crate) fn run(args: &ShowArgs) -> Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
+/// Classify a capsule's contracts skew by reading its on-disk `meta.json`
+/// from `capsule_dir` and comparing against the daemon canonical.
+///
+/// Returns [`ContractsSkew::NotPinned`] — the silent case — when the meta
+/// is missing or unreadable, so a warn-only diagnostic never surfaces an
+/// install or read path as failed. Shared with the install flow so the
+/// install-time notice reflects the same pins `show` / `list` read.
+pub(super) fn contracts_skew_at(
+    capsule_dir: &std::path::Path,
+    home: &AstridHome,
+) -> astrid_capsule_install::ContractsSkew {
+    match std::fs::read_to_string(capsule_dir.join("meta.json"))
+        .ok()
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+    {
+        Some(meta) => contracts_skew_from_meta(home, &meta),
+        None => astrid_capsule_install::ContractsSkew::NotPinned,
+    }
+}
+
 /// Classify a capsule's contracts pin against the daemon canonical from
 /// its on-disk `meta.json` value, extracting the `wit_files` map.
 fn contracts_skew_from_meta(

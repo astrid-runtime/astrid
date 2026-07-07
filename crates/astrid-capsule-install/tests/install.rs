@@ -473,7 +473,7 @@ fn install_seeds_canonical_contracts_first_writer_wins() {
         contracts_b,
     )
     .unwrap();
-    let out_b = install_from_local_path(cap_b.path(), &home, InstallOptions::default())
+    install_from_local_path(cap_b.path(), &home, InstallOptions::default())
         .expect("second install should still succeed despite skew");
 
     assert_eq!(
@@ -481,9 +481,17 @@ fn install_seeds_canonical_contracts_first_writer_wins() {
         contracts_a,
         "canonical must stay first-writer-wins across later installs"
     );
+    // The ahead-of-canonical capsule reads as skewed against the baseline.
+    let meta_b = read_meta(
+        &home
+            .principal_home(&astrid_core::PrincipalId::default())
+            .capsules_dir()
+            .join("contracts-b"),
+    )
+    .unwrap();
     assert!(
-        out_b.contracts_skew.is_mismatch(),
-        "the ahead-of-canonical capsule's install output must flag skew"
+        contracts_skew(&home, &meta_b.wit_files).is_mismatch(),
+        "the ahead-of-canonical capsule must read as skewed against the baseline"
     );
 
     // And the first capsule still reads as aligned.
