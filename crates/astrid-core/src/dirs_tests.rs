@@ -364,3 +364,68 @@ fn test_workspace_path_accessors() {
         PathBuf::from("/home/user/project/.astrid/ASTRID.md")
     );
 }
+
+// ── workspace_is_git_managed ─────────────────────────────────────
+
+#[test]
+fn test_git_managed_with_dot_git_dir() {
+    // Case 1 (depth 1): workspace root itself contains a `.git` directory.
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir(dir.path().join(".git")).unwrap();
+    assert!(workspace_is_git_managed(dir.path()));
+}
+
+#[test]
+fn test_git_managed_with_dot_git_file() {
+    // Case 1: a submodule / linked worktree records `.git` as a FILE.
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join(".git"),
+        "gitdir: /somewhere/.git/worktrees/x\n",
+    )
+    .unwrap();
+    assert!(workspace_is_git_managed(dir.path()));
+}
+
+#[test]
+fn test_git_managed_when_ancestor_has_git() {
+    // Case 1: an ancestor of the workspace root is a work tree.
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir(dir.path().join(".git")).unwrap();
+    let sub = dir.path().join("crates").join("inner");
+    std::fs::create_dir_all(&sub).unwrap();
+    assert!(workspace_is_git_managed(&sub));
+}
+
+#[test]
+fn test_git_managed_when_child_dir_has_git() {
+    // Case 2 (depth 2): an immediate child directory is a repo, but the
+    // workspace root itself is not.
+    let dir = tempfile::tempdir().unwrap();
+    let child = dir.path().join("some-repo");
+    std::fs::create_dir_all(child.join(".git")).unwrap();
+    assert!(workspace_is_git_managed(dir.path()));
+}
+
+#[test]
+fn test_git_managed_false_when_no_git_anywhere() {
+    // False case: no `.git` at the root, in any ancestor, or in any child.
+    let dir = tempfile::tempdir().unwrap();
+    let ws = dir.path().join("workspace");
+    std::fs::create_dir_all(ws.join("src")).unwrap();
+    std::fs::write(ws.join("README.md"), "# no git here").unwrap();
+    assert!(!workspace_is_git_managed(&ws));
+}
+
+#[test]
+fn test_git_managed_skips_noise_child_dirs() {
+    // A noise dir that happens to contain `.git` (e.g. a vendored dep tree)
+    // must NOT flip an otherwise-non-git workspace to git-managed. The `.git`
+    // sits exactly where the depth-2 child scan would otherwise catch it, so
+    // this test fails if the skip list is not honoured.
+    let dir = tempfile::tempdir().unwrap();
+    let ws = dir.path().join("workspace");
+    std::fs::create_dir_all(ws.join("node_modules").join(".git")).unwrap();
+    std::fs::create_dir_all(ws.join("target").join(".git")).unwrap();
+    assert!(!workspace_is_git_managed(&ws));
+}

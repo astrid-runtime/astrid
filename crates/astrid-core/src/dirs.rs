@@ -631,6 +631,68 @@ impl WorkspaceDir {
     }
 }
 
+/// Directories skipped while scanning a workspace's immediate children for a
+/// nested repository. These are obviously-huge or noise trees (build output,
+/// dependency caches) and the repo's own `.git`; descending them would make
+/// the shallow scan expensive without changing the outcome.
+const GIT_SCAN_SKIP_DIRS: &[&str] = &["target", "node_modules", "dist", ".git"];
+
+/// Returns `true` when `workspace_root` is under, or itself contains, git
+/// version control.
+///
+/// A git-managed workspace must NOT use the in-process copy-on-write overlay:
+/// its writes have to land on the real workspace so spawned processes (e.g.
+/// `cargo`) and the user see them, with git providing the rollback. A
+/// workspace counts as git-managed when ANY of:
+///
+/// 1. **Inside a work tree:** `workspace_root` or any ancestor (walking up to
+///    the filesystem root) contains a `.git` entry. A submodule or linked
+///    worktree records `.git` as a *file*, so both files and directories
+///    count — [`Path::exists`] matches either.
+/// 2. **Contains a repo:** `workspace_root` itself (depth 1, covered by the
+///    first ancestor-walk iteration), or any of its immediate child
+///    directories (shallow, depth <= 2), contains a `.git` entry. Obviously
+///    huge / noise directories are skipped while scanning (see
+///    [`GIT_SCAN_SKIP_DIRS`]).
+///
+/// The check is bounded and cheap — an ancestor walk plus a single shallow
+/// read of the immediate children, no recursive tree walk — so it is safe to
+/// run on every capsule load. Reuses the walk-up idiom of
+/// [`WorkspaceDir::detect`].
+#[must_use]
+pub fn workspace_is_git_managed(workspace_root: &Path) -> bool {
+    // Case 1: `workspace_root` or any ancestor is a git work tree. The first
+    // iteration also covers "the workspace root itself is a repo" (depth 1).
+    let mut current = workspace_root;
+    loop {
+        if current.join(".git").exists() {
+            return true;
+        }
+        match current.parent() {
+            Some(parent) if parent != current => current = parent,
+            _ => break,
+        }
+    }
+
+    // Case 2: an immediate child directory of `workspace_root` is a repo
+    // (depth <= 2). Shallow, single-level scan — no recursion.
+    if let Ok(entries) = std::fs::read_dir(workspace_root) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if let Some(name) = path.file_name().and_then(|n| n.to_str())
+                && GIT_SCAN_SKIP_DIRS.contains(&name)
+            {
+                continue;
+            }
+            if path.is_dir() && path.join(".git").exists() {
+                return true;
+            }
+        }
+    }
+
+    false
+}
+
 #[cfg(test)]
 #[path = "dirs_tests.rs"]
 mod tests;

@@ -1305,35 +1305,80 @@ impl ExecutionEngine for WasmEngine {
                 (None, None)
             };
 
-            // Build HostState
-            let lower_vfs = astrid_vfs::HostVfs::new();
-            let upper_vfs = astrid_vfs::HostVfs::new();
+            // Build HostState. The workspace VFS is chosen by whether the
+            // workspace is under (or contains) git version control:
+            //
+            //   * git-managed  → a DIRECT `HostVfs` over `workspace_root`. The
+            //     in-process copy-on-write overlay must NOT engage: writes have
+            //     to land on the real workspace so spawned processes (`cargo`)
+            //     and the user see them, with git providing the rollback. No
+            //     upper tempdir is created in this branch.
+            //   * non-git      → today's `OverlayVfs`: writes divert into a
+            //     per-capsule tempdir upper, sandboxed until explicitly
+            //     committed (a separate later change replaces this branch with
+            //     real OS-level CoW).
+            //
+            // Detection is automatic (no config flag) and cheap enough to run on
+            // every load — a bounded ancestor walk plus one shallow child scan
+            // (see `astrid_core::dirs::workspace_is_git_managed`).
             let root_handle = astrid_capabilities::DirHandle::new();
+            let git_managed = astrid_core::dirs::workspace_is_git_managed(&workspace_root);
 
-            // Upper layer uses a per-capsule temporary directory so writes
-            // are sandboxed until explicitly committed. The TempDir is kept
-            // alive in HostState.upper_dir for the capsule's lifetime.
-            let upper_temp = tempfile::TempDir::new().map_err(|e| {
-                CapsuleError::UnsupportedEntryPoint(format!(
-                    "Failed to create overlay temp dir: {e}"
-                ))
-            })?;
+            // Lower layer (the real workspace) is common to both branches.
+            let lower_vfs = astrid_vfs::HostVfs::new();
+            lower_vfs
+                .register_dir(root_handle.clone(), workspace_root.clone())
+                .await
+                .map_err(|e| {
+                    CapsuleError::UnsupportedEntryPoint(format!(
+                        "Failed to register VFS directory: {e}"
+                    ))
+                })?;
 
-            async {
-                lower_vfs
-                    .register_dir(root_handle.clone(), workspace_root.clone())
-                    .await?;
+            // `workspace_vfs` backs `HostState.vfs`; `overlay_vfs_opt` and
+            // `upper_dir_opt` back the concrete-overlay / upper-tempdir fields
+            // (both `None` for the direct-HostVfs configuration, exactly like
+            // the lifecycle-hook state that also runs on a plain `HostVfs`).
+            let (workspace_vfs, overlay_vfs_opt, upper_dir_opt): (
+                Arc<dyn astrid_vfs::Vfs>,
+                Option<Arc<astrid_vfs::OverlayVfs>>,
+                Option<Arc<tempfile::TempDir>>,
+            ) = if git_managed {
+                tracing::debug!(
+                    capsule = %manifest.package.name,
+                    workspace = %workspace_root.display(),
+                    "git-managed workspace: bypassing CoW overlay, writing directly to \
+                     workspace root (git is the rollback)"
+                );
+                (Arc::new(lower_vfs), None, None)
+            } else {
+                // Upper layer uses a per-capsule temporary directory so writes
+                // are sandboxed until explicitly committed. The TempDir is kept
+                // alive in HostState.upper_dir for the capsule's lifetime.
+                let upper_temp = tempfile::TempDir::new().map_err(|e| {
+                    CapsuleError::UnsupportedEntryPoint(format!(
+                        "Failed to create overlay temp dir: {e}"
+                    ))
+                })?;
+                let upper_vfs = astrid_vfs::HostVfs::new();
                 upper_vfs
                     .register_dir(root_handle.clone(), upper_temp.path().to_path_buf())
-                    .await?;
-                Ok::<(), astrid_vfs::VfsError>(())
-            }
-            .await
-            .map_err(|e| {
-                CapsuleError::UnsupportedEntryPoint(format!(
-                    "Failed to register VFS directory: {e}"
-                ))
-            })?;
+                    .await
+                    .map_err(|e| {
+                        CapsuleError::UnsupportedEntryPoint(format!(
+                            "Failed to register VFS directory: {e}"
+                        ))
+                    })?;
+                let overlay_vfs = Arc::new(astrid_vfs::OverlayVfs::new(
+                    Box::new(lower_vfs),
+                    Box::new(upper_vfs),
+                ));
+                (
+                    Arc::clone(&overlay_vfs) as Arc<dyn astrid_vfs::Vfs>,
+                    Some(Arc::clone(&overlay_vfs)),
+                    Some(Arc::new(upper_temp)),
+                )
+            };
 
             // The per-principal home mount is NOT built at load time. A shared
             // content-addressed runtime (issue #1069) is loaded under no real
@@ -1341,10 +1386,6 @@ impl ExecutionEngine for WasmEngine {
             // `invocation_home` overlay, mounted for the INVOKING principal on
             // each call (see `invoke_interceptor` / the recv path). The load-time
             // `home`/`tmp` fields stay neutral (`None`), never the load-owner's.
-            let overlay_vfs = Arc::new(astrid_vfs::OverlayVfs::new(
-                Box::new(lower_vfs),
-                Box::new(upper_vfs),
-            ));
 
             // NEUTRAL gate default: the gate must NOT carry a load-owner
             // (`default`) home as its fallback. Every real `home://` access
@@ -1405,8 +1446,6 @@ impl ExecutionEngine for WasmEngine {
             // One IPC rate limiter shared by every pooled instance, so the
             // per-capsule throughput budget is not multiplied by pool size.
             let ipc_limiter = Arc::new(astrid_events::ipc::IpcRateLimiter::new());
-            // The CoW overlay upper-dir tempdir is shared by all instances.
-            let upper_dir_arc = Arc::new(upper_temp);
 
             // ── Run-loop resource bound (CPU epoch interrupt + linear memory) ─
             //
@@ -1569,7 +1608,7 @@ impl ExecutionEngine for WasmEngine {
                 capsule_log: None,
                 capsule_id: capsule_id_val.clone(),
                 workspace_root: workspace_root.clone(),
-                vfs: Arc::clone(&overlay_vfs) as Arc<dyn astrid_vfs::Vfs>,
+                vfs: Arc::clone(&workspace_vfs),
                 vfs_root_handle: root_handle.clone(),
                 home: None,
                 tmp: None,
@@ -1580,8 +1619,8 @@ impl ExecutionEngine for WasmEngine {
                 invocation_profile: None,
                 profile_cache: st_profile_cache.clone(),
                 invocation_env_overlay: None,
-                overlay_vfs: Some(Arc::clone(&overlay_vfs)),
-                upper_dir: Some(Arc::clone(&upper_dir_arc)),
+                overlay_vfs: overlay_vfs_opt.clone(),
+                upper_dir: upper_dir_opt.clone(),
                 // Neutral, physically-isolated KV fallback (see the `kv` field
                 // doc). Real per-invocation overlays are built from `kv_backend`.
                 kv: HostState::neutral_kv(),
