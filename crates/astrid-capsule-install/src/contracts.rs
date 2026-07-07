@@ -198,6 +198,14 @@ pub fn seed_canonical_contracts_if_absent<S: BuildHasher>(
     let Some(pin) = contracts_pin(wit_files) else {
         return Ok(());
     };
+    // Defense in depth: `pin` builds the `wit/store/<pin>.wit` lookup path
+    // below. The install caller passes a freshly content-addressed pin, but
+    // validate the BLAKE3-hex shape at the boundary so no caller can traverse
+    // out of the store (mirrors `daemon_fleet_contracts_pin`).
+    if !is_blake3_pin(pin) {
+        anyhow::bail!("refusing to seed canonical from a non-content-address contracts pin");
+    }
+
     let canonical = canonical_contracts_path(home);
     if canonical.exists() {
         return Ok(());
@@ -606,6 +614,20 @@ mod tests {
         let home = AstridHome::from_path(tmp.path());
         let files = wit_files(&[("capsule.wit", "deadbeef")]);
         seed_canonical_contracts_if_absent(&home, &files).unwrap();
+        assert!(!canonical_contracts_path(&home).exists());
+    }
+
+    #[test]
+    fn seed_rejects_non_content_address_pin() {
+        // Defense-in-depth: a pin that isn't a BLAKE3 digest must be refused at
+        // the boundary before it can build a store lookup path, even if the
+        // traversal target exists.
+        let tmp = tempfile::tempdir().unwrap();
+        let home = AstridHome::from_path(tmp.path());
+        std::fs::create_dir_all(home.wit_store_dir()).unwrap();
+        std::fs::write(home.wit_dir().join("evil.wit"), b"stolen contents\n").unwrap();
+        let files = wit_files(&[("astrid-contracts.wit", "../evil")]);
+        assert!(seed_canonical_contracts_if_absent(&home, &files).is_err());
         assert!(!canonical_contracts_path(&home).exists());
     }
 
