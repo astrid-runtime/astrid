@@ -48,8 +48,7 @@ pub fn content_address_wit(
 
     // Best-effort store directory creation. Computing pins only needs to
     // read the source; persisting the blobs is the retention layer, which
-    // must never break an otherwise-valid install (task requirement:
-    // "retention failure must never break install"). If the store dir
+    // must never break an otherwise-valid install. If the store dir
     // can't be created, we still hash and record the pins — the bytes
     // just aren't retained this pass (re-attempted on the next install).
     let wit_store = home.wit_store_dir();
