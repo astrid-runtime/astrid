@@ -10,7 +10,10 @@
 //! * File layout — copying the capsule tree into its target dir under
 //!   `~/.astrid/<principal>/capsules/<id>/`, with rollback on failure.
 //! * Content-addressing — `wasm` binaries go to `~/.astrid/bin/`,
-//!   `wit` files go to `~/.astrid/wit/`, both keyed by BLAKE3.
+//!   `wit` blobs go to `~/.astrid/wit/store/`, both keyed by BLAKE3.
+//! * Contracts retention/skew — seeding the daemon canonical
+//!   `astrid-contracts.wit` and comparing capsule pins against it
+//!   (warn-only; see [`contracts`]).
 //! * Topic baking — JSON Schema / WIT-record schemas inlined into
 //!   `meta.json` at install time.
 //! * Lifecycle hooks — running the capsule's WASM `install` / `upgrade`
@@ -57,6 +60,7 @@
 #![allow(clippy::must_use_candidate)]
 
 pub mod archive;
+pub mod contracts;
 pub mod copy;
 pub mod github_source;
 pub mod lifecycle;
@@ -69,6 +73,11 @@ pub mod wasm;
 pub mod wit;
 
 pub use archive::{unpack_and_install, unpack_and_install_for_principal};
+pub use contracts::{
+    CONTRACTS_WIT_BASENAME, ContractsSkew, canonical_contracts_b3, canonical_contracts_path,
+    contracts_pin, contracts_skew, mismatching_contracts, seed_canonical_contracts_if_absent,
+    short_hash,
+};
 pub use copy::copy_capsule_dir;
 pub use local::{
     InstallOptions, InstallOutput, InstallPhase, install_from_local_path,

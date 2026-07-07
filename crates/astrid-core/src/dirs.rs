@@ -166,6 +166,7 @@ impl AstridHome {
             self.keys_dir(),
             self.bin_dir(),
             self.wit_dir(),
+            self.wit_store_dir(),
             self.home_dir(),
         ];
         for dir in &dirs {
@@ -347,14 +348,28 @@ impl AstridHome {
         self.root.join("bin")
     }
 
-    /// Content-addressed WIT interface definitions (`wit/`).
+    /// WIT interface directory (`wit/`).
     ///
-    /// Stores BLAKE3-hashed `.wit` files from third-party capsules.
-    /// Standard interfaces ship with the SDK; custom interfaces are
-    /// stored here on capsule install.
+    /// Holds the daemon's canonical named `.wit` copies (e.g.
+    /// `wit/astrid-contracts.wit`, the shared data-shape contracts the
+    /// runtime links capsules against). The content-addressed blob store
+    /// lives one level down at [`Self::wit_store_dir`] so `wit gc` can
+    /// sweep the store without touching these canonical named files.
     #[must_use]
     pub fn wit_dir(&self) -> PathBuf {
         self.root.join("wit")
+    }
+
+    /// Content-addressed WIT blob store (`wit/store/`).
+    ///
+    /// Stores BLAKE3-keyed `.wit` blobs (`wit/store/<hash>.wit`) retained
+    /// at capsule install so a `wit_files` pin recorded in `meta.json` can
+    /// always be dereferenced from local disk — the WIT analogue of the
+    /// `bin/<hash>.wasm` binary store. Append-only from the installer's
+    /// perspective; pruned only by the explicit admin `wit gc` sweep.
+    #[must_use]
+    pub fn wit_store_dir(&self) -> PathBuf {
+        self.wit_dir().join("store")
     }
 
     /// Shared WASM component libraries (`lib/`).

@@ -336,6 +336,179 @@ fn install_wit_mirror_is_idempotent() {
 }
 
 #[test]
+fn install_retains_wit_blobs_in_content_store() {
+    // Every WIT file a capsule vendors must be retained content-addressed
+    // at wit/store/<hash>.wit so its meta.json pin can always be
+    // dereferenced from local disk — the WIT analogue of bin/<hash>.wasm.
+    let capsule_dir = tempfile::tempdir().unwrap();
+    let base = capsule_dir.path();
+    write_minimal_capsule(base, "wit-store-test", "1.0.0");
+
+    std::fs::create_dir_all(base.join("wit/deps/astrid-contracts")).unwrap();
+    let broker_src = "package astrid:broker;\ninterface broker {}\n";
+    let contracts_src = "package astrid:contracts;\ninterface contracts {}\n";
+    std::fs::write(base.join("wit/broker.wit"), broker_src).unwrap();
+    std::fs::write(
+        base.join("wit/deps/astrid-contracts/astrid-contracts.wit"),
+        contracts_src,
+    )
+    .unwrap();
+
+    let home_dir = tempfile::tempdir().unwrap();
+    let home = AstridHome::from_path(home_dir.path());
+    install_from_local_path(base, &home, InstallOptions::default())
+        .expect("install should succeed");
+
+    let installed = home
+        .principal_home(&astrid_core::PrincipalId::default())
+        .capsules_dir()
+        .join("wit-store-test");
+    let meta = read_meta(&installed).expect("meta.json exists after install");
+    assert!(
+        !meta.wit_files.is_empty(),
+        "install must record wit_files pins"
+    );
+
+    // Each pinned file's bytes are retained in the store and re-hash to
+    // the recorded pin.
+    for (rel, hash) in &meta.wit_files {
+        let blob = home.wit_store_dir().join(format!("{hash}.wit"));
+        assert!(
+            blob.exists(),
+            "wit blob for {rel} must be retained at wit/store/{hash}.wit"
+        );
+        let bytes = std::fs::read(&blob).unwrap();
+        assert_eq!(
+            blake3::hash(&bytes).to_hex().to_string(),
+            *hash,
+            "retained blob for {rel} must re-hash to its recorded pin"
+        );
+    }
+
+    // The store is a dedicated subdirectory — hash-named blobs live under
+    // wit/store/, never at the top of wit/ (which is reserved for the
+    // daemon's canonical named copies like astrid-contracts.wit).
+    for hash in meta.wit_files.values() {
+        assert!(
+            !home.wit_dir().join(format!("{hash}.wit")).exists(),
+            "content-addressed blob {hash}.wit must not leak to the top of wit/"
+        );
+    }
+}
+
+#[test]
+fn install_succeeds_when_wit_store_unwritable() {
+    // Retention is best-effort: an unwritable wit/store must NOT fail the
+    // install. Pins are still recorded in meta.json; the bytes just aren't
+    // retained this pass.
+    let capsule_dir = tempfile::tempdir().unwrap();
+    let base = capsule_dir.path();
+    write_minimal_capsule(base, "store-ro-test", "1.0.0");
+    std::fs::create_dir_all(base.join("wit")).unwrap();
+    std::fs::write(
+        base.join("wit/thing.wit"),
+        "package astrid:thing;\ninterface thing {}\n",
+    )
+    .unwrap();
+
+    let home_dir = tempfile::tempdir().unwrap();
+    let home = AstridHome::from_path(home_dir.path());
+    // Make wit/ a regular file so wit/store/ can never be created — a
+    // portable stand-in for "the store is unwritable".
+    std::fs::write(home.wit_dir(), b"not a directory").unwrap();
+
+    install_from_local_path(base, &home, InstallOptions::default())
+        .expect("install must succeed even when the WIT store is unwritable");
+
+    let installed = home
+        .principal_home(&astrid_core::PrincipalId::default())
+        .capsules_dir()
+        .join("store-ro-test");
+    let meta = read_meta(&installed).expect("meta.json exists after install");
+    assert!(
+        !meta.wit_files.is_empty(),
+        "pins must be recorded even when blob retention fails"
+    );
+}
+
+#[test]
+fn install_seeds_canonical_contracts_first_writer_wins() {
+    use astrid_capsule_install::{ContractsSkew, canonical_contracts_path, contracts_skew};
+
+    let home_dir = tempfile::tempdir().unwrap();
+    let home = AstridHome::from_path(home_dir.path());
+
+    // First capsule vendoring contracts seeds the daemon canonical.
+    let cap_a = tempfile::tempdir().unwrap();
+    write_minimal_capsule(cap_a.path(), "contracts-a", "1.0.0");
+    std::fs::create_dir_all(cap_a.path().join("wit/deps/astrid-contracts")).unwrap();
+    let contracts_a = "package astrid:contracts;\ninterface v1 {}\n";
+    std::fs::write(
+        cap_a
+            .path()
+            .join("wit/deps/astrid-contracts/astrid-contracts.wit"),
+        contracts_a,
+    )
+    .unwrap();
+    install_from_local_path(cap_a.path(), &home, InstallOptions::default())
+        .expect("first install should succeed");
+
+    let canonical = canonical_contracts_path(&home);
+    assert_eq!(
+        std::fs::read_to_string(&canonical).unwrap(),
+        contracts_a,
+        "first install must seed the daemon canonical astrid-contracts.wit"
+    );
+
+    // A second capsule pinning DIFFERENT contracts must not overwrite the
+    // canonical (first-writer-wins) and must read as skewed against it.
+    let cap_b = tempfile::tempdir().unwrap();
+    write_minimal_capsule(cap_b.path(), "contracts-b", "1.0.0");
+    std::fs::create_dir_all(cap_b.path().join("wit/deps/astrid-contracts")).unwrap();
+    let contracts_b = "package astrid:contracts;\ninterface v2 {}\n";
+    std::fs::write(
+        cap_b
+            .path()
+            .join("wit/deps/astrid-contracts/astrid-contracts.wit"),
+        contracts_b,
+    )
+    .unwrap();
+    install_from_local_path(cap_b.path(), &home, InstallOptions::default())
+        .expect("second install should still succeed despite skew");
+
+    assert_eq!(
+        std::fs::read_to_string(&canonical).unwrap(),
+        contracts_a,
+        "canonical must stay first-writer-wins across later installs"
+    );
+    // The ahead-of-canonical capsule reads as skewed against the baseline.
+    let meta_b = read_meta(
+        &home
+            .principal_home(&astrid_core::PrincipalId::default())
+            .capsules_dir()
+            .join("contracts-b"),
+    )
+    .unwrap();
+    assert!(
+        contracts_skew(&home, &meta_b.wit_files).is_mismatch(),
+        "the ahead-of-canonical capsule must read as skewed against the baseline"
+    );
+
+    // And the first capsule still reads as aligned.
+    let meta_a = read_meta(
+        &home
+            .principal_home(&astrid_core::PrincipalId::default())
+            .capsules_dir()
+            .join("contracts-a"),
+    )
+    .unwrap();
+    assert!(matches!(
+        contracts_skew(&home, &meta_a.wit_files),
+        ContractsSkew::Match { .. }
+    ));
+}
+
+#[test]
 fn install_detects_upgrade_preserves_installed_at() {
     let capsule_dir = tempfile::tempdir().unwrap();
     let base = capsule_dir.path();

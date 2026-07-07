@@ -14,7 +14,7 @@
 //! 1. Parse manifest.
 //! 2. Check export conflicts (advisory).
 //! 3. Hash WASM at source → `bin/<hash>.wasm`.
-//! 4. Hash WIT at source → `wit/<hash>.wit`.
+//! 4. Hash WIT at source → `wit/store/<hash>.wit`.
 //!
 //! If any of those fail we haven't touched `target_dir` and the
 //! existing install is intact. Only then do we:
@@ -38,6 +38,7 @@ use astrid_core::PrincipalId;
 use astrid_core::dirs::AstridHome;
 use astrid_events::EventBus;
 
+use crate::contracts::seed_canonical_contracts_if_absent;
 use crate::copy::copy_capsule_dir;
 use crate::lifecycle::run_lifecycle;
 use crate::manifest_check::{
@@ -277,6 +278,19 @@ pub fn install_from_local_path_for_principal(
             capsule = %id,
             error = %format!("{e:#}"),
             "failed to materialize home://wit mirror; introspection tools may not see this capsule's interfaces"
+        );
+    }
+
+    // Seed the daemon canonical `astrid-contracts.wit` on the first
+    // install that vendors it (first-writer-wins; never overwritten).
+    // Best-effort: the capsule is already installed and committed, so a
+    // retention failure must not roll it back — it only means later skew
+    // checks have no baseline to compare against.
+    if let Err(e) = seed_canonical_contracts_if_absent(home, &meta.wit_files) {
+        tracing::warn!(
+            capsule = %id,
+            error = %format!("{e:#}"),
+            "failed to seed canonical astrid-contracts.wit; contracts skew checks may lack a baseline"
         );
     }
 
