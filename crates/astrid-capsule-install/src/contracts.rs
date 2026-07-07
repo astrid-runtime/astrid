@@ -207,15 +207,14 @@ pub fn seed_canonical_contracts_if_absent<S: BuildHasher>(
     let content = std::fs::read(&blob)
         .with_context(|| format!("failed to read contracts blob {}", blob.display()))?;
 
-    match write_canonical_atomic(&canonical, &content) {
-        Ok(()) => Ok(()),
-        // A racing install already created the canonical first; first-writer-
-        // wins holds, so treat it as done rather than clobbering theirs.
-        Err(_) if canonical.exists() => Ok(()),
-        Err(e) => {
-            Err(e).with_context(|| format!("failed to write canonical {}", canonical.display()))
-        },
-    }
+    // Create-if-absent (atomic), not write-or-replace: the `exists()` fast path
+    // above is a cheap common-case skip, but two installs racing that check
+    // must not clobber each other's canonical. `create_canonical_if_absent`
+    // returning `Ok(false)` means a racing installer won — first-writer-wins
+    // holds either way, so both outcomes are `Ok`.
+    create_canonical_if_absent(&canonical, &content)
+        .map(|_created| ())
+        .with_context(|| format!("failed to write canonical {}", canonical.display()))
 }
 
 /// Rewrite the daemon canonical `astrid-contracts.wit` from the daemon's
@@ -312,15 +311,15 @@ fn daemon_fleet_contracts_pin(home: &AstridHome) -> Option<String> {
     best.map(|(pin, _)| pin)
 }
 
-/// Atomically write `content` to the canonical path: create parent dirs,
-/// write a UUID-named sibling temp, then rename over the destination.
+/// Write `content` to a UUID-named sibling temp of `canonical`, creating
+/// parent dirs, and return the temp path for the caller to place or drop.
 ///
-/// The rename replaces any existing canonical atomically on unix, so a
-/// concurrent reader never observes a half-written or absent file. The temp
-/// is cleaned up on any failure so a failed write leaks no orphan into
-/// `wit/`. Sibling tokio tasks in the daemon share a pid, so the temp name is
+/// A fully-written temp is the shared prerequisite for both placement
+/// primitives below (overwrite via rename, create-if-absent via hard link).
+/// The temp is cleaned up on a write failure so nothing leaks into `wit/`.
+/// Sibling tokio tasks in the daemon share a pid, so the temp name is
 /// UUID-based rather than pid-based to avoid a collision race.
-fn write_canonical_atomic(canonical: &Path, content: &[u8]) -> std::io::Result<()> {
+fn write_canonical_temp(canonical: &Path, content: &[u8]) -> std::io::Result<PathBuf> {
     if let Some(parent) = canonical.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -332,11 +331,40 @@ fn write_canonical_atomic(canonical: &Path, content: &[u8]) -> std::io::Result<(
         let _ = std::fs::remove_file(&tmp);
         return Err(e);
     }
+    Ok(tmp)
+}
+
+/// Atomically **replace** the canonical with `content` (overwrite). The rename
+/// swaps the destination atomically on unix, so a concurrent reader never
+/// observes a half-written or absent file. Used by the daemon-authoritative
+/// boot refresh, which legitimately moves the baseline.
+fn write_canonical_atomic(canonical: &Path, content: &[u8]) -> std::io::Result<()> {
+    let tmp = write_canonical_temp(canonical, content)?;
     if let Err(e) = std::fs::rename(&tmp, canonical) {
         let _ = std::fs::remove_file(&tmp);
         return Err(e);
     }
     Ok(())
+}
+
+/// Atomically **create** the canonical with `content` only if it does not
+/// already exist (first-writer-wins); returns `Ok(false)` when it already
+/// existed.
+///
+/// `hard_link` is the create-if-absent primitive: it fails with
+/// `AlreadyExists` when the destination is present, so a second installer
+/// racing the same seed cannot clobber the first writer — unlike `rename`,
+/// which silently replaces the destination on unix. The temp is always
+/// dropped afterwards (the link, if made, is the durable copy).
+fn create_canonical_if_absent(canonical: &Path, content: &[u8]) -> std::io::Result<bool> {
+    let tmp = write_canonical_temp(canonical, content)?;
+    let linked = std::fs::hard_link(&tmp, canonical);
+    let _ = std::fs::remove_file(&tmp);
+    match linked {
+        Ok(()) => Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
+        Err(e) => Err(e),
+    }
 }
 
 #[cfg(test)]
@@ -542,6 +570,29 @@ mod tests {
         let files = wit_files(&[("capsule.wit", "deadbeef")]);
         seed_canonical_contracts_if_absent(&home, &files).unwrap();
         assert!(!canonical_contracts_path(&home).exists());
+    }
+
+    #[test]
+    fn create_canonical_if_absent_is_first_writer_wins_under_race() {
+        // Directly exercise the atomic create-if-absent primitive that backs
+        // the seed path: an already-present canonical must NOT be clobbered even
+        // when the caller reaches the write. The `exists()` fast-path in
+        // `seed_canonical_contracts_if_absent` is only an optimization; this
+        // closes the check-then-write race window on unix, where `rename` would
+        // otherwise silently replace the destination.
+        let tmp = tempfile::tempdir().unwrap();
+        let home = AstridHome::from_path(tmp.path());
+        let first = b"package astrid:contracts;\ninterface v1 {}\n";
+        write_canonical(&home, first);
+
+        let canonical = canonical_contracts_path(&home);
+        let created = create_canonical_if_absent(&canonical, b"second writer bytes\n").unwrap();
+        assert!(!created, "an existing canonical must report not-created");
+        assert_eq!(
+            std::fs::read(&canonical).unwrap(),
+            first,
+            "first-writer-wins: the existing canonical must be untouched"
+        );
     }
 
     #[test]
