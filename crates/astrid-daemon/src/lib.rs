@@ -208,6 +208,20 @@ pub async fn run() -> Result<()> {
     // wait on every agent's capsule view.
     kernel.load_boot_capsules().await;
 
+    // Refresh the daemon-canonical contracts baseline (#1165). The daemon is
+    // authoritative for `wit/astrid-contracts.wit`: rewrite it from the
+    // daemon's own system fleet so an already-installed fleet gets
+    // contracts-skew visibility immediately at boot — no install required and
+    // no dependence on which capsule installed first. Best-effort: a failure
+    // only degrades warn-only skew reporting, it must never break boot.
+    if let Err(e) = astrid_capsule_install::refresh_canonical_contracts(&astrid_home) {
+        tracing::warn!(
+            error = %format!("{e:#}"),
+            "failed to refresh canonical astrid-contracts.wit at boot; \
+             contracts skew checks may lack a current baseline"
+        );
+    }
+
     // Verify the CLI proxy capsule loaded. Without it, the daemon
     // has no accept loop and CLI connections will always time out.
     {

@@ -592,6 +592,7 @@ version = "0.9.3"
 dependencies = [
  "anyhow",
  "astrid-capsule",
+ "astrid-capsule-install",
  "astrid-config",
  "astrid-core",
  "astrid-gateway",

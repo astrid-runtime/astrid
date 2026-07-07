@@ -75,8 +75,8 @@ pub mod wit;
 pub use archive::{unpack_and_install, unpack_and_install_for_principal};
 pub use contracts::{
     CONTRACTS_WIT_BASENAME, ContractsSkew, canonical_contracts_b3, canonical_contracts_path,
-    contracts_pin, contracts_skew, mismatching_contracts, seed_canonical_contracts_if_absent,
-    short_hash,
+    contracts_pin, contracts_skew, mismatching_contracts, refresh_canonical_contracts,
+    seed_canonical_contracts_if_absent, short_hash,
 };
 pub use copy::copy_capsule_dir;
 pub use local::{
