@@ -10,10 +10,18 @@
 //!
 //! Detection is a portable, low-frequency poll of `getppid()`: when the parent
 //! dies the process is reparented — to `init`/pid 1 on Linux, `launchd` on
-//! macOS, or a subreaper — so the parent pid CHANGES from the value captured at
-//! startup. Watching for that change subsumes the `getppid() == 1` case, also
-//! handles subreapers (systemd user services), needs no `unsafe`/platform-
-//! specific syscalls, and works identically on macOS and Linux.
+//! macOS, or a subreaper (systemd user services) — so the parent pid CHANGES
+//! from the value captured at startup. It needs no `unsafe`/platform-specific
+//! syscalls and works identically on macOS and Linux.
+//!
+//! A pid-1 initial parent is deliberately NOT treated as death. It is ambiguous:
+//! the shim may have been launched directly under init (a container whose client
+//! IS pid 1, or a systemd/launchd service), where it must KEEP serving — or the
+//! real parent may have died before we captured its pid. Reparenting can't
+//! distinguish these (init never reparents), and exiting would kill a
+//! legitimately init-launched server, so ppid detection is disabled in that
+//! case and the shim relies on its stdin-EOF path instead (a dead real parent
+//! also closes the stdin pipe).
 //!
 //! Stdout discipline: this module never writes to stdout (the MCP transport
 //! owns it) — it only reads `getppid()` and sleeps.
@@ -41,10 +49,12 @@ fn current_ppid() -> i32 {
 }
 
 /// Resolve once `read_ppid()` differs from `initial` — i.e. the parent died and
-/// this process was reparented. Resolves IMMEDIATELY if `initial` is already the
-/// orphan sentinel `1` (init/launchd): the parent died before we captured its
-/// pid, so this process is already orphaned and a reparented process's ppid
-/// stays `1` — polling for a change would loop forever.
+/// this process was reparented.
+///
+/// If `initial` is `1` (a pid-1 parent — launched directly under init, or
+/// already reparented) detection is DISABLED: this future never resolves, so
+/// the shim falls back to its stdin-EOF signal rather than exiting instantly and
+/// killing a legitimately init-launched server (see the module header).
 ///
 /// Generic over the ppid source so the poll logic is unit-testable without a
 /// real fork.
@@ -52,11 +62,11 @@ async fn watch_ppid_change<F>(initial: i32, read_ppid: F, poll: Duration)
 where
     F: Fn() -> i32,
 {
-    // Already reparented at startup (parent died before we captured its pid):
-    // pid 1 is the orphan sentinel and never changes, so resolve now instead of
-    // polling forever. This is the `getppid() == 1` case the module doc names.
+    // A pid-1 initial parent is not watchable via reparenting (init never
+    // reparents) and is ambiguous between a legitimate init-launched parent and
+    // an already-orphaned shim — so provide NO signal and defer to stdin EOF.
     if initial == 1 {
-        return;
+        std::future::pending::<()>().await;
     }
     loop {
         tokio::time::sleep(poll).await;
@@ -107,15 +117,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn resolves_immediately_when_started_already_reparented() {
-        // Parent died before we captured its pid → initial ppid is the orphan
-        // sentinel 1, which never changes. Must resolve at once (not loop
-        // forever), even with a poll interval far longer than the timeout.
-        tokio::time::timeout(
-            Duration::from_millis(50),
-            watch_ppid_change(1, || 1_i32, Duration::from_hours(1)),
+    async fn ppid_one_disables_detection_and_defers_to_stdin() {
+        // A pid-1 initial parent (launched under init — container/systemd — or
+        // already reparented) is ambiguous and not watchable, so detection must
+        // provide NO signal: the future must NOT resolve, letting the shim rely
+        // on stdin EOF rather than exiting instantly and killing a legitimately
+        // init-launched server.
+        let res = tokio::time::timeout(
+            Duration::from_millis(80),
+            watch_ppid_change(1, || 1_i32, Duration::from_millis(5)),
         )
-        .await
-        .expect("must resolve immediately when started already reparented (ppid == 1)");
+        .await;
+        assert!(
+            res.is_err(),
+            "ppid == 1 must NOT resolve — defer to stdin EOF, never exit instantly"
+        );
     }
 }
