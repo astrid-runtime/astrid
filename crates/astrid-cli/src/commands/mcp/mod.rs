@@ -36,6 +36,9 @@
 mod elicit;
 mod grant;
 mod ingress;
+// Parent-death detection reads `getppid()` (Unix-only); the module and its use
+// site are target-gated so the CLI still compiles on non-Unix targets.
+#[cfg(unix)]
 mod parent_death;
 mod server;
 mod watch;
@@ -165,9 +168,16 @@ pub(crate) async fn serve(principal: Option<&str>) -> Result<ExitCode> {
     // pinning >=2 daemon uplinks (observed: a 4-day orphan). When the launching
     // session dies we drop `running` so the transport closes and those uplinks
     // are freed.
+    // Parent-death detection is Unix-only (`getppid`); on other targets fall
+    // back to a never-resolving future so the shim relies solely on stdin EOF.
+    #[cfg(unix)]
+    let parent_death_fut = parent_death::wait_for_parent_death();
+    #[cfg(not(unix))]
+    let parent_death_fut = std::future::pending::<()>();
+
     tokio::select! {
         biased;
-        () = parent_death::wait_for_parent_death() => {
+        () = parent_death_fut => {
             info!("astrid mcp serve: launching session ended (reparented); closing MCP bridge");
             // `running` (moved into the losing `waiting()` future) is dropped
             // here → transport closes → daemon uplinks freed.

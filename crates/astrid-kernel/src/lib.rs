@@ -1883,7 +1883,20 @@ impl Kernel {
                 }
             });
         }
-        while drain_set.join_next().await.is_some() {}
+        // Await every unload task. A task that panicked or was cancelled would
+        // otherwise be swallowed silently, leaving its capsule un-unloaded (and
+        // its MCP subprocess possibly orphaned) with no diagnostic — so log the
+        // join failure. Shutdown still proceeds: a stuck unload must not block
+        // the graceful path (the OS-thread watchdog is the hard backstop).
+        while let Some(res) = drain_set.join_next().await {
+            if let Err(err) = res {
+                if err.is_panic() {
+                    tracing::error!("A capsule unload task panicked during shutdown");
+                } else {
+                    tracing::error!(error = %err, "A capsule unload task failed to join during shutdown");
+                }
+            }
+        }
 
         // 4. Remove the socket and token files so stale-socket detection works
         // on next boot and the auth token doesn't persist on disk after shutdown.
