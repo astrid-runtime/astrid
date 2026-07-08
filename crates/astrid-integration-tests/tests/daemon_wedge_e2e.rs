@@ -9,11 +9,27 @@
 //! instead of dying on a raw surrealkv `Database ... LOCK is already locked`
 //! from a store it should never have opened.
 //!
-//! The audit-lock-release half of the wedge (`AuditLog::close` on shutdown) is
-//! unit-tested in `astrid-audit` (`close_releases_lock_so_same_dir_reopens`);
-//! the SIGTERM-starvation half (the OS-thread signal watchdog) is unit-tested in
-//! `astrid-daemon` (`signal::tests`) and exercised end-to-end by the runtime
-//! bash harness. This file covers the boot-race the two fixes converge on.
+//! This file covers the boot-race the wedge fixes converge on. The other halves
+//! are covered where they can be exercised faithfully:
+//!
+//! * audit-lock release on shutdown (`AuditLog::close`) — unit-tested in
+//!   `astrid-audit` (`close_releases_lock_so_same_dir_reopens`);
+//! * the OS-thread signal watchdog decision logic — unit-tested in
+//!   `astrid-daemon` (`signal::tests`);
+//! * the exempt-run-loop cooperative yield that un-pins the worker (Fix 5), and
+//!   cancellation stopping a compute-bound run-loop (Fix 6) — exercised on the
+//!   real wasmtime engine in `astrid-capsule`
+//!   (`epoch_integration_tests::exempt_*`).
+//!
+//! KNOWN GAP: a full daemon-level reproduction — a real daemon whose tokio
+//! workers are all pinned by an exempt run-loop tight-compute capsule, then
+//! `SIGTERM`, asserting exit within the watchdog grace — is NOT yet automated.
+//! It requires a compute-pinning exempt run-loop capsule fixture and the full
+//! capsule fleet the runtime bash harness assembles (a bare daemon refuses to
+//! boot without the CLI proxy capsule), so it belongs in that harness rather
+//! than the sandboxed workspace test matrix. The engine-level `exempt_*` tests
+//! above prove the un-pinning mechanism the daemon relies on; the end-to-end
+//! harness scenario is a tracked follow-up.
 //!
 //! ## Why `#[ignore]`
 //!
