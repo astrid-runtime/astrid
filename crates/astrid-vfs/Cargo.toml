@@ -21,6 +21,11 @@ thiserror = { workspace = true }
 tokio = { workspace = true, features = ["fs", "io-util", "sync", "rt"] }
 tracing = { workspace = true }
 
+# OS-level copy-on-write backends (workspace_cow): APFS clonefile(2) on macOS,
+# overlayfs mount(2) on Linux. Not needed by the No-CoW fallback on other OSes.
+[target.'cfg(any(target_os = "macos", target_os = "linux"))'.dependencies]
+libc = { workspace = true }
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 

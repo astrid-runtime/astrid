@@ -114,6 +114,24 @@ pub(crate) trait ExecutionEngine: Send + Sync {
     fn check_health(&self) -> crate::capsule::CapsuleState {
         crate::capsule::CapsuleState::Ready
     }
+
+    /// Commit this engine's OS-level copy-on-write workspace changes into the
+    /// pristine workspace (the gate's "approve"). Returns `Ok(true)` if this
+    /// engine committed a copy-on-write workspace, `Ok(false)` if it has none
+    /// (git-managed, No-CoW, or an engine with no workspace).
+    ///
+    /// Default: `Ok(false)`. `WasmEngine` overrides to drive its
+    /// [`WorkspaceCow`](astrid_vfs::WorkspaceCow) backend.
+    async fn promote_workspace(&self) -> CapsuleResult<bool> {
+        Ok(false)
+    }
+
+    /// Discard this engine's OS-level copy-on-write workspace changes (the
+    /// gate's "reject"). Returns `Ok(true)` if this engine rolled back a
+    /// copy-on-write workspace, `Ok(false)` if it has none. Default: `Ok(false)`.
+    async fn rollback_workspace(&self) -> CapsuleResult<bool> {
+        Ok(false)
+    }
 }
 
 /// Build an [`OnboardingField`] from a manifest [`EnvDef`].

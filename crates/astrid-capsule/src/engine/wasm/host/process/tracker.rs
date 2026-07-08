@@ -36,6 +36,21 @@ impl ProcessTracker {
             .insert(pid, call_id);
     }
 
+    /// Whether any child process is currently registered as running.
+    ///
+    /// The workspace copy-on-write promote/rollback interlock consults this to
+    /// refuse mutating the merged tree while a spawned process (e.g. a `cargo`
+    /// with `cwd == merged`) may still be running in it — swapping and deleting
+    /// the tree under it would corrupt or destroy its work.
+    #[must_use]
+    pub fn has_active(&self) -> bool {
+        !self
+            .active_pids
+            .lock()
+            .expect("process tracker lock poisoned")
+            .is_empty()
+    }
+
     /// Unregister a child process PID (process has exited).
     pub fn unregister(&self, pid: u32) {
         self.active_pids

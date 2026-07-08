@@ -927,6 +927,7 @@ dependencies = [
  "cap-std 4.0.2",
  "dashmap",
  "ignore",
+ "libc",
  "serde",
  "tempfile",
  "thiserror 2.0.18",

@@ -145,6 +145,9 @@ impl InstanceBuilder {
 pub(super) struct CapsuleInstancePool {
     available: Arc<Mutex<VecDeque<PooledInstance>>>,
     permits: Arc<Semaphore>,
+    /// The concurrency ceiling `permits` was sized to. Kept so the workspace
+    /// copy-on-write interlock can grab EXCLUSIVE access — every permit at once.
+    max: usize,
     /// Whether returning an instance tears down its per-invocation host
     /// resources (resource table + the resource-table-mirror counters).
     ///
@@ -211,11 +214,25 @@ impl CapsuleInstancePool {
         Self {
             available,
             permits: Arc::new(Semaphore::new(max)),
+            max,
             reset_resources_on_return,
             builder: Arc::new(builder),
             allow_grow,
             evict_task,
         }
+    }
+
+    /// Try to acquire EXCLUSIVE access to the pool — every permit at once — so
+    /// no invocation can be in flight (or start) while the returned guard is
+    /// held. Returns `None` immediately if any invocation currently holds a
+    /// permit (the caller then treats the capsule as busy rather than waiting).
+    /// Used by the workspace copy-on-write promote/rollback interlock so the
+    /// merged tree is never swapped/deleted under a running invocation.
+    pub(super) fn try_acquire_exclusive(&self) -> Option<OwnedSemaphorePermit> {
+        // `max` fits u32 in practice (a per-capsule concurrency ceiling); the
+        // clamp keeps the cast lossless-or-refuse.
+        let want = u32::try_from(self.max).ok()?;
+        Arc::clone(&self.permits).try_acquire_many_owned(want).ok()
     }
 
     /// Lease an instance, awaiting a permit if `max` are already in use.

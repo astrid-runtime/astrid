@@ -78,7 +78,7 @@ impl SandboxCommand {
     /// backslash, or null byte).
     #[allow(clippy::needless_pass_by_value)] // Moved on the unsupported-OS passthrough arm; borrowed on Linux/macOS.
     pub fn wrap(inner_cmd: Command, worktree_path: &Path) -> io::Result<Command> {
-        Self::wrap_with_injections(inner_cmd, worktree_path, &[])
+        Self::wrap_with_injections(inner_cmd, worktree_path, &[], &[])
     }
 
     /// Astrid-home subpaths that hold cross-principal secret material or kernel
@@ -199,11 +199,21 @@ impl SandboxCommand {
     /// for SBPL interpolation (double-quote, backslash, or null byte); or, on a
     /// platform without an OS-level sandbox, if `injections` is non-empty (the
     /// read-only guarantee cannot be enforced without a sandbox — fail-secure).
+    /// `extra_masks` are caller-supplied paths to hide from the spawned child
+    /// IN ADDITION to the always-masked secret/state dirs — the copy-on-write
+    /// upper/work directories (Linux `overlayfs`) or the pristine workspace
+    /// (macOS APFS). Masking them is SECURITY-CRITICAL: a child that wrote them
+    /// directly would smuggle changes past the workspace promote/rollback gate.
+    /// See [`astrid_vfs::workspace_cow`](../../../astrid_vfs/workspace_cow/index.html).
+    /// They are masked with the same mechanism as the built-in set (empty
+    /// `--tmpfs` / `/dev/null` ro-bind on Linux, Seatbelt deny on macOS); pass
+    /// only existing paths (see [`push_mask_arg`](Self::push_mask_arg)).
     #[allow(clippy::needless_pass_by_value)] // Moved on the unsupported-OS passthrough arm; borrowed on Linux/macOS.
     pub fn wrap_with_injections(
         inner_cmd: Command,
         worktree_path: &Path,
         injections: &[RoInjection],
+        extra_masks: &[PathBuf],
     ) -> io::Result<Command> {
         // Validate on all platforms for defense in depth and API consistency.
         // On macOS the validated string is needed for SBPL interpolation.
@@ -246,6 +256,16 @@ impl SandboxCommand {
             // the home is unresolvable.
             for masked in Self::masked_paths()? {
                 Self::push_mask_arg(&mut bwrap, &masked);
+            }
+
+            // Caller-supplied masks (the CoW upper/work dirs). Same mechanism,
+            // placed after the worktree/injection binds so they overlay; the
+            // CoW dirs live OUTSIDE the worktree, so no writable bind needs to
+            // punch back through.
+            for masked in extra_masks {
+                if masked.exists() {
+                    Self::push_mask_arg(&mut bwrap, masked);
+                }
             }
 
             bwrap
@@ -303,6 +323,16 @@ impl SandboxCommand {
             for masked in Self::masked_paths()? {
                 config = config.with_hidden(masked);
             }
+            // Caller-supplied masks (the CoW pristine workspace / upper dirs).
+            // The Seatbelt deny is last-match-wins, so it holds even where the
+            // masked path is under a broadly-writable location (`/var/folders`,
+            // `/private/tmp`). A masked path that is an ANCESTOR of the writable
+            // root is dropped by `build_seatbelt_prefix` (it would deny lstat on
+            // the writable root's own parents) — the CoW backend never masks an
+            // ancestor of `merged` for exactly this reason.
+            for masked in extra_masks {
+                config = config.with_hidden(masked.clone());
+            }
             let prefix = config.build_seatbelt_prefix()?;
 
             let mut sb_cmd = Command::new(&prefix.program);
@@ -331,6 +361,8 @@ impl SandboxCommand {
 
         #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         {
+            // No sandbox here, so there is nothing to mask.
+            let _ = extra_masks;
             // Without an OS-level sandbox there is no mechanism to enforce the
             // read-only guarantee; refuse rather than expose writable bytes.
             if !injections.is_empty() {
