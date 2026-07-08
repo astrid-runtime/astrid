@@ -67,6 +67,7 @@ where
     // an already-orphaned shim — so provide NO signal and defer to stdin EOF.
     if initial == 1 {
         std::future::pending::<()>().await;
+        return;
     }
     loop {
         tokio::time::sleep(poll).await;
