@@ -13,6 +13,8 @@
 use anyhow::{Context, Result};
 use clap::Parser;
 
+mod signal;
+
 /// Astrid Daemon - Background kernel process
 #[derive(Parser)]
 #[command(name = "astrid-daemon")]
@@ -281,30 +283,23 @@ pub async fn run() -> Result<()> {
 
     #[cfg(unix)]
     {
-        let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-            .context("failed to register SIGTERM handler")?;
-        // The daemon detaches into its own session at startup (`setsid`), so it
-        // has no controlling terminal to send it a SIGHUP on close. But an
-        // explicit `kill -HUP` (or a SIGHUP that raced the detach) would
-        // otherwise hit the default disposition — terminate WITHOUT running the
-        // graceful shutdown below, leaking stale run files. Handle it on the
-        // same clean path as SIGTERM.
-        let mut sighup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())
-            .context("failed to register SIGHUP handler")?;
-        tokio::select! {
-            _ = tokio::signal::ctrl_c() => {
-                tracing::info!("Received SIGINT, shutting down");
-            }
-            _ = sigterm.recv() => {
-                tracing::info!("Received SIGTERM, shutting down");
-            }
-            _ = sighup.recv() => {
-                tracing::info!("Received SIGHUP, shutting down");
-            }
-            _ = shutdown_rx.wait_for(|v| *v) => {
-                tracing::info!("Received API shutdown request, shutting down");
-            }
-        }
+        // SIGTERM/SIGINT/SIGHUP are owned by a dedicated OS-thread watchdog
+        // (`signal::spawn_signal_watchdog`) scheduled by the OS, NOT a tokio
+        // worker — so the daemon is killable even when every worker is pinned
+        // by guest compute (the SIGTERM-deafness wedge). The watchdog requests
+        // graceful shutdown through `shutdown_tx` and force-exits if the
+        // graceful path itself wedges. That includes SIGHUP: the daemon detaches
+        // into its own session at startup (`setsid`) so it has no controlling
+        // terminal, but an explicit `kill -HUP` must still run graceful shutdown
+        // rather than the default terminate-and-leak-run-files disposition.
+        //
+        // The async side therefore only waits on the watch channel, fed by the
+        // watchdog AND by an in-process API shutdown request. No tokio signal
+        // registration here — that avoids double-handling the same signals the
+        // watchdog owns.
+        signal::spawn_signal_watchdog(kernel.shutdown_tx.clone());
+        let _ = shutdown_rx.wait_for(|v| *v).await;
+        tracing::info!("Shutdown requested, shutting down");
     }
     #[cfg(not(unix))]
     {

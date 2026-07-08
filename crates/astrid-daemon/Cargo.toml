@@ -38,8 +38,12 @@ uuid = { workspace = true }
 # detaches the daemon into its own session (so a spawner teardown / SIGHUP can't
 # kill it before its graceful shutdown), which is itself `#[cfg(unix)]`-gated —
 # so gate the dependency the same way to keep the crate portable.
+#
+# `signal-hook` is likewise Unix-only: it backs the OS-thread signal watchdog
+# (`src/signal.rs`) that owns SIGTERM/SIGINT/SIGHUP off the tokio runtime.
 [target.'cfg(unix)'.dependencies]
 nix = { workspace = true }
+signal-hook = { workspace = true }
 
 [lints]
 workspace = true

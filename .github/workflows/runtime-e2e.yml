@@ -158,6 +158,15 @@ jobs:
       - name: Check HTTP route coverage
         run: cargo test -p astrid-gateway openapi_lists_every_router_route
 
+      # Daemon-wedge boot-race guard: a second kernel booting on the same
+      # ASTRID_HOME must lose the singleton race at the flock and report
+      # "already running", NOT die on a raw surrealkv store LOCK (the pre-fix
+      # ordering). `#[ignore]`-gated because it binds a real socket and mutates
+      # process-global ASTRID_HOME, so it runs single-threaded here rather than
+      # in the sandboxed workspace matrix.
+      - name: Check daemon singleton boot-race ordering
+        run: cargo test -p astrid-integration-tests --test daemon_wedge_e2e -- --ignored --test-threads=1
+
       - name: Run real runtime harness
         env:
           ASTRID_E2E_CAPSULES_DIR: ${{ runner.temp }}/astrid-runtime-capsules
