@@ -226,11 +226,14 @@ impl SandboxCommand {
         }
 
         // Every caller-supplied mask names copy-on-write bookkeeping the child
-        // must not reach (the overlayfs upper/work, or the APFS pristine). A path
-        // that does not exist is a wiring bug, not a no-op: silently skipping it
-        // leaves the child un-denied. The deny is security-critical, so a missing
-        // target fails the spawn closed rather than proceeding without it.
+        // must not reach (the overlayfs upper/work, or the APFS pristine). Each is
+        // validated exactly like the worktree and injection paths — absolute,
+        // UTF-8, SBPL-safe — because on macOS it is interpolated into the Seatbelt
+        // profile; then it must EXIST, since a path that does not exist is a wiring
+        // bug, not a no-op (silently skipping it leaves the child un-denied). The
+        // deny is security-critical, so either failure fails the spawn closed.
         for masked in extra_masks {
+            let _ = validate_sandbox_str(masked, "workspace CoW mask")?;
             if !masked.exists() {
                 return Err(io::Error::new(
                     io::ErrorKind::NotFound,

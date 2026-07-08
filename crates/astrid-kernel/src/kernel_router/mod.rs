@@ -4,10 +4,12 @@ pub mod admin;
 /// `astrid-capsule-install` library so the daemon and the CLI reach
 /// disk through the same code path.
 mod install;
+mod rate_limit;
 /// Kernel-response publishing envelope + the long-request keepalive pinger.
 mod response;
 
-pub(crate) use response::{KeepalivePinger, publish_response};
+pub(crate) use rate_limit::rate_limit_for_request;
+pub(crate) use response::{KeepalivePinger, publish_response, workspace_commit_response};
 
 use astrid_runtime::time::Instant;
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
@@ -649,61 +651,6 @@ impl ManagementRateLimiter {
         }
         timestamps.push_back(now);
         true
-    }
-}
-
-/// Return the rate limit label and max-per-minute for a request type.
-/// Returns `None` for the limit if the request type is not rate-limited.
-fn rate_limit_for_request(req: &KernelRequest) -> (&'static str, Option<u32>) {
-    (kernel_request_method(req), rate_limit_max(req))
-}
-
-/// Return the max-per-minute rate limit for a request type, if any.
-/// Approve (`commit == true`) or discard (`commit == false`) a capsule's
-/// OS-level copy-on-write workspace changes, shaping the [`KernelResponse`].
-/// Shared by the `PromoteWorkspace` / `RollbackWorkspace` dispatch arms.
-async fn workspace_commit_response(
-    kernel: &Arc<crate::Kernel>,
-    caller: &PrincipalId,
-    id: &str,
-    commit: bool,
-) -> KernelResponse {
-    let verb = if commit { "promoted" } else { "rolled_back" };
-    match astrid_capsule::capsule::CapsuleId::new(id.to_string()) {
-        Ok(cap_id) => match kernel.commit_workspace_for(&cap_id, caller, commit).await {
-            Ok(Some(true)) => {
-                KernelResponse::Success(serde_json::json!({"status": verb, "capsule": id}))
-            },
-            Ok(Some(false)) => KernelResponse::Success(serde_json::json!({
-                "status": "not_applicable",
-                "capsule": id,
-                "reason": "git-managed or no copy-on-write workspace",
-            })),
-            Ok(None) => {
-                KernelResponse::Success(serde_json::json!({"status": "not_loaded", "capsule": id}))
-            },
-            Err(e) => {
-                KernelResponse::Error(format!("workspace commit for capsule '{id}' failed: {e}"))
-            },
-        },
-        Err(e) => KernelResponse::Error(format!("invalid capsule id '{id}': {e}")),
-    }
-}
-
-fn rate_limit_max(req: &KernelRequest) -> Option<u32> {
-    match req {
-        KernelRequest::ReloadCapsules
-        | KernelRequest::ReloadCapsule { .. }
-        | KernelRequest::UnloadCapsule { .. }
-        | KernelRequest::PromoteWorkspace { .. }
-        | KernelRequest::RollbackWorkspace { .. } => Some(5),
-        KernelRequest::InstallCapsule { .. } | KernelRequest::ApproveCapability { .. } => Some(10),
-        KernelRequest::Shutdown { .. } => Some(1),
-        KernelRequest::ListCapsules
-        | KernelRequest::GetCommands
-        | KernelRequest::GetCapsuleMetadata
-        | KernelRequest::GetAgentReadiness
-        | KernelRequest::GetStatus => None,
     }
 }
 

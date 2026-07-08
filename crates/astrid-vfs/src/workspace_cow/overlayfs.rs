@@ -42,7 +42,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 
 use super::{CowCapability, PreparedWorkspace, WorkspaceCow};
 
@@ -70,9 +70,13 @@ struct OverlayfsPaths {
 pub struct OverlayfsCow {
     cow_root: PathBuf,
     paths: OnceLock<OverlayfsPaths>,
-    /// Which mechanism actually mounted (native kernel vs `fuse-overlayfs`),
-    /// so teardown unmounts the right way.
-    capability: OnceLock<CowCapability>,
+    /// Which mechanism currently holds the mount (native kernel vs
+    /// `fuse-overlayfs`), so teardown unmounts the right way. Stored as a
+    /// [`CowCapability`] discriminant ([`CAP_UNSET`] until the first mount) and
+    /// updated by BOTH `prepare` and `rollback`, since a re-mount may resolve via
+    /// a different mechanism than the original — a `OnceLock` would go stale and
+    /// send `unmount` down the wrong teardown path.
+    capability: AtomicU8,
     mounted: AtomicBool,
 }
 
@@ -84,7 +88,7 @@ impl OverlayfsCow {
         Self {
             cow_root,
             paths: OnceLock::new(),
-            capability: OnceLock::new(),
+            capability: AtomicU8::new(CAP_UNSET),
             mounted: AtomicBool::new(false),
         }
     }
@@ -95,9 +99,22 @@ impl OverlayfsCow {
             .ok_or_else(|| io::Error::other("overlayfs workspace CoW: prepare() has not run"))
     }
 
+    /// The mechanism currently holding the mount (native default before the
+    /// first mount, matching the old `unwrap_or(Overlayfs)`).
+    fn load_capability(&self) -> CowCapability {
+        cap_from_u8(self.capability.load(Ordering::SeqCst))
+    }
+
+    /// Record the mechanism a (re)mount resolved to, so `unmount` tears it down
+    /// the matching way. Called by both `prepare` and `rollback`.
+    fn store_capability(&self, capability: CowCapability) {
+        self.capability
+            .store(cap_to_u8(capability), Ordering::SeqCst);
+    }
+
     /// Mount the overlay: try native `mount(2)` first, then `fuse-overlayfs`.
-    /// Records which mechanism succeeded so teardown matches.
-    fn mount(&self, p: &OverlayfsPaths) -> io::Result<CowCapability> {
+    /// Returns which mechanism succeeded so the caller records it for teardown.
+    fn mount(p: &OverlayfsPaths) -> io::Result<CowCapability> {
         let data = format!(
             "lowerdir={},upperdir={},workdir={}",
             p.pristine.display(),
@@ -132,21 +149,13 @@ impl OverlayfsCow {
             return;
         }
         let Some(p) = self.paths.get() else { return };
-        let capability = self
-            .capability
-            .get()
-            .copied()
-            .unwrap_or(CowCapability::Overlayfs);
-        unmount_path(&p.merged, capability);
+        unmount_path(&p.merged, self.load_capability());
     }
 }
 
 impl WorkspaceCow for OverlayfsCow {
     fn capability(&self) -> CowCapability {
-        self.capability
-            .get()
-            .copied()
-            .unwrap_or(CowCapability::Overlayfs)
+        self.load_capability()
     }
 
     fn prepare(&self, pristine: &Path) -> io::Result<PreparedWorkspace> {
@@ -176,7 +185,7 @@ impl WorkspaceCow for OverlayfsCow {
             workspace_dir,
         };
 
-        let capability = self.mount(&paths)?;
+        let capability = Self::mount(&paths)?;
         // Commit the tracked state. If a concurrent prepare() raced past the
         // guard above and set first, unmount + remove the overlay WE just built
         // so it does not leak, then report the double-prepare.
@@ -186,7 +195,7 @@ impl WorkspaceCow for OverlayfsCow {
             return Err(prepared_twice());
         }
         self.mounted.store(true, Ordering::SeqCst);
-        let _ = self.capability.set(capability);
+        self.store_capability(capability);
 
         Ok(PreparedWorkspace {
             merged_path: merged,
@@ -224,9 +233,12 @@ impl WorkspaceCow for OverlayfsCow {
             }
             std::fs::create_dir_all(dir)?;
         }
-        let capability = self.mount(p)?;
+        // A re-mount may resolve via a different mechanism than the original
+        // (e.g. native now fails and fuse takes over); record the new one so
+        // `unmount` tears it down correctly rather than via the stale mechanism.
+        let capability = Self::mount(p)?;
         self.mounted.store(true, Ordering::SeqCst);
-        let _ = self.capability.set(capability);
+        self.store_capability(capability);
         tracing::info!(
             pristine = %p.pristine.display(),
             "workspace CoW: rolled back overlayfs upper"
@@ -340,6 +352,30 @@ fn remove_any(path: &Path) -> io::Result<()> {
     }
 }
 
+/// [`OverlayfsCow::capability`] is stored as a `u8` so both `prepare` and
+/// `rollback` can update it (a re-mount may resolve via a different mechanism).
+/// These map the two overlayfs mechanisms to/from that discriminant.
+const CAP_UNSET: u8 = 0;
+const CAP_NATIVE: u8 = 1;
+const CAP_FUSE: u8 = 2;
+
+fn cap_to_u8(capability: CowCapability) -> u8 {
+    match capability {
+        CowCapability::FuseOverlayfs => CAP_FUSE,
+        // Any non-fuse overlay (including the `Overlayfs` default) is native.
+        _ => CAP_NATIVE,
+    }
+}
+
+fn cap_from_u8(value: u8) -> CowCapability {
+    match value {
+        CAP_FUSE => CowCapability::FuseOverlayfs,
+        // CAP_UNSET (pre-mount) falls through to the native default, matching the
+        // previous `unwrap_or(Overlayfs)` behaviour.
+        _ => CowCapability::Overlayfs,
+    }
+}
+
 /// Unmount a specific merged mountpoint with the mechanism that mounted it.
 /// Shared by [`OverlayfsCow::unmount`] and the race-loser cleanup in
 /// [`OverlayfsCow::prepare`], which must unmount ITS OWN overlay rather than the
@@ -347,10 +383,19 @@ fn remove_any(path: &Path) -> io::Result<()> {
 fn unmount_path(merged: &Path, capability: CowCapability) {
     match capability {
         CowCapability::FuseOverlayfs => {
-            let _ = std::process::Command::new("fusermount")
+            // FUSE3's `fusermount3` is the default on modern distros; fall back to
+            // the FUSE2 `fusermount` only where `fusermount3` is absent or fails.
+            let unmounted = std::process::Command::new("fusermount3")
                 .arg("-u")
                 .arg(merged)
-                .status();
+                .status()
+                .is_ok_and(|s| s.success());
+            if !unmounted {
+                let _ = std::process::Command::new("fusermount")
+                    .arg("-u")
+                    .arg(merged)
+                    .status();
+            }
         },
         _ => {
             if let Err(e) = umount(merged) {
