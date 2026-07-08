@@ -77,11 +77,12 @@ bytes = "1"
 # gitoxide crate for this: it finds the enclosing `.git` (correctly handling the
 # `.git` *file* a submodule / linked worktree uses, and filesystem-boundary
 # ceilings) without opening the object database a full `gix::Repository` would.
-# `sha1` (git's default object format) must be enabled explicitly — gix-discover
-# has no default features, and gix-hash refuses to compile without a hash kind.
-# SHA-256 repos are out of scope for a mere work-tree existence check, so that
-# feature (and its sha2 impl) is left off.
-gix-discover = { version = "0.53.0", default-features = false, features = ["sha1"] }
+# `sha1` and `sha256` (git's two object formats) are both enabled explicitly —
+# gix-discover has no default features, and gix-hash refuses to compile without a
+# hash kind. Both are on so discovery succeeds regardless of a repo's object
+# format; with `sha1` alone, a SHA-256 repo in a detached-HEAD state would be
+# missed and fall back to the CoW overlay.
+gix-discover = { version = "0.53.0", default-features = false, features = ["sha1", "sha256"] }
 notify = "8"
 # `astrid:http@1.1.0` `auto-decompress` toggles gzip/brotli/deflate/zstd per
 # request; those builder methods are feature-gated in reqwest. Enabled here so
