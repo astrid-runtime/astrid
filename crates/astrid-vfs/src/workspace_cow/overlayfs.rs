@@ -6,21 +6,24 @@
 //! tries a native kernel `mount(2)`, then falls back to `fuse-overlayfs`.
 //! [`rollback`](OverlayfsCow::rollback) discards the upper and remounts.
 //!
-//! # PARTIAL promote (char-dev whiteouts only — TODO)
+//! # PARTIAL promote (char-dev whiteouts; opaque dirs refused)
 //! [`promote`](OverlayfsCow::promote) copies the upper into the pristine
-//! workspace and translates only **plain whiteouts** (char device `0:0` → a
-//! real delete of the lower entry). It does NOT yet handle **opaque
-//! directories** (`trusted.overlay.opaque` — set when a dir is replaced
-//! wholesale, e.g. `rm -rf d && mkdir d && touch d/new`) or `redirect_dir`
-//! renames, so in those cases the lower's stale children silently survive the
-//! commit. This is a known gap to close before the Linux path is production-
-//! ready; it is not the "no-whiteout" gap of the in-process `OverlayVfs`
-//! (which handled neither) but a narrower opaque-dir gap.
+//! workspace and translates **plain whiteouts** (char device `0:0` → a real
+//! delete of the lower entry). It does NOT yet translate **opaque directories**
+//! (`trusted.overlay.opaque` — set when a dir is replaced wholesale, e.g.
+//! `rm -rf d && mkdir d && touch d/new`) or `redirect_dir` renames. Rather than
+//! silently leave the lower's stale children behind (an incorrect commit),
+//! promote DETECTS those markers up front and REFUSES — failing closed so the
+//! caller rolls back instead of committing a wrong tree. Translating them (so
+//! such a promote can succeed) is the gap to close before the Linux path is
+//! production-ready; it is a narrower gap than the in-process `OverlayVfs`,
+//! which translated no whiteouts at all.
 //!
 //! # Privilege / runtime validation
-//! This backend is compiled and type-checked on every platform's CI but its
-//! mount path is exercised only on Linux. The macOS development host cannot run
-//! it; see the `#[ignore]`d integration test noted in the crate tests.
+//! This backend compiles only on Linux (`#[cfg(target_os = "linux")]`); its
+//! mount path is exercised only on Linux CI (ubuntu-latest). The macOS
+//! development host neither compiles nor runs it; see the `#[ignore]`d
+//! integration test noted in the crate tests.
 //!
 //! The native `mount(2)` path here does NOT itself create a user namespace, so
 //! it succeeds only when the daemon already holds mount authority for overlayfs
@@ -129,23 +132,12 @@ impl OverlayfsCow {
             return;
         }
         let Some(p) = self.paths.get() else { return };
-        match self.capability.get() {
-            Some(CowCapability::FuseOverlayfs) => {
-                let _ = std::process::Command::new("fusermount")
-                    .arg("-u")
-                    .arg(&p.merged)
-                    .status();
-            },
-            _ => {
-                if let Err(e) = umount(&p.merged) {
-                    tracing::debug!(
-                        merged = %p.merged.display(),
-                        error = %e,
-                        "workspace CoW: overlayfs unmount failed"
-                    );
-                }
-            },
-        }
+        let capability = self
+            .capability
+            .get()
+            .copied()
+            .unwrap_or(CowCapability::Overlayfs);
+        unmount_path(&p.merged, capability);
     }
 }
 
@@ -158,6 +150,13 @@ impl WorkspaceCow for OverlayfsCow {
     }
 
     fn prepare(&self, pristine: &Path) -> io::Result<PreparedWorkspace> {
+        // prepare() must run exactly once per backend. Fail fast on an
+        // accidental repeat before mounting anything; the `set` below is the
+        // authoritative guard that also closes a concurrent race.
+        if self.paths.get().is_some() {
+            return Err(prepared_twice());
+        }
+
         let seq = WORKSPACE_SEQ.fetch_add(1, Ordering::Relaxed);
         let id = format!("{}-{seq}", path_hash(pristine));
         let workspace_dir = self.cow_root.join(&id);
@@ -178,9 +177,16 @@ impl WorkspaceCow for OverlayfsCow {
         };
 
         let capability = self.mount(&paths)?;
+        // Commit the tracked state. If a concurrent prepare() raced past the
+        // guard above and set first, unmount + remove the overlay WE just built
+        // so it does not leak, then report the double-prepare.
+        if self.paths.set(paths.clone()).is_err() {
+            unmount_path(&paths.merged, capability);
+            let _ = std::fs::remove_dir_all(&paths.workspace_dir);
+            return Err(prepared_twice());
+        }
         self.mounted.store(true, Ordering::SeqCst);
         let _ = self.capability.set(capability);
-        let _ = self.paths.set(paths);
 
         Ok(PreparedWorkspace {
             merged_path: merged,
@@ -194,6 +200,12 @@ impl WorkspaceCow for OverlayfsCow {
 
     fn promote(&self) -> io::Result<()> {
         let p = self.paths()?;
+        // Fail closed: refuse to promote an upper that contains an opaque or
+        // redirect directory. `copy_upper_into_lower` cannot yet translate those
+        // into deletes of the shadowed lower entries, so committing anyway would
+        // silently leave stale lower children in place (an incorrect tree). The
+        // caller rolls back instead of committing a wrong tree.
+        ensure_no_opaque_markers(&p.upper)?;
         copy_upper_into_lower(&p.upper, &p.pristine)?;
         tracing::info!(
             pristine = %p.pristine.display(),
@@ -246,10 +258,13 @@ impl Drop for OverlayfsCow {
 /// Recursively copy `upper` into `lower`, translating plain overlayfs whiteouts
 /// (char device `0:0`) into deletes of the corresponding `lower` entry.
 ///
-/// TODO (Linux production-readiness): this does NOT handle opaque directories
-/// (`trusted.overlay.opaque`) or `redirect_dir`, so a wholesale directory
-/// replacement in the upper leaves the lower's stale children in place. Closing
-/// that needs reading the overlay xattrs per directory.
+/// This does NOT translate opaque directories (`trusted.overlay.opaque`) or
+/// `redirect_dir` — a wholesale directory replacement in the upper would leave
+/// the lower's stale children in place. [`OverlayfsCow::promote`] guards against
+/// that by refusing an upper that carries those markers
+/// ([`ensure_no_opaque_markers`]), so this function is only ever reached for the
+/// translatable cases. Making it TRANSLATE them (rather than the caller refusing)
+/// is the Linux production-readiness follow-up.
 fn copy_upper_into_lower(upper: &Path, lower: &Path) -> io::Result<()> {
     for entry in std::fs::read_dir(upper)? {
         let entry = entry?;
@@ -260,26 +275,59 @@ fn copy_upper_into_lower(upper: &Path, lower: &Path) -> io::Result<()> {
 
         // Whiteout: a char device with rdev 0:0 marks a deleted path.
         if ft.is_char_device() && meta.rdev() == 0 {
-            if dst.exists() || std::fs::symlink_metadata(&dst).is_ok() {
+            if dst_symlink_metadata(&dst)?.is_some() {
                 remove_any(&dst)?;
             }
             continue;
         }
 
         if ft.is_dir() {
+            // A file or symlink already occupying `dst` must go before it can
+            // become a directory (`create_dir_all` would fail on it).
+            if let Some(dmeta) = dst_symlink_metadata(&dst)?
+                && !dmeta.is_dir()
+            {
+                remove_any(&dst)?;
+            }
             std::fs::create_dir_all(&dst)?;
             copy_upper_into_lower(&src, &dst)?;
         } else if ft.is_symlink() {
             let target = std::fs::read_link(&src)?;
-            if dst.exists() || std::fs::symlink_metadata(&dst).is_ok() {
+            if dst_symlink_metadata(&dst)?.is_some() {
                 remove_any(&dst)?;
             }
             std::os::unix::fs::symlink(target, &dst)?;
         } else {
+            // Replace a directory or symlink at `dst` first: `fs::copy` would
+            // fail on a directory, and on a symlink it would FOLLOW the link and
+            // overwrite its target (possibly outside the workspace) instead of
+            // replacing the link. An existing regular file it may overwrite.
+            if let Some(dmeta) = dst_symlink_metadata(&dst)?
+                && (dmeta.is_dir() || dmeta.file_type().is_symlink())
+            {
+                remove_any(&dst)?;
+            }
             std::fs::copy(&src, &dst)?;
         }
     }
     Ok(())
+}
+
+/// `symlink_metadata` for a copy destination, distinguishing "absent" from a
+/// real I/O error. `Ok(None)` = the path does not exist (or the platform cannot
+/// stat it, e.g. wasm `Unsupported`); `Ok(Some(meta))` = the existing entry (NOT
+/// following symlinks); any other error propagates rather than being silently
+/// treated as absent.
+fn dst_symlink_metadata(dst: &Path) -> io::Result<Option<std::fs::Metadata>> {
+    match std::fs::symlink_metadata(dst) {
+        Ok(meta) => Ok(Some(meta)),
+        Err(ref e)
+            if e.kind() == io::ErrorKind::NotFound || e.kind() == io::ErrorKind::Unsupported =>
+        {
+            Ok(None)
+        },
+        Err(e) => Err(e),
+    }
 }
 
 /// Remove a path whether it is a file, symlink, or directory.
@@ -289,6 +337,99 @@ fn remove_any(path: &Path) -> io::Result<()> {
         std::fs::remove_dir_all(path)
     } else {
         std::fs::remove_file(path)
+    }
+}
+
+/// Unmount a specific merged mountpoint with the mechanism that mounted it.
+/// Shared by [`OverlayfsCow::unmount`] and the race-loser cleanup in
+/// [`OverlayfsCow::prepare`], which must unmount ITS OWN overlay rather than the
+/// winner's tracked one.
+fn unmount_path(merged: &Path, capability: CowCapability) {
+    match capability {
+        CowCapability::FuseOverlayfs => {
+            let _ = std::process::Command::new("fusermount")
+                .arg("-u")
+                .arg(merged)
+                .status();
+        },
+        _ => {
+            if let Err(e) = umount(merged) {
+                tracing::debug!(
+                    merged = %merged.display(),
+                    error = %e,
+                    "workspace CoW: overlayfs unmount failed"
+                );
+            }
+        },
+    }
+}
+
+/// The error [`OverlayfsCow::prepare`] returns when called more than once on the
+/// same backend — an accidental repeat (caught by the fast `paths.get()` check)
+/// or a lost race with a concurrent call (caught by the `paths.set()` result).
+fn prepared_twice() -> io::Error {
+    io::Error::other("overlayfs workspace CoW: prepare() called more than once on the same backend")
+}
+
+/// overlayfs / fuse-overlayfs "this directory was replaced or renamed wholesale"
+/// markers. Native kernel overlayfs stores them as `trusted.overlay.*` xattrs;
+/// `fuse-overlayfs` uses the `user.fuseoverlayfs.*` namespace.
+const OPAQUE_MARKER_XATTRS: [&str; 4] = [
+    "trusted.overlay.opaque",
+    "trusted.overlay.redirect",
+    "user.fuseoverlayfs.opaque",
+    "user.fuseoverlayfs.redirect",
+];
+
+/// Walk `dir` and error if any directory carries an opaque/redirect marker.
+/// [`copy_upper_into_lower`] cannot yet translate those into deletes of the
+/// shadowed lower entries, so [`OverlayfsCow::promote`] refuses rather than
+/// commit a tree with stale lower children. Fails closed: an xattr that exists
+/// but cannot be read (e.g. `EACCES` on a `trusted.*` name) is treated as
+/// present.
+fn ensure_no_opaque_markers(dir: &Path) -> io::Result<()> {
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if !std::fs::symlink_metadata(&path)?.file_type().is_dir() {
+            continue;
+        }
+        for name in OPAQUE_MARKER_XATTRS {
+            if has_xattr(&path, name)? {
+                return Err(io::Error::other(format!(
+                    "workspace CoW: overlayfs upper has an opaque/redirect directory \
+                     ({name} on {}); promoting it would leave stale lower entries. This \
+                     case is not yet supported, so the promote is refused — roll back \
+                     instead of committing an incorrect tree.",
+                    path.display()
+                )));
+            }
+        }
+        ensure_no_opaque_markers(&path)?;
+    }
+    Ok(())
+}
+
+/// Presence check for a single extended attribute via `lgetxattr(2)`.
+/// `Ok(true)` = the attribute exists; `ENODATA`/`ENOTSUP` → `Ok(false)` (no such
+/// marker, or a filesystem without xattrs); any other error propagates so the
+/// caller fails closed.
+fn has_xattr(path: &Path, name: &str) -> io::Result<bool> {
+    let path_c = CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "xattr path has NUL"))?;
+    let name_c = CString::new(name)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "xattr name has NUL"))?;
+    // SAFETY: both C strings are NUL-terminated and outlive the call; a null
+    // value pointer with size 0 asks only for the current value size and writes
+    // nothing. `lgetxattr` does not follow a final symlink.
+    let rc = unsafe { libc::lgetxattr(path_c.as_ptr(), name_c.as_ptr(), std::ptr::null_mut(), 0) };
+    if rc >= 0 {
+        return Ok(true);
+    }
+    let err = io::Error::last_os_error();
+    match err.raw_os_error() {
+        Some(libc::ENODATA | libc::ENOTSUP) => Ok(false),
+        _ => Err(err),
     }
 }
 

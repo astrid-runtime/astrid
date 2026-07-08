@@ -204,10 +204,10 @@ impl SandboxCommand {
     /// upper/work directories (Linux `overlayfs`) or the pristine workspace
     /// (macOS APFS). Masking them is SECURITY-CRITICAL: a child that wrote them
     /// directly would smuggle changes past the workspace promote/rollback gate.
-    /// See [`astrid_vfs::workspace_cow`](../../../astrid_vfs/workspace_cow/index.html).
-    /// They are masked with the same mechanism as the built-in set (empty
-    /// `--tmpfs` / `/dev/null` ro-bind on Linux, Seatbelt deny on macOS); pass
-    /// only existing paths (see [`push_mask_arg`](Self::push_mask_arg)).
+    /// See the `astrid_vfs::workspace_cow` module. They are masked with the same
+    /// mechanism as the built-in set (empty `--tmpfs` / `/dev/null` ro-bind on
+    /// Linux, Seatbelt deny on macOS). Every path MUST exist: a missing one is a
+    /// wiring bug and fails the spawn closed (see [`push_mask_arg`](Self::push_mask_arg)).
     #[allow(clippy::needless_pass_by_value)] // Moved on the unsupported-OS passthrough arm; borrowed on Linux/macOS.
     pub fn wrap_with_injections(
         inner_cmd: Command,
@@ -223,6 +223,24 @@ impl SandboxCommand {
         for inj in injections {
             let _ = validate_sandbox_str(&inj.source, "injection source")?;
             let _ = validate_sandbox_str(&inj.target, "injection target")?;
+        }
+
+        // Every caller-supplied mask names copy-on-write bookkeeping the child
+        // must not reach (the overlayfs upper/work, or the APFS pristine). A path
+        // that does not exist is a wiring bug, not a no-op: silently skipping it
+        // leaves the child un-denied. The deny is security-critical, so a missing
+        // target fails the spawn closed rather than proceeding without it.
+        for masked in extra_masks {
+            if !masked.exists() {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!(
+                        "workspace CoW mask path does not exist: {} — refusing to spawn \
+                         a child without the intended copy-on-write deny",
+                        masked.display()
+                    ),
+                ));
+            }
         }
 
         #[cfg(target_os = "linux")]
@@ -261,11 +279,10 @@ impl SandboxCommand {
             // Caller-supplied masks (the CoW upper/work dirs). Same mechanism,
             // placed after the worktree/injection binds so they overlay; the
             // CoW dirs live OUTSIDE the worktree, so no writable bind needs to
-            // punch back through.
+            // punch back through. Existence is validated up front (a missing mask
+            // already failed the spawn), so every entry is masked unconditionally.
             for masked in extra_masks {
-                if masked.exists() {
-                    Self::push_mask_arg(&mut bwrap, masked);
-                }
+                Self::push_mask_arg(&mut bwrap, masked);
             }
 
             bwrap
@@ -361,14 +378,13 @@ impl SandboxCommand {
 
         #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         {
-            // No sandbox here, so there is nothing to mask.
-            let _ = extra_masks;
-            // Without an OS-level sandbox there is no mechanism to enforce the
-            // read-only guarantee; refuse rather than expose writable bytes.
-            if !injections.is_empty() {
+            // Without an OS-level sandbox neither the read-only injection
+            // guarantee nor a copy-on-write mask can be enforced; refuse rather
+            // than run a child without the intended deny (fail-secure).
+            if !injections.is_empty() || !extra_masks.is_empty() {
                 return Err(io::Error::other(
-                    "read-only file injection requires an OS sandbox \
-                     (bwrap/Seatbelt); unavailable on this platform",
+                    "read-only file injection / copy-on-write masking requires an OS \
+                     sandbox (bwrap/Seatbelt); unavailable on this platform",
                 ));
             }
             tracing::warn!(
