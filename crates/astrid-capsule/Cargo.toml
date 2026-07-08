@@ -70,6 +70,19 @@ astrid-mcp = { workspace = true }
 astrid-vfs = { workspace = true }
 astrid-workspace = { workspace = true }
 bytes = "1"
+# Robust git work-tree discovery (gitoxide). Used only to decide whether a
+# capsule's workspace is git-managed — if so, writes go direct to disk and git
+# is the rollback, so the in-process CoW overlay is skipped (see
+# `workspace_is_git_managed` in the wasm engine). `gix-discover` is the minimal
+# gitoxide crate for this: it finds the enclosing `.git` (correctly handling the
+# `.git` *file* a submodule / linked worktree uses, and filesystem-boundary
+# ceilings) without opening the object database a full `gix::Repository` would.
+# `sha1` and `sha256` (git's two object formats) are both enabled explicitly —
+# gix-discover has no default features, and gix-hash refuses to compile without a
+# hash kind. Both are on so discovery succeeds regardless of a repo's object
+# format; with `sha1` alone, a SHA-256 repo in a detached-HEAD state would be
+# missed and fall back to the CoW overlay.
+gix-discover = { version = "0.53.0", default-features = false, features = ["sha1", "sha256"] }
 notify = "8"
 # `astrid:http@1.1.0` `auto-decompress` toggles gzip/brotli/deflate/zstd per
 # request; those builder methods are feature-gated in reqwest. Enabled here so

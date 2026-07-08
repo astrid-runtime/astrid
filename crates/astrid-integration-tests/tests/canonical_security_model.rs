@@ -888,3 +888,90 @@ mod principal_isolation {
         assert_eq!(bob_bytes, b"BOB", "Bob must read his own overlay bytes");
     }
 }
+
+// ===========================================================================
+// Git-managed workspaces bypass the CoW overlay
+// ---------------------------------------------------------------------------
+// When a workspace is inside a git work tree, capsule writes must land DIRECTLY
+// on the real workspace (git is the rollback) so spawned processes (`cargo`)
+// and the user see them. When it is NOT git-managed, today's overlay keeps
+// writes in a per-capsule tempdir upper until commit. These tests drive the two
+// VFS configurations the load path selects between
+// (`astrid-capsule/src/engine/wasm/mod.rs`); the git-vs-not detection itself
+// (gitoxide `gix_discover::upwards`) is unit-tested in `astrid-capsule`. They
+// mirror `overlay_vfs_isolates_principal_writes` above.
+// ===========================================================================
+mod git_workspace_cow {
+    use astrid_capabilities::DirHandle;
+    use astrid_vfs::{HostVfs, OverlayVfs, Vfs};
+
+    #[tokio::test]
+    async fn git_managed_workspace_writes_land_on_real_disk() {
+        // The git-managed branch backs the workspace VFS with a DIRECT HostVfs
+        // registered at the workspace root — no overlay, no upper tempdir.
+        let workspace = tempfile::tempdir().unwrap();
+        let root = DirHandle::new();
+        let vfs = HostVfs::new();
+        vfs.register_dir(root.clone(), workspace.path().to_path_buf())
+            .await
+            .unwrap();
+
+        let fh = vfs.open(&root, "out.txt", true, true).await.unwrap();
+        vfs.write(&fh, b"DIRECT").await.unwrap();
+        vfs.close(&fh).await.unwrap();
+
+        // The write is visible on real disk at workspace_root/<file>
+        // immediately — no commit step, exactly what `cargo` and the user see.
+        let on_disk = workspace.path().join("out.txt");
+        assert!(
+            on_disk.exists(),
+            "git-managed write must land at workspace_root/out.txt on real disk"
+        );
+        assert_eq!(std::fs::read(&on_disk).unwrap(), b"DIRECT");
+    }
+
+    #[tokio::test]
+    async fn non_git_workspace_writes_stay_in_overlay_until_commit() {
+        let workspace = tempfile::tempdir().unwrap();
+
+        // The non-git branch keeps today's OverlayVfs: lower = real workspace,
+        // upper = a per-capsule tempdir.
+        let root = DirHandle::new();
+        let lower = HostVfs::new();
+        lower
+            .register_dir(root.clone(), workspace.path().to_path_buf())
+            .await
+            .unwrap();
+        let upper_dir = tempfile::tempdir().unwrap();
+        let upper = HostVfs::new();
+        upper
+            .register_dir(root.clone(), upper_dir.path().to_path_buf())
+            .await
+            .unwrap();
+        let overlay = OverlayVfs::new(Box::new(lower), Box::new(upper));
+
+        let fh = overlay.open(&root, "out.txt", true, true).await.unwrap();
+        overlay.write(&fh, b"OVERLAY").await.unwrap();
+        overlay.close(&fh).await.unwrap();
+
+        // The write is diverted into the upper tempdir — NOT visible at the
+        // real workspace root until an explicit commit.
+        let on_disk = workspace.path().join("out.txt");
+        assert!(
+            !on_disk.exists(),
+            "non-git overlay write must NOT be visible at workspace_root before commit"
+        );
+        assert!(
+            upper_dir.path().join("out.txt").exists(),
+            "non-git overlay write must land in the upper tempdir"
+        );
+
+        // Commit reconciles the upper into the real workspace.
+        overlay.commit(&root).await.unwrap();
+        assert!(
+            on_disk.exists(),
+            "committing the overlay must publish the write to workspace_root"
+        );
+        assert_eq!(std::fs::read(&on_disk).unwrap(), b"OVERLAY");
+    }
+}
