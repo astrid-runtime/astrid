@@ -28,6 +28,40 @@ async fn append_test_entries(
     ids
 }
 
+/// Regression: `AuditLog::close` releases the persistent surrealkv `LOCK` so
+/// the same directory can be re-opened afterwards.
+///
+/// Without the close (the pre-fix behaviour), the first `AuditLog` handle holds
+/// the exclusive `LOCK` for its whole lifetime — only released on process death
+/// — so a second open of the same path while the first is still alive fails
+/// with `Database ... LOCK is already locked`. This is the mechanism that left
+/// a terminating daemon holding the audit lock until `SIGKILL`. Closing first
+/// must let the re-open succeed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn close_releases_lock_so_same_dir_reopens() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("audit-db");
+    let keypair = Arc::new(KeyPair::generate());
+
+    // Sanity: while a handle is open and NOT closed, a second open of the same
+    // path is rejected — this is the lock the fix must release.
+    let log = AuditLog::open(&path, Arc::clone(&keypair)).expect("first open succeeds");
+    append_test_entries(&log, &SessionId::new(), 2).await;
+    assert!(
+        AuditLog::open(&path, Arc::clone(&keypair)).is_err(),
+        "a still-open persistent audit log must hold the surrealkv LOCK"
+    );
+
+    // After an explicit close the LOCK is released, so a fresh handle opens.
+    log.close()
+        .await
+        .expect("close releases the surrealkv LOCK");
+    let reopened =
+        AuditLog::open(&path, keypair).expect("re-open after close must succeed (lock released)");
+    // The re-opened handle is usable (chain head resolves from storage).
+    assert_eq!(reopened.count().await.unwrap(), 2);
+}
+
 #[tokio::test]
 async fn test_append_and_retrieve() {
     let keypair = KeyPair::generate();

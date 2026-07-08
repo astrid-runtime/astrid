@@ -123,10 +123,10 @@ pub struct Kernel {
     /// The natively bound Unix Socket for the CLI proxy.
     pub cli_socket_listener: Option<astrid_capsule::context::UplinkListener>,
     /// Exclusive advisory lock enforcing a single kernel instance, held for
-    /// the daemon's lifetime (see [`socket::bind_session_socket`]). `None` for
-    /// test kernels that don't bind a real socket. Never read — the point is
-    /// that its `Drop` (or process exit) releases the lock so a restart isn't
-    /// wedged.
+    /// the daemon's lifetime (see [`socket::acquire_boot_singleton_lock`],
+    /// acquired before the KV/audit stores open). `None` for test kernels that
+    /// don't bind a real socket. Never read — the point is that its `Drop` (or
+    /// process exit) releases the lock so a restart isn't wedged.
     #[expect(
         dead_code,
         reason = "held for the process lifetime; Drop releases the singleton flock"
@@ -383,6 +383,15 @@ impl Kernel {
             ))
         })?;
 
+        // Acquire the singleton advisory lock as the FIRST fallible boot step —
+        // BEFORE opening any shared state store. A boot-race loser then fails
+        // here with the actionable "already running (singleton lock held)"
+        // error and never opens (or even touches) the shared surrealkv KV /
+        // audit stores, rather than dying on a raw `LOCK is already locked` from
+        // the store layer after having opened one. The listener bind below does
+        // NOT re-acquire the lock — it is already held for the process lifetime.
+        let singleton_lock = socket::acquire_boot_singleton_lock(&home)?;
+
         // Open the persistent KV store (needed by the capability store).
         let kv_path = home.state_db_path();
         let kv: Arc<dyn astrid_storage::KvStore> = Arc::new(
@@ -402,11 +411,11 @@ impl Kernel {
         let runtime_key = Arc::new(load_or_generate_runtime_key(&home.keys_dir())?);
         let audit_log = open_audit_log(&home, Arc::clone(&runtime_key)).await?;
 
-        // Bind the secure Unix socket and generate the session token. The
+        // Bind the secure Unix socket (the singleton lock is already held). The
         // socket is bound here, but not yet listened on. The token is generated
         // before any capsule can accept connections, preventing a race where a
         // client connects before the token file exists.
-        let (listener, singleton_lock) = socket::bind_session_socket(&home)?;
+        let listener = socket::bind_listener(&home)?;
         // Record our PID immediately after acquiring the singleton lock, so the
         // PID on disk always belongs to the process that holds the state-db
         // lock. The CLI reads this to signal a wedged daemon that is no longer
@@ -935,6 +944,14 @@ impl Kernel {
     /// requester's hash, capture only the views pointing at it, tear that runtime
     /// down, then reload it from its own source and re-attach exactly those views.
     ///
+    /// Returns [`RestartOutcome::Clean`] when the old runtime was fully unloaded
+    /// before the fresh instance loaded, or [`RestartOutcome::OldInstanceLingering`]
+    /// when a still-held `Arc` clone (e.g. a live dispatcher consumer) blocked
+    /// the exclusive `unload` — the old run-loop/subprocess are cooperatively
+    /// cancelled regardless (no CPU/process leak), but the health monitor must
+    /// keep the restart tracker so its retry cap engages instead of thrashing a
+    /// persistently-failing capsule every ~10s.
+    ///
     /// # Errors
     ///
     /// Returns an error if the capsule has no source directory, cannot be
@@ -944,7 +961,7 @@ impl Kernel {
         &self,
         id: &astrid_capsule_types::CapsuleId,
         principal: &PrincipalId,
-    ) -> Result<(), anyhow::Error> {
+    ) -> Result<RestartOutcome, anyhow::Error> {
         // Capture the failed runtime's own source directory AND every principal
         // viewing THAT hash before we tear it down. The requesting `principal` is
         // restored first so its `handle_lifecycle_restart` fires below.
@@ -1003,7 +1020,21 @@ impl Kernel {
         // Explicitly unload the torn-down runtime (there is no async Drop, so we
         // must do it here to avoid leaking MCP subprocesses and engine
         // resources). `Arc::get_mut` requires exclusive ownership.
+        //
+        // A restart with NO torn-down runtime (a concurrent unload already
+        // released it) is Clean by definition — there is no old instance left
+        // to leak.
+        let mut outcome = RestartOutcome::Clean;
         if let Some(mut old) = torn_down_runtime {
+            // Cooperatively stop the old instance FIRST, without needing
+            // exclusive ownership. `request_cancel` cancels the instance
+            // cancel-token, which (a) unblocks in-flight blocking host calls so
+            // their dispatcher-task `Arc` clones drop, (b) stops the run-loop
+            // task — its `select!` on the same token preempts even a compute-
+            // bound guest now that exempt run-loops cooperatively yield every
+            // epoch window (Fix 5) — and (c) wakes the host-process reaper,
+            // which reaps subprocesses. So the old run-loop/subprocess are gone
+            // even when the exclusive `unload` below cannot run.
             old.request_cancel();
             let mut unloaded = false;
             for retry in 0..20_u32 {
@@ -1023,10 +1054,22 @@ impl Kernel {
                 }
             }
             if !unloaded {
+                // Exclusive unload was blocked by a still-held `Arc` clone. The
+                // run-loop/subprocess were already cooperatively cancelled
+                // above, so this is not a CPU/process leak — the engine's
+                // epoch-ticker/pool memory is reclaimed when the last clone
+                // (e.g. an idle-evicting dispatcher consumer) drops. But the
+                // restart is NOT clean: report it so the health monitor keeps
+                // the retry tracker and its cap engages, instead of a
+                // persistently-failing capsule thrashing a fresh reload every
+                // ~10s forever.
+                outcome = RestartOutcome::OldInstanceLingering;
                 tracing::warn!(
                     capsule_id = %id,
                     strong_count = std::sync::Arc::strong_count(&old),
-                    "Cannot call unload during restart - Arc still held by in-flight task"
+                    "Old capsule instance not exclusively unloaded during restart \
+                     (Arc still held); run-loop/subprocess were cancelled, memory \
+                     reclaims when the last clone drops. Restart tracker retained."
                 );
             }
         }
@@ -1062,7 +1105,7 @@ impl Kernel {
             );
         }
 
-        Ok(())
+        Ok(outcome)
     }
 
     /// Auto-discover and load the default principal's boot-critical view.
@@ -1816,6 +1859,15 @@ impl Kernel {
             tracing::warn!(error = %e, "Failed to flush KV store during shutdown");
         }
 
+        // 3b. Flush and close the audit log so its surrealkv `LOCK` is released
+        // on graceful shutdown, not just on process death. Without this the
+        // audit lock outlived a terminating daemon — the wedge that forced a
+        // `SIGKILL` (which then raced the next boot on the still-held lock).
+        // Closes through the shared `Arc<AuditLog>` (no `&mut` needed).
+        if let Err(e) = self.audit_log.close().await {
+            tracing::warn!(error = %e, "Failed to close audit log during shutdown");
+        }
+
         // 4. Remove the socket and token files so stale-socket detection works
         // on next boot and the auth token doesn't persist on disk after shutdown.
         // This runs AFTER capsule unload, which is the correct order: MCP child
@@ -2355,9 +2407,45 @@ impl RestartTracker {
     }
 }
 
+/// Whether [`Kernel::restart_capsule`] fully tore the old instance down.
+///
+/// A restart reloads a fresh instance either way; this reports what happened to
+/// the OLD one so the health monitor knows whether to reset the retry budget.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+enum RestartOutcome {
+    /// The old runtime was exclusively unloaded before the fresh instance
+    /// loaded — a genuinely clean restart. The tracker may be cleared.
+    Clean,
+    /// The old runtime's exclusive `unload` was skipped because an `Arc` clone
+    /// (e.g. a live dispatcher consumer) was still held. Its run-loop and
+    /// subprocesses were cooperatively cancelled — no CPU/process leak — and
+    /// its memory reclaims when the last clone drops, but the restart is not
+    /// clean: the tracker must be retained so the retry cap engages.
+    OldInstanceLingering,
+}
+
+/// Whether a completed restart should CLEAR the retry tracker (grant a fresh
+/// budget on the next failure).
+///
+/// Only a genuinely [`Clean`](RestartOutcome::Clean) restart clears it. A
+/// [`lingering`](RestartOutcome::OldInstanceLingering) restart RETAINS the
+/// tracker so its attempts keep accumulating toward the cap — otherwise a
+/// capsule that reloads then re-fails every tick would reset its budget each
+/// time and thrash a fresh reload forever, leaking a lingering old instance
+/// each round. This is the decision the health monitor uses to prune trackers.
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+const fn restart_outcome_clears_tracker(outcome: RestartOutcome) -> bool {
+    matches!(outcome, RestartOutcome::Clean)
+}
+
 /// Attempts to restart a failed capsule, respecting backoff and max retries.
 ///
-/// Returns `true` if the tracker should be removed (successful restart).
+/// Returns `true` (remove the tracker — a fresh budget next time) ONLY on a
+/// genuinely-clean restart ([`RestartOutcome::Clean`]). A lingering-old-instance
+/// restart or an error returns `false` so the tracker is retained and its
+/// 5-attempt cap engages — otherwise a capsule that reloads-then-re-fails would
+/// reset its budget every tick and thrash forever.
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 async fn attempt_capsule_restart(
     kernel: &Kernel,
@@ -2391,14 +2479,41 @@ async fn attempt_capsule_restart(
 
     let capsule_id = astrid_capsule_types::CapsuleId::from_static(id_str);
     match kernel.restart_capsule(&capsule_id, principal).await {
-        Ok(()) => {
-            tracing::info!(
-                capsule_id = %id_str,
-                principal = %principal,
-                attempt,
-                "Capsule restarted successfully"
-            );
-            true
+        Ok(outcome) => {
+            match outcome {
+                RestartOutcome::Clean => {
+                    tracing::info!(
+                        capsule_id = %id_str,
+                        principal = %principal,
+                        attempt,
+                        "Capsule restarted successfully"
+                    );
+                },
+                RestartOutcome::OldInstanceLingering => {
+                    // The fresh instance loaded, but the old one could not be
+                    // exclusively unloaded (an Arc clone was still held). Its
+                    // run-loop/subprocess were cancelled, so this is not a leak
+                    // — but the tracker is retained (see
+                    // `restart_outcome_clears_tracker`) so repeated lingering
+                    // restarts count against the retry cap and a persistently-
+                    // failing capsule stops thrashing every ~10s.
+                    tracing::warn!(
+                        capsule_id = %id_str,
+                        principal = %principal,
+                        attempt,
+                        "Capsule reloaded but old instance lingered (Arc still held); \
+                         retry tracker retained so the cap engages"
+                    );
+                    if tracker.exhausted() {
+                        tracing::error!(
+                            capsule_id = %id_str,
+                            principal = %principal,
+                            "All restart attempts exhausted - capsule will remain down"
+                        );
+                    }
+                },
+            }
+            restart_outcome_clears_tracker(outcome)
         },
         Err(e) => {
             tracing::error!(
@@ -3889,6 +4004,69 @@ mod tests {
             .checked_sub(RestartTracker::MAX_BACKOFF)
             .unwrap();
         assert!(!tracker.should_restart());
+    }
+
+    #[test]
+    fn only_a_clean_restart_clears_the_retry_tracker() {
+        // The health monitor prunes a capsule's restart tracker only when the
+        // restart was genuinely clean. A lingering restart (old instance's
+        // exclusive unload skipped because an Arc clone was held) must RETAIN
+        // the tracker so its attempts accumulate toward the cap.
+        assert!(restart_outcome_clears_tracker(RestartOutcome::Clean));
+        assert!(!restart_outcome_clears_tracker(
+            RestartOutcome::OldInstanceLingering
+        ));
+    }
+
+    #[test]
+    fn lingering_restarts_engage_the_retry_cap_instead_of_thrashing() {
+        // Regression for the restart-leak/thrash bug: a capsule that keeps
+        // failing health while a dispatcher consumer holds an Arc clone always
+        // restarts "lingering" (old instance not exclusively unloaded). The fix
+        // RETAINS the tracker on a lingering restart, so attempts accumulate and
+        // the 5-attempt cap engages — the capsule stops re-loading every ~10s.
+        //
+        // Pre-fix, every restart reported success and the tracker was CLEARED,
+        // resetting attempts to 0 each tick so the cap NEVER engaged (infinite
+        // thrash, leaking a lingering old instance each round). Drive the exact
+        // remove-or-retain decision (`restart_outcome_clears_tracker`) the
+        // monitor uses.
+        use std::collections::HashMap;
+        const KEY: &str = "cap\0hash";
+
+        fn run_until_cap(outcome: RestartOutcome, ticks: u32) -> u32 {
+            let mut trackers: HashMap<&str, RestartTracker> = HashMap::new();
+            let mut restarts = 0;
+            for _ in 0..ticks {
+                let tracker = trackers.entry(KEY).or_insert_with(RestartTracker::new);
+                if tracker.exhausted() {
+                    break; // cap engaged — no more thrashing.
+                }
+                tracker.record_attempt();
+                restarts += 1;
+                if restart_outcome_clears_tracker(outcome) {
+                    trackers.remove(KEY);
+                }
+            }
+            restarts
+        }
+
+        // Always-lingering: attempts accumulate on ONE retained tracker and the
+        // cap engages at exactly MAX_ATTEMPTS.
+        assert_eq!(
+            run_until_cap(RestartOutcome::OldInstanceLingering, 100),
+            RestartTracker::MAX_ATTEMPTS,
+            "lingering restarts must stop at the retry cap, not thrash forever"
+        );
+
+        // Always-clean: the tracker is cleared each tick, so a healthy capsule
+        // that keeps recovering legitimately never exhausts its budget — the cap
+        // is reserved for capsules that cannot be cleanly restarted.
+        assert!(
+            run_until_cap(RestartOutcome::Clean, RestartTracker::MAX_ATTEMPTS + 3)
+                > RestartTracker::MAX_ATTEMPTS,
+            "clean restarts must not exhaust the cap (healthy recovery keeps a fresh budget)"
+        );
     }
 
     // ── Bootstrap admin-group seeding (issue #670) ───────────────────

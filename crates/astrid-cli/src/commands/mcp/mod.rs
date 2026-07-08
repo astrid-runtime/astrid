@@ -36,6 +36,7 @@
 mod elicit;
 mod grant;
 mod ingress;
+mod parent_death;
 mod server;
 mod watch;
 
@@ -83,8 +84,8 @@ fn require_authenticated_unless_anonymous(
     );
 }
 
-/// Run the MCP stdio server until the client closes stdin (EOF) or the
-/// process is signalled.
+/// Run the MCP stdio server until the client closes stdin (EOF), its launching
+/// session dies (parent-death reaping), or the process is signalled.
 ///
 /// `principal` is the `--principal` flag value; when absent it falls
 /// back to the active CLI agent context (or the `default` principal).
@@ -158,13 +159,26 @@ pub(crate) async fn serve(principal: Option<&str>) -> Result<ExitCode> {
     let peer = running.peer().clone();
     tokio::spawn(watch::run(peer, caller.to_string()));
 
-    let quit_reason = running
-        .waiting()
-        .await
-        .context("MCP stdio transport terminated abnormally")?;
-
-    info!(?quit_reason, "astrid mcp serve: MCP transport closed");
-    Ok(ExitCode::SUCCESS)
+    // Race the normal stdin-EOF quit against parent-death. `waiting()` only
+    // returns when the client closes stdin; an MCP client that DIES without
+    // closing stdin would otherwise leave this shim blocked forever, an orphan
+    // pinning >=2 daemon uplinks (observed: a 4-day orphan). When the launching
+    // session dies we drop `running` so the transport closes and those uplinks
+    // are freed.
+    tokio::select! {
+        biased;
+        () = parent_death::wait_for_parent_death() => {
+            info!("astrid mcp serve: launching session ended (reparented); closing MCP bridge");
+            // `running` (moved into the losing `waiting()` future) is dropped
+            // here → transport closes → daemon uplinks freed.
+            Ok(ExitCode::SUCCESS)
+        }
+        quit = running.waiting() => {
+            let quit_reason = quit.context("MCP stdio transport terminated abnormally")?;
+            info!(?quit_reason, "astrid mcp serve: MCP transport closed");
+            Ok(ExitCode::SUCCESS)
+        }
+    }
 }
 
 #[cfg(test)]

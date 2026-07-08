@@ -24,30 +24,15 @@ const MAX_SOCKET_PATH_LEN: usize = 104;
 #[cfg(not(any(target_os = "macos", target_os = "freebsd", target_os = "openbsd")))]
 const MAX_SOCKET_PATH_LEN: usize = 108;
 
-/// Binds a local Unix Domain Socket for the OS and acquires the singleton lock.
-/// Returns the bound listener (for the WASM execution context) plus the lock
-/// file, which the caller MUST keep alive for the process lifetime.
+/// Create the daemon run directory (the parent of the socket and lockfile)
+/// with `0o700` perms.
 ///
-/// Takes the already-resolved [`AstridHome`](astrid_core::dirs::AstridHome) so
-/// the path is resolved exactly once, by the caller. There is intentionally no
-/// `/tmp` fallback: the caller resolves `ASTRID_HOME` strictly and a daemon
-/// that can't resolve it refuses to boot, rather than binding a divergent
-/// `/tmp` path and running side by side with another instance (split-brain).
-///
-/// # Errors
-/// Returns an error if the socket cannot be bound, the path exceeds the
-/// platform's `sun_path` limit, the singleton lock is already held by another
-/// kernel instance, or another kernel is already listening on the socket.
-pub(crate) fn bind_session_socket(
-    home: &astrid_core::dirs::AstridHome,
-) -> Result<(UnixListener, std::fs::File), std::io::Error> {
-    let path = home.socket_path();
-
-    // Create the run directory first — both the lockfile and the socket live
-    // in it. Enforce 0o700: AstridHome::ensure() does this at boot, but if the
-    // directory was just created here it would inherit the process umask
-    // (commonly 0o755, making the socket listable by other users).
-    if let Some(parent) = path.parent() {
+/// `AstridHome::ensure()` does this at boot, but if the directory is created
+/// here it would otherwise inherit the process umask (commonly `0o755`, making
+/// the socket/lockfile listable by other users), so the mode is set
+/// explicitly. Idempotent — safe to call more than once per boot.
+fn ensure_run_dir(socket_path: &std::path::Path) -> Result<(), std::io::Error> {
+    if let Some(parent) = socket_path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| {
             std::io::Error::other(format!(
                 "Failed to create socket parent directory {}: {e}",
@@ -61,15 +46,60 @@ pub(crate) fn bind_session_socket(
             std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))?;
         }
     }
+    Ok(())
+}
 
-    // Singleton guard: hold an exclusive advisory lock on a lockfile next to
-    // the socket for the daemon's lifetime. This closes the connect-probe ->
-    // bind TOCTOU window in `prepare_socket_path` deterministically — a second
-    // daemon fails to acquire the lock and exits before touching the socket.
-    // The OS releases the lock when the process dies, so a crashed daemon
-    // never wedges a restart. The caller MUST keep the returned file alive for
-    // the process lifetime (dropping it releases the lock).
-    let lock = acquire_singleton_lock(&path.with_file_name("system.lock"))?;
+/// Acquire the daemon singleton advisory lock as the FIRST fallible boot step,
+/// before ANY shared state store (KV, audit) is opened.
+///
+/// Returns the lock file, which the caller MUST keep alive for the process
+/// lifetime (dropping it releases the lock). Acquiring the lock ahead of the
+/// store opens means a boot-race loser fails HERE with the actionable "already
+/// running (singleton lock held)" error and never opens — or even touches —
+/// the shared surrealkv stores, instead of dying on a raw
+/// `Database ... LOCK is already locked` from the KV/audit layer after having
+/// opened them. Split from [`bind_listener`] precisely so the lock can be taken
+/// before the stores; the listener bind runs later and does NOT re-acquire it.
+///
+/// Takes the already-resolved [`AstridHome`](astrid_core::dirs::AstridHome) so
+/// the path is resolved exactly once, by the caller. There is intentionally no
+/// `/tmp` fallback: the caller resolves `ASTRID_HOME` strictly and a daemon
+/// that can't resolve it refuses to boot, rather than diverging to a `/tmp`
+/// path and running side by side with another instance (split-brain).
+///
+/// # Errors
+/// Returns an error if the run directory cannot be created or the singleton
+/// lock is already held by another kernel instance.
+pub(crate) fn acquire_boot_singleton_lock(
+    home: &astrid_core::dirs::AstridHome,
+) -> Result<std::fs::File, std::io::Error> {
+    let path = home.socket_path();
+    // Both the lockfile and the socket live in the run directory; create it
+    // before acquiring the lock (the lockfile is opened inside it).
+    ensure_run_dir(&path)?;
+    acquire_singleton_lock(&path.with_file_name("system.lock"))
+}
+
+/// Bind the daemon's Unix listener, assuming the singleton lock is ALREADY held
+/// (via [`acquire_boot_singleton_lock`]).
+///
+/// Returns the bound listener for the WASM execution context. This step only
+/// prepares the socket path (stale-socket / symlink cleanup, live-socket
+/// rejection) and binds — it does NOT touch the singleton lock, which the
+/// caller acquired first so it precedes the KV/audit store opens.
+///
+/// # Errors
+/// Returns an error if the socket cannot be bound, the path exceeds the
+/// platform's `sun_path` limit, or another kernel is already listening on the
+/// socket.
+pub(crate) fn bind_listener(
+    home: &astrid_core::dirs::AstridHome,
+) -> Result<UnixListener, std::io::Error> {
+    let path = home.socket_path();
+
+    // Defensive: the run dir already exists (the lock step created it), but a
+    // second idempotent create keeps this callable independently.
+    ensure_run_dir(&path)?;
 
     prepare_socket_path(&path)?;
 
@@ -77,8 +107,7 @@ pub(crate) fn bind_session_socket(
     // crashes that bypassed graceful shutdown.
     remove_readiness_file();
 
-    let listener = UnixListener::bind(&path)?;
-    Ok((listener, lock))
+    UnixListener::bind(&path)
 }
 
 /// Acquire an exclusive, non-blocking advisory lock on `lock_path`, returning
@@ -86,7 +115,9 @@ pub(crate) fn bind_session_socket(
 /// is alive — the caller stores it for the daemon's lifetime, and the OS
 /// releases it on process exit (so a crash can't wedge a restart). The
 /// lockfile itself is intentionally left in place between runs.
-fn acquire_singleton_lock(lock_path: &std::path::Path) -> Result<std::fs::File, std::io::Error> {
+pub(crate) fn acquire_singleton_lock(
+    lock_path: &std::path::Path,
+) -> Result<std::fs::File, std::io::Error> {
     use std::fs::OpenOptions;
 
     let mut opts = OpenOptions::new();
@@ -150,7 +181,7 @@ pub(crate) fn generate_session_token() -> Result<(SessionToken, PathBuf), std::i
 
 /// Validate a socket path and handle stale/live socket detection.
 ///
-/// Extracted from `bind_session_socket` for testability. Returns `Ok(())`
+/// Extracted from `bind_listener` for testability. Returns `Ok(())`
 /// if the path is safe to bind (stale socket removed or no socket exists).
 /// Returns `Err` if the path is too long or another kernel is listening.
 fn prepare_socket_path(path: &std::path::Path) -> Result<(), std::io::Error> {
@@ -238,7 +269,7 @@ pub fn write_readiness_file() -> Result<(), std::io::Error> {
     let path = readiness_path();
 
     // Ensure the parent directory exists (defense-in-depth for contexts
-    // where bind_session_socket() has not run first).
+    // where bind_listener() has not run first).
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -448,6 +479,38 @@ mod tests {
             err.to_string().contains("already running"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn boot_singleton_lock_precedes_and_blocks_a_second_boot() {
+        // Regression for the boot-order fix: the singleton lock is acquired via
+        // `acquire_boot_singleton_lock` as a standalone FIRST boot step (before
+        // any KV/audit store opens). Acquiring it must create the run dir and,
+        // while held, block a second boot with the actionable "already running"
+        // error — the loser never reaches (or touches) the shared stores.
+        let dir = tempfile::tempdir().unwrap();
+        let home = astrid_core::dirs::AstridHome::from_path(dir.path());
+
+        let first = acquire_boot_singleton_lock(&home).expect("first boot acquires the lock");
+        // The run directory (parent of the socket/lockfile) now exists.
+        assert!(
+            home.socket_path()
+                .parent()
+                .is_some_and(std::path::Path::is_dir),
+            "run dir must be created by the boot lock step"
+        );
+
+        // A racing second boot fails at the lock — before opening any store.
+        let err = acquire_boot_singleton_lock(&home).expect_err("second boot must lose the race");
+        assert!(
+            err.to_string().contains("already running"),
+            "loser must report 'already running (singleton lock held)', got: {err}"
+        );
+
+        // Releasing the lock lets a fresh boot acquire it (no wedged restart).
+        drop(first);
+        let _second = acquire_boot_singleton_lock(&home)
+            .expect("lock is re-acquirable after the holder exits");
     }
 
     #[test]

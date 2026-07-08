@@ -45,7 +45,7 @@
 //!
 //! Unix-socket bind permissions are blocked in some sandboxed
 //! environments (notably the developer-local cargo-sandbox used
-//! here), and the kernel's `bind_session_socket` fails with `EPERM`.
+//! here), and the kernel's `bind_listener` fails with `EPERM`.
 //! Those failures are environmental — the test passes in
 //! unconstrained CI. We detect the bind error and emit a `skipping`
 //! notice rather than claim success or failure.

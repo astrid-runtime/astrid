@@ -484,6 +484,22 @@ impl AuditLog {
         self.storage.flush().await
     }
 
+    /// Flush and close the audit log, releasing the underlying storage lock.
+    ///
+    /// The kernel calls this on graceful shutdown so the persistent surrealkv
+    /// `LOCK` is released on exit rather than only on process death — otherwise
+    /// a wedged/terminating daemon holds the audit lock until `SIGKILL`, and a
+    /// restart races the still-held lock. Callable through the kernel's shared
+    /// `Arc<AuditLog>`: the storage backend closes through its own
+    /// `Arc<dyn KvStore>`, so no exclusive ownership (`&mut self`) is required.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the storage backend fails to close.
+    pub async fn close(&self) -> AuditResult<()> {
+        self.storage.close().await
+    }
+
     /// Get the runtime public key.
     #[must_use]
     pub fn runtime_public_key(&self) -> astrid_crypto::PublicKey {

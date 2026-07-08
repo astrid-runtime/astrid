@@ -754,6 +754,27 @@ pub(crate) fn epoch_decision(
     }
 }
 
+/// Pure epoch-deadline decision for an EXEMPT run-loop.
+///
+/// An exempt run-loop's owner holds an [`EXEMPT_CAPABILITIES`](astrid_core)
+/// capability (`CAP_RESOURCES_UNBOUNDED` / `CAP_NET_BIND` / `CAP_UPLINK`; admin
+/// via `*`), so it is **unbounded CPU** and must NEVER be trapped
+/// (`Interrupt`) or fuel-out. But "unbounded" must not mean "never yields":
+/// before this it was pinned at `epoch_deadline = u64::MAX` with no callback,
+/// so the guest fiber never reached a yield point and enough concurrent exempt
+/// compute pinned every tokio worker — starving the reactor (and the SIGTERM
+/// handler) into a `SIGKILL`-only wedge.
+///
+/// This makes an exempt run-loop **always `Yield`** every window and re-arm —
+/// the exact cooperativeness guarantee a bound run-loop already has, minus the
+/// trap. It can still burn a core, but it can no longer starve the daemon: the
+/// worker is released to the reactor every window. An OS cgroup remains the
+/// backstop for raw CPU burn. Pure so it is unit-testable without wasmtime,
+/// mirroring [`epoch_decision`].
+pub(crate) const fn exempt_epoch_action(window_ticks: u64) -> EpochAction {
+    EpochAction::Yield(window_ticks)
+}
+
 /// Build a minimal `WasiCtx` for capsule sandboxing.
 ///
 /// Only stderr is inherited so capsule panic messages reach the host.
@@ -1713,7 +1734,12 @@ impl ExecutionEngine for WasmEngine {
             // Initial epoch deadline applied to every freshly-instantiated
             // pool Store below. This is a wall-clock placeholder, NOT the
             // bound run-loop CPU mechanism:
-            //  - exempt (incl. exempt run-loops): u64::MAX — never epoch-trapped.
+            //  - exempt: u64::MAX at the pool-load default. For an exempt
+            //    RUN-LOOP this placeholder is REPLACED below with a finite
+            //    yield-always window (`exempt_epoch_action`) so it cooperatively
+            //    yields the worker and can never starve the daemon. Exempt
+            //    interceptor POOL Stores keep u64::MAX here (see the STOP-AND-
+            //    REPORT note on the exempt interceptor epoch path).
             //  - interceptor pool Stores: the existing finite default; the real
             //    per-invocation epoch is re-applied per call in
             //    `invoke_interceptor` (unchanged).
@@ -1863,10 +1889,25 @@ impl ExecutionEngine for WasmEngine {
                     });
                 } else {
                     // EXEMPT run-loop (CAP_RESOURCES_UNBOUNDED / CAP_NET_BIND /
-                    // CAP_UPLINK on the owner principal): unbounded. No epoch
-                    // callback and the deadline pinned to u64::MAX so the
-                    // shared ticker never traps it.
-                    pi.store.set_epoch_deadline(u64::MAX);
+                    // CAP_UPLINK on the owner principal): unbounded CPU — never
+                    // `Interrupt`-trapped, never fuel-out — but it must STILL
+                    // cooperatively yield the tokio worker every window so it
+                    // can no longer starve the daemon/SIGTERM handler (the root
+                    // of the wedge). Same finite-window deadline + epoch
+                    // callback the bound run-loop uses, but with the
+                    // yield-ALWAYS policy from `exempt_epoch_action` (never
+                    // `Interrupt`). `UpdateDeadline::Yield` is async-legal here
+                    // because the run loop drives the guest via `call_async`.
+                    let window_ticks = DEFAULT_RUN_LOOP_WINDOW_TICKS;
+                    pi.store.set_epoch_deadline(window_ticks);
+                    pi.store.epoch_deadline_callback(move |_store_ctx| {
+                        Ok(match exempt_epoch_action(window_ticks) {
+                            EpochAction::Yield(ticks) => wasmtime::UpdateDeadline::Yield(ticks),
+                            // Unreachable: exempt is unbounded, so the policy
+                            // never traps. Mapped for exhaustiveness only.
+                            EpochAction::Interrupt => wasmtime::UpdateDeadline::Interrupt,
+                        })
+                    });
                 }
                 store_arc = Some(Arc::new(AsyncMutex::new(pi.store)));
                 run_instance = Some(pi.instance);
@@ -2078,6 +2119,19 @@ impl ExecutionEngine for WasmEngine {
             let capsule_name = self.manifest.package.name.clone();
             let run_store = Arc::clone(store_arc.as_ref().expect("run-loop has store"));
             let run_inst = run_instance.expect("run-loop has instance");
+            // Clone the instance cancel token so the run loop itself observes
+            // cancellation. `request_cancel()` (callable through a shared `&self`
+            // — no `&mut`/`Arc::get_mut` needed) cancels this token; racing it
+            // against `call_async` guarantees the loop stops even for a compute-
+            // bound guest that never touches a cancellable host call. Dropping
+            // the `call_async` future unwinds the wasmtime fiber (identical to
+            // the `handle.abort()` in `unload`), but here it is reachable while
+            // a dispatcher consumer still holds an `Arc` clone of this capsule —
+            // the mechanism a restart uses to fully tear the OLD instance down
+            // without exclusive ownership. It fires promptly because exempt
+            // run-loops now cooperatively `Yield` every epoch window (Fix 5), so
+            // the fiber reaches a yield point where the `select!` can preempt.
+            let run_cancel = cancel_token.clone();
             // With async wasmtime, `call_async` schedules guest execution
             // on a fiber that yields back to the executor on every host
             // import boundary. The spawned task no longer needs to be a
@@ -2096,12 +2150,23 @@ impl ExecutionEngine for WasmEngine {
                         return;
                     },
                 };
-                if let Err(e) = typed.call_async(&mut *s, ()).await {
-                    tracing::error!(
-                        capsule = %capsule_name,
-                        error = %e,
-                        "WASM background loop failed"
-                    );
+                tokio::select! {
+                    biased;
+                    () = run_cancel.cancelled() => {
+                        tracing::info!(
+                            capsule = %capsule_name,
+                            "WASM background loop stopped (cancellation requested)"
+                        );
+                    }
+                    result = typed.call_async(&mut *s, ()) => {
+                        if let Err(e) = result {
+                            tracing::error!(
+                                capsule = %capsule_name,
+                                error = %e,
+                                "WASM background loop failed"
+                            );
+                        }
+                    }
                 }
             }));
             // The run loop owns the Store via `run_store`; `self.pool` stays
@@ -3698,6 +3763,21 @@ mod tests {
         let (action, _, windows) = epoch_decision(false, u32::MAX, 10, MAX_NO_YIELD_WINDOWS);
         assert_eq!(action, EpochAction::Interrupt);
         assert_eq!(windows, u32::MAX);
+    }
+
+    #[test]
+    fn exempt_epoch_action_always_yields_never_interrupts() {
+        // The exempt run-loop policy is unbounded: it must ALWAYS cooperatively
+        // yield the worker (re-arming by `window_ticks`) and NEVER trap, for any
+        // window value — the guarantee that keeps an exempt capsule from
+        // starving the daemon without ever bounding its CPU.
+        for ticks in [1_u64, 10, 50, DEFAULT_RUN_LOOP_WINDOW_TICKS, u64::MAX] {
+            assert_eq!(
+                exempt_epoch_action(ticks),
+                EpochAction::Yield(ticks),
+                "exempt policy must yield (never interrupt) for window {ticks}"
+            );
+        }
     }
 
     #[test]

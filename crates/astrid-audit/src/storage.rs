@@ -87,6 +87,20 @@ pub(crate) trait AuditStorage: Send + Sync {
     ///
     /// Returns an error if the storage backend fails to flush.
     async fn flush(&self) -> AuditResult<()>;
+
+    /// Flush and close the underlying store, releasing any OS-level file lock
+    /// it holds.
+    ///
+    /// Persistent backends (surrealkv) hold an exclusive `LOCK` on the store
+    /// directory for their whole lifetime; without an explicit close it is
+    /// released only when the process dies. Closing here lets a graceful
+    /// shutdown release it deterministically. Works through `&self` because the
+    /// backend closes through its shared `Arc<dyn KvStore>` handle.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the storage backend fails to close.
+    async fn close(&self) -> AuditResult<()>;
 }
 
 // -- Namespace constants (crate-internal) --
@@ -286,6 +300,16 @@ impl AuditStorage for SurrealKvAuditStorage {
     async fn flush(&self) -> AuditResult<()> {
         // KvStore commits on every set(), no explicit flush needed.
         Ok(())
+    }
+
+    async fn close(&self) -> AuditResult<()> {
+        // Delegates to the shared `Arc<dyn KvStore>`; for surrealkv this closes
+        // the underlying tree and releases its `LOCK`. The in-memory backend's
+        // default `close` is a harmless no-op.
+        self.store
+            .close()
+            .await
+            .map_err(|e| AuditError::StorageError(e.to_string()))
     }
 }
 
