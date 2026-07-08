@@ -360,10 +360,14 @@ fn daemon_fleet_contracts_pin(home: &AstridHome) -> anyhow::Result<Option<String
             );
             continue;
         }
-        // Only a retained blob can source the canonical write.
+        // Only a retained blob can source the canonical write. Clone the pin
+        // into the map only on first sight; a repeated pin bumps in place.
         if store.join(format!("{pin}.wit")).is_file() {
-            let count = counts.entry(pin.clone()).or_insert(0);
-            *count = count.saturating_add(1);
+            if let Some(count) = counts.get_mut(pin.as_str()) {
+                *count = count.saturating_add(1);
+            } else {
+                counts.insert(pin.clone(), 1);
+            }
         }
     }
 
