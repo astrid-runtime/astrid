@@ -270,6 +270,27 @@ pub struct WasmEngine {
     /// snapshotted onto every pooled `HostState` at load. `Default` (the host's
     /// historical constants) in tests.
     http_limits: limits::HttpLimits,
+    /// OS-level copy-on-write backend for a non-git workspace (Fix #2).
+    ///
+    /// Set at load for the non-git branch (`Some(ApfsCow)`/`Some(OverlayfsCow)`,
+    /// or `Some(NoCow)` when the clone/mount failed and it degraded); `None` for
+    /// git-managed workspaces and tests. Held here — not on the pooled
+    /// `HostState` — because promote/rollback/teardown are per-capsule-load
+    /// operations, not per-invocation. [`unload`](WasmEngine::unload) tears it
+    /// down (RAII backstop in the backend's `Drop`); a kernel admin IPC drives
+    /// [`promote_workspace`](WasmEngine::promote_workspace) /
+    /// [`rollback_workspace`](WasmEngine::rollback_workspace).
+    workspace_cow: Option<Arc<dyn astrid_vfs::WorkspaceCow>>,
+    /// Live-process tracker (foreground + background spawns), cloned at load.
+    /// The workspace CoW promote/rollback interlock consults it to REFUSE
+    /// mutating the merged tree while a spawned process may still be running in
+    /// it. `None` in tests / single-tenant paths that never build a process host.
+    process_tracker: Option<Arc<crate::engine::wasm::host::process::ProcessTracker>>,
+    /// Persistent-process registry, cloned at load. Same interlock role as
+    /// [`process_tracker`](Self::process_tracker) for the persistent spawn tier
+    /// (processes that outlive their spawning invocation).
+    persistent_processes:
+        Option<Arc<crate::engine::wasm::host::process::PersistentProcessRegistry>>,
 }
 
 impl WasmEngine {
@@ -323,8 +344,94 @@ impl WasmEngine {
             group_config: None,
             runtime_limits,
             http_limits,
+            workspace_cow: None,
+            process_tracker: None,
+            persistent_processes: None,
         }
     }
+
+    /// Promote/rollback the OS-level copy-on-write workspace behind a QUIESCENCE
+    /// INTERLOCK, so the merged tree is never swapped/deleted under a running
+    /// invocation or spawned child (which would corrupt or destroy its work —
+    /// e.g. a `cargo` with `cwd == merged`). Returns `Ok(false)` when there is
+    /// no copy-on-write workspace (git-managed / No-CoW). Backend-agnostic, so
+    /// it guards the APFS and overlayfs paths alike.
+    async fn commit_workspace(&self, op: CowOp) -> CapsuleResult<bool> {
+        let Some(backend) = self.workspace_cow.clone() else {
+            return Ok(false);
+        };
+
+        // Drain + block interceptor invocations for pooled capsules by grabbing
+        // EVERY permit; held across the mutation so new invocations wait. Refuse
+        // (don't wait) when one is already in flight, so an admin call can't hang
+        // on a long build. A run-loop capsule has no pool — the live-process
+        // check below is then the guard (its run loop is assumed quiescent when
+        // the gate promotes).
+        let _exclusive = match &self.pool {
+            Some(pool) => match pool.try_acquire_exclusive() {
+                Some(guard) => Some(guard),
+                None => {
+                    return Err(CapsuleError::ExecutionFailed(
+                        "workspace commit refused: an invocation is in flight; \
+                         retry when the capsule is idle"
+                            .into(),
+                    ));
+                },
+            },
+            None => None,
+        };
+
+        // Refuse while any spawned child may still be running in the merged tree.
+        // Foreground spawns finished with their (now-drained) invocation above;
+        // this catches background / persistent processes that outlive it.
+        let live_processes = self
+            .process_tracker
+            .as_ref()
+            .is_some_and(|t| t.has_active())
+            || self
+                .persistent_processes
+                .as_ref()
+                .is_some_and(|r| r.total_live() > 0);
+        if live_processes {
+            return Err(CapsuleError::ExecutionFailed(
+                "workspace commit refused: a spawned child process is still running; \
+                 retry when the capsule is idle"
+                    .into(),
+            ));
+        }
+
+        let result = run_workspace_cow_op(backend, op).await;
+        drop(_exclusive); // release the pool once the mutation completes
+        result
+    }
+}
+
+/// Which copy-on-write commit operation to run against a
+/// [`WorkspaceCow`](astrid_vfs::WorkspaceCow) backend.
+#[derive(Clone, Copy)]
+enum CowOp {
+    Promote,
+    Rollback,
+}
+
+/// Run a blocking `WorkspaceCow` promote/rollback off the async runtime
+/// (`spawn_blocking`, since a large promote copies files). The caller
+/// ([`WasmEngine::commit_workspace`]) holds the quiescence interlock. A No-CoW
+/// backend's own promote/rollback returns `Unsupported`, surfaced here as an
+/// `ExecutionFailed` error.
+async fn run_workspace_cow_op(
+    backend: Arc<dyn astrid_vfs::WorkspaceCow>,
+    op: CowOp,
+) -> CapsuleResult<bool> {
+    let result = tokio::task::spawn_blocking(move || match op {
+        CowOp::Promote => backend.promote(),
+        CowOp::Rollback => backend.rollback(),
+    })
+    .await
+    .map_err(|e| CapsuleError::ExecutionFailed(format!("workspace CoW task panicked: {e}")))?;
+    result
+        .map(|()| true)
+        .map_err(|e| CapsuleError::ExecutionFailed(format!("workspace CoW operation failed: {e}")))
 }
 
 /// Build a `wasmtime::Engine` configured for Component Model execution
@@ -1281,6 +1388,12 @@ impl ExecutionEngine for WasmEngine {
             ),
         );
         let persistent_registry_for_reaper = persistent_registry.clone();
+        // Clones held on the engine so the workspace-CoW promote/rollback
+        // interlock can refuse mutating the merged tree while a live child
+        // process may still be running in it. Cloned BEFORE the `make_state`
+        // move closure captures the originals.
+        let process_tracker_for_engine = process_tracker.clone();
+        let persistent_registry_for_engine = persistent_registry.clone();
         // Shared peak-memory ledger, cloned into every pooled `HostState`'s
         // `StoreMemoryMeter` so a principal's high-water linear memory sums
         // cross-capsule (the RAM analogue of the fuel ledger).
@@ -1292,7 +1405,18 @@ impl ExecutionEngine for WasmEngine {
         // `register_dir` calls. Component-model async lets us `.await`
         // those directly here, so the load path no longer pins a worker
         // for the duration of the engine build.
-        let (pool_opt, store_arc, run_instance, rx, has_run, ready_rx, wt_engine) = async {
+        let (
+            pool_opt,
+            store_arc,
+            run_instance,
+            rx,
+            has_run,
+            ready_rx,
+            wt_engine,
+            workspace_cow_backend,
+            process_tracker_for_engine,
+            persistent_registry_for_engine,
+        ) = async {
             let wasm_bytes = std::fs::read(&wasm_path).map_err(|e| {
                 CapsuleError::UnsupportedEntryPoint(format!("Failed to read WASM: {e}"))
             })?;
@@ -1344,59 +1468,105 @@ impl ExecutionEngine for WasmEngine {
             let root_handle = astrid_capabilities::DirHandle::new();
             let git_managed = workspace_is_git_managed(&workspace_root);
 
-            // Lower layer (the real workspace) is common to both branches.
-            let lower_vfs = astrid_vfs::HostVfs::new();
-            lower_vfs
-                .register_dir(root_handle.clone(), workspace_root.clone())
-                .await
-                .map_err(|e| {
-                    CapsuleError::UnsupportedEntryPoint(format!(
-                        "Failed to register VFS directory: {e}"
-                    ))
-                })?;
-
-            // `workspace_vfs` backs `HostState.vfs`; `overlay_vfs_opt` and
-            // `upper_dir_opt` back the concrete-overlay / upper-tempdir fields
-            // (both `None` for the direct-HostVfs configuration, exactly like
-            // the lifecycle-hook state that also runs on a plain `HostVfs`).
-            let (workspace_vfs, overlay_vfs_opt, upper_dir_opt): (
+            // The workspace VFS, the OS-sandbox writable root, and the fs-host
+            // path-confinement all resolve against ONE path: `effective_workspace_root`.
+            //
+            //   * git-managed → the pristine `workspace_root` itself (Fix #1):
+            //     a direct `HostVfs`, no copy-on-write; git is the rollback.
+            //   * non-git → the copy-on-write `merged_path` (Fix #2): a real
+            //     OS-level CoW clone/mount the fs host AND spawned processes
+            //     share. Writes are live in `merged`; the pristine workspace is
+            //     touched only by an explicit promote. This replaces the old
+            //     in-process `OverlayVfs`, whose upper a spawned `cargo` never
+            //     saw (it read the pristine lower and bypassed the CoW entirely).
+            //
+            // `spawn_mask_paths` are the CoW upper/pristine dirs the OS sandbox
+            // must hide from spawned children so a child cannot write them
+            // directly and bypass promote/rollback. `workspace_cow_backend` is
+            // kept alive on the engine for promote/rollback/teardown.
+            let (
+                workspace_vfs,
+                effective_workspace_root,
+                workspace_cow_backend,
+                spawn_mask_paths,
+            ): (
                 Arc<dyn astrid_vfs::Vfs>,
-                Option<Arc<astrid_vfs::OverlayVfs>>,
-                Option<Arc<tempfile::TempDir>>,
+                PathBuf,
+                Option<Arc<dyn astrid_vfs::WorkspaceCow>>,
+                Vec<PathBuf>,
             ) = if git_managed {
-                tracing::debug!(
-                    capsule = %manifest.package.name,
-                    workspace = %workspace_root.display(),
-                    "git-managed workspace: bypassing CoW overlay, writing directly to \
-                     workspace root (git is the rollback)"
-                );
-                (Arc::new(lower_vfs), None, None)
-            } else {
-                // Upper layer uses a per-capsule temporary directory so writes
-                // are sandboxed until explicitly committed. The TempDir is kept
-                // alive in HostState.upper_dir for the capsule's lifetime.
-                let upper_temp = tempfile::TempDir::new().map_err(|e| {
-                    CapsuleError::UnsupportedEntryPoint(format!(
-                        "Failed to create overlay temp dir: {e}"
-                    ))
-                })?;
-                let upper_vfs = astrid_vfs::HostVfs::new();
-                upper_vfs
-                    .register_dir(root_handle.clone(), upper_temp.path().to_path_buf())
+                let host_vfs = astrid_vfs::HostVfs::new();
+                host_vfs
+                    .register_dir(root_handle.clone(), workspace_root.clone())
                     .await
                     .map_err(|e| {
                         CapsuleError::UnsupportedEntryPoint(format!(
                             "Failed to register VFS directory: {e}"
                         ))
                     })?;
-                let overlay_vfs = Arc::new(astrid_vfs::OverlayVfs::new(
-                    Box::new(lower_vfs),
-                    Box::new(upper_vfs),
-                ));
+                tracing::debug!(
+                    capsule = %manifest.package.name,
+                    workspace = %workspace_root.display(),
+                    "git-managed workspace: bypassing CoW, writing directly to \
+                     workspace root (git is the rollback)"
+                );
                 (
-                    Arc::clone(&overlay_vfs) as Arc<dyn astrid_vfs::Vfs>,
-                    Some(Arc::clone(&overlay_vfs)),
-                    Some(Arc::new(upper_temp)),
+                    Arc::new(host_vfs),
+                    workspace_root.clone(),
+                    None,
+                    Vec::new(),
+                )
+            } else {
+                // Establish the OS-level copy-on-write over the pristine
+                // workspace. Fails CLOSED to No-CoW (direct writes, no
+                // rollback) with a warn if the clone/mount cannot be built —
+                // never a silently faked CoW.
+                //
+                // If the Astrid home (and thus the `~/.astrid/cow` root) can't
+                // be resolved we do NOT fall back to a world-writable temp dir:
+                // `/var/folders`/`/private/tmp` are broadly writable by the OS
+                // sandbox, so a sibling child could reach another workspace's
+                // clone there and smuggle changes past its promote gate. Fail
+                // CLOSED to No-CoW (direct writes on the real workspace, no
+                // clone scattered anywhere) instead.
+                let (backend, prepared) = match astrid_core::dirs::AstridHome::resolve() {
+                    Ok(home) => {
+                        astrid_vfs::prepare_workspace_cow(&home.cow_dir(), &workspace_root)
+                    },
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            workspace = %workspace_root.display(),
+                            "workspace CoW: cannot resolve Astrid home for the CoW root; \
+                             failing closed to No-CoW (writes go direct to the workspace, \
+                             no rollback) rather than cloning into a world-writable temp dir"
+                        );
+                        astrid_vfs::no_cow_workspace(&workspace_root)
+                    },
+                };
+                let merged_root = prepared.merged_path.clone();
+                let host_vfs = astrid_vfs::HostVfs::new();
+                host_vfs
+                    .register_dir(root_handle.clone(), merged_root.clone())
+                    .await
+                    .map_err(|e| {
+                        CapsuleError::UnsupportedEntryPoint(format!(
+                            "Failed to register VFS directory: {e}"
+                        ))
+                    })?;
+                tracing::debug!(
+                    capsule = %manifest.package.name,
+                    workspace = %workspace_root.display(),
+                    merged = %merged_root.display(),
+                    capability = ?backend.capability(),
+                    "non-git workspace: OS-level copy-on-write (fs host + spawned \
+                     processes share the merged tree; promote/rollback is the gate)"
+                );
+                (
+                    Arc::new(host_vfs),
+                    merged_root,
+                    Some(Arc::from(backend)),
+                    prepared.mask_from_children,
                 )
             };
 
@@ -1414,9 +1584,13 @@ impl ExecutionEngine for WasmEngine {
             // this default. Leaving the default `None` makes the gate fail closed
             // for principal-less / load-time contexts instead of authorizing
             // `default`'s files.
+            // The gate confines file I/O to the SAME root the VFS and spawns
+            // use — `effective_workspace_root` (the CoW merged path for non-git,
+            // the pristine workspace for git-managed) — so a write the fs host
+            // makes into `merged` is not rejected as out-of-workspace.
             let security_gate = Arc::new(crate::security::ManifestSecurityGate::new(
                 manifest.clone(),
-                workspace_root.clone(),
+                effective_workspace_root.clone(),
                 None,
             ));
 
@@ -1627,7 +1801,12 @@ impl ExecutionEngine for WasmEngine {
                 // reached only by principal-less / load-time contexts and denies.
                 capsule_log: None,
                 capsule_id: capsule_id_val.clone(),
-                workspace_root: workspace_root.clone(),
+                // The CoW merged path (non-git) or the pristine workspace
+                // (git-managed). This is the sandbox writable root + cwd for
+                // spawned processes AND the fs-host confinement root, so both
+                // see ONE filesystem (see the VFS-branch selection above).
+                workspace_root: effective_workspace_root.clone(),
+                spawn_mask_paths: spawn_mask_paths.clone(),
                 vfs: Arc::clone(&workspace_vfs),
                 vfs_root_handle: root_handle.clone(),
                 home: None,
@@ -1639,8 +1818,6 @@ impl ExecutionEngine for WasmEngine {
                 invocation_profile: None,
                 profile_cache: st_profile_cache.clone(),
                 invocation_env_overlay: None,
-                overlay_vfs: overlay_vfs_opt.clone(),
-                upper_dir: upper_dir_opt.clone(),
                 // Neutral, physically-isolated KV fallback (see the `kv` field
                 // doc). Real per-invocation overlays are built from `kv_backend`.
                 kv: HostState::neutral_kv(),
@@ -1973,6 +2150,9 @@ impl ExecutionEngine for WasmEngine {
                 has_run,
                 ready_rx,
                 wt_engine,
+                workspace_cow_backend,
+                process_tracker_for_engine,
+                persistent_registry_for_engine,
             ))
         }
         .await?;
@@ -2114,6 +2294,13 @@ impl ExecutionEngine for WasmEngine {
         self.profile_cache = ctx.profile_cache.clone();
         self.overlay_registry = ctx.overlay_registry.clone();
         self.owner_principal = Some(ctx.principal.clone());
+        // Keep the OS-level CoW backend alive for promote/rollback and for
+        // teardown on unload (`None` for git-managed workspaces).
+        self.workspace_cow = workspace_cow_backend;
+        // Held for the promote/rollback quiescence interlock (refuse to mutate
+        // the merged tree while a live child process may be running in it).
+        self.process_tracker = Some(process_tracker_for_engine);
+        self.persistent_processes = Some(persistent_registry_for_engine);
         // Cache the live group config handle so the CPU-rate deny gate can
         // resolve the invoking principal's exemption against runtime group
         // mutations. `None` in tests / single-tenant => no exemption resolvable
@@ -2149,7 +2336,22 @@ impl ExecutionEngine for WasmEngine {
         self.pool = None;
         self.wasmtime_engine = None;
         self.ready_rx = None; // Prevent stale channel observation post-unload
+        // Tear down the OS-level CoW working tree (unmount / remove the clone).
+        // Explicit because there is no async Drop for the engine; the backend's
+        // own Drop is a backstop. Uncommitted changes are discarded here — the
+        // gate promotes before unload if they were approved.
+        if let Some(cow) = self.workspace_cow.take() {
+            cow.teardown();
+        }
         Ok(())
+    }
+
+    async fn promote_workspace(&self) -> CapsuleResult<bool> {
+        self.commit_workspace(CowOp::Promote).await
+    }
+
+    async fn rollback_workspace(&self) -> CapsuleResult<bool> {
+        self.commit_workspace(CowOp::Rollback).await
     }
 
     fn request_cancel(&self) {
@@ -2662,6 +2864,8 @@ pub async fn run_lifecycle(
         capsule_log: None,
         capsule_id: cfg.capsule_id.clone(),
         workspace_root: cfg.workspace_root,
+        // Lifecycle hooks run on a plain HostVfs with no CoW, so nothing to mask.
+        spawn_mask_paths: Vec::new(),
         vfs: Arc::new(vfs),
         vfs_root_handle: root_handle,
         home: home_mount,
@@ -2674,8 +2878,6 @@ pub async fn run_lifecycle(
         // Lifecycle hooks don't run the per-principal recv loop; no cache needed.
         profile_cache: None,
         invocation_env_overlay: None,
-        overlay_vfs: None,
-        upper_dir: None,
         // Lifecycle hooks (install/upgrade) run a ONE-SHOT, single-principal,
         // NON-shared instance: `cfg.kv` / `cfg.secret_store` are already scoped to
         // the specific principal the operator is installing for, no other

@@ -283,6 +283,16 @@ impl PersistentProcessRegistry {
             .count()
     }
 
+    /// Total number of LIVE persistent processes across every principal.
+    ///
+    /// Consulted by the workspace copy-on-write promote/rollback interlock to
+    /// refuse mutating the merged tree while a persistent child that outlived
+    /// its spawning invocation may still be running in it.
+    #[must_use]
+    pub(crate) fn total_live(&self) -> usize {
+        self.lock().values().filter(|e| e.is_live()).count()
+    }
+
     /// Non-draining status snapshot of one process.
     pub(in crate::engine::wasm::host::process) fn status(
         &self,

@@ -236,6 +236,12 @@ fn all_request_variants() -> Vec<KernelRequest> {
         KernelRequest::UnloadCapsule {
             id: "x".to_string(),
         },
+        KernelRequest::PromoteWorkspace {
+            id: "x".to_string(),
+        },
+        KernelRequest::RollbackWorkspace {
+            id: "x".to_string(),
+        },
         KernelRequest::InstallCapsule {
             source: "x".to_string(),
             workspace: false,

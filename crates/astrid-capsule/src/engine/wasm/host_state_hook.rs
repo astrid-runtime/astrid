@@ -63,6 +63,8 @@ impl HostState {
             capsule_log: None,
             capsule_id,
             workspace_root,
+            // Hooks run a transient one-shot on a plain HostVfs with no CoW.
+            spawn_mask_paths: Vec::new(),
             vfs,
             vfs_root_handle,
             // Hooks intentionally do not support home:// or /tmp access — they run
@@ -76,8 +78,6 @@ impl HostState {
             invocation_profile: None,
             profile_cache: None,
             invocation_env_overlay: None,
-            overlay_vfs: None,
-            upper_dir: None,
             kv_backend,
             kv,
             event_bus,

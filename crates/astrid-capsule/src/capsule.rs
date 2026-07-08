@@ -125,6 +125,21 @@ pub trait Capsule: Send + Sync {
     /// Unload the capsule, terminating all of its execution engines.
     async fn unload(&mut self) -> CapsuleResult<()>;
 
+    /// Promote this capsule's OS-level copy-on-write workspace changes into the
+    /// pristine workspace (the gate's "approve"). Returns `Ok(true)` if a
+    /// copy-on-write workspace was committed, `Ok(false)` if the capsule has
+    /// none (git-managed or No-CoW). Default: `Ok(false)`.
+    async fn promote_workspace(&self) -> CapsuleResult<bool> {
+        Ok(false)
+    }
+
+    /// Discard this capsule's OS-level copy-on-write workspace changes (the
+    /// gate's "reject"). Returns `Ok(true)` if a copy-on-write workspace was
+    /// rolled back, `Ok(false)` if the capsule has none. Default: `Ok(false)`.
+    async fn rollback_workspace(&self) -> CapsuleResult<bool> {
+        Ok(false)
+    }
+
     /// Request cooperative cancellation before exclusive unload is available.
     ///
     /// In-flight dispatcher tasks can hold `Arc<dyn Capsule>` clones, which
@@ -281,6 +296,22 @@ impl Capsule for CompositeCapsule {
         }
         self.state = CapsuleState::Unloaded;
         Ok(())
+    }
+
+    async fn promote_workspace(&self) -> CapsuleResult<bool> {
+        let mut promoted = false;
+        for engine in &self.engines {
+            promoted |= engine.promote_workspace().await?;
+        }
+        Ok(promoted)
+    }
+
+    async fn rollback_workspace(&self) -> CapsuleResult<bool> {
+        let mut rolled_back = false;
+        for engine in &self.engines {
+            rolled_back |= engine.rollback_workspace().await?;
+        }
+        Ok(rolled_back)
     }
 
     fn request_cancel(&self) {

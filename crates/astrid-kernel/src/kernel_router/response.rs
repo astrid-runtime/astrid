@@ -9,6 +9,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use astrid_core::principal::PrincipalId;
 use astrid_events::ipc::{IpcMessage, IpcPayload, Topic};
 use astrid_events::kernel_api::KernelResponse;
 use serde::Serialize;
@@ -106,6 +107,37 @@ impl KeepalivePinger {
 impl Drop for KeepalivePinger {
     fn drop(&mut self) {
         self.handle.abort();
+    }
+}
+
+/// Approve (`commit == true`) or discard (`commit == false`) a capsule's
+/// OS-level copy-on-write workspace changes, shaping the [`KernelResponse`].
+/// Shared by the `PromoteWorkspace` / `RollbackWorkspace` dispatch arms.
+pub(crate) async fn workspace_commit_response(
+    kernel: &Arc<crate::Kernel>,
+    caller: &PrincipalId,
+    id: &str,
+    commit: bool,
+) -> KernelResponse {
+    let verb = if commit { "promoted" } else { "rolled_back" };
+    match astrid_capsule::capsule::CapsuleId::new(id.to_string()) {
+        Ok(cap_id) => match kernel.commit_workspace_for(&cap_id, caller, commit).await {
+            Ok(Some(true)) => {
+                KernelResponse::Success(serde_json::json!({"status": verb, "capsule": id}))
+            },
+            Ok(Some(false)) => KernelResponse::Success(serde_json::json!({
+                "status": "not_applicable",
+                "capsule": id,
+                "reason": "git-managed or no copy-on-write workspace",
+            })),
+            Ok(None) => {
+                KernelResponse::Success(serde_json::json!({"status": "not_loaded", "capsule": id}))
+            },
+            Err(e) => {
+                KernelResponse::Error(format!("workspace commit for capsule '{id}' failed: {e}"))
+            },
+        },
+        Err(e) => KernelResponse::Error(format!("invalid capsule id '{id}': {e}")),
     }
 }
 

@@ -4,10 +4,12 @@ pub mod admin;
 /// `astrid-capsule-install` library so the daemon and the CLI reach
 /// disk through the same code path.
 mod install;
+mod rate_limit;
 /// Kernel-response publishing envelope + the long-request keepalive pinger.
 mod response;
 
-pub(crate) use response::{KeepalivePinger, publish_response};
+pub(crate) use rate_limit::rate_limit_for_request;
+pub(crate) use response::{KeepalivePinger, publish_response, workspace_commit_response};
 
 use astrid_runtime::time::Instant;
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
@@ -378,6 +380,12 @@ async fn handle_request(
                 Err(e) => KernelResponse::Error(format!("invalid capsule id '{id}': {e}")),
             }
         },
+        KernelRequest::PromoteWorkspace { id } => {
+            workspace_commit_response(kernel, &caller, &id, true).await
+        },
+        KernelRequest::RollbackWorkspace { id } => {
+            workspace_commit_response(kernel, &caller, &id, false).await
+        },
         KernelRequest::Shutdown { reason } => {
             info!(
                 reason = reason.as_deref().unwrap_or("none"),
@@ -646,28 +654,6 @@ impl ManagementRateLimiter {
     }
 }
 
-/// Return the rate limit label and max-per-minute for a request type.
-/// Returns `None` for the limit if the request type is not rate-limited.
-fn rate_limit_for_request(req: &KernelRequest) -> (&'static str, Option<u32>) {
-    (kernel_request_method(req), rate_limit_max(req))
-}
-
-/// Return the max-per-minute rate limit for a request type, if any.
-fn rate_limit_max(req: &KernelRequest) -> Option<u32> {
-    match req {
-        KernelRequest::ReloadCapsules
-        | KernelRequest::ReloadCapsule { .. }
-        | KernelRequest::UnloadCapsule { .. } => Some(5),
-        KernelRequest::InstallCapsule { .. } | KernelRequest::ApproveCapability { .. } => Some(10),
-        KernelRequest::Shutdown { .. } => Some(1),
-        KernelRequest::ListCapsules
-        | KernelRequest::GetCommands
-        | KernelRequest::GetCapsuleMetadata
-        | KernelRequest::GetAgentReadiness
-        | KernelRequest::GetStatus => None,
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Management API capability enforcement (issue #670)
 // ---------------------------------------------------------------------------
@@ -723,6 +709,10 @@ pub fn required_capability(req: &KernelRequest, scope: AuthorityScope) -> &'stat
         },
         (KernelRequest::UnloadCapsule { .. }, AuthorityScope::Self_) => "self:capsule:remove",
         (KernelRequest::UnloadCapsule { .. }, _) => "capsule:remove",
+        // Promote/rollback are self-scoped (no target-principal field), so
+        // `resolve_scope` always yields `Self_`; the `_` arm is for exhaustiveness.
+        (KernelRequest::PromoteWorkspace { .. }, _) => "self:workspace:promote",
+        (KernelRequest::RollbackWorkspace { .. }, _) => "self:workspace:rollback",
         (KernelRequest::InstallCapsule { .. }, AuthorityScope::Self_) => "self:capsule:install",
         (KernelRequest::InstallCapsule { .. }, _) => "capsule:install",
         (
@@ -751,6 +741,8 @@ pub fn kernel_request_method(req: &KernelRequest) -> &'static str {
         KernelRequest::ReloadCapsules => "ReloadCapsules",
         KernelRequest::ReloadCapsule { .. } => "ReloadCapsule",
         KernelRequest::UnloadCapsule { .. } => "UnloadCapsule",
+        KernelRequest::PromoteWorkspace { .. } => "PromoteWorkspace",
+        KernelRequest::RollbackWorkspace { .. } => "RollbackWorkspace",
         KernelRequest::InstallCapsule { .. } => "InstallCapsule",
         KernelRequest::ApproveCapability { .. } => "ApproveCapability",
         KernelRequest::ListCapsules => "ListCapsules",

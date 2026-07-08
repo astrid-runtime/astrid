@@ -23,6 +23,10 @@ pub mod overlay;
 pub mod overlay_registry;
 /// Path resolution and sandboxing utilities.
 pub mod path;
+/// OS-level copy-on-write for non-git agent workspaces (overlayfs / APFS
+/// clonefile / fail-closed No-CoW) — the merged filesystem the fs host AND
+/// spawned processes share.
+pub mod workspace_cow;
 /// Worktree-specific virtual filesystem implementation.
 #[allow(dead_code)]
 pub(crate) mod worktree;
@@ -31,6 +35,10 @@ pub use error::{VfsError, VfsResult};
 pub use host::HostVfs;
 pub use overlay::OverlayVfs;
 pub use overlay_registry::OverlayVfsRegistry;
+pub use workspace_cow::{
+    CowCapability, NoCow, PreparedWorkspace, WorkspaceCow, detect_cow_backend, no_cow_workspace,
+    prepare_workspace_cow,
+};
 
 use astrid_capabilities::{DirHandle, FileHandle};
 use async_trait::async_trait;

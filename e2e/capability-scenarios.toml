@@ -60,6 +60,18 @@ status = "mapped"
 allow = ["future caller-workspace remove deletes only that caller's workspace capsule"]
 deny = ["self-scoped principal cannot remove a daemon-wide/shared capsule"]
 
+[capabilities."self:workspace:promote"]
+scenario = "self_capsule_workspace"
+status = "mapped"
+allow = ["caller can promote (commit) its own non-git workspace's copy-on-write changes into the pristine workspace"]
+deny = ["self-scoped principal cannot promote another principal's workspace"]
+
+[capabilities."self:workspace:rollback"]
+scenario = "self_capsule_workspace"
+status = "mapped"
+allow = ["caller can roll back (discard) its own non-git workspace's copy-on-write changes"]
+deny = ["self-scoped principal cannot roll back another principal's workspace"]
+
 [capabilities."capsule:list"]
 scenario = "capsule_metadata"
 status = "covered"
