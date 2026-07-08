@@ -1626,6 +1626,34 @@ impl Kernel {
         Ok(true)
     }
 
+    /// Promote (`commit == true`) or roll back (`commit == false`) a capsule's
+    /// OS-level copy-on-write workspace changes — the gate's approve/reject for
+    /// a non-git workspace (Fix #2).
+    ///
+    /// Returns `Ok(None)` if the capsule is not loaded in `principal`'s view;
+    /// `Ok(Some(true))` if a copy-on-write workspace was committed/rolled back;
+    /// `Ok(Some(false))` if the capsule has no copy-on-write workspace
+    /// (git-managed or No-CoW — nothing to do).
+    pub(crate) async fn commit_workspace_for(
+        &self,
+        id: &astrid_capsule_types::CapsuleId,
+        principal: &PrincipalId,
+        commit: bool,
+    ) -> Result<Option<bool>, anyhow::Error> {
+        let capsule = { self.capsules.read().await.get_for(principal, id) };
+        let Some(capsule) = capsule else {
+            return Ok(None);
+        };
+        let outcome = if commit {
+            capsule.promote_workspace().await
+        } else {
+            capsule.rollback_workspace().await
+        };
+        outcome
+            .map(Some)
+            .map_err(|e| anyhow::anyhow!("workspace commit for capsule '{id}' failed: {e}"))
+    }
+
     /// Record that a new client connection for `principal` has been established.
     pub fn connection_opened(&self, principal: &PrincipalId) {
         self.active_connections

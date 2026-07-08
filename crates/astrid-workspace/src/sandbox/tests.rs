@@ -203,8 +203,12 @@ fn wrap_with_injections_rejects_unsafe_paths() {
             source: PathBuf::from(source),
             target: PathBuf::from(target),
         }];
-        let result =
-            SandboxCommand::wrap_with_injections(Command::new("echo"), Path::new("/tmp/ws"), &inj);
+        let result = SandboxCommand::wrap_with_injections(
+            Command::new("echo"),
+            Path::new("/tmp/ws"),
+            &inj,
+            &[],
+        );
         let msg = result
             .expect_err("unsafe injection path must be rejected")
             .to_string();
@@ -220,7 +224,8 @@ fn wrap_with_injections_emits_ro_bind_pair() {
         source: PathBuf::from("/host/snap"),
         target: PathBuf::from("/etc/x"),
     }];
-    let wrapped = SandboxCommand::wrap_with_injections(cmd, Path::new("/tmp/ws"), &inj).unwrap();
+    let wrapped =
+        SandboxCommand::wrap_with_injections(cmd, Path::new("/tmp/ws"), &inj, &[]).unwrap();
     let args: Vec<String> = wrapped
         .get_args()
         .map(|a| a.to_string_lossy().to_string())
@@ -233,6 +238,111 @@ fn wrap_with_injections_emits_ro_bind_pair() {
         .map(|(i, _)| i)
         .expect("wrapped command must carry the injection --ro-bind");
     assert_eq!(args[pos + 2], "/etc/x", "ro-bind target");
+}
+
+/// SECURITY: a spawned child must NOT be able to write a caller-supplied mask
+/// path (the copy-on-write upper/pristine). End-to-end proof on macOS: the mask
+/// deny must hold even though the masked dir sits under a broadly-writable
+/// location (`/var/folders` / `/private/tmp` are in the Seatbelt write
+/// allowlist) — i.e. the mask, not the location, is what denies the write.
+/// The masked path is a SIBLING of the writable root (not an ancestor), so
+/// `build_seatbelt_prefix`'s ancestor-filter keeps the deny.
+#[cfg(target_os = "macos")]
+#[test]
+fn extra_mask_blocks_child_write_even_under_writable_tmp() {
+    // Probe whether Seatbelt can apply a profile at all in this environment
+    // (nested sandboxes deny sandbox_apply); skip rather than false-fail.
+    let can_apply = std::process::Command::new("sandbox-exec")
+        .args(["-p", "(version 1)(allow default)", "/usr/bin/true"])
+        .status()
+        .is_ok_and(|s| s.success());
+    if !can_apply {
+        eprintln!("sandbox-exec cannot apply a profile here; skipping mask enforcement test");
+        return;
+    }
+
+    // Canonicalize: macOS tempdirs live under /var/folders, a symlink to
+    // /private/var/folders, and Seatbelt matches on the REAL path.
+    let root = tempfile::tempdir().expect("tmp root");
+    let root = std::fs::canonicalize(root.path()).expect("canonicalize tmp root");
+    let merged = root.join("merged");
+    let masked = root.join("masked"); // sibling of merged, both under /var/folders
+    std::fs::create_dir_all(&merged).expect("mkdir merged");
+    std::fs::create_dir_all(&masked).expect("mkdir masked");
+
+    // Child 1: writing the merged (writable) root SUCCEEDS and the host sees it
+    // — proving the fs host and the spawned child share one merged tree.
+    let mut inner = Command::new("/usr/bin/touch");
+    inner.arg(merged.join("from_child.txt"));
+    let mut wrapped =
+        SandboxCommand::wrap_with_injections(inner, &merged, &[], std::slice::from_ref(&masked))
+            .expect("wrap");
+    let status = wrapped.status().expect("spawn child 1");
+    assert!(status.success(), "child write to merged should succeed");
+    assert!(
+        merged.join("from_child.txt").exists(),
+        "the fs host sees the file the sandboxed child created in merged"
+    );
+
+    // Child 2: writing the MASKED path FAILS — the file must not appear, even
+    // though the masked dir sits under a broadly-writable /var/folders location.
+    let mut inner = Command::new("/usr/bin/touch");
+    inner.arg(masked.join("smuggled.txt"));
+    let mut wrapped =
+        SandboxCommand::wrap_with_injections(inner, &merged, &[], std::slice::from_ref(&masked))
+            .expect("wrap");
+    let status = wrapped.status().expect("spawn child 2");
+    assert!(
+        !status.success(),
+        "touch on a masked path must fail (Seatbelt deny)"
+    );
+    assert!(
+        !masked.join("smuggled.txt").exists(),
+        "the mask must block the child from writing the CoW upper/pristine, \
+         even though it lives under a writable /var/folders location"
+    );
+}
+
+/// PROCESS-BYPASS FIX (the whole point of Fix #2): a spawned process whose cwd
+/// is the copy-on-write `merged` tree, writing a RELATIVE path, must land in
+/// `merged` and be visible to the fs host — proving the spawn runs against the
+/// merged tree, not the pristine workspace. An absolute-path write can't
+/// distinguish the two; a relative write resolved against cwd can. Runs on macOS.
+#[cfg(target_os = "macos")]
+#[test]
+fn spawn_with_cwd_merged_sees_relative_write_from_fs_host() {
+    let can_apply = std::process::Command::new("sandbox-exec")
+        .args(["-p", "(version 1)(allow default)", "/usr/bin/true"])
+        .status()
+        .is_ok_and(|s| s.success());
+    if !can_apply {
+        eprintln!("sandbox-exec cannot apply a profile here; skipping cwd/relative test");
+        return;
+    }
+
+    // Canonicalize (macOS /var/folders → /private/var/folders; Seatbelt matches
+    // the real path).
+    let root = tempfile::tempdir().expect("tmp root");
+    let merged = std::fs::canonicalize(root.path()).expect("canonicalize");
+
+    // Spawn with cwd == merged and write a RELATIVE path.
+    let mut inner = Command::new("/usr/bin/touch");
+    inner.current_dir(&merged);
+    inner.arg("rel.txt");
+    let mut wrapped = SandboxCommand::wrap(inner, &merged).expect("wrap");
+    let status = wrapped.status().expect("spawn");
+    assert!(
+        status.success(),
+        "relative write with cwd=merged should succeed"
+    );
+
+    // The fs host (unsandboxed, reading merged directly) sees the child's file:
+    // the spawned process and the fs host share ONE merged tree.
+    assert!(
+        merged.join("rel.txt").exists(),
+        "a relative-path write by a process with cwd=merged must land in merged \
+         and be visible to the fs host (process-bypass fixed)"
+    );
 }
 
 // --- ProcessSandboxConfig builder tests ---

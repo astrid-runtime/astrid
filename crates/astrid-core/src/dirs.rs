@@ -264,6 +264,29 @@ impl AstridHome {
         self.var_dir().join("state.db")
     }
 
+    /// Root directory for OS-level copy-on-write workspace clones (`cow/`).
+    ///
+    /// Each non-git capsule workspace gets a per-workspace subdirectory here
+    /// holding the copy-on-write working tree (an APFS `clonefile` clone on
+    /// macOS, an `overlayfs` upper/work/merged triple on Linux). This tree is
+    /// the directory a spawned process and the fs host both write to; the
+    /// pristine workspace is only touched by an explicit promote.
+    ///
+    /// One workspace's clone is kept from reaching another's by the OS
+    /// sandbox's default-deny-write: only a child's own `merged` tree is a
+    /// writable root, so sibling clones under this `cow/` root are unwritable.
+    /// This depends on `cow/` living under `~/.astrid` (not a world-writable
+    /// location) — which is why the capsule loader fails closed to No-CoW
+    /// rather than clone into a temp dir when the home is unresolvable. (The
+    /// `cow/` root itself is NOT added to the sandbox mask: on macOS Seatbelt a
+    /// mask that is an ancestor of the writable `merged` root is dropped; the
+    /// mask instead covers the pristine workspace / overlay upper dirs.) See
+    /// `astrid_vfs::workspace_cow`.
+    #[must_use]
+    pub fn cow_dir(&self) -> PathBuf {
+        self.root.join("cow")
+    }
+
     /// Ephemeral runtime directory (`run/`).
     #[must_use]
     pub fn run_dir(&self) -> PathBuf {

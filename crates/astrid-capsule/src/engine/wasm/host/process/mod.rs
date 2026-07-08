@@ -109,6 +109,7 @@ fn build_persistent_child(
     want_stdin: bool,
     injections: &[astrid_workspace::RoInjection],
     inject_env: &[(String, String)],
+    extra_masks: &[std::path::PathBuf],
 ) -> Result<tokio::process::Child, ErrorCode> {
     let mut sandboxed = prepare_sandboxed_command(
         &request.cmd,
@@ -116,6 +117,7 @@ fn build_persistent_child(
         workspace_root,
         injections,
         inject_env,
+        extra_masks,
     )
     .map_err(|_| ErrorCode::InvalidInput)?;
     // `configure_piped` sets the process group + stdout/stderr pipes.
@@ -190,6 +192,7 @@ impl process::Host for HostState {
             &workspace_root,
             &prepared.sandbox,
             &injection_env,
+            &self.spawn_mask_paths,
         ) {
             Ok(cmd) => cmd,
             Err(_) => {
@@ -365,6 +368,7 @@ impl process::Host for HostState {
             &workspace_root,
             &prepared.sandbox,
             &injection_env,
+            &self.spawn_mask_paths,
         ) {
             Ok(cmd) => cmd,
             Err(_) => {
@@ -619,6 +623,7 @@ impl process::Host for HostState {
             want_stdin,
             &prepared.sandbox,
             &prepared.env,
+            &self.spawn_mask_paths,
         ) {
             Ok(c) => c,
             Err(e) => {

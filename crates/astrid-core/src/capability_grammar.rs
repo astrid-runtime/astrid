@@ -377,6 +377,22 @@ pub const CAPABILITY_CATALOG: &[CapabilityInfo] = {
             danger: Normal,
         },
         CapabilityInfo {
+            id: "self:workspace:promote",
+            label: "Promote workspace changes",
+            description: "Commit a non-git capsule workspace's copy-on-write changes into the pristine workspace (the gate's approve). No-op for a git-managed or No-CoW workspace.",
+            category: Capsule,
+            scope: Self_,
+            danger: Elevated,
+        },
+        CapabilityInfo {
+            id: "self:workspace:rollback",
+            label: "Roll back workspace changes",
+            description: "Discard a non-git capsule workspace's copy-on-write changes, restoring the pristine contents (the gate's reject). No-op for a git-managed or No-CoW workspace.",
+            category: Capsule,
+            scope: Self_,
+            danger: Normal,
+        },
+        CapabilityInfo {
             id: "capsule:list",
             label: "List all capsules",
             description: "Enumerate every capsule installed on the host, including manifest metadata.",
@@ -691,7 +707,7 @@ pub fn known_capabilities_list() -> &'static [&'static str] {
 /// in the same commit that adds a new capability so a kernel
 /// addition without updating the catalog fails the consuming
 /// crate's tests.
-pub const KNOWN_CAPABILITIES_COUNT: usize = 43;
+pub const KNOWN_CAPABILITIES_COUNT: usize = 45;
 
 const _: () = assert!(
     CAPABILITY_CATALOG.len() == KNOWN_CAPABILITIES_COUNT,

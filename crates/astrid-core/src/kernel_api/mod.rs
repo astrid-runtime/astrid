@@ -61,6 +61,23 @@ pub enum KernelRequest {
         /// The capsule id (its `[package].name`).
         id: String,
     },
+    /// Promote a capsule's OS-level copy-on-write workspace changes into the
+    /// pristine workspace — the gate's "approve" (Fix #2). For a non-git
+    /// workspace, capsule writes and spawned-process output land in a
+    /// copy-on-write merged tree; this commits them to the real workspace. A
+    /// no-op (`not_applicable`) for a git-managed or No-CoW workspace.
+    PromoteWorkspace {
+        /// The capsule id (its `[package].name`).
+        id: String,
+    },
+    /// Discard a capsule's OS-level copy-on-write workspace changes — the
+    /// gate's "reject" (Fix #2). Restores the merged tree to the pristine
+    /// contents. A no-op (`not_applicable`) for a git-managed or No-CoW
+    /// workspace.
+    RollbackWorkspace {
+        /// The capsule id (its `[package].name`).
+        id: String,
+    },
     /// Request the list of globally registered slash commands.
     GetCommands,
     /// Request metadata about loaded capsules (manifests, providers, interceptors).

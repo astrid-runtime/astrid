@@ -248,7 +248,19 @@ pub struct HostState {
     /// The unique session UUID for this plugin's execution state.
     pub capsule_uuid: uuid::Uuid,
     /// Workspace root directory (file operations are confined here).
+    ///
+    /// For a non-git workspace this is the copy-on-write **merged** path (an
+    /// APFS clone / overlayfs mount), NOT the pristine workspace — so the fs
+    /// host AND spawned processes (whose sandbox writable root + cwd are this
+    /// path) share one filesystem, and a spawned `cargo` sees the CoW writes.
+    /// See `astrid_vfs::workspace_cow`.
     pub workspace_root: PathBuf,
+    /// Copy-on-write bookkeeping dirs (the overlayfs upper/work, or the pristine
+    /// workspace under APFS) that the OS sandbox MUST mask from spawned
+    /// children, so a child cannot write them directly and bypass the workspace
+    /// promote/rollback gate. Threaded into `SandboxCommand::wrap_with_injections`
+    /// as `extra_masks` on every spawn. Empty for git-managed / No-CoW workspaces.
+    pub spawn_mask_paths: Vec<PathBuf>,
     /// The Virtual File System (VFS) instance for this plugin.
     pub vfs: Arc<dyn astrid_vfs::Vfs>,
     /// The root capability handle for the VFS.
@@ -259,12 +271,6 @@ pub struct HostState {
     /// Load-time principal tmp mount (`/tmp/` paths, backed by
     /// `~/.astrid/home/{principal}/.local/tmp/`). `None` if unavailable.
     pub tmp: Option<PrincipalMount>,
-    /// Concrete reference to the [`OverlayVfs`](astrid_vfs::OverlayVfs) for
-    /// commit/rollback operations. `None` for non-overlay VFS configurations
-    /// (e.g., tests with a plain `HostVfs`).
-    pub overlay_vfs: Option<Arc<astrid_vfs::OverlayVfs>>,
-    /// Reference to the ephemeral upper directory to keep it alive for the session.
-    pub upper_dir: Option<Arc<tempfile::TempDir>>,
     /// Load-time KV fallback: a NEUTRAL, physically-isolated store that holds
     /// **no real principal's data**.
     ///
