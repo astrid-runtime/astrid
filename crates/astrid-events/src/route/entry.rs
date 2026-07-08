@@ -26,10 +26,29 @@ pub const MAX_SUBSCRIPTION_BUDGET_BYTES: usize = 1024 * 1024;
 /// rotation rather than starving the long tail.
 pub const DRR_QUANTUM_MIN_BYTES: usize = 4 * 1024;
 
-/// Defence-in-depth message-count cap per principal sub-queue. The byte
-/// budget is the primary admission control; this just stops a flood of
-/// 0-byte messages from monopolising one bucket.
-pub(crate) const PENDING_PER_PRINCIPAL_FALLBACK: usize = 256;
+/// Defence-in-depth message-count cap per principal sub-queue. The 1 `MiB`
+/// byte budget ([`MAX_SUBSCRIPTION_BUDGET_BYTES`]) is the primary admission
+/// control; this only stops a flood of tiny (near-0-byte) messages from
+/// monopolising a bucket *without* ever tripping that byte budget.
+///
+/// Sized to admit a legitimate high-rate token stream. An LLM provider
+/// emitting one small event per token at ~2000 tok/s produces thousands of
+/// tiny messages in a ~1-2s burst — collectively far under the 1 `MiB` byte
+/// budget (a 73 `KiB` response is ~80 `KiB` of deltas). At 256 those bursts
+/// overran the sub-queue and dropped the oldest events, which silently
+/// corrupted a streamed response (dropped interior tokens) or hung the
+/// consuming turn outright (a dropped terminal `Done` that react waits on
+/// forever). For real (non-empty) deltas the 1 `MiB` byte budget
+/// ([`MAX_SUBSCRIPTION_BUDGET_BYTES`]) binds *first* — it trips long before a
+/// bucket reaches this count — so the count cap only ever governs a flood of
+/// near-0-byte messages the byte budget cannot see. Each queued slot is an
+/// `Arc` handle (~8 B), but the `Arc` keeps the whole `AstridEvent` allocation
+/// alive, so the true retained heap of such a flood is this cap × per-event
+/// struct overhead — on the order of a few `MiB` per bucket, not a few `KiB`.
+/// Still bounded per bucket, but the message count is a coarse proxy for
+/// memory; a proper memory-based bound for the near-0-byte case is tracked in
+/// #1159.
+pub(crate) const PENDING_PER_PRINCIPAL_FALLBACK: usize = 16_384;
 
 /// Counter: head messages evicted from a per-principal sub-queue because
 /// the route's global byte budget would otherwise be exceeded. Labelled
@@ -120,15 +139,15 @@ pub(crate) struct RouteEntry {
     /// COMPLETENESS is CROSS-PRINCIPAL ONLY. The guarantee above ("can never
     /// head-evict the owner's own entries") is about FOREIGN principals — a
     /// noisy co-principal cannot evict the owner. A scoped route still applies
-    /// the 1 `MiB` byte budget and the 256-message per-principal cap to the
-    /// owner's OWN bucket, so if the owner publishes faster than the consumer
-    /// drains, the owner's OWN oldest entries can still self-evict (host
-    /// `tracing::error!`/metric only — no in-band guest signal). A
-    /// completeness-critical consumer (e.g. an audit-to-blockchain mint
-    /// pipeline) must therefore drain promptly or treat the persisted audit
-    /// log (`append_with_principal`) as the source of truth, not the live bus
-    /// feed. In-band drop-signalling / log reconciliation is a future
-    /// (Phase 2) concern.
+    /// the 1 `MiB` byte budget and the per-principal message-count cap
+    /// ([`PENDING_PER_PRINCIPAL_FALLBACK`]) to the owner's OWN bucket, so if the
+    /// owner publishes faster than the consumer drains, the owner's OWN oldest
+    /// entries can still self-evict (host `tracing::error!`/metric only — no
+    /// in-band guest signal). A completeness-critical consumer (e.g. an
+    /// audit-to-blockchain mint pipeline) must therefore drain promptly or
+    /// treat the persisted audit log (`append_with_principal`) as the source of
+    /// truth, not the live bus feed. In-band drop-signalling / log
+    /// reconciliation is a future (Phase 2) concern.
     pub(crate) scope: Option<PrincipalKey>,
     /// Wakeup for `RoutedEventReceiver::recv`.
     pub(crate) notify: Arc<Notify>,
@@ -865,6 +884,67 @@ mod tests {
         assert_eq!(alice_q.queue.len(), 1, "alice's entry never evicted");
         assert!(!entry.fanout.contains_key(&Some("bob".into())));
         assert_eq!(entry.total_bytes, alice_q.bytes);
+    }
+
+    #[test]
+    fn high_rate_tiny_stream_under_cap_is_not_dropped() {
+        // Regression for #1158: a fast LLM token stream publishes one tiny
+        // event per token. At the old 256-message cap a burst of ~1000 tokens
+        // dropped the oldest events — corrupting the stream, or losing the
+        // terminal `Done` and hanging the turn. 1000 tiny empty-payload events
+        // stay far under the 1 MiB byte budget, so ONLY the count cap could
+        // drop them; at the raised cap none may be. This test fails at cap 256.
+        let mut entry = RouteEntry::new(TopicMatcher::new("t.*"), "capsule-a".into(), None);
+        for _ in 0..1000 {
+            let evicted = entry.push_with_eviction(
+                ipc("t.tok", Some("alice")),
+                Some("alice".into()),
+                MAX_SUBSCRIPTION_BUDGET_BYTES,
+            );
+            assert_eq!(
+                evicted, 0,
+                "no event may be evicted under the cap and budget"
+            );
+        }
+        let bucket = entry
+            .fanout
+            .get(&Some("alice".into()))
+            .expect("alice bucket exists");
+        assert_eq!(bucket.queue.len(), 1000, "all 1000 stream events retained");
+    }
+
+    #[test]
+    fn per_principal_count_cap_drops_oldest_beyond_fallback() {
+        // The count cap is the tiny-message backstop. Isolate it from the byte
+        // budget with an effectively unbounded budget, then push
+        // PENDING_PER_PRINCIPAL_FALLBACK + 1 tiny events for one principal: the
+        // bucket caps at the constant and the OLDEST (FIFO head) is the drop.
+        let mut entry = RouteEntry::new(TopicMatcher::new("t.*"), "capsule-a".into(), None);
+        entry.push_with_eviction(
+            ipc("t.oldest", Some("alice")),
+            Some("alice".into()),
+            usize::MAX,
+        );
+        for _ in 0..PENDING_PER_PRINCIPAL_FALLBACK {
+            entry.push_with_eviction(
+                ipc("t.rest", Some("alice")),
+                Some("alice".into()),
+                usize::MAX,
+            );
+        }
+        let bucket = entry
+            .fanout
+            .get(&Some("alice".into()))
+            .expect("alice bucket exists");
+        assert_eq!(
+            bucket.queue.len(),
+            PENDING_PER_PRINCIPAL_FALLBACK,
+            "bucket is capped at the fallback; exactly one event dropped"
+        );
+        let has_oldest = bucket.queue.iter().any(
+            |ev| matches!(&**ev, AstridEvent::Ipc { message, .. } if message.topic == "t.oldest"),
+        );
+        assert!(!has_oldest, "the FIFO head (oldest) was the evicted event");
     }
 
     #[test]
