@@ -40,7 +40,7 @@ tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 # Requires the build to be run with RUSTFLAGS='--cfg getrandom_backend="wasm_js"'
 # (see scripts/check-wasm-portability.sh).
 [target.'cfg(target_family = "wasm")'.dependencies]
-getrandom = { version = "0.3", features = ["wasm_js"] }
+getrandom = { version = "0.4", features = ["wasm_js"] }
 
 [lints]
 workspace = true
