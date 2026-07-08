@@ -1169,6 +1169,21 @@ impl Drop for EpochTickerGuard {
 /// into the guest. Each tick increments the epoch by 1, so a deadline of
 /// `N` means the guest traps after approximately `N * EPOCH_TICK_INTERVAL`.
 fn spawn_epoch_ticker(engine: &wasmtime::Engine) -> EpochTickerGuard {
+    spawn_epoch_ticker_every(engine, EPOCH_TICK_INTERVAL)
+}
+
+/// Like [`spawn_epoch_ticker`] but with a caller-chosen tick interval.
+///
+/// Tests that must observe a deadline crossing within a BOUNDED workload use a
+/// short interval so a yield is guaranteed no matter how fast the host runs the
+/// guest — the 100 ms production cadence ([`EPOCH_TICK_INTERVAL`]) can be longer
+/// than a finite compute loop on a fast machine, which would leave the yield
+/// count at zero and flake. The interval is a harness knob; it does not change
+/// the mechanism under test (the epoch-deadline callback and its yield).
+fn spawn_epoch_ticker_every(
+    engine: &wasmtime::Engine,
+    interval: std::time::Duration,
+) -> EpochTickerGuard {
     let engine = engine.clone();
     let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let stop_clone = stop.clone();
@@ -1176,7 +1191,7 @@ fn spawn_epoch_ticker(engine: &wasmtime::Engine) -> EpochTickerGuard {
         .name("wasm-epoch-ticker".into())
         .spawn(move || {
             while !stop_clone.load(std::sync::atomic::Ordering::Relaxed) {
-                std::thread::sleep(EPOCH_TICK_INTERVAL);
+                std::thread::sleep(interval);
                 engine.increment_epoch();
             }
         })
@@ -4651,7 +4666,7 @@ mod tests {
 mod epoch_integration_tests {
     use super::{
         EpochAction, INTERCEPTOR_FUEL_BUDGET, MAX_NO_YIELD_WINDOWS, build_wasmtime_engine,
-        epoch_decision, exempt_epoch_action, spawn_epoch_ticker,
+        epoch_decision, exempt_epoch_action, spawn_epoch_ticker, spawn_epoch_ticker_every,
     };
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -5039,7 +5054,7 @@ mod epoch_integration_tests {
                       (br $l)))
                   (local.get $acc)))"#,
         );
-        let heavy: i32 = 200_000_000; // long enough to cross several 1-tick windows
+        let heavy: i32 = 200_000_000; // runs long enough to cross many fast-ticker windows
         let yields = Arc::new(AtomicU64::new(0));
         let mut store = Store::new(&engine, ());
         apply_exempt_epoch_bound(&mut store, 1, Arc::clone(&yields));
@@ -5052,7 +5067,12 @@ mod epoch_integration_tests {
             .get_typed_func::<i32, i32>(&mut store, "count")
             .expect("count export");
 
-        let ticker = spawn_epoch_ticker(&engine);
+        // Fast ticker (vs the 100 ms production cadence): guarantees a deadline
+        // crossing lands during this bounded loop even on a host that finishes
+        // 200M iterations in well under 100 ms — otherwise the yield count could
+        // be zero and flake (as it did on macOS CI). The interval is a harness
+        // knob; the mechanism under test (deadline callback → yield) is the same.
+        let ticker = spawn_epoch_ticker_every(&engine, Duration::from_millis(2));
         let out = count
             .call_async(&mut store, heavy)
             .await
