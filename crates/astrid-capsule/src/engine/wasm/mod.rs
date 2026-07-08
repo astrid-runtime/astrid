@@ -107,6 +107,27 @@ fn resolve_content_addressed_wasm(capsule_dir: &std::path::Path) -> Option<PathB
     }
 }
 
+/// Returns `true` when `workspace_root` sits inside a git work tree.
+///
+/// A git-managed workspace must NOT use the in-process copy-on-write overlay:
+/// its writes have to land on the real workspace so spawned processes (e.g.
+/// `cargo`) and the user see them, with git providing the rollback. When this
+/// returns `false` the capsule load path keeps today's `OverlayVfs`.
+///
+/// Detection is delegated to gitoxide's work-tree discovery
+/// ([`gix_discover::upwards`]), which walks upward from `workspace_root` for an
+/// enclosing repository exactly as git does — correctly following the `.git`
+/// *file* a submodule or linked worktree uses, validating the discovered `.git`
+/// (a bare `mkdir .git` is not a repo), and stopping at filesystem boundaries.
+/// We deliberately do NOT scan downward for a nested repo: git only discovers
+/// upward, there is no robust primitive for "contains a repo below", and the
+/// agent workspaces this guards are themselves git roots. A discovery error
+/// (no repository, or `workspace_root` unreadable) fails safe to `false` — the
+/// overlay branch — matching the pre-git behaviour for non-git workspaces.
+fn workspace_is_git_managed(workspace_root: &std::path::Path) -> bool {
+    gix_discover::upwards(workspace_root).is_ok()
+}
+
 /// Wall-clock timeout for short-lived (non-daemon) WASM capsules.
 /// Generous enough for interceptors doing streaming HTTP (e.g. LLM providers)
 /// while still catching runaways.
@@ -1318,11 +1339,10 @@ impl ExecutionEngine for WasmEngine {
             //     committed (a separate later change replaces this branch with
             //     real OS-level CoW).
             //
-            // Detection is automatic (no config flag) and cheap enough to run on
-            // every load — a bounded ancestor walk plus one shallow child scan
-            // (see `astrid_core::dirs::workspace_is_git_managed`).
+            // Detection is automatic (no config flag) via gitoxide work-tree
+            // discovery (see `workspace_is_git_managed`).
             let root_handle = astrid_capabilities::DirHandle::new();
-            let git_managed = astrid_core::dirs::workspace_is_git_managed(&workspace_root);
+            let git_managed = workspace_is_git_managed(&workspace_root);
 
             // Lower layer (the real workspace) is common to both branches.
             let lower_vfs = astrid_vfs::HostVfs::new();
@@ -2974,6 +2994,62 @@ fn wasm_exports_contain(name: &str, wasm_bytes: &[u8]) -> bool {
 mod tests {
     use super::*;
     use astrid_events::ipc::Topic;
+
+    // ── git-managed workspace detection (gitoxide work-tree discovery) ──
+    //
+    // `workspace_is_git_managed` decides whether a capsule's workspace uses the
+    // CoW overlay (non-git) or writes straight to disk with git as the rollback
+    // (git-managed). It delegates to `gix_discover::upwards`, so these tests
+    // assert real gitoxide behaviour, not a hand-rolled `.git` walk.
+    mod git_managed {
+        use super::super::workspace_is_git_managed;
+
+        /// Create the minimal on-disk structure `gix_discover` accepts as a git
+        /// work tree: a symref `HEAD`, plus the `objects/` and `refs/`
+        /// directories its validation requires. Hermetic — no `git` binary.
+        fn init_git_worktree(root: &std::path::Path) {
+            let dot_git = root.join(".git");
+            std::fs::create_dir_all(dot_git.join("objects")).unwrap();
+            std::fs::create_dir_all(dot_git.join("refs")).unwrap();
+            std::fs::write(dot_git.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+        }
+
+        #[test]
+        fn detects_git_workspace_root() {
+            let ws = tempfile::tempdir().unwrap();
+            init_git_worktree(ws.path());
+            assert!(workspace_is_git_managed(ws.path()));
+        }
+
+        #[test]
+        fn detects_subdir_of_git_workspace() {
+            // Discovery walks upward, so a working directory nested inside the
+            // repo is still git-managed.
+            let ws = tempfile::tempdir().unwrap();
+            init_git_worktree(ws.path());
+            let sub = ws.path().join("crates").join("inner");
+            std::fs::create_dir_all(&sub).unwrap();
+            assert!(workspace_is_git_managed(&sub));
+        }
+
+        #[test]
+        fn plain_workspace_is_not_git_managed() {
+            let ws = tempfile::tempdir().unwrap();
+            std::fs::create_dir_all(ws.path().join("src")).unwrap();
+            std::fs::write(ws.path().join("README.md"), "no git here").unwrap();
+            assert!(!workspace_is_git_managed(ws.path()));
+        }
+
+        #[test]
+        fn bare_dot_git_dir_is_not_a_repo() {
+            // An empty `.git` directory (no HEAD/objects/refs) is not a valid
+            // repository; gitoxide rejects it where a bare `.git`-exists check
+            // would have false-positived.
+            let ws = tempfile::tempdir().unwrap();
+            std::fs::create_dir(ws.path().join(".git")).unwrap();
+            assert!(!workspace_is_git_managed(ws.path()));
+        }
+    }
 
     // ── Layer 3 enabled-gate tests (issue #672) ──────────────────────
 

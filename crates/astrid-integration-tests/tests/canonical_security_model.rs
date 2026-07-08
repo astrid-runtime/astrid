@@ -892,32 +892,24 @@ mod principal_isolation {
 // ===========================================================================
 // Git-managed workspaces bypass the CoW overlay
 // ---------------------------------------------------------------------------
-// When a workspace is under git version control, capsule writes must land
-// DIRECTLY on the real workspace (git is the rollback) so spawned processes
-// (`cargo`) and the user see them. When it is NOT git-managed, today's overlay
-// keeps writes in a per-capsule tempdir upper until commit. These tests drive
-// the two VFS configurations the load path selects between
-// (`astrid-capsule/src/engine/wasm/mod.rs`), gated by the same
-// `astrid_core::dirs::workspace_is_git_managed` predicate the production code
-// branches on. They mirror `overlay_vfs_isolates_principal_writes` above.
+// When a workspace is inside a git work tree, capsule writes must land DIRECTLY
+// on the real workspace (git is the rollback) so spawned processes (`cargo`)
+// and the user see them. When it is NOT git-managed, today's overlay keeps
+// writes in a per-capsule tempdir upper until commit. These tests drive the two
+// VFS configurations the load path selects between
+// (`astrid-capsule/src/engine/wasm/mod.rs`); the git-vs-not detection itself
+// (gitoxide `gix_discover::upwards`) is unit-tested in `astrid-capsule`. They
+// mirror `overlay_vfs_isolates_principal_writes` above.
 // ===========================================================================
 mod git_workspace_cow {
     use astrid_capabilities::DirHandle;
-    use astrid_core::dirs::workspace_is_git_managed;
     use astrid_vfs::{HostVfs, OverlayVfs, Vfs};
 
     #[tokio::test]
     async fn git_managed_workspace_writes_land_on_real_disk() {
-        // A git-managed workspace: `.git` at the root marks it as a work tree.
-        let workspace = tempfile::tempdir().unwrap();
-        std::fs::create_dir(workspace.path().join(".git")).unwrap();
-        assert!(
-            workspace_is_git_managed(workspace.path()),
-            "a workspace containing .git must be detected as git-managed"
-        );
-
         // The git-managed branch backs the workspace VFS with a DIRECT HostVfs
         // registered at the workspace root — no overlay, no upper tempdir.
+        let workspace = tempfile::tempdir().unwrap();
         let root = DirHandle::new();
         let vfs = HostVfs::new();
         vfs.register_dir(root.clone(), workspace.path().to_path_buf())
@@ -940,13 +932,7 @@ mod git_workspace_cow {
 
     #[tokio::test]
     async fn non_git_workspace_writes_stay_in_overlay_until_commit() {
-        // A non-git workspace: no `.git` at the root, in any ancestor, or in
-        // any immediate child directory.
         let workspace = tempfile::tempdir().unwrap();
-        assert!(
-            !workspace_is_git_managed(workspace.path()),
-            "a workspace with no .git anywhere must NOT be detected as git-managed"
-        );
 
         // The non-git branch keeps today's OverlayVfs: lower = real workspace,
         // upper = a per-capsule tempdir.
