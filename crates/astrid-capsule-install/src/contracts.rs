@@ -251,7 +251,7 @@ pub fn seed_canonical_contracts_if_absent<S: BuildHasher>(
 /// canonical write failure only degrades warn-only skew reporting, it must
 /// never break boot.
 pub fn refresh_canonical_contracts(home: &AstridHome) -> anyhow::Result<()> {
-    let Some(pin) = daemon_fleet_contracts_pin(home) else {
+    let Some(pin) = daemon_fleet_contracts_pin(home)? else {
         return Ok(());
     };
     let blob = home.wit_store_dir().join(format!("{pin}.wit"));
@@ -279,7 +279,9 @@ fn is_blake3_pin(pin: &str) -> bool {
 }
 
 /// The contracts pin that the plurality of the daemon's own system fleet
-/// agrees on, or `None` when that fleet vendors no retained contracts.
+/// agrees on: `Ok(Some(pin))`, or `Ok(None)` when that fleet vendors no
+/// retained contracts (including the normal fresh-home case where the fleet
+/// dir doesn't exist yet).
 ///
 /// "System fleet" = the capsules installed under the daemon's own
 /// [`install_principal`](crate::paths::install_principal) (the default /
@@ -291,24 +293,44 @@ fn is_blake3_pin(pin: &str) -> bool {
 /// cannot flip the baseline away from the majority fleet. Ties break to the
 /// lexicographically-smallest pin so the result is deterministic across runs.
 ///
+/// # Errors
+///
+/// A missing fleet dir is the normal no-op (`Ok(None)`), but any *other*
+/// error reading it (e.g. `PermissionDenied`, `EMFILE`) is propagated so the
+/// daemon can warn rather than silently skip the baseline. Per-entry errors
+/// are logged and skipped so one bad entry can't abort the whole scan.
+///
 /// Reads only the injected `home` — never the process environment or a
 /// workspace `.astrid/` (unlike [`scan_installed_capsules`](crate::scan_installed_capsules)) —
 /// so it is safe on the fail-closed daemon boot path.
-fn daemon_fleet_contracts_pin(home: &AstridHome) -> Option<String> {
+fn daemon_fleet_contracts_pin(home: &AstridHome) -> anyhow::Result<Option<String>> {
     let principal = crate::paths::install_principal();
     let capsules_dir = home.principal_home(&principal).capsules_dir();
     let store = home.wit_store_dir();
 
+    let entries = match std::fs::read_dir(&capsules_dir) {
+        Ok(entries) => entries,
+        // A missing fleet dir (fresh home / nothing installed) is the normal
+        // no-op path; any other error is real and must be surfaced.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => {
+            return Err(e).with_context(|| {
+                format!(
+                    "failed to read fleet capsules dir {}",
+                    capsules_dir.display()
+                )
+            });
+        },
+    };
+
     let mut counts: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
-    // A missing dir (fresh home / fleet never installed) is the normal no-op
-    // path -> `None`. Per-entry errors below are surfaced (debug) and skipped
-    // rather than silently dropped, so one unreadable entry can't abort the
-    // baseline scan.
-    for entry in std::fs::read_dir(&capsules_dir).ok()? {
+    for entry in entries {
         let entry = match entry {
             Ok(e) => e,
+            // Surface (not silently drop) a per-entry error, but keep scanning
+            // so one unreadable entry can't abort the whole baseline.
             Err(e) => {
-                tracing::debug!(
+                tracing::warn!(
                     dir = %capsules_dir.display(),
                     error = %e,
                     "skipping unreadable entry during contracts baseline scan"
@@ -353,7 +375,7 @@ fn daemon_fleet_contracts_pin(home: &AstridHome) -> Option<String> {
             best = Some((pin, n));
         }
     }
-    best.map(|(pin, _)| pin)
+    Ok(best.map(|(pin, _)| pin))
 }
 
 /// Write `content` to a UUID-named sibling temp of `canonical`, creating
@@ -817,8 +839,25 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let home = AstridHome::from_path(tmp.path());
         // No fleet at all: the install-principal's capsules dir doesn't exist.
+        // A missing (NotFound) fleet dir is the normal no-op, not an error.
         refresh_canonical_contracts(&home).unwrap();
         assert!(!canonical_contracts_path(&home).exists());
+    }
+
+    #[test]
+    fn boot_refresh_surfaces_unexpected_capsules_dir_error() {
+        // A missing fleet dir is a silent no-op, but a real read error (here:
+        // the capsules dir is a regular file, so `read_dir` fails with a
+        // non-NotFound error) must propagate so the daemon can warn rather than
+        // silently skip the baseline.
+        let tmp = tempfile::tempdir().unwrap();
+        let home = AstridHome::from_path(tmp.path());
+        let capsules = home
+            .principal_home(&crate::paths::install_principal())
+            .capsules_dir();
+        std::fs::create_dir_all(capsules.parent().unwrap()).unwrap();
+        std::fs::write(&capsules, b"not a directory").unwrap();
+        assert!(refresh_canonical_contracts(&home).is_err());
     }
 
     #[test]
