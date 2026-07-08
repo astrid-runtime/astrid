@@ -70,6 +70,13 @@ impl WorkspaceCow for ApfsCow {
     }
 
     fn prepare(&self, pristine: &Path) -> io::Result<PreparedWorkspace> {
+        // prepare() must run exactly once per backend. Fail fast on an
+        // accidental repeat before cloning anything; the `set` below is the
+        // authoritative guard that also closes a concurrent race.
+        if self.paths.get().is_some() {
+            return Err(prepared_twice());
+        }
+
         // Derive a stable-ish, collision-free per-workspace directory name.
         let seq = WORKSPACE_SEQ.fetch_add(1, Ordering::Relaxed);
         let id = format!("{}-{seq}", path_hash(pristine));
@@ -92,10 +99,15 @@ impl WorkspaceCow for ApfsCow {
         let paths = ApfsPaths {
             pristine: pristine.to_path_buf(),
             merged: merged.clone(),
-            workspace_dir,
+            workspace_dir: workspace_dir.clone(),
         };
-        // prepare() runs exactly once; if a second call races, keep the first.
-        let _ = self.paths.set(paths);
+        if self.paths.set(paths).is_err() {
+            // Lost a race with a concurrent prepare(): the winner owns the
+            // tracked state, so tear down the clone WE just made rather than
+            // leak an untracked working tree, and report the double-prepare.
+            let _ = std::fs::remove_dir_all(&workspace_dir);
+            return Err(prepared_twice());
+        }
 
         Ok(PreparedWorkspace {
             merged_path: merged,
@@ -186,6 +198,13 @@ impl Drop for ApfsCow {
         // missed, still remove the clone when the last handle drops.
         self.teardown();
     }
+}
+
+/// The error [`ApfsCow::prepare`] returns when called more than once on the same
+/// backend — an accidental repeat (caught by the fast `paths.get()` check) or a
+/// lost race with a concurrent call (caught by the `paths.set()` result).
+fn prepared_twice() -> io::Error {
+    io::Error::other("APFS workspace CoW: prepare() called more than once on the same backend")
 }
 
 /// A short, deterministic hex digest of a path, used only as a directory name.

@@ -303,6 +303,24 @@ fn extra_mask_blocks_child_write_even_under_writable_tmp() {
     );
 }
 
+/// SECURITY (fail-closed): a caller-supplied copy-on-write mask that does not
+/// exist is a wiring bug, not a no-op — `wrap_with_injections` must refuse the
+/// spawn rather than silently run a child without the intended deny.
+/// Platform-independent: the existence check precedes the OS-specific arms.
+#[test]
+fn missing_extra_mask_fails_the_spawn_closed() {
+    let root = tempfile::tempdir().expect("tmp root");
+    let worktree = root.path().join("worktree");
+    std::fs::create_dir_all(&worktree).expect("mkdir worktree");
+    let absent = root.path().join("does-not-exist");
+
+    let inner = Command::new("/usr/bin/true");
+    let err =
+        SandboxCommand::wrap_with_injections(inner, &worktree, &[], std::slice::from_ref(&absent))
+            .expect_err("a missing mask path must fail the spawn closed");
+    assert_eq!(err.kind(), io::ErrorKind::NotFound);
+}
+
 /// PROCESS-BYPASS FIX (the whole point of Fix #2): a spawned process whose cwd
 /// is the copy-on-write `merged` tree, writing a RELATIVE path, must land in
 /// `merged` and be visible to the fs host — proving the spawn runs against the

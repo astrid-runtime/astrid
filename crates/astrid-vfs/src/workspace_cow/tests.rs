@@ -123,6 +123,37 @@ fn apfs_clone_isolates_then_promote_and_rollback() {
     assert!(!merged.exists(), "teardown removes the clone");
 }
 
+#[cfg(target_os = "macos")]
+#[test]
+fn apfs_prepare_twice_errors_without_leaking_a_second_clone() {
+    // A second prepare() on the same backend must fail fast rather than clone
+    // again: the second clone would be untracked (teardown/promote/rollback
+    // still point at the first) and leak disk. Guards the double-prepare fix.
+    let cow_root = tempfile::tempdir().expect("cow root");
+    let pristine = tempfile::tempdir().expect("pristine");
+
+    let backend = ApfsCow::new(cow_root.path().to_path_buf());
+    let first = backend.prepare(pristine.path()).expect("first prepare");
+
+    let err = backend
+        .prepare(pristine.path())
+        .expect_err("second prepare must error");
+    assert_eq!(err.kind(), io::ErrorKind::Other);
+
+    // The refused call created no second clone: exactly one working dir exists.
+    let dirs = std::fs::read_dir(cow_root.path())
+        .expect("read cow root")
+        .filter_map(Result::ok)
+        .count();
+    assert_eq!(dirs, 1, "second prepare must not create a second clone dir");
+    assert!(
+        first.merged_path.exists(),
+        "the first (tracked) clone is untouched"
+    );
+
+    backend.teardown();
+}
+
 /// Linux overlayfs prepare → write → promote. Ignored: needs a Linux runtime
 /// with unprivileged user namespaces (CI-validated, not runnable on macOS).
 #[cfg(target_os = "linux")]
