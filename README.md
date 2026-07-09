@@ -1,13 +1,11 @@
-# Astrid
+# Unicity Astrid OS
 
-<!-- hero image: TO BE SUPPLIED (Joshua has the asset) -->
-<!--
 <p align="center">
-  <img src="" alt="Astrid OS" width="640">
+  <img src="assets/astrid-github-preview.png" alt="Unicity Astrid OS" width="640">
 </p>
--->
 
-**A secure operating system for AI agents. Run an agent you do not trust.**
+**A modular operating system for AI agents. Build from sealed parts, swap any
+part later, and keep every capability under control.**
 
 [![CI](https://github.com/unicity-astrid/astrid/actions/workflows/ci.yml/badge.svg)](https://github.com/unicity-astrid/astrid/actions/workflows/ci.yml)
 [![CodeQL](https://github.com/unicity-astrid/astrid/actions/workflows/codeql.yml/badge.svg)](https://github.com/unicity-astrid/astrid/actions/workflows/codeql.yml)
@@ -18,17 +16,20 @@
 
 ---
 
-Astrid treats an AI agent the way an operating system treats a process. It boots the agent,
-isolates it in a WebAssembly sandbox with no ambient authority, grants it exactly the capabilities
-it needs and nothing more, and appends every sensitive action to a hash-linked, signed audit chain
-that cannot be quietly rewritten. The model, the agent loop, and the tools all live in user-space
-**capsules**. The kernel holds no model and no business logic. It routes events and enforces
-boundaries.
+Unicity Astrid OS treats an AI agent the way an operating system treats a
+process. Every ability is a sealed WebAssembly **capsule**: the model, the
+loop, memory, tools, skills, guards, and frontends. Compose them into an agent,
+swap any part later, and the agent can never take more than you gave it.
+Unicity Astrid OS slots in underneath the agent you already use.
 
-The payoff is one sentence: **you can run an agent you do not trust**, because a jailbreak, a
-poisoned tool, or a plain bug still cannot reach anything you did not grant, and afterward you can
-prove exactly what ran. Authority is a capability the kernel enforces, not an instruction the model
-is trusted to follow.
+The kernel underneath is small and deliberately dumb. It routes events,
+enforces capabilities, runs the sandbox, and records the audit trail; it holds
+no model, tool schema, or business logic. A jailbreak, poisoned tool, or plain
+bug still cannot read a file, reach a network, or spawn a process outside its
+grant. Authority is a capability the kernel enforces, not an instruction the
+model is trusted to follow.
+
+## Quick start
 
 ```bash
 brew tap unicity-astrid/tap && brew install astrid
@@ -37,9 +38,14 @@ astrid doctor    # verify the daemon, capsules, and an LLM are ready
 astrid chat      # start a session; the daemon auto-starts
 ```
 
-## Why Astrid exists
+Start with the [Astrid website](https://unicity-astrid.github.io/) for a live
+tour, [the Book](https://unicity-astrid.github.io/book/) for the architecture,
+or the [Contributor Handbook](https://unicity-astrid.github.io/handbook/) to
+contribute to Unicity Astrid OS.
 
-Agent frameworks put trust in the prompt. Astrid puts it in the runtime. An agent is untrusted code
+## Why Unicity Astrid OS exists
+
+Agent frameworks put trust in the prompt. Unicity Astrid OS puts it in the runtime. An agent is untrusted code
 executing on your machine with access to your files, your network, and your credentials. Telling it
 to behave is not a security boundary. An OS-grade boundary is.
 
@@ -65,24 +71,19 @@ Frontends (the CLI, the HTTP gateway, Discord, and so on) are **uplinks**: proto
 connect to the daemon over a Unix domain socket and speak in IPC events. There is no `Frontend`
 trait. An uplink publishes events and receives responses like any other bus participant.
 
-```text
-  CLI      HTTP gateway      Discord   ...        uplinks (protocol clients)
-    │            │              │
-    └────────────┴──────────────┘  publish / subscribe IPC events
-                 │
-          Unix domain socket
-                 │
-    ┌────────────▼─────────────────────────┐
-    │  Kernel  (astrid-daemon)              │   a dumb event router
-    │  event bus · capability ACL           │   no business logic
-    │  audit chain · Wasmtime sandbox       │   no model, no tool schemas
-    └────────────┬─────────────────────────┘
-                 │  capability-checked host calls (astrid:* WIT ABI)
-    ┌────────────▼─────────────────────────┐
-    │  Capsules  (WASM, wasm32-unknown-unknown)         all intelligence
-    │  provider · orchestrator · tools · fs · http ·    lives here
-    │  session · registry · identity · ...
-    └───────────────────────────────────────┘
+```mermaid
+flowchart TB
+    CLI[CLI] -->|IPC events over Unix socket| Kernel
+    HTTP[HTTP gateway] -->|IPC events| Kernel
+    Discord[Discord] -->|IPC events| Kernel
+    Uplinks[Other uplinks] -->|IPC events| Kernel
+
+    subgraph Runtime[Unicity Astrid OS runtime]
+        Kernel[Kernel: astrid-daemon<br/>dumb event router<br/>event bus - capability ACL - audit chain - Wasmtime sandbox]
+        Capsules[WASM Component capsules: wasm32-unknown-unknown<br/>providers - orchestrators - tools - fs - http - sessions - registry - identity]
+    end
+
+    Kernel -->|capability-checked host calls<br/>astrid:* WIT ABI| Capsules
 ```
 
 Capsules communicate exclusively through the bus. Each declares what it needs and what it provides
@@ -102,31 +103,15 @@ Astrid's security is decomposed. There is no single gate every action funnels th
 no ambient authority, and authorization is enforced by independent, per-area mechanisms, each
 fail-closed and each enforced where the effect actually happens.
 
-```text
-  [WASM sandbox]    No syscalls, no file descriptors, no host memory.
-                    Every external resource is a capability-checked host call.
-
-  [Manifest gate]   Every host call is checked against the capsule's declared
-                    allowlist (fs / net / process). Empty means deny-all, with
-                    path-traversal and SSRF defenses. A prompt-injected capsule
-                    still cannot exceed its manifest.
-
-  [IPC ACL]         Publish/subscribe authorized by the manifest's declared
-                    topics, with per-principal routing.
-
-  [Capability]      ed25519 tokens scoped to resource patterns, principal-bound,
-                    expiry-checked, globally revocable. Per-device tokens can be
-                    scoped to a subset of the issuing principal's capabilities.
-
-  [Approval]        Human-in-the-loop for sensitive actions: Allow Once /
-                    Session / Always / Deny. "Allow Always" mints a capability
-                    token. Local-network egress elicits per-capsule consent.
-
-  [OS sandbox]      Spawned native subprocesses run under bwrap/seatbelt with
-                    the operator's credential directories masked.
-
-  [Audit]           Sensitive actions append to a hash-chained, ed25519-signed
-                    log, split per principal and independently verifiable.
+```mermaid
+flowchart TB
+    Action[A capsule action] --> Sandbox[WASM sandbox<br/>no syscalls, file descriptors, or host memory<br/>external resources are capability-checked host calls]
+    Action --> Manifest[Manifest gate<br/>declared file, network, and process allow-list<br/>empty is deny-all; path traversal and SSRF defenses]
+    Action --> IPC[IPC ACL<br/>declared publish and subscribe topics only<br/>per-principal routing]
+    Action --> Capability[Capability token<br/>ed25519, principal-bound, scoped, expiring, revocable<br/>per-device tokens can be subset-scoped]
+    Action --> Approval[Approval gate<br/>once - session - always - deny<br/>allow always mints a token; local egress elicits consent]
+    Action --> OS[OS sandbox<br/>bwrap on Linux - seatbelt on macOS for native subprocesses]
+    Action --> Audit[Audit chain<br/>signed, hash-linked JSONL decisions and calls<br/>split per principal and independently verifiable]
 ```
 
 These mechanisms are real and independently tested. There is no unified interceptor orchestrating
@@ -165,7 +150,7 @@ manages the rest.
 | `astrid-build` | Capsule compiler and packager. Builds to `wasm32-unknown-unknown`. |
 | `astrid-emit` | Stdio-to-bus bridge for external hook producers. |
 
-## Quick start
+## Initial setup
 
 `astrid init` fetches a *distro* (a curated capsule bundle), presents a provider multi-select, and
 prompts for whatever each provider needs, including its API key. Secrets are stored per principal in
