@@ -380,3 +380,16 @@ pub(crate) fn create_formatter(format: OutputFormat) -> Box<dyn OutputFormatter>
         OutputFormat::Json => Box::new(JsonFormatter::new()),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::PrettyFormatter;
+
+    #[test]
+    fn pretty_formatter_loads_embedded_syntaxes_and_themes() {
+        let formatter = PrettyFormatter::new();
+
+        assert!(formatter.syntax_set.find_syntax_by_token("rust").is_some());
+        assert_eq!(formatter.theme.name.as_deref(), Some("Base16 Ocean Dark"));
+    }
+}
