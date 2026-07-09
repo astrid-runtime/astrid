@@ -44,6 +44,9 @@ on:
       - 'e2e/**'
       - 'scripts/e2e/**'
 
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
