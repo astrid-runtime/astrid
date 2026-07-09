@@ -64,7 +64,16 @@ fn boot_log_stderr() -> Option<std::process::Stdio> {
 /// Returns an error if the daemon binary is not found, fails to spawn, or
 /// doesn't become ready within the bounded startup window.
 pub(crate) async fn spawn_daemon(ready_path: &std::path::Path) -> Result<std::process::Child> {
-    println!("{}", theme::Theme::info("Booting Astrid daemon..."));
+    spawn_daemon_inner(ready_path, true).await
+}
+
+async fn spawn_daemon_inner(
+    ready_path: &std::path::Path,
+    announce: bool,
+) -> Result<std::process::Child> {
+    if announce {
+        println!("{}", theme::Theme::info("Booting Astrid daemon..."));
+    }
     let ws = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
     let daemon_bin = find_companion_binary("astrid-daemon")?;
 
@@ -128,12 +137,25 @@ pub(crate) async fn spawn_daemon(ready_path: &std::path::Path) -> Result<std::pr
 /// Checks the socket path, cleans up stale sockets, and spawns a fresh
 /// daemon when no live daemon is reachable.
 pub(crate) async fn ensure_daemon(label: &str) -> Result<()> {
+    ensure_daemon_inner(label, true).await
+}
+
+/// Ensure the daemon is running without writing to stdout.
+///
+/// Used by `astrid mcp serve`, whose stdout is the MCP JSON-RPC transport.
+pub(crate) async fn ensure_daemon_quiet(label: &str) -> Result<()> {
+    ensure_daemon_inner(label, false).await
+}
+
+async fn ensure_daemon_inner(label: &str, announce: bool) -> Result<()> {
     let socket_path = socket_client::proxy_socket_path();
     let ready_path = socket_client::readiness_path();
 
     let needs_boot = if socket_path.exists() {
         if tokio::net::UnixStream::connect(&socket_path).await.is_ok() {
-            eprintln!("[{label}] Connected to existing daemon");
+            if announce {
+                eprintln!("[{label}] Connected to existing daemon");
+            }
             false
         } else {
             let _ = std::fs::remove_file(&socket_path);
@@ -144,7 +166,7 @@ pub(crate) async fn ensure_daemon(label: &str) -> Result<()> {
         true
     };
     if needs_boot {
-        spawn_daemon(&ready_path).await?;
+        spawn_daemon_inner(&ready_path, announce).await?;
     }
     Ok(())
 }

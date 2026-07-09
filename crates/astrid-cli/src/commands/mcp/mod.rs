@@ -41,6 +41,7 @@ mod ingress;
 #[cfg(unix)]
 mod parent_death;
 mod server;
+mod session_guard;
 mod watch;
 
 use std::process::ExitCode;
@@ -111,14 +112,10 @@ pub(crate) async fn serve(principal: Option<&str>) -> Result<ExitCode> {
         None => crate::principal::current(),
     };
 
-    let socket_path = crate::socket_client::proxy_socket_path();
-    if !socket_path.exists() {
-        anyhow::bail!(
-            "No Astrid daemon is running (socket not found at {}). \
-             Start it with `astrid start` before launching `astrid mcp serve`.",
-            socket_path.display()
-        );
-    }
+    // `mcp serve` owns stdout for JSON-RPC, so daemon bootstrap must be quiet.
+    crate::commands::daemon::ensure_daemon_quiet("mcp-serve")
+        .await
+        .context("failed to ensure Astrid daemon for `astrid mcp serve`")?;
 
     // The shim holds ONE uplink connection for its whole lifetime. The
     // session id is ephemeral — it only scopes this transport's frames,
@@ -139,6 +136,8 @@ pub(crate) async fn serve(principal: Option<&str>) -> Result<ExitCode> {
         principal = %caller,
         "astrid mcp serve: uplink established, starting MCP stdio transport"
     );
+
+    tokio::spawn(session_guard::run(caller.clone()));
 
     let server = AstridMcpServer::new(Arc::new(Mutex::new(client)), caller.to_string());
 
