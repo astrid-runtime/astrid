@@ -9,6 +9,10 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
 
 ## [Unreleased]
 
+### Changed
+
+- **Astrid's MCP bridge now uses RMCP 2.2.** The client and server adapt to RMCP's current content and elicitation APIs while preserving existing roots and sampling support. The CLI prompt also follows terminal color preferences, including `NO_COLOR`. The reviewed dependency refresh includes updated cryptography, signal handling, random-source, regex, ignore, and WebAssembly component tooling dependencies; `astrid-core` remains on TOML 0.8 because its public error types expose that API, and the optional SurrealDB backend remains on 3.1.5 pending a dedicated storage migration. Closes #1193.
+
 ### Fixed
 
 - **`astrid chat` now remains readable on light and dark terminal themes.** Primary chat text, user input, and the cursor inherit the terminal's configured foreground instead of forcing white or gray; assistant and running-tool bullets follow the same foreground. Closes #1178.

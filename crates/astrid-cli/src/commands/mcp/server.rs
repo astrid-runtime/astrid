@@ -42,7 +42,7 @@ use astrid_uplink::socket_client::ReadError;
 use rmcp::ErrorData as McpError;
 use rmcp::ServerHandler;
 use rmcp::model::{
-    CallToolRequestParams, CallToolResult, Content, Implementation, ListToolsResult,
+    CallToolRequestParams, CallToolResult, ContentBlock, Implementation, ListToolsResult,
     PaginatedRequestParams, ProtocolVersion, ServerCapabilities, ServerInfo, Tool,
 };
 use rmcp::service::{RequestContext, RoleServer};
@@ -351,9 +351,9 @@ impl ServerHandler for AstridMcpServer {
         // tool surface can change at runtime (capsules load/unload), so
         // it should honour `notifications/tools/list_changed`.
         let mut capabilities = ServerCapabilities::default();
-        capabilities.tools = Some(rmcp::model::ToolsCapability {
-            list_changed: Some(true),
-        });
+        let mut tools = rmcp::model::ToolsCapability::default();
+        tools.list_changed = Some(true);
+        capabilities.tools = Some(tools);
 
         // `ServerInfo` (`InitializeResult`) is `#[non_exhaustive]`, so it
         // must be built through its constructor + setters rather than a
@@ -420,7 +420,7 @@ impl ServerHandler for AstridMcpServer {
         let reply = if let Some(ingress) = ingress::IngressRequest::from_reply(&reply) {
             let granted = self.resolve_ingress(&context.peer, &ingress).await?;
             if !granted {
-                return Ok(CallToolResult::error(vec![Content::text(
+                return Ok(CallToolResult::error(vec![ContentBlock::text(
                     "Astrid tool calls were not authorized for this session.",
                 )]));
             }
@@ -458,12 +458,12 @@ impl ServerHandler for AstridMcpServer {
             match next_grant_step(&reply, grants_resolved) {
                 GrantStep::Terminal => break reply,
                 GrantStep::Fail(message) => {
-                    return Ok(CallToolResult::error(vec![Content::text(message)]));
+                    return Ok(CallToolResult::error(vec![ContentBlock::text(message)]));
                 },
                 GrantStep::Resolve(grant) => {
                     let granted = self.resolve_grant(&context.peer, &grant).await?;
                     if !granted {
-                        return Ok(CallToolResult::error(vec![Content::text(
+                        return Ok(CallToolResult::error(vec![ContentBlock::text(
                             GRANT_DENIED_MESSAGE,
                         )]));
                     }
@@ -717,19 +717,19 @@ fn tool_from_descriptor(desc: &Value) -> Option<Tool> {
     Some(tool)
 }
 
-/// Translate one broker content block into rmcp [`Content`].
+/// Translate one broker content block into rmcp [`ContentBlock`].
 ///
 /// The broker emits `{ "type": "text", "text": "..." }` blocks. Anything
 /// that is not a recognized text block is serialized to JSON text so the
 /// payload always reaches the MCP client as valid content.
-fn content_from_block(block: &Value) -> Content {
+fn content_from_block(block: &Value) -> ContentBlock {
     if block.get("type").and_then(Value::as_str) == Some("text")
         && let Some(text) = block.get("text").and_then(Value::as_str)
     {
-        return Content::text(text.to_string());
+        return ContentBlock::text(text.to_string());
     }
     debug!("MCP shim: non-text broker content block, serializing to text");
-    Content::text(block.to_string())
+    ContentBlock::text(block.to_string())
 }
 
 #[cfg(test)]

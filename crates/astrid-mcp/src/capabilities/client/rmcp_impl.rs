@@ -8,10 +8,16 @@ use astrid_core::{
     ElicitationAction as CoreElicitationAction, ElicitationRequest, UrlElicitationRequest,
 };
 use rmcp::model::{
-    ClientCapabilities, ClientInfo, CreateElicitationRequestParams, CreateElicitationResult,
-    CreateMessageRequestParams, CreateMessageResult, ElicitationAction as RmcpElicitationAction,
-    ElicitationCapability, FormElicitationCapability, Implementation, ListRootsResult, Role,
-    RootsCapabilities, SamplingCapability, SamplingMessageContent, UrlElicitationCapability,
+    ClientCapabilities, ClientInfo, ElicitRequestParams, ElicitResult,
+    ElicitationAction as RmcpElicitationAction, ElicitationCapability, FormElicitationCapability,
+    Implementation, Role, RootsCapabilities, SamplingCapability, UrlElicitationCapability,
+};
+#[allow(
+    deprecated,
+    reason = "Astrid supports MCP roots and sampling until their protocol-compatible replacements are designed."
+)]
+use rmcp::model::{
+    CreateMessageRequestParams, CreateMessageResult, ListRootsResult, SamplingMessageContentBlock,
 };
 use rmcp::service::{NotificationContext, RequestContext, RoleClient};
 use tracing::{debug, info, warn};
@@ -28,6 +34,10 @@ use super::bridge::{
 use super::handler::AstridClientHandler;
 use super::notice::ServerNotice;
 
+#[allow(
+    deprecated,
+    reason = "Astrid supports MCP roots and sampling until their protocol-compatible replacements are designed."
+)]
 impl rmcp::ClientHandler for AstridClientHandler {
     fn get_info(&self) -> ClientInfo {
         // `ClientCapabilities` is `#[non_exhaustive]`, so it can't be built with
@@ -41,9 +51,14 @@ impl rmcp::ClientHandler for AstridClientHandler {
         capabilities.elicitation = {
             let has_form = self.inner.has_elicitation();
             let has_url = self.inner.has_url_elicitation();
-            (has_form || has_url).then(|| ElicitationCapability {
-                form: has_form.then(FormElicitationCapability::default),
-                url: has_url.then(UrlElicitationCapability::default),
+            (has_form || has_url).then(|| {
+                let capability = ElicitationCapability::new();
+                let capability = has_form
+                    .then(FormElicitationCapability::default)
+                    .map_or(capability.clone(), |form| capability.with_form(form));
+                has_url
+                    .then(UrlElicitationCapability::default)
+                    .map_or(capability.clone(), |url| capability.with_url(url))
             })
         };
 
@@ -85,15 +100,16 @@ impl rmcp::ClientHandler for AstridClientHandler {
                     rmcp::model::SamplingContent::Multiple(items) => items.iter().find(|item| {
                         matches!(
                             item,
-                            SamplingMessageContent::Text(_) | SamplingMessageContent::Image(_)
+                            SamplingMessageContentBlock::Text(_)
+                                | SamplingMessageContentBlock::Image(_)
                         )
                     }),
                 };
                 let content = match first_supported {
-                    Some(SamplingMessageContent::Text(t)) => SamplingContent::Text {
+                    Some(SamplingMessageContentBlock::Text(t)) => SamplingContent::Text {
                         text: t.text.clone(),
                     },
-                    Some(SamplingMessageContent::Image(i)) => SamplingContent::Image {
+                    Some(SamplingMessageContentBlock::Image(i)) => SamplingContent::Image {
                         data: i.data.clone(),
                         mime_type: i.mime_type.clone(),
                     },
@@ -167,11 +183,11 @@ impl rmcp::ClientHandler for AstridClientHandler {
 
     async fn create_elicitation(
         &self,
-        request: CreateElicitationRequestParams,
+        request: ElicitRequestParams,
         _context: RequestContext<RoleClient>,
-    ) -> Result<CreateElicitationResult, rmcp::ErrorData> {
+    ) -> Result<ElicitResult, rmcp::ErrorData> {
         match request {
-            CreateElicitationRequestParams::FormElicitationParams {
+            ElicitRequestParams::FormElicitationParams {
                 message,
                 requested_schema,
                 ..
@@ -208,25 +224,17 @@ impl rmcp::ClientHandler for AstridClientHandler {
                 match response.action {
                     CoreElicitationAction::Submit { value } => {
                         let content = wrap_response_value(value, prop_name.as_deref());
-                        Ok(CreateElicitationResult {
-                            action: RmcpElicitationAction::Accept,
-                            content: Some(content),
-                            meta: None,
-                        })
+                        Ok(ElicitResult::new(RmcpElicitationAction::Accept).with_content(content))
                     },
-                    CoreElicitationAction::Cancel => Ok(CreateElicitationResult {
-                        action: RmcpElicitationAction::Cancel,
-                        content: None,
-                        meta: None,
-                    }),
-                    CoreElicitationAction::Dismiss => Ok(CreateElicitationResult {
-                        action: RmcpElicitationAction::Decline,
-                        content: None,
-                        meta: None,
-                    }),
+                    CoreElicitationAction::Cancel => {
+                        Ok(ElicitResult::new(RmcpElicitationAction::Cancel))
+                    },
+                    CoreElicitationAction::Dismiss => {
+                        Ok(ElicitResult::new(RmcpElicitationAction::Decline))
+                    },
                 }
             },
-            CreateElicitationRequestParams::UrlElicitationParams { message, url, .. } => {
+            ElicitRequestParams::UrlElicitationParams { message, url, .. } => {
                 let Some(ref handler) = self.inner.url_elicitation else {
                     return Err(rmcp::ErrorData::internal_error(
                         "URL elicitation not supported",
@@ -238,19 +246,15 @@ impl rmcp::ClientHandler for AstridClientHandler {
                 let response = handler.handle_url_elicitation(core_request).await;
 
                 if response.completed {
-                    Ok(CreateElicitationResult {
-                        action: RmcpElicitationAction::Accept,
-                        content: None,
-                        meta: None,
-                    })
+                    Ok(ElicitResult::new(RmcpElicitationAction::Accept))
                 } else {
-                    Ok(CreateElicitationResult {
-                        action: RmcpElicitationAction::Decline,
-                        content: None,
-                        meta: None,
-                    })
+                    Ok(ElicitResult::new(RmcpElicitationAction::Decline))
                 }
             },
+            _ => Err(rmcp::ErrorData::invalid_params(
+                "Unsupported elicitation request variant",
+                None,
+            )),
         }
     }
 

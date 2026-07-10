@@ -135,20 +135,19 @@ impl ReplEditor {
     /// Returns [`ReadlineEvent::Interrupted`] on Ctrl+C and
     /// [`ReadlineEvent::Eof`] on Ctrl+D.
     pub(crate) fn readline(&mut self) -> ReadlineEvent {
-        let prompt = "\x1b[1;32m> \x1b[0m"; // bold green "> "
         let continuation = "  ";
 
         let mut accumulated = String::new();
         let mut is_continuation = false;
 
         loop {
-            let p = if is_continuation {
-                continuation
+            let line = if is_continuation {
+                self.editor.readline(continuation)
             } else {
-                prompt
+                self.editor.readline(&("> ", "\x1b[1;32m> \x1b[0m"))
             };
 
-            match self.editor.readline(p) {
+            match line {
                 Ok(line) => {
                     if line.ends_with('\\') {
                         // Strip trailing backslash and continue to next line.
