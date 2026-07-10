@@ -9,6 +9,10 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
 
 ## [Unreleased]
 
+### Fixed
+
+- **`astrid chat` now remains readable on light and dark terminal themes.** Primary chat text, user input, and the cursor inherit the terminal's configured foreground instead of forcing white or gray; assistant and running-tool bullets follow the same foreground. Closes #1178.
+
 ## [0.9.4] - 2026-07-09
 
 ### Added

@@ -32,7 +32,7 @@ impl SpinnerStyle {
     }
 }
 
-/// Color theme — works on dark terminals.
+/// Color theme — primary text inherits the terminal foreground.
 #[derive(Debug, Clone)]
 pub(crate) struct Theme {
     /// User input text
@@ -68,8 +68,8 @@ pub(crate) struct Theme {
 impl Default for Theme {
     fn default() -> Self {
         Self {
-            user: Color::White,
-            assistant: Color::Gray,
+            user: Color::Reset,
+            assistant: Color::Reset,
             muted: Color::DarkGray,
             tool: Color::Cyan,
             success: Color::Green,
@@ -77,11 +77,27 @@ impl Default for Theme {
             error: Color::Red,
             thinking: Color::Magenta,
             border: Color::DarkGray,
-            cursor: Color::White,
+            cursor: Color::Reset,
             diff_added: Color::Green,
             diff_removed: Color::Red,
             diff_context: Color::DarkGray,
             spinner: SpinnerStyle::Stellar,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use ratatui::style::Color;
+
+    use super::Theme;
+
+    #[test]
+    fn primary_text_inherits_the_terminal_foreground() {
+        let theme = Theme::default();
+
+        assert_eq!(theme.user, Color::Reset);
+        assert_eq!(theme.assistant, Color::Reset);
+        assert_eq!(theme.cursor, Color::Reset);
     }
 }

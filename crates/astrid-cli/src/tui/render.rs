@@ -574,7 +574,7 @@ fn render_nexus(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
                                     if is_first_visual {
                                         let mut spans = vec![Span::styled(
                                             "⏺ ",
-                                            Style::default().fg(Color::White),
+                                            Style::default().fg(theme.assistant),
                                         )];
                                         spans.extend(markdown_to_spans(sub, theme));
                                         lines.push(Line::from(spans));
@@ -637,7 +637,7 @@ fn render_nexus(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
         }
     }
 
-    // Running tools: white ⏺ with spinner + ToolName(arg)
+    // Running tools: primary-text bullet with spinner + ToolName(arg)
     for tool in &app.running_tools {
         let elapsed = tool.start_time.elapsed();
         let spinner = theme.spinner.frame_at(elapsed.as_millis());
@@ -650,7 +650,7 @@ fn render_nexus(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
         };
 
         lines.push(Line::from(vec![
-            Span::styled("⏺ ", Style::default().fg(Color::White)),
+            Span::styled("⏺ ", Style::default().fg(theme.assistant)),
             Span::styled(format!("{spinner} "), Style::default().fg(theme.tool)),
             Span::styled(tool_header, Style::default().fg(theme.tool)),
             Span::styled(
