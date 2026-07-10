@@ -243,6 +243,11 @@ pub(crate) enum Commands {
         /// Set a variable (repeatable): KEY=VALUE.
         #[arg(long = "var", value_name = "KEY=VALUE")]
         vars: Vec<String>,
+        /// Grant the target principal access to every capsule the distro
+        /// installs (same mechanism as `agent modify --add-capsule`).
+        /// No-op for the `default` principal, which already has admin access.
+        #[arg(long = "grant-capsules", requires = "distro")]
+        grant_capsules: bool,
     },
 
     /// View resolved configuration, edit it in `$EDITOR`, or print paths.

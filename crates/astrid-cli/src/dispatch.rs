@@ -172,6 +172,7 @@ async fn dispatch_subcommand(
             allow_unsigned,
             accept_new_key,
             vars,
+            grant_capsules,
         }) => {
             let distro = distro.ok_or_else(|| {
                 anyhow::anyhow!(
@@ -184,6 +185,7 @@ async fn dispatch_subcommand(
                 allow_unsigned,
                 accept_new_key,
                 vars: commands::init::parse_cli_vars(&vars)?,
+                grant_capsules,
             };
             commands::init::run_init(&distro, &opts).await?;
             commands::self_update::ensure_path_setup()?;
@@ -386,6 +388,9 @@ async fn dispatch_distro(command: DistroCommands) -> Result<ExitCode> {
                 allow_unsigned,
                 accept_new_key,
                 vars: commands::init::parse_cli_vars(&vars)?,
+                // `distro apply` has no `--grant-capsules` surface; granting
+                // stays on `astrid init`. Capsules install without grants here.
+                grant_capsules: false,
             };
             commands::init::run_init(&distro, &opts).await?;
             Ok(ExitCode::SUCCESS)

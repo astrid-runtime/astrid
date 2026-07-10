@@ -38,6 +38,13 @@ pub(crate) struct InitOpts {
     pub(crate) accept_new_key: bool,
     /// Pre-supplied variable values from `--var KEY=VALUE`.
     pub(crate) vars: HashMap<String, String>,
+    /// Grant the target principal capsule-access for every capsule the
+    /// distro installs, via the same kernel path as `astrid agent modify
+    /// --add-capsule`. Only valid with `--distro`; a no-op for the
+    /// bootstrap `default` principal (which holds admin `*`). Opt-in:
+    /// without it, `init` installs capsules but attaches no grants and
+    /// prints the manual `agent modify` command for discoverability.
+    pub(crate) grant_capsules: bool,
 }
 
 /// Parse `--var KEY=VALUE` strings into a map.
@@ -71,11 +78,26 @@ pub(crate) async fn run_init(distro_source: &str, opts: &InitOpts) -> anyhow::Re
     // manual installer agree on where a principal's capsules live.
     let principal = crate::principal::current();
 
+    // `--grant-capsules` is only meaningful when a distro install is
+    // resolving the capsule set to grant. Reject an empty source up front so
+    // the flag can never be silently honoured without a distro.
+    grant::validate_grant_capsules(opts.grant_capsules, !distro_source.is_empty())?;
+
     // Workspace init (existing behaviour).
     init_workspace()?;
 
-    // Offline, signed, self-contained install path.
+    // Offline, signed, self-contained install path. `--grant-capsules` is not
+    // wired for `.shuttle` archives (the installed set isn't threaded back
+    // here); fail loud rather than silently skip the grant the operator asked
+    // for, pointing at the manual path.
     if distro_source.ends_with(".shuttle") {
+        if opts.grant_capsules {
+            bail!(
+                "--grant-capsules is not supported for .shuttle installs yet — \
+                 install first, then grant with `astrid agent modify <principal> \
+                 --add-capsule <name>` for each installed capsule."
+            );
+        }
         return run_init_from_shuttle(distro_source, opts);
     }
 
@@ -113,6 +135,20 @@ pub(crate) async fn run_init(distro_source: &str, opts: &InitOpts) -> anyhow::Re
                     .unwrap_or(&manifest.distro.name),
             ))
         );
+        // Idempotent grant path: a re-run with `--grant-capsules` on an
+        // already-installed principal still (re-)applies grants for the
+        // locked capsule set. `apply_set_delta` dedups kernel-side, so a
+        // principal that already holds them reports "no change" rather than
+        // erroring or duplicating — and this is also how a first run whose
+        // grant step failed (daemon was down) recovers on re-run.
+        if opts.grant_capsules {
+            let installed: Vec<String> = existing_lock
+                .capsules
+                .iter()
+                .map(|c| c.name.clone())
+                .collect();
+            grant::apply_or_hint_grants(&principal, &installed, opts.grant_capsules).await?;
+        }
         return Ok(());
     }
 
@@ -182,12 +218,22 @@ pub(crate) async fn run_init(distro_source: &str, opts: &InitOpts) -> anyhow::Re
     // actually retries the missing capsules instead of short-circuiting at
     // the freshness gate (`is_lock_fresh` diffs only distro id+version, not
     // the capsule set) — see `should_write_lock`.
+    // Capture the names that actually installed BEFORE `locked` is consumed
+    // into the lock — the grant set is EXACTLY this locally-resolved set, never
+    // a manifest-declared string the installer didn't land (security stance:
+    // grants derive from what was installed, on explicit `--grant-capsules`).
+    let installed_names: Vec<String> = locked.iter().map(|c| c.name.clone()).collect();
     let lock = create_lock_from_parts(schema_version, &distro_id, &distro_version, locked);
     let wrote_lock = persist_lock_if_earned(&lock_path, total, succeeded, &lock)?;
 
     eprintln!();
     if wrote_lock {
         eprintln!("{}", Theme::success("Installation complete."));
+        // Apply capsule grants (opt-in) or print the discoverability hint.
+        // On a grant failure the capsules are already installed and the lock
+        // is written; this returns Err so init exits non-zero with the exact
+        // manual command to finish.
+        grant::apply_or_hint_grants(&principal, &installed_names, opts.grant_capsules).await?;
         eprintln!("  Run {} to start.", Theme::prompt("astrid"));
         Ok(())
     } else {
@@ -842,6 +888,11 @@ fn onboard_llm_providers(
         }
     }
 }
+
+/// `--grant-capsules` post-install grant logic, split out to keep this
+/// file under the per-file size cap.
+#[path = "init_grant.rs"]
+mod grant;
 
 #[cfg(test)]
 #[path = "init_tests.rs"]
