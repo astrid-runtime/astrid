@@ -325,4 +325,50 @@ mod tests {
             _ => panic!("text content must remain text"),
         }
     }
+
+    #[test]
+    fn rmcp_image_and_resource_content_are_preserved() {
+        let image = ContentBlock::image("aGVsbG8=", "image/png");
+        match ToolContent::from_rmcp(&image) {
+            ToolContent::Image { data, mime_type } => {
+                assert_eq!(data, "aGVsbG8=");
+                assert_eq!(mime_type, "image/png");
+            },
+            _ => panic!("image content must remain image"),
+        }
+
+        let text_resource = ContentBlock::resource(
+            rmcp_model::ResourceContents::text("hello", "file:///note.txt")
+                .with_mime_type("text/markdown"),
+        );
+        match ToolContent::from_rmcp(&text_resource) {
+            ToolContent::Resource {
+                uri,
+                data,
+                mime_type,
+            } => {
+                assert_eq!(uri, "file:///note.txt");
+                assert_eq!(data.as_deref(), Some("hello"));
+                assert_eq!(mime_type.as_deref(), Some("text/markdown"));
+            },
+            _ => panic!("text resource content must remain resource"),
+        }
+
+        let blob_resource = ContentBlock::resource(
+            rmcp_model::ResourceContents::blob("aGVsbG8=", "file:///image.bin")
+                .with_mime_type("application/octet-stream"),
+        );
+        match ToolContent::from_rmcp(&blob_resource) {
+            ToolContent::Resource {
+                uri,
+                data,
+                mime_type,
+            } => {
+                assert_eq!(uri, "file:///image.bin");
+                assert_eq!(data.as_deref(), Some("aGVsbG8="));
+                assert_eq!(mime_type.as_deref(), Some("application/octet-stream"));
+            },
+            _ => panic!("blob resource content must remain resource"),
+        }
+    }
 }

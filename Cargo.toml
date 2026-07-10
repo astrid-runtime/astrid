@@ -176,10 +176,10 @@ rcgen = "0.14"
 rustls = { version = "0.23", features = ["aws-lc-rs"] }
 regex = "1.10"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
-# Pinned to the 1.8.x patch range (~). rmcp shipped a breaking API change in the
-# 1.7 -> 1.8 MINOR bump, and this repo commits no Cargo.lock, so a plain caret
-# (1.x) let CI silently resolve the breaking minor. Pinning to the patch range
-# allows bug and security fixes while preventing automatic upgrades to future breaking minors.
+# Pinned to the 2.2.x patch range (~). RMCP releases breaking protocol and API
+# changes in minor versions. Cargo.lock is committed, but the patch range also
+# prevents fresh resolution from silently adopting a future incompatible minor.
+# It still admits compatible bug and security fixes.
 rmcp = { version = "~2.2.0", features = ["server", "client", "transport-io", "transport-child-process", "elicitation", "macros", "schemars"] }
 rustyline = { version = "18", features = ["derive"] }
 semver = "1"
