@@ -1,6 +1,6 @@
 //! MCP types for tools, resources, and results.
 
-use rmcp::model::{self as rmcp_model, RawContent};
+use rmcp::model::{self as rmcp_model, ContentBlock};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -168,45 +168,52 @@ pub enum ToolContent {
 }
 
 impl ToolContent {
-    /// Convert from an rmcp `Content` (which is `Annotated<RawContent>`).
-    fn from_rmcp(content: &rmcp_model::Content) -> Self {
-        match &**content {
-            RawContent::Text(text) => Self::Text {
+    /// Convert from an rmcp content block.
+    fn from_rmcp(content: &ContentBlock) -> Self {
+        match content {
+            ContentBlock::Text(text) => Self::Text {
                 text: text.text.clone(),
             },
-            RawContent::Image(image) => Self::Image {
+            ContentBlock::Image(image) => Self::Image {
                 data: image.data.clone(),
                 mime_type: image.mime_type.clone(),
             },
-            RawContent::Resource(embedded) => {
-                let (uri, data, mime_type) = match &embedded.resource {
-                    rmcp_model::ResourceContents::TextResourceContents {
-                        uri,
-                        mime_type,
-                        text,
-                        ..
-                    } => (uri.clone(), Some(text.clone()), mime_type.clone()),
-                    rmcp_model::ResourceContents::BlobResourceContents {
-                        uri,
-                        mime_type,
-                        blob,
-                        ..
-                    } => (uri.clone(), Some(blob.clone()), mime_type.clone()),
-                };
-                Self::Resource {
+            ContentBlock::Resource(embedded) => match &embedded.resource {
+                rmcp_model::ResourceContents::TextResourceContents {
                     uri,
-                    data,
                     mime_type,
-                }
+                    text,
+                    ..
+                } => Self::Resource {
+                    uri: uri.clone(),
+                    data: Some(text.clone()),
+                    mime_type: mime_type.clone(),
+                },
+                rmcp_model::ResourceContents::BlobResourceContents {
+                    uri,
+                    mime_type,
+                    blob,
+                    ..
+                } => Self::Resource {
+                    uri: uri.clone(),
+                    data: Some(blob.clone()),
+                    mime_type: mime_type.clone(),
+                },
+                _ => Self::Text {
+                    text: "[unsupported resource content]".to_string(),
+                },
             },
             // Audio and ResourceLink variants map to text fallbacks
-            RawContent::Audio(_) => Self::Text {
+            ContentBlock::Audio(_) => Self::Text {
                 text: "[audio content]".to_string(),
             },
-            RawContent::ResourceLink(resource) => Self::Resource {
+            ContentBlock::ResourceLink(resource) => Self::Resource {
                 uri: resource.uri.clone(),
                 data: None,
                 mime_type: resource.mime_type.clone(),
+            },
+            _ => Self::Text {
+                text: "[unsupported content type]".to_string(),
             },
         }
     }
@@ -307,5 +314,15 @@ mod tests {
         assert!(!result.success);
         assert!(result.is_error);
         assert_eq!(result.error, Some("Something went wrong".to_string()));
+    }
+
+    #[test]
+    fn rmcp_text_content_is_preserved() {
+        let content = ContentBlock::text("Hello from MCP");
+
+        match ToolContent::from_rmcp(&content) {
+            ToolContent::Text { text } => assert_eq!(text, "Hello from MCP"),
+            _ => panic!("text content must remain text"),
+        }
     }
 }
