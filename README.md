@@ -1,26 +1,25 @@
-# Unicity Astrid OS
+# Astrid
 
 <p align="center">
-  <img src="assets/astrid-github-preview.png" alt="Unicity Astrid OS" width="640">
+  <img src="assets/astrid-github-preview.png" alt="Astrid" width="640">
 </p>
 
-**A modular operating system for AI agents. Build from sealed parts, swap any
-part later, and keep every capability under control.**
+**A portable, capability-secure operating system for composable software.**
 
-[![CI](https://github.com/unicity-astrid/astrid/actions/workflows/ci.yml/badge.svg)](https://github.com/unicity-astrid/astrid/actions/workflows/ci.yml)
-[![CodeQL](https://github.com/unicity-astrid/astrid/actions/workflows/codeql.yml/badge.svg)](https://github.com/unicity-astrid/astrid/actions/workflows/codeql.yml)
+[![CI](https://github.com/astrid-runtime/astrid/actions/workflows/ci.yml/badge.svg)](https://github.com/astrid-runtime/astrid/actions/workflows/ci.yml)
+[![CodeQL](https://github.com/astrid-runtime/astrid/actions/workflows/codeql.yml/badge.svg)](https://github.com/astrid-runtime/astrid/actions/workflows/codeql.yml)
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/License-MIT%20OR%20Apache--2.0-blue.svg)](#license)
 [![MSRV](https://img.shields.io/badge/MSRV-1.95-blue)](https://www.rust-lang.org)
 [![Rust 2024](https://img.shields.io/badge/Rust-2024_edition-orange)](https://www.rust-lang.org)
-[![The Astrid Book](https://img.shields.io/badge/docs-The_Astrid_Book-8A2BE2)](https://github.com/unicity-astrid/book)
+[![The Astrid Book](https://img.shields.io/badge/docs-The_Astrid_Book-8A2BE2)](https://github.com/astrid-runtime/book)
 
 ---
 
-Unicity Astrid OS treats an AI agent the way an operating system treats a
-process. Every ability is a sealed WebAssembly **capsule**: the model, the
-loop, memory, tools, skills, guards, and frontends. Compose them into an agent,
-swap any part later, and the agent can never take more than you gave it.
-Unicity Astrid OS slots in underneath the agent you already use.
+Astrid treats a component the way an operating system treats a process. Every
+ability is a sealed WebAssembly **capsule**: it can be composed with other
+capsules, granted only explicit authority, and replaced without expanding its
+reach. Astrid is independent of any particular product, model provider, agent
+loop, user interface, or distribution.
 
 The kernel underneath is small and deliberately dumb. It routes events,
 enforces capabilities, runs the sandbox, and records the audit trail; it holds
@@ -32,20 +31,19 @@ model is trusted to follow.
 ## Quick start
 
 ```bash
-brew tap unicity-astrid/tap && brew install astrid
-astrid init      # pick a provider, enter its key, install a distro
-astrid doctor    # verify the daemon, capsules, and an LLM are ready
-astrid chat      # start a session; the daemon auto-starts
+brew tap astrid-runtime/tap && brew install astrid
+astrid start
+astrid status
+astrid capsule list
 ```
 
-Start with the [Astrid website](https://unicity-astrid.github.io/) for a live
-tour, [the Book](https://unicity-astrid.github.io/book/) for the architecture,
-or the [Contributor Handbook](https://unicity-astrid.github.io/handbook/) to
-contribute to Unicity Astrid OS.
+Start with [the Book](https://github.com/astrid-runtime/book) for the
+architecture or the [Contributor Handbook](https://github.com/astrid-runtime/handbook)
+to contribute.
 
-## Why Unicity Astrid OS exists
+## Why Astrid exists
 
-Agent frameworks put trust in the prompt. Unicity Astrid OS puts it in the runtime. An agent is untrusted code
+Agent frameworks put trust in the prompt. Astrid puts it in the runtime. An agent is untrusted code
 executing on your machine with access to your files, your network, and your credentials. Telling it
 to behave is not a security boundary. An OS-grade boundary is.
 
@@ -78,7 +76,7 @@ flowchart TB
     Discord[Discord] -->|IPC events| Kernel
     Uplinks[Other uplinks] -->|IPC events| Kernel
 
-    subgraph Runtime[Unicity Astrid OS runtime]
+    subgraph Runtime[Astrid]
         Kernel[Kernel: astrid-daemon<br/>dumb event router<br/>event bus - capability ACL - audit chain - Wasmtime sandbox]
         Capsules[WASM Component capsules: wasm32-unknown-unknown<br/>providers - orchestrators - tools - fs - http - sessions - registry - identity]
     end
@@ -115,7 +113,7 @@ flowchart TB
 ```
 
 These mechanisms are real and independently tested. There is no unified interceptor orchestrating
-them. The [five-layer gate](https://github.com/unicity-astrid/book) chapter of The Astrid Book walks
+them. The [five-layer gate](https://github.com/astrid-runtime/book) chapter of The Astrid Book walks
 each layer against the source.
 
 ## Install
@@ -123,7 +121,7 @@ each layer against the source.
 **Homebrew (macOS and Linux):**
 
 ```bash
-brew tap unicity-astrid/tap
+brew tap astrid-runtime/tap
 brew install astrid
 ```
 
@@ -136,7 +134,7 @@ cargo install astrid
 **From source:**
 
 ```bash
-git clone https://github.com/unicity-astrid/astrid
+git clone https://github.com/astrid-runtime/astrid
 cd astrid && cargo build --release   # binary at ./target/release/astrid
 ```
 
@@ -223,7 +221,7 @@ astrid capsule build             # compile and package
 astrid capsule install .         # hot-loaded into the running daemon, no restart
 ```
 
-Capsule authors depend on [`astrid-sdk`](https://github.com/unicity-astrid/sdk-rust), which mirrors
+Capsule authors depend on [`astrid-sdk`](https://github.com/astrid-runtime/sdk-rust), which mirrors
 the `std` module layout (`fs`, `net`, `process`, `env`, `time`, `log`) and adds Astrid modules
 (`ipc`, `kv`, `http`, `hooks`, `uplink`, `identity`, `approval`). The `#[capsule]` proc macro
 generates the WASM ABI boilerplate: exports, serialization, and dispatch for tools, commands, hooks,
@@ -285,9 +283,9 @@ list.
 
 ## Documentation
 
-- **[The Astrid Book](https://github.com/unicity-astrid/book)** is the canonical reference: the
+- **[The Astrid Book](https://github.com/astrid-runtime/book)** is the canonical reference: the
   kernel, the capsule model, the host ABI, the bus, and the security model, grounded in the source
-  with file and line anchors. Start with [Getting Started](https://github.com/unicity-astrid/book)
+  with file and line anchors. Start with [Getting Started](https://github.com/astrid-runtime/book)
   to go from nothing to a working agent in a few minutes.
 - **Operator guides** live in [`docs/`](docs/): the [unified config schema](docs/config.md),
   [LLM model selection](docs/models.md), [distro signing](docs/distro-signing.md), the
@@ -316,7 +314,7 @@ issue. See [CONTRIBUTING.md](CONTRIBUTING.md) for the issue-first workflow and t
 
 Changes to any contract surface (the host ABI, the IPC protocol, the capability model, the manifest
 schema, or the SDK public API) go through the RFC process in the
-[RFCs repository](https://github.com/unicity-astrid/rfcs) before implementation.
+[RFCs repository](https://github.com/astrid-runtime/rfcs) before implementation.
 
 ## License
 

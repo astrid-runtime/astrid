@@ -1,8 +1,8 @@
 blank_issues_enabled: true
 contact_links:
   - name: Security Vulnerability
-    url: https://github.com/unicity-astrid/astrid/security/advisories/new
+    url: https://github.com/astrid-runtime/astrid/security/advisories/new
     about: Report security vulnerabilities privately. Do not open a public issue.
   - name: RFC Proposal
-    url: https://github.com/unicity-astrid/astrid-rfcs
+    url: https://github.com/astrid-runtime/rfcs
     about: Propose new capsule interface standards via the RFC process.

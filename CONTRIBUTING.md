@@ -90,5 +90,5 @@ Only core and maintainer tier contributors can modify these crates.
 ## Reporting Security Vulnerabilities
 
 Do **not** open a public issue. Use
-[GitHub Security Advisories](https://github.com/unicity-astrid/astrid/security/advisories/new)
+[GitHub Security Advisories](https://github.com/astrid-runtime/astrid/security/advisories/new)
 to report vulnerabilities privately. See [SECURITY.md](SECURITY.md) for details.

@@ -36,7 +36,7 @@ version = "0.9.4"
 edition = "2024"
 authors = ["Joshua J. Bouw <dev@joshuajbouw.com>", "Unicity Labs <info@unicity-labs.com>"]
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/unicity-astrid/astrid"
+repository = "https://github.com/astrid-runtime/astrid"
 rust-version = "1.95"
 
 [workspace.dependencies]
