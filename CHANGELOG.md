@@ -11,6 +11,9 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
 
 ### Changed
 
+- **Removed the product-branded README image.** Astrid's repository front door
+  now presents the runtime without Unicity artwork. Closes #1204.
+
 - **Astrid's mutable repository identity now points to `astrid-runtime`.** Current
   documentation links, release automation, the WIT submodule origin, and the
   self-update default use the Astrid Runtime organization, while published crate,
