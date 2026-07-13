@@ -363,10 +363,8 @@ pub(crate) async fn handle_status() -> Result<()> {
     }
 
     match KernelClient::connect(crate::principal::current()).await {
-        Ok(mut client) => {
-            if let Ok(KernelResponse::Status(status)) =
-                client.request(KernelRequest::GetStatus).await
-            {
+        Ok(mut client) => match client.request(KernelRequest::GetStatus).await {
+            Ok(KernelResponse::Status(status)) => {
                 let uptime_display = format_uptime(status.uptime_secs);
                 println!(
                     "{}",
@@ -381,9 +379,16 @@ pub(crate) async fn handle_status() -> Result<()> {
                 for capsule in &status.loaded_capsules {
                     println!("    - {capsule}");
                 }
-            } else {
-                println!("{}", theme::Theme::error("Unexpected response from daemon"));
-            }
+            },
+            Ok(KernelResponse::Error(message)) => println!(
+                "{}",
+                theme::Theme::error(&format!("Daemon rejected status request: {message}"))
+            ),
+            Ok(_) => println!("{}", theme::Theme::error("Unexpected response from daemon")),
+            Err(error) => println!(
+                "{}",
+                theme::Theme::error(&format!("Failed to query daemon: {error}"))
+            ),
         },
         Err(_) => {
             println!(

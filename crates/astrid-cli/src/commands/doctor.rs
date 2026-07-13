@@ -138,13 +138,21 @@ async fn daemon_roundtrip() -> Result<()> {
     )
     .await
     .map_err(|_| anyhow::anyhow!("connection timed out after 5s"))??;
-    let _ = tokio::time::timeout(
+    match tokio::time::timeout(
         Duration::from_secs(5),
         client.request(KernelRequest::GetStatus),
     )
     .await
-    .map_err(|_| anyhow::anyhow!("daemon response timed out after 5s"))??;
-    Ok(())
+    .map_err(|_| anyhow::anyhow!("daemon response timed out after 5s"))??
+    {
+        KernelResponse::Status(_) => Ok(()),
+        KernelResponse::Error(message) => {
+            Err(anyhow::anyhow!("daemon rejected status request: {message}"))
+        },
+        _ => Err(anyhow::anyhow!(
+            "daemon returned an unexpected status response"
+        )),
+    }
 }
 
 /// Query the daemon for agent-loop readiness over the same socket the

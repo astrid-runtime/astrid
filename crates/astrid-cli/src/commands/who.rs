@@ -61,12 +61,29 @@ pub(crate) async fn run(args: WhoArgs) -> Result<ExitCode> {
         return Ok(ExitCode::from(1));
     };
     let status = match client.request(KernelRequest::GetStatus).await {
-        Ok(KernelResponse::Status(status)) => Some(status),
-        _ => None,
+        Ok(KernelResponse::Status(status)) => status,
+        Ok(KernelResponse::Error(message)) => {
+            eprintln!(
+                "{}",
+                Theme::error(&format!("Daemon rejected status request: {message}"))
+            );
+            return Ok(ExitCode::from(1));
+        },
+        Ok(_) => {
+            eprintln!("{}", Theme::error("Unexpected response from daemon"));
+            return Ok(ExitCode::from(1));
+        },
+        Err(error) => {
+            eprintln!(
+                "{}",
+                Theme::error(&format!("Failed to query daemon: {error}"))
+            );
+            return Ok(ExitCode::from(1));
+        },
     };
 
     let connections: Vec<Connection> = match status {
-        Some(s) if !s.connections_by_principal.is_empty() => s
+        s if !s.connections_by_principal.is_empty() => s
             .connections_by_principal
             .iter()
             .flat_map(|pc| {
@@ -80,7 +97,7 @@ pub(crate) async fn run(args: WhoArgs) -> Result<ExitCode> {
         // back to the bare count attributed to `default`. Matches the
         // pre-#22 behaviour so a CLI/daemon version skew degrades
         // gracefully instead of returning an empty roster.
-        Some(s) => {
+        s => {
             let principal = astrid_core::PrincipalId::default();
             (0..s.connected_clients)
                 .map(|_| Connection {
@@ -89,7 +106,6 @@ pub(crate) async fn run(args: WhoArgs) -> Result<ExitCode> {
                 })
                 .collect()
         },
-        None => Vec::new(),
     };
 
     if !format.is_pretty() {

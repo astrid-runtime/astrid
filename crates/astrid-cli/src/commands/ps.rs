@@ -53,7 +53,29 @@ pub(crate) async fn run(args: PsArgs) -> Result<ExitCode> {
     };
     let entries = match client.request(KernelRequest::GetCapsuleMetadata).await {
         Ok(KernelResponse::CapsuleMetadata(list)) => list,
-        _ => Vec::new(),
+        Ok(KernelResponse::Error(message)) => {
+            eprintln!(
+                "{}",
+                Theme::error(&format!(
+                    "Daemon rejected capsule metadata request: {message}"
+                ))
+            );
+            return Ok(ExitCode::from(1));
+        },
+        Ok(_) => {
+            eprintln!(
+                "{}",
+                Theme::error("Unexpected response from daemon while listing capsules")
+            );
+            return Ok(ExitCode::from(1));
+        },
+        Err(error) => {
+            eprintln!(
+                "{}",
+                Theme::error(&format!("Failed to query daemon: {error}"))
+            );
+            return Ok(ExitCode::from(1));
+        },
     };
     let mut rows: Vec<CapsuleRow> = entries
         .into_iter()
