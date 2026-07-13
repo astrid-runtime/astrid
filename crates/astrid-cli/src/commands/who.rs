@@ -17,13 +17,13 @@
 use std::process::ExitCode;
 
 use anyhow::Result;
+use astrid_core::kernel_api::{KernelRequest, KernelResponse};
+use astrid_uplink::KernelClient;
 use clap::Args;
 use colored::Colorize;
 use serde::Serialize;
-use uuid::Uuid;
 
 use crate::commands::daemon;
-use crate::socket_client::SocketClient;
 use crate::theme::Theme;
 use crate::value_formatter::{ValueFormat, emit_structured};
 
@@ -56,35 +56,34 @@ pub(crate) async fn run(args: WhoArgs) -> Result<ExitCode> {
         }
         return Ok(ExitCode::SUCCESS);
     }
-    let session = astrid_core::SessionId::from_uuid(Uuid::new_v4());
-    let Ok(mut client) = SocketClient::connect(session, crate::principal::current()).await else {
+    let Ok(mut client) = KernelClient::connect(crate::principal::current()).await else {
         eprintln!("{}", Theme::error("Failed to connect to daemon"));
         return Ok(ExitCode::from(1));
     };
-    let req = astrid_core::kernel_api::KernelRequest::GetStatus;
-    let val = serde_json::to_value(req)?;
-    let msg = astrid_types::ipc::IpcMessage::new(
-        astrid_types::Topic::kernel_request("status"),
-        astrid_types::ipc::IpcPayload::RawJson(val),
-        Uuid::nil(),
-    );
-    client.send_message(msg).await?;
-    let raw = client
-        .read_until_topic(
-            astrid_types::Topic::kernel_response("status").as_str(),
-            std::time::Duration::from_secs(10),
-        )
-        .await?;
-    // Reuse the shared envelope extractor so this command tracks any
-    // future change to the IPC response wrapper without re-implementing
-    // the `{type, value}` unwrap inline (matches `ps` / `daemon` usage).
-    let status = match crate::socket_client::SocketClient::extract_kernel_response(&raw) {
-        Some(astrid_core::kernel_api::KernelResponse::Status(s)) => Some(s),
-        _ => None,
+    let status = match client.request(KernelRequest::GetStatus).await {
+        Ok(KernelResponse::Status(status)) => status,
+        Ok(KernelResponse::Error(message)) => {
+            eprintln!(
+                "{}",
+                Theme::error(&format!("Daemon rejected status request: {message}"))
+            );
+            return Ok(ExitCode::from(1));
+        },
+        Ok(_) => {
+            eprintln!("{}", Theme::error("Unexpected response from daemon"));
+            return Ok(ExitCode::from(1));
+        },
+        Err(error) => {
+            eprintln!(
+                "{}",
+                Theme::error(&format!("Failed to query daemon: {error}"))
+            );
+            return Ok(ExitCode::from(1));
+        },
     };
 
     let connections: Vec<Connection> = match status {
-        Some(s) if !s.connections_by_principal.is_empty() => s
+        s if !s.connections_by_principal.is_empty() => s
             .connections_by_principal
             .iter()
             .flat_map(|pc| {
@@ -98,7 +97,7 @@ pub(crate) async fn run(args: WhoArgs) -> Result<ExitCode> {
         // back to the bare count attributed to `default`. Matches the
         // pre-#22 behaviour so a CLI/daemon version skew degrades
         // gracefully instead of returning an empty roster.
-        Some(s) => {
+        s => {
             let principal = astrid_core::PrincipalId::default();
             (0..s.connected_clients)
                 .map(|_| Connection {
@@ -107,7 +106,6 @@ pub(crate) async fn run(args: WhoArgs) -> Result<ExitCode> {
                 })
                 .collect()
         },
-        None => Vec::new(),
     };
 
     if !format.is_pretty() {

@@ -4,6 +4,8 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use astrid_core::kernel_api::{KernelRequest, KernelResponse};
+use astrid_uplink::KernelClient;
 
 use crate::bootstrap::find_companion_binary;
 use crate::commands::daemon_control;
@@ -360,45 +362,33 @@ pub(crate) async fn handle_status() -> Result<()> {
         return Ok(());
     }
 
-    let session_id = astrid_core::SessionId::from_uuid(uuid::Uuid::new_v4());
-    match socket_client::SocketClient::connect(session_id, crate::principal::current()).await {
-        Ok(mut client) => {
-            let req = astrid_core::kernel_api::KernelRequest::GetStatus;
-            if let Ok(val) = serde_json::to_value(req) {
-                let msg = astrid_types::ipc::IpcMessage::new(
-                    astrid_types::Topic::kernel_request("status"),
-                    astrid_types::ipc::IpcPayload::RawJson(val),
-                    uuid::Uuid::nil(),
+    match KernelClient::connect(crate::principal::current()).await {
+        Ok(mut client) => match client.request(KernelRequest::GetStatus).await {
+            Ok(KernelResponse::Status(status)) => {
+                let uptime_display = format_uptime(status.uptime_secs);
+                println!(
+                    "{}",
+                    theme::Theme::success(&format!(
+                        "Astrid daemon (PID {}, uptime {})",
+                        status.pid, uptime_display
+                    ))
                 );
-                client.send_message(msg).await?;
-
-                let raw = client
-                    .read_until_topic(
-                        astrid_types::Topic::kernel_response("status").as_str(),
-                        std::time::Duration::from_secs(10),
-                    )
-                    .await?;
-                if let Some(astrid_core::kernel_api::KernelResponse::Status(status)) =
-                    crate::socket_client::SocketClient::extract_kernel_response(&raw)
-                {
-                    let uptime_display = format_uptime(status.uptime_secs);
-                    println!(
-                        "{}",
-                        theme::Theme::success(&format!(
-                            "Astrid daemon (PID {}, uptime {})",
-                            status.pid, uptime_display
-                        ))
-                    );
-                    println!("  Version:    {}", status.version);
-                    println!("  Clients:    {}", status.connected_clients);
-                    println!("  Capsules:   {} loaded", status.loaded_capsules.len());
-                    for capsule in &status.loaded_capsules {
-                        println!("    - {capsule}");
-                    }
-                } else {
-                    println!("{}", theme::Theme::error("Unexpected response from daemon"));
+                println!("  Version:    {}", status.version);
+                println!("  Clients:    {}", status.connected_clients);
+                println!("  Capsules:   {} loaded", status.loaded_capsules.len());
+                for capsule in &status.loaded_capsules {
+                    println!("    - {capsule}");
                 }
-            }
+            },
+            Ok(KernelResponse::Error(message)) => println!(
+                "{}",
+                theme::Theme::error(&format!("Daemon rejected status request: {message}"))
+            ),
+            Ok(_) => println!("{}", theme::Theme::error("Unexpected response from daemon")),
+            Err(error) => println!(
+                "{}",
+                theme::Theme::error(&format!("Failed to query daemon: {error}"))
+            ),
         },
         Err(_) => {
             println!(

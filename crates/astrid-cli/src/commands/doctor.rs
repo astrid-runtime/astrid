@@ -9,11 +9,11 @@ use std::time::Duration;
 
 use anyhow::Result;
 use astrid_core::dirs::AstridHome;
+use astrid_core::kernel_api::{KernelRequest, KernelResponse};
+use astrid_uplink::KernelClient;
 use clap::Args;
 use colored::Colorize;
-use uuid::Uuid;
 
-use crate::socket_client::SocketClient;
 use crate::theme::Theme;
 
 #[derive(Args, Debug, Clone)]
@@ -132,58 +132,48 @@ fn check_fail(name: &str, detail: &str) {
 }
 
 async fn daemon_roundtrip() -> Result<()> {
-    let session = astrid_core::SessionId::from_uuid(Uuid::new_v4());
     let mut client = tokio::time::timeout(
         Duration::from_secs(5),
-        SocketClient::connect(session, crate::principal::current()),
+        KernelClient::connect(crate::principal::current()),
     )
     .await
     .map_err(|_| anyhow::anyhow!("connection timed out after 5s"))??;
-    let req = astrid_core::kernel_api::KernelRequest::GetStatus;
-    let val = serde_json::to_value(req)?;
-    let msg = astrid_types::ipc::IpcMessage::new(
-        astrid_types::Topic::kernel_request("status"),
-        astrid_types::ipc::IpcPayload::RawJson(val),
-        Uuid::nil(),
-    );
-    client.send_message(msg).await?;
-    let _raw = client
-        .read_until_topic(
-            astrid_types::Topic::kernel_response("status").as_str(),
-            Duration::from_secs(5),
-        )
-        .await?;
-    Ok(())
+    match tokio::time::timeout(
+        Duration::from_secs(5),
+        client.request(KernelRequest::GetStatus),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("daemon response timed out after 5s"))??
+    {
+        KernelResponse::Status(_) => Ok(()),
+        KernelResponse::Error(message) => {
+            Err(anyhow::anyhow!("daemon rejected status request: {message}"))
+        },
+        _ => Err(anyhow::anyhow!(
+            "daemon returned an unexpected status response"
+        )),
+    }
 }
 
 /// Query the daemon for agent-loop readiness over the same socket the
 /// other daemon-dependent checks use. Rides the existing
 /// `astrid.v1.request.` ingress allowlist prefix — no capsule change needed.
 async fn agent_readiness() -> Result<astrid_core::kernel_api::AgentLoopReadiness> {
-    let session = astrid_core::SessionId::from_uuid(Uuid::new_v4());
     let mut client = tokio::time::timeout(
         Duration::from_secs(5),
-        SocketClient::connect(session, crate::principal::current()),
+        KernelClient::connect(crate::principal::current()),
     )
     .await
     .map_err(|_| anyhow::anyhow!("connection timed out after 5s"))??;
-    let req = astrid_core::kernel_api::KernelRequest::GetAgentReadiness;
-    let val = serde_json::to_value(req)?;
-    let msg = astrid_types::ipc::IpcMessage::new(
-        astrid_types::Topic::kernel_request("agent_readiness"),
-        astrid_types::ipc::IpcPayload::RawJson(val),
-        Uuid::nil(),
-    );
-    client.send_message(msg).await?;
-    let raw = client
-        .read_until_topic(
-            astrid_types::Topic::kernel_response("agent_readiness").as_str(),
-            Duration::from_secs(5),
-        )
-        .await?;
-    match SocketClient::extract_kernel_response(&raw) {
-        Some(astrid_core::kernel_api::KernelResponse::AgentReadiness(r)) => Ok(r),
-        Some(astrid_core::kernel_api::KernelResponse::Error(msg)) => {
+    match tokio::time::timeout(
+        Duration::from_secs(5),
+        client.request(KernelRequest::GetAgentReadiness),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("daemon response timed out after 5s"))??
+    {
+        KernelResponse::AgentReadiness(readiness) => Ok(readiness),
+        KernelResponse::Error(msg) => {
             Err(anyhow::anyhow!("daemon rejected readiness query: {msg}"))
         },
         _ => Err(anyhow::anyhow!(
