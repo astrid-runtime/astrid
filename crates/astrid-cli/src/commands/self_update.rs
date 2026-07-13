@@ -1,6 +1,6 @@
 //! Self-update command — download and install newer versions of the Astrid CLI.
 //!
-//! Discovers the latest GitHub release for `unicity-astrid/astrid`, compares it
+//! Discovers the latest GitHub release for `astrid-runtime/astrid`, compares it
 //! to the running binary, and — for self-managed installs — verifies, stages,
 //! and atomically swaps the new binary IN PLACE with a backup for rollback.
 //! Installs owned by a package manager (Homebrew, `cargo install`) are deferred
@@ -23,7 +23,7 @@ use crate::theme::Theme;
 
 /// Default GitHub org/repo for the core Astrid release. Overridable for
 /// staging/testing — see [`resolve_repo`].
-const DEFAULT_ORG: &str = "unicity-astrid";
+const DEFAULT_ORG: &str = "astrid-runtime";
 const DEFAULT_REPO: &str = "astrid";
 
 /// Current binary version (set at compile time).

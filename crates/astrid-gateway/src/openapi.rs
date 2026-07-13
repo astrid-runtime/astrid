@@ -54,11 +54,11 @@ use crate::state::GatewayState;
         version = "0.7.0",
         contact(
             name = "Astrid",
-            url = "https://github.com/unicity-astrid/astrid"
+            url = "https://github.com/astrid-runtime/astrid"
         ),
         license(
             name = "MIT OR Apache-2.0",
-            url = "https://github.com/unicity-astrid/astrid/blob/main/LICENSE"
+            url = "https://github.com/astrid-runtime/astrid/blob/main/LICENSE"
         )
     ),
     paths(

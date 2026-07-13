@@ -11,7 +11,7 @@
 
 **Do not open a public issue for security vulnerabilities.**
 
-Use [GitHub's private vulnerability reporting](https://github.com/unicity-astrid/astrid/security/advisories/new) to submit a report. This ensures the issue is triaged privately before any public disclosure.
+Use [GitHub's private vulnerability reporting](https://github.com/astrid-runtime/astrid/security/advisories/new) to submit a report. This ensures the issue is triaged privately before any public disclosure.
 
 Include:
 

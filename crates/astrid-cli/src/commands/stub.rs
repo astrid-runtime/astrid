@@ -23,7 +23,7 @@ impl TrackingIssue {
     /// Build the URL for the issue in the upstream repo.
     pub(crate) fn url(self) -> String {
         format!(
-            "https://github.com/unicity-astrid/astrid/issues/{}",
+            "https://github.com/astrid-runtime/astrid/issues/{}",
             self.number
         )
     }
@@ -89,7 +89,7 @@ mod tests {
     fn url_matches_template() {
         assert_eq!(
             ISSUE_DELEGATION.url(),
-            "https://github.com/unicity-astrid/astrid/issues/656"
+            "https://github.com/astrid-runtime/astrid/issues/656"
         );
     }
 

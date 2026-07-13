@@ -11,6 +11,11 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
 
 ### Changed
 
+- **Astrid's mutable repository identity now points to `astrid-runtime`.** Current
+  documentation links, release automation, the WIT submodule origin, and the
+  self-update default use the Astrid Runtime organization, while published crate,
+  WIT, tag, artifact, and binary identifiers remain compatible. Closes #1202.
+
 - **Astrid's MCP bridge now uses RMCP 2.2.** The client and server adapt to RMCP's current content and elicitation APIs while preserving existing roots and sampling support. The CLI prompt also follows terminal color preferences, including `NO_COLOR`. The reviewed dependency refresh includes updated cryptography, signal handling, random-source, regex, ignore, and WebAssembly component tooling dependencies; `astrid-core` remains on TOML 0.8 because its public error types expose that API, and the optional SurrealDB backend remains on 3.1.5 pending a dedicated storage migration. Closes #1193.
 
 ### Fixed
