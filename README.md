@@ -1,9 +1,5 @@
 # Astrid
 
-<p align="center">
-  <img src="assets/astrid-github-preview.png" alt="Astrid" width="640">
-</p>
-
 **A portable, capability-secure operating system for composable software.**
 
 [![CI](https://github.com/astrid-runtime/astrid/actions/workflows/ci.yml/badge.svg)](https://github.com/astrid-runtime/astrid/actions/workflows/ci.yml)
