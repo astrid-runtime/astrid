@@ -369,7 +369,7 @@ pub(crate) async fn handle_status() -> Result<()> {
         client
             .request(KernelRequest::GetStatus)
             .await
-            .map_err(anyhow::Error::from)?,
+            .context("Failed to query daemon status")?,
     )?;
     let uptime_display = format_uptime(status.uptime_secs);
     println!(
@@ -394,7 +394,7 @@ fn status_response(response: KernelResponse) -> Result<DaemonStatus> {
         KernelResponse::Error(message) => {
             anyhow::bail!("daemon rejected status request: {message}")
         },
-        _ => anyhow::bail!("daemon returned an unexpected status response"),
+        other => anyhow::bail!("daemon returned an unexpected status response: {other:?}"),
     }
 }
 
@@ -429,9 +429,8 @@ pub(crate) async fn handle_stop() -> Result<()> {
     }
 
     // Graceful path: the socket is present and serviceable.
-    if socket_present
-        && let Ok(mut client) = KernelClient::connect(crate::principal::current()).await
-    {
+    if socket_present && let Ok(client) = KernelClient::connect(crate::principal::current()).await {
+        let mut client = client.with_timeout(Duration::from_secs(10));
         match client
             .request(KernelRequest::Shutdown {
                 reason: Some("astrid stop".to_string()),
