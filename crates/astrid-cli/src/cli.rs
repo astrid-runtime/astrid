@@ -225,7 +225,7 @@ pub(crate) enum Commands {
 
     /// Initialize a workspace and install a distro
     Init {
-        /// Distro to install (name, @org/repo, path to Distro.toml, or .shuttle)
+        /// Required distro to install (name, @org/repo, path to Distro.toml, or .shuttle)
         #[arg(long)]
         distro: Option<String>,
         /// Non-interactive: accept all defaults.
