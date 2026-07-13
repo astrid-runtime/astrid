@@ -173,6 +173,12 @@ async fn dispatch_subcommand(
             accept_new_key,
             vars,
         }) => {
+            let distro = distro.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "astrid init requires --distro <name, @org/repo, path, or .shuttle>; \
+                     Astrid Runtime does not choose a product distro"
+                )
+            })?;
             let opts = commands::init::InitOpts {
                 yes,
                 offline,
@@ -370,7 +376,11 @@ async fn dispatch_distro(command: DistroCommands) -> Result<ExitCode> {
                     &[tracker_657()],
                 ));
             }
-            let distro = name.unwrap_or_else(|| "astralis".to_string());
+            let distro = name.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "astrid distro apply requires an explicit distro; Astrid Runtime does not choose a product distro"
+                )
+            })?;
             let opts = commands::init::InitOpts {
                 yes,
                 offline,
