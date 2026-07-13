@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use astrid_core::kernel_api::{KernelRequest, KernelResponse};
+use astrid_core::kernel_api::{DaemonStatus, KernelRequest, KernelResponse};
 use astrid_uplink::KernelClient;
 
 use crate::bootstrap::find_companion_binary;
@@ -362,45 +362,40 @@ pub(crate) async fn handle_status() -> Result<()> {
         return Ok(());
     }
 
-    match KernelClient::connect(crate::principal::current()).await {
-        Ok(mut client) => match client.request(KernelRequest::GetStatus).await {
-            Ok(KernelResponse::Status(status)) => {
-                let uptime_display = format_uptime(status.uptime_secs);
-                println!(
-                    "{}",
-                    theme::Theme::success(&format!(
-                        "Astrid daemon (PID {}, uptime {})",
-                        status.pid, uptime_display
-                    ))
-                );
-                println!("  Version:    {}", status.version);
-                println!("  Clients:    {}", status.connected_clients);
-                println!("  Capsules:   {} loaded", status.loaded_capsules.len());
-                for capsule in &status.loaded_capsules {
-                    println!("    - {capsule}");
-                }
-            },
-            Ok(KernelResponse::Error(message)) => println!(
-                "{}",
-                theme::Theme::error(&format!("Daemon rejected status request: {message}"))
-            ),
-            Ok(_) => println!("{}", theme::Theme::error("Unexpected response from daemon")),
-            Err(error) => println!(
-                "{}",
-                theme::Theme::error(&format!("Failed to query daemon: {error}"))
-            ),
-        },
-        Err(_) => {
-            println!(
-                "{}",
-                theme::Theme::error(
-                    "Daemon socket exists but connection failed. \
-                     It may be starting up or in a bad state."
-                )
-            );
-        },
+    let mut client = KernelClient::connect(crate::principal::current())
+        .await
+        .context("Daemon socket exists but connection failed")?;
+    let status = status_response(
+        client
+            .request(KernelRequest::GetStatus)
+            .await
+            .context("Failed to query daemon status")?,
+    )?;
+    let uptime_display = format_uptime(status.uptime_secs);
+    println!(
+        "{}",
+        theme::Theme::success(&format!(
+            "Astrid daemon (PID {}, uptime {})",
+            status.pid, uptime_display
+        ))
+    );
+    println!("  Version:    {}", status.version);
+    println!("  Clients:    {}", status.connected_clients);
+    println!("  Capsules:   {} loaded", status.loaded_capsules.len());
+    for capsule in &status.loaded_capsules {
+        println!("    - {capsule}");
     }
     Ok(())
+}
+
+fn status_response(response: KernelResponse) -> Result<DaemonStatus> {
+    match response {
+        KernelResponse::Status(status) => Ok(status),
+        KernelResponse::Error(message) => {
+            anyhow::bail!("daemon rejected status request: {message}")
+        },
+        other => anyhow::bail!("daemon returned an unexpected status response: {other:?}"),
+    }
 }
 
 /// Handle `astrid stop`.
@@ -434,45 +429,21 @@ pub(crate) async fn handle_stop() -> Result<()> {
     }
 
     // Graceful path: the socket is present and serviceable.
-    if socket_present
-        && let Ok(mut client) = socket_client::SocketClient::connect(
-            astrid_core::SessionId::from_uuid(uuid::Uuid::new_v4()),
-            crate::principal::current(),
-        )
-        .await
-    {
-        let req = astrid_core::kernel_api::KernelRequest::Shutdown {
-            reason: Some("astrid stop".to_string()),
-        };
-        if let Ok(val) = serde_json::to_value(req) {
-            let msg = astrid_types::ipc::IpcMessage::new(
-                astrid_types::Topic::kernel_request("shutdown"),
-                astrid_types::ipc::IpcPayload::RawJson(val),
-                uuid::Uuid::nil(),
-            );
-            client.send_message(msg).await?;
-            let raw = client
-                .read_until_topic(
-                    astrid_types::Topic::kernel_response("shutdown").as_str(),
-                    Duration::from_secs(10),
-                )
-                .await?;
-            match crate::socket_client::SocketClient::extract_kernel_response(&raw) {
-                Some(astrid_core::kernel_api::KernelResponse::Success(_)) => {
-                    // ACK only — confirm the process actually exits before
-                    // declaring success, and escalate if it wedged.
-                    confirm_graceful_stop(recorded, &pid_path, &socket_path).await;
-                },
-                Some(astrid_core::kernel_api::KernelResponse::Error(reason)) => {
-                    anyhow::bail!("daemon rejected shutdown: {reason}");
-                },
-                Some(other) => {
-                    anyhow::bail!("unexpected response from daemon shutdown: {other:?}");
-                },
-                None => {
-                    anyhow::bail!("daemon shutdown response did not deserialize");
-                },
-            }
+    if socket_present && let Ok(client) = KernelClient::connect(crate::principal::current()).await {
+        let mut client = client.with_timeout(Duration::from_secs(10));
+        match client
+            .request(KernelRequest::Shutdown {
+                reason: Some("astrid stop".to_string()),
+            })
+            .await?
+        {
+            KernelResponse::Success(_) => {
+                // ACK only — confirm the process actually exits before
+                // declaring success, and escalate if it wedged.
+                confirm_graceful_stop(recorded, &pid_path, &socket_path).await;
+            },
+            KernelResponse::Error(reason) => anyhow::bail!("daemon rejected shutdown: {reason}"),
+            other => anyhow::bail!("unexpected response from daemon shutdown: {other:?}"),
         }
         return Ok(());
     }
@@ -694,5 +665,16 @@ mod tests {
         let action = decide_start_action(false, true);
         assert_eq!(action, StartAction::RunningButUnreachable);
         assert!(!start_clears_sentinels(action));
+    }
+
+    #[test]
+    fn status_error_is_not_reported_as_a_successful_status() {
+        let error = status_response(KernelResponse::Error("denied".into()))
+            .expect_err("kernel status errors must fail the command");
+        assert!(
+            error
+                .to_string()
+                .contains("daemon rejected status request: denied")
+        );
     }
 }
