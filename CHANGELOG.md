@@ -11,6 +11,11 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
 
 ### Changed
 
+- **Daemon status and shutdown now use one typed runtime-control path.**
+  `astrid status` propagates daemon connection and response failures instead of
+  reporting success, and `astrid stop` sends its shutdown request through the
+  authenticated, correlated uplink client. Closes #1210.
+
 - **CLI runtime-control requests now use the shared typed uplink client.**
   `astrid status`, `ps`, `who`, and `doctor` no longer rebuild socket frames or
   parse response envelopes themselves; they use `astrid-uplink` for the same
