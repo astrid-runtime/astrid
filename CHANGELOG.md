@@ -9,6 +9,15 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
 
 ## [Unreleased]
 
+### Added
+
+- **Scoped product-control credentials.** The runtime now has a distinct
+  credential primitive for product clients: a random opaque secret is stored
+  only as a runtime-side hash and is bound to a principal, optional device,
+  explicit read-only operation allowlist, expiry, and revocation state. It
+  cannot fall back to the daemon session token or an anonymous control path.
+  Closes #1212.
+
 ### Changed
 
 - **CLI runtime-control requests now use the shared typed uplink client.**

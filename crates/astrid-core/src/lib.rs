@@ -25,6 +25,7 @@ pub mod identity;
 pub mod kernel_api;
 pub mod net;
 pub mod principal;
+pub mod product_control;
 pub mod profile;
 pub mod retry;
 pub mod session_token;
@@ -45,6 +46,10 @@ pub use groups::{
     GroupConfigResult, ValidatedGroup, ValidatedGroupConfig,
 };
 pub use principal::{PrincipalId, PrincipalIdError};
+pub use product_control::{
+    ProductControlAuthorizer, ProductControlCredential, ProductControlError,
+    ProductControlOperation,
+};
 pub use profile::{
     AuthConfig, AuthMethod, BACKGROUND_PROCESSES_UPPER_BOUND, CURRENT_PROFILE_VERSION,
     CapabilityPattern, CapsuleGrant, DEFAULT_MAX_BACKGROUND_PROCESSES,
