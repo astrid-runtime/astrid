@@ -17,13 +17,13 @@
 use std::process::ExitCode;
 
 use anyhow::Result;
+use astrid_core::kernel_api::{KernelRequest, KernelResponse};
+use astrid_uplink::KernelClient;
 use clap::Args;
 use colored::Colorize;
 use serde::Serialize;
-use uuid::Uuid;
 
 use crate::commands::daemon;
-use crate::socket_client::SocketClient;
 use crate::theme::Theme;
 use crate::value_formatter::{ValueFormat, emit_structured};
 
@@ -56,30 +56,12 @@ pub(crate) async fn run(args: WhoArgs) -> Result<ExitCode> {
         }
         return Ok(ExitCode::SUCCESS);
     }
-    let session = astrid_core::SessionId::from_uuid(Uuid::new_v4());
-    let Ok(mut client) = SocketClient::connect(session, crate::principal::current()).await else {
+    let Ok(mut client) = KernelClient::connect(crate::principal::current()).await else {
         eprintln!("{}", Theme::error("Failed to connect to daemon"));
         return Ok(ExitCode::from(1));
     };
-    let req = astrid_core::kernel_api::KernelRequest::GetStatus;
-    let val = serde_json::to_value(req)?;
-    let msg = astrid_types::ipc::IpcMessage::new(
-        astrid_types::Topic::kernel_request("status"),
-        astrid_types::ipc::IpcPayload::RawJson(val),
-        Uuid::nil(),
-    );
-    client.send_message(msg).await?;
-    let raw = client
-        .read_until_topic(
-            astrid_types::Topic::kernel_response("status").as_str(),
-            std::time::Duration::from_secs(10),
-        )
-        .await?;
-    // Reuse the shared envelope extractor so this command tracks any
-    // future change to the IPC response wrapper without re-implementing
-    // the `{type, value}` unwrap inline (matches `ps` / `daemon` usage).
-    let status = match crate::socket_client::SocketClient::extract_kernel_response(&raw) {
-        Some(astrid_core::kernel_api::KernelResponse::Status(s)) => Some(s),
+    let status = match client.request(KernelRequest::GetStatus).await {
+        Ok(KernelResponse::Status(status)) => Some(status),
         _ => None,
     };
 

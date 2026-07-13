@@ -11,6 +11,12 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
 
 ### Changed
 
+- **CLI runtime-control requests now use the shared typed uplink client.**
+  `astrid status`, `ps`, `who`, and `doctor` no longer rebuild socket frames or
+  parse response envelopes themselves; they use `astrid-uplink` for the same
+  authenticated, principal-bound `astrid.v1` control contract that external
+  uplinks will consume. Closes #1208.
+
 - **Removed the product-branded README image.** Astrid's repository front door
   now presents the runtime without Unicity artwork. Closes #1204.
 
