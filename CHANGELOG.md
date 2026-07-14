@@ -51,6 +51,11 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
 
 ### Fixed
 
+- **Security Audit now uses a reproducible cargo-audit installation.** CI installs
+  cargo-audit 0.22.2 with its published lockfile before invoking the pinned RustSec
+  action, keeping the advisory scan compatible with the repository toolchain.
+  Closes #1245.
+
 - **`astrid chat` now remains readable on light and dark terminal themes.** Primary chat text, user input, and the cursor inherit the terminal's configured foreground instead of forcing white or gray; assistant and running-tool bullets follow the same foreground. Closes #1178.
 
 - **The CLI no longer includes unused Syntect XML and YAML loaders.** Its embedded default syntaxes and themes do not need runtime plist or YAML loading, so the dependency graph now excludes `quick-xml` and `yaml-rust`; their obsolete Cargo Audit exceptions are removed. Closes #1190.
