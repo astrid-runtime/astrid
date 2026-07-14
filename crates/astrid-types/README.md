@@ -3,7 +3,7 @@
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/License-MIT%20OR%20Apache--2.0-blue.svg)](LICENSE-MIT)
 [![MSRV: 1.94](https://img.shields.io/badge/MSRV-1.94-blue)](https://www.rust-lang.org)
 
-**Shared data types for the [Astrid](https://github.com/unicity-astrid/astrid) secure agent runtime.**
+**Shared data types for the [Astrid](https://github.com/astrid-runtime/astrid) secure agent runtime.**
 
 This crate is the single source of truth for the types that cross boundaries in Astrid: between the host kernel and WASM capsule guests over IPC, between the runtime and LLM provider capsules, and between frontends and the kernel management API. Both the kernel (`astrid-events`) and the user-space SDK (`astrid-sdk`) depend on it — nothing else does.
 

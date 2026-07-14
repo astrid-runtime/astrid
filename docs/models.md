@@ -370,7 +370,7 @@ astrid models list
 astrid models set openai:gpt-5.5
 
 # Or install and configure a provider if none is listed
-astrid capsule install @unicity-astrid/capsule-openai
+astrid capsule install @example-org/capsule-openai
 ```
 
 If `astrid models list` returns "No LLM models available", no provider capsule

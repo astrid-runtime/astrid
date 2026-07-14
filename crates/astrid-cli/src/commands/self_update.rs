@@ -727,20 +727,17 @@ async fn sync_distro_and_capsules() -> anyhow::Result<()> {
         .config_dir()
         .join("distro.lock");
 
-    // Load existing lock to get the distro ID.
+    // A lock records the installed distro identity, not its canonical source.
+    // Do not turn that identity into an organization-qualified network fetch:
+    // the runtime has no product source default and must not invent provenance.
     let lock = super::distro::lock::load_lock(&lock_path)?;
-
-    // Re-run init which handles: fetch manifest, diff lock, install new capsules.
-    // init is idempotent — if lock is fresh it returns immediately. This runs
-    // in a background sync with no human present, so use headless defaults.
-    let sync_opts = super::init::InitOpts {
-        yes: true,
-        ..Default::default()
-    };
-    if let Some(lock) = lock
-        && let Err(e) = super::init::run_init(&lock.distro.id, &sync_opts).await
-    {
-        println!("{}", Theme::warning(&post_update_sync_message(&e)));
+    if lock.is_some() {
+        println!(
+            "{}",
+            Theme::warning(
+                "Distro refresh skipped because the installed lock does not record an explicit source. Re-run `astrid init --distro <@owner/repo|URL|path|.shuttle>` to refresh it."
+            )
+        );
     }
 
     // Update individual capsules (checks GitHub releases for newer versions).
@@ -771,6 +768,7 @@ async fn sync_distro_and_capsules() -> anyhow::Result<()> {
 ///
 /// Pure over the error so the decision is unit-testable without running a real
 /// update.
+#[cfg(test)]
 fn post_update_sync_message(err: &anyhow::Error) -> String {
     let is_version_gate = err.chain().any(|e| {
         e.downcast_ref::<super::distro::validate::AstridVersionTooOld>()

@@ -17,9 +17,6 @@ use super::distro::lock::{
 use super::distro::manifest::{DistroCapsule, DistroManifest, parse_manifest};
 use crate::theme::Theme;
 
-/// Default GitHub org for distro repos.
-const DEFAULT_ORG: &str = "unicity-astrid";
-
 /// Options controlling the init / `distro apply` flow.
 ///
 /// Carries the headless and trust flags so the interactive prompts can
@@ -233,18 +230,29 @@ fn init_workspace() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Resolve a distro source string to a raw GitHub URL.
+/// Resolve an explicit remote distro source string to a URL.
 ///
-/// - `astralis` → `https://raw.githubusercontent.com/unicity-astrid/astralis/main/Distro.toml`
 /// - `@org/repo` → `https://raw.githubusercontent.com/org/repo/main/Distro.toml`
 /// - `https://...` → as-is
-fn resolve_distro_url(source: &str) -> String {
+///
+/// A bare name has no provenance and is rejected rather than being silently
+/// assigned to an organization by the neutral runtime.
+fn resolve_distro_url(source: &str) -> anyhow::Result<String> {
     if source.starts_with("http://") || source.starts_with("https://") {
-        source.to_string()
+        Ok(source.to_string())
     } else if let Some(repo_path) = source.strip_prefix('@') {
-        format!("https://raw.githubusercontent.com/{repo_path}/main/Distro.toml")
+        if repo_path.is_empty() || !repo_path.contains('/') {
+            bail!(
+                "distro source '{source}' must use @owner/repo, a URL, a local Distro.toml path, or a .shuttle archive"
+            );
+        }
+        Ok(format!(
+            "https://raw.githubusercontent.com/{repo_path}/main/Distro.toml"
+        ))
     } else {
-        format!("https://raw.githubusercontent.com/{DEFAULT_ORG}/{source}/main/Distro.toml")
+        bail!(
+            "distro source '{source}' must use @owner/repo, a URL, a local Distro.toml path, or a .shuttle archive"
+        )
     }
 }
 
@@ -268,7 +276,7 @@ async fn fetch_and_parse_manifest(source: &str, offline: bool) -> anyhow::Result
         );
     }
 
-    let url = resolve_distro_url(source);
+    let url = resolve_distro_url(source)?;
 
     eprintln!("Fetching distro manifest...");
 

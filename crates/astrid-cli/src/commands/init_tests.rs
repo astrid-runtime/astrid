@@ -57,17 +57,16 @@ fn resolve_template_handles_missing_var() {
 }
 
 #[test]
-fn distro_source_resolution_bare_name() {
-    assert_eq!(
-        resolve_distro_url("astralis"),
-        "https://raw.githubusercontent.com/unicity-astrid/astralis/main/Distro.toml",
-    );
+fn distro_source_resolution_rejects_bare_names_without_a_network_default() {
+    let error = resolve_distro_url("astralis").expect_err("bare name has no provenance");
+    assert!(error.to_string().contains("@owner/repo"));
+    assert!(error.to_string().contains("local Distro.toml path"));
 }
 
 #[test]
 fn distro_source_resolution_at_prefix() {
     assert_eq!(
-        resolve_distro_url("@myorg/mydistro"),
+        resolve_distro_url("@myorg/mydistro").unwrap(),
         "https://raw.githubusercontent.com/myorg/mydistro/main/Distro.toml",
     );
 }
@@ -75,7 +74,7 @@ fn distro_source_resolution_at_prefix() {
 #[test]
 fn distro_source_resolution_full_url() {
     let url = "https://example.com/Distro.toml";
-    assert_eq!(resolve_distro_url(url), url);
+    assert_eq!(resolve_distro_url(url).unwrap(), url);
 }
 
 // ---- Part A: headless selection / variable resolution ----
@@ -292,7 +291,7 @@ fn should_write_lock_gates_on_success() {
 fn partial_run_leaves_no_lock_for_retry() {
     let dir = tempfile::tempdir().unwrap();
     let lock_path = dir.path().join("distro.lock");
-    let lock = create_lock_from_parts(1, "astralis", "1.0.0", Vec::new());
+    let lock = create_lock_from_parts(1, "example-distro", "1.0.0", Vec::new());
 
     // Partial (3 of 5): no lock written, returns false.
     let wrote = persist_lock_if_earned(&lock_path, 5, 3, &lock).unwrap();

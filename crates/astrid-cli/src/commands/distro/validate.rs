@@ -351,7 +351,7 @@ mod tests {
 
     #[test]
     fn is_valid_id_accepts_lowercase() {
-        assert!(is_valid_id("astralis"));
+        assert!(is_valid_id("example-distro"));
         assert!(is_valid_id("my-distro"));
         assert!(is_valid_id("a1b2c3"));
     }
@@ -426,7 +426,7 @@ version = "0.1.0"
 
 [[capsule]]
 name = "astrid-capsule-cli"
-source = "@unicity-astrid/capsule-cli"
+source = "@example-org/capsule-cli"
 version = "0.7.0"
 role = "uplink"
 
@@ -669,7 +669,7 @@ version = "0.1.0"
 
 [[capsule]]
 name = "astrid-capsule-cli"
-source = "@unicity-astrid/capsule-cli"
+source = "@example-org/capsule-cli"
 version = "0.7.0"
 role = "uplink"
 "#;
@@ -697,7 +697,7 @@ version = "0.1.0"
 
 [[capsule]]
 name = "astrid-capsule-cli"
-source = "@unicity-astrid/capsule-cli"
+source = "@example-org/capsule-cli"
 version = "0.7.0"
 role = "uplink"
 

@@ -1,13 +1,13 @@
 # Astrid OS — Host-Internal Operational Metrics
 
-> Status: design doc for the **host-internal operational metrics** layer (tracking issue [#791](https://github.com/unicity-astrid/astrid/issues/791)). Target: full RED/USE coverage of the runtime *itself*, built on the `metrics` facade + `metrics-exporter-prometheus` recorder already shipped in `crates/astrid-gateway/src/metrics.rs`.
+> Status: design doc for the **host-internal operational metrics** layer (tracking issue [#791](https://github.com/astrid-runtime/astrid/issues/791)). Target: full RED/USE coverage of the runtime *itself*, built on the `metrics` facade + `metrics-exporter-prometheus` recorder already shipped in `crates/astrid-gateway/src/metrics.rs`.
 > Security posture: `/metrics` and `/healthz` are **unauthenticated** (operators restrict via the network layer). The scrape body is treated as **public output**. No principal identifiers, token material, file paths, prompt/response content, secrets, or audit content may appear in any metric name, label key, label value, or **numeric value** — anywhere, ever.
 
 ---
 
 ## 0. Scope — two metrics layers, two endpoints
 
-Astrid's metrics split cleanly along the kernel/user-space boundary. **This document covers only the host-internal layer.** The capsule-telemetry layer is owned by [#705](https://github.com/unicity-astrid/astrid/issues/705).
+Astrid's metrics split cleanly along the kernel/user-space boundary. **This document covers only the host-internal layer.** The capsule-telemetry layer is owned by [#705](https://github.com/astrid-runtime/astrid/issues/705).
 
 | | **Host-internal operational metrics** *(this doc, #791)* | **Capsule telemetry rollup** *(#705 `astrid-capsule-metrics`)* |
 |---|---|---|
@@ -15,7 +15,7 @@ Astrid's metrics split cleanly along the kernel/user-space boundary. **This docu
 | Examples | HTTP RED, event-bus saturation, WASM sandbox traps/fuel, daemon connections, process CPU/memory | LLM tokens & cost, tool calls, capability/approval decisions per principal |
 | Where it lives | Kernel-side code → the gateway's process-wide recorder → gateway `/metrics` | A capsule that subscribes to the bus → its own capability-gated `/metrics`, off by default |
 | Data source | Direct `counter!/gauge!/histogram!` from daemon-process code | Existing bus event contracts (tool.v1, llm.v1, capability, approval) |
-| Contract surface | **None** — kernel-internal, out of RFC scope per [RFC-0001](https://github.com/unicity-astrid/rfcs/pull/22) | Rides existing event contracts; no new transport |
+| Contract surface | **None** — kernel-internal, out of RFC scope per [RFC-0001](https://github.com/astrid-runtime/rfcs/pull/22) | Rides existing event contracts; no new transport |
 | Why not merged | Per-capsule resource accounting (#639) feeds it | Aggregation belongs in a capsule, not the kernel ("kernel is dumb") |
 
 **Why the split is load-bearing:** a WASM capsule *structurally cannot* observe host-internal signals — bus queue depth, socket accepts, sandbox fuel, and per-subscriber lag are not on the event bus. Equally, per-principal cost/usage rollups are workload intelligence that does **not** belong in the kernel. The two layers are complementary, not competing. An earlier draft of this doc proposed a new `astrid.v1.metrics.emit` IPC *push* transport so capsules could emit into the host recorder; that was **withdrawn** — #705 already chose the more kernel-is-dumb-compliant design (the capsule *subscribes* to bus events it already receives), so no new contract is needed. See §3.
