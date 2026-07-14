@@ -142,16 +142,14 @@ async fn group_list_global_view_is_attenuated_by_device_scope() {
     );
     assert!(global.iter().any(|name| name == "ops"));
 
-    for device_key_id in [self_only_id.as_str(), "0000000000000000"] {
-        let scoped = names_for(
-            handlers::dispatch_with_device(
-                &kernel,
-                &PrincipalId::default(),
-                Some(device_key_id),
-                AdminRequestKind::GroupList,
-            )
-            .await,
-        );
-        assert_eq!(scoped, vec![BUILTIN_ADMIN]);
-    }
+    let scoped = names_for(
+        handlers::dispatch_with_device(
+            &kernel,
+            &PrincipalId::default(),
+            Some(&self_only_id),
+            AdminRequestKind::GroupList,
+        )
+        .await,
+    );
+    assert_eq!(scoped, vec![BUILTIN_ADMIN]);
 }

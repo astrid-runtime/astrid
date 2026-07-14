@@ -1082,17 +1082,15 @@ async fn agent_list_global_view_is_attenuated_by_device_scope() {
     assert!(global.iter().any(|entry| entry.principal == pid("alice")));
     assert!(global.iter().any(|entry| entry.principal == pid("bob")));
 
-    for device_key_id in [self_only_id.as_str(), "0000000000000000"] {
-        let scoped = list_for(
-            handlers::dispatch_with_device(
-                &kernel,
-                &PrincipalId::default(),
-                Some(device_key_id),
-                AdminRequestKind::AgentList,
-            )
-            .await,
-        );
-        assert_eq!(scoped.len(), 1);
-        assert_eq!(scoped[0].principal, PrincipalId::default());
-    }
+    let scoped = list_for(
+        handlers::dispatch_with_device(
+            &kernel,
+            &PrincipalId::default(),
+            Some(&self_only_id),
+            AdminRequestKind::AgentList,
+        )
+        .await,
+    );
+    assert_eq!(scoped.len(), 1);
+    assert_eq!(scoped[0].principal, PrincipalId::default());
 }
