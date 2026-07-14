@@ -661,7 +661,7 @@ async fn capsule_visibility_precomputes_admin_and_capsule_grants() {
     let admin_authorization =
         authorize_request(&kernel, &admin, None, "self:capsule:list").expect("authorize admin");
     let global_lister_authorization =
-        authorize_request(&kernel, &global_lister, None, "self:capsule:list")
+        authorize_request(&kernel, &global_lister, None, "capsule:list")
             .expect("authorize global lister");
     let limited_authorization =
         authorize_request(&kernel, &limited, None, "self:capsule:list").expect("authorize limited");

@@ -80,6 +80,48 @@ fn assert_error_contains(res: &AdminResponseBody, needle: &str) {
     }
 }
 
+fn agent_list_for(response: AdminResponseBody) -> Vec<AgentSummary> {
+    match response {
+        AdminResponseBody::AgentList(list) => list,
+        other => panic!("expected AgentList, got {other:?}"),
+    }
+}
+
+async fn assert_agent_list_authorization_snapshot(
+    kernel: &Arc<Kernel>,
+    mut profile: PrincipalProfile,
+    global_list_id: &str,
+) {
+    let authorization = crate::kernel_router::authorize_request(
+        kernel,
+        &PrincipalId::default(),
+        Some(global_list_id),
+        "self:agent:list",
+    )
+    .expect("authorize agent inventory");
+    profile.auth.public_keys.clear();
+    profile
+        .save_to_path(&PrincipalProfile::path_for(
+            &kernel.astrid_home,
+            &PrincipalId::default(),
+        ))
+        .expect("revoke inventory device");
+    kernel.profile_cache.invalidate(&PrincipalId::default());
+    crate::kernel_router::authorize_request(
+        kernel,
+        &PrincipalId::default(),
+        Some(global_list_id),
+        "self:agent:list",
+    )
+    .expect_err("a later request must observe the revoked device");
+
+    let pinned = agent_list_for(
+        handlers::dispatch_authorized(kernel, &authorization, AdminRequestKind::AgentList).await,
+    );
+    assert!(pinned.iter().any(|entry| entry.principal == pid("alice")));
+    assert!(pinned.iter().any(|entry| entry.principal == pid("bob")));
+}
+
 // ── agent.create ─────────────────────────────────────────────────────
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1054,11 +1096,7 @@ async fn agent_list_global_view_is_attenuated_by_device_scope() {
         .expect("save device-scoped default profile");
     kernel.profile_cache.invalidate(&PrincipalId::default());
 
-    let list_for = |response| match response {
-        AdminResponseBody::AgentList(list) => list,
-        other => panic!("expected AgentList, got {other:?}"),
-    };
-    let full = list_for(
+    let full = agent_list_for(
         handlers::dispatch_with_device(
             &kernel,
             &PrincipalId::default(),
@@ -1070,7 +1108,7 @@ async fn agent_list_global_view_is_attenuated_by_device_scope() {
     assert!(full.iter().any(|entry| entry.principal == pid("alice")));
     assert!(full.iter().any(|entry| entry.principal == pid("bob")));
 
-    let global = list_for(
+    let global = agent_list_for(
         handlers::dispatch_with_device(
             &kernel,
             &PrincipalId::default(),
@@ -1082,7 +1120,7 @@ async fn agent_list_global_view_is_attenuated_by_device_scope() {
     assert!(global.iter().any(|entry| entry.principal == pid("alice")));
     assert!(global.iter().any(|entry| entry.principal == pid("bob")));
 
-    let scoped = list_for(
+    let scoped = agent_list_for(
         handlers::dispatch_with_device(
             &kernel,
             &PrincipalId::default(),
@@ -1094,32 +1132,5 @@ async fn agent_list_global_view_is_attenuated_by_device_scope() {
     assert_eq!(scoped.len(), 1);
     assert_eq!(scoped[0].principal, PrincipalId::default());
 
-    let authorization = crate::kernel_router::authorize_request(
-        &kernel,
-        &PrincipalId::default(),
-        Some(&global_list_id),
-        "self:agent:list",
-    )
-    .expect("authorize agent inventory");
-    profile.auth.public_keys.clear();
-    profile
-        .save_to_path(&PrincipalProfile::path_for(
-            &kernel.astrid_home,
-            &PrincipalId::default(),
-        ))
-        .expect("revoke inventory device");
-    kernel.profile_cache.invalidate(&PrincipalId::default());
-    crate::kernel_router::authorize_request(
-        &kernel,
-        &PrincipalId::default(),
-        Some(&global_list_id),
-        "self:agent:list",
-    )
-    .expect_err("a later request must observe the revoked device");
-
-    let pinned = list_for(
-        handlers::dispatch_authorized(&kernel, &authorization, AdminRequestKind::AgentList).await,
-    );
-    assert!(pinned.iter().any(|entry| entry.principal == pid("alice")));
-    assert!(pinned.iter().any(|entry| entry.principal == pid("bob")));
+    assert_agent_list_authorization_snapshot(&kernel, profile, &global_list_id).await;
 }

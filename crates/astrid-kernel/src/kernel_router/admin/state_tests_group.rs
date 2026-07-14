@@ -35,6 +35,47 @@ fn pid(name: &str) -> PrincipalId {
     PrincipalId::new(name).unwrap()
 }
 
+fn group_names_for(response: AdminResponseBody) -> Vec<String> {
+    match response {
+        AdminResponseBody::GroupList(list) => list.into_iter().map(|group| group.name).collect(),
+        other => panic!("expected GroupList, got {other:?}"),
+    }
+}
+
+async fn assert_group_list_authorization_snapshot(
+    kernel: &Arc<Kernel>,
+    mut profile: PrincipalProfile,
+    global_list_id: &str,
+) {
+    let authorization = crate::kernel_router::authorize_request(
+        kernel,
+        &PrincipalId::default(),
+        Some(global_list_id),
+        "self:group:list",
+    )
+    .expect("authorize group inventory");
+    profile.auth.public_keys.clear();
+    profile
+        .save_to_path(&PrincipalProfile::path_for(
+            &kernel.astrid_home,
+            &PrincipalId::default(),
+        ))
+        .expect("revoke group inventory device");
+    kernel.profile_cache.invalidate(&PrincipalId::default());
+    crate::kernel_router::authorize_request(
+        kernel,
+        &PrincipalId::default(),
+        Some(global_list_id),
+        "self:group:list",
+    )
+    .expect_err("a later request must observe the revoked device");
+
+    let pinned = group_names_for(
+        handlers::dispatch_authorized(kernel, &authorization, AdminRequestKind::GroupList).await,
+    );
+    assert!(pinned.iter().any(|name| name == "ops"));
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn group_list_filters_to_callers_profile_groups_without_global_cap() {
     let (_dir, kernel) = fixture().await;
@@ -114,13 +155,7 @@ async fn group_list_global_view_is_attenuated_by_device_scope() {
         .expect("save device-scoped default profile");
     kernel.profile_cache.invalidate(&PrincipalId::default());
 
-    let names_for = |response| match response {
-        AdminResponseBody::GroupList(list) => {
-            list.into_iter().map(|group| group.name).collect::<Vec<_>>()
-        },
-        other => panic!("expected GroupList, got {other:?}"),
-    };
-    let full = names_for(
+    let full = group_names_for(
         handlers::dispatch_with_device(
             &kernel,
             &PrincipalId::default(),
@@ -131,7 +166,7 @@ async fn group_list_global_view_is_attenuated_by_device_scope() {
     );
     assert!(full.iter().any(|name| name == "ops"));
 
-    let global = names_for(
+    let global = group_names_for(
         handlers::dispatch_with_device(
             &kernel,
             &PrincipalId::default(),
@@ -142,7 +177,7 @@ async fn group_list_global_view_is_attenuated_by_device_scope() {
     );
     assert!(global.iter().any(|name| name == "ops"));
 
-    let scoped = names_for(
+    let scoped = group_names_for(
         handlers::dispatch_with_device(
             &kernel,
             &PrincipalId::default(),
@@ -153,28 +188,5 @@ async fn group_list_global_view_is_attenuated_by_device_scope() {
     );
     assert_eq!(scoped, vec![BUILTIN_ADMIN]);
 
-    let authorization = crate::kernel_router::authorize_request(
-        &kernel,
-        &PrincipalId::default(),
-        Some(&global_list_id),
-        "self:group:list",
-    )
-    .expect("authorize group inventory");
-    profile.auth.public_keys.clear();
-    profile
-        .save_to_path(&profile_path)
-        .expect("revoke group inventory device");
-    kernel.profile_cache.invalidate(&PrincipalId::default());
-    crate::kernel_router::authorize_request(
-        &kernel,
-        &PrincipalId::default(),
-        Some(&global_list_id),
-        "self:group:list",
-    )
-    .expect_err("a later request must observe the revoked device");
-
-    let pinned = names_for(
-        handlers::dispatch_authorized(&kernel, &authorization, AdminRequestKind::GroupList).await,
-    );
-    assert!(pinned.iter().any(|name| name == "ops"));
+    assert_group_list_authorization_snapshot(&kernel, profile, &global_list_id).await;
 }
