@@ -18,6 +18,38 @@ const REGISTRY_DIGEST_DOMAIN: &[u8] = b"astrid-capability-registry\0";
 /// Digest algorithm used by capability entries and registry manifests.
 pub const CAPABILITY_REGISTRY_DIGEST_ALGORITHM: &str = "blake3";
 
+/// Nonzero schema revision for a capability-registry manifest.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct CapabilityRegistryRevision<T = NonZeroU32>(T);
+
+impl<T> CapabilityRegistryRevision<T> {
+    /// Consume the wrapper and return its storage.
+    #[must_use]
+    pub fn into_inner(self) -> T {
+        self.0
+    }
+
+    /// Borrow the wrapped revision storage.
+    #[must_use]
+    pub const fn as_inner(&self) -> &T {
+        &self.0
+    }
+}
+
+impl CapabilityRegistryRevision {
+    /// Wrap a validated nonzero schema revision.
+    #[must_use]
+    pub const fn new(value: NonZeroU32) -> Self {
+        Self(value)
+    }
+
+    /// Return the revision as a primitive integer.
+    #[must_use]
+    pub const fn get(self) -> u32 {
+        self.0.get()
+    }
+}
+
 /// Exact capability IDs in capability-registry revision 1.
 ///
 /// This set is authority-bearing and frozen for its registry schema revision.
@@ -144,13 +176,7 @@ impl<T: AsRef<[u8]>> CapabilityEntryDigest<T> {
     ///
     /// Returns an error unless the storage contains exactly 32 bytes.
     pub fn new(value: T) -> Result<Self, AuthorityRegistryError> {
-        let actual = value.as_ref().len();
-        if actual != 32 {
-            return Err(AuthorityRegistryError::InvalidDigestLength {
-                kind: "capability entry",
-                actual,
-            });
-        }
+        validate_digest_length("capability entry", value.as_ref())?;
         Ok(Self(value))
     }
 
@@ -200,13 +226,7 @@ impl<T: AsRef<[u8]>> CapabilityRegistryDigest<T> {
     ///
     /// Returns an error unless the storage contains exactly 32 bytes.
     pub fn new(value: T) -> Result<Self, AuthorityRegistryError> {
-        let actual = value.as_ref().len();
-        if actual != 32 {
-            return Err(AuthorityRegistryError::InvalidDigestLength {
-                kind: "capability registry",
-                actual,
-            });
-        }
+        validate_digest_length("capability registry", value.as_ref())?;
         Ok(Self(value))
     }
 
@@ -224,6 +244,56 @@ impl<T: AsRef<[u8]>> CapabilityRegistryDigest<T> {
 }
 
 impl CapabilityRegistryDigest {
+    /// Wrap a compile-time-sized BLAKE3 digest.
+    #[must_use]
+    pub const fn from_array(value: [u8; 32]) -> Self {
+        Self(value)
+    }
+
+    /// Borrow the fixed-size digest array.
+    #[must_use]
+    pub const fn as_array(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
+
+/// BLAKE3 digest of a signed extension package that defines capabilities.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ExtensionPackageDigest<T = [u8; 32]>(T);
+
+impl<T> ExtensionPackageDigest<T> {
+    /// Consume the wrapper and return its storage.
+    #[must_use]
+    pub fn into_inner(self) -> T {
+        self.0
+    }
+}
+
+impl<T: AsRef<[u8]>> ExtensionPackageDigest<T> {
+    /// Validate and wrap digest storage.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error unless the storage contains exactly 32 bytes.
+    pub fn new(value: T) -> Result<Self, AuthorityRegistryError> {
+        validate_digest_length("signed extension package", value.as_ref())?;
+        Ok(Self(value))
+    }
+
+    /// Borrow the digest bytes.
+    #[must_use]
+    pub fn as_bytes(&self) -> &[u8] {
+        self.0.as_ref()
+    }
+
+    /// Render the digest as lowercase hexadecimal.
+    #[must_use]
+    pub fn to_hex(&self) -> String {
+        hex::encode(self.as_bytes())
+    }
+}
+
+impl ExtensionPackageDigest {
     /// Wrap a compile-time-sized BLAKE3 digest.
     #[must_use]
     pub const fn from_array(value: [u8; 32]) -> Self {
@@ -317,7 +387,7 @@ pub enum CapabilitySource {
     /// A capability supplied by a verified signed extension package.
     SignedExtension {
         /// BLAKE3 digest of the signed extension package.
-        package_digest: [u8; 32],
+        package_digest: ExtensionPackageDigest,
     },
 }
 
@@ -454,7 +524,7 @@ impl RegisteredCapability {
 /// A sorted, content-addressed registry generation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CapabilityRegistryManifest {
-    schema_revision: NonZeroU32,
+    schema_revision: CapabilityRegistryRevision,
     entries: Vec<RegisteredCapability>,
     digest: CapabilityRegistryDigest,
 }
@@ -467,7 +537,7 @@ impl CapabilityRegistryManifest {
     /// Returns an error for an empty registry, a duplicate capability ID, or an
     /// entry whose stored digest does not match its authorization semantics.
     pub fn new(
-        schema_revision: NonZeroU32,
+        schema_revision: CapabilityRegistryRevision,
         entries: impl IntoIterator<Item = RegisteredCapability>,
     ) -> Result<Self, AuthorityRegistryError> {
         let mut entries = entries.into_iter().collect::<Vec<_>>();
@@ -495,7 +565,7 @@ impl CapabilityRegistryManifest {
 
     /// Return the registry schema revision.
     #[must_use]
-    pub const fn schema_revision(&self) -> NonZeroU32 {
+    pub const fn schema_revision(&self) -> CapabilityRegistryRevision {
         self.schema_revision
     }
 
@@ -635,7 +705,7 @@ fn digest_entry(
 }
 
 fn digest_registry(
-    schema_revision: NonZeroU32,
+    schema_revision: CapabilityRegistryRevision,
     entries: &[RegisteredCapability],
 ) -> CapabilityRegistryDigest {
     let mut canonical = Vec::new();
@@ -702,7 +772,7 @@ fn encode_source(output: &mut Vec<u8>, source: CapabilitySource) {
         CapabilitySource::SignedExtension { package_digest } => {
             encode_array_len(output, 2);
             encode_unsigned(output, 1);
-            encode_bytes(output, &package_digest);
+            encode_bytes(output, package_digest.as_bytes());
         },
     }
 }
@@ -762,6 +832,14 @@ fn usize_to_u64(value: usize) -> u64 {
         Ok(value) => value,
         Err(_) => unreachable!("usize always fits into u64 on supported targets"),
     }
+}
+
+fn validate_digest_length(kind: &'static str, value: &[u8]) -> Result<(), AuthorityRegistryError> {
+    let actual = value.len();
+    if actual != 32 {
+        return Err(AuthorityRegistryError::InvalidDigestLength { kind, actual });
+    }
+    Ok(())
 }
 
 #[cfg(test)]

@@ -21,6 +21,10 @@ fn registered(
     .unwrap()
 }
 
+fn revision(value: u32) -> CapabilityRegistryRevision {
+    CapabilityRegistryRevision::new(NonZeroU32::new(value).unwrap())
+}
+
 #[test]
 fn exact_capability_id_rejects_every_wildcard_position() {
     for value in ["*", "self:*", "a:*:b"] {
@@ -125,7 +129,7 @@ fn every_authorization_field_changes_the_entry_digest() {
         true,
         false,
         CapabilitySource::SignedExtension {
-            package_digest: [7; 32],
+            package_digest: ExtensionPackageDigest::from_array([7; 32]),
         },
     )
     .unwrap();
@@ -137,7 +141,7 @@ fn every_authorization_field_changes_the_entry_digest() {
         true,
         false,
         CapabilitySource::SignedExtension {
-            package_digest: [8; 32],
+            package_digest: ExtensionPackageDigest::from_array([8; 32]),
         },
     )
     .unwrap();
@@ -179,7 +183,7 @@ fn danger_presentation_does_not_change_authority_identity() {
     .unwrap();
 
     assert_eq!(safe.entry_digest(), extreme.entry_digest());
-    let revision = NonZeroU32::new(1).unwrap();
+    let revision = revision(1);
     let safe_manifest = CapabilityRegistryManifest::new(revision, [safe]).unwrap();
     let extreme_manifest = CapabilityRegistryManifest::new(revision, [extreme]).unwrap();
     assert_eq!(safe_manifest.digest(), extreme_manifest.digest());
@@ -190,7 +194,7 @@ fn manifest_order_is_canonical_and_exact_refs_resolve() {
     let capsule = registered("capsule:list", [AuthorityTargetKind::System], true, false);
     let system = registered("system:status", [AuthorityTargetKind::System], true, false);
     let reference = capsule.capability_ref();
-    let revision = NonZeroU32::new(1).unwrap();
+    let revision = revision(1);
     let left =
         CapabilityRegistryManifest::new(revision, [system.clone(), capsule.clone()]).unwrap();
     let right = CapabilityRegistryManifest::new(revision, [capsule.clone(), system]).unwrap();
@@ -209,7 +213,7 @@ fn manifest_order_is_canonical_and_exact_refs_resolve() {
 fn duplicate_content_bound_entries_fail_closed() {
     let entry = registered("system:status", [AuthorityTargetKind::System], true, false);
     assert!(matches!(
-        CapabilityRegistryManifest::new(NonZeroU32::new(1).unwrap(), [entry.clone(), entry]),
+        CapabilityRegistryManifest::new(revision(1), [entry.clone(), entry]),
         Err(AuthorityRegistryError::DuplicateCapabilityId { .. })
     ));
 }
@@ -222,8 +226,7 @@ fn resolution_requires_the_exact_digest() {
         ExactCapabilityId::new("system:status".to_string()).unwrap(),
         safe.entry_digest(),
     );
-    let manifest =
-        CapabilityRegistryManifest::new(NonZeroU32::new(1).unwrap(), [safe.clone()]).unwrap();
+    let manifest = CapabilityRegistryManifest::new(revision(1), [safe.clone()]).unwrap();
     let unknown = CapabilityRef::new(
         ExactCapabilityId::new("system:status".to_string()).unwrap(),
         CapabilityEntryDigest::from_array([0; 32]),
@@ -249,8 +252,13 @@ fn digest_wrappers_reject_wrong_lengths() {
         CapabilityRegistryDigest::new(&[0_u8; 33][..]),
         Err(AuthorityRegistryError::InvalidDigestLength { actual: 33, .. })
     ));
+    assert!(matches!(
+        ExtensionPackageDigest::new(&[0_u8; 30][..]),
+        Err(AuthorityRegistryError::InvalidDigestLength { actual: 30, .. })
+    ));
     assert!(CapabilityEntryDigest::new(&[0_u8; 32]).is_ok());
     assert!(CapabilityRegistryDigest::new(&[0_u8; 32]).is_ok());
+    assert!(ExtensionPackageDigest::new(&[0_u8; 32]).is_ok());
 }
 
 #[test]
@@ -268,7 +276,7 @@ fn empty_targets_and_registry_fail_closed() {
         Err(AuthorityRegistryError::MissingTargetKind { .. })
     ));
     assert!(matches!(
-        CapabilityRegistryManifest::new(NonZeroU32::new(1).unwrap(), []),
+        CapabilityRegistryManifest::new(revision(1), []),
         Err(AuthorityRegistryError::EmptyRegistry)
     ));
 }
@@ -278,13 +286,12 @@ fn tampered_entry_and_manifest_digests_fail_closed() {
     let mut entry = registered("system:status", [AuthorityTargetKind::System], true, false);
     entry.delegable = false;
     assert!(matches!(
-        CapabilityRegistryManifest::new(NonZeroU32::new(1).unwrap(), [entry]),
+        CapabilityRegistryManifest::new(revision(1), [entry]),
         Err(AuthorityRegistryError::EntryDigestMismatch { .. })
     ));
 
     let entry = registered("system:status", [AuthorityTargetKind::System], true, false);
-    let mut manifest =
-        CapabilityRegistryManifest::new(NonZeroU32::new(1).unwrap(), [entry]).unwrap();
+    let mut manifest = CapabilityRegistryManifest::new(revision(1), [entry]).unwrap();
     manifest.digest = CapabilityRegistryDigest::from_array([0; 32]);
     assert!(matches!(
         manifest.verify(),
@@ -299,7 +306,7 @@ fn same_id_with_different_authorization_semantics_fails_closed() {
 
     assert_ne!(delegable.entry_digest(), direct_only.entry_digest());
     assert!(matches!(
-        CapabilityRegistryManifest::new(NonZeroU32::new(1).unwrap(), [delegable, direct_only]),
+        CapabilityRegistryManifest::new(revision(1), [delegable, direct_only]),
         Err(AuthorityRegistryError::DuplicateCapabilityId { .. })
     ));
 }
@@ -320,7 +327,7 @@ fn registry_digests_have_golden_vectors() {
         "f521ee33bd074ae2b608d5f415d8cc2567b1b2dba0a61b611518da0967b25253"
     );
     let manifest = CapabilityRegistryManifest::new(
-        NonZeroU32::new(1).unwrap(),
+        revision(1),
         [
             capsule,
             registered("system:status", [AuthorityTargetKind::System], true, false),
@@ -332,11 +339,8 @@ fn registry_digests_have_golden_vectors() {
         "82ce5c60e68fe848606aed138d81ac8f814623a7f8823e3e48989c2d8f872ddd"
     );
 
-    let next_revision = CapabilityRegistryManifest::new(
-        NonZeroU32::new(2).unwrap(),
-        manifest.entries().iter().cloned(),
-    )
-    .unwrap();
+    let next_revision =
+        CapabilityRegistryManifest::new(revision(2), manifest.entries().iter().cloned()).unwrap();
     assert_ne!(manifest.digest(), next_revision.digest());
 }
 
@@ -412,7 +416,7 @@ fn canonical_enum_and_source_tags_are_stable() {
     encode_source(
         &mut extension,
         CapabilitySource::SignedExtension {
-            package_digest: [7; 32],
+            package_digest: ExtensionPackageDigest::from_array([7; 32]),
         },
     );
     assert_eq!(&extension[..3], &[0x82, 0x01, 0x58]);
