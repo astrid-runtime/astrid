@@ -1,0 +1,7 @@
+# Capsules build for wasm32-unknown-unknown — an Astrid architectural
+# constraint, not a convention. Same settings as the adversarial fixture.
+[build]
+target = "wasm32-unknown-unknown"
+
+[target.wasm32-unknown-unknown]
+rustflags = ["--cfg=getrandom_backend=\"custom\""]

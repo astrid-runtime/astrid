@@ -47,6 +47,13 @@ pub struct CapabilitiesDef {
     /// Unix/TCP socket bind addresses the capsule requires.
     #[serde(default)]
     pub net_bind: Vec<String>,
+    /// Concurrent run-loop workers for a loopback TCP server capsule. Each worker
+    /// is an independent Store running `run()` and accepting on the shared bound
+    /// listener, so N workers serve N connections concurrently. None/1 = today's
+    /// single-instance behavior. Only honored for run-loop capsules that declare
+    /// net_bind and no host_process.
+    #[serde(default)]
+    pub bind_workers: Option<usize>,
     /// Outbound TCP destinations the capsule is allowed to connect to.
     ///
     /// Each entry is a `"host:port"` pattern. The `host` portion is a
@@ -117,6 +124,7 @@ impl CapabilitiesDef {
             net_connect,
             identity,
             allow_prompt_injection,
+            bind_workers,
         } = other;
         self.uplink |= *uplink;
         self.allow_persistent |= *allow_persistent;
@@ -129,6 +137,12 @@ impl CapabilitiesDef {
         self.net_bind.extend(net_bind.iter().cloned());
         self.net_connect.extend(net_connect.iter().cloned());
         self.identity.extend(identity.iter().cloned());
+        // Scalar, not a list: a component declaring bind_workers wins over the
+        // root default. Single-component capsules — the common case — simply
+        // promote it up so the run-loop worker count is honoured at the gate.
+        if bind_workers.is_some() {
+            self.bind_workers = *bind_workers;
+        }
     }
 
     /// Whether a serialized capability field counts as HELD: a non-empty
@@ -267,6 +281,7 @@ mod tests {
             net_connect: vec!["h1:1".into()],
             identity: vec!["resolve".into()],
             allow_prompt_injection: false,
+            bind_workers: None,
         };
         let other = CapabilitiesDef {
             uplink: true,
@@ -280,6 +295,7 @@ mod tests {
             net_connect: vec!["h2:2".into()],
             identity: vec!["link".into()],
             allow_prompt_injection: true,
+            bind_workers: Some(4),
         };
         base.merge_from(&other);
 
@@ -301,6 +317,23 @@ mod tests {
         assert!(base.uplink);
         assert!(base.allow_persistent);
         assert!(base.allow_prompt_injection);
+        // Scalar, not a list: a component's worker count is promoted to the
+        // root, which is what the security gate and the run-loop builder read.
+        assert_eq!(base.bind_workers, Some(4));
+    }
+
+    /// A component that declares no worker count must not erase one the root
+    /// already set — the mirror of the flag test below, for the scalar field.
+    #[test]
+    fn merge_from_preserves_root_bind_workers_when_component_is_silent() {
+        let mut base = CapabilitiesDef {
+            bind_workers: Some(8),
+            ..CapabilitiesDef::default()
+        };
+
+        base.merge_from(&CapabilitiesDef::default());
+
+        assert_eq!(base.bind_workers, Some(8));
     }
 
     #[test]
@@ -332,6 +365,7 @@ mod tests {
             host_process: vec!["bash".into()],
             allow_persistent: true,
             net_bind: vec!["127.0.0.1:0".into()],
+            bind_workers: None,
             net_connect: vec!["host:443".into()],
             identity: vec!["resolve".into()],
             allow_prompt_injection: true,
@@ -366,9 +400,30 @@ mod tests {
         let serde_json::Value::Object(fields) = serde_json::to_value(&caps).unwrap() else {
             panic!("CapabilitiesDef serializes to a JSON object");
         };
+        // Deliberate decision, forced by the guard above: `bind_workers` is a
+        // TUNING SCALAR, not a capability. It grants no authority — it only
+        // parameterises an already-granted `net_bind` by saying how many worker
+        // Stores serve the port. So it must not appear in `held_names`, which
+        // answers "what does this capsule hold" for `astrid capsule show` and
+        // the audit trail. Listing a worker count as a held capability would
+        // misreport the security posture.
+        //
+        // Named rather than counted, so a future non-capability field trips
+        // this same assertion and gets the same deliberate decision.
+        const NON_CAPABILITY_FIELDS: &[&str] = &["bind_workers"];
+        for name in NON_CAPABILITY_FIELDS {
+            assert!(
+                !caps.has(name),
+                "{name} is not a capability and must not be reported as held"
+            );
+        }
+        let capability_fields = fields
+            .keys()
+            .filter(|field| !NON_CAPABILITY_FIELDS.contains(&field.as_str()))
+            .count();
         assert_eq!(
             names.len(),
-            fields.len(),
+            capability_fields,
             "held_names must cover every serialized capability field"
         );
     }

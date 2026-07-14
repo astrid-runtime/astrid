@@ -23,6 +23,17 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
   bounded to 4096 bytes so `astrid storage` can render them instead of rejecting
   the provider as an invalid structured error. Generic mount, permission, lease,
   and rollback failures stay `provider-operation` hard errors. Closes #1567.
+### Added
+
+- **A run-loop capsule serving a loopback TCP port can now handle connections
+  concurrently.** A `#[astrid::run]` capsule that declares `net_bind` and no
+  `host_process` may set `bind_workers = N` to run N worker Stores, each
+  executing `run()` against ONE shared bound listener — the OS accept queue
+  load-balances. Previously a single Store served every connection serially, so
+  a client fanning out parallel requests queued behind itself. `N = 1` is
+  unchanged behaviour, and a capsule declaring interceptors is held at one
+  worker because N subscriptions would double-process every event. Closes
+  #1231.
 
 ### Changed
 

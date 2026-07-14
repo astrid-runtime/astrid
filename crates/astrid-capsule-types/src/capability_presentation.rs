@@ -40,6 +40,7 @@ pub fn semantic_capabilities(capabilities: &CapabilitiesDef) -> Vec<SemanticCapa
         net_connect,
         identity,
         allow_prompt_injection,
+        bind_workers: _,
     } = capabilities;
 
     if *uplink {
@@ -373,6 +374,7 @@ mod tests {
             net_connect: vec![],
             identity: vec![],
             allow_prompt_injection: true,
+            bind_workers: None,
         };
         let semantic = semantic_capabilities(&capabilities);
         assert_eq!(semantic.len(), 8);
