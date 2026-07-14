@@ -453,7 +453,7 @@ mod tests {
     }
 
     #[test]
-    fn invalidating_one_principal_does_not_reject_another_principals_load() {
+    fn invalidating_one_principal_does_not_reject_another_principal_load() {
         let (_dir, cache) = fixture();
         let alice = principal("alice-invalidation");
         let bob = principal("bob-load");
