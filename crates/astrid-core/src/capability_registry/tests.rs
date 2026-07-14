@@ -33,13 +33,13 @@ fn exact_capability_id_rejects_every_wildcard_position() {
 }
 
 #[test]
-fn migration_baseline_freezes_current_and_dormant_exact_ids() {
-    let baseline = MIGRATION_BASELINE_CAPABILITY_IDS
+fn capability_registry_revision_1_freezes_current_and_dormant_exact_ids() {
+    let baseline = CAPABILITY_REGISTRY_REVISION_1_IDS
         .iter()
         .copied()
         .collect::<BTreeSet<_>>();
-    assert_eq!(baseline.len(), MIGRATION_BASELINE_CAPABILITY_IDS.len());
-    for id in &MIGRATION_BASELINE_CAPABILITY_IDS {
+    assert_eq!(baseline.len(), CAPABILITY_REGISTRY_REVISION_1_IDS.len());
+    for id in &CAPABILITY_REGISTRY_REVISION_1_IDS {
         ExactCapabilityId::new(*id).unwrap();
     }
 
@@ -317,7 +317,7 @@ fn registry_digests_have_golden_vectors() {
     );
     assert_eq!(
         capsule.entry_digest().to_hex(),
-        "908fee5f09e75ca149b93fd78de24340cef97d7ddeecd3d5d56fed3401f44195"
+        "f521ee33bd074ae2b608d5f415d8cc2567b1b2dba0a61b611518da0967b25253"
     );
     let manifest = CapabilityRegistryManifest::new(
         NonZeroU32::new(1).unwrap(),
@@ -329,7 +329,7 @@ fn registry_digests_have_golden_vectors() {
     .unwrap();
     assert_eq!(
         manifest.digest().to_hex(),
-        "e61693befc8711222db7c91ecc44a1599f95ff3a16a4632f237c2d07545f7a88"
+        "82ce5c60e68fe848606aed138d81ac8f814623a7f8823e3e48989c2d8f872ddd"
     );
 
     let next_revision = CapabilityRegistryManifest::new(

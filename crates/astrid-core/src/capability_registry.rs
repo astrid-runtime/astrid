@@ -6,7 +6,6 @@
 use std::collections::BTreeSet;
 use std::num::NonZeroU32;
 
-use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::capability_grammar::{
@@ -17,13 +16,13 @@ const ENTRY_DIGEST_DOMAIN: &[u8] = b"astrid-capability-entry\0";
 const REGISTRY_DIGEST_DOMAIN: &[u8] = b"astrid-capability-registry\0";
 
 /// Digest algorithm used by capability entries and registry manifests.
-pub const CAPABILITY_REGISTRY_DIGEST_ALGORITHM: &str = "sha256";
+pub const CAPABILITY_REGISTRY_DIGEST_ALGORITHM: &str = "blake3";
 
-/// Exact capability IDs in the authority migration baseline.
+/// Exact capability IDs in capability-registry revision 1.
 ///
 /// This set is authority-bearing and frozen for its registry schema revision.
 /// Expanding it requires an intentional schema revision and reviewed digest vectors.
-pub const MIGRATION_BASELINE_CAPABILITY_IDS: [&str; 51] = [
+const CAPABILITY_REGISTRY_REVISION_1_IDS: [&str; 51] = [
     "system:shutdown",
     "system:status",
     "capsule:install",
@@ -126,7 +125,7 @@ impl<T> ExactCapabilityId<T> {
     }
 }
 
-/// SHA-256 digest of one immutable registered capability definition.
+/// BLAKE3 digest of one immutable registered capability definition.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct CapabilityEntryDigest<T = [u8; 32]>(T);
 
@@ -169,7 +168,7 @@ impl<T: AsRef<[u8]>> CapabilityEntryDigest<T> {
 }
 
 impl CapabilityEntryDigest {
-    /// Wrap a compile-time-sized SHA-256 digest.
+    /// Wrap a compile-time-sized BLAKE3 digest.
     #[must_use]
     pub const fn from_array(value: [u8; 32]) -> Self {
         Self(value)
@@ -182,7 +181,7 @@ impl CapabilityEntryDigest {
     }
 }
 
-/// SHA-256 digest of one complete capability-registry manifest.
+/// BLAKE3 digest of one complete capability-registry manifest.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct CapabilityRegistryDigest<T = [u8; 32]>(T);
 
@@ -225,7 +224,7 @@ impl<T: AsRef<[u8]>> CapabilityRegistryDigest<T> {
 }
 
 impl CapabilityRegistryDigest {
-    /// Wrap a compile-time-sized SHA-256 digest.
+    /// Wrap a compile-time-sized BLAKE3 digest.
     #[must_use]
     pub const fn from_array(value: [u8; 32]) -> Self {
         Self(value)
@@ -317,7 +316,7 @@ pub enum CapabilitySource {
     Kernel,
     /// A capability supplied by a verified signed extension package.
     SignedExtension {
-        /// SHA-256 digest of the signed extension package.
+        /// BLAKE3 digest of the signed extension package.
         package_digest: [u8; 32],
     },
 }
@@ -709,10 +708,10 @@ fn encode_source(output: &mut Vec<u8>, source: CapabilitySource) {
 }
 
 fn domain_hash(domain: &[u8], canonical: &[u8]) -> [u8; 32] {
-    let mut hasher = Sha256::new();
+    let mut hasher = blake3::Hasher::new();
     hasher.update(domain);
     hasher.update(canonical);
-    hasher.finalize().into()
+    *hasher.finalize().as_bytes()
 }
 
 fn encode_array_len(output: &mut Vec<u8>, len: usize) {
@@ -739,17 +738,19 @@ fn encode_bool(output: &mut Vec<u8>, value: bool) {
 
 fn encode_major_len(output: &mut Vec<u8>, major: u8, value: u64) {
     let prefix = major << 5;
-    if value <= 23 {
-        output.push(prefix | narrow_u8(value));
-    } else if u8::try_from(value).is_ok() {
-        output.push(prefix | 0x18);
-        output.push(narrow_u8(value));
-    } else if u16::try_from(value).is_ok() {
+    if let Ok(value) = u8::try_from(value) {
+        if value <= 23 {
+            output.push(prefix | value);
+        } else {
+            output.push(prefix | 0x18);
+            output.push(value);
+        }
+    } else if let Ok(value) = u16::try_from(value) {
         output.push(prefix | 0x19);
-        output.extend_from_slice(&narrow_u16(value).to_be_bytes());
-    } else if u32::try_from(value).is_ok() {
+        output.extend_from_slice(&value.to_be_bytes());
+    } else if let Ok(value) = u32::try_from(value) {
         output.push(prefix | 0x1a);
-        output.extend_from_slice(&narrow_u32(value).to_be_bytes());
+        output.extend_from_slice(&value.to_be_bytes());
     } else {
         output.push(prefix | 0x1b);
         output.extend_from_slice(&value.to_be_bytes());
@@ -760,27 +761,6 @@ fn usize_to_u64(value: usize) -> u64 {
     match u64::try_from(value) {
         Ok(value) => value,
         Err(_) => unreachable!("usize always fits into u64 on supported targets"),
-    }
-}
-
-fn narrow_u8(value: u64) -> u8 {
-    match u8::try_from(value) {
-        Ok(value) => value,
-        Err(_) => unreachable!("caller checked u8 range"),
-    }
-}
-
-fn narrow_u16(value: u64) -> u16 {
-    match u16::try_from(value) {
-        Ok(value) => value,
-        Err(_) => unreachable!("caller checked u16 range"),
-    }
-}
-
-fn narrow_u32(value: u64) -> u32 {
-    match u32::try_from(value) {
-        Ok(value) => value,
-        Err(_) => unreachable!("caller checked u32 range"),
     }
 }
 

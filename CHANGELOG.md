@@ -13,9 +13,9 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
 
 - **Passive content-addressed capability-registry primitives.** Astrid now has
   exact capability IDs, typed content-bound references, immutable registered
-  definitions, deterministic semantic digests and canonical registry manifests.
-  Existing profile persistence, wildcard evaluation, bootstrap, socket and wire
-  behavior remain unchanged. Closes #1233. Refs #1228.
+  definitions, deterministic BLAKE3 semantic digests and canonical registry
+  manifests. Existing profile persistence, wildcard evaluation, bootstrap,
+  socket and wire behavior remain unchanged. Closes #1233. Refs #1228.
 
 ### Changed
 
