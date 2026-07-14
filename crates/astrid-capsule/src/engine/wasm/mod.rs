@@ -2196,6 +2196,46 @@ impl ExecutionEngine for WasmEngine {
                 );
             }
 
+            // Install the run loop's per-principal resource context.
+            //
+            // A run-loop capsule drives its `run` export directly (the task
+            // spawned further below) and never goes through
+            // `invoke_interceptor`, so the per-invocation overlays that path
+            // installs are never applied here: the env overlay, secret store,
+            // and `home://` all sit at the neutral deny-all floor. But `run()`
+            // reads `env::var` / secrets / `home://` for the WHOLE lifetime of
+            // its single long-lived invocation (e.g. a request loop calling
+            // `env::var` per request), so the owner context must be installed
+            // ONCE here, before the run task is spawned — not per message.
+            //
+            // Owner = `ctx.principal`, the shared-runtime load owner
+            // (`PrincipalId::default()` for a run-loop capsule). Scoping to it
+            // hands the loop ONLY the owner's config — exactly what a bus
+            // invocation from the owner would install, never another
+            // principal's data. `caller_context` is deliberately left `None`
+            // so an inbound `ipc::recv` can still install a per-publisher
+            // context and `effective_principal()` keeps resolving the owner
+            // for the loop's own autonomous work.
+            if has_run {
+                let mut s = store_arc.as_ref().expect("run-loop has store").lock().await;
+                let state = s.data_mut();
+                state.invocation_env_overlay =
+                    load_invocation_env_overlay(&ctx.principal, state.capsule_id.as_str());
+                // Installs invocation_kv + invocation_secret_store +
+                // invocation_capsule_log + invocation_home/tmp scoped to the
+                // owner, or clears to the neutral fail-closed floor if the
+                // owner has no registered home / KV construction fails
+                // (identical to today's behavior — no regression).
+                install_principal_overlays(state, Some(&ctx.principal)).await;
+                tracing::debug!(
+                    capsule = %manifest.package.name,
+                    principal = %ctx.principal,
+                    env_overlay = state.invocation_env_overlay.is_some(),
+                    home = state.invocation_home.is_some(),
+                    "Installed run-loop owner resource context"
+                );
+            }
+
             Ok::<_, CapsuleError>((
                 pool_opt,
                 store_arc,
