@@ -2,9 +2,7 @@
 
 use astrid_core::PrincipalId;
 use astrid_core::capability_grammar::known_capabilities;
-use astrid_core::capability_registry::{
-    MIGRATION_BASELINE_CAPABILITY_IDS, migration_baseline_registry,
-};
+use astrid_core::capability_registry::capability_registry_revision_1;
 use astrid_core::kernel_api::{AdminRequestKind, KernelRequest};
 use astrid_core::profile::Quotas;
 use std::collections::BTreeSet;
@@ -51,8 +49,8 @@ fn all_kernel_request_variants() -> Vec<KernelRequest> {
 }
 
 #[test]
-fn migration_registry_covers_every_kernel_request_cap() {
-    let registry = migration_baseline_registry().unwrap();
+fn registry_revision_1_covers_every_kernel_request_cap() {
+    let registry = capability_registry_revision_1().unwrap();
     let registered = registry
         .entries()
         .iter()
@@ -64,7 +62,7 @@ fn migration_registry_covers_every_kernel_request_cap() {
             let cap = required_capability(&req, scope);
             assert!(
                 registered.contains(cap),
-                "kernel returns capability {cap:?} without a migration-baseline registry entry"
+                "kernel returns capability {cap:?} without a registry revision 1 entry"
             );
         }
     }
@@ -176,8 +174,8 @@ fn all_admin_request_variants() -> Vec<AdminRequestKind> {
 }
 
 #[test]
-fn migration_registry_covers_every_admin_request_cap() {
-    let registry = migration_baseline_registry().unwrap();
+fn registry_revision_1_covers_every_admin_request_cap() {
+    let registry = capability_registry_revision_1().unwrap();
     let registered = registry
         .entries()
         .iter()
@@ -189,14 +187,14 @@ fn migration_registry_covers_every_admin_request_cap() {
             let cap = required_capability_for_admin_request(req, scope);
             assert!(
                 registered.contains(cap),
-                "admin op returns capability {cap:?} without a migration-baseline registry entry"
+                "admin op returns capability {cap:?} without a registry revision 1 entry"
             );
         }
     }
 }
 
 #[test]
-fn migration_baseline_classifies_every_current_enforcement_role() {
+fn registry_revision_1_classifies_every_current_enforcement_role() {
     let primary = BTreeSet::from([
         "system:shutdown",
         "system:status",
@@ -275,11 +273,13 @@ fn migration_baseline_classifies_every_current_enforcement_role() {
         .into_iter()
         .flat_map(|class| class.iter().copied())
         .collect::<BTreeSet<_>>();
-    let baseline = MIGRATION_BASELINE_CAPABILITY_IDS
+    let revision = capability_registry_revision_1().unwrap();
+    let revision_ids = revision
+        .entries()
         .iter()
-        .copied()
+        .map(|entry| entry.id().as_str())
         .collect::<BTreeSet<_>>();
-    assert_eq!(classified, baseline);
+    assert_eq!(classified, revision_ids);
 }
 
 #[test]
