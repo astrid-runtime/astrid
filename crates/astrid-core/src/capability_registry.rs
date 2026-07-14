@@ -61,7 +61,6 @@ impl CapabilityRegistryRevision {
 ///
 /// This set is authority-bearing and frozen for its registry schema revision.
 /// Expanding it requires an intentional schema revision and reviewed digest vectors.
-#[cfg(test)]
 const CAPABILITY_REGISTRY_REVISION_1_IDS: [&str; 51] = [
     "system:shutdown",
     "system:status",
