@@ -43,10 +43,15 @@ pub mod socket_client;
 mod theme;
 mod tui;
 mod value_formatter;
+mod workspace_layout;
 
 #[tokio::main]
 async fn main() -> ExitCode {
     let parsed = cli::Cli::parse();
+    if workspace_layout::initialize(parsed.workspace_state_dir.clone()).is_err() {
+        eprintln!("error: workspace layout was already initialized");
+        return ExitCode::from(1);
+    }
     bootstrap::init_logging(&parsed);
 
     // Resolve and validate the process-wide principal ONCE, before any

@@ -41,6 +41,7 @@ use std::time::Duration;
 
 use astrid_events::AstridEvent;
 use astrid_events::ipc::{IpcMessage, IpcPayload, Topic};
+use axum::Extension;
 use axum::Json;
 use axum::extract::State;
 use axum::http::Request;
@@ -49,12 +50,12 @@ use serde_json::json;
 use utoipa::ToSchema;
 use uuid::Uuid;
 
-use astrid_core::PrincipalId;
-
 use crate::error::{ErrorBody, GatewayError, GatewayResult};
+use crate::routes::WorkspaceContext;
 use crate::routes::capsule_sources::{capsule_source_id_v0, trusted_capsule_source_ids};
 use crate::routes::principals::caller_from;
 use crate::state::GatewayState;
+use astrid_core::PrincipalId;
 
 /// Wall-clock budget for the registry to answer a model request. Matches
 /// the 10s budget the CLI uses for the equivalent daemon read
@@ -193,6 +194,7 @@ fn classify_set_active_reply(reply: &serde_json::Value) -> SetActiveOutcome {
 async fn registry_round_trip(
     state: &GatewayState,
     principal_id: &PrincipalId,
+    workspace: &WorkspaceContext,
     request_topic: &'static str,
     response_topic: &'static str,
     payload: serde_json::Value,
@@ -256,7 +258,12 @@ async fn registry_round_trip(
     // `recv` is bounded by the time REMAINING, so a stream of skipped foreign
     // replies can never extend the total wait past the original budget.
     let timeout = state.registry_timeout.unwrap_or(REGISTRY_TIMEOUT);
-    let expected_source_ids = trusted_capsule_source_ids(REGISTRY_CAPSULE_ID, principal_id);
+    let expected_source_ids = trusted_capsule_source_ids(
+        REGISTRY_CAPSULE_ID,
+        principal_id,
+        &workspace.root,
+        &workspace.layout,
+    );
     let expected_source_ids = if expected_source_ids.is_empty() {
         tracing::warn!(
             capsule_id = REGISTRY_CAPSULE_ID,
@@ -356,10 +363,27 @@ pub async fn list_models(
     State(state): State<Arc<GatewayState>>,
     req: Request<axum::body::Body>,
 ) -> GatewayResult<Json<serde_json::Value>> {
+    list_models_inner(state, &WorkspaceContext::default(), req).await
+}
+
+pub(crate) async fn list_models_with_layout(
+    State(state): State<Arc<GatewayState>>,
+    Extension(workspace): Extension<WorkspaceContext>,
+    req: Request<axum::body::Body>,
+) -> GatewayResult<Json<serde_json::Value>> {
+    list_models_inner(state, &workspace, req).await
+}
+
+async fn list_models_inner(
+    state: Arc<GatewayState>,
+    workspace: &WorkspaceContext,
+    req: Request<axum::body::Body>,
+) -> GatewayResult<Json<serde_json::Value>> {
     let caller = caller_from(&req)?;
     let reply = registry_round_trip(
         &state,
         &caller.principal,
+        workspace,
         GET_PROVIDERS_REQUEST,
         GET_PROVIDERS_RESPONSE,
         json!({}),
@@ -386,10 +410,27 @@ pub async fn get_active_model(
     State(state): State<Arc<GatewayState>>,
     req: Request<axum::body::Body>,
 ) -> GatewayResult<Json<serde_json::Value>> {
+    get_active_model_inner(state, &WorkspaceContext::default(), req).await
+}
+
+pub(crate) async fn get_active_model_with_layout(
+    State(state): State<Arc<GatewayState>>,
+    Extension(workspace): Extension<WorkspaceContext>,
+    req: Request<axum::body::Body>,
+) -> GatewayResult<Json<serde_json::Value>> {
+    get_active_model_inner(state, &workspace, req).await
+}
+
+async fn get_active_model_inner(
+    state: Arc<GatewayState>,
+    workspace: &WorkspaceContext,
+    req: Request<axum::body::Body>,
+) -> GatewayResult<Json<serde_json::Value>> {
     let caller = caller_from(&req)?;
     let reply = registry_round_trip(
         &state,
         &caller.principal,
+        workspace,
         GET_ACTIVE_REQUEST,
         GET_ACTIVE_RESPONSE,
         json!({}),
@@ -418,6 +459,22 @@ pub async fn set_active_model(
     State(state): State<Arc<GatewayState>>,
     req: Request<axum::body::Body>,
 ) -> GatewayResult<Json<serde_json::Value>> {
+    set_active_model_inner(state, &WorkspaceContext::default(), req).await
+}
+
+pub(crate) async fn set_active_model_with_layout(
+    State(state): State<Arc<GatewayState>>,
+    Extension(workspace): Extension<WorkspaceContext>,
+    req: Request<axum::body::Body>,
+) -> GatewayResult<Json<serde_json::Value>> {
+    set_active_model_inner(state, &workspace, req).await
+}
+
+async fn set_active_model_inner(
+    state: Arc<GatewayState>,
+    workspace: &WorkspaceContext,
+    req: Request<axum::body::Body>,
+) -> GatewayResult<Json<serde_json::Value>> {
     // Clone only the principal id, not the whole `CallerContext`: the
     // round-trip needs nothing else, and `read_json_body` below consumes
     // `req` (which `caller_from` borrows), so the value we carry past it must
@@ -444,6 +501,7 @@ pub async fn set_active_model(
     let reply = registry_round_trip(
         &state,
         &principal,
+        workspace,
         SET_ACTIVE_REQUEST,
         SET_ACTIVE_RESPONSE,
         // The registry reads `model_id` (also accepted under `data`); the
@@ -609,6 +667,7 @@ mod tests {
         let err = registry_round_trip(
             &state,
             &principal,
+            &WorkspaceContext::default(),
             GET_ACTIVE_REQUEST,
             GET_ACTIVE_RESPONSE,
             json!({}),
@@ -668,6 +727,7 @@ mod tests {
         let reply = registry_round_trip(
             &state,
             &principal,
+            &WorkspaceContext::default(),
             GET_ACTIVE_REQUEST,
             GET_ACTIVE_RESPONSE,
             json!({}),

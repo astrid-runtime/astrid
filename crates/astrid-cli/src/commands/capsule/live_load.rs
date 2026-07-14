@@ -33,7 +33,6 @@ pub(crate) async fn nudge_daemon_reload(capsule_ids: &[String]) {
     if !crate::socket_client::proxy_socket_path().exists() {
         return;
     }
-
     // One fresh session UUID, used for BOTH the connection's SessionId and each
     // message source_id, so these requests are attributed to a real client
     // session — never the reserved nil UUID, which is SYSTEM_SESSION_UUID.
@@ -46,6 +45,11 @@ pub(crate) async fn nudge_daemon_reload(capsule_ids: &[String]) {
         // install standalone rather than failing it.
         return;
     };
+    // Validate after connect so a concurrent daemon restart cannot retarget us.
+    if let Err(error) = crate::commands::daemon::ensure_daemon_workspace_matches(None).await {
+        eprintln!("Note: installed capsules to disk, but skipped live reload because {error}.");
+        return;
+    }
 
     for id in capsule_ids {
         let Ok(val) = serde_json::to_value(KernelRequest::ReloadCapsule { id: id.clone() }) else {
@@ -116,7 +120,6 @@ pub(crate) async fn try_daemon_unload(capsule_id: &str) -> anyhow::Result<LiveUn
     if capsule_id.is_empty() || !crate::socket_client::proxy_socket_path().exists() {
         return Ok(LiveUnload::NoDaemon);
     }
-
     let session_uuid = uuid::Uuid::new_v4();
     let session = astrid_core::SessionId::from_uuid(session_uuid);
     let Ok(mut client) =
@@ -124,6 +127,10 @@ pub(crate) async fn try_daemon_unload(capsule_id: &str) -> anyhow::Result<LiveUn
     else {
         return Ok(LiveUnload::NoDaemon);
     };
+    // A connected mismatch is an error; removal must not proceed as offline.
+    crate::commands::daemon::ensure_daemon_workspace_matches(None)
+        .await
+        .context("refusing to unload from a daemon with a different workspace selection")?;
 
     let val = serde_json::to_value(KernelRequest::UnloadCapsule {
         id: capsule_id.to_string(),

@@ -12,7 +12,9 @@
 
 use anyhow::{Context, bail};
 use astrid_capsule_install::github_source::{parse_github_source, strip_version_prefix};
-use astrid_capsule_install::scan_installed_capsules_in_home_for;
+use astrid_capsule_install::{
+    CapsuleLocation, InstalledCapsule, scan_installed_capsules_in_home_for_with_layout,
+};
 use astrid_core::dirs::AstridHome;
 
 use super::install::install_capsule;
@@ -115,8 +117,13 @@ pub(crate) async fn update_capsule(target: Option<&str>, workspace: bool) -> any
     let principal = crate::principal::current();
 
     if let Some(name) = target {
-        let target_dir =
-            astrid_capsule_install::resolve_target_dir_for(&home, &principal, name, workspace)?;
+        let target_dir = astrid_capsule_install::resolve_target_dir_for_with_layout(
+            &home,
+            &principal,
+            name,
+            workspace,
+            crate::workspace_layout::current(),
+        )?;
         if !target_dir.exists() {
             bail!("Capsule '{name}' is not installed.");
         }
@@ -152,11 +159,17 @@ async fn update_all_capsules(
     principal: &astrid_core::PrincipalId,
     workspace: bool,
 ) -> anyhow::Result<()> {
-    let capsules: Vec<(String, Option<CapsuleMeta>)> =
-        scan_installed_capsules_in_home_for(home, principal)?
-            .into_iter()
-            .map(|capsule| (capsule.name, capsule.meta))
-            .collect();
+    let capsules: Vec<(String, Option<CapsuleMeta>)> = filter_update_scope(
+        scan_installed_capsules_in_home_for_with_layout(
+            home,
+            principal,
+            crate::workspace_layout::current(),
+        )?,
+        workspace,
+    )
+    .into_iter()
+    .map(|capsule| (capsule.name, capsule.meta))
+    .collect();
 
     if capsules.is_empty() {
         eprintln!("No capsules installed.");
@@ -236,6 +249,18 @@ async fn update_all_capsules(
     Ok(())
 }
 
+fn filter_update_scope(capsules: Vec<InstalledCapsule>, workspace: bool) -> Vec<InstalledCapsule> {
+    let selected = if workspace {
+        CapsuleLocation::Workspace
+    } else {
+        CapsuleLocation::User
+    };
+    capsules
+        .into_iter()
+        .filter(|capsule| capsule.location == selected)
+        .collect()
+}
+
 /// Regenerate the Distro.lock from currently installed capsules.
 ///
 /// Scans all installed capsules, reads their `meta.json`, and writes
@@ -256,7 +281,11 @@ fn regenerate_distro_lock(
         return Ok(());
     };
 
-    let all = scan_installed_capsules_in_home_for(home, principal)?;
+    let all = scan_installed_capsules_in_home_for_with_layout(
+        home,
+        principal,
+        crate::workspace_layout::current(),
+    )?;
     let capsules: Vec<LockedCapsule> = all
         .iter()
         .map(|c| {
@@ -311,6 +340,37 @@ fn regenerate_distro_lock(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn installed(name: &str, location: CapsuleLocation) -> InstalledCapsule {
+        InstalledCapsule {
+            name: name.to_string(),
+            meta: None,
+            location,
+        }
+    }
+
+    #[test]
+    fn update_scope_does_not_move_capsules_between_locations() {
+        let user = filter_update_scope(
+            vec![
+                installed("user-only", CapsuleLocation::User),
+                installed("workspace-only", CapsuleLocation::Workspace),
+            ],
+            false,
+        );
+        assert_eq!(user.len(), 1);
+        assert_eq!(user[0].name, "user-only");
+
+        let workspace = filter_update_scope(
+            vec![
+                installed("user-only", CapsuleLocation::User),
+                installed("workspace-only", CapsuleLocation::Workspace),
+            ],
+            true,
+        );
+        assert_eq!(workspace.len(), 1);
+        assert_eq!(workspace[0].name, "workspace-only");
+    }
 
     #[tokio::test]
     async fn test_check_remote_version_invalid_semver() {

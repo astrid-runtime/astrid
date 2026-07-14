@@ -9,6 +9,7 @@ rust-version.workspace = true
 description = "Unified configuration system for Astrid"
 
 [dependencies]
+astrid-core = { workspace = true }
 directories = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

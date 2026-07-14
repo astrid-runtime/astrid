@@ -32,7 +32,7 @@ use astrid_capsule::capsule::CapsuleId;
 use astrid_capsule_install::github_source::{
     capsule_assets, extract_github_org_repo, parse_github_source, pick_capsule,
 };
-use astrid_capsule_install::{InstallOptions, InstallOutput};
+use astrid_capsule_install::{InstallOptions, InstallOutput, resolve_target_dir_for_with_layout};
 use astrid_core::dirs::AstridHome;
 use astrid_events::EventBus;
 
@@ -695,17 +695,22 @@ fn install_from_local_path_for_principal(
         };
         match expected {
             Some(expected) => {
-                astrid_capsule_install::install_from_local_path_checked_for_principal(
+                astrid_capsule_install::install_from_local_path_checked_for_principal_with_layout(
                     source_dir,
                     home,
                     opts,
                     principal,
                     expected.id,
                     expected.version,
+                    crate::workspace_layout::current(),
                 )
             },
-            None => astrid_capsule_install::install_from_local_path_for_principal(
-                source_dir, home, opts, principal,
+            None => astrid_capsule_install::install_from_local_path_for_principal_with_layout(
+                source_dir,
+                home,
+                opts,
+                principal,
+                crate::workspace_layout::current(),
             ),
         }
     })?;
@@ -744,9 +749,15 @@ pub(crate) fn install_offline_capsule(
             }),
         )?;
         // Post-stamp provenance into the freshly-written meta.json. The
-        // unpack above installs under the explicit target principal, so
-        // read metadata back from that same home.
-        let target_dir = resolve_target_dir_for(home, principal, expected.as_str(), false)?;
+        // unpack above installs under the explicit target principal and
+        // selected workspace layout, so read metadata through the same path.
+        let target_dir = resolve_target_dir_for_with_layout(
+            home,
+            principal,
+            expected.as_str(),
+            false,
+            crate::workspace_layout::current(),
+        )?;
         if let Some(mut meta) = super::meta::read_meta(&target_dir) {
             meta.resolved_ref = provenance.resolved_ref.map(String::from);
             meta.signer = provenance.signer.map(String::from);
@@ -781,16 +792,23 @@ fn unpack_via_lib(
             ..opts
         };
         match expected {
-            Some(expected) => astrid_capsule_install::unpack_and_install_checked_for_principal(
+            Some(expected) => {
+                astrid_capsule_install::unpack_and_install_checked_for_principal_with_layout(
+                    archive,
+                    home,
+                    opts,
+                    principal,
+                    expected.id,
+                    expected.version,
+                    crate::workspace_layout::current(),
+                )
+            },
+            None => astrid_capsule_install::unpack_and_install_for_principal_with_layout(
                 archive,
                 home,
                 opts,
                 principal,
-                expected.id,
-                expected.version,
-            ),
-            None => astrid_capsule_install::unpack_and_install_for_principal(
-                archive, home, opts, principal,
+                crate::workspace_layout::current(),
             ),
         }
     })?;

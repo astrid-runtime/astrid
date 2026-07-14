@@ -80,7 +80,10 @@ async fn spawn_daemon_inner(
     let daemon_bin = find_companion_binary("astrid-daemon")?;
 
     let mut cmd = std::process::Command::new(daemon_bin);
-    cmd.arg("--ephemeral");
+    cmd.arg("--ephemeral").env(
+        "ASTRID_WORKSPACE_STATE_DIR",
+        crate::workspace_layout::current().state_dir_name(),
+    );
 
     if let Some(ws_path) = ws.to_str() {
         cmd.arg("--workspace").arg(ws_path);
@@ -155,6 +158,7 @@ async fn ensure_daemon_inner(label: &str, announce: bool) -> Result<()> {
 
     let needs_boot = if socket_path.exists() {
         if tokio::net::UnixStream::connect(&socket_path).await.is_ok() {
+            ensure_daemon_workspace_matches(None).await?;
             if announce {
                 eprintln!("[{label}] Connected to existing daemon");
             }
@@ -169,6 +173,50 @@ async fn ensure_daemon_inner(label: &str, announce: bool) -> Result<()> {
     };
     if needs_boot {
         spawn_daemon_inner(&ready_path, announce).await?;
+        ensure_daemon_workspace_matches(None).await?;
+    }
+    Ok(())
+}
+
+pub(crate) async fn ensure_daemon_workspace_matches(workspace_root: Option<&Path>) -> Result<()> {
+    let root = workspace_root.map_or_else(
+        || std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+        Path::to_path_buf,
+    );
+    let expected = astrid_core::dirs::workspace_selection_fingerprint(
+        &root,
+        crate::workspace_layout::current(),
+    );
+    let ready_path = socket_client::readiness_path();
+
+    for _ in 0..DAEMON_READY_ATTEMPTS {
+        match std::fs::read_to_string(&ready_path) {
+            Ok(metadata) => return validate_daemon_workspace_metadata(&metadata, &expected),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                tokio::time::sleep(DAEMON_READY_POLL).await;
+            },
+            Err(error) => {
+                return Err(error).context("failed to read daemon workspace metadata");
+            },
+        }
+    }
+
+    anyhow::bail!(
+        "daemon workspace metadata was not available within {} seconds; run `astrid restart`",
+        DAEMON_READY_TIMEOUT_SECS
+    )
+}
+
+fn validate_daemon_workspace_metadata(metadata: &str, expected: &str) -> Result<()> {
+    let Some(actual) = metadata.trim().strip_prefix("v1:") else {
+        anyhow::bail!(
+            "running daemon does not expose workspace selection metadata; run `astrid restart`"
+        );
+    };
+    if actual != expected {
+        anyhow::bail!(
+            "running daemon belongs to another project or workspace layout; run `astrid restart` from this project"
+        );
     }
     Ok(())
 }
@@ -185,6 +233,10 @@ pub(crate) async fn spawn_persistent_daemon() -> Result<()> {
 
     let mut cmd = std::process::Command::new(daemon_bin);
     // No --ephemeral flag = persistent mode
+    cmd.env(
+        "ASTRID_WORKSPACE_STATE_DIR",
+        crate::workspace_layout::current().state_dir_name(),
+    );
 
     if let Some(ws_path) = ws.to_str() {
         cmd.arg("--workspace").arg(ws_path);
@@ -312,13 +364,19 @@ pub(crate) async fn handle_start() -> Result<()> {
     let ready_path = socket_client::readiness_path();
     let pid_path = socket_client::pid_path();
 
-    let socket_reachable =
-        socket_path.exists() && tokio::net::UnixStream::connect(&socket_path).await.is_ok();
+    let socket_probe = if socket_path.exists() {
+        tokio::net::UnixStream::connect(&socket_path).await.ok()
+    } else {
+        None
+    };
+    let socket_reachable = socket_probe.is_some();
     let recorded_pid_alive = daemon_control::read_pid_file(&pid_path)
         .is_some_and(|(pid, _)| daemon_control::is_process_alive(pid));
 
     match decide_start_action(socket_reachable, recorded_pid_alive) {
         StartAction::AlreadyRunning => {
+            ensure_daemon_workspace_matches(None).await?;
+            drop(socket_probe);
             println!(
                 "{}",
                 theme::Theme::warning("Astrid daemon is already running.")
@@ -611,6 +669,17 @@ mod tests {
                 .expect("readiness window fits"),
             60_000
         );
+    }
+
+    #[test]
+    fn daemon_workspace_metadata_rejects_unknown_or_different_selection() {
+        let expected = "a".repeat(64);
+        assert!(validate_daemon_workspace_metadata("", &expected).is_err());
+        assert!(
+            validate_daemon_workspace_metadata(&format!("v1:{}", "b".repeat(64)), &expected)
+                .is_err()
+        );
+        validate_daemon_workspace_metadata(&format!("v1:{expected}\n"), &expected).unwrap();
     }
 
     /// REGRESSION (#1120): `astrid stop` must remove the socket/PID files ONLY

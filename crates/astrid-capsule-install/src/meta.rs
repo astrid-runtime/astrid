@@ -14,7 +14,7 @@ use std::fmt;
 use std::path::Path;
 
 use anyhow::Context;
-use astrid_core::dirs::AstridHome;
+use astrid_core::dirs::{AstridHome, WorkspaceLayout};
 use serde::{Deserialize, Serialize};
 
 /// Capsule installation metadata, persisted as `meta.json` alongside `Capsule.toml`.
@@ -110,7 +110,7 @@ pub fn write_meta(target_dir: &Path, meta: &CapsuleMeta) -> anyhow::Result<()> {
 pub enum CapsuleLocation {
     /// User-level: `~/.astrid/capsules/`
     User,
-    /// Workspace-level: `.astrid/capsules/` relative to CWD
+    /// Workspace-level: capsules under the selected project state directory.
     Workspace,
 }
 
@@ -136,15 +136,30 @@ pub struct InstalledCapsule {
 /// Scan user-level and workspace capsule directories, returning all installed
 /// capsules sorted alphabetically by name.
 pub fn scan_installed_capsules() -> anyhow::Result<Vec<InstalledCapsule>> {
+    scan_installed_capsules_with_layout(&WorkspaceLayout::default())
+}
+
+/// Scan installed capsules using an explicit workspace layout.
+pub fn scan_installed_capsules_with_layout(
+    workspace_layout: &WorkspaceLayout,
+) -> anyhow::Result<Vec<InstalledCapsule>> {
     let home = AstridHome::resolve().context("failed to resolve Astrid home directory")?;
-    scan_installed_capsules_in_home(&home)
+    scan_installed_capsules_in_home_with_layout(&home, workspace_layout)
 }
 
 /// Scan user-level and workspace capsule directories for an explicit Astrid
 /// home, returning all installed capsules sorted alphabetically by name.
 pub fn scan_installed_capsules_in_home(home: &AstridHome) -> anyhow::Result<Vec<InstalledCapsule>> {
+    scan_installed_capsules_in_home_with_layout(home, &WorkspaceLayout::default())
+}
+
+/// Scan installed capsules for an explicit home and workspace layout.
+pub fn scan_installed_capsules_in_home_with_layout(
+    home: &AstridHome,
+    workspace_layout: &WorkspaceLayout,
+) -> anyhow::Result<Vec<InstalledCapsule>> {
     let principal = crate::paths::install_principal();
-    scan_installed_capsules_in_home_for(home, &principal)
+    scan_installed_capsules_in_home_for_with_layout(home, &principal, workspace_layout)
 }
 
 /// Scan user-level capsule directories for `principal` and workspace capsule
@@ -154,6 +169,31 @@ pub fn scan_installed_capsules_in_home_for(
     home: &AstridHome,
     principal: &astrid_core::PrincipalId,
 ) -> anyhow::Result<Vec<InstalledCapsule>> {
+    scan_installed_capsules_in_home_for_with_layout(home, principal, &WorkspaceLayout::default())
+}
+
+/// Scan principal and workspace capsules using an explicit workspace layout.
+pub fn scan_installed_capsules_in_home_for_with_layout(
+    home: &AstridHome,
+    principal: &astrid_core::PrincipalId,
+    workspace_layout: &WorkspaceLayout,
+) -> anyhow::Result<Vec<InstalledCapsule>> {
+    let workspace_root = std::env::current_dir().ok();
+    scan_installed_capsules_in_home_for_in_workspace(
+        home,
+        principal,
+        workspace_root.as_deref(),
+        workspace_layout,
+    )
+}
+
+/// Scan principal and workspace capsules using explicit workspace inputs.
+pub fn scan_installed_capsules_in_home_for_in_workspace(
+    home: &AstridHome,
+    principal: &astrid_core::PrincipalId,
+    workspace_root: Option<&Path>,
+    workspace_layout: &WorkspaceLayout,
+) -> anyhow::Result<Vec<InstalledCapsule>> {
     let mut capsules = Vec::new();
 
     let principal_dir = home.principal_home(principal).capsules_dir();
@@ -161,8 +201,8 @@ pub fn scan_installed_capsules_in_home_for(
         scan_dir(&principal_dir, CapsuleLocation::User, &mut capsules)?;
     }
 
-    if let Ok(cwd) = std::env::current_dir() {
-        let ws_dir = cwd.join(".astrid").join("capsules");
+    if let Some(workspace_root) = workspace_root {
+        let ws_dir = workspace_layout.capsules_dir(workspace_root);
         if ws_dir.is_dir() {
             scan_dir(&ws_dir, CapsuleLocation::Workspace, &mut capsules)?;
         }
@@ -295,5 +335,31 @@ mod tests {
             results[0].meta.is_none(),
             "corrupt meta.json should be treated as missing"
         );
+    }
+
+    #[test]
+    fn scan_uses_only_injected_workspace_layout() {
+        let home_dir = tempfile::tempdir().unwrap();
+        let home = AstridHome::from_path(home_dir.path());
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(workspace.path().join(".astrid/capsules/default-capsule")).unwrap();
+        std::fs::create_dir_all(
+            workspace
+                .path()
+                .join(".alternate-runtime/capsules/alternate-capsule"),
+        )
+        .unwrap();
+
+        let layout = WorkspaceLayout::new(".alternate-runtime").unwrap();
+        let capsules = scan_installed_capsules_in_home_for_in_workspace(
+            &home,
+            &crate::paths::install_principal(),
+            Some(workspace.path()),
+            &layout,
+        )
+        .unwrap();
+
+        assert_eq!(capsules.len(), 1);
+        assert_eq!(capsules[0].name, "alternate-capsule");
     }
 }

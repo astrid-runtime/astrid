@@ -33,6 +33,7 @@ use std::time::Duration;
 use astrid_core::PrincipalId;
 use astrid_events::ipc::{IpcMessage, IpcPayload, MessageOrigin, Topic};
 use astrid_events::{AstridEvent, EventBus, EventMetadata};
+use axum::Extension;
 use axum::Json;
 use axum::extract::{Path, Query, State};
 use axum::http::Request;
@@ -42,6 +43,7 @@ use utoipa::ToSchema;
 use uuid::Uuid;
 
 use crate::error::{ErrorBody, GatewayError, GatewayResult};
+use crate::routes::WorkspaceContext;
 use crate::routes::capsule_sources::trusted_capsule_source_ids;
 use crate::routes::principals::caller_from;
 use crate::state::GatewayState;
@@ -333,6 +335,24 @@ pub async fn list_sessions(
     Query(query): Query<SessionListQuery>,
     req: Request<axum::body::Body>,
 ) -> GatewayResult<Json<SessionListResponse>> {
+    list_sessions_inner(state, &WorkspaceContext::default(), query, req).await
+}
+
+pub(crate) async fn list_sessions_with_layout(
+    State(state): State<Arc<GatewayState>>,
+    Extension(workspace): Extension<WorkspaceContext>,
+    Query(query): Query<SessionListQuery>,
+    req: Request<axum::body::Body>,
+) -> GatewayResult<Json<SessionListResponse>> {
+    list_sessions_inner(state, &workspace, query, req).await
+}
+
+async fn list_sessions_inner(
+    state: Arc<GatewayState>,
+    workspace: &WorkspaceContext,
+    query: SessionListQuery,
+    req: Request<axum::body::Body>,
+) -> GatewayResult<Json<SessionListResponse>> {
     let caller = caller_from(&req)?;
     metrics::counter!("astrid_gateway_agent_sessions_list_total").increment(1);
 
@@ -352,7 +372,7 @@ pub async fn list_sessions(
         query.include_archived.unwrap_or(false),
     );
     let response_topic = format!("{TOPIC_LIST_RESPONSE_PREFIX}.{correlation_id}");
-    let expected_sources = session_capsule_source_ids(&caller.principal);
+    let expected_sources = session_capsule_source_ids(&caller.principal, workspace);
 
     let value = request_capsule(
         &bus,
@@ -400,6 +420,24 @@ pub async fn get_session_messages(
     Path(id): Path<String>,
     req: Request<axum::body::Body>,
 ) -> GatewayResult<Json<TranscriptResponse>> {
+    get_session_messages_inner(state, &WorkspaceContext::default(), id, req).await
+}
+
+pub(crate) async fn get_session_messages_with_layout(
+    State(state): State<Arc<GatewayState>>,
+    Extension(workspace): Extension<WorkspaceContext>,
+    Path(id): Path<String>,
+    req: Request<axum::body::Body>,
+) -> GatewayResult<Json<TranscriptResponse>> {
+    get_session_messages_inner(state, &workspace, id, req).await
+}
+
+async fn get_session_messages_inner(
+    state: Arc<GatewayState>,
+    workspace: &WorkspaceContext,
+    id: String,
+    req: Request<axum::body::Body>,
+) -> GatewayResult<Json<TranscriptResponse>> {
     let caller = caller_from(&req)?;
     metrics::counter!("astrid_gateway_agent_sessions_transcript_total").increment(1);
 
@@ -408,7 +446,7 @@ pub async fn get_session_messages(
     let correlation_id = Uuid::new_v4().to_string();
     let payload = build_messages_payload(&id, &correlation_id);
     let response_topic = format!("{TOPIC_MESSAGES_RESPONSE_PREFIX}.{correlation_id}");
-    let expected_sources = session_capsule_source_ids(&caller.principal);
+    let expected_sources = session_capsule_source_ids(&caller.principal, workspace);
 
     let value = request_capsule(
         &bus,
@@ -460,6 +498,24 @@ pub async fn get_session(
     Path(id): Path<String>,
     req: Request<axum::body::Body>,
 ) -> GatewayResult<Json<SessionSummary>> {
+    get_session_inner(state, &WorkspaceContext::default(), id, req).await
+}
+
+pub(crate) async fn get_session_with_layout(
+    State(state): State<Arc<GatewayState>>,
+    Extension(workspace): Extension<WorkspaceContext>,
+    Path(id): Path<String>,
+    req: Request<axum::body::Body>,
+) -> GatewayResult<Json<SessionSummary>> {
+    get_session_inner(state, &workspace, id, req).await
+}
+
+async fn get_session_inner(
+    state: Arc<GatewayState>,
+    workspace: &WorkspaceContext,
+    id: String,
+    req: Request<axum::body::Body>,
+) -> GatewayResult<Json<SessionSummary>> {
     let caller = caller_from(&req)?;
     metrics::counter!("astrid_gateway_agent_sessions_get_meta_total").increment(1);
 
@@ -475,7 +531,7 @@ pub async fn get_session(
         "session_id": id,
     });
     let response_topic = format!("{TOPIC_GET_META_RESPONSE_PREFIX}.{correlation_id}");
-    let expected_sources = session_capsule_source_ids(&caller.principal);
+    let expected_sources = session_capsule_source_ids(&caller.principal, workspace);
 
     let value = request_capsule(
         &bus,
@@ -525,6 +581,24 @@ pub async fn update_session(
     Path(id): Path<String>,
     req: Request<axum::body::Body>,
 ) -> GatewayResult<Json<SessionSummary>> {
+    update_session_inner(state, &WorkspaceContext::default(), id, req).await
+}
+
+pub(crate) async fn update_session_with_layout(
+    State(state): State<Arc<GatewayState>>,
+    Extension(workspace): Extension<WorkspaceContext>,
+    Path(id): Path<String>,
+    req: Request<axum::body::Body>,
+) -> GatewayResult<Json<SessionSummary>> {
+    update_session_inner(state, &workspace, id, req).await
+}
+
+async fn update_session_inner(
+    state: Arc<GatewayState>,
+    workspace: &WorkspaceContext,
+    id: String,
+    req: Request<axum::body::Body>,
+) -> GatewayResult<Json<SessionSummary>> {
     // Clone the principal/device floor before `read_json_body` consumes
     // `req` (which `caller_from` borrows), exactly as `models.rs` does.
     let caller = caller_from(&req)?;
@@ -543,7 +617,7 @@ pub async fn update_session(
     let correlation_id = Uuid::new_v4().to_string();
     let payload = build_update_payload(&correlation_id, &id, &body)?;
     let response_topic = format!("{TOPIC_UPDATE_RESPONSE_PREFIX}.{correlation_id}");
-    let expected_sources = session_capsule_source_ids(&principal);
+    let expected_sources = session_capsule_source_ids(&principal, workspace);
 
     let value = request_capsule(
         &bus,
@@ -589,6 +663,24 @@ pub async fn delete_session(
     Path(id): Path<String>,
     req: Request<axum::body::Body>,
 ) -> GatewayResult<Json<DeleteResponse>> {
+    delete_session_inner(state, &WorkspaceContext::default(), id, req).await
+}
+
+pub(crate) async fn delete_session_with_layout(
+    State(state): State<Arc<GatewayState>>,
+    Extension(workspace): Extension<WorkspaceContext>,
+    Path(id): Path<String>,
+    req: Request<axum::body::Body>,
+) -> GatewayResult<Json<DeleteResponse>> {
+    delete_session_inner(state, &workspace, id, req).await
+}
+
+async fn delete_session_inner(
+    state: Arc<GatewayState>,
+    workspace: &WorkspaceContext,
+    id: String,
+    req: Request<axum::body::Body>,
+) -> GatewayResult<Json<DeleteResponse>> {
     let caller = caller_from(&req)?;
     metrics::counter!("astrid_gateway_agent_sessions_delete_total").increment(1);
 
@@ -601,7 +693,7 @@ pub async fn delete_session(
         "session_id": id,
     });
     let response_topic = format!("{TOPIC_DELETE_RESPONSE_PREFIX}.{correlation_id}");
-    let expected_sources = session_capsule_source_ids(&caller.principal);
+    let expected_sources = session_capsule_source_ids(&caller.principal, workspace);
 
     let value = request_capsule(
         &bus,
@@ -648,6 +740,24 @@ pub async fn search_sessions(
     Query(query): Query<SearchQuery>,
     req: Request<axum::body::Body>,
 ) -> GatewayResult<Json<SearchResponse>> {
+    search_sessions_inner(state, &WorkspaceContext::default(), query, req).await
+}
+
+pub(crate) async fn search_sessions_with_layout(
+    State(state): State<Arc<GatewayState>>,
+    Extension(workspace): Extension<WorkspaceContext>,
+    Query(query): Query<SearchQuery>,
+    req: Request<axum::body::Body>,
+) -> GatewayResult<Json<SearchResponse>> {
+    search_sessions_inner(state, &workspace, query, req).await
+}
+
+async fn search_sessions_inner(
+    state: Arc<GatewayState>,
+    workspace: &WorkspaceContext,
+    query: SearchQuery,
+    req: Request<axum::body::Body>,
+) -> GatewayResult<Json<SearchResponse>> {
     let caller = caller_from(&req)?;
     metrics::counter!("astrid_gateway_agent_sessions_search_total").increment(1);
 
@@ -664,7 +774,7 @@ pub async fn search_sessions(
         query.include_archived.unwrap_or(false),
     );
     let response_topic = format!("{TOPIC_SEARCH_RESPONSE_PREFIX}.{correlation_id}");
-    let expected_sources = session_capsule_source_ids(&caller.principal);
+    let expected_sources = session_capsule_source_ids(&caller.principal, workspace);
 
     let value = request_capsule(
         &bus,
@@ -737,8 +847,13 @@ async fn ensure_session_mgmt_supported(
     }
 }
 
-fn session_capsule_source_ids(principal: &PrincipalId) -> Vec<Uuid> {
-    trusted_capsule_source_ids(SESSION_CAPSULE_ID, principal)
+fn session_capsule_source_ids(principal: &PrincipalId, workspace: &WorkspaceContext) -> Vec<Uuid> {
+    trusted_capsule_source_ids(
+        SESSION_CAPSULE_ID,
+        principal,
+        &workspace.root,
+        &workspace.layout,
+    )
 }
 
 fn scoped_topic_probe_key(principal: &PrincipalId, capsule_id: &str, topic: &str) -> String {

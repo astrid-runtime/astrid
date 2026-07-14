@@ -82,7 +82,12 @@ pub async fn run(
     state: Arc<GatewayState>,
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> Result<()> {
-    run_inner(state, shutdown, routes::events::CapabilityProbe::deny_all()).await
+    run_with_workspace_layout(
+        state,
+        shutdown,
+        astrid_core::dirs::WorkspaceLayout::default(),
+    )
+    .await
 }
 
 /// Run the gateway with a borrowed in-process capability evaluator.
@@ -97,9 +102,63 @@ pub async fn run_with_capability_probe<F>(
 where
     F: Fn(&astrid_core::PrincipalId, Option<&str>, &str) -> bool + Send + Sync + 'static,
 {
+    let workspace_root = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
     run_inner(
         state,
         shutdown,
+        workspace_root,
+        astrid_core::dirs::WorkspaceLayout::default(),
+        routes::events::CapabilityProbe::new(capability_probe),
+    )
+    .await
+}
+
+/// Run the gateway with an explicit per-project runtime layout.
+pub async fn run_with_workspace_layout(
+    state: Arc<GatewayState>,
+    shutdown: impl Future<Output = ()> + Send + 'static,
+    workspace_layout: astrid_core::dirs::WorkspaceLayout,
+) -> Result<()> {
+    let workspace_root = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    run_with_workspace(state, shutdown, workspace_root, workspace_layout).await
+}
+
+/// Run the gateway with explicit workspace inputs.
+pub async fn run_with_workspace(
+    state: Arc<GatewayState>,
+    shutdown: impl Future<Output = ()> + Send + 'static,
+    workspace_root: std::path::PathBuf,
+    workspace_layout: astrid_core::dirs::WorkspaceLayout,
+) -> Result<()> {
+    run_inner(
+        state,
+        shutdown,
+        workspace_root,
+        workspace_layout,
+        routes::events::CapabilityProbe::deny_all(),
+    )
+    .await
+}
+
+/// Run the gateway with explicit workspace inputs and an in-process capability evaluator.
+///
+/// # Errors
+/// Returns the same startup and server errors as [`run`].
+pub async fn run_with_workspace_and_capability_probe<F>(
+    state: Arc<GatewayState>,
+    shutdown: impl Future<Output = ()> + Send + 'static,
+    workspace_root: std::path::PathBuf,
+    workspace_layout: astrid_core::dirs::WorkspaceLayout,
+    capability_probe: F,
+) -> Result<()>
+where
+    F: Fn(&astrid_core::PrincipalId, Option<&str>, &str) -> bool + Send + Sync + 'static,
+{
+    run_inner(
+        state,
+        shutdown,
+        workspace_root,
+        workspace_layout,
         routes::events::CapabilityProbe::new(capability_probe),
     )
     .await
@@ -127,10 +186,13 @@ where
         .local_addr()
         .context("failed to read pre-bound gateway listener address")?;
     warn_if_plaintext_non_loopback(addr);
+    let workspace_root = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
     serve_http_listener(
         state,
         listener,
         shutdown,
+        workspace_root,
+        astrid_core::dirs::WorkspaceLayout::default(),
         routes::events::CapabilityProbe::new(capability_probe),
     )
     .await
@@ -139,6 +201,8 @@ where
 async fn run_inner(
     state: Arc<GatewayState>,
     shutdown: impl Future<Output = ()> + Send + 'static,
+    workspace_root: std::path::PathBuf,
+    workspace_layout: astrid_core::dirs::WorkspaceLayout,
     capability_probe: routes::events::CapabilityProbe,
 ) -> Result<()> {
     let addr: SocketAddr = state.config.listen.parse().with_context(|| {
@@ -154,7 +218,12 @@ async fn run_inner(
         // doesn't apply here — axum-server opens its own listener.
         info!(addr = %addr, scheme = "https", "astrid-gateway listening (TLS)");
         let rustls = tls::load_rustls_config(tls_cfg).await?;
-        let router = tls::apply_hsts(routes::build_with_probe(state, capability_probe));
+        let router = tls::apply_hsts(routes::build_with_workspace_and_probe(
+            state,
+            workspace_root,
+            workspace_layout,
+            capability_probe,
+        ));
         return tls::serve_https(addr, router, rustls, shutdown).await;
     }
 
@@ -163,7 +232,15 @@ async fn run_inner(
     let listener = TcpListener::bind(addr)
         .await
         .with_context(|| format!("failed to bind gateway listener on {addr}"))?;
-    serve_http_listener(state, listener, shutdown, capability_probe).await
+    serve_http_listener(
+        state,
+        listener,
+        shutdown,
+        workspace_root,
+        workspace_layout,
+        capability_probe,
+    )
+    .await
 }
 
 fn warn_if_plaintext_non_loopback(addr: SocketAddr) {
@@ -179,6 +256,8 @@ async fn serve_http_listener(
     state: Arc<GatewayState>,
     listener: TcpListener,
     shutdown: impl Future<Output = ()> + Send + 'static,
+    workspace_root: std::path::PathBuf,
+    workspace_layout: astrid_core::dirs::WorkspaceLayout,
     capability_probe: routes::events::CapabilityProbe,
 ) -> Result<()> {
     let bound = listener
@@ -200,7 +279,12 @@ async fn serve_http_listener(
         );
     }
 
-    let router = routes::build_with_probe(state, capability_probe);
+    let router = routes::build_with_workspace_and_probe(
+        state,
+        workspace_root,
+        workspace_layout,
+        capability_probe,
+    );
     // `into_make_service_with_connect_info::<SocketAddr>()` is what
     // populates the `ConnectInfo<SocketAddr>` request extension that
     // `routes::auth::post_redeem` extracts for per-IP rate limiting.

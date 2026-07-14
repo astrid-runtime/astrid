@@ -506,9 +506,15 @@ async fn inventory_manifest_map(
         &kernel.astrid_home,
         &kernel.workspace_root,
         &visibility.principal,
+        &kernel.workspace_layout,
     );
+    let workspace_layout = kernel.workspace_layout.clone();
     let discovered = match tokio::task::spawn_blocking(move || {
-        astrid_capsule::discovery::discover_manifests(Some(&paths))
+        astrid_capsule::discovery::discover_manifests_in_workspace(
+            Some(&paths),
+            None,
+            &workspace_layout,
+        )
     })
     .await
     {

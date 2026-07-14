@@ -11,6 +11,15 @@ pub(crate) use astrid_uplink::socket_client::{
 
 use anyhow::Result;
 
+pub(crate) async fn connect_for_workspace(
+    session: astrid_core::SessionId,
+    principal: astrid_core::PrincipalId,
+) -> Result<SocketClient> {
+    let client = SocketClient::connect(session, principal).await?;
+    crate::commands::daemon::ensure_daemon_workspace_matches(None).await?;
+    Ok(client)
+}
+
 /// Send a user prompt over an established uplink.
 ///
 /// The connection is already bound to the process principal (resolved

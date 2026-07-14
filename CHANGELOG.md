@@ -86,6 +86,13 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
   duplicate, or SHA-only manifests. Existing v0.9.x installations can still
   cross the boundary through the compatibility manifest. External protocol
   requirements remain unchanged. Closes #1249.
+- **Project runtime state now uses one validated workspace layout.** The CLI
+  and daemon default to `.astrid`, while distributions can select another safe
+  relative directory name through `--workspace-state-dir` or
+  `ASTRID_WORKSPACE_STATE_DIR`. Config, capsule installation and discovery,
+  kernel boot, gateway source checks, hooks, and WIT garbage collection share
+  the selected layout and never scan both project roots. CLI uplinks reject a
+  daemon booted for a different project or layout.
 
 - **Runtime E2E now stages the pinned Unicity AOS monorepo.** The workflow
   preserves the AOS Cargo workspace outside the core checkout and supplies

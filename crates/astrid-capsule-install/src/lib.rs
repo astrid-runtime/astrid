@@ -73,7 +73,10 @@ pub mod wasm;
 pub mod wit;
 
 pub use archive::{
-    unpack_and_install, unpack_and_install_checked_for_principal, unpack_and_install_for_principal,
+    unpack_and_install, unpack_and_install_checked_for_principal,
+    unpack_and_install_checked_for_principal_with_layout, unpack_and_install_for_principal,
+    unpack_and_install_for_principal_in_workspace, unpack_and_install_for_principal_with_layout,
+    unpack_and_install_with_layout,
 };
 pub use contracts::{
     CONTRACTS_WIT_BASENAME, ContractsSkew, canonical_contracts_b3, canonical_contracts_path,
@@ -83,16 +86,26 @@ pub use contracts::{
 pub use copy::copy_capsule_dir;
 pub use local::{
     InstallOptions, InstallOutput, InstallPhase, install_from_local_path,
-    install_from_local_path_checked_for_principal, install_from_local_path_for_principal,
+    install_from_local_path_checked_for_principal,
+    install_from_local_path_checked_for_principal_with_layout,
+    install_from_local_path_for_principal, install_from_local_path_for_principal_in_workspace,
+    install_from_local_path_for_principal_with_layout, install_from_local_path_with_layout,
 };
-pub use manifest_check::{ExportConflict, MissingImport, check_export_conflicts, validate_imports};
+pub use manifest_check::{
+    ExportConflict, MissingImport, check_export_conflicts, check_export_conflicts_in_workspace,
+    check_export_conflicts_with_layout, validate_imports, validate_imports_in_workspace,
+    validate_imports_with_layout,
+};
 pub use meta::{
     CapsuleLocation, CapsuleMeta, InstalledCapsule, read_meta, scan_installed_capsules,
-    scan_installed_capsules_in_home_for, write_meta,
+    scan_installed_capsules_in_home_for, scan_installed_capsules_in_home_for_in_workspace,
+    scan_installed_capsules_in_home_for_with_layout, scan_installed_capsules_in_home_with_layout,
+    scan_installed_capsules_with_layout, write_meta,
 };
 pub use paths::{
     resolve_env_path, resolve_env_path_for, resolve_target_dir, resolve_target_dir_for,
-    restore_env_from_backup, restore_env_from_backup_for,
+    resolve_target_dir_for_in_workspace, resolve_target_dir_for_with_layout,
+    resolve_target_dir_with_layout, restore_env_from_backup, restore_env_from_backup_for,
 };
 pub use principal_introspection::materialize_principal_introspection;
 pub use wit::{content_address_wit, materialize_wit_mirror};

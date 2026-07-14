@@ -55,6 +55,7 @@ use astrid_capsule::profile_cache::PrincipalProfileCache;
 use astrid_capsule::registry::CapsuleRegistry;
 use astrid_capsule_types::CapsuleId;
 use astrid_core::SessionId;
+use astrid_core::dirs::WorkspaceLayout;
 use astrid_core::groups::GroupConfig;
 use astrid_core::principal::PrincipalId;
 use astrid_crypto::KeyPair;
@@ -114,6 +115,8 @@ pub struct Kernel {
     pub vfs_root_handle: DirHandle,
     /// The physical path the VFS is mounted to.
     pub workspace_root: PathBuf,
+    /// Per-project runtime state layout selected at boot.
+    workspace_layout: WorkspaceLayout,
     /// The principal home resources directory (`~/.astrid/home/{principal}/`).
     /// Capsules declaring `fs_read = ["home://"]` can read files under this
     /// root. Scoped to the principal's home so that keys, databases, and
@@ -335,6 +338,12 @@ impl KernelResources {
 }
 
 impl Kernel {
+    /// Per-project runtime layout selected at boot.
+    #[must_use]
+    pub fn workspace_layout(&self) -> &WorkspaceLayout {
+        &self.workspace_layout
+    }
+
     /// Boot a new Kernel instance mounted at the specified directory.
     ///
     /// The native composition root: resolves the Astrid home, opens the
@@ -374,6 +383,27 @@ impl Kernel {
         runtime_limits: astrid_capsule_types::CapsuleRuntimeLimits,
         local_egress: std::collections::HashMap<String, Vec<String>>,
         http_limits: astrid_capsule_types::HttpLimits,
+    ) -> Result<Arc<Self>, std::io::Error> {
+        Self::new_with_workspace_layout(
+            session_id,
+            workspace_root,
+            runtime_limits,
+            local_egress,
+            http_limits,
+            WorkspaceLayout::default(),
+        )
+        .await
+    }
+
+    /// Boot a kernel with an explicit per-project runtime layout.
+    #[cfg(unix)]
+    pub async fn new_with_workspace_layout(
+        session_id: SessionId,
+        workspace_root: PathBuf,
+        runtime_limits: astrid_capsule_types::CapsuleRuntimeLimits,
+        local_egress: std::collections::HashMap<String, Vec<String>>,
+        http_limits: astrid_capsule_types::HttpLimits,
+        workspace_layout: WorkspaceLayout,
     ) -> Result<Arc<Self>, std::io::Error> {
         use astrid_core::dirs::AstridHome;
 
@@ -440,13 +470,14 @@ impl Kernel {
             Some(singleton_lock),
         );
 
-        Self::with_resources(
+        Self::with_resources_and_workspace_layout(
             session_id,
             workspace_root,
             runtime_limits,
             local_egress,
             http_limits,
             resources,
+            workspace_layout,
         )
         .await
     }
@@ -485,10 +516,6 @@ impl Kernel {
     /// cannot be registered, the capability store cannot be initialized over
     /// the injected KV, the group configuration cannot be loaded, or the CLI
     /// root identity cannot be bootstrapped.
-    #[expect(
-        clippy::too_many_lines,
-        reason = "boot sequence: sequential setup that does not benefit from splitting"
-    )]
     pub async fn with_resources(
         session_id: SessionId,
         workspace_root: PathBuf,
@@ -496,6 +523,32 @@ impl Kernel {
         local_egress: std::collections::HashMap<String, Vec<String>>,
         http_limits: astrid_capsule_types::HttpLimits,
         resources: KernelResources,
+    ) -> Result<Arc<Self>, std::io::Error> {
+        Self::with_resources_and_workspace_layout(
+            session_id,
+            workspace_root,
+            runtime_limits,
+            local_egress,
+            http_limits,
+            resources,
+            WorkspaceLayout::default(),
+        )
+        .await
+    }
+
+    /// Construct a kernel from injected resources and workspace layout.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "boot sequence: sequential setup that does not benefit from splitting"
+    )]
+    pub async fn with_resources_and_workspace_layout(
+        session_id: SessionId,
+        workspace_root: PathBuf,
+        runtime_limits: astrid_capsule_types::CapsuleRuntimeLimits,
+        local_egress: std::collections::HashMap<String, Vec<String>>,
+        http_limits: astrid_capsule_types::HttpLimits,
+        resources: KernelResources,
+        workspace_layout: WorkspaceLayout,
     ) -> Result<Arc<Self>, std::io::Error> {
         // The native capsule engine uses `block_in_place`, which requires a
         // multi-thread runtime. The browser profile has no such runtime (and no
@@ -621,7 +674,7 @@ impl Kernel {
                 })?;
 
             // Apply pre-configured identity links from config.
-            apply_identity_config(&identity_store, &workspace_root).await;
+            apply_identity_config(&identity_store, &workspace_root, &workspace_layout).await;
         }
 
         let kernel = Arc::new(Self {
@@ -637,6 +690,7 @@ impl Kernel {
             overlay_registry,
             vfs_root_handle: root_handle,
             workspace_root,
+            workspace_layout,
             home_root,
             cli_socket_listener,
             singleton_lock,
@@ -1269,8 +1323,17 @@ impl Kernel {
     ) -> Vec<(astrid_capsule_types::manifest::CapsuleManifest, PathBuf)> {
         use astrid_capsule::toposort::toposort_manifests;
 
-        let paths = capsule_discovery_paths_for(&self.astrid_home, &self.workspace_root, principal);
-        let discovered = astrid_capsule::discovery::discover_manifests(Some(&paths));
+        let paths = capsule_discovery_paths_for(
+            &self.astrid_home,
+            &self.workspace_root,
+            principal,
+            &self.workspace_layout,
+        );
+        let discovered = astrid_capsule::discovery::discover_manifests_in_workspace(
+            Some(&paths),
+            None,
+            &self.workspace_layout,
+        );
         match toposort_manifests(discovered) {
             Ok(sorted) => sorted,
             Err((e, original)) => {
@@ -2173,6 +2236,7 @@ pub(crate) async fn test_kernel_with_home(home: astrid_core::dirs::AstridHome) -
         overlay_registry,
         vfs_root_handle: root_handle,
         workspace_root: home.root().to_path_buf(),
+        workspace_layout: WorkspaceLayout::default(),
         home_root: Some(principal_home.root().to_path_buf()),
         cli_socket_listener: None,
         singleton_lock: None,
@@ -2859,15 +2923,24 @@ fn capsule_discovery_paths(
     home: &astrid_core::dirs::AstridHome,
     workspace_root: &Path,
 ) -> Vec<PathBuf> {
-    capsule_discovery_paths_for(home, workspace_root, &PrincipalId::default())
+    capsule_discovery_paths_for(
+        home,
+        workspace_root,
+        &PrincipalId::default(),
+        &WorkspaceLayout::default(),
+    )
 }
 
 fn capsule_discovery_paths_for(
     home: &astrid_core::dirs::AstridHome,
     workspace_root: &Path,
     principal: &PrincipalId,
+    workspace_layout: &WorkspaceLayout,
 ) -> Vec<PathBuf> {
-    let workspace = astrid_core::dirs::WorkspaceDir::from_path(workspace_root);
+    let workspace = astrid_core::dirs::WorkspaceDir::from_path_with_layout(
+        workspace_root,
+        workspace_layout.clone(),
+    );
     vec![
         home.principal_home(principal).capsules_dir(),
         workspace.capsules_dir(),
@@ -3327,14 +3400,16 @@ fn mint_default_principal_keypair(
 async fn apply_identity_config(
     store: &Arc<dyn astrid_storage::IdentityStore>,
     workspace_root: &std::path::Path,
+    workspace_layout: &WorkspaceLayout,
 ) {
-    let config = match astrid_config::Config::load(Some(workspace_root)) {
-        Ok(resolved) => resolved.config,
-        Err(e) => {
-            tracing::debug!(error = %e, "No config loaded for identity links");
-            return;
-        },
-    };
+    let config =
+        match astrid_config::Config::load_with_layout(Some(workspace_root), workspace_layout) {
+            Ok(resolved) => resolved.config,
+            Err(e) => {
+                tracing::debug!(error = %e, "No config loaded for identity links");
+                return;
+            },
+        };
 
     for link_cfg in &config.identity.links {
         let result = apply_single_identity_link(store, link_cfg).await;
@@ -3490,6 +3565,20 @@ mod tests {
                 workspace.path().join(".astrid").join("capsules"),
             ],
             "daemon discovery must scan the default install dir and the configured workspace"
+        );
+    }
+
+    #[test]
+    fn capsule_discovery_paths_use_injected_workspace_layout() {
+        let (_d, home) = scratch_home();
+        let workspace = tempfile::tempdir().unwrap();
+        let layout = WorkspaceLayout::new(".alternate-runtime").unwrap();
+        let paths =
+            capsule_discovery_paths_for(&home, workspace.path(), &PrincipalId::default(), &layout);
+
+        assert_eq!(
+            paths[1],
+            workspace.path().join(".alternate-runtime").join("capsules")
         );
     }
 

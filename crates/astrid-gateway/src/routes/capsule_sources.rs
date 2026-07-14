@@ -2,7 +2,7 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use astrid_core::PrincipalId;
-use astrid_core::dirs::AstridHome;
+use astrid_core::dirs::{AstridHome, WorkspaceLayout};
 use serde::Deserialize;
 use uuid::Uuid;
 
@@ -27,7 +27,12 @@ pub(super) fn capsule_source_id_v1(capsule_id: &str, content_hash: &str) -> Uuid
     Uuid::new_v5(&CAPSULE_ID_NAMESPACE, seed.as_bytes())
 }
 
-pub(super) fn trusted_capsule_source_ids(capsule_id: &str, caller: &PrincipalId) -> Vec<Uuid> {
+pub(super) fn trusted_capsule_source_ids(
+    capsule_id: &str,
+    caller: &PrincipalId,
+    workspace_root: &Path,
+    workspace_layout: &WorkspaceLayout,
+) -> Vec<Uuid> {
     let Ok(home) = AstridHome::resolve() else {
         return Vec::new();
     };
@@ -38,9 +43,11 @@ pub(super) fn trusted_capsule_source_ids(capsule_id: &str, caller: &PrincipalId)
     // principals (issue #1069).
     let mut dirs = Vec::new();
     dirs.push(home.principal_home(caller).capsules_dir().join(capsule_id));
-    if let Ok(cwd) = std::env::current_dir() {
-        dirs.push(cwd.join(".astrid").join("capsules").join(capsule_id));
-    }
+    dirs.push(
+        workspace_layout
+            .capsules_dir(workspace_root)
+            .join(capsule_id),
+    );
 
     trusted_capsule_source_ids_from_dirs(capsule_id, dirs)
 }

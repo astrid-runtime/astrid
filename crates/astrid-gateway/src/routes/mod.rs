@@ -15,6 +15,21 @@ use astrid_uplink::KernelClientError;
 use crate::error::GatewayError;
 use crate::state::GatewayState;
 
+#[derive(Clone)]
+pub(crate) struct WorkspaceContext {
+    pub(crate) root: std::path::PathBuf,
+    pub(crate) layout: astrid_core::dirs::WorkspaceLayout,
+}
+
+impl Default for WorkspaceContext {
+    fn default() -> Self {
+        Self {
+            root: std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
+            layout: astrid_core::dirs::WorkspaceLayout::default(),
+        }
+    }
+}
+
 /// Map a bus-direct / socket kernel-request failure ([`KernelClientError`]) to a
 /// [`GatewayError`]. Single-sourced so every `kernel_client_for(...).request()`
 /// call site maps consistently.
@@ -66,7 +81,36 @@ pub mod system;
 // rows here. Splitting it into sub-routers would obscure the single
 // public/authed grouping for no readability gain.
 pub fn build(state: Arc<GatewayState>) -> Router {
-    build_with_probe(state, events::CapabilityProbe::deny_all())
+    build_with_workspace_layout(state, astrid_core::dirs::WorkspaceLayout::default())
+}
+
+/// Build the gateway router with an explicit workspace layout and self-only
+/// audit visibility.
+///
+/// This has the same real-socket connect-info requirement as [`build`].
+pub fn build_with_workspace_layout(
+    state: Arc<GatewayState>,
+    workspace_layout: astrid_core::dirs::WorkspaceLayout,
+) -> Router {
+    let workspace_root = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    build_with_workspace(state, workspace_root, workspace_layout)
+}
+
+/// Build the gateway router with explicit workspace inputs and self-only
+/// audit visibility.
+///
+/// This has the same real-socket connect-info requirement as [`build`].
+pub fn build_with_workspace(
+    state: Arc<GatewayState>,
+    workspace_root: std::path::PathBuf,
+    workspace_layout: astrid_core::dirs::WorkspaceLayout,
+) -> Router {
+    build_with_workspace_and_probe(
+        state,
+        workspace_root,
+        workspace_layout,
+        events::CapabilityProbe::deny_all(),
+    )
 }
 
 /// Build the gateway's HTTP router with an in-process capability evaluator.
@@ -83,12 +127,42 @@ pub fn build_with_capability_probe<F>(state: Arc<GatewayState>, capability_probe
 where
     F: Fn(&astrid_core::PrincipalId, Option<&str>, &str) -> bool + Send + Sync + 'static,
 {
-    build_with_probe(state, events::CapabilityProbe::new(capability_probe))
+    let workspace_root = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    build_with_workspace_and_probe(
+        state,
+        workspace_root,
+        astrid_core::dirs::WorkspaceLayout::default(),
+        events::CapabilityProbe::new(capability_probe),
+    )
+}
+
+/// Build the gateway router with explicit workspace inputs and an in-process
+/// capability evaluator.
+///
+/// This is the fully composed direct-embedding path. It has the same
+/// real-socket connect-info requirement as [`build`].
+pub fn build_with_workspace_and_capability_probe<F>(
+    state: Arc<GatewayState>,
+    workspace_root: std::path::PathBuf,
+    workspace_layout: astrid_core::dirs::WorkspaceLayout,
+    capability_probe: F,
+) -> Router
+where
+    F: Fn(&astrid_core::PrincipalId, Option<&str>, &str) -> bool + Send + Sync + 'static,
+{
+    build_with_workspace_and_probe(
+        state,
+        workspace_root,
+        workspace_layout,
+        events::CapabilityProbe::new(capability_probe),
+    )
 }
 
 #[allow(clippy::too_many_lines)]
-pub(crate) fn build_with_probe(
+pub(crate) fn build_with_workspace_and_probe(
     state: Arc<GatewayState>,
+    workspace_root: std::path::PathBuf,
+    workspace_layout: astrid_core::dirs::WorkspaceLayout,
     capability_probe: events::CapabilityProbe,
 ) -> Router {
     // Unauthenticated routes — discovery + redeem + ops probes.
@@ -154,7 +228,12 @@ pub(crate) fn build_with_probe(
     // A future misconfigured handler that accidentally renders HTML
     // would be neutered rather than ship a clickjacking / XSS
     // surface.
-    apply_security_headers(with_cors).with_state(state)
+    apply_security_headers(with_cors)
+        .with_state(state)
+        .layer(Extension(WorkspaceContext {
+            root: workspace_root,
+            layout: workspace_layout,
+        }))
 }
 
 /// Build the bearer-gated router half. Split out of [`build`] so each stays
@@ -240,20 +319,26 @@ fn build_authed_router(state: &Arc<GatewayState>) -> Router<Arc<GatewayState>> {
         // ── Per-principal live conversation feed (SSE, #973) ──
         .route("/api/agent/stream", get(stream::get_stream))
         // ── Conversation threads (proxied to capsule-session) ──
-        .route("/api/agent/sessions", get(sessions::list_sessions))
+        .route(
+            "/api/agent/sessions",
+            get(sessions::list_sessions_with_layout),
+        )
         // `search` is a static segment and is registered before the `:id`
         // routes; axum prefers the static match, so `/sessions/search` never
         // collides with `/sessions/:id`.
-        .route("/api/agent/sessions/search", get(sessions::search_sessions))
+        .route(
+            "/api/agent/sessions/search",
+            get(sessions::search_sessions_with_layout),
+        )
         .route(
             "/api/agent/sessions/{id}",
-            get(sessions::get_session)
-                .patch(sessions::update_session)
-                .delete(sessions::delete_session),
+            get(sessions::get_session_with_layout)
+                .patch(sessions::update_session_with_layout)
+                .delete(sessions::delete_session_with_layout),
         )
         .route(
             "/api/agent/sessions/{id}/messages",
-            get(sessions::get_session_messages),
+            get(sessions::get_session_messages_with_layout),
         )
         // ── Agent elicitation reply ──
         .route(
@@ -265,9 +350,15 @@ fn build_authed_router(state: &Arc<GatewayState>) -> Router<Arc<GatewayState>> {
             post(agent::post_approval_response),
         )
         // ── Models (active-LLM selection) ──
-        .route("/api/models", get(models::list_models))
-        .route("/api/models/active", get(models::get_active_model))
-        .route("/api/models/active", put(models::set_active_model))
+        .route("/api/models", get(models::list_models_with_layout))
+        .route(
+            "/api/models/active",
+            get(models::get_active_model_with_layout),
+        )
+        .route(
+            "/api/models/active",
+            put(models::set_active_model_with_layout),
+        )
         // ── System ──
         .route("/api/sys/status", get(system::get_status))
         .route("/api/sys/readiness", get(system::get_readiness))

@@ -12,7 +12,6 @@ use tracing::{debug, warn};
 use uuid::Uuid;
 
 use crate::commands::daemon;
-use crate::socket_client::SocketClient;
 
 const INITIAL_RETRY_BACKOFF: Duration = Duration::from_secs(2);
 const MAX_RETRY_BACKOFF: Duration = Duration::from_secs(30);
@@ -38,7 +37,7 @@ async fn hold_guard_uplink(
     daemon::ensure_daemon_quiet("mcp-session-guard").await?;
 
     let session = astrid_core::SessionId::from_uuid(Uuid::new_v4());
-    let c = SocketClient::connect(session, principal.clone())
+    let c = crate::socket_client::connect_for_workspace(session, principal.clone())
         .await
         .context("failed to connect guard uplink to daemon")?;
 

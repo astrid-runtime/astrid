@@ -93,16 +93,34 @@ pub(super) async fn handle_install_capsule(
         let p = path.clone();
         let h = home.clone();
         let principal = caller.clone();
+        let workspace_layout = kernel.workspace_layout.clone();
+        let workspace_root = kernel.workspace_root.clone();
         tokio::task::spawn_blocking(move || {
-            astrid_capsule_install::unpack_and_install_for_principal(&p, &h, opts, &principal)
+            astrid_capsule_install::unpack_and_install_for_principal_in_workspace(
+                &p,
+                &h,
+                opts,
+                &principal,
+                Some(&workspace_root),
+                &workspace_layout,
+            )
         })
         .await
     } else if path.is_dir() {
         let p = path.clone();
         let h = home.clone();
         let principal = caller.clone();
+        let workspace_layout = kernel.workspace_layout.clone();
+        let workspace_root = kernel.workspace_root.clone();
         tokio::task::spawn_blocking(move || {
-            astrid_capsule_install::install_from_local_path_for_principal(&p, &h, opts, &principal)
+            astrid_capsule_install::install_from_local_path_for_principal_in_workspace(
+                &p,
+                &h,
+                opts,
+                &principal,
+                Some(&workspace_root),
+                &workspace_layout,
+            )
         })
         .await
     } else {

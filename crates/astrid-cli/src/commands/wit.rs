@@ -50,7 +50,7 @@ pub(crate) fn gc(force: bool) -> anyhow::Result<()> {
     }
 
     // Build the mark set: every WIT hash referenced by any installed capsule.
-    let marks = collect_marks(&home)?;
+    let marks = collect_marks(&home, crate::workspace_layout::current())?;
 
     // Scan the store and identify orphans.
     let mut orphans = Vec::new();
@@ -142,7 +142,19 @@ pub(crate) fn gc(force: bool) -> anyhow::Result<()> {
 
 /// Collect the set of hashes referenced by every installed capsule's
 /// `meta.json` across all principals and the workspace.
-fn collect_marks(home: &AstridHome) -> anyhow::Result<HashSet<String>> {
+fn collect_marks(
+    home: &AstridHome,
+    workspace_layout: &astrid_core::dirs::WorkspaceLayout,
+) -> anyhow::Result<HashSet<String>> {
+    let workspace_root = std::env::current_dir().ok();
+    collect_marks_in_workspace(home, workspace_root.as_deref(), workspace_layout)
+}
+
+fn collect_marks_in_workspace(
+    home: &AstridHome,
+    workspace_root: Option<&Path>,
+    workspace_layout: &astrid_core::dirs::WorkspaceLayout,
+) -> anyhow::Result<HashSet<String>> {
     let mut marks = HashSet::new();
 
     // Walk every principal home under ~/.astrid/home/
@@ -167,8 +179,8 @@ fn collect_marks(home: &AstridHome) -> anyhow::Result<HashSet<String>> {
     }
 
     // Workspace-level capsules (if running from a workspace)
-    if let Ok(cwd) = std::env::current_dir() {
-        let ws_caps = cwd.join(".astrid").join("capsules");
+    if let Some(workspace_root) = workspace_root {
+        let ws_caps = workspace_layout.capsules_dir(workspace_root);
         if ws_caps.is_dir() {
             collect_from_capsules_dir(&ws_caps, &mut marks);
         }
@@ -198,5 +210,40 @@ fn collect_from_capsules_dir(dir: &Path, marks: &mut HashSet<String>) {
 fn add_meta_marks(meta: &CapsuleMeta, marks: &mut HashSet<String>) {
     for hash in meta.wit_files.values() {
         marks.insert(hash.clone());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wit_gc_marks_only_the_injected_workspace_root() {
+        let home_dir = tempfile::tempdir().unwrap();
+        let home = AstridHome::from_path(home_dir.path());
+        let workspace = tempfile::tempdir().unwrap();
+        let default_capsule = workspace.path().join(".astrid/capsules/default");
+        let alternate_capsule = workspace
+            .path()
+            .join(".alternate-runtime/capsules/alternate");
+        std::fs::create_dir_all(&default_capsule).unwrap();
+        std::fs::create_dir_all(&alternate_capsule).unwrap();
+
+        let mut default_meta = CapsuleMeta::default();
+        default_meta
+            .wit_files
+            .insert("default.wit".into(), "default-hash".into());
+        super::super::capsule::meta::write_meta(&default_capsule, &default_meta).unwrap();
+        let mut alternate_meta = CapsuleMeta::default();
+        alternate_meta
+            .wit_files
+            .insert("alternate.wit".into(), "alternate-hash".into());
+        super::super::capsule::meta::write_meta(&alternate_capsule, &alternate_meta).unwrap();
+
+        let layout = astrid_core::dirs::WorkspaceLayout::new(".alternate-runtime").unwrap();
+        let marks = collect_marks_in_workspace(&home, Some(workspace.path()), &layout).unwrap();
+
+        assert!(marks.contains("alternate-hash"));
+        assert!(!marks.contains("default-hash"));
     }
 }

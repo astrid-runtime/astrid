@@ -263,7 +263,10 @@ fn run_init_from_shuttle(source: &str, opts: &InitOpts) -> anyhow::Result<()> {
 /// Initialize the current directory as an Astrid workspace (if not already).
 fn init_workspace() -> anyhow::Result<()> {
     let cwd = std::env::current_dir()?;
-    let ws = astrid_core::dirs::WorkspaceDir::from_path(&cwd);
+    let ws = astrid_core::dirs::WorkspaceDir::from_path_with_layout(
+        &cwd,
+        crate::workspace_layout::current().clone(),
+    );
 
     if !ws.dot_astrid().exists() {
         ws.ensure()?;

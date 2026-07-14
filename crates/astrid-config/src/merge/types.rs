@@ -9,7 +9,7 @@ pub enum ConfigLayer {
     System,
     /// User-level configuration (`~/.astrid/config.toml`).
     User,
-    /// Workspace-level configuration (`{workspace}/.astrid/config.toml`).
+    /// Workspace-level configuration under selected project state.
     Workspace,
     /// Environment variable fallback.
     Environment,
@@ -21,7 +21,7 @@ impl std::fmt::Display for ConfigLayer {
             Self::Defaults => write!(f, "defaults"),
             Self::System => write!(f, "system (/etc/astrid/config.toml)"),
             Self::User => write!(f, "user (~/.astrid/config.toml)"),
-            Self::Workspace => write!(f, "workspace (.astrid/config.toml)"),
+            Self::Workspace => write!(f, "workspace config"),
             Self::Environment => write!(f, "environment variable"),
         }
     }

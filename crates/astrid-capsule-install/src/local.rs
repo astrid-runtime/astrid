@@ -36,24 +36,39 @@ use astrid_capsule::capsule::CapsuleId;
 use astrid_capsule::discovery::load_manifest;
 use astrid_capsule::engine::wasm::host_state::LifecyclePhase;
 use astrid_core::PrincipalId;
-use astrid_core::dirs::AstridHome;
+use astrid_core::dirs::{AstridHome, WorkspaceLayout};
 use astrid_events::EventBus;
 
 use crate::contracts::seed_canonical_contracts_if_absent;
 use crate::copy::copy_capsule_dir;
 use crate::lifecycle::run_lifecycle;
 use crate::manifest_check::{
-    ExportConflict, MissingImport, check_export_conflicts, validate_imports,
+    ExportConflict, MissingImport, check_export_conflicts_in_workspace,
+    validate_imports_in_workspace,
 };
 use crate::meta::{CapsuleMeta, read_meta, write_meta};
-use crate::paths::{resolve_env_path_for, resolve_target_dir_for, restore_env_from_backup_for};
+use crate::paths::{
+    resolve_env_path_for, resolve_target_dir_for_in_workspace, restore_env_from_backup_for,
+};
 use crate::wasm::{WasmAddressed, content_address_wasm};
 use crate::wit::{content_address_wit, materialize_wit_mirror, version_map_to_strings};
+
+#[derive(Clone, Copy)]
+pub(crate) struct InstallWorkspace<'a> {
+    pub(crate) root: Option<&'a Path>,
+    pub(crate) layout: &'a WorkspaceLayout,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct ExpectedCapsuleIdentity<'a> {
+    pub(crate) id: &'a CapsuleId,
+    pub(crate) version: Option<&'a str>,
+}
 
 /// Knobs passed to [`install_from_local_path`].
 #[derive(Default)]
 pub struct InstallOptions {
-    /// Install into `<cwd>/.astrid/capsules/` instead of the
+    /// Install into the selected project's capsules directory instead of the
     /// principal's home directory.
     pub workspace: bool,
     /// The source string the user originally typed (e.g. a GitHub
@@ -146,11 +161,23 @@ pub fn install_from_local_path(
     home: &AstridHome,
     options: InstallOptions,
 ) -> anyhow::Result<InstallOutput> {
-    install_from_local_path_for_principal(
+    install_from_local_path_with_layout(source_dir, home, options, &WorkspaceLayout::default())
+}
+
+/// Install a capsule using an explicit workspace layout.
+#[allow(clippy::needless_pass_by_value, clippy::too_many_lines)]
+pub fn install_from_local_path_with_layout(
+    source_dir: &Path,
+    home: &AstridHome,
+    options: InstallOptions,
+    workspace_layout: &WorkspaceLayout,
+) -> anyhow::Result<InstallOutput> {
+    install_from_local_path_for_principal_with_layout(
         source_dir,
         home,
         options,
         &crate::paths::install_principal(),
+        workspace_layout,
     )
 }
 
@@ -162,7 +189,56 @@ pub fn install_from_local_path_for_principal(
     options: InstallOptions,
     target_principal: &PrincipalId,
 ) -> anyhow::Result<InstallOutput> {
-    install_from_local_path_internal(source_dir, home, options, target_principal, None, None)
+    install_from_local_path_for_principal_with_layout(
+        source_dir,
+        home,
+        options,
+        target_principal,
+        &WorkspaceLayout::default(),
+    )
+}
+
+/// Install a capsule for an explicit principal and workspace layout.
+#[allow(clippy::needless_pass_by_value, clippy::too_many_lines)]
+pub fn install_from_local_path_for_principal_with_layout(
+    source_dir: &Path,
+    home: &AstridHome,
+    options: InstallOptions,
+    target_principal: &PrincipalId,
+    workspace_layout: &WorkspaceLayout,
+) -> anyhow::Result<InstallOutput> {
+    let workspace_root = std::env::current_dir().ok();
+    install_from_local_path_for_principal_in_workspace(
+        source_dir,
+        home,
+        options,
+        target_principal,
+        workspace_root.as_deref(),
+        workspace_layout,
+    )
+}
+
+/// Install a capsule with explicit principal and workspace inputs.
+#[allow(clippy::needless_pass_by_value, clippy::too_many_lines)]
+pub fn install_from_local_path_for_principal_in_workspace(
+    source_dir: &Path,
+    home: &AstridHome,
+    options: InstallOptions,
+    target_principal: &PrincipalId,
+    workspace_root: Option<&Path>,
+    workspace_layout: &WorkspaceLayout,
+) -> anyhow::Result<InstallOutput> {
+    install_from_local_path_internal(
+        source_dir,
+        home,
+        options,
+        target_principal,
+        InstallWorkspace {
+            root: workspace_root,
+            layout: workspace_layout,
+        },
+        None,
+    )
 }
 
 /// Install for an explicit principal only when the loaded manifest identity
@@ -182,13 +258,61 @@ pub fn install_from_local_path_checked_for_principal(
     expected: &CapsuleId,
     expected_version: Option<&str>,
 ) -> anyhow::Result<InstallOutput> {
+    install_from_local_path_checked_for_principal_with_layout(
+        source_dir,
+        home,
+        options,
+        target_principal,
+        expected,
+        expected_version,
+        &WorkspaceLayout::default(),
+    )
+}
+
+/// Checked install for an explicit principal and workspace layout.
+#[allow(clippy::needless_pass_by_value)]
+pub fn install_from_local_path_checked_for_principal_with_layout(
+    source_dir: &Path,
+    home: &AstridHome,
+    options: InstallOptions,
+    target_principal: &PrincipalId,
+    expected: &CapsuleId,
+    expected_version: Option<&str>,
+    workspace_layout: &WorkspaceLayout,
+) -> anyhow::Result<InstallOutput> {
+    let workspace_root = std::env::current_dir().ok();
+    install_from_local_path_checked_for_principal_in_workspace(
+        source_dir,
+        home,
+        options,
+        target_principal,
+        InstallWorkspace {
+            root: workspace_root.as_deref(),
+            layout: workspace_layout,
+        },
+        ExpectedCapsuleIdentity {
+            id: expected,
+            version: expected_version,
+        },
+    )
+}
+
+#[allow(clippy::needless_pass_by_value)]
+pub(crate) fn install_from_local_path_checked_for_principal_in_workspace(
+    source_dir: &Path,
+    home: &AstridHome,
+    options: InstallOptions,
+    target_principal: &PrincipalId,
+    workspace: InstallWorkspace<'_>,
+    expected: ExpectedCapsuleIdentity<'_>,
+) -> anyhow::Result<InstallOutput> {
     install_from_local_path_internal(
         source_dir,
         home,
         options,
         target_principal,
+        workspace,
         Some(expected),
-        expected_version,
     )
 }
 
@@ -198,8 +322,8 @@ fn install_from_local_path_internal(
     home: &AstridHome,
     options: InstallOptions,
     target_principal: &PrincipalId,
-    expected: Option<&CapsuleId>,
-    expected_version: Option<&str>,
+    workspace: InstallWorkspace<'_>,
+    expected: Option<ExpectedCapsuleIdentity<'_>>,
 ) -> anyhow::Result<InstallOutput> {
     let manifest_path = source_dir.join("Capsule.toml");
     if !manifest_path.exists() {
@@ -208,12 +332,15 @@ fn install_from_local_path_internal(
     let manifest = load_manifest(&manifest_path).context("failed to load Capsule manifest")?;
     let id = CapsuleId::new(manifest.package.name.clone())?;
     if let Some(expected) = expected
-        && id != *expected
+        && id != *expected.id
     {
-        bail!("capsule identity mismatch: expected '{expected}', manifest declares '{id}'");
+        bail!(
+            "capsule identity mismatch: expected '{}', manifest declares '{id}'",
+            expected.id
+        );
     }
     let installed_version = manifest.package.version.clone();
-    if let Some(expected_version) = expected_version
+    if let Some(expected_version) = expected.and_then(|expected| expected.version)
         && installed_version != expected_version
     {
         bail!(
@@ -222,12 +349,24 @@ fn install_from_local_path_internal(
     }
 
     // Pre-flight checks — pure reads, no target mutation.
-    let export_conflicts = check_export_conflicts(&manifest)?;
+    let export_conflicts = check_export_conflicts_in_workspace(
+        &manifest,
+        home,
+        target_principal,
+        workspace.root,
+        workspace.layout,
+    )?;
 
     // Resolve target. The parent must exist before we attempt the
     // backup-rename later; create it now.
-    let target_dir =
-        resolve_target_dir_for(home, target_principal, id.as_str(), options.workspace)?;
+    let target_dir = resolve_target_dir_for_in_workspace(
+        home,
+        target_principal,
+        id.as_str(),
+        options.workspace,
+        workspace.root,
+        workspace.layout,
+    )?;
     let parent = target_dir.parent().context("target dir has no parent")?;
     std::fs::create_dir_all(parent)
         .with_context(|| format!("failed to create {}", parent.display()))?;
@@ -354,7 +493,13 @@ fn install_from_local_path_internal(
     let missing_imports = if options.skip_import_check {
         Vec::new()
     } else {
-        validate_imports(&manifest)
+        validate_imports_in_workspace(
+            &manifest,
+            home,
+            target_principal,
+            workspace.root,
+            workspace.layout,
+        )
     };
 
     // Cleanup the backup — success path.

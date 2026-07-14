@@ -149,16 +149,27 @@ fn resolve_http_limits(cfg: Option<&astrid_config::Config>) -> astrid_capsule::H
 )]
 pub async fn run() -> Result<()> {
     let args = Args::parse();
+    let workspace_layout = match std::env::var("ASTRID_WORKSPACE_STATE_DIR") {
+        Ok(value) => astrid_core::dirs::WorkspaceLayout::new(value)
+            .context("invalid ASTRID_WORKSPACE_STATE_DIR")?,
+        Err(std::env::VarError::NotPresent) => astrid_core::dirs::WorkspaceLayout::default(),
+        Err(std::env::VarError::NotUnicode(_)) => {
+            anyhow::bail!("ASTRID_WORKSPACE_STATE_DIR must be valid UTF-8")
+        },
+    };
     let astrid_home =
         astrid_core::dirs::AstridHome::resolve().context("Failed to resolve Astrid home")?;
 
+    let workspace_root = args.workspace.clone().unwrap_or_else(|| {
+        std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."))
+    });
+
     // Load the unified config once: it drives both logging and the capsule
-    // runtime concurrency ceilings below. Loaded against the current dir (as
-    // logging always did), independent of `--workspace`.
-    let workspace_root_for_cfg = std::env::current_dir().ok();
-    let unified_cfg = astrid_config::Config::load_with_home(
-        workspace_root_for_cfg.as_deref(),
+    // runtime concurrency ceilings below.
+    let unified_cfg = astrid_config::Config::load_with_home_and_layout(
+        Some(&workspace_root),
         astrid_home.root(),
+        &workspace_layout,
     )
     .ok()
     .map(|r| r.config);
@@ -175,10 +186,6 @@ pub async fn run() -> Result<()> {
     // Done before `args.workspace` is consumed below.
     let runtime_limits = resolve_capsule_limits(&args, unified_cfg.as_ref());
 
-    let ws = args.workspace.unwrap_or_else(|| {
-        std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."))
-    });
-
     // Operator-approved per-capsule local-egress allowlist (SSRF-airlock
     // exemptions). Operator config only — the kernel hands each capsule its
     // own slice at load time. Absent config = empty = no exemptions.
@@ -190,12 +197,13 @@ pub async fn run() -> Result<()> {
     // Operator ceilings for the astrid:http host (global; absent `[http]`
     // config = the host's historical constants). Forwarded to every capsule.
     let http_limits = resolve_http_limits(unified_cfg.as_ref());
-    let kernel = astrid_kernel::Kernel::new(
+    let kernel = astrid_kernel::Kernel::new_with_workspace_layout(
         session_id.clone(),
-        ws,
+        workspace_root,
         runtime_limits,
         local_egress,
         http_limits,
+        workspace_layout,
     )
     .await
     .map_err(|e| anyhow::anyhow!("Failed to boot Kernel: {e}"))?;
@@ -247,7 +255,11 @@ pub async fn run() -> Result<()> {
     // Signal readiness AFTER the default CLI/system view is loaded and
     // accepting connections. The CLI polls for this file to avoid connecting
     // before the handshake accept loop is running.
-    astrid_kernel::socket::write_readiness_file().map_err(|e| {
+    astrid_kernel::socket::write_readiness_file_for_workspace(
+        &kernel.workspace_root,
+        kernel.workspace_layout(),
+    )
+    .map_err(|e| {
         anyhow::anyhow!(
             "Failed to write readiness file \
              (daemon is useless without it): {e}"
@@ -363,6 +375,8 @@ fn spawn_gateway(
     let capability_kernel = std::sync::Arc::clone(kernel);
     let readiness_probe = kernel.agent_readiness_probe();
     let topic_probe = kernel.capsule_topic_probe_with_warm();
+    let workspace_root = kernel.workspace_root.clone();
+    let workspace_layout = kernel.workspace_layout().clone();
     let state = astrid_gateway::GatewayState::new(
         cfg,
         Some(bus),
@@ -383,8 +397,14 @@ fn spawn_gateway(
                                      capability: &str| {
             capability_kernel.runtime_capability_allows(principal, device_key_id, capability)
         };
-        if let Err(e) =
-            astrid_gateway::run_with_capability_probe(state, shutdown, capability_probe).await
+        if let Err(e) = astrid_gateway::run_with_workspace_and_capability_probe(
+            state,
+            shutdown,
+            workspace_root,
+            workspace_layout,
+            capability_probe,
+        )
+        .await
         {
             tracing::error!(error = %e, "astrid-gateway exited with error");
         }

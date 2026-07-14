@@ -26,9 +26,12 @@ pub(crate) async fn ensure_global_config() {
 /// Configure tracing/logging for this CLI invocation.
 pub(crate) fn init_logging(cli: &Cli) {
     let workspace_root = std::env::current_dir().ok();
-    let unified_cfg = astrid_config::Config::load(workspace_root.as_deref())
-        .ok()
-        .map(|r| r.config);
+    let unified_cfg = astrid_config::Config::load_with_layout(
+        workspace_root.as_deref(),
+        crate::workspace_layout::current(),
+    )
+    .ok()
+    .map(|r| r.config);
 
     let needs_file_log = matches!(cli.command, Some(crate::cli::Commands::Chat { .. }) | None);
 
@@ -136,7 +139,7 @@ pub(crate) fn run_build_companion(
 /// Returns an error if the kernel fails to boot or the socket fails to connect.
 pub(crate) async fn run_or_connect(
     session: Option<String>,
-    _workspace: Option<std::path::PathBuf>,
+    workspace: Option<std::path::PathBuf>,
     format: OutputFormat,
 ) -> Result<()> {
     use astrid_core::SessionId;
@@ -190,10 +193,11 @@ pub(crate) async fn run_or_connect(
     }
 
     let mut client =
-        match socket_client::SocketClient::connect(session_id.clone(), crate::principal::current())
+        match socket_client::connect_for_workspace(session_id.clone(), crate::principal::current())
             .await
         {
             Ok(c) => {
+                commands::daemon::ensure_daemon_workspace_matches(workspace.as_deref()).await?;
                 drop(daemon_child);
                 c
             },
@@ -216,9 +220,12 @@ pub(crate) async fn run_or_connect(
         };
 
     let workspace_root = std::env::current_dir().ok();
-    let model_name = astrid_config::Config::load(workspace_root.as_deref())
-        .ok()
-        .map_or_else(|| "unknown".to_string(), |r| r.config.model.model);
+    let model_name = astrid_config::Config::load_with_layout(
+        workspace_root.as_deref(),
+        crate::workspace_layout::current(),
+    )
+    .ok()
+    .map_or_else(|| "unknown".to_string(), |r| r.config.model.model);
 
     crate::commands::chat::run_chat(&mut client, &session_id, &model_name, format).await
 }

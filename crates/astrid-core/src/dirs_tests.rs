@@ -251,6 +251,90 @@ fn test_principal_home_ensure_idempotent() {
 // ── WorkspaceDir ─────────────────────────────────────────────────
 
 #[test]
+fn workspace_layout_defaults_to_dot_astrid() {
+    let layout = WorkspaceLayout::default();
+    assert_eq!(layout.state_dir_name(), ".astrid");
+    assert_eq!(
+        layout.capsules_dir(Path::new("/project")),
+        PathBuf::from("/project/.astrid/capsules")
+    );
+}
+
+#[test]
+fn workspace_layout_accepts_one_portable_directory_name() {
+    let layout = WorkspaceLayout::new(".alternate-runtime").unwrap();
+    assert_eq!(
+        layout.config_path(Path::new("/project")),
+        PathBuf::from("/project/.alternate-runtime/config.toml")
+    );
+}
+
+#[test]
+fn workspace_layout_rejects_ambiguous_or_unsafe_names() {
+    for value in [
+        "",
+        ".",
+        "..",
+        "/absolute",
+        "nested/path",
+        "nested\\path",
+        "../escape",
+        "name with spaces",
+        "drive:name",
+        ".trailing.",
+        "CON",
+        "nul.txt",
+        "COM1",
+        ".LPT9",
+    ] {
+        assert!(
+            WorkspaceLayout::new(value).is_err(),
+            "{value:?} must be rejected"
+        );
+    }
+}
+
+#[test]
+fn workspace_selection_identity_covers_root_and_layout() {
+    let root_a = tempfile::tempdir().unwrap();
+    let root_b = tempfile::tempdir().unwrap();
+    let default = WorkspaceLayout::default();
+    let alternate = WorkspaceLayout::new(".alternate-runtime").unwrap();
+
+    let selected = workspace_selection_fingerprint(root_a.path(), &default);
+    assert_eq!(
+        selected,
+        workspace_selection_fingerprint(root_a.path(), &default)
+    );
+    assert_ne!(
+        selected,
+        workspace_selection_fingerprint(root_a.path(), &alternate)
+    );
+    assert_ne!(
+        selected,
+        workspace_selection_fingerprint(root_b.path(), &default)
+    );
+}
+
+#[test]
+fn workspace_detect_uses_only_the_selected_state_directory() {
+    let dir = tempfile::tempdir().unwrap();
+    let default_root = dir.path().join("default");
+    let alternate_root = default_root.join("nested");
+    std::fs::create_dir_all(default_root.join(".astrid")).unwrap();
+    std::fs::create_dir_all(alternate_root.join(".alternate-runtime")).unwrap();
+    let start = alternate_root.join("src");
+    std::fs::create_dir_all(&start).unwrap();
+
+    let alternate = WorkspaceLayout::new(".alternate-runtime").unwrap();
+    assert_eq!(
+        WorkspaceDir::detect_with_layout(&start, alternate).root(),
+        alternate_root
+    );
+    assert_eq!(WorkspaceDir::detect(&start).root(), default_root);
+}
+
+#[test]
 fn test_workspace_detect_with_dot_astrid() {
     let dir = tempfile::tempdir().unwrap();
     let astrid_dir = dir.path().join(".astrid");
@@ -362,5 +446,23 @@ fn test_workspace_path_accessors() {
     assert_eq!(
         ws.instructions_path(),
         PathBuf::from("/home/user/project/.astrid/ASTRID.md")
+    );
+}
+
+#[test]
+fn workspace_path_accessors_use_injected_layout() {
+    let layout = WorkspaceLayout::new(".alternate-runtime").unwrap();
+    let ws = WorkspaceDir::from_path_with_layout("/home/user/project", layout);
+    assert_eq!(
+        ws.state_dir(),
+        PathBuf::from("/home/user/project/.alternate-runtime")
+    );
+    assert_eq!(
+        ws.capsules_dir(),
+        PathBuf::from("/home/user/project/.alternate-runtime/capsules")
+    );
+    assert_eq!(
+        ws.workspace_id_path(),
+        PathBuf::from("/home/user/project/.alternate-runtime/workspace-id")
     );
 }

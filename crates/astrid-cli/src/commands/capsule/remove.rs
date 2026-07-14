@@ -49,8 +49,13 @@ fn remove_capsule_from_home_for(
     force: bool,
     purge: bool,
 ) -> anyhow::Result<()> {
-    let target_dir =
-        astrid_capsule_install::resolve_target_dir_for(home, principal, name, workspace)?;
+    let target_dir = astrid_capsule_install::resolve_target_dir_for_with_layout(
+        home,
+        principal,
+        name,
+        workspace,
+        crate::workspace_layout::current(),
+    )?;
 
     // Content-addressed artifacts in bin/ and wit/ are NEVER deleted.
     // They are the audit trail — the BLAKE3 hash in audit entries must always
@@ -116,8 +121,13 @@ fn validate_capsule_removal_from_home_for(
     workspace: bool,
     force: bool,
 ) -> anyhow::Result<()> {
-    let target_dir =
-        astrid_capsule_install::resolve_target_dir_for(home, principal, name, workspace)?;
+    let target_dir = astrid_capsule_install::resolve_target_dir_for_with_layout(
+        home,
+        principal,
+        name,
+        workspace,
+        crate::workspace_layout::current(),
+    )?;
 
     if !target_dir.exists() {
         bail!("Capsule '{name}' is not installed.");
@@ -126,7 +136,11 @@ fn validate_capsule_removal_from_home_for(
     let target_meta = super::meta::read_meta(&target_dir);
 
     // Scan once, reuse for both dependency check and binary cleanup
-    let all_capsules = super::meta::scan_installed_capsules_in_home_for(home, principal)?;
+    let all_capsules = super::meta::scan_installed_capsules_in_home_for_with_layout(
+        home,
+        principal,
+        crate::workspace_layout::current(),
+    )?;
 
     // Dependency safety check (skip with --force)
     if !force && let Some(block) = check_removal_safety(name, target_meta.as_ref(), &all_capsules) {
