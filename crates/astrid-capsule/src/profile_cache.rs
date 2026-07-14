@@ -246,6 +246,17 @@ impl PrincipalProfileCache {
             .profiles
             .len()
     }
+
+    #[cfg(test)]
+    fn generation_for(&self, principal: &PrincipalId) -> u64 {
+        self.state
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .generations
+            .get(principal)
+            .copied()
+            .unwrap_or(0)
+    }
 }
 
 #[cfg(test)]
@@ -421,14 +432,7 @@ mod tests {
                  enabled = true\n"
             ),
         );
-        let generation = cache
-            .state
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .generations
-            .get(&p)
-            .copied()
-            .unwrap_or(0);
+        let generation = cache.generation_for(&p);
         let stale = Arc::new(
             PrincipalProfile::load(&cache.astrid_home, &p).expect("load pre-invalidation profile"),
         );
@@ -570,22 +574,19 @@ mod tests {
     fn persist_egress_is_idempotent() {
         let (_dir, cache) = fixture();
         let p = principal("bob");
-        let initial_generation = cache.generation.load(Ordering::Acquire);
+        let initial_generation = cache.generation_for(&p);
         // No file on disk → starts from default (empty capsule_egress).
         cache
             .persist_egress(&p, "react", "10.0.0.5:8080")
             .expect("first persist");
-        let persisted_generation = cache.generation.load(Ordering::Acquire);
+        let persisted_generation = cache.generation_for(&p);
         assert_eq!(persisted_generation, initial_generation + 1);
         // A second persist of the SAME endpoint under the SAME capsule
         // (case-insensitive) is a no-op success, not a duplicate.
         cache
             .persist_egress(&p, "react", "10.0.0.5:8080")
             .expect("idempotent persist");
-        assert_eq!(
-            cache.generation.load(Ordering::Acquire),
-            persisted_generation + 1
-        );
+        assert_eq!(cache.generation_for(&p), persisted_generation + 1);
 
         let profile = cache.resolve(&p).expect("reload");
         assert_eq!(
