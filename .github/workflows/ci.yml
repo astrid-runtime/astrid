@@ -524,6 +524,9 @@ jobs:
       - name: Verify lockfile
         run: cargo metadata --locked --no-deps > /dev/null
 
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --version 0.22.2 --locked
+
       - uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2.0.0
         with:
           token: ${{ github.token }}
