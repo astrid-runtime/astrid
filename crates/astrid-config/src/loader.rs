@@ -366,12 +366,12 @@ mod tests {
         std::fs::create_dir_all(&alternate_dir).unwrap();
         std::fs::write(
             default_dir.join("config.toml"),
-            "[model]\nprovider = \"default-root\"\n",
+            "[model]\nprovider = \"openai\"\n",
         )
         .unwrap();
         std::fs::write(
             alternate_dir.join("config.toml"),
-            "[model]\nprovider = \"alternate-root\"\n",
+            "[model]\nprovider = \"claude\"\n",
         )
         .unwrap();
 
@@ -379,7 +379,7 @@ mod tests {
         let resolved =
             load_with_layout(Some(workspace.path()), Some(home.path()), &layout).unwrap();
 
-        assert_eq!(resolved.config.model.provider, "alternate-root");
+        assert_eq!(resolved.config.model.provider, "claude");
         assert!(
             resolved
                 .loaded_files

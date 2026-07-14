@@ -180,8 +180,7 @@ pub fn workspace_selection_fingerprint(
             project_root.to_path_buf()
         } else {
             std::env::current_dir()
-                .map(|cwd| cwd.join(project_root))
-                .unwrap_or_else(|_| project_root.to_path_buf())
+                .map_or_else(|_| project_root.to_path_buf(), |cwd| cwd.join(project_root))
         }
     });
     let mut hasher = Sha256::new();
