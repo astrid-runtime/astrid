@@ -1,5 +1,6 @@
 /// Admin management API dispatcher (issue #672, Layer 6).
 pub mod admin;
+mod device_scope;
 /// `KernelRequest::InstallCapsule` handler — delegates to the
 /// `astrid-capsule-install` library so the daemon and the CLI reach
 /// disk through the same code path.
@@ -22,6 +23,8 @@ use astrid_core::principal::PrincipalId;
 use astrid_events::ipc::{IpcMessage, IpcPayload, Topic};
 use astrid_events::kernel_api::{KernelRequest, KernelResponse};
 use tracing::{debug, info, warn};
+
+use device_scope::resolve_device_scope;
 
 #[cfg(test)]
 mod capability_catalog_tests;
@@ -298,7 +301,7 @@ async fn handle_request(
             KernelResponse::Error("Approval logic not yet implemented in kernel router".to_string())
         },
         KernelRequest::ListCapsules => {
-            let visibility = CapsuleVisibility::new(kernel, &caller);
+            let visibility = CapsuleVisibility::new(kernel, &caller, device_key_id.as_deref());
             let list: Vec<_> = visible_inventory_manifests(kernel, &visibility)
                 .await
                 .into_iter()
@@ -307,7 +310,7 @@ async fn handle_request(
             KernelResponse::Success(serde_json::json!(list))
         },
         KernelRequest::GetCommands => {
-            let visibility = CapsuleVisibility::new(kernel, &caller);
+            let visibility = CapsuleVisibility::new(kernel, &caller, device_key_id.as_deref());
             let mut commands = Vec::new();
             let manifests = visible_inventory_manifests(kernel, &visibility).await;
             for manifest in &manifests {
@@ -432,7 +435,7 @@ async fn handle_request(
             KernelResponse::Status(status)
         },
         KernelRequest::GetCapsuleMetadata => {
-            let visibility = CapsuleVisibility::new(kernel, &caller);
+            let visibility = CapsuleVisibility::new(kernel, &caller, device_key_id.as_deref());
             let mut entries = Vec::new();
             for manifest in visible_inventory_manifests(kernel, &visibility).await {
                 entries.push(astrid_events::kernel_api::CapsuleMetadataEntry {
@@ -448,7 +451,7 @@ async fn handle_request(
             KernelResponse::CapsuleMetadata(entries)
         },
         KernelRequest::GetAgentReadiness => {
-            let visibility = CapsuleVisibility::new(kernel, &caller);
+            let visibility = CapsuleVisibility::new(kernel, &caller, device_key_id.as_deref());
             let manifests = visible_inventory_manifests(kernel, &visibility).await;
             let readiness = astrid_capsule::readiness::agent_loop_readiness(&manifests);
             KernelResponse::AgentReadiness(readiness)
@@ -560,7 +563,7 @@ struct CapsuleVisibility {
 }
 
 impl CapsuleVisibility {
-    fn new(kernel: &crate::Kernel, caller: &PrincipalId) -> Self {
+    fn new(kernel: &crate::Kernel, caller: &PrincipalId, device_key_id: Option<&str>) -> Self {
         let profile = if caller.as_str() == "anonymous" {
             None
         } else {
@@ -578,20 +581,32 @@ impl CapsuleVisibility {
             }
         };
         let Some(profile) = profile else {
-            return Self {
-                principal: caller.clone(),
-                is_admin: false,
-                capsule_grants: BTreeSet::new(),
-            };
+            return Self::denied(caller);
         };
 
+        let device_scope =
+            match resolve_device_scope(profile.as_ref(), caller, device_key_id, "capsule:list") {
+                Ok(scope) => scope,
+                Err(_) => return Self::denied(caller),
+            };
         let groups = kernel.groups.load_full();
-        let check = CapabilityCheck::new(profile.as_ref(), groups.as_ref(), caller.clone());
+        let mut check = CapabilityCheck::new(profile.as_ref(), groups.as_ref(), caller.clone());
+        if let Some(scope) = &device_scope {
+            check = check.with_device_scope(scope);
+        }
 
         Self {
             principal: caller.clone(),
-            is_admin: check.has("*") || check.has("capsule:list"),
+            is_admin: check.has("capsule:list"),
             capsule_grants: profile.capsules.iter().cloned().collect(),
+        }
+    }
+
+    fn denied(caller: &PrincipalId) -> Self {
+        Self {
+            principal: caller.clone(),
+            is_admin: false,
+            capsule_grants: BTreeSet::new(),
         }
     }
 
@@ -826,36 +841,7 @@ fn authorize_request(
     }
     let groups = kernel.groups.load_full();
 
-    // Per-device scope attenuation. When the request authenticated with a
-    // specific registered device, the device's scope is applied as a floor on
-    // the principal's effective capabilities (deny wins, can only narrow).
-    //
-    // Fail-closed on an unresolved key_id: a request that names a device the
-    // principal no longer has (revoked / unknown) must NOT fall back to the
-    // principal's full authority — that would let a revoked device keep acting.
-    //
-    // The scope is cloned into a local so it outlives the borrow of `profile`
-    // for the `require` call below (a `DeviceScope` clone is cheap — at most a
-    // couple of small pattern vectors — and avoids fighting the borrow that
-    // `device_by_key_id` takes on `profile`).
-    let device_scope: Option<astrid_core::profile::DeviceScope> = if let Some(kid) = device_key_id {
-        let Some(dev) = profile.auth.device_by_key_id(kid) else {
-            warn!(
-                security_event = true,
-                principal = %caller,
-                key_id = %kid,
-                required = required_cap,
-                "device_key_id resolves to no registered key — fail-closed deny"
-            );
-            return Err(PermissionError::DeviceScopeDenied {
-                principal: caller.clone(),
-                required: required_cap.to_string(),
-            });
-        };
-        Some(dev.scope.clone())
-    } else {
-        None
-    };
+    let device_scope = resolve_device_scope(profile.as_ref(), caller, device_key_id, required_cap)?;
 
     let mut check = CapabilityCheck::new(profile.as_ref(), groups.as_ref(), caller.clone());
     if let Some(scope) = &device_scope {

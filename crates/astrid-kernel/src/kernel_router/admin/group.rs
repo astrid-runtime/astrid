@@ -68,9 +68,13 @@ pub(super) async fn group_modify(
     commit_group_config(kernel, next)
 }
 
-pub(super) fn group_list(kernel: &Arc<crate::Kernel>, caller: &PrincipalId) -> AdminResponseBody {
+pub(super) fn group_list(
+    kernel: &Arc<crate::Kernel>,
+    caller: &PrincipalId,
+    device_key_id: Option<&str>,
+) -> AdminResponseBody {
     let cfg = kernel.groups.load_full();
-    let visible_groups = if caller_has_global_group_list(kernel, caller) {
+    let visible_groups = if caller_has_global_group_list(kernel, caller, device_key_id) {
         None
     } else {
         Some(caller_group_names(kernel, caller))
@@ -94,13 +98,32 @@ pub(super) fn group_list(kernel: &Arc<crate::Kernel>, caller: &PrincipalId) -> A
     AdminResponseBody::GroupList(summaries)
 }
 
-fn caller_has_global_group_list(kernel: &Arc<crate::Kernel>, caller: &PrincipalId) -> bool {
+fn caller_has_global_group_list(
+    kernel: &Arc<crate::Kernel>,
+    caller: &PrincipalId,
+    device_key_id: Option<&str>,
+) -> bool {
     let Ok(profile) = kernel.profile_cache.resolve(caller) else {
         return false;
     };
+    let Ok(device_scope) = crate::kernel_router::resolve_device_scope(
+        profile.as_ref(),
+        caller,
+        device_key_id,
+        "group:list",
+    ) else {
+        return false;
+    };
     let groups = kernel.groups.load_full();
-    astrid_capabilities::CapabilityCheck::new(profile.as_ref(), groups.as_ref(), caller.clone())
-        .has("group:list")
+    let mut check = astrid_capabilities::CapabilityCheck::new(
+        profile.as_ref(),
+        groups.as_ref(),
+        caller.clone(),
+    );
+    if let Some(scope) = &device_scope {
+        check = check.with_device_scope(scope);
+    }
+    check.has("group:list")
 }
 
 fn caller_group_names(kernel: &Arc<crate::Kernel>, caller: &PrincipalId) -> BTreeSet<String> {

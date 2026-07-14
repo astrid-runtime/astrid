@@ -64,18 +64,12 @@ pub(super) async fn dispatch(
     dispatch_with_device(kernel, caller, None, req).await
 }
 
-/// Dispatch carrying the issuer's authenticating device key id.
-///
-/// `issuer_device_key_id` is the device key that authenticated this request,
-/// when one did. Only [`AdminRequestKind::PairDeviceIssue`] consumes it: it
-/// resolves the issuer's OWN device scope so the no-escalation subset check
-/// and the full-mint gate run against the issuer's *attenuated* effective set
-/// (a scoped device cannot mint a child broader than itself). Every other
-/// handler ignores it.
+/// Dispatch carrying the caller's authenticating device key id.
+/// Device scope applies to every authority decision made during dispatch.
 pub(super) async fn dispatch_with_device(
     kernel: &Arc<crate::Kernel>,
     caller: &PrincipalId,
-    issuer_device_key_id: Option<&str>,
+    device_key_id: Option<&str>,
     req: AdminRequestKind,
 ) -> AdminResponseBody {
     match req {
@@ -87,7 +81,7 @@ pub(super) async fn dispatch_with_device(
         AdminRequestKind::AgentDisable { principal } => {
             agent_set_enabled(kernel, principal, false).await
         },
-        AdminRequestKind::AgentList => agent_list(kernel, caller),
+        AdminRequestKind::AgentList => agent_list(kernel, caller, device_key_id),
         req @ AdminRequestKind::AgentModify { .. } => agent_modify_from_req(kernel, req).await,
         AdminRequestKind::QuotaSet { principal, quotas } => {
             super::quota::quota_set(kernel, principal, quotas).await
@@ -111,7 +105,7 @@ pub(super) async fn dispatch_with_device(
         } => {
             super::group::group_modify(kernel, name, capabilities, description, unsafe_admin).await
         },
-        AdminRequestKind::GroupList => super::group::group_list(kernel, caller),
+        AdminRequestKind::GroupList => super::group::group_list(kernel, caller, device_key_id),
         AdminRequestKind::CapsGrant {
             principal,
             capabilities,
@@ -156,7 +150,7 @@ pub(super) async fn dispatch_with_device(
         | AdminRequestKind::PairDeviceRedeem { .. }
         | AdminRequestKind::PairDeviceList { .. }
         | AdminRequestKind::PairDeviceRevoke { .. }) => {
-            pair_device_dispatch(kernel, caller, issuer_device_key_id, req).await
+            pair_device_dispatch(kernel, caller, device_key_id, req).await
         },
     }
 }
@@ -652,16 +646,39 @@ where
 /// (segment 1 `self` ≠ `agent`), so this returns `false` for them — they
 /// are filtered to their own row. Fail-closed: an unresolvable caller
 /// profile yields `false` (most restrictive, self-only).
-fn caller_has_global_agent_list(kernel: &Arc<crate::Kernel>, caller: &PrincipalId) -> bool {
+fn caller_has_global_agent_list(
+    kernel: &Arc<crate::Kernel>,
+    caller: &PrincipalId,
+    device_key_id: Option<&str>,
+) -> bool {
     let Ok(profile) = kernel.profile_cache.resolve(caller) else {
         return false;
     };
+    let Ok(device_scope) = crate::kernel_router::resolve_device_scope(
+        profile.as_ref(),
+        caller,
+        device_key_id,
+        "agent:list",
+    ) else {
+        return false;
+    };
     let groups = kernel.groups.load_full();
-    astrid_capabilities::CapabilityCheck::new(profile.as_ref(), groups.as_ref(), caller.clone())
-        .has("agent:list")
+    let mut check = astrid_capabilities::CapabilityCheck::new(
+        profile.as_ref(),
+        groups.as_ref(),
+        caller.clone(),
+    );
+    if let Some(scope) = &device_scope {
+        check = check.with_device_scope(scope);
+    }
+    check.has("agent:list")
 }
 
-fn agent_list(kernel: &Arc<crate::Kernel>, caller: &PrincipalId) -> AdminResponseBody {
+fn agent_list(
+    kernel: &Arc<crate::Kernel>,
+    caller: &PrincipalId,
+    device_key_id: Option<&str>,
+) -> AdminResponseBody {
     // Source of truth: `etc/profiles/{principal}.toml`. Iterating the
     // home directory was the pre-#672 approach but stopped working
     // when profiles moved out — and was always wrong in spirit since
@@ -725,7 +742,7 @@ fn agent_list(kernel: &Arc<crate::Kernel>, caller: &PrincipalId) -> AdminRespons
     // self-scoped form), so in practice only the `admin` group's `*`
     // (which matches both) sees everyone. This realises the gateway's
     // documented "the kernel filters server-side" contract.
-    if !caller_has_global_agent_list(kernel, caller) {
+    if !caller_has_global_agent_list(kernel, caller, device_key_id) {
         summaries.retain(|s| s.principal == *caller);
     }
 

@@ -54,15 +54,12 @@ pub(crate) async fn pair_device_issue(
         ));
     }
 
-    // Resolve the requested scope arg to a concrete DeviceScope. An unknown
-    // preset name is a bad-input rejection, not a silent fallback.
     let requested_scope = match resolve_pair_scope(&requested) {
         Ok(s) => s,
         Err(e) => return err_bad_input(e),
     };
 
-    // Caller's profile must already exist. A pair-token tied to a
-    // missing principal would be a dead grant on redeem.
+    // Pair tokens must name an existing principal.
     let profile_path = kernel.astrid_home.profile_path(caller);
     if !profile_path.exists() {
         return err_bad_input(format!(
@@ -70,42 +67,28 @@ pub(crate) async fn pair_device_issue(
         ));
     }
 
-    // ── No-escalation enforcement ──────────────────────────────────────
-    //
-    // Resolve the issuer's EFFECTIVE capability set: their principal profile
-    // narrowed by the issuer's OWN authenticating device scope. A
-    // restricted-but-can-pair device must NOT be able to mint a broader child
-    // — "device scope ⊆ issuer effective caps" where the issuer's effective
-    // caps already account for their own device attenuation.
-    //
-    // The scope is cloned into a local so it outlives the borrow of `profile`
-    // for the `CapabilityCheck` below (cheap — a couple of small pattern
-    // vectors — and avoids fighting the borrow `device_by_key_id` takes).
     let profile = match kernel.profile_cache.resolve(caller) {
         Ok(p) => p,
         Err(e) => return err_internal(format!("issuer profile resolution failed: {e}")),
     };
-    let issuer_scope: Option<DeviceScope> = issuer_device_key_id
-        .and_then(|kid| profile.auth.device_by_key_id(kid))
-        .map(|dev| dev.scope.clone());
+    let issuer_scope = match crate::kernel_router::resolve_device_scope(
+        profile.as_ref(),
+        caller,
+        issuer_device_key_id,
+        "self:auth:pair",
+    ) {
+        Ok(scope) => scope,
+        Err(e) => return err_unauthorized(e.to_string()),
+    };
     let groups = kernel.groups.load_full();
     let mut issuer_check = CapabilityCheck::new(profile.as_ref(), groups.as_ref(), caller.clone());
-    // Apply the issuer's own device floor (Full / None = unattenuated, the
-    // common admin/agent case — behaviour unchanged there).
+    // A scoped issuer can grant only its attenuated authority.
     if let Some(scope @ DeviceScope::Scoped { .. }) = &issuer_scope {
         issuer_check = issuer_check.with_device_scope(scope);
     }
 
     match &requested_scope {
-        // FULL-MINT GATE: minting an unattenuated device is the broadest grant
-        // possible. It requires BOTH:
-        //  1. that the ISSUER is itself unattenuated. A device under its own
-        //     scope cannot grant "no restrictions" to a child — a Full child
-        //     applies no attenuation, so it would escape the issuer's own
-        //     denies (deny-inheritance below only narrows *Scoped* children,
-        //     not Full ones). A scoped issuer must mint a Scoped child instead.
-        //  2. that the issuer holds `self:auth:pair:admin` under their
-        //     attenuated effective set.
+        // Full devices require an unattenuated issuer with pair-admin authority.
         DeviceScope::Full => {
             if matches!(&issuer_scope, Some(DeviceScope::Scoped { .. })) {
                 return err_unauthorized(format!(
@@ -118,10 +101,14 @@ pub(crate) async fn pair_device_issue(
                 ));
             }
         },
-        // SUBSET CHECK: every requested `allow` pattern must be held by the
-        // issuer's attenuated effective set (no escalation). `deny` patterns
-        // only restrict and need no validation.
-        DeviceScope::Scoped { .. } => {
+        DeviceScope::Scoped { allow, .. } => {
+            // Bare `*` confers the principal's full authority even in a scoped shape.
+            let requests_universal_scope = allow.iter().any(|pattern| pattern == "*");
+            if requests_universal_scope && !issuer_check.has("self:auth:pair:admin") {
+                return err_unauthorized(format!(
+                    "minting a device scope with universal `*` requires self:auth:pair:admin, which {caller} does not effectively hold"
+                ));
+            }
             if let Err(e) = device_scope_within(&issuer_check, &requested_scope) {
                 return err_unauthorized(format!(
                     "requested device scope exceeds your authority: {e}"
@@ -130,14 +117,9 @@ pub(crate) async fn pair_device_issue(
         },
     }
 
-    // DENY-INHERITANCE (monotonic narrowing): a Scoped child inherits the
-    // issuer's own device-scope denies. Without this, a broad child
-    // `allow:[self:*]` from an issuer that denies e.g. `self:capsule:install`
-    // would let the child exceed the parent on that cap. Unioning the parent's
-    // deny list re-blocks those caps in the child — children only ever get
-    // more restricted.
+    // A scoped child inherits its issuer's denies.
     let stored_scope = inherit_issuer_denies(requested_scope, issuer_scope.as_ref());
-    // Drop the borrow on `profile`/`groups` before taking the write lock.
+    // Release authority state before awaiting the write lock.
     drop(issuer_check);
     drop(profile);
     drop(groups);

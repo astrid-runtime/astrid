@@ -602,11 +602,7 @@ async fn handle_admin_request(
         },
     }
 
-    // Pass the issuer's authenticating device key id through so
-    // `pair_device_issue` can resolve the issuer's OWN device scope and
-    // enforce no-escalation against the issuer's *attenuated* effective set
-    // (a scoped issuer cannot mint a broader child). Every other handler
-    // ignores it.
+    // Secondary views and pair delegation use the authenticated device scope.
     let body =
         handlers::dispatch_with_device(kernel, &caller, device_key_id.as_deref(), req.kind).await;
     publish_response(

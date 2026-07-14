@@ -15,7 +15,7 @@ use std::sync::Arc;
 use astrid_core::dirs::AstridHome;
 use astrid_core::groups::{BUILTIN_ADMIN, BUILTIN_AGENT, BUILTIN_RESTRICTED, GroupConfig};
 use astrid_core::principal::PrincipalId;
-use astrid_core::profile::{PrincipalProfile, Quotas};
+use astrid_core::profile::{AuthMethod, DeviceKey, DeviceScope, PrincipalProfile, Quotas};
 use astrid_events::kernel_api::{AdminRequestKind, AdminResponseBody, AgentSummary, GroupSummary};
 use tempfile::TempDir;
 
@@ -995,4 +995,104 @@ async fn agent_list_filters_to_self_for_non_admin_caller() {
         "self-scoped caller must see exactly one row, got {mine:?}"
     );
     assert_eq!(mine[0].principal.as_str(), "alice");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn agent_list_global_view_is_attenuated_by_device_scope() {
+    let (_dir, kernel) = fixture().await;
+    for name in ["alice", "bob"] {
+        let res = handlers::dispatch(
+            &kernel,
+            &PrincipalId::default(),
+            AdminRequestKind::AgentCreate {
+                name: name.into(),
+                groups: Vec::new(),
+                grants: Vec::new(),
+                inherit_from: None,
+                clone_from: None,
+                allow_admin_clone: false,
+            },
+        )
+        .await;
+        assert_success(&res);
+    }
+
+    let full = DeviceKey::new("a".repeat(64), DeviceScope::Full, None, 0);
+    let self_only = DeviceKey::new(
+        "b".repeat(64),
+        DeviceScope::Scoped {
+            allow: vec!["self:*".to_string()],
+            deny: Vec::new(),
+        },
+        None,
+        0,
+    );
+    let global_list = DeviceKey::new(
+        "c".repeat(64),
+        DeviceScope::Scoped {
+            allow: vec!["self:*".to_string(), "agent:list".to_string()],
+            deny: Vec::new(),
+        },
+        None,
+        0,
+    );
+    let full_id = full.key_id.clone();
+    let self_only_id = self_only.key_id.clone();
+    let global_list_id = global_list.key_id.clone();
+    let mut profile = PrincipalProfile::load_from_path(&PrincipalProfile::path_for(
+        &kernel.astrid_home,
+        &PrincipalId::default(),
+    ))
+    .expect("load default profile");
+    profile.auth.methods = vec![AuthMethod::Keypair];
+    profile.auth.public_keys = vec![full, self_only, global_list];
+    profile
+        .save_to_path(&PrincipalProfile::path_for(
+            &kernel.astrid_home,
+            &PrincipalId::default(),
+        ))
+        .expect("save device-scoped default profile");
+    kernel.profile_cache.invalidate(&PrincipalId::default());
+
+    let list_for = |response| match response {
+        AdminResponseBody::AgentList(list) => list,
+        other => panic!("expected AgentList, got {other:?}"),
+    };
+    let full = list_for(
+        handlers::dispatch_with_device(
+            &kernel,
+            &PrincipalId::default(),
+            Some(&full_id),
+            AdminRequestKind::AgentList,
+        )
+        .await,
+    );
+    assert!(full.iter().any(|entry| entry.principal == pid("alice")));
+    assert!(full.iter().any(|entry| entry.principal == pid("bob")));
+
+    let global = list_for(
+        handlers::dispatch_with_device(
+            &kernel,
+            &PrincipalId::default(),
+            Some(&global_list_id),
+            AdminRequestKind::AgentList,
+        )
+        .await,
+    );
+    assert!(global.iter().any(|entry| entry.principal == pid("alice")));
+    assert!(global.iter().any(|entry| entry.principal == pid("bob")));
+
+    for device_key_id in [self_only_id.as_str(), "0000000000000000"] {
+        let scoped = list_for(
+            handlers::dispatch_with_device(
+                &kernel,
+                &PrincipalId::default(),
+                Some(device_key_id),
+                AdminRequestKind::AgentList,
+            )
+            .await,
+        );
+        assert_eq!(scoped.len(), 1);
+        assert_eq!(scoped[0].principal, PrincipalId::default());
+    }
 }

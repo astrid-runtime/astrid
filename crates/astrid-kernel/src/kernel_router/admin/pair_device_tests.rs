@@ -42,8 +42,19 @@ fn pid(name: &str) -> PrincipalId {
 
 /// Seed `principal` holding `grants`, enabled, with the supplied device keys.
 fn seed(kernel: &Arc<Kernel>, principal: &PrincipalId, grants: &[&str], devices: Vec<DeviceKey>) {
+    seed_policy(kernel, principal, grants, &[], devices);
+}
+
+fn seed_policy(
+    kernel: &Arc<Kernel>,
+    principal: &PrincipalId,
+    grants: &[&str],
+    revokes: &[&str],
+    devices: Vec<DeviceKey>,
+) {
     let mut profile = PrincipalProfile {
         grants: grants.iter().map(|g| (*g).to_string()).collect(),
+        revokes: revokes.iter().map(|r| (*r).to_string()).collect(),
         enabled: true,
         ..Default::default()
     };
@@ -83,6 +94,27 @@ fn issue(scope: PairScopeArg) -> AdminRequestKind {
         expires_secs: Some(300),
         label: Some("dev".into()),
         scope,
+    }
+}
+
+async fn assert_missing_device_rejects_broad_mints(
+    kernel: &Arc<Kernel>,
+    caller: &PrincipalId,
+    device_key_id: &str,
+) {
+    for scope in [
+        PairScopeArg::Full,
+        PairScopeArg::Explicit {
+            allow: vec!["*".into()],
+            deny: vec![],
+        },
+    ] {
+        let response =
+            handlers::dispatch_with_device(kernel, caller, Some(device_key_id), issue(scope)).await;
+        assert!(
+            matches!(response, AdminResponseBody::Error(_)),
+            "a missing issuer device must not mint broad authority: {response:?}"
+        );
     }
 }
 
@@ -179,6 +211,118 @@ async fn full_scope_device_can_mint_full() {
     assert!(
         matches!(resp, AdminResponseBody::PairToken(_)),
         "a full-scope device can mint Full: {resp:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn unknown_or_revoked_issuer_device_cannot_mint_broad_authority() {
+    let (_dir, kernel) = fixture().await;
+
+    let unknown_caller = pid("unknown_issuer_device");
+    seed(&kernel, &unknown_caller, &["*"], vec![]);
+    assert_missing_device_rejects_broad_mints(&kernel, &unknown_caller, "0000000000000000").await;
+    assert_missing_device_rejects_broad_mints(&kernel, &unknown_caller, "not-a-key-id").await;
+
+    let revoked_caller = pid("revoked_issuer_device");
+    let revoked_device = full_device('f');
+    let revoked_id = revoked_device.key_id.clone();
+    seed(&kernel, &revoked_caller, &["*"], vec![revoked_device]);
+    let response = handlers::dispatch(
+        &kernel,
+        &revoked_caller,
+        AdminRequestKind::PairDeviceRevoke {
+            principal: revoked_caller.clone(),
+            key_id: revoked_id.clone(),
+        },
+    )
+    .await;
+    assert!(matches!(
+        response,
+        AdminResponseBody::PairDeviceRevoked { .. }
+    ));
+    assert_missing_device_rejects_broad_mints(&kernel, &revoked_caller, &revoked_id).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn universal_scoped_mint_requires_effective_admin_capability() {
+    let (_dir, kernel) = fixture().await;
+    let caller = pid("universal_scope_without_admin");
+    seed_policy(&kernel, &caller, &["*"], &["self:auth:pair:admin"], vec![]);
+
+    let req = issue(PairScopeArg::Explicit {
+        allow: vec!["*".into()],
+        deny: vec![],
+    });
+    let resp = handlers::dispatch_with_device(&kernel, &caller, None, req).await;
+    match resp {
+        AdminResponseBody::Error(msg) => assert!(
+            msg.contains("universal `*`") && msg.contains("self:auth:pair:admin"),
+            "universal scoped denial must name both the scope and required capability: {msg}"
+        ),
+        other => panic!("universal scoped mint without pair-admin must reject, got: {other:?}"),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn universal_scoped_mint_is_accepted_with_admin_capability() {
+    let (_dir, kernel) = fixture().await;
+    let caller = pid("universal_scope_with_admin");
+    let dev = scoped_device('a', &["*"], &[]);
+    let dev_id = dev.key_id.clone();
+    seed(&kernel, &caller, &["*"], vec![dev]);
+
+    let req = issue(PairScopeArg::Explicit {
+        allow: vec!["*".into()],
+        deny: vec![],
+    });
+    let resp = handlers::dispatch_with_device(&kernel, &caller, Some(&dev_id), req).await;
+    assert!(
+        matches!(resp, AdminResponseBody::PairToken(_)),
+        "an issuer effectively holding pair-admin may mint a universal scoped device: {resp:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn scoped_issuer_cannot_bypass_admin_gate_with_universal_allow() {
+    let (_dir, kernel) = fixture().await;
+    let caller = pid("attenuated_universal_issuer");
+    let dev = scoped_device('a', &["*"], &["self:auth:pair:admin"]);
+    let dev_id = dev.key_id.clone();
+    seed(&kernel, &caller, &["*"], vec![dev]);
+
+    let req = issue(PairScopeArg::Explicit {
+        allow: vec!["*".into()],
+        deny: vec![],
+    });
+    let resp = handlers::dispatch_with_device(&kernel, &caller, Some(&dev_id), req).await;
+    match resp {
+        AdminResponseBody::Error(msg) => assert!(
+            msg.contains("self:auth:pair:admin"),
+            "attenuated issuer denial must name the missing effective capability: {msg}"
+        ),
+        other => panic!("attenuated scoped issuer must not mint universal scope, got: {other:?}"),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn use_only_scope_does_not_require_admin_capability() {
+    let (_dir, kernel) = fixture().await;
+    let caller = pid("self_scope_without_admin");
+    seed_policy(
+        &kernel,
+        &caller,
+        &["self:*"],
+        &["self:auth:pair:admin"],
+        vec![],
+    );
+
+    let req = issue(PairScopeArg::Preset {
+        name: "use-only".into(),
+    });
+    let resp = handlers::dispatch_with_device(&kernel, &caller, None, req).await;
+    assert!(
+        matches!(resp, AdminResponseBody::PairToken(_)),
+        "self:* must remain an ordinary subset-checked scoped grant: {resp:?}"
     );
 }
 
