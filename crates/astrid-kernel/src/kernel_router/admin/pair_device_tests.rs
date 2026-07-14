@@ -1,7 +1,7 @@
 //! Acceptance tests for per-device capability scope on pairing.
 //!
 //! These drive the kernel/handler path end-to-end (real `Kernel`, profiles on
-//! disk, the same `handlers::dispatch_with_device` the IPC router uses) and
+//! disk, with the same authorization snapshot the IPC router uses) and
 //! prove the no-escalation guarantees the feature exists to provide:
 //!
 //! * a `use-only` device cannot mint pair-tokens (cap-gate denial), but the
@@ -377,6 +377,17 @@ async fn scoped_issuer_child_inherits_issuer_denies() {
     let dev = scoped_device('a', &["self:*"], &["self:capsule:install"]);
     let dev_id = dev.key_id.clone();
     seed(&kernel, &caller, &["self:*"], vec![dev]);
+    let authorization =
+        crate::kernel_router::authorize_request(&kernel, &caller, Some(&dev_id), "self:auth:pair")
+            .expect("authorize pair issuance");
+    let mut revoked = load(&kernel, &caller);
+    revoked.auth.public_keys.clear();
+    revoked
+        .save_to_path(&PrincipalProfile::path_for(&kernel.astrid_home, &caller))
+        .expect("revoke issuer device");
+    kernel.profile_cache.invalidate(&caller);
+    crate::kernel_router::authorize_request(&kernel, &caller, Some(&dev_id), "self:auth:pair")
+        .expect_err("a later request must observe the revoked issuer");
 
     // The issuer requests a broad child: allow self:*. The stored child scope
     // must inherit the issuer's deny (self:capsule:install) so the child can
@@ -385,7 +396,7 @@ async fn scoped_issuer_child_inherits_issuer_denies() {
         allow: vec!["self:*".into()],
         deny: vec![],
     });
-    let resp = handlers::dispatch_with_device(&kernel, &caller, Some(&dev_id), req).await;
+    let resp = handlers::dispatch_authorized(&kernel, &authorization, req).await;
     let token = match resp {
         AdminResponseBody::PairToken(t) => t.token,
         other => panic!("issue must succeed (allow self:* ⊆ issuer self:*): {other:?}"),

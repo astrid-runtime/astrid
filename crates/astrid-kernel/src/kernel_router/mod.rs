@@ -19,7 +19,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use astrid_audit::{AuditAction, AuditOutcome, AuthorizationProof};
 use astrid_capabilities::{CapabilityCheck, PermissionError};
+use astrid_core::groups::GroupConfig;
 use astrid_core::principal::PrincipalId;
+use astrid_core::profile::{DeviceScope, PrincipalProfile};
 use astrid_events::ipc::{IpcMessage, IpcPayload, Topic};
 use astrid_events::kernel_api::{KernelRequest, KernelResponse};
 use tracing::{debug, info, warn};
@@ -229,53 +231,55 @@ async fn handle_request(
     let method = kernel_request_method(&req);
     let scope = resolve_scope(&req, &caller);
     let required_cap = required_capability(&req, scope);
-    match authorize_request(kernel, &caller, device_key_id.as_deref(), required_cap) {
-        Ok(()) => {
-            record_admin_audit(
-                kernel,
-                AdminAuditEntry {
-                    caller: &caller,
-                    method,
-                    required_cap,
-                    device_key_id: device_key_id.as_deref(),
-                    target_principal: None,
-                    params: None,
-                    authorization: AuthorizationProof::System {
-                        reason: format!("policy allow: {caller} holds {required_cap}"),
+    let authorization =
+        match authorize_request(kernel, &caller, device_key_id.as_deref(), required_cap) {
+            Ok(authorization) => {
+                record_admin_audit(
+                    kernel,
+                    AdminAuditEntry {
+                        caller: &caller,
+                        method,
+                        required_cap,
+                        device_key_id: device_key_id.as_deref(),
+                        target_principal: None,
+                        params: None,
+                        authorization: AuthorizationProof::System {
+                            reason: format!("policy allow: {caller} holds {required_cap}"),
+                        },
+                        outcome: AuditOutcome::success(),
                     },
-                    outcome: AuditOutcome::success(),
-                },
-            )
-            .await;
-        },
-        Err(e) => {
-            warn!(
-                security_event = true,
-                method = method,
-                principal = %caller,
-                required = required_cap,
-                "Permission check denied admin request"
-            );
-            record_admin_audit(
-                kernel,
-                AdminAuditEntry {
-                    caller: &caller,
-                    method,
-                    required_cap,
-                    device_key_id: device_key_id.as_deref(),
-                    target_principal: None,
-                    params: None,
-                    authorization: AuthorizationProof::Denied {
-                        reason: e.to_string(),
+                )
+                .await;
+                authorization
+            },
+            Err(e) => {
+                warn!(
+                    security_event = true,
+                    method = method,
+                    principal = %caller,
+                    required = required_cap,
+                    "Permission check denied admin request"
+                );
+                record_admin_audit(
+                    kernel,
+                    AdminAuditEntry {
+                        caller: &caller,
+                        method,
+                        required_cap,
+                        device_key_id: device_key_id.as_deref(),
+                        target_principal: None,
+                        params: None,
+                        authorization: AuthorizationProof::Denied {
+                            reason: e.to_string(),
+                        },
+                        outcome: AuditOutcome::failure(e.to_string()),
                     },
-                    outcome: AuditOutcome::failure(e.to_string()),
-                },
-            )
-            .await;
-            publish_response(kernel, response_topic, KernelResponse::Error(e.to_string()));
-            return;
-        },
-    }
+                )
+                .await;
+                publish_response(kernel, response_topic, KernelResponse::Error(e.to_string()));
+                return;
+            },
+        };
 
     // Keepalive pinger: from here until the terminal response is published, emit
     // a `KernelResponse::Working` frame every `KEEPALIVE_INTERVAL` so a waiting
@@ -301,7 +305,7 @@ async fn handle_request(
             KernelResponse::Error("Approval logic not yet implemented in kernel router".to_string())
         },
         KernelRequest::ListCapsules => {
-            let visibility = CapsuleVisibility::new(kernel, &caller, device_key_id.as_deref());
+            let visibility = CapsuleVisibility::new(&authorization);
             let list: Vec<_> = visible_inventory_manifests(kernel, &visibility)
                 .await
                 .into_iter()
@@ -310,7 +314,7 @@ async fn handle_request(
             KernelResponse::Success(serde_json::json!(list))
         },
         KernelRequest::GetCommands => {
-            let visibility = CapsuleVisibility::new(kernel, &caller, device_key_id.as_deref());
+            let visibility = CapsuleVisibility::new(&authorization);
             let mut commands = Vec::new();
             let manifests = visible_inventory_manifests(kernel, &visibility).await;
             for manifest in &manifests {
@@ -435,7 +439,7 @@ async fn handle_request(
             KernelResponse::Status(status)
         },
         KernelRequest::GetCapsuleMetadata => {
-            let visibility = CapsuleVisibility::new(kernel, &caller, device_key_id.as_deref());
+            let visibility = CapsuleVisibility::new(&authorization);
             let mut entries = Vec::new();
             for manifest in visible_inventory_manifests(kernel, &visibility).await {
                 entries.push(astrid_events::kernel_api::CapsuleMetadataEntry {
@@ -451,7 +455,7 @@ async fn handle_request(
             KernelResponse::CapsuleMetadata(entries)
         },
         KernelRequest::GetAgentReadiness => {
-            let visibility = CapsuleVisibility::new(kernel, &caller, device_key_id.as_deref());
+            let visibility = CapsuleVisibility::new(&authorization);
             let manifests = visible_inventory_manifests(kernel, &visibility).await;
             let readiness = astrid_capsule::readiness::agent_loop_readiness(&manifests);
             KernelResponse::AgentReadiness(readiness)
@@ -563,40 +567,15 @@ struct CapsuleVisibility {
 }
 
 impl CapsuleVisibility {
-    fn new(kernel: &crate::Kernel, caller: &PrincipalId, device_key_id: Option<&str>) -> Self {
-        let profile = if caller.as_str() == "anonymous" {
-            None
-        } else {
-            match kernel.profile_cache.resolve(caller) {
-                Ok(profile) => Some(profile),
-                Err(e) => {
-                    warn!(
-                        security_event = true,
-                        principal = %caller,
-                        error = %e,
-                        "Capsule inventory visibility check: profile resolution failed — deny"
-                    );
-                    None
-                },
-            }
-        };
-        let Some(profile) = profile else {
-            return Self::denied(caller);
-        };
-
-        let Ok(device_scope) =
-            resolve_device_scope(profile.as_ref(), caller, device_key_id, "capsule:list")
-        else {
-            return Self::denied(caller);
-        };
-        let groups = kernel.groups.load_full();
-        let mut check = CapabilityCheck::new(profile.as_ref(), groups.as_ref(), caller.clone());
-        if let Some(scope) = &device_scope {
-            check = check.with_device_scope(scope);
+    fn new(authorization: &AuthorizedRequest) -> Self {
+        if authorization.principal.as_str() == "anonymous" {
+            return Self::denied(&authorization.principal);
         }
+        let profile = authorization.profile.as_ref();
+        let check = authorization.capability_check();
 
         Self {
-            principal: caller.clone(),
+            principal: authorization.principal.clone(),
             is_admin: check.has("capsule:list"),
             capsule_grants: profile.capsules.iter().cloned().collect(),
         }
@@ -794,19 +773,42 @@ fn resolve_device_key_id(message: &IpcMessage) -> Option<String> {
     message.device_key_id.clone()
 }
 
-/// Evaluate the capability check for `caller` against the kernel's
-/// resolved group config and the caller's profile.
+/// Authorization inputs pinned at the request's policy decision point.
+#[derive(Debug)]
+struct AuthorizedRequest {
+    principal: PrincipalId,
+    profile: Arc<PrincipalProfile>,
+    groups: Arc<GroupConfig>,
+    device_scope: Option<DeviceScope>,
+}
+
+impl AuthorizedRequest {
+    fn capability_check(&self) -> CapabilityCheck<'_> {
+        let check = CapabilityCheck::new(
+            self.profile.as_ref(),
+            self.groups.as_ref(),
+            self.principal.clone(),
+        );
+        match &self.device_scope {
+            Some(scope) => check.with_device_scope(scope),
+            None => check,
+        }
+    }
+}
+
+/// Evaluate the capability check for `caller` against the kernel's resolved
+/// group config and the caller's profile.
 ///
-/// Returns `Ok(())` on success, or the policy reason on denial. Profile
-/// resolution failures (malformed TOML, IO error) are themselves treated
-/// as deny — fail-closed — with a synthesized `MissingCapability` so the
-/// deny path has a single shape in the audit log.
+/// Returns the pinned authorization snapshot on success, or the policy reason
+/// on denial. Profile resolution failures (malformed TOML, IO error) are
+/// themselves treated as deny — fail-closed — with a synthesized
+/// `MissingCapability` so the deny path has a single shape in the audit log.
 fn authorize_request(
     kernel: &crate::Kernel,
     caller: &PrincipalId,
     device_key_id: Option<&str>,
     required_cap: &str,
-) -> Result<(), PermissionError> {
+) -> Result<AuthorizedRequest, PermissionError> {
     let profile = match kernel.profile_cache.resolve(caller) {
         Ok(p) => p,
         Err(e) => {
@@ -847,7 +849,13 @@ fn authorize_request(
     if let Some(scope) = &device_scope {
         check = check.with_device_scope(scope);
     }
-    check.require(required_cap)
+    check.require(required_cap)?;
+    Ok(AuthorizedRequest {
+        principal: caller.clone(),
+        profile,
+        groups,
+        device_scope,
+    })
 }
 
 /// Bundled inputs for [`record_admin_audit`] — keeps the call site

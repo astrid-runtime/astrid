@@ -29,6 +29,7 @@ use astrid_core::profile::{
 };
 use tracing::{info, warn};
 
+use crate::kernel_router::AuthorizedRequest;
 use crate::pair_token::{self, MAX_EXPIRY_SECS, PairToken, PairTokenStore};
 
 /// Default token lifetime when the issuer doesn't specify. Matches
@@ -36,9 +37,10 @@ use crate::pair_token::{self, MAX_EXPIRY_SECS, PairToken, PairTokenStore};
 /// device to be close at hand.
 const DEFAULT_EXPIRY_SECS: u64 = 5 * 60;
 
-pub(crate) async fn pair_device_issue(
+pub(super) async fn pair_device_issue(
     kernel: &Arc<crate::Kernel>,
     caller: &PrincipalId,
+    authorization: Option<&AuthorizedRequest>,
     issuer_device_key_id: Option<&str>,
     expires_secs: Option<u64>,
     label: Option<String>,
@@ -49,28 +51,34 @@ pub(crate) async fn pair_device_issue(
         Err(error) => return err_bad_input(error),
     };
 
-    // Pair tokens must name an existing principal.
-    let profile_path = kernel.astrid_home.profile_path(caller);
-    if !profile_path.exists() {
-        return err_bad_input(format!(
-            "caller principal {caller} does not exist (no profile.toml)"
-        ));
-    }
-
-    let profile = match kernel.profile_cache.resolve(caller) {
-        Ok(p) => p,
-        Err(e) => return err_internal(format!("issuer profile resolution failed: {e}")),
+    let (profile, groups, issuer_scope) = if let Some(authorization) = authorization {
+        (
+            Arc::clone(&authorization.profile),
+            Arc::clone(&authorization.groups),
+            authorization.device_scope.clone(),
+        )
+    } else {
+        let profile_path = kernel.astrid_home.profile_path(caller);
+        if !profile_path.exists() {
+            return err_bad_input(format!(
+                "caller principal {caller} does not exist (no profile.toml)"
+            ));
+        }
+        let profile = match kernel.profile_cache.resolve(caller) {
+            Ok(profile) => profile,
+            Err(e) => return err_internal(format!("issuer profile resolution failed: {e}")),
+        };
+        let issuer_scope = match crate::kernel_router::resolve_device_scope(
+            profile.as_ref(),
+            caller,
+            issuer_device_key_id,
+            "self:auth:pair",
+        ) {
+            Ok(scope) => scope,
+            Err(e) => return err_unauthorized(e.to_string()),
+        };
+        (profile, kernel.groups.load_full(), issuer_scope)
     };
-    let issuer_scope = match crate::kernel_router::resolve_device_scope(
-        profile.as_ref(),
-        caller,
-        issuer_device_key_id,
-        "self:auth:pair",
-    ) {
-        Ok(scope) => scope,
-        Err(e) => return err_unauthorized(e.to_string()),
-    };
-    let groups = kernel.groups.load_full();
     let mut issuer_check = CapabilityCheck::new(profile.as_ref(), groups.as_ref(), caller.clone());
     // A scoped issuer can grant only its attenuated authority.
     if let Some(scope @ DeviceScope::Scoped { .. }) = &issuer_scope {

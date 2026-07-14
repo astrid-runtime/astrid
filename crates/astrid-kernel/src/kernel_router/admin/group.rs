@@ -13,6 +13,8 @@ use astrid_core::groups::{Group, GroupConfig};
 use astrid_core::principal::PrincipalId;
 use astrid_events::kernel_api::{AdminResponseBody, GroupSummary};
 
+use crate::kernel_router::AuthorizedRequest;
+
 use super::handlers::{err_bad_input, err_internal, success_json};
 
 pub(super) async fn group_create(
@@ -71,14 +73,19 @@ pub(super) async fn group_modify(
 pub(super) fn group_list(
     kernel: &Arc<crate::Kernel>,
     caller: &PrincipalId,
+    authorization: Option<&AuthorizedRequest>,
     device_key_id: Option<&str>,
 ) -> AdminResponseBody {
-    let cfg = kernel.groups.load_full();
-    let visible_groups = if caller_has_global_group_list(kernel, caller, device_key_id) {
-        None
-    } else {
-        Some(caller_group_names(kernel, caller))
-    };
+    let cfg = authorization.map_or_else(
+        || kernel.groups.load_full(),
+        |authorization| Arc::clone(&authorization.groups),
+    );
+    let visible_groups =
+        if caller_has_global_group_list(kernel, caller, authorization, device_key_id) {
+            None
+        } else {
+            Some(caller_group_names(kernel, caller, authorization))
+        };
     let mut summaries: Vec<GroupSummary> = cfg
         .iter()
         .filter(|(name, _)| {
@@ -101,8 +108,12 @@ pub(super) fn group_list(
 fn caller_has_global_group_list(
     kernel: &Arc<crate::Kernel>,
     caller: &PrincipalId,
+    authorization: Option<&AuthorizedRequest>,
     device_key_id: Option<&str>,
 ) -> bool {
+    if let Some(authorization) = authorization {
+        return authorization.capability_check().has("group:list");
+    }
     let Ok(profile) = kernel.profile_cache.resolve(caller) else {
         return false;
     };
@@ -126,7 +137,14 @@ fn caller_has_global_group_list(
     check.has("group:list")
 }
 
-fn caller_group_names(kernel: &Arc<crate::Kernel>, caller: &PrincipalId) -> BTreeSet<String> {
+fn caller_group_names(
+    kernel: &Arc<crate::Kernel>,
+    caller: &PrincipalId,
+    authorization: Option<&AuthorizedRequest>,
+) -> BTreeSet<String> {
+    if let Some(authorization) = authorization {
+        return authorization.profile.groups.iter().cloned().collect();
+    }
     kernel
         .profile_cache
         .resolve(caller)

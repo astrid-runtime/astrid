@@ -36,6 +36,8 @@ use astrid_core::profile::{
 use astrid_events::kernel_api::{AdminRequestKind, AdminResponseBody, AgentSummary};
 use tracing::{info, warn};
 
+use crate::kernel_router::AuthorizedRequest;
+
 /// Platform label used by the identity store for agent principals
 /// created via [`AdminRequestKind::AgentCreate`]. The per-principal
 /// `platform_user_id` equals the `PrincipalId` string.
@@ -52,10 +54,9 @@ pub(super) const AGENT_IDENTITY_PLATFORM: &str = "cli";
 /// token tied to the caller's own principal regardless of any
 /// wire-level hint) need it.
 ///
-/// Thin wrapper over [`dispatch_with_device`] for callers (tests, any
-/// non-device path) that have no authenticating device key id. The
-/// production admin path uses [`dispatch_with_device`] so a paired issuer's
-/// own device scope is threaded into `PairDeviceIssue`'s no-escalation checks.
+/// Thin wrapper over [`dispatch_with_device`] for direct callers and tests that
+/// have no pinned authorization snapshot. The production admin path uses
+/// [`dispatch_authorized`].
 pub(super) async fn dispatch(
     kernel: &Arc<crate::Kernel>,
     caller: &PrincipalId,
@@ -64,11 +65,36 @@ pub(super) async fn dispatch(
     dispatch_with_device(kernel, caller, None, req).await
 }
 
+pub(super) async fn dispatch_authorized(
+    kernel: &Arc<crate::Kernel>,
+    authorization: &AuthorizedRequest,
+    req: AdminRequestKind,
+) -> AdminResponseBody {
+    dispatch_inner(
+        kernel,
+        &authorization.principal,
+        Some(authorization),
+        None,
+        req,
+    )
+    .await
+}
+
 /// Dispatch carrying the caller's authenticating device key id.
 /// Device scope applies to every authority decision made during dispatch.
 pub(super) async fn dispatch_with_device(
     kernel: &Arc<crate::Kernel>,
     caller: &PrincipalId,
+    device_key_id: Option<&str>,
+    req: AdminRequestKind,
+) -> AdminResponseBody {
+    dispatch_inner(kernel, caller, None, device_key_id, req).await
+}
+
+async fn dispatch_inner(
+    kernel: &Arc<crate::Kernel>,
+    caller: &PrincipalId,
+    authorization: Option<&AuthorizedRequest>,
     device_key_id: Option<&str>,
     req: AdminRequestKind,
 ) -> AdminResponseBody {
@@ -81,7 +107,7 @@ pub(super) async fn dispatch_with_device(
         AdminRequestKind::AgentDisable { principal } => {
             agent_set_enabled(kernel, principal, false).await
         },
-        AdminRequestKind::AgentList => agent_list(kernel, caller, device_key_id),
+        AdminRequestKind::AgentList => agent_list(kernel, caller, authorization, device_key_id),
         req @ AdminRequestKind::AgentModify { .. } => agent_modify_from_req(kernel, req).await,
         AdminRequestKind::QuotaSet { principal, quotas } => {
             super::quota::quota_set(kernel, principal, quotas).await
@@ -105,7 +131,9 @@ pub(super) async fn dispatch_with_device(
         } => {
             super::group::group_modify(kernel, name, capabilities, description, unsafe_admin).await
         },
-        AdminRequestKind::GroupList => super::group::group_list(kernel, caller, device_key_id),
+        AdminRequestKind::GroupList => {
+            super::group::group_list(kernel, caller, authorization, device_key_id)
+        },
         AdminRequestKind::CapsGrant {
             principal,
             capabilities,
@@ -150,7 +178,7 @@ pub(super) async fn dispatch_with_device(
         | AdminRequestKind::PairDeviceRedeem { .. }
         | AdminRequestKind::PairDeviceList { .. }
         | AdminRequestKind::PairDeviceRevoke { .. }) => {
-            pair_device_dispatch(kernel, caller, device_key_id, req).await
+            pair_device_dispatch(kernel, caller, authorization, device_key_id, req).await
         },
     }
 }
@@ -161,6 +189,7 @@ pub(super) async fn dispatch_with_device(
 async fn pair_device_dispatch(
     kernel: &Arc<crate::Kernel>,
     caller: &PrincipalId,
+    authorization: Option<&AuthorizedRequest>,
     issuer_device_key_id: Option<&str>,
     req: AdminRequestKind,
 ) -> AdminResponseBody {
@@ -173,6 +202,7 @@ async fn pair_device_dispatch(
             super::pair_device_handlers::pair_device_issue(
                 kernel,
                 caller,
+                authorization,
                 issuer_device_key_id,
                 expires_secs,
                 label,
@@ -649,8 +679,12 @@ where
 fn caller_has_global_agent_list(
     kernel: &Arc<crate::Kernel>,
     caller: &PrincipalId,
+    authorization: Option<&AuthorizedRequest>,
     device_key_id: Option<&str>,
 ) -> bool {
+    if let Some(authorization) = authorization {
+        return authorization.capability_check().has("agent:list");
+    }
     let Ok(profile) = kernel.profile_cache.resolve(caller) else {
         return false;
     };
@@ -677,6 +711,7 @@ fn caller_has_global_agent_list(
 fn agent_list(
     kernel: &Arc<crate::Kernel>,
     caller: &PrincipalId,
+    authorization: Option<&AuthorizedRequest>,
     device_key_id: Option<&str>,
 ) -> AdminResponseBody {
     // Source of truth: `etc/profiles/{principal}.toml`. Iterating the
@@ -742,7 +777,7 @@ fn agent_list(
     // self-scoped form), so in practice only the `admin` group's `*`
     // (which matches both) sees everyone. This realises the gateway's
     // documented "the kernel filters server-side" contract.
-    if !caller_has_global_agent_list(kernel, caller, device_key_id) {
+    if !caller_has_global_agent_list(kernel, caller, authorization, device_key_id) {
         summaries.retain(|s| s.principal == *caller);
     }
 

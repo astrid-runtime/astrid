@@ -546,65 +546,65 @@ async fn handle_admin_request(
         return;
     }
 
-    match authorize_request(kernel, &caller, device_key_id.as_deref(), required_cap) {
-        Ok(()) => {
-            record_admin_audit(
-                kernel,
-                AdminAuditEntry {
-                    caller: &caller,
-                    method,
-                    required_cap,
-                    device_key_id: device_key_id.as_deref(),
-                    target_principal: target.clone(),
-                    params: audit_params.clone(),
-                    authorization: AuthorizationProof::System {
-                        reason: format!("policy allow: {caller} holds {required_cap}"),
+    let authorization =
+        match authorize_request(kernel, &caller, device_key_id.as_deref(), required_cap) {
+            Ok(authorization) => {
+                record_admin_audit(
+                    kernel,
+                    AdminAuditEntry {
+                        caller: &caller,
+                        method,
+                        required_cap,
+                        device_key_id: device_key_id.as_deref(),
+                        target_principal: target.clone(),
+                        params: audit_params.clone(),
+                        authorization: AuthorizationProof::System {
+                            reason: format!("policy allow: {caller} holds {required_cap}"),
+                        },
+                        outcome: AuditOutcome::success(),
                     },
-                    outcome: AuditOutcome::success(),
-                },
-            )
-            .await;
-        },
-        Err(e) => {
-            warn!(
-                security_event = true,
-                method = method,
-                principal = %caller,
-                required = required_cap,
-                error = %e,
-                "Permission check denied admin request"
-            );
-            record_admin_audit(
-                kernel,
-                AdminAuditEntry {
-                    caller: &caller,
-                    method,
-                    required_cap,
-                    device_key_id: device_key_id.as_deref(),
-                    target_principal: target,
-                    params: audit_params,
-                    authorization: AuthorizationProof::Denied {
-                        reason: e.to_string(),
+                )
+                .await;
+                authorization
+            },
+            Err(e) => {
+                warn!(
+                    security_event = true,
+                    method = method,
+                    principal = %caller,
+                    required = required_cap,
+                    error = %e,
+                    "Permission check denied admin request"
+                );
+                record_admin_audit(
+                    kernel,
+                    AdminAuditEntry {
+                        caller: &caller,
+                        method,
+                        required_cap,
+                        device_key_id: device_key_id.as_deref(),
+                        target_principal: target,
+                        params: audit_params,
+                        authorization: AuthorizationProof::Denied {
+                            reason: e.to_string(),
+                        },
+                        outcome: AuditOutcome::failure(e.to_string()),
                     },
-                    outcome: AuditOutcome::failure(e.to_string()),
-                },
-            )
-            .await;
-            publish_response(
-                kernel,
-                response_topic,
-                AdminKernelResponse::for_request(
-                    request_id,
-                    AdminResponseBody::Error(e.to_string()),
-                ),
-            );
-            return;
-        },
-    }
+                )
+                .await;
+                publish_response(
+                    kernel,
+                    response_topic,
+                    AdminKernelResponse::for_request(
+                        request_id,
+                        AdminResponseBody::Error(e.to_string()),
+                    ),
+                );
+                return;
+            },
+        };
 
-    // Secondary views and pair delegation use the authenticated device scope.
-    let body =
-        handlers::dispatch_with_device(kernel, &caller, device_key_id.as_deref(), req.kind).await;
+    let body = handlers::dispatch_authorized(kernel, &authorization, req.kind).await;
     publish_response(
         kernel,
         response_topic,

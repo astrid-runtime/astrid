@@ -1093,4 +1093,33 @@ async fn agent_list_global_view_is_attenuated_by_device_scope() {
     );
     assert_eq!(scoped.len(), 1);
     assert_eq!(scoped[0].principal, PrincipalId::default());
+
+    let authorization = crate::kernel_router::authorize_request(
+        &kernel,
+        &PrincipalId::default(),
+        Some(&global_list_id),
+        "self:agent:list",
+    )
+    .expect("authorize agent inventory");
+    profile.auth.public_keys.clear();
+    profile
+        .save_to_path(&PrincipalProfile::path_for(
+            &kernel.astrid_home,
+            &PrincipalId::default(),
+        ))
+        .expect("revoke inventory device");
+    kernel.profile_cache.invalidate(&PrincipalId::default());
+    crate::kernel_router::authorize_request(
+        &kernel,
+        &PrincipalId::default(),
+        Some(&global_list_id),
+        "self:agent:list",
+    )
+    .expect_err("a later request must observe the revoked device");
+
+    let pinned = list_for(
+        handlers::dispatch_authorized(&kernel, &authorization, AdminRequestKind::AgentList).await,
+    );
+    assert!(pinned.iter().any(|entry| entry.principal == pid("alice")));
+    assert!(pinned.iter().any(|entry| entry.principal == pid("bob")));
 }

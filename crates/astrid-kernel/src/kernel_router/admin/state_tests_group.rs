@@ -152,4 +152,29 @@ async fn group_list_global_view_is_attenuated_by_device_scope() {
         .await,
     );
     assert_eq!(scoped, vec![BUILTIN_ADMIN]);
+
+    let authorization = crate::kernel_router::authorize_request(
+        &kernel,
+        &PrincipalId::default(),
+        Some(&global_list_id),
+        "self:group:list",
+    )
+    .expect("authorize group inventory");
+    profile.auth.public_keys.clear();
+    profile
+        .save_to_path(&profile_path)
+        .expect("revoke group inventory device");
+    kernel.profile_cache.invalidate(&PrincipalId::default());
+    crate::kernel_router::authorize_request(
+        &kernel,
+        &PrincipalId::default(),
+        Some(&global_list_id),
+        "self:group:list",
+    )
+    .expect_err("a later request must observe the revoked device");
+
+    let pinned = names_for(
+        handlers::dispatch_authorized(&kernel, &authorization, AdminRequestKind::GroupList).await,
+    );
+    assert!(pinned.iter().any(|name| name == "ops"));
 }

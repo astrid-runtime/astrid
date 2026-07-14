@@ -658,9 +658,16 @@ async fn capsule_visibility_precomputes_admin_and_capsule_grants() {
 
     let allowed = CapsuleId::new("allowed").expect("valid capsule id");
     let default_only = CapsuleId::new("default-only").expect("valid capsule id");
-    let admin_visibility = CapsuleVisibility::new(&kernel, &admin, None);
-    let global_lister_visibility = CapsuleVisibility::new(&kernel, &global_lister, None);
-    let limited_visibility = CapsuleVisibility::new(&kernel, &limited, None);
+    let admin_authorization =
+        authorize_request(&kernel, &admin, None, "self:capsule:list").expect("authorize admin");
+    let global_lister_authorization =
+        authorize_request(&kernel, &global_lister, None, "self:capsule:list")
+            .expect("authorize global lister");
+    let limited_authorization =
+        authorize_request(&kernel, &limited, None, "self:capsule:list").expect("authorize limited");
+    let admin_visibility = CapsuleVisibility::new(&admin_authorization);
+    let global_lister_visibility = CapsuleVisibility::new(&global_lister_authorization);
+    let limited_visibility = CapsuleVisibility::new(&limited_authorization);
 
     assert!(admin_visibility.allows(&allowed));
     assert!(admin_visibility.allows(&default_only));
@@ -738,12 +745,6 @@ async fn device_scope_attenuates_every_capsule_inventory_surface() {
     )
     .await;
 
-    let allowed = CapsuleId::new("allowed").expect("valid capsule id");
-    let unknown = CapsuleVisibility::new(&kernel, &caller, Some("0000000000000000"));
-    let malformed = CapsuleVisibility::new(&kernel, &caller, Some("not-a-key-id"));
-    assert!(!unknown.allows(&allowed));
-    assert!(!malformed.allows(&allowed));
-
     let response = request_kernel_for_device(
         &kernel,
         &caller,
@@ -753,6 +754,39 @@ async fn device_scope_attenuates_every_capsule_inventory_surface() {
     )
     .await;
     assert!(matches!(response, KernelResponse::Error(_)));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn capsule_visibility_uses_the_authorized_device_scope_snapshot() {
+    let (_dir, kernel) = kernel_with_inventory_capsules().await;
+    let caller = PrincipalId::new("device-snapshot-admin").expect("valid principal");
+    let devices = seed_inventory_device_scopes(&kernel, &caller);
+    let authorization = authorize_request(
+        &kernel,
+        &caller,
+        Some(&devices.global_list),
+        "self:capsule:list",
+    )
+    .expect("authorize inventory request");
+
+    let allowed = CapsuleId::new("default-only").expect("valid capsule id");
+    assert!(CapsuleVisibility::new(&authorization).allows(&allowed));
+
+    let mut revoked = authorization.profile.as_ref().clone();
+    revoked.auth.public_keys.clear();
+    seed_profile(&kernel, &caller, &revoked);
+    authorize_request(
+        &kernel,
+        &caller,
+        Some(&devices.global_list),
+        "self:capsule:list",
+    )
+    .expect_err("a later request must observe the revoked device");
+
+    assert!(
+        CapsuleVisibility::new(&authorization).allows(&allowed),
+        "the in-flight request must keep the authority snapshot already audited as allowed"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -773,14 +807,30 @@ async fn device_scope_denials_do_not_expose_key_resolution() {
     let malformed = authorize_request(&kernel, &caller, Some("not-a-key-id"), required)
         .expect_err("malformed device id must be denied")
         .to_string();
-    // Revoked devices are removed from the profile and therefore share the
-    // same resolution path as a never-registered id.
-    let unresolved = authorize_request(&kernel, &caller, Some("0000000000000000"), required)
-        .expect_err("unresolved device id must be denied")
+    let unknown = authorize_request(&kernel, &caller, Some("0000000000000000"), required)
+        .expect_err("unknown device id must be denied")
         .to_string();
 
+    let mut revoked_profile = kernel
+        .profile_cache
+        .resolve(&caller)
+        .expect("resolve device profile")
+        .as_ref()
+        .clone();
+    revoked_profile.auth.public_keys.clear();
+    seed_profile(&kernel, &caller, &revoked_profile);
+    let revoked = authorize_request(
+        &kernel,
+        &caller,
+        Some(&devices.denied_global_list),
+        required,
+    )
+    .expect_err("revoked device id must be denied")
+    .to_string();
+
     assert_eq!(malformed, scoped);
-    assert_eq!(unresolved, scoped);
+    assert_eq!(unknown, scoped);
+    assert_eq!(revoked, scoped);
 }
 
 struct InventoryDeviceScopes {
