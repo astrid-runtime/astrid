@@ -241,7 +241,12 @@ fn resolve_distro_url(source: &str) -> anyhow::Result<String> {
     if source.starts_with("http://") || source.starts_with("https://") {
         Ok(source.to_string())
     } else if let Some(repo_path) = source.strip_prefix('@') {
-        if repo_path.is_empty() || !repo_path.contains('/') {
+        let mut segments = repo_path.split('/');
+        let valid = matches!(
+            (segments.next(), segments.next(), segments.next()),
+            (Some(owner), Some(repo), None) if !owner.is_empty() && !repo.is_empty()
+        );
+        if !valid {
             bail!(
                 "distro source '{source}' must use @owner/repo, a URL, a local Distro.toml path, or a .shuttle archive"
             );

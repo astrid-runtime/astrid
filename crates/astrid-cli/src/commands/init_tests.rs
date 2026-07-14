@@ -58,9 +58,16 @@ fn resolve_template_handles_missing_var() {
 
 #[test]
 fn distro_source_resolution_rejects_bare_names_without_a_network_default() {
-    let error = resolve_distro_url("astralis").expect_err("bare name has no provenance");
+    let error = resolve_distro_url("example-distro").expect_err("bare name has no provenance");
     assert!(error.to_string().contains("@owner/repo"));
     assert!(error.to_string().contains("local Distro.toml path"));
+}
+
+#[test]
+fn distro_source_resolution_rejects_non_repository_at_paths() {
+    for source in ["@", "@owner", "@/repo", "@owner/", "@owner/repo/extra"] {
+        assert!(resolve_distro_url(source).is_err(), "must reject {source}");
+    }
 }
 
 #[test]

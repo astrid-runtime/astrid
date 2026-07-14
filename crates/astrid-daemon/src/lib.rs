@@ -239,7 +239,7 @@ pub async fn run() -> Result<()> {
             );
             anyhow::bail!(
                 "CLI proxy capsule (astrid-capsule-cli) not found. \
-                 Install a compatible CLI proxy capsule, then restart the daemon."
+                 Install a compatible `astrid-capsule-cli` capsule, then restart the daemon."
             );
         }
     }
