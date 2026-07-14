@@ -527,8 +527,9 @@ fn confirm(prompt: &str, assume_yes: bool) -> anyhow::Result<bool> {
 
 /// Run the self-update command — flag → stage → finish:
 /// check the latest release, (for self-managed installs) verify + atomically
-/// swap the binary in place with rollback, restart the daemon, then sync distro
-/// and capsules. Homebrew installs are deferred to `brew upgrade`.
+/// swap the binary in place with rollback, restart the daemon, then update
+/// capsules. Distro refresh requires explicit recorded source provenance and is
+/// deliberately skipped by this path. Homebrew installs are deferred to `brew upgrade`.
 pub(crate) async fn run_self_update(args: UpdateArgs) -> anyhow::Result<()> {
     let target = platform_target()?;
     let (owner, repo) = resolve_repo(args.source.as_deref())?;
@@ -680,7 +681,7 @@ async fn download_verify_extract(
 }
 
 /// After the binary swap: restart a running daemon so the new code takes effect,
-/// sync distro + capsules, and warn if the install dir isn't on PATH.
+/// update capsules, and warn if the install dir isn't on PATH.
 async fn finish_update(install_dir: &Path) -> anyhow::Result<()> {
     if crate::socket_client::proxy_socket_path().exists() {
         println!(
@@ -711,11 +712,12 @@ async fn finish_update(install_dir: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Re-fetch the distro manifest and sync capsules.
+/// Update capsules after a binary update without inventing distro provenance.
 ///
-/// Compares the remote Distro.toml against the local Distro.lock. If the distro
-/// version changed, re-runs init to install new/updated capsules. Then runs
-/// `capsule update` for any capsules with newer GitHub releases.
+/// A lock records only a distro identity, not its source. Re-fetching from that
+/// identity would silently choose a product source, so distro refresh is skipped
+/// until the operator supplies an explicit source to `astrid init --distro`.
+/// Capsule update remains independent and checks installed capsules for releases.
 async fn sync_distro_and_capsules() -> anyhow::Result<()> {
     println!();
     println!("{}", Theme::info("Checking distro and capsule updates..."));
