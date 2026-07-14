@@ -169,6 +169,12 @@ impl<T> ExactCapabilityId<T> {
 pub struct CapabilityEntryDigest<T = [u8; 32]>(T);
 
 impl<T> CapabilityEntryDigest<T> {
+    /// Borrow the wrapped digest storage.
+    #[must_use]
+    pub const fn as_inner(&self) -> &T {
+        &self.0
+    }
+
     /// Consume the wrapper and return its storage.
     #[must_use]
     pub fn into_inner(self) -> T {
@@ -219,6 +225,12 @@ impl CapabilityEntryDigest {
 pub struct CapabilityRegistryDigest<T = [u8; 32]>(T);
 
 impl<T> CapabilityRegistryDigest<T> {
+    /// Borrow the wrapped digest storage.
+    #[must_use]
+    pub const fn as_inner(&self) -> &T {
+        &self.0
+    }
+
     /// Consume the wrapper and return its storage.
     #[must_use]
     pub fn into_inner(self) -> T {
@@ -269,6 +281,12 @@ impl CapabilityRegistryDigest {
 pub struct ExtensionPackageDigest<T = [u8; 32]>(T);
 
 impl<T> ExtensionPackageDigest<T> {
+    /// Borrow the wrapped digest storage.
+    #[must_use]
+    pub const fn as_inner(&self) -> &T {
+        &self.0
+    }
+
     /// Consume the wrapper and return its storage.
     #[must_use]
     pub fn into_inner(self) -> T {
@@ -349,6 +367,7 @@ impl<I, D> CapabilityRef<I, D> {
 
 /// Canonical authorization target families understood by the host.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[non_exhaustive]
 pub enum AuthorityTargetKind {
     /// The local Astrid system.
     System,
@@ -388,6 +407,7 @@ impl AuthorityTargetKind {
 
 /// Provenance of a registered capability definition.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum CapabilitySource {
     /// A capability defined by the Astrid host.
     Kernel,
@@ -631,6 +651,7 @@ impl CapabilityRegistryManifest {
 
 /// Validation failures for content-addressed authority registry data.
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum AuthorityRegistryError {
     /// A capability ID failed the existing static capability grammar.
     #[error("invalid capability id {id:?}: {source}")]
