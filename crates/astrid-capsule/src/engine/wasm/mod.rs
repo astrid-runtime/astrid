@@ -2197,6 +2197,17 @@ impl ExecutionEngine for WasmEngine {
                 );
             }
 
+            // Install the run loop's per-principal resource context ONCE, here,
+            // before the `run` task is spawned below. A run loop drives `run`
+            // directly and never goes through `invoke_interceptor`, so without
+            // this its env overlay / secrets / `home://` / KV all sit at the
+            // neutral deny-all floor (#1197 / #1224). The store lock is released
+            // at the end of this block, before the run task locks it below.
+            if has_run {
+                let mut s = store_arc.as_ref().expect("run-loop has store").lock().await;
+                s.data_mut().install_run_loop_owner_context(&ctx.principal).await;
+            }
+
             Ok::<_, CapsuleError>((
                 pool_opt,
                 store_arc,

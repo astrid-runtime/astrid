@@ -82,6 +82,43 @@ impl HostState {
         }
     }
 
+    /// Install the OWNER's per-principal resource context for a run-loop
+    /// (`#[astrid::run]`) capsule, ONCE, before its `run` export is entered.
+    ///
+    /// A run loop drives `run` directly and never goes through
+    /// [`invoke_interceptor`](crate::engine::wasm::WasmEngine::invoke_interceptor),
+    /// so the per-invocation overlays that path installs are otherwise never
+    /// applied here: without this, the run loop's env overlay, secret store,
+    /// `home://`, and KV all sit at the neutral deny-all floor — its background
+    /// writes misroute to the neutral store (invisible to the owner's tools and
+    /// lost on reload) and its `env::var` / secrets / `home://` reads deny.
+    /// (#1197 — the KV symptom; #1224 — the full per-principal-resource gap.)
+    ///
+    /// `owner` is the load owner (`ctx.principal`; `PrincipalId::default()` for a
+    /// shared run-loop capsule) — the loop gets ONLY the owner's config, exactly
+    /// what a bus invocation from the owner would install, never another
+    /// principal's data. `caller_context` is deliberately left untouched so an
+    /// inbound `ipc::recv` can still install a per-publisher context and
+    /// [`effective_principal`](Self::effective_principal) keeps resolving the
+    /// owner for the loop's own autonomous work. Fail-closed is preserved:
+    /// [`install_principal_overlays`](crate::engine::wasm::install_principal_overlays)
+    /// clears every overlay to the neutral floor when the owner has no home or
+    /// KV construction fails — identical to today, no regression.
+    pub(crate) async fn install_run_loop_owner_context(
+        &mut self,
+        owner: &astrid_core::PrincipalId,
+    ) {
+        self.invocation_env_overlay =
+            crate::engine::wasm::load_invocation_env_overlay(owner, self.capsule_id.as_str());
+        crate::engine::wasm::install_principal_overlays(self, Some(owner)).await;
+        tracing::debug!(
+            principal = %owner,
+            env_overlay = self.invocation_env_overlay.is_some(),
+            home = self.invocation_home.is_some(),
+            "Installed run-loop owner resource context"
+        );
+    }
+
     /// Install per-invocation context from an inbound IPC message picked
     /// up via [`ipc::Host::ipc_recv`](crate::engine::wasm::host::ipc) /
     /// [`ipc::Host::ipc_poll`].
