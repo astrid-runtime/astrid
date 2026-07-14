@@ -47,12 +47,22 @@ fn all_admin_variants() -> Vec<AdminRequestKind> {
         AdminRequestKind::AgentDisable {
             principal: pid("a"),
         },
+        AdminRequestKind::AgentModify {
+            principal: pid("a"),
+            add_groups: Vec::new(),
+            remove_groups: Vec::new(),
+            add_capsules: Vec::new(),
+            remove_capsules: Vec::new(),
+        },
         AdminRequestKind::AgentList,
         AdminRequestKind::QuotaSet {
             principal: pid("a"),
             quotas: astrid_core::profile::Quotas::default(),
         },
         AdminRequestKind::QuotaGet {
+            principal: pid("a"),
+        },
+        AdminRequestKind::UsageGet {
             principal: pid("a"),
         },
         AdminRequestKind::GroupCreate {
@@ -89,6 +99,35 @@ fn all_admin_variants() -> Vec<AdminRequestKind> {
         },
         AdminRequestKind::CapsTokenList {
             principal: pid("a"),
+        },
+        AdminRequestKind::InviteIssue {
+            group: "agent".into(),
+            expires_secs: None,
+            max_uses: 1,
+            metadata: None,
+        },
+        AdminRequestKind::InviteRedeem {
+            token: "x".into(),
+            public_key: String::new(),
+            display_name: None,
+        },
+        AdminRequestKind::InviteList,
+        AdminRequestKind::InviteRevoke { token: "x".into() },
+        AdminRequestKind::PairDeviceIssue {
+            expires_secs: None,
+            label: None,
+            scope: astrid_core::kernel_api::PairScopeArg::Full,
+        },
+        AdminRequestKind::PairDeviceRedeem {
+            token: "x".into(),
+            public_key: String::new(),
+        },
+        AdminRequestKind::PairDeviceList {
+            principal: pid("a"),
+        },
+        AdminRequestKind::PairDeviceRevoke {
+            principal: pid("a"),
+            key_id: "k".into(),
         },
     ]
 }

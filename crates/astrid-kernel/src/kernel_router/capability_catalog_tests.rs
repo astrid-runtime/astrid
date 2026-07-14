@@ -1,16 +1,10 @@
-//! Drift checks for `astrid_core::capability_grammar::CAPABILITY_CATALOG`.
-//!
-//! The structured catalog is what the HTTP gateway returns from
-//! `/api/sys/capabilities`. If a new capability lands in
-//! `required_capability` or `required_capability_for_admin_request`
-//! without being added to the catalog, the gateway silently omits
-//! it from discovery — breaking dashboards that build cap-grant UI
-//! from the list. These tests enumerate every string returned by
-//! both match tables (across both [`AuthorityScope`] variants) and
-//! assert each appears in the catalog.
+//! Drift checks for enforcement capability mappings and registry definitions.
 
 use astrid_core::PrincipalId;
 use astrid_core::capability_grammar::known_capabilities;
+use astrid_core::capability_registry::{
+    MIGRATION_BASELINE_CAPABILITY_IDS, migration_baseline_registry,
+};
 use astrid_core::kernel_api::{AdminRequestKind, KernelRequest};
 use astrid_core::profile::Quotas;
 use std::collections::BTreeSet;
@@ -35,6 +29,12 @@ fn all_kernel_request_variants() -> Vec<KernelRequest> {
         KernelRequest::UnloadCapsule {
             id: "x".to_string(),
         },
+        KernelRequest::PromoteWorkspace {
+            id: "x".to_string(),
+        },
+        KernelRequest::RollbackWorkspace {
+            id: "x".to_string(),
+        },
         KernelRequest::InstallCapsule {
             source: "x".to_string(),
             workspace: false,
@@ -42,6 +42,7 @@ fn all_kernel_request_variants() -> Vec<KernelRequest> {
         KernelRequest::ListCapsules,
         KernelRequest::GetCommands,
         KernelRequest::GetCapsuleMetadata,
+        KernelRequest::GetAgentReadiness,
         KernelRequest::ApproveCapability {
             request_id: "r".to_string(),
             signature: "s".to_string(),
@@ -50,16 +51,20 @@ fn all_kernel_request_variants() -> Vec<KernelRequest> {
 }
 
 #[test]
-fn known_capabilities_covers_every_kernel_request_cap() {
+fn migration_registry_covers_every_kernel_request_cap() {
+    let registry = migration_baseline_registry().unwrap();
+    let registered = registry
+        .entries()
+        .iter()
+        .map(|entry| entry.id().as_str())
+        .collect::<BTreeSet<_>>();
     let scopes = [AuthorityScope::Self_, AuthorityScope::Global];
     for req in all_kernel_request_variants() {
         for scope in scopes {
             let cap = required_capability(&req, scope);
             assert!(
-                known_capabilities().any(|c| c == cap),
-                "kernel returns capability {cap:?} not in \
-                 astrid_core::capability_grammar::CAPABILITY_CATALOG — \
-                 update the catalog when adding a capability"
+                registered.contains(cap),
+                "kernel returns capability {cap:?} without a migration-baseline registry entry"
             );
         }
     }
@@ -98,6 +103,9 @@ fn all_admin_request_variants() -> Vec<AdminRequestKind> {
             quotas: Quotas::default(),
         },
         AdminRequestKind::QuotaGet {
+            principal: p.clone(),
+        },
+        AdminRequestKind::UsageGet {
             principal: p.clone(),
         },
         AdminRequestKind::GroupCreate {
@@ -168,19 +176,110 @@ fn all_admin_request_variants() -> Vec<AdminRequestKind> {
 }
 
 #[test]
-fn known_capabilities_covers_every_admin_request_cap() {
+fn migration_registry_covers_every_admin_request_cap() {
+    let registry = migration_baseline_registry().unwrap();
+    let registered = registry
+        .entries()
+        .iter()
+        .map(|entry| entry.id().as_str())
+        .collect::<BTreeSet<_>>();
     let scopes = [AuthorityScope::Self_, AuthorityScope::Global];
     for req in &all_admin_request_variants() {
         for scope in scopes {
             let cap = required_capability_for_admin_request(req, scope);
             assert!(
-                known_capabilities().any(|c| c == cap),
-                "admin op returns capability {cap:?} not in \
-                 astrid_core::capability_grammar::CAPABILITY_CATALOG — \
-                 update the catalog when adding a capability"
+                registered.contains(cap),
+                "admin op returns capability {cap:?} without a migration-baseline registry entry"
             );
         }
     }
+}
+
+#[test]
+fn migration_baseline_classifies_every_current_enforcement_role() {
+    let primary = BTreeSet::from([
+        "system:shutdown",
+        "system:status",
+        "capsule:install",
+        "self:capsule:install",
+        "capsule:reload",
+        "self:capsule:reload",
+        "self:capsule:remove",
+        "self:workspace:promote",
+        "self:workspace:rollback",
+        "self:capsule:list",
+        "agent:create",
+        "agent:create:inherit",
+        "agent:create:clone",
+        "agent:delete",
+        "agent:enable",
+        "agent:disable",
+        "agent:modify",
+        "self:agent:list",
+        "quota:set",
+        "self:quota:set",
+        "quota:get",
+        "self:quota:get",
+        "group:create",
+        "group:delete",
+        "group:modify",
+        "self:group:list",
+        "caps:grant",
+        "caps:revoke",
+        "caps:token:mint",
+        "caps:token:revoke",
+        "caps:token:list",
+        "invite:issue",
+        "invite:list",
+        "invite:revoke",
+        "self:approval:respond",
+        "self:auth:pair",
+        "auth:pair",
+    ]);
+    let secondary = BTreeSet::from([
+        "capsule:list",
+        "agent:list",
+        "group:list",
+        "audit:read_all",
+        "self:auth:pair:admin",
+        "system:resources:unbounded",
+        "net_bind",
+        "uplink",
+    ]);
+    let token_authenticated = BTreeSet::from(["invite:redeem", "auth:pair:redeem"]);
+    let dormant = BTreeSet::from([
+        "capsule:access:any",
+        "authority:profile:manage",
+        "authority:repair",
+    ]);
+    let mapping_only = BTreeSet::from(["capsule:remove"]);
+
+    let classes = [
+        &primary,
+        &secondary,
+        &token_authenticated,
+        &dormant,
+        &mapping_only,
+    ];
+    for (index, class) in classes.iter().enumerate() {
+        for other in classes.iter().skip(index + 1) {
+            assert!(
+                class.is_disjoint(other),
+                "baseline enforcement classes overlap: {:?}",
+                class.intersection(other).collect::<Vec<_>>()
+            );
+        }
+    }
+
+    let classified = classes
+        .into_iter()
+        .flat_map(|class| class.iter().copied())
+        .collect::<BTreeSet<_>>();
+    let baseline = MIGRATION_BASELINE_CAPABILITY_IDS
+        .iter()
+        .copied()
+        .collect::<BTreeSet<_>>();
+    assert_eq!(classified, baseline);
 }
 
 #[test]
