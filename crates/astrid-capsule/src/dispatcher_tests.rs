@@ -406,7 +406,7 @@ async fn find_matching_interceptors_sorts_by_priority() {
     let registry = Arc::new(RwLock::new(registry));
     let bus = EventBus::with_capacity(64);
 
-    let matches = find_matching_interceptors(&registry, "test.event", None, None, &bus).await;
+    let matches = find_matching_interceptors(&registry, "test.event", None, None, None, &bus).await;
     let names: Vec<&str> = matches.iter().map(|(c, _, _)| c.id().as_str()).collect();
     assert_eq!(
         names,
@@ -435,7 +435,7 @@ async fn find_matching_interceptors_tiebreaks_equal_priority_by_id() {
     let registry = Arc::new(RwLock::new(registry));
     let bus = EventBus::with_capacity(64);
 
-    let matches = find_matching_interceptors(&registry, "test.event", None, None, &bus).await;
+    let matches = find_matching_interceptors(&registry, "test.event", None, None, None, &bus).await;
     let names: Vec<&str> = matches.iter().map(|(c, _, _)| c.id().as_str()).collect();
     assert_eq!(
         names,
