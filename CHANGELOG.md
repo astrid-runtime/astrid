@@ -19,6 +19,12 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
 
 ### Changed
 
+- **Device key IDs now use BLAKE3.** The short per-device handle is derived from
+  the first eight bytes of `BLAKE3(pubkey_hex_bytes)`. Profile loading already
+  treats the stored `key_id` as informational and re-derives it from the public
+  key, so existing local profiles self-heal; device-scoped bearer sessions must
+  authenticate again after upgrading.
+
 - **Runtime E2E now stages the pinned Unicity AOS monorepo.** The workflow
   preserves the AOS Cargo workspace outside the core checkout and supplies
   compatibility directory aliases for the existing runtime harness, replacing

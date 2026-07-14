@@ -106,7 +106,7 @@ pub struct DeviceKey {
 }
 
 /// Length, in hex characters, of a [`DeviceKey::key_id`] fingerprint
-/// (8 bytes of SHA-256 → 16 hex chars). Collision-resistant enough for the
+/// (8 bytes of BLAKE3 -> 16 hex chars). Collision-resistant enough for the
 /// per-principal device set while staying short enough to paste.
 pub const DEVICE_KEY_ID_HEX_LEN: usize = 16;
 
@@ -372,7 +372,7 @@ impl<'de> Deserialize<'de> for DevicePubkey<String> {
 
 /// Derive a deterministic, non-secret fingerprint for a device key from its
 /// canonical lowercase-hex pubkey: the first [`DEVICE_KEY_ID_HEX_LEN`] hex
-/// chars of `SHA-256(pubkey_hex_bytes)`.
+/// chars of `BLAKE3(pubkey_hex_bytes)`.
 ///
 /// The fingerprint is **not** a secret — it is derived purely from the
 /// already-public ed25519 public key, so surfacing it in listings, audit
@@ -385,14 +385,8 @@ pub fn device_key_id_fingerprint(pubkey_hex: &str) -> String {
 }
 
 fn device_key_id_for_pubkey_hex(pubkey_hex: &str) -> DeviceKeyId<String> {
-    use sha2::{Digest, Sha256};
-    let mut hasher = Sha256::new();
-    hasher.update(pubkey_hex.as_bytes());
-    let mut digest = hex::encode(hasher.finalize());
-    // SHA-256 hex is always longer than the short device-key id; truncate
-    // defensively so a future hash swap still cannot panic.
-    digest.truncate(DEVICE_KEY_ID_HEX_LEN.min(digest.len()));
-    DeviceKeyId(digest)
+    let digest = blake3::hash(pubkey_hex.as_bytes());
+    DeviceKeyId(hex::encode(&digest.as_bytes()[..DEVICE_KEY_ID_HEX_LEN / 2]))
 }
 
 /// Normalise a candidate ed25519 public key string to canonical lowercase hex
@@ -621,11 +615,12 @@ mod tests {
     }
 
     #[test]
-    fn device_key_id_is_deterministic_and_short() {
+    fn device_key_id_is_deterministic_blake3_and_short() {
         let hex = "a".repeat(64);
         let a = device_key_id_fingerprint(&hex);
         let b = device_key_id_fingerprint(&hex);
         assert_eq!(a, b, "fingerprint must be deterministic");
+        assert_eq!(a, "472c51290d607f10");
         assert_eq!(a.len(), DEVICE_KEY_ID_HEX_LEN);
         assert_ne!(a, device_key_id_fingerprint(&"b".repeat(64)));
     }
@@ -752,22 +747,14 @@ mod tests {
     }
 
     #[test]
-    fn device_key_full_struct_rederives_key_id_ignoring_on_disk_value() {
-        // A hand-edited / stale `key_id` that does NOT match the pubkey is
-        // ignored: `key_id` is always re-derived as the deterministic
-        // fingerprint of the pubkey, so the handshake-returned id can never
-        // diverge from the gate/revocation fingerprint.
+    fn device_key_full_struct_self_heals_legacy_sha256_key_id() {
         let hex = "a".repeat(64);
         let json = format!(
-            r#"{{"key_id":"deadbeefdeadbeef","pubkey":"{hex}","scope":{{"type":"full"}}}}"#
+            r#"{{"key_id":"ffe054fe7ae0cb6d","pubkey":"{hex}","scope":{{"type":"full"}}}}"#
         );
         let key: DeviceKey = serde_json::from_str(&json).unwrap();
-        assert_eq!(
-            key.key_id,
-            device_key_id_fingerprint(&hex),
-            "key_id must be re-derived from the pubkey, not taken from disk"
-        );
-        assert_ne!(key.key_id, "deadbeefdeadbeef");
+        assert_eq!(key.key_id, "472c51290d607f10");
+        assert_eq!(key.key_id, device_key_id_fingerprint(&hex));
     }
 
     #[test]
