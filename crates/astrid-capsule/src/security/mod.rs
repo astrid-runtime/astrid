@@ -151,6 +151,32 @@ pub trait CapsuleSecurityGate: Send + Sync {
         ))
     }
 
+    /// Check whether the capsule is allowed to bind an INBOUND TCP listener
+    /// on `host:port` (capsule-hosted server).
+    ///
+    /// Default denies (fail-closed). The manifest gate overrides this to match
+    /// `host:port` against the capsule's `net_bind` allowlist (whose field
+    /// documents "Unix/TCP socket bind addresses"). A `unix:*` entry never
+    /// matches a TCP `host:port`, so the unix-listener path
+    /// ([`check_net_bind`](Self::check_net_bind)) and this TCP path share the
+    /// `net_bind` field without cross-authorizing.
+    ///
+    /// SECURITY: this gate only enforces the manifest allowlist. The host fn
+    /// (`bind-tcp`) additionally confines the bind to loopback — the same
+    /// gate-then-airlock split `connect-tcp` uses (`check_net_connect` then
+    /// `is_safe_ip`). Exposing a capsule-hosted server beyond loopback is a
+    /// deliberate future opt-in, not reachable through this method today.
+    async fn check_net_tcp_bind(
+        &self,
+        capsule_id: &str,
+        _host: &str,
+        _port: u16,
+    ) -> Result<(), String> {
+        Err(format!(
+            "capsule '{capsule_id}' denied: net_tcp_bind not permitted (default)"
+        ))
+    }
+
     /// Check whether the capsule is allowed to register a uplink.
     ///
     /// Default implementation permits all registrations. Override to enforce

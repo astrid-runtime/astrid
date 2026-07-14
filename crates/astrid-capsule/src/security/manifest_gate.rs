@@ -312,6 +312,33 @@ impl CapsuleSecurityGate for ManifestSecurityGate {
         }
     }
 
+    async fn check_net_tcp_bind(
+        &self,
+        capsule_id: &str,
+        host: &str,
+        port: u16,
+    ) -> Result<(), String> {
+        // Reuse the `net_bind` allowlist (its field documents "Unix/TCP socket
+        // bind addresses"). TCP entries are `host:port` / `host:*` patterns,
+        // matched with the SAME semantics as `net_connect`. Unix entries
+        // (`unix:*`) never match a TCP host:port, so the two socket families
+        // share the field without cross-authorizing. The host fn confines the
+        // bind to loopback after this gate returns Ok.
+        let allowed = self
+            .manifest
+            .capabilities
+            .net_bind
+            .iter()
+            .any(|entry| net_connect_pattern_matches(entry, host, port));
+        if allowed {
+            Ok(())
+        } else {
+            Err(format!(
+                "capsule '{capsule_id}' denied: TCP bind \"{host}:{port}\" not in net_bind allowlist"
+            ))
+        }
+    }
+
     async fn check_identity(
         &self,
         capsule_id: &str,
