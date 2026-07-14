@@ -1,6 +1,6 @@
 use super::*;
 use crate::capability_grammar::{
-    CAP_NET_BIND, CAP_RESOURCES_UNBOUNDED, CAP_UPLINK, CAPABILITY_CATALOG,
+    CAP_NET_BIND, CAP_RESOURCES_UNBOUNDED, CAP_UPLINK, CAPABILITY_CATALOG, KNOWN_CAPABILITIES_COUNT,
 };
 
 fn registered(
@@ -47,7 +47,7 @@ fn migration_baseline_freezes_current_and_dormant_exact_ids() {
         .iter()
         .map(|entry| entry.id)
         .collect::<BTreeSet<_>>();
-    assert_eq!(catalog.len(), 45);
+    assert_eq!(catalog.len(), KNOWN_CAPABILITIES_COUNT);
     assert!(catalog.is_subset(&baseline));
 
     let additions = baseline

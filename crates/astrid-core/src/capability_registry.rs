@@ -20,6 +20,9 @@ const REGISTRY_DIGEST_DOMAIN: &[u8] = b"astrid-capability-registry\0";
 pub const CAPABILITY_REGISTRY_DIGEST_ALGORITHM: &str = "sha256";
 
 /// Exact capability IDs in the authority migration baseline.
+///
+/// This set is authority-bearing and frozen for its registry schema revision.
+/// Expanding it requires an intentional schema revision and reviewed digest vectors.
 pub const MIGRATION_BASELINE_CAPABILITY_IDS: [&str; 51] = [
     "system:shutdown",
     "system:status",
@@ -522,10 +525,12 @@ impl CapabilityRegistryManifest {
         I: AsRef<str>,
         D: AsRef<[u8]>,
     {
-        self.entries.iter().find(|entry| {
-            entry.id.as_str() == reference.id().as_str()
-                && entry.entry_digest.as_bytes() == reference.entry_digest().as_bytes()
-        })
+        let index = self
+            .entries
+            .binary_search_by(|entry| entry.id.as_str().cmp(reference.id().as_str()))
+            .ok()?;
+        let entry = &self.entries[index];
+        (entry.entry_digest.as_bytes() == reference.entry_digest().as_bytes()).then_some(entry)
     }
 
     /// Recompute and verify all entry and manifest digests.
