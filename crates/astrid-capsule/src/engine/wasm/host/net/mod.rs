@@ -341,29 +341,45 @@ impl net::Host for HostState {
             return Err(ErrorCode::AirlockRejected);
         }
 
-        // Bind a fresh tokio listener on the daemon runtime. Quick op — the
-        // non-cancellable bounded_block_on is fine (accept, which blocks
-        // indefinitely, uses the cancellable variant instead).
-        let rt = self.runtime_handle.clone();
-        let sem = self.blocking_semaphore.clone();
-        let host_owned = host.clone();
-        let bind_result: Result<tokio::net::TcpListener, std::io::Error> =
-            util::bounded_block_on(&rt, &sem, async move {
-                tokio::net::TcpListener::bind((host_owned.as_str(), port)).await
-            });
-        let listener = match bind_result {
-            Ok(l) => l,
-            Err(e) => {
-                let mapped = map_io_err(e);
-                let reason = format!("{mapped:?}");
-                audit_net_bind(self, &bind_addr, HostAuditOutcome::Failed(&reason));
-                return Err(mapped);
-            },
-        };
+        // Resolve the listener via the shared registry so a run-loop capsule's
+        // N worker Stores dedupe onto ONE bound socket (Approach B): the first
+        // worker binds, the rest observe the Occupied entry and clone its
+        // `Arc<TcpListener>`. All N then block on `accept()` against the single
+        // OS accept queue, which load-balances (SO_REUSEPORT does NOT on macOS).
+        // The bind runs UNDER the shard lock so racing workers serialize here —
+        // without it a second concurrent bind would fail EADDRINUSE (macOS sets
+        // no SO_REUSEADDR). Quick op — the non-cancellable bounded_block_on is
+        // fine (accept, which blocks indefinitely, uses the cancellable variant).
+        // For a non-run-loop pool `shared_listeners` starts empty and each
+        // instance binds its own address, unchanged from before.
+        let listener: Arc<tokio::net::TcpListener> =
+            match self.shared_listeners.entry((host.clone(), port)) {
+                dashmap::mapref::entry::Entry::Occupied(existing) => Arc::clone(existing.get()),
+                dashmap::mapref::entry::Entry::Vacant(vacant) => {
+                    let rt = self.runtime_handle.clone();
+                    let sem = self.blocking_semaphore.clone();
+                    let host_owned = host.clone();
+                    let bind_result: Result<tokio::net::TcpListener, std::io::Error> =
+                        util::bounded_block_on(&rt, &sem, async move {
+                            tokio::net::TcpListener::bind((host_owned.as_str(), port)).await
+                        });
+                    match bind_result {
+                        Ok(l) => {
+                            let listener = Arc::new(l);
+                            vacant.insert(Arc::clone(&listener));
+                            listener
+                        },
+                        Err(e) => {
+                            let mapped = map_io_err(e);
+                            let reason = format!("{mapped:?}");
+                            audit_net_bind(self, &bind_addr, HostAuditOutcome::Failed(&reason));
+                            return Err(mapped);
+                        },
+                    }
+                },
+            };
 
-        let slot = TcpListenerSlot {
-            listener: Arc::new(listener),
-        };
+        let slot = TcpListenerSlot { listener };
         let res = match self.resource_table.push(slot) {
             Ok(res) => res,
             Err(e) => {

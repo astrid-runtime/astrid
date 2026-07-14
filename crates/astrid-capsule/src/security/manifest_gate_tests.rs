@@ -33,6 +33,7 @@ fn make_manifest(net: Vec<&str>, fs_read: Vec<&str>, fs_write: Vec<&str>) -> Cap
         capabilities: CapabilitiesDef {
             net: net.into_iter().map(String::from).collect(),
             net_bind: vec![],
+            bind_workers: None,
             net_connect: vec![],
             kv: vec![],
             fs_read: fs_read.into_iter().map(String::from).collect(),

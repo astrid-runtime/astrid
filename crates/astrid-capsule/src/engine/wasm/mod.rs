@@ -155,7 +155,7 @@ pub struct WasmEngine {
     /// interceptors run concurrently instead of serialising through one Store
     /// (the throughput floor behind `astrid#813`; see `astrid#816` and
     /// [`pool`]). `None` for run-loop capsules — they keep one dedicated
-    /// Store owned by `run_handle` and never go through this pool. The pool is
+    /// Store(s) owned by `run_handles` and never go through this pool. The pool is
     /// dynamic: it warm-starts at `min_idle`, grows lazily toward the
     /// host-derived (operator-overridable) `instance_pool_size` max under load,
     /// and idle-evicts back down. Capsules carved out via the `host_process`
@@ -163,14 +163,21 @@ pub struct WasmEngine {
     /// handles must never move to a second Store).
     pool: Option<pool::CapsuleInstancePool>,
     inbound_rx: Option<tokio::sync::mpsc::Receiver<astrid_core::InboundMessage>>,
-    run_handle: Option<tokio::task::JoinHandle<()>>,
-    /// Receiver for the readiness signal from the run loop.
-    /// Only set for capsules that have a `run()` export.
+    /// Background run-loop tasks. One entry for the single-worker default; N
+    /// entries when a loopback TCP server capsule declares `bind_workers > 1`,
+    /// each driving its own worker Store's `run()` export against the shared
+    /// bound listener. Empty for non-run-loop capsules. `unload` aborts every
+    /// handle after the shared `cancel_token` fires.
+    run_handles: Vec<tokio::task::JoinHandle<()>>,
+    /// Receivers for the readiness signal from the run loop — one per worker
+    /// Store (a single entry for the default, N for `bind_workers > 1`).
+    /// Only populated for capsules that have a `run()` export.
     /// The Mutex is required because `wait_ready` takes `&self` but we need
-    /// to clone the receiver (which marks the current value as seen). We
+    /// to clone each receiver (which marks the current value as seen). We
     /// clone inside the lock and immediately drop it, so concurrent
-    /// `wait_ready` calls each get their own independent receiver.
-    ready_rx: Option<tokio::sync::Mutex<tokio::sync::watch::Receiver<bool>>>,
+    /// `wait_ready` calls each get their own independent receivers.
+    /// `wait_ready` reports Ready only once EVERY worker has signaled.
+    ready_rxs: Vec<tokio::sync::Mutex<tokio::sync::watch::Receiver<bool>>>,
     /// Cancellation token for cooperative shutdown of blocking host functions.
     /// Triggered during `unload()` before aborting the run handle.
     cancel_token: Option<tokio_util::sync::CancellationToken>,
@@ -330,8 +337,8 @@ impl WasmEngine {
             wasmtime_engine: None,
             pool: None,
             inbound_rx: None,
-            run_handle: None,
-            ready_rx: None,
+            run_handles: Vec::new(),
+            ready_rxs: Vec::new(),
             cancel_token: None,
             principal_cancel_tokens: None,
             epoch_ticker: None,
@@ -880,6 +887,51 @@ pub(crate) fn epoch_decision(
 /// mirroring [`epoch_decision`].
 pub(crate) const fn exempt_epoch_action(window_ticks: u64) -> EpochAction {
     EpochAction::Yield(window_ticks)
+}
+
+/// Apply a run-loop Store's CPU bound: a wasmtime EPOCH deadline plus interrupt
+/// callback driven by the shared epoch ticker. Factored out of `load` so every
+/// worker Store (one for the single-worker default, N for `bind_workers > 1`)
+/// is configured identically.
+///
+/// BOUND run-loop (`window_ticks = Some`): the callback runs the pure
+/// [`epoch_decision`] each window — a recv/accept loop `Yield`s (never trapped),
+/// a no-recv spinner accrues toward `Interrupt` after `MAX_NO_YIELD_WINDOWS` but
+/// still `Yield`s during the grace windows, so it can never starve the daemon.
+///
+/// EXEMPT run-loop (`window_ticks = None`): unbounded CPU — [`exempt_epoch_action`]
+/// always `Yield`s, never `Interrupt`s — but still cooperatively yields the tokio
+/// worker every window. `UpdateDeadline::Yield` is async-legal because the run
+/// loop drives the guest via `call_async`.
+fn configure_run_store(store: &mut Store<HostState>, run_budget: &RunLoopBudget) {
+    if let Some(window_ticks) = run_budget.window_ticks {
+        store.set_epoch_deadline(window_ticks);
+        store.epoch_deadline_callback(move |mut store_ctx| {
+            let st = store_ctx.data_mut();
+            let (action, recv_yielded, no_yield_windows) = epoch_decision(
+                st.recv_yielded,
+                st.no_yield_windows,
+                window_ticks,
+                MAX_NO_YIELD_WINDOWS,
+            );
+            st.recv_yielded = recv_yielded;
+            st.no_yield_windows = no_yield_windows;
+            Ok(match action {
+                EpochAction::Yield(ticks) => wasmtime::UpdateDeadline::Yield(ticks),
+                EpochAction::Interrupt => wasmtime::UpdateDeadline::Interrupt,
+            })
+        });
+    } else {
+        let window_ticks = DEFAULT_RUN_LOOP_WINDOW_TICKS;
+        store.set_epoch_deadline(window_ticks);
+        store.epoch_deadline_callback(move |_store_ctx| {
+            Ok(match exempt_epoch_action(window_ticks) {
+                EpochAction::Yield(ticks) => wasmtime::UpdateDeadline::Yield(ticks),
+                // Unreachable: exempt is unbounded, so the policy never traps.
+                EpochAction::Interrupt => wasmtime::UpdateDeadline::Interrupt,
+            })
+        });
+    }
 }
 
 /// Build a minimal `WasiCtx` for capsule sandboxing.
@@ -1441,11 +1493,10 @@ impl ExecutionEngine for WasmEngine {
         // for the duration of the engine build.
         let (
             pool_opt,
-            store_arc,
-            run_instance,
+            run_stores,
             rx,
             has_run,
-            ready_rx,
+            ready_rxs,
             wt_engine,
             workspace_cow_backend,
             process_tracker_for_engine,
@@ -1807,6 +1858,15 @@ impl ExecutionEngine for WasmEngine {
             let client_connections: Arc<
                 dashmap::DashMap<u32, astrid_core::principal::PrincipalId>,
             > = Arc::new(dashmap::DashMap::new());
+            // Bound loopback TCP listeners shared across a run-loop capsule's
+            // worker Stores. The first worker to `bind_tcp` an address binds the
+            // socket and inserts here; the rest dedupe onto its Arc so all N
+            // accept on ONE OS accept queue (Approach B). Cloned into every
+            // HostState below like `connection_principals`; starts empty and
+            // stays empty for the single-worker default and non-run-loop pools.
+            let shared_listeners: Arc<
+                dashmap::DashMap<(String, u16), Arc<tokio::net::TcpListener>>,
+            > = Arc::new(dashmap::DashMap::new());
             let make_state: Arc<dyn Fn() -> HostState + Send + Sync> = Arc::new(move || HostState {
                 wasi_ctx: build_wasi_ctx(),
                 resource_table: wasmtime::component::ResourceTable::new(),
@@ -1902,6 +1962,7 @@ impl ExecutionEngine for WasmEngine {
                 process_count_by_principal: std::collections::HashMap::new(),
                 connection_principals: connection_principals.clone(),
                 client_connections: client_connections.clone(),
+                shared_listeners: shared_listeners.clone(),
                 // No frame in flight at construction; both the ingress
                 // principal and its authenticating device key_id are set per
                 // framed read.
@@ -1987,6 +2048,38 @@ impl ExecutionEngine for WasmEngine {
                 )
             };
 
+            // Concurrent run-loop workers (Approach B, shared listener). Only a
+            // loopback TCP server capsule (run-loop + `net_bind`, no
+            // `host_process`) is eligible; everyone else stays single-instance.
+            // Clamp to [1, instance_pool_size] so an operator misconfiguration
+            // can't spawn unbounded Stores. `None`/1 ⇒ today's single-worker
+            // behavior, byte-for-byte. A capsule that ALSO declares interceptors
+            // is forced back to 1: N auto-subscribed interceptor sets would
+            // double-process every matching event.
+            let worker_count = if has_run_export
+                && manifest.capabilities.host_process.is_empty()
+                && !manifest.capabilities.net_bind.is_empty()
+            {
+                let requested = manifest
+                    .capabilities
+                    .bind_workers
+                    .unwrap_or(1)
+                    .clamp(1, self.runtime_limits.instance_pool_size);
+                if requested > 1 && !manifest.effective_interceptors().is_empty() {
+                    tracing::warn!(
+                        capsule = %manifest.package.name,
+                        requested,
+                        "bind_workers > 1 ignored: capsule declares interceptors \
+                         (N subscriptions would double-process events); using 1 worker"
+                    );
+                    1
+                } else {
+                    requested
+                }
+            } else {
+                1
+            };
+
             // On-demand instance factory. The eager warm-start instances are
             // built through it too, so an eagerly-built and a lazily-grown
             // instance are identical (required for free checkout). The factory
@@ -1999,9 +2092,18 @@ impl ExecutionEngine for WasmEngine {
                 pool_epoch_deadline,
                 INTERCEPTOR_FUEL_BUDGET,
             );
+            // Run-loop capsules build one dedicated Store per worker (default 1);
+            // pools build their `min_idle` warm set. `worker_count == 1` for
+            // every non-eligible capsule, so this is `pool_min_idle` (today's
+            // behavior) unless a loopback TCP server opted into `bind_workers`.
+            let warm_count = if has_run_export {
+                worker_count
+            } else {
+                pool_min_idle
+            };
             let mut initial_instances: Vec<pool::PooledInstance> =
-                Vec::with_capacity(pool_min_idle);
-            for _ in 0..pool_min_idle {
+                Vec::with_capacity(warm_count);
+            for _ in 0..warm_count {
                 initial_instances.push(builder.build().await?);
             }
             tracing::debug!(
@@ -2015,92 +2117,38 @@ impl ExecutionEngine for WasmEngine {
             );
 
             let has_run = has_run_export;
-            // Run-loop capsules pull one instance out as a dedicated,
-            // mutex-guarded Store owned by the run loop; pooled capsules keep
-            // the whole set for `invoke_interceptor` to lease from.
+            // Run-loop capsules pull their warm instances out as dedicated,
+            // mutex-guarded worker Stores owned by the run loop(s); pooled
+            // capsules keep the whole set for `invoke_interceptor` to lease from.
             let mut pool_opt: Option<pool::CapsuleInstancePool> = None;
-            let mut store_arc: Option<Arc<AsyncMutex<Store<HostState>>>> = None;
-            let mut run_instance: Option<wasmtime::component::Instance> = None;
+            // One `(Store, Instance)` per worker: a single entry for the
+            // single-worker default, N for a `bind_workers` loopback TCP server.
+            // All N share the bound listener via `shared_listeners` and each
+            // blocks on `accept()` against the one OS accept queue.
+            let mut run_stores: Vec<(
+                Arc<AsyncMutex<Store<HostState>>>,
+                wasmtime::component::Instance,
+            )> = Vec::new();
             if has_run {
-                let mut pi = initial_instances
-                    .pop()
-                    .expect("min_idle >= 1, so the run-loop instance exists");
-                // The run-loop Store's memory cap is already baked into
-                // `store_meter` by `make_state` (pool_size 1 ⇒ this IS the
-                // run-loop Store) and was enforced during `instantiate_async`.
-                // Fuel was seeded to INTERCEPTOR_FUEL_BUDGET above for
-                // instantiation; the run loop is NOT fuel-bound, so re-seed it
-                // to effectively-infinite (consume_fuel makes a 0-fuel Store
-                // trap, and we never want a run loop to fuel-out). CPU is
-                // bounded by the epoch interrupt below, not fuel.
-                pi.store.set_fuel(u64::MAX).map_err(|e| {
-                    CapsuleError::UnsupportedEntryPoint(format!("Failed to set run-loop fuel: {e}"))
-                })?;
-                // Apply the CPU bound: a wasmtime EPOCH deadline + interrupt
-                // callback driven by the shared epoch ticker.
-                if let Some(window_ticks) = run_budget.window_ticks {
-                    // BOUND run-loop. The epoch ticker fires the callback every
-                    // `window_ticks` of wall-clock. The callback runs the pure
-                    // `epoch_decision`:
-                    //   * a recv/accept loop sets `recv_yielded` (ipc recv host
-                    //     fn) → the window resets the counter and `Yield`s
-                    //     (cooperatively yields the worker, re-arms) — NEVER
-                    //     trapped;
-                    //   * a no-recv spinner accrues `no_yield_windows` and is
-                    //     `Interrupt`-trapped once it reaches
-                    //     MAX_NO_YIELD_WINDOWS — but still `Yield`s during the
-                    //     grace windows, so even a pure `loop {}` cooperatively
-                    //     yields the tokio worker every window and can NEVER
-                    //     starve the daemon (the real worker-starvation fix).
-                    //
-                    // DOCUMENTED RESIDUAL: a `loop { recv(0); burn() }` spammer
-                    // sets `recv_yielded` every iteration, so it is never
-                    // trapped — but because every recv yields the worker it
-                    // also cannot starve the daemon; it can burn one core. An
-                    // OS cgroup is the recommended backstop for that case.
-                    // `UpdateDeadline::Yield` is async-legal here because the
-                    // run loop drives the guest via `call_async` (verified
-                    // against wasmtime 45).
-                    pi.store.set_epoch_deadline(window_ticks);
-                    pi.store.epoch_deadline_callback(move |mut store_ctx| {
-                        let st = store_ctx.data_mut();
-                        let (action, recv_yielded, no_yield_windows) = epoch_decision(
-                            st.recv_yielded,
-                            st.no_yield_windows,
-                            window_ticks,
-                            MAX_NO_YIELD_WINDOWS,
-                        );
-                        st.recv_yielded = recv_yielded;
-                        st.no_yield_windows = no_yield_windows;
-                        Ok(match action {
-                            EpochAction::Yield(ticks) => wasmtime::UpdateDeadline::Yield(ticks),
-                            EpochAction::Interrupt => wasmtime::UpdateDeadline::Interrupt,
-                        })
-                    });
-                } else {
-                    // EXEMPT run-loop (CAP_RESOURCES_UNBOUNDED / CAP_NET_BIND /
-                    // CAP_UPLINK on the owner principal): unbounded CPU — never
-                    // `Interrupt`-trapped, never fuel-out — but it must STILL
-                    // cooperatively yield the tokio worker every window so it
-                    // can no longer starve the daemon/SIGTERM handler (the root
-                    // of the wedge). Same finite-window deadline + epoch
-                    // callback the bound run-loop uses, but with the
-                    // yield-ALWAYS policy from `exempt_epoch_action` (never
-                    // `Interrupt`). `UpdateDeadline::Yield` is async-legal here
-                    // because the run loop drives the guest via `call_async`.
-                    let window_ticks = DEFAULT_RUN_LOOP_WINDOW_TICKS;
-                    pi.store.set_epoch_deadline(window_ticks);
-                    pi.store.epoch_deadline_callback(move |_store_ctx| {
-                        Ok(match exempt_epoch_action(window_ticks) {
-                            EpochAction::Yield(ticks) => wasmtime::UpdateDeadline::Yield(ticks),
-                            // Unreachable: exempt is unbounded, so the policy
-                            // never traps. Mapped for exhaustiveness only.
-                            EpochAction::Interrupt => wasmtime::UpdateDeadline::Interrupt,
-                        })
-                    });
+                // Each warm instance becomes a dedicated run-loop Store. The
+                // Store's memory cap is already baked into `store_meter` by
+                // `make_state` and was enforced during `instantiate_async`. Fuel
+                // was seeded to INTERCEPTOR_FUEL_BUDGET above for instantiation;
+                // the run loop is NOT fuel-bound, so re-seed it to
+                // effectively-infinite (a 0-fuel Store traps, and a run loop must
+                // never fuel-out). CPU is bounded by the epoch interrupt
+                // (`configure_run_store`), not fuel. For the single-worker
+                // default this drains exactly one instance — identical to the
+                // prior `pop()` path.
+                for mut pi in initial_instances.drain(..) {
+                    pi.store.set_fuel(u64::MAX).map_err(|e| {
+                        CapsuleError::UnsupportedEntryPoint(format!(
+                            "Failed to set run-loop fuel: {e}"
+                        ))
+                    })?;
+                    configure_run_store(&mut pi.store, &run_budget);
+                    run_stores.push((Arc::new(AsyncMutex::new(pi.store)), pi.instance));
                 }
-                store_arc = Some(Arc::new(AsyncMutex::new(pi.store)));
-                run_instance = Some(pi.instance);
             } else {
                 // Free-checkout pools tear down each returned instance's
                 // resource table so a cancelled/panicked invocation can't leak
@@ -2120,129 +2168,120 @@ impl ExecutionEngine for WasmEngine {
                 ));
             }
 
-            // Only allocate the watch channel for run-loop capsules.
-            let ready_rx = if has_run {
-                let (ready_tx, ready_rx) = tokio::sync::watch::channel(false);
-                // Async-mutex `lock()` cannot fail (no poisoning) so the
-                // legacy poisoned-lock conversion is gone. The borrow is
-                // held synchronously across the small mutation below;
-                // no `.await` occurs while it is alive.
-                let mut s = store_arc.as_ref().expect("run-loop has store").lock().await;
-                s.data_mut().ready_tx = Some(ready_tx);
-                Some(ready_rx)
-            } else {
-                None
-            };
-
-            // Auto-subscribe interceptor topics for run-loop capsules.
-            // Events arrive via the IPC channel the run loop already reads from,
-            // avoiding mutex contention (no external invoke_interceptor calls).
-            //
-            // Note: subscriptions are created before the WASM guest starts, so
-            // events published between subscribe and the guest's first recv/poll
-            // call are buffered in the broadcast channel (same as normal IPC).
-            // RFC cargo-like-manifest: read interceptor bindings from
-            // [subscribe].handler (new) merged with [[interceptor]] (legacy).
-            let effective_interceptors = manifest.effective_interceptors();
-            if has_run && !effective_interceptors.is_empty() {
-                // Cap auto-subscribed interceptors to leave headroom for
-                // guest-initiated subscriptions (shared 128-slot pool).
-                const MAX_AUTO_SUBSCRIBE: usize = 64;
-                if effective_interceptors.len() > MAX_AUTO_SUBSCRIBE {
-                    return Err(CapsuleError::UnsupportedEntryPoint(format!(
-                        "Capsule '{}' declares {} interceptors, exceeding the \
-                         auto-subscribe limit ({MAX_AUTO_SUBSCRIBE})",
-                        manifest.package.name,
-                        effective_interceptors.len()
-                    )));
-                }
-
-                // Validate interceptor event patterns have well-formed segments
-                // (no empty segments, leading/trailing dots, or empty strings).
-                for interceptor in &effective_interceptors {
-                    if !crate::topic::has_valid_segments(&interceptor.event) {
+            // Per-worker context install. Each run-loop worker Store gets, BEFORE
+            // its run task spawns: (a) its own readiness watch channel, (b) the
+            // auto-subscribed interceptor bindings (metadata under the new ABI),
+            // and (c) the owner's per-principal resource context. For the
+            // single-worker default this loops exactly once — behaviorally
+            // identical to the prior three separate single-store blocks.
+            // `worker_count > 1` is gated to net_bind capsules with NO
+            // interceptors (see `worker_count`), so the interceptor install is a
+            // no-op whenever N > 1.
+            let mut ready_rxs: Vec<tokio::sync::watch::Receiver<bool>> = Vec::new();
+            if has_run {
+                // Auto-subscribe interceptor topics for run-loop capsules.
+                // Events arrive via the IPC channel the run loop already reads
+                // from, avoiding mutex contention (no external invoke_interceptor
+                // calls).
+                //
+                // Note: subscriptions are created before the WASM guest starts,
+                // so events published between subscribe and the guest's first
+                // recv/poll call are buffered in the broadcast channel (same as
+                // normal IPC). RFC cargo-like-manifest: read interceptor bindings
+                // from [subscribe].handler (new) merged with [[interceptor]]
+                // (legacy). Validated ONCE below; installed per worker.
+                let effective_interceptors = manifest.effective_interceptors();
+                if !effective_interceptors.is_empty() {
+                    // Cap auto-subscribed interceptors to leave headroom for
+                    // guest-initiated subscriptions (shared 128-slot pool).
+                    const MAX_AUTO_SUBSCRIBE: usize = 64;
+                    if effective_interceptors.len() > MAX_AUTO_SUBSCRIBE {
                         return Err(CapsuleError::UnsupportedEntryPoint(format!(
-                            "Interceptor event '{}' has invalid segment structure \
-                             (empty segments, leading/trailing dots, or empty string)",
-                            interceptor.event
+                            "Capsule '{}' declares {} interceptors, exceeding the \
+                             auto-subscribe limit ({MAX_AUTO_SUBSCRIBE})",
+                            manifest.package.name,
+                            effective_interceptors.len()
                         )));
+                    }
+                    // Validate interceptor event patterns have well-formed
+                    // segments (no empty segments, leading/trailing dots, or
+                    // empty strings).
+                    for interceptor in &effective_interceptors {
+                        if !crate::topic::has_valid_segments(&interceptor.event) {
+                            return Err(CapsuleError::UnsupportedEntryPoint(format!(
+                                "Interceptor event '{}' has invalid segment structure \
+                                 (empty segments, leading/trailing dots, or empty string)",
+                                interceptor.event
+                            )));
+                        }
                     }
                 }
 
-                let mut s = store_arc.as_ref().expect("run-loop has store").lock().await;
-                let state = s.data_mut();
-                // Interceptor bindings are metadata under the new
-                // ABI. The kernel dispatches matching IPC messages to
-                // `astrid-hook-trigger` directly (no capsule-side
-                // receiver poll), so we record the action / topic
-                // mapping but do not allocate an EventReceiver per
-                // interceptor. `handle-id` is informational only —
-                // capsules cannot convert it back to a
-                // `Resource<Subscription>`.
-                let count = effective_interceptors.len();
-                for (idx, interceptor) in effective_interceptors.into_iter().enumerate() {
-                    state
-                        .interceptor_handles
-                        .push(host_state::InterceptorHandle {
-                            handle_id: idx as u64,
-                            action: interceptor.action,
-                            topic: interceptor.event,
-                        });
+                // Owner = `ctx.principal`, the shared-runtime load owner
+                // (`PrincipalId::default()` for a run-loop capsule) — the SAME
+                // owner for all N workers. A run-loop capsule drives its `run`
+                // export directly (the tasks spawned below) and never goes
+                // through `invoke_interceptor`, so the per-invocation overlays
+                // that path installs are never applied here: without this the env
+                // overlay, secret store, and `home://` sit at the neutral
+                // deny-all floor. But `run()` reads `env::var` / secrets /
+                // `home://` for the WHOLE lifetime of its single long-lived
+                // invocation, so the owner context is installed ONCE per worker
+                // here, before its run task spawns — not per message.
+                // `caller_context` is deliberately left `None` so an inbound
+                // `ipc::recv` can still install a per-publisher context and
+                // `effective_principal()` keeps resolving the owner for the
+                // loop's own autonomous work.
+                for (store_arc, _inst) in &run_stores {
+                    let (ready_tx, ready_rx) = tokio::sync::watch::channel(false);
+                    // Async-mutex `lock()` cannot fail (no poisoning). Held
+                    // across the awaited overlay install (which needs `&mut
+                    // state`) — safe on tokio's async mutex.
+                    let mut s = store_arc.lock().await;
+                    let state = s.data_mut();
+                    state.ready_tx = Some(ready_tx);
+                    // Interceptor bindings are metadata under the new ABI. The
+                    // kernel dispatches matching IPC messages to
+                    // `astrid-hook-trigger` directly (no capsule-side receiver
+                    // poll), so we record the action / topic mapping but allocate
+                    // no EventReceiver. `handle-id` is informational only.
+                    for (idx, interceptor) in effective_interceptors.iter().enumerate() {
+                        state
+                            .interceptor_handles
+                            .push(host_state::InterceptorHandle {
+                                handle_id: idx as u64,
+                                action: interceptor.action.clone(),
+                                topic: interceptor.event.clone(),
+                            });
+                    }
+                    state.invocation_env_overlay = load_invocation_env_overlay(
+                        &ctx.principal,
+                        state.capsule_id.as_str(),
+                    );
+                    // Installs invocation_kv + invocation_secret_store +
+                    // invocation_capsule_log + invocation_home/tmp scoped to the
+                    // owner, or clears to the neutral fail-closed floor if the
+                    // owner has no registered home / KV construction fails
+                    // (identical to today's behavior — no regression).
+                    install_principal_overlays(state, Some(&ctx.principal)).await;
+                    drop(s);
+                    ready_rxs.push(ready_rx);
                 }
                 tracing::debug!(
                     capsule = %manifest.package.name,
-                    count,
-                    "Auto-subscribed interceptors for run-loop capsule"
-                );
-            }
-
-            // Install the run loop's per-principal resource context.
-            //
-            // A run-loop capsule drives its `run` export directly (the task
-            // spawned further below) and never goes through
-            // `invoke_interceptor`, so the per-invocation overlays that path
-            // installs are never applied here: the env overlay, secret store,
-            // and `home://` all sit at the neutral deny-all floor. But `run()`
-            // reads `env::var` / secrets / `home://` for the WHOLE lifetime of
-            // its single long-lived invocation (e.g. a request loop calling
-            // `env::var` per request), so the owner context must be installed
-            // ONCE here, before the run task is spawned — not per message.
-            //
-            // Owner = `ctx.principal`, the shared-runtime load owner
-            // (`PrincipalId::default()` for a run-loop capsule). Scoping to it
-            // hands the loop ONLY the owner's config — exactly what a bus
-            // invocation from the owner would install, never another
-            // principal's data. `caller_context` is deliberately left `None`
-            // so an inbound `ipc::recv` can still install a per-publisher
-            // context and `effective_principal()` keeps resolving the owner
-            // for the loop's own autonomous work.
-            if has_run {
-                let mut s = store_arc.as_ref().expect("run-loop has store").lock().await;
-                let state = s.data_mut();
-                state.invocation_env_overlay =
-                    load_invocation_env_overlay(&ctx.principal, state.capsule_id.as_str());
-                // Installs invocation_kv + invocation_secret_store +
-                // invocation_capsule_log + invocation_home/tmp scoped to the
-                // owner, or clears to the neutral fail-closed floor if the
-                // owner has no registered home / KV construction fails
-                // (identical to today's behavior — no regression).
-                install_principal_overlays(state, Some(&ctx.principal)).await;
-                tracing::debug!(
-                    capsule = %manifest.package.name,
                     principal = %ctx.principal,
-                    env_overlay = state.invocation_env_overlay.is_some(),
-                    home = state.invocation_home.is_some(),
-                    "Installed run-loop owner resource context"
+                    workers = run_stores.len(),
+                    interceptors = effective_interceptors.len(),
+                    "Installed run-loop worker resource context(s)"
                 );
             }
 
             Ok::<_, CapsuleError>((
                 pool_opt,
-                store_arc,
-                run_instance,
+                run_stores,
                 rx,
                 has_run,
-                ready_rx,
+                ready_rxs,
                 wt_engine,
                 workspace_cow_backend,
                 process_tracker_for_engine,
@@ -2343,66 +2382,79 @@ impl ExecutionEngine for WasmEngine {
         }
 
         if has_run {
-            self.ready_rx = ready_rx.map(tokio::sync::Mutex::new);
+            self.ready_rxs = ready_rxs
+                .into_iter()
+                .map(tokio::sync::Mutex::new)
+                .collect();
 
-            // The run loop holds the store mutex for its entire lifetime.
-            // We must NOT store the instance for direct invoke_interceptor use,
-            // because run-loop capsules receive events via auto-subscribed IPC
-            // channels instead — no external invoke_interceptor calls.
-            let capsule_name = self.manifest.package.name.clone();
-            let run_store = Arc::clone(store_arc.as_ref().expect("run-loop has store"));
-            let run_inst = run_instance.expect("run-loop has instance");
-            // Clone the instance cancel token so the run loop itself observes
-            // cancellation. `request_cancel()` (callable through a shared `&self`
-            // — no `&mut`/`Arc::get_mut` needed) cancels this token; racing it
-            // against `call_async` guarantees the loop stops even for a compute-
-            // bound guest that never touches a cancellable host call. Dropping
-            // the `call_async` future unwinds the wasmtime fiber (identical to
-            // the `handle.abort()` in `unload`), but here it is reachable while
-            // a dispatcher consumer still holds an `Arc` clone of this capsule —
-            // the mechanism a restart uses to fully tear the OLD instance down
-            // without exclusive ownership. It fires promptly because exempt
-            // run-loops now cooperatively `Yield` every epoch window (Fix 5), so
-            // the fiber reaches a yield point where the `select!` can preempt.
-            let run_cancel = cancel_token.clone();
-            // With async wasmtime, `call_async` schedules guest execution
-            // on a fiber that yields back to the executor on every host
-            // import boundary. The spawned task no longer needs to be a
-            // blocking thread — it's an ordinary async task.
-            self.run_handle = Some(tokio::task::spawn(async move {
-                tracing::info!(capsule = %capsule_name, "Starting background WASM run loop");
-                let mut s = run_store.lock().await;
-                let typed = match run_inst.get_typed_func::<(), ()>(&mut *s, "run") {
-                    Ok(f) => f,
-                    Err(e) => {
-                        tracing::error!(
-                            capsule = %capsule_name,
-                            error = %e,
-                            "WASM background loop missing `run` export"
-                        );
-                        return;
-                    },
-                };
-                tokio::select! {
-                    biased;
-                    () = run_cancel.cancelled() => {
-                        tracing::info!(
-                            capsule = %capsule_name,
-                            "WASM background loop stopped (cancellation requested)"
-                        );
-                    }
-                    result = typed.call_async(&mut *s, ()) => {
-                        if let Err(e) = result {
+            // Spawn one run task per worker Store. Each holds its Store's mutex
+            // for the worker's entire lifetime and drives the guest `run` export
+            // via `call_async`. We must NOT expose the instances for direct
+            // invoke_interceptor use, because run-loop capsules receive events
+            // via auto-subscribed IPC channels instead. For the single-worker
+            // default this spawns exactly one task — identical to before.
+            for (worker_idx, (run_store, run_inst)) in run_stores.into_iter().enumerate() {
+                let capsule_name = self.manifest.package.name.clone();
+                // Clone the SHARED instance cancel token so every worker observes
+                // cancellation. `request_cancel()` (callable through a shared
+                // `&self` — no `&mut`/`Arc::get_mut` needed) cancels this token;
+                // racing it against `call_async` guarantees each loop stops even
+                // for a compute-bound guest that never touches a cancellable host
+                // call. Dropping the `call_async` future unwinds the wasmtime
+                // fiber (identical to the `handle.abort()` in `unload`), and it is
+                // reachable while a dispatcher consumer still holds an `Arc` clone
+                // of this capsule — the mechanism a restart uses to tear the OLD
+                // instance down without exclusive ownership. It fires promptly
+                // because exempt run-loops cooperatively `Yield` every epoch
+                // window, so the fiber reaches a yield point where the `select!`
+                // can preempt.
+                let run_cancel = cancel_token.clone();
+                // With async wasmtime, `call_async` schedules guest execution on
+                // a fiber that yields back to the executor on every host import
+                // boundary, so each worker is an ordinary async task, not a
+                // blocking thread.
+                self.run_handles.push(tokio::task::spawn(async move {
+                    tracing::info!(
+                        capsule = %capsule_name,
+                        worker = worker_idx,
+                        "Starting background WASM run loop"
+                    );
+                    let mut s = run_store.lock().await;
+                    let typed = match run_inst.get_typed_func::<(), ()>(&mut *s, "run") {
+                        Ok(f) => f,
+                        Err(e) => {
                             tracing::error!(
                                 capsule = %capsule_name,
+                                worker = worker_idx,
                                 error = %e,
-                                "WASM background loop failed"
+                                "WASM background loop missing `run` export"
+                            );
+                            return;
+                        },
+                    };
+                    tokio::select! {
+                        biased;
+                        () = run_cancel.cancelled() => {
+                            tracing::info!(
+                                capsule = %capsule_name,
+                                worker = worker_idx,
+                                "WASM background loop stopped (cancellation requested)"
                             );
                         }
+                        result = typed.call_async(&mut *s, ()) => {
+                            if let Err(e) = result {
+                                tracing::error!(
+                                    capsule = %capsule_name,
+                                    worker = worker_idx,
+                                    error = %e,
+                                    "WASM background loop failed"
+                                );
+                            }
+                        }
                     }
-                }
-            }));
-            // The run loop owns the Store via `run_store`; `self.pool` stays
+                }));
+            }
+            // The run loops own the Stores via `run_store`; `self.pool` stays
             // None so `invoke_interceptor` reports NotSupported for run-loop
             // capsules (they receive events through auto-subscribed IPC).
         } else {
@@ -2439,21 +2491,24 @@ impl ExecutionEngine for WasmEngine {
             "Unloading WASM component"
         );
         // Signal cooperative cancellation to unblock ipc_recv/elicit/net calls
-        // before aborting the run handle.
+        // before aborting the run handles. The single shared token fans out to
+        // every worker.
         if let Some(token) = self.cancel_token.take() {
             token.cancel();
         }
-        if let Some(handle) = self.run_handle.take() {
+        // Abort every worker's run task (one for the default, N for
+        // `bind_workers > 1`).
+        for handle in self.run_handles.drain(..) {
             handle.abort();
         }
         // Stop the epoch ticker thread (RAII guard joins on drop).
         drop(self.epoch_ticker.take());
         // Drop the pool — releases every pooled Store's WASM memory. (Run-loop
-        // capsules have `pool == None`; their Store is owned by the aborted
-        // run_handle and dropped with it.)
+        // capsules have `pool == None`; their worker Stores are owned by the
+        // aborted run tasks and dropped with them.)
         self.pool = None;
         self.wasmtime_engine = None;
-        self.ready_rx = None; // Prevent stale channel observation post-unload
+        self.ready_rxs.clear(); // Prevent stale channel observation post-unload
         // Tear down the OS-level CoW working tree (unmount / remove the clone).
         // Explicit because there is no async Drop for the engine; the backend's
         // own Drop is a backstop. Uncommitted changes are discarded here — the
@@ -2487,13 +2542,29 @@ impl ExecutionEngine for WasmEngine {
     async fn wait_ready(&self, timeout: std::time::Duration) -> crate::capsule::ReadyStatus {
         use crate::capsule::ReadyStatus;
 
-        let Some(rx_mutex) = &self.ready_rx else {
+        // No receivers ⇒ non-run-loop capsule (or already unloaded): Ready.
+        if self.ready_rxs.is_empty() {
             return ReadyStatus::Ready;
+        }
+        // Clone each worker's receiver under its lock (cloning marks the current
+        // value seen, so concurrent callers each get an independent receiver),
+        // then wait for EVERY worker to signal readiness within one shared
+        // timeout budget. Ready only once all workers signaled; Crashed if any
+        // worker's sender dropped first (its run task died before signaling).
+        let mut rxs = Vec::with_capacity(self.ready_rxs.len());
+        for rx_mutex in &self.ready_rxs {
+            rxs.push(rx_mutex.lock().await.clone());
+        }
+        let wait_all = async {
+            for rx in &mut rxs {
+                if rx.wait_for(|&v| v).await.is_err() {
+                    return ReadyStatus::Crashed; // sender dropped before signaling
+                }
+            }
+            ReadyStatus::Ready
         };
-        let mut rx = rx_mutex.lock().await.clone();
-        match tokio::time::timeout(timeout, rx.wait_for(|&v| v)).await {
-            Ok(Ok(_)) => ReadyStatus::Ready,
-            Ok(Err(_)) => ReadyStatus::Crashed, // sender dropped before signaling
+        match tokio::time::timeout(timeout, wait_all).await {
+            Ok(status) => status,
             Err(_) => ReadyStatus::Timeout,
         }
     }
@@ -2864,9 +2935,10 @@ impl ExecutionEngine for WasmEngine {
     }
 
     fn check_health(&self) -> crate::capsule::CapsuleState {
-        if let Some(handle) = &self.run_handle
-            && handle.is_finished()
-        {
+        // Any worker's run task finishing means its loop exited unexpectedly
+        // (they run forever until cancelled). One handle for the default, N for
+        // `bind_workers > 1`.
+        if self.run_handles.iter().any(|h| h.is_finished()) {
             return crate::capsule::CapsuleState::Failed(
                 "WASM run loop exited unexpectedly".into(),
             );
@@ -3067,6 +3139,9 @@ pub async fn run_lifecycle(
         // Lifecycle hooks never accept inbound uplink connections; a throwaway
         // lifecycle registry satisfies the field.
         client_connections: Arc::new(dashmap::DashMap::new()),
+        // Lifecycle hooks never bind a listener; a throwaway empty registry
+        // satisfies the field.
+        shared_listeners: Arc::new(dashmap::DashMap::new()),
         // Lifecycle hooks never forward client frames; no in-flight principal
         // or authenticating device.
         ingress_principal: None,
