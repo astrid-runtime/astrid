@@ -44,19 +44,9 @@ pub(crate) async fn pair_device_issue(
     label: Option<String>,
     requested: PairScopeArg,
 ) -> AdminResponseBody {
-    let lifetime = expires_secs.unwrap_or(DEFAULT_EXPIRY_SECS);
-    if lifetime == 0 {
-        return err_bad_input("expires_secs must be greater than 0".into());
-    }
-    if lifetime > MAX_EXPIRY_SECS {
-        return err_bad_input(format!(
-            "expires_secs {lifetime} exceeds the 1-hour cap ({MAX_EXPIRY_SECS}s) — pair-tokens are intended for immediate use"
-        ));
-    }
-
-    let requested_scope = match resolve_pair_scope(&requested) {
-        Ok(s) => s,
-        Err(e) => return err_bad_input(e),
+    let (lifetime, requested_scope) = match validate_pair_issue(expires_secs, &requested) {
+        Ok(values) => values,
+        Err(error) => return err_bad_input(error),
     };
 
     // Pair tokens must name an existing principal.
@@ -164,6 +154,23 @@ pub(crate) async fn pair_device_issue(
         expires_at_epoch,
         label,
     })
+}
+
+fn validate_pair_issue(
+    expires_secs: Option<u64>,
+    requested: &PairScopeArg,
+) -> Result<(u64, DeviceScope), String> {
+    let lifetime = expires_secs.unwrap_or(DEFAULT_EXPIRY_SECS);
+    if lifetime == 0 {
+        return Err("expires_secs must be greater than 0".into());
+    }
+    if lifetime > MAX_EXPIRY_SECS {
+        return Err(format!(
+            "expires_secs {lifetime} exceeds the 1-hour cap ({MAX_EXPIRY_SECS}s) — pair-tokens are intended for immediate use"
+        ));
+    }
+
+    resolve_pair_scope(requested).map(|scope| (lifetime, scope))
 }
 
 /// Resolve a [`PairScopeArg`] to a concrete [`DeviceScope`]. An unknown preset

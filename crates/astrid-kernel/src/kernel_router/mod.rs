@@ -584,11 +584,11 @@ impl CapsuleVisibility {
             return Self::denied(caller);
         };
 
-        let device_scope =
-            match resolve_device_scope(profile.as_ref(), caller, device_key_id, "capsule:list") {
-                Ok(scope) => scope,
-                Err(_) => return Self::denied(caller),
-            };
+        let Ok(device_scope) =
+            resolve_device_scope(profile.as_ref(), caller, device_key_id, "capsule:list")
+        else {
+            return Self::denied(caller);
+        };
         let groups = kernel.groups.load_full();
         let mut check = CapabilityCheck::new(profile.as_ref(), groups.as_ref(), caller.clone());
         if let Some(scope) = &device_scope {

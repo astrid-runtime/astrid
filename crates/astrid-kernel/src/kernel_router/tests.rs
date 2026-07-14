@@ -675,7 +675,97 @@ async fn device_scope_attenuates_every_capsule_inventory_surface() {
     let (_dir, kernel) = kernel_with_inventory_capsules().await;
     let caller = PrincipalId::new("device-scoped-admin").expect("valid principal");
     seed_capsule_inventory_profile(&kernel, &caller, &["allowed"]).await;
+    let devices = seed_inventory_device_scopes(&kernel, &caller);
 
+    let global_capsules = &["allowed", "default-only"];
+    let global_commands = &["allowed-cmd", "default-only-cmd"];
+    let scoped_capsules = &["allowed"];
+    let scoped_commands = &["allowed-cmd"];
+
+    assert_capsule_inventory_surface_for_device(
+        &kernel,
+        &caller,
+        None,
+        "unattenuated_admin",
+        global_capsules,
+        global_commands,
+        global_capsules,
+        global_capsules,
+    )
+    .await;
+    assert_capsule_inventory_surface_for_device(
+        &kernel,
+        &caller,
+        Some(&devices.full),
+        "full_device_admin",
+        global_capsules,
+        global_commands,
+        global_capsules,
+        global_capsules,
+    )
+    .await;
+    assert_capsule_inventory_surface_for_device(
+        &kernel,
+        &caller,
+        Some(&devices.self_only),
+        "self_only_device_admin",
+        scoped_capsules,
+        scoped_commands,
+        scoped_capsules,
+        scoped_capsules,
+    )
+    .await;
+    assert_capsule_inventory_surface_for_device(
+        &kernel,
+        &caller,
+        Some(&devices.denied_global_list),
+        "global_list_denied_device_admin",
+        scoped_capsules,
+        scoped_commands,
+        scoped_capsules,
+        scoped_capsules,
+    )
+    .await;
+    assert_capsule_inventory_surface_for_device(
+        &kernel,
+        &caller,
+        Some(&devices.global_list),
+        "global_list_device_admin",
+        global_capsules,
+        global_commands,
+        global_capsules,
+        global_capsules,
+    )
+    .await;
+
+    let allowed = CapsuleId::new("allowed").expect("valid capsule id");
+    let unknown = CapsuleVisibility::new(&kernel, &caller, Some("0000000000000000"));
+    let malformed = CapsuleVisibility::new(&kernel, &caller, Some("not-a-key-id"));
+    assert!(!unknown.allows(&allowed));
+    assert!(!malformed.allows(&allowed));
+
+    let response = request_kernel_for_device(
+        &kernel,
+        &caller,
+        Some("0000000000000000"),
+        "unknown_device_inventory",
+        KernelRequest::ListCapsules,
+    )
+    .await;
+    assert!(matches!(response, KernelResponse::Error(_)));
+}
+
+struct InventoryDeviceScopes {
+    full: String,
+    self_only: String,
+    global_list: String,
+    denied_global_list: String,
+}
+
+fn seed_inventory_device_scopes(
+    kernel: &Arc<crate::Kernel>,
+    caller: &PrincipalId,
+) -> InventoryDeviceScopes {
     let full = DeviceKey::new("a".repeat(64), DeviceScope::Full, None, 0);
     let self_only = DeviceKey::new(
         "b".repeat(64),
@@ -704,10 +794,12 @@ async fn device_scope_attenuates_every_capsule_inventory_surface() {
         None,
         0,
     );
-    let full_id = full.key_id.clone();
-    let self_only_id = self_only.key_id.clone();
-    let global_list_id = global_list.key_id.clone();
-    let denied_global_list_id = denied_global_list.key_id.clone();
+    let devices = InventoryDeviceScopes {
+        full: full.key_id.clone(),
+        self_only: self_only.key_id.clone(),
+        global_list: global_list.key_id.clone(),
+        denied_global_list: denied_global_list.key_id.clone(),
+    };
     let mut profile = PrincipalProfile {
         grants: vec!["*".to_string()],
         capsules: vec!["allowed".to_string()],
@@ -715,84 +807,8 @@ async fn device_scope_attenuates_every_capsule_inventory_surface() {
     };
     profile.auth.methods.push(AuthMethod::Keypair);
     profile.auth.public_keys = vec![full, self_only, global_list, denied_global_list];
-    seed_profile(&kernel, &caller, &profile);
-
-    let global_capsules = &["allowed", "default-only"];
-    let global_commands = &["allowed-cmd", "default-only-cmd"];
-    let scoped_capsules = &["allowed"];
-    let scoped_commands = &["allowed-cmd"];
-
-    assert_capsule_inventory_surface_for_device(
-        &kernel,
-        &caller,
-        None,
-        "unattenuated_admin",
-        global_capsules,
-        global_commands,
-        global_capsules,
-        global_capsules,
-    )
-    .await;
-    assert_capsule_inventory_surface_for_device(
-        &kernel,
-        &caller,
-        Some(&full_id),
-        "full_device_admin",
-        global_capsules,
-        global_commands,
-        global_capsules,
-        global_capsules,
-    )
-    .await;
-    assert_capsule_inventory_surface_for_device(
-        &kernel,
-        &caller,
-        Some(&self_only_id),
-        "self_only_device_admin",
-        scoped_capsules,
-        scoped_commands,
-        scoped_capsules,
-        scoped_capsules,
-    )
-    .await;
-    assert_capsule_inventory_surface_for_device(
-        &kernel,
-        &caller,
-        Some(&denied_global_list_id),
-        "global_list_denied_device_admin",
-        scoped_capsules,
-        scoped_commands,
-        scoped_capsules,
-        scoped_capsules,
-    )
-    .await;
-    assert_capsule_inventory_surface_for_device(
-        &kernel,
-        &caller,
-        Some(&global_list_id),
-        "global_list_device_admin",
-        global_capsules,
-        global_commands,
-        global_capsules,
-        global_capsules,
-    )
-    .await;
-
-    let allowed = CapsuleId::new("allowed").expect("valid capsule id");
-    let unknown = CapsuleVisibility::new(&kernel, &caller, Some("0000000000000000"));
-    let malformed = CapsuleVisibility::new(&kernel, &caller, Some("not-a-key-id"));
-    assert!(!unknown.allows(&allowed));
-    assert!(!malformed.allows(&allowed));
-
-    let response = request_kernel_for_device(
-        &kernel,
-        &caller,
-        Some("0000000000000000"),
-        "unknown_device_inventory",
-        KernelRequest::ListCapsules,
-    )
-    .await;
-    assert!(matches!(response, KernelResponse::Error(_)));
+    seed_profile(kernel, caller, &profile);
+    devices
 }
 
 async fn kernel_with_inventory_capsules() -> (tempfile::TempDir, Arc<crate::Kernel>) {
