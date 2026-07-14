@@ -54,6 +54,7 @@ fn build_test_manifest(
         capabilities: CapabilitiesDef {
             net: net_caps,
             net_bind: vec![],
+            bind_workers: None,
             net_connect: vec![],
             kv: vec!["*".into()],
             fs_read: fs_read_caps,

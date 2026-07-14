@@ -280,6 +280,12 @@ pub fn load_manifest(path: &Path) -> CapsuleResult<CapsuleManifest> {
                 .extend(caps.host_process.clone());
             manifest.capabilities.net.extend(caps.net.clone());
             manifest.capabilities.net_bind.extend(caps.net_bind.clone());
+            // Scalar (not a list): a component declaring bind_workers wins over
+            // the root default. Single-component capsules (the common case) just
+            // promote it up so the run-loop worker count is honored.
+            if caps.bind_workers.is_some() {
+                manifest.capabilities.bind_workers = caps.bind_workers;
+            }
         }
     }
 

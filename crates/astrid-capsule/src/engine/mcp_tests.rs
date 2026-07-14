@@ -38,6 +38,7 @@ mod tests {
             capabilities: CapabilitiesDef {
                 net: vec![],
                 net_bind: vec![],
+                bind_workers: None,
                 net_connect: vec![],
                 kv: vec![],
                 fs_read: vec![],

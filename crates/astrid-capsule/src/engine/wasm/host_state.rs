@@ -720,6 +720,18 @@ pub struct HostState {
     /// anonymous fallback). `Arc<DashMap>` so the binding survives drop landing
     /// on a different pooled instance than the one that accepted.
     pub client_connections: Arc<dashmap::DashMap<u32, astrid_core::principal::PrincipalId>>,
+    /// Bound loopback TCP listeners shared across a run-loop capsule's worker
+    /// Stores, keyed by `(host, port)`. When `bind_workers > 1`, each of the N
+    /// worker Stores runs `run()` and calls `bind_tcp` for the same address;
+    /// the first worker binds the socket and the rest dedupe onto its
+    /// `Arc<TcpListener>` here, so all N block on `accept()` against ONE OS
+    /// accept queue (which load-balances). `Arc<DashMap>` so the binding is
+    /// shared across the worker Stores, exactly like
+    /// [`connection_principals`](Self::connection_principals). Empty for the
+    /// single-worker default and for non-run-loop pools (each pooled instance
+    /// still binds independently, matching today's behavior).
+    pub shared_listeners:
+        Arc<dashmap::DashMap<(String, u16), Arc<tokio::net::TcpListener>>>,
     /// Bound run-loop CPU-bound signal: set `true` by the ipc `recv` host fn
     /// each time the guest blocks on recv, read + cleared by the run-loop's
     /// epoch-deadline callback once per window.
