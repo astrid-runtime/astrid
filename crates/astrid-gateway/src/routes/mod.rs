@@ -67,6 +67,7 @@ pub mod observability;
 pub mod principals;
 pub mod quotas;
 pub mod sessions;
+mod sessions_layout;
 pub mod stream;
 pub mod system;
 
@@ -321,24 +322,24 @@ fn build_authed_router(state: &Arc<GatewayState>) -> Router<Arc<GatewayState>> {
         // ── Conversation threads (proxied to capsule-session) ──
         .route(
             "/api/agent/sessions",
-            get(sessions::list_sessions_with_layout),
+            get(sessions_layout::list_sessions_with_layout),
         )
         // `search` is a static segment and is registered before the `:id`
         // routes; axum prefers the static match, so `/sessions/search` never
         // collides with `/sessions/:id`.
         .route(
             "/api/agent/sessions/search",
-            get(sessions::search_sessions_with_layout),
+            get(sessions_layout::search_sessions_with_layout),
         )
         .route(
             "/api/agent/sessions/{id}",
-            get(sessions::get_session_with_layout)
-                .patch(sessions::update_session_with_layout)
-                .delete(sessions::delete_session_with_layout),
+            get(sessions_layout::get_session_with_layout)
+                .patch(sessions_layout::update_session_with_layout)
+                .delete(sessions_layout::delete_session_with_layout),
         )
         .route(
             "/api/agent/sessions/{id}/messages",
-            get(sessions::get_session_messages_with_layout),
+            get(sessions_layout::get_session_messages_with_layout),
         )
         // ── Agent elicitation reply ──
         .route(

@@ -540,6 +540,7 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
 
     use crate::error::GatewayError;
+    use crate::routes::WorkspaceContext;
     use crate::routes::capsule_sources::capsule_source_id_v0;
     use crate::state::{GatewayState, SigningMaterial};
     use astrid_core::PrincipalId;

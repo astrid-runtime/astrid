@@ -908,15 +908,15 @@ fn onboard_llm_providers(
             continue;
         }
 
-        let target_dir = match super::capsule::install::resolve_target_dir_for(
-            home, principal, &cap.name, false,
-        ) {
-            Ok(dir) => dir,
-            Err(e) => {
-                eprintln!("  Skipping {} onboarding: {e}", cap.name);
-                continue;
-            },
-        };
+        let target_dir =
+            match astrid_capsule_install::resolve_target_dir_for(home, principal, &cap.name, false)
+            {
+                Ok(dir) => dir,
+                Err(e) => {
+                    eprintln!("  Skipping {} onboarding: {e}", cap.name);
+                    continue;
+                },
+            };
         let manifest_path = target_dir.join("Capsule.toml");
         let manifest = match astrid_capsule::discovery::load_manifest(&manifest_path) {
             Ok(m) => m,

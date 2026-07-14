@@ -1,31 +1,14 @@
 //! Principal-scoped session HTTP routes backed by the session capsule.
 //!
-//! Every route proxies to the `capsule-session` capsule over the
-//! in-process event bus. The gateway:
-//!
-//! 1. Generates a fresh `correlation_id` (UUID v4).
-//! 2. Subscribes to `session.v1.response.<verb>.<correlation_id>` before
-//!    publishing so a fast reply cannot race the subscription.
-//! 3. Publishes the request, principal-stamped, on the verb's request
-//!    topic.
-//! 4. Awaits one reply on a route scoped to the caller principal, then
-//!    verifies the responder source and body correlation.
+//! Routes proxy to `capsule-session` over the in-process event bus. Each request
+//! gets a fresh correlation ID; the gateway subscribes before publishing,
+//! stamps the verified principal, and validates the reply source and body.
 //!
 //! ## Trust boundary
 //!
-//! The principal stamp is the caller authority. The kernel scopes
-//! capsule-session's KV reads to the stamped principal's namespace, so
-//! a caller only ever sees their own threads. The response authority is
-//! the kernel-stamped capsule `source_id`: a different capsule may
-//! declare the same response topic, but its reply is ignored unless it
-//! came from `astrid-capsule-session`. We stamp `caller.principal` (and
-//! `caller.device_key_id` when the bearer is device-scoped, exactly as
-//! `bus_admin.rs` does) on every outbound request. The path `{id}` and
-//! every query param are payload data — they NEVER substitute for the
-//! principal and never reach a topic segment (the response topic is
-//! keyed on the gateway-generated `correlation_id`, not on caller
-//! input), so a malicious `id` cannot cross into another principal's
-//! namespace or hijack another request's reply.
+//! The kernel scopes capsule KV reads to the verified principal. Replies must
+//! carry the kernel-stamped session-capsule source ID. Path and query values are
+//! payload only; response topics use gateway-generated correlation IDs.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -33,7 +16,6 @@ use std::time::Duration;
 use astrid_core::PrincipalId;
 use astrid_events::ipc::{IpcMessage, IpcPayload, MessageOrigin, Topic};
 use astrid_events::{AstridEvent, EventBus, EventMetadata};
-use axum::Extension;
 use axum::Json;
 use axum::extract::{Path, Query, State};
 use axum::http::Request;
@@ -338,16 +320,7 @@ pub async fn list_sessions(
     list_sessions_inner(state, &WorkspaceContext::default(), query, req).await
 }
 
-pub(crate) async fn list_sessions_with_layout(
-    State(state): State<Arc<GatewayState>>,
-    Extension(workspace): Extension<WorkspaceContext>,
-    Query(query): Query<SessionListQuery>,
-    req: Request<axum::body::Body>,
-) -> GatewayResult<Json<SessionListResponse>> {
-    list_sessions_inner(state, &workspace, query, req).await
-}
-
-async fn list_sessions_inner(
+pub(super) async fn list_sessions_inner(
     state: Arc<GatewayState>,
     workspace: &WorkspaceContext,
     query: SessionListQuery,
@@ -423,16 +396,7 @@ pub async fn get_session_messages(
     get_session_messages_inner(state, &WorkspaceContext::default(), id, req).await
 }
 
-pub(crate) async fn get_session_messages_with_layout(
-    State(state): State<Arc<GatewayState>>,
-    Extension(workspace): Extension<WorkspaceContext>,
-    Path(id): Path<String>,
-    req: Request<axum::body::Body>,
-) -> GatewayResult<Json<TranscriptResponse>> {
-    get_session_messages_inner(state, &workspace, id, req).await
-}
-
-async fn get_session_messages_inner(
+pub(super) async fn get_session_messages_inner(
     state: Arc<GatewayState>,
     workspace: &WorkspaceContext,
     id: String,
@@ -501,16 +465,7 @@ pub async fn get_session(
     get_session_inner(state, &WorkspaceContext::default(), id, req).await
 }
 
-pub(crate) async fn get_session_with_layout(
-    State(state): State<Arc<GatewayState>>,
-    Extension(workspace): Extension<WorkspaceContext>,
-    Path(id): Path<String>,
-    req: Request<axum::body::Body>,
-) -> GatewayResult<Json<SessionSummary>> {
-    get_session_inner(state, &workspace, id, req).await
-}
-
-async fn get_session_inner(
+pub(super) async fn get_session_inner(
     state: Arc<GatewayState>,
     workspace: &WorkspaceContext,
     id: String,
@@ -584,16 +539,7 @@ pub async fn update_session(
     update_session_inner(state, &WorkspaceContext::default(), id, req).await
 }
 
-pub(crate) async fn update_session_with_layout(
-    State(state): State<Arc<GatewayState>>,
-    Extension(workspace): Extension<WorkspaceContext>,
-    Path(id): Path<String>,
-    req: Request<axum::body::Body>,
-) -> GatewayResult<Json<SessionSummary>> {
-    update_session_inner(state, &workspace, id, req).await
-}
-
-async fn update_session_inner(
+pub(super) async fn update_session_inner(
     state: Arc<GatewayState>,
     workspace: &WorkspaceContext,
     id: String,
@@ -666,16 +612,7 @@ pub async fn delete_session(
     delete_session_inner(state, &WorkspaceContext::default(), id, req).await
 }
 
-pub(crate) async fn delete_session_with_layout(
-    State(state): State<Arc<GatewayState>>,
-    Extension(workspace): Extension<WorkspaceContext>,
-    Path(id): Path<String>,
-    req: Request<axum::body::Body>,
-) -> GatewayResult<Json<DeleteResponse>> {
-    delete_session_inner(state, &workspace, id, req).await
-}
-
-async fn delete_session_inner(
+pub(super) async fn delete_session_inner(
     state: Arc<GatewayState>,
     workspace: &WorkspaceContext,
     id: String,
@@ -743,16 +680,7 @@ pub async fn search_sessions(
     search_sessions_inner(state, &WorkspaceContext::default(), query, req).await
 }
 
-pub(crate) async fn search_sessions_with_layout(
-    State(state): State<Arc<GatewayState>>,
-    Extension(workspace): Extension<WorkspaceContext>,
-    Query(query): Query<SearchQuery>,
-    req: Request<axum::body::Body>,
-) -> GatewayResult<Json<SearchResponse>> {
-    search_sessions_inner(state, &workspace, query, req).await
-}
-
-async fn search_sessions_inner(
+pub(super) async fn search_sessions_inner(
     state: Arc<GatewayState>,
     workspace: &WorkspaceContext,
     query: SearchQuery,
