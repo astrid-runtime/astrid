@@ -15,6 +15,13 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
   `astrid init` and `astrid distro apply` now require an explicit distro, first-run
   bootstrap only creates runtime state, self-update refreshes only an already locked
   distro, and agent creation no longer carries a product-distro default. Closes #1214.
+- **Removed residual product distro policy from Astrid Runtime.** Standalone
+  distro installation now requires an explicit `@owner/repo`, URL, local
+  manifest, or signed `.shuttle` input; it no longer manufactures a source URL
+  from a bare distro name. Background update does not reconstruct a source from
+  a lockfile identifier, and runtime guidance, examples, and mutable repository
+  links use neutral/current values while published WIT and package identities
+  remain unchanged. Closes #1216.
 
 - **Daemon status and shutdown now use one typed runtime-control path.**
   `astrid status` propagates daemon connection and response failures instead of

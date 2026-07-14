@@ -91,11 +91,11 @@ pub(crate) struct BrandingConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub(crate) struct DistroMeta {
-    /// Machine-readable identifier (e.g. `astralis`).
+    /// Machine-readable identifier (e.g. `example-distro`).
     pub(crate) id: String,
-    /// Display name (e.g. `Astralis`).
+    /// Display name (e.g. `Example Distro`).
     pub(crate) name: String,
-    /// Full human-readable string (e.g. `Astralis 0.1.0 (Genesis)`).
+    /// Full human-readable string (e.g. `Example Distro 0.1.0 (Genesis)`).
     #[serde(default)]
     pub(crate) pretty_name: Option<String>,
     /// Semantic version.
@@ -182,7 +182,7 @@ pub(crate) struct VariableDef {
 pub(crate) struct DistroCapsule {
     /// Capsule package name (e.g. `astrid-capsule-session`).
     pub(crate) name: String,
-    /// Source location (e.g. `@unicity-astrid/capsule-session`).
+    /// Source location (e.g. `@example-org/capsule-session`).
     pub(crate) source: String,
     /// Exact version to install (resolved to a git tag).
     pub(crate) version: String,
@@ -240,7 +240,7 @@ version = "0.1.0"
 
 [[capsule]]
 name = "astrid-capsule-cli"
-source = "@unicity-astrid/capsule-cli"
+source = "@example-org/capsule-cli"
 version = "0.1.0"
 role = "uplink"
 "#;
@@ -263,19 +263,19 @@ role = "uplink"
 schema-version = 1
 
 [distro]
-id = "astralis"
-name = "Astralis"
-pretty-name = "Astralis 0.1.0 (Genesis)"
+id = "example-distro"
+name = "Example Distro"
+pretty-name = "Example Distro 0.1.0 (Genesis)"
 version = "0.1.0"
 codename = "genesis"
 release-date = "2026-03-21"
-description = "The complete Astrid AI assistant experience"
-authors = ["Astrid Core Team"]
-maintainers = ["Joshua J. Bouw <josh@unicity-labs.com>"]
-homepage = "https://github.com/unicity-astrid/astralis"
-support = "https://github.com/unicity-astrid/astrid/discussions"
-bug-tracker = "https://github.com/unicity-astrid/astralis/issues"
-repository = "https://github.com/unicity-astrid/astralis"
+description = "An example Astrid distro"
+authors = ["Example Maintainers"]
+maintainers = ["Example Maintainer <maintainer@example.com>"]
+homepage = "https://example.com/example-distro"
+support = "https://example.com/support"
+bug-tracker = "https://example.com/issues"
+repository = "https://example.com/example-distro.git"
 license = "MIT OR Apache-2.0"
 astrid-version = ">=0.5.0"
 
@@ -289,13 +289,13 @@ base_url = { description = "Base URL", default = "https://api.openai.com" }
 
 [[capsule]]
 name = "astrid-capsule-cli"
-source = "@unicity-astrid/capsule-cli"
+source = "@example-org/capsule-cli"
 version = "0.1.0"
 role = "uplink"
 
 [[capsule]]
 name = "astrid-capsule-openai-compat"
-source = "@unicity-astrid/capsule-openai-compat"
+source = "@example-org/capsule-openai-compat"
 version = "0.1.0"
 group = "llm"
 

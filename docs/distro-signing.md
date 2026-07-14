@@ -51,8 +51,8 @@ and the roadmap (transparency log) at the end.
 ### 3.1 Generate a signing key (once)
 
 ```sh
-astrid keypair generate --name astralis-release
-# → secret at ~/.astrid/keys/local/astralis-release.ed25519 (raw 32 bytes, 0600)
+astrid keypair generate --name example-distro-release
+# → secret at ~/.astrid/keys/local/example-distro-release.ed25519 (raw 32 bytes, 0600)
 ```
 
 **Back this key up offline.** It is the trust root for every release
@@ -67,7 +67,7 @@ Get the public key in the wire form the manifest expects, and paste it
 into `Distro.toml`:
 
 ```sh
-astrid keypair pubkey astralis-release --format wire
+astrid keypair pubkey example-distro-release --format wire
 # → ed25519:AAAA...
 ```
 
@@ -83,8 +83,8 @@ pubkey = "ed25519:AAAA..."
 
 ```sh
 astrid distro seal ./Distro.toml \
-  --output astralis-0.1.0.shuttle \
-  --key ~/.astrid/keys/local/astralis-release.ed25519
+  --output example-distro-0.1.0.shuttle \
+  --key ~/.astrid/keys/local/example-distro-release.ed25519
 ```
 
 `seal` resolves each capsule to its released `.capsule` (no clone, no
@@ -100,7 +100,7 @@ rejected by `seal` — those require building from source. Pin a
 ### 3.4 Distribute
 
 Attach the `.shuttle` to the GitHub release (or host it anywhere).
-Consumers install with `astrid init ./astralis-0.1.0.shuttle`.
+Consumers install with `astrid init --distro ./example-distro-0.1.0.shuttle`.
 
 ### 3.5 Make it an *official* key (first-contact pinning)
 
@@ -112,7 +112,7 @@ distro takes the TOFU path.
 ## 4. Operator: installing a signed distro
 
 ```sh
-astrid init ./astralis-0.1.0.shuttle
+astrid init --distro ./example-distro-0.1.0.shuttle
 ```
 
 The install runs, in order: unpack (hardened — traversal/symlink/size
@@ -161,9 +161,9 @@ dangerous," put the pin where the key-holder can't reach it:
   notice. This is unaffected by upstream key theft.
 
 ```dockerfile
-COPY astralis-0.1.0.shuttle /tmp/
-RUN echo "<sha256>  /tmp/astralis-0.1.0.shuttle" | sha256sum -c - \
- && astrid init /tmp/astralis-0.1.0.shuttle --yes
+COPY example-distro-0.1.0.shuttle /tmp/
+RUN echo "<sha256>  /tmp/example-distro-0.1.0.shuttle" | sha256sum -c - \
+ && astrid init --distro /tmp/example-distro-0.1.0.shuttle --yes
 ```
 
 ## 7. Roadmap (not yet implemented)

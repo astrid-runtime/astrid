@@ -109,7 +109,7 @@ is the opposite:
   together forces unrelated lockstep bumps.
 
 When a generated client graduates into a maintained, externally
-consumed library, it gets **its own repo** under the `unicity-astrid`
+consumed library, it gets **its own repo** under the `astrid-runtime`
 org (per the polyrepo convention) — not a module inside the capsule
 SDKs. Until then, generate from the spec as described above.
 

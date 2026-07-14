@@ -34,7 +34,7 @@ use astrid_crypto::PublicKey;
 use super::lock::DistroLock;
 use super::sign;
 
-/// Official `unicity-astrid` signing keys, compiled in. A key here pins
+/// Built-in official signing keys. A key here pins
 /// without prompting on first use. Changing this set requires rebuilding
 /// the binary — that is the point: official trust is not runtime-mutable.
 ///

@@ -137,7 +137,7 @@ mod tests {
             capsules: vec![LockedCapsule {
                 name: "astrid-capsule-cli".into(),
                 version: "0.1.0".into(),
-                source: "@unicity-astrid/capsule-cli".into(),
+                source: "@example-org/capsule-cli".into(),
                 hash: "blake3:abc123".into(),
                 resolved_ref: Some("v0.1.0".into()),
             }],

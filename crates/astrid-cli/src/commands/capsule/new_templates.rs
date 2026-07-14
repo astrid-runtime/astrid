@@ -130,7 +130,7 @@ pub(super) fn readme_md(name: &str) -> String {
     format!(
         r#"# {name}
 
-An [Astrid](https://github.com/unicity-astrid/astrid) tool capsule, scaffolded
+An [Astrid](https://github.com/astrid-runtime/astrid) tool capsule, scaffolded
 by `astrid capsule new`.
 
 A capsule is a WebAssembly component that runs in the Astrid kernel's sandbox
@@ -181,7 +181,7 @@ astrid capsule install ./dist/{name}.capsule
   dev loop. Read it before you touch `src/lib.rs`.
 - If the `capsule-forge` capsule is installed, its authoring skill lives at
   `home://skills/capsule-forge/SKILL.md`.
-- The [Astrid Book](https://github.com/unicity-astrid/astrid) covers the
+- The [Astrid Book](https://github.com/astrid-runtime/astrid) covers the
   capsule model, the IPC bus, capabilities, and the WIT contracts in depth.
 "#
     )
