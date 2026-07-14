@@ -9,6 +9,9 @@ use tracing::warn;
 ///
 /// A supplied id must be canonical and registered to `caller`; an invalid,
 /// unknown, or revoked id never falls back to full-principal authority.
+/// Resolution failures deliberately share the outward scope-denial reason so
+/// authorization responses cannot reveal whether a device key exists. The
+/// structured security warning retains the operator-visible cause.
 pub(super) fn resolve_device_scope(
     profile: &PrincipalProfile,
     caller: &PrincipalId,

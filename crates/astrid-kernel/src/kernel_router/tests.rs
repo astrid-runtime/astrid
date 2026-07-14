@@ -755,6 +755,34 @@ async fn device_scope_attenuates_every_capsule_inventory_surface() {
     assert!(matches!(response, KernelResponse::Error(_)));
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn device_scope_denials_do_not_expose_key_resolution() {
+    let (_dir, kernel) = kernel_with_inventory_capsules().await;
+    let caller = PrincipalId::new("device-denial-oracle").expect("valid principal");
+    let devices = seed_inventory_device_scopes(&kernel, &caller);
+    let required = "capsule:list";
+
+    let scoped = authorize_request(
+        &kernel,
+        &caller,
+        Some(&devices.denied_global_list),
+        required,
+    )
+    .expect_err("known scoped device must be denied")
+    .to_string();
+    let malformed = authorize_request(&kernel, &caller, Some("not-a-key-id"), required)
+        .expect_err("malformed device id must be denied")
+        .to_string();
+    // Revoked devices are removed from the profile and therefore share the
+    // same resolution path as a never-registered id.
+    let unresolved = authorize_request(&kernel, &caller, Some("0000000000000000"), required)
+        .expect_err("unresolved device id must be denied")
+        .to_string();
+
+    assert_eq!(malformed, scoped);
+    assert_eq!(unresolved, scoped);
+}
+
 struct InventoryDeviceScopes {
     full: String,
     self_only: String,
