@@ -120,7 +120,7 @@ pub(crate) async fn serve(principal: Option<&str>) -> Result<ExitCode> {
     // not a chat session; the kernel attributes work via the per-message
     // `principal`, not the session.
     let session = astrid_core::SessionId::from_uuid(Uuid::new_v4());
-    let client = crate::socket_client::connect_for_workspace(session, caller.clone())
+    let client = crate::socket_client::connect_for_workspace(session, caller.clone(), None)
         .await
         .context("Failed to connect to the Astrid daemon socket")?;
 

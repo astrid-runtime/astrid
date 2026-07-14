@@ -14,9 +14,10 @@ use anyhow::Result;
 pub(crate) async fn connect_for_workspace(
     session: astrid_core::SessionId,
     principal: astrid_core::PrincipalId,
+    workspace_root: Option<&std::path::Path>,
 ) -> Result<SocketClient> {
     let client = SocketClient::connect(session, principal).await?;
-    crate::commands::daemon::ensure_daemon_workspace_matches(None).await?;
+    crate::commands::daemon::ensure_daemon_workspace_matches(workspace_root).await?;
     Ok(client)
 }
 

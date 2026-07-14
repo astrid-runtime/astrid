@@ -171,7 +171,7 @@ async fn resolve_commands() -> Result<Vec<CommandInfo>> {
     // (admin) principal — letting a non-admin enumerate capsule verbs under
     // admin context, an RBAC bypass.
     let caller = crate::principal::current();
-    let mut client = crate::socket_client::connect_for_workspace(session, caller.clone())
+    let mut client = crate::socket_client::connect_for_workspace(session, caller.clone(), None)
         .await
         .map_err(|e| anyhow::anyhow!("Failed to connect to daemon: {e}"))?;
 
@@ -210,7 +210,7 @@ async fn execute(provider: &str, verb: &str, args: &[String]) -> Result<ExitCode
     // `default` (admin) principal a nil/unstamped message falls back to.
     let caller = crate::principal::current();
     let mut client =
-        match crate::socket_client::connect_for_workspace(session, caller.clone()).await {
+        match crate::socket_client::connect_for_workspace(session, caller.clone(), None).await {
             Ok(c) => c,
             Err(e) => {
                 eprintln!(

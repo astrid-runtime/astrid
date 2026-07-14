@@ -51,7 +51,7 @@ pub(crate) async fn run_snapshot_tui(
     };
 
     let mut client =
-        socket_client::connect_for_workspace(session_id.clone(), crate::principal::current())
+        socket_client::connect_for_workspace(session_id.clone(), crate::principal::current(), None)
             .await
             .context("Failed to connect to daemon")?;
 
@@ -114,7 +114,7 @@ pub(crate) async fn run_headless(
         SessionId::from_uuid(id)
     };
     let mut client =
-        socket_client::connect_for_workspace(session_id.clone(), crate::principal::current())
+        socket_client::connect_for_workspace(session_id.clone(), crate::principal::current(), None)
             .await
             .context("Failed to connect to daemon")?;
 

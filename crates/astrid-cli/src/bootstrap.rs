@@ -192,32 +192,34 @@ pub(crate) async fn run_or_connect(
         }
     }
 
-    let mut client =
-        match socket_client::connect_for_workspace(session_id.clone(), crate::principal::current())
-            .await
-        {
-            Ok(c) => {
-                commands::daemon::ensure_daemon_workspace_matches(workspace.as_deref()).await?;
-                drop(daemon_child);
-                c
-            },
-            Err(e) => {
-                if let Some(mut child) = daemon_child {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                }
-                let log_hint = astrid_core::dirs::AstridHome::resolve().map_or_else(
-                    |_| "Failed to connect to daemon".to_string(),
-                    |h| {
-                        format!(
-                            "Failed to connect to daemon. Check logs: {}",
-                            h.log_dir().display()
-                        )
-                    },
-                );
-                return Err(e.context(log_hint));
-            },
-        };
+    let mut client = match socket_client::connect_for_workspace(
+        session_id.clone(),
+        crate::principal::current(),
+        workspace.as_deref(),
+    )
+    .await
+    {
+        Ok(c) => {
+            drop(daemon_child);
+            c
+        },
+        Err(e) => {
+            if let Some(mut child) = daemon_child {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+            let log_hint = astrid_core::dirs::AstridHome::resolve().map_or_else(
+                |_| "Failed to connect to daemon".to_string(),
+                |h| {
+                    format!(
+                        "Failed to connect to daemon. Check logs: {}",
+                        h.log_dir().display()
+                    )
+                },
+            );
+            return Err(e.context(log_hint));
+        },
+    };
 
     let workspace_root = std::env::current_dir().ok();
     let model_name = astrid_config::Config::load_with_layout(

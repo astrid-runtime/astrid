@@ -37,7 +37,7 @@ async fn hold_guard_uplink(
     daemon::ensure_daemon_quiet("mcp-session-guard").await?;
 
     let session = astrid_core::SessionId::from_uuid(Uuid::new_v4());
-    let c = crate::socket_client::connect_for_workspace(session, principal.clone())
+    let c = crate::socket_client::connect_for_workspace(session, principal.clone(), None)
         .await
         .context("failed to connect guard uplink to daemon")?;
 

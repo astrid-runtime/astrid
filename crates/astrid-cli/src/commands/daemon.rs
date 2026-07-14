@@ -179,14 +179,7 @@ async fn ensure_daemon_inner(label: &str, announce: bool) -> Result<()> {
 }
 
 pub(crate) async fn ensure_daemon_workspace_matches(workspace_root: Option<&Path>) -> Result<()> {
-    let root = workspace_root.map_or_else(
-        || std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
-        Path::to_path_buf,
-    );
-    let expected = astrid_core::dirs::workspace_selection_fingerprint(
-        &root,
-        crate::workspace_layout::current(),
-    );
+    let expected = expected_workspace_fingerprint(workspace_root);
     let ready_path = socket_client::readiness_path();
 
     for _ in 0..DAEMON_READY_ATTEMPTS {
@@ -204,6 +197,14 @@ pub(crate) async fn ensure_daemon_workspace_matches(workspace_root: Option<&Path
     anyhow::bail!(
         "daemon workspace metadata was not available within {DAEMON_READY_TIMEOUT_SECS} seconds; run `astrid restart`"
     )
+}
+
+fn expected_workspace_fingerprint(workspace_root: Option<&Path>) -> String {
+    let root = workspace_root.map_or_else(
+        || std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+        Path::to_path_buf,
+    );
+    astrid_core::dirs::workspace_selection_fingerprint(&root, crate::workspace_layout::current())
 }
 
 fn validate_daemon_workspace_metadata(metadata: &str, expected: &str) -> Result<()> {
@@ -679,6 +680,28 @@ mod tests {
                 .is_err()
         );
         validate_daemon_workspace_metadata(&format!("v1:{expected}\n"), &expected).unwrap();
+    }
+
+    #[test]
+    fn explicit_workspace_selection_wins_over_current_directory() {
+        let current = std::env::current_dir().expect("current directory");
+        let explicit = tempfile::tempdir().expect("explicit workspace");
+        assert_ne!(explicit.path(), current);
+
+        assert_eq!(
+            expected_workspace_fingerprint(Some(explicit.path())),
+            astrid_core::dirs::workspace_selection_fingerprint(
+                explicit.path(),
+                crate::workspace_layout::current(),
+            )
+        );
+        assert_eq!(
+            expected_workspace_fingerprint(None),
+            astrid_core::dirs::workspace_selection_fingerprint(
+                &current,
+                crate::workspace_layout::current(),
+            )
+        );
     }
 
     /// REGRESSION (#1120): `astrid stop` must remove the socket/PID files ONLY
