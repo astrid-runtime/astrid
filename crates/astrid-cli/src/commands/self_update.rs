@@ -731,8 +731,16 @@ async fn sync_distro_and_capsules() -> anyhow::Result<()> {
     // Do not turn that identity into an organization-qualified network fetch:
     // the runtime has no product source default and must not invent provenance.
     let lock = super::distro::lock::load_lock(&lock_path)?;
-    if let Some(message) = distro_refresh_skip_message(lock.is_some()) {
-        println!("{}", Theme::warning(message));
+    match distro_refresh_action(lock.is_some()) {
+        DistroRefreshAction::SkipNoProvenance => {
+            println!(
+                "{}",
+                Theme::warning(
+                    "Distro refresh skipped because the installed lock does not record an explicit source. Re-run `astrid init --distro <@owner/repo|URL|path|.shuttle>` to refresh it.",
+                )
+            );
+        },
+        DistroRefreshAction::NoInstalledDistro => {},
     }
 
     // Update individual capsules (checks GitHub releases for newer versions).
@@ -743,48 +751,17 @@ async fn sync_distro_and_capsules() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn distro_refresh_skip_message(has_lock: bool) -> Option<&'static str> {
-    if has_lock {
-        Some(
-            "Distro refresh skipped because the installed lock does not record an explicit source. Re-run `astrid init --distro <@owner/repo|URL|path|.shuttle>` to refresh it.",
-        )
-    } else {
-        None
-    }
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DistroRefreshAction {
+    SkipNoProvenance,
+    NoInstalledDistro,
 }
 
-/// Choose the warning text for a failed post-update distro sync.
-///
-/// The post-swap sync re-runs `init` inside the **still-running old process**
-/// (old `CARGO_PKG_VERSION`) after the new binary is already on disk. If the
-/// freshly-fetched `Distro.toml` raised its `[distro].astrid-version` floor to
-/// the new release, the version gate fires — but here it is *expected and benign*:
-/// the on-disk binary is already correct, only the in-flight process is stale, so
-/// the raw "Run `astrid update`" text would be confusing right after a successful
-/// update. We look for the typed [`AstridVersionTooOld`] and substitute an
-/// accurate "takes effect next run" message; every other failure keeps the
-/// generic "Distro sync: {e}" warning.
-///
-/// The match walks the **whole error chain** (`err.chain()`), not just the root,
-/// so the softening still fires if a caller has wrapped the gate error with
-/// `.context(...)` — a `downcast_ref` on the root alone would silently miss a
-/// context-wrapped gate and resurface the confusing raw "Run `astrid update`"
-/// text right after a successful update.
-///
-/// Pure over the error so the decision is unit-testable without running a real
-/// update.
-#[cfg(test)]
-fn post_update_sync_message(err: &anyhow::Error) -> String {
-    let is_version_gate = err.chain().any(|e| {
-        e.downcast_ref::<super::distro::validate::AstridVersionTooOld>()
-            .is_some()
-    });
-    if is_version_gate {
-        "The updated distro manifest requires the new astrid; it will take effect \
-         on your next run — restart astrid (or re-run `astrid distro apply`)."
-            .to_string()
+const fn distro_refresh_action(has_lock: bool) -> DistroRefreshAction {
+    if has_lock {
+        DistroRefreshAction::SkipNoProvenance
     } else {
-        format!("Distro sync: {err}")
+        DistroRefreshAction::NoInstalledDistro
     }
 }
 
