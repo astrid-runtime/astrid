@@ -11,6 +11,11 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
 
 ### Changed
 
+- **Astrid Runtime no longer silently selects a product distro.** Standalone
+  `astrid init` and `astrid distro apply` now require an explicit distro, first-run
+  bootstrap only creates runtime state, self-update refreshes only an already locked
+  distro, and agent creation no longer carries a product-distro default. Closes #1214.
+
 - **Daemon status and shutdown now use one typed runtime-control path.**
   `astrid status` propagates daemon connection and response failures instead of
   reporting success, and `astrid stop` sends its shutdown request through the

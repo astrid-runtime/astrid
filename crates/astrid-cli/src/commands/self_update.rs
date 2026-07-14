@@ -729,7 +729,6 @@ async fn sync_distro_and_capsules() -> anyhow::Result<()> {
 
     // Load existing lock to get the distro ID.
     let lock = super::distro::lock::load_lock(&lock_path)?;
-    let distro_id = lock.as_ref().map_or("astralis", |l| l.distro.id.as_str());
 
     // Re-run init which handles: fetch manifest, diff lock, install new capsules.
     // init is idempotent — if lock is fresh it returns immediately. This runs
@@ -738,7 +737,9 @@ async fn sync_distro_and_capsules() -> anyhow::Result<()> {
         yes: true,
         ..Default::default()
     };
-    if let Err(e) = super::init::run_init(distro_id, &sync_opts).await {
+    if let Some(lock) = lock
+        && let Err(e) = super::init::run_init(&lock.distro.id, &sync_opts).await
+    {
         println!("{}", Theme::warning(&post_update_sync_message(&e)));
     }
 

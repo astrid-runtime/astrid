@@ -7,7 +7,7 @@
 use std::process::ExitCode;
 
 use anyhow::{Context, Result};
-use astrid_core::{PrincipalId, dirs::AstridHome};
+use astrid_core::dirs::AstridHome;
 
 use crate::cli::Cli;
 use crate::commands;
@@ -15,50 +15,12 @@ use crate::formatter::OutputFormat;
 use crate::socket_client;
 use crate::theme;
 
-/// Ensure `~/.astrid/` exists and run first-boot init if needed.
+/// Ensure `~/.astrid/` exists without selecting product composition.
+#[allow(clippy::unused_async)]
 pub(crate) async fn ensure_global_config() {
     if let Ok(home) = AstridHome::resolve() {
         let _ = home.ensure();
     }
-    let _ = ensure_initialized().await;
-}
-
-/// Run `astrid init` automatically if no distro has been installed yet.
-async fn ensure_initialized() -> Result<()> {
-    if let Ok(home) = astrid_core::dirs::AstridHome::resolve() {
-        let principal = crate::principal::current();
-        if should_auto_init(&home, &principal)? {
-            eprintln!(
-                "{}",
-                theme::Theme::info("First run detected — running astrid init...")
-            );
-            commands::init::run_init("astralis", &commands::init::InitOpts::default()).await?;
-            commands::self_update::ensure_path_setup()?;
-        }
-    }
-    Ok(())
-}
-
-fn should_auto_init(home: &AstridHome, principal: &PrincipalId) -> Result<bool> {
-    let principal_home = home.principal_home(principal);
-    let lock_path = principal_home.config_dir().join("distro.lock");
-    if lock_path.exists() {
-        return Ok(false);
-    }
-    Ok(!has_installed_capsules(&principal_home.capsules_dir())?)
-}
-
-fn has_installed_capsules(capsules_dir: &std::path::Path) -> std::io::Result<bool> {
-    if !capsules_dir.is_dir() {
-        return Ok(false);
-    }
-    for entry in std::fs::read_dir(capsules_dir)? {
-        let entry = entry?;
-        if entry.file_type()?.is_dir() {
-            return Ok(true);
-        }
-    }
-    Ok(false)
 }
 
 /// Configure tracing/logging for this CLI invocation.
@@ -259,60 +221,4 @@ pub(crate) async fn run_or_connect(
         .map_or_else(|| "unknown".to_string(), |r| r.config.model.model);
 
     crate::commands::chat::run_chat(&mut client, &session_id, &model_name, format).await
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn principal(name: &str) -> PrincipalId {
-        PrincipalId::new(name).expect("test principal must be valid")
-    }
-
-    #[test]
-    fn auto_init_uses_current_principal_lockfile() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let home = AstridHome::from_path(dir.path());
-        let alice = principal("alice");
-        let alice_config = home.principal_home(&alice).config_dir();
-        std::fs::create_dir_all(&alice_config).expect("config dir");
-        std::fs::write(alice_config.join("distro.lock"), "schema-version = 1\n").expect("lockfile");
-
-        assert!(
-            !should_auto_init(&home, &alice).expect("bootstrap state"),
-            "a lockfile for the selected principal must suppress first-run init"
-        );
-        assert!(
-            should_auto_init(&home, &principal("bob")).expect("bootstrap state"),
-            "another principal must not see alice's lockfile as its own init state"
-        );
-    }
-
-    #[test]
-    fn installed_capsules_suppress_auto_init_without_lockfile() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let home = AstridHome::from_path(dir.path());
-        let alice = principal("alice");
-        let capsules = home
-            .principal_home(&alice)
-            .capsules_dir()
-            .join("astrid-capsule-registry");
-        std::fs::create_dir_all(&capsules).expect("capsule dir");
-
-        assert!(
-            !should_auto_init(&home, &alice).expect("bootstrap state"),
-            "a manually installed capsule set must not be treated as untouched first run"
-        );
-    }
-
-    #[test]
-    fn empty_principal_home_still_auto_inits() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let home = AstridHome::from_path(dir.path());
-
-        assert!(
-            should_auto_init(&home, &principal("alice")).expect("bootstrap state"),
-            "no lockfile and no installed capsules is still first run"
-        );
-    }
 }

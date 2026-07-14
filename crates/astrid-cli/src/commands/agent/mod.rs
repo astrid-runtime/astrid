@@ -70,8 +70,8 @@ pub(crate) struct CreateArgs {
     /// Agent principal name (a-z, A-Z, 0-9, -, _).
     pub name: String,
     /// Distro to apply on first boot.
-    #[arg(short, long, default_value = "astralis")]
-    pub distro: String,
+    #[arg(short, long)]
+    pub distro: Option<String>,
     /// Skip distro installation entirely.
     #[arg(long)]
     pub bare: bool,
@@ -367,7 +367,7 @@ async fn run_create(mut args: CreateArgs) -> Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
-/// Reject `--bare`, non-default `--distro`, and `--link` up front —
+/// Reject `--bare`, `--distro`, and `--link` up front —
 /// each still needs kernel-side IPC that has not shipped. Returns the
 /// exit code for the failure, or `None` if all three are absent.
 fn check_unshipped_provisioning_flags(args: &CreateArgs) -> Option<ExitCode> {
@@ -377,7 +377,7 @@ fn check_unshipped_provisioning_flags(args: &CreateArgs) -> Option<ExitCode> {
         );
         return Some(ExitCode::from(2));
     }
-    if args.distro != "astralis" {
+    if args.distro.is_some() {
         eprintln!(
             "astrid: per-agent --distro pinning needs distro management IPC that has not \
              shipped. Track in #657."
@@ -831,7 +831,7 @@ mod tests {
     fn create_with_spawned_by_is_deferred() {
         let args = CreateArgs {
             name: "x".into(),
-            distro: "astralis".into(),
+            distro: None,
             bare: false,
             groups: vec![],
             egress: None,
@@ -859,7 +859,7 @@ mod tests {
     fn vanilla_create_is_not_deferred() {
         let args = CreateArgs {
             name: "x".into(),
-            distro: "astralis".into(),
+            distro: None,
             bare: false,
             groups: vec![],
             egress: None,

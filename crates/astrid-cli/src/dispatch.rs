@@ -173,6 +173,11 @@ async fn dispatch_subcommand(
             accept_new_key,
             vars,
         }) => {
+            let distro = distro.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "astrid init requires --distro <name, @org/repo, path, or .shuttle>; Astrid Runtime does not choose a product distro"
+                )
+            })?;
             let opts = commands::init::InitOpts {
                 yes,
                 offline,
@@ -370,7 +375,11 @@ async fn dispatch_distro(command: DistroCommands) -> Result<ExitCode> {
                     &[tracker_657()],
                 ));
             }
-            let distro = name.unwrap_or_else(|| "astralis".to_string());
+            let distro = name.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "astrid distro apply requires a distro name, @org/repo, path, or .shuttle; Astrid Runtime does not choose a product distro"
+                )
+            })?;
             let opts = commands::init::InitOpts {
                 yes,
                 offline,
@@ -530,6 +539,48 @@ mod tests {
             Some("self-update"),
             "a one-character slip off the `self-update` alias must suggest it; \
              this fails if the production harvest drops aliases"
+        );
+    }
+
+    #[tokio::test]
+    async fn init_without_a_distro_never_selects_a_product_default() {
+        let error = dispatch_subcommand(
+            Some(Commands::Init {
+                distro: None,
+                yes: false,
+                offline: false,
+                allow_unsigned: false,
+                accept_new_key: false,
+                vars: Vec::new(),
+            }),
+            OutputFormat::Pretty,
+        )
+        .await
+        .expect_err("standalone init must require an explicit distro");
+
+        assert_eq!(
+            error.to_string(),
+            "astrid init requires --distro <name, @org/repo, path, or .shuttle>; Astrid Runtime does not choose a product distro"
+        );
+    }
+
+    #[tokio::test]
+    async fn distro_apply_without_a_name_never_selects_a_product_default() {
+        let error = dispatch_distro(DistroCommands::Apply {
+            name: None,
+            agent: None,
+            yes: false,
+            offline: false,
+            allow_unsigned: false,
+            accept_new_key: false,
+            vars: Vec::new(),
+        })
+        .await
+        .expect_err("standalone distro apply must require an explicit distro");
+
+        assert_eq!(
+            error.to_string(),
+            "astrid distro apply requires a distro name, @org/repo, path, or .shuttle; Astrid Runtime does not choose a product distro"
         );
     }
 }
