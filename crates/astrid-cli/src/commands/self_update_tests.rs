@@ -5,6 +5,16 @@
 use super::*;
 
 #[test]
+fn installed_distro_lock_never_implies_a_remote_refresh_source() {
+    let message = distro_refresh_skip_message(true)
+        .expect("an installed lock without source provenance must skip refresh");
+    assert!(message.contains("skipped"));
+    assert!(message.contains("--distro"));
+    assert!(!message.contains("unicity-astrid"));
+    assert!(distro_refresh_skip_message(false).is_none());
+}
+
+#[test]
 fn rc_path_guard_is_idempotent() {
     let bin = "/home/jb/.astrid/bin";
     let export = format!("export PATH=\"{bin}:$PATH\"");

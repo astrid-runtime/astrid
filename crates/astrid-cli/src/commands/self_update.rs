@@ -731,13 +731,8 @@ async fn sync_distro_and_capsules() -> anyhow::Result<()> {
     // Do not turn that identity into an organization-qualified network fetch:
     // the runtime has no product source default and must not invent provenance.
     let lock = super::distro::lock::load_lock(&lock_path)?;
-    if lock.is_some() {
-        println!(
-            "{}",
-            Theme::warning(
-                "Distro refresh skipped because the installed lock does not record an explicit source. Re-run `astrid init --distro <@owner/repo|URL|path|.shuttle>` to refresh it."
-            )
-        );
+    if let Some(message) = distro_refresh_skip_message(lock.is_some()) {
+        println!("{}", Theme::warning(message));
     }
 
     // Update individual capsules (checks GitHub releases for newer versions).
@@ -746,6 +741,16 @@ async fn sync_distro_and_capsules() -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+fn distro_refresh_skip_message(has_lock: bool) -> Option<&'static str> {
+    if has_lock {
+        Some(
+            "Distro refresh skipped because the installed lock does not record an explicit source. Re-run `astrid init --distro <@owner/repo|URL|path|.shuttle>` to refresh it.",
+        )
+    } else {
+        None
+    }
 }
 
 /// Choose the warning text for a failed post-update distro sync.
