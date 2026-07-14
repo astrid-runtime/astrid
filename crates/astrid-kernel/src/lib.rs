@@ -396,6 +396,11 @@ impl Kernel {
     }
 
     /// Boot a kernel with an explicit per-project runtime layout.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the Astrid home or native resources cannot be
+    /// acquired, or if portable kernel wiring fails.
     #[cfg(unix)]
     pub async fn new_with_workspace_layout(
         session_id: SessionId,
@@ -537,6 +542,16 @@ impl Kernel {
     }
 
     /// Construct a kernel from injected resources and workspace layout.
+    ///
+    /// # Panics
+    ///
+    /// Panics on native targets when called from a single-threaded tokio
+    /// runtime because the capsule engine requires `block_in_place`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if VFS mounts, the capability store, group
+    /// configuration, or CLI root bootstrap cannot be initialized.
     #[expect(
         clippy::too_many_lines,
         reason = "boot sequence: sequential setup that does not benefit from splitting"

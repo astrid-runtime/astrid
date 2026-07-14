@@ -320,27 +320,7 @@ fn build_authed_router(state: &Arc<GatewayState>) -> Router<Arc<GatewayState>> {
         // ── Per-principal live conversation feed (SSE, #973) ──
         .route("/api/agent/stream", get(stream::get_stream))
         // ── Conversation threads (proxied to capsule-session) ──
-        .route(
-            "/api/agent/sessions",
-            get(sessions_layout::list_sessions_with_layout),
-        )
-        // `search` is a static segment and is registered before the `:id`
-        // routes; axum prefers the static match, so `/sessions/search` never
-        // collides with `/sessions/:id`.
-        .route(
-            "/api/agent/sessions/search",
-            get(sessions_layout::search_sessions_with_layout),
-        )
-        .route(
-            "/api/agent/sessions/{id}",
-            get(sessions_layout::get_session_with_layout)
-                .patch(sessions_layout::update_session_with_layout)
-                .delete(sessions_layout::delete_session_with_layout),
-        )
-        .route(
-            "/api/agent/sessions/{id}/messages",
-            get(sessions_layout::get_session_messages_with_layout),
-        )
+        .merge(build_session_router())
         // ── Agent elicitation reply ──
         .route(
             "/api/agent/elicit-response",
@@ -371,6 +351,28 @@ fn build_authed_router(state: &Arc<GatewayState>) -> Router<Arc<GatewayState>> {
             Arc::clone(state),
             crate::auth::require_session,
         ))
+}
+
+fn build_session_router() -> Router<Arc<GatewayState>> {
+    Router::new()
+        .route(
+            "/api/agent/sessions",
+            get(sessions_layout::list_sessions_with_layout),
+        )
+        .route(
+            "/api/agent/sessions/search",
+            get(sessions_layout::search_sessions_with_layout),
+        )
+        .route(
+            "/api/agent/sessions/{id}",
+            get(sessions_layout::get_session_with_layout)
+                .patch(sessions_layout::update_session_with_layout)
+                .delete(sessions_layout::delete_session_with_layout),
+        )
+        .route(
+            "/api/agent/sessions/{id}/messages",
+            get(sessions_layout::get_session_messages_with_layout),
+        )
 }
 
 /// Apply the four static security headers every gateway response
