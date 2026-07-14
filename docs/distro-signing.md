@@ -7,7 +7,7 @@ produced it and that its contents haven't changed. This document is for
 them.
 
 If you just want to publish an online distro (a `Distro.toml` in a repo,
-installed with `astrid init @org/distro`), signing is optional — but the
+installed with `astrid init --distro @org/distro`), signing is optional — but the
 strong, offline, supply-chain-resistant path is a signed `.shuttle`, and
 that's what this covers.
 
@@ -139,7 +139,7 @@ Relevant flags (also on `astrid distro apply`):
 Yes — layered, and fail-closed where it matters:
 
 - **Producing:** optional. No `[distro.signing]` / no `--key` → an
-  unsigned distro. Local development (`astrid init ./Distro.toml`) stays
+  unsigned distro. Local development (`astrid init --distro ./Distro.toml`) stays
   frictionless.
 - **Consuming:** fail-closed. A sealed/remote artifact with no signature
   is **refused** unless the operator passes `--allow-unsigned`. Skipping

@@ -9,7 +9,7 @@ This document covers four topics:
 
 1. [Picking a model at runtime](#picking-a-model-at-runtime) -- the `astrid models` commands
 2. [Provider discovery](#provider-discovery) -- where the model list comes from
-3. [Install-time onboarding](#install-time-onboarding) -- what `astrid init` walks you through
+3. [Install-time onboarding](#install-time-onboarding) -- what `astrid init --distro` walks you through
 4. [When no model is selected](#when-no-model-is-selected) -- the error you see and how to fix it
 
 > **Running a local LLM?** The SSRF airlock blocks runtime egress to loopback and
@@ -272,8 +272,8 @@ exact ports to minimise exposure.
 
 ## Install-time onboarding
 
-`astrid init` (and `astrid distro install <distro>`) walks you through LLM
-provider setup as part of the distro install flow.
+`astrid init --distro <source>` (and `astrid distro apply <source>`) walks you
+through LLM provider setup when the selected distro includes provider capsules.
 
 ### Provider multi-select
 
