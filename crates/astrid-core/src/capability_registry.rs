@@ -117,7 +117,8 @@ const CAPABILITY_REGISTRY_REVISION_1_IDS: [&str; 51] = [
 ];
 
 /// Schema revision for the 51-ID authority registry.
-pub const CAPABILITY_REGISTRY_REVISION_1: NonZeroU32 = NonZeroU32::MIN;
+pub const CAPABILITY_REGISTRY_REVISION_1: CapabilityRegistryRevision =
+    CapabilityRegistryRevision::new(NonZeroU32::MIN);
 
 #[derive(Clone, Copy)]
 struct RevisionSemantics {
