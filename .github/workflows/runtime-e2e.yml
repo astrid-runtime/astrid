@@ -100,7 +100,8 @@ jobs:
       - name: Stage AOS monorepo outside core workspace
         run: |
           rm -rf "$RUNNER_TEMP/astrid-runtime-capsules"
-          cp -a .aos-ce "$RUNNER_TEMP/astrid-runtime-capsules"
+          mkdir -p "$RUNNER_TEMP/astrid-runtime-capsules"
+          git -C .aos-ce archive --format=tar HEAD | tar -x -C "$RUNNER_TEMP/astrid-runtime-capsules"
           cd "$RUNNER_TEMP/astrid-runtime-capsules/capsules"
           ln -s capsule-cli astrid-capsule-cli
           ln -s capsule-registry astrid-capsule-registry
