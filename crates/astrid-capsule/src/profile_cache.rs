@@ -23,7 +23,6 @@
 //! defaults or the capsule owner's limits.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
 use astrid_core::dirs::AstridHome;
@@ -35,7 +34,8 @@ use astrid_core::profile::{PrincipalProfile, ProfileError, ProfileResult};
 /// One instance is created per kernel boot and shared (via `Arc`) through
 /// the capsule load context into every [`WasmEngine`](crate::engine::wasm::WasmEngine).
 /// Reads vastly outnumber writes (entries are populated on first use and
-/// never mutated afterward), so the inner map sits behind a `RwLock`.
+/// never mutated afterward), so profiles and their per-principal invalidation
+/// generations share one `RwLock`.
 #[derive(Debug)]
 pub struct PrincipalProfileCache {
     /// Root against which principal profile paths are resolved.
@@ -46,8 +46,21 @@ pub struct PrincipalProfileCache {
     /// [`AstridHome::resolve`] once — matching the rest of the kernel's
     /// one-shot home resolution at boot.
     astrid_home: AstridHome,
-    cache: RwLock<HashMap<PrincipalId, Arc<PrincipalProfile>>>,
-    generation: AtomicU64,
+    state: RwLock<ProfileCacheState>,
+}
+
+#[derive(Debug, Default)]
+struct ProfileCacheState {
+    profiles: HashMap<PrincipalId, Arc<PrincipalProfile>>,
+    generations: HashMap<PrincipalId, u64>,
+}
+
+impl ProfileCacheState {
+    fn invalidate(&mut self, principal: &PrincipalId) {
+        self.profiles.remove(principal);
+        let generation = self.generations.entry(principal.clone()).or_default();
+        *generation = generation.wrapping_add(1);
+    }
 }
 
 impl PrincipalProfileCache {
@@ -77,8 +90,7 @@ impl PrincipalProfileCache {
     pub fn with_home(astrid_home: AstridHome) -> Self {
         Self {
             astrid_home,
-            cache: RwLock::new(HashMap::new()),
-            generation: AtomicU64::new(0),
+            state: RwLock::new(ProfileCacheState::default()),
         }
     }
 
@@ -102,16 +114,15 @@ impl PrincipalProfileCache {
     /// (see Layer 3 design doc, issue #666).
     pub fn resolve(&self, principal: &PrincipalId) -> ProfileResult<Arc<PrincipalProfile>> {
         loop {
-            if let Some(profile) = self
-                .cache
+            let state = self
+                .state
                 .read()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .get(principal)
-            {
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(profile) = state.profiles.get(principal) {
                 return Ok(Arc::clone(profile));
             }
-
-            let generation = self.generation.load(Ordering::Acquire);
+            let generation = state.generations.get(principal).copied().unwrap_or(0);
+            drop(state);
             let profile = Arc::new(PrincipalProfile::load(&self.astrid_home, principal)?);
             if let Some(profile) = self.publish_loaded(principal, profile, generation) {
                 return Ok(profile);
@@ -125,14 +136,14 @@ impl PrincipalProfileCache {
         profile: Arc<PrincipalProfile>,
         generation: u64,
     ) -> Option<Arc<PrincipalProfile>> {
-        let mut cache = self
-            .cache
+        let mut state = self
+            .state
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if self.generation.load(Ordering::Acquire) != generation {
+        if state.generations.get(principal).copied().unwrap_or(0) != generation {
             return None;
         }
-        let entry = cache.entry(principal.clone()).or_insert(profile);
+        let entry = state.profiles.entry(principal.clone()).or_insert(profile);
         Some(Arc::clone(entry))
     }
 
@@ -141,12 +152,11 @@ impl PrincipalProfileCache {
     ///
     /// A concurrent pre-invalidation load cannot repopulate the cache.
     pub fn invalidate(&self, principal: &PrincipalId) {
-        let mut cache = self
-            .cache
+        let mut state = self
+            .state
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        cache.remove(principal);
-        self.generation.fetch_add(1, Ordering::Release);
+        state.invalidate(principal);
     }
 
     /// Persist an operator-consented local-egress endpoint to `principal`'s
@@ -197,7 +207,7 @@ impl PrincipalProfileCache {
         // the disk write, or snapshot-then-swap) only if this becomes a
         // measurable `resolve()` latency source.
         let mut guard = self
-            .cache
+            .state
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
 
@@ -214,8 +224,7 @@ impl PrincipalProfileCache {
             // Already persisted for this capsule — idempotent. Drop the stale
             // cache entry so a reload reflects on-disk state, then return
             // success.
-            guard.remove(principal);
-            self.generation.fetch_add(1, Ordering::Release);
+            guard.invalidate(principal);
             return Ok(());
         }
 
@@ -223,8 +232,7 @@ impl PrincipalProfileCache {
         // `save_to_path` re-runs `validate()` before writing, so a malformed
         // profile never reaches disk.
         profile.save_to_path(&path)?;
-        guard.remove(principal);
-        self.generation.fetch_add(1, Ordering::Release);
+        guard.invalidate(principal);
         Ok(())
     }
 
@@ -232,9 +240,10 @@ impl PrincipalProfileCache {
     #[cfg(test)]
     #[must_use]
     pub(crate) fn len(&self) -> usize {
-        self.cache
+        self.state
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .profiles
             .len()
     }
 }
@@ -412,7 +421,14 @@ mod tests {
                  enabled = true\n"
             ),
         );
-        let generation = cache.generation.load(Ordering::Acquire);
+        let generation = cache
+            .state
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .generations
+            .get(&p)
+            .copied()
+            .unwrap_or(0);
         let stale = Arc::new(
             PrincipalProfile::load(&cache.astrid_home, &p).expect("load pre-invalidation profile"),
         );
@@ -430,6 +446,24 @@ mod tests {
         assert!(cache.publish_loaded(&p, stale, generation).is_none());
         assert_eq!(cache.len(), 0);
         assert!(!cache.resolve(&p).expect("resolve current profile").enabled);
+    }
+
+    #[test]
+    fn invalidating_one_principal_does_not_reject_another_principals_load() {
+        let (_dir, cache) = fixture();
+        let alice = principal("alice-invalidation");
+        let bob = principal("bob-load");
+        let bob_generation = 0;
+        let bob_profile = Arc::new(PrincipalProfile::default());
+
+        cache.invalidate(&alice);
+
+        assert!(
+            cache
+                .publish_loaded(&bob, bob_profile, bob_generation)
+                .is_some()
+        );
+        assert_eq!(cache.len(), 1);
     }
 
     #[test]
