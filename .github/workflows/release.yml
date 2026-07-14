@@ -156,7 +156,11 @@ jobs:
           sudo mv astrid-*/astrid astrid-*/astrid-daemon astrid-*/astrid-build astrid-*/astrid-emit /usr/local/bin/
           ```
 
-          Then run `astrid init` to set up capsules.
+          Astrid Runtime does not bundle a product distro. To compose it with a
+          distro you trust, run:
+          ```
+          astrid init --distro <name, @org/repo, path, or .shuttle>
+          ```
 
           ---
 

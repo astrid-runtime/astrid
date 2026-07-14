@@ -28,10 +28,16 @@ model is trusted to follow.
 
 ```bash
 brew tap astrid-runtime/tap && brew install astrid
+astrid init --distro @yourorg/your-distro
 astrid start
 astrid status
 astrid capsule list
 ```
+
+Astrid Runtime does not select or bundle a product distro. Choose a distro you
+trust and pass its name, repository, local `Distro.toml`, or signed `.shuttle`
+archive explicitly with `--distro`. Operators running an uncomposed runtime can
+skip `init` and start the daemon directly.
 
 Start with [the Book](https://github.com/astrid-runtime/book) for the
 architecture or the [Contributor Handbook](https://github.com/astrid-runtime/handbook)
@@ -146,20 +152,21 @@ manages the rest.
 
 ## Initial setup
 
-`astrid init` fetches a *distro* (a curated capsule bundle), presents a provider multi-select, and
-prompts for whatever each provider needs, including its API key. Secrets are stored per principal in
-the secret store, never passed on the command line. `init` writes a `Distro.lock` pinning every
-capsule by BLAKE3 hash, so the same `init` reproduces the same fleet.
+`astrid init --distro <source>` fetches a *distro* (a curated capsule bundle), presents any selection
+groups declared by that distro, and prompts for its required configuration. Secrets are stored per
+principal in the secret store, never passed on the command line. `init` writes a `Distro.lock`
+pinning every capsule by BLAKE3 hash, so the same explicit distro input reproduces the same fleet.
 
 ```bash
-astrid init                              # interactive: pick provider(s), enter keys
-astrid init --yes                        # non-interactive, accept defaults
-astrid init --offline ./bundle.shuttle   # install a signed bundle, no network
-astrid init --distro @yourorg/your-distro
+astrid init --distro @yourorg/your-distro          # repository distro
+astrid init --distro ./Distro.toml                  # local manifest
+astrid init --distro ./bundle.shuttle --offline     # signed bundle, no network
+astrid init --distro @yourorg/your-distro --yes     # non-interactive defaults
 ```
 
-During onboarding the model field discovers the provider's live model list from its `/v1/models`
-endpoint. After `init`, confirm the agent loop is ready, then talk to it:
+When a distro includes an LLM provider, onboarding can discover that provider's live model list from
+its `/v1/models` endpoint. If the distro also includes an agent loop, confirm that it is ready before
+starting a session:
 
 ```bash
 astrid doctor    # daemon up? capsules ready? an LLM available?
