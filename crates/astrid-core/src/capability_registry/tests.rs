@@ -72,22 +72,19 @@ fn capability_registry_revision_1_freezes_current_and_dormant_exact_ids() {
 }
 
 #[test]
-fn migration_baseline_registry_contains_every_fixed_definition() {
-    let manifest = migration_baseline_registry().unwrap();
+fn capability_registry_revision_1_contains_every_fixed_definition() {
+    let manifest = capability_registry_revision_1().unwrap();
     let ids = manifest
         .entries()
         .iter()
         .map(|entry| entry.id().as_str())
         .collect::<BTreeSet<_>>();
-    let expected = MIGRATION_BASELINE_CAPABILITY_IDS
+    let expected = CAPABILITY_REGISTRY_REVISION_1_IDS
         .iter()
         .copied()
         .collect::<BTreeSet<_>>();
 
-    assert_eq!(
-        manifest.schema_revision(),
-        MIGRATION_BASELINE_SCHEMA_REVISION
-    );
+    assert_eq!(manifest.schema_revision(), CAPABILITY_REGISTRY_REVISION_1);
     assert_eq!(manifest.entries().len(), 51);
     assert_eq!(ids, expected);
     assert!(
@@ -100,8 +97,8 @@ fn migration_baseline_registry_contains_every_fixed_definition() {
 }
 
 #[test]
-fn migration_baseline_preserves_catalog_scope_and_danger() {
-    let manifest = migration_baseline_registry().unwrap();
+fn capability_registry_revision_1_preserves_catalog_scope_and_danger() {
+    let manifest = capability_registry_revision_1().unwrap();
     for catalog_entry in CAPABILITY_CATALOG {
         let registered = manifest
             .entries()
@@ -134,20 +131,20 @@ fn migration_baseline_preserves_catalog_scope_and_danger() {
             .entries()
             .iter()
             .find(|entry| entry.id().as_str() == id)
-            .unwrap_or_else(|| panic!("missing baseline addition {id}"));
+            .unwrap_or_else(|| panic!("missing revision 1 addition {id}"));
         assert_eq!(registered.danger(), CapabilityDanger::Extreme, "{id}");
     }
 }
 
 #[test]
-fn migration_baseline_semantics_cover_sensitive_edges() {
-    let manifest = migration_baseline_registry().unwrap();
+fn capability_registry_revision_1_semantics_cover_sensitive_edges() {
+    let manifest = capability_registry_revision_1().unwrap();
     let entry = |id: &str| {
         manifest
             .entries()
             .iter()
             .find(|entry| entry.id().as_str() == id)
-            .unwrap_or_else(|| panic!("missing baseline capability {id}"))
+            .unwrap_or_else(|| panic!("missing revision 1 capability {id}"))
     };
 
     assert!(!entry("system:status").delegable());
@@ -169,214 +166,214 @@ fn migration_baseline_semantics_cover_sensitive_edges() {
 }
 
 #[test]
-fn migration_baseline_digest_vectors_are_stable() {
+fn capability_registry_revision_1_digest_vectors_are_stable() {
     let expected = [
         (
             "agent:create",
-            "c9d1587351a1456f6e50f66d377560916a7f6f92d9d131d7024ad294628529cc",
+            "4e8a0890fe5a2cedd3dfdaa20329a54a28714541677290b0104ad649094ee58e",
         ),
         (
             "agent:create:clone",
-            "eb43c11bb883dedcb5a3221a7d555c20df1ba05b7d8e5bae82a52943059d48f5",
+            "0e68aaaa67c638ea41abd52a6c38e55dfffaaa98bd7a64c89a0c0f7d54d25b7e",
         ),
         (
             "agent:create:inherit",
-            "3591843cd8e4056cc0c18b29e69c1af40c9aa7deaf1c5732bbd4d5acbacc0d9a",
+            "7c6dc890286f51fc02f6294431007a7353a4454901f9bd05a638b0bb91f532a1",
         ),
         (
             "agent:delete",
-            "b50d4003730c3a4cd97ba0ad60c9e172d5d999d47c45e75a4671e0bb19e92af7",
+            "50b16eb3103205b8a43b23c9570482ed0fb2ef6de0d7d4d4290aeb52b42fd0c9",
         ),
         (
             "agent:disable",
-            "76218ce076f9af7f55ca306140e59ddcf3addff4937898096d06b9fb01ddc169",
+            "70f598abbde78c9fa59d7283204d3112ca90d575a8a1bb8e1e159c91b5b1ecf0",
         ),
         (
             "agent:enable",
-            "26d69fe48db627f94442f56a1cd1d648e12be670cdc50342fad7051adf82fe0e",
+            "f369036099ab2ff2f4970d95a6ab3652921c96f7f335e6817350d96b2950436d",
         ),
         (
             "agent:list",
-            "b929c8c5e9867f4c8d3b9998ef03f38ef4247f2000f23ae5501871e3de0674db",
+            "e3288b4ff5930c8bb0dd5fb132424289d11245029521720933ee06b9d99a58be",
         ),
         (
             "agent:modify",
-            "688a7b33ada935bc7d12e0bf7a4c062f6040cb6066c2bac3b16bf537129b31d8",
+            "2f0b08cbbbb0608e13c41cec8e60d7569b44ab8ce67507261947e2a37d300ff7",
         ),
         (
             "audit:read_all",
-            "0b8d39b03f848957d73ad0db00977e73e09da57f69a2680f30b26668a5885c1e",
+            "d37700942d51a65ae02aef16edf6ab306d1814fe0845b52d2f07c76b19acd3de",
         ),
         (
             "auth:pair",
-            "17dd59e8d673908b9e65e9e1987ef6a956cb54ea52dd91391d39db6fb5c7a8c2",
+            "02d0db72af63a1bda4688296daa5979ca89148a3208d23641a0eafeb21c9691d",
         ),
         (
             "auth:pair:redeem",
-            "755164d6481d3474ce244048c4c3b8d4f7e53e03476150334f61b62f39bd7963",
+            "ecf9c2e6c34b9f6d26bba43040febe57c955e53290ec17516a0ca97c22932dc4",
         ),
         (
             "authority:profile:manage",
-            "ffe78ba8b48a775dbb344743463b60a5943c69ca764bb373e7111eb6c173f9a0",
+            "f5647f9424ca66e8ad86b3bbc6cd69abe769bcfaeef0afdcf1dc32ec04e66d48",
         ),
         (
             "authority:repair",
-            "1e1367b51221b5e2667c50aead762b871a1262decf3f90e8f449591912b0d848",
+            "fa83a7e2fe53adccdfb8f22ec76b16442ad348a821f91f200897385b873cc770",
         ),
         (
             "caps:grant",
-            "01655efea292a62b3656babf8d888abb1bf7752f40185a661a172633e2325823",
+            "ab418eaca028c77daee3cf24e603e2981249ba480605f9dad666abfa91d1d01f",
         ),
         (
             "caps:revoke",
-            "76ceda7e4be1cc3bc52335d30851eb478e50adb766c1817075bc5f587c4da55a",
+            "12e19d80b91efad946ed33a3a75588e4f63b157a3f025a38450c3ec3e79a4970",
         ),
         (
             "caps:token:list",
-            "176df3fd4672f24cbae46fbbca7999d9b0374019f93fc36136eecc6cb1a0991f",
+            "bc57c6774958f6df5216d77153983462c59c89a7f21db693546bbf1ed2f7de20",
         ),
         (
             "caps:token:mint",
-            "ec9841e62d5833a1b163350e7b375f25d52bfe27623fc66aecc11c9d0a0f5f25",
+            "78e21ccbbe92d40efd26d8a4ae2dc9bdfb8ec3b9182a6182ebccd1477f6d11e5",
         ),
         (
             "caps:token:revoke",
-            "6b935504883624fa06e0a0ee97aa21c889424543a08cfc30230c5c71113f1cc2",
+            "2ed0188f7ab75bb99147848c25f8847021dd59ce40bf952c36490b50f136e9af",
         ),
         (
             "capsule:access:any",
-            "f9a5c447a08aa674999b32131b9ac560812f2dcfd479a426e84922ff2d52c710",
+            "c2e5c9eaac898896dc7c0a2bd39ad84ec7cfcc5555ddc50c0b5d8cdf981a1e18",
         ),
         (
             "capsule:install",
-            "79eb65b1216c6edc719e107b91f5b33be0bb4865eb57f83fdb6df54cd936c6e5",
+            "8c6934700efda9c3077c8f2b3cb5dbc563dad62421d0a4725a982c5e5686d878",
         ),
         (
             "capsule:list",
-            "8eeb6a4ce2191d78c82dfd9598d44250af37cfe73ce80ce4c41f278688246409",
+            "4a57fb6dba5592c6d0c7f046b8373fe99de315e82f783fdae86e6b99ebed1e09",
         ),
         (
             "capsule:reload",
-            "d2b4ad2566218eb87d45cd9107d0ae45d282ffc97ec33ebc9a6b6ff03e93740f",
+            "2a8d975f2c82f0c510baf700352f38ad61aaa3244ad4341845a06184d38a6ae5",
         ),
         (
             "capsule:remove",
-            "70a45a0bbce7ea9da81e04360aba4e0f6c67ddc39ae42efe7484e2b19fa45d31",
+            "4758193d4d2aa4ec284792ee4de016aadd51ff28ff802e7bcbf684f68243edc2",
         ),
         (
             "group:create",
-            "d79da52e4033bf4e5febfcee1af9751c65a014fed1472f7b23e12420de5025ad",
+            "d8261e0b62963c7a75e47c73c7a8dfd71c898d55af212b7bbb7b1eedbfaccfbe",
         ),
         (
             "group:delete",
-            "8a00eb4cd858515050cbcf58174c8294e769fb1d407c22ad6f941c949726a89f",
+            "6c1d7bb11fcb15fcbdb5cc00892dc66b24b0721c83e2afb230fd6bd14632c9a8",
         ),
         (
             "group:list",
-            "e93d376265c24fdbc39321ef86af19c7c719687d7ea12d568bf2684c13605fc4",
+            "9a2e4502bc8b79b62eb7d0515486582ffb55d2e33ddd547706aebed0a209f3b9",
         ),
         (
             "group:modify",
-            "a3957746717fce4f1922ae255a45ae16966fb54e8f9602b0106c6cbc41fa3e67",
+            "906832c4748cdef984c2c20a066bb11614438c1197406c984fa3e18ba169f79c",
         ),
         (
             "invite:issue",
-            "dd6b1efec81f3183f82ae92dae8b3090bc22e5eb6eef6a071453c299a150574c",
+            "6304a695cf77a53846a66993940fd7fd5505aa71c65b92cb3fc003814e3eeac9",
         ),
         (
             "invite:list",
-            "5d51573ee575411b1569cb738c1b26bac068ee78331947820de912f02d2d0ecc",
+            "7f62b4b325d5a03b70b21f29ce5d3489d64e8d45572288e5b9c4ca2084b42f80",
         ),
         (
             "invite:redeem",
-            "bcf035e877441c90fee85e9fb67e17ca148f4f31d05542c13b580f4452ee4764",
+            "a6f9b37568ef8d649cbb1652408a640eac085d574313877a288aed1abe158d36",
         ),
         (
             "invite:revoke",
-            "84f8a09710474578ca166aff32347aefb7e82cdfaafe495324cb7e3e48399faf",
+            "71bfda3067d8bdb9d70eef16381bbff69866329f3cf1fae7942cd82fa246e44e",
         ),
         (
             "net_bind",
-            "573c7e818405313d3d9adb625e8c0f31ab515be1895d229166e8cddca9060f23",
+            "de912396886486562595f29f9cdb9e4e86d7cade76aa50c2b99e997cd90852bf",
         ),
         (
             "quota:get",
-            "b5af127b2ee4038daa9ee3069c3f6b808f6e9afd970ab0398b5e0b46e0d5e74e",
+            "9eafffe692d740029403f1cc4f1b997f00a30aacaa4248febde92794e899c575",
         ),
         (
             "quota:set",
-            "4064cc54281dacf202f13bcf3313eb00eb441b556312fd42d9ec23b907bc40c3",
+            "83a27029dde977fc3075653552e5a53fd3e04566297ce6c7ac3ff12fce4c7fab",
         ),
         (
             "self:agent:list",
-            "70ada28d4c69802d4601d3031b294fa4cd4d462f715a3a64c14d40afa0a20c32",
+            "4ae3e25b7eb21956fceb73eee59d9304e9a0830397e55633216e08eebc5cfdfe",
         ),
         (
             "self:approval:respond",
-            "fdac7a876ba95c7ba7c42cf1f4f5e3034dbcb3f07c865aa96b6894dd30ee7e9c",
+            "2e225891a674aee4205da30f5bbc72454df1b5b24f978acec688ddde7950cfd8",
         ),
         (
             "self:auth:pair",
-            "965a89a82060415f1440a38947760f017660dfa7cba64c0dd5f80202ed740bb5",
+            "9ab37c94ad77fc70b34ad1283b4e254573fb73d068c064c365ca3828ae679cb0",
         ),
         (
             "self:auth:pair:admin",
-            "17171d102c5907748f961ffef6363267c79142ba277719f2eada06e8140b51fa",
+            "5a4867fa2fc29d4e6607b149e92e2fcb83023f31962b4817f2b3b98ffc974469",
         ),
         (
             "self:capsule:install",
-            "04cede94f155ec402dde49baeb2a94b57c089768eb61ef691553863265770081",
+            "5383c1090fa3e204fc20f3c04d5b3acc3325566d9d49c91756af05353759c709",
         ),
         (
             "self:capsule:list",
-            "a5c24d855d68c7b336f74176360bb66dac44affd352d97d54397c149ba8c247a",
+            "c0880b629be8f453b9087a1d18f5820750e371e320f09fb7ece038117e3bd59c",
         ),
         (
             "self:capsule:reload",
-            "b6d260d5a5aea185ee8f04d751ad7e7392b753f24d42988698af0deb0b66e11a",
+            "3a0882f7d4969fd06ff42ef722062ddfee384a73e0cce2328045d5dc18384089",
         ),
         (
             "self:capsule:remove",
-            "2f50b2efdd603d2fad8aefc7a0cd785d67d29a07981afeec4c157101b58f9699",
+            "40da32931da6f54e2045c97c936c0a7cbb6e3c04a509b92e869b9adf6462dbeb",
         ),
         (
             "self:group:list",
-            "d3a41e67d25c6a2b3c67f728ff03381bfef14432f3044807a1c9fc1185d5173b",
+            "e774470a69d80d46dfee25a4029a12f52bb4792e8802bc1309c589e69a484536",
         ),
         (
             "self:quota:get",
-            "909eb0ec2fdb481a756e5d367d665219ed742c64008a6b98ec7d1caeda3cf82f",
+            "ca7311bb4622f366a71d12b33f1b3633a58bcd5af9c167a25cc2ba314d4dcbda",
         ),
         (
             "self:quota:set",
-            "0a49cae4d934a7e7cf797530e2c7c9a2dc6df7b6c1349484e497933466cccf9b",
+            "5cc56b5ba3c8232f2022b7730bb0a36ffd944dc0a7eb1eafe800c44ab7060944",
         ),
         (
             "self:workspace:promote",
-            "4ed985ebd2dd162f235f6667d7a847016b45ac9ea697a9f6c2c8762d3bf9b08e",
+            "c2e85a4b1738922a63d7be3f708982474dea52105e69ea4604d26cd0dee49cfc",
         ),
         (
             "self:workspace:rollback",
-            "a826b1764a9e6069a55d9307e96a2cedc2a4fa9df5a8b349e914be29b996a896",
+            "50817838952523b74ec779178cd6ac1ecaa9b649137e4fd09f1767f72f4520f0",
         ),
         (
             "system:resources:unbounded",
-            "8c1ff06ff52166e4c21d44483bb6ba58d9d4b3c6356d411b88fa30b210c8a70f",
+            "541ff0a36f55450dda506f8d07127e9ec585fd77a78d9895d1fe0d8befca7f91",
         ),
         (
             "system:shutdown",
-            "88bb6671343b4cfafbe8cb8a0543fea47a9d45b214f06bde24a3a7d75a2e5cef",
+            "b357447f17a3e8f5821542e96ccef03bb9ebe0be4cd55b57657e4eb8e0fefdc8",
         ),
         (
             "system:status",
-            "fead56af90fd2681c504d8a87bfc630b7f2085552b81bff03d0bcdd22e70d9b3",
+            "86b76eb96e06c806d3599620f8af6e539407f7b667641fe40e52a35bfb752c6d",
         ),
         (
             "uplink",
-            "eb57220a6af0d3eaad2cebd5a6a242a44ddda25ff31bb5968c3861659493c66c",
+            "89561b0ac228a3c5ef22b08059b4b832bd988b038e37cf548aa5d4c8fddceaf5",
         ),
     ];
-    let manifest = migration_baseline_registry().unwrap();
+    let manifest = capability_registry_revision_1().unwrap();
     let actual = manifest
         .entries()
         .iter()
@@ -391,7 +388,7 @@ fn migration_baseline_digest_vectors_are_stable() {
     }
     assert_eq!(
         manifest.digest().to_hex(),
-        "8acc9a0070c3787531b8000ab14d055003583e2c1d6256ab47186635a58a2b37"
+        "111cf3fe35104ccd25767d3f0b85778c0bb2561d10016f56ac868de4607940e6"
     );
 }
 

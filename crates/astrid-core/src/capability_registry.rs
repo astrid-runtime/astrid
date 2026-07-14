@@ -117,10 +117,10 @@ const CAPABILITY_REGISTRY_REVISION_1_IDS: [&str; 51] = [
 ];
 
 /// Schema revision for the 51-ID authority registry.
-pub const MIGRATION_BASELINE_SCHEMA_REVISION: NonZeroU32 = NonZeroU32::MIN;
+pub const CAPABILITY_REGISTRY_REVISION_1: NonZeroU32 = NonZeroU32::MIN;
 
 #[derive(Clone, Copy)]
-struct BaselineSemantics {
+struct RevisionSemantics {
     scope: CapabilityScope,
     target_kinds: &'static [AuthorityTargetKind],
     delegable: bool,
@@ -133,15 +133,16 @@ struct BaselineSemantics {
 ///
 /// Returns an error if an ID lacks fixed semantics or display metadata, or if
 /// any definition fails registry validation.
-pub fn migration_baseline_registry() -> Result<CapabilityRegistryManifest, AuthorityRegistryError> {
-    let entries = MIGRATION_BASELINE_CAPABILITY_IDS
+pub fn capability_registry_revision_1() -> Result<CapabilityRegistryManifest, AuthorityRegistryError>
+{
+    let entries = CAPABILITY_REGISTRY_REVISION_1_IDS
         .into_iter()
         .map(|id| {
-            let semantics = baseline_semantics(id).ok_or_else(|| {
-                AuthorityRegistryError::MissingBaselineDefinition { id: id.to_string() }
+            let semantics = revision_1_semantics(id).ok_or_else(|| {
+                AuthorityRegistryError::MissingRevisionDefinition { id: id.to_string() }
             })?;
-            let danger = baseline_danger(id).ok_or_else(|| {
-                AuthorityRegistryError::MissingBaselineDisplayMetadata { id: id.to_string() }
+            let danger = revision_1_danger(id).ok_or_else(|| {
+                AuthorityRegistryError::MissingRevisionDisplayMetadata { id: id.to_string() }
             })?;
             RegisteredCapability::new(
                 ExactCapabilityId::new(id.to_string())?,
@@ -155,10 +156,10 @@ pub fn migration_baseline_registry() -> Result<CapabilityRegistryManifest, Autho
         })
         .collect::<Result<Vec<_>, AuthorityRegistryError>>()?;
 
-    CapabilityRegistryManifest::new(MIGRATION_BASELINE_SCHEMA_REVISION, entries)
+    CapabilityRegistryManifest::new(CAPABILITY_REGISTRY_REVISION_1, entries)
 }
 
-fn baseline_danger(id: &str) -> Option<CapabilityDanger> {
+fn revision_1_danger(id: &str) -> Option<CapabilityDanger> {
     CAPABILITY_CATALOG
         .iter()
         .find(|entry| entry.id == id)
@@ -177,38 +178,38 @@ fn baseline_danger(id: &str) -> Option<CapabilityDanger> {
         })
 }
 
-fn baseline_semantics(id: &str) -> Option<BaselineSemantics> {
+fn revision_1_semantics(id: &str) -> Option<RevisionSemantics> {
     use AuthorityTargetKind::{
         AuditScope, CapsuleInstance, CapsulePackage, Credential, Group, Principal, System,
     };
     use CapabilityScope::{Global, Self_};
 
     let semantics = match id {
-        "system:shutdown" => BaselineSemantics::new(Global, &[System], false, true),
-        "system:status" => BaselineSemantics::new(Global, &[System], false, false),
-        "capsule:install" => BaselineSemantics::new(Global, &[System, CapsulePackage], true, true),
+        "system:shutdown" => RevisionSemantics::new(Global, &[System], false, true),
+        "system:status" => RevisionSemantics::new(Global, &[System], false, false),
+        "capsule:install" => RevisionSemantics::new(Global, &[System, CapsulePackage], true, true),
         "self:capsule:install" => {
-            BaselineSemantics::new(Self_, &[Principal, CapsulePackage], true, false)
+            RevisionSemantics::new(Self_, &[Principal, CapsulePackage], true, false)
         },
         "capsule:reload" | "capsule:remove" => {
-            BaselineSemantics::new(Global, &[System, CapsuleInstance], true, true)
+            RevisionSemantics::new(Global, &[System, CapsuleInstance], true, true)
         },
         "self:capsule:reload"
         | "self:capsule:remove"
         | "self:workspace:promote"
         | "self:workspace:rollback" => {
-            BaselineSemantics::new(Self_, &[Principal, CapsuleInstance], true, false)
+            RevisionSemantics::new(Self_, &[Principal, CapsuleInstance], true, false)
         },
         "capsule:list" | "agent:list" | "group:list" | "invite:list" => {
-            BaselineSemantics::new(Global, &[System], true, true)
+            RevisionSemantics::new(Global, &[System], true, true)
         },
         "self:capsule:list"
         | "self:agent:list"
         | "self:group:list"
         | "self:quota:get"
-        | "self:approval:respond" => BaselineSemantics::new(Self_, &[Principal], true, false),
+        | "self:approval:respond" => RevisionSemantics::new(Self_, &[Principal], true, false),
         "agent:create" | "agent:create:clone" | "agent:modify" => {
-            BaselineSemantics::new(Global, &[Principal, Group, CapsulePackage], true, true)
+            RevisionSemantics::new(Global, &[Principal, Group, CapsulePackage], true, true)
         },
         "agent:create:inherit"
         | "agent:delete"
@@ -218,41 +219,41 @@ fn baseline_semantics(id: &str) -> Option<BaselineSemantics> {
         | "quota:get"
         | "caps:grant"
         | "caps:revoke"
-        | "caps:token:list" => BaselineSemantics::new(Global, &[Principal], true, true),
-        "self:quota:set" => BaselineSemantics::new(Self_, &[Principal], true, true),
+        | "caps:token:list" => RevisionSemantics::new(Global, &[Principal], true, true),
+        "self:quota:set" => RevisionSemantics::new(Self_, &[Principal], true, true),
         "group:create" | "group:delete" | "group:modify" => {
-            BaselineSemantics::new(Global, &[Group], true, true)
+            RevisionSemantics::new(Global, &[Group], true, true)
         },
         "caps:token:mint" | "caps:token:revoke" => {
-            BaselineSemantics::new(Global, &[Principal, Credential], true, true)
+            RevisionSemantics::new(Global, &[Principal, Credential], true, true)
         },
-        "invite:issue" => BaselineSemantics::new(Global, &[Group, Credential], true, true),
+        "invite:issue" => RevisionSemantics::new(Global, &[Group, Credential], true, true),
         "invite:redeem" => {
-            BaselineSemantics::new(Global, &[Principal, Group, Credential], false, true)
+            RevisionSemantics::new(Global, &[Principal, Group, Credential], false, true)
         },
-        "invite:revoke" => BaselineSemantics::new(Global, &[Credential], true, true),
-        "audit:read_all" => BaselineSemantics::new(Global, &[AuditScope], true, true),
-        "self:auth:pair" => BaselineSemantics::new(Self_, &[Principal, Credential], true, true),
+        "invite:revoke" => RevisionSemantics::new(Global, &[Credential], true, true),
+        "audit:read_all" => RevisionSemantics::new(Global, &[AuditScope], true, true),
+        "self:auth:pair" => RevisionSemantics::new(Self_, &[Principal, Credential], true, true),
         "self:auth:pair:admin" => {
-            BaselineSemantics::new(Self_, &[Principal, Credential], false, true)
+            RevisionSemantics::new(Self_, &[Principal, Credential], false, true)
         },
-        "auth:pair:redeem" => BaselineSemantics::new(Global, &[Principal, Credential], false, true),
-        "auth:pair" => BaselineSemantics::new(Global, &[Principal, Credential], true, true),
+        "auth:pair:redeem" => RevisionSemantics::new(Global, &[Principal, Credential], false, true),
+        "auth:pair" => RevisionSemantics::new(Global, &[Principal, Credential], true, true),
         "system:resources:unbounded" | "net_bind" | "uplink" => {
-            BaselineSemantics::new(Self_, &[Principal, CapsuleInstance], false, true)
+            RevisionSemantics::new(Self_, &[Principal, CapsuleInstance], false, true)
         },
         "capsule:access:any" => {
-            BaselineSemantics::new(Self_, &[CapsulePackage, CapsuleInstance], false, true)
+            RevisionSemantics::new(Self_, &[CapsulePackage, CapsuleInstance], false, true)
         },
         "authority:profile:manage" | "authority:repair" => {
-            BaselineSemantics::new(Global, &[System, Principal, Group, Credential], false, true)
+            RevisionSemantics::new(Global, &[System, Principal, Group, Credential], false, true)
         },
         _ => return None,
     };
     Some(semantics)
 }
 
-impl BaselineSemantics {
+impl RevisionSemantics {
     const fn new(
         scope: CapabilityScope,
         target_kinds: &'static [AuthorityTargetKind],
@@ -807,14 +808,14 @@ impl CapabilityRegistryManifest {
 #[non_exhaustive]
 pub enum AuthorityRegistryError {
     /// A fixed capability ID has no authorization definition.
-    #[error("migration-baseline capability {id:?} has no authorization definition")]
-    MissingBaselineDefinition {
+    #[error("capability-registry revision 1 entry {id:?} has no authorization definition")]
+    MissingRevisionDefinition {
         /// Capability identifier.
         id: String,
     },
     /// A fixed capability ID has no danger classification.
-    #[error("migration-baseline capability {id:?} has no display metadata")]
-    MissingBaselineDisplayMetadata {
+    #[error("capability-registry revision 1 entry {id:?} has no display metadata")]
+    MissingRevisionDisplayMetadata {
         /// Capability identifier.
         id: String,
     },

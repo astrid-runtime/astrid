@@ -17,7 +17,7 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
   manifests. Existing profile persistence, wildcard evaluation, bootstrap,
   socket and wire behavior remain unchanged. Closes #1233. Refs #1228.
 
-- **The passive authority migration baseline now has fixed semantics and digest
+- **Capability-registry revision 1 now has fixed semantics and BLAKE3 digest
   vectors.** All 51 kernel entries bind scope, target kinds, delegability,
   privileged status and provenance; request mappings and current enforcement
   roles fail tests if they drift outside the registry. Authorization and
