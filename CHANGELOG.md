@@ -11,6 +11,11 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
 
 ### Changed
 
+- **Runtime E2E now stages the pinned Unicity AOS monorepo.** The workflow
+  preserves the AOS Cargo workspace outside the core checkout and supplies
+  compatibility directory aliases for the existing runtime harness, replacing
+  seven historical per-capsule repository checkouts. Closes #1220.
+
 - **Astrid Runtime no longer silently selects a product distro.** Standalone
   `astrid init` and `astrid distro apply` now require an explicit distro, first-run
   bootstrap only creates runtime state, self-update refreshes only an already locked

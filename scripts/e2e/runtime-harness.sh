@@ -324,7 +324,15 @@ main() {
   note "building .capsule artifact for lifecycle coverage"
   local capsule_dist="$ARTIFACTS/capsule-dist"
   mkdir -p "$capsule_dist"
-  run_cli capsule build "$CAPSULES_DIR/astrid-capsule-registry" --output "$capsule_dist"
+  # AOS keeps capsule sources in one Cargo workspace under `capsule-*`, while
+  # the harness's published/runtime IDs remain `astrid-capsule-*`. Prefer the
+  # canonical workspace member for Cargo resolution; historical independent
+  # checkout layouts continue through the legacy path.
+  local registry_source="$CAPSULES_DIR/capsule-registry"
+  if [[ ! -d "$registry_source" ]]; then
+    registry_source="$CAPSULES_DIR/astrid-capsule-registry"
+  fi
+  run_cli capsule build "$registry_source" --output "$capsule_dist"
   local registry_archive="$capsule_dist/astrid-capsule-registry.capsule"
   [[ -f "$registry_archive" ]] || fail "registry .capsule artifact was not built at $registry_archive"
   run_cli_offline_init_smoke "$registry_archive"
