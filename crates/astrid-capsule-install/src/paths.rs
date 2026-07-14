@@ -89,29 +89,6 @@ pub fn resolve_target_dir_for_in_workspace(
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn workspace_target_uses_injected_layout() {
-        let layout = WorkspaceLayout::new(".alternate-runtime").unwrap();
-        let root = Path::new("/workspace");
-        assert_eq!(
-            resolve_target_dir_for_in_workspace(
-                &AstridHome::from_path("/home/runtime"),
-                &install_principal(),
-                "example",
-                true,
-                Some(root),
-                &layout,
-            )
-            .unwrap(),
-            PathBuf::from("/workspace/.alternate-runtime/capsules/example")
-        );
-    }
-}
-
 /// Resolve the path to a capsule's env config file.
 ///
 /// Returns `home/{principal}/.config/env/{capsule}.env.json`.
@@ -150,5 +127,28 @@ pub fn restore_env_from_backup_for(
         && let Ok(env_path) = resolve_env_path_for(home, principal, capsule_name)
     {
         let _ = std::fs::copy(&old_env, env_path);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn workspace_target_uses_injected_layout() {
+        let layout = WorkspaceLayout::new(".alternate-runtime").unwrap();
+        let root = Path::new("/workspace");
+        assert_eq!(
+            resolve_target_dir_for_in_workspace(
+                &AstridHome::from_path("/home/runtime"),
+                &install_principal(),
+                "example",
+                true,
+                Some(root),
+                &layout,
+            )
+            .unwrap(),
+            PathBuf::from("/workspace/.alternate-runtime/capsules/example")
+        );
     }
 }

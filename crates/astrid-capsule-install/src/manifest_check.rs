@@ -36,9 +36,8 @@ pub fn validate_imports_with_layout(
     manifest: &CapsuleManifest,
     workspace_layout: &WorkspaceLayout,
 ) -> Vec<MissingImport> {
-    let home = match astrid_core::dirs::AstridHome::resolve() {
-        Ok(home) => home,
-        Err(_) => return Vec::new(),
+    let Ok(home) = astrid_core::dirs::AstridHome::resolve() else {
+        return Vec::new();
     };
     let workspace_root = std::env::current_dir().ok();
     validate_imports_in_workspace(
