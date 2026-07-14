@@ -23,6 +23,7 @@
 //! defaults or the capsule owner's limits.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
 use astrid_core::dirs::AstridHome;
@@ -46,6 +47,7 @@ pub struct PrincipalProfileCache {
     /// one-shot home resolution at boot.
     astrid_home: AstridHome,
     cache: RwLock<HashMap<PrincipalId, Arc<PrincipalProfile>>>,
+    generation: AtomicU64,
 }
 
 impl PrincipalProfileCache {
@@ -76,6 +78,7 @@ impl PrincipalProfileCache {
         Self {
             astrid_home,
             cache: RwLock::new(HashMap::new()),
+            generation: AtomicU64::new(0),
         }
     }
 
@@ -98,41 +101,52 @@ impl PrincipalProfileCache {
     /// The caller is expected to deny the invocation on any of these errors
     /// (see Layer 3 design doc, issue #666).
     pub fn resolve(&self, principal: &PrincipalId) -> ProfileResult<Arc<PrincipalProfile>> {
-        // Fast path: a concurrent reader should never take the write lock.
-        // RwLock poisoning can happen only if a writer panicked mid-insert;
-        // recover and continue — the map is a simple key → Arc mapping
-        // with no partial-write window.
-        if let Some(profile) = self
-            .cache
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(principal)
-        {
-            return Ok(Arc::clone(profile));
+        loop {
+            if let Some(profile) = self
+                .cache
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .get(principal)
+            {
+                return Ok(Arc::clone(profile));
+            }
+
+            let generation = self.generation.load(Ordering::Acquire);
+            let profile = Arc::new(PrincipalProfile::load(&self.astrid_home, principal)?);
+            if let Some(profile) = self.publish_loaded(principal, profile, generation) {
+                return Ok(profile);
+            }
         }
+    }
 
-        let profile = Arc::new(PrincipalProfile::load(&self.astrid_home, principal)?);
-
-        let mut w = self
+    fn publish_loaded(
+        &self,
+        principal: &PrincipalId,
+        profile: Arc<PrincipalProfile>,
+        generation: u64,
+    ) -> Option<Arc<PrincipalProfile>> {
+        let mut cache = self
             .cache
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        // Two threads may race to resolve the same principal; the first
-        // writer wins and the second returns the already-inserted value.
-        let entry = w.entry(principal.clone()).or_insert(profile);
-        Ok(Arc::clone(entry))
+        if self.generation.load(Ordering::Acquire) != generation {
+            return None;
+        }
+        let entry = cache.entry(principal.clone()).or_insert(profile);
+        Some(Arc::clone(entry))
     }
 
     /// Drop the cached entry for `principal`, forcing a reload on the next
     /// [`resolve`](Self::resolve) call.
     ///
-    /// Reserved for Layer 6 management IPC (`astrid.v1.admin.quota.set`).
-    /// Unused today — the invalidation model is kernel restart.
+    /// A concurrent pre-invalidation load cannot repopulate the cache.
     pub fn invalidate(&self, principal: &PrincipalId) {
-        self.cache
+        let mut cache = self
+            .cache
             .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(principal);
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        cache.remove(principal);
+        self.generation.fetch_add(1, Ordering::Release);
     }
 
     /// Persist an operator-consented local-egress endpoint to `principal`'s
@@ -201,6 +215,7 @@ impl PrincipalProfileCache {
             // cache entry so a reload reflects on-disk state, then return
             // success.
             guard.remove(principal);
+            self.generation.fetch_add(1, Ordering::Release);
             return Ok(());
         }
 
@@ -209,6 +224,7 @@ impl PrincipalProfileCache {
         // profile never reaches disk.
         profile.save_to_path(&path)?;
         guard.remove(principal);
+        self.generation.fetch_add(1, Ordering::Release);
         Ok(())
     }
 
@@ -385,6 +401,38 @@ mod tests {
     }
 
     #[test]
+    fn invalidation_prevents_stale_load_publication() {
+        let (dir, cache) = fixture();
+        let p = principal("generation-race");
+        write_profile(
+            &dir,
+            &p,
+            &format!(
+                "profile_version = {CURRENT_PROFILE_VERSION}\n\
+                 enabled = true\n"
+            ),
+        );
+        let generation = cache.generation.load(Ordering::Acquire);
+        let stale = Arc::new(
+            PrincipalProfile::load(&cache.astrid_home, &p).expect("load pre-invalidation profile"),
+        );
+
+        write_profile(
+            &dir,
+            &p,
+            &format!(
+                "profile_version = {CURRENT_PROFILE_VERSION}\n\
+                 enabled = false\n"
+            ),
+        );
+        cache.invalidate(&p);
+
+        assert!(cache.publish_loaded(&p, stale, generation).is_none());
+        assert_eq!(cache.len(), 0);
+        assert!(!cache.resolve(&p).expect("resolve current profile").enabled);
+    }
+
+    #[test]
     fn concurrent_readers_do_not_race() {
         // Lightweight contention check — not a loom model, just a sanity
         // check that multiple threads can `resolve()` the same principal
@@ -488,15 +536,22 @@ mod tests {
     fn persist_egress_is_idempotent() {
         let (_dir, cache) = fixture();
         let p = principal("bob");
+        let initial_generation = cache.generation.load(Ordering::Acquire);
         // No file on disk → starts from default (empty capsule_egress).
         cache
             .persist_egress(&p, "react", "10.0.0.5:8080")
             .expect("first persist");
+        let persisted_generation = cache.generation.load(Ordering::Acquire);
+        assert_eq!(persisted_generation, initial_generation + 1);
         // A second persist of the SAME endpoint under the SAME capsule
         // (case-insensitive) is a no-op success, not a duplicate.
         cache
             .persist_egress(&p, "react", "10.0.0.5:8080")
             .expect("idempotent persist");
+        assert_eq!(
+            cache.generation.load(Ordering::Acquire),
+            persisted_generation + 1
+        );
 
         let profile = cache.resolve(&p).expect("reload");
         assert_eq!(
