@@ -17,6 +17,7 @@
 pub mod prelude;
 
 pub mod capability_grammar;
+pub mod capability_registry;
 pub mod dirs;
 pub mod elicitation;
 pub mod env_policy;
