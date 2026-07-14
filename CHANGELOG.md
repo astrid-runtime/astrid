@@ -31,6 +31,12 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
   Signed `.shuttle` grant composition remains deferred and fails explicitly.
   Closes #1195.
 
+- **The passive authority migration baseline now has fixed semantics and digest
+  vectors.** All 51 kernel entries bind scope, target kinds, delegability,
+  privileged status and provenance; request mappings and current enforcement
+  roles fail tests if they drift outside the registry. Authorization and
+  persisted state remain unchanged. Closes #1235. Refs #1228 and #1233.
+
 ### Changed
 
 - **Device key IDs now use BLAKE3.** The short per-device handle is derived from

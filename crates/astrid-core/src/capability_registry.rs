@@ -9,7 +9,8 @@ use std::num::NonZeroU32;
 use thiserror::Error;
 
 use crate::capability_grammar::{
-    CapabilityDanger, CapabilityGrammarError, CapabilityScope, validate_capability,
+    CAPABILITY_CATALOG, CapabilityDanger, CapabilityGrammarError, CapabilityScope,
+    validate_capability,
 };
 use util::{
     domain_hash, encode_array_len, encode_bool, encode_bytes, encode_text, encode_unsigned,
@@ -114,6 +115,158 @@ const CAPABILITY_REGISTRY_REVISION_1_IDS: [&str; 51] = [
     "authority:profile:manage",
     "authority:repair",
 ];
+
+/// Schema revision for the 51-ID authority registry.
+pub const MIGRATION_BASELINE_SCHEMA_REVISION: NonZeroU32 = NonZeroU32::MIN;
+
+#[derive(Clone, Copy)]
+struct BaselineSemantics {
+    scope: CapabilityScope,
+    target_kinds: &'static [AuthorityTargetKind],
+    delegable: bool,
+    privileged: bool,
+}
+
+/// Build the content-addressed registry for the 51 fixed capability IDs.
+///
+/// # Errors
+///
+/// Returns an error if an ID lacks fixed semantics or display metadata, or if
+/// any definition fails registry validation.
+pub fn migration_baseline_registry() -> Result<CapabilityRegistryManifest, AuthorityRegistryError> {
+    let entries = MIGRATION_BASELINE_CAPABILITY_IDS
+        .into_iter()
+        .map(|id| {
+            let semantics = baseline_semantics(id).ok_or_else(|| {
+                AuthorityRegistryError::MissingBaselineDefinition { id: id.to_string() }
+            })?;
+            let danger = baseline_danger(id).ok_or_else(|| {
+                AuthorityRegistryError::MissingBaselineDisplayMetadata { id: id.to_string() }
+            })?;
+            RegisteredCapability::new(
+                ExactCapabilityId::new(id.to_string())?,
+                semantics.scope,
+                semantics.target_kinds.iter().copied(),
+                danger,
+                semantics.delegable,
+                semantics.privileged,
+                CapabilitySource::Kernel,
+            )
+        })
+        .collect::<Result<Vec<_>, AuthorityRegistryError>>()?;
+
+    CapabilityRegistryManifest::new(MIGRATION_BASELINE_SCHEMA_REVISION, entries)
+}
+
+fn baseline_danger(id: &str) -> Option<CapabilityDanger> {
+    CAPABILITY_CATALOG
+        .iter()
+        .find(|entry| entry.id == id)
+        .map(|entry| entry.danger)
+        .or_else(|| {
+            matches!(
+                id,
+                "system:resources:unbounded"
+                    | "net_bind"
+                    | "uplink"
+                    | "capsule:access:any"
+                    | "authority:profile:manage"
+                    | "authority:repair"
+            )
+            .then_some(CapabilityDanger::Extreme)
+        })
+}
+
+fn baseline_semantics(id: &str) -> Option<BaselineSemantics> {
+    use AuthorityTargetKind::{
+        AuditScope, CapsuleInstance, CapsulePackage, Credential, Group, Principal, System,
+    };
+    use CapabilityScope::{Global, Self_};
+
+    let semantics = match id {
+        "system:shutdown" => BaselineSemantics::new(Global, &[System], false, true),
+        "system:status" => BaselineSemantics::new(Global, &[System], false, false),
+        "capsule:install" => BaselineSemantics::new(Global, &[System, CapsulePackage], true, true),
+        "self:capsule:install" => {
+            BaselineSemantics::new(Self_, &[Principal, CapsulePackage], true, false)
+        },
+        "capsule:reload" | "capsule:remove" => {
+            BaselineSemantics::new(Global, &[System, CapsuleInstance], true, true)
+        },
+        "self:capsule:reload"
+        | "self:capsule:remove"
+        | "self:workspace:promote"
+        | "self:workspace:rollback" => {
+            BaselineSemantics::new(Self_, &[Principal, CapsuleInstance], true, false)
+        },
+        "capsule:list" | "agent:list" | "group:list" | "invite:list" => {
+            BaselineSemantics::new(Global, &[System], true, true)
+        },
+        "self:capsule:list"
+        | "self:agent:list"
+        | "self:group:list"
+        | "self:quota:get"
+        | "self:approval:respond" => BaselineSemantics::new(Self_, &[Principal], true, false),
+        "agent:create" | "agent:create:clone" | "agent:modify" => {
+            BaselineSemantics::new(Global, &[Principal, Group, CapsulePackage], true, true)
+        },
+        "agent:create:inherit"
+        | "agent:delete"
+        | "agent:enable"
+        | "agent:disable"
+        | "quota:set"
+        | "quota:get"
+        | "caps:grant"
+        | "caps:revoke"
+        | "caps:token:list" => BaselineSemantics::new(Global, &[Principal], true, true),
+        "self:quota:set" => BaselineSemantics::new(Self_, &[Principal], true, true),
+        "group:create" | "group:delete" | "group:modify" => {
+            BaselineSemantics::new(Global, &[Group], true, true)
+        },
+        "caps:token:mint" | "caps:token:revoke" => {
+            BaselineSemantics::new(Global, &[Principal, Credential], true, true)
+        },
+        "invite:issue" => BaselineSemantics::new(Global, &[Group, Credential], true, true),
+        "invite:redeem" => {
+            BaselineSemantics::new(Global, &[Principal, Group, Credential], false, true)
+        },
+        "invite:revoke" => BaselineSemantics::new(Global, &[Credential], true, true),
+        "audit:read_all" => BaselineSemantics::new(Global, &[AuditScope], true, true),
+        "self:auth:pair" => BaselineSemantics::new(Self_, &[Principal, Credential], true, true),
+        "self:auth:pair:admin" => {
+            BaselineSemantics::new(Self_, &[Principal, Credential], false, true)
+        },
+        "auth:pair:redeem" => BaselineSemantics::new(Global, &[Principal, Credential], false, true),
+        "auth:pair" => BaselineSemantics::new(Global, &[Principal, Credential], true, true),
+        "system:resources:unbounded" | "net_bind" | "uplink" => {
+            BaselineSemantics::new(Self_, &[Principal, CapsuleInstance], false, true)
+        },
+        "capsule:access:any" => {
+            BaselineSemantics::new(Self_, &[CapsulePackage, CapsuleInstance], false, true)
+        },
+        "authority:profile:manage" | "authority:repair" => {
+            BaselineSemantics::new(Global, &[System, Principal, Group, Credential], false, true)
+        },
+        _ => return None,
+    };
+    Some(semantics)
+}
+
+impl BaselineSemantics {
+    const fn new(
+        scope: CapabilityScope,
+        target_kinds: &'static [AuthorityTargetKind],
+        delegable: bool,
+        privileged: bool,
+    ) -> Self {
+        Self {
+            scope,
+            target_kinds,
+            delegable,
+            privileged,
+        }
+    }
+}
 
 /// A validated capability identifier containing no wildcard segment.
 ///
@@ -653,6 +806,18 @@ impl CapabilityRegistryManifest {
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum AuthorityRegistryError {
+    /// A fixed capability ID has no authorization definition.
+    #[error("migration-baseline capability {id:?} has no authorization definition")]
+    MissingBaselineDefinition {
+        /// Capability identifier.
+        id: String,
+    },
+    /// A fixed capability ID has no danger classification.
+    #[error("migration-baseline capability {id:?} has no display metadata")]
+    MissingBaselineDisplayMetadata {
+        /// Capability identifier.
+        id: String,
+    },
     /// A capability ID failed the existing static capability grammar.
     #[error("invalid capability id {id:?}: {source}")]
     InvalidCapabilityId {
