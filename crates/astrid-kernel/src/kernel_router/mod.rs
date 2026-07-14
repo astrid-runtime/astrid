@@ -431,6 +431,10 @@ async fn handle_request(
             };
             KernelResponse::Status(status)
         },
+        KernelRequest::GetRuntimeHealth => {
+            let ready = kernel.agent_readiness_probe().probe().await.ready;
+            KernelResponse::RuntimeHealth(astrid_events::kernel_api::RuntimeHealth { ready })
+        },
         KernelRequest::GetCapsuleMetadata => {
             let visibility = CapsuleVisibility::new(kernel, &caller);
             let mut entries = Vec::new();
@@ -699,7 +703,7 @@ pub fn resolve_scope(req: &KernelRequest, _caller: &PrincipalId) -> AuthoritySco
 pub fn required_capability(req: &KernelRequest, scope: AuthorityScope) -> &'static str {
     match (req, scope) {
         (KernelRequest::Shutdown { .. }, _) => "system:shutdown",
-        (KernelRequest::GetStatus, _) => "system:status",
+        (KernelRequest::GetStatus | KernelRequest::GetRuntimeHealth, _) => "system:status",
         (
             KernelRequest::ReloadCapsules | KernelRequest::ReloadCapsule { .. },
             AuthorityScope::Self_,
@@ -749,6 +753,7 @@ pub fn kernel_request_method(req: &KernelRequest) -> &'static str {
         KernelRequest::GetCommands => "GetCommands",
         KernelRequest::GetCapsuleMetadata => "GetCapsuleMetadata",
         KernelRequest::GetAgentReadiness => "GetAgentReadiness",
+        KernelRequest::GetRuntimeHealth => "GetRuntimeHealth",
         KernelRequest::Shutdown { .. } => "Shutdown",
         KernelRequest::GetStatus => "GetStatus",
     }

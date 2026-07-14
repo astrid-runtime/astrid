@@ -11,6 +11,11 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
 
 ### Changed
 
+- **Added a minimal typed runtime-health IPC operation.** Authenticated callers
+  with `system:status` can request only `{ ready: bool }`; the operation does
+  not expose daemon status, principals, capsule inventory, missing imports,
+  keys, audit data, sessions, or arbitrary control operations. Closes #1221.
+
 - **Astrid Runtime no longer silently selects a product distro.** Standalone
   `astrid init` and `astrid distro apply` now require an explicit distro, first-run
   bootstrap only creates runtime state, self-update refreshes only an already locked

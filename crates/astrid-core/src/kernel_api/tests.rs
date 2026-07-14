@@ -2,7 +2,24 @@
 //! under the 1000-line CI threshold. Included as a `tests` submodule of
 //! `kernel_api`.
 
-use super::{CommandInfo, CommandKind, KernelResponse};
+use super::{CommandInfo, CommandKind, KernelResponse, RuntimeHealth};
+
+#[test]
+fn runtime_health_wire_shape_exposes_only_ready() {
+    let json = serde_json::to_value(KernelResponse::RuntimeHealth(RuntimeHealth { ready: true }))
+        .expect("serialize runtime health");
+    assert_eq!(
+        json,
+        serde_json::json!({ "status": "RuntimeHealth", "data": { "ready": true } })
+    );
+    let health = json["data"].as_object().expect("health object");
+    assert_eq!(health.len(), 1, "health must not leak runtime detail");
+    let back: KernelResponse = serde_json::from_value(json).expect("round-trip health");
+    assert!(matches!(
+        back,
+        KernelResponse::RuntimeHealth(RuntimeHealth { ready: true })
+    ));
+}
 
 #[test]
 fn kernel_response_working_serializes_as_status_working() {

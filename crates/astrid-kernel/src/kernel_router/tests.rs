@@ -229,6 +229,7 @@ fn all_request_variants() -> Vec<KernelRequest> {
     vec![
         KernelRequest::Shutdown { reason: None },
         KernelRequest::GetStatus,
+        KernelRequest::GetRuntimeHealth,
         KernelRequest::ReloadCapsules,
         KernelRequest::ReloadCapsule {
             id: "x".to_string(),
@@ -279,6 +280,10 @@ fn required_capability_mapping_per_variant_self_scope() {
     );
     assert_eq!(
         required_capability(&KernelRequest::GetStatus, AuthorityScope::Self_),
+        "system:status"
+    );
+    assert_eq!(
+        required_capability(&KernelRequest::GetRuntimeHealth, AuthorityScope::Self_),
         "system:status"
     );
     assert_eq!(
@@ -557,6 +562,18 @@ async fn get_agent_readiness_returns_readiness_response() {
         },
         other => panic!("expected AgentReadiness, got {other:?}"),
     }
+
+    let health = request_kernel(
+        &kernel,
+        &caller,
+        "runtime_health",
+        KernelRequest::GetRuntimeHealth,
+    )
+    .await;
+    assert!(matches!(
+        health,
+        KernelResponse::RuntimeHealth(astrid_events::kernel_api::RuntimeHealth { ready: false })
+    ));
 }
 
 #[tokio::test(flavor = "multi_thread")]

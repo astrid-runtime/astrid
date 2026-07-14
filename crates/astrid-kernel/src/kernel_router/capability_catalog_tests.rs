@@ -28,6 +28,7 @@ fn all_kernel_request_variants() -> Vec<KernelRequest> {
     vec![
         KernelRequest::Shutdown { reason: None },
         KernelRequest::GetStatus,
+        KernelRequest::GetRuntimeHealth,
         KernelRequest::ReloadCapsules,
         KernelRequest::ReloadCapsule {
             id: "x".to_string(),

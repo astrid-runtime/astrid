@@ -90,6 +90,10 @@ pub enum KernelRequest {
     },
     /// Request daemon status information.
     GetStatus,
+    /// Request the minimal runtime health signal. Unlike status and agent
+    /// readiness diagnostics, this exposes no process, principal, capsule, or
+    /// import details.
+    GetRuntimeHealth,
     /// Request agent-loop readiness: whether the loaded capsule set can serve
     /// an agent chat turn. Read-only, name-agnostic — see [`AgentLoopReadiness`].
     GetAgentReadiness,
@@ -109,6 +113,8 @@ pub enum KernelResponse {
     Error(String),
     /// Daemon status information.
     Status(DaemonStatus),
+    /// Minimal runtime health information.
+    RuntimeHealth(RuntimeHealth),
     /// Agent-loop readiness report.
     AgentReadiness(AgentLoopReadiness),
     /// The request requires user capability approval before it can proceed.
@@ -133,6 +139,17 @@ pub enum KernelResponse {
     /// A stray late `Working` that races out after the terminal response is
     /// harmless: the uplink skips it and returns the already-received terminal.
     Working,
+}
+
+/// Minimal authenticated runtime-health response.
+///
+/// A successful response proves the daemon's local IPC path is reachable.
+/// `ready` additionally reports whether the loaded runtime can serve an agent
+/// turn, without exposing the capsule inventory or missing-import diagnostics.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RuntimeHealth {
+    /// Whether the loaded runtime can serve an agent turn.
+    pub ready: bool,
 }
 
 /// Daemon runtime status information.

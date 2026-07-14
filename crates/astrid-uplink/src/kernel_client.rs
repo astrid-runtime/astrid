@@ -176,6 +176,7 @@ pub const fn topic_suffix(req: &KernelRequest) -> &'static str {
         KernelRequest::GetCommands => "get_commands",
         KernelRequest::GetCapsuleMetadata => "metadata",
         KernelRequest::GetAgentReadiness => "agent_readiness",
+        KernelRequest::GetRuntimeHealth => "runtime_health",
         KernelRequest::Shutdown { .. } => "shutdown",
         KernelRequest::GetStatus => "status",
     }
@@ -414,6 +415,10 @@ mod tests {
         // Drift here means the gateway and CLI publish to different
         // topics for the same payload — silent breakage.
         assert_eq!(topic_suffix(&KernelRequest::GetStatus), "status");
+        assert_eq!(
+            topic_suffix(&KernelRequest::GetRuntimeHealth),
+            "runtime_health"
+        );
         assert_eq!(topic_suffix(&KernelRequest::ListCapsules), "list_capsules");
         assert_eq!(topic_suffix(&KernelRequest::GetCommands), "get_commands");
         assert_eq!(topic_suffix(&KernelRequest::GetCapsuleMetadata), "metadata");
