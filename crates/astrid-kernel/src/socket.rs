@@ -290,6 +290,11 @@ fn publish_readiness_metadata(path: &std::path::Path, metadata: &str) -> std::io
 
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))?;
+        }
     }
     let tmp = path.with_extension(format!("ready.tmp.{}", std::process::id()));
     let mut opts = std::fs::OpenOptions::new();
@@ -441,12 +446,19 @@ mod tests {
     #[test]
     fn readiness_metadata_is_published_atomically() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("system.ready");
+        let run_dir = dir.path().join("run");
+        let path = run_dir.join("system.ready");
 
         publish_readiness_metadata(&path, "v1:selected\n").unwrap();
 
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "v1:selected\n");
-        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+        assert_eq!(std::fs::read_dir(&run_dir).unwrap().count(), 1);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = std::fs::metadata(&run_dir).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o700);
+        }
     }
 
     #[test]
