@@ -197,7 +197,7 @@ async fn matching(
 
 async fn assert_no_grant_required(receiver: &mut astrid_events::EventReceiver) {
     assert!(
-        tokio::time::timeout(Duration::from_millis(25), receiver.recv())
+        tokio::time::timeout(Duration::from_millis(100), receiver.recv())
             .await
             .is_err()
     );
