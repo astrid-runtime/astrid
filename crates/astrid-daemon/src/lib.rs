@@ -360,6 +360,7 @@ fn spawn_gateway(
     let bus = std::sync::Arc::clone(&kernel.event_bus);
     let audit_log = std::sync::Arc::clone(&kernel.audit_log);
     let session_id = kernel.session_id.clone();
+    let capability_kernel = std::sync::Arc::clone(kernel);
     let readiness_probe = kernel.agent_readiness_probe();
     let topic_probe = kernel.capsule_topic_probe_with_warm();
     let state = astrid_gateway::GatewayState::new(
@@ -377,7 +378,14 @@ fn spawn_gateway(
         let shutdown = async move {
             notify_for_task.notified().await;
         };
-        if let Err(e) = astrid_gateway::run(state, shutdown).await {
+        let capability_probe = move |principal: &astrid_core::PrincipalId,
+                                     device_key_id: Option<&str>,
+                                     capability: &str| {
+            capability_kernel.runtime_capability_allows(principal, device_key_id, capability)
+        };
+        if let Err(e) =
+            astrid_gateway::run_with_capability_probe(state, shutdown, capability_probe).await
+        {
             tracing::error!(error = %e, "astrid-gateway exited with error");
         }
     });

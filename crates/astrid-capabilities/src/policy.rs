@@ -41,6 +41,8 @@
 //! caching. The caller is expected to have resolved the profile and
 //! the group config beforehand.
 
+use std::borrow::Cow;
+
 use astrid_core::{
     CapabilityPattern, DeviceScope, GroupConfig, PrincipalId, PrincipalProfile,
     ValidatedGroupConfig, ValidatedProfileFields, capability_matches,
@@ -110,7 +112,7 @@ pub enum PermissionError {
 pub struct CapabilityCheck<'a> {
     profile: Result<ValidatedProfileFields<'a>, String>,
     groups: Result<ValidatedGroupConfig<'a>, String>,
-    principal: PrincipalId,
+    principal: Cow<'a, PrincipalId>,
     /// Optional per-device attenuation floor. `None` (the default) means the
     /// check is unattenuated — the principal's full effective capability set
     /// applies, which is the behaviour for every full-scope / un-paired
@@ -136,7 +138,29 @@ impl<'a> CapabilityCheck<'a> {
         Self {
             profile,
             groups,
-            principal,
+            principal: Cow::Owned(principal),
+            device_scope: None,
+        }
+    }
+
+    /// Build a new check while borrowing the resolved principal identifier.
+    ///
+    /// This is equivalent to [`Self::new`] but avoids cloning an identifier
+    /// for checks that only need the boolean result from [`Self::has`]. A
+    /// denied [`Self::require`] still returns an owned identifier in its
+    /// [`PermissionError`].
+    #[must_use]
+    pub fn new_borrowed(
+        profile: &'a PrincipalProfile,
+        groups: &'a GroupConfig,
+        principal: &'a PrincipalId,
+    ) -> Self {
+        let profile = profile.typed_fields().map_err(|e| e.to_string());
+        let groups = groups.typed().map_err(|e| e.to_string());
+        Self {
+            profile,
+            groups,
+            principal: Cow::Borrowed(principal),
             device_scope: None,
         }
     }
@@ -167,7 +191,7 @@ impl<'a> CapabilityCheck<'a> {
             Err(e) => {
                 warn!(
                     security_event = true,
-                    principal = %self.principal,
+                    principal = %self.principal.as_ref(),
                     error = %e,
                     "Principal profile contains invalid typed fields — no capabilities inherited"
                 );
@@ -197,19 +221,19 @@ impl<'a> CapabilityCheck<'a> {
             Err(e) => {
                 warn!(
                     security_event = true,
-                    principal = %self.principal,
+                    principal = %self.principal.as_ref(),
                     error = %e,
                     "Principal profile contains invalid typed fields — denying capability"
                 );
                 return Err(PermissionError::MissingCapability {
-                    principal: self.principal.clone(),
+                    principal: self.principal.as_ref().clone(),
                     required: cap.to_string(),
                 });
             },
         };
         if let Some(revoke) = Self::first_matching_revoke(profile, cap) {
             return Err(PermissionError::RevokedCapability {
-                principal: self.principal.clone(),
+                principal: self.principal.as_ref().clone(),
                 required: cap.to_string(),
                 revoke_pattern: revoke.to_string(),
             });
@@ -219,7 +243,7 @@ impl<'a> CapabilityCheck<'a> {
                 || self.holds_via_groups(profile, cap);
         if !principal_holds {
             return Err(PermissionError::MissingCapability {
-                principal: self.principal.clone(),
+                principal: self.principal.as_ref().clone(),
                 required: cap.to_string(),
             });
         }
@@ -227,7 +251,7 @@ impl<'a> CapabilityCheck<'a> {
         // a scoped device's narrower grant can deny without ever widening.
         if !self.device_scope_admits(cap) {
             return Err(PermissionError::DeviceScopeDenied {
-                principal: self.principal.clone(),
+                principal: self.principal.as_ref().clone(),
                 required: cap.to_string(),
             });
         }
@@ -277,7 +301,7 @@ impl<'a> CapabilityCheck<'a> {
             Err(e) => {
                 warn!(
                     security_event = true,
-                    principal = %self.principal,
+                    principal = %self.principal.as_ref(),
                     error = %e,
                     "Group config contains invalid typed fields — no group capabilities inherited"
                 );
@@ -288,7 +312,7 @@ impl<'a> CapabilityCheck<'a> {
             let Some(group) = groups.get(name) else {
                 warn!(
                     security_event = true,
-                    principal = %self.principal,
+                    principal = %self.principal.as_ref(),
                     group = %name,
                     "Principal profile references unknown group — no capabilities inherited"
                 );
@@ -348,7 +372,7 @@ pub fn device_scope_within(
     for pattern in allow {
         if !issuer_check.has(pattern) {
             return Err(PermissionError::MissingCapability {
-                principal: issuer_check.principal.clone(),
+                principal: issuer_check.principal.as_ref().clone(),
                 required: pattern.clone(),
             });
         }
@@ -377,6 +401,35 @@ mod tests {
 
     fn pid() -> PrincipalId {
         PrincipalId::new("alice").unwrap()
+    }
+
+    #[test]
+    fn borrowed_principal_check_preserves_allow_semantics() {
+        let profile = profile_in(&["agent"]);
+        let groups = gc();
+        let principal = pid();
+        let check = CapabilityCheck::new_borrowed(&profile, &groups, &principal);
+
+        assert!(check.has("self:capsule:install"));
+        assert!(!check.has("system:shutdown"));
+        assert_eq!(principal, pid());
+    }
+
+    #[test]
+    fn borrowed_principal_is_owned_in_permission_errors() {
+        let profile = profile_in(&["restricted"]);
+        let groups = gc();
+        let principal = pid();
+        let check = CapabilityCheck::new_borrowed(&profile, &groups, &principal);
+
+        assert_eq!(
+            check.require("system:shutdown"),
+            Err(PermissionError::MissingCapability {
+                principal: principal.clone(),
+                required: "system:shutdown".to_owned(),
+            })
+        );
+        assert_eq!(principal, pid());
     }
 
     #[test]

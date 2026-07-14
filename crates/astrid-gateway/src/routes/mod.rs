@@ -7,8 +7,8 @@
 
 use std::sync::Arc;
 
-use axum::Router;
 use axum::routing::{delete, get, patch, post, put};
+use axum::{Extension, Router};
 
 use astrid_uplink::KernelClientError;
 
@@ -60,8 +60,15 @@ pub mod system;
 // not branching complexity, and both the readiness and models surfaces add
 // rows here. Splitting it into sub-routers would obscure the single
 // public/authed grouping for no readability gain.
-#[allow(clippy::too_many_lines)]
 pub fn build(state: Arc<GatewayState>) -> Router {
+    build_with_capability_probe(state, events::CapabilityProbe::deny_all())
+}
+
+#[allow(clippy::too_many_lines)]
+pub(crate) fn build_with_capability_probe(
+    state: Arc<GatewayState>,
+    capability_probe: events::CapabilityProbe,
+) -> Router {
     // Unauthenticated routes — discovery + redeem + ops probes.
     let public = Router::new()
         .route("/api/distribution", get(distribution::get_distribution))
@@ -90,6 +97,7 @@ pub fn build(state: Arc<GatewayState>) -> Router {
     let authed = build_authed_router(&state);
 
     let combined = public.merge(authed)
+        .layer(Extension(capability_probe))
         // Count every request after it routes — axum's `MatchedPath`
         // extractor gives the registered template (e.g.
         // `/api/sys/principals/:id`) so the metric stays bounded

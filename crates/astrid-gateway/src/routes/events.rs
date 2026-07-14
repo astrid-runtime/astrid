@@ -39,6 +39,32 @@ pub const AUDIT_TOPIC: &str = "astrid.v1.audit.entry";
 /// `GET /api/sys/audit` route in [`super::audit`].
 pub(super) const AUDIT_FIREHOSE_CAP: &str = "audit:read_all";
 
+type CapabilityEvaluator = dyn Fn(&PrincipalId, Option<&str>, &str) -> bool + Send + Sync + 'static;
+
+#[derive(Clone)]
+pub(crate) struct CapabilityProbe(Arc<CapabilityEvaluator>);
+
+impl CapabilityProbe {
+    pub(crate) fn new(
+        evaluator: impl Fn(&PrincipalId, Option<&str>, &str) -> bool + Send + Sync + 'static,
+    ) -> Self {
+        Self(Arc::new(evaluator))
+    }
+
+    pub(crate) fn deny_all() -> Self {
+        Self::new(|_, _, _| false)
+    }
+
+    fn allows(
+        &self,
+        principal: &PrincipalId,
+        device_key_id: Option<&str>,
+        capability: &str,
+    ) -> bool {
+        (self.0)(principal, device_key_id, capability)
+    }
+}
+
 /// `GET /api/events` — opens a long-lived Server-Sent Events
 /// stream. The connection stays open until the client disconnects
 /// or the daemon shuts down.
@@ -57,6 +83,11 @@ pub async fn get_events(
     req: Request<axum::body::Body>,
 ) -> GatewayResult<Sse<impl Stream<Item = Result<Event, Infallible>>>> {
     let caller = caller_from(&req)?.clone();
+    let capability_probe = req
+        .extensions()
+        .get::<CapabilityProbe>()
+        .cloned()
+        .unwrap_or_else(CapabilityProbe::deny_all);
 
     // Without a bus handle (the standalone GatewayState ctor used
     // by route-level tests), report an honest 502 instead of
@@ -68,72 +99,32 @@ pub async fn get_events(
         )));
     };
 
-    // Resolve whether the caller gets the firehose or the
-    // per-principal filtered view. The caller's capability set is
-    // expressed in their bearer — we don't have it directly, so
-    // ask the kernel via AgentList and look for the caller's row.
-    // AgentList is cap-gated by self:agent:list for agents and by
-    // `*` for admins, so the call always succeeds for any valid
-    // bearer. The kernel filters by scope server-side.
-    //
-    // Use the bus-direct admin client (not the socket-based one) —
-    // SSE handshakes happen once per dashboard tab open, and the
-    // socket-dial latency would otherwise dominate first-byte
-    // time for the audit stream.
-    let firehose = caller_holds(
-        &state,
+    // The kernel-owned probe applies the caller's live device scope.
+    let initial_firehose = caller_holds(
+        &capability_probe,
         &caller.principal,
         caller.device_key_id.as_deref(),
         AUDIT_FIREHOSE_CAP,
-    )
-    .await;
+    );
 
     // Routed subscription so the audit firehose gets the same
     // per-(topic, principal) DRR fairness the rest of the gateway
     // SSE streams now use (#813 Layer 4). The principal-firehose
     // filter at the post-receive layer is unchanged — it's a
     // capability gate, not a routing concern.
-    let mut receiver = bus.subscribe_topic_routed(
+    let receiver = bus.subscribe_topic_routed(
         state.gateway_route_uuid,
         AUDIT_TOPIC,
         "gateway",
         "gateway::audit_sse",
     );
-    let caller_principal = caller.principal;
-
-    let stream = async_stream::stream! {
-        // Initial handshake event so clients can confirm the
-        // stream opened without waiting on the first audit entry.
-        yield Ok::<Event, Infallible>(
-            Event::default()
-                .event("ready")
-                .data(serde_json::json!({
-                    "principal": caller_principal.to_string(),
-                    "firehose": firehose,
-                }).to_string())
-        );
-
-        while let Some(event) = receiver.recv(None).await {
-            let AstridEvent::Ipc { message, .. } = &*event else {
-                continue;
-            };
-            let IpcPayload::RawJson(val) = &message.payload else {
-                continue;
-            };
-            // Per-principal filter for non-firehose subscribers.
-            // The kernel-side broadcast embeds `principal` (the
-            // acting caller); if that's not present or doesn't
-            // match, skip silently.
-            if !firehose {
-                let entry_principal = val.get("principal").and_then(serde_json::Value::as_str);
-                if entry_principal != Some(caller_principal.as_str()) {
-                    continue;
-                }
-            }
-            let Ok(payload) = serde_json::to_string(val) else { continue };
-            yield Ok(Event::default().event("audit").data(payload));
-        }
-    };
+    let stream = audit_event_stream(
+        receiver,
+        capability_probe,
+        caller.principal,
+        caller.device_key_id,
+        initial_firehose,
+    );
 
     // Heartbeat every 15s — keeps NAT/proxy state alive and lets
     // clients distinguish "idle stream" from "daemon crashed".
@@ -144,43 +135,133 @@ pub async fn get_events(
     ))
 }
 
-/// Best-effort capability check via the kernel's `AgentList`. Returns
-/// `false` on any failure (parse error, bus unavailable) so the
-/// caller falls back to the safer per-principal filter rather than
-/// accidentally widening to the firehose.
-pub(super) async fn caller_holds(
-    state: &GatewayState,
+fn audit_event_stream(
+    mut receiver: astrid_events::RoutedEventReceiver,
+    capability_probe: CapabilityProbe,
+    caller_principal: PrincipalId,
+    device_key_id: Option<String>,
+    initial_firehose: bool,
+) -> impl Stream<Item = Result<Event, Infallible>> {
+    async_stream::stream! {
+        // Initial handshake event so clients can confirm the
+        // stream opened without waiting on the first audit entry.
+        yield Ok::<Event, Infallible>(
+            Event::default()
+                .event("ready")
+                .data(serde_json::json!({
+                    "principal": caller_principal.to_string(),
+                    "firehose": initial_firehose,
+                }).to_string())
+        );
+
+        while let Some(event) = receiver.recv(None).await {
+            let AstridEvent::Ipc { message, .. } = &*event else {
+                continue;
+            };
+            let IpcPayload::RawJson(val) = &message.payload else {
+                continue;
+            };
+            // Re-evaluate long-lived streams so policy changes and device
+            // revocation narrow the feed without waiting for reconnect.
+            let firehose = caller_holds(
+                &capability_probe,
+                &caller_principal,
+                device_key_id.as_deref(),
+                AUDIT_FIREHOSE_CAP,
+            );
+            if !firehose {
+                let entry_principal = val.get("principal").and_then(serde_json::Value::as_str);
+                if entry_principal != Some(caller_principal.as_str()) {
+                    continue;
+                }
+            }
+            let Ok(payload) = serde_json::to_string(val) else { continue };
+            yield Ok(Event::default().event("audit").data(payload));
+        }
+    }
+}
+
+/// The deny-all default keeps callers on the per-principal view.
+pub(super) fn caller_holds(
+    capability_probe: &CapabilityProbe,
     principal: &PrincipalId,
     device_key_id: Option<&str>,
     capability: &str,
 ) -> bool {
-    use astrid_core::kernel_api::{AdminRequestKind, AdminResponseBody};
-    // Carry the session's device scope: a device-scoped caller whose scope
-    // denies `self:agent:list` cannot read its own row, so the firehose check
-    // fails closed to the narrower per-principal view — a scoped device must
-    // not gain the audit firehose its principal would otherwise hold.
-    let Ok(client) = state
-        .admin_client(principal.clone())
-        .map(|c| c.with_device_key_id(device_key_id.map(str::to_owned)))
-    else {
-        return false;
-    };
-    let Ok(resp) = client.request(AdminRequestKind::AgentList).await else {
-        return false;
-    };
-    let AdminResponseBody::AgentList(list) = resp else {
-        return false;
-    };
-    // Approximate: caller holds the cap if their direct grants
-    // include it or if they're in the admin group. Group-level
-    // inheritance resolution proper lives kernel-side; the gateway
-    // doesn't have a public API for it, so we recognise the
-    // bootstrap shape (admin → universal grant) and explicit
-    // direct grants.
-    list.into_iter()
-        .find(|s| &s.principal == principal)
-        .is_some_and(|s| {
-            s.groups.iter().any(|g| g == "admin")
-                || s.grants.iter().any(|g| g == capability || g == "*")
-        })
+    capability_probe.allows(principal, device_key_id, capability)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use astrid_events::ipc::{IpcMessage, Topic};
+    use astrid_events::{AstridEvent, EventBus, EventMetadata};
+
+    fn audit_event(principal: &str) -> AstridEvent {
+        let message = IpcMessage::new(
+            Topic::from_raw(AUDIT_TOPIC),
+            IpcPayload::RawJson(serde_json::json!({ "principal": principal })),
+            uuid::Uuid::nil(),
+        )
+        .with_principal(principal.to_owned());
+        AstridEvent::Ipc {
+            metadata: EventMetadata::new("audit_stream_test"),
+            message,
+        }
+    }
+
+    #[tokio::test]
+    async fn live_stream_loses_firehose_and_keeps_own_visibility() {
+        let bus = EventBus::new();
+        let receiver = bus.subscribe_topic_routed(
+            uuid::Uuid::new_v4(),
+            AUDIT_TOPIC,
+            "gateway-test",
+            "audit_stream_test",
+        );
+        let firehose = Arc::new(AtomicBool::new(true));
+        let firehose_for_probe = Arc::clone(&firehose);
+        let probe = CapabilityProbe::new(move |principal, device_key_id, capability| {
+            principal.as_str() == "alice"
+                && device_key_id == Some("0123456789abcdef")
+                && capability == AUDIT_FIREHOSE_CAP
+                && firehose_for_probe.load(Ordering::SeqCst)
+        });
+        let principal = PrincipalId::new("alice").expect("principal");
+        let mut stream = Box::pin(audit_event_stream(
+            receiver,
+            probe,
+            principal,
+            Some("0123456789abcdef".to_owned()),
+            true,
+        ));
+
+        assert!(stream.next().await.is_some());
+        let _ = bus.publish(audit_event("bob"));
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), stream.next())
+                .await
+                .expect("firehose event")
+                .is_some()
+        );
+
+        firehose.store(false, Ordering::SeqCst);
+        let _ = bus.publish(audit_event("bob"));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), stream.next())
+                .await
+                .is_err()
+        );
+
+        let _ = bus.publish(audit_event("alice"));
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), stream.next())
+                .await
+                .expect("own event")
+                .is_some()
+        );
+    }
 }

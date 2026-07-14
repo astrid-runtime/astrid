@@ -135,6 +135,11 @@ pub async fn get_audit(
     req: Request<axum::body::Body>,
 ) -> GatewayResult<Json<AuditQueryResponse>> {
     let caller = caller_from(&req)?;
+    let capability_probe = req
+        .extensions()
+        .get::<super::events::CapabilityProbe>()
+        .cloned()
+        .unwrap_or_else(super::events::CapabilityProbe::deny_all);
     let caller_principal = caller.principal.clone();
 
     let (audit_log, session_id) = match (state.audit_log.as_ref(), state.session_id.as_ref()) {
@@ -155,17 +160,6 @@ pub async fn get_audit(
         Some(0) | None => DEFAULT_LIMIT,
         Some(l) => l,
     };
-
-    // Cap-gate: admin / `audit:read_all` callers get the firehose;
-    // everyone else is silently scoped to their own principal,
-    // matching the SSE handler's posture.
-    let firehose = super::events::caller_holds(
-        &state,
-        &caller_principal,
-        caller.device_key_id.as_deref(),
-        AUDIT_FIREHOSE_CAP,
-    )
-    .await;
 
     // Pull the full session slice from the audit log. The audit log
     // doesn't expose an "after cursor" query primitive today, so we
@@ -189,10 +183,16 @@ pub async fn get_audit(
     let mut entries: Vec<AuditEntry> = all;
     entries.reverse();
 
-    // Effective principal filter: admins can use the `principal=`
-    // query param; non-admins are pinned to their own principal
-    // regardless of what they ask for.
-    let principal_filter: Option<PrincipalId> = if firehose {
+    // Resolve an explicit filter only under post-read authority. Pagination
+    // applies the current policy to each record, so narrowing takes effect at
+    // the next record boundary.
+    let firehose_at_query_boundary = super::events::caller_holds(
+        &capability_probe,
+        &caller_principal,
+        caller.device_key_id.as_deref(),
+        AUDIT_FIREHOSE_CAP,
+    );
+    let requested_principal: Option<PrincipalId> = if firehose_at_query_boundary {
         match query.principal.as_deref() {
             Some(s) => Some(PrincipalId::new(s).map_err(|e| {
                 GatewayError::BadRequest(format!("invalid `principal` query value: {e}"))
@@ -200,7 +200,13 @@ pub async fn get_audit(
             None => None,
         }
     } else {
-        Some(caller_principal)
+        None
+    };
+    let access = AuditAccess {
+        capability_probe: &capability_probe,
+        caller_principal: &caller_principal,
+        device_key_id: caller.device_key_id.as_deref(),
+        requested_principal: requested_principal.as_ref(),
     };
 
     // Cursor is `"<ts_epoch>_<offset>"` — `offset` is the number of
@@ -210,13 +216,34 @@ pub async fn get_audit(
     // entries across the page boundary. The plain `"<ts_epoch>"`
     // shape is still accepted for compatibility with v1 cursors.
     let cursor = parse_cursor(query.cursor.as_deref())?;
-    let (page, next_cursor) =
-        paginate_page(entries, &query, principal_filter.as_ref(), cursor, limit);
+    let (page, next_cursor) = paginate_page(entries, &query, &access, cursor, limit);
 
     Ok(Json(AuditQueryResponse {
         entries: page,
         next_cursor,
     }))
+}
+
+struct AuditAccess<'a> {
+    capability_probe: &'a super::events::CapabilityProbe,
+    caller_principal: &'a PrincipalId,
+    device_key_id: Option<&'a str>,
+    requested_principal: Option<&'a PrincipalId>,
+}
+
+impl AuditAccess<'_> {
+    fn current_principal_filter(&self) -> Option<&PrincipalId> {
+        if super::events::caller_holds(
+            self.capability_probe,
+            self.caller_principal,
+            self.device_key_id,
+            AUDIT_FIREHOSE_CAP,
+        ) {
+            self.requested_principal
+        } else {
+            Some(self.caller_principal)
+        }
+    }
 }
 
 /// Walk the entries (newest first) and assemble one page worth of
@@ -228,7 +255,7 @@ pub async fn get_audit(
 fn paginate_page(
     entries: Vec<AuditEntry>,
     query: &AuditQuery,
-    principal_filter: Option<&PrincipalId>,
+    access: &AuditAccess<'_>,
     cursor: (Option<u64>, usize),
     limit: usize,
 ) -> (Vec<AuditEntryView>, Option<String>) {
@@ -257,7 +284,7 @@ fn paginate_page(
         {
             continue;
         }
-        if let Some(p) = principal_filter
+        if let Some(p) = access.current_principal_filter()
             && view.principal.as_deref() != Some(p.as_str())
         {
             continue;
@@ -363,6 +390,8 @@ fn render_entry(entry: &AuditEntry) -> Option<AuditEntryView> {
 mod tests {
     use super::*;
 
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use astrid_audit::{AuditLog, AuthorizationProof};
     use astrid_core::SessionId;
     use astrid_crypto::KeyPair;
@@ -427,6 +456,62 @@ mod tests {
         assert_eq!(view.principal.as_deref(), Some("admin"));
         assert_eq!(view.target_principal.as_deref(), Some("alice"));
         assert_eq!(view.outcome, "success");
+    }
+
+    #[tokio::test]
+    async fn pagination_narrows_live_without_hiding_the_callers_records() {
+        let log = AuditLog::in_memory(KeyPair::generate());
+        let session = SessionId::from_uuid(uuid::Uuid::nil());
+        for (principal, method) in [
+            ("alice", "AliceOwnAfterNarrowing"),
+            ("bob", "BobHiddenAfterNarrowing"),
+            ("bob", "BobVisibleBeforeNarrowing"),
+        ] {
+            log.append_with_principal(
+                session.clone(),
+                PrincipalId::new(principal).unwrap(),
+                admin_action(method, None),
+                AuthorizationProof::System {
+                    reason: "test".into(),
+                },
+                AuditOutcome::Success { details: None },
+            )
+            .await
+            .expect("append");
+        }
+        let mut entries = log.get_session_entries(&session).await.expect("read");
+        entries.reverse();
+
+        let checks = Arc::new(AtomicUsize::new(0));
+        let checks_for_probe = Arc::clone(&checks);
+        let capability_probe = super::super::events::CapabilityProbe::new(move |_, _, _| {
+            checks_for_probe.fetch_add(1, Ordering::SeqCst) == 0
+        });
+        let caller = PrincipalId::new("alice").unwrap();
+        let access = AuditAccess {
+            capability_probe: &capability_probe,
+            caller_principal: &caller,
+            device_key_id: Some("0123456789abcdef"),
+            requested_principal: None,
+        };
+
+        let (page, _) = paginate_page(
+            entries,
+            &AuditQuery::default(),
+            &access,
+            (None, 0),
+            DEFAULT_LIMIT,
+        );
+        let methods: Vec<_> = page
+            .iter()
+            .filter_map(|entry| entry.method.as_deref())
+            .collect();
+
+        assert_eq!(
+            methods,
+            vec!["BobVisibleBeforeNarrowing", "AliceOwnAfterNarrowing"]
+        );
+        assert!(!methods.contains(&"BobHiddenAfterNarrowing"));
     }
 
     #[test]

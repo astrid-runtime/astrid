@@ -20,10 +20,10 @@
 //!    the live state — `GET /api/distribution`, `GET /api/openapi.json`,
 //!    `GET /healthz`.
 //! 4. Audit events the kernel publishes on
-//!    `astrid.v1.audit.entry` reach a subscriber on the shared
-//!    `event_bus` — i.e. the SSE handler would see them when run
-//!    against a real listener. We tap the bus directly because
-//!    `Sse::keep_alive` makes `oneshot` await indefinitely.
+//!    `astrid.v1.audit.entry` reach both a direct bus subscriber and
+//!    the gateway's live SSE response. Revoking the authenticating
+//!    device immediately narrows that open response to the caller's
+//!    own records through the kernel's live policy evaluator.
 //! 5. Bearers minted by the gateway and verified by the gateway
 //!    round-trip correctly — i.e. `signed → token → verified
 //!    principal` matches against a real on-disk key.
@@ -36,11 +36,6 @@
 //!   start && curl ...` against a built daemon, and by the
 //!   in-process router tests in `astrid-gateway/tests/router.rs`
 //!   that exercise the auth middleware with mocked state.
-//! * **Full SSE streaming.** `axum::Sse` keeps the connection open
-//!   by design; `oneshot` would block. The bus-tap above proves the
-//!   audit-event arm of the wiring; the SSE serialisation itself is
-//!   covered by `astrid-gateway/src/routes/events.rs` unit tests.
-//!
 //! ## Sandbox note
 //!
 //! Unix-socket bind permissions are blocked in some sandboxed
@@ -59,8 +54,10 @@
 #![allow(unsafe_code)]
 
 use std::sync::Arc;
+use std::time::Duration;
 
-use astrid_core::PrincipalId;
+use astrid_core::kernel_api::{AdminRequestKind, AdminResponseBody};
+use astrid_core::{AuthMethod, DeviceKey, DeviceScope, PrincipalId, PrincipalProfile};
 use astrid_events::AstridEvent;
 use astrid_events::ipc::{IpcMessage, IpcPayload, Topic};
 use astrid_gateway::{GatewayConfig, GatewayState, routes};
@@ -85,6 +82,175 @@ fn set_astrid_home(dir: &TempDir) {
 
 fn looks_like_sandbox_block(err: &std::io::Error) -> bool {
     err.kind() == std::io::ErrorKind::PermissionDenied || err.raw_os_error() == Some(1) // EPERM
+}
+
+fn publish_audit_marker(event_bus: &astrid_events::EventBus, principal: &str, marker: &str) {
+    let payload = serde_json::json!({
+        "principal": principal,
+        "method": marker,
+    });
+    let message = IpcMessage::new(
+        Topic::from_raw("astrid.v1.audit.entry"),
+        IpcPayload::RawJson(payload),
+        uuid::Uuid::nil(),
+    )
+    .with_principal(principal.to_owned());
+    let _ = event_bus.publish(AstridEvent::Ipc {
+        metadata: astrid_events::EventMetadata::new("gateway_sse_policy_test"),
+        message,
+    });
+}
+
+async fn wait_for_sse_marker(
+    response: &mut reqwest::Response,
+    observed: &mut String,
+    marker: &str,
+) {
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while !observed.contains(marker) {
+            let chunk = response
+                .chunk()
+                .await
+                .expect("read SSE response")
+                .expect("SSE response closed");
+            observed.push_str(&String::from_utf8_lossy(&chunk));
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("SSE response did not contain {marker:?}: {observed}"));
+}
+
+async fn assert_sse_marker_absent(
+    response: &mut reqwest::Response,
+    observed: &mut String,
+    marker: &str,
+) {
+    assert!(!observed.contains(marker));
+    let result = tokio::time::timeout(Duration::from_millis(500), async {
+        loop {
+            let chunk = response
+                .chunk()
+                .await
+                .expect("read SSE response")
+                .expect("SSE response closed");
+            observed.push_str(&String::from_utf8_lossy(&chunk));
+            assert!(
+                !observed.contains(marker),
+                "SSE response leaked {marker:?}: {observed}"
+            );
+        }
+    })
+    .await;
+    assert!(result.is_err());
+    assert!(!observed.contains(marker));
+}
+
+async fn check_live_sse_device_revocation(
+    kernel: &Arc<astrid_kernel::Kernel>,
+    state: &Arc<GatewayState>,
+    listener: tokio::net::TcpListener,
+) {
+    let address = listener.local_addr().expect("gateway listener address");
+    let principal = PrincipalId::new("audit-e2e-principal").unwrap();
+    let device = DeviceKey::new(
+        "a".repeat(64),
+        DeviceScope::Scoped {
+            allow: vec!["audit:read_all".into()],
+            deny: vec![],
+        },
+        Some("gateway-e2e".into()),
+        0,
+    );
+    let device_key_id = device.key_id.clone();
+    let profile = PrincipalProfile {
+        grants: vec!["audit:read_all".into()],
+        auth: astrid_core::AuthConfig {
+            methods: vec![AuthMethod::Keypair],
+            public_keys: vec![device],
+        },
+        ..PrincipalProfile::default()
+    };
+    let home = astrid_core::dirs::AstridHome::resolve().expect("ASTRID_HOME");
+    profile
+        .save_to_path(&PrincipalProfile::path_for(&home, &principal))
+        .expect("save SSE principal profile");
+
+    let bearer = astrid_gateway::auth::mint_bearer_scoped(
+        &state.signing.signer,
+        &principal,
+        &device_key_id,
+        300,
+    );
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    let server_state = Arc::clone(state);
+    let policy_kernel = Arc::clone(kernel);
+    let mut server = tokio::spawn(async move {
+        astrid_gateway::run_with_capability_probe_on_listener(
+            server_state,
+            listener,
+            async move {
+                let _ = shutdown_rx.await;
+            },
+            move |principal, device_key_id, capability| {
+                policy_kernel.runtime_capability_allows(principal, device_key_id, capability)
+            },
+        )
+        .await
+    });
+
+    let client = reqwest::Client::new();
+    let url = format!("http://{address}/api/events");
+    let mut response = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            match client.get(&url).bearer_auth(&bearer).send().await {
+                Ok(response) => return response,
+                Err(_) => tokio::time::sleep(Duration::from_millis(25)).await,
+            }
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("gateway did not become ready at {url}"));
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let mut observed = String::new();
+    wait_for_sse_marker(&mut response, &mut observed, "ready").await;
+
+    publish_audit_marker(&kernel.event_bus, "bob", "BobVisibleBeforeRevocation");
+    wait_for_sse_marker(&mut response, &mut observed, "BobVisibleBeforeRevocation").await;
+
+    let revoke = state
+        .admin_client(PrincipalId::default())
+        .expect("admin client")
+        .request(AdminRequestKind::PairDeviceRevoke {
+            principal: principal.clone(),
+            key_id: device_key_id,
+        })
+        .await
+        .expect("revoke device");
+    assert!(matches!(
+        revoke,
+        AdminResponseBody::PairDeviceRevoked { .. }
+    ));
+
+    publish_audit_marker(&kernel.event_bus, "bob", "BobHiddenAfterRevocation");
+    assert_sse_marker_absent(&mut response, &mut observed, "BobHiddenAfterRevocation").await;
+    publish_audit_marker(
+        &kernel.event_bus,
+        principal.as_str(),
+        "CallerOwnAfterRevocation",
+    );
+    wait_for_sse_marker(&mut response, &mut observed, "CallerOwnAfterRevocation").await;
+    assert_sse_marker_absent(&mut response, &mut observed, "BobHiddenAfterRevocation").await;
+
+    drop(response);
+    let _ = shutdown_tx.send(());
+    match tokio::time::timeout(Duration::from_secs(3), &mut server).await {
+        Ok(result) => result.expect("gateway task").expect("gateway shutdown"),
+        Err(_) => {
+            server.abort();
+            let _ = server.await;
+            panic!("gateway shutdown timed out");
+        },
+    }
 }
 
 async fn check_unauthenticated_routes(router: Router) {
@@ -258,8 +424,16 @@ async fn kernel_and_gateway_boot_against_shared_home() {
     // every subsequent boot loads. Both paths are covered by the
     // SigningMaterial unit tests; here we just confirm the on-disk
     // artefact lands.
+    let gateway_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind gateway listener");
+    let gateway_address = gateway_listener
+        .local_addr()
+        .expect("gateway listener address");
+    let mut gateway_config = GatewayConfig::default();
+    gateway_config.listen = gateway_address.to_string();
     let state = GatewayState::new(
-        GatewayConfig::default(),
+        gateway_config,
         Some(Arc::clone(&kernel.event_bus)),
         Some(Arc::clone(&kernel.audit_log)),
         Some(kernel.session_id.clone()),
@@ -292,6 +466,8 @@ async fn kernel_and_gateway_boot_against_shared_home() {
     // agent-loop fail-fast path closes immediately when no capsule
     // is loaded.
     check_bearer_roundtrip(router, &state).await;
+
+    check_live_sse_device_revocation(&kernel, &state, gateway_listener).await;
 
     // ── Cleanup ─────────────────────────────────────────────────
     kernel.shutdown(Some("e2e-test-complete".into())).await;

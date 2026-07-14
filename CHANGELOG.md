@@ -140,6 +140,10 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
   identities fail closed. `capsule:list` controls global describe visibility,
   while exact `capsule:access:any` controls unrestricted execution. Closes
   #1239.
+- **Audit views now use the live kernel authority evaluator.** Historical and
+  streaming firehose access carries the authenticated device scope; revoked,
+  disabled, malformed, unknown, or narrowed credentials fall back to the
+  caller's own records. Closes #1241.
 
 - **Device attenuation now applies to every kernel authority view.** Capsule,
   agent, and group inventory checks use the authenticating device scope, and a
