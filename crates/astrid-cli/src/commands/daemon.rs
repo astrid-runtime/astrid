@@ -202,8 +202,7 @@ pub(crate) async fn ensure_daemon_workspace_matches(workspace_root: Option<&Path
     }
 
     anyhow::bail!(
-        "daemon workspace metadata was not available within {} seconds; run `astrid restart`",
-        DAEMON_READY_TIMEOUT_SECS
+        "daemon workspace metadata was not available within {DAEMON_READY_TIMEOUT_SECS} seconds; run `astrid restart`"
     )
 }
 
