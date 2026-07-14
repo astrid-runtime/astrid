@@ -599,3 +599,43 @@ async fn check_net_connect_matches_allowlist_entry() {
     );
     assert!(gate.check_net_connect("c", "evil.com", 443).await.is_err());
 }
+
+#[tokio::test]
+async fn check_net_tcp_bind_matches_net_bind_host_port() {
+    let mut manifest = make_manifest(vec![], vec![], vec![]);
+    manifest.capabilities.net_bind = vec!["127.0.0.1:8799".to_string()];
+    let gate = ManifestSecurityGate::new(manifest, workspace_root(), None);
+    // Exact host:port allowed.
+    assert!(gate.check_net_tcp_bind("c", "127.0.0.1", 8799).await.is_ok());
+    // Wrong port denied.
+    assert!(gate.check_net_tcp_bind("c", "127.0.0.1", 9000).await.is_err());
+    // Wrong host denied.
+    assert!(gate.check_net_tcp_bind("c", "0.0.0.0", 8799).await.is_err());
+}
+
+#[tokio::test]
+async fn check_net_tcp_bind_wildcard_port() {
+    let mut manifest = make_manifest(vec![], vec![], vec![]);
+    manifest.capabilities.net_bind = vec!["127.0.0.1:*".to_string()];
+    let gate = ManifestSecurityGate::new(manifest, workspace_root(), None);
+    assert!(gate.check_net_tcp_bind("c", "127.0.0.1", 8799).await.is_ok());
+    assert!(gate.check_net_tcp_bind("c", "127.0.0.1", 1234).await.is_ok());
+}
+
+#[tokio::test]
+async fn check_net_tcp_bind_unix_entry_does_not_authorize_tcp() {
+    // The CLI proxy declares `net_bind = ["unix:*"]`. That entry must NEVER
+    // authorize an inbound TCP bind — the two socket families share the field
+    // without cross-authorizing.
+    let mut manifest = make_manifest(vec![], vec![], vec![]);
+    manifest.capabilities.net_bind = vec!["unix:*".to_string()];
+    let gate = ManifestSecurityGate::new(manifest, workspace_root(), None);
+    assert!(gate.check_net_tcp_bind("c", "127.0.0.1", 8799).await.is_err());
+}
+
+#[tokio::test]
+async fn check_net_tcp_bind_empty_net_bind_denies() {
+    let manifest = make_manifest(vec![], vec![], vec![]);
+    let gate = ManifestSecurityGate::new(manifest, workspace_root(), None);
+    assert!(gate.check_net_tcp_bind("c", "127.0.0.1", 8799).await.is_err());
+}
