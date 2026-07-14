@@ -1,8 +1,8 @@
 //! Acceptance tests for per-device capability scope on pairing.
 //!
-//! These drive the kernel/handler path end-to-end (real `Kernel`, profiles on
-//! disk, with the same authorization snapshot the IPC router uses) and
-//! prove the no-escalation guarantees the feature exists to provide:
+//! These drive the kernel/handler path end-to-end with a real `Kernel`,
+//! disk-backed profiles, and the same authorization snapshot as the IPC router.
+//! They prove the no-escalation guarantees the feature exists to provide:
 //!
 //! * a `use-only` device cannot mint pair-tokens (cap-gate denial), but the
 //!   same principal can from a full device;
