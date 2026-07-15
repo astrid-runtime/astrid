@@ -45,7 +45,7 @@ use arc_swap::ArcSwap;
 use astrid_capabilities::CapabilityCheck;
 use astrid_core::GroupConfig;
 use astrid_core::principal::PrincipalId;
-use astrid_core::profile::{DeviceKeyId, DeviceScope, PrincipalProfile};
+use astrid_core::profile::{DeviceKeyId, PrincipalProfile};
 use tracing::warn;
 
 use crate::capsule::CapsuleId;
@@ -327,7 +327,7 @@ mod tests {
 
     use astrid_core::dirs::AstridHome;
     use astrid_core::groups::{BUILTIN_ADMIN, Group, GroupConfig};
-    use astrid_core::profile::{AuthConfig, AuthMethod, DeviceKey, PrincipalProfile};
+    use astrid_core::profile::{AuthConfig, AuthMethod, DeviceKey, DeviceScope, PrincipalProfile};
 
     fn fixture() -> (tempfile::TempDir, AstridHome, CapsuleAccessResolver) {
         let (dir, home, _cache, resolver) = fixture_with_cache();
