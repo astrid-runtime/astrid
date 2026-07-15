@@ -149,7 +149,11 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
   disabled, malformed, unknown, or narrowed credentials fall back to the
   caller's own records. Historical continuation cursors bind the immutable
   audit-entry identity and visibility scope, preventing same-second appends
-  from shifting the page boundary and rejecting unsafe widening. Closes #1241.
+  from shifting the page boundary and rejecting unsafe widening. Co-located
+  callers that need firehose visibility must now pass the kernel evaluator via
+  `astrid_gateway::run_with_capability_probe(...)` or
+  `routes::build_with_capability_probe(...)`; the legacy default runner and
+  router remain self-only. Closes #1241.
 
 - **Device attenuation now applies to every kernel authority view.** Capsule,
   agent, and group inventory checks use the authenticating device scope, and a
