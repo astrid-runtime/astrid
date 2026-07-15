@@ -278,7 +278,7 @@ pub async fn get_audit(
     // plain `"<ts_epoch>"` and v2 `"<ts_epoch>_<offset>"` shapes are
     // still accepted for compatibility.
     let cursor = parse_cursor(query.cursor.as_deref())?;
-    validate_cursor_scope(cursor.2.as_ref(), &access)?;
+    validate_cursor_scope(cursor.0, cursor.2.as_ref(), &query, &access)?;
     let (page, next_cursor) = paginate_page(entries, &query, &access, cursor, limit)?;
 
     Ok(Json(AuditQueryResponse {
@@ -317,14 +317,32 @@ impl AuditAccess<'_> {
 }
 
 fn validate_cursor_scope(
+    cursor_ts: Option<u64>,
     cursor_scope: Option<&CursorScope>,
+    query: &AuditQuery,
     access: &AuditAccess<'_>,
 ) -> GatewayResult<()> {
-    let Some(previous_scope) = cursor_scope else {
-        return Ok(());
-    };
     let current_scope = access.current_cursor_scope();
-    validate_scope_continuation(previous_scope, &current_scope)
+    match cursor_scope {
+        Some(previous_scope) => validate_scope_continuation(previous_scope, &current_scope),
+        None if cursor_ts.is_some() => validate_legacy_cursor_scope(query, access, &current_scope),
+        None => Ok(()),
+    }
+}
+
+fn validate_legacy_cursor_scope(
+    query: &AuditQuery,
+    access: &AuditAccess<'_>,
+    current_scope: &CursorScope,
+) -> GatewayResult<()> {
+    match current_scope {
+        CursorScope::Principal(principal)
+            if query.principal.is_none() && principal == access.caller_principal =>
+        {
+            Ok(())
+        },
+        _ => Err(GatewayError::BadRequest(CURSOR_SCOPE_CHANGED.into())),
+    }
 }
 
 fn validate_scope_continuation(
@@ -359,6 +377,7 @@ fn paginate_page(
     let mut last_visible_ts: Option<u64> = None;
     let mut last_visible_ts_position: usize = 0;
     let mut last_visible_scope: Option<CursorScope> = None;
+    let mut has_more = false;
     let mut effective_scope = access.current_cursor_scope();
     if let Some(cursor_scope) = cursor_scope.as_ref() {
         validate_scope_continuation(cursor_scope, &effective_scope)?;
@@ -390,9 +409,14 @@ fn paginate_page(
         };
         raw_last_ts = Some(view.ts_epoch);
 
-        let current_scope = access.current_cursor_scope();
-        validate_scope_continuation(&effective_scope, &current_scope)?;
-        effective_scope = current_scope;
+        let current_scope = if page.len() < limit {
+            let next_scope = access.current_cursor_scope();
+            validate_scope_continuation(&effective_scope, &next_scope)?;
+            effective_scope = next_scope;
+            effective_scope.clone()
+        } else {
+            effective_scope.clone()
+        };
 
         // Cursor positioning: drop everything strictly newer than
         // the cursor's `ts`, then skip the first `cursor_offset`
@@ -406,22 +430,26 @@ fn paginate_page(
             }
         }
 
-        if let Some(p) = effective_scope.principal_filter()
+        if let Some(p) = current_scope.principal_filter()
             && view.principal.as_deref() != Some(p.as_str())
         {
             continue;
         }
 
-        last_visible_ts = Some(view.ts_epoch);
-        last_visible_ts_position = raw_ts_position;
-        last_visible_scope = Some(effective_scope.clone());
-        page.push(view);
+        // One additional visible row beyond the page limit means the current
+        // scope has another page to resume from, so emit a continuation cursor.
         if page.len() >= limit {
+            has_more = true;
             break;
         }
+
+        last_visible_ts = Some(view.ts_epoch);
+        last_visible_ts_position = raw_ts_position;
+        last_visible_scope = Some(current_scope);
+        page.push(view);
     }
 
-    let next_cursor = if page.len() == limit {
+    let next_cursor = if has_more {
         last_visible_ts
             .zip(last_visible_scope)
             .map(|(t, scope)| format!("{t}_{last_visible_ts_position}_{}", scope.encode()))
