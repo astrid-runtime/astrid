@@ -9,12 +9,13 @@ mod install;
 mod rate_limit;
 /// Kernel-response publishing envelope + the long-request keepalive pinger.
 mod response;
+mod visibility;
 
 pub(crate) use rate_limit::rate_limit_for_request;
 pub(crate) use response::{KeepalivePinger, publish_response, workspace_commit_response};
 
 use astrid_runtime::time::Instant;
-use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -31,6 +32,7 @@ use tracing::{debug, info, warn};
 use caller::CallerResolutionError;
 use caller::{MANAGEMENT_CALLER_REQUIRED, resolve_caller, resolve_connection_principal};
 use device_scope::resolve_device_scope;
+use visibility::CapsuleVisibility;
 
 #[cfg(test)]
 mod capability_catalog_tests;
@@ -594,51 +596,6 @@ async fn unregister_failed_capsules(kernel: &crate::Kernel) {
     let mut reg = kernel.capsules.write().await;
     for (principal, id) in failed {
         let _ = reg.unregister_for(&principal, &id);
-    }
-}
-
-struct CapsuleVisibility {
-    principal: PrincipalId,
-    is_admin: bool,
-    capsule_grants: BTreeSet<String>,
-}
-
-impl CapsuleVisibility {
-    fn new(authorization: &AuthorizedRequest) -> Self {
-        if authorization.principal.as_str() == "anonymous" {
-            return Self::denied(&authorization.principal);
-        }
-        let profile = authorization.profile.as_ref();
-        let check = authorization.capability_check();
-
-        Self {
-            principal: authorization.principal.clone(),
-            is_admin: check.has("capsule:list"),
-            capsule_grants: profile.capsules.iter().cloned().collect(),
-        }
-    }
-
-    fn denied(caller: &PrincipalId) -> Self {
-        Self {
-            principal: caller.clone(),
-            is_admin: false,
-            capsule_grants: BTreeSet::new(),
-        }
-    }
-
-    fn allows(&self, capsule_id: &astrid_capsule::capsule::CapsuleId) -> bool {
-        self.is_admin || self.capsule_grants.contains(capsule_id.as_str())
-    }
-
-    fn capsules(
-        &self,
-        registry: &astrid_capsule::registry::CapsuleRegistry,
-    ) -> Vec<Arc<dyn astrid_capsule::capsule::Capsule>> {
-        if self.is_admin {
-            registry.cloned_values()
-        } else {
-            registry.cloned_values_for(&self.principal)
-        }
     }
 }
 
