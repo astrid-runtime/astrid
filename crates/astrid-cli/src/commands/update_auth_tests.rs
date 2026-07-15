@@ -235,6 +235,9 @@ async fn release_gate_authenticates_all_archives_with_production_policy() {
         .collect::<Vec<_>>();
     archives.sort();
     assert!(!archives.is_empty(), "release gate found no archives");
+    let authenticator = PublisherAuthenticator::production()
+        .await
+        .expect("refresh production Sigstore trust root");
 
     for archive_path in archives {
         let archive_name = archive_path
@@ -250,8 +253,8 @@ async fn release_gate_authenticates_all_archives_with_production_policy() {
             )
         });
 
-        authenticate_archive(archive, &bundle, &version)
-            .await
+        authenticator
+            .authenticate(archive, &bundle, &version)
             .unwrap_or_else(|error| {
                 panic!(
                     "native verifier rejected {} after Cosign accepted it: {error}",

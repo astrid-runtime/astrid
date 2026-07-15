@@ -93,6 +93,36 @@ fn verify_with_root(
         .context("Sigstore evidence did not satisfy the release policy")
 }
 
+struct PublisherAuthenticator {
+    root: TrustedRoot,
+}
+
+impl PublisherAuthenticator {
+    async fn production() -> Result<Self, UpdateStageError> {
+        let config = TufConfig::production().without_cache();
+        let root = tokio::time::timeout(TRUST_ROOT_TIMEOUT, TrustedRoot::from_tuf(config))
+            .await
+            .map_err(|_| UpdateStageError::publisher("Sigstore trust refresh timed out"))?
+            .map_err(|_| UpdateStageError::publisher("Sigstore trust refresh failed"))?;
+        Ok(Self { root })
+    }
+
+    fn authenticate(
+        &self,
+        archive: Vec<u8>,
+        bundle_json: &[u8],
+        version: &str,
+    ) -> Result<PublisherAuthenticatedArchive, UpdateStageError> {
+        let bundle = parse_publisher_bundle(bundle_json)?;
+        verify_with_root(&archive, &bundle, version, &self.root).map_err(|_| {
+            UpdateStageError::publisher(
+                "archive signature or exact release identity did not verify",
+            )
+        })?;
+        Ok(PublisherAuthenticatedArchive(archive))
+    }
+}
+
 #[cfg(test)]
 fn authenticate_for_test(
     archive: Vec<u8>,
@@ -118,19 +148,9 @@ pub(super) async fn authenticate_archive(
     bundle_json: &[u8],
     version: &str,
 ) -> Result<PublisherAuthenticatedArchive, UpdateStageError> {
-    let bundle = parse_publisher_bundle(bundle_json)?;
-
-    let config = TufConfig::production().without_cache();
-    let root = tokio::time::timeout(TRUST_ROOT_TIMEOUT, TrustedRoot::from_tuf(config))
-        .await
-        .map_err(|_| UpdateStageError::publisher("Sigstore trust refresh timed out"))?
-        .map_err(|_| UpdateStageError::publisher("Sigstore trust refresh failed"))?;
-
-    verify_with_root(&archive, &bundle, version, &root).map_err(|_| {
-        UpdateStageError::publisher("archive signature or exact release identity did not verify")
-    })?;
-
-    Ok(PublisherAuthenticatedArchive(archive))
+    PublisherAuthenticator::production()
+        .await?
+        .authenticate(archive, bundle_json, version)
 }
 
 /// Verify the authenticated archive against the one canonical BLAKE3 entry for
