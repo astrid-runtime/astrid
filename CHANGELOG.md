@@ -63,12 +63,14 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
   protocols such as SRI, Git, and registry checksums remain unchanged. Closes
   #1247.
 
-- **Astrid release archives now use BLAKE3 integrity manifests.** Release
-  automation publishes, signs, and attests `BLAKE3SUMS.txt`; self-managed
-  updates require a strict lowercase BLAKE3 entry and reject absent, malformed,
-  duplicate, or legacy SHA-only manifests. Existing v0.9.x self-managed
-  installations need one manual, Cargo, or Homebrew upgrade across this format
-  boundary. External protocol requirements remain unchanged. Closes #1249.
+- **Astrid release archives now use BLAKE3 as their primary integrity
+  manifest.** Release automation publishes, signs, and attests
+  `BLAKE3SUMS.txt`, while retaining a signed `SHA256SUMS.txt` compatibility
+  manifest for Homebrew and existing downstream tooling. Self-managed updates
+  require a strict lowercase BLAKE3 entry and reject absent, malformed,
+  duplicate, or SHA-only manifests. Existing v0.9.x installations can still
+  cross the boundary through the compatibility manifest. External protocol
+  requirements remain unchanged. Closes #1249.
 
 - **Runtime E2E now stages the pinned Unicity AOS monorepo.** The workflow
   preserves the AOS Cargo workspace outside the core checkout and supplies

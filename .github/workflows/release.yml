@@ -200,8 +200,10 @@ jobs:
       - name: Generate checksums
         run: |
           cd artifacts
-          b3sum *.tar.gz > BLAKE3SUMS.txt
+          b3sum -- ./*.tar.gz | sed 's#  \./#  #' > BLAKE3SUMS.txt
+          sha256sum -- ./*.tar.gz | sed 's#  \./#  #' > SHA256SUMS.txt
           cat BLAKE3SUMS.txt
+          cat SHA256SUMS.txt
 
       - name: Attest release provenance
         uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
@@ -209,6 +211,7 @@ jobs:
           subject-path: |
             artifacts/*.tar.gz
             artifacts/BLAKE3SUMS.txt
+            artifacts/SHA256SUMS.txt
 
       - name: Install cosign
         uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
@@ -218,7 +221,7 @@ jobs:
           COSIGN_YES: "true"
         run: |
           cd artifacts
-          for asset in *.tar.gz BLAKE3SUMS.txt; do
+          for asset in *.tar.gz BLAKE3SUMS.txt SHA256SUMS.txt; do
             cosign sign-blob --yes --bundle "${asset}.sigstore.json" "$asset"
           done
 
@@ -228,6 +231,7 @@ jobs:
           files: |
             artifacts/*.tar.gz
             artifacts/BLAKE3SUMS.txt
+            artifacts/SHA256SUMS.txt
             artifacts/*.sigstore.json
           body_path: release-notes.md
 
