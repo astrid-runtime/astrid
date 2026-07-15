@@ -434,9 +434,9 @@ fn verify_blake3(archive: &[u8], sums_body: &str, asset_name: &str) -> anyhow::R
     Ok(())
 }
 
-/// Require the canonical BLAKE3 manifest from a release. Legacy-only releases
-/// fail closed; an existing v0.9.x installation needs one manual package-manager
-/// upgrade across this format boundary.
+/// Require the canonical BLAKE3 manifest from a release. A release containing
+/// only the legacy SHA-256 manifest fails closed; release automation retains a
+/// compatibility manifest so existing v0.9.x clients can cross this boundary.
 fn blake3_sums_url(release: &serde_json::Value) -> anyhow::Result<&str> {
     asset_url(release, "BLAKE3SUMS.txt").ok_or_else(|| {
         anyhow::anyhow!(
