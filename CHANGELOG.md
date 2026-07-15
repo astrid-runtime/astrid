@@ -9,7 +9,21 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
 
 ## [Unreleased]
 
+### Added
+
+- **Passive content-addressed capability-registry primitives.** Astrid now has
+  exact capability IDs, typed content-bound references, immutable registered
+  definitions, deterministic BLAKE3 semantic digests and canonical registry
+  manifests. Existing profile persistence, wildcard evaluation, bootstrap,
+  socket and wire behavior remain unchanged. Closes #1233. Refs #1228.
+
 ### Changed
+
+- **Device key IDs now use BLAKE3.** The short per-device handle is derived from
+  the first eight bytes of `BLAKE3(pubkey_hex_bytes)`. Profile loading already
+  treats the stored `key_id` as informational and re-derives it from the public
+  key, so existing local profiles self-heal; device-scoped bearer sessions must
+  authenticate again after upgrading.
 
 - **Runtime E2E now stages the pinned Unicity AOS monorepo.** The workflow
   preserves the AOS Cargo workspace outside the core checkout and supplies
