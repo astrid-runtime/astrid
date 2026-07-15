@@ -2,9 +2,9 @@
 //!
 //! Invite tokens are short opaque secrets that grant a one-time-ish
 //! right to mint a principal. The kernel never stores the raw token —
-//! it stores a domain-separated BLAKE3 identifier of the URL-safe base64
-//! form. Redemption hashes the incoming token and compares against the
-//! persisted set.
+//! it stores a domain-separated BLAKE3 identifier of the complete typed
+//! bearer string (`astrid_inv_` plus its URL-safe base64 secret). Redemption
+//! hashes the incoming token and compares against the persisted set.
 //!
 //! ## On-disk layout
 //!
@@ -73,7 +73,7 @@ pub const MAX_EXPIRY_SECS: u64 = 60 * 60 * 24 * 30;
 /// only its domain-separated BLAKE3 identifier.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Invite {
-    /// `blake3:<hex>` identifier of the URL-safe base64 token.
+    /// `blake3:<hex>` identifier of the complete `astrid_inv_` bearer token.
     pub token_hash: String,
     /// Group new redeemers join.
     pub group: String,

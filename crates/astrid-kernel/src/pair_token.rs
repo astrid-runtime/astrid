@@ -64,7 +64,7 @@ pub const MAX_EXPIRY_SECS: u64 = 60 * 60;
 /// only its domain-separated BLAKE3 identifier.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PairToken {
-    /// `blake3:<hex>` identifier of the URL-safe base64 token.
+    /// `blake3:<hex>` identifier of the complete `astrid_pair_` bearer token.
     pub token_hash: String,
     /// Principal the new device's key will attach to.
     pub principal: PrincipalId,
