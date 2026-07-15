@@ -197,7 +197,7 @@ max_pending_requests = 50
 # args = ["--config", "react.toml"]
 # auto_start = true
 # trusted = true
-# binary_hash = "sha256:abc123..."  # Optional: verify binary integrity
+# binary_hash = "blake3:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"  # Optional: verify binary integrity
 #
 # # Restart on failure with max 5 retries (exponential backoff applied):
 # [servers.react.restart_policy]

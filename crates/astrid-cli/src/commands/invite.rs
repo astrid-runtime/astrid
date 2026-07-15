@@ -54,7 +54,7 @@ pub(crate) struct IssueArgs {
 
 #[derive(Args, Debug, Clone)]
 pub(crate) struct RedeemArgs {
-    /// The opaque token returned by a prior `astrid invite issue`.
+    /// The typed `astrid_inv_` token returned by a prior `astrid invite issue`.
     #[arg(allow_hyphen_values = true)]
     pub token: String,
     /// Hex-encoded ed25519 public key. Accepts bare 64 hex chars or
@@ -89,7 +89,7 @@ pub(crate) struct ListArgs {
 
 #[derive(Args, Debug, Clone)]
 pub(crate) struct RevokeArgs {
-    /// Either the raw token or its hex fingerprint (from `invite list`).
+    /// Either the raw token or its `blake3:<hex>` fingerprint (from `invite list`).
     #[arg(allow_hyphen_values = true)]
     pub token_or_fingerprint: String,
 }
@@ -225,12 +225,12 @@ async fn run_list(args: ListArgs) -> Result<ExitCode> {
                 println!("{}", Theme::dimmed("no outstanding invites"));
             } else {
                 println!(
-                    "{:<64} {:<15} {:>5}  {:<10}  LABEL",
+                    "{:<71} {:<15} {:>5}  {:<10}  LABEL",
                     "FINGERPRINT", "GROUP", "USES", "EXPIRES",
                 );
                 for inv in invites {
                     println!(
-                        "{:<64} {:<15} {:>5}  {:<10}  {}",
+                        "{:<71} {:<15} {:>5}  {:<10}  {}",
                         inv.token_fingerprint,
                         inv.group,
                         inv.remaining_uses,

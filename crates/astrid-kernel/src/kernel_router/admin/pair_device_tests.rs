@@ -445,6 +445,10 @@ async fn valid_explicit_allow_and_deny_survive_issue_and_redeem() {
         AdminResponseBody::PairToken(token) => token.token,
         other => panic!("valid explicit scope must issue, got: {other:?}"),
     };
+    assert!(
+        token.starts_with("astrid_pair_"),
+        "pair authority must be carried by the typed BLAKE3-era token"
+    );
 
     let public_key = "d".repeat(64);
     let response = handlers::dispatch(
@@ -469,6 +473,31 @@ async fn valid_explicit_allow_and_deny_survive_issue_and_redeem() {
             allow: vec!["self:capsule:reload".into()],
             deny: vec!["self:capsule:install".into()],
         }
+    );
+    let redeemed_key_id = child.key_id.clone();
+    drop(profile);
+
+    let response = handlers::dispatch(
+        &kernel,
+        &caller,
+        AdminRequestKind::PairDeviceRevoke {
+            principal: caller.clone(),
+            key_id: redeemed_key_id.clone(),
+        },
+    )
+    .await;
+    match response {
+        AdminResponseBody::PairDeviceRevoked { key_id } => {
+            assert_eq!(key_id, redeemed_key_id);
+        },
+        other => panic!("redeemed BLAKE3 device identity must revoke, got: {other:?}"),
+    }
+    assert!(
+        load(&kernel, &caller)
+            .auth
+            .device_by_key_id(&redeemed_key_id)
+            .is_none(),
+        "revoked redeemed device must no longer authorize"
     );
 }
 

@@ -26,9 +26,8 @@ use crate::state::GatewayState;
 /// Inbound body for `POST /api/auth/redeem`.
 #[derive(Debug, Clone, Deserialize, ToSchema)]
 pub struct RedeemRequest {
-    /// The opaque token from an `astrid invite issue` (or
-    /// dashboard-issued) invite.
-    #[schema(example = "AAAA...")]
+    /// The typed token from an `astrid invite issue` (or dashboard-issued) invite.
+    #[schema(example = "astrid_inv_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA")]
     pub token: String,
     /// Hex-encoded ed25519 public key. Bare 64 hex chars or the
     /// `ed25519:<hex>` form.
@@ -47,7 +46,7 @@ pub struct RedeemResponse {
     pub principal: PrincipalId,
     /// Group the new principal joined.
     pub group: String,
-    /// SHA-256 fingerprint of the registered ed25519 key — lets the
+    /// Domain-separated `blake3:<hex>` fingerprint of the registered Ed25519 key — lets the
     /// redeemer verify the gateway didn't swap their key.
     pub public_key_fingerprint: String,
     /// Signed bearer token for subsequent requests.
@@ -262,7 +261,8 @@ impl PairDeviceIssueRequest {
 /// route — the pair-token is the auth.
 #[derive(Debug, Clone, Deserialize, ToSchema)]
 pub struct PairDeviceRedeemRequest {
-    /// Opaque pair-token from a prior issue.
+    /// Typed `astrid_pair_` token from a prior issue.
+    #[schema(example = "astrid_pair_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA")]
     pub token: String,
     /// Hex-encoded ed25519 public key. Bare 64 hex or
     /// `ed25519:<hex>`.
@@ -277,7 +277,7 @@ pub struct PairDeviceRedeemResponse {
     /// The principal the new device is now bound to.
     #[schema(value_type = String, example = "agent-alice")]
     pub principal: PrincipalId,
-    /// SHA-256 fingerprint of the registered key.
+    /// Domain-separated `blake3:<hex>` fingerprint of the registered key.
     pub public_key_fingerprint: String,
     /// Deterministic `key_id` of the registered device key. The session
     /// bearer is scoped to this `key_id`, so the device authenticates with —
@@ -291,7 +291,7 @@ pub struct PairDeviceRedeemResponse {
 }
 
 /// `POST /api/auth/pair-device` — issue a pair-token tied to the
-/// authenticated caller's principal. Returns the opaque token,
+/// authenticated caller's principal. Returns the typed `astrid_pair_` token,
 /// which the caller hands to the new device out-of-band (QR code,
 /// NFC, etc.).
 #[utoipa::path(

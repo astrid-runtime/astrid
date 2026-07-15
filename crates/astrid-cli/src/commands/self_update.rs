@@ -9,7 +9,8 @@
 //! for every install method on both macOS and Linux, so the session-start nudge
 //! fires regardless of how Astrid was installed. The release source can be
 //! overridden (`--source owner/repo` / `ASTRID_UPDATE_REPO` / `ASTRID_UPDATE_API`)
-//! so the whole flow can be rehearsed against a fork, pre-release, or local mock.
+//! so metadata and downloads can be rehearsed against a mirror or local mock.
+//! Publisher authentication remains pinned to Astrid's release workflow.
 //!
 //! Also provides PATH setup helpers for `astrid init`.
 
@@ -21,8 +22,13 @@ use anyhow::{Context, bail};
 use crate::cli::UpdateArgs;
 use crate::theme::Theme;
 
-/// Default GitHub org/repo for the core Astrid release. Overridable for
-/// staging/testing — see [`resolve_repo`].
+use super::update_auth::{
+    UpdateStageError, authenticate_archive, extract_verified_archive,
+    integrity_manifest_download_error, publisher_bundle_download_error, verify_integrity,
+};
+
+/// Default Astrid release repository. Discovery overrides never widen the
+/// authenticated publisher identity.
 const DEFAULT_ORG: &str = "astrid-runtime";
 const DEFAULT_REPO: &str = "astrid";
 
@@ -35,6 +41,12 @@ const CHECK_TTL_SECS: u64 = 86_400;
 /// Max size of a downloaded release archive.
 const MAX_ARCHIVE_BYTES: usize = 100 * 1024 * 1024;
 
+/// Separate caps keep metadata downloads far below the archive allowance.
+const MAX_RELEASE_METADATA_BYTES: usize = 2 * 1024 * 1024;
+const MAX_RELEASE_ASSETS: usize = 1_024;
+const MAX_BUNDLE_BYTES: usize = 256 * 1024;
+const MAX_MANIFEST_BYTES: usize = 256 * 1024;
+
 /// Binaries managed by an in-place update.
 const MANAGED_BINARIES: &[&str] = &["astrid", "astrid-daemon"];
 
@@ -44,9 +56,8 @@ fn api_base() -> String {
     std::env::var("ASTRID_UPDATE_API").unwrap_or_else(|_| "https://api.github.com".to_string())
 }
 
-/// Resolve the release source repo as `(owner, repo)`. Precedence: the explicit
-/// `--source owner/repo`, then `ASTRID_UPDATE_REPO`, then the built-in default.
-/// Lets the update flow be pointed at a fork or pre-release for staging/testing.
+/// Resolve release discovery: explicit `--source`, environment, then default.
+/// Mirrors and mocks must still serve archives signed by Astrid's exact identity.
 fn resolve_repo(source: Option<&str>) -> anyhow::Result<(String, String)> {
     let spec = source
         .map(str::to_owned)
@@ -293,18 +304,22 @@ pub(crate) async fn check_for_update_cached() -> Option<String> {
         .build()
         .ok()?;
     let url = format!("{}/repos/{owner}/{repo}/releases/latest", api_base());
-    let response = client.get(&url).send().await.ok()?;
-    if !response.status().is_success() {
-        return None;
-    }
-    let json: serde_json::Value = response.json().await.ok()?;
+    let body = download_bounded(
+        &client,
+        &url,
+        MAX_RELEASE_METADATA_BYTES,
+        "release metadata",
+    )
+    .await
+    .ok()?;
+    let json: serde_json::Value = serde_json::from_slice(&body).ok()?;
     let tag = json.get("tag_name")?.as_str()?;
-    let version_str = tag.strip_prefix('v').unwrap_or(tag);
-    write_cache(version_str);
+    let version_str = canonical_release_version(tag).ok()?;
+    write_cache(&version_str);
 
     let current = semver::Version::parse(CURRENT_VERSION).ok()?;
-    let latest = semver::Version::parse(version_str).ok()?;
-    (latest > current).then(|| version_str.to_string())
+    let latest = semver::Version::parse(&version_str).ok()?;
+    (latest > current).then_some(version_str)
 }
 
 /// Print an install-aware update banner if a newer version is available. The
@@ -334,86 +349,106 @@ async fn fetch_latest_release(
     repo: &str,
 ) -> anyhow::Result<(String, serde_json::Value)> {
     let url = format!("{}/repos/{owner}/{repo}/releases/latest", api_base());
-    let response = client
-        .get(&url)
-        .send()
-        .await
-        .context("failed to reach GitHub API")?;
-    if !response.status().is_success() {
-        bail!("GitHub API returned {}", response.status());
-    }
-    let json: serde_json::Value = response
-        .json()
-        .await
-        .context("failed to parse API response")?;
+    let body =
+        download_bounded(client, &url, MAX_RELEASE_METADATA_BYTES, "release metadata").await?;
+    let json: serde_json::Value =
+        serde_json::from_slice(&body).context("failed to parse release metadata")?;
     let tag = json
         .get("tag_name")
         .and_then(|v| v.as_str())
         .ok_or_else(|| anyhow::anyhow!("release has no tag_name"))?;
-    let version = tag.strip_prefix('v').unwrap_or(tag).to_string();
+    let version = canonical_release_version(tag)?;
     Ok((version, json))
 }
 
-/// Find a release asset's browser download URL by exact name.
-fn asset_url<'a>(release: &'a serde_json::Value, name: &str) -> Option<&'a str> {
-    release
-        .get("assets")?
-        .as_array()?
+/// Parse the only tag form release authentication can bind to.
+fn canonical_release_version(tag: &str) -> anyhow::Result<String> {
+    let version = tag
+        .strip_prefix('v')
+        .ok_or_else(|| anyhow::anyhow!("release tag '{tag}' is not canonical v<semver>"))?;
+    let parsed = semver::Version::parse(version)
+        .with_context(|| format!("release tag '{tag}' is not valid semver"))?;
+    anyhow::ensure!(
+        tag == format!("v{parsed}"),
+        "release tag '{tag}' is not canonical v<semver>"
+    );
+    Ok(parsed.to_string())
+}
+
+/// Find exactly one release asset and return its browser download URL.
+fn exact_asset_url<'a>(release: &'a serde_json::Value, name: &str) -> anyhow::Result<&'a str> {
+    let assets = release
+        .get("assets")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| anyhow::anyhow!("release has no asset list"))?;
+    anyhow::ensure!(
+        assets.len() <= MAX_RELEASE_ASSETS,
+        "release contains too many assets"
+    );
+    let mut matches = assets
         .iter()
-        .find(|a| a.get("name").and_then(|n| n.as_str()) == Some(name))
-        .and_then(|a| a.get("browser_download_url").and_then(|u| u.as_str()))
+        .filter(|asset| asset.get("name").and_then(|value| value.as_str()) == Some(name));
+    let asset = matches
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("release has no asset '{name}'"))?;
+    anyhow::ensure!(
+        matches.next().is_none(),
+        "release contains duplicate asset '{name}'"
+    );
+    asset
+        .get("browser_download_url")
+        .and_then(|value| value.as_str())
+        .filter(|url| !url.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("release asset '{name}' has no download URL"))
+}
+
+fn publisher_bundle_url<'a>(
+    release: &'a serde_json::Value,
+    archive_name: &str,
+) -> Result<&'a str, UpdateStageError> {
+    let bundle_name = format!("{archive_name}.sigstore.json");
+    exact_asset_url(release, &bundle_name)
+        .map_err(|error| UpdateStageError::publisher(error.to_string()))
+}
+
+fn integrity_manifest_url(release: &serde_json::Value) -> Result<&str, UpdateStageError> {
+    exact_asset_url(release, "BLAKE3SUMS.txt")
+        .map_err(|error| UpdateStageError::integrity(error.to_string()))
 }
 
 /// Stream a URL into memory under the size cap.
-async fn download(client: &reqwest::Client, url: &str) -> anyhow::Result<Vec<u8>> {
-    let mut response = client.get(url).send().await?;
+async fn download_bounded(
+    client: &reqwest::Client,
+    url: &str,
+    limit: usize,
+    label: &str,
+) -> anyhow::Result<Vec<u8>> {
+    let mut response = client
+        .get(url)
+        .send()
+        .await
+        .map_err(|_| anyhow::anyhow!("{label} download failed"))?;
     if !response.status().is_success() {
-        bail!("download failed: HTTP {}", response.status());
+        bail!("{label} download failed: HTTP {}", response.status());
+    }
+    if let Some(length) = response.content_length() {
+        let length = usize::try_from(length)
+            .map_err(|_| anyhow::anyhow!("{label} exceeds {limit} byte limit"))?;
+        anyhow::ensure!(length <= limit, "{label} exceeds {limit} byte limit");
     }
     let mut bytes = Vec::new();
-    while let Some(chunk) = response.chunk().await? {
-        bytes.extend_from_slice(&chunk);
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|_| anyhow::anyhow!("{label} download failed"))?
+    {
         anyhow::ensure!(
-            bytes.len() <= MAX_ARCHIVE_BYTES,
-            "release archive exceeds {MAX_ARCHIVE_BYTES} byte limit"
+            chunk.len() <= limit.saturating_sub(bytes.len()),
+            "{label} exceeds {limit} byte limit"
         );
+        bytes.extend_from_slice(&chunk);
     }
     Ok(bytes)
-}
-
-/// Hex-encode bytes (no extra dep).
-fn to_hex(bytes: &[u8]) -> String {
-    use std::fmt::Write as _;
-    let mut s = String::with_capacity(bytes.len().saturating_mul(2));
-    for b in bytes {
-        let _ = write!(s, "{b:02x}");
-    }
-    s
-}
-
-/// Verify `archive` against the sha256 recorded for `asset_name` in a
-/// `SHA256SUMS.txt` body (`<hex>  <name>` per line). This is INTEGRITY only —
-/// it catches a corrupt/truncated/MITM-altered download whose checksum no longer
-/// matches the release's recorded sum. It is NOT authenticity (an attacker who
-/// controls the release controls both the artifact and the sum); a publisher
-/// signature is tracked separately.
-fn verify_sha256(archive: &[u8], sums_body: &str, asset_name: &str) -> anyhow::Result<()> {
-    use sha2::{Digest, Sha256};
-    let expected = sums_body
-        .lines()
-        .find_map(|line| {
-            let mut it = line.split_whitespace();
-            let hex = it.next()?;
-            let name = it.next()?;
-            // `sha256sum` marks binary entries with a leading '*'.
-            (name.trim_start_matches('*') == asset_name).then_some(hex)
-        })
-        .ok_or_else(|| anyhow::anyhow!("no checksum for '{asset_name}' in SHA256SUMS"))?;
-    let actual = to_hex(&Sha256::digest(archive));
-    if !actual.eq_ignore_ascii_case(expected) {
-        bail!("checksum mismatch for '{asset_name}': expected {expected}, got {actual}");
-    }
-    Ok(())
 }
 
 /// Back up and atomically swap the named binaries from `extract_dir` into
@@ -611,9 +646,10 @@ pub(crate) async fn run_self_update(args: UpdateArgs) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    // Stage: download → verify checksum → extract.
-    let (_tmp_dir, extract_dir) =
-        download_verify_extract(&client, &release, &version_str, target).await?;
+    // Stage: download → authenticate publisher → verify integrity → extract.
+    let (_tmp_dir, extract_dir) = download_verify_extract(&client, &release, &version_str, target)
+        .await
+        .map_err(anyhow::Error::new)?;
 
     // Finish: back up + atomically swap (rolls back on any failure).
     backup_and_swap(&install_dir, &extract_dir, MANAGED_BINARIES)?;
@@ -628,56 +664,60 @@ pub(crate) async fn run_self_update(args: UpdateArgs) -> anyhow::Result<()> {
     finish_update(&install_dir).await
 }
 
-/// Download the release archive for `version`/`target`, verify its checksum, and
-/// extract it. Returns the temp dir (kept alive by the caller for the lifetime
-/// of `extract_dir`) and the extracted `astrid-<version>-<target>/` directory.
+/// Download the release archive for `version`/`target`, authenticate its
+/// publisher, independently verify its BLAKE3 integrity, and only then extract
+/// it. Returns the temp dir (kept alive by the caller for the lifetime of
+/// `extract_dir`) and the extracted `astrid-<version>-<target>/` directory.
 async fn download_verify_extract(
     client: &reqwest::Client,
     release: &serde_json::Value,
     version: &str,
     target: &str,
-) -> anyhow::Result<(tempfile::TempDir, PathBuf)> {
+) -> Result<(tempfile::TempDir, PathBuf), UpdateStageError> {
     println!(
         "{}",
         Theme::info(&format!("Downloading v{version} for {target}..."))
     );
     let asset_name = format!("astrid-{version}-{target}.tar.gz");
-    let url = asset_url(release, &asset_name)
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "no release asset '{asset_name}' — no pre-built binary for this platform"
-            )
-        })?
-        .to_string();
-    let archive = download(client, &url).await?;
+    let archive_url = exact_asset_url(release, &asset_name)
+        .with_context(|| format!("no pre-built binary for platform {target}"))
+        .map_err(UpdateStageError::Preparation)?
+        .to_owned();
+    let archive = download_bounded(client, &archive_url, MAX_ARCHIVE_BYTES, "release archive")
+        .await
+        .map_err(UpdateStageError::Preparation)?;
 
-    // Fail closed: a release with no SHA256SUMS.txt is unverifiable, so we refuse
-    // to install it rather than swap in an unchecked binary. (SHA256SUMS is
-    // integrity, not authenticity — but skipping it entirely would defeat even
-    // the on-the-wire / corrupted-download check.)
-    let sums_url = asset_url(release, "SHA256SUMS.txt")
-        .map(str::to_owned)
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "release has no SHA256SUMS.txt — refusing to install an unverifiable binary"
-            )
-        })?;
-    let sums = download(client, &sums_url).await?;
-    let sums_body = String::from_utf8(sums).context("SHA256SUMS.txt is not UTF-8")?;
-    verify_sha256(&archive, &sums_body, &asset_name)?;
-    println!("{}", Theme::dimmed("Checksum verified."));
+    let bundle_url = publisher_bundle_url(release, &asset_name)?.to_owned();
+    let bundle = download_bounded(
+        client,
+        &bundle_url,
+        MAX_BUNDLE_BYTES,
+        "publisher-authentication bundle",
+    )
+    .await
+    .map_err(|error| publisher_bundle_download_error(&error))?;
+    let authenticated = authenticate_archive(archive, &bundle, version).await?;
+    println!("{}", Theme::dimmed("Publisher authenticated."));
 
-    let tmp_dir = tempfile::tempdir()?;
-    let archive_path = tmp_dir.path().join(&asset_name);
-    std::fs::write(&archive_path, &archive)?;
-    {
-        let tar_gz = std::fs::File::open(&archive_path)?;
-        let decoder = flate2::read::GzDecoder::new(tar_gz);
-        let mut tar = tar::Archive::new(decoder);
-        tar.unpack(tmp_dir.path())?;
-    }
-    let extract_dir = tmp_dir.path().join(format!("astrid-{version}-{target}"));
-    Ok((tmp_dir, extract_dir))
+    // This remains a separate integrity signal. It neither replaces nor is
+    // presented as publisher authentication.
+    let sums_url = integrity_manifest_url(release)?.to_owned();
+    let sums = download_bounded(
+        client,
+        &sums_url,
+        MAX_MANIFEST_BYTES,
+        "BLAKE3 integrity manifest",
+    )
+    .await
+    .map_err(|error| integrity_manifest_download_error(&error))?;
+    let sums_body = String::from_utf8(sums)
+        .map_err(|_| UpdateStageError::integrity("BLAKE3SUMS.txt is not UTF-8"))?;
+    let archive = verify_integrity(authenticated, &sums_body, &asset_name)?;
+    println!("{}", Theme::dimmed("Integrity verified."));
+
+    // The mutating boundary accepts only the fully verified archive type.
+    extract_verified_archive(archive, &asset_name, &format!("astrid-{version}-{target}"))
+        .map_err(UpdateStageError::Preparation)
 }
 
 /// After the binary swap: restart a running daemon so the new code takes effect,

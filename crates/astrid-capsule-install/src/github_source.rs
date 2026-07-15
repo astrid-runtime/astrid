@@ -347,7 +347,7 @@ mod tests {
                 "name": "cli.capsule",
                 "browser_download_url": "https://example.com/cli.capsule"
             }),
-            serde_json::json!({ "name": "checksums.sha256" }),
+            serde_json::json!({ "name": "BLAKE3SUMS.txt" }),
             // `.capsule` asset with no download URL is skipped, not panicked on.
             serde_json::json!({ "name": "broken.capsule" }),
         ];

@@ -26,7 +26,7 @@ transitively covers the whole archive. Two distinct guarantees stack:
   manifest against `manifest_hash`, the lock against the signature.
 
 A signature does **not** survive key theft on its own (a thief re-signs).
-The durable guarantee is to **vendor the `.shuttle` / pin its sha256** —
+The durable guarantee is to **vendor the `.shuttle` / pin its BLAKE3** —
 see §6.
 
 ## 2. Trust: TOFU, pinning, official keys
@@ -156,13 +156,13 @@ lock and re-signs. To get "break rather than install something
 dangerous," put the pin where the key-holder can't reach it:
 
 - **Vendor the `.shuttle`** in your repo / Docker build context, or pin
-  its `sha256`. Your CI then installs *your* bytes every time; a
+  its BLAKE3 digest. Your CI then installs *your* bytes every time; a
   malicious re-publish is a different file with a different hash you'd
   notice. This is unaffected by upstream key theft.
 
 ```dockerfile
 COPY example-distro-0.1.0.shuttle /tmp/
-RUN echo "<sha256>  /tmp/example-distro-0.1.0.shuttle" | sha256sum -c - \
+RUN echo "<blake3>  /tmp/example-distro-0.1.0.shuttle" | b3sum -c - \
  && astrid init --distro /tmp/example-distro-0.1.0.shuttle --yes
 ```
 

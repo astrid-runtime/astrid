@@ -336,9 +336,9 @@ pub(crate) struct UpdateArgs {
     #[arg(long)]
     pub(crate) check: bool,
 
-    /// Override the release source as `owner/repo` — rehearse the update flow
-    /// against a fork or pre-release. (Env: `ASTRID_UPDATE_REPO`; API base:
-    /// `ASTRID_UPDATE_API`.)
+    /// Override release discovery as `owner/repo` for an official-asset mirror
+    /// or test server. This never overrides the required Astrid publisher.
+    /// (Env: `ASTRID_UPDATE_REPO`; API base: `ASTRID_UPDATE_API`.)
     #[arg(long, value_name = "OWNER/REPO")]
     pub(crate) source: Option<String>,
 }

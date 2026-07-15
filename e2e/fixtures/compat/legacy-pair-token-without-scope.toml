@@ -1,5 +1,7 @@
+schema_version = 1
+
 [[pair_token]]
-token_hash = "abc123"
+token_hash = "blake3:4e8275107b87254c5236647be8785404cdf3388d1ec2e149df1054de5a01e7a4"
 principal = "compat-user"
 expires_at_epoch = 9999999999
 issued_at_epoch = 1

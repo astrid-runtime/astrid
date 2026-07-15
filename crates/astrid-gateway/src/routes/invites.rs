@@ -34,7 +34,7 @@ pub struct IssueRequest {
 /// field-for-field with the serialized shape of `InviteIssued`.
 #[derive(ToSchema)]
 pub struct InviteIssuedView {
-    /// Opaque token (URL-safe base64). Returned once — store securely.
+    /// Typed `astrid_inv_` bearer token. Returned once — store securely.
     pub token: String,
     /// Group the redeemer will join on success.
     pub group: String,
@@ -58,7 +58,7 @@ pub struct IssueResponse {
     tag = "invites",
     request_body = IssueRequest,
     responses(
-        (status = 200, body = IssueResponse, description = "Invite minted; opaque token returned once — store it securely."),
+        (status = 200, body = IssueResponse, description = "Invite minted; typed `astrid_inv_` token returned once — store it securely."),
         (status = 401, body = ErrorBody),
         (status = 403, body = ErrorBody, description = "Caller lacks `invite:issue`."),
     )
@@ -108,7 +108,7 @@ pub async fn issue_invite(
 /// `issued_at_epoch` is always present.
 #[derive(ToSchema)]
 pub struct InviteSummaryView {
-    /// SHA-256 fingerprint (hex) of the token. Raw tokens are never
+    /// Domain-separated `blake3:<hex>` fingerprint of the token. Raw tokens are never
     /// leaked through list responses.
     pub token_fingerprint: String,
     /// Group the redeemer will join.
@@ -166,7 +166,7 @@ pub async fn list_invites(
     delete,
     path = "/api/sys/invites/{fingerprint}",
     tag = "invites",
-    params(("fingerprint" = String, Path, description = "SHA-256 fingerprint from a prior `IssueResponse` / list entry")),
+    params(("fingerprint" = String, Path, description = "`blake3:<hex>` fingerprint from a prior `IssueResponse` / list entry")),
     responses(
         (status = 204, description = "Invite revoked."),
         (status = 401, body = ErrorBody),

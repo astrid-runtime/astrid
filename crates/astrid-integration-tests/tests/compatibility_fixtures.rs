@@ -65,3 +65,20 @@ fn legacy_pair_token_without_scope_loads_as_full_scope() {
     assert_eq!(loaded[0].principal.as_str(), "compat-user");
     assert_eq!(loaded[0].scope, DeviceScope::Full);
 }
+
+#[test]
+fn legacy_sha_pair_token_is_invalidated_in_a_working_copy() {
+    let dir = tempfile::tempdir().expect("compat tempdir");
+    let path = dir.path().join("pair-tokens.toml");
+    std::fs::copy(fixture("legacy-sha-pair-token.toml"), &path)
+        .expect("copy legacy pair-token fixture");
+
+    let loaded = PairTokenStore::new(path.clone())
+        .load()
+        .expect("legacy SHA pair-token store migrates");
+    assert!(loaded.is_empty());
+
+    let rewritten = std::fs::read_to_string(path).expect("read migrated store");
+    assert!(rewritten.contains("schema_version = 1"));
+    assert!(!rewritten.contains("[[pair_token]]"));
+}

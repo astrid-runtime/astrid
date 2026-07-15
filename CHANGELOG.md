@@ -51,6 +51,41 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
   treats the stored `key_id` as informational and re-derives it from the public
   key, so existing local profiles self-heal; device-scoped bearer sessions must
   authenticate again after upgrading.
+- **Self-managed updates now authenticate the release publisher before any
+  archive is extracted or installed.** The updater requires a Sigstore bundle
+  for the exact archive bytes, verifies it with fresh public-good trust
+  material, and pins the certificate to Astrid's release workflow, repository,
+  tag, and GitHub Actions issuer. Only an authenticated archive can enter the
+  independent BLAKE3 integrity stage; missing, duplicated, malformed, or
+  mismatched evidence fails closed with a distinct publisher-authentication or
+  integrity error. Homebrew and Cargo installs remain delegated to their
+  package managers, and the signed SHA-256 compatibility manifest remains
+  available to downstream tooling. Before publishing, release automation now
+  requires both Cosign and the updater's native production verifier to accept
+  every generated archive and bundle pair. Existing v0.9.x self-updaters cannot
+  enforce the new publisher policy retroactively; it applies from the first
+  release containing this updater onward. Closes #1250.
+
+- **Astrid-owned identifiers now use domain-separated BLAKE3.** Invite and
+  pair-device token stores carry an explicit schema and invalidate
+  legacy SHA-256 records that cannot be rehashed without their raw secrets;
+  newly issued bearer tokens use type-specific `astrid_inv_` and
+  `astrid_pair_` prefixes, while fingerprints use an explicit `blake3:` label.
+  CLI key metadata self-heals from the retained public key. Public-key
+  fingerprints share a typed derivation primitive, MCP binary pins now carry
+  an honest `blake3:` label, and gateway env-write logs no longer expose
+  dictionary-testable fingerprints of low-entropy values. External SHA-based
+  protocols such as SRI, Git, and registry checksums remain unchanged. Closes
+  #1247.
+
+- **Astrid release archives now use BLAKE3 as their primary integrity
+  manifest.** Release automation publishes, signs, and attests
+  `BLAKE3SUMS.txt`, while retaining a signed `SHA256SUMS.txt` compatibility
+  manifest for Homebrew and existing downstream tooling. Self-managed updates
+  require a strict lowercase BLAKE3 entry and reject absent, malformed,
+  duplicate, or SHA-only manifests. Existing v0.9.x installations can still
+  cross the boundary through the compatibility manifest. External protocol
+  requirements remain unchanged. Closes #1249.
 
 - **Runtime E2E now stages the pinned Unicity AOS monorepo.** The workflow
   preserves the AOS Cargo workspace outside the core checkout and supplies

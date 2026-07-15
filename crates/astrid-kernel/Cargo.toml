@@ -45,7 +45,6 @@ rand = { workspace = true }
 semver = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-sha2 = { workspace = true }
 subtle = { workspace = true }
 tempfile = { workspace = true }
 # Base tokio: the wasm-clean subset (mirrors the astrid-capsule base). The

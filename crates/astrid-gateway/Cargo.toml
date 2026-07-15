@@ -37,7 +37,7 @@ description = "HTTP gateway for the Astrid admin API — translates HTTP request
 #                          the gateway is a kernel-side consumer so opting in
 #                          is correct.
 #
-# Everything else (`anyhow`, `serde*`, `tokio`, `rand`, `sha2`, …) is already
+# Everything else (`anyhow`, `serde*`, `tokio`, `rand`, …) is already
 # load-bearing across the workspace; pulling them here introduces no new
 # vertices.
 
@@ -71,7 +71,6 @@ reqwest = { workspace = true, features = ["json"] }
 rustls = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-sha2 = { workspace = true }
 subtle = { workspace = true }
 tempfile = { workspace = true }
 thiserror = { workspace = true }

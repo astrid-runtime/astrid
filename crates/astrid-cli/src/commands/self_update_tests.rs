@@ -229,18 +229,114 @@ fn resolve_repo_precedence_and_validation() {
 }
 
 #[test]
-fn sha256_verification_matches_and_rejects() {
-    use sha2::Digest;
-    let archive = b"hello astrid";
-    let good = to_hex(&sha2::Sha256::digest(archive));
-    let body = format!("{good}  astrid-1.0.0-x.tar.gz\n");
-    verify_sha256(archive, &body, "astrid-1.0.0-x.tar.gz").expect("matching sum verifies");
+fn release_tags_are_canonical_and_identity_safe() {
+    assert_eq!(canonical_release_version("v1.2.3").unwrap(), "1.2.3");
+    assert_eq!(
+        canonical_release_version("v1.2.3-rc.1").unwrap(),
+        "1.2.3-rc.1"
+    );
 
-    // Wrong sum -> error.
-    let bad_body = format!("{}  astrid-1.0.0-x.tar.gz\n", "0".repeat(64));
-    assert!(verify_sha256(archive, &bad_body, "astrid-1.0.0-x.tar.gz").is_err());
-    // Missing entry -> error.
-    assert!(verify_sha256(archive, "deadbeef  other.tar.gz\n", "astrid-1.0.0-x.tar.gz").is_err());
+    for invalid in ["1.2.3", "vv1.2.3", "v01.2.3", "v1.2", "v1.2.3-01"] {
+        assert!(
+            canonical_release_version(invalid).is_err(),
+            "unexpectedly accepted {invalid}"
+        );
+    }
+}
+
+#[test]
+fn release_asset_lookup_requires_one_exact_asset() {
+    let release = serde_json::json!({
+        "assets": [
+            {
+                "name": "astrid-1.0.0-x.tar.gz",
+                "browser_download_url": "https://example.com/archive"
+            },
+            {
+                "name": "astrid-1.0.0-x.tar.gz.sigstore.json",
+                "browser_download_url": "https://example.com/bundle"
+            },
+            {
+                "name": "BLAKE3SUMS.txt",
+                "browser_download_url": "https://example.com/sums"
+            }
+        ]
+    });
+    assert_eq!(
+        exact_asset_url(&release, "astrid-1.0.0-x.tar.gz").unwrap(),
+        "https://example.com/archive"
+    );
+    assert!(exact_asset_url(&release, "astrid-1.0.0-y.tar.gz").is_err());
+
+    let duplicate = serde_json::json!({
+        "assets": [
+            {
+                "name": "BLAKE3SUMS.txt",
+                "browser_download_url": "https://example.com/one"
+            },
+            {
+                "name": "BLAKE3SUMS.txt",
+                "browser_download_url": "https://example.com/two"
+            }
+        ]
+    });
+    assert!(exact_asset_url(&duplicate, "BLAKE3SUMS.txt").is_err());
+
+    let oversized = serde_json::json!({
+        "assets": vec![serde_json::json!({"name": "irrelevant"}); MAX_RELEASE_ASSETS + 1]
+    });
+    assert!(
+        exact_asset_url(&oversized, "irrelevant")
+            .unwrap_err()
+            .to_string()
+            .contains("too many assets")
+    );
+}
+
+#[test]
+fn publisher_bundle_and_blake3_manifest_are_both_mandatory() {
+    let sha_only = serde_json::json!({
+        "assets": [{
+            "name": "SHA256SUMS.txt",
+            "browser_download_url": "https://example.com/SHA256SUMS.txt"
+        }]
+    });
+    assert!(matches!(
+        integrity_manifest_url(&sha_only).unwrap_err(),
+        UpdateStageError::Integrity(_)
+    ));
+    assert!(matches!(
+        publisher_bundle_url(&sha_only, "astrid-1.0.0-x.tar.gz").unwrap_err(),
+        UpdateStageError::PublisherAuthentication(_)
+    ));
+}
+
+#[test]
+fn staged_asset_selection_preserves_the_exact_failure() {
+    let bundle_name = "astrid-1.0.0-x.tar.gz.sigstore.json";
+    let duplicate_bundle = serde_json::json!({
+        "assets": [
+            {"name": bundle_name, "browser_download_url": "https://example.com/one"},
+            {"name": bundle_name, "browser_download_url": "https://example.com/two"}
+        ]
+    });
+    let error = publisher_bundle_url(&duplicate_bundle, "astrid-1.0.0-x.tar.gz")
+        .unwrap_err()
+        .to_string();
+    assert_eq!(
+        error,
+        format!(
+            "publisher authentication failed: release contains duplicate asset '{bundle_name}'"
+        )
+    );
+
+    let oversized = serde_json::json!({
+        "assets": vec![serde_json::json!({"name": "irrelevant"}); MAX_RELEASE_ASSETS + 1]
+    });
+    assert_eq!(
+        integrity_manifest_url(&oversized).unwrap_err().to_string(),
+        "integrity check failed: release contains too many assets"
+    );
 }
 
 #[test]

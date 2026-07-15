@@ -1,0 +1,4 @@
+72f336cb43c40598d43550422883ebdbc23de3604c180128ea365d6c11e95bf5  astrid-0.9.4-aarch64-apple-darwin.tar.gz
+976014a7ade7b03d7286143440128ba8bae9f73976fba27b6ea77e0b55ae8bfc  astrid-0.9.4-aarch64-unknown-linux-gnu.tar.gz
+2110edd2d5b59d456e2f1ead9fe35e68040d52049d417179ff2a7f6654552b06  astrid-0.9.4-x86_64-apple-darwin.tar.gz
+2a56f6a0e194a25f4eb72cefc556a4317cfb5f30204a80f2c18a4b7cc2a78f04  astrid-0.9.4-x86_64-unknown-linux-gnu.tar.gz

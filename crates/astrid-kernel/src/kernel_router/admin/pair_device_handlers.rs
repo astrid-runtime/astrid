@@ -12,7 +12,7 @@
 //!   bound principal's `AuthConfig.public_keys`, and removes the
 //!   token (single-use).
 //!
-//! The store at `etc/pair-tokens.toml` persists only SHA-256
+//! The store at `etc/pair-tokens.toml` persists only domain-separated BLAKE3
 //! hashes — same posture as `etc/invites.toml`. Audit redaction
 //! lives in `admin::mod::sanitize_admin_audit_params` so neither
 //! the raw token nor the ed25519 key ever reaches the audit log.

@@ -70,7 +70,7 @@ pub struct ServerConfig {
     pub args: Vec<String>,
     /// URL for SSE transport.
     pub url: Option<String>,
-    /// Expected binary hash (sha256:...) for verification.
+    /// Expected binary content hash (`blake3:<64 lowercase hex>`).
     pub binary_hash: Option<String>,
     /// Environment variables.
     #[serde(default)]
@@ -237,10 +237,10 @@ impl ServerConfig {
         let Some(expected) = &self.binary_hash else {
             return Ok(()); // No hash configured, skip verification
         };
-
         let Some(command) = &self.command else {
             return Ok(()); // No command to verify
         };
+        let expected_hash = parse_binary_content_hash(expected)?;
 
         // Find the binary path
         let binary_path = which::which(command)
@@ -249,9 +249,9 @@ impl ServerConfig {
         // Read and hash the binary
         let binary_data = std::fs::read(&binary_path)?;
         let actual_hash = ContentHash::hash(&binary_data);
-        let actual_str = format!("sha256:{}", actual_hash.to_hex());
+        let actual_str = format_binary_content_hash(&actual_hash);
 
-        if expected != &actual_str {
+        if expected_hash != actual_hash {
             return Err(McpError::BinaryHashMismatch {
                 name: self.name.clone(),
                 expected: expected.clone(),
@@ -261,6 +261,33 @@ impl ServerConfig {
 
         Ok(())
     }
+}
+
+fn format_binary_content_hash(hash: &ContentHash) -> String {
+    format!("blake3:{}", hash.to_hex())
+}
+
+fn parse_binary_content_hash(value: &str) -> McpResult<ContentHash> {
+    if value.starts_with("sha256:") {
+        return Err(McpError::ConfigError(
+            "binary_hash uses the retired sha256: label for BLAKE3 bytes; replace it with blake3:"
+                .into(),
+        ));
+    }
+    let digest = value.strip_prefix("blake3:").ok_or_else(|| {
+        McpError::ConfigError("binary_hash must use blake3:<64 lowercase hex>".into())
+    })?;
+    if digest.len() != 64
+        || !digest
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(McpError::ConfigError(
+            "binary_hash must use blake3:<64 lowercase hex>".into(),
+        ));
+    }
+    ContentHash::from_hex(digest)
+        .map_err(|_| McpError::ConfigError("binary_hash must use blake3:<64 lowercase hex>".into()))
 }
 
 /// Maximum length for a server name.
@@ -440,6 +467,41 @@ impl ServersConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn binary_hash_uses_an_honest_blake3_label() {
+        assert_eq!(
+            format_binary_content_hash(&ContentHash::hash(b"hello")),
+            "blake3:ea8f163db38682925e4491c5e58d4bb3506ef8c14eb78a86e908c5624a67200f"
+        );
+        assert!(!format_binary_content_hash(&ContentHash::hash(b"hello")).starts_with("sha256:"));
+        assert_eq!(
+            parse_binary_content_hash(&format_binary_content_hash(&ContentHash::hash(b"hello")))
+                .unwrap(),
+            ContentHash::hash(b"hello")
+        );
+        let retired = format!("sha256:{}", ContentHash::hash(b"hello").to_hex());
+        let error = parse_binary_content_hash(&retired).unwrap_err();
+        assert!(error.to_string().contains("retired sha256: label"));
+        assert!(parse_binary_content_hash("blake3:not-hex").is_err());
+        assert!(
+            parse_binary_content_hash(&format!(
+                "blake3:{}",
+                ContentHash::hash(b"hello").to_hex().to_ascii_uppercase()
+            ))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn binary_hash_is_ignored_when_there_is_no_local_command() {
+        let config = ServerConfig::sse("remote", "https://example.com/mcp")
+            .with_hash("sha256:legacy-irrelevant-value");
+
+        config
+            .verify_binary()
+            .expect("an SSE server has no local binary to verify");
+    }
 
     #[test]
     fn test_server_config_stdio() {

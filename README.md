@@ -190,7 +190,7 @@ astrid start     # persistent daemon (survives terminal close)
 astrid status    # PID, uptime, connected clients, loaded capsules
 astrid ps        # loaded capsules and their lifecycle state
 astrid stop      # graceful shutdown
-astrid update    # download, verify, and stage the latest release (self-update alias)
+astrid update    # authenticate, verify, and install the latest release
 ```
 
 ## Per-principal isolation
@@ -307,7 +307,12 @@ cargo fmt --all -- --check
 All crates enforce `#![deny(unsafe_code)]` except `astrid-sys` and `astrid-sdk`, where WASM FFI
 requires it. Clippy runs at pedantic level and integer-overflow arithmetic is a lint error. Release
 binaries for macOS and Linux (x86_64 and aarch64) are built on tag push and signed with keyless
-Sigstore attestations.
+Sigstore. Self-managed updates authenticate the exact archive and its pinned Astrid release-workflow
+identity before independently checking the BLAKE3 manifest and extracting any bytes. Homebrew and
+Cargo remain responsible for updates they install; signed SHA-256 manifests remain available for
+their compatibility requirements. GitHub build-provenance attestations are published as additional
+evidence and are not substituted for the updater's release-archive signature. See the
+[self-update security model](docs/self-update-security.md).
 
 ## Contributing
 

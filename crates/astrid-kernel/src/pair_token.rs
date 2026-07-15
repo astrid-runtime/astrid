@@ -9,8 +9,10 @@
 //! `$ASTRID_HOME/etc/pair-tokens.toml`:
 //!
 //! ```toml
+//! schema_version = 1
+//!
 //! [[pair_token]]
-//! token_hash = "..."           # hex(sha256(token)) — 64 hex chars
+//! token_hash = "blake3:..."    # domain-separated BLAKE3 identifier
 //! principal = "alice"          # the principal the new key will bind to
 //! expires_at_epoch = 1234567890
 //! issued_at_epoch = 1234560000
@@ -19,8 +21,8 @@
 //!
 //! ## Threat model
 //!
-//! Same posture as the invite store: hashes on disk, atomic
-//! write-then-rename, 0600 perms, constant-time hash comparison on
+//! Same posture as the invite store: hashes on disk, Unix write-then-rename,
+//! 0600 perms, constant-time hash comparison on
 //! redeem. Pair-tokens are single-use only (no `remaining_uses`
 //! field) — a redeemed token is removed immediately.
 //!
@@ -35,11 +37,19 @@ use std::path::PathBuf;
 use astrid_core::DeviceScope;
 use astrid_core::PrincipalId;
 use astrid_core::dirs::AstridHome;
+use astrid_crypto::IdentifierHash;
 use base64::Engine;
 use rand::{TryRng, rngs::SysRng};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+use tracing::warn;
+
+const STORE_SCHEMA_VERSION: u32 = 1;
+const TOKEN_HASH_CONTEXT: &str = "astrid.runtime.pair-device-token.identifier.v1";
+
+/// Type prefix carried by every raw device-pairing bearer token.
+pub const TOKEN_PREFIX: &str = "astrid_pair_";
 
 /// Length of the random token portion in bytes (192 bits → 32 chars
 /// URL-safe base64). Same sizing as invite tokens.
@@ -51,10 +61,10 @@ pub const TOKEN_RAW_LEN: usize = 24;
 pub const MAX_EXPIRY_SECS: u64 = 60 * 60;
 
 /// On-disk persisted pair-token record. Raw token is never stored —
-/// only its SHA-256.
+/// only its domain-separated BLAKE3 identifier.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PairToken {
-    /// Hex-encoded SHA-256 of the URL-safe base64 token.
+    /// `blake3:<hex>` identifier of the complete `astrid_pair_` bearer token.
     pub token_hash: String,
     /// Principal the new device's key will attach to.
     pub principal: PrincipalId,
@@ -83,9 +93,9 @@ fn default_full_scope() -> DeviceScope {
     DeviceScope::Full
 }
 
-/// File-backed pair-token store. Read-modify-write with atomic
-/// rename; concurrent mutators serialise on the kernel's
-/// `admin_write_lock`.
+/// File-backed pair-token store. Read-modify-write uses atomic rename on Unix;
+/// all loads and mutators serialise on the kernel's `admin_write_lock` because
+/// a load can migrate legacy state.
 #[derive(Debug)]
 pub struct PairTokenStore {
     path: PathBuf,
@@ -104,7 +114,9 @@ impl PairTokenStore {
         home.etc_dir().join("pair-tokens.toml")
     }
 
-    /// Read the persisted list. Missing file → empty Vec.
+    /// Read the persisted list. Missing file → empty Vec. A schema-0 store is
+    /// invalidated because its SHA-256 token identifiers cannot be
+    /// converted without the raw tokens.
     ///
     /// # Errors
     /// Returns an error if the file exists but is unreadable or
@@ -134,14 +146,41 @@ impl PairTokenStore {
             PairTokenStoreError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e))
         })?;
         if text.trim().is_empty() {
+            if let Err(error) = self.save_to_disk(&[]) {
+                warn!(
+                    path = %self.path.display(),
+                    %error,
+                    "could not normalize empty pair-token store"
+                );
+            }
             return Ok(Vec::new());
         }
+        let probe: SchemaProbe = toml::from_str(text).map_err(PairTokenStoreError::Toml)?;
+        if probe.schema_version > STORE_SCHEMA_VERSION {
+            return Err(PairTokenStoreError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "pair-token store schema {} is newer than supported schema {STORE_SCHEMA_VERSION}",
+                    probe.schema_version
+                ),
+            )));
+        }
         let parsed: PersistedFile = toml::from_str(text).map_err(PairTokenStoreError::Toml)?;
+        if probe.schema_version == 0 {
+            let invalidated = parsed.pair_token.len();
+            self.save_to_disk(&[])?;
+            warn!(
+                path = %self.path.display(),
+                invalidated,
+                "invalidated legacy SHA-256 pair-token store"
+            );
+            return Ok(Vec::new());
+        }
         Ok(parsed.pair_token)
     }
 
-    /// Write the supplied list atomically (write-then-rename, 0600
-    /// perms). Empty list persists as an empty TOML file.
+    /// Write the supplied list with write-then-rename and 0600 permissions on
+    /// Unix. An empty list retains the versioned TOML envelope.
     ///
     /// # Errors
     /// Returns an error if the file cannot be written.
@@ -165,6 +204,7 @@ impl PairTokenStore {
             std::fs::create_dir_all(parent).map_err(PairTokenStoreError::Io)?;
         }
         let body = PersistedFile {
+            schema_version: STORE_SCHEMA_VERSION,
             pair_token: tokens.to_vec(),
         };
         let text = toml::to_string_pretty(&body).map_err(PairTokenStoreError::TomlSer)?;
@@ -223,13 +263,21 @@ impl std::fmt::Display for PairTokenStoreError {
 
 impl std::error::Error for PairTokenStoreError {}
 
+#[derive(Debug, Default, Deserialize)]
+struct SchemaProbe {
+    #[serde(default)]
+    schema_version: u32,
+}
+
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct PersistedFile {
+    #[serde(default)]
+    schema_version: u32,
     #[serde(default)]
     pair_token: Vec<PairToken>,
 }
 
-/// Generate a random URL-safe-base64 token from the OS CSPRNG.
+/// Generate a typed token with a random URL-safe-base64 secret from the OS CSPRNG.
 ///
 /// # Panics
 ///
@@ -240,15 +288,16 @@ pub fn generate_token() -> String {
     SysRng
         .try_fill_bytes(&mut bytes)
         .expect("OS CSPRNG unavailable while generating pair token");
-    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
+    format!(
+        "{TOKEN_PREFIX}{}",
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
+    )
 }
 
-/// Hash a token for storage / lookup. Hex-encoded SHA-256.
+/// Derive a token identifier for storage and lookup.
 #[must_use]
 pub fn hash_token(token: &str) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(token.as_bytes());
-    hex::encode(hasher.finalize())
+    IdentifierHash::derive(TOKEN_HASH_CONTEXT, token.as_bytes()).to_prefixed_hex()
 }
 
 /// Constant-time hash comparison.
@@ -283,15 +332,37 @@ mod tests {
         let a = generate_token();
         let b = generate_token();
         assert_ne!(a, b);
-        assert_eq!(a.len(), 32);
+        assert!(a.starts_with(TOKEN_PREFIX));
+        assert_eq!(a.strip_prefix(TOKEN_PREFIX).unwrap().len(), 32);
     }
 
     #[test]
-    fn hash_is_deterministic_hex() {
+    fn hash_is_domain_separated_blake3() {
         let h = hash_token("hello");
-        assert_eq!(h.len(), 64);
+        assert_eq!(
+            h,
+            "blake3:4e8275107b87254c5236647be8785404cdf3388d1ec2e149df1054de5a01e7a4"
+        );
+        assert_eq!(h.len(), 71);
         assert_eq!(h, hash_token("hello"));
         assert_ne!(h, hash_token("world"));
+        assert_ne!(h, crate::invite::hash_token("hello"));
+    }
+
+    #[test]
+    fn ct_hash_eq_checks_the_full_identifier_shape() {
+        let expected = hash_token("hello");
+        assert!(ct_hash_eq(&expected, &expected));
+        for index in [7, expected.len() / 2, expected.len() - 1] {
+            let mut different = expected.clone().into_bytes();
+            different[index] = if different[index] == b'0' { b'1' } else { b'0' };
+            assert!(!ct_hash_eq(
+                &expected,
+                std::str::from_utf8(&different).unwrap()
+            ));
+        }
+        assert!(!ct_hash_eq(&expected, &expected[..70]));
+        assert!(!ct_hash_eq(&expected, &format!("{expected}0")));
     }
 
     #[test]
@@ -299,7 +370,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = PairTokenStore::new(dir.path().join("pair-tokens.toml"));
         let token = PairToken {
-            token_hash: "abc".into(),
+            token_hash: hash_token("pair alice phone"),
             principal: PrincipalId::new("alice").unwrap(),
             expires_at_epoch: 9_999_999_999,
             issued_at_epoch: 1,
@@ -310,6 +381,11 @@ mod tests {
             },
         };
         store.save(std::slice::from_ref(&token)).unwrap();
+        assert!(
+            std::fs::read_to_string(&store.path)
+                .unwrap()
+                .contains("schema_version = 1")
+        );
         let loaded = store.load().unwrap();
         assert_eq!(loaded, vec![token]);
     }
@@ -321,8 +397,9 @@ mod tests {
         // device so the round-trip preserves the prior behaviour.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("pair-tokens.toml");
-        let legacy = "[[pair_token]]\n\
-            token_hash = \"abc\"\n\
+        let legacy = "schema_version = 1\n\
+            [[pair_token]]\n\
+            token_hash = \"blake3:4e8275107b87254c5236647be8785404cdf3388d1ec2e149df1054de5a01e7a4\"\n\
             principal = \"alice\"\n\
             expires_at_epoch = 9999999999\n\
             issued_at_epoch = 1\n";
@@ -330,6 +407,92 @@ mod tests {
         let loaded = PairTokenStore::new(path).load().unwrap();
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].scope, DeviceScope::Full);
+    }
+
+    #[test]
+    fn legacy_sha256_store_is_invalidated_and_rewritten() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pair-tokens.toml");
+        let legacy = "[[pair_token]]\n\
+            token_hash = \"2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824\"\n\
+            principal = \"alice\"\n\
+            expires_at_epoch = 9999999999\n\
+            issued_at_epoch = 1\n";
+        std::fs::write(&path, legacy).unwrap();
+
+        let store = PairTokenStore::new(path.clone());
+        assert!(store.load().unwrap().is_empty());
+        let rewritten = std::fs::read_to_string(&path).unwrap();
+        assert!(rewritten.contains("schema_version = 1"));
+        assert!(!rewritten.contains("[[pair_token]]"));
+        assert!(store.load().unwrap().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_only_legacy_sha256_store_fails_closed_without_rewrite() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pair-tokens.toml");
+        let legacy = "[[pair_token]]\n\
+            token_hash = \"2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824\"\n\
+            principal = \"alice\"\n\
+            expires_at_epoch = 9999999999\n\
+            issued_at_epoch = 1\n";
+        std::fs::write(&path, legacy).unwrap();
+
+        let original = std::fs::metadata(dir.path()).unwrap().permissions();
+        let mut read_only = original.clone();
+        read_only.set_mode(0o500);
+        std::fs::set_permissions(dir.path(), read_only).unwrap();
+        let loaded = PairTokenStore::new(path.clone()).load();
+        std::fs::set_permissions(dir.path(), original).unwrap();
+
+        assert!(loaded.is_err());
+        assert_eq!(std::fs::read_to_string(path).unwrap(), legacy);
+    }
+
+    #[test]
+    fn future_store_is_rejected_without_rewrite() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pair-tokens.toml");
+        let future = "schema_version = 2\nfuture_field = \"preserve me\"\n";
+        std::fs::write(&path, future).unwrap();
+
+        let err = PairTokenStore::new(path.clone()).load().unwrap_err();
+        assert!(err.to_string().contains("schema 2 is newer"));
+        assert_eq!(std::fs::read_to_string(path).unwrap(), future);
+    }
+
+    #[test]
+    fn malformed_store_is_rejected_without_rewrite() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pair-tokens.toml");
+        let malformed = "schema_version = [not valid\n";
+        std::fs::write(&path, malformed).unwrap();
+
+        assert!(PairTokenStore::new(path.clone()).load().is_err());
+        assert_eq!(std::fs::read_to_string(path).unwrap(), malformed);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_only_empty_file_still_loads_as_empty_vec() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = PairTokenStore::new(dir.path().join("pair-tokens.toml"));
+        std::fs::write(&store.path, "").unwrap();
+
+        let original = std::fs::metadata(dir.path()).unwrap().permissions();
+        let mut read_only = original.clone();
+        read_only.set_mode(0o500);
+        std::fs::set_permissions(dir.path(), read_only).unwrap();
+        let loaded = store.load();
+        std::fs::set_permissions(dir.path(), original).unwrap();
+
+        assert_eq!(loaded.unwrap(), Vec::<PairToken>::new());
     }
 
     #[test]

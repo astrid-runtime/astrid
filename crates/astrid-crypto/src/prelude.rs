@@ -28,5 +28,5 @@ pub use crate::{KeyPair, PublicKey};
 // Signature
 pub use crate::Signature;
 
-// Hashing
-pub use crate::ContentHash;
+// Hashing and identifiers
+pub use crate::{ContentHash, IdentifierHash, PublicKeyFingerprint};
