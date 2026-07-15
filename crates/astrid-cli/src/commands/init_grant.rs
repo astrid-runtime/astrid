@@ -222,6 +222,28 @@ pub(super) fn validate_locked_capsules(
     Ok(installed)
 }
 
+/// Reuse a fresh lock only when its installed state still verifies. A current
+/// distro id/version with stale or incomplete install provenance falls through
+/// to the normal checked install path so init can regenerate the lock.
+pub(super) fn validated_grant_set_for_reuse(
+    home: &AstridHome,
+    target: &PrincipalId,
+    locked: &[super::LockedCapsule],
+) -> Option<Vec<String>> {
+    match validate_locked_capsules(home, target, locked) {
+        Ok(installed) => Some(installed),
+        Err(error) => {
+            eprintln!(
+                "{}",
+                Theme::warning(&format!(
+                    "Distro.lock is current but installed state failed verification ({error:#}); reinstalling"
+                ))
+            );
+            None
+        },
+    }
+}
+
 fn validate_locked_wasm(
     home: &AstridHome,
     capsule: &CapsuleId,
@@ -619,6 +641,7 @@ mod tests {
 
         let err = validate_locked_capsules(&home, &target, &locked).unwrap_err();
         assert!(err.to_string().contains("blob bytes do not match"));
+        assert!(validated_grant_set_for_reuse(&home, &target, &locked).is_none());
         std::fs::remove_file(blob).unwrap();
         let err = validate_locked_capsules(&home, &target, &locked).unwrap_err();
         assert!(err.to_string().contains("missing or unreadable"));

@@ -130,6 +130,8 @@ pub(crate) async fn run_init(distro_source: &str, opts: &InitOpts) -> anyhow::Re
     // Check lock freshness AFTER parsing manifest (need manifest to compare).
     if let Some(existing_lock) = load_lock(&lock_path)?
         && is_lock_fresh(&existing_lock, &manifest)
+        && let Some(installed) =
+            grant::validated_grant_set_for_reuse(&home, &target, &existing_lock.capsules)
     {
         eprintln!(
             "{}",
@@ -148,7 +150,6 @@ pub(crate) async fn run_init(distro_source: &str, opts: &InitOpts) -> anyhow::Re
         // principal that already holds them reports "no change" rather than
         // erroring or duplicating — and this is also how a first run whose
         // grant step failed (daemon was down) recovers on re-run.
-        let installed = grant::validate_locked_capsules(&home, &target, &existing_lock.capsules)?;
         grant::apply_or_hint_grants(&operator, &target, &installed, opts.grant_capsules).await?;
         return Ok(());
     }
