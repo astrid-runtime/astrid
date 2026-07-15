@@ -159,44 +159,62 @@ pub fn capability_registry_revision_1() -> Result<CapabilityRegistryManifest, Au
 }
 
 fn revision_1_danger(id: &str) -> Option<CapabilityDanger> {
-    match id {
-        "system:shutdown" => Some(CapabilityDanger::Extreme),
-        "system:status" => Some(CapabilityDanger::Safe),
-        "capsule:install" => Some(CapabilityDanger::Extreme),
-        "self:capsule:install" => Some(CapabilityDanger::Elevated),
-        "capsule:reload" | "self:capsule:reload" => Some(CapabilityDanger::Normal),
-        "capsule:remove" => Some(CapabilityDanger::Elevated),
-        "self:capsule:remove" => Some(CapabilityDanger::Normal),
-        "self:workspace:promote" => Some(CapabilityDanger::Elevated),
-        "self:workspace:rollback" => Some(CapabilityDanger::Normal),
-        "capsule:list" | "self:capsule:list" => Some(CapabilityDanger::Safe),
-        "agent:create" => Some(CapabilityDanger::Normal),
-        "agent:create:inherit" | "agent:create:clone" => Some(CapabilityDanger::Extreme),
-        "agent:delete" | "agent:disable" | "agent:modify" => Some(CapabilityDanger::Elevated),
-        "agent:enable" => Some(CapabilityDanger::Normal),
-        "agent:list" | "self:agent:list" => Some(CapabilityDanger::Safe),
-        "quota:set" | "self:quota:set" => Some(CapabilityDanger::Normal),
-        "quota:get" | "self:quota:get" => Some(CapabilityDanger::Safe),
-        "group:create" | "group:delete" | "group:modify" => Some(CapabilityDanger::Elevated),
-        "group:list" | "self:group:list" => Some(CapabilityDanger::Safe),
-        "caps:grant" | "caps:token:mint" => Some(CapabilityDanger::Extreme),
-        "caps:revoke" | "caps:token:revoke" => Some(CapabilityDanger::Elevated),
-        "caps:token:list" => Some(CapabilityDanger::Safe),
-        "invite:issue" | "audit:read_all" | "self:auth:pair:admin" | "auth:pair" => {
-            Some(CapabilityDanger::Elevated)
-        },
-        "invite:redeem" | "invite:revoke" | "self:auth:pair" | "auth:pair:redeem" => {
-            Some(CapabilityDanger::Normal)
-        },
-        "invite:list" | "self:approval:respond" => Some(CapabilityDanger::Safe),
-        "system:resources:unbounded"
+    use CapabilityDanger::{Elevated, Extreme, Normal, Safe};
+
+    Some(match id {
+        "system:status"
+        | "capsule:list"
+        | "self:capsule:list"
+        | "agent:list"
+        | "self:agent:list"
+        | "quota:get"
+        | "self:quota:get"
+        | "group:list"
+        | "self:group:list"
+        | "caps:token:list"
+        | "invite:list"
+        | "self:approval:respond" => Safe,
+        "capsule:reload"
+        | "self:capsule:reload"
+        | "self:capsule:remove"
+        | "self:workspace:rollback"
+        | "agent:create"
+        | "agent:enable"
+        | "quota:set"
+        | "self:quota:set"
+        | "invite:redeem"
+        | "invite:revoke"
+        | "self:auth:pair"
+        | "auth:pair:redeem" => Normal,
+        "self:capsule:install"
+        | "capsule:remove"
+        | "self:workspace:promote"
+        | "agent:delete"
+        | "agent:disable"
+        | "agent:modify"
+        | "group:create"
+        | "group:delete"
+        | "group:modify"
+        | "caps:revoke"
+        | "caps:token:revoke"
+        | "invite:issue"
+        | "audit:read_all"
+        | "self:auth:pair:admin"
+        | "auth:pair" => Elevated,
+        "system:shutdown"
+        | "capsule:install"
+        | "agent:create:inherit"
+        | "agent:create:clone"
+        | "caps:grant"
+        | "caps:token:mint"
+        | "system:resources:unbounded"
         | "net_bind"
         | "uplink"
         | "capsule:access:any"
         | "authority:profile:manage"
-        | "authority:repair" => Some(CapabilityDanger::Extreme),
-        _ => None,
-    }
+        | "authority:repair" => Extreme,
+        _ => return None,
+    })
 }
 
 fn revision_1_semantics(id: &str) -> Option<RevisionSemantics> {
