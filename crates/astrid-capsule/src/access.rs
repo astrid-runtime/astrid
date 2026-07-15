@@ -363,6 +363,7 @@ mod tests {
 
     #[test]
     fn unrestricted_capsule_access_enforcement_id_is_registered() {
+        assert_eq!(CAPSULE_ACCESS_ANY, "capsule:access:any");
         let registry = astrid_core::capability_registry::capability_registry_revision_1().unwrap();
         assert!(
             registry

@@ -3563,6 +3563,11 @@ mod tests {
 
     #[test]
     fn secondary_enforcement_ids_are_registered() {
+        assert_eq!(AUDIT_FIREHOSE_CAP, "audit:read_all");
+        assert_eq!(
+            astrid_core::EXEMPT_CAPABILITIES,
+            ["system:resources:unbounded", "net_bind", "uplink"]
+        );
         let registry = astrid_core::capability_registry::capability_registry_revision_1().unwrap();
         for id in std::iter::once(AUDIT_FIREHOSE_CAP).chain(astrid_core::EXEMPT_CAPABILITIES) {
             assert!(
