@@ -23,81 +23,10 @@ use super::{
     AuthorityScope, admin_request_method, admin_response_topic, admin_target_principal,
     required_capability_for_admin_request, resolve_admin_scope,
 };
+use crate::kernel_router::test_util::all_admin_request_variants;
 
 fn pid(name: &str) -> PrincipalId {
     PrincipalId::new(name).unwrap()
-}
-
-fn all_admin_variants() -> Vec<AdminRequestKind> {
-    vec![
-        AdminRequestKind::AgentCreate {
-            name: "n".into(),
-            groups: Vec::new(),
-            grants: Vec::new(),
-            inherit_from: None,
-            clone_from: None,
-            allow_admin_clone: false,
-        },
-        AdminRequestKind::AgentDelete {
-            principal: pid("a"),
-        },
-        AdminRequestKind::AgentEnable {
-            principal: pid("a"),
-        },
-        AdminRequestKind::AgentDisable {
-            principal: pid("a"),
-        },
-        AdminRequestKind::AgentModify {
-            principal: pid("a"),
-            add_groups: vec!["agent".into()],
-            remove_groups: Vec::new(),
-            add_capsules: Vec::new(),
-            remove_capsules: Vec::new(),
-        },
-        AdminRequestKind::AgentList,
-        AdminRequestKind::QuotaSet {
-            principal: pid("a"),
-            quotas: astrid_core::profile::Quotas::default(),
-        },
-        AdminRequestKind::QuotaGet {
-            principal: pid("a"),
-        },
-        AdminRequestKind::GroupCreate {
-            name: "ops".into(),
-            capabilities: vec!["capsule:install".into()],
-            description: None,
-            unsafe_admin: false,
-        },
-        AdminRequestKind::GroupDelete { name: "ops".into() },
-        AdminRequestKind::GroupModify {
-            name: "ops".into(),
-            capabilities: None,
-            description: None,
-            unsafe_admin: None,
-        },
-        AdminRequestKind::GroupList,
-        AdminRequestKind::CapsGrant {
-            principal: pid("a"),
-            capabilities: vec!["self:capsule:install".into()],
-            unsafe_admin: false,
-        },
-        AdminRequestKind::CapsRevoke {
-            principal: pid("a"),
-            capabilities: vec!["self:*".into()],
-        },
-        AdminRequestKind::CapsTokenMint {
-            principal: pid("a"),
-            resource: "mcp://server:tool".into(),
-            permission: None,
-            ttl_secs: None,
-        },
-        AdminRequestKind::CapsTokenRevoke {
-            token_id: "00000000-0000-0000-0000-000000000000".into(),
-        },
-        AdminRequestKind::CapsTokenList {
-            principal: pid("a"),
-        },
-    ]
 }
 
 fn agent_profile() -> PrincipalProfile {
@@ -129,7 +58,7 @@ fn authorize_with(
 
 #[test]
 fn every_variant_has_non_empty_mapping_in_both_scopes() {
-    for req in all_admin_variants() {
+    for req in all_admin_request_variants() {
         for scope in [AuthorityScope::Self_, AuthorityScope::Global] {
             let cap = required_capability_for_admin_request(&req, scope);
             assert!(
@@ -253,7 +182,7 @@ fn agent_create_mapping_uses_granular_clone_and_inherit_caps() {
 
 #[test]
 fn every_variant_has_a_method_label() {
-    for req in all_admin_variants() {
+    for req in all_admin_request_variants() {
         let m = admin_request_method(&req);
         assert!(
             m.starts_with("admin."),
@@ -363,7 +292,7 @@ fn agent_denied_cross_tenant_every_admin_topic() {
     let profile = agent_profile();
     let caller = pid("agent_user");
 
-    for req in all_admin_variants() {
+    for req in all_admin_request_variants() {
         let method = admin_request_method(&req);
         let scope = resolve_admin_scope(&req, &caller);
         let cap = required_capability_for_admin_request(&req, scope);
@@ -390,7 +319,7 @@ fn admin_allowed_every_admin_topic() {
     let profile = admin_profile();
     let caller = pid("admin_user");
 
-    for req in all_admin_variants() {
+    for req in all_admin_request_variants() {
         let method = admin_request_method(&req);
         let scope = resolve_admin_scope(&req, &caller);
         let cap = required_capability_for_admin_request(&req, scope);

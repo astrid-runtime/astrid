@@ -16,6 +16,7 @@ use util::{
     validate_digest_length,
 };
 
+mod revision_1;
 mod util;
 
 const ENTRY_DIGEST_DOMAIN: &[u8] = b"astrid-capability-entry\0";
@@ -60,7 +61,6 @@ impl CapabilityRegistryRevision {
 ///
 /// This set is authority-bearing and frozen for its registry schema revision.
 /// Expanding it requires an intentional schema revision and reviewed digest vectors.
-#[cfg(test)]
 const CAPABILITY_REGISTRY_REVISION_1_IDS: [&str; 51] = [
     "system:shutdown",
     "system:status",
@@ -114,6 +114,141 @@ const CAPABILITY_REGISTRY_REVISION_1_IDS: [&str; 51] = [
     "authority:profile:manage",
     "authority:repair",
 ];
+
+/// Schema revision for the 51-ID authority registry.
+pub const CAPABILITY_REGISTRY_REVISION_1: CapabilityRegistryRevision =
+    CapabilityRegistryRevision::new(NonZeroU32::MIN);
+
+#[derive(Clone, Copy)]
+struct RevisionSemantics {
+    scope: CapabilityScope,
+    target_kinds: &'static [AuthorityTargetKind],
+    delegable: bool,
+    privileged: bool,
+}
+
+/// Build the content-addressed registry for the 51 fixed capability IDs.
+///
+/// # Errors
+///
+/// Returns an error if an ID lacks fixed semantics or display metadata, or if
+/// any definition fails registry validation.
+pub fn capability_registry_revision_1() -> Result<CapabilityRegistryManifest, AuthorityRegistryError>
+{
+    let entries = CAPABILITY_REGISTRY_REVISION_1_IDS
+        .into_iter()
+        .map(|id| {
+            let semantics = revision_1_semantics(id).ok_or_else(|| {
+                AuthorityRegistryError::MissingRevisionDefinition { id: id.to_string() }
+            })?;
+            let danger = revision_1::danger(id).ok_or_else(|| {
+                AuthorityRegistryError::MissingRevisionDisplayMetadata { id: id.to_string() }
+            })?;
+            RegisteredCapability::new(
+                ExactCapabilityId::new(id.to_string())?,
+                semantics.scope,
+                semantics.target_kinds.iter().copied(),
+                danger,
+                semantics.delegable,
+                semantics.privileged,
+                CapabilitySource::Kernel,
+            )
+        })
+        .collect::<Result<Vec<_>, AuthorityRegistryError>>()?;
+
+    CapabilityRegistryManifest::new(CAPABILITY_REGISTRY_REVISION_1, entries)
+}
+
+fn revision_1_semantics(id: &str) -> Option<RevisionSemantics> {
+    use AuthorityTargetKind::{
+        AuditScope, CapsuleInstance, CapsulePackage, Credential, Group, Principal, System,
+    };
+    use CapabilityScope::{Global, Self_};
+
+    let semantics = match id {
+        "system:shutdown" => RevisionSemantics::new(Global, &[System], false, true),
+        "system:status" => RevisionSemantics::new(Global, &[System], false, false),
+        "capsule:install" => RevisionSemantics::new(Global, &[System, CapsulePackage], true, true),
+        "self:capsule:install" => {
+            RevisionSemantics::new(Self_, &[Principal, CapsulePackage], true, false)
+        },
+        "capsule:reload" | "capsule:remove" => {
+            RevisionSemantics::new(Global, &[System, CapsuleInstance], true, true)
+        },
+        "self:capsule:reload"
+        | "self:capsule:remove"
+        | "self:workspace:promote"
+        | "self:workspace:rollback" => {
+            RevisionSemantics::new(Self_, &[Principal, CapsuleInstance], true, false)
+        },
+        "capsule:list" | "agent:list" | "group:list" | "invite:list" => {
+            RevisionSemantics::new(Global, &[System], true, true)
+        },
+        "self:capsule:list"
+        | "self:agent:list"
+        | "self:group:list"
+        | "self:quota:get"
+        | "self:approval:respond" => RevisionSemantics::new(Self_, &[Principal], true, false),
+        "agent:create" | "agent:create:clone" | "agent:modify" => {
+            RevisionSemantics::new(Global, &[Principal, Group, CapsulePackage], true, true)
+        },
+        "agent:create:inherit"
+        | "agent:delete"
+        | "agent:enable"
+        | "agent:disable"
+        | "quota:set"
+        | "quota:get"
+        | "caps:grant"
+        | "caps:revoke"
+        | "caps:token:list" => RevisionSemantics::new(Global, &[Principal], true, true),
+        "self:quota:set" => RevisionSemantics::new(Self_, &[Principal], true, true),
+        "group:create" | "group:delete" | "group:modify" => {
+            RevisionSemantics::new(Global, &[Group], true, true)
+        },
+        "caps:token:mint" | "caps:token:revoke" => {
+            RevisionSemantics::new(Global, &[Principal, Credential], true, true)
+        },
+        "invite:issue" => RevisionSemantics::new(Global, &[Group, Credential], true, true),
+        "invite:redeem" => {
+            RevisionSemantics::new(Global, &[Principal, Group, Credential], false, true)
+        },
+        "invite:revoke" => RevisionSemantics::new(Global, &[Credential], true, true),
+        "audit:read_all" => RevisionSemantics::new(Global, &[AuditScope], true, true),
+        "self:auth:pair" => RevisionSemantics::new(Self_, &[Principal, Credential], true, true),
+        "self:auth:pair:admin" => {
+            RevisionSemantics::new(Self_, &[Principal, Credential], false, true)
+        },
+        "auth:pair:redeem" => RevisionSemantics::new(Global, &[Principal, Credential], false, true),
+        "auth:pair" => RevisionSemantics::new(Global, &[Principal, Credential], true, true),
+        "system:resources:unbounded" | "net_bind" | "uplink" => {
+            RevisionSemantics::new(Self_, &[Principal, CapsuleInstance], false, true)
+        },
+        "capsule:access:any" => {
+            RevisionSemantics::new(Self_, &[CapsulePackage, CapsuleInstance], false, true)
+        },
+        "authority:profile:manage" | "authority:repair" => {
+            RevisionSemantics::new(Global, &[System, Principal, Group, Credential], false, true)
+        },
+        _ => return None,
+    };
+    Some(semantics)
+}
+
+impl RevisionSemantics {
+    const fn new(
+        scope: CapabilityScope,
+        target_kinds: &'static [AuthorityTargetKind],
+        delegable: bool,
+        privileged: bool,
+    ) -> Self {
+        Self {
+            scope,
+            target_kinds,
+            delegable,
+            privileged,
+        }
+    }
+}
 
 /// A validated capability identifier containing no wildcard segment.
 ///
@@ -708,6 +843,18 @@ pub enum AuthorityRegistryError {
         expected: String,
         /// Recomputed digest.
         actual: String,
+    },
+    /// A fixed capability ID has no authorization definition.
+    #[error("capability-registry revision 1 entry {id:?} has no authorization definition")]
+    MissingRevisionDefinition {
+        /// Capability identifier.
+        id: String,
+    },
+    /// A fixed capability ID has no danger classification.
+    #[error("capability-registry revision 1 entry {id:?} has no display metadata")]
+    MissingRevisionDisplayMetadata {
+        /// Capability identifier.
+        id: String,
     },
 }
 

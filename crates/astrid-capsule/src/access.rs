@@ -362,6 +362,19 @@ mod tests {
     }
 
     #[test]
+    fn unrestricted_capsule_access_enforcement_id_is_registered() {
+        assert_eq!(CAPSULE_ACCESS_ANY, "capsule:access:any");
+        let registry = astrid_core::capability_registry::capability_registry_revision_1().unwrap();
+        assert!(
+            registry
+                .entries()
+                .iter()
+                .any(|entry| entry.id().as_str() == CAPSULE_ACCESS_ANY),
+            "capsule access enforcement uses {CAPSULE_ACCESS_ANY:?} without a registry revision 1 entry"
+        );
+    }
+
+    #[test]
     fn none_principal_denied() {
         let (_d, _h, r) = fixture();
         assert!(!r.is_capsule_allowed(None, &cap("identity")));

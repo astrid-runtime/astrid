@@ -21,7 +21,8 @@ fn audit_topic_literal_pinned() {
     // `pattern_covers_audit` would otherwise silently stop recognising
     // audit subscriptions and leave them on the unscoped firehose default
     // for the renamed topic — exactly the drift the doc comment promises
-    // is guarded. Mirrors `tests::audit_firehose_cap_literal_pinned`.
+    // is guarded. The separate firehose capability identifier is checked
+    // against registry revision 1 by `tests::secondary_enforcement_ids_are_registered`.
     assert_eq!(AUDIT_TOPIC, "astrid.v1.audit.entry");
 }
 
