@@ -1,13 +1,27 @@
-//! CLI re-export shim for the shared
+//! Workspace-checked CLI wrapper for the shared
 //! [`astrid_uplink::AdminClient`](::astrid_uplink::admin_client::AdminClient).
 //!
 //! The CLI binds the admin client to the process-wide principal
 //! (resolved once at startup from `--principal` / `ASTRID_PRINCIPAL` /
 //! `default`) — a fresh client per call, all stamping one identity.
 
-pub(crate) use astrid_uplink::admin_client::{AdminClient, into_result};
+pub(crate) use astrid_uplink::admin_client::into_result;
 
 use anyhow::Result;
+use astrid_core::kernel_api::{AdminRequestKind, AdminResponseBody};
+use astrid_uplink::admin_client::AdminClient as UplinkAdminClient;
+
+/// Admin request surface available to CLI commands.
+///
+/// Construction stays private to this module so command code cannot bypass
+/// the selected-workspace checks in [`connect_for_workspace_as`].
+pub(crate) struct AdminClient(UplinkAdminClient);
+
+impl AdminClient {
+    pub(crate) async fn request(&mut self, kind: AdminRequestKind) -> Result<AdminResponseBody> {
+        self.0.request(kind).await
+    }
+}
 
 /// Connect to the daemon as the process principal.
 ///
@@ -34,8 +48,8 @@ pub(crate) async fn connect_as_active_agent() -> Result<AdminClient> {
 pub(crate) async fn connect_for_workspace_as(
     caller: astrid_core::PrincipalId,
 ) -> Result<AdminClient> {
-    Ok(
-        crate::socket_client::connect_workspace_client(None, || AdminClient::connect(caller))
-            .await?,
-    )
+    let client =
+        crate::socket_client::connect_workspace_client(None, || UplinkAdminClient::connect(caller))
+            .await?;
+    Ok(AdminClient(client))
 }

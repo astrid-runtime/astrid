@@ -91,9 +91,9 @@ pub(super) async fn preflight_grants(
     preflight_sequence(
         crate::commands::daemon::ensure_daemon("init grant preflight"),
         || async move {
-            let mut client = crate::admin_client::AdminClient::connect(operator.clone())
+            let mut client = crate::admin_client::connect_for_workspace_as(operator.clone())
                 .await
-                .context("grant preflight could not connect to the daemon")?;
+                .context("grant preflight could not connect to the selected workspace daemon")?;
             let body = client
                 .request(AdminRequestKind::AgentModify {
                     principal: target.clone(),
@@ -384,11 +384,11 @@ async fn grant_installed_capsules(
         ))
     );
 
-    let mut client = match crate::admin_client::AdminClient::connect(operator.clone()).await {
+    let mut client = match crate::admin_client::connect_for_workspace_as(operator.clone()).await {
         Ok(c) => c,
         Err(e) => {
             bail!(
-                "capsules are installed, but connecting to the daemon to grant access failed: {e}\n  \
+                "capsules are installed, but connecting to the selected workspace daemon to grant access failed: {e}\n  \
                  Grant them once the daemon is running:\n  {}",
                 agent_modify_grant_command(operator, target, installed)
             );
