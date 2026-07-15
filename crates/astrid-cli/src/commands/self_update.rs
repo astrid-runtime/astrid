@@ -392,7 +392,9 @@ fn verify_blake3(archive: &[u8], sums_body: &str, asset_name: &str) -> anyhow::R
     let mut seen_assets = std::collections::HashSet::new();
 
     for (index, line) in sums_body.lines().enumerate() {
-        let line_number = index + 1;
+        let line_number = index
+            .checked_add(1)
+            .context("BLAKE3SUMS.txt line count exceeds usize")?;
         let (hex, name) = line.split_once("  ").ok_or_else(|| {
             anyhow::anyhow!(
                 "malformed BLAKE3SUMS.txt line {line_number}: expected '<digest>  <asset>'"
