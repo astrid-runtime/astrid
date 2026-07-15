@@ -213,6 +213,19 @@ mod tests {
         }
     }
 
+    #[test]
+    fn audit_firehose_enforcement_id_is_registered() {
+        assert_eq!(AUDIT_FIREHOSE_CAP, "audit:read_all");
+        let registry = astrid_core::capability_registry::capability_registry_revision_1().unwrap();
+        assert!(
+            registry
+                .entries()
+                .iter()
+                .any(|entry| entry.id().as_str() == AUDIT_FIREHOSE_CAP),
+            "gateway enforcement uses {AUDIT_FIREHOSE_CAP:?} without a registry revision 1 entry"
+        );
+    }
+
     #[tokio::test]
     async fn live_stream_loses_firehose_and_keeps_own_visibility() {
         let bus = EventBus::new();
