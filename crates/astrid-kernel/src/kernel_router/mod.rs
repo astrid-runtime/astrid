@@ -1,5 +1,6 @@
 /// Admin management API dispatcher (issue #672, Layer 6).
 pub mod admin;
+mod caller;
 mod device_scope;
 /// `KernelRequest::InstallCapsule` handler — delegates to the
 /// `astrid-capsule-install` library so the daemon and the CLI reach
@@ -26,6 +27,9 @@ use astrid_events::ipc::{IpcMessage, IpcPayload, Topic};
 use astrid_events::kernel_api::{KernelRequest, KernelResponse};
 use tracing::{debug, info, warn};
 
+use caller::{
+    CallerResolutionError, MANAGEMENT_CALLER_REQUIRED, resolve_caller, resolve_connection_principal,
+};
 use device_scope::resolve_device_scope;
 
 #[cfg(test)]
@@ -769,52 +773,6 @@ pub fn kernel_request_method(req: &KernelRequest) -> &'static str {
         KernelRequest::GetAgentReadiness => "GetAgentReadiness",
         KernelRequest::Shutdown { .. } => "Shutdown",
         KernelRequest::GetStatus => "GetStatus",
-    }
-}
-
-/// Stable outward denial for a management request with no authenticated caller.
-const MANAGEMENT_CALLER_REQUIRED: &str = "management request denied: missing or invalid principal";
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum CallerResolutionError {
-    Missing,
-    Invalid,
-}
-
-impl CallerResolutionError {
-    const fn reason(self) -> &'static str {
-        match self {
-            Self::Missing => "missing principal",
-            Self::Invalid => "invalid principal",
-        }
-    }
-}
-
-/// Resolve the authenticated caller from a management IPC envelope.
-///
-/// The kernel never supplies the interactive CLI's active-principal default:
-/// that deliberate UX choice is made by the local client before it publishes.
-/// Once a request reaches this authority boundary, an absent or malformed
-/// principal must not acquire the bootstrap `default` principal's authority.
-fn resolve_caller(message: &IpcMessage) -> Result<PrincipalId, CallerResolutionError> {
-    let raw = message
-        .principal
-        .as_deref()
-        .ok_or(CallerResolutionError::Missing)?;
-    PrincipalId::new(raw).map_err(|_| CallerResolutionError::Invalid)
-}
-
-/// Resolve one connection-tracking identity without granting bootstrap authority.
-///
-/// A missing identity is the explicit no-capability `anonymous` principal used by
-/// the legacy handshake. A malformed identity is rejected so a forged lifecycle
-/// message cannot move any principal's counter.
-fn resolve_connection_principal(
-    message: &IpcMessage,
-) -> Result<PrincipalId, CallerResolutionError> {
-    match message.principal.as_deref() {
-        Some(raw) => PrincipalId::new(raw).map_err(|_| CallerResolutionError::Invalid),
-        None => Ok(PrincipalId::anonymous()),
     }
 }
 
