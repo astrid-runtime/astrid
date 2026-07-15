@@ -6,7 +6,7 @@ use std::sync::Arc;
 use astrid_core::dirs::AstridHome;
 use astrid_core::groups::{BUILTIN_ADMIN, BUILTIN_AGENT};
 use astrid_core::principal::PrincipalId;
-use astrid_core::profile::PrincipalProfile;
+use astrid_core::profile::{AuthMethod, DeviceKey, DeviceScope, PrincipalProfile};
 use astrid_events::kernel_api::{AdminRequestKind, AdminResponseBody};
 use tempfile::TempDir;
 
@@ -33,6 +33,47 @@ async fn fixture() -> (TempDir, Arc<Kernel>) {
 
 fn pid(name: &str) -> PrincipalId {
     PrincipalId::new(name).unwrap()
+}
+
+fn group_names_for(response: AdminResponseBody) -> Vec<String> {
+    match response {
+        AdminResponseBody::GroupList(list) => list.into_iter().map(|group| group.name).collect(),
+        other => panic!("expected GroupList, got {other:?}"),
+    }
+}
+
+async fn assert_group_list_authorization_snapshot(
+    kernel: &Arc<Kernel>,
+    mut profile: PrincipalProfile,
+    global_list_id: &str,
+) {
+    let authorization = crate::kernel_router::authorize_request(
+        kernel,
+        &PrincipalId::default(),
+        Some(global_list_id),
+        "self:group:list",
+    )
+    .expect("authorize group inventory");
+    profile.auth.public_keys.clear();
+    profile
+        .save_to_path(&PrincipalProfile::path_for(
+            &kernel.astrid_home,
+            &PrincipalId::default(),
+        ))
+        .expect("revoke group inventory device");
+    kernel.profile_cache.invalidate(&PrincipalId::default());
+    crate::kernel_router::authorize_request(
+        kernel,
+        &PrincipalId::default(),
+        Some(global_list_id),
+        "self:group:list",
+    )
+    .expect_err("a later request must observe the revoked device");
+
+    let pinned = group_names_for(
+        handlers::dispatch_authorized(kernel, &authorization, AdminRequestKind::GroupList).await,
+    );
+    assert!(pinned.iter().any(|name| name == "ops"));
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -65,4 +106,87 @@ async fn group_list_filters_to_callers_profile_groups_without_global_cap() {
     };
     let names: Vec<_> = list.iter().map(|group| group.name.as_str()).collect();
     assert_eq!(names, vec![BUILTIN_AGENT]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn group_list_global_view_is_attenuated_by_device_scope() {
+    let (_dir, kernel) = fixture().await;
+    handlers::dispatch(
+        &kernel,
+        &PrincipalId::default(),
+        AdminRequestKind::GroupCreate {
+            name: "ops".into(),
+            capabilities: vec!["capsule:install".into()],
+            description: None,
+            unsafe_admin: false,
+        },
+    )
+    .await;
+
+    let full = DeviceKey::new("a".repeat(64), DeviceScope::Full, None, 0);
+    let self_only = DeviceKey::new(
+        "b".repeat(64),
+        DeviceScope::Scoped {
+            allow: vec!["self:*".to_string()],
+            deny: Vec::new(),
+        },
+        None,
+        0,
+    );
+    let global_list = DeviceKey::new(
+        "c".repeat(64),
+        DeviceScope::Scoped {
+            allow: vec!["self:*".to_string(), "group:list".to_string()],
+            deny: Vec::new(),
+        },
+        None,
+        0,
+    );
+    let full_id = full.key_id.clone();
+    let self_only_id = self_only.key_id.clone();
+    let global_list_id = global_list.key_id.clone();
+    let profile_path = PrincipalProfile::path_for(&kernel.astrid_home, &PrincipalId::default());
+    let mut profile =
+        PrincipalProfile::load_from_path(&profile_path).expect("load default profile");
+    profile.auth.methods = vec![AuthMethod::Keypair];
+    profile.auth.public_keys = vec![full, self_only, global_list];
+    profile
+        .save_to_path(&profile_path)
+        .expect("save device-scoped default profile");
+    kernel.profile_cache.invalidate(&PrincipalId::default());
+
+    let full = group_names_for(
+        handlers::dispatch_with_device(
+            &kernel,
+            &PrincipalId::default(),
+            Some(&full_id),
+            AdminRequestKind::GroupList,
+        )
+        .await,
+    );
+    assert!(full.iter().any(|name| name == "ops"));
+
+    let global = group_names_for(
+        handlers::dispatch_with_device(
+            &kernel,
+            &PrincipalId::default(),
+            Some(&global_list_id),
+            AdminRequestKind::GroupList,
+        )
+        .await,
+    );
+    assert!(global.iter().any(|name| name == "ops"));
+
+    let scoped = group_names_for(
+        handlers::dispatch_with_device(
+            &kernel,
+            &PrincipalId::default(),
+            Some(&self_only_id),
+            AdminRequestKind::GroupList,
+        )
+        .await,
+    );
+    assert_eq!(scoped, vec![BUILTIN_ADMIN]);
+
+    assert_group_list_authorization_snapshot(&kernel, profile, &global_list_id).await;
 }

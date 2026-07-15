@@ -1,8 +1,8 @@
 //! Acceptance tests for per-device capability scope on pairing.
 //!
-//! These drive the kernel/handler path end-to-end (real `Kernel`, profiles on
-//! disk, the same `handlers::dispatch_with_device` the IPC router uses) and
-//! prove the no-escalation guarantees the feature exists to provide:
+//! These drive the kernel/handler path end-to-end with a real `Kernel`,
+//! disk-backed profiles, and the same authorization snapshot as the IPC router.
+//! They prove the no-escalation guarantees the feature exists to provide:
 //!
 //! * a `use-only` device cannot mint pair-tokens (cap-gate denial), but the
 //!   same principal can from a full device;
@@ -28,6 +28,7 @@ use tempfile::TempDir;
 
 use super::handlers;
 use crate::Kernel;
+use crate::pair_token::PairTokenStore;
 
 async fn fixture() -> (TempDir, Arc<Kernel>) {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -42,8 +43,19 @@ fn pid(name: &str) -> PrincipalId {
 
 /// Seed `principal` holding `grants`, enabled, with the supplied device keys.
 fn seed(kernel: &Arc<Kernel>, principal: &PrincipalId, grants: &[&str], devices: Vec<DeviceKey>) {
+    seed_policy(kernel, principal, grants, &[], devices);
+}
+
+fn seed_policy(
+    kernel: &Arc<Kernel>,
+    principal: &PrincipalId,
+    grants: &[&str],
+    revokes: &[&str],
+    devices: Vec<DeviceKey>,
+) {
     let mut profile = PrincipalProfile {
         grants: grants.iter().map(|g| (*g).to_string()).collect(),
+        revokes: revokes.iter().map(|r| (*r).to_string()).collect(),
         enabled: true,
         ..Default::default()
     };
@@ -83,6 +95,27 @@ fn issue(scope: PairScopeArg) -> AdminRequestKind {
         expires_secs: Some(300),
         label: Some("dev".into()),
         scope,
+    }
+}
+
+async fn assert_missing_device_rejects_broad_mints(
+    kernel: &Arc<Kernel>,
+    caller: &PrincipalId,
+    device_key_id: &str,
+) {
+    for scope in [
+        PairScopeArg::Full,
+        PairScopeArg::Explicit {
+            allow: vec!["*".into()],
+            deny: vec![],
+        },
+    ] {
+        let response =
+            handlers::dispatch_with_device(kernel, caller, Some(device_key_id), issue(scope)).await;
+        assert!(
+            matches!(response, AdminResponseBody::Error(_)),
+            "a missing issuer device must not mint broad authority: {response:?}"
+        );
     }
 }
 
@@ -182,6 +215,118 @@ async fn full_scope_device_can_mint_full() {
     );
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn unknown_or_revoked_issuer_device_cannot_mint_broad_authority() {
+    let (_dir, kernel) = fixture().await;
+
+    let unknown_caller = pid("unknown_issuer_device");
+    seed(&kernel, &unknown_caller, &["*"], vec![]);
+    assert_missing_device_rejects_broad_mints(&kernel, &unknown_caller, "0000000000000000").await;
+    assert_missing_device_rejects_broad_mints(&kernel, &unknown_caller, "not-a-key-id").await;
+
+    let revoked_caller = pid("revoked_issuer_device");
+    let revoked_device = full_device('f');
+    let revoked_id = revoked_device.key_id.clone();
+    seed(&kernel, &revoked_caller, &["*"], vec![revoked_device]);
+    let response = handlers::dispatch(
+        &kernel,
+        &revoked_caller,
+        AdminRequestKind::PairDeviceRevoke {
+            principal: revoked_caller.clone(),
+            key_id: revoked_id.clone(),
+        },
+    )
+    .await;
+    assert!(matches!(
+        response,
+        AdminResponseBody::PairDeviceRevoked { .. }
+    ));
+    assert_missing_device_rejects_broad_mints(&kernel, &revoked_caller, &revoked_id).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn universal_scoped_mint_requires_effective_admin_capability() {
+    let (_dir, kernel) = fixture().await;
+    let caller = pid("universal_scope_without_admin");
+    seed_policy(&kernel, &caller, &["*"], &["self:auth:pair:admin"], vec![]);
+
+    let req = issue(PairScopeArg::Explicit {
+        allow: vec!["*".into()],
+        deny: vec![],
+    });
+    let resp = handlers::dispatch_with_device(&kernel, &caller, None, req).await;
+    match resp {
+        AdminResponseBody::Error(msg) => assert!(
+            msg.contains("universal `*`") && msg.contains("self:auth:pair:admin"),
+            "universal scoped denial must name both the scope and required capability: {msg}"
+        ),
+        other => panic!("universal scoped mint without pair-admin must reject, got: {other:?}"),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn universal_scoped_mint_is_accepted_with_admin_capability() {
+    let (_dir, kernel) = fixture().await;
+    let caller = pid("universal_scope_with_admin");
+    let dev = scoped_device('a', &["*"], &[]);
+    let dev_id = dev.key_id.clone();
+    seed(&kernel, &caller, &["*"], vec![dev]);
+
+    let req = issue(PairScopeArg::Explicit {
+        allow: vec!["*".into()],
+        deny: vec![],
+    });
+    let resp = handlers::dispatch_with_device(&kernel, &caller, Some(&dev_id), req).await;
+    assert!(
+        matches!(resp, AdminResponseBody::PairToken(_)),
+        "an issuer effectively holding pair-admin may mint a universal scoped device: {resp:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn scoped_issuer_cannot_bypass_admin_gate_with_universal_allow() {
+    let (_dir, kernel) = fixture().await;
+    let caller = pid("attenuated_universal_issuer");
+    let dev = scoped_device('a', &["*"], &["self:auth:pair:admin"]);
+    let dev_id = dev.key_id.clone();
+    seed(&kernel, &caller, &["*"], vec![dev]);
+
+    let req = issue(PairScopeArg::Explicit {
+        allow: vec!["*".into()],
+        deny: vec![],
+    });
+    let resp = handlers::dispatch_with_device(&kernel, &caller, Some(&dev_id), req).await;
+    match resp {
+        AdminResponseBody::Error(msg) => assert!(
+            msg.contains("self:auth:pair:admin"),
+            "attenuated issuer denial must name the missing effective capability: {msg}"
+        ),
+        other => panic!("attenuated scoped issuer must not mint universal scope, got: {other:?}"),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn use_only_scope_does_not_require_admin_capability() {
+    let (_dir, kernel) = fixture().await;
+    let caller = pid("self_scope_without_admin");
+    seed_policy(
+        &kernel,
+        &caller,
+        &["self:*"],
+        &["self:auth:pair:admin"],
+        vec![],
+    );
+
+    let req = issue(PairScopeArg::Preset {
+        name: "use-only".into(),
+    });
+    let resp = handlers::dispatch_with_device(&kernel, &caller, None, req).await;
+    assert!(
+        matches!(resp, AdminResponseBody::PairToken(_)),
+        "self:* must remain an ordinary subset-checked scoped grant: {resp:?}"
+    );
+}
+
 // ── Criterion 3: over-broad requested scope rejected at issue time ────
 
 #[tokio::test(flavor = "multi_thread")]
@@ -222,6 +367,90 @@ async fn over_broad_scope_rejected_at_issue() {
     );
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn malformed_explicit_patterns_are_rejected_before_persistence() {
+    let (_dir, kernel) = fixture().await;
+    let caller = pid("malformed_scope_issuer");
+    seed(&kernel, &caller, &["self:*"], vec![]);
+
+    for scope in [
+        PairScopeArg::Explicit {
+            allow: vec!["self:capsule;install".into()],
+            deny: vec![],
+        },
+        PairScopeArg::Explicit {
+            allow: vec!["self:capsule:reload".into()],
+            deny: vec!["self:capsule;install".into()],
+        },
+    ] {
+        let response = handlers::dispatch_with_device(&kernel, &caller, None, issue(scope)).await;
+        match response {
+            AdminResponseBody::Error(message) => assert!(
+                message.contains("invalid device scope capability pattern"),
+                "canonical capability validation must reject the scope: {message}"
+            ),
+            other => panic!("malformed explicit scope must reject, got: {other:?}"),
+        }
+    }
+
+    let store = PairTokenStore::new(PairTokenStore::path_for(&kernel.astrid_home));
+    assert!(
+        store.load().expect("load pair-token store").is_empty(),
+        "invalid allow or deny patterns must never be persisted"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn valid_explicit_allow_and_deny_survive_issue_and_redeem() {
+    let (_dir, kernel) = fixture().await;
+    let caller = pid("explicit_scope_issuer");
+    seed(
+        &kernel,
+        &caller,
+        &["self:auth:pair", "self:capsule:reload"],
+        vec![],
+    );
+    let response = handlers::dispatch_with_device(
+        &kernel,
+        &caller,
+        None,
+        issue(PairScopeArg::Explicit {
+            allow: vec!["self:capsule:reload".into()],
+            deny: vec!["self:capsule:install".into()],
+        }),
+    )
+    .await;
+    let token = match response {
+        AdminResponseBody::PairToken(token) => token.token,
+        other => panic!("valid explicit scope must issue, got: {other:?}"),
+    };
+
+    let public_key = "d".repeat(64);
+    let response = handlers::dispatch(
+        &kernel,
+        &PrincipalId::default(),
+        AdminRequestKind::PairDeviceRedeem {
+            token,
+            public_key: public_key.clone(),
+        },
+    )
+    .await;
+    assert!(matches!(response, AdminResponseBody::PairTokenRedeemed(_)));
+
+    let profile = load(&kernel, &caller);
+    let child = profile
+        .auth
+        .device_by_key_id(&device_key_id_fingerprint(&public_key))
+        .expect("redeemed device");
+    assert_eq!(
+        child.scope,
+        DeviceScope::Scoped {
+            allow: vec!["self:capsule:reload".into()],
+            deny: vec!["self:capsule:install".into()],
+        }
+    );
+}
+
 // ── Coordinator correction: deny-inheritance (monotonic narrowing) ────
 
 #[tokio::test(flavor = "multi_thread")]
@@ -233,6 +462,17 @@ async fn scoped_issuer_child_inherits_issuer_denies() {
     let dev = scoped_device('a', &["self:*"], &["self:capsule:install"]);
     let dev_id = dev.key_id.clone();
     seed(&kernel, &caller, &["self:*"], vec![dev]);
+    let authorization =
+        crate::kernel_router::authorize_request(&kernel, &caller, Some(&dev_id), "self:auth:pair")
+            .expect("authorize pair issuance");
+    let mut revoked = load(&kernel, &caller);
+    revoked.auth.public_keys.clear();
+    revoked
+        .save_to_path(&PrincipalProfile::path_for(&kernel.astrid_home, &caller))
+        .expect("revoke issuer device");
+    kernel.profile_cache.invalidate(&caller);
+    crate::kernel_router::authorize_request(&kernel, &caller, Some(&dev_id), "self:auth:pair")
+        .expect_err("a later request must observe the revoked issuer");
 
     // The issuer requests a broad child: allow self:*. The stored child scope
     // must inherit the issuer's deny (self:capsule:install) so the child can
@@ -241,7 +481,7 @@ async fn scoped_issuer_child_inherits_issuer_denies() {
         allow: vec!["self:*".into()],
         deny: vec![],
     });
-    let resp = handlers::dispatch_with_device(&kernel, &caller, Some(&dev_id), req).await;
+    let resp = handlers::dispatch_authorized(&kernel, &authorization, req).await;
     let token = match resp {
         AdminResponseBody::PairToken(t) => t.token,
         other => panic!("issue must succeed (allow self:* ⊆ issuer self:*): {other:?}"),

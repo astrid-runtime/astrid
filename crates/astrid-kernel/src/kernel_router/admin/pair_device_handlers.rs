@@ -21,14 +21,17 @@ use std::sync::Arc;
 
 use astrid_capabilities::{CapabilityCheck, device_scope_within};
 use astrid_core::PrincipalId;
+use astrid_core::groups::GroupConfig;
 use astrid_core::kernel_api::{
     AdminResponseBody, DeviceKeyInfo, PairScopeArg, PairTokenIssued, PairTokenRedeemed,
 };
 use astrid_core::profile::{
-    AuthMethod, DeviceKey, DeviceKeyId, DevicePubkey, DeviceScope, PrincipalProfile,
+    AuthMethod, CapabilityPattern, DeviceKey, DeviceKeyId, DevicePubkey, DeviceScope,
+    PrincipalProfile,
 };
 use tracing::{info, warn};
 
+use crate::kernel_router::AuthorizedRequest;
 use crate::pair_token::{self, MAX_EXPIRY_SECS, PairToken, PairTokenStore};
 
 /// Default token lifetime when the issuer doesn't specify. Matches
@@ -36,109 +39,72 @@ use crate::pair_token::{self, MAX_EXPIRY_SECS, PairToken, PairTokenStore};
 /// device to be close at hand.
 const DEFAULT_EXPIRY_SECS: u64 = 5 * 60;
 
-pub(crate) async fn pair_device_issue(
+type PairIssuerAuthority = (Arc<PrincipalProfile>, Arc<GroupConfig>, Option<DeviceScope>);
+
+fn resolve_pair_issuer_authority(
     kernel: &Arc<crate::Kernel>,
     caller: &PrincipalId,
+    authorization: Option<&AuthorizedRequest>,
+    issuer_device_key_id: Option<&str>,
+) -> Result<PairIssuerAuthority, AdminResponseBody> {
+    if let Some(authorization) = authorization {
+        return Ok((
+            Arc::clone(&authorization.profile),
+            Arc::clone(&authorization.groups),
+            authorization.device_scope.clone(),
+        ));
+    }
+
+    let profile_path = kernel.astrid_home.profile_path(caller);
+    if !profile_path.exists() {
+        return Err(err_bad_input(format!(
+            "caller principal {caller} does not exist (no profile.toml)"
+        )));
+    }
+    let profile = kernel
+        .profile_cache
+        .resolve(caller)
+        .map_err(|error| err_internal(format!("issuer profile resolution failed: {error}")))?;
+    let issuer_scope = crate::kernel_router::resolve_device_scope(
+        profile.as_ref(),
+        caller,
+        issuer_device_key_id,
+        "self:auth:pair",
+    )
+    .map_err(|error| err_unauthorized(error.to_string()))?;
+    Ok((profile, kernel.groups.load_full(), issuer_scope))
+}
+
+pub(super) async fn pair_device_issue(
+    kernel: &Arc<crate::Kernel>,
+    caller: &PrincipalId,
+    authorization: Option<&AuthorizedRequest>,
     issuer_device_key_id: Option<&str>,
     expires_secs: Option<u64>,
     label: Option<String>,
     requested: PairScopeArg,
 ) -> AdminResponseBody {
-    let lifetime = expires_secs.unwrap_or(DEFAULT_EXPIRY_SECS);
-    if lifetime == 0 {
-        return err_bad_input("expires_secs must be greater than 0".into());
-    }
-    if lifetime > MAX_EXPIRY_SECS {
-        return err_bad_input(format!(
-            "expires_secs {lifetime} exceeds the 1-hour cap ({MAX_EXPIRY_SECS}s) — pair-tokens are intended for immediate use"
-        ));
-    }
-
-    // Resolve the requested scope arg to a concrete DeviceScope. An unknown
-    // preset name is a bad-input rejection, not a silent fallback.
-    let requested_scope = match resolve_pair_scope(&requested) {
-        Ok(s) => s,
-        Err(e) => return err_bad_input(e),
+    let (lifetime, requested_scope) = match validate_pair_issue(expires_secs, &requested) {
+        Ok(values) => values,
+        Err(error) => return err_bad_input(error),
     };
 
-    // Caller's profile must already exist. A pair-token tied to a
-    // missing principal would be a dead grant on redeem.
-    let profile_path = kernel.astrid_home.profile_path(caller);
-    if !profile_path.exists() {
-        return err_bad_input(format!(
-            "caller principal {caller} does not exist (no profile.toml)"
-        ));
-    }
-
-    // ── No-escalation enforcement ──────────────────────────────────────
-    //
-    // Resolve the issuer's EFFECTIVE capability set: their principal profile
-    // narrowed by the issuer's OWN authenticating device scope. A
-    // restricted-but-can-pair device must NOT be able to mint a broader child
-    // — "device scope ⊆ issuer effective caps" where the issuer's effective
-    // caps already account for their own device attenuation.
-    //
-    // The scope is cloned into a local so it outlives the borrow of `profile`
-    // for the `CapabilityCheck` below (cheap — a couple of small pattern
-    // vectors — and avoids fighting the borrow `device_by_key_id` takes).
-    let profile = match kernel.profile_cache.resolve(caller) {
-        Ok(p) => p,
-        Err(e) => return err_internal(format!("issuer profile resolution failed: {e}")),
+    let (profile, groups, issuer_scope) =
+        match resolve_pair_issuer_authority(kernel, caller, authorization, issuer_device_key_id) {
+            Ok(authority) => authority,
+            Err(response) => return response,
+        };
+    let stored_scope = match validate_pair_issue_authority(
+        caller,
+        profile.as_ref(),
+        groups.as_ref(),
+        issuer_scope.as_ref(),
+        &requested_scope,
+    ) {
+        Ok(scope) => scope,
+        Err(error) => return err_unauthorized(error),
     };
-    let issuer_scope: Option<DeviceScope> = issuer_device_key_id
-        .and_then(|kid| profile.auth.device_by_key_id(kid))
-        .map(|dev| dev.scope.clone());
-    let groups = kernel.groups.load_full();
-    let mut issuer_check = CapabilityCheck::new(profile.as_ref(), groups.as_ref(), caller.clone());
-    // Apply the issuer's own device floor (Full / None = unattenuated, the
-    // common admin/agent case — behaviour unchanged there).
-    if let Some(scope @ DeviceScope::Scoped { .. }) = &issuer_scope {
-        issuer_check = issuer_check.with_device_scope(scope);
-    }
-
-    match &requested_scope {
-        // FULL-MINT GATE: minting an unattenuated device is the broadest grant
-        // possible. It requires BOTH:
-        //  1. that the ISSUER is itself unattenuated. A device under its own
-        //     scope cannot grant "no restrictions" to a child — a Full child
-        //     applies no attenuation, so it would escape the issuer's own
-        //     denies (deny-inheritance below only narrows *Scoped* children,
-        //     not Full ones). A scoped issuer must mint a Scoped child instead.
-        //  2. that the issuer holds `self:auth:pair:admin` under their
-        //     attenuated effective set.
-        DeviceScope::Full => {
-            if matches!(&issuer_scope, Some(DeviceScope::Scoped { .. })) {
-                return err_unauthorized(format!(
-                    "a scoped device cannot mint a full-scope (unattenuated) device; issue a scoped device instead — {caller}"
-                ));
-            }
-            if !issuer_check.has("self:auth:pair:admin") {
-                return err_unauthorized(format!(
-                    "minting a full-scope device requires self:auth:pair:admin, which {caller} does not effectively hold"
-                ));
-            }
-        },
-        // SUBSET CHECK: every requested `allow` pattern must be held by the
-        // issuer's attenuated effective set (no escalation). `deny` patterns
-        // only restrict and need no validation.
-        DeviceScope::Scoped { .. } => {
-            if let Err(e) = device_scope_within(&issuer_check, &requested_scope) {
-                return err_unauthorized(format!(
-                    "requested device scope exceeds your authority: {e}"
-                ));
-            }
-        },
-    }
-
-    // DENY-INHERITANCE (monotonic narrowing): a Scoped child inherits the
-    // issuer's own device-scope denies. Without this, a broad child
-    // `allow:[self:*]` from an issuer that denies e.g. `self:capsule:install`
-    // would let the child exceed the parent on that cap. Unioning the parent's
-    // deny list re-blocks those caps in the child — children only ever get
-    // more restricted.
-    let stored_scope = inherit_issuer_denies(requested_scope, issuer_scope.as_ref());
-    // Drop the borrow on `profile`/`groups` before taking the write lock.
-    drop(issuer_check);
+    // Release the pinned authority snapshot before awaiting the write lock.
     drop(profile);
     drop(groups);
 
@@ -182,6 +148,121 @@ pub(crate) async fn pair_device_issue(
         expires_at_epoch,
         label,
     })
+}
+
+fn validate_pair_issue(
+    expires_secs: Option<u64>,
+    requested: &PairScopeArg,
+) -> Result<(u64, DeviceScope), String> {
+    let lifetime = expires_secs.unwrap_or(DEFAULT_EXPIRY_SECS);
+    if lifetime == 0 {
+        return Err("expires_secs must be greater than 0".into());
+    }
+    if lifetime > MAX_EXPIRY_SECS {
+        return Err(format!(
+            "expires_secs {lifetime} exceeds the 1-hour cap ({MAX_EXPIRY_SECS}s) — pair-tokens are intended for immediate use"
+        ));
+    }
+
+    let scope = resolve_pair_scope(requested)?;
+    validate_pair_scope_patterns(&scope)?;
+    Ok((lifetime, scope))
+}
+
+/// Return whether the requested scope confers unattenuated authority and must
+/// therefore pass the pair-admin capability preamble.
+pub(super) fn pair_scope_requires_admin(scope: &PairScopeArg) -> bool {
+    match scope {
+        PairScopeArg::Full => true,
+        PairScopeArg::Preset { name } => {
+            matches!(DeviceScope::preset(name), Some(DeviceScope::Full))
+        },
+        PairScopeArg::Explicit { allow, .. } => allow.iter().any(|pattern| pattern == "*"),
+    }
+}
+
+/// Pair-issuance failure class used to keep audit authorization and operation
+/// outcomes distinct without changing the public error wire shape.
+pub(super) enum PairIssuePreflightError {
+    /// The caller was authorized, but the requested expiry or scope is invalid.
+    BadInput(String),
+    /// The requested scope exceeds the issuer's effective authority.
+    Unauthorized(String),
+}
+
+/// Validate pair issuance against the exact policy snapshot pinned by the
+/// router before it records an authorization success audit row.
+pub(super) fn preflight_pair_device_issue(
+    authorization: &AuthorizedRequest,
+    expires_secs: Option<u64>,
+    requested: &PairScopeArg,
+) -> Result<(), PairIssuePreflightError> {
+    let (_, requested_scope) =
+        validate_pair_issue(expires_secs, requested).map_err(PairIssuePreflightError::BadInput)?;
+    validate_pair_issue_authority(
+        &authorization.principal,
+        authorization.profile.as_ref(),
+        authorization.groups.as_ref(),
+        authorization.device_scope.as_ref(),
+        &requested_scope,
+    )
+    .map_err(PairIssuePreflightError::Unauthorized)?;
+    Ok(())
+}
+
+fn validate_pair_issue_authority(
+    caller: &PrincipalId,
+    profile: &PrincipalProfile,
+    groups: &GroupConfig,
+    issuer_scope: Option<&DeviceScope>,
+    requested_scope: &DeviceScope,
+) -> Result<DeviceScope, String> {
+    let mut issuer_check = CapabilityCheck::new(profile, groups, caller.clone());
+    if let Some(scope @ DeviceScope::Scoped { .. }) = issuer_scope {
+        issuer_check = issuer_check.with_device_scope(scope);
+    }
+
+    match requested_scope {
+        DeviceScope::Full => {
+            if matches!(issuer_scope, Some(DeviceScope::Scoped { .. })) {
+                return Err(format!(
+                    "a scoped device cannot mint a full-scope (unattenuated) device; issue a scoped device instead — {caller}"
+                ));
+            }
+            if !issuer_check.has("self:auth:pair:admin") {
+                return Err(format!(
+                    "minting a full-scope device requires self:auth:pair:admin, which {caller} does not effectively hold"
+                ));
+            }
+        },
+        DeviceScope::Scoped { allow, .. } => {
+            let requests_universal_scope = allow.iter().any(|pattern| pattern == "*");
+            if requests_universal_scope && !issuer_check.has("self:auth:pair:admin") {
+                return Err(format!(
+                    "minting a device scope with universal `*` requires self:auth:pair:admin, which {caller} does not effectively hold"
+                ));
+            }
+            if let Err(error) = device_scope_within(&issuer_check, requested_scope) {
+                return Err(format!(
+                    "requested device scope exceeds your authority: {error}"
+                ));
+            }
+        },
+    }
+
+    Ok(inherit_issuer_denies(requested_scope.clone(), issuer_scope))
+}
+
+fn validate_pair_scope_patterns(scope: &DeviceScope) -> Result<(), String> {
+    let DeviceScope::Scoped { allow, deny } = scope else {
+        return Ok(());
+    };
+    for pattern in allow.iter().chain(deny) {
+        CapabilityPattern::new(pattern.as_str()).map_err(|error| {
+            format!("invalid device scope capability pattern {pattern:?}: {error}")
+        })?;
+    }
+    Ok(())
 }
 
 /// Resolve a [`PairScopeArg`] to a concrete [`DeviceScope`]. An unknown preset

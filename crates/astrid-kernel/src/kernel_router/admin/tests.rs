@@ -17,7 +17,7 @@ use std::sync::Arc;
 use astrid_capabilities::CapabilityCheck;
 use astrid_core::principal::PrincipalId;
 use astrid_core::{GroupConfig, PrincipalProfile};
-use astrid_events::kernel_api::AdminRequestKind;
+use astrid_events::kernel_api::{AdminRequestKind, PairScopeArg};
 
 use super::{
     AuthorityScope, admin_request_method, admin_response_topic, admin_target_principal,
@@ -166,6 +166,42 @@ fn agent_list_maps_self_to_self_prefix() {
     assert_eq!(
         required_capability_for_admin_request(&AdminRequestKind::AgentList, AuthorityScope::Global),
         "agent:list"
+    );
+}
+
+#[test]
+fn pair_issue_mapping_requires_admin_only_for_unattenuated_scopes() {
+    for scope in [
+        PairScopeArg::Full,
+        PairScopeArg::Preset {
+            name: "full".into(),
+        },
+        PairScopeArg::Explicit {
+            allow: vec!["*".into()],
+            deny: vec![],
+        },
+    ] {
+        let request = AdminRequestKind::PairDeviceIssue {
+            expires_secs: None,
+            label: None,
+            scope,
+        };
+        assert_eq!(
+            required_capability_for_admin_request(&request, AuthorityScope::Self_),
+            "self:auth:pair:admin"
+        );
+    }
+
+    let scoped = AdminRequestKind::PairDeviceIssue {
+        expires_secs: None,
+        label: None,
+        scope: PairScopeArg::Preset {
+            name: "use-only".into(),
+        },
+    };
+    assert_eq!(
+        required_capability_for_admin_request(&scoped, AuthorityScope::Self_),
+        "self:auth:pair"
     );
 }
 
