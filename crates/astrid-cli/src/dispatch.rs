@@ -641,6 +641,38 @@ mod tests {
     }
 
     #[test]
+    fn operator_distro_and_targeted_capsule_grants_compose() {
+        let cli = Cli::try_parse_from([
+            "astrid",
+            "--principal",
+            "operator-1",
+            "init",
+            "--target-principal",
+            "agent-1",
+            "--grant-capsules",
+        ])
+        .expect("an operator may supply the distro outside Astrid's CLI arguments");
+
+        assert_eq!(cli.principal.as_deref(), Some("operator-1"));
+        let Some(Commands::Init {
+            distro,
+            target_principal,
+            grant_capsules,
+            ..
+        }) = cli.command
+        else {
+            panic!("expected init command");
+        };
+        assert_eq!(
+            resolve_init_distro_with(distro, Some(OsString::from("/opt/product/Distro.toml")),)
+                .expect("operator-enforced distro should satisfy init"),
+            "/opt/product/Distro.toml"
+        );
+        assert_eq!(target_principal.as_deref(), Some("agent-1"));
+        assert!(grant_capsules);
+    }
+
+    #[test]
     fn malformed_operator_enforced_distro_fails_closed() {
         let empty = resolve_init_distro_with(None, Some(OsString::new()))
             .expect_err("empty enforced distro must fail");
