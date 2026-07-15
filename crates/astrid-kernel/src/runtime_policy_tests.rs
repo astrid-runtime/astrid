@@ -101,6 +101,25 @@ async fn scoped_device_must_admit_the_exact_firehose_capability() {
 }
 
 #[tokio::test]
+async fn scoped_admin_self_list_does_not_imply_audit_firehose() {
+    let (_dir, kernel, principal) = fixture().await;
+    let device = scoped_device('a', &["self:agent:list"], &[AUDIT_FIREHOSE_CAP]);
+    let key_id = device.key_id.clone();
+    seed_policy(
+        &kernel,
+        &principal,
+        true,
+        &["admin"],
+        &[],
+        &[],
+        vec![device],
+    );
+
+    assert!(kernel.runtime_capability_allows(&principal, Some(&key_id), "self:agent:list"));
+    assert!(!kernel.runtime_capability_allows(&principal, Some(&key_id), AUDIT_FIREHOSE_CAP));
+}
+
+#[tokio::test]
 async fn malformed_and_unknown_device_ids_fail_closed() {
     let (_dir, kernel, principal) = fixture().await;
     seed(&kernel, &principal, vec![full_device('a')]);
