@@ -87,6 +87,10 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
 
 ### Fixed
 
+- **Invite commands accept every token the runtime can issue.** `invite redeem`
+  and `invite revoke` now treat a leading hyphen in an opaque base64url token as
+  token data instead of misparsing it as an unknown option.
+
 - **Security Audit now uses a reproducible cargo-audit installation.** CI installs
   cargo-audit 0.22.2 with its published lockfile before invoking the pinned RustSec
   action, keeping the advisory scan compatible with the repository toolchain.

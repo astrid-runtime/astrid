@@ -563,7 +563,7 @@ pub(crate) enum DistroCommands {
 
 #[cfg(test)]
 mod tests {
-    use super::{CapsuleCommands, Cli, Commands};
+    use super::{CapsuleCommands, Cli, Commands, InviteCommand};
     use clap::{CommandFactory, Parser, Subcommand};
     use std::collections::BTreeSet;
 
@@ -652,6 +652,36 @@ mod tests {
         ])
         .expect("global --principal should parse before nested subcommands");
         assert_eq!(cli.principal.as_deref(), Some("operator-1"));
+    }
+
+    #[test]
+    fn opaque_invite_tokens_may_start_with_a_hyphen() {
+        let redeem = Cli::try_parse_from([
+            "astrid",
+            "invite",
+            "redeem",
+            "-opaque-token",
+            "--public-key",
+            "ed25519:0000000000000000000000000000000000000000000000000000000000000000",
+        ])
+        .expect("an issued base64url token may begin with a hyphen");
+        assert!(matches!(
+            redeem.command,
+            Some(Commands::Invite {
+                command: InviteCommand::Redeem(ref args),
+            }) if args.token == "-opaque-token"
+                && args.public_key.as_deref()
+                    == Some("ed25519:0000000000000000000000000000000000000000000000000000000000000000")
+        ));
+
+        let revoke = Cli::try_parse_from(["astrid", "invite", "revoke", "-opaque-token"])
+            .expect("the same issued token must be accepted by revoke");
+        assert!(matches!(
+            revoke.command,
+            Some(Commands::Invite {
+                command: InviteCommand::Revoke(ref args),
+            }) if args.token_or_fingerprint == "-opaque-token"
+        ));
     }
 
     #[test]

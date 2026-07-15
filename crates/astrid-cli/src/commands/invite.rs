@@ -55,6 +55,7 @@ pub(crate) struct IssueArgs {
 #[derive(Args, Debug, Clone)]
 pub(crate) struct RedeemArgs {
     /// The opaque token returned by a prior `astrid invite issue`.
+    #[arg(allow_hyphen_values = true)]
     pub token: String,
     /// Hex-encoded ed25519 public key. Accepts bare 64 hex chars or
     /// the self-describing `ed25519:<hex>` form. The new principal's
@@ -89,6 +90,7 @@ pub(crate) struct ListArgs {
 #[derive(Args, Debug, Clone)]
 pub(crate) struct RevokeArgs {
     /// Either the raw token or its hex fingerprint (from `invite list`).
+    #[arg(allow_hyphen_values = true)]
     pub token_or_fingerprint: String,
 }
 
