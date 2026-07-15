@@ -352,6 +352,8 @@ fn paginate_page(
     let mut last_visible_ts: Option<u64> = None;
     let mut last_visible_ts_position: usize = 0;
     let mut last_visible_scope: Option<CursorScope> = None;
+    let mut effective_scope: Option<CursorScope> = None;
+    let mut clipped_by_scope_change = false;
     for entry in entries {
         let Some(view) = render_entry(&entry) else {
             continue;
@@ -392,7 +394,16 @@ fn paginate_page(
         }
 
         let current_scope = access.current_cursor_scope();
-        if let Some(p) = current_scope.principal_filter()
+        if let Some(previous_scope) = effective_scope.as_ref()
+            && !current_scope.accepts_continuation_from(previous_scope)
+        {
+            clipped_by_scope_change = true;
+            break;
+        }
+        effective_scope = Some(current_scope);
+        if let Some(p) = effective_scope
+            .as_ref()
+            .and_then(CursorScope::principal_filter)
             && view.principal.as_deref() != Some(p.as_str())
         {
             continue;
@@ -400,14 +411,14 @@ fn paginate_page(
 
         last_visible_ts = Some(view.ts_epoch);
         last_visible_ts_position = raw_ts_position;
-        last_visible_scope = Some(current_scope);
+        last_visible_scope = effective_scope.clone();
         page.push(view);
         if page.len() >= limit {
             break;
         }
     }
 
-    let next_cursor = if page.len() == limit {
+    let next_cursor = if page.len() == limit || clipped_by_scope_change {
         last_visible_ts
             .zip(last_visible_scope)
             .map(|(t, scope)| format!("{t}_{last_visible_ts_position}_{}", scope.encode()))
@@ -840,6 +851,68 @@ mod tests {
             err.to_string()
                 .contains("restart pagination without a cursor"),
             "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn pagination_clips_mid_page_when_scope_rewidens() {
+        let log = AuditLog::in_memory(KeyPair::generate());
+        let session = SessionId::from_uuid(uuid::Uuid::nil());
+        for (principal, method) in [
+            ("bob", "BobVisibleAfterRewidening"),
+            ("alice", "AliceVisibleWhileScoped"),
+            ("bob", "BobHiddenWhileScoped"),
+            ("bob", "BobVisibleBeforeNarrowing"),
+        ] {
+            log.append_with_principal(
+                session.clone(),
+                PrincipalId::new(principal).unwrap(),
+                admin_action(method, None),
+                AuthorizationProof::System {
+                    reason: "test".into(),
+                },
+                AuditOutcome::Success { details: None },
+            )
+            .await
+            .expect("append");
+        }
+        let mut entries = log.get_session_entries(&session).await.expect("read");
+        entries.reverse();
+
+        let checks = Arc::new(AtomicUsize::new(0));
+        let checks_for_probe = Arc::clone(&checks);
+        let capability_probe = super::super::events::CapabilityProbe::new(move |_, _, _| {
+            matches!(checks_for_probe.fetch_add(1, Ordering::SeqCst), 0 | 3)
+        });
+        let caller = PrincipalId::new("alice").unwrap();
+        let access = AuditAccess {
+            capability_probe: &capability_probe,
+            caller_principal: &caller,
+            device_key_id: Some("0123456789abcdef"),
+            requested_principal: None,
+        };
+
+        let (page, next_cursor) =
+            paginate_page(entries, &AuditQuery::default(), &access, (None, 0, None), 3);
+        let methods: Vec<_> = page
+            .iter()
+            .filter_map(|entry| entry.method.as_deref())
+            .collect();
+
+        assert_eq!(
+            methods,
+            vec!["BobVisibleBeforeNarrowing", "AliceVisibleWhileScoped"]
+        );
+        let (cursor_ts, cursor_offset, cursor_scope) =
+            parse_cursor(next_cursor.as_deref()).expect("cursor parses");
+        assert!(
+            cursor_ts.is_some(),
+            "clipped page must still return a cursor"
+        );
+        assert_eq!(cursor_offset, 3);
+        assert_eq!(
+            cursor_scope,
+            Some(CursorScope::Principal(PrincipalId::new("alice").unwrap()))
         );
     }
 }
