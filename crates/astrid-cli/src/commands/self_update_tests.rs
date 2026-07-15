@@ -229,18 +229,56 @@ fn resolve_repo_precedence_and_validation() {
 }
 
 #[test]
-fn sha256_verification_matches_and_rejects() {
-    use sha2::Digest;
+fn blake3_verification_matches_independent_vector() {
     let archive = b"hello astrid";
-    let good = to_hex(&sha2::Sha256::digest(archive));
+    // Independently generated with `printf %s 'hello astrid' | b3sum --no-names`.
+    let good = "41251d32ddff968c23c1c83c4e7b3af8d6fef8912b4806aadec90e106a629fef";
+    assert_eq!(blake3::hash(archive).to_hex().as_str(), good);
     let body = format!("{good}  astrid-1.0.0-x.tar.gz\n");
-    verify_sha256(archive, &body, "astrid-1.0.0-x.tar.gz").expect("matching sum verifies");
+    verify_blake3(archive, &body, "astrid-1.0.0-x.tar.gz").expect("matching sum verifies");
+
+    let asset = "astrid-1.0.0-x.tar.gz";
 
     // Wrong sum -> error.
-    let bad_body = format!("{}  astrid-1.0.0-x.tar.gz\n", "0".repeat(64));
-    assert!(verify_sha256(archive, &bad_body, "astrid-1.0.0-x.tar.gz").is_err());
+    let bad_body = format!("{}  {asset}\n", "0".repeat(64));
+    assert!(verify_blake3(archive, &bad_body, asset).is_err());
     // Missing entry -> error.
-    assert!(verify_sha256(archive, "deadbeef  other.tar.gz\n", "astrid-1.0.0-x.tar.gz").is_err());
+    let other = format!("{}  other.tar.gz\n", "0".repeat(64));
+    assert!(verify_blake3(archive, &other, asset).is_err());
+    // Malformed length, non-hex and uppercase encodings are rejected.
+    assert!(verify_blake3(archive, &format!("{}  {asset}\n", "a".repeat(63)), asset).is_err());
+    assert!(verify_blake3(archive, &format!("{}g  {asset}\n", "a".repeat(63)), asset).is_err());
+    assert!(
+        verify_blake3(
+            archive,
+            &format!("{}  {asset}\n", good.to_uppercase()),
+            asset
+        )
+        .is_err()
+    );
+    // A matching checksum cannot be shadowed by a duplicate entry.
+    let duplicate = format!("{good}  {asset}\n{good}  {asset}\n");
+    assert!(verify_blake3(archive, &duplicate, asset).is_err());
+    // Manifest validity is platform-independent: duplicates for a different
+    // release asset are rejected as well.
+    let duplicate_other = format!(
+        "{good}  {asset}\n{}  other.tar.gz\n{}  other.tar.gz\n",
+        "0".repeat(64),
+        "1".repeat(64)
+    );
+    assert!(verify_blake3(archive, &duplicate_other, asset).is_err());
+}
+
+#[test]
+fn legacy_sha_only_release_is_not_accepted() {
+    let release = serde_json::json!({
+        "assets": [{
+            "name": "SHA256SUMS.txt",
+            "browser_download_url": "https://example.com/SHA256SUMS.txt"
+        }]
+    });
+    let error = blake3_sums_url(&release).unwrap_err().to_string();
+    assert!(error.contains("release has no BLAKE3SUMS.txt"));
 }
 
 #[test]

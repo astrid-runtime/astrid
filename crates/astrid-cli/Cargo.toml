@@ -45,7 +45,6 @@ base64 = { workspace = true }
 ed25519-dalek = { workspace = true }
 hex = { workspace = true }
 rand = { workspace = true }
-sha2 = { workspace = true }
 zeroize = { workspace = true }
 chrono = { workspace = true, features = ["clock"] }
 clap = { workspace = true }

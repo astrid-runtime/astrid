@@ -60,8 +60,15 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
   fingerprints share a typed derivation primitive, MCP binary pins now carry
   an honest `blake3:` label, and gateway env-write logs no longer expose
   dictionary-testable fingerprints of low-entropy values. External SHA-based
-  protocols such as SRI, Git, registry checksums, and release tooling remain
-  unchanged. Closes #1247.
+  protocols such as SRI, Git, and registry checksums remain unchanged. Closes
+  #1247.
+
+- **Astrid release archives now use BLAKE3 integrity manifests.** Release
+  automation publishes, signs, and attests `BLAKE3SUMS.txt`; self-managed
+  updates require a strict lowercase BLAKE3 entry and reject absent, malformed,
+  duplicate, or legacy SHA-only manifests. Existing v0.9.x self-managed
+  installations need one manual, Cargo, or Homebrew upgrade across this format
+  boundary. External protocol requirements remain unchanged. Closes #1249.
 
 - **Runtime E2E now stages the pinned Unicity AOS monorepo.** The workflow
   preserves the AOS Cargo workspace outside the core checkout and supplies

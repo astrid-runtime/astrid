@@ -381,39 +381,68 @@ async fn download(client: &reqwest::Client, url: &str) -> anyhow::Result<Vec<u8>
     Ok(bytes)
 }
 
-/// Hex-encode bytes (no extra dep).
-fn to_hex(bytes: &[u8]) -> String {
-    use std::fmt::Write as _;
-    let mut s = String::with_capacity(bytes.len().saturating_mul(2));
-    for b in bytes {
-        let _ = write!(s, "{b:02x}");
-    }
-    s
-}
-
-/// Verify `archive` against the sha256 recorded for `asset_name` in a
-/// `SHA256SUMS.txt` body (`<hex>  <name>` per line). This is INTEGRITY only —
+/// Verify `archive` against the BLAKE3 digest recorded for `asset_name` in a
+/// `BLAKE3SUMS.txt` body (`<hex>  <name>` per line). This is INTEGRITY only —
 /// it catches a corrupt/truncated/MITM-altered download whose checksum no longer
 /// matches the release's recorded sum. It is NOT authenticity (an attacker who
 /// controls the release controls both the artifact and the sum); a publisher
 /// signature is tracked separately.
-fn verify_sha256(archive: &[u8], sums_body: &str, asset_name: &str) -> anyhow::Result<()> {
-    use sha2::{Digest, Sha256};
-    let expected = sums_body
-        .lines()
-        .find_map(|line| {
-            let mut it = line.split_whitespace();
-            let hex = it.next()?;
-            let name = it.next()?;
-            // `sha256sum` marks binary entries with a leading '*'.
-            (name.trim_start_matches('*') == asset_name).then_some(hex)
-        })
-        .ok_or_else(|| anyhow::anyhow!("no checksum for '{asset_name}' in SHA256SUMS"))?;
-    let actual = to_hex(&Sha256::digest(archive));
-    if !actual.eq_ignore_ascii_case(expected) {
-        bail!("checksum mismatch for '{asset_name}': expected {expected}, got {actual}");
+fn verify_blake3(archive: &[u8], sums_body: &str, asset_name: &str) -> anyhow::Result<()> {
+    let mut expected = None;
+    let mut seen_assets = std::collections::HashSet::new();
+
+    for (index, line) in sums_body.lines().enumerate() {
+        let line_number = index + 1;
+        let (hex, name) = line.split_once("  ").ok_or_else(|| {
+            anyhow::anyhow!(
+                "malformed BLAKE3SUMS.txt line {line_number}: expected '<digest>  <asset>'"
+            )
+        })?;
+        anyhow::ensure!(
+            hex.len() == 64
+                && hex
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
+            "malformed BLAKE3 digest on line {line_number}: expected 64 lowercase hex characters"
+        );
+        anyhow::ensure!(
+            !name.is_empty() && !name.bytes().any(|byte| byte.is_ascii_whitespace()),
+            "malformed BLAKE3SUMS.txt asset name on line {line_number}"
+        );
+        anyhow::ensure!(
+            seen_assets.insert(name),
+            "duplicate checksum for '{name}' in BLAKE3SUMS.txt"
+        );
+
+        let digest = blake3::Hash::from_hex(hex)
+            .with_context(|| format!("invalid BLAKE3 digest on line {line_number}"))?;
+        if name == asset_name {
+            expected = Some(digest);
+        }
+    }
+
+    let expected = expected
+        .ok_or_else(|| anyhow::anyhow!("no checksum for '{asset_name}' in BLAKE3SUMS.txt"))?;
+    let actual = blake3::hash(archive);
+    if actual != expected {
+        bail!(
+            "checksum mismatch for '{asset_name}': expected {}, got {}",
+            expected.to_hex(),
+            actual.to_hex()
+        );
     }
     Ok(())
+}
+
+/// Require the canonical BLAKE3 manifest from a release. Legacy-only releases
+/// fail closed; an existing v0.9.x installation needs one manual package-manager
+/// upgrade across this format boundary.
+fn blake3_sums_url(release: &serde_json::Value) -> anyhow::Result<&str> {
+    asset_url(release, "BLAKE3SUMS.txt").ok_or_else(|| {
+        anyhow::anyhow!(
+            "release has no BLAKE3SUMS.txt — refusing to install an unverifiable binary"
+        )
+    })
 }
 
 /// Back up and atomically swap the named binaries from `extract_dir` into
@@ -651,20 +680,14 @@ async fn download_verify_extract(
         .to_string();
     let archive = download(client, &url).await?;
 
-    // Fail closed: a release with no SHA256SUMS.txt is unverifiable, so we refuse
-    // to install it rather than swap in an unchecked binary. (SHA256SUMS is
+    // Fail closed: a release with no BLAKE3SUMS.txt is unverifiable, so we refuse
+    // to install it rather than swap in an unchecked binary. (BLAKE3SUMS is
     // integrity, not authenticity — but skipping it entirely would defeat even
     // the on-the-wire / corrupted-download check.)
-    let sums_url = asset_url(release, "SHA256SUMS.txt")
-        .map(str::to_owned)
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "release has no SHA256SUMS.txt — refusing to install an unverifiable binary"
-            )
-        })?;
+    let sums_url = blake3_sums_url(release)?.to_owned();
     let sums = download(client, &sums_url).await?;
-    let sums_body = String::from_utf8(sums).context("SHA256SUMS.txt is not UTF-8")?;
-    verify_sha256(&archive, &sums_body, &asset_name)?;
+    let sums_body = String::from_utf8(sums).context("BLAKE3SUMS.txt is not UTF-8")?;
+    verify_blake3(&archive, &sums_body, &asset_name)?;
     println!("{}", Theme::dimmed("Checksum verified."));
 
     let tmp_dir = tempfile::tempdir()?;
