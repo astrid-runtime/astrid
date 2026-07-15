@@ -239,7 +239,7 @@ fn resolve_init_distro_with(
     enforced: Option<OsString>,
 ) -> Result<String> {
     let Some(enforced) = enforced else {
-        return requested.ok_or_else(|| {
+        return non_empty_distro_source(requested).ok_or_else(|| {
             anyhow::anyhow!(
                 "astrid init requires --distro <@owner/repo, URL, local Distro.toml, or .shuttle> unless ASTRID_ENFORCED_DISTRO is set by an embedding launcher; Astrid Runtime does not choose a product distro"
             )
@@ -257,6 +257,10 @@ fn resolve_init_distro_with(
         );
     }
     Ok(enforced)
+}
+
+fn non_empty_distro_source(source: Option<String>) -> Option<String> {
+    source.filter(|source| !source.is_empty())
 }
 
 /// Route the root capsule-verb shorthand (`astrid <verb> [args…]`).
@@ -408,7 +412,7 @@ async fn dispatch_distro(command: DistroCommands) -> Result<ExitCode> {
                     &[tracker_657()],
                 ));
             }
-            let distro = name.ok_or_else(|| {
+            let distro = non_empty_distro_source(name).ok_or_else(|| {
                 anyhow::anyhow!(
                     "astrid distro apply requires an explicit distro source: @owner/repo, URL, local Distro.toml, or .shuttle; Astrid Runtime does not choose a product distro"
                 )
@@ -583,26 +587,28 @@ mod tests {
 
     #[tokio::test]
     async fn init_without_a_distro_never_selects_a_product_default() {
-        let error = dispatch_subcommand(
-            Some(Commands::Init {
-                distro: None,
-                yes: false,
-                offline: false,
-                allow_unsigned: false,
-                accept_new_key: false,
-                vars: Vec::new(),
-                target_principal: None,
-                grant_capsules: false,
-            }),
-            OutputFormat::Pretty,
-        )
-        .await
-        .expect_err("standalone init must require an explicit distro");
+        for distro in [None, Some(String::new())] {
+            let error = dispatch_subcommand(
+                Some(Commands::Init {
+                    distro,
+                    yes: false,
+                    offline: false,
+                    allow_unsigned: false,
+                    accept_new_key: false,
+                    vars: Vec::new(),
+                    target_principal: None,
+                    grant_capsules: false,
+                }),
+                OutputFormat::Pretty,
+            )
+            .await
+            .expect_err("standalone init must require a non-empty explicit distro");
 
-        assert_eq!(
-            error.to_string(),
-            "astrid init requires --distro <@owner/repo, URL, local Distro.toml, or .shuttle> unless ASTRID_ENFORCED_DISTRO is set by an embedding launcher; Astrid Runtime does not choose a product distro"
-        );
+            assert_eq!(
+                error.to_string(),
+                "astrid init requires --distro <@owner/repo, URL, local Distro.toml, or .shuttle> unless ASTRID_ENFORCED_DISTRO is set by an embedding launcher; Astrid Runtime does not choose a product distro"
+            );
+        }
     }
 
     #[test]
@@ -701,21 +707,23 @@ mod tests {
 
     #[tokio::test]
     async fn distro_apply_without_a_source_never_selects_a_product_default() {
-        let error = dispatch_distro(DistroCommands::Apply {
-            name: None,
-            agent: None,
-            yes: false,
-            offline: false,
-            allow_unsigned: false,
-            accept_new_key: false,
-            vars: Vec::new(),
-        })
-        .await
-        .expect_err("standalone distro apply must require an explicit distro");
+        for name in [None, Some(String::new())] {
+            let error = dispatch_distro(DistroCommands::Apply {
+                name,
+                agent: None,
+                yes: false,
+                offline: false,
+                allow_unsigned: false,
+                accept_new_key: false,
+                vars: Vec::new(),
+            })
+            .await
+            .expect_err("standalone distro apply must require a non-empty explicit distro");
 
-        assert_eq!(
-            error.to_string(),
-            "astrid distro apply requires an explicit distro source: @owner/repo, URL, local Distro.toml, or .shuttle; Astrid Runtime does not choose a product distro"
-        );
+            assert_eq!(
+                error.to_string(),
+                "astrid distro apply requires an explicit distro source: @owner/repo, URL, local Distro.toml, or .shuttle; Astrid Runtime does not choose a product distro"
+            );
+        }
     }
 }

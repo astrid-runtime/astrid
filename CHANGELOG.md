@@ -13,8 +13,8 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
 
 - **Operators can enforce a distro for `astrid init`.**
   `ASTRID_ENFORCED_DISTRO` supplies the distro source and rejects CLI attempts
-  to override it. Standalone Astrid still chooses no product distro unless its
-  operator sets one. Closes #1253.
+  to override it. Standalone `astrid init` requires an explicit `--distro`;
+  Astrid Runtime never chooses a product distro. Closes #1253.
 
 - **Passive content-addressed capability-registry primitives.** Astrid now has
   exact capability IDs, typed content-bound references, immutable registered
