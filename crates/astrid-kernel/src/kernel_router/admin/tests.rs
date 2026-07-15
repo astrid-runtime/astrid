@@ -47,6 +47,16 @@ fn all_admin_variants() -> Vec<AdminRequestKind> {
         AdminRequestKind::AgentDisable {
             principal: pid("a"),
         },
+        AdminRequestKind::AgentModify {
+            principal: pid("a"),
+            add_groups: vec!["agent".into()],
+            remove_groups: Vec::new(),
+            add_capsules: Vec::new(),
+            remove_capsules: Vec::new(),
+        },
+        AdminRequestKind::AgentModifyCheck {
+            principal: pid("a"),
+        },
         AdminRequestKind::AgentList,
         AdminRequestKind::QuotaSet {
             principal: pid("a"),
@@ -159,6 +169,19 @@ fn agent_list_maps_self_to_self_prefix() {
     assert_eq!(
         required_capability_for_admin_request(&AdminRequestKind::AgentList, AuthorityScope::Global),
         "agent:list"
+    );
+}
+
+#[test]
+fn agent_modify_check_uses_global_modify_authority_even_for_self() {
+    let caller = pid("alice");
+    let req = AdminRequestKind::AgentModifyCheck {
+        principal: caller.clone(),
+    };
+    assert_eq!(resolve_admin_scope(&req, &caller), AuthorityScope::Global);
+    assert_eq!(
+        required_capability_for_admin_request(&req, AuthorityScope::Global),
+        "agent:modify"
     );
 }
 

@@ -180,6 +180,7 @@ pub fn resolve_admin_scope(req: &AdminRequestKind, caller: &PrincipalId) -> Auth
         | AdminRequestKind::AgentEnable { .. }
         | AdminRequestKind::AgentDisable { .. }
         | AdminRequestKind::AgentModify { .. }
+        | AdminRequestKind::AgentModifyCheck { .. }
         | AdminRequestKind::GroupCreate { .. }
         | AdminRequestKind::GroupDelete { .. }
         | AdminRequestKind::GroupModify { .. }
@@ -234,6 +235,7 @@ pub fn required_capability_for_admin_request(
         (AdminRequestKind::AgentEnable { .. }, _) => "agent:enable",
         (AdminRequestKind::AgentDisable { .. }, _) => "agent:disable",
         (AdminRequestKind::AgentModify { .. }, _) => "agent:modify",
+        (AdminRequestKind::AgentModifyCheck { .. }, _) => "agent:modify",
         (AdminRequestKind::AgentList, AuthorityScope::Self_) => "self:agent:list",
         (AdminRequestKind::AgentList, AuthorityScope::Global) => "agent:list",
         (AdminRequestKind::QuotaSet { .. }, AuthorityScope::Self_) => "self:quota:set",
@@ -305,6 +307,7 @@ pub fn admin_request_method(req: &AdminRequestKind) -> &'static str {
         AdminRequestKind::AgentEnable { .. } => "admin.agent.enable",
         AdminRequestKind::AgentDisable { .. } => "admin.agent.disable",
         AdminRequestKind::AgentModify { .. } => "admin.agent.modify",
+        AdminRequestKind::AgentModifyCheck { .. } => "admin.agent.modify.check",
         AdminRequestKind::AgentList => "admin.agent.list",
         AdminRequestKind::QuotaSet { .. } => "admin.quota.set",
         AdminRequestKind::QuotaGet { .. } => "admin.quota.get",
@@ -426,6 +429,7 @@ pub fn admin_target_principal(req: &AdminRequestKind) -> Option<&PrincipalId> {
         | AdminRequestKind::AgentEnable { principal }
         | AdminRequestKind::AgentDisable { principal }
         | AdminRequestKind::AgentModify { principal, .. }
+        | AdminRequestKind::AgentModifyCheck { principal }
         | AdminRequestKind::QuotaSet { principal, .. }
         | AdminRequestKind::QuotaGet { principal }
         | AdminRequestKind::UsageGet { principal }

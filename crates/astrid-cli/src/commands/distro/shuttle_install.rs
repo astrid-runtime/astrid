@@ -133,10 +133,9 @@ pub(crate) fn install_from_shuttle(shuttle_path: &Path, opts: &InitOpts) -> anyh
     // any install side effect.
     verify_capsule_hashes(mirror, &lock)?;
 
-    // The process-wide principal (global `--principal` flag). The offline
-    // install scopes env config, capsule files, and the Distro.lock to this
-    // principal's home, matching the online `astrid init` path.
-    let principal = crate::principal::current();
+    // The explicit provisioning target. The authenticated runtime operator is
+    // independent and does not select where product state is installed.
+    let principal = opts.target_principal.clone();
 
     // 5. Select capsules + collect variables (headless-aware).
     let variables = manifest.variables.clone();
@@ -226,6 +225,7 @@ fn install_selected_capsules(
             resolved_ref.as_deref(),
             signer,
             signature,
+            principal,
         )
         .with_context(|| format!("failed to install capsule {}", cap.name))?;
 

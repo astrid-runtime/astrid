@@ -492,6 +492,14 @@ pub enum AdminRequestKind {
         #[serde(default)]
         remove_capsules: Vec<String>,
     },
+    /// Read-only preflight for [`AgentModify`](Self::AgentModify). This
+    /// exercises the same global `agent:modify` authorization gate and
+    /// verifies that the target principal exists, without changing its
+    /// profile. Provisioners use it before making local filesystem changes.
+    AgentModifyCheck {
+        /// Principal that a later `AgentModify` request would target.
+        principal: PrincipalId,
+    },
     /// Replace the target principal's [`Quotas`] block. Values are
     /// validated before the atomic profile write.
     QuotaSet {

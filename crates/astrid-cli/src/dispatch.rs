@@ -172,6 +172,7 @@ async fn dispatch_subcommand(
             allow_unsigned,
             accept_new_key,
             vars,
+            target_principal,
             grant_capsules,
         }) => {
             let distro = distro.ok_or_else(|| {
@@ -185,6 +186,10 @@ async fn dispatch_subcommand(
                 allow_unsigned,
                 accept_new_key,
                 vars: commands::init::parse_cli_vars(&vars)?,
+                target_principal: target_principal
+                    .map(astrid_core::PrincipalId::new)
+                    .transpose()?
+                    .unwrap_or_else(crate::principal::current),
                 grant_capsules,
             };
             commands::init::run_init(&distro, &opts).await?;
@@ -388,6 +393,7 @@ async fn dispatch_distro(command: DistroCommands) -> Result<ExitCode> {
                 allow_unsigned,
                 accept_new_key,
                 vars: commands::init::parse_cli_vars(&vars)?,
+                target_principal: crate::principal::current(),
                 // `distro apply` has no `--grant-capsules` surface; granting
                 // stays on `astrid init`. Capsules install without grants here.
                 grant_capsules: false,
@@ -557,6 +563,8 @@ mod tests {
                 allow_unsigned: false,
                 accept_new_key: false,
                 vars: Vec::new(),
+                target_principal: None,
+                grant_capsules: false,
             }),
             OutputFormat::Pretty,
         )

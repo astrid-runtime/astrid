@@ -16,7 +16,17 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
   definitions, deterministic BLAKE3 semantic digests and canonical registry
   manifests. Existing profile persistence, wildcard evaluation, bootstrap,
   socket and wire behavior remain unchanged. Closes #1233. Refs #1228.
-- **`astrid init --grant-capsules` grants the installed distro capsules to the target principal.** A distro install placed capsule files under a principal's home but attached no capsule-access grants, so provisioning a working non-`default` principal required an out-of-band `astrid agent modify <p> --add-capsule <...>` step whose list had to be hand-kept in sync with the distro's `[capsules]` set — skip it and the principal's tools all fail authorization. The new opt-in `--grant-capsules` flag (valid with an explicit or operator-enforced distro) applies grants for exactly the set of capsules that installed, through the same `admin.agent.modify` kernel path as `agent modify --add-capsule` (now a shared helper), and is idempotent across re-runs. It is a no-op for the `default` principal, which already holds admin `*`. Without the flag, a non-`default` install prints the exact `agent modify` command to finish manually; on a grant failure the capsules are already installed and `init` exits non-zero with the same recovery command. Closes #1195.
+- **Distro init can grant exactly installed capsules to an explicit target.**
+  `astrid --principal <operator> init --target-principal <target>
+  --grant-capsules` ensures the runtime daemon, verifies the operator has
+  `agent:modify` authority over an existing target before provisioning, and
+  applies the installed set through the shared `admin.agent.modify` path.
+  Batch identities and fresh-lock metadata are verified before names become
+  grants, concurrent provisioning of one target is rejected, and recovery
+  commands preserve the operator identity. The target defaults to the process
+  principal when omitted; no principal name receives special treatment.
+  Signed `.shuttle` grant composition remains deferred and fails explicitly.
+  Closes #1195.
 
 ### Changed
 

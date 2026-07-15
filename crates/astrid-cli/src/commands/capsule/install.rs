@@ -37,6 +37,7 @@ use astrid_events::EventBus;
 
 use super::install_prompts::{cli_elicit_handler, prompt_env_fields};
 
+pub(crate) use super::install_batch::{BatchInstallOutcome, RefSpec, install_capsule_batch};
 /// Re-exported so sibling CLI modules (`init.rs`, `shuttle_install.rs`)
 /// keep the `super::install::resolve_target_dir_for` import path. The
 /// `_for` variant scopes the target to a specific principal — the
@@ -51,7 +52,7 @@ pub(crate) use super::install_update::update_capsule;
 /// When true, import validation and env prompting are suppressed.
 /// Set by `install_capsule_batch` (called from distro init) where the
 /// distro handles env config and all capsules are installed together.
-static BATCH_MODE: AtomicBool = AtomicBool::new(false);
+pub(super) static BATCH_MODE: AtomicBool = AtomicBool::new(false);
 
 // ---------------------------------------------------------------------------
 // Top-level install dispatch
@@ -91,63 +92,15 @@ pub(crate) async fn install_capsule(
     capsule: Option<&str>,
     workspace: bool,
 ) -> anyhow::Result<()> {
+    let principal = crate::principal::current();
     let (installed, _resolved) =
-        install_capsule_inner(source, capsule, workspace, &RefSpec::default()).await?;
+        install_capsule_inner(source, capsule, workspace, &RefSpec::default(), &principal).await?;
     // Live-load: if a daemon is running, hot-load (or upgrade) each just-installed
     // capsule so it's usable without a restart. Best-effort and non-fatal — the
     // on-disk install above already succeeded standalone. The `update` and TUI
     // install paths route through here too, so they inherit live hot-swap.
     super::live_load::nudge_daemon_reload(&installed).await;
     Ok(())
-}
-
-/// Which concrete git ref a GitHub install should resolve.
-///
-/// Mirrors the manifest's `tag`/`version` selectors. When everything is
-/// `None`, the installer falls back to the latest release (documented,
-/// not silent — see [`resolve_github_ref`]).
-#[derive(Debug, Clone, Default)]
-pub(crate) struct RefSpec {
-    /// Semver version (resolved to a `v`-prefixed or bare release tag).
-    pub(crate) version: Option<String>,
-    /// Explicit git tag (highest priority).
-    pub(crate) tag: Option<String>,
-}
-
-impl RefSpec {
-    /// Build a [`RefSpec`] from a distro capsule's pinning fields.
-    pub(crate) fn from_capsule(cap: &super::super::distro::manifest::DistroCapsule) -> Self {
-        Self {
-            // An empty `version` string carries no pin.
-            version: (!cap.version.is_empty()).then(|| cap.version.clone()),
-            tag: cap.tag.clone(),
-        }
-    }
-}
-
-/// Install a capsule in batch mode (from distro init) — skips import
-/// validation and env prompting. `name_hint` is the distro capsule `name`,
-/// used to pick the right archive when one source ships several (a monorepo
-/// builds/releases one `.capsule` per capsule crate). Honors an explicit
-/// version/tag pin from the distro manifest.
-///
-/// Returns the concrete git ref that was actually resolved and fetched
-/// (`Some` for GitHub-backed sources, `None` for local-path sources),
-/// so the caller can record the *installed* ref in the lock rather than
-/// an optimistic guess from the manifest's declared fields.
-pub(crate) async fn install_capsule_batch(
-    source: &str,
-    name_hint: Option<&str>,
-    workspace: bool,
-    refspec: &RefSpec,
-) -> anyhow::Result<Option<String>> {
-    BATCH_MODE.store(true, Ordering::Relaxed);
-    let result = install_capsule_inner(source, name_hint, workspace, refspec).await;
-    BATCH_MODE.store(false, Ordering::Relaxed);
-    // Distro batch install does not nudge a live reload (init manages its own
-    // load, and the daemon is typically down during init) — keep only the
-    // resolved ref so the caller can record it in the lock.
-    result.map(|(_ids, resolved_ref)| resolved_ref)
 }
 
 /// Install dispatch shared by the CLI and distro-batch paths.
@@ -157,11 +110,12 @@ pub(crate) async fn install_capsule_batch(
 /// `(installed_capsule_ids, resolved_ref)`: the ids of every capsule
 /// installed, and the resolved git ref for GitHub-backed sources (`Some`),
 /// or `None` for local-path sources, which have no remote ref to resolve.
-async fn install_capsule_inner(
+pub(super) async fn install_capsule_inner(
     source: &str,
     name_hint: Option<&str>,
     workspace: bool,
     refspec: &RefSpec,
+    principal: &astrid_core::PrincipalId,
 ) -> anyhow::Result<(Vec<String>, Option<String>)> {
     let home = AstridHome::resolve()?;
 
@@ -179,7 +133,7 @@ async fn install_capsule_inner(
     //    canonical reference for a locally-sourced capsule). No remote
     //    ref to resolve.
     if base.starts_with('.') || base.starts_with('/') {
-        let ids = install_from_local(base, workspace, &home, Some(base))?;
+        let ids = install_from_local(base, workspace, &home, Some(base), principal)?;
         return Ok((ids, None));
     }
 
@@ -194,6 +148,7 @@ async fn install_capsule_inner(
             name_hint,
             version.as_deref(),
             tag.as_deref(),
+            principal,
         )
         .await;
     }
@@ -208,12 +163,13 @@ async fn install_capsule_inner(
             name_hint,
             version.as_deref(),
             tag.as_deref(),
+            principal,
         )
         .await;
     }
 
     // 4. Fallback: assume local folder. No remote ref to resolve.
-    let ids = install_from_local(base, workspace, &home, Some(base))?;
+    let ids = install_from_local(base, workspace, &home, Some(base), principal)?;
     Ok((ids, None))
 }
 
@@ -407,6 +363,7 @@ async fn install_from_github(
     name_hint: Option<&str>,
     version: Option<&str>,
     tag: Option<&str>,
+    principal: &astrid_core::PrincipalId,
 ) -> anyhow::Result<(Vec<String>, Option<String>)> {
     // Authenticated when a token is present so release resolution isn't
     // throttled at the anonymous 60/hr limit mid-distro (see
@@ -462,6 +419,7 @@ async fn install_from_github(
                             workspace,
                             home,
                             original_source,
+                            principal,
                         )
                         .await?;
                         vec![id]
@@ -470,8 +428,15 @@ async fn install_from_github(
                     // the release ships. Best-effort — report which assets fail
                     // but keep going, then fail if any did.
                     None => {
-                        install_all_capsules(&client, &candidates, workspace, home, original_source)
-                            .await?
+                        install_all_capsules(
+                            &client,
+                            &candidates,
+                            workspace,
+                            home,
+                            original_source,
+                            principal,
+                        )
+                        .await?
                     },
                 };
                 return Ok((ids, Some(resolved_ref)));
@@ -500,7 +465,15 @@ async fn install_from_github(
 
     // Priority 2: clone + build from source via astrid-build — reached only
     // when nothing was pinned (a pin would have bailed above).
-    let id = clone_and_build(url, repo, workspace, home, original_source, name_hint)?;
+    let id = clone_and_build(
+        url,
+        repo,
+        workspace,
+        home,
+        original_source,
+        name_hint,
+        principal,
+    )?;
     Ok((vec![id], None))
 }
 
@@ -587,6 +560,7 @@ async fn download_and_unpack(
     workspace: bool,
     home: &AstridHome,
     original_source: Option<&str>,
+    principal: &astrid_core::PrincipalId,
 ) -> anyhow::Result<String> {
     let tmp_dir = tempfile::tempdir()?;
     let sanitized_name = Path::new(name).file_name().unwrap_or_default();
@@ -602,7 +576,7 @@ async fn download_and_unpack(
         );
     }
     std::fs::write(&download_path, &bytes)?;
-    unpack_via_lib(&download_path, workspace, home, original_source)
+    unpack_via_lib(&download_path, workspace, home, original_source, principal)
 }
 
 /// Install every `.capsule` asset in a release (the manual-install default).
@@ -617,14 +591,23 @@ async fn install_all_capsules(
     workspace: bool,
     home: &AstridHome,
     original_source: Option<&str>,
+    principal: &astrid_core::PrincipalId,
 ) -> anyhow::Result<Vec<String>> {
     eprintln!("Release ships {} capsule(s):", candidates.len());
     let mut installed: Vec<String> = Vec::new();
     let mut failed: Vec<(&str, String)> = Vec::new();
     for (name, download_url) in candidates {
         eprintln!("Installing {name}...");
-        match download_and_unpack(client, name, download_url, workspace, home, original_source)
-            .await
+        match download_and_unpack(
+            client,
+            name,
+            download_url,
+            workspace,
+            home,
+            original_source,
+            principal,
+        )
+        .await
         {
             Ok(id) => installed.push(id),
             Err(e) => {
@@ -659,6 +642,7 @@ fn clone_and_build(
     home: &AstridHome,
     original_source: Option<&str>,
     name_hint: Option<&str>,
+    principal: &astrid_core::PrincipalId,
 ) -> anyhow::Result<String> {
     let tmp_dir = tempfile::tempdir().context("failed to create temp dir for cloning")?;
     let clone_dir = tmp_dir.path().join(repo);
@@ -712,7 +696,7 @@ fn clone_and_build(
         .map(|p| p.file_name().and_then(|n| n.to_str()).unwrap_or(""))
         .collect();
     if let Some(idx) = pick_capsule(&names, name_hint)? {
-        return unpack_via_lib(&produced[idx], workspace, home, original_source);
+        return unpack_via_lib(&produced[idx], workspace, home, original_source, principal);
     }
 
     bail!("astrid-build produced no .capsule archive.");
@@ -727,6 +711,7 @@ fn install_from_local(
     workspace: bool,
     home: &AstridHome,
     original_source: Option<&str>,
+    principal: &astrid_core::PrincipalId,
 ) -> anyhow::Result<Vec<String>> {
     let source_path = Path::new(source);
     if !source_path.exists() {
@@ -735,7 +720,8 @@ fn install_from_local(
 
     // Unpack `.capsule` archive when source is a file.
     if source_path.is_file() && source.ends_with(".capsule") {
-        return unpack_via_lib(source_path, workspace, home, original_source).map(|id| vec![id]);
+        return unpack_via_lib(source_path, workspace, home, original_source, principal)
+            .map(|id| vec![id]);
     }
 
     // Auto-build Rust capsules when source is a directory with a Cargo.toml.
@@ -762,14 +748,15 @@ fn install_from_local(
         for entry in std::fs::read_dir(&output_dir)? {
             let entry = entry?;
             if entry.path().extension().and_then(|s| s.to_str()) == Some("capsule") {
-                return unpack_via_lib(&entry.path(), workspace, home, original_source)
+                return unpack_via_lib(&entry.path(), workspace, home, original_source, principal)
                     .map(|id| vec![id]);
             }
         }
         bail!("Failed to auto-build capsule from Cargo project.");
     }
 
-    install_from_local_path(source_path, workspace, home, original_source).map(|id| vec![id])
+    install_from_local_path_for_principal(source_path, workspace, home, original_source, principal)
+        .map(|id| vec![id])
 }
 
 // ---------------------------------------------------------------------------
@@ -789,13 +776,23 @@ pub(crate) fn install_from_local_path(
     home: &AstridHome,
     original_source: Option<&str>,
 ) -> anyhow::Result<String> {
+    let principal = crate::principal::current();
+    install_from_local_path_for_principal(source_dir, workspace, home, original_source, &principal)
+}
+
+fn install_from_local_path_for_principal(
+    source_dir: &Path,
+    workspace: bool,
+    home: &AstridHome,
+    original_source: Option<&str>,
+    principal: &astrid_core::PrincipalId,
+) -> anyhow::Result<String> {
     let opts = InstallOptions {
         workspace,
         original_source: original_source.map(String::from),
         skip_import_check: BATCH_MODE.load(Ordering::Relaxed),
         lifecycle_bus: None,
     };
-    let principal = crate::principal::current();
     let output = run_with_elicit(opts, |opts, bus| {
         astrid_capsule_install::install_from_local_path_for_principal(
             source_dir,
@@ -804,7 +801,7 @@ pub(crate) fn install_from_local_path(
                 lifecycle_bus: Some(bus),
                 ..opts
             },
-            &principal,
+            principal,
         )
     })?;
     finish_install(&output, home)
@@ -828,15 +825,15 @@ pub(crate) fn install_offline_capsule(
     resolved_ref: Option<&str>,
     signer: Option<&str>,
     signature: Option<&str>,
+    principal: &astrid_core::PrincipalId,
 ) -> anyhow::Result<()> {
     BATCH_MODE.store(true, Ordering::Relaxed);
     let result = (|| {
-        unpack_via_lib(archive, false, home, Some(original_source))?;
+        unpack_via_lib(archive, false, home, Some(original_source), principal)?;
         // Post-stamp provenance into the freshly-written meta.json. The
-        // unpack above installs under the process principal's home, so read
-        // it back from there rather than the legacy `default` resolver — a
-        // scoped principal's offline install would otherwise not be found.
-        let target_dir = resolve_target_dir_for(home, &crate::principal::current(), name, false)?;
+        // The unpack above installs under the explicit target principal, so
+        // read metadata back from that same home.
+        let target_dir = resolve_target_dir_for(home, principal, name, false)?;
         if let Some(mut meta) = super::meta::read_meta(&target_dir) {
             meta.resolved_ref = resolved_ref.map(String::from);
             meta.signer = signer.map(String::from);
@@ -856,6 +853,7 @@ fn unpack_via_lib(
     workspace: bool,
     home: &AstridHome,
     original_source: Option<&str>,
+    principal: &astrid_core::PrincipalId,
 ) -> anyhow::Result<String> {
     let opts = InstallOptions {
         workspace,
@@ -863,7 +861,6 @@ fn unpack_via_lib(
         skip_import_check: BATCH_MODE.load(Ordering::Relaxed),
         lifecycle_bus: None,
     };
-    let principal = crate::principal::current();
     let output = run_with_elicit(opts, |opts, bus| {
         astrid_capsule_install::unpack_and_install_for_principal(
             archive,
@@ -872,7 +869,7 @@ fn unpack_via_lib(
                 lifecycle_bus: Some(bus),
                 ..opts
             },
-            &principal,
+            principal,
         )
     })?;
     finish_install(&output, home)

@@ -5,6 +5,120 @@
 use super::*;
 
 #[test]
+fn batch_identity_mismatch_removes_unexpected_install() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = AstridHome::from_path(dir.path());
+    let principal = astrid_core::PrincipalId::new("agent-1").unwrap();
+    let unexpected = super::super::capsule::install::resolve_target_dir_for(
+        &home,
+        &principal,
+        "wrong-capsule",
+        false,
+    )
+    .unwrap();
+    std::fs::create_dir_all(&unexpected).unwrap();
+    std::fs::write(unexpected.join("marker"), b"installed").unwrap();
+
+    let err = validate_batch_install_identity(
+        &home,
+        &principal,
+        "expected-capsule",
+        super::super::capsule::install::BatchInstallOutcome {
+            installed_ids: vec!["wrong-capsule".to_string()],
+            resolved_ref: Some("v1.0.0".to_string()),
+        },
+    )
+    .unwrap_err();
+
+    assert!(err.to_string().contains("expected-capsule"), "got: {err:#}");
+    assert!(!unexpected.exists());
+}
+
+#[test]
+fn batch_identity_accepts_one_exact_installed_id() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = AstridHome::from_path(dir.path());
+    let principal = astrid_core::PrincipalId::new("agent-1").unwrap();
+    let resolved = validate_batch_install_identity(
+        &home,
+        &principal,
+        "expected-capsule",
+        super::super::capsule::install::BatchInstallOutcome {
+            installed_ids: vec!["expected-capsule".to_string()],
+            resolved_ref: Some("v1.0.0".to_string()),
+        },
+    )
+    .unwrap();
+    assert_eq!(resolved.as_deref(), Some("v1.0.0"));
+}
+
+#[test]
+fn batch_identity_extra_id_removes_entire_invalid_batch() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = AstridHome::from_path(dir.path());
+    let principal = astrid_core::PrincipalId::new("agent-1").unwrap();
+    let expected = super::super::capsule::install::resolve_target_dir_for(
+        &home,
+        &principal,
+        "expected-capsule",
+        false,
+    )
+    .unwrap();
+    let unexpected = super::super::capsule::install::resolve_target_dir_for(
+        &home,
+        &principal,
+        "wrong-capsule",
+        false,
+    )
+    .unwrap();
+    std::fs::create_dir_all(&expected).unwrap();
+    std::fs::create_dir_all(&unexpected).unwrap();
+
+    validate_batch_install_identity(
+        &home,
+        &principal,
+        "expected-capsule",
+        super::super::capsule::install::BatchInstallOutcome {
+            installed_ids: vec!["expected-capsule".to_string(), "wrong-capsule".to_string()],
+            resolved_ref: None,
+        },
+    )
+    .unwrap_err();
+
+    assert!(!expected.exists());
+    assert!(!unexpected.exists());
+}
+
+#[test]
+fn batch_identity_cleanup_continues_after_an_invalid_reported_id() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = AstridHome::from_path(dir.path());
+    let principal = astrid_core::PrincipalId::new("agent-1").unwrap();
+    let removable = super::super::capsule::install::resolve_target_dir_for(
+        &home,
+        &principal,
+        "wrong-capsule",
+        false,
+    )
+    .unwrap();
+    std::fs::create_dir_all(&removable).unwrap();
+
+    let err = validate_batch_install_identity(
+        &home,
+        &principal,
+        "expected-capsule",
+        super::super::capsule::install::BatchInstallOutcome {
+            installed_ids: vec!["../invalid".to_string(), "wrong-capsule".to_string()],
+            resolved_ref: None,
+        },
+    )
+    .unwrap_err();
+
+    assert!(err.to_string().contains("cleanup was incomplete"));
+    assert!(!removable.exists());
+}
+
+#[test]
 fn provider_selection_parses_multi_select() {
     assert_eq!(parse_provider_selection("1,2", 3), vec![1, 2]);
     assert_eq!(parse_provider_selection(" 2 , 3 ", 3), vec![2, 3]);

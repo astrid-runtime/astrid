@@ -184,6 +184,48 @@ async fn agent_modify_rejects_unknown_principal() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn agent_modify_check_verifies_target_without_writing_profile() {
+    let (_dir, kernel) = fixture().await;
+    handlers::dispatch(
+        &kernel,
+        &PrincipalId::default(),
+        AdminRequestKind::AgentCreate {
+            name: "preflight-target".into(),
+            groups: Vec::new(),
+            grants: Vec::new(),
+            inherit_from: None,
+            clone_from: None,
+            allow_admin_clone: false,
+        },
+    )
+    .await;
+    let target = pid("preflight-target");
+    let path = PrincipalProfile::path_for(&kernel.astrid_home, &target);
+    let before = std::fs::read(&path).unwrap();
+
+    let response = handlers::dispatch(
+        &kernel,
+        &PrincipalId::default(),
+        AdminRequestKind::AgentModifyCheck {
+            principal: target.clone(),
+        },
+    )
+    .await;
+    assert_success(&response);
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+
+    let missing = handlers::dispatch(
+        &kernel,
+        &PrincipalId::default(),
+        AdminRequestKind::AgentModifyCheck {
+            principal: pid("missing-target"),
+        },
+    )
+    .await;
+    assert_error_contains(&missing, "missing-target");
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn agent_modify_rejects_invalid_remove_entries() {
     let (_dir, kernel) = fixture().await;
     handlers::dispatch(

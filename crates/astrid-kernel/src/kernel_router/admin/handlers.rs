@@ -89,6 +89,7 @@ pub(super) async fn dispatch_with_device(
         },
         AdminRequestKind::AgentList => agent_list(kernel, caller),
         req @ AdminRequestKind::AgentModify { .. } => agent_modify_from_req(kernel, req).await,
+        AdminRequestKind::AgentModifyCheck { principal } => agent_modify_check(kernel, &principal),
         AdminRequestKind::QuotaSet { principal, quotas } => {
             super::quota::quota_set(kernel, principal, quotas).await
         },
@@ -528,6 +529,23 @@ async fn agent_modify_from_req(
         "Layer 6 agent.modify"
     );
     modify_response(&principal, &profile, true)
+}
+
+/// Verify the target of a future `agent.modify` request without mutating it.
+/// Authorization is enforced by the router before this handler runs, using
+/// the same global `agent:modify` capability as the write itself.
+fn agent_modify_check(kernel: &Arc<crate::Kernel>, principal: &PrincipalId) -> AdminResponseBody {
+    let path = principal_profile_path(kernel, principal);
+    if let Err(msg) = require_principal_exists(principal, &path) {
+        return err_bad_input(msg);
+    }
+    if let Err(e) = PrincipalProfile::load_from_path(&path) {
+        return err_profile(principal, &e);
+    }
+    success_json(serde_json::json!({
+        "principal": principal.as_str(),
+        "authorized": true,
+    }))
 }
 
 fn warm_principal_capsules(kernel: &Arc<crate::Kernel>, principal: PrincipalId) {
