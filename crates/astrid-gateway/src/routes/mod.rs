@@ -30,6 +30,16 @@ impl Default for WorkspaceContext {
     }
 }
 
+#[cfg(test)]
+async fn get_workspace_context_probe(
+    Extension(workspace): Extension<WorkspaceContext>,
+) -> axum::Json<serde_json::Value> {
+    axum::Json(serde_json::json!({
+        "root": workspace.root,
+        "state_dir": workspace.layout.state_dir_name(),
+    }))
+}
+
 /// Map a bus-direct / socket kernel-request failure ([`KernelClientError`]) to a
 /// [`GatewayError`]. Single-sourced so every `kernel_client_for(...).request()`
 /// call site maps consistently.
@@ -188,6 +198,12 @@ pub(crate) fn build_with_workspace_and_probe(
         // (dashboards, codegen tools) read it before they have
         // a bearer.
         .route("/api/openapi.json", get(crate::openapi::get_openapi));
+
+    #[cfg(test)]
+    let public = public.route(
+        "/__test/workspace-context",
+        get(get_workspace_context_probe),
+    );
 
     // Authenticated routes — bearer required, principal attached to
     // request extensions.
@@ -548,10 +564,65 @@ fn intern_route(s: &str) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use astrid_uplink::{KernelClientError, TimeoutKind};
+    use std::sync::Arc;
 
-    use super::daemon_kernel_error;
+    use astrid_uplink::{KernelClientError, TimeoutKind};
+    use axum::body::{Body, to_bytes};
+    use axum::http::Request;
+    use tower::ServiceExt;
+
+    use super::{build_with_workspace_and_capability_probe, daemon_kernel_error};
     use crate::error::GatewayError;
+    use crate::state::{GatewayState, SigningMaterial};
+
+    fn test_state() -> Arc<GatewayState> {
+        Arc::new(GatewayState {
+            config: crate::config::GatewayConfig::default(),
+            signing: SigningMaterial::fresh(),
+            event_bus: None,
+            distribution: Arc::new(crate::routes::distribution::DistributionInfo::single_tenant()),
+            onboarding: Arc::new(crate::routes::distribution::OnboardingFields::default()),
+            redeem_limiter: tokio::sync::Mutex::default(),
+            metrics_handle: crate::metrics::install_recorder().expect("recorder"),
+            revoked_at: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
+            revoked_key_ids: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
+            audit_log: None,
+            session_id: None,
+            gateway_route_uuid: uuid::Uuid::new_v4(),
+            readiness_probe: None,
+            topic_probe: None,
+            registry_timeout: None,
+        })
+    }
+
+    #[tokio::test]
+    async fn composed_builder_propagates_explicit_workspace_context() {
+        let root = tempfile::tempdir().expect("workspace root");
+        let layout = astrid_core::dirs::WorkspaceLayout::new(".alternate-runtime")
+            .expect("workspace layout");
+        let router = build_with_workspace_and_capability_probe(
+            test_state(),
+            root.path().to_path_buf(),
+            layout,
+            |_, _, _| false,
+        );
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/__test/workspace-context")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        let body = to_bytes(response.into_body(), 4096)
+            .await
+            .expect("response body");
+        let body: serde_json::Value = serde_json::from_slice(&body).expect("response json");
+
+        assert_eq!(body["root"], root.path().display().to_string());
+        assert_eq!(body["state_dir"], ".alternate-runtime");
+    }
 
     /// The shared kernel-request error mapper turns a typed `Timeout` into a 504
     /// `GatewayError::Timeout` (retryable — the daemon was slow/wedged, e.g. a

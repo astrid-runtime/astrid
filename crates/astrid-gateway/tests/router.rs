@@ -16,7 +16,10 @@
 //! 3. **The principal a client claims in the request body is
 //!    ignored** — the verified bearer is the only source of truth.
 
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 
 use astrid_audit::{AuditAction, AuditLog, AuditOutcome, AuthorizationProof};
 use astrid_core::PrincipalId;
@@ -274,13 +277,20 @@ async fn public_router_builders_accept_live_capability_probe() {
         )
         .await
         .expect("append audit entry");
-    let _default_workspace_router =
-        routes::build_with_capability_probe(Arc::clone(&state), |_, _, _| true);
+    let _default_workspace_router = routes::build_with_capability_probe(Arc::clone(&state), {
+        let marker = String::from("captured-default-probe");
+        move |_, _, _| !marker.is_empty()
+    });
+    let probe_called = Arc::new(AtomicBool::new(false));
+    let probe_called_by_router = Arc::clone(&probe_called);
     let router = routes::build_with_workspace_and_capability_probe(
         Arc::clone(&state),
         std::env::temp_dir(),
-        astrid_core::dirs::WorkspaceLayout::new(".custom-aos").unwrap(),
-        |_, _, _| true,
+        astrid_core::dirs::WorkspaceLayout::new(".alternate-runtime").unwrap(),
+        move |_, _, _| {
+            probe_called_by_router.store(true, Ordering::SeqCst);
+            true
+        },
     );
 
     let principal = PrincipalId::new("alice").unwrap();
@@ -294,6 +304,7 @@ async fn public_router_builders_accept_live_capability_probe() {
     assert_eq!(resp.status(), StatusCode::OK);
     let bytes = to_bytes(resp.into_body(), 4096).await.unwrap();
     let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert!(probe_called.load(Ordering::SeqCst));
     assert_eq!(body["entries"][0]["principal"], "bob");
     assert_eq!(body["entries"][0]["method"], "BobVisibleThroughProbe");
 }
