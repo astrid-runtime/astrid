@@ -300,8 +300,7 @@ fn is_blake3_pin(pin: &str) -> bool {
 /// daemon can warn rather than silently skip the baseline. Per-entry errors
 /// are logged and skipped so one bad entry can't abort the whole scan.
 ///
-/// Reads only the injected `home` — never the process environment or a
-/// workspace `.astrid/` (unlike [`scan_installed_capsules`](crate::scan_installed_capsules)) —
+/// Reads only the injected `home`, never process environment or project state,
 /// so it is safe on the fail-closed daemon boot path.
 fn daemon_fleet_contracts_pin(home: &AstridHome) -> anyhow::Result<Option<String>> {
     let principal = crate::paths::install_principal();

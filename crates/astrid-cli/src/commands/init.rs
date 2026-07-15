@@ -263,7 +263,10 @@ fn run_init_from_shuttle(source: &str, opts: &InitOpts) -> anyhow::Result<()> {
 /// Initialize the current directory as an Astrid workspace (if not already).
 fn init_workspace() -> anyhow::Result<()> {
     let cwd = std::env::current_dir()?;
-    let ws = astrid_core::dirs::WorkspaceDir::from_path(&cwd);
+    let ws = astrid_core::dirs::WorkspaceDir::from_path_with_layout(
+        &cwd,
+        crate::workspace_layout::current().clone(),
+    );
 
     if !ws.dot_astrid().exists() {
         ws.ensure()?;
@@ -905,15 +908,15 @@ fn onboard_llm_providers(
             continue;
         }
 
-        let target_dir = match super::capsule::install::resolve_target_dir_for(
-            home, principal, &cap.name, false,
-        ) {
-            Ok(dir) => dir,
-            Err(e) => {
-                eprintln!("  Skipping {} onboarding: {e}", cap.name);
-                continue;
-            },
-        };
+        let target_dir =
+            match astrid_capsule_install::resolve_target_dir_for(home, principal, &cap.name, false)
+            {
+                Ok(dir) => dir,
+                Err(e) => {
+                    eprintln!("  Skipping {} onboarding: {e}", cap.name);
+                    continue;
+                },
+            };
         let manifest_path = target_dir.join("Capsule.toml");
         let manifest = match astrid_capsule::discovery::load_manifest(&manifest_path) {
             Ok(m) => m,

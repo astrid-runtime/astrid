@@ -5,7 +5,6 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use astrid_core::kernel_api::{DaemonStatus, KernelRequest, KernelResponse};
-use astrid_uplink::KernelClient;
 
 use crate::bootstrap::find_companion_binary;
 use crate::commands::daemon_control;
@@ -65,26 +64,27 @@ fn boot_log_stderr() -> Option<std::process::Stdio> {
 /// # Errors
 /// Returns an error if the daemon binary is not found, fails to spawn, or
 /// doesn't become ready within the bounded startup window.
-pub(crate) async fn spawn_daemon(ready_path: &std::path::Path) -> Result<std::process::Child> {
-    spawn_daemon_inner(ready_path, true).await
+pub(crate) async fn spawn_daemon(
+    ready_path: &std::path::Path,
+    workspace_root: Option<&Path>,
+) -> Result<std::process::Child> {
+    spawn_daemon_inner(ready_path, true, workspace_root).await
 }
 
 async fn spawn_daemon_inner(
     ready_path: &std::path::Path,
     announce: bool,
+    workspace_root: Option<&Path>,
 ) -> Result<std::process::Child> {
     if announce {
         println!("{}", theme::Theme::info("Booting Astrid daemon..."));
     }
-    let ws = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    let ws = workspace_root.map_or_else(
+        || std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
+        Path::to_path_buf,
+    );
     let daemon_bin = find_companion_binary("astrid-daemon")?;
-
-    let mut cmd = std::process::Command::new(daemon_bin);
-    cmd.arg("--ephemeral");
-
-    if let Some(ws_path) = ws.to_str() {
-        cmd.arg("--workspace").arg(ws_path);
-    }
+    let mut cmd = ephemeral_daemon_command(&daemon_bin, &ws);
 
     // Capture the daemon's stderr to an append log so a boot failure (lock
     // contention, panic before tracing init) leaves a record instead of
@@ -134,6 +134,18 @@ async fn spawn_daemon_inner(
     Ok(child)
 }
 
+fn ephemeral_daemon_command(daemon_bin: &Path, workspace_root: &Path) -> std::process::Command {
+    let mut cmd = std::process::Command::new(daemon_bin);
+    cmd.arg("--ephemeral")
+        .arg("--workspace")
+        .arg(workspace_root)
+        .env(
+            "ASTRID_WORKSPACE_STATE_DIR",
+            crate::workspace_layout::current().state_dir_name(),
+        );
+    cmd
+}
+
 /// Ensure the daemon is running, spawning it if needed.
 ///
 /// Checks the socket path, cleans up stale sockets, and spawns a fresh
@@ -155,6 +167,7 @@ async fn ensure_daemon_inner(label: &str, announce: bool) -> Result<()> {
 
     let needs_boot = if socket_path.exists() {
         if tokio::net::UnixStream::connect(&socket_path).await.is_ok() {
+            ensure_daemon_workspace_matches(None).await?;
             if announce {
                 eprintln!("[{label}] Connected to existing daemon");
             }
@@ -168,7 +181,55 @@ async fn ensure_daemon_inner(label: &str, announce: bool) -> Result<()> {
         true
     };
     if needs_boot {
-        spawn_daemon_inner(&ready_path, announce).await?;
+        spawn_daemon_inner(&ready_path, announce, None).await?;
+        ensure_daemon_workspace_matches(None).await?;
+    }
+    Ok(())
+}
+
+pub(crate) async fn ensure_daemon_workspace_matches(workspace_root: Option<&Path>) -> Result<()> {
+    let expected = expected_workspace_fingerprint(workspace_root)?;
+    let ready_path = socket_client::readiness_path();
+
+    for _ in 0..DAEMON_READY_ATTEMPTS {
+        match std::fs::read_to_string(&ready_path) {
+            Ok(metadata) => return validate_daemon_workspace_metadata(&metadata, &expected),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                tokio::time::sleep(DAEMON_READY_POLL).await;
+            },
+            Err(error) => {
+                return Err(error).context("failed to read daemon workspace metadata");
+            },
+        }
+    }
+
+    anyhow::bail!(
+        "daemon workspace metadata was not available within {DAEMON_READY_TIMEOUT_SECS} seconds; run `astrid restart`"
+    )
+}
+
+fn expected_workspace_fingerprint(workspace_root: Option<&Path>) -> Result<String> {
+    let root = workspace_root.map_or_else(
+        || std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+        Path::to_path_buf,
+    );
+    astrid_core::dirs::checked_workspace_selection_fingerprint(
+        &root,
+        crate::workspace_layout::current(),
+    )
+    .context("selected workspace state path is unsafe")
+}
+
+fn validate_daemon_workspace_metadata(metadata: &str, expected: &str) -> Result<()> {
+    let Some(actual) = metadata.trim().strip_prefix("v1:") else {
+        anyhow::bail!(
+            "running daemon does not expose workspace selection metadata; run `astrid restart`"
+        );
+    };
+    if actual != expected {
+        anyhow::bail!(
+            "running daemon belongs to another project or workspace layout; run `astrid restart` from this project"
+        );
     }
     Ok(())
 }
@@ -185,6 +246,10 @@ pub(crate) async fn spawn_persistent_daemon() -> Result<()> {
 
     let mut cmd = std::process::Command::new(daemon_bin);
     // No --ephemeral flag = persistent mode
+    cmd.env(
+        "ASTRID_WORKSPACE_STATE_DIR",
+        crate::workspace_layout::current().state_dir_name(),
+    );
 
     if let Some(ws_path) = ws.to_str() {
         cmd.arg("--workspace").arg(ws_path);
@@ -312,13 +377,19 @@ pub(crate) async fn handle_start() -> Result<()> {
     let ready_path = socket_client::readiness_path();
     let pid_path = socket_client::pid_path();
 
-    let socket_reachable =
-        socket_path.exists() && tokio::net::UnixStream::connect(&socket_path).await.is_ok();
+    let socket_probe = if socket_path.exists() {
+        tokio::net::UnixStream::connect(&socket_path).await.ok()
+    } else {
+        None
+    };
+    let socket_reachable = socket_probe.is_some();
     let recorded_pid_alive = daemon_control::read_pid_file(&pid_path)
         .is_some_and(|(pid, _)| daemon_control::is_process_alive(pid));
 
     match decide_start_action(socket_reachable, recorded_pid_alive) {
         StartAction::AlreadyRunning => {
+            ensure_daemon_workspace_matches(None).await?;
+            drop(socket_probe);
             println!(
                 "{}",
                 theme::Theme::warning("Astrid daemon is already running.")
@@ -362,7 +433,7 @@ pub(crate) async fn handle_status() -> Result<()> {
         return Ok(());
     }
 
-    let mut client = KernelClient::connect(crate::principal::current())
+    let mut client = socket_client::connect_kernel_for_workspace(None)
         .await
         .context("Daemon socket exists but connection failed")?;
     let status = status_response(
@@ -429,7 +500,9 @@ pub(crate) async fn handle_stop() -> Result<()> {
     }
 
     // Graceful path: the socket is present and serviceable.
-    if socket_present && let Ok(client) = KernelClient::connect(crate::principal::current()).await {
+    // Deliberately bypass the selected-workspace check: stopping a daemon is
+    // the recovery path when that daemon belongs to another project/layout.
+    if socket_present && let Ok(client) = socket_client::connect_kernel_for_recovery().await {
         let mut client = client.with_timeout(Duration::from_secs(10));
         match client
             .request(KernelRequest::Shutdown {
@@ -610,6 +683,70 @@ mod tests {
                 .checked_mul(DAEMON_READY_POLL_MILLIS)
                 .expect("readiness window fits"),
             60_000
+        );
+    }
+
+    #[test]
+    fn daemon_workspace_metadata_rejects_unknown_or_different_selection() {
+        let expected = "a".repeat(64);
+        assert!(validate_daemon_workspace_metadata("", &expected).is_err());
+        assert!(
+            validate_daemon_workspace_metadata(&format!("v1:{}", "b".repeat(64)), &expected)
+                .is_err()
+        );
+        validate_daemon_workspace_metadata(&format!("v1:{expected}\n"), &expected).unwrap();
+    }
+
+    #[test]
+    fn explicit_workspace_selection_wins_over_current_directory() {
+        let current = std::env::current_dir().expect("current directory");
+        let explicit = tempfile::tempdir().expect("explicit workspace");
+        assert_ne!(explicit.path(), current);
+
+        assert_eq!(
+            expected_workspace_fingerprint(Some(explicit.path())).unwrap(),
+            astrid_core::dirs::checked_workspace_selection_fingerprint(
+                explicit.path(),
+                crate::workspace_layout::current(),
+            )
+            .unwrap()
+        );
+        assert_eq!(
+            expected_workspace_fingerprint(None).unwrap(),
+            astrid_core::dirs::checked_workspace_selection_fingerprint(
+                &current,
+                crate::workspace_layout::current(),
+            )
+            .unwrap()
+        );
+    }
+
+    #[test]
+    fn ephemeral_boot_passes_the_selected_workspace_to_the_daemon() {
+        use std::ffi::OsStr;
+
+        let command = ephemeral_daemon_command(
+            Path::new("/installed/astrid-daemon"),
+            Path::new("/selected/project"),
+        );
+        let args = command.get_args().collect::<Vec<_>>();
+
+        assert_eq!(
+            args,
+            vec![
+                OsStr::new("--ephemeral"),
+                OsStr::new("--workspace"),
+                OsStr::new("/selected/project"),
+            ]
+        );
+        assert_eq!(
+            command
+                .get_envs()
+                .find(|(name, _)| *name == OsStr::new("ASTRID_WORKSPACE_STATE_DIR"))
+                .and_then(|(_, value)| value),
+            Some(OsStr::new(
+                crate::workspace_layout::current().state_dir_name()
+            ))
         );
     }
 

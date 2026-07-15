@@ -2,7 +2,7 @@
 
 use colored::Colorize;
 
-use super::meta::{InstalledCapsule, scan_installed_capsules};
+use super::meta::{InstalledCapsule, scan_installed_capsules_with_layout};
 use crate::theme::Theme;
 
 // ---------------------------------------------------------------------------
@@ -140,7 +140,7 @@ fn build_dep_graph(capsules: &[InstalledCapsule]) -> (Vec<CapsuleTree<'_>>, Vec<
 
 /// Show the capsule dependency tree (imports/exports graph).
 pub(crate) fn show_tree() -> anyhow::Result<()> {
-    let capsules = scan_installed_capsules()?;
+    let capsules = scan_installed_capsules_with_layout(crate::workspace_layout::current())?;
 
     if capsules.is_empty() {
         println!("{}", Theme::info("No capsules installed."));

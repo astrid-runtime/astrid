@@ -1,5 +1,6 @@
 //! Hook discovery - find hooks from standard locations.
 
+use astrid_core::dirs::WorkspaceLayout;
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 use tracing::{debug, info, warn};
@@ -46,22 +47,49 @@ pub(crate) const HOOK_FILE_NAMES: &[&str] = &["HOOK.toml", "hook.toml", "hooks.t
 /// Discover hooks from standard locations.
 ///
 /// This function looks for hooks in:
-/// 1. `.astrid/hooks/` in the current directory (workspace-level)
+/// 1. Hooks under the selected project state directory
 /// 2. Any additional paths provided in `extra_paths`
 ///
 /// Callers should pass the user-level hooks directory (e.g.
 /// `AstridHome::hooks_dir()`) via `extra_paths` rather than relying
 /// on hard-coded platform paths.
 pub(crate) fn discover_hooks(extra_paths: Option<&[PathBuf]>) -> Vec<Hook> {
+    discover_hooks_with_layout(extra_paths, &WorkspaceLayout::default())
+}
+
+pub(crate) fn discover_hooks_with_layout(
+    extra_paths: Option<&[PathBuf]>,
+    workspace_layout: &WorkspaceLayout,
+) -> Vec<Hook> {
+    let workspace_root = std::env::current_dir().ok();
+    discover_hooks_in_workspace(extra_paths, workspace_root.as_deref(), workspace_layout)
+}
+
+pub(crate) fn discover_hooks_in_workspace(
+    extra_paths: Option<&[PathBuf]>,
+    workspace_root: Option<&Path>,
+    workspace_layout: &WorkspaceLayout,
+) -> Vec<Hook> {
     let mut hooks = Vec::new();
 
-    // Look in local .astrid/hooks directory
-    let local_hooks_dir = PathBuf::from(".astrid/hooks");
-    if local_hooks_dir.exists() {
-        info!(path = %local_hooks_dir.display(), "Discovering hooks from local directory");
-        match load_hooks_from_dir(&local_hooks_dir) {
-            Ok(found) => hooks.extend(found),
-            Err(e) => warn!(error = %e, "Failed to load hooks from local directory"),
+    if let Some(workspace_root) = workspace_root {
+        let checked = workspace_layout
+            .resolve(workspace_root)
+            .and_then(|selection| selection.verify_tree("hooks").map(|dir| (selection, dir)));
+        if let Ok((selection, local_hooks_dir)) = checked {
+            if local_hooks_dir.exists() {
+                info!(path = %local_hooks_dir.display(), "Discovering hooks from local directory");
+                match load_hooks_from_dir(&local_hooks_dir) {
+                    Ok(found) => hooks.extend(found),
+                    Err(e) => warn!(error = %e, "Failed to load hooks from local directory"),
+                }
+            }
+            if let Err(error) = selection.verify_tree("hooks") {
+                warn!(%error, "Workspace changed during hook discovery; discarding workspace hooks");
+                hooks.clear();
+            }
+        } else if let Err(error) = checked {
+            warn!(%error, "Unsafe workspace hook path; skipping workspace hooks");
         }
     }
 
@@ -188,7 +216,15 @@ pub(crate) fn save_hook(hook: &Hook, path: &Path) -> DiscoveryResult<()> {
 /// Hooks directory in a workspace.
 #[must_use]
 pub(crate) fn workspace_hooks_dir(workspace_root: &Path) -> PathBuf {
-    workspace_root.join(".astrid").join("hooks")
+    workspace_hooks_dir_with_layout(workspace_root, &WorkspaceLayout::default())
+}
+
+#[must_use]
+pub(crate) fn workspace_hooks_dir_with_layout(
+    workspace_root: &Path,
+    workspace_layout: &WorkspaceLayout,
+) -> PathBuf {
+    workspace_layout.hooks_dir(workspace_root)
 }
 
 #[cfg(test)]
@@ -243,5 +279,51 @@ mod tests {
         let hooks = discover_hooks(None);
         // May find system hooks, so just check it doesn't panic
         let _ = hooks;
+    }
+
+    #[test]
+    fn workspace_hooks_use_injected_layout() {
+        let layout = WorkspaceLayout::new(".alternate-runtime").unwrap();
+        assert_eq!(
+            workspace_hooks_dir_with_layout(Path::new("/workspace"), &layout),
+            PathBuf::from("/workspace/.alternate-runtime/hooks")
+        );
+    }
+
+    #[test]
+    fn discovery_uses_explicit_workspace_root() {
+        let workspace = TempDir::new().unwrap();
+        let layout = WorkspaceLayout::new(".alternate-runtime").unwrap();
+        let hooks_dir = layout.hooks_dir(workspace.path());
+        std::fs::create_dir_all(&hooks_dir).unwrap();
+        save_hook(
+            &Hook::new(HookEvent::SessionStart).with_name("selected"),
+            &hooks_dir.join("HOOK.toml"),
+        )
+        .unwrap();
+
+        let hooks = discover_hooks_in_workspace(None, Some(workspace.path()), &layout);
+
+        assert_eq!(hooks.len(), 1);
+        assert_eq!(hooks[0].name.as_deref(), Some("selected"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn discovery_skips_workspace_with_symlinked_hook_file() {
+        use std::os::unix::fs::symlink;
+
+        let workspace = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        let hooks = workspace.path().join(".astrid/hooks");
+        std::fs::create_dir_all(&hooks).unwrap();
+        let target = outside.path().join("HOOK.toml");
+        std::fs::write(&target, "event = 'session-start'\n").unwrap();
+        symlink(target, hooks.join("HOOK.toml")).unwrap();
+
+        assert!(
+            discover_hooks_in_workspace(None, Some(workspace.path()), &WorkspaceLayout::default())
+                .is_empty()
+        );
     }
 }

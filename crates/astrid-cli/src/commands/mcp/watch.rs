@@ -84,7 +84,9 @@ pub(super) async fn run(peer: Peer<RoleServer>, principal: String) {
         },
     };
     let session = astrid_core::SessionId::from_uuid(Uuid::new_v4());
-    let mut watch_client = match SocketClient::connect(session, caller).await {
+    let mut watch_client = match crate::socket_client::connect_for_workspace(session, caller, None)
+        .await
+    {
         Ok(c) => c,
         Err(e) => {
             // Non-fatal: the server still serves tools; clients just won't

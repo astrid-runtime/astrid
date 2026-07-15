@@ -26,9 +26,12 @@ pub(crate) async fn ensure_global_config() {
 /// Configure tracing/logging for this CLI invocation.
 pub(crate) fn init_logging(cli: &Cli) {
     let workspace_root = std::env::current_dir().ok();
-    let unified_cfg = astrid_config::Config::load(workspace_root.as_deref())
-        .ok()
-        .map(|r| r.config);
+    let unified_cfg = astrid_config::Config::load_with_layout(
+        workspace_root.as_deref(),
+        crate::workspace_layout::current(),
+    )
+    .ok()
+    .map(|r| r.config);
 
     let needs_file_log = matches!(cli.command, Some(crate::cli::Commands::Chat { .. }) | None);
 
@@ -129,6 +132,10 @@ pub(crate) fn run_build_companion(
     }
 }
 
+fn selected_workspace_root(workspace: Option<std::path::PathBuf>) -> Option<std::path::PathBuf> {
+    workspace.or_else(|| std::env::current_dir().ok())
+}
+
 /// Resolve the session, check for an existing socket, and boot the
 /// kernel locally if necessary. Drives the interactive-session path.
 ///
@@ -136,7 +143,7 @@ pub(crate) fn run_build_companion(
 /// Returns an error if the kernel fails to boot or the socket fails to connect.
 pub(crate) async fn run_or_connect(
     session: Option<String>,
-    _workspace: Option<std::path::PathBuf>,
+    workspace: Option<std::path::PathBuf>,
     format: OutputFormat,
 ) -> Result<()> {
     use astrid_core::SessionId;
@@ -149,6 +156,7 @@ pub(crate) async fn run_or_connect(
     } else {
         SessionId::from_uuid(Uuid::new_v4())
     };
+    let workspace_root = selected_workspace_root(workspace);
 
     let socket_path = socket_client::proxy_socket_path();
     let ready_path = socket_client::readiness_path();
@@ -183,42 +191,66 @@ pub(crate) async fn run_or_connect(
     let mut daemon_child: Option<std::process::Child> = None;
 
     if needs_boot {
-        match commands::daemon::spawn_daemon(&ready_path).await {
+        match commands::daemon::spawn_daemon(&ready_path, workspace_root.as_deref()).await {
             Ok(child) => daemon_child = Some(child),
             Err(e) => return Err(e),
         }
     }
 
-    let mut client =
-        match socket_client::SocketClient::connect(session_id.clone(), crate::principal::current())
-            .await
-        {
-            Ok(c) => {
-                drop(daemon_child);
-                c
-            },
-            Err(e) => {
-                if let Some(mut child) = daemon_child {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                }
-                let log_hint = astrid_core::dirs::AstridHome::resolve().map_or_else(
-                    |_| "Failed to connect to daemon".to_string(),
-                    |h| {
-                        format!(
-                            "Failed to connect to daemon. Check logs: {}",
-                            h.log_dir().display()
-                        )
-                    },
-                );
-                return Err(e.context(log_hint));
-            },
-        };
+    let mut client = match socket_client::connect_for_workspace(
+        session_id.clone(),
+        crate::principal::current(),
+        workspace_root.as_deref(),
+    )
+    .await
+    {
+        Ok(c) => {
+            drop(daemon_child);
+            c
+        },
+        Err(e) => {
+            if let Some(mut child) = daemon_child {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+            let log_hint = astrid_core::dirs::AstridHome::resolve().map_or_else(
+                |_| "Failed to connect to daemon".to_string(),
+                |h| {
+                    format!(
+                        "Failed to connect to daemon. Check logs: {}",
+                        h.log_dir().display()
+                    )
+                },
+            );
+            return Err(anyhow::Error::new(e).context(log_hint));
+        },
+    };
 
-    let workspace_root = std::env::current_dir().ok();
-    let model_name = astrid_config::Config::load(workspace_root.as_deref())
-        .ok()
-        .map_or_else(|| "unknown".to_string(), |r| r.config.model.model);
+    let model_name = astrid_config::Config::load_with_layout(
+        workspace_root.as_deref(),
+        crate::workspace_layout::current(),
+    )
+    .ok()
+    .map_or_else(|| "unknown".to_string(), |r| r.config.model.model);
 
     crate::commands::chat::run_chat(&mut client, &session_id, &model_name, format).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::selected_workspace_root;
+
+    #[test]
+    fn explicit_workspace_root_wins_over_current_directory() {
+        let explicit = tempfile::tempdir().expect("explicit workspace");
+        assert_eq!(
+            selected_workspace_root(Some(explicit.path().to_path_buf())).as_deref(),
+            Some(explicit.path())
+        );
+    }
+
+    #[test]
+    fn absent_workspace_root_uses_current_directory() {
+        assert_eq!(selected_workspace_root(None), std::env::current_dir().ok());
+    }
 }

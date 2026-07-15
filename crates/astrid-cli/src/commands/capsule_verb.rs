@@ -171,7 +171,7 @@ async fn resolve_commands() -> Result<Vec<CommandInfo>> {
     // (admin) principal — letting a non-admin enumerate capsule verbs under
     // admin context, an RBAC bypass.
     let caller = crate::principal::current();
-    let mut client = SocketClient::connect(session, caller.clone())
+    let mut client = crate::socket_client::connect_for_workspace(session, caller.clone(), None)
         .await
         .map_err(|e| anyhow::anyhow!("Failed to connect to daemon: {e}"))?;
 
@@ -209,16 +209,17 @@ async fn execute(provider: &str, verb: &str, args: &[String]) -> Result<ExitCode
     // under the invoking identity's context (VFS/KV/secrets), not the
     // `default` (admin) principal a nil/unstamped message falls back to.
     let caller = crate::principal::current();
-    let mut client = match SocketClient::connect(session, caller.clone()).await {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!(
-                "{}",
-                Theme::error(&format!("Failed to connect to daemon: {e}"))
-            );
-            return Ok(ExitCode::from(1));
-        },
-    };
+    let mut client =
+        match crate::socket_client::connect_for_workspace(session, caller.clone(), None).await {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!(
+                    "{}",
+                    Theme::error(&format!("Failed to connect to daemon: {e}"))
+                );
+                return Ok(ExitCode::from(1));
+            },
+        };
 
     let req_id = Uuid::new_v4().simple().to_string();
     let body = serde_json::json!({

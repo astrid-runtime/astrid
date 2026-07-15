@@ -541,6 +541,7 @@ dependencies = [
 name = "astrid-config"
 version = "0.9.4"
 dependencies = [
+ "astrid-core",
  "directories",
  "serde",
  "serde_json",

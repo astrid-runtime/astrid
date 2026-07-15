@@ -6,8 +6,8 @@
 //!   Linux FHS-aligned layout with `etc/`, `var/`, `run/`, `log/`, `keys/`,
 //!   `bin/`, `lib/`, and `home/` for multi-principal isolation.
 //!
-//! - [`WorkspaceDir`]: Per-project directory at `<project>/.astrid/`.
-//!   Holds only committable project-level config (like `.astrid/ASTRID.md`).
+//! - [`WorkspaceDir`]: Selected per-project state directory.
+//!   Holds project configuration, capsules, hooks, and instructions.
 //!   Contains a `workspace-id` UUID that links the project to its global state.
 //!
 //! - [`PrincipalHome`]: Per-principal home directory under `~/.astrid/home/{id}/`.
@@ -47,13 +47,18 @@
 //!         └── .config/
 //!             └── env/                   capsule config overrides
 //!
-//! <project>/.astrid/                   (WorkspaceDir)
+//! <project>/<selected-state-dir>/      (WorkspaceDir)
 //! ├── workspace-id                       UUID linking project to global state
-//! └── ASTRID.md                        project-level instructions
+//! ├── config.toml                        project configuration
+//! ├── capsules/                          project-installed capsules
+//! ├── hooks/                             project hooks
+//! └── ASTRID.md                          project instructions
 //! ```
 
+use std::fmt;
 use std::io;
 use std::path::{Component, Path, PathBuf};
+use std::str::FromStr;
 
 use uuid::Uuid;
 
@@ -61,6 +66,175 @@ use crate::principal::PrincipalId;
 
 /// Current layout version. Written to `etc/layout-version` on first boot.
 pub const LAYOUT_VERSION: &str = "1";
+
+/// Default per-project runtime state directory.
+pub const DEFAULT_WORKSPACE_STATE_DIR: &str = ".astrid";
+
+/// Validated per-project runtime layout.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct WorkspaceLayout {
+    state_dir_name: String,
+}
+
+#[path = "workspace_security.rs"]
+mod workspace_security;
+
+pub use workspace_security::{
+    WorkspaceSelection, checked_workspace_selection_fingerprint, workspace_selection_fingerprint,
+};
+
+impl WorkspaceLayout {
+    /// Create a layout from one portable relative directory name.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for empty names, absolute paths, traversal,
+    /// separators, control characters, or non-portable characters.
+    pub fn new(name: impl Into<String>) -> Result<Self, WorkspaceLayoutError> {
+        let name = name.into();
+        if name.is_empty() {
+            return Err(WorkspaceLayoutError::Empty);
+        }
+        if name == "." || name == ".." {
+            return Err(WorkspaceLayoutError::Ambiguous(name));
+        }
+        if name.len() > 64 {
+            return Err(WorkspaceLayoutError::TooLong);
+        }
+        if name.ends_with('.') {
+            return Err(WorkspaceLayoutError::Ambiguous(name));
+        }
+        if name.contains('/') || name.contains('\\') {
+            return Err(WorkspaceLayoutError::Separator);
+        }
+        if !name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+        {
+            return Err(WorkspaceLayoutError::InvalidCharacter);
+        }
+
+        let portable_stem = name.trim_start_matches('.').split('.').next().unwrap_or("");
+        let upper = portable_stem.to_ascii_uppercase();
+        if matches!(upper.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+            || upper.strip_prefix("COM").is_some_and(|suffix| {
+                matches!(suffix, "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9")
+            })
+            || upper.strip_prefix("LPT").is_some_and(|suffix| {
+                matches!(suffix, "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9")
+            })
+        {
+            return Err(WorkspaceLayoutError::Reserved(name));
+        }
+
+        let path = Path::new(&name);
+        let mut components = path.components();
+        if path.is_absolute()
+            || !matches!(components.next(), Some(Component::Normal(_)))
+            || components.next().is_some()
+        {
+            return Err(WorkspaceLayoutError::Ambiguous(name));
+        }
+
+        Ok(Self {
+            state_dir_name: name,
+        })
+    }
+
+    /// Relative directory name used for project state.
+    #[must_use]
+    pub fn state_dir_name(&self) -> &str {
+        &self.state_dir_name
+    }
+
+    /// Project state directory under `project_root`.
+    #[must_use]
+    pub fn state_dir(&self, project_root: &Path) -> PathBuf {
+        project_root.join(&self.state_dir_name)
+    }
+
+    /// Workspace capsule directory under `project_root`.
+    #[must_use]
+    pub fn capsules_dir(&self, project_root: &Path) -> PathBuf {
+        self.state_dir(project_root).join("capsules")
+    }
+
+    /// Workspace configuration path under `project_root`.
+    #[must_use]
+    pub fn config_path(&self, project_root: &Path) -> PathBuf {
+        self.state_dir(project_root).join("config.toml")
+    }
+
+    /// Workspace hooks directory under `project_root`.
+    #[must_use]
+    pub fn hooks_dir(&self, project_root: &Path) -> PathBuf {
+        self.state_dir(project_root).join("hooks")
+    }
+
+    /// Resolve and validate this layout beneath `project_root`.
+    ///
+    /// The root must exist and be a directory. If the state directory exists,
+    /// it must be a real directory whose canonical path is exactly the selected
+    /// direct child of the canonical root. A missing state directory is valid;
+    /// callers that create it must use [`WorkspaceSelection::ensure_state_dir`]
+    /// so the boundary is checked again after creation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the root cannot be canonicalized, is not a
+    /// directory, or the selected state path is redirected or is not a
+    /// directory.
+    pub fn resolve(&self, project_root: &Path) -> io::Result<WorkspaceSelection> {
+        WorkspaceSelection::resolve(project_root, self.clone())
+    }
+}
+
+impl Default for WorkspaceLayout {
+    fn default() -> Self {
+        Self {
+            state_dir_name: DEFAULT_WORKSPACE_STATE_DIR.to_owned(),
+        }
+    }
+}
+
+impl fmt::Display for WorkspaceLayout {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.state_dir_name)
+    }
+}
+
+impl FromStr for WorkspaceLayout {
+    type Err = WorkspaceLayoutError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Self::new(value)
+    }
+}
+
+/// Invalid workspace layout input.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum WorkspaceLayoutError {
+    /// The name is empty.
+    #[error("workspace state directory name must not be empty")]
+    Empty,
+    /// The name is `.` or `..`, or does not resolve to one directory component.
+    #[error("workspace state directory name is ambiguous: {0:?}")]
+    Ambiguous(String),
+    /// The name contains a path separator.
+    #[error("workspace state directory name must not contain path separators")]
+    Separator,
+    /// The name contains a non-portable character.
+    #[error(
+        "workspace state directory name may contain only ASCII letters, digits, '.', '_', and '-'"
+    )]
+    InvalidCharacter,
+    /// The name exceeds the portable length bound.
+    #[error("workspace state directory name must be at most 64 bytes")]
+    TooLong,
+    /// The name is reserved by a supported filesystem.
+    #[error("workspace state directory name is reserved: {0:?}")]
+    Reserved(String),
+}
 
 /// Reject paths containing `..` (parent directory) components.
 fn reject_parent_traversal(path: &Path, var_name: &str) -> io::Result<()> {
@@ -145,7 +319,7 @@ impl AstridHome {
 
     /// Ensure the system directory structure exists with secure permissions.
     ///
-    /// Creates `etc/`, `var/`, `run/`, `log/`, `keys/`, `lib/`, and `home/`.
+    /// Creates `etc/`, `var/`, `run/`, `log/`, `keys/`, `secrets/`, `lib/`, and `home/`.
     /// Writes `etc/layout-version` with the current version.
     /// Sets all directories to `0o700` on Unix.
     ///
@@ -164,6 +338,7 @@ impl AstridHome {
             self.run_dir(),
             self.log_dir(),
             self.keys_dir(),
+            self.secrets_dir(),
             self.bin_dir(),
             self.wit_dir(),
             self.wit_store_dir(),
@@ -526,26 +701,33 @@ impl PrincipalHome {
 
 // ── WorkspaceDir (per-project) ───────────────────────────────────────────
 
-/// Per-project workspace directory (`<project>/.astrid/`).
+/// Selected per-project workspace state directory.
 ///
-/// Contains only committable project-level config. A `workspace-id` UUID
-/// links the project to its global state in `~/.astrid/`.
+/// Contains project-local runtime state. A `workspace-id` UUID links the
+/// project to its global state in `~/.astrid/`.
 #[derive(Debug, Clone)]
 pub struct WorkspaceDir {
-    /// The project root (parent of `.astrid/`).
+    /// The project root containing the selected state directory.
     project_root: PathBuf,
+    layout: WorkspaceLayout,
 }
 
 impl WorkspaceDir {
     /// Detect the workspace directory by walking up from `start_dir`.
     ///
     /// Detection order:
-    /// 1. Directory containing `.astrid/`
+    /// 1. Directory containing the selected state directory
     /// 2. Directory containing `.git`
     /// 3. Directory containing `ASTRID.md`
     /// 4. Fallback to `start_dir` itself
     #[must_use]
     pub fn detect(start_dir: &Path) -> Self {
+        Self::detect_with_layout(start_dir, WorkspaceLayout::default())
+    }
+
+    /// Detect the workspace directory using `layout`.
+    #[must_use]
+    pub fn detect_with_layout(start_dir: &Path, layout: WorkspaceLayout) -> Self {
         let start = if start_dir.is_absolute() {
             start_dir.to_path_buf()
         } else {
@@ -555,19 +737,22 @@ impl WorkspaceDir {
         let mut current = start.as_path();
 
         loop {
-            if current.join(".astrid").is_dir() {
+            if layout.state_dir(current).is_dir() {
                 return Self {
                     project_root: current.to_path_buf(),
+                    layout,
                 };
             }
             if current.join(".git").exists() {
                 return Self {
                     project_root: current.to_path_buf(),
+                    layout,
                 };
             }
             if current.join("ASTRID.md").exists() {
                 return Self {
                     project_root: current.to_path_buf(),
+                    layout,
                 };
             }
             match current.parent() {
@@ -578,48 +763,82 @@ impl WorkspaceDir {
 
         Self {
             project_root: start,
+            layout,
         }
     }
 
     /// Create from an explicit project root (useful for testing).
     #[must_use]
     pub fn from_path(project_root: impl Into<PathBuf>) -> Self {
+        Self::from_path_with_layout(project_root, WorkspaceLayout::default())
+    }
+
+    /// Create from an explicit project root and layout.
+    #[must_use]
+    pub fn from_path_with_layout(
+        project_root: impl Into<PathBuf>,
+        layout: WorkspaceLayout,
+    ) -> Self {
         Self {
             project_root: project_root.into(),
+            layout,
         }
     }
 
-    /// Ensure the `.astrid/` directory exists and generate a workspace ID
+    /// Ensure the selected state directory exists and generate a workspace ID
     /// if one does not already exist.
     ///
     /// # Errors
     ///
     /// Returns an error if directory creation or workspace ID generation fails.
     pub fn ensure(&self) -> io::Result<()> {
-        std::fs::create_dir_all(self.dot_astrid())?;
+        let selection = self.layout.resolve(&self.project_root)?;
+        selection.ensure_state_dir()?;
         let _ = self.workspace_id()?;
+        selection.verify()?;
         Ok(())
     }
 
-    /// Project root directory (parent of `.astrid/`).
+    /// Resolve this workspace through the checked filesystem boundary.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the project root or selected state path is unsafe.
+    pub fn selection(&self) -> io::Result<WorkspaceSelection> {
+        self.layout.resolve(&self.project_root)
+    }
+
+    /// Project root directory containing the selected state directory.
     #[must_use]
     pub fn root(&self) -> &Path {
         &self.project_root
     }
 
-    /// The `.astrid/` directory itself.
+    /// The selected project state directory.
     #[must_use]
     pub fn dot_astrid(&self) -> PathBuf {
-        self.project_root.join(".astrid")
+        self.layout.state_dir(&self.project_root)
     }
 
-    /// Workspace capsules directory (`.astrid/capsules/`).
+    /// The active per-project runtime state directory.
+    #[must_use]
+    pub fn state_dir(&self) -> PathBuf {
+        self.layout.state_dir(&self.project_root)
+    }
+
+    /// The active workspace layout.
+    #[must_use]
+    pub fn layout(&self) -> &WorkspaceLayout {
+        &self.layout
+    }
+
+    /// Capsules under the selected project state directory.
     #[must_use]
     pub fn capsules_dir(&self) -> PathBuf {
         self.dot_astrid().join("capsules")
     }
 
-    /// Path to the workspace-id file (`.astrid/workspace-id`).
+    /// Path to the workspace-id file under selected project state.
     #[must_use]
     pub fn workspace_id_path(&self) -> PathBuf {
         self.dot_astrid().join("workspace-id")
@@ -634,20 +853,25 @@ impl WorkspaceDir {
     ///
     /// Returns an error if the file cannot be read or written.
     pub fn workspace_id(&self) -> io::Result<Uuid> {
-        let path = self.workspace_id_path();
+        let selection = self.selection()?;
+        selection.ensure_state_dir()?;
+        let path = selection.resolve_file("workspace-id")?;
         if let Ok(content) = std::fs::read_to_string(&path) {
             let trimmed = content.trim();
             if let Ok(id) = Uuid::parse_str(trimmed) {
+                selection.verify()?;
                 return Ok(id);
             }
         }
-        std::fs::create_dir_all(self.dot_astrid())?;
         let id = Uuid::new_v4();
+        selection.verify()?;
         std::fs::write(&path, id.to_string())?;
+        selection.resolve_file("workspace-id")?;
+        selection.verify()?;
         Ok(id)
     }
 
-    /// Path to the project-level instructions file (`.astrid/ASTRID.md`).
+    /// Path to project instructions under selected project state.
     #[must_use]
     pub fn instructions_path(&self) -> PathBuf {
         self.dot_astrid().join("ASTRID.md")

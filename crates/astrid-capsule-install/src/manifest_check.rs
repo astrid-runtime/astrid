@@ -7,8 +7,10 @@
 
 use anyhow::Context;
 use astrid_capsule::manifest::CapsuleManifest;
+use astrid_core::dirs::WorkspaceLayout;
+use std::path::Path;
 
-use crate::meta::scan_installed_capsules;
+use crate::meta::scan_installed_capsules_in_home_for_in_workspace;
 
 /// An unsatisfied non-optional import surfaced by [`validate_imports`].
 #[derive(Debug, Clone)]
@@ -26,10 +28,44 @@ pub struct MissingImport {
 /// are silently skipped. Returns the missing ones — the caller decides
 /// whether to log, error, or render in a UI.
 pub fn validate_imports(manifest: &CapsuleManifest) -> Vec<MissingImport> {
+    validate_imports_with_layout(manifest, &WorkspaceLayout::default())
+}
+
+/// Validate imports using an explicit workspace layout.
+pub fn validate_imports_with_layout(
+    manifest: &CapsuleManifest,
+    workspace_layout: &WorkspaceLayout,
+) -> Vec<MissingImport> {
+    let Ok(home) = astrid_core::dirs::AstridHome::resolve() else {
+        return Vec::new();
+    };
+    let workspace_root = std::env::current_dir().ok();
+    validate_imports_in_workspace(
+        manifest,
+        &home,
+        &crate::paths::install_principal(),
+        workspace_root.as_deref(),
+        workspace_layout,
+    )
+}
+
+/// Validate imports using explicit home and workspace inputs.
+pub fn validate_imports_in_workspace(
+    manifest: &CapsuleManifest,
+    home: &astrid_core::dirs::AstridHome,
+    principal: &astrid_core::PrincipalId,
+    workspace_root: Option<&Path>,
+    workspace_layout: &WorkspaceLayout,
+) -> Vec<MissingImport> {
     if !manifest.has_imports() {
         return Vec::new();
     }
-    let Ok(all_capsules) = scan_installed_capsules() else {
+    let Ok(all_capsules) = scan_installed_capsules_in_home_for_in_workspace(
+        home,
+        principal,
+        workspace_root,
+        workspace_layout,
+    ) else {
         return Vec::new();
     };
 
@@ -75,12 +111,45 @@ pub struct ExportConflict {
 /// dispatcher decides who handles a given call. The caller may want
 /// to log this for operator visibility.
 pub fn check_export_conflicts(manifest: &CapsuleManifest) -> anyhow::Result<Vec<ExportConflict>> {
+    check_export_conflicts_with_layout(manifest, &WorkspaceLayout::default())
+}
+
+/// Detect export conflicts using an explicit workspace layout.
+pub fn check_export_conflicts_with_layout(
+    manifest: &CapsuleManifest,
+    workspace_layout: &WorkspaceLayout,
+) -> anyhow::Result<Vec<ExportConflict>> {
+    let home = astrid_core::dirs::AstridHome::resolve()
+        .context("failed to resolve Astrid home directory")?;
+    let workspace_root = std::env::current_dir().ok();
+    check_export_conflicts_in_workspace(
+        manifest,
+        &home,
+        &crate::paths::install_principal(),
+        workspace_root.as_deref(),
+        workspace_layout,
+    )
+}
+
+/// Detect export conflicts using explicit home and workspace inputs.
+pub fn check_export_conflicts_in_workspace(
+    manifest: &CapsuleManifest,
+    home: &astrid_core::dirs::AstridHome,
+    principal: &astrid_core::PrincipalId,
+    workspace_root: Option<&Path>,
+    workspace_layout: &WorkspaceLayout,
+) -> anyhow::Result<Vec<ExportConflict>> {
     if !manifest.has_exports() {
         return Ok(Vec::new());
     }
 
-    let all_capsules = scan_installed_capsules()
-        .context("failed to scan installed capsules for export conflict check")?;
+    let all_capsules = scan_installed_capsules_in_home_for_in_workspace(
+        home,
+        principal,
+        workspace_root,
+        workspace_layout,
+    )
+    .context("failed to scan installed capsules for export conflict check")?;
 
     let mut shared = Vec::new();
     for (ns, name, _ver) in manifest.export_triples() {

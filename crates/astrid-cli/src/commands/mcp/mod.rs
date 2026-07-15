@@ -53,8 +53,6 @@ use tokio::sync::Mutex;
 use tracing::info;
 use uuid::Uuid;
 
-use crate::socket_client::SocketClient;
-
 use server::AstridMcpServer;
 
 /// Refuse to serve the MCP bridge silently as the no-capability `anonymous`
@@ -122,7 +120,7 @@ pub(crate) async fn serve(principal: Option<&str>) -> Result<ExitCode> {
     // not a chat session; the kernel attributes work via the per-message
     // `principal`, not the session.
     let session = astrid_core::SessionId::from_uuid(Uuid::new_v4());
-    let client = SocketClient::connect(session, caller.clone())
+    let client = crate::socket_client::connect_for_workspace(session, caller.clone(), None)
         .await
         .context("Failed to connect to the Astrid daemon socket")?;
 
@@ -139,7 +137,7 @@ pub(crate) async fn serve(principal: Option<&str>) -> Result<ExitCode> {
 
     tokio::spawn(session_guard::run(caller.clone()));
 
-    let server = AstridMcpServer::new(Arc::new(Mutex::new(client)), caller.to_string());
+    let server = AstridMcpServer::new(Arc::new(Mutex::new(client)), caller.clone());
 
     // `rmcp::transport::stdio()` yields the (stdin, stdout) pair the MCP
     // transport drives. `serve` performs the MCP handshake and spawns the

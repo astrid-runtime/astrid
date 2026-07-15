@@ -2,7 +2,7 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use astrid_core::PrincipalId;
-use astrid_core::dirs::AstridHome;
+use astrid_core::dirs::{AstridHome, WorkspaceLayout};
 use serde::Deserialize;
 use uuid::Uuid;
 
@@ -27,22 +27,45 @@ pub(super) fn capsule_source_id_v1(capsule_id: &str, content_hash: &str) -> Uuid
     Uuid::new_v5(&CAPSULE_ID_NAMESPACE, seed.as_bytes())
 }
 
-pub(super) fn trusted_capsule_source_ids(capsule_id: &str, caller: &PrincipalId) -> Vec<Uuid> {
+pub(super) fn trusted_capsule_source_ids(
+    capsule_id: &str,
+    caller: &PrincipalId,
+    workspace_root: &Path,
+    workspace_layout: &WorkspaceLayout,
+) -> Vec<Uuid> {
     let Ok(home) = AstridHome::resolve() else {
         return Vec::new();
     };
+    trusted_capsule_source_ids_in_home(capsule_id, caller, workspace_root, workspace_layout, &home)
+}
 
+fn trusted_capsule_source_ids_in_home(
+    capsule_id: &str,
+    caller: &PrincipalId,
+    workspace_root: &Path,
+    workspace_layout: &WorkspaceLayout,
+    home: &AstridHome,
+) -> Vec<Uuid> {
     // The `caller` selects WHICH install set to read the content hash from (a
     // principal may have its own installed version); it no longer contributes to
     // the derived source id, which is content-addressed and shared across
     // principals (issue #1069).
-    let mut dirs = Vec::new();
-    dirs.push(home.principal_home(caller).capsules_dir().join(capsule_id));
-    if let Ok(cwd) = std::env::current_dir() {
-        dirs.push(cwd.join(".astrid").join("capsules").join(capsule_id));
+    let mut dirs = vec![home.principal_home(caller).capsules_dir().join(capsule_id)];
+    let workspace = workspace_layout.resolve(workspace_root).ok();
+    if let Some(workspace) = &workspace
+        && let Ok(capsules) = workspace.verify_tree("capsules")
+    {
+        dirs.push(capsules.join(capsule_id));
     }
 
-    trusted_capsule_source_ids_from_dirs(capsule_id, dirs)
+    let ids = trusted_capsule_source_ids_from_dirs(capsule_id, dirs);
+    if workspace
+        .as_ref()
+        .is_some_and(|workspace| workspace.verify_tree("capsules").is_err())
+    {
+        return Vec::new();
+    }
+    ids
 }
 
 fn trusted_capsule_source_ids_from_dirs(
@@ -160,7 +183,10 @@ fn read_manifest_package(dir: &Path) -> Option<CapsuleManifestPackage> {
 mod tests {
     use super::{
         capsule_source_id_v1, synthetic_content_hash, trusted_capsule_source_ids_from_dirs,
+        trusted_capsule_source_ids_in_home,
     };
+    use astrid_core::PrincipalId;
+    use astrid_core::dirs::{AstridHome, WorkspaceLayout};
     use serde_json::json;
     use uuid::Uuid;
 
@@ -297,5 +323,31 @@ mod tests {
         let ids = trusted_capsule_source_ids_from_dirs("astrid-capsule-session", [capsule_dir]);
 
         assert!(ids.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn workspace_source_id_skips_symlinked_meta_and_manifest() {
+        use std::os::unix::fs::symlink;
+
+        for name in ["meta.json", "Capsule.toml"] {
+            let workspace = tempfile::tempdir().unwrap();
+            let home_dir = tempfile::tempdir().unwrap();
+            let outside = tempfile::tempdir().unwrap();
+            let capsule = workspace.path().join(".astrid/capsules/example");
+            std::fs::create_dir_all(&capsule).unwrap();
+            let target = outside.path().join(name);
+            std::fs::write(&target, r#"{"wasm_hash":"outside"}"#).unwrap();
+            symlink(target, capsule.join(name)).unwrap();
+
+            let ids = trusted_capsule_source_ids_in_home(
+                "example",
+                &PrincipalId::default(),
+                workspace.path(),
+                &WorkspaceLayout::default(),
+                &AstridHome::from_path(home_dir.path()),
+            );
+            assert!(ids.is_empty(), "accepted redirected {name}");
+        }
     }
 }

@@ -47,6 +47,15 @@ pub(crate) struct Cli {
     )]
     pub principal: Option<String>,
 
+    /// Per-project runtime state directory name.
+    #[arg(
+        long,
+        global = true,
+        env = "ASTRID_WORKSPACE_STATE_DIR",
+        default_value = astrid_core::dirs::DEFAULT_WORKSPACE_STATE_DIR
+    )]
+    pub workspace_state_dir: astrid_core::dirs::WorkspaceLayout,
+
     /// Non-interactive prompt. Sends the prompt, prints the response, and exits.
     /// Forces headless mode (no TUI). Stdin is appended to the prompt if piped.
     #[arg(short, long)]
@@ -571,6 +580,34 @@ mod tests {
     use super::{CapsuleCommands, Cli, Commands, InviteCommand};
     use clap::{CommandFactory, Parser, Subcommand};
     use std::collections::BTreeSet;
+
+    #[test]
+    fn workspace_layout_defaults_and_accepts_an_injected_name() {
+        let default = Cli::try_parse_from(["astrid", "status"]).unwrap();
+        assert_eq!(default.workspace_state_dir.state_dir_name(), ".astrid");
+
+        let alternate = Cli::try_parse_from([
+            "astrid",
+            "--workspace-state-dir",
+            ".alternate-runtime",
+            "status",
+        ])
+        .unwrap();
+        assert_eq!(
+            alternate.workspace_state_dir.state_dir_name(),
+            ".alternate-runtime"
+        );
+    }
+
+    #[test]
+    fn workspace_layout_rejects_unsafe_cli_input() {
+        for value in ["", ".", "..", "/tmp/state", "nested/state", "CON"] {
+            assert!(
+                Cli::try_parse_from(["astrid", "--workspace-state-dir", value, "status"]).is_err(),
+                "{value:?} must be rejected"
+            );
+        }
+    }
 
     /// Every built-in `astrid capsule` subcommand name must appear in
     /// [`astrid_core::kernel_api::RESERVED_CAPSULE_VERBS`]. The reserved

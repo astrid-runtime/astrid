@@ -4,7 +4,7 @@
 # It is embedded in the binary and serves as the fallback when no user config exists.
 #
 # Configuration precedence (highest to lowest):
-# 1. Project config ({workspace}/.astrid/config.toml) — can only tighten security
+# 1. Selected project config — can only tighten security
 # 2. User config (~/.astrid/config.toml)
 # 3. System config (/etc/astrid/config.toml)
 # 4. Environment variables (ASTRID_*, ANTHROPIC_*) — fallback only, not override

@@ -10,7 +10,6 @@ use std::time::Duration;
 use anyhow::Result;
 use astrid_core::dirs::AstridHome;
 use astrid_core::kernel_api::{KernelRequest, KernelResponse};
-use astrid_uplink::KernelClient;
 use clap::Args;
 use colored::Colorize;
 
@@ -134,7 +133,7 @@ fn check_fail(name: &str, detail: &str) {
 async fn daemon_roundtrip() -> Result<()> {
     let mut client = tokio::time::timeout(
         Duration::from_secs(5),
-        KernelClient::connect(crate::principal::current()),
+        crate::socket_client::connect_kernel_for_workspace(None),
     )
     .await
     .map_err(|_| anyhow::anyhow!("connection timed out after 5s"))??;
@@ -161,7 +160,7 @@ async fn daemon_roundtrip() -> Result<()> {
 async fn agent_readiness() -> Result<astrid_core::kernel_api::AgentLoopReadiness> {
     let mut client = tokio::time::timeout(
         Duration::from_secs(5),
-        KernelClient::connect(crate::principal::current()),
+        crate::socket_client::connect_kernel_for_workspace(None),
     )
     .await
     .map_err(|_| anyhow::anyhow!("connection timed out after 5s"))??;

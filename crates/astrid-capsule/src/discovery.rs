@@ -6,6 +6,7 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
+use astrid_core::dirs::WorkspaceLayout;
 use tracing::{debug, info, warn};
 
 use crate::error::{CapsuleError, CapsuleResult};
@@ -91,7 +92,7 @@ fn validate_cli_verb_name(name: &str) -> Result<(), String> {
 ///
 /// Scans directories in priority order:
 /// 1. `extra_paths` (system and principal capsule dirs, passed by kernel)
-/// 2. `.astrid/capsules/` (workspace-level, relative to CWD)
+/// 2. Capsules under the selected project state directory
 ///
 /// **Deduplication:** When the same `package.name` appears in multiple
 /// sources, the first occurrence wins (highest priority). Lower-priority
@@ -103,6 +104,24 @@ fn validate_cli_verb_name(name: &str) -> Result<(), String> {
 /// Returns `(manifest, capsule_dir)` pairs where `capsule_dir` is the
 /// directory containing the manifest.
 pub fn discover_manifests(extra_paths: Option<&[PathBuf]>) -> Vec<(CapsuleManifest, PathBuf)> {
+    discover_manifests_with_layout(extra_paths, &WorkspaceLayout::default())
+}
+
+/// Discover capsule manifests using an explicit workspace layout.
+pub fn discover_manifests_with_layout(
+    extra_paths: Option<&[PathBuf]>,
+    workspace_layout: &WorkspaceLayout,
+) -> Vec<(CapsuleManifest, PathBuf)> {
+    let workspace_root = std::env::current_dir().ok();
+    discover_manifests_in_workspace(extra_paths, workspace_root.as_deref(), workspace_layout)
+}
+
+/// Discover capsule manifests with an explicit workspace root and layout.
+pub fn discover_manifests_in_workspace(
+    extra_paths: Option<&[PathBuf]>,
+    workspace_root: Option<&Path>,
+    workspace_layout: &WorkspaceLayout,
+) -> Vec<(CapsuleManifest, PathBuf)> {
     let mut manifests = Vec::new();
     let mut seen_names: HashSet<String> = HashSet::new();
 
@@ -140,7 +159,26 @@ pub fn discover_manifests(extra_paths: Option<&[PathBuf]>) -> Vec<(CapsuleManife
     }
 
     // 2. Workspace-level capsules (lowest priority).
-    load_dedup(&PathBuf::from(".astrid/capsules"), "workspace");
+    if let Some(workspace_root) = workspace_root {
+        match workspace_layout
+            .resolve(workspace_root)
+            .and_then(|selection| {
+                selection
+                    .verify_tree("capsules")
+                    .map(|dir| (selection, dir))
+            }) {
+            Ok((selection, dir)) => {
+                load_dedup(&dir, "workspace");
+                if let Err(error) = selection.verify_tree("capsules") {
+                    warn!(%error, "Workspace changed during capsule discovery; discarding results");
+                    manifests.retain(|(_, path)| !path.starts_with(&dir));
+                }
+            },
+            Err(error) => {
+                warn!(%error, "Unsafe workspace capsule path; skipping workspace capsules")
+            },
+        }
+    }
 
     info!(count = manifests.len(), "Discovered capsule manifests");
     manifests
@@ -366,6 +404,56 @@ mod tests {
 name = "test-capsule"
 version = "0.1.0"
 "#;
+
+    #[test]
+    fn discovery_uses_only_the_injected_workspace_layout() {
+        let workspace = tempfile::tempdir().unwrap();
+        let default_capsule = workspace.path().join(".astrid/capsules/default-capsule");
+        let alternate_capsule = workspace
+            .path()
+            .join(".alternate-runtime/capsules/alternate-capsule");
+        std::fs::create_dir_all(&default_capsule).unwrap();
+        std::fs::create_dir_all(&alternate_capsule).unwrap();
+        std::fs::write(
+            default_capsule.join("Capsule.toml"),
+            "[package]\nname = \"default-capsule\"\nversion = \"1.0.0\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            alternate_capsule.join("Capsule.toml"),
+            "[package]\nname = \"alternate-capsule\"\nversion = \"1.0.0\"\n",
+        )
+        .unwrap();
+
+        let layout = WorkspaceLayout::new(".alternate-runtime").unwrap();
+        let found = discover_manifests_in_workspace(None, Some(workspace.path()), &layout);
+
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].0.package.name, "alternate-capsule");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn discovery_skips_workspace_with_symlinked_manifest() {
+        use std::os::unix::fs::symlink;
+
+        let workspace = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let capsule = workspace.path().join(".astrid/capsules/redirected");
+        std::fs::create_dir_all(&capsule).unwrap();
+        let manifest = outside.path().join("Capsule.toml");
+        std::fs::write(&manifest, "[package]\nname='outside'\nversion='1.0.0'\n").unwrap();
+        symlink(manifest, capsule.join("Capsule.toml")).unwrap();
+
+        assert!(
+            discover_manifests_in_workspace(
+                None,
+                Some(workspace.path()),
+                &WorkspaceLayout::default()
+            )
+            .is_empty()
+        );
+    }
 
     #[test]
     fn load_manifest_accepts_valid_ipc_publish() {

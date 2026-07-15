@@ -38,6 +38,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
+use astrid_core::PrincipalId;
 use astrid_uplink::socket_client::ReadError;
 use rmcp::ErrorData as McpError;
 use rmcp::ServerHandler;
@@ -102,7 +103,7 @@ pub(crate) struct AstridMcpServer {
     /// The single long-lived uplink, shared across `&self` handlers.
     client: Arc<Mutex<SocketClient>>,
     /// Principal stamped on every outbound IPC message.
-    principal: String,
+    principal: PrincipalId,
     /// Set when a prior round trip ended in a connection-loss condition (a
     /// failed send, or a reply read that hit EOF / reset). The NEXT round trip
     /// re-handshakes (`reconnect()`) before sending, so a request never goes
@@ -118,12 +119,36 @@ pub(crate) struct AstridMcpServer {
 
 impl AstridMcpServer {
     /// Build a new shim over an established uplink and resolved principal.
-    pub(crate) fn new(client: Arc<Mutex<SocketClient>>, principal: String) -> Self {
+    pub(crate) fn new(client: Arc<Mutex<SocketClient>>, principal: PrincipalId) -> Self {
         Self {
             client,
             principal,
             needs_reconnect: AtomicBool::new(false),
         }
+    }
+
+    /// Reconnect the held uplink without ever retaining a client authenticated
+    /// to a daemon for another workspace. Every failure leaves the recovery
+    /// flag armed; only a fully checked replacement clears it.
+    async fn reconnect(&self, client: &mut SocketClient) -> Result<(), McpError> {
+        self.needs_reconnect.store(true, Ordering::Relaxed);
+        let principal = self.principal.clone();
+        let result = crate::socket_client::reconnect_for_workspace(
+            client,
+            principal.clone(),
+            None,
+            |replacement| {
+                super::require_authenticated_unless_anonymous(
+                    &principal,
+                    replacement.is_authenticated(),
+                )
+            },
+        )
+        .await;
+        record_reconnect_outcome(&self.needs_reconnect, &result);
+        result.map_err(|error| {
+            McpError::internal_error(format!("reconnect to daemon failed: {error}"), None)
+        })
     }
 
     /// Publish `body` on `request_topic` and await the broker reply on
@@ -148,7 +173,7 @@ impl AstridMcpServer {
             // CLI uplink verbs and send nil.
             Uuid::nil(),
         )
-        .with_principal(self.principal.clone());
+        .with_principal(self.principal.to_string());
 
         let mut client = self.client.lock().await;
 
@@ -159,20 +184,14 @@ impl AstridMcpServer {
         // fully-authenticated connection rather than silently dropping into a
         // half-open socket. A clean deadline against a slow broker never sets
         // the flag, so a slow tool does not force a needless reconnect.
-        if self.needs_reconnect.swap(false, Ordering::Relaxed) {
+        if self.needs_reconnect.load(Ordering::Relaxed) {
             warn!(
                 topic = request_topic,
                 "MCP shim: pre-healing a connection flagged dead by a prior round trip"
             );
-            if let Err(e) = client.reconnect().await {
-                // Re-arm the flag: the connection is still dead, so the next
-                // attempt must try to heal again rather than assume health.
-                self.needs_reconnect.store(true, Ordering::Relaxed);
+            if let Err(e) = self.reconnect(&mut client).await {
                 warn!(error = %e, "MCP shim: pre-heal reconnect failed");
-                return Err(McpError::internal_error(
-                    format!("reconnect to daemon failed: {e}"),
-                    None,
-                ));
+                return Err(e);
             }
         }
 
@@ -185,11 +204,12 @@ impl AstridMcpServer {
         // retried for idempotent requests).
         if let Err(first) = client.send_message(msg.clone()).await {
             warn!(topic = request_topic, error = %first, "MCP shim: broker publish failed; reconnecting to daemon and retrying once");
-            client.reconnect().await.map_err(|e| {
+            self.reconnect(&mut client).await.map_err(|e| {
                 warn!(error = %e, "MCP shim: reconnect to daemon failed");
-                McpError::internal_error(format!("reconnect to daemon failed: {e}"), None)
+                e
             })?;
             client.send_message(msg.clone()).await.map_err(|e| {
+                self.needs_reconnect.store(true, Ordering::Relaxed);
                 warn!(topic = request_topic, error = %e, "MCP shim: failed to publish broker request after reconnect");
                 McpError::internal_error(format!("failed to publish broker request after reconnect: {e}"), None)
             })?;
@@ -214,13 +234,12 @@ impl AstridMcpServer {
                 self.needs_reconnect.store(true, Ordering::Relaxed);
                 if is_request_retriable(request_topic) {
                     warn!(topic = request_topic, error = %e, "MCP shim: connection lost awaiting reply; reconnecting and retrying idempotent request once");
-                    client.reconnect().await.map_err(|re| {
+                    self.reconnect(&mut client).await.map_err(|re| {
                         warn!(error = %re, "MCP shim: reconnect for idempotent retry failed");
-                        McpError::internal_error(format!("reconnect to daemon failed: {re}"), None)
+                        re
                     })?;
-                    // Healed in-line; clear the flag we just set.
-                    self.needs_reconnect.store(false, Ordering::Relaxed);
                     client.send_message(msg).await.map_err(|se| {
+                        self.needs_reconnect.store(true, Ordering::Relaxed);
                         warn!(topic = request_topic, error = %se, "MCP shim: re-publish after reconnect failed");
                         McpError::internal_error(
                             format!("failed to re-publish broker request after reconnect: {se}"),
@@ -267,6 +286,10 @@ impl AstridMcpServer {
             },
         }
     }
+}
+
+fn record_reconnect_outcome<T, E>(needs_reconnect: &AtomicBool, result: &Result<T, E>) {
+    needs_reconnect.store(result.is_err(), Ordering::Relaxed);
 }
 
 /// Whether a broker round trip on `request_topic` may be transparently
@@ -735,6 +758,16 @@ fn content_from_block(block: &Value) -> ContentBlock {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn failed_reconnect_remains_armed_until_a_checked_replacement_succeeds() {
+        let needs_reconnect = AtomicBool::new(false);
+        record_reconnect_outcome(&needs_reconnect, &Err::<(), _>("mismatch"));
+        assert!(needs_reconnect.load(Ordering::Relaxed));
+
+        record_reconnect_outcome(&needs_reconnect, &Ok::<_, &str>(()));
+        assert!(!needs_reconnect.load(Ordering::Relaxed));
+    }
 
     /// The read-only tool-enumeration front door (MCP `tools/list`) is the only
     /// round trip safe to transparently re-issue after a mid-wait connection

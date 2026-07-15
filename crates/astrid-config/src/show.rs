@@ -5,6 +5,8 @@
 
 use std::fmt::{self, Write as _};
 
+use astrid_core::dirs::WorkspaceLayout;
+
 use crate::merge::FieldSources;
 use crate::types::Config;
 
@@ -130,6 +132,22 @@ impl ResolvedConfig {
         astrid_home: Option<&str>,
         workspace_root: Option<&str>,
     ) -> Vec<String> {
+        Self::config_paths_with_layout(
+            home_dir,
+            astrid_home,
+            workspace_root,
+            &WorkspaceLayout::default(),
+        )
+    }
+
+    /// List config file paths using an explicit workspace layout.
+    #[must_use]
+    pub fn config_paths_with_layout(
+        home_dir: Option<&str>,
+        astrid_home: Option<&str>,
+        workspace_root: Option<&str>,
+        workspace_layout: &WorkspaceLayout,
+    ) -> Vec<String> {
         let mut paths = Vec::new();
 
         paths.push("/etc/astrid/config.toml".to_owned());
@@ -143,9 +161,17 @@ impl ResolvedConfig {
         }
 
         if let Some(ws) = workspace_root {
-            paths.push(format!("{ws}/.astrid/config.toml"));
+            paths.push(
+                workspace_layout
+                    .config_path(std::path::Path::new(ws))
+                    .display()
+                    .to_string(),
+            );
         } else {
-            paths.push("{workspace}/.astrid/config.toml".to_owned());
+            paths.push(format!(
+                "{{workspace}}/{}/config.toml",
+                workspace_layout.state_dir_name()
+            ));
         }
 
         paths
@@ -233,5 +259,20 @@ mod tests {
         );
         assert_eq!(paths[1], "/tmp/astrid-home/config.toml");
         assert!(!paths[1].contains("/home/user/.astrid"));
+    }
+
+    #[test]
+    fn config_paths_use_injected_workspace_layout() {
+        let layout = WorkspaceLayout::new(".alternate-runtime").unwrap();
+        let paths = ResolvedConfig::config_paths_with_layout(
+            Some("/home/user"),
+            None,
+            Some("/home/user/project"),
+            &layout,
+        );
+        assert_eq!(
+            paths[2],
+            "/home/user/project/.alternate-runtime/config.toml"
+        );
     }
 }

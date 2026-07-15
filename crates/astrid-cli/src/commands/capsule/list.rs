@@ -6,7 +6,7 @@ use astrid_capsule_install::mismatching_contracts;
 use astrid_core::dirs::AstridHome;
 use colored::Colorize;
 
-use super::meta::scan_installed_capsules_in_home;
+use super::meta::scan_installed_capsules_in_home_with_layout;
 use crate::theme::Theme;
 
 /// List all installed capsules with their provides/requires metadata.
@@ -16,7 +16,8 @@ use crate::theme::Theme;
 /// list and install source.
 pub(crate) fn list_capsules(verbose: bool) -> anyhow::Result<()> {
     let home = AstridHome::resolve()?;
-    let capsules = scan_installed_capsules_in_home(&home)?;
+    let capsules =
+        scan_installed_capsules_in_home_with_layout(&home, crate::workspace_layout::current())?;
 
     if capsules.is_empty() {
         println!("{}", Theme::info("No capsules installed."));

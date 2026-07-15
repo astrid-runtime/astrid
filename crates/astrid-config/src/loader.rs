@@ -4,7 +4,7 @@
 //! 1. Parse `defaults.toml` → base
 //! 2. Merge `/etc/astrid/config.toml` (system)
 //! 3. Merge `$ASTRID_HOME/config.toml` or `~/.astrid/config.toml` (user)
-//! 4. Merge `{workspace}/.astrid/config.toml` (workspace) + restriction enforcement
+//! 4. Merge the selected workspace config + restriction enforcement
 //! 5. Apply env var fallbacks for unset fields
 //! 6. Deserialize merged tree → `Config`
 //! 7. Resolve `${VAR}` references
@@ -13,6 +13,7 @@
 
 use std::path::{Path, PathBuf};
 
+use astrid_core::dirs::WorkspaceLayout;
 use tracing::{debug, info};
 
 use crate::env::{
@@ -43,6 +44,25 @@ const DEFAULTS_TOML: &str = include_str!("defaults.toml");
 pub fn load(
     workspace_root: Option<&Path>,
     astrid_home_override: Option<&Path>,
+) -> ConfigResult<ResolvedConfig> {
+    load_with_layout(
+        workspace_root,
+        astrid_home_override,
+        &WorkspaceLayout::default(),
+    )
+}
+
+/// Load the unified configuration using an explicit workspace layout.
+///
+/// # Errors
+///
+/// Returns a [`ConfigError`] if any config file is malformed, or if the
+/// final merged configuration fails validation.
+#[allow(clippy::too_many_lines)]
+pub fn load_with_layout(
+    workspace_root: Option<&Path>,
+    astrid_home_override: Option<&Path>,
+    workspace_layout: &WorkspaceLayout,
 ) -> ConfigResult<ResolvedConfig> {
     let env_vars = collect_env_vars();
     let home_dir = if let Some(h) = astrid_home_override {
@@ -99,13 +119,32 @@ pub fn load(
         info!(path = %path.display(), "loaded user config");
     }
 
-    // 4. Workspace config ({workspace}/.astrid/config.toml).
+    // 4. Selected workspace config.
     //    Snapshot the merged config *before* the workspace layer as the baseline
     //    for restriction enforcement. This ensures restrictions work even when
     //    no user config file exists (the baseline includes defaults + system).
     if let Some(ws_root) = workspace_root {
-        let ws_path = ws_root.join(".astrid").join("config.toml");
-        if let Some(mut overlay) = try_load_file(&ws_path)? {
+        let workspace =
+            workspace_layout
+                .resolve(ws_root)
+                .map_err(|source| ConfigError::ReadError {
+                    path: workspace_layout.state_dir(ws_root).display().to_string(),
+                    source,
+                })?;
+        let ws_path = workspace
+            .config_path()
+            .map_err(|source| ConfigError::ReadError {
+                path: workspace.state_dir().display().to_string(),
+                source,
+            })?;
+        let workspace_overlay = try_load_file(&ws_path)?;
+        workspace
+            .verify()
+            .map_err(|source| ConfigError::ReadError {
+                path: ws_path.display().to_string(),
+                source,
+            })?;
+        if let Some(mut overlay) = workspace_overlay {
             // Resolve ${VAR} references in workspace overlay with restricted
             // env vars (only ASTRID_* and ANTHROPIC_*). This prevents a
             // malicious workspace config from exfiltrating sensitive env vars.
@@ -126,6 +165,12 @@ pub fn load(
 
             loaded_files.push(ws_path.display().to_string());
             info!(path = %ws_path.display(), "loaded workspace config");
+            workspace
+                .verify()
+                .map_err(|source| ConfigError::ReadError {
+                    path: workspace.state_dir().display().to_string(),
+                    source,
+                })?;
         }
     }
 
@@ -335,6 +380,80 @@ mod tests {
         // that defaults parse correctly.
         let config = Config::default();
         assert!(validate::validate(&config).is_ok());
+    }
+
+    #[test]
+    fn workspace_config_uses_only_injected_layout() {
+        let home = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let default_dir = workspace.path().join(".astrid");
+        let alternate_dir = workspace.path().join(".alternate-runtime");
+        std::fs::create_dir_all(&default_dir).unwrap();
+        std::fs::create_dir_all(&alternate_dir).unwrap();
+        std::fs::write(
+            default_dir.join("config.toml"),
+            "[model]\nprovider = \"openai\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            alternate_dir.join("config.toml"),
+            "[model]\nprovider = \"claude\"\n",
+        )
+        .unwrap();
+
+        let layout = WorkspaceLayout::new(".alternate-runtime").unwrap();
+        let resolved =
+            load_with_layout(Some(workspace.path()), Some(home.path()), &layout).unwrap();
+
+        assert_eq!(resolved.config.model.provider, "claude");
+        assert!(
+            resolved
+                .loaded_files
+                .iter()
+                .any(|path| path.ends_with(".alternate-runtime/config.toml"))
+        );
+        assert!(
+            resolved
+                .loaded_files
+                .iter()
+                .all(|path| !path.ends_with(".astrid/config.toml"))
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn workspace_config_rejects_redirected_state_directory() {
+        use std::os::unix::fs::symlink;
+
+        let home = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(
+            outside.path().join("config.toml"),
+            "[model]\nprovider = \"claude\"\n",
+        )
+        .unwrap();
+        symlink(outside.path(), workspace.path().join(".alternate-runtime")).unwrap();
+
+        let layout = WorkspaceLayout::new(".alternate-runtime").unwrap();
+        assert!(load_with_layout(Some(workspace.path()), Some(home.path()), &layout).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn workspace_config_rejects_redirected_config_file() {
+        use std::os::unix::fs::symlink;
+
+        let home = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let state = workspace.path().join(".alternate-runtime");
+        std::fs::create_dir(&state).unwrap();
+        let outside = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(outside.path(), "[model]\nprovider = \"claude\"\n").unwrap();
+        symlink(outside.path(), state.join("config.toml")).unwrap();
+
+        let layout = WorkspaceLayout::new(".alternate-runtime").unwrap();
+        assert!(load_with_layout(Some(workspace.path()), Some(home.path()), &layout).is_err());
     }
 
     #[test]

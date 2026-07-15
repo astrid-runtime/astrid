@@ -6,7 +6,10 @@ use astrid_config::{Config, ResolvedConfig, ShowFormat};
 /// Show the resolved configuration with source annotations.
 pub(crate) fn show_config(format: &str, section: Option<&str>) -> Result<()> {
     let workspace_root = std::env::current_dir().ok();
-    let resolved = Config::load(workspace_root.as_deref())?;
+    let resolved = Config::load_with_layout(
+        workspace_root.as_deref(),
+        crate::workspace_layout::current(),
+    )?;
 
     let show_format = match format {
         "json" => ShowFormat::Json,
@@ -26,7 +29,10 @@ pub(crate) fn show_config(format: &str, section: Option<&str>) -> Result<()> {
 pub(crate) fn validate_config() -> Result<()> {
     let workspace_root = std::env::current_dir().ok();
 
-    match Config::load(workspace_root.as_deref()) {
+    match Config::load_with_layout(
+        workspace_root.as_deref(),
+        crate::workspace_layout::current(),
+    ) {
         Ok(resolved) => {
             println!("Configuration is valid.");
             if !resolved.loaded_files.is_empty() {
@@ -81,10 +87,11 @@ pub(crate) fn show_paths() -> Result<()> {
         .map(|p| p.to_string_lossy().to_string());
     let astrid_home = std::env::var("ASTRID_HOME").ok();
 
-    let paths = ResolvedConfig::config_paths_with_astrid_home(
+    let paths = ResolvedConfig::config_paths_with_layout(
         home.as_deref(),
         astrid_home.as_deref(),
         workspace.as_deref(),
+        crate::workspace_layout::current(),
     );
 
     println!("Configuration files checked (in precedence order):\n");

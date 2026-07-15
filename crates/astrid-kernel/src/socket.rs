@@ -264,29 +264,63 @@ pub fn readiness_path() -> PathBuf {
 /// this as a fatal boot failure - without the sentinel, the CLI will never
 /// detect that the daemon is ready.
 pub fn write_readiness_file() -> Result<(), std::io::Error> {
-    use std::fs::OpenOptions;
+    let workspace_root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    write_readiness_file_for_workspace(
+        &workspace_root,
+        &astrid_core::dirs::WorkspaceLayout::default(),
+    )
+}
 
+/// Write readiness metadata for the selected project workspace.
+///
+/// # Errors
+/// Returns an error if the sentinel cannot be written.
+pub fn write_readiness_file_for_workspace(
+    workspace_root: &std::path::Path,
+    workspace_layout: &astrid_core::dirs::WorkspaceLayout,
+) -> Result<(), std::io::Error> {
     let path = readiness_path();
+    let fingerprint = astrid_core::dirs::checked_workspace_selection_fingerprint(
+        workspace_root,
+        workspace_layout,
+    )?;
+    publish_readiness_metadata(&path, &format!("v1:{fingerprint}\n"))
+}
 
-    // Ensure the parent directory exists (defense-in-depth for contexts
-    // where bind_listener() has not run first).
+fn publish_readiness_metadata(path: &std::path::Path, metadata: &str) -> std::io::Result<()> {
+    use std::io::Write as _;
+
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))?;
+        }
     }
-
-    // Create the sentinel file with owner-only permissions set atomically
-    // via OpenOptions::mode() to avoid a TOCTOU window where the file exists
-    // with default permissions before chmod.
-    let mut opts = OpenOptions::new();
+    let tmp = path.with_extension(format!("ready.tmp.{}", std::process::id()));
+    let mut opts = std::fs::OpenOptions::new();
     opts.write(true).create(true).truncate(true);
-
     #[cfg(unix)]
     {
-        use std::os::unix::fs::OpenOptionsExt;
+        use std::os::unix::fs::OpenOptionsExt as _;
         opts.mode(0o600);
     }
 
-    opts.open(&path)?;
+    let write_result = (|| -> std::io::Result<()> {
+        let mut file = opts.open(&tmp)?;
+        file.write_all(metadata.as_bytes())?;
+        file.flush()?;
+        file.sync_all()
+    })();
+    if let Err(error) = write_result {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(error);
+    }
+    if let Err(error) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(error);
+    }
     Ok(())
 }
 
@@ -409,6 +443,24 @@ mod tests {
             err.to_string().contains("exceeding the platform limit"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn readiness_metadata_is_published_atomically() {
+        let dir = tempfile::tempdir().unwrap();
+        let run_dir = dir.path().join("run");
+        let path = run_dir.join("system.ready");
+
+        publish_readiness_metadata(&path, "v1:selected\n").unwrap();
+
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "v1:selected\n");
+        assert_eq!(std::fs::read_dir(&run_dir).unwrap().count(), 1);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = std::fs::metadata(&run_dir).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o700);
+        }
     }
 
     #[test]

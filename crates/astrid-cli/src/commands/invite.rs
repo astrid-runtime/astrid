@@ -14,7 +14,7 @@ use astrid_core::kernel_api::{AdminRequestKind, AdminResponseBody};
 use clap::{Args, Subcommand};
 use colored::Colorize;
 
-use crate::admin_client::{AdminClient, connect_as_active_agent, into_result};
+use crate::admin_client::{connect_as_active_agent, connect_for_workspace_as, into_result};
 use crate::theme::Theme;
 
 #[derive(Subcommand, Debug, Clone)]
@@ -161,7 +161,7 @@ async fn run_redeem(args: RedeemArgs) -> Result<ExitCode> {
     // `cli-context.toml` yet, so don't require an active-agent context
     // here; stamp the IPC message as `default` and let the kernel's
     // `InviteRedeem` dispatch path verify the token internally.
-    let mut client = AdminClient::connect(PrincipalId::default())
+    let mut client = connect_for_workspace_as(PrincipalId::default())
         .await
         .context("connect to daemon for invite redeem")?;
     let resp = client

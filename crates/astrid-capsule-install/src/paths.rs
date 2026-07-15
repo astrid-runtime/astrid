@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Context;
 use astrid_core::PrincipalId;
-use astrid_core::dirs::AstridHome;
+use astrid_core::dirs::{AstridHome, WorkspaceLayout};
 
 /// The principal a non-workspace install targets.
 ///
@@ -23,9 +23,19 @@ pub fn install_principal() -> astrid_core::PrincipalId {
 ///
 /// User installs (`workspace = false`) land in the principal's home
 /// under `capsules/<id>/`, for the [`install_principal`]. Workspace
-/// installs go to `<cwd>/.astrid/capsules/<id>/`.
+/// installs go under the selected project state directory.
 pub fn resolve_target_dir(home: &AstridHome, id: &str, workspace: bool) -> anyhow::Result<PathBuf> {
-    resolve_target_dir_for(home, &install_principal(), id, workspace)
+    resolve_target_dir_with_layout(home, id, workspace, &WorkspaceLayout::default())
+}
+
+/// Resolve a capsule target using an explicit workspace layout.
+pub fn resolve_target_dir_with_layout(
+    home: &AstridHome,
+    id: &str,
+    workspace: bool,
+    workspace_layout: &WorkspaceLayout,
+) -> anyhow::Result<PathBuf> {
+    resolve_target_dir_for_with_layout(home, &install_principal(), id, workspace, workspace_layout)
 }
 
 /// Resolve the directory a capsule should be installed into for `principal`.
@@ -35,9 +45,49 @@ pub fn resolve_target_dir_for(
     id: &str,
     workspace: bool,
 ) -> anyhow::Result<PathBuf> {
+    resolve_target_dir_for_with_layout(home, principal, id, workspace, &WorkspaceLayout::default())
+}
+
+/// Resolve a capsule target for `principal` using an explicit workspace layout.
+pub fn resolve_target_dir_for_with_layout(
+    home: &AstridHome,
+    principal: &PrincipalId,
+    id: &str,
+    workspace: bool,
+    workspace_layout: &WorkspaceLayout,
+) -> anyhow::Result<PathBuf> {
+    let workspace_root = if workspace {
+        Some(std::env::current_dir().context("could not determine current directory")?)
+    } else {
+        None
+    };
+    resolve_target_dir_for_in_workspace(
+        home,
+        principal,
+        id,
+        workspace,
+        workspace_root.as_deref(),
+        workspace_layout,
+    )
+}
+
+/// Resolve a capsule target using an explicit workspace root and layout.
+pub fn resolve_target_dir_for_in_workspace(
+    home: &AstridHome,
+    principal: &PrincipalId,
+    id: &str,
+    workspace: bool,
+    workspace_root: Option<&Path>,
+    workspace_layout: &WorkspaceLayout,
+) -> anyhow::Result<PathBuf> {
     if workspace {
-        let root = std::env::current_dir().context("could not determine current directory")?;
-        Ok(root.join(".astrid").join("capsules").join(id))
+        let root = workspace_root.context("workspace install requires a workspace root")?;
+        let selection = workspace_layout
+            .resolve(root)
+            .context("selected workspace state path is unsafe")?;
+        selection
+            .resolve_directory(Path::new("capsules").join(id))
+            .context("workspace capsule target is unsafe")
     } else {
         let ph = home.principal_home(principal);
         Ok(ph.capsules_dir().join(id))
@@ -82,5 +132,55 @@ pub fn restore_env_from_backup_for(
         && let Ok(env_path) = resolve_env_path_for(home, principal, capsule_name)
     {
         let _ = std::fs::copy(&old_env, env_path);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn workspace_target_uses_injected_layout() {
+        let layout = WorkspaceLayout::new(".alternate-runtime").unwrap();
+        let root = tempfile::tempdir().unwrap();
+        assert_eq!(
+            resolve_target_dir_for_in_workspace(
+                &AstridHome::from_path("/home/runtime"),
+                &install_principal(),
+                "example",
+                true,
+                Some(root.path()),
+                &layout,
+            )
+            .unwrap(),
+            root.path()
+                .canonicalize()
+                .unwrap()
+                .join(".alternate-runtime/capsules/example")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn workspace_target_rejects_redirected_capsule_tree() {
+        use std::os::unix::fs::symlink;
+
+        let home = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let state = workspace.path().join(".alternate-runtime");
+        std::fs::create_dir(&state).unwrap();
+        symlink(outside.path(), state.join("capsules")).unwrap();
+
+        let error = resolve_target_dir_for_in_workspace(
+            &AstridHome::from_path(home.path()),
+            &install_principal(),
+            "example",
+            true,
+            Some(workspace.path()),
+            &WorkspaceLayout::new(".alternate-runtime").unwrap(),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("unsafe"));
     }
 }

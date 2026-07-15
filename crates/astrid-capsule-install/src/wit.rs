@@ -195,9 +195,8 @@ fn persist_wit_blob(wit_store: &Path, hash: &str, content: &[u8]) {
 /// `home.principal_home(principal)/wit`. The caller passes
 /// [`crate::paths::install_principal`] — the same id used for the home-scoped
 /// install paths — so introspection tools resolve the mirror under the home
-/// they read from. (For a workspace install the capsule itself lives under
-/// `<cwd>/.astrid`, so `principal` names the mirror home, not necessarily the
-/// capsule's own directory.)
+/// they read from. For a workspace install, `principal` names the mirror home,
+/// not necessarily the capsule's project-state directory.
 ///
 /// `wit_files` is the name→hash map returned by [`content_address_wit`]:
 /// keys are paths relative to the source `wit/` directory (e.g.

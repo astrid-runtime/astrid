@@ -19,18 +19,14 @@
 //!
 //! From highest to lowest priority:
 //!
-//! 1. **Workspace** (`{workspace}/.astrid/config.toml`) — can only *tighten* security
+//! 1. **Workspace** (selected project state config) — can only *tighten* security
 //! 2. **User** (`~/.astrid/config.toml`)
 //! 3. **System** (`/etc/astrid/config.toml`)
 //! 4. **Environment variables** (`ASTRID_*`, `ANTHROPIC_*`) — fallback only
 //! 5. **Embedded defaults** (`defaults.toml` compiled into binary)
 //!
-//! # Design
-//!
-//! This crate has **no dependencies on other internal astrid crates**. It only
-//! depends on `serde`, `toml`, `thiserror`, `tracing`, and `directories`.
-//! Conversion from config types to domain types happens at the integration
-//! boundary (CLI startup, gateway init) via bridge modules.
+//! Workspace file discovery accepts the runtime's validated
+//! [`WorkspaceLayout`](astrid_core::dirs::WorkspaceLayout).
 
 #![deny(unsafe_code)]
 #![deny(missing_docs)]
@@ -83,6 +79,33 @@ impl Config {
         astrid_home: &std::path::Path,
     ) -> ConfigResult<ResolvedConfig> {
         loader::load(workspace_root, Some(astrid_home))
+    }
+
+    /// Load configuration with an explicit workspace layout.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`ConfigError`] if any config file is malformed or the final
+    /// configuration fails validation.
+    pub fn load_with_layout(
+        workspace_root: Option<&std::path::Path>,
+        workspace_layout: &astrid_core::dirs::WorkspaceLayout,
+    ) -> ConfigResult<ResolvedConfig> {
+        loader::load_with_layout(workspace_root, None, workspace_layout)
+    }
+
+    /// Load configuration with explicit home and workspace layout inputs.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`ConfigError`] if any config file is malformed or the final
+    /// configuration fails validation.
+    pub fn load_with_home_and_layout(
+        workspace_root: Option<&std::path::Path>,
+        astrid_home: &std::path::Path,
+        workspace_layout: &astrid_core::dirs::WorkspaceLayout,
+    ) -> ConfigResult<ResolvedConfig> {
+        loader::load_with_layout(workspace_root, Some(astrid_home), workspace_layout)
     }
 
     /// Load configuration from a single file (no layering).
