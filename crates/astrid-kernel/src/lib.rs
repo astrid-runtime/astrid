@@ -4233,9 +4233,8 @@ mod tests {
         std::fs::write(home.profiles_dir(), b"blocks profile directory")
             .expect("create deterministic migration obstacle");
 
-        let error = match boot_with_injected_resources(&home, resources).await {
-            Ok(_) => panic!("kernel boot must fail when policy migration fails"),
-            Err(error) => error,
+        let Err(error) = boot_with_injected_resources(&home, resources).await else {
+            panic!("kernel boot must fail when policy migration fails");
         };
         assert_bootstrap_error(&error);
         assert!(
@@ -4251,9 +4250,8 @@ mod tests {
         std::fs::create_dir(home.keys_dir().join("default.key"))
             .expect("create deterministic key-write obstacle");
 
-        let error = match boot_with_injected_resources(&home, resources).await {
-            Ok(_) => panic!("kernel boot must fail when bootstrap key seeding fails"),
-            Err(error) => error,
+        let Err(error) = boot_with_injected_resources(&home, resources).await else {
+            panic!("kernel boot must fail when bootstrap key seeding fails");
         };
         assert_bootstrap_error(&error);
     }
