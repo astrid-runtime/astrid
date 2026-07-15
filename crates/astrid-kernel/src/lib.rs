@@ -3108,7 +3108,7 @@ fn migrate_legacy_profile_path(
         // Operator already migrated, or a prior boot did the rename.
         // Drop the stale legacy file so capsules can no longer reach
         // it via `home://.config/profile.toml`.
-        std::fs::remove_file(&legacy_path)?;
+        remove_legacy_profile_file(&legacy_path)?;
         return Ok(());
     }
     if let Some(parent) = new_path.parent() {
@@ -3123,6 +3123,14 @@ fn migrate_legacy_profile_path(
          (security: capsules with home:// fs_read could read the legacy file)"
     );
     Ok(())
+}
+
+fn remove_legacy_profile_file(path: &Path) -> Result<(), std::io::Error> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
 }
 
 /// Idempotently ensure the default principal's profile on disk has the
@@ -4475,5 +4483,11 @@ mod tests {
         assert!(!legacy_path.exists());
         let result = astrid_core::PrincipalProfile::load_from_path(&new_path).unwrap();
         assert_eq!(result.groups, vec!["canonical".to_string()]);
+    }
+
+    #[test]
+    fn missing_legacy_profile_cleanup_is_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        remove_legacy_profile_file(&dir.path().join("already-removed.toml")).unwrap();
     }
 }
