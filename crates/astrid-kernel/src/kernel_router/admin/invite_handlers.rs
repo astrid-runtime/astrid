@@ -14,20 +14,25 @@ use astrid_core::PrincipalId;
 use astrid_core::groups::GroupConfig;
 use astrid_core::kernel_api::{AdminResponseBody, InviteIssued, InviteRedeemed, InviteSummary};
 use astrid_core::profile::{AuthConfig, AuthMethod, DeviceKey, DeviceScope, PrincipalProfile};
-use sha2::{Digest, Sha256};
+use astrid_crypto::{IdentifierHash, PublicKeyFingerprint};
 use tracing::{info, warn};
 
 use crate::invite::{self, Invite, InviteStore, MAX_EXPIRY_SECS};
 
-/// Hex-encoded SHA-256 of a hex-encoded ed25519 public key. Surfaced
-/// as the `public_key_fingerprint` field on
+/// Domain-separated BLAKE3 fingerprint of an Ed25519 public key. Surfaced as
+/// the `public_key_fingerprint` field on
 /// [`AdminResponseBody::InviteRedeemed`] and used by the audit
 /// sanitiser to redact the raw key from persisted audit rows.
 #[must_use]
 pub(crate) fn fingerprint_public_key(hex_key: &str) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(hex_key.as_bytes());
-    hex::encode(hasher.finalize())
+    PublicKeyFingerprint::from_ed25519_hex(hex_key).map_or_else(
+        |_| {
+            const REJECTED_INPUT_CONTEXT: &str =
+                "astrid.runtime.rejected-public-key-input.fingerprint.v1";
+            IdentifierHash::derive(REJECTED_INPUT_CONTEXT, hex_key.as_bytes()).to_prefixed_hex()
+        },
+        PublicKeyFingerprint::into_inner,
+    )
 }
 
 // ── invite.issue ──────────────────────────────────────────────────────
@@ -307,15 +312,20 @@ pub(crate) async fn invite_revoke(kernel: &Arc<crate::Kernel>, token: String) ->
         Err(e) => return err_internal(format!("invites.toml load failed: {e}")),
     };
     // `token` here may be either the raw token (operator paste) or the
-    // hex fingerprint (operator copy from `invite.list`). Hash the
+    // `blake3:<hex>` fingerprint (operator copy from `invite.list`). Hash the
     // input as raw token first; if no match, also try the input verbatim
     // (treating it as the already-hashed fingerprint). This dual lookup
     // never leaks which form matched — both produce the same
     // success/failure shape.
     let from_raw = invite::hash_token(&token);
+    let from_fingerprint = invite::canonical_token_fingerprint(&token);
     let pre_len = invites.len();
     invites.retain(|i| {
-        !invite::ct_hash_eq(&i.token_hash, &from_raw) && !invite::ct_hash_eq(&i.token_hash, &token)
+        let raw_match = invite::ct_hash_eq(&i.token_hash, &from_raw);
+        let fingerprint_match = from_fingerprint
+            .as_deref()
+            .is_some_and(|fingerprint| invite::ct_hash_eq(&i.token_hash, fingerprint));
+        !(raw_match | fingerprint_match)
     });
     if invites.len() == pre_len {
         return err_bad_input("no invite matches the supplied token or fingerprint".into());
@@ -450,6 +460,30 @@ fn err_unauthorized(msg: String) -> AdminResponseBody {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use astrid_core::dirs::AstridHome;
+    use tempfile::TempDir;
+
+    async fn fixture() -> (TempDir, Arc<crate::Kernel>) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let home = AstridHome::from_path(dir.path());
+        let kernel = crate::test_kernel_with_home(home).await;
+        (dir, kernel)
+    }
+
+    async fn issue_token(kernel: &Arc<crate::Kernel>) -> String {
+        match invite_issue(
+            kernel,
+            "agent".into(),
+            Some(300),
+            1,
+            Some("test invite".into()),
+        )
+        .await
+        {
+            AdminResponseBody::Invite(issued) => issued.token,
+            other => panic!("invite issue failed: {other:?}"),
+        }
+    }
 
     #[test]
     fn normalise_public_key_accepts_bare_hex() {
@@ -499,10 +533,62 @@ mod tests {
 
     #[test]
     fn fingerprint_is_deterministic() {
-        let a = fingerprint_public_key("ed25519:abcd");
-        let b = fingerprint_public_key("ed25519:abcd");
+        let key = "ab".repeat(32);
+        let other = "ac".repeat(32);
+        let a = fingerprint_public_key(&format!("ed25519:{key}"));
+        let b = fingerprint_public_key(&key);
         assert_eq!(a, b);
-        assert_ne!(a, fingerprint_public_key("ed25519:abce"));
-        assert_eq!(a.len(), 64);
+        assert_ne!(a, fingerprint_public_key(&other));
+        assert_eq!(a.len(), 71);
+    }
+
+    #[test]
+    fn malformed_public_key_is_still_redacted_deterministically() {
+        let a = fingerprint_public_key("not-a-key");
+        let b = fingerprint_public_key("not-a-key");
+        assert_eq!(a, b);
+        assert_ne!(a, "not-a-key");
+        assert_eq!(a.len(), 71);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn issue_persists_schema_one_and_redeems_after_reload() {
+        let (_dir, kernel) = fixture().await;
+        let token = issue_token(&kernel).await;
+        assert!(token.starts_with(invite::TOKEN_PREFIX));
+
+        let store = InviteStore::new(InviteStore::path_for(&kernel.astrid_home));
+        let persisted = store.load().expect("reload issued invite");
+        assert_eq!(persisted.len(), 1);
+        assert_eq!(persisted[0].token_hash, invite::hash_token(&token));
+        let body = std::fs::read_to_string(InviteStore::path_for(&kernel.astrid_home))
+            .expect("read invite store");
+        assert!(body.contains("schema_version = 1"));
+
+        let response =
+            invite_redeem(&kernel, token, "ab".repeat(32), Some("BLAKE3 Test".into())).await;
+        assert!(matches!(response, AdminResponseBody::InviteRedeemed(_)));
+        assert!(store.load().expect("reload consumed store").is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn revoke_accepts_raw_and_copied_uppercase_fingerprints() {
+        let (_dir, kernel) = fixture().await;
+
+        let raw = issue_token(&kernel).await;
+        assert!(matches!(
+            invite_revoke(&kernel, raw).await,
+            AdminResponseBody::Success(_)
+        ));
+
+        let copied = issue_token(&kernel).await;
+        let uppercase = invite::hash_token(&copied).to_ascii_uppercase();
+        assert!(matches!(
+            invite_revoke(&kernel, uppercase).await,
+            AdminResponseBody::Success(_)
+        ));
+
+        let store = InviteStore::new(InviteStore::path_for(&kernel.astrid_home));
+        assert!(store.load().expect("reload revoked store").is_empty());
     }
 }

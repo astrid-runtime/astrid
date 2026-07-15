@@ -39,7 +39,7 @@ curl http://127.0.0.1:2787/api/openapi.json > openapi.json
 | Browsable | Swagger UI / Redoc / Scalar | Drop the spec URL straight in. |
 
 **Pin the generator version and record the spec hash** (e.g. the
-`sha256` of `openapi.json`) alongside the generated output. The
+`b3sum` of `openapi.json`) alongside the generated output. The
 gateway is workspace-locked to `core` and ships breaking changes on
 `core` version bumps — the bearer wire format already went
 `v1 → v2` (3 → 4 segments) this way — so a client must be able to say

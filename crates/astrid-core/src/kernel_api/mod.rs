@@ -648,8 +648,7 @@ pub enum AdminRequestKind {
     /// ed25519 public key on the new principal's profile, and decrements
     /// the token's use counter (deleting the record on the last use).
     InviteRedeem {
-        /// Opaque token bytes (URL-safe base64) returned from a prior
-        /// `InviteIssue`.
+        /// Typed `astrid_inv_` bearer token returned from a prior `InviteIssue`.
         token: String,
         /// Hex-encoded ed25519 public key (32 bytes / 64 hex chars).
         /// Registered on the new principal's `AuthConfig.public_keys`.
@@ -666,7 +665,7 @@ pub enum AdminRequestKind {
     /// Revoke an outstanding invite token without consuming it.
     /// Gated by `invite:revoke`.
     InviteRevoke {
-        /// The opaque token to invalidate.
+        /// The typed `astrid_inv_` token or its `blake3:<hex>` fingerprint.
         token: String,
     },
     /// Issue a pair-device token. Scoped issuance is gated by
@@ -703,7 +702,7 @@ pub enum AdminRequestKind {
     /// principal's `AuthConfig.public_keys`, and decrements / deletes
     /// the token record.
     PairDeviceRedeem {
-        /// The opaque token from a prior `PairDeviceIssue`.
+        /// The typed `astrid_pair_` token from a prior `PairDeviceIssue`.
         token: String,
         /// Hex-encoded ed25519 public key (32 bytes / 64 hex chars).
         public_key: String,
@@ -873,7 +872,7 @@ pub struct AgentSummary {
 /// Response payload for [`AdminRequestKind::InviteIssue`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InviteIssued {
-    /// Opaque token (URL-safe base64). The caller delivers this to the
+    /// Typed `astrid_inv_` bearer token. The caller delivers this to the
     /// redeemer out-of-band — e.g. printed by the CLI, surfaced by the
     /// gateway as a redeem URL fragment, or pasted into a chat.
     pub token: String,
@@ -899,7 +898,7 @@ pub struct InviteRedeemed {
     pub principal: PrincipalId,
     /// Group the new principal is now a member of.
     pub group: String,
-    /// SHA-256 fingerprint (hex) of the registered ed25519 public key.
+    /// Domain-separated `blake3:<hex>` fingerprint of the registered Ed25519 public key.
     /// Lets the redeemer verify that the kernel registered the key it
     /// sent rather than substituting one of its own.
     pub public_key_fingerprint: String,
@@ -908,7 +907,7 @@ pub struct InviteRedeemed {
 /// Response payload for [`AdminRequestKind::PairDeviceIssue`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PairTokenIssued {
-    /// Opaque token. The issuing device hands this to the new
+    /// Typed `astrid_pair_` bearer token. The issuing device hands this to the new
     /// device out-of-band (QR code, NFC, manual copy).
     pub token: String,
     /// Principal the new device's key will attach to (always the
@@ -926,7 +925,7 @@ pub struct PairTokenIssued {
 pub struct PairTokenRedeemed {
     /// The principal the new device is now bound to.
     pub principal: PrincipalId,
-    /// SHA-256 fingerprint (hex) of the registered ed25519 key.
+    /// Domain-separated `blake3:<hex>` fingerprint of the registered Ed25519 key.
     /// Lets the redeemer verify the kernel registered the key it
     /// sent rather than substituting one of its own.
     pub public_key_fingerprint: String,
@@ -941,7 +940,7 @@ pub struct PairTokenRedeemed {
 /// [`AdminRequestKind::InviteList`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InviteSummary {
-    /// SHA-256 fingerprint (hex) of the token — the kernel does not
+    /// Domain-separated `blake3:<hex>` fingerprint of the token — the kernel does not
     /// leak the raw token through list responses. Issuers retain the
     /// raw value from the original [`InviteIssued`] response.
     pub token_fingerprint: String,

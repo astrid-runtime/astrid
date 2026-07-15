@@ -406,11 +406,11 @@ pub fn admin_request_method(req: &AdminRequestKind) -> &'static str {
 ///
 /// Redactions:
 ///
-/// * `InviteRedeem.public_key` → `public_key_fingerprint` (SHA-256 of
+/// * `InviteRedeem.public_key` → `public_key_fingerprint` (domain-separated BLAKE3 of
 ///   the supplied key). Storing the raw ed25519 key in the audit log
 ///   would double the system of record for authorization, which Layer
 ///   5/6 treat as `AuthConfig.public_keys` alone.
-/// * `InviteRedeem.token` → `token_fingerprint` (`hex(sha256(token))`).
+/// * `InviteRedeem.token` → `token_fingerprint` (domain-separated BLAKE3).
 ///   The raw invite token is a secret that grants the right to mint a
 ///   principal; persisting it in the audit log would let anyone with
 ///   read access replay it on a multi-use invite. The fingerprint
@@ -419,7 +419,7 @@ pub fn admin_request_method(req: &AdminRequestKind) -> &'static str {
 /// * `InviteRevoke.token` → `token_fingerprint`. Same hazard as
 ///   `InviteRedeem.token`: the caller can pass either the raw token or
 ///   the already-fingerprinted form. Hash unconditionally when the
-///   input doesn't already look like a fingerprint (64 hex chars).
+///   input isn't already a `blake3:<hex>` fingerprint.
 /// * `PairDeviceRedeem` `token` / `public_key` → fingerprints, as above.
 ///
 /// `PairDeviceIssue` (carries `expires_secs` / `label` / `scope`),
@@ -475,16 +475,13 @@ fn sanitize_admin_audit_params(req: &AdminRequestKind) -> Option<serde_json::Val
 }
 
 /// Fingerprint helper for `InviteRevoke.token`, which can be supplied
-/// either as the raw token *or* as an already-fingerprinted 64-hex
+/// either as the raw token *or* as an already-fingerprinted `blake3:<hex>`
 /// identifier (from `astrid invite list`). The audit row stores the
 /// fingerprint form unconditionally so an auditor can correlate
 /// against `invites.toml` without seeing the secret.
 fn fingerprint_revoke_input(token: &str) -> String {
-    if token.len() == 64 && token.chars().all(|c| c.is_ascii_hexdigit()) {
-        token.to_ascii_lowercase()
-    } else {
-        crate::invite::hash_token(token)
-    }
+    crate::invite::canonical_token_fingerprint(token)
+        .unwrap_or_else(|| crate::invite::hash_token(token))
 }
 
 /// Borrow the target principal for audit purposes — `Some` only when the

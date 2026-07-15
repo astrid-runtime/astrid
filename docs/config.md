@@ -300,7 +300,7 @@ args = ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]
 auto_start = true
 trusted = false
 restart_policy = "never"
-# binary_hash = "sha256:abc123..."  # Optional: verify binary integrity
+# binary_hash = "blake3:abc123..."  # Optional: verify binary integrity
 # cwd = "/path/to/working/dir"     # Optional: working directory for the process
 # description = "Filesystem access" # Optional: human-readable description
 
@@ -316,7 +316,7 @@ NODE_ENV = "production"
 | `url` | string | URL for network transports (`sse`, `streamable-http`). |
 | `env` | table | Environment variables to pass to the process. |
 | `cwd` | string | (Optional) Working directory for the server process. |
-| `binary_hash` | string | (Optional) Expected hash for binary integrity verification (e.g., `"sha256:..."`). |
+| `binary_hash` | string | (Optional) Expected hash for binary integrity verification (e.g., `"blake3:..."`). |
 | `description` | string | (Optional) Human-readable description of this server. |
 | `trusted` | bool | Whether this server is trusted (affects capability defaults). |
 | `auto_start` | bool | Start automatically with the daemon. |

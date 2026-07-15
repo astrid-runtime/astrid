@@ -51,6 +51,17 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
   treats the stored `key_id` as informational and re-derives it from the public
   key, so existing local profiles self-heal; device-scoped bearer sessions must
   authenticate again after upgrading.
+- **Astrid-owned identifiers now use domain-separated BLAKE3.** Invite and
+  pair-device token stores carry an explicit schema and invalidate
+  legacy SHA-256 records that cannot be rehashed without their raw secrets;
+  newly issued bearer tokens use type-specific `astrid_inv_` and
+  `astrid_pair_` prefixes, while fingerprints use an explicit `blake3:` label.
+  CLI key metadata self-heals from the retained public key. Public-key
+  fingerprints share a typed derivation primitive, MCP binary pins now carry
+  an honest `blake3:` label, and gateway env-write logs no longer expose
+  dictionary-testable fingerprints of low-entropy values. External SHA-based
+  protocols such as SRI, Git, registry checksums, and release tooling remain
+  unchanged. Closes #1247.
 
 - **Runtime E2E now stages the pinned Unicity AOS monorepo.** The workflow
   preserves the AOS Cargo workspace outside the core checkout and supplies

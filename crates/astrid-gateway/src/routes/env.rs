@@ -30,9 +30,9 @@
 //!
 //! ## Audit
 //!
-//! Each successful write is logged at `info` with the caller, the
-//! capsule, the field name, and the SHA-256 fingerprint of the
-//! value (never the value itself). The kernel-side audit log
+//! Each successful write is logged at `info` with the caller, capsule, field
+//! name, and declared env type. Values and reversible fingerprints of
+//! low-entropy values are never logged. The kernel-side audit log
 //! covers admin-API mutations; env writes are gateway-side only
 //! today. A proper IPC audit topic for env writes is a follow-up
 //! (would need a new `AdminRequestKind` or a dedicated topic for
@@ -48,7 +48,6 @@ use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::{Request, StatusCode};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use utoipa::ToSchema;
 
 use crate::error::{ErrorBody, GatewayError, GatewayResult};
@@ -154,8 +153,6 @@ pub async fn write_env(
     let home = AstridHome::resolve()
         .map_err(|e| GatewayError::Internal(anyhow::anyhow!("resolve ASTRID_HOME: {e}")))?;
 
-    let value_fp = fingerprint(&body.value);
-
     // The disk writes below (`FileSecretStore::set`, `write_env_string`,
     // `append_env_array`) are synchronous `std::fs` calls that fsync
     // through a temp-and-rename. Running them on the tokio worker
@@ -214,7 +211,6 @@ pub async fn write_env(
         capsule = %capsule_id,
         field = %field,
         env_type = %def.env_type,
-        value_fingerprint = %value_fp,
         "gateway env-write"
     );
 
@@ -385,12 +381,6 @@ fn is_safe_field_name(name: &str) -> bool {
         && !name.contains("..")
 }
 
-fn fingerprint(value: &str) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(value.as_bytes());
-    hex::encode(hasher.finalize())
-}
-
 /// Write or replace a single string field in
 /// `$ASTRID_HOME/home/<principal>/.config/env/<capsule>.env.json`.
 /// Atomic write-then-rename; existing fields are preserved.
@@ -505,16 +495,6 @@ mod tests {
         assert!(!is_safe_field_name("a/b"));
         assert!(!is_safe_field_name("a..b"));
         assert!(!is_safe_field_name(&"a".repeat(129)));
-    }
-
-    #[test]
-    fn fingerprint_is_deterministic_sha256() {
-        let a = fingerprint("hello");
-        let b = fingerprint("hello");
-        let c = fingerprint("world");
-        assert_eq!(a, b);
-        assert_ne!(a, c);
-        assert_eq!(a.len(), 64);
     }
 
     #[test]

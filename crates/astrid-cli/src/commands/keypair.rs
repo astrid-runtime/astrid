@@ -37,12 +37,12 @@ use std::time::SystemTime;
 use anyhow::{Context, Result, bail};
 use astrid_core::PrincipalId;
 use astrid_core::dirs::AstridHome;
+use astrid_crypto::PublicKeyFingerprint;
 use clap::{Args, Subcommand};
 use colored::Colorize;
 use ed25519_dalek::SigningKey;
 use rand::{TryRng, rngs::SysRng};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 
 use crate::theme::Theme;
 
@@ -140,9 +140,9 @@ struct KeyMeta {
     /// changes to this struct so older `astrid` binaries can refuse
     /// keys they don't understand.
     schema_version: u32,
-    /// SHA-256 of the public key. Same shape the kernel + audit log
-    /// uses, so an operator can copy-paste from `astrid keypair
-    /// show` into `astrid invite list` and bind by eye.
+    /// Domain-separated BLAKE3 fingerprint of the public key. The kernel and
+    /// audit log use the same derivation, so operators can correlate local
+    /// key metadata with redeem and pairing events.
     fingerprint: String,
     /// Unix-epoch seconds the keypair was generated.
     created_at_epoch: u64,
@@ -160,7 +160,7 @@ struct KeyMeta {
     bound_principal: Option<String>,
 }
 
-const META_SCHEMA_VERSION: u32 = 1;
+const META_SCHEMA_VERSION: u32 = 2;
 
 /// Returns the directory `~/.astrid/keys/local/`, creating it if
 /// missing with 0700 perms.
@@ -237,7 +237,7 @@ fn run_generate(args: GenerateArgs) -> Result<ExitCode> {
 
     let verifying = signing.verifying_key();
     let pub_hex = hex::encode(verifying.to_bytes());
-    let fingerprint = fingerprint_pubkey(&pub_hex);
+    let fingerprint = fingerprint_pubkey(&pub_hex)?;
 
     let now = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
@@ -283,13 +283,13 @@ fn run_list(args: &ListArgs) -> Result<ExitCode> {
         return Ok(ExitCode::SUCCESS);
     }
     println!(
-        "{:<24} {:<64} {:<10}  BOUND PRINCIPAL",
+        "{:<24} {:<71} {:<10}  BOUND PRINCIPAL",
         "NAME", "FINGERPRINT", "CREATED",
     );
     for entry in entries {
         let bound = entry.meta.bound_principal.as_deref().unwrap_or("-");
         println!(
-            "{:<24} {:<64} {:<10}  {}",
+            "{:<24} {:<71} {:<10}  {}",
             entry.name, entry.meta.fingerprint, entry.meta.created_at_epoch, bound,
         );
     }
@@ -302,7 +302,7 @@ fn run_show(args: &ShowArgs) -> Result<ExitCode> {
     if !paths.meta.exists() {
         bail!("keypair {:?} not found", args.name);
     }
-    let meta = read_meta(&paths.meta)?;
+    let meta = read_meta(&paths)?;
     let pub_hex = read_public(&paths.public_hex).unwrap_or_else(|_| "<missing>".to_string());
     println!("name:            {}", args.name);
     println!("fingerprint:     {}", meta.fingerprint);
@@ -384,7 +384,7 @@ pub(crate) fn record_binding(name: &str, principal: &PrincipalId) -> Result<()> 
     if !paths.meta.exists() {
         return Ok(());
     }
-    let mut meta = read_meta(&paths.meta)?;
+    let mut meta = read_meta(&paths)?;
     meta.bound_principal = Some(principal.to_string());
     write_meta(&paths.meta, &meta)?;
     Ok(())
@@ -466,17 +466,50 @@ fn read_public(path: &Path) -> Result<String> {
     Ok(trimmed)
 }
 
-fn read_meta(path: &Path) -> Result<KeyMeta> {
-    let text = fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
+fn read_meta(paths: &KeyPaths) -> Result<KeyMeta> {
+    let text = fs::read_to_string(&paths.meta)
+        .with_context(|| format!("read {}", paths.meta.display()))?;
     let meta: KeyMeta =
-        toml::from_str(&text).with_context(|| format!("parse {}", path.display()))?;
+        toml::from_str(&text).with_context(|| format!("parse {}", paths.meta.display()))?;
     if meta.schema_version > META_SCHEMA_VERSION {
         bail!(
             "keypair {} was written by a newer astrid (schema {} > {})",
-            path.display(),
+            paths.meta.display(),
             meta.schema_version,
             META_SCHEMA_VERSION
         );
+    }
+    if meta.schema_version < META_SCHEMA_VERSION {
+        let public_hex = match read_public(&paths.public_hex) {
+            Ok(public_hex) => public_hex,
+            Err(error) => {
+                tracing::warn!(
+                    path = %paths.meta.display(),
+                    %error,
+                    "keypair fingerprint migration deferred until a valid public key is available"
+                );
+                return Ok(meta);
+            },
+        };
+        let expected = fingerprint_pubkey(&public_hex)?;
+        let migrated = KeyMeta {
+            schema_version: META_SCHEMA_VERSION,
+            fingerprint: expected,
+            ..meta
+        };
+        write_meta(&paths.meta, &migrated)?;
+        return Ok(migrated);
+    }
+    if let Ok(public_hex) = read_public(&paths.public_hex) {
+        let expected = fingerprint_pubkey(&public_hex)?;
+        if meta.fingerprint != expected {
+            let repaired = KeyMeta {
+                fingerprint: expected,
+                ..meta
+            };
+            write_meta(&paths.meta, &repaired)?;
+            return Ok(repaired);
+        }
     }
     Ok(meta)
 }
@@ -520,7 +553,12 @@ fn scan_keys() -> Result<Vec<KeyEntry>> {
         else {
             continue;
         };
-        match read_meta(&path) {
+        let paths = KeyPaths {
+            private: dir.join(format!("{name}.ed25519")),
+            public_hex: dir.join(format!("{name}.pub.hex")),
+            meta: path,
+        };
+        match read_meta(&paths) {
             Ok(meta) => out.push(KeyEntry {
                 name: name.to_string(),
                 meta,
@@ -565,10 +603,10 @@ fn default_name() -> String {
     format!("key-{}", hex::encode(bytes))
 }
 
-fn fingerprint_pubkey(hex_pub: &str) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(format!("ed25519:{hex_pub}").as_bytes());
-    hex::encode(hasher.finalize())
+fn fingerprint_pubkey(hex_pub: &str) -> Result<String> {
+    PublicKeyFingerprint::from_ed25519_hex(hex_pub)
+        .map(PublicKeyFingerprint::into_inner)
+        .map_err(|e| anyhow::anyhow!("fingerprint Ed25519 public key: {e}"))
 }
 
 /// Convert a 64-char hex ed25519 public key into the `ed25519:<base64>`
@@ -637,12 +675,107 @@ mod tests {
 
     #[test]
     fn fingerprint_is_stable_and_distinct() {
-        let a = fingerprint_pubkey(&"a".repeat(64));
-        let b = fingerprint_pubkey(&"a".repeat(64));
-        let c = fingerprint_pubkey(&"b".repeat(64));
+        let a = fingerprint_pubkey(&"a".repeat(64)).unwrap();
+        let b = fingerprint_pubkey(&"a".repeat(64)).unwrap();
+        let c = fingerprint_pubkey(&"b".repeat(64)).unwrap();
         assert_eq!(a, b);
         assert_ne!(a, c);
-        assert_eq!(a.len(), 64);
+        assert_eq!(a.len(), 71);
+    }
+
+    #[test]
+    fn legacy_key_metadata_self_heals_from_the_public_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = KeyPaths {
+            private: dir.path().join("laptop.ed25519"),
+            public_hex: dir.path().join("laptop.pub.hex"),
+            meta: dir.path().join("laptop.meta.toml"),
+        };
+        let public_hex = "ab".repeat(32);
+        write_public(&paths.public_hex, &public_hex).unwrap();
+        write_meta(
+            &paths.meta,
+            &KeyMeta {
+                schema_version: 1,
+                fingerprint: "a4182c80cf8467d91a58382943715d4062d3c6f4464c8b346a3f7b1b11164c7a"
+                    .into(),
+                created_at_epoch: 1,
+                backend: "file".into(),
+                note: Some("offline release key".into()),
+                bound_principal: Some("operator".into()),
+            },
+        )
+        .unwrap();
+
+        let migrated = read_meta(&paths).unwrap();
+        assert_eq!(migrated.schema_version, META_SCHEMA_VERSION);
+        assert_eq!(migrated.note.as_deref(), Some("offline release key"));
+        assert_eq!(migrated.bound_principal.as_deref(), Some("operator"));
+        assert_eq!(
+            migrated.fingerprint,
+            fingerprint_pubkey(&public_hex).unwrap()
+        );
+        let persisted = fs::read_to_string(&paths.meta).unwrap();
+        assert!(persisted.contains("schema_version = 2"));
+        assert!(!persisted.contains("a4182c80cf8467d"));
+    }
+
+    #[test]
+    fn legacy_metadata_without_public_key_remains_readable_and_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = KeyPaths {
+            private: dir.path().join("laptop.ed25519"),
+            public_hex: dir.path().join("laptop.pub.hex"),
+            meta: dir.path().join("laptop.meta.toml"),
+        };
+        write_meta(
+            &paths.meta,
+            &KeyMeta {
+                schema_version: 1,
+                fingerprint: "a4182c80cf8467d91a58382943715d4062d3c6f4464c8b346a3f7b1b11164c7a"
+                    .into(),
+                created_at_epoch: 1,
+                backend: "file".into(),
+                note: Some("preserve me".into()),
+                bound_principal: Some("operator".into()),
+            },
+        )
+        .unwrap();
+        let before = fs::read(&paths.meta).unwrap();
+
+        let deferred = read_meta(&paths).unwrap();
+        assert_eq!(deferred.schema_version, 1);
+        assert_eq!(deferred.note.as_deref(), Some("preserve me"));
+        assert_eq!(fs::read(&paths.meta).unwrap(), before);
+    }
+
+    #[test]
+    fn legacy_metadata_with_malformed_public_key_remains_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = KeyPaths {
+            private: dir.path().join("laptop.ed25519"),
+            public_hex: dir.path().join("laptop.pub.hex"),
+            meta: dir.path().join("laptop.meta.toml"),
+        };
+        write_public(&paths.public_hex, "not-a-public-key").unwrap();
+        write_meta(
+            &paths.meta,
+            &KeyMeta {
+                schema_version: 1,
+                fingerprint: "a4182c80cf8467d91a58382943715d4062d3c6f4464c8b346a3f7b1b11164c7a"
+                    .into(),
+                created_at_epoch: 1,
+                backend: "file".into(),
+                note: None,
+                bound_principal: None,
+            },
+        )
+        .unwrap();
+        let before = fs::read(&paths.meta).unwrap();
+
+        let deferred = read_meta(&paths).unwrap();
+        assert_eq!(deferred.schema_version, 1);
+        assert_eq!(fs::read(&paths.meta).unwrap(), before);
     }
 
     #[test]
