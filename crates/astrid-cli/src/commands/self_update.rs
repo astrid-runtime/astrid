@@ -415,6 +415,14 @@ fn integrity_manifest_url(release: &serde_json::Value) -> Result<&str, UpdateSta
         .map_err(|error| UpdateStageError::integrity(error.to_string()))
 }
 
+fn publisher_bundle_download_error(error: &anyhow::Error) -> UpdateStageError {
+    UpdateStageError::publisher(format!("could not download Sigstore bundle: {error}"))
+}
+
+fn integrity_manifest_download_error(error: &anyhow::Error) -> UpdateStageError {
+    UpdateStageError::integrity(format!("could not download BLAKE3SUMS.txt: {error}"))
+}
+
 /// Stream a URL into memory under the size cap.
 async fn download_bounded(
     client: &reqwest::Client,
@@ -694,7 +702,7 @@ async fn download_verify_extract(
         "publisher-authentication bundle",
     )
     .await
-    .map_err(|_| UpdateStageError::publisher("could not download Sigstore bundle"))?;
+    .map_err(|error| publisher_bundle_download_error(&error))?;
     let authenticated = authenticate_archive(archive, &bundle, version).await?;
     println!("{}", Theme::dimmed("Publisher authenticated."));
 
@@ -708,7 +716,7 @@ async fn download_verify_extract(
         "BLAKE3 integrity manifest",
     )
     .await
-    .map_err(|_| UpdateStageError::integrity("could not download BLAKE3SUMS.txt"))?;
+    .map_err(|error| integrity_manifest_download_error(&error))?;
     let sums_body = String::from_utf8(sums)
         .map_err(|_| UpdateStageError::integrity("BLAKE3SUMS.txt is not UTF-8"))?;
     let archive = verify_integrity(authenticated, &sums_body, &asset_name)?;
