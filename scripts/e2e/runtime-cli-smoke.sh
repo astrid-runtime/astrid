@@ -246,8 +246,38 @@ PY
   run_cli_daemon_lifecycle_smoke
 }
 
+capsule_archive_version() {
+  local archive=$1
+  "$PYTHON" - "$archive" <<'PY'
+import sys
+import tarfile
+import re
+
+with tarfile.open(sys.argv[1], "r:gz") as capsule:
+    manifest = capsule.extractfile("Capsule.toml")
+    if manifest is None:
+        raise SystemExit("capsule archive is missing Capsule.toml")
+    section = None
+    for raw_line in manifest.read().decode("utf-8").splitlines():
+        line = raw_line.split("#", 1)[0].strip()
+        header = re.fullmatch(r"\[([^]]+)]", line)
+        if header:
+            section = header.group(1)
+            continue
+        if section == "package":
+            version = re.fullmatch(r'version\s*=\s*"([^"]+)"', line)
+            if version:
+                print(version.group(1))
+                break
+    else:
+        raise SystemExit("capsule manifest is missing package.version")
+PY
+}
+
 run_cli_offline_init_smoke() {
   local registry_archive=$1
+  local registry_version
+  registry_version="$(capsule_archive_version "$registry_archive")"
   local home="$ARTIFACTS/cli-init-home"
   local cwd="$ARTIFACTS/cli-init-cwd"
   local distro="$ARTIFACTS/cli-init-distro.toml"
@@ -263,7 +293,7 @@ version = "0.1.0"
 [[capsule]]
 name = "astrid-capsule-registry"
 source = "$registry_archive"
-version = "0.8.0"
+version = "$registry_version"
 role = "uplink"
 EOF
   run_isolated_cli "$home" "$cwd" init --distro "$distro" --offline --yes --allow-unsigned \
@@ -277,6 +307,8 @@ EOF
 
 run_cli_distro_seal_smoke() {
   local registry_archive=$1
+  local registry_version
+  registry_version="$(capsule_archive_version "$registry_archive")"
   local distro_dir="$ARTIFACTS/cli-distro-seal"
   local key="$distro_dir/signing.key"
   mkdir -p "$distro_dir"
@@ -291,7 +323,7 @@ version = "0.1.0"
 [[capsule]]
 name = "astrid-capsule-registry"
 source = "$registry_archive"
-version = "0.8.0"
+version = "$registry_version"
 role = "uplink"
 EOF
   "$PYTHON" - "$key" <<'PY'
