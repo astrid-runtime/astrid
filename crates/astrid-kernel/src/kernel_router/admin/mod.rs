@@ -279,10 +279,14 @@ pub fn required_capability_for_admin_request(
         // audit-log readability.
         (AdminRequestKind::PairDeviceRedeem { .. }, _) => "auth:pair:redeem",
         // PairDeviceIssue is intrinsically self-scoped (kernel binds the
-        // token to the caller). Device list / revoke reuse the same pairing
-        // capability (no new base cap): a principal manages its own devices
-        // with `self:auth:pair`; an admin manages anyone's via the global
-        // `auth:pair`.
+        // token to the caller). Unattenuated scopes are escalation primitives
+        // and require the pair-admin capability in the common preamble; the
+        // handler independently enforces scope subset and attenuation rules.
+        (AdminRequestKind::PairDeviceIssue { scope, .. }, _)
+            if pair_device_handlers::pair_scope_requires_admin(scope) =>
+        {
+            "self:auth:pair:admin"
+        },
         (AdminRequestKind::PairDeviceIssue { .. }, _)
         | (
             AdminRequestKind::PairDeviceList { .. } | AdminRequestKind::PairDeviceRevoke { .. },
@@ -548,25 +552,7 @@ async fn handle_admin_request(
 
     let authorization =
         match authorize_request(kernel, &caller, device_key_id.as_deref(), required_cap) {
-            Ok(authorization) => {
-                record_admin_audit(
-                    kernel,
-                    AdminAuditEntry {
-                        caller: &caller,
-                        method,
-                        required_cap,
-                        device_key_id: device_key_id.as_deref(),
-                        target_principal: target.clone(),
-                        params: audit_params.clone(),
-                        authorization: AuthorizationProof::System {
-                            reason: format!("policy allow: {caller} holds {required_cap}"),
-                        },
-                        outcome: AuditOutcome::success(),
-                    },
-                )
-                .await;
-                authorization
-            },
+            Ok(authorization) => authorization,
             Err(e) => {
                 warn!(
                     security_event = true,
@@ -603,6 +589,63 @@ async fn handle_admin_request(
                 return;
             },
         };
+
+    if let AdminRequestKind::PairDeviceIssue {
+        expires_secs,
+        scope,
+        ..
+    } = &req.kind
+        && let Err(error) =
+            pair_device_handlers::preflight_pair_device_issue(&authorization, *expires_secs, scope)
+    {
+        warn!(
+            security_event = true,
+            method,
+            principal = %caller,
+            required = required_cap,
+            error = %error,
+            "Pair-device issuance denied by scope validation"
+        );
+        record_admin_audit(
+            kernel,
+            AdminAuditEntry {
+                caller: &caller,
+                method,
+                required_cap,
+                device_key_id: device_key_id.as_deref(),
+                target_principal: target,
+                params: audit_params,
+                authorization: AuthorizationProof::Denied {
+                    reason: error.clone(),
+                },
+                outcome: AuditOutcome::failure(error.clone()),
+            },
+        )
+        .await;
+        publish_response(
+            kernel,
+            response_topic,
+            AdminKernelResponse::for_request(request_id, AdminResponseBody::Error(error)),
+        );
+        return;
+    }
+
+    record_admin_audit(
+        kernel,
+        AdminAuditEntry {
+            caller: &caller,
+            method,
+            required_cap,
+            device_key_id: device_key_id.as_deref(),
+            target_principal: target,
+            params: audit_params,
+            authorization: AuthorizationProof::System {
+                reason: format!("policy allow: {caller} holds {required_cap}"),
+            },
+            outcome: AuditOutcome::success(),
+        },
+    )
+    .await;
 
     let body = handlers::dispatch_authorized(kernel, &authorization, req.kind).await;
     publish_response(

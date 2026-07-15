@@ -325,7 +325,8 @@ impl From<AdminRequestKind> for AdminKernelRequest {
 /// on `PairDeviceIssue` defaults to [`PairScopeArg::Full`] when omitted, so
 /// pre-scope callers (and single-tenant admin flows) keep their existing
 /// behaviour — but minting a `Full` device additionally requires the issuer to
-/// hold `self:auth:pair:admin`, enforced in the handler.
+/// hold `self:auth:pair:admin`, enforced by the authorization preamble and
+/// rechecked with the issuer's pinned policy snapshot before persistence.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "kind")]
 pub enum PairScopeArg {
@@ -357,8 +358,8 @@ pub enum PairScopeArg {
 
 /// Serde default for [`AdminRequestKind::PairDeviceIssue::scope`] — `Full`,
 /// for back-compat with callers that predate the `scope` field. A `Full` mint
-/// is independently gated on `self:auth:pair:admin` in the handler, so the
-/// permissive *default* does not relax the *authority* required to use it.
+/// is independently gated on `self:auth:pair:admin`, so the permissive
+/// *default* does not relax the *authority* required to use it.
 fn default_pair_scope() -> PairScopeArg {
     PairScopeArg::Full
 }
@@ -666,12 +667,13 @@ pub enum AdminRequestKind {
         /// The opaque token to invalidate.
         token: String,
     },
-    /// Issue a pair-device token. Gated by `self:auth:pair` (the
-    /// caller can only mint pair-tokens for their own principal —
-    /// the kernel ignores any target field on the wire and ties the
-    /// token to the caller). Used to add a new device's ed25519
-    /// public key to an existing principal's `AuthConfig.public_keys`
-    /// without minting a separate principal.
+    /// Issue a pair-device token. Scoped issuance is gated by
+    /// `self:auth:pair`; unattenuated issuance additionally requires
+    /// `self:auth:pair:admin`. The caller can only mint pair-tokens for their
+    /// own principal — the kernel ignores any target field on the wire and
+    /// ties the token to the caller. Used to add a new device's ed25519 public
+    /// key to an existing principal's `AuthConfig.public_keys` without minting
+    /// a separate principal.
     PairDeviceIssue {
         /// Seconds until the token expires. Capped server-side to
         /// 1 hour — pair-tokens are intended for immediate use on a
@@ -686,9 +688,9 @@ pub enum AdminRequestKind {
         /// Capability scope the redeemed device will authenticate under.
         /// Defaults to [`PairScopeArg::Full`] when omitted, for back-compat
         /// with pre-scope callers; a `Full` mint is independently gated on
-        /// `self:auth:pair:admin` in the handler, and an `Explicit`/`Preset`
-        /// scope is validated to be a subset of the issuer's effective
-        /// capabilities (no escalation).
+        /// `self:auth:pair:admin`, and an `Explicit`/`Preset` scope is validated
+        /// to be a subset of the issuer's effective capabilities (no
+        /// escalation).
         #[serde(default = "default_pair_scope")]
         scope: PairScopeArg,
     },

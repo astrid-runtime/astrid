@@ -28,6 +28,7 @@ use tempfile::TempDir;
 
 use super::handlers;
 use crate::Kernel;
+use crate::pair_token::PairTokenStore;
 
 async fn fixture() -> (TempDir, Arc<Kernel>) {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -363,6 +364,90 @@ async fn over_broad_scope_rejected_at_issue() {
     assert!(
         matches!(resp, AdminResponseBody::PairToken(_)),
         "a held scope must be accepted: {resp:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn malformed_explicit_patterns_are_rejected_before_persistence() {
+    let (_dir, kernel) = fixture().await;
+    let caller = pid("malformed_scope_issuer");
+    seed(&kernel, &caller, &["self:*"], vec![]);
+
+    for scope in [
+        PairScopeArg::Explicit {
+            allow: vec!["self:capsule;install".into()],
+            deny: vec![],
+        },
+        PairScopeArg::Explicit {
+            allow: vec!["self:capsule:reload".into()],
+            deny: vec!["self:capsule;install".into()],
+        },
+    ] {
+        let response = handlers::dispatch_with_device(&kernel, &caller, None, issue(scope)).await;
+        match response {
+            AdminResponseBody::Error(message) => assert!(
+                message.contains("invalid device scope capability pattern"),
+                "canonical capability validation must reject the scope: {message}"
+            ),
+            other => panic!("malformed explicit scope must reject, got: {other:?}"),
+        }
+    }
+
+    let store = PairTokenStore::new(PairTokenStore::path_for(&kernel.astrid_home));
+    assert!(
+        store.load().expect("load pair-token store").is_empty(),
+        "invalid allow or deny patterns must never be persisted"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn valid_explicit_allow_and_deny_survive_issue_and_redeem() {
+    let (_dir, kernel) = fixture().await;
+    let caller = pid("explicit_scope_issuer");
+    seed(
+        &kernel,
+        &caller,
+        &["self:auth:pair", "self:capsule:reload"],
+        vec![],
+    );
+    let response = handlers::dispatch_with_device(
+        &kernel,
+        &caller,
+        None,
+        issue(PairScopeArg::Explicit {
+            allow: vec!["self:capsule:reload".into()],
+            deny: vec!["self:capsule:install".into()],
+        }),
+    )
+    .await;
+    let token = match response {
+        AdminResponseBody::PairToken(token) => token.token,
+        other => panic!("valid explicit scope must issue, got: {other:?}"),
+    };
+
+    let public_key = "d".repeat(64);
+    let response = handlers::dispatch(
+        &kernel,
+        &PrincipalId::default(),
+        AdminRequestKind::PairDeviceRedeem {
+            token,
+            public_key: public_key.clone(),
+        },
+    )
+    .await;
+    assert!(matches!(response, AdminResponseBody::PairTokenRedeemed(_)));
+
+    let profile = load(&kernel, &caller);
+    let child = profile
+        .auth
+        .device_by_key_id(&device_key_id_fingerprint(&public_key))
+        .expect("redeemed device");
+    assert_eq!(
+        child.scope,
+        DeviceScope::Scoped {
+            allow: vec!["self:capsule:reload".into()],
+            deny: vec!["self:capsule:install".into()],
+        }
     );
 }
 

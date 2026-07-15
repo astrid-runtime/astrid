@@ -109,9 +109,11 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
 - **Device attenuation now applies to every kernel authority view.** Capsule,
   agent, and group inventory checks use the authenticating device scope, and a
   scoped pair request containing bare `*` requires effective pair-admin
-  authority. Malformed, unknown, and revoked device IDs fail closed, and cache
-  invalidation prevents stale pre-revocation profiles from being republished.
-  Closes #1237.
+  authority. Explicit pair-scope allow and deny patterns pass canonical
+  validation before persistence, and structural no-escalation denials produce
+  a failure audit row without a preceding success row. Malformed, unknown, and
+  revoked device IDs fail closed, and cache invalidation prevents stale
+  pre-revocation profiles from being republished. Closes #1237.
 
 - Bumped the locked `crossbeam-epoch` transitive dependency to `0.9.20`, clearing `RUSTSEC-2026-0204` (published 2026-07-06 — an invalid pointer dereference in the `fmt::Pointer` / pre-0.9 `fmt::Display` impls for `Atomic` and `Shared` when the underlying pointer is null or invalid) from the RustSec audit. The advisory landed the day after the 0.9.3 release and turned the Security Audit CI check red on `main` and every open PR; nothing in our own code changed. Lockfile-only, same-minor patch — no other dependency moved. Closes #1161.
 ## [0.9.3] - 2026-07-06

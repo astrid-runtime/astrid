@@ -26,7 +26,8 @@ use astrid_core::kernel_api::{
     AdminResponseBody, DeviceKeyInfo, PairScopeArg, PairTokenIssued, PairTokenRedeemed,
 };
 use astrid_core::profile::{
-    AuthMethod, DeviceKey, DeviceKeyId, DevicePubkey, DeviceScope, PrincipalProfile,
+    AuthMethod, CapabilityPattern, DeviceKey, DeviceKeyId, DevicePubkey, DeviceScope,
+    PrincipalProfile,
 };
 use tracing::{info, warn};
 
@@ -93,46 +94,17 @@ pub(super) async fn pair_device_issue(
             Ok(authority) => authority,
             Err(response) => return response,
         };
-    let mut issuer_check = CapabilityCheck::new(profile.as_ref(), groups.as_ref(), caller.clone());
-    // A scoped issuer can grant only its attenuated authority.
-    if let Some(scope @ DeviceScope::Scoped { .. }) = &issuer_scope {
-        issuer_check = issuer_check.with_device_scope(scope);
-    }
-
-    match &requested_scope {
-        // Full devices require an unattenuated issuer with pair-admin authority.
-        DeviceScope::Full => {
-            if matches!(&issuer_scope, Some(DeviceScope::Scoped { .. })) {
-                return err_unauthorized(format!(
-                    "a scoped device cannot mint a full-scope (unattenuated) device; issue a scoped device instead — {caller}"
-                ));
-            }
-            if !issuer_check.has("self:auth:pair:admin") {
-                return err_unauthorized(format!(
-                    "minting a full-scope device requires self:auth:pair:admin, which {caller} does not effectively hold"
-                ));
-            }
-        },
-        DeviceScope::Scoped { allow, .. } => {
-            // Bare `*` confers the principal's full authority even in a scoped shape.
-            let requests_universal_scope = allow.iter().any(|pattern| pattern == "*");
-            if requests_universal_scope && !issuer_check.has("self:auth:pair:admin") {
-                return err_unauthorized(format!(
-                    "minting a device scope with universal `*` requires self:auth:pair:admin, which {caller} does not effectively hold"
-                ));
-            }
-            if let Err(e) = device_scope_within(&issuer_check, &requested_scope) {
-                return err_unauthorized(format!(
-                    "requested device scope exceeds your authority: {e}"
-                ));
-            }
-        },
-    }
-
-    // A scoped child inherits its issuer's denies.
-    let stored_scope = inherit_issuer_denies(requested_scope, issuer_scope.as_ref());
-    // Release authority state before awaiting the write lock.
-    drop(issuer_check);
+    let stored_scope = match validate_pair_issue_authority(
+        caller,
+        profile.as_ref(),
+        groups.as_ref(),
+        issuer_scope.as_ref(),
+        &requested_scope,
+    ) {
+        Ok(scope) => scope,
+        Err(error) => return err_unauthorized(error),
+    };
+    // Release the pinned authority snapshot before awaiting the write lock.
     drop(profile);
     drop(groups);
 
@@ -192,7 +164,94 @@ fn validate_pair_issue(
         ));
     }
 
-    resolve_pair_scope(requested).map(|scope| (lifetime, scope))
+    let scope = resolve_pair_scope(requested)?;
+    validate_pair_scope_patterns(&scope)?;
+    Ok((lifetime, scope))
+}
+
+/// Return whether the requested scope confers unattenuated authority and must
+/// therefore pass the pair-admin capability preamble.
+pub(super) fn pair_scope_requires_admin(scope: &PairScopeArg) -> bool {
+    match scope {
+        PairScopeArg::Full => true,
+        PairScopeArg::Preset { name } => {
+            matches!(DeviceScope::preset(name), Some(DeviceScope::Full))
+        },
+        PairScopeArg::Explicit { allow, .. } => allow.iter().any(|pattern| pattern == "*"),
+    }
+}
+
+/// Validate pair issuance against the exact policy snapshot pinned by the
+/// router before it records an authorization success audit row.
+pub(super) fn preflight_pair_device_issue(
+    authorization: &AuthorizedRequest,
+    expires_secs: Option<u64>,
+    requested: &PairScopeArg,
+) -> Result<(), String> {
+    let (_, requested_scope) = validate_pair_issue(expires_secs, requested)?;
+    validate_pair_issue_authority(
+        &authorization.principal,
+        authorization.profile.as_ref(),
+        authorization.groups.as_ref(),
+        authorization.device_scope.as_ref(),
+        &requested_scope,
+    )?;
+    Ok(())
+}
+
+fn validate_pair_issue_authority(
+    caller: &PrincipalId,
+    profile: &PrincipalProfile,
+    groups: &GroupConfig,
+    issuer_scope: Option<&DeviceScope>,
+    requested_scope: &DeviceScope,
+) -> Result<DeviceScope, String> {
+    let mut issuer_check = CapabilityCheck::new(profile, groups, caller.clone());
+    if let Some(scope @ DeviceScope::Scoped { .. }) = issuer_scope {
+        issuer_check = issuer_check.with_device_scope(scope);
+    }
+
+    match requested_scope {
+        DeviceScope::Full => {
+            if matches!(issuer_scope, Some(DeviceScope::Scoped { .. })) {
+                return Err(format!(
+                    "a scoped device cannot mint a full-scope (unattenuated) device; issue a scoped device instead — {caller}"
+                ));
+            }
+            if !issuer_check.has("self:auth:pair:admin") {
+                return Err(format!(
+                    "minting a full-scope device requires self:auth:pair:admin, which {caller} does not effectively hold"
+                ));
+            }
+        },
+        DeviceScope::Scoped { allow, .. } => {
+            let requests_universal_scope = allow.iter().any(|pattern| pattern == "*");
+            if requests_universal_scope && !issuer_check.has("self:auth:pair:admin") {
+                return Err(format!(
+                    "minting a device scope with universal `*` requires self:auth:pair:admin, which {caller} does not effectively hold"
+                ));
+            }
+            if let Err(error) = device_scope_within(&issuer_check, requested_scope) {
+                return Err(format!(
+                    "requested device scope exceeds your authority: {error}"
+                ));
+            }
+        },
+    }
+
+    Ok(inherit_issuer_denies(requested_scope.clone(), issuer_scope))
+}
+
+fn validate_pair_scope_patterns(scope: &DeviceScope) -> Result<(), String> {
+    let DeviceScope::Scoped { allow, deny } = scope else {
+        return Ok(());
+    };
+    for pattern in allow.iter().chain(deny) {
+        CapabilityPattern::new(pattern.as_str()).map_err(|error| {
+            format!("invalid device scope capability pattern {pattern:?}: {error}")
+        })?;
+    }
+    Ok(())
 }
 
 /// Resolve a [`PairScopeArg`] to a concrete [`DeviceScope`]. An unknown preset

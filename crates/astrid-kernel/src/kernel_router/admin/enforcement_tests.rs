@@ -14,7 +14,7 @@
 
 use std::sync::Arc;
 
-use astrid_audit::AuditAction;
+use astrid_audit::{AuditAction, AuditOutcome, AuthorizationProof};
 use astrid_core::dirs::AstridHome;
 use astrid_core::principal::PrincipalId;
 use astrid_core::profile::PrincipalProfile;
@@ -323,6 +323,55 @@ async fn send_admin_scoped(
     .expect("admin response within 2s")
 }
 
+async fn assert_pair_issue_audit(
+    kernel: &Arc<Kernel>,
+    expected_capability: &str,
+    expected_success: bool,
+) {
+    let entries = kernel
+        .audit_log
+        .get_session_entries(&kernel.session_id)
+        .await
+        .expect("read audit chain");
+    let pair_entries = entries
+        .iter()
+        .filter(|entry| {
+            matches!(
+                &entry.action,
+                AuditAction::AdminRequest { method, .. }
+                    if method == "admin.auth.pair.issue"
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        pair_entries.len(),
+        1,
+        "pair issuance must produce exactly one terminal audit row"
+    );
+    let entry = pair_entries[0];
+    let AuditAction::AdminRequest {
+        required_capability,
+        ..
+    } = &entry.action
+    else {
+        unreachable!("filtered to pair issue audit rows")
+    };
+    assert_eq!(required_capability, expected_capability);
+    if expected_success {
+        assert!(matches!(
+            &entry.authorization,
+            AuthorizationProof::System { .. }
+        ));
+        assert!(matches!(&entry.outcome, AuditOutcome::Success { .. }));
+    } else {
+        assert!(matches!(
+            &entry.authorization,
+            AuthorizationProof::Denied { .. }
+        ));
+        assert!(matches!(&entry.outcome, AuditOutcome::Failure { .. }));
+    }
+}
+
 /// Seed a principal that holds `self:auth:pair` and registers two devices: a
 /// Full-scope device and a use-only device whose scope denies `self:auth:pair`.
 /// Returns `(full_key_id, scoped_key_id)`.
@@ -362,7 +411,7 @@ async fn device_scope_denies_pair_issue_but_full_device_and_none_allow() {
     let caller = pid("paired_user");
     let (full_id, scoped_id) = seed_principal_with_devices(&kernel, &caller);
 
-    // PairDeviceIssue is gated by `self:auth:pair`, which the principal holds.
+    // Full PairDeviceIssue is gated by pair-admin, which `self:*` admits.
     let req = || {
         AdminRequestKind::PairDeviceIssue {
             expires_secs: Some(300),
@@ -430,4 +479,139 @@ async fn unknown_device_key_id_fails_closed() {
         resp["status"], "Error",
         "an unresolved device_key_id must fail closed: {resp}"
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn full_pair_mint_without_admin_capability_audits_denial() {
+    let (_dir, kernel) = fixture().await;
+    let caller = pid("pair_issue_only");
+    seed_profile(
+        &kernel,
+        &caller,
+        &PrincipalProfile {
+            grants: vec!["self:auth:pair".into()],
+            enabled: true,
+            ..Default::default()
+        },
+    );
+
+    let response = send_admin(
+        &kernel,
+        &caller,
+        "auth.pair.issue",
+        AdminRequestKind::PairDeviceIssue {
+            expires_secs: Some(300),
+            label: None,
+            scope: astrid_events::kernel_api::PairScopeArg::Full,
+        }
+        .into(),
+    )
+    .await;
+    assert_eq!(response["status"], "Error", "got: {response}");
+    assert_pair_issue_audit(&kernel, "self:auth:pair:admin", false).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn scoped_issuer_full_mint_structural_denial_is_audited() {
+    use astrid_core::profile::{AuthMethod, DeviceKey, DeviceScope};
+
+    let (_dir, kernel) = fixture().await;
+    let caller = pid("scoped_pair_admin");
+    let device = DeviceKey::new(
+        "c".repeat(64),
+        DeviceScope::Scoped {
+            allow: vec!["self:*".into()],
+            deny: vec![],
+        },
+        None,
+        0,
+    );
+    let device_id = device.key_id.clone();
+    let mut profile = PrincipalProfile {
+        grants: vec!["self:*".into()],
+        enabled: true,
+        ..Default::default()
+    };
+    profile.auth.methods.push(AuthMethod::Keypair);
+    profile.auth.public_keys.push(device);
+    seed_profile(&kernel, &caller, &profile);
+
+    let response = send_admin_scoped(
+        &kernel,
+        &caller,
+        Some(&device_id),
+        "auth.pair.issue",
+        AdminRequestKind::PairDeviceIssue {
+            expires_secs: Some(300),
+            label: None,
+            scope: astrid_events::kernel_api::PairScopeArg::Full,
+        }
+        .into(),
+    )
+    .await;
+    assert_eq!(response["status"], "Error", "got: {response}");
+    assert_pair_issue_audit(&kernel, "self:auth:pair:admin", false).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn universal_pair_mint_subset_denial_is_audited() {
+    let (_dir, kernel) = fixture().await;
+    let caller = pid("bounded_pair_admin");
+    seed_profile(
+        &kernel,
+        &caller,
+        &PrincipalProfile {
+            grants: vec!["self:auth:pair:admin".into()],
+            enabled: true,
+            ..Default::default()
+        },
+    );
+
+    let response = send_admin(
+        &kernel,
+        &caller,
+        "auth.pair.issue",
+        AdminRequestKind::PairDeviceIssue {
+            expires_secs: Some(300),
+            label: None,
+            scope: astrid_events::kernel_api::PairScopeArg::Explicit {
+                allow: vec!["*".into()],
+                deny: vec![],
+            },
+        }
+        .into(),
+    )
+    .await;
+    assert_eq!(response["status"], "Error", "got: {response}");
+    assert_pair_issue_audit(&kernel, "self:auth:pair:admin", false).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn successful_full_pair_mint_audits_pair_admin_allow() {
+    let (_dir, kernel) = fixture().await;
+    let caller = pid("unattenuated_pair_admin");
+    seed_profile(
+        &kernel,
+        &caller,
+        &PrincipalProfile {
+            grants: vec!["*".into()],
+            enabled: true,
+            ..Default::default()
+        },
+    );
+
+    let response = send_admin(
+        &kernel,
+        &caller,
+        "auth.pair.issue",
+        AdminRequestKind::PairDeviceIssue {
+            expires_secs: Some(300),
+            label: None,
+            scope: astrid_events::kernel_api::PairScopeArg::Full,
+        }
+        .into(),
+    )
+    .await;
+    assert_eq!(response["status"], "PairToken", "got: {response}");
+    assert_pair_issue_audit(&kernel, "self:auth:pair:admin", true).await;
 }
