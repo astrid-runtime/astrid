@@ -27,9 +27,9 @@ use astrid_events::ipc::{IpcMessage, IpcPayload, Topic};
 use astrid_events::kernel_api::{KernelRequest, KernelResponse};
 use tracing::{debug, info, warn};
 
-use caller::{
-    CallerResolutionError, MANAGEMENT_CALLER_REQUIRED, resolve_caller, resolve_connection_principal,
-};
+#[cfg(test)]
+use caller::CallerResolutionError;
+use caller::{MANAGEMENT_CALLER_REQUIRED, resolve_caller, resolve_connection_principal};
 use device_scope::resolve_device_scope;
 
 #[cfg(test)]

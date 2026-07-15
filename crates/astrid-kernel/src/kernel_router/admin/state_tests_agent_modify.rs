@@ -222,7 +222,7 @@ async fn agent_modify_preserves_default_admin_bootstrap_anchor() {
         &kernel,
         &default,
         AdminRequestKind::AgentModify {
-            principal: default,
+            principal: default.clone(),
             add_groups: vec![BUILTIN_ADMIN.to_string()],
             remove_groups: vec![BUILTIN_ADMIN.to_string()],
             add_capsules: Vec::new(),
