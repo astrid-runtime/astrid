@@ -805,7 +805,6 @@ impl Kernel {
         Ok(kernel)
     }
 
-    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
     fn verify_workspace_capsule_tree(&self, dir: &Path) -> anyhow::Result<()> {
         if let Ok(relative) = dir.strip_prefix(self.workspace_selection.state_dir()) {
             self.workspace_selection
