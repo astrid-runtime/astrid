@@ -60,7 +60,7 @@ use std::io;
 use std::path::{Component, Path, PathBuf};
 use std::str::FromStr;
 
-use sha2::{Digest, Sha256};
+use blake3::Hasher;
 use uuid::Uuid;
 
 use crate::principal::PrincipalId;
@@ -183,15 +183,15 @@ pub fn workspace_selection_fingerprint(
                 .map_or_else(|_| project_root.to_path_buf(), |cwd| cwd.join(project_root))
         }
     });
-    let mut hasher = Sha256::new();
+    let mut hasher = Hasher::new();
     hasher.update(b"astrid-workspace-selection-v1\0");
     hash_path(&mut hasher, &root);
     hasher.update(b"\0");
     hasher.update(workspace_layout.state_dir_name().as_bytes());
-    hex::encode(hasher.finalize())
+    hex::encode(hasher.finalize().as_bytes())
 }
 
-fn hash_path(hasher: &mut Sha256, path: &Path) {
+fn hash_path(hasher: &mut Hasher, path: &Path) {
     #[cfg(unix)]
     {
         use std::os::unix::ffi::OsStrExt as _;
