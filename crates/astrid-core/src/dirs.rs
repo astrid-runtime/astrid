@@ -201,7 +201,7 @@ fn hash_path(hasher: &mut Hasher, path: &Path) {
     {
         use std::os::windows::ffi::OsStrExt as _;
         for unit in path.as_os_str().encode_wide() {
-            hasher.update(unit.to_le_bytes());
+            hasher.update(&unit.to_le_bytes());
         }
     }
     #[cfg(not(any(unix, windows)))]
