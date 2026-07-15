@@ -61,11 +61,23 @@ pub mod system;
 // rows here. Splitting it into sub-routers would obscure the single
 // public/authed grouping for no readability gain.
 pub fn build(state: Arc<GatewayState>) -> Router {
-    build_with_capability_probe(state, events::CapabilityProbe::deny_all())
+    build_with_probe(state, events::CapabilityProbe::deny_all())
+}
+
+/// Build the gateway's HTTP router with an in-process capability evaluator.
+///
+/// Co-located runtimes can use this to preserve live audit firehose policy
+/// when they embed the router directly instead of calling
+/// [`crate::run_with_capability_probe`].
+pub fn build_with_capability_probe<F>(state: Arc<GatewayState>, capability_probe: F) -> Router
+where
+    F: Fn(&astrid_core::PrincipalId, Option<&str>, &str) -> bool + Send + Sync + 'static,
+{
+    build_with_probe(state, events::CapabilityProbe::new(capability_probe))
 }
 
 #[allow(clippy::too_many_lines)]
-pub(crate) fn build_with_capability_probe(
+pub(crate) fn build_with_probe(
     state: Arc<GatewayState>,
     capability_probe: events::CapabilityProbe,
 ) -> Router {

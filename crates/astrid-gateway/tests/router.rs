@@ -18,7 +18,10 @@
 
 use std::sync::Arc;
 
+use astrid_audit::{AuditAction, AuditLog, AuditOutcome, AuthorizationProof};
 use astrid_core::PrincipalId;
+use astrid_core::SessionId;
+use astrid_crypto::KeyPair;
 use astrid_gateway::{
     GatewayConfig, GatewayState,
     auth::{CallerContext, mint_bearer, mint_bearer_scoped, verify_bearer},
@@ -81,6 +84,31 @@ fn fresh_state_with_distro(distro: Option<&str>) -> Arc<GatewayState> {
         topic_probe: None,
         registry_timeout: None,
     })
+}
+
+fn fresh_state_with_audit_log() -> (Arc<GatewayState>, Arc<AuditLog>, SessionId) {
+    let session_id = SessionId::from_uuid(uuid::Uuid::new_v4());
+    let audit_log = Arc::new(AuditLog::in_memory(KeyPair::generate()));
+    let state = Arc::new(GatewayState {
+        config: GatewayConfig::default(),
+        signing: SigningMaterial::fresh(),
+        distribution: Arc::new(DistributionInfo::single_tenant()),
+        onboarding: Arc::new(OnboardingFields::default()),
+        redeem_limiter: tokio::sync::Mutex::default(),
+        metrics_handle: astrid_gateway::metrics::install_recorder().expect("recorder"),
+        event_bus: None,
+        revoked_at: std::sync::Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
+        revoked_key_ids: std::sync::Arc::new(std::sync::RwLock::new(
+            std::collections::HashMap::new(),
+        )),
+        audit_log: Some(Arc::clone(&audit_log)),
+        session_id: Some(session_id.clone()),
+        gateway_route_uuid: uuid::Uuid::new_v4(),
+        readiness_probe: None,
+        topic_probe: None,
+        registry_timeout: None,
+    });
+    (state, audit_log, session_id)
 }
 
 #[tokio::test]
@@ -223,6 +251,44 @@ async fn me_route_returns_principal_from_valid_bearer() {
     let bytes = to_bytes(resp.into_body(), 4096).await.unwrap();
     let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(body["principal"], "alice");
+}
+
+#[tokio::test]
+async fn public_router_builder_accepts_live_capability_probe() {
+    let (state, audit_log, session_id) = fresh_state_with_audit_log();
+    audit_log
+        .append_with_principal(
+            session_id,
+            PrincipalId::new("bob").unwrap(),
+            AuditAction::AdminRequest {
+                method: "BobVisibleThroughProbe".into(),
+                required_capability: "audit:read_all".into(),
+                target_principal: None,
+                params: None,
+                device_key_id: None,
+            },
+            AuthorizationProof::System {
+                reason: "test".into(),
+            },
+            AuditOutcome::Success { details: None },
+        )
+        .await
+        .expect("append audit entry");
+    let router = routes::build_with_capability_probe(Arc::clone(&state), |_, _, _| true);
+
+    let principal = PrincipalId::new("alice").unwrap();
+    let bearer = mint_bearer(&state.signing.signer, &principal, 3600);
+    let req = Request::builder()
+        .uri("/api/sys/audit?principal=bob")
+        .header(header::AUTHORIZATION, String::from("Bearer ") + &bearer)
+        .body(Body::empty())
+        .unwrap();
+    let resp = router.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = to_bytes(resp.into_body(), 4096).await.unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(body["entries"][0]["principal"], "bob");
+    assert_eq!(body["entries"][0]["method"], "BobVisibleThroughProbe");
 }
 
 #[tokio::test]

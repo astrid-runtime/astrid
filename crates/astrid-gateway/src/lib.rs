@@ -154,7 +154,7 @@ async fn run_inner(
         // doesn't apply here — axum-server opens its own listener.
         info!(addr = %addr, scheme = "https", "astrid-gateway listening (TLS)");
         let rustls = tls::load_rustls_config(tls_cfg).await?;
-        let router = tls::apply_hsts(routes::build_with_capability_probe(state, capability_probe));
+        let router = tls::apply_hsts(routes::build_with_probe(state, capability_probe));
         return tls::serve_https(addr, router, rustls, shutdown).await;
     }
 
@@ -200,7 +200,7 @@ async fn serve_http_listener(
         );
     }
 
-    let router = routes::build_with_capability_probe(state, capability_probe);
+    let router = routes::build_with_probe(state, capability_probe);
     // `into_make_service_with_connect_info::<SocketAddr>()` is what
     // populates the `ConnectInfo<SocketAddr>` request extension that
     // `routes::auth::post_redeem` extracts for per-IP rate limiting.
