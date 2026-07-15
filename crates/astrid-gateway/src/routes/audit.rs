@@ -385,6 +385,8 @@ fn paginate_page(
     let mut last_visible_ts_position: usize = 0;
     let mut last_visible_scope: Option<CursorScope> = None;
     let mut effective_scope = access.current_cursor_scope();
+    let mut has_more = false;
+    let mut skipped_by_scope_before_limit = false;
     if let Some(cursor_scope) = cursor_scope.as_ref() {
         validate_scope_continuation(cursor_scope, &effective_scope)?;
     }
@@ -431,9 +433,15 @@ fn paginate_page(
             }
         }
 
+        if page.len() >= limit {
+            has_more = true;
+            break;
+        }
+
         if let Some(p) = effective_scope.principal_filter()
             && view.principal.as_deref() != Some(p.as_str())
         {
+            skipped_by_scope_before_limit = true;
             continue;
         }
 
@@ -441,12 +449,9 @@ fn paginate_page(
         last_visible_ts_position = raw_ts_position;
         last_visible_scope = Some(effective_scope.clone());
         page.push(view);
-        if page.len() >= limit {
-            break;
-        }
     }
 
-    let next_cursor = if page.len() == limit {
+    let next_cursor = if page.len() == limit && (has_more || skipped_by_scope_before_limit) {
         last_visible_ts
             .zip(last_visible_scope)
             .map(|(t, scope)| format!("{t}_{last_visible_ts_position}_{}", scope.encode()))

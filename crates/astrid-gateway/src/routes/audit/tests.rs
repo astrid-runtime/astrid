@@ -239,27 +239,100 @@ async fn pagination_cursor_survives_live_narrowing_with_same_second_batch() {
     )
     .expect("page three");
     assert_eq!(page_three[0].method.as_deref(), Some("AliceOlder"));
-    assert_eq!(next_cursor.as_deref(), Some("1699999999_1_p616c696365"));
+    assert_eq!(next_cursor.as_deref(), None);
+}
 
-    let (cursor_ts, cursor_offset, cursor_scope) =
-        parse_cursor(next_cursor.as_deref()).expect("page-three cursor parses");
-    let cursor_scope = validate_cursor_scope(
+#[tokio::test]
+async fn exact_limit_page_preserves_scope_cursor_after_hidden_row() {
+    let log = AuditLog::in_memory(KeyPair::generate());
+    let session = SessionId::from_uuid(uuid::Uuid::nil());
+    for (principal, method) in [
+        ("alice", "AliceTerminal"),
+        ("bob", "BobHiddenBeforeTerminal"),
+    ] {
+        log.append_with_principal(
+            session.clone(),
+            PrincipalId::new(principal).unwrap(),
+            admin_action(method, None),
+            AuthorizationProof::System {
+                reason: "test".into(),
+            },
+            AuditOutcome::Success { details: None },
+        )
+        .await
+        .expect("append");
+    }
+    let mut entries = log.get_session_entries(&session).await.expect("read");
+    entries.reverse();
+
+    let self_only_probe = super::super::events::CapabilityProbe::new(|_, _, _| false);
+    let firehose_probe = super::super::events::CapabilityProbe::new(|_, _, _| true);
+    let caller = PrincipalId::new("alice").unwrap();
+    let access = AuditAccess {
+        capability_probe: &self_only_probe,
+        caller_principal: &caller,
+        device_key_id: Some("0123456789abcdef"),
+        requested_principal: None,
+    };
+    let widened_access = AuditAccess {
+        capability_probe: &firehose_probe,
+        caller_principal: &caller,
+        device_key_id: Some("0123456789abcdef"),
+        requested_principal: None,
+    };
+
+    let (page, next_cursor) =
+        paginate_page(entries, &AuditQuery::default(), &access, (None, 0, None), 1)
+            .expect("terminal page");
+
+    assert_eq!(page.len(), 1);
+    assert_eq!(page[0].method.as_deref(), Some("AliceTerminal"));
+    let (cursor_ts, _, cursor_scope) =
+        parse_cursor(next_cursor.as_deref()).expect("scope-bound cursor");
+    let err = validate_cursor_scope(
         cursor_ts,
         cursor_scope.as_ref(),
         &AuditQuery::default(),
-        &self_only_access,
+        &widened_access,
     )
-    .expect("self-only cursor continues under same scope");
-    let (page_four, next_cursor) = paginate_page(
-        entries,
-        &AuditQuery::default(),
-        &self_only_access,
-        (cursor_ts, cursor_offset, cursor_scope),
-        1,
+    .expect_err("widening after a hidden row must restart pagination");
+    assert!(err.to_string().contains(CURSOR_SCOPE_CHANGED));
+}
+
+#[tokio::test]
+async fn exact_limit_physical_eof_has_no_continuation_cursor() {
+    let log = AuditLog::in_memory(KeyPair::generate());
+    let session = SessionId::from_uuid(uuid::Uuid::nil());
+    log.append_with_principal(
+        session.clone(),
+        PrincipalId::new("alice").unwrap(),
+        admin_action("AliceTerminal", None),
+        AuthorizationProof::System {
+            reason: "test".into(),
+        },
+        AuditOutcome::Success { details: None },
     )
-    .expect("page four");
-    assert!(page_four.is_empty());
-    assert_eq!(next_cursor.as_deref(), None);
+    .await
+    .expect("append");
+    let mut entries = log.get_session_entries(&session).await.expect("read");
+    entries.reverse();
+
+    let self_only_probe = super::super::events::CapabilityProbe::new(|_, _, _| false);
+    let caller = PrincipalId::new("alice").unwrap();
+    let access = AuditAccess {
+        capability_probe: &self_only_probe,
+        caller_principal: &caller,
+        device_key_id: Some("0123456789abcdef"),
+        requested_principal: None,
+    };
+
+    let (page, next_cursor) =
+        paginate_page(entries, &AuditQuery::default(), &access, (None, 0, None), 1)
+            .expect("terminal page");
+
+    assert_eq!(page.len(), 1);
+    assert_eq!(page[0].method.as_deref(), Some("AliceTerminal"));
+    assert_eq!(next_cursor, None);
 }
 
 #[test]
@@ -472,22 +545,17 @@ async fn pagination_rejects_scope_widening_before_first_visible_row() {
 async fn principal_cursor_rejects_widening_during_skipped_rows() {
     let log = AuditLog::in_memory(KeyPair::generate());
     let session = SessionId::from_uuid(uuid::Uuid::nil());
-    for (principal, method) in [
-        ("alice", "AliceEligibleAfterCursor"),
-        ("bob", "BobSkippedByCursor"),
-    ] {
-        log.append_with_principal(
-            session.clone(),
-            PrincipalId::new(principal).unwrap(),
-            admin_action(method, None),
-            AuthorizationProof::System {
-                reason: "test".into(),
-            },
-            AuditOutcome::Success { details: None },
-        )
-        .await
-        .expect("append");
-    }
+    log.append_with_principal(
+        session.clone(),
+        PrincipalId::new("bob").unwrap(),
+        admin_action("BobSkippedByCursor", None),
+        AuthorizationProof::System {
+            reason: "test".into(),
+        },
+        AuditOutcome::Success { details: None },
+    )
+    .await
+    .expect("append");
     let mut entries = log.get_session_entries(&session).await.expect("read");
     entries.reverse();
     let cursor_ts = 1_700_000_000_u64;
