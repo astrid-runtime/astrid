@@ -428,6 +428,31 @@ mod tests {
         assert!(store.load().unwrap().is_empty());
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn read_only_legacy_sha256_store_fails_closed_without_rewrite() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pair-tokens.toml");
+        let legacy = "[[pair_token]]\n\
+            token_hash = \"2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824\"\n\
+            principal = \"alice\"\n\
+            expires_at_epoch = 9999999999\n\
+            issued_at_epoch = 1\n";
+        std::fs::write(&path, legacy).unwrap();
+
+        let original = std::fs::metadata(dir.path()).unwrap().permissions();
+        let mut read_only = original.clone();
+        read_only.set_mode(0o500);
+        std::fs::set_permissions(dir.path(), read_only).unwrap();
+        let loaded = PairTokenStore::new(path.clone()).load();
+        std::fs::set_permissions(dir.path(), original).unwrap();
+
+        assert!(loaded.is_err());
+        assert_eq!(std::fs::read_to_string(path).unwrap(), legacy);
+    }
+
     #[test]
     fn future_store_is_rejected_without_rewrite() {
         let dir = tempfile::tempdir().unwrap();
