@@ -221,10 +221,11 @@ impl PrincipalProfileCache {
             .or_default();
 
         if entries.iter().any(|e| e.eq_ignore_ascii_case(endpoint)) {
-            // Already persisted for this capsule — idempotent. Drop the stale
-            // cache entry so a reload reflects on-disk state, then return
-            // success.
-            guard.invalidate(principal);
+            // Already persisted for this capsule — idempotent. The profile was
+            // just loaded from disk while holding the cache write lock, so it
+            // is the current system-of-record value and can refresh the cache
+            // directly without a generation bump or another disk read.
+            guard.profiles.insert(principal.clone(), Arc::new(profile));
             return Ok(());
         }
 
@@ -586,9 +587,10 @@ mod tests {
         cache
             .persist_egress(&p, "react", "10.0.0.5:8080")
             .expect("idempotent persist");
-        assert_eq!(cache.generation_for(&p), persisted_generation + 1);
+        assert_eq!(cache.generation_for(&p), persisted_generation);
+        assert_eq!(cache.len(), 1, "idempotent persist refreshes the cache");
 
-        let profile = cache.resolve(&p).expect("reload");
+        let profile = cache.resolve(&p).expect("resolve refreshed profile");
         assert_eq!(
             profile.network.capsule_egress.get("react"),
             Some(&vec!["10.0.0.5:8080".to_string()]),
