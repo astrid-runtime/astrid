@@ -312,6 +312,41 @@ async fn admin_router_denies_missing_and_invalid_principals_deterministically() 
         assert_eq!(response["status"], "Error");
         assert_eq!(response["data"], super::super::MANAGEMENT_CALLER_REQUIRED);
     }
+
+    let entries = kernel
+        .audit_log
+        .get_session_entries(&kernel.session_id)
+        .await
+        .expect("read audit chain");
+    let denials = entries
+        .iter()
+        .filter(|entry| {
+            entry.principal.as_ref() == Some(&PrincipalId::anonymous())
+                && matches!(
+                    &entry.action,
+                    AuditAction::AdminRequest { method, .. }
+                        if method == "admin.agent.list"
+                )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        denials.len(),
+        2,
+        "missing and malformed callers must each produce one terminal audit row"
+    );
+    for (entry, expected_reason) in denials
+        .iter()
+        .zip(["missing principal", "invalid principal"])
+    {
+        let AuthorizationProof::Denied { reason } = &entry.authorization else {
+            panic!("caller-boundary denial must carry a denied authorization proof");
+        };
+        assert!(reason.contains(expected_reason), "got: {reason}");
+        let AuditOutcome::Failure { error } = &entry.outcome else {
+            panic!("caller-boundary denial must carry a failure outcome");
+        };
+        assert!(error.contains(expected_reason), "got: {error}");
+    }
 }
 
 // ── Per-device scope attenuation at the cap-gate ────────────────────

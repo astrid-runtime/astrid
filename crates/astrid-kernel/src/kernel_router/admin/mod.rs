@@ -62,6 +62,7 @@ use astrid_events::kernel_api::{
 };
 use tracing::warn;
 
+use super::caller::{CallerResolutionError, MANAGEMENT_CALLER_REQUIRED};
 use super::{
     AdminAuditEntry, AuthorityScope, authorize_request, publish_response, record_admin_audit,
     resolve_caller, resolve_device_key_id,
@@ -118,16 +119,19 @@ pub(crate) fn spawn_admin_router(kernel: Arc<crate::Kernel>) -> astrid_runtime::
                                 reason = error.reason(),
                                 "Rejected admin management request without a valid principal"
                             );
-                            publish_response(
-                                &kernel,
-                                admin_response_topic(&message.topic),
-                                AdminKernelResponse::for_request(
-                                    req.request_id,
-                                    AdminResponseBody::Error(
-                                        super::MANAGEMENT_CALLER_REQUIRED.to_string(),
-                                    ),
-                                ),
-                            );
+                            let kernel = Arc::clone(&kernel);
+                            let response_topic = admin_response_topic(&message.topic);
+                            let device_key_id = resolve_device_key_id(message);
+                            astrid_runtime::spawn(async move {
+                                reject_admin_request_without_caller(
+                                    &kernel,
+                                    response_topic,
+                                    device_key_id,
+                                    req,
+                                    error,
+                                )
+                                .await;
+                            });
                             continue;
                         },
                     };
@@ -148,6 +152,47 @@ pub(crate) fn spawn_admin_router(kernel: Arc<crate::Kernel>) -> astrid_runtime::
             }
         }
     })
+}
+
+/// Record and reject an admin request that crossed the IPC boundary without a
+/// valid authenticated principal. The reserved `anonymous` identity preserves
+/// the audit trail without granting the malformed envelope a caller identity.
+async fn reject_admin_request_without_caller(
+    kernel: &Arc<crate::Kernel>,
+    response_topic: Topic,
+    device_key_id: Option<String>,
+    req: AdminKernelRequest,
+    error: CallerResolutionError,
+) {
+    let caller = PrincipalId::anonymous();
+    let method = admin_request_method(&req.kind);
+    let required_cap =
+        required_capability_for_admin_request(&req.kind, resolve_admin_scope(&req.kind, &caller));
+    let reason = format!("{MANAGEMENT_CALLER_REQUIRED}: {}", error.reason());
+    record_admin_audit(
+        kernel,
+        AdminAuditEntry {
+            caller: &caller,
+            method,
+            required_cap,
+            device_key_id: device_key_id.as_deref(),
+            target_principal: admin_target_principal(&req.kind).cloned(),
+            params: sanitize_admin_audit_params(&req.kind),
+            authorization: AuthorizationProof::Denied {
+                reason: reason.clone(),
+            },
+            outcome: AuditOutcome::failure(reason),
+        },
+    )
+    .await;
+    publish_response(
+        kernel,
+        response_topic,
+        AdminKernelResponse::for_request(
+            req.request_id,
+            AdminResponseBody::Error(MANAGEMENT_CALLER_REQUIRED.to_string()),
+        ),
+    );
 }
 
 /// Compute the response topic for an incoming admin request topic.
