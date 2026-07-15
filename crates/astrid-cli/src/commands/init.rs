@@ -786,6 +786,7 @@ async fn install_capsules(
     Ok(locked)
 }
 
+#[derive(Debug)]
 struct VerifiedBatchInstall {
     version: String,
     wasm_hash: Option<String>,

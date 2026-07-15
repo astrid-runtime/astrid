@@ -306,9 +306,10 @@ fn parse_locked_blake3(capsule: &CapsuleId, value: &str) -> anyhow::Result<blake
 }
 
 fn manifest_declares_wasm(manifest: &CapsuleManifest) -> bool {
-    manifest.components.first().is_some_and(|component| {
-        component.path.extension().and_then(|ext| ext.to_str()) == Some("wasm")
-    })
+    manifest
+        .components
+        .iter()
+        .any(|component| component.path.extension().and_then(|ext| ext.to_str()) == Some("wasm"))
 }
 
 #[cfg(unix)]
@@ -434,6 +435,8 @@ async fn grant_installed_capsules(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::commands::capsule::{install, meta};
+    use crate::commands::init::LockedCapsule;
 
     /// (c) The flag is only meaningful with a distro to resolve the grant
     /// set: setting it without a distro source is a hard error.
@@ -570,9 +573,7 @@ mod tests {
         let target = PrincipalId::new("alice").unwrap();
         let wasm = b"real wasm bytes";
         let hash = blake3::hash(wasm).to_hex().to_string();
-        let install_dir =
-            super::super::capsule::install::resolve_target_dir_for(&home, &target, "cli", false)
-                .unwrap();
+        let install_dir = install::resolve_target_dir_for(&home, &target, "cli", false).unwrap();
         std::fs::create_dir_all(&install_dir).unwrap();
         std::fs::write(
             install_dir.join("Capsule.toml"),
@@ -581,13 +582,13 @@ mod tests {
         .unwrap();
         std::fs::create_dir_all(home.bin_dir()).unwrap();
         std::fs::write(home.bin_dir().join(format!("{hash}.wasm")), wasm).unwrap();
-        let meta = super::super::capsule::meta::CapsuleMeta {
+        let meta = meta::CapsuleMeta {
             version: "1.0.0".to_string(),
             wasm_hash: Some(hash.clone()),
             ..Default::default()
         };
-        super::super::capsule::meta::write_meta(&install_dir, &meta).unwrap();
-        let locked = vec![super::LockedCapsule {
+        meta::write_meta(&install_dir, &meta).unwrap();
+        let locked = vec![LockedCapsule {
             name: "cli".to_string(),
             version: "1.0.0".to_string(),
             source: "@example/cli".to_string(),
@@ -600,12 +601,12 @@ mod tests {
             vec!["cli"]
         );
 
-        let mismatched = super::super::capsule::meta::CapsuleMeta {
+        let mismatched = meta::CapsuleMeta {
             version: "2.0.0".to_string(),
             wasm_hash: Some(hash),
             ..Default::default()
         };
-        super::super::capsule::meta::write_meta(&install_dir, &mismatched).unwrap();
+        meta::write_meta(&install_dir, &mismatched).unwrap();
         let err = validate_locked_capsules(&home, &target, &locked).unwrap_err();
         assert!(err.to_string().contains("disagrees between Capsule.toml"));
     }
@@ -615,9 +616,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let home = AstridHome::from_path(dir.path());
         let target = PrincipalId::new("alice").unwrap();
-        let install_dir =
-            super::super::capsule::install::resolve_target_dir_for(&home, &target, "cli", false)
-                .unwrap();
+        let install_dir = install::resolve_target_dir_for(&home, &target, "cli", false).unwrap();
         std::fs::create_dir_all(&install_dir).unwrap();
         std::fs::write(
             install_dir.join("Capsule.toml"),
@@ -625,9 +624,9 @@ mod tests {
         )
         .unwrap();
         let hash = blake3::hash(b"original").to_hex().to_string();
-        super::super::capsule::meta::write_meta(
+        meta::write_meta(
             &install_dir,
-            &super::super::capsule::meta::CapsuleMeta {
+            &meta::CapsuleMeta {
                 version: "1.0.0".to_string(),
                 wasm_hash: Some(hash.clone()),
                 ..Default::default()
@@ -637,7 +636,7 @@ mod tests {
         std::fs::create_dir_all(home.bin_dir()).unwrap();
         let blob = home.bin_dir().join(format!("{hash}.wasm"));
         std::fs::write(&blob, b"tampered").unwrap();
-        let locked = vec![super::LockedCapsule {
+        let locked = vec![LockedCapsule {
             name: "cli".to_string(),
             version: "1.0.0".to_string(),
             source: "@example/cli".to_string(),
@@ -657,9 +656,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let home = AstridHome::from_path(dir.path());
         let target = PrincipalId::new("alice").unwrap();
-        let install_dir =
-            super::super::capsule::install::resolve_target_dir_for(&home, &target, "mcp", false)
-                .unwrap();
+        let install_dir = install::resolve_target_dir_for(&home, &target, "mcp", false).unwrap();
         std::fs::create_dir_all(&install_dir).unwrap();
         let manifest_path = install_dir.join("Capsule.toml");
         std::fs::write(
@@ -667,16 +664,16 @@ mod tests {
             "[package]\nname = \"mcp\"\nversion = \"1.0.0\"\n",
         )
         .unwrap();
-        super::super::capsule::meta::write_meta(
+        meta::write_meta(
             &install_dir,
-            &super::super::capsule::meta::CapsuleMeta {
+            &meta::CapsuleMeta {
                 version: "1.0.0".to_string(),
                 wasm_hash: None,
                 ..Default::default()
             },
         )
         .unwrap();
-        let locked = vec![super::LockedCapsule {
+        let locked = vec![LockedCapsule {
             name: "mcp".to_string(),
             version: "1.0.0".to_string(),
             source: "@example/mcp".to_string(),
@@ -689,9 +686,9 @@ mod tests {
         );
 
         let stray_hash = blake3::hash(b"stray").to_hex().to_string();
-        super::super::capsule::meta::write_meta(
+        meta::write_meta(
             &install_dir,
-            &super::super::capsule::meta::CapsuleMeta {
+            &meta::CapsuleMeta {
                 version: "1.0.0".to_string(),
                 wasm_hash: Some(stray_hash.clone()),
                 ..Default::default()
@@ -703,9 +700,9 @@ mod tests {
         let err = validate_locked_capsules(&home, &target, &hashed_non_wasm).unwrap_err();
         assert!(err.to_string().contains("does not declare WASM"));
 
-        super::super::capsule::meta::write_meta(
+        meta::write_meta(
             &install_dir,
-            &super::super::capsule::meta::CapsuleMeta {
+            &meta::CapsuleMeta {
                 version: "1.0.0".to_string(),
                 wasm_hash: None,
                 ..Default::default()
@@ -715,7 +712,7 @@ mod tests {
 
         std::fs::write(
             manifest_path,
-            "[package]\nname = \"mcp\"\nversion = \"1.0.0\"\n\n[[component]]\nfile = \"mcp.wasm\"\n",
+            "[package]\nname = \"mcp\"\nversion = \"1.0.0\"\n\n[[component]]\nfile = \"helper.js\"\n\n[[component]]\nfile = \"mcp.wasm\"\n",
         )
         .unwrap();
         let err = validate_locked_capsules(&home, &target, &locked).unwrap_err();
