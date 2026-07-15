@@ -237,11 +237,10 @@ impl ServerConfig {
         let Some(expected) = &self.binary_hash else {
             return Ok(()); // No hash configured, skip verification
         };
-        let expected_hash = parse_binary_content_hash(expected)?;
-
         let Some(command) = &self.command else {
             return Ok(()); // No command to verify
         };
+        let expected_hash = parse_binary_content_hash(expected)?;
 
         // Find the binary path
         let binary_path = which::which(command)
@@ -492,6 +491,16 @@ mod tests {
             ))
             .is_err()
         );
+    }
+
+    #[test]
+    fn binary_hash_is_ignored_when_there_is_no_local_command() {
+        let config = ServerConfig::sse("remote", "https://example.com/mcp")
+            .with_hash("sha256:legacy-irrelevant-value");
+
+        config
+            .verify_binary()
+            .expect("an SSE server has no local binary to verify");
     }
 
     #[test]
