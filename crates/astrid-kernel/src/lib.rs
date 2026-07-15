@@ -41,6 +41,8 @@ pub mod invite;
 pub mod kernel_router;
 /// Persistent pair-device token store (issue #756).
 pub mod pair_token;
+#[cfg(all(test, not(all(target_arch = "wasm32", target_os = "unknown"))))]
+mod runtime_policy_tests;
 /// The Unix Domain Socket manager. Unix-only: binds the `UnixListener` and
 /// acquires the singleton advisory lock.
 #[cfg(unix)]
@@ -1323,6 +1325,47 @@ impl Kernel {
                 astrid_capsule::readiness::agent_loop_readiness(&manifests)
             })
         })
+    }
+
+    /// Evaluate one capability against the current principal and device policy.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn runtime_capability_allows(
+        &self,
+        principal: &PrincipalId,
+        device_key_id: Option<&str>,
+        capability: &str,
+    ) -> bool {
+        let Ok(profile) = self.profile_cache.resolve(principal) else {
+            return false;
+        };
+        if !profile.enabled {
+            return false;
+        }
+
+        let device_scope = match device_key_id {
+            Some(key_id) => {
+                let Ok(key_id) = astrid_core::profile::DeviceKeyId::new(key_id) else {
+                    return false;
+                };
+                let Some(device) = profile.auth.device_by_typed_key_id(&key_id) else {
+                    return false;
+                };
+                Some(&device.scope)
+            },
+            None => None,
+        };
+
+        let groups = self.groups.load_full();
+        let mut check = astrid_capabilities::CapabilityCheck::new_borrowed(
+            profile.as_ref(),
+            groups.as_ref(),
+            principal,
+        );
+        if let Some(scope) = device_scope {
+            check = check.with_device_scope(scope);
+        }
+        check.has(capability)
     }
 
     /// In-process probe for "does a loaded capsule subscribe to this topic",

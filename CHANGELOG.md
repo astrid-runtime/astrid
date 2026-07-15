@@ -87,6 +87,10 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
 
 ### Fixed
 
+- **Invite commands accept every token the runtime can issue.** `invite redeem`
+  and `invite revoke` now treat a leading hyphen in an opaque base64url token as
+  token data instead of misparsing it as an unknown option.
+
 - **Security Audit now uses a reproducible cargo-audit installation.** CI installs
   cargo-audit 0.22.2 with its published lockfile before invoking the pinned RustSec
   action, keeping the advisory scan compatible with the repository toolchain.
@@ -140,6 +144,16 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
   identities fail closed. `capsule:list` controls global describe visibility,
   while exact `capsule:access:any` controls unrestricted execution. Closes
   #1239.
+- **Audit views now use the live kernel authority evaluator.** Historical and
+  streaming firehose access carries the authenticated device scope; revoked,
+  disabled, malformed, unknown, or narrowed credentials fall back to the
+  caller's own records. Historical continuation cursors bind the immutable
+  audit-entry identity and visibility scope, preventing same-second appends
+  from shifting the page boundary and rejecting unsafe widening. Co-located
+  callers that need firehose visibility must now pass the kernel evaluator via
+  `astrid_gateway::run_with_capability_probe(...)` or
+  `routes::build_with_capability_probe(...)`; the legacy default runner and
+  router remain self-only. Closes #1241.
 
 - **Device attenuation now applies to every kernel authority view.** Capsule,
   agent, and group inventory checks use the authenticating device scope, and a

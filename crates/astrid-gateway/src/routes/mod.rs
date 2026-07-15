@@ -7,8 +7,8 @@
 
 use std::sync::Arc;
 
-use axum::Router;
 use axum::routing::{delete, get, patch, post, put};
+use axum::{Extension, Router};
 
 use astrid_uplink::KernelClientError;
 
@@ -55,13 +55,42 @@ pub mod sessions;
 pub mod stream;
 pub mod system;
 
-/// Build the gateway's HTTP router.
+/// Build the gateway's HTTP router with self-only audit visibility.
+///
+/// This builder installs a deny-all capability evaluator. Runtimes that need
+/// live `audit:read_all` policy must use [`build_with_capability_probe`], which
+/// also documents the required connect-info serving path for the unauthenticated
+/// redeem routes' per-IP throttling.
 // A flat list of route registrations: its length tracks the API surface,
 // not branching complexity, and both the readiness and models surfaces add
 // rows here. Splitting it into sub-routers would obscure the single
 // public/authed grouping for no readability gain.
-#[allow(clippy::too_many_lines)]
 pub fn build(state: Arc<GatewayState>) -> Router {
+    build_with_probe(state, events::CapabilityProbe::deny_all())
+}
+
+/// Build the gateway's HTTP router with an in-process capability evaluator.
+///
+/// Co-located runtimes can use this to preserve live audit firehose policy
+/// when they embed the router directly instead of calling
+/// [`crate::run_with_capability_probe`].
+///
+/// When serving this router over a real socket, use
+/// `router.into_make_service_with_connect_info::<std::net::SocketAddr>()`
+/// rather than plain `axum::serve(listener, router)`. The unauthenticated
+/// redeem routes require the peer address for per-IP throttling.
+pub fn build_with_capability_probe<F>(state: Arc<GatewayState>, capability_probe: F) -> Router
+where
+    F: Fn(&astrid_core::PrincipalId, Option<&str>, &str) -> bool + Send + Sync + 'static,
+{
+    build_with_probe(state, events::CapabilityProbe::new(capability_probe))
+}
+
+#[allow(clippy::too_many_lines)]
+pub(crate) fn build_with_probe(
+    state: Arc<GatewayState>,
+    capability_probe: events::CapabilityProbe,
+) -> Router {
     // Unauthenticated routes — discovery + redeem + ops probes.
     let public = Router::new()
         .route("/api/distribution", get(distribution::get_distribution))
@@ -90,6 +119,7 @@ pub fn build(state: Arc<GatewayState>) -> Router {
     let authed = build_authed_router(&state);
 
     let combined = public.merge(authed)
+        .layer(Extension(capability_probe))
         // Count every request after it routes — axum's `MatchedPath`
         // extractor gives the registered template (e.g.
         // `/api/sys/principals/:id`) so the metric stays bounded

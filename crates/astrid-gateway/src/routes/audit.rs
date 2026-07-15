@@ -38,6 +38,11 @@ const DEFAULT_LIMIT: usize = 100;
 /// paginate; the cap exists so a malicious bearer can't request a
 /// 10-million-entry page and OOM the gateway.
 const MAX_LIMIT: usize = 1000;
+const CURSOR_SCOPE_ALL: &str = "all";
+const CURSOR_SCOPE_PRINCIPAL_PREFIX: char = 'p';
+const CURSOR_SCOPE_CHANGED: &str = "audit visibility widened or changed principal during pagination; restart pagination without a cursor";
+const CURSOR_ANCHOR_MISSING: &str =
+    "audit cursor anchor is no longer available; restart pagination without a cursor";
 
 /// Query parameters for `GET /api/sys/audit`. All optional —
 /// the default behaviour is "the last [`DEFAULT_LIMIT`] entries
@@ -109,6 +114,68 @@ pub struct AuditQueryResponse {
     pub next_cursor: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CursorScope {
+    All,
+    Principal(PrincipalId),
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct AuditCursor {
+    timestamp: Option<u64>,
+    same_second_offset: usize,
+    scope: Option<CursorScope>,
+    anchor_entry_id: Option<uuid::Uuid>,
+}
+
+impl CursorScope {
+    fn encode(&self) -> String {
+        match self {
+            Self::All => CURSOR_SCOPE_ALL.into(),
+            Self::Principal(principal) => format!(
+                "{CURSOR_SCOPE_PRINCIPAL_PREFIX}{}",
+                hex::encode(principal.as_str())
+            ),
+        }
+    }
+
+    fn decode(raw: &str) -> GatewayResult<Self> {
+        if raw == CURSOR_SCOPE_ALL {
+            return Ok(Self::All);
+        }
+        let encoded = raw
+            .strip_prefix(CURSOR_SCOPE_PRINCIPAL_PREFIX)
+            .ok_or_else(|| {
+                GatewayError::BadRequest(
+                    "cursor scope must be \"all\" or \"p<hex-encoded-principal>\"".into(),
+                )
+            })?;
+        let principal = String::from_utf8(hex::decode(encoded).map_err(|_| {
+            GatewayError::BadRequest("cursor scope principal must be valid hex".into())
+        })?)
+        .map_err(|_| GatewayError::BadRequest("cursor scope principal must be UTF-8".into()))?;
+        let principal = PrincipalId::new(&principal)
+            .map_err(|e| GatewayError::BadRequest(format!("invalid cursor principal: {e}")))?;
+        Ok(Self::Principal(principal))
+    }
+
+    fn principal_filter(&self) -> Option<&PrincipalId> {
+        match self {
+            Self::All => None,
+            Self::Principal(principal) => Some(principal),
+        }
+    }
+
+    // A raw-offset cursor may safely continue only when the next page
+    // sees the same principal scope or a narrower one. If visibility
+    // widens (for example self-only → firehose or principal A →
+    // principal B), records skipped above the raw boundary could
+    // become newly visible and would otherwise be lost silently.
+    fn accepts_continuation_from(&self, previous: &Self) -> bool {
+        matches!(previous, Self::All) || previous == self
+    }
+}
+
 /// `GET /api/sys/audit` handler.
 #[utoipa::path(
     get,
@@ -135,6 +202,11 @@ pub async fn get_audit(
     req: Request<axum::body::Body>,
 ) -> GatewayResult<Json<AuditQueryResponse>> {
     let caller = caller_from(&req)?;
+    let capability_probe = req
+        .extensions()
+        .get::<super::events::CapabilityProbe>()
+        .cloned()
+        .unwrap_or_else(super::events::CapabilityProbe::deny_all);
     let caller_principal = caller.principal.clone();
 
     let (audit_log, session_id) = match (state.audit_log.as_ref(), state.session_id.as_ref()) {
@@ -155,17 +227,6 @@ pub async fn get_audit(
         Some(0) | None => DEFAULT_LIMIT,
         Some(l) => l,
     };
-
-    // Cap-gate: admin / `audit:read_all` callers get the firehose;
-    // everyone else is silently scoped to their own principal,
-    // matching the SSE handler's posture.
-    let firehose = super::events::caller_holds(
-        &state,
-        &caller_principal,
-        caller.device_key_id.as_deref(),
-        AUDIT_FIREHOSE_CAP,
-    )
-    .await;
 
     // Pull the full session slice from the audit log. The audit log
     // doesn't expose an "after cursor" query primitive today, so we
@@ -189,10 +250,16 @@ pub async fn get_audit(
     let mut entries: Vec<AuditEntry> = all;
     entries.reverse();
 
-    // Effective principal filter: admins can use the `principal=`
-    // query param; non-admins are pinned to their own principal
-    // regardless of what they ask for.
-    let principal_filter: Option<PrincipalId> = if firehose {
+    // Resolve an explicit filter only under post-read authority. Pagination
+    // applies the current policy to each record, so narrowing takes effect at
+    // the next record boundary.
+    let firehose_at_query_boundary = super::events::caller_holds(
+        &capability_probe,
+        &caller_principal,
+        caller.device_key_id.as_deref(),
+        AUDIT_FIREHOSE_CAP,
+    );
+    let requested_principal: Option<PrincipalId> = if firehose_at_query_boundary {
         match query.principal.as_deref() {
             Some(s) => Some(PrincipalId::new(s).map_err(|e| {
                 GatewayError::BadRequest(format!("invalid `principal` query value: {e}"))
@@ -200,18 +267,24 @@ pub async fn get_audit(
             None => None,
         }
     } else {
-        Some(caller_principal)
+        None
+    };
+    let access = AuditAccess {
+        capability_probe: &capability_probe,
+        caller_principal: &caller_principal,
+        device_key_id: caller.device_key_id.as_deref(),
+        requested_principal: requested_principal.as_ref(),
     };
 
-    // Cursor is `"<ts_epoch>_<offset>"` — `offset` is the number of
-    // entries with the same `ts_epoch` we've already returned from
-    // previous pages. Encoding both means same-second batches
-    // (timer ticks, scripted ops) can't silently lose or duplicate
-    // entries across the page boundary. The plain `"<ts_epoch>"`
-    // shape is still accepted for compatibility with v1 cursors.
-    let cursor = parse_cursor(query.cursor.as_deref())?;
-    let (page, next_cursor) =
-        paginate_page(entries, &query, principal_filter.as_ref(), cursor, limit);
+    // New cursors bind the last visible entry's immutable ID and effective
+    // principal scope. The ID remains stable when another same-second entry is
+    // appended between page requests, while the scope forces a restart when
+    // visibility widens or changes principal. Legacy timestamp-only and raw
+    // same-second offset cursors remain accepted only for the unambiguous
+    // default self view.
+    let mut cursor = parse_cursor(query.cursor.as_deref())?;
+    cursor.scope = validate_cursor_scope(cursor.timestamp, cursor.scope.as_ref(), &query, &access)?;
+    let (page, next_cursor) = paginate_page(entries, &query, &access, cursor, limit)?;
 
     Ok(Json(AuditQueryResponse {
         entries: page,
@@ -219,24 +292,115 @@ pub async fn get_audit(
     }))
 }
 
+struct AuditAccess<'a> {
+    capability_probe: &'a super::events::CapabilityProbe,
+    caller_principal: &'a PrincipalId,
+    device_key_id: Option<&'a str>,
+    requested_principal: Option<&'a PrincipalId>,
+}
+
+impl AuditAccess<'_> {
+    fn current_principal_filter(&self) -> Option<&PrincipalId> {
+        if super::events::caller_holds(
+            self.capability_probe,
+            self.caller_principal,
+            self.device_key_id,
+            AUDIT_FIREHOSE_CAP,
+        ) {
+            self.requested_principal
+        } else {
+            Some(self.caller_principal)
+        }
+    }
+
+    fn current_cursor_scope(&self) -> CursorScope {
+        match self.current_principal_filter() {
+            Some(principal) => CursorScope::Principal(principal.clone()),
+            None => CursorScope::All,
+        }
+    }
+}
+
+fn validate_cursor_scope(
+    cursor_ts: Option<u64>,
+    cursor_scope: Option<&CursorScope>,
+    query: &AuditQuery,
+    access: &AuditAccess<'_>,
+) -> GatewayResult<Option<CursorScope>> {
+    let current_scope = access.current_cursor_scope();
+    match cursor_scope {
+        Some(previous_scope) => {
+            validate_scope_continuation(previous_scope, &current_scope)?;
+            Ok(Some(previous_scope.clone()))
+        },
+        None if cursor_ts.is_some() => {
+            validate_legacy_cursor_scope(query, access, &current_scope)?;
+            Ok(Some(current_scope))
+        },
+        None => Ok(None),
+    }
+}
+
+fn validate_legacy_cursor_scope(
+    query: &AuditQuery,
+    access: &AuditAccess<'_>,
+    current_scope: &CursorScope,
+) -> GatewayResult<()> {
+    match current_scope {
+        CursorScope::Principal(principal)
+            if query.principal.is_none() && principal == access.caller_principal =>
+        {
+            Ok(())
+        },
+        _ => Err(GatewayError::BadRequest(CURSOR_SCOPE_CHANGED.into())),
+    }
+}
+
+fn validate_scope_continuation(
+    previous_scope: &CursorScope,
+    current_scope: &CursorScope,
+) -> GatewayResult<()> {
+    if current_scope.accepts_continuation_from(previous_scope) {
+        Ok(())
+    } else {
+        Err(GatewayError::BadRequest(CURSOR_SCOPE_CHANGED.into()))
+    }
+}
+
 /// Walk the entries (newest first) and assemble one page worth of
-/// rendered views, honouring every filter + the cursor offset.
-/// Returns the page plus the next-page cursor (or `None` if the
-/// result is the last page). Pulled out of [`get_audit`] so the
-/// handler stays inside the function-length budget and the cursor
-/// arithmetic lives in one place.
+/// rendered views, honouring every stable filter plus the live
+/// principal restriction. Returns the page plus the next-page cursor
+/// (or `None` if the result is the last page), and rejects a live
+/// scope widening that would invalidate the raw cursor boundary. Pulled out of
+/// [`get_audit`] so the handler stays inside the function-length
+/// budget and the cursor arithmetic lives in one place.
 fn paginate_page(
     entries: Vec<AuditEntry>,
     query: &AuditQuery,
-    principal_filter: Option<&PrincipalId>,
-    cursor: (Option<u64>, usize),
+    access: &AuditAccess<'_>,
+    cursor: AuditCursor,
     limit: usize,
-) -> (Vec<AuditEntryView>, Option<String>) {
-    let (cursor_ts, cursor_offset) = cursor;
+) -> GatewayResult<(Vec<AuditEntryView>, Option<String>)> {
+    let AuditCursor {
+        timestamp: cursor_ts,
+        same_second_offset: cursor_offset,
+        scope: cursor_scope,
+        anchor_entry_id,
+    } = cursor;
     let mut page: Vec<AuditEntryView> = Vec::with_capacity(limit);
-    let mut equal_ts_skipped: usize = 0;
-    let mut equal_ts_count_in_page: usize = 0;
-    let mut last_ts: Option<u64> = None;
+    let mut raw_last_ts: Option<u64> = None;
+    let mut raw_ts_position: usize = 0;
+    let mut last_visible_ts: Option<u64> = None;
+    let mut last_visible_ts_position: usize = 0;
+    let mut last_visible_scope: Option<CursorScope> = None;
+    let mut last_visible_entry_id: Option<uuid::Uuid> = None;
+    let mut effective_scope = access.current_cursor_scope();
+    let mut anchor_found = anchor_entry_id.is_none();
+    let mut has_more = false;
+    let mut skipped_by_scope_before_limit = false;
+    if let Some(cursor_scope) = cursor_scope.as_ref() {
+        validate_scope_continuation(cursor_scope, &effective_scope)?;
+    }
     for entry in entries {
         let Some(view) = render_entry(&entry) else {
             continue;
@@ -257,74 +421,126 @@ fn paginate_page(
         {
             continue;
         }
-        if let Some(p) = principal_filter
-            && view.principal.as_deref() != Some(p.as_str())
-        {
+
+        raw_ts_position = match raw_last_ts {
+            Some(t) if t == view.ts_epoch => raw_ts_position.saturating_add(1),
+            _ => 1,
+        };
+        raw_last_ts = Some(view.ts_epoch);
+
+        let current_scope = access.current_cursor_scope();
+        validate_scope_continuation(&effective_scope, &current_scope)?;
+        effective_scope = current_scope;
+
+        // Identity-anchored cursors skip through the exact entry returned at
+        // the prior page boundary. Legacy cursors retain timestamp/offset
+        // positioning for compatibility.
+        if !anchor_found {
+            if anchor_entry_id.as_ref() == Some(&entry.id.0) {
+                anchor_found = true;
+            }
             continue;
         }
-
-        // Cursor positioning: drop everything strictly newer than
-        // the cursor's `ts`, then skip the first `cursor_offset`
-        // entries that share `ts` (those were on the prior page).
-        if let Some(c_ts) = cursor_ts {
+        if anchor_entry_id.is_none()
+            && let Some(c_ts) = cursor_ts
+        {
             if view.ts_epoch > c_ts {
                 continue;
             }
-            if view.ts_epoch == c_ts && equal_ts_skipped < cursor_offset {
-                equal_ts_skipped = equal_ts_skipped.saturating_add(1);
+            if view.ts_epoch == c_ts && raw_ts_position <= cursor_offset {
                 continue;
             }
         }
 
-        equal_ts_count_in_page = match last_ts {
-            Some(t) if t == view.ts_epoch => equal_ts_count_in_page.saturating_add(1),
-            _ => 1,
-        };
-        last_ts = Some(view.ts_epoch);
-        page.push(view);
         if page.len() >= limit {
+            has_more = true;
             break;
         }
+
+        if let Some(p) = effective_scope.principal_filter()
+            && view.principal.as_deref() != Some(p.as_str())
+        {
+            skipped_by_scope_before_limit = true;
+            continue;
+        }
+
+        last_visible_ts = Some(view.ts_epoch);
+        last_visible_ts_position = raw_ts_position;
+        last_visible_scope = Some(effective_scope.clone());
+        last_visible_entry_id = Some(entry.id.0);
+        page.push(view);
     }
 
-    let next_cursor = if page.len() == limit {
-        last_ts.map(|t| {
-            let offset = if cursor_ts == Some(t) {
-                cursor_offset.saturating_add(equal_ts_count_in_page)
-            } else {
-                equal_ts_count_in_page
-            };
-            format!("{t}_{offset}")
-        })
+    if !anchor_found {
+        return Err(GatewayError::BadRequest(CURSOR_ANCHOR_MISSING.into()));
+    }
+
+    let next_cursor = if page.len() == limit && (has_more || skipped_by_scope_before_limit) {
+        last_visible_ts
+            .zip(last_visible_scope)
+            .zip(last_visible_entry_id)
+            .map(|((t, scope), entry_id)| {
+                format!(
+                    "{t}_{last_visible_ts_position}_{}_{entry_id}",
+                    scope.encode()
+                )
+            })
     } else {
         None
     };
 
-    (page, next_cursor)
+    Ok((page, next_cursor))
 }
 
-/// Parse an opaque cursor into `(ts_epoch, equal_ts_offset)`.
-/// Supports both the v2 shape (`"<ts>_<offset>"`) and the legacy
-/// v1 plain-`"<ts>"` shape so dashboards holding a v1 cursor across
-/// the upgrade don't fail their next paginated fetch.
-fn parse_cursor(cursor: Option<&str>) -> GatewayResult<(Option<u64>, usize)> {
+/// Parse an opaque cursor. New cursors carry a visibility scope and immutable
+/// audit-entry anchor. Legacy timestamp/offset cursors remain accepted only for
+/// the caller's effective self scope because they cannot safely resume a
+/// broader scope.
+fn parse_cursor(cursor: Option<&str>) -> GatewayResult<AuditCursor> {
     let Some(raw) = cursor else {
-        return Ok((None, 0));
+        return Ok(AuditCursor::default());
     };
-    if let Some((ts_str, off_str)) = raw.split_once('_') {
-        let ts = ts_str
-            .parse::<u64>()
-            .map_err(|_| GatewayError::BadRequest("cursor timestamp must be an integer".into()))?;
-        let off = off_str.parse::<usize>().map_err(|_| {
-            GatewayError::BadRequest("cursor offset must be a non-negative integer".into())
-        })?;
-        Ok((Some(ts), off))
-    } else {
+    let mut parts = raw.split('_');
+    let ts_str = parts.next().unwrap_or_default();
+    let Some(off_str) = parts.next() else {
         let ts = raw.parse::<u64>().map_err(|_| {
             GatewayError::BadRequest("cursor must be \"<ts>\" or \"<ts>_<offset>\"".into())
         })?;
-        Ok((Some(ts), 0))
+        return Ok(AuditCursor {
+            timestamp: Some(ts),
+            ..AuditCursor::default()
+        });
+    };
+    let ts = ts_str
+        .parse::<u64>()
+        .map_err(|_| GatewayError::BadRequest("cursor timestamp must be an integer".into()))?;
+    let off = off_str.parse::<usize>().map_err(|_| {
+        GatewayError::BadRequest("cursor offset must be a non-negative integer".into())
+    })?;
+    let Some(scope_str) = parts.next() else {
+        return Ok(AuditCursor {
+            timestamp: Some(ts),
+            same_second_offset: off,
+            ..AuditCursor::default()
+        });
+    };
+    let entry_id_str = parts.next().ok_or_else(|| {
+        GatewayError::BadRequest("scoped audit cursor must include an entry ID".into())
+    })?;
+    if parts.next().is_some() {
+        return Err(GatewayError::BadRequest(
+            "audit cursor contains too many fields".into(),
+        ));
     }
+    let scope = CursorScope::decode(scope_str)?;
+    let anchor_entry_id = uuid::Uuid::parse_str(entry_id_str)
+        .map_err(|_| GatewayError::BadRequest("audit cursor entry ID must be a UUID".into()))?;
+    Ok(AuditCursor {
+        timestamp: Some(ts),
+        same_second_offset: off,
+        scope: Some(scope),
+        anchor_entry_id: Some(anchor_entry_id),
+    })
 }
 
 /// Map an `AuditEntry` into the flat JSON shape we ship over the
@@ -360,99 +576,4 @@ fn render_entry(entry: &AuditEntry) -> Option<AuditEntryView> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    use astrid_audit::{AuditLog, AuthorizationProof};
-    use astrid_core::SessionId;
-    use astrid_crypto::KeyPair;
-
-    fn admin_action(method: &str, target: Option<&str>) -> AuditAction {
-        AuditAction::AdminRequest {
-            method: method.into(),
-            required_capability: "*".into(),
-            target_principal: target.map(|s| PrincipalId::new(s).unwrap()),
-            params: None,
-            device_key_id: None,
-        }
-    }
-
-    #[tokio::test]
-    async fn render_drops_non_admin_actions() {
-        // Non-admin entries (MCP tool calls, capsule events) belong
-        // to a different audit feed; they must not surface in the
-        // historical-admin view.
-        let log = AuditLog::in_memory(KeyPair::generate());
-        let session = SessionId::from_uuid(uuid::Uuid::nil());
-        log.append(
-            session.clone(),
-            AuditAction::McpToolCall {
-                server: "x".into(),
-                tool: "y".into(),
-                args_hash: astrid_crypto::ContentHash::from_bytes([0u8; 32]),
-            },
-            AuthorizationProof::System {
-                reason: "test".into(),
-            },
-            AuditOutcome::Success { details: None },
-        )
-        .await
-        .expect("append");
-        let entries = log.get_session_entries(&session).await.expect("read");
-        assert_eq!(entries.len(), 1);
-        assert!(
-            render_entry(&entries[0]).is_none(),
-            "McpToolCall must not render into the admin-history view"
-        );
-    }
-
-    #[tokio::test]
-    async fn render_admin_request_round_trips() {
-        let log = AuditLog::in_memory(KeyPair::generate());
-        let session = SessionId::from_uuid(uuid::Uuid::nil());
-        log.append_with_principal(
-            session.clone(),
-            PrincipalId::new("admin").unwrap(),
-            admin_action("AgentDelete", Some("alice")),
-            AuthorizationProof::System {
-                reason: "test".into(),
-            },
-            AuditOutcome::Success { details: None },
-        )
-        .await
-        .expect("append");
-        let entries = log.get_session_entries(&session).await.expect("read");
-        let view = render_entry(&entries[0]).expect("admin entry must render");
-        assert_eq!(view.method.as_deref(), Some("AgentDelete"));
-        assert_eq!(view.principal.as_deref(), Some("admin"));
-        assert_eq!(view.target_principal.as_deref(), Some("alice"));
-        assert_eq!(view.outcome, "success");
-    }
-
-    #[test]
-    fn parse_cursor_handles_v1_and_v2_shapes() {
-        // v1 (legacy): bare integer, no underscore — offset
-        // defaults to 0. We accept this shape so v0.7.0 cursors
-        // already in flight don't fail the next paginated fetch.
-        let (ts, off) = parse_cursor(Some("1700000000")).expect("bare ts parses");
-        assert_eq!(ts, Some(1_700_000_000));
-        assert_eq!(off, 0);
-
-        // v2: `<ts>_<offset>` — same-second batches resume cleanly
-        // without losing or duplicating entries across the page
-        // boundary.
-        let (ts, off) = parse_cursor(Some("1700000000_3")).expect("v2 cursor parses");
-        assert_eq!(ts, Some(1_700_000_000));
-        assert_eq!(off, 3);
-
-        // None: no cursor → no positioning, start from newest.
-        let (ts, off) = parse_cursor(None).expect("None passes");
-        assert_eq!(ts, None);
-        assert_eq!(off, 0);
-
-        // Garbage rejected with `BadRequest`.
-        assert!(parse_cursor(Some("not-a-number")).is_err());
-        assert!(parse_cursor(Some("123_not-a-number")).is_err());
-        assert!(parse_cursor(Some("not-a-number_4")).is_err());
-    }
-}
+mod tests;

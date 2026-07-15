@@ -71,6 +71,8 @@ pub use state::GatewayState;
 /// router (see [`tls::serve_https`]). The default posture remains
 /// "TLS upstream"; native TLS is an opt-in feature for single-box
 /// installs that don't want to run a reverse proxy.
+/// Audit views remain per-principal; co-located runtimes can use
+/// [`run_with_capability_probe`] to enable exact firehose policy.
 ///
 /// # Errors
 /// Returns an error if the listener cannot bind, the rustls config
@@ -79,6 +81,65 @@ pub use state::GatewayState;
 pub async fn run(
     state: Arc<GatewayState>,
     shutdown: impl Future<Output = ()> + Send + 'static,
+) -> Result<()> {
+    run_inner(state, shutdown, routes::events::CapabilityProbe::deny_all()).await
+}
+
+/// Run the gateway with a borrowed in-process capability evaluator.
+///
+/// # Errors
+/// Returns the same startup and server errors as [`run`].
+pub async fn run_with_capability_probe<F>(
+    state: Arc<GatewayState>,
+    shutdown: impl Future<Output = ()> + Send + 'static,
+    capability_probe: F,
+) -> Result<()>
+where
+    F: Fn(&astrid_core::PrincipalId, Option<&str>, &str) -> bool + Send + Sync + 'static,
+{
+    run_inner(
+        state,
+        shutdown,
+        routes::events::CapabilityProbe::new(capability_probe),
+    )
+    .await
+}
+
+/// Run the gateway on an already-bound plain-HTTP listener.
+///
+/// # Errors
+/// Returns an error when native TLS is configured, the listener address is
+/// unavailable, or the HTTP server fails.
+#[doc(hidden)]
+pub async fn run_with_capability_probe_on_listener<F>(
+    state: Arc<GatewayState>,
+    listener: TcpListener,
+    shutdown: impl Future<Output = ()> + Send + 'static,
+    capability_probe: F,
+) -> Result<()>
+where
+    F: Fn(&astrid_core::PrincipalId, Option<&str>, &str) -> bool + Send + Sync + 'static,
+{
+    if state.config.tls.is_some() {
+        anyhow::bail!("an already-bound plain-HTTP listener cannot serve native TLS");
+    }
+    let addr = listener
+        .local_addr()
+        .context("failed to read pre-bound gateway listener address")?;
+    warn_if_plaintext_non_loopback(addr);
+    serve_http_listener(
+        state,
+        listener,
+        shutdown,
+        routes::events::CapabilityProbe::new(capability_probe),
+    )
+    .await
+}
+
+async fn run_inner(
+    state: Arc<GatewayState>,
+    shutdown: impl Future<Output = ()> + Send + 'static,
+    capability_probe: routes::events::CapabilityProbe,
 ) -> Result<()> {
     let addr: SocketAddr = state.config.listen.parse().with_context(|| {
         format!(
@@ -93,27 +154,36 @@ pub async fn run(
         // doesn't apply here — axum-server opens its own listener.
         info!(addr = %addr, scheme = "https", "astrid-gateway listening (TLS)");
         let rustls = tls::load_rustls_config(tls_cfg).await?;
-        let router = tls::apply_hsts(routes::build(state));
+        let router = tls::apply_hsts(routes::build_with_probe(state, capability_probe));
         return tls::serve_https(addr, router, rustls, shutdown).await;
     }
 
-    // Plain HTTP path — unchanged behaviour from v0.7.0. Warn loudly
-    // when the operator binds beyond loopback without enabling TLS,
-    // since that's almost always a misconfig: either the gateway is
-    // about to serve unencrypted traffic on the LAN/public, or
-    // there's a reverse proxy upstream that the operator should
-    // confirm is actually fronting plain TCP correctly.
+    warn_if_plaintext_non_loopback(addr);
+
+    let listener = TcpListener::bind(addr)
+        .await
+        .with_context(|| format!("failed to bind gateway listener on {addr}"))?;
+    serve_http_listener(state, listener, shutdown, capability_probe).await
+}
+
+fn warn_if_plaintext_non_loopback(addr: SocketAddr) {
     if !addr.ip().is_loopback() {
         tracing::warn!(
             addr = %addr,
             "gateway is binding a non-loopback address without TLS; ensure a TLS-terminating reverse proxy fronts this listener, or enable [tls] in gateway-http.toml"
         );
     }
+}
 
-    let listener = TcpListener::bind(addr)
-        .await
-        .with_context(|| format!("failed to bind gateway listener on {addr}"))?;
-    let bound = listener.local_addr().unwrap_or(addr);
+async fn serve_http_listener(
+    state: Arc<GatewayState>,
+    listener: TcpListener,
+    shutdown: impl Future<Output = ()> + Send + 'static,
+    capability_probe: routes::events::CapabilityProbe,
+) -> Result<()> {
+    let bound = listener
+        .local_addr()
+        .context("failed to read bound gateway listener address")?;
     info!(addr = %bound, scheme = "http", "astrid-gateway listening");
 
     // Spawn the revocation watcher as soon as we know we have a live
@@ -130,7 +200,7 @@ pub async fn run(
         );
     }
 
-    let router = routes::build(state);
+    let router = routes::build_with_probe(state, capability_probe);
     // `into_make_service_with_connect_info::<SocketAddr>()` is what
     // populates the `ConnectInfo<SocketAddr>` request extension that
     // `routes::auth::post_redeem` extracts for per-IP rate limiting.
