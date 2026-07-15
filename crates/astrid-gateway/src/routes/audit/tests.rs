@@ -126,6 +126,7 @@ async fn pagination_narrows_live_without_hiding_the_callers_records() {
     assert!(!methods.contains(&"BobHiddenAfterNarrowing"));
 }
 
+#[allow(clippy::too_many_lines)]
 #[tokio::test]
 async fn pagination_cursor_survives_live_narrowing_with_same_second_batch() {
     let log = AuditLog::in_memory(KeyPair::generate());
