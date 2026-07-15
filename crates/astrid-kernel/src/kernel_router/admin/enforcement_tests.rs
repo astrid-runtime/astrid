@@ -52,13 +52,22 @@ async fn send_admin(
     suffix: &str,
     req: AdminKernelRequest,
 ) -> serde_json::Value {
+    send_admin_with_raw_principal(kernel, Some(caller.as_str()), suffix, req).await
+}
+
+async fn send_admin_with_raw_principal(
+    kernel: &Arc<Kernel>,
+    principal: Option<&str>,
+    suffix: &str,
+    req: AdminKernelRequest,
+) -> serde_json::Value {
     let topic = Topic::admin_request(suffix);
     let response_topic = Topic::admin_response(suffix);
     let mut rx = kernel.event_bus.subscribe_topic(response_topic.as_str());
 
     let payload = serde_json::to_value(&req).expect("serialize admin request");
     let mut msg = IpcMessage::new(topic, IpcPayload::RawJson(payload), kernel.session_id.0);
-    msg.principal = Some(caller.as_str().to_string());
+    msg.principal = principal.map(str::to_string);
     let _ = kernel.event_bus.publish(astrid_events::AstridEvent::Ipc {
         metadata: astrid_events::EventMetadata::new("test"),
         message: msg,
@@ -281,6 +290,63 @@ async fn admin_request_id_echoed_on_deny_path_too() {
     .await;
     assert_eq!(resp["request_id"], "req-deny-correlate");
     assert_eq!(resp["status"], "Error");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn admin_router_denies_missing_and_invalid_principals_deterministically() {
+    let (_dir, kernel) = fixture().await;
+
+    for (suffix, principal) in [
+        ("caller.missing", None),
+        ("caller.invalid", Some("alice@evil.example")),
+    ] {
+        let request_id = format!("req-{suffix}");
+        let response = send_admin_with_raw_principal(
+            &kernel,
+            principal,
+            suffix,
+            AdminKernelRequest::with_request_id(&request_id, AdminRequestKind::AgentList),
+        )
+        .await;
+        assert_eq!(response["request_id"], request_id);
+        assert_eq!(response["status"], "Error");
+        assert_eq!(response["data"], super::super::MANAGEMENT_CALLER_REQUIRED);
+    }
+
+    let entries = kernel
+        .audit_log
+        .get_session_entries(&kernel.session_id)
+        .await
+        .expect("read audit chain");
+    let denials = entries
+        .iter()
+        .filter(|entry| {
+            entry.principal.as_ref() == Some(&PrincipalId::anonymous())
+                && matches!(
+                    &entry.action,
+                    AuditAction::AdminRequest { method, .. }
+                        if method == "admin.agent.list"
+                )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        denials.len(),
+        2,
+        "missing and malformed callers must each produce one terminal audit row"
+    );
+    for (entry, expected_reason) in denials
+        .iter()
+        .zip(["missing principal", "invalid principal"])
+    {
+        let AuthorizationProof::Denied { reason } = &entry.authorization else {
+            panic!("caller-boundary denial must carry a denied authorization proof");
+        };
+        assert!(reason.contains(expected_reason), "got: {reason}");
+        let AuditOutcome::Failure { error } = &entry.outcome else {
+            panic!("caller-boundary denial must carry a failure outcome");
+        };
+        assert!(error.contains(expected_reason), "got: {error}");
+    }
 }
 
 // ── Per-device scope attenuation at the cap-gate ────────────────────

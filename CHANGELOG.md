@@ -120,6 +120,14 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
 
 ### Security
 
+- **Bootstrap authority boundaries now fail closed.** Kernel management requests
+  require a valid principal instead of falling back to the `default` bootstrap
+  administrator, malformed connection lifecycle identities cannot move its
+  counter, bootstrap profile/key and legacy-profile migration failures abort
+  kernel construction, and agent modification cannot remove `default` from the
+  built-in `admin` group. The local CLI retains its intentional active-principal
+  default before requests reach the kernel. Closes #1256.
+
 - **Device attenuation now applies to every kernel authority view.** Capsule,
   agent, and group inventory checks use the authenticating device scope, and a
   scoped pair request containing bare `*` requires effective pair-admin

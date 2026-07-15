@@ -9,7 +9,9 @@ use astrid_events::AstridEvent;
 use astrid_events::EventMetadata;
 use astrid_events::ipc::{IpcMessage, IpcPayload, Topic};
 
-use super::{ConnectionSignal, connection_signal};
+use super::{
+    CallerResolutionError, ConnectionSignal, connection_signal, resolve_connection_principal,
+};
 
 #[test]
 fn typed_connect_payload_opens() {
@@ -93,6 +95,32 @@ fn typed_payload_wins_even_on_an_unrelated_topic() {
     assert_eq!(
         connection_signal("some.other.topic", &IpcPayload::Disconnect { reason: None }),
         Some(ConnectionSignal::Closed { reason: None })
+    );
+}
+
+#[test]
+fn missing_connection_principal_maps_to_anonymous_not_default() {
+    let message = IpcMessage::new(
+        Topic::client_connect(),
+        IpcPayload::Connect,
+        uuid::Uuid::nil(),
+    );
+    let principal = resolve_connection_principal(&message).expect("anonymous identity");
+    assert_eq!(principal, astrid_core::PrincipalId::anonymous());
+    assert_ne!(principal, astrid_core::PrincipalId::default());
+}
+
+#[test]
+fn malformed_connection_principal_is_ignored_not_defaulted() {
+    let message = IpcMessage::new(
+        Topic::client_connect(),
+        IpcPayload::Connect,
+        uuid::Uuid::nil(),
+    )
+    .with_principal("alice@evil.example");
+    assert_eq!(
+        resolve_connection_principal(&message),
+        Err(CallerResolutionError::Invalid)
     );
 }
 
@@ -196,6 +224,41 @@ async fn matched_cycles_balance_to_baseline_for_verified_principal() {
             .iter()
             .all(|(p, _)| *p != principal),
         "the verified principal must hold no residual connection"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn missing_principal_lifecycle_balances_under_anonymous() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = astrid_core::dirs::AstridHome::from_path(dir.path());
+    let kernel = crate::test_kernel_with_home(home).await;
+    drop(super::spawn_connection_tracker(Arc::clone(&kernel)));
+
+    for (topic, expected) in [
+        (Topic::client_connect(), 1),
+        (Topic::client_disconnect(), 0),
+    ] {
+        let message = IpcMessage::new(
+            topic,
+            IpcPayload::RawJson(serde_json::json!({})),
+            uuid::Uuid::nil(),
+        );
+        let _ = kernel.event_bus.publish(AstridEvent::Ipc {
+            metadata: EventMetadata::new("test").with_session_id(uuid::Uuid::nil()),
+            message,
+        });
+        assert!(
+            wait_until(|| kernel.total_connection_count() == expected).await,
+            "anonymous lifecycle count should become {expected}"
+        );
+    }
+
+    assert!(
+        kernel
+            .connections_by_principal()
+            .iter()
+            .all(|(principal, _)| *principal != astrid_core::PrincipalId::default()),
+        "missing lifecycle identity must never touch the bootstrap principal"
     );
 }
 

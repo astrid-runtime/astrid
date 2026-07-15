@@ -3058,9 +3058,11 @@ async fn bootstrap_cli_root_user(
     // Seed the default principal profile with the admin group. Runs
     // before the identity-link short-circuit below so a deleted profile
     // between boots is restored even when the identity record persists.
-    if let Err(e) = seed_default_principal_admin_profile(home) {
-        tracing::warn!(error = %e, "Failed to seed default admin profile — continuing boot");
-    }
+    seed_default_principal_admin_profile(home).map_err(|error| {
+        astrid_storage::IdentityError::Storage(format!(
+            "default admin profile bootstrap failed: {error}"
+        ))
+    })?;
 
     // Check if root user already exists by trying to resolve the CLI link.
     if let Some(_user) = store.resolve("cli", "local").await? {
@@ -3106,7 +3108,7 @@ fn migrate_legacy_profile_path(
         // Operator already migrated, or a prior boot did the rename.
         // Drop the stale legacy file so capsules can no longer reach
         // it via `home://.config/profile.toml`.
-        let _ = std::fs::remove_file(&legacy_path);
+        remove_legacy_profile_file(&legacy_path)?;
         return Ok(());
     }
     if let Some(parent) = new_path.parent() {
@@ -3121,6 +3123,14 @@ fn migrate_legacy_profile_path(
          (security: capsules with home:// fs_read could read the legacy file)"
     );
     Ok(())
+}
+
+fn remove_legacy_profile_file(path: &Path) -> Result<(), std::io::Error> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
 }
 
 /// Idempotently ensure the default principal's profile on disk has the
@@ -3148,9 +3158,7 @@ fn seed_default_principal_admin_profile(
     // Move any legacy file in front of load — load_from_path on the new
     // path would otherwise return Default and clobber the operator's
     // existing groups/grants/revokes.
-    if let Err(e) = migrate_legacy_profile_path(home, &default_principal) {
-        tracing::warn!(error = %e, "Failed to migrate legacy profile path — continuing");
-    }
+    migrate_legacy_profile_path(home, &default_principal)?;
 
     let path = PrincipalProfile::path_for(home, &default_principal);
     let mut profile = PrincipalProfile::load_from_path(&path)?;
@@ -4169,6 +4177,93 @@ mod tests {
         (dir, home)
     }
 
+    fn injected_kernel_resources(home: &astrid_core::dirs::AstridHome) -> KernelResources {
+        home.ensure().expect("ensure test home");
+        let kv: Arc<dyn astrid_storage::KvStore> = Arc::new(astrid_storage::MemoryKvStore::new());
+        let runtime_key = Arc::new(astrid_crypto::KeyPair::generate());
+        let principal_home = home.principal_home(&astrid_core::PrincipalId::default());
+        principal_home.ensure().expect("ensure default home");
+        let audit_log = Arc::new(
+            AuditLog::open(principal_home.audit_dir(), Arc::clone(&runtime_key))
+                .expect("open test audit log"),
+        );
+        KernelResources::new(
+            home.clone(),
+            kv,
+            audit_log,
+            runtime_key,
+            Arc::new(astrid_core::session_token::SessionToken::generate()),
+            home.token_path(),
+            None,
+            None,
+        )
+    }
+
+    async fn boot_with_injected_resources(
+        home: &astrid_core::dirs::AstridHome,
+        resources: KernelResources,
+    ) -> std::io::Result<Arc<Kernel>> {
+        Kernel::with_resources(
+            SessionId::SYSTEM,
+            home.root().to_path_buf(),
+            astrid_capsule_types::CapsuleRuntimeLimits::default(),
+            std::collections::HashMap::new(),
+            astrid_capsule_types::HttpLimits::default(),
+            resources,
+        )
+        .await
+    }
+
+    fn assert_bootstrap_error(error: &std::io::Error) {
+        let message = error.to_string();
+        assert!(
+            message.contains("Failed to bootstrap CLI root user")
+                && message.contains("default admin profile bootstrap failed"),
+            "unexpected boot error: {message}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn with_resources_aborts_when_legacy_profile_migration_fails() {
+        let (_dir, home) = scratch_home();
+        let resources = injected_kernel_resources(&home);
+        let default = astrid_core::PrincipalId::default();
+        let legacy_path = home
+            .principal_home(&default)
+            .config_dir()
+            .join("profile.toml");
+        astrid_core::PrincipalProfile {
+            groups: vec![astrid_core::groups::BUILTIN_ADMIN.to_string()],
+            ..Default::default()
+        }
+        .save_to_path(&legacy_path)
+        .expect("seed legacy profile");
+        std::fs::write(home.profiles_dir(), b"blocks profile directory")
+            .expect("create deterministic migration obstacle");
+
+        let Err(error) = boot_with_injected_resources(&home, resources).await else {
+            panic!("kernel boot must fail when policy migration fails");
+        };
+        assert_bootstrap_error(&error);
+        assert!(
+            legacy_path.exists(),
+            "failed migration must preserve source policy"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn with_resources_aborts_when_default_key_seeding_fails() {
+        let (_dir, home) = scratch_home();
+        let resources = injected_kernel_resources(&home);
+        std::fs::create_dir(home.keys_dir().join("default.key"))
+            .expect("create deterministic key-write obstacle");
+
+        let Err(error) = boot_with_injected_resources(&home, resources).await else {
+            panic!("kernel boot must fail when bootstrap key seeding fails");
+        };
+        assert_bootstrap_error(&error);
+    }
+
     #[test]
     fn seed_admin_writes_fresh_profile_when_missing() {
         let (_d, home) = scratch_home();
@@ -4388,5 +4483,11 @@ mod tests {
         assert!(!legacy_path.exists());
         let result = astrid_core::PrincipalProfile::load_from_path(&new_path).unwrap();
         assert_eq!(result.groups, vec!["canonical".to_string()]);
+    }
+
+    #[test]
+    fn missing_legacy_profile_cleanup_is_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        remove_legacy_profile_file(&dir.path().join("already-removed.toml")).unwrap();
     }
 }

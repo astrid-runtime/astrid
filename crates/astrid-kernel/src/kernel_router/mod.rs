@@ -1,5 +1,6 @@
 /// Admin management API dispatcher (issue #672, Layer 6).
 pub mod admin;
+mod caller;
 mod device_scope;
 /// `KernelRequest::InstallCapsule` handler — delegates to the
 /// `astrid-capsule-install` library so the daemon and the CLI reach
@@ -26,6 +27,9 @@ use astrid_events::ipc::{IpcMessage, IpcPayload, Topic};
 use astrid_events::kernel_api::{KernelRequest, KernelResponse};
 use tracing::{debug, info, warn};
 
+#[cfg(test)]
+use caller::CallerResolutionError;
+use caller::{MANAGEMENT_CALLER_REQUIRED, resolve_caller, resolve_connection_principal};
 use device_scope::resolve_device_scope;
 
 #[cfg(test)]
@@ -76,6 +80,23 @@ pub(crate) fn spawn_kernel_router(kernel: Arc<crate::Kernel>) -> astrid_runtime:
 
             match serde_json::from_value::<KernelRequest>(val.clone()) {
                 Ok(req) => {
+                    let caller = match resolve_caller(message) {
+                        Ok(caller) => caller,
+                        Err(error) => {
+                            warn!(
+                                security_event = true,
+                                topic = %message.topic,
+                                reason = error.reason(),
+                                "Rejected kernel management request without a valid principal"
+                            );
+                            publish_response(
+                                &kernel,
+                                response_topic_for(&message.topic),
+                                KernelResponse::Error(MANAGEMENT_CALLER_REQUIRED.to_string()),
+                            );
+                            continue;
+                        },
+                    };
                     let (method, limit) = rate_limit_for_request(&req);
                     if let Some(max) = limit
                         && !rate_limiter.check(method, max)
@@ -95,7 +116,6 @@ pub(crate) fn spawn_kernel_router(kernel: Arc<crate::Kernel>) -> astrid_runtime:
                         );
                         continue;
                     }
-                    let caller = resolve_caller(message);
                     let device_key_id = resolve_device_key_id(message);
                     handle_request(&kernel, message.topic.clone(), caller, device_key_id, req)
                         .await;
@@ -179,26 +199,34 @@ fn spawn_connection_tracker(kernel: Arc<crate::Kernel>) -> astrid_runtime::JoinH
             let astrid_events::AstridEvent::Ipc { message, .. } = &*event else {
                 continue;
             };
-            // Derive the connecting principal from the IPC message. Today's
-            // CLI socket always sets this to the default principal
-            // (bootstrapped in `bootstrap_cli_root_user`), but as per-agent
-            // socket auth lands (#658) the same plumbing will carry the
-            // real invoking principal.
-            let principal = message
-                .principal
-                .as_deref()
-                .and_then(|p| astrid_core::principal::PrincipalId::new(p).ok())
-                .unwrap_or_default();
-            match connection_signal(&message.topic, &message.payload) {
-                Some(ConnectionSignal::Closed { reason }) => {
+            let Some(signal) = connection_signal(&message.topic, &message.payload) else {
+                continue;
+            };
+            // Lifecycle messages without a principal belong to the explicit
+            // no-authority identity. A malformed principal is not a lifecycle
+            // identity at all, so ignore it rather than crediting the bootstrap
+            // `default` principal with a connection it never authenticated.
+            let principal = match resolve_connection_principal(message) {
+                Ok(principal) => principal,
+                Err(error) => {
+                    warn!(
+                        security_event = true,
+                        topic = %message.topic,
+                        reason = error.reason(),
+                        "Ignored connection lifecycle event with malformed principal"
+                    );
+                    continue;
+                },
+            };
+            match signal {
+                ConnectionSignal::Closed { reason } => {
                     kernel.connection_closed(&principal);
                     debug!(%principal, topic = %message.topic, ?reason, "Client disconnected");
                 },
-                Some(ConnectionSignal::Opened) => {
+                ConnectionSignal::Opened => {
                     kernel.connection_opened(&principal);
                     debug!(%principal, topic = %message.topic, "New client connection accepted");
                 },
-                None => {},
             }
         }
     })
@@ -746,20 +774,6 @@ pub fn kernel_request_method(req: &KernelRequest) -> &'static str {
         KernelRequest::Shutdown { .. } => "Shutdown",
         KernelRequest::GetStatus => "GetStatus",
     }
-}
-
-/// Resolve the caller [`PrincipalId`] from an incoming [`IpcMessage`].
-///
-/// Pre-#658 single-token socket traffic arrives without a principal
-/// field set; we fall back to [`PrincipalId::default`] — the default
-/// principal is bootstrapped with the built-in `admin` group, matching
-/// today's single-tenant behaviour.
-fn resolve_caller(message: &IpcMessage) -> PrincipalId {
-    message
-        .principal
-        .as_deref()
-        .and_then(|p| PrincipalId::new(p).ok())
-        .unwrap_or_default()
 }
 
 /// Resolve the authenticating device `key_id` from an incoming [`IpcMessage`].
