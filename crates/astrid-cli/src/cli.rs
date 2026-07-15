@@ -225,7 +225,8 @@ pub(crate) enum Commands {
 
     /// Initialize a workspace and install a distro
     Init {
-        /// Required distro to install (name, @org/repo, path to Distro.toml, or .shuttle)
+        /// Distro source to install. Required unless an embedding launcher sets
+        /// `ASTRID_ENFORCED_DISTRO` (`@owner/repo`, URL, local Distro.toml, or .shuttle).
         #[arg(long)]
         distro: Option<String>,
         /// Non-interactive: accept all defaults.
@@ -512,7 +513,7 @@ pub(crate) enum SessionCommands {
 pub(crate) enum DistroCommands {
     /// Apply a distro to the active or specified agent.
     Apply {
-        /// Distro identifier (name, `@org/repo`, path, or .shuttle).
+        /// Distro source (`@owner/repo`, URL, local Distro.toml, or .shuttle).
         name: Option<String>,
         /// Target agent (defaults to active context).
         #[arg(short, long)]
@@ -700,6 +701,44 @@ mod tests {
     }
 
     #[test]
+    fn distro_help_lists_only_supported_sources_and_the_launcher_exception() {
+        let mut command = Cli::command();
+        let init_help = command
+            .find_subcommand_mut("init")
+            .expect("init command")
+            .render_long_help()
+            .to_string();
+        for expected in [
+            "ASTRID_ENFORCED_DISTRO",
+            "@owner/repo",
+            "URL",
+            "local Distro.toml",
+            ".shuttle",
+        ] {
+            assert!(
+                init_help.contains(expected),
+                "missing {expected}: {init_help}"
+            );
+        }
+        assert!(
+            !init_help.contains("name, @"),
+            "bare names are not valid sources"
+        );
+
+        let mut command = Cli::command();
+        let apply_help = command
+            .find_subcommand_mut("distro")
+            .expect("distro command")
+            .find_subcommand_mut("apply")
+            .expect("distro apply command")
+            .render_long_help()
+            .to_string();
+        assert!(apply_help.contains("@owner/repo"));
+        assert!(apply_help.contains("local Distro.toml"));
+        assert!(!apply_help.contains("name, `@"));
+    }
+
+    #[test]
     fn init_parses_target_separately_from_operator() {
         let cli = Cli::try_parse_from([
             "astrid",
@@ -733,7 +772,7 @@ mod tests {
             "operator-1",
             "init",
             "--distro",
-            "other",
+            "@example/other",
         ])
         .expect("global options before init should parse");
 
@@ -743,7 +782,7 @@ mod tests {
             Some(Commands::Init {
                 distro: Some(ref distro),
                 ..
-            }) if distro == "other"
+            }) if distro == "@example/other"
         ));
     }
 

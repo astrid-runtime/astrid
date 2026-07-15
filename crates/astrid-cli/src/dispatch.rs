@@ -241,7 +241,7 @@ fn resolve_init_distro_with(
     let Some(enforced) = enforced else {
         return requested.ok_or_else(|| {
             anyhow::anyhow!(
-                "astrid init requires --distro <name, @org/repo, path, or .shuttle>; Astrid Runtime does not choose a product distro"
+                "astrid init requires --distro <@owner/repo, URL, local Distro.toml, or .shuttle> unless ASTRID_ENFORCED_DISTRO is set by an embedding launcher; Astrid Runtime does not choose a product distro"
             )
         });
     };
@@ -410,7 +410,7 @@ async fn dispatch_distro(command: DistroCommands) -> Result<ExitCode> {
             }
             let distro = name.ok_or_else(|| {
                 anyhow::anyhow!(
-                    "astrid distro apply requires a distro name, @org/repo, path, or .shuttle; Astrid Runtime does not choose a product distro"
+                    "astrid distro apply requires an explicit distro source: @owner/repo, URL, local Distro.toml, or .shuttle; Astrid Runtime does not choose a product distro"
                 )
             })?;
             let opts = commands::init::InitOpts {
@@ -601,7 +601,7 @@ mod tests {
 
         assert_eq!(
             error.to_string(),
-            "astrid init requires --distro <name, @org/repo, path, or .shuttle>; Astrid Runtime does not choose a product distro"
+            "astrid init requires --distro <@owner/repo, URL, local Distro.toml, or .shuttle> unless ASTRID_ENFORCED_DISTRO is set by an embedding launcher; Astrid Runtime does not choose a product distro"
         );
     }
 
@@ -612,16 +612,16 @@ mod tests {
 
         assert_eq!(
             error.to_string(),
-            "astrid init requires --distro <name, @org/repo, path, or .shuttle>; Astrid Runtime does not choose a product distro"
+            "astrid init requires --distro <@owner/repo, URL, local Distro.toml, or .shuttle> unless ASTRID_ENFORCED_DISTRO is set by an embedding launcher; Astrid Runtime does not choose a product distro"
         );
     }
 
     #[test]
     fn operator_enforced_distro_cannot_be_overridden_by_the_cli() {
         assert_eq!(
-            resolve_init_distro_with(Some("other".to_string()), None)
+            resolve_init_distro_with(Some("@example/other".to_string()), None)
                 .expect("standalone explicit distro should remain valid"),
-            "other"
+            "@example/other"
         );
         assert_eq!(
             resolve_init_distro_with(None, Some(OsString::from("/opt/product/Distro.toml")))
@@ -630,7 +630,7 @@ mod tests {
         );
 
         let error = resolve_init_distro_with(
-            Some("other".to_string()),
+            Some("@example/other".to_string()),
             Some(OsString::from("/opt/product/Distro.toml")),
         )
         .expect_err("CLI must not override an operator-enforced distro");
@@ -700,7 +700,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn distro_apply_without_a_name_never_selects_a_product_default() {
+    async fn distro_apply_without_a_source_never_selects_a_product_default() {
         let error = dispatch_distro(DistroCommands::Apply {
             name: None,
             agent: None,
@@ -715,7 +715,7 @@ mod tests {
 
         assert_eq!(
             error.to_string(),
-            "astrid distro apply requires a distro name, @org/repo, path, or .shuttle; Astrid Runtime does not choose a product distro"
+            "astrid distro apply requires an explicit distro source: @owner/repo, URL, local Distro.toml, or .shuttle; Astrid Runtime does not choose a product distro"
         );
     }
 }
