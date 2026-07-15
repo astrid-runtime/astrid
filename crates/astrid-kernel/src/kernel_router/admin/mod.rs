@@ -480,6 +480,42 @@ fn redeem_audit_proof(body: &AdminResponseBody) -> (AuthorizationProof, AuditOut
     }
 }
 
+/// Redeem requests use the token as authorization, so dispatch must complete
+/// before the audit row can record the real allow-or-deny outcome.
+async fn handle_redeem_admin_request(
+    kernel: &Arc<crate::Kernel>,
+    response_topic: Topic,
+    request_id: Option<String>,
+    caller: PrincipalId,
+    kind: AdminRequestKind,
+) {
+    let method = admin_request_method(&kind);
+    let required_cap =
+        required_capability_for_admin_request(&kind, resolve_admin_scope(&kind, &caller));
+    let audit_params = sanitize_admin_audit_params(&kind);
+    let body = handlers::dispatch(kernel, &caller, kind).await;
+    let (authorization, outcome) = redeem_audit_proof(&body);
+    record_admin_audit(
+        kernel,
+        AdminAuditEntry {
+            caller: &caller,
+            method,
+            required_cap,
+            device_key_id: None,
+            target_principal: None,
+            params: audit_params,
+            authorization,
+            outcome,
+        },
+    )
+    .await;
+    publish_response(
+        kernel,
+        response_topic,
+        AdminKernelResponse::for_request(request_id, body),
+    );
+}
+
 async fn handle_admin_request(
     kernel: &Arc<crate::Kernel>,
     topic: Topic,
@@ -489,6 +525,14 @@ async fn handle_admin_request(
 ) {
     let response_topic = admin_response_topic(&topic);
     let request_id = req.request_id.clone();
+    if matches!(
+        req.kind,
+        AdminRequestKind::InviteRedeem { .. } | AdminRequestKind::PairDeviceRedeem { .. }
+    ) {
+        handle_redeem_admin_request(kernel, response_topic, request_id, caller, req.kind).await;
+        return;
+    }
+
     let method = admin_request_method(&req.kind);
     let scope = resolve_admin_scope(&req.kind, &caller);
     let required_cap = required_capability_for_admin_request(&req.kind, scope);
@@ -501,54 +545,6 @@ async fn handle_admin_request(
     // later mistake for a system-of-record entry — the canonical copy
     // lives on `AuthConfig.public_keys`.
     let audit_params = sanitize_admin_audit_params(&req.kind);
-
-    // `InviteRedeem` / `PairDeviceRedeem` are the two variants that
-    // bypass the capability preamble: the redeemer's principal does not
-    // exist yet at the moment the request arrives — the token IS the
-    // auth. The handler verifies the token internally and either mints a
-    // principal (success) or rejects it (invalid / expired / consumed /
-    // forged token, or an internal store error).
-    //
-    // Dispatch FIRST, then audit with the REAL outcome. Stamping
-    // `success` before dispatch (as this used to) meant a rejected token
-    // still wrote a success row, so brute-force / forged-token attempts
-    // were invisible in the audit log itself — only in tracing.
-    // Recording after dispatch makes the row's outcome match what
-    // actually happened: this is the "allow OR deny" the comment always
-    // promised. The handler still emits its own `security_event` warn on
-    // rejection; this adds the missing audit-store signal so the
-    // security team can detect token brute-forcing from audit rows alone.
-    if matches!(
-        req.kind,
-        AdminRequestKind::InviteRedeem { .. } | AdminRequestKind::PairDeviceRedeem { .. }
-    ) {
-        // Redeem variants carry no issuer device scope — the token is the
-        // auth, not a paired device.
-        let body = handlers::dispatch(kernel, &caller, req.kind).await;
-        let (authorization, outcome) = redeem_audit_proof(&body);
-        record_admin_audit(
-            kernel,
-            AdminAuditEntry {
-                caller: &caller,
-                method,
-                required_cap,
-                // Redeems mint an identity and carry no device scope — the
-                // token is the auth, not a paired device.
-                device_key_id: None,
-                target_principal: None,
-                params: audit_params,
-                authorization,
-                outcome,
-            },
-        )
-        .await;
-        publish_response(
-            kernel,
-            response_topic,
-            AdminKernelResponse::for_request(request_id, body),
-        );
-        return;
-    }
 
     let authorization =
         match authorize_request(kernel, &caller, device_key_id.as_deref(), required_cap) {
