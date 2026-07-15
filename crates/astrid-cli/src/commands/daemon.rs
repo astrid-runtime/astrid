@@ -188,7 +188,7 @@ async fn ensure_daemon_inner(label: &str, announce: bool) -> Result<()> {
 }
 
 pub(crate) async fn ensure_daemon_workspace_matches(workspace_root: Option<&Path>) -> Result<()> {
-    let expected = expected_workspace_fingerprint(workspace_root);
+    let expected = expected_workspace_fingerprint(workspace_root)?;
     let ready_path = socket_client::readiness_path();
 
     for _ in 0..DAEMON_READY_ATTEMPTS {
@@ -208,12 +208,16 @@ pub(crate) async fn ensure_daemon_workspace_matches(workspace_root: Option<&Path
     )
 }
 
-fn expected_workspace_fingerprint(workspace_root: Option<&Path>) -> String {
+fn expected_workspace_fingerprint(workspace_root: Option<&Path>) -> Result<String> {
     let root = workspace_root.map_or_else(
         || std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
         Path::to_path_buf,
     );
-    astrid_core::dirs::workspace_selection_fingerprint(&root, crate::workspace_layout::current())
+    astrid_core::dirs::checked_workspace_selection_fingerprint(
+        &root,
+        crate::workspace_layout::current(),
+    )
+    .context("selected workspace state path is unsafe")
 }
 
 fn validate_daemon_workspace_metadata(metadata: &str, expected: &str) -> Result<()> {
@@ -700,18 +704,20 @@ mod tests {
         assert_ne!(explicit.path(), current);
 
         assert_eq!(
-            expected_workspace_fingerprint(Some(explicit.path())),
-            astrid_core::dirs::workspace_selection_fingerprint(
+            expected_workspace_fingerprint(Some(explicit.path())).unwrap(),
+            astrid_core::dirs::checked_workspace_selection_fingerprint(
                 explicit.path(),
                 crate::workspace_layout::current(),
             )
+            .unwrap()
         );
         assert_eq!(
-            expected_workspace_fingerprint(None),
-            astrid_core::dirs::workspace_selection_fingerprint(
+            expected_workspace_fingerprint(None).unwrap(),
+            astrid_core::dirs::checked_workspace_selection_fingerprint(
                 &current,
                 crate::workspace_layout::current(),
             )
+            .unwrap()
         );
     }
 

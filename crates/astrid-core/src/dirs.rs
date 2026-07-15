@@ -77,6 +77,19 @@ pub struct WorkspaceLayout {
     state_dir_name: String,
 }
 
+/// A checked project workspace selection.
+///
+/// The project root is canonical and the selected state directory is either
+/// absent or a real directory directly beneath that root. Symlinks, junctions,
+/// and other redirects are rejected by requiring an existing directory to
+/// canonicalize to the exact direct-child path selected here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkspaceSelection {
+    project_root: PathBuf,
+    state_dir: PathBuf,
+    layout: WorkspaceLayout,
+}
+
 impl WorkspaceLayout {
     /// Create a layout from one portable relative directory name.
     ///
@@ -164,6 +177,281 @@ impl WorkspaceLayout {
     pub fn hooks_dir(&self, project_root: &Path) -> PathBuf {
         self.state_dir(project_root).join("hooks")
     }
+
+    /// Resolve and validate this layout beneath `project_root`.
+    ///
+    /// The root must exist and be a directory. If the state directory exists,
+    /// it must be a real directory whose canonical path is exactly the selected
+    /// direct child of the canonical root. A missing state directory is valid;
+    /// callers that create it must use [`WorkspaceSelection::ensure_state_dir`]
+    /// so the boundary is checked again after creation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the root cannot be canonicalized, is not a
+    /// directory, or the selected state path is redirected or is not a
+    /// directory.
+    pub fn resolve(&self, project_root: &Path) -> io::Result<WorkspaceSelection> {
+        WorkspaceSelection::resolve(project_root, self.clone())
+    }
+}
+
+impl WorkspaceSelection {
+    fn resolve(project_root: &Path, layout: WorkspaceLayout) -> io::Result<Self> {
+        let project_root = std::fs::canonicalize(project_root).map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!(
+                    "failed to resolve workspace root {}: {error}",
+                    project_root.display()
+                ),
+            )
+        })?;
+        if !std::fs::metadata(&project_root)?.is_dir() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "workspace root is not a directory: {}",
+                    project_root.display()
+                ),
+            ));
+        }
+
+        let state_dir = project_root.join(layout.state_dir_name());
+        verify_state_dir_path(&project_root, &state_dir)?;
+        Ok(Self {
+            project_root,
+            state_dir,
+            layout,
+        })
+    }
+
+    /// Canonical project root used by every workspace filesystem consumer.
+    #[must_use]
+    pub fn project_root(&self) -> &Path {
+        &self.project_root
+    }
+
+    /// Checked selected state directory.
+    #[must_use]
+    pub fn state_dir(&self) -> &Path {
+        &self.state_dir
+    }
+
+    /// Selected workspace layout.
+    #[must_use]
+    pub fn layout(&self) -> &WorkspaceLayout {
+        &self.layout
+    }
+
+    /// Checked capsule directory under selected project state.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if an existing path component is redirected or is not
+    /// a directory.
+    pub fn capsules_dir(&self) -> io::Result<PathBuf> {
+        self.resolve_directory("capsules")
+    }
+
+    /// Checked configuration path under selected project state.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the existing file or one of its parents is
+    /// redirected or has the wrong type.
+    pub fn config_path(&self) -> io::Result<PathBuf> {
+        self.resolve_file("config.toml")
+    }
+
+    /// Checked hooks directory under selected project state.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if an existing path component is redirected or is not
+    /// a directory.
+    pub fn hooks_dir(&self) -> io::Result<PathBuf> {
+        self.resolve_directory("hooks")
+    }
+
+    /// Resolve a relative directory beneath selected project state without
+    /// following an existing redirect.
+    ///
+    /// Missing components are allowed so callers can validate before creation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for non-normal relative components, redirects, or an
+    /// existing non-directory component.
+    pub fn resolve_directory(&self, relative: impl AsRef<Path>) -> io::Result<PathBuf> {
+        self.resolve_descendant(relative.as_ref(), DescendantKind::Directory)
+    }
+
+    /// Resolve a relative file beneath selected project state without following
+    /// an existing redirect.
+    ///
+    /// Missing components are allowed so callers can validate before creation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for non-normal relative components, redirects, a
+    /// non-directory parent, or an existing non-file target.
+    pub fn resolve_file(&self, relative: impl AsRef<Path>) -> io::Result<PathBuf> {
+        self.resolve_descendant(relative.as_ref(), DescendantKind::File)
+    }
+
+    fn resolve_descendant(&self, relative: &Path, kind: DescendantKind) -> io::Result<PathBuf> {
+        self.verify()?;
+        let components = relative.components().collect::<Vec<_>>();
+        if components.is_empty()
+            || components
+                .iter()
+                .any(|component| !matches!(component, Component::Normal(_)))
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "workspace descendant must be a non-empty relative path without traversal",
+            ));
+        }
+
+        let mut current = self.state_dir.clone();
+        for (index, component) in components.iter().enumerate() {
+            let Component::Normal(component) = component else {
+                unreachable!("components validated above")
+            };
+            current.push(component);
+            let metadata = match std::fs::symlink_metadata(&current) {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error),
+            };
+            let final_component = index == components.len().saturating_sub(1);
+            let expected_file = final_component && kind == DescendantKind::File;
+            if metadata.file_type().is_symlink()
+                || (expected_file && !metadata.is_file())
+                || (!expected_file && !metadata.is_dir())
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "workspace path must not contain redirects or unexpected file types: {}",
+                        current.display()
+                    ),
+                ));
+            }
+            if std::fs::canonicalize(&current)? != current {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "workspace path redirects from its selected target: {}",
+                        current.display()
+                    ),
+                ));
+            }
+        }
+        Ok(self.state_dir.join(relative))
+    }
+
+    /// Re-check that the selected state path has not been redirected.
+    ///
+    /// A missing state directory remains valid. This permits a checked
+    /// selection to be created before initialization while still rejecting a
+    /// later symlink or non-directory replacement.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the project root or state path no longer satisfies
+    /// the original selection.
+    pub fn verify(&self) -> io::Result<()> {
+        let current = Self::resolve(&self.project_root, self.layout.clone())?;
+        if current.project_root != self.project_root || current.state_dir != self.state_dir {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "workspace selection changed after validation",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Create the selected state directory and verify it again afterwards.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if creation fails or the path is redirected before or
+    /// after creation.
+    pub fn ensure_state_dir(&self) -> io::Result<()> {
+        self.verify()?;
+        match std::fs::create_dir(&self.state_dir) {
+            Ok(()) => {},
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {},
+            Err(error) => return Err(error),
+        }
+        self.verify()
+    }
+
+    /// Create a checked relative directory and verify the full path afterwards.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a component is unsafe, creation fails, or a redirect
+    /// appears during creation.
+    pub fn ensure_directory(&self, relative: impl AsRef<Path>) -> io::Result<PathBuf> {
+        let relative = relative.as_ref();
+        let path = self.resolve_directory(relative)?;
+        self.ensure_state_dir()?;
+        std::fs::create_dir_all(&path)?;
+        let checked = self.resolve_directory(relative)?;
+        self.verify()?;
+        Ok(checked)
+    }
+
+    /// Stable opaque identity for the checked root and state-directory target.
+    #[must_use]
+    pub fn fingerprint(&self) -> String {
+        let mut hasher = Hasher::new();
+        hasher.update(b"astrid-workspace-selection-v2\0");
+        hash_path(&mut hasher, &self.project_root);
+        hasher.update(b"\0");
+        hash_path(&mut hasher, &self.state_dir);
+        hasher.update(b"\0");
+        hasher.update(self.layout.state_dir_name().as_bytes());
+        hex::encode(hasher.finalize().as_bytes())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DescendantKind {
+    Directory,
+    File,
+}
+
+fn verify_state_dir_path(project_root: &Path, state_dir: &Path) -> io::Result<()> {
+    let metadata = match std::fs::symlink_metadata(state_dir) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "workspace state path must be a real directory, not a redirect or file: {}",
+                state_dir.display()
+            ),
+        ));
+    }
+
+    let canonical = std::fs::canonicalize(state_dir)?;
+    if canonical != state_dir || canonical.parent() != Some(project_root) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "workspace state directory escapes or redirects outside its selected path: {}",
+                state_dir.display()
+            ),
+        ));
+    }
+    Ok(())
 }
 
 /// Stable identity for one project root and workspace layout selection.
@@ -175,6 +463,9 @@ pub fn workspace_selection_fingerprint(
     project_root: &Path,
     workspace_layout: &WorkspaceLayout,
 ) -> String {
+    if let Ok(selection) = workspace_layout.resolve(project_root) {
+        return selection.fingerprint();
+    }
     let root = std::fs::canonicalize(project_root).unwrap_or_else(|_| {
         if project_root.is_absolute() {
             project_root.to_path_buf()
@@ -189,6 +480,21 @@ pub fn workspace_selection_fingerprint(
     hasher.update(b"\0");
     hasher.update(workspace_layout.state_dir_name().as_bytes());
     hex::encode(hasher.finalize().as_bytes())
+}
+
+/// Resolve a workspace safely and derive its opaque selection identity.
+///
+/// Security-sensitive callers must use this fallible form rather than relying
+/// on a lexical path fingerprint.
+///
+/// # Errors
+///
+/// Returns an error if the workspace root or selected state path is unsafe.
+pub fn checked_workspace_selection_fingerprint(
+    project_root: &Path,
+    workspace_layout: &WorkspaceLayout,
+) -> io::Result<String> {
+    Ok(workspace_layout.resolve(project_root)?.fingerprint())
 }
 
 fn hash_path(hasher: &mut Hasher, path: &Path) {
@@ -338,7 +644,7 @@ impl AstridHome {
 
     /// Ensure the system directory structure exists with secure permissions.
     ///
-    /// Creates `etc/`, `var/`, `run/`, `log/`, `keys/`, `lib/`, and `home/`.
+    /// Creates `etc/`, `var/`, `run/`, `log/`, `keys/`, `secrets/`, `lib/`, and `home/`.
     /// Writes `etc/layout-version` with the current version.
     /// Sets all directories to `0o700` on Unix.
     ///
@@ -357,6 +663,7 @@ impl AstridHome {
             self.run_dir(),
             self.log_dir(),
             self.keys_dir(),
+            self.secrets_dir(),
             self.bin_dir(),
             self.wit_dir(),
             self.wit_store_dir(),
@@ -810,9 +1117,20 @@ impl WorkspaceDir {
     ///
     /// Returns an error if directory creation or workspace ID generation fails.
     pub fn ensure(&self) -> io::Result<()> {
-        std::fs::create_dir_all(self.dot_astrid())?;
+        let selection = self.layout.resolve(&self.project_root)?;
+        selection.ensure_state_dir()?;
         let _ = self.workspace_id()?;
+        selection.verify()?;
         Ok(())
+    }
+
+    /// Resolve this workspace through the checked filesystem boundary.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the project root or selected state path is unsafe.
+    pub fn selection(&self) -> io::Result<WorkspaceSelection> {
+        self.layout.resolve(&self.project_root)
     }
 
     /// Project root directory containing the selected state directory.
@@ -860,16 +1178,21 @@ impl WorkspaceDir {
     ///
     /// Returns an error if the file cannot be read or written.
     pub fn workspace_id(&self) -> io::Result<Uuid> {
-        let path = self.workspace_id_path();
+        let selection = self.selection()?;
+        selection.ensure_state_dir()?;
+        let path = selection.resolve_file("workspace-id")?;
         if let Ok(content) = std::fs::read_to_string(&path) {
             let trimmed = content.trim();
             if let Ok(id) = Uuid::parse_str(trimmed) {
+                selection.verify()?;
                 return Ok(id);
             }
         }
-        std::fs::create_dir_all(self.dot_astrid())?;
         let id = Uuid::new_v4();
+        selection.verify()?;
         std::fs::write(&path, id.to_string())?;
+        selection.resolve_file("workspace-id")?;
+        selection.verify()?;
         Ok(id)
     }
 

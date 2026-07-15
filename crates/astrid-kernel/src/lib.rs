@@ -55,7 +55,7 @@ use astrid_capsule::profile_cache::PrincipalProfileCache;
 use astrid_capsule::registry::CapsuleRegistry;
 use astrid_capsule_types::CapsuleId;
 use astrid_core::SessionId;
-use astrid_core::dirs::WorkspaceLayout;
+use astrid_core::dirs::{WorkspaceLayout, WorkspaceSelection};
 use astrid_core::groups::GroupConfig;
 use astrid_core::principal::PrincipalId;
 use astrid_crypto::KeyPair;
@@ -117,6 +117,8 @@ pub struct Kernel {
     pub workspace_root: PathBuf,
     /// Per-project runtime state layout selected at boot.
     workspace_layout: WorkspaceLayout,
+    /// Checked root/state target used to detect later filesystem redirection.
+    workspace_selection: WorkspaceSelection,
     /// The principal home resources directory (`~/.astrid/home/{principal}/`).
     /// Capsules declaring `fs_read = ["home://"]` can read files under this
     /// root. Scoped to the principal's home so that keys, databases, and
@@ -342,6 +344,12 @@ impl Kernel {
     #[must_use]
     pub fn workspace_layout(&self) -> &WorkspaceLayout {
         &self.workspace_layout
+    }
+
+    /// Checked project state selection captured at boot.
+    #[must_use]
+    pub fn workspace_selection(&self) -> &WorkspaceSelection {
+        &self.workspace_selection
     }
 
     /// Boot a new Kernel instance mounted at the specified directory.
@@ -587,6 +595,11 @@ impl Kernel {
             singleton_lock,
         } = resources;
 
+        let workspace_selection = workspace_layout.resolve(&workspace_root).map_err(|error| {
+            std::io::Error::new(error.kind(), format!("unsafe workspace selection: {error}"))
+        })?;
+        let workspace_root = workspace_selection.project_root().to_path_buf();
+
         let event_bus = Arc::new(EventBus::new());
         let capsules = Arc::new(RwLock::new(CapsuleRegistry::new()));
 
@@ -706,6 +719,7 @@ impl Kernel {
             vfs_root_handle: root_handle,
             workspace_root,
             workspace_layout,
+            workspace_selection,
             home_root,
             cli_socket_listener,
             singleton_lock,
@@ -2252,6 +2266,9 @@ pub(crate) async fn test_kernel_with_home(home: astrid_core::dirs::AstridHome) -
         vfs_root_handle: root_handle,
         workspace_root: home.root().to_path_buf(),
         workspace_layout: WorkspaceLayout::default(),
+        workspace_selection: WorkspaceLayout::default()
+            .resolve(home.root())
+            .expect("test workspace selection"),
         home_root: Some(principal_home.root().to_path_buf()),
         cli_socket_listener: None,
         singleton_lock: None,
@@ -2952,14 +2969,17 @@ fn capsule_discovery_paths_for(
     principal: &PrincipalId,
     workspace_layout: &WorkspaceLayout,
 ) -> Vec<PathBuf> {
-    let workspace = astrid_core::dirs::WorkspaceDir::from_path_with_layout(
-        workspace_root,
-        workspace_layout.clone(),
-    );
-    vec![
-        home.principal_home(principal).capsules_dir(),
-        workspace.capsules_dir(),
-    ]
+    let mut paths = vec![home.principal_home(principal).capsules_dir()];
+    match workspace_layout
+        .resolve(workspace_root)
+        .and_then(|workspace| workspace.capsules_dir())
+    {
+        Ok(path) => paths.push(path),
+        Err(error) => {
+            tracing::warn!(%error, "Unsafe workspace capsule path; skipping workspace capsules");
+        },
+    }
+    paths
 }
 
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]

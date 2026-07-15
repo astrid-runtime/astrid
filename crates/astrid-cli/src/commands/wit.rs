@@ -180,10 +180,14 @@ fn collect_marks_in_workspace(
 
     // Workspace-level capsules (if running from a workspace)
     if let Some(workspace_root) = workspace_root {
-        let ws_caps = workspace_layout.capsules_dir(workspace_root);
+        let workspace = workspace_layout
+            .resolve(workspace_root)
+            .with_context(|| format!("unsafe workspace at {}", workspace_root.display()))?;
+        let ws_caps = workspace.capsules_dir()?;
         if ws_caps.is_dir() {
             collect_from_capsules_dir(&ws_caps, &mut marks);
         }
+        workspace.verify()?;
     }
 
     Ok(marks)

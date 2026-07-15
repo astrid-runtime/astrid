@@ -325,6 +325,19 @@ fn install_from_local_path_internal(
     workspace: InstallWorkspace<'_>,
     expected: Option<ExpectedCapsuleIdentity<'_>>,
 ) -> anyhow::Result<InstallOutput> {
+    let checked_workspace = if options.workspace {
+        let root = workspace
+            .root
+            .context("workspace install requires a workspace root")?;
+        Some(
+            workspace
+                .layout
+                .resolve(root)
+                .context("selected workspace state path is unsafe")?,
+        )
+    } else {
+        None
+    };
     let manifest_path = source_dir.join("Capsule.toml");
     if !manifest_path.exists() {
         bail!("No Capsule.toml found in {}", source_dir.display());
@@ -368,8 +381,17 @@ fn install_from_local_path_internal(
         workspace.layout,
     )?;
     let parent = target_dir.parent().context("target dir has no parent")?;
-    std::fs::create_dir_all(parent)
-        .with_context(|| format!("failed to create {}", parent.display()))?;
+    if let Some(selection) = &checked_workspace {
+        selection
+            .ensure_directory("capsules")
+            .context("failed to create checked workspace capsule directory")?;
+        selection
+            .resolve_directory(Path::new("capsules").join(id.as_str()))
+            .context("workspace capsule target changed after selection")?;
+    } else {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
 
     // Phase detection from existing meta (read-only).
     let existing_meta = read_meta(&target_dir);
@@ -391,6 +413,17 @@ fn install_from_local_path_internal(
     // this point onward must restore the backup over target_dir.
     let backup_dir = if target_dir.exists() {
         let backup = target_dir.with_extension("bak");
+        if let Some(selection) = &checked_workspace {
+            selection
+                .verify()
+                .context("workspace changed before install backup")?;
+            let backup_name = backup
+                .file_name()
+                .context("workspace capsule backup has no file name")?;
+            selection
+                .resolve_directory(Path::new("capsules").join(backup_name))
+                .context("workspace capsule backup path is unsafe")?;
+        }
         if backup.exists() {
             std::fs::remove_dir_all(&backup)
                 .with_context(|| format!("failed to remove stale backup {}", backup.display()))?;
@@ -406,6 +439,12 @@ fn install_from_local_path_internal(
     } else {
         None
     };
+
+    if let Some(selection) = &checked_workspace {
+        selection
+            .verify()
+            .context("workspace changed before capsule copy")?;
+    }
 
     // Copy non-WASM tree to target. Excludes `*.wasm` and `wit/`.
     if let Err(e) = copy_capsule_dir(source_dir, &target_dir) {
@@ -458,6 +497,14 @@ fn install_from_local_path_internal(
         rollback(&target_dir, backup_dir.as_deref());
         return Err(e);
     }
+    if let Some(selection) = &checked_workspace {
+        selection
+            .resolve_directory(Path::new("capsules").join(id.as_str()))
+            .context("workspace capsule target changed during install")?;
+        selection
+            .verify()
+            .context("workspace changed during capsule install")?;
+    }
 
     // Mirror the capsule's WIT into the principal's `home://wit/` so the
     // system capsule's `list_interfaces` / `read_interface` tools can
@@ -507,6 +554,12 @@ fn install_from_local_path_internal(
         && let Err(e) = std::fs::remove_dir_all(&backup)
     {
         tracing::warn!(path = %backup.display(), error = %e, "failed to remove install backup");
+    }
+
+    if let Some(selection) = &checked_workspace {
+        selection
+            .verify()
+            .context("workspace changed before install completion")?;
     }
 
     Ok(InstallOutput {

@@ -280,8 +280,10 @@ pub fn write_readiness_file_for_workspace(
     workspace_layout: &astrid_core::dirs::WorkspaceLayout,
 ) -> Result<(), std::io::Error> {
     let path = readiness_path();
-    let fingerprint =
-        astrid_core::dirs::workspace_selection_fingerprint(workspace_root, workspace_layout);
+    let fingerprint = astrid_core::dirs::checked_workspace_selection_fingerprint(
+        workspace_root,
+        workspace_layout,
+    )?;
     publish_readiness_metadata(&path, &format!("v1:{fingerprint}\n"))
 }
 

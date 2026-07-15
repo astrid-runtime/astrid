@@ -58,6 +58,7 @@ pub fn load(
 ///
 /// Returns a [`ConfigError`] if any config file is malformed, or if the
 /// final merged configuration fails validation.
+#[allow(clippy::too_many_lines)]
 pub fn load_with_layout(
     workspace_root: Option<&Path>,
     astrid_home_override: Option<&Path>,
@@ -123,8 +124,27 @@ pub fn load_with_layout(
     //    for restriction enforcement. This ensures restrictions work even when
     //    no user config file exists (the baseline includes defaults + system).
     if let Some(ws_root) = workspace_root {
-        let ws_path = workspace_layout.config_path(ws_root);
-        if let Some(mut overlay) = try_load_file(&ws_path)? {
+        let workspace =
+            workspace_layout
+                .resolve(ws_root)
+                .map_err(|source| ConfigError::ReadError {
+                    path: workspace_layout.state_dir(ws_root).display().to_string(),
+                    source,
+                })?;
+        let ws_path = workspace
+            .config_path()
+            .map_err(|source| ConfigError::ReadError {
+                path: workspace.state_dir().display().to_string(),
+                source,
+            })?;
+        let workspace_overlay = try_load_file(&ws_path)?;
+        workspace
+            .verify()
+            .map_err(|source| ConfigError::ReadError {
+                path: ws_path.display().to_string(),
+                source,
+            })?;
+        if let Some(mut overlay) = workspace_overlay {
             // Resolve ${VAR} references in workspace overlay with restricted
             // env vars (only ASTRID_* and ANTHROPIC_*). This prevents a
             // malicious workspace config from exfiltrating sensitive env vars.
@@ -145,6 +165,12 @@ pub fn load_with_layout(
 
             loaded_files.push(ws_path.display().to_string());
             info!(path = %ws_path.display(), "loaded workspace config");
+            workspace
+                .verify()
+                .map_err(|source| ConfigError::ReadError {
+                    path: workspace.state_dir().display().to_string(),
+                    source,
+                })?;
         }
     }
 
@@ -392,6 +418,42 @@ mod tests {
                 .iter()
                 .all(|path| !path.ends_with(".astrid/config.toml"))
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn workspace_config_rejects_redirected_state_directory() {
+        use std::os::unix::fs::symlink;
+
+        let home = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(
+            outside.path().join("config.toml"),
+            "[model]\nprovider = \"claude\"\n",
+        )
+        .unwrap();
+        symlink(outside.path(), workspace.path().join(".alternate-runtime")).unwrap();
+
+        let layout = WorkspaceLayout::new(".alternate-runtime").unwrap();
+        assert!(load_with_layout(Some(workspace.path()), Some(home.path()), &layout).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn workspace_config_rejects_redirected_config_file() {
+        use std::os::unix::fs::symlink;
+
+        let home = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let state = workspace.path().join(".alternate-runtime");
+        std::fs::create_dir(&state).unwrap();
+        let outside = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(outside.path(), "[model]\nprovider = \"claude\"\n").unwrap();
+        symlink(outside.path(), state.join("config.toml")).unwrap();
+
+        let layout = WorkspaceLayout::new(".alternate-runtime").unwrap();
+        assert!(load_with_layout(Some(workspace.path()), Some(home.path()), &layout).is_err());
     }
 
     #[test]

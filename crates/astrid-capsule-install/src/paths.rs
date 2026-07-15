@@ -82,7 +82,12 @@ pub fn resolve_target_dir_for_in_workspace(
 ) -> anyhow::Result<PathBuf> {
     if workspace {
         let root = workspace_root.context("workspace install requires a workspace root")?;
-        Ok(workspace_layout.capsules_dir(root).join(id))
+        let selection = workspace_layout
+            .resolve(root)
+            .context("selected workspace state path is unsafe")?;
+        selection
+            .resolve_directory(Path::new("capsules").join(id))
+            .context("workspace capsule target is unsafe")
     } else {
         let ph = home.principal_home(principal);
         Ok(ph.capsules_dir().join(id))
@@ -150,5 +155,29 @@ mod tests {
             .unwrap(),
             PathBuf::from("/workspace/.alternate-runtime/capsules/example")
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn workspace_target_rejects_redirected_capsule_tree() {
+        use std::os::unix::fs::symlink;
+
+        let home = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let state = workspace.path().join(".alternate-runtime");
+        std::fs::create_dir(&state).unwrap();
+        symlink(outside.path(), state.join("capsules")).unwrap();
+
+        let error = resolve_target_dir_for_in_workspace(
+            &AstridHome::from_path(home.path()),
+            &install_principal(),
+            "example",
+            true,
+            Some(workspace.path()),
+            &WorkspaceLayout::new(".alternate-runtime").unwrap(),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("unsafe"));
     }
 }

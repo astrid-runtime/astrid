@@ -202,9 +202,17 @@ pub fn scan_installed_capsules_in_home_for_in_workspace(
     }
 
     if let Some(workspace_root) = workspace_root {
-        let ws_dir = workspace_layout.capsules_dir(workspace_root);
+        let workspace = workspace_layout
+            .resolve(workspace_root)
+            .context("selected workspace state path is unsafe")?;
+        let ws_dir = workspace
+            .capsules_dir()
+            .context("workspace capsule directory is unsafe")?;
         if ws_dir.is_dir() {
             scan_dir(&ws_dir, CapsuleLocation::Workspace, &mut capsules)?;
+            workspace
+                .verify()
+                .context("workspace selection changed while scanning capsules")?;
         }
     }
 
@@ -361,5 +369,27 @@ mod tests {
 
         assert_eq!(capsules.len(), 1);
         assert_eq!(capsules[0].name, "alternate-capsule");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scan_rejects_redirected_workspace_capsules() {
+        use std::os::unix::fs::symlink;
+
+        let home_dir = tempfile::tempdir().unwrap();
+        let home = AstridHome::from_path(home_dir.path());
+        let workspace = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let state = workspace.path().join(".alternate-runtime");
+        std::fs::create_dir(&state).unwrap();
+        symlink(outside.path(), state.join("capsules")).unwrap();
+
+        let result = scan_installed_capsules_in_home_for_in_workspace(
+            &home,
+            &crate::paths::install_principal(),
+            Some(workspace.path()),
+            &WorkspaceLayout::new(".alternate-runtime").unwrap(),
+        );
+        assert!(result.is_err());
     }
 }

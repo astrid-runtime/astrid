@@ -41,12 +41,12 @@ pub(super) fn trusted_capsule_source_ids(
     // principal may have its own installed version); it no longer contributes to
     // the derived source id, which is content-addressed and shared across
     // principals (issue #1069).
-    let dirs = vec![
-        home.principal_home(caller).capsules_dir().join(capsule_id),
-        workspace_layout
-            .capsules_dir(workspace_root)
-            .join(capsule_id),
-    ];
+    let mut dirs = vec![home.principal_home(caller).capsules_dir().join(capsule_id)];
+    if let Ok(workspace) = workspace_layout.resolve(workspace_root)
+        && let Ok(capsules) = workspace.capsules_dir()
+    {
+        dirs.push(capsules.join(capsule_id));
+    }
 
     trusted_capsule_source_ids_from_dirs(capsule_id, dirs)
 }

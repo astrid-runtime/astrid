@@ -73,13 +73,23 @@ pub(crate) fn discover_hooks_in_workspace(
     let mut hooks = Vec::new();
 
     if let Some(workspace_root) = workspace_root {
-        let local_hooks_dir = workspace_layout.hooks_dir(workspace_root);
-        if local_hooks_dir.exists() {
-            info!(path = %local_hooks_dir.display(), "Discovering hooks from local directory");
-            match load_hooks_from_dir(&local_hooks_dir) {
-                Ok(found) => hooks.extend(found),
-                Err(e) => warn!(error = %e, "Failed to load hooks from local directory"),
+        let checked = workspace_layout
+            .resolve(workspace_root)
+            .and_then(|selection| selection.hooks_dir().map(|dir| (selection, dir)));
+        if let Ok((selection, local_hooks_dir)) = checked {
+            if local_hooks_dir.exists() {
+                info!(path = %local_hooks_dir.display(), "Discovering hooks from local directory");
+                match load_hooks_from_dir(&local_hooks_dir) {
+                    Ok(found) => hooks.extend(found),
+                    Err(e) => warn!(error = %e, "Failed to load hooks from local directory"),
+                }
             }
+            if let Err(error) = selection.verify() {
+                warn!(%error, "Workspace changed during hook discovery; discarding workspace hooks");
+                hooks.clear();
+            }
+        } else if let Err(error) = checked {
+            warn!(%error, "Unsafe workspace hook path; skipping workspace hooks");
         }
     }
 

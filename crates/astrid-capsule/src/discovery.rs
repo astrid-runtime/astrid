@@ -160,7 +160,21 @@ pub fn discover_manifests_in_workspace(
 
     // 2. Workspace-level capsules (lowest priority).
     if let Some(workspace_root) = workspace_root {
-        load_dedup(&workspace_layout.capsules_dir(workspace_root), "workspace");
+        match workspace_layout
+            .resolve(workspace_root)
+            .and_then(|selection| selection.capsules_dir().map(|dir| (selection, dir)))
+        {
+            Ok((selection, dir)) => {
+                load_dedup(&dir, "workspace");
+                if let Err(error) = selection.verify() {
+                    warn!(%error, "Workspace changed during capsule discovery; discarding results");
+                    manifests.retain(|(_, path)| !path.starts_with(&dir));
+                }
+            },
+            Err(error) => {
+                warn!(%error, "Unsafe workspace capsule path; skipping workspace capsules")
+            },
+        }
     }
 
     info!(count = manifests.len(), "Discovered capsule manifests");

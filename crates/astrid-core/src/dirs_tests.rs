@@ -79,6 +79,7 @@ fn test_astrid_home_ensure_creates_dirs() {
     assert!(home.run_dir().exists());
     assert!(home.log_dir().exists());
     assert!(home.keys_dir().exists());
+    assert!(home.secrets_dir().exists());
     assert!(home.bin_dir().exists());
     assert!(home.home_dir().exists());
 }
@@ -117,6 +118,26 @@ fn test_astrid_home_ensure_sets_permissions() {
 
     let keys_perms = std::fs::metadata(home.keys_dir()).unwrap().permissions();
     assert_eq!(keys_perms.mode() & 0o777, 0o700);
+}
+
+#[cfg(unix)]
+#[test]
+fn test_astrid_home_ensure_repairs_secrets_permissions_without_touching_contents() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let home = AstridHome::from_path(dir.path());
+    std::fs::create_dir_all(home.secrets_dir()).unwrap();
+    let secret = home.secrets_dir().join("existing-secret");
+    let bytes = b"preserve-these-secret-bytes";
+    std::fs::write(&secret, bytes).unwrap();
+    std::fs::set_permissions(home.secrets_dir(), std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    home.ensure().unwrap();
+
+    let permissions = std::fs::metadata(home.secrets_dir()).unwrap().permissions();
+    assert_eq!(permissions.mode() & 0o777, 0o700);
+    assert_eq!(std::fs::read(secret).unwrap(), bytes);
 }
 
 // ── AstridHome path accessors ────────────────────────────────────
@@ -314,6 +335,100 @@ fn workspace_selection_identity_covers_root_and_layout() {
         selected,
         workspace_selection_fingerprint(root_b.path(), &default)
     );
+}
+
+#[test]
+fn workspace_selection_accepts_missing_then_real_state_directory() {
+    let root = tempfile::tempdir().unwrap();
+    let layout = WorkspaceLayout::new(".alternate-runtime").unwrap();
+    let selection = layout.resolve(root.path()).unwrap();
+
+    assert!(!selection.state_dir().exists());
+    selection.ensure_state_dir().unwrap();
+    selection.verify().unwrap();
+    assert!(selection.state_dir().is_dir());
+    assert_eq!(
+        selection.project_root(),
+        root.path().canonicalize().unwrap()
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn workspace_selection_rejects_state_directory_symlink_escape() {
+    use std::os::unix::fs::symlink;
+
+    let root = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    symlink(outside.path(), root.path().join(".alternate-runtime")).unwrap();
+
+    let error = WorkspaceLayout::new(".alternate-runtime")
+        .unwrap()
+        .resolve(root.path())
+        .unwrap_err();
+    assert!(error.to_string().contains("redirect"));
+}
+
+#[cfg(unix)]
+#[test]
+fn workspace_selection_detects_post_selection_symlink_swap() {
+    use std::os::unix::fs::symlink;
+
+    let root = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let layout = WorkspaceLayout::new(".alternate-runtime").unwrap();
+    let selection = layout.resolve(root.path()).unwrap();
+    selection.ensure_state_dir().unwrap();
+
+    std::fs::remove_dir(selection.state_dir()).unwrap();
+    symlink(outside.path(), selection.state_dir()).unwrap();
+
+    assert!(selection.verify().is_err());
+    assert!(checked_workspace_selection_fingerprint(root.path(), &layout).is_err());
+}
+
+#[cfg(unix)]
+#[test]
+fn workspace_selection_rejects_redirected_capsule_directory() {
+    use std::os::unix::fs::symlink;
+
+    let root = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let selection = WorkspaceLayout::default().resolve(root.path()).unwrap();
+    selection.ensure_state_dir().unwrap();
+    symlink(outside.path(), selection.state_dir().join("capsules")).unwrap();
+
+    assert!(selection.capsules_dir().is_err());
+    assert!(selection.resolve_directory("capsules/example").is_err());
+}
+
+#[cfg(unix)]
+#[test]
+fn workspace_selection_rejects_redirected_config_file() {
+    use std::os::unix::fs::symlink;
+
+    let root = tempfile::tempdir().unwrap();
+    let outside = tempfile::NamedTempFile::new().unwrap();
+    let selection = WorkspaceLayout::default().resolve(root.path()).unwrap();
+    selection.ensure_state_dir().unwrap();
+    symlink(outside.path(), selection.state_dir().join("config.toml")).unwrap();
+
+    assert!(selection.config_path().is_err());
+}
+
+#[test]
+fn checked_workspace_fingerprint_binds_state_directory_target() {
+    let root = tempfile::tempdir().unwrap();
+    let default = WorkspaceLayout::default();
+    let alternate = WorkspaceLayout::new(".alternate-runtime").unwrap();
+
+    let default_fingerprint =
+        checked_workspace_selection_fingerprint(root.path(), &default).unwrap();
+    let alternate_fingerprint =
+        checked_workspace_selection_fingerprint(root.path(), &alternate).unwrap();
+
+    assert_ne!(default_fingerprint, alternate_fingerprint);
+    assert_eq!(default_fingerprint.len(), 64);
 }
 
 #[test]
