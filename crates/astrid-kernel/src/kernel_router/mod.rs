@@ -36,6 +36,8 @@ use device_scope::resolve_device_scope;
 mod capability_catalog_tests;
 #[cfg(test)]
 mod connection_tracker_tests;
+#[cfg(test)]
+mod test_util;
 
 /// Spawns background tasks for the kernel management API and connection tracking.
 ///

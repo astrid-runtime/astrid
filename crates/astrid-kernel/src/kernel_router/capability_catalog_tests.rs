@@ -1,13 +1,12 @@
 //! Drift checks for enforcement capability mappings and registry definitions.
 
-use astrid_core::PrincipalId;
 use astrid_core::capability_grammar::known_capabilities;
 use astrid_core::capability_registry::capability_registry_revision_1;
-use astrid_core::kernel_api::{AdminRequestKind, KernelRequest};
-use astrid_core::profile::Quotas;
+use astrid_core::kernel_api::KernelRequest;
 use std::collections::BTreeSet;
 
 use crate::kernel_router::admin::required_capability_for_admin_request;
+use crate::kernel_router::test_util::all_admin_request_variants;
 use crate::kernel_router::{AuthorityScope, required_capability};
 
 /// Mirror of `tests::all_request_variants` from the parent module —
@@ -66,111 +65,6 @@ fn registry_revision_1_covers_every_kernel_request_cap() {
             );
         }
     }
-}
-
-fn all_admin_request_variants() -> Vec<AdminRequestKind> {
-    let p = PrincipalId::default();
-    vec![
-        AdminRequestKind::AgentCreate {
-            name: "alice".into(),
-            groups: vec![],
-            grants: vec![],
-            inherit_from: None,
-            clone_from: None,
-            allow_admin_clone: false,
-        },
-        AdminRequestKind::AgentDelete {
-            principal: p.clone(),
-        },
-        AdminRequestKind::AgentEnable {
-            principal: p.clone(),
-        },
-        AdminRequestKind::AgentDisable {
-            principal: p.clone(),
-        },
-        AdminRequestKind::AgentModify {
-            principal: p.clone(),
-            add_groups: vec![],
-            remove_groups: vec![],
-            add_capsules: vec![],
-            remove_capsules: vec![],
-        },
-        AdminRequestKind::AgentList,
-        AdminRequestKind::QuotaSet {
-            principal: p.clone(),
-            quotas: Quotas::default(),
-        },
-        AdminRequestKind::QuotaGet {
-            principal: p.clone(),
-        },
-        AdminRequestKind::UsageGet {
-            principal: p.clone(),
-        },
-        AdminRequestKind::GroupCreate {
-            name: "g".into(),
-            capabilities: vec![],
-            description: None,
-            unsafe_admin: false,
-        },
-        AdminRequestKind::GroupDelete { name: "g".into() },
-        AdminRequestKind::GroupModify {
-            name: "g".into(),
-            capabilities: None,
-            description: None,
-            unsafe_admin: None,
-        },
-        AdminRequestKind::GroupList,
-        AdminRequestKind::CapsGrant {
-            principal: p.clone(),
-            capabilities: vec![],
-            unsafe_admin: false,
-        },
-        AdminRequestKind::CapsRevoke {
-            principal: p.clone(),
-            capabilities: vec![],
-        },
-        AdminRequestKind::CapsTokenMint {
-            principal: p.clone(),
-            resource: "mcp://server:tool".into(),
-            permission: None,
-            ttl_secs: None,
-        },
-        AdminRequestKind::CapsTokenRevoke {
-            token_id: "00000000-0000-0000-0000-000000000000".into(),
-        },
-        AdminRequestKind::CapsTokenList {
-            principal: p.clone(),
-        },
-        AdminRequestKind::InviteIssue {
-            group: "agent".into(),
-            expires_secs: None,
-            max_uses: 1,
-            metadata: None,
-        },
-        AdminRequestKind::InviteRedeem {
-            token: "x".into(),
-            public_key: String::new(),
-            display_name: None,
-        },
-        AdminRequestKind::InviteList,
-        AdminRequestKind::InviteRevoke { token: "x".into() },
-        AdminRequestKind::PairDeviceIssue {
-            expires_secs: None,
-            label: None,
-            scope: astrid_core::kernel_api::PairScopeArg::Full,
-        },
-        AdminRequestKind::PairDeviceRedeem {
-            token: "x".into(),
-            public_key: String::new(),
-        },
-        AdminRequestKind::PairDeviceList {
-            principal: p.clone(),
-        },
-        AdminRequestKind::PairDeviceRevoke {
-            principal: p,
-            key_id: "k".into(),
-        },
-    ]
 }
 
 #[test]
