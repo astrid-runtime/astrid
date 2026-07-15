@@ -172,90 +172,20 @@ async fn assert_sse_marker_absent(
     assert!(!observed.contains(marker));
 }
 
-async fn check_live_audit_device_attenuation(
-    kernel: &Arc<astrid_kernel::Kernel>,
-    state: &Arc<GatewayState>,
-    listener: tokio::net::TcpListener,
+async fn assert_scoped_admin_audit_history(
+    client: &reqwest::Client,
+    address: std::net::SocketAddr,
+    kernel: &astrid_kernel::Kernel,
+    principal: &PrincipalId,
+    bob: &PrincipalId,
+    bearer: &str,
 ) {
-    let address = listener.local_addr().expect("gateway listener address");
-    let principal = PrincipalId::new("audit-e2e-principal").unwrap();
-    let audit_device = DeviceKey::new(
-        "a".repeat(64),
-        DeviceScope::Scoped {
-            allow: vec!["audit:read_all".into()],
-            deny: vec![],
-        },
-        Some("gateway-e2e".into()),
-        0,
-    );
-    let audit_device_key_id = audit_device.key_id.clone();
-    let self_list_device = DeviceKey::new(
-        "b".repeat(64),
-        DeviceScope::Scoped {
-            allow: vec!["self:agent:list".into()],
-            deny: vec!["audit:read_all".into()],
-        },
-        Some("gateway-e2e-self-list".into()),
-        0,
-    );
-    let self_list_device_key_id = self_list_device.key_id.clone();
-    let profile = PrincipalProfile {
-        groups: vec!["admin".into()],
-        auth: astrid_core::AuthConfig {
-            methods: vec![AuthMethod::Keypair],
-            public_keys: vec![audit_device, self_list_device],
-        },
-        ..PrincipalProfile::default()
-    };
-    let home = astrid_core::dirs::AstridHome::resolve().expect("ASTRID_HOME");
-    profile
-        .save_to_path(&PrincipalProfile::path_for(&home, &principal))
-        .expect("save SSE principal profile");
-
-    let audit_bearer = astrid_gateway::auth::mint_bearer_scoped(
-        &state.signing.signer,
-        &principal,
-        &audit_device_key_id,
-        300,
-    );
-    let self_list_bearer = astrid_gateway::auth::mint_bearer_scoped(
-        &state.signing.signer,
-        &principal,
-        &self_list_device_key_id,
-        300,
-    );
-    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
-    let server_state = Arc::clone(state);
-    let policy_kernel = Arc::clone(kernel);
-    let mut server = tokio::spawn(async move {
-        astrid_gateway::run_with_capability_probe_on_listener(
-            server_state,
-            listener,
-            async move {
-                let _ = shutdown_rx.await;
-            },
-            move |principal, device_key_id, capability| {
-                policy_kernel.runtime_capability_allows(principal, device_key_id, capability)
-            },
-        )
-        .await
-    });
-
-    let client = reqwest::Client::new();
-    let url = format!("http://{address}/api/events");
-
-    let bob = PrincipalId::new("audit-e2e-bob").unwrap();
-    append_audit_marker(kernel, &bob, "BobHiddenFromScopedAdminHistory").await;
-    append_audit_marker(kernel, &principal, "CallerOwnScopedAdminHistory").await;
+    append_audit_marker(kernel, bob, "BobHiddenFromScopedAdminHistory").await;
+    append_audit_marker(kernel, principal, "CallerOwnScopedAdminHistory").await;
     let historical_url = format!("http://{address}/api/sys/audit?limit=1000");
     let historical = tokio::time::timeout(Duration::from_secs(3), async {
         loop {
-            match client
-                .get(&historical_url)
-                .bearer_auth(&self_list_bearer)
-                .send()
-                .await
-            {
+            match client.get(&historical_url).bearer_auth(bearer).send().await {
                 Ok(response) => return response,
                 Err(_) => tokio::time::sleep(Duration::from_millis(25)).await,
             }
@@ -276,10 +206,20 @@ async fn check_live_audit_device_attenuation(
         .collect::<Vec<_>>();
     assert!(historical_methods.contains(&"CallerOwnScopedAdminHistory"));
     assert!(!historical_methods.contains(&"BobHiddenFromScopedAdminHistory"));
+}
 
+async fn assert_scoped_admin_audit_stream(
+    client: &reqwest::Client,
+    address: std::net::SocketAddr,
+    kernel: &astrid_kernel::Kernel,
+    principal: &PrincipalId,
+    bob: &PrincipalId,
+    bearer: &str,
+) {
+    let url = format!("http://{address}/api/events");
     let mut scoped_response = client
         .get(&url)
-        .bearer_auth(&self_list_bearer)
+        .bearer_auth(bearer)
         .send()
         .await
         .expect("open scoped-admin audit stream");
@@ -313,11 +253,21 @@ async fn check_live_audit_device_attenuation(
     )
     .await;
     assert!(!scoped_observed.contains("BobHiddenFromScopedAdminStream"));
-    drop(scoped_response);
+}
 
+async fn assert_live_audit_revocation(
+    client: &reqwest::Client,
+    address: std::net::SocketAddr,
+    kernel: &astrid_kernel::Kernel,
+    state: &GatewayState,
+    principal: &PrincipalId,
+    device_key_id: String,
+    bearer: &str,
+) {
+    let url = format!("http://{address}/api/events");
     let mut response = tokio::time::timeout(Duration::from_secs(3), async {
         loop {
-            match client.get(&url).bearer_auth(&audit_bearer).send().await {
+            match client.get(&url).bearer_auth(bearer).send().await {
                 Ok(response) => return response,
                 Err(_) => tokio::time::sleep(Duration::from_millis(25)).await,
             }
@@ -337,7 +287,7 @@ async fn check_live_audit_device_attenuation(
         .expect("admin client")
         .request(AdminRequestKind::PairDeviceRevoke {
             principal: principal.clone(),
-            key_id: audit_device_key_id,
+            key_id: device_key_id,
         })
         .await
         .expect("revoke device");
@@ -355,16 +305,120 @@ async fn check_live_audit_device_attenuation(
     );
     wait_for_sse_marker(&mut response, &mut observed, "CallerOwnAfterRevocation").await;
     assert_sse_marker_absent(&mut response, &mut observed, "BobHiddenAfterRevocation").await;
+}
 
-    drop(response);
-    let _ = shutdown_tx.send(());
-    match tokio::time::timeout(Duration::from_secs(3), &mut server).await {
-        Ok(result) => result.expect("gateway task").expect("gateway shutdown"),
-        Err(_) => {
-            server.abort();
-            let _ = server.await;
-            panic!("gateway shutdown timed out");
+fn seed_audit_test_identity() -> (PrincipalId, String, String) {
+    let principal = PrincipalId::new("audit-e2e-principal").unwrap();
+    let audit_device = DeviceKey::new(
+        "a".repeat(64),
+        DeviceScope::Scoped {
+            allow: vec!["audit:read_all".into()],
+            deny: vec![],
         },
+        Some("gateway-e2e".into()),
+        0,
+    );
+    let audit_device_key_id = audit_device.key_id.clone();
+    let self_list_device = DeviceKey::new(
+        "b".repeat(64),
+        DeviceScope::Scoped {
+            allow: vec!["self:agent:list".into()],
+            deny: vec!["audit:read_all".into()],
+        },
+        Some("gateway-e2e-self-list".into()),
+        0,
+    );
+    let self_list_device_key_id = self_list_device.key_id.clone();
+    let profile = PrincipalProfile {
+        groups: vec!["admin".into()],
+        auth: astrid_core::AuthConfig {
+            methods: vec![AuthMethod::Keypair],
+            public_keys: vec![audit_device, self_list_device],
+        },
+        ..PrincipalProfile::default()
+    };
+    let home = astrid_core::dirs::AstridHome::resolve().expect("ASTRID_HOME");
+    profile
+        .save_to_path(&PrincipalProfile::path_for(&home, &principal))
+        .expect("save SSE principal profile");
+    (principal, audit_device_key_id, self_list_device_key_id)
+}
+
+async fn check_live_audit_device_attenuation(
+    kernel: &Arc<astrid_kernel::Kernel>,
+    state: &Arc<GatewayState>,
+    listener: tokio::net::TcpListener,
+) {
+    let address = listener.local_addr().expect("gateway listener address");
+    let (principal, audit_device_key_id, self_list_device_key_id) = seed_audit_test_identity();
+
+    let audit_bearer = astrid_gateway::auth::mint_bearer_scoped(
+        &state.signing.signer,
+        &principal,
+        &audit_device_key_id,
+        300,
+    );
+    let self_list_bearer = astrid_gateway::auth::mint_bearer_scoped(
+        &state.signing.signer,
+        &principal,
+        &self_list_device_key_id,
+        300,
+    );
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    let server_state = Arc::clone(state);
+    let policy_kernel = Arc::clone(kernel);
+    let mut server = tokio::spawn(async move {
+        astrid_gateway::run_with_capability_probe_on_listener(
+            server_state,
+            listener,
+            async move {
+                let _ = shutdown_rx.await;
+            },
+            move |principal, device_key_id, capability| {
+                policy_kernel.runtime_capability_allows(principal, device_key_id, capability)
+            },
+        )
+        .await
+    });
+
+    let client = reqwest::Client::new();
+    let bob = PrincipalId::new("audit-e2e-bob").unwrap();
+    assert_scoped_admin_audit_history(
+        &client,
+        address,
+        kernel,
+        &principal,
+        &bob,
+        &self_list_bearer,
+    )
+    .await;
+    assert_scoped_admin_audit_stream(
+        &client,
+        address,
+        kernel,
+        &principal,
+        &bob,
+        &self_list_bearer,
+    )
+    .await;
+    assert_live_audit_revocation(
+        &client,
+        address,
+        kernel,
+        state,
+        &principal,
+        audit_device_key_id,
+        &audit_bearer,
+    )
+    .await;
+
+    let _ = shutdown_tx.send(());
+    if let Ok(result) = tokio::time::timeout(Duration::from_secs(3), &mut server).await {
+        result.expect("gateway task").expect("gateway shutdown");
+    } else {
+        server.abort();
+        let _ = server.await;
+        panic!("gateway shutdown timed out");
     }
 }
 
@@ -545,8 +599,10 @@ async fn kernel_and_gateway_boot_against_shared_home() {
     let gateway_address = gateway_listener
         .local_addr()
         .expect("gateway listener address");
-    let mut gateway_config = GatewayConfig::default();
-    gateway_config.listen = gateway_address.to_string();
+    let gateway_config = GatewayConfig {
+        listen: gateway_address.to_string(),
+        ..GatewayConfig::default()
+    };
     let state = GatewayState::new(
         gateway_config,
         Some(Arc::clone(&kernel.event_bus)),
