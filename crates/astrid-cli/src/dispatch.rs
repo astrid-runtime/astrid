@@ -4,6 +4,7 @@
 //! [`crate::cli::Commands`] to its handler. Lives in its own module so
 //! [`crate::main`] is just `tokio::main` plus error-formatting plumbing.
 
+use std::ffi::OsString;
 use std::io::IsTerminal;
 use std::process::ExitCode;
 
@@ -175,11 +176,7 @@ async fn dispatch_subcommand(
             target_principal,
             grant_capsules,
         }) => {
-            let distro = distro.ok_or_else(|| {
-                anyhow::anyhow!(
-                    "astrid init requires --distro <name, @org/repo, path, or .shuttle>; Astrid Runtime does not choose a product distro"
-                )
-            })?;
+            let distro = resolve_init_distro(distro)?;
             let opts = commands::init::InitOpts {
                 yes,
                 offline,
@@ -231,6 +228,39 @@ async fn dispatch_subcommand(
         },
         Some(Commands::External(tokens)) => dispatch_root_shorthand(tokens).await,
     }
+}
+
+fn resolve_init_distro(requested: Option<String>) -> Result<String> {
+    resolve_init_distro_with(requested, std::env::var_os("ASTRID_ENFORCED_DISTRO"))
+}
+
+fn resolve_init_distro_with(
+    requested: Option<String>,
+    enforced: Option<OsString>,
+) -> Result<String> {
+    let Some(enforced) = enforced else {
+        return non_empty_distro_source(requested).ok_or_else(|| {
+            anyhow::anyhow!(
+                "astrid init requires --distro <@owner/repo, URL, local Distro.toml, or .shuttle> unless ASTRID_ENFORCED_DISTRO is set by an embedding launcher; Astrid Runtime does not choose a product distro"
+            )
+        });
+    };
+    let enforced = enforced.into_string().map_err(|_| {
+        anyhow::anyhow!("ASTRID_ENFORCED_DISTRO must contain a valid UTF-8 distro source")
+    })?;
+    if enforced.is_empty() {
+        anyhow::bail!("ASTRID_ENFORCED_DISTRO must not be empty");
+    }
+    if requested.is_some() {
+        anyhow::bail!(
+            "astrid init cannot override the operator-enforced distro in ASTRID_ENFORCED_DISTRO"
+        );
+    }
+    Ok(enforced)
+}
+
+fn non_empty_distro_source(source: Option<String>) -> Option<String> {
+    source.filter(|source| !source.is_empty())
 }
 
 /// Route the root capsule-verb shorthand (`astrid <verb> [args…]`).
@@ -382,9 +412,9 @@ async fn dispatch_distro(command: DistroCommands) -> Result<ExitCode> {
                     &[tracker_657()],
                 ));
             }
-            let distro = name.ok_or_else(|| {
+            let distro = non_empty_distro_source(name).ok_or_else(|| {
                 anyhow::anyhow!(
-                    "astrid distro apply requires a distro name, @org/repo, path, or .shuttle; Astrid Runtime does not choose a product distro"
+                    "astrid distro apply requires an explicit distro source: @owner/repo, URL, local Distro.toml, or .shuttle; Astrid Runtime does not choose a product distro"
                 )
             })?;
             let opts = commands::init::InitOpts {
@@ -502,6 +532,8 @@ fn dispatch_session(command: SessionCommands) -> Result<ExitCode> {
 
 #[cfg(test)]
 mod tests {
+    use clap::Parser;
+
     use super::*;
 
     /// The production harvest must include invocable **aliases**, not just
@@ -555,45 +587,143 @@ mod tests {
 
     #[tokio::test]
     async fn init_without_a_distro_never_selects_a_product_default() {
-        let error = dispatch_subcommand(
-            Some(Commands::Init {
-                distro: None,
+        for distro in [None, Some(String::new())] {
+            let error = dispatch_subcommand(
+                Some(Commands::Init {
+                    distro,
+                    yes: false,
+                    offline: false,
+                    allow_unsigned: false,
+                    accept_new_key: false,
+                    vars: Vec::new(),
+                    target_principal: None,
+                    grant_capsules: false,
+                }),
+                OutputFormat::Pretty,
+            )
+            .await
+            .expect_err("standalone init must require a non-empty explicit distro");
+
+            assert_eq!(
+                error.to_string(),
+                "astrid init requires --distro <@owner/repo, URL, local Distro.toml, or .shuttle> unless ASTRID_ENFORCED_DISTRO is set by an embedding launcher; Astrid Runtime does not choose a product distro"
+            );
+        }
+    }
+
+    #[test]
+    fn distro_resolution_without_a_source_never_selects_a_product_default() {
+        let error = resolve_init_distro_with(None, None)
+            .expect_err("standalone init must require an explicit distro");
+
+        assert_eq!(
+            error.to_string(),
+            "astrid init requires --distro <@owner/repo, URL, local Distro.toml, or .shuttle> unless ASTRID_ENFORCED_DISTRO is set by an embedding launcher; Astrid Runtime does not choose a product distro"
+        );
+    }
+
+    #[test]
+    fn operator_enforced_distro_cannot_be_overridden_by_the_cli() {
+        assert_eq!(
+            resolve_init_distro_with(Some("@example/other".to_string()), None)
+                .expect("standalone explicit distro should remain valid"),
+            "@example/other"
+        );
+        assert_eq!(
+            resolve_init_distro_with(None, Some(OsString::from("/opt/product/Distro.toml")))
+                .expect("operator distro should satisfy init"),
+            "/opt/product/Distro.toml"
+        );
+
+        let error = resolve_init_distro_with(
+            Some("@example/other".to_string()),
+            Some(OsString::from("/opt/product/Distro.toml")),
+        )
+        .expect_err("CLI must not override an operator-enforced distro");
+        assert_eq!(
+            error.to_string(),
+            "astrid init cannot override the operator-enforced distro in ASTRID_ENFORCED_DISTRO"
+        );
+    }
+
+    #[test]
+    fn operator_distro_and_targeted_capsule_grants_compose() {
+        let cli = Cli::try_parse_from([
+            "astrid",
+            "--principal",
+            "operator-1",
+            "init",
+            "--target-principal",
+            "agent-1",
+            "--grant-capsules",
+        ])
+        .expect("an operator may supply the distro outside Astrid's CLI arguments");
+
+        assert_eq!(cli.principal.as_deref(), Some("operator-1"));
+        let Some(Commands::Init {
+            distro,
+            target_principal,
+            grant_capsules,
+            ..
+        }) = cli.command
+        else {
+            panic!("expected init command");
+        };
+        assert_eq!(
+            resolve_init_distro_with(distro, Some(OsString::from("/opt/product/Distro.toml")),)
+                .expect("operator-enforced distro should satisfy init"),
+            "/opt/product/Distro.toml"
+        );
+        assert_eq!(target_principal.as_deref(), Some("agent-1"));
+        assert!(grant_capsules);
+    }
+
+    #[test]
+    fn malformed_operator_enforced_distro_fails_closed() {
+        let empty = resolve_init_distro_with(None, Some(OsString::new()))
+            .expect_err("empty enforced distro must fail");
+        assert_eq!(
+            empty.to_string(),
+            "ASTRID_ENFORCED_DISTRO must not be empty"
+        );
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStringExt;
+
+            let invalid = resolve_init_distro_with(
+                None,
+                Some(OsString::from_vec(vec![
+                    b'd', b'i', b's', b't', b'r', b'o', 0xff,
+                ])),
+            )
+            .expect_err("non-UTF-8 enforced distro must fail");
+            assert_eq!(
+                invalid.to_string(),
+                "ASTRID_ENFORCED_DISTRO must contain a valid UTF-8 distro source"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn distro_apply_without_a_source_never_selects_a_product_default() {
+        for name in [None, Some(String::new())] {
+            let error = dispatch_distro(DistroCommands::Apply {
+                name,
+                agent: None,
                 yes: false,
                 offline: false,
                 allow_unsigned: false,
                 accept_new_key: false,
                 vars: Vec::new(),
-                target_principal: None,
-                grant_capsules: false,
-            }),
-            OutputFormat::Pretty,
-        )
-        .await
-        .expect_err("standalone init must require an explicit distro");
+            })
+            .await
+            .expect_err("standalone distro apply must require a non-empty explicit distro");
 
-        assert_eq!(
-            error.to_string(),
-            "astrid init requires --distro <name, @org/repo, path, or .shuttle>; Astrid Runtime does not choose a product distro"
-        );
-    }
-
-    #[tokio::test]
-    async fn distro_apply_without_a_name_never_selects_a_product_default() {
-        let error = dispatch_distro(DistroCommands::Apply {
-            name: None,
-            agent: None,
-            yes: false,
-            offline: false,
-            allow_unsigned: false,
-            accept_new_key: false,
-            vars: Vec::new(),
-        })
-        .await
-        .expect_err("standalone distro apply must require an explicit distro");
-
-        assert_eq!(
-            error.to_string(),
-            "astrid distro apply requires a distro name, @org/repo, path, or .shuttle; Astrid Runtime does not choose a product distro"
-        );
+            assert_eq!(
+                error.to_string(),
+                "astrid distro apply requires an explicit distro source: @owner/repo, URL, local Distro.toml, or .shuttle; Astrid Runtime does not choose a product distro"
+            );
+        }
     }
 }

@@ -225,7 +225,8 @@ pub(crate) enum Commands {
 
     /// Initialize a workspace and install a distro
     Init {
-        /// Required distro to install (name, @org/repo, path to Distro.toml, or .shuttle)
+        /// Distro source to install. Required unless an embedding launcher sets
+        /// `ASTRID_ENFORCED_DISTRO` (`@owner/repo`, URL, local Distro.toml, or .shuttle).
         #[arg(long)]
         distro: Option<String>,
         /// Non-interactive: accept all defaults.
@@ -512,7 +513,7 @@ pub(crate) enum SessionCommands {
 pub(crate) enum DistroCommands {
     /// Apply a distro to the active or specified agent.
     Apply {
-        /// Distro identifier (name, `@org/repo`, path, or .shuttle).
+        /// Distro source (`@owner/repo`, URL, local Distro.toml, or .shuttle).
         name: Option<String>,
         /// Target agent (defaults to active context).
         #[arg(short, long)]
@@ -560,6 +561,10 @@ pub(crate) enum DistroCommands {
         key: PathBuf,
     },
 }
+
+#[cfg(test)]
+#[path = "cli_distro_tests.rs"]
+mod distro_tests;
 
 #[cfg(test)]
 mod tests {
@@ -681,47 +686,6 @@ mod tests {
             Some(Commands::Invite {
                 command: InviteCommand::Revoke(ref args),
             }) if args.token_or_fingerprint == "-opaque-token"
-        ));
-    }
-
-    #[test]
-    fn grant_capsules_parsing_stays_open_for_embedding_composition() {
-        let cli = Cli::try_parse_from(["astrid", "init", "--grant-capsules"])
-            .expect("parsing stays open so an embedding layer can resolve the distro source");
-
-        assert!(matches!(
-            cli.command,
-            Some(Commands::Init {
-                distro: None,
-                grant_capsules: true,
-                ..
-            })
-        ));
-    }
-
-    #[test]
-    fn init_parses_target_separately_from_operator() {
-        let cli = Cli::try_parse_from([
-            "astrid",
-            "--principal",
-            "operator-1",
-            "init",
-            "--distro",
-            "./Distro.toml",
-            "--target-principal",
-            "agent-1",
-            "--grant-capsules",
-        ])
-        .expect("operator and target principal should parse independently");
-
-        assert_eq!(cli.principal.as_deref(), Some("operator-1"));
-        assert!(matches!(
-            cli.command,
-            Some(Commands::Init {
-                target_principal: Some(ref target),
-                grant_capsules: true,
-                ..
-            }) if target == "agent-1"
         ));
     }
 
