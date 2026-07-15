@@ -35,6 +35,11 @@ const CHECK_TTL_SECS: u64 = 86_400;
 /// Max size of a downloaded release archive.
 const MAX_ARCHIVE_BYTES: usize = 100 * 1024 * 1024;
 
+/// Release manifest entries are a digest plus one archive filename. Bound each
+/// entry independently so malformed manifests fail before parsing untrusted
+/// line contents.
+const MAX_MANIFEST_LINE_BYTES: usize = 1_024;
+
 /// Binaries managed by an in-place update.
 const MANAGED_BINARIES: &[&str] = &["astrid", "astrid-daemon"];
 
@@ -395,6 +400,10 @@ fn verify_blake3(archive: &[u8], sums_body: &str, asset_name: &str) -> anyhow::R
         let line_number = index
             .checked_add(1)
             .context("BLAKE3SUMS.txt line count exceeds usize")?;
+        anyhow::ensure!(
+            line.len() <= MAX_MANIFEST_LINE_BYTES,
+            "BLAKE3SUMS.txt line {line_number} exceeds {MAX_MANIFEST_LINE_BYTES} byte limit"
+        );
         let (hex, name) = line.split_once("  ").ok_or_else(|| {
             anyhow::anyhow!(
                 "malformed BLAKE3SUMS.txt line {line_number}: expected '<digest>  <asset>'"

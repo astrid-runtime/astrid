@@ -267,6 +267,15 @@ fn blake3_verification_matches_independent_vector() {
         "1".repeat(64)
     );
     assert!(verify_blake3(archive, &duplicate_other, asset).is_err());
+
+    let overlong = "a".repeat(MAX_MANIFEST_LINE_BYTES + 1);
+    let error = verify_blake3(archive, &overlong, asset)
+        .unwrap_err()
+        .to_string();
+    assert_eq!(
+        error,
+        format!("BLAKE3SUMS.txt line 1 exceeds {MAX_MANIFEST_LINE_BYTES} byte limit")
+    );
 }
 
 #[test]
