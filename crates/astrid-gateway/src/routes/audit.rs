@@ -38,6 +38,8 @@ const DEFAULT_LIMIT: usize = 100;
 /// paginate; the cap exists so a malicious bearer can't request a
 /// 10-million-entry page and OOM the gateway.
 const MAX_LIMIT: usize = 1000;
+const CURSOR_SCOPE_ALL: &str = "all";
+const CURSOR_SCOPE_PRINCIPAL_PREFIX: char = 'p';
 
 /// Query parameters for `GET /api/sys/audit`. All optional —
 /// the default behaviour is "the last [`DEFAULT_LIMIT`] entries
@@ -118,20 +120,25 @@ enum CursorScope {
 impl CursorScope {
     fn encode(&self) -> String {
         match self {
-            Self::All => "all".into(),
-            Self::Principal(principal) => format!("p{}", hex::encode(principal.as_str())),
+            Self::All => CURSOR_SCOPE_ALL.into(),
+            Self::Principal(principal) => format!(
+                "{CURSOR_SCOPE_PRINCIPAL_PREFIX}{}",
+                hex::encode(principal.as_str())
+            ),
         }
     }
 
     fn decode(raw: &str) -> GatewayResult<Self> {
-        if raw == "all" {
+        if raw == CURSOR_SCOPE_ALL {
             return Ok(Self::All);
         }
-        let encoded = raw.strip_prefix('p').ok_or_else(|| {
-            GatewayError::BadRequest(
-                "cursor scope must be \"all\" or \"p<hex-encoded-principal>\"".into(),
-            )
-        })?;
+        let encoded = raw
+            .strip_prefix(CURSOR_SCOPE_PRINCIPAL_PREFIX)
+            .ok_or_else(|| {
+                GatewayError::BadRequest(
+                    "cursor scope must be \"all\" or \"p<hex-encoded-principal>\"".into(),
+                )
+            })?;
         let principal = String::from_utf8(hex::decode(encoded).map_err(|_| {
             GatewayError::BadRequest("cursor scope principal must be valid hex".into())
         })?)
@@ -148,6 +155,11 @@ impl CursorScope {
         }
     }
 
+    // A raw-offset cursor may safely continue only when the next page
+    // sees the same principal scope or a narrower one. If visibility
+    // widens (for example self-only → firehose or principal A →
+    // principal B), records skipped above the raw boundary could
+    // become newly visible and would otherwise be lost silently.
     fn accepts_continuation_from(&self, previous: &Self) -> bool {
         matches!(previous, Self::All) || previous == self
     }
@@ -315,7 +327,7 @@ fn validate_cursor_scope(
         Ok(())
     } else {
         Err(GatewayError::BadRequest(
-            "cursor scope no longer matches the caller's current audit visibility; restart pagination without a cursor".into(),
+            "cursor scope widened or changed principal since the previous page; restart pagination without a cursor".into(),
         ))
     }
 }
@@ -427,17 +439,13 @@ fn parse_cursor(cursor: Option<&str>) -> GatewayResult<(Option<u64>, usize, Opti
         Some(scope) => Some(CursorScope::decode(scope)?),
         None => None,
     };
-    if raw.contains('_') {
-        let ts = ts_str
-            .parse::<u64>()
-            .map_err(|_| GatewayError::BadRequest("cursor timestamp must be an integer".into()))?;
-        let off = off_str.parse::<usize>().map_err(|_| {
-            GatewayError::BadRequest("cursor offset must be a non-negative integer".into())
-        })?;
-        Ok((Some(ts), off, scope))
-    } else {
-        unreachable!("plain cursor shape handled above")
-    }
+    let ts = ts_str
+        .parse::<u64>()
+        .map_err(|_| GatewayError::BadRequest("cursor timestamp must be an integer".into()))?;
+    let off = off_str.parse::<usize>().map_err(|_| {
+        GatewayError::BadRequest("cursor offset must be a non-negative integer".into())
+    })?;
+    Ok((Some(ts), off, scope))
 }
 
 /// Map an `AuditEntry` into the flat JSON shape we ship over the
