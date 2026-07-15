@@ -4,6 +4,7 @@
 //! [`crate::cli::Commands`] to its handler. Lives in its own module so
 //! [`crate::main`] is just `tokio::main` plus error-formatting plumbing.
 
+use std::ffi::OsString;
 use std::io::IsTerminal;
 use std::process::ExitCode;
 
@@ -175,11 +176,7 @@ async fn dispatch_subcommand(
             target_principal,
             grant_capsules,
         }) => {
-            let distro = distro.ok_or_else(|| {
-                anyhow::anyhow!(
-                    "astrid init requires --distro <name, @org/repo, path, or .shuttle>; Astrid Runtime does not choose a product distro"
-                )
-            })?;
+            let distro = resolve_init_distro(distro)?;
             let opts = commands::init::InitOpts {
                 yes,
                 offline,
@@ -231,6 +228,35 @@ async fn dispatch_subcommand(
         },
         Some(Commands::External(tokens)) => dispatch_root_shorthand(tokens).await,
     }
+}
+
+fn resolve_init_distro(requested: Option<String>) -> Result<String> {
+    resolve_init_distro_with(requested, std::env::var_os("ASTRID_ENFORCED_DISTRO"))
+}
+
+fn resolve_init_distro_with(
+    requested: Option<String>,
+    enforced: Option<OsString>,
+) -> Result<String> {
+    let Some(enforced) = enforced else {
+        return requested.ok_or_else(|| {
+            anyhow::anyhow!(
+                "astrid init requires --distro <name, @org/repo, path, or .shuttle>; Astrid Runtime does not choose a product distro"
+            )
+        });
+    };
+    let enforced = enforced.into_string().map_err(|_| {
+        anyhow::anyhow!("ASTRID_ENFORCED_DISTRO must contain a valid UTF-8 distro source")
+    })?;
+    if enforced.is_empty() {
+        anyhow::bail!("ASTRID_ENFORCED_DISTRO must not be empty");
+    }
+    if requested.is_some() {
+        anyhow::bail!(
+            "astrid init cannot override the operator-enforced distro in ASTRID_ENFORCED_DISTRO"
+        );
+    }
+    Ok(enforced)
 }
 
 /// Route the root capsule-verb shorthand (`astrid <verb> [args…]`).
@@ -575,6 +601,68 @@ mod tests {
             error.to_string(),
             "astrid init requires --distro <name, @org/repo, path, or .shuttle>; Astrid Runtime does not choose a product distro"
         );
+    }
+
+    #[test]
+    fn distro_resolution_without_a_source_never_selects_a_product_default() {
+        let error = resolve_init_distro_with(None, None)
+            .expect_err("standalone init must require an explicit distro");
+
+        assert_eq!(
+            error.to_string(),
+            "astrid init requires --distro <name, @org/repo, path, or .shuttle>; Astrid Runtime does not choose a product distro"
+        );
+    }
+
+    #[test]
+    fn operator_enforced_distro_cannot_be_overridden_by_the_cli() {
+        assert_eq!(
+            resolve_init_distro_with(Some("other".to_string()), None)
+                .expect("standalone explicit distro should remain valid"),
+            "other"
+        );
+        assert_eq!(
+            resolve_init_distro_with(None, Some(OsString::from("/opt/product/Distro.toml")))
+                .expect("operator distro should satisfy init"),
+            "/opt/product/Distro.toml"
+        );
+
+        let error = resolve_init_distro_with(
+            Some("other".to_string()),
+            Some(OsString::from("/opt/product/Distro.toml")),
+        )
+        .expect_err("CLI must not override an operator-enforced distro");
+        assert_eq!(
+            error.to_string(),
+            "astrid init cannot override the operator-enforced distro in ASTRID_ENFORCED_DISTRO"
+        );
+    }
+
+    #[test]
+    fn malformed_operator_enforced_distro_fails_closed() {
+        let empty = resolve_init_distro_with(None, Some(OsString::new()))
+            .expect_err("empty enforced distro must fail");
+        assert_eq!(
+            empty.to_string(),
+            "ASTRID_ENFORCED_DISTRO must not be empty"
+        );
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStringExt;
+
+            let invalid = resolve_init_distro_with(
+                None,
+                Some(OsString::from_vec(vec![
+                    b'd', b'i', b's', b't', b'r', b'o', 0xff,
+                ])),
+            )
+            .expect_err("non-UTF-8 enforced distro must fail");
+            assert_eq!(
+                invalid.to_string(),
+                "ASTRID_ENFORCED_DISTRO must contain a valid UTF-8 distro source"
+            );
+        }
     }
 
     #[tokio::test]

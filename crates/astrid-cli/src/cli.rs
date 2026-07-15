@@ -685,9 +685,9 @@ mod tests {
     }
 
     #[test]
-    fn grant_capsules_parsing_stays_open_for_embedding_composition() {
+    fn grant_capsules_allows_an_operator_enforced_distro() {
         let cli = Cli::try_parse_from(["astrid", "init", "--grant-capsules"])
-            .expect("parsing stays open so an embedding layer can resolve the distro source");
+            .expect("the operator may supply the distro outside the CLI argument surface");
 
         assert!(matches!(
             cli.command,
@@ -722,6 +722,28 @@ mod tests {
                 grant_capsules: true,
                 ..
             }) if target == "agent-1"
+        ));
+    }
+
+    #[test]
+    fn global_options_before_init_preserve_the_requested_distro() {
+        let cli = Cli::try_parse_from([
+            "astrid",
+            "--principal",
+            "operator-1",
+            "init",
+            "--distro",
+            "other",
+        ])
+        .expect("global options before init should parse");
+
+        assert_eq!(cli.principal.as_deref(), Some("operator-1"));
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Init {
+                distro: Some(ref distro),
+                ..
+            }) if distro == "other"
         ));
     }
 
