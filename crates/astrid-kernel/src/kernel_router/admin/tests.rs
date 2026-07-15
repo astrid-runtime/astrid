@@ -47,6 +47,13 @@ fn all_admin_variants() -> Vec<AdminRequestKind> {
         AdminRequestKind::AgentDisable {
             principal: pid("a"),
         },
+        AdminRequestKind::AgentModify {
+            principal: pid("a"),
+            add_groups: vec!["agent".into()],
+            remove_groups: Vec::new(),
+            add_capsules: Vec::new(),
+            remove_capsules: Vec::new(),
+        },
         AdminRequestKind::AgentList,
         AdminRequestKind::QuotaSet {
             principal: pid("a"),
@@ -217,6 +224,28 @@ fn every_variant_has_a_method_label() {
             "method must start with admin.: {m}"
         );
     }
+}
+
+#[test]
+fn empty_agent_modify_keeps_existing_wire_and_authority_mapping() {
+    let target = pid("target");
+    let req = AdminRequestKind::AgentModify {
+        principal: target.clone(),
+        add_groups: Vec::new(),
+        remove_groups: Vec::new(),
+        add_capsules: Vec::new(),
+        remove_capsules: Vec::new(),
+    };
+    assert_eq!(
+        resolve_admin_scope(&req, &pid("operator")),
+        AuthorityScope::Global
+    );
+    assert_eq!(
+        required_capability_for_admin_request(&req, AuthorityScope::Global),
+        "agent:modify"
+    );
+    assert_eq!(admin_request_method(&req), "admin.agent.modify");
+    assert_eq!(admin_target_principal(&req), Some(&target));
 }
 
 #[test]

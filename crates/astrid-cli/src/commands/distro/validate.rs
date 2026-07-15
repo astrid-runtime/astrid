@@ -152,6 +152,38 @@ pub(crate) fn validate_manifest(manifest: &DistroManifest) -> anyhow::Result<()>
                 cap.name,
             );
         }
+        let version = cap.version.trim();
+        if cap.version != version {
+            anyhow::bail!(
+                "capsule '{}': version must not contain surrounding whitespace",
+                cap.name
+            );
+        }
+        if !version.is_empty() && Version::parse(version).is_err() {
+            anyhow::bail!(
+                "capsule '{}': version '{}' is not valid semver",
+                cap.name,
+                cap.version
+            );
+        }
+        let tag = cap.tag.as_deref().map(str::trim);
+        if let Some(raw_tag) = cap.tag.as_deref()
+            && raw_tag != raw_tag.trim()
+        {
+            anyhow::bail!(
+                "capsule '{}': tag must not contain surrounding whitespace",
+                cap.name
+            );
+        }
+        if matches!(tag, Some("")) {
+            anyhow::bail!("capsule '{}': tag must not be empty", cap.name);
+        }
+        if version.is_empty() && tag.is_none() {
+            anyhow::bail!(
+                "capsule '{}': distro capsules require a concrete released version or tag",
+                cap.name
+            );
+        }
     }
 
     // At least one uplink.
@@ -533,6 +565,53 @@ tag = "v0.2.0-rc1"
 "#;
         let manifest: DistroManifest = toml::from_str(toml_src).unwrap();
         validate_manifest(&manifest).expect("version/tag release selectors are allowed");
+    }
+
+    #[test]
+    fn accepts_tag_only_release_selector() {
+        let toml_src = r#"
+schema-version = 1
+
+[distro]
+id = "test"
+name = "Test"
+version = "0.1.0"
+
+[[capsule]]
+name = "astrid-capsule-cli"
+source = "@org/cli"
+version = ""
+tag = "v0.2.0-rc1"
+role = "uplink"
+"#;
+        let manifest: DistroManifest = toml::from_str(toml_src).unwrap();
+        validate_manifest(&manifest).expect("a non-empty tag is a concrete release selector");
+    }
+
+    #[test]
+    fn rejects_missing_or_malformed_release_selector() {
+        let base = r#"
+schema-version = 1
+
+[distro]
+id = "test"
+name = "Test"
+version = "0.1.0"
+
+[[capsule]]
+name = "astrid-capsule-cli"
+source = "@org/cli"
+role = "uplink"
+"#;
+        for (selector, needle) in [
+            ("version = \"\"", "concrete released version or tag"),
+            ("version = \"latest\"", "not valid semver"),
+            ("version = \"\"\ntag = \"\"", "tag must not be empty"),
+        ] {
+            let manifest: DistroManifest = toml::from_str(&format!("{base}{selector}\n")).unwrap();
+            let err = validate_manifest(&manifest).unwrap_err();
+            assert!(err.to_string().contains(needle), "got: {err:#}");
+        }
     }
 
     #[test]

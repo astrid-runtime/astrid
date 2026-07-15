@@ -730,18 +730,80 @@ async fn run_modify(args: ModifyArgs) -> Result<ExitCode> {
         return Ok(ExitCode::from(1));
     }
     let mut client = crate::admin_client::connect_as_active_agent().await?;
+    let outcome = apply_agent_modify(
+        &mut client,
+        &principal,
+        &args.add_group,
+        &args.remove_group,
+        &args.add_capsule,
+        &args.remove_capsule,
+    )
+    .await?;
+    if outcome.changed {
+        println!(
+            "{}",
+            Theme::success(&format!(
+                "Updated agent '{principal}' groups: [{}] capsules: [{}]",
+                outcome.groups.join(", "),
+                outcome.capsules.join(", ")
+            ))
+        );
+    } else {
+        println!(
+            "{}",
+            Theme::info(&format!(
+                "agent '{principal}' already has the requested groups and capsules (no change)"
+            ))
+        );
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// Parsed result of an `admin.agent.modify` round-trip: the principal's
+/// resulting group and capsule sets, plus whether the kernel actually
+/// changed the profile (`false` on an idempotent no-op re-apply).
+pub(crate) struct AgentModifyOutcome {
+    /// The principal's group memberships after the delta.
+    pub(crate) groups: Vec<String>,
+    /// The principal's capsule-access grant set after the delta.
+    pub(crate) capsules: Vec<String>,
+    /// Whether the profile changed (set-wise). `false` means every
+    /// requested add/remove was already reflected — an idempotent re-run.
+    pub(crate) changed: bool,
+}
+
+/// Issue an `admin.agent.modify` request and parse the kernel's reply.
+///
+/// The single seam through which group and capsule-access grants reach
+/// the kernel. Shared by the `agent modify` verb and `init
+/// --grant-capsules` so both provision through the *exact same*
+/// idempotent kernel path (`apply_set_delta`) — never a divergent copy of
+/// the grant logic. The kernel applies removes-then-adds atomically for
+/// the whole request and reports `changed = false` when the resulting set
+/// is unchanged, which is what makes a re-apply safe.
+///
+/// # Errors
+/// Propagates transport errors and any `AdminResponseBody::Error` the
+/// kernel returns (e.g. the caller lacks `agent:modify`, or the target
+/// principal has no profile).
+pub(crate) async fn apply_agent_modify(
+    client: &mut AdminClient,
+    principal: &PrincipalId,
+    add_groups: &[String],
+    remove_groups: &[String],
+    add_capsules: &[String],
+    remove_capsules: &[String],
+) -> Result<AgentModifyOutcome> {
     let body = client
         .request(AdminRequestKind::AgentModify {
             principal: principal.clone(),
-            add_groups: args.add_group.clone(),
-            remove_groups: args.remove_group.clone(),
-            add_capsules: args.add_capsule.clone(),
-            remove_capsules: args.remove_capsule.clone(),
+            add_groups: add_groups.to_vec(),
+            remove_groups: remove_groups.to_vec(),
+            add_capsules: add_capsules.to_vec(),
+            remove_capsules: remove_capsules.to_vec(),
         })
         .await?;
-    let body = into_result(body)?;
-
-    let value = match body {
+    let value = match into_result(body)? {
         AdminResponseBody::Success(v) => v,
         other => anyhow::bail!("unexpected response from kernel: {other:?}"),
     };
@@ -757,30 +819,14 @@ async fn run_modify(args: ModifyArgs) -> Result<ExitCode> {
             })
             .unwrap_or_default()
     };
-    let groups = string_array("groups");
-    let capsules = string_array("capsules");
-    let changed = value
-        .get("changed")
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false);
-    if changed {
-        println!(
-            "{}",
-            Theme::success(&format!(
-                "Updated agent '{principal}' groups: [{}] capsules: [{}]",
-                groups.join(", "),
-                capsules.join(", ")
-            ))
-        );
-    } else {
-        println!(
-            "{}",
-            Theme::info(&format!(
-                "agent '{principal}' already has the requested groups and capsules (no change)"
-            ))
-        );
-    }
-    Ok(ExitCode::SUCCESS)
+    Ok(AgentModifyOutcome {
+        groups: string_array("groups"),
+        capsules: string_array("capsules"),
+        changed: value
+            .get("changed")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false),
+    })
 }
 
 fn run_link(_args: LinkArgs) -> ExitCode {

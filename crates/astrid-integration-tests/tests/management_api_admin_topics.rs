@@ -82,6 +82,13 @@ fn all_admin_variants() -> Vec<AdminRequestKind> {
         AdminRequestKind::AgentDisable {
             principal: pid("target"),
         },
+        AdminRequestKind::AgentModify {
+            principal: pid("target"),
+            add_groups: vec!["agent".into()],
+            remove_groups: Vec::new(),
+            add_capsules: Vec::new(),
+            remove_capsules: Vec::new(),
+        },
         AdminRequestKind::AgentList,
         AdminRequestKind::QuotaSet {
             principal: pid("target"),

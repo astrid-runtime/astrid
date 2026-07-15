@@ -243,6 +243,15 @@ pub(crate) enum Commands {
         /// Set a variable (repeatable): KEY=VALUE.
         #[arg(long = "var", value_name = "KEY=VALUE")]
         vars: Vec<String>,
+        /// Principal whose home and capsule access this init provisions.
+        /// The global `--principal` remains the authenticated operator.
+        #[arg(long = "target-principal", value_name = "PRINCIPAL")]
+        target_principal: Option<String>,
+        /// Grant the target principal access to every capsule the distro
+        /// installs (same mechanism as `agent modify --add-capsule`).
+        /// A distro source must resolve before initialization runs.
+        #[arg(long = "grant-capsules")]
+        grant_capsules: bool,
     },
 
     /// View resolved configuration, edit it in `$EDITOR`, or print paths.
@@ -643,6 +652,47 @@ mod tests {
         ])
         .expect("global --principal should parse before nested subcommands");
         assert_eq!(cli.principal.as_deref(), Some("operator-1"));
+    }
+
+    #[test]
+    fn grant_capsules_parsing_stays_open_for_embedding_composition() {
+        let cli = Cli::try_parse_from(["astrid", "init", "--grant-capsules"])
+            .expect("parsing stays open so an embedding layer can resolve the distro source");
+
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Init {
+                distro: None,
+                grant_capsules: true,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn init_parses_target_separately_from_operator() {
+        let cli = Cli::try_parse_from([
+            "astrid",
+            "--principal",
+            "operator-1",
+            "init",
+            "--distro",
+            "./Distro.toml",
+            "--target-principal",
+            "agent-1",
+            "--grant-capsules",
+        ])
+        .expect("operator and target principal should parse independently");
+
+        assert_eq!(cli.principal.as_deref(), Some("operator-1"));
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Init {
+                target_principal: Some(ref target),
+                grant_capsules: true,
+                ..
+            }) if target == "agent-1"
+        ));
     }
 
     #[test]

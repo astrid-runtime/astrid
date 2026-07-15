@@ -8,6 +8,7 @@ use std::collections::HashMap;
 use std::io::Write;
 
 use anyhow::{Context, bail};
+use astrid_capsule::capsule::CapsuleId;
 use astrid_core::dirs::AstridHome;
 use indicatif::{ProgressBar, ProgressStyle};
 
@@ -38,6 +39,16 @@ pub(crate) struct InitOpts {
     pub(crate) accept_new_key: bool,
     /// Pre-supplied variable values from `--var KEY=VALUE`.
     pub(crate) vars: HashMap<String, String>,
+    /// Principal whose local home, capsule installs, env, lock, and grants
+    /// this invocation provisions. The process principal is separately used
+    /// to authenticate admin requests.
+    pub(crate) target_principal: astrid_core::PrincipalId,
+    /// Grant the target principal capsule-access for every capsule the
+    /// distro installs, via the same kernel path as `astrid agent modify
+    /// --add-capsule`. Only valid with a resolved distro. Opt-in: without it,
+    /// `init` installs capsules but attaches no grants and
+    /// prints the manual `agent modify` command for discoverability.
+    pub(crate) grant_capsules: bool,
 }
 
 /// Parse `--var KEY=VALUE` strings into a map.
@@ -60,31 +71,49 @@ pub(crate) fn parse_cli_vars(raw: &[String]) -> anyhow::Result<HashMap<String, S
 /// Run the init flow: workspace setup + distro-based capsule installation.
 pub(crate) async fn run_init(distro_source: &str, opts: &InitOpts) -> anyhow::Result<()> {
     let home = AstridHome::resolve()?;
-    home.ensure()?;
+    let operator = crate::principal::current();
+    let target = opts.target_principal.clone();
 
-    // The process-wide principal resolved from the global `--principal` flag
-    // (falling back to ASTRID_PRINCIPAL / active-agent context / `default`).
-    // Every install target below — capsule files, per-capsule env config, and
-    // the Distro.lock — is scoped to THIS principal so `astrid init --principal
-    // <x>` provisions <x>'s home rather than always landing under `default`.
-    // This is the same source `astrid capsule install` reads, so init and the
-    // manual installer agree on where a principal's capsules live.
-    let principal = crate::principal::current();
+    // `--grant-capsules` is only meaningful when a distro install is
+    // resolving the capsule set to grant. Reject an empty source up front so
+    // the flag can never be silently honoured without a distro.
+    grant::validate_grant_capsules(opts.grant_capsules, !distro_source.is_empty())?;
 
-    // Workspace init (existing behaviour).
-    init_workspace()?;
-
-    // Offline, signed, self-contained install path.
+    // Offline, signed, self-contained install path. `--grant-capsules` is not
+    // wired for `.shuttle` archives (the installed set isn't threaded back
+    // here); fail loud rather than silently skip the grant the operator asked
+    // for, pointing at the manual path.
     if distro_source.ends_with(".shuttle") {
+        if opts.grant_capsules {
+            bail!(
+                "--grant-capsules is not supported for .shuttle installs yet — \
+                 install first, then grant with `astrid --principal {operator} \
+                 agent modify {target} \
+                 --add-capsule <name>` for each installed capsule."
+            );
+        }
+        home.ensure()?;
+        let _provisioning_lock = grant::ProvisioningLock::acquire(&home, &target)?;
+        init_workspace()?;
         return run_init_from_shuttle(distro_source, opts);
     }
+
+    // Refuse an unauthorized or nonexistent grant target before creating any
+    // local workspace, principal-home, env, capsule, or lock state.
+    if opts.grant_capsules {
+        grant::preflight_grants(&operator, &target).await?;
+    }
+
+    home.ensure()?;
+    let _provisioning_lock = grant::ProvisioningLock::acquire(&home, &target)?;
+    init_workspace()?;
 
     // Check lockfile — if fresh, we're already initialized. The lock lives
     // under the resolved principal's home, matching bootstrap's auto-init
     // freshness check (`should_auto_init`) so a scoped principal isn't
     // re-provisioned on every run.
     let lock_path = home
-        .principal_home(&principal)
+        .principal_home(&target)
         .config_dir()
         .join("distro.lock");
 
@@ -101,6 +130,8 @@ pub(crate) async fn run_init(distro_source: &str, opts: &InitOpts) -> anyhow::Re
     // Check lock freshness AFTER parsing manifest (need manifest to compare).
     if let Some(existing_lock) = load_lock(&lock_path)?
         && is_lock_fresh(&existing_lock, &manifest)
+        && let Some(installed) =
+            grant::validated_grant_set_for_reuse(&home, &target, &existing_lock.capsules)
     {
         eprintln!(
             "{}",
@@ -113,6 +144,13 @@ pub(crate) async fn run_init(distro_source: &str, opts: &InitOpts) -> anyhow::Re
                     .unwrap_or(&manifest.distro.name),
             ))
         );
+        // Idempotent grant path: a re-run with `--grant-capsules` on an
+        // already-installed principal still (re-)applies grants for the
+        // locked capsule set. `apply_set_delta` dedups kernel-side, so a
+        // principal that already holds them reports "no change" rather than
+        // erroring or duplicating — and this is also how a first run whose
+        // grant step failed (daemon was down) recovers on re-run.
+        grant::apply_or_hint_grants(&operator, &target, &installed, opts.grant_capsules).await?;
         return Ok(());
     }
 
@@ -143,14 +181,14 @@ pub(crate) async fn run_init(distro_source: &str, opts: &InitOpts) -> anyhow::Re
     // Write per-capsule env files BEFORE installing capsules so that
     // install_capsule's onboarding check finds existing values and
     // doesn't re-prompt for fields the distro already configured.
-    write_env_files(&home, &principal, &selected, &vars)?;
+    write_env_files(&home, &target, &selected, &vars)?;
 
     // Install each capsule with progress. `install_capsules` writes the
     // capsule files under `principal`'s home and returns one LockedCapsule
     // per capsule that actually installed — failures are reported and
     // dropped, so `locked.len()` is the true success count.
     let total = selected.len();
-    let locked = install_capsules(&selected, opts.offline, &principal).await?;
+    let locked = install_capsules(&selected, opts.offline, &target).await?;
     let succeeded = locked.len();
 
     // Provisioning honesty: a run where every selected install FAILED must
@@ -174,7 +212,7 @@ pub(crate) async fn run_init(distro_source: &str, opts: &InitOpts) -> anyhow::Re
     // shared free-text `[variables]`. Shared values already written above
     // are preserved (the prompt skips set keys).
     if should_write_lock(total, succeeded) {
-        onboard_llm_providers(&home, &principal, &selected);
+        onboard_llm_providers(&home, &target, &selected);
     }
 
     // Persist Distro.lock iff the run earned it (full success or empty
@@ -182,12 +220,23 @@ pub(crate) async fn run_init(distro_source: &str, opts: &InitOpts) -> anyhow::Re
     // actually retries the missing capsules instead of short-circuiting at
     // the freshness gate (`is_lock_fresh` diffs only distro id+version, not
     // the capsule set) — see `should_write_lock`.
+    // Capture the names that actually installed BEFORE `locked` is consumed
+    // into the lock — the grant set is EXACTLY this locally-resolved set, never
+    // a manifest-declared string the installer didn't land (security stance:
+    // grants derive from what was installed, on explicit `--grant-capsules`).
+    let installed_names: Vec<String> = locked.iter().map(|c| c.name.clone()).collect();
     let lock = create_lock_from_parts(schema_version, &distro_id, &distro_version, locked);
     let wrote_lock = persist_lock_if_earned(&lock_path, total, succeeded, &lock)?;
 
     eprintln!();
     if wrote_lock {
         eprintln!("{}", Theme::success("Installation complete."));
+        // Apply capsule grants (opt-in) or print the discoverability hint.
+        // On a grant failure the capsules are already installed and the lock
+        // is written; this returns Err so init exits non-zero with the exact
+        // manual command to finish.
+        grant::apply_or_hint_grants(&operator, &target, &installed_names, opts.grant_capsules)
+            .await?;
         eprintln!("  Run {} to start.", Theme::prompt("astrid"));
         Ok(())
     } else {
@@ -670,11 +719,10 @@ async fn install_capsules(
 
     let mut locked = Vec::with_capacity(total);
     let mut failed = Vec::new();
-    let home = AstridHome::resolve()?;
-
     for cap in selected {
         pb.set_message(cap.name.clone());
 
+        let expected = CapsuleId::new(cap.name.clone())?;
         let refspec = super::capsule::install::RefSpec::from_capsule(cap);
         // The installer returns the ref it ACTUALLY resolved and fetched
         // (`Some` for GitHub sources, `None` for local paths). Record
@@ -682,15 +730,25 @@ async fn install_capsules(
         // lock attests what was truly installed. `Some(&cap.name)` is the
         // name hint used to pick the right archive from a multi-asset
         // release.
-        let resolved_ref = match super::capsule::install::install_capsule_batch(
+        let outcome = match super::capsule::install::install_capsule_batch(
             &cap.source,
-            Some(&cap.name),
+            &expected,
             false,
             &refspec,
+            principal,
         )
         .await
         {
-            Ok(resolved_ref) => resolved_ref,
+            Ok(outcome) => outcome,
+            Err(e) => {
+                eprintln!("\n  Failed to install {}: {e}", cap.name);
+                failed.push(cap.name.clone());
+                pb.inc(1);
+                continue;
+            },
+        };
+        let verified = match validate_batch_install(&expected, &cap.version, outcome) {
+            Ok(verified) => verified,
             Err(e) => {
                 eprintln!("\n  Failed to install {}: {e}", cap.name);
                 failed.push(cap.name.clone());
@@ -699,24 +757,15 @@ async fn install_capsules(
             },
         };
 
-        // Read the installed meta to get the wasm_hash for the lock. The
-        // capsule was installed under `principal`'s home (via the
-        // `*_for_principal` install lib), so read it back from there — not
-        // from the legacy `default`-principal resolver, which would miss a
-        // scoped principal's install and record an empty hash.
-        let target_dir =
-            super::capsule::install::resolve_target_dir_for(&home, principal, &cap.name, false)?;
-        let meta = super::capsule::meta::read_meta(&target_dir);
-
         locked.push(LockedCapsule {
             name: cap.name.clone(),
-            version: cap.version.clone(),
+            version: verified.version,
             source: cap.source.clone(),
-            hash: meta
-                .and_then(|m| m.wasm_hash)
+            hash: verified
+                .wasm_hash
                 .map(|h| format!("blake3:{h}"))
                 .unwrap_or_default(),
-            resolved_ref,
+            resolved_ref: verified.resolved_ref,
         });
 
         pb.inc(1);
@@ -736,6 +785,55 @@ async fn install_capsules(
     }
 
     Ok(locked)
+}
+
+#[derive(Debug)]
+struct VerifiedBatchInstall {
+    version: String,
+    wasm_hash: Option<String>,
+    resolved_ref: Option<String>,
+}
+
+/// Require the checked installer to report one exact identity and an actual
+/// version consistent with the distro's released selector.
+fn validate_batch_install(
+    expected: &CapsuleId,
+    declared_version: &str,
+    outcome: super::capsule::install::BatchInstallOutcome,
+) -> anyhow::Result<VerifiedBatchInstall> {
+    if outcome.installed.len() != 1 {
+        let actual = outcome
+            .installed
+            .iter()
+            .map(|installed| installed.id.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        bail!(
+            "distro declared capsule '{expected}', but the checked installer reported [{actual}]"
+        );
+    }
+    let installed = outcome
+        .installed
+        .into_iter()
+        .next()
+        .expect("length checked");
+    if installed.id != *expected {
+        bail!(
+            "distro declared capsule '{expected}', but the checked installer reported '{}'",
+            installed.id
+        );
+    }
+    if !declared_version.is_empty() && installed.version != declared_version {
+        bail!(
+            "capsule '{expected}' release selector declared version {declared_version}, but the installed manifest reports {}",
+            installed.version
+        );
+    }
+    Ok(VerifiedBatchInstall {
+        version: installed.version,
+        wasm_hash: installed.wasm_hash,
+        resolved_ref: outcome.resolved_ref,
+    })
 }
 
 /// Write per-capsule .env.json files with resolved variable templates.
@@ -842,6 +940,11 @@ fn onboard_llm_providers(
         }
     }
 }
+
+/// `--grant-capsules` post-install grant logic, split out to keep this
+/// file under the per-file size cap.
+#[path = "init_grant.rs"]
+mod grant;
 
 #[cfg(test)]
 #[path = "init_tests.rs"]

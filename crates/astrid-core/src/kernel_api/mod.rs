@@ -466,7 +466,9 @@ pub enum AdminRequestKind {
     /// loaded from `groups.toml` are both accepted as identifiers;
     /// validation that the named groups exist happens at the new
     /// profile's `validate` step. Mutations are idempotent — adding an
-    /// already-present group or removing an absent one is a no-op.
+    /// already-present group or removing an absent one is a no-op. An empty
+    /// delta performs the same authorized target-existence check without
+    /// rewriting the profile.
     AgentModify {
         /// Principal to modify.
         principal: PrincipalId,

@@ -452,18 +452,6 @@ async fn agent_modify_from_req(
             "agent_modify_from_req received a non-AgentModify variant".to_string(),
         );
     };
-    if add_groups.is_empty()
-        && remove_groups.is_empty()
-        && add_capsules.is_empty()
-        && remove_capsules.is_empty()
-    {
-        return err_bad_input(
-            "agent.modify: at least one of `add_groups`, `remove_groups`, `add_capsules`, or \
-             `remove_capsules` must be non-empty"
-                .to_string(),
-        );
-    }
-
     let _guard = kernel.admin_write_lock.lock().await;
     let path = principal_profile_path(kernel, &principal);
     if let Err(msg) = require_principal_exists(&principal, &path) {

@@ -5,6 +5,8 @@ pub(crate) mod check;
 pub(crate) mod config;
 pub(crate) mod deps;
 pub(crate) mod install;
+mod install_batch;
+mod install_github;
 pub(crate) mod install_prompts;
 pub(crate) mod install_update;
 pub(crate) mod list;

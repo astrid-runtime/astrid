@@ -5,6 +5,92 @@
 use super::*;
 
 #[test]
+fn batch_install_rejects_reported_identity_mismatch() {
+    let expected = astrid_capsule::capsule::CapsuleId::new("expected-capsule").unwrap();
+    let err = validate_batch_install(
+        &expected,
+        "1.0.0",
+        super::super::capsule::install::BatchInstallOutcome {
+            installed: vec![super::super::capsule::install::InstalledCapsuleOutcome {
+                id: astrid_capsule::capsule::CapsuleId::new("wrong-capsule").unwrap(),
+                version: "1.0.0".to_string(),
+                wasm_hash: Some("abcd".to_string()),
+            }],
+            resolved_ref: Some("v1.0.0".to_string()),
+        },
+    )
+    .unwrap_err();
+
+    assert!(err.to_string().contains("expected-capsule"), "got: {err:#}");
+}
+
+#[test]
+fn batch_install_accepts_actual_version_hash_and_ref() {
+    let expected = astrid_capsule::capsule::CapsuleId::new("expected-capsule").unwrap();
+    let verified = validate_batch_install(
+        &expected,
+        "1.0.0",
+        super::super::capsule::install::BatchInstallOutcome {
+            installed: vec![super::super::capsule::install::InstalledCapsuleOutcome {
+                id: expected.clone(),
+                version: "1.0.0".to_string(),
+                wasm_hash: Some("abcd".to_string()),
+            }],
+            resolved_ref: Some("v1.0.0".to_string()),
+        },
+    )
+    .unwrap();
+    assert_eq!(verified.version, "1.0.0");
+    assert_eq!(verified.wasm_hash.as_deref(), Some("abcd"));
+    assert_eq!(verified.resolved_ref.as_deref(), Some("v1.0.0"));
+}
+
+#[test]
+fn batch_install_rejects_multiple_reported_capsules() {
+    let expected = astrid_capsule::capsule::CapsuleId::new("expected-capsule").unwrap();
+    let err = validate_batch_install(
+        &expected,
+        "1.0.0",
+        super::super::capsule::install::BatchInstallOutcome {
+            installed: vec![
+                super::super::capsule::install::InstalledCapsuleOutcome {
+                    id: expected.clone(),
+                    version: "1.0.0".to_string(),
+                    wasm_hash: None,
+                },
+                super::super::capsule::install::InstalledCapsuleOutcome {
+                    id: astrid_capsule::capsule::CapsuleId::new("wrong-capsule").unwrap(),
+                    version: "1.0.0".to_string(),
+                    wasm_hash: None,
+                },
+            ],
+            resolved_ref: None,
+        },
+    )
+    .unwrap_err();
+    assert!(err.to_string().contains("checked installer reported"));
+}
+
+#[test]
+fn batch_install_rejects_declared_version_mismatch() {
+    let expected = astrid_capsule::capsule::CapsuleId::new("expected-capsule").unwrap();
+    let err = validate_batch_install(
+        &expected,
+        "1.0.0",
+        super::super::capsule::install::BatchInstallOutcome {
+            installed: vec![super::super::capsule::install::InstalledCapsuleOutcome {
+                id: expected.clone(),
+                version: "2.0.0".to_string(),
+                wasm_hash: None,
+            }],
+            resolved_ref: None,
+        },
+    )
+    .unwrap_err();
+    assert!(err.to_string().contains("installed manifest reports 2.0.0"));
+}
+
+#[test]
 fn provider_selection_parses_multi_select() {
     assert_eq!(parse_provider_selection("1,2", 3), vec![1, 2]);
     assert_eq!(parse_provider_selection(" 2 , 3 ", 3), vec![2, 3]);
