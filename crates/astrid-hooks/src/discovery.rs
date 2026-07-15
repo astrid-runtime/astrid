@@ -75,7 +75,7 @@ pub(crate) fn discover_hooks_in_workspace(
     if let Some(workspace_root) = workspace_root {
         let checked = workspace_layout
             .resolve(workspace_root)
-            .and_then(|selection| selection.hooks_dir().map(|dir| (selection, dir)));
+            .and_then(|selection| selection.verify_tree("hooks").map(|dir| (selection, dir)));
         if let Ok((selection, local_hooks_dir)) = checked {
             if local_hooks_dir.exists() {
                 info!(path = %local_hooks_dir.display(), "Discovering hooks from local directory");
@@ -84,7 +84,7 @@ pub(crate) fn discover_hooks_in_workspace(
                     Err(e) => warn!(error = %e, "Failed to load hooks from local directory"),
                 }
             }
-            if let Err(error) = selection.verify() {
+            if let Err(error) = selection.verify_tree("hooks") {
                 warn!(%error, "Workspace changed during hook discovery; discarding workspace hooks");
                 hooks.clear();
             }
@@ -306,5 +306,24 @@ mod tests {
 
         assert_eq!(hooks.len(), 1);
         assert_eq!(hooks[0].name.as_deref(), Some("selected"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn discovery_skips_workspace_with_symlinked_hook_file() {
+        use std::os::unix::fs::symlink;
+
+        let workspace = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        let hooks = workspace.path().join(".astrid/hooks");
+        std::fs::create_dir_all(&hooks).unwrap();
+        let target = outside.path().join("HOOK.toml");
+        std::fs::write(&target, "event = 'session-start'\n").unwrap();
+        symlink(target, hooks.join("HOOK.toml")).unwrap();
+
+        assert!(
+            discover_hooks_in_workspace(None, Some(workspace.path()), &WorkspaceLayout::default())
+                .is_empty()
+        );
     }
 }

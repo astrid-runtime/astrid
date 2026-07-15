@@ -206,12 +206,12 @@ pub fn scan_installed_capsules_in_home_for_in_workspace(
             .resolve(workspace_root)
             .context("selected workspace state path is unsafe")?;
         let ws_dir = workspace
-            .capsules_dir()
+            .verify_tree("capsules")
             .context("workspace capsule directory is unsafe")?;
         if ws_dir.is_dir() {
             scan_dir(&ws_dir, CapsuleLocation::Workspace, &mut capsules)?;
             workspace
-                .verify()
+                .verify_tree("capsules")
                 .context("workspace selection changed while scanning capsules")?;
         }
     }
@@ -391,5 +391,31 @@ mod tests {
             &WorkspaceLayout::new(".alternate-runtime").unwrap(),
         );
         assert!(result.is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scan_rejects_symlinked_workspace_capsule_metadata() {
+        use std::os::unix::fs::symlink;
+
+        let home_dir = tempfile::tempdir().unwrap();
+        let home = AstridHome::from_path(home_dir.path());
+        let workspace = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let capsule = workspace.path().join(".astrid/capsules/example");
+        std::fs::create_dir_all(&capsule).unwrap();
+        let outside_meta = outside.path().join("meta.json");
+        std::fs::write(&outside_meta, "{}").unwrap();
+        symlink(outside_meta, capsule.join("meta.json")).unwrap();
+
+        assert!(
+            scan_installed_capsules_in_home_for_in_workspace(
+                &home,
+                &crate::paths::install_principal(),
+                Some(workspace.path()),
+                &WorkspaceLayout::default(),
+            )
+            .is_err()
+        );
     }
 }

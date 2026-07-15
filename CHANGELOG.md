@@ -91,9 +91,10 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
   relative directory name through `--workspace-state-dir` or
   `ASTRID_WORKSPACE_STATE_DIR`. Config, capsule installation and discovery,
   kernel boot, gateway source checks, hooks, and WIT garbage collection share
-  the selected layout, reject symlink/reparse redirection of workspace state and
-  its security-sensitive descendants, and never scan both project roots. CLI uplinks, including
-  long-lived MCP reconnects, and project-sensitive management reads reject a
+  the selected layout and reject persistent symlink/reparse redirection anywhere
+  in workspace capsule and hook trees before reading them. They never scan both
+  project roots. CLI uplinks, including long-lived MCP reconnects, and
+  project-sensitive management reads reject a
   daemon booted for a different project or layout; daemon stop remains
   available as a recovery operation.
 

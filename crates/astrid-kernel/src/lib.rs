@@ -805,6 +805,46 @@ impl Kernel {
         Ok(kernel)
     }
 
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    fn verify_workspace_capsule_tree(&self, dir: &Path) -> anyhow::Result<()> {
+        if let Ok(relative) = dir.strip_prefix(self.workspace_selection.state_dir()) {
+            self.workspace_selection
+                .verify_tree(relative)
+                .map_err(|error| {
+                    anyhow::anyhow!("workspace capsule tree contains an unsafe redirect: {error}")
+                })?;
+        }
+        Ok(())
+    }
+
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    fn verify_workspace_component_paths(
+        &self,
+        dir: &Path,
+        manifest: &astrid_capsule_types::manifest::CapsuleManifest,
+    ) -> anyhow::Result<()> {
+        let Ok(capsule_relative) = dir.strip_prefix(self.workspace_selection.state_dir()) else {
+            return Ok(());
+        };
+        for component in &manifest.components {
+            if component.path.is_absolute() {
+                anyhow::bail!(
+                    "workspace capsule component must be relative: {}",
+                    component.path.display()
+                );
+            }
+            self.workspace_selection
+                .resolve_file(capsule_relative.join(&component.path))
+                .map_err(|error| {
+                    anyhow::anyhow!(
+                        "workspace capsule component path is unsafe ({}): {error}",
+                        component.path.display()
+                    )
+                })?;
+        }
+        Ok(())
+    }
+
     /// Load a capsule into the Kernel from a directory containing a Capsule.toml
     ///
     /// # Errors
@@ -816,11 +856,14 @@ impl Kernel {
         dir: PathBuf,
         principal: &PrincipalId,
     ) -> Result<(), anyhow::Error> {
+        self.verify_workspace_capsule_tree(&dir)?;
         let manifest_path = dir.join("Capsule.toml");
         let manifest = astrid_capsule::discovery::load_manifest(&manifest_path)
             .map_err(|e| anyhow::anyhow!(e))?;
+        self.verify_workspace_component_paths(&dir, &manifest)?;
         let id = astrid_capsule_types::CapsuleId::from_static(&manifest.package.name);
         let wasm_hash = capsule_instance_hash(&manifest, &dir);
+        self.verify_workspace_capsule_tree(&dir)?;
 
         // Dedup by content hash (issue #1069). Runtime instances are shared by
         // hash across principals: a hash referenced by N principals loads ONCE.
@@ -932,6 +975,7 @@ impl Kernel {
         manifest: astrid_capsule_types::manifest::CapsuleManifest,
         dir: &std::path::Path,
     ) -> Result<Box<dyn astrid_capsule::capsule::Capsule>, anyhow::Error> {
+        self.verify_workspace_capsule_tree(dir)?;
         let load_principal = PrincipalId::default();
 
         let loader = astrid_capsule::loader::CapsuleLoader::new(
@@ -974,6 +1018,7 @@ impl Kernel {
                 let _ = kv.set(&k, v.into_bytes()).await;
             }
         }
+        self.verify_workspace_capsule_tree(dir)?;
 
         let ctx = astrid_capsule::context::CapsuleContext::new(
             load_principal,
@@ -1360,7 +1405,7 @@ impl Kernel {
         );
         let discovered = astrid_capsule::discovery::discover_manifests_in_workspace(
             Some(&paths),
-            None,
+            Some(&self.workspace_root),
             &self.workspace_layout,
         );
         match toposort_manifests(discovered) {
@@ -1599,9 +1644,12 @@ impl Kernel {
         for (principal, capsule) in &capsules {
             let principal = principal.to_string();
             let name = capsule.id().to_string();
-            let mut meta = capsule
-                .source_dir()
-                .and_then(capsules_loaded::read_capsule_meta_opaque);
+            let mut meta = capsule.source_dir().and_then(|source_dir| {
+                self.verify_workspace_capsule_tree(source_dir).ok()?;
+                let meta = capsules_loaded::read_capsule_meta_opaque(source_dir);
+                self.verify_workspace_capsule_tree(source_dir).ok()?;
+                meta
+            });
 
             // Probe the live instance for its tool surface and inject it. Best-
             // effort: a describe (or serialize) failure leaves `tools` absent
@@ -2969,17 +3017,8 @@ fn capsule_discovery_paths_for(
     principal: &PrincipalId,
     workspace_layout: &WorkspaceLayout,
 ) -> Vec<PathBuf> {
-    let mut paths = vec![home.principal_home(principal).capsules_dir()];
-    match workspace_layout
-        .resolve(workspace_root)
-        .and_then(|workspace| workspace.capsules_dir())
-    {
-        Ok(path) => paths.push(path),
-        Err(error) => {
-            tracing::warn!(%error, "Unsafe workspace capsule path; skipping workspace capsules");
-        },
-    }
-    paths
+    let _ = (workspace_root, workspace_layout);
+    vec![home.principal_home(principal).capsules_dir()]
 }
 
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
@@ -3587,34 +3626,24 @@ mod tests {
     }
 
     #[test]
-    fn capsule_discovery_paths_include_workspace_capsules() {
+    fn capsule_discovery_extra_paths_include_principal_capsules_only() {
         let (_d, home) = scratch_home();
         let workspace = tempfile::tempdir().unwrap();
         let paths = capsule_discovery_paths(&home, workspace.path());
         let default = astrid_core::PrincipalId::default();
 
-        assert_eq!(
-            paths,
-            vec![
-                home.principal_home(&default).capsules_dir(),
-                workspace.path().join(".astrid").join("capsules"),
-            ],
-            "daemon discovery must scan the default install dir and the configured workspace"
-        );
+        assert_eq!(paths, vec![home.principal_home(&default).capsules_dir()]);
     }
 
     #[test]
-    fn capsule_discovery_paths_use_injected_workspace_layout() {
+    fn workspace_capsules_are_not_flattened_into_unchecked_extra_paths() {
         let (_d, home) = scratch_home();
         let workspace = tempfile::tempdir().unwrap();
         let layout = WorkspaceLayout::new(".alternate-runtime").unwrap();
         let paths =
             capsule_discovery_paths_for(&home, workspace.path(), &PrincipalId::default(), &layout);
 
-        assert_eq!(
-            paths[1],
-            workspace.path().join(".alternate-runtime").join("capsules")
-        );
+        assert_eq!(paths.len(), 1);
     }
 
     #[tokio::test(flavor = "multi_thread")]

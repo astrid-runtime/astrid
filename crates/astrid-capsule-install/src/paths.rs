@@ -142,18 +142,21 @@ mod tests {
     #[test]
     fn workspace_target_uses_injected_layout() {
         let layout = WorkspaceLayout::new(".alternate-runtime").unwrap();
-        let root = Path::new("/workspace");
+        let root = tempfile::tempdir().unwrap();
         assert_eq!(
             resolve_target_dir_for_in_workspace(
                 &AstridHome::from_path("/home/runtime"),
                 &install_principal(),
                 "example",
                 true,
-                Some(root),
+                Some(root.path()),
                 &layout,
             )
             .unwrap(),
-            PathBuf::from("/workspace/.alternate-runtime/capsules/example")
+            root.path()
+                .canonicalize()
+                .unwrap()
+                .join(".alternate-runtime/capsules/example")
         );
     }
 

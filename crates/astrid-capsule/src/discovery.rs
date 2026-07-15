@@ -162,11 +162,14 @@ pub fn discover_manifests_in_workspace(
     if let Some(workspace_root) = workspace_root {
         match workspace_layout
             .resolve(workspace_root)
-            .and_then(|selection| selection.capsules_dir().map(|dir| (selection, dir)))
-        {
+            .and_then(|selection| {
+                selection
+                    .verify_tree("capsules")
+                    .map(|dir| (selection, dir))
+            }) {
             Ok((selection, dir)) => {
                 load_dedup(&dir, "workspace");
-                if let Err(error) = selection.verify() {
+                if let Err(error) = selection.verify_tree("capsules") {
                     warn!(%error, "Workspace changed during capsule discovery; discarding results");
                     manifests.retain(|(_, path)| !path.starts_with(&dir));
                 }
@@ -427,6 +430,29 @@ version = "0.1.0"
 
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].0.package.name, "alternate-capsule");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn discovery_skips_workspace_with_symlinked_manifest() {
+        use std::os::unix::fs::symlink;
+
+        let workspace = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let capsule = workspace.path().join(".astrid/capsules/redirected");
+        std::fs::create_dir_all(&capsule).unwrap();
+        let manifest = outside.path().join("Capsule.toml");
+        std::fs::write(&manifest, "[package]\nname='outside'\nversion='1.0.0'\n").unwrap();
+        symlink(manifest, capsule.join("Capsule.toml")).unwrap();
+
+        assert!(
+            discover_manifests_in_workspace(
+                None,
+                Some(workspace.path()),
+                &WorkspaceLayout::default()
+            )
+            .is_empty()
+        );
     }
 
     #[test]

@@ -388,6 +388,9 @@ fn install_from_local_path_internal(
         selection
             .resolve_directory(Path::new("capsules").join(id.as_str()))
             .context("workspace capsule target changed after selection")?;
+        selection
+            .verify_tree("capsules")
+            .context("workspace capsule tree contains an unsafe redirect")?;
     } else {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("failed to create {}", parent.display()))?;
@@ -454,6 +457,11 @@ fn install_from_local_path_internal(
 
     // Preserve existing .env.json (user configuration survives reinstall).
     if let Some(ref backup) = backup_dir {
+        if let Some(selection) = &checked_workspace {
+            selection
+                .verify_tree("capsules")
+                .context("workspace backup contains an unsafe redirect")?;
+        }
         restore_env_from_backup_for(home, target_principal, backup, id.as_str());
     }
 
@@ -502,8 +510,8 @@ fn install_from_local_path_internal(
             .resolve_directory(Path::new("capsules").join(id.as_str()))
             .context("workspace capsule target changed during install")?;
         selection
-            .verify()
-            .context("workspace changed during capsule install")?;
+            .verify_tree("capsules")
+            .context("workspace capsule tree changed during install")?;
     }
 
     // Mirror the capsule's WIT into the principal's `home://wit/` so the
@@ -558,8 +566,8 @@ fn install_from_local_path_internal(
 
     if let Some(selection) = &checked_workspace {
         selection
-            .verify()
-            .context("workspace changed before install completion")?;
+            .verify_tree("capsules")
+            .context("workspace capsule tree changed before install completion")?;
     }
 
     Ok(InstallOutput {

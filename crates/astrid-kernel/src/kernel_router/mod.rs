@@ -509,10 +509,11 @@ async fn inventory_manifest_map(
         &kernel.workspace_layout,
     );
     let workspace_layout = kernel.workspace_layout.clone();
+    let workspace_root = kernel.workspace_root.clone();
     let discovered = match tokio::task::spawn_blocking(move || {
         astrid_capsule::discovery::discover_manifests_in_workspace(
             Some(&paths),
-            None,
+            Some(&workspace_root),
             &workspace_layout,
         )
     })

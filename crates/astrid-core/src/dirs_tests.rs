@@ -404,6 +404,41 @@ fn workspace_selection_rejects_redirected_capsule_directory() {
 
 #[cfg(unix)]
 #[test]
+fn workspace_selection_rejects_persistent_redirects_anywhere_in_checked_trees() {
+    use std::os::unix::fs::symlink;
+
+    for relative in [
+        "capsules/child",
+        "capsules/child/Capsule.toml",
+        "capsules/child/meta.json",
+        "capsules/child/.env.json",
+        "capsules/child/component.wasm",
+        "hooks/direct.toml",
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let selection = WorkspaceLayout::default().resolve(root.path()).unwrap();
+        selection.ensure_state_dir().unwrap();
+        let redirected = selection.state_dir().join(relative);
+        std::fs::create_dir_all(redirected.parent().unwrap()).unwrap();
+        if relative == "capsules/child" {
+            symlink(outside.path(), &redirected).unwrap();
+        } else {
+            let outside_file = outside.path().join("outside");
+            std::fs::write(&outside_file, b"outside bytes").unwrap();
+            symlink(outside_file, &redirected).unwrap();
+        }
+        let tree = if relative.starts_with("hooks/") {
+            "hooks"
+        } else {
+            "capsules"
+        };
+        assert!(selection.verify_tree(tree).is_err(), "accepted {relative}");
+    }
+}
+
+#[cfg(unix)]
+#[test]
 fn workspace_selection_rejects_redirected_config_file() {
     use std::os::unix::fs::symlink;
 

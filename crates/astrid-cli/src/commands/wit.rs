@@ -183,11 +183,11 @@ fn collect_marks_in_workspace(
         let workspace = workspace_layout
             .resolve(workspace_root)
             .with_context(|| format!("unsafe workspace at {}", workspace_root.display()))?;
-        let ws_caps = workspace.capsules_dir()?;
+        let ws_caps = workspace.verify_tree("capsules")?;
         if ws_caps.is_dir() {
             collect_from_capsules_dir(&ws_caps, &mut marks);
         }
-        workspace.verify()?;
+        workspace.verify_tree("capsules")?;
     }
 
     Ok(marks)
@@ -249,5 +249,30 @@ mod tests {
 
         assert!(marks.contains("alternate-hash"));
         assert!(!marks.contains("default-hash"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn wit_gc_rejects_symlinked_workspace_meta() {
+        use std::os::unix::fs::symlink;
+
+        let home_dir = tempfile::tempdir().unwrap();
+        let home = AstridHome::from_path(home_dir.path());
+        let workspace = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let capsule = workspace.path().join(".astrid/capsules/example");
+        std::fs::create_dir_all(&capsule).unwrap();
+        let outside_meta = outside.path().join("meta.json");
+        std::fs::write(&outside_meta, r#"{"wit_files":{"x":"outside-hash"}}"#).unwrap();
+        symlink(outside_meta, capsule.join("meta.json")).unwrap();
+
+        assert!(
+            collect_marks_in_workspace(
+                &home,
+                Some(workspace.path()),
+                &astrid_core::dirs::WorkspaceLayout::default(),
+            )
+            .is_err()
+        );
     }
 }

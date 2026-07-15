@@ -300,6 +300,46 @@ impl WorkspaceSelection {
         self.resolve_descendant(relative.as_ref(), DescendantKind::File)
     }
 
+    /// Verify every existing entry in a workspace-relative tree without
+    /// following redirects.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the root is unsafe, any descendant is a symlink,
+    /// reparse redirect, or special file, or the tree changes while walking.
+    pub fn verify_tree(&self, relative: impl AsRef<Path>) -> io::Result<PathBuf> {
+        let relative = relative.as_ref();
+        let root = self.resolve_directory(relative)?;
+        if !root.exists() {
+            return Ok(root);
+        }
+        let mut pending = vec![root.clone()];
+        while let Some(dir) = pending.pop() {
+            for entry in std::fs::read_dir(&dir)? {
+                let entry = entry?;
+                let path = entry.path();
+                let metadata = std::fs::symlink_metadata(&path)?;
+                if metadata.file_type().is_symlink()
+                    || (!metadata.is_dir() && !metadata.is_file())
+                    || std::fs::canonicalize(&path)? != path
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!(
+                            "workspace tree contains a redirected or special entry: {}",
+                            path.display()
+                        ),
+                    ));
+                }
+                if metadata.is_dir() {
+                    pending.push(path);
+                }
+            }
+        }
+        self.resolve_directory(relative)?;
+        Ok(root)
+    }
+
     fn resolve_descendant(&self, relative: &Path, kind: DescendantKind) -> io::Result<PathBuf> {
         self.verify()?;
         let components = relative.components().collect::<Vec<_>>();
