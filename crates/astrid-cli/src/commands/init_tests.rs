@@ -79,7 +79,7 @@ fn batch_install_rejects_declared_version_mismatch() {
         "1.0.0",
         super::super::capsule::install::BatchInstallOutcome {
             installed: vec![super::super::capsule::install::InstalledCapsuleOutcome {
-                id: expected,
+                id: expected.clone(),
                 version: "2.0.0".to_string(),
                 wasm_hash: None,
             }],

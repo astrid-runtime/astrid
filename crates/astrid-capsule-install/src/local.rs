@@ -210,21 +210,14 @@ fn install_from_local_path_internal(
     if let Some(expected) = expected
         && id != *expected
     {
-        bail!(
-            "capsule identity mismatch: expected '{}', manifest declares '{}'",
-            expected,
-            id
-        );
+        bail!("capsule identity mismatch: expected '{expected}', manifest declares '{id}'");
     }
     let installed_version = manifest.package.version.clone();
     if let Some(expected_version) = expected_version
         && installed_version != expected_version
     {
         bail!(
-            "capsule version mismatch for '{}': expected '{}', manifest declares '{}'",
-            id,
-            expected_version,
-            installed_version
+            "capsule version mismatch for '{id}': expected '{expected_version}', manifest declares '{installed_version}'"
         );
     }
 

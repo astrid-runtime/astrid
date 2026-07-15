@@ -249,7 +249,7 @@ pub(crate) enum Commands {
         target_principal: Option<String>,
         /// Grant the target principal access to every capsule the distro
         /// installs (same mechanism as `agent modify --add-capsule`).
-        /// The distro may be selected explicitly or enforced by the operator.
+        /// A distro source must resolve before initialization runs.
         #[arg(long = "grant-capsules")]
         grant_capsules: bool,
     },
@@ -655,9 +655,9 @@ mod tests {
     }
 
     #[test]
-    fn grant_capsules_allows_an_operator_enforced_distro() {
+    fn grant_capsules_parsing_stays_open_for_embedding_composition() {
         let cli = Cli::try_parse_from(["astrid", "init", "--grant-capsules"])
-            .expect("the operator may supply the distro outside the CLI argument surface");
+            .expect("parsing stays open so an embedding layer can resolve the distro source");
 
         assert!(matches!(
             cli.command,
