@@ -9,7 +9,7 @@
 use std::sync::Arc;
 
 use astrid_core::dirs::AstridHome;
-use astrid_core::groups::{BUILTIN_AGENT, BUILTIN_RESTRICTED};
+use astrid_core::groups::{BUILTIN_ADMIN, BUILTIN_AGENT, BUILTIN_RESTRICTED};
 use astrid_core::principal::PrincipalId;
 use astrid_core::profile::PrincipalProfile;
 use astrid_events::kernel_api::{AdminRequestKind, AdminResponseBody};
@@ -184,6 +184,59 @@ async fn agent_modify_empty_delta_verifies_target_without_writing_profile() {
     )
     .await;
     assert_error_contains(&missing, "missing-target");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn agent_modify_preserves_default_admin_bootstrap_anchor() {
+    let (_dir, kernel) = fixture().await;
+    let default = PrincipalId::default();
+    let path = PrincipalProfile::path_for(&kernel.astrid_home, &default);
+    PrincipalProfile {
+        groups: vec![BUILTIN_ADMIN.to_string()],
+        ..Default::default()
+    }
+    .save_to_path(&path)
+    .expect("seed default admin profile");
+
+    let removal = handlers::dispatch(
+        &kernel,
+        &default,
+        AdminRequestKind::AgentModify {
+            principal: default.clone(),
+            add_groups: Vec::new(),
+            remove_groups: vec![BUILTIN_ADMIN.to_string()],
+            add_capsules: Vec::new(),
+            remove_capsules: Vec::new(),
+        },
+    )
+    .await;
+    assert_error_contains(&removal, "bootstrap anchor");
+    assert_eq!(
+        PrincipalProfile::load_from_path(&path)
+            .expect("reload default profile")
+            .groups,
+        vec![BUILTIN_ADMIN.to_string()]
+    );
+
+    let remove_and_add = handlers::dispatch(
+        &kernel,
+        &default,
+        AdminRequestKind::AgentModify {
+            principal: default,
+            add_groups: vec![BUILTIN_ADMIN.to_string()],
+            remove_groups: vec![BUILTIN_ADMIN.to_string()],
+            add_capsules: Vec::new(),
+            remove_capsules: Vec::new(),
+        },
+    )
+    .await;
+    assert_success(&remove_and_add);
+    assert_eq!(
+        PrincipalProfile::load_from_path(&path)
+            .expect("reload default profile")
+            .groups,
+        vec![BUILTIN_ADMIN.to_string()]
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

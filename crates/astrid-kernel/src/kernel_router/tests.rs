@@ -457,32 +457,76 @@ fn resolve_caller_uses_ipc_principal_when_present() {
         uuid::Uuid::nil(),
     );
     msg.principal = Some("alice".to_string());
-    let caller = resolve_caller(&msg);
+    let caller = resolve_caller(&msg).expect("valid caller");
     assert_eq!(caller.as_str(), "alice");
 }
 
 #[test]
-fn resolve_caller_falls_back_to_default_when_missing() {
+fn resolve_caller_rejects_missing_principal() {
     let msg = IpcMessage::new(
         Topic::kernel_request("system"),
         IpcPayload::RawJson(serde_json::json!({})),
         uuid::Uuid::nil(),
     );
-    let caller = resolve_caller(&msg);
-    assert_eq!(caller, PrincipalId::default());
+    assert_eq!(resolve_caller(&msg), Err(CallerResolutionError::Missing));
 }
 
 #[test]
-fn resolve_caller_falls_back_to_default_on_invalid_principal() {
+fn resolve_caller_rejects_invalid_principal() {
     let mut msg = IpcMessage::new(
         Topic::kernel_request("system"),
         IpcPayload::RawJson(serde_json::json!({})),
         uuid::Uuid::nil(),
     );
-    // Invalid principal chars → PrincipalId::new fails → fall back.
     msg.principal = Some("alice@evil.example".to_string());
-    let caller = resolve_caller(&msg);
-    assert_eq!(caller, PrincipalId::default());
+    assert_eq!(resolve_caller(&msg), Err(CallerResolutionError::Invalid));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn management_router_denies_missing_and_invalid_principals_deterministically() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let home = astrid_core::dirs::AstridHome::from_path(dir.path());
+    let kernel = crate::test_kernel_with_home(home).await;
+    drop(spawn_kernel_router(Arc::clone(&kernel)));
+
+    for (suffix, principal) in [
+        ("missing_caller", None),
+        ("invalid_caller", Some("alice@evil.example")),
+    ] {
+        let request_topic = Topic::kernel_request(suffix);
+        let response_topic = Topic::kernel_response(suffix);
+        let mut receiver = kernel.event_bus.subscribe_topic(response_topic.as_str());
+        let payload = serde_json::to_value(KernelRequest::GetStatus).expect("serialize request");
+        let mut message = IpcMessage::new(
+            request_topic,
+            IpcPayload::RawJson(payload),
+            kernel.session_id.0,
+        );
+        message.principal = principal.map(str::to_string);
+        let _ = kernel.event_bus.publish(astrid_events::AstridEvent::Ipc {
+            metadata: astrid_events::EventMetadata::new("test"),
+            message,
+        });
+
+        let value = astrid_runtime::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let event = receiver.recv().await.expect("response event");
+                if let astrid_events::AstridEvent::Ipc { message, .. } = &*event
+                    && let IpcPayload::RawJson(value) = &message.payload
+                {
+                    return value.clone();
+                }
+            }
+        })
+        .await
+        .expect("management denial within 2s");
+        let response: KernelResponse = serde_json::from_value(value).expect("typed response");
+        assert!(matches!(
+            response,
+            KernelResponse::Error(ref reason) if reason == MANAGEMENT_CALLER_REQUIRED
+        ));
+        assert_eq!(kernel.total_connection_count(), 0);
+    }
 }
 
 // ── Agent-loop readiness dispatch (roundtrip) ────────────────────

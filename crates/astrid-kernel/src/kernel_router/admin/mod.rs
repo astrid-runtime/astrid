@@ -109,9 +109,30 @@ pub(crate) fn spawn_admin_router(kernel: Arc<crate::Kernel>) -> astrid_runtime::
                     // pure-read endpoints. (For an HTTP front that
                     // hosts thousands of agents the serial loop is
                     // unworkable.)
+                    let caller = match resolve_caller(message) {
+                        Ok(caller) => caller,
+                        Err(error) => {
+                            warn!(
+                                security_event = true,
+                                topic = %message.topic,
+                                reason = error.reason(),
+                                "Rejected admin management request without a valid principal"
+                            );
+                            publish_response(
+                                &kernel,
+                                admin_response_topic(&message.topic),
+                                AdminKernelResponse::for_request(
+                                    req.request_id,
+                                    AdminResponseBody::Error(
+                                        super::MANAGEMENT_CALLER_REQUIRED.to_string(),
+                                    ),
+                                ),
+                            );
+                            continue;
+                        },
+                    };
                     let kernel = Arc::clone(&kernel);
                     let topic = message.topic.clone();
-                    let caller = resolve_caller(message);
                     let device_key_id = resolve_device_key_id(message);
                     astrid_runtime::spawn(async move {
                         handle_admin_request(&kernel, topic, caller, device_key_id, req).await;

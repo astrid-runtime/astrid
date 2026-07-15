@@ -495,6 +495,18 @@ async fn agent_modify_from_req(
             Ok(changed) => changed,
             Err(e) => return err_bad_input(format!("group delta rejected: {e}")),
         };
+    if principal == PrincipalId::default()
+        && !profile
+            .groups
+            .iter()
+            .any(|group| group == astrid_core::groups::BUILTIN_ADMIN)
+    {
+        return err_bad_input(
+            "cannot remove the built-in `admin` group from the `default` principal — it is the \
+             single-tenant bootstrap anchor"
+                .to_string(),
+        );
+    }
     let capsules_changed = match apply_set_delta::<CapsuleGrant>(
         &mut profile.capsules,
         &add_capsules,
