@@ -382,8 +382,9 @@ fn capability_registry_revision_1_digest_vectors_are_stable() {
         .collect::<Vec<_>>();
 
     assert_eq!(actual.len(), CAPABILITY_REGISTRY_REVISION_1_DIGESTS.len());
-    for ((actual_id, actual_digest), (expected_id, expected_digest)) in
-        actual.iter().zip(CAPABILITY_REGISTRY_REVISION_1_DIGESTS)
+    for ((actual_id, actual_digest), (expected_id, expected_digest)) in actual
+        .iter()
+        .zip(CAPABILITY_REGISTRY_REVISION_1_DIGESTS.iter().copied())
     {
         assert_eq!(*actual_id, expected_id);
         assert_eq!(actual_digest.as_str(), expected_digest, "{expected_id}");
