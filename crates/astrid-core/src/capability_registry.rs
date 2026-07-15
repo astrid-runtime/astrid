@@ -16,6 +16,7 @@ use util::{
     validate_digest_length,
 };
 
+mod revision_1;
 mod util;
 
 const ENTRY_DIGEST_DOMAIN: &[u8] = b"astrid-capability-entry\0";
@@ -140,7 +141,7 @@ pub fn capability_registry_revision_1() -> Result<CapabilityRegistryManifest, Au
             let semantics = revision_1_semantics(id).ok_or_else(|| {
                 AuthorityRegistryError::MissingRevisionDefinition { id: id.to_string() }
             })?;
-            let danger = revision_1_danger(id).ok_or_else(|| {
+            let danger = revision_1::danger(id).ok_or_else(|| {
                 AuthorityRegistryError::MissingRevisionDisplayMetadata { id: id.to_string() }
             })?;
             RegisteredCapability::new(
@@ -156,65 +157,6 @@ pub fn capability_registry_revision_1() -> Result<CapabilityRegistryManifest, Au
         .collect::<Result<Vec<_>, AuthorityRegistryError>>()?;
 
     CapabilityRegistryManifest::new(CAPABILITY_REGISTRY_REVISION_1, entries)
-}
-
-fn revision_1_danger(id: &str) -> Option<CapabilityDanger> {
-    use CapabilityDanger::{Elevated, Extreme, Normal, Safe};
-
-    Some(match id {
-        "system:status"
-        | "capsule:list"
-        | "self:capsule:list"
-        | "agent:list"
-        | "self:agent:list"
-        | "quota:get"
-        | "self:quota:get"
-        | "group:list"
-        | "self:group:list"
-        | "caps:token:list"
-        | "invite:list"
-        | "self:approval:respond" => Safe,
-        "capsule:reload"
-        | "self:capsule:reload"
-        | "self:capsule:remove"
-        | "self:workspace:rollback"
-        | "agent:create"
-        | "agent:enable"
-        | "quota:set"
-        | "self:quota:set"
-        | "invite:redeem"
-        | "invite:revoke"
-        | "self:auth:pair"
-        | "auth:pair:redeem" => Normal,
-        "self:capsule:install"
-        | "capsule:remove"
-        | "self:workspace:promote"
-        | "agent:delete"
-        | "agent:disable"
-        | "agent:modify"
-        | "group:create"
-        | "group:delete"
-        | "group:modify"
-        | "caps:revoke"
-        | "caps:token:revoke"
-        | "invite:issue"
-        | "audit:read_all"
-        | "self:auth:pair:admin"
-        | "auth:pair" => Elevated,
-        "system:shutdown"
-        | "capsule:install"
-        | "agent:create:inherit"
-        | "agent:create:clone"
-        | "caps:grant"
-        | "caps:token:mint"
-        | "system:resources:unbounded"
-        | "net_bind"
-        | "uplink"
-        | "capsule:access:any"
-        | "authority:profile:manage"
-        | "authority:repair" => Extreme,
-        _ => return None,
-    })
 }
 
 fn revision_1_semantics(id: &str) -> Option<RevisionSemantics> {
