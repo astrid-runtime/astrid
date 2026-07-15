@@ -516,6 +516,99 @@ async fn handle_redeem_admin_request(
     );
 }
 
+struct AdminAuthorizationContext<'a> {
+    caller: &'a PrincipalId,
+    device_key_id: Option<&'a str>,
+    kind: &'a AdminRequestKind,
+    method: &'static str,
+    required_cap: &'static str,
+    target_principal: Option<&'a PrincipalId>,
+    audit_params: Option<&'a serde_json::Value>,
+}
+
+async fn record_admin_authorization_failure(
+    kernel: &Arc<crate::Kernel>,
+    context: &AdminAuthorizationContext<'_>,
+    error: &str,
+) {
+    warn!(
+        security_event = true,
+        method = context.method,
+        principal = %context.caller,
+        required = context.required_cap,
+        error,
+        "Permission check denied admin request"
+    );
+    record_admin_audit(
+        kernel,
+        AdminAuditEntry {
+            caller: context.caller,
+            method: context.method,
+            required_cap: context.required_cap,
+            device_key_id: context.device_key_id,
+            target_principal: context.target_principal.cloned(),
+            params: context.audit_params.cloned(),
+            authorization: AuthorizationProof::Denied {
+                reason: error.to_string(),
+            },
+            outcome: AuditOutcome::failure(error),
+        },
+    )
+    .await;
+}
+
+async fn authorize_admin_request(
+    kernel: &Arc<crate::Kernel>,
+    context: &AdminAuthorizationContext<'_>,
+) -> Result<super::AuthorizedRequest, String> {
+    let authorization = match authorize_request(
+        kernel,
+        context.caller,
+        context.device_key_id,
+        context.required_cap,
+    ) {
+        Ok(authorization) => authorization,
+        Err(error) => {
+            let error = error.to_string();
+            record_admin_authorization_failure(kernel, context, &error).await;
+            return Err(error);
+        },
+    };
+
+    if let AdminRequestKind::PairDeviceIssue {
+        expires_secs,
+        scope,
+        ..
+    } = context.kind
+        && let Err(error) =
+            pair_device_handlers::preflight_pair_device_issue(&authorization, *expires_secs, scope)
+    {
+        record_admin_authorization_failure(kernel, context, &error).await;
+        return Err(error);
+    }
+
+    record_admin_audit(
+        kernel,
+        AdminAuditEntry {
+            caller: context.caller,
+            method: context.method,
+            required_cap: context.required_cap,
+            device_key_id: context.device_key_id,
+            target_principal: context.target_principal.cloned(),
+            params: context.audit_params.cloned(),
+            authorization: AuthorizationProof::System {
+                reason: format!(
+                    "policy allow: {} holds {}",
+                    context.caller, context.required_cap
+                ),
+            },
+            outcome: AuditOutcome::success(),
+        },
+    )
+    .await;
+    Ok(authorization)
+}
+
 async fn handle_admin_request(
     kernel: &Arc<crate::Kernel>,
     topic: Topic,
@@ -545,103 +638,26 @@ async fn handle_admin_request(
     // later mistake for a system-of-record entry — the canonical copy
     // lives on `AuthConfig.public_keys`.
     let audit_params = sanitize_admin_audit_params(&req.kind);
-
-    let authorization =
-        match authorize_request(kernel, &caller, device_key_id.as_deref(), required_cap) {
-            Ok(authorization) => authorization,
-            Err(e) => {
-                warn!(
-                    security_event = true,
-                    method = method,
-                    principal = %caller,
-                    required = required_cap,
-                    error = %e,
-                    "Permission check denied admin request"
-                );
-                record_admin_audit(
-                    kernel,
-                    AdminAuditEntry {
-                        caller: &caller,
-                        method,
-                        required_cap,
-                        device_key_id: device_key_id.as_deref(),
-                        target_principal: target,
-                        params: audit_params,
-                        authorization: AuthorizationProof::Denied {
-                            reason: e.to_string(),
-                        },
-                        outcome: AuditOutcome::failure(e.to_string()),
-                    },
-                )
-                .await;
-                publish_response(
-                    kernel,
-                    response_topic,
-                    AdminKernelResponse::for_request(
-                        request_id,
-                        AdminResponseBody::Error(e.to_string()),
-                    ),
-                );
-                return;
-            },
-        };
-
-    if let AdminRequestKind::PairDeviceIssue {
-        expires_secs,
-        scope,
-        ..
-    } = &req.kind
-        && let Err(error) =
-            pair_device_handlers::preflight_pair_device_issue(&authorization, *expires_secs, scope)
-    {
-        warn!(
-            security_event = true,
-            method,
-            principal = %caller,
-            required = required_cap,
-            error = %error,
-            "Pair-device issuance denied by scope validation"
-        );
-        record_admin_audit(
-            kernel,
-            AdminAuditEntry {
-                caller: &caller,
-                method,
-                required_cap,
-                device_key_id: device_key_id.as_deref(),
-                target_principal: target,
-                params: audit_params,
-                authorization: AuthorizationProof::Denied {
-                    reason: error.clone(),
-                },
-                outcome: AuditOutcome::failure(error.clone()),
-            },
-        )
-        .await;
-        publish_response(
-            kernel,
-            response_topic,
-            AdminKernelResponse::for_request(request_id, AdminResponseBody::Error(error)),
-        );
-        return;
-    }
-
-    record_admin_audit(
-        kernel,
-        AdminAuditEntry {
-            caller: &caller,
-            method,
-            required_cap,
-            device_key_id: device_key_id.as_deref(),
-            target_principal: target,
-            params: audit_params,
-            authorization: AuthorizationProof::System {
-                reason: format!("policy allow: {caller} holds {required_cap}"),
-            },
-            outcome: AuditOutcome::success(),
+    let context = AdminAuthorizationContext {
+        caller: &caller,
+        device_key_id: device_key_id.as_deref(),
+        kind: &req.kind,
+        method,
+        required_cap,
+        target_principal: target.as_ref(),
+        audit_params: audit_params.as_ref(),
+    };
+    let authorization = match authorize_admin_request(kernel, &context).await {
+        Ok(authorization) => authorization,
+        Err(error) => {
+            publish_response(
+                kernel,
+                response_topic,
+                AdminKernelResponse::for_request(request_id, AdminResponseBody::Error(error)),
+            );
+            return;
         },
-    )
-    .await;
+    };
 
     let body = handlers::dispatch_authorized(kernel, &authorization, req.kind).await;
     publish_response(
