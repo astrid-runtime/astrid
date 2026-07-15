@@ -5,7 +5,6 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use astrid_core::kernel_api::{DaemonStatus, KernelRequest, KernelResponse};
-use astrid_uplink::KernelClient;
 
 use crate::bootstrap::find_companion_binary;
 use crate::commands::daemon_control;
@@ -420,7 +419,7 @@ pub(crate) async fn handle_status() -> Result<()> {
         return Ok(());
     }
 
-    let mut client = KernelClient::connect(crate::principal::current())
+    let mut client = socket_client::connect_kernel_for_workspace(None)
         .await
         .context("Daemon socket exists but connection failed")?;
     let status = status_response(
@@ -487,7 +486,9 @@ pub(crate) async fn handle_stop() -> Result<()> {
     }
 
     // Graceful path: the socket is present and serviceable.
-    if socket_present && let Ok(client) = KernelClient::connect(crate::principal::current()).await {
+    // Deliberately bypass the selected-workspace check: stopping a daemon is
+    // the recovery path when that daemon belongs to another project/layout.
+    if socket_present && let Ok(client) = socket_client::connect_kernel_for_recovery().await {
         let mut client = client.with_timeout(Duration::from_secs(10));
         match client
             .request(KernelRequest::Shutdown {

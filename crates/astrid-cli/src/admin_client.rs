@@ -23,5 +23,19 @@ use anyhow::Result;
 /// Returns an error if the socket file is missing (no daemon),
 /// connection fails, or the handshake is rejected.
 pub(crate) async fn connect_as_active_agent() -> Result<AdminClient> {
-    AdminClient::connect(crate::principal::current()).await
+    connect_for_workspace_as(crate::principal::current()).await
+}
+
+/// Connect an admin client as an explicit caller after verifying the selected
+/// workspace on both sides of the daemon handshake.
+///
+/// Invite redemption uses the default principal because the invite token is
+/// the authentication credential; the workspace boundary still applies.
+pub(crate) async fn connect_for_workspace_as(
+    caller: astrid_core::PrincipalId,
+) -> Result<AdminClient> {
+    Ok(
+        crate::socket_client::connect_workspace_client(None, || AdminClient::connect(caller))
+            .await?,
+    )
 }

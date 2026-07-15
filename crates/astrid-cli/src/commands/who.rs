@@ -18,7 +18,6 @@ use std::process::ExitCode;
 
 use anyhow::Result;
 use astrid_core::kernel_api::{KernelRequest, KernelResponse};
-use astrid_uplink::KernelClient;
 use clap::Args;
 use colored::Colorize;
 use serde::Serialize;
@@ -56,9 +55,15 @@ pub(crate) async fn run(args: WhoArgs) -> Result<ExitCode> {
         }
         return Ok(ExitCode::SUCCESS);
     }
-    let Ok(mut client) = KernelClient::connect(crate::principal::current()).await else {
-        eprintln!("{}", Theme::error("Failed to connect to daemon"));
-        return Ok(ExitCode::from(1));
+    let mut client = match crate::socket_client::connect_kernel_for_workspace(None).await {
+        Ok(client) => client,
+        Err(error) => {
+            eprintln!(
+                "{}",
+                Theme::error(&format!("Failed to connect to daemon: {error:#}"))
+            );
+            return Ok(ExitCode::from(1));
+        },
     };
     let status = match client.request(KernelRequest::GetStatus).await {
         Ok(KernelResponse::Status(status)) => status,

@@ -217,7 +217,7 @@ pub(crate) async fn run_or_connect(
                     )
                 },
             );
-            return Err(e.context(log_hint));
+            return Err(anyhow::Error::new(e).context(log_hint));
         },
     };
 

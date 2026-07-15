@@ -91,8 +91,9 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
   relative directory name through `--workspace-state-dir` or
   `ASTRID_WORKSPACE_STATE_DIR`. Config, capsule installation and discovery,
   kernel boot, gateway source checks, hooks, and WIT garbage collection share
-  the selected layout and never scan both project roots. CLI uplinks reject a
-  daemon booted for a different project or layout.
+  the selected layout and never scan both project roots. CLI uplinks and
+  project-sensitive management reads reject a daemon booted for a different
+  project or layout; daemon stop remains available as a recovery operation.
 
 - **Runtime E2E now stages the pinned Unicity AOS monorepo.** The workflow
   preserves the AOS Cargo workspace outside the core checkout and supplies

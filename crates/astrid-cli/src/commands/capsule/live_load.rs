@@ -28,9 +28,10 @@ pub(crate) async fn nudge_daemon_reload(capsule_ids: &[String]) {
     if capsule_ids.is_empty() {
         return;
     }
-    // No socket file => no daemon to nudge. Stay silent: the standalone install
-    // already reported success, and the capsule loads on the next daemon start.
-    if !crate::socket_client::proxy_socket_path().exists() {
+    // A stale socket is still an offline install. Probe reachability without an
+    // authenticated handshake before the workspace checks so missing readiness
+    // metadata cannot turn an unreachable daemon into a 60-second wait.
+    if !daemon_socket_reachable().await {
         return;
     }
     // One fresh session UUID, used for BOTH the connection's SessionId and each
@@ -38,18 +39,17 @@ pub(crate) async fn nudge_daemon_reload(capsule_ids: &[String]) {
     // session — never the reserved nil UUID, which is SYSTEM_SESSION_UUID.
     let session_uuid = uuid::Uuid::new_v4();
     let session = astrid_core::SessionId::from_uuid(session_uuid);
-    let Ok(mut client) =
-        crate::socket_client::SocketClient::connect(session, crate::principal::current()).await
-    else {
-        // Socket present but unreachable (e.g. a hung/stale daemon). Leave the
-        // install standalone rather than failing it.
-        return;
+    let mut client = match classify_live_client(
+        crate::socket_client::connect_for_workspace(session, crate::principal::current(), None)
+            .await,
+    ) {
+        Ok(Some(client)) => client,
+        Ok(None) => return,
+        Err(error) => {
+            eprintln!("Note: installed capsules to disk, but skipped live reload because {error}.");
+            return;
+        },
     };
-    // Validate after connect so a concurrent daemon restart cannot retarget us.
-    if let Err(error) = crate::commands::daemon::ensure_daemon_workspace_matches(None).await {
-        eprintln!("Note: installed capsules to disk, but skipped live reload because {error}.");
-        return;
-    }
 
     for id in capsule_ids {
         let Ok(val) = serde_json::to_value(KernelRequest::ReloadCapsule { id: id.clone() }) else {
@@ -117,20 +117,19 @@ pub(crate) async fn try_daemon_unload(capsule_id: &str) -> anyhow::Result<LiveUn
     use anyhow::{Context, bail};
     use astrid_core::kernel_api::{KernelRequest, KernelResponse};
 
-    if capsule_id.is_empty() || !crate::socket_client::proxy_socket_path().exists() {
+    if capsule_id.is_empty() || !daemon_socket_reachable().await {
         return Ok(LiveUnload::NoDaemon);
     }
     let session_uuid = uuid::Uuid::new_v4();
     let session = astrid_core::SessionId::from_uuid(session_uuid);
-    let Ok(mut client) =
-        crate::socket_client::SocketClient::connect(session, crate::principal::current()).await
+    let Some(mut client) = classify_live_client(
+        crate::socket_client::connect_for_workspace(session, crate::principal::current(), None)
+            .await,
+    )
+    .context("refusing to unload from a daemon with a different workspace selection")?
     else {
         return Ok(LiveUnload::NoDaemon);
     };
-    // A connected mismatch is an error; removal must not proceed as offline.
-    crate::commands::daemon::ensure_daemon_workspace_matches(None)
-        .await
-        .context("refusing to unload from a daemon with a different workspace selection")?;
 
     let val = serde_json::to_value(KernelRequest::UnloadCapsule {
         id: capsule_id.to_string(),
@@ -169,5 +168,43 @@ pub(crate) async fn try_daemon_unload(capsule_id: &str) -> anyhow::Result<LiveUn
             bail!("running daemon declined live capsule unload: {reason}")
         },
         _ => bail!("running daemon returned a malformed live capsule unload response"),
+    }
+}
+
+async fn daemon_socket_reachable() -> bool {
+    let path = crate::socket_client::proxy_socket_path();
+    path.exists() && tokio::net::UnixStream::connect(path).await.is_ok()
+}
+
+fn classify_live_client<T>(
+    result: crate::socket_client::WorkspaceConnectionResult<T>,
+) -> anyhow::Result<Option<T>> {
+    match result {
+        Ok(client) => Ok(Some(client)),
+        Err(crate::socket_client::WorkspaceConnectionError::Connect(_)) => Ok(None),
+        Err(crate::socket_client::WorkspaceConnectionError::Selection(error)) => Err(error),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::classify_live_client;
+    use crate::socket_client::WorkspaceConnectionError;
+
+    #[test]
+    fn live_client_classification_keeps_offline_and_mismatch_distinct() {
+        assert!(
+            classify_live_client::<()>(Err(WorkspaceConnectionError::Connect(anyhow::anyhow!(
+                "unreachable socket"
+            ))))
+            .unwrap()
+            .is_none()
+        );
+        assert!(
+            classify_live_client::<()>(Err(WorkspaceConnectionError::Selection(anyhow::anyhow!(
+                "workspace mismatch"
+            ))))
+            .is_err()
+        );
     }
 }
