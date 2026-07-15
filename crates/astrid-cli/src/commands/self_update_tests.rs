@@ -229,65 +229,85 @@ fn resolve_repo_precedence_and_validation() {
 }
 
 #[test]
-fn blake3_verification_matches_independent_vector() {
-    let archive = b"hello astrid";
-    // Independently generated with `printf %s 'hello astrid' | b3sum --no-names`.
-    let good = "41251d32ddff968c23c1c83c4e7b3af8d6fef8912b4806aadec90e106a629fef";
-    assert_eq!(blake3::hash(archive).to_hex().as_str(), good);
-    let body = format!("{good}  astrid-1.0.0-x.tar.gz\n");
-    verify_blake3(archive, &body, "astrid-1.0.0-x.tar.gz").expect("matching sum verifies");
-
-    let asset = "astrid-1.0.0-x.tar.gz";
-
-    // Wrong sum -> error.
-    let bad_body = format!("{}  {asset}\n", "0".repeat(64));
-    assert!(verify_blake3(archive, &bad_body, asset).is_err());
-    // Missing entry -> error.
-    let other = format!("{}  other.tar.gz\n", "0".repeat(64));
-    assert!(verify_blake3(archive, &other, asset).is_err());
-    // Malformed length, non-hex and uppercase encodings are rejected.
-    assert!(verify_blake3(archive, &format!("{}  {asset}\n", "a".repeat(63)), asset).is_err());
-    assert!(verify_blake3(archive, &format!("{}g  {asset}\n", "a".repeat(63)), asset).is_err());
-    assert!(
-        verify_blake3(
-            archive,
-            &format!("{}  {asset}\n", good.to_uppercase()),
-            asset
-        )
-        .is_err()
-    );
-    // A matching checksum cannot be shadowed by a duplicate entry.
-    let duplicate = format!("{good}  {asset}\n{good}  {asset}\n");
-    assert!(verify_blake3(archive, &duplicate, asset).is_err());
-    // Manifest validity is platform-independent: duplicates for a different
-    // release asset are rejected as well.
-    let duplicate_other = format!(
-        "{good}  {asset}\n{}  other.tar.gz\n{}  other.tar.gz\n",
-        "0".repeat(64),
-        "1".repeat(64)
-    );
-    assert!(verify_blake3(archive, &duplicate_other, asset).is_err());
-
-    let overlong = "a".repeat(MAX_MANIFEST_LINE_BYTES + 1);
-    let error = verify_blake3(archive, &overlong, asset)
-        .unwrap_err()
-        .to_string();
+fn release_tags_are_canonical_and_identity_safe() {
+    assert_eq!(canonical_release_version("v1.2.3").unwrap(), "1.2.3");
     assert_eq!(
-        error,
-        format!("BLAKE3SUMS.txt line 1 exceeds {MAX_MANIFEST_LINE_BYTES} byte limit")
+        canonical_release_version("v1.2.3-rc.1").unwrap(),
+        "1.2.3-rc.1"
+    );
+    for invalid in ["1.2.3", "vv1.2.3", "v01.2.3", "v1.2", "v1.2.3-01"] {
+        assert!(
+            canonical_release_version(invalid).is_err(),
+            "unexpectedly accepted {invalid}"
+        );
+    }
+}
+
+#[test]
+fn release_asset_lookup_requires_one_exact_asset() {
+    let release = serde_json::json!({
+        "assets": [
+            {
+                "name": "astrid-1.0.0-x.tar.gz",
+                "browser_download_url": "https://example.com/archive"
+            },
+            {
+                "name": "astrid-1.0.0-x.tar.gz.sigstore.json",
+                "browser_download_url": "https://example.com/bundle"
+            },
+            {
+                "name": "BLAKE3SUMS.txt",
+                "browser_download_url": "https://example.com/sums"
+            }
+        ]
+    });
+    assert_eq!(
+        exact_asset_url(&release, "astrid-1.0.0-x.tar.gz").unwrap(),
+        "https://example.com/archive"
+    );
+    assert!(exact_asset_url(&release, "astrid-1.0.0-y.tar.gz").is_err());
+
+    let duplicate = serde_json::json!({
+        "assets": [
+            {
+                "name": "BLAKE3SUMS.txt",
+                "browser_download_url": "https://example.com/one"
+            },
+            {
+                "name": "BLAKE3SUMS.txt",
+                "browser_download_url": "https://example.com/two"
+            }
+        ]
+    });
+    assert!(exact_asset_url(&duplicate, "BLAKE3SUMS.txt").is_err());
+
+    let oversized = serde_json::json!({
+        "assets": vec![serde_json::json!({"name": "irrelevant"}); MAX_RELEASE_ASSETS + 1]
+    });
+    assert!(
+        exact_asset_url(&oversized, "irrelevant")
+            .unwrap_err()
+            .to_string()
+            .contains("too many assets")
     );
 }
 
 #[test]
-fn legacy_sha_only_release_is_not_accepted() {
-    let release = serde_json::json!({
+fn publisher_bundle_and_blake3_manifest_are_both_mandatory() {
+    let sha_only = serde_json::json!({
         "assets": [{
             "name": "SHA256SUMS.txt",
             "browser_download_url": "https://example.com/SHA256SUMS.txt"
         }]
     });
-    let error = blake3_sums_url(&release).unwrap_err().to_string();
-    assert!(error.contains("release has no BLAKE3SUMS.txt"));
+    assert!(matches!(
+        integrity_manifest_url(&sha_only).unwrap_err(),
+        UpdateStageError::Integrity(_)
+    ));
+    assert!(matches!(
+        publisher_bundle_url(&sha_only, "astrid-1.0.0-x.tar.gz").unwrap_err(),
+        UpdateStageError::PublisherAuthentication(_)
+    ));
 }
 
 #[test]

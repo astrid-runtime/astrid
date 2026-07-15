@@ -187,6 +187,10 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 serde_yaml = "0.9"
 sha2 = "0.11"
+# Security-sensitive native verifier for keyless Sigstore bundles. Keep this
+# exact-pinned: it sits on the self-update trust boundary, and its TUF support
+# refreshes the public-good trust root without invoking an external verifier.
+sigstore-verify = { version = "=0.11.0", default-features = false, features = ["rustls", "tuf"] }
 subtle = "2"
 surrealkv = "0.21"
 surrealdb = { version = "3.0.0-beta.3", default-features = false, features = ["kv-surrealkv", "kv-mem"] }

@@ -51,6 +51,21 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
   treats the stored `key_id` as informational and re-derives it from the public
   key, so existing local profiles self-heal; device-scoped bearer sessions must
   authenticate again after upgrading.
+- **Self-managed updates now authenticate the release publisher before any
+  archive is extracted or installed.** The updater requires a Sigstore bundle
+  for the exact archive bytes, verifies it with fresh public-good trust
+  material, and pins the certificate to Astrid's release workflow, repository,
+  tag, and GitHub Actions issuer. Only an authenticated archive can enter the
+  independent BLAKE3 integrity stage; missing, duplicated, malformed, or
+  mismatched evidence fails closed with a distinct publisher-authentication or
+  integrity error. Homebrew and Cargo installs remain delegated to their
+  package managers, and the signed SHA-256 compatibility manifest remains
+  available to downstream tooling. Before publishing, release automation now
+  requires both Cosign and the updater's native production verifier to accept
+  every generated archive and bundle pair. Existing v0.9.x self-updaters cannot
+  enforce the new publisher policy retroactively; it applies from the first
+  release containing this updater onward. Closes #1250.
+
 - **Astrid-owned identifiers now use domain-separated BLAKE3.** Invite and
   pair-device token stores carry an explicit schema and invalidate
   legacy SHA-256 records that cannot be rehashed without their raw secrets;

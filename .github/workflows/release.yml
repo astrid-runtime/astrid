@@ -113,6 +113,7 @@ jobs:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           fetch-depth: 0
+          submodules: recursive
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
@@ -224,6 +225,32 @@ jobs:
           for asset in *.tar.gz BLAKE3SUMS.txt SHA256SUMS.txt; do
             cosign sign-blob --yes --bundle "${asset}.sigstore.json" "$asset"
           done
+
+      - name: Verify release signatures
+        run: |
+          cd artifacts
+          IDENTITY="https://github.com/astrid-runtime/astrid/.github/workflows/release.yml@refs/tags/${GITHUB_REF_NAME}"
+          ISSUER="https://token.actions.githubusercontent.com"
+          for asset in *.tar.gz BLAKE3SUMS.txt SHA256SUMS.txt; do
+            cosign verify-blob \
+              --bundle "${asset}.sigstore.json" \
+              --certificate-identity "$IDENTITY" \
+              --certificate-oidc-issuer "$ISSUER" \
+              --use-signed-timestamps \
+              "$asset"
+          done
+
+      - name: Verify release archives with the native updater policy
+        env:
+          ASTRID_RELEASE_GATE_ARTIFACTS: ${{ github.workspace }}/artifacts
+          ASTRID_RELEASE_GATE_VERSION: ${{ github.ref_name }}
+          CARGO_BUILD_JOBS: "1"
+        run: |
+          ASTRID_RELEASE_GATE_VERSION="${ASTRID_RELEASE_GATE_VERSION#v}"
+          export ASTRID_RELEASE_GATE_VERSION
+          cargo test -p astrid --bin astrid --locked \
+            commands::update_auth::tests::release_gate_authenticates_all_archives_with_production_policy \
+            -- --ignored --exact
 
       - name: Create release
         uses: softprops/action-gh-release@718ea10b132b3b2eba29c1007bb80653f286566b # v3.0.1
