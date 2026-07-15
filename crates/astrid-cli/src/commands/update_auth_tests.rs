@@ -206,6 +206,20 @@ fn integrity_manifest_rejects_noncanonical_and_duplicate_entries() {
         .unwrap_err(),
         UpdateStageError::Integrity(_)
     ));
+
+    let overlong = "a".repeat(MAX_MANIFEST_LINE_BYTES + 1);
+    let error = verify_integrity(
+        PublisherAuthenticatedArchive(b"archive".to_vec()),
+        &overlong,
+        asset,
+    )
+    .unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        format!(
+            "integrity check failed: BLAKE3SUMS.txt line 1 exceeds {MAX_MANIFEST_LINE_BYTES} byte limit"
+        )
+    );
 }
 
 #[tokio::test]

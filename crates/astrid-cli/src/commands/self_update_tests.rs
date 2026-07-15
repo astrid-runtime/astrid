@@ -235,6 +235,7 @@ fn release_tags_are_canonical_and_identity_safe() {
         canonical_release_version("v1.2.3-rc.1").unwrap(),
         "1.2.3-rc.1"
     );
+
     for invalid in ["1.2.3", "vv1.2.3", "v01.2.3", "v1.2", "v1.2.3-01"] {
         assert!(
             canonical_release_version(invalid).is_err(),
@@ -308,6 +309,34 @@ fn publisher_bundle_and_blake3_manifest_are_both_mandatory() {
         publisher_bundle_url(&sha_only, "astrid-1.0.0-x.tar.gz").unwrap_err(),
         UpdateStageError::PublisherAuthentication(_)
     ));
+}
+
+#[test]
+fn staged_asset_selection_preserves_the_exact_failure() {
+    let bundle_name = "astrid-1.0.0-x.tar.gz.sigstore.json";
+    let duplicate_bundle = serde_json::json!({
+        "assets": [
+            {"name": bundle_name, "browser_download_url": "https://example.com/one"},
+            {"name": bundle_name, "browser_download_url": "https://example.com/two"}
+        ]
+    });
+    let error = publisher_bundle_url(&duplicate_bundle, "astrid-1.0.0-x.tar.gz")
+        .unwrap_err()
+        .to_string();
+    assert_eq!(
+        error,
+        format!(
+            "publisher authentication failed: release contains duplicate asset '{bundle_name}'"
+        )
+    );
+
+    let oversized = serde_json::json!({
+        "assets": vec![serde_json::json!({"name": "irrelevant"}); MAX_RELEASE_ASSETS + 1]
+    });
+    assert_eq!(
+        integrity_manifest_url(&oversized).unwrap_err().to_string(),
+        "integrity check failed: release contains too many assets"
+    );
 }
 
 #[test]

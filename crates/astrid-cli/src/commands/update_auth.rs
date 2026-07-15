@@ -15,6 +15,7 @@ use sigstore_verify::{VerificationPolicy, verify};
 
 const GITHUB_ACTIONS_ISSUER: &str = "https://token.actions.githubusercontent.com";
 const TRUST_ROOT_TIMEOUT: Duration = Duration::from_secs(30);
+const MAX_MANIFEST_LINE_BYTES: usize = 1_024;
 
 #[derive(Debug, thiserror::Error)]
 #[error("{0}")]
@@ -168,6 +169,11 @@ pub(super) fn verify_integrity(
         let line_number = index
             .checked_add(1)
             .ok_or_else(|| UpdateStageError::integrity("BLAKE3SUMS.txt contains too many lines"))?;
+        if line.len() > MAX_MANIFEST_LINE_BYTES {
+            return Err(UpdateStageError::integrity(format!(
+                "BLAKE3SUMS.txt line {line_number} exceeds {MAX_MANIFEST_LINE_BYTES} byte limit"
+            )));
+        }
         let (hex, name) = line.split_once("  ").ok_or_else(|| {
             UpdateStageError::integrity(format!(
                 "malformed BLAKE3SUMS.txt line {line_number}: expected '<digest>  <asset>'"

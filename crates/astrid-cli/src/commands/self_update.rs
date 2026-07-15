@@ -407,12 +407,12 @@ fn publisher_bundle_url<'a>(
 ) -> Result<&'a str, UpdateStageError> {
     let bundle_name = format!("{archive_name}.sigstore.json");
     exact_asset_url(release, &bundle_name)
-        .map_err(|_| UpdateStageError::publisher(format!("release has no unique '{bundle_name}'")))
+        .map_err(|error| UpdateStageError::publisher(error.to_string()))
 }
 
 fn integrity_manifest_url(release: &serde_json::Value) -> Result<&str, UpdateStageError> {
     exact_asset_url(release, "BLAKE3SUMS.txt")
-        .map_err(|_| UpdateStageError::integrity("release has no unique BLAKE3SUMS.txt"))
+        .map_err(|error| UpdateStageError::integrity(error.to_string()))
 }
 
 /// Stream a URL into memory under the size cap.
