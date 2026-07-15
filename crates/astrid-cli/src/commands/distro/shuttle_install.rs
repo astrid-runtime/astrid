@@ -222,10 +222,12 @@ fn install_selected_capsules(
             home,
             &expected,
             expected_version,
-            &cap.source,
-            resolved_ref.as_deref(),
-            signer,
-            signature,
+            crate::commands::capsule::install::OfflineCapsuleProvenance {
+                original_source: &cap.source,
+                resolved_ref: resolved_ref.as_deref(),
+                signer,
+                signature,
+            },
             principal,
         )
         .with_context(|| format!("failed to install capsule {}", cap.name))?;

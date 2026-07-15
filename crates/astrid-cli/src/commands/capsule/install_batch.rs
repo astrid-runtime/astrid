@@ -48,8 +48,7 @@ pub(crate) async fn install_capsule_batch(
 ) -> anyhow::Result<BatchInstallOutcome> {
     anyhow::ensure!(
         refspec.version.is_some() || refspec.tag.is_some(),
-        "distro capsule '{}' has no concrete released version or tag",
-        expected
+        "distro capsule '{expected}' has no concrete released version or tag"
     );
     super::install::BATCH_MODE.store(true, Ordering::Relaxed);
     let result = super::install::install_capsule_inner(

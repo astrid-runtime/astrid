@@ -184,9 +184,7 @@ pub(super) fn validate_locked_capsules(
         let actual = CapsuleId::new(manifest.package.name.clone())?;
         if actual != expected {
             bail!(
-                "Distro.lock capsule '{}' resolves to installed manifest '{}'; refusing to grant stale identity",
-                expected,
-                actual
+                "Distro.lock capsule '{expected}' resolves to installed manifest '{actual}'; refusing to grant stale identity"
             );
         }
         let meta = super::super::capsule::meta::read_meta(&target_dir).ok_or_else(|| {
@@ -232,75 +230,50 @@ fn validate_locked_wasm(
     locked_hash: &str,
 ) -> anyhow::Result<()> {
     let declares_wasm = manifest_declares_wasm(manifest);
-    match meta_hash {
-        Some(meta_hash) => {
-            if !declares_wasm {
-                bail!(
-                    "Distro.lock capsule '{}' does not declare WASM but installed metadata carries a WASM hash",
-                    capsule
-                );
-            }
-            let locked = parse_locked_blake3(capsule, locked_hash)?;
-            let locked_hex = locked.to_hex().to_string();
-            if meta_hash != locked_hex {
-                bail!(
-                    "Distro.lock capsule '{}' hash disagrees with installed metadata",
-                    capsule
-                );
-            }
-            let blob_path = home.bin_dir().join(format!("{locked_hex}.wasm"));
-            let bytes = std::fs::read(&blob_path).with_context(|| {
-                format!(
-                    "Distro.lock capsule '{}' content blob is missing or unreadable at {}",
-                    capsule,
-                    blob_path.display()
-                )
-            })?;
-            let actual = blake3::hash(&bytes);
-            if actual != locked {
-                bail!(
-                    "Distro.lock capsule '{}' content blob bytes do not match hash {}",
-                    capsule,
-                    locked_hash
-                );
-            }
-        },
-        None => {
-            if declares_wasm {
-                bail!(
-                    "Distro.lock capsule '{}' declares WASM but has no installed WASM hash",
-                    capsule
-                );
-            }
-            if !locked_hash.is_empty() {
-                bail!(
-                    "Distro.lock non-WASM capsule '{}' must not carry a WASM hash",
-                    capsule
-                );
-            }
-        },
+    let Some(meta_hash) = meta_hash else {
+        if declares_wasm {
+            bail!("Distro.lock capsule '{capsule}' declares WASM but has no installed WASM hash");
+        }
+        if !locked_hash.is_empty() {
+            bail!("Distro.lock non-WASM capsule '{capsule}' must not carry a WASM hash");
+        }
+        return Ok(());
+    };
+
+    if !declares_wasm {
+        bail!(
+            "Distro.lock capsule '{capsule}' does not declare WASM but installed metadata carries a WASM hash"
+        );
+    }
+    let locked = parse_locked_blake3(capsule, locked_hash)?;
+    let locked_hex = locked.to_hex().to_string();
+    if meta_hash != locked_hex {
+        bail!("Distro.lock capsule '{capsule}' hash disagrees with installed metadata");
+    }
+    let blob_path = home.bin_dir().join(format!("{locked_hex}.wasm"));
+    let bytes = std::fs::read(&blob_path).with_context(|| {
+        format!(
+            "Distro.lock capsule '{}' content blob is missing or unreadable at {}",
+            capsule,
+            blob_path.display()
+        )
+    })?;
+    let actual = blake3::hash(&bytes);
+    if actual != locked {
+        bail!("Distro.lock capsule '{capsule}' content blob bytes do not match hash {locked_hash}");
     }
     Ok(())
 }
 
 fn parse_locked_blake3(capsule: &CapsuleId, value: &str) -> anyhow::Result<blake3::Hash> {
     let Some(hex) = value.strip_prefix("blake3:") else {
-        bail!(
-            "Distro.lock capsule '{}' requires a canonical blake3:<hex> WASM hash",
-            capsule
-        );
+        bail!("Distro.lock capsule '{capsule}' requires a canonical blake3:<hex> WASM hash");
     };
     let hash = blake3::Hash::from_hex(hex).map_err(|_| {
-        anyhow::anyhow!(
-            "Distro.lock capsule '{}' has an invalid BLAKE3 hash",
-            capsule
-        )
+        anyhow::anyhow!("Distro.lock capsule '{capsule}' has an invalid BLAKE3 hash")
     })?;
     if hex.len() != 64 || hash.to_hex().as_str() != hex {
-        bail!(
-            "Distro.lock capsule '{}' requires a canonical lowercase BLAKE3 hash",
-            capsule
-        );
+        bail!("Distro.lock capsule '{capsule}' requires a canonical lowercase BLAKE3 hash");
     }
     Ok(hash)
 }

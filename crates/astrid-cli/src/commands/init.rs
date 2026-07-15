@@ -808,8 +808,7 @@ fn validate_batch_install(
             .collect::<Vec<_>>()
             .join(", ");
         bail!(
-            "distro declared capsule '{expected}', but the checked installer reported [{}]",
-            actual
+            "distro declared capsule '{expected}', but the checked installer reported [{actual}]"
         );
     }
     let installed = outcome
