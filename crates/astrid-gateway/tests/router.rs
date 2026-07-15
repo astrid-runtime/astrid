@@ -254,7 +254,7 @@ async fn me_route_returns_principal_from_valid_bearer() {
 }
 
 #[tokio::test]
-async fn public_router_builder_accepts_live_capability_probe() {
+async fn public_router_builders_accept_live_capability_probe() {
     let (state, audit_log, session_id) = fresh_state_with_audit_log();
     audit_log
         .append_with_principal(
@@ -274,7 +274,14 @@ async fn public_router_builder_accepts_live_capability_probe() {
         )
         .await
         .expect("append audit entry");
-    let router = routes::build_with_capability_probe(Arc::clone(&state), |_, _, _| true);
+    let _default_workspace_router =
+        routes::build_with_capability_probe(Arc::clone(&state), |_, _, _| true);
+    let router = routes::build_with_workspace_and_capability_probe(
+        Arc::clone(&state),
+        std::env::temp_dir(),
+        astrid_core::dirs::WorkspaceLayout::new(".custom-aos").unwrap(),
+        |_, _, _| true,
+    );
 
     let principal = PrincipalId::new("alice").unwrap();
     let bearer = mint_bearer(&state.signing.signer, &principal, 3600);
