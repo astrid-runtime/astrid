@@ -45,6 +45,7 @@ use arc_swap::ArcSwap;
 use astrid_capabilities::CapabilityCheck;
 use astrid_core::GroupConfig;
 use astrid_core::principal::PrincipalId;
+use astrid_core::profile::{DeviceKeyId, PrincipalProfile};
 use tracing::warn;
 
 use crate::capsule::CapsuleId;
@@ -60,6 +61,9 @@ use crate::topic::TOOL_EXECUTE_PREFIX;
 /// Topic prefix for the user-invocable **CLI command run** surface.
 /// A capsule command invocation is `cli.v1.command.run.<provider>`.
 const CLI_COMMAND_RUN_PREFIX: &str = "cli.v1.command.run.";
+
+/// Exact internal capability for unrestricted capsule execution.
+const CAPSULE_ACCESS_ANY: &str = "capsule:access:any";
 
 /// Is `topic` part of the **user-invocable surface** that the per-principal
 /// capsule-access filter gates? Co-located with the resolver because it
@@ -145,6 +149,43 @@ pub struct CapsuleAccessResolver {
     groups: Arc<ArcSwap<GroupConfig>>,
 }
 
+/// Immutable authority inputs for one dispatched event.
+pub(crate) struct ResolvedCapsuleAccess {
+    principal: PrincipalId,
+    profile: Arc<PrincipalProfile>,
+    groups: Arc<GroupConfig>,
+    has_global_capsule_view: bool,
+    has_unrestricted_capsule_access: bool,
+}
+
+impl ResolvedCapsuleAccess {
+    #[must_use]
+    pub(crate) fn principal(&self) -> &PrincipalId {
+        &self.principal
+    }
+
+    #[must_use]
+    pub(crate) fn has_global_capsule_view(&self) -> bool {
+        self.has_global_capsule_view
+    }
+
+    #[must_use]
+    pub(crate) fn has_unrestricted_capsule_access(&self) -> bool {
+        self.has_unrestricted_capsule_access
+    }
+
+    #[must_use]
+    pub(crate) fn is_capsule_allowed(&self, capsule: &CapsuleId) -> bool {
+        if self.has_unrestricted_capsule_access() {
+            return true;
+        }
+        self.profile
+            .capsules
+            .iter()
+            .any(|granted| granted == capsule.as_str())
+    }
+}
+
 impl std::fmt::Debug for CapsuleAccessResolver {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         // The cache and group config are large and not useful here; only
@@ -168,86 +209,115 @@ impl CapsuleAccessResolver {
         }
     }
 
-    /// Return `true` if `principal` may invoke `capsule`.
-    ///
-    /// Resolution order:
-    /// 1. **Fail-closed identity gate** — a `None`, empty, `anonymous`, or
-    ///    syntactically invalid principal yields `false` (no grant set).
-    /// 2. **Profile resolve** — a resolution error (malformed TOML, IO
-    ///    error) yields `false`. Never default-allow on error.
-    /// 3. **Admin bypass** — a caller holding `*` (directly, via a grant,
-    ///    or via an `admin`-group `*`) returns `true` for any capsule.
-    /// 4. **Grant-set membership** — otherwise, `true` iff the capsule id
-    ///    appears in the principal's `capsules` grant set.
-    ///
-    /// `principal` is the kernel-stamped value carried on the originating
-    /// IPC message — never a capsule- or caller-supplied claim — so a
-    /// principal cannot forge its way past the filter.
+    /// Resolve one immutable authority snapshot for a dispatched event.
     #[must_use]
-    pub fn is_capsule_allowed(&self, principal: Option<&str>, capsule: &CapsuleId) -> bool {
-        // (1) Identity gate. `anonymous` is the explicit unauthenticated
-        // sentinel; treat it like an absent principal — no grant set.
-        let Some(principal_str) = principal else {
-            return false;
-        };
+    pub(crate) fn resolve_access(
+        &self,
+        principal: Option<&str>,
+        device_key_id: Option<&str>,
+    ) -> Option<ResolvedCapsuleAccess> {
+        let principal_str = principal?;
         if principal_str.is_empty() || principal_str == "anonymous" {
-            return false;
+            return None;
         }
-        let Ok(pid) = PrincipalId::new(principal_str) else {
-            warn!(
-                security_event = true,
-                principal = %principal_str,
-                "Capsule-access check: invalid principal string — deny (fail-closed)"
-            );
-            return false;
+        let pid = match PrincipalId::new(principal_str) {
+            Ok(pid) => pid,
+            Err(error) => {
+                warn!(
+                    security_event = true,
+                    principal = %principal_str,
+                    %error,
+                    "Capsule-access check: invalid principal string — deny (fail-closed)"
+                );
+                return None;
+            },
         };
-
-        // (2) Profile resolve. Fail-closed on any error.
         let profile = match self.profile_cache.resolve(&pid) {
-            Ok(p) => p,
-            Err(e) => {
+            Ok(profile) => profile,
+            Err(error) => {
                 warn!(
                     security_event = true,
                     principal = %pid,
-                    error = %e,
+                    %error,
                     "Capsule-access check: profile resolution failed — deny (fail-closed)"
                 );
-                return false;
+                return None;
+            },
+        };
+        if !profile.enabled {
+            warn!(
+                security_event = true,
+                principal = %pid,
+                "Capsule-access check: disabled principal — deny (fail-closed)"
+            );
+            return None;
+        }
+        let device_scope = match device_key_id {
+            None => None,
+            Some(raw_key_id) => {
+                let key_id = match DeviceKeyId::new(raw_key_id) {
+                    Ok(key_id) => key_id,
+                    Err(error) => {
+                        warn!(
+                            security_event = true,
+                            principal = %pid,
+                            key_id = %raw_key_id,
+                            %error,
+                            "Capsule-access check: invalid device key id — deny (fail-closed)"
+                        );
+                        return None;
+                    },
+                };
+                let Some(device) = profile.auth.device_by_typed_key_id(&key_id) else {
+                    warn!(
+                        security_event = true,
+                        principal = %pid,
+                        key_id = %raw_key_id,
+                        "Capsule-access check: device key id is not registered — deny (fail-closed)"
+                    );
+                    return None;
+                };
+                Some(device.scope.clone())
             },
         };
 
-        // (3) Admin bypass — reuse the SAME machinery `authorize_request`
-        // uses. A `*` holder (admin) bypasses the per-principal filter.
-        let groups = self.groups.load();
-        let check = CapabilityCheck::new(profile.as_ref(), groups.as_ref(), pid);
-        if check.has("*") {
-            return true;
+        let groups = self.groups.load_full();
+        let mut device_check = CapabilityCheck::new(profile.as_ref(), groups.as_ref(), pid.clone());
+        if let Some(scope) = &device_scope {
+            device_check = device_check.with_device_scope(scope);
         }
+        let has_global_capsule_view = device_check.has("capsule:list");
+        let has_unrestricted_capsule_access = device_check.has(CAPSULE_ACCESS_ANY);
 
-        // (4) Grant-set membership.
-        profile
-            .capsules
-            .iter()
-            .any(|granted| granted == capsule.as_str())
+        Some(ResolvedCapsuleAccess {
+            principal: pid,
+            profile,
+            groups,
+            has_global_capsule_view,
+            has_unrestricted_capsule_access,
+        })
+    }
+
+    /// Return whether `principal` may invoke `capsule`.
+    /// Invalid identities fail closed; exact `capsule:access:any` bypasses the
+    /// principal's exact capsule grant set.
+    #[must_use]
+    pub fn is_capsule_allowed(&self, principal: Option<&str>, capsule: &CapsuleId) -> bool {
+        self.resolve_access(principal, None)
+            .is_some_and(|access| access.is_capsule_allowed(capsule))
     }
 
     /// Return true when the caller may bypass principal-view narrowing.
     #[must_use]
     pub fn is_admin(&self, principal: Option<&str>) -> bool {
-        let Some(principal_str) = principal else {
-            return false;
-        };
-        if principal_str.is_empty() || principal_str == "anonymous" {
-            return false;
-        }
-        let Ok(pid) = PrincipalId::new(principal_str) else {
-            return false;
-        };
-        let Ok(profile) = self.profile_cache.resolve(&pid) else {
-            return false;
-        };
-        let groups = self.groups.load();
-        CapabilityCheck::new(profile.as_ref(), groups.as_ref(), pid).has("*")
+        self.resolve_access(principal, None).is_some_and(|access| {
+            CapabilityCheck::new(
+                access.profile.as_ref(),
+                access.groups.as_ref(),
+                access.principal.clone(),
+            )
+            .has("*")
+        })
     }
 }
 
@@ -256,15 +326,26 @@ mod tests {
     use super::*;
 
     use astrid_core::dirs::AstridHome;
-    use astrid_core::groups::{BUILTIN_ADMIN, GroupConfig};
-    use astrid_core::profile::PrincipalProfile;
+    use astrid_core::groups::{BUILTIN_ADMIN, Group, GroupConfig};
+    use astrid_core::profile::{AuthConfig, AuthMethod, DeviceKey, DeviceScope, PrincipalProfile};
 
     fn fixture() -> (tempfile::TempDir, AstridHome, CapsuleAccessResolver) {
+        let (dir, home, _cache, resolver) = fixture_with_cache();
+        (dir, home, resolver)
+    }
+
+    fn fixture_with_cache() -> (
+        tempfile::TempDir,
+        AstridHome,
+        Arc<PrincipalProfileCache>,
+        CapsuleAccessResolver,
+    ) {
         let dir = tempfile::tempdir().expect("tempdir");
         let home = AstridHome::from_path(dir.path());
         let cache = Arc::new(PrincipalProfileCache::with_home(home.clone()));
         let groups = Arc::new(ArcSwap::from_pointee(GroupConfig::builtin_only()));
-        (dir, home, CapsuleAccessResolver::new(cache, groups))
+        let resolver = CapsuleAccessResolver::new(Arc::clone(&cache), groups);
+        (dir, home, cache, resolver)
     }
 
     fn write(home: &AstridHome, principal: &str, profile: &PrincipalProfile) {
@@ -274,6 +355,10 @@ mod tests {
 
     fn cap(id: &str) -> CapsuleId {
         CapsuleId::from_static(id)
+    }
+
+    fn device(seed: char, scope: DeviceScope) -> DeviceKey {
+        DeviceKey::new(seed.to_string().repeat(64), scope, None, 0)
     }
 
     #[test]
@@ -343,5 +428,198 @@ mod tests {
         // Future profile_version fails validation → resolve returns Err.
         std::fs::write(&path, "profile_version = 9999\n").unwrap();
         assert!(!r.is_capsule_allowed(Some("broken"), &cap("identity")));
+    }
+
+    #[test]
+    fn device_scope_attenuates_admin_bypass() {
+        let (_d, home, r) = fixture();
+        let full = device('a', DeviceScope::Full);
+        let list_only = device(
+            'b',
+            DeviceScope::Scoped {
+                allow: vec!["capsule:list".into()],
+                deny: Vec::new(),
+            },
+        );
+        let access_any = device(
+            'c',
+            DeviceScope::Scoped {
+                allow: vec!["capsule:access:any".into()],
+                deny: Vec::new(),
+            },
+        );
+        let access_denied = device(
+            'd',
+            DeviceScope::Scoped {
+                allow: vec!["*".into()],
+                deny: vec!["capsule:access:any".into()],
+            },
+        );
+        let ids = [
+            full.key_id.clone(),
+            list_only.key_id.clone(),
+            access_any.key_id.clone(),
+            access_denied.key_id.clone(),
+        ];
+        write(
+            &home,
+            "root",
+            &PrincipalProfile {
+                groups: vec![BUILTIN_ADMIN.to_string()],
+                capsules: vec!["identity".into()],
+                auth: AuthConfig {
+                    methods: vec![AuthMethod::Keypair],
+                    public_keys: vec![full, list_only, access_any, access_denied],
+                },
+                ..PrincipalProfile::default()
+            },
+        );
+
+        let no_device = r.resolve_access(Some("root"), None).unwrap();
+        let full = r.resolve_access(Some("root"), Some(&ids[0])).unwrap();
+        let list_only = r.resolve_access(Some("root"), Some(&ids[1])).unwrap();
+        let access_any = r.resolve_access(Some("root"), Some(&ids[2])).unwrap();
+        let denied = r.resolve_access(Some("root"), Some(&ids[3])).unwrap();
+        assert!(no_device.is_capsule_allowed(&cap("registry")));
+        assert!(full.is_capsule_allowed(&cap("registry")));
+        assert!(list_only.has_global_capsule_view());
+        assert!(!list_only.is_capsule_allowed(&cap("registry")));
+        assert!(access_any.has_unrestricted_capsule_access());
+        assert!(access_any.is_capsule_allowed(&cap("registry")));
+        assert!(!denied.is_capsule_allowed(&cap("registry")));
+        assert!(list_only.is_capsule_allowed(&cap("identity")));
+        assert!(denied.is_capsule_allowed(&cap("identity")));
+    }
+
+    #[test]
+    fn global_capsule_view_does_not_bypass_capsule_grants() {
+        let (_d, home, r) = fixture();
+        write(
+            &home,
+            "operator",
+            &PrincipalProfile {
+                grants: vec!["capsule:list".into()],
+                capsules: vec!["identity".into()],
+                ..PrincipalProfile::default()
+            },
+        );
+
+        let access = r.resolve_access(Some("operator"), None).unwrap();
+        assert!(access.has_global_capsule_view());
+        assert!(access.is_capsule_allowed(&cap("identity")));
+        assert!(!access.is_capsule_allowed(&cap("registry")));
+    }
+
+    #[test]
+    fn disabled_principal_has_no_access_snapshot() {
+        let (_d, home, r) = fixture();
+        write(
+            &home,
+            "disabled",
+            &PrincipalProfile {
+                enabled: false,
+                groups: vec![BUILTIN_ADMIN.to_string()],
+                capsules: vec!["identity".into()],
+                ..PrincipalProfile::default()
+            },
+        );
+        assert!(r.resolve_access(Some("disabled"), None).is_none());
+    }
+
+    #[test]
+    fn group_changes_apply_to_the_next_access_snapshot() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let home = AstridHome::from_path(dir.path());
+        let cache = Arc::new(PrincipalProfileCache::with_home(home.clone()));
+        let groups = Arc::new(ArcSwap::from_pointee(GroupConfig::builtin_only()));
+        let resolver = CapsuleAccessResolver::new(cache, Arc::clone(&groups));
+        write(
+            &home,
+            "operator",
+            &PrincipalProfile {
+                groups: vec!["ops".into()],
+                ..PrincipalProfile::default()
+            },
+        );
+
+        let before = resolver.resolve_access(Some("operator"), None).unwrap();
+        assert!(!before.has_global_capsule_view());
+        assert!(!before.has_unrestricted_capsule_access());
+
+        let promoted = GroupConfig::builtin_only()
+            .insert_custom_group(
+                "ops".into(),
+                Group {
+                    capabilities: vec!["*".into()],
+                    description: None,
+                    unsafe_admin: true,
+                },
+            )
+            .unwrap();
+        groups.store(Arc::new(promoted));
+        let promoted = resolver.resolve_access(Some("operator"), None).unwrap();
+        assert!(promoted.has_global_capsule_view());
+        assert!(promoted.has_unrestricted_capsule_access());
+
+        groups.store(Arc::new(GroupConfig::builtin_only()));
+        let demoted = resolver.resolve_access(Some("operator"), None).unwrap();
+        assert!(!demoted.has_global_capsule_view());
+        assert!(!demoted.has_unrestricted_capsule_access());
+    }
+
+    #[test]
+    fn malformed_unknown_and_revoked_device_ids_fail_closed() {
+        let (_d, home, cache, r) = fixture_with_cache();
+        let full = device('d', DeviceScope::Full);
+        let full_id = full.key_id.clone();
+        let mut profile = PrincipalProfile {
+            groups: vec![BUILTIN_ADMIN.to_string()],
+            auth: AuthConfig {
+                methods: vec![AuthMethod::Keypair],
+                public_keys: vec![full],
+            },
+            ..PrincipalProfile::default()
+        };
+        write(&home, "root", &profile);
+
+        assert!(r.resolve_access(Some("root"), Some(&full_id)).is_some());
+        assert!(
+            r.resolve_access(Some("root"), Some("not-a-key-id"))
+                .is_none()
+        );
+        assert!(
+            r.resolve_access(Some("root"), Some("0000000000000000"))
+                .is_none()
+        );
+
+        profile.auth.public_keys.clear();
+        write(&home, "root", &profile);
+        cache.invalidate(&PrincipalId::new("root").unwrap());
+        assert!(r.resolve_access(Some("root"), Some(&full_id)).is_none());
+    }
+
+    #[test]
+    fn one_dispatch_snapshot_cannot_fall_back_after_revocation() {
+        let (_d, home, cache, r) = fixture_with_cache();
+        let full = device('e', DeviceScope::Full);
+        let full_id = full.key_id.clone();
+        let mut profile = PrincipalProfile {
+            groups: vec![BUILTIN_ADMIN.to_string()],
+            auth: AuthConfig {
+                methods: vec![AuthMethod::Keypair],
+                public_keys: vec![full],
+            },
+            ..PrincipalProfile::default()
+        };
+        write(&home, "root", &profile);
+        let in_flight = r.resolve_access(Some("root"), Some(&full_id)).unwrap();
+
+        profile.auth.public_keys.clear();
+        write(&home, "root", &profile);
+        cache.invalidate(&PrincipalId::new("root").unwrap());
+
+        assert!(in_flight.has_global_capsule_view());
+        assert!(in_flight.is_capsule_allowed(&cap("registry")));
+        assert!(r.resolve_access(Some("root"), Some(&full_id)).is_none());
     }
 }

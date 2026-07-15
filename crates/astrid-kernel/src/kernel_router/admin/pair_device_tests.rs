@@ -197,6 +197,27 @@ async fn non_admin_principal_denied_full_mint() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn admin_cap_without_base_pair_capability_cannot_issue_full_token() {
+    let (_dir, kernel) = fixture().await;
+    let caller = pid("pair_admin_without_base");
+    seed(&kernel, &caller, &["self:auth:pair:admin"], vec![]);
+
+    let resp =
+        handlers::dispatch_with_device(&kernel, &caller, None, issue(PairScopeArg::Full)).await;
+    match resp {
+        AdminResponseBody::Error(msg) => assert!(
+            msg.contains("requires self:auth:pair,"),
+            "pair-admin without the base pair capability must fail the base gate: {msg}"
+        ),
+        other => {
+            panic!(
+                "pair-admin without the base pair cap must be denied a Full mint, got: {other:?}"
+            )
+        },
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn full_scope_device_can_mint_full() {
     // The common case is unchanged: a `full`-preset device (DeviceScope::Full,
     // NOT Scoped) whose principal holds the admin cap mints Full fine.

@@ -221,6 +221,11 @@ fn validate_pair_issue_authority(
     if let Some(scope @ DeviceScope::Scoped { .. }) = issuer_scope {
         issuer_check = issuer_check.with_device_scope(scope);
     }
+    if !issuer_check.has("self:auth:pair") {
+        return Err(format!(
+            "minting a paired device requires self:auth:pair, which {caller} does not effectively hold"
+        ));
+    }
 
     match requested_scope {
         DeviceScope::Full => {

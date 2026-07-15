@@ -294,10 +294,14 @@ impl EventDispatcher {
             // granted capsules — never a caller-supplied claim.
             let caller_principal: Option<&str> =
                 ipc_message.as_deref().and_then(|m| m.principal.as_deref());
+            let caller_device_key_id: Option<&str> = ipc_message
+                .as_deref()
+                .and_then(|m| m.device_key_id.as_deref());
             let matches = find_matching_interceptors(
                 &self.registry,
                 &topic,
                 caller_principal,
+                caller_device_key_id,
                 self.access_resolver.as_ref(),
                 &self.event_bus,
             )
@@ -790,36 +794,15 @@ fn dispatch_single(
 /// returned so the caller can distinguish an ordered chain (distinct
 /// priorities) from an independent fan-out (all equal).
 ///
-/// # Per-principal capsule-access filter
-///
-/// When an `access_resolver` is wired, principal-stamped non-admin dispatch is
-/// first narrowed to the caller's capsule view. When `topic` is also in the
-/// **user-invocable surface** (`tool.v1.execute.*`, `cli.v1.command.run.*`),
-/// a matched capsule is kept only if `caller_principal` is granted it (or is an
-/// admin holding `*`). The grant-on-use filter is keyed on the **topic**, so a
-/// dual-role capsule's orchestration interceptors (on non-tool topics) are
-/// view-scoped but not grant-gated.
-///
-/// The gate engages **only for capsules whose subscription actually matches the
-/// dispatched topic**. The cheap, manifest-local interceptor match is evaluated
-/// first (using the same [`crate::topic::topic_matches`] delivery uses), and a
-/// capsule that provides no interceptor for `topic` never reaches the access
-/// gate — so a single tool call cannot storm `GrantRequired` across every
-/// ungranted capsule in the view (#1113). Only a capsule that *would* be
-/// delivered the call is gated.
-///
-/// For an **authenticated, non-admin** caller a denied match is no longer a
-/// pure silent drop: before dropping, a [`IpcPayload::GrantRequired`] signal is
-/// published on `astrid.v1.approval` (grant-on-first-use, #998) so a broker/shim
-/// can elicit consent and, on approve, the kernel grants the capsule. The match
-/// is still dropped for THIS call (the capsule never sees the ungranted call);
-/// the caller's request simply finds no tool, exactly as if the capsule were not
-/// installed. A `None`/empty/`anonymous` caller (no authenticated principal to
-/// grant to) is still a pure silent drop with no signal.
+/// One resolved identity snapshot controls each dispatch. `capsule:list`
+/// expands describe visibility; exact `capsule:access:any` expands and bypasses
+/// execution filtering. Invalid identities drop before matching. A valid caller
+/// denied an exact capsule receives one `GrantRequired` after topic matching.
 async fn find_matching_interceptors(
     registry: &RwLock<CapsuleRegistry>,
     topic: &str,
     caller_principal: Option<&str>,
+    caller_device_key_id: Option<&str>,
     access_resolver: Option<&CapsuleAccessResolver>,
     event_bus: &EventBus,
 ) -> Vec<(Arc<dyn crate::capsule::Capsule>, String, u32)> {
@@ -827,24 +810,38 @@ async fn find_matching_interceptors(
     // dispatch is view-scoped when a resolver is present; grant-on-use only
     // engages for the narrower user-invocable surface.
     let gate_surface = crate::access::is_user_invocable_surface(topic);
-    let view_scoped_surface = access_resolver.is_some()
-        && (gate_surface
-            || topic == "tool.v1.request.describe"
-            || topic == "llm.v1.request.describe");
+    let describe_surface =
+        topic == "tool.v1.request.describe" || topic == "llm.v1.request.describe";
+    let view_scoped_surface = access_resolver.is_some() && (gate_surface || describe_surface);
+    let identity_stamped = caller_principal.is_some() || caller_device_key_id.is_some();
+    let resolved_access = if access_resolver.is_some() && identity_stamped {
+        access_resolver
+            .and_then(|resolver| resolver.resolve_access(caller_principal, caller_device_key_id))
+    } else {
+        None
+    };
+    if access_resolver.is_some() && identity_stamped && resolved_access.is_none() {
+        return Vec::new();
+    }
     let registry = registry.read().await;
     let mut matches: Vec<(Arc<dyn crate::capsule::Capsule>, String, u32)> = Vec::new();
     // Dedup grant-on-use signals within a single dispatch pass. This stays
     // tiny in practice, so a Vec keeps the gate path simple.
     let mut grant_signalled: Vec<String> = Vec::new();
-    let caller_pid = caller_principal.and_then(|p| astrid_core::PrincipalId::new(p).ok());
-    let view_scoped_admin = view_scoped_surface
-        && access_resolver.is_some_and(|resolver| resolver.is_admin(caller_principal));
+    let caller_pid = resolved_access
+        .as_ref()
+        .map(|access| access.principal().clone())
+        .or_else(|| caller_principal.and_then(|p| astrid_core::PrincipalId::new(p).ok()));
+    let expand_global_view = resolved_access.as_ref().is_some_and(|access| {
+        (gate_surface && access.has_unrestricted_capsule_access())
+            || (describe_surface && access.has_global_capsule_view())
+    });
     let candidate_capsules = candidate_capsules_for_dispatch(
         &registry,
         caller_pid.as_ref(),
         access_resolver.is_some(),
         view_scoped_surface,
-        view_scoped_admin,
+        expand_global_view,
     );
 
     for capsule in candidate_capsules {
@@ -882,17 +879,14 @@ async fn find_matching_interceptors(
         // caller drops this capsule's matching interceptors entirely — the
         // capsule never sees the ungranted call.
         if gate_surface
-            && let Some(resolver) = access_resolver
-            && !resolver.is_capsule_allowed(caller_principal, capsule.id())
+            && access_resolver.is_some()
+            && !resolved_access
+                .as_ref()
+                .is_some_and(|access| access.is_capsule_allowed(capsule.id()))
         {
-            // Grant-on-first-use (#998): for an authenticated non-admin
-            // caller, emit a `GrantRequired` signal before dropping. The
-            // grant TARGET is the kernel-stamped caller + this capsule —
-            // never any caller-supplied claim. Skip a `None`/empty/
-            // `anonymous` principal (no authenticated principal to grant).
-            if let Some(principal) = caller_principal
-                && !principal.is_empty()
-                && principal != "anonymous"
+            // Valid resolved callers receive one signal for this matching capsule.
+            if resolved_access.is_some()
+                && let Some(principal) = caller_principal
             {
                 let capsule_key = capsule.id().to_string();
                 if !grant_signalled.contains(&capsule_key) {
@@ -930,14 +924,14 @@ fn candidate_capsules_for_dispatch(
     caller_pid: Option<&astrid_core::PrincipalId>,
     has_access_resolver: bool,
     view_scoped_surface: bool,
-    view_scoped_admin: bool,
+    expand_global_view: bool,
 ) -> Vec<Arc<dyn crate::capsule::Capsule>> {
-    if view_scoped_surface && !view_scoped_admin {
+    if view_scoped_surface && !expand_global_view {
         return caller_pid.map_or_else(Vec::new, |principal| registry.cloned_values_for(principal));
     }
 
     if has_access_resolver
-        && !view_scoped_admin
+        && !expand_global_view
         && let Some(principal) = caller_pid
     {
         return registry.cloned_values_for(principal);
@@ -953,3 +947,7 @@ fn candidate_capsules_for_dispatch(
 #[cfg(test)]
 #[path = "dispatcher_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "dispatcher_device_scope_tests.rs"]
+mod device_scope_tests;
