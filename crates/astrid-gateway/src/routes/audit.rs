@@ -210,11 +210,13 @@ pub async fn get_audit(
     };
 
     // Cursor is `"<ts_epoch>_<offset>"` — `offset` is the number of
-    // entries with the same `ts_epoch` we've already returned from
-    // previous pages. Encoding both means same-second batches
-    // (timer ticks, scripted ops) can't silently lose or duplicate
-    // entries across the page boundary. The plain `"<ts_epoch>"`
-    // shape is still accepted for compatibility with v1 cursors.
+    // same-second entries we've already traversed after the stable
+    // query filters and before the live principal filter. Encoding
+    // both means same-second batches (timer ticks, scripted ops)
+    // can't silently lose or duplicate entries across the page
+    // boundary when authority narrows between page fetches. The
+    // plain `"<ts_epoch>"` shape is still accepted for
+    // compatibility with v1 cursors.
     let cursor = parse_cursor(query.cursor.as_deref())?;
     let (page, next_cursor) = paginate_page(entries, &query, &access, cursor, limit);
 
@@ -247,11 +249,11 @@ impl AuditAccess<'_> {
 }
 
 /// Walk the entries (newest first) and assemble one page worth of
-/// rendered views, honouring every filter + the cursor offset.
-/// Returns the page plus the next-page cursor (or `None` if the
-/// result is the last page). Pulled out of [`get_audit`] so the
-/// handler stays inside the function-length budget and the cursor
-/// arithmetic lives in one place.
+/// rendered views, honouring every stable filter plus the live
+/// principal restriction. Returns the page plus the next-page cursor
+/// (or `None` if the result is the last page). Pulled out of
+/// [`get_audit`] so the handler stays inside the function-length
+/// budget and the cursor arithmetic lives in one place.
 fn paginate_page(
     entries: Vec<AuditEntry>,
     query: &AuditQuery,
@@ -261,9 +263,10 @@ fn paginate_page(
 ) -> (Vec<AuditEntryView>, Option<String>) {
     let (cursor_ts, cursor_offset) = cursor;
     let mut page: Vec<AuditEntryView> = Vec::with_capacity(limit);
-    let mut equal_ts_skipped: usize = 0;
-    let mut equal_ts_count_in_page: usize = 0;
-    let mut last_ts: Option<u64> = None;
+    let mut raw_last_ts: Option<u64> = None;
+    let mut raw_ts_position: usize = 0;
+    let mut last_visible_ts: Option<u64> = None;
+    let mut last_visible_ts_position: usize = 0;
     for entry in entries {
         let Some(view) = render_entry(&entry) else {
             continue;
@@ -284,30 +287,33 @@ fn paginate_page(
         {
             continue;
         }
+
+        raw_ts_position = match raw_last_ts {
+            Some(t) if t == view.ts_epoch => raw_ts_position.saturating_add(1),
+            _ => 1,
+        };
+        raw_last_ts = Some(view.ts_epoch);
+
+        // Cursor positioning: drop everything strictly newer than
+        // the cursor's `ts`, then skip the first `cursor_offset`
+        // same-second entries in the stable pre-authorization order.
+        if let Some(c_ts) = cursor_ts {
+            if view.ts_epoch > c_ts {
+                continue;
+            }
+            if view.ts_epoch == c_ts && raw_ts_position <= cursor_offset {
+                continue;
+            }
+        }
+
         if let Some(p) = access.current_principal_filter()
             && view.principal.as_deref() != Some(p.as_str())
         {
             continue;
         }
 
-        // Cursor positioning: drop everything strictly newer than
-        // the cursor's `ts`, then skip the first `cursor_offset`
-        // entries that share `ts` (those were on the prior page).
-        if let Some(c_ts) = cursor_ts {
-            if view.ts_epoch > c_ts {
-                continue;
-            }
-            if view.ts_epoch == c_ts && equal_ts_skipped < cursor_offset {
-                equal_ts_skipped = equal_ts_skipped.saturating_add(1);
-                continue;
-            }
-        }
-
-        equal_ts_count_in_page = match last_ts {
-            Some(t) if t == view.ts_epoch => equal_ts_count_in_page.saturating_add(1),
-            _ => 1,
-        };
-        last_ts = Some(view.ts_epoch);
+        last_visible_ts = Some(view.ts_epoch);
+        last_visible_ts_position = raw_ts_position;
         page.push(view);
         if page.len() >= limit {
             break;
@@ -315,14 +321,7 @@ fn paginate_page(
     }
 
     let next_cursor = if page.len() == limit {
-        last_ts.map(|t| {
-            let offset = if cursor_ts == Some(t) {
-                cursor_offset.saturating_add(equal_ts_count_in_page)
-            } else {
-                equal_ts_count_in_page
-            };
-            format!("{t}_{offset}")
-        })
+        last_visible_ts.map(|t| format!("{t}_{last_visible_ts_position}"))
     } else {
         None
     };
@@ -393,8 +392,9 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use astrid_audit::{AuditLog, AuthorizationProof};
-    use astrid_core::SessionId;
+    use astrid_core::{SessionId, Timestamp};
     use astrid_crypto::KeyPair;
+    use chrono::TimeZone;
 
     fn admin_action(method: &str, target: Option<&str>) -> AuditAction {
         AuditAction::AdminRequest {
@@ -512,6 +512,116 @@ mod tests {
             vec!["BobVisibleBeforeNarrowing", "AliceOwnAfterNarrowing"]
         );
         assert!(!methods.contains(&"BobHiddenAfterNarrowing"));
+    }
+
+    #[tokio::test]
+    async fn pagination_cursor_survives_live_narrowing_with_same_second_batch() {
+        let log = AuditLog::in_memory(KeyPair::generate());
+        let session = SessionId::from_uuid(uuid::Uuid::nil());
+        for (principal, method) in [
+            ("alice", "AliceOlder"),
+            ("alice", "AliceVisibleAfterNarrowing"),
+            ("bob", "BobHiddenAfterNarrowing"),
+            ("bob", "BobVisibleBeforeNarrowing"),
+        ] {
+            log.append_with_principal(
+                session.clone(),
+                PrincipalId::new(principal).unwrap(),
+                admin_action(method, None),
+                AuthorizationProof::System {
+                    reason: "test".into(),
+                },
+                AuditOutcome::Success { details: None },
+            )
+            .await
+            .expect("append");
+        }
+        let mut entries = log.get_session_entries(&session).await.expect("read");
+        entries.reverse();
+        let same_second = Timestamp::from_datetime(
+            chrono::Utc
+                .timestamp_opt(1_700_000_000, 0)
+                .single()
+                .unwrap(),
+        );
+        let next_second = Timestamp::from_datetime(
+            chrono::Utc
+                .timestamp_opt(1_699_999_999, 0)
+                .single()
+                .unwrap(),
+        );
+        for entry in &mut entries[..3] {
+            entry.timestamp = same_second;
+        }
+        entries[3].timestamp = next_second;
+
+        let firehose_probe = super::super::events::CapabilityProbe::new(|_, _, _| true);
+        let self_only_probe = super::super::events::CapabilityProbe::new(|_, _, _| false);
+        let caller = PrincipalId::new("alice").unwrap();
+        let firehose_access = AuditAccess {
+            capability_probe: &firehose_probe,
+            caller_principal: &caller,
+            device_key_id: Some("0123456789abcdef"),
+            requested_principal: None,
+        };
+        let self_only_access = AuditAccess {
+            capability_probe: &self_only_probe,
+            caller_principal: &caller,
+            device_key_id: Some("0123456789abcdef"),
+            requested_principal: None,
+        };
+
+        let (page_one, next_cursor) = paginate_page(
+            entries.clone(),
+            &AuditQuery::default(),
+            &firehose_access,
+            (None, 0),
+            1,
+        );
+        assert_eq!(
+            page_one[0].method.as_deref(),
+            Some("BobVisibleBeforeNarrowing")
+        );
+        assert_eq!(next_cursor.as_deref(), Some("1700000000_1"));
+
+        let (cursor_ts, cursor_offset) =
+            parse_cursor(next_cursor.as_deref()).expect("page-one cursor parses");
+        let (page_two, next_cursor) = paginate_page(
+            entries.clone(),
+            &AuditQuery::default(),
+            &self_only_access,
+            (cursor_ts, cursor_offset),
+            1,
+        );
+        assert_eq!(
+            page_two[0].method.as_deref(),
+            Some("AliceVisibleAfterNarrowing")
+        );
+        assert_eq!(next_cursor.as_deref(), Some("1700000000_3"));
+
+        let (cursor_ts, cursor_offset) =
+            parse_cursor(next_cursor.as_deref()).expect("page-two cursor parses");
+        let (page_three, next_cursor) = paginate_page(
+            entries.clone(),
+            &AuditQuery::default(),
+            &self_only_access,
+            (cursor_ts, cursor_offset),
+            1,
+        );
+        assert_eq!(page_three[0].method.as_deref(), Some("AliceOlder"));
+        assert_eq!(next_cursor.as_deref(), Some("1699999999_1"));
+
+        let (cursor_ts, cursor_offset) =
+            parse_cursor(next_cursor.as_deref()).expect("page-three cursor parses");
+        let (page_four, next_cursor) = paginate_page(
+            entries,
+            &AuditQuery::default(),
+            &self_only_access,
+            (cursor_ts, cursor_offset),
+            1,
+        );
+        assert!(page_four.is_empty());
+        assert_eq!(next_cursor.as_deref(), None);
     }
 
     #[test]
