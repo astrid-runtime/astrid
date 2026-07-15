@@ -12,6 +12,8 @@ use astrid_core::kernel_api::CommandKind;
 use astrid_core::profile::{AuthMethod, DeviceKey, DeviceScope, PrincipalProfile};
 use std::sync::atomic::AtomicBool;
 
+use super::test_util::all_kernel_request_variants;
+
 struct InventoryCapsule {
     id: CapsuleId,
     manifest: CapsuleManifest,
@@ -225,41 +227,9 @@ fn rate_limit_for_request_returns_correct_limits() {
 
 // ── Capability mapping (issue #670) ──────────────────────────────
 
-fn all_request_variants() -> Vec<KernelRequest> {
-    vec![
-        KernelRequest::Shutdown { reason: None },
-        KernelRequest::GetStatus,
-        KernelRequest::ReloadCapsules,
-        KernelRequest::ReloadCapsule {
-            id: "x".to_string(),
-        },
-        KernelRequest::UnloadCapsule {
-            id: "x".to_string(),
-        },
-        KernelRequest::PromoteWorkspace {
-            id: "x".to_string(),
-        },
-        KernelRequest::RollbackWorkspace {
-            id: "x".to_string(),
-        },
-        KernelRequest::InstallCapsule {
-            source: "x".to_string(),
-            workspace: false,
-        },
-        KernelRequest::ListCapsules,
-        KernelRequest::GetCommands,
-        KernelRequest::GetCapsuleMetadata,
-        KernelRequest::GetAgentReadiness,
-        KernelRequest::ApproveCapability {
-            request_id: "r".to_string(),
-            signature: "s".to_string(),
-        },
-    ]
-}
-
 #[test]
 fn required_capability_every_variant_has_non_empty_mapping() {
-    for req in all_request_variants() {
+    for req in all_kernel_request_variants() {
         let cap = required_capability(&req, AuthorityScope::Self_);
         assert!(
             !cap.is_empty(),
@@ -376,7 +346,7 @@ fn required_capability_mapping_global_scope() {
 #[test]
 fn resolve_scope_defaults_to_self_except_daemon_capsule_lifecycle() {
     let caller = PrincipalId::new("alice").unwrap();
-    for req in all_request_variants() {
+    for req in all_kernel_request_variants() {
         if matches!(
             req,
             KernelRequest::ReloadCapsules

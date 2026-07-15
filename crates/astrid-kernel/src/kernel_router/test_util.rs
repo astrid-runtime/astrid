@@ -1,6 +1,30 @@
 use astrid_core::PrincipalId;
-use astrid_core::kernel_api::{AdminRequestKind, PairScopeArg};
+use astrid_core::kernel_api::{AdminRequestKind, KernelRequest, PairScopeArg};
 use astrid_core::profile::Quotas;
+
+pub(crate) fn all_kernel_request_variants() -> Vec<KernelRequest> {
+    vec![
+        KernelRequest::Shutdown { reason: None },
+        KernelRequest::GetStatus,
+        KernelRequest::ReloadCapsules,
+        KernelRequest::ReloadCapsule { id: "x".into() },
+        KernelRequest::UnloadCapsule { id: "x".into() },
+        KernelRequest::PromoteWorkspace { id: "x".into() },
+        KernelRequest::RollbackWorkspace { id: "x".into() },
+        KernelRequest::InstallCapsule {
+            source: "x".into(),
+            workspace: false,
+        },
+        KernelRequest::ListCapsules,
+        KernelRequest::GetCommands,
+        KernelRequest::GetCapsuleMetadata,
+        KernelRequest::GetAgentReadiness,
+        KernelRequest::ApproveCapability {
+            request_id: "r".into(),
+            signature: "s".into(),
+        },
+    ]
+}
 
 pub(crate) fn all_admin_request_variants() -> Vec<AdminRequestKind> {
     let principal = PrincipalId::default();

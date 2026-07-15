@@ -2,50 +2,11 @@
 
 use astrid_core::capability_grammar::known_capabilities;
 use astrid_core::capability_registry::capability_registry_revision_1;
-use astrid_core::kernel_api::KernelRequest;
 use std::collections::BTreeSet;
 
 use crate::kernel_router::admin::required_capability_for_admin_request;
-use crate::kernel_router::test_util::all_admin_request_variants;
+use crate::kernel_router::test_util::{all_admin_request_variants, all_kernel_request_variants};
 use crate::kernel_router::{AuthorityScope, required_capability};
-
-/// Mirror of `tests::all_request_variants` from the parent module —
-/// duplicated here because the parent's helper lives inside a
-/// `#[cfg(test)] mod tests` block and isn't visible to sibling test
-/// modules. Adding a `KernelRequest` variant requires updating both
-/// lists; the size is small enough that the duplication beats
-/// plumbing visibility through.
-fn all_kernel_request_variants() -> Vec<KernelRequest> {
-    vec![
-        KernelRequest::Shutdown { reason: None },
-        KernelRequest::GetStatus,
-        KernelRequest::ReloadCapsules,
-        KernelRequest::ReloadCapsule {
-            id: "x".to_string(),
-        },
-        KernelRequest::UnloadCapsule {
-            id: "x".to_string(),
-        },
-        KernelRequest::PromoteWorkspace {
-            id: "x".to_string(),
-        },
-        KernelRequest::RollbackWorkspace {
-            id: "x".to_string(),
-        },
-        KernelRequest::InstallCapsule {
-            source: "x".to_string(),
-            workspace: false,
-        },
-        KernelRequest::ListCapsules,
-        KernelRequest::GetCommands,
-        KernelRequest::GetCapsuleMetadata,
-        KernelRequest::GetAgentReadiness,
-        KernelRequest::ApproveCapability {
-            request_id: "r".to_string(),
-            signature: "s".to_string(),
-        },
-    ]
-}
 
 #[test]
 fn registry_revision_1_covers_every_kernel_request_cap() {
@@ -88,7 +49,7 @@ fn registry_revision_1_covers_every_admin_request_cap() {
 }
 
 #[test]
-fn registry_revision_1_classifies_every_current_enforcement_role() {
+fn registry_revision_1_freezes_the_complete_role_partition() {
     let primary = BTreeSet::from([
         "system:shutdown",
         "system:status",

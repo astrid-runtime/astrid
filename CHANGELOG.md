@@ -33,9 +33,11 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
 
 - **Capability-registry revision 1 now has fixed semantics and BLAKE3 digest
   vectors.** All 51 kernel entries bind scope, target kinds, delegability,
-  privileged status and provenance; request mappings and current enforcement
-  roles fail tests if they drift outside the registry. Authorization and
-  persisted state remain unchanged. Closes #1235. Refs #1228 and #1233.
+  privileged status and provenance. Kernel/admin request mappings and the
+  current capsule-side secondary enforcement constants resolve through the
+  registry in tests, while the complete role partition is frozen independently.
+  Authorization and persisted state remain unchanged. Closes #1235. Refs #1228
+  and #1233.
 
 ### Changed
 

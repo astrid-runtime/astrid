@@ -670,7 +670,7 @@ pub(crate) fn resolve_exemption(
 /// Elevated). A capsule-local literal keeps the kernel/capsule dependency
 /// boundary clean (the capsule must not reach into the gateway or grow the
 /// core grammar surface for one internal reference); the value is pinned by
-/// [`tests::audit_firehose_cap_literal_pinned`].
+/// [`tests::secondary_enforcement_ids_are_registered`].
 const AUDIT_FIREHOSE_CAP: &str = "audit:read_all";
 
 /// Pure decision: does this load principal's profile hold the audit
@@ -3562,11 +3562,17 @@ mod tests {
     // pinned positively/negatively below.
 
     #[test]
-    fn audit_firehose_cap_literal_pinned() {
-        // The capsule-local literal must stay byte-equal to the gateway's
-        // `events::AUDIT_FIREHOSE_CAP` and the core grammar's `audit:read_all`
-        // so the three references can never drift.
-        assert_eq!(AUDIT_FIREHOSE_CAP, "audit:read_all");
+    fn secondary_enforcement_ids_are_registered() {
+        let registry = astrid_core::capability_registry::capability_registry_revision_1().unwrap();
+        for id in std::iter::once(AUDIT_FIREHOSE_CAP).chain(astrid_core::EXEMPT_CAPABILITIES) {
+            assert!(
+                registry
+                    .entries()
+                    .iter()
+                    .any(|entry| entry.id().as_str() == id),
+                "capsule enforcement uses {id:?} without a registry revision 1 entry"
+            );
+        }
     }
 
     #[test]
