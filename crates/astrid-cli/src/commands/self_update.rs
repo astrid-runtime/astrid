@@ -23,7 +23,8 @@ use crate::cli::UpdateArgs;
 use crate::theme::Theme;
 
 use super::update_auth::{
-    UpdateStageError, authenticate_archive, extract_verified_archive, verify_integrity,
+    UpdateStageError, authenticate_archive, extract_verified_archive,
+    integrity_manifest_download_error, publisher_bundle_download_error, verify_integrity,
 };
 
 /// Default Astrid release repository. Discovery overrides never widen the
@@ -413,14 +414,6 @@ fn publisher_bundle_url<'a>(
 fn integrity_manifest_url(release: &serde_json::Value) -> Result<&str, UpdateStageError> {
     exact_asset_url(release, "BLAKE3SUMS.txt")
         .map_err(|error| UpdateStageError::integrity(error.to_string()))
-}
-
-fn publisher_bundle_download_error(error: &anyhow::Error) -> UpdateStageError {
-    UpdateStageError::publisher(format!("could not download Sigstore bundle: {error}"))
-}
-
-fn integrity_manifest_download_error(error: &anyhow::Error) -> UpdateStageError {
-    UpdateStageError::integrity(format!("could not download BLAKE3SUMS.txt: {error}"))
 }
 
 /// Stream a URL into memory under the size cap.

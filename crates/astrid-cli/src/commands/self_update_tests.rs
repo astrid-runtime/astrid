@@ -340,27 +340,6 @@ fn staged_asset_selection_preserves_the_exact_failure() {
 }
 
 #[test]
-fn staged_download_failures_preserve_the_bounded_download_cause() {
-    let bundle_error =
-        anyhow::anyhow!("publisher-authentication bundle exceeds 10485760 byte limit");
-    let bundle = publisher_bundle_download_error(&bundle_error);
-    assert_eq!(
-        bundle.to_string(),
-        "publisher authentication failed: could not download Sigstore bundle: \
-         publisher-authentication bundle exceeds 10485760 byte limit"
-    );
-
-    let manifest_error =
-        anyhow::anyhow!("BLAKE3 integrity manifest download failed: HTTP 503 Service Unavailable");
-    let manifest = integrity_manifest_download_error(&manifest_error);
-    assert_eq!(
-        manifest.to_string(),
-        "integrity check failed: could not download BLAKE3SUMS.txt: \
-         BLAKE3 integrity manifest download failed: HTTP 503 Service Unavailable"
-    );
-}
-
-#[test]
 fn backup_and_swap_replaces_and_keeps_backup() {
     let dir = tempfile::tempdir().unwrap();
     let install = dir.path().join("bin");

@@ -33,6 +33,27 @@ fn release_identity_is_exact_and_tag_bound() {
 }
 
 #[test]
+fn staged_download_failures_preserve_the_bounded_download_cause() {
+    let bundle_error =
+        anyhow::anyhow!("publisher-authentication bundle exceeds 10485760 byte limit");
+    let bundle = publisher_bundle_download_error(&bundle_error);
+    assert_eq!(
+        bundle.to_string(),
+        "publisher authentication failed: could not download Sigstore bundle: \
+         publisher-authentication bundle exceeds 10485760 byte limit"
+    );
+
+    let manifest_error =
+        anyhow::anyhow!("BLAKE3 integrity manifest download failed: HTTP 503 Service Unavailable");
+    let manifest = integrity_manifest_download_error(&manifest_error);
+    assert_eq!(
+        manifest.to_string(),
+        "integrity check failed: could not download BLAKE3SUMS.txt: \
+         BLAKE3 integrity manifest download failed: HTTP 503 Service Unavailable"
+    );
+}
+
+#[test]
 fn real_bundle_verifies_with_its_historical_identity_and_signed_time() {
     // The leaf certificate expired ten minutes after v0.9.4 was signed. A
     // successful verification now proves the bundle's Rekor/TSA evidence is

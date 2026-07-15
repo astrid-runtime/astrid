@@ -47,6 +47,14 @@ impl UpdateStageError {
     }
 }
 
+pub(super) fn publisher_bundle_download_error(error: &anyhow::Error) -> UpdateStageError {
+    UpdateStageError::publisher(format!("could not download Sigstore bundle: {error}"))
+}
+
+pub(super) fn integrity_manifest_download_error(error: &anyhow::Error) -> UpdateStageError {
+    UpdateStageError::integrity(format!("could not download BLAKE3SUMS.txt: {error}"))
+}
+
 /// Archive bytes whose Sigstore bundle authenticated the exact Astrid release
 /// workflow and tag. Construction is private to this module.
 #[derive(Debug)]
