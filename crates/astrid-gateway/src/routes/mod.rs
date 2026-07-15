@@ -55,7 +55,15 @@ pub mod sessions;
 pub mod stream;
 pub mod system;
 
-/// Build the gateway's HTTP router.
+/// Build the gateway's HTTP router with self-only audit visibility.
+///
+/// This builder installs a deny-all capability evaluator. Runtimes that need
+/// live `audit:read_all` policy must use [`build_with_capability_probe`].
+///
+/// When serving this router over a real socket, use
+/// `router.into_make_service_with_connect_info::<std::net::SocketAddr>()`
+/// rather than plain `axum::serve(listener, router)`. The unauthenticated
+/// redeem routes require the peer address for per-IP throttling.
 // A flat list of route registrations: its length tracks the API surface,
 // not branching complexity, and both the readiness and models surfaces add
 // rows here. Splitting it into sub-routers would obscure the single
@@ -73,9 +81,7 @@ pub fn build(state: Arc<GatewayState>) -> Router {
 /// When serving this router over a real socket, use
 /// `router.into_make_service_with_connect_info::<std::net::SocketAddr>()`
 /// rather than plain `axum::serve(listener, router)`. The unauthenticated
-/// redeem routes extract `ConnectInfo<SocketAddr>` for per-IP throttling, and
-/// axum only installs that request extension through the connect-info make
-/// service path.
+/// redeem routes require the peer address for per-IP throttling.
 pub fn build_with_capability_probe<F>(state: Arc<GatewayState>, capability_probe: F) -> Router
 where
     F: Fn(&astrid_core::PrincipalId, Option<&str>, &str) -> bool + Send + Sync + 'static,
