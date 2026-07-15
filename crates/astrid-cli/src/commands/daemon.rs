@@ -64,29 +64,27 @@ fn boot_log_stderr() -> Option<std::process::Stdio> {
 /// # Errors
 /// Returns an error if the daemon binary is not found, fails to spawn, or
 /// doesn't become ready within the bounded startup window.
-pub(crate) async fn spawn_daemon(ready_path: &std::path::Path) -> Result<std::process::Child> {
-    spawn_daemon_inner(ready_path, true).await
+pub(crate) async fn spawn_daemon(
+    ready_path: &std::path::Path,
+    workspace_root: Option<&Path>,
+) -> Result<std::process::Child> {
+    spawn_daemon_inner(ready_path, true, workspace_root).await
 }
 
 async fn spawn_daemon_inner(
     ready_path: &std::path::Path,
     announce: bool,
+    workspace_root: Option<&Path>,
 ) -> Result<std::process::Child> {
     if announce {
         println!("{}", theme::Theme::info("Booting Astrid daemon..."));
     }
-    let ws = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-    let daemon_bin = find_companion_binary("astrid-daemon")?;
-
-    let mut cmd = std::process::Command::new(daemon_bin);
-    cmd.arg("--ephemeral").env(
-        "ASTRID_WORKSPACE_STATE_DIR",
-        crate::workspace_layout::current().state_dir_name(),
+    let ws = workspace_root.map_or_else(
+        || std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
+        Path::to_path_buf,
     );
-
-    if let Some(ws_path) = ws.to_str() {
-        cmd.arg("--workspace").arg(ws_path);
-    }
+    let daemon_bin = find_companion_binary("astrid-daemon")?;
+    let mut cmd = ephemeral_daemon_command(&daemon_bin, &ws);
 
     // Capture the daemon's stderr to an append log so a boot failure (lock
     // contention, panic before tracing init) leaves a record instead of
@@ -136,6 +134,18 @@ async fn spawn_daemon_inner(
     Ok(child)
 }
 
+fn ephemeral_daemon_command(daemon_bin: &Path, workspace_root: &Path) -> std::process::Command {
+    let mut cmd = std::process::Command::new(daemon_bin);
+    cmd.arg("--ephemeral")
+        .arg("--workspace")
+        .arg(workspace_root)
+        .env(
+            "ASTRID_WORKSPACE_STATE_DIR",
+            crate::workspace_layout::current().state_dir_name(),
+        );
+    cmd
+}
+
 /// Ensure the daemon is running, spawning it if needed.
 ///
 /// Checks the socket path, cleans up stale sockets, and spawns a fresh
@@ -171,7 +181,7 @@ async fn ensure_daemon_inner(label: &str, announce: bool) -> Result<()> {
         true
     };
     if needs_boot {
-        spawn_daemon_inner(&ready_path, announce).await?;
+        spawn_daemon_inner(&ready_path, announce, None).await?;
         ensure_daemon_workspace_matches(None).await?;
     }
     Ok(())
@@ -702,6 +712,35 @@ mod tests {
                 &current,
                 crate::workspace_layout::current(),
             )
+        );
+    }
+
+    #[test]
+    fn ephemeral_boot_passes_the_selected_workspace_to_the_daemon() {
+        use std::ffi::OsStr;
+
+        let command = ephemeral_daemon_command(
+            Path::new("/installed/astrid-daemon"),
+            Path::new("/selected/project"),
+        );
+        let args = command.get_args().collect::<Vec<_>>();
+
+        assert_eq!(
+            args,
+            vec![
+                OsStr::new("--ephemeral"),
+                OsStr::new("--workspace"),
+                OsStr::new("/selected/project"),
+            ]
+        );
+        assert_eq!(
+            command
+                .get_envs()
+                .find(|(name, _)| *name == OsStr::new("ASTRID_WORKSPACE_STATE_DIR"))
+                .and_then(|(_, value)| value),
+            Some(OsStr::new(
+                crate::workspace_layout::current().state_dir_name()
+            ))
         );
     }
 

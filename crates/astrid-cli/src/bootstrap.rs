@@ -132,6 +132,10 @@ pub(crate) fn run_build_companion(
     }
 }
 
+fn selected_workspace_root(workspace: Option<std::path::PathBuf>) -> Option<std::path::PathBuf> {
+    workspace.or_else(|| std::env::current_dir().ok())
+}
+
 /// Resolve the session, check for an existing socket, and boot the
 /// kernel locally if necessary. Drives the interactive-session path.
 ///
@@ -152,6 +156,7 @@ pub(crate) async fn run_or_connect(
     } else {
         SessionId::from_uuid(Uuid::new_v4())
     };
+    let workspace_root = selected_workspace_root(workspace);
 
     let socket_path = socket_client::proxy_socket_path();
     let ready_path = socket_client::readiness_path();
@@ -186,7 +191,7 @@ pub(crate) async fn run_or_connect(
     let mut daemon_child: Option<std::process::Child> = None;
 
     if needs_boot {
-        match commands::daemon::spawn_daemon(&ready_path).await {
+        match commands::daemon::spawn_daemon(&ready_path, workspace_root.as_deref()).await {
             Ok(child) => daemon_child = Some(child),
             Err(e) => return Err(e),
         }
@@ -195,7 +200,7 @@ pub(crate) async fn run_or_connect(
     let mut client = match socket_client::connect_for_workspace(
         session_id.clone(),
         crate::principal::current(),
-        workspace.as_deref(),
+        workspace_root.as_deref(),
     )
     .await
     {
@@ -221,7 +226,6 @@ pub(crate) async fn run_or_connect(
         },
     };
 
-    let workspace_root = std::env::current_dir().ok();
     let model_name = astrid_config::Config::load_with_layout(
         workspace_root.as_deref(),
         crate::workspace_layout::current(),
@@ -230,4 +234,23 @@ pub(crate) async fn run_or_connect(
     .map_or_else(|| "unknown".to_string(), |r| r.config.model.model);
 
     crate::commands::chat::run_chat(&mut client, &session_id, &model_name, format).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::selected_workspace_root;
+
+    #[test]
+    fn explicit_workspace_root_wins_over_current_directory() {
+        let explicit = tempfile::tempdir().expect("explicit workspace");
+        assert_eq!(
+            selected_workspace_root(Some(explicit.path().to_path_buf())).as_deref(),
+            Some(explicit.path())
+        );
+    }
+
+    #[test]
+    fn absent_workspace_root_uses_current_directory() {
+        assert_eq!(selected_workspace_root(None), std::env::current_dir().ok());
+    }
 }

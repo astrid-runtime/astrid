@@ -137,7 +137,7 @@ pub(crate) async fn serve(principal: Option<&str>) -> Result<ExitCode> {
 
     tokio::spawn(session_guard::run(caller.clone()));
 
-    let server = AstridMcpServer::new(Arc::new(Mutex::new(client)), caller.to_string());
+    let server = AstridMcpServer::new(Arc::new(Mutex::new(client)), caller.clone());
 
     // `rmcp::transport::stdio()` yields the (stdin, stdout) pair the MCP
     // transport drives. `serve` performs the MCP handshake and spawns the

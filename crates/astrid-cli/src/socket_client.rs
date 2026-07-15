@@ -12,6 +12,7 @@ pub(crate) use astrid_uplink::socket_client::{
 use std::future::Future;
 
 use anyhow::Result;
+use astrid_core::PrincipalId;
 use astrid_uplink::KernelClient;
 
 enum KernelConnectionScope<'a> {
@@ -38,6 +39,31 @@ pub(crate) async fn connect_for_workspace(
     workspace_root: Option<&std::path::Path>,
 ) -> WorkspaceConnectionResult<SocketClient> {
     connect_workspace_client(workspace_root, || SocketClient::connect(session, principal)).await
+}
+
+/// Transactionally reconnect a long-lived uplink to the selected workspace.
+///
+/// A replacement client is authenticated between the same pre/post selection
+/// checks as an initial connection. The held client is swapped only after the
+/// post-check succeeds, so a daemon restart into another workspace can never
+/// leave the long-lived client bound to that daemon after returning an error.
+pub(crate) async fn reconnect_for_workspace<Validate>(
+    client: &mut SocketClient,
+    principal: PrincipalId,
+    workspace_root: Option<&std::path::Path>,
+    validate: Validate,
+) -> WorkspaceConnectionResult<()>
+where
+    Validate: FnOnce(&SocketClient) -> Result<()>,
+{
+    let session = client.session_id.clone();
+    replace_between_workspace_checks(
+        client,
+        || crate::commands::daemon::ensure_daemon_workspace_matches(workspace_root),
+        || SocketClient::connect(session, principal),
+        validate,
+    )
+    .await
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -118,6 +144,24 @@ where
     Ok(client)
 }
 
+async fn replace_between_workspace_checks<T, Check, CheckFuture, Connect, ConnectFuture>(
+    current: &mut T,
+    check: Check,
+    connect: Connect,
+    validate: impl FnOnce(&T) -> Result<()>,
+) -> WorkspaceConnectionResult<()>
+where
+    Check: FnMut() -> CheckFuture,
+    CheckFuture: Future<Output = Result<()>>,
+    Connect: FnOnce() -> ConnectFuture,
+    ConnectFuture: Future<Output = Result<T>>,
+{
+    let replacement = connect_between_workspace_checks(check, connect).await?;
+    validate(&replacement).map_err(WorkspaceConnectionError::Connect)?;
+    *current = replacement;
+    Ok(())
+}
+
 /// Send a user prompt over an established uplink.
 ///
 /// The connection is already bound to the process principal (resolved
@@ -143,6 +187,7 @@ mod tests {
 
     use super::{
         KernelConnectionScope, WorkspaceConnectionError, connect_between_workspace_checks,
+        replace_between_workspace_checks,
     };
 
     #[test]
@@ -221,5 +266,90 @@ mod tests {
 
         assert_eq!(client, 42);
         assert_eq!(checks.get(), 2);
+    }
+
+    #[tokio::test]
+    async fn pre_reconnect_mismatch_never_dials_or_replaces() {
+        let dialed = Cell::new(false);
+        let mut client = 7_u8;
+        let result = replace_between_workspace_checks(
+            &mut client,
+            || future::ready(Err(anyhow::anyhow!("workspace mismatch"))),
+            || async {
+                dialed.set(true);
+                Ok(9_u8)
+            },
+            |_| Ok(()),
+        )
+        .await;
+
+        assert!(matches!(
+            result,
+            Err(WorkspaceConnectionError::Selection(_))
+        ));
+        assert!(!dialed.get());
+        assert_eq!(client, 7);
+    }
+
+    #[tokio::test]
+    async fn post_reconnect_mismatch_keeps_the_previous_client() {
+        let checks = Cell::new(0_u8);
+        let mut client = 7_u8;
+        let result = replace_between_workspace_checks(
+            &mut client,
+            || {
+                checks.set(checks.get() + 1);
+                future::ready(if checks.get() == 1 {
+                    Ok(())
+                } else {
+                    Err(anyhow::anyhow!("daemon retargeted during reconnect"))
+                })
+            },
+            || async { Ok(9_u8) },
+            |_| Ok(()),
+        )
+        .await;
+
+        assert!(matches!(
+            result,
+            Err(WorkspaceConnectionError::Selection(_))
+        ));
+        assert_eq!(checks.get(), 2);
+        assert_eq!(client, 7);
+    }
+
+    #[tokio::test]
+    async fn matching_reconnect_replaces_only_after_both_checks() {
+        let checks = Cell::new(0_u8);
+        let mut client = 7_u8;
+        replace_between_workspace_checks(
+            &mut client,
+            || {
+                checks.set(checks.get() + 1);
+                future::ready(Ok(()))
+            },
+            || async { Ok(9_u8) },
+            |_| Ok(()),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(checks.get(), 2);
+        assert_eq!(client, 9);
+    }
+
+    #[tokio::test]
+    async fn rejected_reconnect_candidate_does_not_replace_the_client() {
+        let mut client = 7_u8;
+        let result = replace_between_workspace_checks(
+            &mut client,
+            || future::ready(Ok(())),
+            || async { Ok(9_u8) },
+            |_| Err(anyhow::anyhow!("replacement authentication failed")),
+        )
+        .await;
+
+        assert!(matches!(result, Err(WorkspaceConnectionError::Connect(_))));
+        assert_eq!(client, 7);
     }
 }
