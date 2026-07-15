@@ -200,7 +200,7 @@ async fn pagination_cursor_survives_live_narrowing_with_same_second_batch() {
 
     let (cursor_ts, cursor_offset, cursor_scope) =
         parse_cursor(next_cursor.as_deref()).expect("page-one cursor parses");
-    validate_cursor_scope(
+    let cursor_scope = validate_cursor_scope(
         cursor_ts,
         cursor_scope.as_ref(),
         &AuditQuery::default(),
@@ -223,7 +223,7 @@ async fn pagination_cursor_survives_live_narrowing_with_same_second_batch() {
 
     let (cursor_ts, cursor_offset, cursor_scope) =
         parse_cursor(next_cursor.as_deref()).expect("page-two cursor parses");
-    validate_cursor_scope(
+    let cursor_scope = validate_cursor_scope(
         cursor_ts,
         cursor_scope.as_ref(),
         &AuditQuery::default(),
@@ -239,14 +239,34 @@ async fn pagination_cursor_survives_live_narrowing_with_same_second_batch() {
     )
     .expect("page three");
     assert_eq!(page_three[0].method.as_deref(), Some("AliceOlder"));
+    assert_eq!(next_cursor.as_deref(), Some("1699999999_1_p616c696365"));
+
+    let (cursor_ts, cursor_offset, cursor_scope) =
+        parse_cursor(next_cursor.as_deref()).expect("page-three cursor parses");
+    let cursor_scope = validate_cursor_scope(
+        cursor_ts,
+        cursor_scope.as_ref(),
+        &AuditQuery::default(),
+        &self_only_access,
+    )
+    .expect("self-only cursor continues under same scope");
+    let (page_four, next_cursor) = paginate_page(
+        entries,
+        &AuditQuery::default(),
+        &self_only_access,
+        (cursor_ts, cursor_offset, cursor_scope),
+        1,
+    )
+    .expect("page four");
+    assert!(page_four.is_empty());
     assert_eq!(next_cursor.as_deref(), None);
 }
 
 #[test]
 fn parse_cursor_handles_v1_v2_and_v3_shapes() {
     // v1 (legacy): bare integer, no underscore — offset
-    // defaults to 0. We accept this shape so v0.7.0 cursors
-    // already in flight don't fail the next paginated fetch.
+    // defaults to 0. Validation later accepts this shape only
+    // for an unambiguous default self-view continuation.
     let (ts, off, scope) = parse_cursor(Some("1700000000")).expect("bare ts parses");
     assert_eq!(ts, Some(1_700_000_000));
     assert_eq!(off, 0);
@@ -288,7 +308,6 @@ async fn pagination_cursor_rejects_scope_widening_after_self_only_page() {
     let log = AuditLog::in_memory(KeyPair::generate());
     let session = SessionId::from_uuid(uuid::Uuid::nil());
     for (principal, method) in [
-        ("alice", "AliceOlder"),
         ("alice", "AliceVisibleWhileScoped"),
         ("bob", "BobNewlyVisibleAfterWidening"),
     ] {
@@ -312,16 +331,9 @@ async fn pagination_cursor_rejects_scope_widening_after_self_only_page() {
             .single()
             .unwrap(),
     );
-    let next_second = Timestamp::from_datetime(
-        chrono::Utc
-            .timestamp_opt(1_699_999_999, 0)
-            .single()
-            .unwrap(),
-    );
-    for entry in &mut entries[..2] {
+    for entry in &mut entries {
         entry.timestamp = same_second;
     }
-    entries[2].timestamp = next_second;
 
     let self_only_probe = super::super::events::CapabilityProbe::new(|_, _, _| false);
     let firehose_probe = super::super::events::CapabilityProbe::new(|_, _, _| true);
@@ -501,13 +513,13 @@ async fn principal_cursor_rejects_widening_during_skipped_rows() {
         device_key_id: Some("0123456789abcdef"),
         requested_principal: None,
     };
-    let cursor = (
+    let mut cursor = (
         Some(cursor_ts),
         1,
         Some(CursorScope::Principal(caller.clone())),
     );
 
-    validate_cursor_scope(cursor.0, cursor.2.as_ref(), &AuditQuery::default(), &access)
+    cursor.2 = validate_cursor_scope(cursor.0, cursor.2.as_ref(), &AuditQuery::default(), &access)
         .expect("principal cursor initially matches principal visibility");
     let err = paginate_page(entries, &AuditQuery::default(), &access, cursor, 1)
         .expect_err("widening while skipping cursor rows must restart pagination");
@@ -529,8 +541,37 @@ fn legacy_cursor_self_view_stays_compatible() {
     };
     let cursor = parse_cursor(Some("1700000000_3")).expect("legacy cursor parses");
 
-    validate_cursor_scope(cursor.0, cursor.2.as_ref(), &AuditQuery::default(), &access)
-        .expect("legacy self-view cursor remains compatible");
+    let bound_scope =
+        validate_cursor_scope(cursor.0, cursor.2.as_ref(), &AuditQuery::default(), &access)
+            .expect("legacy self-view cursor remains compatible");
+    assert_eq!(bound_scope, Some(CursorScope::Principal(caller)));
+}
+
+#[test]
+fn legacy_cursor_rejects_widening_between_validation_and_pagination() {
+    let checks = Arc::new(AtomicUsize::new(0));
+    let checks_for_probe = Arc::clone(&checks);
+    let capability_probe = super::super::events::CapabilityProbe::new(move |_, _, _| {
+        checks_for_probe.fetch_add(1, Ordering::SeqCst) >= 1
+    });
+    let caller = PrincipalId::new("alice").unwrap();
+    let access = AuditAccess {
+        capability_probe: &capability_probe,
+        caller_principal: &caller,
+        device_key_id: Some("0123456789abcdef"),
+        requested_principal: None,
+    };
+    let mut cursor = parse_cursor(Some("1700000000_3")).expect("legacy cursor parses");
+
+    cursor.2 = validate_cursor_scope(cursor.0, cursor.2.as_ref(), &AuditQuery::default(), &access)
+        .expect("legacy cursor validates while authority is self-only");
+    let err = paginate_page(Vec::new(), &AuditQuery::default(), &access, cursor, 1)
+        .expect_err("widening after legacy validation must restart pagination");
+
+    assert!(
+        err.to_string().contains(CURSOR_SCOPE_CHANGED),
+        "unexpected error: {err}"
+    );
 }
 
 #[test]
