@@ -137,13 +137,10 @@ fn registry_revision_1_classifies_every_current_enforcement_role() {
         "system:resources:unbounded",
         "net_bind",
         "uplink",
+        "capsule:access:any",
     ]);
     let token_authenticated = BTreeSet::from(["invite:redeem", "auth:pair:redeem"]);
-    let dormant = BTreeSet::from([
-        "capsule:access:any",
-        "authority:profile:manage",
-        "authority:repair",
-    ]);
+    let dormant = BTreeSet::from(["authority:profile:manage", "authority:repair"]);
     let mapping_only = BTreeSet::from(["capsule:remove"]);
 
     let classes = [
