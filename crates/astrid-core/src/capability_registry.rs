@@ -807,18 +807,6 @@ impl CapabilityRegistryManifest {
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum AuthorityRegistryError {
-    /// A fixed capability ID has no authorization definition.
-    #[error("capability-registry revision 1 entry {id:?} has no authorization definition")]
-    MissingRevisionDefinition {
-        /// Capability identifier.
-        id: String,
-    },
-    /// A fixed capability ID has no danger classification.
-    #[error("capability-registry revision 1 entry {id:?} has no display metadata")]
-    MissingRevisionDisplayMetadata {
-        /// Capability identifier.
-        id: String,
-    },
     /// A capability ID failed the existing static capability grammar.
     #[error("invalid capability id {id:?}: {source}")]
     InvalidCapabilityId {
@@ -874,6 +862,18 @@ pub enum AuthorityRegistryError {
         expected: String,
         /// Recomputed digest.
         actual: String,
+    },
+    /// A fixed capability ID has no authorization definition.
+    #[error("capability-registry revision 1 entry {id:?} has no authorization definition")]
+    MissingRevisionDefinition {
+        /// Capability identifier.
+        id: String,
+    },
+    /// A fixed capability ID has no danger classification.
+    #[error("capability-registry revision 1 entry {id:?} has no display metadata")]
+    MissingRevisionDisplayMetadata {
+        /// Capability identifier.
+        id: String,
     },
 }
 
