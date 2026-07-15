@@ -526,6 +526,15 @@ struct AdminAuthorizationContext<'a> {
     audit_params: Option<&'a serde_json::Value>,
 }
 
+fn allowed_admin_authorization(context: &AdminAuthorizationContext<'_>) -> AuthorizationProof {
+    AuthorizationProof::System {
+        reason: format!(
+            "policy allow: {} holds {}",
+            context.caller, context.required_cap
+        ),
+    }
+}
+
 async fn record_admin_authorization_failure(
     kernel: &Arc<crate::Kernel>,
     context: &AdminAuthorizationContext<'_>,
@@ -557,6 +566,27 @@ async fn record_admin_authorization_failure(
     .await;
 }
 
+async fn record_admin_bad_input_failure(
+    kernel: &Arc<crate::Kernel>,
+    context: &AdminAuthorizationContext<'_>,
+    error: &str,
+) {
+    record_admin_audit(
+        kernel,
+        AdminAuditEntry {
+            caller: context.caller,
+            method: context.method,
+            required_cap: context.required_cap,
+            device_key_id: context.device_key_id,
+            target_principal: context.target_principal.cloned(),
+            params: context.audit_params.cloned(),
+            authorization: allowed_admin_authorization(context),
+            outcome: AuditOutcome::failure(error),
+        },
+    )
+    .await;
+}
+
 async fn authorize_admin_request(
     kernel: &Arc<crate::Kernel>,
     context: &AdminAuthorizationContext<'_>,
@@ -575,16 +605,26 @@ async fn authorize_admin_request(
         },
     };
 
-    if let AdminRequestKind::PairDeviceIssue {
+    let preflight = if let AdminRequestKind::PairDeviceIssue {
         expires_secs,
         scope,
         ..
     } = context.kind
-        && let Err(error) =
-            pair_device_handlers::preflight_pair_device_issue(&authorization, *expires_secs, scope)
     {
-        record_admin_authorization_failure(kernel, context, &error).await;
-        return Err(error);
+        pair_device_handlers::preflight_pair_device_issue(&authorization, *expires_secs, scope)
+    } else {
+        Ok(())
+    };
+    match preflight {
+        Ok(()) => {},
+        Err(pair_device_handlers::PairIssuePreflightError::BadInput(error)) => {
+            record_admin_bad_input_failure(kernel, context, &error).await;
+            return Err(error);
+        },
+        Err(pair_device_handlers::PairIssuePreflightError::Unauthorized(error)) => {
+            record_admin_authorization_failure(kernel, context, &error).await;
+            return Err(error);
+        },
     }
 
     record_admin_audit(
@@ -596,12 +636,7 @@ async fn authorize_admin_request(
             device_key_id: context.device_key_id,
             target_principal: context.target_principal.cloned(),
             params: context.audit_params.cloned(),
-            authorization: AuthorizationProof::System {
-                reason: format!(
-                    "policy allow: {} holds {}",
-                    context.caller, context.required_cap
-                ),
-            },
+            authorization: allowed_admin_authorization(context),
             outcome: AuditOutcome::success(),
         },
     )

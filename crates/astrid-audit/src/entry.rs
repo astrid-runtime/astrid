@@ -437,10 +437,11 @@ pub enum AuditAction {
     /// Kernel management-API request (admin surface) — allowed or denied by
     /// the [`CapabilityCheck`](astrid_capabilities::CapabilityCheck)
     /// enforcement preamble and any request-specific no-escalation checks.
-    /// Pair this action with
-    /// [`AuthorizationProof::Denied`] + [`AuditOutcome::failure`] for the
-    /// deny path, or any of the positive authorization variants +
-    /// [`AuditOutcome::success`] for the allow path.
+    /// Pair this action with [`AuthorizationProof::Denied`] plus
+    /// [`AuditOutcome::failure`] for an authorization denial. A request that
+    /// passes authorization but fails request-shape validation carries a
+    /// positive authorization proof plus a failure outcome; a completed allow
+    /// path carries a positive proof plus [`AuditOutcome::success`].
     AdminRequest {
         /// Request variant name (e.g. `"Shutdown"`, `"ReloadCapsules"`).
         method: String,

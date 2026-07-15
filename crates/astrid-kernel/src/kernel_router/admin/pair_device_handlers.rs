@@ -181,21 +181,32 @@ pub(super) fn pair_scope_requires_admin(scope: &PairScopeArg) -> bool {
     }
 }
 
+/// Pair-issuance failure class used to keep audit authorization and operation
+/// outcomes distinct without changing the public error wire shape.
+pub(super) enum PairIssuePreflightError {
+    /// The caller was authorized, but the requested expiry or scope is invalid.
+    BadInput(String),
+    /// The requested scope exceeds the issuer's effective authority.
+    Unauthorized(String),
+}
+
 /// Validate pair issuance against the exact policy snapshot pinned by the
 /// router before it records an authorization success audit row.
 pub(super) fn preflight_pair_device_issue(
     authorization: &AuthorizedRequest,
     expires_secs: Option<u64>,
     requested: &PairScopeArg,
-) -> Result<(), String> {
-    let (_, requested_scope) = validate_pair_issue(expires_secs, requested)?;
+) -> Result<(), PairIssuePreflightError> {
+    let (_, requested_scope) =
+        validate_pair_issue(expires_secs, requested).map_err(PairIssuePreflightError::BadInput)?;
     validate_pair_issue_authority(
         &authorization.principal,
         authorization.profile.as_ref(),
         authorization.groups.as_ref(),
         authorization.device_scope.as_ref(),
         &requested_scope,
-    )?;
+    )
+    .map_err(PairIssuePreflightError::Unauthorized)?;
     Ok(())
 }
 

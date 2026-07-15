@@ -323,10 +323,17 @@ async fn send_admin_scoped(
     .expect("admin response within 2s")
 }
 
+#[derive(Clone, Copy)]
+enum PairIssueAuditExpectation {
+    Success,
+    Denied,
+    BadInput,
+}
+
 async fn assert_pair_issue_audit(
     kernel: &Arc<Kernel>,
     expected_capability: &str,
-    expected_success: bool,
+    expectation: PairIssueAuditExpectation,
 ) {
     let entries = kernel
         .audit_log
@@ -357,18 +364,28 @@ async fn assert_pair_issue_audit(
         unreachable!("filtered to pair issue audit rows")
     };
     assert_eq!(required_capability, expected_capability);
-    if expected_success {
-        assert!(matches!(
-            &entry.authorization,
-            AuthorizationProof::System { .. }
-        ));
-        assert!(matches!(&entry.outcome, AuditOutcome::Success { .. }));
-    } else {
-        assert!(matches!(
-            &entry.authorization,
-            AuthorizationProof::Denied { .. }
-        ));
-        assert!(matches!(&entry.outcome, AuditOutcome::Failure { .. }));
+    match expectation {
+        PairIssueAuditExpectation::Success => {
+            assert!(matches!(
+                &entry.authorization,
+                AuthorizationProof::System { .. }
+            ));
+            assert!(matches!(&entry.outcome, AuditOutcome::Success { .. }));
+        },
+        PairIssueAuditExpectation::Denied => {
+            assert!(matches!(
+                &entry.authorization,
+                AuthorizationProof::Denied { .. }
+            ));
+            assert!(matches!(&entry.outcome, AuditOutcome::Failure { .. }));
+        },
+        PairIssueAuditExpectation::BadInput => {
+            assert!(matches!(
+                &entry.authorization,
+                AuthorizationProof::System { .. }
+            ));
+            assert!(matches!(&entry.outcome, AuditOutcome::Failure { .. }));
+        },
     }
 }
 
@@ -508,7 +525,12 @@ async fn full_pair_mint_without_admin_capability_audits_denial() {
     )
     .await;
     assert_eq!(response["status"], "Error", "got: {response}");
-    assert_pair_issue_audit(&kernel, "self:auth:pair:admin", false).await;
+    assert_pair_issue_audit(
+        &kernel,
+        "self:auth:pair:admin",
+        PairIssueAuditExpectation::Denied,
+    )
+    .await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -550,7 +572,12 @@ async fn scoped_issuer_full_mint_structural_denial_is_audited() {
     )
     .await;
     assert_eq!(response["status"], "Error", "got: {response}");
-    assert_pair_issue_audit(&kernel, "self:auth:pair:admin", false).await;
+    assert_pair_issue_audit(
+        &kernel,
+        "self:auth:pair:admin",
+        PairIssueAuditExpectation::Denied,
+    )
+    .await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -583,7 +610,50 @@ async fn universal_pair_mint_subset_denial_is_audited() {
     )
     .await;
     assert_eq!(response["status"], "Error", "got: {response}");
-    assert_pair_issue_audit(&kernel, "self:auth:pair:admin", false).await;
+    assert_pair_issue_audit(
+        &kernel,
+        "self:auth:pair:admin",
+        PairIssueAuditExpectation::Denied,
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn malformed_pair_scope_audits_bad_input_not_permission_denial() {
+    let (_dir, kernel) = fixture().await;
+    let caller = pid("malformed_pair_scope");
+    seed_profile(
+        &kernel,
+        &caller,
+        &PrincipalProfile {
+            grants: vec!["self:auth:pair".into(), "self:capsule:reload".into()],
+            enabled: true,
+            ..Default::default()
+        },
+    );
+
+    let response = send_admin(
+        &kernel,
+        &caller,
+        "auth.pair.issue",
+        AdminRequestKind::PairDeviceIssue {
+            expires_secs: Some(300),
+            label: None,
+            scope: astrid_events::kernel_api::PairScopeArg::Explicit {
+                allow: vec!["self:capsule:reload".into()],
+                deny: vec!["self:capsule;install".into()],
+            },
+        }
+        .into(),
+    )
+    .await;
+    assert_eq!(response["status"], "Error", "got: {response}");
+    assert_pair_issue_audit(
+        &kernel,
+        "self:auth:pair",
+        PairIssueAuditExpectation::BadInput,
+    )
+    .await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -613,5 +683,10 @@ async fn successful_full_pair_mint_audits_pair_admin_allow() {
     )
     .await;
     assert_eq!(response["status"], "PairToken", "got: {response}");
-    assert_pair_issue_audit(&kernel, "self:auth:pair:admin", true).await;
+    assert_pair_issue_audit(
+        &kernel,
+        "self:auth:pair:admin",
+        PairIssueAuditExpectation::Success,
+    )
+    .await;
 }
