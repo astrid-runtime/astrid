@@ -528,6 +528,8 @@ fn dispatch_session(command: SessionCommands) -> Result<ExitCode> {
 
 #[cfg(test)]
 mod tests {
+    use clap::Parser;
+
     use super::*;
 
     /// The production harvest must include invocable **aliases**, not just
