@@ -134,13 +134,13 @@ async fn agent_modify_adds_and_removes_groups_idempotently() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn agent_modify_rejects_empty_changes() {
+async fn agent_modify_empty_delta_verifies_target_without_writing_profile() {
     let (_dir, kernel) = fixture().await;
     handlers::dispatch(
         &kernel,
         &astrid_core::PrincipalId::default(),
         AdminRequestKind::AgentCreate {
-            name: "nina".into(),
+            name: "preflight-target".into(),
             groups: Vec::new(),
             grants: Vec::new(),
             inherit_from: None,
@@ -149,11 +149,15 @@ async fn agent_modify_rejects_empty_changes() {
         },
     )
     .await;
-    let res = handlers::dispatch(
+    let target = pid("preflight-target");
+    let path = PrincipalProfile::path_for(&kernel.astrid_home, &target);
+    let before = std::fs::read(&path).unwrap();
+
+    let response = handlers::dispatch(
         &kernel,
-        &astrid_core::PrincipalId::default(),
+        &PrincipalId::default(),
         AdminRequestKind::AgentModify {
-            principal: pid("nina"),
+            principal: target,
             add_groups: Vec::new(),
             remove_groups: Vec::new(),
             add_capsules: Vec::new(),
@@ -161,7 +165,25 @@ async fn agent_modify_rejects_empty_changes() {
         },
     )
     .await;
-    assert_error_contains(&res, "must be non-empty");
+    let AdminResponseBody::Success(body) = response else {
+        panic!("expected success, got {response:?}");
+    };
+    assert_eq!(body["changed"], false);
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+
+    let missing = handlers::dispatch(
+        &kernel,
+        &PrincipalId::default(),
+        AdminRequestKind::AgentModify {
+            principal: pid("missing-target"),
+            add_groups: Vec::new(),
+            remove_groups: Vec::new(),
+            add_capsules: Vec::new(),
+            remove_capsules: Vec::new(),
+        },
+    )
+    .await;
+    assert_error_contains(&missing, "missing-target");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -181,48 +203,6 @@ async fn agent_modify_rejects_unknown_principal() {
     .await;
     // require_principal_exists's phantom-principal guard.
     assert_error_contains(&res, "ghost");
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn agent_modify_check_verifies_target_without_writing_profile() {
-    let (_dir, kernel) = fixture().await;
-    handlers::dispatch(
-        &kernel,
-        &PrincipalId::default(),
-        AdminRequestKind::AgentCreate {
-            name: "preflight-target".into(),
-            groups: Vec::new(),
-            grants: Vec::new(),
-            inherit_from: None,
-            clone_from: None,
-            allow_admin_clone: false,
-        },
-    )
-    .await;
-    let target = pid("preflight-target");
-    let path = PrincipalProfile::path_for(&kernel.astrid_home, &target);
-    let before = std::fs::read(&path).unwrap();
-
-    let response = handlers::dispatch(
-        &kernel,
-        &PrincipalId::default(),
-        AdminRequestKind::AgentModifyCheck {
-            principal: target.clone(),
-        },
-    )
-    .await;
-    assert_success(&response);
-    assert_eq!(std::fs::read(&path).unwrap(), before);
-
-    let missing = handlers::dispatch(
-        &kernel,
-        &PrincipalId::default(),
-        AdminRequestKind::AgentModifyCheck {
-            principal: pid("missing-target"),
-        },
-    )
-    .await;
-    assert_error_contains(&missing, "missing-target");
 }
 
 #[tokio::test(flavor = "multi_thread")]

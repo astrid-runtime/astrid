@@ -466,7 +466,9 @@ pub enum AdminRequestKind {
     /// loaded from `groups.toml` are both accepted as identifiers;
     /// validation that the named groups exist happens at the new
     /// profile's `validate` step. Mutations are idempotent — adding an
-    /// already-present group or removing an absent one is a no-op.
+    /// already-present group or removing an absent one is a no-op. An empty
+    /// delta performs the same authorized target-existence check without
+    /// rewriting the profile.
     AgentModify {
         /// Principal to modify.
         principal: PrincipalId,
@@ -491,14 +493,6 @@ pub enum AdminRequestKind {
         /// capsule's tool surface.
         #[serde(default)]
         remove_capsules: Vec<String>,
-    },
-    /// Read-only preflight for [`AgentModify`](Self::AgentModify). This
-    /// exercises the same global `agent:modify` authorization gate and
-    /// verifies that the target principal exists, without changing its
-    /// profile. Provisioners use it before making local filesystem changes.
-    AgentModifyCheck {
-        /// Principal that a later `AgentModify` request would target.
-        principal: PrincipalId,
     },
     /// Replace the target principal's [`Quotas`] block. Values are
     /// validated before the atomic profile write.

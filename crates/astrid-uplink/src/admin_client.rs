@@ -50,7 +50,6 @@ pub const fn topic_suffix(req: &AdminRequestKind) -> &'static str {
         AdminRequestKind::AgentEnable { .. } => "agent.enable",
         AdminRequestKind::AgentDisable { .. } => "agent.disable",
         AdminRequestKind::AgentModify { .. } => "agent.modify",
-        AdminRequestKind::AgentModifyCheck { .. } => "agent.modify.check",
         AdminRequestKind::AgentList => "agent.list",
         AdminRequestKind::QuotaSet { .. } => "quota.set",
         AdminRequestKind::QuotaGet { .. } => "quota.get",
@@ -268,12 +267,6 @@ mod tests {
         assert_eq!(topic_suffix(&AdminRequestKind::AgentList), "agent.list");
         assert_eq!(topic_suffix(&AdminRequestKind::GroupList), "group.list");
         let p = PrincipalId::default();
-        assert_eq!(
-            topic_suffix(&AdminRequestKind::AgentModifyCheck {
-                principal: p.clone(),
-            }),
-            "agent.modify.check"
-        );
         assert_eq!(
             topic_suffix(&AdminRequestKind::QuotaGet { principal: p }),
             "quota.get"

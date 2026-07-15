@@ -89,9 +89,6 @@ fn all_admin_variants() -> Vec<AdminRequestKind> {
             add_capsules: Vec::new(),
             remove_capsules: Vec::new(),
         },
-        AdminRequestKind::AgentModifyCheck {
-            principal: pid("target"),
-        },
         AdminRequestKind::AgentList,
         AdminRequestKind::QuotaSet {
             principal: pid("target"),

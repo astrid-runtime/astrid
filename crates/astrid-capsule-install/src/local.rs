@@ -32,6 +32,7 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, bail};
+use astrid_capsule::capsule::CapsuleId;
 use astrid_capsule::discovery::load_manifest;
 use astrid_capsule::engine::wasm::host_state::LifecyclePhase;
 use astrid_core::PrincipalId;
@@ -161,20 +162,79 @@ pub fn install_from_local_path_for_principal(
     options: InstallOptions,
     target_principal: &PrincipalId,
 ) -> anyhow::Result<InstallOutput> {
+    install_from_local_path_internal(source_dir, home, options, target_principal, None, None)
+}
+
+/// Install for an explicit principal only when the loaded manifest identity
+/// equals `expected`. When `expected_version` is present, the manifest version
+/// must match it too. Both comparisons happen before any install mutation.
+///
+/// # Errors
+///
+/// Returns an error when the manifest identity or expected version differs,
+/// or when any ordinary install validation or filesystem operation fails.
+#[allow(clippy::needless_pass_by_value)]
+pub fn install_from_local_path_checked_for_principal(
+    source_dir: &Path,
+    home: &AstridHome,
+    options: InstallOptions,
+    target_principal: &PrincipalId,
+    expected: &CapsuleId,
+    expected_version: Option<&str>,
+) -> anyhow::Result<InstallOutput> {
+    install_from_local_path_internal(
+        source_dir,
+        home,
+        options,
+        target_principal,
+        Some(expected),
+        expected_version,
+    )
+}
+
+#[allow(clippy::needless_pass_by_value, clippy::too_many_lines)]
+fn install_from_local_path_internal(
+    source_dir: &Path,
+    home: &AstridHome,
+    options: InstallOptions,
+    target_principal: &PrincipalId,
+    expected: Option<&CapsuleId>,
+    expected_version: Option<&str>,
+) -> anyhow::Result<InstallOutput> {
     let manifest_path = source_dir.join("Capsule.toml");
     if !manifest_path.exists() {
         bail!("No Capsule.toml found in {}", source_dir.display());
     }
     let manifest = load_manifest(&manifest_path).context("failed to load Capsule manifest")?;
-    let id = manifest.package.name.clone();
+    let id = CapsuleId::new(manifest.package.name.clone())?;
+    if let Some(expected) = expected
+        && id != *expected
+    {
+        bail!(
+            "capsule identity mismatch: expected '{}', manifest declares '{}'",
+            expected,
+            id
+        );
+    }
     let installed_version = manifest.package.version.clone();
+    if let Some(expected_version) = expected_version
+        && installed_version != expected_version
+    {
+        bail!(
+            "capsule version mismatch for '{}': expected '{}', manifest declares '{}'",
+            id,
+            expected_version,
+            installed_version
+        );
+    }
 
     // Pre-flight checks — pure reads, no target mutation.
     let export_conflicts = check_export_conflicts(&manifest)?;
 
     // Resolve target. The parent must exist before we attempt the
     // backup-rename later; create it now.
-    let target_dir = resolve_target_dir_for(home, target_principal, &id, options.workspace)?;
+    let target_dir =
+        resolve_target_dir_for(home, target_principal, id.as_str(), options.workspace)?;
     let parent = target_dir.parent().context("target dir has no parent")?;
     std::fs::create_dir_all(parent)
         .with_context(|| format!("failed to create {}", parent.display()))?;
@@ -223,7 +283,7 @@ pub fn install_from_local_path_for_principal(
 
     // Preserve existing .env.json (user configuration survives reinstall).
     if let Some(ref backup) = backup_dir {
-        restore_env_from_backup_for(home, target_principal, backup, &id);
+        restore_env_from_backup_for(home, target_principal, backup, id.as_str());
     }
 
     // Lifecycle hook — bytes from the content store, not the target.
@@ -295,7 +355,7 @@ pub fn install_from_local_path_for_principal(
     }
 
     // Determine env-prompt signal for the caller.
-    let env_path = resolve_env_path_for(home, target_principal, &id)?;
+    let env_path = resolve_env_path_for(home, target_principal, id.as_str())?;
     let env_needs_prompt = !manifest.env.is_empty() && !env_path.exists();
 
     let missing_imports = if options.skip_import_check {

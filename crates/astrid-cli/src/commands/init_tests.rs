@@ -5,117 +5,89 @@
 use super::*;
 
 #[test]
-fn batch_identity_mismatch_removes_unexpected_install() {
-    let dir = tempfile::tempdir().unwrap();
-    let home = AstridHome::from_path(dir.path());
-    let principal = astrid_core::PrincipalId::new("agent-1").unwrap();
-    let unexpected = super::super::capsule::install::resolve_target_dir_for(
-        &home,
-        &principal,
-        "wrong-capsule",
-        false,
-    )
-    .unwrap();
-    std::fs::create_dir_all(&unexpected).unwrap();
-    std::fs::write(unexpected.join("marker"), b"installed").unwrap();
-
-    let err = validate_batch_install_identity(
-        &home,
-        &principal,
-        "expected-capsule",
+fn batch_install_rejects_reported_identity_mismatch() {
+    let expected = astrid_capsule::capsule::CapsuleId::new("expected-capsule").unwrap();
+    let err = validate_batch_install(
+        &expected,
+        "1.0.0",
         super::super::capsule::install::BatchInstallOutcome {
-            installed_ids: vec!["wrong-capsule".to_string()],
+            installed: vec![super::super::capsule::install::InstalledCapsuleOutcome {
+                id: astrid_capsule::capsule::CapsuleId::new("wrong-capsule").unwrap(),
+                version: "1.0.0".to_string(),
+                wasm_hash: Some("abcd".to_string()),
+            }],
             resolved_ref: Some("v1.0.0".to_string()),
         },
     )
     .unwrap_err();
 
     assert!(err.to_string().contains("expected-capsule"), "got: {err:#}");
-    assert!(!unexpected.exists());
 }
 
 #[test]
-fn batch_identity_accepts_one_exact_installed_id() {
-    let dir = tempfile::tempdir().unwrap();
-    let home = AstridHome::from_path(dir.path());
-    let principal = astrid_core::PrincipalId::new("agent-1").unwrap();
-    let resolved = validate_batch_install_identity(
-        &home,
-        &principal,
-        "expected-capsule",
+fn batch_install_accepts_actual_version_hash_and_ref() {
+    let expected = astrid_capsule::capsule::CapsuleId::new("expected-capsule").unwrap();
+    let verified = validate_batch_install(
+        &expected,
+        "1.0.0",
         super::super::capsule::install::BatchInstallOutcome {
-            installed_ids: vec!["expected-capsule".to_string()],
+            installed: vec![super::super::capsule::install::InstalledCapsuleOutcome {
+                id: expected.clone(),
+                version: "1.0.0".to_string(),
+                wasm_hash: Some("abcd".to_string()),
+            }],
             resolved_ref: Some("v1.0.0".to_string()),
         },
     )
     .unwrap();
-    assert_eq!(resolved.as_deref(), Some("v1.0.0"));
+    assert_eq!(verified.version, "1.0.0");
+    assert_eq!(verified.wasm_hash.as_deref(), Some("abcd"));
+    assert_eq!(verified.resolved_ref.as_deref(), Some("v1.0.0"));
 }
 
 #[test]
-fn batch_identity_extra_id_removes_entire_invalid_batch() {
-    let dir = tempfile::tempdir().unwrap();
-    let home = AstridHome::from_path(dir.path());
-    let principal = astrid_core::PrincipalId::new("agent-1").unwrap();
-    let expected = super::super::capsule::install::resolve_target_dir_for(
-        &home,
-        &principal,
-        "expected-capsule",
-        false,
-    )
-    .unwrap();
-    let unexpected = super::super::capsule::install::resolve_target_dir_for(
-        &home,
-        &principal,
-        "wrong-capsule",
-        false,
-    )
-    .unwrap();
-    std::fs::create_dir_all(&expected).unwrap();
-    std::fs::create_dir_all(&unexpected).unwrap();
-
-    validate_batch_install_identity(
-        &home,
-        &principal,
-        "expected-capsule",
+fn batch_install_rejects_multiple_reported_capsules() {
+    let expected = astrid_capsule::capsule::CapsuleId::new("expected-capsule").unwrap();
+    let err = validate_batch_install(
+        &expected,
+        "1.0.0",
         super::super::capsule::install::BatchInstallOutcome {
-            installed_ids: vec!["expected-capsule".to_string(), "wrong-capsule".to_string()],
+            installed: vec![
+                super::super::capsule::install::InstalledCapsuleOutcome {
+                    id: expected.clone(),
+                    version: "1.0.0".to_string(),
+                    wasm_hash: None,
+                },
+                super::super::capsule::install::InstalledCapsuleOutcome {
+                    id: astrid_capsule::capsule::CapsuleId::new("wrong-capsule").unwrap(),
+                    version: "1.0.0".to_string(),
+                    wasm_hash: None,
+                },
+            ],
             resolved_ref: None,
         },
     )
     .unwrap_err();
-
-    assert!(!expected.exists());
-    assert!(!unexpected.exists());
+    assert!(err.to_string().contains("checked installer reported"));
 }
 
 #[test]
-fn batch_identity_cleanup_continues_after_an_invalid_reported_id() {
-    let dir = tempfile::tempdir().unwrap();
-    let home = AstridHome::from_path(dir.path());
-    let principal = astrid_core::PrincipalId::new("agent-1").unwrap();
-    let removable = super::super::capsule::install::resolve_target_dir_for(
-        &home,
-        &principal,
-        "wrong-capsule",
-        false,
-    )
-    .unwrap();
-    std::fs::create_dir_all(&removable).unwrap();
-
-    let err = validate_batch_install_identity(
-        &home,
-        &principal,
-        "expected-capsule",
+fn batch_install_rejects_declared_version_mismatch() {
+    let expected = astrid_capsule::capsule::CapsuleId::new("expected-capsule").unwrap();
+    let err = validate_batch_install(
+        &expected,
+        "1.0.0",
         super::super::capsule::install::BatchInstallOutcome {
-            installed_ids: vec!["../invalid".to_string(), "wrong-capsule".to_string()],
+            installed: vec![super::super::capsule::install::InstalledCapsuleOutcome {
+                id: expected,
+                version: "2.0.0".to_string(),
+                wasm_hash: None,
+            }],
             resolved_ref: None,
         },
     )
     .unwrap_err();
-
-    assert!(err.to_string().contains("cleanup was incomplete"));
-    assert!(!removable.exists());
+    assert!(err.to_string().contains("installed manifest reports 2.0.0"));
 }
 
 #[test]

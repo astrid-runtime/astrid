@@ -28,6 +28,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::{Context, bail};
+use astrid_capsule::capsule::CapsuleId;
 use astrid_capsule_install::github_source::{
     capsule_assets, extract_github_org_repo, parse_github_source, pick_capsule,
 };
@@ -37,7 +38,17 @@ use astrid_events::EventBus;
 
 use super::install_prompts::{cli_elicit_handler, prompt_env_fields};
 
-pub(crate) use super::install_batch::{BatchInstallOutcome, RefSpec, install_capsule_batch};
+pub(crate) use super::install_batch::{
+    BatchInstallOutcome, InstalledCapsuleOutcome, RefSpec, install_capsule_batch,
+};
+use super::install_github::{github_api_client, release_tag_url, resolve_github_ref};
+
+#[derive(Clone, Copy)]
+struct ExpectedCapsule<'a> {
+    id: &'a CapsuleId,
+    version: Option<&'a str>,
+}
+
 /// Re-exported so sibling CLI modules (`init.rs`, `shuttle_install.rs`)
 /// keep the `super::install::resolve_target_dir_for` import path. The
 /// `_for` variant scopes the target to a specific principal — the
@@ -93,13 +104,24 @@ pub(crate) async fn install_capsule(
     workspace: bool,
 ) -> anyhow::Result<()> {
     let principal = crate::principal::current();
-    let (installed, _resolved) =
-        install_capsule_inner(source, capsule, workspace, &RefSpec::default(), &principal).await?;
+    let (installed, _resolved) = install_capsule_inner(
+        source,
+        capsule,
+        workspace,
+        &RefSpec::default(),
+        &principal,
+        None,
+    )
+    .await?;
+    let installed_ids: Vec<String> = installed
+        .iter()
+        .map(|capsule| capsule.id.as_str().to_string())
+        .collect();
     // Live-load: if a daemon is running, hot-load (or upgrade) each just-installed
     // capsule so it's usable without a restart. Best-effort and non-fatal — the
     // on-disk install above already succeeded standalone. The `update` and TUI
     // install paths route through here too, so they inherit live hot-swap.
-    super::live_load::nudge_daemon_reload(&installed).await;
+    super::live_load::nudge_daemon_reload(&installed_ids).await;
     Ok(())
 }
 
@@ -116,7 +138,8 @@ pub(super) async fn install_capsule_inner(
     workspace: bool,
     refspec: &RefSpec,
     principal: &astrid_core::PrincipalId,
-) -> anyhow::Result<(Vec<String>, Option<String>)> {
+    expected: Option<&CapsuleId>,
+) -> anyhow::Result<(Vec<InstalledCapsuleOutcome>, Option<String>)> {
     let home = AstridHome::resolve()?;
 
     // Recover any `@org/repo@version` CLI suffix and fold it into the
@@ -127,13 +150,17 @@ pub(super) async fn install_capsule_inner(
         .clone()
         .or_else(|| suffix_version.map(str::to_string));
     let tag = refspec.tag.clone();
+    let expected = expected.map(|id| ExpectedCapsule {
+        id,
+        version: version.as_deref(),
+    });
 
     // 1. Explicit local path — record the path as the source so a
     //    later `astrid distro update` can re-resolve from it (it's the
     //    canonical reference for a locally-sourced capsule). No remote
     //    ref to resolve.
     if base.starts_with('.') || base.starts_with('/') {
-        let ids = install_from_local(base, workspace, &home, Some(base), principal)?;
+        let ids = install_from_local(base, workspace, &home, Some(base), principal, expected)?;
         return Ok((ids, None));
     }
 
@@ -149,6 +176,7 @@ pub(super) async fn install_capsule_inner(
             version.as_deref(),
             tag.as_deref(),
             principal,
+            expected,
         )
         .await;
     }
@@ -164,169 +192,19 @@ pub(super) async fn install_capsule_inner(
             version.as_deref(),
             tag.as_deref(),
             principal,
+            expected,
         )
         .await;
     }
 
     // 4. Fallback: assume local folder. No remote ref to resolve.
-    let ids = install_from_local(base, workspace, &home, Some(base), principal)?;
+    let ids = install_from_local(base, workspace, &home, Some(base), principal, expected)?;
     Ok((ids, None))
 }
 
 // ---------------------------------------------------------------------------
 // GitHub installs — release-artifact download with clone-and-build fallback.
 // ---------------------------------------------------------------------------
-
-/// A GitHub token from the environment, if present.
-///
-/// Checks `GH_TOKEN` then `GITHUB_TOKEN` — the conventions the `gh` CLI and
-/// CI both honour. An empty or whitespace value counts as absent.
-fn github_token() -> Option<String> {
-    ["GH_TOKEN", "GITHUB_TOKEN"].into_iter().find_map(|key| {
-        std::env::var(key)
-            .ok()
-            .map(|v| v.trim().to_string())
-            .filter(|v| !v.is_empty())
-    })
-}
-
-/// Build an HTTP client for GitHub release/source resolution, authenticated
-/// when a token is available.
-///
-/// Anonymous GitHub API access is capped at 60 requests/hour, which a full
-/// distro (~9 capsules, each costing one or more release-resolution calls)
-/// can exhaust mid-provision. A token lifts the ceiling to 5000/hour. The
-/// token is attached as a default `Authorization` header; reqwest strips
-/// sensitive headers on cross-host redirects, so it never leaks to the
-/// release-asset CDN the API redirects downloads to. Absence of a token is
-/// NOT an error — resolution simply proceeds anonymously.
-fn github_api_client() -> anyhow::Result<reqwest::Client> {
-    let mut headers = reqwest::header::HeaderMap::new();
-    if let Some(token) = github_token() {
-        match reqwest::header::HeaderValue::from_str(&format!("Bearer {token}")) {
-            Ok(mut value) => {
-                value.set_sensitive(true);
-                headers.insert(reqwest::header::AUTHORIZATION, value);
-            },
-            // A PRESENT-but-malformed token is surfaced rather than silently
-            // dropped, but does NOT hard-fail: anonymous access still works
-            // for public repos, and aborting init over an unrelated bad env
-            // var is worse than the 60/hr ceiling. The token value is never
-            // echoed. An ABSENT token stays silent — the normal case.
-            Err(_) => {
-                eprintln!(
-                    "warning: ignoring malformed GH_TOKEN/GITHUB_TOKEN \
-                     (not a valid HTTP header value); proceeding with \
-                     anonymous GitHub API access"
-                );
-            },
-        }
-    }
-    reqwest::Client::builder()
-        .user_agent("astrid-cli")
-        .timeout(std::time::Duration::from_secs(30))
-        .default_headers(headers)
-        .build()
-        .context("failed to build GitHub HTTP client")
-}
-
-/// Build the GitHub "release by tag" API URL with the tag as a single,
-/// percent-encoded path segment.
-///
-/// Interpolating the tag into the path (`releases/tags/{tag}`) is unsafe: a
-/// tag legitimately containing `/` (e.g. `release/1.0`) would change the URL
-/// path structure. Parsing the base and pushing the tag through
-/// `path_segments_mut` encodes it as one segment (`release%2F1.0`).
-fn release_tag_url(org: &str, repo: &str, tag: &str) -> anyhow::Result<String> {
-    // Parse the base WITHOUT a trailing slash: a trailing `/` leaves an empty
-    // final path segment, so pushing onto it yields `releases//tags`. Pushing
-    // `tags` then `tag` onto the un-slashed base gives the right path, with the
-    // tag percent-encoded as a single segment.
-    let mut url = reqwest::Url::parse(&format!(
-        "https://api.github.com/repos/{org}/{repo}/releases"
-    ))
-    .context("failed to build GitHub releases URL")?;
-    url.path_segments_mut()
-        .map_err(|()| anyhow::anyhow!("GitHub releases URL cannot be a base"))?
-        .push("tags")
-        .push(tag);
-    Ok(url.to_string())
-}
-
-/// Resolve which GitHub release tag to install for `org/repo`.
-///
-/// Resolution priority:
-/// 1. An explicit `tag` is used verbatim — the caller asked for it.
-/// 2. A `version` is matched against a release tag: `v{version}` first
-///    (the convention), then the bare `{version}`. A version with no
-///    matching release is a hard error (we never silently fall through
-///    to "latest" when the caller pinned a version).
-/// 3. Neither set → the `latest` release. This fallback is explicit and
-///    logged, replacing the previous behaviour where `releases/latest`
-///    was fetched unconditionally and any `version` field was ignored.
-async fn resolve_github_ref(
-    client: &reqwest::Client,
-    org: &str,
-    repo: &str,
-    version: Option<&str>,
-    tag: Option<&str>,
-) -> anyhow::Result<String> {
-    if let Some(t) = tag {
-        return Ok(t.to_string());
-    }
-
-    if let Some(v) = version {
-        for candidate in [format!("v{v}"), v.to_string()] {
-            let tag_url = release_tag_url(org, repo, &candidate)?;
-            let r = client.get(&tag_url).send().await.with_context(|| {
-                format!("failed to query release tag {candidate} for {org}/{repo}")
-            })?;
-            // 404 → this candidate tag simply doesn't exist; try the next.
-            if r.status() == reqwest::StatusCode::NOT_FOUND {
-                continue;
-            }
-            // Any other non-success (5xx, rate-limit, auth) is a real failure
-            // that must surface — not be misreported as "no release found".
-            if !r.status().is_success() {
-                bail!(
-                    "GitHub API error querying release tag {candidate} for {org}/{repo}: HTTP {}",
-                    r.status()
-                );
-            }
-            let json = r
-                .json::<serde_json::Value>()
-                .await
-                .with_context(|| format!("invalid GitHub API response for tag {candidate}"))?;
-            return Ok(json
-                .get("tag_name")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or(&candidate)
-                .to_string());
-        }
-        bail!("no GitHub release found for version {v} in {org}/{repo}");
-    }
-
-    // Explicit, documented fallback to the latest release.
-    tracing::debug!(%org, %repo, "no version/tag pin — resolving latest release");
-    let api_url = format!("https://api.github.com/repos/{org}/{repo}/releases/latest");
-    let r = client
-        .get(&api_url)
-        .send()
-        .await
-        .context("failed to reach GitHub API for latest release")?;
-    if !r.status().is_success() {
-        bail!(
-            "GitHub API returned {} for {org}/{repo} latest release",
-            r.status()
-        );
-    }
-    let json: serde_json::Value = r.json().await.context("invalid GitHub API response")?;
-    Ok(json
-        .get("tag_name")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("latest")
-        .to_string())
-}
 
 /// Stream a `.capsule` asset to `dest`, enforcing a 50 MB ceiling.
 async fn download_capsule_asset(
@@ -364,7 +242,8 @@ async fn install_from_github(
     version: Option<&str>,
     tag: Option<&str>,
     principal: &astrid_core::PrincipalId,
-) -> anyhow::Result<(Vec<String>, Option<String>)> {
+    expected: Option<ExpectedCapsule<'_>>,
+) -> anyhow::Result<(Vec<InstalledCapsuleOutcome>, Option<String>)> {
     // Authenticated when a token is present so release resolution isn't
     // throttled at the anonymous 60/hr limit mid-distro (see
     // `github_api_client`).
@@ -420,6 +299,7 @@ async fn install_from_github(
                             home,
                             original_source,
                             principal,
+                            expected,
                         )
                         .await?;
                         vec![id]
@@ -435,6 +315,7 @@ async fn install_from_github(
                             home,
                             original_source,
                             principal,
+                            expected,
                         )
                         .await?
                     },
@@ -473,6 +354,7 @@ async fn install_from_github(
         original_source,
         name_hint,
         principal,
+        expected,
     )?;
     Ok((vec![id], None))
 }
@@ -561,7 +443,8 @@ async fn download_and_unpack(
     home: &AstridHome,
     original_source: Option<&str>,
     principal: &astrid_core::PrincipalId,
-) -> anyhow::Result<String> {
+    expected: Option<ExpectedCapsule<'_>>,
+) -> anyhow::Result<InstalledCapsuleOutcome> {
     let tmp_dir = tempfile::tempdir()?;
     let sanitized_name = Path::new(name).file_name().unwrap_or_default();
     let download_path = tmp_dir.path().join(sanitized_name);
@@ -576,7 +459,14 @@ async fn download_and_unpack(
         );
     }
     std::fs::write(&download_path, &bytes)?;
-    unpack_via_lib(&download_path, workspace, home, original_source, principal)
+    unpack_via_lib(
+        &download_path,
+        workspace,
+        home,
+        original_source,
+        principal,
+        expected,
+    )
 }
 
 /// Install every `.capsule` asset in a release (the manual-install default).
@@ -592,9 +482,10 @@ async fn install_all_capsules(
     home: &AstridHome,
     original_source: Option<&str>,
     principal: &astrid_core::PrincipalId,
-) -> anyhow::Result<Vec<String>> {
+    expected: Option<ExpectedCapsule<'_>>,
+) -> anyhow::Result<Vec<InstalledCapsuleOutcome>> {
     eprintln!("Release ships {} capsule(s):", candidates.len());
-    let mut installed: Vec<String> = Vec::new();
+    let mut installed: Vec<InstalledCapsuleOutcome> = Vec::new();
     let mut failed: Vec<(&str, String)> = Vec::new();
     for (name, download_url) in candidates {
         eprintln!("Installing {name}...");
@@ -606,6 +497,7 @@ async fn install_all_capsules(
             home,
             original_source,
             principal,
+            expected,
         )
         .await
         {
@@ -643,7 +535,8 @@ fn clone_and_build(
     original_source: Option<&str>,
     name_hint: Option<&str>,
     principal: &astrid_core::PrincipalId,
-) -> anyhow::Result<String> {
+    expected: Option<ExpectedCapsule<'_>>,
+) -> anyhow::Result<InstalledCapsuleOutcome> {
     let tmp_dir = tempfile::tempdir().context("failed to create temp dir for cloning")?;
     let clone_dir = tmp_dir.path().join(repo);
 
@@ -696,7 +589,14 @@ fn clone_and_build(
         .map(|p| p.file_name().and_then(|n| n.to_str()).unwrap_or(""))
         .collect();
     if let Some(idx) = pick_capsule(&names, name_hint)? {
-        return unpack_via_lib(&produced[idx], workspace, home, original_source, principal);
+        return unpack_via_lib(
+            &produced[idx],
+            workspace,
+            home,
+            original_source,
+            principal,
+            expected,
+        );
     }
 
     bail!("astrid-build produced no .capsule archive.");
@@ -712,7 +612,8 @@ fn install_from_local(
     home: &AstridHome,
     original_source: Option<&str>,
     principal: &astrid_core::PrincipalId,
-) -> anyhow::Result<Vec<String>> {
+    expected: Option<ExpectedCapsule<'_>>,
+) -> anyhow::Result<Vec<InstalledCapsuleOutcome>> {
     let source_path = Path::new(source);
     if !source_path.exists() {
         bail!("Source path does not exist: {source}");
@@ -720,8 +621,15 @@ fn install_from_local(
 
     // Unpack `.capsule` archive when source is a file.
     if source_path.is_file() && source.ends_with(".capsule") {
-        return unpack_via_lib(source_path, workspace, home, original_source, principal)
-            .map(|id| vec![id]);
+        return unpack_via_lib(
+            source_path,
+            workspace,
+            home,
+            original_source,
+            principal,
+            expected,
+        )
+        .map(|installed| vec![installed]);
     }
 
     // Auto-build Rust capsules when source is a directory with a Cargo.toml.
@@ -748,15 +656,29 @@ fn install_from_local(
         for entry in std::fs::read_dir(&output_dir)? {
             let entry = entry?;
             if entry.path().extension().and_then(|s| s.to_str()) == Some("capsule") {
-                return unpack_via_lib(&entry.path(), workspace, home, original_source, principal)
-                    .map(|id| vec![id]);
+                return unpack_via_lib(
+                    &entry.path(),
+                    workspace,
+                    home,
+                    original_source,
+                    principal,
+                    expected,
+                )
+                .map(|installed| vec![installed]);
             }
         }
         bail!("Failed to auto-build capsule from Cargo project.");
     }
 
-    install_from_local_path_for_principal(source_path, workspace, home, original_source, principal)
-        .map(|id| vec![id])
+    install_from_local_path_for_principal(
+        source_path,
+        workspace,
+        home,
+        original_source,
+        principal,
+        expected,
+    )
+    .map(|installed| vec![installed])
 }
 
 // ---------------------------------------------------------------------------
@@ -777,7 +699,15 @@ pub(crate) fn install_from_local_path(
     original_source: Option<&str>,
 ) -> anyhow::Result<String> {
     let principal = crate::principal::current();
-    install_from_local_path_for_principal(source_dir, workspace, home, original_source, &principal)
+    install_from_local_path_for_principal(
+        source_dir,
+        workspace,
+        home,
+        original_source,
+        &principal,
+        None,
+    )
+    .map(|installed| installed.id.as_str().to_string())
 }
 
 fn install_from_local_path_for_principal(
@@ -786,7 +716,8 @@ fn install_from_local_path_for_principal(
     home: &AstridHome,
     original_source: Option<&str>,
     principal: &astrid_core::PrincipalId,
-) -> anyhow::Result<String> {
+    expected: Option<ExpectedCapsule<'_>>,
+) -> anyhow::Result<InstalledCapsuleOutcome> {
     let opts = InstallOptions {
         workspace,
         original_source: original_source.map(String::from),
@@ -794,15 +725,25 @@ fn install_from_local_path_for_principal(
         lifecycle_bus: None,
     };
     let output = run_with_elicit(opts, |opts, bus| {
-        astrid_capsule_install::install_from_local_path_for_principal(
-            source_dir,
-            home,
-            InstallOptions {
-                lifecycle_bus: Some(bus),
-                ..opts
+        let opts = InstallOptions {
+            lifecycle_bus: Some(bus),
+            ..opts
+        };
+        match expected {
+            Some(expected) => {
+                astrid_capsule_install::install_from_local_path_checked_for_principal(
+                    source_dir,
+                    home,
+                    opts,
+                    principal,
+                    expected.id,
+                    expected.version,
+                )
             },
-            principal,
-        )
+            None => astrid_capsule_install::install_from_local_path_for_principal(
+                source_dir, home, opts, principal,
+            ),
+        }
     })?;
     finish_install(&output, home)
 }
@@ -820,27 +761,38 @@ fn install_from_local_path_for_principal(
 pub(crate) fn install_offline_capsule(
     archive: &Path,
     home: &AstridHome,
-    name: &str,
+    expected: &CapsuleId,
+    expected_version: Option<&str>,
     original_source: &str,
     resolved_ref: Option<&str>,
     signer: Option<&str>,
     signature: Option<&str>,
     principal: &astrid_core::PrincipalId,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<InstalledCapsuleOutcome> {
     BATCH_MODE.store(true, Ordering::Relaxed);
     let result = (|| {
-        unpack_via_lib(archive, false, home, Some(original_source), principal)?;
+        let installed = unpack_via_lib(
+            archive,
+            false,
+            home,
+            Some(original_source),
+            principal,
+            Some(ExpectedCapsule {
+                id: expected,
+                version: expected_version,
+            }),
+        )?;
         // Post-stamp provenance into the freshly-written meta.json. The
-        // The unpack above installs under the explicit target principal, so
+        // unpack above installs under the explicit target principal, so
         // read metadata back from that same home.
-        let target_dir = resolve_target_dir_for(home, principal, name, false)?;
+        let target_dir = resolve_target_dir_for(home, principal, expected.as_str(), false)?;
         if let Some(mut meta) = super::meta::read_meta(&target_dir) {
             meta.resolved_ref = resolved_ref.map(String::from);
             meta.signer = signer.map(String::from);
             meta.signature = signature.map(String::from);
             super::meta::write_meta(&target_dir, &meta)?;
         }
-        Ok(())
+        Ok(installed)
     })();
     BATCH_MODE.store(false, Ordering::Relaxed);
     result
@@ -854,7 +806,8 @@ fn unpack_via_lib(
     home: &AstridHome,
     original_source: Option<&str>,
     principal: &astrid_core::PrincipalId,
-) -> anyhow::Result<String> {
+    expected: Option<ExpectedCapsule<'_>>,
+) -> anyhow::Result<InstalledCapsuleOutcome> {
     let opts = InstallOptions {
         workspace,
         original_source: original_source.map(String::from),
@@ -862,15 +815,23 @@ fn unpack_via_lib(
         lifecycle_bus: None,
     };
     let output = run_with_elicit(opts, |opts, bus| {
-        astrid_capsule_install::unpack_and_install_for_principal(
-            archive,
-            home,
-            InstallOptions {
-                lifecycle_bus: Some(bus),
-                ..opts
-            },
-            principal,
-        )
+        let opts = InstallOptions {
+            lifecycle_bus: Some(bus),
+            ..opts
+        };
+        match expected {
+            Some(expected) => astrid_capsule_install::unpack_and_install_checked_for_principal(
+                archive,
+                home,
+                opts,
+                principal,
+                expected.id,
+                expected.version,
+            ),
+            None => astrid_capsule_install::unpack_and_install_for_principal(
+                archive, home, opts, principal,
+            ),
+        }
     })?;
     finish_install(&output, home)
 }
@@ -901,7 +862,10 @@ where
 /// Render post-install diagnostics and prompt for unset env fields. Returns the
 /// installed capsule id (its directory name), so the manual-install path can
 /// nudge a running daemon to hot-load exactly that capsule.
-fn finish_install(output: &InstallOutput, home: &AstridHome) -> anyhow::Result<String> {
+fn finish_install(
+    output: &InstallOutput,
+    home: &AstridHome,
+) -> anyhow::Result<InstalledCapsuleOutcome> {
     let batch = BATCH_MODE.load(Ordering::Relaxed);
 
     // Load the manifest once (always present post-install) — used both for
@@ -914,10 +878,26 @@ fn finish_install(output: &InstallOutput, home: &AstridHome) -> anyhow::Result<S
     // any `kind = "cli"` commands, list the new top-level `astrid capsule
     // <verb>` verbs it adds so the operator knows what just became
     // invocable. Printed adjacent to the other manifest-derived notices.
-    let capsule_id = output.target_dir.file_name().map_or_else(
-        || "capsule".to_string(),
-        |n| n.to_string_lossy().into_owned(),
-    );
+    let capsule_id = CapsuleId::new(manifest.package.name.clone())?;
+    let meta = super::meta::read_meta(&output.target_dir)
+        .context("installed capsule has no readable meta.json")?;
+    if manifest.package.version != meta.version || output.installed_version != meta.version {
+        bail!(
+            "installed capsule '{}' version disagreement: manifest={}, meta={}, installer={}",
+            capsule_id,
+            manifest.package.version,
+            meta.version,
+            output.installed_version
+        );
+    }
+    if output.wasm_hash != meta.wasm_hash {
+        bail!(
+            "installed capsule '{}' hash disagreement: installer={:?}, meta={:?}",
+            capsule_id,
+            output.wasm_hash,
+            meta.wasm_hash
+        );
+    }
     let cli_commands: Vec<&astrid_capsule::manifest::CommandDef> = manifest
         .commands
         .iter()
@@ -936,16 +916,13 @@ fn finish_install(output: &InstallOutput, home: &AstridHome) -> anyhow::Result<S
         prompt_env_fields(
             &manifest.env,
             &output.env_path,
-            &capsule_id,
+            capsule_id.as_str(),
             &home.config_path(),
         )?;
     }
 
     if !batch && !output.missing_imports.is_empty() {
-        let importer = output.target_dir.file_name().map_or_else(
-            || "capsule".to_string(),
-            |n| n.to_string_lossy().into_owned(),
-        );
+        let importer = capsule_id.as_str();
         eprintln!();
         for missing in &output.missing_imports {
             eprintln!(
@@ -974,10 +951,14 @@ fn finish_install(output: &InstallOutput, home: &AstridHome) -> anyhow::Result<S
     // a fresh home with no canonical to compare against.
     if !batch {
         let skew = super::show::contracts_skew_at(&output.target_dir, home);
-        super::show::print_install_skew_notice(&capsule_id, &skew);
+        super::show::print_install_skew_notice(capsule_id.as_str(), &skew);
     }
 
-    Ok(capsule_id)
+    Ok(InstalledCapsuleOutcome {
+        id: capsule_id,
+        version: meta.version,
+        wasm_hash: meta.wasm_hash,
+    })
 }
 
 // ---------------------------------------------------------------------------

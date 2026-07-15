@@ -11,6 +11,8 @@ use std::fs::{File, OpenOptions};
 use std::future::Future;
 
 use anyhow::{Context, bail};
+use astrid_capsule::capsule::CapsuleId;
+use astrid_capsule::manifest::CapsuleManifest;
 use astrid_core::PrincipalId;
 use astrid_core::dirs::AstridHome;
 use astrid_core::kernel_api::{AdminRequestKind, AdminResponseBody};
@@ -93,8 +95,12 @@ pub(super) async fn preflight_grants(
                 .await
                 .context("grant preflight could not connect to the daemon")?;
             let body = client
-                .request(AdminRequestKind::AgentModifyCheck {
+                .request(AdminRequestKind::AgentModify {
                     principal: target.clone(),
+                    add_groups: Vec::new(),
+                    remove_groups: Vec::new(),
+                    add_capsules: Vec::new(),
+                    remove_capsules: Vec::new(),
                 })
                 .await
                 .context("grant preflight request failed")?;
@@ -161,10 +167,11 @@ pub(super) fn validate_locked_capsules(
 ) -> anyhow::Result<Vec<String>> {
     let mut installed = Vec::with_capacity(locked.len());
     for capsule in locked {
+        let expected = CapsuleId::new(capsule.name.clone())?;
         let target_dir = super::super::capsule::install::resolve_target_dir_for(
             home,
             target,
-            &capsule.name,
+            expected.as_str(),
             false,
         )?;
         let manifest_path = target_dir.join("Capsule.toml");
@@ -174,19 +181,12 @@ pub(super) fn validate_locked_capsules(
                 capsule.name, target
             )
         })?;
-        if manifest.package.name != capsule.name {
+        let actual = CapsuleId::new(manifest.package.name.clone())?;
+        if actual != expected {
             bail!(
                 "Distro.lock capsule '{}' resolves to installed manifest '{}'; refusing to grant stale identity",
-                capsule.name,
-                manifest.package.name
-            );
-        }
-        if !capsule.version.is_empty() && manifest.package.version != capsule.version {
-            bail!(
-                "Distro.lock capsule '{}' expects version {}, but installed metadata reports {}",
-                capsule.name,
-                capsule.version,
-                manifest.package.version
+                expected,
+                actual
             );
         }
         let meta = super::super::capsule::meta::read_meta(&target_dir).ok_or_else(|| {
@@ -196,6 +196,14 @@ pub(super) fn validate_locked_capsules(
                 target
             )
         })?;
+        if manifest.package.version != meta.version {
+            bail!(
+                "installed capsule '{}' version disagrees between Capsule.toml ({}) and meta.json ({})",
+                expected,
+                manifest.package.version,
+                meta.version
+            );
+        }
         if !capsule.version.is_empty() && meta.version != capsule.version {
             bail!(
                 "Distro.lock capsule '{}' expects version {}, but meta.json reports {}",
@@ -204,18 +212,103 @@ pub(super) fn validate_locked_capsules(
                 meta.version
             );
         }
-        if !capsule.hash.is_empty() {
-            let installed_hash = meta.wasm_hash.map(|hash| format!("blake3:{hash}"));
-            if installed_hash.as_deref() != Some(capsule.hash.as_str()) {
-                bail!(
-                    "Distro.lock capsule '{}' hash does not match its installed metadata",
-                    capsule.name
-                );
-            }
-        }
-        installed.push(capsule.name.clone());
+        validate_locked_wasm(
+            home,
+            &expected,
+            &manifest,
+            meta.wasm_hash.as_deref(),
+            &capsule.hash,
+        )?;
+        installed.push(expected.as_str().to_string());
     }
     Ok(installed)
+}
+
+fn validate_locked_wasm(
+    home: &AstridHome,
+    capsule: &CapsuleId,
+    manifest: &CapsuleManifest,
+    meta_hash: Option<&str>,
+    locked_hash: &str,
+) -> anyhow::Result<()> {
+    let declares_wasm = manifest_declares_wasm(manifest);
+    match meta_hash {
+        Some(meta_hash) => {
+            if !declares_wasm {
+                bail!(
+                    "Distro.lock capsule '{}' does not declare WASM but installed metadata carries a WASM hash",
+                    capsule
+                );
+            }
+            let locked = parse_locked_blake3(capsule, locked_hash)?;
+            let locked_hex = locked.to_hex().to_string();
+            if meta_hash != locked_hex {
+                bail!(
+                    "Distro.lock capsule '{}' hash disagrees with installed metadata",
+                    capsule
+                );
+            }
+            let blob_path = home.bin_dir().join(format!("{locked_hex}.wasm"));
+            let bytes = std::fs::read(&blob_path).with_context(|| {
+                format!(
+                    "Distro.lock capsule '{}' content blob is missing or unreadable at {}",
+                    capsule,
+                    blob_path.display()
+                )
+            })?;
+            let actual = blake3::hash(&bytes);
+            if actual != locked {
+                bail!(
+                    "Distro.lock capsule '{}' content blob bytes do not match hash {}",
+                    capsule,
+                    locked_hash
+                );
+            }
+        },
+        None => {
+            if declares_wasm {
+                bail!(
+                    "Distro.lock capsule '{}' declares WASM but has no installed WASM hash",
+                    capsule
+                );
+            }
+            if !locked_hash.is_empty() {
+                bail!(
+                    "Distro.lock non-WASM capsule '{}' must not carry a WASM hash",
+                    capsule
+                );
+            }
+        },
+    }
+    Ok(())
+}
+
+fn parse_locked_blake3(capsule: &CapsuleId, value: &str) -> anyhow::Result<blake3::Hash> {
+    let Some(hex) = value.strip_prefix("blake3:") else {
+        bail!(
+            "Distro.lock capsule '{}' requires a canonical blake3:<hex> WASM hash",
+            capsule
+        );
+    };
+    let hash = blake3::Hash::from_hex(hex).map_err(|_| {
+        anyhow::anyhow!(
+            "Distro.lock capsule '{}' has an invalid BLAKE3 hash",
+            capsule
+        )
+    })?;
+    if hex.len() != 64 || hash.to_hex().as_str() != hex {
+        bail!(
+            "Distro.lock capsule '{}' requires a canonical lowercase BLAKE3 hash",
+            capsule
+        );
+    }
+    Ok(hash)
+}
+
+fn manifest_declares_wasm(manifest: &CapsuleManifest) -> bool {
+    manifest.components.first().is_some_and(|component| {
+        component.path.extension().and_then(|ext| ext.to_str()) == Some("wasm")
+    })
 }
 
 #[cfg(unix)]
@@ -475,18 +568,22 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let home = AstridHome::from_path(dir.path());
         let target = PrincipalId::new("alice").unwrap();
+        let wasm = b"real wasm bytes";
+        let hash = blake3::hash(wasm).to_hex().to_string();
         let install_dir =
             super::super::capsule::install::resolve_target_dir_for(&home, &target, "cli", false)
                 .unwrap();
         std::fs::create_dir_all(&install_dir).unwrap();
         std::fs::write(
             install_dir.join("Capsule.toml"),
-            "[package]\nname = \"cli\"\nversion = \"1.0.0\"\n",
+            "[package]\nname = \"cli\"\nversion = \"1.0.0\"\n\n[[component]]\nid = \"main\"\nfile = \"cli.wasm\"\n",
         )
         .unwrap();
+        std::fs::create_dir_all(home.bin_dir()).unwrap();
+        std::fs::write(home.bin_dir().join(format!("{hash}.wasm")), wasm).unwrap();
         let meta = super::super::capsule::meta::CapsuleMeta {
             version: "1.0.0".to_string(),
-            wasm_hash: Some("abcd".to_string()),
+            wasm_hash: Some(hash.clone()),
             ..Default::default()
         };
         super::super::capsule::meta::write_meta(&install_dir, &meta).unwrap();
@@ -494,7 +591,7 @@ mod tests {
             name: "cli".to_string(),
             version: "1.0.0".to_string(),
             source: "@example/cli".to_string(),
-            hash: "blake3:abcd".to_string(),
+            hash: format!("blake3:{hash}"),
             resolved_ref: Some("v1.0.0".to_string()),
         }];
 
@@ -505,12 +602,124 @@ mod tests {
 
         let mismatched = super::super::capsule::meta::CapsuleMeta {
             version: "2.0.0".to_string(),
-            wasm_hash: Some("abcd".to_string()),
+            wasm_hash: Some(hash),
             ..Default::default()
         };
         super::super::capsule::meta::write_meta(&install_dir, &mismatched).unwrap();
         let err = validate_locked_capsules(&home, &target, &locked).unwrap_err();
-        assert!(err.to_string().contains("meta.json reports 2.0.0"));
+        assert!(err.to_string().contains("disagrees between Capsule.toml"));
+    }
+
+    #[test]
+    fn fresh_lock_rehashes_content_blob_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = AstridHome::from_path(dir.path());
+        let target = PrincipalId::new("alice").unwrap();
+        let install_dir =
+            super::super::capsule::install::resolve_target_dir_for(&home, &target, "cli", false)
+                .unwrap();
+        std::fs::create_dir_all(&install_dir).unwrap();
+        std::fs::write(
+            install_dir.join("Capsule.toml"),
+            "[package]\nname = \"cli\"\nversion = \"1.0.0\"\n\n[[component]]\nfile = \"cli.wasm\"\n",
+        )
+        .unwrap();
+        let hash = blake3::hash(b"original").to_hex().to_string();
+        super::super::capsule::meta::write_meta(
+            &install_dir,
+            &super::super::capsule::meta::CapsuleMeta {
+                version: "1.0.0".to_string(),
+                wasm_hash: Some(hash.clone()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        std::fs::create_dir_all(home.bin_dir()).unwrap();
+        let blob = home.bin_dir().join(format!("{hash}.wasm"));
+        std::fs::write(&blob, b"tampered").unwrap();
+        let locked = vec![super::LockedCapsule {
+            name: "cli".to_string(),
+            version: "1.0.0".to_string(),
+            source: "@example/cli".to_string(),
+            hash: format!("blake3:{hash}"),
+            resolved_ref: Some("v1.0.0".to_string()),
+        }];
+
+        let err = validate_locked_capsules(&home, &target, &locked).unwrap_err();
+        assert!(err.to_string().contains("blob bytes do not match"));
+        std::fs::remove_file(blob).unwrap();
+        let err = validate_locked_capsules(&home, &target, &locked).unwrap_err();
+        assert!(err.to_string().contains("missing or unreadable"));
+    }
+
+    #[test]
+    fn fresh_lock_allows_empty_hash_only_for_non_wasm_capsule() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = AstridHome::from_path(dir.path());
+        let target = PrincipalId::new("alice").unwrap();
+        let install_dir =
+            super::super::capsule::install::resolve_target_dir_for(&home, &target, "mcp", false)
+                .unwrap();
+        std::fs::create_dir_all(&install_dir).unwrap();
+        let manifest_path = install_dir.join("Capsule.toml");
+        std::fs::write(
+            &manifest_path,
+            "[package]\nname = \"mcp\"\nversion = \"1.0.0\"\n",
+        )
+        .unwrap();
+        super::super::capsule::meta::write_meta(
+            &install_dir,
+            &super::super::capsule::meta::CapsuleMeta {
+                version: "1.0.0".to_string(),
+                wasm_hash: None,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let locked = vec![super::LockedCapsule {
+            name: "mcp".to_string(),
+            version: "1.0.0".to_string(),
+            source: "@example/mcp".to_string(),
+            hash: String::new(),
+            resolved_ref: Some("v1.0.0".to_string()),
+        }];
+        assert_eq!(
+            validate_locked_capsules(&home, &target, &locked).unwrap(),
+            vec!["mcp"]
+        );
+
+        let stray_hash = blake3::hash(b"stray").to_hex().to_string();
+        super::super::capsule::meta::write_meta(
+            &install_dir,
+            &super::super::capsule::meta::CapsuleMeta {
+                version: "1.0.0".to_string(),
+                wasm_hash: Some(stray_hash.clone()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let mut hashed_non_wasm = locked.clone();
+        hashed_non_wasm[0].hash = format!("blake3:{stray_hash}");
+        let err = validate_locked_capsules(&home, &target, &hashed_non_wasm).unwrap_err();
+        assert!(err.to_string().contains("does not declare WASM"));
+
+        super::super::capsule::meta::write_meta(
+            &install_dir,
+            &super::super::capsule::meta::CapsuleMeta {
+                version: "1.0.0".to_string(),
+                wasm_hash: None,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        std::fs::write(
+            manifest_path,
+            "[package]\nname = \"mcp\"\nversion = \"1.0.0\"\n\n[[component]]\nfile = \"mcp.wasm\"\n",
+        )
+        .unwrap();
+        let err = validate_locked_capsules(&home, &target, &locked).unwrap_err();
+        assert!(err.to_string().contains("declares WASM"));
     }
 
     #[cfg(unix)]

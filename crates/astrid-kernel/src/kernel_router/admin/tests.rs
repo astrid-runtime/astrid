@@ -54,9 +54,6 @@ fn all_admin_variants() -> Vec<AdminRequestKind> {
             add_capsules: Vec::new(),
             remove_capsules: Vec::new(),
         },
-        AdminRequestKind::AgentModifyCheck {
-            principal: pid("a"),
-        },
         AdminRequestKind::AgentList,
         AdminRequestKind::QuotaSet {
             principal: pid("a"),
@@ -173,19 +170,6 @@ fn agent_list_maps_self_to_self_prefix() {
 }
 
 #[test]
-fn agent_modify_check_uses_global_modify_authority_even_for_self() {
-    let caller = pid("alice");
-    let req = AdminRequestKind::AgentModifyCheck {
-        principal: caller.clone(),
-    };
-    assert_eq!(resolve_admin_scope(&req, &caller), AuthorityScope::Global);
-    assert_eq!(
-        required_capability_for_admin_request(&req, AuthorityScope::Global),
-        "agent:modify"
-    );
-}
-
-#[test]
 fn agent_create_mapping_uses_granular_clone_and_inherit_caps() {
     assert_eq!(
         required_capability_for_admin_request(
@@ -240,6 +224,28 @@ fn every_variant_has_a_method_label() {
             "method must start with admin.: {m}"
         );
     }
+}
+
+#[test]
+fn empty_agent_modify_keeps_existing_wire_and_authority_mapping() {
+    let target = pid("target");
+    let req = AdminRequestKind::AgentModify {
+        principal: target.clone(),
+        add_groups: Vec::new(),
+        remove_groups: Vec::new(),
+        add_capsules: Vec::new(),
+        remove_capsules: Vec::new(),
+    };
+    assert_eq!(
+        resolve_admin_scope(&req, &pid("operator")),
+        AuthorityScope::Global
+    );
+    assert_eq!(
+        required_capability_for_admin_request(&req, AuthorityScope::Global),
+        "agent:modify"
+    );
+    assert_eq!(admin_request_method(&req), "admin.agent.modify");
+    assert_eq!(admin_target_principal(&req), Some(&target));
 }
 
 #[test]

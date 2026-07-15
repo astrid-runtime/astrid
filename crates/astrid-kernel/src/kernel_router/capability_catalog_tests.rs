@@ -92,9 +92,6 @@ fn all_admin_request_variants() -> Vec<AdminRequestKind> {
             add_capsules: vec![],
             remove_capsules: vec![],
         },
-        AdminRequestKind::AgentModifyCheck {
-            principal: p.clone(),
-        },
         AdminRequestKind::AgentList,
         AdminRequestKind::QuotaSet {
             principal: p.clone(),

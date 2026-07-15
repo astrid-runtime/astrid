@@ -21,6 +21,7 @@
 use std::path::Path;
 
 use anyhow::{Context, bail};
+use astrid_capsule::capsule::CapsuleId;
 use astrid_core::dirs::AstridHome;
 
 use super::lock::{DistroLock, DistroLockMeta, LockedCapsule, manifest_hash, write_lock};
@@ -188,11 +189,9 @@ pub(crate) fn install_from_shuttle(shuttle_path: &Path, opts: &InitOpts) -> anyh
 /// Install each selected capsule from the verified mirror and return
 /// the resolved [`LockedCapsule`] entries for the user's lock.
 ///
-/// Capsule blake3 was already validated against the lock up front by
-/// [`verify_capsule_hashes`] (file bytes proven == lock hash), so this
-/// does NOT re-read or re-hash the archive: it reads the installed
-/// `meta.json` for the content-addressed WASM hash and falls back to the
-/// sealed lock's already-verified blake3 if meta is absent.
+/// Capsule archive bytes were already validated against the sealed lock up
+/// front by [`verify_capsule_hashes`]. The user's lock records the version and
+/// content-addressed WASM hash reported by the checked install itself.
 fn install_selected_capsules(
     home: &AstridHome,
     principal: &astrid_core::PrincipalId,
@@ -212,15 +211,17 @@ fn install_selected_capsules(
             );
         }
 
-        // The sealed lock entry: carries both the truly-resolved ref (sealed
-        // online; nothing is resolved or guessed offline) and the
-        // already-verified blake3 used as the hash fallback below.
+        // The sealed lock entry carries the truly-resolved ref. Nothing is
+        // resolved or guessed during offline installation.
         let sealed = sealed_capsules.get(cap.name.as_str());
         let resolved_ref = sealed.and_then(|c| c.resolved_ref.clone());
-        crate::commands::capsule::install::install_offline_capsule(
+        let expected = CapsuleId::new(cap.name.clone())?;
+        let expected_version = (!cap.version.trim().is_empty()).then_some(cap.version.trim());
+        let installed = crate::commands::capsule::install::install_offline_capsule(
             &file,
             home,
-            &cap.name,
+            &expected,
+            expected_version,
             &cap.source,
             resolved_ref.as_deref(),
             signer,
@@ -229,26 +230,14 @@ fn install_selected_capsules(
         )
         .with_context(|| format!("failed to install capsule {}", cap.name))?;
 
-        // Record the installed content-addressed WASM hash from meta,
-        // falling back to the sealed lock's already-verified archive blake3
-        // (no re-read: `verify_capsule_hashes` proved file bytes == this).
-        // Read back from the scoped principal's home — the offline install
-        // (via `install_offline_capsule`) wrote it there.
-        let target_dir = crate::commands::capsule::install::resolve_target_dir_for(
-            home, principal, &cap.name, false,
-        )?;
-        let installed_hash = crate::commands::capsule::meta::read_meta(&target_dir)
-            .and_then(|m| m.wasm_hash)
-            .map_or_else(
-                || sealed.map(|c| c.hash.clone()).unwrap_or_default(),
-                |h| format!("blake3:{h}"),
-            );
-
         locked.push(LockedCapsule {
             name: cap.name.clone(),
-            version: cap.version.clone(),
+            version: installed.version,
             source: cap.source.clone(),
-            hash: installed_hash,
+            hash: installed
+                .wasm_hash
+                .map(|hash| format!("blake3:{hash}"))
+                .unwrap_or_default(),
             resolved_ref,
         });
         eprintln!("  installed {}", cap.name);

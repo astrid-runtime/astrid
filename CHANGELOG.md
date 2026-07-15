@@ -21,10 +21,13 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
   --grant-capsules` ensures the runtime daemon, verifies the operator has
   `agent:modify` authority over an existing target before provisioning, and
   applies the installed set through the shared `admin.agent.modify` path.
-  Batch identities and fresh-lock metadata are verified before names become
-  grants, concurrent provisioning of one target is rejected, and recovery
-  commands preserve the operator identity. The target defaults to the process
-  principal when omitted; no principal name receives special treatment.
+  Distro capsules require a concrete released version or tag; identity and
+  declared version are checked before install mutation, and locks record the
+  version and WASM hash that actually landed. Fresh-lock reuse rehashes the
+  installed content blob before names become grants. Concurrent provisioning
+  of one target is rejected, and recovery commands preserve the operator
+  identity. The target defaults to the process principal when omitted; no
+  principal name receives special treatment.
   Signed `.shuttle` grant composition remains deferred and fails explicitly.
   Closes #1195.
 

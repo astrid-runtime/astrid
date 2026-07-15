@@ -8,6 +8,7 @@ use std::collections::HashMap;
 use std::io::Write;
 
 use anyhow::{Context, bail};
+use astrid_capsule::capsule::CapsuleId;
 use astrid_core::dirs::AstridHome;
 use indicatif::{ProgressBar, ProgressStyle};
 
@@ -717,11 +718,10 @@ async fn install_capsules(
 
     let mut locked = Vec::with_capacity(total);
     let mut failed = Vec::new();
-    let home = AstridHome::resolve()?;
-
     for cap in selected {
         pb.set_message(cap.name.clone());
 
+        let expected = CapsuleId::new(cap.name.clone())?;
         let refspec = super::capsule::install::RefSpec::from_capsule(cap);
         // The installer returns the ref it ACTUALLY resolved and fetched
         // (`Some` for GitHub sources, `None` for local paths). Record
@@ -731,7 +731,7 @@ async fn install_capsules(
         // release.
         let outcome = match super::capsule::install::install_capsule_batch(
             &cap.source,
-            Some(&cap.name),
+            &expected,
             false,
             &refspec,
             principal,
@@ -746,35 +746,25 @@ async fn install_capsules(
                 continue;
             },
         };
-        let resolved_ref =
-            match validate_batch_install_identity(&home, principal, &cap.name, outcome) {
-                Ok(resolved_ref) => resolved_ref,
-                Err(e) => {
-                    eprintln!("\n  Failed to install {}: {e}", cap.name);
-                    failed.push(cap.name.clone());
-                    pb.inc(1);
-                    continue;
-                },
-            };
-
-        // Read the installed meta to get the wasm_hash for the lock. The
-        // capsule was installed under `principal`'s home (via the
-        // `*_for_principal` install lib), so read it back from there — not
-        // from the legacy `default`-principal resolver, which would miss a
-        // scoped principal's install and record an empty hash.
-        let target_dir =
-            super::capsule::install::resolve_target_dir_for(&home, principal, &cap.name, false)?;
-        let meta = super::capsule::meta::read_meta(&target_dir);
+        let verified = match validate_batch_install(&expected, &cap.version, outcome) {
+            Ok(verified) => verified,
+            Err(e) => {
+                eprintln!("\n  Failed to install {}: {e}", cap.name);
+                failed.push(cap.name.clone());
+                pb.inc(1);
+                continue;
+            },
+        };
 
         locked.push(LockedCapsule {
             name: cap.name.clone(),
-            version: cap.version.clone(),
+            version: verified.version,
             source: cap.source.clone(),
-            hash: meta
-                .and_then(|m| m.wasm_hash)
+            hash: verified
+                .wasm_hash
                 .map(|h| format!("blake3:{h}"))
                 .unwrap_or_default(),
-            resolved_ref,
+            resolved_ref: verified.resolved_ref,
         });
 
         pb.inc(1);
@@ -796,56 +786,53 @@ async fn install_capsules(
     Ok(locked)
 }
 
-/// Require the installer-reported identity to match the distro declaration.
-/// Any unexpected install is removed before the mismatch is returned.
-fn validate_batch_install_identity(
-    home: &AstridHome,
-    principal: &astrid_core::PrincipalId,
-    expected: &str,
-    outcome: super::capsule::install::BatchInstallOutcome,
-) -> anyhow::Result<Option<String>> {
-    if outcome.installed_ids.as_slice() == [expected] {
-        return Ok(outcome.resolved_ref);
-    }
+struct VerifiedBatchInstall {
+    version: String,
+    wasm_hash: Option<String>,
+    resolved_ref: Option<String>,
+}
 
-    let actual = outcome.installed_ids.join(", ");
-    let mut cleanup_errors = Vec::new();
-    for installed_id in &outcome.installed_ids {
-        let safe_id = match astrid_capsule::capsule::CapsuleId::new(installed_id.clone()) {
-            Ok(id) => id,
-            Err(error) => {
-                cleanup_errors.push(format!("'{installed_id}': invalid capsule id: {error}"));
-                continue;
-            },
-        };
-        let target = match super::capsule::install::resolve_target_dir_for(
-            home,
-            principal,
-            safe_id.as_str(),
-            false,
-        ) {
-            Ok(target) => target,
-            Err(error) => {
-                cleanup_errors.push(format!("'{installed_id}': {error}"));
-                continue;
-            },
-        };
-        if target.exists() {
-            if let Err(error) = std::fs::remove_dir_all(&target) {
-                cleanup_errors.push(format!("'{}': {error}", target.display()));
-            }
-        }
-    }
-    if !cleanup_errors.is_empty() {
+/// Require the checked installer to report one exact identity and an actual
+/// version consistent with the distro's released selector.
+fn validate_batch_install(
+    expected: &CapsuleId,
+    declared_version: &str,
+    outcome: super::capsule::install::BatchInstallOutcome,
+) -> anyhow::Result<VerifiedBatchInstall> {
+    if outcome.installed.len() != 1 {
+        let actual = outcome
+            .installed
+            .iter()
+            .map(|installed| installed.id.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
         bail!(
-            "distro declared capsule '{expected}', but the installer reported [{actual}]; cleanup was incomplete: {}",
-            cleanup_errors.join("; ")
+            "distro declared capsule '{expected}', but the checked installer reported [{}]",
+            actual
         );
     }
-    bail!(
-        "distro declared capsule '{expected}', but the installer reported [{}]; unexpected installs were removed",
-        actual
-    )
+    let installed = outcome
+        .installed
+        .into_iter()
+        .next()
+        .expect("length checked");
+    if installed.id != *expected {
+        bail!(
+            "distro declared capsule '{expected}', but the checked installer reported '{}'",
+            installed.id
+        );
+    }
+    if !declared_version.is_empty() && installed.version != declared_version {
+        bail!(
+            "capsule '{expected}' release selector declared version {declared_version}, but the installed manifest reports {}",
+            installed.version
+        );
+    }
+    Ok(VerifiedBatchInstall {
+        version: installed.version,
+        wasm_hash: installed.wasm_hash,
+        resolved_ref: outcome.resolved_ref,
+    })
 }
 
 /// Write per-capsule .env.json files with resolved variable templates.
