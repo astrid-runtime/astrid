@@ -110,7 +110,7 @@ async fn pagination_narrows_live_without_hiding_the_callers_records() {
         entries,
         &AuditQuery::default(),
         &access,
-        (None, 0, None),
+        AuditCursor::default(),
         DEFAULT_LIMIT,
     )
     .expect("pagination");
@@ -188,7 +188,7 @@ async fn pagination_cursor_survives_live_narrowing_with_same_second_batch() {
         entries.clone(),
         &AuditQuery::default(),
         &firehose_access,
-        (None, 0, None),
+        AuditCursor::default(),
         1,
     )
     .expect("page one");
@@ -196,13 +196,14 @@ async fn pagination_cursor_survives_live_narrowing_with_same_second_batch() {
         page_one[0].method.as_deref(),
         Some("BobVisibleBeforeNarrowing")
     );
-    assert_eq!(next_cursor.as_deref(), Some("1700000000_1_all"));
-
-    let (cursor_ts, cursor_offset, cursor_scope) =
-        parse_cursor(next_cursor.as_deref()).expect("page-one cursor parses");
-    let cursor_scope = validate_cursor_scope(
-        cursor_ts,
-        cursor_scope.as_ref(),
+    let mut cursor = parse_cursor(next_cursor.as_deref()).expect("page-one cursor parses");
+    assert_eq!(cursor.timestamp, Some(1_700_000_000));
+    assert_eq!(cursor.same_second_offset, 1);
+    assert_eq!(cursor.scope, Some(CursorScope::All));
+    assert_eq!(cursor.anchor_entry_id, Some(entries[0].id.0));
+    cursor.scope = validate_cursor_scope(
+        cursor.timestamp,
+        cursor.scope.as_ref(),
         &AuditQuery::default(),
         &self_only_access,
     )
@@ -211,7 +212,7 @@ async fn pagination_cursor_survives_live_narrowing_with_same_second_batch() {
         entries.clone(),
         &AuditQuery::default(),
         &self_only_access,
-        (cursor_ts, cursor_offset, cursor_scope),
+        cursor,
         1,
     )
     .expect("page two");
@@ -219,13 +220,14 @@ async fn pagination_cursor_survives_live_narrowing_with_same_second_batch() {
         page_two[0].method.as_deref(),
         Some("AliceVisibleAfterNarrowing")
     );
-    assert_eq!(next_cursor.as_deref(), Some("1700000000_3_p616c696365"));
-
-    let (cursor_ts, cursor_offset, cursor_scope) =
-        parse_cursor(next_cursor.as_deref()).expect("page-two cursor parses");
-    let cursor_scope = validate_cursor_scope(
-        cursor_ts,
-        cursor_scope.as_ref(),
+    let mut cursor = parse_cursor(next_cursor.as_deref()).expect("page-two cursor parses");
+    assert_eq!(cursor.timestamp, Some(1_700_000_000));
+    assert_eq!(cursor.same_second_offset, 3);
+    assert_eq!(cursor.scope, Some(CursorScope::Principal(caller.clone())));
+    assert_eq!(cursor.anchor_entry_id, Some(entries[2].id.0));
+    cursor.scope = validate_cursor_scope(
+        cursor.timestamp,
+        cursor.scope.as_ref(),
         &AuditQuery::default(),
         &self_only_access,
     )
@@ -234,12 +236,136 @@ async fn pagination_cursor_survives_live_narrowing_with_same_second_batch() {
         entries.clone(),
         &AuditQuery::default(),
         &self_only_access,
-        (cursor_ts, cursor_offset, cursor_scope),
+        cursor,
         1,
     )
     .expect("page three");
     assert_eq!(page_three[0].method.as_deref(), Some("AliceOlder"));
     assert_eq!(next_cursor.as_deref(), None);
+}
+
+#[tokio::test]
+async fn identity_cursor_survives_same_second_append_between_pages() {
+    let log = AuditLog::in_memory(KeyPair::generate());
+    let session = SessionId::from_uuid(uuid::Uuid::nil());
+    for method in ["Older", "PageOne"] {
+        log.append_with_principal(
+            session.clone(),
+            PrincipalId::new("alice").unwrap(),
+            admin_action(method, None),
+            AuthorizationProof::System {
+                reason: "test".into(),
+            },
+            AuditOutcome::Success { details: None },
+        )
+        .await
+        .expect("append");
+    }
+    let timestamp = Timestamp::from_datetime(
+        chrono::Utc
+            .timestamp_opt(1_700_000_000, 0)
+            .single()
+            .unwrap(),
+    );
+    let mut first_snapshot = log.get_session_entries(&session).await.expect("read");
+    first_snapshot.reverse();
+    for entry in &mut first_snapshot {
+        entry.timestamp = timestamp;
+    }
+
+    let self_only_probe = super::super::events::CapabilityProbe::new(|_, _, _| false);
+    let caller = PrincipalId::new("alice").unwrap();
+    let access = AuditAccess {
+        capability_probe: &self_only_probe,
+        caller_principal: &caller,
+        device_key_id: Some("0123456789abcdef"),
+        requested_principal: None,
+    };
+
+    let (page_one, next_cursor) = paginate_page(
+        first_snapshot.clone(),
+        &AuditQuery::default(),
+        &access,
+        AuditCursor::default(),
+        1,
+    )
+    .expect("page one");
+    assert_eq!(page_one[0].method.as_deref(), Some("PageOne"));
+
+    let mut cursor = parse_cursor(next_cursor.as_deref()).expect("identity cursor");
+    assert_eq!(cursor.anchor_entry_id, Some(first_snapshot[0].id.0));
+    cursor.scope = validate_cursor_scope(
+        cursor.timestamp,
+        cursor.scope.as_ref(),
+        &AuditQuery::default(),
+        &access,
+    )
+    .expect("self scope continues");
+
+    log.append_with_principal(
+        session.clone(),
+        caller.clone(),
+        admin_action("AppendedAfterPageOne", None),
+        AuthorizationProof::System {
+            reason: "test".into(),
+        },
+        AuditOutcome::Success { details: None },
+    )
+    .await
+    .expect("append between pages");
+    let mut second_snapshot = log.get_session_entries(&session).await.expect("read");
+    second_snapshot.reverse();
+    for entry in &mut second_snapshot {
+        entry.timestamp = timestamp;
+    }
+
+    let (page_two, next_cursor) =
+        paginate_page(second_snapshot, &AuditQuery::default(), &access, cursor, 2)
+            .expect("page two");
+    let methods: Vec<_> = page_two
+        .iter()
+        .filter_map(|entry| entry.method.as_deref())
+        .collect();
+    assert_eq!(methods, vec!["Older"]);
+    assert_eq!(next_cursor, None);
+}
+
+#[tokio::test]
+async fn identity_cursor_missing_anchor_requires_restart() {
+    let log = AuditLog::in_memory(KeyPair::generate());
+    let session = SessionId::from_uuid(uuid::Uuid::nil());
+    log.append_with_principal(
+        session.clone(),
+        PrincipalId::new("alice").unwrap(),
+        admin_action("OnlyEntry", None),
+        AuthorizationProof::System {
+            reason: "test".into(),
+        },
+        AuditOutcome::Success { details: None },
+    )
+    .await
+    .expect("append");
+    let mut entries = log.get_session_entries(&session).await.expect("read");
+    entries.reverse();
+
+    let self_only_probe = super::super::events::CapabilityProbe::new(|_, _, _| false);
+    let caller = PrincipalId::new("alice").unwrap();
+    let access = AuditAccess {
+        capability_probe: &self_only_probe,
+        caller_principal: &caller,
+        device_key_id: Some("0123456789abcdef"),
+        requested_principal: None,
+    };
+    let cursor = AuditCursor {
+        timestamp: Some(1_700_000_000),
+        same_second_offset: 1,
+        scope: Some(CursorScope::Principal(caller.clone())),
+        anchor_entry_id: Some(uuid::Uuid::new_v4()),
+    };
+
+    let err = paginate_page(entries, &AuditQuery::default(), &access, cursor, 1)
+        .expect_err("missing anchor must restart pagination");
+    assert!(err.to_string().contains(CURSOR_ANCHOR_MISSING));
 }
 
 #[tokio::test]
@@ -281,17 +407,21 @@ async fn exact_limit_page_preserves_scope_cursor_after_hidden_row() {
         requested_principal: None,
     };
 
-    let (page, next_cursor) =
-        paginate_page(entries, &AuditQuery::default(), &access, (None, 0, None), 1)
-            .expect("terminal page");
+    let (page, next_cursor) = paginate_page(
+        entries,
+        &AuditQuery::default(),
+        &access,
+        AuditCursor::default(),
+        1,
+    )
+    .expect("terminal page");
 
     assert_eq!(page.len(), 1);
     assert_eq!(page[0].method.as_deref(), Some("AliceTerminal"));
-    let (cursor_ts, _, cursor_scope) =
-        parse_cursor(next_cursor.as_deref()).expect("scope-bound cursor");
+    let cursor = parse_cursor(next_cursor.as_deref()).expect("scope-bound cursor");
     let err = validate_cursor_scope(
-        cursor_ts,
-        cursor_scope.as_ref(),
+        cursor.timestamp,
+        cursor.scope.as_ref(),
         &AuditQuery::default(),
         &widened_access,
     )
@@ -326,9 +456,14 @@ async fn exact_limit_physical_eof_has_no_continuation_cursor() {
         requested_principal: None,
     };
 
-    let (page, next_cursor) =
-        paginate_page(entries, &AuditQuery::default(), &access, (None, 0, None), 1)
-            .expect("terminal page");
+    let (page, next_cursor) = paginate_page(
+        entries,
+        &AuditQuery::default(),
+        &access,
+        AuditCursor::default(),
+        1,
+    )
+    .expect("terminal page");
 
     assert_eq!(page.len(), 1);
     assert_eq!(page[0].method.as_deref(), Some("AliceTerminal"));
@@ -336,44 +471,51 @@ async fn exact_limit_physical_eof_has_no_continuation_cursor() {
 }
 
 #[test]
-fn parse_cursor_handles_v1_v2_and_v3_shapes() {
+fn parse_cursor_handles_legacy_and_identity_anchored_shapes() {
     // v1 (legacy): bare integer, no underscore — offset
     // defaults to 0. Validation later accepts this shape only
     // for an unambiguous default self-view continuation.
-    let (ts, off, scope) = parse_cursor(Some("1700000000")).expect("bare ts parses");
-    assert_eq!(ts, Some(1_700_000_000));
-    assert_eq!(off, 0);
-    assert_eq!(scope, None);
+    let cursor = parse_cursor(Some("1700000000")).expect("bare ts parses");
+    assert_eq!(cursor.timestamp, Some(1_700_000_000));
+    assert_eq!(cursor.same_second_offset, 0);
+    assert_eq!(cursor.scope, None);
+    assert_eq!(cursor.anchor_entry_id, None);
 
     // v2: `<ts>_<offset>` — same-second batches resume cleanly
     // without losing or duplicating entries across the page
     // boundary.
-    let (ts, off, scope) = parse_cursor(Some("1700000000_3")).expect("v2 cursor parses");
-    assert_eq!(ts, Some(1_700_000_000));
-    assert_eq!(off, 3);
-    assert_eq!(scope, None);
+    let cursor = parse_cursor(Some("1700000000_3")).expect("v2 cursor parses");
+    assert_eq!(cursor.timestamp, Some(1_700_000_000));
+    assert_eq!(cursor.same_second_offset, 3);
+    assert_eq!(cursor.scope, None);
+    assert_eq!(cursor.anchor_entry_id, None);
 
-    // v3: `<ts>_<offset>_<scope>` — carries the last page's
-    // effective scope so incompatible widens fail closed.
-    let (ts, off, scope) =
-        parse_cursor(Some("1700000000_3_p616c696365")).expect("v3 cursor parses");
-    assert_eq!(ts, Some(1_700_000_000));
-    assert_eq!(off, 3);
+    // New cursors carry both the effective scope and immutable entry anchor.
+    let entry_id = uuid::Uuid::from_u128(1);
+    let cursor = parse_cursor(Some(
+        "1700000000_3_p616c696365_00000000-0000-0000-0000-000000000001",
+    ))
+    .expect("identity-anchored cursor parses");
+    assert_eq!(cursor.timestamp, Some(1_700_000_000));
+    assert_eq!(cursor.same_second_offset, 3);
     assert_eq!(
-        scope,
+        cursor.scope,
         Some(CursorScope::Principal(PrincipalId::new("alice").unwrap()))
     );
+    assert_eq!(cursor.anchor_entry_id, Some(entry_id));
 
     // None: no cursor → no positioning, start from newest.
-    let (ts, off, scope) = parse_cursor(None).expect("None passes");
-    assert_eq!(ts, None);
-    assert_eq!(off, 0);
-    assert_eq!(scope, None);
+    assert_eq!(
+        parse_cursor(None).expect("None passes"),
+        AuditCursor::default()
+    );
 
     // Garbage rejected with `BadRequest`.
     assert!(parse_cursor(Some("not-a-number")).is_err());
     assert!(parse_cursor(Some("123_not-a-number")).is_err());
     assert!(parse_cursor(Some("not-a-number_4")).is_err());
+    assert!(parse_cursor(Some("1700000000_3_p616c696365")).is_err());
+    assert!(parse_cursor(Some("1700000000_3_all_not-a-uuid")).is_err());
 }
 
 #[tokio::test]
@@ -428,7 +570,7 @@ async fn pagination_cursor_rejects_scope_widening_after_self_only_page() {
         entries,
         &AuditQuery::default(),
         &self_only_access,
-        (None, 0, None),
+        AuditCursor::default(),
         1,
     )
     .expect("page one");
@@ -436,10 +578,10 @@ async fn pagination_cursor_rejects_scope_widening_after_self_only_page() {
         page_one[0].method.as_deref(),
         Some("AliceVisibleWhileScoped")
     );
-    let (cursor_ts, _, cursor_scope) = parse_cursor(next_cursor.as_deref()).expect("cursor parses");
+    let cursor = parse_cursor(next_cursor.as_deref()).expect("cursor parses");
     let err = validate_cursor_scope(
-        cursor_ts,
-        cursor_scope.as_ref(),
+        cursor.timestamp,
+        cursor.scope.as_ref(),
         &AuditQuery::default(),
         &firehose_access,
     )
@@ -489,8 +631,14 @@ async fn pagination_rejects_mid_page_scope_widening_after_visible_rows() {
         requested_principal: None,
     };
 
-    let err = paginate_page(entries, &AuditQuery::default(), &access, (None, 0, None), 3)
-        .expect_err("mid-page widening must restart pagination");
+    let err = paginate_page(
+        entries,
+        &AuditQuery::default(),
+        &access,
+        AuditCursor::default(),
+        3,
+    )
+    .expect_err("mid-page widening must restart pagination");
     assert!(
         err.to_string().contains(CURSOR_SCOPE_CHANGED),
         "unexpected error: {err}"
@@ -533,8 +681,14 @@ async fn pagination_rejects_scope_widening_before_first_visible_row() {
         requested_principal: None,
     };
 
-    let err = paginate_page(entries, &AuditQuery::default(), &access, (None, 0, None), 3)
-        .expect_err("widening before the first visible row must not signal EOF");
+    let err = paginate_page(
+        entries,
+        &AuditQuery::default(),
+        &access,
+        AuditCursor::default(),
+        3,
+    )
+    .expect_err("widening before the first visible row must not signal EOF");
     assert!(
         err.to_string().contains(CURSOR_SCOPE_CHANGED),
         "unexpected error: {err}"
@@ -542,20 +696,25 @@ async fn pagination_rejects_scope_widening_before_first_visible_row() {
 }
 
 #[tokio::test]
-async fn principal_cursor_rejects_widening_during_skipped_rows() {
+async fn identity_cursor_rejects_widening_while_seeking_anchor() {
     let log = AuditLog::in_memory(KeyPair::generate());
     let session = SessionId::from_uuid(uuid::Uuid::nil());
-    log.append_with_principal(
-        session.clone(),
-        PrincipalId::new("bob").unwrap(),
-        admin_action("BobSkippedByCursor", None),
-        AuthorizationProof::System {
-            reason: "test".into(),
-        },
-        AuditOutcome::Success { details: None },
-    )
-    .await
-    .expect("append");
+    for (principal, method) in [
+        ("alice", "PriorPageAnchor"),
+        ("bob", "AppendedBeforeAnchor"),
+    ] {
+        log.append_with_principal(
+            session.clone(),
+            PrincipalId::new(principal).unwrap(),
+            admin_action(method, None),
+            AuthorizationProof::System {
+                reason: "test".into(),
+            },
+            AuditOutcome::Success { details: None },
+        )
+        .await
+        .expect("append");
+    }
     let mut entries = log.get_session_entries(&session).await.expect("read");
     entries.reverse();
     let cursor_ts = 1_700_000_000_u64;
@@ -581,16 +740,22 @@ async fn principal_cursor_rejects_widening_during_skipped_rows() {
         device_key_id: Some("0123456789abcdef"),
         requested_principal: None,
     };
-    let mut cursor = (
-        Some(cursor_ts),
-        1,
-        Some(CursorScope::Principal(caller.clone())),
-    );
+    let mut cursor = AuditCursor {
+        timestamp: Some(cursor_ts),
+        same_second_offset: 1,
+        scope: Some(CursorScope::Principal(caller.clone())),
+        anchor_entry_id: Some(entries[1].id.0),
+    };
 
-    cursor.2 = validate_cursor_scope(cursor.0, cursor.2.as_ref(), &AuditQuery::default(), &access)
-        .expect("principal cursor initially matches principal visibility");
+    cursor.scope = validate_cursor_scope(
+        cursor.timestamp,
+        cursor.scope.as_ref(),
+        &AuditQuery::default(),
+        &access,
+    )
+    .expect("principal cursor initially matches principal visibility");
     let err = paginate_page(entries, &AuditQuery::default(), &access, cursor, 1)
-        .expect_err("widening while skipping cursor rows must restart pagination");
+        .expect_err("widening while seeking the identity anchor must restart pagination");
     assert!(
         err.to_string().contains(CURSOR_SCOPE_CHANGED),
         "unexpected error: {err}"
@@ -609,9 +774,13 @@ fn legacy_cursor_self_view_stays_compatible() {
     };
     let cursor = parse_cursor(Some("1700000000_3")).expect("legacy cursor parses");
 
-    let bound_scope =
-        validate_cursor_scope(cursor.0, cursor.2.as_ref(), &AuditQuery::default(), &access)
-            .expect("legacy self-view cursor remains compatible");
+    let bound_scope = validate_cursor_scope(
+        cursor.timestamp,
+        cursor.scope.as_ref(),
+        &AuditQuery::default(),
+        &access,
+    )
+    .expect("legacy self-view cursor remains compatible");
     assert_eq!(bound_scope, Some(CursorScope::Principal(caller)));
 }
 
@@ -631,8 +800,13 @@ fn legacy_cursor_rejects_widening_between_validation_and_pagination() {
     };
     let mut cursor = parse_cursor(Some("1700000000_3")).expect("legacy cursor parses");
 
-    cursor.2 = validate_cursor_scope(cursor.0, cursor.2.as_ref(), &AuditQuery::default(), &access)
-        .expect("legacy cursor validates while authority is self-only");
+    cursor.scope = validate_cursor_scope(
+        cursor.timestamp,
+        cursor.scope.as_ref(),
+        &AuditQuery::default(),
+        &access,
+    )
+    .expect("legacy cursor validates while authority is self-only");
     let err = paginate_page(Vec::new(), &AuditQuery::default(), &access, cursor, 1)
         .expect_err("widening after legacy validation must restart pagination");
 
@@ -653,8 +827,13 @@ fn legacy_cursor_rejects_firehose_resume() {
         requested_principal: None,
     };
     let cursor = parse_cursor(Some("1700000000_3")).expect("legacy cursor parses");
-    let err = validate_cursor_scope(cursor.0, cursor.2.as_ref(), &AuditQuery::default(), &access)
-        .expect_err("legacy firehose resume must restart pagination");
+    let err = validate_cursor_scope(
+        cursor.timestamp,
+        cursor.scope.as_ref(),
+        &AuditQuery::default(),
+        &access,
+    )
+    .expect_err("legacy firehose resume must restart pagination");
 
     assert!(
         err.to_string().contains(CURSOR_SCOPE_CHANGED),
@@ -678,7 +857,7 @@ fn legacy_cursor_rejects_explicit_principal_resume() {
         principal: Some("bob".into()),
         ..AuditQuery::default()
     };
-    let err = validate_cursor_scope(cursor.0, cursor.2.as_ref(), &query, &access)
+    let err = validate_cursor_scope(cursor.timestamp, cursor.scope.as_ref(), &query, &access)
         .expect_err("legacy explicit-principal resume must restart pagination");
 
     assert!(
