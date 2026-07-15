@@ -20,33 +20,36 @@ fn grant_capsules_allows_an_operator_enforced_distro() {
 #[test]
 fn distro_help_lists_only_supported_sources_and_the_launcher_exception() {
     let mut command = Cli::command();
-    let init_help = command
-        .find_subcommand_mut("init")
-        .expect("init command")
-        .render_long_help()
-        .to_string();
+    let init = command.find_subcommand_mut("init").expect("init command");
+    let init_distro_help = init
+        .get_arguments()
+        .find(|argument| argument.get_id() == "distro")
+        .and_then(|argument| argument.get_help())
+        .map(ToString::to_string);
 
     let mut command = Cli::command();
-    let apply_help = command
+    let apply = command
         .find_subcommand_mut("distro")
         .expect("distro command")
         .find_subcommand_mut("apply")
-        .expect("distro apply command")
-        .render_long_help()
-        .to_string();
+        .expect("distro apply command");
+    let apply_name_help = apply
+        .get_arguments()
+        .find(|argument| argument.get_id() == "name")
+        .and_then(|argument| argument.get_help())
+        .map(ToString::to_string);
 
-    for expected in ["@owner/repo", "URL", "local Distro.toml", ".shuttle"] {
-        assert!(
-            init_help.contains(expected),
-            "missing {expected}: {init_help}"
-        );
-        assert!(
-            apply_help.contains(expected),
-            "missing {expected}: {apply_help}"
-        );
-    }
-    assert!(init_help.contains("ASTRID_ENFORCED_DISTRO"));
-    assert!(!apply_help.contains("ASTRID_ENFORCED_DISTRO"));
+    assert_eq!(
+        init_distro_help.as_deref(),
+        Some(
+            "Distro source to install. Required unless an embedding launcher sets \
+             `ASTRID_ENFORCED_DISTRO` (`@owner/repo`, URL, local Distro.toml, or .shuttle)"
+        )
+    );
+    assert_eq!(
+        apply_name_help.as_deref(),
+        Some("Distro source (`@owner/repo`, URL, local Distro.toml, or .shuttle)")
+    );
 }
 
 #[test]
