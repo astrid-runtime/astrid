@@ -26,7 +26,9 @@ pub(super) fn validate_grant_capsules(
     distro_present: bool,
 ) -> anyhow::Result<()> {
     if grant_capsules && !distro_present {
-        bail!("--grant-capsules requires --distro: grants apply to the capsules a distro installs");
+        bail!(
+            "--grant-capsules requires a resolved distro: grants apply to the capsules a distro installs"
+        );
     }
     Ok(())
 }
@@ -208,7 +210,7 @@ mod tests {
         // Flag set, no distro → error.
         let err = validate_grant_capsules(true, false).unwrap_err();
         assert!(err.to_string().contains("--grant-capsules"), "got: {err}");
-        assert!(err.to_string().contains("--distro"), "got: {err}");
+        assert!(err.to_string().contains("resolved distro"), "got: {err}");
 
         // Flag set with a distro → allowed.
         assert!(validate_grant_capsules(true, true).is_ok());

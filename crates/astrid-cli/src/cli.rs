@@ -246,7 +246,8 @@ pub(crate) enum Commands {
         /// Grant the target principal access to every capsule the distro
         /// installs (same mechanism as `agent modify --add-capsule`).
         /// No-op for the `default` principal, which already has admin access.
-        #[arg(long = "grant-capsules", requires = "distro")]
+        /// The distro may be selected explicitly or enforced by the operator.
+        #[arg(long = "grant-capsules")]
         grant_capsules: bool,
     },
 
@@ -648,6 +649,21 @@ mod tests {
         ])
         .expect("global --principal should parse before nested subcommands");
         assert_eq!(cli.principal.as_deref(), Some("operator-1"));
+    }
+
+    #[test]
+    fn grant_capsules_allows_an_operator_enforced_distro() {
+        let cli = Cli::try_parse_from(["astrid", "init", "--grant-capsules"])
+            .expect("the operator may supply the distro outside the CLI argument surface");
+
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Init {
+                distro: None,
+                grant_capsules: true,
+                ..
+            })
+        ));
     }
 
     #[test]

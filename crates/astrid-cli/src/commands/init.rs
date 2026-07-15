@@ -40,7 +40,7 @@ pub(crate) struct InitOpts {
     pub(crate) vars: HashMap<String, String>,
     /// Grant the target principal capsule-access for every capsule the
     /// distro installs, via the same kernel path as `astrid agent modify
-    /// --add-capsule`. Only valid with `--distro`; a no-op for the
+    /// --add-capsule`. Only valid with a resolved distro; a no-op for the
     /// bootstrap `default` principal (which holds admin `*`). Opt-in:
     /// without it, `init` installs capsules but attaches no grants and
     /// prints the manual `agent modify` command for discoverability.
