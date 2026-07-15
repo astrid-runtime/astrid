@@ -58,12 +58,9 @@ pub mod system;
 /// Build the gateway's HTTP router with self-only audit visibility.
 ///
 /// This builder installs a deny-all capability evaluator. Runtimes that need
-/// live `audit:read_all` policy must use [`build_with_capability_probe`].
-///
-/// When serving this router over a real socket, use
-/// `router.into_make_service_with_connect_info::<std::net::SocketAddr>()`
-/// rather than plain `axum::serve(listener, router)`. The unauthenticated
-/// redeem routes require the peer address for per-IP throttling.
+/// live `audit:read_all` policy must use [`build_with_capability_probe`], which
+/// also documents the required connect-info serving path for the unauthenticated
+/// redeem routes' per-IP throttling.
 // A flat list of route registrations: its length tracks the API surface,
 // not branching complexity, and both the readiness and models surfaces add
 // rows here. Splitting it into sub-routers would obscure the single
