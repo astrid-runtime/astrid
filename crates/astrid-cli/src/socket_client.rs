@@ -20,9 +20,13 @@ enum KernelConnectionScope<'a> {
 }
 
 impl<'a> KernelConnectionScope<'a> {
-    fn workspace_check(self) -> Option<Option<&'a std::path::Path>> {
+    const fn requires_workspace_check(&self) -> bool {
+        matches!(self, Self::Workspace(_))
+    }
+
+    fn workspace_root(self) -> Option<&'a std::path::Path> {
         match self {
-            Self::Workspace(workspace_root) => Some(workspace_root),
+            Self::Workspace(workspace_root) => workspace_root,
             Self::Recovery => None,
         }
     }
@@ -88,7 +92,8 @@ pub(crate) async fn connect_kernel_for_recovery() -> Result<KernelClient> {
 }
 
 async fn connect_kernel(scope: KernelConnectionScope<'_>) -> Result<KernelClient> {
-    if let Some(workspace_root) = scope.workspace_check() {
+    if scope.requires_workspace_check() {
+        let workspace_root = scope.workspace_root();
         return Ok(connect_workspace_client(workspace_root, || {
             KernelClient::connect(crate::principal::current())
         })
@@ -143,15 +148,17 @@ mod tests {
     #[test]
     fn kernel_connection_scope_checks_project_reads_but_keeps_recovery_global() {
         let explicit = Path::new("/selected/project");
-        assert_eq!(
-            KernelConnectionScope::Workspace(Some(explicit)).workspace_check(),
-            Some(Some(explicit))
-        );
-        assert_eq!(
-            KernelConnectionScope::Workspace(None).workspace_check(),
-            Some(None)
-        );
-        assert_eq!(KernelConnectionScope::Recovery.workspace_check(), None);
+        let explicit_scope = KernelConnectionScope::Workspace(Some(explicit));
+        assert!(explicit_scope.requires_workspace_check());
+        assert_eq!(explicit_scope.workspace_root(), Some(explicit));
+
+        let default_scope = KernelConnectionScope::Workspace(None);
+        assert!(default_scope.requires_workspace_check());
+        assert_eq!(default_scope.workspace_root(), None);
+
+        let recovery_scope = KernelConnectionScope::Recovery;
+        assert!(!recovery_scope.requires_workspace_check());
+        assert_eq!(recovery_scope.workspace_root(), None);
     }
 
     #[tokio::test]
