@@ -553,16 +553,14 @@ fn scan_keys() -> Result<Vec<KeyEntry>> {
         else {
             continue;
         };
+        let name = name.to_owned();
         let paths = KeyPaths {
             private: dir.join(format!("{name}.ed25519")),
             public_hex: dir.join(format!("{name}.pub.hex")),
             meta: path,
         };
         match read_meta(&paths) {
-            Ok(meta) => out.push(KeyEntry {
-                name: name.to_string(),
-                meta,
-            }),
+            Ok(meta) => out.push(KeyEntry { name, meta }),
             Err(e) => {
                 tracing::warn!(name = %name, error = %e, "skipping unreadable keypair meta");
             },
