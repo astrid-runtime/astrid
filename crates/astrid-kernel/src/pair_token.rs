@@ -146,7 +146,13 @@ impl PairTokenStore {
             PairTokenStoreError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, e))
         })?;
         if text.trim().is_empty() {
-            self.save_to_disk(&[])?;
+            if let Err(error) = self.save_to_disk(&[]) {
+                warn!(
+                    path = %self.path.display(),
+                    %error,
+                    "could not normalize empty pair-token store"
+                );
+            }
             return Ok(Vec::new());
         }
         let probe: SchemaProbe = toml::from_str(text).map_err(PairTokenStoreError::Toml)?;
@@ -443,6 +449,25 @@ mod tests {
 
         assert!(PairTokenStore::new(path.clone()).load().is_err());
         assert_eq!(std::fs::read_to_string(path).unwrap(), malformed);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_only_empty_file_still_loads_as_empty_vec() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = PairTokenStore::new(dir.path().join("pair-tokens.toml"));
+        std::fs::write(&store.path, "").unwrap();
+
+        let original = std::fs::metadata(dir.path()).unwrap().permissions();
+        let mut read_only = original.clone();
+        read_only.set_mode(0o500);
+        std::fs::set_permissions(dir.path(), read_only).unwrap();
+        let loaded = store.load();
+        std::fs::set_permissions(dir.path(), original).unwrap();
+
+        assert_eq!(loaded.unwrap(), Vec::<PairToken>::new());
     }
 
     #[test]
