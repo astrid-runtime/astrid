@@ -69,6 +69,13 @@ pub fn build(state: Arc<GatewayState>) -> Router {
 /// Co-located runtimes can use this to preserve live audit firehose policy
 /// when they embed the router directly instead of calling
 /// [`crate::run_with_capability_probe`].
+///
+/// When serving this router over a real socket, use
+/// `router.into_make_service_with_connect_info::<std::net::SocketAddr>()`
+/// rather than plain `axum::serve(listener, router)`. The unauthenticated
+/// redeem routes extract `ConnectInfo<SocketAddr>` for per-IP throttling, and
+/// axum only installs that request extension through the connect-info make
+/// service path.
 pub fn build_with_capability_probe<F>(state: Arc<GatewayState>, capability_probe: F) -> Router
 where
     F: Fn(&astrid_core::PrincipalId, Option<&str>, &str) -> bool + Send + Sync + 'static,
