@@ -149,6 +149,8 @@ pub struct SocketClient {
     /// (the MCP shim) refuse to serve silently as `anonymous`; see
     /// [`is_authenticated`](Self::is_authenticated).
     authenticated: bool,
+    /// Features explicitly advertised by the daemon during the handshake.
+    server_features: Vec<String>,
 }
 
 impl SocketClient {
@@ -174,7 +176,7 @@ impl SocketClient {
             .await
             .context("Failed to connect to IPC socket")?;
 
-        let authenticated = perform_handshake(&mut stream, &principal).await?;
+        let handshake = perform_handshake(&mut stream, &principal).await?;
 
         let (read_half, write_half) = stream.into_split();
 
@@ -183,7 +185,8 @@ impl SocketClient {
             write_half,
             session_id,
             principal,
-            authenticated,
+            authenticated: handshake.authenticated,
+            server_features: handshake.server_features,
         })
     }
 
@@ -204,6 +207,9 @@ impl SocketClient {
             session_id,
             principal,
             authenticated: true,
+            server_features: vec![
+                astrid_core::session_token::FEATURE_ENSURE_TOPIC_READY.to_string(),
+            ],
         }
     }
 
@@ -217,6 +223,14 @@ impl SocketClient {
     #[must_use]
     pub fn is_authenticated(&self) -> bool {
         self.authenticated
+    }
+
+    /// Whether the connected daemon advertised `feature` during handshake.
+    #[must_use]
+    pub fn server_supports(&self, feature: &str) -> bool {
+        self.server_features
+            .iter()
+            .any(|candidate| candidate == feature)
     }
 
     /// Re-establish the connection to the (possibly restarted) daemon,
@@ -494,7 +508,15 @@ fn principal_key_path(principal: &PrincipalId) -> Option<std::path::PathBuf> {
 /// took the legacy single-frame path that the daemon stamps the no-capability
 /// `anonymous`. An outright-rejected handshake (e.g. a bad signature) is an
 /// `Err`, never a silent `false`.
-async fn perform_handshake(stream: &mut UnixStream, principal: &PrincipalId) -> Result<bool> {
+struct HandshakeOutcome {
+    authenticated: bool,
+    server_features: Vec<String>,
+}
+
+async fn perform_handshake(
+    stream: &mut UnixStream,
+    principal: &PrincipalId,
+) -> Result<HandshakeOutcome> {
     let tok_path = token_path()?;
     let token = SessionToken::read_from_file(&tok_path).with_context(|| {
         format!(
@@ -562,7 +584,10 @@ async fn perform_handshake(stream: &mut UnixStream, principal: &PrincipalId) -> 
         anyhow::bail!("Daemon rejected connection: {reason}");
     }
 
-    Ok(authenticated)
+    Ok(HandshakeOutcome {
+        authenticated,
+        server_features: response.features,
+    })
 }
 
 /// Write one length-prefixed [`HandshakeRequest`] frame and read the

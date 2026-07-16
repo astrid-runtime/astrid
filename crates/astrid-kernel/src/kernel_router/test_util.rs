@@ -19,6 +19,9 @@ pub(crate) fn all_kernel_request_variants() -> Vec<KernelRequest> {
         KernelRequest::GetCommands,
         KernelRequest::GetCapsuleMetadata,
         KernelRequest::GetAgentReadiness,
+        KernelRequest::EnsureTopicReady {
+            topic: "service.v1.request".into(),
+        },
         KernelRequest::ApproveCapability {
             request_id: "r".into(),
             signature: "s".into(),

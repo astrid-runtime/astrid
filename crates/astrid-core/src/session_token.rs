@@ -227,6 +227,9 @@ pub enum HandshakeStatus {
     Error,
 }
 
+/// Daemon handshake feature advertising caller-scoped topic readiness.
+pub const FEATURE_ENSURE_TOPIC_READY: &str = "kernel.ensure-topic-ready.v1";
+
 /// Response sent by the daemon after validating the handshake.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct HandshakeResponse {
@@ -249,6 +252,11 @@ pub struct HandshakeResponse {
     /// final success/error response and for unauthenticated handshakes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub challenge: Option<String>,
+    /// Optional daemon capabilities understood by this connection.
+    ///
+    /// Older daemons omit this field; clients must treat that as an empty set.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub features: Vec<String>,
 }
 
 impl HandshakeResponse {
@@ -261,7 +269,15 @@ impl HandshakeResponse {
             server_version: env!("CARGO_PKG_VERSION").to_string(),
             reason: None,
             challenge: None,
+            features: Vec::new(),
         }
+    }
+
+    /// Advertise one daemon feature on this response.
+    #[must_use]
+    pub fn with_feature(mut self, feature: impl Into<String>) -> Self {
+        self.features.push(feature.into());
+        self
     }
 
     /// Create an error handshake response.
@@ -273,6 +289,7 @@ impl HandshakeResponse {
             server_version: env!("CARGO_PKG_VERSION").to_string(),
             reason: Some(reason.into()),
             challenge: None,
+            features: Vec::new(),
         }
     }
 
@@ -291,6 +308,7 @@ impl HandshakeResponse {
             server_version: env!("CARGO_PKG_VERSION").to_string(),
             reason: None,
             challenge: Some(nonce_hex.into()),
+            features: Vec::new(),
         }
     }
 
@@ -420,6 +438,14 @@ mod tests {
         let resp: HandshakeResponse = serde_json::from_str(legacy).expect("parse legacy response");
         assert!(resp.is_ok());
         assert_eq!(resp.challenge, None);
+        assert!(resp.features.is_empty());
+    }
+
+    #[test]
+    fn handshake_response_advertises_optional_features() {
+        let response = HandshakeResponse::ok().with_feature(FEATURE_ENSURE_TOPIC_READY);
+        let json = serde_json::to_value(&response).expect("serialize response");
+        assert_eq!(json["features"][0], FEATURE_ENSURE_TOPIC_READY);
     }
 
     #[test]

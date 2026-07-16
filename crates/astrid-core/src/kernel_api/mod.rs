@@ -93,6 +93,12 @@ pub enum KernelRequest {
     /// Request agent-loop readiness: whether the loaded capsule set can serve
     /// an agent chat turn. Read-only, name-agnostic — see [`AgentLoopReadiness`].
     GetAgentReadiness,
+    /// Complete the caller's capsule-view load and report whether that exact
+    /// view can dispatch an interceptor for `topic`.
+    EnsureTopicReady {
+        /// Exact IPC topic the caller intends to publish.
+        topic: String,
+    },
 }
 
 /// Management API responses from the core daemon.

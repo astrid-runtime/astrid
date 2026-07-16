@@ -105,7 +105,20 @@ where
 pub(crate) async fn connect_kernel_for_workspace(
     workspace_root: Option<&std::path::Path>,
 ) -> Result<KernelClient> {
-    connect_kernel(KernelConnectionScope::Workspace(workspace_root)).await
+    connect_kernel(
+        KernelConnectionScope::Workspace(workspace_root),
+        crate::principal::current(),
+    )
+    .await
+}
+
+/// Connect a workspace-sensitive management client as an explicitly selected
+/// principal.
+pub(crate) async fn connect_kernel_for_workspace_as(
+    principal: PrincipalId,
+    workspace_root: Option<&std::path::Path>,
+) -> Result<KernelClient> {
+    connect_kernel(KernelConnectionScope::Workspace(workspace_root), principal).await
 }
 
 /// Connect for a daemon lifecycle recovery operation.
@@ -114,18 +127,20 @@ pub(crate) async fn connect_kernel_for_workspace(
 /// project or layout. Keep this restricted to operations such as `stop` that
 /// terminate the process and do not read or mutate project-owned daemon state.
 pub(crate) async fn connect_kernel_for_recovery() -> Result<KernelClient> {
-    connect_kernel(KernelConnectionScope::Recovery).await
+    connect_kernel(KernelConnectionScope::Recovery, crate::principal::current()).await
 }
 
-async fn connect_kernel(scope: KernelConnectionScope<'_>) -> Result<KernelClient> {
+async fn connect_kernel(
+    scope: KernelConnectionScope<'_>,
+    principal: PrincipalId,
+) -> Result<KernelClient> {
     if scope.requires_workspace_check() {
         let workspace_root = scope.workspace_root();
-        return Ok(connect_workspace_client(workspace_root, || {
-            KernelClient::connect(crate::principal::current())
-        })
-        .await?);
+        return Ok(
+            connect_workspace_client(workspace_root, || KernelClient::connect(principal)).await?,
+        );
     }
-    KernelClient::connect(crate::principal::current()).await
+    KernelClient::connect(principal).await
 }
 
 async fn connect_between_workspace_checks<T, Check, CheckFuture, Connect, ConnectFuture>(

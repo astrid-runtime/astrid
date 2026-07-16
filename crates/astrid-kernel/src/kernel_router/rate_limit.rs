@@ -24,6 +24,7 @@ fn rate_limit_max(req: &KernelRequest) -> Option<u32> {
         | KernelRequest::PromoteWorkspace { .. }
         | KernelRequest::RollbackWorkspace { .. } => Some(5),
         KernelRequest::InstallCapsule { .. } | KernelRequest::ApproveCapability { .. } => Some(10),
+        KernelRequest::EnsureTopicReady { .. } => Some(30),
         KernelRequest::Shutdown { .. } => Some(1),
         KernelRequest::ListCapsules
         | KernelRequest::GetCommands

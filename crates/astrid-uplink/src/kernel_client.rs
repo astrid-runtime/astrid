@@ -176,6 +176,7 @@ pub const fn topic_suffix(req: &KernelRequest) -> &'static str {
         KernelRequest::GetCommands => "get_commands",
         KernelRequest::GetCapsuleMetadata => "metadata",
         KernelRequest::GetAgentReadiness => "agent_readiness",
+        KernelRequest::EnsureTopicReady { .. } => "ensure_topic_ready",
         KernelRequest::Shutdown { .. } => "shutdown",
         KernelRequest::GetStatus => "status",
     }
@@ -243,6 +244,12 @@ impl KernelClient {
             timeout: DEFAULT_TIMEOUT,
             device_key_id: None,
         })
+    }
+
+    /// Whether the connected daemon advertised `feature` during handshake.
+    #[must_use]
+    pub fn server_supports(&self, feature: &str) -> bool {
+        self.inner.server_supports(feature)
     }
 
     /// Override the response read timeout.

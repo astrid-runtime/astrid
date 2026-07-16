@@ -48,12 +48,62 @@ use std::process::ExitCode;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
+use astrid_core::kernel_api::{KernelRequest, KernelResponse};
 use rmcp::ServiceExt;
 use tokio::sync::Mutex;
 use tracing::info;
 use uuid::Uuid;
 
 use server::AstridMcpServer;
+
+fn require_service_topic(response: KernelResponse, topic: &str) -> Result<()> {
+    match response {
+        KernelResponse::Success(value)
+            if value.get("topic").and_then(serde_json::Value::as_str) == Some(topic)
+                && value.get("ready").and_then(serde_json::Value::as_bool) == Some(true) =>
+        {
+            Ok(())
+        },
+        KernelResponse::Success(value)
+            if value.get("topic").and_then(serde_json::Value::as_str) == Some(topic)
+                && value.get("ready").and_then(serde_json::Value::as_bool) == Some(false) =>
+        {
+            anyhow::bail!(
+                "the selected principal has no live capsule serving '{topic}'; install its MCP pack and retry"
+            )
+        },
+        KernelResponse::Error(message) => {
+            anyhow::bail!("the daemon could not prepare the MCP service: {message}")
+        },
+        other => anyhow::bail!("unexpected daemon response while preparing MCP: {other:?}"),
+    }
+}
+
+fn require_topic_readiness_feature(supported: bool) -> Result<()> {
+    if supported {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "the running daemon predates caller-scoped MCP readiness; restart the daemon with the newly installed runtime, then retry"
+    )
+}
+
+async fn ensure_mcp_service_ready(caller: astrid_core::PrincipalId) -> Result<()> {
+    let mut client = crate::socket_client::connect_kernel_for_workspace_as(caller, None)
+        .await
+        .context("failed to connect to the daemon management surface")?;
+    require_topic_readiness_feature(
+        client.server_supports(astrid_core::session_token::FEATURE_ENSURE_TOPIC_READY),
+    )?;
+    let response = client
+        .request(KernelRequest::EnsureTopicReady {
+            topic: server::TOOLS_LIST_TOPIC.to_string(),
+        })
+        .await
+        .context("failed to prepare the selected principal's capsule view")?;
+    require_service_topic(response, server::TOOLS_LIST_TOPIC)?;
+    Ok(())
+}
 
 /// Refuse to serve the MCP bridge silently as the no-capability `anonymous`
 /// identity.
@@ -129,6 +179,15 @@ pub(crate) async fn serve(principal: Option<&str>) -> Result<ExitCode> {
     // fail the ingress-trust / capability checks and appear to hang. Fail loud
     // instead of serving a broken bridge.
     require_authenticated_unless_anonymous(&caller, client.is_authenticated())?;
+    require_topic_readiness_feature(
+        client.server_supports(astrid_core::session_token::FEATURE_ENSURE_TOPIC_READY),
+    )?;
+
+    // Do not expose MCP stdio until this principal's live capsule view contains
+    // the broker front door. The management request waits for the real profile
+    // load and receives keepalives while slow work is progressing; no startup
+    // delay or retry timer is used.
+    ensure_mcp_service_ready(caller.clone()).await?;
 
     info!(
         principal = %caller,
@@ -190,8 +249,12 @@ pub(crate) async fn serve(principal: Option<&str>) -> Result<ExitCode> {
 
 #[cfg(test)]
 mod fail_loud_tests {
-    use super::require_authenticated_unless_anonymous;
+    use super::{
+        require_authenticated_unless_anonymous, require_service_topic,
+        require_topic_readiness_feature,
+    };
     use astrid_core::PrincipalId;
+    use astrid_core::kernel_api::KernelResponse;
 
     #[test]
     fn authenticated_principal_is_allowed() {
@@ -217,5 +280,34 @@ mod fail_loud_tests {
     fn explicit_anonymous_is_allowed_even_unauthenticated() {
         // Serving unauthenticated on purpose is fine.
         assert!(require_authenticated_unless_anonymous(&PrincipalId::anonymous(), false).is_ok());
+    }
+
+    #[test]
+    fn live_service_topic_is_accepted() {
+        let response = KernelResponse::Success(serde_json::json!({
+            "topic": "astrid.v1.request.mcp.tools.list",
+            "ready": true,
+        }));
+        assert!(require_service_topic(response, "astrid.v1.request.mcp.tools.list").is_ok());
+    }
+
+    #[test]
+    fn missing_service_topic_fails_before_stdio_starts() {
+        let response = KernelResponse::Success(serde_json::json!({
+            "topic": "astrid.v1.request.mcp.tools.list",
+            "ready": false,
+        }));
+        let error = require_service_topic(response, "astrid.v1.request.mcp.tools.list")
+            .expect_err("a missing broker must fail startup");
+        assert!(error.to_string().contains("no live capsule"));
+    }
+
+    #[test]
+    fn old_daemon_without_readiness_feature_fails_with_restart_guidance() {
+        let error = require_topic_readiness_feature(false)
+            .expect_err("an old daemon must be rejected before sending the new request");
+        let message = error.to_string();
+        assert!(message.contains("predates"));
+        assert!(message.contains("restart"));
     }
 }

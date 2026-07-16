@@ -105,9 +105,13 @@ pub(super) async fn validate_handshake(
     };
 
     // 4. All checks passed - send the final success response.
-    send_handshake_response_timed(stream, &HandshakeResponse::ok())
-        .await
-        .map_err(|e| format!("failed to send handshake response: {e}"))?;
+    send_handshake_response_timed(
+        stream,
+        &HandshakeResponse::ok()
+            .with_feature(astrid_core::session_token::FEATURE_ENSURE_TOPIC_READY),
+    )
+    .await
+    .map_err(|e| format!("failed to send handshake response: {e}"))?;
 
     // Truncate client_version to prevent log injection from oversized values.
     // Use chars().take() to avoid panicking on multi-byte UTF-8 boundaries.

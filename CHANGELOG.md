@@ -138,6 +138,14 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
 
 ### Fixed
 
+- **MCP startup now waits for the selected principal's live service surface.**
+  A self-scoped readiness request completes the caller's profile load and
+  checks the exact live interceptor dispatch view. `astrid mcp serve` verifies
+  the broker topic before accepting stdio traffic and after daemon reconnects,
+  eliminating the race without sleeps or retry timing. The daemon advertises
+  this support during handshake, so a new CLI fails immediately with restart
+  guidance when an older daemon is still running.
+
 - **Invite commands accept every token the runtime can issue.** `invite redeem`
   and `invite revoke` now treat a leading hyphen in an opaque base64url token as
   token data instead of misparsing it as an unknown option.

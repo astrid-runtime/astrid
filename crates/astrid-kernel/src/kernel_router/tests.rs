@@ -149,6 +149,19 @@ fn rate_limiter_independent_buckets() {
 }
 
 #[test]
+fn topic_readiness_rate_limit_is_independent_per_caller() {
+    let mut limiter = ManagementRateLimiter::new();
+    let alice = PrincipalId::new("alice").unwrap();
+    let bob = PrincipalId::new("bob").unwrap();
+
+    for _ in 0..30 {
+        assert!(limiter.check_for_caller("EnsureTopicReady", &alice, 30));
+    }
+    assert!(!limiter.check_for_caller("EnsureTopicReady", &alice, 30));
+    assert!(limiter.check_for_caller("EnsureTopicReady", &bob, 30));
+}
+
+#[test]
 fn full_reload_guard_coalesces_until_finished() {
     let in_flight = AtomicBool::new(false);
 
@@ -223,6 +236,12 @@ fn rate_limit_for_request_returns_correct_limits() {
     let (name, limit) = rate_limit_for_request(&KernelRequest::ListCapsules);
     assert_eq!(name, "ListCapsules");
     assert_eq!(limit, None);
+
+    let (name, limit) = rate_limit_for_request(&KernelRequest::EnsureTopicReady {
+        topic: "service.v1.request".into(),
+    });
+    assert_eq!(name, "EnsureTopicReady");
+    assert_eq!(limit, Some(30));
 }
 
 // ── Capability mapping (issue #670) ──────────────────────────────
@@ -286,6 +305,15 @@ fn required_capability_mapping_per_variant_self_scope() {
     );
     assert_eq!(
         required_capability(&KernelRequest::GetAgentReadiness, AuthorityScope::Self_),
+        "self:capsule:list"
+    );
+    assert_eq!(
+        required_capability(
+            &KernelRequest::EnsureTopicReady {
+                topic: "service.v1.request".into(),
+            },
+            AuthorityScope::Self_,
+        ),
         "self:capsule:list"
     );
     assert_eq!(
@@ -625,6 +653,180 @@ async fn list_capsules_uses_materialized_inventory_without_runtime_load() {
     assert!(
         kernel.capsules.read().await.list_for(&caller).is_empty(),
         "listing materialized inventory must not synchronously load capsule runtimes"
+    );
+}
+
+#[test]
+fn topic_readiness_accepts_only_bounded_exact_topics() {
+    assert!(is_exact_topic("astrid.v1.request.mcp.tools.list"));
+    assert!(!is_exact_topic("astrid.v1.request.mcp.*"));
+    assert!(!is_exact_topic("astrid..request"));
+    assert!(!is_exact_topic(&"x".repeat(257)));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn topic_readiness_warms_only_the_callers_dispatch_view() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let home = astrid_core::dirs::AstridHome::from_path(dir.path());
+    let kernel = crate::test_kernel_with_home(home).await;
+    let caller = PrincipalId::new("codex-code").expect("valid principal");
+    let admin = PrincipalId::new("global-admin").expect("valid principal");
+    let topic = "astrid.v1.request.mcp.tools.list";
+
+    {
+        let mut registry = kernel.capsules.write().await;
+        registry
+            .register(Box::new(
+                InventoryCapsule::new("broker", "broker-cmd").with_subscribe(topic),
+            ))
+            .expect("register shared broker runtime");
+    }
+    seed_profile(
+        &kernel,
+        &admin,
+        &PrincipalProfile {
+            grants: vec!["*".to_string()],
+            ..Default::default()
+        },
+    );
+    seed_profile(
+        &kernel,
+        &caller,
+        &PrincipalProfile {
+            grants: vec!["self:capsule:list".to_string()],
+            capsules: vec!["broker".to_string()],
+            ..Default::default()
+        },
+    );
+    let capsule_dir = kernel
+        .astrid_home
+        .principal_home(&caller)
+        .capsules_dir()
+        .join("broker");
+    std::fs::create_dir_all(&capsule_dir).expect("create broker install directory");
+    std::fs::write(
+        capsule_dir.join("Capsule.toml"),
+        format!(
+            r#"[package]
+name = "broker"
+version = "0.0.1"
+
+[subscribe]
+"{topic}" = {{ wit = "opaque", handler = "handle" }}
+"#
+        ),
+    )
+    .expect("write broker manifest");
+    drop(spawn_kernel_router(Arc::clone(&kernel)));
+
+    let admin_response = request_kernel(
+        &kernel,
+        &admin,
+        "admin_topic_readiness",
+        KernelRequest::EnsureTopicReady {
+            topic: topic.to_string(),
+        },
+    )
+    .await;
+    let KernelResponse::Success(admin_readiness) = admin_response else {
+        panic!("expected admin readiness response, got {admin_response:?}");
+    };
+    assert_eq!(admin_readiness["ready"], false);
+
+    assert!(
+        kernel.capsules.read().await.list_for(&caller).is_empty(),
+        "the selected principal starts cold"
+    );
+    let caller_response = request_kernel(
+        &kernel,
+        &caller,
+        "caller_topic_readiness",
+        KernelRequest::EnsureTopicReady {
+            topic: topic.to_string(),
+        },
+    )
+    .await;
+    let KernelResponse::Success(caller_readiness) = caller_response else {
+        panic!("expected caller readiness response, got {caller_response:?}");
+    };
+    assert_eq!(caller_readiness["topic"], topic);
+    assert_eq!(caller_readiness["ready"], true);
+    let broker_id = CapsuleId::new("broker").expect("valid broker id");
+    assert!(
+        kernel
+            .capsules
+            .read()
+            .await
+            .get_for(&caller, &broker_id)
+            .is_some(),
+        "readiness returns only after the caller view is registered"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn topic_readiness_rejects_manifest_only_handler_when_capsule_fails_to_load() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let home = astrid_core::dirs::AstridHome::from_path(dir.path());
+    let kernel = crate::test_kernel_with_home(home).await;
+    let caller = PrincipalId::new("codex-code").expect("valid principal");
+    let topic = "astrid.v1.request.mcp.tools.list";
+
+    seed_profile(
+        &kernel,
+        &caller,
+        &PrincipalProfile {
+            grants: vec!["self:capsule:list".to_string()],
+            capsules: vec!["broken-broker".to_string()],
+            ..Default::default()
+        },
+    );
+    let capsule_dir = kernel
+        .astrid_home
+        .principal_home(&caller)
+        .capsules_dir()
+        .join("broken-broker");
+    std::fs::create_dir_all(&capsule_dir).expect("create broken broker directory");
+    std::fs::write(
+        capsule_dir.join("Capsule.toml"),
+        format!(
+            r#"[package]
+name = "broken-broker"
+version = "0.0.1"
+
+[[component]]
+id = "main"
+file = "missing.wasm"
+
+[subscribe]
+"{topic}" = {{ wit = "opaque", handler = "handle" }}
+"#
+        ),
+    )
+    .expect("write broken broker manifest");
+    drop(spawn_kernel_router(Arc::clone(&kernel)));
+
+    let response = request_kernel(
+        &kernel,
+        &caller,
+        "broken_broker_topic_readiness",
+        KernelRequest::EnsureTopicReady {
+            topic: topic.to_string(),
+        },
+    )
+    .await;
+    let KernelResponse::Success(readiness) = response else {
+        panic!("expected readiness response, got {response:?}");
+    };
+    assert_eq!(readiness["ready"], false);
+    let broker_id = CapsuleId::new("broken-broker").expect("valid capsule id");
+    assert!(
+        kernel
+            .capsules
+            .read()
+            .await
+            .get_for(&caller, &broker_id)
+            .is_none(),
+        "a manifest is not ready unless its runtime loaded and registered"
     );
 }
 

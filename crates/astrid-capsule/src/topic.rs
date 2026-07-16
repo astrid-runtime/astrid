@@ -29,7 +29,7 @@ pub(crate) fn has_valid_segments(s: &str) -> bool {
 /// assert!(!topic_matches("tool.execute.result", "tool.execute.*.result"));
 /// assert!(!topic_matches("user.prompt.extra", "user.prompt"));
 /// ```
-pub(crate) fn topic_matches(topic: &str, pattern: &str) -> bool {
+pub fn topic_matches(topic: &str, pattern: &str) -> bool {
     if !has_valid_segments(topic) || !has_valid_segments(pattern) {
         return false;
     }

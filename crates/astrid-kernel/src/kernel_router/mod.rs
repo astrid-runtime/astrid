@@ -102,9 +102,15 @@ pub(crate) fn spawn_kernel_router(kernel: Arc<crate::Kernel>) -> astrid_runtime:
                         },
                     };
                     let (method, limit) = rate_limit_for_request(&req);
-                    if let Some(max) = limit
-                        && !rate_limiter.check(method, max)
-                    {
+                    let within_limit = limit.is_none_or(|max| {
+                        if matches!(req, KernelRequest::EnsureTopicReady { .. }) {
+                            rate_limiter.check_for_caller(method, &caller, max)
+                        } else {
+                            rate_limiter.check(method, max)
+                        }
+                    });
+                    if !within_limit {
+                        let max = limit.expect("a rejected request must have a rate limit");
                         warn!(
                             security_event = true,
                             method = method,
@@ -492,12 +498,41 @@ async fn handle_request(
             let readiness = astrid_capsule::readiness::agent_loop_readiness(&manifests);
             KernelResponse::AgentReadiness(readiness)
         },
+        KernelRequest::EnsureTopicReady { topic } => {
+            if is_exact_topic(&topic) {
+                kernel.ensure_principal_loaded(&caller).await;
+                let ready =
+                    {
+                        let registry = kernel.capsules.read().await;
+                        registry.cloned_values_for(&caller).iter().any(|capsule| {
+                            matches!(
+                                capsule.state(),
+                                astrid_capsule::capsule::CapsuleState::Ready
+                            ) && capsule.manifest().effective_interceptors().iter().any(
+                                |interceptor| {
+                                    astrid_capsule::topic::topic_matches(&topic, &interceptor.event)
+                                },
+                            )
+                        })
+                    };
+                KernelResponse::Success(serde_json::json!({
+                    "topic": topic,
+                    "ready": ready,
+                }))
+            } else {
+                KernelResponse::Error("readiness requires a valid exact IPC topic".to_string())
+            }
+        },
     };
 
     // Stop the keepalive before the terminal frame so it isn't preceded by a
     // late redundant `Working`.
     drop(pinger);
     publish_response(kernel, response_topic, res);
+}
+
+fn is_exact_topic(topic: &str) -> bool {
+    topic.len() <= 256 && !topic.contains('*') && astrid_capsule::topic::topic_matches(topic, topic)
 }
 
 async fn inventory_manifest_map(
@@ -608,7 +643,7 @@ async fn unregister_failed_capsules(kernel: &crate::Kernel) {
 /// preventing the 2x burst possible with fixed-window designs.
 /// Single-consumer (owned by the router task), no concurrency concerns.
 struct ManagementRateLimiter {
-    buckets: HashMap<&'static str, VecDeque<Instant>>,
+    buckets: HashMap<String, VecDeque<Instant>>,
 }
 
 impl ManagementRateLimiter {
@@ -621,9 +656,23 @@ impl ManagementRateLimiter {
     /// Check if a request of the given type is within the rate limit.
     /// Returns `true` if allowed, `false` if rate-limited.
     fn check(&mut self, method: &'static str, max_per_minute: u32) -> bool {
+        self.check_bucket(method.to_string(), max_per_minute)
+    }
+
+    /// Apply a request limit independently to each authenticated caller.
+    fn check_for_caller(
+        &mut self,
+        method: &'static str,
+        caller: &PrincipalId,
+        max_per_minute: u32,
+    ) -> bool {
+        self.check_bucket(format!("{method}:{}", caller.as_str()), max_per_minute)
+    }
+
+    fn check_bucket(&mut self, bucket: String, max_per_minute: u32) -> bool {
         let now = Instant::now();
         let window = std::time::Duration::from_mins(1);
-        let timestamps = self.buckets.entry(method).or_default();
+        let timestamps = self.buckets.entry(bucket).or_default();
 
         // Evict timestamps older than the 60-second sliding window.
         while let Some(&oldest) = timestamps.front() {
@@ -707,14 +756,16 @@ pub fn required_capability(req: &KernelRequest, scope: AuthorityScope) -> &'stat
             KernelRequest::ListCapsules
             | KernelRequest::GetCommands
             | KernelRequest::GetCapsuleMetadata
-            | KernelRequest::GetAgentReadiness,
+            | KernelRequest::GetAgentReadiness
+            | KernelRequest::EnsureTopicReady { .. },
             AuthorityScope::Self_,
         ) => "self:capsule:list",
         (
             KernelRequest::ListCapsules
             | KernelRequest::GetCommands
             | KernelRequest::GetCapsuleMetadata
-            | KernelRequest::GetAgentReadiness,
+            | KernelRequest::GetAgentReadiness
+            | KernelRequest::EnsureTopicReady { .. },
             _,
         ) => "capsule:list",
         (KernelRequest::ApproveCapability { .. }, _) => "self:approval:respond",
@@ -737,6 +788,7 @@ pub fn kernel_request_method(req: &KernelRequest) -> &'static str {
         KernelRequest::GetCommands => "GetCommands",
         KernelRequest::GetCapsuleMetadata => "GetCapsuleMetadata",
         KernelRequest::GetAgentReadiness => "GetAgentReadiness",
+        KernelRequest::EnsureTopicReady { .. } => "EnsureTopicReady",
         KernelRequest::Shutdown { .. } => "Shutdown",
         KernelRequest::GetStatus => "GetStatus",
     }

@@ -141,6 +141,10 @@ impl AstridMcpServer {
                 super::require_authenticated_unless_anonymous(
                     &principal,
                     replacement.is_authenticated(),
+                )?;
+                super::require_topic_readiness_feature(
+                    replacement
+                        .server_supports(astrid_core::session_token::FEATURE_ENSURE_TOPIC_READY),
                 )
             },
         )
@@ -148,7 +152,17 @@ impl AstridMcpServer {
         record_reconnect_outcome(&self.needs_reconnect, &result);
         result.map_err(|error| {
             McpError::internal_error(format!("reconnect to daemon failed: {error}"), None)
-        })
+        })?;
+
+        if let Err(error) = super::ensure_mcp_service_ready(principal).await {
+            self.needs_reconnect.store(true, Ordering::Relaxed);
+            return Err(McpError::internal_error(
+                format!("reconnected daemon did not restore the MCP service: {error:#}"),
+                None,
+            ));
+        }
+        self.needs_reconnect.store(false, Ordering::Relaxed);
+        Ok(())
     }
 
     /// Publish `body` on `request_topic` and await the broker reply on
