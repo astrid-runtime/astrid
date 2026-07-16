@@ -143,7 +143,6 @@ pub(crate) fn install_from_shuttle(shuttle_path: &Path, opts: &InitOpts) -> anyh
     let selected = crate::commands::init::select_capsules(manifest.capsules.clone(), opts.yes)?;
     let vars =
         crate::commands::init::collect_variables(&variables, &selected, opts.yes, &opts.vars)?;
-    crate::commands::init::write_env_files(&home, &principal, &selected, &vars)?;
 
     // 6. Install each selected capsule from the verified mirror. The
     //    sealed lock IS the resolved truth offline — no resolution
@@ -163,6 +162,10 @@ pub(crate) fn install_from_shuttle(shuttle_path: &Path, opts: &InitOpts) -> anyh
         signer.as_deref(),
         signature.as_deref(),
     )?;
+    // Classify target keys from the installed manifests. Secret-typed values
+    // go directly to the principal file-secret store; ordinary values go to
+    // env JSON. This must precede any future provider onboarding/discovery.
+    crate::commands::init::write_env_files(&home, &principal, &selected, &vars)?;
 
     // 7. Write the user's Distro.lock, carrying the sealed manifest hash.
     let lock_path = home

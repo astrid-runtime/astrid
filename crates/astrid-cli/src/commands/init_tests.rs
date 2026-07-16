@@ -245,6 +245,22 @@ fn cap_with_env(name: &str, key: &str, template: &str) -> DistroCapsule {
     c
 }
 
+fn write_installed_manifest(
+    home: &AstridHome,
+    principal: &astrid_core::PrincipalId,
+    capsule: &str,
+    env_toml: &str,
+) {
+    let target =
+        astrid_capsule_install::resolve_target_dir_for(home, principal, capsule, false).unwrap();
+    std::fs::create_dir_all(&target).unwrap();
+    std::fs::write(
+        target.join("Capsule.toml"),
+        format!("[package]\nname = \"{capsule}\"\nversion = \"0.1.0\"\n\n{env_toml}"),
+    )
+    .unwrap();
+}
+
 #[test]
 fn headless_collect_uses_cli_var_override() {
     let mut variables = HashMap::new();
@@ -282,9 +298,14 @@ async fn offline_refuses_remote_capsule_source() {
     // A local Distro.toml with a remote @org/repo capsule must not
     // silently fetch under --offline.
     let selected = vec![cap("llm", None, false)]; // source "@org/llm"
-    let err = install_capsules(&selected, true, &astrid_core::PrincipalId::default())
-        .await
-        .unwrap_err();
+    let err = install_capsules(
+        &selected,
+        true,
+        &astrid_core::PrincipalId::default(),
+        &std::collections::HashMap::new(),
+    )
+    .await
+    .unwrap_err();
     assert!(err.to_string().contains("--offline"), "got: {err}");
     assert!(err.to_string().contains("network/GitHub"), "got: {err}");
 }
@@ -338,6 +359,7 @@ fn write_env_files_targets_the_given_principal() {
     let selected = vec![cap_with_env("cli", "TOKEN", "{{ tok }}")];
     let mut vars = HashMap::new();
     vars.insert("tok".to_string(), "abc123".to_string());
+    write_installed_manifest(&home, &scope, "cli", "[env.TOKEN]\ntype = \"text\"\n");
 
     write_env_files(&home, &scope, &selected, &vars).unwrap();
 
@@ -353,6 +375,47 @@ fn write_env_files_targets_the_given_principal() {
     assert!(
         !default_path.exists(),
         "env file must NOT be written under `default` for a scoped principal"
+    );
+}
+
+#[test]
+fn headless_distro_secret_uses_installed_manifest_type() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = AstridHome::from_path(dir.path());
+    let principal = astrid_core::PrincipalId::new("headless").unwrap();
+    write_installed_manifest(
+        &home,
+        &principal,
+        "provider",
+        "[env.API_KEY]\ntype = \"secret\"\n\n[env.MODEL]\ntype = \"text\"\n",
+    );
+
+    let mut capsule = cap_with_env("provider", "API_KEY", "{{ credential }}");
+    capsule
+        .env
+        .insert("MODEL".to_string(), "{{ model }}".to_string());
+    let mut vars = HashMap::new();
+    vars.insert("credential".to_string(), "headless-token".to_string());
+    vars.insert("model".to_string(), "model-a".to_string());
+
+    write_env_files(&home, &principal, &[capsule], &vars).unwrap();
+
+    let env_path = home
+        .principal_home(&principal)
+        .env_dir()
+        .join("provider.env.json");
+    let env: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&env_path).unwrap()).unwrap();
+    assert_eq!(env["MODEL"], "model-a");
+    assert!(env.get("API_KEY").is_none(), "secret leaked into env JSON");
+    let secret_path = home
+        .secrets_dir()
+        .join("headless")
+        .join("provider")
+        .join("API_KEY");
+    assert_eq!(
+        std::fs::read_to_string(secret_path).unwrap(),
+        "headless-token"
     );
 }
 

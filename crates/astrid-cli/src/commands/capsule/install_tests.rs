@@ -134,3 +134,122 @@ fn capsule_toml_raw_url_format() {
         "https://raw.githubusercontent.com/unicity-astrid/capsule-cli/v0.1.0/Capsule.toml"
     );
 }
+
+#[test]
+fn direct_install_reads_only_manifest_declared_preseed_values() {
+    let defs: std::collections::HashMap<String, astrid_capsule::manifest::EnvDef> = toml::from_str(
+        r#"
+api_key = { type = "secret", request = "API key" }
+auth_mode = { type = "string", default = "api_key" }
+"#,
+    )
+    .unwrap();
+    let values = process_env_values(&defs, |name| match name {
+        "ASTRID_VAR_API_KEY" => Some("secret-value".to_string()),
+        "ASTRID_VAR_AUTH_MODE" => Some("subscription".to_string()),
+        "ASTRID_VAR_UNDECLARED" => Some("ignored".to_string()),
+        _ => None,
+    })
+    .unwrap();
+
+    assert_eq!(values.len(), 2);
+    assert_eq!(values["api_key"], "secret-value");
+    assert_eq!(values["auth_mode"], "subscription");
+    assert!(!values.contains_key("undeclared"));
+}
+
+#[test]
+fn direct_install_rejects_case_colliding_manifest_env_fields() {
+    let defs: std::collections::HashMap<String, astrid_capsule::manifest::EnvDef> = toml::from_str(
+        r#"
+api_key = { type = "secret", request = "API key" }
+API_KEY = { type = "string" }
+"#,
+    )
+    .unwrap();
+
+    let error = process_env_values(&defs, |_| Some("credential".to_string()))
+        .expect_err("case-colliding fields must fail before any value is provisioned");
+    assert!(error.to_string().contains("both normalize"));
+    assert!(error.to_string().contains("ASTRID_VAR_API_KEY"));
+}
+
+#[test]
+fn untrusted_source_children_never_inherit_capsule_preseeds() {
+    let sanitized = sanitized_source_environment([
+        ("PATH", "/usr/bin:/bin"),
+        ("HOME", "/tmp/operator"),
+        ("ASTRID_VAR_API_KEY", "runtime-secret"),
+        ("astrid_var_token", "case-folded-runtime-secret"),
+    ]);
+    let sanitized = sanitized
+        .into_iter()
+        .collect::<std::collections::HashMap<_, _>>();
+
+    assert_eq!(
+        sanitized.get(std::ffi::OsStr::new("PATH")),
+        Some(&std::ffi::OsString::from("/usr/bin:/bin"))
+    );
+    assert_eq!(
+        sanitized.get(std::ffi::OsStr::new("HOME")),
+        Some(&std::ffi::OsString::from("/tmp/operator"))
+    );
+    assert_eq!(sanitized.len(), 2);
+}
+
+#[test]
+fn direct_install_persists_preseed_after_success_using_manifest_types() {
+    let source = tempfile::tempdir().unwrap();
+    std::fs::write(
+        source.path().join("Capsule.toml"),
+        r#"
+[package]
+name = "configured-capsule"
+version = "1.0.0"
+
+[env]
+api_key = { type = "secret", request = "API key" }
+auth_mode = { type = "string", default = "api_key" }
+"#,
+    )
+    .unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let home = AstridHome::from_path(root.path());
+    let principal = astrid_core::PrincipalId::default();
+    let provided = serde_json::Map::from_iter([
+        (
+            "api_key".to_string(),
+            serde_json::Value::String("secret-value".to_string()),
+        ),
+        (
+            "auth_mode".to_string(),
+            serde_json::Value::String("subscription".to_string()),
+        ),
+    ]);
+
+    install_from_local_path_for_principal(
+        source.path(),
+        false,
+        &home,
+        Some("test-fixture"),
+        &principal,
+        None,
+        Some(&provided),
+    )
+    .unwrap();
+
+    let env_path = home
+        .principal_home(&principal)
+        .env_dir()
+        .join("configured-capsule.env.json");
+    let env: serde_json::Value = serde_json::from_slice(&std::fs::read(env_path).unwrap()).unwrap();
+    assert_eq!(env, serde_json::json!({"auth_mode": "subscription"}));
+    assert_eq!(
+        std::fs::read_to_string(
+            home.secrets_dir()
+                .join("default/configured-capsule/api_key")
+        )
+        .unwrap(),
+        "secret-value"
+    );
+}

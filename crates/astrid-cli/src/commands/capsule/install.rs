@@ -56,6 +56,7 @@ struct InstallContext<'a> {
     original_source: Option<&'a str>,
     principal: &'a astrid_core::PrincipalId,
     expected: Option<ExpectedCapsule<'a>>,
+    provided_env: Option<&'a serde_json::Map<String, serde_json::Value>>,
 }
 
 #[derive(Clone, Copy)]
@@ -128,6 +129,7 @@ pub(crate) async fn install_capsule(
         &RefSpec::default(),
         &principal,
         None,
+        None,
     )
     .await?;
     let installed_ids: Vec<String> = installed
@@ -156,6 +158,7 @@ pub(super) async fn install_capsule_inner(
     refspec: &RefSpec,
     principal: &astrid_core::PrincipalId,
     expected: Option<&CapsuleId>,
+    provided_env: Option<&serde_json::Map<String, serde_json::Value>>,
 ) -> anyhow::Result<(Vec<InstalledCapsuleOutcome>, Option<String>)> {
     let home = AstridHome::resolve()?;
 
@@ -177,7 +180,15 @@ pub(super) async fn install_capsule_inner(
     //    canonical reference for a locally-sourced capsule). No remote
     //    ref to resolve.
     if base.starts_with('.') || base.starts_with('/') {
-        let ids = install_from_local(base, workspace, &home, Some(base), principal, expected)?;
+        let ids = install_from_local(
+            base,
+            workspace,
+            &home,
+            Some(base),
+            principal,
+            expected,
+            provided_env,
+        )?;
         return Ok((ids, None));
     }
 
@@ -195,6 +206,7 @@ pub(super) async fn install_capsule_inner(
                 original_source: Some(base),
                 principal,
                 expected,
+                provided_env,
             },
         )
         .await;
@@ -213,13 +225,22 @@ pub(super) async fn install_capsule_inner(
                 original_source: Some(base),
                 principal,
                 expected,
+                provided_env,
             },
         )
         .await;
     }
 
     // 4. Fallback: assume local folder. No remote ref to resolve.
-    let ids = install_from_local(base, workspace, &home, Some(base), principal, expected)?;
+    let ids = install_from_local(
+        base,
+        workspace,
+        &home,
+        Some(base),
+        principal,
+        expected,
+        provided_env,
+    )?;
     Ok((ids, None))
 }
 
@@ -449,6 +470,7 @@ async fn download_and_unpack(
         context.original_source,
         context.principal,
         context.expected,
+        context.provided_env,
     )
 }
 
@@ -504,7 +526,8 @@ fn clone_and_build(
     let tmp_dir = tempfile::tempdir().context("failed to create temp dir for cloning")?;
     let clone_dir = tmp_dir.path().join(repo);
 
-    let status = std::process::Command::new("git")
+    let mut git = sanitized_source_command("git");
+    let status = git
         .args(["clone", "--depth", "1", url, &clone_dir.to_string_lossy()])
         .status()
         .context("Failed to spawn git clone")?;
@@ -517,7 +540,8 @@ fn clone_and_build(
     std::fs::create_dir_all(&output_dir)?;
 
     let build_bin = crate::bootstrap::find_companion_binary("astrid-build")?;
-    let build_status = std::process::Command::new(build_bin)
+    let mut build = sanitized_source_command(build_bin);
+    let build_status = build
         .arg(clone_dir.to_str().context("Invalid clone dir path")?)
         .arg("--output")
         .arg(output_dir.to_str().context("Invalid output dir path")?)
@@ -560,6 +584,7 @@ fn clone_and_build(
             context.original_source,
             context.principal,
             context.expected,
+            context.provided_env,
         );
     }
 
@@ -577,6 +602,7 @@ fn install_from_local(
     original_source: Option<&str>,
     principal: &astrid_core::PrincipalId,
     expected: Option<ExpectedCapsule<'_>>,
+    provided_env: Option<&serde_json::Map<String, serde_json::Value>>,
 ) -> anyhow::Result<Vec<InstalledCapsuleOutcome>> {
     let source_path = Path::new(source);
     if !source_path.exists() {
@@ -592,6 +618,7 @@ fn install_from_local(
             original_source,
             principal,
             expected,
+            provided_env,
         )
         .map(|installed| vec![installed]);
     }
@@ -602,7 +629,8 @@ fn install_from_local(
         let output_dir = tmp_dir.path().join("dist");
 
         let build_bin = crate::bootstrap::find_companion_binary("astrid-build")?;
-        let status = std::process::Command::new(build_bin)
+        let mut build = sanitized_source_command(build_bin);
+        let status = build
             .arg(source)
             .arg("--output")
             .arg(output_dir.to_str().context("Invalid output dir path")?)
@@ -627,6 +655,7 @@ fn install_from_local(
                     original_source,
                     principal,
                     expected,
+                    provided_env,
                 )
                 .map(|installed| vec![installed]);
             }
@@ -641,6 +670,7 @@ fn install_from_local(
         original_source,
         principal,
         expected,
+        provided_env,
     )
     .map(|installed| vec![installed])
 }
@@ -670,6 +700,7 @@ pub(crate) fn install_from_local_path(
         original_source,
         &principal,
         None,
+        None,
     )
     .map(|installed| installed.id.as_str().to_string())
 }
@@ -681,6 +712,7 @@ fn install_from_local_path_for_principal(
     original_source: Option<&str>,
     principal: &astrid_core::PrincipalId,
     expected: Option<ExpectedCapsule<'_>>,
+    provided_env: Option<&serde_json::Map<String, serde_json::Value>>,
 ) -> anyhow::Result<InstalledCapsuleOutcome> {
     let opts = InstallOptions {
         workspace,
@@ -714,7 +746,7 @@ fn install_from_local_path_for_principal(
             ),
         }
     })?;
-    finish_install(&output, home)
+    finish_install(&output, home, principal, provided_env)
 }
 
 /// Install a capsule from a local `.capsule` file in batch (offline)
@@ -747,6 +779,7 @@ pub(crate) fn install_offline_capsule(
                 id: expected,
                 version: expected_version,
             }),
+            None,
         )?;
         // Post-stamp provenance into the freshly-written meta.json. The
         // unpack above installs under the explicit target principal and
@@ -779,6 +812,7 @@ fn unpack_via_lib(
     original_source: Option<&str>,
     principal: &astrid_core::PrincipalId,
     expected: Option<ExpectedCapsule<'_>>,
+    provided_env: Option<&serde_json::Map<String, serde_json::Value>>,
 ) -> anyhow::Result<InstalledCapsuleOutcome> {
     let opts = InstallOptions {
         workspace,
@@ -812,7 +846,7 @@ fn unpack_via_lib(
             ),
         }
     })?;
-    finish_install(&output, home)
+    finish_install(&output, home, principal, provided_env)
 }
 
 /// Run a lib-install closure with a fresh event bus and a stdin
@@ -844,6 +878,8 @@ where
 fn finish_install(
     output: &InstallOutput,
     home: &AstridHome,
+    principal: &astrid_core::PrincipalId,
+    provided_env: Option<&serde_json::Map<String, serde_json::Value>>,
 ) -> anyhow::Result<InstalledCapsuleOutcome> {
     let batch = BATCH_MODE.load(Ordering::Relaxed);
 
@@ -877,6 +913,22 @@ fn finish_install(
             meta.wasm_hash
         );
     }
+
+    let resolved_env = match provided_env {
+        Some(values) => values.clone(),
+        None if batch => serde_json::Map::new(),
+        None => process_env_values(&manifest.env, |name| std::env::var(name).ok())?,
+    };
+    if !manifest.env.is_empty() {
+        super::install_prompts::provision_manifest_env_values(
+            &manifest.env,
+            &output.env_path,
+            capsule_id.as_str(),
+            home,
+            principal,
+            &resolved_env,
+        )?;
+    }
     let cli_commands: Vec<&astrid_capsule::manifest::CommandDef> = manifest
         .commands
         .iter()
@@ -891,12 +943,18 @@ fn finish_install(
         }
     }
 
-    if !batch && output.env_needs_prompt {
+    // Always inspect a declared env schema in interactive mode. The installer
+    // library's `env_needs_prompt` signal only tracks whether the env JSON
+    // exists; it cannot see principal-scoped file secrets or detect legacy
+    // plaintext secret keys that must be migrated out of an existing JSON.
+    if !batch && !manifest.env.is_empty() {
         prompt_env_fields(
             &manifest.env,
             &output.env_path,
             capsule_id.as_str(),
             &home.config_path(),
+            home,
+            principal,
         )?;
     }
 
@@ -938,6 +996,63 @@ fn finish_install(
         version: meta.version,
         wasm_hash: meta.wasm_hash,
     })
+}
+
+fn process_env_values(
+    env_defs: &std::collections::HashMap<String, astrid_capsule::manifest::EnvDef>,
+    mut lookup: impl FnMut(&str) -> Option<String>,
+) -> anyhow::Result<serde_json::Map<String, serde_json::Value>> {
+    let mut normalized = std::collections::HashMap::<String, &str>::new();
+    let mut keys = env_defs.keys().map(String::as_str).collect::<Vec<_>>();
+    keys.sort_unstable();
+
+    for key in &keys {
+        let env_key = format!("ASTRID_VAR_{}", key.to_uppercase());
+        if let Some(previous) = normalized.insert(env_key.clone(), key) {
+            anyhow::bail!(
+                "capsule env fields '{previous}' and '{key}' both normalize to {env_key}"
+            );
+        }
+    }
+
+    Ok(keys
+        .into_iter()
+        .filter_map(|key| {
+            let env_key = format!("ASTRID_VAR_{}", key.to_uppercase());
+            lookup(&env_key).map(|value| (key.to_string(), serde_json::Value::String(value)))
+        })
+        .collect())
+}
+
+fn sanitized_source_environment<I, K, V>(
+    variables: I,
+) -> Vec<(std::ffi::OsString, std::ffi::OsString)>
+where
+    I: IntoIterator<Item = (K, V)>,
+    K: Into<std::ffi::OsString>,
+    V: Into<std::ffi::OsString>,
+{
+    variables
+        .into_iter()
+        .map(|(name, value)| (name.into(), value.into()))
+        .filter(|(name, _)| {
+            let uppercase = name.to_string_lossy().to_ascii_uppercase();
+            !uppercase.starts_with("ASTRID_VAR_")
+        })
+        .collect()
+}
+
+/// Build an untrusted source command without capsule-preseed credentials.
+///
+/// Clearing and reconstructing the complete child environment is deliberate:
+/// `env_remove` alone is vulnerable to platform-specific case folding. The
+/// parent retains its preseeds for post-install classification, while clone and
+/// build children receive every unrelated environment entry unchanged.
+fn sanitized_source_command(program: impl AsRef<std::ffi::OsStr>) -> std::process::Command {
+    let mut command = std::process::Command::new(program);
+    command.env_clear();
+    command.envs(sanitized_source_environment(std::env::vars_os()));
+    command
 }
 
 // ---------------------------------------------------------------------------

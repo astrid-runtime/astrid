@@ -46,6 +46,13 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
 
 ### Changed
 
+- **Daemon boot now discovers the local control uplink by capability instead
+  of a package name.** Any distribution can provide the control capsule under
+  its own identity when it declares both `uplink = true` and
+  `net_bind = ["unix:*"]`; unrelated uplinks and socket binders do not satisfy
+  the readiness gate. Existing `astrid-capsule-cli` installations retain the
+  same behavior.
+
 - **Device key IDs now use BLAKE3.** The short per-device handle is derived from
   the first eight bytes of `BLAKE3(pubkey_hex_bytes)`. Profile loading already
   treats the stored `key_id` as informational and re-derives it from the public
@@ -137,6 +144,17 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
 - **Astrid's MCP bridge now uses RMCP 2.2.** The client and server adapt to RMCP's current content and elicitation APIs while preserving existing roots and sampling support. The CLI prompt also follows terminal color preferences, including `NO_COLOR`. The reviewed dependency refresh includes updated cryptography, signal handling, random-source, regex, ignore, and WebAssembly component tooling dependencies; `astrid-core` remains on TOML 0.8 because its public error types expose that API, and the optional SurrealDB backend remains on 3.1.5 pending a dedicated storage migration. Closes #1193.
 
 ### Fixed
+
+- **Capsule onboarding no longer serializes manifest-declared secrets into env
+  JSON.** Interactive installs and distro initialization route exact
+  `type = "secret"` fields into the principal-scoped file secret store, migrate
+  legacy plaintext copies, and keep credentials process-local when resolving
+  dependent dynamic options. Direct installs apply manifest-declared
+  `ASTRID_VAR_<KEY>` values only after installation succeeds. Undeclared distro
+  keys and case-colliding direct-install fields fail closed, clone/build children
+  never inherit the preseed namespace, host-shared secrets retain precedence,
+  and dynamic discovery cannot substitute a secret into a manifest-controlled
+  URL.
 
 - **Invite commands accept every token the runtime can issue.** `invite redeem`
   and `invite revoke` now treat a leading hyphen in an opaque base64url token as

@@ -133,6 +133,11 @@ pub(crate) async fn run_init(distro_source: &str, opts: &InitOpts) -> anyhow::Re
         && let Some(installed) =
             grant::validated_grant_set_for_reuse(&home, &target, &existing_lock.capsules)
     {
+        // A prior release may have put manifest-declared secrets in the
+        // ordinary env JSON. Re-running init is an onboarding boundary too:
+        // heal those exact keys before taking the fresh-lock fast path.
+        let installed_names = locked_capsule_names(&existing_lock.capsules);
+        migrate_installed_env_secrets(&home, &target, &installed_names)?;
         eprintln!(
             "{}",
             Theme::info(&format!(
@@ -178,17 +183,12 @@ pub(crate) async fn run_init(distro_source: &str, opts: &InitOpts) -> anyhow::Re
     // Collect variables needed by selected capsules.
     let vars = collect_variables(&variables, &selected, opts.yes, &opts.vars)?;
 
-    // Write per-capsule env files BEFORE installing capsules so that
-    // install_capsule's onboarding check finds existing values and
-    // doesn't re-prompt for fields the distro already configured.
-    write_env_files(&home, &target, &selected, &vars)?;
-
     // Install each capsule with progress. `install_capsules` writes the
     // capsule files under `principal`'s home and returns one LockedCapsule
     // per capsule that actually installed — failures are reported and
     // dropped, so `locked.len()` is the true success count.
     let total = selected.len();
-    let locked = install_capsules(&selected, opts.offline, &target).await?;
+    let locked = install_capsules(&selected, opts.offline, &target, &vars).await?;
     let succeeded = locked.len();
 
     // Provisioning honesty: a run where every selected install FAILED must
@@ -209,8 +209,7 @@ pub(crate) async fn run_init(distro_source: &str, opts: &InitOpts) -> anyhow::Re
     // each selected llm-group capsule this runs its own `[env]` schema
     // prompt so capsule-specific fields (api_key, base_url) and the dynamic
     // `model` select resolve from the installed manifest — not just the
-    // shared free-text `[variables]`. Shared values already written above
-    // are preserved (the prompt skips set keys).
+    // distro `[variables]`. Values provisioned above are preserved.
     if should_write_lock(total, succeeded) {
         onboard_llm_providers(&home, &target, &selected);
     }
@@ -274,7 +273,7 @@ fn init_workspace() -> anyhow::Result<()> {
         if !config_path.exists() {
             std::fs::write(
                 &config_path,
-                "# Astrid workspace configuration\n\
+                "# Runtime workspace configuration\n\
                  # See docs for available options.\n",
             )?;
         }
@@ -583,12 +582,11 @@ fn collect_variables_headless(
                 )
             })?;
 
-        let is_secret = var_def.is_some_and(|d| d.secret);
-        if is_secret {
-            tracing::debug!(var = %var_name, "resolved distro variable [secret]");
-        } else {
-            tracing::debug!(var = %var_name, value = %value, "resolved distro variable");
-        }
+        // A distro variable can feed multiple target keys, and only the
+        // installed capsule manifests authoritatively classify those keys.
+        // Never log values here, even when VariableDef does not mark the
+        // source variable as secret.
+        tracing::debug!(var = %var_name, "resolved distro variable");
 
         vars.insert(var_name.to_string(), value);
     }
@@ -697,6 +695,7 @@ async fn install_capsules(
     selected: &[DistroCapsule],
     offline: bool,
     principal: &astrid_core::PrincipalId,
+    vars: &HashMap<String, String>,
 ) -> anyhow::Result<Vec<LockedCapsule>> {
     if offline {
         for cap in selected {
@@ -727,6 +726,16 @@ async fn install_capsules(
 
         let expected = CapsuleId::new(cap.name.clone())?;
         let refspec = super::capsule::install::RefSpec::from_capsule(cap);
+        let provided_env: serde_json::Map<String, serde_json::Value> = cap
+            .env
+            .iter()
+            .map(|(key, template)| {
+                (
+                    key.clone(),
+                    serde_json::Value::String(resolve_template(template, vars)),
+                )
+            })
+            .collect();
         // The installer returns the ref it ACTUALLY resolved and fetched
         // (`Some` for GitHub sources, `None` for local paths). Record
         // that — never a guess derived from the manifest fields — so the
@@ -739,6 +748,7 @@ async fn install_capsules(
             false,
             &refspec,
             principal,
+            &provided_env,
         )
         .await
         {
@@ -839,7 +849,16 @@ fn validate_batch_install(
     })
 }
 
-/// Write per-capsule .env.json files with resolved variable templates.
+fn locked_capsule_names(locked: &[LockedCapsule]) -> Vec<String> {
+    locked.iter().map(|capsule| capsule.name.clone()).collect()
+}
+
+/// Provision per-capsule env values using each installed manifest's schema.
+///
+/// Non-secret values are written to the principal env JSON. Exact
+/// manifest-declared `type = "secret"` fields go to the per-principal
+/// [`astrid_storage::FileSecretStore`] instead. Existing env files are
+/// preserved except that any legacy plaintext secret fields are migrated out.
 pub(crate) fn write_env_files(
     home: &AstridHome,
     principal: &astrid_core::PrincipalId,
@@ -847,52 +866,77 @@ pub(crate) fn write_env_files(
     vars: &HashMap<String, String>,
 ) -> anyhow::Result<()> {
     let env_dir = home.principal_home(principal).env_dir();
-    std::fs::create_dir_all(&env_dir)?;
 
     for cap in selected {
-        if cap.env.is_empty() {
-            continue;
-        }
-
+        let target_dir =
+            astrid_capsule_install::resolve_target_dir_for(home, principal, &cap.name, false)?;
+        let manifest_path = target_dir.join("Capsule.toml");
+        let manifest =
+            astrid_capsule::discovery::load_manifest(&manifest_path).with_context(|| {
+                format!(
+                    "failed to load installed manifest for env provisioning: {}",
+                    manifest_path.display()
+                )
+            })?;
         let env_path = env_dir.join(format!("{}.env.json", cap.name));
-        if env_path.exists() {
-            // Don't overwrite existing env config — user may have customized.
-            continue;
-        }
-
         let mut resolved: serde_json::Map<String, serde_json::Value> = serde_json::Map::new();
         for (key, template) in &cap.env {
-            // Write all keys — even empty values. An empty string means
-            // "use default" and prevents install-time onboarding from
-            // re-prompting for fields the distro already configured.
             let value = resolve_template(template, vars);
             resolved.insert(key.clone(), serde_json::Value::String(value));
         }
-
-        if !resolved.is_empty() {
-            let json = serde_json::to_string_pretty(&resolved)?;
-            std::fs::write(&env_path, &json)?;
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                std::fs::set_permissions(&env_path, std::fs::Permissions::from_mode(0o600))?;
-            }
-        }
+        super::capsule::install_prompts::provision_manifest_env_values(
+            &manifest.env,
+            &env_path,
+            &cap.name,
+            home,
+            principal,
+            &resolved,
+        )?;
     }
 
+    Ok(())
+}
+
+/// Heal legacy plaintext env secrets for already-installed capsules.
+fn migrate_installed_env_secrets(
+    home: &AstridHome,
+    principal: &astrid_core::PrincipalId,
+    capsule_names: &[String],
+) -> anyhow::Result<()> {
+    let env_dir = home.principal_home(principal).env_dir();
+    for capsule_name in capsule_names {
+        let target_dir =
+            astrid_capsule_install::resolve_target_dir_for(home, principal, capsule_name, false)?;
+        let manifest_path = target_dir.join("Capsule.toml");
+        let manifest =
+            astrid_capsule::discovery::load_manifest(&manifest_path).with_context(|| {
+                format!(
+                    "failed to load installed manifest for secret migration: {}",
+                    manifest_path.display()
+                )
+            })?;
+        let env_path = env_dir.join(format!("{capsule_name}.env.json"));
+        super::capsule::install_prompts::migrate_manifest_env_secrets(
+            &manifest.env,
+            &env_path,
+            capsule_name,
+            home,
+            principal,
+        )?;
+    }
     Ok(())
 }
 
 /// Run per-provider env onboarding for selected `group = "llm"` capsules.
 ///
 /// Non-llm capsules are configured entirely from the distro's shared
-/// `[variables]` (templated into env files before install). LLM providers,
-/// by contrast, own capsule-specific fields — credentials and a model that
-/// is best chosen from a live list — so each selected llm capsule runs its
-/// own `[env]` schema prompt here, after install (the manifest is on disk).
+/// `[variables]`, provisioned after install according to the installed
+/// manifest. LLM providers also own capsule-specific fields — credentials and
+/// a model best chosen from a live list — so each selected llm capsule runs
+/// its own `[env]` schema prompt here after provisioning.
 ///
-/// The prompt skips keys that already hold a non-empty value, so any
-/// `[variables]`-templated shared values survive. Dynamic `model` selects
+/// The prompt skips configured env keys and existing file secrets, so any
+/// `[variables]`-templated values survive. Dynamic `model` selects
 /// (declared via `options-from`) resolve their option list live at this
 /// point. A missing manifest or env error for one provider is reported and
 /// skipped — it never aborts the whole install.
@@ -938,6 +982,8 @@ fn onboard_llm_providers(
             &env_path,
             &cap.name,
             &home.config_path(),
+            home,
+            principal,
         ) {
             eprintln!("  Configuration for {} failed: {e}", cap.name);
         }

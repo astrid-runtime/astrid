@@ -45,6 +45,7 @@ pub(crate) async fn install_capsule_batch(
     workspace: bool,
     refspec: &RefSpec,
     principal: &astrid_core::PrincipalId,
+    provided_env: &serde_json::Map<String, serde_json::Value>,
 ) -> anyhow::Result<BatchInstallOutcome> {
     anyhow::ensure!(
         refspec.version.is_some() || refspec.tag.is_some(),
@@ -58,6 +59,7 @@ pub(crate) async fn install_capsule_batch(
         refspec,
         principal,
         Some(expected),
+        Some(provided_env),
     )
     .await;
     super::install::BATCH_MODE.store(false, Ordering::Relaxed);

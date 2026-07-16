@@ -134,6 +134,20 @@ fn resolve_http_limits(cfg: Option<&astrid_config::Config>) -> astrid_capsule::H
     )
 }
 
+/// Whether a loaded capsule provides the daemon's local control uplink.
+///
+/// The control contract is capability-based so a distribution can supply its
+/// own package identity. An ordinary long-lived uplink is insufficient: the
+/// capsule must also request the runtime's Unix control listener.
+fn is_local_control_uplink(manifest: &astrid_capsule::manifest::CapsuleManifest) -> bool {
+    manifest.capabilities.uplink
+        && manifest
+            .capabilities
+            .net_bind
+            .iter()
+            .any(|address| address == "unix:*")
+}
+
 /// Run the Astrid daemon with the given arguments.
 ///
 /// This is the shared entry point used by both the standalone `astrid-daemon`
@@ -141,7 +155,7 @@ fn resolve_http_limits(cfg: Option<&astrid_config::Config>) -> astrid_capsule::H
 ///
 /// # Errors
 ///
-/// Returns an error if the kernel fails to boot, the CLI proxy capsule is
+/// Returns an error if the kernel fails to boot, the local control uplink is
 /// missing, or the readiness file cannot be written.
 #[expect(
     clippy::too_many_lines,
@@ -232,22 +246,20 @@ pub async fn run() -> Result<()> {
         );
     }
 
-    // Verify the CLI proxy capsule loaded. Without it, the daemon
+    // Verify the local control uplink loaded. Without it, the daemon
     // has no accept loop and CLI connections will always time out.
     {
         let reg = kernel.capsules.read().await;
-        let has_cli_proxy = reg
-            .list()
-            .iter()
-            .any(|id| id.as_str() == "astrid-capsule-cli");
-        if !has_cli_proxy {
+        let has_local_control = reg
+            .values()
+            .any(|capsule| is_local_control_uplink(capsule.manifest()));
+        if !has_local_control {
             tracing::error!(
-                "CLI proxy capsule (astrid-capsule-cli) not found - \
-                 daemon cannot accept CLI connections"
+                "local control uplink not found - daemon cannot accept CLI connections"
             );
             anyhow::bail!(
-                "CLI proxy capsule (astrid-capsule-cli) not found. \
-                 Install a compatible `astrid-capsule-cli` capsule, then restart the daemon."
+                "local control uplink not found. Install a compatible capsule declaring \
+                 `uplink = true` and `net_bind = [\"unix:*\"]`, then restart the daemon."
             );
         }
     }
@@ -410,4 +422,52 @@ fn spawn_gateway(
         }
     });
     Ok(notify)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_local_control_uplink;
+    use astrid_capsule::manifest::CapsuleManifest;
+
+    fn manifest(name: &str, uplink: bool, net_bind: &[&str]) -> CapsuleManifest {
+        let mut manifest = CapsuleManifest::default();
+        manifest.package.name = name.to_string();
+        manifest.capabilities.uplink = uplink;
+        manifest.capabilities.net_bind =
+            net_bind.iter().map(|value| (*value).to_string()).collect();
+        manifest
+    }
+
+    #[test]
+    fn local_control_uplink_is_package_name_agnostic() {
+        assert!(is_local_control_uplink(&manifest(
+            "aos-cli",
+            true,
+            &["unix:*"]
+        )));
+        assert!(is_local_control_uplink(&manifest(
+            "independent-distro-control",
+            true,
+            &["unix:*"]
+        )));
+    }
+
+    #[test]
+    fn unrelated_uplinks_and_socket_binders_do_not_satisfy_control_boot() {
+        assert!(!is_local_control_uplink(&manifest(
+            "telegram-uplink",
+            true,
+            &[]
+        )));
+        assert!(!is_local_control_uplink(&manifest(
+            "local-server",
+            false,
+            &["unix:*"]
+        )));
+        assert!(!is_local_control_uplink(&manifest(
+            "tcp-uplink",
+            true,
+            &["127.0.0.1:0"]
+        )));
+    }
 }
