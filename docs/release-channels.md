@@ -23,7 +23,8 @@ disable administrator bypass. Keep the existing `release` environment equally
 protected. Add `ASTRID_RELEASE_ADMIN_TOKEN` to the `release` environment using
 a fine-grained token scoped to this repository with Administration read/write;
 it is used only to inspect and enable the immutable-release setting. The
-workflow's scoped `GITHUB_TOKEN` retains ordinary Contents write access.
+workflow's scoped `GITHUB_TOKEN` retains ordinary Contents write access. Add a
+crates.io API token as `CARGO_REGISTRY_TOKEN` in the same protected environment.
 
 Run **Bootstrap mutable Astrid channels** from `main` exactly once before the
 first release. It creates the three empty, published prerelease containers
@@ -40,7 +41,11 @@ never-published draft whose exact inventory, manifest, source and WIT commits,
 checksums, and tag-bound Sigstore identities reauthenticate. Published,
 incomplete, duplicate, empty, or unexpected assets fail closed. The first
 eligible immutable release must contain the release manifest and channel-aware
-updater; earlier releases cannot be promoted into this contract.
+updater; earlier releases cannot be promoted into this contract. After the
+immutable binary release is complete, the workflow publishes all 26 public
+workspace crates in dependency order and confirms each permanent crates.io
+checksum. Channel promotion requires the exact tag's complete release workflow
+to have succeeded, so it cannot run ahead of the crates.io train.
 
 ## Signed contract
 

@@ -32,6 +32,7 @@ jobs:
     environment:
       name: astrid-channel-${{ inputs.channel }}
     permissions:
+      actions: read
       contents: write
       id-token: write
     steps:
@@ -117,6 +118,12 @@ jobs:
           gh api "repos/$GITHUB_REPOSITORY/releases/tags/$RELEASE_TAG" \
             --jq 'select(.draft == false and .immutable == true) | true' \
             | grep -Fx true
+          RELEASE_RUNS="$RUNNER_TEMP/release-workflow-runs.json"
+          gh api "repos/$GITHUB_REPOSITORY/actions/workflows/release.yml/runs?event=push&status=completed&per_page=100" \
+            --paginate --slurp > "$RELEASE_RUNS"
+          jq -e --arg tag "$RELEASE_TAG" --arg commit "$TAG_COMMIT" \
+            '[.[].workflow_runs[] | select(.head_branch == $tag and .head_sha == $commit and .conclusion == "success")] | length >= 1' \
+            "$RELEASE_RUNS" >/dev/null
           gh release view "$RELEASE_TAG" \
             --repo "$GITHUB_REPOSITORY" \
             --json assets,isDraft,isPrerelease > release.json

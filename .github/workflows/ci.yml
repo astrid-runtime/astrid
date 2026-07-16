@@ -9,6 +9,8 @@ on:
       - 'scripts/test_release_manifest.py'
       - 'scripts/release_publication.py'
       - 'scripts/test_release_publication.py'
+      - 'scripts/crate_publication.py'
+      - 'scripts/test_crate_publication.py'
       - 'scripts/channel_metadata.py'
       - 'scripts/test_channel_metadata.py'
       - 'scripts/channel_publication.py'
@@ -25,6 +27,8 @@ on:
       - 'scripts/test_release_manifest.py'
       - 'scripts/release_publication.py'
       - 'scripts/test_release_publication.py'
+      - 'scripts/crate_publication.py'
+      - 'scripts/test_crate_publication.py'
       - 'scripts/channel_metadata.py'
       - 'scripts/test_channel_metadata.py'
       - 'scripts/channel_publication.py'
@@ -77,6 +81,7 @@ jobs:
         run: |
           python3 scripts/test_release_manifest.py
           python3 scripts/test_release_publication.py
+          python3 scripts/test_crate_publication.py
           python3 scripts/test_channel_metadata.py
           python3 scripts/test_channel_publication.py
           bash scripts/test_channel_workflow_contract.sh
