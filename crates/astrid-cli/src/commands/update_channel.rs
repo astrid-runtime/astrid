@@ -9,8 +9,6 @@ use chrono::{DateTime, SecondsFormat, Utc};
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 
-use crate::cli::UpdateChannel;
-
 use super::self_update::{api_base, download_bounded, exact_asset_url};
 use super::update_auth::MetadataAuthenticator;
 
