@@ -28,6 +28,29 @@ const MAX_BUNDLE_BYTES: usize = 256 * 1024;
 const MAX_MANIFEST_BYTES: usize = 256 * 1024;
 const MAX_FUTURE_SKEW_SECS: i64 = 5 * 60;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub(crate) enum UpdateChannel {
+    Stable,
+    Dev,
+    Nightly,
+}
+
+impl UpdateChannel {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Stable => "stable",
+            Self::Dev => "dev",
+            Self::Nightly => "nightly",
+        }
+    }
+}
+
+impl std::fmt::Display for UpdateChannel {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
 pub(super) struct ResolvedChannelRelease {
     pub(super) version: String,
     pub(super) release: serde_json::Value,

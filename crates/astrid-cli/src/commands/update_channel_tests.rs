@@ -9,13 +9,17 @@ fn targets() -> Vec<TargetMetadata> {
         .iter()
         .enumerate()
         .map(|(index, triple)| {
+            let ordinal = index.checked_add(1).expect("target ordinal fits usize");
+            let checksum_ordinal = index
+                .checked_add(10)
+                .expect("target checksum ordinal fits usize");
             let asset = format!("astrid-{VERSION}-{triple}.tar.gz");
             TargetMetadata {
                 triple: (*triple).to_owned(),
                 asset: asset.clone(),
-                size: i64::try_from(index + 1).unwrap(),
-                blake3: format!("{:064x}", index + 1),
-                sha256: format!("{:064x}", index + 10),
+                size: i64::try_from(ordinal).expect("target ordinal fits i64"),
+                blake3: format!("{ordinal:064x}"),
+                sha256: format!("{checksum_ordinal:064x}"),
                 sigstore_bundle: format!("{asset}.sigstore.json"),
             }
         })

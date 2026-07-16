@@ -35,6 +35,7 @@ pub(crate) mod top;
 pub(crate) mod trust;
 mod update_auth;
 mod update_channel;
+pub(crate) use update_channel::UpdateChannel;
 pub(crate) mod verb_suggest;
 pub(crate) mod version;
 pub(crate) mod voucher;

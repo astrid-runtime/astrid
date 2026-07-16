@@ -9,6 +9,7 @@ use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
 
+use crate::commands::UpdateChannel;
 use crate::commands::{
     agent::AgentCommand, audit::AuditArgs, budget::BudgetCommand, caps::CapsCommand,
     capsule::config::ConfigArgs as CapsuleConfigArgs, capsule::show::ShowArgs as CapsuleShowArgs,
@@ -354,29 +355,6 @@ pub(crate) struct UpdateArgs {
     /// (Env: `ASTRID_UPDATE_REPO`; API base: `ASTRID_UPDATE_API`.)
     #[arg(long, value_name = "OWNER/REPO")]
     pub(crate) source: Option<String>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
-pub(crate) enum UpdateChannel {
-    Stable,
-    Dev,
-    Nightly,
-}
-
-impl UpdateChannel {
-    pub(crate) const fn as_str(self) -> &'static str {
-        match self {
-            Self::Stable => "stable",
-            Self::Dev => "dev",
-            Self::Nightly => "nightly",
-        }
-    }
-}
-
-impl std::fmt::Display for UpdateChannel {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str(self.as_str())
-    }
 }
 
 #[derive(Subcommand)]

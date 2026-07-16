@@ -4,12 +4,11 @@ use std::path::PathBuf;
 
 use anyhow::bail;
 
-use crate::cli::UpdateChannel;
 use crate::theme::Theme;
 
 use super::{
-    CHECK_TTL_SECS, CURRENT_VERSION, InstallMethod, platform_target, resolve_repo, running_binary,
-    update_channel,
+    CHECK_TTL_SECS, CURRENT_VERSION, InstallMethod, UpdateChannel, platform_target, resolve_repo,
+    running_binary, update_channel,
 };
 
 #[derive(serde::Serialize, serde::Deserialize)]

@@ -10,9 +10,10 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, bail};
 
-use crate::cli::{UpdateArgs, UpdateChannel};
+use crate::cli::UpdateArgs;
 use crate::theme::Theme;
 
+use super::UpdateChannel;
 use super::update_auth::{
     UpdateStageError, authenticate_archive, extract_verified_archive,
     integrity_manifest_download_error, publisher_bundle_download_error, verify_integrity,
