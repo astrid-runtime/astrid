@@ -469,6 +469,28 @@ fn status_response(response: KernelResponse) -> Result<DaemonStatus> {
     }
 }
 
+fn accept_shutdown_result(
+    result: std::result::Result<KernelResponse, astrid_uplink::KernelClientError>,
+    has_verifiable_identity: bool,
+) -> Result<()> {
+    match result {
+        Ok(KernelResponse::Success(_)) => Ok(()),
+        Ok(KernelResponse::Error(reason)) => anyhow::bail!("daemon rejected shutdown: {reason}"),
+        Ok(other) => anyhow::bail!("unexpected response from daemon shutdown: {other:?}"),
+        Err(astrid_uplink::KernelClientError::ConnectionLost { .. }) if has_verifiable_identity => {
+            // The daemon can close its uplink while the terminal response is
+            // still queued. The caller must now prove the recorded process
+            // exited (or terminate that exact process) before reporting success.
+            Ok(())
+        },
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn recorded_identity_is_verifiable(recorded: Option<&(u32, Option<PathBuf>)>) -> bool {
+    recorded.is_some_and(|(_, exe)| exe.is_some())
+}
+
 /// Handle `astrid stop`.
 ///
 /// A shutdown request over the socket only earns an ACK ("shutting down"), not a
@@ -504,20 +526,16 @@ pub(crate) async fn handle_stop() -> Result<()> {
     // the recovery path when that daemon belongs to another project/layout.
     if socket_present && let Ok(client) = socket_client::connect_kernel_for_recovery().await {
         let mut client = client.with_timeout(Duration::from_secs(10));
-        match client
+        let result = client
             .request(KernelRequest::Shutdown {
                 reason: Some("astrid stop".to_string()),
             })
-            .await?
-        {
-            KernelResponse::Success(_) => {
-                // ACK only — confirm the process actually exits before
-                // declaring success, and escalate if it wedged.
-                confirm_graceful_stop(recorded, &pid_path, &socket_path).await;
-            },
-            KernelResponse::Error(reason) => anyhow::bail!("daemon rejected shutdown: {reason}"),
-            other => anyhow::bail!("unexpected response from daemon shutdown: {other:?}"),
-        }
+            .await;
+        accept_shutdown_result(result, recorded_identity_is_verifiable(recorded.as_ref()))?;
+        // An ACK confirms shutdown began. A connection loss is accepted only
+        // when the recorded process identity lets this path prove the same
+        // result. Either way, do not report success until the process is gone.
+        confirm_graceful_stop(recorded, &pid_path, &socket_path).await?;
         return Ok(());
     }
 
@@ -532,7 +550,7 @@ pub(crate) async fn handle_stop() -> Result<()> {
         None => daemon_control::KillOutcome::NotRunning,
     };
     report_orphan_stop(outcome, socket_present, &pid_path, &socket_path);
-    Ok(())
+    require_stop_confirmed(outcome)
 }
 
 /// After a graceful shutdown ACK, confirm the daemon process actually exited —
@@ -544,14 +562,14 @@ async fn confirm_graceful_stop(
     recorded: Option<(u32, Option<PathBuf>)>,
     pid_path: &Path,
     socket_path: &Path,
-) {
+) -> Result<()> {
     let Some((pid, exe)) = recorded else {
         // Legacy pidless daemon (or an unresolved PID): we can't confirm exit,
         // so trust the ACK. The daemon cleans up its own socket on a clean exit;
         // remove the PID file best-effort in case one was left behind.
         println!("{}", theme::Theme::success("Astrid daemon stopped."));
         let _ = std::fs::remove_file(pid_path);
-        return;
+        return Ok(());
     };
 
     if daemon_control::wait_for_exit(pid, daemon_control::GRACE).await {
@@ -561,7 +579,7 @@ async fn confirm_graceful_stop(
         // stale socket for the next `status`/`start` to trip on.
         println!("{}", theme::Theme::success("Astrid daemon stopped."));
         remove_runtime_files(pid_path, socket_path);
-        return;
+        return Ok(());
     }
 
     // Acknowledged but still alive past the grace window → wedged mid-shutdown,
@@ -575,6 +593,7 @@ async fn confirm_graceful_stop(
     );
     let outcome = daemon_control::terminate_known(pid, exe.as_deref()).await;
     report_orphan_stop(outcome, true, pid_path, socket_path);
+    require_stop_confirmed(outcome)
 }
 
 /// Report a signal-based stop outcome and clean up runtime files ONLY when the
@@ -652,6 +671,14 @@ fn stop_confirmed_gone(outcome: daemon_control::KillOutcome) -> bool {
             | daemon_control::KillOutcome::TermExited
             | daemon_control::KillOutcome::KilledExited
     )
+}
+
+fn require_stop_confirmed(outcome: daemon_control::KillOutcome) -> Result<()> {
+    if stop_confirmed_gone(outcome) {
+        Ok(())
+    } else {
+        anyhow::bail!("could not confirm that the Astrid daemon stopped")
+    }
 }
 
 /// Format seconds into a human-readable uptime string.
@@ -813,5 +840,52 @@ mod tests {
                 .to_string()
                 .contains("daemon rejected status request: denied")
         );
+    }
+
+    #[test]
+    fn shutdown_connection_loss_requires_a_recorded_process_to_confirm() {
+        let lost = || astrid_uplink::KernelClientError::ConnectionLost {
+            topic: "astrid.v1.response.shutdown.test".to_string(),
+            source: astrid_uplink::socket_client::ReadError::ConnectionLost(anyhow::anyhow!(
+                "socket closed"
+            )),
+        };
+
+        let verified = Some((4242, Some(PathBuf::from("/usr/local/bin/astrid-daemon"))));
+        let legacy_pid_only = Some((4242, None));
+        assert!(recorded_identity_is_verifiable(verified.as_ref()));
+        assert!(!recorded_identity_is_verifiable(legacy_pid_only.as_ref()));
+
+        accept_shutdown_result(
+            Err(lost()),
+            recorded_identity_is_verifiable(verified.as_ref()),
+        )
+        .expect("a recorded process can be confirmed independently");
+        let error = accept_shutdown_result(
+            Err(lost()),
+            recorded_identity_is_verifiable(legacy_pid_only.as_ref()),
+        )
+        .expect_err("EOF with a legacy PID-only record is not proof of shutdown");
+        assert!(error.to_string().contains("connection lost"));
+    }
+
+    #[test]
+    fn unverified_or_still_alive_shutdown_is_not_success() {
+        for outcome in [
+            daemon_control::KillOutcome::Unverified(4242),
+            daemon_control::KillOutcome::StillAlive,
+        ] {
+            let error = require_stop_confirmed(outcome)
+                .expect_err("an unconfirmed process must keep stop failed");
+            assert!(error.to_string().contains("could not confirm"));
+        }
+    }
+
+    #[test]
+    fn shutdown_rejection_is_not_hidden_by_exit_confirmation() {
+        let error =
+            accept_shutdown_result(Ok(KernelResponse::Error("policy denied".to_string())), true)
+                .expect_err("an explicit rejection must remain an error");
+        assert!(error.to_string().contains("policy denied"));
     }
 }

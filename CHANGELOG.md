@@ -138,6 +138,12 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
 
 ### Fixed
 
+- **`astrid stop` confirms shutdown when the daemon closes before its reply is
+  delivered.** A connection loss is accepted only when the CLI captured the
+  daemon's recorded process identity and can confirm that exact process exited
+  (or terminate it through the existing identity-gated recovery path). EOF
+  without a recorded process remains an error.
+
 - **Invite commands accept every token the runtime can issue.** `invite redeem`
   and `invite revoke` now treat a leading hyphen in an opaque base64url token as
   token data instead of misparsing it as an unknown option.
