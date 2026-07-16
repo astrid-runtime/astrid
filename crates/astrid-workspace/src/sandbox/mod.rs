@@ -363,7 +363,7 @@ impl SandboxCommand {
                 }
             }
             for masked in &built_in_masks {
-                Self::push_mask_arg(&mut bwrap, &masked);
+                Self::push_mask_arg(&mut bwrap, masked);
             }
 
             // Caller-supplied masks (the CoW upper/work dirs). Same mechanism,
