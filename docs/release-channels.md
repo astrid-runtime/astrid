@@ -20,12 +20,27 @@ not currently cut a release or advance a channel merely because `main` moved.
 No channel pointer is published by this change. Before the first promotion,
 configure all three channel environments with a required human reviewer and
 disable administrator bypass. Keep the existing `release` environment equally
-protected, and enable GitHub immutable releases before publishing the first
-eligible build. The release workflow refuses an existing tag release, uploads
-all assets while the release is a draft, disables file overwrite, and publishes
-only after the complete signed asset set is present. The first eligible immutable release must contain the release
-manifest and channel-aware updater; earlier releases cannot be promoted into
-this contract.
+protected. Add `ASTRID_RELEASE_ADMIN_TOKEN` to the `release` environment using
+a fine-grained token scoped to this repository with Administration read/write;
+it is used only to inspect and enable the immutable-release setting. The
+workflow's scoped `GITHUB_TOKEN` retains ordinary Contents write access.
+
+Run **Bootstrap mutable Astrid channels** from `main` exactly once before the
+first release. It creates the three empty, published prerelease containers
+`channel-stable`, `channel-dev`, and `channel-nightly`, verifies that they remain
+mutable, and only then enables immutable releases for the repository. The
+workflow is idempotent after later promotions, but it fails closed if a channel
+container is missing after immutability has been enabled. Promotion never
+creates a channel container.
+
+The release workflow requires repository immutability, uploads all assets while
+the release is a draft, disables file overwrite, and publishes only after the
+complete signed asset set is present. A retry may resume only a complete,
+never-published draft whose exact inventory, manifest, source and WIT commits,
+checksums, and tag-bound Sigstore identities reauthenticate. Published,
+incomplete, duplicate, empty, or unexpected assets fail closed. The first
+eligible immutable release must contain the release manifest and channel-aware
+updater; earlier releases cannot be promoted into this contract.
 
 ## Signed contract
 
@@ -50,10 +65,14 @@ Renewal is a new promotion with a higher generation, even if it keeps the same
 release version.
 
 The promotion workflow retains each generation as one immutable history archive
-containing the pointer and bundle. A retry reuses and reauthenticates that exact
-archive, so interruption after history or current-bundle upload is recoverable.
-It publishes the current bundle before replacing the current pointer, so a
-reader racing publication fails closed rather than accepting unsigned bytes.
+containing the pointer and bundle. It validates GitHub's paginated asset state,
+removes interrupted non-uploaded asset records, rejects duplicate or empty
+uploaded assets, and byte-compares a newly uploaded or reused history archive
+before replacing the current files. A retry reuses and reauthenticates that
+exact archive, so interruption after history or current-bundle upload is
+recoverable. It snapshots and rechecks both current files before publication,
+then publishes the bundle before replacing the pointer, so a reader racing
+publication fails closed rather than accepting unsigned bytes.
 
 ## Client behavior
 

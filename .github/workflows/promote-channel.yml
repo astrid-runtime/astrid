@@ -114,6 +114,9 @@ jobs:
             exit 1
           }
           [[ "$SOURCE_COMMIT" == "$TAG_COMMIT" ]]
+          gh api "repos/$GITHUB_REPOSITORY/releases/tags/$RELEASE_TAG" \
+            --jq 'select(.draft == false and .immutable == true) | true' \
+            | grep -Fx true
           gh release view "$RELEASE_TAG" \
             --repo "$GITHUB_REPOSITORY" \
             --json assets,isDraft,isPrerelease > release.json
@@ -217,6 +220,7 @@ jobs:
           HISTORY_ARCHIVE="channel-${CHANNEL}-${GENERATION}.tar.gz"
           CURRENT=0
           CURRENT_PRESENT=0
+          CURRENT_BUNDLE_PRESENT=0
           HISTORY_EXISTS=0
           echo "HISTORY_ARCHIVE=$HISTORY_ARCHIVE" >> "$GITHUB_ENV"
           extract_history() {
@@ -239,6 +243,7 @@ jobs:
           authenticate_current_history() {
             local generation=$1
             local destination=$2
+            local compare_bundle=$3
             local archive="channel-${CHANNEL}-${generation}.tar.gz"
             grep -Fx "$archive" <<< "$ASSETS" >/dev/null || return 1
             mkdir "$destination" || return 1
@@ -257,17 +262,39 @@ jobs:
               --expected-channel "$CHANNEL" \
               --generation "$generation" \
               "$destination/channel.toml" || return 1
-            cmp -s current-channel/channel.toml "$destination/channel.toml"
+            cmp -s current-channel/channel.toml "$destination/channel.toml" || return 1
+            if [[ "$compare_bundle" == 1 ]]; then
+              cmp -s current-channel/channel.toml.sigstore.json \
+                "$destination/channel.toml.sigstore.json"
+            fi
           }
           if gh release view "$CHANNEL_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            ASSETS=$(gh release view "$CHANNEL_TAG" \
-              --repo "$GITHUB_REPOSITORY" \
-              --json assets \
-              --jq '.assets[].name')
-            HISTORY_GENERATIONS=$(printf '%s\n' "$ASSETS" | sed -nE "s/^channel-${CHANNEL}-([1-9][0-9]{0,18})\\.tar\\.gz$/\\1/p")
-            HISTORY_FLOOR=0
-            if [[ -n "$HISTORY_GENERATIONS" ]]; then
-              HISTORY_FLOOR=$(printf '%s\n' "$HISTORY_GENERATIONS" | sort -n | tail -n1)
+            gh api "repos/$GITHUB_REPOSITORY/releases/tags/$CHANNEL_TAG" \
+              --jq 'select(.draft == false and .prerelease == true and .immutable == false) | true' \
+              | grep -Fx true
+            RELEASE_ID=$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$CHANNEL_TAG" --jq .id)
+            ASSET_RESPONSE="$RUNNER_TEMP/channel-assets.json"
+            ASSET_PLAN="$RUNNER_TEMP/channel-publication-plan.json"
+            load_asset_plan() {
+              gh api "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID/assets?per_page=100" \
+                --paginate --slurp > "$ASSET_RESPONSE"
+              python3 scripts/channel_publication.py \
+                --channel "$CHANNEL" \
+                --generation "$GENERATION" \
+                --assets "$ASSET_RESPONSE" > "$ASSET_PLAN"
+            }
+            load_asset_plan
+            mapfile -t cleanup_asset_ids < <(jq -r '."cleanup-asset-ids"[]' "$ASSET_PLAN")
+            for asset_id in "${cleanup_asset_ids[@]}"; do
+              gh api --method DELETE \
+                "repos/$GITHUB_REPOSITORY/releases/assets/$asset_id"
+            done
+            if (( ${#cleanup_asset_ids[@]} > 0 )); then
+              load_asset_plan
+            fi
+            ASSETS=$(jq -r '."uploaded-names"[]' "$ASSET_PLAN")
+            HISTORY_FLOOR=$(jq -er '."history-floor"' "$ASSET_PLAN")
+            if [[ "$HISTORY_FLOOR" != 0 ]]; then
               FLOOR_ARCHIVE="channel-${CHANNEL}-${HISTORY_FLOOR}.tar.gz"
               mkdir history-floor history-floor-pair
               gh release download "$CHANNEL_TAG" \
@@ -287,18 +314,19 @@ jobs:
                 history-floor-pair/channel.toml
             fi
             mkdir current-channel
-            if grep -Fx channel.toml <<< "$ASSETS"; then
+            if [[ "$(jq -er '."current-bundle-present"' "$ASSET_PLAN")" == true ]]; then
+              CURRENT_BUNDLE_PRESENT=1
+              gh release download "$CHANNEL_TAG" \
+                --repo "$GITHUB_REPOSITORY" \
+                --dir current-channel \
+                --pattern channel.toml.sigstore.json
+            fi
+            if [[ "$(jq -er '."current-pointer-present"' "$ASSET_PLAN")" == true ]]; then
               CURRENT_PRESENT=1
               gh release download "$CHANNEL_TAG" \
                 --repo "$GITHUB_REPOSITORY" \
                 --dir current-channel \
                 --pattern channel.toml
-              if grep -Fx channel.toml.sigstore.json <<< "$ASSETS"; then
-                gh release download "$CHANNEL_TAG" \
-                  --repo "$GITHUB_REPOSITORY" \
-                  --dir current-channel \
-                  --pattern channel.toml.sigstore.json
-              fi
               if CURRENT_CANDIDATE=$(python3 - current-channel/channel.toml "$CHANNEL" <<'PY'
           import sys
           import tomllib
@@ -327,13 +355,14 @@ jobs:
                     --expected-channel "$CHANNEL" \
                     --generation "$CURRENT" \
                     current-channel/channel.toml
-                  authenticate_current_history "$CURRENT" verified-current-history
-                elif authenticate_current_history "$CURRENT" recovered-current; then
-                  # Bundle-first current-pointer replacement can be interrupted.
-                  # Recover the pointer's matching bundle from its atomic history
-                  # archive instead of deadlocking every later promotion.
-                  cp recovered-current/channel.toml.sigstore.json \
-                    current-channel/channel.toml.sigstore.json
+                  authenticate_current_history "$CURRENT" verified-current-history 1 || {
+                    echo "authenticated current pointer diverges from its immutable history" >&2
+                    exit 1
+                  }
+                elif authenticate_current_history "$CURRENT" recovered-current 0; then
+                  # Signed history establishes continuity; current-channel
+                  # remains the byte-for-byte race snapshot of the remote state.
+                  :
                 else
                   # Keep the observed bytes for the pre-publish race check, but
                   # derive continuity only from authenticated history.
@@ -345,7 +374,7 @@ jobs:
               fi
             fi
 
-            if grep -Fx "$HISTORY_ARCHIVE" <<< "$ASSETS"; then
+            if [[ "$(jq -er '."requested-history-present"' "$ASSET_PLAN")" == true ]]; then
               mkdir requested-history
               gh release download "$CHANNEL_TAG" \
                 --repo "$GITHUB_REPOSITORY" \
@@ -365,14 +394,15 @@ jobs:
                 requested-history/channel.toml
               cp requested-history/channel.toml channel.toml
               cp requested-history/channel.toml.sigstore.json channel.toml.sigstore.json
+              cp "requested-history/$HISTORY_ARCHIVE" "$HISTORY_ARCHIVE"
               HISTORY_EXISTS=1
               echo "REUSE_HISTORY=1" >> "$GITHUB_ENV"
             else
               echo "REUSE_HISTORY=0" >> "$GITHUB_ENV"
             fi
           else
-            [[ "$GENERATION" == 1 ]]
-            echo "REUSE_HISTORY=0" >> "$GITHUB_ENV"
+            echo "$CHANNEL_TAG is missing; run the protected channel bootstrap before promotion" >&2
+            exit 1
           fi
           [[ "$GENERATION" -ge "$CURRENT" ]]
           [[ "$GENERATION" -ge "${HISTORY_FLOOR:-0}" ]]
@@ -385,8 +415,10 @@ jobs:
           fi
           {
             echo "HISTORY_EXISTS=$HISTORY_EXISTS"
+            echo "HISTORY_FLOOR=${HISTORY_FLOOR:-0}"
             echo "EXPECTED_CURRENT=$CURRENT"
             echo "CURRENT_PRESENT=$CURRENT_PRESENT"
+            echo "CURRENT_BUNDLE_PRESENT=$CURRENT_BUNDLE_PRESENT"
           } >> "$GITHUB_ENV"
       - name: Render and authenticate new channel pointer
         env:
@@ -440,14 +472,29 @@ jobs:
           GENERATION: ${{ inputs.generation }}
         run: |
           CHANNEL_TAG="channel-${CHANNEL}"
-          if ! gh release view "$CHANNEL_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            gh release create "$CHANNEL_TAG" \
-              --repo "$GITHUB_REPOSITORY" \
-              --target main \
-              --prerelease \
-              --title "Astrid ${CHANNEL} channel" \
-              --notes "Signed mutable channel pointer; immutable generations are retained as assets."
-          fi
+          gh api "repos/$GITHUB_REPOSITORY/releases/tags/$CHANNEL_TAG" \
+            --jq 'select(.draft == false and .prerelease == true and .immutable == false) | true' \
+            | grep -Fx true
+          RELEASE_ID=$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$CHANNEL_TAG" --jq .id)
+          ASSET_RESPONSE="$RUNNER_TEMP/prepublish-channel-assets.json"
+          ASSET_PLAN="$RUNNER_TEMP/prepublish-channel-plan.json"
+          gh api "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID/assets?per_page=100" \
+            --paginate --slurp > "$ASSET_RESPONSE"
+          python3 scripts/channel_publication.py \
+            --channel "$CHANNEL" \
+            --generation "$GENERATION" \
+            --assets "$ASSET_RESPONSE" > "$ASSET_PLAN"
+          EXPECTED_POINTER_PRESENT=false
+          EXPECTED_BUNDLE_PRESENT=false
+          EXPECTED_HISTORY_PRESENT=false
+          [[ "$CURRENT_PRESENT" == 1 ]] && EXPECTED_POINTER_PRESENT=true
+          [[ "$CURRENT_BUNDLE_PRESENT" == 1 ]] && EXPECTED_BUNDLE_PRESENT=true
+          [[ "$HISTORY_EXISTS" == 1 ]] && EXPECTED_HISTORY_PRESENT=true
+          [[ "$(jq -er '."cleanup-asset-ids" | length' "$ASSET_PLAN")" == 0 ]]
+          [[ "$(jq -er '."history-floor"' "$ASSET_PLAN")" == "$HISTORY_FLOOR" ]]
+          [[ "$(jq -er '."current-pointer-present"' "$ASSET_PLAN")" == "$EXPECTED_POINTER_PRESENT" ]]
+          [[ "$(jq -er '."current-bundle-present"' "$ASSET_PLAN")" == "$EXPECTED_BUNDLE_PRESENT" ]]
+          [[ "$(jq -er '."requested-history-present"' "$ASSET_PLAN")" == "$EXPECTED_HISTORY_PRESENT" ]]
           mkdir prepublish-current
           if [[ "$CURRENT_PRESENT" == 1 ]]; then
             gh release download "$CHANNEL_TAG" \
@@ -455,20 +502,36 @@ jobs:
               --dir prepublish-current \
               --pattern channel.toml
             cmp -s current-channel/channel.toml prepublish-current/channel.toml
-          else
-            if gh release view "$CHANNEL_TAG" \
+          fi
+          if [[ "$CURRENT_BUNDLE_PRESENT" == 1 ]]; then
+            gh release download "$CHANNEL_TAG" \
               --repo "$GITHUB_REPOSITORY" \
-              --json assets \
-              --jq '.assets[].name' | grep -Fx channel.toml; then
-              echo "channel pointer changed after authentication" >&2
-              exit 1
-            fi
+              --dir prepublish-current \
+              --pattern channel.toml.sigstore.json
+            cmp -s current-channel/channel.toml.sigstore.json \
+              prepublish-current/channel.toml.sigstore.json
+          fi
+          if [[ "$HISTORY_FLOOR" != 0 ]]; then
+            FLOOR_ARCHIVE="channel-${CHANNEL}-${HISTORY_FLOOR}.tar.gz"
+            mkdir prepublish-floor
+            gh release download "$CHANNEL_TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --dir prepublish-floor \
+              --pattern "$FLOOR_ARCHIVE"
+            cmp -s "history-floor/$FLOOR_ARCHIVE" \
+              "prepublish-floor/$FLOOR_ARCHIVE"
           fi
           if [[ "$HISTORY_EXISTS" != 1 ]]; then
             gh release upload "$CHANNEL_TAG" \
               --repo "$GITHUB_REPOSITORY" \
               "$HISTORY_ARCHIVE"
           fi
+          mkdir published-history
+          gh release download "$CHANNEL_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --dir published-history \
+            --pattern "$HISTORY_ARCHIVE"
+          cmp -s "$HISTORY_ARCHIVE" "published-history/$HISTORY_ARCHIVE"
           # Publish the bundle first. A reader racing the two replacements
           # fails closed until the matching signed pointer is available.
           gh release upload "$CHANNEL_TAG" \
@@ -477,6 +540,14 @@ jobs:
           gh release upload "$CHANNEL_TAG" \
             --repo "$GITHUB_REPOSITORY" \
             --clobber channel.toml
+          mkdir published-current
+          gh release download "$CHANNEL_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --dir published-current \
+            --pattern channel.toml \
+            --pattern channel.toml.sigstore.json
+          cmp -s channel.toml published-current/channel.toml
+          cmp -s channel.toml.sigstore.json published-current/channel.toml.sigstore.json
       - name: Notify Homebrew tap after stable promotion
         if: inputs.channel == 'stable'
         env:

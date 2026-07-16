@@ -1,0 +1,88 @@
+name: Bootstrap mutable Astrid channels
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: astrid-channel-bootstrap
+  cancel-in-progress: false
+
+jobs:
+  bootstrap:
+    name: Create channel containers then enable immutable releases
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment: release
+    steps:
+      - uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
+        with:
+          egress-policy: audit
+      - name: Establish mutable channels before repository immutability
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_ADMIN_TOKEN: ${{ secrets.ASTRID_RELEASE_ADMIN_TOKEN }}
+        run: |
+          [[ -n "$GH_ADMIN_TOKEN" ]]
+          setting_error="$RUNNER_TEMP/immutable-release-setting-error"
+          if GH_TOKEN="$GH_ADMIN_TOKEN" gh api \
+            "repos/$GITHUB_REPOSITORY/immutable-releases" \
+            >/dev/null 2>"$setting_error"; then
+            immutable_enabled=1
+          elif grep -Eq 'HTTP 404|Not Found' "$setting_error"; then
+            immutable_enabled=0
+          else
+            cat "$setting_error" >&2
+            exit 1
+          fi
+
+          for channel in stable dev nightly; do
+            tag="channel-${channel}"
+            release_error="$RUNNER_TEMP/${tag}-error"
+            if gh api "repos/$GITHUB_REPOSITORY/releases/tags/$tag" \
+              > "$RUNNER_TEMP/${tag}.json" 2>"$release_error"; then
+              :
+            elif grep -Eq 'HTTP 404|Not Found' "$release_error"; then
+              [[ "$immutable_enabled" == 0 ]] || {
+                echo "$tag is missing after immutable releases were enabled" >&2
+                exit 1
+              }
+              gh release create "$tag" \
+                --repo "$GITHUB_REPOSITORY" \
+                --target main \
+                --prerelease \
+                --title "Astrid ${channel} channel" \
+                --notes "Signed mutable channel pointer; immutable generations are retained as assets."
+              gh api "repos/$GITHUB_REPOSITORY/releases/tags/$tag" \
+                > "$RUNNER_TEMP/${tag}.json"
+            else
+              cat "$release_error" >&2
+              exit 1
+            fi
+            jq -e '.draft == false and .prerelease == true and .immutable == false' \
+              "$RUNNER_TEMP/${tag}.json" >/dev/null || {
+              echo "$tag is not a published mutable channel container" >&2
+              exit 1
+            }
+            if [[ "$immutable_enabled" == 0 ]]; then
+              jq -e '(.assets | length) == 0' "$RUNNER_TEMP/${tag}.json" >/dev/null || {
+                echo "$tag must be empty before immutable releases are enabled" >&2
+                exit 1
+              }
+            fi
+          done
+
+          if [[ "$immutable_enabled" == 0 ]]; then
+            GH_TOKEN="$GH_ADMIN_TOKEN" gh api --method PUT \
+              "repos/$GITHUB_REPOSITORY/immutable-releases"
+          fi
+          GH_TOKEN="$GH_ADMIN_TOKEN" gh api \
+            "repos/$GITHUB_REPOSITORY/immutable-releases" \
+            --jq 'select(.enabled == true) | true' | grep -Fx true
+          for channel in stable dev nightly; do
+            gh api "repos/$GITHUB_REPOSITORY/releases/tags/channel-${channel}" \
+              --jq 'select(.draft == false and .prerelease == true and .immutable == false) | true' \
+              | grep -Fx true
+          done

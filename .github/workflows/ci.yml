@@ -7,8 +7,12 @@ on:
       - '**.rs'
       - 'scripts/release_manifest.py'
       - 'scripts/test_release_manifest.py'
+      - 'scripts/release_publication.py'
+      - 'scripts/test_release_publication.py'
       - 'scripts/channel_metadata.py'
       - 'scripts/test_channel_metadata.py'
+      - 'scripts/channel_publication.py'
+      - 'scripts/test_channel_publication.py'
       - 'scripts/test_channel_workflow_contract.sh'
       - '**/Cargo.toml'
       - '**/Cargo.lock'
@@ -19,8 +23,12 @@ on:
       - '**.rs'
       - 'scripts/release_manifest.py'
       - 'scripts/test_release_manifest.py'
+      - 'scripts/release_publication.py'
+      - 'scripts/test_release_publication.py'
       - 'scripts/channel_metadata.py'
       - 'scripts/test_channel_metadata.py'
+      - 'scripts/channel_publication.py'
+      - 'scripts/test_channel_publication.py'
       - 'scripts/test_channel_workflow_contract.sh'
       - '**/Cargo.toml'
       - '**/Cargo.lock'
@@ -68,7 +76,9 @@ jobs:
       - name: Test release manifest contract
         run: |
           python3 scripts/test_release_manifest.py
+          python3 scripts/test_release_publication.py
           python3 scripts/test_channel_metadata.py
+          python3 scripts/test_channel_publication.py
           bash scripts/test_channel_workflow_contract.sh
 
   wasm-portability:
