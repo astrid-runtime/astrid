@@ -148,6 +148,11 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
 
 ### Fixed
 
+- **Offline init no longer performs the cached release check.** `astrid init
+  --offline` and `astrid distro apply --offline` skip update discovery before
+  command dispatch, so their no-network contract covers the complete CLI
+  invocation rather than only distro and capsule resolution.
+
 - **Invite commands accept every token the runtime can issue.** `invite redeem`
   and `invite revoke` now treat a leading hyphen in an opaque base64url token as
   token data instead of misparsing it as an unknown option.
