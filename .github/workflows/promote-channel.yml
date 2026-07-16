@@ -1,0 +1,488 @@
+name: Promote Astrid channel
+
+on:
+  workflow_dispatch:
+    inputs:
+      channel:
+        description: Signed update channel to advance
+        required: true
+        type: choice
+        options: [stable, dev, nightly]
+      release_tag:
+        description: Existing immutable Astrid release tag (vX.Y.Z)
+        required: true
+        type: string
+      generation:
+        description: New monotonically increasing channel generation
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: astrid-channel-${{ inputs.channel }}
+  cancel-in-progress: false
+
+jobs:
+  promote:
+    name: Authenticate release and publish signed pointer
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment:
+      name: astrid-channel-${{ inputs.channel }}
+    permissions:
+      contents: write
+      id-token: write
+    steps:
+      - uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.12'
+      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+      - name: Install pinned b3sum
+        run: cargo install b3sum --version 1.8.5 --locked
+      - name: Validate promotion inputs
+        env:
+          CHANNEL: ${{ inputs.channel }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          GENERATION: ${{ inputs.generation }}
+        run: |
+          [[ "$CHANNEL" =~ ^(stable|dev|nightly)$ ]]
+          python3 - "$RELEASE_TAG" "$CHANNEL" "$GENERATION" <<'PY'
+          import sys
+
+          sys.path.insert(0, "scripts")
+          import release_manifest
+
+          tag, channel, value = sys.argv[1:]
+          if not tag.startswith("v"):
+              raise SystemExit("release tag must be canonical v<semver>")
+          version = release_manifest.canonical_version(tag[1:])
+          if tag != f"v{version}":
+              raise SystemExit("release tag must be canonical v<semver>")
+          if channel == "stable" and "-" in version.split("+", 1)[0]:
+              raise SystemExit("stable cannot point to a semantic prerelease")
+          if not value.isascii() or not value.isdecimal() or value.startswith("0"):
+              raise SystemExit("generation must be a canonical positive decimal integer")
+          generation = int(value)
+          if not 1 <= generation <= (1 << 63) - 1:
+              raise SystemExit("generation must fit a positive signed 64-bit integer")
+          PY
+      - name: Download and authenticate immutable release metadata
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CHANNEL: ${{ inputs.channel }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+        run: |
+          VERSION="${RELEASE_TAG#v}"
+          RELEASE_METADATA="astrid-${VERSION}-release.toml"
+          gh release download "$RELEASE_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --pattern "$RELEASE_METADATA" \
+            --pattern "$RELEASE_METADATA.sigstore.json"
+          IDENTITY="https://github.com/astrid-runtime/astrid/.github/workflows/release.yml@refs/tags/${RELEASE_TAG}"
+          cosign verify-blob \
+            --bundle "$RELEASE_METADATA.sigstore.json" \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+            --certificate-identity "$IDENTITY" \
+            --use-signed-timestamps \
+            "$RELEASE_METADATA"
+          python3 scripts/release_manifest.py validate "$RELEASE_METADATA"
+          SOURCE_COMMIT=$(python3 - "$RELEASE_METADATA" <<'PY'
+          import sys
+          import tomllib
+
+          with open(sys.argv[1], "rb") as file:
+              print(tomllib.load(file)["source-commit"])
+          PY
+          )
+          TAG_OBJECT=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$RELEASE_TAG")
+          TAG_TYPE=$(jq -er .object.type <<< "$TAG_OBJECT")
+          TAG_COMMIT=$(jq -er .object.sha <<< "$TAG_OBJECT")
+          for _ in {1..8}; do
+            [[ "$TAG_TYPE" == tag ]] || break
+            TAG_OBJECT=$(gh api "repos/$GITHUB_REPOSITORY/git/tags/$TAG_COMMIT")
+            TAG_TYPE=$(jq -er .object.type <<< "$TAG_OBJECT")
+            TAG_COMMIT=$(jq -er .object.sha <<< "$TAG_OBJECT")
+          done
+          [[ "$TAG_TYPE" == commit ]] || {
+            echo "release tag does not peel to a commit" >&2
+            exit 1
+          }
+          [[ "$SOURCE_COMMIT" == "$TAG_COMMIT" ]]
+          gh release view "$RELEASE_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --json assets,isDraft,isPrerelease > release.json
+          python3 - "$RELEASE_METADATA" release.json <<'PY'
+          import json
+          import sys
+          import tomllib
+
+          with open(sys.argv[1], "rb") as file:
+              metadata = tomllib.load(file)
+          with open(sys.argv[2], encoding="utf-8") as file:
+              release = json.load(file)
+          if release["isDraft"]:
+              raise SystemExit("draft releases cannot be promoted")
+          names = [asset["name"] for asset in release["assets"]]
+          required = {
+              sys.argv[1],
+              f"{sys.argv[1]}.sigstore.json",
+              "BLAKE3SUMS.txt",
+              "BLAKE3SUMS.txt.sigstore.json",
+              "SHA256SUMS.txt",
+              "SHA256SUMS.txt.sigstore.json",
+          }
+          for target in metadata["targets"]:
+              required.add(target["asset"])
+              required.add(target["sigstore-bundle"])
+          missing = required - set(names)
+          duplicate = sorted(name for name in required if names.count(name) != 1)
+          if missing or duplicate:
+              raise SystemExit(
+                  f"release asset set is incomplete: missing={sorted(missing)}, non-unique={duplicate}"
+              )
+          PY
+          if [[ "$CHANNEL" == stable ]]; then
+            python3 - release.json <<'PY'
+          import json
+          import sys
+
+          with open(sys.argv[1], encoding="utf-8") as file:
+              release = json.load(file)
+          if release["isPrerelease"]:
+              raise SystemExit("stable cannot point to a prerelease")
+          PY
+          fi
+          mkdir release-assets
+          gh release download "$RELEASE_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --dir release-assets \
+            --pattern 'astrid-*.tar.gz' \
+            --pattern 'astrid-*.tar.gz.sigstore.json' \
+            --pattern BLAKE3SUMS.txt \
+            --pattern BLAKE3SUMS.txt.sigstore.json \
+            --pattern SHA256SUMS.txt \
+            --pattern SHA256SUMS.txt.sigstore.json
+          cp "$RELEASE_METADATA" release-assets/
+          python3 scripts/release_manifest.py validate \
+            "release-assets/$RELEASE_METADATA" \
+            --artifacts release-assets \
+            --verify-artifacts \
+            --require-bundles
+          python3 - "$RELEASE_METADATA" <<'PY' > archive-assets.txt
+          import sys
+          import tomllib
+
+          with open(sys.argv[1], "rb") as file:
+              for target in tomllib.load(file)["targets"]:
+                  print(target["asset"])
+          PY
+          while IFS= read -r archive; do
+            cosign verify-blob \
+              --bundle "release-assets/${archive}.sigstore.json" \
+              --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+              --certificate-identity "$IDENTITY" \
+              --use-signed-timestamps \
+              "release-assets/$archive"
+          done < archive-assets.txt
+          for checksums in BLAKE3SUMS.txt SHA256SUMS.txt; do
+            cosign verify-blob \
+              --bundle "release-assets/${checksums}.sigstore.json" \
+              --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+              --certificate-identity "$IDENTITY" \
+              --use-signed-timestamps \
+              "release-assets/$checksums"
+          done
+          python3 scripts/release_manifest.py validate-checksums \
+            "$RELEASE_METADATA" release-assets/BLAKE3SUMS.txt \
+            --algorithm blake3
+          python3 scripts/release_manifest.py validate-checksums \
+            "$RELEASE_METADATA" release-assets/SHA256SUMS.txt \
+            --algorithm sha256
+          echo "RELEASE_METADATA=$RELEASE_METADATA" >> "$GITHUB_ENV"
+      - name: Authenticate current channel generation
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CHANNEL: ${{ inputs.channel }}
+          GENERATION: ${{ inputs.generation }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+        run: |
+          CHANNEL_TAG="channel-${CHANNEL}"
+          IDENTITY="https://github.com/astrid-runtime/astrid/.github/workflows/promote-channel.yml@refs/heads/main"
+          HISTORY_ARCHIVE="channel-${CHANNEL}-${GENERATION}.tar.gz"
+          CURRENT=0
+          CURRENT_PRESENT=0
+          HISTORY_EXISTS=0
+          echo "HISTORY_ARCHIVE=$HISTORY_ARCHIVE" >> "$GITHUB_ENV"
+          extract_history() {
+            python3 - "$1" "$2" <<'PY'
+          import pathlib
+          import sys
+          import tarfile
+
+          destination = pathlib.Path(sys.argv[2])
+          with tarfile.open(sys.argv[1], "r:gz") as archive:
+              members = archive.getmembers()
+              if sorted(member.name for member in members) != [
+                  "channel.toml",
+                  "channel.toml.sigstore.json",
+              ] or any(not member.isfile() for member in members):
+                  raise SystemExit("history archive must contain exactly two regular files")
+              archive.extractall(destination, filter="data")
+          PY
+          }
+          authenticate_current_history() {
+            local generation=$1
+            local destination=$2
+            local archive="channel-${CHANNEL}-${generation}.tar.gz"
+            grep -Fx "$archive" <<< "$ASSETS" >/dev/null || return 1
+            mkdir "$destination" || return 1
+            gh release download "$CHANNEL_TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --dir "$destination" \
+              --pattern "$archive" || return 1
+            extract_history "$destination/$archive" "$destination" || return 1
+            cosign verify-blob \
+              --bundle "$destination/channel.toml.sigstore.json" \
+              --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+              --certificate-identity "$IDENTITY" \
+              --use-signed-timestamps \
+              "$destination/channel.toml" || return 1
+            python3 scripts/channel_metadata.py validate \
+              --expected-channel "$CHANNEL" \
+              --generation "$generation" \
+              "$destination/channel.toml" || return 1
+            cmp -s current-channel/channel.toml "$destination/channel.toml"
+          }
+          if gh release view "$CHANNEL_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            ASSETS=$(gh release view "$CHANNEL_TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --json assets \
+              --jq '.assets[].name')
+            HISTORY_GENERATIONS=$(printf '%s\n' "$ASSETS" | sed -nE "s/^channel-${CHANNEL}-([1-9][0-9]{0,18})\\.tar\\.gz$/\\1/p")
+            HISTORY_FLOOR=0
+            if [[ -n "$HISTORY_GENERATIONS" ]]; then
+              HISTORY_FLOOR=$(printf '%s\n' "$HISTORY_GENERATIONS" | sort -n | tail -n1)
+              FLOOR_ARCHIVE="channel-${CHANNEL}-${HISTORY_FLOOR}.tar.gz"
+              mkdir history-floor history-floor-pair
+              gh release download "$CHANNEL_TAG" \
+                --repo "$GITHUB_REPOSITORY" \
+                --dir history-floor \
+                --pattern "$FLOOR_ARCHIVE"
+              extract_history "history-floor/$FLOOR_ARCHIVE" history-floor-pair
+              cosign verify-blob \
+                --bundle history-floor-pair/channel.toml.sigstore.json \
+                --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+                --certificate-identity "$IDENTITY" \
+                --use-signed-timestamps \
+                history-floor-pair/channel.toml
+              python3 scripts/channel_metadata.py validate \
+                --expected-channel "$CHANNEL" \
+                --generation "$HISTORY_FLOOR" \
+                history-floor-pair/channel.toml
+            fi
+            mkdir current-channel
+            if grep -Fx channel.toml <<< "$ASSETS"; then
+              CURRENT_PRESENT=1
+              gh release download "$CHANNEL_TAG" \
+                --repo "$GITHUB_REPOSITORY" \
+                --dir current-channel \
+                --pattern channel.toml
+              if grep -Fx channel.toml.sigstore.json <<< "$ASSETS"; then
+                gh release download "$CHANNEL_TAG" \
+                  --repo "$GITHUB_REPOSITORY" \
+                  --dir current-channel \
+                  --pattern channel.toml.sigstore.json
+              fi
+              if CURRENT_CANDIDATE=$(python3 - current-channel/channel.toml "$CHANNEL" <<'PY'
+          import sys
+          import tomllib
+
+          with open(sys.argv[1], "rb") as file:
+              metadata = tomllib.load(file)
+          generation = metadata.get("generation")
+          if (
+              type(generation) is not int
+              or not 1 <= generation <= (1 << 63) - 1
+              or metadata.get("channel") != sys.argv[2]
+          ):
+              raise SystemExit("current pointer cannot name a safe history asset")
+          print(generation)
+          PY
+              ); then
+                CURRENT=$CURRENT_CANDIDATE
+                if [[ -f current-channel/channel.toml.sigstore.json ]] \
+                  && cosign verify-blob \
+                    --bundle current-channel/channel.toml.sigstore.json \
+                    --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+                    --certificate-identity "$IDENTITY" \
+                    --use-signed-timestamps \
+                    current-channel/channel.toml; then
+                  python3 scripts/channel_metadata.py validate \
+                    --expected-channel "$CHANNEL" \
+                    --generation "$CURRENT" \
+                    current-channel/channel.toml
+                  authenticate_current_history "$CURRENT" verified-current-history
+                elif authenticate_current_history "$CURRENT" recovered-current; then
+                  # Bundle-first current-pointer replacement can be interrupted.
+                  # Recover the pointer's matching bundle from its atomic history
+                  # archive instead of deadlocking every later promotion.
+                  cp recovered-current/channel.toml.sigstore.json \
+                    current-channel/channel.toml.sigstore.json
+                else
+                  # Keep the observed bytes for the pre-publish race check, but
+                  # derive continuity only from authenticated history.
+                  CURRENT=0
+                  echo "current pointer is unauthenticated; continuity will use authenticated history" >&2
+                fi
+              else
+                echo "current pointer is malformed; continuity will use authenticated history" >&2
+              fi
+            fi
+
+            if grep -Fx "$HISTORY_ARCHIVE" <<< "$ASSETS"; then
+              mkdir requested-history
+              gh release download "$CHANNEL_TAG" \
+                --repo "$GITHUB_REPOSITORY" \
+                --dir requested-history \
+                --pattern "$HISTORY_ARCHIVE"
+              extract_history "requested-history/$HISTORY_ARCHIVE" requested-history
+              cosign verify-blob \
+                --bundle requested-history/channel.toml.sigstore.json \
+                --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+                --certificate-identity "$IDENTITY" \
+                --use-signed-timestamps \
+                requested-history/channel.toml
+              python3 scripts/channel_metadata.py validate \
+                --expected-channel "$CHANNEL" \
+                --generation "$GENERATION" \
+                --release-manifest "$RELEASE_METADATA" \
+                requested-history/channel.toml
+              cp requested-history/channel.toml channel.toml
+              cp requested-history/channel.toml.sigstore.json channel.toml.sigstore.json
+              HISTORY_EXISTS=1
+              echo "REUSE_HISTORY=1" >> "$GITHUB_ENV"
+            else
+              echo "REUSE_HISTORY=0" >> "$GITHUB_ENV"
+            fi
+          else
+            [[ "$GENERATION" == 1 ]]
+            echo "REUSE_HISTORY=0" >> "$GITHUB_ENV"
+          fi
+          [[ "$GENERATION" -ge "$CURRENT" ]]
+          [[ "$GENERATION" -ge "${HISTORY_FLOOR:-0}" ]]
+          [[ "$CURRENT" -le "${HISTORY_FLOOR:-0}" ]]
+          if [[ "${HISTORY_FLOOR:-0}" == 0 && "$HISTORY_EXISTS" != 1 ]]; then
+            [[ "$GENERATION" == 1 ]]
+          fi
+          if [[ "$GENERATION" == "$CURRENT" || "$GENERATION" == "${HISTORY_FLOOR:-0}" ]]; then
+            [[ "$HISTORY_EXISTS" == 1 ]]
+          fi
+          {
+            echo "HISTORY_EXISTS=$HISTORY_EXISTS"
+            echo "EXPECTED_CURRENT=$CURRENT"
+            echo "CURRENT_PRESENT=$CURRENT_PRESENT"
+          } >> "$GITHUB_ENV"
+      - name: Render and authenticate new channel pointer
+        env:
+          CHANNEL: ${{ inputs.channel }}
+          GENERATION: ${{ inputs.generation }}
+          COSIGN_YES: 'true'
+        run: |
+          if [[ "$REUSE_HISTORY" != 1 ]]; then
+            read -r PUBLISHED_AT EXPIRES_AT < <(python3 - "$CHANNEL" <<'PY'
+          import datetime
+          import sys
+
+          days = {"stable": 30, "dev": 7, "nightly": 2}[sys.argv[1]]
+          published = datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0)
+          expires = published + datetime.timedelta(days=days)
+          print(
+              published.strftime("%Y-%m-%dT%H:%M:%SZ"),
+              expires.strftime("%Y-%m-%dT%H:%M:%SZ"),
+          )
+          PY
+            )
+            python3 scripts/channel_metadata.py render \
+              --release-manifest "$RELEASE_METADATA" \
+              --channel "$CHANNEL" \
+              --generation "$GENERATION" \
+              --published-at "$PUBLISHED_AT" \
+              --expires-at "$EXPIRES_AT" \
+              --output channel.toml
+            cosign sign-blob --yes --bundle channel.toml.sigstore.json channel.toml
+          fi
+          IDENTITY="https://github.com/astrid-runtime/astrid/.github/workflows/promote-channel.yml@refs/heads/main"
+          cosign verify-blob \
+            --bundle channel.toml.sigstore.json \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+            --certificate-identity "$IDENTITY" \
+            --use-signed-timestamps \
+            channel.toml
+          python3 scripts/channel_metadata.py validate \
+            --expected-channel "$CHANNEL" \
+            --generation "$GENERATION" \
+            --release-manifest "$RELEASE_METADATA" \
+            --now "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" \
+            channel.toml
+          if [[ "$HISTORY_EXISTS" != 1 ]]; then
+            tar -czf "$HISTORY_ARCHIVE" channel.toml channel.toml.sigstore.json
+          fi
+      - name: Publish immutable history then current pointer
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CHANNEL: ${{ inputs.channel }}
+          GENERATION: ${{ inputs.generation }}
+        run: |
+          CHANNEL_TAG="channel-${CHANNEL}"
+          if ! gh release view "$CHANNEL_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release create "$CHANNEL_TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --target main \
+              --prerelease \
+              --title "Astrid ${CHANNEL} channel" \
+              --notes "Signed mutable channel pointer; immutable generations are retained as assets."
+          fi
+          mkdir prepublish-current
+          if [[ "$CURRENT_PRESENT" == 1 ]]; then
+            gh release download "$CHANNEL_TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --dir prepublish-current \
+              --pattern channel.toml
+            cmp -s current-channel/channel.toml prepublish-current/channel.toml
+          else
+            if gh release view "$CHANNEL_TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --json assets \
+              --jq '.assets[].name' | grep -Fx channel.toml; then
+              echo "channel pointer changed after authentication" >&2
+              exit 1
+            fi
+          fi
+          if [[ "$HISTORY_EXISTS" != 1 ]]; then
+            gh release upload "$CHANNEL_TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              "$HISTORY_ARCHIVE"
+          fi
+          # Publish the bundle first. A reader racing the two replacements
+          # fails closed until the matching signed pointer is available.
+          gh release upload "$CHANNEL_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --clobber channel.toml.sigstore.json
+          gh release upload "$CHANNEL_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --clobber channel.toml
+      - name: Notify Homebrew tap after stable promotion
+        if: inputs.channel == 'stable'
+        env:
+          GH_TOKEN: ${{ secrets.TAP_DISPATCH_TOKEN }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+        run: |
+          gh api repos/astrid-runtime/homebrew-tap/dispatches \
+            -f event_type=release \
+            -f "client_payload[version]=${RELEASE_TAG#v}"

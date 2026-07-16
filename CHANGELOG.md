@@ -11,6 +11,16 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
 
 ### Added
 
+- **Signed runtime release channels and immutable manifests.** Every release records the exact
+  runtime and WIT source commits, release-workflow identity, and all four platform archives with
+  their sizes, BLAKE3 digests, SHA-256 compatibility digests, and Sigstore bundle
+  names. Protected manual promotion advances signed, expiring `stable`, `dev`,
+  or `nightly` pointers only to those immutable releases. `astrid update`
+  authenticates the pointer, manifest, and archive; rejects generation rollback,
+  same-generation equivocation, expiry, digest drift, and workflow-identity
+  drift; and follows deliberate higher-generation rollbacks for self-managed
+  installations. No channel is promoted automatically by this change.
+
 - **Operators can enforce a distro for `astrid init`.**
   `ASTRID_ENFORCED_DISTRO` supplies the distro source and rejects CLI attempts
   to override it. Standalone `astrid init` requires an explicit `--distro`;

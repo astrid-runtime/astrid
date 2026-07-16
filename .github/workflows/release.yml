@@ -8,6 +8,10 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: astrid-release-${{ github.ref }}
+  cancel-in-progress: false
+
 env:
   CARGO_TERM_COLOR: always
 
@@ -115,6 +119,10 @@ jobs:
           fetch-depth: 0
           submodules: recursive
 
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.12'
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
         with:
@@ -203,8 +211,29 @@ jobs:
           cd artifacts
           b3sum -- ./*.tar.gz | sed 's#  \./#  #' > BLAKE3SUMS.txt
           sha256sum -- ./*.tar.gz | sed 's#  \./#  #' > SHA256SUMS.txt
+          b3sum --check BLAKE3SUMS.txt
+          sha256sum --check SHA256SUMS.txt
           cat BLAKE3SUMS.txt
           cat SHA256SUMS.txt
+
+      - name: Generate immutable release manifest
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          CARGO_VERSION=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n1)
+          test "$VERSION" = "$CARGO_VERSION"
+          SOURCE_COMMIT=$(git rev-parse "${GITHUB_REF_NAME}^{commit}")
+          CONTRACTS_COMMIT=$(git -C wit rev-parse HEAD)
+          python3 scripts/release_manifest.py generate \
+            --artifacts artifacts \
+            --version "$VERSION" \
+            --tag "$GITHUB_REF_NAME" \
+            --source-commit "$SOURCE_COMMIT" \
+            --contracts-commit "$CONTRACTS_COMMIT" \
+            --output "artifacts/astrid-${VERSION}-release.toml"
+          python3 scripts/release_manifest.py validate \
+            "artifacts/astrid-${VERSION}-release.toml" \
+            --artifacts artifacts \
+            --verify-artifacts
 
       - name: Attest release provenance
         uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
@@ -213,6 +242,7 @@ jobs:
             artifacts/*.tar.gz
             artifacts/BLAKE3SUMS.txt
             artifacts/SHA256SUMS.txt
+            artifacts/astrid-*-release.toml
 
       - name: Install cosign
         uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
@@ -222,7 +252,7 @@ jobs:
           COSIGN_YES: "true"
         run: |
           cd artifacts
-          for asset in *.tar.gz BLAKE3SUMS.txt SHA256SUMS.txt; do
+          for asset in *.tar.gz BLAKE3SUMS.txt SHA256SUMS.txt astrid-*-release.toml; do
             cosign sign-blob --yes --bundle "${asset}.sigstore.json" "$asset"
           done
 
@@ -231,7 +261,7 @@ jobs:
           cd artifacts
           IDENTITY="https://github.com/astrid-runtime/astrid/.github/workflows/release.yml@refs/tags/${GITHUB_REF_NAME}"
           ISSUER="https://token.actions.githubusercontent.com"
-          for asset in *.tar.gz BLAKE3SUMS.txt SHA256SUMS.txt; do
+          for asset in *.tar.gz BLAKE3SUMS.txt SHA256SUMS.txt astrid-*-release.toml; do
             cosign verify-blob \
               --bundle "${asset}.sigstore.json" \
               --certificate-identity "$IDENTITY" \
@@ -239,6 +269,12 @@ jobs:
               --use-signed-timestamps \
               "$asset"
           done
+          VERSION="${GITHUB_REF_NAME#v}"
+          python3 ../scripts/release_manifest.py validate \
+            "astrid-${VERSION}-release.toml" \
+            --artifacts . \
+            --verify-artifacts \
+            --require-bundles
 
       - name: Verify release archives with the native updater policy
         env:
@@ -252,20 +288,36 @@ jobs:
             commands::update_auth::tests::release_gate_authenticates_all_archives_with_production_policy \
             -- --ignored --exact
 
-      - name: Create release
+      - name: Refuse an existing release for this tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          existing=$(gh api "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
+            --paginate \
+            --slurp \
+            | jq -r --arg tag "$GITHUB_REF_NAME" '.[][] | select(.tag_name == $tag) | .id')
+          if [[ -n "$existing" ]]; then
+            echo "release $GITHUB_REF_NAME already exists; release assets are write-once" >&2
+            exit 1
+          fi
+
+      - name: Create draft release with write-once assets
         uses: softprops/action-gh-release@718ea10b132b3b2eba29c1007bb80653f286566b # v3.0.1
         with:
+          draft: true
+          overwrite_files: false
+          fail_on_unmatched_files: true
           files: |
             artifacts/*.tar.gz
             artifacts/BLAKE3SUMS.txt
             artifacts/SHA256SUMS.txt
+            artifacts/astrid-*-release.toml
             artifacts/*.sigstore.json
           body_path: release-notes.md
 
-      - name: Notify Homebrew tap
-        env:
-          GH_TOKEN: ${{ secrets.TAP_DISPATCH_TOKEN }}
-        run: |
-          gh api repos/astrid-runtime/homebrew-tap/dispatches \
-            -f event_type=release \
-            -f "client_payload[version]=${GITHUB_REF_NAME#v}"
+      - name: Publish completed immutable release
+        uses: softprops/action-gh-release@718ea10b132b3b2eba29c1007bb80653f286566b # v3.0.1
+        with:
+          draft: false
+          overwrite_files: false
+          body_path: release-notes.md

@@ -60,6 +60,18 @@ pub(super) fn integrity_manifest_download_error(error: &anyhow::Error) -> Update
 #[derive(Debug)]
 pub(super) struct PublisherAuthenticatedArchive(Vec<u8>);
 
+/// Metadata bytes authenticated for one hard-coded Astrid workflow identity.
+/// Construction remains private to this module so callers cannot supply a
+/// different repository, workflow, ref, or issuer.
+#[derive(Debug)]
+pub(super) struct PublisherAuthenticatedMetadata(Vec<u8>);
+
+impl PublisherAuthenticatedMetadata {
+    pub(super) fn into_bytes(self) -> Vec<u8> {
+        self.0
+    }
+}
+
 /// Archive bytes that also match their strict BLAKE3 release-manifest entry.
 /// Extraction accepts this type rather than unverified bytes.
 #[derive(Debug)]
@@ -77,6 +89,10 @@ fn release_identity(version: &str) -> String {
     format!(
         "https://github.com/astrid-runtime/astrid/.github/workflows/release.yml@refs/tags/v{version}"
     )
+}
+
+fn channel_identity() -> &'static str {
+    "https://github.com/astrid-runtime/astrid/.github/workflows/promote-channel.yml@refs/heads/main"
 }
 
 fn parse_bundle(bundle_json: &[u8]) -> anyhow::Result<Bundle> {
@@ -130,6 +146,24 @@ impl PublisherAuthenticator {
         })?;
         Ok(PublisherAuthenticatedArchive(archive))
     }
+
+    fn authenticate_metadata(
+        &self,
+        bytes: Vec<u8>,
+        bundle_json: &[u8],
+        identity: &str,
+    ) -> Result<PublisherAuthenticatedMetadata, UpdateStageError> {
+        let bundle = parse_publisher_bundle(bundle_json)?;
+        let policy = VerificationPolicy::default()
+            .require_identity(identity)
+            .require_issuer(GITHUB_ACTIONS_ISSUER);
+        verify(&bytes, &bundle, &policy, &self.root).map_err(|_| {
+            UpdateStageError::publisher(
+                "metadata signature or exact workflow identity did not verify",
+            )
+        })?;
+        Ok(PublisherAuthenticatedMetadata(bytes))
+    }
 }
 
 #[cfg(test)]
@@ -162,6 +196,40 @@ pub(super) async fn authenticate_archive(
         .authenticate(archive, bundle_json, version)
 }
 
+/// Authenticate a channel pointer only for Astrid's promotion workflow on
+/// `main`. The identity is not caller-configurable.
+pub(super) struct MetadataAuthenticator(PublisherAuthenticator);
+
+impl MetadataAuthenticator {
+    /// Refresh the public-good trust root once for all metadata in this update
+    /// resolution. Reusing that fresh root within one operation avoids a
+    /// second network refresh without admitting a stale/offline fallback.
+    pub(super) async fn production() -> Result<Self, UpdateStageError> {
+        PublisherAuthenticator::production().await.map(Self)
+    }
+
+    pub(super) fn authenticate_channel_pointer(
+        &self,
+        bytes: Vec<u8>,
+        bundle_json: &[u8],
+    ) -> Result<PublisherAuthenticatedMetadata, UpdateStageError> {
+        self.0
+            .authenticate_metadata(bytes, bundle_json, channel_identity())
+    }
+
+    /// Authenticate an immutable release manifest for the exact version tag.
+    /// The identity is derived from a canonical version, never from metadata.
+    pub(super) fn authenticate_release_manifest(
+        &self,
+        bytes: Vec<u8>,
+        bundle_json: &[u8],
+        version: &str,
+    ) -> Result<PublisherAuthenticatedMetadata, UpdateStageError> {
+        self.0
+            .authenticate_metadata(bytes, bundle_json, &release_identity(version))
+    }
+}
+
 /// Verify the authenticated archive against the one canonical BLAKE3 entry for
 /// `asset_name`. Manifest parsing is global: malformed or duplicate entries for
 /// another platform invalidate the release too.
@@ -169,6 +237,7 @@ pub(super) fn verify_integrity(
     archive: PublisherAuthenticatedArchive,
     sums_body: &str,
     asset_name: &str,
+    channel_blake3: Option<&str>,
 ) -> Result<IntegrityVerifiedArchive, UpdateStageError> {
     let mut expected = None;
     let mut seen_assets = HashSet::new();
@@ -218,6 +287,16 @@ pub(super) fn verify_integrity(
     let expected = expected.ok_or_else(|| {
         UpdateStageError::integrity(format!("no checksum for '{asset_name}' in BLAKE3SUMS.txt"))
     })?;
+    if let Some(channel_blake3) = channel_blake3 {
+        let channel_digest = blake3::Hash::from_hex(channel_blake3).map_err(|_| {
+            UpdateStageError::integrity("signed channel contains an invalid BLAKE3 digest")
+        })?;
+        if channel_digest != expected {
+            return Err(UpdateStageError::integrity(format!(
+                "BLAKE3SUMS.txt does not match the signed channel digest for '{asset_name}'"
+            )));
+        }
+    }
     let actual = blake3::hash(&archive.0);
     if actual != expected {
         return Err(UpdateStageError::integrity(format!(

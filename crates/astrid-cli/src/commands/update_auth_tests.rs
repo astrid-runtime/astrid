@@ -123,7 +123,7 @@ fn rejected_evidence_cannot_reach_filesystem_mutation() {
                 &fixture_root(),
             )?;
             let sums = format!("{digest}  archive.tar.gz\n");
-            let verified = verify_integrity(authenticated, &sums, "archive.tar.gz")?;
+            let verified = verify_integrity(authenticated, &sums, "archive.tar.gz", None)?;
             extract_verified_archive_with(verified, "archive.tar.gz", "archive", || {
                 tempfile::Builder::new()
                     .prefix("extraction-")
@@ -187,17 +187,30 @@ fn malformed_bundle_is_rejected() {
 }
 
 #[test]
+fn production_workflow_identities_are_exact() {
+    assert_eq!(
+        release_identity("1.2.3"),
+        "https://github.com/astrid-runtime/astrid/.github/workflows/release.yml@refs/tags/v1.2.3"
+    );
+    assert_eq!(
+        channel_identity(),
+        "https://github.com/astrid-runtime/astrid/.github/workflows/promote-channel.yml@refs/heads/main"
+    );
+}
+
+#[test]
 fn integrity_stage_is_strict_and_consumes_authenticated_bytes() {
     let asset = "astrid-1.0.0-x86_64-unknown-linux-gnu.tar.gz";
     let digest = blake3::hash(b"archive");
     let body = format!("{}  {asset}\n", digest.to_hex());
     let authenticated = PublisherAuthenticatedArchive(b"archive".to_vec());
-    let verified = verify_integrity(authenticated, &body, asset).expect("matching digest");
+    let verified = verify_integrity(authenticated, &body, asset, Some(&digest.to_hex()))
+        .expect("matching digest");
     assert_eq!(verified.as_bytes(), b"archive");
 
     let bad = PublisherAuthenticatedArchive(b"modified".to_vec());
     assert!(matches!(
-        verify_integrity(bad, &body, asset).unwrap_err(),
+        verify_integrity(bad, &body, asset, None).unwrap_err(),
         UpdateStageError::Integrity(_)
     ));
 }
@@ -211,7 +224,8 @@ fn integrity_manifest_rejects_noncanonical_and_duplicate_entries() {
         verify_integrity(
             PublisherAuthenticatedArchive(b"archive".to_vec()),
             &uppercase,
-            asset
+            asset,
+            None,
         )
         .unwrap_err(),
         UpdateStageError::Integrity(_)
@@ -222,7 +236,8 @@ fn integrity_manifest_rejects_noncanonical_and_duplicate_entries() {
         verify_integrity(
             PublisherAuthenticatedArchive(b"archive".to_vec()),
             &duplicate,
-            asset
+            asset,
+            None,
         )
         .unwrap_err(),
         UpdateStageError::Integrity(_)
@@ -233,6 +248,7 @@ fn integrity_manifest_rejects_noncanonical_and_duplicate_entries() {
         PublisherAuthenticatedArchive(b"archive".to_vec()),
         &overlong,
         asset,
+        None,
     )
     .unwrap_err();
     assert_eq!(
@@ -241,6 +257,22 @@ fn integrity_manifest_rejects_noncanonical_and_duplicate_entries() {
             "integrity check failed: BLAKE3SUMS.txt line 1 exceeds {MAX_MANIFEST_LINE_BYTES} byte limit"
         )
     );
+}
+
+#[test]
+fn integrity_manifest_must_match_the_signed_channel_digest() {
+    let asset = "astrid-1.0.0-x86_64-unknown-linux-gnu.tar.gz";
+    let digest = blake3::hash(b"archive");
+    let body = format!("{}  {asset}\n", digest.to_hex());
+    let wrong = blake3::hash(b"different").to_hex();
+    let error = verify_integrity(
+        PublisherAuthenticatedArchive(b"archive".to_vec()),
+        &body,
+        asset,
+        Some(&wrong),
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("signed channel digest"));
 }
 
 #[tokio::test]

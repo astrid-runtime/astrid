@@ -1,58 +1,46 @@
-//! Self-update command — download and install newer versions of the Astrid CLI.
+//! Signed-channel self-update and PATH setup for `astrid init`.
 //!
-//! Discovers the latest GitHub release for `astrid-runtime/astrid`, compares it
-//! to the running binary, and — for self-managed installs — verifies, stages,
-//! and atomically swaps the new binary IN PLACE with a backup for rollback.
-//! Installs owned by a package manager (Homebrew, `cargo install`) are deferred
-//! to that manager rather than shadowed with a second copy. The version CHECK,
-//! however, is method-independent: `astrid update --check` reports availability
-//! for every install method on both macOS and Linux, so the session-start nudge
-//! fires regardless of how Astrid was installed. The release source can be
-//! overridden (`--source owner/repo` / `ASTRID_UPDATE_REPO` / `ASTRID_UPDATE_API`)
-//! so metadata and downloads can be rehearsed against a mirror or local mock.
-//! Publisher authentication remains pinned to Astrid's release workflow.
-//!
-//! Also provides PATH setup helpers for `astrid init`.
+//! Stable is the default; dev/nightly are explicit. Self-managed installs swap
+//! authenticated binaries in place with rollback backups. Homebrew and Cargo
+//! remain package-manager owned. Discovery can use a mirror or mock, but the
+//! accepted Astrid workflow identities and issuer cannot be overridden.
 
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, bail};
 
-use crate::cli::UpdateArgs;
+use crate::cli::{UpdateArgs, UpdateChannel};
 use crate::theme::Theme;
 
 use super::update_auth::{
     UpdateStageError, authenticate_archive, extract_verified_archive,
     integrity_manifest_download_error, publisher_bundle_download_error, verify_integrity,
 };
+use super::update_channel;
+
+#[path = "self_update_notice.rs"]
+mod notice;
+pub(crate) use notice::print_update_banner;
+use notice::{handle_managed_channel, write_cache};
 
 /// Default Astrid release repository. Discovery overrides never widen the
 /// authenticated publisher identity.
 const DEFAULT_ORG: &str = "astrid-runtime";
 const DEFAULT_REPO: &str = "astrid";
 
-/// Current binary version (set at compile time).
 const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
-
-/// TTL for cached update checks (24 hours).
 const CHECK_TTL_SECS: u64 = 86_400;
-
-/// Max size of a downloaded release archive.
 const MAX_ARCHIVE_BYTES: usize = 100 * 1024 * 1024;
-
-/// Separate caps keep metadata downloads far below the archive allowance.
-const MAX_RELEASE_METADATA_BYTES: usize = 2 * 1024 * 1024;
 const MAX_RELEASE_ASSETS: usize = 1_024;
 const MAX_BUNDLE_BYTES: usize = 256 * 1024;
 const MAX_MANIFEST_BYTES: usize = 256 * 1024;
 
-/// Binaries managed by an in-place update.
 const MANAGED_BINARIES: &[&str] = &["astrid", "astrid-daemon"];
 
 /// GitHub API base URL. `ASTRID_UPDATE_API` overrides it so the flow can be
 /// rehearsed against a local/staging mock server.
-fn api_base() -> String {
+pub(super) fn api_base() -> String {
     std::env::var("ASTRID_UPDATE_API").unwrap_or_else(|_| "https://api.github.com".to_string())
 }
 
@@ -181,11 +169,15 @@ impl InstallMethod {
     }
 
     /// The command a user runs to upgrade this install.
-    fn upgrade_command(self) -> &'static str {
+    fn upgrade_command(self, channel: UpdateChannel) -> &'static str {
         match self {
             Self::Homebrew => "brew upgrade astrid",
             Self::Cargo => "cargo install astrid --force",
-            Self::SelfManaged => "astrid update",
+            Self::SelfManaged => match channel {
+                UpdateChannel::Stable => "astrid update",
+                UpdateChannel::Dev => "astrid update --channel dev",
+                UpdateChannel::Nightly => "astrid update --channel nightly",
+            },
         }
     }
 
@@ -233,150 +225,35 @@ fn plan_update(
     current: &semver::Version,
     latest: &semver::Version,
     is_check: bool,
+    channel: UpdateChannel,
 ) -> UpdatePlan {
-    if latest <= current {
+    // A channel is authoritative in either direction. A deliberate rollback is
+    // published as a higher signed generation pointing at an older immutable
+    // release, so only exact version equality means no action.
+    if latest == current {
         return UpdatePlan::UpToDate;
     }
     // A `--check` always REPORTS, regardless of install method — the version
     // check is method-independent, and only reporting (not applying) is asked.
     if is_check {
         return UpdatePlan::Available {
-            how: method.upgrade_command(),
+            how: method.upgrade_command(channel),
         };
     }
     if method.manages_own_binary() {
         return UpdatePlan::DeferToManager {
             manager: method.label(),
-            how: method.upgrade_command(),
+            how: method.upgrade_command(channel),
         };
     }
     UpdatePlan::ApplyInPlace
 }
 
-/// Cached update check result.
-#[derive(serde::Serialize, serde::Deserialize)]
-struct UpdateCache {
-    checked_at: u64,
-    latest_version: String,
-}
-
-fn cache_path() -> anyhow::Result<PathBuf> {
-    let home = astrid_core::dirs::AstridHome::resolve()?;
-    Ok(home.var_dir().join("update-check.json"))
-}
-
-fn now_epoch() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs())
-}
-
-fn write_cache(version: &str) {
-    let cache = UpdateCache {
-        checked_at: now_epoch(),
-        latest_version: version.to_owned(),
-    };
-    if let Ok(path) = cache_path()
-        && let Ok(json) = serde_json::to_string(&cache)
-    {
-        let _ = std::fs::write(path, json);
-    }
-}
-
-/// Check for a newer version (cached, background-safe). Returns `Some(version)`
-/// if an update is available, `None` if up-to-date or the check failed.
-pub(crate) async fn check_for_update_cached() -> Option<String> {
-    let path = cache_path().ok()?;
-
-    if let Ok(data) = std::fs::read_to_string(&path)
-        && let Ok(cache) = serde_json::from_str::<UpdateCache>(&data)
-        && now_epoch().saturating_sub(cache.checked_at) < CHECK_TTL_SECS
-    {
-        let current = semver::Version::parse(CURRENT_VERSION).ok()?;
-        let latest = semver::Version::parse(&cache.latest_version).ok()?;
-        return (latest > current).then_some(cache.latest_version);
-    }
-
-    let (owner, repo) = resolve_repo(None).ok()?;
-    let client = reqwest::Client::builder()
-        .user_agent("astrid-cli")
-        .timeout(std::time::Duration::from_secs(5))
-        .build()
-        .ok()?;
-    let url = format!("{}/repos/{owner}/{repo}/releases/latest", api_base());
-    let body = download_bounded(
-        &client,
-        &url,
-        MAX_RELEASE_METADATA_BYTES,
-        "release metadata",
-    )
-    .await
-    .ok()?;
-    let json: serde_json::Value = serde_json::from_slice(&body).ok()?;
-    let tag = json.get("tag_name")?.as_str()?;
-    let version_str = canonical_release_version(tag).ok()?;
-    write_cache(&version_str);
-
-    let current = semver::Version::parse(CURRENT_VERSION).ok()?;
-    let latest = semver::Version::parse(&version_str).ok()?;
-    (latest > current).then_some(version_str)
-}
-
-/// Print an install-aware update banner if a newer version is available. The
-/// upgrade command matches the install method ([`InstallMethod::upgrade_command`]):
-/// Homebrew → `brew upgrade astrid`, cargo → `cargo install astrid --force`,
-/// self-managed → `astrid update`.
-pub(crate) async fn print_update_banner() {
-    let Some(latest) = check_for_update_cached().await else {
-        return;
-    };
-    let how = match running_binary() {
-        Ok(exe) => InstallMethod::detect(&exe).upgrade_command(),
-        Err(_) => "astrid update",
-    };
-    eprintln!(
-        "{}",
-        Theme::warning(&format!(
-            "Update available: v{CURRENT_VERSION} → v{latest}. Run `{how}` to upgrade."
-        ))
-    );
-}
-
-/// Fetch the latest release metadata `(version, json)` from the resolved repo.
-async fn fetch_latest_release(
-    client: &reqwest::Client,
-    owner: &str,
-    repo: &str,
-) -> anyhow::Result<(String, serde_json::Value)> {
-    let url = format!("{}/repos/{owner}/{repo}/releases/latest", api_base());
-    let body =
-        download_bounded(client, &url, MAX_RELEASE_METADATA_BYTES, "release metadata").await?;
-    let json: serde_json::Value =
-        serde_json::from_slice(&body).context("failed to parse release metadata")?;
-    let tag = json
-        .get("tag_name")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| anyhow::anyhow!("release has no tag_name"))?;
-    let version = canonical_release_version(tag)?;
-    Ok((version, json))
-}
-
-/// Parse the only tag form release authentication can bind to.
-fn canonical_release_version(tag: &str) -> anyhow::Result<String> {
-    let version = tag
-        .strip_prefix('v')
-        .ok_or_else(|| anyhow::anyhow!("release tag '{tag}' is not canonical v<semver>"))?;
-    let parsed = semver::Version::parse(version)
-        .with_context(|| format!("release tag '{tag}' is not valid semver"))?;
-    anyhow::ensure!(
-        tag == format!("v{parsed}"),
-        "release tag '{tag}' is not canonical v<semver>"
-    );
-    Ok(parsed.to_string())
-}
-
 /// Find exactly one release asset and return its browser download URL.
-fn exact_asset_url<'a>(release: &'a serde_json::Value, name: &str) -> anyhow::Result<&'a str> {
+pub(super) fn exact_asset_url<'a>(
+    release: &'a serde_json::Value,
+    name: &str,
+) -> anyhow::Result<&'a str> {
     let assets = release
         .get("assets")
         .and_then(serde_json::Value::as_array)
@@ -417,7 +294,7 @@ fn integrity_manifest_url(release: &serde_json::Value) -> Result<&str, UpdateSta
 }
 
 /// Stream a URL into memory under the size cap.
-async fn download_bounded(
+pub(super) async fn download_bounded(
     client: &reqwest::Client,
     url: &str,
     limit: usize,
@@ -561,7 +438,7 @@ fn confirm(prompt: &str, assume_yes: bool) -> anyhow::Result<bool> {
 }
 
 /// Run the self-update command — flag → stage → finish:
-/// check the latest release, (for self-managed installs) verify + atomically
+/// resolve the signed channel, (for self-managed installs) verify + atomically
 /// swap the binary in place with rollback, restart the daemon, then update
 /// capsules. Distro refresh requires explicit recorded source provenance and is
 /// deliberately skipped by this path. Homebrew installs are deferred to `brew upgrade`.
@@ -574,7 +451,8 @@ pub(crate) async fn run_self_update(args: UpdateArgs) -> anyhow::Result<()> {
     println!(
         "{}",
         Theme::info(&format!(
-            "Checking for updates (current: v{CURRENT_VERSION}, platform: {target}, source: {owner}/{repo})..."
+            "Checking the signed {} channel (current: v{CURRENT_VERSION}, platform: {target}, source: {owner}/{repo})...",
+            args.channel
         ))
     );
 
@@ -583,17 +461,20 @@ pub(crate) async fn run_self_update(args: UpdateArgs) -> anyhow::Result<()> {
         .timeout(std::time::Duration::from_secs(30))
         .build()?;
 
-    // Check the release FIRST, for every install method. Homebrew/cargo installs
-    // are checked the same as self-managed ones — only how the update is APPLIED
-    // differs — so `--check` reports availability everywhere (the session-start
-    // nudge depends on it). Previously the Homebrew branch returned before this
-    // ran, so brew installs never learned an update existed (#1121).
-    let (version_str, release) = fetch_latest_release(&client, &owner, &repo).await?;
+    let resolved =
+        update_channel::resolve_signed_channel(&client, &owner, &repo, args.channel, target)
+            .await?;
+    let version_str = resolved.version;
+    let release = resolved.release;
     let current = semver::Version::parse(CURRENT_VERSION)?;
     let latest = semver::Version::parse(&version_str)?;
-    write_cache(&version_str);
+    write_cache(args.channel, &version_str);
 
-    match plan_update(method, &current, &latest, args.check) {
+    if handle_managed_channel(method, args.channel, &current, &latest, &version_str)? {
+        return Ok(());
+    }
+
+    match plan_update(method, &current, &latest, args.check, args.channel) {
         UpdatePlan::UpToDate => {
             println!(
                 "{}",
@@ -622,8 +503,6 @@ pub(crate) async fn run_self_update(args: UpdateArgs) -> anyhow::Result<()> {
         UpdatePlan::ApplyInPlace => {},
     }
 
-    // Update IN PLACE at the directory of the running binary, so there is exactly
-    // one `astrid` and `which astrid` never diverges from the updated version.
     let install_dir = exe
         .parent()
         .ok_or_else(|| anyhow::anyhow!("cannot resolve install directory for {}", exe.display()))?
@@ -646,12 +525,16 @@ pub(crate) async fn run_self_update(args: UpdateArgs) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    // Stage: download → authenticate publisher → verify integrity → extract.
-    let (_tmp_dir, extract_dir) = download_verify_extract(&client, &release, &version_str, target)
-        .await
-        .map_err(anyhow::Error::new)?;
+    let (_tmp_dir, extract_dir) = download_verify_extract(
+        &client,
+        &release,
+        &version_str,
+        target,
+        &resolved.target_blake3,
+    )
+    .await
+    .map_err(anyhow::Error::new)?;
 
-    // Finish: back up + atomically swap (rolls back on any failure).
     backup_and_swap(&install_dir, &extract_dir, MANAGED_BINARIES)?;
     println!(
         "{}",
@@ -664,15 +547,13 @@ pub(crate) async fn run_self_update(args: UpdateArgs) -> anyhow::Result<()> {
     finish_update(&install_dir).await
 }
 
-/// Download the release archive for `version`/`target`, authenticate its
-/// publisher, independently verify its BLAKE3 integrity, and only then extract
-/// it. Returns the temp dir (kept alive by the caller for the lifetime of
-/// `extract_dir`) and the extracted `astrid-<version>-<target>/` directory.
+/// Authenticate, content-check, and extract one platform archive.
 async fn download_verify_extract(
     client: &reqwest::Client,
     release: &serde_json::Value,
     version: &str,
     target: &str,
+    expected_blake3: &str,
 ) -> Result<(tempfile::TempDir, PathBuf), UpdateStageError> {
     println!(
         "{}",
@@ -712,7 +593,12 @@ async fn download_verify_extract(
     .map_err(|error| integrity_manifest_download_error(&error))?;
     let sums_body = String::from_utf8(sums)
         .map_err(|_| UpdateStageError::integrity("BLAKE3SUMS.txt is not UTF-8"))?;
-    let archive = verify_integrity(authenticated, &sums_body, &asset_name)?;
+    let archive = verify_integrity(
+        authenticated,
+        &sums_body,
+        &asset_name,
+        Some(expected_blake3),
+    )?;
     println!("{}", Theme::dimmed("Integrity verified."));
 
     // The mutating boundary accepts only the fully verified archive type.

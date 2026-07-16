@@ -317,7 +317,7 @@ pub(crate) enum Commands {
     /// Generate shell completion scripts.
     Completions(CompletionsArgs),
 
-    /// Update Astrid to the latest release (`self-update` is a legacy alias).
+    /// Update Astrid from a signed release channel (`self-update` is a legacy alias).
     #[command(alias = "self-update")]
     Update(UpdateArgs),
 
@@ -345,11 +345,38 @@ pub(crate) struct UpdateArgs {
     #[arg(long)]
     pub(crate) check: bool,
 
+    /// Follow Astrid's signed stable, dev, or nightly release channel.
+    #[arg(long, value_enum, default_value_t = UpdateChannel::Stable)]
+    pub(crate) channel: UpdateChannel,
+
     /// Override release discovery as `owner/repo` for an official-asset mirror
     /// or test server. This never overrides the required Astrid publisher.
     /// (Env: `ASTRID_UPDATE_REPO`; API base: `ASTRID_UPDATE_API`.)
     #[arg(long, value_name = "OWNER/REPO")]
     pub(crate) source: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub(crate) enum UpdateChannel {
+    Stable,
+    Dev,
+    Nightly,
+}
+
+impl UpdateChannel {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Stable => "stable",
+            Self::Dev => "dev",
+            Self::Nightly => "nightly",
+        }
+    }
+}
+
+impl std::fmt::Display for UpdateChannel {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
 }
 
 #[derive(Subcommand)]
