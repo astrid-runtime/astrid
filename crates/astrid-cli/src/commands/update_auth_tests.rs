@@ -202,9 +202,10 @@ fn production_workflow_identities_are_exact() {
 fn integrity_stage_is_strict_and_consumes_authenticated_bytes() {
     let asset = "astrid-1.0.0-x86_64-unknown-linux-gnu.tar.gz";
     let digest = blake3::hash(b"archive");
-    let body = format!("{}  {asset}\n", digest.to_hex());
+    let digest_hex = digest.to_hex().to_string();
+    let body = format!("{digest_hex}  {asset}\n");
     let authenticated = PublisherAuthenticatedArchive(b"archive".to_vec());
-    let verified = verify_integrity(authenticated, &body, asset, Some(&digest.to_hex()))
+    let verified = verify_integrity(authenticated, &body, asset, Some(digest_hex.as_str()))
         .expect("matching digest");
     assert_eq!(verified.as_bytes(), b"archive");
 
