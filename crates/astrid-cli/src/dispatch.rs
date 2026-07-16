@@ -339,9 +339,17 @@ async fn dispatch_capsule(command: crate::cli::CapsuleCommands) -> Result<ExitCo
             source,
             capsule,
             workspace,
+            yes,
+            vars,
         } => {
-            commands::capsule::install::install_capsule(&source, capsule.as_deref(), workspace)
-                .await?;
+            commands::capsule::install::install_capsule_with_options(
+                &source,
+                capsule.as_deref(),
+                workspace,
+                yes,
+                &vars,
+            )
+            .await?;
             Ok(ExitCode::SUCCESS)
         },
         CapsuleCommands::Update { target, workspace } => {

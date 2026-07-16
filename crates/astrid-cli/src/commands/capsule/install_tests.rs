@@ -4,6 +4,31 @@
 
 use super::*;
 
+#[test]
+fn manual_install_vars_parse_once_per_key() {
+    let items = vec!["mode=headless".to_string(), "token=a=b".to_string()];
+    let options = ManualInstallOptions::from_cli(true, &items).expect("valid variables");
+    assert!(options.yes);
+    assert_eq!(
+        options.vars.get("mode").map(String::as_str),
+        Some("headless")
+    );
+    assert_eq!(options.vars.get("token").map(String::as_str), Some("a=b"));
+}
+
+#[test]
+fn manual_install_vars_reject_malformed_or_duplicate_keys() {
+    assert!(ManualInstallOptions::from_cli(true, &["missing".to_string()]).is_err());
+    assert!(ManualInstallOptions::from_cli(true, &["=value".to_string()]).is_err());
+    assert!(
+        ManualInstallOptions::from_cli(
+            true,
+            &["mode=headless".to_string(), "mode=repl".to_string()],
+        )
+        .is_err()
+    );
+}
+
 // Source-string parsing (`strip_version_prefix`, `extract_github_org_repo`,
 // `parse_github_source`) now lives in `astrid_capsule_install::github_source`
 // and is tested there. Only the CLI-local `@version` suffix splitter stays

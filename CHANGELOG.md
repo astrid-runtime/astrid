@@ -11,6 +11,13 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
 
 ### Added
 
+- **Capsule installation has an explicit non-interactive configuration path.**
+  `astrid capsule install --yes` resolves lifecycle fields from repeatable
+  `--var KEY=VALUE` inputs, `ASTRID_VAR_<KEY>` environment variables, or
+  manifest defaults, and fails instead of silently choosing an enum value or
+  empty secret when a required value is absent. Secret automation can use the
+  environment form so credentials do not appear in process arguments.
+
 - **Signed runtime release channels and immutable manifests.** Every release records the exact
   runtime and WIT source commits, release-workflow identity, and all four platform archives with
   their sizes, BLAKE3 digests, SHA-256 compatibility digests, and Sigstore bundle

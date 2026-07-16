@@ -376,6 +376,14 @@ pub(crate) enum CapsuleCommands {
         /// Install to workspace instead of user-level
         #[arg(long)]
         workspace: bool,
+        /// Resolve capsule configuration without reading stdin. Missing values
+        /// must come from `--var`, `ASTRID_VAR_<KEY>`, or manifest defaults.
+        #[arg(short = 'y', long)]
+        yes: bool,
+        /// Pre-supply a capsule configuration value (repeatable).
+        /// Prefer `ASTRID_VAR_<KEY>` for secrets so values do not appear in argv.
+        #[arg(long = "var", value_name = "KEY=VALUE")]
+        vars: Vec<String>,
     },
     /// Update an installed capsule (or all capsules) from its original source
     Update {

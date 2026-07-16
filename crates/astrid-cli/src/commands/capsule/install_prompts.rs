@@ -19,7 +19,10 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use astrid_capsule::manifest::EnvDef;
+use astrid_core::PrincipalId;
+use astrid_core::dirs::AstridHome;
 use astrid_events::{AstridEvent, EventBus, EventMetadata, EventReceiver};
+use astrid_storage::{FileSecretStore, SecretStore};
 use astrid_types::Topic;
 use astrid_types::ipc::{IpcMessage, IpcPayload, OnboardingFieldType};
 
@@ -94,6 +97,8 @@ pub(crate) fn prompt_env_fields(
     env_path: &Path,
     capsule_id: &str,
     config_path: &Path,
+    home: &AstridHome,
+    principal: &PrincipalId,
 ) -> anyhow::Result<()> {
     let mut values: serde_json::Map<String, serde_json::Value> = if env_path.exists() {
         let content = std::fs::read_to_string(env_path)?;
@@ -102,15 +107,38 @@ pub(crate) fn prompt_env_fields(
         serde_json::Map::new()
     };
 
+    let secret_store =
+        FileSecretStore::new(home.secrets_dir().join(principal.as_str()).join(capsule_id));
     let mut prompted = false;
+    let mut changed = false;
     let keys = order_env_keys(env_defs);
 
     for key in &keys {
+        let def = &env_defs[key];
+        if def.env_type == "secret" {
+            if secret_store.exists(key)? {
+                if values.get(key).and_then(serde_json::Value::as_str) != Some("") {
+                    values.insert(key.clone(), serde_json::Value::String(String::new()));
+                    changed = true;
+                }
+                continue;
+            }
+            if let Some(legacy) = values
+                .get(key)
+                .and_then(serde_json::Value::as_str)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+            {
+                secret_store.set(key, &legacy)?;
+                values.insert(key.clone(), serde_json::Value::String(String::new()));
+                changed = true;
+                continue;
+            }
+        }
         if !should_prompt_for_key(&values, key) {
             continue;
         }
 
-        let def = &env_defs[key];
         if !prompted {
             eprintln!("\nThis capsule requires configuration:");
             prompted = true;
@@ -118,7 +146,13 @@ pub(crate) fn prompt_env_fields(
 
         let value = prompt_single_field(key, def, &values);
 
-        if !value.is_empty() {
+        if def.env_type == "secret" {
+            if !value.is_empty() {
+                secret_store.set(key, &value)?;
+            }
+            values.insert(key.clone(), serde_json::Value::String(String::new()));
+            changed = true;
+        } else if !value.is_empty() {
             // Guided pre-bless: if the operator just entered a provider endpoint
             // pointing at a local/private address (e.g. an LM Studio / Ollama
             // base_url), offer to add the SSRF-airlock exemption so the capsule
@@ -128,10 +162,14 @@ pub(crate) fn prompt_env_fields(
             // free-text value is a silent no-op.
             super::local_egress::maybe_prompt_local_egress(capsule_id, &value, config_path);
             values.insert(key.clone(), serde_json::Value::String(value));
+            changed = true;
         }
     }
 
-    if prompted {
+    if changed {
+        if let Some(parent) = env_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
         let json = serde_json::to_string_pretty(&values)?;
         std::fs::write(env_path, &json)?;
         #[cfg(unix)]
@@ -139,10 +177,116 @@ pub(crate) fn prompt_env_fields(
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(env_path, std::fs::Permissions::from_mode(0o600))?;
         }
-        eprintln!("  Configuration saved.\n");
+        if prompted {
+            eprintln!("  Configuration saved.\n");
+        }
     }
 
     Ok(())
+}
+
+/// Persist manifest configuration supplied to `capsule install --yes` without
+/// reading stdin. Existing values are preserved unless the operator explicitly
+/// supplies a replacement. Secret values go directly to the principal-scoped
+/// secret store; the env JSON records only an empty configured marker.
+pub(crate) fn write_headless_env_fields(
+    env_defs: &HashMap<String, EnvDef>,
+    env_path: &Path,
+    capsule_id: &str,
+    home: &AstridHome,
+    principal: &PrincipalId,
+    vars: &HashMap<String, String>,
+) -> anyhow::Result<()> {
+    for key in vars.keys() {
+        if !env_defs.contains_key(key) {
+            anyhow::bail!("--var names no [env] field in {capsule_id}: {key}");
+        }
+    }
+
+    let mut values: serde_json::Map<String, serde_json::Value> = if env_path.exists() {
+        let content = std::fs::read_to_string(env_path)?;
+        serde_json::from_str(&content).unwrap_or_default()
+    } else {
+        serde_json::Map::new()
+    };
+    let secret_store =
+        FileSecretStore::new(home.secrets_dir().join(principal.as_str()).join(capsule_id));
+
+    for key in order_env_keys(env_defs) {
+        let def = &env_defs[&key];
+        let env_key = headless_env_key(&key);
+        let supplied = vars
+            .get(&key)
+            .cloned()
+            .or_else(|| std::env::var(&env_key).ok());
+        let existing = if def.env_type == "secret" {
+            secret_store.exists(&key)?
+        } else {
+            values.contains_key(&key)
+        };
+        if supplied.is_none() && existing {
+            continue;
+        }
+        let resolved = supplied
+            .or_else(|| def.default.as_ref().map(json_value_string))
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "required value is missing for {capsule_id}.{key} \
+                     (use --var {key}=… or set {env_key})"
+                )
+            })?;
+
+        if !def.enum_values.is_empty() && !def.enum_values.iter().any(|item| item == &resolved) {
+            anyhow::bail!(
+                "invalid value for {capsule_id}.{key}: expected one of {}, got {resolved:?}",
+                def.enum_values.join(", ")
+            );
+        }
+
+        if def.env_type == "secret" {
+            if resolved.is_empty() {
+                let _ = secret_store.delete(&key)?;
+            } else {
+                secret_store.set(&key, &resolved)?;
+            }
+            values.insert(key, serde_json::Value::String(String::new()));
+        } else {
+            values.insert(key, serde_json::Value::String(resolved));
+        }
+    }
+
+    if !env_defs.is_empty() {
+        if let Some(parent) = env_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let json = serde_json::to_string_pretty(&values)?;
+        std::fs::write(env_path, json)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(env_path, std::fs::Permissions::from_mode(0o600))?;
+        }
+    }
+    Ok(())
+}
+
+fn headless_env_key(key: &str) -> String {
+    format!(
+        "ASTRID_VAR_{}",
+        key.chars()
+            .map(|ch| if ch.is_ascii_alphanumeric() {
+                ch.to_ascii_uppercase()
+            } else {
+                '_'
+            })
+            .collect::<String>()
+    )
+}
+
+fn json_value_string(value: &serde_json::Value) -> String {
+    value
+        .as_str()
+        .map_or_else(|| value.to_string(), str::to_string)
 }
 
 /// Decide whether to prompt the user for `key`, given the env values already
@@ -312,6 +456,111 @@ pub(crate) async fn cli_elicit_handler(mut receiver: EventReceiver, event_bus: E
     }
 }
 
+/// Non-interactive install responder used by `capsule install --yes`.
+///
+/// Values resolve in the same order as distro initialization: an explicit
+/// `--var KEY=VALUE`, `ASTRID_VAR_<KEY>`, then the manifest default. A field
+/// with no source is recorded as an error instead of silently accepting the
+/// first enum choice or an empty secret. The response is still published so a
+/// lifecycle hook cannot remain blocked; the install command reports the
+/// accumulated errors before it can claim success.
+pub(crate) async fn headless_elicit_handler(
+    mut receiver: EventReceiver,
+    event_bus: EventBus,
+    vars: HashMap<String, String>,
+    errors: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+) {
+    loop {
+        let Some(event) = receiver.recv().await else {
+            return;
+        };
+        let AstridEvent::Ipc { message, .. } = &*event else {
+            continue;
+        };
+        let IpcPayload::ElicitRequest {
+            request_id,
+            capsule_id,
+            field,
+        } = &message.payload
+        else {
+            continue;
+        };
+
+        let resolved = resolve_headless_field(
+            &field.key,
+            &field.field_type,
+            field.default.as_deref(),
+            &vars,
+        );
+        let (value, values) = match resolved {
+            Ok(resolved) => resolved,
+            Err(error) => {
+                if let Ok(mut guard) = errors.lock() {
+                    guard.push(format!("{capsule_id}.{}: {error}", field.key));
+                }
+                (None, None)
+            },
+        };
+
+        let response =
+            build_elicit_response_msg(*request_id, message.principal.as_deref(), value, values);
+        event_bus.publish(AstridEvent::Ipc {
+            message: response,
+            metadata: EventMetadata::default(),
+        });
+    }
+}
+
+fn resolve_headless_field(
+    key: &str,
+    field_type: &OnboardingFieldType,
+    default: Option<&str>,
+    vars: &HashMap<String, String>,
+) -> Result<(Option<String>, Option<Vec<String>>), String> {
+    let env_key = format!(
+        "ASTRID_VAR_{}",
+        key.chars()
+            .map(|ch| {
+                if ch.is_ascii_alphanumeric() {
+                    ch.to_ascii_uppercase()
+                } else {
+                    '_'
+                }
+            })
+            .collect::<String>()
+    );
+    let resolved = vars
+        .get(key)
+        .cloned()
+        .or_else(|| std::env::var(&env_key).ok())
+        .or_else(|| default.map(str::to_string))
+        .ok_or_else(|| format!("required value is missing (use --var {key}=… or set {env_key})"))?;
+
+    match field_type {
+        OnboardingFieldType::Enum(options) => {
+            if !options.iter().any(|option| option == &resolved) {
+                return Err(format!(
+                    "value is not one of the declared options: {}",
+                    options.join(", ")
+                ));
+            }
+            Ok((Some(resolved), None))
+        },
+        OnboardingFieldType::Array => Ok((
+            None,
+            Some(
+                resolved
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|item| !item.is_empty())
+                    .map(str::to_string)
+                    .collect(),
+            ),
+        )),
+        OnboardingFieldType::Text | OnboardingFieldType::Secret => Ok((Some(resolved), None)),
+    }
+}
+
 /// Build the `ElicitResponse` IPC message for the in-process install answerer,
 /// echoing the originating `request_principal` so the host waiter's
 /// same-principal check accepts it.
@@ -442,6 +691,61 @@ mod tests {
     }
 
     #[test]
+    fn headless_value_prefers_explicit_input_and_validates_enums() {
+        let mut vars = HashMap::new();
+        vars.insert("auth_mode".to_string(), "subscription".to_string());
+        let options =
+            OnboardingFieldType::Enum(vec!["api_key".to_string(), "subscription".to_string()]);
+        assert_eq!(
+            resolve_headless_field("auth_mode", &options, Some("api_key"), &vars),
+            Ok((Some("subscription".to_string()), None))
+        );
+
+        vars.insert("auth_mode".to_string(), "invalid".to_string());
+        assert!(resolve_headless_field("auth_mode", &options, Some("api_key"), &vars).is_err());
+    }
+
+    #[test]
+    fn headless_value_uses_manifest_default_without_guessing() {
+        let vars = HashMap::new();
+        assert_eq!(
+            resolve_headless_field(
+                "interaction_mode",
+                &OnboardingFieldType::Text,
+                Some("headless"),
+                &vars,
+            ),
+            Ok((Some("headless".to_string()), None))
+        );
+        assert!(
+            resolve_headless_field(
+                "release_required_value_8c3f",
+                &OnboardingFieldType::Secret,
+                None,
+                &vars,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn headless_array_uses_comma_separated_values() {
+        let mut vars = HashMap::new();
+        vars.insert("tags".to_string(), "one, two,,three".to_string());
+        assert_eq!(
+            resolve_headless_field("tags", &OnboardingFieldType::Array, None, &vars),
+            Ok((
+                None,
+                Some(vec![
+                    "one".to_string(),
+                    "two".to_string(),
+                    "three".to_string()
+                ])
+            ))
+        );
+    }
+
+    #[test]
     fn explicitly_empty_value_is_not_reprompted() {
         // Regression for the blank-as-default nag: `write_env_files` writes an
         // empty string to mean "use the capsule default". A present-but-empty
@@ -483,12 +787,149 @@ type = "text"
         std::fs::write(&env_path, r#"{"model":"","base_url":"https://h"}"#).expect("write");
 
         let config_path = dir.path().join("config.toml");
-        prompt_env_fields(&defs, &env_path, "cap", &config_path).expect("no prompt → Ok");
+        let home = AstridHome::from_path(dir.path());
+        prompt_env_fields(
+            &defs,
+            &env_path,
+            "cap",
+            &config_path,
+            &home,
+            &PrincipalId::default(),
+        )
+        .expect("no prompt → Ok");
 
         // Untouched: still exactly what we wrote (the function only rewrites
         // when it actually prompted).
         let after = std::fs::read_to_string(&env_path).expect("read");
         assert_eq!(after, r#"{"model":"","base_url":"https://h"}"#);
+    }
+
+    #[test]
+    fn headless_env_persists_modes_and_keeps_secret_out_of_json() {
+        let defs = env(r#"
+[interaction_mode]
+type = "select"
+enum_values = ["headless", "repl"]
+default = "headless"
+
+[auth_mode]
+type = "select"
+enum_values = ["api_key", "subscription"]
+default = "api_key"
+
+[api_key]
+type = "secret"
+"#);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let home = AstridHome::from_path(dir.path());
+        let principal = PrincipalId::new("claude-code").expect("principal");
+        let env_path = home
+            .principal_home(&principal)
+            .env_dir()
+            .join("claude-runner.env.json");
+        let vars = HashMap::from([
+            ("auth_mode".to_string(), "api_key".to_string()),
+            ("api_key".to_string(), "top-secret".to_string()),
+        ]);
+
+        write_headless_env_fields(&defs, &env_path, "claude-runner", &home, &principal, &vars)
+            .expect("headless config");
+
+        let raw = std::fs::read_to_string(&env_path).expect("env json");
+        assert!(!raw.contains("top-secret"));
+        let values: serde_json::Value = serde_json::from_str(&raw).expect("valid json");
+        assert_eq!(values["interaction_mode"], "headless");
+        assert_eq!(values["auth_mode"], "api_key");
+        assert_eq!(values["api_key"], "");
+        let secrets = FileSecretStore::new(
+            home.secrets_dir()
+                .join(principal.as_str())
+                .join("claude-runner"),
+        );
+        assert_eq!(
+            secrets.get("api_key").expect("secret read").as_deref(),
+            Some("top-secret")
+        );
+    }
+
+    #[test]
+    fn headless_env_requires_missing_secret_and_rejects_unknown_var() {
+        let defs = env(r#"
+[api_key]
+type = "secret"
+"#);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let home = AstridHome::from_path(dir.path());
+        let principal = PrincipalId::default();
+        let env_path = dir.path().join("cap.env.json");
+
+        let missing =
+            write_headless_env_fields(&defs, &env_path, "cap", &home, &principal, &HashMap::new())
+                .expect_err("missing secret must fail");
+        assert!(missing.to_string().contains("required value is missing"));
+
+        let unknown = write_headless_env_fields(
+            &defs,
+            &env_path,
+            "cap",
+            &home,
+            &principal,
+            &HashMap::from([("typo".to_string(), "value".to_string())]),
+        )
+        .expect_err("unknown --var must fail");
+        assert!(unknown.to_string().contains("names no [env] field"));
+    }
+
+    #[test]
+    fn headless_env_does_not_treat_an_empty_json_marker_as_a_stored_secret() {
+        let defs = env(r#"
+[api_key]
+type = "secret"
+"#);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let home = AstridHome::from_path(dir.path());
+        let principal = PrincipalId::default();
+        let env_path = dir.path().join("cap.env.json");
+        std::fs::write(&env_path, r#"{"api_key":""}"#).expect("secret marker");
+
+        let error =
+            write_headless_env_fields(&defs, &env_path, "cap", &home, &principal, &HashMap::new())
+                .expect_err("marker without secret material must fail");
+
+        assert!(error.to_string().contains("required value is missing"));
+    }
+
+    #[test]
+    fn interactive_env_migrates_legacy_plaintext_secret() {
+        let defs = env(r#"
+[api_key]
+type = "secret"
+"#);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let home = AstridHome::from_path(dir.path());
+        let principal = PrincipalId::new("agent").expect("principal");
+        let env_path = dir.path().join("cap.env.json");
+        std::fs::write(&env_path, r#"{"api_key":"legacy-secret"}"#).expect("legacy env");
+
+        prompt_env_fields(
+            &defs,
+            &env_path,
+            "cap",
+            &dir.path().join("config.toml"),
+            &home,
+            &principal,
+        )
+        .expect("migrate secret");
+
+        assert_eq!(
+            std::fs::read_to_string(&env_path).expect("env marker"),
+            "{\n  \"api_key\": \"\"\n}"
+        );
+        let secrets = FileSecretStore::new(home.secrets_dir().join(principal.as_str()).join("cap"));
+        assert_eq!(
+            secrets.get("api_key").expect("secret read").as_deref(),
+            Some("legacy-secret")
+        );
     }
 
     #[test]
