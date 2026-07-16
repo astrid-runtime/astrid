@@ -231,6 +231,29 @@ impl CapsuleSecurityGate for ManifestSecurityGate {
         }
     }
 
+    fn process_home_write_paths(
+        &self,
+        principal_home: &std::path::Path,
+    ) -> Vec<std::path::PathBuf> {
+        let root = principal_home
+            .canonicalize()
+            .unwrap_or_else(|_| principal_home.to_path_buf());
+        self.home_suffixes_write
+            .iter()
+            .filter(|suffix| {
+                !std::path::Path::new(suffix).components().any(|component| {
+                    matches!(
+                        component,
+                        std::path::Component::ParentDir
+                            | std::path::Component::RootDir
+                            | std::path::Component::Prefix(_)
+                    )
+                })
+            })
+            .map(|suffix| root.join(suffix))
+            .collect()
+    }
+
     async fn check_host_process(&self, capsule_id: &str, command: &str) -> Result<(), String> {
         if self
             .manifest

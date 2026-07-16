@@ -240,6 +240,59 @@ fn wrap_with_injections_emits_ro_bind_pair() {
     assert_eq!(args[pos + 2], "/etc/x", "ro-bind target");
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn process_write_path_is_bound_read_write() {
+    let root = tempfile::tempdir().expect("root");
+    let workspace = root.path().join("workspace");
+    let principal = root.path().join("principal");
+    std::fs::create_dir_all(&workspace).expect("workspace");
+    std::fs::create_dir_all(&principal).expect("principal");
+    let wrapped = SandboxCommand::wrap_with_process_paths(
+        &Command::new("echo"),
+        &workspace,
+        &[],
+        &[],
+        std::slice::from_ref(&principal),
+        std::slice::from_ref(&principal),
+        true,
+    )
+    .expect("wrap");
+    let args: Vec<_> = wrapped.get_args().collect();
+    assert!(args.windows(3).any(|window| {
+        window[0] == "--bind"
+            && window[1] == principal.as_os_str()
+            && window[2] == principal.as_os_str()
+    }));
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn process_paths_are_explicit_in_seatbelt_profile() {
+    let root = tempfile::tempdir().expect("root");
+    let workspace = root.path().join("workspace");
+    let principal = root.path().join("principal");
+    std::fs::create_dir_all(&workspace).expect("workspace");
+    std::fs::create_dir_all(&principal).expect("principal");
+    let wrapped = SandboxCommand::wrap_with_process_paths(
+        &Command::new("echo"),
+        &workspace,
+        &[],
+        &[],
+        std::slice::from_ref(&principal),
+        std::slice::from_ref(&principal),
+        true,
+    )
+    .expect("wrap");
+    let profile = wrapped
+        .get_args()
+        .map(|arg| arg.to_string_lossy())
+        .find(|arg| arg.contains("(deny default)"))
+        .expect("seatbelt profile");
+    let rule = format!("(subpath \"{}\")", principal.display());
+    assert_eq!(profile.matches(&rule).count(), 2, "read and write grants");
+}
+
 /// SECURITY: a spawned child must NOT be able to write a caller-supplied mask
 /// path (the copy-on-write upper/pristine). End-to-end proof on macOS: the mask
 /// deny must hold even though the masked dir sits under a broadly-writable
@@ -554,21 +607,30 @@ fn test_sandbox_prefix_rejects_null_byte_in_paths() {
 
 // --- #856: sensitive Astrid-home subpaths are masked in every spawn ---
 
-/// The masked set is `keys/`, `secrets/`, `var/` in that order. The exact
+/// The masked set is `keys/`, `secrets/`, `var/`, `home/` in that order. The exact
 /// subset is existence-filtered (see `sensitive_astrid_paths_in`), so this
 /// drives a fully-populated `tempdir` home to assert all three are emitted in
 /// the documented order rather than depending on the test runner's real home.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
-fn sensitive_astrid_paths_are_keys_secrets_var() {
+fn sensitive_astrid_paths_are_keys_secrets_var_home() {
     let tmp = tempfile::tempdir().expect("create temp astrid home");
     let home = astrid_core::dirs::AstridHome::from_path(tmp.path());
-    for dir in [home.keys_dir(), home.secrets_dir(), home.var_dir()] {
+    for dir in [
+        home.keys_dir(),
+        home.secrets_dir(),
+        home.var_dir(),
+        home.home_dir(),
+    ] {
         std::fs::create_dir_all(&dir).expect("create masked dir");
     }
 
     let paths = SandboxCommand::sensitive_astrid_paths_in(&home);
-    assert_eq!(paths.len(), 3, "exactly keys/, secrets/, var/ are masked");
+    assert_eq!(
+        paths.len(),
+        4,
+        "exactly keys/, secrets/, var/, home/ are masked"
+    );
     assert!(
         paths[0].ends_with("keys"),
         "first masked path is keys/: {:?}",
@@ -583,6 +645,11 @@ fn sensitive_astrid_paths_are_keys_secrets_var() {
         paths[2].ends_with("var"),
         "third masked path is var/: {:?}",
         paths[2]
+    );
+    assert!(
+        paths[3].ends_with("home"),
+        "fourth masked path is home/: {:?}",
+        paths[3]
     );
 }
 
@@ -602,6 +669,7 @@ fn sensitive_astrid_paths_skips_missing_dirs() {
     // secrets/ has never been written.
     std::fs::create_dir_all(home.keys_dir()).expect("create keys/");
     std::fs::create_dir_all(home.var_dir()).expect("create var/");
+    std::fs::create_dir_all(home.home_dir()).expect("create home/");
     assert!(
         !home.secrets_dir().exists(),
         "precondition: secrets/ absent"
@@ -610,7 +678,7 @@ fn sensitive_astrid_paths_skips_missing_dirs() {
     let paths = SandboxCommand::sensitive_astrid_paths_in(&home);
     assert_eq!(
         paths.len(),
-        2,
+        3,
         "the absent secrets/ dir is filtered out: {paths:?}"
     );
     assert!(
@@ -629,7 +697,7 @@ fn sensitive_astrid_paths_skips_missing_dirs() {
     // Once secrets/ exists (first secret written), it rejoins the masked set.
     std::fs::create_dir_all(home.secrets_dir()).expect("create secrets/");
     let paths = SandboxCommand::sensitive_astrid_paths_in(&home);
-    assert_eq!(paths.len(), 3, "secrets/ rejoins once it exists: {paths:?}");
+    assert_eq!(paths.len(), 4, "secrets/ rejoins once it exists: {paths:?}");
 }
 
 /// The home credential deny-list masks the well-known credential stores that

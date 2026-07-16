@@ -356,17 +356,13 @@ pub(crate) struct UpdateArgs {
     #[arg(long, value_name = "OWNER/REPO")]
     pub(crate) source: Option<String>,
 }
-
 #[derive(Subcommand)]
 pub(crate) enum CapsuleCommands {
     /// Scaffold a new, first-try-compiling capsule project.
     New(crate::commands::capsule::new::NewArgs),
     /// Install a capsule from a local path or registry.
-    ///
-    /// Capsule artifact bytes are content-addressed under the Astrid home, but
-    /// principal access is not shared. A principal can only see or invoke
-    /// capsules explicitly listed on its profile, and env/secrets/KV remain
-    /// caller-scoped.
+    /// Artifact bytes are content-addressed, while capsule visibility and
+    /// env/secrets/KV remain principal-scoped.
     Install {
         /// Capsule source (local path or package name)
         source: String,
@@ -376,12 +372,10 @@ pub(crate) enum CapsuleCommands {
         /// Install to workspace instead of user-level
         #[arg(long)]
         workspace: bool,
-        /// Resolve capsule configuration without reading stdin. Missing values
-        /// must come from `--var`, `ASTRID_VAR_<KEY>`, or manifest defaults.
+        /// Resolve configuration from vars, environment, or defaults without stdin.
         #[arg(short = 'y', long)]
         yes: bool,
-        /// Pre-supply a capsule configuration value (repeatable).
-        /// Prefer `ASTRID_VAR_<KEY>` for secrets so values do not appear in argv.
+        /// Pre-supply a value; prefer `ASTRID_VAR_<KEY>` for secrets (repeatable).
         #[arg(long = "var", value_name = "KEY=VALUE")]
         vars: Vec<String>,
     },

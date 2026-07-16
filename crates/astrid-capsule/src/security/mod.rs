@@ -104,6 +104,16 @@ pub trait CapsuleSecurityGate: Send + Sync {
         principal_home: Option<&std::path::Path>,
     ) -> Result<(), String>;
 
+    /// Resolve the declared `home://` write roots for a native child running
+    /// under `principal_home`. The default is empty: only manifest-backed gates
+    /// may project filesystem grants into the OS sandbox.
+    fn process_home_write_paths(
+        &self,
+        _principal_home: &std::path::Path,
+    ) -> Vec<std::path::PathBuf> {
+        Vec::new()
+    }
+
     /// Check whether the capsule is allowed to spawn a host process.
     async fn check_host_process(&self, capsule_id: &str, command: &str) -> Result<(), String>;
 

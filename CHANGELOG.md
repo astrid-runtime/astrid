@@ -11,6 +11,17 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
 
 ### Added
 
+- **Native process requests now honor their declared environment and working
+  directory.** Every spawn tier starts from a small host environment allowlist,
+  applies validated guest variables, rejects session-token injection, confines
+  relative working directories to the capsule workspace, and can resolve
+  `HOME=home://...` or a `home://...` working directory after host-side policy
+  checks. The native child receives the resolved path, but the process host API
+  does not return it directly. Principal-home reads require an
+  explicit read capability; the OS sandbox makes writable only the capsule's
+  declared `home://` write roots for that principal. Recv-driven capsules now install the same
+  per-principal home/tmp overlays as interceptor invocations.
+
 - **Capsule installation has an explicit non-interactive configuration path.**
   `astrid capsule install --yes` resolves lifecycle fields from repeatable
   `--var KEY=VALUE` inputs, `ASTRID_VAR_<KEY>` environment variables, or

@@ -91,6 +91,15 @@ jobs:
           toolchain: "1.95.0"
           targets: wasm32-unknown-unknown
 
+      - name: Install pinned Unicity AOS capsule toolchain
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          # The pinned AOS source currently builds its capsules with 1.94.0.
+          # Install it up front so the runtime harness cannot trigger an
+          # implicit rustup download halfway through the sweep.
+          toolchain: "1.94.0"
+          targets: wasm32-unknown-unknown
+
       - name: Cache Rust artifacts
         uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
         with:

@@ -69,7 +69,7 @@ impl SandboxCommand {
     ///
     /// - On Linux, this dynamically prepends `bwrap` with strict mount rules.
     /// - On macOS, this dynamically generates a Seatbelt profile and prepends `sandbox-exec -p`.
-    /// - On other platforms (Windows), this currently passes through the command unmodified (with a warning).
+    /// - On other platforms, native process execution is refused.
     ///
     /// # Errors
     ///
@@ -81,8 +81,8 @@ impl SandboxCommand {
         Self::wrap_with_injections(inner_cmd, worktree_path, &[], &[])
     }
 
-    /// Astrid-home subpaths that hold cross-principal secret material or kernel
-    /// state and must never be readable by a spawned native process. Masked in
+    /// Astrid-home subpaths that hold cross-principal state or secret material
+    /// and must never be readable by a spawned native process. Masked in
     /// every sandboxed spawn (issue #856 — bwrap's `--ro-bind / /` mounts the
     /// whole host filesystem read-only, which exposed these): `keys/` (ed25519
     /// private keys → principal impersonation), `secrets/` (the secret store →
@@ -112,10 +112,15 @@ impl SandboxCommand {
     /// non-existent dir is fail-safe: an absent dir holds no bytes to mask.
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     fn sensitive_astrid_paths_in(home: &astrid_core::dirs::AstridHome) -> Vec<PathBuf> {
-        vec![home.keys_dir(), home.secrets_dir(), home.var_dir()]
-            .into_iter()
-            .filter(|p| p.exists())
-            .collect()
+        vec![
+            home.keys_dir(),
+            home.secrets_dir(),
+            home.var_dir(),
+            home.home_dir(),
+        ]
+        .into_iter()
+        .filter(|p| p.exists())
+        .collect()
     }
 
     /// Well-known credential / secret-material directories under the operator's
@@ -215,6 +220,37 @@ impl SandboxCommand {
         injections: &[RoInjection],
         extra_masks: &[PathBuf],
     ) -> io::Result<Command> {
+        Self::wrap_with_process_paths(
+            &inner_cmd,
+            worktree_path,
+            injections,
+            extra_masks,
+            &[],
+            &[],
+            false,
+        )
+    }
+
+    /// Like [`wrap_with_injections`](Self::wrap_with_injections), with
+    /// host-authorized filesystem roots needed by the child process itself.
+    /// Read paths remain read-only; write paths are bound/allowed read-write.
+    /// Callers must authorize these paths before invoking this function.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a path is invalid, missing, overlaps a protected
+    /// path, or the native OS sandbox cannot enforce the requested grants.
+    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_lines)] // Platform assembly shares one validation boundary.
+    pub fn wrap_with_process_paths(
+        inner_cmd: &Command,
+        worktree_path: &Path,
+        injections: &[RoInjection],
+        extra_masks: &[PathBuf],
+        extra_read_paths: &[PathBuf],
+        extra_write_paths: &[PathBuf],
+        clear_env: bool,
+    ) -> io::Result<Command> {
         // Validate on all platforms for defense in depth and API consistency.
         // On macOS the validated string is needed for SBPL interpolation.
         // On Linux bwrap passes paths as argv entries (no injection risk),
@@ -223,6 +259,24 @@ impl SandboxCommand {
         for inj in injections {
             let _ = validate_sandbox_str(&inj.source, "injection source")?;
             let _ = validate_sandbox_str(&inj.target, "injection target")?;
+        }
+        for path in extra_read_paths {
+            let _ = validate_sandbox_str(path, "process read path")?;
+            if !path.exists() {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("process read path does not exist: {}", path.display()),
+                ));
+            }
+        }
+        for path in extra_write_paths {
+            let _ = validate_sandbox_str(path, "process write path")?;
+            if !path.exists() {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("process write path does not exist: {}", path.display()),
+                ));
+            }
         }
 
         // Every caller-supplied mask names copy-on-write bookkeeping the child
@@ -245,12 +299,29 @@ impl SandboxCommand {
                 ));
             }
         }
+        for granted in extra_read_paths.iter().chain(extra_write_paths) {
+            if extra_masks
+                .iter()
+                .any(|masked| paths_overlap(granted, masked))
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    format!(
+                        "process path {} overlaps a copy-on-write mask",
+                        granted.display()
+                    ),
+                ));
+            }
+        }
 
         #[cfg(target_os = "linux")]
         {
             // Bubblewrap implementation - paths are passed as separate argv entries (no injection).
             // The process can only read the root OS, but can only write to the worktree and /tmp.
             let mut bwrap = Command::new("bwrap");
+            if clear_env {
+                bwrap.env_clear();
+            }
             bwrap
                 .arg("--ro-bind").arg("/").arg("/") // Read-only access to host OS (for binaries like /usr/bin/node)
                 .arg("--dev").arg("/dev")           // Standard dev mounts
@@ -275,7 +346,23 @@ impl SandboxCommand {
             // and the worktree/injection binds; `run/` (socket+token) and `etc/`
             // stay reachable for daemon access. Fail-secure: refuse the spawn if
             // the home is unresolvable.
-            for masked in Self::masked_paths()? {
+            let built_in_masks = Self::masked_paths()?;
+            let home_root = astrid_core::dirs::AstridHome::resolve()?.home_dir();
+            for granted in extra_read_paths.iter().chain(extra_write_paths) {
+                if built_in_masks.iter().any(|masked| {
+                    paths_overlap(granted, masked)
+                        && !(masked == &home_root && granted.starts_with(masked))
+                }) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        format!(
+                            "process path {} overlaps a sensitive runtime path",
+                            granted.display()
+                        ),
+                    ));
+                }
+            }
+            for masked in &built_in_masks {
                 Self::push_mask_arg(&mut bwrap, &masked);
             }
 
@@ -286,6 +373,17 @@ impl SandboxCommand {
             // already failed the spawn), so every entry is masked unconditionally.
             for masked in extra_masks {
                 Self::push_mask_arg(&mut bwrap, masked);
+            }
+
+            // The root filesystem is already read-only, but the entire
+            // cross-principal home container is masked above. Re-bind only the
+            // authorized principal path, then punch through its explicitly
+            // declared writable subpaths.
+            for path in extra_read_paths {
+                bwrap.arg("--ro-bind").arg(path).arg(path);
+            }
+            for path in extra_write_paths {
+                bwrap.arg("--bind").arg(path).arg(path);
             }
 
             bwrap
@@ -333,6 +431,12 @@ impl SandboxCommand {
             // materialized the verified snapshot AT `target`; the profile
             // grants read and a trailing deny-write on that literal path.
             let mut config = ProcessSandboxConfig::new(worktree_path);
+            for path in extra_read_paths {
+                config = config.with_extra_read(path);
+            }
+            for path in extra_write_paths {
+                config = config.with_extra_write(path);
+            }
             for inj in injections {
                 config = config.with_ro_inject(&inj.source, &inj.target);
             }
@@ -356,6 +460,9 @@ impl SandboxCommand {
             let prefix = config.build_seatbelt_prefix()?;
 
             let mut sb_cmd = Command::new(&prefix.program);
+            if clear_env {
+                sb_cmd.env_clear();
+            }
             sb_cmd.args(&prefix.args);
 
             // Append the original program and its arguments.
@@ -384,18 +491,23 @@ impl SandboxCommand {
             // Without an OS-level sandbox neither the read-only injection
             // guarantee nor a copy-on-write mask can be enforced; refuse rather
             // than run a child without the intended deny (fail-secure).
-            if !injections.is_empty() || !extra_masks.is_empty() {
-                return Err(io::Error::other(
-                    "read-only file injection / copy-on-write masking requires an OS \
-                     sandbox (bwrap/Seatbelt); unavailable on this platform",
-                ));
-            }
-            tracing::warn!(
-                "Host-level sandboxing is not supported on this OS. Processes will run unsandboxed."
+            let _ = (
+                inner_cmd,
+                injections,
+                extra_masks,
+                extra_read_paths,
+                extra_write_paths,
             );
-            Ok(inner_cmd)
+            Err(io::Error::other(
+                "native process execution requires an OS sandbox (bwrap/Seatbelt); \
+                 unavailable on this platform",
+            ))
         }
     }
+}
+
+fn paths_overlap(left: &Path, right: &Path) -> bool {
+    left.starts_with(right) || right.starts_with(left)
 }
 
 /// The sandbox wrapper program and its argument prefix.

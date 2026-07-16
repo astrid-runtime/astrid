@@ -1016,12 +1016,10 @@ async fn install_principal_overlays(
 /// neutral fail-closed floor when `principal` is `None` or KV construction
 /// fails). Returns `true` iff a real per-principal scope was installed.
 ///
-/// Split out so the sync `ipc::poll` / `recv` recv path can install the
-/// security-critical KV + secret overlays without an async VFS mount. `home` /
-/// `tmp` are async (they mount a VFS) and are installed only by the async
-/// [`install_principal_overlays`]; on the recv path they stay `None` and resolve
-/// to the neutral placeholder (fail-closed, never the load-owner), which is
-/// correct because run+recv capsules do not touch `home://` / `/tmp` paths.
+/// Split out so the sync `ipc::poll` / `recv` path can install the
+/// security-critical KV + secret overlays before its VFS setup. The
+/// async interceptor path calls [`install_principal_overlays`] directly; the
+/// recv path mounts the same principal home/tmp bundle immediately afterward.
 fn install_principal_overlays_sync(
     state: &mut HostState,
     principal: Option<&astrid_core::PrincipalId>,

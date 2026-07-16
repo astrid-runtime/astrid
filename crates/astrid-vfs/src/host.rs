@@ -46,6 +46,29 @@ impl HostVfs {
         }
     }
 
+    /// Create a host VFS with one root capability already registered.
+    ///
+    /// This is the synchronous constructor for synchronous WIT host calls that
+    /// must switch principal mounts before returning to the guest. It performs
+    /// the same ambient-directory open as [`register_dir`](Self::register_dir)
+    /// but initializes the lock before the VFS becomes shared, avoiding a
+    /// nested async-runtime bridge.
+    ///
+    /// # Errors
+    ///
+    /// Returns `VfsError::Io` when the directory cannot be opened.
+    pub fn with_registered_dir(handle: DirHandle, physical_path: &Path) -> VfsResult<Self> {
+        let dir = Dir::open_ambient_dir(physical_path, cap_std::ambient_authority())
+            .map_err(VfsError::Io)?;
+        let mut open_dirs = HashMap::new();
+        open_dirs.insert(handle, Arc::new(dir));
+        Ok(Self {
+            open_dirs: RwLock::new(open_dirs),
+            open_files: RwLock::new(HashMap::new()),
+            fd_semaphore: Arc::new(Semaphore::new(64)),
+        })
+    }
+
     /// Register a root directory capability manually (e.g. from the Daemon).
     ///
     /// # Panics
@@ -340,5 +363,28 @@ impl Vfs for HostVfs {
             return Err(VfsError::InvalidHandle);
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn synchronous_constructor_registers_the_root() {
+        let root = tempfile::tempdir().expect("root");
+        std::fs::write(root.path().join("visible.txt"), b"ok").expect("fixture");
+        let handle = DirHandle::new();
+        let vfs = HostVfs::with_registered_dir(handle.clone(), root.path()).expect("VFS");
+
+        assert!(vfs.exists(&handle, "visible.txt").await.expect("exists"));
+    }
+
+    #[test]
+    fn synchronous_constructor_rejects_a_missing_root() {
+        let root = tempfile::tempdir().expect("root");
+        let missing = root.path().join("missing");
+        let result = HostVfs::with_registered_dir(DirHandle::new(), &missing);
+        assert!(matches!(result, Err(VfsError::Io(_))));
     }
 }

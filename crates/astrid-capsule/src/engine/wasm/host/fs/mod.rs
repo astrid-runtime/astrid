@@ -246,6 +246,25 @@ fn gate_write(
     Ok(())
 }
 
+/// Resolve and read-authorize a VFS path exposed to a sandboxed native child.
+pub(super) fn authorize_process_read_path(
+    state: &HostState,
+    raw_path: &str,
+) -> Result<std::path::PathBuf, ErrorCode> {
+    let resolved = resolve_path(state, raw_path).map_err(map_resolve_err)?;
+    gate_read(state, &resolved.physical)?;
+    Ok(resolved.physical)
+}
+
+/// Write-authorize an already-resolved physical process path before adding it
+/// to the native sandbox's writable roots.
+pub(super) fn authorize_process_write_path(
+    state: &HostState,
+    physical: &std::path::Path,
+) -> Result<(), ErrorCode> {
+    gate_write(state, physical, WriteKind::Write)
+}
+
 /// Convert a VFS metadata record into the WIT `FileStat`. The VFS only
 /// exposes size / is_dir / mtime today; created/accessed timestamps and
 /// POSIX mode bits land as defaults until the VFS surfaces them.

@@ -94,7 +94,7 @@ impl PreparedInjections {
 /// sets it on the child, so a malformed name must not be able to break the env
 /// list or smuggle a second assignment.
 fn validate_env_name(name: &str) -> Result<(), ErrorCode> {
-    if name.is_empty() || name.contains(['=', '\0']) {
+    if !super::context::valid_env_key(name) || super::context::reserved_process_env(name) {
         return Err(ErrorCode::InvalidInput);
     }
     Ok(())
@@ -283,6 +283,14 @@ mod tests {
         ));
         assert!(matches!(
             validate_env_name("FOO\0BAR"),
+            Err(ErrorCode::InvalidInput)
+        ));
+        assert!(matches!(
+            validate_env_name("ASTRID_SESSION_TOKEN"),
+            Err(ErrorCode::InvalidInput)
+        ));
+        assert!(matches!(
+            validate_env_name("LD_PRELOAD"),
             Err(ErrorCode::InvalidInput)
         ));
     }

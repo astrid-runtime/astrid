@@ -99,8 +99,8 @@ impl HostState {
     /// namespace, the turn-state phase doesn't match, and the chain
     /// stalls.
     ///
-    /// Sets up the subset relevant to publish stamping and per-principal
-    /// KV / log routing:
+    /// Sets up the context relevant to publish stamping and per-principal
+    /// state routing:
     /// - [`caller_context`](Self::caller_context) — drives both
     ///   [`effective_principal`](Self::effective_principal) and the
     ///   `principal_str` chosen by `publish_inner`.
@@ -121,18 +121,11 @@ impl HostState {
     ///   [`install_principal_overlays_sync`](crate::engine::wasm::install_principal_overlays_sync),
     ///   so a non-owner publisher's `has_secret` / secret writes resolve to ITS
     ///   OWN store, never the neutral load-time fallback and never `default`'s.
+    /// - `invocation_home` / `invocation_tmp` — mounted for the publisher so a
+    ///   recv-driven capsule can use principal-scoped VFS paths and can spawn a
+    ///   native process rooted in that same principal's home.
     ///
-    /// Skipped vs the interceptor path (each is independently
-    /// recoverable; documenting the gaps so the omissions are
-    /// auditable):
-    /// - `invocation_home` / `invocation_tmp` — these MOUNT a VFS (async), but
-    ///   `ipc::poll` is a synchronous bindgen fn, so they are not installed on
-    ///   this path. Run+recv capsules do not touch `home://` / `/tmp` paths, and
-    ///   the load-time `home` / `tmp` fields are NEUTRAL (`None`) fail-closed
-    ///   placeholders — so leaving them unset denies rather than exposing the
-    ///   load-owner's mount. Install them (via the async
-    ///   [`install_principal_overlays`](crate::engine::wasm::install_principal_overlays))
-    ///   if a recv-driven capsule ever needs per-principal `home://`.
+    /// Remaining difference from the interceptor path:
     /// - `store_meter` — the per-invocation linear-memory ceiling stays the
     ///   capsule owner's; the recv path does not re-target it per publisher
     ///   the way `invoke_interceptor` does. Acceptable because the run+recv
@@ -178,6 +171,9 @@ impl HostState {
                 env_principal,
                 self.capsule_id.as_str(),
             );
+            if self.invocation_home.is_none() {
+                self.install_recv_invocation_vfs(publisher.as_ref());
+            }
             // Refresh the cancellation token from the shared map too (the map
             // is the source of truth; this field is a cache). Without this, a
             // publisher whose token was cancelled + removed on view release —
@@ -249,14 +245,133 @@ impl HostState {
             self.capsule_id.as_str(),
         );
 
-        // Install the KV / secret-store / capsule-log overlays for the publisher
-        // (owner included), or clear them to the neutral floor for a
-        // principal-less event. `home` / `tmp` are NOT installed here: they mount
-        // a VFS (async) and `ipc::poll` is a sync bindgen fn; run+recv capsules
-        // do not touch `home://` / `/tmp`, and the neutral `None` fallback is
-        // fail-closed (never the load-owner), so leaving them unset is correct.
-        // This closes the recv-path secret bleed: a non-owner publisher now
-        // resolves `effective_secret_store` to ITS OWN store, not `default`'s.
-        crate::engine::wasm::install_principal_overlays_sync(self, publisher.as_ref());
+        // Install every principal-scoped overlay for the publisher (owner
+        // included), or clear to the neutral floor for a principal-less event.
+        if crate::engine::wasm::install_principal_overlays_sync(self, publisher.as_ref()) {
+            self.install_recv_invocation_vfs(publisher.as_ref());
+        } else {
+            self.invocation_home = None;
+            self.invocation_tmp = None;
+        }
+    }
+
+    /// Build the recv message's home/tmp VFS bundle synchronously. Principal
+    /// switches are already deduplicated above, making this a per-switch cost
+    /// rather than a per-message mount.
+    fn install_recv_invocation_vfs(&mut self, principal: Option<&astrid_core::PrincipalId>) {
+        let Some(principal) = principal else {
+            self.invocation_home = None;
+            self.invocation_tmp = None;
+            return;
+        };
+        let Ok(astrid_home) = astrid_core::dirs::AstridHome::resolve() else {
+            self.invocation_home = None;
+            self.invocation_tmp = None;
+            return;
+        };
+        self.install_recv_invocation_vfs_at(principal, &astrid_home);
+    }
+
+    fn install_recv_invocation_vfs_at(
+        &mut self,
+        principal: &astrid_core::PrincipalId,
+        astrid_home: &astrid_core::dirs::AstridHome,
+    ) {
+        let bundle = build_recv_vfs_bundle_at(&astrid_home.principal_home(principal));
+        self.invocation_home = bundle.home;
+        self.invocation_tmp = bundle.tmp;
+    }
+}
+
+fn build_recv_vfs_bundle_at(
+    principal_home: &astrid_core::dirs::PrincipalHome,
+) -> crate::engine::wasm::PrincipalVfsBundle {
+    let home = mount_recv_dir(principal_home.root());
+    let tmp = if home.is_some() {
+        let path = principal_home.tmp_dir();
+        if path.exists() || std::fs::create_dir_all(&path).is_ok() {
+            mount_recv_dir(&path)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    crate::engine::wasm::PrincipalVfsBundle { home, tmp }
+}
+
+fn mount_recv_dir(root: &std::path::Path) -> Option<crate::engine::wasm::PrincipalMount> {
+    if !root.exists() {
+        return None;
+    }
+    let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    let handle = astrid_capabilities::DirHandle::new();
+    match astrid_vfs::HostVfs::with_registered_dir(handle.clone(), &root) {
+        Ok(vfs) => Some(crate::engine::wasm::PrincipalMount {
+            root,
+            vfs: std::sync::Arc::new(vfs),
+            handle,
+        }),
+        Err(error) => {
+            tracing::warn!(%error, "failed to mount recv-path principal VFS");
+            None
+        },
+    }
+}
+
+#[cfg(test)]
+mod recv_vfs_tests {
+    #[tokio::test]
+    async fn recv_vfs_switches_principals_and_clears_without_one() {
+        let root = tempfile::tempdir().expect("runtime home");
+        let astrid_home = astrid_core::dirs::AstridHome::from_path(root.path());
+        astrid_home.ensure().expect("runtime layout");
+        let alice = astrid_core::PrincipalId::new("alice").expect("alice");
+        let bob = astrid_core::PrincipalId::new("bob").expect("bob");
+        astrid_home
+            .principal_home(&alice)
+            .ensure()
+            .expect("Alice home");
+        astrid_home.principal_home(&bob).ensure().expect("Bob home");
+
+        let mut state = crate::engine::wasm::test_fixtures::minimal_host_state(
+            tokio::runtime::Handle::current(),
+        );
+        state.install_recv_invocation_vfs_at(&alice, &astrid_home);
+        let alice_root = state
+            .invocation_home
+            .as_ref()
+            .expect("Alice mount")
+            .root
+            .clone();
+        assert_eq!(
+            alice_root,
+            astrid_home
+                .principal_home(&alice)
+                .root()
+                .canonicalize()
+                .expect("canonical Alice home")
+        );
+
+        state.install_recv_invocation_vfs_at(&bob, &astrid_home);
+        let bob_root = state
+            .invocation_home
+            .as_ref()
+            .expect("Bob mount")
+            .root
+            .clone();
+        assert_ne!(alice_root, bob_root);
+        assert_eq!(
+            bob_root,
+            astrid_home
+                .principal_home(&bob)
+                .root()
+                .canonicalize()
+                .expect("canonical Bob home")
+        );
+
+        state.install_recv_invocation_vfs(None);
+        assert!(state.invocation_home.is_none());
+        assert!(state.invocation_tmp.is_none());
     }
 }
