@@ -166,6 +166,12 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
 
 ### Fixed
 
+- **`astrid secret list` no longer reports an empty configured marker as a
+  second legacy secret.** Secret-typed capsule fields may retain `""` in their
+  env JSON to record completed configuration while the credential lives only in
+  the principal file-secret store. Listing now omits that valueless marker but
+  continues to flag every non-empty secret-typed env value as legacy plaintext.
+
 - **Offline init no longer performs the cached release check.** `astrid init
   --offline` and `astrid distro apply --offline` skip update discovery before
   command dispatch, so their no-network contract covers the complete CLI

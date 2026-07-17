@@ -273,6 +273,16 @@ fn write_env(path: &std::path::Path, env: &Map<String, Value>) -> Result<()> {
     Ok(())
 }
 
+fn classify_env_storage(is_declared_secret: bool, value: &Value) -> Option<SecretStorage> {
+    if !is_declared_secret {
+        return Some(SecretStorage::EnvJson);
+    }
+    if value.as_str() == Some("") {
+        return None;
+    }
+    Some(SecretStorage::EnvJsonLegacy)
+}
+
 fn run_set(args: &SetArgs) -> Result<ExitCode> {
     if args.key.is_empty() {
         anyhow::bail!("invalid key: must not be empty");
@@ -388,12 +398,14 @@ fn run_list(args: &ListArgs) -> Result<ExitCode> {
             // classified as `EnvJson` (non-secret) when it might be a
             // legacy plaintext secret.
             let manifest = load_capsule_manifest(stem)?;
-            for k in env.keys() {
-                let storage = manifest
+            for (k, value) in &env {
+                let is_declared_secret = manifest
                     .as_ref()
                     .and_then(|m| m.env.get(k))
-                    .filter(|d| d.env_type.eq_ignore_ascii_case("secret"))
-                    .map_or(SecretStorage::EnvJson, |_| SecretStorage::EnvJsonLegacy);
+                    .is_some_and(|d| d.env_type.eq_ignore_ascii_case("secret"));
+                let Some(storage) = classify_env_storage(is_declared_secret, value) else {
+                    continue;
+                };
                 keys.push(SecretKey {
                     capsule: stem.to_string(),
                     key: k.clone(),
@@ -619,5 +631,18 @@ mod tests {
         fs::write(&p, "{not json").unwrap();
         let err = read_env(&p).expect_err("malformed");
         assert!(err.to_string().contains("not valid JSON"), "got: {err}");
+    }
+
+    #[test]
+    fn empty_secret_marker_is_not_reported_as_legacy_plaintext() {
+        assert!(classify_env_storage(true, &Value::String(String::new())).is_none());
+        assert!(matches!(
+            classify_env_storage(true, &Value::String("secret".into())),
+            Some(SecretStorage::EnvJsonLegacy)
+        ));
+        assert!(matches!(
+            classify_env_storage(false, &Value::String(String::new())),
+            Some(SecretStorage::EnvJson)
+        ));
     }
 }
