@@ -4,6 +4,8 @@ on:
   push:
     tags:
       - 'v[0-9]+.*'
+      - '!v[0-9]+.*-nightly.*'
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -16,9 +18,66 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  classify:
+    name: Classify release lane
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
+    outputs:
+      nightly: ${{ steps.release.outputs.nightly }}
+      version: ${{ steps.release.outputs.version }}
+      source-commit: ${{ steps.release.outputs.source-commit }}
+    steps:
+      - uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.12'
+      - name: Bind event, tag, and source commit
+        id: release
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          [[ "$GITHUB_REF" == refs/tags/v* ]]
+          VERSION="${GITHUB_REF_NAME#v}"
+          SOURCE_COMMIT=$(git rev-parse 'HEAD^{commit}')
+          if [[ "$EVENT_NAME" == push ]]; then
+            [[ "$VERSION" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]
+            NIGHTLY=false
+          elif [[ "$EVENT_NAME" == workflow_dispatch ]]; then
+            NIGHTLY_DATE="${VERSION#*-nightly.}"
+            NIGHTLY_DATE="${NIGHTLY_DATE%%.g*}"
+            RUN_CREATED_AT=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" --jq .created_at)
+            python3 scripts/nightly_version.py validate-dispatch \
+              --date "$NIGHTLY_DATE" \
+              --created-at "$RUN_CREATED_AT"
+            EXPECTED=$(python3 scripts/nightly_version.py derive \
+              --date "$NIGHTLY_DATE" \
+              --source-commit "$SOURCE_COMMIT")
+            [[ "$VERSION" == "$EXPECTED" ]]
+            git fetch --no-tags origin main
+            git merge-base --is-ancestor "$SOURCE_COMMIT" origin/main
+            NIGHTLY=true
+          else
+            echo "unsupported release event: $EVENT_NAME" >&2
+            exit 1
+          fi
+          {
+            echo "nightly=$NIGHTLY"
+            echo "version=$VERSION"
+            echo "source-commit=$SOURCE_COMMIT"
+          } >> "$GITHUB_OUTPUT"
+
   # ── Build binaries for each platform ──────────────────────────────
   build:
     name: Build (${{ matrix.target }})
+    needs: classify
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -50,6 +109,32 @@ jobs:
           # release build fails with `read wit/host: No such file or
           # directory`. Matches the ci.yml fix landed in #752.
           submodules: recursive
+
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.12'
+
+      - name: Refuse a nightly after its canonical base is tagged
+        if: needs.classify.outputs.nightly == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          BASE_VERSION=$(python3 - <<'PY'
+          import tomllib
+          with open("release/nightly.toml", "rb") as file:
+              print(tomllib.load(file)["base-version"])
+          PY
+          )
+          BASE_REFS="$RUNNER_TEMP/canonical-base-refs.json"
+          gh api "repos/$GITHUB_REPOSITORY/git/matching-refs/tags/v$BASE_VERSION" > "$BASE_REFS"
+          if ! jq -e --arg ref "refs/tags/v$BASE_VERSION" 'all(.ref != $ref)' "$BASE_REFS" >/dev/null; then
+            echo "canonical v$BASE_VERSION was tagged while this nightly waited for approval" >&2
+            exit 1
+          fi
+
+      - name: Stage deterministic nightly version
+        if: needs.classify.outputs.nightly == 'true'
+        run: python3 scripts/nightly_version.py stage --version "${GITHUB_REF_NAME#v}"
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
@@ -101,7 +186,7 @@ jobs:
   # ── Create the GitHub release with all binaries ───────────────────
   github-release:
     name: GitHub Release
-    needs: build
+    needs: [classify, build]
     runs-on: ubuntu-latest
     environment: release
     permissions:
@@ -131,6 +216,10 @@ jobs:
         with:
           python-version: '3.12'
 
+      - name: Stage deterministic nightly version
+        if: needs.classify.outputs.nightly == 'true'
+        run: python3 scripts/nightly_version.py stage --version "${GITHUB_REF_NAME#v}"
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
         with:
@@ -155,6 +244,7 @@ jobs:
       - name: Compose release notes
         env:
           GH_TOKEN: ${{ github.token }}
+          NIGHTLY: ${{ needs.classify.outputs.nightly }}
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
           NOTES=release-notes.md
@@ -168,11 +258,26 @@ jobs:
           cat >> "$NOTES" <<'INSTALL'
 
           ## Install
+          INSTALL
+
+          if [[ "$NIGHTLY" == true ]]; then
+            cat >> "$NOTES" <<'INSTALL'
+
+          Nightly releases are available only as signed pre-built binaries and
+          through `astrid update --channel nightly`. They are not published to
+          crates.io or Homebrew.
+          INSTALL
+          else
+            cat >> "$NOTES" <<'INSTALL'
 
           **From source (requires Rust 1.95+):**
           ```
           cargo install astrid
           ```
+          INSTALL
+          fi
+
+          cat >> "$NOTES" <<'INSTALL'
 
           **Pre-built binaries:**
           Download the archive for your platform, extract, and add to PATH:
@@ -192,7 +297,10 @@ jobs:
           **With many thanks from the following Astrinauts** 🚀
 
           INSTALL
-          PREV_TAG=$(git tag --sort=-v:refname | sed -n '2p')
+          PREV_TAG=$(git tag --merged HEAD --sort=-v:refname \
+            | grep -E '^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$' \
+            | grep -Fvx "$GITHUB_REF_NAME" \
+            | sed -n '1p' || true)
           if [ -z "$PREV_TAG" ]; then
             AUTHORS=$(git log --format='%aN' | sort -u)
           else
@@ -251,6 +359,7 @@ jobs:
       - name: Detect an interrupted never-published draft
         env:
           GH_TOKEN: ${{ github.token }}
+          EXPECTED_PRERELEASE: ${{ needs.classify.outputs.nightly }}
         run: |
           RELEASES="$RUNNER_TEMP/releases-preflight.json"
           gh api "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
@@ -262,8 +371,8 @@ jobs:
             echo "EXISTING_RELEASE=0" >> "$GITHUB_ENV"
             exit 0
           fi
-          jq -e --arg tag "$GITHUB_REF_NAME" \
-            '.[][] | select(.tag_name == $tag) | select(.draft == true and .prerelease == false and .published_at == null)' \
+          jq -e --arg tag "$GITHUB_REF_NAME" --argjson prerelease "$EXPECTED_PRERELEASE" \
+            '.[][] | select(.tag_name == $tag) | select(.draft == true and .prerelease == $prerelease and .published_at == null)' \
             "$RELEASES" >/dev/null || {
             echo "release $GITHUB_REF_NAME already exists and is not a never-published draft" >&2
             echo "release assets are write-once; never clobber, delete, or retag a published version" >&2
@@ -297,6 +406,7 @@ jobs:
       - name: Select and authenticate the exact release candidate
         env:
           GH_TOKEN: ${{ github.token }}
+          EXPECTED_PRERELEASE: ${{ needs.classify.outputs.nightly }}
         run: |
           CANDIDATE="$GITHUB_WORKSPACE/artifacts"
           if [[ "$EXISTING_RELEASE" == 1 ]]; then
@@ -307,7 +417,8 @@ jobs:
               --paginate --slurp > "$RELEASES"
             jq --arg tag "$GITHUB_REF_NAME" \
               '[.[][] | select(.tag_name == $tag)]' "$RELEASES" > "$MATCHING_RELEASE"
-            jq -e 'length == 1 and .[0].draft == true and .[0].prerelease == false and .[0].published_at == null' \
+            jq -e --argjson prerelease "$EXPECTED_PRERELEASE" \
+              'length == 1 and .[0].draft == true and .[0].prerelease == $prerelease and .[0].published_at == null' \
               "$MATCHING_RELEASE" >/dev/null
             RELEASE_ID=$(jq -er '.[0].id' "$MATCHING_RELEASE")
             echo "SELECTED_RELEASE_ID=$RELEASE_ID" >> "$GITHUB_ENV"
@@ -357,6 +468,38 @@ jobs:
             commands::update_auth::tests::release_gate_authenticates_all_archives_with_production_policy \
             -- --ignored --exact
 
+      - name: Authenticate the remote tag before candidate publication
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EXPECTED_SOURCE: ${{ needs.classify.outputs.source-commit }}
+          NIGHTLY: ${{ needs.classify.outputs.nightly }}
+        run: |
+          TAG_OBJECT=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$GITHUB_REF_NAME")
+          TAG_TYPE=$(jq -er .object.type <<< "$TAG_OBJECT")
+          TAG_COMMIT=$(jq -er .object.sha <<< "$TAG_OBJECT")
+          for _ in {1..8}; do
+            [[ "$TAG_TYPE" == tag ]] || break
+            TAG_OBJECT=$(gh api "repos/$GITHUB_REPOSITORY/git/tags/$TAG_COMMIT")
+            TAG_TYPE=$(jq -er .object.type <<< "$TAG_OBJECT")
+            TAG_COMMIT=$(jq -er .object.sha <<< "$TAG_OBJECT")
+          done
+          [[ "$TAG_TYPE" == commit ]]
+          [[ "$TAG_COMMIT" == "$EXPECTED_SOURCE" ]]
+          if [[ "$NIGHTLY" == true ]]; then
+            BASE_VERSION=$(python3 - <<'PY'
+          import tomllib
+          with open("release/nightly.toml", "rb") as file:
+              print(tomllib.load(file)["base-version"])
+          PY
+            )
+            BASE_REFS="$RUNNER_TEMP/canonical-base-refs.json"
+            gh api "repos/$GITHUB_REPOSITORY/git/matching-refs/tags/v$BASE_VERSION" > "$BASE_REFS"
+            if ! jq -e --arg ref "refs/tags/v$BASE_VERSION" 'all(.ref != $ref)' "$BASE_REFS" >/dev/null; then
+              echo "canonical v$BASE_VERSION was tagged while this nightly waited for approval" >&2
+              exit 1
+            fi
+          fi
+
       - name: Require the release tag to remain unused before draft creation
         if: env.EXISTING_RELEASE != '1'
         env:
@@ -373,6 +516,8 @@ jobs:
         uses: softprops/action-gh-release@718ea10b132b3b2eba29c1007bb80653f286566b # v3.0.1
         with:
           draft: true
+          prerelease: ${{ needs.classify.outputs.nightly == 'true' }}
+          make_latest: false
           overwrite_files: false
           fail_on_unmatched_files: true
           files: |
@@ -387,26 +532,59 @@ jobs:
         if: env.EXISTING_RELEASE != '1'
         env:
           GH_TOKEN: ${{ github.token }}
+          EXPECTED_PRERELEASE: ${{ needs.classify.outputs.nightly }}
         run: |
           RELEASES="$RUNNER_TEMP/releases-after-create.json"
           gh api "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
             --paginate --slurp > "$RELEASES"
-          RELEASE_ID=$(jq -er --arg tag "$GITHUB_REF_NAME" \
-            '[.[][] | select(.tag_name == $tag) | select(.draft == true and .prerelease == false and .published_at == null)] | select(length == 1) | .[0].id' \
+          RELEASE_ID=$(jq -er --arg tag "$GITHUB_REF_NAME" --argjson prerelease "$EXPECTED_PRERELEASE" \
+            '[.[][] | select(.tag_name == $tag) | select(.draft == true and .prerelease == $prerelease and .published_at == null)] | select(length == 1) | .[0].id' \
             "$RELEASES")
           echo "SELECTED_RELEASE_ID=$RELEASE_ID" >> "$GITHUB_ENV"
 
       - name: Reauthenticate and publish the exact immutable release
         env:
           GH_TOKEN: ${{ github.token }}
+          EXPECTED_PRERELEASE: ${{ needs.classify.outputs.nightly }}
+          EXPECTED_SOURCE: ${{ needs.classify.outputs.source-commit }}
         run: |
+          EXPECTED_LATEST=true
+          if [[ "$EXPECTED_PRERELEASE" == true ]]; then
+            EXPECTED_LATEST=false
+          fi
+          TAG_OBJECT=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$GITHUB_REF_NAME")
+          TAG_TYPE=$(jq -er .object.type <<< "$TAG_OBJECT")
+          TAG_COMMIT=$(jq -er .object.sha <<< "$TAG_OBJECT")
+          for _ in {1..8}; do
+            [[ "$TAG_TYPE" == tag ]] || break
+            TAG_OBJECT=$(gh api "repos/$GITHUB_REPOSITORY/git/tags/$TAG_COMMIT")
+            TAG_TYPE=$(jq -er .object.type <<< "$TAG_OBJECT")
+            TAG_COMMIT=$(jq -er .object.sha <<< "$TAG_OBJECT")
+          done
+          [[ "$TAG_TYPE" == commit ]]
+          [[ "$TAG_COMMIT" == "$EXPECTED_SOURCE" ]]
+          if [[ "$EXPECTED_PRERELEASE" == true ]]; then
+            BASE_VERSION=$(python3 - <<'PY'
+          import tomllib
+          with open("release/nightly.toml", "rb") as file:
+              print(tomllib.load(file)["base-version"])
+          PY
+            )
+            BASE_REFS="$RUNNER_TEMP/canonical-base-refs.json"
+            gh api "repos/$GITHUB_REPOSITORY/git/matching-refs/tags/v$BASE_VERSION" > "$BASE_REFS"
+            if ! jq -e --arg ref "refs/tags/v$BASE_VERSION" 'all(.ref != $ref)' "$BASE_REFS" >/dev/null; then
+              echo "canonical v$BASE_VERSION was tagged before nightly publication" >&2
+              exit 1
+            fi
+          fi
           RELEASES="$RUNNER_TEMP/releases-before-publish.json"
           MATCHING_RELEASE="$RUNNER_TEMP/matching-release-before-publish.json"
           gh api "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
             --paginate --slurp > "$RELEASES"
           jq --arg tag "$GITHUB_REF_NAME" \
             '[.[][] | select(.tag_name == $tag)]' "$RELEASES" > "$MATCHING_RELEASE"
-          jq -e 'length == 1 and .[0].draft == true and .[0].prerelease == false and .[0].published_at == null' \
+          jq -e --argjson prerelease "$EXPECTED_PRERELEASE" \
+            'length == 1 and .[0].draft == true and .[0].prerelease == $prerelease and .[0].published_at == null' \
             "$MATCHING_RELEASE" >/dev/null
           RELEASE_ID=$(jq -er '.[0].id' "$MATCHING_RELEASE")
           [[ "$RELEASE_ID" == "$SELECTED_RELEASE_ID" ]]
@@ -448,15 +626,19 @@ jobs:
           gh api --method PATCH \
             "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" \
             -F draft=false \
-            --jq 'select(.draft == false and .immutable == true and .published_at != null) | true' \
+            -f make_latest="$EXPECTED_LATEST" \
+            | jq -e --argjson prerelease "$EXPECTED_PRERELEASE" \
+              'select(.draft == false and .immutable == true and .prerelease == $prerelease and .published_at != null) | true' \
             | grep -Fx true
           gh api "repos/$GITHUB_REPOSITORY/releases/tags/$GITHUB_REF_NAME" \
-            --jq 'select(.draft == false and .immutable == true and .published_at != null) | true' \
+            | jq -e --argjson prerelease "$EXPECTED_PRERELEASE" \
+              'select(.draft == false and .immutable == true and .prerelease == $prerelease and .published_at != null) | true' \
             | grep -Fx true
 
   crates-io:
     name: Publish crates.io workspace
-    needs: github-release
+    needs: [classify, github-release]
+    if: needs.classify.outputs.nightly != 'true'
     runs-on: ubuntu-latest
     environment: release
     permissions:

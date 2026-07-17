@@ -37,7 +37,9 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
   authenticates the pointer, manifest, and archive; rejects generation rollback,
   same-generation equivocation, expiry, digest drift, and workflow-identity
   drift; and follows deliberate higher-generation rollbacks for self-managed
-  installations. No channel is promoted automatically by this change.
+  installations. An opt-in daily nightly train reuses the same tag-bound signer,
+  remains disabled by default, and still requires protected release and channel
+  approvals. A merge to `main` never publishes a release or moves a pointer.
 
 - **Operators can enforce a distro for `astrid init`.**
   `ASTRID_ENFORCED_DISTRO` supplies the distro source and rejects CLI attempts

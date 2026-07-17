@@ -9,7 +9,7 @@ on:
         type: choice
         options: [stable, dev, nightly]
       release_tag:
-        description: Existing immutable Astrid release tag (vX.Y.Z)
+        description: Existing immutable canonical or nightly Astrid release tag
         required: true
         type: string
       generation:
@@ -65,8 +65,11 @@ jobs:
           version = release_manifest.canonical_version(tag[1:])
           if tag != f"v{version}":
               raise SystemExit("release tag must be canonical v<semver>")
-          if channel == "stable" and "-" in version.split("+", 1)[0]:
-              raise SystemExit("stable cannot point to a semantic prerelease")
+          nightly = release_manifest.nightly_source_commit(version) is not None
+          if (channel == "nightly") != nightly:
+              raise SystemExit("nightly and canonical releases cannot cross channel classes")
+          if channel != "nightly" and ("-" in version or "+" in version):
+              raise SystemExit("stable and dev require canonical X.Y.Z releases")
           if not value.isascii() or not value.isdecimal() or value.startswith("0"):
               raise SystemExit("generation must be a canonical positive decimal integer")
           generation = int(value)
@@ -115,14 +118,22 @@ jobs:
             exit 1
           }
           [[ "$SOURCE_COMMIT" == "$TAG_COMMIT" ]]
+          EXPECTED_PRERELEASE=false
+          EXPECTED_EVENT=push
+          if [[ "$CHANNEL" == nightly ]]; then
+            EXPECTED_PRERELEASE=true
+            EXPECTED_EVENT=workflow_dispatch
+            [[ "${VERSION##*.g}" == "$SOURCE_COMMIT" ]]
+          fi
           gh api "repos/$GITHUB_REPOSITORY/releases/tags/$RELEASE_TAG" \
-            --jq 'select(.draft == false and .immutable == true) | true' \
+            | jq -e --argjson prerelease "$EXPECTED_PRERELEASE" \
+              'select(.draft == false and .immutable == true and .prerelease == $prerelease) | true' \
             | grep -Fx true
           RELEASE_RUNS="$RUNNER_TEMP/release-workflow-runs.json"
-          gh api "repos/$GITHUB_REPOSITORY/actions/workflows/release.yml/runs?event=push&status=completed&per_page=100" \
+          gh api "repos/$GITHUB_REPOSITORY/actions/workflows/release.yml/runs?status=completed&per_page=100" \
             --paginate --slurp > "$RELEASE_RUNS"
-          jq -e --arg tag "$RELEASE_TAG" --arg commit "$TAG_COMMIT" \
-            '[.[].workflow_runs[] | select(.head_branch == $tag and .head_sha == $commit and .conclusion == "success")] | length >= 1' \
+          jq -e --arg tag "$RELEASE_TAG" --arg commit "$TAG_COMMIT" --arg event "$EXPECTED_EVENT" \
+            '[.[].workflow_runs[] | select(.event == $event and .head_branch == $tag and .head_sha == $commit and .conclusion == "success")] | length >= 1' \
             "$RELEASE_RUNS" >/dev/null
           gh release view "$RELEASE_TAG" \
             --repo "$GITHUB_REPOSITORY" \
@@ -157,17 +168,15 @@ jobs:
                   f"release asset set is incomplete: missing={sorted(missing)}, non-unique={duplicate}"
               )
           PY
-          if [[ "$CHANNEL" == stable ]]; then
-            python3 - release.json <<'PY'
+          python3 - release.json "$EXPECTED_PRERELEASE" <<'PY'
           import json
           import sys
 
           with open(sys.argv[1], encoding="utf-8") as file:
               release = json.load(file)
-          if release["isPrerelease"]:
-              raise SystemExit("stable cannot point to a prerelease")
+          if release["isPrerelease"] != (sys.argv[2] == "true"):
+              raise SystemExit("GitHub prerelease state does not match the selected channel class")
           PY
-          fi
           mkdir release-assets
           gh release download "$RELEASE_TAG" \
             --repo "$GITHUB_REPOSITORY" \
@@ -215,6 +224,30 @@ jobs:
             "$RELEASE_METADATA" release-assets/SHA256SUMS.txt \
             --algorithm sha256
           echo "RELEASE_METADATA=$RELEASE_METADATA" >> "$GITHUB_ENV"
+      - name: Require stable to match the authenticated dev candidate
+        if: inputs.channel == 'stable'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir dev-candidate
+          gh release download channel-dev \
+            --repo "$GITHUB_REPOSITORY" \
+            --dir dev-candidate \
+            --pattern channel.toml \
+            --pattern channel.toml.sigstore.json
+          IDENTITY="https://github.com/astrid-runtime/astrid/.github/workflows/promote-channel.yml@refs/heads/main"
+          cosign verify-blob \
+            --bundle dev-candidate/channel.toml.sigstore.json \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+            --certificate-identity "$IDENTITY" \
+            --use-signed-timestamps \
+            dev-candidate/channel.toml
+          NOW=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          python3 scripts/channel_metadata.py validate \
+            --expected-channel dev \
+            --now "$NOW" \
+            --release-manifest "$RELEASE_METADATA" \
+            dev-candidate/channel.toml
       - name: Authenticate current channel generation
         env:
           GH_TOKEN: ${{ github.token }}
@@ -414,9 +447,6 @@ jobs:
           [[ "$GENERATION" -ge "$CURRENT" ]]
           [[ "$GENERATION" -ge "${HISTORY_FLOOR:-0}" ]]
           [[ "$CURRENT" -le "${HISTORY_FLOOR:-0}" ]]
-          if [[ "${HISTORY_FLOOR:-0}" == 0 && "$HISTORY_EXISTS" != 1 ]]; then
-            [[ "$GENERATION" == 1 ]]
-          fi
           if [[ "$GENERATION" == "$CURRENT" || "$GENERATION" == "${HISTORY_FLOOR:-0}" ]]; then
             [[ "$HISTORY_EXISTS" == 1 ]]
           fi
@@ -555,12 +585,3 @@ jobs:
             --pattern channel.toml.sigstore.json
           cmp -s channel.toml published-current/channel.toml
           cmp -s channel.toml.sigstore.json published-current/channel.toml.sigstore.json
-      - name: Notify Homebrew tap after stable promotion
-        if: inputs.channel == 'stable'
-        env:
-          GH_TOKEN: ${{ secrets.TAP_DISPATCH_TOKEN }}
-          RELEASE_TAG: ${{ inputs.release_tag }}
-        run: |
-          gh api repos/astrid-runtime/homebrew-tap/dispatches \
-            -f event_type=release \
-            -f "client_payload[version]=${RELEASE_TAG#v}"

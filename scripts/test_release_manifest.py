@@ -68,6 +68,29 @@ class ReleaseManifestTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "canonical"):
                 release_manifest.canonical_version(invalid)
 
+    def test_nightly_version_must_embed_source_commit(self) -> None:
+        version = f"1.2.4-nightly.20260716.g{COMMIT}"
+        manifest = self.manifest()
+        manifest["version"] = version
+        manifest["tag"] = f"v{version}"
+        manifest["release-workflow-identity"] = (
+            "https://github.com/astrid-runtime/astrid/.github/workflows/"
+            f"release.yml@refs/tags/v{version}"
+        )
+        for target in manifest["targets"]:
+            target["asset"] = f"astrid-{version}-{target['triple']}.tar.gz"
+            target["sigstore-bundle"] = f"{target['asset']}.sigstore.json"
+        release_manifest.validate_manifest(manifest)
+        manifest["source-commit"] = "c" * 40
+        with self.assertRaisesRegex(ValueError, "embed its source commit"):
+            release_manifest.validate_manifest(manifest)
+        manifest["source-commit"] = COMMIT
+        bad_version = version.replace("20260716", "20260230")
+        manifest["version"] = bad_version
+        manifest["tag"] = f"v{bad_version}"
+        with self.assertRaisesRegex(ValueError, "malformed"):
+            release_manifest.validate_manifest(manifest)
+
     def test_rejects_missing_or_extra_checksum_assets(self) -> None:
         path = self.artifacts / "BLAKE3SUMS.txt"
         path.write_text(path.read_text() + f"{'f' * 64}  extra.tar.gz\n")

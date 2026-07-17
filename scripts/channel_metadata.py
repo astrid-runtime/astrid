@@ -181,13 +181,19 @@ def validate_channel(
     for key in RELEASE_KEYS:
         string(release[key], f"channel release {key}")
     version = release_manifest.canonical_version(release["version"])
-    if channel == "stable" and "-" in version.split("+", 1)[0]:
-        fail("stable channel cannot point to a prerelease")
+    nightly = release_manifest.nightly_source_commit(version) is not None
+    if channel == "nightly":
+        if not nightly:
+            fail("nightly channel must point to an exact nightly prerelease")
+    elif nightly or "-" in version or "+" in version:
+        fail("stable and dev channels must point to canonical releases")
     tag = release["tag"]
     if tag != f"v{version}":
         fail("channel release tag does not match its version")
     if release_manifest.COMMIT.fullmatch(release["source-commit"]) is None:
         fail("channel release source commit is invalid")
+    if nightly and release_manifest.nightly_source_commit(version) != release["source-commit"]:
+        fail("nightly channel version does not embed its source commit")
     if release["metadata-asset"] != f"astrid-{version}-release.toml":
         fail("channel release metadata asset is not canonical")
     if release_manifest.HEX_64.fullmatch(release["metadata-blake3"]) is None:

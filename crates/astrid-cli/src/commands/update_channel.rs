@@ -5,7 +5,7 @@ use std::io::Write;
 use std::path::PathBuf;
 
 use anyhow::{Context, bail, ensure};
-use chrono::{DateTime, SecondsFormat, Utc};
+use chrono::{DateTime, NaiveDate, SecondsFormat, Utc};
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 
@@ -363,11 +363,16 @@ fn validate_pointer(
         "signed channel lifetime exceeds the maximum for its channel"
     );
     let version = canonical_version(&pointer.release.version)?;
-    if expected_channel == UpdateChannel::Stable {
-        ensure!(
-            version.pre.is_empty(),
-            "stable channel cannot point to a prerelease"
-        );
+    let nightly_commit = nightly_source_commit(&version);
+    match expected_channel {
+        UpdateChannel::Nightly => ensure!(
+            nightly_commit.is_some() && version.build.is_empty(),
+            "nightly channel must point to an exact nightly prerelease"
+        ),
+        UpdateChannel::Stable | UpdateChannel::Dev => ensure!(
+            version.pre.is_empty() && version.build.is_empty(),
+            "stable and dev channels must point to canonical releases"
+        ),
     }
     ensure!(
         pointer.release.tag == format!("v{version}"),
@@ -377,6 +382,12 @@ fn validate_pointer(
         is_commit(&pointer.release.source_commit),
         "signed channel source commit is invalid"
     );
+    if let Some(commit) = nightly_commit {
+        ensure!(
+            commit == pointer.release.source_commit,
+            "nightly channel version does not embed its source commit"
+        );
+    }
     ensure!(
         pointer.release.metadata_asset == format!("astrid-{version}-release.toml"),
         "signed channel release metadata asset is invalid"
@@ -394,6 +405,26 @@ fn validate_pointer(
     );
     validate_targets(&pointer.targets, &pointer.release.version)?;
     Ok(())
+}
+
+fn nightly_source_commit(version: &semver::Version) -> Option<&str> {
+    let mut parts = version.pre.as_str().split('.');
+    let kind = parts.next()?;
+    let date = parts.next()?;
+    let commit = parts.next()?.strip_prefix('g')?;
+    if parts.next().is_some()
+        || kind != "nightly"
+        || date.len() != 8
+        || !date.bytes().all(|byte| byte.is_ascii_digit())
+        || NaiveDate::parse_from_str(date, "%Y%m%d").is_err()
+        || commit.len() != 40
+        || !commit
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return None;
+    }
+    Some(commit)
 }
 
 pub(super) fn verify_release_manifest(

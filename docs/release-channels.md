@@ -14,8 +14,23 @@ signed pointers to those exact bytes:
 All three channels point only to an existing release whose manifest and every
 platform archive were signed by Astrid's exact tag-bound release workflow. A
 promotion does not rebuild, rename, or replace release archives. The build
-train and channel promotion remain separate operations: this repository does
-not currently cut a release or advance a channel merely because `main` moved.
+train and channel promotion remain separate operations. A merge to `main` is
+never itself a release or channel promotion.
+
+Stable and dev releases are deliberate canonical `X.Y.Z` tags. Nightly is a
+deterministic prerelease of the reviewed base version in `release/nightly.toml`:
+
+```text
+X.Y.Z-nightly.YYYYMMDD.g<40-character-source-commit>
+```
+
+The scheduled nightly orchestrator tags the exact `main` commit, then explicitly
+dispatches the tag-bound release workflow. It is inert unless the repository
+variable `ASTRID_NIGHTLY_RELEASES_ENABLED` is exactly `true`. The release still
+waits at the protected `release` environment, and its successful completion only
+requests a protected nightly promotion; neither approval is bypassed. The
+ephemeral version overlay exists only in the release checkout and is never
+committed to `main`.
 
 No channel pointer is published by this change. Before the first promotion,
 configure all three channel environments with a required human reviewer and
@@ -41,11 +56,13 @@ never-published draft whose exact inventory, manifest, source and WIT commits,
 checksums, and tag-bound Sigstore identities reauthenticate. Published,
 incomplete, duplicate, empty, or unexpected assets fail closed. The first
 eligible immutable release must contain the release manifest and channel-aware
-updater; earlier releases cannot be promoted into this contract. After the
-immutable binary release is complete, the workflow publishes all 26 public
-workspace crates in dependency order and confirms each permanent crates.io
-checksum. Channel promotion requires the exact tag's complete release workflow
-to have succeeded, so it cannot run ahead of the crates.io train.
+updater; earlier releases cannot be promoted into this contract. After an
+immutable canonical binary release is complete, the workflow publishes all 26
+public workspace crates in dependency order and confirms each permanent
+crates.io checksum. Nightly releases are GitHub prereleases and never publish to
+crates.io. Stable and dev promotion require the canonical release workflow,
+including crates.io publication, to have succeeded. Nightly promotion requires
+the exact scheduled tag-bound workflow to have succeeded.
 
 ## Signed contract
 
@@ -68,6 +85,11 @@ release-workflow identity, and all four archive identities and digests. Stable
 pointers expire after 30 days, dev after 7 days, and nightly after 2 days.
 Renewal is a new promotion with a higher generation, even if it keeps the same
 release version.
+
+Stable promotion is allowed only when the currently authenticated dev pointer
+already identifies the exact same immutable release metadata and archives.
+Promotion therefore changes only the signed pointer; it never rebuilds dev
+bytes for stable.
 
 The promotion workflow retains each generation as one immutable history archive
 containing the pointer and bundle. It validates GitHub's paginated asset state,
@@ -107,11 +129,12 @@ self-managed clients follow that signed rollback.
 
 Homebrew and Cargo installations remain controlled by their package managers
 and follow stable. They do not silently switch to dev or nightly; use a
-self-managed Astrid installation for those channels. Immutable release creation
-does not notify the Homebrew tap; only successful stable promotion does. A
-signed stable rollback is applied with an exact Cargo reinstall or a Homebrew
-formula reinstall because ordinary package-manager upgrade commands do not
-downgrade.
+self-managed Astrid installation for those channels. The Homebrew tap
+independently authenticates the signed stable pointer and derives the formula
+version from it; Astrid does not dispatch a caller-selected version or share a
+cross-repository credential. A signed stable rollback is applied with an exact
+Cargo reinstall or a Homebrew formula reinstall because ordinary
+package-manager upgrade commands do not downgrade.
 
 `--source`, `ASTRID_UPDATE_REPO`, and `ASTRID_UPDATE_API` can select a mirror or
 test endpoint, but they cannot alter either accepted workflow identity, issuer,
@@ -120,3 +143,19 @@ repository, release tag, channel name, or signed digest.
 Product distributions such as Unicity AOS pin an immutable Astrid release
 manifest and exact runtime source commit. They do not resolve Astrid through a
 moving runtime channel while composing a product release.
+
+## Branch and retention policy
+
+`main` is the development trunk. There is no permanent `develop`, `stable`, or
+channel branch. After a stable minor release, create `release/X.Y` only when a
+supported patch line needs maintenance. Patch fixes land on that maintenance
+branch and are forward-ported to `main`; releases still require a deliberate
+signed tag and protected approval.
+
+Stable and dev releases and their channel history are retained permanently.
+Nightly releases and nightly history archives are retained for 90 days, except
+that the release and history archive referenced by the current nightly pointer
+are never deleted. Deletion must be performed by a separate, reviewed
+maintenance operation and installed before the channel approaches GitHub's
+per-release asset limit; the release train has no destructive garbage-collection
+permission. GitHub release tags are never reused.
