@@ -97,11 +97,19 @@ pub struct CapsuleTopicProbe(std::sync::Arc<CapsuleTopicProbeFns>);
 struct CapsuleTopicProbeFns {
     is_subscribed: CapsuleTopicProbeFn,
     ensure_subscribed: CapsuleTopicProbeFn,
+    subscriber_source_ids: CapsuleTopicSourceProbeFn,
 }
 
 #[allow(clippy::type_complexity)]
 type CapsuleTopicProbeFn = std::sync::Arc<
     dyn Fn(String) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send>>
+        + Send
+        + Sync,
+>;
+
+#[allow(clippy::type_complexity)]
+type CapsuleTopicSourceProbeFn = std::sync::Arc<
+    dyn Fn(String) -> std::pin::Pin<Box<dyn std::future::Future<Output = Vec<uuid::Uuid>> + Send>>
         + Send
         + Sync,
 >;
@@ -125,6 +133,7 @@ impl CapsuleTopicProbe {
         Self(std::sync::Arc::new(CapsuleTopicProbeFns {
             is_subscribed,
             ensure_subscribed,
+            subscriber_source_ids: std::sync::Arc::new(|_| Box::pin(async { Vec::new() })),
         }))
     }
 
@@ -150,6 +159,39 @@ impl CapsuleTopicProbe {
         Self(std::sync::Arc::new(CapsuleTopicProbeFns {
             is_subscribed: std::sync::Arc::new(is_subscribed),
             ensure_subscribed: std::sync::Arc::new(ensure_subscribed),
+            subscriber_source_ids: std::sync::Arc::new(|_| Box::pin(async { Vec::new() })),
+        }))
+    }
+
+    /// Wrap readiness, warm-up, and trusted-source probes from the same live
+    /// capsule registry.
+    pub fn new_with_ensure_and_sources(
+        is_subscribed: impl Fn(
+            String,
+        )
+            -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send>>
+        + Send
+        + Sync
+        + 'static,
+        ensure_subscribed: impl Fn(
+            String,
+        )
+            -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send>>
+        + Send
+        + Sync
+        + 'static,
+        subscriber_source_ids: impl Fn(
+            String,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Vec<uuid::Uuid>> + Send>,
+        > + Send
+        + Sync
+        + 'static,
+    ) -> Self {
+        Self(std::sync::Arc::new(CapsuleTopicProbeFns {
+            is_subscribed: std::sync::Arc::new(is_subscribed),
+            ensure_subscribed: std::sync::Arc::new(ensure_subscribed),
+            subscriber_source_ids: std::sync::Arc::new(subscriber_source_ids),
         }))
     }
 
@@ -163,6 +205,11 @@ impl CapsuleTopicProbe {
     /// [`Self::is_subscribed`].
     pub async fn ensure_subscribed(&self, topic: &str) -> bool {
         (self.0.ensure_subscribed)(topic.to_string()).await
+    }
+
+    /// Kernel-stamped IPC source IDs of loaded subscribers matching `topic`.
+    pub async fn subscriber_source_ids(&self, topic: &str) -> Vec<uuid::Uuid> {
+        (self.0.subscriber_source_ids)(topic.to_string()).await
     }
 }
 

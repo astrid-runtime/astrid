@@ -4,6 +4,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use crate::state::SigningMaterial;
 use astrid_core::kernel_api::CapsuleTopicProbe;
 
+fn test_provider_source_id() -> Uuid {
+    Uuid::from_u128(0x9141b6d2_61a8_4bf4_93cc_d0468375c492)
+}
+
 #[test]
 fn resolve_limit_defaults_and_caps() {
     // Absent → default.
@@ -249,7 +253,7 @@ async fn request_capsule_round_trips_scoped_reply() {
         let mut msg = IpcMessage::new(
             Topic::from_raw(resp_topic.clone()),
             IpcPayload::RawJson(reply),
-            session_capsule_source_id_v0(),
+            test_provider_source_id(),
         );
         if let AstridEvent::Ipc { message, .. } = &*event
             && let Some(principal) = &message.principal
@@ -271,7 +275,7 @@ async fn request_capsule_round_trips_scoped_reply() {
         correlation_id,
         &principal,
         None,
-        &[],
+        &[test_provider_source_id()],
         CAPSULE_TIMEOUT,
     )
     .await
@@ -306,7 +310,6 @@ async fn session_mgmt_gate_warms_caller_session_before_501() {
             |_topic| Box::pin(async { false }),
             move |topic| {
                 assert!(topic.contains("alice"));
-                assert!(topic.contains(SESSION_CAPSULE_ID));
                 assert!(topic.contains(TOPIC_LIST_REQUEST));
                 warmed_probe.store(true, Ordering::SeqCst);
                 Box::pin(async { true })
@@ -348,7 +351,7 @@ async fn request_capsule_round_trips_custom_json_reply() {
         let mut msg = IpcMessage::new(
             Topic::from_raw(resp_topic.clone()),
             IpcPayload::Custom { data: reply },
-            session_capsule_source_id_v0(),
+            test_provider_source_id(),
         );
         if let AstridEvent::Ipc { message, .. } = &*event
             && let Some(principal) = &message.principal
@@ -370,7 +373,7 @@ async fn request_capsule_round_trips_custom_json_reply() {
         correlation_id,
         &principal,
         None,
-        &[],
+        &[test_provider_source_id()],
         CAPSULE_TIMEOUT,
     )
     .await
@@ -389,7 +392,7 @@ async fn request_capsule_accepts_live_registry_source_id() {
     let correlation_id = "corr-live-source-1";
     let response_topic = format!("{TOPIC_LIST_RESPONSE_PREFIX}.{correlation_id}");
     let live_source = Uuid::new_v4();
-    assert_ne!(live_source, session_capsule_source_id_v0());
+    assert_ne!(live_source, test_provider_source_id());
 
     let mut req_rx = bus.subscribe_topic(TOPIC_LIST_REQUEST.to_string());
     let bus_capsule = Arc::clone(&bus);
@@ -748,7 +751,7 @@ async fn request_capsule_round_trips_update_reply() {
         let mut msg = IpcMessage::new(
             Topic::from_raw(resp_topic),
             IpcPayload::RawJson(reply),
-            session_capsule_source_id_v0(),
+            test_provider_source_id(),
         );
         if let Some(principal) = &message.principal {
             msg = msg.with_principal(principal.clone());
@@ -769,7 +772,7 @@ async fn request_capsule_round_trips_update_reply() {
         correlation_id,
         &principal,
         None,
-        &[],
+        &[test_provider_source_id()],
         CAPSULE_TIMEOUT,
     )
     .await
@@ -804,7 +807,7 @@ async fn request_capsule_ignores_wrong_principal_reply() {
         let msg = IpcMessage::new(
             Topic::from_raw(resp_topic),
             IpcPayload::RawJson(reply),
-            session_capsule_source_id_v0(),
+            test_provider_source_id(),
         )
         .with_principal("mallory".to_string());
         bus_bg.publish(AstridEvent::Ipc {
@@ -822,7 +825,7 @@ async fn request_capsule_ignores_wrong_principal_reply() {
         correlation_id,
         &principal,
         None,
-        &[],
+        &[test_provider_source_id()],
         Duration::from_millis(150),
     )
     .await
@@ -852,8 +855,7 @@ async fn request_capsule_ignores_wrong_capsule_source_reply() {
             }],
             "next_cursor": null
         });
-        let wrong_source =
-            crate::routes::capsule_sources::capsule_source_id_v0("astrid-capsule-adversarial");
+        let wrong_source = Uuid::from_u128(0x6ad9013c_23e4_4c0b_8cad_a7303e241ef0);
         let msg = IpcMessage::new(
             Topic::from_raw(resp_topic),
             IpcPayload::RawJson(reply),
@@ -875,7 +877,7 @@ async fn request_capsule_ignores_wrong_capsule_source_reply() {
         correlation_id,
         &principal,
         None,
-        &[],
+        &[test_provider_source_id()],
         Duration::from_millis(150),
     )
     .await
@@ -908,7 +910,7 @@ async fn request_capsule_ignores_mismatched_correlation() {
         let msg = IpcMessage::new(
             Topic::from_raw(resp_topic),
             IpcPayload::RawJson(reply),
-            session_capsule_source_id_v0(),
+            test_provider_source_id(),
         )
         .with_principal("alice".to_string());
         bus_bg.publish(AstridEvent::Ipc {
@@ -926,7 +928,7 @@ async fn request_capsule_ignores_mismatched_correlation() {
         correlation_id,
         &principal,
         None,
-        &[],
+        &[test_provider_source_id()],
         // Short timeout — we expect the mismatched reply to be skipped
         // and the call to time out rather than return a foreign body.
         Duration::from_millis(150),

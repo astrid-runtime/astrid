@@ -144,6 +144,8 @@ pub struct CapsuleRegistry {
     /// `source_id` back to the originating shared instance. One runtime per hash
     /// means one source UUID per hash, so this keys by [`WasmHash`].
     uuid_map: HashMap<Uuid, WasmHash>,
+    /// Forward map from content hashes to their live kernel-stamped source IDs.
+    source_uuid_by_hash: HashMap<WasmHash, Uuid>,
 }
 
 impl CapsuleRegistry {
@@ -156,6 +158,7 @@ impl CapsuleRegistry {
             uplinks: HashMap::new(),
             uuid_id_map: HashMap::new(),
             uuid_map: HashMap::new(),
+            source_uuid_by_hash: HashMap::new(),
         }
     }
 
@@ -413,6 +416,7 @@ impl CapsuleRegistry {
                 self.unregister_capsule_uplinks(id);
             }
             self.uuid_map.retain(|_, mapped_hash| mapped_hash != &hash);
+            self.source_uuid_by_hash.remove(&hash);
             self.uuid_id_map
                 .retain(|_, mapped_capsule_id| mapped_capsule_id != id);
             info!(capsule_id = %id, principal = %principal, hash = %hash, "Unregistered shared capsule instance (last view released)");
@@ -455,7 +459,16 @@ impl CapsuleRegistry {
             hash = %hash,
             "Registered capsule UUID mapping"
         );
-        self.uuid_map.insert(uuid, hash);
+        if let Some(previous_hash) = self.uuid_map.insert(uuid, hash.clone())
+            && previous_hash != hash
+        {
+            self.source_uuid_by_hash.remove(&previous_hash);
+        }
+        if let Some(previous_uuid) = self.source_uuid_by_hash.insert(hash, uuid)
+            && previous_uuid != uuid
+        {
+            self.uuid_map.remove(&previous_uuid);
+        }
     }
 
     /// Look up a capsule instance by its session UUID.
@@ -547,6 +560,14 @@ impl CapsuleRegistry {
     #[must_use]
     pub fn hash_for(&self, principal: &PrincipalId, id: &CapsuleId) -> Option<WasmHash> {
         self.views.get(principal)?.get(id).cloned()
+    }
+
+    /// Kernel-stamped IPC source ID for the runtime visible as `id` to
+    /// `principal`.
+    #[must_use]
+    pub fn source_id_for(&self, principal: &PrincipalId, id: &CapsuleId) -> Option<Uuid> {
+        let hash = self.views.get(principal)?.get(id)?;
+        self.source_uuid_by_hash.get(hash).copied()
     }
 
     /// Return an arbitrary principal whose view contains `id`.
@@ -765,6 +786,7 @@ impl CapsuleRegistry {
         self.uplinks.clear();
         self.uuid_id_map.clear();
         self.uuid_map.clear();
+        self.source_uuid_by_hash.clear();
         self.views.clear();
         self.instances
             .drain()

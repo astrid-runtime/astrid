@@ -26,15 +26,12 @@ use uuid::Uuid;
 
 use crate::error::{ErrorBody, GatewayError, GatewayResult};
 use crate::routes::WorkspaceContext;
-use crate::routes::capsule_sources::trusted_capsule_source_ids;
 use crate::routes::principals::caller_from;
 use crate::state::GatewayState;
 
 #[path = "sessions_bus.rs"]
 mod sessions_bus;
-use sessions_bus::request_capsule;
-#[cfg(test)]
-use sessions_bus::session_capsule_source_id_v0;
+use sessions_bus::{provider_source_ids, request_capsule, scoped_topic_probe_key};
 
 /// Default page size for the session-list endpoint when the caller
 /// omits `limit` (or passes `0`). Bounds the response body for casual
@@ -60,14 +57,6 @@ const CAPSULE_TIMEOUT: Duration = Duration::from_secs(15);
 /// finish async warm-up before publishing a request that would otherwise be
 /// dropped.
 const CAPSULE_PROBE_INTERVAL: Duration = Duration::from_millis(100);
-
-/// Internal topic-probe sentinel understood by the co-located kernel probe.
-/// This is deliberately not an IPC topic: it only travels through the
-/// in-process [`CapsuleTopicProbe`] closure.
-const SCOPED_TOPIC_PROBE_SENTINEL: &str = "\0astrid.scoped-topic\0";
-
-/// Capsule package that owns the session request/reply contract.
-const SESSION_CAPSULE_ID: &str = "astrid-capsule-session";
 
 /// Request topic the gateway publishes a session-list request on. Its
 /// presence in a loaded capsule's interceptor events is also the
@@ -322,7 +311,7 @@ pub async fn list_sessions(
 
 pub(super) async fn list_sessions_inner(
     state: Arc<GatewayState>,
-    workspace: &WorkspaceContext,
+    _workspace: &WorkspaceContext,
     query: SessionListQuery,
     req: Request<axum::body::Body>,
 ) -> GatewayResult<Json<SessionListResponse>> {
@@ -345,7 +334,8 @@ pub(super) async fn list_sessions_inner(
         query.include_archived.unwrap_or(false),
     );
     let response_topic = format!("{TOPIC_LIST_RESPONSE_PREFIX}.{correlation_id}");
-    let expected_sources = session_capsule_source_ids(&caller.principal, workspace);
+    let expected_sources =
+        provider_source_ids(&state, &caller.principal, TOPIC_LIST_REQUEST).await?;
 
     let value = request_capsule(
         &bus,
@@ -398,7 +388,7 @@ pub async fn get_session_messages(
 
 pub(super) async fn get_session_messages_inner(
     state: Arc<GatewayState>,
-    workspace: &WorkspaceContext,
+    _workspace: &WorkspaceContext,
     id: String,
     req: Request<axum::body::Body>,
 ) -> GatewayResult<Json<TranscriptResponse>> {
@@ -410,7 +400,8 @@ pub(super) async fn get_session_messages_inner(
     let correlation_id = Uuid::new_v4().to_string();
     let payload = build_messages_payload(&id, &correlation_id);
     let response_topic = format!("{TOPIC_MESSAGES_RESPONSE_PREFIX}.{correlation_id}");
-    let expected_sources = session_capsule_source_ids(&caller.principal, workspace);
+    let expected_sources =
+        provider_source_ids(&state, &caller.principal, TOPIC_MESSAGES_REQUEST).await?;
 
     let value = request_capsule(
         &bus,
@@ -467,7 +458,7 @@ pub async fn get_session(
 
 pub(super) async fn get_session_inner(
     state: Arc<GatewayState>,
-    workspace: &WorkspaceContext,
+    _workspace: &WorkspaceContext,
     id: String,
     req: Request<axum::body::Body>,
 ) -> GatewayResult<Json<SessionSummary>> {
@@ -486,7 +477,8 @@ pub(super) async fn get_session_inner(
         "session_id": id,
     });
     let response_topic = format!("{TOPIC_GET_META_RESPONSE_PREFIX}.{correlation_id}");
-    let expected_sources = session_capsule_source_ids(&caller.principal, workspace);
+    let expected_sources =
+        provider_source_ids(&state, &caller.principal, TOPIC_GET_META_REQUEST).await?;
 
     let value = request_capsule(
         &bus,
@@ -541,7 +533,7 @@ pub async fn update_session(
 
 pub(super) async fn update_session_inner(
     state: Arc<GatewayState>,
-    workspace: &WorkspaceContext,
+    _workspace: &WorkspaceContext,
     id: String,
     req: Request<axum::body::Body>,
 ) -> GatewayResult<Json<SessionSummary>> {
@@ -563,7 +555,7 @@ pub(super) async fn update_session_inner(
     let correlation_id = Uuid::new_v4().to_string();
     let payload = build_update_payload(&correlation_id, &id, &body)?;
     let response_topic = format!("{TOPIC_UPDATE_RESPONSE_PREFIX}.{correlation_id}");
-    let expected_sources = session_capsule_source_ids(&principal, workspace);
+    let expected_sources = provider_source_ids(&state, &principal, TOPIC_UPDATE_REQUEST).await?;
 
     let value = request_capsule(
         &bus,
@@ -614,7 +606,7 @@ pub async fn delete_session(
 
 pub(super) async fn delete_session_inner(
     state: Arc<GatewayState>,
-    workspace: &WorkspaceContext,
+    _workspace: &WorkspaceContext,
     id: String,
     req: Request<axum::body::Body>,
 ) -> GatewayResult<Json<DeleteResponse>> {
@@ -630,7 +622,8 @@ pub(super) async fn delete_session_inner(
         "session_id": id,
     });
     let response_topic = format!("{TOPIC_DELETE_RESPONSE_PREFIX}.{correlation_id}");
-    let expected_sources = session_capsule_source_ids(&caller.principal, workspace);
+    let expected_sources =
+        provider_source_ids(&state, &caller.principal, TOPIC_DELETE_REQUEST).await?;
 
     let value = request_capsule(
         &bus,
@@ -682,7 +675,7 @@ pub async fn search_sessions(
 
 pub(super) async fn search_sessions_inner(
     state: Arc<GatewayState>,
-    workspace: &WorkspaceContext,
+    _workspace: &WorkspaceContext,
     query: SearchQuery,
     req: Request<axum::body::Body>,
 ) -> GatewayResult<Json<SearchResponse>> {
@@ -702,7 +695,8 @@ pub(super) async fn search_sessions_inner(
         query.include_archived.unwrap_or(false),
     );
     let response_topic = format!("{TOPIC_SEARCH_RESPONSE_PREFIX}.{correlation_id}");
-    let expected_sources = session_capsule_source_ids(&caller.principal, workspace);
+    let expected_sources =
+        provider_source_ids(&state, &caller.principal, TOPIC_SEARCH_REQUEST).await?;
 
     let value = request_capsule(
         &bus,
@@ -743,18 +737,19 @@ fn require_bus(state: &GatewayState) -> GatewayResult<Arc<EventBus>> {
 /// registry, the same approach `POST /api/agent/prompt` takes for its
 /// fail-fast. The check is principal-scoped because default is not a shared
 /// fallback: a loaded default session capsule says nothing about whether the
-/// caller's own runtime has finished async warm-up. When the probe is absent
-/// (a standalone gateway with no kernel), the gate is skipped and the bus
-/// round-trip governs the outcome.
+/// caller's own runtime has finished async warm-up. The probe is required so
+/// replies can be authenticated against kernel-stamped live source IDs.
 async fn ensure_session_mgmt_supported(
     state: &GatewayState,
     principal: &PrincipalId,
 ) -> GatewayResult<()> {
     let Some(probe) = &state.topic_probe else {
-        return Ok(());
+        return Err(GatewayError::Kernel(
+            "gateway has no live capsule provider probe".into(),
+        ));
     };
 
-    let key = scoped_topic_probe_key(principal, SESSION_CAPSULE_ID, TOPIC_LIST_REQUEST);
+    let key = scoped_topic_probe_key(principal, TOPIC_LIST_REQUEST);
     if probe.is_subscribed(&key).await || probe.ensure_subscribed(&key).await {
         return Ok(());
     }
@@ -773,19 +768,6 @@ async fn ensure_session_mgmt_supported(
         }
         tokio::time::sleep(CAPSULE_PROBE_INTERVAL).await;
     }
-}
-
-fn session_capsule_source_ids(principal: &PrincipalId, workspace: &WorkspaceContext) -> Vec<Uuid> {
-    trusted_capsule_source_ids(
-        SESSION_CAPSULE_ID,
-        principal,
-        &workspace.root,
-        &workspace.layout,
-    )
-}
-
-fn scoped_topic_probe_key(principal: &PrincipalId, capsule_id: &str, topic: &str) -> String {
-    format!("{SCOPED_TOPIC_PROBE_SENTINEL}{principal}\0{capsule_id}\0{topic}")
 }
 
 /// Resolve the effective page size: reject anything over [`MAX_LIMIT`]

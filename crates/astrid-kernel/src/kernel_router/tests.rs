@@ -6,7 +6,7 @@ use super::*;
 use astrid_capsule::capsule::{Capsule, CapsuleId, CapsuleState};
 use astrid_capsule::context::CapsuleContext;
 use astrid_capsule::error::CapsuleResult;
-use astrid_capsule::manifest::{CapsuleManifest, CommandDef, PackageDef, SubscribeDef};
+use astrid_capsule::manifest::{CapsuleManifest, CommandDef, ExportDef, PackageDef, SubscribeDef};
 use astrid_capsule::registry::WasmHash;
 use astrid_core::kernel_api::CommandKind;
 use astrid_core::profile::{AuthMethod, DeviceKey, DeviceScope, PrincipalProfile};
@@ -68,6 +68,20 @@ impl InventoryCapsule {
                 priority: None,
             },
         );
+        self
+    }
+
+    fn with_export(mut self, namespace: &str, interface: &str, version: &str) -> Self {
+        self.manifest
+            .exports
+            .entry(namespace.to_string())
+            .or_default()
+            .insert(
+                interface.to_string(),
+                ExportDef {
+                    version: semver::Version::parse(version).expect("valid export version"),
+                },
+            );
         self
     }
 }
@@ -1186,41 +1200,113 @@ async fn capsule_topic_probe_can_target_exact_capsule_in_principal_view() {
     let principal = PrincipalId::new("regular-user").expect("valid principal");
     let topic = "session.v1.request.list";
 
+    let source_id = uuid::Uuid::new_v4();
     {
         let mut registry = kernel.capsules.write().await;
-        let hostile = InventoryCapsule::new("astrid-capsule-adversarial", "adversarial")
-            .with_subscribe(topic);
+        let provider =
+            InventoryCapsule::new("test-topic-provider", "provider").with_subscribe(topic);
+        let hash = WasmHash::synthetic("test-topic-provider", "0.0.1");
         registry
-            .register_for(
-                Box::new(hostile),
-                WasmHash::synthetic("astrid-capsule-adversarial", "0.0.1"),
-                &principal,
-            )
-            .expect("register hostile fixture");
+            .register_for(Box::new(provider), hash.clone(), &principal)
+            .expect("register provider fixture");
+        registry.register_instance_uuid(source_id, hash);
     }
 
     let probe = kernel.capsule_topic_probe();
-    let hostile_key = format!(
+    let provider_key = format!(
         "{}{}\0{}\0{}",
         crate::SCOPED_TOPIC_PROBE_SENTINEL,
         principal,
-        "astrid-capsule-adversarial",
+        "test-topic-provider",
         topic
     );
-    let session_key = format!(
+    let other_key = format!(
         "{}{}\0{}\0{}",
         crate::SCOPED_TOPIC_PROBE_SENTINEL,
         principal,
-        "astrid-capsule-session",
+        "test-other-provider",
+        topic
+    );
+    let any_provider_key = format!(
+        "{}{}\0{}",
+        crate::SCOPED_TOPIC_PROBE_SENTINEL,
+        principal,
         topic
     );
 
     assert!(
-        probe.is_subscribed(&hostile_key).await,
-        "exact hostile capsule probe should see the hostile subscriber"
+        probe.is_subscribed(&provider_key).await,
+        "exact provider probe should see the subscriber"
     );
     assert!(
-        !probe.is_subscribed(&session_key).await,
-        "session readiness must not be satisfied by a different capsule with the same topic"
+        !probe.is_subscribed(&other_key).await,
+        "an unrelated package name must not match the exact probe"
     );
+    assert_eq!(
+        probe.subscriber_source_ids(&any_provider_key).await,
+        vec![source_id],
+        "topic discovery must return the loaded provider's kernel-stamped source identity"
+    );
+}
+
+#[tokio::test]
+async fn capsule_service_probe_accepts_only_one_compatible_interface_provider() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let home = astrid_core::dirs::AstridHome::from_path(dir.path());
+    let kernel = crate::test_kernel_with_home(home).await;
+    let principal = PrincipalId::new("regular-user").expect("valid principal");
+    let topic = "session.v1.request.list";
+    let provider_source = uuid::Uuid::new_v4();
+
+    {
+        let mut registry = kernel.capsules.write().await;
+        let provider = InventoryCapsule::new("renamed-session-provider", "session")
+            .with_subscribe(topic)
+            .with_export("astrid", "session", "1.0.0");
+        let provider_hash = WasmHash::synthetic("renamed-session-provider", "0.0.1");
+        registry
+            .register_for(Box::new(provider), provider_hash.clone(), &principal)
+            .expect("register provider fixture");
+        registry.register_instance_uuid(provider_source, provider_hash);
+
+        let unrelated =
+            InventoryCapsule::new("topic-only-adversary", "adversary").with_subscribe(topic);
+        let unrelated_hash = WasmHash::synthetic("topic-only-adversary", "0.0.1");
+        registry
+            .register_for(Box::new(unrelated), unrelated_hash.clone(), &principal)
+            .expect("register unrelated fixture");
+        registry.register_instance_uuid(uuid::Uuid::new_v4(), unrelated_hash);
+    }
+
+    let probe = kernel.capsule_topic_probe();
+    let service_key = format!(
+        "{}{}\0astrid\0session\0^1.0\0{}",
+        crate::SCOPED_SERVICE_PROBE_SENTINEL,
+        principal,
+        topic
+    );
+    assert!(probe.is_subscribed(&service_key).await);
+    assert_eq!(
+        probe.subscriber_source_ids(&service_key).await,
+        vec![provider_source],
+        "a topic-only capsule must not become an authenticated service provider"
+    );
+
+    {
+        let mut registry = kernel.capsules.write().await;
+        let duplicate = InventoryCapsule::new("duplicate-session-provider", "duplicate")
+            .with_subscribe(topic)
+            .with_export("astrid", "session", "1.2.0");
+        let duplicate_hash = WasmHash::synthetic("duplicate-session-provider", "0.0.1");
+        registry
+            .register_for(Box::new(duplicate), duplicate_hash.clone(), &principal)
+            .expect("register duplicate fixture");
+        registry.register_instance_uuid(uuid::Uuid::new_v4(), duplicate_hash);
+    }
+
+    assert!(
+        !probe.is_subscribed(&service_key).await,
+        "ambiguous providers must fail closed"
+    );
+    assert!(probe.subscriber_source_ids(&service_key).await.is_empty());
 }

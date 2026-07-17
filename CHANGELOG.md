@@ -9,6 +9,11 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Runtime service discovery is product-neutral.** CLI and unique compatible
+  model/session interfaces authenticate live source IDs. Closes #1267.
+
 ## [0.10.0] - 2026-07-17
 
 ### Added
