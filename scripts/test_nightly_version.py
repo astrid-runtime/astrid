@@ -71,6 +71,13 @@ class NightlyVersionTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "source commit"):
             nightly_version.derive("0.10.0", "20260717", "A" * 40)
 
+    def test_rejects_boolean_schema_version(self) -> None:
+        (self.root / "release/nightly.toml").write_text(
+            'schema-version = true\nbase-version = "0.10.0"\n', encoding="utf-8"
+        )
+        with self.assertRaisesRegex(ValueError, "schema-version must be integer 1"):
+            nightly_version.base_version(self.root)
+
     def test_rejects_externalized_workspace_lock_entry(self) -> None:
         lock = self.root / "Cargo.lock"
         lock.write_text(lock.read_text().replace('name = "astrid-one"\nversion = "0.9.4"', 'name = "astrid-one"\nversion = "0.9.4"\nsource = "registry+https://example.invalid"'), encoding="utf-8")

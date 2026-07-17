@@ -39,7 +39,11 @@ def source_version(root: Path) -> str:
 def base_version(root: Path) -> str:
     metadata = load(root / "release/nightly.toml")
     require(set(metadata) == {"schema-version", "base-version"}, "nightly train metadata keys are invalid")
-    require(metadata["schema-version"] == 1, "nightly train schema-version must be integer 1")
+    schema_version = metadata["schema-version"]
+    require(
+        type(schema_version) is int and schema_version == 1,
+        "nightly train schema-version must be integer 1",
+    )
     value = metadata["base-version"]
     require(isinstance(value, str) and SEMVER.fullmatch(value) is not None, "nightly base-version must be canonical SemVer")
     current = tuple(int(part) for part in source_version(root).split("."))
