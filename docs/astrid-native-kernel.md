@@ -2,11 +2,15 @@
 
 Status: exploratory architecture and execution plan
 
-Last reviewed: 2026-07-17
+Last reviewed: 2026-07-18
 
 Code baseline: Astrid Runtime `v0.10.1` (`4771bab3`)
 
 Decision state: scope an Astrid-owned kernel; implementation choices remain open
+
+Execution and evidence are tracked in the
+[AI-Native OS Workplan](astrid-ai-native-os-workplan.md). The precise driver-role
+boundary is in the [Driver Domain Contract](astrid-driver-domain-contract.md).
 
 ## 1. Executive conclusion
 
@@ -589,21 +593,29 @@ creates a dedicated driver-host domain, and derives only the required handles.
 
 ```mermaid
 flowchart LR
-    Device[Physical or virtio device] --> Native[Ring-0 transport and isolation]
-    Native -->|native capability handles| Host[Ring-3 driver host]
+    Device[Physical or virtio device] --> Native[Platform authority and isolation]
+    Native -->|exclusive claim and native handles| Host[Ring-3 driver host]
     Host -->|WIT resources| Driver[WASM driver capsule]
-    Driver -->|typed service WIT or IPC| Consumers[System and app capsules]
+    Driver -->|single-client class service| Virtualizer[Resource virtualizer if shared]
+    Virtualizer -->|principal-scoped service| Consumers[Protocol, system, and app capsules]
 ```
 
 The native transport shim should perform operations that require privileged CPU or
-platform state. The driver capsule should own device-class and protocol logic.
+platform state. The driver capsule should own device-specific protocol and control
+state. A separate virtualizer owns multi-client admission, scheduling, fairness,
+and per-principal resources; higher protocol services own filesystems, networking,
+graphics, audio, or application semantics. The virtualizer may be omitted for a
+single-client device, but the roles must remain explicit even when a prototype
+co-locates them.
 
 Examples:
 
 - Native: PCI enumeration, BAR mapping, interrupt controller programming, IOMMU
   domain assignment, DMA map/unmap, cache maintenance, device reset.
-- WASM: USB class protocol, sensor protocol, filesystem semantics, packet filtering,
-  higher-level NIC queue policy, device-specific control state machines.
+- WASM driver: USB/device class protocol, sensor/device protocol, virtio feature and
+  queue state, and device-specific control state machines.
+- Virtualizer/protocol services: partitions and filesystems, packet filtering and
+  TCP/IP, GPU context scheduling, compositing, audio mixing, and principal policy.
 
 For virtio, the first split should put descriptor validation, device notification,
 and DMA mapping in native code while a driver capsule manages protocol state over a
@@ -611,6 +623,10 @@ mediated queue interface. That works without granting the driver direct DMA. A l
 fast path can move queue management into a dedicated ring-3 domain backed by an
 IOMMU. Whether buffers can also be shared with the WASM instance depends on a
 zero-copy, bounded-memory design and Wasmtime's supported memory model.
+
+The complete identity, capability, lifecycle, reset, DMA, composition, and GPU
+refinement is specified in the
+[Driver Domain Contract](astrid-driver-domain-contract.md).
 
 ### 7.2 Required hardware host interface
 

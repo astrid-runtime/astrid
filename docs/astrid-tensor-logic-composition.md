@@ -2,12 +2,16 @@
 
 Status: architecture design and pre-implementation model
 
-Last reviewed: 2026-07-17
+Last reviewed: 2026-07-18
 
 Code baseline: Astrid Runtime 0.10.1
 
 Decision state: preserve current behavior; add an exact composition model first;
 reserve Tensor Logic execution for a later, explicitly activated backend
+
+Execution and evidence are tracked in the
+[AI-Native OS Workplan](astrid-ai-native-os-workplan.md). Hardware-role terminology
+is defined by the [Driver Domain Contract](astrid-driver-domain-contract.md).
 
 ## 1. Executive decision
 
@@ -1068,6 +1072,13 @@ API over Vulkan, Metal, D3D12, and OpenGL, and supports WebGPU/WebGL when compil
 for browser Wasm. It is a provider implementation, not the Astrid contract or the
 authority model.
 
+More precisely, `astrid-graphics-wgpu` is an Astrid graphics API
+provider/resource broker, not the physical GPU driver. On a conventional host the
+vendor user/kernel driver, GPU scheduler, and memory manager remain host-OS
+components. On a native host the exclusive device driver, resource virtualizer,
+graphics API provider, and compositor are separately identified roles even if an
+early prototype co-locates some of them.
+
 The graphics provider is trusted to validate and account for resource use, but it
 is not kernel policy or business logic. Run it in a supervised process/domain where
 the host permits so a driver or shader-compiler failure does not take down routing,
@@ -1075,6 +1086,8 @@ capability state, or audit. The kernel's irreducible job remains handle isolatio
 authority checks, budgets, revocation, and fault containment.
 
 Reference: [wgpu documentation](https://docs.rs/wgpu/latest/wgpu/)
+
+Reference: [Astrid Driver Domain Contract](astrid-driver-domain-contract.md)
 
 A driver can be implemented in WASM only if a smaller trusted substrate gives it
 the device primitives it needs. WASM does not make a GPU self-driving: DMA can
