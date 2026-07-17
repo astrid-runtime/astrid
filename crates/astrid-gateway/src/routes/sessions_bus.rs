@@ -1,10 +1,40 @@
 use super::{
     AstridEvent, Duration, EventBus, EventMetadata, GatewayError, GatewayResult, IpcMessage,
-    IpcPayload, MessageOrigin, PrincipalId, SESSION_CAPSULE_ID, Topic, Uuid, Value,
+    IpcPayload, MessageOrigin, PrincipalId, Topic, Uuid, Value,
 };
+use crate::state::GatewayState;
 
-pub(super) fn session_capsule_source_id_v0() -> Uuid {
-    crate::routes::capsule_sources::capsule_source_id_v0(SESSION_CAPSULE_ID)
+const SCOPED_SERVICE_PROBE_SENTINEL: &str = "\0astrid.scoped-service\0";
+const SESSION_INTERFACE_REQUIREMENT: &str = "^1.0";
+
+pub(super) async fn provider_source_ids(
+    state: &GatewayState,
+    principal: &PrincipalId,
+    request_topic: &str,
+) -> GatewayResult<Vec<Uuid>> {
+    let probe = state
+        .topic_probe
+        .as_ref()
+        .ok_or_else(|| GatewayError::Kernel("gateway has no live capsule provider probe".into()))?;
+    let key = scoped_topic_probe_key(principal, request_topic);
+    if !probe.is_subscribed(&key).await && !probe.ensure_subscribed(&key).await {
+        return Err(GatewayError::Kernel(
+            "no loaded capsule handles the session request".into(),
+        ));
+    }
+    let source_ids = probe.subscriber_source_ids(&key).await;
+    if source_ids.is_empty() {
+        return Err(GatewayError::Kernel(
+            "no unique compatible loaded capsule handles the session request".into(),
+        ));
+    }
+    Ok(source_ids)
+}
+
+pub(super) fn scoped_topic_probe_key(principal: &PrincipalId, topic: &str) -> String {
+    format!(
+        "{SCOPED_SERVICE_PROBE_SENTINEL}{principal}\0astrid\0session\0{SESSION_INTERFACE_REQUIREMENT}\0{topic}"
+    )
 }
 
 /// Reusable capsule request/reply-over-bus primitive.
@@ -58,15 +88,11 @@ pub(super) async fn request_capsule(
     let deadline = tokio::time::Instant::now()
         .checked_add(timeout)
         .unwrap_or_else(tokio::time::Instant::now);
-    let expected_source_ids = if expected_source_ids.is_empty() {
-        tracing::warn!(
-            capsule_id = SESSION_CAPSULE_ID,
-            "falling back to v0 package-only capsule source id"
-        );
-        vec![session_capsule_source_id_v0()]
-    } else {
-        expected_source_ids.to_vec()
-    };
+    if expected_source_ids.is_empty() {
+        return Err(GatewayError::Kernel(
+            "no unique compatible loaded capsule handles the session request".into(),
+        ));
+    }
 
     loop {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());

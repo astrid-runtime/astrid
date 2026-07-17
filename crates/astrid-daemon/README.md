@@ -50,7 +50,7 @@ astrid-daemon --verbose
 2. Boots the kernel: event bus, KV store, capability store, audit log, VFS, MCP servers.
 3. Binds Unix socket at `~/.astrid/run/system.sock`, generates session token at `~/.astrid/run/system.token`.
 4. Loads all capsules from `~/.astrid/home/{principal}/.local/capsules/` and `.astrid/capsules/` (workspace).
-5. Verifies `astrid-capsule-cli` proxy is loaded (required for socket accept loop).
+5. Verifies a compatible Unix socket uplink is loaded (required for the socket accept loop).
 6. Writes readiness sentinel at `~/.astrid/run/system.ready` — CLI polls for this.
 7. Waits for SIGTERM/SIGINT, then shuts down gracefully (drains capsules, cleans up socket/token/readiness files).
 

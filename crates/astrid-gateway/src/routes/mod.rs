@@ -16,6 +16,7 @@ use crate::error::GatewayError;
 use crate::state::GatewayState;
 
 #[derive(Clone)]
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct WorkspaceContext {
     pub(crate) root: std::path::PathBuf,
     pub(crate) layout: astrid_core::dirs::WorkspaceLayout,
@@ -65,6 +66,7 @@ pub mod agent;
 pub mod audit;
 pub mod auth;
 pub mod caps;
+#[cfg(test)]
 mod capsule_sources;
 pub mod capsules;
 pub mod distribution;

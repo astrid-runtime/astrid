@@ -134,6 +134,19 @@ fn resolve_http_limits(cfg: Option<&astrid_config::Config>) -> astrid_capsule::H
     )
 }
 
+/// Whether a loaded capsule can serve the kernel-owned CLI Unix socket.
+///
+/// Package names are distribution policy. The runtime identifies the bridge
+/// by the behavior it requests: a long-lived uplink with a Unix bind.
+fn provides_cli_socket_uplink(manifest: &astrid_capsule::manifest::CapsuleManifest) -> bool {
+    manifest.capabilities.uplink
+        && manifest.capabilities.net_bind.iter().any(|binding| {
+            binding
+                .strip_prefix("unix:")
+                .is_some_and(|address| !address.trim().is_empty())
+        })
+}
+
 /// Run the Astrid daemon with the given arguments.
 ///
 /// This is the shared entry point used by both the standalone `astrid-daemon`
@@ -232,22 +245,22 @@ pub async fn run() -> Result<()> {
         );
     }
 
-    // Verify the CLI proxy capsule loaded. Without it, the daemon
-    // has no accept loop and CLI connections will always time out.
+    // Verify a compatible CLI socket uplink loaded. Without one, the daemon
+    // has no accept loop and CLI connections will always time out. Identify
+    // the provider by manifest behavior, never a distribution package name.
     {
         let reg = kernel.capsules.read().await;
         let has_cli_proxy = reg
-            .list()
-            .iter()
-            .any(|id| id.as_str() == "astrid-capsule-cli");
+            .values()
+            .any(|capsule| provides_cli_socket_uplink(capsule.manifest()));
         if !has_cli_proxy {
             tracing::error!(
-                "CLI proxy capsule (astrid-capsule-cli) not found - \
+                "compatible CLI socket uplink not found - \
                  daemon cannot accept CLI connections"
             );
             anyhow::bail!(
-                "CLI proxy capsule (astrid-capsule-cli) not found. \
-                 Install a compatible `astrid-capsule-cli` capsule, then restart the daemon."
+                "Compatible CLI socket uplink not found. \
+                 Install a capsule that provides a Unix socket uplink, then restart the daemon."
             );
         }
     }
@@ -410,4 +423,42 @@ fn spawn_gateway(
         }
     });
     Ok(notify)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::provides_cli_socket_uplink;
+    use astrid_capsule::manifest::CapsuleManifest;
+
+    fn manifest(name: &str, uplink: bool, net_bind: &[&str]) -> CapsuleManifest {
+        let mut manifest = CapsuleManifest::default();
+        manifest.package.name = name.to_owned();
+        manifest.capabilities.uplink = uplink;
+        manifest.capabilities.net_bind = net_bind.iter().map(ToString::to_string).collect();
+        manifest
+    }
+
+    #[test]
+    fn accepts_renamed_cli_socket_uplink() {
+        let renamed = manifest("distribution-cli", true, &["unix:*"]);
+        assert!(provides_cli_socket_uplink(&renamed));
+    }
+
+    #[test]
+    fn rejects_incomplete_or_non_unix_uplinks() {
+        let cases = [
+            manifest("no-uplink", false, &["unix:*"]),
+            manifest("no-bind", true, &[]),
+            manifest("tcp-only", true, &["127.0.0.1:8080"]),
+            manifest("empty-unix-bind", true, &["unix:"]),
+        ];
+
+        for manifest in cases {
+            assert!(
+                !provides_cli_socket_uplink(&manifest),
+                "{} must not satisfy CLI socket readiness",
+                manifest.package.name
+            );
+        }
+    }
 }

@@ -16,6 +16,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use astrid_core::PrincipalId;
+use astrid_core::kernel_api::CapsuleTopicProbe;
 use astrid_events::ipc::{IpcMessage, IpcPayload, Topic};
 use astrid_events::{AstridEvent, EventBus, EventMetadata};
 use astrid_gateway::{
@@ -31,10 +32,10 @@ use tower::ServiceExt;
 use uuid::Uuid;
 
 const REGISTRY_CAPSULE_NAMESPACE: Uuid = Uuid::from_u128(0x310714d5_9c6d_4c94_8187_75258f393bb6);
-const REGISTRY_CAPSULE_ID: &str = "astrid-capsule-registry";
+const TEST_PROVIDER_ID: &str = "test-model-provider";
 
 fn registry_source_id() -> Uuid {
-    Uuid::new_v5(&REGISTRY_CAPSULE_NAMESPACE, REGISTRY_CAPSULE_ID.as_bytes())
+    Uuid::new_v5(&REGISTRY_CAPSULE_NAMESPACE, TEST_PROVIDER_ID.as_bytes())
 }
 
 /// Build a gateway state, optionally wired to a live event bus. The
@@ -65,7 +66,11 @@ fn state_with_bus_timeout(
         session_id: None,
         gateway_route_uuid: Uuid::new_v4(),
         readiness_probe: None,
-        topic_probe: None,
+        topic_probe: Some(CapsuleTopicProbe::new_with_ensure_and_sources(
+            |_topic| Box::pin(async { true }),
+            |_topic| Box::pin(async { true }),
+            |_topic| Box::pin(async { vec![registry_source_id()] }),
+        )),
         registry_timeout,
     })
 }

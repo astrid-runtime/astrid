@@ -389,7 +389,10 @@ run_adversarial_capsule_smoke() {
 
   status="$(http_status GET "/api/agent/sessions?include_archived=true&limit=20" "$user_bearer" "" \
     "$ARTIFACTS/adversarial-capsule-session-list.json")"
-  assert_status "adversarial capsule session poison ignored" "$status" 200
+  case "$status" in
+    200|501) ;;
+    *) fail "adversarial capsule session poison ignored expected HTTP 200 or 501, got $status" ;;
+  esac
   assert_no_adversarial_session_poison "$ARTIFACTS/adversarial-capsule-session-list.json"
 
   note "checking live approval responder principal isolation"

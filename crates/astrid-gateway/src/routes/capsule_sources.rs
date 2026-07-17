@@ -8,10 +8,6 @@ use uuid::Uuid;
 
 const CAPSULE_ID_NAMESPACE: Uuid = Uuid::from_u128(0x310714d5_9c6d_4c94_8187_75258f393bb6);
 
-pub(super) fn capsule_source_id_v0(capsule_id: &str) -> Uuid {
-    Uuid::new_v5(&CAPSULE_ID_NAMESPACE, capsule_id.as_bytes())
-}
-
 /// Derive the trusted `source_id` a shared capsule runtime stamps on its IPC
 /// replies.
 ///
@@ -25,18 +21,6 @@ pub(super) fn capsule_source_id_v0(capsule_id: &str) -> Uuid {
 pub(super) fn capsule_source_id_v1(capsule_id: &str, content_hash: &str) -> Uuid {
     let seed = format!("{capsule_id}\0{content_hash}");
     Uuid::new_v5(&CAPSULE_ID_NAMESPACE, seed.as_bytes())
-}
-
-pub(super) fn trusted_capsule_source_ids(
-    capsule_id: &str,
-    caller: &PrincipalId,
-    workspace_root: &Path,
-    workspace_layout: &WorkspaceLayout,
-) -> Vec<Uuid> {
-    let Ok(home) = AstridHome::resolve() else {
-        return Vec::new();
-    };
-    trusted_capsule_source_ids_in_home(capsule_id, caller, workspace_root, workspace_layout, &home)
 }
 
 fn trusted_capsule_source_ids_in_home(

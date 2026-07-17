@@ -52,7 +52,6 @@ use uuid::Uuid;
 
 use crate::error::{ErrorBody, GatewayError, GatewayResult};
 use crate::routes::WorkspaceContext;
-use crate::routes::capsule_sources::{capsule_source_id_v0, trusted_capsule_source_ids};
 use crate::routes::principals::caller_from;
 use crate::state::GatewayState;
 use astrid_core::PrincipalId;
@@ -63,7 +62,8 @@ use astrid_core::PrincipalId;
 /// an unresponsive registry doesn't tie a request up indefinitely.
 const REGISTRY_TIMEOUT: Duration = Duration::from_secs(10);
 const CAPSULE_PROBE_INTERVAL: Duration = Duration::from_millis(100);
-const SCOPED_TOPIC_PROBE_SENTINEL: &str = "\0astrid.scoped-topic\0";
+const SCOPED_SERVICE_PROBE_SENTINEL: &str = "\0astrid.scoped-service\0";
+const REGISTRY_INTERFACE_REQUIREMENT: &str = "^1.0";
 
 /// Registry request/response topic pairs. Kept as `&'static str` so the
 /// `id` a client supplies can never reshape the topic namespace (no
@@ -74,12 +74,6 @@ const GET_ACTIVE_REQUEST: &str = "registry.v1.get_active_model";
 const GET_ACTIVE_RESPONSE: &str = "registry.v1.response.get_active_model";
 const SET_ACTIVE_REQUEST: &str = "registry.v1.set_active_model";
 const SET_ACTIVE_RESPONSE: &str = "registry.v1.response.set_active_model";
-const REGISTRY_CAPSULE_ID: &str = "astrid-capsule-registry";
-
-fn registry_capsule_source_id_v0() -> Uuid {
-    capsule_source_id_v0(REGISTRY_CAPSULE_ID)
-}
-
 /// Body for `PUT /api/models/active`.
 #[derive(Debug, Clone, Deserialize, ToSchema)]
 pub struct SetActiveModelRequest {
@@ -194,7 +188,7 @@ fn classify_set_active_reply(reply: &serde_json::Value) -> SetActiveOutcome {
 async fn registry_round_trip(
     state: &GatewayState,
     principal_id: &PrincipalId,
-    workspace: &WorkspaceContext,
+    _workspace: &WorkspaceContext,
     request_topic: &'static str,
     response_topic: &'static str,
     payload: serde_json::Value,
@@ -208,6 +202,7 @@ async fn registry_round_trip(
 
     let principal = principal_id.to_string();
     ensure_registry_request_subscribed(state, principal_id, request_topic).await?;
+    let expected_source_ids = provider_source_ids(state, principal_id, request_topic).await?;
 
     // Subscribe FIRST, then publish. Reverse order would race a fast
     // registry reply — the reply could land before subscribe returns and
@@ -258,21 +253,6 @@ async fn registry_round_trip(
     // `recv` is bounded by the time REMAINING, so a stream of skipped foreign
     // replies can never extend the total wait past the original budget.
     let timeout = state.registry_timeout.unwrap_or(REGISTRY_TIMEOUT);
-    let expected_source_ids = trusted_capsule_source_ids(
-        REGISTRY_CAPSULE_ID,
-        principal_id,
-        &workspace.root,
-        &workspace.layout,
-    );
-    let expected_source_ids = if expected_source_ids.is_empty() {
-        tracing::warn!(
-            capsule_id = REGISTRY_CAPSULE_ID,
-            "falling back to v0 package-only capsule source id"
-        );
-        vec![registry_capsule_source_id_v0()]
-    } else {
-        expected_source_ids
-    };
     // `checked_add` over the bare `+` so an absurd timeout can't panic on
     // overflow; saturating to `now` (a zero remaining budget) on overflow is
     // a harmless immediate timeout that the production budget never hits.
@@ -322,9 +302,11 @@ async fn ensure_registry_request_subscribed(
     request_topic: &str,
 ) -> GatewayResult<()> {
     let Some(probe) = &state.topic_probe else {
-        return Ok(());
+        return Err(GatewayError::Kernel(
+            "gateway has no live capsule provider probe".into(),
+        ));
     };
-    let key = scoped_topic_probe_key(principal, REGISTRY_CAPSULE_ID, request_topic);
+    let key = scoped_topic_probe_key(principal, request_topic);
     if probe.is_subscribed(&key).await || probe.ensure_subscribed(&key).await {
         return Ok(());
     }
@@ -337,15 +319,42 @@ async fn ensure_registry_request_subscribed(
         }
         if started.elapsed() >= timeout {
             return Err(GatewayError::Internal(anyhow::anyhow!(
-                "registry capsule is not loaded for caller"
+                "no loaded capsule handles the registry request for caller"
             )));
         }
         tokio::time::sleep(CAPSULE_PROBE_INTERVAL).await;
     }
 }
 
-fn scoped_topic_probe_key(principal: &PrincipalId, capsule_id: &str, topic: &str) -> String {
-    format!("{SCOPED_TOPIC_PROBE_SENTINEL}{principal}\0{capsule_id}\0{topic}")
+async fn provider_source_ids(
+    state: &GatewayState,
+    principal: &PrincipalId,
+    request_topic: &str,
+) -> GatewayResult<Vec<Uuid>> {
+    let probe = state.topic_probe.as_ref().ok_or_else(|| {
+        GatewayError::Internal(anyhow::anyhow!(
+            "gateway has no live capsule provider probe"
+        ))
+    })?;
+    let key = scoped_topic_probe_key(principal, request_topic);
+    if !probe.is_subscribed(&key).await && !probe.ensure_subscribed(&key).await {
+        return Err(GatewayError::Internal(anyhow::anyhow!(
+            "no loaded capsule handles the registry request for caller"
+        )));
+    }
+    let source_ids = probe.subscriber_source_ids(&key).await;
+    if source_ids.is_empty() {
+        return Err(GatewayError::Internal(anyhow::anyhow!(
+            "no unique compatible loaded capsule handles the registry request for caller"
+        )));
+    }
+    Ok(source_ids)
+}
+
+fn scoped_topic_probe_key(principal: &PrincipalId, topic: &str) -> String {
+    format!(
+        "{SCOPED_SERVICE_PROBE_SENTINEL}{principal}\0astrid\0registry\0{REGISTRY_INTERFACE_REQUIREMENT}\0{topic}"
+    )
 }
 
 /// `GET /api/models` — list the caller's available provider-entries.
@@ -532,16 +541,14 @@ async fn set_active_model_inner(
 #[cfg(test)]
 mod tests {
     use super::{
-        GET_ACTIVE_REQUEST, GET_ACTIVE_RESPONSE, REGISTRY_CAPSULE_ID, SetActiveOutcome,
-        classify_set_active_reply, registry_reply_payload_json, registry_round_trip,
-        reply_satisfies_corr_id,
+        GET_ACTIVE_REQUEST, GET_ACTIVE_RESPONSE, SetActiveOutcome, classify_set_active_reply,
+        registry_reply_payload_json, registry_round_trip, reply_satisfies_corr_id,
     };
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
 
     use crate::error::GatewayError;
     use crate::routes::WorkspaceContext;
-    use crate::routes::capsule_sources::capsule_source_id_v0;
     use crate::state::{GatewayState, SigningMaterial};
     use astrid_core::PrincipalId;
     use astrid_core::kernel_api::CapsuleTopicProbe;
@@ -550,6 +557,10 @@ mod tests {
     use serde_json::json;
     use tokio::sync::Mutex;
     use uuid::Uuid;
+
+    fn test_provider_source_id() -> Uuid {
+        Uuid::from_u128(0x9141b6d2_61a8_4bf4_93cc_d0468375c492)
+    }
 
     #[test]
     fn set_reply_with_entry_binds() {
@@ -637,7 +648,11 @@ mod tests {
             session_id: None,
             gateway_route_uuid: Uuid::new_v4(),
             readiness_probe: None,
-            topic_probe: None,
+            topic_probe: Some(CapsuleTopicProbe::new_with_ensure_and_sources(
+                |_topic| Box::pin(async { true }),
+                |_topic| Box::pin(async { true }),
+                |_topic| Box::pin(async { vec![test_provider_source_id()] }),
+            )),
             registry_timeout: Some(std::time::Duration::from_millis(150)),
         }
     }
@@ -656,7 +671,7 @@ mod tests {
                 IpcPayload::RawJson(json!({
                     "active_model": { "id": "openai-compat:forged" }
                 })),
-                capsule_source_id_v0("astrid-capsule-adversarial"),
+                Uuid::from_u128(0x6ad9013c_23e4_4c0b_8cad_a7303e241ef0),
             )
             .with_principal("alice".to_string());
             bus_bg.publish(AstridEvent::Ipc {
@@ -687,7 +702,7 @@ mod tests {
         let warmed = Arc::new(AtomicBool::new(false));
 
         let warmed_probe = Arc::clone(&warmed);
-        state.topic_probe = Some(CapsuleTopicProbe::new_with_ensure(
+        state.topic_probe = Some(CapsuleTopicProbe::new_with_ensure_and_sources(
             |_topic| Box::pin(async { false }),
             move |topic| {
                 assert!(topic.contains("alice"));
@@ -695,6 +710,7 @@ mod tests {
                 warmed_probe.store(true, Ordering::SeqCst);
                 Box::pin(async { true })
             },
+            |_topic| Box::pin(async { vec![test_provider_source_id()] }),
         ));
 
         let mut req_rx = bus.subscribe_topic(GET_ACTIVE_REQUEST.to_string());
@@ -716,7 +732,7 @@ mod tests {
                 IpcPayload::RawJson(json!({
                     "active_model": { "id": "openai-compat:fake-slow" }
                 })),
-                capsule_source_id_v0(REGISTRY_CAPSULE_ID),
+                test_provider_source_id(),
             )
             .with_principal("alice".to_string());
             bus_bg.publish(AstridEvent::Ipc {

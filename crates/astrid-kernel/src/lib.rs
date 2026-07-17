@@ -73,6 +73,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use tokio::sync::{Mutex, RwLock};
 
 const SCOPED_TOPIC_PROBE_SENTINEL: &str = "\0astrid.scoped-topic\0";
+const SCOPED_SERVICE_PROBE_SENTINEL: &str = "\0astrid.scoped-service\0";
 
 /// The core Operating System Kernel.
 pub struct Kernel {
@@ -1513,11 +1514,23 @@ impl Kernel {
     /// going through capability-gated inventory APIs.
     #[must_use]
     pub fn capsule_topic_probe(&self) -> astrid_core::kernel_api::CapsuleTopicProbe {
-        let registry = Arc::clone(&self.capsules);
-        astrid_core::kernel_api::CapsuleTopicProbe::new(move |topic: String| {
-            let registry = Arc::clone(&registry);
-            Box::pin(async move { Self::topic_has_subscriber(registry, topic).await })
-        })
+        let passive_registry = Arc::clone(&self.capsules);
+        let ensure_registry = Arc::clone(&self.capsules);
+        let source_registry = Arc::clone(&self.capsules);
+        astrid_core::kernel_api::CapsuleTopicProbe::new_with_ensure_and_sources(
+            move |topic: String| {
+                let registry = Arc::clone(&passive_registry);
+                Box::pin(async move { Self::topic_has_subscriber(registry, topic).await })
+            },
+            move |topic: String| {
+                let registry = Arc::clone(&ensure_registry);
+                Box::pin(async move { Self::topic_has_subscriber(registry, topic).await })
+            },
+            move |topic: String| {
+                let registry = Arc::clone(&source_registry);
+                Box::pin(async move { Self::topic_subscriber_source_ids(registry, topic).await })
+            },
+        )
     }
 
     /// Build a topic probe that can actively warm the caller's uplink capsules
@@ -1533,16 +1546,18 @@ impl Kernel {
         self: &Arc<Self>,
     ) -> astrid_core::kernel_api::CapsuleTopicProbe {
         let passive = self.capsule_topic_probe();
+        let passive_read = passive.clone();
+        let passive_sources = passive.clone();
         let warm_kernel = Arc::clone(self);
-        astrid_core::kernel_api::CapsuleTopicProbe::new_with_ensure(
+        astrid_core::kernel_api::CapsuleTopicProbe::new_with_ensure_and_sources(
             move |topic: String| {
-                let passive = passive.clone();
+                let passive = passive_read.clone();
                 Box::pin(async move { passive.is_subscribed(&topic).await })
             },
             move |topic: String| {
                 let kernel = Arc::clone(&warm_kernel);
                 Box::pin(async move {
-                    if let Some((principal, _, _)) = Self::split_scoped_topic_probe_key(&topic) {
+                    if let Some(principal) = Self::scoped_probe_principal(&topic) {
                         kernel.ensure_principal_uplinks_loaded(&principal).await;
                         kernel.publish_capsules_loaded().await;
                         if Self::topic_has_subscriber(Arc::clone(&kernel.capsules), topic.clone())
@@ -1556,10 +1571,32 @@ impl Kernel {
                     Self::topic_has_subscriber(Arc::clone(&kernel.capsules), topic).await
                 })
             },
+            move |topic: String| {
+                let passive = passive_sources.clone();
+                Box::pin(async move { passive.subscriber_source_ids(&topic).await })
+            },
         )
     }
 
     async fn topic_has_subscriber(registry: Arc<RwLock<CapsuleRegistry>>, topic: String) -> bool {
+        if let Some((principal, namespace, interface, requirement, scoped_topic)) =
+            Self::split_scoped_service_probe_key(&topic)
+        {
+            let reg = registry.read().await;
+            let mut providers = reg
+                .cloned_values_for(&principal)
+                .into_iter()
+                .filter(|capsule| {
+                    Self::capsule_provides_service(
+                        capsule.manifest(),
+                        &namespace,
+                        &interface,
+                        &requirement,
+                        &scoped_topic,
+                    )
+                });
+            return providers.next().is_some() && providers.next().is_none();
+        }
         if let Some((principal, capsule_id, scoped_topic)) =
             Self::split_scoped_topic_probe_key(&topic)
         {
@@ -1590,6 +1627,98 @@ impl Kernel {
                 &topic,
             )
         })
+    }
+
+    async fn topic_subscriber_source_ids(
+        registry: Arc<RwLock<CapsuleRegistry>>,
+        topic: String,
+    ) -> Vec<uuid::Uuid> {
+        if let Some((principal, namespace, interface, requirement, scoped_topic)) =
+            Self::split_scoped_service_probe_key(&topic)
+        {
+            let reg = registry.read().await;
+            let providers: Vec<_> = reg
+                .cloned_values_for(&principal)
+                .into_iter()
+                .filter(|capsule| {
+                    Self::capsule_provides_service(
+                        capsule.manifest(),
+                        &namespace,
+                        &interface,
+                        &requirement,
+                        &scoped_topic,
+                    )
+                })
+                .collect();
+            if providers.len() != 1 {
+                return Vec::new();
+            }
+            return providers
+                .first()
+                .and_then(|capsule| reg.source_id_for(&principal, capsule.id()))
+                .into_iter()
+                .collect();
+        }
+        let (principal, capsule_id, topic) = Self::split_scoped_topic_probe_key(&topic)
+            .unwrap_or_else(|| (PrincipalId::default(), None, topic));
+        let reg = registry.read().await;
+        let capsules = match capsule_id {
+            Some(capsule_id) => reg.get_for(&principal, &capsule_id).into_iter().collect(),
+            None => reg.cloned_values_for(&principal),
+        };
+        let mut source_ids: Vec<uuid::Uuid> = capsules
+            .into_iter()
+            .filter(|capsule| {
+                astrid_capsule::readiness::manifest_subscribes_topic(capsule.manifest(), &topic)
+            })
+            .filter_map(|capsule| reg.source_id_for(&principal, capsule.id()))
+            .collect();
+        source_ids.sort_unstable();
+        source_ids.dedup();
+        source_ids
+    }
+
+    fn capsule_provides_service(
+        manifest: &astrid_capsule_types::manifest::CapsuleManifest,
+        namespace: &str,
+        interface: &str,
+        requirement: &semver::VersionReq,
+        topic: &str,
+    ) -> bool {
+        manifest
+            .exports
+            .get(namespace)
+            .and_then(|interfaces| interfaces.get(interface))
+            .is_some_and(|export| requirement.matches(&export.version))
+            && astrid_capsule::readiness::manifest_subscribes_topic(manifest, topic)
+    }
+
+    fn scoped_probe_principal(raw: &str) -> Option<PrincipalId> {
+        Self::split_scoped_service_probe_key(raw)
+            .map(|(principal, _, _, _, _)| principal)
+            .or_else(|| Self::split_scoped_topic_probe_key(raw).map(|(principal, _, _)| principal))
+    }
+
+    fn split_scoped_service_probe_key(
+        raw: &str,
+    ) -> Option<(PrincipalId, String, String, semver::VersionReq, String)> {
+        let rest = raw.strip_prefix(SCOPED_SERVICE_PROBE_SENTINEL)?;
+        let mut parts = rest.splitn(5, '\0');
+        let principal = PrincipalId::new(parts.next()?).ok()?;
+        let namespace = parts.next()?;
+        let interface = parts.next()?;
+        let requirement = semver::VersionReq::parse(parts.next()?).ok()?;
+        let topic = parts.next()?;
+        if namespace.is_empty() || interface.is_empty() || topic.is_empty() {
+            return None;
+        }
+        Some((
+            principal,
+            namespace.to_string(),
+            interface.to_string(),
+            requirement,
+            topic.to_string(),
+        ))
     }
 
     fn split_scoped_topic_probe_key(raw: &str) -> Option<(PrincipalId, Option<CapsuleId>, String)> {

@@ -154,6 +154,14 @@ fn uuid_mapping_register_and_find() {
         "test-capsule"
     );
     assert!(registry.find_instance_by_uuid(&Uuid::new_v4()).is_none());
+    assert_eq!(
+        registry.source_id_for(&pid("alice"), &CapsuleId::from_static("test-capsule")),
+        Some(uuid)
+    );
+    assert_eq!(
+        registry.source_id_for(&pid("bob"), &CapsuleId::from_static("test-capsule")),
+        None
+    );
 }
 
 #[test]
@@ -179,6 +187,11 @@ fn uuid_mapping_overwrite_on_duplicate() {
         .expect("register second");
     registry.register_instance_uuid(uuid, first);
     registry.register_instance_uuid(uuid, second);
+    assert_eq!(
+        registry.source_id_for(&pid("alice"), &CapsuleId::from_static("first")),
+        None,
+        "remapping a source UUID must remove the stale reverse mapping"
+    );
     assert_eq!(
         registry
             .find_instance_by_uuid(&uuid)
@@ -210,6 +223,7 @@ fn uuid_mapping_cleanup_on_unregister() {
         .unregister_for(&pid("alice"), &capsule_id)
         .expect("unregister");
     assert!(registry.find_instance_by_uuid(&uuid).is_none());
+    assert_eq!(registry.source_id_for(&pid("alice"), &capsule_id), None);
 }
 
 #[test]
@@ -229,6 +243,10 @@ fn uuid_mapping_cleanup_on_drain() {
 
     let _ = registry.drain();
     assert!(registry.find_instance_by_uuid(&uuid).is_none());
+    assert_eq!(
+        registry.source_id_for(&pid("alice"), &CapsuleId::from_static("test")),
+        None
+    );
 }
 
 #[test]
