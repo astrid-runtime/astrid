@@ -29,6 +29,7 @@ grep -Fq "[[ \"\$RELEASE_ID\" == \"\$SELECTED_RELEASE_ID\" ]]" "$release_workflo
 grep -Fq 'scripts/release_publication.py' "$release_workflow"
 grep -Fq '.immutable == true and .prerelease == $prerelease and .published_at != null' "$release_workflow"
 grep -Fq 'actions/runs/$GITHUB_RUN_ID' "$release_workflow"
+grep -Fq -- "- '!v[0-9]+.*-nightly.*'" "$release_workflow"
 grep -Fq 'git/matching-refs/tags/v$BASE_VERSION' "$release_workflow"
 grep -Fq 'repos/$GITHUB_REPOSITORY/git/ref/tags/$GITHUB_REF_NAME' "$release_workflow"
 grep -Fq -- '-f make_latest="$EXPECTED_LATEST"' "$release_workflow"
