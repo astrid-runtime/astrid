@@ -16,6 +16,12 @@ boundary is in the [Driver Domain Contract](astrid-driver-domain-contract.md).
 
 Build an actual Astrid kernel.
 
+Do not make that kernel a prerequisite for the first agent OS. The immediate
+workbench is the principal-owned `AOS Realm` capsule in `unicity-aos/aos-ce`: a
+Linux-shaped environment hosted by today's daemon and, later, unchanged by the
+native host. It gives the kernel programme a real workload while keeping Linux
+syscall emulation, filesystems, shells, compilers, and package policy out of ring 0.
+
 The target is not Astrid statically linked into somebody else's library OS. It is
 an Astrid-owned capability microkernel that boots on hardware or a microVM, creates
 isolated protection domains, schedules them, routes IPC, brokers hardware, and
@@ -999,9 +1005,11 @@ security model while becoming operationally smaller and more local.
 | Reused OS crate is effectively abandoned | Security and toolchain burden moves in-house | Narrow adapters, pinned provenance, upstream health gate, replaceable seam |
 | Recovery depends on broken user space | Fault cannot be repaired in place | Immutable init/recovery domain, reserved resources, A/B slots, serial recovery path |
 
-## 12. Recommended immediate next artifact
+## 12. Recommended next native-kernel artifact
 
-The next implementation should be a bounded native-kernel skeleton, not a Hermit
+The product-wide immediate implementation is the AOS Realm's principal-scoped
+durable VFS and process environment. Within the independent native-kernel track,
+the next implementation should be a bounded native-kernel skeleton, not a Hermit
 host:
 
 1. Add the isolated `native-kernel/` workspace with pinned toolchain, loader,
@@ -1034,5 +1042,8 @@ sound.
 - Driver and Dock contracts that alter WIT require an Astrid RFC before adoption.
 - Public capsule and wire shapes remain stable; host profiles are additive.
 - The current native daemon remains supported while the image path matures.
+- The AOS Realm is a system capsule, not a second authority kernel. Its Linux guest
+  ABI remains above the stable Astrid capsule boundary and runs unchanged on daemon
+  and native hosts.
 - A signed single-purpose machine image is an additional deployment surface, not a
   release-channel alias and not an implicit promotion of experimental code.

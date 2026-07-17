@@ -9,12 +9,19 @@ Baselines:
 - [Astrid Native Component Kernel](astrid-native-kernel.md)
 - [Astrid Tensor Logic Composition](astrid-tensor-logic-composition.md)
 - [Astrid Driver Domain Contract](astrid-driver-domain-contract.md)
+- [AOS Principal Linux Realm](https://github.com/unicity-aos/aos-ce/blob/main/docs/principal-linux-realm.md)
 
 ## 1. Answer and purpose
 
 There is enough architecture to begin methodically. There is not enough evidence to
 claim that the kernel, driver, composition, graphical application, or Tensor Logic
 designs are complete.
+
+The first executable OS artifact is now the principal-owned AOS Realm workbench in
+`unicity-aos/aos-ce`. Its nested-process seed is implemented, but it is not yet a
+Linux environment: persistence, process semantics, a shell, and a toolchain remain
+open. This workbench precedes the native kernel because it is useful on today's
+runtime and becomes a concrete compatibility workload for every later host.
 
 The existing documents capture the intended system and its major deployment
 scenarios. This workplan converts them into dependency-ordered work with explicit
@@ -26,6 +33,7 @@ evidence and exit conditions. In particular, it prevents these category errors:
 - treating a model-checked abstraction as a proof of implementation;
 - treating a tensor backend as an authority decision;
 - treating a raw `.wasm` build as an installable Astrid capsule;
+- treating one nested WASM process as evidence of Linux or Bash compatibility;
 - expanding the first QEMU machine contract to consumer hardware by accident.
 
 The driver scenario is captured at the architectural level and is decomposed into
@@ -39,6 +47,7 @@ recorded in the driver-domain contract.
 |---|---|---|
 | Native-kernel purpose and boundary | Protection domains, capability handles, IPC, budgets, recovery, minimal QEMU machine | Kernel charter, threat model, formal object model, skeleton, fault evidence |
 | Current Astrid preservation | Portability seams, host assumptions, stable capsule/WIT direction | Compile boundary audit, host conformance suite, explicit compatibility ledger |
+| Principal Linux realm | Private guest ABI, bounded nested Wasmi process, installable no-`host_process` capsule, AOS Realm image direction | Principal-scoped durable VFS, processes, shell, toolchain, self-hosted capsule build |
 | Driver architecture | WASM/native split, role separation, mediated queues, deferred IRQ, IOMMU/DMA, lifecycle/transition contract, three GPU deployments | Formal models, resolved open decisions, reset evidence, prototype measurements |
 | Composition architecture | Principal catalog, exact relations, candidates, validator, materializer, Tensor Logic seam | Fixture corpus, executable sparse evaluator, Alloy/TLA+ models, production adapters |
 | Tensor algebra | Named-axis IR and backend boundary reserved | Semantic comparison with Tensor Logic implementation, lowering adapter, differential suite; deliberately inactive |
@@ -76,6 +85,11 @@ flowchart TB
     Kernel[QEMU ring-0 and ring-3 skeleton]
     Host[Freestanding component host]
 
+    RealmSeed[Bounded realm process seed]
+    RealmStorage[Principal-scoped durable VFS]
+    RealmProcesses[Processes, pipes, waits, and shell]
+    RealmWorkbench[Agent toolchain and capsule build]
+
     Catalog[Exact composition catalog and evaluator]
     Models[Alloy and TLA+ models]
     Inspect[Read-only composition inspection]
@@ -93,6 +107,7 @@ flowchart TB
 
     Charter --> Objects --> Kernel --> Host
     Compat --> Host
+    Compat --> RealmSeed --> RealmStorage --> RealmProcesses --> RealmWorkbench
     Compat --> Catalog --> Inspect
     Models --> Inspect
 
@@ -109,17 +124,23 @@ flowchart TB
 
     Inspect --> Dock
     Host --> Dock
+    RealmWorkbench --> Dock
 
     Catalog --> Tensor
     Models --> Tensor
 ```
 
-Host-native graphics and exact composition can proceed without waiting for the
-native kernel. Native graphics cannot.
+The realm, host-native graphics, and exact composition can proceed without waiting
+for the native kernel. Native graphics cannot. The realm remains an ordinary
+capsule on both today's daemon and a future native host; its Linux-shaped ABI does
+not become a ring-0 ABI.
 
 ## 5. Architecture covenant and traceability
 
 - [x] Record the native-kernel scope and explicit non-goals.
+- [x] Record the principal-owned Linux realm boundary, distribution direction, and
+  relationship to current and future hosts.
+- [x] Implement the bounded nested-process seed without `host_process` authority.
 - [x] Record the exact composition/Tensor Logic scope and preservation strategy.
 - [x] Record graphical game, host GPU, VM GPU, and bare-metal GPU scenarios.
 - [x] Separate device driver, platform authority, resource virtualizer, and
@@ -156,7 +177,43 @@ and planned evidence. No guarantee depends on “the architecture should prevent
 Exit condition: kernel work can refactor host adapters without changing public
 capsule behavior accidentally.
 
-## 7. Exact composition foundation
+## 7. Principal-owned Linux realm
+
+- [x] Keep the capsule, private guest ABI, image recipe, and product integration in
+  the authoritative `unicity-aos/aos-ce` monorepo.
+- [x] Embed and run one signed core-WASM guest under fixed fuel, memory, descriptor,
+  instance, table, and output limits.
+- [x] Package the outer component as an installable capsule with no host-process
+  grant and adversarial tests for malformed modules and boundary violations.
+- [ ] Define a principal-bound storage contract with generations, quotas, flush,
+  atomic rename, crash points, snapshots, rollback, deletion, and key revocation.
+- [ ] Implement the realm VFS over an immutable base, private writable overlay,
+  durable `/home/agent`, explicit `/workspace`, ephemeral `/tmp`, and synthetic
+  `/proc` and `/dev`.
+- [ ] Implement process IDs, descriptors, pipes, spawn/exec, wait, signals, blocking
+  calls, cancellation, output backpressure, and supervisor recovery.
+- [ ] Add a small shell only after filesystem and process semantics have executable
+  conformance tests; do not make Bash the process-model specification.
+- [ ] Build the first immutable `AOS Realm` base and package index for the actual
+  guest target, with digests, provenance, rollback, and no false Debian claim.
+- [ ] Add compiler tooling and prove that an agent can build and export a canonical
+  `.capsule` artifact entirely inside its realm.
+- [ ] Expose structured status, effective authority, filesystem generations, build
+  receipts, and failure records so an agent need not scrape terminal prose.
+- [ ] Define an explicit capsule-to-realm job contract whose effective authority is
+  the intersection of caller, calling capsule, realm, and per-job grants; never
+  inject ambient Bash into every capsule.
+- [ ] Migrate Forge as the first build-service consumer, then replace `aos-shell`
+  in the default distro only after measured shell/process parity.
+- [ ] Prove that a forged principal identifier, guest root, package hook, or child
+  process cannot widen the realm's outer Astrid grants.
+
+Exit condition: an agent can restart its realm, recover the same private home, use
+files/pipes/processes through a shell, build an installable capsule, and export it
+through an explicit portal; a second principal cannot observe that state, and no
+guest action invokes a host process.
+
+## 8. Exact composition foundation
 
 - [ ] Select at least ten representative manifests spanning imports/exports,
   typed/opaque topics, tools, adapters, optional requirements, duplicate providers,
@@ -176,7 +233,7 @@ capsule behavior accidentally.
 Exit condition: exact plans and explanations are reproducible from fixtures, while
 the daemon behaves identically with composition disabled.
 
-## 8. Structural and temporal models
+## 9. Structural and temporal models
 
 - [ ] Write the Alloy model for owner/port/type compatibility, cardinality,
   authority attenuation, principal isolation, adapters, and synchronous cycles.
@@ -194,7 +251,7 @@ Exit condition: the bounded models contain no unexplained counterexample for the
 stated invariants. Results are described as bounded model evidence, not universal
 proof.
 
-## 9. Native kernel foundations
+## 10. Native kernel foundations
 
 - [ ] Freeze the initial x86-64 QEMU/KVM, UEFI, single-CPU, virtio machine contract.
 - [ ] Create the isolated native-kernel workspace and pinned toolchain.
@@ -214,7 +271,7 @@ proof.
 Exit condition: a hostile native test domain cannot corrupt or indefinitely stop
 ring 0 or a peer, and every failure emits a structured record.
 
-## 10. Freestanding component host
+## 11. Freestanding component host
 
 - [ ] Audit the pinned Wasmtime custom-platform requirements and maintenance risk.
 - [ ] Choose and document AOT, Pulley, or other execution strategy per architecture.
@@ -230,7 +287,7 @@ ring 0 or a peer, and every failure emits a structured record.
 Exit condition: a component trap stays inside Wasmtime, while compromise/failure of
 the runtime host remains within its native domain and does not widen its grants.
 
-## 11. Driver system
+## 12. Driver system
 
 ### Contract and terminology
 
@@ -286,7 +343,7 @@ Exit condition: the first driver proof cannot address memory outside its DMA spa
 retain access after revocation, monopolize CPU/queue resources, or leave reusable
 memory exposed to a device whose reset is unconfirmed.
 
-## 12. First mediated virtio driver proof
+## 13. First mediated virtio driver proof
 
 - [ ] Choose one simple virtio class based on reset quality and testability; do not
   begin with a vendor GPU.
@@ -305,7 +362,7 @@ memory exposed to a device whose reset is unconfirmed.
 Exit condition: the proof meets the driver-system exit condition and produces enough
 evidence to decide whether a public device RFC is warranted.
 
-## 13. Host-native graphical application proof
+## 14. Host-native graphical application proof
 
 - [ ] Compare `wasi:webgpu` with Astrid's audited `wasm32-unknown-unknown` import
   model and record compatibility choices.
@@ -331,7 +388,7 @@ evidence to decide whether a public device RFC is warranted.
 Exit condition: an installable game capsule runs without DOM/POSIX/native-window
 authority, and its exact composition plan exposes every provider and grant.
 
-## 14. Native graphics path
+## 15. Native graphics path
 
 - [ ] Reuse the upper graphics/presentation/input contracts from the host proof.
 - [ ] Start with virtio-gpu in the fixed VM machine contract.
@@ -348,7 +405,7 @@ authority, and its exact composition plan exposes every provider and grant.
 Exit condition: the same game artifact and upper contract run through a distinctly
 identified native provider without pretending that virtio proves vendor hardware.
 
-## 15. Dock application proof
+## 16. Dock application proof
 
 - [ ] Select one local-first application whose server process can genuinely move
   into an Astrid capsule graph.
@@ -365,7 +422,7 @@ identified native provider without pretending that virtio proves vendor hardware
 Exit condition: the application runs locally without a server-side application
 process and without placing application semantics in the kernel.
 
-## 16. Tensor Logic backend—reserved
+## 17. Tensor Logic backend—reserved
 
 - [ ] Keep the exact sparse evaluator as the semantic oracle.
 - [ ] Compare the stable equation IR with the actual Tensor Logic language/compiler.
@@ -380,9 +437,11 @@ process and without placing application semantics in the kernel.
 Exit condition: exact candidates agree with the oracle, learned output cannot mint
 authority, and backend failure returns safely to exact or explicit behavior.
 
-## 17. Supply chain, updates, and recovery
+## 18. Supply chain, updates, and recovery
 
 - [ ] Define reproducible kernel/system image inputs and signed provenance.
+- [ ] Normalize `.capsule` archive metadata in `astrid-build` and gate two
+  same-input builds on byte-identical package digests.
 - [ ] Bind capsule source identity, compiled cache, driver match metadata, and
   provider implementation identity.
 - [ ] Define A/B images, signed channel/candidate identity, rollback metadata, and
@@ -396,26 +455,32 @@ authority, and backend failure returns safely to exact or explicit behavior.
 Exit condition: a broken image, driver, provider, or capsule cannot corrupt both
 recovery paths or silently broaden authority.
 
-## 18. Immediate execution tranche
+## 19. Immediate execution tranche
 
 The next bounded tranche is:
 
-1. review and accept the driver-domain contract;
-2. create the kernel charter and whole-system threat model;
-3. create the sanitized composition fixture corpus, including the game topology;
-4. write the first Alloy composition model;
-5. write the first TLA+ driver lifecycle model, including non-completing reset;
-6. audit portable core crates and host dependencies;
-7. freeze the QEMU machine/toolchain inputs;
-8. only then create the native-kernel skeleton and sparse composition crate.
+1. preserve and review the bounded realm seed in `unicity-aos/aos-ce`;
+2. specify the principal-bound durable storage contract and crash traces;
+3. implement the immutable-base/private-overlay VFS and cross-principal tests;
+4. implement process, descriptor, pipe, spawn/exec, wait, and cancellation semantics;
+5. add the first small shell and an AOS Realm base-image recipe;
+6. compile, package, verify, and export one real Astrid capsule inside the realm;
+7. in parallel, accept the driver-domain contract and create the kernel charter,
+   threat model, composition fixtures, and first Alloy/TLA+ models;
+8. start the native-kernel skeleton only when its machine contract and adversarial
+   acceptance harness are frozen.
 
-This ordering creates executable semantics and counterexamples before large code
-surfaces, while still reaching a booting kernel early enough to test assumptions.
+This ordering delivers a useful agent environment on the current runtime, then
+uses it as a real workload for the broader OS. It still requires executable models
+and counterexamples before large kernel and driver surfaces.
 
-## 19. Repository and issue strategy
+## 20. Repository and issue strategy
 
-- Keep architecture, exact composition integration, native-kernel work, and early
-  prototypes in core while their interfaces change together.
+- Keep the AOS Realm capsule, private guest ABI, image recipe, and CE integration in
+  `unicity-aos/aos-ce`; do not recreate a standalone capsule repository while those
+  surfaces evolve together.
+- Keep native-kernel architecture, exact composition integration, and early
+  host/kernel prototypes in core while their interfaces change together.
 - Do not create a separate Astrid driver repository before a stable independent
   contract and release cadence exist.
 - Keep generic Tensor Logic language/compiler work independent of Astrid.
@@ -427,13 +492,14 @@ surfaces, while still reaching a booting kernel early enough to test assumptions
 - Every core implementation PR still needs its own linked issue, complete template,
   and existing `[Unreleased]` changelog section where applicable.
 
-## 20. Definition of programme success
+## 21. Definition of programme success
 
-The programme is successful when Astrid can boot its own narrow machine substrate,
-run the same signed component contracts across supported hosts, isolate and recover
-driver/runtime domains, derive exact principal-scoped compositions, Dock a real
-local application, and run a graphical WASM application through explicit device and
-presentation services.
+The programme is successful when an agent has a durable, principal-private realm
+that can build canonical capsules; Astrid can boot its own narrow machine substrate;
+the same signed component contracts run across supported hosts; driver/runtime
+domains isolate and recover; exact principal-scoped compositions can be derived; a
+real local application can Dock; and a graphical WASM application runs through
+explicit device and presentation services.
 
 Tensor Logic may make that system adaptive and learnable. It is not required to
 make the enforcement true.
