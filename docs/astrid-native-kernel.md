@@ -550,6 +550,11 @@ This is enough to run a local service machine and validate Astrid's kernel model
 is not a laptop or general-purpose OS. AArch64 should follow only after the ABI and
 architecture abstraction survive the x86-64 vertical slice.
 
+The later graphics path—including a host-native `wgpu` provider, separate
+presentation/input services, and a possible virtio-gpu bridge—is scoped in
+[Astrid Tensor Logic Composition](astrid-tensor-logic-composition.md#124-graphical-wasm-applications-as-a-forcing-function).
+It does not expand this first machine contract.
+
 ### 6.3 Effort boundary
 
 Approximate ranges are planning bands, not commitments. They assume engineers
