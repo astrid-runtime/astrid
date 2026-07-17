@@ -56,6 +56,8 @@ grep -Fq 'secrets.ASTRID_RELEASE_ADMIN_TOKEN' "$bootstrap_workflow"
 grep -Fq "gh release create \"\$tag\"" "$bootstrap_workflow"
 grep -Fq '.draft == false and .prerelease == true and .immutable == false' "$bootstrap_workflow"
 grep -Fq "repos/\$GITHUB_REPOSITORY/immutable-releases" "$bootstrap_workflow"
+grep -Fq "jq -e '.enabled == true'" "$bootstrap_workflow"
+grep -Fq "jq -e '.enabled == false'" "$bootstrap_workflow"
 
 grep -Fq 'vars.ASTRID_NIGHTLY_RELEASES_ENABLED' "$nightly_workflow"
 grep -Fq 'actions/runs/$GITHUB_RUN_ID' "$nightly_workflow"

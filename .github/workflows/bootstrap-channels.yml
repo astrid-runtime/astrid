@@ -27,10 +27,18 @@ jobs:
         run: |
           [[ -n "$GH_ADMIN_TOKEN" ]]
           setting_error="$RUNNER_TEMP/immutable-release-setting-error"
+          setting_json="$RUNNER_TEMP/immutable-release-setting.json"
           if GH_TOKEN="$GH_ADMIN_TOKEN" gh api \
             "repos/$GITHUB_REPOSITORY/immutable-releases" \
-            >/dev/null 2>"$setting_error"; then
-            immutable_enabled=1
+            >"$setting_json" 2>"$setting_error"; then
+            if jq -e '.enabled == true' "$setting_json" >/dev/null; then
+              immutable_enabled=1
+            elif jq -e '.enabled == false' "$setting_json" >/dev/null; then
+              immutable_enabled=0
+            else
+              echo "immutable release setting did not contain a boolean enabled field" >&2
+              exit 1
+            fi
           elif grep -Eq 'HTTP 404|Not Found' "$setting_error"; then
             immutable_enabled=0
           else
