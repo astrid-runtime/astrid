@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import datetime as dt
 import hashlib
 import pathlib
 import re
@@ -51,6 +52,12 @@ SEMVER = re.compile(
     r")(?:\.(?:(?:0|[1-9][0-9]*)|(?:[0-9]*[A-Za-z-][0-9A-Za-z-]*)))*)?"
     r"(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?"
 )
+NIGHTLY = re.compile(
+    r"(?:0|[1-9][0-9]*)\."
+    r"(?:0|[1-9][0-9]*)\."
+    r"(?:0|[1-9][0-9]*)-nightly\."
+    r"[0-9]{8}\.g(?P<commit>[0-9a-f]{40})"
+)
 HEX_64 = re.compile(r"[0-9a-f]{64}")
 COMMIT = re.compile(r"[0-9a-f]{40}")
 
@@ -65,6 +72,18 @@ def canonical_version(value: object) -> str:
     if SEMVER.fullmatch(value) is None:
         fail(f"version must be canonical SemVer, got {value!r}")
     return value
+
+
+def nightly_source_commit(version: str) -> str | None:
+    match = NIGHTLY.fullmatch(version)
+    if match is None:
+        return None
+    date = version.rsplit("-nightly.", 1)[1].split(".g", 1)[0]
+    try:
+        dt.datetime.strptime(date, "%Y%m%d")
+    except ValueError:
+        return None
+    return match.group("commit")
 
 
 def read_checksums(path: pathlib.Path, label: str) -> dict[str, str]:
@@ -114,6 +133,11 @@ def build_manifest(
         fail(f"tag must be v{version}, got {tag!r}")
     if COMMIT.fullmatch(source_commit) is None:
         fail("source commit must be 40 lowercase hexadecimal characters")
+    nightly_commit = nightly_source_commit(version)
+    if "-nightly." in version and nightly_commit is None:
+        fail("nightly version is malformed")
+    if nightly_commit is not None and nightly_commit != source_commit:
+        fail("nightly version must embed its source commit")
     if COMMIT.fullmatch(contracts_commit) is None:
         fail("contracts commit must be 40 lowercase hexadecimal characters")
 
@@ -190,6 +214,11 @@ def validate_manifest(
     source_commit = data["source-commit"]
     if COMMIT.fullmatch(source_commit) is None:
         fail("manifest source commit is invalid")
+    nightly_commit = nightly_source_commit(version)
+    if "-nightly." in version and nightly_commit is None:
+        fail("nightly manifest version is malformed")
+    if nightly_commit is not None and nightly_commit != source_commit:
+        fail("nightly manifest version does not embed its source commit")
     expected_identity = (
         f"https://github.com/{REPOSITORY}/.github/workflows/release.yml@refs/tags/{tag}"
     )

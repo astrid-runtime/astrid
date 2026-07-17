@@ -74,6 +74,21 @@ class ChannelMetadataTests(unittest.TestCase):
                 expires,
             )
 
+    def nightly_channel(self, generation: int = 1) -> dict[str, object]:
+        version = f"1.2.4-nightly.20260716.g{COMMIT}"
+        data = self.channel("nightly", generation)
+        data["release"]["version"] = version
+        data["release"]["tag"] = f"v{version}"
+        data["release"]["metadata-asset"] = f"astrid-{version}-release.toml"
+        data["release"]["release-workflow-identity"] = (
+            "https://github.com/astrid-runtime/astrid/.github/workflows/"
+            f"release.yml@refs/tags/v{version}"
+        )
+        for target in data["targets"]:
+            target["asset"] = f"astrid-{version}-{target['triple']}.tar.gz"
+            target["sigstore-bundle"] = f"{target['asset']}.sigstore.json"
+        return data
+
     def test_round_trip_is_deterministic(self) -> None:
         rendered = channel_metadata.render_channel(self.channel())
         path = self.root / "channel.toml"
@@ -87,8 +102,9 @@ class ChannelMetadataTests(unittest.TestCase):
         self.assertEqual(channel_metadata.render_channel(loaded), rendered)
 
     def test_all_three_channels_are_accepted(self) -> None:
-        for name in channel_metadata.CHANNELS:
-            channel_metadata.validate_channel(self.channel(name))
+        channel_metadata.validate_channel(self.channel("stable"))
+        channel_metadata.validate_channel(self.channel("dev"))
+        channel_metadata.validate_channel(self.nightly_channel())
 
     def test_stable_rejects_prerelease_version(self) -> None:
         data = self.channel()
@@ -102,8 +118,27 @@ class ChannelMetadataTests(unittest.TestCase):
         for target in data["targets"]:
             target["asset"] = target["asset"].replace("astrid-1.2.3-", "astrid-1.2.3-rc.1-")
             target["sigstore-bundle"] = f"{target['asset']}.sigstore.json"
-        with self.assertRaisesRegex(ValueError, "stable.*prerelease"):
+        with self.assertRaisesRegex(ValueError, "canonical releases"):
             channel_metadata.validate_channel(data)
+
+    def test_channel_release_classes_do_not_cross(self) -> None:
+        nightly_as_dev = self.nightly_channel()
+        nightly_as_dev["channel"] = "dev"
+        nightly_as_dev["expires-at"] = "2026-07-23T00:00:00Z"
+        with self.assertRaisesRegex(ValueError, "canonical releases"):
+            channel_metadata.validate_channel(nightly_as_dev)
+        with self.assertRaisesRegex(ValueError, "exact nightly"):
+            channel_metadata.validate_channel(self.channel("nightly"))
+        mismatch = self.nightly_channel()
+        mismatch["release"]["source-commit"] = "c" * 40
+        with self.assertRaisesRegex(ValueError, "embed its source commit"):
+            channel_metadata.validate_channel(mismatch)
+        impossible = self.nightly_channel()
+        impossible["release"]["version"] = impossible["release"]["version"].replace(
+            "20260716", "20260230"
+        )
+        with self.assertRaisesRegex(ValueError, "exact nightly"):
+            channel_metadata.validate_channel(impossible)
 
     def test_rejects_unknown_keys_and_scalar_type_confusion(self) -> None:
         extra = self.channel()

@@ -1,0 +1,40 @@
+name: Queue Astrid nightly promotion
+
+on:
+  workflow_run:
+    workflows: [Release]
+    types: [completed]
+
+permissions:
+  contents: read
+
+jobs:
+  dispatch:
+    name: Dispatch protected nightly pointer promotion
+    if: >-
+      github.repository == 'astrid-runtime/astrid' &&
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'workflow_dispatch' &&
+      vars.ASTRID_NIGHTLY_RELEASES_ENABLED == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+      contents: read
+    steps:
+      - uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
+        with:
+          egress-policy: audit
+      - name: Validate completed nightly and dispatch promotion
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.event.workflow_run.head_branch }}
+          SOURCE_COMMIT: ${{ github.event.workflow_run.head_sha }}
+          GENERATION: ${{ github.event.workflow_run.run_number }}
+        run: |
+          [[ "$RELEASE_TAG" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)-nightly\.[0-9]{8}\.g[0-9a-f]{40}$ ]]
+          [[ "${RELEASE_TAG##*.g}" == "$SOURCE_COMMIT" ]]
+          gh workflow run promote-channel.yml \
+            --ref main \
+            -f channel=nightly \
+            -f release_tag="$RELEASE_TAG" \
+            -f generation="$GENERATION"

@@ -78,6 +78,22 @@ fn pointer(channel: UpdateChannel, generation: i64) -> ChannelPointer {
     }
 }
 
+fn nightly_pointer(generation: i64) -> ChannelPointer {
+    let version = format!("1.2.4-nightly.20260716.g{COMMIT}");
+    let mut value = pointer(UpdateChannel::Nightly, generation);
+    value.release.version.clone_from(&version);
+    value.release.tag = format!("v{version}");
+    value.release.metadata_asset = format!("astrid-{version}-release.toml");
+    value.release.release_workflow_identity = format!(
+        "https://github.com/{REPOSITORY}/.github/workflows/release.yml@refs/tags/v{version}"
+    );
+    for target in &mut value.targets {
+        target.asset = format!("astrid-{version}-{}.tar.gz", target.triple);
+        target.sigstore_bundle = format!("{}.sigstore.json", target.asset);
+    }
+    value
+}
+
 fn encoded(pointer: &ChannelPointer) -> Vec<u8> {
     toml::to_string(pointer).unwrap().into_bytes()
 }
@@ -88,11 +104,7 @@ fn validation_time() -> DateTime<Utc> {
 
 #[test]
 fn all_channels_parse_with_strict_identity_and_expiry() {
-    for channel in [
-        UpdateChannel::Stable,
-        UpdateChannel::Dev,
-        UpdateChannel::Nightly,
-    ] {
+    for channel in [UpdateChannel::Stable, UpdateChannel::Dev] {
         let value = pointer(channel, 1);
         assert_eq!(
             parse_channel(&encoded(&value), channel, validation_time())
@@ -101,6 +113,69 @@ fn all_channels_parse_with_strict_identity_and_expiry() {
             VERSION
         );
     }
+    let nightly = nightly_pointer(1);
+    assert_eq!(
+        parse_channel(
+            &encoded(&nightly),
+            UpdateChannel::Nightly,
+            validation_time()
+        )
+        .unwrap()
+        .version(),
+        format!("1.2.4-nightly.20260716.g{COMMIT}")
+    );
+}
+
+#[test]
+fn channel_release_classes_do_not_cross() {
+    let mut nightly_as_dev = nightly_pointer(1);
+    nightly_as_dev.channel = "dev".to_owned();
+    nightly_as_dev.expires_at = "2026-07-23T00:00:00Z".to_owned();
+    assert!(
+        parse_channel(
+            &encoded(&nightly_as_dev),
+            UpdateChannel::Dev,
+            validation_time()
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("canonical releases")
+    );
+    assert!(
+        parse_channel(
+            &encoded(&pointer(UpdateChannel::Nightly, 1)),
+            UpdateChannel::Nightly,
+            validation_time()
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("exact nightly")
+    );
+    let mut mismatch = nightly_pointer(1);
+    mismatch.release.source_commit = "cccccccccccccccccccccccccccccccccccccccc".to_owned();
+    assert!(
+        parse_channel(
+            &encoded(&mismatch),
+            UpdateChannel::Nightly,
+            validation_time()
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("embed its source commit")
+    );
+    let mut impossible = nightly_pointer(1);
+    impossible.release.version = impossible.release.version.replace("20260716", "20260230");
+    impossible.release.tag = format!("v{}", impossible.release.version);
+    assert!(
+        parse_channel(
+            &encoded(&impossible),
+            UpdateChannel::Nightly,
+            validation_time()
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("exact nightly")
+    );
 }
 
 #[test]

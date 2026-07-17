@@ -16,6 +16,9 @@ on:
       - 'scripts/channel_publication.py'
       - 'scripts/test_channel_publication.py'
       - 'scripts/test_channel_workflow_contract.sh'
+      - 'scripts/nightly_version.py'
+      - 'scripts/test_nightly_version.py'
+      - 'release/nightly.toml'
       - '**/Cargo.toml'
       - '**/Cargo.lock'
       - '.github/workflows/**'
@@ -34,6 +37,9 @@ on:
       - 'scripts/channel_publication.py'
       - 'scripts/test_channel_publication.py'
       - 'scripts/test_channel_workflow_contract.sh'
+      - 'scripts/nightly_version.py'
+      - 'scripts/test_nightly_version.py'
+      - 'release/nightly.toml'
       - '**/Cargo.toml'
       - '**/Cargo.lock'
       - '.github/workflows/**'
@@ -84,6 +90,7 @@ jobs:
           python3 scripts/test_crate_publication.py
           python3 scripts/test_channel_metadata.py
           python3 scripts/test_channel_publication.py
+          python3 scripts/test_nightly_version.py
           bash scripts/test_channel_workflow_contract.sh
 
   wasm-portability:

@@ -1,0 +1,116 @@
+name: Schedule Astrid nightly
+
+on:
+  schedule:
+    - cron: '7 2 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: astrid-nightly-orchestrator
+  cancel-in-progress: false
+
+jobs:
+  dispatch:
+    name: Tag main and dispatch the signed release lane
+    if: >-
+      github.repository == 'astrid-runtime/astrid' &&
+      github.ref == 'refs/heads/main' &&
+      vars.ASTRID_NIGHTLY_RELEASES_ENABLED == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+      contents: write
+    steps:
+      - uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.12'
+      - name: Create or authenticate deterministic nightly tag
+        id: nightly
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          git fetch --no-tags origin main
+          SOURCE_COMMIT=$(git rev-parse 'HEAD^{commit}')
+          git merge-base --is-ancestor "$SOURCE_COMMIT" origin/main
+          RUN_CREATED_AT=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" --jq .created_at)
+          RUN_DATE=$(python3 - "$RUN_CREATED_AT" <<'PY'
+          import datetime as dt
+          import sys
+
+          created = dt.datetime.fromisoformat(sys.argv[1].replace("Z", "+00:00"))
+          print(created.astimezone(dt.timezone.utc).strftime("%Y%m%d"))
+          PY
+          )
+          VERSION=$(python3 scripts/nightly_version.py derive \
+            --date "$RUN_DATE" \
+            --source-commit "$SOURCE_COMMIT")
+          BASE_VERSION=$(python3 - <<'PY'
+          import tomllib
+          with open("release/nightly.toml", "rb") as file:
+              print(tomllib.load(file)["base-version"])
+          PY
+          )
+          BASE_REFS="$RUNNER_TEMP/canonical-base-refs.json"
+          gh api "repos/$GITHUB_REPOSITORY/git/matching-refs/tags/v$BASE_VERSION" > "$BASE_REFS"
+          if ! jq -e --arg ref "refs/tags/v$BASE_VERSION" 'all(.ref != $ref)' "$BASE_REFS" >/dev/null; then
+            echo "canonical v$BASE_VERSION is already tagged; advance release/nightly.toml before another nightly train" >&2
+            exit 1
+          fi
+
+          TAG="v$VERSION"
+          if TAG_OBJECT=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$TAG" 2>/dev/null); then
+            [[ "$(jq -er .object.type <<< "$TAG_OBJECT")" == commit ]]
+            [[ "$(jq -er .object.sha <<< "$TAG_OBJECT")" == "$SOURCE_COMMIT" ]]
+            if gh api "repos/$GITHUB_REPOSITORY/releases/tags/$TAG" \
+              --jq 'select(.draft == false and .immutable == true and .prerelease == true) | true' \
+              | grep -Fx true; then
+              RUNS="$RUNNER_TEMP/release-runs.json"
+              gh api "repos/$GITHUB_REPOSITORY/actions/workflows/release.yml/runs?status=completed&per_page=100" \
+                --paginate --slurp > "$RUNS"
+              GENERATION=$(jq -er --arg tag "$TAG" --arg commit "$SOURCE_COMMIT" \
+                '[.[].workflow_runs[] | select(.event == "workflow_dispatch" and .head_branch == $tag and .head_sha == $commit and .conclusion == "success") | .run_number] | unique | if length == 1 then .[0] else error("nightly release does not have one successful release generation") end' \
+                "$RUNS")
+              {
+                echo "dispatch=false"
+                echo "recover-promotion=true"
+                echo "generation=$GENERATION"
+                echo "tag=$TAG"
+              } >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          else
+            gh api --method POST "repos/$GITHUB_REPOSITORY/git/refs" \
+              -f ref="refs/tags/$TAG" \
+              -f sha="$SOURCE_COMMIT"
+          fi
+          {
+            echo "dispatch=true"
+            echo "tag=$TAG"
+          } >> "$GITHUB_OUTPUT"
+      - name: Dispatch tag-bound release workflow
+        if: steps.nightly.outputs.dispatch == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.nightly.outputs.tag }}
+        run: gh workflow run release.yml --ref "$TAG"
+      - name: Recover protected nightly promotion
+        if: steps.nightly.outputs.recover-promotion == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.nightly.outputs.tag }}
+          GENERATION: ${{ steps.nightly.outputs.generation }}
+        run: |
+          gh workflow run promote-channel.yml \
+            --ref main \
+            -f channel=nightly \
+            -f release_tag="$TAG" \
+            -f generation="$GENERATION"
