@@ -39,19 +39,7 @@ pub(crate) async fn dispatch(cli: Cli) -> Result<ExitCode> {
         return Ok(ExitCode::SUCCESS);
     }
 
-    // Update banner check (cached) — skip for non-interactive paths.
-    if cli.prompt.is_none()
-        && !matches!(
-            cli.command,
-            Some(
-                Commands::Update(_)
-                    | Commands::Completions(_)
-                    // `mcp serve` owns stdout for the MCP JSON-RPC stream;
-                    // a banner there would corrupt the protocol framing.
-                    | Commands::Mcp { .. }
-            )
-        )
-    {
+    if should_check_for_update(&cli) {
         commands::self_update::print_update_banner().await;
     }
 
@@ -103,6 +91,22 @@ pub(crate) async fn dispatch(cli: Cli) -> Result<ExitCode> {
     }
 
     dispatch_subcommand(cli.command, output_format).await
+}
+
+fn should_check_for_update(cli: &Cli) -> bool {
+    cli.prompt.is_none()
+        && !matches!(
+            cli.command,
+            Some(
+                Commands::Update(_)
+                    | Commands::Completions(_)
+                    | Commands::Mcp { .. }
+                    | Commands::Init { offline: true, .. }
+                    | Commands::Distro {
+                        command: DistroCommands::Apply { offline: true, .. }
+                    }
+            )
+        )
 }
 
 #[allow(
@@ -335,9 +339,17 @@ async fn dispatch_capsule(command: crate::cli::CapsuleCommands) -> Result<ExitCo
             source,
             capsule,
             workspace,
+            yes,
+            vars,
         } => {
-            commands::capsule::install::install_capsule(&source, capsule.as_deref(), workspace)
-                .await?;
+            commands::capsule::install::install_capsule_with_options(
+                &source,
+                capsule.as_deref(),
+                workspace,
+                yes,
+                &vars,
+            )
+            .await?;
             Ok(ExitCode::SUCCESS)
         },
         CapsuleCommands::Update { target, workspace } => {
@@ -535,6 +547,27 @@ mod tests {
     use clap::Parser;
 
     use super::*;
+
+    #[test]
+    fn offline_commands_never_check_for_updates() {
+        for args in [
+            vec![
+                "astrid",
+                "init",
+                "--distro",
+                "/tmp/Distro.toml",
+                "--offline",
+            ],
+            vec!["astrid", "distro", "apply", "/tmp/Distro.toml", "--offline"],
+        ] {
+            let cli = Cli::try_parse_from(args).expect("parse offline command");
+            assert!(!should_check_for_update(&cli));
+        }
+
+        let cli = Cli::try_parse_from(["astrid", "init", "--distro", "@astrid-runtime/example"])
+            .expect("parse online init");
+        assert!(should_check_for_update(&cli));
+    }
 
     /// The production harvest must include invocable **aliases**, not just
     /// primary subcommand names. `self-update` is an alias of `update`; if

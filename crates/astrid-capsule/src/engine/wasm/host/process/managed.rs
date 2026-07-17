@@ -114,7 +114,9 @@ pub(super) fn spawn_reader_task<R>(
 ///
 /// `injections` exposes host-verified, read-only files inside the child's
 /// sandbox (see [`InjectionGuard`](super::inject)); pass `&[]` for none.
-/// `inject_env` sets host-controlled env vars on the child (the `env-pointer`
+/// `context` contains the validated working directory, guest environment, and
+/// authorized process paths; `inject_env` sets
+/// host-controlled vars on the child (the `env-pointer`
 /// placements point an agent at its injected file); pass `&[]` for none. These
 /// are set by the HOST authoritatively — not via the guest `spawn-request.env`.
 /// `extra_masks` are the copy-on-write dirs the sandbox must hide from the
@@ -123,6 +125,7 @@ pub(super) fn prepare_sandboxed_command(
     cmd: &str,
     args: &[String],
     workspace_root: &std::path::Path,
+    context: &super::context::PreparedSpawnContext,
     injections: &[astrid_workspace::RoInjection],
     inject_env: &[(String, String)],
     extra_masks: &[std::path::PathBuf],
@@ -130,22 +133,28 @@ pub(super) fn prepare_sandboxed_command(
     let mut inner_cmd = Command::new(cmd);
     let str_args: Vec<&str> = args.iter().map(String::as_str).collect();
     inner_cmd.args(&str_args);
-    // Run IN the writable workspace root. For a non-git CoW workspace this is
-    // the merged clone/mount, so a spawned `cargo`/`git`/`build.rs` operates on
-    // the same tree the fs host writes to — not the pristine workspace. The
-    // sandbox layer propagates this cwd (bwrap `--chdir` inheritance / Seatbelt
-    // `current_dir`). Previously unset, so the child inherited the daemon's cwd
-    // and CoW was inert for any tool that relies on the working directory.
-    inner_cmd.current_dir(workspace_root);
-    inner_cmd.env_remove("ASTRID_SOCKET_PATH");
-    inner_cmd.env_remove("ASTRID_SESSION_TOKEN");
-    inner_cmd.env_remove("ASTRID_HOME");
+    // `cwd` has already been resolved and boundary-checked by the process host.
+    // It normally points into the writable CoW workspace; a capability-gated
+    // `home://` request can instead target the invoking principal's home.
+    inner_cmd.current_dir(&context.cwd);
+    inner_cmd.env_clear();
+    for (key, value) in &context.env {
+        inner_cmd.env(key, value);
+    }
     for (k, v) in inject_env {
         inner_cmd.env(k, v);
     }
 
-    SandboxCommand::wrap_with_injections(inner_cmd, workspace_root, injections, extra_masks)
-        .map_err(|e| format!("failed to wrap command in sandbox: {e}"))
+    SandboxCommand::wrap_with_process_paths(
+        &inner_cmd,
+        workspace_root,
+        injections,
+        extra_masks,
+        &context.read_paths,
+        &context.write_paths,
+        true,
+    )
+    .map_err(|e| format!("failed to wrap command in sandbox: {e}"))
 }
 
 /// Wire a freshly-spawned child's stdout / stderr into tokio reader

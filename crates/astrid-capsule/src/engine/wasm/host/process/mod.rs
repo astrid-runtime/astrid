@@ -26,6 +26,7 @@
 
 mod audit;
 mod compat;
+mod context;
 mod handle;
 mod inject;
 mod managed;
@@ -46,6 +47,7 @@ use crate::engine::wasm::bindings::astrid::process1_1_0::host::{
 };
 use crate::engine::wasm::host::util;
 use crate::engine::wasm::host_state::HostState;
+use context::{PreparedSpawnContext, prepare_spawn_context};
 use managed::{ManagedProcess, attach_pipes, configure_piped, prepare_sandboxed_command};
 
 pub(crate) use audit::{
@@ -77,9 +79,7 @@ fn extract_call_id(state: &HostState) -> Option<String> {
     })
 }
 
-/// Convert SpawnRequest's env list into the legacy String args style.
-/// Currently env is ignored at exec time (the sandbox strips most vars);
-/// retained for the audit log.
+/// Summarize environment keys for audit without recording their values.
 fn env_summary(env: &[EnvVar]) -> String {
     env.iter()
         .map(|e| e.key.as_str())
@@ -106,6 +106,7 @@ fn authenticated_principal(state: &HostState) -> Option<astrid_core::principal::
 fn build_persistent_child(
     request: &SpawnRequest,
     workspace_root: &std::path::Path,
+    context: &PreparedSpawnContext,
     want_stdin: bool,
     injections: &[astrid_workspace::RoInjection],
     inject_env: &[(String, String)],
@@ -115,6 +116,7 @@ fn build_persistent_child(
         &request.cmd,
         &request.args,
         workspace_root,
+        context,
         injections,
         inject_env,
         extra_masks,
@@ -170,6 +172,15 @@ impl process::Host for HostState {
             return Err(ErrorCode::CapabilityDenied);
         }
 
+        let spawn_context = match prepare_spawn_context(self, &request) {
+            Ok(context) => context,
+            Err(error) => {
+                let result: Result<ProcessResult, ErrorCode> = Err(error);
+                audit_process(self, "astrid:process/host.spawn", &cmd_for_audit, &result);
+                return result;
+            },
+        };
+
         // Snapshot + verify any read-only file injections before building the
         // command. `_injection_guard` is held to the end of this fn so the
         // host-owned snapshot lives for the child's lifetime and is cleaned up
@@ -190,6 +201,7 @@ impl process::Host for HostState {
             &request.cmd,
             &request.args,
             &workspace_root,
+            &spawn_context,
             &prepared.sandbox,
             &injection_env,
             &self.spawn_mask_paths,
@@ -343,6 +355,20 @@ impl process::Host for HostState {
             return Err(ErrorCode::Cancelled);
         }
 
+        let spawn_context = match prepare_spawn_context(self, &request) {
+            Ok(context) => context,
+            Err(error) => {
+                let result: Result<Resource<ProcessHandle>, ErrorCode> = Err(error);
+                audit_process(
+                    self,
+                    "astrid:process/host.spawn-background",
+                    &cmd_for_audit,
+                    &result,
+                );
+                return result;
+            },
+        };
+
         // Snapshot + verify any read-only file injections. The guard is stored
         // on the `ManagedProcess` below so it lives as long as the handle and
         // cleans up the host-owned snapshot dir when it drops.
@@ -366,6 +392,7 @@ impl process::Host for HostState {
             &request.cmd,
             &request.args,
             &workspace_root,
+            &spawn_context,
             &prepared.sandbox,
             &injection_env,
             &self.spawn_mask_paths,
@@ -566,6 +593,20 @@ impl process::Host for HostState {
             return Err(ErrorCode::Cancelled);
         }
 
+        let spawn_context = match prepare_spawn_context(self, &request) {
+            Ok(context) => context,
+            Err(error) => {
+                let result: Result<String, ErrorCode> = Err(error);
+                audit_process(
+                    self,
+                    "astrid:process/host.spawn-persistent",
+                    &cmd_for_audit,
+                    &result,
+                );
+                return result;
+            },
+        };
+
         // Snapshot + verify any read-only file injections. The guard is threaded
         // into the registry entry below so it lives as long as the persistent
         // process and is cleaned up by `reap_entry` (which consumes the entry by
@@ -620,6 +661,7 @@ impl process::Host for HostState {
         let mut child = match build_persistent_child(
             &request,
             &workspace_root,
+            &spawn_context,
             want_stdin,
             &prepared.sandbox,
             &prepared.env,

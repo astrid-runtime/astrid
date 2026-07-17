@@ -8,6 +8,10 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: astrid-release-${{ github.ref }}
+  cancel-in-progress: false
+
 env:
   CARGO_TERM_COLOR: always
 
@@ -115,6 +119,18 @@ jobs:
           fetch-depth: 0
           submodules: recursive
 
+      - name: Require repository immutable releases
+        env:
+          GH_TOKEN: ${{ secrets.ASTRID_RELEASE_ADMIN_TOKEN }}
+        run: |
+          [[ -n "$GH_TOKEN" ]]
+          gh api "repos/$GITHUB_REPOSITORY/immutable-releases" \
+            --jq 'select(.enabled == true) | true' | grep -Fx true
+
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.12'
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
         with:
@@ -203,69 +219,341 @@ jobs:
           cd artifacts
           b3sum -- ./*.tar.gz | sed 's#  \./#  #' > BLAKE3SUMS.txt
           sha256sum -- ./*.tar.gz | sed 's#  \./#  #' > SHA256SUMS.txt
+          b3sum --check BLAKE3SUMS.txt
+          sha256sum --check SHA256SUMS.txt
           cat BLAKE3SUMS.txt
           cat SHA256SUMS.txt
 
+      - name: Generate immutable release manifest
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          CARGO_VERSION=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n1)
+          test "$VERSION" = "$CARGO_VERSION"
+          SOURCE_COMMIT=$(git rev-parse "${GITHUB_REF_NAME}^{commit}")
+          CONTRACTS_COMMIT=$(git -C wit rev-parse HEAD)
+          python3 scripts/release_manifest.py generate \
+            --artifacts artifacts \
+            --version "$VERSION" \
+            --tag "$GITHUB_REF_NAME" \
+            --source-commit "$SOURCE_COMMIT" \
+            --contracts-commit "$CONTRACTS_COMMIT" \
+            --output "artifacts/astrid-${VERSION}-release.toml"
+          python3 scripts/release_manifest.py validate \
+            "artifacts/astrid-${VERSION}-release.toml" \
+            --artifacts artifacts \
+            --verify-artifacts
+          {
+            echo "VERSION=$VERSION"
+            echo "SOURCE_COMMIT=$SOURCE_COMMIT"
+            echo "CONTRACTS_COMMIT=$CONTRACTS_COMMIT"
+          } >> "$GITHUB_ENV"
+
+      - name: Detect an interrupted never-published draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          RELEASES="$RUNNER_TEMP/releases-preflight.json"
+          gh api "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
+            --paginate --slurp > "$RELEASES"
+          MATCH_COUNT=$(jq -er --arg tag "$GITHUB_REF_NAME" \
+            '[.[][] | select(.tag_name == $tag)] | length' "$RELEASES")
+          [[ "$MATCH_COUNT" -le 1 ]]
+          if [[ "$MATCH_COUNT" == 0 ]]; then
+            echo "EXISTING_RELEASE=0" >> "$GITHUB_ENV"
+            exit 0
+          fi
+          jq -e --arg tag "$GITHUB_REF_NAME" \
+            '.[][] | select(.tag_name == $tag) | select(.draft == true and .prerelease == false and .published_at == null)' \
+            "$RELEASES" >/dev/null || {
+            echo "release $GITHUB_REF_NAME already exists and is not a never-published draft" >&2
+            echo "release assets are write-once; never clobber, delete, or retag a published version" >&2
+            exit 1
+          }
+          echo "EXISTING_RELEASE=1" >> "$GITHUB_ENV"
+
       - name: Attest release provenance
+        if: env.EXISTING_RELEASE != '1'
         uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
         with:
           subject-path: |
             artifacts/*.tar.gz
             artifacts/BLAKE3SUMS.txt
             artifacts/SHA256SUMS.txt
+            artifacts/astrid-*-release.toml
 
       - name: Install cosign
         uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
 
       - name: Sign release assets
+        if: env.EXISTING_RELEASE != '1'
         env:
           COSIGN_YES: "true"
         run: |
           cd artifacts
-          for asset in *.tar.gz BLAKE3SUMS.txt SHA256SUMS.txt; do
+          for asset in *.tar.gz BLAKE3SUMS.txt SHA256SUMS.txt astrid-*-release.toml; do
             cosign sign-blob --yes --bundle "${asset}.sigstore.json" "$asset"
           done
 
-      - name: Verify release signatures
+      - name: Select and authenticate the exact release candidate
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          cd artifacts
+          CANDIDATE="$GITHUB_WORKSPACE/artifacts"
+          if [[ "$EXISTING_RELEASE" == 1 ]]; then
+            CANDIDATE="$RUNNER_TEMP/existing-release-assets"
+            RELEASES="$RUNNER_TEMP/releases-candidate.json"
+            MATCHING_RELEASE="$RUNNER_TEMP/matching-release.json"
+            gh api "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
+              --paginate --slurp > "$RELEASES"
+            jq --arg tag "$GITHUB_REF_NAME" \
+              '[.[][] | select(.tag_name == $tag)]' "$RELEASES" > "$MATCHING_RELEASE"
+            jq -e 'length == 1 and .[0].draft == true and .[0].prerelease == false and .[0].published_at == null' \
+              "$MATCHING_RELEASE" >/dev/null
+            RELEASE_ID=$(jq -er '.[0].id' "$MATCHING_RELEASE")
+            echo "SELECTED_RELEASE_ID=$RELEASE_ID" >> "$GITHUB_ENV"
+            ASSETS="$RUNNER_TEMP/existing-release-assets.json"
+            gh api "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID/assets?per_page=100" \
+              --paginate --slurp > "$ASSETS"
+            jq -e '[.[][]] | all(.state == "uploaded" and .size > 0)' "$ASSETS" >/dev/null
+            jq -e '[.[][]] as $assets | ([$assets[].name] | unique | length) == ($assets | length)' \
+              "$ASSETS" >/dev/null
+            mkdir "$CANDIDATE"
+            gh release download "$GITHUB_REF_NAME" \
+              --repo "$GITHUB_REPOSITORY" \
+              --dir "$CANDIDATE"
+          fi
+          PAYLOADS="$RUNNER_TEMP/release-payloads.txt"
+          python3 scripts/release_publication.py \
+            --artifacts "$CANDIDATE" \
+            --version "$VERSION" \
+            --source-commit "$SOURCE_COMMIT" \
+            --contracts-commit "$CONTRACTS_COMMIT" > "$PAYLOADS"
+          (
+            cd "$CANDIDATE"
+            b3sum --check BLAKE3SUMS.txt
+            sha256sum --check SHA256SUMS.txt
+          )
           IDENTITY="https://github.com/astrid-runtime/astrid/.github/workflows/release.yml@refs/tags/${GITHUB_REF_NAME}"
           ISSUER="https://token.actions.githubusercontent.com"
-          for asset in *.tar.gz BLAKE3SUMS.txt SHA256SUMS.txt; do
+          while IFS= read -r asset; do
             cosign verify-blob \
-              --bundle "${asset}.sigstore.json" \
+              --bundle "$CANDIDATE/${asset}.sigstore.json" \
               --certificate-identity "$IDENTITY" \
               --certificate-oidc-issuer "$ISSUER" \
               --use-signed-timestamps \
-              "$asset"
-          done
+              "$CANDIDATE/$asset"
+          done < "$PAYLOADS"
+          echo "CANDIDATE=$CANDIDATE" >> "$GITHUB_ENV"
 
       - name: Verify release archives with the native updater policy
         env:
-          ASTRID_RELEASE_GATE_ARTIFACTS: ${{ github.workspace }}/artifacts
           ASTRID_RELEASE_GATE_VERSION: ${{ github.ref_name }}
           CARGO_BUILD_JOBS: "1"
         run: |
+          export ASTRID_RELEASE_GATE_ARTIFACTS="$CANDIDATE"
           ASTRID_RELEASE_GATE_VERSION="${ASTRID_RELEASE_GATE_VERSION#v}"
           export ASTRID_RELEASE_GATE_VERSION
           cargo test -p astrid --bin astrid --locked \
             commands::update_auth::tests::release_gate_authenticates_all_archives_with_production_policy \
             -- --ignored --exact
 
-      - name: Create release
+      - name: Require the release tag to remain unused before draft creation
+        if: env.EXISTING_RELEASE != '1'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          RELEASES="$RUNNER_TEMP/releases-before-create.json"
+          gh api "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
+            --paginate --slurp > "$RELEASES"
+          jq -e --arg tag "$GITHUB_REF_NAME" \
+            '[.[][] | select(.tag_name == $tag)] | length == 0' "$RELEASES" >/dev/null
+
+      - name: Create draft release with write-once assets
+        if: env.EXISTING_RELEASE != '1'
         uses: softprops/action-gh-release@718ea10b132b3b2eba29c1007bb80653f286566b # v3.0.1
         with:
+          draft: true
+          overwrite_files: false
+          fail_on_unmatched_files: true
           files: |
             artifacts/*.tar.gz
             artifacts/BLAKE3SUMS.txt
             artifacts/SHA256SUMS.txt
+            artifacts/astrid-*-release.toml
             artifacts/*.sigstore.json
           body_path: release-notes.md
 
-      - name: Notify Homebrew tap
+      - name: Bind newly created draft identity
+        if: env.EXISTING_RELEASE != '1'
         env:
-          GH_TOKEN: ${{ secrets.TAP_DISPATCH_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
         run: |
-          gh api repos/astrid-runtime/homebrew-tap/dispatches \
-            -f event_type=release \
-            -f "client_payload[version]=${GITHUB_REF_NAME#v}"
+          RELEASES="$RUNNER_TEMP/releases-after-create.json"
+          gh api "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
+            --paginate --slurp > "$RELEASES"
+          RELEASE_ID=$(jq -er --arg tag "$GITHUB_REF_NAME" \
+            '[.[][] | select(.tag_name == $tag) | select(.draft == true and .prerelease == false and .published_at == null)] | select(length == 1) | .[0].id' \
+            "$RELEASES")
+          echo "SELECTED_RELEASE_ID=$RELEASE_ID" >> "$GITHUB_ENV"
+
+      - name: Reauthenticate and publish the exact immutable release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          RELEASES="$RUNNER_TEMP/releases-before-publish.json"
+          MATCHING_RELEASE="$RUNNER_TEMP/matching-release-before-publish.json"
+          gh api "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
+            --paginate --slurp > "$RELEASES"
+          jq --arg tag "$GITHUB_REF_NAME" \
+            '[.[][] | select(.tag_name == $tag)]' "$RELEASES" > "$MATCHING_RELEASE"
+          jq -e 'length == 1 and .[0].draft == true and .[0].prerelease == false and .[0].published_at == null' \
+            "$MATCHING_RELEASE" >/dev/null
+          RELEASE_ID=$(jq -er '.[0].id' "$MATCHING_RELEASE")
+          [[ "$RELEASE_ID" == "$SELECTED_RELEASE_ID" ]]
+          ASSETS="$RUNNER_TEMP/release-assets-before-publish.json"
+          gh api "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID/assets?per_page=100" \
+            --paginate --slurp > "$ASSETS"
+          jq -e '[.[][]] | all(.state == "uploaded" and .size > 0)' "$ASSETS" >/dev/null
+          jq -e '[.[][]] as $assets | ([$assets[].name] | unique | length) == ($assets | length)' \
+            "$ASSETS" >/dev/null
+
+          FINAL="$RUNNER_TEMP/final-release-assets"
+          mkdir "$FINAL"
+          gh release download "$GITHUB_REF_NAME" \
+            --repo "$GITHUB_REPOSITORY" \
+            --dir "$FINAL"
+          PAYLOADS="$RUNNER_TEMP/final-release-payloads.txt"
+          python3 scripts/release_publication.py \
+            --artifacts "$FINAL" \
+            --version "$VERSION" \
+            --source-commit "$SOURCE_COMMIT" \
+            --contracts-commit "$CONTRACTS_COMMIT" > "$PAYLOADS"
+          (
+            cd "$FINAL"
+            b3sum --check BLAKE3SUMS.txt
+            sha256sum --check SHA256SUMS.txt
+          )
+          IDENTITY="https://github.com/astrid-runtime/astrid/.github/workflows/release.yml@refs/tags/${GITHUB_REF_NAME}"
+          while IFS= read -r asset; do
+            cmp "$CANDIDATE/$asset" "$FINAL/$asset"
+            cmp "$CANDIDATE/${asset}.sigstore.json" "$FINAL/${asset}.sigstore.json"
+            cosign verify-blob \
+              --bundle "$FINAL/${asset}.sigstore.json" \
+              --certificate-identity "$IDENTITY" \
+              --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+              --use-signed-timestamps \
+              "$FINAL/$asset"
+          done < "$PAYLOADS"
+
+          gh api --method PATCH \
+            "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" \
+            -F draft=false \
+            --jq 'select(.draft == false and .immutable == true and .published_at != null) | true' \
+            | grep -Fx true
+          gh api "repos/$GITHUB_REPOSITORY/releases/tags/$GITHUB_REF_NAME" \
+            --jq 'select(.draft == false and .immutable == true and .published_at != null) | true' \
+            | grep -Fx true
+
+  crates-io:
+    name: Publish crates.io workspace
+    needs: github-release
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      contents: read
+    steps:
+      - uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          submodules: recursive
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.12'
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          toolchain: '1.95.0'
+      - name: Publish the complete workspace in dependency order
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          [[ -n "$CARGO_REGISTRY_TOKEN" ]]
+          VERSION="${GITHUB_REF_NAME#v}"
+          cargo metadata --no-deps --format-version 1 > "$RUNNER_TEMP/cargo-metadata.json"
+          python3 scripts/crate_publication.py \
+            --metadata "$RUNNER_TEMP/cargo-metadata.json" \
+            --version "$VERSION" > "$RUNNER_TEMP/crates.txt"
+          [[ "$(wc -l < "$RUNNER_TEMP/crates.txt")" == 26 ]]
+
+          crates_io_version() {
+            local crate=$1
+            local output=$2
+            curl --silent --show-error \
+              --user-agent 'astrid-release-workflow (https://github.com/astrid-runtime/astrid)' \
+              --output "$output" \
+              --write-out '%{http_code}' \
+              "https://crates.io/api/v1/crates/${crate}/${VERSION}"
+          }
+
+          verify_crates_io_version() {
+            local crate=$1
+            local response=$2
+            local expected=$3
+            jq -e --arg expected "$expected" \
+              '.version.checksum == $expected and .version.yanked == false' \
+              "$response" >/dev/null || {
+                echo "crates.io has an unusable or byte-different ${crate}@${VERSION}" >&2
+                return 1
+              }
+          }
+
+          while IFS= read -r crate; do
+            packaged=0
+            for _ in {1..60}; do
+              if cargo package --locked --no-verify -p "$crate"; then
+                packaged=1
+                break
+              fi
+              sleep 5
+            done
+            [[ "$packaged" == 1 ]] || {
+              echo "could not package ${crate}@${VERSION} from the crates.io dependency graph" >&2
+              exit 1
+            }
+            archive="target/package/${crate}-${VERSION}.crate"
+            expected=$(sha256sum -- "$archive" | awk '{print $1}')
+            response="$RUNNER_TEMP/crates-io-${crate}.json"
+            status=$(crates_io_version "$crate" "$response")
+            case "$status" in
+              200)
+                verify_crates_io_version "$crate" "$response" "$expected"
+                continue
+                ;;
+              404) ;;
+              *)
+                echo "crates.io returned HTTP $status for ${crate}@${VERSION}" >&2
+                exit 1
+                ;;
+            esac
+
+            published=0
+            for _ in {1..60}; do
+              cargo publish --locked -p "$crate" || true
+              status=$(crates_io_version "$crate" "$response")
+              if [[ "$status" == 200 ]]; then
+                verify_crates_io_version "$crate" "$response" "$expected"
+                published=1
+                break
+              fi
+              [[ "$status" == 404 ]] || {
+                echo "crates.io returned HTTP $status for ${crate}@${VERSION}" >&2
+                exit 1
+              }
+              sleep 5
+            done
+            [[ "$published" == 1 ]] || {
+              echo "${crate}@${VERSION} did not become available on crates.io" >&2
+              exit 1
+            }
+          done < "$RUNNER_TEMP/crates.txt"

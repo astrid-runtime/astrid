@@ -5,6 +5,17 @@ on:
     branches: [main, stream-*]
     paths:
       - '**.rs'
+      - 'scripts/release_manifest.py'
+      - 'scripts/test_release_manifest.py'
+      - 'scripts/release_publication.py'
+      - 'scripts/test_release_publication.py'
+      - 'scripts/crate_publication.py'
+      - 'scripts/test_crate_publication.py'
+      - 'scripts/channel_metadata.py'
+      - 'scripts/test_channel_metadata.py'
+      - 'scripts/channel_publication.py'
+      - 'scripts/test_channel_publication.py'
+      - 'scripts/test_channel_workflow_contract.sh'
       - '**/Cargo.toml'
       - '**/Cargo.lock'
       - '.github/workflows/**'
@@ -12,6 +23,17 @@ on:
     branches: [main]
     paths:
       - '**.rs'
+      - 'scripts/release_manifest.py'
+      - 'scripts/test_release_manifest.py'
+      - 'scripts/release_publication.py'
+      - 'scripts/test_release_publication.py'
+      - 'scripts/crate_publication.py'
+      - 'scripts/test_crate_publication.py'
+      - 'scripts/channel_metadata.py'
+      - 'scripts/test_channel_metadata.py'
+      - 'scripts/channel_publication.py'
+      - 'scripts/test_channel_publication.py'
+      - 'scripts/test_channel_workflow_contract.sh'
       - '**/Cargo.toml'
       - '**/Cargo.lock'
       - '.github/workflows/**'
@@ -37,6 +59,10 @@ jobs:
         with:
           submodules: recursive
 
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.12'
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
         with:
@@ -50,6 +76,15 @@ jobs:
 
       - name: Run cargo check
         run: cargo check --workspace --all-features --locked
+
+      - name: Test release manifest contract
+        run: |
+          python3 scripts/test_release_manifest.py
+          python3 scripts/test_release_publication.py
+          python3 scripts/test_crate_publication.py
+          python3 scripts/test_channel_metadata.py
+          python3 scripts/test_channel_publication.py
+          bash scripts/test_channel_workflow_contract.sh
 
   wasm-portability:
     name: Wasm portability

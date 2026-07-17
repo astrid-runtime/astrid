@@ -51,6 +51,7 @@ pub(crate) async fn install_capsule_batch(
         "distro capsule '{expected}' has no concrete released version or tag"
     );
     super::install::BATCH_MODE.store(true, Ordering::Relaxed);
+    let prompt = super::install::ManualInstallOptions::default();
     let result = super::install::install_capsule_inner(
         source,
         Some(expected.as_str()),
@@ -58,6 +59,7 @@ pub(crate) async fn install_capsule_batch(
         refspec,
         principal,
         Some(expected),
+        &prompt,
     )
     .await;
     super::install::BATCH_MODE.store(false, Ordering::Relaxed);

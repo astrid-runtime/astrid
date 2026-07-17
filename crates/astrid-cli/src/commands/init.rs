@@ -938,6 +938,8 @@ fn onboard_llm_providers(
             &env_path,
             &cap.name,
             &home.config_path(),
+            home,
+            principal,
         ) {
             eprintln!("  Configuration for {} failed: {e}", cap.name);
         }

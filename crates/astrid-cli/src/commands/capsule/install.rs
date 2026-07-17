@@ -24,6 +24,7 @@
 //! by hash via `resolve_content_addressed_wasm`); only the install
 //! path is cleaner.
 
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -32,11 +33,10 @@ use astrid_capsule::capsule::CapsuleId;
 use astrid_capsule_install::github_source::{
     capsule_assets, extract_github_org_repo, parse_github_source, pick_capsule,
 };
-use astrid_capsule_install::{InstallOptions, InstallOutput, resolve_target_dir_for_with_layout};
+use astrid_capsule_install::{InstallOptions, resolve_target_dir_for_with_layout};
 use astrid_core::dirs::AstridHome;
-use astrid_events::EventBus;
 
-use super::install_prompts::{cli_elicit_handler, prompt_env_fields};
+use super::install_finish::{finish_install, run_with_elicit};
 
 pub(crate) use super::install_batch::{
     BatchInstallOutcome, InstalledCapsuleOutcome, RefSpec, install_capsule_batch,
@@ -56,6 +56,32 @@ struct InstallContext<'a> {
     original_source: Option<&'a str>,
     principal: &'a astrid_core::PrincipalId,
     expected: Option<ExpectedCapsule<'a>>,
+    prompt: &'a ManualInstallOptions,
+}
+
+/// Operator input policy for a manual capsule install.
+#[derive(Debug, Clone, Default)]
+pub(super) struct ManualInstallOptions {
+    pub(super) yes: bool,
+    pub(super) vars: HashMap<String, String>,
+}
+
+impl ManualInstallOptions {
+    fn from_cli(yes: bool, items: &[String]) -> anyhow::Result<Self> {
+        let mut vars = HashMap::new();
+        for item in items {
+            let (key, value) = item
+                .split_once('=')
+                .ok_or_else(|| anyhow::anyhow!("--var must be KEY=VALUE (got {item:?})"))?;
+            if key.is_empty() {
+                bail!("--var has an empty key (got {item:?})");
+            }
+            if vars.insert(key.to_string(), value.to_string()).is_some() {
+                bail!("--var '{key}' was supplied more than once");
+            }
+        }
+        Ok(Self { yes, vars })
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -120,7 +146,19 @@ pub(crate) async fn install_capsule(
     capsule: Option<&str>,
     workspace: bool,
 ) -> anyhow::Result<()> {
+    install_capsule_with_options(source, capsule, workspace, false, &[]).await
+}
+
+/// Manual install with explicit non-interactive configuration inputs.
+pub(crate) async fn install_capsule_with_options(
+    source: &str,
+    capsule: Option<&str>,
+    workspace: bool,
+    yes: bool,
+    vars: &[String],
+) -> anyhow::Result<()> {
     let principal = crate::principal::current();
+    let prompt = ManualInstallOptions::from_cli(yes, vars)?;
     let (installed, _resolved) = install_capsule_inner(
         source,
         capsule,
@@ -128,6 +166,7 @@ pub(crate) async fn install_capsule(
         &RefSpec::default(),
         &principal,
         None,
+        &prompt,
     )
     .await?;
     let installed_ids: Vec<String> = installed
@@ -156,6 +195,7 @@ pub(super) async fn install_capsule_inner(
     refspec: &RefSpec,
     principal: &astrid_core::PrincipalId,
     expected: Option<&CapsuleId>,
+    prompt: &ManualInstallOptions,
 ) -> anyhow::Result<(Vec<InstalledCapsuleOutcome>, Option<String>)> {
     let home = AstridHome::resolve()?;
 
@@ -177,7 +217,15 @@ pub(super) async fn install_capsule_inner(
     //    canonical reference for a locally-sourced capsule). No remote
     //    ref to resolve.
     if base.starts_with('.') || base.starts_with('/') {
-        let ids = install_from_local(base, workspace, &home, Some(base), principal, expected)?;
+        let ids = install_from_local(
+            base,
+            workspace,
+            &home,
+            Some(base),
+            principal,
+            expected,
+            prompt,
+        )?;
         return Ok((ids, None));
     }
 
@@ -195,6 +243,7 @@ pub(super) async fn install_capsule_inner(
                 original_source: Some(base),
                 principal,
                 expected,
+                prompt,
             },
         )
         .await;
@@ -213,13 +262,22 @@ pub(super) async fn install_capsule_inner(
                 original_source: Some(base),
                 principal,
                 expected,
+                prompt,
             },
         )
         .await;
     }
 
     // 4. Fallback: assume local folder. No remote ref to resolve.
-    let ids = install_from_local(base, workspace, &home, Some(base), principal, expected)?;
+    let ids = install_from_local(
+        base,
+        workspace,
+        &home,
+        Some(base),
+        principal,
+        expected,
+        prompt,
+    )?;
     Ok((ids, None))
 }
 
@@ -449,6 +507,7 @@ async fn download_and_unpack(
         context.original_source,
         context.principal,
         context.expected,
+        context.prompt,
     )
 }
 
@@ -560,6 +619,7 @@ fn clone_and_build(
             context.original_source,
             context.principal,
             context.expected,
+            context.prompt,
         );
     }
 
@@ -577,6 +637,7 @@ fn install_from_local(
     original_source: Option<&str>,
     principal: &astrid_core::PrincipalId,
     expected: Option<ExpectedCapsule<'_>>,
+    prompt: &ManualInstallOptions,
 ) -> anyhow::Result<Vec<InstalledCapsuleOutcome>> {
     let source_path = Path::new(source);
     if !source_path.exists() {
@@ -592,6 +653,7 @@ fn install_from_local(
             original_source,
             principal,
             expected,
+            prompt,
         )
         .map(|installed| vec![installed]);
     }
@@ -627,6 +689,7 @@ fn install_from_local(
                     original_source,
                     principal,
                     expected,
+                    prompt,
                 )
                 .map(|installed| vec![installed]);
             }
@@ -641,6 +704,7 @@ fn install_from_local(
         original_source,
         principal,
         expected,
+        prompt,
     )
     .map(|installed| vec![installed])
 }
@@ -663,6 +727,7 @@ pub(crate) fn install_from_local_path(
     original_source: Option<&str>,
 ) -> anyhow::Result<String> {
     let principal = crate::principal::current();
+    let prompt = ManualInstallOptions::default();
     install_from_local_path_for_principal(
         source_dir,
         workspace,
@@ -670,6 +735,7 @@ pub(crate) fn install_from_local_path(
         original_source,
         &principal,
         None,
+        &prompt,
     )
     .map(|installed| installed.id.as_str().to_string())
 }
@@ -681,6 +747,7 @@ fn install_from_local_path_for_principal(
     original_source: Option<&str>,
     principal: &astrid_core::PrincipalId,
     expected: Option<ExpectedCapsule<'_>>,
+    prompt: &ManualInstallOptions,
 ) -> anyhow::Result<InstalledCapsuleOutcome> {
     let opts = InstallOptions {
         workspace,
@@ -688,7 +755,7 @@ fn install_from_local_path_for_principal(
         skip_import_check: BATCH_MODE.load(Ordering::Relaxed),
         lifecycle_bus: None,
     };
-    let output = run_with_elicit(opts, |opts, bus| {
+    let output = run_with_elicit(opts, prompt, |opts, bus| {
         let opts = InstallOptions {
             lifecycle_bus: Some(bus),
             ..opts
@@ -714,7 +781,7 @@ fn install_from_local_path_for_principal(
             ),
         }
     })?;
-    finish_install(&output, home)
+    finish_install(&output, home, principal, prompt)
 }
 
 /// Install a capsule from a local `.capsule` file in batch (offline)
@@ -736,6 +803,7 @@ pub(crate) fn install_offline_capsule(
     principal: &astrid_core::PrincipalId,
 ) -> anyhow::Result<InstalledCapsuleOutcome> {
     BATCH_MODE.store(true, Ordering::Relaxed);
+    let prompt = ManualInstallOptions::default();
     let result = (|| {
         let installed = unpack_via_lib(
             archive,
@@ -747,6 +815,7 @@ pub(crate) fn install_offline_capsule(
                 id: expected,
                 version: expected_version,
             }),
+            &prompt,
         )?;
         // Post-stamp provenance into the freshly-written meta.json. The
         // unpack above installs under the explicit target principal and
@@ -779,6 +848,7 @@ fn unpack_via_lib(
     original_source: Option<&str>,
     principal: &astrid_core::PrincipalId,
     expected: Option<ExpectedCapsule<'_>>,
+    prompt: &ManualInstallOptions,
 ) -> anyhow::Result<InstalledCapsuleOutcome> {
     let opts = InstallOptions {
         workspace,
@@ -786,7 +856,7 @@ fn unpack_via_lib(
         skip_import_check: BATCH_MODE.load(Ordering::Relaxed),
         lifecycle_bus: None,
     };
-    let output = run_with_elicit(opts, |opts, bus| {
+    let output = run_with_elicit(opts, prompt, |opts, bus| {
         let opts = InstallOptions {
             lifecycle_bus: Some(bus),
             ..opts
@@ -812,132 +882,7 @@ fn unpack_via_lib(
             ),
         }
     })?;
-    finish_install(&output, home)
-}
-
-/// Run a lib-install closure with a fresh event bus and a stdin
-/// elicit handler subscribed. Tears the handler down before
-/// returning either Ok or Err.
-fn run_with_elicit<F>(opts: InstallOptions, f: F) -> anyhow::Result<InstallOutput>
-where
-    F: FnOnce(InstallOptions, EventBus) -> anyhow::Result<InstallOutput>,
-{
-    let event_bus = EventBus::with_capacity(128);
-    let receiver = event_bus.subscribe_topic("astrid.v1.elicit");
-    let bus_for_handler = event_bus.clone();
-    let elicit_task = tokio::runtime::Handle::try_current().ok().map(|h| {
-        h.spawn(async move {
-            cli_elicit_handler(receiver, bus_for_handler).await;
-        })
-    });
-    let result = f(opts, event_bus.clone());
-    if let Some(task) = elicit_task {
-        task.abort();
-    }
-    drop(event_bus);
-    result
-}
-
-/// Render post-install diagnostics and prompt for unset env fields. Returns the
-/// installed capsule id (its directory name), so the manual-install path can
-/// nudge a running daemon to hot-load exactly that capsule.
-fn finish_install(
-    output: &InstallOutput,
-    home: &AstridHome,
-) -> anyhow::Result<InstalledCapsuleOutcome> {
-    let batch = BATCH_MODE.load(Ordering::Relaxed);
-
-    // Load the manifest once (always present post-install) — used both for
-    // env prompting and for surfacing the CLI commands this capsule adds.
-    let manifest_path = output.target_dir.join("Capsule.toml");
-    let manifest = astrid_capsule::discovery::load_manifest(&manifest_path)
-        .context("re-reading manifest for post-install diagnostics")?;
-
-    // Visibility (no approval gate in this phase): if the capsule declares
-    // any `kind = "cli"` commands, list the new top-level `astrid capsule
-    // <verb>` verbs it adds so the operator knows what just became
-    // invocable. Printed adjacent to the other manifest-derived notices.
-    let capsule_id = CapsuleId::new(manifest.package.name.clone())?;
-    let meta = super::meta::read_meta(&output.target_dir)
-        .context("installed capsule has no readable meta.json")?;
-    if manifest.package.version != meta.version || output.installed_version != meta.version {
-        bail!(
-            "installed capsule '{}' version disagreement: manifest={}, meta={}, installer={}",
-            capsule_id,
-            manifest.package.version,
-            meta.version,
-            output.installed_version
-        );
-    }
-    if output.wasm_hash != meta.wasm_hash {
-        bail!(
-            "installed capsule '{}' hash disagreement: installer={:?}, meta={:?}",
-            capsule_id,
-            output.wasm_hash,
-            meta.wasm_hash
-        );
-    }
-    let cli_commands: Vec<&astrid_capsule::manifest::CommandDef> = manifest
-        .commands
-        .iter()
-        .filter(|c| c.kind == astrid_core::kernel_api::CommandKind::Cli)
-        .collect();
-    if !cli_commands.is_empty() {
-        eprintln!();
-        eprintln!("This capsule adds CLI commands:");
-        for c in cli_commands {
-            let desc = c.description.as_deref().unwrap_or("(no description)");
-            eprintln!("  {} — {desc} (provider: {capsule_id})", c.name);
-        }
-    }
-
-    if !batch && output.env_needs_prompt {
-        prompt_env_fields(
-            &manifest.env,
-            &output.env_path,
-            capsule_id.as_str(),
-            &home.config_path(),
-        )?;
-    }
-
-    if !batch && !output.missing_imports.is_empty() {
-        let importer = capsule_id.as_str();
-        eprintln!();
-        for missing in &output.missing_imports {
-            eprintln!(
-                "  Note: {importer} needs {}/{} {}.",
-                missing.namespace, missing.interface, missing.requirement
-            );
-        }
-        eprintln!(
-            "  Install the missing capsule(s) or run `astrid init` to set up a complete environment."
-        );
-    }
-
-    for c in &output.export_conflicts {
-        tracing::info!(
-            interface = %c.interface,
-            existing = %c.existing_capsule,
-            "Shared export — both capsules will be active"
-        );
-    }
-
-    // Contracts skew — warn-only. Side-loading an ahead-of-daemon dev
-    // build is legitimate, so a differing `astrid-contracts.wit` pin is
-    // surfaced, never blocked. Classified from the just-written meta.json
-    // (the canonical was seeded during install), so it reflects the same
-    // pins `capsule show` / `list` read. Silent for aligned pins and for
-    // a fresh home with no canonical to compare against.
-    if !batch {
-        let skew = super::show::contracts_skew_at(&output.target_dir, home);
-        super::show::print_install_skew_notice(capsule_id.as_str(), &skew);
-    }
-
-    Ok(InstalledCapsuleOutcome {
-        id: capsule_id,
-        version: meta.version,
-        wasm_hash: meta.wasm_hash,
-    })
+    finish_install(&output, home, principal, prompt)
 }
 
 // ---------------------------------------------------------------------------

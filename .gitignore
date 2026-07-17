@@ -25,6 +25,8 @@ secrets.toml
 
 # Tools
 /tools
+__pycache__/
+*.pyc
 
 # Compiled WASM artifacts and test fixtures
 **/*.wasm

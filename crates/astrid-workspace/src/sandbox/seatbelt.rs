@@ -4,6 +4,7 @@ use std::io;
 use super::{ProcessSandboxConfig, SandboxPrefix, validate_sandbox_str};
 
 impl ProcessSandboxConfig {
+    #[allow(clippy::too_many_lines)] // The generated profile's ordering is one security invariant.
     pub(super) fn build_seatbelt_prefix(&self) -> io::Result<SandboxPrefix> {
         let writable_root_str = validate_sandbox_str(&self.writable_root, "writable root")?;
 
@@ -14,7 +15,9 @@ impl ProcessSandboxConfig {
             ""
         };
 
-        // Build extra read path rules
+        // Build exact read grants applied after any containing hidden root is
+        // denied. This exposes the selected principal path without exposing
+        // sibling principals under the same runtime home.
         let extra_read_rules: String = self
             .extra_read_paths
             .iter()
@@ -24,7 +27,7 @@ impl ProcessSandboxConfig {
             .collect::<io::Result<Vec<_>>>()?
             .join("\n");
 
-        // Build extra write path rules
+        // Build exact write grants applied after containing-root denies.
         let extra_write_rules: String = self
             .extra_write_paths
             .iter()
@@ -62,23 +65,47 @@ impl ProcessSandboxConfig {
             .collect::<io::Result<Vec<_>>>()?
             .join("\n");
 
-        // Build deny rules for hidden paths (e.g. ~/.astrid/).
-        // Skip any hidden path that is an ancestor of or equal to the
-        // writable_root — the capsule must be able to access its own
-        // directory, and Seatbelt deny rules block even lstat() on parent
-        // paths which prevents Node.js from resolving real paths.
+        let has_grant_below = |hidden: &std::path::Path| {
+            self.writable_root.starts_with(hidden)
+                || self
+                    .extra_read_paths
+                    .iter()
+                    .any(|path| path.starts_with(hidden))
+                || self
+                    .extra_write_paths
+                    .iter()
+                    .any(|path| path.starts_with(hidden))
+                || self
+                    .ro_injections
+                    .iter()
+                    .any(|injection| injection.target.starts_with(hidden))
+        };
+        let deny_rule = |path: &std::path::Path| {
+            validate_sandbox_str(path, "hidden path").map(|s| {
+                format!(
+                    "(deny file-read* (subpath \"{s}\"))\n\
+                     (deny file-write* (subpath \"{s}\"))"
+                )
+            })
+        };
+
+        // A hidden ancestor of an explicit grant is denied after broad system
+        // grants such as /private/tmp, then the exact child is allowed below.
+        let scoped_hidden_deny_rules: String = self
+            .hidden_paths
+            .iter()
+            .filter(|hidden| has_grant_below(hidden))
+            .map(|path| deny_rule(path))
+            .collect::<io::Result<Vec<_>>>()?
+            .join("\n");
+
+        // Other hidden paths stay trailing hard denies and cannot be reopened
+        // by an earlier broad allow.
         let hidden_deny_rules: String = self
             .hidden_paths
             .iter()
-            .filter(|p| !self.writable_root.starts_with(p.as_path()))
-            .map(|p| {
-                validate_sandbox_str(p, "hidden path").map(|s| {
-                    format!(
-                        "(deny file-read* (subpath \"{s}\"))\n\
-                         (deny file-write* (subpath \"{s}\"))"
-                    )
-                })
-            })
+            .filter(|hidden| !has_grant_below(hidden))
+            .map(|path| deny_rule(path))
             .collect::<io::Result<Vec<_>>>()?
             .join("\n");
 
@@ -99,18 +126,23 @@ impl ProcessSandboxConfig {
     (subpath "/Library")
     (subpath "/opt")
     (subpath "/dev")
-    (subpath "{writable_root_str}")
     (subpath "/private/tmp")
     (subpath "/var/folders")
     (literal "/")
+)
+(allow file-write*
+    (subpath "/private/tmp")
+    (subpath "/var/folders")
+    (literal "/dev/null")
+)
+{scoped_hidden_deny_rules}
+(allow file-read*
+    (subpath "{writable_root_str}")
 {extra_read_rules}
 {inject_read_rules}
 )
 (allow file-write*
     (subpath "{writable_root_str}")
-    (subpath "/private/tmp")
-    (subpath "/var/folders")
-    (literal "/dev/null")
 {extra_write_rules}
 )
 {hidden_deny_rules}
@@ -218,9 +250,8 @@ mod tests {
         );
     }
 
-    /// Regression test for the macOS side of #648: when the writable root is
-    /// inside a hidden path, the deny rule for that path must be skipped so
-    /// the capsule directory remains accessible.
+    /// Regression for #648: deny the containing root, then reopen only the
+    /// selected writable child.
     #[test]
     fn test_seatbelt_prefix_writable_inside_hidden_path() {
         let config = ProcessSandboxConfig::new("/Users/testuser/.astrid/capsules/bridge-unicity")
@@ -228,14 +259,45 @@ mod tests {
         let prefix = config.build_seatbelt_prefix().unwrap();
 
         let profile = prefix.args[1].to_string_lossy().to_string();
+        let deny = r#"(deny file-read* (subpath "/Users/testuser/.astrid"))"#;
+        let grant = r#"(subpath "/Users/testuser/.astrid/capsules/bridge-unicity")"#;
+        let deny_pos = profile.find(deny).expect("containing root deny");
+        let grant_pos = profile.rfind(grant).expect("exact child grant");
         assert!(
-            !profile.contains(r#"(deny file-read* (subpath "/Users/testuser/.astrid"))"#),
-            "should NOT deny file-read for hidden path that is ancestor of writable root"
+            deny_pos < grant_pos,
+            "exact child must reopen after root deny"
+        );
+    }
+
+    #[test]
+    fn test_seatbelt_prefix_keeps_sibling_principal_hidden_under_tmp() {
+        let runtime_home = "/private/tmp/aos/home";
+        let alice = "/private/tmp/aos/home/alice";
+        let config = ProcessSandboxConfig::new("/private/tmp/workspace")
+            .with_hidden(runtime_home)
+            .with_extra_read(alice)
+            .with_extra_write(format!("{alice}/.claude"));
+        let prefix = config.build_seatbelt_prefix().unwrap();
+        let profile = prefix.args[1].to_string_lossy().to_string();
+
+        let broad_tmp = profile
+            .find(r#"(subpath "/private/tmp")"#)
+            .expect("broad temporary-directory grant");
+        let home_deny = profile
+            .find(r#"(deny file-read* (subpath "/private/tmp/aos/home"))"#)
+            .expect("runtime home deny");
+        let alice_grant = profile
+            .rfind(r#"(subpath "/private/tmp/aos/home/alice")"#)
+            .expect("Alice read grant");
+        assert!(
+            broad_tmp < home_deny,
+            "home deny must override broad tmp read"
         );
         assert!(
-            !profile.contains(r#"(deny file-write* (subpath "/Users/testuser/.astrid"))"#),
-            "should NOT deny file-write for hidden path that is ancestor of writable root"
+            home_deny < alice_grant,
+            "Alice must be reopened after home deny"
         );
+        assert!(!profile.contains("/private/tmp/aos/home/bob"));
     }
 
     /// Locate a `node` binary for the enforcement test, or `None` to skip.

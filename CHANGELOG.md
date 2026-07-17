@@ -11,6 +11,34 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
 
 ### Added
 
+- **Native process requests now honor their declared environment and working
+  directory.** Every spawn tier starts from a small host environment allowlist,
+  applies validated guest variables, rejects session-token injection, confines
+  relative working directories to the capsule workspace, and can resolve
+  `HOME=home://...` or a `home://...` working directory after host-side policy
+  checks. The native child receives the resolved path, but the process host API
+  does not return it directly. Principal-home reads require an
+  explicit read capability; the OS sandbox makes writable only the capsule's
+  declared `home://` write roots for that principal. Recv-driven capsules now install the same
+  per-principal home/tmp overlays as interceptor invocations.
+
+- **Capsule installation has an explicit non-interactive configuration path.**
+  `astrid capsule install --yes` resolves lifecycle fields from repeatable
+  `--var KEY=VALUE` inputs, `ASTRID_VAR_<KEY>` environment variables, or
+  manifest defaults, and fails instead of silently choosing an enum value or
+  empty secret when a required value is absent. Secret automation can use the
+  environment form so credentials do not appear in process arguments.
+
+- **Signed runtime release channels and immutable manifests.** Every release records the exact
+  runtime and WIT source commits, release-workflow identity, and all four platform archives with
+  their sizes, BLAKE3 digests, SHA-256 compatibility digests, and Sigstore bundle
+  names. Protected manual promotion advances signed, expiring `stable`, `dev`,
+  or `nightly` pointers only to those immutable releases. `astrid update`
+  authenticates the pointer, manifest, and archive; rejects generation rollback,
+  same-generation equivocation, expiry, digest drift, and workflow-identity
+  drift; and follows deliberate higher-generation rollbacks for self-managed
+  installations. No channel is promoted automatically by this change.
+
 - **Operators can enforce a distro for `astrid init`.**
   `ASTRID_ENFORCED_DISTRO` supplies the distro source and rejects CLI attempts
   to override it. Standalone `astrid init` requires an explicit `--distro`;
@@ -137,6 +165,17 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
 - **Astrid's MCP bridge now uses RMCP 2.2.** The client and server adapt to RMCP's current content and elicitation APIs while preserving existing roots and sampling support. The CLI prompt also follows terminal color preferences, including `NO_COLOR`. The reviewed dependency refresh includes updated cryptography, signal handling, random-source, regex, ignore, and WebAssembly component tooling dependencies; `astrid-core` remains on TOML 0.8 because its public error types expose that API, and the optional SurrealDB backend remains on 3.1.5 pending a dedicated storage migration. Closes #1193.
 
 ### Fixed
+
+- **`astrid secret list` no longer reports an empty configured marker as a
+  second legacy secret.** Secret-typed capsule fields may retain `""` in their
+  env JSON to record completed configuration while the credential lives only in
+  the principal file-secret store. Listing now omits that valueless marker but
+  continues to flag every non-empty secret-typed env value as legacy plaintext.
+
+- **Offline init no longer performs the cached release check.** `astrid init
+  --offline` and `astrid distro apply --offline` skip update discovery before
+  command dispatch, so their no-network contract covers the complete CLI
+  invocation rather than only distro and capsule resolution.
 
 - **Invite commands accept every token the runtime can issue.** `invite redeem`
   and `invite revoke` now treat a leading hyphen in an opaque base64url token as

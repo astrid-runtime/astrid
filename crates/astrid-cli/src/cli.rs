@@ -9,6 +9,7 @@ use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
 
+use crate::commands::UpdateChannel;
 use crate::commands::{
     agent::AgentCommand, audit::AuditArgs, budget::BudgetCommand, caps::CapsCommand,
     capsule::config::ConfigArgs as CapsuleConfigArgs, capsule::show::ShowArgs as CapsuleShowArgs,
@@ -317,7 +318,7 @@ pub(crate) enum Commands {
     /// Generate shell completion scripts.
     Completions(CompletionsArgs),
 
-    /// Update Astrid to the latest release (`self-update` is a legacy alias).
+    /// Update Astrid from a signed release channel (`self-update` is a legacy alias).
     #[command(alias = "self-update")]
     Update(UpdateArgs),
 
@@ -345,23 +346,23 @@ pub(crate) struct UpdateArgs {
     #[arg(long)]
     pub(crate) check: bool,
 
+    /// Follow Astrid's signed stable, dev, or nightly release channel.
+    #[arg(long, value_enum, default_value_t = UpdateChannel::Stable)]
+    pub(crate) channel: UpdateChannel,
+
     /// Override release discovery as `owner/repo` for an official-asset mirror
     /// or test server. This never overrides the required Astrid publisher.
     /// (Env: `ASTRID_UPDATE_REPO`; API base: `ASTRID_UPDATE_API`.)
     #[arg(long, value_name = "OWNER/REPO")]
     pub(crate) source: Option<String>,
 }
-
 #[derive(Subcommand)]
 pub(crate) enum CapsuleCommands {
     /// Scaffold a new, first-try-compiling capsule project.
     New(crate::commands::capsule::new::NewArgs),
     /// Install a capsule from a local path or registry.
-    ///
-    /// Capsule artifact bytes are content-addressed under the Astrid home, but
-    /// principal access is not shared. A principal can only see or invoke
-    /// capsules explicitly listed on its profile, and env/secrets/KV remain
-    /// caller-scoped.
+    /// Artifact bytes are content-addressed, while capsule visibility and
+    /// env/secrets/KV remain principal-scoped.
     Install {
         /// Capsule source (local path or package name)
         source: String,
@@ -371,6 +372,12 @@ pub(crate) enum CapsuleCommands {
         /// Install to workspace instead of user-level
         #[arg(long)]
         workspace: bool,
+        /// Resolve configuration from vars, environment, or defaults without stdin.
+        #[arg(short = 'y', long)]
+        yes: bool,
+        /// Pre-supply a value; prefer `ASTRID_VAR_<KEY>` for secrets (repeatable).
+        #[arg(long = "var", value_name = "KEY=VALUE")]
+        vars: Vec<String>,
     },
     /// Update an installed capsule (or all capsules) from its original source
     Update {

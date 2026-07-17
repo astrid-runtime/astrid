@@ -174,19 +174,15 @@ fn check_reports_update_for_all_install_methods() {
         // `--check`: availability is reported for every method, with that
         // method's own upgrade command — never UpToDate, never a deferral.
         assert_eq!(
-            plan_update(method, &older, &newer, true),
+            plan_update(method, &older, &newer, true, UpdateChannel::Stable),
             UpdatePlan::Available {
-                how: method.upgrade_command()
+                how: method.upgrade_command(UpdateChannel::Stable)
             },
             "check must report availability for {method:?}"
         );
         // Up to date is up to date for every method.
         assert_eq!(
-            plan_update(method, &newer, &newer, true),
-            UpdatePlan::UpToDate
-        );
-        assert_eq!(
-            plan_update(method, &newer, &older, false),
+            plan_update(method, &newer, &newer, true, UpdateChannel::Stable),
             UpdatePlan::UpToDate
         );
     }
@@ -194,22 +190,57 @@ fn check_reports_update_for_all_install_methods() {
     // Applying an update (not --check): external managers defer, self-managed
     // swaps in place.
     assert_eq!(
-        plan_update(Homebrew, &older, &newer, false),
+        plan_update(Homebrew, &older, &newer, false, UpdateChannel::Stable),
         UpdatePlan::DeferToManager {
             manager: "Homebrew",
             how: "brew upgrade astrid"
         }
     );
     assert_eq!(
-        plan_update(Cargo, &older, &newer, false),
+        plan_update(Cargo, &older, &newer, false, UpdateChannel::Stable),
         UpdatePlan::DeferToManager {
             manager: "cargo",
             how: "cargo install astrid --force"
         }
     );
     assert_eq!(
-        plan_update(SelfManaged, &older, &newer, false),
+        plan_update(SelfManaged, &older, &newer, false, UpdateChannel::Stable),
         UpdatePlan::ApplyInPlace
+    );
+
+    // A higher signed channel generation can deliberately point back to a
+    // prior immutable release. Self-managed clients follow that rollback.
+    assert_eq!(
+        plan_update(SelfManaged, &newer, &older, false, UpdateChannel::Stable),
+        UpdatePlan::ApplyInPlace
+    );
+}
+
+#[test]
+fn package_manager_commands_follow_the_signed_stable_version() {
+    let older = semver::Version::parse("1.2.2").unwrap();
+    let selected = semver::Version::parse("1.2.3").unwrap();
+    assert_eq!(
+        notice::managed_update_command(InstallMethod::Cargo, &older, &selected, "1.2.3").unwrap(),
+        "cargo install astrid --version =1.2.3 --force"
+    );
+    assert_eq!(
+        notice::managed_update_command(InstallMethod::Homebrew, &older, &selected, "1.2.3")
+            .unwrap(),
+        "brew upgrade astrid-runtime/tap/astrid"
+    );
+    assert_eq!(
+        notice::managed_update_command(InstallMethod::Homebrew, &selected, &older, "1.2.2")
+            .unwrap(),
+        "brew reinstall astrid-runtime/tap/astrid"
+    );
+    assert_eq!(
+        notice::managed_update_command(InstallMethod::Cargo, &selected, &older, "1.2.2").unwrap(),
+        "cargo install astrid --version =1.2.2 --force"
+    );
+    assert!(
+        notice::managed_update_command(InstallMethod::SelfManaged, &older, &selected, "1.2.3")
+            .is_none()
     );
 }
 
@@ -226,22 +257,6 @@ fn resolve_repo_precedence_and_validation() {
     assert!(resolve_repo(Some("no-slash")).is_err());
     assert!(resolve_repo(Some("owner/")).is_err());
     assert!(resolve_repo(Some("/repo")).is_err());
-}
-
-#[test]
-fn release_tags_are_canonical_and_identity_safe() {
-    assert_eq!(canonical_release_version("v1.2.3").unwrap(), "1.2.3");
-    assert_eq!(
-        canonical_release_version("v1.2.3-rc.1").unwrap(),
-        "1.2.3-rc.1"
-    );
-
-    for invalid in ["1.2.3", "vv1.2.3", "v01.2.3", "v1.2", "v1.2.3-01"] {
-        assert!(
-            canonical_release_version(invalid).is_err(),
-            "unexpectedly accepted {invalid}"
-        );
-    }
 }
 
 #[test]

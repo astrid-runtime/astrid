@@ -7,9 +7,20 @@ ASTRID_HOME_GENERATED=0; if [[ -n "${ASTRID_E2E_HOME:-}" ]]; then ASTRID_HOME="$
 ARTIFACTS="$ASTRID_HOME/artifacts"
 REDACTED_UPLOAD="$ARTIFACTS/redacted-upload"
 GATEWAY_HOST="${ASTRID_E2E_GATEWAY_HOST:-127.0.0.1}"
-GATEWAY_PORT="${ASTRID_E2E_GATEWAY_PORT:-38756}"
-GATEWAY="http://$GATEWAY_HOST:$GATEWAY_PORT"
 PYTHON="${PYTHON:-python3}"
+if [[ -n "${ASTRID_E2E_GATEWAY_PORT:-}" ]]; then
+  GATEWAY_PORT="$ASTRID_E2E_GATEWAY_PORT"
+else
+  GATEWAY_PORT="$($PYTHON - <<'PY'
+import socket
+
+with socket.socket() as listener:
+    listener.bind(("127.0.0.1", 0))
+    print(listener.getsockname()[1])
+PY
+)"
+fi
+GATEWAY="http://$GATEWAY_HOST:$GATEWAY_PORT"
 CORE_CAPSULES="${ASTRID_E2E_CORE_CAPSULES:-astrid-capsule-cli astrid-capsule-registry astrid-capsule-session astrid-capsule-identity astrid-capsule-prompt-builder astrid-capsule-react astrid-capsule-openai-compat}"
 DAEMON_PID=""
 SECONDARY_DAEMON_PID=""

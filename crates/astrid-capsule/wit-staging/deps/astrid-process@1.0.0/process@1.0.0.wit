@@ -170,9 +170,9 @@ interface host {
         /// Environment variables. Replaces the host's default sandbox
         /// environment except for a small kernel-passthrough allowlist.
         env: list<env-var>,
-        /// Working directory relative to the workspace. Must resolve
-        /// inside the sandbox; absolute paths and `..` escapes are
-        /// rejected with `boundary-escape`.
+        /// Working directory relative to the workspace, or a capability-gated
+        /// `home://` path. It must resolve inside an authorized sandbox root;
+        /// absolute paths and `..` escapes are rejected with `boundary-escape`.
         cwd: option<string>,
         /// Per-child OS resource ceilings. Applies to EVERY tier.
         /// (NOT YET ENFORCED — see `resource-limits`.)

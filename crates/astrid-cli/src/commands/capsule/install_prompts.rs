@@ -19,7 +19,10 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use astrid_capsule::manifest::EnvDef;
+use astrid_core::PrincipalId;
+use astrid_core::dirs::AstridHome;
 use astrid_events::{AstridEvent, EventBus, EventMetadata, EventReceiver};
+use astrid_storage::{FileSecretStore, SecretStore};
 use astrid_types::Topic;
 use astrid_types::ipc::{IpcMessage, IpcPayload, OnboardingFieldType};
 
@@ -94,6 +97,8 @@ pub(crate) fn prompt_env_fields(
     env_path: &Path,
     capsule_id: &str,
     config_path: &Path,
+    home: &AstridHome,
+    principal: &PrincipalId,
 ) -> anyhow::Result<()> {
     let mut values: serde_json::Map<String, serde_json::Value> = if env_path.exists() {
         let content = std::fs::read_to_string(env_path)?;
@@ -102,15 +107,38 @@ pub(crate) fn prompt_env_fields(
         serde_json::Map::new()
     };
 
+    let secret_store =
+        FileSecretStore::new(home.secrets_dir().join(principal.as_str()).join(capsule_id));
     let mut prompted = false;
+    let mut changed = false;
     let keys = order_env_keys(env_defs);
 
     for key in &keys {
+        let def = &env_defs[key];
+        if def.env_type == "secret" {
+            if secret_store.exists(key)? {
+                if values.get(key).and_then(serde_json::Value::as_str) != Some("") {
+                    values.insert(key.clone(), serde_json::Value::String(String::new()));
+                    changed = true;
+                }
+                continue;
+            }
+            if let Some(legacy) = values
+                .get(key)
+                .and_then(serde_json::Value::as_str)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+            {
+                secret_store.set(key, &legacy)?;
+                values.insert(key.clone(), serde_json::Value::String(String::new()));
+                changed = true;
+                continue;
+            }
+        }
         if !should_prompt_for_key(&values, key) {
             continue;
         }
 
-        let def = &env_defs[key];
         if !prompted {
             eprintln!("\nThis capsule requires configuration:");
             prompted = true;
@@ -118,7 +146,13 @@ pub(crate) fn prompt_env_fields(
 
         let value = prompt_single_field(key, def, &values);
 
-        if !value.is_empty() {
+        if def.env_type == "secret" {
+            if !value.is_empty() {
+                secret_store.set(key, &value)?;
+            }
+            values.insert(key.clone(), serde_json::Value::String(String::new()));
+            changed = true;
+        } else if !value.is_empty() {
             // Guided pre-bless: if the operator just entered a provider endpoint
             // pointing at a local/private address (e.g. an LM Studio / Ollama
             // base_url), offer to add the SSRF-airlock exemption so the capsule
@@ -128,10 +162,14 @@ pub(crate) fn prompt_env_fields(
             // free-text value is a silent no-op.
             super::local_egress::maybe_prompt_local_egress(capsule_id, &value, config_path);
             values.insert(key.clone(), serde_json::Value::String(value));
+            changed = true;
         }
     }
 
-    if prompted {
+    if changed {
+        if let Some(parent) = env_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
         let json = serde_json::to_string_pretty(&values)?;
         std::fs::write(env_path, &json)?;
         #[cfg(unix)]
@@ -139,7 +177,9 @@ pub(crate) fn prompt_env_fields(
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(env_path, std::fs::Permissions::from_mode(0o600))?;
         }
-        eprintln!("  Configuration saved.\n");
+        if prompted {
+            eprintln!("  Configuration saved.\n");
+        }
     }
 
     Ok(())
@@ -483,12 +523,54 @@ type = "text"
         std::fs::write(&env_path, r#"{"model":"","base_url":"https://h"}"#).expect("write");
 
         let config_path = dir.path().join("config.toml");
-        prompt_env_fields(&defs, &env_path, "cap", &config_path).expect("no prompt → Ok");
+        let home = AstridHome::from_path(dir.path());
+        prompt_env_fields(
+            &defs,
+            &env_path,
+            "cap",
+            &config_path,
+            &home,
+            &PrincipalId::default(),
+        )
+        .expect("no prompt → Ok");
 
         // Untouched: still exactly what we wrote (the function only rewrites
         // when it actually prompted).
         let after = std::fs::read_to_string(&env_path).expect("read");
         assert_eq!(after, r#"{"model":"","base_url":"https://h"}"#);
+    }
+
+    #[test]
+    fn interactive_env_migrates_legacy_plaintext_secret() {
+        let defs = env(r#"
+[api_key]
+type = "secret"
+"#);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let home = AstridHome::from_path(dir.path());
+        let principal = PrincipalId::new("agent").expect("principal");
+        let env_path = dir.path().join("cap.env.json");
+        std::fs::write(&env_path, r#"{"api_key":"legacy-secret"}"#).expect("legacy env");
+
+        prompt_env_fields(
+            &defs,
+            &env_path,
+            "cap",
+            &dir.path().join("config.toml"),
+            &home,
+            &principal,
+        )
+        .expect("migrate secret");
+
+        assert_eq!(
+            std::fs::read_to_string(&env_path).expect("env marker"),
+            "{\n  \"api_key\": \"\"\n}"
+        );
+        let secrets = FileSecretStore::new(home.secrets_dir().join(principal.as_str()).join("cap"));
+        assert_eq!(
+            secrets.get("api_key").expect("secret read").as_deref(),
+            Some("legacy-secret")
+        );
     }
 
     #[test]
