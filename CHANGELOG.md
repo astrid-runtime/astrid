@@ -9,6 +9,8 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-07-17
+
 ### Added
 
 - **Native process requests now honor their declared environment and working
@@ -976,7 +978,8 @@ Breaking changes to note: `Capsule.toml` moves to `[publish]` / `[subscribe]` ta
 Initial tracked release. See the [repository history](https://github.com/unicity-astrid/astrid/commits/v0.2.0)
 for changes included in this version.
 
-[Unreleased]: https://github.com/unicity-astrid/astrid/compare/v0.9.4...HEAD
+[Unreleased]: https://github.com/astrid-runtime/astrid/compare/v0.10.0...HEAD
+[0.10.0]: https://github.com/astrid-runtime/astrid/compare/v0.9.4...v0.10.0
 [0.9.4]: https://github.com/unicity-astrid/astrid/compare/v0.9.3...v0.9.4
 [0.9.3]: https://github.com/unicity-astrid/astrid/compare/v0.9.2...v0.9.3
 [0.9.2]: https://github.com/unicity-astrid/astrid/compare/v0.9.1...v0.9.2
