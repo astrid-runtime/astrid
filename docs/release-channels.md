@@ -129,11 +129,12 @@ self-managed clients follow that signed rollback.
 
 Homebrew and Cargo installations remain controlled by their package managers
 and follow stable. They do not silently switch to dev or nightly; use a
-self-managed Astrid installation for those channels. Immutable release creation
-does not notify the Homebrew tap; only successful stable promotion does. A
-signed stable rollback is applied with an exact Cargo reinstall or a Homebrew
-formula reinstall because ordinary package-manager upgrade commands do not
-downgrade.
+self-managed Astrid installation for those channels. The Homebrew tap
+independently authenticates the signed stable pointer and derives the formula
+version from it; Astrid does not dispatch a caller-selected version or share a
+cross-repository credential. A signed stable rollback is applied with an exact
+Cargo reinstall or a Homebrew formula reinstall because ordinary
+package-manager upgrade commands do not downgrade.
 
 `--source`, `ASTRID_UPDATE_REPO`, and `ASTRID_UPDATE_API` can select a mirror or
 test endpoint, but they cannot alter either accepted workflow identity, issuer,

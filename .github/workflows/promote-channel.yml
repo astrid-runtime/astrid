@@ -585,12 +585,3 @@ jobs:
             --pattern channel.toml.sigstore.json
           cmp -s channel.toml published-current/channel.toml
           cmp -s channel.toml.sigstore.json published-current/channel.toml.sigstore.json
-      - name: Notify Homebrew tap after stable promotion
-        if: inputs.channel == 'stable'
-        env:
-          GH_TOKEN: ${{ secrets.TAP_DISPATCH_TOKEN }}
-          RELEASE_TAG: ${{ inputs.release_tag }}
-        run: |
-          gh api repos/astrid-runtime/homebrew-tap/dispatches \
-            -f event_type=release \
-            -f "client_payload[version]=${RELEASE_TAG#v}"

@@ -9,6 +9,11 @@ nightly_workflow="$repo_root/.github/workflows/nightly.yml"
 nightly_promotion_workflow="$repo_root/.github/workflows/promote-nightly.yml"
 
 grep -Fq "if: github.ref == 'refs/heads/main'" "$workflow"
+if grep -Fq 'TAP_DISPATCH_TOKEN' "$workflow" || \
+  grep -Fq 'homebrew-tap/dispatches' "$workflow"; then
+  echo "channel promotion must not push caller-selected versions to Homebrew" >&2
+  exit 1
+fi
 grep -Fq "repos/\$GITHUB_REPOSITORY/git/ref/tags/\$RELEASE_TAG" "$workflow"
 grep -Fq "repos/\$GITHUB_REPOSITORY/git/tags/\$TAG_COMMIT" "$workflow"
 grep -Fq "[[ \"\$TAG_TYPE\" == commit ]]" "$workflow"
