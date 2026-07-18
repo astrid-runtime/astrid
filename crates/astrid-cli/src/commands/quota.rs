@@ -196,9 +196,8 @@ fn print_quotas_pretty(principal: &PrincipalId, q: &Quotas) {
 
 /// Render the read-only usage-vs-budget report: live consumption paired
 /// with the ceilings it's measured against. CPU is the cross-capsule fuel
-/// total; the per-instance memory ceiling is shown because there is no
-/// per-principal RAM aggregate yet (so `memory current` reads `n/a` until
-/// that lands).
+/// total. Memory current is exact for principal-affine Stores and `n/a` when
+/// none is resident; free-checkout Stores remain represented by their peak.
 fn print_usage_pretty(u: &ResourceUsage) {
     println!("{}", "Usage vs budget".bold());
     println!(
@@ -237,7 +236,7 @@ fn print_usage_pretty(u: &ResourceUsage) {
     println!("  {:<24}  {}", "memory peak".bold(), mem_peak);
     println!(
         "  {:<24}  {}",
-        "memory limit/instance".bold(),
+        "memory limit".bold(),
         format_bytes(u.memory_bytes_limit_per_instance)
     );
 }
@@ -254,8 +253,9 @@ fn exempt_label(exempt: bool) -> String {
 }
 
 /// Plain text for an optional byte total (the `memory current` / `memory peak`
-/// rows). `None` renders the `n/a` placeholder the caller dims: `current` has no
-/// per-principal aggregate, and `peak` is `None` until a guest grows memory.
+/// rows). `None` renders the `n/a` placeholder the caller dims: `current` is
+/// absent without a principal-affine Store, and `peak` is absent until a guest
+/// grows memory.
 fn mem_bytes_label(bytes: Option<u64>) -> String {
     match bytes {
         Some(b) => format_bytes(b),

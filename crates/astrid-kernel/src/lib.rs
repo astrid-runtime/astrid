@@ -176,11 +176,11 @@ pub struct Kernel {
     /// 1-second window is denied at interceptor entry, cross-capsule. See
     /// [`FuelRateLimiter`](astrid_capsule_types::FuelRateLimiter).
     fuel_rate: astrid_capsule_types::FuelRateLimiter,
-    /// Shared per-principal peak-memory ledger, the RAM analogue of
-    /// `fuel_ledger`: cloned into every capsule's `WasmEngine` (via the loader)
-    /// so a principal's linear-memory high-water mark is the max across all
-    /// capsules. Telemetry today; fills `ResourceUsage::memory_bytes_peak_total`.
-    /// See [`MemoryLedger`](astrid_capsule_types::MemoryLedger).
+    /// Shared per-principal memory ledger, cloned into every capsule's
+    /// `WasmEngine` (via the loader). It retains cross-capsule peak telemetry
+    /// for every Store and enforces/reports one exact current aggregate for
+    /// principal-affine resident Stores. See
+    /// [`MemoryLedger`](astrid_capsule_types::MemoryLedger).
     memory_ledger: astrid_capsule_types::MemoryLedger,
     /// Host-derived (operator-overridable) concurrency ceilings for capsule
     /// host calls, resolved once by the daemon and forwarded to every

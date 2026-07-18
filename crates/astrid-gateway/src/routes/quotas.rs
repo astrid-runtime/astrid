@@ -79,12 +79,12 @@ pub struct ResourceUsageView {
     /// Whether the principal is exempt from resource budgets. When `true` the
     /// limit fields are advisory, never enforced.
     pub exempt: bool,
-    /// Per-capsule-instance memory ceiling (`max_memory_bytes`). A per-Store
-    /// cap, not a cross-capsule total.
+    /// Memory ceiling (`max_memory_bytes`). Free-checkout Stores apply it per
+    /// invocation; principal-affine Stores also apply it to their exact
+    /// cross-capsule current aggregate.
     pub memory_bytes_limit_per_instance: u64,
-    /// Current cross-capsule resident memory total, or `null` — not cleanly
-    /// attributable under pooled, shared Stores; the peak below is the reported
-    /// memory signal instead.
+    /// Current cross-capsule memory held by principal-affine Stores, or `null`
+    /// when none is resident. Free-checkout Stores are not included.
     pub memory_bytes_current_total: Option<u64>,
     /// Peak cross-capsule linear-memory high-water mark this principal has
     /// driven, in bytes (max across all capsules), or `null` if none recorded.

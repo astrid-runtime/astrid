@@ -89,9 +89,13 @@ pub(super) fn usage_get(kernel: &Arc<crate::Kernel>, principal: &PrincipalId) ->
                 cpu_fuel_per_sec_limit: profile.quotas.max_cpu_fuel_per_sec,
                 exempt,
                 memory_bytes_limit_per_instance: profile.quotas.max_memory_bytes,
-                // A live cross-capsule "current" total is not cleanly
-                // attributable under pooled, shared Stores; report the peak.
-                memory_bytes_current_total: None,
+                // Exact aggregate for principal-affine resident Stores. Free
+                // checkout Stores remain unattributable and contribute no
+                // current value; zero therefore stays `None`.
+                memory_bytes_current_total: match kernel.memory_ledger.current(principal) {
+                    0 => None,
+                    bytes => Some(bytes),
+                },
                 memory_bytes_peak_total: match kernel.memory_ledger.peak(principal) {
                     0 => None,
                     bytes => Some(bytes),

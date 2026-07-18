@@ -193,6 +193,29 @@ async fn usage_get_ceilings_match_profile_quotas() {
         usage.memory_bytes_limit_per_instance,
         quotas.max_memory_bytes
     );
-    // Per-principal aggregate RAM is unimplemented (#72) → always None.
+    // No principal-affine Store is resident in this fixture.
     assert_eq!(usage.memory_bytes_current_total, None);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn usage_get_reports_principal_affine_current_memory() {
+    let (_dir, kernel) = fixture().await;
+    create_agent(&kernel, "carol", Vec::new()).await;
+    let carol = pid("carol");
+
+    assert!(
+        kernel
+            .memory_ledger
+            .try_reserve_current(&carol, 12 * 1024 * 1024, 64 * 1024 * 1024)
+    );
+    let usage = usage_get(&kernel, &carol).await;
+    assert_eq!(usage.memory_bytes_current_total, Some(12 * 1024 * 1024));
+
+    kernel
+        .memory_ledger
+        .release_current(&carol, 12 * 1024 * 1024);
+    assert_eq!(
+        usage_get(&kernel, &carol).await.memory_bytes_current_total,
+        None
+    );
 }

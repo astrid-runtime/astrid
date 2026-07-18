@@ -30,7 +30,7 @@
 //! the run-loop task) and never go through this pool — they receive events
 //! via auto-subscribed IPC inside `run()`, not via `invoke_interceptor`.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -101,7 +101,27 @@ impl InstanceBuilder {
     /// build, so eager and lazy instances are interchangeable under free
     /// checkout.
     pub(super) async fn build(&self) -> CapsuleResult<PooledInstance> {
-        let mut store = Store::new(&self.engine, (self.make_state)());
+        self.build_bound(None, false).await
+    }
+
+    /// Instantiate a Store whose memory ceiling and accounting identity are
+    /// bound before component initialization can grow linear memory.
+    async fn build_bound(
+        &self,
+        binding: Option<(&astrid_core::PrincipalId, usize)>,
+        resident: bool,
+    ) -> CapsuleResult<PooledInstance> {
+        let mut state = (self.make_state)();
+        if let Some((principal, max_memory_bytes)) = binding {
+            if resident {
+                state
+                    .store_meter
+                    .bind_resident(max_memory_bytes, principal.clone());
+            } else {
+                state.store_meter.set(max_memory_bytes, principal.clone());
+            }
+        }
+        let mut store = Store::new(&self.engine, state);
         store.limiter(|state| &mut state.store_meter);
         store.set_epoch_deadline(self.epoch_deadline);
         // Fuel is engine-wide; a fresh Store starts at 0 and would trap on the
@@ -120,6 +140,27 @@ impl InstanceBuilder {
                 ))
             })?;
         Ok(PooledInstance { store, instance })
+    }
+
+    /// Build a free-checkout Store under the first invocation's own memory
+    /// profile, including component initialization.
+    async fn build_for_invocation(
+        &self,
+        principal: &astrid_core::PrincipalId,
+        max_memory_bytes: usize,
+    ) -> CapsuleResult<PooledInstance> {
+        self.build_bound(Some((principal, max_memory_bytes)), false)
+            .await
+    }
+
+    /// Build a permanently principal-bound resident Store.
+    async fn build_for_resident(
+        &self,
+        principal: &astrid_core::PrincipalId,
+        max_memory_bytes: usize,
+    ) -> CapsuleResult<PooledInstance> {
+        self.build_bound(Some((principal, max_memory_bytes)), true)
+            .await
     }
 }
 
@@ -168,11 +209,10 @@ pub(super) struct CapsuleInstancePool {
     reset_resources_on_return: bool,
     /// On-demand instance factory for lazy growth.
     builder: Arc<InstanceBuilder>,
-    /// Whether a checkout that finds no warm instance may build one. `false`
-    /// for the size-1 `host_process` carve-out (`max == min_idle == 1`): its
-    /// single instance is always warm, so this is belt-and-suspenders — if a
-    /// build were ever reached it would mint a *second* Store and violate the
-    /// carve-out, so we fail closed instead.
+    /// Whether the pool may grow above its initial warm set. `false` whenever
+    /// `max == min_idle`; an ordinary clean pool may still replace a destroyed
+    /// over-quota Store, while the `host_process` carve-out fails closed rather
+    /// than minting a Store that lacks its persistent resource table.
     allow_grow: bool,
     /// Idle-eviction timer; aborted on drop. `None` when the pool cannot grow
     /// (`max == min_idle`) — `available` can then never exceed `min_idle`, so
@@ -242,7 +282,11 @@ impl CapsuleInstancePool {
     /// Returns `None` if the semaphore is closed (capsule unloading), if a
     /// lazy build fails, or if a non-growable pool somehow finds no warm
     /// instance — all treated by the caller as "not invocable".
-    pub(super) async fn checkout(&self) -> Option<PoolCheckout> {
+    pub(super) async fn checkout(
+        &self,
+        principal: &astrid_core::PrincipalId,
+        max_memory_bytes: usize,
+    ) -> Option<PoolCheckout> {
         let permit = Arc::clone(&self.permits).acquire_owned().await.ok()?;
         // Pop the most-recently-returned instance (the BACK — return pushes
         // back) so we lease the warmest, hottest store for cache locality and
@@ -255,14 +299,41 @@ impl CapsuleInstancePool {
             .expect("instance pool mutex poisoned")
             .pop_back();
         let pooled = match warm {
-            Some(pooled) => pooled,
+            Some(pooled)
+                if pooled.store.data().store_meter.current_memory_bytes() <= max_memory_bytes =>
+            {
+                pooled
+            },
+            Some(over_quota) => {
+                // Linear memory cannot shrink. A lower live quota therefore
+                // replaces the clean free-checkout Store before it can be
+                // leased, even when the configured pool size is one.
+                drop(over_quota);
+                match self
+                    .builder
+                    .build_for_invocation(principal, max_memory_bytes)
+                    .await
+                {
+                    Ok(pooled) => pooled,
+                    Err(e) => {
+                        tracing::error!(error = %e, "failed to rebuild over-quota capsule instance");
+                        return None;
+                    },
+                }
+            },
             None => {
-                if !self.allow_grow {
-                    // Unreachable for a size-1 carve-out (its instance is
-                    // always warm); fail closed rather than mint a second Store.
+                if !self.allow_grow && !self.reset_resources_on_return {
+                    // The host-process carve-out must never mint a replacement
+                    // Store because live resource handles deliberately persist
+                    // in its sole warm Store. Ordinary clean pools may recover
+                    // an empty slot after a cancelled/failed quota rebuild.
                     return None;
                 }
-                match self.builder.build().await {
+                match self
+                    .builder
+                    .build_for_invocation(principal, max_memory_bytes)
+                    .await
+                {
                     Ok(pooled) => pooled,
                     Err(e) => {
                         tracing::error!(error = %e, "failed to grow capsule instance pool");
@@ -273,9 +344,11 @@ impl CapsuleInstancePool {
         };
         Some(PoolCheckout {
             pooled: Some(pooled),
-            available: Arc::clone(&self.available),
+            return_to: CheckoutReturn::Free {
+                available: Arc::clone(&self.available),
+            },
             reset_resources_on_return: self.reset_resources_on_return,
-            _permit: permit,
+            permit: Some(permit),
         })
     }
 }
@@ -287,6 +360,294 @@ impl Drop for CapsuleInstancePool {
         // this is the backstop for any path that drops the pool first.
         if let Some(task) = self.evict_task.take() {
             task.abort();
+        }
+    }
+}
+
+/// Invocation pool selected from the component's manifest residency policy.
+pub(super) enum InstancePool {
+    /// Backward-compatible free checkout with no principal affinity.
+    Free(CapsuleInstancePool),
+    /// One resident Store per admitted principal, bounded by the same operator
+    /// pool ceiling and evicted LRU only while idle.
+    Principal(PrincipalInstancePool),
+}
+
+impl InstancePool {
+    pub(super) fn free(pool: CapsuleInstancePool) -> Self {
+        Self::Free(pool)
+    }
+
+    pub(super) fn principal(max: usize, builder: InstanceBuilder) -> Self {
+        Self::Principal(PrincipalInstancePool::new(max, builder))
+    }
+
+    pub(super) fn try_acquire_exclusive(&self) -> Option<OwnedSemaphorePermit> {
+        match self {
+            Self::Free(pool) => pool.try_acquire_exclusive(),
+            Self::Principal(pool) => pool.try_acquire_exclusive(),
+        }
+    }
+
+    pub(super) fn is_principal_resident(&self) -> bool {
+        matches!(self, Self::Principal(_))
+    }
+
+    pub(super) async fn checkout(
+        &self,
+        principal: &astrid_core::PrincipalId,
+        max_memory_bytes: usize,
+    ) -> Option<PoolCheckout> {
+        match self {
+            Self::Free(pool) => pool.checkout(principal, max_memory_bytes).await,
+            Self::Principal(pool) => pool.checkout(principal, max_memory_bytes).await,
+        }
+    }
+}
+
+struct ResidentInstance {
+    pooled: PooledInstance,
+    last_used: u64,
+}
+
+#[derive(Default)]
+struct PrincipalPoolState {
+    idle: HashMap<astrid_core::PrincipalId, ResidentInstance>,
+    in_use: HashSet<astrid_core::PrincipalId>,
+    total: usize,
+    clock: u64,
+}
+
+impl PrincipalPoolState {
+    fn take_lru_idle(&mut self) -> Option<(astrid_core::PrincipalId, ResidentInstance)> {
+        let principal = self
+            .idle
+            .iter()
+            .min_by_key(|(_, resident)| resident.last_used)
+            .map(|(principal, _)| principal.clone())?;
+        self.idle.remove_entry(&principal)
+    }
+}
+
+enum PrincipalCheckoutDecision {
+    Reuse {
+        pooled: PooledInstance,
+        permit: OwnedSemaphorePermit,
+    },
+    Build {
+        evicted: Option<(astrid_core::PrincipalId, PooledInstance)>,
+        permit: OwnedSemaphorePermit,
+    },
+    Wait,
+}
+
+/// Cancellation-safe reservation for an instance currently being built.
+/// Until disarmed by a successful build, dropping this guard restores both the
+/// principal and total-count invariants and wakes blocked checkouts.
+struct PrincipalBuildGuard {
+    state: Arc<Mutex<PrincipalPoolState>>,
+    notify: Arc<tokio::sync::Notify>,
+    principal: astrid_core::PrincipalId,
+    permit: Option<OwnedSemaphorePermit>,
+    armed: bool,
+}
+
+impl PrincipalBuildGuard {
+    fn new(
+        state: Arc<Mutex<PrincipalPoolState>>,
+        notify: Arc<tokio::sync::Notify>,
+        principal: astrid_core::PrincipalId,
+        permit: OwnedSemaphorePermit,
+    ) -> Self {
+        Self {
+            state,
+            notify,
+            principal,
+            permit: Some(permit),
+            armed: true,
+        }
+    }
+
+    fn complete(mut self) -> OwnedSemaphorePermit {
+        self.armed = false;
+        self.permit.take().expect("build permit missing")
+    }
+}
+
+impl Drop for PrincipalBuildGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        // Release capacity before waking a waiter so its non-blocking permit
+        // acquisition cannot observe stale semaphore state.
+        drop(self.permit.take());
+        let mut state = self.state.lock().expect("principal pool mutex poisoned");
+        let removed = state.in_use.remove(&self.principal);
+        debug_assert!(removed, "cancelled build principal was not in use");
+        if removed {
+            state.total = state
+                .total
+                .checked_sub(1)
+                .expect("principal pool total underflow");
+        }
+        drop(state);
+        self.notify.notify_waiters();
+    }
+}
+
+/// Bounded principal-affine Store pool.
+///
+/// A principal's Store is never leased to another principal. Calls for one
+/// principal serialize, while calls for different principals can run in
+/// parallel up to `max`. When all resident slots are occupied, the least
+/// recently used idle Store is dropped before a new principal is admitted.
+/// In-flight Stores are never evicted.
+pub(super) struct PrincipalInstancePool {
+    state: Arc<Mutex<PrincipalPoolState>>,
+    permits: Arc<Semaphore>,
+    max: usize,
+    builder: Arc<InstanceBuilder>,
+    notify: Arc<tokio::sync::Notify>,
+}
+
+impl PrincipalInstancePool {
+    fn new(max: usize, builder: InstanceBuilder) -> Self {
+        debug_assert!(max >= 1, "principal pool max must be >= 1");
+        Self {
+            state: Arc::new(Mutex::new(PrincipalPoolState::default())),
+            permits: Arc::new(Semaphore::new(max)),
+            max,
+            builder: Arc::new(builder),
+            notify: Arc::new(tokio::sync::Notify::new()),
+        }
+    }
+
+    fn try_acquire_exclusive(&self) -> Option<OwnedSemaphorePermit> {
+        let want = u32::try_from(self.max).ok()?;
+        Arc::clone(&self.permits).try_acquire_many_owned(want).ok()
+    }
+
+    async fn checkout(
+        &self,
+        principal: &astrid_core::PrincipalId,
+        max_memory_bytes: usize,
+    ) -> Option<PoolCheckout> {
+        loop {
+            // Register the waiter before inspecting state so a return between
+            // the inspection and `.await` cannot be lost.
+            let notified = self.notify.notified();
+            let decision = {
+                let mut state = self.state.lock().expect("principal pool mutex poisoned");
+                if state.in_use.contains(principal) {
+                    PrincipalCheckoutDecision::Wait
+                } else if state.idle.contains_key(principal) {
+                    let Ok(permit) = Arc::clone(&self.permits).try_acquire_owned() else {
+                        return None;
+                    };
+                    let resident = state
+                        .idle
+                        .remove(principal)
+                        .expect("resident disappeared under pool lock");
+                    state.in_use.insert(principal.clone());
+                    if resident
+                        .pooled
+                        .store
+                        .data()
+                        .store_meter
+                        .resident_memory_exceeds(max_memory_bytes)
+                    {
+                        // WebAssembly memory cannot shrink. Rebuild instead of
+                        // letting a lowered principal quota inherit a Store
+                        // whose current allocation already exceeds it.
+                        PrincipalCheckoutDecision::Build {
+                            evicted: Some((principal.clone(), resident.pooled)),
+                            permit,
+                        }
+                    } else {
+                        PrincipalCheckoutDecision::Reuse {
+                            pooled: resident.pooled,
+                            permit,
+                        }
+                    }
+                } else if state.total < self.max {
+                    let Ok(permit) = Arc::clone(&self.permits).try_acquire_owned() else {
+                        return None;
+                    };
+                    state.total += 1;
+                    state.in_use.insert(principal.clone());
+                    PrincipalCheckoutDecision::Build {
+                        evicted: None,
+                        permit,
+                    }
+                } else if !state.idle.is_empty() {
+                    let Ok(permit) = Arc::clone(&self.permits).try_acquire_owned() else {
+                        return None;
+                    };
+                    let (evicted_principal, resident) = state
+                        .take_lru_idle()
+                        .expect("idle resident disappeared under pool lock");
+                    state.in_use.insert(principal.clone());
+                    PrincipalCheckoutDecision::Build {
+                        evicted: Some((evicted_principal, resident.pooled)),
+                        permit,
+                    }
+                } else {
+                    PrincipalCheckoutDecision::Wait
+                }
+            };
+
+            let (pooled, permit) = match decision {
+                PrincipalCheckoutDecision::Reuse { pooled, permit } => (pooled, permit),
+                PrincipalCheckoutDecision::Build { evicted, permit } => {
+                    let build_guard = PrincipalBuildGuard::new(
+                        Arc::clone(&self.state),
+                        Arc::clone(&self.notify),
+                        principal.clone(),
+                        permit,
+                    );
+                    if let Some((evicted_principal, evicted)) = evicted {
+                        tracing::debug!(
+                            principal = %evicted_principal,
+                            "evicted idle principal-affine capsule instance"
+                        );
+                        drop(evicted);
+                    }
+                    match self
+                        .builder
+                        .build_for_resident(principal, max_memory_bytes)
+                        .await
+                    {
+                        Ok(pooled) => {
+                            let permit = build_guard.complete();
+                            (pooled, permit)
+                        },
+                        Err(error) => {
+                            tracing::error!(
+                                principal = %principal,
+                                error = %error,
+                                "failed to build principal-affine capsule instance"
+                            );
+                            return None;
+                        },
+                    }
+                },
+                PrincipalCheckoutDecision::Wait => {
+                    notified.await;
+                    continue;
+                },
+            };
+
+            return Some(PoolCheckout {
+                pooled: Some(pooled),
+                return_to: CheckoutReturn::Principal {
+                    state: Arc::clone(&self.state),
+                    notify: Arc::clone(&self.notify),
+                    principal: principal.clone(),
+                },
+                reset_resources_on_return: true,
+                permit: Some(permit),
+            });
         }
     }
 }
@@ -352,11 +713,22 @@ fn drain_excess<T>(queue: &mut VecDeque<T>, min_idle: usize) -> Vec<T> {
 /// leaked on an error path.
 pub(super) struct PoolCheckout {
     pooled: Option<PooledInstance>,
-    available: Arc<Mutex<VecDeque<PooledInstance>>>,
+    return_to: CheckoutReturn,
     /// Mirrors [`CapsuleInstancePool::reset_resources_on_return`]; copied at
     /// checkout so the drop path needs no back-pointer to the pool.
     reset_resources_on_return: bool,
-    _permit: OwnedSemaphorePermit,
+    permit: Option<OwnedSemaphorePermit>,
+}
+
+enum CheckoutReturn {
+    Free {
+        available: Arc<Mutex<VecDeque<PooledInstance>>>,
+    },
+    Principal {
+        state: Arc<Mutex<PrincipalPoolState>>,
+        notify: Arc<tokio::sync::Notify>,
+        principal: astrid_core::PrincipalId,
+    },
 }
 
 impl PoolCheckout {
@@ -376,14 +748,39 @@ impl PoolCheckout {
 impl Drop for PoolCheckout {
     fn drop(&mut self) {
         if let Some(mut pooled) = self.pooled.take() {
+            let permit = self.permit.take();
             // Phase 3: CLEAR. Reset every per-invocation field before the
             // instance returns to the pool so the next lease starts clean.
             // Mirrors the old `ClearOnDrop` guard from the single-Store path.
             clear_on_return(pooled.store.data_mut(), self.reset_resources_on_return);
-            self.available
-                .lock()
-                .expect("instance pool mutex poisoned")
-                .push_back(pooled);
+            match &self.return_to {
+                CheckoutReturn::Free { available } => {
+                    available
+                        .lock()
+                        .expect("instance pool mutex poisoned")
+                        .push_back(pooled);
+                    drop(permit);
+                },
+                CheckoutReturn::Principal {
+                    state,
+                    notify,
+                    principal,
+                } => {
+                    let mut state = state.lock().expect("principal pool mutex poisoned");
+                    let removed = state.in_use.remove(principal);
+                    debug_assert!(removed, "returned principal was not marked in use");
+                    state.clock = state.clock.saturating_add(1);
+                    let last_used = state.clock;
+                    let previous = state
+                        .idle
+                        .insert(principal.clone(), ResidentInstance { pooled, last_used });
+                    debug_assert!(previous.is_none(), "principal already had an idle Store");
+                    drop(state);
+                    // Make capacity visible before waking principal waiters.
+                    drop(permit);
+                    notify.notify_waiters();
+                },
+            }
         }
     }
 }
@@ -676,6 +1073,20 @@ mod tests {
         CapsuleInstancePool::new(initial, max, min_idle, true, builder, cancel)
     }
 
+    async fn empty_principal_pool(max: usize) -> PrincipalInstancePool {
+        let engine = super::super::build_wasmtime_engine().expect("engine");
+        let component =
+            wasmtime::component::Component::new(&engine, "(component)").expect("empty component");
+        let linker: wasmtime::component::Linker<HostState> =
+            wasmtime::component::Linker::new(&engine);
+        let instance_pre = linker.instantiate_pre(&component).expect("instantiate_pre");
+        let handle = tokio::runtime::Handle::current();
+        let make_state: Arc<dyn Fn() -> HostState + Send + Sync> =
+            Arc::new(move || minimal_host_state(handle.clone()));
+        let builder = InstanceBuilder::new(engine, instance_pre, make_state, u64::MAX, 1_000_000);
+        PrincipalInstancePool::new(max, builder)
+    }
+
     /// Checkout pops the warm instances first, then grows lazily (building fresh
     /// instances) up to `max`, and blocks once `max` are in flight — releasing
     /// only when one is returned. Exercises the real instantiate path.
@@ -683,15 +1094,27 @@ mod tests {
     async fn checkout_grows_lazily_then_bounds_at_max() {
         let cancel = CancellationToken::new();
         let pool = empty_pool(4, 2, &cancel).await;
+        let principal = astrid_core::PrincipalId::default();
+        let memory = 64 * 1024 * 1024;
 
         // First two pop the warm set; the next two force a lazy build.
-        let c1 = pool.checkout().await.expect("warm 1");
-        let c2 = pool.checkout().await.expect("warm 2");
-        let c3 = pool.checkout().await.expect("lazy grow 3");
-        let c4 = pool.checkout().await.expect("lazy grow 4");
+        let c1 = pool.checkout(&principal, memory).await.expect("warm 1");
+        let c2 = pool.checkout(&principal, memory).await.expect("warm 2");
+        let c3 = pool
+            .checkout(&principal, memory)
+            .await
+            .expect("lazy grow 3");
+        let c4 = pool
+            .checkout(&principal, memory)
+            .await
+            .expect("lazy grow 4");
 
         // Five would exceed max=4: the permit wait must not resolve.
-        let blocked = tokio::time::timeout(Duration::from_millis(100), pool.checkout()).await;
+        let blocked = tokio::time::timeout(
+            Duration::from_millis(100),
+            pool.checkout(&principal, memory),
+        )
+        .await;
         assert!(
             blocked.is_err(),
             "checkout must block once max are in flight"
@@ -699,10 +1122,13 @@ mod tests {
 
         // Returning one frees a permit and a warm instance; the wait resolves.
         drop(c4);
-        let c5 = tokio::time::timeout(Duration::from_millis(1000), pool.checkout())
-            .await
-            .expect("a returned instance must unblock the waiter")
-            .expect("checkout after return");
+        let c5 = tokio::time::timeout(
+            Duration::from_millis(1000),
+            pool.checkout(&principal, memory),
+        )
+        .await
+        .expect("a returned instance must unblock the waiter")
+        .expect("checkout after return");
 
         drop((c1, c2, c3, c5));
         cancel.cancel();
@@ -715,22 +1141,228 @@ mod tests {
     async fn carveout_pool_never_grows() {
         let cancel = CancellationToken::new();
         let pool = empty_pool(1, 1, &cancel).await;
+        let principal = astrid_core::PrincipalId::default();
+        let memory = 64 * 1024 * 1024;
         assert!(!pool.allow_grow, "size-1 pool must not be growable");
         assert!(
             pool.evict_task.is_none(),
             "non-growable pool spawns no evictor"
         );
 
-        let c1 = pool.checkout().await.expect("the one instance");
+        let c1 = pool
+            .checkout(&principal, memory)
+            .await
+            .expect("the one instance");
         // A second concurrent checkout must block (only one Store ever exists).
-        let blocked = tokio::time::timeout(Duration::from_millis(100), pool.checkout()).await;
+        let blocked = tokio::time::timeout(
+            Duration::from_millis(100),
+            pool.checkout(&principal, memory),
+        )
+        .await;
         assert!(blocked.is_err(), "carve-out serialises: no second Store");
         drop(c1);
-        let c2 = tokio::time::timeout(Duration::from_millis(1000), pool.checkout())
-            .await
-            .expect("unblocks on return")
-            .expect("same instance again");
+        let c2 = tokio::time::timeout(
+            Duration::from_millis(1000),
+            pool.checkout(&principal, memory),
+        )
+        .await
+        .expect("unblocks on return")
+        .expect("same instance again");
         drop(c2);
         cancel.cancel();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn free_pool_rebuilds_before_leasing_memory_above_a_live_quota() {
+        use wasmtime::ResourceLimiter;
+
+        let cancel = CancellationToken::new();
+        let pool = empty_pool(1, 1, &cancel).await;
+        let alice = astrid_core::PrincipalId::new("alice").unwrap();
+
+        let mut initial = pool
+            .checkout(&alice, 64 * 1024 * 1024)
+            .await
+            .expect("initial Store");
+        initial.store_mut().data_mut().no_yield_windows = 29;
+        assert!(
+            initial
+                .store_mut()
+                .data_mut()
+                .store_meter
+                .memory_growing(0, 32 * 1024 * 1024, None)
+                .expect("synthetic admitted growth")
+        );
+        drop(initial);
+
+        let mut rebuilt = pool
+            .checkout(&alice, 16 * 1024 * 1024)
+            .await
+            .expect("rebuilt Store");
+        assert_eq!(
+            rebuilt.store_mut().data().no_yield_windows,
+            0,
+            "free checkout must not inherit an allocation above a lowered quota"
+        );
+        assert!(
+            rebuilt
+                .store_mut()
+                .data()
+                .store_meter
+                .current_memory_bytes()
+                <= 16 * 1024 * 1024
+        );
+        cancel.cancel();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn principal_pool_reuses_only_the_owner_and_evicts_idle_lru() {
+        let pool = empty_principal_pool(2).await;
+        let alice = astrid_core::PrincipalId::new("alice").unwrap();
+        let bob = astrid_core::PrincipalId::new("bob").unwrap();
+        let carol = astrid_core::PrincipalId::new("carol").unwrap();
+        let memory = 64 * 1024 * 1024;
+
+        let mut alice_first = pool.checkout(&alice, memory).await.expect("alice first");
+        alice_first.store_mut().data_mut().no_yield_windows = 11;
+        drop(alice_first);
+
+        let mut bob_first = pool.checkout(&bob, memory).await.expect("bob first");
+        assert_eq!(bob_first.store_mut().data().no_yield_windows, 0);
+        bob_first.store_mut().data_mut().no_yield_windows = 22;
+        drop(bob_first);
+
+        let mut alice_again = pool.checkout(&alice, memory).await.expect("alice reuse");
+        assert_eq!(alice_again.store_mut().data().no_yield_windows, 11);
+        drop(alice_again);
+
+        // Alice was just used, so Bob is the LRU idle resident and is evicted
+        // when Carol needs the third logical residency slot.
+        let mut carol_first = pool.checkout(&carol, memory).await.expect("carol first");
+        assert_eq!(carol_first.store_mut().data().no_yield_windows, 0);
+        carol_first.store_mut().data_mut().no_yield_windows = 33;
+        drop(carol_first);
+
+        let mut alice_still_warm = pool.checkout(&alice, memory).await.expect("alice retained");
+        assert_eq!(alice_still_warm.store_mut().data().no_yield_windows, 11);
+        drop(alice_still_warm);
+
+        let mut bob_after_eviction = pool.checkout(&bob, memory).await.expect("bob rebuilt");
+        assert_eq!(
+            bob_after_eviction.store_mut().data().no_yield_windows,
+            0,
+            "an evicted principal must receive a fresh Store, never another principal's state"
+        );
+        drop(bob_after_eviction);
+
+        let state = pool.state.lock().expect("principal pool state");
+        assert_eq!(state.total, 2);
+        assert_eq!(state.idle.len(), 2);
+        assert!(state.in_use.is_empty());
+    }
+
+    #[test]
+    fn cancelled_principal_build_restores_capacity_and_bookkeeping() {
+        let alice = astrid_core::PrincipalId::new("alice").unwrap();
+        let state = Arc::new(Mutex::new(PrincipalPoolState {
+            idle: HashMap::new(),
+            in_use: HashSet::from([alice.clone()]),
+            total: 1,
+            clock: 0,
+        }));
+        let notify = Arc::new(tokio::sync::Notify::new());
+        let permits = Arc::new(Semaphore::new(1));
+        let permit = Arc::clone(&permits)
+            .try_acquire_owned()
+            .expect("build permit");
+
+        drop(PrincipalBuildGuard::new(
+            Arc::clone(&state),
+            notify,
+            alice,
+            permit,
+        ));
+
+        let state = state.lock().expect("principal pool state");
+        assert_eq!(state.total, 0);
+        assert!(state.in_use.is_empty());
+        assert_eq!(permits.available_permits(), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn principal_pool_serializes_one_principal_but_not_another() {
+        let pool = empty_principal_pool(2).await;
+        let alice = astrid_core::PrincipalId::new("alice").unwrap();
+        let bob = astrid_core::PrincipalId::new("bob").unwrap();
+        let memory = 64 * 1024 * 1024;
+
+        let mut alice_active = pool.checkout(&alice, memory).await.expect("alice active");
+        alice_active.store_mut().data_mut().no_yield_windows = 17;
+
+        let same_principal = pool.checkout(&alice, memory);
+        tokio::pin!(same_principal);
+        let still_waiting =
+            tokio::time::timeout(Duration::from_millis(100), &mut same_principal).await;
+        assert!(
+            still_waiting.is_err(),
+            "a second call for one principal must wait for its resident Store"
+        );
+
+        // Keep the Alice waiter alive. It must not consume the second global
+        // permit and prevent an unrelated principal from running.
+        let bob_active =
+            tokio::time::timeout(Duration::from_millis(1000), pool.checkout(&bob, memory))
+                .await
+                .expect("different principal must run concurrently")
+                .expect("bob Store");
+        drop(bob_active);
+        drop(alice_active);
+
+        let mut alice_again = tokio::time::timeout(Duration::from_millis(1000), same_principal)
+            .await
+            .expect("same-principal waiter must wake on return")
+            .expect("alice resumed");
+        assert_eq!(alice_again.store_mut().data().no_yield_windows, 17);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn principal_pool_rebuilds_when_a_live_quota_falls_below_resident_memory() {
+        use wasmtime::ResourceLimiter;
+
+        let pool = empty_principal_pool(1).await;
+        let alice = astrid_core::PrincipalId::new("alice").unwrap();
+
+        let mut initial = pool
+            .checkout(&alice, 64 * 1024 * 1024)
+            .await
+            .expect("initial Store");
+        initial.store_mut().data_mut().no_yield_windows = 41;
+        assert!(
+            initial
+                .store_mut()
+                .data_mut()
+                .store_meter
+                .memory_growing(0, 32 * 1024 * 1024, None)
+                .expect("synthetic admitted growth")
+        );
+        drop(initial);
+
+        let mut after_quota_drop = pool
+            .checkout(&alice, 16 * 1024 * 1024)
+            .await
+            .expect("rebuilt Store");
+        assert_eq!(
+            after_quota_drop.store_mut().data().no_yield_windows,
+            0,
+            "an over-quota resident Store must be destroyed, not reused"
+        );
+        assert!(
+            after_quota_drop
+                .store_mut()
+                .data()
+                .store_meter
+                .current_memory_bytes()
+                <= 16 * 1024 * 1024
+        );
     }
 }
