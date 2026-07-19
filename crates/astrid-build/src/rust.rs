@@ -432,6 +432,8 @@ fn declared_skill_files(dir: &Path, manifest_content: &str) -> Result<Vec<PathBu
         let relative = Path::new(declared);
         if relative.as_os_str().is_empty()
             || relative.is_absolute()
+            || declared.contains('\\')
+            || declared.contains("://")
             || relative
                 .components()
                 .any(|component| !matches!(component, Component::Normal(_)))
@@ -840,6 +842,18 @@ mod tests {
         let absolute =
             declared_skill_files(dir.path(), &manifest_with_skill("/tmp/SKILL.md")).unwrap_err();
         assert!(absolute.to_string().contains("unsafe file path"));
+
+        let backslashes =
+            declared_skill_files(dir.path(), &manifest_with_skill("skills\\test\\SKILL.md"))
+                .unwrap_err();
+        assert!(backslashes.to_string().contains("unsafe file path"));
+
+        let scheme = declared_skill_files(
+            dir.path(),
+            &manifest_with_skill("home://skills/test/SKILL.md"),
+        )
+        .unwrap_err();
+        assert!(scheme.to_string().contains("unsafe file path"));
     }
 
     #[test]
