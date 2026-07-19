@@ -103,6 +103,14 @@ async fn wait_for_broker_on<I: ReadinessIo>(
                 ready_deadline.as_secs()
             );
         }
+        if now >= retry_at {
+            debug!(%principal, "MCP broker readiness probe interval elapsed; retrying idempotent tools/list");
+            send_probe(io, principal, &mut outstanding).await?;
+            retry_at = Instant::now()
+                .checked_add(retry_interval)
+                .unwrap_or(deadline);
+            continue;
+        }
 
         let wake_at = retry_at.min(deadline);
         let frame = match tokio::time::timeout_at(wake_at, io.read_raw_frame()).await {
@@ -200,6 +208,7 @@ mod tests {
         sends: usize,
         principal: PrincipalId,
         drop_first_probe: bool,
+        continuous_noise: bool,
     }
 
     impl ColdStartIo {
@@ -209,6 +218,14 @@ mod tests {
                 sends: 0,
                 principal,
                 drop_first_probe,
+                continuous_noise: false,
+            }
+        }
+
+        fn noisy(principal: PrincipalId) -> Self {
+            Self {
+                continuous_noise: true,
+                ..Self::new(principal, true)
             }
         }
 
@@ -232,11 +249,13 @@ mod tests {
             if self.drop_first_probe && self.sends == 1 {
                 // Exact cold-start race: the event-bus request had no broker
                 // subscriber, then the principal's capsule view completed.
-                self.frames.push_back(Self::raw_frame(&json!({
-                    "topic": CAPSULES_LOADED_TOPIC,
-                    "principal": self.principal.to_string(),
-                    "payload": { "status": "ready", "capsules": [] }
-                })));
+                if !self.continuous_noise {
+                    self.frames.push_back(Self::raw_frame(&json!({
+                        "topic": CAPSULES_LOADED_TOPIC,
+                        "principal": self.principal.to_string(),
+                        "payload": { "status": "ready", "capsules": [] }
+                    })));
+                }
             } else {
                 self.frames.push_back(Self::raw_frame(&json!({
                     "topic": astrid_types::Topic::kernel_response(&req_id).to_string(),
@@ -253,6 +272,11 @@ mod tests {
         async fn read_raw_frame(&mut self) -> Result<Option<Vec<u8>>> {
             match self.frames.pop_front() {
                 Some(frame) => Ok(Some(frame)),
+                None if self.continuous_noise => Ok(Some(Self::raw_frame(&json!({
+                    "topic": "astrid.v1.unrelated",
+                    "principal": self.principal.to_string(),
+                    "payload": {}
+                })))),
                 None => std::future::pending().await,
             }
         }
@@ -290,6 +314,23 @@ mod tests {
         .expect("warm broker answers first probe");
 
         assert_eq!(io.sends, 1);
+    }
+
+    #[tokio::test]
+    async fn unrelated_frames_cannot_starve_retry_interval() {
+        let principal = PrincipalId::new("codex-code").expect("principal");
+        let mut io = ColdStartIo::noisy(principal.clone());
+
+        wait_for_broker_on(
+            &mut io,
+            &principal,
+            Duration::from_millis(100),
+            Duration::from_millis(10),
+        )
+        .await
+        .expect("wall-clock retry fires despite continuously ready noise");
+
+        assert_eq!(io.sends, 2, "noise must not starve the fallback retry");
     }
 
     #[test]
