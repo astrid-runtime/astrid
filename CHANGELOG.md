@@ -15,6 +15,10 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
   Ingress, capsule-grant, and capability-approval prompts omit optional
   top-level schema annotations that Codex rejects while preserving typed
   responses and fail-secure authorization. Closes #1277.
+- **Dev candidates no longer publish the Astrid workspace to crates.io.**
+  Immutable GitHub releases remain binary candidates; the protected stable
+  promotion authenticates the exact signed dev candidate and publishes its
+  crates idempotently before advancing the stable pointer. Closes #1279.
 
 ## [0.10.2] - 2026-07-19
 

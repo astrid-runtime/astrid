@@ -1,0 +1,133 @@
+name: Publish stable crates.io workspace
+
+on:
+  workflow_call:
+    inputs:
+      release_tag:
+        description: Immutable canonical release already selected by the dev channel
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    name: Authenticate dev candidate and publish exact crates
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.12'
+      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+      - name: Authenticate immutable release and current dev pointer
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+        run: |
+          python3 - "$RELEASE_TAG" <<'PY'
+          import sys
+
+          sys.path.insert(0, "scripts")
+          import release_manifest
+
+          tag = sys.argv[1]
+          if not tag.startswith("v"):
+              raise SystemExit("stable release tag must be vX.Y.Z")
+          version = release_manifest.canonical_version(tag[1:])
+          if tag != f"v{version}" or "-" in version or "+" in version:
+              raise SystemExit("stable release tag must be canonical vX.Y.Z")
+          PY
+
+          VERSION="${RELEASE_TAG#v}"
+          RELEASE_METADATA="astrid-${VERSION}-release.toml"
+          mkdir authenticated-release authenticated-dev
+          gh release download "$RELEASE_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --dir authenticated-release \
+            --pattern "$RELEASE_METADATA" \
+            --pattern "$RELEASE_METADATA.sigstore.json"
+          RELEASE_IDENTITY="https://github.com/astrid-runtime/astrid/.github/workflows/release.yml@refs/tags/${RELEASE_TAG}"
+          cosign verify-blob \
+            --bundle "authenticated-release/$RELEASE_METADATA.sigstore.json" \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+            --certificate-identity "$RELEASE_IDENTITY" \
+            --use-signed-timestamps \
+            "authenticated-release/$RELEASE_METADATA"
+          python3 scripts/release_manifest.py validate \
+            "authenticated-release/$RELEASE_METADATA"
+
+          SOURCE_COMMIT=$(python3 - "authenticated-release/$RELEASE_METADATA" <<'PY'
+          import sys
+          import tomllib
+
+          with open(sys.argv[1], "rb") as file:
+              print(tomllib.load(file)["source-commit"])
+          PY
+          )
+          TAG_OBJECT=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$RELEASE_TAG")
+          TAG_TYPE=$(jq -er .object.type <<< "$TAG_OBJECT")
+          TAG_COMMIT=$(jq -er .object.sha <<< "$TAG_OBJECT")
+          for _ in {1..8}; do
+            [[ "$TAG_TYPE" == tag ]] || break
+            TAG_OBJECT=$(gh api "repos/$GITHUB_REPOSITORY/git/tags/$TAG_COMMIT")
+            TAG_TYPE=$(jq -er .object.type <<< "$TAG_OBJECT")
+            TAG_COMMIT=$(jq -er .object.sha <<< "$TAG_OBJECT")
+          done
+          [[ "$TAG_TYPE" == commit ]]
+          [[ "$TAG_COMMIT" == "$SOURCE_COMMIT" ]]
+          gh api "repos/$GITHUB_REPOSITORY/releases/tags/$RELEASE_TAG" \
+            | jq -e 'select(.draft == false and .immutable == true and .prerelease == false and .published_at != null) | true' \
+            | grep -Fx true
+
+          gh release download channel-dev \
+            --repo "$GITHUB_REPOSITORY" \
+            --dir authenticated-dev \
+            --pattern channel.toml \
+            --pattern channel.toml.sigstore.json
+          CHANNEL_IDENTITY="https://github.com/astrid-runtime/astrid/.github/workflows/promote-channel.yml@refs/heads/main"
+          cosign verify-blob \
+            --bundle authenticated-dev/channel.toml.sigstore.json \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+            --certificate-identity "$CHANNEL_IDENTITY" \
+            --use-signed-timestamps \
+            authenticated-dev/channel.toml
+          NOW=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          python3 scripts/channel_metadata.py validate \
+            --expected-channel dev \
+            --now "$NOW" \
+            --release-manifest "authenticated-release/$RELEASE_METADATA" \
+            authenticated-dev/channel.toml
+          {
+            echo "RELEASE_VERSION=$VERSION"
+            echo "RELEASE_SOURCE_COMMIT=$SOURCE_COMMIT"
+          } >> "$GITHUB_ENV"
+      - name: Check out exact authenticated release source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ inputs.release_tag }}
+          path: stable-release-source
+          fetch-depth: 0
+          submodules: recursive
+      - name: Verify checked-out release source
+        run: |
+          [[ "$(git -C stable-release-source rev-parse 'HEAD^{commit}')" == "$RELEASE_SOURCE_COMMIT" ]]
+          [[ "$(sed -n 's/^version = "\([^"]*\)"/\1/p' stable-release-source/Cargo.toml | head -n1)" == "$RELEASE_VERSION" ]]
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          toolchain: '1.95.0'
+      - name: Publish the authenticated stable workspace
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: scripts/publish_crates_io.sh "$RELEASE_VERSION" "$GITHUB_WORKSPACE/stable-release-source"
