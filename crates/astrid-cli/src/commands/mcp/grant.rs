@@ -233,7 +233,7 @@ pub(super) async fn elicit_grant(peer: &Peer<RoleServer>, request: &GrantRequest
         return false;
     }
 
-    match peer.elicit::<GrantForm>(request.prompt()).await {
+    match super::form_elicitation::elicit::<GrantForm>(peer, request.prompt()).await {
         Ok(Some(form)) => {
             debug!(
                 grant = form.grant,
