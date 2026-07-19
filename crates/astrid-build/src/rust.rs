@@ -398,9 +398,10 @@ fn build_manifest_content(
 ///
 /// Declared assets are untrusted manifest input. They must remain at a
 /// relative, traversal-free path inside the capsule source tree, and must
-/// resolve to regular files. The original declared path is returned (rather
-/// than its canonical target) so the archive layout exactly matches
-/// `SkillDef::file` even when an in-tree symlink is dereferenced.
+/// resolve to regular files. The source-tree path formed from the declared
+/// relative path is returned (rather than its canonical target) so the archive
+/// layout exactly matches `SkillDef::file` even when an in-tree symlink is
+/// dereferenced.
 fn declared_skill_files(dir: &Path, manifest_content: &str) -> Result<Vec<PathBuf>> {
     let doc = manifest_content
         .parse::<toml_edit::DocumentMut>()
