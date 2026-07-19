@@ -9,6 +9,13 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
 
 ## [Unreleased]
 
+### Fixed
+
+- **MCP form elicitations now interoperate with strict clients such as Codex.**
+  Ingress, capsule-grant, and capability-approval prompts omit optional
+  top-level schema annotations that Codex rejects while preserving typed
+  responses and fail-secure authorization. Closes #1277.
+
 ## [0.10.2] - 2026-07-19
 
 ### Fixed

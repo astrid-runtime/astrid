@@ -145,7 +145,7 @@ pub(super) async fn elicit_consent(peer: &Peer<RoleServer>, request: &IngressReq
         return false;
     }
 
-    match peer.elicit::<IngressForm>(request.prompt()).await {
+    match super::form_elicitation::elicit::<IngressForm>(peer, request.prompt()).await {
         Ok(Some(form)) => {
             debug!(allow = form.allow, "MCP shim: ingress consent resolved");
             form.allow

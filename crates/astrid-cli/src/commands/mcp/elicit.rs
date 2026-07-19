@@ -239,7 +239,7 @@ async fn elicit_choice(peer: &Peer<RoleServer>, request: &ApprovalRequest) -> Ap
         return ApprovalChoice::Deny;
     }
 
-    match peer.elicit::<ApprovalForm>(request.prompt()).await {
+    match super::form_elicitation::elicit::<ApprovalForm>(peer, request.prompt()).await {
         Ok(Some(form)) => form.choice,
         Ok(None) => {
             // Accepted but no content — treat as no decision -> deny.

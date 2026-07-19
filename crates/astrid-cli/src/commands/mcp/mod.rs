@@ -34,6 +34,7 @@
 //! config, so a stray diagnostic can never corrupt the protocol stream.
 
 mod elicit;
+mod form_elicitation;
 mod grant;
 mod ingress;
 // Parent-death detection reads `getppid()` (Unix-only); the module and its use
