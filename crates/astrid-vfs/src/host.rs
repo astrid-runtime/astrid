@@ -28,6 +28,16 @@ fn make_relative(requested: &str) -> &Path {
     components.as_path()
 }
 
+/// Preserve filesystem conditions that callers need for control flow while
+/// retaining all other native failures as opaque I/O errors.
+fn classify_io_error(error: std::io::Error) -> VfsError {
+    match error.kind() {
+        std::io::ErrorKind::NotFound => VfsError::NotFound(error.to_string()),
+        std::io::ErrorKind::PermissionDenied => VfsError::PermissionDenied(error.to_string()),
+        _ => VfsError::Io(error),
+    }
+}
+
 /// An implementation of `Vfs` backed by the physical host filesystem.
 pub struct HostVfs {
     open_dirs: RwLock<HashMap<DirHandle, Arc<Dir>>>,
@@ -56,10 +66,10 @@ impl HostVfs {
     ///
     /// # Errors
     ///
-    /// Returns `VfsError::Io` when the directory cannot be opened.
+    /// Returns a typed VFS error when the directory cannot be opened.
     pub fn with_registered_dir(handle: DirHandle, physical_path: &Path) -> VfsResult<Self> {
         let dir = Dir::open_ambient_dir(physical_path, cap_std::ambient_authority())
-            .map_err(VfsError::Io)?;
+            .map_err(classify_io_error)?;
         let mut open_dirs = HashMap::new();
         open_dirs.insert(handle, Arc::new(dir));
         Ok(Self {
@@ -75,7 +85,7 @@ impl HostVfs {
     ///
     /// # Errors
     ///
-    /// Returns a `VfsError::Io` if the directory cannot be opened.
+    /// Returns a typed VFS error if the directory cannot be opened.
     pub async fn register_dir(&self, handle: DirHandle, physical_path: PathBuf) -> VfsResult<()> {
         let dir_res = tokio::task::spawn_blocking(move || {
             Dir::open_ambient_dir(&physical_path, cap_std::ambient_authority())
@@ -92,7 +102,7 @@ impl HostVfs {
             },
             Err(e) => {
                 tracing::error!("Failed to register root capability: {}", e);
-                Err(VfsError::Io(e))
+                Err(classify_io_error(e))
             },
         }
     }
@@ -134,11 +144,11 @@ impl Vfs for HostVfs {
             } else {
                 dir.read_dir(&safe_path)
             }
-            .map_err(VfsError::Io)?;
+            .map_err(classify_io_error)?;
 
             let mut entries = Vec::new();
             for entry_res in iter {
-                let entry = entry_res.map_err(VfsError::Io)?;
+                let entry = entry_res.map_err(classify_io_error)?;
                 let is_dir = entry.file_type().is_ok_and(|ft| ft.is_dir());
                 entries.push(VfsDirEntry {
                     name: entry.file_name().to_string_lossy().to_string(),
@@ -161,7 +171,7 @@ impl Vfs for HostVfs {
             } else {
                 dir.symlink_metadata(&safe_path)
             }
-            .map_err(VfsError::Io)?;
+            .map_err(classify_io_error)?;
 
             let mtime = meta
                 .modified()
@@ -193,7 +203,7 @@ impl Vfs for HostVfs {
         tokio::task::spawn_blocking(move || dir.create_dir_all(&safe_path))
             .await
             .expect("spawn_blocking panicked")
-            .map_err(VfsError::Io)
+            .map_err(classify_io_error)
     }
 
     async fn unlink(&self, handle: &DirHandle, path: &str) -> VfsResult<()> {
@@ -206,11 +216,13 @@ impl Vfs for HostVfs {
         }
 
         tokio::task::spawn_blocking(move || {
-            let meta = dir.symlink_metadata(&safe_path).map_err(VfsError::Io)?;
+            let meta = dir
+                .symlink_metadata(&safe_path)
+                .map_err(classify_io_error)?;
             if meta.is_dir() {
-                dir.remove_dir(&safe_path).map_err(VfsError::Io)
+                dir.remove_dir(&safe_path).map_err(classify_io_error)
             } else {
-                dir.remove_file(&safe_path).map_err(VfsError::Io)
+                dir.remove_file(&safe_path).map_err(classify_io_error)
             }
         })
         .await
@@ -245,7 +257,7 @@ impl Vfs for HostVfs {
         })
         .await
         .expect("spawn_blocking panicked")
-        .map_err(VfsError::Io)?;
+        .map_err(classify_io_error)?;
 
         // Convert the cap_std File into a tokio async File
         let tokio_file = tokio::fs::File::from_std(std_file.into_std());
@@ -283,7 +295,7 @@ impl Vfs for HostVfs {
         })
         .await
         .expect("spawn_blocking panicked")
-        .map_err(VfsError::Io)?;
+        .map_err(classify_io_error)?;
 
         let mut dirs: tokio::sync::RwLockWriteGuard<'_, HashMap<DirHandle, Arc<Dir>>> =
             self.open_dirs.write().await;
@@ -317,7 +329,7 @@ impl Vfs for HostVfs {
         let mut file_tuple = file_arc.write().await;
         let file = &mut file_tuple.0;
 
-        let meta = file.metadata().await.map_err(VfsError::Io)?;
+        let meta = file.metadata().await.map_err(classify_io_error)?;
         let max_size = 50 * 1024 * 1024;
         if meta.len() > max_size as u64 {
             return Err(VfsError::PermissionDenied(
@@ -330,7 +342,7 @@ impl Vfs for HostVfs {
         file_handle
             .read_to_end(&mut buffer)
             .await
-            .map_err(VfsError::Io)?;
+            .map_err(classify_io_error)?;
 
         if buffer.len() > max_size {
             return Err(VfsError::PermissionDenied(
@@ -351,8 +363,8 @@ impl Vfs for HostVfs {
 
         let mut file_tuple = file_arc.write().await;
         let file = &mut file_tuple.0;
-        file.write_all(content).await.map_err(VfsError::Io)?;
-        file.flush().await.map_err(VfsError::Io)?;
+        file.write_all(content).await.map_err(classify_io_error)?;
+        file.flush().await.map_err(classify_io_error)?;
         Ok(())
     }
 
@@ -380,11 +392,31 @@ mod tests {
         assert!(vfs.exists(&handle, "visible.txt").await.expect("exists"));
     }
 
+    #[tokio::test]
+    async fn missing_paths_are_reported_as_not_found() {
+        let root = tempfile::tempdir().expect("root");
+        let handle = DirHandle::new();
+        let vfs = HostVfs::with_registered_dir(handle.clone(), root.path()).expect("VFS");
+
+        assert!(matches!(
+            vfs.stat(&handle, "missing").await,
+            Err(VfsError::NotFound(_))
+        ));
+        assert!(matches!(
+            vfs.readdir(&handle, "missing").await,
+            Err(VfsError::NotFound(_))
+        ));
+        assert!(matches!(
+            vfs.open(&handle, "missing", false, false).await,
+            Err(VfsError::NotFound(_))
+        ));
+    }
+
     #[test]
     fn synchronous_constructor_rejects_a_missing_root() {
         let root = tempfile::tempdir().expect("root");
         let missing = root.path().join("missing");
         let result = HostVfs::with_registered_dir(DirHandle::new(), &missing);
-        assert!(matches!(result, Err(VfsError::Io(_))));
+        assert!(matches!(result, Err(VfsError::NotFound(_))));
     }
 }
