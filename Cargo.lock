@@ -312,7 +312,7 @@ dependencies = [
 
 [[package]]
 name = "astrid"
-version = "0.10.1"
+version = "0.10.2"
 dependencies = [
  "anyhow",
  "arboard",
@@ -374,7 +374,7 @@ dependencies = [
 
 [[package]]
 name = "astrid-approval"
-version = "0.10.1"
+version = "0.10.2"
 dependencies = [
  "astrid-audit",
  "astrid-capabilities",
@@ -394,7 +394,7 @@ dependencies = [
 
 [[package]]
 name = "astrid-audit"
-version = "0.10.1"
+version = "0.10.2"
 dependencies = [
  "astrid-capabilities",
  "astrid-core",
@@ -413,7 +413,7 @@ dependencies = [
 
 [[package]]
 name = "astrid-build"
-version = "0.10.1"
+version = "0.10.2"
 dependencies = [
  "anyhow",
  "cargo_metadata",
@@ -430,7 +430,7 @@ dependencies = [
 
 [[package]]
 name = "astrid-capabilities"
-version = "0.10.1"
+version = "0.10.2"
 dependencies = [
  "astrid-core",
  "astrid-crypto",
@@ -448,7 +448,7 @@ dependencies = [
 
 [[package]]
 name = "astrid-capsule"
-version = "0.10.1"
+version = "0.10.2"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -498,7 +498,7 @@ dependencies = [
 
 [[package]]
 name = "astrid-capsule-install"
-version = "0.10.1"
+version = "0.10.2"
 dependencies = [
  "anyhow",
  "astrid-build",
@@ -523,7 +523,7 @@ dependencies = [
 
 [[package]]
 name = "astrid-capsule-types"
-version = "0.10.1"
+version = "0.10.2"
 dependencies = [
  "astrid-core",
  "dashmap",
@@ -539,7 +539,7 @@ dependencies = [
 
 [[package]]
 name = "astrid-config"
-version = "0.10.1"
+version = "0.10.2"
 dependencies = [
  "astrid-core",
  "directories",
@@ -553,7 +553,7 @@ dependencies = [
 
 [[package]]
 name = "astrid-core"
-version = "0.10.1"
+version = "0.10.2"
 dependencies = [
  "async-trait",
  "base64",
@@ -574,7 +574,7 @@ dependencies = [
 
 [[package]]
 name = "astrid-crypto"
-version = "0.10.1"
+version = "0.10.2"
 dependencies = [
  "base64",
  "blake3",
@@ -591,7 +591,7 @@ dependencies = [
 
 [[package]]
 name = "astrid-daemon"
-version = "0.10.1"
+version = "0.10.2"
 dependencies = [
  "anyhow",
  "astrid-capsule",
@@ -613,7 +613,7 @@ dependencies = [
 
 [[package]]
 name = "astrid-emit"
-version = "0.10.1"
+version = "0.10.2"
 dependencies = [
  "anyhow",
  "astrid-core",
@@ -626,7 +626,7 @@ dependencies = [
 
 [[package]]
 name = "astrid-events"
-version = "0.10.1"
+version = "0.10.2"
 dependencies = [
  "astrid-core",
  "astrid-runtime",
@@ -648,7 +648,7 @@ dependencies = [
 
 [[package]]
 name = "astrid-gateway"
-version = "0.10.1"
+version = "0.10.2"
 dependencies = [
  "anyhow",
  "astrid-audit",
@@ -693,7 +693,7 @@ dependencies = [
 
 [[package]]
 name = "astrid-hooks"
-version = "0.10.1"
+version = "0.10.2"
 dependencies = [
  "astrid-capabilities",
  "astrid-capsule",
@@ -721,7 +721,7 @@ dependencies = [
 
 [[package]]
 name = "astrid-integration-tests"
-version = "0.10.1"
+version = "0.10.2"
 dependencies = [
  "arc-swap",
  "astrid-approval",
@@ -758,7 +758,7 @@ dependencies = [
 
 [[package]]
 name = "astrid-kernel"
-version = "0.10.1"
+version = "0.10.2"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -796,7 +796,7 @@ dependencies = [
 
 [[package]]
 name = "astrid-mcp"
-version = "0.10.1"
+version = "0.10.2"
 dependencies = [
  "astrid-audit",
  "astrid-capabilities",
@@ -818,7 +818,7 @@ dependencies = [
 
 [[package]]
 name = "astrid-prelude"
-version = "0.10.1"
+version = "0.10.2"
 dependencies = [
  "astrid-audit",
  "astrid-capabilities",
@@ -833,7 +833,7 @@ dependencies = [
 
 [[package]]
 name = "astrid-runtime"
-version = "0.10.1"
+version = "0.10.2"
 dependencies = [
  "futures",
  "tokio",
@@ -844,7 +844,7 @@ dependencies = [
 
 [[package]]
 name = "astrid-storage"
-version = "0.10.1"
+version = "0.10.2"
 dependencies = [
  "astrid-core",
  "async-trait",
@@ -864,7 +864,7 @@ dependencies = [
 
 [[package]]
 name = "astrid-telemetry"
-version = "0.10.1"
+version = "0.10.2"
 dependencies = [
  "astrid-config",
  "chrono",
@@ -881,7 +881,7 @@ dependencies = [
 
 [[package]]
 name = "astrid-test"
-version = "0.10.1"
+version = "0.10.2"
 dependencies = [
  "astrid-core",
  "chrono",
@@ -894,7 +894,7 @@ dependencies = [
 
 [[package]]
 name = "astrid-types"
-version = "0.10.1"
+version = "0.10.2"
 dependencies = [
  "chrono",
  "getrandom 0.4.3",
@@ -906,7 +906,7 @@ dependencies = [
 
 [[package]]
 name = "astrid-uplink"
-version = "0.10.1"
+version = "0.10.2"
 dependencies = [
  "anyhow",
  "astrid-core",
@@ -922,7 +922,7 @@ dependencies = [
 
 [[package]]
 name = "astrid-vfs"
-version = "0.10.1"
+version = "0.10.2"
 dependencies = [
  "astrid-capabilities",
  "astrid-core",
@@ -940,7 +940,7 @@ dependencies = [
 
 [[package]]
 name = "astrid-workspace"
-version = "0.10.1"
+version = "0.10.2"
 dependencies = [
  "astrid-core",
  "chrono",
