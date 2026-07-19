@@ -11,9 +11,18 @@ source_root=$2
 work_root=${RUNNER_TEMP:?RUNNER_TEMP must be set by the protected release runner}
 script_root=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 
-[[ "$version" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]
-[[ -n "${CARGO_REGISTRY_TOKEN:-}" ]]
-[[ -f "$source_root/Cargo.toml" && ! -L "$source_root/Cargo.toml" ]]
+if [[ ! "$version" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+  echo "crates.io publication requires a canonical X.Y.Z version: $version" >&2
+  exit 1
+fi
+if [[ -z "${CARGO_REGISTRY_TOKEN:-}" ]]; then
+  echo "CARGO_REGISTRY_TOKEN is unavailable in the protected release environment" >&2
+  exit 1
+fi
+if [[ ! -f "$source_root/Cargo.toml" || -L "$source_root/Cargo.toml" ]]; then
+  echo "authenticated release source has no regular root Cargo.toml: $source_root" >&2
+  exit 1
+fi
 
 (
   cd "$source_root"
@@ -22,7 +31,11 @@ script_root=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 python3 "$script_root/crate_publication.py" \
   --metadata "$work_root/cargo-metadata.json" \
   --version "$version" > "$work_root/crates.txt"
-[[ "$(wc -l < "$work_root/crates.txt")" == 26 ]]
+crate_count=$(wc -l < "$work_root/crates.txt")
+if [[ "$crate_count" != 26 ]]; then
+  echo "expected 26 publishable workspace crates, found $crate_count" >&2
+  exit 1
+fi
 
 crates_io_version() {
   local crate=$1

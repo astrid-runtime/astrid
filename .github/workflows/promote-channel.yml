@@ -31,7 +31,6 @@ jobs:
     uses: ./.github/workflows/publish-stable-crates.yml
     with:
       release_tag: ${{ inputs.release_tag }}
-    secrets: inherit
 
   promote:
     name: Authenticate release and publish signed pointer

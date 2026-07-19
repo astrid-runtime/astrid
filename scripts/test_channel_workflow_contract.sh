@@ -48,6 +48,10 @@ if grep -Fq 'CARGO_REGISTRY_TOKEN' "$release_workflow" || \
 fi
 grep -Fq "if: github.ref == 'refs/heads/main' && inputs.channel == 'stable'" "$workflow"
 grep -Fq 'uses: ./.github/workflows/publish-stable-crates.yml' "$workflow"
+if grep -Fq 'secrets: inherit' "$workflow"; then
+  echo "stable crates publication must not inherit unrelated caller secrets" >&2
+  exit 1
+fi
 grep -Fq "inputs.channel != 'stable' || needs.publish-stable-crates.result == 'success'" "$workflow"
 grep -Fq 'workflow_call:' "$stable_crates_workflow"
 if grep -Fq 'workflow_dispatch:' "$stable_crates_workflow"; then
@@ -55,10 +59,13 @@ if grep -Fq 'workflow_dispatch:' "$stable_crates_workflow"; then
   exit 1
 fi
 grep -Fq 'environment: release' "$stable_crates_workflow"
+grep -Fq "if: github.ref == 'refs/heads/main'" "$stable_crates_workflow"
 grep -Fq -- '--expected-channel dev' "$stable_crates_workflow"
 grep -Fq 'secrets.CARGO_REGISTRY_TOKEN' "$stable_crates_workflow"
 grep -Fq 'scripts/publish_crates_io.sh' "$stable_crates_workflow"
 grep -Fq 'python3 "$script_root/crate_publication.py"' "$stable_crates_script"
+grep -Fq 'crates.io publication requires a canonical X.Y.Z version' "$stable_crates_script"
+grep -Fq 'expected 26 publishable workspace crates' "$stable_crates_script"
 grep -Fq "cargo publish --locked -p \"\$crate\"" "$stable_crates_script"
 grep -Fq ".version.checksum == \$expected and .version.yanked == false" "$stable_crates_script"
 grep -Fq "[[ \"\$published\" == 1 ]]" "$stable_crates_script"
