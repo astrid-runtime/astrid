@@ -2,8 +2,9 @@
 
 use crate::archiver::pack_capsule_archive;
 use anyhow::{Context, Result, bail};
+use std::collections::BTreeMap;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use tracing::{info, warn};
 
 /// Stub WIT package written when a capsule has no local `wit/` directory.
@@ -51,6 +52,8 @@ pub(crate) fn build(dir: &Path, output: Option<&str>) -> Result<()> {
 
     let toml_content =
         build_manifest_content(dir, &wasm_path, &crate_name, &package_version, &wasm_name)?;
+    let skill_files = declared_skill_files(dir, &toml_content)?;
+    let skill_file_refs: Vec<&Path> = skill_files.iter().map(PathBuf::as_path).collect();
 
     let out_dir = resolve_output_dir(output)?;
     let out_file = out_dir.join(format!("{crate_name}.capsule"));
@@ -65,7 +68,7 @@ pub(crate) fn build(dir: &Path, output: Option<&str>) -> Result<()> {
         &toml_content,
         Some(&wasm_path),
         dir,
-        &[],
+        &skill_file_refs,
         wit_staging.as_deref(),
     )?;
 
@@ -391,6 +394,74 @@ fn build_manifest_content(
     Ok(toml_doc.to_string())
 }
 
+/// Resolve the files referenced by `[[skill]]` declarations for archiving.
+///
+/// Declared assets are untrusted manifest input. They must remain at a
+/// relative, traversal-free path inside the capsule source tree, and must
+/// resolve to regular files. The source-tree path formed from the declared
+/// relative path is returned (rather than its canonical target) so the archive
+/// layout exactly matches `SkillDef::file` even when an in-tree symlink is
+/// dereferenced.
+fn declared_skill_files(dir: &Path, manifest_content: &str) -> Result<Vec<PathBuf>> {
+    let doc = manifest_content
+        .parse::<toml_edit::DocumentMut>()
+        .context("Failed to parse synthesized Capsule.toml for declared skills")?;
+    let Some(skills) = doc
+        .get("skill")
+        .and_then(toml_edit::Item::as_array_of_tables)
+    else {
+        return Ok(Vec::new());
+    };
+
+    let canonical_dir = dir.canonicalize().with_context(|| {
+        format!(
+            "Failed to resolve capsule source directory {}",
+            dir.display()
+        )
+    })?;
+    let mut files = BTreeMap::new();
+
+    for skill in skills {
+        let name = skill
+            .get("name")
+            .and_then(toml_edit::Item::as_str)
+            .unwrap_or("<unnamed>");
+        let declared = skill
+            .get("file")
+            .and_then(toml_edit::Item::as_str)
+            .with_context(|| format!("skill {name:?} is missing a string `file` path"))?;
+        let relative = Path::new(declared);
+        if relative.as_os_str().is_empty()
+            || relative.is_absolute()
+            || declared.contains('\\')
+            || declared.contains("://")
+            || relative
+                .components()
+                .any(|component| !matches!(component, Component::Normal(_)))
+        {
+            bail!("skill {name:?} has an unsafe file path: {declared:?}");
+        }
+
+        let source = dir.join(relative);
+        let canonical_source = source.canonicalize().with_context(|| {
+            format!(
+                "skill {name:?} file does not exist or cannot be resolved: {}",
+                source.display()
+            )
+        })?;
+        if !canonical_source.starts_with(&canonical_dir) || !canonical_source.is_file() {
+            bail!(
+                "skill {name:?} file must resolve to a regular file inside the capsule source: {}",
+                source.display()
+            );
+        }
+
+        files.entry(relative.to_path_buf()).or_insert(source);
+    }
+
+    Ok(files.into_values().collect())
+}
+
 /// Resolve the output directory, creating it if necessary.
 fn resolve_output_dir(output: Option<&str>) -> Result<PathBuf> {
     let out_dir = match output {
@@ -567,6 +638,12 @@ fn create_default_manifest(
 mod tests {
     use super::*;
 
+    fn manifest_with_skill(file: &str) -> String {
+        format!(
+            "[package]\nname = \"test\"\nversion = \"0.1.0\"\n\n[[skill]]\nname = \"test-skill\"\nfile = {file:?}\n"
+        )
+    }
+
     fn decode(encoded: &str) -> Vec<String> {
         encoded.split(RUSTFLAGS_SEP).map(str::to_owned).collect()
     }
@@ -723,5 +800,79 @@ mod tests {
         let (target, flags) = cargo_config_target_and_rustflags(dir.path());
         assert_eq!(target, None);
         assert!(flags.is_empty());
+    }
+
+    #[test]
+    fn resolves_declared_skill_files_at_their_archive_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let skill = dir.path().join("skills/test/SKILL.md");
+        fs::create_dir_all(skill.parent().unwrap()).unwrap();
+        fs::write(&skill, "# Test skill").unwrap();
+
+        let manifest = manifest_with_skill("skills/test/SKILL.md");
+        let files = declared_skill_files(dir.path(), &manifest).unwrap();
+
+        assert_eq!(files, vec![skill]);
+
+        let archive_path = dir.path().join("test.capsule");
+        let refs: Vec<&Path> = files.iter().map(PathBuf::as_path).collect();
+        pack_capsule_archive(&archive_path, &manifest, None, dir.path(), &refs, None).unwrap();
+        let decoder = flate2::read::GzDecoder::new(fs::File::open(archive_path).unwrap());
+        let mut archive = tar::Archive::new(decoder);
+        let entries: Vec<_> = archive
+            .entries()
+            .unwrap()
+            .map(|entry| entry.unwrap().path().unwrap().into_owned())
+            .collect();
+        assert!(entries.contains(&PathBuf::from("skills/test/SKILL.md")));
+    }
+
+    #[test]
+    fn rejects_missing_or_escaping_declared_skill_files() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let missing =
+            declared_skill_files(dir.path(), &manifest_with_skill("skills/missing/SKILL.md"))
+                .unwrap_err();
+        assert!(missing.to_string().contains("does not exist"));
+
+        let traversal =
+            declared_skill_files(dir.path(), &manifest_with_skill("../SKILL.md")).unwrap_err();
+        assert!(traversal.to_string().contains("unsafe file path"));
+
+        let absolute =
+            declared_skill_files(dir.path(), &manifest_with_skill("/tmp/SKILL.md")).unwrap_err();
+        assert!(absolute.to_string().contains("unsafe file path"));
+
+        let backslashes =
+            declared_skill_files(dir.path(), &manifest_with_skill("skills\\test\\SKILL.md"))
+                .unwrap_err();
+        assert!(backslashes.to_string().contains("unsafe file path"));
+
+        let scheme = declared_skill_files(
+            dir.path(),
+            &manifest_with_skill("home://skills/test/SKILL.md"),
+        )
+        .unwrap_err();
+        assert!(scheme.to_string().contains("unsafe file path"));
+    }
+
+    #[test]
+    #[cfg_attr(windows, ignore = "symlinks require elevated privileges on Windows")]
+    fn rejects_declared_skill_symlinks_that_escape_the_source_tree() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let outside_skill = outside.path().join("SKILL.md");
+        fs::write(&outside_skill, "# Outside").unwrap();
+        let skill = dir.path().join("skills/test/SKILL.md");
+        fs::create_dir_all(skill.parent().unwrap()).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&outside_skill, &skill).unwrap();
+        #[cfg(windows)]
+        std::os::windows::fs::symlink_file(&outside_skill, &skill).unwrap();
+
+        let error = declared_skill_files(dir.path(), &manifest_with_skill("skills/test/SKILL.md"))
+            .unwrap_err();
+        assert!(error.to_string().contains("inside the capsule source"));
     }
 }
