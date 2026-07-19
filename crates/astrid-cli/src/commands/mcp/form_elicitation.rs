@@ -114,7 +114,18 @@ mod tests {
             .keys()
             .map(String::as_str)
             .collect();
-        assert_eq!(keys, BTreeSet::from(["properties", "required", "type"]));
+        let allowed = BTreeSet::from(["$schema", "properties", "required", "type"]);
+        assert!(
+            keys.is_subset(&allowed),
+            "strict clients reject these top-level keys: {:?}",
+            keys.difference(&allowed).collect::<Vec<_>>()
+        );
+        for required in ["properties", "required", "type"] {
+            assert!(
+                keys.contains(required),
+                "schema omitted required key {required}"
+            );
+        }
         assert_eq!(wire["properties"]["allow"]["type"], "boolean");
     }
 
