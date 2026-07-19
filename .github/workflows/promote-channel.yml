@@ -25,9 +25,21 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  publish-stable-crates:
+    name: Publish exact stable candidate to crates.io
+    if: github.ref == 'refs/heads/main' && inputs.channel == 'stable'
+    uses: ./.github/workflows/publish-stable-crates.yml
+    with:
+      release_tag: ${{ inputs.release_tag }}
+    secrets: inherit
+
   promote:
     name: Authenticate release and publish signed pointer
-    if: github.ref == 'refs/heads/main'
+    needs: publish-stable-crates
+    if: >-
+      always() &&
+      github.ref == 'refs/heads/main' &&
+      (inputs.channel != 'stable' || needs.publish-stable-crates.result == 'success')
     runs-on: ubuntu-latest
     environment:
       name: astrid-channel-${{ inputs.channel }}
