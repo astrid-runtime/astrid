@@ -9,6 +9,17 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
 
 ## [Unreleased]
 
+### Fixed
+
+- **`astrid mcp serve` now waits for the authenticated principal's broker to
+  answer before exposing MCP stdio.** Non-default capsule views intentionally
+  warm after global daemon readiness; an immediate client `tools/list` could
+  previously publish before the broker subscribed, lose the non-durable bus
+  request, and hang for the full 55-second reply deadline. Startup now proves
+  the generic broker path with an idempotent `tools/list` probe and reissues it
+  when the principal's `capsules_loaded` signal arrives, without hardcoding a
+  product capsule name.
+
 ## [0.10.1] - 2026-07-17
 
 ### Fixed

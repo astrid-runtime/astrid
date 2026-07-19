@@ -40,6 +40,7 @@ mod ingress;
 // site are target-gated so the CLI still compiles on non-Unix targets.
 #[cfg(unix)]
 mod parent_death;
+mod readiness;
 mod server;
 mod session_guard;
 mod watch;
@@ -120,7 +121,7 @@ pub(crate) async fn serve(principal: Option<&str>) -> Result<ExitCode> {
     // not a chat session; the kernel attributes work via the per-message
     // `principal`, not the session.
     let session = astrid_core::SessionId::from_uuid(Uuid::new_v4());
-    let client = crate::socket_client::connect_for_workspace(session, caller.clone(), None)
+    let mut client = crate::socket_client::connect_for_workspace(session, caller.clone(), None)
         .await
         .context("Failed to connect to the Astrid daemon socket")?;
 
@@ -129,6 +130,15 @@ pub(crate) async fn serve(principal: Option<&str>) -> Result<ExitCode> {
     // fail the ingress-trust / capability checks and appear to hang. Fail loud
     // instead of serving a broken bridge.
     require_authenticated_unless_anonymous(&caller, client.is_authenticated())?;
+
+    // Global daemon readiness deliberately does not wait for every persisted
+    // non-default principal to warm. Prove this principal's generic MCP broker
+    // front door is responsive before exposing stdio; otherwise an immediate
+    // client tools/list can be published before the broker subscribes and be
+    // dropped forever by the non-durable event bus.
+    readiness::wait_for_broker(&mut client, &caller)
+        .await
+        .context("MCP broker readiness check failed")?;
 
     info!(
         principal = %caller,
