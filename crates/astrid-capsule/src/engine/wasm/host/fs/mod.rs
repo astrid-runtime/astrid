@@ -147,9 +147,10 @@ fn map_resolve_err(e: String) -> ErrorCode {
     }
 }
 
-/// Map a VFS error into an ErrorCode. The VFS exposes a coarse error
-/// type — finer classification (already-exists / not-empty / would-block)
-/// comes back as Unknown until the VFS layer surfaces typed variants.
+/// Map a VFS error into an ErrorCode. Preserve native not-found and
+/// permission-denied kinds even when the VFS operation wrapped them in the
+/// coarse `Io` variant, so guests can safely distinguish optional inputs from
+/// real I/O failures.
 fn map_vfs_err(e: astrid_vfs::VfsError) -> ErrorCode {
     use astrid_vfs::VfsError;
     match e {
@@ -158,7 +159,35 @@ fn map_vfs_err(e: astrid_vfs::VfsError) -> ErrorCode {
         VfsError::SandboxViolation(_) => ErrorCode::BoundaryEscape,
         VfsError::InvalidHandle => ErrorCode::InvalidPath,
         VfsError::NotSupported(msg) => ErrorCode::Unknown(format!("not supported: {msg}")),
-        VfsError::Io(io) => ErrorCode::Unknown(io.to_string()),
+        VfsError::Io(io) => match io.kind() {
+            std::io::ErrorKind::NotFound => ErrorCode::NotFound,
+            std::io::ErrorKind::PermissionDenied => ErrorCode::Access,
+            _ => ErrorCode::Unknown(io.to_string()),
+        },
+    }
+}
+
+#[cfg(test)]
+mod error_mapping_tests {
+    use super::*;
+
+    #[test]
+    fn native_not_found_and_permission_denied_remain_typed() {
+        let not_found =
+            astrid_vfs::VfsError::Io(std::io::Error::from(std::io::ErrorKind::NotFound));
+        let denied =
+            astrid_vfs::VfsError::Io(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
+
+        assert!(matches!(map_vfs_err(not_found), ErrorCode::NotFound));
+        assert!(matches!(map_vfs_err(denied), ErrorCode::Access));
+    }
+
+    #[test]
+    fn unrelated_native_io_errors_remain_unknown() {
+        let error =
+            astrid_vfs::VfsError::Io(std::io::Error::from(std::io::ErrorKind::UnexpectedEof));
+
+        assert!(matches!(map_vfs_err(error), ErrorCode::Unknown(_)));
     }
 }
 

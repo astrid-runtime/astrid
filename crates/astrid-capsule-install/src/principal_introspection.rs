@@ -2,7 +2,9 @@
 //!
 //! This module is for callers that explicitly need to expose public capsule
 //! introspection metadata from the install principal's home to another
-//! principal. The kernel does not call it during boot or principal creation:
+//! principal. In addition to manifests and `meta.json`, the capsule registry
+//! may contain declarative public assets such as skills. The kernel does not
+//! call it during boot or principal creation:
 //! `default` is a principal, not a shared tenant, and fresh principals must
 //! not implicitly receive a copy of its installed-capsule registry.
 //!
@@ -12,9 +14,10 @@
 //!
 //! ## Security
 //!
-//! This copies ONLY public, non-secret material: capsule manifests /
-//! `meta.json` and WIT interface definitions. It deliberately NEVER touches
-//! the target's `.config/env/` (per-principal secrets — API keys), nor its
+//! This copies ONLY public, non-secret material: capsule manifests,
+//! `meta.json`, declarative capsule assets, and WIT interface definitions. It
+//! deliberately NEVER touches the target's `.config/env/` (per-principal
+//! secrets — API keys), nor its
 //! `.local/kv`, `.local/audit`, `.local/tokens`, `.local/log`, or anything
 //! else under the home. Only the two mirror subdirectories
 //! (`.local/capsules` and `wit`) are ever removed or written under the
@@ -30,11 +33,11 @@ use astrid_core::dirs::AstridHome;
 /// Mirror the read-only introspection view (installed-capsule registry +
 /// `home://wit/`) from the install principal's home into `target`'s home.
 ///
-/// SECURITY: copies ONLY public capsule metadata (manifests, meta.json) and
-/// WIT interface definitions. It MUST NOT copy `.config/env/` — that holds
-/// per-principal secrets (API keys) that must never cross principal
-/// boundaries. Idempotent. No-op when `target` is the install principal
-/// (that home is authoritative, not a mirror).
+/// SECURITY: copies ONLY public capsule introspection content (manifests,
+/// meta.json, declarative assets) and WIT interface definitions. It MUST NOT
+/// copy `.config/env/` — that holds per-principal secrets (API keys) that must
+/// never cross principal boundaries. Idempotent. No-op when `target` is the
+/// install principal (that home is authoritative, not a mirror).
 pub fn materialize_principal_introspection(
     home: &AstridHome,
     target: &PrincipalId,
@@ -143,6 +146,15 @@ mod tests {
             r#"{"version":"2.0.0"}"#,
         );
         write_file(
+            &install
+                .capsules_dir()
+                .join("alpha")
+                .join("skills")
+                .join("alpha")
+                .join("SKILL.md"),
+            "# Alpha skill",
+        );
+        write_file(
             &install.root().join("wit").join("system.wit"),
             "interface system {}",
         );
@@ -173,6 +185,18 @@ mod tests {
             std::fs::read_to_string(target_home.capsules_dir().join("bravo").join("meta.json"))
                 .expect("bravo meta"),
             r#"{"version":"2.0.0"}"#
+        );
+        assert_eq!(
+            std::fs::read_to_string(
+                target_home
+                    .capsules_dir()
+                    .join("alpha")
+                    .join("skills")
+                    .join("alpha")
+                    .join("SKILL.md")
+            )
+            .expect("alpha skill"),
+            "# Alpha skill"
         );
 
         // WIT mirrored.

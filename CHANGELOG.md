@@ -19,6 +19,14 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
   Immutable GitHub releases remain binary candidates; the protected stable
   promotion authenticates the exact signed dev candidate and publishes its
   crates idempotently before advancing the stable pointer. Closes #1279.
+### Added
+
+- **Rust capsule builds now package files declared by `[[skill]]`.** Declared
+  skill assets are confined to regular files inside the capsule source tree
+  and flow through the existing per-principal introspection mirror, allowing
+  agent runtimes to discover skills from installed capsules without
+  install-time copies. Native not-found and permission-denied filesystem
+  errors also retain their typed guest error codes. Closes #1281.
 
 ## [0.10.2] - 2026-07-19
 
