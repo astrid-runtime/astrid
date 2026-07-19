@@ -212,14 +212,14 @@ mod tests {
             }
         }
 
-        fn raw_frame(value: Value) -> Vec<u8> {
-            serde_json::to_vec(&value).expect("serialize test frame")
+        fn raw_frame(value: &Value) -> Vec<u8> {
+            serde_json::to_vec(value).expect("serialize test frame")
         }
     }
 
     impl ReadinessIo for ColdStartIo {
         async fn send_message(&mut self, message: IpcMessage) -> Result<()> {
-            self.sends += 1;
+            self.sends = self.sends.checked_add(1).expect("test send count overflow");
             let req_id = match message.payload {
                 IpcPayload::RawJson(body) => body
                     .get("req_id")
@@ -232,13 +232,13 @@ mod tests {
             if self.drop_first_probe && self.sends == 1 {
                 // Exact cold-start race: the event-bus request had no broker
                 // subscriber, then the principal's capsule view completed.
-                self.frames.push_back(Self::raw_frame(json!({
+                self.frames.push_back(Self::raw_frame(&json!({
                     "topic": CAPSULES_LOADED_TOPIC,
                     "principal": self.principal.to_string(),
                     "payload": { "status": "ready", "capsules": [] }
                 })));
             } else {
-                self.frames.push_back(Self::raw_frame(json!({
+                self.frames.push_back(Self::raw_frame(&json!({
                     "topic": astrid_types::Topic::kernel_response(&req_id).to_string(),
                     "principal": self.principal.to_string(),
                     "payload": {
