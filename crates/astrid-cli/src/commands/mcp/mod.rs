@@ -87,6 +87,13 @@ fn require_authenticated_unless_anonymous(
     );
 }
 
+/// Explicit `anonymous` MCP is a transport-only, no-capability mode and has no
+/// broker capsule to prove. Named principals must always prove their broker
+/// front door before stdio is exposed.
+fn broker_readiness_required(caller: &astrid_core::PrincipalId) -> bool {
+    *caller != astrid_core::PrincipalId::anonymous()
+}
+
 /// Run the MCP stdio server until the client closes stdin (EOF), its launching
 /// session dies (parent-death reaping), or the process is signalled.
 ///
@@ -136,9 +143,11 @@ pub(crate) async fn serve(principal: Option<&str>) -> Result<ExitCode> {
     // front door is responsive before exposing stdio; otherwise an immediate
     // client tools/list can be published before the broker subscribes and be
     // dropped forever by the non-durable event bus.
-    readiness::wait_for_broker(&mut client, &caller)
-        .await
-        .context("MCP broker readiness check failed")?;
+    if broker_readiness_required(&caller) {
+        readiness::wait_for_broker(&mut client, &caller)
+            .await
+            .context("MCP broker readiness check failed")?;
+    }
 
     info!(
         principal = %caller,
@@ -200,7 +209,7 @@ pub(crate) async fn serve(principal: Option<&str>) -> Result<ExitCode> {
 
 #[cfg(test)]
 mod fail_loud_tests {
-    use super::require_authenticated_unless_anonymous;
+    use super::{broker_readiness_required, require_authenticated_unless_anonymous};
     use astrid_core::PrincipalId;
 
     #[test]
@@ -227,5 +236,16 @@ mod fail_loud_tests {
     fn explicit_anonymous_is_allowed_even_unauthenticated() {
         // Serving unauthenticated on purpose is fine.
         assert!(require_authenticated_unless_anonymous(&PrincipalId::anonymous(), false).is_ok());
+    }
+
+    #[test]
+    fn explicit_anonymous_does_not_wait_for_an_absent_broker() {
+        assert!(!broker_readiness_required(&PrincipalId::anonymous()));
+    }
+
+    #[test]
+    fn named_principal_must_prove_broker_readiness() {
+        let principal = PrincipalId::new("codex-code").expect("principal");
+        assert!(broker_readiness_required(&principal));
     }
 }
