@@ -612,6 +612,18 @@ pub struct HostState {
     /// http handles unrelated to net). Single-threaded: wasmtime
     /// stores are owned by exactly one OS thread.
     pub net_stream_count: usize,
+    /// Live count of `astrid:fs` open-file resources in this Store.
+    ///
+    /// The frozen filesystem ABI caps these at 16. Keeping an O(1) mirror
+    /// avoids inspecting the heterogeneous Wasmtime resource table.
+    pub(crate) file_handle_count: usize,
+    /// Resource-table representatives for live `astrid:fs` file handles.
+    ///
+    /// File descriptors are invocation-scoped even for the `host_process`
+    /// pool carve-out, whose process resources deliberately survive a return.
+    /// Tracking the representatives lets pool cleanup remove only file slots
+    /// without disturbing persistent process handles in the same table.
+    pub(crate) file_handle_reps: std::collections::HashSet<u32>,
     /// Live count of `SubscriptionEntry` entries. Same rationale as
     /// `net_stream_count`.
     pub subscription_count: usize,

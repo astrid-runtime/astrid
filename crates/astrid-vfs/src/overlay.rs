@@ -1,7 +1,7 @@
 use astrid_capabilities::{DirHandle, FileHandle};
 use async_trait::async_trait;
 
-use crate::{Vfs, VfsDirEntry, VfsMetadata, VfsResult};
+use crate::{Vfs, VfsDirEntry, VfsMetadata, VfsOpenMode, VfsResult};
 
 use dashmap::DashMap;
 use std::sync::Arc;
@@ -324,6 +324,13 @@ impl Vfs for OverlayVfs {
         self.lower.stat(handle, path).await
     }
 
+    async fn mode(&self, handle: &DirHandle, path: &str) -> VfsResult<u32> {
+        if self.upper.exists(handle, path).await.unwrap_or(false) {
+            return self.upper.mode(handle, path).await;
+        }
+        self.lower.mode(handle, path).await
+    }
+
     async fn mkdir(&self, handle: &DirHandle, path: &str) -> VfsResult<()> {
         // Validate before mutation to avoid phantom dirs on SandboxViolation.
         let normalized = Self::normalize_path(path)?;
@@ -453,6 +460,32 @@ impl Vfs for OverlayVfs {
         self.lower.open(handle, path, false, false).await
     }
 
+    async fn open_mode(
+        &self,
+        handle: &DirHandle,
+        path: &str,
+        mode: VfsOpenMode,
+    ) -> VfsResult<FileHandle> {
+        match mode {
+            VfsOpenMode::Read => self.open(handle, path, false, false).await,
+            VfsOpenMode::Write => self.open(handle, path, true, true).await,
+            VfsOpenMode::Append | VfsOpenMode::ReadWrite => {
+                if mode == VfsOpenMode::ReadWrite
+                    && !self.upper.exists(handle, path).await.unwrap_or(false)
+                    && !self.lower.exists(handle, path).await.unwrap_or(false)
+                {
+                    return Err(crate::VfsError::NotFound(path.to_string()));
+                }
+
+                // Reuse the established copy-up path, then reopen with the
+                // exact append/read-write flags on the upper layer.
+                let copied = self.open(handle, path, true, false).await?;
+                self.upper.close(&copied).await?;
+                self.upper.open_mode(handle, path, mode).await
+            },
+        }
+    }
+
     async fn open_dir(
         &self,
         handle: &DirHandle,
@@ -511,10 +544,109 @@ impl Vfs for OverlayVfs {
         }
     }
 
+    async fn read_at(
+        &self,
+        handle: &FileHandle,
+        offset: u64,
+        max_bytes: u32,
+    ) -> VfsResult<Vec<u8>> {
+        match self.upper.read_at(handle, offset, max_bytes).await {
+            Ok(data) => Ok(data),
+            Err(crate::VfsError::InvalidHandle) => {
+                self.lower.read_at(handle, offset, max_bytes).await
+            },
+            Err(error) => Err(error),
+        }
+    }
+
     async fn write(&self, handle: &FileHandle, content: &[u8]) -> VfsResult<()> {
         // Writes always go to upper. If it's a lower handle, this is an error
         // since lower files are opened read-only.
         self.upper.write(handle, content).await
+    }
+
+    async fn write_at(&self, handle: &FileHandle, offset: u64, content: &[u8]) -> VfsResult<u32> {
+        self.upper.write_at(handle, offset, content).await
+    }
+
+    async fn sync_data(&self, handle: &FileHandle) -> VfsResult<()> {
+        match self.upper.sync_data(handle).await {
+            Ok(()) => Ok(()),
+            Err(crate::VfsError::InvalidHandle) => self.lower.sync_data(handle).await,
+            Err(error) => Err(error),
+        }
+    }
+
+    async fn sync_all(&self, handle: &FileHandle) -> VfsResult<()> {
+        match self.upper.sync_all(handle).await {
+            Ok(()) => Ok(()),
+            Err(crate::VfsError::InvalidHandle) => self.lower.sync_all(handle).await,
+            Err(error) => Err(error),
+        }
+    }
+
+    async fn file_stat(&self, handle: &FileHandle) -> VfsResult<VfsMetadata> {
+        match self.upper.file_stat(handle).await {
+            Ok(metadata) => Ok(metadata),
+            Err(crate::VfsError::InvalidHandle) => self.lower.file_stat(handle).await,
+            Err(error) => Err(error),
+        }
+    }
+
+    async fn file_mode(&self, handle: &FileHandle) -> VfsResult<u32> {
+        match self.upper.file_mode(handle).await {
+            Ok(mode) => Ok(mode),
+            Err(crate::VfsError::InvalidHandle) => self.lower.file_mode(handle).await,
+            Err(error) => Err(error),
+        }
+    }
+
+    async fn set_len(&self, handle: &FileHandle, size: u64) -> VfsResult<()> {
+        self.upper.set_len(handle, size).await
+    }
+
+    async fn rename(&self, handle: &DirHandle, src: &str, dst: &str) -> VfsResult<()> {
+        let src = Self::normalize_path(src)?;
+        let dst = Self::normalize_path(dst)?;
+        if !self.upper.exists(handle, &src).await.unwrap_or(false) {
+            return Err(crate::VfsError::NotSupported(
+                "Cannot rename a read-only workspace entry (whiteout support not implemented)"
+                    .into(),
+            ));
+        }
+        if self.lower.exists(handle, &dst).await.unwrap_or(false) {
+            return Err(crate::VfsError::NotSupported(
+                "Cannot replace a read-only workspace entry (whiteout support not implemented)"
+                    .into(),
+            ));
+        }
+        if let Some(parent) = std::path::Path::new(&dst).parent() {
+            let parent = parent.to_string_lossy();
+            if !parent.is_empty() {
+                self.ensure_upper_dirs(handle, &parent).await?;
+            }
+        }
+        self.upper.rename(handle, &src, &dst).await?;
+
+        let prefix = format!("{src}/");
+        let moved = self
+            .dirty_entries
+            .iter()
+            .filter_map(|entry| {
+                let path = entry.key();
+                if path == &src || path.starts_with(&prefix) {
+                    let suffix = path.strip_prefix(&src).expect("prefix checked");
+                    Some((path.clone(), format!("{dst}{suffix}"), *entry.value()))
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
+        for (old, new, kind) in moved {
+            self.dirty_entries.remove(&old);
+            self.dirty_entries.insert(new, kind);
+        }
+        Ok(())
     }
 
     async fn close(&self, handle: &FileHandle) -> VfsResult<()> {

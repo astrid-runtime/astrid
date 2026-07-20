@@ -123,6 +123,8 @@ impl HostState {
             process_tracker,
             persistent_processes,
             net_stream_count: 0,
+            file_handle_count: 0,
+            file_handle_reps: std::collections::HashSet::new(),
             subscription_count: 0,
             process_count_total: 0,
             process_count_by_principal: HashMap::new(),

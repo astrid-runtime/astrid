@@ -38,7 +38,7 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use wasmtime::Store;
-use wasmtime::component::{Instance, InstancePre};
+use wasmtime::component::{Instance, InstancePre, Resource};
 
 use super::host_state::HostState;
 use crate::error::{CapsuleError, CapsuleResult};
@@ -416,7 +416,9 @@ impl Drop for PoolCheckout {
 /// `reset_resources` is `false` for the `host_process` carve-out, whose
 /// `ManagedProcess` handles legitimately persist across invocations; it is
 /// sound to skip there because that capsule never leases a second Store, so no
-/// cross-principal reuse can occur (see [`CapsuleInstancePool`]).
+/// cross-principal reuse can occur (see [`CapsuleInstancePool`]). File handles
+/// are an explicit exception: they never represent durable background work,
+/// so they are selectively dropped below even when process resources persist.
 ///
 /// NOTE: the per-Store *owner* state (`vfs`, `kv`, `secret_store`,
 /// `ipc_limiter`, `blocking_semaphore`, `io_semaphore`, `process_tracker`,
@@ -452,6 +454,18 @@ fn clear_on_return(state: &mut HostState, reset_resources: bool) {
     // fail-closed) in lockstep.
     state.ingress_origin = None;
 
+    // File descriptors are scoped to one invocation. In the normal free-pool
+    // case the whole table reset below also drops them; the selective sweep is
+    // needed for `host_process`, where ManagedProcess resources intentionally
+    // remain in the same table between calls. Deleting each typed value runs
+    // OpenFileSlot::drop, which closes the VFS handle asynchronously.
+    for rep in std::mem::take(&mut state.file_handle_reps) {
+        let _ = state
+            .resource_table
+            .delete::<crate::engine::wasm::host::fs::PooledOpenFileSlot>(Resource::new_own(rep));
+    }
+    state.file_handle_count = 0;
+
     if reset_resources {
         // Drops every entry still in the old table (orphaned subscriptions,
         // HTTP/net streams, process handles, WASI fds) via their `Drop` impls.
@@ -477,8 +491,6 @@ fn clear_on_return(state: &mut HostState, reset_resources: bool) {
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
-
-    use wasmtime::component::Resource;
 
     use super::super::test_fixtures::minimal_host_state;
     use super::*;
@@ -551,14 +563,13 @@ mod tests {
     }
 
     /// The `host_process` carve-out (`reset_resources = false`) deliberately
-    /// keeps its `ManagedProcess` handles across invocations — the resource
-    /// table and its counters must survive the return.
-    #[test]
-    fn clear_on_return_preserves_resources_for_carveout() {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .build()
-            .expect("runtime");
-        let mut state = minimal_host_state(rt.handle().clone());
+    /// keeps its `ManagedProcess` handles across invocations, while ordinary
+    /// file handles remain invocation-scoped and must be removed selectively.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn clear_on_return_preserves_only_durable_carveout_resources() {
+        use crate::engine::wasm::bindings::astrid::fs::host::{Host as HostFs, OpenMode};
+
+        let mut state = minimal_host_state(tokio::runtime::Handle::current());
 
         let dropped = Arc::new(AtomicBool::new(false));
         let res = state
@@ -567,6 +578,18 @@ mod tests {
             .expect("push test resource");
         state.process_count_total = 1;
         state.interceptor_active = true;
+
+        let root = tempfile::tempdir().expect("workspace");
+        let root_handle = astrid_capabilities::DirHandle::new();
+        state.workspace_root = root.path().to_path_buf();
+        state.vfs = Arc::new(
+            astrid_vfs::HostVfs::with_registered_dir(root_handle.clone(), root.path())
+                .expect("workspace VFS"),
+        );
+        state.vfs_root_handle = root_handle;
+        let file = HostFs::fs_open(&mut state, "scratch".to_string(), OpenMode::Write)
+            .expect("invocation-scoped file");
+        let file_rep = file.rep();
 
         clear_on_return(&mut state, false);
 
@@ -583,6 +606,17 @@ mod tests {
             "carve-out resource table must persist across return"
         );
         assert_eq!(state.process_count_total, 1);
+        assert_eq!(state.file_handle_count, 0);
+        assert!(state.file_handle_reps.is_empty());
+        assert!(
+            state
+                .resource_table
+                .get::<crate::engine::wasm::host::fs::PooledOpenFileSlot>(&Resource::new_borrow(
+                    file_rep,
+                ))
+                .is_err(),
+            "file resources must not survive the carve-out return"
+        );
         // Per-invocation scoping fields are still cleared even for the carve-out.
         assert!(!state.interceptor_active);
     }

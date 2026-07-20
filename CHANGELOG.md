@@ -9,6 +9,15 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
 
 ## [Unreleased]
 
+### Added
+
+- **Capsules can stream workspace files through live, principal-affine file
+  handles.** The frozen `astrid:fs@1.0.0` resource now supports precise open
+  modes, bounded positional reads and writes, truncate, sync, open-file stat,
+  POSIX mode reporting, and same-VFS rename. Handles are capability-checked on
+  every operation, capped per Store, and closed at the invocation boundary,
+  including Stores that retain explicit persistent-process resources.
+
 ### Fixed
 
 - **Long-running local capsules are no longer stopped by a hidden 10-billion

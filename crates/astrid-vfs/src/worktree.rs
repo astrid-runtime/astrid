@@ -1,5 +1,5 @@
 use crate::boundary::IgnoreBoundary;
-use crate::{HostVfs, Vfs, VfsDirEntry, VfsError, VfsMetadata, VfsResult};
+use crate::{HostVfs, Vfs, VfsDirEntry, VfsError, VfsMetadata, VfsOpenMode, VfsResult};
 use astrid_capabilities::{DirHandle, FileHandle};
 use async_trait::async_trait;
 use std::path::{Path, PathBuf};
@@ -75,6 +75,12 @@ impl Vfs for WorktreeVfs {
         Ok(meta)
     }
 
+    async fn mode(&self, handle: &DirHandle, path: &str) -> VfsResult<u32> {
+        let meta = self.inner.stat(handle, path).await?;
+        self.check_access(path, meta.is_dir)?;
+        self.inner.mode(handle, path).await
+    }
+
     async fn mkdir(&self, handle: &DirHandle, path: &str) -> VfsResult<()> {
         self.check_access(path, true)?;
         self.inner.mkdir(handle, path).await
@@ -102,6 +108,16 @@ impl Vfs for WorktreeVfs {
         self.inner.open(handle, path, write, truncate).await
     }
 
+    async fn open_mode(
+        &self,
+        handle: &DirHandle,
+        path: &str,
+        mode: VfsOpenMode,
+    ) -> VfsResult<FileHandle> {
+        self.check_access(path, false)?;
+        self.inner.open_mode(handle, path, mode).await
+    }
+
     async fn open_dir(
         &self,
         handle: &DirHandle,
@@ -121,8 +137,54 @@ impl Vfs for WorktreeVfs {
         self.inner.read(handle).await
     }
 
+    async fn read_at(
+        &self,
+        handle: &FileHandle,
+        offset: u64,
+        max_bytes: u32,
+    ) -> VfsResult<Vec<u8>> {
+        self.inner.read_at(handle, offset, max_bytes).await
+    }
+
     async fn write(&self, handle: &FileHandle, content: &[u8]) -> VfsResult<()> {
         self.inner.write(handle, content).await
+    }
+
+    async fn write_at(&self, handle: &FileHandle, offset: u64, content: &[u8]) -> VfsResult<u32> {
+        self.inner.write_at(handle, offset, content).await
+    }
+
+    async fn sync_data(&self, handle: &FileHandle) -> VfsResult<()> {
+        self.inner.sync_data(handle).await
+    }
+
+    async fn sync_all(&self, handle: &FileHandle) -> VfsResult<()> {
+        self.inner.sync_all(handle).await
+    }
+
+    async fn file_stat(&self, handle: &FileHandle) -> VfsResult<VfsMetadata> {
+        self.inner.file_stat(handle).await
+    }
+
+    async fn file_mode(&self, handle: &FileHandle) -> VfsResult<u32> {
+        self.inner.file_mode(handle).await
+    }
+
+    async fn set_len(&self, handle: &FileHandle, size: u64) -> VfsResult<()> {
+        self.inner.set_len(handle, size).await
+    }
+
+    async fn rename(&self, handle: &DirHandle, src: &str, dst: &str) -> VfsResult<()> {
+        let src_meta = self.inner.stat(handle, src).await?;
+        self.check_access(src, src_meta.is_dir)?;
+        // A missing destination has no metadata to classify. Check both ignore
+        // forms so a rename cannot create either a protected file or directory.
+        if self.boundary.is_ignored(dst, false) || self.boundary.is_ignored(dst, true) {
+            return Err(VfsError::PermissionDenied(format!(
+                "Path is protected by .astridignore boundary: {dst}"
+            )));
+        }
+        self.inner.rename(handle, src, dst).await
     }
 
     async fn close(&self, handle: &FileHandle) -> VfsResult<()> {

@@ -8,10 +8,21 @@ use cap_std::fs::Dir;
 use tokio::fs;
 use tokio::sync::{OwnedSemaphorePermit, RwLock, Semaphore};
 
-use crate::{Vfs, VfsDirEntry, VfsError, VfsMetadata, VfsResult};
+use crate::{Vfs, VfsDirEntry, VfsError, VfsMetadata, VfsOpenMode, VfsResult};
 
 /// An open file and its associated semaphore permit, tying the FD quota to the struct's lifetime.
 type OpenFileEntry = Arc<RwLock<(fs::File, OwnedSemaphorePermit)>>;
+
+#[derive(Clone, Copy)]
+enum HostOpenMode {
+    Read,
+    Write,
+    Append,
+    ReadWrite,
+    /// Compatibility behavior of the original `Vfs::open(write=true,
+    /// truncate=false)` surface.
+    ReadWriteCreate,
+}
 
 /// Strip any leading absolute slashes or prefixes from the requested path
 /// so that `cap_std` can operate on it safely within its sandbox.
@@ -36,6 +47,28 @@ fn classify_io_error(error: std::io::Error) -> VfsError {
         std::io::ErrorKind::PermissionDenied => VfsError::PermissionDenied(error.to_string()),
         _ => VfsError::Io(error),
     }
+}
+
+#[cfg(unix)]
+fn cap_metadata_mode(metadata: &cap_std::fs::Metadata) -> u32 {
+    use cap_std::fs::MetadataExt;
+    metadata.mode()
+}
+
+#[cfg(not(unix))]
+fn cap_metadata_mode(_metadata: &cap_std::fs::Metadata) -> u32 {
+    0
+}
+
+#[cfg(unix)]
+fn std_metadata_mode(metadata: &std::fs::Metadata) -> u32 {
+    use std::os::unix::fs::MetadataExt;
+    metadata.mode()
+}
+
+#[cfg(not(unix))]
+fn std_metadata_mode(_metadata: &std::fs::Metadata) -> u32 {
+    0
 }
 
 /// An implementation of `Vfs` backed by the physical host filesystem.
@@ -111,6 +144,61 @@ impl HostVfs {
         let dirs: tokio::sync::RwLockReadGuard<'_, HashMap<DirHandle, Arc<Dir>>> =
             self.open_dirs.read().await;
         dirs.get(handle).cloned().ok_or(VfsError::InvalidHandle)
+    }
+
+    async fn open_with_mode(
+        &self,
+        handle: &DirHandle,
+        path: &str,
+        mode: HostOpenMode,
+    ) -> VfsResult<FileHandle> {
+        let dir = self.get_dir(handle).await?;
+        let safe_path = make_relative(path).to_path_buf();
+
+        // Prevent transient FD exhaustion before asking the OS to open a file.
+        let permit = self
+            .fd_semaphore
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| VfsError::PermissionDenied("Too many open files".into()))?;
+
+        let std_file = tokio::task::spawn_blocking(move || {
+            let mut options = cap_std::fs::OpenOptions::new();
+            match mode {
+                HostOpenMode::Read => {
+                    options.read(true);
+                },
+                HostOpenMode::Write => {
+                    options.write(true).create(true).truncate(true);
+                },
+                HostOpenMode::Append => {
+                    options.write(true).create(true).append(true);
+                },
+                HostOpenMode::ReadWrite => {
+                    options.read(true).write(true);
+                },
+                HostOpenMode::ReadWriteCreate => {
+                    options.read(true).write(true).create(true);
+                },
+            }
+            dir.open_with(&safe_path, &options)
+        })
+        .await
+        .expect("spawn_blocking panicked")
+        .map_err(classify_io_error)?;
+
+        let tokio_file = tokio::fs::File::from_std(std_file.into_std());
+        let mut files = self.open_files.write().await;
+        if files.len() >= 64 {
+            return Err(VfsError::PermissionDenied("Too many open files".into()));
+        }
+
+        let new_handle = FileHandle::new();
+        files.insert(
+            new_handle.clone(),
+            Arc::new(RwLock::new((tokio_file, permit))),
+        );
+        Ok(new_handle)
     }
 }
 
@@ -191,6 +279,22 @@ impl Vfs for HostVfs {
         .expect("spawn_blocking panicked")
     }
 
+    async fn mode(&self, handle: &DirHandle, path: &str) -> VfsResult<u32> {
+        let dir = self.get_dir(handle).await?;
+        let safe_path = make_relative(path).to_path_buf();
+        tokio::task::spawn_blocking(move || {
+            let metadata = if safe_path.as_os_str().is_empty() {
+                dir.dir_metadata()
+            } else {
+                dir.symlink_metadata(&safe_path)
+            }
+            .map_err(classify_io_error)?;
+            Ok(cap_metadata_mode(&metadata))
+        })
+        .await
+        .expect("spawn_blocking panicked")
+    }
+
     async fn mkdir(&self, handle: &DirHandle, path: &str) -> VfsResult<()> {
         let dir = self.get_dir(handle).await?;
         let safe_path = make_relative(path).to_path_buf();
@@ -236,45 +340,32 @@ impl Vfs for HostVfs {
         write: bool,
         truncate: bool,
     ) -> VfsResult<FileHandle> {
-        let dir = self.get_dir(handle).await?;
-        let safe_path = make_relative(path).to_path_buf();
+        let mode = match (write, truncate) {
+            (false, _) => HostOpenMode::Read,
+            (true, true) => HostOpenMode::Write,
+            (true, false) => HostOpenMode::ReadWriteCreate,
+        };
+        self.open_with_mode(handle, path, mode).await
+    }
 
-        // Prevent transient FD exhaustion via semaphore before calling the OS
-        let permit = self
-            .fd_semaphore
-            .clone()
-            .try_acquire_owned()
-            .map_err(|_| VfsError::PermissionDenied("Too many open files".into()))?;
-
-        let std_file = tokio::task::spawn_blocking(move || {
-            let mut options = cap_std::fs::OpenOptions::new();
-            options
-                .read(true)
-                .write(write)
-                .create(write)
-                .truncate(truncate);
-            dir.open_with(&safe_path, &options)
-        })
-        .await
-        .expect("spawn_blocking panicked")
-        .map_err(classify_io_error)?;
-
-        // Convert the cap_std File into a tokio async File
-        let tokio_file = tokio::fs::File::from_std(std_file.into_std());
-
-        let mut files: tokio::sync::RwLockWriteGuard<'_, HashMap<FileHandle, OpenFileEntry>> =
-            self.open_files.write().await;
-        if files.len() >= 64 {
-            return Err(VfsError::PermissionDenied("Too many open files".into()));
+    async fn open_mode(
+        &self,
+        handle: &DirHandle,
+        path: &str,
+        mode: VfsOpenMode,
+    ) -> VfsResult<FileHandle> {
+        match mode {
+            VfsOpenMode::Read => self.open_with_mode(handle, path, HostOpenMode::Read).await,
+            VfsOpenMode::Write => self.open_with_mode(handle, path, HostOpenMode::Write).await,
+            VfsOpenMode::Append => {
+                self.open_with_mode(handle, path, HostOpenMode::Append)
+                    .await
+            },
+            VfsOpenMode::ReadWrite => {
+                self.open_with_mode(handle, path, HostOpenMode::ReadWrite)
+                    .await
+            },
         }
-
-        let new_handle = FileHandle::new();
-        files.insert(
-            new_handle.clone(),
-            Arc::new(RwLock::new((tokio_file, permit))),
-        );
-
-        Ok(new_handle)
     }
 
     async fn open_dir(
@@ -353,6 +444,30 @@ impl Vfs for HostVfs {
         Ok(buffer)
     }
 
+    async fn read_at(
+        &self,
+        handle: &FileHandle,
+        offset: u64,
+        max_bytes: u32,
+    ) -> VfsResult<Vec<u8>> {
+        use tokio::io::{AsyncReadExt, AsyncSeekExt};
+        let file_arc = {
+            let files = self.open_files.read().await;
+            files.get(handle).cloned().ok_or(VfsError::InvalidHandle)?
+        };
+        let mut file_tuple = file_arc.write().await;
+        let file = &mut file_tuple.0;
+        file.seek(std::io::SeekFrom::Start(offset))
+            .await
+            .map_err(classify_io_error)?;
+        let mut bytes = Vec::with_capacity(max_bytes as usize);
+        file.take(u64::from(max_bytes))
+            .read_to_end(&mut bytes)
+            .await
+            .map_err(classify_io_error)?;
+        Ok(bytes)
+    }
+
     async fn write(&self, handle: &FileHandle, content: &[u8]) -> VfsResult<()> {
         use tokio::io::AsyncWriteExt;
         let file_arc = {
@@ -366,6 +481,119 @@ impl Vfs for HostVfs {
         file.write_all(content).await.map_err(classify_io_error)?;
         file.flush().await.map_err(classify_io_error)?;
         Ok(())
+    }
+
+    async fn write_at(&self, handle: &FileHandle, offset: u64, content: &[u8]) -> VfsResult<u32> {
+        use tokio::io::{AsyncSeekExt, AsyncWriteExt};
+        let file_arc = {
+            let files = self.open_files.read().await;
+            files.get(handle).cloned().ok_or(VfsError::InvalidHandle)?
+        };
+        let mut file_tuple = file_arc.write().await;
+        let file = &mut file_tuple.0;
+        file.seek(std::io::SeekFrom::Start(offset))
+            .await
+            .map_err(classify_io_error)?;
+        let written = file.write(content).await.map_err(classify_io_error)?;
+        u32::try_from(written)
+            .map_err(|_| VfsError::PermissionDenied("write count exceeds u32".into()))
+    }
+
+    async fn sync_data(&self, handle: &FileHandle) -> VfsResult<()> {
+        let file_arc = {
+            let files = self.open_files.read().await;
+            files.get(handle).cloned().ok_or(VfsError::InvalidHandle)?
+        };
+        file_arc
+            .write()
+            .await
+            .0
+            .sync_data()
+            .await
+            .map_err(classify_io_error)
+    }
+
+    async fn sync_all(&self, handle: &FileHandle) -> VfsResult<()> {
+        let file_arc = {
+            let files = self.open_files.read().await;
+            files.get(handle).cloned().ok_or(VfsError::InvalidHandle)?
+        };
+        file_arc
+            .write()
+            .await
+            .0
+            .sync_all()
+            .await
+            .map_err(classify_io_error)
+    }
+
+    async fn file_stat(&self, handle: &FileHandle) -> VfsResult<VfsMetadata> {
+        let file_arc = {
+            let files = self.open_files.read().await;
+            files.get(handle).cloned().ok_or(VfsError::InvalidHandle)?
+        };
+        let metadata = file_arc
+            .read()
+            .await
+            .0
+            .metadata()
+            .await
+            .map_err(classify_io_error)?;
+        let mtime = metadata
+            .modified()
+            .ok()
+            .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+            .map_or(0, |duration| duration.as_secs());
+        Ok(VfsMetadata {
+            is_dir: metadata.is_dir(),
+            is_file: metadata.is_file(),
+            size: metadata.len(),
+            mtime,
+        })
+    }
+
+    async fn file_mode(&self, handle: &FileHandle) -> VfsResult<u32> {
+        let file_arc = {
+            let files = self.open_files.read().await;
+            files.get(handle).cloned().ok_or(VfsError::InvalidHandle)?
+        };
+        let metadata = file_arc
+            .read()
+            .await
+            .0
+            .metadata()
+            .await
+            .map_err(classify_io_error)?;
+        Ok(std_metadata_mode(&metadata))
+    }
+
+    async fn set_len(&self, handle: &FileHandle, size: u64) -> VfsResult<()> {
+        let file_arc = {
+            let files = self.open_files.read().await;
+            files.get(handle).cloned().ok_or(VfsError::InvalidHandle)?
+        };
+        file_arc
+            .write()
+            .await
+            .0
+            .set_len(size)
+            .await
+            .map_err(classify_io_error)
+    }
+
+    async fn rename(&self, handle: &DirHandle, src: &str, dst: &str) -> VfsResult<()> {
+        let dir = self.get_dir(handle).await?;
+        let src = make_relative(src).to_path_buf();
+        let dst = make_relative(dst).to_path_buf();
+        if src.as_os_str().is_empty() || dst.as_os_str().is_empty() {
+            return Err(VfsError::PermissionDenied(
+                "Cannot rename a capability root".into(),
+            ));
+        }
+        tokio::task::spawn_blocking(move || dir.rename(src, &dir, dst))
+            .await
+            .expect("spawn_blocking panicked")
+            .map_err(classify_io_error)
     }
 
     async fn close(&self, handle: &FileHandle) -> VfsResult<()> {
@@ -408,6 +636,57 @@ mod tests {
         ));
         assert!(matches!(
             vfs.open(&handle, "missing", false, false).await,
+            Err(VfsError::NotFound(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn positional_io_append_and_rename_preserve_open_handle_semantics() {
+        let root = tempfile::tempdir().expect("root");
+        let dir = DirHandle::new();
+        let vfs = HostVfs::with_registered_dir(dir.clone(), root.path()).expect("VFS");
+
+        let writer = vfs
+            .open_mode(&dir, "build.log", VfsOpenMode::Write)
+            .await
+            .expect("writer");
+        assert_eq!(
+            vfs.write_at(&writer, 4, b"done")
+                .await
+                .expect("positioned write"),
+            4
+        );
+        vfs.set_len(&writer, 10).await.expect("extend");
+        assert_eq!(vfs.file_stat(&writer).await.expect("fstat").size, 10);
+        vfs.close(&writer).await.expect("close writer");
+
+        let appender = vfs
+            .open_mode(&dir, "build.log", VfsOpenMode::Append)
+            .await
+            .expect("appender");
+        vfs.write_at(&appender, 0, b"!")
+            .await
+            .expect("append ignores offset");
+        vfs.sync_data(&appender).await.expect("sync");
+        vfs.close(&appender).await.expect("close appender");
+
+        vfs.rename(&dir, "build.log", "renamed.log")
+            .await
+            .expect("rename");
+        assert!(!root.path().join("build.log").exists());
+        assert_eq!(
+            std::fs::read(root.path().join("renamed.log")).expect("renamed bytes"),
+            b"\0\0\0\0done\0\0!"
+        );
+    }
+
+    #[tokio::test]
+    async fn read_write_mode_requires_an_existing_file() {
+        let root = tempfile::tempdir().expect("root");
+        let dir = DirHandle::new();
+        let vfs = HostVfs::with_registered_dir(dir.clone(), root.path()).expect("VFS");
+        assert!(matches!(
+            vfs.open_mode(&dir, "missing", VfsOpenMode::ReadWrite).await,
             Err(VfsError::NotFound(_))
         ));
     }

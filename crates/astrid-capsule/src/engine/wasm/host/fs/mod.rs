@@ -1,23 +1,22 @@
 //! `astrid:fs@1.0.0` host implementation.
 //!
 //! Path-based ops route through the workspace / home / tmp VFS bundles
-//! after passing the per-principal security gate. The FileHandle resource
-//! is stubbed in `file_handle.rs` pending the dedicated handle-lifecycle
-//! port-back.
+//! after passing the per-principal security gate. Open files are held as
+//! principal-affine resources in Wasmtime's resource table and retain the VFS
+//! capability selected at open time.
 //!
 //! Live surface (the most-used legacy fns ported to typed errors):
 //!
-//! - fs-exists, fs-mkdir, fs-readdir, fs-stat, fs-unlink, read-file,
-//!   write-file
+//! - fs-open + FileHandle, fs-exists, fs-mkdir, fs-readdir, fs-stat,
+//!   fs-unlink, read-file, write-file, fs-rename
 //!
 //! Stubbed (planned for follow-ups; all return Unknown so capsules can
 //! handle them as transient failures):
 //!
-//! - fs-open + FileHandle resource (positional pread/pwrite, fsync, etc.)
-//! - fs-mkdir-all, fs-append, fs-copy, fs-rename,
+//! - fs-append, fs-copy,
 //!   fs-remove-dir-all, fs-canonicalize, fs-read-link, fs-hard-link
 //!
-//! Audit: every path-based op emits `astrid.audit.fs` per call
+//! Audit: every implemented op emits `astrid.audit.fs` per call
 //! (capsule + principal + op + path). Both the allowed and the denied paths
 //! record the RESOLVED PHYSICAL path (the exact path the security gate
 //! evaluated), not the guest-supplied logical path — so a `home://x` allow and
@@ -36,6 +35,12 @@ use crate::engine::wasm::host::util;
 use crate::engine::wasm::host_state::HostState;
 use resolve::{resolve_path, resolve_vfs};
 
+use self::file_handle::{FileAccess, OpenFileSlot};
+
+pub(crate) use self::file_handle::OpenFileSlot as PooledOpenFileSlot;
+
+const MAX_OPEN_FILE_HANDLES: usize = 16;
+
 /// Audit envelope for path-based fs operations.
 ///
 /// Emits the off-by-default `astrid.audit.fs` observability line AND, when a
@@ -43,8 +48,8 @@ use resolve::{resolve_path, resolve_vfs};
 /// is installed, reports a typed event onto the kernel's signed audit chain.
 /// The op string maps to an event class: content/metadata reads →
 /// [`FileRead`], mutations → [`FileWrite`], removals → [`FileDelete`]. Ops
-/// that don't clearly map (e.g. `fs-open`) skip the sink rather than invent a
-/// variant.
+/// that don't clearly map skip the sink rather than invent a variant. Open is
+/// classified by its concrete read-only or mutating mode at the call site.
 pub(crate) fn audit_fs<T, E: std::fmt::Debug>(
     state: &HostState,
     op: &str,
@@ -90,9 +95,9 @@ pub(crate) fn audit_fs<T, E: std::fmt::Debug>(
     sink.record(&principal, event, outcome);
 }
 
-/// Map a path-based fs op string to its typed audit event class. Returns
-/// `None` for ops with no clear fs-effect mapping (handle-based ops, no-op
-/// stubs) so the sink is skipped rather than fed a guessed variant.
+/// Map a filesystem op string to its typed audit event class. Returns `None`
+/// for ops with no clear effect mapping so the sink is skipped rather than fed
+/// a guessed variant. Handle operations retain their open-time physical path.
 fn fs_event_for_op<'a>(op: &str, path: &'a str) -> Option<HostAuditEvent<'a>> {
     // `op` is a fully-qualified WIT path (`astrid:fs/host.read-file`) or a
     // bare verb in tests (`read-file`); match on the trailing verb so both
@@ -100,8 +105,11 @@ fn fs_event_for_op<'a>(op: &str, path: &'a str) -> Option<HostAuditEvent<'a>> {
     let verb = op.rsplit('.').next().unwrap_or(op);
     match verb {
         "read-file" | "fs-readdir" | "readdir" | "fs-stat" | "stat" | "fs-stat-symlink"
-        | "stat-symlink" | "fs-exists" | "exists" => Some(HostAuditEvent::FileRead { path }),
-        "write-file" | "fs-mkdir" | "mkdir" | "fs-mkdir-all" => {
+        | "stat-symlink" | "fs-exists" | "exists" | "read-at" | "handle-stat" | "fs-open-read" => {
+            Some(HostAuditEvent::FileRead { path })
+        },
+        "write-file" | "fs-mkdir" | "mkdir" | "fs-mkdir-all" | "write-at" | "set-len"
+        | "sync-data" | "sync-all" | "fs-rename" | "fs-open-write" => {
             Some(HostAuditEvent::FileWrite { path })
         },
         "fs-unlink" | "unlink" | "remove" | "remove-dir" => {
@@ -161,6 +169,13 @@ fn map_vfs_err(e: astrid_vfs::VfsError) -> ErrorCode {
         VfsError::Io(io) => match io.kind() {
             std::io::ErrorKind::NotFound => ErrorCode::NotFound,
             std::io::ErrorKind::PermissionDenied => ErrorCode::Access,
+            std::io::ErrorKind::AlreadyExists => ErrorCode::AlreadyExists,
+            std::io::ErrorKind::IsADirectory => ErrorCode::IsDirectory,
+            std::io::ErrorKind::NotADirectory => ErrorCode::NotDirectory,
+            std::io::ErrorKind::DirectoryNotEmpty => ErrorCode::NotEmpty,
+            std::io::ErrorKind::FileTooLarge => ErrorCode::TooLarge,
+            std::io::ErrorKind::StorageFull | std::io::ErrorKind::QuotaExceeded => ErrorCode::Quota,
+            std::io::ErrorKind::CrossesDevices => ErrorCode::CrossVfs,
             _ => ErrorCode::Unknown(io.to_string()),
         },
     }
@@ -195,6 +210,22 @@ mod error_mapping_tests {
             fs_event_for_op("astrid:fs/host.fs-stat-symlink", "/workspace"),
             Some(HostAuditEvent::FileRead { path: "/workspace" })
         ));
+    }
+
+    #[test]
+    fn open_and_handle_operations_keep_their_effect_class() {
+        for op in ["fs-open-read", "read-at", "handle-stat"] {
+            assert!(matches!(
+                fs_event_for_op(op, "/workspace/input"),
+                Some(HostAuditEvent::FileRead { .. })
+            ));
+        }
+        for op in ["fs-open-write", "write-at", "set-len", "sync-all"] {
+            assert!(matches!(
+                fs_event_for_op(op, "/workspace/output"),
+                Some(HostAuditEvent::FileWrite { .. })
+            ));
+        }
     }
 }
 
@@ -304,7 +335,7 @@ pub(super) fn authorize_process_write_path(
 /// Convert a VFS metadata record into the WIT `FileStat`. The VFS only
 /// exposes size / is_dir / mtime today; created/accessed timestamps and
 /// POSIX mode bits land as defaults until the VFS surfaces them.
-fn to_file_stat(meta: &astrid_vfs::VfsMetadata) -> FileStat {
+fn to_file_stat(meta: &astrid_vfs::VfsMetadata, mode: u32) -> FileStat {
     let kind = if meta.is_dir {
         FileType::Directory
     } else if meta.is_file {
@@ -319,7 +350,7 @@ fn to_file_stat(meta: &astrid_vfs::VfsMetadata) -> FileStat {
     FileStat {
         size: meta.size,
         kind,
-        mode: 0,
+        mode,
         modified,
         created: None,
         accessed: None,
@@ -327,18 +358,79 @@ fn to_file_stat(meta: &astrid_vfs::VfsMetadata) -> FileStat {
 }
 
 impl fs::Host for HostState {
-    fn fs_open(
-        &mut self,
-        _path: String,
-        _mode: OpenMode,
-    ) -> Result<Resource<FileHandle>, ErrorCode> {
-        // FileHandle resource lifecycle (positional pread/pwrite, fsync,
-        // set-len) lands in a follow-up. Capsules calling fs-open today
-        // see `unknown("not yet implemented")` and can fall back to
-        // read-file / write-file.
-        Err(ErrorCode::Unknown(
-            "fs-open: FileHandle resource port pending".to_string(),
-        ))
+    fn fs_open(&mut self, path: String, mode: OpenMode) -> Result<Resource<FileHandle>, ErrorCode> {
+        if self.file_handle_count >= MAX_OPEN_FILE_HANDLES {
+            return Err(ErrorCode::Quota);
+        }
+
+        let resolved = resolve_path(self, &path).map_err(map_resolve_err)?;
+        let (access, vfs_mode, audit_op) = match mode {
+            OpenMode::Read => {
+                gate_read(self, &resolved.physical)?;
+                (
+                    FileAccess::Read,
+                    astrid_vfs::VfsOpenMode::Read,
+                    "astrid:fs/host.fs-open-read",
+                )
+            },
+            OpenMode::Write => {
+                gate_write(self, &resolved.physical, WriteKind::Write)?;
+                (
+                    FileAccess::Write,
+                    astrid_vfs::VfsOpenMode::Write,
+                    "astrid:fs/host.fs-open-write",
+                )
+            },
+            OpenMode::Append => {
+                gate_write(self, &resolved.physical, WriteKind::Write)?;
+                (
+                    FileAccess::Write,
+                    astrid_vfs::VfsOpenMode::Append,
+                    "astrid:fs/host.fs-open-write",
+                )
+            },
+            OpenMode::ReadWrite => {
+                gate_read(self, &resolved.physical)?;
+                gate_write(self, &resolved.physical, WriteKind::Write)?;
+                (
+                    FileAccess::ReadWrite,
+                    astrid_vfs::VfsOpenMode::ReadWrite,
+                    "astrid:fs/host.fs-open-write",
+                )
+            },
+        };
+        let vfs_path = resolve_vfs(self, &resolved).map_err(map_resolve_err)?;
+        let vfs = vfs_path.vfs;
+        let relative = vfs_path.relative.to_string_lossy().to_string();
+        let physical_path = resolved.physical.to_string_lossy().into_owned();
+        let result = (|| {
+            let vfs_handle = util::bounded_block_on(
+                &self.runtime_handle,
+                &self.blocking_semaphore,
+                vfs.open_mode(&vfs_path.handle, &relative, vfs_mode),
+            )
+            .map_err(map_vfs_err)?;
+
+            let slot = OpenFileSlot::new(
+                vfs.clone(),
+                vfs_handle,
+                access,
+                physical_path.clone(),
+                self.effective_principal(),
+                self.runtime_handle.clone(),
+            );
+            let table_resource = self.resource_table.push(slot).map_err(|error| {
+                // `ResourceTable::push` consumed and dropped the slot. Its
+                // destructor schedules the VFS close, including on this error
+                // path and on whole-table pool resets.
+                ErrorCode::Unknown(format!("resource table: {error}"))
+            })?;
+            self.file_handle_count += 1;
+            self.file_handle_reps.insert(table_resource.rep());
+            Ok(Resource::new_own(table_resource.rep()))
+        })();
+        audit_fs(self, audit_op, &physical_path, &result);
+        result
     }
 
     fn fs_exists(&mut self, path: String) -> Result<bool, ErrorCode> {
@@ -481,15 +573,17 @@ impl fs::Host for HostState {
         let vfs_path = resolve_vfs(self, &resolved).map_err(map_resolve_err)?;
         let result =
             util::bounded_block_on(&self.runtime_handle, &self.blocking_semaphore, async {
-                vfs_path
+                let relative = vfs_path.relative.to_string_lossy();
+                let metadata = vfs_path
                     .vfs
-                    .stat(
-                        &vfs_path.handle,
-                        vfs_path.relative.to_string_lossy().as_ref(),
-                    )
-                    .await
+                    .stat(&vfs_path.handle, relative.as_ref())
+                    .await?;
+                let mode = vfs_path
+                    .vfs
+                    .mode(&vfs_path.handle, relative.as_ref())
+                    .await?;
+                Ok(to_file_stat(&metadata, mode))
             })
-            .map(|m| to_file_stat(&m))
             .map_err(map_vfs_err);
         audit_fs(
             self,
@@ -511,15 +605,17 @@ impl fs::Host for HostState {
         let vfs_path = resolve_vfs(self, &resolved).map_err(map_resolve_err)?;
         let result =
             util::bounded_block_on(&self.runtime_handle, &self.blocking_semaphore, async {
-                vfs_path
+                let relative = vfs_path.relative.to_string_lossy();
+                let metadata = vfs_path
                     .vfs
-                    .stat(
-                        &vfs_path.handle,
-                        vfs_path.relative.to_string_lossy().as_ref(),
-                    )
-                    .await
+                    .stat(&vfs_path.handle, relative.as_ref())
+                    .await?;
+                let mode = vfs_path
+                    .vfs
+                    .mode(&vfs_path.handle, relative.as_ref())
+                    .await?;
+                Ok(to_file_stat(&metadata, mode))
             })
-            .map(|metadata| to_file_stat(&metadata))
             .map_err(map_vfs_err);
         audit_fs(
             self,
@@ -666,10 +762,33 @@ impl fs::Host for HostState {
         ))
     }
 
-    fn fs_rename(&mut self, _src: String, _dst: String) -> Result<(), ErrorCode> {
-        Err(ErrorCode::Unknown(
-            "fs-rename: VFS rename port pending".to_string(),
-        ))
+    fn fs_rename(&mut self, src: String, dst: String) -> Result<(), ErrorCode> {
+        let src_resolved = resolve_path(self, &src).map_err(map_resolve_err)?;
+        let dst_resolved = resolve_path(self, &dst).map_err(map_resolve_err)?;
+        if src_resolved.target != dst_resolved.target {
+            return Err(ErrorCode::CrossVfs);
+        }
+        gate_write(self, &src_resolved.physical, WriteKind::Write)?;
+        gate_write(self, &dst_resolved.physical, WriteKind::Write)?;
+        let src_vfs = resolve_vfs(self, &src_resolved).map_err(map_resolve_err)?;
+        let dst_vfs = resolve_vfs(self, &dst_resolved).map_err(map_resolve_err)?;
+        let src_relative = src_vfs.relative.to_string_lossy().to_string();
+        let dst_relative = dst_vfs.relative.to_string_lossy().to_string();
+        let result = util::bounded_block_on(
+            &self.runtime_handle,
+            &self.blocking_semaphore,
+            src_vfs
+                .vfs
+                .rename(&src_vfs.handle, &src_relative, &dst_relative),
+        )
+        .map_err(map_vfs_err);
+        let audit_path = format!(
+            "{} -> {}",
+            src_resolved.physical.to_string_lossy(),
+            dst_resolved.physical.to_string_lossy()
+        );
+        audit_fs(self, "astrid:fs/host.fs-rename", &audit_path, &result);
+        result
     }
 
     fn fs_remove_dir_all(&mut self, _path: String) -> Result<u64, ErrorCode> {
