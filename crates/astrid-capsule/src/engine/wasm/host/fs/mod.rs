@@ -14,7 +14,7 @@
 //! handle them as transient failures):
 //!
 //! - fs-open + FileHandle resource (positional pread/pwrite, fsync, etc.)
-//! - fs-mkdir-all, fs-stat-symlink, fs-append, fs-copy, fs-rename,
+//! - fs-mkdir-all, fs-append, fs-copy, fs-rename,
 //!   fs-remove-dir-all, fs-canonicalize, fs-read-link, fs-hard-link
 //!
 //! Audit: every path-based op emits `astrid.audit.fs` per call
@@ -99,9 +99,8 @@ fn fs_event_for_op<'a>(op: &str, path: &'a str) -> Option<HostAuditEvent<'a>> {
     // forms classify identically.
     let verb = op.rsplit('.').next().unwrap_or(op);
     match verb {
-        "read-file" | "fs-readdir" | "readdir" | "fs-stat" | "stat" | "fs-exists" | "exists" => {
-            Some(HostAuditEvent::FileRead { path })
-        },
+        "read-file" | "fs-readdir" | "readdir" | "fs-stat" | "stat" | "fs-stat-symlink"
+        | "stat-symlink" | "fs-exists" | "exists" => Some(HostAuditEvent::FileRead { path }),
         "write-file" | "fs-mkdir" | "mkdir" | "fs-mkdir-all" => {
             Some(HostAuditEvent::FileWrite { path })
         },
@@ -188,6 +187,14 @@ mod error_mapping_tests {
             astrid_vfs::VfsError::Io(std::io::Error::from(std::io::ErrorKind::UnexpectedEof));
 
         assert!(matches!(map_vfs_err(error), ErrorCode::Unknown(_)));
+    }
+
+    #[test]
+    fn symlink_metadata_is_audited_as_a_file_read() {
+        assert!(matches!(
+            fs_event_for_op("astrid:fs/host.fs-stat-symlink", "/workspace"),
+            Some(HostAuditEvent::FileRead { path: "/workspace" })
+        ));
     }
 }
 
@@ -493,10 +500,34 @@ impl fs::Host for HostState {
         result
     }
 
-    fn fs_stat_symlink(&mut self, _path: String) -> Result<FileStat, ErrorCode> {
-        Err(ErrorCode::Unknown(
-            "fs-stat-symlink: lstat port pending".to_string(),
-        ))
+    fn fs_stat_symlink(&mut self, path: String) -> Result<FileStat, ErrorCode> {
+        // The VFS stat contract is deliberately non-following: HostVfs uses
+        // cap-std's `symlink_metadata`, while the overlay/worktree backends
+        // preserve the same node-type semantics. Keep this path separate from
+        // `fs_stat` so the SDK's explicit lstat operation remains visible in
+        // the audit trail.
+        let resolved = resolve_path(self, &path).map_err(map_resolve_err)?;
+        gate_read(self, &resolved.physical)?;
+        let vfs_path = resolve_vfs(self, &resolved).map_err(map_resolve_err)?;
+        let result =
+            util::bounded_block_on(&self.runtime_handle, &self.blocking_semaphore, async {
+                vfs_path
+                    .vfs
+                    .stat(
+                        &vfs_path.handle,
+                        vfs_path.relative.to_string_lossy().as_ref(),
+                    )
+                    .await
+            })
+            .map(|metadata| to_file_stat(&metadata))
+            .map_err(map_vfs_err);
+        audit_fs(
+            self,
+            "astrid:fs/host.fs-stat-symlink",
+            &resolved.physical.to_string_lossy(),
+            &result,
+        );
+        result
     }
 
     fn fs_unlink(&mut self, path: String) -> Result<(), ErrorCode> {
