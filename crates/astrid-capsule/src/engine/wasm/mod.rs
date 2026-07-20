@@ -2844,7 +2844,7 @@ pub struct LifecycleConfig {
     /// Workspace root directory for VFS.
     pub workspace_root: PathBuf,
     /// Principal home root for `home://` VFS scheme. Optional — when set,
-    /// lifecycle hooks can access `home://` paths (e.g. to write skill files).
+    /// lifecycle hooks can access principal-scoped configuration and assets.
     pub home_root: Option<PathBuf>,
     /// Scoped KV store for the capsule.
     pub kv: astrid_storage::ScopedKvStore,

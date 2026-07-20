@@ -3,8 +3,8 @@
 //! This module is for callers that explicitly need to expose public capsule
 //! introspection metadata from the install principal's home to another
 //! principal. In addition to manifests and `meta.json`, the capsule registry
-//! may contain declarative public assets such as skills. The kernel does not
-//! call it during boot or principal creation:
+//! may contain generic declarative public assets. The kernel does not call it
+//! during boot or principal creation:
 //! `default` is a principal, not a shared tenant, and fresh principals must
 //! not implicitly receive a copy of its installed-capsule registry.
 //!
@@ -149,10 +149,10 @@ mod tests {
             &install
                 .capsules_dir()
                 .join("alpha")
-                .join("skills")
+                .join("assets")
                 .join("alpha")
-                .join("SKILL.md"),
-            "# Alpha skill",
+                .join("README.md"),
+            "# Alpha asset",
         );
         write_file(
             &install.root().join("wit").join("system.wit"),
@@ -191,12 +191,12 @@ mod tests {
                 target_home
                     .capsules_dir()
                     .join("alpha")
-                    .join("skills")
+                    .join("assets")
                     .join("alpha")
-                    .join("SKILL.md")
+                    .join("README.md")
             )
-            .expect("alpha skill"),
-            "# Alpha skill"
+            .expect("alpha asset"),
+            "# Alpha asset"
         );
 
         // WIT mirrored.

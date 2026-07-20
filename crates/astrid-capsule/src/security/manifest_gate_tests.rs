@@ -188,7 +188,7 @@ async fn test_scheme_resolution_home_default_root() {
 
     // With no principal_home override, falls back to default_home_root (capsule owner's).
     assert!(
-        gate.check_file_read("test", "/home/user/.astrid/skills/my-skill/SKILL.md", None)
+        gate.check_file_read("test", "/home/user/.astrid/documents/project/note.md", None)
             .await
             .is_ok()
     );
@@ -222,7 +222,7 @@ async fn test_scheme_resolution_home_principal_override() {
     assert!(
         gate.check_file_read(
             "test",
-            "/home/user/.astrid/skills/my-skill/SKILL.md",
+            "/home/user/.astrid/documents/project/note.md",
             Some(&alice),
         )
         .await
@@ -270,7 +270,7 @@ async fn test_scheme_resolution_home_without_default_root() {
     let gate = ManifestSecurityGate::new(manifest, workspace_root(), None);
 
     assert!(
-        gate.check_file_read("test", "/home/user/.astrid/skills/my-skill/SKILL.md", None,)
+        gate.check_file_read("test", "/home/user/.astrid/documents/project/note.md", None,)
             .await
             .is_err()
     );
@@ -306,7 +306,7 @@ async fn test_global_path_denied_without_manifest_entry() {
     let gate = ManifestSecurityGate::new(manifest, workspace_root(), Some(home_root()));
 
     assert!(
-        gate.check_file_read("test", "/home/user/.astrid/skills/foo/SKILL.md", None)
+        gate.check_file_read("test", "/home/user/.astrid/documents/project/note.md", None)
             .await
             .is_err()
     );

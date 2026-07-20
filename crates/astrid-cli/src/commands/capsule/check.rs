@@ -23,6 +23,10 @@ use std::process::ExitCode;
 use anyhow::{Context, Result};
 use astrid_capsule::ToolDescriptor;
 use astrid_capsule::manifest::{CapsuleManifest, InterceptorDef};
+use syn::visit::Visit;
+use syn::{
+    Attribute, Expr, ImplItemFn, ItemFn, Lit, Meta, Token, TraitItemFn, punctuated::Punctuated,
+};
 
 use crate::theme::Theme;
 
@@ -79,7 +83,7 @@ pub(crate) fn run(path: Option<&str>) -> Result<ExitCode> {
     let manifest: CapsuleManifest =
         toml::from_str(&raw).with_context(|| format!("parsing {}", manifest_path.display()))?;
 
-    let tool_names = scan_tool_annotations(&dir.join("src"));
+    let tool_names = scan_tool_annotations(&dir.join("src"))?;
     let interceptors = manifest.effective_interceptors();
     let publishes = manifest.effective_ipc_publish_patterns();
 
@@ -224,48 +228,54 @@ fn print_report(tool_count: usize, findings: &[Finding]) {
     );
 }
 
-/// Collect the tool names declared by `#[astrid::tool("…")]` under `src_dir`.
+/// Collect the tool names declared by `#[astrid::tool]` under `src_dir`.
 ///
 /// Static source scan (no build): recurses `src/`, reads each `.rs` file, and
-/// extracts the first string argument of each `astrid::tool(` attribute. Best-
-/// effort — a non-literal tool name or a heavily reformatted attribute may be
-/// missed; the `--deep` mode (later) is the authoritative alternative.
-fn scan_tool_annotations(src_dir: &Path) -> Vec<String> {
+/// uses an explicit string argument when present or infers the enclosing
+/// function name for bare and empty attributes. A source read or parse failure
+/// aborts the check: silently returning a partial tool inventory would let
+/// wiring errors pass CI.
+fn scan_tool_annotations(src_dir: &Path) -> Result<Vec<String>> {
     let mut names = Vec::new();
-    for path in rs_files(src_dir) {
-        let Ok(content) = std::fs::read_to_string(&path) else {
-            continue;
-        };
-        for line in content.lines() {
-            if let Some(name) = tool_name_in_line(line)
-                && !names.contains(&name)
-            {
+    for path in rs_files(src_dir)? {
+        let content = std::fs::read_to_string(&path)
+            .with_context(|| format!("reading Rust source {}", path.display()))?;
+        for name in tool_names_in_source(&content)
+            .with_context(|| format!("parsing Rust source {}", path.display()))?
+        {
+            if !names.contains(&name) {
                 names.push(name);
             }
         }
     }
-    names
+    Ok(names)
 }
 
 /// Recursively collect `.rs` file paths under `dir` (iterative, so a deep tree
-/// can't blow the stack). A missing/unreadable dir yields none.
+/// can't blow the stack). A missing source directory yields no files, while an
+/// unreadable directory or entry fails the scan rather than returning a
+/// partial inventory.
 ///
 /// Uses `entry.file_type()` rather than `path.is_dir()`: `file_type` does NOT
 /// follow symlinks, so a symlinked directory is never recursed into — which also
 /// makes a symlink loop (a link pointing at an ancestor) impossible to follow, so
 /// the scan can't spin forever / OOM on a hostile or accidental link cycle.
-fn rs_files(dir: &Path) -> Vec<PathBuf> {
+fn rs_files(dir: &Path) -> Result<Vec<PathBuf>> {
+    if !dir.exists() {
+        return Ok(Vec::new());
+    }
     let mut out = Vec::new();
     let mut stack = vec![dir.to_path_buf()];
     while let Some(d) = stack.pop() {
-        let Ok(entries) = std::fs::read_dir(&d) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            // A file_type error (raced unlink, permissions) → skip this entry.
-            let Ok(file_type) = entry.file_type() else {
-                continue;
-            };
+        let entries = std::fs::read_dir(&d)
+            .with_context(|| format!("reading Rust source directory {}", d.display()))?;
+        for entry in entries {
+            let entry = entry.with_context(|| {
+                format!("reading an entry in Rust source directory {}", d.display())
+            })?;
+            let file_type = entry
+                .file_type()
+                .with_context(|| format!("reading file type for {}", entry.path().display()))?;
             let p = entry.path();
             if file_type.is_dir() {
                 stack.push(p);
@@ -274,34 +284,90 @@ fn rs_files(dir: &Path) -> Vec<PathBuf> {
             }
         }
     }
-    out
+    out.sort();
+    Ok(out)
 }
 
-/// Extract the tool name from a single line carrying an `astrid::tool("name")`
-/// attribute, or `None`.
+/// Parse Rust syntax and collect explicit or inferred names from live
+/// `#[astrid::tool("name")]` and bare `#[astrid::tool]` attributes.
 ///
-/// Requires `astrid::tool` to be immediately followed (modulo whitespace) by
-/// `(` — so `astrid::tool_helper(` is not mistaken for the attribute — and
-/// ignores a line whose attribute sits behind a `//` line comment.
-fn tool_name_in_line(line: &str) -> Option<String> {
-    const MARKER: &str = "astrid::tool";
-    let idx = line.find(MARKER)?;
-    // Commented out if a `//` precedes the attribute on this line.
-    if let Some(comment) = line.find("//")
-        && comment < idx
-    {
+/// Parsing the syntax tree is important here: Forge and other authoring tools
+/// embed example Rust source in string literals. A text scan mistakes those
+/// examples for executable attributes and reports phantom unrouted tools.
+fn tool_names_in_source(source: &str) -> syn::Result<Vec<String>> {
+    let file = syn::parse_file(source)?;
+    let mut visitor = ToolAttributeVisitor::default();
+    visitor.visit_file(&file);
+    Ok(visitor.names)
+}
+
+#[derive(Default)]
+struct ToolAttributeVisitor {
+    names: Vec<String>,
+}
+
+impl<'ast> Visit<'ast> for ToolAttributeVisitor {
+    fn visit_item_fn(&mut self, function: &'ast ItemFn) {
+        self.record_tool(&function.attrs, &function.sig.ident.to_string());
+        syn::visit::visit_item_fn(self, function);
+    }
+
+    fn visit_impl_item_fn(&mut self, function: &'ast ImplItemFn) {
+        self.record_tool(&function.attrs, &function.sig.ident.to_string());
+        syn::visit::visit_impl_item_fn(self, function);
+    }
+
+    fn visit_trait_item_fn(&mut self, function: &'ast TraitItemFn) {
+        self.record_tool(&function.attrs, &function.sig.ident.to_string());
+        syn::visit::visit_trait_item_fn(self, function);
+    }
+}
+
+impl ToolAttributeVisitor {
+    fn record_tool(&mut self, attributes: &[Attribute], inferred_name: &str) {
+        for attribute in attributes {
+            let Some(name) = tool_attribute_name(attribute, inferred_name) else {
+                continue;
+            };
+            if !name.is_empty() {
+                self.names.push(name);
+            }
+        }
+    }
+}
+
+fn tool_attribute_name(attribute: &Attribute, inferred_name: &str) -> Option<String> {
+    let mut segments = attribute.path().segments.iter();
+    let is_tool = segments
+        .next()
+        .is_some_and(|segment| segment.ident == "astrid")
+        && segments
+            .next()
+            .is_some_and(|segment| segment.ident == "tool")
+        && segments.next().is_none();
+    if !is_tool {
         return None;
     }
-    // Must be the `tool(` call form, not `tool_helper(` or `tool_describe`.
-    // `.get()` with saturating offsets avoids both a panic on a bad index and
-    // the crate's `arithmetic_side_effects` lint.
-    let after = line.get(idx.saturating_add(MARKER.len())..)?.trim_start();
-    let inner = after.strip_prefix('(')?;
-    let q1 = inner.find('"')?;
-    let rest = inner.get(q1.saturating_add(1)..)?;
-    let q2 = rest.find('"')?;
-    let name = rest.get(..q2)?;
-    (!name.is_empty()).then(|| name.to_string())
+
+    match &attribute.meta {
+        Meta::Path(_) => Some(inferred_name.to_string()),
+        Meta::List(_) => {
+            let arguments = attribute
+                .parse_args_with(Punctuated::<Expr, Token![,]>::parse_terminated)
+                .ok()?;
+            if arguments.is_empty() {
+                return Some(inferred_name.to_string());
+            }
+            let Expr::Lit(literal) = arguments.first()? else {
+                return None;
+            };
+            let Lit::Str(name) = &literal.lit else {
+                return None;
+            };
+            Some(name.value())
+        },
+        Meta::NameValue(_) => None,
+    }
 }
 
 #[cfg(test)]

@@ -1,7 +1,7 @@
 //! Legacy MCP/extension manifest converter — transforms `mcp.json` or
 //! `gemini-extension.json` into a `Capsule.toml` and packages it.
 
-use crate::archiver::pack_capsule_archive;
+use crate::archiver::{discover_opaque_assets, pack_capsule_archive};
 use anyhow::{Context, Result};
 use serde_json::Value;
 use std::fs;
@@ -76,11 +76,12 @@ pub(crate) fn convert(dir: &Path, json_filename: &str, output: Option<&str>) -> 
     // 5. Inject context files (AGENTS.md)
     inject_context_files(dir, &parsed, &mut toml_doc, &mut additional_files);
 
-    // 6. Inject skills
-    inject_skills(dir, &mut toml_doc, &mut additional_files);
-
-    // 7. Inject commands
+    // 6. Inject commands
     inject_commands(dir, &mut toml_doc, &mut additional_files);
+
+    // 7. Preserve user-space assets as opaque archive data. No manifest
+    // metadata is synthesized and Astrid assigns these files no semantics.
+    additional_files.extend(discover_opaque_assets(dir)?);
 
     let toml = toml_doc.to_string();
 
@@ -245,40 +246,6 @@ fn inject_context_files(
         "context_file",
         toml_edit::Item::ArrayOfTables(context_files_array),
     );
-}
-
-/// Inject `skills/*.md` files into `[[skill]]`.
-fn inject_skills(
-    dir: &Path,
-    toml_doc: &mut toml_edit::DocumentMut,
-    additional_files: &mut Vec<PathBuf>,
-) {
-    let skills_dir = dir.join("skills");
-    if !skills_dir.exists() || !skills_dir.is_dir() {
-        return;
-    }
-    let Ok(entries) = fs::read_dir(&skills_dir) else {
-        return;
-    };
-
-    let mut skills_array = toml_edit::ArrayOfTables::new();
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_file() && path.extension().and_then(|s| s.to_str()) == Some("md") {
-            let file_name = path.file_name().unwrap_or_default().to_string_lossy();
-            let skill_name = path.file_stem().unwrap_or_default().to_string_lossy();
-
-            let mut skill_table = toml_edit::Table::new();
-            skill_table.insert("name", toml_edit::value(skill_name.as_ref()));
-            skill_table.insert("file", toml_edit::value(format!("skills/{file_name}")));
-            skills_array.push(skill_table);
-        }
-    }
-
-    if !skills_array.is_empty() {
-        additional_files.push(skills_dir);
-        toml_doc.insert("skill", toml_edit::Item::ArrayOfTables(skills_array));
-    }
 }
 
 /// Inject `commands/*.toml` files into `[[command]]`.

@@ -125,7 +125,7 @@ impl Capsule {
 }
 
 /// `README.md` for the generated project: build/install/iterate commands and
-/// pointers to the in-runtime skill and the Astrid Book.
+/// pointers to runtime authoring guidance and the Astrid Book.
 pub(super) fn readme_md(name: &str) -> String {
     format!(
         r#"# {name}
@@ -179,8 +179,9 @@ astrid capsule install ./dist/{name}.capsule
 - **`AUTHORING.md`** in this project is the from-zero guide to writing this
   capsule — the tool pattern, the manifest, the capability/ACL model, and the
   dev loop. Read it before you touch `src/lib.rs`.
-- If the `capsule-forge` capsule is installed, its authoring skill lives at
-  `home://skills/capsule-forge/SKILL.md`.
+- An agent runtime may expose additional authoring guidance over IPC or through
+  its host plugin; discover that user-space surface through the runtime rather
+  than assuming the guidance is part of the kernel manifest.
 - The [Astrid Book](https://github.com/astrid-runtime/astrid) covers the
   capsule model, the IPC bus, capabilities, and the WIT contracts in depth.
 "#

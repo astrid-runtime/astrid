@@ -9,8 +9,21 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
 
 ## [Unreleased]
 
+### Removed
+
+- **Capsule manifests no longer embed the agent-specific `[[skill]]`
+  protocol.** Skills remain a user-space concern that agent runtimes can
+  discover over IPC or advertise through product registries without teaching
+  the Astrid kernel or generic capsule archive about an AI workflow format.
+  Builders still preserve files under `assets/` and legacy `skills/` as opaque,
+  symlink-free capsule data without generating manifest metadata.
+
 ### Fixed
 
+- **`astrid capsule check` no longer treats embedded Rust examples as live
+  tools.** The scanner now parses Rust attributes instead of matching source
+  text, so scaffold templates and documentation strings cannot create phantom
+  unrouted-tool failures.
 - **Interrupted immutable-release drafts recover without replacing uploaded
   assets.** Release uploads are sequential, and reruns authenticate every
   existing payload and signature before adding only the missing files. Closes

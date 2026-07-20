@@ -8,7 +8,7 @@ use crate::error::CapsuleResult;
 use crate::manifest::CapsuleManifest;
 
 /// The simplest engine. Handles universal, non-executable data injected into
-/// the OS memory (e.g., static skills, context files, declarative commands).
+/// the OS memory (e.g., context files and declarative commands).
 ///
 /// Every CompositeCapsule contains a `StaticEngine` by default.
 pub(crate) struct StaticEngine {
@@ -30,8 +30,8 @@ impl StaticEngine {
 #[async_trait]
 impl ExecutionEngine for StaticEngine {
     async fn load(&mut self, _ctx: &CapsuleContext) -> CapsuleResult<()> {
-        // TODO: Read `self.manifest.context_files` and `skills`
-        // from `self.capsule_dir` and publish them to the OS Event Bus or LLM Router.
+        // TODO: Read `self.manifest.context_files` from `self.capsule_dir` and
+        // publish them to the OS Event Bus or another user-space consumer.
 
         // For now, loading static files is instantaneous and infallible.
         Ok(())

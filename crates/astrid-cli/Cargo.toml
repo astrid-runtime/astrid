@@ -68,6 +68,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 serde_yaml = { workspace = true }
 sigstore-verify = { workspace = true }
+syn = { workspace = true }
 syntect = { workspace = true }
 tar = { workspace = true }
 tempfile = { workspace = true }

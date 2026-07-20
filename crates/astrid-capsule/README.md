@@ -13,7 +13,7 @@ A single manifest can run multiple engines simultaneously under one lifecycle:
 
 - **`WasmEngine`** - Extism/Wasmtime sandbox. Full host ABI access via syscalls. 64 MB memory ceiling (1024 WASM pages).
 - **`McpHostEngine`** - Native stdio subprocess bridged through `SecureMcpClient`. Binary hash verification, capability gating.
-- **`StaticEngine`** - Context files, skills, and commands loaded into memory without booting a VM.
+- **`StaticEngine`** - Context files and commands loaded into memory without booting a VM.
 
 The `CompositeCapsule` owns a `Vec<Box<dyn ExecutionEngine>>` and fans lifecycle calls across all engines. Load, unload, tool invocation, interceptor dispatch, and health checks all iterate the engine list.
 

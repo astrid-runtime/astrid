@@ -113,8 +113,8 @@ impl CapsuleLoader {
             }
         }
         // 3. Static Context Engine
-        // Always added. Handles injecting context_files, static commands, and skills
-        // directly into the OS memory without booting any VMs or Processes.
+        // Always added. Handles injecting context files and static commands
+        // directly into the OS memory without booting any VMs or processes.
         composite.add_engine(Box::new(crate::engine::StaticEngine::new(
             manifest.clone(),
             capsule_dir.clone(),
