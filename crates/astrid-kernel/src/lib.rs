@@ -188,6 +188,10 @@ pub struct Kernel {
     /// `Copy` value — no resolution logic lives here. See
     /// [`CapsuleRuntimeLimits`](astrid_capsule_types::CapsuleRuntimeLimits).
     runtime_limits: astrid_capsule_types::CapsuleRuntimeLimits,
+    /// Optional operator ceiling for one interceptor call. This remains
+    /// independent of the per-principal rate ledger and capsule-owned inner
+    /// budgets; unlimited still records exact Wasmtime fuel consumption.
+    interceptor_fuel: astrid_capsule_types::InterceptorFuelLimit,
     /// Operator-approved per-capsule local-egress allowlist
     /// (`[security.capsule_local_egress]`), keyed by capsule id. Resolved
     /// once from config by the daemon; the kernel only stores it and hands
@@ -362,7 +366,7 @@ impl Kernel {
     /// flock have no browser-profile analogue; that host builds its own
     /// [`KernelResources`] and calls `with_resources` directly.
     ///
-    /// `runtime_limits` is the resolved per-host capsule concurrency ceiling
+    /// `runtime_limits` contains the resolved per-host capsule runtime ceilings
     /// pair (blocking vs async-I/O host calls); the daemon resolves it from
     /// config + CLI + host defaults and the kernel forwards it, unmodified, to
     /// every capsule's `WasmEngine`. In tests, pass
@@ -418,6 +422,35 @@ impl Kernel {
         local_egress: std::collections::HashMap<String, Vec<String>>,
         http_limits: astrid_capsule_types::HttpLimits,
         workspace_layout: WorkspaceLayout,
+    ) -> Result<Arc<Self>, std::io::Error> {
+        Self::new_with_workspace_layout_and_interceptor_fuel(
+            session_id,
+            workspace_root,
+            runtime_limits,
+            local_egress,
+            http_limits,
+            workspace_layout,
+            astrid_capsule_types::InterceptorFuelLimit::default(),
+        )
+        .await
+    }
+
+    /// Boot a kernel with an explicit project layout and interceptor fuel
+    /// policy while preserving the established constructor above.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the Astrid home or native resources cannot be
+    /// acquired, or if portable kernel wiring fails.
+    #[cfg(unix)]
+    pub async fn new_with_workspace_layout_and_interceptor_fuel(
+        session_id: SessionId,
+        workspace_root: PathBuf,
+        runtime_limits: astrid_capsule_types::CapsuleRuntimeLimits,
+        local_egress: std::collections::HashMap<String, Vec<String>>,
+        http_limits: astrid_capsule_types::HttpLimits,
+        workspace_layout: WorkspaceLayout,
+        interceptor_fuel: astrid_capsule_types::InterceptorFuelLimit,
     ) -> Result<Arc<Self>, std::io::Error> {
         use astrid_core::dirs::AstridHome;
 
@@ -484,7 +517,7 @@ impl Kernel {
             Some(singleton_lock),
         );
 
-        Self::with_resources_and_workspace_layout(
+        Self::with_resources_and_workspace_layout_and_interceptor_fuel(
             session_id,
             workspace_root,
             runtime_limits,
@@ -492,6 +525,7 @@ impl Kernel {
             http_limits,
             resources,
             workspace_layout,
+            interceptor_fuel,
         )
         .await
     }
@@ -508,7 +542,7 @@ impl Kernel {
     /// token) and delegates here. An alternate host can build its own
     /// [`KernelResources`] and call this directly.
     ///
-    /// `runtime_limits` is the resolved per-host capsule concurrency ceiling
+    /// `runtime_limits` contains the resolved per-host capsule runtime ceilings
     /// pair (blocking vs async-I/O host calls); the daemon resolves it from
     /// config + CLI + host defaults and the kernel forwards it, unmodified, to
     /// every capsule's `WasmEngine`. In tests, pass
@@ -561,10 +595,6 @@ impl Kernel {
     ///
     /// Returns an error if VFS mounts, the capability store, group
     /// configuration, or CLI root bootstrap cannot be initialized.
-    #[expect(
-        clippy::too_many_lines,
-        reason = "boot sequence: sequential setup that does not benefit from splitting"
-    )]
     pub async fn with_resources_and_workspace_layout(
         session_id: SessionId,
         workspace_root: PathBuf,
@@ -573,6 +603,46 @@ impl Kernel {
         http_limits: astrid_capsule_types::HttpLimits,
         resources: KernelResources,
         workspace_layout: WorkspaceLayout,
+    ) -> Result<Arc<Self>, std::io::Error> {
+        Self::with_resources_and_workspace_layout_and_interceptor_fuel(
+            session_id,
+            workspace_root,
+            runtime_limits,
+            local_egress,
+            http_limits,
+            resources,
+            workspace_layout,
+            astrid_capsule_types::InterceptorFuelLimit::default(),
+        )
+        .await
+    }
+
+    /// Construct a kernel from injected resources, workspace layout, and an
+    /// explicit single-interceptor fuel policy.
+    ///
+    /// # Panics
+    ///
+    /// Panics on native targets when called from a single-threaded tokio
+    /// runtime because the capsule engine requires `block_in_place`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if VFS mounts, the capability store, group
+    /// configuration, or CLI root bootstrap cannot be initialized.
+    #[expect(
+        clippy::too_many_arguments,
+        clippy::too_many_lines,
+        reason = "composition root: explicit policy and resource dependencies remain visible"
+    )]
+    pub async fn with_resources_and_workspace_layout_and_interceptor_fuel(
+        session_id: SessionId,
+        workspace_root: PathBuf,
+        runtime_limits: astrid_capsule_types::CapsuleRuntimeLimits,
+        local_egress: std::collections::HashMap<String, Vec<String>>,
+        http_limits: astrid_capsule_types::HttpLimits,
+        resources: KernelResources,
+        workspace_layout: WorkspaceLayout,
+        interceptor_fuel: astrid_capsule_types::InterceptorFuelLimit,
     ) -> Result<Arc<Self>, std::io::Error> {
         // The native capsule engine uses `block_in_place`, which requires a
         // multi-thread runtime. The browser profile has no such runtime (and no
@@ -732,6 +802,7 @@ impl Kernel {
             fuel_rate: astrid_capsule_types::FuelRateLimiter::default(),
             memory_ledger: astrid_capsule_types::MemoryLedger::default(),
             runtime_limits,
+            interceptor_fuel,
             local_egress,
             http_limits,
             full_reload_in_flight: AtomicBool::new(false),
@@ -985,7 +1056,8 @@ impl Kernel {
             self.memory_ledger.clone(),
             self.runtime_limits,
             self.http_limits,
-        );
+        )
+        .with_interceptor_fuel(self.interceptor_fuel);
         let mut capsule = loader.create_capsule(manifest, dir.to_path_buf())?;
 
         let kv = astrid_storage::ScopedKvStore::new(
@@ -2456,6 +2528,7 @@ pub(crate) async fn test_kernel_with_home(home: astrid_core::dirs::AstridHome) -
         fuel_rate: astrid_capsule_types::FuelRateLimiter::default(),
         memory_ledger: astrid_capsule_types::MemoryLedger::default(),
         runtime_limits: astrid_capsule_types::CapsuleRuntimeLimits::default(),
+        interceptor_fuel: astrid_capsule_types::InterceptorFuelLimit::default(),
         local_egress: std::collections::HashMap::new(),
         http_limits: astrid_capsule_types::HttpLimits::default(),
         full_reload_in_flight: AtomicBool::new(false),

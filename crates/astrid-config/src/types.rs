@@ -824,6 +824,12 @@ pub struct CapsuleSection {
     /// this bounds the peak, not the resting footprint. (Run-loop and
     /// `host_process` capsules stay single-Store regardless.)
     pub instance_pool_size: Option<usize>,
+    /// Hard wasmtime-fuel ceiling for one interceptor invocation.
+    ///
+    /// `None` means no fuel ceiling. Fuel is still measured and charged to
+    /// each principal's CPU-rate ledger; this knob exists for operators of
+    /// shared services that require a finite single-call guard.
+    pub interceptor_fuel: Option<u64>,
 }
 
 // ---------------------------------------------------------------------------

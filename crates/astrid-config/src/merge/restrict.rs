@@ -101,6 +101,17 @@ pub fn enforce_restrictions(
     // global config can set `[http]`.
     block_workspace_override(merged, baseline, workspace_layer, &["http"], "http");
 
+    // A workspace may tighten a finite operator interceptor-fuel ceiling, and
+    // may introduce one when the operator default is unlimited (absent), but
+    // it must never raise an existing service ceiling.
+    clamp_max_int(
+        merged,
+        baseline,
+        workspace_layer,
+        &["capsule", "interceptor_fuel"],
+        "capsule.interceptor_fuel",
+    );
+
     // workspace.auto_allow_read: cannot expand beyond baseline.
     block_workspace_expansion(
         merged,

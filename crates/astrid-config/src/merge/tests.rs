@@ -334,6 +334,54 @@ fn test_approval_timeout_cannot_increase() {
 }
 
 #[test]
+fn test_interceptor_fuel_cannot_increase_from_workspace() {
+    let baseline: toml::Value = toml::from_str(
+        r"
+        [capsule]
+        interceptor_fuel = 20000000000
+    ",
+    )
+    .unwrap();
+    let workspace: toml::Value = toml::from_str(
+        r"
+        [capsule]
+        interceptor_fuel = 40000000000
+    ",
+    )
+    .unwrap();
+
+    let mut merged = baseline.clone();
+    deep_merge(&mut merged, &workspace);
+    enforce_restrictions(&mut merged, &baseline, &workspace);
+
+    assert_eq!(
+        merged["capsule"]["interceptor_fuel"].as_integer(),
+        Some(20_000_000_000)
+    );
+}
+
+#[test]
+fn test_workspace_can_tighten_unlimited_interceptor_fuel() {
+    let baseline: toml::Value = toml::from_str("[capsule]").unwrap();
+    let workspace: toml::Value = toml::from_str(
+        r"
+        [capsule]
+        interceptor_fuel = 10000000000
+    ",
+    )
+    .unwrap();
+
+    let mut merged = baseline.clone();
+    deep_merge(&mut merged, &workspace);
+    enforce_restrictions(&mut merged, &baseline, &workspace);
+
+    assert_eq!(
+        merged["capsule"]["interceptor_fuel"].as_integer(),
+        Some(10_000_000_000)
+    );
+}
+
+#[test]
 fn test_api_key_cannot_be_overridden_by_workspace() {
     let baseline: toml::Value = toml::from_str(
         r#"

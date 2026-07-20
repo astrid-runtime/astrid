@@ -16,7 +16,7 @@ use std::sync::Arc;
 use tokio::sync::Semaphore;
 
 pub use astrid_capsule_types::limits::{
-    CapsuleRuntimeLimits, HttpLimits, host_blocking_concurrency_default,
+    CapsuleRuntimeLimits, HttpLimits, InterceptorFuelLimit, host_blocking_concurrency_default,
     host_instance_pool_size_default, host_io_concurrency_default,
 };
 

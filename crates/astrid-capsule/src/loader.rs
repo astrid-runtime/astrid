@@ -3,7 +3,7 @@
 use std::path::PathBuf;
 
 use crate::capsule::{Capsule, CompositeCapsule};
-use crate::engine::wasm::limits::{CapsuleRuntimeLimits, HttpLimits};
+use crate::engine::wasm::limits::{CapsuleRuntimeLimits, HttpLimits, InterceptorFuelLimit};
 use crate::error::CapsuleResult;
 use crate::fuel_ledger::{FuelLedger, FuelRateLimiter};
 use crate::manifest::CapsuleManifest;
@@ -32,6 +32,9 @@ pub struct CapsuleLoader {
     /// semaphores. A plain `Copy` value, not a shared handle. See
     /// [`CapsuleRuntimeLimits`].
     runtime_limits: CapsuleRuntimeLimits,
+    /// Optional operator guard for one interceptor call. Separate from the
+    /// stable public runtime-limit struct shape.
+    interceptor_fuel: InterceptorFuelLimit,
     /// Resolved `astrid:http` host ceilings (timeouts, redirect/stream caps,
     /// buffered-body limit), resolved once by the daemon from the `[http]`
     /// config section and handed to every `WasmEngine`. A global `Copy` value.
@@ -66,8 +69,16 @@ impl CapsuleLoader {
             fuel_rate,
             memory_ledger,
             runtime_limits,
+            interceptor_fuel: InterceptorFuelLimit::default(),
             http_limits,
         }
+    }
+
+    /// Apply the operator's optional single-interceptor fuel guard.
+    #[must_use]
+    pub fn with_interceptor_fuel(mut self, limit: InterceptorFuelLimit) -> Self {
+        self.interceptor_fuel = limit;
+        self
     }
 
     /// Parse a `CapsuleManifest` and build a unified `CompositeCapsule`.
@@ -88,15 +99,18 @@ impl CapsuleLoader {
 
         // 1. WASM Component Engine
         if !manifest.components.is_empty() {
-            composite.add_engine(Box::new(crate::engine::WasmEngine::new(
-                manifest.clone(),
-                capsule_dir.clone(),
-                self.fuel_ledger.clone(),
-                self.fuel_rate.clone(),
-                self.memory_ledger.clone(),
-                self.runtime_limits,
-                self.http_limits,
-            )));
+            composite.add_engine(Box::new(
+                crate::engine::WasmEngine::new(
+                    manifest.clone(),
+                    capsule_dir.clone(),
+                    self.fuel_ledger.clone(),
+                    self.fuel_rate.clone(),
+                    self.memory_ledger.clone(),
+                    self.runtime_limits,
+                    self.http_limits,
+                )
+                .with_interceptor_fuel(self.interceptor_fuel),
+            ));
         }
 
         // 2. Legacy Host MCP Engine (The Airlock Override)

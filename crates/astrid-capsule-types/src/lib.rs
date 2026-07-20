@@ -19,5 +19,5 @@ pub mod memory_ledger;
 pub use capsule::CapsuleId;
 pub use error::{CapsuleError, CapsuleResult};
 pub use fuel_ledger::{FuelLedger, FuelRateLimiter};
-pub use limits::{CapsuleRuntimeLimits, HttpLimits};
+pub use limits::{CapsuleRuntimeLimits, HttpLimits, InterceptorFuelLimit};
 pub use memory_ledger::MemoryLedger;

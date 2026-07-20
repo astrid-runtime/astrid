@@ -76,6 +76,10 @@ const ENV_MAPPINGS: &[EnvMapping] = &[
         var_name: "ASTRID_CAPSULE_INSTANCE_POOL_SIZE",
         field_path: "capsule.instance_pool_size",
     },
+    EnvMapping {
+        var_name: "ASTRID_CAPSULE_INTERCEPTOR_FUEL",
+        field_path: "capsule.interceptor_fuel",
+    },
     // Retry settings.
     EnvMapping {
         var_name: "ASTRID_RETRY_LLM_MAX_ATTEMPTS",
@@ -296,6 +300,7 @@ fn coerce_to_toml_value(path: &str, val: &str) -> toml::Value {
             | "capsule.host_blocking_concurrency"
             | "capsule.host_io_concurrency"
             | "capsule.instance_pool_size"
+            | "capsule.interceptor_fuel"
             | "retry.llm_max_attempts"
             | "retry.mcp_max_attempts"
     ) && let Ok(i) = val.parse::<i64>()
@@ -343,6 +348,25 @@ mod tests {
         assert_eq!(merged["logging"]["level"].as_str().unwrap(), "debug");
         assert_eq!(
             sources.get("logging.level"),
+            Some(&ConfigLayer::Environment)
+        );
+    }
+
+    #[test]
+    fn test_capsule_interceptor_fuel_env_is_integer() {
+        let mut merged: toml::Value = toml::from_str("[capsule]").unwrap();
+        let mut sources = FieldSources::new();
+        let env = make_env(&[("ASTRID_CAPSULE_INTERCEPTOR_FUEL", "20000000000")]);
+
+        let count = apply_env_fallbacks(&mut merged, &mut sources, &env);
+
+        assert_eq!(count, 1);
+        assert_eq!(
+            merged["capsule"]["interceptor_fuel"].as_integer(),
+            Some(20_000_000_000)
+        );
+        assert_eq!(
+            sources.get("capsule.interceptor_fuel"),
             Some(&ConfigLayer::Environment)
         );
     }

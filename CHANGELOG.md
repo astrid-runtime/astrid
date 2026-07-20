@@ -11,6 +11,15 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
 
 ### Fixed
 
+- **Long-running local capsules are no longer stopped by a hidden 10-billion
+  fuel ceiling.** Interceptor fuel remains an exact per-principal CPU meter but
+  defaults to no hard per-call ceiling. Shared-service operators can set a
+  positive `capsule.interceptor_fuel` value through config,
+  `ASTRID_CAPSULE_INTERCEPTOR_FUEL`, or `astrid-daemon --interceptor-fuel`,
+  independently of wall-clock, memory, and per-principal CPU-rate limits.
+- **Capsule `symlink_metadata` now reaches the capability-confined VFS.** The
+  host no longer returns the former `lstat port pending` stub, which prevented
+  filesystem adapters from safely inspecting an admitted mount root.
 - **Stable crates publication installs its authenticated-hash prerequisite.**
   The protected publisher installs the pinned `b3sum` binary before validating
   the exact dev candidate, so BLAKE3 release metadata checks run before any

@@ -89,6 +89,35 @@ auto_summarize = true
 keep_recent_count = 10
 ```
 
+## Capsule Runtime
+
+Tune host-side capsule concurrency and the optional single-invocation fuel
+guard. Concurrency defaults are derived from the host. Interceptor fuel is
+unlimited by default: Wasmtime still counts every guest instruction and Astrid
+still charges it to the invoking principal's CPU-rate ledger, but fuel alone
+does not terminate a call.
+
+```toml
+[capsule]
+# host_blocking_concurrency = 6
+# host_io_concurrency = 512
+# instance_pool_size = 32
+
+# Optional positive hard ceiling for one interceptor call. Leave unset for a
+# local agent runtime; shared-service operators can set this after measuring
+# representative workloads.
+# interceptor_fuel = 20000000000
+```
+
+`capsule.interceptor_fuel` is intentionally independent of the principal
+profile's `quotas.max_cpu_fuel_per_sec`: the former is an operator hard stop for
+one call, while the latter is a per-principal rolling admission limit. Wall
+clock (`max_timeout_secs`) and memory (`max_memory_bytes`) quotas remain active
+in both cases. A workspace may lower an operator's finite fuel ceiling, but
+cannot raise it. The equivalent environment fallback is
+`ASTRID_CAPSULE_INTERCEPTOR_FUEL`; the daemon's highest-precedence override is
+`--interceptor-fuel`.
+
 ## Security
 
 Define the security boundary for the agent.

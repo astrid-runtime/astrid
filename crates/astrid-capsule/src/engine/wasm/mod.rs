@@ -264,6 +264,10 @@ pub struct WasmEngine {
     /// `blocking_semaphore` / `io_semaphore` at load time. `Default` (all
     /// host-derived) in tests.
     runtime_limits: limits::CapsuleRuntimeLimits,
+    /// Operator-selected single-interceptor fuel guard. Kept separate from the
+    /// established public [`CapsuleRuntimeLimits`](limits::CapsuleRuntimeLimits)
+    /// shape so downstream exhaustive struct construction remains compatible.
+    interceptor_fuel: limits::InterceptorFuelLimit,
     /// Resolved operator ceilings for the `astrid:http` host. A GLOBAL value
     /// (same for every capsule), resolved once by the daemon from the `[http]`
     /// config section and handed down the loader chain like `runtime_limits`;
@@ -343,11 +347,19 @@ impl WasmEngine {
             fuel_rate,
             group_config: None,
             runtime_limits,
+            interceptor_fuel: limits::InterceptorFuelLimit::default(),
             http_limits,
             workspace_cow: None,
             process_tracker: None,
             persistent_processes: None,
         }
+    }
+
+    /// Apply the operator's optional single-interceptor fuel guard.
+    #[must_use]
+    pub fn with_interceptor_fuel(mut self, limit: limits::InterceptorFuelLimit) -> Self {
+        self.interceptor_fuel = limit;
+        self
     }
 
     /// Promote/rollback the OS-level copy-on-write workspace behind a QUIESCENCE
@@ -472,18 +484,16 @@ const DEFAULT_RUN_LOOP_WINDOW_TICKS: u64 = 50;
 /// enough to bound a genuine spinner.
 const MAX_NO_YIELD_WINDOWS: u32 = 3;
 
-/// Per-single-invocation fuel budget for a pooled interceptor call (10e9).
+/// Fuel used while constructing a pooled Store, before it belongs to an
+/// invocation and therefore before there is a principal to charge.
 ///
-/// This is the per-invocation CPU **measurement** seed, NOT the run-loop CPU
-/// bound (that is the epoch mechanism). `invoke_interceptor` re-seeds the
-/// leased Store to this budget before the call and reads `get_fuel()` after;
-/// `INTERCEPTOR_FUEL_BUDGET - get_fuel()` is the exact deterministic
-/// guest-instruction count for the call, accumulated into the per-principal
-/// `fuel_ledger`. The budget sits far above any legitimate one-prompt cost (a
-/// prompt assembly is low-millions of instructions), so it also caps a runaway
-/// single interceptor call. Because fuel is engine-wide, re-seeding per call
-/// means one leaseholder cannot drain a pooled Store for the next.
-const INTERCEPTOR_FUEL_BUDGET: u64 = 10_000_000_000;
+/// The Store is re-seeded from [`InterceptorFuelLimit`](limits::InterceptorFuelLimit) at
+/// every call boundary. Keeping construction unbounded avoids turning an
+/// implementation detail into a second, hidden hard ceiling.
+const STORE_INITIAL_FUEL: u64 = u64::MAX;
+
+#[cfg(test)]
+const TEST_INTERCEPTOR_FUEL_BUDGET: u64 = 10_000_000_000;
 
 /// Register every Astrid host interface on `linker`. Single source of
 /// truth shared between the main capsule-load path and the lifecycle-
@@ -564,11 +574,11 @@ fn build_wasmtime_engine() -> CapsuleResult<wasmtime::Engine> {
     // invoking principal in the per-principal fuel ledger. Enabling it
     // engine-wide means EVERY Store starts at 0 fuel and would trap on the
     // first instruction, so every Store-creation site below explicitly fuels
-    // its store: interceptor pools are re-seeded to INTERCEPTOR_FUEL_BUDGET
-    // per call, and run-loop / lifecycle Stores (whose CPU is bounded by the
-    // epoch interrupt or are exempt) are fuelled to u64::MAX so fuel never
-    // traps them. consume_fuel is incompatible with Winch; this build uses
-    // cranelift (Cargo.toml feature), so it is supported.
+    // its store: interceptor pools are re-seeded from the resolved operator
+    // config per call, and run-loop / lifecycle Stores (whose CPU is bounded
+    // by the epoch interrupt or are exempt) are fuelled to u64::MAX so fuel
+    // never traps them. consume_fuel is incompatible with Winch; this build
+    // uses cranelift (Cargo.toml feature), so it is supported.
     config.consume_fuel(true);
     // Component Model async: every guest call goes through `call_async`
     // and yields on every host import boundary. This lets the per-capsule
@@ -1997,7 +2007,7 @@ impl ExecutionEngine for WasmEngine {
                 instance_pre,
                 Arc::clone(&make_state),
                 pool_epoch_deadline,
-                INTERCEPTOR_FUEL_BUDGET,
+                STORE_INITIAL_FUEL,
             );
             let mut initial_instances: Vec<pool::PooledInstance> =
                 Vec::with_capacity(pool_min_idle);
@@ -2028,7 +2038,7 @@ impl ExecutionEngine for WasmEngine {
                 // The run-loop Store's memory cap is already baked into
                 // `store_meter` by `make_state` (pool_size 1 ⇒ this IS the
                 // run-loop Store) and was enforced during `instantiate_async`.
-                // Fuel was seeded to INTERCEPTOR_FUEL_BUDGET above for
+                // Fuel was seeded to STORE_INITIAL_FUEL above for
                 // instantiation; the run loop is NOT fuel-bound, so re-seed it
                 // to effectively-infinite (consume_fuel makes a 0-fuel Store
                 // trap, and we never want a run loop to fuel-out). CPU is
@@ -2665,6 +2675,12 @@ impl ExecutionEngine for WasmEngine {
         // busy), distinct from a slow guest call.
         let pool_wait_ms = checkout_start.elapsed().as_millis() as u64;
         let typed_instance = checkout.instance();
+        // Operator-level hard ceiling for one call. The local/default runtime
+        // resolves this to u64::MAX: fuel remains an exact meter without
+        // imposing an accidental compute ceiling. Shared-service operators can
+        // configure a finite value independently of the per-principal
+        // max_cpu_fuel_per_sec admission quota.
+        let invocation_fuel_budget = self.interceptor_fuel.budget();
         let result: CapsuleResult<HookTriggerResult> = {
             let s = checkout.store_mut();
             // ── Phase 1: SET ──────────────────────────────────────
@@ -2680,15 +2696,16 @@ impl ExecutionEngine for WasmEngine {
             }
 
             // Per-invocation CPU: fuel is engine-wide, so re-seed the leased
-            // Store to a known budget before the call. This (a) bounds a
-            // runaway single interceptor call, and (b) makes
-            // `INTERCEPTOR_FUEL_BUDGET - get_fuel()` after the call the EXACT
-            // deterministic instruction count for THIS invocation, attributable
-            // to the invoking principal — independent of whatever the previous
-            // leaseholder of this pooled Store consumed. Errors only if fuel is
-            // disabled (it is not); on the impossible error we leave fuel as-is
-            // (fail-secure: a smaller budget traps sooner).
-            let _ = s.set_fuel(INTERCEPTOR_FUEL_BUDGET);
+            // Store to the configured budget before the call. This makes
+            // `invocation_fuel_budget - get_fuel()` after the call the EXACT
+            // deterministic instruction count for THIS invocation,
+            // attributable to the invoking principal and independent of the
+            // previous leaseholder. u64::MAX is the unlimited measurement seed;
+            // a finite operator value additionally traps a runaway single call.
+            // Errors only if fuel is disabled (it is not); on the impossible
+            // error we leave fuel as-is (fail-secure: a smaller budget traps
+            // sooner).
+            let _ = s.set_fuel(invocation_fuel_budget);
 
             {
                 let state = s.data_mut();
@@ -2769,7 +2786,7 @@ impl ExecutionEngine for WasmEngine {
         // ENFORCED by the epoch interrupt mechanism, not fuel; windowed
         // deny/throttle on this aggregate is the deliberate follow-up).
         let fuel_after = checkout.store_mut().get_fuel().unwrap_or(0);
-        let fuel_used = INTERCEPTOR_FUEL_BUDGET.saturating_sub(fuel_after);
+        let fuel_used = invocation_fuel_budget.saturating_sub(fuel_after);
         self.fuel_ledger.charge(&invoking_principal, fuel_used);
         // Feed this call's fuel into the CPU-rate window stamped at the moment
         // the burn FINISHED, not `invoke_start`. The gate at the top reads the
@@ -2781,9 +2798,8 @@ impl ExecutionEngine for WasmEngine {
         // in a window that is already stale by the time it returns, so the next
         // invocation's `over_budget` roll discards it — a principal issuing
         // back-to-back >1s calls would never be throttled despite each call
-        // burning up to 5x the per-second budget (INTERCEPTOR_FUEL_BUDGET vs
-        // max_cpu_fuel_per_sec). Stamping at completion places the fuel in the
-        // live window so the next call sees it.
+        // burning well over the per-second budget. Stamping at completion
+        // places the fuel in the live window so the next call sees it.
         self.fuel_rate
             .record(&invoking_principal, fuel_used, std::time::Instant::now());
         // Drop the lease: Phase 3 CLEAR runs and the instance returns to the
@@ -4862,7 +4878,7 @@ mod tests {
 //     calls a recv-marking host import every iteration survives forever.
 //   * memory cap          — `StoreLimitsBuilder::memory_size(cap)` BEFORE
 //     `instantiate_async` (the MEMORY-ORDERING fix — `make_state`).
-//   * fuel-delta meter     — `INTERCEPTOR_FUEL_BUDGET - get_fuel()` after a
+//   * fuel-delta meter     — `seed - get_fuel()` after a
 //     call (the kept interceptor measurement).
 //
 // Core modules (not full WIT components) are deliberate: they exercise the
@@ -4876,7 +4892,7 @@ mod tests {
 #[cfg(test)]
 mod epoch_integration_tests {
     use super::{
-        EpochAction, INTERCEPTOR_FUEL_BUDGET, MAX_NO_YIELD_WINDOWS, build_wasmtime_engine,
+        EpochAction, MAX_NO_YIELD_WINDOWS, TEST_INTERCEPTOR_FUEL_BUDGET, build_wasmtime_engine,
         epoch_decision, exempt_epoch_action, spawn_epoch_ticker, spawn_epoch_ticker_every,
     };
     use std::sync::Arc;
@@ -5157,7 +5173,7 @@ mod epoch_integration_tests {
             },
         );
         store.limiter(|s| &mut s.limits);
-        store.set_fuel(INTERCEPTOR_FUEL_BUDGET).expect("fuel");
+        store.set_fuel(TEST_INTERCEPTOR_FUEL_BUDGET).expect("fuel");
         store.set_epoch_deadline(u64::MAX);
         let linker = Linker::new(&engine);
         let over_res = linker.instantiate_async(&mut store, &over).await;
@@ -5174,7 +5190,7 @@ mod epoch_integration_tests {
             },
         );
         store.limiter(|s| &mut s.limits);
-        store.set_fuel(INTERCEPTOR_FUEL_BUDGET).expect("fuel");
+        store.set_fuel(TEST_INTERCEPTOR_FUEL_BUDGET).expect("fuel");
         store.set_epoch_deadline(u64::MAX);
         linker
             .instantiate_async(&mut store, &ok)
@@ -5183,7 +5199,7 @@ mod epoch_integration_tests {
     }
 
     /// KEPT interceptor MEASUREMENT: the per-invocation fuel delta
-    /// `INTERCEPTOR_FUEL_BUDGET - get_fuel()` is the exact deterministic
+    /// `seed - get_fuel()` is the exact deterministic
     /// instruction count, stable across repeated runs of the same deterministic
     /// guest (the property the per-principal ledger relies on). A counting loop
     /// of N iterations costs a fixed, reproducible amount of fuel; N and 2N show
@@ -5205,9 +5221,8 @@ mod epoch_integration_tests {
                   (local.get $acc)))"#,
         );
 
-        async fn run_n(engine: &Engine, module: &Module, n: i32) -> (i32, u64) {
+        async fn run_n(engine: &Engine, module: &Module, n: i32, seed: u64) -> (i32, u64) {
             let mut store = Store::new(engine, ());
-            store.set_fuel(INTERCEPTOR_FUEL_BUDGET).expect("fuel");
             store.set_epoch_deadline(u64::MAX);
             let linker = Linker::new(engine);
             let instance = linker
@@ -5217,20 +5232,29 @@ mod epoch_integration_tests {
             let count = instance
                 .get_typed_func::<i32, i32>(&mut store, "count")
                 .expect("count export");
+            // Production re-seeds after leasing an already-instantiated Store,
+            // immediately before the guest call. Mirror that exact boundary.
+            store.set_fuel(seed).expect("fuel");
             let out = count.call_async(&mut store, n).await.expect("call");
             let after = store.get_fuel().expect("fuel enabled");
-            (out, INTERCEPTOR_FUEL_BUDGET.saturating_sub(after))
+            (out, seed.saturating_sub(after))
         }
 
-        let (out_a, used_a1) = run_n(&engine, &module, 1000).await;
-        let (out_a2, used_a2) = run_n(&engine, &module, 1000).await;
-        let (_out_b, used_b) = run_n(&engine, &module, 2000).await;
+        let (out_a, used_a1) = run_n(&engine, &module, 1000, TEST_INTERCEPTOR_FUEL_BUDGET).await;
+        let (out_a2, used_a2) = run_n(&engine, &module, 1000, TEST_INTERCEPTOR_FUEL_BUDGET).await;
+        let (_out_b, used_b) = run_n(&engine, &module, 2000, TEST_INTERCEPTOR_FUEL_BUDGET).await;
+        let (out_unlimited, used_unlimited) = run_n(&engine, &module, 1000, u64::MAX).await;
 
         assert_eq!(out_a, 1000, "guest must compute the loop result");
         assert_eq!(out_a2, 1000);
+        assert_eq!(out_unlimited, 1000);
         assert_eq!(
             used_a1, used_a2,
             "fuel delta must be deterministic for identical guest work"
+        );
+        assert_eq!(
+            used_a1, used_unlimited,
+            "u64::MAX must remove the hard ceiling without changing metering"
         );
         assert!(
             used_b > used_a1,
@@ -5238,8 +5262,33 @@ mod epoch_integration_tests {
              must exceed used(1000)={used_a1}"
         );
         assert!(
-            used_a1 > 0 && used_a1 < INTERCEPTOR_FUEL_BUDGET,
+            used_a1 > 0 && used_a1 < TEST_INTERCEPTOR_FUEL_BUDGET,
             "fuel delta must be a real, bounded count: {used_a1}"
+        );
+
+        // A deliberately tiny finite operator guard must trap the same call
+        // for fuel exhaustion. Wasmtime charges/reserves fuel in compiled
+        // blocks, so "observed cost minus one" is not a stable trap boundary;
+        // one unit is unambiguously insufficient for this loop.
+        let mut store = Store::new(&engine, ());
+        store.set_epoch_deadline(u64::MAX);
+        let linker = Linker::new(&engine);
+        let instance = linker
+            .instantiate_async(&mut store, &module)
+            .await
+            .expect("instantiate");
+        let count = instance
+            .get_typed_func::<i32, i32>(&mut store, "count")
+            .expect("count export");
+        store.set_fuel(1).expect("finite fuel guard");
+        let err = count
+            .call_async(&mut store, 1000)
+            .await
+            .expect_err("finite fuel below the measured cost must trap");
+        assert_eq!(
+            err.root_cause().downcast_ref::<Trap>(),
+            Some(&Trap::OutOfFuel),
+            "finite operator ceiling must produce the fuel trap: {err:?}"
         );
     }
 

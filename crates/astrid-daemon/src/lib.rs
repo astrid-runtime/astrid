@@ -53,6 +53,11 @@ pub struct Args {
     /// host-derived value (cores-scaled, replacing the old fixed 16).
     #[arg(long)]
     pub instance_pool_size: Option<usize>,
+
+    /// Hard wasmtime-fuel ceiling for one interceptor invocation. Unset means
+    /// unlimited; metering and per-principal CPU-rate quotas remain active.
+    #[arg(long, value_parser = parse_nonzero_fuel)]
+    pub interceptor_fuel: Option<u64>,
 }
 
 /// Reject a concurrency ceiling of `0` at CLI parse time. `0` would otherwise
@@ -65,6 +70,14 @@ fn parse_nonzero_concurrency(s: &str) -> Result<usize, String> {
         Ok(0) => Err("must be >= 1 (a concurrency ceiling of 0 would wedge the gate)".to_string()),
         Ok(n) => Ok(n),
         Err(e) => Err(format!("not a valid concurrency value: {e}")),
+    }
+}
+
+fn parse_nonzero_fuel(s: &str) -> Result<u64, String> {
+    match s.parse::<u64>() {
+        Ok(0) => Err("must be >= 1 (omit the setting for unlimited fuel)".to_string()),
+        Ok(n) => Ok(n),
+        Err(e) => Err(format!("not a valid fuel value: {e}")),
     }
 }
 
@@ -93,9 +106,9 @@ fn init_logging(verbose: bool, unified_cfg: Option<&astrid_config::Config>) {
     }
 }
 
-/// Resolve the capsule host-call concurrency ceilings from CLI flags, the
-/// loaded config (which already folded in `ASTRID_CAPSULE_*` env), and the
-/// host-derived defaults. Precedence: CLI flag > config file > env > host.
+/// Resolve capsule runtime ceilings from CLI flags, the loaded config (which
+/// already folded in `ASTRID_CAPSULE_*` env), and defaults. Precedence: CLI
+/// flag > config file > env > host/default.
 fn resolve_capsule_limits(
     args: &Args,
     cfg: Option<&astrid_config::Config>,
@@ -108,6 +121,16 @@ fn resolve_capsule_limits(
             .or_else(|| capsule_cfg.and_then(|c| c.host_io_concurrency)),
         args.instance_pool_size
             .or_else(|| capsule_cfg.and_then(|c| c.instance_pool_size)),
+    )
+}
+
+fn resolve_interceptor_fuel(
+    args: &Args,
+    cfg: Option<&astrid_config::Config>,
+) -> astrid_capsule::InterceptorFuelLimit {
+    astrid_capsule::InterceptorFuelLimit::resolve(
+        args.interceptor_fuel
+            .or_else(|| cfg.and_then(|config| config.capsule.interceptor_fuel)),
     )
 }
 
@@ -178,7 +201,7 @@ pub async fn run() -> Result<()> {
     });
 
     // Load the unified config once: it drives both logging and the capsule
-    // runtime concurrency ceilings below.
+    // runtime ceilings below.
     let unified_cfg = astrid_config::Config::load_with_home_and_layout(
         Some(&workspace_root),
         astrid_home.root(),
@@ -194,10 +217,23 @@ pub async fn run() -> Result<()> {
             .map_err(|e| anyhow::anyhow!("Invalid UUID format: {e}"))?,
     );
 
-    // Resolve the capsule host-call concurrency ceilings (CLI > config+env >
-    // host-derived default); the kernel forwards them to every `WasmEngine`.
-    // Done before `args.workspace` is consumed below.
+    // Resolve capsule runtime ceilings (CLI > config+env > default); the kernel
+    // forwards them to every `WasmEngine`. Done before `args.workspace` is
+    // consumed below.
     let runtime_limits = resolve_capsule_limits(&args, unified_cfg.as_ref());
+    let interceptor_fuel = resolve_interceptor_fuel(&args, unified_cfg.as_ref());
+    let interceptor_fuel_display = if interceptor_fuel.is_unlimited() {
+        "unlimited".to_owned()
+    } else {
+        interceptor_fuel.budget().to_string()
+    };
+    tracing::info!(
+        blocking_concurrency = runtime_limits.blocking_concurrency,
+        io_concurrency = runtime_limits.io_concurrency,
+        instance_pool_size = runtime_limits.instance_pool_size,
+        interceptor_fuel = interceptor_fuel_display,
+        "Resolved capsule runtime limits"
+    );
 
     // Operator-approved per-capsule local-egress allowlist (SSRF-airlock
     // exemptions). Operator config only — the kernel hands each capsule its
@@ -210,13 +246,14 @@ pub async fn run() -> Result<()> {
     // Operator ceilings for the astrid:http host (global; absent `[http]`
     // config = the host's historical constants). Forwarded to every capsule.
     let http_limits = resolve_http_limits(unified_cfg.as_ref());
-    let kernel = astrid_kernel::Kernel::new_with_workspace_layout(
+    let kernel = astrid_kernel::Kernel::new_with_workspace_layout_and_interceptor_fuel(
         session_id.clone(),
         workspace_root,
         runtime_limits,
         local_egress,
         http_limits,
         workspace_layout,
+        interceptor_fuel,
     )
     .await
     .map_err(|e| anyhow::anyhow!("Failed to boot Kernel: {e}"))?;
@@ -427,8 +464,9 @@ fn spawn_gateway(
 
 #[cfg(test)]
 mod tests {
-    use super::provides_cli_socket_uplink;
+    use super::{Args, parse_nonzero_fuel, provides_cli_socket_uplink, resolve_interceptor_fuel};
     use astrid_capsule::manifest::CapsuleManifest;
+    use clap::Parser;
 
     fn manifest(name: &str, uplink: bool, net_bind: &[&str]) -> CapsuleManifest {
         let mut manifest = CapsuleManifest::default();
@@ -460,5 +498,29 @@ mod tests {
                 manifest.package.name
             );
         }
+    }
+
+    #[test]
+    fn interceptor_fuel_cli_defaults_unlimited_and_accepts_a_finite_guard() {
+        let default = Args::try_parse_from(["astrid-daemon"]).expect("default args");
+        assert_eq!(default.interceptor_fuel, None);
+        assert!(resolve_interceptor_fuel(&default, None).is_unlimited());
+
+        let finite = Args::try_parse_from(["astrid-daemon", "--interceptor-fuel", "20000000000"])
+            .expect("finite fuel guard");
+        assert_eq!(finite.interceptor_fuel, Some(20_000_000_000));
+        assert!(parse_nonzero_fuel("0").is_err());
+
+        let mut config = astrid_config::Config::default();
+        config.capsule.interceptor_fuel = Some(7);
+        assert_eq!(
+            resolve_interceptor_fuel(&default, Some(&config)).budget(),
+            7
+        );
+        assert_eq!(
+            resolve_interceptor_fuel(&finite, Some(&config)).budget(),
+            20_000_000_000,
+            "CLI must override config and env"
+        );
     }
 }

@@ -20,6 +20,7 @@
 //! resolved by the caller (CLI > config file > env > host-derived default); a
 //! `None` override here means "use the host-derived default".
 
+use std::num::NonZeroU64;
 use std::thread::available_parallelism;
 use std::time::Duration;
 
@@ -197,6 +198,53 @@ impl CapsuleRuntimeLimits {
     #[must_use]
     pub fn instance_pool_min_idle(self) -> usize {
         WARM_MIN_IDLE.min(self.instance_pool_size).max(1)
+    }
+}
+
+/// Operator policy for the fuel available to one interceptor invocation.
+///
+/// This is deliberately separate from [`CapsuleRuntimeLimits`] so adding the
+/// policy does not change that established public struct's construction shape.
+/// Unlimited invocations are still deterministically metered and charged to
+/// the invoking principal's fuel ledgers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum InterceptorFuelLimit {
+    /// Do not impose a second per-invocation ceiling above the principal and
+    /// capsule budgets enforced by their respective layers.
+    #[default]
+    Unlimited,
+    /// Trap one interceptor invocation after this many Wasmtime fuel units.
+    Limited(NonZeroU64),
+}
+
+impl InterceptorFuelLimit {
+    /// Resolve an optional operator value. Absence means unlimited; zero is
+    /// defensively clamped to one because config and CLI validation reject it
+    /// before this boundary.
+    #[must_use]
+    pub const fn resolve(value: Option<u64>) -> Self {
+        match value {
+            None => Self::Unlimited,
+            Some(value) => match NonZeroU64::new(value) {
+                Some(value) => Self::Limited(value),
+                None => Self::Limited(NonZeroU64::MIN),
+            },
+        }
+    }
+
+    /// Concrete Wasmtime fuel seeded at each interceptor call boundary.
+    #[must_use]
+    pub const fn budget(self) -> u64 {
+        match self {
+            Self::Unlimited => u64::MAX,
+            Self::Limited(value) => value.get(),
+        }
+    }
+
+    /// Whether the operator has omitted the optional single-call guard.
+    #[must_use]
+    pub const fn is_unlimited(self) -> bool {
+        matches!(self, Self::Unlimited)
     }
 }
 
@@ -404,6 +452,14 @@ mod tests {
         assert_eq!(r.blocking_concurrency, host_blocking_concurrency_default());
         assert_eq!(r.io_concurrency, host_io_concurrency_default());
         assert_eq!(r.instance_pool_size, host_instance_pool_size_default());
+    }
+
+    #[test]
+    fn interceptor_fuel_is_typed_and_defaults_to_unlimited() {
+        assert_eq!(InterceptorFuelLimit::resolve(None).budget(), u64::MAX);
+        assert!(InterceptorFuelLimit::default().is_unlimited());
+        assert_eq!(InterceptorFuelLimit::resolve(Some(20)).budget(), 20);
+        assert_eq!(InterceptorFuelLimit::resolve(Some(0)).budget(), 1);
     }
 
     #[test]

@@ -428,11 +428,10 @@ timeout_secs = 300
 # ============================================================================
 # Capsule Runtime
 # ============================================================================
-# Concurrency ceilings for capsule host calls. Both keys are commented out on
-# purpose: when unset the daemon derives them from the host at boot (CPU cores
-# for blocking calls, the file-descriptor limit for async-I/O calls). Uncomment
-# to pin an explicit value. Precedence: CLI flag > this file > ASTRID_CAPSULE_*
-# env > host-derived default.
+# Runtime ceilings for capsule host calls. The keys are commented out on
+# purpose: when unset the daemon derives concurrency from the host and leaves
+# interceptor fuel unlimited. Uncomment to pin an explicit value. Precedence:
+# CLI flag > this file > ASTRID_CAPSULE_* env > default.
 
 [capsule]
 # Max concurrent BLOCKING host calls (KV, fs, identity, sys, sockets, the
@@ -450,6 +449,13 @@ timeout_secs = 300
 # pool warm-starts small and grows lazily toward this, so it bounds the peak,
 # not the resting footprint. Run-loop / host_process capsules ignore it.
 # instance_pool_size = 32
+
+# Optional hard fuel ceiling for ONE interceptor invocation. Fuel metering and
+# per-principal max_cpu_fuel_per_sec accounting remain active when this is
+# unset; only the hard fuel trap is disabled. Local/default installations should
+# normally leave this unset. Shared-service operators may set a positive finite
+# value after measuring representative workloads.
+# interceptor_fuel = 20000000000
 
 # ============================================================================
 # Spark (Agent Identity)

@@ -307,6 +307,13 @@ fn validate_capsule(config: &Config) -> ConfigResult<()> {
         });
     }
 
+    if c.interceptor_fuel == Some(0) {
+        return Err(ConfigError::ValidationError {
+            field: "capsule.interceptor_fuel".to_owned(),
+            message: "interceptor_fuel must be greater than 0 when set".to_owned(),
+        });
+    }
+
     Ok(())
 }
 
@@ -392,10 +399,12 @@ mod tests {
 
     #[test]
     fn test_capsule_none_is_valid() {
-        // Default (all `None` → host-derived) must pass validation.
+        // Default concurrency is host-derived and invocation fuel is
+        // unlimited; the complete default must pass validation.
         let config = Config::default();
         assert!(config.capsule.host_blocking_concurrency.is_none());
         assert!(config.capsule.host_io_concurrency.is_none());
+        assert!(config.capsule.interceptor_fuel.is_none());
         assert!(validate(&config).is_ok());
     }
 
@@ -404,6 +413,7 @@ mod tests {
         let mut config = Config::default();
         config.capsule.host_blocking_concurrency = Some(4);
         config.capsule.host_io_concurrency = Some(256);
+        config.capsule.interceptor_fuel = Some(20_000_000_000);
         assert!(validate(&config).is_ok());
     }
 
@@ -440,6 +450,18 @@ mod tests {
             err,
             ConfigError::ValidationError { field, .. }
                 if field == "capsule.instance_pool_size"
+        ));
+    }
+
+    #[test]
+    fn test_capsule_zero_interceptor_fuel_rejected() {
+        let mut config = Config::default();
+        config.capsule.interceptor_fuel = Some(0);
+        let err = validate(&config).unwrap_err();
+        assert!(matches!(
+            err,
+            ConfigError::ValidationError { field, .. }
+                if field == "capsule.interceptor_fuel"
         ));
     }
 
