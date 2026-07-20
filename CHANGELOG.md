@@ -11,6 +11,10 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
 
 ### Fixed
 
+- **Stable crates publication installs its authenticated-hash prerequisite.**
+  The protected publisher installs the pinned `b3sum` binary before validating
+  the exact dev candidate, so BLAKE3 release metadata checks run before any
+  crates.io mutation instead of failing on a missing executable. Closes #1294.
 - **Channel promotion starts successfully after the stable crates workflow
   split.** The reusable stable publisher now declares its optional named
   crates.io secret while the protected release environment remains the actual

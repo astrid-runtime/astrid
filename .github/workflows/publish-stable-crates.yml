@@ -35,6 +35,11 @@ jobs:
         with:
           python-version: '3.12'
       - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          toolchain: '1.95.0'
+      - name: Install pinned b3sum
+        run: cargo install b3sum --version 1.8.5 --locked
       - name: Authenticate immutable release and current dev pointer
         env:
           GH_TOKEN: ${{ github.token }}
@@ -128,9 +133,6 @@ jobs:
         run: |
           [[ "$(git -C stable-release-source rev-parse 'HEAD^{commit}')" == "$RELEASE_SOURCE_COMMIT" ]]
           [[ "$(sed -n 's/^version = "\([^"]*\)"/\1/p' stable-release-source/Cargo.toml | head -n1)" == "$RELEASE_VERSION" ]]
-      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
-        with:
-          toolchain: '1.95.0'
       - name: Publish the authenticated stable workspace
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
