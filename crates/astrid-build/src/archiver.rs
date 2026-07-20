@@ -57,7 +57,7 @@ pub(crate) fn pack_capsule_archive(
         }
     }
 
-    // 3. Append any additional contextual files (like READMEs, skill files, etc.)
+    // 3. Append any additional contextual files (like READMEs or command files).
     // Use a cycle-safe recursive walk instead of tar's append_dir_all, because
     // follow_symlinks(true) + append_dir_all has no cycle detection — a symlink
     // pointing to an ancestor directory would cause infinite recursion and OOM.

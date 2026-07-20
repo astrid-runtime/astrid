@@ -248,7 +248,7 @@ impl Weather {
 ```
 
 Building capsules is a first-class workflow in Astrid. The Forge (`astrid capsule new` plus authoring
-tools and a scaffolding Skill) is the on-ramp; the direction is an agent that writes, builds, and
+tools and runtime-served guidance) is the on-ramp; the direction is an agent that writes, builds, and
 installs its own capsules within the capability sandbox.
 
 ### Live capsule lifecycle

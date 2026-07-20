@@ -86,9 +86,6 @@ pub struct CapsuleManifest {
     /// MCP servers this capsule exposes.
     #[serde(default, rename = "mcp_server")]
     pub mcp_servers: Vec<McpServerDef>,
-    /// Skills this capsule provides.
-    #[serde(default, rename = "skill")]
-    pub skills: Vec<SkillDef>,
     /// Uplinks this capsule provides (e.g. Telegram, CLI).
     #[serde(default, rename = "uplink")]
     pub uplinks: Vec<UplinkDef>,
@@ -612,17 +609,6 @@ pub struct McpServerDef {
     /// The host arguments (if type = stdio).
     #[serde(default)]
     pub args: Vec<String>,
-}
-
-/// A skill provided by the capsule.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SkillDef {
-    /// Name of the skill.
-    pub name: String,
-    /// Description of what the skill provides.
-    pub description: Option<String>,
-    /// Path to the skill file.
-    pub file: PathBuf,
 }
 
 /// An uplink provided by the capsule (e.g., Telegram, CLI).

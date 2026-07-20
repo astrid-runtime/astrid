@@ -9,6 +9,13 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
 
 ## [Unreleased]
 
+### Removed
+
+- **Capsule manifests no longer embed the agent-specific `[[skill]]`
+  protocol.** Skills remain a user-space concern that agent runtimes can
+  discover over IPC or advertise through product registries without teaching
+  the Astrid kernel or generic capsule archive about an AI workflow format.
+
 ### Fixed
 
 - **Interrupted immutable-release drafts recover without replacing uploaded

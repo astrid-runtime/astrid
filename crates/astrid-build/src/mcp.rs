@@ -76,15 +76,12 @@ pub(crate) fn convert(dir: &Path, json_filename: &str, output: Option<&str>) -> 
     // 5. Inject context files (AGENTS.md)
     inject_context_files(dir, &parsed, &mut toml_doc, &mut additional_files);
 
-    // 6. Inject skills
-    inject_skills(dir, &mut toml_doc, &mut additional_files);
-
-    // 7. Inject commands
+    // 6. Inject commands
     inject_commands(dir, &mut toml_doc, &mut additional_files);
 
     let toml = toml_doc.to_string();
 
-    // 8. Pack the archive
+    // 7. Pack the archive
     let out_dir = match output {
         Some(p) => PathBuf::from(p),
         None => std::env::current_dir()?.join("dist"),
@@ -245,40 +242,6 @@ fn inject_context_files(
         "context_file",
         toml_edit::Item::ArrayOfTables(context_files_array),
     );
-}
-
-/// Inject `skills/*.md` files into `[[skill]]`.
-fn inject_skills(
-    dir: &Path,
-    toml_doc: &mut toml_edit::DocumentMut,
-    additional_files: &mut Vec<PathBuf>,
-) {
-    let skills_dir = dir.join("skills");
-    if !skills_dir.exists() || !skills_dir.is_dir() {
-        return;
-    }
-    let Ok(entries) = fs::read_dir(&skills_dir) else {
-        return;
-    };
-
-    let mut skills_array = toml_edit::ArrayOfTables::new();
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_file() && path.extension().and_then(|s| s.to_str()) == Some("md") {
-            let file_name = path.file_name().unwrap_or_default().to_string_lossy();
-            let skill_name = path.file_stem().unwrap_or_default().to_string_lossy();
-
-            let mut skill_table = toml_edit::Table::new();
-            skill_table.insert("name", toml_edit::value(skill_name.as_ref()));
-            skill_table.insert("file", toml_edit::value(format!("skills/{file_name}")));
-            skills_array.push(skill_table);
-        }
-    }
-
-    if !skills_array.is_empty() {
-        additional_files.push(skills_dir);
-        toml_doc.insert("skill", toml_edit::Item::ArrayOfTables(skills_array));
-    }
 }
 
 /// Inject `commands/*.toml` files into `[[command]]`.

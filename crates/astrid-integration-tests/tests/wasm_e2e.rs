@@ -68,7 +68,6 @@ fn build_test_manifest(
         context_files: vec![],
         commands: vec![],
         mcp_servers: vec![],
-        skills: vec![],
         uplinks: vec![],
         publishes: HashMap::new(),
         subscribes,
