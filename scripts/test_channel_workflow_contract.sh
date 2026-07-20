@@ -64,6 +64,7 @@ fi
 grep -Fq 'environment: release' "$stable_crates_workflow"
 grep -Fq "if: github.ref == 'refs/heads/main'" "$stable_crates_workflow"
 grep -Fq -- '--expected-channel dev' "$stable_crates_workflow"
+grep -Fq 'CARGO_REGISTRY_TOKEN:' "$stable_crates_workflow"
 grep -Fq 'secrets.CARGO_REGISTRY_TOKEN' "$stable_crates_workflow"
 grep -Fq 'scripts/publish_crates_io.sh' "$stable_crates_workflow"
 grep -Fq 'python3 "$script_root/crate_publication.py"' "$stable_crates_script"

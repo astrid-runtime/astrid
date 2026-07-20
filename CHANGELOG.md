@@ -9,6 +9,14 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Channel promotion starts successfully after the stable crates workflow
+  split.** The reusable stable publisher now declares its optional named
+  crates.io secret while the protected release environment remains the actual
+  credential authority, so GitHub can validate dev, nightly, and stable
+  dispatches without broadly inheriting caller secrets. Closes #1292.
+
 ## [0.10.4] - 2026-07-20
 
 ### Removed
