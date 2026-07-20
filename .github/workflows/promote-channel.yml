@@ -28,6 +28,9 @@ jobs:
   publish-stable-crates:
     name: Publish exact stable candidate to crates.io
     if: github.ref == 'refs/heads/main' && inputs.channel == 'stable'
+    permissions:
+      actions: read
+      contents: read
     uses: ./.github/workflows/publish-stable-crates.yml
     with:
       release_tag: ${{ inputs.release_tag }}

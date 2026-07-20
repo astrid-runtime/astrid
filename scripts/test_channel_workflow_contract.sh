@@ -51,6 +51,7 @@ if grep -Fq 'CARGO_REGISTRY_TOKEN' "$release_workflow" || \
 fi
 grep -Fq "if: github.ref == 'refs/heads/main' && inputs.channel == 'stable'" "$workflow"
 grep -Fq 'uses: ./.github/workflows/publish-stable-crates.yml' "$workflow"
+grep -A8 -F 'publish-stable-crates:' "$workflow" | grep -Fq 'actions: read'
 if grep -Fq 'secrets: inherit' "$workflow"; then
   echo "stable crates publication must not inherit unrelated caller secrets" >&2
   exit 1
