@@ -9,6 +9,8 @@ on:
       - 'scripts/test_release_manifest.py'
       - 'scripts/release_publication.py'
       - 'scripts/test_release_publication.py'
+      - 'scripts/release_draft_recovery.py'
+      - 'scripts/test_release_draft_recovery.py'
       - 'scripts/crate_publication.py'
       - 'scripts/test_crate_publication.py'
       - 'scripts/channel_metadata.py'
@@ -30,6 +32,8 @@ on:
       - 'scripts/test_release_manifest.py'
       - 'scripts/release_publication.py'
       - 'scripts/test_release_publication.py'
+      - 'scripts/release_draft_recovery.py'
+      - 'scripts/test_release_draft_recovery.py'
       - 'scripts/crate_publication.py'
       - 'scripts/test_crate_publication.py'
       - 'scripts/channel_metadata.py'
@@ -87,6 +91,7 @@ jobs:
         run: |
           python3 scripts/test_release_manifest.py
           python3 scripts/test_release_publication.py
+          python3 scripts/test_release_draft_recovery.py
           python3 scripts/test_crate_publication.py
           python3 scripts/test_channel_metadata.py
           python3 scripts/test_channel_publication.py
