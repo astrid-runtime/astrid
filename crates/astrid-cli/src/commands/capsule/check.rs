@@ -23,6 +23,8 @@ use std::process::ExitCode;
 use anyhow::{Context, Result};
 use astrid_capsule::ToolDescriptor;
 use astrid_capsule::manifest::{CapsuleManifest, InterceptorDef};
+use syn::visit::Visit;
+use syn::{Attribute, Expr, Lit, Token, punctuated::Punctuated};
 
 use crate::theme::Theme;
 
@@ -236,10 +238,8 @@ fn scan_tool_annotations(src_dir: &Path) -> Vec<String> {
         let Ok(content) = std::fs::read_to_string(&path) else {
             continue;
         };
-        for line in content.lines() {
-            if let Some(name) = tool_name_in_line(line)
-                && !names.contains(&name)
-            {
+        for name in tool_names_in_source(&content) {
+            if !names.contains(&name) {
                 names.push(name);
             }
         }
@@ -277,31 +277,56 @@ fn rs_files(dir: &Path) -> Vec<PathBuf> {
     out
 }
 
-/// Extract the tool name from a single line carrying an `astrid::tool("name")`
-/// attribute, or `None`.
+/// Parse Rust syntax and collect literal names from live
+/// `#[astrid::tool("name")]` attributes.
 ///
-/// Requires `astrid::tool` to be immediately followed (modulo whitespace) by
-/// `(` — so `astrid::tool_helper(` is not mistaken for the attribute — and
-/// ignores a line whose attribute sits behind a `//` line comment.
-fn tool_name_in_line(line: &str) -> Option<String> {
-    const MARKER: &str = "astrid::tool";
-    let idx = line.find(MARKER)?;
-    // Commented out if a `//` precedes the attribute on this line.
-    if let Some(comment) = line.find("//")
-        && comment < idx
-    {
-        return None;
+/// Parsing the syntax tree is important here: Forge and other authoring tools
+/// embed example Rust source in string literals. A text scan mistakes those
+/// examples for executable attributes and reports phantom unrouted tools.
+fn tool_names_in_source(source: &str) -> Vec<String> {
+    let Ok(file) = syn::parse_file(source) else {
+        return Vec::new();
+    };
+    let mut visitor = ToolAttributeVisitor::default();
+    visitor.visit_file(&file);
+    visitor.names
+}
+
+#[derive(Default)]
+struct ToolAttributeVisitor {
+    names: Vec<String>,
+}
+
+impl<'ast> Visit<'ast> for ToolAttributeVisitor {
+    fn visit_attribute(&mut self, attribute: &'ast Attribute) {
+        let mut segments = attribute.path().segments.iter();
+        let is_tool = segments
+            .next()
+            .is_some_and(|segment| segment.ident == "astrid")
+            && segments
+                .next()
+                .is_some_and(|segment| segment.ident == "tool")
+            && segments.next().is_none();
+        if !is_tool {
+            return;
+        }
+
+        let Ok(arguments) =
+            attribute.parse_args_with(Punctuated::<Expr, Token![,]>::parse_terminated)
+        else {
+            return;
+        };
+        let Some(Expr::Lit(literal)) = arguments.first() else {
+            return;
+        };
+        let Lit::Str(name) = &literal.lit else {
+            return;
+        };
+        let name = name.value();
+        if !name.is_empty() {
+            self.names.push(name);
+        }
     }
-    // Must be the `tool(` call form, not `tool_helper(` or `tool_describe`.
-    // `.get()` with saturating offsets avoids both a panic on a bad index and
-    // the crate's `arithmetic_side_effects` lint.
-    let after = line.get(idx.saturating_add(MARKER.len())..)?.trim_start();
-    let inner = after.strip_prefix('(')?;
-    let q1 = inner.find('"')?;
-    let rest = inner.get(q1.saturating_add(1)..)?;
-    let q2 = rest.find('"')?;
-    let name = rest.get(..q2)?;
-    (!name.is_empty()).then(|| name.to_string())
 }
 
 #[cfg(test)]

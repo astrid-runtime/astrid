@@ -30,38 +30,42 @@ fn rules(findings: &[Finding]) -> Vec<&'static str> {
 // ── source scan ────────────────────────────────────────────────────────
 
 #[test]
-fn tool_name_in_line_extracts_literal_names() {
+fn source_scan_extracts_literal_names() {
     assert_eq!(
-        tool_name_in_line("    #[astrid::tool(\"reverse_text\")]"),
-        Some("reverse_text".into())
-    );
-    // Extra args after the name (e.g. `mutable`) don't matter.
-    assert_eq!(
-        tool_name_in_line("#[astrid::tool(\"upcase\", mutable)]"),
-        Some("upcase".into())
-    );
-    // Whitespace between `tool` and `(` is tolerated.
-    assert_eq!(
-        tool_name_in_line("#[astrid::tool (\"spaced\")]"),
-        Some("spaced".into())
+        tool_names_in_source(
+            r#"
+            #[astrid::tool("reverse_text")]
+            fn reverse_text() {}
+
+            #[astrid::tool("upcase", mutable)]
+            fn upcase() {}
+            "#,
+        ),
+        names(&["reverse_text", "upcase"]),
     );
 }
 
 #[test]
-fn tool_name_in_line_ignores_non_tool_and_commented() {
-    // Commented-out attribute is inert.
-    assert_eq!(tool_name_in_line("// #[astrid::tool(\"nope\")]"), None);
-    // A different symbol that merely has `astrid::tool` as a prefix.
-    assert_eq!(
-        tool_name_in_line("let x = astrid::tool_helper(\"nope\");"),
-        None
-    );
-    // The auto-generated describe endpoint is not a tool.
-    assert_eq!(tool_name_in_line("astrid::tool_describe()"), None);
-    // No string argument.
-    assert_eq!(tool_name_in_line("#[astrid::tool()]"), None);
-    // Unrelated line.
-    assert_eq!(tool_name_in_line("fn reverse(s: &str) -> String {"), None);
+fn source_scan_ignores_comments_calls_and_embedded_templates() {
+    let source = r##"
+        // #[astrid::tool("line_comment")]
+        /* #[astrid::tool("block_comment")] */
+        const ORDINARY: &str = "#[astrid::tool(\"ordinary_string\")]";
+        const TEMPLATE: &str = r#"
+            #[astrid::tool("raw_string")]
+            fn example() {}
+        "#;
+
+        fn unrelated() {
+            astrid::tool_helper("helper_call");
+            astrid::tool_describe();
+        }
+
+        #[astrid::tool("real_tool")]
+        fn real_tool() {}
+    "##;
+
+    assert_eq!(tool_names_in_source(source), names(&["real_tool"]));
 }
 
 // ── ruleset ────────────────────────────────────────────────────────────

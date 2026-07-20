@@ -18,6 +18,10 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
 
 ### Fixed
 
+- **`astrid capsule check` no longer treats embedded Rust examples as live
+  tools.** The scanner now parses Rust attributes instead of matching source
+  text, so scaffold templates and documentation strings cannot create phantom
+  unrouted-tool failures.
 - **Interrupted immutable-release drafts recover without replacing uploaded
   assets.** Release uploads are sequential, and reruns authenticate every
   existing payload and signature before adding only the missing files. Closes
