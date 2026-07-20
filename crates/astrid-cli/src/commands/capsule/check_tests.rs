@@ -40,7 +40,8 @@ fn source_scan_extracts_literal_names() {
             #[astrid::tool("upcase", mutable)]
             fn upcase() {}
             "#,
-        ),
+        )
+        .unwrap(),
         names(&["reverse_text", "upcase"]),
     );
 }
@@ -65,7 +66,13 @@ fn source_scan_ignores_comments_calls_and_embedded_templates() {
         fn real_tool() {}
     "##;
 
-    assert_eq!(tool_names_in_source(source), names(&["real_tool"]));
+    assert_eq!(tool_names_in_source(source).unwrap(), names(&["real_tool"]));
+}
+
+#[test]
+fn source_scan_fails_closed_on_unparseable_rust() {
+    let error = tool_names_in_source("fn incomplete(").unwrap_err();
+    assert!(!error.to_string().is_empty());
 }
 
 // ── ruleset ────────────────────────────────────────────────────────────
