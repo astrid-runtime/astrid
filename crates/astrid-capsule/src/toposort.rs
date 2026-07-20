@@ -228,6 +228,7 @@ mod tests {
             context_files: Vec::new(),
             commands: Vec::new(),
             mcp_servers: Vec::new(),
+            skills: Vec::new(),
             uplinks: Vec::new(),
             publishes: ::std::collections::HashMap::new(),
             subscribes: ::std::collections::HashMap::new(),

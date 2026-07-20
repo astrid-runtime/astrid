@@ -47,6 +47,7 @@ fn make_manifest(net: Vec<&str>, fs_read: Vec<&str>, fs_write: Vec<&str>) -> Cap
         context_files: vec![],
         commands: vec![],
         mcp_servers: vec![],
+        skills: vec![],
         uplinks: vec![],
         publishes: ::std::collections::HashMap::new(),
         subscribes: ::std::collections::HashMap::new(),

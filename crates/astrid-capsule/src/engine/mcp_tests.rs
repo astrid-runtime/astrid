@@ -57,6 +57,7 @@ mod tests {
                 command: Some(command.to_string()),
                 args: vec![],
             }],
+            skills: vec![],
             commands: vec![],
             uplinks: vec![],
             publishes: ::std::collections::HashMap::new(),

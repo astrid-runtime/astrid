@@ -86,6 +86,13 @@ pub struct CapsuleManifest {
     /// MCP servers this capsule exposes.
     #[serde(default, rename = "mcp_server")]
     pub mcp_servers: Vec<McpServerDef>,
+    /// Source-compatibility field retained for callers that construct manifests.
+    ///
+    /// Astrid does not deserialize, serialize, package, or interpret this field.
+    /// Agent Skills are user-space assets rather than a capsule manifest
+    /// protocol. New code should leave it empty.
+    #[serde(skip)]
+    pub skills: Vec<SkillDef>,
     /// Uplinks this capsule provides (e.g. Telegram, CLI).
     #[serde(default, rename = "uplink")]
     pub uplinks: Vec<UplinkDef>,
@@ -611,6 +618,20 @@ pub struct McpServerDef {
     pub args: Vec<String>,
 }
 
+/// Source-compatibility shape for the former manifest Skill declaration.
+///
+/// This type has no manifest or runtime semantics. It remains public only so
+/// downstream Rust code compiled against the previous API does not break.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SkillDef {
+    /// Name of the legacy Skill declaration.
+    pub name: String,
+    /// Description carried by the legacy declaration.
+    pub description: Option<String>,
+    /// Former asset path, no longer interpreted by Astrid.
+    pub file: PathBuf,
+}
+
 /// An uplink provided by the capsule (e.g., Telegram, CLI).
 ///
 /// This allows the LLM agent to route messages out to a specific platform.
@@ -717,5 +738,26 @@ description = "Base URL"
 "#;
         let def: EnvDef = toml::from_str(toml_src).unwrap();
         assert!(def.options_from.is_none());
+    }
+
+    #[test]
+    fn legacy_skill_declarations_have_no_manifest_semantics() {
+        let manifest: CapsuleManifest = toml::from_str(
+            r#"
+[package]
+name = "legacy-skill"
+version = "1.0.0"
+
+[[skill]]
+name = "ignored"
+file = "skills/ignored/SKILL.md"
+"#,
+        )
+        .unwrap();
+
+        assert!(manifest.skills.is_empty());
+        let encoded = toml::to_string(&manifest).unwrap();
+        assert!(!encoded.contains("[[skill]]"));
+        assert!(!encoded.contains("skills/ignored/SKILL.md"));
     }
 }

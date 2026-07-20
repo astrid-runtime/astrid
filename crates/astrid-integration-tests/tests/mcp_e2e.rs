@@ -56,6 +56,7 @@ async fn test_mcp_host_engine_capability_validation() {
             command: Some("python3".into()), // "python3" is NOT allowed
             args: vec!["server.py".into()],
         }],
+        skills: vec![],
         uplinks: vec![],
         publishes: ::std::collections::HashMap::new(),
         subscribes: ::std::collections::HashMap::new(),

@@ -76,6 +76,7 @@ impl TestCapsule {
                     context_files: Vec::new(),
                     commands: Vec::new(),
                     mcp_servers: Vec::new(),
+                    skills: Vec::new(),
                     uplinks: Vec::new(),
                     publishes: HashMap::new(),
                     subscribes,
