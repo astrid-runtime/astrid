@@ -228,12 +228,13 @@ fn print_report(tool_count: usize, findings: &[Finding]) {
     );
 }
 
-/// Collect the tool names declared by `#[astrid::tool("…")]` under `src_dir`.
+/// Collect the tool names declared by `#[astrid::tool]` under `src_dir`.
 ///
 /// Static source scan (no build): recurses `src/`, reads each `.rs` file, and
-/// extracts the first string argument of each `astrid::tool(` attribute. A
-/// source read or parse failure aborts the check: silently returning a partial
-/// tool inventory would let wiring errors pass CI.
+/// uses an explicit string argument when present or infers the enclosing
+/// function name for bare and empty attributes. A source read or parse failure
+/// aborts the check: silently returning a partial tool inventory would let
+/// wiring errors pass CI.
 fn scan_tool_annotations(src_dir: &Path) -> Result<Vec<String>> {
     let mut names = Vec::new();
     for path in rs_files(src_dir)? {
