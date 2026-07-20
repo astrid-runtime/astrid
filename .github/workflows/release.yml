@@ -381,7 +381,6 @@ jobs:
           echo "EXISTING_RELEASE=1" >> "$GITHUB_ENV"
 
       - name: Attest release provenance
-        if: env.EXISTING_RELEASE != '1'
         uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
         with:
           subject-path: |
@@ -394,7 +393,6 @@ jobs:
         uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
 
       - name: Sign release assets
-        if: env.EXISTING_RELEASE != '1'
         env:
           COSIGN_YES: "true"
         run: |
@@ -409,30 +407,6 @@ jobs:
           EXPECTED_PRERELEASE: ${{ needs.classify.outputs.nightly }}
         run: |
           CANDIDATE="$GITHUB_WORKSPACE/artifacts"
-          if [[ "$EXISTING_RELEASE" == 1 ]]; then
-            CANDIDATE="$RUNNER_TEMP/existing-release-assets"
-            RELEASES="$RUNNER_TEMP/releases-candidate.json"
-            MATCHING_RELEASE="$RUNNER_TEMP/matching-release.json"
-            gh api "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
-              --paginate --slurp > "$RELEASES"
-            jq --arg tag "$GITHUB_REF_NAME" \
-              '[.[][] | select(.tag_name == $tag)]' "$RELEASES" > "$MATCHING_RELEASE"
-            jq -e --argjson prerelease "$EXPECTED_PRERELEASE" \
-              'length == 1 and .[0].draft == true and .[0].prerelease == $prerelease and .[0].published_at == null' \
-              "$MATCHING_RELEASE" >/dev/null
-            RELEASE_ID=$(jq -er '.[0].id' "$MATCHING_RELEASE")
-            echo "SELECTED_RELEASE_ID=$RELEASE_ID" >> "$GITHUB_ENV"
-            ASSETS="$RUNNER_TEMP/existing-release-assets.json"
-            gh api "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID/assets?per_page=100" \
-              --paginate --slurp > "$ASSETS"
-            jq -e '[.[][]] | all(.state == "uploaded" and .size > 0)' "$ASSETS" >/dev/null
-            jq -e '[.[][]] as $assets | ([$assets[].name] | unique | length) == ($assets | length)' \
-              "$ASSETS" >/dev/null
-            mkdir "$CANDIDATE"
-            gh release download "$GITHUB_REF_NAME" \
-              --repo "$GITHUB_REPOSITORY" \
-              --dir "$CANDIDATE"
-          fi
           PAYLOADS="$RUNNER_TEMP/release-payloads.txt"
           python3 scripts/release_publication.py \
             --artifacts "$CANDIDATE" \
@@ -454,6 +428,84 @@ jobs:
               --use-signed-timestamps \
               "$CANDIDATE/$asset"
           done < "$PAYLOADS"
+
+          if [[ "$EXISTING_RELEASE" == 1 ]]; then
+            RELEASES="$RUNNER_TEMP/releases-candidate.json"
+            MATCHING_RELEASE="$RUNNER_TEMP/matching-release.json"
+            gh api "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
+              --paginate --slurp > "$RELEASES"
+            jq --arg tag "$GITHUB_REF_NAME" \
+              '[.[][] | select(.tag_name == $tag)]' "$RELEASES" > "$MATCHING_RELEASE"
+            jq -e --argjson prerelease "$EXPECTED_PRERELEASE" \
+              --arg tag "$GITHUB_REF_NAME" \
+              'length == 1 and .[0].draft == true and .[0].prerelease == $prerelease and .[0].published_at == null and .[0].name == $tag' \
+              "$MATCHING_RELEASE" >/dev/null
+            jq -e --rawfile notes release-notes.md \
+              'length == 1 and .[0].body == $notes' "$MATCHING_RELEASE" >/dev/null
+            RELEASE_ID=$(jq -er '.[0].id' "$MATCHING_RELEASE")
+            echo "SELECTED_RELEASE_ID=$RELEASE_ID" >> "$GITHUB_ENV"
+
+            ASSETS="$RUNNER_TEMP/existing-release-assets.json"
+            gh api "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID/assets?per_page=100" \
+              --paginate --slurp > "$ASSETS"
+            jq -e '[.[][]] | all(.state == "uploaded" and .size > 0)' "$ASSETS" >/dev/null
+            jq -e '[.[][]] as $assets | ([$assets[].name] | unique | length) == ($assets | length)' \
+              "$ASSETS" >/dev/null
+            EXISTING="$RUNNER_TEMP/existing-release-assets"
+            mkdir "$EXISTING"
+            if jq -e '[.[][]] | length > 0' "$ASSETS" >/dev/null; then
+              gh release download "$GITHUB_REF_NAME" \
+                --repo "$GITHUB_REPOSITORY" \
+                --dir "$EXISTING"
+            fi
+            MISSING="$RUNNER_TEMP/missing-release-assets.txt"
+            EXISTING_BUNDLES="$RUNNER_TEMP/existing-release-bundles.txt"
+            python3 scripts/release_draft_recovery.py \
+              --candidate "$CANDIDATE" \
+              --existing "$EXISTING" \
+              --payloads "$PAYLOADS" \
+              --missing-output "$MISSING" \
+              --existing-bundles-output "$EXISTING_BUNDLES"
+            while IFS= read -r bundle; do
+              [[ -n "$bundle" ]] || continue
+              asset="${bundle%.sigstore.json}"
+              cosign verify-blob \
+                --bundle "$EXISTING/$bundle" \
+                --certificate-identity "$IDENTITY" \
+                --certificate-oidc-issuer "$ISSUER" \
+                --use-signed-timestamps \
+                "$CANDIDATE/$asset"
+            done < "$EXISTING_BUNDLES"
+            while IFS= read -r asset; do
+              [[ -n "$asset" ]] || continue
+              gh release upload "$GITHUB_REF_NAME" "$CANDIDATE/$asset" \
+                --repo "$GITHUB_REPOSITORY"
+            done < "$MISSING"
+
+            CANDIDATE="$RUNNER_TEMP/recovered-release-assets"
+            mkdir "$CANDIDATE"
+            gh release download "$GITHUB_REF_NAME" \
+              --repo "$GITHUB_REPOSITORY" \
+              --dir "$CANDIDATE"
+            python3 scripts/release_publication.py \
+              --artifacts "$CANDIDATE" \
+              --version "$VERSION" \
+              --source-commit "$SOURCE_COMMIT" \
+              --contracts-commit "$CONTRACTS_COMMIT" > "$PAYLOADS"
+            (
+              cd "$CANDIDATE"
+              b3sum --check BLAKE3SUMS.txt
+              sha256sum --check SHA256SUMS.txt
+            )
+            while IFS= read -r asset; do
+              cosign verify-blob \
+                --bundle "$CANDIDATE/${asset}.sigstore.json" \
+                --certificate-identity "$IDENTITY" \
+                --certificate-oidc-issuer "$ISSUER" \
+                --use-signed-timestamps \
+                "$CANDIDATE/$asset"
+            done < "$PAYLOADS"
+          fi
           echo "CANDIDATE=$CANDIDATE" >> "$GITHUB_ENV"
 
       - name: Verify release archives with the native updater policy
@@ -519,6 +571,7 @@ jobs:
           prerelease: ${{ needs.classify.outputs.nightly == 'true' }}
           make_latest: false
           overwrite_files: false
+          preserve_order: true
           fail_on_unmatched_files: true
           files: |
             artifacts/*.tar.gz

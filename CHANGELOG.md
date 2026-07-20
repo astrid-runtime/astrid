@@ -9,6 +9,13 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Interrupted immutable-release drafts recover without replacing uploaded
+  assets.** Release uploads are sequential, and reruns authenticate every
+  existing payload and signature before adding only the missing files. Closes
+  #1285.
+
 ## [0.10.3] - 2026-07-20
 
 ### Fixed
