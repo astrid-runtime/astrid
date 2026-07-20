@@ -403,7 +403,9 @@ async fn dispatch_capsule(command: crate::cli::CapsuleCommands) -> Result<ExitCo
 
 async fn dispatch_mcp(command: McpCommands) -> Result<ExitCode> {
     match command {
-        McpCommands::Serve => commands::mcp::serve(None).await,
+        McpCommands::Serve { request_timeout } => {
+            commands::mcp::serve(None, request_timeout.as_deref()).await
+        },
     }
 }
 

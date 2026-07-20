@@ -48,6 +48,7 @@ mod watch;
 
 use std::process::ExitCode;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use rmcp::ServiceExt;
@@ -56,6 +57,25 @@ use tracing::info;
 use uuid::Uuid;
 
 use server::AstridMcpServer;
+
+const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(55);
+const MIN_REQUEST_TIMEOUT: Duration = Duration::from_secs(1);
+// The runtime caps one principal invocation at 24 hours. Five minutes of
+// shim-side headroom lets a broker configured near that ceiling still return
+// its terminal timeout reply instead of losing it at the stdio boundary.
+const MAX_REQUEST_TIMEOUT: Duration = Duration::from_mins(1_445);
+
+fn resolve_request_timeout(value: Option<&str>) -> Result<Duration> {
+    let Some(value) = value else {
+        return Ok(DEFAULT_REQUEST_TIMEOUT);
+    };
+    let timeout = crate::commands::quota::parse_duration(value)
+        .with_context(|| format!("invalid --request-timeout value '{value}'"))?;
+    if !(MIN_REQUEST_TIMEOUT..=MAX_REQUEST_TIMEOUT).contains(&timeout) {
+        anyhow::bail!("--request-timeout must be between 1s and 1d5m (received '{value}')");
+    }
+    Ok(timeout)
+}
 
 /// Refuse to serve the MCP bridge silently as the no-capability `anonymous`
 /// identity.
@@ -107,7 +127,11 @@ fn broker_readiness_required(caller: &astrid_core::PrincipalId) -> bool {
 ///
 /// Returns an error if the daemon socket is unreachable, the principal
 /// is invalid, or the MCP transport fails to initialize.
-pub(crate) async fn serve(principal: Option<&str>) -> Result<ExitCode> {
+pub(crate) async fn serve(
+    principal: Option<&str>,
+    request_timeout: Option<&str>,
+) -> Result<ExitCode> {
+    let request_timeout = resolve_request_timeout(request_timeout)?;
     // The subcommand `--principal` is an explicit per-invocation
     // override; when absent, fall back to the process-wide principal
     // (the global `--principal` / `ASTRID_PRINCIPAL`, already validated
@@ -157,7 +181,11 @@ pub(crate) async fn serve(principal: Option<&str>) -> Result<ExitCode> {
 
     tokio::spawn(session_guard::run(caller.clone()));
 
-    let server = AstridMcpServer::new(Arc::new(Mutex::new(client)), caller.clone());
+    let server = AstridMcpServer::new(
+        Arc::new(Mutex::new(client)),
+        caller.clone(),
+        request_timeout,
+    );
 
     // `rmcp::transport::stdio()` yields the (stdin, stdout) pair the MCP
     // transport drives. `serve` performs the MCP handshake and spawns the
@@ -210,8 +238,35 @@ pub(crate) async fn serve(principal: Option<&str>) -> Result<ExitCode> {
 
 #[cfg(test)]
 mod fail_loud_tests {
-    use super::{broker_readiness_required, require_authenticated_unless_anonymous};
+    use super::{
+        DEFAULT_REQUEST_TIMEOUT, MAX_REQUEST_TIMEOUT, broker_readiness_required,
+        require_authenticated_unless_anonymous, resolve_request_timeout,
+    };
     use astrid_core::PrincipalId;
+    use std::time::Duration;
+
+    #[test]
+    fn request_timeout_defaults_and_parses_human_durations() {
+        assert_eq!(
+            resolve_request_timeout(None).unwrap(),
+            DEFAULT_REQUEST_TIMEOUT
+        );
+        assert_eq!(
+            resolve_request_timeout(Some("5m")).unwrap(),
+            Duration::from_mins(5)
+        );
+        assert_eq!(
+            resolve_request_timeout(Some("1d5m")).unwrap(),
+            MAX_REQUEST_TIMEOUT
+        );
+    }
+
+    #[test]
+    fn request_timeout_rejects_zero_malformed_and_over_cap_values() {
+        assert!(resolve_request_timeout(Some("0")).is_err());
+        assert!(resolve_request_timeout(Some("forever")).is_err());
+        assert!(resolve_request_timeout(Some("1d5m1s")).is_err());
+    }
 
     #[test]
     fn authenticated_principal_is_allowed() {

@@ -473,7 +473,13 @@ pub(crate) enum McpCommands {
     /// Long-running: serves on stdin/stdout until the client closes the
     /// stream (EOF) or the process is killed. Stdout carries the MCP
     /// JSON-RPC protocol only — all diagnostics go to stderr.
-    Serve,
+    Serve {
+        /// Maximum time to await one broker round trip (for example `55s`,
+        /// `5m`, or `2h`). Configure this above the broker capsule's tool
+        /// execution timeout and below the launching client's own deadline.
+        #[arg(long, value_name = "DURATION")]
+        request_timeout: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
