@@ -32,7 +32,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.10.3"
+version = "0.10.4"
 edition = "2024"
 authors = ["Joshua J. Bouw <dev@joshuajbouw.com>", "Unicity Labs <info@unicity-labs.com>"]
 license = "MIT OR Apache-2.0"
@@ -40,32 +40,32 @@ repository = "https://github.com/astrid-runtime/astrid"
 rust-version = "1.95"
 
 [workspace.dependencies]
-astrid-approval = { path = "crates/astrid-approval", version = "0.10.3" }
-astrid-audit = { path = "crates/astrid-audit", version = "0.10.3" }
-astrid-capabilities = { path = "crates/astrid-capabilities", version = "0.10.3" }
-astrid-build = { path = "crates/astrid-build", version = "0.10.3" }
-astrid-capsule = { path = "crates/astrid-capsule", version = "0.10.3" }
-astrid-capsule-install = { path = "crates/astrid-capsule-install", version = "0.10.3" }
-astrid-capsule-types = { path = "crates/astrid-capsule-types", version = "0.10.3" }
-astrid-config = { path = "crates/astrid-config", version = "0.10.3" }
-astrid-daemon = { path = "crates/astrid-daemon", version = "0.10.3" }
-astrid-core = { path = "crates/astrid-core", version = "0.10.3" }
-astrid-crypto = { path = "crates/astrid-crypto", version = "0.10.3" }
-astrid-emit = { path = "crates/astrid-emit", version = "0.10.3" }
-astrid-events = { path = "crates/astrid-events", version = "0.10.3" }
-astrid-hooks = { path = "crates/astrid-hooks", version = "0.10.3" }
-astrid-kernel = { path = "crates/astrid-kernel", version = "0.10.3" }
-astrid-mcp = { path = "crates/astrid-mcp", version = "0.10.3" }
-astrid-prelude = { path = "crates/astrid-prelude", version = "0.10.3" }
-astrid-runtime = { path = "crates/astrid-runtime", version = "0.10.3" }
-astrid-storage = { path = "crates/astrid-storage", version = "0.10.3" }
-astrid-telemetry = { path = "crates/astrid-telemetry", version = "0.10.3" }
+astrid-approval = { path = "crates/astrid-approval", version = "0.10.4" }
+astrid-audit = { path = "crates/astrid-audit", version = "0.10.4" }
+astrid-capabilities = { path = "crates/astrid-capabilities", version = "0.10.4" }
+astrid-build = { path = "crates/astrid-build", version = "0.10.4" }
+astrid-capsule = { path = "crates/astrid-capsule", version = "0.10.4" }
+astrid-capsule-install = { path = "crates/astrid-capsule-install", version = "0.10.4" }
+astrid-capsule-types = { path = "crates/astrid-capsule-types", version = "0.10.4" }
+astrid-config = { path = "crates/astrid-config", version = "0.10.4" }
+astrid-daemon = { path = "crates/astrid-daemon", version = "0.10.4" }
+astrid-core = { path = "crates/astrid-core", version = "0.10.4" }
+astrid-crypto = { path = "crates/astrid-crypto", version = "0.10.4" }
+astrid-emit = { path = "crates/astrid-emit", version = "0.10.4" }
+astrid-events = { path = "crates/astrid-events", version = "0.10.4" }
+astrid-hooks = { path = "crates/astrid-hooks", version = "0.10.4" }
+astrid-kernel = { path = "crates/astrid-kernel", version = "0.10.4" }
+astrid-mcp = { path = "crates/astrid-mcp", version = "0.10.4" }
+astrid-prelude = { path = "crates/astrid-prelude", version = "0.10.4" }
+astrid-runtime = { path = "crates/astrid-runtime", version = "0.10.4" }
+astrid-storage = { path = "crates/astrid-storage", version = "0.10.4" }
+astrid-telemetry = { path = "crates/astrid-telemetry", version = "0.10.4" }
 astrid-test = { path = "crates/astrid-test" }
-astrid-types = { path = "crates/astrid-types", version = "0.10.3", features = ["clock"] }
-astrid-uplink = { path = "crates/astrid-uplink", version = "0.10.3" }
-astrid-gateway = { path = "crates/astrid-gateway", version = "0.10.3" }
-astrid-vfs = { path = "crates/astrid-vfs", version = "0.10.3" }
-astrid-workspace = { path = "crates/astrid-workspace", version = "0.10.3" }
+astrid-types = { path = "crates/astrid-types", version = "0.10.4", features = ["clock"] }
+astrid-uplink = { path = "crates/astrid-uplink", version = "0.10.4" }
+astrid-gateway = { path = "crates/astrid-gateway", version = "0.10.4" }
+astrid-vfs = { path = "crates/astrid-vfs", version = "0.10.4" }
+astrid-workspace = { path = "crates/astrid-workspace", version = "0.10.4" }
 anyhow = "1.0"
 arboard = "3"
 arc-swap = "1.7"
