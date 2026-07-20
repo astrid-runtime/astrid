@@ -51,6 +51,7 @@ if grep -Fq 'CARGO_REGISTRY_TOKEN' "$release_workflow" || \
 fi
 grep -Fq "if: github.ref == 'refs/heads/main' && inputs.channel == 'stable'" "$workflow"
 grep -Fq 'uses: ./.github/workflows/publish-stable-crates.yml' "$workflow"
+grep -A8 -F 'publish-stable-crates:' "$workflow" | grep -Fq 'actions: read'
 if grep -Fq 'secrets: inherit' "$workflow"; then
   echo "stable crates publication must not inherit unrelated caller secrets" >&2
   exit 1
@@ -64,7 +65,9 @@ fi
 grep -Fq 'environment: release' "$stable_crates_workflow"
 grep -Fq "if: github.ref == 'refs/heads/main'" "$stable_crates_workflow"
 grep -Fq -- '--expected-channel dev' "$stable_crates_workflow"
+grep -Fq 'CARGO_REGISTRY_TOKEN:' "$stable_crates_workflow"
 grep -Fq 'secrets.CARGO_REGISTRY_TOKEN' "$stable_crates_workflow"
+grep -Fq 'CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}' "$workflow"
 grep -Fq 'scripts/publish_crates_io.sh' "$stable_crates_workflow"
 grep -Fq 'python3 "$script_root/crate_publication.py"' "$stable_crates_script"
 grep -Fq 'crates.io publication requires a canonical X.Y.Z version' "$stable_crates_script"

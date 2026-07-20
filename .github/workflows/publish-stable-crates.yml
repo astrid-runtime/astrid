@@ -7,6 +7,10 @@ on:
         description: Immutable canonical release already selected by the dev channel
         required: true
         type: string
+    secrets:
+      CARGO_REGISTRY_TOKEN:
+        description: Optional caller token; the protected release environment supplies the publishing credential
+        required: false
 
 permissions:
   contents: read
