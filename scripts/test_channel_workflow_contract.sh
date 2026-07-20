@@ -68,6 +68,9 @@ grep -Fq -- '--expected-channel dev' "$stable_crates_workflow"
 grep -Fq 'CARGO_REGISTRY_TOKEN:' "$stable_crates_workflow"
 grep -Fq 'secrets.CARGO_REGISTRY_TOKEN' "$stable_crates_workflow"
 grep -Fq 'cargo install b3sum --version 1.8.5 --locked' "$stable_crates_workflow"
+stable_toolchain_line=$(grep -n 'uses: dtolnay/rust-toolchain@' "$stable_crates_workflow" | cut -d: -f1)
+stable_b3sum_line=$(grep -n 'cargo install b3sum --version 1.8.5 --locked' "$stable_crates_workflow" | cut -d: -f1)
+[[ "$stable_toolchain_line" -lt "$stable_b3sum_line" ]]
 grep -Fq 'CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}' "$workflow"
 grep -Fq 'scripts/publish_crates_io.sh' "$stable_crates_workflow"
 grep -Fq 'python3 "$script_root/crate_publication.py"' "$stable_crates_script"
