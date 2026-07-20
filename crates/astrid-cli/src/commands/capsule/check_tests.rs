@@ -39,10 +39,18 @@ fn source_scan_extracts_literal_names() {
 
             #[astrid::tool("upcase", mutable)]
             fn upcase() {}
+
+            #[astrid::tool]
+            fn inferred_name() {}
+
+            impl Tools {
+                #[astrid::tool]
+                fn inferred_method(&self) {}
+            }
             "#,
         )
         .unwrap(),
-        names(&["reverse_text", "upcase"]),
+        names(&["reverse_text", "upcase", "inferred_name", "inferred_method",]),
     );
 }
 

@@ -7,6 +7,61 @@ use std::path::{Path, PathBuf};
 use tracing::{info, warn};
 
 const LARGE_ARCHIVE_BYTES: u64 = 50 * 1024 * 1024; // 50 MB
+const OPAQUE_ASSET_DIRS: &[&str] = &["assets", "skills"];
+
+/// Find files under conventional opaque asset directories without assigning
+/// them manifest or runtime semantics.
+///
+/// `assets/` is the generic surface. `skills/` remains packable as opaque data
+/// so existing capsule sources do not lose files when the old `[[skill]]`
+/// protocol is removed. Symlinks are rejected so recursive discovery cannot
+/// escape the capsule source tree.
+pub(crate) fn discover_opaque_assets(base_dir: &Path) -> Result<Vec<PathBuf>> {
+    let mut files = Vec::new();
+    for name in OPAQUE_ASSET_DIRS {
+        let root = base_dir.join(name);
+        let metadata = match fs::symlink_metadata(&root) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("Failed to inspect asset path: {}", root.display()));
+            },
+        };
+        if metadata.file_type().is_symlink() {
+            anyhow::bail!(
+                "opaque capsule asset directories cannot be symlinks: {}",
+                root.display()
+            );
+        }
+        if !metadata.is_dir() {
+            anyhow::bail!("opaque asset path must be a directory: {}", root.display());
+        }
+        let mut pending = vec![root];
+        while let Some(dir) = pending.pop() {
+            for entry in fs::read_dir(&dir)
+                .with_context(|| format!("Failed to read asset directory: {}", dir.display()))?
+            {
+                let entry = entry?;
+                let path = entry.path();
+                let file_type = entry.file_type()?;
+                if file_type.is_symlink() {
+                    anyhow::bail!(
+                        "opaque capsule assets cannot be symlinks: {}",
+                        path.display()
+                    );
+                }
+                if file_type.is_dir() {
+                    pending.push(path);
+                } else if file_type.is_file() {
+                    files.push(path);
+                }
+            }
+        }
+    }
+    files.sort();
+    Ok(files)
+}
 
 /// Packages a set of files and directories into a single `.capsule` (tar.gz) archive.
 pub(crate) fn pack_capsule_archive(
@@ -57,7 +112,7 @@ pub(crate) fn pack_capsule_archive(
         }
     }
 
-    // 3. Append any additional contextual files (like READMEs or command files).
+    // 3. Append additional contextual and opaque asset files.
     // Use a cycle-safe recursive walk instead of tar's append_dir_all, because
     // follow_symlinks(true) + append_dir_all has no cycle detection — a symlink
     // pointing to an ancestor directory would cause infinite recursion and OOM.
@@ -170,4 +225,56 @@ fn append_dir_recursive(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn opaque_assets_are_packaged_without_manifest_metadata() {
+        let source = tempfile::tempdir().unwrap();
+        let assets = source.path().join("assets/reference.txt");
+        let skill = source.path().join("skills/example/SKILL.md");
+        fs::create_dir_all(assets.parent().unwrap()).unwrap();
+        fs::create_dir_all(skill.parent().unwrap()).unwrap();
+        fs::write(&assets, "reference").unwrap();
+        fs::write(&skill, "# Example").unwrap();
+
+        let files = discover_opaque_assets(source.path()).unwrap();
+        assert_eq!(files, vec![assets, skill]);
+
+        let archive_path = source.path().join("example.capsule");
+        let manifest = "[package]\nname = \"example\"\nversion = \"1.0.0\"\n";
+        let refs: Vec<&Path> = files.iter().map(PathBuf::as_path).collect();
+        pack_capsule_archive(&archive_path, manifest, None, source.path(), &refs, None).unwrap();
+
+        let decoder = flate2::read::GzDecoder::new(File::open(archive_path).unwrap());
+        let mut archive = tar::Archive::new(decoder);
+        let entries: Vec<PathBuf> = archive
+            .entries()
+            .unwrap()
+            .map(|entry| entry.unwrap().path().unwrap().into_owned())
+            .collect();
+        assert!(entries.contains(&PathBuf::from("assets/reference.txt")));
+        assert!(entries.contains(&PathBuf::from("skills/example/SKILL.md")));
+        assert!(!manifest.contains("[[skill]]"));
+    }
+
+    #[test]
+    #[cfg_attr(windows, ignore = "symlinks require elevated privileges on Windows")]
+    fn opaque_asset_symlinks_are_rejected() {
+        let source = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let assets = source.path().join("assets");
+        fs::create_dir(&assets).unwrap();
+        let link = assets.join("outside");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(outside.path(), &link).unwrap();
+        #[cfg(windows)]
+        std::os::windows::fs::symlink_dir(outside.path(), &link).unwrap();
+
+        let error = discover_opaque_assets(source.path()).unwrap_err();
+        assert!(error.to_string().contains("cannot be symlinks"));
+    }
 }

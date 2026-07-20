@@ -15,6 +15,8 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
   protocol.** Skills remain a user-space concern that agent runtimes can
   discover over IPC or advertise through product registries without teaching
   the Astrid kernel or generic capsule archive about an AI workflow format.
+  Builders still preserve files under `assets/` and legacy `skills/` as opaque,
+  symlink-free capsule data without generating manifest metadata.
 
 ### Fixed
 

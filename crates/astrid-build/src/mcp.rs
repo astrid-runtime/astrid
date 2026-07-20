@@ -1,7 +1,7 @@
 //! Legacy MCP/extension manifest converter — transforms `mcp.json` or
 //! `gemini-extension.json` into a `Capsule.toml` and packages it.
 
-use crate::archiver::pack_capsule_archive;
+use crate::archiver::{discover_opaque_assets, pack_capsule_archive};
 use anyhow::{Context, Result};
 use serde_json::Value;
 use std::fs;
@@ -79,9 +79,13 @@ pub(crate) fn convert(dir: &Path, json_filename: &str, output: Option<&str>) -> 
     // 6. Inject commands
     inject_commands(dir, &mut toml_doc, &mut additional_files);
 
+    // 7. Preserve user-space assets as opaque archive data. No manifest
+    // metadata is synthesized and Astrid assigns these files no semantics.
+    additional_files.extend(discover_opaque_assets(dir)?);
+
     let toml = toml_doc.to_string();
 
-    // 7. Pack the archive
+    // 8. Pack the archive
     let out_dir = match output {
         Some(p) => PathBuf::from(p),
         None => std::env::current_dir()?.join("dist"),

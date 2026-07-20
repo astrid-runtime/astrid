@@ -1,6 +1,6 @@
 //! Rust capsule builder — compiles a Rust crate to `wasm32-wasip2` and packages it.
 
-use crate::archiver::pack_capsule_archive;
+use crate::archiver::{discover_opaque_assets, pack_capsule_archive};
 use anyhow::{Context, Result, bail};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -51,6 +51,8 @@ pub(crate) fn build(dir: &Path, output: Option<&str>) -> Result<()> {
 
     let toml_content =
         build_manifest_content(dir, &wasm_path, &crate_name, &package_version, &wasm_name)?;
+    let assets = discover_opaque_assets(dir)?;
+    let asset_refs: Vec<&Path> = assets.iter().map(PathBuf::as_path).collect();
 
     let out_dir = resolve_output_dir(output)?;
     let out_file = out_dir.join(format!("{crate_name}.capsule"));
@@ -65,7 +67,7 @@ pub(crate) fn build(dir: &Path, output: Option<&str>) -> Result<()> {
         &toml_content,
         Some(&wasm_path),
         dir,
-        &[],
+        &asset_refs,
         wit_staging.as_deref(),
     )?;
 

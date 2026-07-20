@@ -24,7 +24,9 @@ use anyhow::{Context, Result};
 use astrid_capsule::ToolDescriptor;
 use astrid_capsule::manifest::{CapsuleManifest, InterceptorDef};
 use syn::visit::Visit;
-use syn::{Attribute, Expr, Lit, Token, punctuated::Punctuated};
+use syn::{
+    Attribute, Expr, ImplItemFn, ItemFn, Lit, Meta, Token, TraitItemFn, punctuated::Punctuated,
+};
 
 use crate::theme::Theme;
 
@@ -285,8 +287,8 @@ fn rs_files(dir: &Path) -> Result<Vec<PathBuf>> {
     Ok(out)
 }
 
-/// Parse Rust syntax and collect literal names from live
-/// `#[astrid::tool("name")]` attributes.
+/// Parse Rust syntax and collect explicit or inferred names from live
+/// `#[astrid::tool("name")]` and bare `#[astrid::tool]` attributes.
 ///
 /// Parsing the syntax tree is important here: Forge and other authoring tools
 /// embed example Rust source in string literals. A text scan mistakes those
@@ -304,34 +306,66 @@ struct ToolAttributeVisitor {
 }
 
 impl<'ast> Visit<'ast> for ToolAttributeVisitor {
-    fn visit_attribute(&mut self, attribute: &'ast Attribute) {
-        let mut segments = attribute.path().segments.iter();
-        let is_tool = segments
-            .next()
-            .is_some_and(|segment| segment.ident == "astrid")
-            && segments
-                .next()
-                .is_some_and(|segment| segment.ident == "tool")
-            && segments.next().is_none();
-        if !is_tool {
-            return;
-        }
+    fn visit_item_fn(&mut self, function: &'ast ItemFn) {
+        self.record_tool(&function.attrs, &function.sig.ident.to_string());
+        syn::visit::visit_item_fn(self, function);
+    }
 
-        let Ok(arguments) =
-            attribute.parse_args_with(Punctuated::<Expr, Token![,]>::parse_terminated)
-        else {
-            return;
-        };
-        let Some(Expr::Lit(literal)) = arguments.first() else {
-            return;
-        };
-        let Lit::Str(name) = &literal.lit else {
-            return;
-        };
-        let name = name.value();
-        if !name.is_empty() {
-            self.names.push(name);
+    fn visit_impl_item_fn(&mut self, function: &'ast ImplItemFn) {
+        self.record_tool(&function.attrs, &function.sig.ident.to_string());
+        syn::visit::visit_impl_item_fn(self, function);
+    }
+
+    fn visit_trait_item_fn(&mut self, function: &'ast TraitItemFn) {
+        self.record_tool(&function.attrs, &function.sig.ident.to_string());
+        syn::visit::visit_trait_item_fn(self, function);
+    }
+}
+
+impl ToolAttributeVisitor {
+    fn record_tool(&mut self, attributes: &[Attribute], inferred_name: &str) {
+        for attribute in attributes {
+            let Some(name) = tool_attribute_name(attribute, inferred_name) else {
+                continue;
+            };
+            if !name.is_empty() {
+                self.names.push(name);
+            }
         }
+    }
+}
+
+fn tool_attribute_name(attribute: &Attribute, inferred_name: &str) -> Option<String> {
+    let mut segments = attribute.path().segments.iter();
+    let is_tool = segments
+        .next()
+        .is_some_and(|segment| segment.ident == "astrid")
+        && segments
+            .next()
+            .is_some_and(|segment| segment.ident == "tool")
+        && segments.next().is_none();
+    if !is_tool {
+        return None;
+    }
+
+    match &attribute.meta {
+        Meta::Path(_) => Some(inferred_name.to_string()),
+        Meta::List(_) => {
+            let arguments = attribute
+                .parse_args_with(Punctuated::<Expr, Token![,]>::parse_terminated)
+                .ok()?;
+            if arguments.is_empty() {
+                return Some(inferred_name.to_string());
+            }
+            let Expr::Lit(literal) = arguments.first()? else {
+                return None;
+            };
+            let Lit::Str(name) = &literal.lit else {
+                return None;
+            };
+            Some(name.value())
+        },
+        Meta::NameValue(_) => None,
     }
 }
 
