@@ -145,6 +145,31 @@ fn load_compute_workers(
     Ok(Arc::new(workers))
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct InstancePoolPolicy {
+    single_store: bool,
+    reset_resources_on_return: bool,
+}
+
+/// Decide whether a capsule can use free checkout or must retain one Store.
+///
+/// A live host resource is a handle into one Store's resource table. Capsules
+/// that deliberately keep such handles between invocations must therefore use
+/// one serialized Store and retain its table. Compute resources remain bound
+/// to their opening principal at every host operation; retaining the table
+/// does not weaken that authority boundary.
+fn instance_pool_policy(
+    has_run_export: bool,
+    has_host_process: bool,
+    has_compute_workers: bool,
+) -> InstancePoolPolicy {
+    let retains_resources = has_host_process || has_compute_workers;
+    InstancePoolPolicy {
+        single_store: has_run_export || retains_resources,
+        reset_resources_on_return: !retains_resources,
+    }
+}
+
 /// Returns `true` when `workspace_root` sits inside a git work tree.
 ///
 /// A git-managed workspace must NOT use the in-process copy-on-write overlay:
@@ -196,9 +221,10 @@ pub struct WasmEngine {
     /// Store owned by `run_handle` and never go through this pool. The pool is
     /// dynamic: it warm-starts at `min_idle`, grows lazily toward the
     /// host-derived (operator-overridable) `instance_pool_size` max under load,
-    /// and idle-evicts back down. Capsules carved out via the `host_process`
-    /// capability are pinned to a single Store (live cross-invocation resource
-    /// handles must never move to a second Store).
+    /// and idle-evicts back down. Capsules that retain live host resources
+    /// between invocations (`host_process` or declared `compute-worker`
+    /// components) are pinned to a single Store because resource handles
+    /// cannot move to a second Store.
     pool: Option<pool::CapsuleInstancePool>,
     inbound_rx: Option<tokio::sync::mpsc::Receiver<astrid_core::InboundMessage>>,
     run_handle: Option<tokio::task::JoinHandle<()>>,
@@ -2098,17 +2124,26 @@ impl ExecutionEngine for WasmEngine {
                 ))
             })?;
 
-            // Dynamic-pool sizing. Run-loop and `host_process` capsules are
+            // Dynamic-pool sizing. Run-loop and persistent-resource capsules are
             // pinned to a single Store regardless of the configured pool max:
-            // run-loops own their dedicated Store; `host_process` capsules hold
-            // live resource handles across invocations and must never lease a
-            // second Store. Everyone else gets a dynamic pool that warm-starts
+            // run-loops own their dedicated Store; capsules using `host_process`
+            // or a declared compute worker hold live resource handles across
+            // invocations and must never lease a second Store. Everyone else
+            // gets a dynamic pool that warm-starts
             // at `min_idle`, grows lazily toward `instance_pool_size` under
             // load, and is trimmed back to `min_idle` when idle (issue #816,
             // replacing the old fixed `INSTANCE_POOL_SIZE`).
-            let is_single_store =
-                has_run_export || !manifest.capabilities.host_process.is_empty();
-            let (pool_max, pool_min_idle) = if is_single_store {
+            let has_host_process = !manifest.capabilities.host_process.is_empty();
+            let has_compute_workers = manifest
+                .components
+                .iter()
+                .any(|component| component.r#type == "compute-worker");
+            let pool_policy = instance_pool_policy(
+                has_run_export,
+                has_host_process,
+                has_compute_workers,
+            );
+            let (pool_max, pool_min_idle) = if pool_policy.single_store {
                 (1, 1)
             } else {
                 (
@@ -2140,7 +2175,8 @@ impl ExecutionEngine for WasmEngine {
                 pool_min_idle,
                 warm = initial_instances.len(),
                 has_run = has_run_export,
-                host_process = !manifest.capabilities.host_process.is_empty(),
+                host_process = has_host_process,
+                compute_workers = has_compute_workers,
                 "Instantiated capsule instance pool"
             );
 
@@ -2235,16 +2271,16 @@ impl ExecutionEngine for WasmEngine {
                 // Free-checkout pools tear down each returned instance's
                 // resource table so a cancelled/panicked invocation can't leak
                 // a live handle into the next (possibly different-principal)
-                // lease. The `host_process` carve-out (size 1) is the sole
-                // exception: it holds `ManagedProcess` handles across
-                // invocations, and never leases a second Store, so its table
-                // must persist. See `pool::clear_on_return`.
-                let reset_resources_on_return = manifest.capabilities.host_process.is_empty();
+                // lease. Persistent-resource capsules are the exception: they
+                // hold process or compute handles across invocations and never
+                // lease a second Store, so their table must persist. Compute
+                // handles are still principal-checked by every host operation.
+                // See `pool::clear_on_return`.
                 pool_opt = Some(pool::CapsuleInstancePool::new(
                     initial_instances,
                     pool_max,
                     pool_min_idle,
-                    reset_resources_on_return,
+                    pool_policy.reset_resources_on_return,
                     builder,
                     &cancel_token,
                 ));
@@ -3406,6 +3442,39 @@ fn wasm_exports_contain(name: &str, wasm_bytes: &[u8]) -> bool {
 mod tests {
     use super::*;
     use astrid_events::ipc::Topic;
+
+    #[test]
+    fn ordinary_interceptors_keep_free_checkout_and_reset_resources() {
+        assert_eq!(
+            instance_pool_policy(false, false, false),
+            InstancePoolPolicy {
+                single_store: false,
+                reset_resources_on_return: true,
+            }
+        );
+    }
+
+    #[test]
+    fn compute_workers_retain_one_store_and_its_resource_table() {
+        assert_eq!(
+            instance_pool_policy(false, false, true),
+            InstancePoolPolicy {
+                single_store: true,
+                reset_resources_on_return: false,
+            }
+        );
+    }
+
+    #[test]
+    fn host_process_retains_existing_single_store_behavior() {
+        assert_eq!(
+            instance_pool_policy(false, true, false),
+            InstancePoolPolicy {
+                single_store: true,
+                reset_resources_on_return: false,
+            }
+        );
+    }
 
     // ── git-managed workspace detection (gitoxide work-tree discovery) ──
     //

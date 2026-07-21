@@ -85,6 +85,48 @@ fn accounting(value: astrid_compute::GroupAccounting) -> Accounting {
     }
 }
 
+fn group_for_principal<'a>(
+    state: &'a HostState,
+    resource: &Resource<astrid_compute::ComputeGroup>,
+    operation: &str,
+) -> Result<&'a astrid_compute::ComputeGroup, ErrorCode> {
+    let group = state
+        .resource_table
+        .get(resource)
+        .map_err(|_| ErrorCode::Closed)?;
+    if group.principal() != &state.effective_principal() {
+        audit_compute(
+            state,
+            operation,
+            group.worker_id(),
+            HostAuditOutcome::Denied("compute group belongs to another principal"),
+        );
+        return Err(ErrorCode::CapabilityDenied);
+    }
+    Ok(group)
+}
+
+fn job_for_principal<'a>(
+    state: &'a HostState,
+    resource: &Resource<astrid_compute::ComputeJob>,
+    operation: &str,
+) -> Result<&'a astrid_compute::ComputeJob, ErrorCode> {
+    let job = state
+        .resource_table
+        .get(resource)
+        .map_err(|_| ErrorCode::Closed)?;
+    if job.principal() != &state.effective_principal() {
+        audit_compute(
+            state,
+            operation,
+            job.worker_id(),
+            HostAuditOutcome::Denied("compute job belongs to another principal"),
+        );
+        return Err(ErrorCode::CapabilityDenied);
+    }
+    Ok(job)
+}
+
 struct JobReadiness {
     job: astrid_compute::ComputeJob,
 }
@@ -188,10 +230,7 @@ impl compute::HostComputeGroup for HostState {
         &mut self,
         self_: Resource<astrid_compute::ComputeGroup>,
     ) -> Result<GroupInfo, ErrorCode> {
-        let group = self
-            .resource_table
-            .get(&self_)
-            .map_err(|_| ErrorCode::Closed)?;
+        let group = group_for_principal(self, &self_, "info")?;
         Ok(GroupInfo {
             worker: group.worker_id().to_owned(),
             mode: match group.mode() {
@@ -216,9 +255,7 @@ impl compute::HostComputeGroup for HostState {
         if usize::try_from(length).map_err(|_| ErrorCode::TooLarge)? > MAX_CONTROL_TRANSFER_BYTES {
             return Err(ErrorCode::TooLarge);
         }
-        self.resource_table
-            .get(&self_)
-            .map_err(|_| ErrorCode::Closed)?
+        group_for_principal(self, &self_, "read")?
             .read(offset, length)
             .map_err(map_error)
     }
@@ -232,9 +269,7 @@ impl compute::HostComputeGroup for HostState {
         if data.len() > MAX_CONTROL_TRANSFER_BYTES {
             return Err(ErrorCode::TooLarge);
         }
-        self.resource_table
-            .get(&self_)
-            .map_err(|_| ErrorCode::Closed)?
+        group_for_principal(self, &self_, "write")?
             .write(offset, &data)
             .map_err(map_error)
     }
@@ -244,9 +279,7 @@ impl compute::HostComputeGroup for HostState {
         self_: Resource<astrid_compute::ComputeGroup>,
         delta_pages: u32,
     ) -> Result<u32, ErrorCode> {
-        self.resource_table
-            .get(&self_)
-            .map_err(|_| ErrorCode::Closed)?
+        group_for_principal(self, &self_, "grow")?
             .grow(delta_pages)
             .map_err(map_error)
     }
@@ -256,10 +289,7 @@ impl compute::HostComputeGroup for HostState {
         self_: Resource<astrid_compute::ComputeGroup>,
         descriptor: WorkDescriptor,
     ) -> Result<Resource<astrid_compute::ComputeJob>, ErrorCode> {
-        let group = self
-            .resource_table
-            .get(&self_)
-            .map_err(|_| ErrorCode::Closed)?;
+        let group = group_for_principal(self, &self_, "submit")?;
         let worker = group.worker_id().to_owned();
         let job = match group.submit(astrid_compute::WorkDescriptor {
             offset: descriptor.offset,
@@ -292,10 +322,7 @@ impl compute::HostComputeGroup for HostState {
 
     fn cancel(&mut self, self_: Resource<astrid_compute::ComputeGroup>) -> Result<(), ErrorCode> {
         let worker = {
-            let group = self
-                .resource_table
-                .get(&self_)
-                .map_err(|_| ErrorCode::Closed)?;
+            let group = group_for_principal(self, &self_, "cancel")?;
             group.cancel();
             group.worker_id().to_owned()
         };
@@ -304,16 +331,16 @@ impl compute::HostComputeGroup for HostState {
     }
 
     fn drop(&mut self, rep: Resource<astrid_compute::ComputeGroup>) -> wasmtime::Result<()> {
-        let worker = self
-            .resource_table
-            .get(&Resource::new_borrow(rep.rep()))
-            .ok()
-            .map(|group: &astrid_compute::ComputeGroup| group.worker_id().to_owned());
+        let borrowed = Resource::new_borrow(rep.rep());
+        let Ok(group) = group_for_principal(self, &borrowed, "drop") else {
+            return Ok(());
+        };
+        let worker = group.worker_id().to_owned();
         let deleted = self
             .resource_table
             .delete::<astrid_compute::ComputeGroup>(Resource::new_own(rep.rep()))
             .is_ok();
-        if deleted && let Some(worker) = worker {
+        if deleted {
             audit_compute(self, "drop", &worker, HostAuditOutcome::Allowed);
         }
         Ok(())
@@ -325,10 +352,7 @@ impl compute::HostJob for HostState {
         &mut self,
         self_: Resource<astrid_compute::ComputeJob>,
     ) -> Result<JobStatus, ErrorCode> {
-        let job = self
-            .resource_table
-            .get(&self_)
-            .map_err(|_| ErrorCode::Closed)?;
+        let job = job_for_principal(self, &self_, "job-status")?;
         Ok(JobStatus {
             state: job_state(job.state()),
             worker_index: job.worker_index(),
@@ -336,7 +360,7 @@ impl compute::HostJob for HostState {
     }
 
     fn subscribe(&mut self, self_: Resource<astrid_compute::ComputeJob>) -> Resource<DynPollable> {
-        let Ok(job) = self.resource_table.get(&self_).cloned() else {
+        let Ok(job) = job_for_principal(self, &self_, "job-subscribe").cloned() else {
             return super::stubs::always_ready_pollable(&mut self.resource_table);
         };
         let Ok(readiness) = self.resource_table.push(JobReadiness { job }) else {
@@ -350,11 +374,7 @@ impl compute::HostJob for HostState {
         &mut self,
         self_: Resource<astrid_compute::ComputeJob>,
     ) -> Result<JobResult, ErrorCode> {
-        let job = self
-            .resource_table
-            .get(&self_)
-            .map_err(|_| ErrorCode::Closed)?
-            .clone();
+        let job = job_for_principal(self, &self_, "job-join")?.clone();
         tokio::task::spawn_blocking(move || job.join())
             .await
             .map_err(|error| ErrorCode::WorkerFailed(error.to_string()))?
@@ -363,14 +383,15 @@ impl compute::HostJob for HostState {
     }
 
     fn cancel(&mut self, self_: Resource<astrid_compute::ComputeJob>) -> Result<(), ErrorCode> {
-        self.resource_table
-            .get(&self_)
-            .map_err(|_| ErrorCode::Closed)?
-            .cancel();
+        job_for_principal(self, &self_, "job-cancel")?.cancel();
         Ok(())
     }
 
     fn drop(&mut self, rep: Resource<astrid_compute::ComputeJob>) -> wasmtime::Result<()> {
+        let borrowed = Resource::new_borrow(rep.rep());
+        if job_for_principal(self, &borrowed, "job-drop").is_err() {
+            return Ok(());
+        }
         let _ = self
             .resource_table
             .delete::<astrid_compute::ComputeJob>(Resource::new_own(rep.rep()));
@@ -413,6 +434,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn host_boundary_is_capability_gated_and_executes_declared_worker() {
         let mut state = minimal_host_state(tokio::runtime::Handle::current());
+        state.principal = astrid_core::PrincipalId::new("alice").expect("valid principal");
         assert!(matches!(
             <HostState as compute::Host>::open(&mut state, request("cpu")),
             Err(ErrorCode::CapabilityDenied)
@@ -461,5 +483,34 @@ mod tests {
                 .expect("job completes");
         assert_eq!(result.worker_status, 42);
         assert!(matches!(result.state, JobState::Completed));
+
+        // A retained Store is shared by sequential invocations, but its live
+        // compute handles are not: every operation rechecks the opening
+        // principal at the host boundary. A malicious controller cannot use or
+        // destroy Alice's group/job while serving Bob.
+        state.principal = astrid_core::PrincipalId::new("bob").expect("valid principal");
+        assert!(matches!(
+            <HostState as compute::HostComputeGroup>::info(
+                &mut state,
+                Resource::new_borrow(group.rep()),
+            ),
+            Err(ErrorCode::CapabilityDenied)
+        ));
+        assert!(matches!(
+            <HostState as compute::HostJob>::status(&mut state, Resource::new_borrow(job.rep()),),
+            Err(ErrorCode::CapabilityDenied)
+        ));
+        <HostState as compute::HostComputeGroup>::drop(&mut state, Resource::new_own(group.rep()))
+            .expect("cross-principal drop is safely ignored");
+
+        state.principal = astrid_core::PrincipalId::new("alice").expect("valid principal");
+        assert!(
+            <HostState as compute::HostComputeGroup>::info(
+                &mut state,
+                Resource::new_borrow(group.rep()),
+            )
+            .is_ok(),
+            "Alice's group must remain live after Bob's denied drop"
+        );
     }
 }

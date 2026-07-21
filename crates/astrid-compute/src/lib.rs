@@ -540,6 +540,7 @@ impl ComputeRuntime {
 
         Ok(ComputeGroup {
             inner: Arc::new(GroupInner {
+                principal: principal.clone(),
                 artifact_id: artifact.id.clone(),
                 artifact_digest: artifact.digest.clone(),
                 mode: request.mode,
@@ -695,6 +696,7 @@ impl std::fmt::Debug for ComputeGroup {
 }
 
 struct GroupInner {
+    principal: PrincipalId,
     artifact_id: String,
     artifact_digest: String,
     mode: ExecutionMode,
@@ -710,6 +712,12 @@ struct GroupInner {
 }
 
 impl ComputeGroup {
+    /// Principal that opened and owns this group.
+    #[must_use]
+    pub fn principal(&self) -> &PrincipalId {
+        &self.inner.principal
+    }
+
     /// Verified worker id.
     #[must_use]
     pub fn worker_id(&self) -> &str {
@@ -802,7 +810,10 @@ impl ComputeGroup {
             return Err(ComputeError::Closed);
         }
         validate_descriptor(&self.inner.memory, descriptor)?;
-        let job = Arc::new(JobInner::new());
+        let job = Arc::new(JobInner::new(
+            self.inner.principal.clone(),
+            self.inner.artifact_id.clone(),
+        ));
         self.inner
             .jobs
             .lock()
@@ -973,6 +984,18 @@ impl std::fmt::Debug for ComputeJob {
 }
 
 impl ComputeJob {
+    /// Principal that owns the group which submitted this job.
+    #[must_use]
+    pub fn principal(&self) -> &PrincipalId {
+        &self.inner.principal
+    }
+
+    /// Verified worker id of the group which submitted this job.
+    #[must_use]
+    pub fn worker_id(&self) -> &str {
+        &self.inner.worker_id
+    }
+
     /// Current non-blocking state.
     #[must_use]
     pub fn state(&self) -> JobState {
@@ -1041,14 +1064,18 @@ impl ComputeJob {
 }
 
 struct JobInner {
+    principal: PrincipalId,
+    worker_id: String,
     record: Mutex<JobRecord>,
     ready: Condvar,
     cancel: Arc<AtomicBool>,
 }
 
 impl JobInner {
-    fn new() -> Self {
+    fn new(principal: PrincipalId, worker_id: String) -> Self {
         Self {
+            principal,
+            worker_id,
             record: Mutex::new(JobRecord {
                 state: JobState::Queued,
                 worker_index: None,

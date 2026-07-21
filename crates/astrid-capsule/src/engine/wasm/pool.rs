@@ -19,10 +19,10 @@
 //! *within* a single invocation (subscribe → publish → recv → drop in one
 //! call), so no handle created on one Store is reused on another. The
 //! per-capsule pool-safety audit confirmed this for every pooled capsule;
-//! the one capsule that holds a live resource across invocations
-//! (`astrid-capsule-shell`'s background-process handles) is carved out to
-//! `size == 1` via its `host_process` capability and so never leases a
-//! second Store.
+//! Capsules that declare intentional cross-invocation resources are carved out
+//! to `size == 1`: `host_process` retains background-process handles, while a
+//! `compute-worker` component retains principal-bound compute groups. Neither
+//! can lease a second Store because wasmtime resources are Store-local.
 //!
 //! ## Run-loop capsules are not pooled
 //!
@@ -160,16 +160,16 @@ pub(super) struct CapsuleInstancePool {
     /// the whole resource table to close those handles before the instance is
     /// reusable. See [`PoolCheckout::drop`].
     ///
-    /// `false` for the `host_process` carve-out (`size == 1`): that capsule
-    /// deliberately holds live `ManagedProcess` handles across invocations
-    /// (background processes), so tearing the resource table down on return
-    /// would kill them. It is sound to skip the reset there precisely because
-    /// it never leases a *second* Store, so no cross-principal reuse occurs.
+    /// `false` for persistent-resource capsules (`size == 1`): these
+    /// deliberately hold live process or compute handles across invocations,
+    /// so tearing the resource table down on return would close them. They
+    /// never lease a *second* Store; retained compute objects additionally
+    /// enforce their opening principal at every host operation.
     reset_resources_on_return: bool,
     /// On-demand instance factory for lazy growth.
     builder: Arc<InstanceBuilder>,
     /// Whether a checkout that finds no warm instance may build one. `false`
-    /// for the size-1 `host_process` carve-out (`max == min_idle == 1`): its
+    /// for a size-1 persistent-resource pool (`max == min_idle == 1`): its
     /// single instance is always warm, so this is belt-and-suspenders — if a
     /// build were ever reached it would mint a *second* Store and violate the
     /// carve-out, so we fail closed instead.
@@ -189,7 +189,7 @@ impl CapsuleInstancePool {
     /// signal) stops the eviction timer.
     ///
     /// `reset_resources_on_return` is `true` for free-checkout pools and
-    /// `false` for the `host_process` carve-out — see the field docs.
+    /// `false` for a persistent-resource capsule — see the field docs.
     pub(super) fn new(
         initial: Vec<PooledInstance>,
         max: usize,
@@ -413,10 +413,10 @@ impl Drop for PoolCheckout {
 ///    Resetting an already-empty table (the normal subscribe→use→drop path) is
 ///    a cheap no-op: a fresh `ResourceTable` allocation and a few field writes.
 ///
-/// `reset_resources` is `false` for the `host_process` carve-out, whose
-/// `ManagedProcess` handles legitimately persist across invocations; it is
-/// sound to skip there because that capsule never leases a second Store, so no
-/// cross-principal reuse can occur (see [`CapsuleInstancePool`]).
+/// `reset_resources` is `false` for persistent-resource capsules whose process
+/// or compute handles legitimately persist across invocations. They never
+/// lease a second Store; compute objects remain independently principal-bound
+/// at the host boundary (see [`CapsuleInstancePool`]).
 ///
 /// NOTE: the per-Store *owner* state (`vfs`, `kv`, `secret_store`,
 /// `ipc_limiter`, `blocking_semaphore`, `io_semaphore`, `process_tracker`,
@@ -550,8 +550,8 @@ mod tests {
         );
     }
 
-    /// The `host_process` carve-out (`reset_resources = false`) deliberately
-    /// keeps its `ManagedProcess` handles across invocations — the resource
+    /// A persistent-resource capsule (`reset_resources = false`) deliberately
+    /// keeps its process or compute handles across invocations — the resource
     /// table and its counters must survive the return.
     #[test]
     fn clear_on_return_preserves_resources_for_carveout() {
