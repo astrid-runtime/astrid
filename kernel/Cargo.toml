@@ -1,0 +1,19 @@
+# Astrid native-kernel M1 skeleton workspace.
+#
+# This workspace is intentionally isolated from the surrounding `core/`
+# workspace (whose members are an explicit list under `crates/*`). A nested
+# `[workspace]` is auto-excluded from the parent, so `core/` never ingests
+# these crates.
+[workspace]
+resolver = "2"
+members = ["crates/astrid-kernel", "tools/kimage", "tools/ktest"]
+
+# Ring-0 profile: optimized, no unwinding. Applied workspace-wide; the host
+# tools are plain binaries and abort-on-panic is fine for them.
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+opt-level = 2
+panic = "abort"
+lto = false
