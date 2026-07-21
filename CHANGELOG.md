@@ -17,6 +17,12 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
   an audited host boundary. Aggregate worker, memory, and optional fuel ceilings
   are operator-controlled; defaults add no arbitrary Astrid policy cap. The
   pre-1.0 WIT contract remains deliberately unmerged until Astrid 1.0.
+- **Principal-bound open-file resources now implement the existing Astrid FS
+  contract.** Capsules can perform bounded positional reads and writes, resize
+  and sync open files, inspect handle metadata, and atomically rename paths
+  within one confined VFS root. Handles are re-authorized on every operation
+  and count against an exact per-Store quota, enabling compiler and VM-backed
+  workloads without whole-file read-modify-write shims.
 
 ### Fixed
 

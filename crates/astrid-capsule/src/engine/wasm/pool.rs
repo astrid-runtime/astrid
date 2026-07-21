@@ -460,6 +460,9 @@ fn clear_on_return(state: &mut HostState, reset_resources: bool) {
         // them to the empty-table baseline so the per-(principal) gates start
         // from zero for the next lease.
         state.active_http_streams.clear();
+        state
+            .open_file_count
+            .store(0, std::sync::atomic::Ordering::Release);
         state.net_stream_count = 0;
         state.subscription_count = 0;
         state.process_count_total = 0;

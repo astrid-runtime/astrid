@@ -53,4 +53,10 @@ pub use memory_ledger::MemoryLedger;
 // `StoreMemoryMeter` is the Wasmtime `ResourceLimiter`; native-only.
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 pub use memory_ledger::StoreMemoryMeter;
+// Wasmtime's component bindgen requires mapped resource storage types to be
+// publicly reachable from the crate root. This is runtime plumbing, not a
+// capsule-author API.
+#[doc(hidden)]
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+pub use engine::wasm::host::fs::OpenFileHandle;
 pub use tool_discovery::{ToolDescriptor, describe_loaded_capsule, tools_missing_execute_route};

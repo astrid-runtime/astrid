@@ -597,6 +597,10 @@ pub struct HostState {
     /// Monotonic counter for HTTP stream handle IDs.
     /// Starts at 1 (0 reserved as sentinel).
     pub next_http_stream_id: u64,
+    /// Live `astrid:fs` file handles in this Store's resource table.
+    /// Shared with each resource's RAII drop guard so the frozen 16-handle
+    /// contract remains exact even when the entire table is reset.
+    pub open_file_count: Arc<std::sync::atomic::AtomicUsize>,
     /// Tracks active child process PIDs for cancellation.
     ///
     /// Shared with the cancel listener background task. The spawn host function

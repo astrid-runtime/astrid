@@ -2019,6 +2019,7 @@ impl ExecutionEngine for WasmEngine {
                 cli_socket_listener: cli_listener.clone(),
                 active_http_streams: std::collections::HashMap::new(),
                 next_http_stream_id: 1,
+                open_file_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
                 security: Some(
                     Arc::clone(&security_gate) as Arc<dyn crate::security::CapsuleSecurityGate>
                 ),
@@ -3164,6 +3165,7 @@ pub async fn run_lifecycle(
         cli_socket_listener: None,
         active_http_streams: std::collections::HashMap::new(),
         next_http_stream_id: 1,
+        open_file_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         lifecycle_phase: Some(phase),
         secret_store: cfg.secret_store,
         ready_tx: None,

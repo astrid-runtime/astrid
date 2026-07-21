@@ -93,6 +93,7 @@ wasmtime::component::bindgen!({
         "astrid:io/error@1.0.0.error": wasmtime_wasi::p2::IoError,
         "astrid:io/streams@1.0.0.input-stream": wasmtime_wasi::p2::DynInputStream,
         "astrid:io/streams@1.0.0.output-stream": wasmtime_wasi::p2::DynOutputStream,
+        "astrid:fs/host@1.0.0.file-handle": crate::OpenFileHandle,
         "astrid:compute/host@1.0.0.compute-group": astrid_compute::ComputeGroup,
         "astrid:compute/host@1.0.0.job": astrid_compute::ComputeJob,
     },

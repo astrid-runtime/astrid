@@ -106,6 +106,7 @@ impl HostState {
             cli_socket_listener: None,
             active_http_streams: HashMap::new(),
             next_http_stream_id: 1,
+            open_file_count: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             lifecycle_phase: None,
             secret_store,
             ready_tx: None,
