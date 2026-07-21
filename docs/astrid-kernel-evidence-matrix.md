@@ -24,9 +24,12 @@ Each row is one property. Columns:
 - **Property** — the invariant, phrased so its negation is a concrete bug.
 - **Source** — the charter clause or threat-model section that asserts it.
 - **Evidence** — the executable check whose failure disproves the property.
-- **Kind** — `host` (runs off-target on an ordinary build), `qemu` (runs in
-  the QEMU serial-assertion harness), `fuzz` (coverage-guided), or `build`
-  (a property of the image/artifact pipeline).
+- **Kind** — one or more of `host` (runs off-target on an ordinary build),
+  `qemu` (runs in the QEMU serial-assertion harness), `fuzz`
+  (coverage-guided), or `build` (a property of the image/artifact pipeline).
+  A row combines kinds with `+` when its evidence genuinely spans stages
+  (for example `host+qemu` when a property is proven both off-target and in
+  the harness); each named kind is an independent obligation for that row.
 - **Gate** — the milestone whose exit this row blocks (M1–M6, per the
   [scope document](astrid-native-kernel.md) execution plan).
 
