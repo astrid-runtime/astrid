@@ -8,7 +8,7 @@ use cap_std::fs::Dir;
 use tokio::fs;
 use tokio::sync::{OwnedSemaphorePermit, RwLock, Semaphore};
 
-use crate::{Vfs, VfsDirEntry, VfsError, VfsMetadata, VfsResult};
+use crate::{Vfs, VfsDirEntry, VfsError, VfsMetadata, VfsResult, VfsSymlinkMetadata};
 
 /// An open file and its associated semaphore permit, tying the FD quota to the struct's lifetime.
 type OpenFileEntry = Arc<RwLock<(fs::File, OwnedSemaphorePermit)>>;
@@ -175,7 +175,7 @@ impl Vfs for HostVfs {
             let meta = if safe_path.as_os_str().is_empty() {
                 dir.dir_metadata()
             } else {
-                dir.symlink_metadata(&safe_path)
+                dir.metadata(&safe_path)
             }
             .map_err(classify_io_error)?;
 
@@ -191,6 +191,38 @@ impl Vfs for HostVfs {
                 is_file: meta.is_file(),
                 size: meta.len(),
                 mtime,
+            })
+        })
+        .await
+        .expect("spawn_blocking panicked")
+    }
+
+    async fn stat_symlink(&self, handle: &DirHandle, path: &str) -> VfsResult<VfsSymlinkMetadata> {
+        let dir = self.get_dir(handle).await?;
+        let safe_path = make_relative(path).to_path_buf();
+
+        tokio::task::spawn_blocking(move || {
+            let meta = if safe_path.as_os_str().is_empty() {
+                dir.dir_metadata()
+            } else {
+                dir.symlink_metadata(&safe_path)
+            }
+            .map_err(classify_io_error)?;
+
+            let mtime = meta
+                .modified()
+                .ok()
+                .map(cap_std::time::SystemTime::into_std)
+                .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+                .map_or(0, |duration| duration.as_secs());
+            Ok(VfsSymlinkMetadata {
+                metadata: VfsMetadata {
+                    is_dir: meta.is_dir(),
+                    is_file: meta.is_file(),
+                    size: meta.len(),
+                    mtime,
+                },
+                is_symlink: meta.file_type().is_symlink(),
             })
         })
         .await
@@ -585,6 +617,30 @@ mod tests {
             vfs.rename(&handle, "renamed", "/").await,
             Err(VfsError::PermissionDenied(_))
         ));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn following_and_non_following_metadata_are_distinct() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().expect("root");
+        std::fs::write(root.path().join("target.txt"), b"target-bytes").expect("target");
+        symlink("target.txt", root.path().join("link.txt")).expect("symlink");
+        let handle = DirHandle::new();
+        let vfs = HostVfs::with_registered_dir(handle.clone(), root.path()).expect("host VFS");
+
+        let followed = vfs.stat(&handle, "link.txt").await.expect("following stat");
+        assert!(followed.is_file);
+        assert_eq!(followed.size, 12);
+
+        let link = vfs
+            .stat_symlink(&handle, "link.txt")
+            .await
+            .expect("non-following stat");
+        assert!(link.is_symlink);
+        assert!(!link.metadata.is_file);
+        assert!(!link.metadata.is_dir);
     }
 
     #[test]

@@ -56,6 +56,15 @@ pub struct VfsMetadata {
     pub mtime: u64,
 }
 
+/// Metadata returned by a non-following symbolic-link stat.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct VfsSymlinkMetadata {
+    /// Metadata for the directory entry itself.
+    pub metadata: VfsMetadata,
+    /// True when the entry is a symbolic link rather than its resolved target.
+    pub is_symlink: bool,
+}
+
 /// Directory entry returned by readdir.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct VfsDirEntry {
@@ -76,6 +85,17 @@ pub trait Vfs: Send + Sync {
 
     /// Get metadata for a path.
     async fn stat(&self, handle: &DirHandle, path: &str) -> VfsResult<VfsMetadata>;
+
+    /// Get metadata for a path without following its final symbolic link.
+    async fn stat_symlink(
+        &self,
+        _handle: &DirHandle,
+        _path: &str,
+    ) -> VfsResult<VfsSymlinkMetadata> {
+        Err(VfsError::NotSupported(
+            "non-following metadata is not supported by this VFS".to_owned(),
+        ))
+    }
 
     /// Create a new directory.
     async fn mkdir(&self, handle: &DirHandle, path: &str) -> VfsResult<()>;

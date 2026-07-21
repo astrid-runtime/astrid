@@ -324,6 +324,17 @@ impl Vfs for OverlayVfs {
         self.lower.stat(handle, path).await
     }
 
+    async fn stat_symlink(
+        &self,
+        handle: &DirHandle,
+        path: &str,
+    ) -> VfsResult<crate::VfsSymlinkMetadata> {
+        if let Ok(meta) = self.upper.stat_symlink(handle, path).await {
+            return Ok(meta);
+        }
+        self.lower.stat_symlink(handle, path).await
+    }
+
     async fn mkdir(&self, handle: &DirHandle, path: &str) -> VfsResult<()> {
         // Validate before mutation to avoid phantom dirs on SandboxViolation.
         let normalized = Self::normalize_path(path)?;

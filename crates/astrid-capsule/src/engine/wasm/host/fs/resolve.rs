@@ -96,6 +96,33 @@ pub(super) fn resolve_physical_absolute(
     })
 }
 
+/// Resolve a path while preserving its final directory entry instead of
+/// following a final symbolic link. Every parent is still canonicalized and
+/// confined beneath `root`, so callers can safely implement lstat semantics
+/// without turning the final link target into authority.
+fn resolve_physical_symlink(root: &Path, requested: &str) -> Result<ResolvedPhysical, String> {
+    let relative = make_relative(requested);
+    if relative.as_os_str().is_empty() || relative == Path::new(".") {
+        return resolve_physical_absolute(root, "");
+    }
+    let leaf = relative
+        .file_name()
+        .ok_or_else(|| format!("invalid non-following path: {requested}"))?;
+    let parent = relative.parent().unwrap_or_else(|| Path::new(""));
+    let parent = resolve_physical_absolute(root, parent.to_string_lossy().as_ref())?;
+    let physical = parent.physical.join(leaf);
+    if !physical.starts_with(&parent.canonical_root) {
+        return Err(format!(
+            "path escapes root boundary: {requested} resolves to {}",
+            physical.display()
+        ));
+    }
+    Ok(ResolvedPhysical {
+        physical,
+        canonical_root: parent.canonical_root,
+    })
+}
+
 /// Which VFS target a resolved path points at.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum VfsTarget {
@@ -125,8 +152,31 @@ pub(super) struct ResolvedVfsPath {
 /// mounts (per-invocation > load-time) so cross-principal calls land in
 /// the right tree.
 pub(super) fn resolve_path(state: &HostState, raw_path: &str) -> Result<ResolvedPath, String> {
+    resolve_path_with(state, raw_path, true)
+}
+
+/// Resolve a path without following its final symbolic link.
+pub(super) fn resolve_path_symlink(
+    state: &HostState,
+    raw_path: &str,
+) -> Result<ResolvedPath, String> {
+    resolve_path_with(state, raw_path, false)
+}
+
+fn resolve_path_with(
+    state: &HostState,
+    raw_path: &str,
+    follow_final: bool,
+) -> Result<ResolvedPath, String> {
+    let resolve = |root: &Path, requested: &str| {
+        if follow_final {
+            resolve_physical_absolute(root, requested)
+        } else {
+            resolve_physical_symlink(root, requested)
+        }
+    };
     if let Some(stripped) = raw_path.strip_prefix(CWD_SCHEME) {
-        let resolved = resolve_physical_absolute(&state.workspace_root, stripped)?;
+        let resolved = resolve(&state.workspace_root, stripped)?;
         let relative = resolved
             .physical
             .strip_prefix(&resolved.canonical_root)
@@ -141,7 +191,7 @@ pub(super) fn resolve_path(state: &HostState, raw_path: &str) -> Result<Resolved
         let home = state
             .effective_home()
             .ok_or_else(|| "home:// scheme is not available for this principal".to_string())?;
-        let resolved = resolve_physical_absolute(&home.root, stripped)?;
+        let resolved = resolve(&home.root, stripped)?;
         let relative = resolved
             .physical
             .strip_prefix(&resolved.canonical_root)
@@ -160,7 +210,7 @@ pub(super) fn resolve_path(state: &HostState, raw_path: &str) -> Result<Resolved
             .strip_prefix(TMP_PREFIX)
             .or_else(|| raw_path.strip_prefix("/tmp"))
             .unwrap_or("");
-        let resolved = resolve_physical_absolute(&tmp_mount.root, stripped)?;
+        let resolved = resolve(&tmp_mount.root, stripped)?;
         let relative = resolved
             .physical
             .strip_prefix(&resolved.canonical_root)
@@ -172,7 +222,7 @@ pub(super) fn resolve_path(state: &HostState, raw_path: &str) -> Result<Resolved
             target: VfsTarget::Tmp,
         })
     } else {
-        let resolved = resolve_physical_absolute(&state.workspace_root, raw_path)?;
+        let resolved = resolve(&state.workspace_root, raw_path)?;
         let relative = resolved
             .physical
             .strip_prefix(&resolved.canonical_root)

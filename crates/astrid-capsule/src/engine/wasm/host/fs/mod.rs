@@ -7,13 +7,13 @@
 //! Live surface (the most-used legacy fns ported to typed errors):
 //!
 //! - fs-open + FileHandle positional I/O, stat, resize, sync and close
-//! - fs-exists, fs-mkdir, fs-readdir, fs-stat, fs-unlink, fs-rename,
-//!   read-file, write-file
+//! - fs-exists, fs-mkdir, fs-readdir, fs-stat, fs-stat-symlink, fs-unlink,
+//!   fs-rename, read-file, write-file
 //!
 //! Stubbed (planned for follow-ups; all return Unknown so capsules can
 //! handle them as transient failures):
 //!
-//! - fs-mkdir-all, fs-stat-symlink, fs-append, fs-copy,
+//! - fs-mkdir-all, fs-append, fs-copy,
 //!   fs-remove-dir-all, fs-canonicalize, fs-read-link, fs-hard-link
 //!
 //! Audit: every path-based op emits `astrid.audit.fs` per call
@@ -37,7 +37,7 @@ use crate::engine::wasm::bindings::astrid::fs::host::{
 };
 use crate::engine::wasm::host::util;
 use crate::engine::wasm::host_state::HostState;
-use resolve::{resolve_path, resolve_vfs};
+use resolve::{resolve_path, resolve_path_symlink, resolve_vfs};
 
 /// Audit envelope for path-based fs operations.
 ///
@@ -102,14 +102,10 @@ fn fs_event_for_op<'a>(op: &str, path: &'a str) -> Option<HostAuditEvent<'a>> {
     // forms classify identically.
     let verb = op.rsplit('.').next().unwrap_or(op);
     match verb {
-        "read-file" | "read-at" | "fs-readdir" | "readdir" | "fs-stat" | "stat"
-        | "fs-exists" | "exists" => {
-            Some(HostAuditEvent::FileRead { path })
-        },
-        "write-file" | "write-at" | "set-len" | "sync-data" | "sync-all" | "fs-mkdir"
-        | "mkdir" | "fs-mkdir-all" | "fs-rename" => {
-            Some(HostAuditEvent::FileWrite { path })
-        },
+        "read-file" | "read-at" | "fs-readdir" | "readdir" | "fs-stat" | "fs-stat-symlink"
+        | "stat" | "fs-exists" | "exists" => Some(HostAuditEvent::FileRead { path }),
+        "write-file" | "write-at" | "set-len" | "sync-data" | "sync-all" | "fs-mkdir" | "mkdir"
+        | "fs-mkdir-all" | "fs-rename" => Some(HostAuditEvent::FileWrite { path }),
         "fs-unlink" | "unlink" | "remove" | "remove-dir" => {
             Some(HostAuditEvent::FileDelete { path })
         },
@@ -175,6 +171,7 @@ fn map_vfs_err(e: astrid_vfs::VfsError) -> ErrorCode {
 #[cfg(test)]
 mod error_mapping_tests {
     use super::*;
+    use crate::engine::wasm::test_fixtures::minimal_host_state;
 
     #[test]
     fn native_not_found_and_permission_denied_remain_typed() {
@@ -209,6 +206,47 @@ mod error_mapping_tests {
             fs_event_for_op("astrid:fs/host.fs-rename", "/workspace/renamed"),
             Some(HostAuditEvent::FileWrite { .. })
         ));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn fs_stat_follows_but_fs_stat_symlink_preserves_the_final_link() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().expect("root");
+        let outside = tempfile::tempdir().expect("outside");
+        std::fs::write(root.path().join("target.txt"), b"inside").expect("inside target");
+        std::fs::write(outside.path().join("outside.txt"), b"outside").expect("outside target");
+        symlink("target.txt", root.path().join("inside-link")).expect("inside symlink");
+        symlink(
+            outside.path().join("outside.txt"),
+            root.path().join("escape-link"),
+        )
+        .expect("escaping symlink");
+
+        let root_handle = astrid_capabilities::DirHandle::new();
+        let vfs = astrid_vfs::HostVfs::with_registered_dir(root_handle.clone(), root.path())
+            .expect("host VFS");
+        let mut state = minimal_host_state(tokio::runtime::Handle::current());
+        state.workspace_root = root.path().to_path_buf();
+        state.vfs = Arc::new(vfs);
+        state.vfs_root_handle = root_handle;
+
+        let followed = <HostState as fs::Host>::fs_stat(&mut state, "inside-link".to_owned())
+            .expect("following stat");
+        assert!(matches!(followed.kind, FileType::Regular));
+        let link = <HostState as fs::Host>::fs_stat_symlink(&mut state, "inside-link".to_owned())
+            .expect("non-following stat");
+        assert!(matches!(link.kind, FileType::Symlink));
+
+        assert!(matches!(
+            <HostState as fs::Host>::fs_stat(&mut state, "escape-link".to_owned()),
+            Err(ErrorCode::BoundaryEscape)
+        ));
+        let escaping_link =
+            <HostState as fs::Host>::fs_stat_symlink(&mut state, "escape-link".to_owned())
+                .expect("the confined link itself remains inspectable");
+        assert!(matches!(escaping_link.kind, FileType::Symlink));
     }
 }
 
@@ -338,6 +376,14 @@ fn to_file_stat(meta: &astrid_vfs::VfsMetadata) -> FileStat {
         created: None,
         accessed: None,
     }
+}
+
+fn to_symlink_file_stat(meta: &astrid_vfs::VfsSymlinkMetadata) -> FileStat {
+    let mut stat = to_file_stat(&meta.metadata);
+    if meta.is_symlink {
+        stat.kind = FileType::Symlink;
+    }
+    stat
 }
 
 impl fs::Host for HostState {
@@ -508,10 +554,27 @@ impl fs::Host for HostState {
         result
     }
 
-    fn fs_stat_symlink(&mut self, _path: String) -> Result<FileStat, ErrorCode> {
-        Err(ErrorCode::Unknown(
-            "fs-stat-symlink: lstat port pending".to_string(),
-        ))
+    fn fs_stat_symlink(&mut self, path: String) -> Result<FileStat, ErrorCode> {
+        let resolved = resolve_path_symlink(self, &path).map_err(map_resolve_err)?;
+        gate_read(self, &resolved.physical)?;
+        let vfs_path = resolve_vfs(self, &resolved).map_err(map_resolve_err)?;
+        let result = util::bounded_block_on(
+            &self.runtime_handle,
+            &self.blocking_semaphore,
+            vfs_path.vfs.stat_symlink(
+                &vfs_path.handle,
+                vfs_path.relative.to_string_lossy().as_ref(),
+            ),
+        )
+        .map(|metadata| to_symlink_file_stat(&metadata))
+        .map_err(map_vfs_err);
+        audit_fs(
+            self,
+            "astrid:fs/host.fs-stat-symlink",
+            &resolved.physical.to_string_lossy(),
+            &result,
+        );
+        result
     }
 
     fn fs_unlink(&mut self, path: String) -> Result<(), ErrorCode> {

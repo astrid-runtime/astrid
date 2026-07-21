@@ -26,6 +26,11 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
 
 ### Fixed
 
+- **Filesystem metadata now distinguishes `stat` from `lstat`.** Following
+  metadata resolves a final symlink, while `fs-stat-symlink` inspects the link
+  entry itself without granting authority over an escaping target. This lets
+  Linux-style workspace projections handle symlinks without relying on an
+  accidental VFS implementation detail.
 - **Stable crates publication installs its authenticated-hash prerequisite.**
   The protected publisher installs the pinned `b3sum` binary before validating
   the exact dev candidate, so BLAKE3 release metadata checks run before any
