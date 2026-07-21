@@ -818,6 +818,11 @@ pub struct CapsuleSection {
     /// the outbound-throughput gate the LLM path rides on; sizing it well above
     /// the blocking ceiling is the point of the split.
     pub host_io_concurrency: Option<usize>,
+    /// Process-wide ceiling on persistent capsule network streams. `None` uses
+    /// a host-derived share of the file-descriptor budget. Unlike the old
+    /// per-Store constant, this limit is shared across every capsule and pooled
+    /// instance, so capacity cannot multiply past the process fd envelope.
+    pub host_net_streams: Option<usize>,
     /// **Max** size of a capsule's dynamic instance pool — the ceiling on its
     /// concurrent interceptor invocations. `None` → cores-scaled (replacing the
     /// old fixed 16). The pool warm-starts well below this and grows lazily, so

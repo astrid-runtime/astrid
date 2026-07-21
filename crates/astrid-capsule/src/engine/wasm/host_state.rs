@@ -56,6 +56,19 @@ pub struct TcpStreamSlot {
     pub write_timeout: Option<std::time::Duration>,
 }
 
+/// Incremental decoder state for one length-prefixed stream.
+///
+/// A readiness wake promises only one readable byte. Preserving partial header
+/// and payload bytes prevents fragmented clients from desynchronizing framing
+/// when a non-blocking read window expires between bytes.
+#[derive(Debug, Default)]
+pub(crate) struct FrameReadState {
+    pub(crate) header: [u8; 4],
+    pub(crate) header_read: usize,
+    pub(crate) payload: Vec<u8>,
+    pub(crate) payload_read: usize,
+}
+
 /// The lifecycle phase a capsule is currently executing in.
 ///
 /// Set on [`HostState`] during `#[install]` or `#[upgrade]` dispatch.
@@ -605,9 +618,18 @@ pub struct HostState {
     /// here — off the wasmtime resource table — which is what lets them
     /// survive instance churn.
     pub persistent_processes: Arc<crate::engine::wasm::host::process::PersistentProcessRegistry>,
+    /// Kernel-owned process-wide network-stream admission budget shared by
+    /// every capsule engine and pooled Store.
+    pub net_stream_budget: Arc<crate::NetStreamBudget>,
+    /// RAII leases keyed by resource-table rep. Clearing this map releases
+    /// global capacity even when a pool reset replaces the table without
+    /// invoking the guest-visible stream `drop` method.
+    pub net_stream_leases: HashMap<u32, crate::NetStreamLease>,
+    /// Incremental length-prefixed decoder state keyed by network-stream rep.
+    pub(crate) net_frame_states: HashMap<u32, FrameReadState>,
     /// Live count of `NetStream` entries currently in the resource table.
     /// Maintained alongside `ResourceTable` insertions / drops so the
-    /// `MAX_ACTIVE_STREAMS` gate is O(1) instead of iterating every
+    /// local accounting and diagnostics stay O(1) instead of iterating every
     /// resource (the table may hold hundreds of pollables / errors /
     /// http handles unrelated to net). Single-threaded: wasmtime
     /// stores are owned by exactly one OS thread.

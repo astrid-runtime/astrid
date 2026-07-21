@@ -7,26 +7,58 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+#[cfg(unix)]
+use std::os::fd::{AsFd, OwnedFd};
+
 use wasmtime::component::Resource;
-use wasmtime_wasi::p2::DynPollable;
+use wasmtime_wasi::p2::{DynPollable, Pollable, subscribe};
 
 use super::client_lifecycle;
 use super::handshake::validate_handshake;
 #[cfg(unix)]
 use super::handshake::verify_peer_credentials;
-use super::{HostState, MAX_ACTIVE_STREAMS, NetStream, UnixListenerSlot, audit_net, map_io_err};
+use super::{
+    HostState, NetStream, UnixListenerSlot, audit_net, map_io_err, record_net_stream_metrics,
+};
 use crate::engine::wasm::bindings::astrid::net::host::{
     ErrorCode, HostUnixListener, TcpStream, UnixListener,
 };
 use crate::engine::wasm::host::util;
 
+#[cfg(unix)]
+struct UnixListenerReadiness {
+    descriptor: tokio::io::unix::AsyncFd<OwnedFd>,
+    budget: Arc<crate::NetStreamBudget>,
+}
+
+#[cfg(unix)]
+#[async_trait::async_trait]
+impl Pollable for UnixListenerReadiness {
+    async fn ready(&mut self) {
+        loop {
+            self.budget.wait_available().await;
+            if let Ok(mut readiness) = self.descriptor.readable().await {
+                // The listener itself remains level-triggered. Clear only this
+                // duplicate descriptor's cached Tokio readiness so the next
+                // poll waits for the post-accept state instead of firing
+                // forever.
+                readiness.clear_ready();
+                if self.budget.has_capacity() {
+                    return;
+                }
+            } else {
+                return;
+            }
+        }
+    }
+}
+
 impl HostUnixListener for HostState {
     fn accept(&mut self, _self_: Resource<UnixListener>) -> Result<Resource<TcpStream>, ErrorCode> {
-        if self.net_stream_count >= MAX_ACTIVE_STREAMS {
+        let listener_arc = self.cli_socket_listener.clone().ok_or(ErrorCode::Closed)?;
+        if !self.net_stream_budget.has_capacity() {
             return Err(ErrorCode::Quota);
         }
-
-        let listener_arc = self.cli_socket_listener.clone().ok_or(ErrorCode::Closed)?;
         let rt_handle = self.runtime_handle.clone();
         let cancel_token = self.effective_cancel_token();
         let session_token = self.session_token.clone();
@@ -58,11 +90,11 @@ impl HostUnixListener for HostState {
                 &blocking_semaphore,
                 &cancel_token,
                 async {
-                    let l = listener_arc.lock().await;
-                    l.accept().await
+                    let listener = listener_arc.lock().await;
+                    listener.accept().await.map(|(stream, _)| stream)
                 },
             );
-            let (stream, _addr) = match accept_result {
+            let stream = match accept_result {
                 Some(result) => result.map_err(map_io_err)?,
                 None => return Err(ErrorCode::Closed),
             };
@@ -117,11 +149,13 @@ impl HostUnixListener for HostState {
             }
         };
 
-        if self.net_stream_count >= MAX_ACTIVE_STREAMS {
+        // Waiting for an inbound connection does not consume another file
+        // descriptor, so acquire only after accept and authentication. The
+        // atomic acquisition closes the race between concurrent acceptors.
+        let Some(stream_lease) = self.net_stream_budget.try_acquire() else {
             drop(stream);
             return Err(ErrorCode::Quota);
-        }
-
+        };
         let net_stream = NetStream::Unix(Arc::new(tokio::sync::Mutex::new(stream)));
         let res = self
             .resource_table
@@ -129,6 +163,12 @@ impl HostUnixListener for HostState {
             .map_err(|e| ErrorCode::Unknown(format!("resource table: {e}")))?;
         self.net_stream_count += 1;
         let rep = res.rep();
+        let previous = self.net_stream_leases.insert(rep, stream_lease);
+        debug_assert!(
+            previous.is_none(),
+            "net stream resource rep reused while live"
+        );
+        record_net_stream_metrics(self);
         // Record the verified principal AND its authenticating device key_id
         // (issue #45/#852) keyed by the stream resource rep, now that the rep
         // is known. Storage only; enforcement reads this registry separately —
@@ -166,7 +206,7 @@ impl HostUnixListener for HostState {
         let session_token = self.session_token.clone();
         let blocking_semaphore = self.blocking_semaphore.clone();
 
-        if self.net_stream_count >= MAX_ACTIVE_STREAMS {
+        if !self.net_stream_budget.has_capacity() {
             return Ok(None);
         }
 
@@ -176,16 +216,16 @@ impl HostUnixListener for HostState {
             &blocking_semaphore,
             &cancel_token,
             async {
-                let l = listener_arc.lock().await;
-                tokio::time::timeout(Duration::from_millis(timeout_ms), l.accept()).await
+                let listener = listener_arc.lock().await;
+                tokio::time::timeout(Duration::from_millis(timeout_ms), listener.accept()).await
             },
         );
 
-        let (stream, _addr) = match accept_result {
+        let stream = match accept_result {
             None => return Ok(None),
             Some(Err(_)) => return Ok(None),
             Some(Ok(Err(e))) => return Err(map_io_err(e)),
-            Some(Ok(Ok(pair))) => pair,
+            Some(Ok(Ok((stream, _)))) => stream,
         };
 
         #[cfg(unix)]
@@ -236,11 +276,10 @@ impl HostUnixListener for HostState {
             }
         }
 
-        if self.net_stream_count >= MAX_ACTIVE_STREAMS {
+        let Some(stream_lease) = self.net_stream_budget.try_acquire() else {
             drop(stream);
             return Ok(None);
-        }
-
+        };
         let net_stream = NetStream::Unix(Arc::new(tokio::sync::Mutex::new(stream)));
         let res = self
             .resource_table
@@ -248,6 +287,12 @@ impl HostUnixListener for HostState {
             .map_err(|e| ErrorCode::Unknown(format!("resource table: {e}")))?;
         self.net_stream_count += 1;
         let rep = res.rep();
+        let previous = self.net_stream_leases.insert(rep, stream_lease);
+        debug_assert!(
+            previous.is_none(),
+            "net stream resource rep reused while live"
+        );
+        record_net_stream_metrics(self);
         // Same per-connection principal + device-key binding as `accept`
         // (issue #45/#852).
         let verified_principal = verified_identity.as_ref().map(|(p, _)| p.clone());
@@ -265,11 +310,27 @@ impl HostUnixListener for HostState {
     }
 
     fn subscribe_readiness(&mut self, _self_: Resource<UnixListener>) -> Resource<DynPollable> {
-        // Real wiring (tokio UnixListener::poll_accept-backed) lands
-        // with the dedicated pollable commit. Always-ready sentinel
-        // until then — guests poll, call accept, get a connection or
-        // wait inside accept's own blocking path.
-        super::super::stubs::always_ready_pollable(&mut self.resource_table)
+        let Some(listener) = self.cli_socket_listener.clone() else {
+            return Resource::new_own(0);
+        };
+        let runtime = self.runtime_handle.clone();
+        let semaphore = self.blocking_semaphore.clone();
+        let cancel = self.effective_cancel_token();
+        let async_fd = util::bounded_block_on_cancellable(&runtime, &semaphore, &cancel, async {
+            let listener = listener.lock().await;
+            let descriptor = listener.as_fd().try_clone_to_owned()?;
+            tokio::io::unix::AsyncFd::new(descriptor)
+        });
+        let Some(Ok(async_fd)) = async_fd else {
+            return Resource::new_own(0);
+        };
+        let Ok(readiness) = self.resource_table.push(UnixListenerReadiness {
+            descriptor: async_fd,
+            budget: Arc::clone(&self.net_stream_budget),
+        }) else {
+            return Resource::new_own(0);
+        };
+        subscribe(&mut self.resource_table, readiness).unwrap_or_else(|_| Resource::new_own(0))
     }
 
     fn drop(&mut self, rep: Resource<UnixListener>) -> wasmtime::Result<()> {
@@ -277,5 +338,56 @@ impl HostUnixListener for HostState {
             .resource_table
             .delete::<UnixListenerSlot>(Resource::new_own(rep.rep()));
         Ok(())
+    }
+}
+
+#[cfg(all(test, unix))]
+mod readiness_tests {
+    use std::os::fd::AsFd;
+
+    use wasmtime_wasi::p2::Pollable;
+
+    use super::UnixListenerReadiness;
+
+    #[tokio::test]
+    async fn listener_readiness_waits_for_connection_and_capacity_without_accepting() {
+        let directory = tempfile::tempdir().expect("temporary socket directory");
+        let socket_path = directory.path().join("readiness.sock");
+        let listener = tokio::net::UnixListener::bind(&socket_path).expect("bind test listener");
+        let descriptor = listener
+            .as_fd()
+            .try_clone_to_owned()
+            .expect("duplicate listener descriptor");
+        let mut readiness = UnixListenerReadiness {
+            descriptor: tokio::io::unix::AsyncFd::new(descriptor)
+                .expect("register duplicate descriptor"),
+            budget: std::sync::Arc::new(crate::NetStreamBudget::new(1)),
+        };
+        let lease = readiness
+            .budget
+            .try_acquire()
+            .expect("occupy the only stream slot");
+
+        let connector = tokio::spawn(async move {
+            tokio::net::UnixStream::connect(socket_path)
+                .await
+                .expect("connect test client")
+        });
+
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(30), readiness.ready())
+                .await
+                .is_err(),
+            "a readable listener must not wake while stream capacity is full"
+        );
+        drop(lease);
+        tokio::time::timeout(std::time::Duration::from_secs(2), readiness.ready())
+            .await
+            .expect("readiness should fire");
+        tokio::time::timeout(std::time::Duration::from_secs(2), listener.accept())
+            .await
+            .expect("readiness must not consume the connection")
+            .expect("accept test connection");
+        connector.await.expect("connector task");
     }
 }

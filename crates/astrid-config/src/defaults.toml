@@ -445,6 +445,11 @@ timeout_secs = 300
 # rides on. Host default is cores-scaled and clamped by half the fd limit.
 # host_io_concurrency = 512
 
+# Process-wide persistent capsule network-stream budget. Host default derives
+# from the file-descriptor envelope (half of the fd-clamped async-I/O budget),
+# and is shared across every capsule and pooled instance.
+# host_net_streams = 256
+
 # Max size of a capsule's dynamic instance pool (concurrent interceptor
 # invocations). Replaces the old fixed 16; host default is cores-scaled. The
 # pool warm-starts small and grows lazily toward this, so it bounds the peak,

@@ -31,6 +31,7 @@
 use std::sync::Arc;
 
 use wasmtime::component::Resource;
+use wasmtime_wasi::p2::Pollable;
 
 use crate::audit_sink::{HostAuditEvent, HostAuditOutcome};
 use crate::engine::wasm::bindings::astrid::net::host::{
@@ -50,12 +51,21 @@ mod unix_listener;
 
 use stream::CONNECT_TIMEOUT;
 
-/// Maximum concurrent socket connections per capsule. Defense-in-depth
-/// cap on top of the per-principal profile quota. Tracked via
-/// [`HostState::net_stream_count`], bumped on every successful
-/// `accept` / `connect-tcp` push and decremented in the resource
-/// drop path.
-pub(super) const MAX_ACTIVE_STREAMS: usize = 8;
+#[async_trait::async_trait]
+impl Pollable for NetStream {
+    async fn ready(&mut self) {
+        match self {
+            Self::Unix(stream) => {
+                let stream = stream.lock().await;
+                let _ = stream.readable().await;
+            },
+            Self::Tcp(slot) => {
+                let stream = slot.stream.lock().await;
+                let _ = stream.readable().await;
+            },
+        }
+    }
+}
 
 /// Stamp marking a resource slot in the table as a `UnixListener` handle.
 /// The kernel pre-binds the listener; the resource handle is just a
@@ -129,6 +139,15 @@ pub(super) fn audit_net<T, E: std::fmt::Debug>(
             "audit",
         ),
     }
+}
+
+pub(super) fn record_net_stream_metrics(state: &HostState) {
+    metrics::gauge!("astrid_capsule_net_streams_active").set(f64::from(
+        u32::try_from(state.net_stream_budget.active()).unwrap_or(u32::MAX),
+    ));
+    metrics::gauge!("astrid_capsule_net_streams_limit").set(f64::from(
+        u32::try_from(state.net_stream_budget.limit()).unwrap_or(u32::MAX),
+    ));
 }
 
 /// Audit an outbound TCP connect, carrying the destination host + port.
@@ -324,11 +343,11 @@ impl net::Host for HostState {
             }
         }
 
-        if self.net_stream_count >= MAX_ACTIVE_STREAMS {
+        let Some(stream_lease) = self.net_stream_budget.try_acquire() else {
             let result: Result<Resource<TcpStream>, ErrorCode> = Err(ErrorCode::Quota);
             audit_net_connect(self, &host, port, &result);
             return result;
-        }
+        };
 
         let rt_handle = self.runtime_handle.clone();
         let blocking_semaphore = self.blocking_semaphore.clone();
@@ -377,13 +396,6 @@ impl net::Host for HostState {
             },
         };
 
-        if self.net_stream_count >= MAX_ACTIVE_STREAMS {
-            drop(stream);
-            let result: Result<Resource<TcpStream>, ErrorCode> = Err(ErrorCode::Quota);
-            audit_net_connect(self, &host, port, &result);
-            return result;
-        }
-
         let net_stream = NetStream::Tcp(TcpStreamSlot {
             stream: Arc::new(tokio::sync::Mutex::new(stream)),
             read_timeout: None,
@@ -402,6 +414,12 @@ impl net::Host for HostState {
                 return result;
             },
         };
+        let previous = self.net_stream_leases.insert(res.rep(), stream_lease);
+        debug_assert!(
+            previous.is_none(),
+            "net stream resource rep reused while live"
+        );
+        record_net_stream_metrics(self);
         self.net_stream_count += 1;
         let result: Result<Resource<TcpStream>, ErrorCode> = Ok(Resource::new_own(res.rep()));
         audit_net_connect(self, &host, port, &result);
@@ -466,11 +484,6 @@ impl net::Host for HostState {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn max_active_streams_pinned() {
-        assert_eq!(MAX_ACTIVE_STREAMS, 8);
-    }
 
     #[test]
     fn validate_host_accepts_normal_names() {

@@ -48,6 +48,11 @@ pub struct Args {
     #[arg(long, value_parser = parse_nonzero_concurrency)]
     pub host_blocking_concurrency: Option<usize>,
 
+    /// Override the process-wide persistent capsule network-stream budget.
+    /// Defaults to a host-derived share of the file-descriptor envelope.
+    #[arg(long, value_parser = parse_nonzero_concurrency)]
+    pub host_net_streams: Option<usize>,
+
     /// Override the max size of each capsule's dynamic instance pool (concurrent
     /// interceptor invocations). Highest-precedence override; defaults to a
     /// host-derived value (cores-scaled, replacing the old fixed 16).
@@ -109,6 +114,15 @@ fn resolve_capsule_limits(
         args.instance_pool_size
             .or_else(|| capsule_cfg.and_then(|c| c.instance_pool_size)),
     )
+}
+
+/// Resolve the process-wide persistent network-stream budget from the same
+/// precedence chain as the other capsule runtime limits.
+fn resolve_net_stream_limit(args: &Args, cfg: Option<&astrid_config::Config>) -> usize {
+    args.host_net_streams
+        .or_else(|| cfg.and_then(|c| c.capsule.host_net_streams))
+        .unwrap_or_else(astrid_capsule::host_net_stream_limit_default)
+        .max(1)
 }
 
 /// Resolve the `astrid:http` operator host policy from the `[http]` config
@@ -198,6 +212,7 @@ pub async fn run() -> Result<()> {
     // host-derived default); the kernel forwards them to every `WasmEngine`.
     // Done before `args.workspace` is consumed below.
     let runtime_limits = resolve_capsule_limits(&args, unified_cfg.as_ref());
+    let net_stream_limit = resolve_net_stream_limit(&args, unified_cfg.as_ref());
 
     // Operator-approved per-capsule local-egress allowlist (SSRF-airlock
     // exemptions). Operator config only — the kernel hands each capsule its
@@ -220,6 +235,7 @@ pub async fn run() -> Result<()> {
     )
     .await
     .map_err(|e| anyhow::anyhow!("Failed to boot Kernel: {e}"))?;
+    kernel.set_net_stream_limit(net_stream_limit);
 
     // In ephemeral mode, shut down immediately when the last client disconnects.
     if args.ephemeral {
@@ -427,8 +443,9 @@ fn spawn_gateway(
 
 #[cfg(test)]
 mod tests {
-    use super::provides_cli_socket_uplink;
+    use super::{Args, provides_cli_socket_uplink, resolve_net_stream_limit};
     use astrid_capsule::manifest::CapsuleManifest;
+    use clap::Parser;
 
     fn manifest(name: &str, uplink: bool, net_bind: &[&str]) -> CapsuleManifest {
         let mut manifest = CapsuleManifest::default();
@@ -460,5 +477,32 @@ mod tests {
                 manifest.package.name
             );
         }
+    }
+
+    #[test]
+    fn net_stream_limit_uses_cli_then_config_then_host_default() {
+        let mut config = astrid_config::Config::default();
+        config.capsule.host_net_streams = Some(123);
+
+        let from_config =
+            Args::try_parse_from(["astrid-daemon"]).expect("default daemon arguments should parse");
+        assert_eq!(resolve_net_stream_limit(&from_config, Some(&config)), 123);
+
+        let from_cli = Args::try_parse_from(["astrid-daemon", "--host-net-streams", "456"])
+            .expect("CLI stream override should parse");
+        assert_eq!(resolve_net_stream_limit(&from_cli, Some(&config)), 456);
+
+        assert_eq!(
+            resolve_net_stream_limit(&from_config, None),
+            astrid_capsule::host_net_stream_limit_default()
+        );
+    }
+
+    #[test]
+    fn net_stream_cli_rejects_zero() {
+        let Err(error) = Args::try_parse_from(["astrid-daemon", "--host-net-streams", "0"]) else {
+            panic!("zero must fail at the CLI boundary");
+        };
+        assert!(error.to_string().contains("must be >= 1"));
     }
 }

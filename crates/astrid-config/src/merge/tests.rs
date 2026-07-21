@@ -455,6 +455,35 @@ fn test_capsule_local_egress_workspace_cannot_widen_operator_value() {
 }
 
 #[test]
+fn test_host_net_streams_is_operator_only() {
+    let operator: toml::Value = toml::from_str(
+        r"
+        [capsule]
+        host_net_streams = 64
+        ",
+    )
+    .unwrap();
+    let workspace: toml::Value = toml::from_str(
+        r"
+        [capsule]
+        host_net_streams = 4096
+        ",
+    )
+    .unwrap();
+
+    let mut merged = operator.clone();
+    deep_merge(&mut merged, &workspace);
+    enforce_restrictions(&mut merged, &operator, &workspace);
+    assert_eq!(merged["capsule"]["host_net_streams"].as_integer(), Some(64));
+
+    let empty_operator: toml::Value = toml::from_str("").unwrap();
+    let mut no_operator = empty_operator.clone();
+    deep_merge(&mut no_operator, &workspace);
+    enforce_restrictions(&mut no_operator, &empty_operator, &workspace);
+    assert!(no_operator["capsule"].get("host_net_streams").is_none());
+}
+
+#[test]
 fn test_http_section_cannot_be_set_by_workspace() {
     // The [http] host limits are widening controls (raising a timeout, redirect
     // cap, or body cap relaxes the host). A workspace/project layer must not be

@@ -1,6 +1,7 @@
 //! Factory and routing logic for instantiating Composite Capsules.
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use crate::capsule::{Capsule, CompositeCapsule};
 use crate::engine::wasm::limits::{CapsuleRuntimeLimits, HttpLimits};
@@ -32,6 +33,10 @@ pub struct CapsuleLoader {
     /// semaphores. A plain `Copy` value, not a shared handle. See
     /// [`CapsuleRuntimeLimits`].
     runtime_limits: CapsuleRuntimeLimits,
+    /// Process-wide persistent network-stream budget. Kernel construction
+    /// replaces the default with its one shared handle before loading any
+    /// capsule; the default preserves standalone loader compatibility.
+    net_stream_budget: Arc<crate::NetStreamBudget>,
     /// Resolved `astrid:http` host ceilings (timeouts, redirect/stream caps,
     /// buffered-body limit), resolved once by the daemon from the `[http]`
     /// config section and handed to every `WasmEngine`. A global `Copy` value.
@@ -66,8 +71,16 @@ impl CapsuleLoader {
             fuel_rate,
             memory_ledger,
             runtime_limits,
+            net_stream_budget: Arc::new(crate::NetStreamBudget::default()),
             http_limits,
         }
+    }
+
+    /// Use the kernel-owned process-wide persistent network-stream budget.
+    #[must_use]
+    pub fn with_net_stream_budget(mut self, budget: Arc<crate::NetStreamBudget>) -> Self {
+        self.net_stream_budget = budget;
+        self
     }
 
     /// Parse a `CapsuleManifest` and build a unified `CompositeCapsule`.
@@ -88,15 +101,18 @@ impl CapsuleLoader {
 
         // 1. WASM Component Engine
         if !manifest.components.is_empty() {
-            composite.add_engine(Box::new(crate::engine::WasmEngine::new(
-                manifest.clone(),
-                capsule_dir.clone(),
-                self.fuel_ledger.clone(),
-                self.fuel_rate.clone(),
-                self.memory_ledger.clone(),
-                self.runtime_limits,
-                self.http_limits,
-            )));
+            composite.add_engine(Box::new(
+                crate::engine::WasmEngine::new(
+                    manifest.clone(),
+                    capsule_dir.clone(),
+                    self.fuel_ledger.clone(),
+                    self.fuel_rate.clone(),
+                    self.memory_ledger.clone(),
+                    self.runtime_limits,
+                    self.http_limits,
+                )
+                .with_net_stream_budget(Arc::clone(&self.net_stream_budget)),
+            ));
         }
 
         // 2. Legacy Host MCP Engine (The Airlock Override)

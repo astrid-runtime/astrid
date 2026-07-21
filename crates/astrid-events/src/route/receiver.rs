@@ -39,6 +39,19 @@ impl std::fmt::Debug for RoutedEventReceiver {
 }
 
 impl RoutedEventReceiver {
+    /// Wait until at least one routed event is available without consuming it.
+    /// Used by the Component Model pollable adapter so a guest can multiplex
+    /// IPC and socket readiness without timeout polling.
+    pub async fn ready(&mut self) {
+        loop {
+            let notified = self.notify.notified();
+            if self.route_entry.lock().total_bytes > 0 {
+                return;
+            }
+            notified.await;
+        }
+    }
+
     /// Non-blocking receive of one event from the next DRR round.
     ///
     /// This is the host-boundary counterpart to [`recv`](Self::recv): WASM

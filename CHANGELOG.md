@@ -9,7 +9,23 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
 
 ## [Unreleased]
 
+### Added
+
+- **Host-derived, operator-tunable persistent network-stream capacity.** A
+  process-wide admission budget is shared by every capsule and pooled Store,
+  exposed through `capsule.host_net_streams`,
+  `ASTRID_CAPSULE_HOST_NET_STREAMS`, and `--host-net-streams`. The derived
+  default reserves file-descriptor headroom, live usage/limit gauges are
+  exported, and lowering the ceiling does not disrupt existing streams.
+- **Real Component Model readiness for IPC, TCP/Unix streams, and the kernel
+  Unix listener.** Capsules can block on heterogeneous pollables without
+  timeout-scanning idle resources.
+
 ### Fixed
+
+- **Fragmented framed socket reads preserve partial decoder state.** A slow
+  peer can no longer split the four-byte length prefix across non-blocking read
+  windows and desynchronize the connection.
 
 - **Stable crates publication installs its authenticated-hash prerequisite.**
   The protected publisher installs the pinned `b3sum` binary before validating

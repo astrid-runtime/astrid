@@ -20,6 +20,10 @@
 //! resolved by the caller (CLI > config file > env > host-derived default); a
 //! `None` override here means "use the host-derived default".
 
+use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
+};
 use std::thread::available_parallelism;
 use std::time::Duration;
 
@@ -106,6 +110,113 @@ pub fn host_io_concurrency_default() -> usize {
         // re-opening the EMFILE risk this clamp exists to close.
         Some(soft) => by_cores.min((soft / 2).max(1)),
         None => by_cores,
+    }
+}
+
+/// Host-derived process-wide ceiling for persistent network streams.
+///
+/// A stream occupies a file descriptor for its whole lifetime. Taking half of
+/// the already fd-clamped async-I/O budget reserves at most one quarter of
+/// `RLIMIT_NOFILE` for persistent capsule streams and leaves the rest for
+/// in-flight I/O, listeners, storage, logs, and unrelated descriptors.
+#[must_use]
+pub fn host_net_stream_limit_default() -> usize {
+    (host_io_concurrency_default() / 2).max(1)
+}
+
+/// Process-wide admission budget shared by every capsule engine and Store.
+/// Lowering the limit is non-destructive: existing streams remain valid and
+/// new admissions pause until usage falls below the new ceiling.
+#[derive(Debug)]
+pub struct NetStreamBudget {
+    limit: AtomicUsize,
+    active: AtomicUsize,
+    available: event_listener::Event,
+}
+
+impl NetStreamBudget {
+    /// Construct a stream budget. Programmatic zero is clamped to one; config
+    /// and CLI validation reject explicit zero earlier with a clearer error.
+    #[must_use]
+    pub fn new(limit: usize) -> Self {
+        Self {
+            limit: AtomicUsize::new(limit.max(1)),
+            active: AtomicUsize::new(0),
+            available: event_listener::Event::new(),
+        }
+    }
+
+    /// Atomically acquire one stream slot and return its RAII lease.
+    #[must_use]
+    pub fn try_acquire(self: &Arc<Self>) -> Option<NetStreamLease> {
+        self.active
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
+                (active < self.limit.load(Ordering::Acquire)).then_some(active + 1)
+            })
+            .ok()?;
+        Some(NetStreamLease {
+            budget: Arc::clone(self),
+        })
+    }
+
+    /// Change the admission ceiling without disrupting existing streams.
+    pub fn set_limit(&self, limit: usize) {
+        let limit = limit.max(1);
+        let previous = self.limit.swap(limit, Ordering::AcqRel);
+        if limit > previous {
+            self.available.notify(usize::MAX);
+        }
+    }
+
+    /// Current admission ceiling.
+    #[must_use]
+    pub fn limit(&self) -> usize {
+        self.limit.load(Ordering::Acquire)
+    }
+
+    /// Current number of admitted live streams.
+    #[must_use]
+    pub fn active(&self) -> usize {
+        self.active.load(Ordering::Acquire)
+    }
+
+    /// Whether a new stream can be admitted at this instant.
+    #[must_use]
+    pub fn has_capacity(&self) -> bool {
+        self.active() < self.limit()
+    }
+
+    /// Wait without polling until at least one stream slot may be available.
+    /// Callers must still use [`try_acquire`](Self::try_acquire): another task
+    /// may win the slot between this wake and admission.
+    pub async fn wait_available(&self) {
+        loop {
+            let listener = self.available.listen();
+            if self.has_capacity() {
+                return;
+            }
+            listener.await;
+        }
+    }
+}
+
+impl Default for NetStreamBudget {
+    fn default() -> Self {
+        Self::new(host_net_stream_limit_default())
+    }
+}
+
+/// RAII ownership of one slot in a [`NetStreamBudget`].
+#[derive(Debug)]
+pub struct NetStreamLease {
+    budget: Arc<NetStreamBudget>,
+}
+
+impl Drop for NetStreamLease {
+    fn drop(&mut self) {
+        let previous = self.budget.active.fetch_sub(1, Ordering::AcqRel);
+        debug_assert!(previous > 0, "net stream budget underflow");
+        self.budget.available.notify(1);
     }
 }
 
@@ -382,6 +493,30 @@ mod tests {
                 "with ample fds the io ceiling must not be tighter than blocking"
             );
         }
+    }
+
+    #[test]
+    fn net_stream_default_is_derived_from_fd_clamped_io_budget() {
+        assert_eq!(
+            host_net_stream_limit_default(),
+            (host_io_concurrency_default() / 2).max(1)
+        );
+    }
+
+    #[test]
+    fn net_stream_budget_is_atomic_raii_and_live_tunable() {
+        let budget = Arc::new(NetStreamBudget::new(2));
+        let first = budget.try_acquire().expect("first stream");
+        let second = budget.try_acquire().expect("second stream");
+        assert!(budget.try_acquire().is_none());
+        assert_eq!(budget.active(), 2);
+
+        budget.set_limit(1);
+        drop(first);
+        assert!(budget.try_acquire().is_none());
+        drop(second);
+        assert_eq!(budget.active(), 0);
+        assert!(budget.try_acquire().is_some());
     }
 
     #[test]

@@ -528,6 +528,7 @@ version = "0.10.4"
 dependencies = [
  "astrid-core",
  "dashmap",
+ "event-listener",
  "nix 0.31.3",
  "parking_lot",
  "semver",
