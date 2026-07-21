@@ -13,13 +13,17 @@
 #![no_main]
 
 mod apic;
+mod domain;
 mod entropy;
 mod gdt;
 mod interrupts;
 mod memory;
+mod payloads;
 mod serial;
+mod syscall;
 mod tests;
 mod trap;
+mod vm;
 
 use bootloader_api::config::Mapping;
 use bootloader_api::{entry_point, BootInfo, BootloaderConfig};
@@ -61,8 +65,13 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     apic::init(phys_offset);
     serial::ev_apic_timer_start();
 
-    // Enable interrupts and wait for the timer to deliver 8 ticks; the handler
-    // masks the timer at tick 8.
+    // Bring up syscall/sysret (EFER.SCE + STAR/LSTAR/SFMASK) for ring-3 entry.
+    syscall::init();
+
+    // Enable interrupts and wait for the timer to deliver 8 ticks (the M1 boot
+    // proof). Unlike M1 the timer is NOT masked at tick 8: it stays running so
+    // it can preempt ring-3 domains. Interrupts are then disabled in the kernel;
+    // domains re-enable them for themselves on entry via the iretq frame.
     x86_64::instructions::interrupts::enable();
     while interrupts::tick_count() < 8 {
         x86_64::instructions::hlt();
@@ -74,7 +83,9 @@ fn kernel_main(boot_info: &'static mut BootInfo) -> ! {
     // A W^X or NX violation observed by the audit must not silently pass.
     let wx_ok = !rodata_nx_w && !text_w && !data_exec;
     let tests_ok = tests::run_all(data_exec);
-    let ok = wx_ok && tests_ok;
+    // First ring-3 protection domain: the seven kernel-driven scenarios.
+    let scenarios_ok = domain::run_all();
+    let ok = wx_ok && tests_ok && scenarios_ok;
 
     serial::ev_halt(ok);
     serial::exit_qemu(ok);

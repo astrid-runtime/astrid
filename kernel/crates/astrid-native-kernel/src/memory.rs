@@ -156,6 +156,35 @@ pub fn reset_frames() {
     FRAMES.lock().reset();
 }
 
+/// Real allocator census: the number of frames currently available
+/// (`usable & !allocated`), counted from the live bitmap. This is the ground
+/// truth the domain reclaim balance check compares against — it is derived by
+/// counting free bits, never from side bookkeeping that the same paths mutate.
+pub fn free_frame_count() -> usize {
+    let alloc = FRAMES.lock();
+    let mut count = 0usize;
+    for word in 0..BITMAP_WORDS {
+        count += (alloc.usable[word] & !alloc.allocated[word]).count_ones() as usize;
+    }
+    count
+}
+
+/// Base of the full physical-memory mapping. Physical frame `p` is readable and
+/// writable by the kernel at virtual address `phys_offset_addr() + p`.
+pub fn phys_offset_addr() -> u64 {
+    phys_offset()
+}
+
+/// A kernel-writable pointer to the byte at physical address `phys`, via the
+/// physical-memory mapping.
+///
+/// # Safety
+/// `phys` must be a physical address within the mapped physical span; the
+/// caller must respect Rust aliasing for the pointee it forms.
+pub unsafe fn phys_mut(phys: u64) -> *mut u8 {
+    (phys_offset() + phys) as *mut u8
+}
+
 /// Initialize the kernel heap over the static region.
 pub fn init_heap() {
     HEAP.call_once(|| {

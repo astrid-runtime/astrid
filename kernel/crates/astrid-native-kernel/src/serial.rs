@@ -157,6 +157,52 @@ pub fn ev_fault(vector: u8, code: u64, rip: u64) {
     ));
 }
 
+pub fn ev_domain_create(domain: usize, frames: usize) {
+    emit(format_args!(
+        "\"ev\":\"domain.create\",\"domain\":{domain},\"frames\":{frames}"
+    ));
+}
+
+pub fn ev_domain_enter(domain: usize) {
+    emit(format_args!("\"ev\":\"domain.enter\",\"domain\":{domain}"));
+}
+
+pub fn ev_domain_note(domain: usize, value: u64) {
+    emit(format_args!(
+        "\"ev\":\"domain.note\",\"domain\":{domain},\"value\":{value}"
+    ));
+}
+
+pub fn ev_domain_fault(domain: usize, vector: u64, code: u64, rip: u64) {
+    emit(format_args!(
+        "\"ev\":\"domain.fault\",\"domain\":{domain},\"vector\":{vector},\"code\":{code},\"rip\":\"{rip:#x}\",\"cpl\":3"
+    ));
+}
+
+pub fn ev_domain_exit(domain: usize, code: u64) {
+    emit(format_args!(
+        "\"ev\":\"domain.exit\",\"domain\":{domain},\"code\":{code}"
+    ));
+}
+
+pub fn ev_domain_killed(domain: usize, cause: &'static str) {
+    emit(format_args!(
+        "\"ev\":\"domain.killed\",\"domain\":{domain},\"cause\":\"{cause}\""
+    ));
+}
+
+pub fn ev_domain_reclaimed(domain: usize, frames_freed: usize, balance_ok: bool) {
+    emit(format_args!(
+        "\"ev\":\"domain.reclaimed\",\"domain\":{domain},\"frames_freed\":{frames_freed},\"balance_ok\":{balance_ok}"
+    ));
+}
+
+pub fn ev_cap_revoked(object: u32, generation: u32) {
+    emit(format_args!(
+        "\"ev\":\"cap.revoked\",\"object\":{object},\"generation\":{generation}"
+    ));
+}
+
 pub fn ev_test(name: &'static str, pass: bool) {
     let ev = if pass { "test.pass" } else { "test.fail" };
     emit(format_args!("\"ev\":\"{ev}\",\"name\":\"{name}\""));

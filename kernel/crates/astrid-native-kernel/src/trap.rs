@@ -51,9 +51,16 @@ pub struct TrapFrame {
 }
 
 const VECTOR_BREAKPOINT: u8 = 3;
+const VECTOR_GENERAL_PROTECTION: u8 = 13;
 const VECTOR_PAGE_FAULT: u8 = 14;
 const VECTOR_TIMER: u8 = 32;
 const VECTOR_SPURIOUS: u8 = 255;
+
+/// True if the trap was taken while executing in ring 3 (CPL=3).
+#[inline]
+fn from_user(frame: &TrapFrame) -> bool {
+    frame.cs & 3 == 3
+}
 
 /// The one Rust trap handler. Receives a pointer to the on-stack [`TrapFrame`];
 /// mutations to `frame.rip` take effect on `iretq`.
@@ -68,14 +75,23 @@ unsafe extern "C" fn rust_trap_handler(frame: *mut TrapFrame) {
     let vector = f.vector as u8;
     match vector {
         VECTOR_TIMER => {
-            let n = TICK.fetch_add(1, Ordering::SeqCst) + 1;
-            if n <= 8 {
-                serial::ev_apic_timer_tick(n);
+            if from_user(f) {
+                // Preemption of a running domain: acknowledge, then charge one
+                // tick against its quota and kill it if the quota is spent.
+                apic::eoi();
+                if crate::domain::timer_tick() {
+                    crate::domain::quota_kill(); // fills the death record; never returns
+                }
+                // Otherwise fall through to iretq, resuming ring 3.
+            } else {
+                // Boot proof: emit ticks 1..=8. The timer is left running (no
+                // mask) so it can preempt ring 3 later.
+                let n = TICK.fetch_add(1, Ordering::SeqCst) + 1;
+                if n <= 8 {
+                    serial::ev_apic_timer_tick(n);
+                }
+                apic::eoi();
             }
-            if n == 8 {
-                apic::mask_timer();
-            }
-            apic::eoi();
         },
         VECTOR_SPURIOUS => {
             // Spurious interrupts require no EOI.
@@ -85,11 +101,38 @@ unsafe extern "C" fn rust_trap_handler(frame: *mut TrapFrame) {
             serial::ev_fault(VECTOR_BREAKPOINT, f.error_code, f.rip);
         },
         VECTOR_PAGE_FAULT => {
+            if from_user(f) {
+                // A ring-3 domain touched memory it may not: structured
+                // domain.fault record, then kill via the continuation.
+                serial::ev_domain_fault(
+                    crate::domain::current(),
+                    VECTOR_PAGE_FAULT as u64,
+                    f.error_code,
+                    f.rip,
+                );
+                crate::domain::fault_kill(VECTOR_PAGE_FAULT as u64, f.error_code, f.rip);
+            }
             serial::ev_fault(VECTOR_PAGE_FAULT, f.error_code, f.rip);
             if EXPECT_FAULT.swap(false, Ordering::SeqCst) {
                 f.rip = RECOVERY_RIP.load(Ordering::SeqCst);
                 return;
             }
+            serial::ev_halt(false);
+            serial::exit_qemu(false);
+        },
+        VECTOR_GENERAL_PROTECTION => {
+            if from_user(f) {
+                // A ring-3 domain executed a privileged instruction: structured
+                // domain.fault record, then kill via the continuation.
+                serial::ev_domain_fault(
+                    crate::domain::current(),
+                    VECTOR_GENERAL_PROTECTION as u64,
+                    f.error_code,
+                    f.rip,
+                );
+                crate::domain::fault_kill(VECTOR_GENERAL_PROTECTION as u64, f.error_code, f.rip);
+            }
+            serial::ev_fault(VECTOR_GENERAL_PROTECTION, f.error_code, f.rip);
             serial::ev_halt(false);
             serial::exit_qemu(false);
         },

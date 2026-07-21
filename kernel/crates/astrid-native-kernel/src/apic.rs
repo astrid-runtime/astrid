@@ -23,7 +23,6 @@ const IA32_APIC_BASE: u32 = 0x1B;
 pub const TIMER_VECTOR: u8 = 32;
 pub const SPURIOUS_VECTOR: u8 = 255;
 
-const LVT_MASKED: u32 = 1 << 16;
 const LVT_PERIODIC: u32 = 1 << 17;
 
 /// Virtual base of the LAPIC MMIO window (physical base + phys offset).
@@ -32,12 +31,6 @@ static LAPIC_VIRT_BASE: AtomicU64 = AtomicU64::new(0);
 #[inline]
 fn lapic_ptr(reg: u64) -> *mut u32 {
     (LAPIC_VIRT_BASE.load(Ordering::Relaxed) + reg) as *mut u32
-}
-
-#[inline]
-fn read_reg(reg: u64) -> u32 {
-    // SAFETY: LAPIC MMIO window is identity-offset mapped and 4-byte aligned.
-    unsafe { core::ptr::read_volatile(lapic_ptr(reg)) }
 }
 
 #[inline]
@@ -91,12 +84,6 @@ pub fn init(phys_offset: u64) {
     write_reg(REG_TIMER_DIVIDE, 0b0011);
     write_reg(REG_LVT_TIMER, TIMER_VECTOR as u32 | LVT_PERIODIC);
     write_reg(REG_TIMER_INITIAL, 0x0010_0000);
-}
-
-/// Mask the LVT timer so no further ticks are delivered.
-pub fn mask_timer() {
-    let cur = read_reg(REG_LVT_TIMER);
-    write_reg(REG_LVT_TIMER, cur | LVT_MASKED);
 }
 
 /// Signal end-of-interrupt to the local APIC.
