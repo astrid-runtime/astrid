@@ -145,6 +145,22 @@ fn infinite_start_worker() -> WorkerArtifact {
     )
 }
 
+fn growing_worker() -> WorkerArtifact {
+    artifact(
+        "growing",
+        r#"(module
+            (memory (import "astrid_compute" "memory") 1 2 shared)
+            (func (export "astrid_compute_abi_version") (result i32)
+                i32.const 1)
+            (func (export "astrid_compute_run")
+                (param i32 i64 i64 i64) (result i32)
+                i32.const 1
+                memory.grow
+                drop
+                i32.const 0))"#,
+    )
+}
+
 fn request(mode: ExecutionMode, parallelism: Parallelism) -> GroupRequest {
     GroupRequest {
         mode,
@@ -390,14 +406,20 @@ fn ledger_aggregates_across_runtimes_and_releases_on_drop() {
         .open_group(
             &alice,
             &basic_worker(),
-            request(ExecutionMode::Parallel, Parallelism::Exact(2)),
+            GroupRequest {
+                maximum_memory_pages: 2,
+                ..request(ExecutionMode::Parallel, Parallelism::Exact(2))
+            },
         )
         .expect("first capsule reserves both workers");
     assert!(matches!(
         runtime_b.open_group(
             &alice,
             &basic_worker(),
-            request(ExecutionMode::Deterministic, Parallelism::Auto),
+            GroupRequest {
+                maximum_memory_pages: 2,
+                ..request(ExecutionMode::Deterministic, Parallelism::Auto)
+            },
         ),
         Err(ComputeError::Quota)
     ));
@@ -408,7 +430,10 @@ fn ledger_aggregates_across_runtimes_and_releases_on_drop() {
         .open_group(
             &alice,
             &basic_worker(),
-            request(ExecutionMode::Deterministic, Parallelism::Auto),
+            GroupRequest {
+                maximum_memory_pages: 2,
+                ..request(ExecutionMode::Deterministic, Parallelism::Auto)
+            },
         )
         .expect("released reservation is reusable");
     assert_eq!(second.parallelism(), 1);
@@ -427,14 +452,20 @@ fn principals_do_not_compete_for_each_others_reservation() {
         .open_group(
             &principal("alice"),
             &basic_worker(),
-            request(ExecutionMode::Deterministic, Parallelism::Auto),
+            GroupRequest {
+                maximum_memory_pages: 1,
+                ..request(ExecutionMode::Deterministic, Parallelism::Auto)
+            },
         )
         .expect("alice reserves one");
     let bob = runtime
         .open_group(
             &principal("bob"),
             &basic_worker(),
-            request(ExecutionMode::Deterministic, Parallelism::Auto),
+            GroupRequest {
+                maximum_memory_pages: 1,
+                ..request(ExecutionMode::Deterministic, Parallelism::Auto)
+            },
         )
         .expect("bob independently reserves one");
     assert_eq!(alice.parallelism(), 1);
@@ -442,7 +473,7 @@ fn principals_do_not_compete_for_each_others_reservation() {
 }
 
 #[test]
-fn memory_growth_is_aggregate_and_rolls_back_on_engine_failure() {
+fn maximum_memory_is_reserved_before_worker_direct_growth() {
     let ledger = ComputeLedger::default();
     let limits = ComputeLimits {
         max_memory_bytes_per_principal: Some(2 * WASM_PAGE_BYTES),
@@ -460,9 +491,47 @@ fn memory_growth_is_aggregate_and_rolls_back_on_engine_failure() {
             },
         )
         .expect("group opens");
+    assert_eq!(ledger.usage(&alice).memory_bytes, 2 * WASM_PAGE_BYTES);
     assert_eq!(group.grow(1).expect("one page admitted"), 1);
     assert_eq!(ledger.usage(&alice).memory_bytes, 2 * WASM_PAGE_BYTES);
-    assert_eq!(group.grow(1), Err(ComputeError::Quota));
+    assert!(matches!(group.grow(1), Err(ComputeError::WorkerFailed(_))));
+    assert_eq!(ledger.usage(&alice).memory_bytes, 2 * WASM_PAGE_BYTES);
+}
+
+#[test]
+fn worker_direct_growth_is_pre_reserved_and_observed_after_the_job() {
+    let ledger = ComputeLedger::default();
+    let limits = ComputeLimits {
+        max_memory_bytes_per_principal: Some(2 * WASM_PAGE_BYTES),
+        ..ComputeLimits::default()
+    };
+    let runtime = ComputeRuntime::new(ledger.clone(), limits).expect("runtime starts");
+    let alice = principal("alice");
+    let group = runtime
+        .open_group(
+            &alice,
+            &growing_worker(),
+            GroupRequest {
+                maximum_memory_pages: 2,
+                ..request(ExecutionMode::Deterministic, Parallelism::Auto)
+            },
+        )
+        .expect("maximum is admitted before execution");
+    assert_eq!(group.memory_pages(), 1);
+    assert_eq!(ledger.usage(&alice).memory_bytes, 2 * WASM_PAGE_BYTES);
+    group
+        .submit(WorkDescriptor {
+            offset: ABI_HEADER_BYTES,
+            length: 0,
+            tag: 0,
+            worker_index: None,
+            fuel: Some(1_000_000),
+        })
+        .expect("growth job queues")
+        .join()
+        .expect("growth job completes");
+    assert_eq!(group.memory_pages(), 2);
+    assert_eq!(group.accounting().memory_bytes_current, 2 * WASM_PAGE_BYTES);
     assert_eq!(ledger.usage(&alice).memory_bytes, 2 * WASM_PAGE_BYTES);
 }
 

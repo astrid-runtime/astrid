@@ -189,7 +189,7 @@ pub struct GroupAccounting {
 pub struct PrincipalComputeUsage {
     /// Workers held by all groups/capsules sharing this ledger.
     pub workers: u64,
-    /// Shared bytes held by all groups/capsules sharing this ledger.
+    /// Maximum shared bytes reserved by all groups/capsules sharing this ledger.
     pub memory_bytes: u64,
 }
 
@@ -248,29 +248,9 @@ impl ComputeLedger {
             ledger: self.clone(),
             principal,
             workers: u64::from(workers),
-            memory_bytes: AtomicU64::new(memory_bytes),
+            memory_bytes,
             released: AtomicBool::new(false),
-            memory_limit: limits.max_memory_bytes_per_principal,
         })
-    }
-
-    fn grow_memory(
-        &self,
-        principal: &PrincipalId,
-        delta: u64,
-        limit: Option<u64>,
-    ) -> Result<(), ComputeError> {
-        let mut map = self
-            .inner
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let usage = map.entry(principal.clone()).or_default();
-        let next = usage.memory_bytes.saturating_add(delta);
-        if limit.is_some_and(|max| next > max) {
-            return Err(ComputeError::Quota);
-        }
-        usage.memory_bytes = next;
-        Ok(())
     }
 
     fn release(&self, principal: &PrincipalId, workers: u64, memory_bytes: u64) {
@@ -293,33 +273,15 @@ struct ComputeReservation {
     ledger: ComputeLedger,
     principal: PrincipalId,
     workers: u64,
-    memory_bytes: AtomicU64,
+    memory_bytes: u64,
     released: AtomicBool,
-    memory_limit: Option<u64>,
-}
-
-impl ComputeReservation {
-    fn grow_memory(&self, delta: u64) -> Result<(), ComputeError> {
-        self.ledger
-            .grow_memory(&self.principal, delta, self.memory_limit)?;
-        self.memory_bytes.fetch_add(delta, Ordering::Relaxed);
-        Ok(())
-    }
-
-    fn rollback_memory(&self, delta: u64) {
-        self.ledger.release(&self.principal, 0, delta);
-        self.memory_bytes.fetch_sub(delta, Ordering::Relaxed);
-    }
 }
 
 impl Drop for ComputeReservation {
     fn drop(&mut self) {
         if !self.released.swap(true, Ordering::AcqRel) {
-            self.ledger.release(
-                &self.principal,
-                self.workers,
-                self.memory_bytes.load(Ordering::Relaxed),
-            );
+            self.ledger
+                .release(&self.principal, self.workers, self.memory_bytes);
         }
     }
 }
@@ -525,10 +487,16 @@ impl ComputeRuntime {
         let initial_bytes = u64::from(request.initial_memory_pages)
             .checked_mul(WASM_PAGE_BYTES)
             .ok_or_else(|| ComputeError::InvalidInput("initial memory overflow".to_owned()))?;
+        // A worker can execute `memory.grow` directly. Reserve its declared
+        // maximum up front so no guest instruction can bypass aggregate
+        // principal admission between host calls.
+        let maximum_bytes = u64::from(request.maximum_memory_pages)
+            .checked_mul(WASM_PAGE_BYTES)
+            .ok_or_else(|| ComputeError::InvalidInput("maximum memory overflow".to_owned()))?;
         let reservation = self.inner.ledger.reserve(
             principal.clone(),
             workers,
-            initial_bytes,
+            maximum_bytes,
             self.inner.limits,
         )?;
 
@@ -582,7 +550,7 @@ impl ComputeRuntime {
                 closed,
                 jobs,
                 accounting,
-                reservation,
+                _reservation: reservation,
                 max_job_fuel: self.inner.limits.max_job_fuel,
             }),
         })
@@ -737,7 +705,7 @@ struct GroupInner {
     closed: Arc<AtomicBool>,
     jobs: Arc<Mutex<Vec<Weak<JobInner>>>>,
     accounting: Arc<AccountingState>,
-    reservation: ComputeReservation,
+    _reservation: ComputeReservation,
     max_job_fuel: Option<u64>,
 }
 
@@ -798,21 +766,16 @@ impl ComputeGroup {
         atomic_write_bytes(&self.inner.memory, offset, bytes)
     }
 
-    /// Grow shared memory after reserving the principal's additional bytes.
+    /// Grow shared memory within the maximum reserved when the group opened.
     ///
     /// # Errors
     ///
     /// Returns [`ComputeError::Closed`] after cancellation,
-    /// [`ComputeError::Quota`] when aggregate policy denies the growth, or
     /// [`ComputeError::WorkerFailed`] if Wasmtime cannot grow the memory.
     pub fn grow(&self, delta_pages: u32) -> Result<u32, ComputeError> {
         if self.inner.closed.load(Ordering::Acquire) {
             return Err(ComputeError::Closed);
         }
-        let delta_bytes = u64::from(delta_pages)
-            .checked_mul(WASM_PAGE_BYTES)
-            .ok_or_else(|| ComputeError::InvalidInput("memory growth overflow".to_owned()))?;
-        self.inner.reservation.grow_memory(delta_bytes)?;
         match self.inner.memory.grow(u64::from(delta_pages)) {
             Ok(previous) => {
                 let current = self.inner.memory.data_size() as u64;
@@ -822,12 +785,9 @@ impl ComputeGroup {
                     ComputeError::WorkerFailed("previous page count exceeded u32".to_owned())
                 })
             },
-            Err(error) => {
-                self.inner.reservation.rollback_memory(delta_bytes);
-                Err(ComputeError::WorkerFailed(format!(
-                    "grow shared memory: {error}"
-                )))
-            },
+            Err(error) => Err(ComputeError::WorkerFailed(format!(
+                "grow shared memory: {error}"
+            ))),
         }
     }
 
@@ -1289,6 +1249,9 @@ impl WorkerSlot {
                     };
                     let remaining = store.get_fuel().unwrap_or(0);
                     let consumed = fuel.saturating_sub(remaining);
+                    let current_memory = memory.data_size() as u64;
+                    accounting.set_memory(current_memory);
+                    let _ = atomic_store_u64(&memory, 24, current_memory);
                     accounting
                         .fuel_consumed
                         .fetch_add(consumed, Ordering::Relaxed);
