@@ -4,7 +4,8 @@ Status: Milestone 0 exit artifact; binding on all native-kernel work
 
 Last reviewed: 2026-07-21
 
-Companions: [native-kernel scope](astrid-native-kernel.md),
+Companions: [threat model](astrid-kernel-threat-model.md),
+[native-kernel scope](astrid-native-kernel.md),
 [AI-native OS workplan](astrid-ai-native-os-workplan.md),
 [driver domain contract](astrid-driver-domain-contract.md),
 [Tensor Logic composition](astrid-tensor-logic-composition.md)
