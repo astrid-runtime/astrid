@@ -105,6 +105,46 @@ fn trapping_worker() -> WorkerArtifact {
     )
 }
 
+fn expensive_start_worker() -> WorkerArtifact {
+    artifact(
+        "expensive-start",
+        r#"(module
+            (memory (import "astrid_compute" "memory") 1 32 shared)
+            (func $start
+                (local $remaining i32)
+                i32.const 2000000
+                local.set $remaining
+                loop $initialize
+                    local.get $remaining
+                    i32.const 1
+                    i32.sub
+                    local.tee $remaining
+                    br_if $initialize
+                end)
+            (start $start)
+            (func (export "astrid_compute_abi_version") (result i32)
+                i32.const 1)
+            (func (export "astrid_compute_run")
+                (param i32 i64 i64 i64) (result i32)
+                i32.const 0))"#,
+    )
+}
+
+fn infinite_start_worker() -> WorkerArtifact {
+    artifact(
+        "infinite-start",
+        r#"(module
+            (memory (import "astrid_compute" "memory") 1 32 shared)
+            (func $start (loop $spin br $spin))
+            (start $start)
+            (func (export "astrid_compute_abi_version") (result i32)
+                i32.const 1)
+            (func (export "astrid_compute_run")
+                (param i32 i64 i64 i64) (result i32)
+                i32.const 0))"#,
+    )
+}
+
 fn request(mode: ExecutionMode, parallelism: Parallelism) -> GroupRequest {
     GroupRequest {
         mode,
@@ -145,6 +185,52 @@ fn deterministic_jobs_share_memory_and_preserve_queue_order() {
         group.read(ABI_HEADER_BYTES, 4).expect("memory reads"),
         2_u32.to_le_bytes()
     );
+}
+
+#[test]
+fn worker_startup_has_no_hidden_one_million_fuel_ceiling() {
+    let runtime = ComputeRuntime::new(ComputeLedger::default(), ComputeLimits::default())
+        .expect("runtime starts");
+    let group = runtime
+        .open_group(
+            &principal("alice"),
+            &expensive_start_worker(),
+            request(ExecutionMode::Deterministic, Parallelism::Auto),
+        )
+        .expect("bounded but expensive worker initialization succeeds");
+    let result = group
+        .submit(WorkDescriptor {
+            offset: ABI_HEADER_BYTES,
+            length: 0,
+            tag: 0,
+            worker_index: None,
+            fuel: Some(1_000_000),
+        })
+        .expect("job queues")
+        .join()
+        .expect("job completes");
+    assert_eq!(result.worker_status, 0);
+}
+
+#[test]
+fn non_terminating_worker_startup_is_forcibly_interrupted() {
+    let runtime = ComputeRuntime::new_with_worker_start_timeout(
+        ComputeLedger::default(),
+        ComputeLimits::default(),
+        Duration::from_millis(100),
+    )
+    .expect("runtime starts");
+    let started = Instant::now();
+    let error = runtime
+        .open_group(
+            &principal("alice"),
+            &infinite_start_worker(),
+            request(ExecutionMode::Deterministic, Parallelism::Auto),
+        )
+        .expect_err("infinite start is rejected");
+    assert!(matches!(error, ComputeError::WorkerInvalid(_)));
+    assert!(error.to_string().contains("worker startup exceeded"));
+    assert!(started.elapsed() < Duration::from_secs(2));
 }
 
 #[test]

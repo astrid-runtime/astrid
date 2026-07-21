@@ -43,6 +43,10 @@ pub const UNBOUNDED_JOB_FUEL: u64 = u64::MAX;
 const WORKER_QUEUE_CAPACITY: usize = 64;
 /// Epoch cadence bounds forced cancellation latency for non-cooperative code.
 const EPOCH_INTERVAL: Duration = Duration::from_millis(25);
+/// Signed workers may initialize large passive data segments (for example a
+/// kernel image) before their first job. Startup has no hidden fuel ceiling,
+/// but must still be interruptible if a malformed start function never exits.
+const WORKER_START_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Typed failure returned by the engine-agnostic compute mechanism.
 #[derive(Debug, Clone, Error, PartialEq, Eq)]
@@ -442,6 +446,7 @@ struct RuntimeInner {
     engine: Engine,
     ledger: ComputeLedger,
     limits: ComputeLimits,
+    worker_start_timeout: Duration,
     ticker_stop: Arc<AtomicBool>,
     ticker: Mutex<Option<JoinHandle<()>>>,
 }
@@ -462,6 +467,14 @@ impl ComputeRuntime {
     /// Returns [`ComputeError::WorkerFailed`] if Wasmtime cannot enable the
     /// required proposals or the epoch ticker thread cannot start.
     pub fn new(ledger: ComputeLedger, limits: ComputeLimits) -> Result<Self, ComputeError> {
+        Self::new_with_worker_start_timeout(ledger, limits, WORKER_START_TIMEOUT)
+    }
+
+    fn new_with_worker_start_timeout(
+        ledger: ComputeLedger,
+        limits: ComputeLimits,
+        worker_start_timeout: Duration,
+    ) -> Result<Self, ComputeError> {
         let mut config = Config::new();
         config
             .wasm_threads(true)
@@ -487,6 +500,7 @@ impl ComputeRuntime {
                 engine,
                 ledger,
                 limits,
+                worker_start_timeout,
                 ticker_stop: stop,
                 ticker: Mutex::new(Some(ticker)),
             }),
@@ -540,6 +554,7 @@ impl ComputeRuntime {
                 &memory,
                 Arc::clone(&accounting),
                 Arc::clone(&closed),
+                self.inner.worker_start_timeout,
             ) {
                 Ok(slot) => slots.push(slot),
                 Err(error) => {
@@ -1154,30 +1169,33 @@ impl WorkerSlot {
         memory: &SharedMemory,
         accounting: Arc<AccountingState>,
         closed: Arc<AtomicBool>,
+        worker_start_timeout: Duration,
     ) -> Result<Self, ComputeError> {
         let (sender, receiver) = mpsc::sync_channel(WORKER_QUEUE_CAPACITY);
         let (ready_tx, ready_rx) = mpsc::sync_channel(1);
         let pending = Arc::new(AtomicUsize::new(0));
         let pending_for_thread = Arc::clone(&pending);
         let engine = engine.clone();
+        let interrupt_engine = engine.clone();
         let module = module.clone();
         let memory = memory.clone();
+        let startup_cancel = Arc::new(AtomicBool::new(false));
+        let startup_cancel_for_thread = Arc::clone(&startup_cancel);
         let handle = std::thread::Builder::new()
             .name(format!("astrid-compute-{index}"))
             .spawn(move || {
-                let initial_cancel = Arc::new(AtomicBool::new(false));
                 let mut store = Store::new(
                     &engine,
                     WorkerStoreState {
-                        cancel: initial_cancel,
+                        cancel: startup_cancel_for_thread,
                         group_closed: Arc::clone(&closed),
                     },
                 );
-                // Fuel consumption is engine-wide. A newly created Store starts
-                // empty, so seed a small validation allowance before invoking
-                // the ABI-version export. Every real job replaces this value
-                // with its own principal-attributed allowance below.
-                if let Err(error) = store.set_fuel(1_000_000) {
+                // Initialization may materialize large signed data segments.
+                // It is not a principal job and has no hidden fuel quota; the
+                // epoch deadline plus startup timeout below remains a forced
+                // interruption boundary for a non-terminating start function.
+                if let Err(error) = store.set_fuel(UNBOUNDED_JOB_FUEL) {
                     let _ = ready_tx.send(Err(ComputeError::WorkerFailed(format!(
                         "seed validation fuel: {error}"
                     ))));
@@ -1196,7 +1214,7 @@ impl WorkerSlot {
                 let startup = (|| {
                     let instance = Instance::new(&mut store, &module, &[memory.clone().into()])
                         .map_err(|error| {
-                            ComputeError::WorkerInvalid(format!("instantiate worker: {error}"))
+                            ComputeError::WorkerInvalid(format!("instantiate worker: {error:#}"))
                         })?;
                     let abi = instance
                         .get_typed_func::<(), i32>(&mut store, "astrid_compute_abi_version")
@@ -1320,7 +1338,7 @@ impl WorkerSlot {
                 }
             })
             .map_err(|error| ComputeError::WorkerFailed(format!("start worker thread: {error}")))?;
-        match ready_rx.recv() {
+        match ready_rx.recv_timeout(worker_start_timeout) {
             Ok(Ok(())) => Ok(Self {
                 sender,
                 pending,
@@ -1330,11 +1348,20 @@ impl WorkerSlot {
                 let _ = handle.join();
                 Err(error)
             },
-            Err(error) => {
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                startup_cancel.store(true, Ordering::Release);
+                interrupt_engine.increment_epoch();
                 let _ = handle.join();
-                Err(ComputeError::WorkerFailed(format!(
-                    "worker startup channel closed: {error}"
+                Err(ComputeError::WorkerInvalid(format!(
+                    "worker startup exceeded {} seconds",
+                    worker_start_timeout.as_secs_f64()
                 )))
+            },
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                let _ = handle.join();
+                Err(ComputeError::WorkerFailed(
+                    "worker startup channel closed".to_owned(),
+                ))
             },
         }
     }
