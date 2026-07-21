@@ -147,7 +147,7 @@ REQ-CAP-2.
 
 ## ADR-K4: Revocation
 
-**Context.** The charter (§7) chartered revocation as externally atomic and
+**Context.** The charter (§7) specifies revocation as externally atomic and
 internally preemptible, with self-referential revocation made
 unrepresentable and completion reported only at the terminal state. The
 mechanism must deliver that without the seL4-documented pathology where
