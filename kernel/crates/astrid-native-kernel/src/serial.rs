@@ -203,6 +203,66 @@ pub fn ev_cap_revoked(object: u32, generation: u32) {
     ));
 }
 
+// ---- M3: bounded IPC endpoints + capability transfer by derivation ---------
+
+pub fn ev_ep_create(object: u32, ep: u8, domain: usize) {
+    emit(format_args!(
+        "\"ev\":\"ep.create\",\"object\":{object},\"ep\":{ep},\"domain\":{domain}"
+    ));
+}
+
+pub fn ev_ipc_send(ep: u8, from: usize, data: u64, cap: bool) {
+    emit(format_args!(
+        "\"ev\":\"ipc.send\",\"ep\":{ep},\"from\":{from},\"data\":{data},\"cap\":{cap}"
+    ));
+}
+
+pub fn ev_ipc_recv(ep: u8, to: usize, data: u64, cap: bool) {
+    emit(format_args!(
+        "\"ev\":\"ipc.recv\",\"ep\":{ep},\"to\":{to},\"data\":{data},\"cap\":{cap}"
+    ));
+}
+
+pub fn ev_ipc_blocked(domain: usize, ep: u8) {
+    emit(format_args!(
+        "\"ev\":\"ipc.blocked\",\"domain\":{domain},\"ep\":{ep}"
+    ));
+}
+
+pub fn ev_ipc_wakeup(domain: usize, ep: u8) {
+    emit(format_args!(
+        "\"ev\":\"ipc.wakeup\",\"domain\":{domain},\"ep\":{ep}"
+    ));
+}
+
+pub fn ev_ipc_cap_dropped(ep: u8) {
+    emit(format_args!("\"ev\":\"ipc.cap_dropped\",\"ep\":{ep}"));
+}
+
+pub fn ev_cap_transfer(object: u32, from: usize, to: usize, rights: u32, node: u32) {
+    emit(format_args!(
+        "\"ev\":\"cap.transfer\",\"object\":{object},\"from\":{from},\"to\":{to},\"rights\":{rights},\"node\":{node}"
+    ));
+}
+
+pub fn ev_cap_revoke_tree(node: u32, killed: usize) {
+    emit(format_args!(
+        "\"ev\":\"cap.revoke_tree\",\"node\":{node},\"killed\":{killed}"
+    ));
+}
+
+pub fn ev_ipc_deadlock(domains: usize) {
+    emit(format_args!(
+        "\"ev\":\"ipc.deadlock\",\"domains\":{domains}"
+    ));
+}
+
+pub fn ev_pools_census(objects_free: usize, endpoints_free: usize, deriv_free: usize) {
+    emit(format_args!(
+        "\"ev\":\"pools.census\",\"objects_free\":{objects_free},\"endpoints_free\":{endpoints_free},\"deriv_free\":{deriv_free}"
+    ));
+}
+
 pub fn ev_test(name: &'static str, pass: bool) {
     let ev = if pass { "test.pass" } else { "test.fail" };
     emit(format_args!("\"ev\":\"{ev}\",\"name\":\"{name}\""));

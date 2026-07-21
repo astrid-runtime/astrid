@@ -33,6 +33,10 @@ pub const OUT_EXITED: u64 = 0;
 pub const OUT_KILLED_PF: u64 = 1;
 pub const OUT_KILLED_GP: u64 = 2;
 pub const OUT_QUOTA: u64 = 3;
+/// M3: the domain suspended itself at a `recv` boundary (blocking IPC). It saved
+/// its user continuation into the domain slot and is now `Blocked`; the
+/// scheduler must not finish/reclaim it — it resumes on a later delivery.
+pub const OUT_BLOCKED: u64 = 4;
 
 /// Kernel-stack top for the running domain; loaded by the syscall stub.
 pub static CURRENT_KSTACK_TOP: AtomicU64 = AtomicU64::new(0);
@@ -93,9 +97,16 @@ pub fn arm(kstack_top: u64, save_slot: u64) {
 }
 
 /// Save the scheduler continuation into `*save_slot`, switch to `cr3`, and
-/// `iretq` into ring 3 at `user_rip` with stack `user_rsp`. Does not return
-/// normally: it returns (with the outcome tag in `rax`) only when a later
-/// [`context_switch_back`] restores the continuation.
+/// `iretq` into ring 3 at `user_rip` with stack `user_rsp`, entering with
+/// `rax=entry_rax` and `rdx=entry_rdx` and every OTHER GP register zeroed. Does
+/// not return normally: it returns (with the outcome tag in `rax`) only when a
+/// later [`context_switch_back`] restores the continuation.
+///
+/// First run of a domain passes `entry_rax=0, entry_rdx=0` (identical to the
+/// M2 all-zero entry). Resuming a `Blocked` domain passes the delivered
+/// `(status, data)` in `(entry_rax, entry_rdx)` so a blocked `recv` returns its
+/// result. The M2 infoleak defense is preserved: every register other than the
+/// two entry values is still zeroed before `iretq`.
 ///
 /// # Safety
 /// `save_slot` must point at a live `u64`; `cr3` must be a valid PML4 that maps
@@ -106,7 +117,11 @@ pub unsafe extern "C" fn context_enter(
     user_rip: u64,
     user_rsp: u64,
     cr3: u64,
+    entry_rax: u64,
+    entry_rdx: u64,
 ) -> u64 {
+    // Args (SysV): rdi=save_slot, rsi=user_rip, rdx=user_rsp, rcx=cr3,
+    // r8=entry_rax, r9=entry_rdx.
     naked_asm!(
         "push rbx",
         "push rbp",
@@ -121,7 +136,8 @@ pub unsafe extern "C" fn context_enter(
         "push {urfl}",      // RFLAGS
         "push {ucs}",       // CS
         "push rsi",         // RIP (user)
-        // Zero every GP register so no kernel value leaks into ring 3.
+        // Zero every GP register (no kernel value leaks into ring 3), except
+        // r8/r9 which still carry the two entry values.
         "xor eax, eax",
         "xor ebx, ebx",
         "xor ecx, ecx",
@@ -129,14 +145,17 @@ pub unsafe extern "C" fn context_enter(
         "xor esi, esi",
         "xor edi, edi",
         "xor ebp, ebp",
-        "xor r8d, r8d",
-        "xor r9d, r9d",
         "xor r10d, r10d",
         "xor r11d, r11d",
         "xor r12d, r12d",
         "xor r13d, r13d",
         "xor r14d, r14d",
         "xor r15d, r15d",
+        // Place the entry values, then zero their source registers.
+        "mov rax, r8",      // rax = entry_rax (status on resume, 0 on first run)
+        "mov rdx, r9",      // rdx = entry_rdx (data on resume, 0 on first run)
+        "xor r8d, r8d",
+        "xor r9d, r9d",
         "iretq",
         uss = const USER_SS,
         urfl = const USER_RFLAGS,
@@ -242,6 +261,25 @@ unsafe extern "C" fn syscall_dispatch(frame: *mut SyscallFrame) -> SyscallRet {
         },
         3 => {
             let (status, value) = crate::domain::sys_cap_rights(f.arg1);
+            SyscallRet { status, value }
+        },
+        4 => {
+            let (status, value) = crate::domain::sys_ep_create();
+            SyscallRet { status, value }
+        },
+        5 => {
+            let (status, value) = crate::domain::sys_send(f.arg1, f.arg2, f.arg3, f.arg4);
+            SyscallRet { status, value }
+        },
+        6 => {
+            // A blocking `recv` on an empty endpoint diverges through
+            // `context_switch_back(OUT_BLOCKED)` and never returns here; the
+            // ready path returns `(OK, data)` normally.
+            let (status, value) = crate::domain::sys_recv(f.arg1, f.arg2, f.user_rip, f.user_rsp);
+            SyscallRet { status, value }
+        },
+        7 => {
+            let (status, value) = crate::domain::sys_revoke_tree(f.arg1);
             SyscallRet { status, value }
         },
         _ => SyscallRet {
