@@ -20,6 +20,11 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
 
 ### Fixed
 
+- **Late principal-affine Store creation no longer traps during component
+  initialization.** Store construction now uses a finite relative epoch
+  deadline; the former `u64::MAX` sentinel wrapped behind Wasmtime's current
+  epoch after the ticker advanced, so the first non-owner principal could hit
+  an immediate `interrupt` trap while the load owner remained warm.
 - **Long-running local capsules are no longer stopped by a hidden 10-billion
   fuel ceiling.** Interceptor fuel remains an exact per-principal CPU meter but
   defaults to no hard per-call ceiling. Shared-service operators can set a

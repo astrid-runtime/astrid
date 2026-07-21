@@ -138,6 +138,18 @@ const WASM_CAPSULE_TIMEOUT_SECS: u64 = 5 * 60;
 /// granularity is `EPOCH_TICK_INTERVAL * epoch_deadline`.
 const EPOCH_TICK_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
 
+/// Relative epoch deadline used while constructing a fresh Store.
+///
+/// Wasmtime adds this delta to the engine's current epoch. `u64::MAX` is not a
+/// valid "unlimited" sentinel here: after the ticker has advanced even once,
+/// that addition wraps to a deadline in the past and a lazily-created Store
+/// traps during component initialization. Keep construction generously but
+/// finitely bounded; the invoking principal's own deadline replaces this at
+/// the call boundary.
+const fn store_instantiation_deadline_ticks() -> u64 {
+    WASM_CAPSULE_TIMEOUT_SECS * 1000 / EPOCH_TICK_INTERVAL.as_millis() as u64
+}
+
 /// Executes WASM Components via the wasmtime Component Model.
 ///
 /// This engine sandboxes execution in wasmtime and wires the
@@ -1995,25 +2007,14 @@ impl ExecutionEngine for WasmEngine {
             });
 
             // Initial epoch deadline applied to every freshly-instantiated
-            // pool Store below. This is a wall-clock placeholder, NOT the
-            // bound run-loop CPU mechanism:
-            //  - exempt: u64::MAX at the pool-load default. For an exempt
-            //    RUN-LOOP this placeholder is REPLACED below with a finite
-            //    yield-always window (`exempt_epoch_action`) so it cooperatively
-            //    yields the worker and can never starve the daemon. Exempt
-            //    interceptor POOL Stores keep u64::MAX here (see the STOP-AND-
-            //    REPORT note on the exempt interceptor epoch path).
-            //  - interceptor pool Stores: the existing finite default; the real
-            //    per-invocation epoch is re-applied per call in
-            //    `invoke_interceptor` (unchanged).
-            //  - bound run-loops: this default is replaced in the run-loop
-            //    Store setup with the per-WINDOW epoch deadline + interrupt
-            //    callback (`epoch_decision`).
-            let pool_epoch_deadline = if run_budget.exempt {
-                u64::MAX
-            } else {
-                WASM_CAPSULE_TIMEOUT_SECS * 1000 / EPOCH_TICK_INTERVAL.as_millis() as u64
-            };
+            // pool Store below. This is a finite construction guard, NOT the
+            // bound run-loop CPU mechanism. Interceptor Stores receive the
+            // invoking principal's deadline at each call boundary; run-loop
+            // Stores replace this below with their yield/interrupt callback.
+            // It must remain a finite relative delta: `u64::MAX` wraps behind
+            // the current epoch when a principal-affine Store is built after
+            // the engine ticker has started.
+            let pool_epoch_deadline = store_instantiation_deadline_ticks();
 
             // Build the engine, linker, and compiled component ONCE; the pool
             // mints N instances from the same `InstancePre` without re-running
@@ -5089,11 +5090,30 @@ mod epoch_integration_tests {
     use super::{
         EpochAction, MAX_NO_YIELD_WINDOWS, TEST_INTERCEPTOR_FUEL_BUDGET, build_wasmtime_engine,
         epoch_decision, exempt_epoch_action, spawn_epoch_ticker, spawn_epoch_ticker_every,
+        store_instantiation_deadline_ticks,
     };
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::Duration;
     use wasmtime::{Engine, Linker, Module, Store, StoreLimits, StoreLimitsBuilder, Trap};
+
+    #[tokio::test]
+    async fn late_store_instantiation_deadline_does_not_wrap_behind_current_epoch() {
+        let engine = build_wasmtime_engine().expect("engine");
+        engine.increment_epoch();
+        let mut store = Store::new(&engine, ());
+        store
+            .set_fuel(TEST_INTERCEPTOR_FUEL_BUDGET)
+            .expect("fuel enabled");
+        store.set_epoch_deadline(store_instantiation_deadline_ticks());
+
+        let module =
+            Module::new(&engine, "(module (func $start) (start $start))").expect("minimal module");
+        Linker::new(&engine)
+            .instantiate_async(&mut store, &module)
+            .await
+            .expect("a Store created after the first epoch tick must instantiate");
+    }
 
     /// Install the PRODUCTION EXEMPT-run-loop epoch policy on `store` (Fix 5).
     ///
