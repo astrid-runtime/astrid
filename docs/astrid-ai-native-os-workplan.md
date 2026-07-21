@@ -151,7 +151,8 @@ not become a ring-0 ABI.
   malicious native domains, runtime-host compromise, malicious capsules, malicious
   drivers, DMA, and recovery infrastructure:
   [Astrid Kernel Threat Model](astrid-kernel-threat-model.md).
-- [ ] Create a requirement-to-evidence matrix for every claimed security property.
+- [x] Create a requirement-to-evidence matrix for every claimed security property:
+  [Astrid Kernel Requirement-to-Evidence Matrix](astrid-kernel-evidence-matrix.md).
 - [ ] Record ADRs for protection domains, capability object representation, handle
   transfer, revocation, fault endpoints, scheduling, and audit ordering.
 - [ ] Define the support-policy vocabulary: experimental machine, supported host,
