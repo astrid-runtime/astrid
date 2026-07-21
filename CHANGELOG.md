@@ -94,6 +94,23 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
   the generic broker path with an idempotent `tools/list` probe and reissues it
   when the principal's `capsules_loaded` signal arrives, without hardcoding a
   product capsule name.
+- **Experimental principal-affine WASM services.** A non-`run()` capsule can
+  request a bounded resident Store per verified invoking principal through
+  `[package.metadata.astrid-runtime] component-residency = "principal"`.
+  Calls for one principal serialize, different principals remain concurrent,
+  guest linear memory persists between calls, and the least-recently-used idle
+  Store is destroyed when the operator's instance ceiling is full. The
+  existing public manifest structs and wire APIs are unchanged.
+
+### Changed
+
+- **WASM memory ceilings now cover the aggregate of every linear memory in a
+  Store.** Principal-affine Stores reserve exact current bytes against one
+  cross-capsule principal total and surface it through the existing usage API;
+  failed allocations and Store eviction release the reservation. Shared guest
+  memory is disabled because Wasmtime does not route it through
+  `ResourceLimiter`. Free-checkout Stores are rebuilt before reuse when a live
+  quota falls below their retained allocation.
 
 ## [0.10.1] - 2026-07-17
 

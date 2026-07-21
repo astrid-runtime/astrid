@@ -817,10 +817,9 @@ pub enum AdminResponseBody {
 /// across all capsules. **Memory** is reported as a per-principal *peak*
 /// (`memory_bytes_peak_total`): the kernel's shared memory ledger records the
 /// high-water linear-memory size each invoking principal grows a Store to,
-/// max'd across all capsules. A live cross-capsule *current* total
-/// (`memory_bytes_current_total`) is not implemented — under pooled, shared
-/// Stores it is not cleanly attributable — so it stays `None`; the limit field
-/// reports the per-instance ceiling.
+/// max'd across all capsules. `memory_bytes_current_total` is exact for
+/// principal-affine resident Stores; ordinary free-checkout Stores remain
+/// unattributable and do not contribute to that current total.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ResourceUsage {
     /// Principal this usage report describes.
@@ -837,12 +836,13 @@ pub struct ResourceUsage {
     /// `system:resources:unbounded`, `net_bind`, or `uplink` (admins via `*`).
     /// When `true` the limit fields are advisory, never enforced.
     pub exempt: bool,
-    /// Per-capsule-instance memory ceiling ([`Quotas::max_memory_bytes`]). This
-    /// is a per-Store cap, not a cross-capsule total.
+    /// Memory ceiling ([`Quotas::max_memory_bytes`]). Ordinary free-checkout
+    /// Stores apply it per invocation. Principal-affine Stores additionally
+    /// reserve against it as one aggregate current total across capsules.
     pub memory_bytes_limit_per_instance: u64,
-    /// Current cross-capsule resident memory total, or `None` — a live
-    /// "current" total is not cleanly attributable under pooled, shared Stores,
-    /// so the peak (below) is the reported memory signal instead.
+    /// Current cross-capsule memory held by principal-affine resident Stores,
+    /// or `None` when none is resident. Free-checkout shared Stores are not
+    /// included because their retained allocation has no stable principal.
     pub memory_bytes_current_total: Option<u64>,
     /// Peak cross-capsule linear-memory high-water mark this principal has
     /// driven, in bytes, max'd across every capsule it invokes (from the shared

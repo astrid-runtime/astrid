@@ -151,17 +151,11 @@ pub struct WasmEngine {
     /// The wasmtime store holding HostState. Wrapped in `Arc<AsyncMutex<>>`
     /// Pool of `(Store, Instance)` pairs for a non-run-loop capsule.
     ///
-    /// `invoke_interceptor` leases a free instance per call, so N principals'
-    /// interceptors run concurrently instead of serialising through one Store
-    /// (the throughput floor behind `astrid#813`; see `astrid#816` and
-    /// [`pool`]). `None` for run-loop capsules — they keep one dedicated
-    /// Store owned by `run_handle` and never go through this pool. The pool is
-    /// dynamic: it warm-starts at `min_idle`, grows lazily toward the
-    /// host-derived (operator-overridable) `instance_pool_size` max under load,
-    /// and idle-evicts back down. Capsules carved out via the `host_process`
-    /// capability are pinned to a single Store (live cross-invocation resource
-    /// handles must never move to a second Store).
-    pool: Option<pool::CapsuleInstancePool>,
+    /// Ordinary components use free checkout. Components opting into principal
+    /// residency retain one Store per verified principal and LRU-evict only
+    /// idle Stores at the same operator pool ceiling. `None` for run-loop
+    /// capsules, which keep one owner-bound dedicated Store.
+    pool: Option<pool::InstancePool>,
     inbound_rx: Option<tokio::sync::mpsc::Receiver<astrid_core::InboundMessage>>,
     run_handle: Option<tokio::task::JoinHandle<()>>,
     /// Receiver for the readiness signal from the run loop.
@@ -230,12 +224,10 @@ pub struct WasmEngine {
     /// enforced by the epoch-interrupt mechanism (not this ledger, not fuel).
     /// Keyed by the *invoking* principal (caller or owner).
     fuel_ledger: crate::FuelLedger,
-    /// Shared per-principal **peak-memory** ledger, the RAM analogue of
-    /// `fuel_ledger`: the per-Store [`StoreMemoryMeter`](crate::StoreMemoryMeter)
-    /// records the high-water linear-memory size each invoking principal grows a
-    /// Store to. Cloned from the kernel-owned ledger so a principal's peak is the
-    /// max across every capsule it drives, filling
-    /// `ResourceUsage::memory_bytes_peak_total`. Telemetry only.
+    /// Shared per-principal memory ledger. Every Store records peak telemetry;
+    /// principal-affine Stores additionally reserve their exact current linear
+    /// memory against one cross-capsule principal total. Cloned from the
+    /// kernel-owned ledger so accounting cannot multiply per engine.
     memory_ledger: crate::MemoryLedger,
     /// Shared per-principal CPU-**rate** limiter — the deny side of the budget
     /// (PR2), built on the same shared-handle model as `fuel_ledger`.
@@ -565,7 +557,14 @@ pub fn call_hook_trigger(
 
 fn build_wasmtime_engine() -> CapsuleResult<wasmtime::Engine> {
     let mut config = wasmtime::Config::new();
-    config.wasm_component_model(true).epoch_interruption(true);
+    config
+        .wasm_component_model(true)
+        .epoch_interruption(true)
+        // ResourceLimiter is not invoked for shared memories. Disable the
+        // threads proposal so every guest linear-memory allocation crosses the
+        // quota and principal-accounting boundary below. Host concurrency still
+        // runs across independent Stores on Tokio workers.
+        .wasm_threads(false);
     // Fuel metering is the per-invocation CPU MEASUREMENT only (not the
     // run-loop CPU bound — that is the epoch mechanism below). Fuel counts
     // EXECUTED guest instructions independent of host-call yields, so
@@ -816,6 +815,66 @@ pub(crate) fn resolve_run_loop_budget(
         window_ticks,
         mem_bytes,
     }
+}
+
+/// Store residency selected through the existing namespaced package metadata
+/// escape hatch. Keeping this runtime-private preserves the public manifest
+/// struct API while the contract is exercised before it graduates to a formal
+/// manifest field through the RFC process.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+enum ComponentResidency {
+    #[default]
+    Invocation,
+    Principal,
+}
+
+#[derive(Debug, Default, serde::Deserialize)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+struct AstridRuntimeMetadata {
+    #[serde(default)]
+    component_residency: ComponentResidency,
+}
+
+fn component_residency(manifest: &CapsuleManifest) -> Result<ComponentResidency, &'static str> {
+    let Some(metadata) = manifest.package.metadata.as_ref() else {
+        return Ok(ComponentResidency::Invocation);
+    };
+    let Some(runtime) = metadata.get("astrid-runtime") else {
+        return Ok(ComponentResidency::Invocation);
+    };
+    serde_json::from_value::<AstridRuntimeMetadata>(runtime.clone())
+        .map(|runtime| runtime.component_residency)
+        .map_err(|_| {
+            "package.metadata.astrid-runtime must contain only component-residency = 'invocation' or 'principal'"
+        })
+}
+
+fn validate_component_residency(
+    residency: ComponentResidency,
+    has_run_export: bool,
+    has_host_process: bool,
+    has_uplink_daemon: bool,
+) -> Result<(), &'static str> {
+    if residency != ComponentResidency::Principal {
+        return Ok(());
+    }
+    if has_run_export {
+        return Err(
+            "principal-resident components cannot export run(); use metered tool/interceptor invocations",
+        );
+    }
+    if has_host_process {
+        return Err(
+            "principal-resident components cannot request host_process in the initial residency contract",
+        );
+    }
+    if has_uplink_daemon {
+        return Err(
+            "principal-resident components cannot request uplink daemon semantics; every call must remain epoch-bounded",
+        );
+    }
+    Ok(())
 }
 
 /// The action a bound run-loop's epoch callback takes when a deadline window
@@ -1330,6 +1389,8 @@ impl ExecutionEngine for WasmEngine {
                 "WASM engine requires at least one component definition".into(),
             )
         })?;
+        let component_residency = component_residency(&self.manifest)
+            .map_err(|message| CapsuleError::UnsupportedEntryPoint(message.into()))?;
 
         let wasm_path = if component.path.is_absolute() {
             component.path.clone()
@@ -1980,6 +2041,15 @@ impl ExecutionEngine for WasmEngine {
                 ))
             })?;
 
+            let principal_resident = component_residency == ComponentResidency::Principal;
+            validate_component_residency(
+                component_residency,
+                has_run_export,
+                !manifest.capabilities.host_process.is_empty(),
+                !manifest.uplinks.is_empty() || manifest.capabilities.uplink,
+            )
+            .map_err(|message| CapsuleError::UnsupportedEntryPoint(message.into()))?;
+
             // Dynamic-pool sizing. Run-loop and `host_process` capsules are
             // pinned to a single Store regardless of the configured pool max:
             // run-loops own their dedicated Store; `host_process` capsules hold
@@ -1992,6 +2062,11 @@ impl ExecutionEngine for WasmEngine {
                 has_run_export || !manifest.capabilities.host_process.is_empty();
             let (pool_max, pool_min_idle) = if is_single_store {
                 (1, 1)
+            } else if principal_resident {
+                // A resident Store cannot be built before its verified
+                // principal and memory profile are known. Start empty and
+                // instantiate on the first invocation for each principal.
+                (self.runtime_limits.instance_pool_size, 0)
             } else {
                 (
                     self.runtime_limits.instance_pool_size,
@@ -2023,6 +2098,7 @@ impl ExecutionEngine for WasmEngine {
                 warm = initial_instances.len(),
                 has_run = has_run_export,
                 host_process = !manifest.capabilities.host_process.is_empty(),
+                principal_resident,
                 "Instantiated capsule instance pool"
             );
 
@@ -2030,7 +2106,7 @@ impl ExecutionEngine for WasmEngine {
             // Run-loop capsules pull one instance out as a dedicated,
             // mutex-guarded Store owned by the run loop; pooled capsules keep
             // the whole set for `invoke_interceptor` to lease from.
-            let mut pool_opt: Option<pool::CapsuleInstancePool> = None;
+            let mut pool_opt: Option<pool::InstancePool> = None;
             let mut store_arc: Option<Arc<AsyncMutex<Store<HostState>>>> = None;
             let mut run_instance: Option<wasmtime::component::Instance> = None;
             if has_run {
@@ -2113,6 +2189,8 @@ impl ExecutionEngine for WasmEngine {
                 }
                 store_arc = Some(Arc::new(AsyncMutex::new(pi.store)));
                 run_instance = Some(pi.instance);
+            } else if principal_resident {
+                pool_opt = Some(pool::InstancePool::principal(pool_max, builder));
             } else {
                 // Free-checkout pools tear down each returned instance's
                 // resource table so a cancelled/panicked invocation can't leak
@@ -2122,14 +2200,14 @@ impl ExecutionEngine for WasmEngine {
                 // invocations, and never leases a second Store, so its table
                 // must persist. See `pool::clear_on_return`.
                 let reset_resources_on_return = manifest.capabilities.host_process.is_empty();
-                pool_opt = Some(pool::CapsuleInstancePool::new(
+                pool_opt = Some(pool::InstancePool::free(pool::CapsuleInstancePool::new(
                     initial_instances,
                     pool_max,
                     pool_min_idle,
                     reset_resources_on_return,
                     builder,
                     &cancel_token,
-                ));
+                )));
             }
 
             // Only allocate the watch channel for run-loop capsules.
@@ -2491,9 +2569,20 @@ impl ExecutionEngine for WasmEngine {
         // Invoking principal, derived once: used both for the quota profile
         // below and the per-invocation diagnostic span at the end. Lock-free
         // — `owner_principal` is the immutable load-time `state.principal`.
-        let invoking_principal = caller
+        let caller_principal = caller
             .and_then(|msg| msg.principal.as_deref())
-            .and_then(|p| astrid_core::PrincipalId::new(p).ok())
+            .and_then(|p| astrid_core::PrincipalId::new(p).ok());
+        // Live tool capture is a kernel-internal probe with no bus envelope.
+        // Bind that one generated, read-only action to the verified load owner;
+        // every externally dispatched action still requires its stamped caller.
+        let owner_describe =
+            pool.is_principal_resident() && caller_principal.is_none() && action == "tool_describe";
+        if pool.is_principal_resident() && caller_principal.is_none() && !owner_describe {
+            return Err(CapsuleError::WasmError(
+                "principal-resident component requires a kernel-stamped principal".into(),
+            ));
+        }
+        let invoking_principal = caller_principal
             .or_else(|| self.owner_principal.clone())
             .unwrap_or_default();
 
@@ -2656,6 +2745,13 @@ impl ExecutionEngine for WasmEngine {
         // Store), so the SET/CALL state is private to this invocation.
         type HookTriggerResult = bindings::astrid::guest::lifecycle::CapsuleResult;
 
+        let applied_profile: Arc<astrid_core::profile::PrincipalProfile> =
+            invocation_profile.clone().unwrap_or_else(|| {
+                Arc::new(astrid_core::profile::PrincipalProfile::default_ref().clone())
+            });
+        let invocation_memory_bytes =
+            usize::try_from(applied_profile.quotas.max_memory_bytes).unwrap_or(usize::MAX);
+
         // Lease a free pooled instance. A waiter here `.await`s for a permit
         // instead of pinning a tokio worker, and — unlike the old single Store
         // — up to the pool size of invocations run concurrently on independent
@@ -2663,15 +2759,18 @@ impl ExecutionEngine for WasmEngine {
         // borrowing the store mutably for the SET/CALL block; `PoolCheckout`
         // clears the invocation state and returns the instance on drop.
         let checkout_start = std::time::Instant::now();
-        let mut checkout = pool.checkout().await.ok_or_else(|| {
-            // `checkout` returns `None` for any of: the capsule is unloading
-            // (semaphore closed), a lazy pool-grow instantiation failed, or a
-            // size-1 carve-out found no warm instance. The true cause is logged
-            // at the checkout site; keep the surfaced error generic rather than
-            // asserting "unloading", which misleads when the real cause was a
-            // transient grow failure on a fully-loaded capsule.
-            CapsuleError::NotSupported("no capsule instance available".into())
-        })?;
+        let mut checkout = pool
+            .checkout(&invoking_principal, invocation_memory_bytes)
+            .await
+            .ok_or_else(|| {
+                // `checkout` returns `None` for any of: the capsule is unloading
+                // (semaphore closed), a lazy pool-grow instantiation failed, or a
+                // size-1 carve-out found no warm instance. The true cause is logged
+                // at the checkout site; keep the surfaced error generic rather than
+                // asserting "unloading", which misleads when the real cause was a
+                // transient grow failure on a fully-loaded capsule.
+                CapsuleError::NotSupported("no capsule instance available".into())
+            })?;
         // Time spent waiting for a free pooled instance — a rising
         // `pool_wait_ms` is the signal the pool is saturated (all instances
         // busy), distinct from a slow guest call.
@@ -2686,11 +2785,6 @@ impl ExecutionEngine for WasmEngine {
         let result: CapsuleResult<HookTriggerResult> = {
             let s = checkout.store_mut();
             // ── Phase 1: SET ──────────────────────────────────────
-            let applied_profile: Arc<astrid_core::profile::PrincipalProfile> =
-                invocation_profile.clone().unwrap_or_else(|| {
-                    Arc::new(astrid_core::profile::PrincipalProfile::default_ref().clone())
-                });
-
             if !is_daemon {
                 let deadline = applied_profile.quotas.max_timeout_secs.saturating_mul(1000)
                     / EPOCH_TICK_INTERVAL.as_millis() as u64;
@@ -2725,10 +2819,9 @@ impl ExecutionEngine for WasmEngine {
                 // `memory.grow`, so mutating in place takes effect for the
                 // upcoming call — independent of the previous leaseholder of
                 // this pooled Store.
-                state.store_meter.set(
-                    usize::try_from(applied_profile.quotas.max_memory_bytes).unwrap_or(usize::MAX),
-                    invoking_principal.clone(),
-                );
+                state
+                    .store_meter
+                    .set(invocation_memory_bytes, invoking_principal.clone());
                 state.invocation_profile = invocation_profile.clone();
                 state.invocation_env_overlay =
                     load_invocation_env_overlay(&invoking_principal, state.capsule_id.as_str());
@@ -3355,6 +3448,104 @@ mod tests {
 
     fn pid(name: &str) -> astrid_core::PrincipalId {
         astrid_core::PrincipalId::new(name).unwrap()
+    }
+
+    #[test]
+    fn principal_residency_rejects_singleton_run_loop_and_host_process() {
+        assert!(
+            validate_component_residency(ComponentResidency::Invocation, true, true, true).is_ok(),
+            "ordinary manifests retain their existing validation path"
+        );
+        assert!(
+            validate_component_residency(ComponentResidency::Principal, false, false, false)
+                .is_ok()
+        );
+        assert_eq!(
+            validate_component_residency(ComponentResidency::Principal, true, false, false),
+            Err(
+                "principal-resident components cannot export run(); use metered tool/interceptor invocations"
+            )
+        );
+        assert_eq!(
+            validate_component_residency(ComponentResidency::Principal, false, true, false),
+            Err(
+                "principal-resident components cannot request host_process in the initial residency contract"
+            )
+        );
+        assert_eq!(
+            validate_component_residency(ComponentResidency::Principal, false, false, true),
+            Err(
+                "principal-resident components cannot request uplink daemon semantics; every call must remain epoch-bounded"
+            )
+        );
+    }
+
+    #[test]
+    fn principal_residency_uses_namespaced_metadata_without_public_manifest_changes() {
+        let mut manifest: CapsuleManifest = toml::from_str(
+            r#"
+[package]
+name = "resident-test"
+version = "0.1.0"
+
+[[component]]
+id = "main"
+file = "main.wasm"
+"#,
+        )
+        .expect("ordinary manifest");
+        assert_eq!(
+            component_residency(&manifest),
+            Ok(ComponentResidency::Invocation)
+        );
+
+        manifest = toml::from_str(
+            r#"
+[package]
+name = "resident-test"
+version = "0.1.0"
+
+[package.metadata.astrid-runtime]
+component-residency = "principal"
+
+[[component]]
+id = "main"
+file = "main.wasm"
+"#,
+        )
+        .expect("principal-resident manifest");
+        assert_eq!(
+            component_residency(&manifest),
+            Ok(ComponentResidency::Principal)
+        );
+
+        manifest.package.metadata = Some(serde_json::json!({
+            "astrid-runtime": { "component-residency": "typo" }
+        }));
+        assert_eq!(
+            component_residency(&manifest),
+            Err(
+                "package.metadata.astrid-runtime must contain only component-residency = 'invocation' or 'principal'"
+            )
+        );
+
+        manifest.package.metadata = Some(serde_json::json!({
+            "astrid-runtime": { "component_residency": "principal" }
+        }));
+        assert!(
+            component_residency(&manifest).is_err(),
+            "a misspelled runtime key must not silently weaken to free checkout"
+        );
+    }
+
+    #[test]
+    fn runtime_rejects_shared_memory_that_would_bypass_the_store_limiter() {
+        let engine = build_wasmtime_engine().expect("engine");
+        let result = wasmtime::Module::new(&engine, "(module (memory 1 2 shared))");
+        assert!(
+            result.is_err(),
+            "shared memory must stay disabled while ResourceLimiter cannot meter it"
+        );
     }
 
     // ── Run-loop resource-bound resolution (CPU epoch + memory) ──────────

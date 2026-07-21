@@ -1,10 +1,16 @@
-//! Shared per-principal peak-memory accounting ledger.
+//! Shared per-principal WASM linear-memory accounting ledger.
 //!
 //! Records the high-water linear-memory size each invoking principal grows a
 //! Store to. Like [`FuelLedger`](crate::FuelLedger) the [`MemoryLedger`] is
 //! kernel-owned and cloned into every `WasmEngine`, so a principal's peak is the
 //! max across every capsule it drives — the substrate that fills
 //! `ResourceUsage::memory_bytes_peak_total`.
+//!
+//! Principal-affine resident Stores additionally reserve their aggregate
+//! current linear-memory bytes here. One atomic reserve/release boundary across
+//! every capsule prevents a principal's quota from multiplying by its number of
+//! resident Stores. Free-checkout Stores retain only peak telemetry because an
+//! idle Store can serve a different principal on its next lease.
 //!
 //! **Attribution under pooling.** A capsule's pooled Stores are shared across
 //! principals under free checkout, and grown linear memory persists across
@@ -33,6 +39,7 @@
 //! ephemeral sub-agent principals cannot grow the map without limit, and the
 //! biggest memory users (the interesting telemetry) are the ones retained.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -49,14 +56,19 @@ use dashmap::DashMap;
 /// ephemeral churn.
 const MAX_PRINCIPALS: usize = 4096;
 
-/// Shared, cloneable handle to the per-principal peak-memory ledger.
+/// Shared, cloneable handle to per-principal peak and resident-memory state.
 ///
 /// Cloning is an `Arc` bump; every clone observes the same map, so the kernel
 /// hands one clone to each `WasmEngine` and they all record into the same
-/// per-principal high-water marks.
+/// per-principal accounting state.
 #[derive(Clone, Default)]
 pub struct MemoryLedger {
     inner: Arc<DashMap<PrincipalId, AtomicU64>>,
+    /// Exact aggregate bytes held by principal-affine resident Stores. Memory
+    /// growth is rare compared with ordinary instructions, so one
+    /// non-poisoning lock keeps cross-capsule reserve/release atomic and makes
+    /// the principal quota a total rather than a per-Store multiplier.
+    current: Arc<parking_lot::Mutex<HashMap<PrincipalId, u64>>>,
 }
 
 impl MemoryLedger {
@@ -143,6 +155,65 @@ impl MemoryLedger {
             .get(principal)
             .map_or(0, |counter| counter.load(Ordering::Relaxed))
     }
+
+    /// Atomically reserve additional current resident bytes for `principal`.
+    /// Returns `false` without mutation when the aggregate would exceed
+    /// `limit`, overflow, or require tracking a new principal above the bounded
+    /// ledger cardinality.
+    pub fn try_reserve_current(
+        &self,
+        principal: &PrincipalId,
+        additional: u64,
+        limit: u64,
+    ) -> bool {
+        if additional == 0 {
+            return true;
+        }
+        let mut current = self.current.lock();
+        if !current.contains_key(principal) && current.len() >= MAX_PRINCIPALS {
+            return false;
+        }
+        let prior = current.get(principal).copied().unwrap_or(0);
+        let Some(next) = prior.checked_add(additional) else {
+            return false;
+        };
+        if next > limit {
+            return false;
+        }
+        current.insert(principal.clone(), next);
+        true
+    }
+
+    /// Release bytes when a principal-affine Store shrinks by destruction.
+    /// Removes zero entries so ephemeral principals cannot accumulate in the
+    /// current-residency map after eviction.
+    pub fn release_current(&self, principal: &PrincipalId, bytes: u64) {
+        if bytes == 0 {
+            return;
+        }
+        let mut current = self.current.lock();
+        let Some(prior) = current.get(principal).copied() else {
+            debug_assert!(false, "released resident memory was never reserved");
+            return;
+        };
+        let Some(next) = prior.checked_sub(bytes) else {
+            // Fail secure: retain the reservation rather than under-accounting
+            // if an internal ownership bug ever attempts an over-release.
+            debug_assert!(false, "released more resident memory than reserved");
+            return;
+        };
+        if next == 0 {
+            current.remove(principal);
+        } else {
+            current.insert(principal.clone(), next);
+        }
+    }
+
+    /// Exact currently resident bytes held by principal-affine Stores.
+    #[must_use]
+    pub fn current(&self, principal: &PrincipalId) -> u64 {
+        self.current.lock().get(principal).copied().unwrap_or(0)
+    }
 }
 
 #[cfg(test)]
@@ -185,6 +256,25 @@ mod tests {
         assert_eq!(ledger.peak(&a), 2048);
         assert_eq!(ledger.peak(&b), 8192);
         assert_eq!(clone.peak(&a), 2048);
+    }
+
+    #[test]
+    fn current_reservations_are_aggregate_bounded_and_released() {
+        let ledger = MemoryLedger::default();
+        let alice = PrincipalId::new("alice").unwrap();
+        let clone = ledger.clone();
+
+        assert!(ledger.try_reserve_current(&alice, 32, 64));
+        assert!(clone.try_reserve_current(&alice, 16, 64));
+        assert_eq!(ledger.current(&alice), 48);
+        assert!(!ledger.try_reserve_current(&alice, 17, 64));
+        assert_eq!(ledger.current(&alice), 48);
+
+        clone.release_current(&alice, 16);
+        assert_eq!(ledger.current(&alice), 32);
+        ledger.release_current(&alice, 32);
+        assert_eq!(ledger.current(&alice), 0);
+        assert!(ledger.current.lock().is_empty());
     }
 
     #[test]
