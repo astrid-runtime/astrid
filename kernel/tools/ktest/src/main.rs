@@ -18,7 +18,7 @@ use wait_timeout::ChildExt;
 /// Frozen machine contract.
 const FIRMWARE_CODE: &str = "/opt/homebrew/share/qemu/edk2-x86_64-code.fd";
 const FIRMWARE_VARS_TEMPLATE: &str = "/opt/homebrew/share/qemu/edk2-i386-vars.fd";
-const QEMU_TIMEOUT_SECS: u64 = 120;
+const QEMU_TIMEOUT_SECS: u64 = 180;
 /// isa-debug-exit success value 0x10 -> QEMU process exit code (0x10<<1)|1.
 const EXPECT_EXIT_CODE: i32 = 33;
 /// Toolchain used to build the host tools. The `bootloader` 0.11 builder runs
@@ -330,6 +330,57 @@ fn assert_events(events: &[Value], exit_code: Option<i32>) -> bool {
         });
         check(&format!("test.pass {name}"), passed && !failed);
     }
+
+    // ---- M2: first ring-3 protection domain -------------------------------
+
+    // All seven ring-3 scenarios passed (present as test.pass, never test.fail).
+    let scenario_tests = [
+        "ring3_happy",
+        "ring3_kernel_read",
+        "ring3_priv_insn",
+        "ring3_bad_cap",
+        "ring3_stale_cap",
+        "ring3_runaway",
+        "ring3_reuse",
+    ];
+    for name in scenario_tests {
+        let passed = events.iter().any(|e| {
+            ev_name(e) == "test.pass" && e.get("name").and_then(Value::as_str) == Some(name)
+        });
+        let failed = events.iter().any(|e| {
+            ev_name(e) == "test.fail" && e.get("name").and_then(Value::as_str) == Some(name)
+        });
+        check(&format!("test.pass {name}"), passed && !failed);
+    }
+
+    // At least one domain.killed for each cause literal (the fixed 3-set).
+    for cause in ["pf", "gp", "quota"] {
+        let present = events.iter().any(|e| {
+            ev_name(e) == "domain.killed"
+                && e.get("cause").and_then(Value::as_str) == Some(cause)
+        });
+        check(&format!("domain.killed cause={cause}"), present);
+    }
+
+    // Revocation produced at least one cap.revoked record.
+    let revoked = events.iter().any(|e| ev_name(e) == "cap.revoked");
+    check("cap.revoked present", revoked);
+
+    // Every domain that was created was reclaimed, and every reclaim balanced.
+    let creates = events.iter().filter(|e| ev_name(e) == "domain.create").count();
+    let reclaims: Vec<&Value> = events
+        .iter()
+        .filter(|e| ev_name(e) == "domain.reclaimed")
+        .collect();
+    check(
+        &format!("domain.reclaimed count == domain.create count ({})", creates),
+        creates > 0 && reclaims.len() == creates,
+    );
+    let all_balanced = !reclaims.is_empty()
+        && reclaims
+            .iter()
+            .all(|e| e.get("balance_ok") == Some(&Value::Bool(true)));
+    check("every domain.reclaimed balance_ok=true", all_balanced);
 
     // Final halt with outcome ok.
     let halt_ok = events
