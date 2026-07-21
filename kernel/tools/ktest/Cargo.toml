@@ -1,0 +1,16 @@
+[package]
+name = "ktest"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "ktest"
+test = false
+bench = false
+
+[dependencies]
+anyhow = "=1.0.104"
+serde_json = "=1.0.151"
+blake3 = "=1.8.5"
+wait-timeout = "=0.2.1"
