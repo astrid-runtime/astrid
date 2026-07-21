@@ -166,16 +166,27 @@ async fn ensure_daemon_inner(label: &str, announce: bool) -> Result<()> {
     let ready_path = socket_client::readiness_path();
 
     let needs_boot = if socket_path.exists() {
-        if tokio::net::UnixStream::connect(&socket_path).await.is_ok() {
-            ensure_daemon_workspace_matches(None).await?;
-            if announce {
-                eprintln!("[{label}] Connected to existing daemon");
-            }
-            false
-        } else {
-            let _ = std::fs::remove_file(&socket_path);
-            let _ = std::fs::remove_file(&ready_path);
-            true
+        match tokio::net::UnixStream::connect(&socket_path).await {
+            Ok(_) => {
+                ensure_daemon_workspace_matches(None).await?;
+                if announce {
+                    eprintln!("[{label}] Connected to existing daemon");
+                }
+                false
+            },
+            Err(error) if socket_error_proves_stale(&error) => {
+                let _ = std::fs::remove_file(&socket_path);
+                let _ = std::fs::remove_file(&ready_path);
+                true
+            },
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "failed to connect to daemon socket {}; leaving it intact",
+                        socket_path.display()
+                    )
+                });
+            },
         }
     } else {
         true
@@ -185,6 +196,20 @@ async fn ensure_daemon_inner(label: &str, announce: bool) -> Result<()> {
         ensure_daemon_workspace_matches(None).await?;
     }
     Ok(())
+}
+
+/// Whether a failed Unix-socket connect proves that no listener owns the path.
+///
+/// Permission errors, descriptor exhaustion, and other environmental failures
+/// say nothing about listener liveness. Unlinking on those errors can sever a
+/// healthy daemon from every future client while its bound descriptor remains
+/// open. A refused connection (or a path that disappeared during the probe) is
+/// the only stale-sentinel evidence this auto-healing path accepts.
+fn socket_error_proves_stale(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound
+    )
 }
 
 pub(crate) async fn ensure_daemon_workspace_matches(workspace_root: Option<&Path>) -> Result<()> {
@@ -802,6 +827,30 @@ mod tests {
         let action = decide_start_action(false, true);
         assert_eq!(action, StartAction::RunningButUnreachable);
         assert!(!start_clears_sentinels(action));
+    }
+
+    /// A caller may be sandboxed away from an otherwise healthy Unix socket.
+    /// EPERM is not evidence that the listener is stale and must never authorize
+    /// unlinking the daemon's only pathname.
+    #[test]
+    fn daemon_probe_only_heals_errors_that_prove_a_stale_socket() {
+        assert!(socket_error_proves_stale(&std::io::Error::from(
+            std::io::ErrorKind::ConnectionRefused
+        )));
+        assert!(socket_error_proves_stale(&std::io::Error::from(
+            std::io::ErrorKind::NotFound
+        )));
+        for kind in [
+            std::io::ErrorKind::PermissionDenied,
+            std::io::ErrorKind::TimedOut,
+            std::io::ErrorKind::WouldBlock,
+            std::io::ErrorKind::OutOfMemory,
+        ] {
+            assert!(
+                !socket_error_proves_stale(&std::io::Error::from(kind)),
+                "{kind:?} must preserve the socket"
+            );
+        }
     }
 
     #[test]
