@@ -313,8 +313,9 @@ not a solved claim.
 ## 11. Requirement-to-evidence seed
 
 Each threat class above must graduate from "addressed by clause" to "a test
-fails if the property is lost." The Milestone 0 requirement-to-evidence
-matrix (a separate exit-gate artifact) carries at least:
+fails if the property is lost." The Milestone 0
+[requirement-to-evidence matrix](astrid-kernel-evidence-matrix.md) carries the
+full mapping; in summary, at least:
 
 - forged handle, widened-rights transfer, out-of-range memory/IPC → rejected
   (charter §4);
