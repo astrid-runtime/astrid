@@ -30,15 +30,14 @@
 //! ## Capability gating and fail-secure
 //!
 //! Prefer wire **form-mode** elicitation when the client advertised it at
-//! `initialize` ([`Peer::supported_elicitation_modes`]). Clients with form
-//! support (Claude, Codex, …) never leave that path.
+//! `initialize` ([`Peer::supported_elicitation_modes`]). Capable clients
+//! never leave that path.
 //!
-//! When the client advertised **no** elicitation modes (e.g. Grok Build
-//! today), fall back to a **local native system dialog**
-//! ([`super::host_dialog`]) for the same boolean consent. Decline, cancel,
-//! dialog error, or kill-switch still DENY: no `ingress.respond`, no trust
-//! recorded. Fail secure — the absence of an explicit accept is never
-//! treated as consent. Capable clients never see this path.
+//! When the client advertised **no** elicitation modes, fall back to a
+//! **local native system dialog** ([`super::host_dialog`]) for the same
+//! boolean consent. Decline, cancel, dialog error, or kill-switch still
+//! DENY: no `ingress.respond`, no trust recorded. Fail secure — the absence
+//! of an explicit accept is never treated as consent.
 //!
 //! ## Never elicit secrets (this flow)
 //!
@@ -151,7 +150,7 @@ pub(super) async fn elicit_consent(peer: &Peer<RoleServer>, request: &IngressReq
             "MCP shim: client did not advertise elicitation; using host form dialog for ingress"
         );
         return super::host_dialog::binary_form_consent(
-            "Unicity AOS",
+            "Astrid",
             &request.prompt(),
             "Allow",
             "Deny",

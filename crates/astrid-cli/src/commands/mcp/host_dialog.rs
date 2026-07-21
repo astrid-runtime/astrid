@@ -1,11 +1,16 @@
-//! Host-side **Apple-native** (or platform-native) consent UI when the MCP
-//! client has no elicitation capability.
+//! Host-side native consent UI when the connected MCP **client** advertised
+//! no elicitation capability at `initialize`.
 //!
-//! ## When this runs
+//! ## Runtime posture
 //!
-//! **Only** if `peer.supported_elicitation_modes()` is empty. Claude, Codex,
-//! and any client that advertised form (or URL) elicitation keep the pure
-//! wire path (`elicitation/create`) and never open a host dialog.
+//! The kernel/CLI does not know or care which product launched the client.
+//! The only signal is MCP: did `supported_elicitation_modes()` include a
+//! usable mode? If yes → wire `elicitation/create` only (this module is
+//! never called). If no → optional **local** system dialog so form-shaped
+//! consent can still complete for a local `astrid mcp serve` process.
+//!
+//! Product hosts (IDEs, coding agents, chat CLIs, …) are out of scope here;
+//! they are packaging and docs concerns for distributions built *on* Astrid.
 //!
 //! ## What we show (minimal system rectangles)
 //!
@@ -14,29 +19,25 @@
 //! | Binary | Deny / Allow buttons | `boolean` |
 //! | Enum | Choose-from-list | `string` enum |
 //! | Text | Dialog + text field | `string` |
-//! | Secret | Dialog + secure field | `string` (local host only) |
+//! | Secret | Dialog + secure field | `string` (local process only) |
 //!
-//! On macOS this is stock `osascript` → AppKit `display dialog` / `choose
-//! from list`: small system sheets that follow the user’s light/dark
-//! appearance. That *is* the “looks Apple native” surface — not a web
-//! popup, not a custom chrome window.
+//! On macOS: stock `osascript` → AppKit `display dialog` / `choose from
+//! list`. On Linux: zenity when present.
 //!
-//! ## Security boundary (local MCP vs hosted)
+//! ## Security boundary (local process vs remote server)
 //!
-//! `astrid mcp serve` is a **local** stdio process on the operator’s machine.
-//! A host system dialog runs **outside** the MCP client and the LLM context:
-//! the model never sees the dialog, only the server-side decision (or the
-//! value we intentionally feed into a broker respond path).
+//! `astrid mcp serve` is typically a **local** stdio child of the MCP client.
+//! A host system dialog runs in that process, outside the LLM context: the
+//! model never sees the UI, only the server-side decision.
 //!
 //! That is a different threat model from a **remotely hosted** MCP server,
-//! where opening a system dialog on the *server* host would be wrong and
-//! secrets must stay on a user-facing HTTPS page (MCP URL-mode elicitation).
+//! where a dialog on the server machine is not the operator’s UI and secrets
+//! must stay on a user-facing page (MCP URL-mode elicitation).
 //!
-//! Wire form mode still **must not** request secrets from a capable client
-//! (MCP client elicitation spec). For no-elicitation local clients (e.g.
-//! Grok today), collecting a short secret in a **secure system field** on
-//! the same machine as the shim keeps the boundary: client/LLM never sees
-//! it; only this local process does.
+//! Wire form mode still must not request secrets from a client that supports
+//! elicitation (MCP client elicitation spec). For a local no-elicitation
+//! client, a secure system field on the same machine as the shim keeps the
+//! value out of the client/LLM; only this process sees it.
 //!
 //! ## Kill switch
 //!
@@ -53,7 +54,8 @@ const DEFAULT_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Whether the host native-dialog fallback is enabled.
 ///
-/// Default **on**. Explicit opt-out for headless / CI.
+/// Default **on** for interactive local serve. Explicit opt-out for
+/// headless / CI.
 pub(super) fn host_form_dialog_enabled() -> bool {
     match std::env::var("ASTRID_MCP_HOST_FORM_DIALOG") {
         Ok(v) => {

@@ -57,20 +57,19 @@
 //! ## Capability gating and fail-secure
 //!
 //! Prefer wire **form-mode** elicitation when the client advertised it at
-//! `initialize`. Clients with form support never leave that path.
+//! `initialize`. Capable clients never leave that path.
 //!
-//! When the client advertised **no** elicitation modes, fall back to a host
-//! form-shaped dialog ([`super::host_dialog`]) for the same binary grant
-//! decision. Decline / cancel / dialog error still DENY (and we still
-//! publish a deny respond so the broker marker clears). Fail secure — the
-//! absence of an explicit accept is never treated as consent.
+//! When the client advertised **no** elicitation modes, fall back to a local
+//! native dialog ([`super::host_dialog`]) for the same binary grant decision.
+//! Decline / cancel / dialog error still DENY (and we still publish a deny
+//! respond so the broker marker clears). Fail secure — the absence of an
+//! explicit accept is never treated as consent.
 //!
 //! ## Never elicit secrets
 //!
 //! The elicited type ([`GrantForm`]) is a single boolean `grant` field. No
 //! free-form text, no tool argument, and no secret is surfaced or
-//! round-tripped. Per MCP, secrets must use URL-mode elicitation, not form
-//! mode and not a host form dialog.
+//! round-tripped.
 
 use std::fmt::Write as _;
 
@@ -238,7 +237,7 @@ pub(super) async fn elicit_grant(peer: &Peer<RoleServer>, request: &GrantRequest
             "MCP shim: client did not advertise elicitation; using host form dialog for grant-on-use"
         );
         return super::host_dialog::binary_form_consent(
-            "Unicity AOS",
+            "Astrid",
             &request.prompt(),
             "Grant",
             "Deny",

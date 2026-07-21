@@ -29,21 +29,20 @@
 //! ## Capability gating and fail-secure
 //!
 //! Prefer wire **form-mode** elicitation when the client advertised it at
-//! `initialize`. Clients with form support never leave that path.
+//! `initialize`. Capable clients never leave that path.
 //!
-//! When the client advertised **no** elicitation modes, fall back to a host
-//! form-shaped multi-choice dialog ([`super::host_dialog`]) for the same
-//! enum of approve verbs. Decline / cancel / dialog error still fall through
-//! to `Deny`: the broker publishes `deny`, the parked tool retires cleanly,
-//! and the shim returns the resulting `isError` terminal reply. Fail secure —
+//! When the client advertised **no** elicitation modes, fall back to a local
+//! native multi-choice dialog ([`super::host_dialog`]) for the same enum of
+//! approve verbs. Decline / cancel / dialog error still fall through to
+//! `Deny`: the broker publishes `deny`, the parked tool retires cleanly, and
+//! the shim returns the resulting `isError` terminal reply. Fail secure —
 //! the absence of an explicit approval is never treated as consent.
 //!
 //! ## Never elicit secrets
 //!
 //! The elicited type ([`ApprovalForm`]) is a single constrained-string
 //! `choice` field. No free-form text, no tool argument, and no secret is
-//! ever surfaced to the client or round-tripped back into the tool. Per MCP,
-//! secrets must use URL-mode elicitation, not form mode.
+//! ever surfaced to the client or round-tripped back into the tool.
 
 use std::fmt::Write as _;
 
@@ -267,7 +266,7 @@ async fn elicit_choice(peer: &Peer<RoleServer>, request: &ApprovalRequest) -> Ap
 /// Mirrors the wire [`ApprovalForm`] enum only — never free text or secrets.
 async fn host_form_approval_choice(request: &ApprovalRequest) -> ApprovalChoice {
     let selected = super::host_dialog::enum_form_consent(
-        "Unicity AOS",
+        "Astrid",
         &request.prompt(),
         &[
             ("approve_once", "Approve once"),
