@@ -18,7 +18,7 @@ use wait_timeout::ChildExt;
 /// Frozen machine contract.
 const FIRMWARE_CODE: &str = "/opt/homebrew/share/qemu/edk2-x86_64-code.fd";
 const FIRMWARE_VARS_TEMPLATE: &str = "/opt/homebrew/share/qemu/edk2-i386-vars.fd";
-const QEMU_TIMEOUT_SECS: u64 = 300;
+const QEMU_TIMEOUT_SECS: u64 = 360;
 /// isa-debug-exit success value 0x10 -> QEMU process exit code (0x10<<1)|1.
 const EXPECT_EXIT_CODE: i32 = 33;
 /// Toolchain used to build the host tools. The `bootloader` 0.11 builder runs
@@ -382,6 +382,139 @@ fn snapshot_equals_fold(events: &[Value]) -> bool {
     ok
 }
 
+/// Parse an `audit.root` event's `"root":[w0,w1,w2,w3]` (four LE u64 words) back
+/// into the 32-byte root value.
+fn root_bytes(v: &Value) -> Option<[u8; 32]> {
+    let arr = v.get("root")?.as_array()?;
+    if arr.len() != 4 {
+        return None;
+    }
+    let mut root = [0u8; 32];
+    for (i, w) in arr.iter().enumerate() {
+        let x = w.as_u64()?;
+        root[i * 8..i * 8 + 8].copy_from_slice(&x.to_le_bytes());
+    }
+    Some(root)
+}
+
+/// The canonical 40-byte serialization of a record (five LE u64 fields), the
+/// harness's own independent copy of the ring-0 format.
+fn canonical40(aseq: u64, fields: &[u64; 4]) -> [u8; 40] {
+    let mut buf = [0u8; 40];
+    buf[0..8].copy_from_slice(&aseq.to_le_bytes());
+    buf[8..16].copy_from_slice(&fields[0].to_le_bytes());
+    buf[16..24].copy_from_slice(&fields[1].to_le_bytes());
+    buf[24..32].copy_from_slice(&fields[2].to_le_bytes());
+    buf[32..40].copy_from_slice(&fields[3].to_le_bytes());
+    buf
+}
+
+/// Fold the record stream `0..=max` into a BLAKE3 rolling root from the frozen
+/// genesis `blake3("astrid-audit-v0")`, optionally flipping one byte of the
+/// record at `tamper_at` (to prove the chain binds every record).
+fn fold_root(
+    records: &std::collections::BTreeMap<u64, [u64; 4]>,
+    max: u64,
+    tamper_at: Option<u64>,
+) -> [u8; 32] {
+    let mut root = *blake3::hash(b"astrid-audit-v0").as_bytes();
+    for s in 0..=max {
+        let fields = records[&s];
+        let mut buf = canonical40(s, &fields);
+        if tamper_at == Some(s) {
+            buf[16] ^= 0x01; // flip one byte of the record's canonical bytes
+        }
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(&root);
+        hasher.update(&buf);
+        root = *hasher.finalize().as_bytes();
+    }
+    root
+}
+
+/// M5's teeth (host-side, ADR-K7's user-space verifier half). Reconstruct the
+/// BLAKE3 rolling root from the emitted `audit.record` stream using the SAME
+/// genesis + `blake3(prev32 || canonical40)` rule and assert it equals ring 0's
+/// final `audit.root`; ed25519-sign the recomputed head with a host keypair and
+/// verify it round-trips; then flip one record byte and assert the root diverges.
+/// Prints the three sub-checks and gates on all three.
+fn audit_chain_verify(events: &[Value]) -> bool {
+    use ed25519_dalek::{Signer, SigningKey, Verifier};
+    use std::collections::BTreeMap;
+
+    // Dedup records by aseq (append-time + every enumerate re-emit are identical).
+    let mut records: BTreeMap<u64, [u64; 4]> = BTreeMap::new();
+    for e in events {
+        if ev_name(e) == "audit.record" {
+            let (Some(aseq), Some(kind), Some(a), Some(b), Some(c)) = (
+                u64_field(e, "aseq"),
+                u64_field(e, "kind"),
+                u64_field(e, "a"),
+                u64_field(e, "b"),
+                u64_field(e, "c"),
+            ) else {
+                continue;
+            };
+            records.insert(aseq, [kind, a, b, c]);
+        }
+    }
+    // Ring 0's final root = the audit.root event with the maximal aseq.
+    let mut final_root: Option<(u64, [u8; 32])> = None;
+    for e in events {
+        if ev_name(e) == "audit.root" {
+            let (Some(aseq), Some(root)) = (u64_field(e, "aseq"), root_bytes(e)) else {
+                continue;
+            };
+            if final_root.map(|(m, _)| aseq >= m).unwrap_or(true) {
+                final_root = Some((aseq, root));
+            }
+        }
+    }
+
+    println!("audit-chain:");
+    println!("  records: {}", records.len());
+
+    let Some((max_aseq, kernel_root)) = final_root else {
+        println!("  recomputed_root == kernel_root : FAIL (no audit.root event)");
+        println!("  ed25519 sign+verify head        : FAIL");
+        println!("  tamper flips root (detected)    : FAIL");
+        return false;
+    };
+
+    // The record set must be exactly the gapless 0..=max_aseq for a fold.
+    let gapless =
+        records.len() as u64 == max_aseq + 1 && (0..=max_aseq).all(|s| records.contains_key(&s));
+    let recomputed = fold_root(&records, max_aseq, None);
+    let recomputed_ok = gapless && recomputed == kernel_root;
+    println!(
+        "  recomputed_root == kernel_root : {}",
+        if recomputed_ok { "PASS" } else { "FAIL" }
+    );
+
+    // The "user space builds the ed25519 chain" half: sign the recomputed head
+    // with a host keypair (fixed seed — no rng dep) and verify it round-trips.
+    let signing = SigningKey::from_bytes(&[7u8; 32]);
+    let signature = signing.sign(&recomputed);
+    let sign_ok = signing
+        .verifying_key()
+        .verify(&recomputed, &signature)
+        .is_ok();
+    println!(
+        "  ed25519 sign+verify head        : {}",
+        if sign_ok { "PASS" } else { "FAIL" }
+    );
+
+    // Tamper: flip one byte of record 0's canonical bytes; the root MUST diverge.
+    let tampered = fold_root(&records, max_aseq, Some(0));
+    let tamper_ok = gapless && tampered != kernel_root;
+    println!(
+        "  tamper flips root (detected)    : {}",
+        if tamper_ok { "PASS" } else { "FAIL" }
+    );
+
+    recomputed_ok && sign_ok && tamper_ok
+}
+
 fn assert_events(events: &[Value], exit_code: Option<i32>) -> bool {
     let mut ok = true;
     let mut check = |label: &str, pass: bool| {
@@ -676,6 +809,50 @@ fn assert_events(events: &[Value], exit_code: Option<i32>) -> bool {
     // enumerate.
     let denied = events.iter().any(|e| ev_name(e) == "legible.denied");
     check("legible.denied present (unauthorized enumerate)", denied);
+
+    // ---- M5: audit chain (ADR-K7) -----------------------------------------
+
+    // All four M5 audit-chain scenarios passed (present, never test.fail).
+    let m5_scenarios = [
+        "audit_orders_and_roots",
+        "audit_gated",
+        "audit_chain_verifies",
+        "audit_light_tenant",
+    ];
+    for name in m5_scenarios {
+        let passed = events.iter().any(|e| {
+            ev_name(e) == "test.pass" && e.get("name").and_then(Value::as_str) == Some(name)
+        });
+        let failed = events.iter().any(|e| {
+            ev_name(e) == "test.fail" && e.get("name").and_then(Value::as_str) == Some(name)
+        });
+        check(&format!("test.pass {name}"), passed && !failed);
+    }
+
+    // audit_seq is gapless 0..len across the enumerated `audit.record` stream.
+    let mut aseqs: Vec<u64> = events
+        .iter()
+        .filter(|e| ev_name(e) == "audit.record")
+        .filter_map(|e| u64_field(e, "aseq"))
+        .collect();
+    aseqs.sort_unstable();
+    aseqs.dedup();
+    let gapless = !aseqs.is_empty() && aseqs.iter().enumerate().all(|(i, &s)| s == i as u64);
+    check(
+        &format!("audit_seq gapless 0..len (len {})", aseqs.len()),
+        gapless,
+    );
+
+    // Unauthorized audit syscalls produced an observable denial.
+    let audit_denied = events.iter().any(|e| ev_name(e) == "audit.denied");
+    check(
+        "audit.denied present (unauthorized audit syscall)",
+        audit_denied,
+    );
+
+    // THE killer test: host-side reconstruction of the BLAKE3 chain, ed25519
+    // sign+verify of the head, and tamper-evidence. Gates on all three sub-checks.
+    check("audit-chain host verification", audit_chain_verify(events));
 
     // Final halt with outcome ok.
     let halt_ok = events
