@@ -147,9 +147,10 @@ not become a ring-0 ABI.
   protocol/application service roles.
 - [x] Write a concise kernel charter stating what may never enter ring 0:
   [Astrid Kernel Charter](astrid-kernel-charter.md).
-- [ ] Write the system threat model covering firmware, hypervisor, device firmware,
+- [x] Write the system threat model covering firmware, hypervisor, device firmware,
   malicious native domains, runtime-host compromise, malicious capsules, malicious
-  drivers, DMA, and recovery infrastructure.
+  drivers, DMA, and recovery infrastructure:
+  [Astrid Kernel Threat Model](astrid-kernel-threat-model.md).
 - [ ] Create a requirement-to-evidence matrix for every claimed security property.
 - [ ] Record ADRs for protection domains, capability object representation, handle
   transfer, revocation, fault endpoints, scheduling, and audit ordering.
