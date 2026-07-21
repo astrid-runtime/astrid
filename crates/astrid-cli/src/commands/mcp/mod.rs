@@ -35,6 +35,7 @@
 
 mod elicit;
 mod form_elicitation;
+mod generation_fence;
 mod grant;
 mod ingress;
 // Parent-death detection reads `getppid()` (Unix-only); the module and its use
@@ -55,6 +56,7 @@ use tokio::sync::Mutex;
 use tracing::info;
 use uuid::Uuid;
 
+use generation_fence::HostGenerationFence;
 use server::AstridMcpServer;
 
 /// Refuse to serve the MCP bridge silently as the no-capability `anonymous`
@@ -108,6 +110,11 @@ fn broker_readiness_required(caller: &astrid_core::PrincipalId) -> bool {
 /// Returns an error if the daemon socket is unreachable, the principal
 /// is invalid, or the MCP transport fails to initialize.
 pub(crate) async fn serve(principal: Option<&str>) -> Result<ExitCode> {
+    let generation_fence =
+        HostGenerationFence::from_environment().context("invalid MCP host generation fence")?;
+    generation_fence
+        .validate()
+        .context("this MCP host session is stale; restart its host application")?;
     // The subcommand `--principal` is an explicit per-invocation
     // override; when absent, fall back to the process-wide principal
     // (the global `--principal` / `ASTRID_PRINCIPAL`, already validated
@@ -155,9 +162,13 @@ pub(crate) async fn serve(principal: Option<&str>) -> Result<ExitCode> {
         "astrid mcp serve: uplink established, starting MCP stdio transport"
     );
 
-    tokio::spawn(session_guard::run(caller.clone()));
+    tokio::spawn(session_guard::run(caller.clone(), generation_fence.clone()));
 
-    let server = AstridMcpServer::new(Arc::new(Mutex::new(client)), caller.clone());
+    let server = AstridMcpServer::new(
+        Arc::new(Mutex::new(client)),
+        caller.clone(),
+        generation_fence.clone(),
+    );
 
     // `rmcp::transport::stdio()` yields the (stdin, stdout) pair the MCP
     // transport drives. `serve` performs the MCP handshake and spawns the
@@ -177,7 +188,7 @@ pub(crate) async fn serve(principal: Option<&str>) -> Result<ExitCode> {
     // if the watch uplink dies, tool-list pushes simply stop, but the server
     // keeps serving `tools/list`/`tools/call` on demand.
     let peer = running.peer().clone();
-    tokio::spawn(watch::run(peer, caller.to_string()));
+    tokio::spawn(watch::run(peer, caller.to_string(), generation_fence));
 
     // Race the normal stdin-EOF quit against parent-death. `waiting()` only
     // returns when the client closes stdin; an MCP client that DIES without

@@ -181,6 +181,10 @@ fn test_astrid_home_fhs_paths() {
         PathBuf::from(format!("{r}/run/system.ready"))
     );
     assert_eq!(
+        home.daemon_generation_path(),
+        PathBuf::from(format!("{r}/run/system.generation"))
+    );
+    assert_eq!(
         home.deferred_db_path(),
         PathBuf::from(format!("{r}/run/deferred.db"))
     );

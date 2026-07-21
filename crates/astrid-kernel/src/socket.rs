@@ -252,6 +252,19 @@ pub fn readiness_path() -> PathBuf {
     }
 }
 
+/// Path to the exact daemon executable-generation sidecar.
+#[must_use]
+pub fn daemon_generation_path() -> PathBuf {
+    use astrid_core::dirs::AstridHome;
+    match AstridHome::resolve() {
+        Ok(home) => home.daemon_generation_path(),
+        Err(e) => {
+            warn!(error = %e, "Failed to resolve ASTRID_HOME; falling back to /tmp/.astrid/run/system.generation");
+            PathBuf::from("/tmp/.astrid/run/system.generation")
+        },
+    }
+}
+
 /// Write the readiness sentinel file to signal that the daemon is fully
 /// initialized and accepting connections.
 ///
@@ -280,10 +293,14 @@ pub fn write_readiness_file_for_workspace(
     workspace_layout: &astrid_core::dirs::WorkspaceLayout,
 ) -> Result<(), std::io::Error> {
     let path = readiness_path();
+    let generation_path = daemon_generation_path();
     let fingerprint = astrid_core::dirs::checked_workspace_selection_fingerprint(
         workspace_root,
         workspace_layout,
     )?;
+    let generation = astrid_core::DaemonGeneration::current()
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
+    publish_readiness_metadata(&generation_path, &format!("{generation}\n"))?;
     publish_readiness_metadata(&path, &format!("v1:{fingerprint}\n"))
 }
 
@@ -331,6 +348,7 @@ fn publish_readiness_metadata(path: &std::path::Path, metadata: &str) -> std::io
 /// CLI's pre-spawn cleanup will handle it on next boot.
 pub fn remove_readiness_file() {
     let _ = std::fs::remove_file(readiness_path());
+    let _ = std::fs::remove_file(daemon_generation_path());
 }
 
 /// Path to the daemon PID file (`run/system.pid`).

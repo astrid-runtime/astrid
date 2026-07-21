@@ -16,6 +16,8 @@ use rand::{TryRng, rngs::SysRng};
 use serde::{Deserialize, Serialize};
 use subtle::ConstantTimeEq;
 
+use crate::DaemonGeneration;
+
 /// Current wire protocol version. Bumped when the handshake or IPC message
 /// format changes in a backwards-incompatible way.
 pub const PROTOCOL_VERSION: u8 = 1;
@@ -216,6 +218,22 @@ pub struct HandshakeRequest {
     pub signature: Option<String>,
 }
 
+/// Additive generation-aware envelope around [`HandshakeRequest`].
+///
+/// Flattening preserves the existing v1 JSON shape. Legacy daemons ignore the
+/// extra field, while current clients can detect the missing generation in the
+/// legacy response and refuse the attachment. The original public struct stays
+/// unchanged for Rust API compatibility.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct GenerationHandshakeRequest {
+    /// Existing token, protocol, version, and principal-auth fields.
+    #[serde(flatten)]
+    pub handshake: HandshakeRequest,
+    /// Exact daemon generation required by the client.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_server_generation: Option<DaemonGeneration>,
+}
+
 /// Typed status for handshake responses. Using an enum instead of a raw
 /// string prevents typo-induced mismatches between client and server.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -249,6 +267,50 @@ pub struct HandshakeResponse {
     /// final success/error response and for unauthenticated handshakes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub challenge: Option<String>,
+}
+
+/// Machine-readable generation error returned during the handshake.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GenerationHandshakeError {
+    /// The client expected another daemon executable generation.
+    GenerationMismatch,
+}
+
+/// Additive generation-aware envelope around [`HandshakeResponse`].
+#[derive(Debug, Serialize, Deserialize)]
+pub struct GenerationHandshakeResponse {
+    /// Existing status, protocol, version, reason, and challenge fields.
+    #[serde(flatten)]
+    pub handshake: HandshakeResponse,
+    /// Exact generation served by this daemon.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server_generation: Option<DaemonGeneration>,
+    /// Typed generation refusal, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generation_error: Option<GenerationHandshakeError>,
+}
+
+impl GenerationHandshakeResponse {
+    /// Wrap a normal handshake response with the daemon generation.
+    #[must_use]
+    pub fn new(handshake: HandshakeResponse, server_generation: DaemonGeneration) -> Self {
+        Self {
+            handshake,
+            server_generation: Some(server_generation),
+            generation_error: None,
+        }
+    }
+
+    /// Build a typed generation-mismatch response.
+    #[must_use]
+    pub fn mismatch(reason: impl Into<String>, server_generation: DaemonGeneration) -> Self {
+        Self {
+            handshake: HandshakeResponse::error(reason),
+            server_generation: Some(server_generation),
+            generation_error: Some(GenerationHandshakeError::GenerationMismatch),
+        }
+    }
 }
 
 impl HandshakeResponse {
@@ -389,6 +451,19 @@ mod tests {
         let json = serde_json::to_value(&resp).expect("serialize");
         assert_eq!(json["status"], "ok");
         assert!(json.get("reason").is_none(), "reason should be skipped");
+    }
+
+    #[test]
+    fn generation_envelope_is_additive_to_v1_wire_shape() {
+        let generation = DaemonGeneration::parse("astrid:0.10.5:source").unwrap();
+        let response =
+            GenerationHandshakeResponse::new(HandshakeResponse::ok(), generation.clone());
+        let json = serde_json::to_value(&response).unwrap();
+        assert_eq!(json["status"], "ok");
+        assert_eq!(json["server_generation"], generation.as_str());
+
+        let legacy: HandshakeResponse = serde_json::from_value(json).unwrap();
+        assert!(legacy.is_ok(), "legacy readers ignore additive fields");
     }
 
     #[test]

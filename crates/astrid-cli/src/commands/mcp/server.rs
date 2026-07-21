@@ -55,6 +55,7 @@ use uuid::Uuid;
 use crate::socket_client::SocketClient;
 
 use super::elicit;
+use super::generation_fence::HostGenerationFence;
 use super::grant;
 use super::ingress;
 
@@ -98,6 +99,9 @@ const GRANT_DENIED_MESSAGE: &str = "Capsule access was not granted for this tool
 const GRANT_BOUND_EXCEEDED_MESSAGE: &str = "Astrid needed to resolve more capsule grants than a single tool call allows; the tool call \
      was dropped. Re-run the tool to continue granting the remaining capsules.";
 
+const STALE_HOST_SESSION_MESSAGE: &str =
+    "Unicity AOS or Astrid was upgraded; restart this host session before using AOS tools.";
+
 /// MCP server shim bridging a stdio client to the daemon tool broker.
 pub(crate) struct AstridMcpServer {
     /// The single long-lived uplink, shared across `&self` handlers.
@@ -115,15 +119,39 @@ pub(crate) struct AstridMcpServer {
     /// the flag is already serialized by that lock and needs no inter-thread
     /// ordering of its own — all accesses use `Ordering::Relaxed`.
     needs_reconnect: AtomicBool,
+    /// Terminal fence set after either the daemon or host-owned external
+    /// generation changes. A stale host session must never retry into the new
+    /// generation.
+    stale_session: AtomicBool,
+    /// Host/plugin generation expected by the process that launched this MCP
+    /// bridge. This is checked before every daemon operation.
+    generation_fence: HostGenerationFence,
 }
 
 impl AstridMcpServer {
     /// Build a new shim over an established uplink and resolved principal.
-    pub(crate) fn new(client: Arc<Mutex<SocketClient>>, principal: PrincipalId) -> Self {
+    pub(crate) fn new(
+        client: Arc<Mutex<SocketClient>>,
+        principal: PrincipalId,
+        generation_fence: HostGenerationFence,
+    ) -> Self {
         Self {
             client,
             principal,
             needs_reconnect: AtomicBool::new(false),
+            stale_session: AtomicBool::new(false),
+            generation_fence,
+        }
+    }
+
+    fn validate_host_generation(&self) -> Result<(), McpError> {
+        if self.generation_fence.validate().is_err() {
+            self.stale_session.store(true, Ordering::Relaxed);
+        }
+        if self.stale_session.load(Ordering::Relaxed) {
+            Err(McpError::internal_error(STALE_HOST_SESSION_MESSAGE, None))
+        } else {
+            Ok(())
         }
     }
 
@@ -131,6 +159,7 @@ impl AstridMcpServer {
     /// to a daemon for another workspace. Every failure leaves the recovery
     /// flag armed; only a fully checked replacement clears it.
     async fn reconnect(&self, client: &mut SocketClient) -> Result<(), McpError> {
+        self.validate_host_generation()?;
         self.needs_reconnect.store(true, Ordering::Relaxed);
         let principal = self.principal.clone();
         let result = crate::socket_client::reconnect_for_workspace(
@@ -145,9 +174,18 @@ impl AstridMcpServer {
             },
         )
         .await;
+        if result.as_ref().err().is_some_and(
+            crate::socket_client::WorkspaceConnectionError::is_daemon_generation_mismatch,
+        ) {
+            self.stale_session.store(true, Ordering::Relaxed);
+        }
         record_reconnect_outcome(&self.needs_reconnect, &result);
         result.map_err(|error| {
-            McpError::internal_error(format!("reconnect to daemon failed: {error}"), None)
+            if self.stale_session.load(Ordering::Relaxed) {
+                McpError::internal_error(STALE_HOST_SESSION_MESSAGE, None)
+            } else {
+                McpError::internal_error(format!("reconnect to daemon failed: {error}"), None)
+            }
         })
     }
 
@@ -163,6 +201,7 @@ impl AstridMcpServer {
         req_id: &str,
         body: Value,
     ) -> Result<Value, McpError> {
+        self.validate_host_generation()?;
         let reply_topic = astrid_types::Topic::kernel_response(req_id);
 
         let msg = astrid_types::ipc::IpcMessage::new(

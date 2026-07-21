@@ -5,6 +5,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use astrid_core::kernel_api::{DaemonStatus, KernelRequest, KernelResponse};
+use astrid_core::{DaemonGeneration, DaemonGenerationMismatch};
 
 use crate::bootstrap::find_companion_binary;
 use crate::commands::daemon_control;
@@ -98,6 +99,7 @@ async fn spawn_daemon_inner(
     // Remove stale readiness file before spawning so we don't
     // mistake a leftover from a crashed daemon for the new one.
     let _ = std::fs::remove_file(ready_path);
+    let _ = std::fs::remove_file(socket_client::daemon_generation_path());
 
     let mut child = cmd
         .spawn()
@@ -175,6 +177,7 @@ async fn ensure_daemon_inner(label: &str, announce: bool) -> Result<()> {
         } else {
             let _ = std::fs::remove_file(&socket_path);
             let _ = std::fs::remove_file(&ready_path);
+            let _ = std::fs::remove_file(socket_client::daemon_generation_path());
             true
         }
     } else {
@@ -189,15 +192,28 @@ async fn ensure_daemon_inner(label: &str, announce: bool) -> Result<()> {
 
 pub(crate) async fn ensure_daemon_workspace_matches(workspace_root: Option<&Path>) -> Result<()> {
     let expected = expected_workspace_fingerprint(workspace_root)?;
+    let expected_generation =
+        DaemonGeneration::current().context("invalid expected daemon generation identity")?;
     let ready_path = socket_client::readiness_path();
+    let generation_path = socket_client::daemon_generation_path();
 
     for _ in 0..DAEMON_READY_ATTEMPTS {
-        match std::fs::read_to_string(&ready_path) {
-            Ok(metadata) => return validate_daemon_workspace_metadata(&metadata, &expected),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+        match (
+            std::fs::read_to_string(&ready_path),
+            std::fs::read_to_string(&generation_path),
+        ) {
+            (Ok(metadata), Ok(generation)) => {
+                validate_daemon_workspace_metadata(&metadata, &expected)?;
+                return validate_daemon_generation_metadata(&generation, &expected_generation);
+            },
+            (Ok(metadata), Err(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+                validate_daemon_workspace_metadata(&metadata, &expected)?;
+                return Err(DaemonGenerationMismatch::new(expected_generation, None).into());
+            },
+            (Err(error), _) if error.kind() == std::io::ErrorKind::NotFound => {
                 tokio::time::sleep(DAEMON_READY_POLL).await;
             },
-            Err(error) => {
+            (Err(error), _) | (_, Err(error)) => {
                 return Err(error).context("failed to read daemon workspace metadata");
             },
         }
@@ -206,6 +222,14 @@ pub(crate) async fn ensure_daemon_workspace_matches(workspace_root: Option<&Path
     anyhow::bail!(
         "daemon workspace metadata was not available within {DAEMON_READY_TIMEOUT_SECS} seconds; run `astrid restart`"
     )
+}
+
+fn validate_daemon_generation_metadata(metadata: &str, expected: &DaemonGeneration) -> Result<()> {
+    let actual = DaemonGeneration::parse(metadata.trim()).ok();
+    if actual.as_ref() != Some(expected) {
+        return Err(DaemonGenerationMismatch::new(expected.clone(), actual).into());
+    }
+    Ok(())
 }
 
 fn expected_workspace_fingerprint(workspace_root: Option<&Path>) -> Result<String> {
@@ -265,6 +289,7 @@ pub(crate) async fn spawn_persistent_daemon() -> Result<()> {
         .stderr(stderr);
 
     let _ = std::fs::remove_file(&ready_path);
+    let _ = std::fs::remove_file(socket_client::daemon_generation_path());
 
     let mut child = cmd.spawn().context("Failed to spawn Astrid daemon")?;
 
@@ -419,6 +444,7 @@ pub(crate) async fn handle_start() -> Result<()> {
             // readiness, PID) and spawn onto a clean run-dir.
             let _ = std::fs::remove_file(&socket_path);
             let _ = std::fs::remove_file(&ready_path);
+            let _ = std::fs::remove_file(socket_client::daemon_generation_path());
             let _ = std::fs::remove_file(&pid_path);
             spawn_persistent_daemon().await
         },
@@ -436,6 +462,7 @@ pub(crate) async fn handle_status() -> Result<()> {
     let mut client = socket_client::connect_kernel_for_workspace(None)
         .await
         .context("Daemon socket exists but connection failed")?;
+    let daemon_generation = client.daemon_generation().clone();
     let status = status_response(
         client
             .request(KernelRequest::GetStatus)
@@ -451,6 +478,7 @@ pub(crate) async fn handle_status() -> Result<()> {
         ))
     );
     println!("  Version:    {}", status.version);
+    println!("  Generation: {daemon_generation}");
     println!("  Clients:    {}", status.connected_clients);
     println!("  Capsules:   {} loaded", status.loaded_capsules.len());
     for capsule in &status.loaded_capsules {
@@ -633,6 +661,7 @@ fn report_orphan_stop(
 fn remove_runtime_files(pid_path: &Path, socket_path: &Path) {
     let _ = std::fs::remove_file(socket_path);
     let _ = std::fs::remove_file(socket_client::readiness_path());
+    let _ = std::fs::remove_file(socket_client::daemon_generation_path());
     let _ = std::fs::remove_file(pid_path);
 }
 
@@ -695,6 +724,19 @@ mod tests {
                 .is_err()
         );
         validate_daemon_workspace_metadata(&format!("v1:{expected}\n"), &expected).unwrap();
+    }
+
+    #[test]
+    fn daemon_generation_metadata_requires_an_exact_release_identity() {
+        let expected = DaemonGeneration::parse("astrid:0.10.5:new-source").unwrap();
+        validate_daemon_generation_metadata("astrid:0.10.5:new-source\n", &expected).unwrap();
+
+        let error = validate_daemon_generation_metadata("astrid:0.10.5:old-source\n", &expected)
+            .unwrap_err();
+        assert!(error.is::<DaemonGenerationMismatch>());
+
+        let legacy = validate_daemon_generation_metadata("", &expected).unwrap_err();
+        assert!(legacy.is::<DaemonGenerationMismatch>());
     }
 
     #[test]

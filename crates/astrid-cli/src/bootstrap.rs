@@ -180,6 +180,7 @@ pub(crate) async fn run_or_connect(
                 );
                 let _ = std::fs::remove_file(&socket_path);
                 let _ = std::fs::remove_file(&ready_path);
+                let _ = std::fs::remove_file(crate::socket_client::daemon_generation_path());
                 needs_boot = true;
             },
             Err(e) => {

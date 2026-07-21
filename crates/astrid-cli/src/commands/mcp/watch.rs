@@ -51,6 +51,7 @@ use uuid::Uuid;
 
 use crate::socket_client::SocketClient;
 
+use super::generation_fence::HostGenerationFence;
 use super::server::{TOOLS_LIST_TOPIC, new_req_id, unwrap_reply_payload, unwrap_reply_payload_ref};
 
 /// Kernel broadcast emitted once every capsule (re)load completes.
@@ -68,7 +69,15 @@ const ENUMERATE_DEADLINE: Duration = Duration::from_secs(55);
 /// so the kernel scopes discovery to the same identity as the request
 /// handlers. The function owns a freshly-connected [`SocketClient`] and
 /// drives it to EOF; it returns when the daemon closes the watch uplink.
-pub(super) async fn run(peer: Peer<RoleServer>, principal: String) {
+pub(super) async fn run(
+    peer: Peer<RoleServer>,
+    principal: String,
+    generation_fence: HostGenerationFence,
+) {
+    if let Err(error) = generation_fence.validate() {
+        warn!(%error, "MCP hot-reload watcher: host session is stale; watcher disabled");
+        return;
+    }
     // The watch uplink's session id is ephemeral — it only keys this
     // transport's frames. Bind the connection to the SAME principal the
     // request handlers use: the proxy pins the first principal it sees per
@@ -125,8 +134,20 @@ pub(super) async fn run(peer: Peer<RoleServer>, principal: String) {
         },
     };
 
+    let mut generation_check = tokio::time::interval(Duration::from_secs(1));
+    generation_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
-        let frame = match watch_client.read_raw_frame().await {
+        let read_result = tokio::select! {
+            frame = watch_client.read_raw_frame() => frame,
+            _ = generation_check.tick() => {
+                if let Err(error) = generation_fence.validate() {
+                    warn!(%error, "MCP hot-reload watcher: host session became stale; stopping");
+                    return;
+                }
+                continue;
+            },
+        };
+        let frame = match read_result {
             Ok(Some(bytes)) => bytes,
             Ok(None) => {
                 debug!("MCP hot-reload watcher: watch uplink closed; stopping");

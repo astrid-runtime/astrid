@@ -6,7 +6,7 @@
 //! (`crate::socket_client::*`) working without churning every caller.
 
 pub(crate) use astrid_uplink::socket_client::{
-    SocketClient, pid_path, proxy_socket_path, readiness_path,
+    SocketClient, daemon_generation_path, pid_path, proxy_socket_path, readiness_path,
 };
 
 use std::future::Future;
@@ -72,6 +72,17 @@ pub(crate) enum WorkspaceConnectionError {
     Selection(#[source] anyhow::Error),
     #[error("{0:#}")]
     Connect(#[source] anyhow::Error),
+}
+
+impl WorkspaceConnectionError {
+    pub(crate) fn is_daemon_generation_mismatch(&self) -> bool {
+        let error = match self {
+            Self::Selection(error) | Self::Connect(error) => error,
+        };
+        error
+            .chain()
+            .any(<dyn std::error::Error + 'static>::is::<astrid_core::DaemonGenerationMismatch>)
+    }
 }
 
 pub(crate) type WorkspaceConnectionResult<T> = std::result::Result<T, WorkspaceConnectionError>;
@@ -204,6 +215,16 @@ mod tests {
         let recovery_scope = KernelConnectionScope::Recovery;
         assert!(!recovery_scope.requires_workspace_check());
         assert_eq!(recovery_scope.workspace_root(), None);
+    }
+
+    #[test]
+    fn typed_generation_mismatch_survives_workspace_error_wrapping() {
+        let expected = astrid_core::DaemonGeneration::parse("astrid:1.0.0:new").unwrap();
+        let actual = astrid_core::DaemonGeneration::parse("astrid:1.0.0:old").unwrap();
+        let error = WorkspaceConnectionError::Selection(anyhow::Error::new(
+            astrid_core::DaemonGenerationMismatch::new(expected, Some(actual)),
+        ));
+        assert!(error.is_daemon_generation_mismatch());
     }
 
     #[tokio::test]

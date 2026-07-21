@@ -15,8 +15,10 @@ use anyhow::{Context, Result};
 use astrid_core::PrincipalId;
 use astrid_core::SessionId;
 use astrid_core::session_token::{
-    HandshakeRequest, HandshakeResponse, PROTOCOL_VERSION, SessionToken,
+    GenerationHandshakeError, GenerationHandshakeRequest, GenerationHandshakeResponse,
+    HandshakeRequest, PROTOCOL_VERSION, SessionToken,
 };
+use astrid_core::{DaemonGeneration, DaemonGenerationMismatch};
 use astrid_types::Topic;
 use astrid_types::ipc::{IpcMessage, IpcPayload};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -56,6 +58,22 @@ pub fn readiness_path() -> std::path::PathBuf {
                 "Failed to resolve ASTRID_HOME; falling back to /tmp/.astrid/run/system.ready"
             );
             std::path::PathBuf::from("/tmp/.astrid/run/system.ready")
+        },
+    }
+}
+
+/// Path to the daemon's exact executable-generation sidecar.
+#[must_use]
+pub fn daemon_generation_path() -> std::path::PathBuf {
+    use astrid_core::dirs::AstridHome;
+    match AstridHome::resolve() {
+        Ok(home) => home.daemon_generation_path(),
+        Err(e) => {
+            warn!(
+                error = %e,
+                "Failed to resolve ASTRID_HOME; falling back to /tmp/.astrid/run/system.generation"
+            );
+            std::path::PathBuf::from("/tmp/.astrid/run/system.generation")
         },
     }
 }
@@ -149,6 +167,8 @@ pub struct SocketClient {
     /// (the MCP shim) refuse to serve silently as `anonymous`; see
     /// [`is_authenticated`](Self::is_authenticated).
     authenticated: bool,
+    /// Exact executable generation authenticated during the handshake.
+    daemon_generation: DaemonGeneration,
 }
 
 impl SocketClient {
@@ -174,7 +194,7 @@ impl SocketClient {
             .await
             .context("Failed to connect to IPC socket")?;
 
-        let authenticated = perform_handshake(&mut stream, &principal).await?;
+        let outcome = perform_handshake(&mut stream, &principal).await?;
 
         let (read_half, write_half) = stream.into_split();
 
@@ -183,7 +203,8 @@ impl SocketClient {
             write_half,
             session_id,
             principal,
-            authenticated,
+            authenticated: outcome.authenticated,
+            daemon_generation: outcome.daemon_generation,
         })
     }
 
@@ -204,6 +225,7 @@ impl SocketClient {
             session_id,
             principal,
             authenticated: true,
+            daemon_generation: DaemonGeneration::built_in(),
         }
     }
 
@@ -217,6 +239,12 @@ impl SocketClient {
     #[must_use]
     pub fn is_authenticated(&self) -> bool {
         self.authenticated
+    }
+
+    /// Exact executable generation accepted during the handshake.
+    #[must_use]
+    pub const fn daemon_generation(&self) -> &DaemonGeneration {
+        &self.daemon_generation
     }
 
     /// Re-establish the connection to the (possibly restarted) daemon,
@@ -494,7 +522,15 @@ fn principal_key_path(principal: &PrincipalId) -> Option<std::path::PathBuf> {
 /// took the legacy single-frame path that the daemon stamps the no-capability
 /// `anonymous`. An outright-rejected handshake (e.g. a bad signature) is an
 /// `Err`, never a silent `false`.
-async fn perform_handshake(stream: &mut UnixStream, principal: &PrincipalId) -> Result<bool> {
+struct HandshakeOutcome {
+    authenticated: bool,
+    daemon_generation: DaemonGeneration,
+}
+
+async fn perform_handshake(
+    stream: &mut UnixStream,
+    principal: &PrincipalId,
+) -> Result<HandshakeOutcome> {
     let tok_path = token_path()?;
     let token = SessionToken::read_from_file(&tok_path).with_context(|| {
         format!(
@@ -521,56 +557,90 @@ async fn perform_handshake(stream: &mut UnixStream, principal: &PrincipalId) -> 
     };
 
     let claimed_principal = keypair.as_ref().map(|_| principal.to_string());
-    let request = HandshakeRequest {
-        token: token.to_hex(),
-        protocol_version: PROTOCOL_VERSION,
-        client_version: env!("CARGO_PKG_VERSION").to_string(),
-        claimed_principal,
-        // The signature rides the SECOND frame (after the challenge), never
-        // the first.
-        signature: None,
+    let expected_generation =
+        DaemonGeneration::current().context("invalid expected daemon generation identity")?;
+    let request = GenerationHandshakeRequest {
+        handshake: HandshakeRequest {
+            token: token.to_hex(),
+            protocol_version: PROTOCOL_VERSION,
+            client_version: env!("CARGO_PKG_VERSION").to_string(),
+            claimed_principal,
+            // The signature rides the SECOND frame (after the challenge), never
+            // the first.
+            signature: None,
+        },
+        expected_server_generation: Some(expected_generation.clone()),
     };
 
     let response = send_request_read_response(stream, &request).await?;
+    validate_daemon_generation(&expected_generation, &response)?;
 
     // Authenticated path: the daemon's first response carries a challenge
     // nonce. Sign it and send a second frame, then read the final response.
     let (response, authenticated) = if let (Some(keypair), Some(nonce_hex)) =
-        (keypair.as_ref(), response.challenge.as_deref())
+        (keypair.as_ref(), response.handshake.challenge.as_deref())
     {
         let message = astrid_core::session_token::principal_auth_challenge_message(
             principal.as_str(),
             nonce_hex,
         );
         let signature = keypair.sign(message.as_bytes()).to_hex();
-        let signed = HandshakeRequest {
-            token: token.to_hex(),
-            protocol_version: PROTOCOL_VERSION,
-            client_version: env!("CARGO_PKG_VERSION").to_string(),
-            claimed_principal: Some(principal.to_string()),
-            signature: Some(signature),
+        let signed = GenerationHandshakeRequest {
+            handshake: HandshakeRequest {
+                token: token.to_hex(),
+                protocol_version: PROTOCOL_VERSION,
+                client_version: env!("CARGO_PKG_VERSION").to_string(),
+                claimed_principal: Some(principal.to_string()),
+                signature: Some(signature),
+            },
+            expected_server_generation: Some(expected_generation.clone()),
         };
-        (send_request_read_response(stream, &signed).await?, true)
+        let final_response = send_request_read_response(stream, &signed).await?;
+        validate_daemon_generation(&expected_generation, &final_response)?;
+        (final_response, true)
     } else {
         (response, false)
     };
 
-    if !response.is_ok() {
+    if !response.handshake.is_ok() {
         let reason = response
+            .handshake
             .reason
             .unwrap_or_else(|| "unknown error".to_string());
         anyhow::bail!("Daemon rejected connection: {reason}");
     }
 
-    Ok(authenticated)
+    let daemon_generation = response
+        .server_generation
+        .ok_or_else(|| DaemonGenerationMismatch::new(expected_generation, None))?;
+    Ok(HandshakeOutcome {
+        authenticated,
+        daemon_generation,
+    })
+}
+
+fn validate_daemon_generation(
+    expected: &DaemonGeneration,
+    response: &GenerationHandshakeResponse,
+) -> Result<()> {
+    if response.generation_error == Some(GenerationHandshakeError::GenerationMismatch)
+        || response.server_generation.as_ref() != Some(expected)
+    {
+        return Err(DaemonGenerationMismatch::new(
+            expected.clone(),
+            response.server_generation.clone(),
+        )
+        .into());
+    }
+    Ok(())
 }
 
 /// Write one length-prefixed [`HandshakeRequest`] frame and read the
 /// length-prefixed [`HandshakeResponse`] frame, with per-operation timeouts.
 async fn send_request_read_response(
     stream: &mut UnixStream,
-    request: &HandshakeRequest,
-) -> Result<HandshakeResponse> {
+    request: &GenerationHandshakeRequest,
+) -> Result<GenerationHandshakeResponse> {
     let request_bytes =
         serde_json::to_vec(request).context("Failed to serialize handshake request")?;
     let len = u32::try_from(request_bytes.len()).context("Handshake request too large")?;
@@ -603,4 +673,31 @@ async fn send_request_read_response(
         .context("Failed to read handshake response payload")?;
 
     serde_json::from_slice(&resp_payload).context("Failed to parse handshake response")
+}
+
+#[cfg(test)]
+mod generation_tests {
+    use super::*;
+    use astrid_core::session_token::{GenerationHandshakeResponse, HandshakeResponse};
+
+    #[test]
+    fn generation_validation_rejects_legacy_and_wrong_daemons() {
+        let expected = DaemonGeneration::parse("astrid:0.10.5:new").unwrap();
+        let matching = GenerationHandshakeResponse::new(HandshakeResponse::ok(), expected.clone());
+        validate_daemon_generation(&expected, &matching).unwrap();
+
+        let legacy: GenerationHandshakeResponse = serde_json::from_str(
+            r#"{"status":"ok","protocol_version":1,"server_version":"0.10.5"}"#,
+        )
+        .unwrap();
+        let error = validate_daemon_generation(&expected, &legacy).unwrap_err();
+        assert!(error.is::<DaemonGenerationMismatch>());
+
+        let wrong = GenerationHandshakeResponse::new(
+            HandshakeResponse::ok(),
+            DaemonGeneration::parse("astrid:0.10.5:old").unwrap(),
+        );
+        let error = validate_daemon_generation(&expected, &wrong).unwrap_err();
+        assert!(error.is::<DaemonGenerationMismatch>());
+    }
 }

@@ -2592,11 +2592,11 @@ fn load_or_generate_runtime_key(keys_dir: &Path) -> std::io::Result<KeyPair> {
 ///
 /// Takes the minimum of both signals to handle ungraceful disconnects.
 ///
-/// Idle shutdown is on by default in `--ephemeral` mode (30s after the
-/// last client disconnects) and **off by default** in persistent mode
+/// Idle shutdown is immediate by default in `--ephemeral` mode after the
+/// final client lease disconnects and **off by default** in persistent mode
 /// (`astrid start`). Both modes respect `ASTRID_IDLE_TIMEOUT_SECS` —
 /// setting it in persistent mode opts the operator into auto-shutdown,
-/// setting it in ephemeral mode overrides the 30s default.
+/// setting it in ephemeral mode opts into an additional reconnect window.
 /// Number of permanent internal event bus subscribers that are not client
 /// connections: `KernelRouter` (`kernel.request.*`), `AdminRouter`
 /// (`kernel.admin.*`), `ConnectionTracker` (`client.*`),
@@ -2633,8 +2633,29 @@ const IDLE_INITIAL_GRACE: std::time::Duration = std::time::Duration::from_secs(5
 const IDLE_NON_EPHEMERAL_GRACE: std::time::Duration = std::time::Duration::from_secs(25);
 /// How often the idle monitor polls when running in ephemeral mode.
 const IDLE_EPHEMERAL_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+/// Bound for an ephemeral daemon whose launcher disappears before establishing
+/// its first client lease. Slow capsule startup gets a bounded runway, while a
+/// formerly-connected daemon still retires immediately after its final lease.
+const IDLE_EPHEMERAL_ORPHAN_GRACE: std::time::Duration = std::time::Duration::from_secs(30);
 /// How often the idle monitor polls when running in persistent mode.
 const IDLE_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(15);
+
+const fn no_client_leases_remain(active_connections: usize) -> bool {
+    active_connections == 0
+}
+
+fn idle_shutdown_timeout(
+    ephemeral: bool,
+    observed_client_lease: bool,
+    configured: std::time::Duration,
+) -> std::time::Duration {
+    if ephemeral && !observed_client_lease {
+        configured.max(IDLE_EPHEMERAL_ORPHAN_GRACE)
+    } else {
+        configured
+    }
+}
+
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 fn spawn_idle_monitor(kernel: Arc<Kernel>) -> astrid_runtime::JoinHandle<()> {
     astrid_runtime::spawn(async move {
@@ -2645,20 +2666,15 @@ fn spawn_idle_monitor(kernel: Arc<Kernel>) -> astrid_runtime::JoinHandle<()> {
         // Read ephemeral flag after grace period (set by daemon after boot).
         let ephemeral = kernel.ephemeral.load(Ordering::Relaxed);
         let idle_timeout = if ephemeral {
-            // Give the CLI time to reconnect after brief disconnects (e.g.
-            // during tool execution when the TUI might momentarily drop
-            // the socket). Zero timeout caused premature shutdowns.
-            //
-            // Operators may still override via `ASTRID_IDLE_TIMEOUT_SECS`
-            // when they want a longer ephemeral window (e.g. headless
-            // batch runs that pause between prompts).
+            // An ephemeral daemon is owned only by its explicit live client
+            // leases. The initial boot grace above protects the launcher race;
+            // after that, the final disconnect retires the process on the next
+            // monitor tick. Operators may opt into a reconnect window for a
+            // special-purpose headless flow.
             std::env::var("ASTRID_IDLE_TIMEOUT_SECS")
                 .ok()
                 .and_then(|v| v.parse().ok())
-                .map_or(
-                    std::time::Duration::from_secs(30),
-                    std::time::Duration::from_secs,
-                )
+                .map_or(std::time::Duration::ZERO, std::time::Duration::from_secs)
         } else {
             // Persistent (`astrid start`) mode: idle shutdown is opt-in.
             // The operator explicitly chose persistent — honour that.
@@ -2689,6 +2705,7 @@ fn spawn_idle_monitor(kernel: Arc<Kernel>) -> astrid_runtime::JoinHandle<()> {
             astrid_runtime::time::sleep(IDLE_NON_EPHEMERAL_GRACE).await;
         }
         let mut idle_since: Option<astrid_runtime::time::Instant> = None;
+        let mut observed_client_lease = false;
 
         loop {
             astrid_runtime::time::sleep(check_interval).await;
@@ -2702,28 +2719,27 @@ fn spawn_idle_monitor(kernel: Arc<Kernel>) -> astrid_runtime::JoinHandle<()> {
             // reduce subscriber_count, causing false "0 connections" readings
             // that trigger premature idle shutdown while a client is active.
             let effective_connections = connections;
+            observed_client_lease |= effective_connections > 0;
 
-            let has_daemons = {
-                let reg = kernel.capsules.read().await;
-                reg.values().any(|c| {
-                    let m = c.manifest();
-                    !m.uplinks.is_empty()
-                })
-            };
-
-            if effective_connections == 0 && !has_daemons {
+            // Capsule roles are not process-liveness leases. In particular, a
+            // loaded socket uplink must not silently convert an MCP-spawned
+            // ephemeral daemon into a persistent service.
+            if no_client_leases_remain(effective_connections) {
                 let now = astrid_runtime::time::Instant::now();
                 let start = *idle_since.get_or_insert(now);
                 let elapsed = now.duration_since(start);
+                let shutdown_timeout =
+                    idle_shutdown_timeout(ephemeral, observed_client_lease, idle_timeout);
 
                 tracing::debug!(
                     idle_secs = elapsed.as_secs(),
-                    timeout_secs = idle_timeout.as_secs(),
+                    timeout_secs = shutdown_timeout.as_secs(),
                     connections,
+                    observed_client_lease,
                     "Kernel idle, monitoring timeout"
                 );
 
-                if elapsed >= idle_timeout {
+                if elapsed >= shutdown_timeout {
                     tracing::info!("Idle timeout reached, initiating shutdown");
                     kernel.shutdown(Some("idle_timeout".to_string())).await;
                     std::process::exit(0);
@@ -2732,7 +2748,6 @@ fn spawn_idle_monitor(kernel: Arc<Kernel>) -> astrid_runtime::JoinHandle<()> {
                 if idle_since.is_some() {
                     tracing::debug!(
                         effective_connections,
-                        has_daemons,
                         "Activity detected, resetting idle timer"
                     );
                 }
@@ -4213,6 +4228,25 @@ mod tests {
         // fetch_update returns Err(0) when the closure returns None (no-op).
         assert!(result.is_err());
         assert_eq!(counter.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn ephemeral_liveness_is_owned_only_by_explicit_client_leases() {
+        assert!(no_client_leases_remain(0));
+        assert!(!no_client_leases_remain(1));
+        assert!(!no_client_leases_remain(4));
+        assert_eq!(
+            idle_shutdown_timeout(true, false, std::time::Duration::ZERO),
+            IDLE_EPHEMERAL_ORPHAN_GRACE
+        );
+        assert_eq!(
+            idle_shutdown_timeout(true, true, std::time::Duration::ZERO),
+            std::time::Duration::ZERO
+        );
+        assert_eq!(
+            idle_shutdown_timeout(false, false, std::time::Duration::from_secs(90)),
+            std::time::Duration::from_secs(90)
+        );
     }
 
     /// Mirrors the `connection_closed(&principal)` logic: only `Ok(1)`

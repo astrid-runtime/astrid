@@ -32,9 +32,10 @@
 use astrid_core::principal::PrincipalId;
 use astrid_core::profile::DeviceKey;
 use astrid_core::session_token::{
-    HandshakeRequest, HandshakeResponse, PRINCIPAL_AUTH_NONCE_LEN, PROTOCOL_VERSION, SessionToken,
-    principal_auth_challenge_message,
+    GenerationHandshakeRequest, GenerationHandshakeResponse, HandshakeResponse,
+    PRINCIPAL_AUTH_NONCE_LEN, PROTOCOL_VERSION, SessionToken, principal_auth_challenge_message,
 };
+use astrid_core::{DaemonGeneration, DaemonGenerationMismatch, daemon_generation_required};
 
 /// Timeout for individual handshake read/write operations (server-side).
 pub(super) const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
@@ -62,20 +63,40 @@ pub(super) async fn validate_handshake(
     home: &astrid_core::dirs::AstridHome,
 ) -> Result<Option<(PrincipalId, String)>, String> {
     let request = read_handshake_request(stream).await?;
+    let server_generation = DaemonGeneration::current()
+        .map_err(|error| format!("invalid daemon generation identity: {error}"))?;
+    let generation_required = daemon_generation_required()
+        .map_err(|error| format!("invalid daemon generation policy: {error}"))?;
 
     // 1. Validate protocol version FIRST - this check reveals no information
     // about token validity. Checking version before token prevents an oracle
     // where a "protocol mismatch" response confirms the token was correct.
-    if request.protocol_version != PROTOCOL_VERSION {
+    if request.handshake.protocol_version != PROTOCOL_VERSION {
         let reason = format!(
             "Protocol version mismatch (client={}, server={}). \
              Restart the daemon with `astrid daemon restart`.",
-            request.protocol_version, PROTOCOL_VERSION,
+            request.handshake.protocol_version, PROTOCOL_VERSION,
         );
-        if let Err(e) =
-            send_handshake_response_timed(stream, &HandshakeResponse::error(&reason)).await
-        {
+        let response = GenerationHandshakeResponse::new(
+            HandshakeResponse::error(&reason),
+            server_generation.clone(),
+        );
+        if let Err(e) = send_handshake_response_timed(stream, &response).await {
             tracing::warn!(error = %e, "Failed to send handshake error response for protocol mismatch");
+        }
+        return Err(reason);
+    }
+
+    // Generation is a compatibility boundary, not an authorization oracle.
+    // Check it before token validity and return only public release identity.
+    if let Some(reason) = generation_rejection_reason(
+        generation_required,
+        request.expected_server_generation.as_ref(),
+        &server_generation,
+    ) {
+        let response = GenerationHandshakeResponse::mismatch(&reason, server_generation.clone());
+        if let Err(error) = send_handshake_response_timed(stream, &response).await {
+            tracing::warn!(%error, "Failed to send daemon-generation mismatch response");
         }
         return Err(reason);
     }
@@ -83,35 +104,47 @@ pub(super) async fn validate_handshake(
     // 2. Validate token (constant-time comparison).
     // Send a uniform error response on both malformed-hex and wrong-token
     // paths to prevent an oracle that distinguishes the two failure modes.
-    let client_token = match SessionToken::from_hex(&request.token) {
+    let client_token = match SessionToken::from_hex(&request.handshake.token) {
         Ok(t) => t,
         Err(_) => {
-            send_auth_failed(stream).await;
+            send_auth_failed(stream, &server_generation).await;
             return Err("invalid session token".to_string());
         },
     };
 
     if !expected_token.ct_eq(&client_token) {
-        send_auth_failed(stream).await;
+        send_auth_failed(stream, &server_generation).await;
         return Err("invalid session token".to_string());
     }
 
     // 3. Optional per-connection principal challenge-response. A claimed
     // principal restructures the flow into two frames; absence keeps the
     // legacy single round trip.
-    let verified_principal = match request.claimed_principal.clone() {
-        Some(claimed) => Some(run_principal_challenge(stream, &claimed, home).await?),
+    let verified_principal = match request.handshake.claimed_principal.clone() {
+        Some(claimed) => Some(
+            run_principal_challenge(
+                stream,
+                &claimed,
+                home,
+                &server_generation,
+                request.expected_server_generation.as_ref(),
+            )
+            .await?,
+        ),
         None => None,
     };
 
     // 4. All checks passed - send the final success response.
-    send_handshake_response_timed(stream, &HandshakeResponse::ok())
-        .await
-        .map_err(|e| format!("failed to send handshake response: {e}"))?;
+    send_handshake_response_timed(
+        stream,
+        &GenerationHandshakeResponse::new(HandshakeResponse::ok(), server_generation),
+    )
+    .await
+    .map_err(|e| format!("failed to send handshake response: {e}"))?;
 
     // Truncate client_version to prevent log injection from oversized values.
     // Use chars().take() to avoid panicking on multi-byte UTF-8 boundaries.
-    let safe_version: String = request.client_version.chars().take(64).collect();
+    let safe_version: String = request.handshake.client_version.chars().take(64).collect();
     tracing::info!(
         client_version = %safe_version,
         authenticated = verified_principal.is_some(),
@@ -120,10 +153,28 @@ pub(super) async fn validate_handshake(
     Ok(verified_principal)
 }
 
+fn generation_rejection_reason(
+    generation_required: bool,
+    client_expected: Option<&DaemonGeneration>,
+    server_generation: &DaemonGeneration,
+) -> Option<String> {
+    match client_expected {
+        Some(expected) if expected != server_generation => Some(
+            DaemonGenerationMismatch::new(expected.clone(), Some(server_generation.clone()))
+                .to_string(),
+        ),
+        None if generation_required => Some(
+            "daemon requires an exact client generation; restart or update this host session"
+                .to_string(),
+        ),
+        Some(_) | None => None,
+    }
+}
+
 /// Read one length-prefixed JSON [`HandshakeRequest`] frame off the stream.
 async fn read_handshake_request(
     stream: &mut tokio::net::UnixStream,
-) -> Result<HandshakeRequest, String> {
+) -> Result<GenerationHandshakeRequest, String> {
     use tokio::io::AsyncReadExt;
 
     let mut len_buf = [0u8; 4];
@@ -160,13 +211,15 @@ async fn run_principal_challenge(
     stream: &mut tokio::net::UnixStream,
     claimed: &str,
     home: &astrid_core::dirs::AstridHome,
+    server_generation: &DaemonGeneration,
+    expected_server_generation: Option<&DaemonGeneration>,
 ) -> Result<(PrincipalId, String), String> {
     // Validate the principal id shape before touching disk so a malformed
     // claim never reaches the filesystem.
     let principal = match PrincipalId::new(claimed) {
         Ok(p) => p,
         Err(e) => {
-            send_auth_failed(stream).await;
+            send_auth_failed(stream, server_generation).await;
             return Err(format!("invalid claimed principal: {e}"));
         },
     };
@@ -176,18 +229,34 @@ async fn run_principal_challenge(
     let nonce_hex = match generate_nonce_hex() {
         Ok(n) => n,
         Err(e) => {
-            send_auth_failed(stream).await;
+            send_auth_failed(stream, server_generation).await;
             return Err(format!("challenge nonce generation failed: {e}"));
         },
     };
-    send_handshake_response_timed(stream, &HandshakeResponse::challenge(nonce_hex.clone()))
-        .await
-        .map_err(|e| format!("failed to send challenge: {e}"))?;
+    send_handshake_response_timed(
+        stream,
+        &GenerationHandshakeResponse::new(
+            HandshakeResponse::challenge(nonce_hex.clone()),
+            server_generation.clone(),
+        ),
+    )
+    .await
+    .map_err(|e| format!("failed to send challenge: {e}"))?;
 
     // Read the second frame carrying the signature.
     let signed = read_handshake_request(stream).await?;
-    let Some(signature_hex) = signed.signature else {
-        send_auth_failed(stream).await;
+    if let Some(expected) = expected_server_generation
+        && signed.expected_server_generation.as_ref() != Some(expected)
+    {
+        let mismatch =
+            DaemonGenerationMismatch::new(expected.clone(), Some(server_generation.clone()));
+        let reason = mismatch.to_string();
+        let response = GenerationHandshakeResponse::mismatch(&reason, server_generation.clone());
+        let _ = send_handshake_response_timed(stream, &response).await;
+        return Err(reason);
+    }
+    let Some(signature_hex) = signed.handshake.signature else {
+        send_auth_failed(stream, server_generation).await;
         return Err("missing signature in second handshake frame".to_string());
     };
 
@@ -197,7 +266,7 @@ async fn run_principal_challenge(
     let key_id = match verify_principal_signature(&principal, &nonce_hex, &signature_hex, home) {
         Ok(key_id) => key_id,
         Err(reason) => {
-            send_auth_failed(stream).await;
+            send_auth_failed(stream, server_generation).await;
             return Err(reason);
         },
     };
@@ -295,11 +364,15 @@ fn generate_nonce_hex() -> Result<String, String> {
 }
 
 /// Send the uniform `authentication failed` response, logging a write error.
-async fn send_auth_failed(stream: &mut tokio::net::UnixStream) {
-    if let Err(e) =
-        send_handshake_response_timed(stream, &HandshakeResponse::error("authentication failed"))
-            .await
-    {
+async fn send_auth_failed(
+    stream: &mut tokio::net::UnixStream,
+    server_generation: &DaemonGeneration,
+) {
+    let response = GenerationHandshakeResponse::new(
+        HandshakeResponse::error("authentication failed"),
+        server_generation.clone(),
+    );
+    if let Err(e) = send_handshake_response_timed(stream, &response).await {
         tracing::warn!(error = %e, "Failed to send handshake error response");
     }
 }
@@ -308,9 +381,9 @@ async fn send_auth_failed(stream: &mut tokio::net::UnixStream) {
 ///
 /// Wraps [`send_handshake_response`] with a timeout to prevent a stalled
 /// client from holding the accept loop hostage during the response write.
-async fn send_handshake_response_timed(
+async fn send_handshake_response_timed<Response: serde::Serialize>(
     stream: &mut tokio::net::UnixStream,
-    response: &HandshakeResponse,
+    response: &Response,
 ) -> Result<(), std::io::Error> {
     tokio::time::timeout(HANDSHAKE_TIMEOUT, send_handshake_response(stream, response))
         .await
@@ -318,9 +391,9 @@ async fn send_handshake_response_timed(
 }
 
 /// Send a length-prefixed JSON handshake response.
-async fn send_handshake_response(
+async fn send_handshake_response<Response: serde::Serialize>(
     stream: &mut tokio::net::UnixStream,
-    response: &HandshakeResponse,
+    response: &Response,
 ) -> Result<(), std::io::Error> {
     use tokio::io::AsyncWriteExt;
 

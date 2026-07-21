@@ -11,6 +11,16 @@ Changelog tracking starts with 0.2.0. Prior versions were not tracked.
 
 ### Fixed
 
+- **Ephemeral daemon lifetime now follows explicit client leases.** Loaded
+  uplink capsules no longer pin an MCP-spawned daemon after its final client
+  disconnects; persistent service mode remains operator-owned. Closes #1296.
+- **Daemon connections fail closed across executable generations.** Readiness,
+  authenticated handshakes, status output, and MCP reconnects carry and enforce
+  an exact runtime release identity, returning a typed mismatch instead of
+  silently attaching to an old process image. Long-lived MCP bridges can also
+  bind to a host-owned, byte-exact generation marker; requests, guard uplinks,
+  and tool watchers become terminally stale without contacting the daemon when
+  that marker changes. Closes #1297.
 - **Stable crates publication installs its authenticated-hash prerequisite.**
   The protected publisher installs the pinned `b3sum` binary before validating
   the exact dev candidate, so BLAKE3 release metadata checks run before any

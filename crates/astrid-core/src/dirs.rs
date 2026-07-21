@@ -30,6 +30,7 @@
 //! │   ├── system.sock
 //! │   ├── system.token
 //! │   ├── system.ready
+//! │   ├── system.generation
 //! │   └── deferred.db/                   deferred queue (ephemeral)
 //! ├── log/                               system logs
 //! ├── keys/                              runtime signing key
@@ -488,6 +489,17 @@ impl AstridHome {
     #[must_use]
     pub fn ready_path(&self) -> PathBuf {
         self.run_dir().join("system.ready")
+    }
+
+    /// Path to the exact daemon executable generation
+    /// (`run/system.generation`).
+    ///
+    /// This sidecar is published before the readiness sentinel so launchers
+    /// can reject a reachable but stale process before authenticating or
+    /// issuing project-sensitive requests.
+    #[must_use]
+    pub fn daemon_generation_path(&self) -> PathBuf {
+        self.run_dir().join("system.generation")
     }
 
     /// Path to the daemon PID file (`run/system.pid`).

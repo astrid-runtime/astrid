@@ -34,6 +34,7 @@ pub(crate) async fn run() -> Result<ExitCode> {
     if socket.exists() {
         let _ = std::fs::remove_file(&socket);
         let _ = std::fs::remove_file(socket_client::readiness_path());
+        let _ = std::fs::remove_file(socket_client::daemon_generation_path());
         eprintln!(
             "{}",
             Theme::warning(

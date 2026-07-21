@@ -18,6 +18,7 @@ pub mod prelude;
 
 pub mod capability_grammar;
 pub mod capability_registry;
+pub mod daemon_generation;
 pub mod dirs;
 pub mod elicitation;
 pub mod env_policy;
@@ -36,6 +37,10 @@ pub(crate) mod utils;
 pub use capability_grammar::{
     CAP_NET_BIND, CAP_RESOURCES_UNBOUNDED, CAP_UPLINK, CapabilityGrammarError, EXEMPT_CAPABILITIES,
     MAX_CAPABILITY_LEN, capability_matches, validate_capability,
+};
+pub use daemon_generation::{
+    DAEMON_GENERATION_ENV, DaemonGeneration, DaemonGenerationError, DaemonGenerationMismatch,
+    DaemonGenerationPolicyError, REQUIRE_DAEMON_GENERATION_ENV, daemon_generation_required,
 };
 pub use elicitation::{
     ElicitationAction, ElicitationRequest, ElicitationResponse, ElicitationSchema, SelectOption,

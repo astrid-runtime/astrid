@@ -14,6 +14,7 @@ use super::*;
 use astrid_core::dirs::AstridHome;
 use astrid_core::profile::{DeviceKey, DeviceScope};
 use astrid_core::session_token::{
+    GenerationHandshakeError, GenerationHandshakeRequest, GenerationHandshakeResponse,
     HandshakeRequest, HandshakeResponse, PROTOCOL_VERSION, principal_auth_challenge_message,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -132,6 +133,20 @@ fn token() -> SessionToken {
     SessionToken::generate()
 }
 
+#[test]
+fn product_policy_rejects_legacy_clients_without_weakening_standalone_compatibility() {
+    let server_generation = DaemonGeneration::built_in();
+    assert!(generation_rejection_reason(false, None, &server_generation).is_none());
+    assert!(
+        generation_rejection_reason(true, None, &server_generation)
+            .unwrap()
+            .contains("requires an exact client generation")
+    );
+    assert!(
+        generation_rejection_reason(true, Some(&server_generation), &server_generation).is_none()
+    );
+}
+
 #[tokio::test]
 async fn handshake_unsigned_returns_no_principal() {
     let (mut server, mut client) = tokio::net::UnixStream::pair().unwrap();
@@ -160,6 +175,38 @@ async fn handshake_unsigned_returns_no_principal() {
         verified, None,
         "unsigned handshake yields no verified principal"
     );
+}
+
+#[tokio::test]
+async fn wrong_daemon_generation_is_rejected_before_authentication() {
+    let (mut server, mut client) = tokio::net::UnixStream::pair().unwrap();
+    let tok = token();
+    let dir = tempfile::tempdir().unwrap();
+    let home = AstridHome::from_path(dir.path());
+
+    let request = GenerationHandshakeRequest {
+        handshake: HandshakeRequest {
+            token: tok.to_hex(),
+            protocol_version: PROTOCOL_VERSION,
+            client_version: "test".to_string(),
+            claimed_principal: None,
+            signature: None,
+        },
+        expected_server_generation: Some(
+            astrid_core::DaemonGeneration::parse("astrid:0.10.5:different-source").unwrap(),
+        ),
+    };
+    let server_task =
+        tokio::spawn(async move { validate_handshake(&mut server, &tok, &home).await });
+
+    let response: GenerationHandshakeResponse = client_send_recv(&mut client, &request).await;
+    assert!(!response.handshake.is_ok());
+    assert_eq!(
+        response.generation_error,
+        Some(GenerationHandshakeError::GenerationMismatch)
+    );
+    assert!(response.server_generation.is_some());
+    assert!(server_task.await.unwrap().is_err());
 }
 
 #[tokio::test]

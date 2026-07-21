@@ -376,6 +376,12 @@ impl KernelClient {
         &self.caller
     }
 
+    /// Exact daemon executable generation authenticated on this connection.
+    #[must_use]
+    pub const fn daemon_generation(&self) -> &astrid_core::DaemonGeneration {
+        self.inner.daemon_generation()
+    }
+
     /// Build a `KernelClient` over an already-constructed [`SocketClient`] with
     /// an explicit inactivity `timeout`. Test-only: lets the crate's tests drive
     /// [`request`](Self::request) over a loopback socket pair with a short
