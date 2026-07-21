@@ -1,0 +1,24 @@
+[package]
+name = "astrid-kernel"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "astrid-kernel"
+test = false
+bench = false
+
+[dependencies]
+# Boot contract. `bootloader_api` must match the `bootloader` builder version
+# used by tools/kimage exactly (the loader embeds an API-version check).
+bootloader_api = "=0.11.16"
+# Bare-metal x86-64 primitives. Default features pull in `nightly`; on the
+# pinned stable toolchain we take only `instructions` and register interrupt
+# handlers via the stable `Entry::set_handler_addr` path (naked-fn ISR stubs),
+# never the nightly `extern "x86-interrupt"` ABI.
+x86_64 = { version = "=0.15.5", default-features = false, features = ["instructions"] }
+# Fallible bump/free-list heap used directly as `Heap` (no #[global_allocator]).
+linked_list_allocator = { version = "=0.10.6", default-features = false }
+spin = "=0.9.9"
+raw-cpuid = "=11.6.0"
