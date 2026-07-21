@@ -145,7 +145,8 @@ not become a ring-0 ABI.
 - [x] Record graphical game, host GPU, VM GPU, and bare-metal GPU scenarios.
 - [x] Separate device driver, platform authority, resource virtualizer, and
   protocol/application service roles.
-- [ ] Write a concise kernel charter stating what may never enter ring 0.
+- [x] Write a concise kernel charter stating what may never enter ring 0:
+  [Astrid Kernel Charter](astrid-kernel-charter.md).
 - [ ] Write the system threat model covering firmware, hypervisor, device firmware,
   malicious native domains, runtime-host compromise, malicious capsules, malicious
   drivers, DMA, and recovery infrastructure.
