@@ -34,20 +34,20 @@ fn main() -> Result<()> {
     let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
 
     // 1. Build the ring-0 kernel for the bare-metal target.
-    println!("== building astrid-kernel (x86_64-unknown-none, release) ==");
+    println!("== building astrid-native-kernel (x86_64-unknown-none, release) ==");
     run_inherited(
         Command::new(&cargo).current_dir(&root).args([
             "build",
             "-p",
-            "astrid-kernel",
+            "astrid-native-kernel",
             "--target",
             "x86_64-unknown-none",
             "--release",
         ]),
-        "cargo build -p astrid-kernel",
+        "cargo build -p astrid-native-kernel",
     )?;
 
-    let kernel_elf = root.join("target/x86_64-unknown-none/release/astrid-kernel");
+    let kernel_elf = root.join("target/x86_64-unknown-none/release/astrid-native-kernel");
     if !kernel_elf.exists() {
         bail!("kernel ELF not found at {}", kernel_elf.display());
     }
@@ -55,8 +55,8 @@ fn main() -> Result<()> {
     // 2. Build the UEFI image twice for the determinism check.
     let out_dir = root.join("target/kimage");
     std::fs::create_dir_all(&out_dir).context("creating kimage output dir")?;
-    let image_a = out_dir.join("astrid-kernel-a.img");
-    let image_b = out_dir.join("astrid-kernel-b.img");
+    let image_a = out_dir.join("astrid-native-kernel-a.img");
+    let image_b = out_dir.join("astrid-native-kernel-b.img");
     println!("== building UEFI disk image (x2) ==");
     build_image(&root, &kernel_elf, &image_a)?;
     build_image(&root, &kernel_elf, &image_b)?;

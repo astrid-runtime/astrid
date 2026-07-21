@@ -1,11 +1,11 @@
 [package]
-name = "astrid-kernel"
+name = "astrid-native-kernel"
 version = "0.0.0"
 edition = "2021"
 publish = false
 
 [[bin]]
-name = "astrid-kernel"
+name = "astrid-native-kernel"
 test = false
 bench = false
 

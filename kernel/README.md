@@ -9,7 +9,7 @@ ring-0 binary for `x86_64-unknown-none` and two host tools.
 
 ## Layout
 
-- `crates/astrid-kernel/` — `#![no_std] #![no_main]` ring-0 binary.
+- `crates/astrid-native-kernel/` — `#![no_std] #![no_main]` ring-0 binary.
 - `tools/kimage/` — wraps a kernel ELF into a bootable UEFI disk image.
 - `tools/ktest/` — the QEMU serial-assertion harness.
 

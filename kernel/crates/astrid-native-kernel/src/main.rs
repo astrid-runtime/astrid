@@ -6,10 +6,8 @@
 //! covenant surface: it is replaceable, and its output is checked by the
 //! paging-audit and self-test evidence below, never trusted by design.
 //!
-//! Note (charter §9): the covenant reserves the name `astrid-native-kernel`
-//! for the ring-0 artifact. This crate is named `astrid-kernel` per its build
-//! spec; the naming is a deliberate, reported deviation, not a conflation with
-//! the user-space semantic supervisor.
+//! This crate carries the charter §9 reserved name `astrid-native-kernel`; it
+//! is distinct from the user-space `astrid-kernel` semantic supervisor.
 
 #![no_std]
 #![no_main]

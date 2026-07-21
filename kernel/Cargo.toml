@@ -6,7 +6,7 @@
 # these crates.
 [workspace]
 resolver = "2"
-members = ["crates/astrid-kernel", "tools/kimage", "tools/ktest"]
+members = ["crates/astrid-native-kernel", "tools/kimage", "tools/ktest"]
 
 # Ring-0 profile: optimized, no unwinding. Applied workspace-wide; the host
 # tools are plain binaries and abort-on-panic is fine for them.
